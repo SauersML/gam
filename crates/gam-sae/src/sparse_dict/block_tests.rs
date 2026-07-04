@@ -6,6 +6,10 @@
 
 use super::*;
 use crate::frames::GrassmannFrame;
+use crate::sparse_dict::{
+    BlockChartComposeConfig, BlockSeedManifestConfig, block_sparse_dictionary_firings,
+    block_sparse_dictionary_seed_manifest, compose_block_coordinate_charts,
+};
 use ndarray::{Array1, Array2};
 
 /// Deterministic LCG in `[-1, 1)` (no RNG dependency → reproducible tests).
@@ -398,4 +402,109 @@ fn utilization_and_stable_rank_reported() {
         max_sr > 1.2,
         "a block spanning a genuine 2D subspace should report stable rank > 1.2, got {max_sr}"
     );
+}
+
+#[test]
+fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
+    let n = 24usize;
+    let mut x = Array2::<f32>::zeros((n, 2));
+    let mut blocks = ndarray::Array2::<u32>::zeros((n, 2));
+    let mut codes = ndarray::Array3::<f32>::zeros((n, 2, 1));
+    for i in 0..n {
+        let theta = i as f32 * std::f32::consts::TAU / n as f32;
+        x[[i, 0]] = theta.cos();
+        x[[i, 1]] = theta.sin();
+        blocks[[i, 0]] = 0;
+        blocks[[i, 1]] = 1;
+        codes[[i, 0, 0]] = x[[i, 0]];
+        codes[[i, 1, 0]] = x[[i, 1]];
+    }
+    let decoder = ndarray::arr2(&[[1.0f32, 0.0], [0.0, 1.0]]);
+    let counts = block_sparse_dictionary_firings(blocks.view(), 2).expect("firings");
+    assert_eq!(counts, vec![n, n]);
+    let config = BlockSeedManifestConfig {
+        block_size: 1,
+        block_topk: 2,
+        gamma: 1.0,
+        residual_target: false,
+        n_basis_chart: 4,
+        include_bases: true,
+        name_prefix: "block".to_string(),
+    };
+    let manifest = block_sparse_dictionary_seed_manifest(
+        x.view(),
+        decoder.view(),
+        blocks.view(),
+        &[1.0, 1.0],
+        &[1.0, 1.0],
+        1.0,
+        &config,
+    )
+    .expect("seed manifest");
+    assert_eq!(manifest.n_blocks, 2);
+    assert_eq!(manifest.blocks.len(), 2);
+    assert_eq!(manifest.blocks[0].n_firings, n);
+    assert_eq!(manifest.blocks[0].basis.as_ref().expect("basis").len(), 2);
+    assert!(manifest.blocks[0].total_var > 0.0);
+    assert_eq!(manifest.blocks[0].mdl_block.kind, "block");
+    assert_eq!(manifest.blocks[0].mdl_chart.kind, "chart");
+    let recon = reconstruct_block_sparse_rows(decoder.view(), blocks.view(), codes.view(), 1)
+        .expect("block reconstruct");
+    for i in 0..n {
+        for c in 0..2 {
+            assert!((recon[[i, c]] - x[[i, c]]).abs() < 1.0e-6);
+        }
+    }
+}
+
+#[test]
+fn block_coordinate_chart_pair_screen_accepts_split_circle() {
+    let n = 96usize;
+    let mut x = Array2::<f32>::zeros((n, 2));
+    let mut blocks = ndarray::Array2::<u32>::zeros((n, 2));
+    let mut codes = ndarray::Array3::<f32>::zeros((n, 2, 1));
+    for i in 0..n {
+        let theta = i as f32 * std::f32::consts::TAU / n as f32;
+        x[[i, 0]] = theta.cos();
+        x[[i, 1]] = theta.sin();
+        blocks[[i, 0]] = 0;
+        blocks[[i, 1]] = 1;
+        codes[[i, 0, 0]] = x[[i, 0]];
+        codes[[i, 1, 0]] = x[[i, 1]];
+    }
+    let decoder = ndarray::arr2(&[[1.0f32, 0.0], [0.0, 1.0]]);
+    let config = BlockChartComposeConfig {
+        block_size: 1,
+        block_topk: 2,
+        gamma: 1.0,
+        residual_target: false,
+        min_firings: 8,
+        max_blocks: 2,
+        crossfit_folds: 4,
+        alpha: 1.0,
+        min_effect: 0.0,
+        whitening_ridge: 1.0e-8,
+        pair_screen: true,
+        pair_top_blocks: 2,
+        max_pairs: 1,
+        pair_min_cofirings: 8,
+        pair_min_score: 0.0,
+    };
+    let result = compose_block_coordinate_charts(
+        x.view(),
+        decoder.view(),
+        blocks.view(),
+        codes.view(),
+        &config,
+    )
+    .expect("compose charts");
+    assert_eq!(result.accepted_pairs, vec![(0, 1)]);
+    assert_eq!(result.pair_records.len(), 1);
+    assert!(result.pair_records[0].screen_score > 0.9);
+    assert!(result.pair_records[0].evidence.deviance_gain > 0.0);
+    for i in 0..n {
+        let radius =
+            (result.reconstructed[[i, 0]].powi(2) + result.reconstructed[[i, 1]].powi(2)).sqrt();
+        assert!((radius - 1.0).abs() < 5.0e-2);
+    }
 }

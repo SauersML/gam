@@ -4357,9 +4357,38 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
+    module.add_function(wrap_pyfunction!(sparse_dictionary_reconstruct_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
         block_sparse_dictionary_transform_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_reconstruct_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_block_coords_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_lift_block_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_project_residual_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_firings_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_sparse_dictionary_seed_manifest_ffi,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        block_coordinate_chart_compose_ffi,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(rank_charge_dof, module)?)?;
@@ -4922,6 +4951,26 @@ fn sparse_dictionary_transform_ffi<'py>(
     Ok(out.unbind())
 }
 
+#[pyfunction(signature = (decoder, indices, codes))]
+fn sparse_dictionary_reconstruct_ffi<'py>(
+    py: Python<'py>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    indices: PyReadonlyArray2<'py, u32>,
+    codes: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let decoder_values = decoder.as_array().to_owned();
+    let index_values = indices.as_array().to_owned();
+    let code_values = codes.as_array().to_owned();
+    let out = detach_py_result(py, "sparse_dictionary_reconstruct", move || {
+        reconstruct_sparse_rows(
+            decoder_values.view(),
+            index_values.view(),
+            code_values.view(),
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 /// #1026 block-sparse lane — fit a **block-sparse** dictionary: the `K = G·b`
 /// atoms are grouped into `G` blocks of `b` orthonormal atoms, routing selects
 /// whole blocks by their group ℓ₂ gate `‖z_g‖₂` (block-TopK, signed codes, no
@@ -5021,6 +5070,354 @@ fn block_sparse_dictionary_transform_ffi<'py>(
         gates.into_pyarray(py).unbind(),
         codes.into_pyarray(py).unbind(),
     ))
+}
+
+#[pyfunction(signature = (decoder, blocks, codes, block_size))]
+fn block_sparse_dictionary_reconstruct_ffi<'py>(
+    py: Python<'py>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    blocks: PyReadonlyArray2<'py, u32>,
+    codes: PyReadonlyArray3<'py, f32>,
+    block_size: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let decoder_values = decoder.as_array().to_owned();
+    let block_values = blocks.as_array().to_owned();
+    let code_values = codes.as_array().to_owned();
+    let out = detach_py_result(py, "block_sparse_dictionary_reconstruct", move || {
+        reconstruct_block_sparse_rows(
+            decoder_values.view(),
+            block_values.view(),
+            code_values.view(),
+            block_size,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (x, decoder, block_size, block))]
+fn block_sparse_dictionary_block_coords_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    block_size: usize,
+    block: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let out = detach_py_result(py, "block_sparse_dictionary_block_coords", move || {
+        block_sparse_dictionary_block_coords(
+            x_values.view(),
+            decoder_values.view(),
+            block_size,
+            block,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (coords, decoder, block_size, block))]
+fn block_sparse_dictionary_lift_block_ffi<'py>(
+    py: Python<'py>,
+    coords: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    block_size: usize,
+    block: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let coord_values = coords.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let out = detach_py_result(py, "block_sparse_dictionary_lift_block", move || {
+        block_sparse_dictionary_lift_block(
+            coord_values.view(),
+            decoder_values.view(),
+            block_size,
+            block,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (x, decoder, gamma, block_size, block_topk, block, block_tile = 1024))]
+fn block_sparse_dictionary_project_residual_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    block: usize,
+    block_tile: usize,
+) -> PyResult<Py<PyArray2<f32>>> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let out = detach_py_result(py, "block_sparse_dictionary_project_residual", move || {
+        block_sparse_dictionary_project_residual(
+            x_values.view(),
+            decoder_values.view(),
+            gamma,
+            block_size,
+            block_topk,
+            block_tile,
+            block,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (blocks, n_blocks))]
+fn block_sparse_dictionary_firings_ffi<'py>(
+    py: Python<'py>,
+    blocks: PyReadonlyArray2<'py, u32>,
+    n_blocks: usize,
+) -> PyResult<Vec<usize>> {
+    let block_values = blocks.as_array().to_owned();
+    detach_py_result(py, "block_sparse_dictionary_firings", move || {
+        block_sparse_dictionary_firings(block_values.view(), n_blocks)
+    })
+}
+
+#[pyfunction(signature = (
+    x,
+    decoder,
+    blocks,
+    block_utilization,
+    block_stable_rank,
+    gamma,
+    block_size,
+    block_topk,
+    explained_variance,
+    residual_target = true,
+    n_basis_chart = 4,
+    include_bases = true,
+    name_prefix = "block"
+))]
+fn block_sparse_dictionary_seed_manifest_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    blocks: PyReadonlyArray2<'py, u32>,
+    block_utilization: PyReadonlyArray1<'py, f32>,
+    block_stable_rank: PyReadonlyArray1<'py, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    explained_variance: f64,
+    residual_target: bool,
+    n_basis_chart: usize,
+    include_bases: bool,
+    name_prefix: &str,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let block_values = blocks.as_array().to_owned();
+    let utilization = block_utilization.as_array().to_vec();
+    let stable_rank = block_stable_rank.as_array().to_vec();
+    let config = BlockSeedManifestConfig {
+        block_size,
+        block_topk,
+        gamma,
+        residual_target,
+        n_basis_chart,
+        include_bases,
+        name_prefix: name_prefix.to_string(),
+    };
+    let manifest = detach_py_result(py, "block_sparse_dictionary_seed_manifest", move || {
+        block_sparse_dictionary_seed_manifest(
+            x_values.view(),
+            decoder_values.view(),
+            block_values.view(),
+            &utilization,
+            &stable_rank,
+            explained_variance,
+            &config,
+        )
+    })?;
+    block_seed_manifest_to_py(py, &manifest)
+}
+
+#[pyfunction(signature = (
+    x,
+    decoder,
+    blocks,
+    codes,
+    gamma,
+    block_size,
+    block_topk,
+    residual_target = true,
+    min_firings = 64,
+    max_blocks = 256,
+    crossfit_folds = 2,
+    alpha = 0.10,
+    min_effect = 0.0,
+    whitening_ridge = 1.0e-8,
+    pair_screen = true,
+    pair_top_blocks = 64,
+    max_pairs = 128,
+    pair_min_cofirings = 64,
+    pair_min_score = 0.20
+))]
+fn block_coordinate_chart_compose_ffi<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    blocks: PyReadonlyArray2<'py, u32>,
+    codes: PyReadonlyArray3<'py, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    residual_target: bool,
+    min_firings: usize,
+    max_blocks: usize,
+    crossfit_folds: usize,
+    alpha: f64,
+    min_effect: f64,
+    whitening_ridge: f64,
+    pair_screen: bool,
+    pair_top_blocks: usize,
+    max_pairs: usize,
+    pair_min_cofirings: usize,
+    pair_min_score: f64,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let decoder_values = decoder.as_array().to_owned();
+    let block_values = blocks.as_array().to_owned();
+    let code_values = codes.as_array().to_owned();
+    let config = BlockChartComposeConfig {
+        block_size,
+        block_topk,
+        gamma,
+        residual_target,
+        min_firings,
+        max_blocks,
+        crossfit_folds,
+        alpha,
+        min_effect,
+        whitening_ridge,
+        pair_screen,
+        pair_top_blocks,
+        max_pairs,
+        pair_min_cofirings,
+        pair_min_score,
+    };
+    let result = detach_py_result(py, "block_coordinate_chart_compose", move || {
+        compose_block_coordinate_charts(
+            x_values.view(),
+            decoder_values.view(),
+            block_values.view(),
+            code_values.view(),
+            &config,
+        )
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("reconstructed", result.reconstructed.into_pyarray(py))?;
+    out.set_item("selected_blocks", result.selected_blocks)?;
+    out.set_item("accepted_blocks", result.accepted_blocks)?;
+    out.set_item("accepted_pairs", result.accepted_pairs)?;
+    out.set_item("blocks", chart_records_to_py(py, &result.block_records)?)?;
+    out.set_item("pairs", chart_records_to_py(py, &result.pair_records)?)?;
+    Ok(out.unbind())
+}
+
+fn chart_records_to_py(py: Python<'_>, records: &[BlockChartRecord]) -> PyResult<Py<PyList>> {
+    let rows = PyList::empty(py);
+    for record in records {
+        let e = &record.evidence;
+        let row = PyDict::new(py);
+        row.set_item("block0", record.block0)?;
+        row.set_item("block1", record.block1)?;
+        row.set_item("screen_score", record.screen_score)?;
+        row.set_item("n_rows", e.n_rows)?;
+        row.set_item("n_effective", e.n_effective)?;
+        row.set_item("linear_loss", e.linear_loss)?;
+        row.set_item("chart_loss", e.chart_loss)?;
+        row.set_item("deviance_gain", e.deviance_gain)?;
+        row.set_item("mean_delta", e.mean_delta)?;
+        row.set_item("sandwich_se", e.se)?;
+        row.set_item("ci_low", e.ci_low)?;
+        row.set_item("ci_high", e.ci_high)?;
+        row.set_item("charge", e.charge)?;
+        row.set_item("margin", e.margin)?;
+        row.set_item("log_e_value", e.log_e_value)?;
+        row.set_item("accepted_pre_ebh", e.accepted_pre_ebh)?;
+        row.set_item("accepted", e.accepted)?;
+        rows.append(row)?;
+    }
+    Ok(rows.unbind())
+}
+
+fn block_seed_manifest_to_py(py: Python<'_>, manifest: &BlockSeedManifest) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("schema", "block_seed_manifest.v1")?;
+    out.set_item("n_blocks", manifest.n_blocks)?;
+    out.set_item("block_size", manifest.block_size)?;
+    out.set_item("block_topk", manifest.block_topk)?;
+    out.set_item("ambient_p", manifest.ambient_p)?;
+    out.set_item("gamma", manifest.gamma)?;
+    out.set_item("explained_variance", manifest.explained_variance)?;
+    out.set_item("residual_target", manifest.residual_target)?;
+    out.set_item("n_basis_chart", manifest.n_basis_chart)?;
+    out.set_item(
+        "blocks",
+        block_seed_records_to_py(py, &manifest.blocks, false)?,
+    )?;
+    out.set_item(
+        "block_seeds",
+        block_seed_records_to_py(py, &manifest.blocks, true)?,
+    )?;
+    let featurizers = PyList::empty(py);
+    for record in &manifest.blocks {
+        featurizers.append(mdl_featurizer_to_py(py, &record.mdl_block)?)?;
+        featurizers.append(mdl_featurizer_to_py(py, &record.mdl_chart)?)?;
+    }
+    out.set_item("mdl_featurizers", featurizers)?;
+    Ok(out.unbind())
+}
+
+fn block_seed_records_to_py(
+    py: Python<'_>,
+    records: &[BlockSeedRecord],
+    include_mdl: bool,
+) -> PyResult<Py<PyList>> {
+    let rows = PyList::empty(py);
+    for record in records {
+        let row = PyDict::new(py);
+        row.set_item("block", record.block)?;
+        row.set_item("block_dim", record.block_dim)?;
+        row.set_item("n_firings", record.n_firings)?;
+        row.set_item("utilization", record.utilization)?;
+        row.set_item("stable_rank", record.stable_rank)?;
+        row.set_item("coded_var", record.coded_var.clone())?;
+        row.set_item("total_var", record.total_var)?;
+        row.set_item("block_linear_ev", record.block_linear_ev)?;
+        if let Some(basis) = &record.basis {
+            row.set_item("basis", basis.clone())?;
+        }
+        if include_mdl {
+            row.set_item("mdl_block", mdl_featurizer_to_py(py, &record.mdl_block)?)?;
+            row.set_item("mdl_chart", mdl_featurizer_to_py(py, &record.mdl_chart)?)?;
+        }
+        rows.append(row)?;
+    }
+    Ok(rows.unbind())
+}
+
+fn mdl_featurizer_to_py(py: Python<'_>, row: &MdlFeaturizerRow) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("name", &row.name)?;
+    out.set_item("kind", &row.kind)?;
+    out.set_item("total_var", row.total_var)?;
+    out.set_item("n_tokens", row.n_tokens)?;
+    out.set_item("n_firings", row.n_firings)?;
+    out.set_item("n_params", row.n_params)?;
+    out.set_item("coded_var", row.coded_var.clone())?;
+    out.set_item("g_dict", row.g_dict)?;
+    out.set_item("k_active", row.k_active)?;
+    if let Some(block_name) = &row.block_name {
+        out.set_item("block_name", block_name)?;
+    }
+    if let Some(chart_name) = &row.chart_name {
+        out.set_item("chart_name", chart_name)?;
+    }
+    Ok(out.unbind())
 }
 
 /// Streaming (partial-fit) handle for the collapsed linear lane: a native-side

@@ -48,7 +48,7 @@
 
 use super::scoring::TopSSelector;
 use crate::frames::GrassmannFrame;
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
 
 /// Shared (NOT per-block) hyper-parameters for the block-sparse lane. As in
@@ -1162,6 +1162,185 @@ pub fn block_sparse_dictionary_transform(
         }
     }
     Ok((blocks, gates, code_arr))
+}
+
+/// Dense reconstruction from fixed-width block routing.
+pub fn reconstruct_block_sparse_rows(
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    block_size: usize,
+) -> Result<Array2<f32>, String> {
+    let b = block_size;
+    if b == 0 {
+        return Err("reconstruct_block_sparse_rows: block_size must be >= 1".to_string());
+    }
+    if decoder.nrows() % b != 0 {
+        return Err(format!(
+            "reconstruct_block_sparse_rows: decoder rows {} not divisible by block_size {b}",
+            decoder.nrows()
+        ));
+    }
+    let (n, k) = blocks.dim();
+    if codes.shape() != [n, k, b] {
+        return Err(format!(
+            "reconstruct_block_sparse_rows: codes shape {:?} does not match ({n}, {k}, {b})",
+            codes.shape()
+        ));
+    }
+    let g = decoder.nrows() / b;
+    let p = decoder.ncols();
+    let mut out = Array2::<f32>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..k {
+            let block = blocks[[i, j]] as usize;
+            if block >= g {
+                return Err(format!(
+                    "reconstruct_block_sparse_rows: block index {block} out of range 0..{g}"
+                ));
+            }
+            for r in 0..b {
+                let code = codes[[i, j, r]];
+                if code == 0.0 {
+                    continue;
+                }
+                let atom = decoder.row(block * b + r);
+                for c in 0..p {
+                    out[[i, c]] += code * atom[c];
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Project rows into one block frame: `X D_g^T`.
+pub fn block_sparse_dictionary_block_coords(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    block_size: usize,
+    block: usize,
+) -> Result<Array2<f32>, String> {
+    let b = block_size;
+    if b == 0 {
+        return Err("block_sparse_dictionary_block_coords: block_size must be >= 1".to_string());
+    }
+    if decoder.nrows() % b != 0 {
+        return Err(format!(
+            "block_sparse_dictionary_block_coords: decoder rows {} not divisible by block_size {b}",
+            decoder.nrows()
+        ));
+    }
+    if x.ncols() != decoder.ncols() {
+        return Err(format!(
+            "block_sparse_dictionary_block_coords: X has P={} columns but decoder has P={}",
+            x.ncols(),
+            decoder.ncols()
+        ));
+    }
+    let g = decoder.nrows() / b;
+    if block >= g {
+        return Err(format!(
+            "block_sparse_dictionary_block_coords: block {block} out of range 0..{g}"
+        ));
+    }
+    let n = x.nrows();
+    let p = x.ncols();
+    let mut out = Array2::<f32>::zeros((n, b));
+    for i in 0..n {
+        for r in 0..b {
+            let atom = decoder.row(block * b + r);
+            let mut dot = 0.0f32;
+            for c in 0..p {
+                dot += x[[i, c]] * atom[c];
+            }
+            out[[i, r]] = dot;
+        }
+    }
+    Ok(out)
+}
+
+/// Lift block coordinates to ambient rows: `coords D_g`.
+pub fn block_sparse_dictionary_lift_block(
+    coords: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    block_size: usize,
+    block: usize,
+) -> Result<Array2<f32>, String> {
+    let b = block_size;
+    if b == 0 {
+        return Err("block_sparse_dictionary_lift_block: block_size must be >= 1".to_string());
+    }
+    if coords.ncols() != b {
+        return Err(format!(
+            "block_sparse_dictionary_lift_block: coords has {} columns, expected block_size {b}",
+            coords.ncols()
+        ));
+    }
+    if decoder.nrows() % b != 0 {
+        return Err(format!(
+            "block_sparse_dictionary_lift_block: decoder rows {} not divisible by block_size {b}",
+            decoder.nrows()
+        ));
+    }
+    let g = decoder.nrows() / b;
+    if block >= g {
+        return Err(format!(
+            "block_sparse_dictionary_lift_block: block {block} out of range 0..{g}"
+        ));
+    }
+    let n = coords.nrows();
+    let p = decoder.ncols();
+    let mut out = Array2::<f32>::zeros((n, p));
+    for i in 0..n {
+        for r in 0..b {
+            let code = coords[[i, r]];
+            if code == 0.0 {
+                continue;
+            }
+            let atom = decoder.row(block * b + r);
+            for c in 0..p {
+                out[[i, c]] += code * atom[c];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Leave-one-block-out residual target projected into block coordinates.
+pub fn block_sparse_dictionary_project_residual(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    block_size: usize,
+    block_topk: usize,
+    block_tile: usize,
+    block: usize,
+) -> Result<Array2<f32>, String> {
+    let (blocks, _gates, codes) =
+        block_sparse_dictionary_transform(x, decoder, gamma, block_size, block_topk, block_tile)?;
+    let xhat = reconstruct_block_sparse_rows(decoder, blocks.view(), codes.view(), block_size)?;
+    let mut residual = x.to_owned();
+    residual -= &xhat;
+    let b = block_size;
+    for i in 0..x.nrows() {
+        for j in 0..blocks.ncols() {
+            if blocks[[i, j]] as usize != block {
+                continue;
+            }
+            for r in 0..b {
+                let code = codes[[i, j, r]];
+                if code == 0.0 {
+                    continue;
+                }
+                let atom = decoder.row(block * b + r);
+                for c in 0..x.ncols() {
+                    residual[[i, c]] += code * atom[c];
+                }
+            }
+        }
+    }
+    block_sparse_dictionary_block_coords(residual.view(), decoder, block_size, block)
 }
 
 #[cfg(test)]

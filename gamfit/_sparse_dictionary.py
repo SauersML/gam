@@ -66,11 +66,9 @@ def _block_transform(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Block out-of-sample routing ``(blocks, gates, codes)`` for held-out rows.
 
-    Delegates to the Rust core (``block_sparse_dictionary_transform_ffi``) — the same
-    group-ℓ₂ gate + block-TopK + tied signed codes the trainer uses, so held-out
-    encoding is bit-consistent with training (SPEC rule 8, python-thin). Falls back
-    to an equivalent numpy path ONLY when the compiled extension predates the symbol
-    or is unavailable (stale-build tolerance); the two agree up to f32 rounding.
+    Delegates to the Rust core (``block_sparse_dictionary_transform_ffi``) — the
+    same group-ℓ₂ gate + block-TopK + tied signed codes the trainer uses, so
+    held-out encoding is bit-consistent with training.
     """
     x = _as_2d_f32(X, "X")
     p = decoder.shape[1]
@@ -79,37 +77,18 @@ def _block_transform(
     b = int(block_size)
     g_blocks = decoder.shape[0] // b
     k = max(1, min(int(block_topk), g_blocks))
-    fn = None
-    try:
-        fn = getattr(rust_module(), "block_sparse_dictionary_transform_ffi", None)
-    except Exception:
-        fn = None  # extension unavailable -> pure-numpy fallback below
-    if fn is not None:
-        blocks, gates, codes = fn(
-            np.ascontiguousarray(x, dtype=np.float32),
-            np.ascontiguousarray(decoder, dtype=np.float32),
-            float(gamma),
-            int(b),
-            int(k),
-            int(block_tile),
-        )
-        return (
-            np.ascontiguousarray(blocks),
-            np.ascontiguousarray(gates),
-            np.ascontiguousarray(codes),
-        )
-    # ---- numpy fallback (documented equivalent; used only on a stale/absent ext) --
-    w = (x @ decoder.T).reshape(x.shape[0], g_blocks, b)  # M x G x b tied projections
-    gate = np.linalg.norm(w, axis=2)  # M x G  (γ-free routing gate)
-    order = np.argsort(-gate, axis=1, kind="stable")[:, :k]  # M x k block-TopK
-    rows = np.arange(x.shape[0])[:, None]
-    blocks = order.astype(np.uint32)
-    gates = float(abs(gamma)) * gate[rows, order]  # M x k presence ‖z_g‖
-    codes = float(gamma) * w[rows, order, :]  # M x k x b signed amplitude
+    blocks, gates, codes = rust_module().block_sparse_dictionary_transform_ffi(
+        np.ascontiguousarray(x, dtype=np.float32),
+        np.ascontiguousarray(decoder, dtype=np.float32),
+        float(gamma),
+        int(b),
+        int(k),
+        int(block_tile),
+    )
     return (
         np.ascontiguousarray(blocks),
-        np.ascontiguousarray(gates.astype(np.float32)),
-        np.ascontiguousarray(codes.astype(np.float32)),
+        np.ascontiguousarray(gates),
+        np.ascontiguousarray(codes),
     )
 
 
@@ -162,12 +141,14 @@ class SparseDictionaryFit:
         cod = self.codes if codes is None else np.asarray(codes, dtype=np.float32)
         if idx.shape != cod.shape:
             raise ValueError(f"indices {idx.shape} and codes {cod.shape} must match")
-        n, s = idx.shape
-        p = self.decoder.shape[1]
-        out = np.zeros((n, p), dtype=np.float32)
-        for j in range(s):
-            out += cod[:, [j]] * self.decoder[idx[:, j]]
-        return np.ascontiguousarray(out)
+        return np.ascontiguousarray(
+            rust_module().sparse_dictionary_reconstruct_ffi(
+                self.decoder,
+                np.ascontiguousarray(idx, dtype=np.uint32),
+                np.ascontiguousarray(cod, dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
 
     def transform(
         self, X: Any, active: int | None = None, *, score_mode: str = "required"
@@ -440,16 +421,15 @@ class BlockSparseDictionaryFit:
     def reconstruct(self) -> np.ndarray:
         """Dense ``N x P`` reconstruction from the stored block routing
         (``x̂_i = Σ_g z_{ig} D_g``)."""
-        n = self.blocks.shape[0]
-        p = self.decoder.shape[1]
-        b = self.block_size
-        out = np.zeros((n, p), dtype=np.float32)
-        for j in range(self.block_topk):
-            g = self.blocks[:, j].astype(np.int64)  # N
-            for r in range(b):
-                atoms = self.decoder[g * b + r]  # N x P
-                out += self.codes[:, j, r][:, None] * atoms
-        return np.ascontiguousarray(out)
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_reconstruct_ffi(
+                self.decoder,
+                self.blocks,
+                self.codes,
+                int(self.block_size),
+            ),
+            dtype=np.float32,
+        )
 
     def transform(
         self, X: Any, block_topk: int | None = None
@@ -460,8 +440,8 @@ class BlockSparseDictionaryFit:
         ``M x k x b`` — the same block-TopK routing (by group ℓ₂ gate) and tied
         signed codes ``z_g = γ x D_gᵀ`` the trainer uses, against the frozen
         frames. Pure block routing (no least-squares), so it is exactly the
-        encoder the fit learned. ``k`` defaults to the fitted ``block_topk``.
-        Delegates to the Rust core (numpy fallback on a stale/absent extension).
+        encoder the fit learned. ``k`` defaults to the fitted ``block_topk`` and
+        delegates to the Rust core.
         """
         k = self.block_topk if block_topk is None else int(block_topk)
         return _block_transform(self.decoder, self.gamma, self.block_size, k, X)
@@ -490,7 +470,15 @@ class BlockSparseDictionaryFit:
         row onto block ``g``'s subspace — the direct nursery coordinate ``Z``
         (before any residual bookkeeping). Deterministic, no routing."""
         x = _as_2d_f32(X, "X")
-        return np.ascontiguousarray(x @ self.block_frame(g).T)
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_block_coords_ffi(
+                x,
+                self.decoder,
+                int(self.block_size),
+                int(g),
+            ),
+            dtype=np.float32,
+        )
 
     def lift_block(self, coords: Any, g: int) -> np.ndarray:
         """Lift ``M x b`` in-block coordinates back to ambient ``M x P`` via the
@@ -501,20 +489,28 @@ class BlockSparseDictionaryFit:
             raise ValueError(
                 f"coords must be M x b (b={self.block_size}); got {c.shape}"
             )
-        return np.ascontiguousarray(c @ self.block_frame(g))
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_lift_block_ffi(
+                c,
+                self.decoder,
+                int(self.block_size),
+                int(g),
+            ),
+            dtype=np.float32,
+        )
 
     def _reconstruct_from(self, blocks: np.ndarray, codes: np.ndarray) -> np.ndarray:
         """Dense ``M x P`` reconstruction from an arbitrary ``(blocks, codes)``
         routing (``M x k`` / ``M x k x b``)."""
-        n = blocks.shape[0]
-        p = self.decoder.shape[1]
-        b = self.block_size
-        out = np.zeros((n, p), dtype=np.float32)
-        for j in range(blocks.shape[1]):
-            g = blocks[:, j].astype(np.int64)
-            for r in range(b):
-                out += codes[:, j, r][:, None] * self.decoder[g * b + r]
-        return out
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_reconstruct_ffi(
+                self.decoder,
+                np.ascontiguousarray(blocks, dtype=np.uint32),
+                np.ascontiguousarray(codes, dtype=np.float32),
+                int(self.block_size),
+            ),
+            dtype=np.float32,
+        )
 
     def project_residual(self, X: Any, g: int) -> np.ndarray:
         """Residual-excluding-block-``g`` projected into block ``g``'s coordinates
@@ -527,28 +523,30 @@ class BlockSparseDictionaryFit:
         (the same ``r_{ig}`` the Rust frame refresh forms), and — unlike the direct
         :meth:`block_coords` — it is meaningful even when blocks share span."""
         x = _as_2d_f32(X, "X")
-        b = self.block_size
-        dg = self.block_frame(g)  # b x P
-        blocks, _gates, codes = self.transform(x)
-        xhat = self._reconstruct_from(blocks, codes)
-        resid = x - xhat
-        # Add block g's own contribution back wherever g was selected.
-        sel = blocks == np.uint32(g)  # M x k
-        for j in range(blocks.shape[1]):
-            mask = sel[:, j]
-            if mask.any():
-                resid[mask] += codes[mask, j, :] @ dg
-        return np.ascontiguousarray(resid @ dg.T)
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_project_residual_ffi(
+                x,
+                self.decoder,
+                float(self.gamma),
+                int(self.block_size),
+                int(self.block_topk),
+                int(g),
+            ),
+            dtype=np.float32,
+        )
 
     def block_firings(self, X: Any) -> np.ndarray:
         """Per-block firing counts on ``X`` (``G``-vector): how many rows route to
         each block under the frozen frames. ``n_firings`` for the MDL scorer."""
         x = _as_2d_f32(X, "X")
         blocks, _gates, _codes = self.transform(x)
-        counts = np.zeros(self.n_blocks, dtype=np.int64)
-        vals, n = np.unique(blocks, return_counts=True)
-        counts[vals.astype(np.int64)] = n
-        return counts
+        return np.ascontiguousarray(
+            rust_module().block_sparse_dictionary_firings_ffi(
+                np.ascontiguousarray(blocks, dtype=np.uint32),
+                int(self.n_blocks),
+            ),
+            dtype=np.int64,
+        )
 
     def block_seeds(
         self,
@@ -573,71 +571,14 @@ class BlockSparseDictionaryFit:
         coordinate space (the shared lift ``Q`` cancels in the block-vs-chart
         crossover), matching how block_nursery scores each block.
         """
-        x = _as_2d_f32(X, "X")
-        n_tokens = x.shape[0]
-        p = self.decoder.shape[1]
-        b = self.block_size
-        firings = self.block_firings(x)
-        # Total ambient variance (denominator for each block's linear EV).
-        xc = x - x.mean(axis=0, keepdims=True)
-        ambient_var = float((xc**2).sum()) or 1.0
-        seeds: list[dict] = []
-        for g in range(self.n_blocks):
-            coords = (
-                self.project_residual(x, g) if residual_target else self.block_coords(x, g)
-            )
-            cc = coords - coords.mean(axis=0, keepdims=True)
-            # Per-intrinsic-coordinate signal variances = eigenvalues of the b x b
-            # coordinate covariance (a gauge invariant of the block code).
-            cov = (cc.T @ cc) / max(cc.shape[0], 1)
-            eig = np.linalg.eigvalsh(cov.astype(np.float64))
-            coded_var = np.sort(np.clip(eig, 0.0, None))[::-1]
-            total_var = float(coded_var.sum())
-            # Linear EV this block captures of the ambient (its projector's energy).
-            block_ev = float((cc**2).sum() / ambient_var)
-            f = int(firings[g])
-            base = f"{name_prefix}{g}"
-            mdl_block = {
-                "name": f"{base}-linear-{b}d",
-                "kind": "block",
-                "total_var": max(total_var, 1e-12),
-                "n_tokens": int(n_tokens),
-                "n_firings": max(f, 1),
-                "n_params": b * p,
-                "coded_var": [float(v) for v in coded_var],
-                "g_dict": int(self.n_blocks),
-                "k_active": int(self.block_topk),
-            }
-            mdl_chart = {
-                "name": f"{base}-circle-chart",
-                "kind": "chart",
-                "total_var": max(total_var, 1e-12),
-                "n_tokens": int(n_tokens),
-                "n_firings": max(f, 1),
-                "n_params": int(n_basis_chart) * p,
-                # A single intrinsic (angular) coordinate carries the block's signal
-                # variance; ev split across the 1 coord = total captured.
-                "coded_var": [max(total_var, 1e-12)],
-                "g_dict": int(self.n_blocks),
-                "k_active": int(self.block_topk),
-                "block_name": f"{base}-linear-{b}d",
-                "chart_name": f"{base}-circle-chart",
-            }
-            seeds.append(
-                {
-                    "block": g,
-                    "block_dim": b,
-                    "n_firings": f,
-                    "utilization": float(self.block_utilization[g]),
-                    "stable_rank": float(self.block_stable_rank[g]),
-                    "coded_var": [float(v) for v in coded_var],
-                    "total_var": total_var,
-                    "block_linear_ev": block_ev,
-                    "mdl_block": mdl_block,
-                    "mdl_chart": mdl_chart,
-                }
-            )
-        return seeds
+        manifest = self.seed_manifest(
+            X,
+            n_basis_chart=n_basis_chart,
+            residual_target=residual_target,
+            include_bases=False,
+            name_prefix=name_prefix,
+        )
+        return list(manifest["block_seeds"])
 
     def seed_manifest(
         self,
@@ -646,6 +587,7 @@ class BlockSparseDictionaryFit:
         n_basis_chart: int = 4,
         residual_target: bool = True,
         include_bases: bool = True,
+        name_prefix: str = "block",
     ) -> dict:
         """A JSON-serialisable Tier-1 -> Tier-2 hand-off manifest: per-block basis,
         coordinate statistics, firing counts, and MDL featurizer rows, plus a flat
@@ -656,34 +598,72 @@ class BlockSparseDictionaryFit:
         alongside); this manifest carries only the (p x b) bases + scalar stats so
         it stays a compact, human-readable JSON. Mirrors the block->chart hand-off
         block_nursery consumes (basis ``Q``, in-block coords, per-block stats)."""
-        seeds = self.block_seeds(
-            X, n_basis_chart=n_basis_chart, residual_target=residual_target
+        x = _as_2d_f32(X, "X")
+        return dict(
+            rust_module().block_sparse_dictionary_seed_manifest_ffi(
+                x,
+                self.decoder,
+                self.blocks,
+                self.block_utilization,
+                self.block_stable_rank,
+                float(self.gamma),
+                int(self.block_size),
+                int(self.block_topk),
+                float(self.explained_variance),
+                residual_target=bool(residual_target),
+                n_basis_chart=int(n_basis_chart),
+                include_bases=bool(include_bases),
+                name_prefix=str(name_prefix),
+            )
         )
-        b = self.block_size
-        blocks_out = []
-        featurizers = []
-        for s in seeds:
-            g = s["block"]
-            entry = {k: v for k, v in s.items() if k not in ("mdl_block", "mdl_chart")}
-            if include_bases:
-                # (p, b) column-orthonormal basis Q = D_gᵀ (nursery convention).
-                entry["basis"] = self.block_frame(g).T.tolist()
-            blocks_out.append(entry)
-            featurizers.append(s["mdl_block"])
-            featurizers.append(s["mdl_chart"])
-        return {
-            "schema": "block_seed_manifest.v1",
-            "n_blocks": int(self.n_blocks),
-            "block_size": int(b),
-            "block_topk": int(self.block_topk),
-            "ambient_p": int(self.decoder.shape[1]),
-            "gamma": float(self.gamma),
-            "explained_variance": float(self.explained_variance),
-            "residual_target": bool(residual_target),
-            "n_basis_chart": int(n_basis_chart),
-            "blocks": blocks_out,
-            "mdl_featurizers": featurizers,
-        }
+
+    def compose_block_charts(
+        self,
+        X: Any,
+        *,
+        residual_target: bool = True,
+        min_firings: int = 64,
+        max_blocks: int = 256,
+        crossfit_folds: int = 2,
+        alpha: float = 0.10,
+        min_effect: float = 0.0,
+        whitening_ridge: float = 1.0e-8,
+        pair_screen: bool = True,
+        pair_top_blocks: int = 64,
+        max_pairs: int = 128,
+        pair_min_cofirings: int = 64,
+        pair_min_score: float = 0.20,
+    ) -> dict[str, Any]:
+        """Compose Rust-owned block-coordinate charts over this T1 dictionary.
+
+        Python only marshals arrays and configuration. Projection, whitening,
+        held-out evidence, e-BH selection, pair screening, and reconstruction are
+        computed by the Rust core.
+        """
+        x = _as_2d_f32(X, "X")
+        return dict(
+            rust_module().block_coordinate_chart_compose_ffi(
+                x,
+                self.decoder,
+                self.blocks,
+                self.codes,
+                float(self.gamma),
+                int(self.block_size),
+                int(self.block_topk),
+                residual_target=bool(residual_target),
+                min_firings=int(min_firings),
+                max_blocks=int(max_blocks),
+                crossfit_folds=int(crossfit_folds),
+                alpha=float(alpha),
+                min_effect=float(min_effect),
+                whitening_ridge=float(whitening_ridge),
+                pair_screen=bool(pair_screen),
+                pair_top_blocks=int(pair_top_blocks),
+                max_pairs=int(max_pairs),
+                pair_min_cofirings=int(pair_min_cofirings),
+                pair_min_score=float(pair_min_score),
+            )
+        )
 
 
 def block_sparse_dictionary_fit(
@@ -813,7 +793,7 @@ class BlockSparseStreamArtifact:
         """Route held-out rows ``X`` (``M x P``) through the fitted block frames,
         returning ``(blocks, gates, codes)`` — the same block-TopK routing + tied
         signed codes the trainer uses, against the frozen frames. Delegates to the
-        Rust core (numpy fallback on a stale/absent extension)."""
+        Rust core."""
         k = self.block_topk if block_topk is None else int(block_topk)
         return _block_transform(self.decoder, self.gamma, self.block_size, k, X)
 
@@ -827,12 +807,12 @@ class BlockSparseStreamArtifact:
         x = _as_2d_f32(X, "X")
         blocks, gates, codes = self.transform(x)
         b = self.block_size
-        p = self.decoder.shape[1]
-        fitted = np.zeros((x.shape[0], p), dtype=np.float32)
-        for j in range(self.block_topk):
-            gg = blocks[:, j].astype(np.int64)
-            for r in range(b):
-                fitted += codes[:, j, r][:, None] * self.decoder[gg * b + r]
+        fitted = rust_module().block_sparse_dictionary_reconstruct_ffi(
+            self.decoder,
+            np.ascontiguousarray(blocks, dtype=np.uint32),
+            np.ascontiguousarray(codes, dtype=np.float32),
+            int(b),
+        )
         return BlockSparseDictionaryFit(
             decoder=np.ascontiguousarray(self.decoder, dtype=np.float32),
             blocks=blocks,

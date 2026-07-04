@@ -27,6 +27,7 @@
 //! [`fit_sparse_dictionary`] (and the `gamfit` Python facade that wraps it).
 
 mod block;
+mod block_chart;
 mod block_stream;
 mod codes;
 mod scoring;
@@ -40,8 +41,16 @@ mod tests;
 
 pub use block::{
     BlockSparseConfig, BlockSparseFit, block_gates, block_projections_row,
-    block_sparse_dictionary_transform, fit_block_sparse_dictionary, reconstruct_row,
-    route_row_blocks, row_loss,
+    block_sparse_dictionary_block_coords, block_sparse_dictionary_lift_block,
+    block_sparse_dictionary_project_residual, block_sparse_dictionary_transform,
+    fit_block_sparse_dictionary, reconstruct_block_sparse_rows, reconstruct_row, route_row_blocks,
+    row_loss,
+};
+pub use block_chart::{
+    BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,
+    BlockSeedManifestConfig, BlockSeedRecord, ChartEvidence, MdlFeaturizerRow,
+    block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest,
+    compose_block_coordinate_charts,
 };
 pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
@@ -152,24 +161,46 @@ impl SparseDictFit {
     /// This *does* allocate an `N×P` array (the data size, not `N×K`); it exists
     /// for diagnostics / EV checks, not as part of the trainer's hot loop.
     pub fn reconstruct(&self) -> Array2<f32> {
-        let n = self.indices.nrows();
-        let p = self.decoder.ncols();
-        let mut out = Array2::<f32>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..self.active {
-                let atom = self.indices[[i, j]] as usize;
-                let code = self.codes[[i, j]];
-                if code == 0.0 {
-                    continue;
-                }
-                let row = self.decoder.row(atom);
-                for c in 0..p {
-                    out[[i, c]] += code * row[c];
-                }
+        reconstruct_sparse_rows(self.decoder.view(), self.indices.view(), self.codes.view())
+            .expect("SparseDictFit stores internally validated routing")
+    }
+}
+
+pub fn reconstruct_sparse_rows(
+    decoder: ArrayView2<'_, f32>,
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+) -> Result<Array2<f32>, String> {
+    if indices.dim() != codes.dim() {
+        return Err(format!(
+            "reconstruct_sparse_rows: indices shape {:?} does not match codes shape {:?}",
+            indices.dim(),
+            codes.dim()
+        ));
+    }
+    let n = indices.nrows();
+    let p = decoder.ncols();
+    let mut out = Array2::<f32>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..indices.ncols() {
+            let atom = indices[[i, j]] as usize;
+            if atom >= decoder.nrows() {
+                return Err(format!(
+                    "reconstruct_sparse_rows: atom index {atom} out of range 0..{}",
+                    decoder.nrows()
+                ));
+            }
+            let code = codes[[i, j]];
+            if code == 0.0 {
+                continue;
+            }
+            let row = decoder.row(atom);
+            for c in 0..p {
+                out[[i, c]] += code * row[c];
             }
         }
-        out
     }
+    Ok(out)
 }
 
 /// Out-of-sample sparse-dictionary encode plus route-dispatch diagnostics.
