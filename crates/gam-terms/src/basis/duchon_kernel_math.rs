@@ -308,7 +308,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     })
 }
 
-fn polynomial_derivative_block(
+pub(crate) fn polynomial_derivative_block(
     points: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
     derivative_order: usize,

@@ -2006,6 +2006,43 @@ pub fn build_duchon_operator_penalty_psi_derivatives(
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw);
     d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_raw);
     d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_raw);
+    // Fill the polynomial null-space columns of the operator design exactly as the
+    // value-side `build_duchon_collocation_operator_matrices` does: the monomial
+    // value (D0), gradient (D1), and Hessian (D2) evaluated at the collocation
+    // sites. The operator penalties (mass `Σ(f−f̄)²`, tension `Σ‖∇f‖²`, stiffness
+    // `Σ‖∇²f‖²`) penalize the WHOLE function, whose polynomial trend block is part
+    // of the collocation Gram `S = DᵀD` — leaving these columns at zero silently
+    // dropped the trend block from the derivative-side penalty. The polynomial
+    // block is κ-independent, so its ψ-derivative columns stay zero; but its
+    // presence in `D` (not `D_ψ`) is precisely the kernel↔trend cross term
+    // `D_ψᵀ P + Pᵀ D_ψ` that the analytic `S_ψ = D_ψᵀ D + Dᵀ D_ψ` was missing.
+    // Without it the analytic operator-penalty log-κ gradient disagreed with a
+    // central finite difference of the rebuilt penalty (the native Primary Gram
+    // was correct because it genuinely leaves the polynomial null space
+    // unpenalized).
+    if poly_cols > 0 {
+        d0.slice_mut(s![.., kernel_cols..total_cols])
+            .assign(&polynomial_block_from_order(
+                collocation_points,
+                effective_nullspace_order,
+            ));
+        if need_d1 {
+            d1.slice_mut(s![.., kernel_cols..total_cols])
+                .assign(&polynomial_derivative_block(
+                    collocation_points,
+                    effective_nullspace_order,
+                    1,
+                ));
+        }
+        if need_d2 {
+            d2.slice_mut(s![.., kernel_cols..total_cols])
+                .assign(&polynomial_derivative_block(
+                    collocation_points,
+                    effective_nullspace_order,
+                    2,
+                ));
+        }
+    }
     d0_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d0_raw_psi);
     d1_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d1_raw_psi);
     d2_psi.slice_mut(s![.., 0..kernel_cols]).assign(&d2_raw_psi);
