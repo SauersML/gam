@@ -373,6 +373,208 @@ impl SparseAtomCodes {
         // bound.
         rho.clamp(-1.0, 1.0)
     }
+
+    /// Empirical per-token support-entropy estimate `H(S)` of the binary support
+    /// process, in BITS, together with the references it must be read against.
+    ///
+    /// The MDL *selection* price names, per token, WHICH atoms fired. The uniform
+    /// (combinatorial) price `log₂ C(G, k)` assumes every `k`-subset is equally
+    /// likely — it is the WORST case, and it grossly OVERPAYS a dictionary whose
+    /// co-firing supports are predictable (a tiling SAE where adjacent atoms fire
+    /// together): charging that worst case would let an MDL comparison argue with
+    /// itself. The honest currency is the entropy of the EMPIRICAL support
+    /// distribution `H(S) = −Σ_s p(s) log₂ p(s)` over the observed supports
+    /// `s ⊆ {0,…,G−1}`. `H(S)` cannot be read off directly (the support space is
+    /// exponential and each token is one sample), so it is priced by the
+    /// achievable code length of a LOW-ORDER model of the binary support process
+    /// fit to the data — no magic constants, only empirical marginals and
+    /// pairwise co-occurrence counts:
+    ///
+    /// * [`SupportEntropy::independent_bits`] — the first-order
+    ///   (product-of-marginals) model `Σ_g h(π_g)`, with `π_g = P(x_g = 1)` the
+    ///   atom's empirical firing rate and `h` the binary entropy. It charges each
+    ///   atom its own on/off entropy and nothing for co-firing — the price if
+    ///   atoms fired independently.
+    /// * [`SupportEntropy::tree_bits`] — the second-order Chow–Liu model: the
+    ///   maximum-likelihood tree-structured distribution `q` whose node and edge
+    ///   marginals match the data. Its per-token code length is
+    ///   `Σ_g h(π_g) − Σ_{(u,v)∈T} I(x_u; x_v)`, where `T` is the maximum-weight
+    ///   spanning tree under pairwise mutual information `I(u,v)` (Chow & Liu,
+    ///   1968). Because `q`'s sufficient statistics match the data exactly,
+    ///   `−E_data[log₂ q] = H(q)` equals that expression, so it is a genuine
+    ///   ACHIEVABLE per-token code length; every `I(u,v) ≥ 0` gives
+    ///   `tree_bits ≤ independent_bits`, and being an achievable code it also
+    ///   bounds the truth from above, `tree_bits ≥ H(S)`. This is the DEFAULT
+    ///   selection currency: predictable adjacent-atom co-firing is charged at its
+    ///   true (low) rate.
+    /// * [`SupportEntropy::combinatorial_bits`] — `log₂ C(G, k̄)` at the mean
+    ///   support size `k̄`, the uniform-support worst case, reported alongside so
+    ///   the combinatorial bound the currency replaces is always visible.
+    pub fn support_entropy(&self) -> SupportEntropy {
+        let n = self.n_obs();
+        let g = self.k_atoms();
+        if n == 0 || g == 0 {
+            return SupportEntropy {
+                tree_bits: 0.0,
+                independent_bits: 0.0,
+                combinatorial_bits: 0.0,
+                mean_support: 0.0,
+            };
+        }
+
+        // Marginal firing counts and pairwise co-occurrence counts, in ONE
+        // streaming pass over the active-support masks. Only the (small) active
+        // set of each row contributes to the pairwise counts, so the cost is
+        // `Σ_row |S_row|²` — cheap for the sparse SAE codes this consumes.
+        let mut marg = vec![0.0_f64; g];
+        let mut co = vec![0.0_f64; g * g]; // symmetric; upper triangle used
+        let mut total_active = 0.0_f64;
+        for code in &self.codes {
+            let active: Vec<usize> = code.active_mask.iter_ones().collect();
+            total_active += active.len() as f64;
+            for (idx, &u) in active.iter().enumerate() {
+                marg[u] += 1.0;
+                for &v in &active[idx + 1..] {
+                    co[u * g + v] += 1.0;
+                }
+            }
+        }
+
+        let nn = n as f64;
+        let independent_bits: f64 = marg.iter().map(|&c| binary_entropy_bits(c / nn)).sum();
+
+        // Maximum-weight (mutual-information) spanning tree by Prim over the dense
+        // pairwise-MI graph. `best_mi[v]` is the largest MI connecting an
+        // out-of-tree node `v` to the current tree; grow the tree by the
+        // out-of-tree node of largest such MI, accumulating its edge weight.
+        let mi = |u: usize, v: usize| -> f64 {
+            let (a, b) = if u < v { (u, v) } else { (v, u) };
+            mutual_information_bits(nn, marg[a], marg[b], co[a * g + b])
+        };
+        let mut in_tree = vec![false; g];
+        let mut best_mi = vec![f64::NEG_INFINITY; g];
+        in_tree[0] = true;
+        for v in 1..g {
+            best_mi[v] = mi(0, v);
+        }
+        let mut tree_mi_sum = 0.0_f64;
+        for _ in 1..g {
+            // Pick the out-of-tree node joined to the tree by the strongest edge.
+            let mut pick = usize::MAX;
+            let mut pick_w = f64::NEG_INFINITY;
+            for v in 0..g {
+                if !in_tree[v] && best_mi[v] > pick_w {
+                    pick_w = best_mi[v];
+                    pick = v;
+                }
+            }
+            if pick == usize::MAX {
+                break;
+            }
+            in_tree[pick] = true;
+            tree_mi_sum += pick_w.max(0.0);
+            for v in 0..g {
+                if !in_tree[v] {
+                    let w = mi(pick, v);
+                    if w > best_mi[v] {
+                        best_mi[v] = w;
+                    }
+                }
+            }
+        }
+
+        // `tree_bits = Σ h(π_g) − Σ_tree I`, clamped into `[0, independent_bits]`
+        // against floating-point drift (MI can carry a hair of negative noise, and
+        // rounding must never report a negative or super-independent code length).
+        let tree_bits = (independent_bits - tree_mi_sum).clamp(0.0, independent_bits);
+
+        let mean_support = total_active / nn;
+        // Combinatorial worst case at the mean support size (rounded to the
+        // nearest whole active-atom count the `log₂ C(G, k)` bound is defined on).
+        let k_bar = mean_support.round().max(0.0) as i64;
+        let combinatorial_bits = log2_binom(g as i64, k_bar);
+
+        SupportEntropy {
+            tree_bits,
+            independent_bits,
+            combinatorial_bits,
+            mean_support,
+        }
+    }
+}
+
+/// The empirical per-token support-entropy estimate produced by
+/// [`SparseAtomCodes::support_entropy`], with the two references (independent
+/// model and combinatorial worst case) it is read against. All fields are BITS
+/// per token except [`Self::mean_support`]. See the method for the derivation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SupportEntropy {
+    /// Chow–Liu tree-model per-token support entropy in bits — the DEFAULT MDL
+    /// selection currency. `Σ_g h(π_g) − Σ_{tree} I(u,v)`. Satisfies
+    /// `H(S) ≤ tree_bits ≤ independent_bits`.
+    pub tree_bits: f64,
+    /// First-order (independent-atom) per-token support entropy `Σ_g h(π_g)` in
+    /// bits — the tree model with no edges; an upper bound on [`Self::tree_bits`].
+    pub independent_bits: f64,
+    /// `log₂ C(G, k̄)` at the mean support size — the uniform-support worst-case
+    /// per-token selection price, reported alongside the currency it replaces.
+    pub combinatorial_bits: f64,
+    /// Mean support size `k̄` (mean number of active atoms per token).
+    pub mean_support: f64,
+}
+
+/// Binary entropy `h(p) = −p log₂ p − (1−p) log₂(1−p)` in bits. Zero at the
+/// boundaries (`p ≤ 0` or `p ≥ 1`) where a term is `0 · log 0 ≡ 0`.
+fn binary_entropy_bits(p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        return 0.0;
+    }
+    -p * p.log2() - (1.0 - p) * (1.0 - p).log2()
+}
+
+/// Pairwise mutual information `I(x_u; x_v)` in bits of two binary indicators,
+/// from the `2×2` empirical joint implied by the counts `n` (rows), `n_u`, `n_v`
+/// (marginals), and `n_uv` (joint). Non-negative up to floating-point noise; the
+/// `0 · log 0` cells are dropped.
+fn mutual_information_bits(n: f64, n_u: f64, n_v: f64, n_uv: f64) -> f64 {
+    if n <= 0.0 {
+        return 0.0;
+    }
+    let p1x = n_u / n;
+    let px1 = n_v / n;
+    let p11 = n_uv / n;
+    let p10 = (p1x - p11).max(0.0);
+    let p01 = (px1 - p11).max(0.0);
+    let p00 = (1.0 - p11 - p10 - p01).max(0.0);
+    let cell = |p: f64, pa: f64, pb: f64| -> f64 {
+        if p > 0.0 && pa > 0.0 && pb > 0.0 {
+            p * (p / (pa * pb)).log2()
+        } else {
+            0.0
+        }
+    };
+    let mi = cell(p11, p1x, px1)
+        + cell(p10, p1x, 1.0 - px1)
+        + cell(p01, 1.0 - p1x, px1)
+        + cell(p00, 1.0 - p1x, 1.0 - px1);
+    mi.max(0.0)
+}
+
+/// `log₂ C(g, k)`: bits to name which `k` of `g` atoms fired under the uniform
+/// support prior. Computed as `Σ_{i=1..k} log₂((g−k+i)/i)` so it never overflows
+/// a binomial. Zero when `g ≤ 0` or `k ≤ 0`; `k` is capped at `g`. (The same
+/// combinatorial bound [`crate::description_length::selection_bits`] reports; kept
+/// local so the support-entropy estimator stays self-contained.)
+fn log2_binom(g: i64, k: i64) -> f64 {
+    if g <= 0 || k <= 0 {
+        return 0.0;
+    }
+    let k = k.min(g);
+    let mut bits = 0.0;
+    for i in 1..=k {
+        bits += ((g - k + i) as f64 / i as f64).log2();
+    }
+    bits
 }
 
 /// Pairwise co-activation summary for two atoms (see

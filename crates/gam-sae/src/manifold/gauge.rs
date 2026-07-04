@@ -756,10 +756,420 @@ impl SaeManifoldTerm {
     }
 }
 
+// ===========================================================================
+// F1 — amplitude-concentration certificate (the "intensity is presence vs a
+// hidden radial coordinate" law).
+//
+// The scale/intensity/existence quotient above splits an atom's magnitude into
+// the unit-Frobenius decoder shape, the explicit log-amplitude `s_k`, and the
+// gate. What it does NOT certify is the SHAPE of an atom's realized amplitude
+// distribution ACROSS the samples it fires on. Two regimes are observationally
+// distinct and carry opposite structural verdicts:
+//
+//   * **Spike-at-saturation** — the realized amplitude piles at the two ends of
+//     its range (near 0 = absent, near its saturation = present). This is a
+//     genuine binary presence coordinate; the gate is honest and the atom's
+//     latent dimension is what the chart says it is (a `circle` stays a circle).
+//   * **Continuous** — the amplitude spreads unimodally across the interior of
+//     its range. Intensity is then not presence but a hidden RADIAL latent axis:
+//     the atom is really a disk / annulus (`S¹ × ℝ_radius`), and `d_atom` is
+//     understated by one. `steer_delta`'s predicted nats scale with `a²`, so a
+//     dosimetry claim rides on this uncertified quantity unless the radial axis
+//     is promoted to an explicit coordinate and raced (circle vs cylinder-radial
+//     vs disk).
+//
+// The certificate is an EVIDENCE decision, not a tuned threshold. Normalise the
+// realized amplitudes to their saturation `r = a / max(a) ∈ (0, 1)` and fit a
+// Beta(α, β) by maximum likelihood. The Beta family's own analytic mode-count
+// transition IS the decision boundary: `Beta(α, β)` is U-shaped (density → ∞ at
+// BOTH endpoints, an interior minimum — mass at absent AND saturated) exactly
+// when `α < 1 AND β < 1`, and is unimodal / monotone (mass in the interior — a
+// radial spread) otherwise. The boundary `α = β = 1` is the uniform density, the
+// analytic shape-transition of the family, so "spike vs continuous" is read off
+// the fitted shape with no magic constant. A disk's area-uniform radius has
+// density `∝ r = Beta(2, 1)` (α > 1 ⇒ Continuous), and a present/absent atom
+// collapses onto both endpoints (α, β < 1 ⇒ SpikeAtSaturation) — both verdicts
+// fall out of the family analytically.
+// ===========================================================================
+
+/// The certified verdict on one atom's realized amplitude-concentration law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmplitudeConcentration {
+    /// The realized amplitude is bimodal at the ends of its range (present /
+    /// absent): a genuine binary presence coordinate. The gate is honest and the
+    /// atom keeps its charted latent dimension.
+    SpikeAtSaturation,
+    /// The realized amplitude spreads continuously across the interior: intensity
+    /// is a hidden RADIAL latent axis. Promote radius to an explicit coordinate
+    /// and race the atom as circle vs cylinder-radial vs disk.
+    Continuous,
+    /// Too few / degenerate (no spread, non-finite, or all-equal) amplitudes to
+    /// certify. Carries no radial promotion — a constant-intensity atom is a pure
+    /// presence coordinate, not a disk.
+    Indeterminate,
+}
+
+impl AmplitudeConcentration {
+    /// Lowercase label for the diagnostics payload.
+    pub fn label(self) -> &'static str {
+        match self {
+            AmplitudeConcentration::SpikeAtSaturation => "spike_at_saturation",
+            AmplitudeConcentration::Continuous => "continuous",
+            AmplitudeConcentration::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+/// The per-atom amplitude-concentration certificate (F1): the fitted Beta shape
+/// of the realized amplitude distribution and the presence-vs-radial verdict it
+/// implies. Produced by [`amplitude_concentration_certificate`].
+#[derive(Debug, Clone, Copy)]
+pub struct AmplitudeConcentrationCertificate {
+    /// The certified verdict.
+    pub verdict: AmplitudeConcentration,
+    /// Fitted Beta shape parameter `α` of the saturation-normalized amplitudes.
+    /// `NaN` when [`AmplitudeConcentration::Indeterminate`].
+    pub beta_alpha: f64,
+    /// Fitted Beta shape parameter `β`.
+    pub beta_beta: f64,
+    /// The Beta log-likelihood at `(α, β)` — the evidence the verdict is read
+    /// from. `NaN` when indeterminate.
+    pub log_likelihood: f64,
+    /// Number of realized amplitudes the certificate was fitted from.
+    pub n: usize,
+}
+
+impl AmplitudeConcentrationCertificate {
+    /// `true` iff the certificate calls for promoting a radial latent axis: the
+    /// amplitude is a continuous (radial) coordinate, not a binary presence.
+    pub fn recommends_radial_axis(&self) -> bool {
+        matches!(self.verdict, AmplitudeConcentration::Continuous)
+    }
+}
+
+/// Certify one atom's realized amplitude-concentration law from the amplitudes
+/// `a_n ≥ 0` it fires with across its samples (the gated intensity per row, e.g.
+/// `exp(s_k)` times the per-row gate). The verdict is read from the fitted Beta
+/// shape of the saturation-normalized amplitudes: U-shaped (`α < 1 ∧ β < 1`) ⟺
+/// [`AmplitudeConcentration::SpikeAtSaturation`], otherwise
+/// [`AmplitudeConcentration::Continuous`]; a degenerate / no-spread sample is
+/// [`AmplitudeConcentration::Indeterminate`].
+pub fn amplitude_concentration_certificate(
+    amplitudes: ArrayView1<'_, f64>,
+) -> AmplitudeConcentrationCertificate {
+    let n = amplitudes.len();
+    let indeterminate = |n: usize| AmplitudeConcentrationCertificate {
+        verdict: AmplitudeConcentration::Indeterminate,
+        beta_alpha: f64::NAN,
+        beta_beta: f64::NAN,
+        log_likelihood: f64::NAN,
+        n,
+    };
+    if n < 4 {
+        // Fewer than four samples cannot resolve a shape (a Beta has two shape
+        // parameters; a bimodality claim needs mass observed at both ends).
+        return indeterminate(n);
+    }
+    if amplitudes.iter().any(|a| !a.is_finite() || *a < 0.0) {
+        return indeterminate(n);
+    }
+    let amax = amplitudes.iter().copied().fold(0.0_f64, f64::max);
+    if !(amax > 0.0) {
+        // All-zero: the atom never fires — no distribution to certify.
+        return indeterminate(n);
+    }
+    // Saturation-normalize into [0, 1]. A near-constant amplitude (no spread)
+    // carries neither bimodality nor a radial axis: it is a pure fixed-intensity
+    // presence coordinate, reported Indeterminate so no radial axis is promoted.
+    let raw: Vec<f64> = amplitudes.iter().map(|&a| (a / amax).clamp(0.0, 1.0)).collect();
+    let mean_r: f64 = raw.iter().sum::<f64>() / n as f64;
+    let var_r: f64 = raw.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / n as f64;
+    // Spread floor: the sample must vary by more than floating-point noise
+    // relative to its scale for a shape to be identifiable at all.
+    if !(var_r > f64::EPSILON) {
+        return indeterminate(n);
+    }
+    // Open-interval boundary correction: map endpoints strictly inside (0, 1) via
+    // the standard `(r(n−1) + 1/2)/n` compression so `ln r` / `ln(1−r)` stay
+    // finite. This is a recognized boundary rule, not a tuning knob.
+    let nf = n as f64;
+    let r: Vec<f64> = raw
+        .iter()
+        .map(|&x| (x * (nf - 1.0) + 0.5) / nf)
+        .collect();
+
+    let (alpha, beta, loglik) = match fit_beta_mle(&r) {
+        Some(v) => v,
+        None => return indeterminate(n),
+    };
+
+    // The Beta family's analytic U-shape region: density diverges at both 0 and 1
+    // (mass at absent AND saturation) iff both shape parameters are below the
+    // uniform-density boundary `1`. This is the family's own mode-count
+    // transition — the decision, not a threshold.
+    let verdict = if alpha < 1.0 && beta < 1.0 {
+        AmplitudeConcentration::SpikeAtSaturation
+    } else {
+        AmplitudeConcentration::Continuous
+    };
+    AmplitudeConcentrationCertificate {
+        verdict,
+        beta_alpha: alpha,
+        beta_beta: beta,
+        log_likelihood: loglik,
+        n,
+    }
+}
+
+/// Maximum-likelihood fit of a `Beta(α, β)` to samples `r ∈ (0, 1)` by Newton's
+/// method on the (concave) Beta log-likelihood, method-of-moments initialized.
+/// Returns `(α, β, loglik)` or `None` when the sufficient statistics are
+/// undefined (a sample at the closed boundary slipped through, or the moments are
+/// degenerate). Newton uses the exact digamma/trigamma score and Hessian — no
+/// finite differences (SPEC), and no autodiff.
+fn fit_beta_mle(r: &[f64]) -> Option<(f64, f64, f64)> {
+    let n = r.len();
+    if n < 2 {
+        return None;
+    }
+    let mut sum_ln = 0.0_f64;
+    let mut sum_ln1m = 0.0_f64;
+    let mut mean = 0.0_f64;
+    let mut mean_sq = 0.0_f64;
+    for &x in r {
+        if !(x > 0.0 && x < 1.0) {
+            return None;
+        }
+        sum_ln += x.ln();
+        sum_ln1m += (1.0 - x).ln();
+        mean += x;
+        mean_sq += x * x;
+    }
+    let nf = n as f64;
+    mean /= nf;
+    let var = (mean_sq / nf - mean * mean).max(f64::EPSILON);
+    // Method-of-moments seed: `common = m(1−m)/v − 1`, `α = m·common`,
+    // `β = (1−m)·common`. Guard positivity so Newton starts in the interior.
+    let common = (mean * (1.0 - mean) / var - 1.0).max(1.0e-3);
+    let mut alpha = (mean * common).max(1.0e-3);
+    let mut beta = ((1.0 - mean) * common).max(1.0e-3);
+
+    let s_ln = sum_ln / nf;
+    let s_ln1m = sum_ln1m / nf;
+    // Newton on the per-sample-averaged score (concave objective; the Hessian is
+    // negative definite, so a damped Newton with step-halving converges).
+    for _ in 0..100 {
+        let psi_ab = digamma(alpha + beta);
+        let g_a = s_ln - (digamma(alpha) - psi_ab);
+        let g_b = s_ln1m - (digamma(beta) - psi_ab);
+        if g_a.abs() < 1.0e-12 && g_b.abs() < 1.0e-12 {
+            break;
+        }
+        let t_ab = trigamma(alpha + beta);
+        // Negative Hessian of the averaged loglik (positive definite):
+        //   H = [[ψ₁(α) − ψ₁(α+β), −ψ₁(α+β)], [−ψ₁(α+β), ψ₁(β) − ψ₁(α+β)]].
+        let h_aa = trigamma(alpha) - t_ab;
+        let h_bb = trigamma(beta) - t_ab;
+        let h_ab = -t_ab;
+        let det = h_aa * h_bb - h_ab * h_ab;
+        if !(det.abs() > 0.0) {
+            break;
+        }
+        // Newton step `Δ = H⁻¹ g` (H is the negative Hessian, g the gradient).
+        let d_a = (h_bb * g_a - h_ab * g_b) / det;
+        let d_b = (h_aa * g_b - h_ab * g_a) / det;
+        // Step-halving to keep `(α, β)` strictly positive and non-decreasing in
+        // loglik — a standard safeguard, no wall-clock budget.
+        let mut step = 1.0_f64;
+        let base = beta_loglik_avg(alpha, beta, s_ln, s_ln1m);
+        let mut moved = false;
+        for _ in 0..40 {
+            let na = alpha + step * d_a;
+            let nb = beta + step * d_b;
+            if na > 0.0 && nb > 0.0 && beta_loglik_avg(na, nb, s_ln, s_ln1m) >= base {
+                alpha = na;
+                beta = nb;
+                moved = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !moved {
+            break;
+        }
+    }
+    let loglik = nf * beta_loglik_avg(alpha, beta, s_ln, s_ln1m);
+    if !loglik.is_finite() {
+        return None;
+    }
+    Some((alpha, beta, loglik))
+}
+
+/// Per-sample-averaged Beta log-likelihood `(α−1)⟨ln r⟩ + (β−1)⟨ln(1−r)⟩ −
+/// ln B(α, β)` given the averaged sufficient statistics.
+fn beta_loglik_avg(alpha: f64, beta: f64, s_ln: f64, s_ln1m: f64) -> f64 {
+    (alpha - 1.0) * s_ln + (beta - 1.0) * s_ln1m
+        - (ln_gamma(alpha) + ln_gamma(beta) - ln_gamma(alpha + beta))
+}
+
+/// Digamma `ψ(x) = d/dx ln Γ(x)` for `x > 0`: recurrence up to `x ≥ 6` then the
+/// standard asymptotic (Bernoulli) series. Hand-derived closed form.
+fn digamma(mut x: f64) -> f64 {
+    let mut result = 0.0_f64;
+    while x < 6.0 {
+        result -= 1.0 / x;
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    result + x.ln() - 0.5 * inv
+        - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0))
+}
+
+/// Trigamma `ψ₁(x) = d²/dx² ln Γ(x)` for `x > 0`: recurrence up to `x ≥ 6` then
+/// the asymptotic series `1/x + 1/(2x²) + Σ B₂ₖ/x^{2k+1}`.
+fn trigamma(mut x: f64) -> f64 {
+    let mut result = 0.0_f64;
+    while x < 6.0 {
+        result += 1.0 / (x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    result
+        + inv * (1.0 + inv * (0.5 + inv * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))))
+}
+
+/// `ln Γ(x)` for `x > 0` via the Lanczos approximation (g = 7). Hand-derived
+/// closed form; used only to report the Beta log-likelihood.
+fn ln_gamma(x: f64) -> f64 {
+    const G: f64 = 7.0;
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_13,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let mut a = C[0];
+    let t = x + G - 0.5;
+    for (i, &c) in C.iter().enumerate().skip(1) {
+        a += c / (x + i as f64 - 1.0);
+    }
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x - 0.5) * t.ln() - t + a.ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::{Array3, array};
+
+    // ---- F1: amplitude-concentration certificate ----------------------------
+
+    /// A deterministic low-discrepancy sequence on `[0, 1)` (van der Corput,
+    /// base 2) so the amplitude tests need no RNG and are byte-reproducible.
+    fn van_der_corput(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let (mut x, mut denom, mut k) = (0.0_f64, 2.0_f64, i + 1);
+                while k > 0 {
+                    x += (k & 1) as f64 / denom;
+                    denom *= 2.0;
+                    k >>= 1;
+                }
+                x
+            })
+            .collect()
+    }
+
+    #[test]
+    fn digamma_trigamma_match_known_values() {
+        // ψ(1) = −γ ≈ −0.5772156649; ψ(2) = 1 − γ; ψ₁(1) = π²/6.
+        let gamma = 0.577_215_664_901_532_9_f64;
+        assert!((digamma(1.0) + gamma).abs() < 1.0e-9);
+        assert!((digamma(2.0) - (1.0 - gamma)).abs() < 1.0e-9);
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        assert!((trigamma(1.0) - pi2_6).abs() < 1.0e-8);
+        // ln Γ(5) = ln 24.
+        assert!((ln_gamma(5.0) - 24.0_f64.ln()).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn beta_mle_recovers_planted_shape() {
+        // Sample the Beta(2, 5) CDF quantiles deterministically via a coarse
+        // inverse-CDF over a fine low-discrepancy grid on the density, and check
+        // the MLE lands near the planted shape. We synthesize from the density
+        // directly by rejection on the grid to stay RNG-free.
+        // Simpler + exact: fit to the Beta(2,1) family whose CDF is r² so the
+        // quantile of a uniform u is sqrt(u) — an exact inverse transform.
+        let u = van_der_corput(400);
+        let samples: Vec<f64> = u.iter().map(|&x| x.sqrt()).collect(); // Beta(2,1)
+        let (a, b, _ll) = fit_beta_mle(&samples).expect("beta fit");
+        assert!((a - 2.0).abs() < 0.3, "alpha {a}");
+        assert!((b - 1.0).abs() < 0.3, "beta {b}");
+    }
+
+    #[test]
+    fn continuous_disk_radius_recommends_radial_axis() {
+        // A disk uniform in AREA has radius density ∝ r on [0, 1] = Beta(2, 1),
+        // whose quantile of uniform u is sqrt(u). Amplitude = radius. The
+        // certificate must read this as a continuous (radial) coordinate.
+        let u = van_der_corput(500);
+        let amps = Array1::from_iter(u.iter().map(|&x| x.sqrt()));
+        let cert = amplitude_concentration_certificate(amps.view());
+        assert_eq!(cert.verdict, AmplitudeConcentration::Continuous, "{cert:?}");
+        assert!(cert.recommends_radial_axis());
+        assert!(cert.beta_alpha > 1.0, "alpha {}", cert.beta_alpha);
+    }
+
+    #[test]
+    fn true_presence_certifies_spike_at_saturation() {
+        // A genuine binary presence atom: roughly half the samples absent
+        // (amplitude ≈ 0) and half saturated (≈ 1), with a little jitter so the
+        // sample is not literally two atoms. Mass at both ends ⇒ U-shaped Beta
+        // (α, β < 1) ⇒ SpikeAtSaturation, and NO radial axis is promoted.
+        let jitter = van_der_corput(600);
+        let amps = Array1::from_iter(jitter.iter().enumerate().map(|(i, &j)| {
+            let base = if i % 2 == 0 { 0.0 } else { 1.0 };
+            // Pull each sample toward its end by ≤ 8% so the piles stay at the
+            // endpoints without ever leaving [0, 1].
+            (base + if base == 0.0 { 0.08 * j } else { -0.08 * j }).clamp(0.0, 1.0)
+        }));
+        let cert = amplitude_concentration_certificate(amps.view());
+        assert_eq!(
+            cert.verdict,
+            AmplitudeConcentration::SpikeAtSaturation,
+            "{cert:?}"
+        );
+        assert!(!cert.recommends_radial_axis());
+        assert!(cert.beta_alpha < 1.0 && cert.beta_beta < 1.0, "{cert:?}");
+    }
+
+    #[test]
+    fn degenerate_amplitudes_are_indeterminate() {
+        // No spread (constant intensity) ⇒ pure fixed-intensity presence, not a
+        // disk: Indeterminate, no radial promotion.
+        let flat = Array1::from_elem(50, 0.7);
+        let cert = amplitude_concentration_certificate(flat.view());
+        assert_eq!(cert.verdict, AmplitudeConcentration::Indeterminate);
+        assert!(!cert.recommends_radial_axis());
+        // All-zero (never fires) is also indeterminate.
+        let zero = Array1::<f64>::zeros(50);
+        assert_eq!(
+            amplitude_concentration_certificate(zero.view()).verdict,
+            AmplitudeConcentration::Indeterminate
+        );
+        // Too few samples.
+        let few = array![0.1, 0.9];
+        assert_eq!(
+            amplitude_concentration_certificate(few.view()).verdict,
+            AmplitudeConcentration::Indeterminate
+        );
+    }
 
     /// A trivial `d = 1` evaluator whose basis is the monomial patch
     /// `Φ(t) = [1, t]` — enough to build straight-line and circle-arc decoders

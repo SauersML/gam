@@ -16,6 +16,15 @@ pub(crate) struct BetaCouplingGraph {
     pub(crate) edges: Vec<BetaEdge>,
     pub(crate) adj_start: Vec<usize>,
     pub(crate) adj_targets: Vec<usize>,
+    /// Co-visibility WEIGHT parallel to `adj_targets`: `adj_weights[e]` is the
+    /// number of rows in which `node` and `adj_targets[e]` both fire. This is
+    /// the co-visibility count that keys the visibility-based cluster partition
+    /// (Kushal & Agarwal, CVPR 2012): the reduced Schur is, up to its
+    /// block-diagonal penalty, a graph Laplacian over this weighted graph, so a
+    /// strong `adj_weights[e]` marks an off-block coupling a good preconditioner
+    /// block must keep together. Symmetric: the `(a→b)` and `(b→a)` entries carry
+    /// the same weight.
+    pub(crate) adj_weights: Vec<f64>,
 }
 
 impl BetaCouplingGraph {
@@ -27,10 +36,15 @@ impl BetaCouplingGraph {
                 edges: Vec::new(),
                 adj_start: vec![0],
                 adj_targets: Vec::new(),
+                adj_weights: Vec::new(),
             };
         }
 
-        let mut edge_set = Vec::<(usize, usize)>::new();
+        // Accumulate the co-firing MULTIPLICITY per undirected pair: the number
+        // of rows where the two blocks are simultaneously active. The unweighted
+        // edge set (for `component_partition`) is its key set; the counts become
+        // the co-visibility weights that drive the bounded cluster partition.
+        let mut edge_count = std::collections::BTreeMap::<(usize, usize), f64>::new();
         for row in htbeta_rows {
             let mut active = Vec::<usize>::new();
             for (block, range) in block_offsets.iter().enumerate() {
@@ -43,14 +57,17 @@ impl BetaCouplingGraph {
             }
             for i in 0..active.len() {
                 for j in (i + 1)..active.len() {
-                    edge_set.push((active[i].min(active[j]), active[i].max(active[j])));
+                    let key = (active[i].min(active[j]), active[i].max(active[j]));
+                    *edge_count.entry(key).or_insert(0.0) += 1.0;
                 }
             }
         }
-        edge_set.sort_unstable();
-        edge_set.dedup();
 
-        let edges: Vec<_> = edge_set.iter().map(|&(a, b)| BetaEdge { a, b }).collect();
+        let edges: Vec<_> = edge_count
+            .keys()
+            .map(|&(a, b)| BetaEdge { a, b })
+            .collect();
+        let weights: Vec<f64> = edge_count.values().copied().collect();
         let mut degree = vec![0usize; num_blocks];
         for &BetaEdge { a, b } in &edges {
             degree[a] += 1;
@@ -61,11 +78,14 @@ impl BetaCouplingGraph {
             adj_start[block + 1] = adj_start[block] + degree[block];
         }
         let mut adj_targets = vec![0usize; adj_start[num_blocks]];
+        let mut adj_weights = vec![0.0f64; adj_start[num_blocks]];
         let mut cursor = adj_start[..num_blocks].to_vec();
-        for &BetaEdge { a, b } in &edges {
+        for (&BetaEdge { a, b }, &w) in edges.iter().zip(weights.iter()) {
             adj_targets[cursor[a]] = b;
+            adj_weights[cursor[a]] = w;
             cursor[a] += 1;
             adj_targets[cursor[b]] = a;
+            adj_weights[cursor[b]] = w;
             cursor[b] += 1;
         }
         Self {
@@ -73,11 +93,116 @@ impl BetaCouplingGraph {
             edges,
             adj_start,
             adj_targets,
+            adj_weights,
         }
     }
 
     pub(crate) fn neighbours(&self, node: usize) -> &[usize] {
         &self.adj_targets[self.adj_start[node]..self.adj_start[node + 1]]
+    }
+
+    /// Co-visibility neighbours of `node` paired with their co-firing weights.
+    pub(crate) fn weighted_neighbours(&self, node: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let lo = self.adj_start[node];
+        let hi = self.adj_start[node + 1];
+        self.adj_targets[lo..hi]
+            .iter()
+            .copied()
+            .zip(self.adj_weights[lo..hi].iter().copied())
+    }
+
+    /// Add each unassigned co-visibility neighbour of `block` to `gain`,
+    /// accumulating its co-firing weight toward the growing cluster.
+    fn accumulate_frontier(
+        &self,
+        block: usize,
+        assigned: &[bool],
+        gain: &mut std::collections::HashMap<usize, f64>,
+    ) {
+        for (nbr, w) in self.weighted_neighbours(block) {
+            if !assigned[nbr] {
+                *gain.entry(nbr).or_insert(0.0) += w;
+            }
+        }
+    }
+
+    /// Bounded greedy co-visibility partition of the β-coupling graph (Kushal &
+    /// Agarwal, "Visibility Based Preconditioning for Bundle Adjustment",
+    /// CVPR 2012).
+    ///
+    /// `component_partition` groups by CONNECTED COMPONENT, which at real over-
+    /// complete SAE widths collapses into a single giant component (transitive
+    /// co-firing) — pushing the dense per-cluster factor past the size cap and
+    /// degrading the whole cluster tier to scalar Jacobi, the scaling ceiling.
+    /// This routine instead PARTITIONS the graph into clusters bounded by
+    /// `max_block_cols` (total member columns) that keep the STRONGEST co-firing
+    /// edges inside a cluster: seed at the lowest unassigned block, then
+    /// repeatedly absorb the unassigned neighbour with the greatest accumulated
+    /// co-firing weight to the current cluster, stopping when the next admissible
+    /// block would push the cluster's column count past the cap. A block wider
+    /// than the cap on its own becomes a singleton (the caller scalar-degrades
+    /// it). Every block lands in exactly one cluster.
+    ///
+    /// Deterministic and independent of thread scheduling: the seed order is
+    /// ascending block index and candidate ties break by ascending index, so the
+    /// partition is a pure function of the graph. It is a partition of the SAME
+    /// operator (the preconditioner only steers the PCG iterate), so the solve
+    /// converges to the same reduced-system solution — the change is pure
+    /// numerics on the CG path, REML-neutral.
+    pub(crate) fn covisibility_cluster_partition(
+        &self,
+        block_offsets: &[Range<usize>],
+        max_block_cols: usize,
+    ) -> Vec<Vec<usize>> {
+        let nb = self.num_blocks;
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        if nb == 0 {
+            return clusters;
+        }
+        let block_cols =
+            |b: usize| block_offsets[b].end.saturating_sub(block_offsets[b].start).max(1);
+        let cap = max_block_cols.max(1);
+        let mut assigned = vec![false; nb];
+        for seed in 0..nb {
+            if assigned[seed] {
+                continue;
+            }
+            let mut members = vec![seed];
+            assigned[seed] = true;
+            let mut cols = block_cols(seed);
+            let mut gain = std::collections::HashMap::<usize, f64>::new();
+            self.accumulate_frontier(seed, &assigned, &mut gain);
+            loop {
+                // Pick the admissible frontier block of greatest co-firing weight
+                // to the current cluster; tie-break by ascending index for a
+                // schedule-independent partition. Stale (already-assigned) map
+                // entries are skipped rather than eagerly purged.
+                let mut best: Option<(usize, f64)> = None;
+                for (&cand, &g) in gain.iter() {
+                    if assigned[cand] || cols + block_cols(cand) > cap {
+                        continue;
+                    }
+                    match best {
+                        None => best = Some((cand, g)),
+                        Some((bi, bg)) if g > bg || (g == bg && cand < bi) => {
+                            best = Some((cand, g))
+                        }
+                        _ => {}
+                    }
+                }
+                let Some((cand, _)) = best else {
+                    break;
+                };
+                assigned[cand] = true;
+                members.push(cand);
+                cols += block_cols(cand);
+                gain.remove(&cand);
+                self.accumulate_frontier(cand, &assigned, &mut gain);
+            }
+            members.sort_unstable();
+            clusters.push(members);
+        }
+        clusters
     }
 
     pub(crate) fn component_partition(&self) -> Vec<Vec<usize>> {

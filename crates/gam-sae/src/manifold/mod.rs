@@ -144,16 +144,20 @@ mod construction_cache_refresh;
 mod construction_padded_blocks;
 mod construction_reconstruction;
 mod coordinate_fidelity;
+mod cross_fit;
 mod fit_drivers;
 mod gauge;
+mod inframe_curved;
 mod isa_seed;
 mod kronecker;
 mod loss;
 mod outer_objective;
 mod pca_seed;
 mod penalties;
+mod persistence;
 mod rho;
 mod row_layout;
+mod sandwich;
 mod schedule;
 mod shape_uncertainty;
 mod stagewise;
@@ -262,6 +266,12 @@ mod lambda_smooth_1556_tests;
 #[cfg(test)]
 mod tests_behavior_twoblock_rung2;
 
+#[cfg(test)]
+mod tests_inframe_curved_2130;
+
+#[cfg(test)]
+mod tests_topology_persistence_f3;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use behavior::*;
@@ -296,15 +306,19 @@ pub fn rank_charge_dof(
 }
 
 pub use coordinate_fidelity::*;
+pub use cross_fit::*;
 pub use gauge::*;
+pub use inframe_curved::*;
 pub use isa_seed::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
 pub use outer_objective::*;
 pub use pca_seed::*;
 pub use penalties::*;
+pub use persistence::*;
 pub use rho::*;
 pub use row_layout::*;
+pub use sandwich::*;
 pub use schedule::*;
 pub use shape_uncertainty::*;
 pub use stagewise::*;

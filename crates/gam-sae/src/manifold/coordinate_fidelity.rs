@@ -30,6 +30,20 @@
 //! arc-length chart (no pathology); a HIGH arc-length defect means the chart
 //! itself squishes arc length (the #2081 pathology), which EV cannot see.
 //!
+//! F2 — two-part split (chart honesty vs occupancy law). Watson's `U²` tests the
+//! coordinates against the UNIFORM invariant measure, but uniformity is a
+//! property of the data's OCCUPANCY, not the chart's honesty: a correct circle
+//! whose data occupies seven points (weekdays) reads a highly non-uniform
+//! coordinate and so fails a uniform-null test even though the chart is perfectly
+//! honest. Reporting that as a fidelity failure conflates "dishonest chart" with
+//! "discrete measure on an honest chart." The certificate therefore reports two
+//! independent verdicts: `chart_honest` (a pure parameterization property — the
+//! unit-speed / collapse verdict) and the `occupancy` law
+//! ([`OccupancyLaw`]: `Uniform` / `Discrete{anchors}` / `Continuous`, adjudicated
+//! by evidence via [`classify_occupancy`], NOT by the p-value). A discrete
+//! measure on an honest chart passes chart-honesty and is reported as discrete
+//! occupancy (`d_eff = anchors − 1`) — the finite-set alternative in the race.
+//!
 //! The seed-selection tie-break ([`prefer_candidate_basin`]) prices the
 //! uniformity statistic: at (near-)equal reconstruction EV — "near" derived from
 //! the existing #1026 EV negligibility band
@@ -247,6 +261,272 @@ pub fn coordinate_uniformity(
     Some(watson_u2_uniform(&u))
 }
 
+// ===========================================================================
+// F2 — occupancy law: the SECOND half of the two-part certificate.
+//
+// Watson's `U²` tests the fitted coordinates against the atom's UNIFORM
+// invariant measure. But uniformity is a property of the DATA's occupancy, NOT
+// of the chart's honesty: a CORRECT circle whose data occupies only seven points
+// (weekdays with cyclic adjacency) reads a highly non-uniform coordinate and so
+// FAILS a uniform-null test — even though the chart is perfectly honest and the
+// seven-point structure is exactly the thing we want to discover. Reporting that
+// as a fidelity failure conflates "dishonest chart" with "discrete measure on an
+// honest chart."
+//
+// The fix is to split the certificate:
+//   * **chart honesty** — a pure property of the parameterization (unit-speed /
+//     arc-length defect, the collapse floor): does the chart faithfully carry a
+//     coordinate at all. Discrete occupancy does not touch this.
+//   * **occupancy law** — WHAT measure the data draws from ON that honest chart:
+//     `Uniform`, `Discrete{anchors}` (a finite set — the finite-set / cluster
+//     alternative, `d_eff = anchors − 1`), or `Continuous` (a non-uniform but
+//     spread density, e.g. a concentrated arc). This is adjudicated by evidence,
+//     not by a p-value cut, so a circle-vs-clusters contest is raced per atom.
+//
+// The occupancy adjudication is a BIC (rank-aware Laplace-evidence) comparison
+// across a small FIXED model-class enumeration — the SAME "discrete structure
+// choice" pattern the topology / `K` / mixture ladders already use, not a grid
+// search: the uniform density (0 free location parameters), a single wrapped
+// Gaussian (the continuous unimodal / von-Mises-like alternative), and a
+// `k`-anchor wrapped-Gaussian mixture for `k` on the anchor ladder. The winning
+// class is the occupancy law; when a `k ≥ 2` anchor model wins, the atom carries
+// a discrete measure of `k` anchors (`d_eff = k − 1`).
+// ===========================================================================
+
+/// The fixed anchor ladder swept for the discrete-occupancy rung. A discrete
+/// structure choice (like [`MIXTURE_K_LADDER`](crate) / the topology ladder),
+/// not a grid search — each `k` is priced by its own free-parameter count and
+/// ranked by evidence. Includes `7` (weekday-cyclic) and `12` (month-cyclic).
+pub const OCCUPANCY_ANCHOR_LADDER: &[usize] = &[2, 3, 4, 5, 6, 7, 9, 12];
+
+/// The occupancy law of a fitted `d = 1` coordinate ON its honest chart: which
+/// measure the data draws from. Adjudicated by evidence ([`classify_occupancy`]),
+/// SEPARATELY from whether the chart itself is honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupancyLaw {
+    /// The coordinate fills its manifold uniformly — the invariant measure. An
+    /// occupied circle / interval.
+    Uniform,
+    /// The coordinate collapses onto a finite set of `anchors` points (a discrete
+    /// measure — weekdays, categories). `d_eff = anchors − 1` is the rank charge
+    /// the finite-set alternative carries into the race.
+    Discrete { anchors: usize },
+    /// The coordinate is non-uniform but continuously spread (a concentrated arc,
+    /// a unimodal density) — neither uniform nor a finite anchor set.
+    Continuous,
+    /// Too few / degenerate coordinates to classify.
+    Indeterminate,
+}
+
+impl OccupancyLaw {
+    /// Lowercase label for the diagnostics payload.
+    pub fn label(self) -> &'static str {
+        match self {
+            OccupancyLaw::Uniform => "uniform",
+            OccupancyLaw::Discrete { .. } => "discrete",
+            OccupancyLaw::Continuous => "continuous",
+            OccupancyLaw::Indeterminate => "indeterminate",
+        }
+    }
+
+    /// The number of anchors for a discrete occupancy (`0` otherwise).
+    pub fn anchors(self) -> usize {
+        match self {
+            OccupancyLaw::Discrete { anchors } => anchors,
+            _ => 0,
+        }
+    }
+
+    /// The effective latent rank the occupancy contributes to the race charge:
+    /// `anchors − 1` for a finite set (the categorical `t` has `anchors − 1`
+    /// independent contrasts), `0` for the smooth / uniform laws whose rank the
+    /// manifold dimension already carries.
+    pub fn d_eff(self) -> usize {
+        match self {
+            OccupancyLaw::Discrete { anchors } => anchors.saturating_sub(1),
+            _ => 0,
+        }
+    }
+}
+
+/// Classify the occupancy law of coordinates already folded onto the unit circle
+/// `u ∈ [0, 1)` (a circle wraps modulo its period; an interval is range
+/// normalized — both handled by [`coordinate_uniformity`]'s mapping) by a BIC
+/// comparison across the fixed model-class enumeration `{uniform, one wrapped
+/// Gaussian, k-anchor wrapped-Gaussian mixture for k on the anchor ladder}`. The
+/// class with the lowest BIC (= highest rank-aware Laplace evidence) is the law:
+/// a `k ≥ 2` anchor model ⟹ [`OccupancyLaw::Discrete`], a single wrapped Gaussian
+/// ⟹ [`OccupancyLaw::Continuous`], the uniform density ⟹ [`OccupancyLaw::Uniform`].
+pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
+    let n = u.len();
+    if n < 4 {
+        return OccupancyLaw::Indeterminate;
+    }
+    // Fold into [0, 1) defensively (callers already normalize, but a raw circle
+    // coordinate may arrive un-wrapped).
+    let mut pts: Vec<f64> = u
+        .iter()
+        .map(|&x| {
+            let f = x - x.floor();
+            if f >= 1.0 { 0.0 } else { f }
+        })
+        .collect();
+    if pts.iter().any(|p| !p.is_finite()) {
+        return OccupancyLaw::Indeterminate;
+    }
+    pts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let nf = n as f64;
+    let ln_n = nf.ln();
+
+    // Uniform density on the unit circle is `1`, so its per-point log-density is
+    // `0` and its total loglik is `0`; it has no free location parameters.
+    let bic_uniform = -2.0 * 0.0 + 0.0 * ln_n;
+
+    // Resolution floor: with `n` points on the unit circle you cannot resolve a
+    // cluster tighter than the mean spacing `1/n`, so a wrapped-Gaussian width is
+    // floored at half that (a Nyquist-like, data-derived floor — not a knob).
+    let sigma_floor = 1.0 / (2.0 * nf);
+
+    // Single wrapped Gaussian: the continuous unimodal (von-Mises-like)
+    // alternative. Two free parameters (mean, width).
+    let single = wrapped_gaussian_mixture_bic(&pts, 1, sigma_floor, ln_n);
+
+    let mut best_law = OccupancyLaw::Uniform;
+    let mut best_bic = bic_uniform;
+    if let Some(bic) = single {
+        if bic < best_bic {
+            best_bic = bic;
+            best_law = OccupancyLaw::Continuous;
+        }
+    }
+    for &k in OCCUPANCY_ANCHOR_LADDER {
+        if k >= n {
+            break;
+        }
+        if let Some(bic) = wrapped_gaussian_mixture_bic(&pts, k, sigma_floor, ln_n) {
+            if bic < best_bic {
+                best_bic = bic;
+                best_law = OccupancyLaw::Discrete { anchors: k };
+            }
+        }
+    }
+    best_law
+}
+
+/// BIC of a `k`-anchor wrapped-Gaussian mixture fitted to sorted circle
+/// coordinates `pts ∈ [0, 1)` by deterministic circular `k`-means (evenly spaced
+/// init) plus a per-cluster wrapped-Gaussian width. Returns `None` when the fit
+/// is degenerate. `BIC = −2·loglik + p·ln n`, `p = 3k − 1` (`k` means, `k`
+/// widths, `k − 1` weights); lower is better.
+fn wrapped_gaussian_mixture_bic(
+    pts: &[f64],
+    k: usize,
+    sigma_floor: f64,
+    ln_n: f64,
+) -> Option<f64> {
+    let n = pts.len();
+    if k == 0 || k > n {
+        return None;
+    }
+    // Deterministic circular k-means. Angles are the coordinates themselves on
+    // the unit-circumference circle (period 1); circular distance wraps.
+    let circ_dist = |a: f64, b: f64| -> f64 {
+        let d = (a - b).rem_euclid(1.0);
+        d.min(1.0 - d)
+    };
+    let mut means: Vec<f64> = (0..k).map(|j| (j as f64 + 0.5) / k as f64).collect();
+    let mut assign = vec![0usize; n];
+    for _ in 0..100 {
+        let mut changed = false;
+        for (i, &p) in pts.iter().enumerate() {
+            let mut best_j = 0usize;
+            let mut best_d = f64::INFINITY;
+            for (j, &m) in means.iter().enumerate() {
+                let d = circ_dist(p, m);
+                if d < best_d {
+                    best_d = d;
+                    best_j = j;
+                }
+            }
+            if assign[i] != best_j {
+                assign[i] = best_j;
+                changed = true;
+            }
+        }
+        // Circular-mean update of each occupied cluster (resultant-vector angle).
+        for (j, m) in means.iter_mut().enumerate() {
+            let (mut sx, mut sy, mut cnt) = (0.0_f64, 0.0_f64, 0usize);
+            for (i, &p) in pts.iter().enumerate() {
+                if assign[i] == j {
+                    let ang = std::f64::consts::TAU * p;
+                    sx += ang.cos();
+                    sy += ang.sin();
+                    cnt += 1;
+                }
+            }
+            if cnt > 0 && (sx * sx + sy * sy) > 0.0 {
+                *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Per-cluster weight + wrapped-Gaussian width (circular std about the mean),
+    // width floored at the resolution limit.
+    let mut weights = vec![0.0_f64; k];
+    let mut sigmas = vec![sigma_floor; k];
+    for j in 0..k {
+        let mut cnt = 0usize;
+        let mut ss = 0.0_f64;
+        for (i, &p) in pts.iter().enumerate() {
+            if assign[i] == j {
+                let d = {
+                    let raw = (p - means[j]).rem_euclid(1.0);
+                    if raw > 0.5 { raw - 1.0 } else { raw }
+                };
+                ss += d * d;
+                cnt += 1;
+            }
+        }
+        weights[j] = cnt as f64 / n as f64;
+        if cnt > 0 {
+            sigmas[j] = (ss / cnt as f64).sqrt().max(sigma_floor);
+        }
+    }
+
+    // Mixture loglik with a wrapped Gaussian per component (±1 wrap images are
+    // ample for σ well below 0.5). Density is per unit circumference so it is
+    // directly commensurable with the uniform density `1`.
+    let inv_sqrt_2pi = 1.0 / (std::f64::consts::TAU).sqrt();
+    let mut loglik = 0.0_f64;
+    for &p in pts {
+        let mut dens = 0.0_f64;
+        for j in 0..k {
+            if weights[j] <= 0.0 {
+                continue;
+            }
+            let s = sigmas[j];
+            let mut g = 0.0_f64;
+            for m in -1..=1 {
+                let d = p - means[j] + m as f64;
+                g += (-0.5 * (d / s) * (d / s)).exp();
+            }
+            dens += weights[j] * inv_sqrt_2pi / s * g;
+        }
+        if !(dens > 0.0) {
+            return None;
+        }
+        loglik += dens.ln();
+    }
+    if !loglik.is_finite() {
+        return None;
+    }
+    let p_free = (3 * k).saturating_sub(1) as f64;
+    Some(-2.0 * loglik + p_free * ln_n)
+}
+
 /// The per-atom coordinate-fidelity certificate: a reported, calibrated summary
 /// of whether one fitted `d = 1` atom's latent coordinate is an honest reading
 /// of its manifold. Produced by [`atom_coordinate_fidelity`]; `None` for atoms
@@ -302,6 +582,24 @@ pub struct AtomCoordinateFidelity {
     /// RMS of `log(‖γ'‖/mean)` on the grid — scale-invariant log-speed spread.
     /// `NaN` when degenerate.
     pub log_speed_rms: f64,
+    /// **Chart-honesty half of the certificate (F2):** `true` iff the chart
+    /// itself faithfully carries a coordinate — a well-conditioned, non-collapsed
+    /// parameterization (`verdict != Degenerate`). This is a property of the
+    /// PARAMETERIZATION alone and is INDEPENDENT of how the data occupies it, so a
+    /// correct circle whose data sits on seven points is still chart-honest.
+    pub chart_honest: bool,
+    /// **Occupancy-law half of the certificate (F2):** which measure the data
+    /// draws from ON the honest chart — `"uniform"`, `"discrete"`, `"continuous"`,
+    /// or `"indeterminate"` ([`OccupancyLaw`]). Adjudicated by evidence, NOT by
+    /// the uniform-null p-value, so a discrete measure is reported as discrete
+    /// occupancy rather than a chart failure.
+    pub occupancy: &'static str,
+    /// Number of anchors when `occupancy == "discrete"` (`0` otherwise) — the
+    /// finite-set size the discrete measure collapses onto.
+    pub occupancy_anchors: usize,
+    /// The effective latent rank the occupancy contributes to the race charge:
+    /// `anchors − 1` for a discrete measure, `0` for the smooth laws.
+    pub occupancy_d_eff: usize,
 }
 
 /// Aggregate certificate adapter for the unified certificate ledger.
@@ -341,6 +639,13 @@ pub fn atom_coordinate_fidelity(
     }
     let row_coords = coords.column(0);
     let uniformity = coordinate_uniformity(row_coords, &topology);
+    // Occupancy law (F2): classified from the SAME folded coordinates the
+    // uniformity statistic reads, but adjudicated by evidence rather than the
+    // uniform-null p-value. Reported separately from chart honesty so a discrete
+    // measure on an honest chart is not read as a fidelity failure.
+    let occupancy_law = fold_for_occupancy(row_coords, &topology)
+        .map(|folded| classify_occupancy(&folded))
+        .unwrap_or(OccupancyLaw::Indeterminate);
     let atom = &term.atoms[atom_idx];
     let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
         format!("atom_coordinate_fidelity: atom {atom_idx} has no basis evaluator")
@@ -427,7 +732,47 @@ pub fn atom_coordinate_fidelity(
         min_speed_over_mean,
         max_speed_over_mean,
         log_speed_rms,
+        chart_honest: verdict.certified(),
+        occupancy: occupancy_law.label(),
+        occupancy_anchors: occupancy_law.anchors(),
+        occupancy_d_eff: occupancy_law.d_eff(),
     }))
+}
+
+/// Fold the fitted `d = 1` coordinates onto the unit interval `[0, 1)` for the
+/// occupancy classifier, using the SAME per-topology mapping as
+/// [`coordinate_uniformity`] (circle wraps modulo its period; interval is range
+/// normalized). Returns `None` when the mapping is ill-defined (non-finite
+/// coordinate, non-positive period, collapsed interval range).
+fn fold_for_occupancy(
+    coords: ArrayView1<'_, f64>,
+    topology: &CanonicalChartTopology,
+) -> Option<Vec<f64>> {
+    if coords.len() < 2 || coords.iter().any(|t| !t.is_finite()) {
+        return None;
+    }
+    match topology {
+        CanonicalChartTopology::Circle { period } => {
+            if !(period.is_finite() && *period > 0.0) {
+                return None;
+            }
+            Some(coords.iter().map(|&t| t.rem_euclid(*period) / *period).collect())
+        }
+        CanonicalChartTopology::Interval => {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &t in coords.iter() {
+                lo = lo.min(t);
+                hi = hi.max(t);
+            }
+            let span = hi - lo;
+            let scale = lo.abs().max(hi.abs()).max(1.0);
+            if !(span > 1.0e-12 * scale) {
+                return None;
+            }
+            Some(coords.iter().map(|&t| (t - lo) / span).collect())
+        }
+    }
 }
 
 /// The (circular, for a circle) distance between the raw normalized coordinate
@@ -1191,5 +1536,92 @@ mod coordinate_fidelity_tests {
             (rms0 - rms_ref).abs() < 1e-9,
             "reflection must not change the defect: {rms0} vs {rms_ref}"
         );
+    }
+
+    // ---- F2: occupancy law (chart honesty vs occupancy split) ---------------
+
+    /// A deterministic low-discrepancy sequence on `[0, 1)` (van der Corput,
+    /// base 2) so the occupancy tests need no RNG.
+    fn vdc(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let (mut x, mut denom, mut k) = (0.0_f64, 2.0_f64, i + 1);
+                while k > 0 {
+                    x += (k & 1) as f64 / denom;
+                    denom *= 2.0;
+                    k >>= 1;
+                }
+                x
+            })
+            .collect()
+    }
+
+    #[test]
+    fn uniform_occupancy_is_classified_uniform() {
+        // A uniformly-occupied circle: an even grid. The uniform density (0 free
+        // params) must win the BIC race over any anchor mixture.
+        let n = 400;
+        let u: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        assert_eq!(classify_occupancy(&u), OccupancyLaw::Uniform);
+    }
+
+    #[test]
+    fn seven_point_cyclic_is_classified_discrete() {
+        // Weekday-cyclic occupancy: 7 anchors at k/7, each realized ~100 times
+        // with sub-resolution jitter. The chart (a circle) is honest; the
+        // OCCUPANCY is discrete — the k=7 anchor model must win by evidence, and
+        // its rank charge d_eff must be 6.
+        let per = 100;
+        let jit = vdc(7 * per);
+        let mut u = Vec::with_capacity(7 * per);
+        for i in 0..(7 * per) {
+            let anchor = (i % 7) as f64 / 7.0;
+            // jitter within ±0.5% of the circle — far below the 1/7 spacing.
+            u.push((anchor + 0.005 * (jit[i] - 0.5)).rem_euclid(1.0));
+        }
+        let law = classify_occupancy(&u);
+        assert_eq!(law, OccupancyLaw::Discrete { anchors: 7 }, "{law:?}");
+        assert_eq!(law.d_eff(), 6);
+        assert_eq!(law.anchors(), 7);
+    }
+
+    #[test]
+    fn concentrated_arc_is_classified_continuous() {
+        // A single concentrated arc (unimodal, spread) is neither uniform nor a
+        // finite anchor set: the single wrapped Gaussian must win, so the
+        // occupancy law is Continuous.
+        let n = 400;
+        let base = vdc(n);
+        // Map a uniform draw through a smooth unimodal bump centered at 0.5 with
+        // moderate spread (a triangular-ish concentration), staying continuous.
+        let u: Vec<f64> = base
+            .iter()
+            .map(|&x| (0.5 + 0.12 * (x - 0.5)).rem_euclid(1.0))
+            .collect();
+        let law = classify_occupancy(&u);
+        assert_eq!(law, OccupancyLaw::Continuous, "{law:?}");
+    }
+
+    #[test]
+    fn discrete_occupancy_passes_chart_honesty_conceptually() {
+        // The core F2 claim as a unit fact: a discrete occupancy is reported as
+        // discrete WITHOUT implying the chart is dishonest. `chart_honest` keys
+        // off the arc-length verdict only; `occupancy` keys off the measure. The
+        // two are independent, so a discrete-occupancy verdict never forces
+        // chart_honest=false. Here we assert the classifier isolates occupancy
+        // (a data property) from any chart notion.
+        let per = 80;
+        let mut u = Vec::new();
+        for i in 0..(3 * per) {
+            u.push((i % 3) as f64 / 3.0 + 0.002 * ((i as f64).sin()));
+        }
+        let law = classify_occupancy(&u);
+        assert!(
+            matches!(law, OccupancyLaw::Discrete { anchors: 3 }),
+            "3-point occupancy should be discrete, got {law:?}"
+        );
+        // d_eff of a 3-anchor discrete measure is 2 (three categories → two
+        // contrasts).
+        assert_eq!(law.d_eff(), 2);
     }
 }

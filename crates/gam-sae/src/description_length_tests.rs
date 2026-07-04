@@ -6,6 +6,7 @@ use super::{
     Crossover, DescriptionLength, Featurizer, ScoreRow, crossover_firings, reverse_water_filling,
     scalar_rate_bits, score, selection_bits,
 };
+use crate::atom_codes::SparseAtomCodes;
 
 fn feat(
     name: &str,
@@ -30,6 +31,7 @@ fn feat(
         n_firings,
         g_dict,
         k_active,
+        support_entropy_bits: None,
     }
 }
 
@@ -166,4 +168,104 @@ fn criterion_bits_reconcile_no_parallel_accounting() {
     // The invariant a REML-fitted atom's surface must satisfy.
     assert!(dl.reconciles_with_criterion(v, 1e-9));
     assert!(!dl.reconciles_with_criterion(v + 10.0 * LN_2, 1.0)); // a 10-bit drift is caught
+}
+
+/// A strongly-structured TILING dictionary: each token activates a contiguous
+/// run of adjacent atoms, so which atoms fire is highly predictable (adjacent
+/// atoms co-fire). Two accounting facts the reviewer required must hold:
+///
+///  1. the empirical support entropy `H(S)` (Chow–Liu tree bits) is FAR below the
+///     combinatorial worst case `log₂ C(G, k̄)` — the uniform price overpays this
+///     dictionary, so charging it would let the MDL comparison argue with itself;
+///  2. charging the tiling baseline `H(S)` instead of the combinatorial price
+///     lowers its selection cost, which SHRINKS a richer chart's reported MDL gap
+///     over it — the direction the math says (the overpay was inflating the win).
+fn tiling_codes(n: usize, g: usize, run: usize, seed: u64) -> SparseAtomCodes {
+    // Deterministic sliding contiguous run [start, start+run) with wraparound; the
+    // run position walks so adjacent atoms co-fire and the support process is a
+    // low-order (near-Markov) chain the tree model captures.
+    let mut codes = SparseAtomCodes::empty(n, g);
+    let mut state = seed | 1;
+    for row in 0..n {
+        // A cheap LCG step just to spread the run starts deterministically.
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let start = (state >> 33) as usize % g;
+        for off in 0..run {
+            codes.row_mut(row).assign((start + off) % g, 1.0);
+        }
+    }
+    codes
+}
+
+#[test]
+fn tiling_support_entropy_undercuts_combinatorial_and_shrinks_gap() {
+    let (n, g, run) = (4000usize, 48usize, 3usize);
+    let codes = tiling_codes(n, g, run, 0xC0FFEE);
+    let se = codes.support_entropy();
+
+    // The run is exactly `run` atoms wide on every row.
+    assert!(
+        (se.mean_support - run as f64).abs() < 1e-9,
+        "mean support {} should equal the run width {run}",
+        se.mean_support
+    );
+    // Chow–Liu bounds: 0 ≤ H(S) ≤ independent ≤ (not necessarily) combinatorial,
+    // but for a PREDICTABLE tiling H(S) must be WELL below the combinatorial price.
+    assert!(se.tree_bits <= se.independent_bits + 1e-9);
+    assert!(
+        se.tree_bits < 0.6 * se.combinatorial_bits,
+        "tiling H(S)={} must be far below combinatorial log2 C(G,k̄)={}",
+        se.tree_bits,
+        se.combinatorial_bits
+    );
+
+    // The reviewer's comparison: a TILING SAE baseline (large G, k>1 co-firing —
+    // the block, which the combinatorial price overpays) versus a single-atom
+    // manifold CHART that reads one coordinate (g_dict = 1, k = 1 → ~zero
+    // selection cost, no redundant support to price). Only the tiling block
+    // carries the empirical H(S); the chart's selection price is 0 either way.
+    let block = feat(
+        "tiling-block", "block", &[1.0, 0.5, 0.5], 64, 0.5, 3.0, n as i64, n as i64, g as i64, run as i64,
+    );
+    let chart = feat(
+        "manifold-chart", "chart", &[1.2], 160, 0.55, 3.0, n as i64, n as i64, 1, 1,
+    );
+    let delta2 = 0.4;
+
+    // Combinatorial accounting (no support entropy attached): the block pays the
+    // full log₂ C(G, k) selection price.
+    let xo_comb = crossover_firings(&block, &chart, delta2, None);
+
+    // Entropy-corrected accounting: charge the tiling block its true H(S).
+    let block_h = block.clone().with_support_entropy(&codes);
+    let xo_h = crossover_firings(&block_h, &chart, delta2, None);
+
+    // The reviewer's worst-case line is preserved unchanged.
+    assert!(
+        (xo_h.selection_bits_delta_combinatorial - xo_comb.selection_bits_delta).abs() < 1e-9,
+        "combinatorial delta must be reported alongside and match the uncorrected run"
+    );
+
+    // The correction lowered the block's selection cost, so the block frees FEWER
+    // selection bits per firing to the chart (`Δsel` drops): the chart's per-firing
+    // advantage shrinks.
+    assert!(
+        xo_h.selection_bits_delta < xo_comb.selection_bits_delta - 1e-6,
+        "entropy correction must reduce the block→chart selection delta: {} !< {}",
+        xo_h.selection_bits_delta,
+        xo_comb.selection_bits_delta
+    );
+
+    // Direction of the reported gap: `f*` is the firing count above which the
+    // chart's total DL beats the block's. Charging the tiling baseline its true
+    // (cheaper) selection price makes the chart pay for its extra decoder params
+    // over more firings — `f*` RISES (the chart wins later), i.e. the previously
+    // inflated MDL gap shrinks. Both configs free coefficients here so f* is finite.
+    assert!(xo_comb.f_star.is_finite() && xo_h.f_star.is_finite());
+    assert!(
+        xo_h.f_star > xo_comb.f_star + 1e-6,
+        "entropy correction must shrink the chart's advantage (f* rises): {} !> {}",
+        xo_h.f_star,
+        xo_comb.f_star
+    );
 }

@@ -1294,6 +1294,14 @@ impl SaeManifoldTerm {
             .map(|atom_idx| atom_coordinate_fidelity(self, atom_idx))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Reviewer-F3 persistent-homology topology audit (one entry per atom,
+        // `None` for caller-supplied or under-sampled atoms). A pure read of the
+        // fitted decoder image and hard assignment; never gated by a flag and
+        // feeds nothing back into the loss/criterion.
+        let topology_persistence = (0..self.k_atoms())
+            .map(|atom_idx| atom_topology_persistence(self, atom_idx))
+            .collect::<Vec<_>>();
+
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
             residual_gauge,
@@ -1305,6 +1313,7 @@ impl SaeManifoldTerm {
             },
             atom_inference,
             coordinate_fidelity,
+            topology_persistence,
         })
     }
 
@@ -1945,7 +1954,7 @@ impl SaeManifoldTerm {
         &self,
         registry: &AnalyticPenaltyRegistry,
     ) -> Result<(), String> {
-        let mut row_block_penalty_present = false;
+        let mut non_composing_row_block: Option<&str> = None;
         for penalty in &registry.penalties {
             if penalty.tier() != PenaltyTier::Psi {
                 continue;
@@ -1982,22 +1991,32 @@ impl SaeManifoldTerm {
                     penalty.name()
                 ));
             }
-            row_block_penalty_present = true;
+            // A row-block penalty that composes over heterogeneous coord dims
+            // (per-atom-additive, dim-adaptive: ScadMcp / Sparsity / native ARD /
+            // Isometry) dispatches cleanly on a mixed dictionary, so it never
+            // forces a uniform `atom_dim`. Only the fixed-`d` structural
+            // penalties (BlockOrthogonality, TopK/JumpReLU, row-precision) do.
+            if !sae_row_block_penalty_composes_over_heterogeneous_coord_dims(penalty) {
+                non_composing_row_block = Some(penalty.name());
+            }
         }
-        if row_block_penalty_present {
+        if let Some(offender) = non_composing_row_block {
             let mut dims = self.assignment.coords.iter().map(|c| c.latent_dim());
             if let Some(first) = dims.next() {
                 if let Some(mismatch) = dims.find(|d| *d != first) {
                     return Err(format!(
-                        "SAE-manifold term refuses row-block analytic penalty: \
+                        "SAE-manifold term refuses row-block analytic penalty {offender:?}: \
                          atoms have heterogeneous coord latent dims (saw {first} \
-                         and {mismatch}). Row-block penalties (ARD, \
-                         BlockOrthogonality, ...) target the unified \"t\" \
-                         latent block whose declared `d` matches one shape; \
-                         per-atom dispatch with mixed `d_k` would silently \
-                         truncate or expand axes. Configure all atoms with the \
-                         same `atom_dim`, or split the row-block penalty into \
-                         per-atom descriptors keyed to per-atom latent blocks"
+                         and {mismatch}). This penalty carries a fixed per-axis \
+                         structure bound to one shared `d` (BlockOrthogonality \
+                         reshapes to `(n_eff × d)` and groups axes; TopK/JumpReLU \
+                         hold per-axis thresholds; the row-precision priors hold a \
+                         `(n_eff × d × d)` stack), so per-atom dispatch with mixed \
+                         `d_k` would silently truncate or expand axes. Configure all \
+                         atoms with the same `atom_dim`, or drop this penalty. \
+                         (Dim-adaptive row-block penalties — ScadMcp, Sparsity, \
+                         native ARD, Isometry — compose on a mixed dictionary and \
+                         are admitted.)"
                     ));
                 }
             }
@@ -2005,28 +2024,37 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// Up-front cross-check (issue #2098, SPEC-8): a heterogeneous-`d_atom`
-    /// dictionary is incompatible with any row-block "t"-block analytic penalty
-    /// (isometry / native ARD / SCAD-MCP coord sparsity / block-orthogonality).
+    /// Up-front cross-check (issue #2098, SPEC-8; F6): a heterogeneous-`d_atom`
+    /// dictionary is compatible with the *dim-adaptive* row-block "t"-block
+    /// penalties (native ARD / SCAD-MCP coord sparsity / sparsity / isometry) but
+    /// incompatible with the *fixed-`d` structural* ones (block-orthogonality,
+    /// TopK/JumpReLU, row-precision priors).
     ///
-    /// The row-block penalties target the UNIFIED "t" latent block, whose width
-    /// is a single shape shared by every atom; with heterogeneous per-atom coord
-    /// dims the arrow-Schur assembler cannot dispatch a shared-width row-block
-    /// penalty per atom without silently truncating or padding axes. The engine
-    /// self-protects here so the incompatibility surfaces as a direct, actionable
-    /// error at the FFI boundary rather than as a deep `RemlConvergenceError`
-    /// mid-REML (the failure mode [`Self::validate_analytic_penalty_registry`]
-    /// otherwise produces during `assemble_arrow_schur`).
+    /// The dim-adaptive penalties are per-atom-additive and read each atom's own
+    /// `d_k` (`ScadMcp`/`Sparsity` iterate the flat block element-wise; native
+    /// ARD sums per atom over `d_k` axes with a per-atom `log_ard[k]`; isometry
+    /// is rebuilt per atom by `corrected_isometry_penalty`), so the arrow-Schur
+    /// assembler dispatches them cleanly across mixed dims and the Laplace/REML
+    /// evidence — itself a per-atom sum — stays exact with no padding or
+    /// truncation (see
+    /// [`sae_row_block_penalty_composes_over_heterogeneous_coord_dims`]). The
+    /// structural penalties carry a fixed per-axis shape bound to one shared `d`
+    /// (reshape to `(n_eff × d)`, per-axis thresholds, a `(n_eff × d × d)`
+    /// precision stack) and cannot dispatch on mixed dims without silently
+    /// truncating or padding axes.
     ///
-    /// Two penalty sources are covered so the check cannot be bypassed:
-    /// * REGISTRY row-block penalties, detected via
-    ///   [`sae_penalty_is_row_block_supported`] on the Psi-tier descriptors; and
-    /// * NATIVE ARD, which rides the separate `native_ard_enabled` FFI flag and
-    ///   is NOT a registry descriptor, so the registry validator alone cannot
-    ///   see the heterogeneous + `ard_per_atom`-only case.
+    /// The engine self-protects here so a genuine incompatibility surfaces as a
+    /// direct, actionable error at the FFI boundary rather than as a deep
+    /// `RemlConvergenceError` mid-REML (the failure mode
+    /// [`Self::validate_analytic_penalty_registry`] otherwise produces during
+    /// `assemble_arrow_schur`).
+    ///
+    /// Native ARD rides the separate `native_ard_enabled` FFI flag rather than a
+    /// registry descriptor, but because it composes it is admitted on a mixed
+    /// dictionary; only a NON-composing REGISTRY penalty triggers the refusal.
     ///
     /// Homogeneous coord dims (including `K == 1`) always pass, as does a
-    /// heterogeneous dictionary that carries no conflicting penalty.
+    /// heterogeneous dictionary that carries only composing penalties.
     pub fn validate_heterogeneous_atom_compatibility(
         &self,
         registry: Option<&AnalyticPenaltyRegistry>,
@@ -2042,25 +2070,32 @@ impl SaeManifoldTerm {
             // Homogeneous coord dims: every row-block penalty dispatches cleanly.
             return Ok(());
         };
-        // A registry row-block coord penalty is exactly a Psi-tier descriptor
-        // accepted by `sae_penalty_is_row_block_supported` (the same predicate
-        // `validate_analytic_penalty_registry` uses to gate the "t" row block).
-        let registry_row_block = registry.is_some_and(|reg| {
-            reg.penalties.iter().any(|penalty| {
-                penalty.tier() == PenaltyTier::Psi && sae_penalty_is_row_block_supported(penalty)
+        // Native ARD (the `native_ard_enabled` flag) composes over heterogeneous
+        // coord dims: `ard_value` sums per atom over `d_k` axes with a per-atom
+        // `log_ard[k]` of length `d_k`, so a mixed dictionary is its native shape
+        // and it never forces a uniform `atom_dim`. Only the fixed-`d` structural
+        // REGISTRY penalties do — detect them via the composability predicate.
+        let non_composing = registry.and_then(|reg| {
+            reg.penalties.iter().find(|penalty| {
+                penalty.tier() == PenaltyTier::Psi
+                    && sae_penalty_is_row_block_supported(penalty)
+                    && !sae_row_block_penalty_composes_over_heterogeneous_coord_dims(penalty)
             })
         });
-        if !(registry_row_block || native_ard_enabled) {
+        let Some(offender) = non_composing else {
             return Ok(());
-        }
+        };
         Err(format!(
-            "SAE-manifold fit refuses a row-block analytic penalty on heterogeneous \
-             atom coordinate dims (saw {first} and {mismatch}): the row-block penalties \
-             (isometry, native ARD, SCAD-MCP coord sparsity, block-orthogonality) target \
-             the unified \"t\" latent block whose declared `d` matches a single shape, so \
-             mixed per-atom coordinate dims cannot be dispatched (they would silently \
-             truncate or pad axes). Either configure a uniform atom_dim for all atoms, or \
-             disable the conflicting penalties (isometry / ard / scad-mcp / block-orthogonality)."
+            "SAE-manifold fit refuses row-block analytic penalty {:?} on heterogeneous \
+             atom coordinate dims (saw {first} and {mismatch}): this penalty carries a \
+             fixed per-axis structure bound to one shared `d` (BlockOrthogonality reshapes \
+             to `(n_eff × d)` and groups axes; TopK/JumpReLU hold per-axis thresholds; the \
+             row-precision priors hold a `(n_eff × d × d)` stack), so mixed per-atom \
+             coordinate dims cannot be dispatched (they would silently truncate or pad axes). \
+             Either configure a uniform atom_dim for all atoms, or drop this penalty. The \
+             dim-adaptive row-block penalties — SCAD-MCP, sparsity, native ARD, isometry — \
+             compose on a mixed dictionary and are admitted.",
+            offender.name()
         ))
     }
 

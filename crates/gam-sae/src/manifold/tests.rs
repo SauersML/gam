@@ -990,6 +990,123 @@ pub(crate) fn scad_coord_penalty_active_on_euclidean_axis() {
     assert_eq!(compacted.len(), 0, "compacted target must be empty");
 }
 
+/// Behavioral certificate for the periodic-axis SCAD/MCP exemption (issue
+/// #795, reviewer item F7): the origin-anchored magnitude shrinkage must exert
+/// **no angular preference** on a Circle atom, so it cannot pin occupancy
+/// toward the (arbitrary, post-canonicalization) chart origin — the exact
+/// occupancy statistics `coordinate_fidelity` certifies.
+///
+/// The crisp, fit-free form of "no origin-pinning": the SCAD *contribution* to
+/// the penalized objective (`with_scad − without`) is identically zero for two
+/// occupancy-wise OPPOSITE configurations — rows spread uniformly around the
+/// circle (mean-resultant length `R ≈ 0`, near-uniform occupancy) versus rows
+/// collapsed at the origin (`R ≈ 1`, degenerate occupancy). If SCAD pinned
+/// toward the origin it would assign the spread config strictly higher energy
+/// than the collapsed one; instead both contributions are zero, so the penalty
+/// is blind to angular position and leaves the occupancy distribution
+/// unbiased. The old unrestricted energy scored these two configs ≈ `5·Σ|t|`
+/// apart, actively rewarding the collapsed (origin-pinned) occupancy.
+#[test]
+pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
+    use gam_terms::analytic_penalties::{PenaltyConcavity, ScadMcpPenalty};
+
+    // Mean-resultant length of a set of circle coordinates (period 1): the
+    // standard directional-occupancy concentration statistic. R→0 is uniform
+    // occupancy, R→1 is a single-point (maximally biased) occupancy.
+    fn resultant_length(coords: &Array2<f64>) -> f64 {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let (mut cx, mut sy) = (0.0_f64, 0.0_f64);
+        for row in 0..coords.nrows() {
+            let a = two_pi * coords[[row, 0]];
+            cx += a.cos();
+            sy += a.sin();
+        }
+        let n = coords.nrows() as f64;
+        ((cx / n).powi(2) + (sy / n).powi(2)).sqrt()
+    }
+
+    // SCAD contribution (with − without) to the penalized objective for a pure
+    // Circle atom holding `coords`, under a large-weight SCAD shrinkage that
+    // would dominate the objective if it were (wrongly) active on the axis.
+    let scad_contribution = |coords: Array2<f64>| -> f64 {
+        let n = coords.nrows();
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.2_f64], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let coord = &term.assignment.coords[0];
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let scad = ScadMcpPenalty::new(
+            PsiSlice::full(coord.len(), Some(coord.latent_dim())),
+            5.0,
+            coord.n_obs(),
+            3.7,
+            1.0e-3,
+            PenaltyConcavity::Scad,
+            false,
+        )
+        .unwrap();
+        registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(scad)));
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0_f64]]);
+        let target = Array2::<f64>::zeros((n, 1));
+        let with_scad = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .unwrap();
+        let without = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .unwrap();
+        with_scad - without
+    };
+
+    // Occupancy-wise opposite configurations.
+    let spread = array![[0.05_f64], [0.25], [0.5], [0.75], [0.95]];
+    let collapsed = array![[0.0_f64], [0.001], [0.0], [0.002], [0.001]];
+    assert!(
+        resultant_length(&spread) < 0.1,
+        "spread config should have near-uniform occupancy (R≈0), got {}",
+        resultant_length(&spread)
+    );
+    assert!(
+        resultant_length(&collapsed) > 0.99,
+        "collapsed config should have degenerate occupancy (R≈1), got {}",
+        resultant_length(&collapsed)
+    );
+
+    let c_spread = scad_contribution(spread);
+    let c_collapsed = scad_contribution(collapsed);
+    // No angular preference: zero energy for BOTH, so their difference — the
+    // origin-pinning force the old code applied — is also zero.
+    assert!(
+        c_spread.abs() < 1.0e-12,
+        "SCAD must add zero energy on a spread circle occupancy, got {c_spread}"
+    );
+    assert!(
+        c_collapsed.abs() < 1.0e-12,
+        "SCAD must add zero energy on a collapsed circle occupancy, got {c_collapsed}"
+    );
+    assert!(
+        (c_spread - c_collapsed).abs() < 1.0e-12,
+        "SCAD must not prefer origin-collapsed over spread occupancy \
+             (origin-pinning bias): spread={c_spread}, collapsed={c_collapsed}"
+    );
+}
+
 /// The von-Mises coordinate-prior curvature `V'' = α·cos(κt)` is indefinite
 /// (negative for |t| past a quarter period). Writing it raw into the
 /// Newton/Schur `htt` diagonal at K=2 made the per-row coordinate block, and
@@ -6175,29 +6292,38 @@ fn hetero_compat_term(d0: usize, d1: usize) -> SaeManifoldTerm {
     .unwrap()
 }
 
-/// #2098 (SPEC-8) — the heterogeneous-`d_atom` + row-block-penalty guard, moved
-/// out of the Python facade into `SaeManifoldTerm::validate_heterogeneous_atom_compatibility`.
-/// It must refuse a heterogeneous dictionary when a conflicting row-block "t"-block
-/// penalty is present via EITHER source (a registry descriptor OR the native-ARD
-/// FFI flag), and admit every other case.
+/// #2098 (SPEC-8) / F6 — the heterogeneous-`d_atom` + row-block-penalty guard,
+/// after the F6 composition split. It must refuse a heterogeneous dictionary
+/// ONLY when a *non-composing*, fixed-`d` structural row-block penalty is present
+/// (block-orthogonality / TopK / JumpReLU / row-precision), and ADMIT the
+/// dim-adaptive penalties that compose per atom (SCAD-MCP, sparsity, native ARD,
+/// isometry) — those are exactly what the flagship evidence-heterogeneous
+/// dictionary + gauge/ARD machinery need to run together.
 #[test]
 pub(crate) fn validate_heterogeneous_atom_compatibility_covers_registry_and_native_ard() {
-    use gam_terms::analytic_penalties::IsometryPenalty;
+    use gam_terms::analytic_penalties::{
+        BlockOrthogonalityPenalty, IsometryPenalty, PenaltyConcavity, ScadMcpPenalty,
+    };
 
-    // A registry holding a single row-block "t"-block penalty (Isometry). The
-    // slice/latent_dim only need to construct validly; detection keys off the
-    // penalty KIND (`sae_penalty_is_row_block_supported`), not its interior.
-    let mut row_block_registry = AnalyticPenaltyRegistry::new();
-    row_block_registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
-        IsometryPenalty::new_euclidean(PsiSlice::full(4 * 2, Some(2)), 2),
-    )));
+    let hetero = hetero_compat_term(2, 1);
     let empty_registry = AnalyticPenaltyRegistry::new();
 
-    // (a) heterogeneous coord dims + a row-block registry penalty ⇒ Err.
-    let hetero = hetero_compat_term(2, 1);
+    // (a) NON-composing structural penalty (BlockOrthogonality: reshapes to
+    // `(n_eff × d)` and groups a fixed axis set) on heterogeneous dims ⇒ Err.
+    let mut structural_registry = AnalyticPenaltyRegistry::new();
+    structural_registry.push(AnalyticPenaltyKind::BlockOrthogonality(Arc::new(
+        BlockOrthogonalityPenalty::new(
+            PsiSlice::full(4 * 2, Some(2)),
+            vec![vec![0], vec![1]],
+            1.0,
+            4,
+            false,
+        )
+        .unwrap(),
+    )));
     let err = hetero
-        .validate_heterogeneous_atom_compatibility(Some(&row_block_registry), false)
-        .expect_err("heterogeneous dims + a row-block registry penalty must be refused");
+        .validate_heterogeneous_atom_compatibility(Some(&structural_registry), false)
+        .expect_err("heterogeneous dims + a fixed-d structural penalty must be refused");
     assert!(
         err.contains("heterogeneous atom coordinate dims"),
         "message must name the heterogeneous conflict: {err}"
@@ -6206,28 +6332,167 @@ pub(crate) fn validate_heterogeneous_atom_compatibility_covers_registry_and_nati
         err.contains("uniform atom_dim"),
         "message must name the uniform-dims resolution: {err}"
     );
+    assert!(
+        err.contains("block_orthogonality"),
+        "message must name the offending penalty kind: {err}"
+    );
 
-    // (b) heterogeneous coord dims + native ARD (the FFI flag, NOT a registry
-    // descriptor) ⇒ Err even with no conflicting registry penalty.
+    // (b) COMPOSING penalties on heterogeneous dims ⇒ Ok. These are the
+    // dim-adaptive row-block penalties the flagship mixed dictionary relies on.
+    let mut iso_registry = AnalyticPenaltyRegistry::new();
+    iso_registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+        IsometryPenalty::new_euclidean(PsiSlice::full(4 * 2, Some(2)), 2),
+    )));
+    hetero
+        .validate_heterogeneous_atom_compatibility(Some(&iso_registry), false)
+        .expect("isometry gauge composes per atom on a heterogeneous dictionary");
+
+    let mut scad_registry = AnalyticPenaltyRegistry::new();
+    scad_registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(
+        ScadMcpPenalty::new(
+            PsiSlice::full(4 * 2, Some(2)),
+            1.0,
+            4,
+            3.7,
+            1.0e-3,
+            PenaltyConcavity::Scad,
+            false,
+        )
+        .unwrap(),
+    )));
+    hetero
+        .validate_heterogeneous_atom_compatibility(Some(&scad_registry), false)
+        .expect("element-wise SCAD-MCP composes on a heterogeneous dictionary");
+
+    // (c) native ARD (the FFI flag) composes per atom over `d_k` ⇒ Ok on
+    // heterogeneous dims, with or without a registry. This is the change from the
+    // pre-F6 blanket refusal: `ard_value` is already a per-atom sum over `d_k`.
     hetero
         .validate_heterogeneous_atom_compatibility(Some(&empty_registry), true)
-        .expect_err("heterogeneous dims + native ARD must be refused");
+        .expect("native ARD composes per atom on a heterogeneous dictionary");
     hetero
         .validate_heterogeneous_atom_compatibility(None, true)
-        .expect_err("heterogeneous dims + native ARD (no registry) must be refused");
+        .expect("native ARD (no registry) composes per atom on a heterogeneous dictionary");
+    // ARD + isometry gauge together — the flagship combination — on mixed dims.
+    hetero
+        .validate_heterogeneous_atom_compatibility(Some(&iso_registry), true)
+        .expect("ARD + isometry gauge compose together on a heterogeneous dictionary");
 
-    // (c) homogeneous coord dims ⇒ Ok even with the row-block penalty AND ARD.
-    let homo = hetero_compat_term(1, 1);
-    homo.validate_heterogeneous_atom_compatibility(Some(&row_block_registry), true)
+    // (d) a structural penalty is fine on HOMOGENEOUS dims (nothing to dispatch
+    // ambiguously) — the refusal is specifically about mixed `d_k`.
+    let homo = hetero_compat_term(2, 2);
+    homo.validate_heterogeneous_atom_compatibility(Some(&structural_registry), true)
         .expect("homogeneous coord dims dispatch every row-block penalty cleanly");
 
-    // (d) heterogeneous coord dims but no conflicting penalty and no ARD ⇒ Ok.
+    // (e) heterogeneous dims, no penalty, no ARD ⇒ Ok.
     hetero
         .validate_heterogeneous_atom_compatibility(Some(&empty_registry), false)
         .expect("heterogeneous dims with no row-block penalty and no ARD is admitted");
     hetero
         .validate_heterogeneous_atom_compatibility(None, false)
         .expect("heterogeneous dims with no registry and no ARD is admitted");
+}
+
+/// Build a single-block SAE term over `(manifold, coords)` with an arbitrary
+/// `EuclideanPatch`-shaped decoder. `ard_value` reads only the coord values and
+/// the coord manifold (for per-axis periodicity), so this is enough to exercise
+/// the native-ARD energy on any atom dim — no basis evaluator / second jet
+/// needed. `coords` is `(n × d)`.
+fn ard_atom_and_coord(
+    name: &'static str,
+    manifold: LatentManifold,
+    coords: Array2<f64>,
+) -> (SaeManifoldAtom, LatentManifold, Array2<f64>) {
+    let (n, d) = coords.dim();
+    let m = 2usize;
+    let p = 3usize;
+    let atom = SaeManifoldAtom::new(
+        name,
+        SaeAtomBasisKind::EuclideanPatch,
+        d,
+        Array2::<f64>::ones((n, m)),
+        Array3::<f64>::zeros((n, m, d)),
+        Array2::<f64>::zeros((m, p)),
+        Array2::<f64>::eye(m),
+    )
+    .unwrap();
+    (atom, manifold, coords)
+}
+
+/// F6 (fit-level composition): the native ARD energy on a coordinate-
+/// HETEROGENEOUS `{circle d=1, patch d=2, linear d=1}` dictionary is *exactly*
+/// the sum of the per-atom ARD energies — the same per-atom-additive
+/// decomposition the Laplace/REML evidence sums over atoms — so admitting ARD on
+/// a mixed dictionary (the F6 composition) keeps the evidence exact with no
+/// padding or truncation. This is the concrete counterpart to the validator
+/// test: the gate opens (validator) AND the energy it lets through composes
+/// correctly (this test). A circle axis contributes the von-Mises energy, the
+/// Euclidean axes the Gaussian one, each read against the atom's own `d_k`.
+#[test]
+pub(crate) fn native_ard_energy_composes_additively_on_mixed_dictionary() {
+    let n = 3usize;
+    // {circle d=1, patch d=2, linear d=1}: exactly F6's flagship mixed shape.
+    let circle_coords = array![[0.1_f64], [0.6], [0.9]];
+    let patch_coords = array![[0.2_f64, -0.3], [0.5, 0.4], [-0.1, 0.7]];
+    let linear_coords = array![[1.0_f64], [-0.5], [0.3]];
+    let circle_m = LatentManifold::Circle { period: 1.0 };
+    let patch_m = LatentManifold::Product(vec![LatentManifold::Euclidean; 2]);
+    let linear_m = LatentManifold::Euclidean;
+
+    // Per-atom log-ARD strengths, lengths d_k = [1, 2, 1] (heterogeneous).
+    let ard0 = array![0.2_f64];
+    let ard1 = array![0.1_f64, -0.3];
+    let ard2 = array![-0.15_f64];
+
+    // Joint mixed term (K = 3).
+    let (a0, m0, c0) = ard_atom_and_coord("circle", circle_m.clone(), circle_coords.clone());
+    let (a1, m1, c1) = ard_atom_and_coord("patch", patch_m.clone(), patch_coords.clone());
+    let (a2, m2, c2) = ard_atom_and_coord("linear", linear_m.clone(), linear_coords.clone());
+    let joint_assign = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 3)),
+        vec![c0, c1, c2],
+        vec![m0, m1, m2],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let joint = SaeManifoldTerm::new(vec![a0, a1, a2], joint_assign).unwrap();
+    let joint_rho =
+        SaeManifoldRho::new(0.0, 0.0, vec![ard0.clone(), ard1.clone(), ard2.clone()]);
+    let joint_energy = joint.ard_value(&joint_rho).unwrap();
+
+    // Per-atom single-block terms, each with the SAME coords / manifold / ARD.
+    let single_energy = |name: &'static str,
+                         manifold: LatentManifold,
+                         coords: Array2<f64>,
+                         ard: Array1<f64>|
+     -> f64 {
+        let (atom, m, c) = ard_atom_and_coord(name, manifold, coords);
+        let assign = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![c],
+            vec![m],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assign).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![ard]);
+        term.ard_value(&rho).unwrap()
+    };
+    let sum = single_energy("circle", circle_m, circle_coords, ard0)
+        + single_energy("patch", patch_m, patch_coords, ard1)
+        + single_energy("linear", linear_m, linear_coords, ard2);
+
+    assert!(
+        (joint_energy - sum).abs() < 1.0e-12,
+        "native ARD must compose additively over a mixed dictionary: \
+             joint={joint_energy}, per-atom sum={sum}"
+    );
+    // Sanity: the energy is genuinely non-trivial (not a vacuous 0 == 0), so the
+    // additivity above is a real check on the heterogeneous evaluation.
+    assert!(
+        joint_energy.abs() > 1.0e-6,
+        "mixed-dictionary ARD energy should be non-trivial, got {joint_energy}"
+    );
 }
 
 #[derive(Debug)]

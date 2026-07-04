@@ -2167,6 +2167,14 @@ pub enum SchurPreconditionerKind {
     Diagonal,
     BetaBlockJacobi,
     ClusterJacobi,
+    /// Cluster-Jacobi whose blocks come from the bounded co-visibility PARTITION
+    /// (`BetaCouplingGraph::covisibility_cluster_partition`) rather than the
+    /// connected-component partition. At real over-complete widths the co-firing
+    /// graph is a single giant component, so plain `ClusterJacobi` exceeds the
+    /// size cap and degrades to scalar Jacobi; this tier splits that component
+    /// into bounded strongly-co-firing clusters so the dense per-cluster factor
+    /// conditions the cross-atom coupling scalar Jacobi cannot see.
+    CoVisibilityClusterJacobi,
     AdditiveSchwarz { overlap: usize },
     DiagAssembledSchwarz { overlap: usize },
     BlockIncompleteCholesky,
@@ -2233,6 +2241,29 @@ impl std::fmt::Debug for ClusterFactor {
 
 /// Maximum columns per cluster before scalar fallback.
 pub(crate) const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
+
+/// Host-memory budget for ONE cluster's dense reduced-Schur Cholesky factor
+/// (the `b×b` f64 `L` the cluster-Jacobi preconditioner stores and applies).
+///
+/// The co-visibility cluster partition caps a cluster's total column count `b`
+/// at the largest value whose factor fits this budget, `b_max = ⌊√(budget/8)⌋`
+/// (`8b²` bytes for an `f64` `b×b` factor). This DERIVES the cluster-size cap
+/// from the factor's memory footprint rather than asserting a bare number:
+/// beyond `b_max` the dense factor's `O(b²)` apply also throttles the CG
+/// iteration budget, so the cap is the point past which a single dense block
+/// stops being the right preconditioner and the partition must split instead.
+/// 2 MiB ⇒ `b_max = 512`, pinned equal to [`CLUSTER_JACOBI_MAX_CLUSTER`] by
+/// [`tests::covisibility_cap_is_derived_from_factor_budget`] so the co-visibility
+/// partition and the legacy scalar-fallback ceiling agree by construction.
+pub(crate) const CLUSTER_SCHUR_FACTOR_BYTES_BUDGET: u128 = 2 * 1024 * 1024;
+
+/// Derived co-visibility cluster-size cap (columns): the largest `b` whose dense
+/// `b×b` f64 Cholesky factor fits [`CLUSTER_SCHUR_FACTOR_BYTES_BUDGET`]. See that
+/// constant for the memory justification. Never below 1.
+pub(crate) fn covisibility_cluster_max_cols() -> usize {
+    let b = ((CLUSTER_SCHUR_FACTOR_BYTES_BUDGET / 8) as f64).sqrt().floor() as usize;
+    b.max(1)
+}
 
 /// Maximum columns in a single connected component for which the IC(0)
 /// preconditioner assembles the dense `S[C,C]` to derive its sparsity pattern.
@@ -2329,6 +2360,40 @@ pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
     s_block
 }
 
+/// Column groups for the bounded co-visibility cluster preconditioner.
+///
+/// Builds the weighted co-firing graph over `sys.block_offsets` and returns the
+/// column sets of its bounded co-visibility partition
+/// (`BetaCouplingGraph::covisibility_cluster_partition`), each capped at
+/// [`covisibility_cluster_max_cols`] columns. With no registered block offsets
+/// there is no block structure to cluster, so the whole `0..k` border is one
+/// group (identical to the component-partition builders' `block_offsets`-empty
+/// case). Each group's columns are sorted ascending.
+pub(crate) fn covisibility_column_groups(sys: &ArrowSchurSystem) -> Vec<Vec<usize>> {
+    if sys.block_offsets.is_empty() {
+        return vec![(0..sys.k).collect()];
+    }
+    let graph = BetaCouplingGraph::build(
+        &sys.block_offsets,
+        &sys.rows
+            .iter()
+            .map(|r| r.htbeta.clone())
+            .collect::<Vec<_>>(),
+    );
+    graph
+        .covisibility_cluster_partition(&sys.block_offsets, covisibility_cluster_max_cols())
+        .iter()
+        .map(|blocks| {
+            let mut cols: Vec<usize> = blocks
+                .iter()
+                .flat_map(|&b| sys.block_offsets[b].clone())
+                .collect();
+            cols.sort_unstable();
+            cols
+        })
+        .collect()
+}
+
 /// Dense Schur block per connected component of the beta-coupling graph.
 ///
 /// Nodes = beta blocks (`block_offsets`); edges = rows where two blocks
@@ -2369,6 +2434,37 @@ impl ClusterJacobiPreconditioner {
                 cols
             })
             .collect();
+        Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
+    }
+
+    /// Cluster-Jacobi from the bounded CO-VISIBILITY partition (Kushal & Agarwal,
+    /// CVPR 2012) — the default above the size cap.
+    ///
+    /// [`Self::from_arrow_schur`] groups β-blocks by CONNECTED COMPONENT of the
+    /// co-firing graph. At real over-complete SAE widths that graph is a single
+    /// giant component (transitive co-firing), so the lone component's column
+    /// count exceeds [`CLUSTER_JACOBI_MAX_CLUSTER`] and
+    /// [`Self::build_from_column_groups`] degrades the whole tier to the scalar
+    /// reciprocal diagonal — the scaling ceiling (cross-atom coupling through
+    /// co-activating atoms with overlapping ambient subspaces is dropped, and PCG
+    /// iteration counts blow up). This builder instead partitions the co-firing
+    /// graph into clusters bounded by [`covisibility_cluster_max_cols`], keeping
+    /// the strongest co-firing edges inside a cluster, so each cluster's dense
+    /// Cholesky conditions the strong cross-atom coupling the scalar diagonal
+    /// misses while staying inside the per-factor memory budget.
+    ///
+    /// With no registered `block_offsets` (or a graph that fits the cap in one
+    /// piece) the partition is a single group and this coincides with
+    /// [`Self::from_arrow_schur`]. Because the preconditioner only steers the CG
+    /// iterate over the SAME reduced operator, the solve converges to the SAME
+    /// reduced-system solution regardless of the partition — REML-neutral.
+    pub(crate) fn from_arrow_schur_covisibility<B: BatchedBlockSolver + Sync>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &ArrowFactorSlab,
+        ridge_beta: f64,
+        backend: &B,
+    ) -> Result<Self, ArrowSchurError> {
+        let col_groups = covisibility_column_groups(sys);
         Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
     }
 
@@ -3083,7 +3179,7 @@ pub fn arrow_precond_ladder_iteration_study(
         })
     };
 
-    let mut out: Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)> = Vec::with_capacity(6);
+    let mut out: Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)> = Vec::with_capacity(7);
 
     // Scalar Diagonal Jacobi: force the scalar path by clearing block_offsets on
     // a clone so the build does not pick up the per-block dense Schur blocks.
@@ -3128,6 +3224,19 @@ pub fn arrow_precond_ladder_iteration_study(
             .ok()
             .and_then(|p| run(&|r| p.apply(r)));
     out.push((SchurPreconditionerKind::ClusterJacobi, cluster_row));
+
+    let covis_row = ClusterJacobiPreconditioner::from_arrow_schur_covisibility(
+        sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+    )
+    .ok()
+    .and_then(|p| run(&|r| p.apply(r)));
+    out.push((
+        SchurPreconditionerKind::CoVisibilityClusterJacobi,
+        covis_row,
+    ));
 
     let schwarz_row =
         AdditiveSchwarzPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend, 1)
@@ -3382,8 +3491,22 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     // LM loop (it only arises if the floored Jacobi tier merely ran out of
     // iterations yet a coarser preconditioner still finds an indefinite
     // direction — rare; the LM loop re-forms at a heavier ridge).
-    let cluster =
-        ClusterJacobiPreconditioner::from_arrow_schur(sys, htt_factors, effective_ridge, backend)?;
+    // Default cluster tier: the bounded CO-VISIBILITY partition, not the
+    // connected-component partition. At the SAE widths this ladder targets the
+    // co-firing graph is one giant component, so the component partition exceeds
+    // the size cap and `from_arrow_schur` degrades to scalar Jacobi (the ceiling
+    // this tier exists to lift). `from_arrow_schur_covisibility` splits that
+    // component into bounded strongly-co-firing clusters whose dense factors
+    // condition the cross-atom coupling scalar Jacobi drops. The component
+    // partition stays selectable via `from_arrow_schur` (used by the ladder
+    // study and its regression gates). Both precondition the SAME operator, so
+    // the converged step — and the REML optimum — is unchanged.
+    let cluster = ClusterJacobiPreconditioner::from_arrow_schur_covisibility(
+        sys,
+        htt_factors,
+        effective_ridge,
+        backend,
+    )?;
     let (x1, diag1) = run_pcg_with_preconditioner(
         sys,
         htt_factors,

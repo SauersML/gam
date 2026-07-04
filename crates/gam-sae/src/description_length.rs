@@ -28,6 +28,8 @@
 
 use std::f64::consts::LN_2;
 
+use crate::atom_codes::SparseAtomCodes;
+
 /// Bits to code one Gaussian scalar of variance `signal_var` to per-sample MSE
 /// `delta2`: the numerically-kind rate `½log₂(1 + σ²/δ²)` (≥ 0, finite at low SNR;
 /// agrees with the high-rate `½log₂(σ²/δ²)` to O(1) bit once `σ² ≫ δ²`).
@@ -100,6 +102,16 @@ pub struct Featurizer {
     pub n_firings: i64,
     pub g_dict: i64,
     pub k_active: i64,
+    /// Empirical per-token support-entropy selection currency `H(S)` in bits
+    /// (the Chow–Liu tree estimate from
+    /// [`SparseAtomCodes::support_entropy`](crate::atom_codes::SparseAtomCodes::support_entropy)),
+    /// when the binary support matrix is available. When `Some`, this is the
+    /// DEFAULT selection price the featurizer is scored at — the reviewer-required
+    /// correction so a tiling dictionary's predictable co-firing is not overpaid
+    /// at the combinatorial worst case `log₂ C(G, k)`. When `None`, the scoring
+    /// surface falls back to that combinatorial bound. The combinatorial line is
+    /// reported ALONGSIDE the currency in either case (never dropped).
+    pub support_entropy_bits: Option<f64>,
 }
 
 impl Featurizer {
@@ -108,6 +120,29 @@ impl Featurizer {
     }
     pub fn residual(&self) -> f64 {
         (1.0 - self.ev) * self.total_var
+    }
+
+    /// The combinatorial (uniform-support) per-token selection price
+    /// `log₂ C(G, k)` — the worst case, always reported.
+    pub fn selection_bits_combinatorial(&self) -> f64 {
+        selection_bits(self.g_dict, self.k_active)
+    }
+
+    /// The selection price this featurizer is CHARGED per token: the empirical
+    /// support entropy `H(S)` when available (the default currency), else the
+    /// combinatorial worst case.
+    pub fn selection_bits_charged(&self) -> f64 {
+        self.support_entropy_bits
+            .unwrap_or_else(|| self.selection_bits_combinatorial())
+    }
+
+    /// Attach the empirical support-entropy selection currency estimated from the
+    /// binary support matrix `codes`, making `H(S)` (the Chow–Liu tree bits) the
+    /// default selection price this featurizer is scored with. The combinatorial
+    /// `log₂ C(G, k)` remains reported as the worst-case line.
+    pub fn with_support_entropy(mut self, codes: &SparseAtomCodes) -> Self {
+        self.support_entropy_bits = Some(codes.support_entropy().tree_bits);
+        self
     }
 }
 
@@ -119,7 +154,15 @@ pub struct ScoreRow {
     pub coded_dim_m: usize,
     pub code_bits_per_firing: f64,
     pub code_coeff_bits_per_firing: f64,
+    /// The selection bits per firing actually CHARGED — the empirical support
+    /// entropy `H(S)` when `feat.support_entropy_bits` is set (the default
+    /// currency), else the combinatorial `log₂ C(G, k)`.
     pub selection_bits_per_firing: f64,
+    /// The combinatorial worst-case selection price `log₂ C(G, k)`, reported
+    /// alongside the charged currency in every row (the reviewer's worst-case
+    /// line). Equals `selection_bits_per_firing` when no support entropy was
+    /// supplied.
+    pub selection_bits_combinatorial_per_firing: f64,
     pub n_params: i64,
     pub l_param_bits: f64,
     pub dict_bits: f64,
@@ -143,7 +186,8 @@ pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> Score
         .iter()
         .map(|&v| scalar_rate_bits(v, delta2))
         .sum();
-    let sel = selection_bits(feat.g_dict, feat.k_active);
+    let sel_comb = feat.selection_bits_combinatorial();
+    let sel = feat.selection_bits_charged();
     let code_per_firing = code_coeff + sel;
     let m = feat.m();
     let l_param = l_param_bits.unwrap_or_else(|| {
@@ -164,6 +208,7 @@ pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> Score
         code_bits_per_firing: code_per_firing,
         code_coeff_bits_per_firing: code_coeff,
         selection_bits_per_firing: sel,
+        selection_bits_combinatorial_per_firing: sel_comb,
         n_params: feat.n_params,
         l_param_bits: l_param,
         dict_bits,
@@ -187,7 +232,15 @@ pub struct Crossover {
     pub chart: String,
     pub delta_code_bits_per_firing: f64,
     pub delta_coeff_bits_per_firing: f64,
+    /// Selection-bits delta `sel_block − sel_chart` in the CHARGED currency
+    /// (support entropy `H(S)` when supplied, else combinatorial). This is what
+    /// feeds `f*`.
     pub selection_bits_delta: f64,
+    /// The same delta in the combinatorial worst-case currency `log₂ C(G, k)`,
+    /// reported alongside so the entropy correction to the reported gap is
+    /// visible. Equals `selection_bits_delta` when neither side supplied a
+    /// support entropy.
+    pub selection_bits_delta_combinatorial: f64,
     pub selection_asymmetric: bool,
     pub phi_extra_params: i64,
     pub r_per_freed_coord_bits: f64,
@@ -224,10 +277,17 @@ pub fn crossover_firings(
         .iter()
         .map(|&v| scalar_rate_bits(v, delta2))
         .sum();
-    let sel_b = selection_bits(block.g_dict, block.k_active);
-    let sel_c = selection_bits(chart.g_dict, chart.k_active);
+    // Selection currency: charge BOTH sides the empirical support entropy `H(S)`
+    // when supplied (the default), else the combinatorial worst case. The
+    // combinatorial delta is computed unconditionally and reported alongside, so
+    // the entropy correction to the reported gap is always visible.
+    let sel_b_comb = block.selection_bits_combinatorial();
+    let sel_c_comb = chart.selection_bits_combinatorial();
+    let sel_b = block.selection_bits_charged();
+    let sel_c = chart.selection_bits_charged();
     let dcode_coeff = code_b - code_c;
     let dsel = sel_b - sel_c;
+    let dsel_comb = sel_b_comb - sel_c_comb;
     let dcode = dcode_coeff + dsel;
     let phi = chart.n_params - block.n_params;
     let mb = block.m();
@@ -250,6 +310,7 @@ pub fn crossover_firings(
         delta_code_bits_per_firing: dcode,
         delta_coeff_bits_per_firing: dcode_coeff,
         selection_bits_delta: dsel,
+        selection_bits_delta_combinatorial: dsel_comb,
         selection_asymmetric: (block.g_dict, block.k_active) != (chart.g_dict, chart.k_active),
         phi_extra_params: phi,
         r_per_freed_coord_bits: r_per_coord,

@@ -4877,6 +4877,11 @@ fn sae_coordinate_fidelity_dict<'py>(
                 a.set_item("min_speed_over_mean", fid.min_speed_over_mean)?;
                 a.set_item("max_speed_over_mean", fid.max_speed_over_mean)?;
                 a.set_item("log_speed_rms", fid.log_speed_rms)?;
+                // F2 two-part split: chart honesty vs occupancy law.
+                a.set_item("chart_honest", fid.chart_honest)?;
+                a.set_item("occupancy", fid.occupancy)?;
+                a.set_item("occupancy_anchors", fid.occupancy_anchors)?;
+                a.set_item("occupancy_d_eff", fid.occupancy_d_eff)?;
             }
             None => {
                 a.set_item("topology", py.None())?;

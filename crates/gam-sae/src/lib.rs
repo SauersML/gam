@@ -18,6 +18,7 @@ pub mod identifiability;
 pub mod inference;
 pub mod k_selection;
 pub mod manifold;
+pub mod null_sampler;
 pub mod row_jet_program;
 pub mod sparse_dict;
 pub mod structure_harvest;

@@ -208,6 +208,18 @@ pub struct SaeManifoldFitDiagnostics {
     /// coordinate quality — which reconstruction EV provably does not certify
     /// (see [`AtomCoordinateFidelity`]).
     pub coordinate_fidelity: Vec<Option<AtomCoordinateFidelity>>,
+    /// Reviewer-F3 persistent-homology topology audit: for each atom, the
+    /// Vietoris–Rips persistence of its assigned-row image points confronted
+    /// with the topology the raced type predicts. `Some(..)` carries the
+    /// measured components/loops and the first-class
+    /// [`AtomTopologyPersistence::contested`] flag (raised when the measured
+    /// topology disagrees with the latched race winner — extra components, a
+    /// missing predicted loop, or an unpredicted loop), which the probe planner
+    /// reads to re-adjudicate rather than trust the winner. `None` for atoms
+    /// whose topology is caller-supplied ([`SaeAtomBasisKind::Precomputed`]) or
+    /// with too few assigned rows to resolve H₁. One entry per fitted atom in
+    /// atom order.
+    pub topology_persistence: Vec<Option<AtomTopologyPersistence>>,
 }
 
 /// Honest trust-diagnostics payload for the Python `diagnostics` block (#1005).

@@ -2028,6 +2028,54 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
     )
 }
 
+/// Whether a row-block coordinate penalty **composes over a
+/// coordinate-heterogeneous dictionary** — i.e. its energy is a sum of
+/// independent per-atom contributions, each evaluated on that atom's own
+/// `(n_obs × d_k)` latent block with the atom's *own* latent dim `d_k`, so a
+/// single registry entry dispatches cleanly across atoms whose coordinate dims
+/// differ (issue F6). For these the assembled value / gradient / curvature is
+/// *exactly* the sum of the per-atom energies — the same additive
+/// decomposition the Laplace/REML evidence log-det already sums per atom — so
+/// admitting them on a mixed `{d=1 circle, d=2 patch, linear}` dictionary keeps
+/// the evidence exact with zero padding or truncation.
+///
+/// The composing penalties are exactly those with **no fixed cross-axis
+/// structure tied to one shared `d`**:
+/// * [`AnalyticPenaltyKind::ScadMcp`] / [`AnalyticPenaltyKind::Sparsity`] —
+///   coordinate-separable, evaluated element-wise over the flat block; length-
+///   and dim-agnostic (they never read a stored `latent_dim` at eval time).
+/// * [`AnalyticPenaltyKind::Ard`] — the native von-Mises/Gaussian coordinate
+///   ARD is summed per atom over `d_k` axes with a per-atom `log_ard[k]` of
+///   length `d_k` (see `ard_value`), so heterogeneous dims are the native shape,
+///   not a special case.
+/// * [`AnalyticPenaltyKind::Isometry`] — rebuilt per atom by
+///   `corrected_isometry_penalty`, which corrects `p_out` to the atom's true
+///   decoder output dim and refreshes its caches from the atom's own second jet.
+///
+/// The **non-composing** row-block penalties carry a fixed per-axis structure
+/// bound to one shared `d` and would silently misinterpret an atom of a
+/// different dim (reshape to the wrong `(n_eff × d)`, index an out-of-range
+/// axis, or misalign a per-axis threshold / precision):
+/// [`AnalyticPenaltyKind::BlockOrthogonality`] (reshapes to `(n_eff × d)` and
+/// partitions a fixed axis set into groups), [`AnalyticPenaltyKind::JumpReLU`]
+/// and [`AnalyticPenaltyKind::TopKActivation`] (per-axis thresholds / top-k
+/// across a fixed `latent_dim`), and the row-precision priors
+/// ([`AnalyticPenaltyKind::RowPrecisionPrior`],
+/// [`AnalyticPenaltyKind::ParametricRowPrecisionPrior`], which hold a
+/// `(n_eff × d × d)` precision stack). These still require a uniform `atom_dim`
+/// (or an explicit per-dim-group configuration, which is a separate feature).
+pub(crate) fn sae_row_block_penalty_composes_over_heterogeneous_coord_dims(
+    penalty: &AnalyticPenaltyKind,
+) -> bool {
+    matches!(
+        penalty,
+        AnalyticPenaltyKind::ScadMcp(_)
+            | AnalyticPenaltyKind::Sparsity(_)
+            | AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::Isometry(_)
+    )
+}
+
 /// Whether a row-block coordinate penalty is an *origin-anchored, axis-separable
 /// magnitude shrinkage* — its energy is `Σ_axis Σ_row f(|t|)` with a fixed zero,
 /// evaluated independently per flat entry.

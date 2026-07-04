@@ -70,6 +70,7 @@ pub mod designed_target;
 pub mod kernels;
 pub mod ledger_store;
 pub mod object_store;
+pub mod residual_stratify;
 pub mod rho_cascade;
 pub mod shard_reader;
 pub mod warm_state;
@@ -89,6 +90,14 @@ pub use warm_state::{DiskRowWarmCache, RowWarmCache, RowWarmState};
 
 /// Subsample → full-pass ρ schedule with importance weights.
 pub use rho_cascade::{RhoCascadeSchedule, RhoStepPlan, row_in_fraction};
+
+/// Residual-energy-stratified birth screen: make the dictionary tail reachable
+/// by guaranteeing rare high-residual rows representation in the discovery
+/// subsample, with Horvitz–Thompson weights that keep every criterion unbiased.
+pub use residual_stratify::{
+    RowResidualEnergy, SpanResidualEnergy, Stratum, StratumDesign, StratifiedCorpusTarget,
+    collect_stratified_target, design_stratified_subsample,
+};
 
 /// Designed corpus target collection (#991): stream → designed sample +
 /// honesty weights, the row set the term actually fits.
