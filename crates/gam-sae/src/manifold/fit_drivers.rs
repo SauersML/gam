@@ -4,6 +4,59 @@ use super::*;
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
+/// Per-fit-CONSTANT centered statistics of the reconstruction target, shared by
+/// the #976 decoder-norm co-collapse guard's EV and output-energy signals.
+///
+/// The target does not change across the outer loop of
+/// [`SaeManifoldTerm::run_joint_fit_arrow_schur`], so its per-column means and
+/// total centered sum-of-squares are invariants of the whole joint fit. The
+/// guard formerly re-derived them from the full `n × p` target on EVERY accepted
+/// outer iteration ([`SaeManifoldTerm::dictionary_reconstruction_ev`] +
+/// [`SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio`] each ran an
+/// `O(n·p)` column-major reduction), which the single-threaded inner-loop profile
+/// showed dominating the fit. Computing them ONCE per joint fit and handing them
+/// to each iteration's guard call removes that per-iteration cost.
+///
+/// The values are BIT-IDENTICAL to the historical per-call computation:
+/// [`Self::compute`] reuses the exact Welford per-column mean and the exact
+/// single-accumulator column-major total, so every EV / output-energy value a
+/// guard derives from a cached instance equals the value the un-cached path
+/// (`compute` re-run inline) would have produced.
+pub(crate) struct TargetCenteredColStats {
+    /// Per-column Welford running mean, in column order (`col_means[col]`).
+    col_means: Vec<f64>,
+    /// `Σ_col Σ_row (target[row, col] − mean_col)²`, accumulated with a single
+    /// running total in column-major order — the exact historical reduction.
+    ss_tot: f64,
+}
+
+impl TargetCenteredColStats {
+    /// Reduce the centered column statistics with the historical loop order, so
+    /// every EV / output-energy value derived from the result is bit-for-bit the
+    /// value the former inline per-call reduction produced. Column means use
+    /// Welford's running update so a huge-but-finite target column cannot overflow
+    /// the total sum of squares.
+    pub(crate) fn compute(target: ArrayView2<'_, f64>) -> Self {
+        let n = target.nrows();
+        let p = target.ncols();
+        let mut col_means = vec![0.0_f64; p];
+        let mut ss_tot = 0.0_f64;
+        for col in 0..p {
+            let mut mean = 0.0_f64;
+            for (count, row) in (0..n).enumerate() {
+                let x = target[[row, col]];
+                mean += (x - mean) / (count as f64 + 1.0);
+            }
+            for row in 0..n {
+                let dev = target[[row, col]] - mean;
+                ss_tot += dev * dev;
+            }
+            col_means[col] = mean;
+        }
+        Self { col_means, ss_tot }
+    }
+}
+
 impl SaeManifoldTerm {
     pub fn solve_newton_step(
         &mut self,
@@ -2184,6 +2237,7 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         iteration: usize,
         rho: &SaeManifoldRho,
+        target_col_stats: Option<&TargetCenteredColStats>,
     ) -> Result<(), String> {
         // SAC — the stagewise lane disarms the guard stack (see
         // `enforce_active_mass_guard`); a disarmed term never reseeds.
@@ -2287,9 +2341,9 @@ impl SaeManifoldTerm {
             if iteration == 0 {
                 return Ok(());
             }
-            let ev = self.dictionary_reconstruction_ev(target, rho)?;
-            let out_energy_ratio =
-                self.dictionary_reconstruction_output_energy_ratio(target, rho)?;
+            let ev = self.dictionary_reconstruction_ev_maybe(target, rho, target_col_stats)?;
+            let out_energy_ratio = self
+                .dictionary_reconstruction_output_energy_ratio_maybe(target, rho, target_col_stats)?;
             let n = self.n_obs();
             let p = target.ncols();
             // Reachable rank `q = rank([Φ_1 … Φ_K])`, the CONCATENATED chart-design
@@ -2524,7 +2578,8 @@ impl SaeManifoldTerm {
             {
                 let incumbent_ev = *incumbent_ev;
                 let incumbent_uniformity = *incumbent_uniformity;
-                let reseeded_ev = self.dictionary_reconstruction_ev(target, rho)?;
+                let reseeded_ev =
+                    self.dictionary_reconstruction_ev_maybe(target, rho, target_col_stats)?;
                 let reseeded_uniformity = self.coordinate_uniformity_aggregate();
                 !prefer_candidate_basin(
                     reseeded_ev,
@@ -2616,24 +2671,34 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
+        self.dictionary_reconstruction_ev_maybe(target, rho, None)
+    }
+
+    /// [`Self::dictionary_reconstruction_ev`] with an optional PRECOMPUTED target
+    /// variance. `precomputed = Some(stats)` reuses the once-per-fit centered
+    /// total-sum-of-squares instead of re-reducing the full `n × p` target
+    /// (`None` reproduces the historical inline reduction bit-for-bit). Only the
+    /// residual sum-of-squares — which depends on the CURRENT dictionary state —
+    /// is recomputed per call; the target variance is a fit invariant.
+    pub(crate) fn dictionary_reconstruction_ev_maybe(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        precomputed: Option<&TargetCenteredColStats>,
+    ) -> Result<f64, String> {
         let residual = self.reconstruction_residual(target, rho)?;
         let mut ss_res = 0.0_f64;
         for &value in residual.iter() {
             ss_res += value * value;
         }
-        let n = target.nrows();
-        let mut ss_tot = 0.0_f64;
-        for col in 0..target.ncols() {
-            let mut mean = 0.0_f64;
-            for (count, row) in (0..n).enumerate() {
-                let x = target[[row, col]];
-                mean += (x - mean) / (count as f64 + 1.0);
+        let owned;
+        let ss_tot = match precomputed {
+            Some(stats) => stats.ss_tot,
+            None => {
+                owned = TargetCenteredColStats::compute(target);
+                owned.ss_tot
             }
-            for row in 0..n {
-                let dev = target[[row, col]] - mean;
-                ss_tot += dev * dev;
-            }
-        }
+        };
         if !(ss_tot > 0.0) {
             // A constant target has zero variance to explain; treat a zero
             // residual as fully explained and anything else as collapsed.
@@ -2654,10 +2719,30 @@ impl SaeManifoldTerm {
     /// a present-decoder fit that simply reconstructs poorly (the optimizer's job).
     /// Returns `0.0` for a constant (zero-variance) target, where the notion is
     /// vacuous. Column means use the same running update as `dictionary_reconstruction_ev`.
+    // Test-only convenience over the `_maybe` form below; gated so the lib
+    // build carries no dead code while the S1 guard tests keep their caller.
+    #[cfg(test)]
     pub(crate) fn dictionary_reconstruction_output_energy_ratio(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        self.dictionary_reconstruction_output_energy_ratio_maybe(target, rho, None)
+    }
+
+    /// [`Self::dictionary_reconstruction_output_energy_ratio`] with an optional
+    /// PRECOMPUTED target variance. `precomputed = Some(stats)` reuses the
+    /// once-per-fit per-column means and centered total-sum-of-squares (`None`
+    /// reproduces the historical inline reduction bit-for-bit). Only the OUTPUT
+    /// energy `Σ (fitted − mean)²` — which depends on the CURRENT dictionary — is
+    /// recomputed per call; the column means and target variance are fit
+    /// invariants. The output-energy accumulation keeps the historical
+    /// single-accumulator column-major order.
+    pub(crate) fn dictionary_reconstruction_output_energy_ratio_maybe(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        precomputed: Option<&TargetCenteredColStats>,
     ) -> Result<f64, String> {
         let fitted = self.try_fitted_for_rho(rho)?;
         if fitted.dim() != target.dim() {
@@ -2669,25 +2754,26 @@ impl SaeManifoldTerm {
             ));
         }
         let n = target.nrows();
-        let mut ss_out = 0.0_f64;
-        let mut ss_tot = 0.0_f64;
-        for col in 0..target.ncols() {
-            let mut mean = 0.0_f64;
-            for (count, row) in (0..n).enumerate() {
-                let x = target[[row, col]];
-                mean += (x - mean) / (count as f64 + 1.0);
+        let owned;
+        let stats = match precomputed {
+            Some(stats) => stats,
+            None => {
+                owned = TargetCenteredColStats::compute(target);
+                &owned
             }
+        };
+        let mut ss_out = 0.0_f64;
+        for col in 0..target.ncols() {
+            let mean = stats.col_means[col];
             for row in 0..n {
-                let dev = target[[row, col]] - mean;
-                ss_tot += dev * dev;
                 let out = fitted[[row, col]] - mean;
                 ss_out += out * out;
             }
         }
-        if !(ss_tot > 0.0) {
+        if !(stats.ss_tot > 0.0) {
             return Ok(0.0);
         }
-        Ok(ss_out / ss_tot)
+        Ok(ss_out / stats.ss_tot)
     }
 
     /// Reseed a set of collapsed atoms onto DISTINCT principal directions of the
@@ -3840,7 +3926,7 @@ impl SaeManifoldTerm {
         // reseed it before the audit. An all-zero cold seed has a zero median
         // decoder norm, so the guard returns early and the cold-start path is
         // untouched.
-        self.enforce_decoder_norm_guard(target, 0, rho)?;
+        self.enforce_decoder_norm_guard(target, 0, rho, None)?;
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
@@ -3954,6 +4040,15 @@ impl SaeManifoldTerm {
         // relative decrease falls below 1e-8, so this never truncates real descent.
         let mut previous_full_iterate_objective = f64::INFINITY;
         let mut consecutive_objective_stalls = 0usize;
+        // #976 hot-path: the decoder-norm co-collapse guard centers its EV and
+        // output-energy signals on the TARGET, an invariant of the whole joint
+        // fit. Reduce its per-column means and total centered sum-of-squares ONCE
+        // here and hand them to every iteration's guard call, rather than
+        // re-reducing the full n×p target on each accepted step (the O(n·p)
+        // column pass that dominated the single-threaded inner-loop profile).
+        // Bit-identical to the historical per-call reduction (see
+        // `TargetCenteredColStats`).
+        let target_col_stats = TargetCenteredColStats::compute(target);
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -4245,7 +4340,12 @@ impl SaeManifoldTerm {
             // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
             // that has fallen far behind its peers and reseed it onto the
             // residual; a strict no-op for K=1.
-            self.enforce_decoder_norm_guard(target, outer_iteration, rho)?;
+            self.enforce_decoder_norm_guard(
+                target,
+                outer_iteration,
+                rho,
+                Some(&target_col_stats),
+            )?;
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). When the co-collapse
             // multi-start budget is fully spent yet the dictionary is STILL at or

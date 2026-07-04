@@ -3528,7 +3528,7 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
         // on both axes. The certified Kantorovich radius refines it per chart.
         Cylinder => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
-        Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) => {
+        Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => {
             1.0 / (resolution.max(2) as f64)
         }
     }
@@ -3566,7 +3566,7 @@ pub(crate) fn chart_region(
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
         Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare
-        | Precomputed(_) => region,
+        | Precomputed(_) | FiniteSet => region,
     }
 }
 

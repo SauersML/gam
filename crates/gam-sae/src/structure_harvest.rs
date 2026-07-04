@@ -50,9 +50,10 @@ use crate::basis::{
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::manifold::{
-    AssignmentMode, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    amplitude_concentration_certificate,
+    AssignmentMode, OccupancyLaw, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
+    SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
@@ -1339,6 +1340,81 @@ fn radial_promoted_specs(
     Ok(Some(promoted))
 }
 
+/// F2 finite-set-atom opt-in. Default `false`: the birth race does NOT enrol a
+/// finite-set (discrete anchor) candidate, so the [`SaeAtomBasisKind::FiniteSet`]
+/// variant + [`AnchorIndicatorEvaluator`] land as inert scaffolding that cannot
+/// affect any birth. The switch flips to `true` only AFTER the finite-set atom is
+/// verified — full `gam-sae` suite green plus the real-data weekday adjudication
+/// (is weekday seven cyclic points or an occupied circle?). Enrolling the
+/// candidate in the actual race additionally needs an `AutoTopologyKind::FiniteSet`
+/// in `gam-solve`'s selector (the cross-crate follow-up); until then the flag +
+/// [`finite_set_candidate_for_birth`] are the staged, unit-tested substrate.
+static FINITE_SET_RACE_ENROLLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the birth race enrols the finite-set (discrete anchor) candidate.
+/// Default `false` — see [`FINITE_SET_RACE_ENROLLED`].
+pub fn finite_set_race_enrolled() -> bool {
+    FINITE_SET_RACE_ENROLLED.load(Ordering::Relaxed)
+}
+
+/// Flip the finite-set-atom enrolment opt-in. Intended for the post-verification
+/// enablement (and for tests exercising the enrolled path); default is `false`.
+pub fn set_finite_set_race_enrolled(enrolled: bool) {
+    FINITE_SET_RACE_ENROLLED.store(enrolled, Ordering::Relaxed);
+}
+
+/// Build the finite-set (discrete anchor) candidate inputs for a `d = 1` birth
+/// whose occupancy is DISCRETE — the honest "seven cyclic points, not an occupied
+/// circle" alternative. Returns `(anchors, index_coords)` where `index_coords`
+/// (`n × 1`) assigns each row to its nearest of `anchors` anchors (the integer
+/// index the [`AnchorIndicatorEvaluator`] reads), and `anchors − 1` is the rank
+/// charge ([`finite_set_rank_charge`]). Returns `None` when the birth is not a
+/// discrete finite set (uniform / continuous occupancy, wrong dimension, or a
+/// degenerate coordinate) — so it never fabricates a cluster structure.
+///
+/// This is the pure, unit-tested substrate the race enrolment consumes once
+/// [`finite_set_race_enrolled`] flips; it does not itself touch any birth.
+pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(usize, Array2<f64>)> {
+    if coords.ncols() != 1 {
+        return None;
+    }
+    let n = coords.nrows();
+    if n < 4 {
+        return None;
+    }
+    let col = coords.column(0);
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &t in col.iter() {
+        if !t.is_finite() {
+            return None;
+        }
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    let span = hi - lo;
+    if !(span > 0.0) {
+        return None;
+    }
+    // Range-normalize the single coordinate column to [0, 1) for the occupancy
+    // classifier (the interval convention `coordinate_uniformity` uses).
+    let u: Vec<f64> = col.iter().map(|&t| ((t - lo) / span).clamp(0.0, 1.0)).collect();
+    match classify_occupancy(&u) {
+        OccupancyLaw::Discrete { anchors } if anchors >= 2 => {
+            // Assign each row to its nearest anchor bin. The `anchors` evenly
+            // spaced bins over [0, 1) give the categorical index the indicator
+            // basis reads; a fitted-anchor-position assignment is the cross-crate
+            // refinement (it needs the classifier's anchor centers exposed).
+            let mut idx = Array2::<f64>::zeros((n, 1));
+            for i in 0..n {
+                let bin = (u[i] * anchors as f64).floor();
+                idx[[i, 0]] = bin.clamp(0.0, (anchors - 1) as f64);
+            }
+            Some((anchors, idx))
+        }
+        _ => None,
+    }
+}
+
 fn race_birth_topology(
     coords: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
@@ -2414,6 +2490,66 @@ mod tests {
         let a = birth_row_amplitudes(y.view());
         assert!((a[0] - 5.0).abs() < 1e-12);
         assert!((a[1]).abs() < 1e-12);
+    }
+
+    // ---- F2: finite-set (discrete anchor) atom ------------------------------
+
+    #[test]
+    fn finite_set_race_is_not_enrolled_by_default() {
+        // Containment: the finite-set candidate is inert unless explicitly
+        // enrolled, so the enum arm + evaluator can never affect a birth by
+        // default.
+        assert!(!finite_set_race_enrolled());
+        set_finite_set_race_enrolled(true);
+        assert!(finite_set_race_enrolled());
+        set_finite_set_race_enrolled(false);
+        assert!(!finite_set_race_enrolled());
+    }
+
+    #[test]
+    fn finite_set_candidate_fires_on_discrete_occupancy() {
+        // Seven-point cyclic occupancy (weekdays): the coordinate collapses onto
+        // 7 anchors, so the finite-set candidate builder returns 7 anchors and a
+        // per-row integer index in [0, 7); the rank charge is anchors − 1 = 6.
+        let per = 100;
+        let mut rows = Vec::new();
+        for i in 0..(7 * per) {
+            rows.push((i % 7) as f64 + 0.01 * ((i as f64).sin()));
+        }
+        let coords = Array2::from_shape_vec((7 * per, 1), rows).unwrap();
+        let (anchors, idx) =
+            finite_set_candidate_for_birth(coords.view()).expect("discrete ⇒ finite-set candidate");
+        assert_eq!(anchors, 7, "anchors");
+        assert_eq!(crate::manifold::finite_set_rank_charge(anchors), 6);
+        // Every index is a valid anchor bin.
+        assert!(idx.iter().all(|&v| (0.0..=6.0).contains(&v) && v.fract() == 0.0));
+
+        // A uniformly-occupied coordinate is NOT a finite set — no candidate.
+        let n = 400;
+        let uni = Array2::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
+        assert!(finite_set_candidate_for_birth(uni.view()).is_none());
+    }
+
+    #[test]
+    fn anchor_indicator_evaluator_is_one_hot_with_zero_jets() {
+        use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
+        let ev = AnchorIndicatorEvaluator::new(3).unwrap();
+        // Coordinates snap to nearest anchor index; the design is one-hot.
+        let coords = Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 1.4]).unwrap();
+        let (phi, jet) = ev.evaluate(coords.view()).unwrap();
+        assert_eq!(phi.dim(), (4, 3));
+        // Row sums are 1 (exactly one active anchor per row).
+        for r in 0..4 {
+            assert!((phi.row(r).sum() - 1.0).abs() < 1e-12);
+        }
+        assert!((phi[[0, 0]] - 1.0).abs() < 1e-12);
+        assert!((phi[[1, 1]] - 1.0).abs() < 1e-12);
+        assert!((phi[[2, 2]] - 1.0).abs() < 1e-12);
+        assert!((phi[[3, 1]] - 1.0).abs() < 1e-12); // 1.4 rounds to anchor 1
+        // The indicator is piecewise constant: all jets are zero.
+        assert!(jet.iter().all(|&v| v == 0.0));
+        let h = ev.second_jet(coords.view()).unwrap();
+        assert!(h.iter().all(|&v| v == 0.0));
     }
 
     /// Build a `K`-atom periodic SAE term whose per-row routing is dictated by a

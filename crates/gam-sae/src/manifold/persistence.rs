@@ -132,8 +132,11 @@ fn kind_expects_loop(kind: &SaeAtomBasisKind) -> Option<bool> {
         | SaeAtomBasisKind::Duchon
         | SaeAtomBasisKind::EuclideanPatch
         | SaeAtomBasisKind::Poincare => Some(false),
-        // Caller-supplied basis: no library prediction, nothing to contest.
-        SaeAtomBasisKind::Precomputed(_) => None,
+        // Caller-supplied basis: no library prediction, nothing to contest. A
+        // finite-set atom's loop structure (e.g. weekday cyclic adjacency) is a
+        // property of the fitted anchor DATA, not a fixed chart topology, so the
+        // library makes no H₁ prediction to contest either.
+        SaeAtomBasisKind::Precomputed(_) | SaeAtomBasisKind::FiniteSet => None,
     }
 }
 

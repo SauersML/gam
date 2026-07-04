@@ -170,6 +170,9 @@ mod wbic_audit;
 mod tests;
 
 #[cfg(test)]
+mod tests_chart_evaluator_jets;
+
+#[cfg(test)]
 mod tests_factored_htbeta;
 
 #[cfg(test)]
@@ -192,6 +195,9 @@ mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
 mod tests_streaming_materialize_chunk_1801;
+
+#[cfg(test)]
+mod tests_recovery_split_780;
 
 #[cfg(test)]
 mod tests_unit_speed_inloop_2022;

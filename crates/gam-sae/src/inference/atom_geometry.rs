@@ -405,7 +405,12 @@ fn ideal_curve_dim(kind: &SaeAtomBasisKind, latent_dim: usize, m: usize, p: usiz
         SaeAtomBasisKind::Linear
         | SaeAtomBasisKind::EuclideanPatch
         | SaeAtomBasisKind::Poincare => d,
-        SaeAtomBasisKind::Duchon | SaeAtomBasisKind::Precomputed(_) => return None,
+        // A finite-set (indicator) atom is a discrete measure, not a continuous
+        // manifold, so it has no ambient intrinsic dimension to report — its rank
+        // charge is the categorical `anchors − 1`, priced by the race, not here.
+        SaeAtomBasisKind::Duchon
+        | SaeAtomBasisKind::Precomputed(_)
+        | SaeAtomBasisKind::FiniteSet => return None,
     };
     let basis_cap = (m as f64 - 1.0).max(1.0); // non-constant basis columns
     Some(intrinsic.min(basis_cap).min(p as f64).max(1.0))
@@ -423,6 +428,7 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Linear => "linear".to_string(),
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
+        SaeAtomBasisKind::FiniteSet => "finite_set".to_string(),
         SaeAtomBasisKind::Precomputed(tag) => format!("precomputed:{tag}"),
     }
 }
