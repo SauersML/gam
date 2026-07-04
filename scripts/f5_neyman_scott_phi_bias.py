@@ -23,12 +23,25 @@ which advertise calibration.
 
 This script is a SELF-CONTAINED reproduction of that estimator structure (it does
 not need the Rust fit): a 1-D circular latent with a controllable 2-basin
-degeneracy, the exact φ̂ formula above, swept as the basins merge. It reports the
-bias curve φ̂/φ_true and contrasts the per-row-Laplace estimator with the
-marginal (soft-posterior / EM) estimator that integrates over BOTH basins — which
-is where a fix would have to land.
+degeneracy, the exact φ̂ formula above, swept as the basins merge.
 
-Run:  uv run --with numpy scripts/f5_neyman_scott_phi_bias.py
+IMPORTANT (faithful model): the MAP here is PENALIZED by the same von-Mises ARD
+prior the engine's joint Newton solve applies (θ̂ = argmin[‖y−f‖²/2φ + α(1−cosθ)]),
+so the coordinate is shrunk and edf = H/(H+α) is consistent with it. An
+UNPENALIZED MAP (argmin ‖y−f‖² alone) over-fits and badly OVERSTATES the bias
+(≈18% at a≈0.25) — that is a sim artifact, NOT the engine's behaviour. Under the
+faithful penalized MAP the bias is a modest ~5–9%, roughly uniform in a, and
+non-vanishing in N (still a real incidental-parameters effect).
+
+The table also shows two CANDIDATE corrections and why they are NOT drop-in fixes:
+`φ̂_basin` (the mixture-of-Laplace between-basin selection dof) OVER-corrects at
+well-identified a because that term is the smooth mixture-MEAN's estimation dof,
+not the RSS-deflation dof of the basin-selecting hard MAP the code uses; `φ̂_marg`
+(posterior-expected residual) over-corrects too. The correct object is the
+SURE/Stein RSS-deflation dof of the penalized selecting MAP — see the VERDICT and
+the F5 report. This script is the diagnostic + acceptance harness for that fix.
+
+Run:  uv run --no-project --with numpy scripts/f5_neyman_scott_phi_bias.py
 
 No plotting deps required; prints a table. Pass --csv to also emit CSV.
 """
@@ -333,11 +346,10 @@ def run(ns, a_sweep, phi_true, alpha, reps, seed):
 
 
 def _verdict(rows, ns):
-    """Summarise the bias curve and where a fix must land."""
+    """Summarise the FAITHFUL (penalized-MAP) bias curve and the fix's scope."""
     lap = [r[2] for r in rows]
+    bas = [r[3] for r in rows]
     worst = min(rows, key=lambda r: r[2])
-    # Incidental-parameters signature: does the bias persist (not vanish) as N
-    # grows, at fixed ambiguity? Compare the largest-N vs smallest-N rows.
     by_a = {}
     for r in rows:
         by_a.setdefault(r[1], {})[r[0]] = r[2]
@@ -345,45 +357,46 @@ def _verdict(rows, ns):
         abs(v[max(ns)] - v[min(ns)]) < 0.05 for v in by_a.values() if len(v) > 1
     )
     print("=" * 70)
-    print("VERDICT")
+    print("VERDICT (faithful penalized-MAP model)")
     print("=" * 70)
     print(
-        f"  oracle φ̂/φ ≈ 1.00 across the sweep (sanity: the estimator is unbiased\n"
-        f"  at the TRUE coordinates — the bias below is purely the coordinate\n"
-        f"  incidental-parameter treatment, not the generative model)."
+        "  φ̂_Laplace = single-basin path, with a PENALIZED MAP (the coordinate is\n"
+        "  shrunk by the von-Mises ARD prior exactly as the engine's joint Newton\n"
+        "  solve does). An UNPENALIZED MAP (argmin ‖y−f‖² with no prior) badly\n"
+        "  OVERSTATES the bias (≈18% at a≈0.25) — a sim-fidelity artifact, not the\n"
+        "  engine's behaviour; do not read those numbers as the real effect."
     )
     print(
-        f"\n  φ̂_Laplace is biased LOW everywhere: {min(lap):.2f}–{max(lap):.2f} × φ_true.\n"
-        f"  Worst: {worst[2]:.2f}× (≈{(1 - worst[2]) * 100:.0f}% low) at N={worst[0]}, a={worst[1]:.2f}\n"
-        f"  — i.e. at INTERMEDIATE basin separation, where the second basin is\n"
-        f"  near enough to steal fit (deflating MAP RSS) but the single-basin\n"
-        f"  Laplace curvature still credits only one well's worth of dof."
+        f"\n  Faithful single-basin bias: {min(lap):.2f}–{max(lap):.2f} × φ_true (oracle ≈ 0.99),\n"
+        f"  worst {worst[2]:.2f}× at a={worst[1]:.2f} — a modest ~5–9% low, roughly\n"
+        f"  UNIFORM in a (NOT a sharp spike at intermediate separation), and it\n"
+        f"  {'PERSISTS' if persists else 'shrinks'} as N grows (Neyman–Scott incidental-params signature)."
     )
     print(
-        f"\n  Incidental-parameters signature: the bias {'PERSISTS' if persists else 'shrinks'} "
-        f"as N grows\n  (≈constant φ̂/φ at fixed a across N={min(ns)}→{max(ns)}). A per-observation\n"
-        f"  bias that does NOT vanish with N is the Neyman–Scott hallmark."
+        f"\n  φ̂_basin = the naive mixture-of-Laplace coord_edf fix (between-basin\n"
+        f"  selection term Σ w_b‖f_b−f̄‖²/φ). It OVER-CORRECTS at well-identified a\n"
+        f"  (up to {max(bas):.2f}× at large a): that term is the estimation/Cov dof of\n"
+        f"  the SMOOTH mixture-MEAN, w₁w₂‖Δf‖²/φ, NOT the RSS-deflation dof of the\n"
+        f"  basin-SELECTING hard MAP the code uses. For a nonlinear selection\n"
+        f"  estimator those two dofs differ (SURE/Stein: E[RSS] deflation ≠ ΣCov(ŷ,y)\n"
+        f"  unless the smoother is a projection). So it is NOT a drop-in fix."
     )
     print(
-        "\n  A marginal / EM coordinate treatment (integrating BOTH basins,\n"
-        "  posterior-variance dof) removes the downward bias in the ambiguous\n"
-        "  regime (a ≤ 0.25 → φ̂_marg ≈ 1.0), which localises the defect to the\n"
-        "  single-basin Laplace step. (The reference marginal here over-corrects\n"
-        "  when rows are well-identified — it is a DIRECTION indicator, not a\n"
-        "  drop-in estimator; a production fix must be designed, per F5 scope.)"
-    )
-    print(
-        "\n  WHERE THE FIX MUST LAND:\n"
-        "   * reconstruction_dispersion (construction_reconstruction.rs:70-118):\n"
-        "     `ard_inverse_traces` → coord_edf uses the single-basin H_tt inverse;\n"
-        "     replace with a marginal (multi-basin) posterior variance so φ̂ is\n"
-        "     honest. φ̂ feeds bands / dosimetry / MDL, so the bias propagates.\n"
-        "   * reml_criterion non-rank-charge branch (construction.rs:4800-4801):\n"
-        "     the coordinate `½log|H_tt|` is the same single-basin Laplace.\n"
-        "   * NOTE: the rank-charge branch (construction.rs:4739-4799) re-prices\n"
-        "     the coordinate block at ½·d_eff·log n (rotation-invariant, robust to\n"
-        "     bimodality) BUT still calls reconstruction_dispersion for its noise\n"
-        "     floor R=φ — so fixing φ̂ is necessary even under rank-charge."
+        "\n  CORRECT FIX (scoped): the SURE/Stein RSS-deflation dof of the penalized\n"
+        "  basin-selecting MAP — dof = 2·div(ŷ) − risk/φ, both weighted by the\n"
+        "  per-basin Laplace evidence — which reduces EXACTLY to H/(H+α) when one\n"
+        "  basin dominates AND at a 2-to-1 degeneracy (identical basin predictions).\n"
+        "  Monte-Carlo ground truth puts the true extra selection dof at only\n"
+        "  ~0.1–0.2 per row (the between-variance form charges ~0.4–0.75/row, i.e.\n"
+        "  over-counts). Land it against an MC-validated acceptance (φ̂/φ within a\n"
+        "  derived tolerance, NO over-shoot) before porting to reconstruction_dispersion.\n"
+        "  Sites: construction_reconstruction.rs:70-118 (coord_edf) and the\n"
+        "  non-rank-charge reml_criterion coordinate ½log|H_tt| (construction.rs ~4800).\n"
+        "  Feeds bands / dosimetry / MDL, so an over-correction is as harmful as the bias.\n"
+        "  NOTE: the rank-charge reml_criterion branch (construction.rs:4739-4799)\n"
+        "  re-prices the coordinate block at ½·d_eff·log n (rotation-invariant) but\n"
+        "  still calls reconstruction_dispersion for its φ noise floor — so φ̂ must be\n"
+        "  fixed regardless of branch."
     )
     print("=" * 70)
 
@@ -412,7 +425,7 @@ def main():
 
         with open(args.csv, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["N", "a", "phi_laplace_over_true", "phi_marg_over_true", "oracle_over_true", "coord_edf_laplace"])
+            w.writerow(["N", "a", "phi_laplace_over_true", "phi_basin_over_true", "phi_marg_over_true", "oracle_over_true"])
             w.writerows(rows)
         print(f"wrote {args.csv}")
 
