@@ -434,7 +434,17 @@ fn wrapped_gaussian_mixture_bic(
         let d = (a - b).rem_euclid(1.0);
         d.min(1.0 - d)
     };
-    let mut means: Vec<f64> = (0..k).map(|j| (j as f64 + 0.5) / k as f64).collect();
+    // QUANTILE init: seed the centers on actual data (the `j/k` quantiles of the
+    // sorted coordinates), NOT at evenly-spaced angles `(j+0.5)/k`. Evenly-spaced
+    // angles land the centers on the GAPS between clusters for the true `k` (a
+    // discrete measure at `j/anchors` seeds a boundary center at `(j+0.5)/anchors`),
+    // the worst-case k-means init, so the true `k` converges to a split-boundary
+    // local optimum and loses to a larger `k` that happens to seed onto data.
+    // Quantile init always seeds inside occupied regions, so the true `k` finds
+    // its anchors.
+    let mut means: Vec<f64> = (0..k)
+        .map(|j| pts[(j * n) / k.max(1)])
+        .collect();
     let mut assign = vec![0usize; n];
     for _ in 0..100 {
         let mut changed = false;
