@@ -140,11 +140,27 @@ def linear_recon_per_atom(Z0: np.ndarray, decoder: np.ndarray) -> np.ndarray:
 
 
 _FIT_WORKER = r'''
-import json, sys, numpy as np, gamfit
+import inspect, json, os, sys, numpy as np, gamfit
+# #28 driver-side heartbeat: pass harness_util.progress_heartbeat() as progress_callback
+# so a long fit emits progress (no silent hang; the run always ends with a signal).
+# Guarded: optional if harness_util or the kwarg isn't present (local/mini runs).
+pcb = None
+for _d in (os.environ.get("GAM_HARNESS_UTIL"),
+           "/projects/standard/hsiehph/sauer354/scratch/compose32k/scripts"):
+    if _d and os.path.isfile(os.path.join(_d, "harness_util.py")):
+        sys.path.insert(0, _d); break
+try:
+    import harness_util
+    pcb = harness_util.progress_heartbeat()
+except Exception:
+    pcb = None
+_kw = {}
+if pcb is not None and "progress_callback" in inspect.signature(gamfit.sae_manifold_fit).parameters:
+    _kw["progress_callback"] = pcb
 z = np.load(sys.argv[1])
 chart = gamfit.sae_manifold_fit(np.ascontiguousarray(z, dtype=np.float32), K=1,
     d_atom=int(sys.argv[3]), atom_topology=sys.argv[4], n_iter=int(sys.argv[5]),
-    random_state=int(sys.argv[6]))
+    random_state=int(sys.argv[6]), **_kw)
 recon = np.asarray(chart.reconstruct(z), dtype=np.float64)
 theta = None
 try:
