@@ -4091,6 +4091,45 @@ impl CustomFamily for LatentSurvivalFamily {
         true
     }
 
+    /// Route the pre-fit identifiability audit CHANNEL-AWARE across the latent
+    /// survival blocks. The time-transform baseline `q(a)`, the frailty mean
+    /// `μ = Xβ`, and the learnable log-σ scale are three STRUCTURALLY DISTINCT
+    /// outputs — block-diagonal entries of the true joint Jacobian
+    /// `blkdiag(X_time, X_mean, X_logσ)`, full rank `Σ p_b`. The blocks are
+    /// hand-built (no `jacobian_callback`), so without this the flat single-
+    /// channel audit runs.
+    ///
+    /// That flat audit is fatal for a learnable scale: the `log_sigma` block's
+    /// design is a single structural constant-of-ones column (`eta = design·β`
+    /// broadcasts the scalar log-σ to every row — see `build_log_sigma_blockspec`).
+    /// The flat RRQR sees that constant as a repeated shared basis and mistakes
+    /// it for a cross-block ALIAS with the `mean` intercept, then — because the
+    /// log-σ block carries the lowest gauge priority — attributes the drop to
+    /// `log_sigma[0]` and demotes it below the rank tolerance. That both FREEZES
+    /// the frailty scale at its seed (the only handle on σ is deleted) and leaves
+    /// the reduced spec width one short of the family's raw joint Hessian, so the
+    /// outer LAML logdet aborts with `joint exact-newton Hessian validation …:
+    /// got (p+1)×(p+1), expected p×p`. The mean intercept and log-σ are NOT
+    /// aliased: they parameterise the frailty MEAN and VARIANCE respectively and
+    /// are jointly identified; the collinearity is an artefact of auditing a
+    /// nonlinear scale channel as if it were a linear predictor. Placing each
+    /// block on its own output channel makes the audit see the genuine
+    /// block-diagonal structure. Mirrors
+    /// `SurvivalLocationScaleFamily::output_channel_assignment`.
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        Some(
+            specs
+                .iter()
+                .map(|spec| match spec.name.as_str() {
+                    "time_transform" => 0,
+                    "mean" => 1,
+                    "log_sigma" => 2,
+                    _ => 0,
+                })
+                .collect(),
+        )
+    }
+
     /// Engage the inner self-vanishing Levenberg–Marquardt μ on a full-rank but
     /// indefinite / ill-conditioned penalized joint Hessian, mirroring the
     /// sibling [`SurvivalMarginalSlopeFamily`]. Interval-censored rows contribute
@@ -4508,6 +4547,65 @@ mod tests {
 
     fn learnable_sigma_test_joint_beta() -> Array1<f64> {
         array![0.15, 0.25, 0.1, -0.15, 0.35_f64.ln()]
+    }
+
+    /// Regression (frailty scale block deletion): a learnable-σ latent-survival
+    /// fit routes the pre-fit identifiability audit CHANNEL-AWARE, so the
+    /// `log_sigma` scale block — realised as a single constant-of-ones column —
+    /// is never aliased against the `mean` intercept and dropped. Before the
+    /// `output_channel_assignment` override the family used the trait default
+    /// (every block → channel 0); the flat single-channel RRQR then saw the two
+    /// constant columns (mean intercept, log-σ constant) as a cross-block alias,
+    /// attributed the drop to the lowest-priority `log_sigma` block, and deleted
+    /// the ONLY handle on the frailty scale — which both froze σ and left the
+    /// reduced spec width one short of the family's raw joint Hessian, aborting
+    /// every outer LAML eval with `joint exact-newton Hessian validation … got
+    /// 15x15, expected 14x14`. The contract this guards: the scale channel must
+    /// be distinct from the location (mean) channel.
+    #[test]
+    fn latent_survival_learnable_sigma_block_lives_on_a_distinct_output_channel() {
+        let family = learnable_sigma_test_family();
+        assert!(
+            family.latent_sd_fixed.is_none(),
+            "test fixture must be the learnable-σ family"
+        );
+
+        // The three blocks the learnable-σ builder emits, in order. Only the
+        // block NAME drives `output_channel_assignment`, so borrow the real
+        // `build_log_sigma_blockspec` shape and relabel for time/mean.
+        let mut time_spec = build_log_sigma_blockspec(0.5, family.event_target.len());
+        time_spec.name = "time_transform".to_string();
+        let mut mean_spec = build_log_sigma_blockspec(0.5, family.event_target.len());
+        mean_spec.name = "mean".to_string();
+        let log_sigma_spec = build_log_sigma_blockspec(0.5, family.event_target.len());
+        assert_eq!(log_sigma_spec.name, "log_sigma");
+        let specs = vec![time_spec, mean_spec, log_sigma_spec];
+
+        let channels = family
+            .output_channel_assignment(&specs)
+            .expect("latent survival must declare an explicit channel assignment");
+        assert_eq!(channels.len(), specs.len());
+
+        let (time_ch, mean_ch, log_sigma_ch) = (channels[0], channels[1], channels[2]);
+        // The load-bearing assertion: the scale channel is NOT the location
+        // channel, so the channel-aware audit never aliases σ's constant column
+        // against the mean intercept.
+        assert_ne!(
+            log_sigma_ch, mean_ch,
+            "log_sigma (frailty scale) must not share the mean's output channel, or the \
+             identifiability audit will alias its constant column against the mean intercept \
+             and delete the scale parameter"
+        );
+        // Each latent-survival block drives a structurally distinct output, so
+        // all three channels are distinct (block-diagonal true Jacobian).
+        assert_ne!(time_ch, mean_ch);
+        assert_ne!(time_ch, log_sigma_ch);
+        let n_outputs = channels.iter().copied().max().unwrap() + 1;
+        assert!(
+            n_outputs >= 3,
+            "learnable-σ latent survival must expose ≥3 output channels (time, mean, scale), \
+             got {n_outputs}"
+        );
     }
 
     fn survival_stress_test_family(n: usize) -> LatentSurvivalFamily {
