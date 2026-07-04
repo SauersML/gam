@@ -3,17 +3,24 @@
 //! regression frame are exchangeable (the REML objective is a sum over rows), so
 //! every fitted/inferential quantity must be invariant to a row permutation.
 //!
-//! Root cause: the tensor-product penalty log-determinant `log|S_λ|₊` is computed
-//! from the Kronecker analytic marginal eigensystem, which is scaled
-//! inconsistently with the marginal penalties actually assembled into the
-//! Hessian `H = XᵀWX + S_λ`. At moderate λ the inconsistency is masked; at an
-//! extreme-λ corner it makes the REML Occam term `½(log|H| − log|S_λ|₊)` swing
-//! *negative* — which is mathematically impossible (Weyl: `H ⪰ S_λ` and X has
-//! full column rank ⟹ the term is ≥ 0). The spurious low-cost basin at that
-//! ill-conditioned corner traps the outer optimizer / seed grid on some row
-//! orders (but not others), where the influence-EDF collapses and the fit is
-//! falsely flagged non-converged, so the reported EDF is floored to the full
-//! basis dimension and the SEs are rescaled.
+//! Root cause (fixed in e2b2b07 + 4422ee0): the stable reparameterization built
+//! the penalized-block penalty by assembling the Gram `Σ_k λ_k S_k = EᵀE`
+//! (`E = vstack_k √λ_k R_k`) and eigendecomposing it, which SQUARES the condition
+//! number (`κ(EᵀE) = κ(E)²`). When the outer optimizer drives the near-linear z
+//! margin toward its null space (λ_ratio ≳ 1e8) a recessive-penalty eigenvalue
+//! `d_min ≈ λ_min·σ²` sinks below the eigensolver's `O(ε·λ_max)` noise floor; its
+//! eigenvector rotates into noise, that genuinely-penalized direction drops out
+//! of the reparameterized penalty, and the inner P-IRLS fits it to the data. The
+//! loss-of-penalty flips discontinuously as the noise floor crosses `d_min`,
+//! injecting spurious low-cost *cliffs* into the LAML objective at the high-λ
+//! corner. A row permutation only perturbs the row-order Gram reduction at the
+//! ULP level, but at that cliff the sub-ULP difference tips which macroscopic
+//! basin the seed path lands in: the original order rails, floors the
+//! influence-EDF to the full basis dim, and is (correctly) flagged non-converged,
+//! while every permutation converges. The fix computes the penalized spectrum
+//! from the SVD of the stacked roots `E` directly (no condition-squaring), and a
+//! companion ridge-free spectral posterior covariance keeps a legitimate ρ-rail
+//! landing from collapsing the reported SEs.
 //!
 //! Observed before the fix (n=300, the exact numpy `default_rng(0)` frame from
 //! the issue, dumped to `tests/data/te_2123_*.csv`):

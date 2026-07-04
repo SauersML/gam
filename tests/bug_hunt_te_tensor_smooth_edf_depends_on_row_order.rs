@@ -14,13 +14,23 @@
 //! essentially identical), so the reported inference is simply wrong on the
 //! order that fails.
 //!
-//! The mechanism is a row-order-sensitive floating-point reduction upstream of
-//! the outer λ-selection: `XᵀWX` is summed in row order (`xt_diag_x_dense_into`
-//! → faer `fast_atb`), so a row permutation perturbs the Gram at the ULP level,
-//! which the outer REML seed selection and basin certification consume through
-//! an order-sensitive `compute_cost`. At a near-tie between two macroscopically
-//! different REML optima the sub-ULP cost difference — which flips with row
-//! order — tips which basin the optimizer descends into.
+//! Root cause (fixed in e2b2b07 + 4422ee0): the outer LAML objective developed a
+//! spurious *discontinuous cliff* in the high-λ corner. The stable
+//! reparameterization built the penalized-block penalty by assembling the Gram
+//! `Σ_k λ_k S_k = EᵀE` (`E = vstack_k √λ_k R_k`) and eigendecomposing it, which
+//! SQUARES the condition number (`κ(EᵀE) = κ(E)²`); when one margin is driven
+//! toward its null space (the near-linear z axis) a recessive-penalty eigenvalue
+//! sinks below the eigensolver's `O(ε·λ_max)` noise floor, its penalized
+//! direction drops out of the reparameterized penalty, and the inner solve
+//! returns a discontinuously different (wiggly) β̂ — the cliff. A row permutation
+//! only PERTURBS the row-order Gram reduction (`XᵀWX` summed via faer `fast_atb`)
+//! at the ULP level, but at that cliff the sub-ULP difference tips which
+//! macroscopic basin the seed path descends into: the original order rails and
+//! floors the EDF to the full basis dim, the permutations converge. The fix
+//! computes the penalized spectrum from the SVD of the stacked roots `E`
+//! directly (no condition-squaring), removing the cliff; a companion ridge-free
+//! spectral posterior covariance keeps a legitimate rail landing from collapsing
+//! the reported SEs.
 //!
 //! This test fits `y ~ te(x, z)` on the original row order and on a fixed stride
 //! permutation across a block of datasets and asserts the reported total EDF
