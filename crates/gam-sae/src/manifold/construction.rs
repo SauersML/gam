@@ -2937,9 +2937,11 @@ impl SaeManifoldTerm {
         self.try_fitted_with_rho(None, true)
     }
 
-    pub(crate) fn try_fitted_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
-        // Internal/fitting reconstruction: the pure CURVED image (the joint fit
-        // and the #1026 adjudication both require the uncollapsed curve).
+    pub fn try_fitted_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
+        // Fitting reconstruction: the pure CURVED image at a specific `rho` (the
+        // joint fit and the #1026 adjudication both require the uncollapsed
+        // curve). Exposed for callers that need the rho-specific curved image
+        // rather than the collapse-adjudicated production `try_fitted`.
         self.try_fitted_with_rho(Some(rho), false)
     }
 
