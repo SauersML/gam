@@ -4981,19 +4981,11 @@ pub(crate) fn symmetric_matrix_cache_bytes(m: &gam_linalg::matrix::SymmetricMatr
 /// Capacity (number of distinct rho-points) of the outer-eval reuse LRU.
 ///
 /// Sized to comfortably span a binomial seed grid's local revisit window
-/// (baseline + isotropic shifts + per-axis refinements) plus the outer
-/// optimizer's line-search trial points AND the post-convergence finalize /
-/// inference re-evaluations at the converged ρ̂, without unbounded growth. Each
-/// slot holds one `OuterEval` (a scalar cost, a length-k gradient — k is the
-/// smoothing-parameter count, typically single digits — an optional inner-beta
-/// hint, and a usually-`Unavailable` Hessian), so even at this capacity the
-/// footprint is a few KB. The prior value of 8 was narrower than a single
-/// coordinate-descent sweep, so an outer optimizer that revisited the ρ̂ basin
-/// (the #1575 binomial/logit fit re-solves the converged ρ̂ ~4× across the ARC
-/// tail + finalize + inference) evicted the entry between visits and paid the
-/// full-n inner P-IRLS solve again. A hit is bit-identical to a recompute, so
-/// widening the window only elides provably-redundant solves.
-pub(crate) const OUTER_EVAL_LRU_CAPACITY: usize = 32;
+/// (baseline + isotropic shifts + per-axis refinements) plus a few
+/// line-search trial points without unbounded growth. Each slot holds one
+/// `OuterEval` (a scalar cost, a length-k gradient, an optional inner-beta
+/// hint, and a usually-`Unavailable` Hessian), so the footprint is tiny.
+pub(crate) const OUTER_EVAL_LRU_CAPACITY: usize = 8;
 
 /// Bounded least-recently-used cache of converged outer REML evaluations,
 /// keyed by sanitized rho-bits.
