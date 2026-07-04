@@ -4243,6 +4243,10 @@ mod joint_fallback_tests {
             );
             fractions.push(frac);
         }
+        eprintln!(
+            "[ENCODE-FALLBACK-SWEEP] similarity rho={:?} -> joint multistart fraction={:?}",
+            sweep, fractions
+        );
         // Orthogonal atoms: the block-diagonal per-atom certificates compose, no
         // row needs multi-start.
         assert!(

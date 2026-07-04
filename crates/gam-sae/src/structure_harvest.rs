@@ -51,6 +51,7 @@ use crate::basis::{
 };
 use crate::manifold::{
     AssignmentMode, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    amplitude_concentration_certificate,
 };
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
@@ -1273,13 +1274,111 @@ fn fit_topology_candidate(
 /// cluster-null rung, handled below the race) or the birth target is degenerate;
 /// the caller then falls back to the template basis (warm inheritance) and the
 /// post-fit curved-vs-linear rung adjudicates as before.
+/// The realized per-row amplitude of a birth target: the L2 norm of each row of
+/// `Y` (`n × p`), i.e. the magnitude the born atom would reconstruct at that
+/// sample. The amplitude-concentration certificate reads this to tell a
+/// present/absent spike (binary presence) from a continuous spread (a radial
+/// coordinate).
+fn birth_row_amplitudes(target: ArrayView2<'_, f64>) -> Array1<f64> {
+    let n = target.nrows();
+    let mut amps = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut ss = 0.0_f64;
+        for &v in target.row(i).iter() {
+            ss += v * v;
+        }
+        amps[i] = ss.sqrt();
+    }
+    amps
+}
+
+/// When a `d = 1` birth's realized amplitude is CONTINUOUS (a hidden radial axis,
+/// per the amplitude-concentration certificate), build the promoted
+/// circle-vs-cylinder(radial)-vs-disk candidate set so the race adjudicates the
+/// extra radial dimension by evidence. Returns `None` when no promotion applies
+/// (not `d = 1`, or the amplitude is a genuine present/absent spike), so the
+/// caller keeps the base race. The promoted set uses DISTINCT topology kinds
+/// (`Circle` d=1, `Cylinder` d=2, `Euclidean` d=2 = the flat disk) so the
+/// by-kind race map has no collision — the `d = 1` line is intentionally dropped,
+/// because if the amplitude is radial the contest is circle vs the radial
+/// two-manifolds, not circle vs line.
+fn radial_promoted_specs(
+    coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    d_k: usize,
+) -> Result<Option<Vec<TopologyCandidateSpec>>, String> {
+    if d_k != 1 {
+        return Ok(None);
+    }
+    let amps = birth_row_amplitudes(target);
+    let cert = amplitude_concentration_certificate(amps.view());
+    if !cert.recommends_radial_axis() {
+        return Ok(None);
+    }
+    // The circle from the d=1 set (the un-promoted alternative the evidence must
+    // still be free to prefer) plus the d=2 radial two-manifolds.
+    let mut promoted: Vec<TopologyCandidateSpec> = Vec::with_capacity(3);
+    for spec in topology_candidates_for_dim(coords, 1)? {
+        if spec.kind == AutoTopologyKind::Circle {
+            promoted.push(spec);
+        }
+    }
+    for spec in topology_candidates_for_dim(coords, 2)? {
+        if matches!(
+            spec.kind,
+            AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean
+        ) {
+            promoted.push(spec);
+        }
+    }
+    if promoted.len() < 2 {
+        // Need at least the circle plus one radial candidate to make a contest.
+        return Ok(None);
+    }
+    Ok(Some(promoted))
+}
+
 fn race_birth_topology(
     coords: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     d_k: usize,
 ) -> Result<Option<TopologyRaceFit>, String> {
-    let specs = topology_candidates_for_dim(coords, d_k)?;
+    let base_specs = topology_candidates_for_dim(coords, d_k)?;
+    if base_specs.is_empty() {
+        return Ok(None);
+    }
+    // F1 radial promotion: a `d = 1` birth whose realized amplitude is CONTINUOUS
+    // (a hidden radial coordinate — the amplitude-concentration certificate reads
+    // the per-row birth magnitudes as a spread, not a present/absent spike) is
+    // really a disk / annulus, not a circle. When the certificate recommends it,
+    // ENRICH the race with the `d = 2` radial candidates so the evidence
+    // adjudicates circle-vs-cylinder(radial)-vs-disk rather than the amplitude
+    // silently riding an uncertified quantity. Strictly additive and fail-safe:
+    // any failure building the promoted set falls back to the base race, and the
+    // gate only fires on a genuine continuous-amplitude signal, so the common path
+    // is unchanged.
+    if let Ok(Some(promoted)) = radial_promoted_specs(coords, target, d_k) {
+        if !promoted.is_empty() {
+            // Try the promoted circle-vs-cylinder-vs-disk race; on ANY failure
+            // (a degenerate d=2 fit, an empty ranking) fall back to the base race
+            // so a radial-flagged birth never regresses relative to the un-promoted
+            // path — the promotion can only ever ADD adjudicated candidates.
+            if let Ok(Some(fit)) = race_spec_set(promoted, target, weights) {
+                return Ok(Some(fit));
+            }
+        }
+    }
+    race_spec_set(base_specs, target, weights)
+}
+
+/// Race one realized candidate spec set against the birth target and return the
+/// evidence-winning fit. Shared by the base and the F1 radial-promoted races.
+fn race_spec_set(
+    specs: Vec<TopologyCandidateSpec>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<Option<TopologyRaceFit>, String> {
     if specs.is_empty() {
         return Ok(None);
     }
@@ -2239,6 +2338,82 @@ mod tests {
     /// softmax of these separates the discrete support cleanly.
     const ON: f64 = 6.0;
     const OFF: f64 = -6.0;
+
+    /// Deterministic low-discrepancy sequence on `[0, 1)` (van der Corput, base
+    /// 2) for RNG-free synthetic birth targets.
+    fn vdc(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let (mut x, mut denom, mut k) = (0.0_f64, 2.0_f64, i + 1);
+                while k > 0 {
+                    x += (k & 1) as f64 / denom;
+                    denom *= 2.0;
+                    k >>= 1;
+                }
+                x
+            })
+            .collect()
+    }
+
+    /// F1 radial promotion: a `d = 1` birth whose per-row amplitude is a
+    /// CONTINUOUS spread (a disk, radius uniform in area ⇒ density ∝ r) must
+    /// enrich the race with the circle-vs-cylinder-vs-disk candidate set; a
+    /// present/absent (bimodal) birth must NOT promote.
+    #[test]
+    fn radial_promotion_fires_only_on_continuous_amplitude() {
+        let n = 400;
+        let coords = Array2::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
+        // Disk: place each row on a circle of radius r_i = sqrt(u_i) (area-uniform
+        // radius, density ∝ r ⇒ Beta(2,1) ⇒ continuous), so the per-row amplitude
+        // (row norm) is a continuous spread.
+        let u = vdc(n);
+        let disk = Array2::from_shape_fn((n, 2), |(i, j)| {
+            let r = u[i].sqrt();
+            let theta = std::f64::consts::TAU * (i as f64 / n as f64);
+            if j == 0 { r * theta.cos() } else { r * theta.sin() }
+        });
+        let promoted = radial_promoted_specs(coords.view(), disk.view(), 1)
+            .expect("promotion decision")
+            .expect("disk amplitude is continuous ⇒ promotion fires");
+        let kinds: std::collections::HashSet<_> = promoted.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&AutoTopologyKind::Circle), "{kinds:?}");
+        assert!(kinds.contains(&AutoTopologyKind::Cylinder), "{kinds:?}");
+        assert!(kinds.contains(&AutoTopologyKind::Euclidean), "{kinds:?}");
+        // No key collision: each promoted kind appears once.
+        assert_eq!(kinds.len(), promoted.len());
+
+        // Present/absent circle: half the rows on the unit circle (amplitude 1),
+        // half at the origin (amplitude 0) ⇒ bimodal ⇒ spike ⇒ NO promotion.
+        let ring = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if i % 2 == 0 {
+                0.0
+            } else {
+                let theta = std::f64::consts::TAU * (i as f64 / n as f64);
+                if j == 0 { theta.cos() } else { theta.sin() }
+            }
+        });
+        assert!(
+            radial_promoted_specs(coords.view(), ring.view(), 1)
+                .expect("promotion decision")
+                .is_none(),
+            "present/absent birth must not promote"
+        );
+
+        // A d != 1 birth never promotes (radial promotion is the d=1→2 lift).
+        assert!(
+            radial_promoted_specs(coords.view(), disk.view(), 2)
+                .expect("promotion decision")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn birth_row_amplitudes_are_row_norms() {
+        let y = Array2::from_shape_vec((2, 2), vec![3.0, 4.0, 0.0, 0.0]).unwrap();
+        let a = birth_row_amplitudes(y.view());
+        assert!((a[0] - 5.0).abs() < 1e-12);
+        assert!((a[1]).abs() < 1e-12);
+    }
 
     /// Build a `K`-atom periodic SAE term whose per-row routing is dictated by a
     /// caller-supplied boolean activity matrix `active[(row, atom)]` (ON/OFF
