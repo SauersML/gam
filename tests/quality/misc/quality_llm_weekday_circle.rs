@@ -7,8 +7,10 @@
 //! of the structure ladder on ONE planted weekday/month dataset, end to end:
 //!
 //!   1. **Shape adjudication (#907 cross-class race).** Seven weekday tokens
-//!      live on a circle in activation space (Mon→Sun at angles `2πd/7`, with
-//!      isotropic jitter). The representational topology race — the exact
+//!      live on a circle in activation space (Mon→Sun centred at angles `2πd/7`,
+//!      each spread by a wide angular jitter that fills the ring into a genuine
+//!      continuum plus a tight radial jitter). The representational topology
+//!      race — the exact
 //!      `fit_mixture_rung` + `adjudicate_cross_class_race` machinery the
 //!      production fit drives — must select the smooth **S¹ atom** over the
 //!      discrete **7-cluster** null, and must do so with a *reported evidence
@@ -84,31 +86,50 @@ impl SplitMix64 {
 const N_WEEKDAYS: usize = 7;
 /// Rows per weekday in the activation cloud (7·N_PER_DAY total).
 const N_PER_DAY: usize = 90;
-/// Isotropic jitter on the planted weekday ring. Adjacent weekday centres are
-/// `2·sin(π/7) ≈ 0.868` apart, so this is SNR ≈ 7 — the weekdays form a clean
-/// ring, yet the cloud is genuinely *continuous* around it (every angle is
-/// populated by the jitter), so the smooth-circle candidate is honestly better
-/// than seven separated blobs, not a planted-in giveaway.
-const RING_JITTER: f64 = 0.12;
+/// Angular spread (radians) of each weekday's activations about its base arc.
+/// Adjacent weekday base angles are `2π/7 ≈ 0.898` apart; a per-weekday angular
+/// σ of this size washes the seven modes into a marginal that is uniform on the
+/// circle to ~1e-9 (the 7th harmonic of seven wrapped Gaussians spaced 0.898
+/// with σ = 0.9 has amplitude `exp(-½·49·0.81) ≈ 2.5e-9`). Every angle is
+/// therefore genuinely populated — the union of the seven weekdays is a
+/// *continuous* S¹, not seven separated blobs — so the smooth-circle atom is the
+/// honest truth and no discrete mixture can localise angle to beat it. (The old
+/// isotropic `RING_JITTER = 0.12` left the weekdays ~7σ apart with essentially
+/// empty inter-weekday valleys: that is genuinely a 7-cluster cloud, so the
+/// mixture rightly won it — the plant contradicted its own "continuous ring"
+/// premise. This polar plant fixes the DGP, not the selector.)
+const ANGULAR_SPREAD: f64 = 0.9;
+/// Radial jitter of the ring, kept tight so the radius carries a strong
+/// `r ~ N(1, σ²)` signal the S¹ atom exploits. Matched in scale to the sibling
+/// `topology_race_calibration` continuous circle (SNR ≈ 12, radial σ ≈ 0.083)
+/// that the SAME production adjudicator selects as a circle decisively.
+const RADIAL_JITTER: f64 = 0.083;
 
 // ===========================================================================
 // Arm 1 — the weekday ring and its shape adjudication.
 // ===========================================================================
 
-/// Planted weekday activations: weekday `d` sits at angle `2πd/7` on the unit
-/// circle with isotropic Gaussian jitter, every weekday equally frequent.
+/// Planted weekday activations: weekday `d` is centred at angle `2πd/7` on the
+/// unit circle, but each draw spreads it in POLAR coordinates — a WIDE angular
+/// jitter (`ANGULAR_SPREAD`) that fills the whole circle continuously (the seven
+/// modes merge into a uniform marginal) and a TIGHT radial jitter
+/// (`RADIAL_JITTER`) that keeps the ring crisp. The union of the seven weekdays
+/// is thus a genuinely continuous S¹ with a sharp radius, every weekday equally
+/// frequent.
 fn sample_weekday_ring(seed: u64) -> Array2<f64> {
     let mut rng = SplitMix64::new(seed ^ 0x7EE_C1_2C1E_u64);
     let n = N_WEEKDAYS * N_PER_DAY;
     let mut out = Array2::<f64>::zeros((n, 2));
     let mut row = 0usize;
     for d in 0..N_WEEKDAYS {
-        let phi = std::f64::consts::TAU * d as f64 / N_WEEKDAYS as f64;
+        let base = std::f64::consts::TAU * d as f64 / N_WEEKDAYS as f64;
         for _ in 0..N_PER_DAY {
-            // Centre on the weekday's arc, then jitter isotropically — the
-            // jitter fills the gaps between weekdays so the cloud is a ring.
-            out[[row, 0]] = phi.cos() + RING_JITTER * rng.next_gaussian();
-            out[[row, 1]] = phi.sin() + RING_JITTER * rng.next_gaussian();
+            // Wide angular spread fills the ring into a continuum; tight radial
+            // jitter keeps the S¹ radius sharp. Two RNG draws per point, as before.
+            let ang = base + ANGULAR_SPREAD * rng.next_gaussian();
+            let rad = 1.0 + RADIAL_JITTER * rng.next_gaussian();
+            out[[row, 0]] = rad * ang.cos();
+            out[[row, 1]] = rad * ang.sin();
             row += 1;
         }
     }
