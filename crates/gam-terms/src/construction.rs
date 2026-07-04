@@ -2118,46 +2118,113 @@ pub fn stable_reparameterizationwith_invariant(
     let mut range_eigenvalues_sorted: Vec<f64> = Vec::new();
     let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
     if penalized_rank > 0 {
-        let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
-        // Deterministic assembly: the independent S_k transforms were computed in
-        // parallel above, but the lambda-weighted sum is accumulated serially in
-        // canonical penalty order to avoid order-dependent floating-point drift.
-        for (lambda, s_k) in lambdas.iter().zip(s_k_penalized_cache.iter()) {
-            for i in 0..penalized_rank {
-                for j in 0..penalized_rank {
-                    range_block[(i, j)] += *lambda * s_k[(i, j)];
+        // Penalized-block spectrum `Σ_k λ_k S_k = U diag(d) Uᵀ` (restricted to the
+        // λ-invariant penalized subspace).  Compute it from the SVD of the STACKED
+        // SCALED ROOTS `E = [√λ_k R_k]_k` (root rows stacked), NOT from an
+        // eigendecomposition of the assembled Gram `range_block = EᵀE`.
+        //
+        // Why (#2123): `S_k = R_kᵀ R_k`, so `Σ_k λ_k S_k = EᵀE` with
+        // `E = vstack_k(√λ_k R_k)`.  Assembling the Gram and eigendecomposing it
+        // SQUARES the condition number (`κ(EᵀE) = κ(E)²`).  When the outer optimizer
+        // drives one margin toward its null space the λ dynamic range is enormous
+        // (here `te(x,z)` with the near-linear z axis reaches `λ_ratio ≳ 1e8`), so a
+        // recessive-penalty eigenvalue `d_min ≈ λ_min·σ²` is swamped by the
+        // eigensolver's `O(ε·d_max) = O(ε·λ_max)` absolute floor — its eigenVECTOR
+        // rotates into numerical noise, the genuinely-penalized direction is lost
+        // from `e_transformed`, and the inner P-IRLS solve then fits that direction
+        // to the data (a WIGGLY β̂ with `βᵀSβ̂ ≈ 0` despite `λ → ∞`).  That silent
+        // loss-of-penalty is a discontinuous function of ρ (it flips as the noise
+        // floor crosses `d_min`), so it injects spurious cliffs into the REML/LAML
+        // objective and a false low-cost basin in the high-λ corner — which the
+        // outer optimizer then lands in for some training-row orders but not others
+        // (the row-order-dependent EDF/SE of #2123).
+        //
+        // The SVD operates on `E` directly, so `σ_min(E) = √d_min` is resolved
+        // whenever `√λ_min·σ ≳ ε·√λ_max·σ` — a λ dynamic range up to ~1e32 instead
+        // of ~1e16 — keeping the reparameterized penalty faithful across the whole ρ
+        // box and the outer objective smooth and permutation-invariant.  `EᵀE`
+        // equals the previous `range_block` bit-for-bit, so well-conditioned fits
+        // are unchanged; only the ill-conditioned corner is corrected.
+        //
+        // As before, the right singular vectors `V` (= the penalized-block rotation)
+        // are used ONLY to build `E`/`S⁺`/traces below; they are NOT applied to
+        // `q_pen` or `rs_transformed`, so `Q_s` stays λ-independent and the
+        // quasi-Newton coordinate system does not drift at eigenvalue crossings.
+        let total_root_rows: usize = rs_transformed.iter().map(Mat::nrows).sum();
+        // Thin SVD yields a COMPLETE orthonormal `V` (all `penalized_rank`
+        // directions, including exactly-zero σ) only when `E` is tall or square
+        // (`total_root_rows ≥ penalized_rank`).  That always holds structurally —
+        // the union of the penalty root ranges spans the penalized subspace — but a
+        // pathological degenerate layout is handled by falling back to the Gram
+        // eigendecomposition so `range_rotation` is never left rank-deficient.
+        if total_root_rows >= penalized_rank {
+            let mut e_stacked = Array2::<f64>::zeros((total_root_rows, penalized_rank));
+            let mut row_off = 0usize;
+            for (lambda, root) in lambdas.iter().zip(rs_transformed.iter()) {
+                let sqrt_lambda = lambda.max(0.0).sqrt();
+                let rk = root.nrows();
+                for r in 0..rk {
+                    for c in 0..penalized_rank {
+                        e_stacked[[row_off + r, c]] = sqrt_lambda * root[(r, c)];
+                    }
+                }
+                row_off += rk;
+            }
+            let (_, singular_values, vt_opt) = e_stacked.svd(false, true).map_err(|e| {
+                EstimationError::LayoutError(format!("penalized-block root SVD failed: {e:?}"))
+            })?;
+            let vt = vt_opt.ok_or_else(|| {
+                EstimationError::LayoutError(
+                    "penalized-block root SVD did not return right singular vectors".to_string(),
+                )
+            })?;
+            // `singular_values` descending → eigenvalues `d_i = σ_i²` descending;
+            // `vt` is `penalized_rank × penalized_rank` with row i = vᵢᵀ.
+            let n_sv = singular_values.len().min(penalized_rank).min(vt.nrows());
+            range_eigenvalues_sorted = (0..penalized_rank)
+                .map(|i| {
+                    if i < n_sv {
+                        let s = singular_values[i];
+                        s * s
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            for col_idx in 0..n_sv {
+                for row in 0..penalized_rank {
+                    range_rotation[(row, col_idx)] = vt[[col_idx, row]];
+                }
+            }
+        } else {
+            // Defensive fallback (structurally unreachable): assemble the Gram and
+            // eigendecompose it. Loses the SVD's small-eigenvalue accuracy, but only
+            // reached if the penalty roots cannot span the penalized subspace.
+            let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
+            for (lambda, s_k) in lambdas.iter().zip(s_k_penalized_cache.iter()) {
+                for i in 0..penalized_rank {
+                    for j in 0..penalized_rank {
+                        range_block[(i, j)] += *lambda * s_k[(i, j)];
+                    }
+                }
+            }
+            let (range_eigenvalues, range_eigenvectors) =
+                robust_eigh_faer(&range_block, Side::Lower, "range penalty block")?;
+            let mut range_order: Vec<usize> = (0..penalized_rank).collect();
+            range_order.sort_by(|&i, &j| {
+                range_eigenvalues[j]
+                    .partial_cmp(&range_eigenvalues[i])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(i.cmp(&j))
+            });
+            range_eigenvalues_sorted =
+                range_order.iter().map(|&idx| range_eigenvalues[idx]).collect();
+            for (col_idx, &idx) in range_order.iter().enumerate() {
+                for row in 0..penalized_rank {
+                    range_rotation[(row, col_idx)] = range_eigenvectors[(row, idx)];
                 }
             }
         }
-        let (range_eigenvalues, range_eigenvectors) =
-            robust_eigh_faer(&range_block, Side::Lower, "range penalty block")?;
-
-        let mut range_order: Vec<usize> = (0..penalized_rank).collect();
-        range_order.sort_by(|&i, &j| {
-            range_eigenvalues[j]
-                .partial_cmp(&range_eigenvalues[i])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(i.cmp(&j))
-        });
-        range_eigenvalues_sorted = range_order
-            .iter()
-            .map(|&idx| range_eigenvalues[idx])
-            .collect();
-
-        // Build range_rotation = U (sorted eigenvectors) for E and S⁺
-        // construction only.  DO NOT apply to q_pen or rs_transformed —
-        // keeping Q_s lambda-independent prevents BFGS coordinate-system
-        // drift when multiple penalties interact (the eigenvectors of
-        // Σ λ_k S_k rotate with λ, breaking the quasi-Newton Hessian
-        // approximation at eigenvalue crossings).
-        for (col_idx, &idx) in range_order.iter().enumerate() {
-            for row in 0..penalized_rank {
-                range_rotation[(row, col_idx)] = range_eigenvectors[(row, idx)];
-            }
-        }
-        // q_pen and rs_transformed stay in the lambda-independent
-        // invariant basis.  E and S⁺ below are expressed in this same
-        // basis using U from the eigendecomposition.
     }
 
     // Subspace-invariant penalty spectral calculus:
