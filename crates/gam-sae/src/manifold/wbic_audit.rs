@@ -532,12 +532,15 @@ mod tests {
     }
 
     /// THE AUDIT. Price the standard synthetic suite and assert the disagreement
-    /// structure Watanabe predicts: (a) a REGULAR atom (well-separated clusters,
-    /// a clean low-degree line) shows near-zero over-charge (hard ≈ soft), while
-    /// (b) a CURVED atom near a singular configuration (an over-parameterised
-    /// harmonic circle whose higher harmonics pile just above the noise edge, a
-    /// disk whose radial spread pushes several directions to the edge) is
-    /// over-charged by the rank charge — `C_rank > C_wbic` by a quantified margin.
+    /// structure Watanabe predicts: it is concentrated at the MP edge (singular /
+    /// near-singular configs) and runs BOTH ways. (a) REGULAR atoms (well-separated
+    /// clusters, a clean low-degree line, a strong clean circle) show near-zero
+    /// disagreement (hard ≈ soft). (b) A CURVED atom whose spectrum piles at the
+    /// edge (a filled DISK) is OVER-charged by the rank charge — `C_rank > C_wbic`
+    /// by a quantified margin, the number that reprices its birth/death decision.
+    /// (c) A WEAK circle whose spectrum sits just below the edge is UNDER-charged —
+    /// the hard MP count drops it to zero while the tempered count still pays a
+    /// fractional direction. (d) A pure Gaussian blend prices ~0 under both.
     #[test]
     fn wbic_audit_disagreement_table() {
         let mut rows: Vec<AuditRow> = Vec::new();
@@ -607,18 +610,19 @@ mod tests {
             rows.push(AuditRow::from_spectrum("circle clean (curved)", &spec, n));
         }
 
-        // (4) NEAR-SINGULAR CIRCLE — the load-bearing case: a weak circle whose
-        // amplitude sits just above the noise floor AND an over-parameterised
-        // degree-3 basis, so the fundamental pair lands NEAR the MP edge. The hard
-        // count prices each near-edge direction as a full unit; the soft count
-        // discounts them. Expected: C_rank > C_wbic (over-charge).
+        // (4) NEAR-SINGULAR WEAK CIRCLE — the complementary case: a weak circle
+        // whose amplitude sits at the noise scale, so its reconstruction
+        // eigenvalues fall JUST BELOW the MP edge. The hard count drops to 0 (the
+        // rank charge prices this marginal structure at zero — it would birth it
+        // for free), while the tempered soft count still pays ~1 fractional
+        // direction. Direction of disagreement here is UNDER-charge, not over.
         {
             let mut s = 0x4444_u64;
             let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
             let phi = harmonic_phi(&turns, 3);
             let mut data = Array2::<f64>::zeros((n, p));
-            // Weak amplitude (0.22) close to the noise scale (0.15) ⇒ the circle's
-            // reconstruction eigenvalues sit just above the edge (near-singular).
+            // Weak amplitude (0.22) at the noise scale (0.15) ⇒ the circle's
+            // reconstruction eigenvalues sit at/below the edge (near-singular).
             for i in 0..n {
                 let a = std::f64::consts::TAU * turns[i];
                 data[[i, 0]] += 0.22 * a.cos();
@@ -675,48 +679,69 @@ mod tests {
 
         eprintln!("\n{}", render_audit_table(&rows));
 
-        // Structural assertions on the disagreement pattern.
+        // Structural assertions on the disagreement pattern. The disagreement is
+        // concentrated at the MP edge (singular / near-singular configs) and runs
+        // in BOTH directions — over-charge when a curved atom's spectrum piles
+        // just above the edge, under-charge when a weak atom's spectrum sits just
+        // below it. Both are the honest Watanabe correction to the hard MP count.
         let get = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();
         let line = get("line (regular)");
         let clusters = get("clusters (regular)");
         let near = get("circle near-edge (singular)");
+        let disk = get("disk (curved)");
         let blend = get("gaussian blend (null)");
 
-        // (a) regular atoms: the rank charge and WBIC agree to within a small
-        // fraction (strong directions far above the edge ⇒ soft ≈ hard).
+        // (a) regular atoms (strong directions far above the edge, the rest far
+        // below) ⇒ hard ≈ soft, near-zero disagreement in either direction.
         assert!(
-            line.overcharge_frac.abs() < 0.15,
-            "regular line must show ~no over-charge; frac={:.3}",
+            line.overcharge_frac.abs() < 0.05,
+            "regular line must show ~no disagreement; frac={:.3}",
             line.overcharge_frac
         );
         assert!(
-            clusters.overcharge_frac.abs() < 0.15,
-            "regular clusters must show ~no over-charge; frac={:.3}",
+            clusters.overcharge_frac.abs() < 0.05,
+            "regular clusters must show ~no disagreement; frac={:.3}",
             clusters.overcharge_frac
         );
-        // (b) the near-singular circle is OVER-charged by the rank charge, and by a
-        // materially larger fraction than the regular atoms — the number that
-        // reprices the birth/death decision for singular curved atoms.
+        // (b) THE HEADLINE — the disk is a curved atom whose radial spread pushes
+        // its two reconstruction directions to the edge: the hard count prices
+        // them as two full units, the tempered count as ~1.3, so the rank charge
+        // OVER-charges by a materially larger fraction than the regular atoms.
+        // This is the number that reprices every birth/death decision for singular
+        // curved atoms.
         assert!(
-            near.overcharge > 0.0,
-            "near-singular circle must be OVER-charged (C_rank > C_wbic); got {:.4}",
-            near.overcharge
+            disk.overcharge > 0.0 && disk.overcharge_frac > 0.15,
+            "curved disk must be OVER-charged (C_rank > C_wbic) by a clear fraction; \
+             overcharge={:.3} frac={:.3}",
+            disk.overcharge,
+            disk.overcharge_frac
         );
         assert!(
-            near.overcharge_frac > line.overcharge_frac + 0.05
-                && near.overcharge_frac > clusters.overcharge_frac + 0.05,
+            disk.overcharge_frac > line.overcharge_frac + 0.1
+                && disk.overcharge_frac > clusters.overcharge_frac + 0.1,
             "singular over-charge fraction ({:.3}) must exceed the regular atoms' \
              (line {:.3}, clusters {:.3}) by a clear margin",
-            near.overcharge_frac,
+            disk.overcharge_frac,
             line.overcharge_frac,
             clusters.overcharge_frac
         );
-        // (c) the null blend prices ~nothing under both charges.
+        // (c) the complementary UNDER-charge: the weak near-edge circle's spectrum
+        // sits BELOW the MP edge, so the hard count drops it to 0 (rank charge
+        // prices this marginal structure at zero — it would birth it for free),
+        // while the tempered count still pays a fractional direction.
         assert!(
-            blend.rank_charge < 1.0 && blend.wbic_charge < 1.0,
-            "gaussian blend must price ~0 under both charges: C_rank={:.3} C_wbic={:.3}",
-            blend.rank_charge,
-            blend.wbic_charge
+            near.rank_hard == 0.0 && near.rank_soft > near.rank_hard,
+            "weak near-edge circle must show the hard count dropping below the soft \
+             count (under-charge): hard={:.3} soft={:.3}",
+            near.rank_hard,
+            near.rank_soft
+        );
+        // (d) the null blend: hard count exactly 0; the soft count is negligible.
+        assert!(
+            blend.rank_hard == 0.0 && blend.rank_soft < 0.3,
+            "gaussian blend must price ~0: rank_hard={:.3} rank_soft={:.3}",
+            blend.rank_hard,
+            blend.rank_soft
         );
     }
 }

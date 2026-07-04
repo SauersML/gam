@@ -340,7 +340,6 @@ fn fit_evidence_ridge(
         if last_log_lambda.is_finite()
             && (log_lambda - last_log_lambda).abs() <= EVIDENCE_REL_TOL * (1.0 + log_lambda.abs())
         {
-            last_log_lambda = log_lambda;
             break;
         }
         last_log_lambda = log_lambda;
@@ -746,9 +745,11 @@ mod tests {
                     c
                 })
                 .collect();
-            // Amplitudes are non-negative masses; take |·| so the target lives in
-            // the encoder's clamped output domain.
-            let amplitudes = amp_raw.mapv(f64::abs);
+            // Amplitudes are non-negative masses; a positive offset plus a small
+            // LINEAR variation keeps them in the encoder's clamped output domain
+            // while staying an exactly-linear map of `x` (so the evidence must
+            // keep the linear null — no spurious nonlinear signal is planted).
+            let amplitudes = amp_raw.mapv(|v| 3.0 + 0.3 * v);
             (x, logits, coords, amplitudes)
         };
         let (x_tr, lg_tr, co_tr, am_tr) = make(&mut rng, n);

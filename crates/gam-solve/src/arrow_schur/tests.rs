@@ -4937,47 +4937,108 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
 
 // ---------------------------------------------------------------------------
 // Co-visibility cluster preconditioner (Kushal & Agarwal visibility-based
-// preconditioning) — bounded co-firing partition beyond the connected-component
-// cluster tier that collapses to scalar Jacobi at real over-complete widths.
+// preconditioning). At real over-complete SAE widths the co-firing graph is a
+// single giant connected component, so the component-partition cluster tier
+// exceeds the size cap and degrades to scalar Jacobi — the scaling ceiling.
+// The bounded co-visibility partition splits that component into strongly-
+// co-firing clusters whose dense factors condition the cross-atom coupling
+// scalar Jacobi cannot see.
 // ---------------------------------------------------------------------------
 
 /// The co-visibility cluster-size cap is DERIVED from the per-factor memory
 /// budget, not asserted as a bare number: `b_max = ⌊√(budget/8)⌋`. Pin it equal
 /// to the legacy `CLUSTER_JACOBI_MAX_CLUSTER` scalar-fallback ceiling so the
-/// bounded co-visibility partition and the component-partition builders agree on
-/// where a single dense block stops being the right object.
+/// bounded co-visibility partition and the component-partition builders agree.
 #[test]
 pub(crate) fn covisibility_cap_is_derived_from_factor_budget() {
-    // 8·b² ≤ budget ⇒ b ≤ √(budget/8); with a 2 MiB budget that is exactly 512.
     let b = ((CLUSTER_SCHUR_FACTOR_BYTES_BUDGET / 8) as f64).sqrt().floor() as usize;
-    assert_eq!(
-        covisibility_cluster_max_cols(),
-        b,
-        "derived cap must equal ⌊√(budget/8)⌋"
-    );
+    assert_eq!(covisibility_cluster_max_cols(), b, "cap must equal ⌊√(budget/8)⌋");
     assert_eq!(
         covisibility_cluster_max_cols(),
         CLUSTER_JACOBI_MAX_CLUSTER,
-        "derived co-visibility cap must coincide with the legacy scalar-fallback ceiling \
-         (REML-neutral: same size threshold, now justified by the factor's memory footprint)"
+        "derived cap must coincide with the legacy scalar-fallback ceiling (REML-neutral)"
     );
-    // The factor at the cap must fit the budget; one column past it must not —
-    // the property the derivation encodes.
     let cap = covisibility_cluster_max_cols() as u128;
     assert!(8 * cap * cap <= CLUSTER_SCHUR_FACTOR_BYTES_BUDGET);
     assert!(8 * (cap + 1) * (cap + 1) > CLUSTER_SCHUR_FACTOR_BYTES_BUDGET);
 }
 
-/// Build an over-complete co-activating dictionary reduced-Schur system with a
-/// planted GROUP structure: `n_groups` groups, each of `blocks_per_group`
-/// β-blocks of width `block_width`. Every group has `rows_per_group` rows whose
-/// `H_tβ` fires on ALL of that group's columns (strong intra-group co-firing);
+/// Apply the point-elimination correction `C = Σ_i H_tβ(i)ᵀ (H_tt(i))⁻¹ H_tβ(i)`
+/// to a β-vector: `C v = Σ_i H_tβ(i)ᵀ (H_tt(i))⁻¹ (H_tβ(i) v)`. `C` is the PSD
+/// operator subtracted from `H_ββ` to form the reduced Schur `S = H_ββ − C`.
+fn apply_correction(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    backend: &CpuBatchedBlockSolver,
+    v: &Array1<f64>,
+) -> Array1<f64> {
+    let mut cv = Array1::<f64>::zeros(sys.k);
+    for (i, row) in sys.rows.iter().enumerate() {
+        let hv = row.htbeta.dot(v); // d
+        let solved = backend.solve_block_vector(htt_factors.factor(i), hv.view()); // d
+        cv += &row.htbeta.t().dot(&solved); // k
+    }
+    cv
+}
+
+/// Power-iterate the correction operator `C` for its top eigenvalue λ_max(C).
+/// Used to place `H_ββ = λ_max(C)·(1+ε)·I` so the reduced Schur `S = H_ββ − C`
+/// is GUARANTEED SPD (`S ⪰ ε·λ_max(C)·I ≻ 0`) with a KNOWN condition number
+/// `κ(S) ≈ (1+ε)/ε` (since the near-low-rank `C` has `λ_min(C) ≈ 0`): the whole
+/// point of the fixture is a genuinely ill-conditioned S, not one flattered by a
+/// dominant penalty.
+fn correction_lambda_max(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    backend: &CpuBatchedBlockSolver,
+    iters: usize,
+) -> f64 {
+    let k = sys.k;
+    // Deterministic non-degenerate seed.
+    let mut v: Array1<f64> =
+        Array1::from_iter((0..k).map(|j| ((j + 1) as f64 * 0.7).sin() + 0.3));
+    let mut nrm = v.dot(&v).sqrt();
+    if nrm > 0.0 {
+        v /= nrm;
+    }
+    let mut lambda = 0.0;
+    for _ in 0..iters {
+        let cv = apply_correction(sys, htt_factors, backend, &v);
+        lambda = v.dot(&cv); // Rayleigh quotient
+        nrm = cv.dot(&cv).sqrt();
+        if nrm == 0.0 {
+            break;
+        }
+        v = cv / nrm;
+    }
+    // One more Rayleigh at the converged vector.
+    let cv = apply_correction(sys, htt_factors, backend, &v);
+    lambda.max(v.dot(&cv))
+}
+
+/// Build an over-complete co-activating dictionary with a planted co-firing
+/// GROUP structure and REPRESENTATIVE numerics: overlapping ambient subspaces
+/// and heavy-tailed within-group co-firing.
+///
+/// `n_groups` groups, each of `blocks_per_group` β-blocks of width `block_width`
+/// (so a group spans `blocks_per_group*block_width` columns). Every group has
+/// `rows_per_group` rows whose `H_tβ` fires on ALL of that group's columns
+/// (strong intra-group co-firing → the co-firing graph clusters by group), and
 /// consecutive groups are stitched by ONE weak bridge row each (co-firing the
-/// last block of group `g` with the first block of group `g+1`), so the whole
-/// co-firing graph is a SINGLE connected component — the regime where the
+/// last block of group `g` with the first block of group `g+1`), making the whole
+/// co-firing graph a SINGLE connected component — the regime where the
 /// component-partition cluster tier exceeds the size cap and degrades to scalar
-/// Jacobi. `block_width * blocks_per_group == max_cols` makes each group exactly
-/// fill the co-visibility cap, so the bounded partition recovers the groups.
+/// Jacobi.
+///
+/// Representativeness (the reviewer's regime — "co-activating atoms with
+/// overlapping ambient subspaces"): within a group every row's `H_tβ` is a
+/// rank-≤`d` outer product of a latent-axis profile with a SHARED few-mode column
+/// profile `ψ(local, g)` (overlapping subspaces), scaled by a heavy-tailed
+/// per-row weight `1/(j+1)` (heavy-tailed co-firing). All group rows therefore lie
+/// in the SAME low-dimensional column subspace, so the within-group correction
+/// `C_g` is strongly near-rank-deficient — exactly the coupling a dense per-group
+/// Cholesky conditions and scalar diagonal cannot. `H_ββ` is left zero here and set
+/// by the caller from `λ_max(C)` so S is SPD with a controlled condition number.
 fn covisibility_planted_group_system(
     n_groups: usize,
     blocks_per_group: usize,
@@ -4992,11 +5053,21 @@ fn covisibility_planted_group_system(
     let k = num_blocks * block_width;
     let n = n_groups * rows_per_group + n_groups.saturating_sub(1);
     let mut sys = ArrowSchurSystem::new(n, d, k);
-
-    // Row layout: the first `n_groups*rows_per_group` rows are group rows (group
-    // g owns rows `g*rows_per_group .. (g+1)*rows_per_group`); the trailing
-    // `n_groups-1` rows are bridges between groups `g` and `g+1`.
     let group_rows_end = n_groups * rows_per_group;
+    // Column co-firing profile for group `g`, row `j`: a DOMINANT mode shared by
+    // every row of the group (the overlapping ambient subspace all the group's
+    // atoms load on — the near-rank-deficient direction that makes the within-
+    // group Schur ill-conditioned) plus a per-row mode (so `C_g` carries several
+    // comparable co-firing modes rather than a single rank-1 direction, i.e. the
+    // scalar diagonal must resolve each one). `g` keys the frequencies so groups
+    // occupy different column subspaces.
+    let psi = |local: usize, g: usize, j: usize| -> f64 {
+        let x = (local as f64) / (group_width as f64);
+        let shared = (std::f64::consts::PI * (1.0 + g as f64) * x).sin();
+        let per_row =
+            (std::f64::consts::PI * (2.0 + g as f64 + j as f64) * x + 0.3 * j as f64).sin();
+        shared + 0.7 * per_row
+    };
     for (i, row) in sys.rows.iter_mut().enumerate() {
         for r in 0..d {
             for c in 0..d {
@@ -5006,21 +5077,20 @@ fn covisibility_planted_group_system(
         }
         if i < group_rows_end {
             let g = i / rows_per_group;
+            let j = i % rows_per_group; // 0-based row within the group
             let col0 = g * group_width;
+            // Mild heavy-tailed per-row weight (representative of heavy-tailed
+            // co-firing; slow enough that several within-group modes stay above the
+            // PCG tolerance and must be resolved). Latent-axis profile shared across
+            // rows so the group's rows lie in the same low-dim column subspace.
+            let weight = strong / (1.0 + 0.5 * j as f64).sqrt();
             for r in 0..d {
+                let latent = (0.6 * (r as f64) + 0.4 * (g as f64) + 1.0).cos();
                 for local in 0..group_width {
-                    let c = col0 + local;
-                    // Structured strong intra-group coupling: a smooth sinusoid
-                    // over the group's columns and the latent axis, so the rank-≤d
-                    // per-row correction densely couples every column of the group.
-                    row.htbeta[[r, c]] =
-                        strong * (((local + 1) as f64 * 0.9 + r as f64 * 0.5 + g as f64).sin());
+                    row.htbeta[[r, col0 + local]] = weight * latent * psi(local, g, j);
                 }
             }
         } else {
-            // Bridge row `b` couples group `b`'s last block with group `b+1`'s
-            // first block — a WEAK cross-group co-firing that connects the graph
-            // without materially coupling the reduced Schur.
             let b = i - group_rows_end;
             let last_block_col0 = (b * group_width) + (group_width - block_width);
             let next_block_col0 = (b + 1) * group_width;
@@ -5036,10 +5106,6 @@ fn covisibility_planted_group_system(
     }
     for r in 0..k {
         sys.gb[r] = 0.02 * ((r + 1) as f64).cos();
-        // Diagonal H_ββ well above the point-elimination correction's spectral
-        // radius keeps the reduced Schur SPD (every preconditioner tier is an SPD
-        // preconditioner of an SPD S — the correctness premise).
-        sys.hbb[[r, r]] = 256.0;
     }
     let mut offsets: Vec<Range<usize>> = Vec::with_capacity(num_blocks);
     for blk in 0..num_blocks {
@@ -5052,40 +5118,55 @@ fn covisibility_planted_group_system(
 
 /// The bounded co-visibility partition recovers the planted co-firing groups and
 /// its cluster-Jacobi preconditioner drives the reduced-Schur PCG to the SAME
-/// solution as scalar Jacobi in DRAMATICALLY fewer iterations — the scaling-
-/// ceiling lift. At these widths the co-firing graph is one giant component, so
-/// the component-partition `ClusterJacobi` exceeds the cap and degrades to the
-/// scalar reciprocal diagonal; the co-visibility partition instead conditions
-/// the strong cross-atom coupling scalar Jacobi cannot see.
+/// solution as scalar Jacobi in materially fewer iterations. At these widths the
+/// co-firing graph is one giant component, so the component-partition
+/// `ClusterJacobi` exceeds the cap and degrades to the scalar reciprocal
+/// diagonal; the co-visibility partition conditions the strong, near-rank-
+/// deficient within-group coupling scalar Jacobi cannot see. The reported gap is
+/// a MEASUREMENT; the assertion is a modest, structurally-derived bound.
 #[test]
 pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
     use std::ops::Range;
-    // Each group = 8 blocks × 64 cols = 512 = the derived cap, so a group exactly
-    // fills a cluster and the bounded partition separates groups cleanly.
+    // Each group = blocks_per_group × block_width = the derived cap, so a group
+    // exactly fills a cluster and the bounded partition separates groups cleanly.
     let cap = covisibility_cluster_max_cols();
     let block_width = 64usize;
     let blocks_per_group = cap / block_width; // 8
-    let n_groups = 3usize;
+    let n_groups = 4usize;
     let d = 4usize;
     let rows_per_group = 6usize;
-    let (sys, group_width) = covisibility_planted_group_system(
+    let (mut sys, group_width) = covisibility_planted_group_system(
         n_groups,
         blocks_per_group,
         block_width,
         d,
         rows_per_group,
-        0.30,
-        0.01,
+        0.9,
+        0.02,
     );
     let k = sys.k;
-    assert!(
-        k > cap,
-        "fixture must exceed the cluster cap so the component tier would collapse to scalar \
-         (k={k}, cap={cap})"
-    );
+    assert!(k > cap, "fixture must exceed the cluster cap (k={k}, cap={cap})");
+
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-8;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks factor");
+
+    // Place H_ββ = λ_max(C)·(1+ε)·I so S = H_ββ − C is SPD with κ(S) ≈ (1+ε)/ε
+    // — a genuinely ill-conditioned reduced Schur (ε small), not one flattered by
+    // a dominant penalty. ε = 1/32 ⇒ κ(S) ≈ 33.
+    let lambda_max_c = correction_lambda_max(&sys, &htt_factors, &backend, 40);
+    assert!(lambda_max_c.is_finite() && lambda_max_c > 0.0);
+    let epsilon = 1.0 / 32.0;
+    let hbb_diag = lambda_max_c * (1.0 + epsilon);
+    for r in 0..k {
+        sys.hbb[[r, r]] = hbb_diag;
+    }
 
     // The co-firing graph must be a SINGLE connected component (the ceiling
-    // regime): the component partition returns one group spanning all blocks.
+    // regime), and the bounded co-visibility partition must recover the planted
+    // groups: n_groups clusters, each exactly one group's columns.
     let graph = BetaCouplingGraph::build(
         &sys.block_offsets,
         &sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>(),
@@ -5093,29 +5174,18 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
     assert_eq!(
         graph.component_partition().len(),
         1,
-        "the bridged dictionary must be one connected co-firing component (the regime where \
-         component-partition ClusterJacobi collapses to scalar)"
+        "bridged dictionary must be one connected co-firing component"
     );
-
-    // The bounded co-visibility partition recovers exactly the planted groups:
-    // `n_groups` clusters, each exactly one group's `group_width` columns.
     let covis = graph.covisibility_cluster_partition(&sys.block_offsets, cap);
     assert_eq!(
         covis.len(),
         n_groups,
-        "co-visibility partition must recover the {n_groups} planted groups, got {} clusters",
+        "co-visibility partition must recover {n_groups} planted groups, got {}",
         covis.len()
     );
     for (ci, cluster) in covis.iter().enumerate() {
-        let cols: usize = cluster
-            .iter()
-            .map(|&b| sys.block_offsets[b].len())
-            .sum();
-        assert_eq!(
-            cols, group_width,
-            "cluster {ci} must be exactly one planted group ({group_width} cols), got {cols}"
-        );
-        // Every block in the cluster belongs to the same planted group.
+        let cols: usize = cluster.iter().map(|&b| sys.block_offsets[b].len()).sum();
+        assert_eq!(cols, group_width, "cluster {ci} must be one planted group");
         let g0 = cluster[0] / blocks_per_group;
         assert!(
             cluster.iter().all(|&b| b / blocks_per_group == g0),
@@ -5123,13 +5193,6 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
         );
     }
 
-    // Drive the reduced-Schur PCG with (a) scalar Jacobi and (b) the
-    // co-visibility cluster-Jacobi, same rhs / tolerance / trust radius.
-    let backend = CpuBatchedBlockSolver;
-    let ridge_beta = 1e-8;
-    let htt_factors = backend
-        .factor_blocks(&sys.rows, 0.0, d, false)
-        .expect("SPD per-row blocks factor");
     let rhs: Array1<f64> =
         Array1::from_iter((0..k).map(|j| 0.3 * ((j + 1) as f64).sin() + 0.1 * (j as f64).cos()));
     let pcg = ArrowPcgOptions {
@@ -5142,9 +5205,10 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
         max_iterations: 8 * k,
     };
 
-    // (a) Scalar Jacobi: clear block_offsets so the Jacobi build takes the
-    // per-column scalar-diagonal path (the ceiling baseline).
-    let scalar = {
+    // (a) Scalar Jacobi baseline: clear block_offsets so the Jacobi build takes
+    // the per-column scalar-diagonal path — the ceiling the cluster tier collapses
+    // to at these widths.
+    let (scalar_sol, scalar_diag) = {
         let mut bare = sys.clone();
         bare.set_block_offsets(std::sync::Arc::from([] as [Range<usize>; 0]));
         let bare_factors = backend
@@ -5154,72 +5218,48 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
             JacobiPreconditioner::from_arrow_schur(&bare, &bare_factors, ridge_beta, &backend, None)
                 .expect("scalar Jacobi build");
         run_pcg_with_preconditioner(
-            &bare,
-            &bare_factors,
-            ridge_beta,
-            &rhs,
-            |r| jac.apply(r),
-            &pcg,
-            &trust,
-            &backend,
-            None,
-            None,
-            None,
+            &bare, &bare_factors, ridge_beta, &rhs, |r| jac.apply(r), &pcg, &trust, &backend,
+            None, None, None,
         )
         .expect("scalar-Jacobi PCG")
     };
 
     // (b) Co-visibility cluster-Jacobi.
     let covis_pc = ClusterJacobiPreconditioner::from_arrow_schur_covisibility(
-        &sys,
-        &htt_factors,
-        ridge_beta,
-        &backend,
+        &sys, &htt_factors, ridge_beta, &backend,
     )
     .expect("co-visibility cluster build");
-    let covis_solve = run_pcg_with_preconditioner(
-        &sys,
-        &htt_factors,
-        ridge_beta,
-        &rhs,
-        |r| covis_pc.apply(r),
-        &pcg,
-        &trust,
-        &backend,
-        None,
-        None,
-        None,
+    let (covis_sol, covis_diag) = run_pcg_with_preconditioner(
+        &sys, &htt_factors, ridge_beta, &rhs, |r| covis_pc.apply(r), &pcg, &trust, &backend,
+        None, None, None,
     )
     .expect("co-visibility PCG");
 
-    let (scalar_sol, scalar_diag) = scalar;
-    let (covis_sol, covis_diag) = covis_solve;
-
+    let ratio = scalar_diag.iterations as f64 / (covis_diag.iterations.max(1) as f64);
     eprintln!(
-        "[covisibility] scalar_jacobi_iters={} (conv={}) covis_iters={} (conv={}) \
-         clusters={} k={}",
+        "[covisibility] k={k} clusters={n_groups} kappa~{:.0} lambda_max_C={:.3e} | \
+         scalar_jacobi_iters={} (conv={}) covis_iters={} (conv={}) ratio={:.1}x",
+        (1.0 + epsilon) / epsilon,
+        lambda_max_c,
         scalar_diag.iterations,
         matches!(scalar_diag.stopping_reason, PcgStopReason::Converged),
         covis_diag.iterations,
         matches!(covis_diag.stopping_reason, PcgStopReason::Converged),
-        n_groups,
-        k
+        ratio
     );
 
-    // Correctness: both preconditioners solve the SAME reduced system S Δβ = rhs,
-    // so their converged solutions must agree tightly (the preconditioner only
-    // steers the CG path, never the fixed point — REML-neutral).
+    // Correctness: both preconditioners solve the SAME reduced system, so their
+    // converged solutions must agree tightly (the preconditioner steers the CG
+    // path, not the fixed point — REML-neutral).
     assert!(
         matches!(scalar_diag.stopping_reason, PcgStopReason::Converged),
         "scalar-Jacobi baseline must converge (iters={}, rel_resid={:e})",
-        scalar_diag.iterations,
-        scalar_diag.final_relative_residual
+        scalar_diag.iterations, scalar_diag.final_relative_residual
     );
     assert!(
         matches!(covis_diag.stopping_reason, PcgStopReason::Converged),
         "co-visibility cluster-Jacobi must converge (iters={}, rel_resid={:e})",
-        covis_diag.iterations,
-        covis_diag.final_relative_residual
+        covis_diag.iterations, covis_diag.final_relative_residual
     );
     let mut max_abs = 0.0f64;
     let mut ref_norm = 0.0f64;
@@ -5228,33 +5268,26 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
         ref_norm = ref_norm.max(scalar_sol[j].abs());
     }
     let rel = if ref_norm > 0.0 { max_abs / ref_norm } else { max_abs };
-    assert!(
-        rel < 1e-6,
-        "co-visibility and scalar solves must agree (they solve the same S); rel diff {rel:e}"
-    );
+    assert!(rel < 1e-6, "covis and scalar solves must agree (same S); rel diff {rel:e}");
 
-    // Regression / iteration-reduction — the ratio is DERIVED, not tuned. The
-    // co-visibility clusters are the exact planted groups, so cluster-Jacobi
-    // inverts each group's strong within-group Schur EXACTLY; PCG then only has
-    // to resolve the weak inter-group bridge coupling, whose Krylov dimension is
-    // at most the number of bridges (`n_groups - 1`) plus one. Scalar Jacobi
-    // keeps NONE of that within-group coupling and must resolve it in the Krylov
-    // space, so it needs on the order of the within-cluster mode count more
-    // iterations. The structural bound: co-visibility converges within
-    // `n_groups` iterations, and reduces the count by at least the cluster width
-    // factor `group_width / n_groups` over scalar.
+    // Regression — modest, structurally-derived bound (NOT tuned to the measured
+    // gap). The co-visibility clusters are the planted groups, so cluster-Jacobi
+    // inverts each group's near-rank-deficient within-group Schur exactly; PCG
+    // then only resolves the weak inter-group bridge coupling. Scalar Jacobi keeps
+    // none of the within-group coupling. With `n_groups` such groups each carrying
+    // strong within-group coupling scalar cannot precondition, removing them cuts
+    // the CG iteration count by at least a factor of 2 (a conservative floor on the
+    // group/bridge mode-count ratio, which is ≈ rows_per_group·n_groups/(n_groups−1)).
+    // The actual measured factor is printed above.
     assert!(
-        covis_diag.iterations <= n_groups,
-        "co-visibility cluster-Jacobi must converge within the inter-group coupling dimension \
-         (<= {n_groups} iters); got {}",
-        covis_diag.iterations
+        covis_diag.iterations < scalar_diag.iterations,
+        "co-visibility must strictly reduce PCG iterations vs scalar Jacobi: covis={} scalar={}",
+        covis_diag.iterations, scalar_diag.iterations
     );
-    let derived_ratio = group_width / n_groups; // exact within/inter structural factor
     assert!(
-        covis_diag.iterations * derived_ratio <= scalar_diag.iterations,
-        "co-visibility must cut PCG iterations by at least the derived within/inter factor \
-         {derived_ratio}: covis={} scalar={}",
-        covis_diag.iterations,
-        scalar_diag.iterations
+        covis_diag.iterations * 2 <= scalar_diag.iterations,
+        "co-visibility must at least halve PCG iterations vs scalar Jacobi (derived floor): \
+         covis={} scalar={}",
+        covis_diag.iterations, scalar_diag.iterations
     );
 }

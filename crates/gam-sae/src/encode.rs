@@ -785,9 +785,11 @@ impl FallbackTelemetry {
         }
     }
 
-    /// Fold another atom's tallies into this one (n_rows is shared; n_atoms and
-    /// the tier counts accumulate).
-    fn accumulate(&mut self, other: &FallbackTelemetry) {
+    /// Fold another atom's tallies into this one (n_rows is shared across atoms;
+    /// n_atoms and the tier counts accumulate). Lets a caller aggregate the
+    /// per-atom telemetry of [`EncodeAtlas::encode_atom_with_fallback_telemetry`]
+    /// into one dictionary-wide breakdown.
+    pub fn accumulate(&mut self, other: &FallbackTelemetry) {
         self.n_rows = other.n_rows;
         self.n_atoms += other.n_atoms;
         self.amortized_certified += other.amortized_certified;
@@ -4285,6 +4287,51 @@ mod joint_fallback_tests {
         assert!(
             frac == 0.0,
             "no co-activation ⇒ no joint fallback, got {frac}"
+        );
+    }
+
+    /// The per-atom fallback tiers PARTITION the (row, atom) grid and the tier
+    /// fractions are consistent probabilities; `accumulate` folds per-atom
+    /// telemetry into a dictionary-wide breakdown that preserves the partition.
+    #[test]
+    fn fallback_telemetry_tiers_partition_and_accumulate() {
+        let a = FallbackTelemetry {
+            n_rows: 100,
+            n_atoms: 1,
+            amortized_certified: 70,
+            newton_rescued: 20,
+            multistart_fallback: 10,
+        };
+        assert_eq!(
+            a.amortized_certified + a.newton_rescued + a.multistart_fallback,
+            a.total(),
+            "the three tiers must partition the (row, atom) grid"
+        );
+        assert!((a.amortized_fraction() - 0.70).abs() < 1e-12);
+        assert!((a.newton_fraction() - 0.20).abs() < 1e-12);
+        assert!((a.multistart_fraction() - 0.10).abs() < 1e-12);
+        assert!(
+            (a.amortized_fraction() + a.newton_fraction() + a.multistart_fraction() - 1.0).abs()
+                < 1e-12,
+            "the tier fractions must sum to one"
+        );
+
+        let b = FallbackTelemetry {
+            n_rows: 100,
+            n_atoms: 1,
+            amortized_certified: 40,
+            newton_rescued: 30,
+            multistart_fallback: 30,
+        };
+        let mut agg = a.clone();
+        agg.accumulate(&b);
+        assert_eq!(agg.n_rows, 100, "n_rows is shared across atoms");
+        assert_eq!(agg.n_atoms, 2, "accumulate sums the atom count");
+        assert_eq!(agg.multistart_fallback, 40);
+        assert_eq!(
+            agg.amortized_certified + agg.newton_rescued + agg.multistart_fallback,
+            agg.total(),
+            "the partition is preserved under accumulation"
         );
     }
 }

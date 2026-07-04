@@ -457,6 +457,10 @@ mod tests {
         // Classical heteroskedasticity-consistent variance of the sample mean:
         // Σ r_i² / n².  Sandwich must reproduce it (φ cancels).
         let white = sum_r2 / (n as f64 * n as f64);
+        let model_based = bread[[0, 0]]; // φ/n, the model-based mean variance
+        println!(
+            "[sandwich/heteroskedastic] model_based_var={model_based:.6} sandwich_var={robust_var:.6} white_ref={white:.6}"
+        );
         assert!(
             (robust_var - white).abs() < 1e-9 * white.max(1.0),
             "sandwich mean-variance {robust_var} must equal White {white}"
@@ -546,6 +550,11 @@ mod tests {
         let model_dof = clic_effective_dof(a_inv.view(), f.view()).unwrap();
         let meat = gaussian_within_channel_meat(design.view(), residuals.view(), phi).unwrap();
         let clic = clic_effective_dof(a_inv.view(), meat[0].view()).unwrap();
+        println!(
+            "[clic/overdispersion s={s}] model_based_dof={model_dof:.4} clic_dof={clic:.4} ratio={:.4} (expected≈s²={:.4})",
+            clic / model_dof,
+            s * s
+        );
         assert!(
             clic > model_dof * 1.5,
             "CLIC dof {clic} must clearly exceed model-based dof {model_dof} under s={s} overdispersion"

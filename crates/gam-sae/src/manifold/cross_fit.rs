@@ -539,6 +539,10 @@ mod tests {
         )
         .unwrap();
 
+        println!(
+            "[optimism/noise] naive R²={:.4} cross_fit R²={:.4} optimism={:.4} per_fold={:?}",
+            report.naive, report.cross_fit, report.optimism, report.per_fold
+        );
         // Naive in-sample R² is inflated well above 0 by the selection.
         assert!(
             report.naive > 0.05,
@@ -625,6 +629,10 @@ mod tests {
         )
         .unwrap();
         let chance = q as f64 / p as f64;
+        println!(
+            "[optimism/recon] naive EV={:.4} cross_fit EV={:.4} optimism={:.4} chance q/p={:.4}",
+            report.naive, report.cross_fit, report.optimism, chance
+        );
         assert!(
             report.optimism > 0.05,
             "reconstruction optimism (naive − cross_fit) should be positive on noise, got {}",

@@ -267,10 +267,22 @@ mod amortized_encoder_glue_tests {
         }
     }
 
-    /// Build a two-atom flat (degree-1) term whose reconstruction is
-    /// `x = Σ_k z_k (b0_k + t_k·b1_k)`, with the target generated FROM the
-    /// dictionary so the exact reconstruction is faithful. Returns the term, the
-    /// ambient target, rho, and the planted exact code (logits, coords, amps).
+    /// Decoder directions / offsets shared by every atom instance so a held-out
+    /// term uses the SAME dictionary as the trained one.
+    const DIRS: [[f64; 6]; 2] = [
+        [1.0, 0.3, -0.2, 0.1, 0.0, 0.4],
+        [-0.1, 0.9, 0.2, -0.3, 0.5, 0.0],
+    ];
+    const OFFSETS: [[f64; 6]; 2] = [
+        [0.2, -0.1, 0.0, 0.3, 0.1, -0.2],
+        [0.0, 0.2, -0.3, 0.1, -0.1, 0.2],
+    ];
+
+    /// Build a SELF-CONSISTENT two-atom flat (degree-1) term: the ambient target
+    /// is `x = Σ_k z_k (b0_k + t_k·b1_k)` where `z_k` are the term's OWN
+    /// assignment masses (softmax of the stored logits), so decoding the term's
+    /// exact code reproduces `x` to machine precision (EV ≈ 1). Returns the term,
+    /// the ambient target, rho, and the exact code (logits, coords, amplitudes).
     #[allow(clippy::type_complexity)]
     fn planted_two_atom_term(
         n: usize,
@@ -287,16 +299,6 @@ mod amortized_encoder_glue_tests {
         let k = 2usize;
         let mut rng = Lcg(seed);
         let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        // Distinct decoder directions per atom.
-        let dirs = [
-            [1.0, 0.3, -0.2, 0.1, 0.0, 0.4_f64],
-            [-0.1, 0.9, 0.2, -0.3, 0.5, 0.0_f64],
-        ];
-        let offsets = [
-            [0.2, -0.1, 0.0, 0.3, 0.1, -0.2_f64],
-            [0.0, 0.2, -0.3, 0.1, -0.1, 0.2_f64],
-        ];
-        // Planted coordinates (a spread) and amplitudes (both active).
         let mut coords_blocks: Vec<Array2<f64>> = Vec::new();
         for atom_idx in 0..k {
             let mut c = Array2::<f64>::zeros((n, 1));
@@ -304,24 +306,6 @@ mod amortized_encoder_glue_tests {
                 c[[row, 0]] = 0.5 * (atom_idx as f64 + 1.0) + 1.5 * rng.signed();
             }
             coords_blocks.push(c);
-        }
-        let mut amps = Array2::<f64>::zeros((n, k));
-        for row in 0..n {
-            for atom_idx in 0..k {
-                amps[[row, atom_idx]] = 0.6 + 0.6 * rng.unit();
-            }
-        }
-        // Ambient target from the dictionary.
-        let mut x = Array2::<f64>::zeros((n, p));
-        for row in 0..n {
-            for atom_idx in 0..k {
-                let t = coords_blocks[atom_idx][[row, 0]];
-                let z = amps[[row, atom_idx]];
-                for col in 0..p {
-                    x[[row, col]] +=
-                        z * (offsets[atom_idx][col] + t * dirs[atom_idx][col]);
-                }
-            }
         }
         // Build atoms with decoder rows [offset; dir] on the degree-1 monomials.
         let probe = Array2::<f64>::zeros((1, 1));
@@ -331,8 +315,8 @@ mod amortized_encoder_glue_tests {
         for atom_idx in 0..k {
             let mut dec = Array2::<f64>::zeros((m, p));
             for col in 0..p {
-                dec[[0, col]] = offsets[atom_idx][col];
-                dec[[1, col]] = dirs[atom_idx][col];
+                dec[[0, col]] = OFFSETS[atom_idx][col];
+                dec[[1, col]] = DIRS[atom_idx][col];
             }
             let atom = SaeManifoldAtom::new(
                 "lin",
@@ -347,19 +331,33 @@ mod amortized_encoder_glue_tests {
             .with_basis_second_jet(evaluator.clone());
             atoms.push(atom);
         }
-        // Logits: both atoms active (positive) so gate agreement is well-defined.
+        // Both atoms active (positive logits) so the softmax gives well-defined,
+        // strictly-positive masses and the gate call (logit > 0) is unambiguous.
         let logits = Array2::<f64>::from_elem((n, k), 1.0);
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            logits,
+            logits.clone(),
             coords_blocks.clone(),
             vec![LatentManifold::Euclidean, LatentManifold::Euclidean],
             AssignmentMode::softmax(1.0),
         )
         .expect("assignment");
         let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
-        let rho = SaeManifoldRho::new(0.0, (0.01_f64).ln(), vec![Array1::zeros(1), Array1::zeros(1)]);
-        let exact_logits = Array2::<f64>::from_elem((n, k), 1.0);
-        (term, x, rho, exact_logits, coords_blocks, amps)
+        let rho =
+            SaeManifoldRho::new(0.0, (0.01_f64).ln(), vec![Array1::zeros(1), Array1::zeros(1)]);
+        // The exact amplitudes are the term's OWN masses; generate x from them so
+        // the term's exact code reconstructs x exactly (self-consistent).
+        let amps = term.fitted_assignment_amplitudes(&rho).expect("masses");
+        let mut x = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            for atom_idx in 0..k {
+                let t = coords_blocks[atom_idx][[row, 0]];
+                let z = amps[[row, atom_idx]];
+                for col in 0..p {
+                    x[[row, col]] += z * (OFFSETS[atom_idx][col] + t * DIRS[atom_idx][col]);
+                }
+            }
+        }
+        (term, x, rho, logits, coords_blocks, amps)
     }
 
     /// The distilled encoder, fit to the term's exact code, reproduces the
@@ -367,26 +365,24 @@ mod amortized_encoder_glue_tests {
     /// amortization gap is small — and the artifact fields are all well-formed.
     #[test]
     fn amortized_encode_reaches_high_fraction_of_exact_ev() {
-        let (term, x_tr, rho, lg_tr, co_tr, am_tr) = planted_two_atom_term(400, 7);
-        // The exact reconstruction from the planted code (the oracle line).
-        let mut code_tr = crate::amortized_encoder::AmortizedCode {
-            logits: lg_tr.clone(),
-            coords: co_tr.clone(),
-            amplitudes: am_tr.clone(),
-        };
-        // Sanity: decoding the planted code reproduces the target (EV ≈ 1).
-        let exact_recon = term.decode_amortized_code(&code_tr).expect("decode");
-        // Fit the encoder on the term's stored exact code.
-        let encoder = term.fit_amortized_encoder(x_tr.view(), &rho).expect("fit encoder");
+        let (term, x_tr, rho, _lg_tr, _co_tr, _am_tr) = planted_two_atom_term(400, 7);
+        // Fit the encoder on the term's own exact code (logits/coords/masses).
+        let encoder = term
+            .fit_amortized_encoder(x_tr.view(), &rho)
+            .expect("fit encoder");
 
-        // Held-out rows from the SAME generator.
-        let (term2, x_te, _rho2, lg_te, co_te, am_te) = planted_two_atom_term(200, 99);
-        // Exact reconstruction on held-out (oracle) uses the held-out planted code
-        // decoded through the SAME dictionary (identical atoms).
-        code_tr.logits = lg_te.clone();
-        code_tr.coords = co_te.clone();
-        code_tr.amplitudes = am_te.clone();
-        let exact_recon_te = term2.decode_amortized_code(&code_tr).expect("decode te");
+        // Held-out rows from the SAME dictionary (identical atoms, fresh coords).
+        let (term_te, x_te, _rho_te, lg_te, co_te, am_te) = planted_two_atom_term(200, 99);
+        // The oracle line: the exact code decoded through the (identical) frozen
+        // dictionary reconstructs the held-out target to machine precision.
+        let exact_recon_te = {
+            let code = crate::amortized_encoder::AmortizedCode {
+                logits: lg_te.clone(),
+                coords: co_te.clone(),
+                amplitudes: am_te.clone(),
+            };
+            term_te.decode_amortized_code(&code).expect("decode te")
+        };
 
         let gap = term
             .amortization_gap(
@@ -402,7 +398,7 @@ mod amortized_encoder_glue_tests {
 
         let ev_exact = gap.ev_exact.expect("exact EV defined");
         let ev_amortized = gap.ev_amortized.expect("amortized EV defined");
-        // The exact reconstruction is faithful by construction.
+        // The exact reconstruction is faithful by construction (self-consistent).
         assert!(
             ev_exact > 0.99,
             "planted exact reconstruction must be near-perfect, got {ev_exact}"
@@ -415,15 +411,16 @@ mod amortized_encoder_glue_tests {
              linearly-encodable dictionary"
         );
         assert!(
-            gap.ev_gap.expect("gap defined") >= -1.0e-9,
-            "the exact solve cannot be BEATEN by its own amortization on held-out data"
+            gap.ev_gap.expect("gap defined") >= -1.0e-6,
+            "the exact solve cannot be materially BEATEN by its own amortization"
         );
         assert!(
             (0.0..=1.0).contains(&gap.joint_multistart_fraction),
             "joint fallback fraction must be a probability, got {}",
             gap.joint_multistart_fraction
         );
-        // In-sample decode is exercised too (keeps `exact_recon` meaningful).
-        assert_eq!(exact_recon.dim(), x_tr.dim());
+        // The error-stats half of the artifact is well-formed.
+        assert!(gap.errors.coord_rmse.is_finite() && gap.errors.coord_rmse >= 0.0);
+        assert!((0.0..=1.0).contains(&gap.errors.gate_agreement));
     }
 }

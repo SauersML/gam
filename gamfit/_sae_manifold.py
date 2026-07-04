@@ -1443,6 +1443,50 @@ class ManifoldSAE:
             "fitted": np.asarray(payload["fitted"], dtype=float),
         }
 
+    def _amortized_encoder(self) -> Any:
+        """Fit the distilled one-matmul encoder against this fit's exact per-row
+        code (reviewer condition #2). The training corpus and the converged
+        (logits, coords, amplitudes) are the supervision; the Rust
+        ``SaeAmortizedEncoder`` learns the closed-form, evidence-selected map
+        ``x -> (logits, coords, amplitudes)``. A thin marshalling wrapper — all
+        math lives in Rust (SPEC)."""
+        rust = rust_module()
+        return rust.SaeAmortizedEncoder(
+            np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64)),
+            np.ascontiguousarray(np.asarray(self.low_level_logits, dtype=np.float64)),
+            [np.ascontiguousarray(np.asarray(c, dtype=np.float64)) for c in self.coords],
+            np.ascontiguousarray(np.asarray(self.assignments, dtype=np.float64)),
+        )
+
+    def encode_amortized(self, X: Any) -> dict[str, Any]:
+        """DISTILLED one-matmul encode of ``X`` (reviewer condition #2).
+
+        Our held-out reconstruction comes from a per-row test-time optimization
+        (:meth:`converged_latents` / :meth:`project`, the exact frozen-decoder
+        Newton solve); a sparse-autoencoder's comes from ONE matmul. This is that
+        one-matmul path: a cheap encoder, distilled against this fit's exact
+        per-row code by closed-form evidence maximization, predicts the code for
+        fresh rows in a single matmul.
+
+        Returns ``{"logits": (N, K), "coords": list[(N, d_k)], "amplitudes":
+        (N, K), "used_quadratic_head": bool, "log_evidence": float,
+        "feature_dim": int, "effective_dof": float}``. The amortization GAP — how
+        far this deployed code sits from :meth:`converged_latents` (the exact
+        oracle) — is the honest encode error; measure it by comparing the two
+        codes / their reconstructions on held-out ``X``."""
+        x = _as_2d_float(X, "X")
+        encoder = self._amortized_encoder()
+        code = encoder.encode_amortized(np.ascontiguousarray(x))
+        return {
+            "logits": np.asarray(code["logits"], dtype=float),
+            "coords": [np.asarray(c, dtype=float) for c in code["coords"]],
+            "amplitudes": np.asarray(code["amplitudes"], dtype=float),
+            "used_quadratic_head": bool(encoder.used_quadratic_head),
+            "log_evidence": float(encoder.log_evidence),
+            "feature_dim": int(encoder.feature_dim),
+            "effective_dof": float(encoder.effective_dof),
+        }
+
     def project(self, X: Any, atom_k: int) -> np.ndarray:
         """Standalone per-atom projection ``project(x, atom_k) -> t`` (#357).
 
