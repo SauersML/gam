@@ -1785,7 +1785,7 @@ pub fn fit_stagewise_batched(
     let mut consecutive_reject_rounds = 0usize;
 
     // ── Phase 1 — batched forward births ───────────────────────────────────────
-    let stopped_reason = 'rounds: loop {
+    let stopped_reason = loop {
         if births_accepted >= base.max_births {
             break StagewiseStop::MaxBirths;
         }
@@ -2978,6 +2978,346 @@ mod tests {
             is_non_decreasing(&result.report.backfit_ev_trace),
             "backfitting EV must be monotone non-decreasing; got {:?}",
             result.report.backfit_ev_trace
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Batched birth-racing (THRPT) — parity + batching-happened
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Build a K-atom periodic term under an arbitrary gate mode from an ON/OFF
+    /// routing table (mirrors `build_term`, which is softmax-only).
+    fn build_term_gate(
+        atoms: Vec<SaeManifoldAtom>,
+        coord_blocks: Vec<Array2<f64>>,
+        active: &[Vec<bool>],
+        mode: AssignmentMode,
+    ) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = active.len();
+        let k = atoms.len();
+        let mut logits = Array2::<f64>::zeros((n, k));
+        for (row, atom_active) in active.iter().enumerate() {
+            for (atom, &on) in atom_active.iter().enumerate() {
+                logits[[row, atom]] = if on { ON } else { OFF };
+            }
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coord_blocks,
+            vec![LatentManifold::Circle { period: 1.0 }; k],
+            mode,
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        (term, rho)
+    }
+
+    /// A hand-built disjoint circle birth seed: harmonic decoder on dirs `(a, b)`,
+    /// an own-presence gate finite ONLY on `rows` (−∞ elsewhere), and a phase
+    /// coordinate sweeping `[0, 1)` over `rows`. Under a ThresholdGate the −∞ →
+    /// BIRTH_SEED_LOGIT off-support rows are gated EXACTLY off.
+    fn disjoint_circle_seed(n: usize, p: usize, a: usize, b: usize, rows: &[usize]) -> BirthSeed {
+        let mut decoder = Array2::<f64>::zeros((3, p));
+        decoder[[1, a]] = 1.0;
+        decoder[[2, b]] = 1.0;
+        let mut gate = vec![f64::NEG_INFINITY; n];
+        let mut phases = Array2::<f64>::zeros((n, 1));
+        for (pos, &r) in rows.iter().enumerate() {
+            gate[r] = 2.0;
+            phases[[r, 0]] = pos as f64 / rows.len() as f64;
+        }
+        BirthSeed {
+            decoder,
+            energy: 1.0,
+            circle_coords: Some(phases),
+            circle_gate: Some(gate),
+        }
+    }
+
+    /// THE PARITY LICENSE (batch-OMP orthogonality). Two DISJOINT planted circles:
+    /// A on rows `[0,h)` in ambient plane (0,1), B on rows `[h,n)` in plane (2,3).
+    /// Under a ThresholdGate the born atom's gate is EXACTLY 0 off its support, so
+    /// B's K=1 fit reads only rows `[h,n)`. The A-deflated residual R1 equals the
+    /// original R0 on those rows (A gates off there), so B's fit against R0 (the
+    /// batched pass) is IDENTICAL to its fit against R1 (the serial pass). Prove it
+    /// bit-for-bit: accepting the disjoint batch in one snapshot is not an
+    /// approximation of the greedy sequence — it IS the greedy sequence.
+    #[test]
+    fn batched_disjoint_birth_fit_matches_serial_bit_for_bit() {
+        let n = 40usize;
+        let p = 6usize;
+        let h = n / 2;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+
+        // Target: circle A on [0,h) in dirs (0,1); circle B on [h,n) in dirs (2,3).
+        let mut target = Array2::<f64>::zeros((n, p));
+        for r in 0..h {
+            let th = std::f64::consts::TAU * (r as f64) / (h as f64);
+            target[[r, 0]] = th.cos();
+            target[[r, 1]] = th.sin();
+        }
+        for r in h..n {
+            let th = std::f64::consts::TAU * ((r - h) as f64) / ((n - h) as f64);
+            target[[r, 2]] = th.cos();
+            target[[r, 3]] = th.sin();
+        }
+
+        // K=1 ThresholdGate seed: a circle atom on dirs (0,1), active on [0,h).
+        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
+        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < h]).collect();
+        let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
+        seed.set_guards_enabled(false);
+        let config = test_config();
+        seed.run_joint_fit_arrow_schur(
+            target.view(),
+            &mut rho,
+            None,
+            config.inner_max_iter,
+            config.learning_rate,
+            config.ridge_ext_coord,
+            config.ridge_beta,
+        )
+        .expect("seed K=1 fit");
+
+        let rows_a: Vec<usize> = (0..h).collect();
+        let rows_b: Vec<usize> = (h..n).collect();
+        let seed_a = disjoint_circle_seed(n, p, 0, 1, &rows_a);
+        let seed_b = disjoint_circle_seed(n, p, 2, 3, &rows_b);
+
+        let r0 = current_residual(&seed, target.view()).unwrap();
+        // Batched: B raced against the ORIGINAL residual R0.
+        let b_batched =
+            race_birth_seed(&seed, &rho, &seed_b, r0.view(), target.view(), None, &config)
+                .expect("race B against R0");
+        // Serial: accept A first, deflate to R1, then race B against R1.
+        let a =
+            race_birth_seed(&seed, &rho, &seed_a, r0.view(), target.view(), None, &config)
+                .expect("race A against R0");
+        let (term_a, rho_a) = append_fitted_atom(
+            &seed,
+            &rho,
+            a.born_atom.clone(),
+            a.born_coord.clone(),
+            &a.born_logit_col,
+            a.born_ard.clone(),
+            a.born_log_lambda_smooth,
+        )
+        .expect("append A");
+        let r1 = current_residual(&term_a, target.view()).unwrap();
+        // R1 must equal R0 on B's rows (A gates off there) — the orthogonality
+        // precondition, checked directly.
+        let mut rows_b_diff = 0.0_f64;
+        for &r in &rows_b {
+            for j in 0..p {
+                rows_b_diff += (r0[[r, j]] - r1[[r, j]]).abs();
+            }
+        }
+        assert!(
+            rows_b_diff < 1e-9,
+            "R0 and R1 must be identical on B's disjoint rows; L1 diff {rows_b_diff}"
+        );
+        let b_serial =
+            race_birth_seed(&term_a, &rho_a, &seed_b, r1.view(), target.view(), None, &config)
+                .expect("race B against R1");
+
+        let d_batched = &b_batched.born_atom.decoder_coefficients;
+        let d_serial = &b_serial.born_atom.decoder_coefficients;
+        let decoder_diff = (d_batched - d_serial).mapv(f64::abs).sum();
+        assert!(
+            decoder_diff < 1e-6,
+            "disjoint birth B must fit IDENTICALLY against R0 (batched) and R1 (serial); \
+             decoder L1 diff {decoder_diff}"
+        );
+        // The evidence charge is likewise identical (same fit, same support).
+        assert!(
+            (b_batched.reml - b_serial.reml).abs() < 1e-6,
+            "disjoint birth B joint-evidence charge must match batched vs serial; \
+             {} vs {}",
+            b_batched.reml,
+            b_serial.reml
+        );
+    }
+
+    /// Integration parity + BATCHING-HAPPENED. Four disjoint planted circles on
+    /// disjoint row-quarters and disjoint ambient planes. The batched driver must
+    /// (a) recover the same atom count as the serial driver (±1), (b) reach a
+    /// comparable final EV, and (c) actually CO-ACCEPT more than one birth from a
+    /// single residual snapshot (max per-round `co_accepted ≥ 2`) — the speed
+    /// enabler, not a serialized loop in disguise.
+    #[test]
+    fn batched_driver_matches_serial_and_batches() {
+        let n = 48usize;
+        let p = 8usize;
+        let q = 4usize; // circles / quarters
+        let per = n / q;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+
+        // Target: quarter c is a clean circle in ambient plane (2c, 2c+1).
+        let mut target = Array2::<f64>::zeros((n, p));
+        for c in 0..q {
+            for pos in 0..per {
+                let r = c * per + pos;
+                let th = std::f64::consts::TAU * (pos as f64) / (per as f64);
+                target[[r, 2 * c]] = th.cos();
+                target[[r, 2 * c + 1]] = th.sin();
+            }
+        }
+
+        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
+        let mut config = test_config();
+        config.max_births = 8;
+        config.max_backfit_sweeps = 1;
+
+        let build_seed = || {
+            let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+            let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < per]).collect();
+            let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
+            seed.set_guards_enabled(false);
+            seed.run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho,
+                None,
+                config.inner_max_iter,
+                config.learning_rate,
+                config.ridge_ext_coord,
+                config.ridge_beta,
+            )
+            .expect("seed K=1 fit");
+            (seed, rho)
+        };
+
+        let (seed_s, rho_s) = build_seed();
+        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None)
+            .expect("serial driver");
+
+        let (seed_b, rho_b) = build_seed();
+        let batch_config = BatchedStagewiseConfig {
+            base: config,
+            max_candidates_per_round: 8,
+        };
+        let batched =
+            fit_stagewise_batched(seed_b, rho_b, target.view(), None, None, &batch_config)
+                .expect("batched driver");
+
+        assert!(
+            is_non_decreasing(&batched.report.ev_trace),
+            "batched EV must be monotone non-decreasing; got {:?}",
+            batched.report.ev_trace
+        );
+        assert!(
+            batched.report.terminal_joint_reml.is_finite(),
+            "batched terminal joint REML must be finite"
+        );
+
+        let serial_k = serial.term.k_atoms() as i64;
+        let batched_k = batched.term.k_atoms() as i64;
+        assert!(
+            (serial_k - batched_k).abs() <= 1,
+            "batched atom count {batched_k} must match serial {serial_k} within 1"
+        );
+
+        let serial_ev = *serial.report.ev_trace.last().unwrap();
+        let batched_ev = *batched.report.ev_trace.last().unwrap();
+        assert!(
+            (serial_ev - batched_ev).abs() < 0.1,
+            "batched final EV {batched_ev} must match serial {serial_ev} within 0.1"
+        );
+
+        let max_co_accept = batched
+            .batch_records
+            .iter()
+            .map(|r| r.co_accepted)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_co_accept >= 2,
+            "batched driver must CO-ACCEPT ≥2 births from one residual snapshot \
+             (else it is a serial loop in disguise); batch_records {:?}",
+            batched.batch_records
+        );
+    }
+
+    /// Births/round MULTIPLIER benchmark (run explicitly: `--ignored`). Plants
+    /// `K_PLANT` disjoint circles and reports serial vs batched accepted births
+    /// and the max co-accept width — the CPU-parallel speed multiplier before any
+    /// GPU batching. Not a CI gate (no wall-clock assertion, per SPEC).
+    #[test]
+    #[ignore]
+    fn bench_batched_births_multiplier() {
+        use std::time::Instant;
+        let k_plant = 16usize;
+        let per = 8usize;
+        let n = k_plant * per;
+        let p = 2 * k_plant;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+        let mut target = Array2::<f64>::zeros((n, p));
+        for c in 0..k_plant {
+            for pos in 0..per {
+                let r = c * per + pos;
+                let th = std::f64::consts::TAU * (pos as f64) / (per as f64);
+                target[[r, 2 * c]] = th.cos();
+                target[[r, 2 * c + 1]] = th.sin();
+            }
+        }
+        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
+        let mut config = test_config();
+        config.max_births = k_plant + 4;
+        config.max_backfit_sweeps = 0;
+        let build_seed = || {
+            let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+            let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < per]).collect();
+            let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
+            seed.set_guards_enabled(false);
+            seed.run_joint_fit_arrow_schur(
+                target.view(),
+                &mut rho,
+                None,
+                config.inner_max_iter,
+                config.learning_rate,
+                config.ridge_ext_coord,
+                config.ridge_beta,
+            )
+            .unwrap();
+            (seed, rho)
+        };
+
+        let (seed_s, rho_s) = build_seed();
+        let t0 = Instant::now();
+        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None).unwrap();
+        let serial_dt = t0.elapsed().as_secs_f64();
+
+        let (seed_b, rho_b) = build_seed();
+        let batch_config = BatchedStagewiseConfig {
+            base: config,
+            max_candidates_per_round: k_plant + 4,
+        };
+        let t1 = Instant::now();
+        let batched =
+            fit_stagewise_batched(seed_b, rho_b, target.view(), None, None, &batch_config).unwrap();
+        let batched_dt = t1.elapsed().as_secs_f64();
+
+        let max_co = batched
+            .batch_records
+            .iter()
+            .map(|r| r.co_accepted)
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "THRPT bench: planted={k_plant} | serial births={} in {serial_dt:.3}s ({} rounds) | \
+             batched births={} in {batched_dt:.3}s ({} rounds, max co-accept={max_co}) | \
+             round-multiplier={:.1}x speedup={:.1}x",
+            serial.report.births_accepted,
+            serial.report.birth_records.len(),
+            batched.report.births_accepted,
+            batched.batch_records.len(),
+            serial.report.birth_records.len() as f64
+                / (batched.batch_records.len().max(1) as f64),
+            serial_dt / batched_dt.max(1e-9),
         );
     }
 }
