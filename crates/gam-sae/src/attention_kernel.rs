@@ -496,6 +496,17 @@ fn separable_sums_of_squares(
     let mean = scores.iter().sum::<f64>() / scores.len() as f64;
     let basis_width = 1 + 2 * max_harmonic;
     let mut row_basis = vec![0.0; coefficients.len()];
+    // Precondition: the separable (query ⊗ key) harmonic design has
+    // `basis_width²` columns, so the coefficient vector `fill_separable_basis`
+    // writes into must match. Checked before the loop that indexes it, in every
+    // build (not a debug-only invariant).
+    assert_eq!(
+        row_basis.len(),
+        basis_width * basis_width,
+        "separable harmonic coefficient length {} must equal basis_width² = {}",
+        row_basis.len(),
+        basis_width * basis_width,
+    );
     let mut sse = 0.0;
     let mut sst = 0.0;
     for query_index in 0..query_t.len() {
@@ -511,7 +522,6 @@ fn separable_sums_of_squares(
             sst += centered * centered;
         }
     }
-    debug_assert_eq!(row_basis.len(), basis_width * basis_width);
     (sse, sst)
 }
 
