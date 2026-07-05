@@ -408,11 +408,6 @@ impl BetaPenaltyOp for WhitenedRowGramPenaltyOp {
 /// `(M·p)²` per-atom covariance. With `M_n = I_p` it reduces bit-for-bit to the
 /// isotropic factored operator (pinned by the reduction test), so it is only
 /// installed on the whitening path.
-// TODO(#974): remove once the frames_engaged whitened assembly wiring in
-// construction_arrow_schur_assembly.rs is fully landed and every field/method is
-// exercised — kept temporarily so a partial checkout can't trip -D dead_code and
-// block the shared tree.
-#[allow(dead_code)]
 pub struct WhitenedFactoredFrameOp {
     /// Decoder output dimension `p`.
     p: usize,
@@ -433,11 +428,7 @@ pub struct WhitenedFactoredFrameOp {
     metric: gam_problem::RowMetric,
 }
 
-// TODO(#974): drop this allow once the whitened frames_engaged path constructs
-// and drives this operator (then dead_code no longer fires).
-#[allow(dead_code)]
 impl WhitenedFactoredFrameOp {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         p: usize,
         dim: usize,
@@ -628,7 +619,6 @@ impl BetaPenaltyOp for WhitenedFactoredFrameOp {
             None => return,
         };
         let r = self.ranks[atom];
-        let m = self.basis_sizes[atom];
         for row in 0..self.n_rows() {
             // Support entries for THIS atom in this row: (basis, weight).
             let entries: Vec<(usize, f64)> = self.support[row]
@@ -656,7 +646,6 @@ impl BetaPenaltyOp for WhitenedFactoredFrameOp {
                 }
             }
         }
-        let _ = m;
     }
 
     fn to_dense(&self) -> Array2<f64> {

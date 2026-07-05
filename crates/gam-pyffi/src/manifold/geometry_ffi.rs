@@ -4426,6 +4426,15 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<TotalVariationPenalty>()?;
     module.add_class::<NuclearNormPenalty>()?;
     module.add_class::<MechanismSparsityPenalty>()?;
+    module.add_function(wrap_pyfunction!(dimension_spectrometer, module)?)?;
+    module.add_function(wrap_pyfunction!(block_firing_coordinates, module)?)?;
+    module.add_function(wrap_pyfunction!(routability_floor, module)?)?;
+    module.add_function(wrap_pyfunction!(routability_audit, module)?)?;
+    module.add_function(wrap_pyfunction!(sparse_dict_dual_certificate, module)?)?;
+    module.add_function(wrap_pyfunction!(separation_limit, module)?)?;
+    module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
+    module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;
+    module.add_function(wrap_pyfunction!(loop_holonomy, module)?)?;
     Ok(())
 }
 

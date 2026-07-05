@@ -224,3 +224,4 @@ scripts/*verify*fresh*.sh
 
 # agent working notes, never commit
 .agent/
+experiments/spectrometer/*.npy

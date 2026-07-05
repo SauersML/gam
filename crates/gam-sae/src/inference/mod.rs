@@ -10,6 +10,7 @@
 pub mod atom_geometry;
 pub mod atom_lens;
 pub mod checkpoint_dynamics;
+pub mod contracts;
 pub mod harvest;
 pub mod intervention_shard;
 pub mod layer_transport;

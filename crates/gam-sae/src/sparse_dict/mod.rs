@@ -28,8 +28,10 @@
 
 mod block;
 mod block_chart;
+mod block_scoring_gpu;
 mod block_stream;
 mod codes;
+mod coordinate;
 mod scoring;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
@@ -52,10 +54,18 @@ pub use block_chart::{
     block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest,
     compose_block_coordinate_charts,
 };
+pub use block_scoring_gpu::{
+    BlockRoutePath, block_gate_block_cpu, block_gate_row_cpu, route_blocks_cpu,
+};
+#[cfg(target_os = "linux")]
+pub use block_scoring_gpu::{DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_required};
 pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
 };
 pub use codes::SparseCode;
+pub use coordinate::{
+    BlockCoordinateReport, FiringCoordinate, block_firing_coordinates, harmonic_firing_coordinates,
+};
 pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer, top_s_online};
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{

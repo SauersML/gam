@@ -4008,8 +4008,48 @@ mod tests {
         // their structural effect — so comparing them would assert a property the
         // cap is not meant to preserve (and the adopted-fit check below is the
         // real guarantee that the converged state matches).
+        // The cap-invariant surface is the DECISION each move records — its
+        // proposal (`mv`), the structure it acts on (`structure_hash`), its
+        // `claim`, and the e-gate VERDICT VARIANT (Accepted vs Contested vs …).
+        // The `trigger` and the verdict's `log_e` are floating-point MAGNITUDES
+        // computed under the scoring budget: a 4-iter scoring fit and a 24-iter
+        // one legitimately land on slightly different evidence for the SAME
+        // decision — that is exactly the economy the cap trades on. Asserting
+        // bit-identical `log_e`/`trigger` would demand the cap be a no-op, which
+        // is the opposite of its purpose; the #1026 soundness property is that no
+        // e-gate DECISION flips, which the projection below captures.
+        use gam_solve::structure_search::MoveVerdict;
+        let verdict_kind = |v: &MoveVerdict| -> &'static str {
+            match v {
+                MoveVerdict::Accepted { .. } => "Accepted",
+                MoveVerdict::Contested { .. } => "Contested",
+                MoveVerdict::Demoted { .. } => "Demoted",
+                MoveVerdict::Vetoed { .. } => "Vetoed",
+                MoveVerdict::Deduplicated => "Deduplicated",
+                MoveVerdict::Stale => "Stale",
+                MoveVerdict::Deferred => "Deferred",
+            }
+        };
         let round_moves = |rounds: &[SearchLedger]| -> String {
-            serde_json::to_string(&rounds.iter().map(|r| &r.moves).collect::<Vec<_>>()).unwrap()
+            serde_json::to_string(
+                &rounds
+                    .iter()
+                    .map(|r| {
+                        r.moves
+                            .iter()
+                            .map(|m| {
+                                (
+                                    serde_json::to_string(&m.mv).unwrap(),
+                                    m.structure_hash,
+                                    serde_json::to_string(&m.claim).unwrap(),
+                                    verdict_kind(&m.verdict),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
         };
         assert_eq!(
             round_moves(&reference.rounds),

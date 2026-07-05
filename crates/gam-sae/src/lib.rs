@@ -11,6 +11,7 @@ pub mod corpus;
 pub mod criterion_atoms;
 pub mod description_length;
 pub mod dictionary_artifact;
+pub mod dual_certificate;
 pub mod encode;
 pub mod frames;
 pub mod gpu_kernels;
@@ -20,9 +21,12 @@ pub mod inference;
 pub mod k_selection;
 pub mod manifold;
 pub mod null_sampler;
+pub mod routability;
 pub mod row_jet_program;
 pub mod sparse_dict;
+pub mod spectrometer;
 pub mod structure_harvest;
+pub mod super_resolution;
 pub mod tiered;
 
 // The pre-split engine referenced GPU infrastructure as `crate::gpu::*`; after

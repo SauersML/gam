@@ -63,5 +63,6 @@ include!("model/model_ffi.rs");
 include!("model/fidelity_ffi.rs");
 include!("latent/latent_basis_and_sae_ffi.rs");
 include!("latent/reml_latent_fit_ffi.rs");
+include!("latent/sae_spectral_ffi.rs");
 include!("manifold/geometry_ffi.rs");
 include!("manifold/manifold_and_posterior_ffi.rs");

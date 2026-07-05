@@ -228,7 +228,11 @@ pub fn rotation_angle_band(
         return Err("at least one token must have positive weight".to_string());
     }
     let mean_angle = s_sum.atan2(c);
-    let resultant = (c * c + s_sum * s_sum).sqrt() / weight_sum;
+    // The mean resultant length is a probability-weighted average of unit vectors,
+    // so it lies in [0, 1] exactly; a value above 1 is pure floating-point drift
+    // (a point mass rounds `√(cos²+sin²)` to 1 ± ε). Clamp to the physical range so
+    // the `−2·ln R̄` circular-SD below cannot see a spurious `R̄ > 1`.
+    let resultant = ((c * c + s_sum * s_sum).sqrt() / weight_sum).min(1.0);
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     // Degenerate resultant (angles spread over the whole circle): the circular
     // std diverges; report it honestly as infinite rather than clamping.
@@ -365,7 +369,12 @@ mod tests {
         let (mean_one, se_one) =
             rotation_angle_band(ops.view(), Some(array![1.0, 0.0].view())).unwrap();
         assert!((mean_one - (std::f64::consts::PI - 0.1)).abs() < 1.0e-9);
-        assert!(se_one.abs() < 1.0e-9);
+        // A point mass has zero circular dispersion, but the SD estimator
+        // `√(−2·ln R̄)` is ill-conditioned as `R̄ → 1`: a point mass leaves `R̄`
+        // one machine-epsilon below 1, which the `√` amplifies to O(√ε) ≈ 1e-8.
+        // That IS "collapsed to the angle"; asserting below the estimator's fp
+        // floor (1e-9) is unmeetable.
+        assert!(se_one.abs() < 1.0e-7, "point-mass band should collapse; got {se_one}");
     }
 
     #[test]
