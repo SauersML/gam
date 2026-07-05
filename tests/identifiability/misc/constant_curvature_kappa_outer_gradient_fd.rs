@@ -158,8 +158,13 @@ fn constant_curvature_kappa_outer_gradient_matches_fd() {
     }
     // Data generated on M_κ with a planted spherical curvature.
     let data = build_dataset(400, 0.8, 0.6, 0xC0FF_EE01);
-    // Start κ away from the truth so the audit exercises a non-trivial point.
-    let formula = "y ~ curv(x1, x2, kappa=0.0, centers=8)";
+    // κ must be a FREE outer coordinate for this FD audit — the audit exists to
+    // check the analytic ∂criterion/∂κ against a finite difference, which only
+    // fires when κ is enrolled as a ψ-coordinate. Since gam#2152, an explicit
+    // `kappa=` PINS κ (fixed geometry, no ψ enrollment), so κ is left OMITTED
+    // here: it seeds at the flat default 0 (the same non-trivial start point away
+    // from the planted 0.8 truth) and enrolls for estimation.
+    let formula = "y ~ curv(x1, x2, centers=8)";
     let config = FitConfig {
         outer_max_iter: Some(2),
         gpu_policy: if cfg!(target_os = "macos") {

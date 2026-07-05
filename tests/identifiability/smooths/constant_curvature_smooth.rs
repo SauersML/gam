@@ -519,3 +519,145 @@ fn kappa_one_fit_recovers_planted_spherical_signal() {
         "kappa=1 curvature smooth failed spherical truth recovery: R² = {r2_curv}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gam#2152: a user-PINNED `kappa=` is a FIXED sectional curvature that the fit
+// must honour verbatim — never re-derive via the #944/#1464 κ estimation.
+// ---------------------------------------------------------------------------
+
+/// A small smooth surface on the ball `‖(x1, x2)‖² < 1/3`, strictly inside BOTH
+/// the κ = +K and κ = −K stereographic charts for K ≤ 3, so a pinned fit at
+/// either sign is well posed rather than chart-rejected.
+fn small_ball_rows(n: usize, seed: u64) -> Vec<(f64, f64, f64, f64)> {
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..n)
+        .map(|_| {
+            let x1 = 0.6 * rng.random::<f64>() - 0.3;
+            let x2 = 0.6 * rng.random::<f64>() - 0.3;
+            let truth = (4.0 * x1).sin() * (4.0 * x2).cos();
+            let y = truth + 0.05 * (rng.random::<f64>() - 0.5);
+            (x1, x2, truth, y)
+        })
+        .collect()
+}
+
+/// Read the FROZEN sectional curvature and its pin flag out of a fitted
+/// `curv(...)` spec (the value/geometry the design was actually built and kept
+/// at, post-fit).
+fn fitted_kappa_and_pin(formula: &str, rows: &[(f64, f64, f64, f64)]) -> (f64, bool) {
+    use csv::StringRecord;
+    let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
+    let records: Vec<StringRecord> = rows
+        .iter()
+        .map(|(x1, x2, _, y)| {
+            StringRecord::from(vec![x1.to_string(), x2.to_string(), y.to_string()])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, records).expect("encode");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(formula, &data, &cfg).expect("fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit");
+    };
+    let SmoothBasisSpec::ConstantCurvature { spec, .. } = &fit.resolvedspec.smooth_terms[0].basis
+    else {
+        panic!("expected a ConstantCurvature term after fit");
+    };
+    (spec.kappa, spec.kappa_fixed)
+}
+
+/// The core #2152 contract at the ENGINE level: the fit keeps the design and
+/// penalty at the user's pinned κ. A spherical `kappa=+3` freezes at +3 and a
+/// hyperbolic `kappa=-3` freezes at −3 — the fit never re-derives them to the
+/// same estimated κ̂ (the byte-identical-fits symptom). This is a different
+/// angle than the prediction-equality Python repro: it inspects the realized
+/// geometry directly, so it catches a regression even if predictions happened to
+/// coincide for unrelated reasons.
+#[test]
+fn pinned_kappa_is_kept_verbatim_by_the_fit() {
+    gam::init_parallelism();
+    let rows = small_ball_rows(600, 2152);
+
+    let (k_pos, pinned_pos) = fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=3, centers=20)", &rows);
+    assert!(pinned_pos, "explicit kappa=3 must mark the term kappa_fixed");
+    assert!(
+        (k_pos - 3.0).abs() < 1e-9,
+        "pinned kappa=+3 was re-derived: fit kept κ = {k_pos} (want +3)"
+    );
+
+    let (k_neg, pinned_neg) =
+        fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=-3, centers=20)", &rows);
+    assert!(pinned_neg, "explicit kappa=-3 must mark the term kappa_fixed");
+    assert!(
+        (k_neg + 3.0).abs() < 1e-9,
+        "pinned kappa=-3 was re-derived: fit kept κ = {k_neg} (want -3)"
+    );
+
+    // A pinned flat kappa=0 must also be kept exactly (the window collapses onto
+    // 0), not left free to drift to a chart bound.
+    let (k_flat, pinned_flat) =
+        fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=0, centers=20)", &rows);
+    assert!(pinned_flat, "explicit kappa=0 must mark the term kappa_fixed");
+    assert!(
+        k_flat.abs() < 1e-9,
+        "pinned kappa=0 drifted off flat: fit kept κ = {k_flat} (want 0)"
+    );
+
+    // The spherical and hyperbolic pinned fits landed at genuinely different κ.
+    assert!(
+        (k_pos - k_neg).abs() > 1.0,
+        "pinned +3 and -3 collapsed to the same κ ({k_pos} vs {k_neg})"
+    );
+}
+
+/// Guard against OVER-correction: omitting `kappa=` must still leave κ FREE for
+/// the #944/#1464 outer estimation (kappa_fixed = false). The pin path must not
+/// swallow the estimation path.
+#[test]
+fn omitted_kappa_stays_free_for_estimation() {
+    gam::init_parallelism();
+    let rows = small_ball_rows(400, 7);
+    let (_k, pinned) = fitted_kappa_and_pin("y ~ curv(x1, x2, centers=20)", &rows);
+    assert!(
+        !pinned,
+        "omitted kappa= must leave the term free to estimate κ (kappa_fixed=false)"
+    );
+}
+
+/// The issue's independent tell: because a pinned κ genuinely builds the design
+/// at that κ, an out-of-chart pinned κ must now be REJECTED loudly by
+/// `validate_chart_points` (`1 + κ‖x‖² > 0`) — under the old
+/// silently-re-derive-κ behaviour such a fit was wrongly ACCEPTED (the realized
+/// design used a different, in-chart estimated κ). Here the data reaches
+/// ‖x‖² ≈ 0.18, and κ = −50 needs ‖x‖² < 1/50 = 0.02, so every far row is out of
+/// chart.
+#[test]
+fn pinned_out_of_chart_kappa_is_rejected() {
+    gam::init_parallelism();
+    let rows = small_ball_rows(300, 99);
+    use csv::StringRecord;
+    let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
+    let records: Vec<StringRecord> = rows
+        .iter()
+        .map(|(x1, x2, _, y)| {
+            StringRecord::from(vec![x1.to_string(), x2.to_string(), y.to_string()])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, records).expect("encode");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ curv(x1, x2, kappa=-50, centers=20)", &data, &cfg);
+    assert!(
+        result.is_err(),
+        "a pinned out-of-chart kappa=-50 must be rejected (design genuinely built \
+         at κ=-50, so validate_chart_points must fire); got Ok — κ was silently re-derived"
+    );
+}
