@@ -83,6 +83,7 @@ fn build_seed(
         AssignmentMode::threshold_gate(1.0, -3.0),
     )
     .unwrap();
+    let _ = n;
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
     term.set_guards_enabled(false);
