@@ -131,6 +131,10 @@ impl CrossModelTransportReport {
     pub fn phase(&self) -> Option<f64> {
         self.circle.as_ref().map(|r| r.phase)
     }
+
+    pub fn o2_defect(&self) -> Option<f64> {
+        self.circle.as_ref().map(|r| r.defect)
+    }
 }
 
 /// Fit a cross-model transport between already-paired one-dimensional
@@ -260,6 +264,7 @@ mod tests {
         let circle = report.circle.as_ref().expect("circle classification");
         assert_eq!(circle.class, CircleTransportClass::Reflect);
         assert_eq!(circle.winding, -1);
+        assert_eq!(report.o2_defect(), Some(circle.defect));
         assert!(wrap_pi(circle.phase - phi).abs() < 1e-6);
         assert!(report.fit.isometry_defect < 1e-10);
         assert!(report.fit.residual_rms < 1e-6);
