@@ -2,7 +2,7 @@
 
 Positional-only nuisance regress-out (`qwen_nuisance_msi.py`, run on MSI via
 `qwen_nuisance.sbatch`, job 12581201) on the Qwen3-8B wikitext harvest
-`/projects/standard/hsiehph/sauer354/harvest_out/qwen3_8b_wikitext`
+`<harvest_dir>/qwen3_8b_wikitext`
 (`[300000, 4096]` fp32 per layer, seq_len 512). Per-token within-doc position was
 reconstructed by re-tokenizing the identical corpus (300000 tokens, aligned
 row-for-row with the harvest's doc-then-position order).

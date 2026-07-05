@@ -22,7 +22,7 @@ is genuinely positional the null collapses to the ~M/N overfit floor, ruling out
 
 Usage (on MSI):
   python qwen_nuisance_msi.py \
-    --harvest /projects/standard/hsiehph/sauer354/harvest_out/qwen3_8b_wikitext \
+    --harvest <harvest_dir> \
     --model Qwen/Qwen3-8B --layers 18,30,6 --out /tmp/qwen_nuisance.json
 """
 from __future__ import annotations

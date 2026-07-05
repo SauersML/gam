@@ -341,7 +341,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
             }
             fixed_state_logdet(t, &target, &rho)
         };
-        let fd = (at(h) - at(-h)) / (2.0 * h);
+        let fd = (at(h) - at(0.0)) / h;
         let analytic = gamma.t[cache.row_offsets[row] + local_pos];
         let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
         assert!(

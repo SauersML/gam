@@ -267,6 +267,33 @@ fn routing_is_gamma_invariant() {
 }
 
 #[test]
+fn near_orthogonal_row_is_orphaned_by_gate_floor() {
+    let (n_blocks, b, p, k) = (2usize, 2usize, 4usize, 2usize);
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+    decoder[[0, 0]] = 1.0;
+    decoder[[1, 1]] = 1.0;
+    decoder[[2, 0]] = std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[2, 1]] = std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[3, 0]] = -std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[3, 1]] = std::f32::consts::FRAC_1_SQRT_2;
+
+    let mut x = Array2::<f32>::zeros((1, p));
+    x[[0, 2]] = 1.0;
+
+    let codes = route_and_code_all(x.view(), decoder.view(), 1.0, n_blocks, b, k, 1, 1);
+    assert_eq!(codes.len(), 1);
+    let code = &codes[0];
+    assert!(
+        code.gates.iter().all(|gate| *gate == 0.0),
+        "orthogonal rows should carry only padded zero gates"
+    );
+    assert!(
+        code.codes.iter().all(|value| *value == 0.0),
+        "orthogonal rows should not populate any block code"
+    );
+}
+
+#[test]
 fn planted_block_subspaces_recovered() {
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);

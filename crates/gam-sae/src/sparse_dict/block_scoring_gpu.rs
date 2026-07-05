@@ -237,7 +237,11 @@ pub fn route_blocks_required(
     let tile_blocks = (plan.tile_items / b.max(1)).clamp(1, g);
 
     match device::route_blocks_device(rows, decoder, b, g, active, tile_blocks) {
-        Ok(out) => Ok((out.selections, BlockRoutePath::Device, out.device_dtoh_bytes)),
+        Ok(out) => Ok((
+            out.selections,
+            BlockRoutePath::Device,
+            out.device_dtoh_bytes,
+        )),
         Err(err) => {
             if mode == GpuMode::Required {
                 return Err(err);
@@ -327,14 +331,18 @@ mod device {
         let slots = (threads as usize)
             .checked_add(1)
             .and_then(|v| v.checked_mul(active))
-            .ok_or_else(|| gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory overflow"))?;
+            .ok_or_else(|| {
+                gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory overflow")
+            })?;
         let bytes = slots
             .checked_mul(
                 std::mem::size_of::<u32>()
                     + std::mem::size_of::<f32>()
                     + std::mem::size_of::<f32>(),
             )
-            .ok_or_else(|| gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory overflow"))?;
+            .ok_or_else(|| {
+                gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory overflow")
+            })?;
         if max_shared_mem_per_block > 0 && bytes > max_shared_mem_per_block {
             return Err(gam_gpu::gpu_err!(
                 "sparse_dict block-gate fold requires {bytes} shared-memory bytes per row block \
@@ -342,8 +350,9 @@ mod device {
                  max_shared_mem_per_block={max_shared_mem_per_block}"
             ));
         }
-        u32::try_from(bytes)
-            .map_err(|_| gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory bytes overflow"))
+        u32::try_from(bytes).map_err(|_| {
+            gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory bytes overflow")
+        })
     }
 
     /// Route a whole minibatch's blocks on the device: rows and the whole decoder
@@ -501,9 +510,8 @@ mod device {
 
             // (2) gate epilogue: reduce each adjacent b-group of z to its ℓ₂ norm.
             let gate_elems = m.saturating_mul(tile_g);
-            let gate_grid: u32 =
-                u32::try_from(gate_elems.div_ceil(GATE_KERNEL_THREADS as usize))
-                    .map_err(|_| gam_gpu::gpu_err!("block-gate gate grid overflow"))?;
+            let gate_grid: u32 = u32::try_from(gate_elems.div_ceil(GATE_KERNEL_THREADS as usize))
+                .map_err(|_| gam_gpu::gpu_err!("block-gate gate grid overflow"))?;
             let gate_cfg = LaunchConfig {
                 grid_dim: (gate_grid, 1, 1),
                 block_dim: (GATE_KERNEL_THREADS, 1, 1),
@@ -598,9 +606,7 @@ mod tests {
         });
         // Orthonormalise each block's b rows so it is a real St(b, P) frame.
         for g in 0..n_blocks {
-            let mut block = decoder
-                .slice(ndarray::s![g * b..g * b + b, ..])
-                .to_owned();
+            let mut block = decoder.slice(ndarray::s![g * b..g * b + b, ..]).to_owned();
             super::super::block::gram_schmidt_rows(&mut block);
             for r in 0..b {
                 for c in 0..p {
@@ -666,7 +672,13 @@ mod tests {
 
         let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
 
-        match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Required) {
+        match route_blocks_required(
+            rows.view(),
+            decoder.view(),
+            b,
+            k,
+            gam_gpu::GpuMode::Required,
+        ) {
             Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
                     path,
@@ -680,7 +692,11 @@ mod tests {
                 );
                 assert_eq!(routed.len(), cpu.len());
                 for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
-                    assert_eq!(dev_sel.len(), cpu_sel.len(), "row {r}: selection length differs");
+                    assert_eq!(
+                        dev_sel.len(),
+                        cpu_sel.len(),
+                        "row {r}: selection length differs"
+                    );
                     for (j, ((db, dg), (cb, cg))) in dev_sel.iter().zip(cpu_sel).enumerate() {
                         assert_eq!(db, cb, "row {r} slot {j}: block differs dev={db} cpu={cb}");
                         let tol = 1e-5 * cg.abs().max(1.0);
@@ -727,9 +743,19 @@ mod tests {
         let (rows, decoder) = fixture(m, g, b, p);
         let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
 
-        match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Required) {
+        match route_blocks_required(
+            rows.view(),
+            decoder.view(),
+            b,
+            k,
+            gam_gpu::GpuMode::Required,
+        ) {
             Ok((routed, path, _)) => {
-                assert_eq!(path, BlockRoutePath::Device, "device did not engage at scale");
+                assert_eq!(
+                    path,
+                    BlockRoutePath::Device,
+                    "device did not engage at scale"
+                );
                 for (r, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {
                     assert_eq!(dev_sel.len(), cpu_sel.len(), "row {r}: length differs");
                     for (j, ((db, dg), (cb, cg))) in dev_sel.iter().zip(cpu_sel).enumerate() {
@@ -749,70 +775,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Device-vs-CPU wall-time for the block-gate route at a production-scale
-    /// shape. Gated behind the off-by-default `gpu_tests` cargo feature (which
-    /// `build.rs` treats as the SPEC-clean equivalent of a skipped/XFAIL test —
-    /// the latter attribute is banned): a reporting bench, not a correctness gate,
-    /// run explicitly on a GPU node via `cargo test -p gam-sae --features
-    /// gpu_tests`. It is NOT a wall-clock BUDGET (nothing fails on a deadline;
-    /// SPEC 18): it first asserts the device selection still equals the CPU
-    /// oracle, then prints the speedup.
-    #[cfg(all(target_os = "linux", feature = "gpu_tests"))]
-    #[test]
-    fn device_block_route_speedup_bench() {
-        use std::time::Instant;
-        let m = 1024usize;
-        let g = 16_384usize;
-        let b = 3usize;
-        let k = 8usize;
-        let p = 128usize;
-        let krows = g * b;
-        assert!(m * krows >= DEVICE_BLOCK_GATE_MIN_ELEMS);
-        let (rows, decoder) = fixture(m, g, b, p);
-
-        // Warm the device (module compile + first alloc) so the timing is
-        // steady-state. Assert the warm-up path resolved (never silently drop it).
-        let warm = route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Auto);
-        assert!(
-            warm.is_ok(),
-            "block-gate warm-up route must not error under Auto: {:?}",
-            warm.err()
-        );
-
-        let t_cpu = Instant::now();
-        let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
-        let cpu_secs = t_cpu.elapsed().as_secs_f64();
-
-        let t_dev = Instant::now();
-        let (routed, path, dtoh) =
-            match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Required)
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    assert!(
-                        gam_gpu::GpuRuntime::global().is_none(),
-                        "Required errored despite a live CUDA runtime: {err}"
-                    );
-                    println!("[block-gate bench] no CUDA runtime; skipping device timing");
-                    return;
-                }
-            };
-        let dev_secs = t_dev.elapsed().as_secs_f64();
-        assert_eq!(path, BlockRoutePath::Device, "bench: device did not engage");
-
-        // Selection parity still holds at bench scale.
-        for (dev_sel, cpu_sel) in routed.iter().zip(&cpu) {
-            assert_eq!(dev_sel.len(), cpu_sel.len());
-            for ((db, _), (cb, _)) in dev_sel.iter().zip(cpu_sel) {
-                assert_eq!(db, cb, "bench: block selection diverged");
-            }
-        }
-        println!(
-            "[block-gate bench] m={m} G={g} b={b} k={k} P={p} (K={krows}): \
-             CPU {cpu_secs:.4}s  device {dev_secs:.4}s  speedup {:.1}x  dtoh={dtoh}B",
-            cpu_secs / dev_secs.max(1e-9)
-        );
     }
 }
