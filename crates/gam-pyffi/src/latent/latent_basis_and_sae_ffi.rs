@@ -1684,6 +1684,13 @@ fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
+        // The finite-set (discrete-anchor) candidate is inert scaffolding that is
+        // not enrolled in the topology race by default, so a discovered dictionary
+        // never actually carries it (see
+        // `structure_harvest::finite_set_race_enrolled`). Round-trip it under the
+        // same `"finite_set"` token the gam-sae inference/harvest paths already
+        // emit, so serialization stays consistent the moment it is enrolled.
+        SaeAtomBasisKind::FiniteSet => "finite_set".to_string(),
         SaeAtomBasisKind::Precomputed(name) => name.clone(),
     }
 }
@@ -2073,6 +2080,22 @@ fn build_sae_basis_evaluators(
                     "build_sae_basis_evaluators: Cylinder atom {k} requires latent_dim == 2; got dim={d}, m={m}"
                 ));
             }
+            SaeAtomBasisKind::FiniteSet => {
+                // A finite-set atom's latent is CATEGORICAL (a discrete anchor
+                // index), so it has no continuous Phi(t)/dPhi/dt for the inner
+                // Newton latent update to refresh. The candidate is inert
+                // scaffolding not enrolled in the topology race
+                // (`structure_harvest::finite_set_race_enrolled` is false by
+                // default), so it cannot reach here from a discovered dictionary;
+                // surface loudly if the enrolment flag is flipped before the
+                // first-class continuous-optimizer integration lands, rather than
+                // mis-refreshing a categorical basis as a smooth one.
+                return Err(format!(
+                    "build_sae_basis_evaluators: atom {k} 'finite_set' is a discrete-anchor \
+                     (categorical) candidate with no continuous Phi(t) refresh; it is not yet \
+                     wired into the inner Newton latent-update path"
+                ));
+            }
             SaeAtomBasisKind::Precomputed(label) => {
                 return Err(format!(
                     "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
@@ -2398,6 +2421,7 @@ fn stagewise_basis_kind_tag(kind: &SaeAtomBasisKind) -> &'static str {
         SaeAtomBasisKind::Linear => "linear",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
+        SaeAtomBasisKind::FiniteSet => "finite_set",
         SaeAtomBasisKind::Precomputed(_) => "precomputed",
     }
 }
@@ -6822,6 +6846,19 @@ fn sae_build_padded_basis_stacks(
                      topology, not a seed-plan stack kind; it has no padded seed basis to build"
                 ));
             }
+            SaeAtomBasisKind::FiniteSet => {
+                // The finite-set candidate is inert scaffolding not enrolled in the
+                // topology race by default, and its latent is categorical (a
+                // discrete anchor index) rather than a continuous seed coordinate,
+                // so there is no padded seed basis to lay down here. Rejected above
+                // in `sae_build_atom_plans`, so it cannot reach this stack builder;
+                // surfaced loudly if it ever does, rather than mis-built.
+                return Err(format!(
+                    "sae_build_padded_basis_stacks: atom {atom_idx} 'finite_set' is a discrete-anchor \
+                     (categorical) candidate, not a continuous seed-plan stack kind; it has no padded \
+                     seed basis to build"
+                ));
+            }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(
                     "sae_build_padded_basis_stacks: unsupported atom {atom_idx} basis {:?}; precomputed atoms require caller-supplied padded basis arrays",
@@ -7009,6 +7046,24 @@ fn sae_build_atom_plans(
                     "sae_build_atom_plans: 'cylinder' is a birth-discovered topology, not a seed \
                      dictionary kind; seed with periodic, duchon, sphere, torus, or \
                      euclidean_patch and let the structure search grow a cylinder by evidence"
+                        .to_string(),
+                );
+            }
+            SaeAtomBasisKind::FiniteSet => {
+                // The finite-set (discrete-anchor) candidate is inert scaffolding
+                // not enrolled in the topology race by default
+                // (`structure_harvest::finite_set_race_enrolled` is false), and its
+                // latent is CATEGORICAL rather than a continuous seed coordinate, so
+                // there is no user-facing finite-set seed geometry to derive a plan
+                // from here. First-class integration into the continuous-latent
+                // optimizer is the documented follow-up; until then a finite_set in
+                // the seed dictionary is a caller error, surfaced loudly rather than
+                // mis-built as a patch.
+                return Err(
+                    "sae_build_atom_plans: 'finite_set' is a discrete-anchor (categorical) \
+                     candidate that is not enrolled in the topology race and cannot be seeded \
+                     through sae_manifold_fit_minimal; seed with periodic, duchon, sphere, \
+                     torus, or euclidean_patch"
                         .to_string(),
                 );
             }
