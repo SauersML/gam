@@ -237,19 +237,6 @@ pub struct BlockRankCharges {
 }
 
 impl BlockSparseStreamState {
-    /// Test-support (#1026 revival): zero one block's decoder rows so the block is
-    /// GUARANTEED dead on the next epoch (its routing gate `‖x·Dᵀ‖` is exactly 0 for
-    /// every row, so top-k routing never selects it). Lets the revival test exercise
-    /// AuxK dead-block reseeding deterministically instead of depending on routing
-    /// round-off to leave a block unpopulated.
-    #[cfg(test)]
-    pub(crate) fn zero_block_for_test(&mut self, block: usize) {
-        for r in 0..self.b {
-            for c in 0..self.p {
-                self.decoder[[block * self.b + r, c]] = 0.0;
-            }
-        }
-    }
     /// fit_begin: seed the block frames from `seed` (a representative sample) and
     /// prime the epoch accumulators. The seed fixes `P` and the initial
     /// orthonormal frames ([`seed_frames`]); the corpus is streamed later through
@@ -663,8 +650,7 @@ impl BlockSparseStreamState {
     pub fn block_rank_charges(&self, n_obs: usize) -> Result<BlockRankCharges, String> {
         if self.last_rows == 0 {
             return Err(
-                "block_rank_charges: no closed epoch to certify; call end_epoch first"
-                    .to_string(),
+                "block_rank_charges: no closed epoch to certify; call end_epoch first".to_string(),
             );
         }
         let phi_raw = self.last_rss / (self.last_rows as f64 * self.p as f64);
@@ -787,6 +773,25 @@ fn validate_config(config: &BlockSparseConfig) -> Result<(), String> {
         return Err("BlockSparseStream tolerance must be finite".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::BlockSparseStreamState;
+
+    pub(super) trait ZeroBlockForTest {
+        fn zero_block_for_test(&mut self, block: usize);
+    }
+
+    impl ZeroBlockForTest for BlockSparseStreamState {
+        fn zero_block_for_test(&mut self, block: usize) {
+            for r in 0..self.b {
+                for c in 0..self.p {
+                    self.decoder[[block * self.b + r, c]] = 0.0;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! in-memory [`fit_block_sparse_dictionary`] on the concatenation.
 
 use super::BlockSparseStreamState;
+use super::test_support::ZeroBlockForTest;
 use crate::sparse_dict::{
     BlockSparseConfig, block_gates, block_projections_row, fit_block_sparse_dictionary,
     reconstruct_row, route_row_blocks,

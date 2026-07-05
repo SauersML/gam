@@ -35,7 +35,3 @@ approx = "0.5.1"
 
 [lints.rust]
 warnings = "deny"
-
-[features]
-real_data_harness = []
-gpu_tests = []
