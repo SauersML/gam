@@ -96,6 +96,29 @@ def test_group_wrapper_stays_lenient_on_unseen_level() -> None:
     assert m.check(pd.DataFrame({"g": ["z"]})).ok is True
 
 
+def test_numeric_coded_factor_predict_and_check_flag_unseen_code() -> None:
+    """``factor(year)`` on a NUMERIC column is stored as a Continuous schema
+    column (no level set), so ``check()`` once returned ``ok=True`` on an unseen
+    code even though ``predict`` (correctly) raised — the two halves of the
+    fixed-factor contract disagreed. Both must now reject an out-of-vocabulary
+    numeric code, while a seen code stays accepted."""
+    rng = np.random.default_rng(3)
+    year = rng.choice([2000.0, 2001.0, 2002.0], size=1500)
+    eff = {2000.0: 0.0, 2001.0: 5.0, 2002.0: 10.0}
+    y = np.array([eff[v] for v in year]) + rng.normal(0, 0.1, year.size)
+    m = gamfit.fit(pd.DataFrame({"year": year, "y": y}), "y ~ factor(year)")
+
+    unseen = pd.DataFrame({"year": [1999.0]})
+    with pytest.raises(gamfit.GamError):
+        m.predict(unseen)
+    assert m.check(unseen).ok is False, "check() must flag an unseen numeric factor code"
+
+    # A seen numeric code stays accepted and predicts near its group mean.
+    seen = pd.DataFrame({"year": [2001.0]})
+    assert m.check(seen).ok is True
+    assert abs(float(np.asarray(m.predict(seen)).ravel()[0]) - 5.0) < 0.6
+
+
 def test_factor_and_group_agree_on_seen_levels() -> None:
     """The fix must ONLY change the unseen-level policy: on seen levels
     ``factor(g)`` and ``group(g)`` share the penalized-categorical block and so
