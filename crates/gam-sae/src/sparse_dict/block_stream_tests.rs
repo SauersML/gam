@@ -223,6 +223,10 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     }
 
     let mut state = BlockSparseStreamState::new(seed.view(), &cfg).expect("fit_begin");
+    // Force the last block DEAD deterministically (its routing gate is then exactly 0
+    // for every row) so AuxK revival is exercised without relying on routing round-off
+    // (a parallel-reduction change, #49c27a883, could otherwise bootstrap it).
+    state.zero_block_for_test(g - 1);
     let mut saw_dead = false;
     let mut saw_revive = false;
     for _ in 0..cfg.max_epochs {

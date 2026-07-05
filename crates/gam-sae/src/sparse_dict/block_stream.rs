@@ -237,6 +237,19 @@ pub struct BlockRankCharges {
 }
 
 impl BlockSparseStreamState {
+    /// Test-support (#1026 revival): zero one block's decoder rows so the block is
+    /// GUARANTEED dead on the next epoch (its routing gate `‖x·Dᵀ‖` is exactly 0 for
+    /// every row, so top-k routing never selects it). Lets the revival test exercise
+    /// AuxK dead-block reseeding deterministically instead of depending on routing
+    /// round-off to leave a block unpopulated.
+    #[cfg(test)]
+    pub(crate) fn zero_block_for_test(&mut self, block: usize) {
+        for r in 0..self.b {
+            for c in 0..self.p {
+                self.decoder[[block * self.b + r, c]] = 0.0;
+            }
+        }
+    }
     /// fit_begin: seed the block frames from `seed` (a representative sample) and
     /// prime the epoch accumulators. The seed fixes `P` and the initial
     /// orthonormal frames ([`seed_frames`]); the corpus is streamed later through
