@@ -1,7 +1,7 @@
 {
  "meta": {
   "tag": "Qwen3-8B L30 (wikitext-103)",
-  "path": "/projects/standard/hsiehph/sauer354/harvest_out/qwen3_8b_wikitext/resid_L30.npy",
+  "path": "<scratch>/hsiehph/sauer354/harvest_out/qwen3_8b_wikitext/resid_L30.npy",
   "n_total": 300000,
   "d": 4096,
   "n_sub": 80000,

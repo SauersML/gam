@@ -3,3 +3,4 @@ __pycache__/
 *.npy
 *.pyc
 smoke_tmp.py
+*.sbatch

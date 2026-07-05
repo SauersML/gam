@@ -1,7 +1,7 @@
 {
  "meta": {
   "tag": "Qwen3.6-35B-A3B L17 (SuperGPQA; per DATA_MANIFEST)",
-  "path": "/projects/standard/hsiehph/sauer354/msae_l17/L17_train.f32.npy",
+  "path": "<scratch>/hsiehph/sauer354/msae_l17/L17_train.f32.npy",
   "n_total": 1204602,
   "d": 2048,
   "n_sub": 80000,
