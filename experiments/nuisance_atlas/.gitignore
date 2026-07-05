@@ -1,0 +1,6 @@
+*.npy
+*.pt
+*.json
+__pycache__/
+.venv/
+*.pyc
