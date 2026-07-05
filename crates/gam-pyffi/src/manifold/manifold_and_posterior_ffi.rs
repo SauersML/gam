@@ -4364,6 +4364,45 @@ fn schema_check(
                 column: None,
             });
         }
+
+        // A numeric-coded `factor(year)` is a fixed factor whose column is
+        // `Continuous` in the schema, so the typed encode above has no level set
+        // to validate — its unseen-level guard is silently skipped (#2137). Here
+        // the schema layer enforces the same fixed-factor contract the design
+        // operator does, validating the frame's values against the frozen
+        // numeric vocabulary so `check` reports an out-of-vocabulary code as a
+        // non-`ok` issue (consistent with the string-factor path and with
+        // `predict`, which raises on the same input).
+        for (column, vocab) in model.numeric_fixed_factor_vocabularies() {
+            let Some(col_idx) = headers.iter().position(|h| h == &column) else {
+                continue;
+            };
+            for row in rows {
+                let Some(cell) = row.get(col_idx) else {
+                    continue;
+                };
+                let trimmed = cell.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(value) = trimmed.parse::<f64>() else {
+                    // A non-numeric cell in a numeric factor column is caught by
+                    // the typed encode above; nothing to add here.
+                    continue;
+                };
+                if !vocab.contains(&gam::data::canonical_level_bits(value)) {
+                    issues.push(SchemaIssue {
+                        kind: "schema_error".to_string(),
+                        message: format!(
+                            "unseen level '{trimmed}' in fixed factor column '{column}'; \
+                             the factor's levels were fixed at fit time"
+                        ),
+                        column: Some(column.clone()),
+                    });
+                    break;
+                }
+            }
+        }
     }
 
     Ok(SchemaCheckPayload {
