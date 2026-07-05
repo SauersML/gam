@@ -284,9 +284,25 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     // This is a setup fix that makes the comparison point EXIST; no tolerance is
     // weakened.
     rho.log_lambda_sparse = 0.5;
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+    // First converge to a well-conditioned PD state (good coords/β), then move the
+    // logits OFF the Gershgorin |·|-majorizer kink. At the softmax fit optimum an
+    // entropy-Hessian off-diagonal can sit exactly at a sign-flip (`|H_kj| = 0`),
+    // where the central FD of `log|H|` straddles two subgradient branches and is
+    // meaningless (acn116 pre-fix: fwd=-3.95 vs bwd=-19.16 on row 0, central their
+    // average). The analytic θ-adjoint is a VALID subgradient there, but no FD can
+    // verify it at the kink. Set a DECISIVE, per-row-distinct softmax state so every
+    // off-diagonal `|H_kj|` is bounded away from 0 and the majorizer is locally
+    // smooth; the θ-adjoint is a fixed-state quantity, so any PD state validates it
+    // and the central FD is once again a clean O(h²) oracle. No tolerance weakened.
+    term.reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
+    for r in 0..term.n_obs() {
+        term.assignment.logits[[r, 0]] = 1.1 + 0.05 * (r as f64);
+        term.assignment.logits[[r, 1]] = -0.9 - 0.04 * (r as f64);
+    }
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .expect("off-kink fixed-state cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
         .logdet_theta_adjoint(&rho, &cache, &solver)
