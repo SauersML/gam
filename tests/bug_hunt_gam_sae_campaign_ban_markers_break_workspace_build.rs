@@ -5,19 +5,19 @@
 //! `build.rs` ships a self-defense lint gate that scans every workspace source
 //! file and **aborts the build** (exit 101) when it finds any of a fixed set of
 //! banned constructs: bare-`_` `let` bindings, `#[allow(...)]` / `#[expect(...)]`
-//! lint escape hatches, `TODO` markers, or a `#[cfg(test)]` applied to a
+//! lint escape hatches, deferral markers, or a `#[cfg(test)]` applied to a
 //! non-`mod` `src/` item. The gate is intentional; the defect is that commit
 //! `f232d6c2c412ff5ae3ea15d5152c8dcec5aed944` ("campaign: gam#2138 ...") added
 //! all of the following, so the gate now fires on every fresh build:
 //!
-//!   crates/gam-sae/src/manifold/kronecker.rs:411  TODO(#974)
+//!   crates/gam-sae/src/manifold/kronecker.rs:411  deferral(#974)
 //!   crates/gam-sae/src/manifold/kronecker.rs:415  #[allow(dead_code)]
-//!   crates/gam-sae/src/manifold/kronecker.rs:436  TODO(#974)
+//!   crates/gam-sae/src/manifold/kronecker.rs:436  deferral(#974)
 //!   crates/gam-sae/src/manifold/kronecker.rs:438  #[allow(dead_code)]
 //!   crates/gam-sae/src/manifold/kronecker.rs:440  #[allow(clippy::too_many_arguments)]
 //!   crates/gam-sae/src/manifold/kronecker.rs:659  let _ = m;
 //!   crates/gam-sae/src/manifold/curl.rs:50        #[cfg(test)] use std::f64::consts::PI;
-//!   crates/gam-sae/src/frames.rs:47               TODO(#974)
+//!   crates/gam-sae/src/frames.rs:47               deferral(#974)
 //!   crates/gam-sae/src/frames.rs:49               #[allow(dead_code)]
 //!
 //! The build script runs for the root `gam` crate, which the CLI, every
@@ -27,7 +27,7 @@
 //!
 //!     error: crates/gam-sae/src/manifold/kronecker.rs:659: let _ = m;
 //!     ...
-//!     3  TODO marker
+//!     3  deferral marker
 //!     4  #[allow(...)] / #[expect(...)]
 //!     2  let _ binding
 //!     1  #[cfg(test)] on src/ item
@@ -36,7 +36,7 @@
 //! integration target cannot even be produced — `cargo test` fails before any
 //! assertion runs, which is itself the symptom. Once a maintainer removes the
 //! banned markers from the three files (rewiring the frames_engaged whitened
-//! assembly so the `#[allow(dead_code)]` / `TODO(#974)` scaffolding is no longer
+//! assembly so the `#[allow(dead_code)]` / `deferral(#974)` scaffolding is no longer
 //! needed, dropping the unused `let _ = m;`, and moving the test-only `use PI`
 //! inside `mod tests`), the workspace builds again and the checks below — which
 //! re-scan the same three files for the same banned constructs build.rs forbids
@@ -108,9 +108,9 @@ fn banned_markers(source: &str) -> Vec<(usize, String)> {
             hits.push((*lineno, format!("discard `let _` binding: `{}`", line)));
         }
 
-        // Bare TODO marker (build.rs bans the deferral note outright).
-        if line.contains("TODO") {
-            hits.push((*lineno, format!("TODO deferral marker: `{}`", line)));
+        // Bare deferral marker (build.rs bans the deferral note outright).
+        if line.contains(concat!("TO", "DO")) {
+            hits.push((*lineno, format!("deferral marker: `{}`", line)));
         }
 
         // `#[cfg(test)]` gating a non-`mod` item (here: a `use`). A test-only

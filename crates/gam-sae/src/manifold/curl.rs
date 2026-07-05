@@ -47,8 +47,6 @@
 //! unit-testable in isolation.
 
 use std::f64::consts::TAU;
-#[cfg(test)]
-use std::f64::consts::PI;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -651,6 +649,7 @@ impl CurlCooldownLedger {
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2};
+    use std::f64::consts::PI;
 
     fn lcg(s: &mut u64) -> f64 {
         *s = s
