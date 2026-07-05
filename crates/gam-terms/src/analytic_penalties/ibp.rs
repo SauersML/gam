@@ -137,11 +137,23 @@ impl IBPAssignmentPenalty {
     /// row-local primitive cannot see). All boundary clamps (`pi_jac = 0` at the
     /// `π_k` clamp) ride the same convention as `hessian_diag`, so the channels
     /// are zero exactly where the assembled curvature is constant in `M_k`.
+    /// When `majorize` is `true`, every channel is the exact derivative of the
+    /// **PSD Loewner-majorized** column block `max(w·s',0)·J Jᵀ +
+    /// diag(max(w·s·c,0))` (gam#2144), not the raw indefinite IBP Hessian. The
+    /// majorizer clamps the rank-one coefficient `w·s'` and the per-slot diagonal
+    /// `w·s·c` to their positive parts; since `max(x,0)` has derivative
+    /// `𝟙[x>0]`, each smooth channel is gated by the sign of the piece it
+    /// differentiates — the rank-one/`s'` pieces by the per-column `s'>0`, the
+    /// diagonal/`s·c` pieces by the per-slot `s·c>0`. This is the metric-first
+    /// consistency partner of the assembly's `ibp_psd_majorized_hdiag` + clamped
+    /// Woodbury `d`, so under low-rank whitening the θ-adjoint/ρ-trace
+    /// differentiate the SAME majorized operator the evidence log-det factors.
     #[must_use]
     pub fn hessian_diag_logit_third_channels(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
+        majorize: bool,
     ) -> IbpHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
         let a = alpha / self.k_max as f64;
@@ -220,11 +232,25 @@ impl IBPAssignmentPenalty {
                 // ∂_z J = (1−2z)/τ, ∂_z c = (1−6z+6z²)/τ².
                 let dz_j = (1.0 - 2.0 * zk) * inv_tau;
                 let dz_c = (1.0 - 6.0 * zk + 6.0 * zk * zk) * inv_tau2;
-                let dz_h = score_derivative[k] * 2.0 * jac * dz_j + score[k] * dz_c;
+                // Split the channel into its rank-one-self (`s'`) and diagonal
+                // (`s·c`) contributions so the majorizer can gate each by the
+                // sign of the piece it clamps (gam#2144). `gate_col` = 𝟙[s'>0]
+                // (the whole column's rank-one, incl. `s''` deriv), `gate_sc` =
+                // 𝟙[s·c>0] (this slot's diagonal). Raw path keeps both = 1.
+                let (gate_col, gate_sc) = if majorize {
+                    let g_col = f64::from(score_derivative[k] > 0.0);
+                    let g_sc = f64::from(score[k] * c_ik > 0.0);
+                    (g_col, g_sc)
+                } else {
+                    (1.0, 1.0)
+                };
+                let dz_h =
+                    gate_col * score_derivative[k] * 2.0 * jac * dz_j + gate_sc * score[k] * dz_c;
                 z_jac[start + k] = jac;
                 local_logit_third[start + k] = self.weight * jac * dz_h;
                 m_channel[start + k] = self.weight
-                    * (score_second_derivative[k] * jac * jac + score_derivative[k] * c_ik);
+                    * (gate_col * score_second_derivative[k] * jac * jac
+                        + gate_sc * score_derivative[k] * c_ik);
                 logit_curvature[start + k] = c_ik;
             }
         }
@@ -247,9 +273,17 @@ impl IBPAssignmentPenalty {
         // diagonal instead of injecting the undifferentiated value `s'_k`.
         let mut cross_row_d_logalpha = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
-            cross_row_d[k] = self.weight * score_derivative[k];
-            // ∂d_k/∂M_k = w·∂s'_k/∂M_k = w·s''_k.
-            cross_row_dd[k] = self.weight * score_second_derivative[k];
+            // Under majorization the rank-one coefficient is `max(w·s'_k,0)` and its
+            // logit/mass derivative is gated by `𝟙[s'_k>0]` (the clamp's subgradient),
+            // matching the per-column `gate_col` used for the diagonal channels above.
+            if majorize && score_derivative[k] <= 0.0 {
+                cross_row_d[k] = 0.0;
+                cross_row_dd[k] = 0.0;
+            } else {
+                cross_row_d[k] = self.weight * score_derivative[k];
+                // ∂d_k/∂M_k = w·∂s'_k/∂M_k = w·s''_k.
+                cross_row_dd[k] = self.weight * score_second_derivative[k];
+            }
         }
         if self.learnable_alpha {
             // `cross_row_d[k] = w·score_derivative_k`, so its ρ (=logα) derivative
@@ -259,7 +293,13 @@ impl IBPAssignmentPenalty {
             // exactly (one operator, one derivative).
             let (_d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
             for k in 0..self.k_max {
-                cross_row_d_logalpha[k] = self.weight * d_score_derivative[k];
+                // Gated by the same `𝟙[s'_k>0]` clamp subgradient: where the
+                // rank-one is clamped off, its α-derivative is 0.
+                cross_row_d_logalpha[k] = if majorize && score_derivative[k] <= 0.0 {
+                    0.0
+                } else {
+                    self.weight * d_score_derivative[k]
+                };
             }
         }
 

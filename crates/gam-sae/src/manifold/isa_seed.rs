@@ -1007,6 +1007,197 @@ mod tests {
     /// fraction of rows lie on the cone at all), yet the plane spanned by its
     /// nonzero rows is still just a 2-plane — support alone still cannot
     /// certify it. κ = 1/q = 4 on the super-Gaussian side of the anchor is
+    #[test]
+    fn zzz_debug_sparse_gated() {
+        let k = 6usize;
+        let amps: Vec<f64> = (0..k).map(|c| 1.0 + 0.1 * c as f64).collect();
+        let (data, truth) = planted_circles(2000, 32, k, 0.25, &amps, 0.05, 0x2111_6A7E_u64);
+        let mut work = data.clone();
+        let cfg = IsaSeedConfig::default();
+        for round in 0..12 {
+            let parts = match isa_eigen_parts(work.view()).unwrap() {
+                Some(p) => p,
+                None => {
+                    eprintln!("round {round}: eigen_parts None (natural exit)");
+                    break;
+                }
+            };
+            eprintln!(
+                "round {round}: above.len()={} mp_edge={:.5} sigma2_cert={:.5} evals_top={:?}",
+                parts.above.len(),
+                parts.mp_edge,
+                parts.sigma2_cert,
+                parts
+                    .above
+                    .iter()
+                    .take(4)
+                    .map(|&i| (parts.evals[i] * 1e4).round() / 1e4)
+                    .collect::<Vec<_>>()
+            );
+            // Inspect the winning basin's per-plane kappa BEFORE certification.
+            let cand = isa_extract_certified_plane(work.view(), &parts, &cfg);
+            match &cand {
+                Some(c) => {
+                    let mut best_ov = 0.0;
+                    for tp in &truth {
+                        let ov = plane_overlap(&c.basis, tp);
+                        if ov > best_ov {
+                            best_ov = ov;
+                        }
+                    }
+                    eprintln!(
+                        "  CERTIFIED: kappa={:.3} q_hat={:.3} best_overlap={:.3}",
+                        c.kappa, c.q_hat, best_ov
+                    );
+                    isa_deflate_fitted_curve(&mut work, c);
+                }
+                None => {
+                    eprintln!("  no certify -> natural exit");
+                    // Show why: replicate the extraction's plane ordering + certify attempt.
+                    debug_extract_why(work.view(), &parts, &cfg, &truth);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn debug_extract_why(
+        residual: ArrayView2<'_, f64>,
+        parts: &IsaEigenParts,
+        config: &IsaSeedConfig,
+        truth: &[Array2<f64>],
+    ) {
+        let n = residual.nrows();
+        let r = parts.above.len();
+        let n_planes = r / 2;
+        let cols = subsample_columns(n);
+        let n_sub = cols.len();
+        let mut z = Array2::<f64>::zeros((r, n_sub));
+        for (a, &kk) in parts.above.iter().enumerate() {
+            let inv = 1.0 / parts.evals[kk].max(f64::MIN_POSITIVE).sqrt();
+            for (cc, &row) in cols.iter().enumerate() {
+                let mut proj = 0.0_f64;
+                for j in 0..residual.ncols() {
+                    proj += (residual[[row, j]] - parts.mean[j]) * parts.evecs[[j, kk]];
+                }
+                z[[a, cc]] = proj * inv;
+            }
+        }
+        let mut best: Option<(f64, Array2<f64>, Array2<f64>)> = None;
+        for init in 0..config.n_inits.max(1) {
+            let mut q = Array2::<f64>::eye(r);
+            if init > 0 {
+                let mut state = 0x2111_15A0_u64 ^ ((init as u64) << 32) ^ n as u64;
+                let mut g = Array2::<f64>::from_shape_fn((r, r), |_| lcg_normal(&mut state));
+                for c in 0..r {
+                    for prev in 0..c {
+                        let mut dot = 0.0;
+                        for row in 0..r {
+                            dot += g[[row, c]] * g[[row, prev]];
+                        }
+                        for row in 0..r {
+                            let sub = dot * g[[row, prev]];
+                            g[[row, c]] -= sub;
+                        }
+                    }
+                    let mut nrm = 0.0;
+                    for row in 0..r {
+                        nrm += g[[row, c]] * g[[row, c]];
+                    }
+                    let nrm = nrm.sqrt();
+                    for row in 0..r {
+                        g[[row, c]] /= nrm;
+                    }
+                }
+                q = g;
+            }
+            let mut y = q.t().dot(&z);
+            jacobi_optimize(&mut y, &mut q, n_planes, config.max_sweeps);
+            let contrast = total_contrast(&y, n_planes);
+            if best.as_ref().is_none_or(|(bc, _, _)| contrast > *bc) {
+                best = Some((contrast, q, y));
+            }
+        }
+        let (tot, q, y) = best.unwrap();
+        eprintln!("    winning basin total_contrast={tot:.4}, per-plane:");
+        let mut order: Vec<(f64, usize)> = (0..n_planes)
+            .map(|m| {
+                let kk = plane_rows_kappa(&y, m);
+                let c = if kk.is_finite() { (kk - 2.0) * (kk - 2.0) } else { 0.0 };
+                (c, m)
+            })
+            .collect();
+        order.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (contrast, m) in order.iter().take(n_planes) {
+            let m = *m;
+            let mut w = Array2::<f64>::zeros((r, 2));
+            for row in 0..r {
+                w[[row, 0]] = q[[row, 2 * m]];
+                w[[row, 1]] = q[[row, 2 * m + 1]];
+            }
+            let kw = plane_rows_kappa(&y, m);
+            // Certify manually with diagnostics inline.
+            let (kobs, kmod, kbl, qh, best_ov) = certify_diag(residual, parts, &w, truth);
+            eprintln!(
+                "      plane m={m} whit_kappa={kw:.3} contrast={contrast:.4} -> kobs={kobs:.3} kmod={kmod:.3} kbl={kbl:.3} qhat={qh:.3} best_ov={best_ov:.3}"
+            );
+        }
+    }
+
+    fn certify_diag(
+        residual: ArrayView2<'_, f64>,
+        parts: &IsaEigenParts,
+        w: &Array2<f64>,
+        truth: &[Array2<f64>],
+    ) -> (f64, f64, f64, f64, f64) {
+        let (n, p) = residual.dim();
+        let r = parts.above.len();
+        let mut amb = Array2::<f64>::zeros((p, 2));
+        for (a, &kk) in parts.above.iter().enumerate().take(r) {
+            let inv = 1.0 / parts.evals[kk].max(f64::MIN_POSITIVE).sqrt();
+            for j in 0..p {
+                amb[[j, 0]] += parts.evecs[[j, kk]] * inv * w[[a, 0]];
+                amb[[j, 1]] += parts.evecs[[j, kk]] * inv * w[[a, 1]];
+            }
+        }
+        if !orthonormalize2(&mut amb) {
+            return (f64::NAN, 0.0, 0.0, 0.0, 0.0);
+        }
+        let noise_2plane = 2.0 * parts.mp_edge;
+        let (mut r2_sum, mut r4_sum) = (0.0_f64, 0.0_f64);
+        let mut n_active = 0usize;
+        for i in 0..n {
+            let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
+            for j in 0..p {
+                let ri = residual[[i, j]] - parts.mean[j];
+                p1 += ri * amb[[j, 0]];
+                p2 += ri * amb[[j, 1]];
+            }
+            let r2 = p1 * p1 + p2 * p2;
+            r2_sum += r2;
+            r4_sum += r2 * r2;
+            if r2 > noise_2plane {
+                n_active += 1;
+            }
+        }
+        let q_hat = n_active as f64 / n as f64;
+        let m2 = (r2_sum / n as f64).max(f64::MIN_POSITIVE);
+        let kappa_obs = (r4_sum / n as f64) / (m2 * m2);
+        let sig2 = parts.sigma2_cert;
+        let a2t = ((m2 - 2.0 * sig2) / q_hat.max(f64::MIN_POSITIVE)).max(0.0);
+        let common = 8.0 * q_hat * a2t * sig2 + 8.0 * sig2 * sig2;
+        let kappa_model = (q_hat * a2t * a2t + common) / (m2 * m2);
+        let kappa_blend = (1.25 * q_hat * a2t * a2t + common) / (m2 * m2);
+        let mut best_ov = 0.0;
+        for tp in truth {
+            let ov = plane_overlap(&amb, tp);
+            if ov > best_ov {
+                best_ov = ov;
+            }
+        }
+        (kappa_obs, kappa_model, kappa_blend, q_hat, best_ov)
+    }
+
     /// what carries the identification.
     #[test]
     fn isa_producer_gate_sparse_gated() {

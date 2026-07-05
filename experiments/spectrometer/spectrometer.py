@@ -27,6 +27,7 @@ just makes losses comparable across models/layers). Configure via env:
 import json, time, os
 import numpy as np
 from numpy.random import default_rng
+from scipy import sparse
 
 EPS = 1e-12
 OUT = os.environ.get("SPEC_OUT", os.path.dirname(os.path.abspath(
@@ -85,14 +86,13 @@ def fit_dict_top1(X, K, n_epochs=25, seed=0, chunk=4000, verbose=False):
     prev = np.inf
     for ep in range(n_epochs):
         best, coeff = _assign(X, D, chunk)
-        # closed-form MOD refresh: D_k = (sum_i coeff_i x_i)/(sum_i coeff_i^2),
-        # accumulated in row-chunks to bound memory.
-        numer = np.zeros((K, p), dtype=np.float64)
-        denom = np.zeros(K, dtype=np.float64)
-        for i in range(0, N, chunk):
-            b = best[i:i+chunk]; c = coeff[i:i+chunk]
-            np.add.at(numer, b, (c[:, None] * X[i:i+chunk]).astype(np.float64))
-            np.add.at(denom, b, (c * c).astype(np.float64))
+        # closed-form MOD refresh: D_k = (sum_i coeff_i x_i)/(sum_i coeff_i^2).
+        # numer = A^T X where A is the (N x K) one-hot-times-coeff assignment;
+        # done as a sparse matmul (orders of magnitude faster than np.add.at).
+        A = sparse.csr_matrix((coeff.astype(np.float64), best.astype(np.int64),
+                               np.arange(N + 1, dtype=np.int64)), shape=(N, K))
+        numer = np.asarray(A.T @ X.astype(np.float64))      # (K, p)
+        denom = np.bincount(best, weights=(coeff * coeff).astype(np.float64), minlength=K)
         alive = denom > EPS
         Dn = numer.copy()
         Dn[alive] = numer[alive] / denom[alive, None]
@@ -263,7 +263,10 @@ def main():
     print(f"[{meta['tag']}] X {X.shape}  mean||x||^2={var_total:.3f}  "
           f"top_var_frac={meta['top_var_frac']:.4f}  ({meta['n_total']} total toks)", flush=True)
 
-    Ks = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    # Cap K so tokens-per-atom N/K stays >= ~18 (avoids the finite-N high-K
+    # overfitting transient); configurable via SPEC_KMAX.
+    kmax = int(os.environ.get("SPEC_KMAX", 4096))
+    Ks = [K for K in [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192] if K <= kmax]
     results = {"meta": meta, "N": N, "p": p, "var_total": var_total, "Ks": Ks}
 
     # (1) GLOBAL spectrum
@@ -290,7 +293,7 @@ def main():
     # are extremely anisotropic (one massive direction), so include R=1,2 to peel
     # the dominant direction(s), plus deeper heads R=16,64,256.
     results["pca_strata"] = {}
-    for R in (0, 1, 2, 16, 64, 256):
+    for R in (0, 1, 2, 16, 64):
         if R == 0:
             continue  # R=0 is the global run above
         print(f"== PCA remove top-{R} ==", flush=True)

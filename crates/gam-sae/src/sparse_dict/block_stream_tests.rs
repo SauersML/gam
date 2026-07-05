@@ -210,7 +210,19 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     let x = planted_data(&planted, g, b, p, 150);
     let cfg = config(g, b, 1);
 
-    let mut state = BlockSparseStreamState::new(x.view(), &cfg).expect("fit_begin");
+    // The seed must genuinely omit the third subspace, otherwise farthest-point
+    // seeding ([`seed_decoder`]) spreads an atom into every block and no block ever
+    // starts dead. `planted_data` places row `i` in subspace `i % g`, so the rows
+    // with `i % g != g - 1` live entirely in the first two subspaces; block 2's
+    // seeded frame then lands inside span{subspace 0, subspace 1}, orthogonal to the
+    // (later-streamed) subspace-2 rows, so it routes to zero usage and is revived.
+    let seed_rows: Vec<usize> = (0..x.nrows()).filter(|&i| i % g != g - 1).collect();
+    let mut seed = Array2::<f32>::zeros((seed_rows.len(), p));
+    for (dst, &src) in seed_rows.iter().enumerate() {
+        seed.row_mut(dst).assign(&x.row(src));
+    }
+
+    let mut state = BlockSparseStreamState::new(seed.view(), &cfg).expect("fit_begin");
     let mut saw_dead = false;
     let mut saw_revive = false;
     for _ in 0..cfg.max_epochs {

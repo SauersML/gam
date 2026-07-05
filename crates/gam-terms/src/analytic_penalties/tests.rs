@@ -337,7 +337,7 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
     let rho = Array1::<f64>::zeros(0);
     let k = pen.k_max;
     let n = t.len() / k;
-    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), false);
     let eps = 1.0e-5;
     let mut max_err = 0.0_f64;
     // Mixed second derivative via 4-point central difference on `value`.
@@ -399,12 +399,12 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
     let rho = Array1::<f64>::zeros(0);
     let k = pen.k_max;
     let n = t.len() / k;
-    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), false);
     let eps = 1.0e-6;
     let bumped = |idx: usize, s: f64| {
         let mut tt = t.clone();
         tt[idx] += s * eps;
-        pen.hessian_diag_logit_third_channels(tt.view(), rho.view())
+        pen.hessian_diag_logit_third_channels(tt.view(), rho.view(), false)
     };
 
     // logit_curvature[i*K+k] = d(z_jac[i*K+k])/dℓ_ik (only the same logit moves it).
@@ -441,6 +441,88 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
 }
 
 #[test]
+fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
+    // gam#2144 consistency: with `majorize = true` every third channel must be the
+    // exact derivative of the PSD Loewner-majorized column block
+    //   D_ik = max(w·s'_k, 0)·J_ik² + max(w·s_k·c_ik, 0),   d_k = max(w·s'_k, 0),
+    // NOT the raw indefinite IBP Hessian — so the low-rank-whitened θ-adjoint/ρ-trace
+    // differentiate the SAME operator the majorized evidence log-det factors. Verify
+    // (a) the clamps actually fire on this fixture (non-vacuous), (b) cross_row_d/dd
+    // are the clamped coefficient and its gated mass-derivative, and (c)
+    // m_channel/local_logit_third reproduce the TOTAL logit-derivative of `D_ik`
+    // (`δ_iw·local_logit_third + m_channel·J_wk`) against a central difference.
+    let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+    let t = array![
+        0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+    ];
+    let rho = Array1::<f64>::zeros(0);
+    let k = pen.k_max;
+    let n = t.len() / k;
+    // Majorized column-block diagonal as a function of the logits, reconstructed
+    // from the raw diagonal (`w·(s'·J² + s·c)`) + raw `cross_row_d` (`w·s'`) + `J`.
+    let maj_diag = |tv: ArrayView1<'_, f64>| -> Array1<f64> {
+        let raw = pen.hessian_diag_logit_third_channels(tv, rho.view(), false);
+        let hdiag = pen.hessian_diag(tv, rho.view()).unwrap();
+        let mut d = Array1::<f64>::zeros(tv.len());
+        for i in 0..n {
+            for col in 0..k {
+                let idx = i * k + col;
+                let jj = raw.z_jac[idx] * raw.z_jac[idx];
+                let self_term = raw.cross_row_d[col] * jj; // w·s'·J²
+                let sc = hdiag[idx] - self_term; // w·s·c
+                d[idx] = raw.cross_row_d[col].max(0.0) * jj + sc.max(0.0);
+            }
+        }
+        d
+    };
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), true);
+    let raw = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), false);
+
+    // (a) non-vacuity: at least one column's rank-one coefficient is clamped off.
+    let clamped_col = (0..k).any(|c| raw.cross_row_d[c] < -1.0e-9 && ch.cross_row_d[c] == 0.0);
+    assert!(
+        clamped_col,
+        "fixture must clamp at least one rank-one column (else the majorizer is vacuous)"
+    );
+
+    // (b) cross_row_d = max(w·s',0); cross_row_dd gated by the same clamp.
+    for c in 0..k {
+        assert_abs_diff_eq!(ch.cross_row_d[c], raw.cross_row_d[c].max(0.0), epsilon = 1.0e-12);
+        if raw.cross_row_d[c] <= 0.0 {
+            assert_eq!(ch.cross_row_dd[c], 0.0, "clamped column must gate cross_row_dd to 0");
+        } else {
+            assert_abs_diff_eq!(ch.cross_row_dd[c], raw.cross_row_dd[c], epsilon = 1.0e-12);
+        }
+    }
+
+    // (c) m_channel/local_logit_third reproduce the total logit-FD of `D_ik`.
+    let eps = 1.0e-6;
+    let mut max_err = 0.0_f64;
+    for w in 0..n {
+        for col in 0..k {
+            let widx = w * k + col;
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[widx] += eps;
+            tm[widx] -= eps;
+            let dp = maj_diag(tp.view());
+            let dm = maj_diag(tm.view());
+            for i in 0..n {
+                let idx = i * k + col;
+                let fd = (dp[idx] - dm[idx]) / (2.0 * eps);
+                let local = if i == w { ch.local_logit_third[idx] } else { 0.0 };
+                let analytic = local + ch.m_channel[idx] * ch.z_jac[widx];
+                max_err = max_err.max((analytic - fd).abs());
+            }
+        }
+    }
+    assert!(
+        max_err < 1.0e-5,
+        "majorized channel total-derivative vs FD of D_ik max abs err = {max_err:.3e}"
+    );
+}
+
+#[test]
 fn ibp_cross_row_d_logalpha_matches_finite_difference() {
     // #1417 fix: the cross-row rank-one coefficient's logα-derivative used by the
     // LEARNABLE-α log-det ρ-gradient. For learnable α, `α(ρ₀)=α_base·e^{ρ₀}` so
@@ -454,14 +536,14 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
     ];
     let rho = array![0.15_f64];
     let k = pen.k_max;
-    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), false);
     let eps = 1.0e-6;
     let mut rp = rho.clone();
     let mut rm = rho.clone();
     rp[0] += eps;
     rm[0] -= eps;
-    let plus = pen.hessian_diag_logit_third_channels(t.view(), rp.view());
-    let minus = pen.hessian_diag_logit_third_channels(t.view(), rm.view());
+    let plus = pen.hessian_diag_logit_third_channels(t.view(), rp.view(), false);
+    let minus = pen.hessian_diag_logit_third_channels(t.view(), rm.view(), false);
     let mut max_err = 0.0_f64;
     let mut saw_nonzero = false;
     for col in 0..k {
@@ -483,7 +565,7 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
     );
     // Fixed-α leaves the channel at zero (the value `cross_row_d` is used there).
     let fixed = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
-    let chf = fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view());
+    let chf = fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view(), false);
     assert!(
         chf.cross_row_d_logalpha.iter().all(|&v| v == 0.0),
         "fixed-α must leave cross_row_d_logalpha zero"
