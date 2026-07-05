@@ -47,8 +47,6 @@
 //! unit-testable in isolation.
 
 use std::f64::consts::TAU;
-#[cfg(test)]
-use std::f64::consts::PI;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -772,7 +770,7 @@ mod tests {
             // amplitude along a single line θ ≈ 0 (or π): a diameter.
             let g = 3.0 * lcg_normal(&mut s);
             radii[i] = g.abs();
-            angles[i] = if g >= 0.0 { 0.0 } else { PI };
+            angles[i] = if g >= 0.0 { 0.0 } else { std::f64::consts::PI };
         }
         let v = flatten_verdict(radii.view(), angles.view()).unwrap();
         eprintln!("[flatten diam] κ={:.3} R2={:.3} rank={}", v.kappa, v.resultant2, v.residual_rank);
