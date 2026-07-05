@@ -736,13 +736,14 @@ impl<'a> GamWorkingModel<'a> {
             .likelihood
             .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
         let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
-        let penalized_objective = deviance + penalty_term;
-        let arithmetic_finite = penalized_objective.is_finite()
+        // Finiteness is a property of the (deviance, penalty) pair regardless of
+        // the family dispersion scale `k` applied later in the gain ratio, so the
+        // arithmetic screen uses the bare, unscaled `deviance + penalty_term`.
+        let arithmetic_finite = (deviance + penalty_term).is_finite()
             && self.workspace.eta_buf.iter().all(|v| v.is_finite())
             && self.lastmu.iter().all(|v| v.is_finite())
             && self.lastweights.iter().all(|v| v.is_finite());
         Ok(CandidateScreen {
-            penalized_objective,
             deviance,
             penalty_term,
             arithmetic_finite,
@@ -753,6 +754,16 @@ impl<'a> GamWorkingModel<'a> {
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+    }
+
+    fn penalized_deviance_scale(&self) -> f64 {
+        // Matches the constant dispersion factor `write_*_working_state` bakes
+        // into `self.lastweights` (Gamma `·shape`, Tweedie/fixed-φ Gaussian
+        // `/φ`), reading the SAME `self.likelihood` the weights are built from,
+        // so the gain-ratio objective `k·D + penalty` is exactly consistent with
+        // the k-scaled gradient/Hessian. For a Gamma smooth this is the locked
+        // shape refreshed once per inner solve (see `gamma_shape_locked`).
+        super::curvature::penalized_objective_deviance_scale(&self.likelihood)
     }
 
     fn update_with_curvature(

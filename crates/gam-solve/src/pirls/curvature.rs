@@ -193,6 +193,57 @@ pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     likelihood.fixed_phi().unwrap_or(1.0)
 }
 
+/// The constant dispersion factor `k` the inner IRLS working weight carries but
+/// the (post-#2126/#2131 *unscaled*) `calculate_deviance` does **not**.
+///
+/// The inner P-IRLS builds its gradient and Hessian from the working weight,
+/// which for the dispersion families is `prior · k` (Gamma) or `prior · … / φ`
+/// (Tweedie / fixed-φ Gaussian) — i.e. the Newton/LM step is computed for the
+/// penalized objective `k·D(β) + βᵀSβ`, whose argmin is the true penalized MLE
+/// (`max ℓ − ½βᵀSβ`, since the Gamma/Tweedie log-likelihood is `−½·k·D`). But
+/// `loglik_deviance` returns the *reported* deviance `D` (φ ≡ 1), so the LM
+/// gain-ratio would compare the *actual* reduction in `D + βᵀSβ` against a
+/// *predicted* reduction built for `k·D + βᵀSβ`. When `k ≠ 1` those two
+/// objectives have different minima; at a heavily-penalized ρ every step that
+/// lowers `k·D + penalty` *raises* `D + penalty`, so no step is ever accepted,
+/// the solve freezes with a non-zero (k-scaled) residual gradient, and the outer
+/// REML sees a non-finite cost for every seed (issue #2128). Scaling the
+/// gain-ratio objective's deviance by `k` realigns it with the step, the
+/// gradient certificate, and the outer objective (which already carries the same
+/// `k`; see `pointwise_loglikelihood_omitting_constants`).
+///
+///  * Gamma:  weight `prior·shape` ⇒ `k = shape` (`= 1/φ`).
+///  * Tweedie: weight `prior·μ^{2−p}/φ` ⇒ `k = 1/φ` (the μ-power is already in
+///    the deviance's η-derivative, so only the constant `1/φ` is missing from D).
+///  * Gaussian with an explicitly fixed `φ ≠ 1`: weight `prior/φ` ⇒ `k = 1/φ`.
+///  * Every other family (Poisson, Binomial, negative-binomial, Beta, profiled
+///    Gaussian): the working weight carries no constant dispersion factor absent
+///    from D, so `k = 1` and the objective is already self-consistent.
+#[inline]
+pub(crate) fn penalized_objective_deviance_scale(likelihood: &GlmLikelihoodSpec) -> f64 {
+    let k = match likelihood.spec.response {
+        ResponseFamily::Gamma => likelihood.gamma_shape().unwrap_or(1.0),
+        ResponseFamily::Tweedie { .. } => {
+            let phi = fixed_glm_dispersion(likelihood);
+            if phi.is_finite() && phi > 0.0 {
+                1.0 / phi
+            } else {
+                1.0
+            }
+        }
+        ResponseFamily::Gaussian => match likelihood.fixed_phi() {
+            Some(phi) if phi.is_finite() && phi > 0.0 && phi != 1.0 => 1.0 / phi,
+            _ => 1.0,
+        },
+        _ => 1.0,
+    };
+    // The scale multiplies an objective value used only for gain-ratio /
+    // stall-detection ratios; a non-finite or non-positive k would corrupt the
+    // accept test, so fall back to the neutral 1.0 (identical to pre-#2126
+    // behaviour when the shape happened to be 1).
+    if k.is_finite() && k > 0.0 { k } else { 1.0 }
+}
+
 #[inline]
 pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> WeightFamily {
     match &likelihood.spec.response {
