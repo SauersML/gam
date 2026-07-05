@@ -1,3 +1,4 @@
 
 [features]
 real_data_harness = []
+gpu_tests = []
