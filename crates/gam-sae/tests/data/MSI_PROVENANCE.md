@@ -8,7 +8,7 @@ genuine model transport.
 ## How it was produced
 
 - **Activations**: the MSI cache
-  `/projects/standard/hsiehph/sauer354/msae_l17/data/shards/*.safetensors`,
+  `${GAM_MSI_DATA}/msae_l17/data/shards/*.safetensors`,
   each shard holding `acts_L11`, `acts_L17`, `acts_L23` (residual stream,
   hidden size 2048) for the same token rows. The first 8000 rows were used.
 - **Chart fit**: one cyclic SAE atom per layer via `gamfit`'s

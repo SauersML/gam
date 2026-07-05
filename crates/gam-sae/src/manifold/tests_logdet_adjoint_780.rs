@@ -94,7 +94,7 @@ fn ibp_1416_oracle_term() -> (SaeManifoldTerm, SaeManifoldRho) {
 /// re-adds the full `d·J Jᵀ` through the Woodbury carrier).
 fn ibp_1416_oracle_cache(term: &SaeManifoldTerm, rho: &SaeManifoldRho) -> ArrowFactorCache {
     let n = term.n_obs();
-    let channels = ibp_assignment_third_channels(&term.assignment, rho)
+    let channels = ibp_assignment_third_channels(&term.assignment, rho, false)
         .expect("channels")
         .expect("IBP mode must yield cross-row channels");
     // Full per-row IBP prior diagonal `(H_p)_ii = d·J_i² + s·c_i`, where the
@@ -140,7 +140,7 @@ fn ibp_1416_oracle_cache_with_coord(
     rho: &SaeManifoldRho,
 ) -> ArrowFactorCache {
     let n = term.n_obs();
-    let channels = ibp_assignment_third_channels(&term.assignment, rho)
+    let channels = ibp_assignment_third_channels(&term.assignment, rho, false)
         .expect("channels")
         .expect("IBP mode must yield cross-row channels");
     let hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho).expect("hdiag");

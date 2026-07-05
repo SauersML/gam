@@ -6193,7 +6193,7 @@ impl SaeManifoldTerm {
             // correction. The IBP cross-row term additionally needs
             // `log det(I_R + D Uᵀ H₀'⁻¹ U)`, which has no matrix-free route yet, so
             // it keeps refusing (loudly, pointing at the dense resident path).
-            if ibp_assignment_third_channels(&self.assignment, rho)?.is_some() {
+            if ibp_assignment_third_channels(&self.assignment, rho, false)?.is_some() {
                 return Err(format!(
                     "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur \
                      {} bytes exceeds budget {} bytes and the exact cross-row IBP Woodbury evidence \

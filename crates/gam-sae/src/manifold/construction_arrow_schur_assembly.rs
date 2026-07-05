@@ -624,8 +624,11 @@ impl SaeManifoldTerm {
         // evidence log-det is defined. `None` on every non-IBP mode (the third
         // channels only exist for IBP-MAP) and whenever the metric is full-rank, so
         // the identity/no-metric assembly is bit-identical.
+        // RAW channels: `ibp_psd_majorized_hdiag` and the source-`d` clamp below do
+        // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
+        // un-majorized channel set.
         let ibp_majorizer = if low_rank_whiten {
-            ibp_assignment_third_channels(&self.assignment, rho)?
+            ibp_assignment_third_channels(&self.assignment, rho, false)?
         } else {
             None
         };
@@ -2262,7 +2265,7 @@ impl SaeManifoldTerm {
         //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
         //     Both pin the `U`-column convention bit-for-bit to the consumer's
         //     `ibp_logit_sites`/`row_vars_for_cache_row` slot mapping.
-        if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
+        if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho, false)? {
             let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
             for row in 0..n {
                 let start = row * k_atoms;

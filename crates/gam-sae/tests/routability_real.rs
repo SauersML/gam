@@ -25,17 +25,17 @@ use gam_sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
 use ndarray::Array2;
 
 /// Absolute MSI paths of the banked activation slices, with the residual/output
-/// dimension label. These live on `/projects/standard` (roomy) on the login node
+/// dimension label. These live on the cluster scratch dir (`${GAM_MSI_DATA}`) (roomy) on the login node
 /// and every compute node; the test is `#[ignore]` so a laptop checkout without
 /// them simply skips it.
 const LAYERS: &[(&str, &str)] = &[
     (
         "qwen3_8b_wikitext_resid_L18",
-        "/projects/standard/hsiehph/sauer354/harvest_out/qwen3_8b_wikitext/resid_L18.npy",
+        "${GAM_MSI_DATA}/harvest_out/qwen3_8b_wikitext/resid_L18.npy",
     ),
     (
         "qwen3_35b_msae_L17_train",
-        "/projects/standard/hsiehph/sauer354/msae_l17/L17_train.f32.npy",
+        "${GAM_MSI_DATA}/msae_l17/L17_train.f32.npy",
     ),
 ];
 

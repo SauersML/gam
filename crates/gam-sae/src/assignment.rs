@@ -1728,6 +1728,7 @@ pub(crate) fn assignment_prior_grad_hdiag(
 pub(crate) fn ibp_assignment_third_channels(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
+    majorize: bool,
 ) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
     let AssignmentMode::IBPMap {
         temperature,
@@ -1752,7 +1753,8 @@ pub(crate) fn ibp_assignment_third_channels(
         penalty.weight = rho.lambda_sparse();
         Array1::zeros(0)
     };
-    let mut channels = penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view());
+    let mut channels =
+        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
     // atoms (ungated, or all atoms under frozen routing) so the #1006 θ-adjoint
     // differentiates the SAME (fixed-logit-zeroed) `htt` that
