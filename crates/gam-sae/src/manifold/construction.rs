@@ -3808,10 +3808,11 @@ impl SaeManifoldTerm {
     /// only accelerates/co-adapts the inner solve, it never replaces the
     /// stationary point.
     ///
-    /// Returns the number of (row, atom) coords actually warm-started (the
-    /// certified-prediction count), for instrumentation / tests. A first-build
-    /// dictionary with no usable charts simply warm-starts nothing and returns 0
-    /// (the cold path is byte-for-byte unchanged).
+    /// Returns the number of ROWS actually warm-started — rows that carried a
+    /// certified prediction AND cleared the per-row acceptance guard — for
+    /// instrumentation / tests. A first-build dictionary with no usable charts, or
+    /// an already-converged one whose seeds are all rejected, simply warm-starts
+    /// nothing and returns 0 (the inner state is left byte-for-byte unchanged).
     pub fn warm_start_latents_from_amortized_encoder(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -3824,16 +3825,42 @@ impl SaeManifoldTerm {
         }
         let amplitudes = self.fitted_assignment_amplitudes(rho)?;
         let encodes = self.amortized_encode_target(target, amplitudes.view())?;
-        let mut warm_started = 0usize;
+        let p = self.output_dim();
+        // Per-row reconstruction squared error BEFORE any seed is applied. The
+        // amortized encoder is an approximate inverse: on a not-yet-converged
+        // dictionary its certified rows accelerate the inner solve, but against an
+        // ALREADY-converged (per-row optimal) dictionary a seed can only move a
+        // coord off its optimum. Adopting such a seed would corrupt a good inner
+        // state — precisely the regression the warm-start contract forbids ("changes
+        // basin entry, not root"). So each certified seed is applied under a per-row
+        // acceptance guard: a row keeps the encoder coord only if it does not worsen
+        // that row's reconstruction. This makes the warm-start a monotone operation
+        // on the reconstruction objective (post-warm per-row SSE ≤ pre-warm), so
+        // recovery can never regress, while still adopting every seed that helps.
+        let row_sse = |fitted: &Array2<f64>, row: usize| -> f64 {
+            let mut acc = 0.0_f64;
+            for col in 0..p {
+                let r = target[[row, col]] - fitted[[row, col]];
+                acc += r * r;
+            }
+            acc
+        };
+        let pre_fitted = self.try_fitted_for_rho(rho)?;
+        let pre_sse: Vec<f64> = (0..n).map(|row| row_sse(&pre_fitted, row)).collect();
+
+        // Snapshot the pre-warm coords so a rejected row can be reverted exactly.
+        let orig_coords: Vec<Array2<f64>> = (0..k_atoms)
+            .map(|atom_idx| self.assignment.coords[atom_idx].as_matrix())
+            .collect();
+        // Tentatively apply every certified seed, then accept/reject per row.
+        let mut candidate_rows: Vec<bool> = vec![false; n];
         for atom_idx in 0..k_atoms {
             let d = self.atoms[atom_idx].latent_dim;
             if d == 0 {
                 continue;
             }
             let result = &encodes[atom_idx];
-            // Start from the atom's CURRENT coords so uncertified rows are left
-            // exactly as they were; overwrite only the certified predictions.
-            let mut coords = self.assignment.coords[atom_idx].as_matrix();
+            let mut coords = orig_coords[atom_idx].clone();
             if coords.dim() != (n, d) {
                 return Err(format!(
                     "warm_start_latents_from_amortized_encoder: atom {atom_idx} coords {:?} != (n={n}, d={d})",
@@ -3847,7 +3874,7 @@ impl SaeManifoldTerm {
                 for axis in 0..d {
                     coords[[row, axis]] = result.coords[[row, axis]];
                 }
-                warm_started += 1;
+                candidate_rows[row] = true;
             }
             // `as_matrix` lays coords out row-major (`[[row, axis]]`), exactly the
             // `values[row*d + axis]` order `set_flat` expects, so a plain
@@ -3855,9 +3882,44 @@ impl SaeManifoldTerm {
             let flat = Array1::from_iter(coords.iter().copied());
             self.assignment.coords[atom_idx].set_flat(flat.view());
         }
-        // The basis caches must follow the freshly-seeded coords so the next
-        // inner solve evaluates Φ at the warm-started t̂, not the stale coords.
+        // The basis caches must follow the freshly-seeded coords so the fit (and the
+        // acceptance check just below) evaluates Φ at the warm-started t̂.
         self.refresh_basis_from_current_coords()?;
+
+        // Reject the seed on any row that got worse, reverting ALL of that row's atom
+        // coords to the snapshot. Reconstruction couples atoms within a row, so the
+        // accept/reject decision is per row, not per (row, atom).
+        let post_fitted = self.try_fitted_for_rho(rho)?;
+        let accepted: Vec<bool> = (0..n)
+            .map(|row| candidate_rows[row] && row_sse(&post_fitted, row) <= pre_sse[row] + 1.0e-12)
+            .collect();
+        let mut reverted_any = false;
+        for atom_idx in 0..k_atoms {
+            let d = self.atoms[atom_idx].latent_dim;
+            if d == 0 {
+                continue;
+            }
+            let mut coords = self.assignment.coords[atom_idx].as_matrix();
+            let mut changed = false;
+            for row in 0..n {
+                if candidate_rows[row] && !accepted[row] {
+                    for axis in 0..d {
+                        coords[[row, axis]] = orig_coords[atom_idx][[row, axis]];
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                let flat = Array1::from_iter(coords.iter().copied());
+                self.assignment.coords[atom_idx].set_flat(flat.view());
+                reverted_any = true;
+            }
+        }
+        if reverted_any {
+            self.refresh_basis_from_current_coords()?;
+        }
+
+        let warm_started = accepted.iter().filter(|&&a| a).count();
         Ok(warm_started)
     }
 

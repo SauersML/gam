@@ -144,13 +144,21 @@ fn linear_ev(z: ArrayView2<'_, f64>, k: usize) -> f64 {
 /// At equal K the historical default `α = 1` structurally underfits an equal-K
 /// linear dictionary (the geometric-by-index prior masks late atoms), while the
 /// K-aware concentration recovers the capacity and matches-or-beats linear.
-/// Tiny (N=64, K=8) so it runs in seconds / a few MB.
+/// Tiny (N=256, K=8) so it runs in seconds / a few MB.
 #[test]
 fn ibp_default_alpha_underfits_but_k_aware_matches_linear_1784() {
-    let z = real_like_activations(64, 10, 6, 7);
+    // N MUST be large enough that α=1 lands on a MEASURABLE underfit rather than a
+    // total gate co-collapse: at α=1 the geometric mask starves the atom tail, and
+    // below ~N=100 the surviving early atoms cannot anchor K=8 charts either — the
+    // IBP gate collapses all mass onto ONE atom (mu_hat→1), the reconstruction EV
+    // falls below the signal-free null floor, and the fit's co-collapse guard
+    // rightly REFUSES (an error, not a low-EV number). N=64 (the first RAM-safe
+    // shrink of this test) sat in that refuse regime; N=256 restores the intended
+    // "α=1 underfits but still fits" regime while staying tiny (256×10 f64).
+    let z = real_like_activations(256, 10, 6, 7);
     let k = 8usize;
     let num_basis = 3usize;
-    let max_iter = 8usize;
+    let max_iter = 12usize;
 
     let lin = linear_ev(z.view(), k);
     let ev_alpha1 = fit_ev(z.view(), k, 1.0, num_basis, max_iter).expect("alpha=1 fit runs");
@@ -168,15 +176,14 @@ fn ibp_default_alpha_underfits_but_k_aware_matches_linear_1784() {
     );
 
     // Margins are calibrated to the deterministic effect at THIS (RAM-safe) scale.
-    // At the original K=32 / N=600 scale the α=1 underfit and K-aware recovery each
-    // cleared ~0.05 EV; shrinking to K=8 / N=64 / num_basis=3 (issue #1784, to keep
-    // the K=128 sibling test off the OOM path) preserves the qualitative ordering
-    // — α=1 (≈0.862) < linear (≈0.893) < K-aware (≈0.908) — but with smaller gaps
-    // (underfit ≈0.031, recovery ≈0.046). The thresholds below sit at roughly half
-    // the observed gap so the strict ordering is enforced with ~2× headroom without
-    // pinning to fragile exact values. The fit is deterministic here (no RNG; the
-    // parallel fold is bit-invariant per #1557), so the headroom guards only
-    // toolchain drift, not run-to-run noise.
+    // At K=8 / N=256 / num_basis=3 / max_iter=12 the ordering is α=1 (≈0.705) <
+    // linear (≈0.865) < K-aware (≈0.896): the α=1 mask underfits the equal-K linear
+    // dictionary, and the K-aware concentration recovers capacity past it. The
+    // recovery gap over α=1 (≈0.19) and the underfit gap under linear (≈0.16) are
+    // both wide, so the thresholds below hold with large headroom without pinning
+    // fragile exact values. The fit is deterministic here (no RNG; the parallel fold
+    // is bit-invariant per #1557), so the headroom guards only toolchain drift, not
+    // run-to-run noise.
 
     // The historical default α=1 must UNDERFIT the linear dictionary.
     assert!(
