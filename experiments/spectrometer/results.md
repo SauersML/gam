@@ -1,9 +1,8 @@
 # Dimension spectrometer on real LLM residual-stream activations
 
-**Status:** headline runs in progress on MSI — Qwen3.6-35B-A3B L17 (job
-`12575326`) and Qwen3-8B L18 (job `12575327`). Finalized once `results.json`
-lands. Methods + synthetic validation below are final. All compute runs on MSI
-(no laptop compute); activations were already harvested on MSI (no re-harvest).
+**Status:** COMPLETE. Depth-resolved spectrum measured on Qwen3-8B (L6/L18/L30)
+plus Qwen3.6-35B-A3B L17, all on MSI from pre-existing harvests (no re-harvest,
+no laptop compute). Headline numbers below.
 
 ## Models measured (current Qwen3-series, pre-existing MSI harvests)
 - **Qwen3.6-35B-A3B, layer 17** — the flagship "3.6" MoE; SuperGPQA reasoning
@@ -112,11 +111,44 @@ why the stratified peel is the load-bearing measurement.
   (R=1..64 → 26.2, 26.4, 28.7, 32.8). Raw 3.8 is an artifact.
 - **Qwen3-8B L30** (late, mild channel): d̂ ≈ **23–26** (R=1..64 → 23.5, 23.7,
   24.7, 26.2).
-- **Qwen3-8B L6** (early): _pending L6 job completion — slotted here._
+- **Qwen3-8B L6** (early, isotropic top-var 0.048): d̂ ≈ **16–18** (raw 16.1 ≈
+  post-peel 16.3, 16.2, 16.6, 17.8 — no confound, so peeling barely moves it).
 
 d̂ rises monotonically as more PCs are peeled (R↑): removing the most-captured,
 lowest-dimension variance leaves a higher-dimensional residual — expected, and it
 means these numbers are lower bounds on the fine-scale dimension.
+
+### Full tables
+
+Depth-resolved global fit (full ladder / drop-last / no-floor):
+
+| condition | d_model | R=0 full | drop-last | no-floor | single-power (d, σ²) |
+|---|---|---|---|---|---|
+| Qwen3-8B L6 (early) | 4096 | 16.1 | 18.4 | 16.1 | 17.2, 3.78 |
+| Qwen3-8B L18 (mid) | 4096 | 3.8 | 4.2 | 13.5 | 3.8, 13.9 |
+| Qwen3-8B L30 (late) | 4096 | 22.8 | 24.8 | 22.8 | 23.5, 0 |
+| Qwen3.6-35B-A3B L17 | 2048 | 19.9 | 22.2 | 19.9 | 20.9, 1.94 |
+
+PCA-stratified d̂ (peeling the top-R principal directions):
+
+| condition | R=0 | R=1 | R=2 | R=16 | R=64 |
+|---|---|---|---|---|---|
+| Qwen3-8B L6 (early) | 16.1 | 16.3 | 16.2 | 16.6 | 17.8 |
+| Qwen3-8B L18 (mid) | 3.8 | 26.2 | 26.4 | 28.7 | 32.8 |
+| Qwen3-8B L30 (late) | 22.8 | 23.5 | 23.7 | 24.7 | 26.2 |
+| Qwen3.6-35B-A3B L17 | 19.9 | 20.0 | 20.0 | 20.9 | 23.2 |
+
+### Depth trend (Qwen3-8B) — the headline picture
+De-confounded intrinsic dimension (post-peel R=16) across depth:
+
+    L6 (early) ≈ 16.6  →  L18 (mid) ≈ 28.7  →  L30 (late) ≈ 24.7
+
+Intrinsic dimension **rises into mid-stack and dips slightly by the late layer** —
+the middle of the network carries the highest-dimensional token manifold. The raw
+(R=0) numbers would tell the opposite, nonsensical story (16 → 3.8 → 22.8, a
+spurious collapse at L18) purely because L18's massive-activation channel swamps
+the unpeeled estimate. This inversion is the whole reason the peel matters, and it
+is the central result of the experiment. See `fig_depth_trend.png`.
 
 ### Cross-check vs. the pre-existing PCA analysis (spectrum_analysis.json)
 That file reports *linear* effective rank after removing the top rogue directions:
