@@ -61,6 +61,46 @@
 //! loss. No finite differences are used (the regression and its standard errors
 //! are closed form); the golden ratio and the reporting confidence quantile are
 //! mathematical constants, not tuned knobs.
+//!
+//! # High-`K` finite-sample bias, and the stable window (derived, not tuned)
+//!
+//! The `K^(−2/d)` rate is a *population* quantization rate: it assumes each of the
+//! `K` cells holds enough points to estimate its atom without overfitting. When the
+//! points-per-atom `n = N/K` gets small (large `K`, or few rows), the single-atom
+//! fit overfits its handful of assigned points and the **held-in** loss dips below
+//! the population rate — biasing the local log-log slope more negative and hence
+//! biasing `d̂ = −2/m` *downward*. On real data this is visible as `d̂` drifting
+//! down along the ladder (e.g. a 33→6 slide as `K` climbs into the token-starved
+//! regime). This is a finite-sample artifact, not a change in intrinsic dimension.
+//!
+//! We control it with a **derived** reliable window, not a magic cutoff. Fitting one
+//! atom (the leading local direction, plus a per-point scale) to `n = N/K` points
+//! underestimates the population cell residual by a leading factor `≈ 1 − d/n`
+//! (a single atom captures the best of `≈ d` local tangent directions estimated from
+//! `n` points — the standard fitted-degrees-of-freedom shrinkage). In log-loss this
+//! adds a term `≈ −d/n = −d·K/N`, which over one octave (`K → 2K`) steepens the slope
+//! by `≈ (d / ln 2)·(K/N)`. Requiring that finite-sample slope bias to stay below the
+//! law's own per-octave signal slope `2/d` gives the condition
+//!
+//! ```text
+//!     n = N/K  ≥  d² / (2 ln 2)              (floored at 2, so a cell's residual
+//!                                             has positive degrees of freedom).
+//! ```
+//!
+//! Every constant here is derived — `ln 2` from the octave spacing of the ladder,
+//! `2/d` from the VQ law, the `d/n` shrinkage from fitted-DOF counting — so the
+//! threshold is **permissive for low `d`** (a `d = 1` circle stays reliable to very
+//! large `K`, matching the tests) and **strict for high `d`** (a `d ≈ 33` manifold
+//! needs hundreds of tokens per atom, which is exactly where the real-data drift
+//! appears). The threshold depends on `d`, which is what we are estimating, so the
+//! window is found by a short deterministic fixed-point: seed with the full-ladder
+//! `d̂`, keep the rungs meeting the threshold, refit, repeat until the rung set
+//! stops changing.
+//!
+//! The report exposes the drift rather than hiding it: it carries the full-ladder
+//! `d̂`, the stable-window `d̂` (the trustworthy default), and a drop-last `d̂`
+//! (drop the single largest-`K` rung), plus per-rung points-per-atom and a
+//! `small_nk_regime` flag that fires when the ladder reaches below the threshold.
 
 use crate::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
 use ndarray::ArrayView2;
@@ -112,27 +152,57 @@ impl Default for SpectrometerConfig {
 }
 
 /// Result of a dimension-spectrometer sweep.
+///
+/// The headline `slope` / `d_hat` / `noise_floor` / standard errors are the
+/// **stable-window** estimate (the rungs that pass the derived points-per-atom
+/// threshold — the trustworthy default). The full-ladder and drop-last estimates
+/// are carried alongside so any high-`K` finite-sample drift is visible.
 #[derive(Clone, Debug)]
 pub struct SpectrometerReport {
     /// Per-rung `(K, mean per-row reconstruction loss)` in ladder order (ascending
     /// `K`). The loss is the mean over rows of the squared reconstruction residual
     /// `‖x_i − c_i d_{a_i}‖²`, accumulated in `f64`.
     pub rungs: Vec<(usize, f64)>,
+    /// Number of data rows `N` (used to form points-per-atom `N/K`).
+    pub n_rows: usize,
+    /// Points-per-atom `N/K` for each rung, aligned with [`Self::rungs`]. Small
+    /// values are the token-starved regime where the single-atom fit overfits.
+    pub points_per_atom: Vec<f64>,
     /// Estimated noise floor `σ²` (the loss plateau), profiled out of the
-    /// log-log regression. Same units as the per-rung loss.
+    /// stable-window log-log regression. Same units as the per-rung loss.
     pub noise_floor: f64,
-    /// Fitted slope `m` of `log(L(K) − σ²)` on `log K`.
+    /// Fitted slope `m` of `log(L(K) − σ²)` on `log K` over the stable window.
     pub slope: f64,
-    /// Standard error of the slope from the log-log regression residuals.
+    /// Standard error of the slope from the stable-window regression residuals.
     pub slope_se: f64,
-    /// Intrinsic-dimension estimate `d̂ = −2/m`.
+    /// Intrinsic-dimension estimate `d̂ = −2/m` over the stable window (primary).
     pub d_hat: f64,
-    /// Delta-method standard error of `d̂`: `|2/m²| · SE(m)`.
+    /// Delta-method standard error of the stable-window `d̂`: `|2/m²| · SE(m)`.
     pub d_hat_se: f64,
-    /// `true` when the slope's confidence interval contains zero — the last rungs
+    /// `d̂` fitted over the FULL ladder (all rungs). May be biased downward when the
+    /// ladder reaches into the small-`N/K` regime; compare against [`Self::d_hat`].
+    pub d_hat_full_ladder: f64,
+    /// `d̂` fitted over the ladder with the single largest-`K` rung dropped — a cheap
+    /// robustness probe: if it disagrees with the full-ladder value the tail is
+    /// biasing the estimate.
+    pub d_hat_drop_last: f64,
+    /// Smallest `K` retained in the stable window.
+    pub stable_window_lo_k: usize,
+    /// Largest `K` retained in the stable window.
+    pub stable_window_hi_k: usize,
+    /// Number of rungs in the stable window.
+    pub stable_rung_count: usize,
+    /// The derived points-per-atom threshold `τ = max(d̂²/(2 ln 2), 2)` used to form
+    /// the stable window (evaluated at the stable-window `d̂`).
+    pub min_points_per_atom: f64,
+    /// `true` when the slope's confidence interval contains zero — the retained rungs
     /// are statistically indistinguishable from the noise floor, the log-log slope
     /// is not resolved, and `d̂ = −2/m` is unreliable (near a division by zero).
     pub floor_saturated: bool,
+    /// `true` when the ladder extends below the points-per-atom threshold (the stable
+    /// window is a strict subset of the ladder, or some rung is token-starved). When
+    /// set, [`Self::d_hat_full_ladder`] is untrustworthy and the drift is real.
+    pub small_nk_regime: bool,
 }
 
 /// Two-sided 95% quantile of the standard normal — the confidence level at which
@@ -206,15 +276,124 @@ pub fn dimension_spectrometer(
         rungs.push((k, loss));
     }
 
-    let law = fit_scaling_law(&rungs)?;
+    analyze_ladder(&rungs, data.nrows())
+}
+
+/// Derived points-per-atom threshold `τ = max(d̂²/(2 ln 2), 2)`.
+///
+/// A single-atom cell fit to `n = N/K` points underestimates the population cell
+/// residual by a leading factor `≈ 1 − d/n` (the atom captures the best of `≈ d`
+/// local tangent directions estimated from `n` points). Over one octave that
+/// steepens the log-log slope by `≈ (d/ln 2)·(K/N)`; requiring that finite-sample
+/// slope bias to stay below the law's per-octave signal slope `2/d` gives
+/// `n ≥ d²/(2 ln 2)`. The floor of 2 keeps a cell's residual non-degenerate
+/// (residual degrees of freedom `> 0` needs more than one point per cell). Every
+/// constant is derived (see the module docs); nothing here is tuned.
+fn threshold_points_per_atom(d_hat: f64) -> f64 {
+    let statistical = (d_hat * d_hat) / (2.0 * std::f64::consts::LN_2);
+    statistical.max(2.0)
+}
+
+/// Select the reliable rung window by a short deterministic fixed-point: keep the
+/// rungs whose points-per-atom `N/K` meets [`threshold_points_per_atom`] evaluated
+/// at the current `d̂`, refit to update `d̂`, and repeat until the retained set
+/// stops changing. Returns rung indices (ascending `K`). If the seed `d̂` is not a
+/// usable positive dimension (e.g. the fit is floor-saturated) the whole ladder is
+/// returned — windowing a non-resolved slope would be meaningless.
+fn select_stable_window(rungs: &[(usize, f64)], n_rows: usize, seed_d: f64) -> Vec<usize> {
+    let full: Vec<usize> = (0..rungs.len()).collect();
+    if !(seed_d.is_finite() && seed_d > 0.0) {
+        return full;
+    }
+    let mut d = seed_d;
+    let mut prev: Vec<usize> = full.clone();
+    for _ in 0..8 {
+        let tau = threshold_points_per_atom(d);
+        let mut window: Vec<usize> = (0..rungs.len())
+            .filter(|&i| (n_rows as f64) / (rungs[i].0 as f64) >= tau)
+            .collect();
+        // A slope needs at least three rungs; if the threshold is stricter than the
+        // ladder can honour, fall back to the three least token-starved (smallest-K)
+        // rungs and let `small_nk_regime` carry the warning.
+        if window.len() < 3 {
+            window = (0..rungs.len().min(3)).collect();
+        }
+        let sub: Vec<(usize, f64)> = window.iter().map(|&i| rungs[i]).collect();
+        match fit_scaling_law(&sub) {
+            Ok(law) if law.d_hat.is_finite() && law.d_hat > 0.0 => {
+                if window == prev {
+                    return window;
+                }
+                d = law.d_hat;
+                prev = window;
+            }
+            _ => return window,
+        }
+    }
+    prev
+}
+
+/// Fit the scaling law over the full ladder, the derived stable window, and the
+/// drop-last ladder, and assemble the report. `n_rows` is `N` (for points-per-atom).
+fn analyze_ladder(rungs: &[(usize, f64)], n_rows: usize) -> Result<SpectrometerReport, String> {
+    if rungs.len() < 3 {
+        return Err("analyze_ladder requires at least 3 rungs".to_string());
+    }
+    let full = fit_scaling_law(rungs)?;
+
+    // Stable window: seed the fixed-point with the full-ladder d̂ (unless the slope
+    // is not resolved, in which case windowing is meaningless and we keep it full).
+    let seed_d = if full.floor_saturated {
+        f64::NAN
+    } else {
+        full.d_hat
+    };
+    let window = select_stable_window(rungs, n_rows, seed_d);
+    let window_sub: Vec<(usize, f64)> = window.iter().map(|&i| rungs[i]).collect();
+    let stable = fit_scaling_law(&window_sub)?;
+
+    // Drop-last robustness probe (only meaningful with a rung to spare).
+    let d_hat_drop_last = if rungs.len() >= 4 {
+        fit_scaling_law(&rungs[..rungs.len() - 1])
+            .map(|law| law.d_hat)
+            .unwrap_or(full.d_hat)
+    } else {
+        full.d_hat
+    };
+
+    let points_per_atom: Vec<f64> = rungs
+        .iter()
+        .map(|&(k, _)| n_rows as f64 / k as f64)
+        .collect();
+    let d_for_threshold = if stable.d_hat.is_finite() && stable.d_hat > 0.0 {
+        stable.d_hat
+    } else {
+        full.d_hat
+    };
+    let threshold = threshold_points_per_atom(d_for_threshold);
+    let small_nk_regime =
+        window.len() < rungs.len() || points_per_atom.iter().any(|&r| r < threshold);
+
+    let lo_k = rungs[window[0]].0;
+    let hi_k = rungs[window[window.len() - 1]].0;
+
     Ok(SpectrometerReport {
-        rungs,
-        noise_floor: law.sigma2,
-        slope: law.slope,
-        slope_se: law.slope_se,
-        d_hat: law.d_hat,
-        d_hat_se: law.d_hat_se,
-        floor_saturated: law.floor_saturated,
+        rungs: rungs.to_vec(),
+        n_rows,
+        points_per_atom,
+        noise_floor: stable.sigma2,
+        slope: stable.slope,
+        slope_se: stable.slope_se,
+        d_hat: stable.d_hat,
+        d_hat_se: stable.d_hat_se,
+        d_hat_full_ladder: full.d_hat,
+        d_hat_drop_last,
+        stable_window_lo_k: lo_k,
+        stable_window_hi_k: hi_k,
+        stable_rung_count: window.len(),
+        min_points_per_atom: threshold,
+        floor_saturated: stable.floor_saturated,
+        small_nk_regime,
     })
 }
 
@@ -560,6 +739,16 @@ mod tests {
             report.slope,
             report.noise_floor
         );
+        // Well-sampled (min N/K = 4000/128 ≈ 31 ≫ τ): the whole ladder is the stable
+        // window, so no drift is flagged and the full-ladder d̂ equals the primary.
+        assert!(
+            !report.small_nk_regime,
+            "well-sampled circle must not flag small-N/K (stable rungs {} of {})",
+            report.stable_rung_count,
+            report.rungs.len()
+        );
+        assert_eq!(report.stable_rung_count, report.rungs.len());
+        assert!((report.d_hat - report.d_hat_full_ladder).abs() < 1.0e-9);
     }
 
     #[test]
@@ -593,6 +782,14 @@ mod tests {
             report.slope,
             report.noise_floor
         );
+        // Well-sampled (min N/K = 6000/256 ≈ 23 ≫ τ): full ladder is the stable window.
+        assert!(
+            !report.small_nk_regime,
+            "well-sampled torus must not flag small-N/K (stable rungs {} of {})",
+            report.stable_rung_count,
+            report.rungs.len()
+        );
+        assert_eq!(report.stable_rung_count, report.rungs.len());
     }
 
     #[test]
@@ -640,6 +837,111 @@ mod tests {
             law.floor_saturated,
             "flat losses must flag floor saturation (slope {} se {})",
             law.slope, law.slope_se
+        );
+    }
+
+    #[test]
+    fn stable_window_resists_high_k_overfit_drift() {
+        // Reproduce the real-data pathology fit-free, then check the hardening. Build
+        // a d=8 ladder whose losses follow the population VQ rate σ² + c·K^(−2/d) but
+        // with the DERIVED finite-sample overfit factor (1 − d/n) applied per rung
+        // (n = N/K). At small N/K (large K) that factor collapses the held-in loss,
+        // steepening the tail and biasing the FULL-ladder d̂ downward — the 33→6 slide.
+        // The stable window must drop those token-starved rungs and recover a d̂ far
+        // closer to the truth, and the small-N/K regime must be flagged.
+        let d_true = 8.0f64;
+        let n_rows = 2000usize;
+        let sigma2 = 1.0e-3f64;
+        let c = 1.0f64;
+        let mut rungs: Vec<(usize, f64)> = Vec::new();
+        let mut k = 4usize;
+        for _ in 0..9 {
+            // rungs 4 .. 1024
+            let population = sigma2 + c * (k as f64).powf(-2.0 / d_true);
+            let n_cell = n_rows as f64 / k as f64;
+            // Derived overfit shrinkage 1 − d/n, clamped away from ≤0 (a cell with
+            // n ≤ d overfits to ~zero residual — the degenerate token-starved regime).
+            let overfit = (1.0 - d_true / n_cell).max(0.05);
+            rungs.push((k, population * overfit));
+            k *= 2;
+        }
+
+        let report = analyze_ladder(&rungs, n_rows).expect("ladder analysis");
+
+        // The tail is token-starved (N/K = 2000/1024 ≈ 2 ≪ τ(8) ≈ 46), so the drift is
+        // real and must be flagged, and the stable window must be a strict subset.
+        assert!(
+            report.small_nk_regime,
+            "token-starved tail must flag small-N/K regime"
+        );
+        assert!(
+            report.stable_rung_count < report.rungs.len(),
+            "stable window must drop the token-starved rungs (kept {} of {})",
+            report.stable_rung_count,
+            report.rungs.len()
+        );
+        assert!(
+            report.stable_window_hi_k < rungs[rungs.len() - 1].0,
+            "stable window must exclude the largest-K rung ({} vs top {})",
+            report.stable_window_hi_k,
+            rungs[rungs.len() - 1].0
+        );
+        // Full-ladder d̂ is biased DOWN by the overfit tail; the stable window corrects
+        // it substantially UPWARD, landing much closer to the truth.
+        assert!(
+            report.d_hat_full_ladder < d_true - 1.0,
+            "full-ladder d̂ {} should be biased below the true d={d_true}",
+            report.d_hat_full_ladder
+        );
+        assert!(
+            report.d_hat > report.d_hat_full_ladder + 1.0,
+            "stable-window d̂ {} must correct the full-ladder d̂ {} upward",
+            report.d_hat,
+            report.d_hat_full_ladder
+        );
+        assert!(
+            (report.d_hat - d_true).abs() < (report.d_hat_full_ladder - d_true).abs(),
+            "stable-window d̂ {} must be closer to d={d_true} than full-ladder d̂ {}",
+            report.d_hat,
+            report.d_hat_full_ladder
+        );
+        // Drop-last is a reported robustness probe (not a monotone de-bias guarantee —
+        // beyond the overfit crater the tail returns to the shallow population slope,
+        // so removing one rung need not move d̂ in a fixed direction). It must be a
+        // finite, usable number.
+        assert!(
+            report.d_hat_drop_last.is_finite() && report.d_hat_drop_last > 0.0,
+            "drop-last d̂ must be a finite positive estimate, got {}",
+            report.d_hat_drop_last
+        );
+        // Points-per-atom is exposed so the drift is inspectable, aligned to the ladder.
+        assert_eq!(report.points_per_atom.len(), report.rungs.len());
+        assert!(
+            (report.points_per_atom[0] - n_rows as f64 / rungs[0].0 as f64).abs() < 1.0e-9
+        );
+    }
+
+    #[test]
+    fn threshold_scales_like_dimension_squared() {
+        // The derived threshold τ = max(d²/(2 ln2), 2): permissive for low d (a circle
+        // stays reliable to large K), strict for high d (a high-dimensional manifold
+        // needs many points per atom — exactly where real data drifts).
+        assert!(
+            (threshold_points_per_atom(1.0) - 2.0).abs() < 1.0e-12,
+            "d=1 threshold floors at 2, got {}",
+            threshold_points_per_atom(1.0)
+        );
+        let t_low = threshold_points_per_atom(4.0);
+        let t_high = threshold_points_per_atom(16.0);
+        // Quadratic scaling: quadrupling d multiplies the threshold by ~16.
+        assert!(
+            (t_high / t_low - 16.0).abs() < 1.0e-6,
+            "threshold must scale like d² (ratio {} for d 4→16)",
+            t_high / t_low
+        );
+        assert!(
+            t_high > 180.0,
+            "a d=16 manifold must demand many points per atom, got {t_high}"
         );
     }
 }
