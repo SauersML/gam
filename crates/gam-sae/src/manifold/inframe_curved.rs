@@ -321,6 +321,83 @@ pub fn inframe_curved_region_prediction(
     Ok(Some((frame.rank(), ambient)))
 }
 
+/// PRODUCTION SEAM. Learn the low-rank ambient frame of a curved region's
+/// residual span *before* any dense fit, returned as the exact
+/// [`GrassmannFrame`] the arrow-Schur assembly consumes through
+/// `SaeManifoldAtom::decoder_frame` / `SaeManifoldTerm::any_frame_active`.
+///
+/// Assigning this to a curved atom's `decoder_frame` flips the term onto its
+/// `frames_engaged` factored path (border `M·r`, posterior covariance `(M·r)²`)
+/// so the composed / terminal joint fit never materializes the dense
+/// `O((M·p)²)` joint Hessian that OOMs at LLM width. Unlike
+/// `SaeManifoldTerm::auto_activate_decoder_frames` — which SVDs an already-fitted
+/// full-`p` decoder and therefore only helps *after* the dense fit has already
+/// paid the memory — this learns the frame straight from the region residual, so
+/// the dense fit is never run.
+///
+/// Returns `None` when the region admits no beneficial low-rank frame (its span
+/// fills the ambient width): that region belongs on the certified full-`p` path
+/// and the caller must leave `decoder_frame` unset (dense) for it.
+///
+/// NOTE for the wiring lane: the existing arrow-Schur gates
+/// `frames_engaged = any_frame_active() && !whitens_likelihood` — frames + a
+/// `WhitenedStructured` metric are out of scope (#974). Seed frames on the
+/// isotropic / OutputFisher / no-metric composed fit; under active structured
+/// whitening the assembly correctly falls back to the dense path.
+pub fn residual_span_frame(
+    residual: ArrayView2<'_, f64>,
+    rows: &[usize],
+    config: &InFrameCurvedConfig,
+) -> Result<Option<GrassmannFrame>, String> {
+    if rows.len() < 2 {
+        return Ok(None);
+    }
+    let r_g = take_rows(residual, rows);
+    learn_frame(&r_g, config)
+}
+
+/// PRODUCTION WIRING HOOK — the single call the composed / curved fit makes to
+/// route a curved atom through the in-frame path instead of the dense ambient
+/// Hessian. Learns the atom's low-rank frame from the residual it will explain
+/// (`residual`, rows `rows`) and installs it EXACTLY the way
+/// `SaeManifoldAtom::maybe_activate_decoder_frame` installs a decoder-derived
+/// frame: sets `decoder_frame` AND projects the decoder `B ← (B U) Uᵀ` so the
+/// factored `B = C Uᵀ` holds from the first assembly (without the projection the
+/// factored C-solve moves only within `range(U)` and the fit never converges).
+///
+/// The difference from `maybe_activate_decoder_frame` is WHERE the frame comes
+/// from: there it is the SVD of an already-fitted full-`p` decoder (so the dense
+/// O((M·p)²) fit has already paid the memory); here it is the residual span,
+/// learned BEFORE any dense fit, so the wall is never hit. After this returns
+/// `Some(r)`, `term.any_frame_active()` is true and the arrow-Schur assembly
+/// takes its `frames_engaged` factored path (border `M·r`, covariance `(M·r)²`).
+///
+/// Returns the installed frame rank, or `None` when the residual admits no
+/// beneficial low-rank frame (the atom stays on the certified full-`p` path).
+///
+/// Wiring note: engages only when the term is NOT whitened
+/// (`frames_engaged = any_frame_active() && !whitens_likelihood`, #974). Call it
+/// on the isotropic / OutputFisher composed fit.
+pub fn activate_residual_frame(
+    atom: &mut crate::manifold::SaeManifoldAtom,
+    residual: ArrayView2<'_, f64>,
+    rows: &[usize],
+    config: &InFrameCurvedConfig,
+) -> Result<Option<usize>, String> {
+    let Some(frame) = residual_span_frame(residual, rows, config)? else {
+        atom.decoder_frame = None;
+        return Ok(None);
+    };
+    let r = frame.rank();
+    let u = frame.frame().to_owned(); // p × r
+    // Project the decoder onto the frame so B = C·Uᵀ holds exactly (mirrors
+    // maybe_activate_decoder_frame's B ← (B U) Uᵀ convergence guard).
+    let c_proj = fast_ab(&atom.decoder_coefficients, &u); // M × r
+    atom.decoder_coefficients = fast_abt(&c_proj, &u); // M × p
+    atom.decoder_frame = Some(frame);
+    Ok(Some(r))
+}
+
 struct RegionFit {
     frame: GrassmannFrame,
     frame_rank: usize,

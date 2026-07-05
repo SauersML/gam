@@ -3,11 +3,12 @@
 //! with the full-`p` fit when the frame contains the truth, and rejection of a
 //! region with no curved structure.
 
-use ndarray::Array2;
+use ndarray::{Array2, Array3};
 
+use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
 use super::inframe_curved::{
-    CurvedRegion, InFrameCurvedConfig, dense_ambient_radial_reference,
-    fit_inframe_curved_regions, inframe_curved_region_prediction,
+    CurvedRegion, InFrameCurvedConfig, activate_residual_frame, dense_ambient_radial_reference,
+    fit_inframe_curved_regions, inframe_curved_region_prediction, residual_span_frame,
 };
 
 /// Deterministic LCG in `[-1, 1)` so the tests are reproducible without an RNG
@@ -241,6 +242,155 @@ fn inframe_matches_dense_full_p_when_frame_contains_truth() {
         rel < 1.0e-6,
         "in-frame and dense full-p radial fits must match on the frame's span; \
          relative Frobenius diff {rel:.3e}"
+    );
+}
+
+#[test]
+fn residual_span_frame_is_the_production_hook_low_rank_and_spans_truth() {
+    // The production seam (`residual_span_frame`) must (a) return a frame whose
+    // rank is far below p — so a curved atom carrying it flips the arrow-Schur
+    // onto its M·r frames_engaged path instead of the dense M·p Hessian — and
+    // (b) span the planted subspace, so the in-frame fit loses no signal. The
+    // second property is checked structurally: the residual projected onto the
+    // frame and lifted back must reconstruct the (exactly low-rank) residual.
+    let n = 400;
+    let p = 1024;
+    let r_true = 6;
+    let (residual, _q) = planted_curved_residual(n, p, r_true, 0.05, 0.0, 2130);
+    let config = InFrameCurvedConfig {
+        frame_rank_min: r_true,
+        frame_rank_max: 16,
+        min_rows: 16,
+        ..Default::default()
+    };
+    let rows: Vec<usize> = (0..n).collect();
+
+    let frame = residual_span_frame(residual.view(), &rows, &config)
+        .expect("frame learns")
+        .expect("beneficial low-rank frame exists for a planted low-rank residual");
+    let r = frame.rank();
+    assert!(
+        r >= r_true && r <= 16 && r < p,
+        "seam frame rank {r} should recover the intrinsic rank {r_true} and stay far below p={p}"
+    );
+
+    // The frame spans the truth: R (U Uᵀ) ≈ R for an exactly-low-rank residual.
+    let u = frame.frame().to_owned(); // p × r
+    let mut diff = 0.0;
+    let mut denom = 0.0;
+    for i in 0..n {
+        // z_i = R_i · U  (length r); lifted = z_i · Uᵀ  (length p).
+        let mut z = vec![0.0; r];
+        for (k, zk) in z.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for j in 0..p {
+                acc += residual[[i, j]] * u[[j, k]];
+            }
+            *zk = acc;
+        }
+        for j in 0..p {
+            let mut lifted = 0.0;
+            for (k, &zk) in z.iter().enumerate() {
+                lifted += zk * u[[j, k]];
+            }
+            let d = residual[[i, j]] - lifted;
+            diff += d * d;
+            denom += residual[[i, j]] * residual[[i, j]];
+        }
+    }
+    let rel = (diff / denom.max(1e-30)).sqrt();
+    assert!(
+        rel < 1e-6,
+        "seam frame must span the planted subspace (residual reconstructs through U Uᵀ); rel={rel:.3e}"
+    );
+
+    // A full-rank (isotropic) residual admits no beneficial low-rank frame, so
+    // the seam returns None and the caller correctly leaves that region dense.
+    let mut rng = Lcg::new(9001);
+    let mut iso = Array2::<f64>::zeros((64, 8));
+    for i in 0..64 {
+        for j in 0..8 {
+            iso[[i, j]] = rng.normal();
+        }
+    }
+    let tight = InFrameCurvedConfig {
+        frame_rank_min: 2,
+        frame_rank_max: 4,
+        rank_cutoff: 1e-9, // count every direction ⇒ numerical rank fills the width
+        ..Default::default()
+    };
+    let iso_rows: Vec<usize> = (0..64).collect();
+    let got = residual_span_frame(iso.view(), &iso_rows, &tight).expect("runs");
+    // rank_max=4 < p=8 so a frame is still returned, but it must be a strict
+    // low-rank projection (r <= 4), never the full width.
+    if let Some(f) = got {
+        assert!(f.rank() <= 4 && f.rank() < 8, "seam frame must stay strictly low-rank");
+    }
+}
+
+#[test]
+fn activate_residual_frame_installs_factored_decoder_and_engages_frames() {
+    // The one-call wiring hook must (a) install a low-rank decoder_frame learned
+    // from the residual, and (b) leave the decoder EXACTLY factored as B = C·Uᵀ
+    // (B == (B U) Uᵀ) so the factored arrow-Schur C-solve converges — the same
+    // invariant maybe_activate_decoder_frame enforces, but with the frame sourced
+    // from the residual span (no dense fit).
+    let n = 200;
+    let p = 128;
+    let m = 3usize; // atom basis size
+    let r_true = 5;
+    let (residual, _q) = planted_curved_residual(n, p, r_true, 0.05, 0.0, 4242);
+
+    // A minimal atom whose decoder is generic full-rank (M×p); activation must
+    // project it onto the residual frame.
+    let mut rng = Lcg::new(77);
+    let mut decoder = Array2::<f64>::zeros((m, p));
+    for a in 0..m {
+        for j in 0..p {
+            decoder[[a, j]] = rng.normal();
+        }
+    }
+    let basis_values = Array2::<f64>::zeros((1, m));
+    let basis_jacobian = Array3::<f64>::zeros((1, m, 1));
+    let smooth_penalty = Array2::<f64>::eye(m);
+    let mut atom = SaeManifoldAtom::new(
+        "seam",
+        SaeAtomBasisKind::Periodic,
+        1,
+        basis_values,
+        basis_jacobian,
+        decoder,
+        smooth_penalty,
+    )
+    .expect("atom builds");
+    assert!(atom.decoder_frame.is_none(), "starts on the full-p path");
+
+    let config = InFrameCurvedConfig {
+        frame_rank_min: r_true,
+        frame_rank_max: 16,
+        min_rows: 16,
+        ..Default::default()
+    };
+    let rows: Vec<usize> = (0..n).collect();
+    let r = activate_residual_frame(&mut atom, residual.view(), &rows, &config)
+        .expect("activation runs")
+        .expect("beneficial low-rank frame installed");
+    assert!(r >= r_true && r < p, "installed frame rank {r} low-rank vs p={p}");
+    let frame = atom.decoder_frame.as_ref().expect("frame installed");
+    assert_eq!(frame.rank(), r);
+
+    // Decoder is now exactly factored: B == (B U) Uᵀ (projection is idempotent).
+    let u = frame.frame().to_owned();
+    let mut reproj = atom.decoder_coefficients.dot(&u).dot(&u.t());
+    reproj -= &atom.decoder_coefficients;
+    let mut fro = 0.0;
+    for v in reproj.iter() {
+        fro += v * v;
+    }
+    assert!(
+        fro.sqrt() < 1e-9,
+        "activated decoder must satisfy B = (B U) Uᵀ exactly; residual {:.3e}",
+        fro.sqrt()
     );
 }
 

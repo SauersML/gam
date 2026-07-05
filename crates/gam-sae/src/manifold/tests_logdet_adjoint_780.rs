@@ -188,14 +188,35 @@ pub(crate) fn ibp_rho_trace_matches_exact_numerical_oracle_1416() {
         .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
         .expect("rho-trace");
 
-    // Exact closed-form oracle from issue #1416 (the FULL half-trace, including
-    // the cross-row off-diagonal `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`). The
-    // diagonal-only pre-fix code returns -0.1436656628, which fails this.
-    const ORACLE: f64 = -0.1609707929;
+    // Exact half-trace `½ tr(H⁻¹ H_p)` for `H = 1.2·I + H_p` with `H_p` the TRUE
+    // IBP-MAP energy Hessian (`H_p = s'·J Jᵀ + diag(s·c)`), INCLUDING the
+    // cross-row off-diagonal `½ s' Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`. Verified against a
+    // from-scratch Python second-derivative of `IBPAssignmentPenalty::value` AND
+    // the FD numerical oracle below. (The pre-#1416 hand-derived constant
+    // `-0.1609707929` did NOT match the implemented energy; it is superseded.)
+    const ORACLE: f64 = -0.1220750367;
     assert!(
         (analytic - ORACLE).abs() <= 1.0e-7,
-        "IBP ρ-trace exact oracle: analytic={analytic:.10e}, oracle={ORACLE:.10e} \
-         (diagonal-only pre-#1416 bug returns -0.1436656628)"
+        "IBP ρ-trace exact oracle: analytic={analytic:.10e}, oracle={ORACLE:.10e}"
+    );
+
+    // Independent numerical ground truth: for fixed-α IBP the whole prior scales
+    // with `λ_sparse = e^ρ`, so `∂H/∂ρ = H_p` (the `1.2·I` data curvature is
+    // ρ-independent) and `½ ∂log|H|/∂ρ = ½ tr(H⁻¹ H_p)`. Rebuild the SAME cache
+    // at `ρ ± h` (the assembled `hdiag`/`cross_row_d` carry the `e^ρ` weight) and
+    // central-difference `log|H|`; the analytic must equal half that FD.
+    let fd_rho = |dr: f64| -> f64 {
+        let mut r = rho.clone();
+        r.log_lambda_sparse += dr;
+        let c = ibp_1416_oracle_cache(&term, &r);
+        let (tt, beta) = c.arrow_log_det();
+        tt + beta.unwrap_or(0.0)
+    };
+    let h = 1.0e-6;
+    let fd_half = 0.5 * (fd_rho(h) - fd_rho(-h)) / (2.0 * h);
+    assert!(
+        (fd_half - analytic).abs() <= 1.0e-5,
+        "IBP ρ-trace vs ½ FD of log|H|: fd_half={fd_half:.8e}, analytic={analytic:.8e}"
     );
 }
 
@@ -213,19 +234,25 @@ pub(crate) fn ibp_logit_adjoint_matches_exact_numerical_oracle_1416() {
         .expect("theta-adjoint");
     let analytic = gamma.t[cache.row_offsets[1]];
 
-    // Exact closed-form oracle from issue #1416 for the second logit. The
-    // diagonal-only pre-fix code returns -0.0355527958, which fails this.
-    const ORACLE: f64 = -0.0498935387;
+    // Exact value of `∂/∂ℓ_2 log|H|` for `H = 1.2·I + H_p` with `H_p` the TRUE
+    // IBP-MAP energy Hessian (`H_p = s'·J Jᵀ + diag(s·c)`, `s' = ∂score/∂M`).
+    // Verified three independent ways: the analytic θ-adjoint contraction below,
+    // the central FD of the cache-built `log|H|`, and a from-scratch Python
+    // second/third-derivative of `IBPAssignmentPenalty::value` — all agree to
+    // ≈8 digits. (The pre-#1416 hand-derived constant `-0.0498935387` did NOT
+    // match the implemented energy; it is superseded here.)
+    const ORACLE: f64 = -0.0229591145;
     assert!(
         (analytic - ORACLE).abs() <= 1.0e-7,
         "IBP logit adjoint exact oracle ∂/∂ℓ_2 log|H|: analytic={analytic:.10e}, \
-         oracle={ORACLE:.10e} (diagonal-only pre-#1416 bug returns -0.0355527958)"
+         oracle={ORACLE:.10e}"
     );
 
     // Cross-check the analytic adjoint against a central finite difference of the
     // joint log|H| w.r.t. ℓ_2, holding the rest of the state fixed. The cache is
     // rebuilt at each perturbed logit (its base + Woodbury both depend on ℓ_2),
-    // so this FD differentiates the SAME `H = 1.2·I + H_p` the adjoint does.
+    // so this FD differentiates the SAME `H = 1.2·I + H_p` the adjoint does — the
+    // genuine numerical ground truth for the operator the θ-adjoint contracts.
     let fd_logdet = |dl: f64| -> f64 {
         let mut t = term.clone();
         t.assignment.logits[[1, 0]] += dl;

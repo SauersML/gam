@@ -184,6 +184,7 @@ mod construction_padded_blocks;
 mod construction_reconstruction;
 mod coordinate_fidelity;
 mod cross_fit;
+mod curl;
 mod fit_drivers;
 mod gauge;
 mod inframe_curved;
@@ -203,6 +204,8 @@ mod shape_uncertainty;
 mod stagewise;
 mod streaming_plan;
 mod term;
+mod terracini;
+mod transport_class;
 mod wbic_audit;
 
 #[cfg(test)]
@@ -372,6 +375,7 @@ pub fn rank_charge_dof(
 
 pub use coordinate_fidelity::*;
 pub use cross_fit::*;
+pub use curl::*;
 pub use gauge::*;
 pub use inframe_curved::*;
 pub use isa_seed::*;
@@ -390,4 +394,6 @@ pub use shape_uncertainty::*;
 pub use stagewise::*;
 pub use streaming_plan::*;
 pub use term::*;
+pub use terracini::*;
+pub use transport_class::*;
 pub use wbic_audit::*;

@@ -1017,7 +1017,11 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
+        let (cur_reml, cur_l) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
+        eprintln!(
+            "[DIAG2111-CUR] seed loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
+            cur_l.data_fit, cur_l.assignment_sparsity, cur_l.smoothness, cur_l.ard, cur_reml
+        );
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
@@ -1095,8 +1099,12 @@ pub fn fit_stagewise(
                     registry,
                     config,
                 )?;
-                let (reml, _) =
+                let (reml, l) =
                     frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
+                eprintln!(
+                    "[DIAG2111-A] cand loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
+                    l.data_fit, l.assignment_sparsity, l.smoothness, l.ard, reml
+                );
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, reml, ev))
             })
@@ -1263,6 +1271,15 @@ pub fn fit_stagewise(
                 && ev.is_finite()
                 && (ev - cur_ev) >= config.min_effect_ev
         };
+        eprintln!(
+            "[DIAG2111] round={} cur_reml={:.6} cur_ev={:.6} cand_a={:?} cand_b={:?} min_eff={}",
+            round,
+            cur_reml,
+            cur_ev,
+            cand_a.as_ref().map(|&(_, _, r, e)| (r, e)),
+            cand_b.as_ref().map(|&(_, _, r, e)| (r, e)),
+            config.min_effect_ev,
+        );
         let a_ok = cand_a
             .as_ref()
             .map(|&(_, _, r, e)| passes(r, e))
@@ -3047,6 +3064,88 @@ mod tests {
             energy: 1.0,
             circle_coords: Some(phases),
             circle_gate: Some(gate),
+        }
+    }
+
+    #[test]
+    fn diag_serial_four_circle_births() {
+        let n = 480usize;
+        let p = 16usize;
+        let q = 4usize;
+        let per = n / q;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+        let mut atoms = Vec::new();
+        let mut cbs = Vec::new();
+        for c in 0..q {
+            let (atom, cb) = circle_atom(&format!("t{c}"), &evaluator, &coords, 2 * c, 2 * c + 1, p);
+            atoms.push(atom);
+            cbs.push(cb);
+        }
+        let active_truth: Vec<Vec<bool>> = (0..n)
+            .map(|r| (0..q).map(|c| r / per == c).collect())
+            .collect();
+        let (truth, _truth_rho) = build_term(atoms.clone(), cbs.clone(), &active_truth);
+        let target = truth.fitted();
+        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
+        let mut config = test_config();
+        config.max_births = 8;
+        config.max_backfit_sweeps = 1;
+        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let (mut seed, mut rho) =
+            build_term_gate(vec![atom0], vec![cb0], &vec![vec![true]; n], mode);
+        seed.set_guards_enabled(false);
+        seed.run_joint_fit_arrow_schur(
+            target.view(),
+            &mut rho,
+            None,
+            config.inner_max_iter,
+            config.learning_rate,
+            config.ridge_ext_coord,
+            config.ridge_beta,
+        )
+        .unwrap();
+
+        // Inspect the seed decision path directly.
+        let (residual, model) = fit_residual_covariance(&seed, target.view(), &config)
+            .unwrap()
+            .expect("residual model");
+        eprintln!("DIAG factor_rank={}", model.factor_rank());
+        let parts = isa_eigen_parts(residual.view()).ok().flatten();
+        eprintln!(
+            "DIAG isa_eigen_parts above.len()={:?}",
+            parts.as_ref().map(|p| p.above.len())
+        );
+        let tf = top_factor_birth_decoder(&seed, &model, residual.view());
+        eprintln!(
+            "DIAG top_factor: some={} circle={:?}",
+            tf.is_some(),
+            tf.as_ref().map(|s| s.circle_coords.is_some())
+        );
+        let rp = residual_principal_birth_candidate(&seed, residual.view());
+        eprintln!(
+            "DIAG residual_principal: some={} circle={:?}",
+            rp.is_some(),
+            rp.as_ref().map(|s| s.circle_coords.is_some())
+        );
+        let harvest =
+            isa_deflationary_producer(residual.view(), 8, &IsaSeedConfig::default()).unwrap();
+        eprintln!("DIAG producer planes={}", harvest.planes.len());
+
+        let result =
+            fit_stagewise(seed, rho, target.view(), None, None, &config, None).unwrap();
+        eprintln!(
+            "DIAG serial births_accepted={} rejected={} stop={:?} ev_trace={:?}",
+            result.report.births_accepted,
+            result.report.births_rejected,
+            result.report.stopped_reason,
+            result.report.ev_trace
+        );
+        for (i, br) in result.report.birth_records.iter().enumerate() {
+            eprintln!(
+                "DIAG birth[{i}] kind={:?} accepted={} dEV={:.4} reml_before={:.3} reml_after={:.3}",
+                br.kind, br.accepted, br.delta_ev, br.joint_reml_before, br.joint_reml_after
+            );
         }
     }
 

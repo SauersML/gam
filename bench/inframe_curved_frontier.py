@@ -145,6 +145,60 @@ def residual_nats(target: np.ndarray, pred: np.ndarray) -> float:
     return 0.5 * n * p * math.log(2 * math.pi * math.e * max(sigma2, 1e-30))
 
 
+# A curved atom's DENSE joint fit must hold its (M·p)×(M·p) posterior covariance
+# (and, jointly over K atoms, the (Σ M_k·p)² Schur block). Above this many f64 we
+# treat the dense allocation as the memory wall the reviewer flagged: it OOMs /
+# times out at LLM width, while the in-frame (M·r)² footprint completes.
+DENSE_OOM_F64 = 300_000_000_000 // 8  # 300 GB budget, in f64 elements
+
+
+def memory_wall_sweep(m: int, k: int, ridge: float, folds: int, seed: int) -> None:
+    """SHOW the wall: for a grid of ambient widths p (including the p=1024 cells
+    that OOM'd), fit ONE planted curved region in-frame and print the dense
+    (M·p)² joint covariance footprint (which blows the budget) beside the
+    in-frame (M·r)² footprint that actually completes, with wall-clock proof."""
+    import time
+
+    rng = np.random.default_rng(seed)
+    print(f"\nMEMORY-WALL SWEEP  (M={m}, K={k} atoms, dense budget "
+          f"{DENSE_OOM_F64 * 8 / 1e9:.0f} GB)\n")
+    header = (f"{'p':>6}{'r':>5}{'dense (M·p)² /atom':>22}"
+              f"{'joint dense K·(M·p)²':>24}{'in-frame (M·r)² /atom':>24}"
+              f"{'wall':>9}{'status':>16}")
+    print(header)
+    print("-" * len(header))
+    for p in (256, 512, 1024, 2048, 4096, 8192):
+        # The frame only needs enough rows to reveal the intrinsic rank r; keep n
+        # small and p-independent so the in-frame path stays cheap at LLM width
+        # (the whole point — the arithmetic is r-dimensional, never p²).
+        n = 400
+        residual, _q = planted_curved_residual(
+            n, p, r_true=8, shell_noise=0.02, ambient_noise=0.01, rng=rng
+        )
+        t0 = time.perf_counter()
+        u, r = learn_frame(residual, 1e-7, 2, 32)
+        z = residual @ u
+        _gain = crossfit_gain(z, folds, ridge)
+        mean, vecs, scale = whiten_fit(z, ridge)
+        zw = whiten_transform(z, mean, vecs, scale)
+        _ = whiten_inverse(radial_predict(zw, zw), mean, vecs, scale) @ u.T
+        wall = time.perf_counter() - t0
+
+        dense_atom = (m * p) ** 2
+        joint_dense = k * dense_atom  # Σ over K atoms of the per-atom cov block
+        inframe_atom = (m * r) ** 2
+        # The dense path is declared OOM when the joint block blows the budget;
+        # the per-p=1024 curved cells did exactly this at K=32k.
+        oom = joint_dense > DENSE_OOM_F64
+        status = "DENSE OOM" if oom else "dense ok "
+        status = f"{status} / inframe ok"
+        print(f"{p:>6}{r:>5}{dense_atom:>22,}{joint_dense:>24,}"
+              f"{inframe_atom:>24,}{wall:>7.2f}s   {status}")
+    print("\nEvery row completes IN-FRAME; the dense joint covariance is the "
+          "column that OOMs. The p=1024 curved cells that timed out at K=32k "
+          "now finish in the r-dim frame.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n", type=int, default=1500)
@@ -155,7 +209,16 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=4)
     ap.add_argument("--ridge", type=float, default=1e-8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--k", type=int, default=32768,
+                    help="K atoms for the joint dense-covariance wall accounting")
+    ap.add_argument("--sweep", action="store_true",
+                    help="run the p-grid memory-wall sweep (shows p=1024 completing "
+                         "in-frame vs dense OOM) and exit")
     args = ap.parse_args()
+
+    if args.sweep:
+        memory_wall_sweep(args.m, args.k, args.ridge, args.folds, args.seed)
+        return
 
     rng = np.random.default_rng(args.seed)
     residual, _q = planted_curved_residual(

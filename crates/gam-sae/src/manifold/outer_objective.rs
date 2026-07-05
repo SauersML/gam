@@ -2377,17 +2377,37 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let (cost, _beta_hat) =
                     match self.evaluate_value_probe_with_refine_policy(rho.view(), false) {
                         Ok(evaluated) => evaluated,
-                        // #2080 — the `Value` order is the BFGS / ARC line-search
-                        // probe lane, where the bridge can distinguish an
-                        // infeasible trial and count it in the recoverable-probe
-                        // guard. Do not hide this behind the finite #1782 wall:
-                        // a non-PD Laplace probe is not an ordinary Wolfe value.
-                        // The finite wall remains on `eval_cost` / EFS / startup
-                        // lanes, where it is deliberately used for seed survival.
+                        // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
+                        // log-det) presents to the line search as the SAME finite
+                        // collapse wall the gradient lane (`eval`) and the value /
+                        // EFS / startup lanes (`eval_cost`, `efs_step`) already
+                        // return for this class (#1782). Returning `+∞` here instead
+                        // (an infeasible Wolfe value) desynced this lane from the
+                        // gradient lane: the anchor `(cost, ∇f)` from `eval` carried
+                        // the finite wall, but every line-search probe overshooting
+                        // the seed's PD basin returned `+∞`, which `finite_cost_or_error`
+                        // in the outer bridge converts into a `Recoverable` probe
+                        // refusal. On a seed whose PD basin the first BFGS direction
+                        // immediately exits (the K=2 wide-`p` two-circle fit, whose
+                        // seed sits on the non-PD boundary), EVERY probe refused, the
+                        // consecutive-refusal counter never reset, and the
+                        // non-termination guard escalated the whole fit to a fatal
+                        // "globally infeasible neighbourhood at seed" abort — never
+                        // shipping the perfectly feasible seed dictionary. The finite
+                        // wall is astronomically larger than any real REML value, so
+                        // the Armijo/Wolfe search still rejects a step INTO it (the
+                        // same steering), but the bridge reads a finite cost, resets
+                        // its refusal streak, and BFGS halts at the feasible seed and
+                        // ships best-so-far instead of aborting.
                         Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                             self.probe_telemetry.record_refusal_kind(&err);
                             self.probe_telemetry.wall_cost_value_probes += 1;
-                            return Ok(OuterEval::infeasible(rho.len()));
+                            return Ok(OuterEval {
+                                cost: Self::recoverable_refusal_wall_cost(),
+                                gradient: Array1::zeros(rho.len()),
+                                hessian: HessianResult::Unavailable,
+                                inner_beta_hint: None,
+                            });
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };

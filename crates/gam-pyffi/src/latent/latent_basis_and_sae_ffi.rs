@@ -2828,16 +2828,23 @@ fn sae_manifold_fit_stagewise<'py>(
         progress_callback.as_mut().map(|callback| {
             callback as &mut gam::terms::sae::manifold::StagewiseProgressCallback<'_>
         });
-    let result = gam::terms::sae::manifold::fit_stagewise(
-        base_term,
-        init_rho,
-        z_view,
-        None,
-        weights.as_deref(),
-        &config,
-        progress_hook,
-    )
-    .map_err(py_value_error)?;
+    // #2138 — release the GIL for the multi-minute forward-birth + backfit solve
+    // so a slow/hung fit stays interruptible from Python. Inputs are owned or
+    // borrowed data views (no Python objects); the optional progress hook
+    // reacquires the GIL itself via `Python::attach`, so it still calls back.
+    let result = py
+        .allow_threads(|| {
+            gam::terms::sae::manifold::fit_stagewise(
+                base_term,
+                init_rho,
+                z_view,
+                None,
+                weights.as_deref(),
+                &config,
+                progress_hook,
+            )
+        })
+        .map_err(py_value_error)?;
 
     let term = result.term;
     let rho = result.rho;
@@ -2902,6 +2909,54 @@ fn sae_manifold_fit_stagewise<'py>(
     )?;
     out.set_item("log_lambda_sparse", rho.log_lambda_sparse)?;
     Ok(out.unbind())
+}
+
+// #1388 — 512 MiB worker-thread stack for the SAE joint fit. The outer-ρ
+// cascade's serial per-row jet loop builds multi-megabyte `Tower4<16>` frames
+// that overflow Python's modest calling-thread stack → SIGSEGV. Mirror the
+// native CLI's headroom (`CLI_WORKER_STACK_SIZE` in `src/main.rs`).
+const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
+
+/// Run an owned SAE fit closure on a 512 MiB worker thread with the GIL
+/// RELEASED, so a multi-minute Rust solve no longer holds the interpreter lock
+/// for its whole duration (#2138). The calling thread blocks on the result
+/// channel in short GIL-dropped windows and, between them, reacquires the GIL to
+/// run any pending Python signal handler ([`Python::check_signals`]): a
+/// `KeyboardInterrupt` / `signal.alarm` therefore RAISES here mid-solve instead
+/// of only after the fit returns. On interrupt the worker is abandoned — it owns
+/// every input (`'static`), so it finishes and drops on its own thread. `f` MUST
+/// NOT touch any Python object; it returns owned Rust values only.
+fn run_sae_fit_interruptible<T, F>(py: Python<'_>, thread_name: &str, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<T>();
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(SAE_FIT_WORKER_STACK_SIZE)
+        // On interrupt the receiver is gone, so the send fails and is dropped.
+        .spawn(move || {
+            tx.send(f()).ok();
+        })
+        .map_err(|err| {
+            py_value_error(format!("sae_manifold_fit: spawn fit worker thread: {err}"))
+        })?;
+    loop {
+        // Block up to the poll window with the GIL released (other Python threads
+        // run; the OS delivers signals to the interpreter), then reacquire it to
+        // service any pending handler. 50 ms is negligible next to a multi-minute
+        // solve yet lands an interrupt within a fraction of a second.
+        match py.allow_threads(|| rx.recv_timeout(std::time::Duration::from_millis(50))) {
+            Ok(value) => return Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => py.check_signals()?,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(py_value_error(format!(
+                    "{thread_name}: joint-fit worker thread panicked (see prior error output)"
+                )));
+            }
+        }
+    }
 }
 
 fn sae_manifold_fit_inner<'py>(
@@ -3453,53 +3508,29 @@ fn sae_manifold_fit_inner<'py>(
     // multistart insurance: the PCA projection lands each row in the decisive
     // basin and EFS refines the per-atom penalties from there. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
-    // #1388: the outer ρ cascade drives a SERIAL per-row jet loop
-    // (`logdet_theta_adjoint` → `row_jets_for_logdet` → `gate_tower`) that builds
-    // `Tower4<16>` derivative towers — each carries a `t4` channel of 16⁴ doubles
-    // (~0.5 MiB) and a dozen-plus temporaries are live at once, so a single
-    // `gate_tower` frame is multi-megabyte. Under PyO3 this whole chain runs on
-    // Python's calling thread, whose fixed, modest stack overflows its guard page
-    // → SIGSEGV (a hard crash, not a Rust panic). `RUST_MIN_STACK` does NOT help:
-    // it only sizes threads spawned by the Rust std runtime, never the foreign
-    // (Python) thread we are called on. The native CLI never hits this because it
-    // runs the whole command on a 512 MiB worker thread (`CLI_WORKER_STACK_SIZE`
-    // in `src/main.rs`); mirror that headroom here. `objective` and `problem` are
-    // fully owned (the objective is built from `z_view.to_owned()` and owned
-    // config — no borrowed Python views), so a *scoped* thread can borrow them
-    // without a `'static` bound and is guaranteed to join before they drop.
-    const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
-    let fit_scope_result = std::thread::scope(|scope| -> PyResult<()> {
-        let worker = std::thread::Builder::new()
-            .name("gam-sae-fit".to_string())
-            .stack_size(SAE_FIT_WORKER_STACK_SIZE)
-            .spawn_scoped(scope, || {
-                if run_outer_rho_search {
-                    let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
-                        .with_initial_rho(init_rho_flat.clone())
-                        .with_seed_config(gam::solver::seeding::SeedConfig {
-                            max_seeds: 1,
-                            seed_budget: 1,
-                            ..Default::default()
-                        });
-                    problem.run(&mut objective, "SAE manifold").map(|_| ())
-                } else {
-                    objective
-                        .fit_at_fixed_rho(init_rho_flat.view())
-                        .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
-                }
-            })
-            .map_err(|err| {
-                py_value_error(format!("sae_manifold_fit: spawn fit worker thread: {err}"))
-            })?;
-        match worker.join() {
-            Ok(run_result) => run_result.map(|_| ()).map_err(estimation_error_to_pyerr),
-            Err(_) => Err(py_value_error(
-                "sae_manifold_fit: joint-fit worker thread panicked (see prior error output)"
-                    .to_string(),
-            )),
-        }
-    });
-    fit_scope_result?;
+    // #2138 — run the multi-minute joint solve on the 512 MiB worker with the GIL
+    // RELEASED and the calling thread polling for signals, so a slow/hung fit is
+    // interruptible from Python. `objective` is fully owned (built from
+    // `z_view.to_owned()` + owned config, no lifetime), so it moves into the
+    // worker and is handed back out; nothing in the closure touches Python.
+    let (mut objective, run_result) = run_sae_fit_interruptible(py, "gam-sae-fit", move || {
+        let run_result = if run_outer_rho_search {
+            let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+                .with_initial_rho(init_rho_flat.clone())
+                .with_seed_config(gam::solver::seeding::SeedConfig {
+                    max_seeds: 1,
+                    seed_budget: 1,
+                    ..Default::default()
+                });
+            problem.run(&mut objective, "SAE manifold").map(|_| ())
+        } else {
+            objective
+                .fit_at_fixed_rho(init_rho_flat.view())
+                .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
+        };
+        (objective, run_result)
+    })?;
+    run_result.map_err(estimation_error_to_pyerr)?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
@@ -3624,28 +3655,13 @@ fn sae_manifold_fit_inner<'py>(
                     seed_budget: 1,
                     ..Default::default()
                 });
-            let pass_result = std::thread::scope(|scope| -> PyResult<()> {
-                let worker = std::thread::Builder::new()
-                    .name("gam-sae-fit-structured".to_string())
-                    .stack_size(SAE_FIT_WORKER_STACK_SIZE)
-                    .spawn_scoped(scope, || {
-                        problem.run(&mut objective, "SAE manifold (structured)")
-                    })
-                    .map_err(|err| {
-                        py_value_error(format!(
-                            "sae_manifold_fit: spawn structured-pass worker thread: {err}"
-                        ))
-                    })?;
-                match worker.join() {
-                    Ok(run_result) => run_result.map(|_| ()).map_err(estimation_error_to_pyerr),
-                    Err(_) => Err(py_value_error(
-                        "sae_manifold_fit: structured-pass worker thread panicked (see prior \
-                         error output)"
-                            .to_string(),
-                    )),
-                }
-            });
-            pass_result?;
+            // #2138 — same GIL-released, interruptible worker per structured pass.
+            let (mut objective, run_result) =
+                run_sae_fit_interruptible(py, "gam-sae-fit-structured", move || {
+                    let run_result = problem.run(&mut objective, "SAE manifold (structured)");
+                    (objective, run_result)
+                })?;
+            run_result.map_err(estimation_error_to_pyerr)?;
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective
