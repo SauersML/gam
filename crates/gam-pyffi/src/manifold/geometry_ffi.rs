@@ -4869,6 +4869,32 @@ fn parse_sparse_dict_score_mode(score_mode: &str) -> PyResult<gam::gpu::GpuMode>
     }
 }
 
+/// Cap on the number of top strictly-improving birth candidates a sparse-dict
+/// fit's dual certificate reports. A safety bound on the report size, not a
+/// tuned selection knob (the birth threshold itself is the derived `1`).
+const SPARSE_DICT_DUAL_CERT_MAX_BIRTHS: usize = 16;
+
+/// Build the fit-report sub-dict for a sparse-dictionary [`DualCertificateReport`]
+/// — the lane's global-optimality certificate channel: the certified fraction of
+/// rows, the per-row optimality-ratio quantiles, and the top strictly-improving
+/// `(row, atom, η)` birth candidates. Emitted on every lane fit so the global
+/// -optimality certificate sits beside the reconstruction/EV report the way the
+/// first-order LAML audit sits beside the exact-manifold fit.
+fn dual_certificate_report_dict(
+    py: Python<'_>,
+    report: &gam::terms::sae::dual_certificate::DualCertificateReport,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("n_rows", report.n_rows)?;
+    out.set_item("frac_certified", report.frac_certified)?;
+    out.set_item(
+        "optimality_ratio_quantiles",
+        report.optimality_ratio_quantiles.clone(),
+    )?;
+    out.set_item("birth_candidates", report.birth_candidates.clone())?;
+    Ok(out.unbind())
+}
+
 #[pyfunction(signature = (
     x,
     k,
@@ -4907,8 +4933,16 @@ fn sparse_dictionary_fit<'py>(
         tolerance,
         score_mode,
     };
-    let fit = detach_py_result(py, "sparse_dictionary_fit", move || {
-        fit_sparse_dictionary(x_values.view(), &config)
+    let (fit, dual_cert) = detach_py_result(py, "sparse_dictionary_fit", move || {
+        let fit = fit_sparse_dictionary(x_values.view(), &config)?;
+        // Global-optimality dual certificate, computed inside the same detached
+        // block from the fitted routing so every lane fit emits it.
+        let dual_cert = gam::terms::sae::dual_certificate::sparse_dict_dual_certificate(
+            x_values.view(),
+            &fit,
+            SPARSE_DICT_DUAL_CERT_MAX_BIRTHS,
+        )?;
+        Ok::<_, String>((fit, dual_cert))
     })?;
     let fitted = fit.reconstruct();
     let out = PyDict::new(py);
@@ -4924,6 +4958,7 @@ fn sparse_dictionary_fit<'py>(
         "score_route_stats",
         score_route_stats_dict(py, fit.score_route_stats)?,
     )?;
+    out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual_cert)?)?;
     Ok(out.unbind())
 }
 
@@ -5035,8 +5070,16 @@ fn block_sparse_dictionary_fit<'py>(
         aux_k,
         tolerance,
     };
-    let fit = detach_py_result(py, "block_sparse_dictionary_fit", move || {
-        fit_block_sparse_dictionary(x_values.view(), &config)
+    let (fit, dual_cert) = detach_py_result(py, "block_sparse_dictionary_fit", move || {
+        let fit = fit_block_sparse_dictionary(x_values.view(), &config)?;
+        // Block-lane global-optimality dual certificate (gate of the residual),
+        // computed in the same detached block so every block fit emits it.
+        let dual_cert = gam::terms::sae::dual_certificate::block_dual_certificate(
+            x_values.view(),
+            &fit,
+            SPARSE_DICT_DUAL_CERT_MAX_BIRTHS,
+        )?;
+        Ok::<_, String>((fit, dual_cert))
     })?;
     let fitted = fit.reconstruct();
     let out = PyDict::new(py);
@@ -5053,6 +5096,7 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("converged", fit.converged)?;
     out.set_item("block_topk", fit.block_topk)?;
     out.set_item("block_size", fit.block_size)?;
+    out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual_cert)?)?;
     Ok(out.unbind())
 }
 
