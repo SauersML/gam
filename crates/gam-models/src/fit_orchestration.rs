@@ -168,6 +168,9 @@ mod smooth_significance_ref_df_floor_1766_tests;
 #[cfg(test)]
 mod gaussian_reml_stall_edf_collapse_1788_tests;
 
+#[cfg(test)]
+mod curv_fixed_kappa_2152_tests;
+
 pub use entry::*;
 pub use error::*;
 pub(crate) use fit::*;
