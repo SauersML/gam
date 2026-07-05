@@ -152,7 +152,7 @@ pub(crate) fn load_dataset_projected(
 fn collect_categorical_role_columns(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
     for term in terms {
         match term {
-            ParsedTerm::RandomEffect { name } => {
+            ParsedTerm::RandomEffect { name, .. } => {
                 out.insert(name.clone());
             }
             ParsedTerm::LogSlopeSurface { terms, .. } => {

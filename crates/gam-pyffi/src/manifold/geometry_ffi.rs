@@ -45,6 +45,9 @@ fn sae_select_k(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
+        // This scalar-curve FFI carries no fit-measured coding ingredients; a
+        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
+        measured_coding: None,
     };
     let selected = gam::terms::sae::k_selection::select_k(&curve, &config);
     let out = PyDict::new(py);
@@ -75,6 +78,9 @@ fn sae_auto_k_recommendation(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
+        // This scalar-curve FFI carries no fit-measured coding ingredients; a
+        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
+        measured_coding: None,
     };
     let rec = gam::terms::sae::k_selection::recommend_auto_k(&manifold, &linear, &config);
     let out = PyDict::new(py);

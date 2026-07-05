@@ -96,9 +96,9 @@ mutually exclusive.
 ## Random effects and factor smooths
 
 ```
-y ~ x + group(site)
-y ~ x + re(site)                         # random-intercept alias
-y ~ x + factor(site)                     # random-intercept alias
+y ~ x + group(site)                      # random intercept per level
+y ~ x + re(site)                         # random-intercept alias of group()
+y ~ x + factor(site)                     # FIXED categorical factor (like bare `+ site`)
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -108,8 +108,18 @@ y ~ sz(subject, time)                    # alias for bs="sz"
 y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 ```
 
-Adds a random intercept per level of the grouping column. The column may be
-string- or integer-valued. Random slopes are supported with `s(x, group, bs="re")`, usually paired with `group(group)` for random intercepts.
+`group(g)`/`re(g)`/`s(g, bs="re")` add a random intercept per level of the
+grouping column. The column may be string- or integer-valued. Random slopes are
+supported with `s(x, group, bs="re")`, usually paired with `group(group)` for
+random intercepts. As random effects, they shrink a held-out group toward the
+population mean, so a level seen only at prediction time is tolerated.
+
+`factor(g)`, by contrast, is a **fixed** categorical factor — the same fixed
+main effect as a bare `+ g`, but with categorical encoding forced even when the
+column is numeric (so `factor(year)` treats `year` as levels, not a slope). Like
+any fixed factor, a level that never appeared in training is a schema mismatch:
+`predict` raises and `check()` reports it, rather than silently returning the
+factor's centering point (#2137).
 
 ## Univariate smooths
 

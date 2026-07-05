@@ -1834,9 +1834,10 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
 ///
 /// A factor-smooth design (`fs`/`re` → `FactorSumToZero`/`FactorSmooth`, a
 /// factor `by=` → `ByVariable`/`BySmooth`, or a categorical tensor margin) gates
-/// its per-level blocks on `value.to_bits() == level_bits` against the saved
-/// levels: a column value that is not bit-identical to a frozen level matches no
-/// block. The summary's representative data (axis-spanning midpoints) therefore
+/// its per-level blocks on `canonical_level_bits(value) == level_bits` against
+/// the saved levels: a column value that is not a (signed-zero/NaN-canonical)
+/// match for a frozen level matches no block. The summary's representative data
+/// (axis-spanning midpoints) therefore
 /// fabricates illegal factor values, and rebuilding the factor design on it
 /// fails — which is why `summary().smooth_terms` came back empty for ANY model
 /// containing a factor-smooth, dragging co-fitted `s(x)` rows down with it
@@ -1971,6 +1972,153 @@ fn representative_data_from_ranges(
     data
 }
 
+/// Dense, space-filling reconstruction of the training inputs for the Wald
+/// design-whitening Gram (#2142). Denser than `representative_data_from_ranges`
+/// so a high-basis univariate smooth gets a full-rank Gram, and with each
+/// continuous column swept in an independent coprime order so multivariate
+/// (tensor) margins are not collinear on the diagonal — the shared-ramp
+/// representative grid samples only the diagonal line and would make every
+/// tensor Gram rank-deficient. `rows` is forced to a power of two so every odd
+/// per-column stride is coprime to it and therefore traverses the full
+/// evenly-spaced grid. Categorical columns keep cycling their frozen levels.
+fn whitening_data_from_ranges(
+    ranges: &[(f64, f64)],
+    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
+    rows: usize,
+) -> Array2<f64> {
+    let rows = rows.max(2);
+    let n_cols = ranges.len();
+    let mut data = Array2::<f64>::zeros((rows, n_cols));
+    for (col, &(lo, hi)) in ranges.iter().enumerate() {
+        if let Some(lv) = factor_levels.get(&col) {
+            if !lv.is_empty() {
+                for row in 0..rows {
+                    data[[row, col]] = f64::from_bits(lv[row % lv.len()]);
+                }
+                continue;
+            }
+        }
+        let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        };
+        // Odd stride is coprime to the power-of-two `rows`, so `(row*stride) %
+        // rows` is a full-period permutation of the evenly-spaced grid — a
+        // different one per column, breaking the diagonal collinearity.
+        let stride = 2 * col + 1;
+        for row in 0..rows {
+            let idx = row.wrapping_mul(stride) % rows;
+            let frac = idx as f64 / (rows - 1) as f64;
+            data[[row, col]] = lo + frac * (hi - lo);
+        }
+    }
+    data
+}
+
+/// Reconstruct the design-whitening Gram `X'X` for the summary Wald smooth test
+/// from the frozen basis (#2142). The persisted summary path drops the fit's
+/// inference block, so the exact weighted Gram `X'WX` is gone; mgcv itself
+/// whitens the Wood (2013) statistic with the *unweighted* prediction-matrix
+/// Gram, so `X'X` at representative inputs is the intended object (and it
+/// reduces to `X'WX` for the Gaussian identity case). Returns the full `p×p`
+/// Gram in the trained coefficient layout, or `None` when the rebuilt design's
+/// column count does not match the trained coefficient count — a stale/mismatched
+/// spec, in which case the test falls back to the un-whitened raw covariance.
+fn summary_whitening_gram(
+    spec: &gam::terms::smooth::TermCollectionSpec,
+    ranges: &[(f64, f64)],
+    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
+    expected_ncols: usize,
+) -> Option<Array2<f64>> {
+    if expected_ncols == 0 {
+        return None;
+    }
+    let rows = (4 * expected_ncols).max(64).next_power_of_two();
+    let data = whitening_data_from_ranges(ranges, factor_levels, rows);
+    let design = gam::terms::smooth::build_term_collection_design(data.view(), spec).ok()?;
+    let x = design.design.to_dense();
+    if x.ncols() != expected_ncols {
+        return None;
+    }
+    // Lower triangle of `X'X` is the true Gram; the whitening eigendecomposition
+    // reads only that side, so no explicit symmetrization is needed.
+    Some(x.t().dot(&x))
+}
+
+#[cfg(test)]
+mod whitening_gram_tests {
+    //! Direct tests of the #2142 design-whitening-Gram reconstruction grid used
+    //! when a summary is built from an inference-stripped (compact) model. The
+    //! whitening math itself is covered by `gam-terms` `smooth_test` tests; here
+    //! we only verify the reconstruction *inputs* are non-degenerate.
+    use super::whitening_data_from_ranges;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn dense_grid_spans_range_and_breaks_diagonal_collinearity() {
+        let ranges = [(0.0_f64, 1.0_f64), (-2.0, 4.0)];
+        let levels = BTreeMap::new();
+        let data = whitening_data_from_ranges(&ranges, &levels, 64);
+        assert_eq!(data.nrows(), 64);
+        assert_eq!(data.ncols(), 2);
+        // Each continuous column sweeps its full [lo, hi] range.
+        for (c, &(lo, hi)) in ranges.iter().enumerate() {
+            let col = data.column(c);
+            let cmin = col.iter().cloned().fold(f64::INFINITY, f64::min);
+            let cmax = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!((cmin - lo).abs() < 1e-9, "col {c} min {cmin} != {lo}");
+            assert!((cmax - hi).abs() < 1e-9, "col {c} max {cmax} != {hi}");
+        }
+        // The shared-ramp representative grid puts both columns on the same
+        // diagonal (Pearson r == 1), collapsing every tensor Gram. The
+        // independent coprime sweeps must break that: |r| strictly below 1.
+        let c0 = data.column(0);
+        let c1 = data.column(1);
+        let m0 = c0.mean().unwrap();
+        let m1 = c1.mean().unwrap();
+        let (mut cov, mut v0, mut v1) = (0.0, 0.0, 0.0);
+        for i in 0..64 {
+            let (a, b) = (c0[i] - m0, c1[i] - m1);
+            cov += a * b;
+            v0 += a * a;
+            v1 += b * b;
+        }
+        let r = cov / (v0.sqrt() * v1.sqrt());
+        assert!(
+            r.abs() < 0.9,
+            "columns must not be collinear (diagonal grid), got r={r}"
+        );
+    }
+
+    #[test]
+    fn categorical_columns_cycle_every_frozen_level() {
+        let ranges = [(0.0_f64, 1.0_f64), (0.0, 0.0)];
+        let mut levels = BTreeMap::new();
+        let lv = vec![
+            1.0_f64.to_bits(),
+            2.0_f64.to_bits(),
+            3.0_f64.to_bits(),
+        ];
+        levels.insert(1usize, lv.clone());
+        let data = whitening_data_from_ranges(&ranges, &levels, 64);
+        let allowed: Vec<f64> = lv.iter().map(|&b| f64::from_bits(b)).collect();
+        for i in 0..64 {
+            let v = data[[i, 1]];
+            assert!(
+                allowed.iter().any(|&a| a == v),
+                "row {i} value {v} is not a frozen level"
+            );
+        }
+        for &a in &allowed {
+            assert!(
+                (0..64).any(|i| data[[i, 1]] == a),
+                "frozen level {a} never appears"
+            );
+        }
+    }
+}
+
 /// Build the mgcv-style per-smooth significance table for the FFI summary.
 ///
 /// Mirrors `main.rs::build_model_summary`'s smooth-term loop: random-effect
@@ -2016,9 +2164,31 @@ fn summary_smooth_terms(
         return Vec::new();
     };
 
+    // The Wald smooth test uses the CONDITIONAL Bayesian covariance
+    // `Vb = H⁻¹·φ̂` (mgcv's `Vp`, the covariance mgcv's `testStat` whitens by
+    // default), NOT the smoothing-parameter-corrected `Vc`. `Vc` adds the λ̂
+    // uncertainty `(∂β/∂ρ)·Cov(ρ)·(∂β/∂ρ)ᵀ`, whose variance concentrates in the
+    // wiggle directions (those are the ones λ controls). For a heavily-smoothed,
+    // near-linear term that inflation can exceed the linear direction's variance
+    // and flip the whitened eigenvalue ordering, so the rank-`round(edf)`
+    // truncation keeps a wiggle mode where β̂≈0 and reports the term
+    // non-significant even though its linear effect is real (#2142). The
+    // conditional covariance is the correct hypothesis-test object; `Vc` is for
+    // prediction/credible bands.
     let cov_forwald = fit
-        .beta_covariance_corrected()
-        .or_else(|| fit.beta_covariance());
+        .beta_covariance()
+        .or_else(|| fit.beta_covariance_corrected());
+    // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
+    // Prefer the fit's exact weighted Gram `X'WX` when the inference block
+    // survived; on the persisted summary path (inference dropped) reconstruct
+    // the unweighted `X'X` from the frozen basis. `None` → un-whitened fallback.
+    let reconstructed_gram = if fit.weighted_gram().is_none() {
+        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols())
+    } else {
+        None
+    };
+    let whitening_gram_full: Option<&Array2<f64>> =
+        fit.weighted_gram().or(reconstructed_gram.as_ref());
     let family = model.likelihood();
     let scale_is_estimated = matches!(
         family.response,
@@ -2126,6 +2296,12 @@ fn summary_smooth_terms(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
+                    // Wood (2013) design-whitening Gram in the original
+                    // coefficient basis (#2142): exact `X'WX` when available, else
+                    // the frozen-basis `X'X` reconstruction. Without it the
+                    // rank-r truncation keeps the wrong eigen-subspace and a
+                    // dominant wiggly smooth reads as non-significant.
+                    whitening_gram: whitening_gram_full,
                     coeff_range: global_range.clone(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),

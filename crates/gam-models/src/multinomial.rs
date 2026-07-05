@@ -1632,6 +1632,7 @@ impl MultinomialSavedModel {
                         beta: theta.view(),
                         covariance: &cov,
                         influence_matrix: influence.as_ref(),
+                        whitening_gram: None,
                         coeff_range: start..end,
                         edf,
                         nullspace_dim: span.nullspace_dim,

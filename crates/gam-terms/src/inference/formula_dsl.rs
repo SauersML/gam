@@ -1258,6 +1258,17 @@ pub enum ParsedTerm {
     },
     RandomEffect {
         name: String,
+        /// Unseen-level policy, fixed at parse time by the wrapper the user
+        /// wrote. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine **random
+        /// effects**: a held-out group is shrunk to the population mean, so an
+        /// unseen level at predict is tolerated (`true`). `factor(g)` is a
+        /// **fixed** categorical factor (R `factor()` / patsy `C()`
+        /// convention): like a bare `+ g` categorical main effect, an unseen
+        /// level is a schema mismatch that must raise rather than collapse onto
+        /// the factor's centering point (`false`, #2137/#2102). Both wrappers
+        /// share the penalized-categorical materialization; only this policy
+        /// distinguishes them, so seen-level fits are identical.
+        lenient_unseen: bool,
     },
     Smooth {
         label: String,
@@ -1309,7 +1320,7 @@ pub fn parsed_term_column_names(
         match term {
             ParsedTerm::Linear { name, .. }
             | ParsedTerm::BoundedLinear { name, .. }
-            | ParsedTerm::RandomEffect { name } => {
+            | ParsedTerm::RandomEffect { name, .. } => {
                 out.insert(name.clone());
             }
             ParsedTerm::Smooth { vars, options, .. } => {
@@ -1337,7 +1348,7 @@ pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) ->
     terms.iter().any(|term| match term {
         ParsedTerm::Linear { name, .. }
         | ParsedTerm::BoundedLinear { name, .. }
-        | ParsedTerm::RandomEffect { name } => name == column_name,
+        | ParsedTerm::RandomEffect { name, .. } => name == column_name,
         ParsedTerm::Smooth { vars, options, .. } => {
             vars.iter().any(|var| var == column_name)
                 || options.get("by").is_some_and(|by| by == column_name)
@@ -2555,8 +2566,17 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
+                // `factor(g)` is a FIXED categorical factor (R `factor()` /
+                // patsy `C()`): it forces categorical encoding of the column
+                // but, like a bare `+ g` main effect, is strict on unseen
+                // levels. `group(g)`/`re(g)` are genuine random effects that
+                // shrink a held-out group to the population mean, so they
+                // tolerate unseen levels. Both share the penalized-categorical
+                // block; only the unseen policy differs (#2137/#2102).
+                let lenient_unseen = name != "factor";
                 return Ok(ParsedTerm::RandomEffect {
                     name: vars[0].clone(),
+                    lenient_unseen,
                 });
             }
             "tensor" | "interaction" | "te" => {
@@ -2661,8 +2681,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     .as_deref()
                     == Some("re");
                 if bs_is_re && vars.len() == 1 {
+                    // `s(g, bs="re")` is a genuine random effect: lenient on
+                    // unseen levels (held-out group → population mean).
                     return Ok(ParsedTerm::RandomEffect {
                         name: vars[0].clone(),
+                        lenient_unseen: true,
                     });
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {

@@ -50,6 +50,48 @@ fn sort_levels_canonical(levels: &mut [String]) {
     levels.sort_by(|a, b| natural_level_cmp(a, b));
 }
 
+/// Canonical bit key for a floating-point categorical / grouping level.
+///
+/// Factor dummies, random-effect groups, `by=` gates and factor-smooth blocks
+/// all identify a level by the raw bits of its numeric code — they intern the
+/// observed codes with `f64::to_bits()` and, at fit/predict time, gate each row
+/// by `data_bits == level_bits`. Raw `to_bits()` is a **bit** identity, not the
+/// **numeric** equality IEEE-754 defines, and the two disagree in exactly two
+/// places:
+///
+/// * **Signed zero.** `+0.0` is `0x0000_0000_0000_0000` and `-0.0` is
+///   `0x8000_0000_0000_0000`, yet IEEE-754 guarantees `+0.0 == -0.0`. Keying on
+///   raw bits splits one physical group into two: a row whose code is `-0.0`
+///   matches no `+0.0` dummy, so its factor / random effect silently drops and
+///   the prediction collapses onto the intercept / population mean. Signed zero
+///   arises routinely from ordinary float arithmetic on a computed group column
+///   (`-1.0 * 0.0`, a centred/differenced column landing on `-0.0`, `np.round`
+///   emitting `-0.0`), and the miss is silent — no schema error, `check()` still
+///   reports `ok=True`. See #2145 (random effect) and #2146 (factor dummy).
+/// * **NaN.** Every quiet/signalling NaN payload and sign bit denotes "not a
+///   number", so `2^53`-ish distinct bit patterns would otherwise intern as
+///   distinct levels. (NaN group codes are rejected upstream on most paths, but
+///   canonicalising here keeps the key numerically honest regardless.)
+///
+/// This maps both encodings to a single canonical key while leaving every
+/// ordinary finite value bit-stable, so that
+/// `canonical_level_bits(a) == canonical_level_bits(b)` iff `a` and `b` name the
+/// same real-valued level. Interning and lookup must **both** route through this
+/// function; because it is idempotent, applying it to an already-canonical
+/// frozen level set is a no-op.
+#[inline]
+pub fn canonical_level_bits(v: f64) -> u64 {
+    if v == 0.0 {
+        // Matches both +0.0 and -0.0 (IEEE-754: -0.0 == 0.0); collapse to +0.0.
+        0.0_f64.to_bits()
+    } else if v.is_nan() {
+        // Collapse every NaN payload/sign to one canonical quiet-NaN key.
+        f64::NAN.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed error
 // ---------------------------------------------------------------------------
@@ -2759,5 +2801,60 @@ mod tests {
         let all = vec!["p".to_string(), "q".to_string()];
         let selected = projected_headers(&all, &[0, 1]);
         assert_eq!(selected, all);
+    }
+
+    #[test]
+    fn canonical_level_bits_collapses_signed_zero() {
+        // The whole point of the helper: +0.0 and -0.0 name the same real
+        // number (IEEE-754: 0.0 == -0.0) and MUST map to the same key, even
+        // though their raw bit patterns differ (#2145 / #2146).
+        let pos = 0.0_f64;
+        let neg = -0.0_f64;
+        assert_ne!(pos.to_bits(), neg.to_bits(), "precondition: raw bits differ");
+        assert_eq!(pos, neg, "precondition: numerically equal");
+        assert_eq!(canonical_level_bits(pos), canonical_level_bits(neg));
+        assert_eq!(canonical_level_bits(neg), 0.0_f64.to_bits());
+        // -0.0 reached via ordinary arithmetic is handled the same way.
+        assert_eq!(canonical_level_bits(-1.0 * 0.0), 0.0_f64.to_bits());
+        assert_eq!(canonical_level_bits(0.0 - 0.0), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn canonical_level_bits_is_bit_stable_on_ordinary_values() {
+        // Every ordinary finite value keeps its raw key — the helper must not
+        // perturb the identity of any genuine level.
+        for &v in &[1.0_f64, -1.0, 2.5, -3.75, 1e300, -1e-300, f64::MIN, f64::MAX] {
+            assert_eq!(canonical_level_bits(v), v.to_bits(), "value {v}");
+        }
+        // Distinct real values keep distinct keys.
+        assert_ne!(canonical_level_bits(1.0), canonical_level_bits(2.0));
+        assert_ne!(canonical_level_bits(0.0), canonical_level_bits(1.0));
+        // Signed infinities are distinct (they are distinct real limits).
+        assert_ne!(
+            canonical_level_bits(f64::INFINITY),
+            canonical_level_bits(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn canonical_level_bits_collapses_nan_payloads() {
+        // Every NaN encoding denotes "not a number"; they collapse to one key.
+        let a = f64::NAN;
+        let b = f64::from_bits(0x7ff8_0000_0000_0001); // a different NaN payload
+        let c = -f64::NAN; // sign-bit-set NaN
+        assert!(a.is_nan() && b.is_nan() && c.is_nan());
+        assert_eq!(canonical_level_bits(a), canonical_level_bits(b));
+        assert_eq!(canonical_level_bits(a), canonical_level_bits(c));
+    }
+
+    #[test]
+    fn canonical_level_bits_is_idempotent() {
+        // Re-canonicalizing an already-canonical key is a no-op — the property
+        // the frozen-level resolution paths rely on.
+        for &v in &[0.0_f64, -0.0, 1.0, -2.0, f64::NAN] {
+            let once = canonical_level_bits(v);
+            let twice = canonical_level_bits(f64::from_bits(once));
+            assert_eq!(once, twice, "value {v}");
+        }
     }
 }

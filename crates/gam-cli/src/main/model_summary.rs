@@ -20,7 +20,26 @@ pub(crate) fn build_model_summary(
     let se = fit
         .beta_standard_errors_corrected()
         .or(fit.beta_standard_errors());
-    let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
+    // Conditional Bayesian covariance `Vb = H⁻¹·φ̂` (mgcv's `Vp`) for the Wald
+    // smooth test — NOT the smoothing-corrected `Vc`, whose λ̂-uncertainty
+    // inflates the wiggle directions and flips the whitened eigenvalue ordering
+    // for near-linear terms (#2142). `Vc` is for prediction/credible bands.
+    let cov_forwald = fit.beta_covariance().or(fit.beta_covariance_corrected());
+    // Wood (2013) design-whitening metric for the Wald smooth test (#2142):
+    // the exact weighted Gram `X'WX` when the inference block is present, else
+    // the unweighted `X'X` from the summary design (here the real training
+    // design, so this is exact — mgcv whitens with the unweighted prediction
+    // Gram anyway). `None` → the test falls back to the raw covariance.
+    // Materialize `X'X` only when the exact `X'WX` is unavailable — `to_dense()`
+    // on a large training design would otherwise be a needless O(n·p) copy.
+    let design_gram = if fit.weighted_gram().is_none() {
+        let x = design.design.to_dense();
+        (x.ncols() == fit.beta.len()).then(|| x.t().dot(&x))
+    } else {
+        None
+    };
+    let whitening_gram_full: Option<&Array2<f64>> =
+        fit.weighted_gram().or(design_gram.as_ref());
     let scale_is_estimated = matches!(
         family.response,
         ResponseFamily::Gaussian | ResponseFamily::Gamma
@@ -269,6 +288,12 @@ pub(crate) fn build_model_summary(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
+                    // Wood (2013) design-whitening Gram in the original
+                    // coefficient basis (#2142): exact `X'WX` or the design
+                    // `X'X`. Without it the rank-r cut keeps the wrong
+                    // eigen-subspace and a dominant wiggly smooth reads as
+                    // non-significant.
+                    whitening_gram: whitening_gram_full,
                     coeff_range: global_range.clone(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),

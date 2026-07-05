@@ -23,7 +23,7 @@ fn random_effect_name(formula: &str) -> String {
         .terms
         .into_iter()
         .find_map(|term| match term {
-            ParsedTerm::RandomEffect { name } => Some(name),
+            ParsedTerm::RandomEffect { name, .. } => Some(name),
             _ => None,
         })
         .unwrap_or_else(|| panic!("{formula} did not parse to a RandomEffect"))
