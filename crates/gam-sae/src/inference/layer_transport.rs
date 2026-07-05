@@ -93,6 +93,27 @@ const DEGREE_CANDIDATES: [i32; 5] = [-2, -1, 0, 1, 2];
 const FOLD_CHECK_GRID: usize = 512;
 /// Default evaluation grid for the composition-law defect.
 pub const DEFAULT_COMPOSITION_GRID: usize = 256;
+/// Absolute floor on the composition-defect studentization variance, expressed
+/// as a fraction of the target chart's coordinate span (`std = span · this`).
+///
+/// The delta-method band variance the defect is studentized against is a pure
+/// SAMPLING variance and collapses toward zero as the adjacent REML transports
+/// approach noiselessness (`σ̂² → 0`). But composing two penalized-spline chart
+/// maps is not closed in a single finite basis, so even a perfectly composable
+/// chain carries an irreducible composition defect at the spline-representation
+/// scale (empirically `~1e-5` of the coordinate span) — a bias the sampling
+/// variance does not model. Without an absolute floor, studentizing that
+/// machine-level defect against a collapsed sampling variance inflates it into a
+/// spurious "law violated" verdict and even inverts the test: a smaller, more
+/// composable defect on cleaner data is judged MORE significant (#2143).
+///
+/// Set an order of magnitude above the representation defect so a machine-level
+/// defect reads as non-significant, and far below any realistic composition-law
+/// violation or genuine sampling scale, so the floor never binds when a real
+/// defect or real noise is present — restoring type-I control at no cost to
+/// power. It is scale-aware (tied to the coordinate span), matching the
+/// scale-aware tolerance convention used elsewhere in this module.
+const COMPOSITION_DEFECT_REL_VAR_FLOOR: f64 = 1e-4;
 /// REML λ-profile: log-spaced grid points then golden-section refinement.
 const REML_LAMBDA_GRID_POINTS: usize = 41;
 const REML_GOLDEN_ITERATIONS: usize = 40;
@@ -1434,8 +1455,25 @@ pub fn composition_defect(
     }
 
     // --- pointwise studentization against the composed bands ----------------
+    // Floor the band variance with BOTH a relative component (numerical guard
+    // against exact zeros) AND an absolute, coordinate-scale component. The
+    // absolute component is the fix for #2143: the delta-method band variance is
+    // a pure sampling variance that collapses on near-noiseless REML fits, so
+    // without it the irreducible spline-representation defect (which the sampling
+    // variance does not model) is studentized into a spurious rejection. The
+    // absolute floor is the squared representation tolerance relative to the
+    // target chart's coordinate span, so a machine-level composition defect on a
+    // clean chain reads as non-significant while a genuine violation (far larger
+    // defect, or real sampling variance well above the floor) is unaffected.
+    let coord_scale = match h_ac.topology_to {
+        ChartTopology::Circle => TAU,
+        ChartTopology::Interval { lo, hi } => (hi - lo).abs(),
+    };
+    let repr_var_floor = (coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR).powi(2);
     let max_var = variance.iter().copied().fold(0.0_f64, f64::max);
-    let var_floor = (max_var * 1e-10).max(f64::MIN_POSITIVE);
+    let var_floor = (max_var * 1e-10)
+        .max(repr_var_floor)
+        .max(f64::MIN_POSITIVE);
     let mut max_abs = 0.0_f64;
     let mut sum_abs = 0.0_f64;
     let mut sum_sq = 0.0_f64;
@@ -1948,5 +1986,31 @@ mod invert_tests {
         let crit = monomial_critical_points(&recon);
         assert_eq!(crit.len(), 1);
         assert!((crit[0] - 1.3 / 4.2).abs() < 1e-12);
+    }
+
+    /// The #2143 composition-defect variance floor must be calibrated: its
+    /// standard deviation must sit ABOVE the irreducible spline-representation
+    /// defect (empirically ~1e-5 of the coordinate span) so a machine-level
+    /// defect on a near-noiseless chain reads as non-significant, yet FAR BELOW
+    /// a genuine composition-law violation (~1e-2 of the span and up) so it never
+    /// masks a real defect. This is the analytic guard on the constant behind
+    /// the runtime behaviour tested end-to-end in the Python bug-hunt.
+    #[test]
+    fn composition_defect_var_floor_is_calibrated() {
+        for coord_scale in [std::f64::consts::TAU, 1.0_f64, (5.0 - (-3.0)).abs()] {
+            let floor_std = coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR;
+            let repr_defect = coord_scale * 1e-5; // spline-representation scale
+            let violation_defect = coord_scale * 1e-2; // a real law violation
+            assert!(
+                floor_std > 3.0 * repr_defect,
+                "floor std {floor_std:.3e} does not clear the representation \
+                 defect {repr_defect:.3e} (span {coord_scale})"
+            );
+            assert!(
+                floor_std < 0.1 * violation_defect,
+                "floor std {floor_std:.3e} is too close to a real violation \
+                 {violation_defect:.3e} (span {coord_scale}) — would cost power"
+            );
+        }
     }
 }
