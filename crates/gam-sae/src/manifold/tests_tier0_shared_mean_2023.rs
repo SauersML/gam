@@ -158,15 +158,25 @@ mod tests {
             manifolds.push(LatentManifold::Circle { period: 1.0 });
         }
 
-        // Independent (IBP-MAP) gates with the same saturating logits the
-        // rank-charge fixture uses ⇒ every atom fires ~1 and each gate is a function
-        // of its own logit alone (no softmax re-normalisation across the merged K).
+        // Independent hard-sigmoid (ThresholdGate) gates with saturating logits ⇒
+        // every atom fires ~1 (σ((3−0)/0.7) ≈ 0.986) and each gate is a function of
+        // its OWN logit alone — no cross-atom coupling. This is deliberately NOT
+        // IBP-MAP here: IBP-MAP multiplies each gate by the ordered stick-breaking
+        // prior mean `π_k = (α/(α+1))^{k+1}` (α=1 ⇒ 0.5^{k+1}), which decays
+        // GEOMETRICALLY in the atom INDEX — so the six circles would fire at
+        // 0.49, 0.25, …, 0.015 and the late circles would carry near-zero
+        // reconstruction mass, making their leave-one-out ΔEV vanishingly small and
+        // fragile (the survival gate `ΔEV > 0` lands in f64 noise and flips
+        // negative). The DC-zombie property this test asserts is about Tier-0 vs the
+        // raw mean, NOT about the assignment prior, so a uniform gate where "every
+        // atom fires ~1" actually holds is the honest fixture: each circle then earns
+        // a solid, index-independent ΔEV ≈ 0.16 in both modes.
         let logits = Array2::<f64>::from_elem((N, NCIRC + 1), 3.0);
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits,
             coord_blocks,
             manifolds,
-            AssignmentMode::ibp_map(0.7, 1.0, false),
+            AssignmentMode::threshold_gate(0.7, 0.0),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
