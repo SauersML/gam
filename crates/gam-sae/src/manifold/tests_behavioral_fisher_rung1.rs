@@ -237,20 +237,34 @@ fn behavioral_fisher_anisotropic_moves_only_the_reconstruction() {
     );
     assert!(loss_gls.data_fit.is_finite());
 
-    // Assembled gradient moved: the reconstruction Jacobian is now weighted by
-    // the anisotropic G_n, so at least one β-tier gradient entry shifts far above
-    // floating-point noise (the total energy alone can be misleading — a rank-s
-    // metric inflates some directions while shrinking others). Entrywise max
-    // relative change is the robust signal that the metric reaches the assembly.
-    let max_gb_rel = sys_gls
+    // Assembled RECONSTRUCTION gradient moved: the reconstruction Jacobian is now
+    // weighted by the anisotropic G_n. The right quantity to inspect is the
+    // reconstruction (data-fit) β-gradient in isolation, exactly what
+    // "moves_only_the_reconstruction" claims to measure — NOT the raw `gb`, whose
+    // entries are dominated by the metric-INDEPENDENT collapse-prevention
+    // separation barrier. That barrier is decoder-subspace geometry (not the
+    // output metric), and it fires hard here because `build_term`'s decoders all
+    // occupy the same 2-D output subspace (every decoder row ∈ span{1, c}), so
+    // its `−log(1 − subspace_overlap + ε)` force is O(1e5) — legitimately
+    // masking the O(0.1) reconstruction-gradient shift in a raw relative compare.
+    //
+    // The barrier (and the decoder smoothness / repulsion) are BYTE-IDENTICAL
+    // between the GLS and MSE assemblies — they depend only on the shared
+    // decoders / routing, not on the output metric — so they CANCEL EXACTLY in
+    // the difference `gb_gls − gb_iid`, leaving only the metric-weighted
+    // reconstruction gradient change. Its per-entry magnitude (O(0.1–1)) sits far
+    // above f64 assembly noise (~1e-10 at this `gb` scale), so a small absolute
+    // floor is a clean, robust detector that the metric reaches the β-tier.
+    let max_recon_grad_shift = sys_gls
         .gb
         .iter()
         .zip(sys_iid.gb.iter())
-        .map(|(a, b)| (a - b).abs() / (1.0 + b.abs()))
+        .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
     assert!(
-        max_gb_rel > 1e-3,
-        "GLS β-tier gradient must differ materially from MSE; max rel change {max_gb_rel:e}"
+        max_recon_grad_shift > 1e-3,
+        "anisotropic GLS must move the reconstruction β-gradient materially; \
+         max |Δgb| = {max_recon_grad_shift:e}"
     );
 
     // Metric-independent penalties are byte-identical: the metric touches only
