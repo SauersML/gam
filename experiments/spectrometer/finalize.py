@@ -73,7 +73,7 @@ def main():
     print("| condition | R=0 | R=1 | R=2 | R=16 | R=64 |")
     print("|---|---|---|---|---|---|")
     for r in rows:
-        s = r["strata"]
+        s = dict(r["strata"]); s[0] = r["d_full"]      # R=0 == global full-ladder d̂
         cells = " | ".join(f"{s.get(R, float('nan')):.1f}" if R in s else "—"
                            for R in (0, 1, 2, 16, 64))
         print(f"| {r['label']} | {cells} |")

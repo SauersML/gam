@@ -79,12 +79,62 @@ Global k-lines loss over the ladder (mean‖x‖² = 2133.8):
   model has an intrinsic dimension in the **high tens** at the scales where the
   estimator is trustworthy, not the ~15 the naive full-ladder fit reports.
 
-## Headline results
-_(filled in when MSI jobs 12575326 / 12575327 complete; outputs land in
-`q36b_L17/` and `q8b_L18/` on MSI and are pulled back small.)_
+## Headline results — depth-resolved dimension spectrum (N=80k, K≤4096)
 
-### Qwen3.6-35B-A3B, layer 17 (N=150k) — global d̂, mixture, PCA strata
-### Qwen3-8B, layer 18 (N=150k) — global d̂, mixture, PCA strata
-### Figures
-- `fig_global_q36b_L17.png`, `fig_pca_strata_q36b_L17.png`
-- `fig_global_q8b_L18.png`, `fig_pca_strata_q8b_L18.png`
+Final runs used N=80,000 tokens and a ladder capped at K=4096 (so tokens-per-atom
+N/K ≥ 19 at every rung — the finite-N overfitting transient is gone) and the fast
+scipy-sparse MOD refresh. Each layer's column mean is computed from its own full
+matrix. MSI jobs 12576897 (L6), 12576898 (L18), 12576899 (L30), 12576900 (L17).
+
+### The headline finding: raw d̂ is confounded by massive-activation channels; peel them
+
+The single most important result is that **the raw (R=0) global d̂ is meaningless
+wherever a massive-activation channel dominates the residual stream**, and the
+PCA-stratified peel recovers the real intrinsic dimension:
+
+| condition | top-1 var frac | raw R=0 d̂ | **post-peel d̂ (R=1 / R=16)** |
+|---|---|---|---|
+| Qwen3-8B L18 (mid) | 0.958 | **3.8 (confounded)** | **26.2 / 28.7** |
+| Qwen3-8B L30 (late) | 0.812 | 22.8 | 23.5 / 24.7 |
+| Qwen3.6-35B-A3B L17 | 0.025 (isotropic) | 19.9 | 20.0 / 20.9 |
+
+L18's raw d̂=3.8 is the estimator locking onto the one massive channel (96% of
+variance); a single atom captures it, so the covering law sees a ~1-D spike. Once
+that direction is projected out (R≥1) the true manifold reveals **d̂ ≈ 26–29**.
+Where the stream is already isotropic (35B L17, top-var 2.5%) peeling barely moves
+d̂ (20.0→20.9) — the confound is real only when a massive channel exists. This is
+why the stratified peel is the load-bearing measurement.
+
+### De-confounded intrinsic dimension per layer/model
+- **Qwen3.6-35B-A3B L17** (d_model 2048, isotropic): d̂ ≈ **20–23** (single-power
+  d=20.9, σ²=1.94; R=1..64 → 20.0, 20.0, 20.9, 23.2). Trustworthy as-is.
+- **Qwen3-8B L18** (mid-stack, massive channel): true d̂ ≈ **26–29** post-peel
+  (R=1..64 → 26.2, 26.4, 28.7, 32.8). Raw 3.8 is an artifact.
+- **Qwen3-8B L30** (late, mild channel): d̂ ≈ **23–26** (R=1..64 → 23.5, 23.7,
+  24.7, 26.2).
+- **Qwen3-8B L6** (early): _pending L6 job completion — slotted here._
+
+d̂ rises monotonically as more PCs are peeled (R↑): removing the most-captured,
+lowest-dimension variance leaves a higher-dimensional residual — expected, and it
+means these numbers are lower bounds on the fine-scale dimension.
+
+### Cross-check vs. the pre-existing PCA analysis (spectrum_analysis.json)
+That file reports *linear* effective rank after removing the top rogue directions:
+L18 eff_rank ≈ 895, L30 ≈ 1375 (top-3 removed). Our spectrometer measures the
+*nonlinear manifold* dimension via the covering law and lands ~1.5 orders of
+magnitude lower (d̂ ~ 20–30). The gap is the substance: the residual stream spans
+a high-rank linear subspace but the token cloud concentrates on a ~20–30-dim
+nonlinear manifold within it.
+
+### On the "strata d̂ = None" report
+The completed N=80k runs populate every stratum with valid d̂ (verified in each
+`results_*.json`). The None values came from earlier runs that never reached the
+`json.dump` — the 40k pilot crashed in the floor/mixture fit (singular normal
+matrix, since hardened with a ridged Levenberg step) and the first N=150k jobs
+were cancelled mid-stratification for being too slow (pre-scipy). No live code
+path emits None for a completed run.
+
+### Figures (per condition, pulled from MSI)
+- `fig_global_<cond>.png` — loss curve, single-power fit, excess-loss slope.
+- `fig_pca_strata_<cond>.png` — stratified excess-loss + d̂ vs. peeled R.
+- `fig_depth_trend.png` — Qwen3-8B intrinsic d̂ vs. layer (L6/L18/L30).
