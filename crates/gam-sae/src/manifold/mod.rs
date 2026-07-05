@@ -6,6 +6,45 @@
 //! Z_i ~= sum_k a_ik g_k(t_ik),     g_k(t) = Phi_k(t) B_k
 //! ```
 //!
+//! # Superposed Geometry (what this machinery is)
+//!
+//! Thesis: **superposition ambiguity is a flatness disease, and curvature is the
+//! cure.** A dictionary of flat co-firing directions is generically
+//! non-identifiable — any `GL(d)` recombination of a co-active linear subspace
+//! reconstructs identically — whereas curved atoms are generically rigid (jet
+//! transversality: second-order osculation of two generic embeddings is
+//! infinite-codimension), so their gauge groupoid collapses to
+//! `Diff(M) x Sym(F)`. Circles are the optimizer's equilibrium response to
+//! superposition, not curiosities. Four faces of the same moduli-geometric object:
+//!
+//! * **Curvature is identifiability.** Realized-rank / Marchenko-Pastur per atom
+//!   is an *empirical Terracini certificate* (border-block Jacobian rank =
+//!   `sum_k (d_k+1)`); the `rank_eff==0` veto is the degenerate-tangent exclusion
+//!   (and the null atom's RLCT `1/2`). A *centered* circle's cone is the plane, so
+//!   it is measure-level identifiable only through its radial law — the `(kappa-2)^2`
+//!   ISA producer (support vs measure are complementary halves). Grounding in
+//!   [`crate::identifiability`], [`isa_seed`], [`crate::structure_harvest`].
+//! * **Persistence is bits.** Log-persistence is an evidence exchange rate — one
+//!   nat of log-barcode-length per active row buys one nat per unit codimension;
+//!   the RD gain is *activation-space* bits, orthogonal to behavioral nats.
+//!   Grounding in [`crate::description_length`], [`persistence`].
+//! * **Binding is transport.** Layers act through a transport groupoid; linear
+//!   transport of an elliptical atom is forced to be a phase shift `+-theta+phi`;
+//!   the residual gauge obstruction is the atom's linear stabilizer.
+//!   Grounding in [`chart_canonicalization`], [`certificate`].
+//! * **Symmetry is charge.** The rank charge is a running complexity
+//!   `lambda(n) = d(-log Z)/d(log n)`; hard rank, the WBIC soft count, and the
+//!   RLCT are three regimes of one object, scaled by the atom's occupancy
+//!   `n_eff`. Grounding in [`construction`], [`wbic_audit`].
+//!
+//! Learnability trichotomy: structure resolves in the strict order existence ->
+//! dimension -> topology, and *fidelity cannot buy topology, only occupancy can*
+//! (why topology labels are the weakest, last-to-converge signal). The identifiability
+//! theorem (uniqueness at `sum_k (d_k+1) <= p-1`) is proven for the complex secant
+//! calculus and empirically holds for real d=1/d=2 atoms; the completeness of the
+//! frame for trained networks is a conjecture. Each mechanism below carries the
+//! matching one-line grounding comment at its definition.
+//!
 //! Tier assignment:
 //!
 //! * beta: [`SaeManifoldAtom::decoder_coefficients`] (`B_k`, one block per atom).
