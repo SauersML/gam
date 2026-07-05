@@ -2163,9 +2163,20 @@ fn summary_smooth_terms(
         return Vec::new();
     };
 
+    // The Wald smooth test uses the CONDITIONAL Bayesian covariance
+    // `Vb = H⁻¹·φ̂` (mgcv's `Vp`, the covariance mgcv's `testStat` whitens by
+    // default), NOT the smoothing-parameter-corrected `Vc`. `Vc` adds the λ̂
+    // uncertainty `(∂β/∂ρ)·Cov(ρ)·(∂β/∂ρ)ᵀ`, whose variance concentrates in the
+    // wiggle directions (those are the ones λ controls). For a heavily-smoothed,
+    // near-linear term that inflation can exceed the linear direction's variance
+    // and flip the whitened eigenvalue ordering, so the rank-`round(edf)`
+    // truncation keeps a wiggle mode where β̂≈0 and reports the term
+    // non-significant even though its linear effect is real (#2142). The
+    // conditional covariance is the correct hypothesis-test object; `Vc` is for
+    // prediction/credible bands.
     let cov_forwald = fit
-        .beta_covariance_corrected()
-        .or_else(|| fit.beta_covariance());
+        .beta_covariance()
+        .or_else(|| fit.beta_covariance_corrected());
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
     // Prefer the fit's exact weighted Gram `X'WX` when the inference block
     // survived; on the persisted summary path (inference dropped) reconstruct

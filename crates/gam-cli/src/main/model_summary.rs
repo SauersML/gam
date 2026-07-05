@@ -20,7 +20,11 @@ pub(crate) fn build_model_summary(
     let se = fit
         .beta_standard_errors_corrected()
         .or(fit.beta_standard_errors());
-    let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
+    // Conditional Bayesian covariance `Vb = H⁻¹·φ̂` (mgcv's `Vp`) for the Wald
+    // smooth test — NOT the smoothing-corrected `Vc`, whose λ̂-uncertainty
+    // inflates the wiggle directions and flips the whitened eigenvalue ordering
+    // for near-linear terms (#2142). `Vc` is for prediction/credible bands.
+    let cov_forwald = fit.beta_covariance().or(fit.beta_covariance_corrected());
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142):
     // the exact weighted Gram `X'WX` when the inference block is present, else
     // the unweighted `X'X` from the summary design (here the real training
