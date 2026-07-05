@@ -297,16 +297,13 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
         (3usize, 1usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
     ];
     for (row, local_pos, var) in probes {
-        // 4th-order 5-point central stencil for the fixed-state `∂log|H|/∂θ`
-        // numerical oracle. The 2-point stencil's O(h²) truncation on this
-        // stiff tiny fixture lands within a small factor of the 2e-3 tolerance,
-        // so the analytic-vs-FD margin was environment-sensitive (the converged
-        // state differs by BLAS/threading, shifting the truncation term across
-        // the tolerance). `[-f₂ + 8f₁ - 8f₋₁ + f₋₂]/(12h)` cuts truncation to
-        // O(h⁴), giving a state-independent margin — a better numerical oracle,
-        // not a weakened tolerance.
-        // Capture the perturbation target as primitives so the multi-call stencil
-        // closure needs no Copy bound on `var`.
+        // Fixed-state central-difference `∂log|H|/∂θ` numerical oracle. NB: the
+        // softmax entropy curvature written into `htt` is the Gershgorin
+        // `|·|`-majorizer `D = diag(Σ_j|H_kj|)`, whose logit-derivative is
+        // PIECEWISE (the `sign(H_kj)` flips where a `H_kj` crosses zero). A
+        // *higher-order* stencil is therefore counterproductive — sampling at
+        // `±2h` straddles a majorizer kink more often than `±h` — so keep the
+        // 2-point difference (narrowest stencil) here.
         let (logit_atom, coord_atom, coord_axis) = match var {
             SaeLocalRowVar::Logit { atom } => (Some(atom), None, 0usize),
             SaeLocalRowVar::Coord { atom, axis } => (None, Some(atom), axis),
@@ -323,7 +320,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
             }
             fixed_state_logdet(t, &target, &rho)
         };
-        let fd = (-at(2.0 * h) + 8.0 * at(h) - 8.0 * at(-h) + at(-2.0 * h)) / (12.0 * h);
+        let fd = (at(h) - at(-h)) / (2.0 * h);
         let analytic = gamma.t[cache.row_offsets[row] + local_pos];
         let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
         assert!(
