@@ -46,6 +46,39 @@
 //! X" line reads straight off [`gam_problem::RowMetric::provenance`]
 //! ([`gam_problem::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
+//!
+//! # This module IS the empirical Terracini certificate (Theorem A)
+//!
+//! Read structurally, `residual_gauge` is doing exactly what Terracini's
+//! theorem does for a join/secant variety: at a generic point of a join of
+//! manifolds `M_1, …, M_K`, the tangent space to the join is the (direct) sum
+//! of the individual tangent spaces `T M_1 ⊕ … ⊕ T M_K`, of dimension
+//! `Σ_k dim T M_k = Σ_k (d_k + 1)` counting the scale/translation directions
+//! each summand contributes. Here each atom's enumerated symmetry generators
+//! ([`atom_isometry_generators`], [`equal_ard_rotation_generators`], the
+//! cross-atom [`frame_rotation_generators`] / [`atom_permutation_generators`])
+//! are exactly a spanning set for that border-block tangent space, realised as
+//! literal tangent directions `ξ` in the fitted model's free-parameter space —
+//! this file's `param_dim()` coordinates are the ambient space Terracini's
+//! generic-point argument is stated in. The stacked curvature root `R`
+//! ([`stacked_curvature_root`]) is the empirical analogue of the Jacobian whose
+//! rank Terracini's theorem predicts: its RRQR-pinned rank (see
+//! `CurvatureReduction::from_model`) is the empirically REALISED tangent
+//! dimension the fit's curvature can see, and the per-generator relative
+//! curvature fraction is a Marchenko–Pastur-style edge test applied
+//! direction-by-direction — a genuine signal direction has curvature energy
+//! resolvably above the calibrated noise floor
+//! ([`GENERATOR_FLAT_ENERGY_TOL`], widened by the #995 lowering-error scale for
+//! directions the mean-frame compression cannot resolve), while a direction
+//! indistinguishable from noise sits below it. When every enumerated tangent
+//! direction the theory predicts is independently confirmed above that edge
+//! (pinned), Theorem A's promise is realised concretely: identifiability STOPS
+//! being an assumption imposed on the model class and becomes a CERTIFICATE
+//! this specific fit carries, verdict-by-verdict, with the exact residual
+//! (unpinned) subgroup named. This is why the certificate returns a full
+//! [`ResidualGaugeReport`] rather than a boolean: Theorem A is a statement
+//! about a decomposition of tangent directions, and the report is that
+//! decomposition made data-legible.
 
 use crate::chart_canonicalization::CanonicalChartTopology;
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
@@ -190,6 +223,20 @@ impl ConditionalPriorIvae {
         // equivalent (an invertible reparameterisation) to requiring that
         // the stacked signature `S = [μ(u) ‖ log σ(u)]` of shape
         // (n_rows, 2k) have rank 2k, with at least 2k+1 distinct rows.
+        //
+        // This is the CLASSICAL precondition the certificate's per-generator
+        // gauge-groupoid slice (see [`GeneratorFamily`]) generalises: Khemakhem's
+        // rank/distinctness check is a single global yes/no gate on whether the
+        // auxiliary-conditioned prior family is rich enough to break rotational
+        // non-identifiability of the whole latent block at once, whereas the
+        // residual-gauge certificate breaks the equivalent question into one
+        // verdict per candidate symmetry direction of a much richer per-atom
+        // manifold model. Both instruments answer the same underlying question
+        // — "is there a source of asymmetry (auxiliary conditioning here, data
+        // curvature / isometry penalty there) that pins this rotational
+        // freedom?" — Khemakhem's at the level of the whole prior, this
+        // certificate's at the level of Prop H's residual continuous
+        // stabilizer for canonical-gauge transport.
         let (n_rows, latent_dim) = mean.dim();
         let needed_rows = 2 * latent_dim + 1;
         if n_rows < needed_rows {
@@ -1108,6 +1155,41 @@ impl FittedSaeManifold {
 
 /// Which symmetry family a generator belongs to. Carried per-generator so the
 /// report names the group the residual freedom (or pin) lives in.
+///
+/// # This enumeration is a slice of the gauge groupoid
+///
+/// The full model-class gauge groupoid has one object per fitted model and one
+/// morphism per way of relabelling it (isometries of each atom, ARD-tied
+/// rotations, output-frame rotations, atom exchanges, chart reparameterizations)
+/// without changing what it reconstructs. `residual_gauge` cannot certify the
+/// whole groupoid abstractly — it certifies, per generator, whether *this
+/// specific converged fit* sits on a fixed point of that morphism (pinned) or
+/// can slide along its orbit (unpinned). That per-generator pinned/unpinned
+/// verdict ([`VerdictProvenance`] records which test decided it) is exactly
+/// slicing the groupoid at this fit: the surviving unpinned generators are the
+/// isotropy/stabilizer subgroup — the largest group under which this fit is
+/// literally undetermined by the data + penalties. Two replicate fits carry
+/// "the same identification" iff they slice the groupoid the same way, which
+/// is exactly what [`ResidualGaugeReport::group_signature`] compares.
+///
+/// The surviving continuous linear stabilizer this slice exposes is the
+/// uniqueness precondition (Prop H) for transporting a fit to a canonical
+/// gauge: [`crate::inference::layer_transport::transport_ladder`] and the
+/// chart-canonicalization machinery in [`crate::chart_canonicalization`] can
+/// only pick a single canonical representative per atom when the residual
+/// stabilizer is the *expected*, finite one (see [`VerdictProvenance::PinnedByCanonicalization`]
+/// below) — a residual freedom the certificate reports as unpinned here is
+/// precisely a direction along which "the" canonical transport is not unique,
+/// so binding one fit's canonical frame to another's (transport) is only
+/// honest once this slice is known. This generalises the classical
+/// finite-dimensional identifiability precondition of Khemakhem et al.
+/// (iVAE, arXiv:2107.10098 Theorem 1 — see [`ConditionalPriorIvae::new`]):
+/// where Khemakhem's condition is a single global rank/distinctness check on
+/// an auxiliary-conditional prior that either holds or fails for the whole
+/// model, this groupoid slice is the same idea made *local and per-generator*
+/// — instead of one yes/no precondition, each candidate symmetry direction of
+/// the richer manifold-atom model gets its own verdict, so "identifiable up
+/// to a named residual group" replaces "identifiable" as the deliverable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeneratorFamily {
     /// A generator of `Isom(M_k)` for a single atom (frame rotation/reflection
@@ -1149,6 +1231,14 @@ impl GeneratorFamily {
 /// (the #1019 post-fit arc-length canonicalization — an exact, image-frozen
 /// representative choice) from a direction pinned **by curvature** (data or
 /// the isometry penalty giving the orbit genuine objective cost).
+///
+/// This is the "how" half of the gauge-groupoid slice described on
+/// [`GeneratorFamily`]: `CurvatureTest` is the empirical Terracini/MP-edge
+/// measurement (does the fit's own curvature resolve this direction),
+/// `PinnedByCanonicalization` is a *chosen* section of the groupoid (a
+/// specific representative picked once, by convention, rather than measured)
+/// — the distinction the report must keep honest so a canonicalization
+/// choice is never mistaken for an emergent identifiability result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictProvenance {
     /// Decided by the relative-curvature flatness test against the stacked
@@ -2032,7 +2122,11 @@ fn exact_orbit_verdicts(
         if raw <= f64::MIN_POSITIVE {
             // The orbit does not move the fit at all (zero tangents / zero
             // mass): structurally trivial, reported pinned with zero norm,
-            // mirroring the frame certificate's convention.
+            // mirroring the frame certificate's convention. Same
+            // degenerate-tangent / RLCT-½ exclusion as the frame-space veto in
+            // `residual_gauge_inner` (see that site for the full argument): a
+            // `rank_eff = 0` orbit buys no genuine identifiability dimension,
+            // so it must never be reported as a residual freedom.
             out.push(GeneratorVerdict {
                 family,
                 description,
@@ -2181,6 +2275,18 @@ enum CurvatureReduction {
 }
 
 impl CurvatureReduction {
+    /// Theorem A, made empirical: `root` is the stacked curvature root `R`
+    /// whose row space is `range(H) = range(H_data) + range(H_isometry)`, the
+    /// pullback of the Terracini border-block Jacobian into this fit's own
+    /// metric. The RRQR rank of `Rᵀ` below is *the same* penalty-aware,
+    /// leverage-scaled rank decision [`gam_identifiability::audit::audit_identifiability`]
+    /// uses on stacked design columns, applied here to the enumerated symmetry
+    /// generators instead — so "pinning rank" is a genuine empirical measurement
+    /// of the realised tangent dimension `Σ_k(d_k+1)` Terracini predicts, not a
+    /// nominal count: rank-deficient curvature (fewer independent directions
+    /// resolved than atoms enumerate) is exactly a failure of the generic-point
+    /// hypothesis Terracini's theorem requires, and shows up here as a smaller
+    /// `pinning_rank` than the generator count.
     fn from_model(model: &FittedSaeManifold) -> Result<Self, String> {
         let root = stacked_curvature_root(model)?;
         if root.nrows() == 0 {
@@ -2191,6 +2297,11 @@ impl CurvatureReduction {
             });
         }
         let r_t = root.t().to_owned();
+        // RRQR-pinned rank of Rᵀ = the empirical tangent-independence
+        // certificate: this is the rank machinery deciding how many of the
+        // Terracini-predicted tangent directions the fit's curvature actually
+        // resolves as independent, i.e. how much of `Σ_k dim Isom(M_k)` etc. is
+        // a genuine, separately-identified direction versus collapsed noise.
         let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
             .map_err(|e| format!("residual_gauge: RRQR on Rᵀ failed: {e:?}"))?;
         let (_u, sv, _vt) = root
@@ -2473,6 +2584,20 @@ fn residual_gauge_inner(
         // A structurally trivial generator (rotation of a rank-deficient frame,
         // zero swap) carries no direction — it cannot be a residual freedom.
         // Report it pinned with zero norm rather than as a spurious gauge.
+        //
+        // This IS the degenerate-tangent exclusion Theorem A requires, not a
+        // defensive nicety: a generator whose realised tangent is `rank_eff = 0`
+        // (`‖ξ‖ = 0`, no genuine direction in the Terracini border-block
+        // Jacobian) is asymptotically CHEAP under the RLCT (real log canonical
+        // threshold) accounting the underlying singular-learning-theory picture
+        // uses — a genuine free direction pays `½` of RLCT per dimension, but a
+        // null/degenerate direction pays nothing and buys nothing, so admitting
+        // it as "unpinned" would claim a free identifiability dimension the
+        // model does not actually have. Vetoing it here (forced `unpinned:
+        // false`, `pinned_energy_fraction: 1.0`) is therefore a VALIDITY
+        // CONDITION for the certificate's rank arithmetic — Theorem A's
+        // tangent-space decomposition is only meaningful once degenerate
+        // summands are excluded from it — not a heuristic tie-break.
         if norm <= f64::MIN_POSITIVE {
             verdicts.push(GeneratorVerdict {
                 family: *family,
@@ -2704,6 +2829,22 @@ fn residual_gauge_inner(
 /// about the world). A claim can fail both ways, and the failure modes
 /// are independent: an atom can be perfectly identified yet statistically
 /// unestablished, or strongly evidenced yet gauge-ambiguous with a twin.
+///
+/// These two reports are the nearest thing in this file to the "one
+/// statistic, two notations" pairing (Cor F): `gauge` is a curvature-based,
+/// model-class statement about identification, `structure` is a
+/// likelihood/evidence-ledger statement about which claims the data has
+/// established, and at the shared asymptotic limit (a well-identified atom
+/// with enough data to certify its structure) the two MUST cohere — a
+/// perfectly-identified atom that never accumulates structural evidence, or a
+/// strongly-evidenced atom that is simultaneously gauge-ambiguous with an
+/// exchangeable twin, is not a conflict to silently paper over. It is a
+/// finite-sample MISSPECIFICATION SIGNAL: either the isometry/ARD pin that
+/// `gauge` reads is not actually active in the fit that produced `structure`'s
+/// evidence, or the ledger's shard evidence is itself confounded by the
+/// unresolved symmetry `gauge` is reporting. Callers that see the two reports
+/// disagree on the same atom should treat that disagreement as diagnostic
+/// input, not as a tie to break by preferring one report over the other.
 #[derive(Debug, Clone)]
 pub struct DictionaryReport {
     /// What cannot be distinguished in principle ([`residual_gauge`]).

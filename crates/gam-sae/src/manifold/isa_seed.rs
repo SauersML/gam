@@ -43,6 +43,19 @@
 //! Everything here is derived from the residual spectrum (MP edge, bottom-
 //! quartile noise scale) plus the analytic κ anchors; the only dials are
 //! multistart/sweep COST caps, typed on [`IsaSeedConfig`].
+//!
+//! THEORY (Superposed Geometry, Prop. 1 — measure-level identifiability). A
+//! CENTERED circle's cone ℝ₊·Y coincides, as a set, with the whole 2-plane
+//! P∖{0}: no support test, no rank test, no Terracini border-block Jacobian
+//! can distinguish "this data lives on a circle" from "this data spans a
+//! plane" — the circle is SUPPORT-INVISIBLE. It is identifiable only through
+//! its RADIAL LAW, i.e. the MEASURE the data puts on that support, not the
+//! support itself. This file is the measure-level half of identifiability;
+//! the support/rank half (Terracini tests, border-block Jacobian) lives in
+//! sibling `identifiability.rs` + the certificate machinery. The two see
+//! COMPLEMENTARY halves of Prop. 1 — support existence vs. the law on that
+//! support — and neither subsumes the other: a centered circle is exactly the
+//! case the support test cannot see and this producer must.
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
@@ -403,6 +416,14 @@ fn pair_polys(
 
 /// Pair objective `J(θ) = Σ_{existing planes} (κ(θ) − 2)²` and its hand-derived
 /// derivative, exactly evaluable from the pair polynomials.
+///
+/// This IS the Prop. 1 measure-vs-support contrast made optimizable: `κ = 2`
+/// is not an arbitrary target but the one population — the Gaussian/CLT blend
+/// of many independent charts — whose radial law a plane and a circle share
+/// asymptotically. `(κ − 2)²` is zero exactly there and rises on BOTH sides
+/// (dense circle `κ → 1`, gated circle `κ = 1/q > 2`), so ascending it always
+/// moves toward whichever clean radial law is present and away from the blend
+/// no support/rank test could have ruled out in the first place.
 fn pair_objective(a: &Option<PlanePolys>, b: &Option<PlanePolys>, theta: f64) -> f64 {
     let (c2, s2) = ((2.0 * theta).cos(), (2.0 * theta).sin());
     let (c4, s4) = ((4.0 * theta).cos(), (4.0 * theta).sin());
@@ -447,7 +468,12 @@ fn plane_rows_kappa(y: &Array2<f64>, m: usize) -> f64 {
     (s4 / n as f64) / (m2 * m2)
 }
 
-/// Total ISA contrast `Σ_planes (κ_m − 2)²` of the current rotation state.
+/// Total ISA contrast `Σ_planes (κ_m − 2)²` of the current rotation state —
+/// the objective the Jacobi sweep ascends and the score used to rank basins
+/// across multistart inits and planes across a single basin (see
+/// [`isa_extract_certified_plane`]). Same Gaussian-anchor logic as
+/// [`pair_objective`], just summed over all current planes rather than the
+/// two planes touched by one rotation.
 fn total_contrast(y: &Array2<f64>, n_planes: usize) -> f64 {
     (0..n_planes)
         .map(|m| {
@@ -574,6 +600,17 @@ fn subsample_columns(n: usize) -> Vec<usize> {
 /// Accept iff the anchors are ordered (`κ_model < κ_blend`) and the observed κ
 /// falls on the model side of their midpoint — a likelihood split between two
 /// derived populations, no tuned ε.
+///
+/// This is the actual certification instrument for Prop. 1: `amb`, the
+/// candidate 2-plane, is by construction support-indistinguishable from a
+/// generic plane (that ambiguity is exactly what the Jacobi ascent's contrast
+/// score cannot resolve on its own, since a lucky rotation could land near a
+/// blend's local optimum). What decides ACCEPT/REJECT here is not the plane
+/// itself but a comparison of two DERIVED MEASURES on it — `κ_model` (clean
+/// gated/dense circle law) vs. `κ_blend` (nearest Gaussian-mixture law) — so
+/// the accept/reject boundary lives entirely in measure space, never in
+/// support space. A circle and a plane occupying identical support pass or
+/// fail this test on the strength of their radial law alone.
 fn certify_plane(
     residual: ArrayView2<'_, f64>,
     parts: &IsaEigenParts,
@@ -938,6 +975,14 @@ mod tests {
     /// (any orthonormal pairing is a valid eigenbasis). Only the fourth-order
     /// contrast separates the circles. Gate: 6 planes, all distinct, all real,
     /// all clean, natural exit.
+    ///
+    /// This is the Davis–Kahan exhaustion case named in the module doc made
+    /// concrete: at second order the equal-amplitude 6-circle covariance is
+    /// exactly isotropic on its 12-dim signal subspace, so ANY orthonormal
+    /// re-pairing of coordinates is an equally valid eigenbasis and a
+    /// second-order method returns arbitrary blends. Recovering 6 clean,
+    /// distinct circles here is possible only because the κ contrast breaks
+    /// the degeneracy that support/covariance information cannot.
     #[test]
     fn isa_producer_gate_dense_torus_equal_amplitude() {
         let k = 6usize;
@@ -956,6 +1001,13 @@ mod tests {
     /// SPARSE GATED — six circles each active on a q = 0.25 Bernoulli row
     /// subset (κ = 1/q = 4, the super-Gaussian side of the contrast). Same
     /// gate: 6 distinct real clean planes, natural exit.
+    ///
+    /// Covers the OTHER anchor arm from the dense-torus test above: a gated
+    /// circle's support is a lower-dimensional slice of the plane (only a q
+    /// fraction of rows lie on the cone at all), yet the plane spanned by its
+    /// nonzero rows is still just a 2-plane — support alone still cannot
+    /// certify it. κ = 1/q = 4 on the super-Gaussian side of the anchor is
+    /// what carries the identification.
     #[test]
     fn isa_producer_gate_sparse_gated() {
         let k = 6usize;
@@ -974,6 +1026,16 @@ mod tests {
     /// (every 2-plane of it has κ = 2, the blend anchor exactly). The producer
     /// must extract NOTHING and exit naturally: a κ certificate that accepted
     /// any plane here would hallucinate circles out of covariance alone.
+    ///
+    /// This is the HONESTY FACE of Prop. 1: a rank-6 Gaussian factor model has
+    /// exactly the same support (a 6-dim subspace, decomposable into any
+    /// orthonormal 2-plane pairing) as six circles do, so a support/rank test
+    /// alone cannot tell them apart — that ambiguity is real, not a producer
+    /// bug. The only thing separating them is measure: every 2-plane slice of
+    /// a Gaussian factor sits at exactly κ = 2, the blend anchor `certify_plane`
+    /// is built to refuse. Certifying a plane here would be the precise
+    /// support-for-measure substitution Prop. 1 rules out — proving the
+    /// negative is as load-bearing as the two positive gates above.
     #[test]
     fn isa_producer_rejects_planted_gaussian_blend() {
         let n = 2000usize;

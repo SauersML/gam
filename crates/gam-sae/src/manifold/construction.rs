@@ -1,6 +1,44 @@
 use super::*;
 use gam_math::jet_scalar::JetScalar;
 
+// ── Theorem K: the rank charge is a RUNNING COMPLEXITY λ(n) ──────────────────
+//
+// The birth/death evidence charge on an atom is not an ad-hoc penalty; it is one
+// evaluation of the running (marginal-likelihood) complexity
+//
+//     λ(n) := d(−log Z_n) / d(log n),
+//
+// the local slope of the log marginal likelihood in log sample size. Watanabe's
+// singular-learning theory says −log Z_n = n·L_n(ŵ) + λ·log n + o(log n), so λ IS
+// the coefficient of log n in the evidence. Theorem K observes that the THREE
+// quantities this code juggles are the SAME object λ evaluated in three regimes:
+//
+//   • HARD rank (n → ∞ limit, atom well above the noise edge): every resolved
+//     decoder direction is a regular parameter, λ → ½·rank_eff·basis_edf = ½·d_eff.
+//     This is the shipped default (`rank_charge_evidence`, hard MP count).
+//   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): a direction
+//     only fractionally resolved contributes a fraction of ½, λ = ½·rank_soft·basis_edf
+//     with rank_soft = Σ_j μ_j/(μ_j+e) the tempered (β=1/log n) count. This is the
+//     opt-in `soft_rank_charge` ledger below (Theorem K, `wbic_audit`).
+//   • RLCT (SINGULAR truth, a symmetry orbit or a null atom): λ drops below ½·d
+//     to the real log-canonical threshold. The null atom (truth B*=0) has λ=½ from
+//     the amplitude singularity of a²‖B‖² — see the veto in `reml_criterion`.
+//
+// Soft → hard away from the edge (every sigmoid → 1) and soft → RLCT at singular
+// truths (sigmoids → 0), so the single ledger `λ(n_eff)·ln n_eff` interpolates all
+// three regimes continuously. The log-scale is the OCCUPANCY-corrected `ln n_eff`
+// (Fisher information actually accumulated by a gated atom), never the global row
+// count — see the #2a inert-row axiom in `reml_criterion`.
+//
+// GATING: the soft ledger is an OPT-IN alternative to the shipped hard charge,
+// selected by the persisted per-fit flag `SaeManifoldTerm::soft_rank_charge`
+// (default false ⇒ bit-for-bit historical hard path). The flag is the SINGLE source
+// of truth: it is carried across clones (including stagewise per-birth clones) and
+// therefore propagates correctly into rayon worker threads during parallel folds —
+// a thread-local scope would silently fail to apply in worker threads, so it is
+// deliberately NOT used. Effect only when `rank_charge_evidence` is also on (the
+// soft coefficient substitutes for the hard one INSIDE that branch).
+
 /// #9 streaming rank-charge inputs, accumulated in a SINGLE pass through
 /// [`SaeManifoldTerm::streaming_exact_arrow_log_det`] when `rank_charge_evidence`
 /// is on: the coordinate-block log-det `log_det_tt` (= 2·`htt_half`; the part the
@@ -150,6 +188,7 @@ impl SaeManifoldTerm {
             quotient_scale: false,
             cone_atom_recovery: false,
             rank_charge_evidence: false,
+            soft_rank_charge: false,
             data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
             // K=1 lane disarms it explicitly (see the field docs on term.rs).
@@ -927,6 +966,20 @@ impl SaeManifoldTerm {
         self.rank_charge_evidence
     }
 
+    /// Theorem K — set the per-fit WBIC SOFT rank-charge ledger opt-in (typed kwarg,
+    /// no env lever). Default false ⇒ historical hard path bit-for-bit. Only has
+    /// effect when `rank_charge_evidence` is also on. Persisted per-fit config,
+    /// carried across clones (including stagewise per-birth clones) and across rayon
+    /// worker threads — the field is the single source of truth.
+    pub fn set_soft_rank_charge(&mut self, enabled: bool) {
+        self.soft_rank_charge = enabled;
+    }
+
+    /// Theorem K — read the per-fit WBIC soft rank-charge ledger opt-in.
+    pub fn soft_rank_charge(&self) -> bool {
+        self.soft_rank_charge
+    }
+
     /// #2023 C4 — install a Tier-0 shared mean μ (the manifold analogue of
     /// [`crate::tiered::Tier0Mean`]). Once set, [`Self::try_fitted_with_rho`] adds
     /// μ back to the assembled per-atom reconstruction, so the atoms only ever
@@ -1036,11 +1089,80 @@ impl SaeManifoldTerm {
         // persisted there) and calls the SAME core — so the criterion is identical.
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
-        let assignments = self.assignment.assignments();
-        let n_eff: Vec<f64> = (0..self.k_atoms())
-            .map(|k| assignments.column(k).iter().map(|&a| a * a).sum())
-            .collect();
+        let n_eff = self.per_atom_effective_sample_size();
         self.rank_dof_from_grams(&grams, &n_eff, rho, dispersion_r)
+    }
+
+    /// Per-atom effective sample size `N_eff,k = Σ_i a_{ik}²` — the occupancy-aware
+    /// Fisher information a gated atom k actually accumulates. This is the honest
+    /// BIC/Laplace log-sample-size for the #2a rank charge (NOT the global row count
+    /// `n_obs`): a row on which atom k's gate is OFF contributes `a²=0`, so appending
+    /// such rows leaves `N_eff,k` — and hence atom k's charge — unchanged (inert-row
+    /// invariance). Matches the `ri.n_eff` the #9 streaming log-det pass accumulates.
+    pub(crate) fn per_atom_effective_sample_size(&self) -> Vec<f64> {
+        let assignments = self.assignment.assignments();
+        (0..self.k_atoms())
+            .map(|k| assignments.column(k).iter().map(|&a| a * a).sum())
+            .collect()
+    }
+
+    /// Theorem K WBIC SOFT learning coefficient `λ_k = ½·rank_soft_k·basis_edf_k` per
+    /// atom, from the PRE-ACCUMULATED per-atom Grams (the streaming twin of
+    /// [`Self::per_atom_soft_learning_coefficient`], as `rank_dof_from_grams` is the
+    /// twin of the dense hard path). `rank_soft_k = Σ_j μ_{kj}/(μ_{kj}+e_k)` is the
+    /// tempered (β=1/log n) count on atom k's occupancy-corrected reconstruction
+    /// spectrum `μ = sv(diag(√λ)·Uᵀ·D)²/N_eff` against the SAME Marchenko–Pastur edge
+    /// `e = R·(1+√(p/N_eff))²` the hard count thresholds on. It is bit-consistent with
+    /// the hard `d_eff` (`rank_dof_from_grams`) — both come from one
+    /// [`super::wbic_audit::recon_spectrum`], whose `rank_hard·basis_edf` matches
+    /// `realised_rank_charge_dof` — so the two ledgers agree away from the edge
+    /// (μ≫e ⇒ rank_soft→rank_hard) and the soft one is strictly smaller near it.
+    pub(crate) fn soft_learning_coefficient_from_grams(
+        &self,
+        grams: &[Array2<f64>],
+        n_eff: &[f64],
+        rho: &SaeManifoldRho,
+        dispersion_r: f64,
+    ) -> Result<Vec<f64>, String> {
+        let lam = rho.lambda_smooth_vec();
+        let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
+            dispersion_r
+        } else {
+            f64::MIN_POSITIVE
+        };
+        let p_out = self.output_dim() as f64;
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for k in 0..self.k_atoms() {
+            let n_eff_k = n_eff.get(k).copied().unwrap_or(0.0);
+            let lam_k = lam.get(k).copied().unwrap_or(0.0);
+            let spec = super::wbic_audit::recon_spectrum(
+                &grams[k],
+                &self.atoms[k].decoder_coefficients,
+                n_eff_k,
+                p_out,
+                r_floor,
+                lam_k,
+                Some(&self.atoms[k].smooth_penalty),
+            )
+            .map_err(|e| format!("soft_learning_coefficient_from_grams: atom {k}: {e}"))?;
+            out.push(spec.learning_coefficient());
+        }
+        Ok(out)
+    }
+
+    /// Dense twin of [`Self::soft_learning_coefficient_from_grams`]: materialise the
+    /// per-atom Grams from `self` and return the WBIC soft learning coefficient `λ_k`.
+    /// Used only when the per-fit `soft_rank_charge` flag is on, so the extra Gram pass is off
+    /// the shipped hot path.
+    pub(crate) fn per_atom_soft_learning_coefficient(
+        &self,
+        rho: &SaeManifoldRho,
+        dispersion_r: f64,
+    ) -> Result<Vec<f64>, String> {
+        let mut grams = self.empty_decoder_gram_accumulator();
+        self.accumulate_decoder_gram(&mut grams);
+        let n_eff = self.per_atom_effective_sample_size();
+        self.soft_learning_coefficient_from_grams(&grams, &n_eff, rho, dispersion_r)
     }
 
     /// Shared rank-charge DOF core (#11): `d_eff_k = rank_eff_k · basis_edf_k` from the
@@ -4608,6 +4730,42 @@ impl SaeManifoldTerm {
         )
     }
 
+    /// [`Self::reml_criterion_with_cache`] priced with the Theorem K WBIC SOFT rank
+    /// charge instead of the hard MP count — the OPT-IN unified running-complexity
+    /// ledger `Σ_k λ_k(N_eff,k)·ln N_eff,k`, `λ_k = ½·rank_soft_k·basis_edf_k`. Only
+    /// changes the value when `rank_charge_evidence` is already on (the soft coefficient
+    /// substitutes for the hard one INSIDE that branch); with the flag off it is
+    /// bit-identical to the historical path. Convenience wrapper that evaluates the
+    /// soft ledger for THIS call only, restoring the persisted `soft_rank_charge` flag
+    /// afterward (use [`Self::set_soft_rank_charge`] to make it stick across a whole
+    /// fit / its clones). Reduces to `reml_criterion_with_cache` away from the MP edge
+    /// (soft→hard) and is strictly smaller for atoms near it (soft<hard) — the finite-n
+    /// Watanabe correction.
+    pub fn reml_criterion_with_cache_soft_charge(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        let prev_soft = self.soft_rank_charge;
+        self.soft_rank_charge = true;
+        let out = self.reml_criterion_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        );
+        self.soft_rank_charge = prev_soft;
+        out
+    }
+
     pub(crate) fn reml_criterion_with_cache_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -4752,7 +4910,6 @@ impl SaeManifoldTerm {
             // invariant, so it accepts a real rank-2 circle and neutralises a
             // vanishing atom — but does NOT distinguish clean-vs-blend (producer's
             // job).
-            let n_obs = self.n_obs() as f64;
             // Noise floor R = residual dispersion φ (per-fit, noise-relative — NOT a
             // hardcoded/self-relative floor). If it cannot be computed the vanishing-
             // atom detection silently degrades (R→0 keeps rank_eff≈rank), so surface
@@ -4768,6 +4925,11 @@ impl SaeManifoldTerm {
                 }
             };
             let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
+            // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
+            // per-atom BIC log-scale (same quantity `per_atom_realised_rank_dof` uses
+            // internally for the MP edge; recomputed here — a cheap Σa² — to price the
+            // charge in the same currency).
+            let n_eff = self.per_atom_effective_sample_size();
             // #5 VETO — categorical Laplace-VALIDITY condition (blend-null null-license
             // fix, recov matrix 12484591): an atom with rank_eff==0 (⟺ d_eff==0)
             // reconstructs NOTHING. Its Laplace evidence is not "small" — it is INVALID:
@@ -4783,10 +4945,56 @@ impl SaeManifoldTerm {
             // β-Schur decoder-curvature block (assemble_arrow_schur) so a vanishing β
             // doesn't drive its Schur log-det → −∞; deferred (touches the shipped Schur
             // path); the birth-gate veto here is the guard.
+            //
+            // #2b — RLCT justification (why the veto is a VALIDITY condition, not a
+            // heuristic): the null atom (truth B*=0) sits at a singularity of the model
+            // — the product form a²‖B‖² makes the Fisher information degenerate there —
+            // and singular learning theory gives it real log-canonical threshold (RLCT)
+            // λ=½: the leading zeta pole of ∫(a²‖B‖²)^s comes from the amplitude at s=½,
+            // independent of M,p,d. So the null's asymptotic evidence cost is only
+            // ½·ln n per e-fold, and NO Θ(log n) rank charge can separate a null birth
+            // from a real one AT the singular point. The categorical veto (v→+∞ when
+            // rank_eff==0) is therefore the only valid way to keep the degenerate class
+            // unbirthable; a finite penalty could not.
             if d_eff.iter().any(|&de| de == 0.0) {
                 f64::INFINITY
             } else {
-                let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
+                // #2a — occupancy-aware BIC/Laplace scale. The per-atom charge is
+                // ½·d_eff,k·ln(N_eff,k), NOT ½·d_eff,k·ln(n_obs): N_eff,k = Σ_i a_{ik}²
+                // is the Fisher information a GATED atom actually accumulates, so it is
+                // the honest effective sample size for atom k's Laplace volume. Using
+                // the global n_obs over-charges atom k by ½·d_eff,k·ln(n_obs/N_eff,k)
+                // — biased worst against the sparse, selective atoms an SAE exists to
+                // find, and it manufactures a spurious asymmetry in fusion/fission.
+                // AXIOM (inert-row invariance): appending rows on which atom k's gate is
+                // OFF changes neither its likelihood nor its curvature, so it must not
+                // change atom k's charge. ln(N_eff,k) satisfies this (those rows add 0
+                // to Σa²); ln(n_obs) violates it. The ln floor at N_eff,k=1 keeps the
+                // log non-negative for a barely-occupied atom (rank_eff>0 ⇒ N_eff,k>0,
+                // and the d_eff==0 veto above already removes the empty case).
+                //
+                // Theorem K: the per-atom coefficient of ln N_eff,k is the running
+                // complexity λ_k(N_eff,k). By default it is the HARD limit ½·d_eff,k
+                // (every above-edge direction a full regular parameter). Under an opt-in
+                // `soft_rank_charge` flag it is the finite-n WBIC SOFT coefficient
+                // λ_k = ½·rank_soft_k·basis_edf_k, which reduces to ½·d_eff,k away from
+                // the MP edge (μ≫e) and shrinks toward the RLCT near it — the same veto
+                // still fires on the hard rank_eff==0 (an atom the soft count also sends
+                // to λ→0, but the categorical veto is the validity guard, not a small λ).
+                let rank_charge: f64 = if self.soft_rank_charge {
+                    let lambda = self.per_atom_soft_learning_coefficient(rho, disp)?;
+                    lambda
+                        .iter()
+                        .zip(n_eff.iter())
+                        .map(|(&lam, &ne)| lam * ne.max(1.0).ln())
+                        .sum()
+                } else {
+                    d_eff
+                        .iter()
+                        .zip(n_eff.iter())
+                        .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
+                        .sum()
+                };
                 // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
                 // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
                 // `log_det`). Subtracting it removes the per-row coordinate log-det.
@@ -5866,7 +6074,6 @@ impl SaeManifoldTerm {
             // `rank_dof_from_grams` MP hard count as the dense path off the
             // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
             // of log_det) is untouched — bit-identical dense↔streaming by design.
-            let n_obs = self.n_obs() as f64;
             let disp = match self.reconstruction_dispersion(&loss, &converged_cache, rho) {
                 Ok(phi) => phi,
                 Err(e) => {
@@ -5886,7 +6093,29 @@ impl SaeManifoldTerm {
             if d_eff.iter().any(|&de| de == 0.0) {
                 f64::INFINITY
             } else {
-                let rank_charge: f64 = d_eff.iter().map(|&de| 0.5 * de * n_obs.ln()).sum();
+                // #2a occupancy-aware scale (see the dense `reml_criterion` for the full
+                // rationale + inert-row axiom + RLCT veto justification): charge atom k
+                // ½·d_eff,k·ln(N_eff,k), N_eff,k = Σ_i a_{ik}² (here `ri.n_eff`, the same
+                // effective sample size chunk-accumulated for the MP edge), NOT the
+                // global n_obs. Bit-identical to the dense path by design — including the
+                // Theorem K soft ledger: under the `soft_rank_charge` flag the coefficient of
+                // ln N_eff,k is the WBIC soft λ_k off the SAME `ri.grams`/`ri.n_eff` the
+                // dense path derives from `self`, so dense↔streaming stay identical.
+                let rank_charge: f64 = if self.soft_rank_charge {
+                    let lambda =
+                        self.soft_learning_coefficient_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
+                    lambda
+                        .iter()
+                        .zip(ri.n_eff.iter())
+                        .map(|(&lam, &ne)| lam * ne.max(1.0).ln())
+                        .sum()
+                } else {
+                    d_eff
+                        .iter()
+                        .zip(ri.n_eff.iter())
+                        .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
+                        .sum()
+                };
                 let htt_half = 0.5 * ri.log_det_tt;
                 loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
                     - occam

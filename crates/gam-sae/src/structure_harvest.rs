@@ -38,6 +38,43 @@
 //! the POST-move dictionary shape (atom count, per-atom basis kind + latent dim
 //! + the move that produced it), so two proposals that reach the same dictionary
 //! shape collide exactly as the engine requires.
+//!
+//! # Theory: curvature IS identifiability (the birth/topology race)
+//!
+//! Of the four move channels this module owns, the BIRTH channel is where a
+//! structural theory claim becomes an operational decision: superposition
+//! ambiguity is fundamentally a FLATNESS disease. When several linear
+//! directions co-fire, any invertible recombination (any element of `GL(d)`
+//! acting on those coordinates) reproduces the same observed activations
+//! exactly — a flat co-firing subspace is generically NON-identifiable, and
+//! its gauge groupoid (the group of relabelings that leave the data
+//! indistinguishable) is as large as `GL(d)` itself. A CURVED embedding does
+//! not have this freedom: by jet transversality, two generic curved
+//! embeddings that agree to second order (the same point, tangent, AND
+//! curvature/osculation) are equal on an infinite-codimension set — so a
+//! curved atom's gauge groupoid collapses from `GL(d)` down to the much
+//! smaller diffeomorphism-and-symmetry group (`Diff × Sym`) of its own
+//! topology. Concretely: a residual-factor blob that looks like a flat 2-D
+//! co-firing pair is compatible with countless linear re-mixings, but a
+//! residual-factor blob that is genuinely a circle can only be reparameterized
+//! by circle diffeomorphisms — its curvature is what pins it down.
+//!
+//! This module's birth path (residual-factor mining in
+//! [`harvest_move_proposals`], candidate construction in
+//! [`topology_candidates_for_dim`], the commensurable evidence comparison in
+//! [`fit_topology_candidate`], the race itself in [`race_birth_topology`], and
+//! the seeding in [`born_atom`]) is the engine's CURE for that flatness
+//! disease: instead of leaving a co-firing residual subspace as an
+//! unidentifiable flat blob (or forcing every birth to inherit a fixed
+//! circular template by fiat), it fits every topology whose intrinsic
+//! dimension matches the candidate atom (line vs circle at `d = 1`; torus vs
+//! sphere vs cylinder vs flat patch at `d = 2`) and lets the data's own
+//! curvature evidence — TK-normalized REML, the same gauge-invariant scale the
+//! smooth-term topology race uses — pick the winner. A curved winner is not
+//! merely a nicer-looking basis: it is the SPECIFIC configuration whose
+//! rigidity is what makes the born atom identifiable at all. The race is
+//! therefore the optimizer's equilibrium response to superposition, not a
+//! stylistic preference for circles.
 
 use std::sync::Arc;
 
@@ -266,6 +303,38 @@ fn post_move_structure_hash(term: &SaeManifoldTerm, mv: &StructureMove) -> u64 {
     ])
 }
 
+/// Collapse the raw fission-audit list to ONE entry per parent atom, keeping the
+/// most-suspect nomination (the LOWEST significance — significance is the
+/// ascending `1 − asym` proxy, so smaller = more absorption-suspect).
+///
+/// A single parent can be nominated by several partners at different
+/// significances, so the raw list carries duplicate atoms. The old
+/// `sort_by(significance).dedup_by_key(atom)` was wrong: `dedup_by_key` removes
+/// only ADJACENT duplicates, and a significance-first sort does not place
+/// same-atom entries adjacently, so duplicates survived — the same parent rode as
+/// several `Fission` proposals, wasting births on a duplicate split. Here the
+/// per-atom minimum is taken explicitly, then the survivors are re-sorted by the
+/// total order `(significance asc, atom asc)` so the result is most-suspect-first
+/// (the order the downstream `take(max_fissions)` and carve loop expect) and fully
+/// deterministic despite the `HashMap`'s arbitrary iteration order.
+fn dedup_most_suspect_per_parent(candidates: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
+    let mut best_per_parent: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::new();
+    for (atom, significance) in candidates {
+        best_per_parent
+            .entry(atom)
+            .and_modify(|s| {
+                if significance < *s {
+                    *s = significance;
+                }
+            })
+            .or_insert(significance);
+    }
+    let mut out: Vec<(usize, f64)> = best_per_parent.into_iter().collect();
+    out.sort_by(|x, y| x.1.total_cmp(&y.1).then(x.0.cmp(&y.0)));
+    out
+}
+
 /// Structural tag for an atom basis kind — the discrete shape identity the
 /// structural hash needs (never coordinates or coefficients).
 fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
@@ -331,7 +400,23 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
 /// * **Births** from the whitened residual-factor subspace: the residuals are
 ///   fed to [`StructuredResidualModel::fit`], whose factor directions
 ///   ([`StructuredResidualModel::factor`]) are the birth candidates, ranked by
-///   explained residual mass.
+///   explained residual mass. This is a SHAPE-level mining step — it finds
+///   directions the current dictionary does not reconstruct, not yet a claim
+///   about what topology lives there. The topology itself is adjudicated
+///   downstream, atom-by-atom, by [`race_birth_topology`] (see the module
+///   docs: curvature is what makes the winner identifiable). Note the two
+///   halves of identifiability this leaves complementary rather than
+///   redundant: this residual-factor step (and the topology race it feeds) is
+///   a SUPPORT/shape-level test (does the reconstruction residual look like a
+///   line, a circle, a torus…?), while a separate producer elsewhere in this
+///   crate (the ISA κ-contrast statistic, `identifiability.rs` /
+///   `isa_seed.rs`) is a MEASURE-level test: a centered circle's cone `ℝ₊·Y`
+///   is literally the same point set as a 2-plane minus the origin, so no
+///   support-based test can ever tell a dense circle from a Gaussian plane —
+///   only the radial fourth-moment ratio `κ = E[r⁴]/E[r²]²` (`= 1` dense
+///   circle, `= 2` Gaussian plane, `= 1/q` gated) can, because it reads the
+///   RADIAL LAW rather than the support. Neither test subsumes the other;
+///   they see complementary halves of the same identifiability question.
 pub fn harvest_move_proposals(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
@@ -443,8 +528,7 @@ pub fn harvest_move_proposals(
         }
     }
     // Keep the most-suspect (lowest significance) audit per parent atom.
-    fission_atoms.sort_by(|x, y| x.1.total_cmp(&y.1).then(x.0.cmp(&y.0)));
-    fission_atoms.dedup_by_key(|(atom, _)| *atom);
+    let fission_atoms = dedup_most_suspect_per_parent(fission_atoms);
 
     // #993: run the within-atom functional-ANOVA carve on each fission
     // candidate that is a genuine `d = 2` product atom. The carve adjudicates
@@ -955,6 +1039,18 @@ struct TopologyCandidateSpec {
 /// The fixed harmonic / degree budgets mirror the seed-dictionary builder
 /// (`sae_build_atom_plans`): periodic gets `2·d_k + 1` columns, torus two
 /// harmonics per axis, the patch degree 3 (`d = 1`) / 2 (`d = 2`).
+///
+/// This is the FLAT-vs-RIGID contest made concrete. Every candidate here
+/// realizes one specific point in the flat/curved spectrum for the born
+/// atom's intrinsic dimension: at `d = 1` the flat `Euclidean` line (large
+/// `GL(1)` gauge freedom — any rescaling of the coordinate is indistinguishable
+/// from any other) against the rigid `Circle` (gauge collapses to rotations of
+/// `S¹`); at `d = 2` the flat patch against the curved `Torus` / `Sphere` /
+/// `Cylinder`, each with its own residual symmetry group strictly smaller than
+/// `GL(2)`. The candidate SET is exactly the set of hypotheses
+/// [`fit_topology_candidate`] scores and [`race_birth_topology`] adjudicates —
+/// building it is choosing which flat/rigid alternatives the evidence gets to
+/// discriminate between; the race itself decides which one is real.
 fn topology_candidates_for_dim(
     coords: ArrayView2<'_, f64>,
     d_k: usize,
@@ -1113,6 +1209,18 @@ fn topology_candidates_for_dim(
 /// * `effective_dim = tr[(Φᵀ W Φ + λ̂S)⁻¹ Φᵀ W Φ]` — the penalized effective
 ///   degrees of freedom the solver returns (`edf`), the per-effective-dim scale's
 ///   denominator.
+///
+/// This is what makes the flat-vs-rigid contest ADJUDICABLE rather than
+/// merely posed: a flat and a curved candidate are different function spaces
+/// (different `m`, different roughness operator `S`, different gauge group),
+/// so their raw fit residuals are not comparable on their own. TK-normalized
+/// REML is the common currency — the same marginal-likelihood scale every
+/// smooth term in the fitter is scored on — that prices each candidate's
+/// data fit against its own complexity/roughness cost, so "the circle beats
+/// the line" is a real, commensurable evidence statement (not an artifact of
+/// one basis happening to have fewer parameters). That evidence is exactly
+/// what [`race_birth_topology`] compares across candidates to pick the
+/// rigid — hence identifiable — winner.
 fn fit_topology_candidate(
     spec: &TopologyCandidateSpec,
     target: ArrayView2<'_, f64>,
@@ -1276,6 +1384,17 @@ fn fit_topology_candidate(
 /// cluster-null rung, handled below the race) or the birth target is degenerate;
 /// the caller then falls back to the template basis (warm inheritance) and the
 /// post-fit curved-vs-linear rung adjudicates as before.
+///
+/// This function IS the flatness cure at runtime: a `d_k`-dimensional
+/// co-firing residual subspace is, prior to this call, exactly the kind of
+/// flat structure that admits an unbounded gauge group of equally-good linear
+/// recombinations (see the module docs). Racing the realizable candidates by
+/// [`fit_topology_candidate`]'s commensurable evidence and keeping only the
+/// winner replaces that flat ambiguity with ONE specific, generically rigid
+/// geometry (or, if nothing curved earns its keep, the flat/line candidate —
+/// an honest verdict, not a default). The winner returned here is what
+/// [`born_atom`] seeds the new atom from directly, so the identifiability
+/// gain is realized in the dictionary rather than merely reported.
 /// The realized per-row amplitude of a birth target: the L2 norm of each row of
 /// `Y` (`n × p`), i.e. the magnitude the born atom would reconstruct at that
 /// sample. The amplitude-concentration certificate reads this to tell a
@@ -1583,6 +1702,14 @@ const BIRTH_SEED_LOGIT: f64 = -4.0;
 /// decides whether the atom is born at all. When the race finds no realizable
 /// candidate (`d_k = 0` cluster-null, or a degenerate image) the born atom falls
 /// back to the template basis (warm inheritance), exactly the prior behavior.
+///
+/// Seeding directly from `fit.evaluator` / `fit.decoder` / `fit.penalty` (the
+/// winning [`TopologyRaceFit`]) rather than re-deriving anything is what makes
+/// the identifiability gain land in the actual dictionary: the born atom does
+/// not merely get labeled with a topology name, it is CONSTRUCTED in the
+/// winning basis, so its gauge group is the winner's `Diff × Sym` (curved
+/// case) or `GL(d)` (flat fallback) from the moment it exists, not something a
+/// later pass has to retrofit.
 fn born_atom(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
@@ -2416,6 +2543,48 @@ mod tests {
     use gam_terms::latent::LatentManifold;
     use ndarray::Array2;
     use std::sync::Arc;
+
+    /// A parent nominated more than once (by different partners at different
+    /// significances) must collapse to EXACTLY ONE entry — the most-suspect
+    /// (lowest-significance) one — and distinct parents must all survive, in
+    /// most-suspect-first order. This is the regression for the
+    /// `dedup_by_key`-only-removes-adjacent-duplicates bug that used to let a
+    /// parent ride as several duplicate `Fission` proposals.
+    #[test]
+    fn dedup_most_suspect_keeps_one_per_parent() {
+        // Atom 2 nominated three times (0.4, 0.1, 0.7); atom 5 twice (0.3, 0.9);
+        // atom 1 once (0.6). Deliberately unsorted so a significance-first sort
+        // would NOT place same-atom entries adjacently.
+        let raw = vec![
+            (2usize, 0.4_f64),
+            (5, 0.9),
+            (1, 0.6),
+            (2, 0.1),
+            (5, 0.3),
+            (2, 0.7),
+        ];
+        let out = dedup_most_suspect_per_parent(raw);
+
+        // Exactly one entry per distinct parent.
+        assert_eq!(out.len(), 3, "one entry per distinct parent: {out:?}");
+        let mut atoms: Vec<usize> = out.iter().map(|(a, _)| *a).collect();
+        atoms.sort_unstable();
+        assert_eq!(atoms, vec![1, 2, 5], "all distinct parents kept");
+
+        // The kept significance per parent is the minimum (most-suspect).
+        let sig = |atom: usize| out.iter().find(|(a, _)| *a == atom).unwrap().1;
+        assert_eq!(sig(2), 0.1, "atom 2 keeps its most-suspect nomination");
+        assert_eq!(sig(5), 0.3, "atom 5 keeps its most-suspect nomination");
+        assert_eq!(sig(1), 0.6, "the singly-nominated atom is unchanged");
+
+        // Most-suspect-first (significance ascending) — the order the downstream
+        // `take(max_fissions)` and carve loop rely on.
+        assert_eq!(
+            out,
+            vec![(2, 0.1), (5, 0.3), (1, 0.6)],
+            "deterministic most-suspect-first order"
+        );
+    }
 
     /// A high active logit (atom routes strongly on the row) and a low one
     /// (atom is dormant). With the `ACTIVE_SUPPORT_REL_FLOOR / K` threshold a

@@ -2,7 +2,8 @@
 //! statistical-debt closure).
 //!
 //! WHY. The production birth/death charge is the Laplace/BIC rank charge
-//! `½·d_eff·log n` (see [`super::construction::realised_rank_charge_dof`]), with
+//! `½·d_eff·log N_eff` (see [`super::construction::realised_rank_charge_dof`]; #2a:
+//! the occupancy-aware `N_eff = Σ_row a²`, not the global `n`), with
 //! `d_eff = rank_eff · basis_edf`. `rank_eff` is a Marchenko–Pastur HARD count of
 //! the reconstruction-Gram eigenvalues above the noise edge — an integer. The
 //! `½·(·)·log n` Laplace charge is the correct free-energy penalty ONLY for a
@@ -57,9 +58,16 @@
 //! ```text
 //! rank_hard = Σ_k 1[μ_k > e]                    (integer MP count — production)
 //! rank_soft = Σ_k μ_k/(μ_k + e)                 (WBIC tempered count)
-//! rank charge  C_rank = ½ · rank_hard · basis_edf · log n
-//! WBIC charge  C_wbic = ½ · rank_soft · basis_edf · log n
+//! rank charge  C_rank = ½ · rank_hard · basis_edf · log N_eff
+//! WBIC charge  C_wbic = ½ · rank_soft · basis_edf · log N_eff
 //! ```
+//! #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
+//! `N_eff = Σ_row a²` (the same `n_eff` the MP edge already uses), NOT the global
+//! row count `n`. `N_eff` is the Fisher information the gated atom actually
+//! accumulates, so it is the honest BIC scale and it makes the charge invariant to
+//! appending rows on which the atom's gate is OFF (inert-row invariance); `log n`
+//! over-charges every atom by `½·d_eff·log(n/N_eff)`, worst for sparse selective
+//! atoms.
 //! `basis_edf = tr(G(G+λS)⁻¹)` is ALREADY a graded (Watanabe-compatible) effective
 //! count of basis functions, so the singular correction lives ENTIRELY in the hard
 //! MP rank count. The audit reports `C_rank − C_wbic ≥ 0` per atom; the expected
@@ -112,19 +120,46 @@ impl ReconSpectrum {
             .sum()
     }
 
-    /// Production rank / Laplace–BIC charge `½·rank_hard·basis_edf·log n`.
-    pub fn rank_charge(&self, n: usize) -> f64 {
-        0.5 * self.rank_hard() * self.basis_edf * (n as f64).ln()
+    /// Production rank / Laplace–BIC charge `½·rank_hard·basis_edf·log N_eff`.
+    ///
+    /// #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
+    /// `N_eff = Σ_row a²` (`self.n_eff`), NOT the global row count `n`: `N_eff` is the
+    /// Fisher information a gated atom actually accumulates, so it is the honest BIC
+    /// scale, and it matches the MP edge in `recon_spectrum` (which already uses
+    /// `n_eff`). This satisfies inert-row invariance — appending rows on which the
+    /// atom's gate is OFF adds 0 to `Σa²` and so must not change the charge — which
+    /// `log n` violates. Floored at `N_eff=1` to keep the log non-negative.
+    pub fn rank_charge(&self) -> f64 {
+        0.5 * self.rank_hard() * self.basis_edf * self.n_eff.max(1.0).ln()
     }
 
-    /// WBIC / singular free-energy charge `½·rank_soft·basis_edf·log n`.
-    pub fn wbic_charge(&self, n: usize) -> f64 {
-        0.5 * self.rank_soft() * self.basis_edf * (n as f64).ln()
+    /// WBIC / singular free-energy charge `½·rank_soft·basis_edf·log N_eff`. Same
+    /// occupancy-aware `log N_eff` scale as [`Self::rank_charge`] (#2a).
+    pub fn wbic_charge(&self) -> f64 {
+        0.5 * self.rank_soft() * self.basis_edf * self.n_eff.max(1.0).ln()
     }
 
     /// Watanabe learning-coefficient estimate `λ̂ = ½·rank_soft·basis_edf` (`≤ d/2`,
     /// the singular bound); the regular Laplace coefficient is
     /// `½·rank_hard·basis_edf`.
+    ///
+    /// Theorem K: this `λ̂` IS the running complexity `λ(n) = d(−log Z)/d(log n)`
+    /// (the coefficient of `ln N_eff` in the atom's evidence charge) evaluated in the
+    /// FINITE-n regime. The default hard charge uses its `n→∞` limit
+    /// `½·rank_hard·basis_edf`; both are the same object, so the soft ledger reduces to
+    /// the hard one away from the MP edge and drops below it near a singularity.
+    ///
+    /// SYMMETRY-IS-CHARGE: a truth with a continuous symmetry — a compact stabilizer
+    /// of dimension `s` acting on the atom (e.g. the O(2) rotation of a clean circle
+    /// chart, or a gauge/permutation orbit of the decoder) — freezes `s` reconstruction
+    /// directions AT `μ=0`. Those directions never cross the noise edge, so they drop
+    /// `rank_soft` (hence `λ̂`) by `s/2` relative to a would-be regular model of the
+    /// same nominal dimension: the running complexity is `λ = (d−s)/2` where `d` counts
+    /// unconstrained directions. The evidence LOST to that lower `λ·ln n` charge is
+    /// exactly the evidence GAINED as `+log Vol(orbit)` (the O(1) integral over the
+    /// symmetry orbit in the Laplace expansion) — a symmetric atom is cheaper to encode
+    /// by precisely its orbit volume. This is why a genuinely curved (symmetric) atom is
+    /// NOT penalized as a full-rank blob: its stabilizer is a discount, not a cost.
     pub fn learning_coefficient(&self) -> f64 {
         0.5 * self.rank_soft() * self.basis_edf
     }
@@ -227,8 +262,8 @@ pub struct AuditRow {
 impl AuditRow {
     /// Price a named atom from its reconstruction spectrum.
     pub fn from_spectrum(name: impl Into<String>, spec: &ReconSpectrum, n: usize) -> Self {
-        let rank_charge = spec.rank_charge(n);
-        let wbic_charge = spec.wbic_charge(n);
+        let rank_charge = spec.rank_charge();
+        let wbic_charge = spec.wbic_charge();
         let overcharge = rank_charge - wbic_charge;
         let overcharge_frac = if rank_charge.abs() > 0.0 {
             overcharge / rank_charge
@@ -742,6 +777,189 @@ mod tests {
             "gaussian blend must price ~0: rank_hard={:.3} rank_soft={:.3}",
             blend.rank_hard,
             blend.rank_soft
+        );
+    }
+
+    /// #2a INERT-ROW INVARIANCE (the correctness criterion for the occupancy scale).
+    /// Appending rows on which the atom's gate is OFF (weight 0) changes neither the
+    /// atom's likelihood nor its curvature nor its effective sample size N_eff = Σ a²,
+    /// so it must NOT change the atom's rank charge. The fixed charge (½·d_eff·ln N_eff)
+    /// satisfies this exactly — the appended zero-weight rows add 0 to Σa² and 0 to the
+    /// Gram, so the whole reconstruction spectrum is bit-identical. The OLD global-row
+    /// scale (½·d_eff·ln n_obs) VIOLATES it: n_obs grows from N to N+M, inflating the
+    /// charge of a real (rank_hard>0) atom by ½·d_eff·ln((N+M)/N) nats — a spurious
+    /// penalty for exactly the sparse, selective atoms an SAE exists to find.
+    #[test]
+    fn rank_charge_is_inert_row_invariant() {
+        let mut s = 0x7777_u64;
+        let n = 400usize;
+        let p = 12usize;
+        // A clean rank-2 circle (gate ON, weight 1) on N rows.
+        let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
+        let phi = harmonic_phi(&turns, 3);
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = std::f64::consts::TAU * turns[i];
+            data[[i, 0]] += a.cos();
+            data[[i, 1]] += a.sin();
+            for j in 0..p {
+                data[[i, j]] += 0.05 * lcg_normal(&mut s);
+            }
+        }
+        let w_on = vec![1.0_f64; n];
+        let spec_before = spectrum_from_fit(data.view(), &w_on, &phi, 0.0025, 0.0, None).unwrap();
+
+        // Append M rows on which the atom's gate is OFF (weight 0). n_obs grows to N+M
+        // but the atom sees none of them: N_eff, the Gram, and the decoder are unchanged.
+        let m_extra = 600usize;
+        let n_aug = n + m_extra;
+        let mut turns_aug = turns.clone();
+        let mut data_aug = Array2::<f64>::zeros((n_aug, p));
+        data_aug.slice_mut(ndarray::s![0..n, ..]).assign(&data);
+        for _ in 0..m_extra {
+            turns_aug.push(lcg(&mut s)); // arbitrary chart position; gate is off anyway
+        }
+        // Fill the appended rows with arbitrary (nonzero) reconstruction targets to
+        // prove the invariance is due to the GATE (weight 0), not zero data.
+        for i in n..n_aug {
+            for j in 0..p {
+                data_aug[[i, j]] = lcg_normal(&mut s);
+            }
+        }
+        let phi_aug = harmonic_phi(&turns_aug, 3);
+        let mut w_aug = vec![1.0_f64; n];
+        w_aug.extend(std::iter::repeat(0.0_f64).take(m_extra));
+        let spec_after =
+            spectrum_from_fit(data_aug.view(), &w_aug, &phi_aug, 0.0025, 0.0, None).unwrap();
+
+        // THE AXIOM: the fixed charge is bit-identical across the inert-row append.
+        assert_eq!(
+            spec_before.rank_charge(),
+            spec_after.rank_charge(),
+            "inert (gate-off) rows must not change the rank charge: before={} after={}",
+            spec_before.rank_charge(),
+            spec_after.rank_charge()
+        );
+        // N_eff is invariant (that is WHY the charge is); n_obs is not.
+        assert_eq!(spec_before.n_eff, spec_after.n_eff);
+        // FALSIFY THE OLD SCALE: under ½·d_eff·ln(n_obs) the same append would have
+        // inflated the charge (rank_hard>0, n_obs grows N→N+M), so the two scales are
+        // genuinely different and this test would fail on the pre-#2a code.
+        assert!(spec_after.rank_hard() > 0.0, "fixture must have a real above-edge atom");
+        let old_before = 0.5 * spec_before.rank_hard() * spec_before.basis_edf * (n as f64).ln();
+        let old_after = 0.5 * spec_after.rank_hard() * spec_after.basis_edf * (n_aug as f64).ln();
+        assert!(
+            old_after > old_before + 1e-6,
+            "the OLD global-n scale WOULD have inflated the charge on inert rows \
+             (old_before={old_before:.4} old_after={old_after:.4}); the fix removes exactly this"
+        );
+    }
+
+    /// #2a EXPLICIT FORMULA on a known small fixture: the rank charge is
+    /// ½·d_eff·ln N_eff with d_eff = rank_hard·basis_edf and N_eff the occupancy-aware
+    /// effective sample size — NOT the global row count. Pins the scale so a regression
+    /// back to ln(n) is caught.
+    #[test]
+    fn rank_charge_equals_half_deff_ln_neff() {
+        // One strong direction far above the edge (mu=10 ≫ edge=1) and one far below
+        // (mu=0.01): rank_hard = 1. Small hand-set numbers, no fit.
+        let spec = ReconSpectrum {
+            mu: vec![10.0, 0.01],
+            edge: 1.0,
+            basis_edf: 3.0,
+            n_eff: 50.0,
+        };
+        assert_eq!(spec.rank_hard(), 1.0);
+        let d_eff = spec.rank_hard() * spec.basis_edf; // 3.0
+        let expected = 0.5 * d_eff * (50.0_f64).ln();
+        assert!(
+            (spec.rank_charge() - expected).abs() < 1e-12,
+            "rank charge must be ½·d_eff·ln(N_eff)={expected}, got {}",
+            spec.rank_charge()
+        );
+        // And it must NOT equal the global-n form for any n != N_eff (here n=5000).
+        let global = 0.5 * d_eff * (5000.0_f64).ln();
+        assert!(
+            (spec.rank_charge() - global).abs() > 1.0,
+            "charge must use N_eff (50), not a global n (5000)"
+        );
+    }
+
+    /// Theorem K SOFT-LEDGER regime test: the unified charge `λ(N_eff)·ln N_eff` with
+    /// the WBIC soft λ (= `wbic_charge`) must (a) REDUCE to the hard rank charge away
+    /// from the MP edge — a clean circle whose two directions sit far above the edge —
+    /// and (b) sit STRICTLY BELOW the hard charge near the edge — a filled disk whose
+    /// directions pile just above the edge, where the hard count prices each as a full
+    /// unit but the tempered count discounts them. This is the finite-n Watanabe
+    /// correction the opt-in `reml_criterion_with_cache_soft_charge` engages.
+    #[test]
+    fn soft_ledger_reduces_to_hard_away_from_edge_and_undercuts_near_it() {
+        let n = 1200usize;
+        let p = 16usize;
+
+        // (A) CLEAN circle far above the edge ⇒ soft ≈ hard.
+        let mut s = 0xA1A1_u64;
+        let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
+        let phi = harmonic_phi(&turns, 3);
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = std::f64::consts::TAU * turns[i];
+            data[[i, 0]] += a.cos();
+            data[[i, 1]] += a.sin();
+            for j in 0..p {
+                data[[i, j]] += 0.05 * lcg_normal(&mut s);
+            }
+        }
+        let w = vec![1.0_f64; n];
+        let clean = spectrum_from_fit(data.view(), &w, &phi, 0.0025, 0.0, None).unwrap();
+        // soft charge == wbic_charge; hard == rank_charge. Reduction: within 5%.
+        assert!(clean.rank_charge() > 0.0);
+        // soft ≈ hard away from the edge: the two strong directions each count ≈1 under
+        // the sigmoid, so the ratio sits near 1 (it can be marginally ABOVE 1 because
+        // the far-below-edge harmonics still add a little soft mass the hard step drops).
+        let clean_ratio = clean.wbic_charge() / clean.rank_charge();
+        assert!(
+            (clean_ratio - 1.0).abs() < 0.05,
+            "clean circle: soft ledger must reduce to the hard charge away from the edge \
+             (ratio soft/hard={clean_ratio:.3})"
+        );
+
+        // (B) FILLED disk piling directions just above the edge ⇒ soft < hard.
+        let mut s = 0xB2B2_u64;
+        let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
+        let radii: Vec<f64> = (0..n).map(|_| lcg(&mut s).sqrt()).collect();
+        let phi = harmonic_phi(&turns, 3);
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let a = std::f64::consts::TAU * turns[i];
+            data[[i, 0]] += 0.35 * radii[i] * a.cos();
+            data[[i, 1]] += 0.35 * radii[i] * a.sin();
+            for j in 0..p {
+                data[[i, j]] += 0.12 * lcg_normal(&mut s);
+            }
+        }
+        let disk = spectrum_from_fit(data.view(), &w, &phi, 0.12 * 0.12, 0.0, None).unwrap();
+        assert!(
+            disk.rank_hard() > 0.0 && disk.rank_soft() < disk.rank_hard(),
+            "disk fixture must have above-edge directions the tempered count discounts: \
+             hard={:.3} soft={:.3}",
+            disk.rank_hard(),
+            disk.rank_soft()
+        );
+        assert!(
+            disk.wbic_charge() < disk.rank_charge(),
+            "disk: soft ledger must undercut the hard charge near the edge \
+             (soft={:.4} hard={:.4})",
+            disk.wbic_charge(),
+            disk.rank_charge()
+        );
+        // The discount must be materially larger for the near-edge disk than for the
+        // far-from-edge circle — the whole point of the soft regime.
+        let disk_ratio = disk.wbic_charge() / disk.rank_charge();
+        assert!(
+            disk_ratio < clean_ratio - 0.1,
+            "near-edge soft/hard ratio ({disk_ratio:.3}) must be clearly below the \
+             far-from-edge ratio ({clean_ratio:.3})"
         );
     }
 }

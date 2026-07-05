@@ -668,6 +668,20 @@ pub struct SaeManifoldTerm {
     /// circle from a blend (both rank-2) — that is the producer's job. Carried
     /// across clones like the other per-fit config.
     pub(crate) rank_charge_evidence: bool,
+    /// Theorem K — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
+    /// path) for the WBIC SOFT rank-charge ledger. Only has effect when
+    /// `rank_charge_evidence` is also on: inside that branch the per-atom coefficient
+    /// of the occupancy log-scale `ln N_eff,k` becomes the finite-n WBIC learning
+    /// coefficient `λ_k = ½·rank_soft_k·basis_edf_k` (the tempered β=1/log n count on
+    /// the occupancy-corrected reconstruction spectrum) instead of the hard limit
+    /// `½·d_eff,k`. The two coincide away from the Marchenko–Pastur edge (soft→hard)
+    /// and the soft one is strictly smaller near it — the honest Watanabe correction
+    /// for near-singular curved atoms. The rank_eff==0 categorical veto (a validity
+    /// condition, not a small charge) is unchanged. Carried across clones like the
+    /// other per-fit config so a cloned candidate (e.g. a stagewise per-birth clone)
+    /// keeps the same charge currency — the field, NOT a thread-local, is the source
+    /// of truth so it propagates correctly across rayon worker threads.
+    pub(crate) soft_rank_charge: bool,
     /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
     /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
     /// no env lever. Carried across clones.
@@ -779,6 +793,7 @@ impl Clone for SaeManifoldTerm {
             quotient_scale: self.quotient_scale,
             cone_atom_recovery: self.cone_atom_recovery,
             rank_charge_evidence: self.rank_charge_evidence,
+            soft_rank_charge: self.soft_rank_charge,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
             // Rung-2 behavioral identity is persisted configuration (like the
@@ -819,4 +834,75 @@ pub(crate) struct SaeManifoldMutableState {
     pub(crate) logits: Array2<f64>,
     pub(crate) coords: Vec<LatentCoordValues>,
     pub(crate) last_row_layout: Option<SaeRowLayout>,
+}
+
+#[cfg(test)]
+mod soft_rank_charge_flag_tests {
+    use crate::manifold::{
+        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+        SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldTerm,
+    };
+    use gam_terms::latent::LatentManifold;
+    use ndarray::Array2;
+    use std::sync::Arc;
+
+    /// A minimal unfitted K=1 periodic term — enough to exercise the manual
+    /// `Clone for SaeManifoldTerm` field copy (no joint fit needed).
+    fn tiny_term() -> SaeManifoldTerm {
+        let n = 8usize;
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut decoder = Array2::<f64>::zeros((3, p));
+        decoder[[1, 0]] = 1.0;
+        decoder[[2, 1]] = 1.0;
+        let atom = SaeManifoldAtom::new(
+            "circle".to_string(),
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap();
+        let logits = Array2::<f64>::from_elem((n, 1), 1.0);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, false),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom], assignment).unwrap()
+    }
+
+    /// The Theorem K soft-rank-charge opt-in must default OFF (bit-identical hard
+    /// path) and, being persisted per-fit config, must PROPAGATE across the manual
+    /// `Clone` impl. Stagewise clones the term once per birth and parallel folds
+    /// hand clones to rayon workers, so a flag that failed to clone would silently
+    /// drop the soft charge in exactly those paths (the reason the earlier
+    /// thread-local gate was replaced by this field).
+    #[test]
+    fn soft_rank_charge_defaults_false_and_clones() {
+        let mut term = tiny_term();
+        assert!(
+            !term.soft_rank_charge(),
+            "soft_rank_charge must default OFF (bit-identical historical hard path)"
+        );
+        assert!(!term.clone().soft_rank_charge(), "a false flag must clone as false");
+
+        term.set_soft_rank_charge(true);
+        assert!(term.soft_rank_charge());
+        assert!(
+            term.clone().soft_rank_charge(),
+            "soft_rank_charge=true must propagate across the manual Clone (stagewise \
+             per-birth clone / rayon worker), NOT silently reset"
+        );
+
+        term.set_soft_rank_charge(false);
+        assert!(!term.soft_rank_charge());
+        assert!(!term.clone().soft_rank_charge());
+    }
 }

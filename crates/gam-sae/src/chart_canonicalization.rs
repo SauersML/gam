@@ -1,3 +1,59 @@
+//! ═══════════════════════════════════════════════════════════════════════════
+//! Structure-theory grounding (memo Part VI, "binding = transport", Prop H):
+//!
+//! A fitted atom's decoder `γ = Φ(t)·B` and its latent chart `t` are related by
+//! an intrinsic (gauge-invariant) smoothness penalty that scores every
+//! reparameterization `t ↦ φ(t)`, `φ ∈ Diff(M)`, identically — the penalty sees
+//! only the pullback metric / curve up to diffeomorphism, never the coordinate
+//! itself. So the fit does not pick a point in coordinate space; it picks an
+//! entire `Diff(M)` ORBIT, and that orbit IS a fiber of the memo's GAUGE
+//! GROUPOID: two charts `t`, `φ(t)` on the same orbit are gauge-equivalent
+//! representations of one physical atom, and reconstruction EV cannot see the
+//! difference (the planted-circle witness: a full loop compressed into ~1 rad
+//! of chart span still scores EV 0.9979 — image perfect, chart arbitrary).
+//!
+//! This module is a SLICE of that groupoid: for each reference topology it
+//! picks out ONE canonical representative per orbit —
+//!   * `d = 1` (circle / interval): the arc-length (unit-speed) representative
+//!     ([`unit_speed_reparameterization`]);
+//!   * `d = 2` torus / free patch: the minimum-isometry-defect flow chart
+//!     ([`torus_isometry_flow_reparameterization`],
+//!     [`patch_isometry_flow_reparameterization`]);
+//!   * `d = 2` sphere: the round-sphere conformal-boost chart
+//!     ([`sphere_isometry_flow_reparameterization`]).
+//! Each slice is EXACT and IMAGE-FROZEN: the recomposed decoder reproduces the
+//! original decoded curve/surface pointwise (`recompose_decoder_exact_ls`) and
+//! the transport is a congruence that preserves the smoothness quadratic form
+//! (`B̃ᵀ S̃ B̃ = Bᵀ S B`). So picking the slice changes nothing the objective (data
+//! fit + intrinsic smoothness) can see — it is a gauge RETRACTION along the
+//! orbit, the concrete realization of the memo's "binding = transport" slogan:
+//! moving the *representation* to a canonical gauge without moving the physics.
+//!
+//! After the slice is taken, what remains of the chart freedom is no longer the
+//! full continuous `Diff(M)` — it collapses to the finite LINEAR STABILIZER of
+//! the reference manifold under its own isometry group: `O(2)` (rotation +
+//! reflection) for the circle, reflection + translation for the interval,
+//! `Isom(T², flat) = U(1)² ⋊ D₄` for the torus, `O(2) ⋉ ℝ²` for the flat patch,
+//! `O(3)` for the round sphere. THIS residual group is exactly Proposition H's
+//! uniqueness condition for canonical layer transport: two fitted atoms (or two
+//! layers of the same atom across refits) are honestly bindable/comparable iff
+//! they agree up to this residual stabilizer — nothing coarser is guaranteed,
+//! and nothing finer is left to compare. The `PinnedByCanonicalization`
+//! provenance ([`crate::identifiability::VerdictProvenance`]) is the
+//! certificate that this collapse — continuous `Diff(M)` freedom sliced down to
+//! the finite residual — has actually been performed for a given atom.
+//!
+//! The honesty gate threaded through every arm (`CHART_RECOMPOSITION_REL_TOL`,
+//! `recompose_decoder_exact_ls` returning `Ok(None)`) is the module's
+//! realization of the memo's honesty doctrine: a basis too poor to carry the
+//! reparameterized image through exactly REFUSES the slice rather than taking
+//! it lossily — canonicalization is a retraction or it does not happen. The
+//! diffeomorphism guards (`SAE_FLOW_DIFFEO_MIN_DET`,
+//! `min_jacobian_det_on_grid`) are the complementary safety rail: they keep the
+//! candidate slice INSIDE `Diff(M)` (`det Dφ > 0` everywhere), because a folded
+//! map leaves the gauge orbit entirely rather than moving along it.
+//! ═══════════════════════════════════════════════════════════════════════════
+//!
 //! #1019 stage 1 / #2022 — arc-length (unit-speed) chart canonicalization for `d = 1`.
 //! The arc-length reparameterization is exact and IMAGE-FROZEN (reconstruction
 //! unchanged; the transport preserves `BᵀSB`), so it is a gauge RETRACTION along
@@ -205,6 +261,13 @@ fn partial_cell_arc(f0: f64, fm: f64, f1: f64, h: f64, x: f64) -> f64 {
 ///   arc length, collapsed interval range), or
 /// * the basis family cannot absorb the reparameterized curve within
 ///   [`CHART_RECOMPOSITION_REL_TOL`] of the curve scale on the audit grid.
+// Gauge-theory reading: `row_coords` ranges over one point of the `Diff(S¹)` /
+// `Diff([0,1])` orbit the fit actually picked; this function computes the
+// SLICE representative of that same orbit (arc length is the unique
+// unit-speed member) and the transport `T` that carries the decoder there.
+// Everything downstream of a successful `Some(..)` return is gauge-equivalent
+// to the input under the residual `O(2)` / reflection+translation stabilizer
+// — never a different physical fit.
 pub fn unit_speed_reparameterization(
     evaluator: &dyn SaeBasisEvaluator,
     decoder: ArrayView2<'_, f64>,
@@ -365,6 +428,15 @@ pub(crate) struct DecoderRecomposition {
     pub recomposition_residual: f64,
 }
 
+// This is the module's one TRANSPORT primitive in the "binding = transport"
+// sense: `T` is the exact congruence carrying the decoder from the fitted
+// gauge to the canonical-slice gauge with the decoded image held fixed
+// pointwise (image-frozen — no new information enters, only the
+// representation moves). The honesty gate below is what makes the slice
+// trustworthy: if the basis cannot carry the reparameterized curve/surface to
+// within `CHART_RECOMPOSITION_REL_TOL`, the function REFUSES (`Ok(None)`)
+// instead of committing a lossy transport — the slice is taken only when it
+// is exact, never approximately.
 pub(crate) fn recompose_decoder_exact_ls(
     evaluator: &dyn SaeBasisEvaluator,
     decoder: ArrayView2<'_, f64>,
@@ -414,6 +486,17 @@ pub(crate) fn recompose_decoder_exact_ls(
 
 // ════════════════════════════════════════════════════════════════════════════
 // #1019 stage 2 — d = 2 torus isometry-flow chart canonicalization
+//
+// Gauge-theory reading: the `Diff(T²)` orbit here is infinite-dimensional; this
+// arm slices it via a finite-dimensional PARAMETERIZED sub-family (the
+// truncated Fourier flow `φ_θ`) and descends the isometry defect over `θ` to
+// find the flat-isometric representative within that family. The slice is
+// still exact (image-frozen recomposition, honesty-gated) even though the
+// search over `θ` is a numerical minimization rather than a closed form — the
+// residual gauge left over is `Isom(T², flat) = U(1)² ⋊ D₄` (pure torus
+// translations, the axis-swap/reflection dihedral symmetry), which is why
+// translations are excluded from the flow basis below: they are already in the
+// residual stabilizer, not something the slice needs to remove.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Highest Fourier order per axis of the truncated flow basis on `T²`:
@@ -435,6 +518,13 @@ pub const TORUS_FLOW_MAX_HARMONIC: i32 = 2;
 /// conservative guard rather than a tuned operating point. The torus, free
 /// patch, and sphere flows all enforce the IDENTICAL contract, so the value
 /// lives here once and the per-topology floors below alias it.
+///
+/// Gauge-theory role: `det Dφ > 0` is precisely the condition that `φ` stays
+/// inside `Diff(M)` — a fold (`det Dφ ≤ 0` somewhere) is not a reparameteriza-
+/// tion at all, it is a map that identifies distinct points or reverses
+/// orientation locally, so it would leave the gauge orbit rather than move
+/// along it. This constant is what keeps every flow-based slice a genuine
+/// gauge retraction instead of an information-destroying collapse.
 pub const SAE_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
 
 /// Torus-flow diffeomorphism floor — see [`SAE_FLOW_DIFFEO_MIN_DET`].
@@ -843,6 +933,15 @@ pub struct ChartArcLengthReading {
     pub total_arc_length: f64,
 }
 
+// Gauge-theory reading: `coords_u_arc` is the gauge-invariant OBSERVABLE this
+// module ultimately exists to expose. It is computed by the same map as the
+// mutating slice ([`unit_speed_reparameterization`]) but without ever touching
+// the decoder or requiring the recomposition gate to pass — the arc-length
+// position along a fitted curve is well-defined from `(decoder, basis)` alone,
+// independent of which point of the `Diff(M)` orbit the fit happened to land
+// on. Any downstream consumer reading angle/dose/adjacency off the raw `t_i`
+// is reading a gauge-ARBITRARY quantity; reading `coords_u_arc` instead reads
+// the coordinate that is actually pinned by the physics.
 pub fn chart_arclength_coordinates(
     evaluator: &dyn SaeBasisEvaluator,
     decoder: ArrayView2<'_, f64>,
@@ -1481,6 +1580,14 @@ pub fn torus_isometry_flow_reparameterization(
 // ════════════════════════════════════════════════════════════════════════════
 // #1019 stage 2 — d = 2 free/patch (Euclidean-patch) isometry-flow chart
 // canonicalization
+//
+// Gauge-theory reading: a contractible patch carries no hairy-ball obstruction,
+// so (unlike the sphere arm below) this slice is a genuine global minimization
+// over an affine flow family, pinning the uniform-speed representative of the
+// `Diff(patch)` orbit. The residual gauge left after the slice is the flat
+// isometry group `O(2) ⋉ ℝ²` (rotation + reflection + translation) — reported
+// via `PinnedByCanonicalization`, exactly the Prop-H stabilizer two patch fits
+// must agree up to before they can be called the same bound feature.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Highest total polynomial degree of the truncated vector-field flow basis on
@@ -1897,6 +2004,18 @@ pub fn patch_isometry_flow_reparameterization(
 
 // ════════════════════════════════════════════════════════════════════════════
 // #1019 sphere arm — d = 2 sphere (S²) isometry-flow chart canonicalization
+//
+// Gauge-theory reading: on `S²` the hairy-ball theorem forbids a pole-free
+// global flow basis, so the residual chart freedom after the gauge-invariant
+// fit is not the finite isometry group directly — it is the full conformal
+// (Möbius) group `PSL(2,ℂ)`, of which `O(3)` (the round sphere's isometries)
+// is only a subgroup. This arm's slice therefore targets the non-isometric
+// complement of that subgroup: the three conformal BOOSTS (gradients of the
+// degree-1 harmonics). Minimizing the isometry defect over just the boosts
+// breaks the conformal moduli down to `O(3)` — the residual stabilizer
+// `PinnedByCanonicalization` reports — while leaving the true rotational
+// isometries alone (they are already defect-null, i.e. already in the
+// stabilizer, so including them would only add null directions to the solve).
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Diffeomorphism floor `δ` for the sphere conformal-boost flow: a candidate
@@ -2107,10 +2226,21 @@ pub struct SphereIsometryFlowReparameterization {
 /// `svec` Gauss–Newton are identical to the torus derivation.
 ///
 /// Whitening by `L(φ(t_i))` (the reference at the MOVED point) rather than
-/// `L(lat_i)` keeps the measured object the true round-sphere defect of the new
-/// chart; to first order in `θ` the two agree, and the post-hoc defect
-/// re-measurement on the committed chart ([`sphere_chart_isometry_defect`])
-/// plus the strict-improvement gate make the commit exact-or-refused.
+/// `L(lat_i)` targets the true round-sphere defect of the new chart. Note the
+/// honest limit: `L(φ_θ(t_i))` is itself re-evaluated at the flow-moved latitude,
+/// so the Gauss–Newton residual actually descended equals the true defect only to
+/// FIRST ORDER in the step `θ` — for a non-infinitesimal step the two differ by an
+/// un-audited second-order term (the derivation's `svec` Jacobian treats the base
+/// `A0_i` as fixed, not re-differentiating `L(φ_θ)`). This does NOT make the pass
+/// incorrect, only its per-iterate objective an approximation of the quantity the
+/// derivation above names "exact": the deviation is caught SYMPTOMATICALLY, not
+/// analytically — the post-hoc defect re-measurement on the committed chart
+/// ([`sphere_chart_isometry_defect`], which evaluates `L` at the final moved point
+/// exactly) together with the strict-improvement gate reject any candidate that
+/// did not genuinely lower the true defect, so a committed chart is
+/// improved-or-refused even where the inner objective drifted. A fully exact inner
+/// objective would re-differentiate `L(φ_θ)` through the flow (a second-order
+/// correction), which is deliberately not done here.
 ///
 /// # Honest refusals (`Ok(None)`)
 ///

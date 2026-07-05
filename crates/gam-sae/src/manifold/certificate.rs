@@ -1,5 +1,31 @@
 use super::*;
 
+// Superposed-Geometry theory (internal memo, Part VI), curvature/measure side.
+//
+// The memo's central slogan is "curvature IS identifiability": superposition
+// ambiguity is fundamentally a FLATNESS disease. If two atoms' active regions
+// co-fire and both are LINEAR (flat) subspaces, any invertible recombination
+// (any GL relabeling of the co-active span) reconstructs the data identically
+// — the gauge groupoid acting on a flat dictionary is enormous (as large as
+// GL itself on the shared span), so a purely linear dictionary is generically
+// NON-identifiable under superposition. A CURVED atom is generically RIGID
+// instead: by jet transversality, two generic embeddings' second-order
+// osculation (agreement of position + tangent + curvature) is an
+// infinite-codimension coincidence, so a curved atom's residual gauge
+// collapses down to the much smaller Diff × Sym (reparameterize the chart,
+// permute/relabel symmetric atoms) rather than a full linear group. Circles —
+// showing up everywhere in fitted dictionaries — are not a curiosity; they
+// are the optimizer's equilibrium response to superposition pressure: bend
+// just enough to buy back identifiability.
+//
+// This module is the quantitative, certificate-producing face of that claim.
+// It is the curvature/measure-side complement to the support-side empirical
+// Terracini rank test in `identifiability.rs` / `isa_seed.rs`: that side
+// certifies from the SUPPORT geometry (transversality of active-row
+// tangents); this side certifies from CURVATURE + cross-atom INCOHERENCE
+// (the two are both needed — support transversality can fail to see a
+// flat-vs-curved distinction that this side exists to certify).
+
 /// The global-optimality verdict of the curved-dictionary incoherence
 /// certificate (#1008): whether the fit's basin stationary point is certified
 /// unique up to the residual gauge group, and by what margin.
@@ -47,15 +73,48 @@ impl GlobalOptimalityVerdict {
 /// `r > 1` (benign, well-resolved atoms) and rejects tightly-curved ones whose
 /// graph approximation is uncontrolled. Raising this constant only ever shrinks
 /// the certified region (withholds certification), never grants a wrong one.
+///
+/// This constant is the load-bearing pivot of "curvature is the
+/// identifiability resource, bounded above for tangent-graph validity": the
+/// factor `(1 − C_κ κ̂)` it feeds (see [`curved_dictionary_global_optimality_verdict`])
+/// is double-duty. Some curvature is *good* — it is precisely what breaks the
+/// flat GL gauge and lets the within-atom restricted-strong-convexity term pin
+/// each atom's identity — but too much curvature (`C_κ κ̂ ≥ 1`) voids the very
+/// tangent-graph perturbation the certificate is built on, so the same
+/// quantity that grants rigidity also bounds how far the atom is allowed to
+/// bend before the analysis stops applying.
 pub const SAE_CERT_CURVATURE_CONSTANT: f64 = 1.0;
 
 /// Conservative incoherence-budget constant `c0` in the sufficient condition
 /// `μ̂ ≤ c0 · a_floor² · (1 − 1/SNR) · (1 − C_κ κ̂) / K`. Small (conservative):
 /// shrinking the budget can only withhold certification, never grant a wrong
 /// one.
+///
+/// `μ̂` is the empirical cross-atom frame incoherence — the coupling channel
+/// through which the superposition/flatness disease acts (large `μ̂` means two
+/// atoms' output frames overlap enough, when co-active, for a cross-atom
+/// recombination to masquerade as the fit). The certificate's claim is exactly
+/// that incoherence (small `μ̂`) *plus* controlled curvature (`κ̂` bounded by
+/// [`SAE_CERT_CURVATURE_CONSTANT`]) together certify rigidity: superposition
+/// coupling that is weak enough, on a dictionary that is curved enough, cannot
+/// hide an alternative flat recombination.
 pub const SAE_CERT_INCOHERENCE_BUDGET: f64 = 0.125;
 
 /// The conservative curved-dictionary global-optimality threshold (#1008).
+///
+/// # Theory: curvature as the identifiability resource
+///
+/// Superposition ambiguity is a flatness disease: a purely linear (flat)
+/// dictionary has a gauge groupoid as large as GL acting on any co-active flat
+/// span, since any invertible recombination of co-firing linear directions
+/// reconstructs identically. Curved atoms are generically rigid instead — jet
+/// transversality makes second-order osculation between two generic
+/// embeddings an infinite-codimension coincidence, so a curved atom's residual
+/// gauge collapses to Diff × Sym. This function is the quantitative decision
+/// procedure for that claim: it takes the empirical curvature `κ̂`, cross-atom
+/// incoherence `μ̂` (the superposition coupling), activity floor, and SNR, and
+/// answers whether the fitted dictionary is curved-and-incoherent *enough* to
+/// certify the flat gauge does not apply here.
 ///
 /// # The condition
 ///
@@ -79,6 +138,13 @@ pub const SAE_CERT_INCOHERENCE_BUDGET: f64 = 0.125;
 /// `SNR > 1` (signal above noise). `a_floor` is the support activity floor
 /// (`min_k max_i a_ik`, the same statistic the collapse guard reads), `K` the
 /// atom count, `κ̂_max` the largest per-atom second-fundamental-form bound.
+///
+/// This is the memo's honesty-ledger doctrine applied to identifiability
+/// itself: identifiability stops being an assumption silently baked into "we
+/// fit a dictionary" and becomes a certificate the fit *carries* — either
+/// `CertifiedGlobal` with an auditable margin, or the structurally
+/// un-overclaimable `Uncertified`. There is no third option where the code
+/// asserts uniqueness without having checked it.
 ///
 /// # Conservatism
 ///
@@ -261,6 +327,16 @@ pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<Certifica
 
 /// Build the empirical curved-dictionary certificate quantities from a fitted
 /// term and an explicit Gaussian reconstruction dispersion.
+///
+/// This is where the theory's abstract quantities get measured off the
+/// fitted term: `mu_hat` (via [`dictionary_frame_incoherence`]) is the
+/// empirical cross-atom incoherence — the superposition coupling — and each
+/// `per_atom_kappa_hat` entry (via [`atom_curvature_bound`]) is the empirical
+/// second-fundamental-form curvature — the per-atom rigidity measure. Feeding
+/// the worst (largest) curvature and the weakest (support-floor) activity
+/// into [`curved_dictionary_global_optimality_verdict`] below is deliberately
+/// pessimistic per-atom: the certificate is only as strong as its most
+/// fragile, most tightly-curved constituent.
 pub fn dictionary_incoherence_report_with_dispersion(
     term: &SaeManifoldTerm,
     dispersion: f64,
@@ -437,6 +513,22 @@ pub(crate) fn atom_curvature_bound(term: &SaeManifoldTerm, atom_idx: usize) -> R
 /// formed by finite-differencing it in the captured channel's coefficients
 /// without mutating the term. With `decoder = atom.decoder_coefficients` this is
 /// exactly `atom_curvature_bound`.
+///
+/// This is the actual measurement of `κ̂`: at each observation row it forms the
+/// tangent frame `J(t) = Φ'(t) B` (the atom's embedded tangent space) and the
+/// second jet pushed through the same decoder, projects the second jet
+/// orthogonally *off* the tangent frame ([`projected_perp_norm`]), and
+/// normalizes by the local tangent scale. That perp-projected, tangent-scaled
+/// second derivative is exactly the (extrinsic) second fundamental form of the
+/// atom's image manifold — the differential-geometric object whose size *is*
+/// the rigidity measure the theory trades on: zero second fundamental form
+/// means the atom is locally flat (gauge-vulnerable, per the module's
+/// flatness-disease framing); a bounded-away-from-zero one is the curvature
+/// budget that lets [`curved_dictionary_global_optimality_verdict`] certify.
+/// The `max` over rows and axis pairs makes `κ̂` a sup-norm (worst-case, hence
+/// conservative) bound, and an unresolved tangent frame with nonzero perp
+/// second derivative reports `f64::INFINITY` rather than a misleadingly finite
+/// number.
 pub(crate) fn atom_curvature_bound_with_decoder(
     atom: &SaeManifoldAtom,
     atom_idx: usize,
