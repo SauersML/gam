@@ -1308,6 +1308,16 @@ fn refine_certified_start(
 /// it never bites a genuinely converging row (Newton in the Kantorovich regime
 /// is at least geometric and quadratic once `h < 1`, contracting `h` far faster
 /// than `1/64` per step) while still forcing termination on a plateau.
+///
+/// PRICED (#2071): the value only sets the termination bound
+/// `N < ln(2·h₀) / −ln(1 − c)` (below) — it is a floor on "real progress", not a
+/// tuning parameter, so any small `c ∈ (0, 1)` is correct; `1/64 = 2^-6` is priced
+/// for its bound. What breaks at 10×: at `c = 1/6.4` the floor starts rejecting
+/// slow-but-genuine geometric contractions near the `½` certifiable boundary
+/// (false plateaus → premature exact fallback); at `c = 1/640` the plateau bound
+/// loosens ~10× (`N` grows from a few hundred to a few thousand
+/// `row_certificate` solves on a pathological row). `1/64` keeps the bound at a
+/// few hundred while leaving a wide margin below Newton's actual contraction.
 const WARMUP_MIN_MULTIPLICATIVE_DECREASE: f64 = 1.0 / 64.0;
 
 /// Kantorovich-quadratic acceptance coefficient for the basin warm-up (FIX #4).
@@ -1316,6 +1326,16 @@ const WARMUP_MIN_MULTIPLICATIVE_DECREASE: f64 = 1.0 / 64.0;
 /// "genuinely-converging rows are untouched" guarantee explicit. Kept `< 1` so
 /// the quadratic path is itself a strict contraction (for `h < 1`,
 /// `κ·h² < κ·h < h`), which preserves the termination bound below.
+///
+/// PRICED (#2071): the only constraint the termination proof imposes is `κ < 1`
+/// (so the quadratic branch stays a strict contraction and cannot defeat the
+/// geometric bound); `0.5` is the natural centre of `(0, 1)`, a factor-2 margin
+/// below the `κ = 1` boundary. What breaks at 10×: `κ = 5` violates `κ < 1` and
+/// the quadratic branch could ACCEPT an expanding step (`κ·h² > h` for
+/// `h > 1/κ`), breaking termination; `κ = 0.05` merely tightens the quadratic
+/// acceptance (fewer rows take the quadratic branch, more fall to the geometric
+/// floor) with no correctness effect. Anything in `(0, 1)` is sound; `0.5` maximises
+/// the margin.
 const WARMUP_QUADRATIC_KAPPA: f64 = 0.5;
 
 /// Sufficient-decrease test for the basin-warmup loop (FIX #4).
