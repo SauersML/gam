@@ -3266,83 +3266,11 @@ mod tests {
         );
     }
 
-    /// Births/round MULTIPLIER benchmark (run explicitly: `--ignored`). Plants
-    /// `K_PLANT` disjoint circles and reports serial vs batched accepted births
-    /// and the max co-accept width — the CPU-parallel speed multiplier before any
-    /// GPU batching. Not a CI gate (no wall-clock assertion, per SPEC).
-    #[test]
-    #[ignore]
-    fn bench_batched_births_multiplier() {
-        use std::time::Instant;
-        let k_plant = 16usize;
-        let per = 8usize;
-        let n = k_plant * per;
-        let p = 2 * k_plant;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
-        let mut target = Array2::<f64>::zeros((n, p));
-        for c in 0..k_plant {
-            for pos in 0..per {
-                let r = c * per + pos;
-                let th = std::f64::consts::TAU * (pos as f64) / (per as f64);
-                target[[r, 2 * c]] = th.cos();
-                target[[r, 2 * c + 1]] = th.sin();
-            }
-        }
-        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
-        let mut config = test_config();
-        config.max_births = k_plant + 4;
-        config.max_backfit_sweeps = 0;
-        let build_seed = || {
-            let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
-            let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < per]).collect();
-            let (mut seed, mut rho) = build_term_gate(vec![atom0], vec![cb0], &active, mode);
-            seed.set_guards_enabled(false);
-            seed.run_joint_fit_arrow_schur(
-                target.view(),
-                &mut rho,
-                None,
-                config.inner_max_iter,
-                config.learning_rate,
-                config.ridge_ext_coord,
-                config.ridge_beta,
-            )
-            .unwrap();
-            (seed, rho)
-        };
-
-        let (seed_s, rho_s) = build_seed();
-        let t0 = Instant::now();
-        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None).unwrap();
-        let serial_dt = t0.elapsed().as_secs_f64();
-
-        let (seed_b, rho_b) = build_seed();
-        let batch_config = BatchedStagewiseConfig {
-            base: config,
-            max_candidates_per_round: k_plant + 4,
-        };
-        let t1 = Instant::now();
-        let batched =
-            fit_stagewise_batched(seed_b, rho_b, target.view(), None, None, &batch_config).unwrap();
-        let batched_dt = t1.elapsed().as_secs_f64();
-
-        let max_co = batched
-            .batch_records
-            .iter()
-            .map(|r| r.co_accepted)
-            .max()
-            .unwrap_or(0);
-        eprintln!(
-            "THRPT bench: planted={k_plant} | serial births={} in {serial_dt:.3}s ({} rounds) | \
-             batched births={} in {batched_dt:.3}s ({} rounds, max co-accept={max_co}) | \
-             round-multiplier={:.1}x speedup={:.1}x",
-            serial.report.births_accepted,
-            serial.report.birth_records.len(),
-            batched.report.births_accepted,
-            batched.batch_records.len(),
-            serial.report.birth_records.len() as f64
-                / (batched.batch_records.len().max(1) as f64),
-            serial_dt / batched_dt.max(1e-9),
-        );
-    }
+    // The births/round MULTIPLIER *timing* benchmark that lived here was removed:
+    // it was `#[ignore]`d (a pure eprintln! wall-clock report, no assertion, "not
+    // a CI gate per SPEC"), and `#[ignore]`d timing benches are banned workspace-
+    // wide by `build.rs`. The behavioural guarantee it shared — that the batched
+    // driver co-accepts ≥2 births from one residual snapshot (i.e. it is not a
+    // serial loop in disguise) — is enforced non-ignored by
+    // `batched_driver_matches_serial_and_batches` directly above.
 }
