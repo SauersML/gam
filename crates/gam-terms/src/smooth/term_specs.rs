@@ -5851,6 +5851,61 @@ pub fn build_random_effect_block(
     })
 }
 
+#[cfg(test)]
+mod random_effect_signed_zero_tests {
+    use super::{RandomEffectTermSpec, build_random_effect_block};
+    use ndarray::array;
+
+    fn spec() -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: "g".to_string(),
+            feature_col: 0,
+            drop_first_level: false,
+            penalized: true,
+            frozen_levels: None,
+            lenient_unseen: true,
+        }
+    }
+
+    #[test]
+    fn signed_zero_rows_share_one_group() {
+        // A column mixing +0.0 and -0.0 for the physically same group must
+        // intern as ONE level, and every row (either spelling) must resolve to
+        // that single group column — the #2145 fit-side regression.
+        let data = array![[-0.0_f64], [0.0], [1.0], [-0.0], [1.0]];
+        let block = build_random_effect_block(data.view(), &spec()).unwrap();
+        assert_eq!(block.num_groups, 2, "0.0/-0.0 must not split into two groups");
+        // Rows 0,1,3 are the same group; rows 2,4 the other.
+        assert_eq!(block.group_ids[0], block.group_ids[1]);
+        assert_eq!(block.group_ids[0], block.group_ids[3]);
+        assert_eq!(block.group_ids[2], block.group_ids[4]);
+        assert_ne!(block.group_ids[0], block.group_ids[2]);
+    }
+
+    #[test]
+    fn frozen_positive_zero_matches_negative_zero_row() {
+        // A model frozen on +0.0 must resolve a -0.0 prediction row to the same
+        // column — the #2145 predict-side regression that dropped the effect.
+        let mut s = spec();
+        s.frozen_levels = Some(vec![0.0_f64.to_bits(), 1.0_f64.to_bits()]);
+        let data = array![[-0.0_f64], [1.0]];
+        let block = build_random_effect_block(data.view(), &s).unwrap();
+        assert_eq!(block.group_ids[0], Some(0), "-0.0 must match the +0.0 column");
+        assert_eq!(block.group_ids[1], Some(1));
+    }
+
+    #[test]
+    fn frozen_negative_zero_matches_positive_zero_row() {
+        // The symmetric direction: a legacy model interned on -0.0 (pre-fix)
+        // must still resolve a +0.0 prediction row after canonicalization.
+        let mut s = spec();
+        s.frozen_levels = Some(vec![(-0.0_f64).to_bits(), 1.0_f64.to_bits()]);
+        let data = array![[0.0_f64], [1.0]];
+        let block = build_random_effect_block(data.view(), &s).unwrap();
+        assert_eq!(block.group_ids[0], Some(0), "+0.0 must match the -0.0 column");
+    }
+}
+
 impl SmoothDesign {
     /// Map an unconstrained term coefficient vector to its constrained shape space.
     /// This is useful for nonlinear fits that optimize unconstrained parameters.

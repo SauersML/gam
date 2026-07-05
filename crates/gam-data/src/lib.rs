@@ -2802,4 +2802,59 @@ mod tests {
         let selected = projected_headers(&all, &[0, 1]);
         assert_eq!(selected, all);
     }
+
+    #[test]
+    fn canonical_level_bits_collapses_signed_zero() {
+        // The whole point of the helper: +0.0 and -0.0 name the same real
+        // number (IEEE-754: 0.0 == -0.0) and MUST map to the same key, even
+        // though their raw bit patterns differ (#2145 / #2146).
+        let pos = 0.0_f64;
+        let neg = -0.0_f64;
+        assert_ne!(pos.to_bits(), neg.to_bits(), "precondition: raw bits differ");
+        assert_eq!(pos, neg, "precondition: numerically equal");
+        assert_eq!(canonical_level_bits(pos), canonical_level_bits(neg));
+        assert_eq!(canonical_level_bits(neg), 0.0_f64.to_bits());
+        // -0.0 reached via ordinary arithmetic is handled the same way.
+        assert_eq!(canonical_level_bits(-1.0 * 0.0), 0.0_f64.to_bits());
+        assert_eq!(canonical_level_bits(0.0 - 0.0), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn canonical_level_bits_is_bit_stable_on_ordinary_values() {
+        // Every ordinary finite value keeps its raw key — the helper must not
+        // perturb the identity of any genuine level.
+        for &v in &[1.0_f64, -1.0, 2.5, -3.75, 1e300, -1e-300, f64::MIN, f64::MAX] {
+            assert_eq!(canonical_level_bits(v), v.to_bits(), "value {v}");
+        }
+        // Distinct real values keep distinct keys.
+        assert_ne!(canonical_level_bits(1.0), canonical_level_bits(2.0));
+        assert_ne!(canonical_level_bits(0.0), canonical_level_bits(1.0));
+        // Signed infinities are distinct (they are distinct real limits).
+        assert_ne!(
+            canonical_level_bits(f64::INFINITY),
+            canonical_level_bits(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn canonical_level_bits_collapses_nan_payloads() {
+        // Every NaN encoding denotes "not a number"; they collapse to one key.
+        let a = f64::NAN;
+        let b = f64::from_bits(0x7ff8_0000_0000_0001); // a different NaN payload
+        let c = -f64::NAN; // sign-bit-set NaN
+        assert!(a.is_nan() && b.is_nan() && c.is_nan());
+        assert_eq!(canonical_level_bits(a), canonical_level_bits(b));
+        assert_eq!(canonical_level_bits(a), canonical_level_bits(c));
+    }
+
+    #[test]
+    fn canonical_level_bits_is_idempotent() {
+        // Re-canonicalizing an already-canonical key is a no-op — the property
+        // the frozen-level resolution paths rely on.
+        for &v in &[0.0_f64, -0.0, 1.0, -2.0, f64::NAN] {
+            let once = canonical_level_bits(v);
+            let twice = canonical_level_bits(f64::from_bits(once));
+            assert_eq!(once, twice, "value {v}");
+        }
+    }
 }
