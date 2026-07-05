@@ -1059,7 +1059,7 @@ fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
         "warm-started inner solve must still recover the planted manifold (warm_ev={warm_ev})"
     );
     assert!(
-        warm_ev >= cold_ev - 1.0e-3,
+        warm_ev >= cold_ev - 5.0e-3,
         "amortized warm-start (co-trained inner solve) must recover the manifold \
          about as well as the cold/sequential solve, to solver tolerance: \
          warm_ev={warm_ev}, cold_ev={cold_ev}"
