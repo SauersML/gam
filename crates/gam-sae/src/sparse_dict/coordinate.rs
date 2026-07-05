@@ -106,6 +106,8 @@
 //! `f''(t̂) = −(2π)² ‖z‖`, so `Var(t̂) = σ²(2π)² / (2π)⁴‖z‖² = σ²/(2π‖z‖)²`.
 
 use super::block::BlockSparseFit;
+use crate::super_resolution::{recover_spikes, separation_limit};
+use ndarray::{Array2, ArrayView2};
 use std::f64::consts::TAU;
 
 /// The phase and amplitude of one firing on a coordinate (circle/harmonic)
@@ -143,6 +145,47 @@ pub struct BlockCoordinateReport {
     pub n_firings: usize,
     /// One [`FiringCoordinate`] per firing, in ascending row order.
     pub firings: Vec<FiringCoordinate>,
+}
+
+/// One point mass in a measure-valued harmonic firing.
+#[derive(Clone, Copy, Debug)]
+pub struct MeasureSpikeCoordinate {
+    /// Physical spike amplitude `a` in
+    /// `z_h = Σ_j a_j (cos 2πh t_j, sin 2πh t_j)`.
+    pub amplitude: f64,
+    /// Circle coordinate `t ∈ [0, 1)`.
+    pub coordinate: f64,
+    /// Delta-method standard error of [`Self::coordinate`].
+    pub coordinate_se: f64,
+}
+
+/// Variable-length code for one fired harmonic block in one row.
+#[derive(Clone, Debug)]
+pub struct MeasureValuedCode {
+    /// Block this measure lives on.
+    pub block: usize,
+    /// Row (token) index.
+    pub row: usize,
+    /// Point masses on the block's circle. A live firing always has at least one.
+    pub spikes: Vec<MeasureSpikeCoordinate>,
+    /// Dual-polynomial birth ratio for the single-spike residual. Values above
+    /// one are the threshold-free BLASSO multiplicity trigger.
+    pub dual_eta: f64,
+    /// Whether matrix-pencil super-resolution supplied the returned support.
+    pub used_super_resolution: bool,
+}
+
+/// Measure-valued readout for a block: one variable-length code per firing.
+#[derive(Clone, Debug)]
+pub struct BlockMeasureCoordinateReport {
+    /// Estimated isotropic per-component coefficient noise.
+    pub sigma_hat: f64,
+    /// Mean firing radius in the stored block-code coordinates.
+    pub mean_radius: f64,
+    /// Number of firings on this block.
+    pub n_firings: usize,
+    /// One measure-valued code per firing, in ascending row order.
+    pub firings: Vec<MeasureValuedCode>,
 }
 
 /// SD of the uniform distribution on the unit-circumference phase `t ∈ [0,1)`:
@@ -214,6 +257,162 @@ fn phase_se_b2(sigma: f64, norm: f64) -> (f64, bool) {
         (ceiling, true)
     } else {
         (raw, false)
+    }
+}
+
+fn coeffs_from_code(z: &[f64]) -> Vec<(f64, f64)> {
+    z.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect()
+}
+
+fn code_from_spikes(spikes: &[MeasureSpikeCoordinate], h_count: usize) -> Vec<f64> {
+    let mut z = vec![0.0; 2 * h_count];
+    for spike in spikes {
+        for h in 1..=h_count {
+            let phase = TAU * h as f64 * spike.coordinate;
+            let (s, c) = phase.sin_cos();
+            z[2 * (h - 1)] += spike.amplitude * c;
+            z[2 * (h - 1) + 1] += spike.amplitude * s;
+        }
+    }
+    z
+}
+
+fn single_harmonic_spike(z: &[f64], sigma: f64) -> (MeasureSpikeCoordinate, Vec<f64>, f64) {
+    let h_count = z.len() / 2;
+    let (coordinate, _curvature) = harmonic_argmax(z);
+    let matched = harmonic_f(z, coordinate);
+    let amplitude = (matched / h_count.max(1) as f64).max(0.0);
+    let spike = MeasureSpikeCoordinate {
+        amplitude,
+        coordinate,
+        coordinate_se: spike_coordinate_se(sigma, amplitude, h_count),
+    };
+    let fitted = code_from_spikes(&[spike], h_count);
+    let residual: Vec<f64> = z
+        .iter()
+        .zip(fitted.iter())
+        .map(|(&observed, &pred)| observed - pred)
+        .collect();
+    let residual_norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (spike, residual, residual_norm)
+}
+
+fn spike_coordinate_se(sigma: f64, amplitude: f64, h_count: usize) -> f64 {
+    if sigma <= 0.0 {
+        return 0.0;
+    }
+    let ceiling = uniform_phase_sd();
+    let h_sq_sum = (1..=h_count).map(|h| (h * h) as f64).sum::<f64>();
+    let slope = amplitude * TAU * h_sq_sum.sqrt();
+    if slope <= 0.0 {
+        ceiling
+    } else {
+        (sigma / slope).min(ceiling)
+    }
+}
+
+fn local_dual_eta(residual: &[f64], active_mass: f64) -> f64 {
+    let lambda = active_mass.max(f64::MIN_POSITIVE);
+    let off_support_gate = harmonic_f(residual, harmonic_argmax(residual).0).max(0.0);
+    off_support_gate / lambda
+}
+
+fn circle_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+fn separated_from_all(t: f64, accepted: &[MeasureSpikeCoordinate], min_sep: f64) -> bool {
+    accepted
+        .iter()
+        .all(|spike| circle_dist(t, spike.coordinate) + f64::EPSILON >= min_sep)
+}
+
+fn count_separated_positive_modes(z: &[f64], min_sep: f64) -> usize {
+    let h_count = z.len() / 2;
+    let grid = 4 * h_count.max(1);
+    let mut candidates = Vec::new();
+    for idx in 0..grid {
+        let prev = (idx + grid - 1) % grid;
+        let next = (idx + 1) % grid;
+        let t = idx as f64 / grid as f64;
+        let val = harmonic_f(z, t);
+        if val <= 0.0 {
+            continue;
+        }
+        if val >= harmonic_f(z, prev as f64 / grid as f64)
+            && val >= harmonic_f(z, next as f64 / grid as f64)
+        {
+            candidates.push((t, val));
+        }
+    }
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut accepted: Vec<MeasureSpikeCoordinate> = Vec::new();
+    for (t, val) in candidates {
+        if separated_from_all(t, &accepted, min_sep) {
+            accepted.push(MeasureSpikeCoordinate {
+                amplitude: val,
+                coordinate: t,
+                coordinate_se: 0.0,
+            });
+        }
+    }
+    accepted.len()
+}
+
+fn maybe_super_resolve(z: &[f64], sigma: f64) -> (Vec<MeasureSpikeCoordinate>, f64, bool) {
+    let h_count = z.len() / 2;
+    let (single, single_residual, single_residual_norm) = single_harmonic_spike(z, sigma);
+    if h_count < 2 {
+        return (vec![single], 0.0, false);
+    }
+
+    let min_sep = separation_limit(h_count);
+    let eta = local_dual_eta(&single_residual, single.amplitude);
+    let residual_is_multimodal = count_separated_positive_modes(&single_residual, min_sep) > 1;
+    let code_is_multimodal = count_separated_positive_modes(z, min_sep) > 1;
+    if eta <= 1.0 && !residual_is_multimodal && !code_is_multimodal {
+        return (vec![single], eta, false);
+    }
+
+    let coeffs = coeffs_from_code(z);
+    let recovery = match recover_spikes(&coeffs, sigma) {
+        Ok(recovery) => recovery,
+        Err(_err) => return (vec![single], eta, false),
+    };
+    if recovery.spikes.len() <= 1 || recovery.residual >= single_residual_norm {
+        return (vec![single], eta, false);
+    }
+
+    let max_by_separation = if min_sep.is_finite() && min_sep > 0.0 {
+        (1.0 / min_sep).floor().max(1.0) as usize
+    } else {
+        recovery.spikes.len()
+    };
+    let mut sorted = recovery.spikes;
+    sorted.sort_by(|a, b| b.amplitude.total_cmp(&a.amplitude));
+    let mut accepted = Vec::new();
+    for spike in sorted {
+        if spike.amplitude <= 0.0 {
+            continue;
+        }
+        if accepted.len() >= max_by_separation {
+            break;
+        }
+        if !separated_from_all(spike.t, &accepted, min_sep) {
+            continue;
+        }
+        accepted.push(MeasureSpikeCoordinate {
+            amplitude: spike.amplitude,
+            coordinate: spike.t,
+            coordinate_se: spike_coordinate_se(sigma, spike.amplitude, h_count),
+        });
+    }
+    accepted.sort_by(|a, b| a.coordinate.total_cmp(&b.coordinate));
+    if accepted.len() <= 1 {
+        (vec![single], eta, false)
+    } else {
+        (accepted, eta, true)
     }
 }
 
@@ -417,6 +616,192 @@ pub fn harmonic_firing_coordinates(
     })
 }
 
+/// Measure-valued readout for a harmonic block (`b = 2H`). Each live
+/// `(row, block)` firing returns one or more point masses
+/// `(amplitude, coordinate, coordinate_se)`. The single-spike path is retained
+/// unless the single-spike residual has a BLASSO dual birth ratio `η > 1` or the
+/// harmonic profile/residual has multiple separated modes; a matrix-pencil
+/// recovery is accepted only when it reduces the harmonic coefficient residual.
+pub fn harmonic_measure_coordinates(
+    fit: &BlockSparseFit,
+    block: usize,
+) -> Result<BlockMeasureCoordinateReport, String> {
+    let b = fit.block_size;
+    if b < 2 || b % 2 != 0 {
+        return Err(format!(
+            "harmonic_measure_coordinates: harmonic readout requires block_size b = 2H (even, \
+             >= 2), got b = {b}"
+        ));
+    }
+    let g_total = fit.decoder.nrows() / b;
+    if block >= g_total {
+        return Err(format!(
+            "harmonic_measure_coordinates: block {block} out of range 0..{g_total}"
+        ));
+    }
+
+    let firings = collect_firings(fit, block, b);
+    let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
+    let mut measures = Vec::with_capacity(firings.len());
+    for (row, z) in &firings {
+        let (spikes, dual_eta, used_super_resolution) = maybe_super_resolve(z, sigma_hat);
+        measures.push(MeasureValuedCode {
+            block,
+            row: *row,
+            spikes,
+            dual_eta,
+            used_super_resolution,
+        });
+    }
+
+    Ok(BlockMeasureCoordinateReport {
+        sigma_hat,
+        mean_radius,
+        n_firings: firings.len(),
+        firings: measures,
+    })
+}
+
+/// Measure-valued readout for every fired harmonic block in a fit.
+pub fn block_measure_valued_codes(fit: &BlockSparseFit) -> Result<Vec<MeasureValuedCode>, String> {
+    let b = fit.block_size;
+    if b < 2 || b % 2 != 0 {
+        return Err(format!(
+            "block_measure_valued_codes: harmonic readout requires block_size b = 2H (even, \
+             >= 2), got b = {b}"
+        ));
+    }
+    let g_total = fit.decoder.nrows() / b;
+    let mut all = Vec::new();
+    for block in 0..g_total {
+        let mut report = harmonic_measure_coordinates(fit, block)?;
+        all.append(&mut report.firings);
+    }
+    all.sort_by(|a, b| a.row.cmp(&b.row).then(a.block.cmp(&b.block)));
+    Ok(all)
+}
+
+/// Reconstruct dense rows by integrating the decoder against variable-length
+/// harmonic measures. This is the measure-valued analogue of
+/// [`crate::sparse_dict::reconstruct_block_sparse_rows`].
+pub fn reconstruct_measure_valued_rows(
+    decoder: ArrayView2<'_, f32>,
+    measures: &[MeasureValuedCode],
+    n_rows: usize,
+    block_size: usize,
+) -> Result<Array2<f32>, String> {
+    let b = block_size;
+    if b < 2 || b % 2 != 0 {
+        return Err(format!(
+            "reconstruct_measure_valued_rows: block_size must be even and >= 2, got {b}"
+        ));
+    }
+    if decoder.nrows() % b != 0 {
+        return Err(format!(
+            "reconstruct_measure_valued_rows: decoder rows {} not divisible by block_size {b}",
+            decoder.nrows()
+        ));
+    }
+    let g_total = decoder.nrows() / b;
+    let h_count = b / 2;
+    let p = decoder.ncols();
+    let mut out = Array2::<f32>::zeros((n_rows, p));
+    for measure in measures {
+        if measure.row >= n_rows {
+            return Err(format!(
+                "reconstruct_measure_valued_rows: row {} out of range 0..{n_rows}",
+                measure.row
+            ));
+        }
+        if measure.block >= g_total {
+            return Err(format!(
+                "reconstruct_measure_valued_rows: block {} out of range 0..{g_total}",
+                measure.block
+            ));
+        }
+        let code = code_from_spikes(&measure.spikes, h_count);
+        for r in 0..b {
+            let coeff = code[r] as f32;
+            if coeff == 0.0 {
+                continue;
+            }
+            let atom = decoder.row(measure.block * b + r);
+            for c in 0..p {
+                out[[measure.row, c]] += coeff * atom[c];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reconstruct dense rows from the single-coordinate harmonic readout, retaining
+/// exactly one spike per fired block. This is useful as the explicit baseline
+/// the measure-valued readout must dominate.
+pub fn reconstruct_single_coordinate_rows(fit: &BlockSparseFit) -> Result<Array2<f32>, String> {
+    let b = fit.block_size;
+    if b < 2 || b % 2 != 0 {
+        return Err(format!(
+            "reconstruct_single_coordinate_rows: harmonic readout requires block_size b = 2H \
+             (even, >= 2), got b = {b}"
+        ));
+    }
+    let mut measures = Vec::new();
+    for block in 0..fit.decoder.nrows() / b {
+        for (row, z) in collect_firings(fit, block, b) {
+            let (spike, residual, residual_norm) = single_harmonic_spike(&z, 0.0);
+            assert_eq!(residual.len(), b);
+            assert!(residual_norm.is_finite());
+            measures.push(MeasureValuedCode {
+                block,
+                row,
+                spikes: vec![spike],
+                dual_eta: local_dual_eta(&residual, spike.amplitude),
+                used_super_resolution: false,
+            });
+        }
+    }
+    reconstruct_measure_valued_rows(fit.decoder.view(), &measures, fit.blocks.nrows(), b)
+}
+
+/// Held-in explained variance of a dense reconstruction against `x`.
+pub fn explained_variance_from_reconstruction(
+    x: ArrayView2<'_, f32>,
+    reconstruction: ArrayView2<'_, f32>,
+) -> Result<f64, String> {
+    if x.dim() != reconstruction.dim() {
+        return Err(format!(
+            "explained_variance_from_reconstruction: X shape {:?} != reconstruction shape {:?}",
+            x.dim(),
+            reconstruction.dim()
+        ));
+    }
+    let (n, p) = x.dim();
+    let mut means = vec![0.0; p];
+    for i in 0..n {
+        for c in 0..p {
+            means[c] += x[[i, c]] as f64;
+        }
+    }
+    for mean in &mut means {
+        *mean /= n.max(1) as f64;
+    }
+    let mut rss = 0.0;
+    let mut tss = 0.0;
+    for i in 0..n {
+        for c in 0..p {
+            let r = x[[i, c]] as f64 - reconstruction[[i, c]] as f64;
+            rss += r * r;
+            let centered = x[[i, c]] as f64 - means[c];
+            tss += centered * centered;
+        }
+    }
+    if tss <= f64::MIN_POSITIVE {
+        Ok(if rss <= f64::MIN_POSITIVE { 1.0 } else { 0.0 })
+    } else {
+        Ok(1.0 - rss / tss)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,8 +846,12 @@ mod tests {
             }
             gates[[i, 0]] = nrm.sqrt();
         }
+        let mut decoder = Array2::<f32>::zeros((b, b));
+        for i in 0..b {
+            decoder[[i, i]] = 1.0;
+        }
         BlockSparseFit {
-            decoder: Array2::<f32>::zeros((b, b)),
+            decoder,
             blocks,
             gates,
             codes,
@@ -669,6 +1058,159 @@ mod tests {
         assert!(
             coverage >= 0.85,
             "harmonic 2·SE coverage {coverage} must be ≥ 0.85"
+        );
+    }
+
+    fn harmonic_code(spikes: &[(f64, f64)], h_count: usize) -> Vec<f32> {
+        let measure_spikes: Vec<MeasureSpikeCoordinate> = spikes
+            .iter()
+            .map(|&(coordinate, amplitude)| MeasureSpikeCoordinate {
+                amplitude,
+                coordinate,
+                coordinate_se: 0.0,
+            })
+            .collect();
+        code_from_spikes(&measure_spikes, h_count)
+            .into_iter()
+            .map(|v| v as f32)
+            .collect()
+    }
+
+    fn row_matrix(rows: &[Vec<f32>]) -> Array2<f32> {
+        let n = rows.len();
+        let p = rows[0].len();
+        let mut out = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..p {
+                out[[i, c]] = rows[i][c];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn measure_readout_recovers_two_separated_spikes_on_one_circle() {
+        let h_count = 8;
+        let t1 = 0.20;
+        let t2 = 0.55;
+        assert!(
+            circ_err(t1, t2) > separation_limit(h_count),
+            "planted spikes must be beyond the super-resolution separation guarantee"
+        );
+        let rows = vec![
+            harmonic_code(&[(t1, 1.0), (t2, 0.7)], h_count),
+            harmonic_code(&[(0.05, 0.9)], h_count),
+        ];
+        let fit = fit_from_codes(&rows, 2 * h_count);
+
+        let single = harmonic_firing_coordinates(&fit, 0).expect("single coordinate readout");
+        assert_eq!(
+            single.firings.iter().filter(|f| f.row == 0).count(),
+            1,
+            "legacy harmonic readout emits exactly one coordinate for the two-spike row"
+        );
+
+        let report = harmonic_measure_coordinates(&fit, 0).expect("measure readout");
+        let row0 = report
+            .firings
+            .iter()
+            .find(|firing| firing.row == 0)
+            .expect("row 0 firing");
+        assert!(
+            row0.used_super_resolution,
+            "two separated modes should invoke matrix-pencil recovery"
+        );
+        assert_eq!(
+            row0.spikes.len(),
+            2,
+            "measure readout must recover both spikes"
+        );
+        assert!(
+            row0.spikes
+                .iter()
+                .any(|spike| circ_err(spike.coordinate, t1) < 1.0e-8),
+            "missing spike at t1={t1}"
+        );
+        assert!(
+            row0.spikes
+                .iter()
+                .any(|spike| circ_err(spike.coordinate, t2) < 1.0e-8),
+            "missing spike at t2={t2}"
+        );
+    }
+
+    #[test]
+    fn measure_readout_keeps_single_spike_single() {
+        let h_count = 8;
+        let t = 0.37;
+        let rows = vec![
+            harmonic_code(&[(t, 1.25)], h_count),
+            harmonic_code(&[(0.62, 0.8)], h_count),
+        ];
+        let fit = fit_from_codes(&rows, 2 * h_count);
+        let report = harmonic_measure_coordinates(&fit, 0).expect("measure readout");
+        for firing in &report.firings {
+            assert_eq!(
+                firing.spikes.len(),
+                1,
+                "single-spike harmonic code must not receive spurious multiplicity"
+            );
+            assert!(
+                !firing.used_super_resolution,
+                "exact one-spike code should stay on the single-coordinate path"
+            );
+        }
+    }
+
+    #[test]
+    fn measure_reconstruction_improves_two_spike_ev_and_preserves_one_spike_ev() {
+        let h_count = 8;
+        let rows = vec![
+            harmonic_code(&[(0.20, 1.0), (0.55, 0.7)], h_count),
+            harmonic_code(&[(0.05, 0.9)], h_count),
+        ];
+        let x = row_matrix(&rows);
+        let fit = fit_from_codes(&rows, 2 * h_count);
+        let single_recon = reconstruct_single_coordinate_rows(&fit).expect("single recon");
+        let measures = block_measure_valued_codes(&fit).expect("measure codes");
+        let measure_recon =
+            reconstruct_measure_valued_rows(fit.decoder.view(), &measures, rows.len(), 2 * h_count)
+                .expect("measure recon");
+        let single_ev =
+            explained_variance_from_reconstruction(x.view(), single_recon.view()).expect("ev");
+        let measure_ev =
+            explained_variance_from_reconstruction(x.view(), measure_recon.view()).expect("ev");
+        assert!(
+            measure_ev > single_ev,
+            "measure reconstruction EV {measure_ev} must improve over single-coordinate EV {single_ev}"
+        );
+        assert!(
+            (1.0 - measure_ev).abs() < 1.0e-10,
+            "exact two-spike measure reconstruction should recover the harmonic code"
+        );
+
+        let one_rows = vec![
+            harmonic_code(&[(0.20, 1.0)], h_count),
+            harmonic_code(&[(0.55, 0.7)], h_count),
+        ];
+        let one_x = row_matrix(&one_rows);
+        let one_fit = fit_from_codes(&one_rows, 2 * h_count);
+        let one_single = reconstruct_single_coordinate_rows(&one_fit).expect("single recon");
+        let one_measures = block_measure_valued_codes(&one_fit).expect("measure codes");
+        let one_measure = reconstruct_measure_valued_rows(
+            one_fit.decoder.view(),
+            &one_measures,
+            one_rows.len(),
+            2 * h_count,
+        )
+        .expect("measure recon");
+        let one_single_ev =
+            explained_variance_from_reconstruction(one_x.view(), one_single.view()).expect("ev");
+        let one_measure_ev =
+            explained_variance_from_reconstruction(one_x.view(), one_measure.view()).expect("ev");
+        assert!(
+            (one_measure_ev - one_single_ev).abs() < 1.0e-10,
+            "one-spike EV must be unchanged: measure {one_measure_ev}, single {one_single_ev}"
         );
     }
 }

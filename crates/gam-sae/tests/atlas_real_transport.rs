@@ -57,7 +57,9 @@ fn load_theta() -> (String, Vec<String>, Vec<Array1<f64>>) {
     let theta: Vec<Array1<f64>> = keys
         .iter()
         .map(|k| {
-            let col = v["theta"][k].as_array().unwrap_or_else(|| panic!("theta[{k}] array"));
+            let col = v["theta"][k]
+                .as_array()
+                .unwrap_or_else(|| panic!("theta[{k}] array"));
             Array1::from_vec(col.iter().map(|x| x.as_f64().unwrap()).collect())
         })
         .collect();
@@ -160,7 +162,11 @@ fn atlas_composed_bound_and_holonomy_on_real_qwen3_transport() {
     );
     println!(
         "  → composition law {} at the loop's own defect scale",
-        if holo.is_trivial { "HOLDS" } else { "is VIOLATED" }
+        if holo.is_trivial {
+            "HOLDS"
+        } else {
+            "is VIOLATED"
+        }
     );
 
     // Structural invariants only — never a fitted value.

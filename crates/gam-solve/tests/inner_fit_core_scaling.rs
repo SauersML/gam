@@ -2,13 +2,9 @@
 //! dominates the stagewise/compose grind — measured directly on a production-shaped
 //! system (large N, the row axis the solver parallelizes over).
 //!
-//! The finding this pins down: the row-parallel Arrow-Schur solve (factor blocks,
-//! Schur matvec, gradient) is gated by `rayon::current_thread_index().is_none()`, so
-//! it runs multi-core ONLY when called from a non-rayon thread. Called from INSIDE a
-//! rayon worker — exactly what the batched candidate-racing `par_iter` does — the
-//! nesting guard silently drops it to a single core. So racing many births and
-//! parallelizing each birth's inner fit are mutually exclusive: whichever layer owns
-//! the rayon context, the other runs serial.
+//! The row-parallel Arrow-Schur solve (factor blocks, Schur matvec, gradient)
+//! must use the Rayon pool when called from the production serial context. Called
+//! from inside a Rayon worker, the nesting guard keeps the inner solve serial.
 
 use gam_solve::arrow_schur::{ArrowSchurSystem, ArrowSolveOptions};
 use ndarray::Array2;
@@ -66,25 +62,33 @@ fn inner_fit_core_scaling() {
     let reps = 3;
 
     // Warm (allocations, first-touch, factor caches).
-    std::hint::black_box(sys.solve_with_options(1e-8, 1e-8, &opts).expect("warm solve"));
+    std::hint::black_box(
+        sys.solve_with_options(1e-8, 1e-8, &opts)
+            .expect("warm solve"),
+    );
 
-    // MULTI-CORE context: called from the main (non-rayon) thread, so the
-    // `current_thread_index().is_none()` gate opens and the row work fans out over
-    // the global rayon pool.
-    let t_multi = time_solve(&sys, &opts, reps);
+    // Serial production context: called from the main non-Rayon thread, so the
+    // row work should fan out over the global Rayon pool.
+    let t_serial = time_solve(&sys, &opts, reps);
 
-    // SINGLE-CORE context: called from INSIDE a rayon worker (what the batched
-    // candidate-racing `par_iter` does) — the nesting guard forces the serial path.
+    // Nested context: called from inside a Rayon worker, where the nesting guard
+    // should keep the inner solve serial.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon::current_num_threads())
         .build()
         .unwrap();
-    let t_nested = pool.install(|| time_solve(&sys, &opts, reps));
+    let t_nested = pool.install(|| {
+        assert!(
+            rayon::current_thread_index().is_some(),
+            "nested timing must run inside a Rayon worker"
+        );
+        time_solve(&sys, &opts, reps)
+    });
 
-    let cores = rayon::current_num_threads();
-    let effective = t_nested / t_multi.max(1e-9);
-    eprintln!(
-        "INNERFIT N={N} D={D} K={K} pool_cores={cores} | multi-core (serial-context) = {t_multi:.4}s | single-core (nested-in-worker) = {t_nested:.4}s | inner-fit effective cores = {effective:.2}x"
+    let cores = pool.current_num_threads();
+    let effective = t_nested / t_serial.max(1e-9);
+    println!(
+        "INNERFIT N={N} D={D} K={K} pool_cores={cores} serial={t_serial:.4}s nested={t_nested:.4}s effective_cores={effective:.2}x"
     );
 
     // The inner fit MUST use more than one core in a serial context on a
@@ -92,7 +96,7 @@ fn inner_fit_core_scaling() {
     // amount of candidate racing fixes it). A conservative floor well below the true
     // speedup keeps the assertion robust to a loaded CI box.
     assert!(
-        effective > 1.5,
+        effective > 2.0,
         "Arrow-Schur inner fit must be multi-core in a serial context (effective {effective:.2}x); \
          if this drops to ~1.0 the row-parallel path regressed or N fell below the \
          SCHUR_MATVEC_PARALLEL_ROW_MIN=256 threshold"

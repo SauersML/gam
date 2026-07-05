@@ -29,8 +29,7 @@ use gam_sae::manifold::{
 };
 
 fn read_csv_matrix(path: &str) -> Result<Array2<f64>, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let mut rows: Vec<Vec<f64>> = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -146,9 +145,8 @@ fn main() -> Result<(), String> {
 
     // Seed the circle coordinate by phase of the two leading activation PCs
     // (cheap deterministic seed; the fit refines it jointly).
-    let evaluator = Arc::new(
-        PeriodicHarmonicEvaluator::new(2 * harmonics + 1).map_err(|e| e.to_string())?,
-    );
+    let evaluator =
+        Arc::new(PeriodicHarmonicEvaluator::new(2 * harmonics + 1).map_err(|e| e.to_string())?);
     let mut coords = Array2::<f64>::zeros((n, 1));
     // Column means for centering.
     let mean0 = z.column(0).sum() / n as f64;
@@ -183,10 +181,7 @@ fn main() -> Result<(), String> {
             log_lambda_tol: 1e-3,
         },
     )?;
-    let block = term
-        .behavior_block()
-        .expect("installed above")
-        .clone();
+    let block = term.behavior_block().expect("installed above").clone();
     writeln!(
         std::io::stdout(),
         "REML-selected log λ_y = {:.4} (λ_y = {:.4}); sweeps = {}, converged = {}, identifiable = {}",

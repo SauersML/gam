@@ -1,5 +1,6 @@
 pub mod amortized_encoder;
 pub mod assignment;
+pub mod attention_kernel;
 pub mod atom_codes;
 pub mod basis;
 pub mod candidate_index;

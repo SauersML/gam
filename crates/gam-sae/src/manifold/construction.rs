@@ -7857,6 +7857,65 @@ impl SaeManifoldTerm {
         Ok(SaeArrowVector { t, beta })
     }
 
+    fn whiten_logdet_metric_vec(
+        metric: &gam_problem::RowMetric,
+        row: usize,
+        p: usize,
+        values: &mut Vec<f64>,
+    ) -> Result<(), String> {
+        if values.len() != p {
+            return Err(format!(
+                "logdet_theta_adjoint: row jet channel length {} != output dim {p}",
+                values.len()
+            ));
+        }
+        let rank = metric.metric_rank();
+        let mut whitened = vec![0.0_f64; rank];
+        for rank_col in 0..rank {
+            let mut acc = 0.0_f64;
+            for out_col in 0..p {
+                acc += metric.factor_entry(row, out_col, rank_col) * values[out_col];
+            }
+            whitened[rank_col] = acc;
+        }
+        *values = whitened;
+        Ok(())
+    }
+
+    fn whiten_logdet_row_jets_for_low_rank_metric(
+        &self,
+        row: usize,
+        jets: &mut SaeRowJets,
+    ) -> Result<(), String> {
+        let metric = self
+            .row_metric
+            .as_ref()
+            .ok_or_else(|| "logdet_theta_adjoint: low-rank whitening metric absent".to_string())?;
+        let p = self.output_dim();
+        for first in jets.first.iter_mut() {
+            Self::whiten_logdet_metric_vec(metric, row, p, first)?;
+        }
+        for second_row in jets.second.iter_mut() {
+            for second in second_row.iter_mut() {
+                Self::whiten_logdet_metric_vec(metric, row, p, second)?;
+            }
+        }
+        for beta in jets.beta.iter_mut() {
+            Self::whiten_logdet_metric_vec(metric, row, p, beta)?;
+        }
+        for beta_deriv_row in jets.beta_deriv.iter_mut() {
+            for beta_deriv in beta_deriv_row.iter_mut() {
+                Self::whiten_logdet_metric_vec(metric, row, p, beta_deriv)?;
+            }
+        }
+        for beta_l_deriv_row in jets.beta_l_deriv.iter_mut() {
+            for beta_l_deriv in beta_l_deriv_row.iter_mut() {
+                Self::whiten_logdet_metric_vec(metric, row, p, beta_l_deriv)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn logdet_theta_adjoint(
         &self,
         rho: &SaeManifoldRho,
@@ -7991,9 +8050,12 @@ impl SaeManifoldTerm {
                     &mut jet_window,
                 )?;
             }
-            let jets = jet_window
+            let mut jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
+            if majorize_ibp {
+                self.whiten_logdet_row_jets_for_low_rank_metric(row, &mut jets)?;
+            }
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
             // full-system `solve` loop under gauge / cross-row Woodbury.

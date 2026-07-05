@@ -550,7 +550,11 @@ fn note_route_engagement(engaged: bool, detail: &str) {
     use std::sync::Once;
     static ENGAGED_ONCE: Once = Once::new();
     static DECLINED_ONCE: Once = Once::new();
-    let once = if engaged { &ENGAGED_ONCE } else { &DECLINED_ONCE };
+    let once = if engaged {
+        &ENGAGED_ONCE
+    } else {
+        &DECLINED_ONCE
+    };
     once.call_once(|| {
         let verdict = if engaged {
             "device ENGAGED"
@@ -768,7 +772,11 @@ mod device {
             .map_err(|_| gam_gpu::gpu_err!("sparse_dict score-block grid_y overflow"))?;
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
-            block_dim: (super::SCORE_BLOCK_THREADS_N, super::SCORE_BLOCK_THREADS_M, 1),
+            block_dim: (
+                super::SCORE_BLOCK_THREADS_N,
+                super::SCORE_BLOCK_THREADS_M,
+                1,
+            ),
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&func);
@@ -943,7 +951,11 @@ mod device {
                 .map_err(|_| gam_gpu::gpu_err!("sparse_dict tiled score grid_y overflow"))?;
             let cfg = LaunchConfig {
                 grid_dim: (grid_x, grid_y, 1),
-                block_dim: (super::SCORE_BLOCK_THREADS_N, super::SCORE_BLOCK_THREADS_M, 1),
+                block_dim: (
+                    super::SCORE_BLOCK_THREADS_N,
+                    super::SCORE_BLOCK_THREADS_M,
+                    1,
+                ),
                 shared_mem_bytes: 0,
             };
             let mut builder = stream.launch_builder(&score_func);

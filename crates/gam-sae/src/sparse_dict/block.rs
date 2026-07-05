@@ -437,6 +437,19 @@ fn route_block_minibatch(
     selectors.into_iter().map(TopSSelector::finish).collect()
 }
 
+fn orphan_gate_floor(row: ArrayView1<'_, f32>, b: usize) -> f32 {
+    let row_norm = row
+        .iter()
+        .map(|v| {
+            let vv = *v as f64;
+            vv * vv
+        })
+        .sum::<f64>()
+        .sqrt() as f32;
+    let projection_roundoff = ((row.len().max(1) * b.max(1)) as f32).sqrt() * f32::EPSILON;
+    row_norm * projection_roundoff
+}
+
 /// Encode + route the whole corpus in minibatches. For each row: block-TopK route
 /// (`gate = ‖x D_gᵀ‖₂`), then the tied signed code `z_g = γ x D_gᵀ` for the
 /// selected blocks. Returns one [`RowBlockCode`] per row in global order.
@@ -462,7 +475,14 @@ pub(super) fn route_and_code_all(
             .axis_iter(Axis(0))
             .into_par_iter()
             .zip(routed.into_par_iter())
-            .map(|(row, shortlist)| code_row(row, decoder, gamma, b, k, &shortlist))
+            .map(|(row, shortlist)| {
+                let best_gate = shortlist.first().map(|entry| entry.1).unwrap_or(0.0);
+                if best_gate < orphan_gate_floor(row, b) {
+                    code_row(row, decoder, gamma, b, k, &[])
+                } else {
+                    code_row(row, decoder, gamma, b, k, &shortlist)
+                }
+            })
             .collect();
         out.append(&mut coded);
         start = end;

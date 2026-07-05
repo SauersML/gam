@@ -1533,19 +1533,21 @@ pub(crate) fn run_outer_with_plan(
                         .with_bounds(bounds)
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter);
-                    // Warm-start first-step scaling. `opt::Bfgs` begins with an
+                    // First-step scaling. `opt::Bfgs` begins with an
                     // UNSCALED identity inverse-Hessian (`B_inv = I`) on iter 0:
                     // the search direction is the raw `d = -g`, so the unit
                     // line-search step (`α = 1`) is `-g` in ρ-space. The
                     // optimizer's Barzilai-Borwein self-scaling (`γ = sᵀy/yᵀy`)
-                    // only fires AFTER the first line search completes, so when a
-                    // warm start lands a near-optimal seed whose residual gradient
-                    // still has a large component along a weakly-curved (heavily
-                    // penalized) log-λ direction, the raw `-g` step overshoots and
-                    // the StrongWolfe search has to bracket/zoom — each bracketing
-                    // probe is a full inner joint-Newton re-solve. On the biobank
-                    // LOSO fold that is the observed three ~65 s `outer eval Value`
-                    // probes before the single accepted step.
+                    // only fires AFTER the first line search completes. When a
+                    // seed's residual gradient has a large component along a
+                    // weakly-curved (heavily penalized) log-lambda direction, the
+                    // raw `-g` step overshoots and the StrongWolfe search has to
+                    // bracket/zoom; in the SAE manifold objective each bracketing
+                    // probe is a full inner joint-Newton re-solve. K=1 circle
+                    // fits hit this especially hard because the saturated single
+                    // assignment gate leaves the outer objective nearly flat in
+                    // one direction but still returns a large scale gradient at
+                    // the seed.
                     //
                     // Seed the iter-0 metric with the one-point magnitude estimate
                     // the `InitialMetric::Scalar` API is designed for ("a previous
@@ -1557,24 +1559,25 @@ pub(crate) fn run_outer_with_plan(
                     // optimum: BFGS converges to the same stationary point
                     // `∇_ρ V(ρ*) = 0` under any symmetric-positive-definite initial
                     // metric, and the gradient/KKT convergence tests are unchanged.
-                    // Gated on "this seed is the pinned warm start" so cold
-                    // multistart seeds keep the optimizer's historical internal
-                    // scaling. Two warm-start mechanisms both pin `initial_rho`:
-                    // the in-process / disk persistent cache (which also flips
-                    // `warm_start_cache_hit`) AND the biobank cross-fit β
-                    // projection (`consume_fit_artifact`, logged `[CACHE]
-                    // beta-warm action=projected source=cross-fit`), which sets
-                    // `initial_rho` to the transferred ρ but leaves
+                    // This scalar normalization is safe for every finite seed:
+                    // it changes only the line-search path, not the stationary
+                    // point. Dense transferred curvature stays gated on true warm
+                    // starts, because it is local to the parent fit. Two warm-start
+                    // mechanisms both pin `initial_rho`: the in-process / disk
+                    // persistent cache (which also flips `warm_start_cache_hit`)
+                    // and the biobank cross-fit beta projection, which sets
+                    // `initial_rho` to the transferred rho but leaves
                     // `warm_start_cache_hit` false. Cover both by testing seed
-                    // identity against `initial_rho`. The scale is clamped to the
-                    // same `[1e-3, 1e3]` band the optimizer applies to its own BB
-                    // estimate so a pathological seed gradient cannot produce a
-                    // degenerate metric.
+                    // identity against `initial_rho`. The scalar scale is clamped
+                    // to the same `[1e-3, 1e3]` band the optimizer applies to its
+                    // own BB estimate so a pathological seed gradient cannot
+                    // produce a degenerate metric.
                     let is_warm_seed = config.warm_start_cache_hit
                         || config
                             .initial_rho
                             .as_ref()
                             .is_some_and(|initial| initial == seed);
+                    let mut installed_initial_metric = false;
                     if is_warm_seed {
                         // Prefer the converged outer curvature transferred from
                         // the prior structurally-matching fit (`H(θ̂)_parent`):
@@ -1612,14 +1615,15 @@ pub(crate) fn run_outer_with_plan(
                             );
                             optimizer = optimizer
                                 .with_initial_metric(InitialMetric::DenseInverseHessian(h_inv));
-                        } else {
-                            let g0_norm =
-                                seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                            if g0_norm.is_finite() && g0_norm > 0.0 {
-                                let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
-                                optimizer =
-                                    optimizer.with_initial_metric(InitialMetric::Scalar(scale));
-                            }
+                            installed_initial_metric = true;
+                        }
+                    }
+                    if !installed_initial_metric {
+                        let g0_norm =
+                            seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                        if g0_norm.is_finite() && g0_norm > 0.0 {
+                            let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
+                            optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
                         }
                     }
                     if let Some(caps) = bfgs_axis_step_caps(config, layout) {

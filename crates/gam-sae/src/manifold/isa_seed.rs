@@ -216,9 +216,9 @@ pub struct IsaPlaneCandidate {
     pub amplitudes: [f64; 2],
     /// Per-row in-plane phase in turns `[0, 1)`, `(n, 1)` — the born chart seed.
     pub phases_turns: Array2<f64>,
-    /// Per-row OWN-PRESENCE gate: `ln(ρ_i² / 2λ₊)` where the plane radius
-    /// clears the derived 2-plane noise floor, else `−∞` (same contract as the
-    /// #2109 gate).
+    /// Per-row OWN-PRESENCE gate: `ln(ρ_i² / (2σ̂² ln n))` where the plane
+    /// radius clears the derived χ²₂ upper-tail noise floor, else `−∞` (same
+    /// contract as the #2109 gate).
     pub gate_logits: Vec<f64>,
     /// Observed raw-radius `κ` over all rows.
     pub kappa: f64,
@@ -631,7 +631,7 @@ fn certify_plane(
     if !orthonormalize2(&mut amb) {
         return None;
     }
-    let noise_2plane = 2.0 * parts.mp_edge;
+    let noise_2plane = 2.0 * parts.sigma2_cert.max(f64::MIN_POSITIVE) * (n as f64).ln();
     let mut phases = Array2::<f64>::zeros((n, 1));
     let mut gate = vec![f64::NEG_INFINITY; n];
     let (mut r2_sum, mut r4_sum) = (0.0_f64, 0.0_f64);
@@ -661,6 +661,13 @@ fn certify_plane(
         }
     }
     if n_active == 0 {
+        return None;
+    }
+    // With the χ²₂ tail gate calibrated to one expected false-active row per
+    // plane, a resolvable circle must clear a super-Poisson tail count rather
+    // than a handful of accidental exceedances.
+    let active_floor = ((n as f64).ln().powi(2).ceil() as usize).max(4);
+    if n_active < active_floor {
         return None;
     }
     let q_hat = n_active as f64 / n as f64;
@@ -795,21 +802,32 @@ pub fn isa_extract_certified_plane(
     None
 }
 
-/// Subtract an accepted plane's FITTED CURVE from the residual, in place: on
-/// each active row (finite gate) remove `â₁cosθ·u₁ + â₂sinθ·u₂`. The plane's
-/// noise energy and any structure other atoms share with it stay — this is the
-/// deflation operator that matches the stagewise fit-then-residual loop.
+/// Subtract an accepted plane's fitted residual projection, in place: on each
+/// active row (finite gate) remove the centered residual component in the
+/// certified plane. Certification still emits the LS harmonic amplitudes used by
+/// the birth seed; harvest deflation must instead zero the accepted plane's
+/// energy so the next eigendecomposition surfaces the next circle.
 pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandidate) {
     let (n, p) = residual.dim();
+    let mut mean = Array1::<f64>::zeros(p);
+    for i in 0..n {
+        for j in 0..p {
+            mean[j] += residual[[i, j]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n as f64);
     for i in 0..n {
         if !cand.gate_logits[i].is_finite() {
             continue;
         }
-        let theta = cand.phases_turns[[i, 0]] * std::f64::consts::TAU;
-        let (ct, st) = (theta.cos(), theta.sin());
+        let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
         for j in 0..p {
-            residual[[i, j]] -=
-                cand.amplitudes[0] * ct * cand.basis[[j, 0]] + cand.amplitudes[1] * st * cand.basis[[j, 1]];
+            let ri = residual[[i, j]] - mean[j];
+            p1 += ri * cand.basis[[j, 0]];
+            p2 += ri * cand.basis[[j, 1]];
+        }
+        for j in 0..p {
+            residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
         }
     }
 }

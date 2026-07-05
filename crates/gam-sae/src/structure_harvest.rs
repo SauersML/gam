@@ -4801,24 +4801,25 @@ mod tests {
     }
 
     /// End-to-end through the round driver: with curl ON the shattered circle
-    /// yields extra Birth proposals into the SAME e-gate the residual births
-    /// race through; with curl OFF (the default) the driver is unchanged. This
-    /// is the flag-gated wiring proof (the REML gate remains the judge; certed
-    /// acceptance of the win additionally rests on the Phase-1 charge ledger).
+    /// yields a circle Birth that certifies through the SAME e-gate the residual
+    /// births race through; with curl OFF (the default) the driver is unchanged.
+    /// This is the flag-gated wiring proof (the REML gate remains the judge;
+    /// certed acceptance of the win additionally rests on the Phase-1 charge
+    /// ledger).
     #[test]
-    fn driver_curl_flag_injects_circle_births() {
+    fn driver_curl_flag_accepts_circle_birth() {
         let budget = MoveBudget {
             max_moves: 4,
             alpha: 0.05,
         };
-        // Only curl births — no residual/fusion/fission channels — so the count
-        // difference isolates the curl injection.
+        // Only curl births — no residual/fusion/fission channels — so any
+        // accepted birth is the curl circle winning the round race.
         let harvest_params = HarvestParams {
             max_fusions: 0,
             max_fissions: 0,
             max_births: 0,
         };
-        let count_births = |curl: Option<CurlConfig>| -> usize {
+        let run = |curl: Option<CurlConfig>| -> StructureSearchResult {
             let (term, rho) = shattered_plane_term(false);
             let mut ledger = StructureLedger::new();
             let config = RoundDriverConfig {
@@ -4837,20 +4838,43 @@ mod tests {
                 |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
                 |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
             )
-            .unwrap();
-            result
-                .rounds
-                .iter()
-                .flat_map(|r| r.moves.iter())
-                .filter(|m| matches!(m.mv, StructureMove::Birth { .. }))
-                .count()
+            .unwrap()
         };
-        let off = count_births(None);
-        let on = count_births(Some(CurlConfig::default()));
-        assert_eq!(off, 0, "curl OFF (default) must inject no births");
+
+        let off = run(None);
+        let off_births = off
+            .rounds
+            .iter()
+            .flat_map(|r| r.moves.iter())
+            .filter(|m| matches!(m.mv, StructureMove::Birth { .. }))
+            .count();
+        assert_eq!(off_births, 0, "curl OFF (default) must inject no births");
+
+        let on = run(Some(CurlConfig::default()));
+        let accepted_curl_births = on
+            .rounds
+            .iter()
+            .flat_map(|r| r.moves.iter())
+            .filter(|m| {
+                matches!(m.mv, StructureMove::Birth { .. })
+                    && matches!(
+                        m.verdict,
+                        gam_solve::structure_search::MoveVerdict::Accepted { .. }
+                    )
+            })
+            .count();
+        assert_eq!(
+            accepted_curl_births, 1,
+            "curl ON must certify exactly one circle Birth winner"
+        );
+        assert_eq!(
+            on.term.atoms.last().map(|a| a.basis_kind),
+            Some(SaeAtomBasisKind::Periodic),
+            "the accepted curl winner must be the recovered circle atom"
+        );
         assert!(
-            on >= 1,
-            "curl ON must inject at least one circle Birth into the race (got {on})"
+            on.structure_changed(),
+            "accepted curl winner must mutate the returned term"
         );
     }
 }

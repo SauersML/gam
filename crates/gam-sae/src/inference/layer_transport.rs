@@ -1471,9 +1471,7 @@ pub fn composition_defect(
     };
     let repr_var_floor = (coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR).powi(2);
     let max_var = variance.iter().copied().fold(0.0_f64, f64::max);
-    let var_floor = (max_var * 1e-10)
-        .max(repr_var_floor)
-        .max(f64::MIN_POSITIVE);
+    let var_floor = (max_var * 1e-10).max(repr_var_floor).max(f64::MIN_POSITIVE);
     let mut max_abs = 0.0_f64;
     let mut sum_abs = 0.0_f64;
     let mut sum_sq = 0.0_f64;

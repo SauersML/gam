@@ -254,7 +254,9 @@ pub fn compose_with_trace(
     }
     for (j, &r) in entry_radii.iter().enumerate() {
         if !r.is_finite() || r < 0.0 {
-            return Err(format!("compose_with_trace: entry_radii[{j}] = {r} invalid"));
+            return Err(format!(
+                "compose_with_trace: entry_radii[{j}] = {r} invalid"
+            ));
         }
     }
 
@@ -629,7 +631,11 @@ mod tests {
         .expect("transport fit");
         let c = Contract::from_transport(&fit, "L_a->L_b", 128).expect("contract");
         assert!((c.domain_radius - TAU).abs() < 1e-9);
-        assert!((c.lipschitz - 1.0).abs() < 0.05, "lipschitz = {}", c.lipschitz);
+        assert!(
+            (c.lipschitz - 1.0).abs() < 0.05,
+            "lipschitz = {}",
+            c.lipschitz
+        );
         assert!(c.defect < 0.05, "defect = {}", c.defect);
         // It composes with itself as a well-formed chain.
         let composed = compose_contracts(&[c.clone(), c]);
