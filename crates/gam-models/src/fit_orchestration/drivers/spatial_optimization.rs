@@ -2584,6 +2584,12 @@ fn try_exact_joint_spatial_length_scale_optimization(
         let mut fixed_kappa_spec = resolvedspec.clone();
         let mut any_kappa_chosen = false;
         for &term_idx in spatial_terms {
+            // gam#2152: a user-PINNED κ is never re-derived. Skip the κ-fair
+            // argmin entirely so the term keeps the user's fixed curvature; it
+            // reaches the joint path below where its κ coordinate is frozen.
+            if constant_curvature_kappa_is_fixed(resolvedspec, term_idx) {
+                continue;
+            }
             // Only OVERRIDE κ with the κ-fair argmin when it selects a NEGATIVE
             // (hyperbolic) curvature. This is the one regime the sign-blind joint
             // REML cannot reach: its objective is monotone toward +κ, so seeding +
@@ -2724,9 +2730,26 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // not enough — without a one-sided bound the optimiser walks back across
     // κ = 0 to the spurious corner (the observed #1464 bit-identical railing).
     let mut cc_sign_seeds: Vec<(usize, f64)> = Vec::new();
+    // gam#2152: slots whose κ is user-PINNED. These are seeded AND hard-frozen at
+    // the user's fixed curvature below (both bounds = kappa=, including exactly
+    // 0), so the joint solve optimises only ρ at that fixed geometry — never the
+    // κ-fair sign scan's estimate. Tracked separately from `cc_sign_seeds`
+    // because a pinned κ = 0 must still freeze (a scanned κ = 0 leaves κ free).
+    let mut cc_fixed_seeds: Vec<(usize, f64)> = Vec::new();
     if has_constant_curvature_term {
         for (slot, &term_idx) in spatial_terms.iter().enumerate() {
             if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
+                continue;
+            }
+            if constant_curvature_kappa_is_fixed(resolvedspec, term_idx) {
+                let fixed_kappa = get_constant_curvature_kappa(resolvedspec, term_idx)
+                    .expect("constant-curvature term exposes its κ");
+                log::info!(
+                    "[#2152] term {term_idx}: κ PINNED at user kappa={fixed_kappa}; \
+                     freezing the joint ψ coordinate (ρ-only refinement, no κ scan)"
+                );
+                log_kappa0.set_scalar_slot(slot, fixed_kappa);
+                cc_fixed_seeds.push((slot, fixed_kappa));
                 continue;
             }
             let scan = select_constant_curvature_kappa_sign_seed(
@@ -2822,6 +2845,20 @@ fn try_exact_joint_spatial_length_scale_optimization(
              (window [{}, {}]); raw fit_score is sign-blind so the κ-fair scan is authoritative",
             log_kappa_lower.as_array()[log_kappa_lower.dims_per_term()[..slot].iter().sum::<usize>()],
             log_kappa_upper.as_array()[log_kappa_upper.dims_per_term()[..slot].iter().sum::<usize>()],
+        );
+    }
+    // gam#2152: hard-freeze every user-PINNED κ coordinate at the fixed value —
+    // UNCONDITIONALLY, unlike the sign-scan freeze above (which leaves a scanned
+    // κ = 0 free): a user who wrote `kappa=0` asked for the flat geometry
+    // verbatim, so both bounds collapse onto 0 too. With lower == upper == κ the
+    // joint solve holds the geometry constant and refines only ρ — exactly the
+    // "fixed sectional curvature, profile ρ" contract the docs promise.
+    for &(slot, fixed_kappa) in &cc_fixed_seeds {
+        log_kappa_lower.set_scalar_slot(slot, fixed_kappa);
+        log_kappa_upper.set_scalar_slot(slot, fixed_kappa);
+        log::info!(
+            "[#2152] slot {slot}: FROZE joint ψ coordinate at PINNED κ={fixed_kappa} \
+             (window [{fixed_kappa}, {fixed_kappa}]); ρ-only refinement at the fixed geometry"
         );
     }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
@@ -5057,6 +5094,17 @@ fn set_single_term_spatial_aniso_log_scales(
 /// "κ̂ = −1.8 (95% CI …)". Mirrors [`get_spatial_length_scale`].
 pub fn get_constant_curvature_kappa(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
     constant_curvature_term_spec(spec, term_idx).map(|cc| cc.kappa)
+}
+
+/// `true` when `term_idx` is a `curv(...)` smooth whose user PINNED the
+/// sectional curvature with an explicit `kappa=` (the mgcv-`sp=` convention,
+/// gam#2152). A pinned κ is a fixed geometry: the outer loop must hold it
+/// constant and never run any of its κ re-derivation heuristics (the κ-fair
+/// sign scan, the κ-fair argmin override, or the joint [ρ, κ] refinement) on
+/// that term. Non-CC terms and CC terms whose `kappa=` was omitted (κ free,
+/// #944/#1464 estimation) return `false`.
+pub fn constant_curvature_kappa_is_fixed(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    constant_curvature_term_spec(spec, term_idx).is_some_and(|cc| cc.kappa_fixed)
 }
 
 /// Indices of every constant-curvature (`curv(...)`) smooth term in `spec`.
@@ -8456,6 +8504,13 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // and the raw criterion both pick the +bound there) and for non-CC spatial
     // terms (never entered). A scan result of κ = 0 (genuinely flat) leaves κ as-is.
     for term_idx in constant_curvature_term_indices(&resolvedspec) {
+        // gam#2152: a user-PINNED κ is a fixed geometry — never overwrite it with
+        // the κ-fair sign scan's estimate. The scan (and every downstream κ
+        // re-derivation) is skipped for this term; its baseline, joint window,
+        // and readback all stay at exactly the user's kappa=.
+        if constant_curvature_kappa_is_fixed(&resolvedspec, term_idx) {
+            continue;
+        }
         if let Some(kappa_seed) =
             select_constant_curvature_kappa_sign_seed(data, y.view(), &resolvedspec, term_idx)
             && kappa_seed != 0.0
