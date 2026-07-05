@@ -7894,7 +7894,13 @@ impl SaeManifoldTerm {
         };
         // Per active logit position: (row i, column k, global t-index,
         // (H⁻¹)_ik,ik) — the inputs to the IBP cross-row empirical-`M_k` channel.
-        let mut ibp_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
+        // Per active logit site: (row, atom, global t-index, RAW selected-inverse
+        // diagonal, DEFLATION-CORRECTED diagonal). The raw diagonal drives the
+        // cross-row Woodbury self-subtraction (it must match the deflated `x_k`
+        // solve); the corrected diagonal `(H⁻¹)_ii − DK_i` drives the empirical-`M_k`
+        // channel, whose diagonal ∂H contraction otherwise misses the Daleckii–Krein
+        // deflation term the `dh_mat` pass already carries (gam#2144 metric-first).
+        let mut ibp_logit_sites: Vec<(usize, usize, usize, f64, f64)> = Vec::new();
 
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
@@ -7954,12 +7960,40 @@ impl SaeManifoldTerm {
                 (inv_vv, inv_vbeta)
             };
 
-            // Record each active logit's column, global t-index, and
-            // selected-inverse diagonal (H⁻¹)_ik,ik for the IBP cross-row pass.
+            // Record each active logit's column, global t-index, and both the RAW
+            // and DEFLATION-CORRECTED selected-inverse diagonal (H⁻¹)_ik,ik for the
+            // IBP cross-row pass. `DK_i` is the Daleckii–Krein correction for a UNIT
+            // diagonal perturbation at this logit slot — the SAME per-row helper the
+            // `dh_mat` pass applies; it is 0 (corrected == raw) whenever the row
+            // carries no deflated directions (the identity/no-metric path), so the
+            // legacy behaviour is bit-identical there.
             if ibp_channels.is_some() {
+                let site_dirs = cache
+                    .deflated_row_directions
+                    .get(row)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let site_spectrum = cache
+                    .deflation_row_spectra
+                    .get(row)
+                    .and_then(Option::as_ref);
                 for (pos, var) in jets.vars.iter().enumerate() {
                     if let SaeLocalRowVar::Logit { atom } = *var {
-                        ibp_logit_sites.push((row, atom, base + pos, inv_vv[[pos, pos]]));
+                        let raw_diag = inv_vv[[pos, pos]];
+                        let corrected_diag = if site_dirs.is_empty() {
+                            raw_diag
+                        } else {
+                            let mut e_slot = Array2::<f64>::zeros((q, q));
+                            e_slot[[pos, pos]] = 1.0;
+                            raw_diag
+                                - Self::deflation_block_correction(
+                                    &inv_vv,
+                                    &e_slot,
+                                    site_dirs,
+                                    site_spectrum,
+                                )
+                        };
+                        ibp_logit_sites.push((row, atom, base + pos, raw_diag, corrected_diag));
                     }
                 }
             }
@@ -8128,11 +8162,19 @@ impl SaeManifoldTerm {
         // self-row M_k self-coupling, which the row-local primitive deliberately
         // omits to avoid double-counting).
         if let Some(channels) = ibp_channels.as_ref() {
+            // gam#2144: contract the empirical-`M_k` diagonal channel against the
+            // DEFLATION-CORRECTED selected-inverse diagonal `(H⁻¹)_ii − DK_i`. The
+            // `M_k` channel's ∂H is a per-row diagonal (`m_channel_i` at row i's
+            // logit slot), so under a low-rank whitening metric each row's slot needs
+            // the SAME Daleckii–Krein deflation correction the `dh_mat` (local-`z`)
+            // pass already applies — the correction is linear in the perturbation, so
+            // the per-unit `DK_i` recorded in `ibp_logit_sites` scales through. `DK_i`
+            // is 0 on the no-metric path, so this is bit-identical there.
             let mut col_coeff = vec![0.0_f64; k_atoms];
-            for &(row, atom, _t_index, inv_diag) in &ibp_logit_sites {
-                col_coeff[atom] += inv_diag * channels.m_channel[row * k_atoms + atom];
+            for &(row, atom, _t_index, _raw_diag, corrected_diag) in &ibp_logit_sites {
+                col_coeff[atom] += corrected_diag * channels.m_channel[row * k_atoms + atom];
             }
-            for &(row, atom, t_index, _inv_diag) in &ibp_logit_sites {
+            for &(row, atom, t_index, _raw_diag, _corrected_diag) in &ibp_logit_sites {
                 gamma_t[t_index] += col_coeff[atom] * channels.z_jac[row * k_atoms + atom];
             }
 
@@ -8195,9 +8237,13 @@ impl SaeManifoldTerm {
             // with `uᵀGu = Σ_i J_ik·(Gu)_i`, `(Gu) = x_k = H⁻¹ u_k` from one solve,
             // and `G_ii` the per-site selected-inverse diagonal.
             let total_t = cache.delta_t_len();
+            // The Woodbury pass reconstructs the off-diagonal `(H⁻¹)_ij` from the
+            // deflated solve `x_k = H⁻¹ u_k` and subtracts the `i=j` self term; the
+            // self term must use the RAW deflated diagonal (matching `x_k`), NOT the
+            // Daleckii–Krein-corrected diagonal the `M_k` pass uses.
             let mut col_sites: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); k_atoms];
-            for &(row, atom, t_index, inv_diag) in &ibp_logit_sites {
-                col_sites[atom].push((row, t_index, inv_diag));
+            for &(row, atom, t_index, raw_diag, _corrected_diag) in &ibp_logit_sites {
+                col_sites[atom].push((row, t_index, raw_diag));
             }
             // Hoisted RHS scratch: fill only this column's active slots, solve,
             // then clear exactly those slots — no per-column total_t zeroing.
