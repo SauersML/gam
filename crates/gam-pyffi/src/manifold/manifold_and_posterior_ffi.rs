@@ -2045,6 +2045,79 @@ fn summary_whitening_gram(
     Some(x.t().dot(&x))
 }
 
+#[cfg(test)]
+mod whitening_gram_tests {
+    //! Direct tests of the #2142 design-whitening-Gram reconstruction grid used
+    //! when a summary is built from an inference-stripped (compact) model. The
+    //! whitening math itself is covered by `gam-terms` `smooth_test` tests; here
+    //! we only verify the reconstruction *inputs* are non-degenerate.
+    use super::whitening_data_from_ranges;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn dense_grid_spans_range_and_breaks_diagonal_collinearity() {
+        let ranges = [(0.0_f64, 1.0_f64), (-2.0, 4.0)];
+        let levels = BTreeMap::new();
+        let data = whitening_data_from_ranges(&ranges, &levels, 64);
+        assert_eq!(data.nrows(), 64);
+        assert_eq!(data.ncols(), 2);
+        // Each continuous column sweeps its full [lo, hi] range.
+        for (c, &(lo, hi)) in ranges.iter().enumerate() {
+            let col = data.column(c);
+            let cmin = col.iter().cloned().fold(f64::INFINITY, f64::min);
+            let cmax = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!((cmin - lo).abs() < 1e-9, "col {c} min {cmin} != {lo}");
+            assert!((cmax - hi).abs() < 1e-9, "col {c} max {cmax} != {hi}");
+        }
+        // The shared-ramp representative grid puts both columns on the same
+        // diagonal (Pearson r == 1), collapsing every tensor Gram. The
+        // independent coprime sweeps must break that: |r| strictly below 1.
+        let c0 = data.column(0);
+        let c1 = data.column(1);
+        let m0 = c0.mean().unwrap();
+        let m1 = c1.mean().unwrap();
+        let (mut cov, mut v0, mut v1) = (0.0, 0.0, 0.0);
+        for i in 0..64 {
+            let (a, b) = (c0[i] - m0, c1[i] - m1);
+            cov += a * b;
+            v0 += a * a;
+            v1 += b * b;
+        }
+        let r = cov / (v0.sqrt() * v1.sqrt());
+        assert!(
+            r.abs() < 0.9,
+            "columns must not be collinear (diagonal grid), got r={r}"
+        );
+    }
+
+    #[test]
+    fn categorical_columns_cycle_every_frozen_level() {
+        let ranges = [(0.0_f64, 1.0_f64), (0.0, 0.0)];
+        let mut levels = BTreeMap::new();
+        let lv = vec![
+            1.0_f64.to_bits(),
+            2.0_f64.to_bits(),
+            3.0_f64.to_bits(),
+        ];
+        levels.insert(1usize, lv.clone());
+        let data = whitening_data_from_ranges(&ranges, &levels, 64);
+        let allowed: Vec<f64> = lv.iter().map(|&b| f64::from_bits(b)).collect();
+        for i in 0..64 {
+            let v = data[[i, 1]];
+            assert!(
+                allowed.iter().any(|&a| a == v),
+                "row {i} value {v} is not a frozen level"
+            );
+        }
+        for &a in &allowed {
+            assert!(
+                (0..64).any(|i| data[[i, 1]] == a),
+                "frozen level {a} never appears"
+            );
+        }
+    }
+}
+
 /// Build the mgcv-style per-smooth significance table for the FFI summary.
 ///
 /// Mirrors `main.rs::build_model_summary`'s smooth-term loop: random-effect
