@@ -1235,14 +1235,18 @@ pub struct RandomEffectTermSpec {
     /// time (encoded as an out-of-vocabulary code and shrunk toward the
     /// population mean) instead of raising a schema mismatch.
     ///
-    /// Only an EXPLICIT random effect — `group(g)`/`re(g)`/`factor(g)` /
-    /// `s(g, bs="re")` — is lenient: the held-out-group policy is a deliberate
-    /// contract. A BARE categorical main effect (`+ g`), although auto-promoted
-    /// to a penalized random block internally, is a FIXED parametric factor, and
-    /// an out-of-vocabulary level of it must raise `SchemaMismatchError` at
-    /// predict rather than being silently mapped to the factor's centering point
-    /// (#2102). The `true` default preserves the pre-#2102 (uniformly lenient)
-    /// behavior for models serialized before this field existed.
+    /// Only a genuine random effect — `group(g)`/`re(g)`/`s(g, bs="re")` — is
+    /// lenient: the held-out-group policy is a deliberate contract. A FIXED
+    /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
+    /// materialized as a penalized one-hot block, must raise on an
+    /// out-of-vocabulary level at predict rather than being silently mapped to
+    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
+    /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
+    /// (#2137). For a string factor the typed schema encode rejects the unseen
+    /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
+    /// by `build_random_effect_block`, which owns the frozen vocabulary. The
+    /// `true` default preserves the pre-#2102 (uniformly lenient) behavior for
+    /// models serialized before this field existed.
     #[serde(default = "default_random_effect_lenient_unseen")]
     pub lenient_unseen: bool,
 }
@@ -5767,6 +5771,17 @@ pub fn tensor_product_design_from_marginals(
     Ok(design)
 }
 
+/// Render a numeric factor level for an error message: an integer-valued code
+/// (`1999.0`) prints as `1999`, so an unseen-level message names the level the
+/// user actually wrote rather than a spurious `.0`.
+fn fmt_level_value(v: f64) -> String {
+    if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
 pub fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
     spec: &RandomEffectTermSpec,
@@ -5841,10 +5856,36 @@ pub fn build_random_effect_block(
             );
         }
     }
+    // A FIXED categorical factor (`factor(g)` or a bare `+ g`; `lenient_unseen
+    // == false`) must reject an out-of-vocabulary level rather than silently
+    // encode it as an all-zero dummy row that collapses onto the factor's
+    // centering point (#2137/#2102). For a *string* factor the typed schema
+    // encode rejects the unseen level before we get here; a *numeric-coded*
+    // `factor(year)` column, however, reaches Rust as a plain numeric column
+    // with no categorical schema, so the operator that owns the frozen level
+    // vocabulary is the enforcement point that closes the same gap. Only when
+    // the full one-hot block is kept (`!drop_first_level`) does an absent level
+    // unambiguously mean "unseen" — with treatment coding the dropped baseline
+    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
+    // presence marks the predict/frozen context; at fit the vocabulary is
+    // derived from this very data, so no row is unseen.
+    let strict_unseen = !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
-    for &v in col {
+    for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
-        group_ids.push(level_to_col.get(&bits).copied());
+        let group_id = level_to_col.get(&bits).copied();
+        if strict_unseen && group_id.is_none() {
+            crate::bail_invalid_basis!(
+                "unseen level '{}' in fixed factor column '{}' at row {}; the factor's levels \
+                 were fixed at fit time and an out-of-vocabulary level cannot be predicted \
+                 (use group({}) for a random effect that tolerates held-out levels)",
+                fmt_level_value(v),
+                spec.name,
+                row,
+                spec.name
+            );
+        }
+        group_ids.push(group_id);
     }
 
     Ok(RandomEffectBlock {
@@ -5907,6 +5948,73 @@ mod random_effect_signed_zero_tests {
         let data = array![[0.0_f64], [1.0]];
         let block = build_random_effect_block(data.view(), &s).unwrap();
         assert_eq!(block.group_ids[0], Some(0), "+0.0 must match the -0.0 column");
+    }
+
+    // ---- #2137: fixed factor (`factor(g)`) strict-unseen enforcement --------
+
+    fn fixed_factor_spec() -> RandomEffectTermSpec {
+        // A numeric-coded `factor(year)`: full one-hot (`drop_first_level=false`),
+        // FIXED (`lenient_unseen=false`), vocabulary pinned at fit.
+        let mut s = spec();
+        s.name = "year".to_string();
+        s.lenient_unseen = false;
+        s
+    }
+
+    #[test]
+    fn fixed_factor_rejects_unseen_numeric_level_at_predict() {
+        // The numeric-coded `factor(year)` gap (#2137): the column reaches the
+        // operator as plain numbers (no categorical schema to pre-filter it), so
+        // the operator that owns the frozen vocabulary must reject an unseen
+        // code rather than encode an all-zero (centering-point) row.
+        let mut s = fixed_factor_spec();
+        s.frozen_levels = Some(vec![2000.0_f64.to_bits(), 2001.0_f64.to_bits()]);
+        let data = array![[2000.0_f64], [1999.0]];
+        let err = build_random_effect_block(data.view(), &s)
+            .expect_err("an unseen fixed-factor level must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("unseen level"), "message must name the defect: {msg}");
+        assert!(msg.contains("1999"), "message must name the integer level (not 1999.0): {msg}");
+        assert!(msg.contains("year"), "message must name the column: {msg}");
+    }
+
+    #[test]
+    fn fixed_factor_accepts_seen_numeric_levels_at_predict() {
+        // Control: every seen level still resolves; strictness rejects only the
+        // genuinely out-of-vocabulary code.
+        let mut s = fixed_factor_spec();
+        s.frozen_levels = Some(vec![2000.0_f64.to_bits(), 2001.0_f64.to_bits()]);
+        let data = array![[2001.0_f64], [2000.0]];
+        let block = build_random_effect_block(data.view(), &s).unwrap();
+        assert_eq!(block.group_ids[0], Some(1));
+        assert_eq!(block.group_ids[1], Some(0));
+    }
+
+    #[test]
+    fn fixed_factor_at_fit_time_derives_vocabulary_and_never_false_rejects() {
+        // At FIT (`frozen_levels=None`) the vocabulary is derived from this very
+        // data, so no row is unseen — the strict guard must not fire even though
+        // the factor is strict.
+        let mut s = fixed_factor_spec();
+        s.frozen_levels = None;
+        let data = array![[2000.0_f64], [2001.0], [2002.0], [2000.0]];
+        let block = build_random_effect_block(data.view(), &s)
+            .expect("fit-time build must not reject its own levels");
+        assert_eq!(block.num_groups, 3);
+    }
+
+    #[test]
+    fn random_effect_still_tolerates_unseen_numeric_level() {
+        // Non-regression: a lenient random effect (`group`/`re`/`s(bs="re")`)
+        // encodes an unseen level as an all-zero (population-mean) row, NOT a
+        // rejection — the held-out-group contract (#2102) is unchanged.
+        let mut s = spec(); // lenient_unseen = true
+        s.frozen_levels = Some(vec![2000.0_f64.to_bits(), 2001.0_f64.to_bits()]);
+        let data = array![[2000.0_f64], [1999.0]];
+        let block = build_random_effect_block(data.view(), &s)
+            .expect("a random effect tolerates unseen levels");
+        assert_eq!(block.group_ids[0], Some(0));
+        assert_eq!(block.group_ids[1], None, "unseen level → population mean, not a reject");
     }
 }
 

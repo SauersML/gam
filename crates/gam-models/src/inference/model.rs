@@ -4988,12 +4988,14 @@ mod tests {
         );
     }
 
-    /// #2102: a BARE categorical predictor (`y ~ g`) is a FIXED parametric
-    /// factor. An unseen level in a prediction frame must reach the strict
-    /// schema encode and raise a `SchemaMismatch` — it must NOT be silently
-    /// mapped to the factor's centering point (the across-level average). Only
-    /// an EXPLICIT random effect (`group(g)`/`re(g)`/`factor(g)`) is eligible
-    /// for the lenient held-out-group policy, and it must stay lenient.
+    /// #2102/#2137: a FIXED categorical factor — a bare `y ~ g` or an explicit
+    /// `y ~ factor(g)` — must reach the strict schema encode and raise a
+    /// `SchemaMismatch` on an unseen level; it must NOT be silently mapped to
+    /// the factor's centering point (the across-level average). Only a genuine
+    /// random effect (`group(g)`/`re(g)`/`s(g, bs="re")`) is eligible for the
+    /// lenient held-out-group policy, and it must stay lenient. `factor(g)`
+    /// shared the `group()`/`re()` parse arm and so wrongly inherited the
+    /// lenient policy (#2137); it is now lowered as the fixed factor it is.
     ///
     /// This drives the real predict/`check` encode contract: it derives the
     /// lenient whitelist from `random_effect_group_columns()` exactly as the
@@ -5091,14 +5093,36 @@ mod tests {
             "expected an unseen-level schema mismatch naming the level, got: {err}"
         );
 
-        // Explicit random effect: stays lenient (held-out group → population mean).
-        let grouped = model_for("y ~ group(g)");
+        // Explicit `factor(g)` is a FIXED categorical factor (#2137): it must
+        // behave exactly like the bare `+ g` above — strict on unseen levels,
+        // NOT whitelisted for lenient encoding — even though it shares the
+        // penalized-categorical materialization with `group(g)`.
+        let factor = model_for("y ~ factor(g)");
         assert!(
-            grouped.random_effect_group_columns().contains("g"),
-            "explicit group(g) must remain lenient on unseen levels (held-out-group policy)"
+            !factor.random_effect_group_columns().contains("g"),
+            "factor(g) is a FIXED categorical factor; it must NOT be whitelisted for lenient \
+             unseen-level encoding (#2137)"
         );
-        encode_level(&grouped, "TYPO")
-            .expect("explicit group(g) tolerates unseen levels by contract");
+        encode_level(&factor, "a").expect("a seen level must still encode for factor(g)");
+        let factor_err = encode_level(&factor, "TYPO")
+            .expect_err("an unseen factor(g) level must raise a schema mismatch (#2137)");
+        assert!(
+            factor_err.contains("unseen level"),
+            "expected an unseen-level schema mismatch naming the level, got: {factor_err}"
+        );
+
+        // Genuine random effects stay lenient (held-out group → population mean):
+        // group(g), its re(g) alias, and the mgcv s(g, bs="re") spelling.
+        for formula in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=\"re\")"] {
+            let grouped = model_for(formula);
+            assert!(
+                grouped.random_effect_group_columns().contains("g"),
+                "`{formula}` is a random effect; it must remain lenient on unseen levels \
+                 (held-out-group policy)"
+            );
+            encode_level(&grouped, "TYPO")
+                .unwrap_or_else(|err| panic!("`{formula}` must tolerate an unseen level, got: {err}"));
+        }
     }
 
     #[test]
