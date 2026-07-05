@@ -26,7 +26,9 @@
 //!    loop of charts, with a trivial/nontrivial verdict whose tolerance is
 //!    DERIVED from the loop's own defects (never a magic constant).
 
+use crate::inference::layer_transport::{ChartTopology, FittedTransport};
 use crate::inference::transport_class::CircleTransportReport;
+use ndarray::Array1;
 use std::f64::consts::{PI, TAU};
 
 /// One component map of a chart-coordinate pipeline, abstracted to exactly the
@@ -78,6 +80,47 @@ impl Contract {
             }
         }
         Ok(())
+    }
+
+    /// Build a component contract from a fitted inter-layer transport `h`, the
+    /// bridge from the crate's real transport artifacts ([`FittedTransport`],
+    /// produced by [`fit_transport_map`](crate::inference::layer_transport::fit_transport_map))
+    /// into the composer. The three certificate numbers are read directly off
+    /// the fit:
+    ///
+    /// - `domain_radius` = the source chart's coordinate span (a full turn `2π`
+    ///   on a circle, `hi − lo` on an interval): the ball on which `h`'s smooth
+    ///   is defined.
+    /// - `defect` = the target-space approximation error of the fitted map,
+    ///   estimated by its [`residual_rms`](FittedTransport::residual_rms) — how
+    ///   far `h` sits from the observed continuation coordinates. This is the
+    ///   sup-norm-style gap the shadowing bound propagates.
+    /// - `lipschitz` = the metric expansion bound `sup_t |h′(t)|` measured over
+    ///   a dense grid of the source domain — the largest local stretch the map
+    ///   applies. For a near-isometric TRANSPORT layer this is `≈ 1`; a COMPUTE
+    ///   layer that reshapes the chart metric reads `> 1` and amplifies earlier
+    ///   stages' error more (see [`compose_contracts`]).
+    pub fn from_transport(
+        t: &FittedTransport,
+        name: impl Into<String>,
+        grid: usize,
+    ) -> Result<Contract, String> {
+        let (lo, hi) = match t.topology_from {
+            ChartTopology::Circle => (0.0, TAU),
+            ChartTopology::Interval { lo, hi } => (lo, hi),
+        };
+        let g = grid.max(2);
+        let pts: Vec<f64> = (0..g)
+            .map(|k| lo + (hi - lo) * (k as f64) / ((g - 1) as f64))
+            .collect();
+        let deriv = t.derivative(Array1::from_vec(pts).view())?;
+        let lipschitz = deriv.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        Ok(Contract {
+            name: name.into(),
+            domain_radius: hi - lo,
+            defect: t.residual_rms,
+            lipschitz,
+        })
     }
 }
 
@@ -277,6 +320,20 @@ fn wrap_pi(x: f64) -> f64 {
     if w <= -PI { w + TAU } else { w }
 }
 
+/// The inverse of the `O(2)` edge `(sign, angle)`.
+///
+/// The element acts as `x ↦ sign·x + angle`; its inverse is `y ↦ sign·(y −
+/// angle) = sign·y − sign·angle` (using `sign² = 1`), i.e. `(sign, −sign·angle)`.
+/// This is what closes a composition triangle into a loop: given the two
+/// forward hops `h_ab, h_bc` and the direct map `h_ac`, the loop
+/// `h_ab, h_bc, h_ac⁻¹` returns to the start, so its [`loop_holonomy`] measures
+/// exactly the failure of the composition law `h_ac = h_bc ∘ h_ab` as an `O(2)`
+/// element.
+pub fn invert_o2_edge(edge: (i8, f64)) -> (i8, f64) {
+    let s = if edge.0 >= 0 { 1i8 } else { -1i8 };
+    (s, -(s as f64) * edge.1)
+}
+
 /// Compose a closed loop of circle isometries and report the net `O(2)` element.
 ///
 /// Each edge is an `O(2)` element `(sign, angle)` in the vocabulary of
@@ -363,6 +420,14 @@ pub fn holonomy_from_transports(loop_edges: &[CircleTransportReport]) -> Holonom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic LCG uniform in `[0, 1)` for the transport-fit tests.
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 11) as f64) / ((1u64 << 53) as f64)
+    }
 
     fn c(name: &str, domain_radius: f64, defect: f64, lipschitz: f64) -> Contract {
         Contract {
@@ -521,6 +586,54 @@ mod tests {
         assert_eq!(r.net_sign, 1);
         assert_eq!(r.net_angle, 0.0);
         assert!(r.is_trivial);
+    }
+
+    #[test]
+    fn invert_o2_edge_round_trips_to_identity() {
+        use crate::inference::contracts::invert_o2_edge;
+        // A rotation and its inverse compose to the identity.
+        let e = (1i8, 0.7);
+        let inv = invert_o2_edge(e);
+        let r = loop_holonomy(&[e, inv], &[0.0, 0.0]);
+        assert_eq!(r.net_sign, 1);
+        assert!(r.net_angle.abs() < 1e-12);
+        assert!(r.is_trivial);
+        // A reflection is its own inverse's sign; edge·inv = identity too.
+        let f = (-1i8, 1.1);
+        let finv = invert_o2_edge(f);
+        assert_eq!(finv.0, -1);
+        let r2 = loop_holonomy(&[f, finv], &[0.0, 0.0]);
+        assert_eq!(r2.net_sign, 1);
+        assert!(r2.net_angle.abs() < 1e-12);
+    }
+
+    #[test]
+    fn contract_from_near_isometric_transport() {
+        use crate::inference::layer_transport::{ChartTopology, fit_transport_map};
+        // Plant a pure rotation θ_to = θ_from + 0.6 (mod 2π): a near-isometry,
+        // so lipschitz ≈ 1, domain_radius = 2π, defect ≈ 0.
+        let mut s = 11u64;
+        let n = 256usize;
+        let (mut from, mut to) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for _ in 0..n {
+            let th = lcg(&mut s) * TAU;
+            from.push(th);
+            to.push((th + 0.6).rem_euclid(TAU));
+        }
+        let fit = fit_transport_map(
+            Array1::from_vec(from).view(),
+            Array1::from_vec(to).view(),
+            ChartTopology::Circle,
+            ChartTopology::Circle,
+        )
+        .expect("transport fit");
+        let c = Contract::from_transport(&fit, "L_a->L_b", 128).expect("contract");
+        assert!((c.domain_radius - TAU).abs() < 1e-9);
+        assert!((c.lipschitz - 1.0).abs() < 0.05, "lipschitz = {}", c.lipschitz);
+        assert!(c.defect < 0.05, "defect = {}", c.defect);
+        // It composes with itself as a well-formed chain.
+        let composed = compose_contracts(&[c.clone(), c]);
+        assert!(composed.total_defect.is_finite());
     }
 
     #[test]
