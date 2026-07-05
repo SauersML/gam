@@ -74,6 +74,7 @@
 use crate::sparse_dict::{BlockSparseFit, SparseDictFit, block_gates, block_projections_row};
 use ndarray::ArrayView2;
 use std::collections::HashSet;
+use std::f64::consts::TAU;
 
 /// Relative slack on the derived unit threshold, absorbing the f32-input /
 /// f64-accumulation rounding of the two dot-product paths (residual and code).
@@ -111,6 +112,96 @@ pub struct DualCertificateReport {
 struct RowCertificate {
     optimality_ratio: f64,
     birth: Option<(u32, f64)>,
+}
+
+/// BLASSO dual birth ratio for a residual harmonic circle code.
+///
+/// `residual_coeffs[h] = (c_{h+1}, s_{h+1})` stores the Fourier residual after
+/// subtracting the current measure on one block. The dual polynomial is
+/// `η(t) = <r, u(t)> / λ`; this returns `sup_t η(t)` scaled by the active
+/// measure mass. Values above `1` are the threshold-free multiplicity/birth
+/// trigger from convex duality.
+pub fn harmonic_dual_birth_eta(residual_coeffs: &[(f64, f64)], active_mass: f64) -> f64 {
+    if residual_coeffs.is_empty() {
+        return 0.0;
+    }
+    let lambda = active_mass.max(LAMBDA_FLOOR);
+    let (t, _curvature) = harmonic_dual_argmax(residual_coeffs);
+    harmonic_dual_value(residual_coeffs, t).max(0.0) / lambda
+}
+
+fn harmonic_dual_value(coeffs: &[(f64, f64)], t: f64) -> f64 {
+    let mut acc = 0.0;
+    for (h, &(c_h, s_h)) in coeffs.iter().enumerate() {
+        let phase = TAU * (h + 1) as f64 * t;
+        let (sin_h, cos_h) = phase.sin_cos();
+        acc += c_h * cos_h + s_h * sin_h;
+    }
+    acc
+}
+
+fn harmonic_dual_derivative(coeffs: &[(f64, f64)], t: f64) -> f64 {
+    let mut acc = 0.0;
+    for (h, &(c_h, s_h)) in coeffs.iter().enumerate() {
+        let omega = TAU * (h + 1) as f64;
+        let phase = omega * t;
+        let (sin_h, cos_h) = phase.sin_cos();
+        acc += omega * (-c_h * sin_h + s_h * cos_h);
+    }
+    acc
+}
+
+fn harmonic_dual_second_derivative(coeffs: &[(f64, f64)], t: f64) -> f64 {
+    let mut acc = 0.0;
+    for (h, &(c_h, s_h)) in coeffs.iter().enumerate() {
+        let omega = TAU * (h + 1) as f64;
+        let phase = omega * t;
+        let (sin_h, cos_h) = phase.sin_cos();
+        acc += omega * omega * (-c_h * cos_h - s_h * sin_h);
+    }
+    acc
+}
+
+fn harmonic_dual_argmax(coeffs: &[(f64, f64)]) -> (f64, f64) {
+    let harmonics = coeffs.len();
+    let grid = 4 * harmonics.max(1);
+    let mut best_t = 0.0;
+    let mut best_value = f64::NEG_INFINITY;
+    for idx in 0..grid {
+        let t = idx as f64 / grid as f64;
+        let value = harmonic_dual_value(coeffs, t);
+        if value > best_value {
+            best_value = value;
+            best_t = t;
+        }
+    }
+
+    let tolerance = f64::EPSILON.sqrt();
+    let iteration_cap = 64;
+    let mut t = best_t;
+    let mut converged = false;
+    for _step_idx in 0..iteration_cap {
+        let second = harmonic_dual_second_derivative(coeffs, t);
+        if second.abs() <= f64::MIN_POSITIVE {
+            break;
+        }
+        let step = harmonic_dual_derivative(coeffs, t) / second;
+        t -= step;
+        if step.abs() <= tolerance * (1.0 + t.abs()) {
+            converged = true;
+            break;
+        }
+    }
+
+    let polished_t = t.rem_euclid(1.0);
+    if converged && harmonic_dual_value(coeffs, polished_t) >= best_value {
+        (
+            polished_t,
+            harmonic_dual_second_derivative(coeffs, polished_t),
+        )
+    } else {
+        (best_t, harmonic_dual_second_derivative(coeffs, best_t))
+    }
 }
 
 /// Assemble a [`DualCertificateReport`] from per-row certificates.

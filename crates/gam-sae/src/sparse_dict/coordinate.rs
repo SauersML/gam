@@ -106,6 +106,7 @@
 //! `f''(t̂) = −(2π)² ‖z‖`, so `Var(t̂) = σ²(2π)² / (2π)⁴‖z‖² = σ²/(2π‖z‖)²`.
 
 use super::block::BlockSparseFit;
+use crate::dual_certificate::harmonic_dual_birth_eta;
 use crate::super_resolution::{recover_spikes, separation_limit};
 use ndarray::{Array2, ArrayView2};
 use std::f64::consts::TAU;
@@ -311,12 +312,6 @@ fn spike_coordinate_se(sigma: f64, amplitude: f64, h_count: usize) -> f64 {
     }
 }
 
-fn local_dual_eta(residual: &[f64], active_mass: f64) -> f64 {
-    let lambda = active_mass.max(f64::MIN_POSITIVE);
-    let off_support_gate = harmonic_f(residual, harmonic_argmax(residual).0).max(0.0);
-    off_support_gate / lambda
-}
-
 fn circle_dist(a: f64, b: f64) -> f64 {
     let d = (a - b).abs();
     d.min(1.0 - d)
@@ -368,7 +363,8 @@ fn maybe_super_resolve(z: &[f64], sigma: f64) -> (Vec<MeasureSpikeCoordinate>, f
     }
 
     let min_sep = separation_limit(h_count);
-    let eta = local_dual_eta(&single_residual, single.amplitude);
+    let single_residual_coeffs = coeffs_from_code(&single_residual);
+    let eta = harmonic_dual_birth_eta(&single_residual_coeffs, single.amplitude);
     let residual_is_multimodal = count_separated_positive_modes(&single_residual, min_sep) > 1;
     let code_is_multimodal = count_separated_positive_modes(z, min_sep) > 1;
     if eta <= 1.0 && !residual_is_multimodal && !code_is_multimodal {
@@ -755,7 +751,7 @@ pub fn reconstruct_single_coordinate_rows(fit: &BlockSparseFit) -> Result<Array2
                 block,
                 row,
                 spikes: vec![spike],
-                dual_eta: local_dual_eta(&residual, spike.amplitude),
+                dual_eta: harmonic_dual_birth_eta(&coeffs_from_code(&residual), spike.amplitude),
                 used_super_resolution: false,
             });
         }
