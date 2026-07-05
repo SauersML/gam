@@ -1,17 +1,21 @@
-//! PyO3 boundary for the SAE spectral / routing-geometry diagnostics landed in
-//! the `gam-sae` crate (`gam::terms::sae`): the dimension spectrometer, the
-//! block-firing circle-coordinate readout, the routability floor + audit, the
-//! sparse-dictionary dual certificate, and the contract-composition / loop
-//! holonomy calculus.
-//!
-//! This is an `include!` fragment textually inlined at the `gam-pyffi` crate
-//! root (see `lib.rs`), so it shares the crate-root namespace with the other
-//! entrypoint fragments and reaches the shared prelude items (`PyDict`,
-//! `PyReadonlyArray2`, `detach_py_result`, …) by bare name. As with the other
-//! fragments, the engine functions are referenced through their fully-qualified
-//! `gam::terms::sae::…` paths and the Python surface is a thin wrapper (SPEC
-//! rule 8): every number is computed in Rust, the FFI only marshals arrays and
-//! dicts.
+// PyO3 boundary for the SAE spectral / routing-geometry diagnostics landed in
+// the `gam-sae` crate (`gam::terms::sae`): the dimension spectrometer, the
+// block-firing circle-coordinate readout, the routability floor + audit, the
+// sparse-dictionary dual certificate, and the contract-composition / loop
+// holonomy calculus.
+//
+// NB: plain `//` comments, NOT `//!` inner-doc — this file is an `include!`
+// fragment textually inlined into `lib.rs` AFTER other items, where an inner
+// doc comment is a hard error (E0753: inner attributes/doc must lead the
+// enclosing module). Every sibling entrypoint fragment (`model_ffi.rs`, …)
+// leads with plain comments for the same reason.
+//
+// The fragment shares the crate-root namespace with the other entrypoint
+// fragments and reaches the shared prelude items (`PyDict`, `PyReadonlyArray2`,
+// `detach_py_result`, …) by bare name. As with the other fragments, the engine
+// functions are referenced through their fully-qualified `gam::terms::sae::…`
+// paths and the Python surface is a thin wrapper (SPEC rule 8): every number is
+// computed in Rust, the FFI only marshals arrays and dicts.
 
 /// Reconstruct a linear-lane [`SparseDictFit`] from the columnar arrays the
 /// `sparse_dictionary_fit` FFI hands back to Python, so the diagnostics that
