@@ -53,7 +53,12 @@ fn planted_axis_dense_circles(n: usize, p: usize, k: usize, sigma: f64, seed: u6
     data
 }
 
-/// A K=1 ThresholdGate circle-atom seed on ambient dirs (0,1), active on every row.
+/// An UNFIT K=1 softmax circle-atom seed on ambient dirs (0,1), active on every
+/// row. Unfit + softmax on purpose (matching the driver parity test): a warm K=1
+/// joint fit chases a rank-2 blend across all circles and contaminates the residual
+/// so the κ certificate rejects it, and a ThresholdGate starves the born circle's
+/// own-presence gate below the birth threshold; an unfit softmax seed leaves round 1
+/// a clean multi-circle residual the drivers actually grow K on.
 fn build_seed(
     evaluator: &Arc<PeriodicHarmonicEvaluator>,
     coords: &Array2<f64>,
@@ -80,7 +85,7 @@ fn build_seed(
         logits,
         vec![coords.clone()],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::threshold_gate(1.0, -3.0),
+        AssignmentMode::softmax(1.0),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -90,9 +95,9 @@ fn build_seed(
 }
 
 fn main() {
-    let n = 600usize;
-    let p = 12usize;
-    let q = 4usize;
+    let n = 900usize;
+    let p = 16usize;
+    let q = 3usize;
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
     let target = planted_axis_dense_circles(n, p, q, 0.03, 0x2111_A11E_u64);
@@ -104,24 +109,11 @@ fn main() {
     config.min_effect_ev = 0.0;
     config.structured_whitening = false;
 
-    // Warm the seed once per driver (fit is timed on the birth phase, not the seed).
-    let (seed_s, rho_s) = {
-        let (mut t, mut r) = build_seed(&evaluator, &coords, p);
-        t.set_guards_enabled(false);
-        t.run_joint_fit_arrow_schur(target.view(), &mut r, None, 24, 1.0, 1e-6, 1e-6)
-            .ok();
-        (t, r)
-    };
-    let (seed_b, rho_b) = {
-        let (mut t, mut r) = build_seed(&evaluator, &coords, p);
-        t.set_guards_enabled(false);
-        t.run_joint_fit_arrow_schur(target.view(), &mut r, None, 24, 1.0, 1e-6, 1e-6)
-            .ok();
-        (t, r)
-    };
+    let (seed_s, rho_s) = build_seed(&evaluator, &coords, p);
+    let (seed_b, rho_b) = build_seed(&evaluator, &coords, p);
 
     let t0 = Instant::now();
-    let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None)
+    let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None, None)
         .expect("serial driver");
     let serial_dt = t0.elapsed().as_secs_f64();
 
