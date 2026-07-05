@@ -468,8 +468,16 @@ where
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<gam_linalg::matrix::SymmetricMatrix> = None;
 
-    let penalizedobjective = |state: &WorkingState| {
-        let mut value = state.deviance + state.penalty_term;
+    // The penalized objective the LM gain ratio and stall detector compare.
+    // `dev_scale` is the family's dispersion factor `k` (Gamma shape, Tweedie /
+    // fixed-φ Gaussian 1/φ, else 1): the inner gradient and Hessian are built
+    // from the `k`-scaled working weight, so the objective value must be
+    // `k·deviance + penalty` for the gain ratio (actual ÷ predicted reduction)
+    // and the accept test to compare like with like. Using the bare (unscaled)
+    // deviance while the step targets `k·D + penalty` freezes the Gamma smooth
+    // at heavily-penalized ρ (issue #2128).
+    let penalizedobjective = |state: &WorkingState, dev_scale: f64| {
+        let mut value = dev_scale * state.deviance + state.penalty_term;
         if options.firth_bias_reduction
             && let Some(jeffreys_logdet) = state.jeffreys_logdet()
         {
@@ -642,7 +650,12 @@ where
         let mut lm_candidate_total = std::time::Duration::ZERO;
         let mut lm_predred_total = std::time::Duration::ZERO;
         let mut lm_attempts_done = 0usize;
-        let current_penalized = penalizedobjective(&state);
+        // Dispersion factor `k` baked into the working weight (Gamma shape,
+        // Tweedie/fixed-φ Gaussian 1/φ, else 1). Read AFTER the iter-start
+        // `update_with_curvature` above so the once-per-solve Gamma-shape lock is
+        // in place; it is constant for the rest of this inner solve.
+        let penalized_dev_scale = model.penalized_deviance_scale();
+        let current_penalized = penalizedobjective(&state, penalized_dev_scale);
         if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
             min_penalized_deviance = current_penalized;
         }
@@ -1198,8 +1211,8 @@ where
             lm_candidate_total += candidate_eval_start.elapsed();
             match candidate_eval_result {
                 Ok(candidate_eval) => {
-                    let screening_penalized =
-                        candidate_eval.penalized_objective(options.firth_bias_reduction);
+                    let screening_penalized = candidate_eval
+                        .penalized_objective(options.firth_bias_reduction, penalized_dev_scale);
                     let screening_reduction = current_penalized - screening_penalized;
 
                     // 4. Gain Ratio
@@ -1282,7 +1295,8 @@ where
                                 }
                             }
                         };
-                        let candidate_penalized = penalizedobjective(&accepted_state);
+                        let candidate_penalized =
+                            penalizedobjective(&accepted_state, penalized_dev_scale);
                         if candidate_penalized.is_finite()
                             && candidate_penalized < min_penalized_deviance
                         {
@@ -2129,8 +2143,15 @@ where
                                 // when the polished objective did not increase
                                 // (a quadratic Newton step cannot increase F, so
                                 // this rejects only nonlinear-family overshoot).
-                                let obj_before = penalizedobjective(&state);
-                                let obj_after = penalizedobjective(&polished_state);
+                                // Same dispersion scale `k` as the gain-ratio
+                                // objective above (the shape lock is constant
+                                // across this inner solve); read locally since
+                                // this polish branch sits outside the iter-start
+                                // binding's scope.
+                                let polish_dev_scale = model.penalized_deviance_scale();
+                                let obj_before = penalizedobjective(&state, polish_dev_scale);
+                                let obj_after =
+                                    penalizedobjective(&polished_state, polish_dev_scale);
                                 let objective_ok = !obj_after.is_finite()
                                     || !obj_before.is_finite()
                                     || obj_after <= obj_before

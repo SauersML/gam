@@ -39,13 +39,23 @@ pub trait WorkingModel {
     fn supports_observed_information_curvature(&self) -> bool {
         false
     }
+
+    /// Dispersion factor `k` the inner working weight carries but the reported
+    /// deviance (`state.deviance` / `CandidateScreen::deviance`) does not, so the
+    /// LM gain-ratio / stall-detection objective must be `k·deviance + penalty`
+    /// to stay consistent with the `k`-scaled gradient and Hessian the step is
+    /// built from. `1.0` for families whose weight carries no such factor (the
+    /// solver objective is already self-consistent there). See
+    /// `curvature::penalized_objective_deviance_scale` and issue #2128.
+    fn penalized_deviance_scale(&self) -> f64 {
+        1.0
+    }
 }
 
 /// Result of a cheap LM-candidate screen: penalized objective + arithmetic
 /// finiteness, without the gradient/Hessian needed for an accepted step.
 #[derive(Debug, Clone)]
 pub struct CandidateScreen {
-    pub penalized_objective: f64,
     pub deviance: f64,
     pub penalty_term: f64,
     pub arithmetic_finite: bool,
@@ -60,12 +70,17 @@ pub enum CandidateEvaluation {
 }
 
 impl CandidateEvaluation {
+    /// The penalized objective `dev_scale·deviance + penalty` (minus the Firth
+    /// Jeffreys term when active). `dev_scale` is the family dispersion factor
+    /// `k` (see `WorkingModel::penalized_deviance_scale`): the trial's deviance
+    /// must be scaled by the SAME `k` the accepted state's is, so the LM
+    /// gain-ratio compares like with like (issue #2128).
     #[inline]
-    pub(crate) fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
+    pub(crate) fn penalized_objective(&self, firth_bias_reduction: bool, dev_scale: f64) -> f64 {
         match self {
-            Self::Screen(s) => s.penalized_objective,
+            Self::Screen(s) => dev_scale * s.deviance + s.penalty_term,
             Self::Full(state) => {
-                let mut value = state.deviance + state.penalty_term;
+                let mut value = dev_scale * state.deviance + state.penalty_term;
                 if firth_bias_reduction && let Some(j) = state.jeffreys_logdet() {
                     value -= 2.0 * j;
                 }
