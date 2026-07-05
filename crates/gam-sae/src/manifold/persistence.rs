@@ -394,12 +394,34 @@ fn symmetric_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// `c − 1` merges at the *inter-cluster* gap — orders of magnitude larger than
 /// the within-cluster spacing. So there is a single dominant multiplicative gap
 /// in the sorted deaths exactly when the cloud is genuinely clustered. The cut
-/// is accepted only when that one log-gap outweighs *all* the others combined —
-/// a parameter-free "one gap dominates" rule that never fires on the roughly
-/// uniform spacings of a single connected manifold.
+/// is accepted only when that one log-gap outweighs *all* the others combined
+/// AND clears a floor of `ln 2`.
+///
+/// The `ln 2` floor is *derived*, not a magic constant. The deaths are computed
+/// on a farthest-point subsample (see [`PERSISTENCE_MAX_POINTS`]); farthest-point
+/// sampling of a connected d-manifold is a covering/packing construction in which
+/// each new landmark sits at the current covering radius, so consecutive landmark
+/// (merge) scales are guaranteed to stay within a factor of 2 of one another.
+/// Hence *within* a single connected manifold every consecutive log-gap is
+/// `≤ ln 2` by construction. Without this floor the sum-only rule is a tie
+/// degeneracy: on a clean, near-noiseless atom the FPS spacings are nearly
+/// uniform, all gaps are tiny and nearly equal, and the largest of them trivially
+/// exceeds the (equally tiny) sum of the rest — so a genuinely connected circle is
+/// declared multi-component. That false positive is *worst* on the atoms that
+/// reconstruct cleanest (lowest residual noise breaks the ties least). A real
+/// cluster separation produces a log-gap `≫ ln 2`, so the floor removes the
+/// degeneracy while leaving genuine splits untouched.
+///
+/// A declared split is additionally rejected when it would isolate a lone
+/// outlier — a component holding fewer than 2 landmarks. That is a single stray
+/// row (a chart artifact), not a second sampled manifold component. The clusters
+/// the dominant cut separates are exactly the single-linkage components just
+/// below the smallest inter-cluster merge scale `deaths[gmax_idx]` (VR H₀ deaths
+/// ARE the single-linkage merge heights), so the guard reuses the same landmark
+/// filtration on `points`.
 ///
 /// Returns `(n_components, within_component_scale)`.
-fn components_and_scale(finite_h0: &[PersistenceBar]) -> (usize, f64) {
+fn components_and_scale(finite_h0: &[PersistenceBar], points: ArrayView2<'_, f64>) -> (usize, f64) {
     let mut deaths: Vec<f64> = finite_h0
         .iter()
         .map(|b| b.death)
@@ -426,16 +448,53 @@ fn components_and_scale(finite_h0: &[PersistenceBar]) -> (usize, f64) {
         }
     }
     let sum_others: f64 = gaps.iter().sum::<f64>() - gmax;
-    if gmax > sum_others && gmax > 0.0 {
+    // Split only when the dominant gap outweighs every other gap combined AND
+    // clears the FPS covering-bound floor `ln 2` (consecutive farthest-point
+    // landmark scales stay within a factor of 2 within a connected manifold, so
+    // within-manifold log-gaps are `≤ ln 2` by construction). The floor kills the
+    // near-uniform-spacing tie degeneracy that otherwise fires on clean atoms.
+    let split_floor = sum_others.max(std::f64::consts::LN_2);
+    if gmax > split_floor && smallest_linkage_component(points, deaths[gmax_idx]) >= 2 {
         // Bars 0..=gmax_idx are inter-cluster merges: gmax_idx + 1 of them, so
         // gmax_idx + 2 components (the extra essential one). The within-cluster
-        // scale is the largest death below the cut.
+        // scale is the largest death below the cut. The linkage guard above has
+        // confirmed no side of the cut is a lone outlier.
         let within = deaths[gmax_idx + 1];
         (gmax_idx + 2, within)
     } else {
-        // Connected: the coarsest merge is the within-component spacing.
+        // Connected (or a rejected lone-outlier cut): the coarsest merge is the
+        // within-component spacing.
         (1, deaths[0])
     }
+}
+
+/// Size (in landmarks) of the smallest single-linkage component at `scale`:
+/// landmark pairs closer than `scale` are unioned, and the least-populated
+/// resulting component is returned. Used to reject a dominant-gap split that
+/// would carve off a lone outlier (a component of one landmark).
+fn smallest_linkage_component(points: ArrayView2<'_, f64>, scale: f64) -> usize {
+    let m = points.nrows();
+    if m == 0 {
+        return 0;
+    }
+    let mut parent: Vec<usize> = (0..m).collect();
+    for i in 0..m {
+        for j in (i + 1)..m {
+            if point_distance(points, i, j) < scale {
+                let ri = nerve_find(&mut parent, i);
+                let rj = nerve_find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut sizes: HashMap<usize, usize> = HashMap::new();
+    for x in 0..m {
+        let r = nerve_find(&mut parent, x);
+        *sizes.entry(r).or_insert(0) += 1;
+    }
+    sizes.values().copied().min().unwrap_or(0)
 }
 
 /// Audit a raced atom's topology against the persistent homology of a point
@@ -462,7 +521,7 @@ pub fn topology_persistence_verdict(
         .copied()
         .filter(|b| !b.is_essential())
         .collect();
-    let (n_components, within_scale) = components_and_scale(&finite_h0);
+    let (n_components, within_scale) = components_and_scale(&finite_h0, sub.view());
 
     // A measured loop is persistent when it outlives the within-component point
     // spacing (or is essential — an unfilled loop at every sampled scale).
@@ -676,5 +735,92 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
         n_edges,
         n_components,
         b1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{components_and_scale, PersistenceBar};
+    use ndarray::Array2;
+
+    fn bars(deaths: &[f64]) -> Vec<PersistenceBar> {
+        deaths
+            .iter()
+            .map(|&d| PersistenceBar {
+                birth: 0.0,
+                death: d,
+            })
+            .collect()
+    }
+
+    /// A 1-D landmark cloud from the given coordinates (one point per row). The
+    /// dominant-gap logic reads the gaps off `bars`; the lone-outlier guard reads
+    /// single-linkage component sizes off these coordinates, so the two are set
+    /// independently in each test to exercise the guard in isolation.
+    fn line_points(xs: &[f64]) -> Array2<f64> {
+        Array2::from_shape_vec((xs.len(), 1), xs.to_vec()).unwrap()
+    }
+
+    /// The sum-only split rule (`g_max > Σ other gaps`) as it stood before the
+    /// `ln 2` floor — used to demonstrate that the false positive it produced is
+    /// now suppressed.
+    fn old_rule_splits(deaths: &[f64]) -> bool {
+        let mut d: Vec<f64> = deaths.to_vec();
+        d.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        if d.len() < 2 {
+            return false;
+        }
+        let logs: Vec<f64> = d.iter().map(|x| x.ln()).collect();
+        let gaps: Vec<f64> = (0..d.len() - 1).map(|i| logs[i] - logs[i + 1]).collect();
+        let gmax = gaps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sum_others: f64 = gaps.iter().sum::<f64>() - gmax;
+        gmax > sum_others && gmax > 0.0
+    }
+
+    #[test]
+    fn near_uniform_clean_spacing_is_connected() {
+        // A clean, near-noiseless atom: farthest-point spacings are nearly tied.
+        // With only two merges the "sum of other gaps" is zero, so the sum-only
+        // rule ALWAYS declared a split; with three nearly-equal gaps whichever is
+        // marginally largest still trips it. Both are genuine single manifolds.
+        for deaths in [vec![1.0, 0.98], vec![1.0, 0.98, 0.96]] {
+            assert!(
+                old_rule_splits(&deaths),
+                "sum-only rule should have (wrongly) split {deaths:?}"
+            );
+            // The floor rejects the split before the guard is consulted; points
+            // are a well-separated cloud so they cannot be what keeps it connected.
+            let pts = line_points(&(0..deaths.len() + 1).map(|i| i as f64 * 100.0).collect::<Vec<_>>());
+            let (n, _) = components_and_scale(&bars(&deaths), pts.view());
+            assert_eq!(n, 1, "ln2 floor should keep {deaths:?} connected");
+        }
+    }
+
+    #[test]
+    fn genuine_two_cluster_split_survives_floor() {
+        // One inter-cluster merge at scale 10 with within-cluster spacing near
+        // 0.1: the dominant log-gap is ≫ ln 2. Landmarks form two groups (3 + 2)
+        // that stay separate below the cut scale 10, so both sides clear the
+        // ≥2-landmark guard and the split is preserved.
+        let deaths = vec![10.0, 0.1, 0.09, 0.08];
+        assert!(old_rule_splits(&deaths));
+        let pts = line_points(&[0.0, 0.1, 0.2, 50.0, 50.1]);
+        let (n, within) = components_and_scale(&bars(&deaths), pts.view());
+        assert_eq!(n, 2, "a real inter-cluster gap with ≥2 per side must still split");
+        assert!((within - 0.1).abs() < 1e-12, "within-scale is the coarsest sub-cut merge");
+    }
+
+    #[test]
+    fn lone_outlier_cut_is_not_split() {
+        // Same dominant log-gap ≫ ln 2, but the cut would carve off a SINGLE
+        // stray landmark (x=50) from a 3-landmark cluster. Below the cut scale 10
+        // the outlier is its own component of size 1, so the guard rejects the
+        // split and the atom is reported connected — a chart artifact, not a
+        // second manifold component.
+        let deaths = vec![10.0, 0.1, 0.09];
+        assert!(old_rule_splits(&deaths));
+        let pts = line_points(&[0.0, 0.1, 0.2, 50.0]);
+        let (n, _) = components_and_scale(&bars(&deaths), pts.view());
+        assert_eq!(n, 1, "a cut isolating one landmark must be rejected");
     }
 }
