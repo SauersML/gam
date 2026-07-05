@@ -35,7 +35,7 @@ use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_maj
 /// `D = max(w·s',0) ⪰ 0` makes `C ⪰ I`. Majorizing a FIXED prior's curvature
 /// only conditions the Newton step / the Laplace normalizer — the gradient
 /// (which sets the stationary point) is untouched.
-fn ibp_psd_majorized_hdiag(
+pub(super) fn ibp_psd_majorized_hdiag(
     channels: &IbpHessianDiagThirdChannels,
     row: usize,
     k_atoms: usize,

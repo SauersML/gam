@@ -2231,6 +2231,18 @@ impl SaeManifoldTerm {
         self.atoms[0].output_dim()
     }
 
+    /// gam#2144 — `true` when a rank-deficient whitening metric (`metric_rank < p`)
+    /// is installed, so the assembly PSD-majorizes the IBP curvature. The
+    /// θ-adjoint / ρ-trace contractions read this to differentiate the SAME
+    /// majorized operator the evidence log-det factors. `false` (bit-identical
+    /// legacy path) for the identity metric (`rank == p`) or no metric.
+    pub(crate) fn ibp_low_rank_whiten(&self) -> bool {
+        let p = self.output_dim();
+        self.row_metric
+            .as_ref()
+            .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < p)
+    }
+
     pub fn beta_dim(&self) -> usize {
         let p = self.output_dim();
         self.atoms.iter().map(|a| a.basis_size() * p).sum()
@@ -6654,7 +6666,7 @@ impl SaeManifoldTerm {
             }
             return Ok(0.5 * trace);
         }
-        let hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
+        let mut hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
         if hdiag.is_empty() {
             return Ok(0.0);
         }
@@ -6701,7 +6713,9 @@ impl SaeManifoldTerm {
         // un-downdated full block. For non-IBP modes `ibp_assignment_third_channels`
         // returns `None`, there is no Woodbury source, and `self_curv` is
         // identically 0 (the deflated block IS the full block).
-        let cross_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
+        // RAW channels: the `w·s·c` diagonal split needs the un-clamped `w·s'`, so
+        // build raw and apply the gam#2144 majorization here.
+        let mut cross_channels = ibp_assignment_third_channels(&self.assignment, rho, false)?;
         let learnable_alpha = matches!(
             self.assignment.mode,
             AssignmentMode::IBPMap {
@@ -6709,6 +6723,31 @@ impl SaeManifoldTerm {
                 ..
             }
         );
+        // gam#2144: under low-rank whitening the assembled `H` carries the
+        // PSD-majorized IBP curvature (`ibp_psd_majorized_hdiag` + clamped Woodbury
+        // `d`). Differentiate the SAME operator: overwrite the per-slot diagonal
+        // with its majorizer and clamp the rank-one coefficient (`cross_row_d`, and
+        // its learnable-α derivative) to `max(·,0)`. `self_curv`, the diagonal
+        // trace, and the cross-row off-diagonal pass all read these, so the whole
+        // ρ-trace stays on the majorized operator. No-op (bit-identical) otherwise.
+        if self.ibp_low_rank_whiten() {
+            if let Some(ch) = cross_channels.as_mut() {
+                for row in 0..self.n_obs() {
+                    for atom in 0..k_atoms {
+                        let slot = row * k_atoms + atom;
+                        hdiag[slot] = super::construction_arrow_schur_assembly::ibp_psd_majorized_hdiag(
+                            ch, row, k_atoms, atom, hdiag[slot],
+                        );
+                    }
+                }
+                for k in 0..k_atoms {
+                    if ch.cross_row_d[k] < 0.0 {
+                        ch.cross_row_d[k] = 0.0;
+                        ch.cross_row_d_logalpha[k] = 0.0;
+                    }
+                }
+            }
+        }
         let self_curv = |row: usize, atom: usize| -> f64 {
             let Some(ch) = cross_channels.as_ref() else {
                 return 0.0;
@@ -7817,7 +7856,14 @@ impl SaeManifoldTerm {
         // `logit_curvature`) contracts the `∂/∂ℓ_w (d_k·J_ik·J_jk)` rank-one
         // derivative — so value, logdet, ρ-trace, and θ-adjoint all differentiate
         // the one operator `H = H₀ + Σ_k d_k u_k u_kᵀ`.
-        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
+        // gam#2144: under a low-rank whitening metric the assembly PSD-majorizes
+        // the IBP curvature, so the θ-adjoint must differentiate the MAJORIZED
+        // channels (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
+        // `local_logit_third`) and the majorized diagonal — else the outer-REML
+        // gradient desyncs from the majorized evidence log-det. Bit-identical
+        // (`false`) on the identity/no-metric path.
+        let majorize_ibp = self.ibp_low_rank_whiten();
+        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, majorize_ibp)?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
         // `block.htt` has off-diagonal logit terms whose θ-derivative the adjoint

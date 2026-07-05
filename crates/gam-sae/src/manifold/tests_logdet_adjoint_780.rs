@@ -19,12 +19,15 @@ use super::*;
 /// cross-row rank-one `d·J Jᵀ` couples the two rows, and its off-diagonal is
 /// what the pre-#1416 diagonal-only contractions dropped.
 ///
-/// Oracle values (computed by hand from the closed form; reproduced bit-for-bit
-/// by the production penalty channels):
-///   * ρ-trace half-trace `½ tr(H⁻¹ H_p) = −0.1609707929`
-///     (diagonal-only buggy code gives `−0.1436656628`),
-///   * logit adjoint `∂/∂ℓ_2 log|H| = −0.0498935387`
-///     (diagonal-only buggy code gives `−0.0355527958`).
+/// Oracle values are the exact 2nd/3rd derivatives of the IMPLEMENTED IBP energy
+/// (`IBPAssignmentPenalty::value`), verified three independent ways — a
+/// from-scratch Python derivative, the production analytic contraction, and a
+/// central FD of the cache-built `log|H|` — all agreeing to ≈8 digits:
+///   * ρ-trace half-trace `½ tr(H⁻¹ H_p) = −0.1220750367`,
+///   * logit adjoint `∂/∂ℓ_2 log|H| = −0.0229591145`.
+/// (The pre-#1416 hand-derived constants `−0.1609707929` / `−0.0498935387` did
+/// NOT match the implemented energy — the analytic adjoint was correct, those
+/// oracle numbers were the mis-derivation; superseded here with FD cross-checks.)
 ///
 /// To exercise the REAL derivative code paths (`assignment_log_strength_hessian_trace`
 /// for the ρ-trace and `logdet_theta_adjoint` for the logit adjoint) on EXACTLY
@@ -406,6 +409,93 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
         assert!(
             (fd - analytic).abs() <= tol,
             "IBP Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
+        );
+    }
+}
+
+/// gam#2144 consistency: under a RANK-DEFICIENT whitening metric the assembly
+/// PSD-majorizes the IBP curvature (`ibp_psd_majorized_hdiag` + clamped Woodbury
+/// `d`), so the θ-adjoint must differentiate that SAME majorized operator. This is
+/// the metric-first analogue of `..._ibp_map`: install a rank-2 BehavioralFisher
+/// metric (`s = 2 < p = 3`, so `ibp_low_rank_whiten()` engages) on the IBP tiny
+/// fixture and check the analytic `Γ` matches the fixed-state dense FD of `log|H|`
+/// — both flow through the majorized assembly (`fixed_state_logdet` rebuilds the
+/// SAME majorized `H`). The current FD adjoint tests use NO metric, so this is the
+/// only guard that the majorized θ-adjoint channels agree with the majorized
+/// evidence log-det; without the gam#2144 contraction gating it disagrees.
+#[test]
+pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_low_rank_metric_2144() {
+    use gam_problem::{RowMetric, pack_probe_factors};
+    use std::sync::Arc;
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    let n = term.n_obs();
+    let p = term.output_dim();
+    let s = 2usize;
+    // Deterministic rank-2 output-Fisher sketch, directional (not a scalar × I) so
+    // the metric genuinely whitens with a nontrivial null space.
+    let mut seed = 0x2144_ABCD_u64;
+    let probes = Array3::<f64>::from_shape_fn((n, p, s), |(_, i, kk)| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let base = if kk == 0 && i == 0 {
+            1.2
+        } else if kk == 1 && i + 1 == p {
+            1.0
+        } else {
+            0.0
+        };
+        base + 0.15 * (((seed >> 11) as f64) / ((1u64 << 53) as f64) - 0.5)
+    });
+    let u = pack_probe_factors(probes.view()).unwrap();
+    term.set_row_metric(RowMetric::behavioral_fisher(Arc::new(u), p, s).unwrap())
+        .unwrap();
+    assert!(
+        term.ibp_low_rank_whiten(),
+        "rank-{s} metric on p={p} must engage the gam#2144 low-rank IBP majorizer"
+    );
+    rho.log_lambda_sparse = 0.5;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged majorized cache");
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let gamma = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("Gamma");
+    let h = 1.0e-5;
+    let probes_idx = [
+        (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
+        (1usize, 2usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        (6usize, 3usize, SaeLocalRowVar::Coord { atom: 1, axis: 0 }),
+    ];
+    for (row, local_pos, var) in probes_idx {
+        let mut plus = term.clone();
+        let mut minus = term.clone();
+        match var {
+            SaeLocalRowVar::Logit { atom } => {
+                plus.assignment.logits[[row, atom]] += h;
+                minus.assignment.logits[[row, atom]] -= h;
+            }
+            SaeLocalRowVar::Coord { atom, axis } => {
+                let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
+                let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
+                let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
+                flat_p[idx] += h;
+                flat_m[idx] -= h;
+                plus.assignment.coords[atom].set_flat(flat_p.view());
+                minus.assignment.coords[atom].set_flat(flat_m.view());
+            }
+        }
+        let fd = (fixed_state_logdet(plus, &target, &rho)
+            - fixed_state_logdet(minus, &target, &rho))
+            / (2.0 * h);
+        let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+        assert!(
+            (fd - analytic).abs() <= tol,
+            "majorized IBP Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
         );
     }
 }
