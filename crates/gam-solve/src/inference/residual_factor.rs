@@ -836,11 +836,17 @@ fn column_variances(r: ArrayView2<'_, f64>) -> Array1<f64> {
 }
 
 /// Scale-deflated second moment `S = (1/n) Σ_n (r_n r_nᵀ) / c_n`.
-fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Array2<f64> {
-    let n = r.nrows();
+/// Per-row-chunk contribution to the scaled second moment — the inner
+/// `p×p` accumulation of one contiguous row block, summed in row order.
+fn scaled_second_moment_chunk(
+    r: ArrayView2<'_, f64>,
+    row_scale: &Array1<f64>,
+    lo: usize,
+    hi: usize,
+) -> Array2<f64> {
     let p = r.ncols();
     let mut s = Array2::<f64>::zeros((p, p));
-    for i in 0..n {
+    for i in lo..hi {
         let w = 1.0 / row_scale[i].max(f64::MIN_POSITIVE);
         for a in 0..p {
             let ra = r[[i, a]];
@@ -849,6 +855,47 @@ fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Arra
             }
         }
     }
+    s
+}
+
+/// `S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n)` — the O(N·p²) scale-deflated second moment
+/// that dominates each alternation sweep of the residual-factor fit.
+///
+/// Parallelized over FIXED contiguous row chunks whose `p×p` partials are summed
+/// in CHUNK ORDER, so the result is bit-reproducible and independent of the thread
+/// count (the estimator's determinism contract holds) — it differs from a single
+/// running row-sum only in the harmless grouping of accumulation round-off, which
+/// the trailing symmetrization already absorbs. Engaged only above a row threshold
+/// (the serial path stays exact on small inputs and avoids rayon overhead) and only
+/// when NOT already inside a rayon worker (the same nesting discipline the
+/// Arrow-Schur solve uses — a nested call runs the serial reduction so an outer
+/// parallel region keeps its cores).
+fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Array2<f64> {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_MIN: usize = 8192;
+    const CHUNK_ROWS: usize = 2048;
+    let n = r.nrows();
+    let p = r.ncols();
+
+    let mut s = if n >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+        let n_chunks = n.div_ceil(CHUNK_ROWS);
+        let partials: Vec<Array2<f64>> = (0..n_chunks)
+            .into_par_iter()
+            .map(|c| {
+                let lo = c * CHUNK_ROWS;
+                let hi = ((c + 1) * CHUNK_ROWS).min(n);
+                scaled_second_moment_chunk(r, row_scale, lo, hi)
+            })
+            .collect();
+        let mut acc = Array2::<f64>::zeros((p, p));
+        for part in &partials {
+            acc += part;
+        }
+        acc
+    } else {
+        scaled_second_moment_chunk(r, row_scale, 0, n)
+    };
+
     s.mapv_inplace(|v| v / n as f64);
     // Symmetrize against accumulation round-off.
     for a in 0..p {
