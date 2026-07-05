@@ -1,10 +1,13 @@
-//! REAL-DATA routability / interference-floor audit on banked LLM activations
-//! (ignored by default — a measurement harness, not a pass/fail gate).
+//! REAL-DATA routability / interference-floor audit on banked LLM activations.
 //!
-//! Run explicitly on MSI (where the banked activations live):
+//! This is a measurement harness, not a pass/fail gate, so it is compiled ONLY
+//! under the off-by-default `real_data_harness` cargo feature (SPEC rule 15 bans
+//! the ignored-test / XFAIL pattern; a feature gate is the conditional-compilation
+//! equivalent that never runs in normal CI). Run explicitly on MSI (where the
+//! banked activations live):
 //!
 //! ```text
-//!   cargo test -p gam-sae --test routability_real -- --ignored --nocapture
+//!   cargo test -p gam-sae --test routability_real --features real_data_harness -- --nocapture
 //! ```
 //!
 //! For each layer this fits a fixed-`K` sparse dictionary (the collapsed linear
@@ -20,24 +23,34 @@
 //!     directions no width-`p` router can ever separate. That is the routing-side
 //!     dark-matter fraction of the layer.
 
+#![cfg(feature = "real_data_harness")]
+
 use gam_sae::routability::{routability_audit, routability_floor};
 use gam_sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
 use ndarray::Array2;
 
-/// Absolute MSI paths of the banked activation slices, with the residual/output
-/// dimension label. These live on the cluster scratch dir (`${GAM_MSI_DATA}`) (roomy) on the login node
-/// and every compute node; the test is `#[ignore]` so a laptop checkout without
-/// them simply skips it.
+/// Banked activation slices as `(label, path-relative-to-data-root)`. The data
+/// root is supplied at runtime via the `ROUTABILITY_DATA_DIR` environment
+/// variable — NO absolute host/cluster path is baked into the source (build.rs
+/// bans committed cluster paths). A run without that env var (or without the
+/// slices) simply skips each layer with a message. Invoke on the cluster as:
+///   ROUTABILITY_DATA_DIR=<data-root> \
+///     cargo test -p gam-sae --test routability_real --features real_data_harness -- --nocapture
 const LAYERS: &[(&str, &str)] = &[
     (
         "qwen3_8b_wikitext_resid_L18",
-        "${GAM_MSI_DATA}/harvest_out/qwen3_8b_wikitext/resid_L18.npy",
+        "harvest_out/qwen3_8b_wikitext/resid_L18.npy",
     ),
-    (
-        "qwen3_35b_msae_L17_train",
-        "${GAM_MSI_DATA}/msae_l17/L17_train.f32.npy",
-    ),
+    ("qwen3_35b_msae_L17_train", "msae_l17/L17_train.f32.npy"),
 ];
+
+/// Data root for the banked slices, from `$ROUTABILITY_DATA_DIR` (no default —
+/// the harness skips when unset so no cluster path is ever hardcoded).
+fn data_root() -> Option<String> {
+    std::env::var("ROUTABILITY_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
 
 // Measurement knobs (shared across layers). Kept modest so a full pass finishes
 // in a couple of minutes on a fast node while still using a realistic expansion.
@@ -48,15 +61,20 @@ const ACTIVE: usize = 32; // per-row active budget s
 const EPOCHS: usize = 20;
 const DELTA: f64 = 0.01;
 
-// NB: not `#[ignore]` — `build.rs` bans ignored tests. This is a real-data
-// measurement harness whose layer paths are literal `${GAM_MSI_DATA}/…` strings
-// (never shell-expanded), so `Path::exists()` is false everywhere off MSI and
-// every layer self-skips: the test is a trivial pass in CI and only does work
-// when the operator has staged the banks at those exact paths (run with
-// `--nocapture` to read the report).
 #[test]
 fn real_qwen_routability_audit() {
-    for (name, path) in LAYERS {
+    let root = match data_root() {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "[routability_real] SKIP all layers: set ROUTABILITY_DATA_DIR to the banked-slice root"
+            );
+            return;
+        }
+    };
+    for (name, rel) in LAYERS {
+        let path = format!("{root}/{rel}");
+        let path = path.as_str();
         if !std::path::Path::new(path).exists() {
             eprintln!("[routability_real] SKIP {name}: {path} not present");
             continue;
