@@ -1017,11 +1017,7 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let (cur_reml, cur_l) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
-        eprintln!(
-            "[DIAG2111-CUR] seed loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
-            cur_l.data_fit, cur_l.assignment_sparsity, cur_l.smoothness, cur_l.ard, cur_reml
-        );
+        let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
@@ -1099,12 +1095,8 @@ pub fn fit_stagewise(
                     registry,
                     config,
                 )?;
-                let (reml, l) =
+                let (reml, _) =
                     frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
-                eprintln!(
-                    "[DIAG2111-A] cand loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
-                    l.data_fit, l.assignment_sparsity, l.smoothness, l.ard, reml
-                );
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, reml, ev))
             })
@@ -1271,15 +1263,6 @@ pub fn fit_stagewise(
                 && ev.is_finite()
                 && (ev - cur_ev) >= config.min_effect_ev
         };
-        eprintln!(
-            "[DIAG2111] round={} cur_reml={:.6} cur_ev={:.6} cand_a={:?} cand_b={:?} min_eff={}",
-            round,
-            cur_reml,
-            cur_ev,
-            cand_a.as_ref().map(|&(_, _, r, e)| (r, e)),
-            cand_b.as_ref().map(|&(_, _, r, e)| (r, e)),
-            config.min_effect_ev,
-        );
         let a_ok = cand_a
             .as_ref()
             .map(|&(_, _, r, e)| passes(r, e))
