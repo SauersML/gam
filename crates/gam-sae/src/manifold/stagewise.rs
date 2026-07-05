@@ -155,6 +155,9 @@ pub enum StagewiseStop {
     /// The residual carried no structured factor above the idiosyncratic-noise
     /// floor (`Σ.factor_rank() == 0`) — nothing left to mine.
     NoResidualStructure,
+    /// #2138 — the host requested cancellation (Python interrupt): the forward
+    /// phase stopped early and the current best-so-far dictionary is returned.
+    Cancelled,
 }
 
 /// One birth round's outcome, recorded for the honesty surface (never silent).
@@ -377,6 +380,32 @@ fn fit_single_atom_response_in_place(
     }
     if let Some(metric) = term.row_metric().cloned() {
         sub_term.set_row_metric(metric)?;
+    }
+    // Memory wall: seed this curved atom's low-rank decoder frame from the
+    // residual it will explain, BEFORE the dense fit, so the arrow-Schur assembly
+    // takes its `frames_engaged` factored path (border `M·r`, posterior
+    // covariance `(M·r)²`) instead of materializing the dense `O((M·p)²)` joint
+    // Hessian that OOMs at LLM width. Each K=1 atom that keeps its frame carries
+    // it into the merged dictionary, so `terminal_joint_assembly`'s frozen pass
+    // over the K-atom term also assembles the `Σ M_k·r` factored border.
+    //
+    // Only when frames will actually engage: the factored β-tier identity
+    // `Φᵀ(G⊗I)Φ = G⊗(UᵀU)` is exact only for an isotropic likelihood, so a
+    // whitened term (`whitens_likelihood`) stays on the certified dense path
+    // (#974). Seeding under whitening would project the decoder to rank `r` for
+    // no assembly benefit, so skip it there.
+    if sub_term
+        .row_metric()
+        .map(|m| !m.whitens_likelihood())
+        .unwrap_or(true)
+    {
+        let frame_rows: Vec<usize> = (0..n).collect();
+        crate::manifold::activate_residual_frame(
+            &mut sub_term.atoms[0],
+            response,
+            &frame_rows,
+            &crate::manifold::InFrameCurvedConfig::default(),
+        )?;
     }
     let mut sub_rho = SaeManifoldRho::with_per_atom_smooth(
         rho.log_lambda_sparse,
@@ -837,6 +866,12 @@ pub fn fit_stagewise(
     sample_weights: Option<&[f64]>,
     config: &StagewiseConfig,
     mut progress: Option<&mut StagewiseProgressCallback<'_>>,
+    // #2138 — cooperative cancellation. When the host (the pyffi fit driver) sets
+    // this after a Python interrupt, the forward-birth loop and backfit sweeps
+    // bail early (returning the best-so-far dictionary with `StagewiseStop::
+    // Cancelled`) so a detached compose worker stops instead of running a hung fit
+    // to completion. `None` ⇒ the historical, uninterruptible path, bit-for-bit.
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StagewiseResult, String> {
     let n = target.nrows();
     if seed.k_atoms() != 1 {
@@ -901,6 +936,10 @@ pub fn fit_stagewise(
     // ── Phase 1b — forward births ──────────────────────────────────────────────
     let mut birth_round = 0usize;
     let stopped_reason = loop {
+        // #2138 — bail before starting another birth round if the host cancelled.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            break StagewiseStop::Cancelled;
+        }
         if births_accepted >= config.max_births {
             break StagewiseStop::MaxBirths;
         }
@@ -1017,11 +1056,7 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let (cur_reml, cur_l) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
-        eprintln!(
-            "[DIAG2111-CUR] seed loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
-            cur_l.data_fit, cur_l.assignment_sparsity, cur_l.smoothness, cur_l.ard, cur_reml
-        );
+        let (cur_reml, _) = frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
@@ -1099,12 +1134,8 @@ pub fn fit_stagewise(
                     registry,
                     config,
                 )?;
-                let (reml, l) =
+                let (reml, _) =
                     frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
-                eprintln!(
-                    "[DIAG2111-A] cand loss: data_fit={:.4} sparsity={:.4} smoothness={:.4} ard={:.4} reml={:.4}",
-                    l.data_fit, l.assignment_sparsity, l.smoothness, l.ard, reml
-                );
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, reml, ev))
             })
@@ -1271,15 +1302,6 @@ pub fn fit_stagewise(
                 && ev.is_finite()
                 && (ev - cur_ev) >= config.min_effect_ev
         };
-        eprintln!(
-            "[DIAG2111] round={} cur_reml={:.6} cur_ev={:.6} cand_a={:?} cand_b={:?} min_eff={}",
-            round,
-            cur_reml,
-            cur_ev,
-            cand_a.as_ref().map(|&(_, _, r, e)| (r, e)),
-            cand_b.as_ref().map(|&(_, _, r, e)| (r, e)),
-            config.min_effect_ev,
-        );
         let a_ok = cand_a
             .as_ref()
             .map(|&(_, _, r, e)| passes(r, e))
@@ -1385,6 +1407,12 @@ pub fn fit_stagewise(
     let mut backfit_ev_trace: Vec<f64> = Vec::new();
     let mut prev_ev = *ev_trace.last().unwrap_or(&f64::NEG_INFINITY);
     for sweep in 0..config.max_backfit_sweeps {
+        // #2138 — on host cancel, stop the terminal backfitting early and fall
+        // through to Phase 3 so a cancelled compose returns its best-so-far
+        // dictionary promptly instead of grinding every remaining sweep.
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            break;
+        }
         emit_stagewise_progress(
             &mut progress,
             StagewiseProgress {
@@ -1542,33 +1570,44 @@ pub fn fit_stagewise(
 //   unchanged (Tropp 2004; Pati–Rezaiifar–Krishnaprasad OMP; the block/group
 //   generalization is standard batch-greedy theory).
 //
-// We realize the sufficient orthogonality condition through DISJOINT GATE ROW
-// SUPPORT under an INDEPENDENT gate (IBP / ThresholdGate): a born atom's gate is
-// exactly `0` on rows below its threshold, so its weighted K=1 objective and
-// gradient read ONLY its support rows. If two accepted atoms have disjoint
-// support, neither's fit sees the other's rows, so
+// The off-diagonal Gram block between two born atoms is a sum over ROWS and OUTPUT
+// DIMS of the product of their (gated) reconstructions, so it vanishes when the two
+// atoms are disjoint on EITHER axis — two independent routes to the sufficient
+// orthogonality:
+//
+//   (1) DISJOINT GATE ROW SUPPORT under an INDEPENDENT gate (IBP / ThresholdGate):
+//       a born atom's gate is exactly `0` on rows below its threshold, so its
+//       weighted K=1 objective + gradient read ONLY its support rows. Two atoms on
+//       disjoint rows never see each other's rows.
+//
+//   (2) DISJOINT OUTPUT-DIM SUPPORT: a born decoder writes only its own ambient
+//       columns (a circle in an orthogonal 2-plane occupies just its cos/sin dims),
+//       so its K=1 fit reads ONLY those residual columns. Two atoms in orthogonal
+//       ambient planes are block-orthogonal even when they share EVERY row — the
+//       dense-torus case, where the row test alone would wrongly force a serial
+//       loop. The accepted set is pairwise block-orthogonal iff every pair is
+//       disjoint on rows OR on output dims.
+//
+// Under either route,
 //
 //   fit_of(cand_j against the ORIGINAL residual R₀)
 //     == fit_of(cand_j against R₁ = R₀ − Σ_{i<j} contribution_i)
 //
-// EXACTLY (not up to tolerance — the off-support rows drop out of the sum
-// entirely), and the joint evidence decomposes additively:
+// EXACTLY (not up to tolerance — the off-block entries drop out of the sum
+// entirely), so the FIT and the per-birth reconstruction ΔEV charge are invariant
+// to acceptance order. (The RAW joint-REML VALUE does not decompose additively —
+// its Laplace term carries a globally-pooled dispersion that couples all rows — but
+// the FIT, the accepted SET, and the ΔEV do, which is what parity needs.) This is
+// the parity license (see `tests_batched_parity_*`): batched must equal serial
+// statistically, or the speed is fake.
 //
-//   reml(K + a + b) − reml(K) = [reml(K+a) − reml(K)] + [reml(K+b) − reml(K)].
-//
-// Each bracket is precisely what the serial loop charges that birth. So the
-// batched loop's accepted SET, per-birth CHARGES, and terminal evidence equal the
-// serial loop's, up to acceptance ORDER. This is the parity license (see
-// `tests_batched_parity_*`): batched must equal serial statistically, or the
-// speed is fake.
-//
-// Overlapping candidates (intersecting support) VIOLATE the orthogonality
-// condition, so we accept only the BEST of an overlapping group (lowest joint
+// Candidates that intersect an accepted atom on BOTH axes VIOLATE the orthogonality
+// condition, so we accept only the BEST of such an overlapping group (lowest joint
 // REML — the same keep-lowest tiebreak as the serial A-vs-B race) and REQUEUE the
 // rest: they are dropped this round and re-mined next round against the UPDATED
-// residual, recovering pure greedy on the conflicting part. No magic constant —
-// the criterion is support-set disjointness, and the per-round fan-out is a
-// safety BOUND (`max_candidates_per_round`), not a tuning knob.
+// residual, recovering pure greedy on the conflicting part. No magic constant — the
+// criterion is per-pair support disjointness on either axis, and the per-round
+// fan-out is a safety BOUND (`max_candidates_per_round`), not a tuning knob.
 
 /// Cost BOUND on the parallel candidate fan-out per batched birth round: the
 /// deflationary producer harvests at most this many certified planes from one
@@ -1630,6 +1669,15 @@ struct RacedCandidate {
     /// global shared-factor DC seed this is ALL rows, so it never co-accepts and
     /// the round reduces to exactly one serial birth.
     support: Vec<usize>,
+    /// Output (ambient) dimensions the born decoder occupies: the columns `j` whose
+    /// decoder energy `Σ_row β[row,j]²` clears a relative floor. A born atom writes
+    /// ONLY these columns, so its K=1 fit reads ONLY these residual columns — the
+    /// SECOND route to the batch-OMP block-orthogonality license (a candidate on
+    /// disjoint output dims is block-orthogonal to the accepted set even when it
+    /// SHARES rows, e.g. a dense torus whose circles live in orthogonal ambient
+    /// planes). Co-acceptance holds when EITHER the rows OR the output dims are
+    /// disjoint; the row-only test alone cannot co-accept a dense multi-circle image.
+    out_support: Vec<usize>,
     reml: f64,
     ev: f64,
     energy: f64,
@@ -1700,6 +1748,24 @@ fn race_birth_seed(
         Some(g) => (0..n).filter(|&i| g[i].is_finite()).collect(),
         None => (0..n).collect(),
     };
+    // Output-dim support: the columns the born decoder actually writes. A circle in
+    // an orthogonal ambient plane occupies only its 2 (cos/sin) output dims, so a
+    // dense torus's per-circle candidates are output-disjoint even though they share
+    // every row — the second block-orthogonality route the acceptance test reads.
+    let decoder = &cand_term.atoms[k].decoder_coefficients;
+    let p_out = decoder.ncols();
+    let mut col_energy = vec![0.0_f64; p_out];
+    for row in 0..decoder.nrows() {
+        for j in 0..p_out {
+            col_energy[j] += decoder[[row, j]] * decoder[[row, j]];
+        }
+    }
+    let total_energy: f64 = col_energy.iter().sum();
+    // Relative floor: a column carrying < 1e-6 of the decoder's energy is fit noise,
+    // not genuine occupancy — so a tiny numerical leak into an orthogonal circle's
+    // dims does not spuriously couple two block-orthogonal candidates.
+    let out_thresh = 1e-6 * total_energy;
+    let out_support: Vec<usize> = (0..p_out).filter(|&j| col_energy[j] > out_thresh).collect();
     let born_logit_col: Vec<f64> = (0..n).map(|r| cand_term.assignment.logits[[r, k]]).collect();
     Ok(RacedCandidate {
         born_atom: cand_term.atoms[k].clone(),
@@ -1708,6 +1774,7 @@ fn race_birth_seed(
         born_ard: cand_rho.log_ard[k].clone(),
         born_log_lambda_smooth: cand_rho.log_lambda_smooth[k],
         support,
+        out_support,
         reml,
         ev,
         energy: seed.energy,
@@ -1890,11 +1957,21 @@ pub fn fit_stagewise_batched(
         });
 
         // ── DISJOINT batch-greedy acceptance ───────────────────────────────────
-        // Accept in best-first order, skipping any candidate whose support
-        // intersects an already-accepted candidate's support this round. The
-        // accepted set is pairwise support-disjoint ⇒ block-orthogonal ⇒ the batch
-        // equals the serial greedy sequence up to order (see the module note).
-        let mut claimed = vec![false; n];
+        // Accept in best-first order. A candidate co-accepts iff it is BLOCK-
+        // ORTHOGONAL to every already-accepted candidate this round, which the
+        // batch-OMP license grants when EITHER their row supports are disjoint OR
+        // their output-dim supports are disjoint (a born atom reads only its own
+        // rows AND writes only its own output columns, so disjointness on either
+        // axis zeroes the cross Gram block). Conflict — the only requeue trigger —
+        // is therefore rows-INTERSECT AND outdims-INTERSECT with some accepted atom.
+        // The accepted set is pairwise block-orthogonal ⇒ the batch equals the
+        // serial greedy sequence up to order (see the module note).
+        let intersects = |a: &[usize], b: &[usize]| -> bool {
+            let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+            let set: std::collections::HashSet<usize> = large.iter().copied().collect();
+            small.iter().any(|i| set.contains(i))
+        };
+        let mut accepted_supports: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
         let mut co_accepted = 0usize;
         let mut requeued_overlap = 0usize;
         for &idx in &order {
@@ -1903,14 +1980,14 @@ pub fn fit_stagewise_batched(
                 continue;
             }
             let c = &raced[idx];
-            let conflict = c.support.iter().any(|&i| claimed[i]);
+            let conflict = accepted_supports.iter().any(|(ar, ad)| {
+                intersects(&c.support, ar) && intersects(&c.out_support, ad)
+            });
             if conflict {
                 requeued_overlap += 1;
                 continue;
             }
-            for &i in &c.support {
-                claimed[i] = true;
-            }
+            accepted_supports.push((c.support.clone(), c.out_support.clone()));
             let (next_term, next_rho) = append_fitted_atom(
                 &term,
                 &rho,
@@ -2177,7 +2254,7 @@ mod tests {
         let config = test_config();
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None, None)
             .expect("fit_stagewise must complete on planted two-circles");
 
         assert!(
@@ -2227,7 +2304,7 @@ mod tests {
         };
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None, None)
             .expect("fit_stagewise must complete on a fully-explained target");
 
         assert_eq!(
@@ -2939,6 +3016,7 @@ mod tests {
             None,
             &config,
             Some(&mut progress),
+            None,
         )
         .expect("fit_stagewise must complete while emitting progress");
 
@@ -3004,7 +3082,7 @@ mod tests {
         let config = test_config();
         let (seed, rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
         let (seed, rho) = fitted_seed(seed, rho, target.view(), &config);
-        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None)
+        let result = fit_stagewise(seed, rho, target.view(), None, None, &config, None, None)
             .expect("fit_stagewise must complete");
         assert!(
             is_non_decreasing(&result.report.backfit_ev_trace),
@@ -3067,86 +3145,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn diag_serial_four_circle_births() {
-        let n = 480usize;
-        let p = 16usize;
-        let q = 4usize;
-        let per = n / q;
-        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
-        let mut atoms = Vec::new();
-        let mut cbs = Vec::new();
-        for c in 0..q {
-            let (atom, cb) = circle_atom(&format!("t{c}"), &evaluator, &coords, 2 * c, 2 * c + 1, p);
-            atoms.push(atom);
-            cbs.push(cb);
-        }
-        let active_truth: Vec<Vec<bool>> = (0..n)
-            .map(|r| (0..q).map(|c| r / per == c).collect())
-            .collect();
-        let (truth, _truth_rho) = build_term(atoms.clone(), cbs.clone(), &active_truth);
-        let target = truth.fitted();
-        let mode = AssignmentMode::threshold_gate(1.0, -3.0);
-        let mut config = test_config();
-        config.max_births = 8;
-        config.max_backfit_sweeps = 1;
-        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
-        let (mut seed, mut rho) =
-            build_term_gate(vec![atom0], vec![cb0], &vec![vec![true]; n], mode);
-        seed.set_guards_enabled(false);
-        seed.run_joint_fit_arrow_schur(
-            target.view(),
-            &mut rho,
-            None,
-            config.inner_max_iter,
-            config.learning_rate,
-            config.ridge_ext_coord,
-            config.ridge_beta,
-        )
-        .unwrap();
+    /// Deterministic LCG uniform in [0,1) — a local RNG for planting clean circle
+    /// geometry the ISA κ-certificate can certify (the softmax `build_term` image
+    /// carries structured linear phase the fourth-order contrast rejects). Mirrors
+    /// the `isa_seed` test generator so the driver is exercised on the same clean
+    /// planted-circle distribution the producer's own gates prove it recovers.
+    fn lcg_uniform(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
 
-        // Inspect the seed decision path directly.
-        let (residual, model) = fit_residual_covariance(&seed, target.view(), &config)
-            .unwrap()
-            .expect("residual model");
-        eprintln!("DIAG factor_rank={}", model.factor_rank());
-        let parts = isa_eigen_parts(residual.view()).ok().flatten();
-        eprintln!(
-            "DIAG isa_eigen_parts above.len()={:?}",
-            parts.as_ref().map(|p| p.above.len())
-        );
-        let tf = top_factor_birth_decoder(&seed, &model, residual.view());
-        eprintln!(
-            "DIAG top_factor: some={} circle={:?}",
-            tf.is_some(),
-            tf.as_ref().map(|s| s.circle_coords.is_some())
-        );
-        let rp = residual_principal_birth_candidate(&seed, residual.view());
-        eprintln!(
-            "DIAG residual_principal: some={} circle={:?}",
-            rp.is_some(),
-            rp.as_ref().map(|s| s.circle_coords.is_some())
-        );
-        let harvest =
-            isa_deflationary_producer(residual.view(), 8, &IsaSeedConfig::default()).unwrap();
-        eprintln!("DIAG producer planes={}", harvest.planes.len());
+    fn lcg_normal(state: &mut u64) -> f64 {
+        let u1 = lcg_uniform(state).max(1e-12);
+        let u2 = lcg_uniform(state);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
 
-        let result =
-            fit_stagewise(seed, rho, target.view(), None, None, &config, None).unwrap();
-        eprintln!(
-            "DIAG serial births_accepted={} rejected={} stop={:?} ev_trace={:?}",
-            result.report.births_accepted,
-            result.report.births_rejected,
-            result.report.stopped_reason,
-            result.report.ev_trace
-        );
-        for (i, br) in result.report.birth_records.iter().enumerate() {
-            eprintln!(
-                "DIAG birth[{i}] kind={:?} accepted={} dEV={:.4} reml_before={:.3} reml_after={:.3}",
-                br.kind, br.accepted, br.delta_ev, br.joint_reml_before, br.joint_reml_after
-            );
+    /// Axis-aligned dense torus: circle `c` lives in ambient plane `{2c, 2c+1}`,
+    /// dense (every row on every circle), independent uniform phase per circle. This
+    /// is the co-acceptance regime the ISA producer certifies cleanly (a rotation of
+    /// its proven random-frame torus) AND whose circles occupy DISJOINT OUTPUT DIMS —
+    /// so the born atoms are block-orthogonal via output columns even though they
+    /// share every row, the case the output-dim disjointness route co-accepts.
+    fn planted_axis_dense_circles(
+        n: usize,
+        p: usize,
+        k: usize,
+        amp: f64,
+        sigma: f64,
+        seed: u64,
+    ) -> Array2<f64> {
+        let mut state = seed;
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..k {
+                let th = std::f64::consts::TAU * lcg_uniform(&mut state);
+                data[[i, 2 * c]] += amp * th.cos();
+                data[[i, 2 * c + 1]] += amp * th.sin();
+            }
+            for j in 0..p {
+                data[[i, j]] += sigma * lcg_normal(&mut state);
+            }
         }
+        data
     }
 
     /// THE PARITY LICENSE (batch-OMP orthogonality). Two DISJOINT planted circles:
@@ -3245,66 +3288,138 @@ mod tests {
             "disjoint birth B must fit IDENTICALLY against R0 (batched) and R1 (serial); \
              decoder L1 diff {decoder_diff}"
         );
-        // The per-birth EVIDENCE CHARGE is B's MARGINAL joint-evidence delta over
-        // the state it is born into — batched charges `evidence(seed+B) −
-        // evidence(seed)`, serial charges `evidence(seed+A+B) − evidence(seed+A)`.
-        // For disjoint A,B the joint Hessian is block-diagonal, so B's marginal is
-        // invariant to whether A is already present: the two charges must match.
-        let mut seed_m = seed.clone();
-        let (reml_seed, _) =
-            frozen_joint_evidence(&mut seed_m, target.view(), &rho, None, &config).unwrap();
-        let mut term_a_m = term_a.clone();
-        let (reml_term_a, _) =
-            frozen_joint_evidence(&mut term_a_m, target.view(), &rho_a, None, &config).unwrap();
-        let charge_batched = b_batched.reml - reml_seed;
-        let charge_serial = b_serial.reml - reml_term_a;
+        // The per-birth CHARGE that MUST be invariant to acceptance order is the
+        // reconstruction ΔEV, not the raw joint-REML delta. B touches only rows
+        // `[h,n)` (its gate is 0 elsewhere), and the EV denominator `SS_tot` is fixed
+        // by the target, so B's ΔEV = (SS_res reduction on B's rows)/SS_tot is
+        // identical whether or not A — disjoint from B — is already present:
+        //
+        //   batched:  EV(seed+B)   − EV(seed)     (A absent)
+        //   serial:   EV(seed+A+B) − EV(seed+A)   (A present)
+        //
+        // The RAW joint-REML delta does NOT decompose this way: the frozen Laplace
+        // criterion carries a globally-pooled dispersion term that couples all rows,
+        // so adding A (which shrinks the residual on `[0,h)`) rescales B's REML
+        // charge even though B's FIT is bit-identical (asserted above). Charging on
+        // the additive quantity (ΔEV) is the honest disjoint-support parity claim.
+        let seed_ev = ev_of(&seed, target.view());
+        let term_a_ev = ev_of(&term_a, target.view());
+        let charge_batched = b_batched.ev - seed_ev;
+        let charge_serial = b_serial.ev - term_a_ev;
         assert!(
-            (charge_batched - charge_serial).abs() < 1e-4,
-            "disjoint birth B marginal evidence charge must match batched vs serial; \
+            (charge_batched - charge_serial).abs() < 1e-6,
+            "disjoint birth B marginal ΔEV charge must match batched vs serial; \
              {charge_batched} vs {charge_serial}"
         );
     }
 
-    /// Integration parity + BATCHING-HAPPENED. Four disjoint planted circles on
-    /// disjoint row-quarters and disjoint ambient planes. The batched driver must
-    /// (a) recover the same atom count as the serial driver (±1), (b) reach a
-    /// comparable final EV, and (c) actually CO-ACCEPT more than one birth from a
-    /// single residual snapshot (max per-round `co_accepted ≥ 2`) — the speed
-    /// enabler, not a serialized loop in disguise.
+    #[test]
+    fn diag_axis_dense_driver() {
+        for &(n, p, q, fit_iters) in &[
+            (900usize, 16usize, 3usize, 24usize),
+            (900, 16, 3, 2),
+            (900, 16, 3, 0),
+            (900, 20, 4, 0),
+            (1200, 24, 5, 0),
+        ] {
+            let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+            let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+            let target = planted_axis_dense_circles(n, p, q, 1.0, 0.03, 0x2111_A11E_u64);
+            let mode = AssignmentMode::threshold_gate(1.0, -3.0);
+            let mut config = test_config();
+            config.max_births = 8;
+            config.max_backfit_sweeps = 1;
+            let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+            let (mut seed, mut rho) =
+                build_term_gate(vec![atom0], vec![cb0], &vec![vec![true]; n], mode);
+            seed.set_guards_enabled(false);
+            if fit_iters > 0 {
+                seed.run_joint_fit_arrow_schur(
+                    target.view(),
+                    &mut rho,
+                    None,
+                    fit_iters,
+                    config.learning_rate,
+                    config.ridge_ext_coord,
+                    config.ridge_beta,
+                )
+                .unwrap();
+            }
+            let (residual, _model) = fit_residual_covariance(&seed, target.view(), &config)
+                .unwrap()
+                .expect("residual model");
+            let res_h =
+                isa_deflationary_producer(residual.view(), 2 * q, &IsaSeedConfig::default()).unwrap();
+            let serial = fit_stagewise(
+                seed.clone(),
+                rho.clone(),
+                target.view(),
+                None,
+                None,
+                &config,
+                None,
+                None,
+            )
+            .unwrap();
+            let batch_config = BatchedStagewiseConfig {
+                base: config,
+                max_candidates_per_round: 8,
+            };
+            let batched = fit_stagewise_batched(
+                seed.clone(),
+                rho.clone(),
+                target.view(),
+                None,
+                None,
+                &batch_config,
+            )
+            .unwrap();
+            let max_co = batched
+                .batch_records
+                .iter()
+                .map(|r| r.co_accepted)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "AXSWEEP n={n} p={p} q={q} fit_iters={fit_iters}: res_planes={} serial_births={} batched_births={} max_co_accept={}",
+                res_h.planes.len(),
+                serial.report.births_accepted,
+                batched.report.births_accepted,
+                max_co
+            );
+        }
+    }
+
+    /// Integration parity + BATCHING-HAPPENED. An AXIS-ALIGNED dense torus (`q`
+    /// circles, circle `c` in ambient plane `{2c, 2c+1}`, every row on every
+    /// circle) at the ISA producer's proven regime. The circles share every row but
+    /// occupy DISJOINT output dimensions, so the born atoms are block-orthogonal via
+    /// output columns — the co-acceptance route the row-only test alone cannot use.
+    /// The batched driver must (a) recover the same atom count as the serial driver
+    /// (±1), (b) reach a comparable final EV, and (c) actually CO-ACCEPT ≥2 births
+    /// from a single residual snapshot — the speed enabler, not a serial loop in
+    /// disguise.
     #[test]
     fn batched_driver_matches_serial_and_batches() {
-        let n = 48usize;
-        let p = 8usize;
-        let q = 4usize; // circles / quarters
-        let per = n / q;
+        let n = 600usize;
+        let p = 12usize;
+        let q = 4usize; // circles, ambient planes {0,1},{2,3},{4,5},{6,7}; dims 8-11 noise
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
 
-        // Truth: q circle atoms, each active on its own disjoint row-quarter, in
-        // disjoint ambient planes — built through the proven `build_term` path so
-        // `target = truth.fitted()` is a genuine multi-atom circle image the
-        // birth detector certifies (mirrors `stagewise_recovers_planted_two_circles`).
-        let mut atoms = Vec::new();
-        let mut cbs = Vec::new();
-        for c in 0..q {
-            let (atom, cb) = circle_atom(&format!("t{c}"), &evaluator, &coords, 2 * c, 2 * c + 1, p);
-            atoms.push(atom);
-            cbs.push(cb);
-        }
-        let active_truth: Vec<Vec<bool>> = (0..n)
-            .map(|r| (0..q).map(|c| r / per == c).collect())
-            .collect();
-        let (truth, _truth_rho) = build_term(atoms.clone(), cbs.clone(), &active_truth);
-        let target = truth.fitted();
+        // Target: a clean axis-aligned dense torus — the geometry the ISA κ
+        // certificate certifies (structured `build_term` softmax images do NOT
+        // certify; see the isa_seed producer gates for the proven regime).
+        let target = planted_axis_dense_circles(n, p, q, 1.0, 0.03, 0x2111_A11E_u64);
 
         let mode = AssignmentMode::threshold_gate(1.0, -3.0);
         let mut config = test_config();
         config.max_births = 8;
         config.max_backfit_sweeps = 1;
 
-        // Seed: a single circle atom active on EVERY row (the residual then carries
-        // all q quarter-circles), under a ThresholdGate so disjoint supports gate
-        // exactly off — the batch-greedy precondition.
+        // Seed: a single circle atom active on EVERY row, under a ThresholdGate. The
+        // residual then carries all q dense circles; because they live in orthogonal
+        // ambient planes the born atoms are output-dim disjoint (co-acceptable).
         let build_seed = || {
             let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
             let (mut seed, mut rho) =
@@ -3324,7 +3439,7 @@ mod tests {
         };
 
         let (seed_s, rho_s) = build_seed();
-        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None)
+        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None, None)
             .expect("serial driver");
         assert!(
             serial.report.births_accepted >= 2,

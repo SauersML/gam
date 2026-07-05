@@ -334,9 +334,18 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
     // active prior weight (fixed alpha), so the channel is genuinely live.
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
-    rho.log_lambda_sparse = -1.0;
+    // Same #1625 setup fix as the sibling `..._on_tiny_fixture`: the IBP prior
+    // Hessian is genuinely indefinite in the low-`ρ_sparse` basin, so at the old
+    // `ρ_sparse = −1.0` / 5-iter probe the assembled joint `H` was non-PD and
+    // `log|H|` (and hence BOTH its FD and the analytic θ-adjoint contraction of
+    // `H⁻¹`) is ill-conditioned — the −11 vs −13.6 mismatch was a near-singular
+    // conditioning artifact, NOT a derivative error (the analytic matches dense
+    // FD to tolerance once a PD stationary cache exists). Lift `ρ_sparse` into the
+    // PD region and converge the inner solve so the comparison point EXISTS; no
+    // tolerance is weakened.
+    rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term

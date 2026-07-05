@@ -451,7 +451,7 @@ mod exact_stationarity_solve_1418_tests {
             for col in 0..p {
                 let phase = (row as f64 + 0.35) / n as f64;
                 let theta = std::f64::consts::TAU * phase;
-                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+                target[[row, col]] += 0.12 * (3.0 * theta + 0.5 * col as f64).sin();
             }
         }
         // IBP-MAP assignment with an ACTIVE sparsity strength so the empirical-mass

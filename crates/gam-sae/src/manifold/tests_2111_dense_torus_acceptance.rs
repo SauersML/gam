@@ -152,15 +152,35 @@ fn seed_term(
     let atom = circle_atom("seed_c0", &evaluator, coords0, 0, 1, p);
     let n = coords0.nrows();
     let logits = Array2::<f64>::from_elem((n, 1), 6.0);
+    // IBP (independent per-atom Bernoulli) assignment — NOT softmax. The dense
+    // torus has every row co-active on EVERY circle; softmax forces per-row
+    // competition (probabilities sum to 1) and its entropy sparsity prior
+    // maximally penalises exactly the dense co-activation the fixture requires,
+    // so no born circle can clear the frozen-ρ evidence gate. This matches the
+    // `probe_2101_birth_locus_disjoint_6circle_ibp` structure this test
+    // reproduces (see the module docstring) and every sibling circle-recovery
+    // fixture (#2027/#2089/#2101), all of which seed `ibp_map(0.7, 1.0, false)`.
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords0.clone()],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::softmax(1.0),
+        AssignmentMode::ibp_map(0.7, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     term.set_guards_enabled(false);
+    // Charge births on the occupancy-aware BIC rank scale (½·d_eff·ln N_eff),
+    // not the raw per-row coordinate-block Laplace log-det ½log|H_tt|. At n=700
+    // the raw coordinate log-det grows ≈ O(n) per born atom with NO compensating
+    // occam offset (λ_smooth = 1 ⇒ occam = 0), so it dwarfs the deviance gain and
+    // the frozen-ρ birth gate rejects every genuinely-good circle (measured: a
+    // clean rank-2 circle that lifts EV 0.27→0.43 raised REML by +391 purely
+    // through +598 of uncompensated ½log|H_tt|). The rank charge is the honest,
+    // rotation-invariant Laplace complexity for a realised-rank decoder and is
+    // exactly the decoder-scale-mispricing remedy this path documents. The flag
+    // propagates to every fit_stagewise clone (see term-clone), so setting it on
+    // the seed engages it for the whole forward-birth sweep.
+    term.set_rank_charge_evidence(true);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
     (term, rho)
 }
@@ -236,7 +256,7 @@ fn dense_torus_integrated_birth_recovery_2111() {
     )
     .expect("K=1 seed fit must complete");
 
-    let result = fit_stagewise(seed, rho, data.view(), None, None, &config, None)
+    let result = fit_stagewise(seed, rho, data.view(), None, None, &config, None, None)
         .expect("fit_stagewise must complete on the dense torus");
 
     let (n_distinct, n_clean, n_real, rows) = score_atoms(&result.term, &true_planes);

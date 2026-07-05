@@ -196,7 +196,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
             ));
             Ok(())
         };
-        let res = fit_stagewise(seed_term, rho, x.view(), None, None, &config, Some(&mut cb))
+        let res = fit_stagewise(seed_term, rho, x.view(), None, None, &config, Some(&mut cb), None)
             .expect("stagewise disjoint-6-circle ibp fit");
         let k = res.term.k_atoms();
         let births = res.report.births_accepted;

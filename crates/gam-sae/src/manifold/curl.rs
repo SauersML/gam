@@ -24,8 +24,31 @@
 //! `flatten` is the inverse demotion, so the move pair is falsifiable *inside*
 //! the dictionary's life, not just at birth: a Gaussian-fill radius law demotes
 //! a circle to a rank-2 flat plane, a diameter collapse demotes it to rank-1.
+//!
+//! # The proposer pipeline (Phase 4)
+//!
+//! The geodict verdict math is only the *judge's pre-screen*. Turning it into a
+//! move that fires on real dictionaries needs three stages the delivered
+//! detector did not contain (INTEGRATION_PLAN Phase 4, risks #3/#5):
+//!
+//!   1. [`coalesce_antipodal`] — a nonnegative-gate dictionary shatters a
+//!      centered circle into up to FOUR rectified half-atoms (`±u, ±v`); curl
+//!      candidates must form over the coalesced signed directions or the move is
+//!      a no-op on every such dictionary (launch blocker).
+//!   2. [`cooccurrence_pairs`] — candidate planes come from co-firing counts on
+//!      a ROW SUBSAMPLE over the coalesced directions, never an `O(K²)`
+//!      enumeration.
+//!   3. [`CurlCooldownLedger`] — an atom-set-keyed cooldown so
+//!      `curl → flatten → curl` cannot oscillate across rounds.
+//!
+//! The term-level driver that assembles per-atom directions/gates, projects the
+//! plane, ranks by `net_evidence_nats`, and submits seeds to the birth/race
+//! plumbing lives in [`crate::structure_harvest`]; these stay pure so each is
+//! unit-testable in isolation.
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
+#[cfg(test)]
+use std::f64::consts::PI;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -389,6 +412,241 @@ pub fn orthonormal_pair_coords(
     Ok((alpha, beta, e1, e2))
 }
 
+// ---------------------------------------------------------------------------
+// Proposer pipeline: antipodal coalescing → co-occurrence candidate gen →
+// hysteresis cooldown. These are the stages the delivered geodict detector did
+// NOT contain (INTEGRATION_PLAN Phase 4 items 1–2 and risk #3/#5); the verdict /
+// seed / orthonormal-coords math above is the geodict core they feed.
+//
+// They are kept pure (ndarray only) so the term-level driver in
+// `structure_harvest.rs` can assemble the per-atom directions/gates and hand
+// them here, and so each stage is unit-testable in isolation.
+// ---------------------------------------------------------------------------
+
+/// A signed ambient direction recovered by antipodal coalescing: either a single
+/// signed linear atom, or the merge of two rectified half-atoms (`±d`) a
+/// nonnegative-gate dictionary produced for one signed direction.
+#[derive(Debug, Clone)]
+pub struct SignedDirection {
+    /// Unit ambient direction of the coalesced signed axis (length `p`).
+    pub dir: Array1<f64>,
+    /// The atom indices coalesced into this signed direction (one or two).
+    pub members: Vec<usize>,
+    /// Per-row activity mask (length `n`): the UNION of the members' gates — a
+    /// row is active on the signed direction when either rectified half fired.
+    pub active: Vec<bool>,
+}
+
+/// Cosine of two vectors; `0` if either is (near-)zero.
+fn cosine(a: ArrayView1<f64>, b: ArrayView1<f64>) -> f64 {
+    let na = a.dot(&a).sqrt();
+    let nb = b.dot(&b).sqrt();
+    if na <= 0.0 || nb <= 0.0 {
+        return 0.0;
+    }
+    a.dot(&b) / (na * nb)
+}
+
+/// Overlap (Jaccard) of two boolean row masks; `0` when both are empty.
+fn mask_overlap(a: &[bool], b: &[bool]) -> f64 {
+    let mut inter = 0usize;
+    let mut union = 0usize;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if *x || *y {
+            union += 1;
+        }
+        if *x && *y {
+            inter += 1;
+        }
+    }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// Coalesce rectified antipodal half-atoms into signed directions
+/// (INTEGRATION_PLAN Phase 4.1; launch blocker risk #3).
+///
+/// A nonnegative-gate dictionary parses a centered signed direction `d` as two
+/// rectified half-atoms `d⁺, d⁻ = −d` whose decoder cosine is `≈ −1` and whose
+/// gates are near-disjoint (a row fires one half or the other, rarely both). A
+/// centered circle in a 2-plane shatters into up to FOUR such halves (`±u, ±v`).
+/// Curl candidates must be formed over the COALESCED signed directions, or the
+/// move is a no-op on every nonnegative-gate dictionary.
+///
+/// `dirs[i]` is atom `atom_ids[i]`'s ambient direction (need not be unit),
+/// `active[i]` its per-row gate mask. A pair `(i, j)` coalesces when
+/// `cos(dir_i, dir_j) ≤ cos_threshold` (opposite) AND
+/// `overlap(active_i, active_j) ≤ max_overlap` (disjoint). Each atom coalesces
+/// with at most one partner (greedy, most-antipodal first); an unpaired atom
+/// rides as its own already-signed direction so signed dictionaries (no
+/// rectification) still yield candidates.
+pub fn coalesce_antipodal(
+    dirs: &[ArrayView1<f64>],
+    active: &[Vec<bool>],
+    atom_ids: &[usize],
+    cos_threshold: f64,
+    max_overlap: f64,
+) -> Vec<SignedDirection> {
+    let k = dirs.len();
+    assert_eq!(active.len(), k, "coalesce: dirs/active length mismatch");
+    assert_eq!(atom_ids.len(), k, "coalesce: dirs/atom_ids length mismatch");
+
+    // Enumerate antipodal + disjoint candidate merges, most-antipodal first.
+    let mut merges: Vec<(f64, usize, usize)> = Vec::new();
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let c = cosine(dirs[i], dirs[j]);
+            if c <= cos_threshold && mask_overlap(&active[i], &active[j]) <= max_overlap {
+                merges.push((c, i, j));
+            }
+        }
+    }
+    // Most antipodal (smallest cosine) binds first; deterministic tiebreak.
+    merges.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    let mut used = vec![false; k];
+    let mut out: Vec<SignedDirection> = Vec::new();
+    for (_c, i, j) in merges {
+        if used[i] || used[j] {
+            continue;
+        }
+        used[i] = true;
+        used[j] = true;
+        // Orient both halves to a common sign and average: e ∝ d̂_i − d̂_j (since
+        // d_j ≈ −d_i, this is the mean signed axis, robust to unequal norms).
+        let ni = dirs[i].dot(&dirs[i]).sqrt().max(1e-300);
+        let nj = dirs[j].dot(&dirs[j]).sqrt().max(1e-300);
+        let mut e: Array1<f64> = dirs[i].mapv(|x| x / ni);
+        for (idx, val) in dirs[j].iter().enumerate() {
+            e[idx] -= val / nj;
+        }
+        let en = e.dot(&e).sqrt();
+        if en <= 0.0 {
+            // Degenerate (exactly opposite unit vectors that cancelled): fall
+            // back to member i's own direction.
+            e = dirs[i].mapv(|x| x / ni);
+        } else {
+            e.mapv_inplace(|x| x / en);
+        }
+        let union: Vec<bool> = active[i]
+            .iter()
+            .zip(active[j].iter())
+            .map(|(a, b)| *a || *b)
+            .collect();
+        out.push(SignedDirection {
+            dir: e,
+            members: vec![atom_ids[i], atom_ids[j]],
+            active: union,
+        });
+    }
+    // Unpaired atoms ride as already-signed directions.
+    for i in 0..k {
+        if used[i] {
+            continue;
+        }
+        let ni = dirs[i].dot(&dirs[i]).sqrt().max(1e-300);
+        out.push(SignedDirection {
+            dir: dirs[i].mapv(|x| x / ni),
+            members: vec![atom_ids[i]],
+            active: active[i].clone(),
+        });
+    }
+    out
+}
+
+/// Co-occurring signed-direction pairs, counted over a ROW SUBSAMPLE
+/// (INTEGRATION_PLAN Phase 4.2). A curl candidate plane is a pair of signed
+/// directions that co-fire (both active) on enough rows to estimate the joint
+/// amplitude law — never an `O(K²)` enumeration of the raw dictionary. Returns
+/// `(i, j, count)` with `count ≥ min_cooccur`, sorted by count descending.
+pub fn cooccurrence_pairs(
+    active: &[Vec<bool>],
+    rows: &[usize],
+    min_cooccur: usize,
+) -> Vec<(usize, usize, usize)> {
+    let k = active.len();
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let mut count = 0usize;
+            for &r in rows {
+                if active[i].get(r).copied().unwrap_or(false)
+                    && active[j].get(r).copied().unwrap_or(false)
+                {
+                    count += 1;
+                }
+            }
+            if count >= min_cooccur {
+                out.push((i, j, count));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    out
+}
+
+/// A cooldown ledger that keys on the atom-set involved in a curl / flatten move
+/// so the pair cannot oscillate `curl → flatten → curl` across rounds
+/// (INTEGRATION_PLAN Phase 4.5; risk #5). A move on a given atom-set is blocked
+/// while its hash sits in cooldown; [`Self::tick`] decrements every entry by one
+/// round, so a cooldown of `c` rounds silences that atom-set for `c` rounds
+/// after either direction of the move fired on it.
+#[derive(Debug, Clone, Default)]
+pub struct CurlCooldownLedger {
+    /// atom-set hash → rounds remaining before the move is allowed again.
+    entries: std::collections::HashMap<u64, usize>,
+}
+
+/// Order-independent hash of an atom set (the cooldown key).
+pub fn atom_set_hash(atoms: &[usize]) -> u64 {
+    let mut sorted: Vec<usize> = atoms.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    // FNV-1a over the sorted indices — order-independent, stable across runs.
+    let mut h = 0xcbf29ce484222325u64;
+    for a in sorted {
+        for b in (a as u64).to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+impl CurlCooldownLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a move on `atoms` is currently blocked (its atom-set is cooling).
+    pub fn blocked(&self, atoms: &[usize]) -> bool {
+        self.entries
+            .get(&atom_set_hash(atoms))
+            .is_some_and(|&r| r > 0)
+    }
+
+    /// Record that a move fired on `atoms`; silence that atom-set for `cooldown`
+    /// rounds (both curl and flatten read the same ledger, so the two directions
+    /// cannot chase each other).
+    pub fn record(&mut self, atoms: &[usize], cooldown: usize) {
+        if cooldown == 0 {
+            return;
+        }
+        self.entries.insert(atom_set_hash(atoms), cooldown);
+    }
+
+    /// Advance one round: every cooling atom-set loses one round of cooldown.
+    pub fn tick(&mut self) {
+        self.entries.retain(|_, r| {
+            *r = r.saturating_sub(1);
+            *r > 0
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +792,92 @@ mod tests {
         }
         let v = flatten_verdict(radii.view(), angles.view()).unwrap();
         assert!(!v.recommend_flatten, "healthy ring must not flatten (κ={:.3} R2={:.3})", v.kappa, v.resultant2);
+    }
+
+    #[test]
+    fn coalesce_merges_four_rectified_halves_into_two_signed_axes() {
+        // A centered circle in the (e0,e1) plane, shattered by a nonneg gate into
+        // four rectified halves ±u, ±v with DISJOINT gates.
+        let p = 6usize;
+        let n = 400usize;
+        let mut up = Array1::<f64>::zeros(p);
+        up[0] = 1.0;
+        let un = up.mapv(|x| -x); // −u
+        let mut vp = Array1::<f64>::zeros(p);
+        vp[1] = 1.0;
+        let vn = vp.mapv(|x| -x); // −v
+        // Disjoint quarter-arc gates: rows 0..100 fire +u, 100..200 +v, etc.
+        let mask = |lo: usize, hi: usize| -> Vec<bool> {
+            (0..n).map(|r| r >= lo && r < hi).collect()
+        };
+        let dirs = [up.view(), un.view(), vp.view(), vn.view()];
+        let active = vec![mask(0, 100), mask(200, 300), mask(100, 200), mask(300, 400)];
+        let ids = [10usize, 11, 12, 13];
+        let signed = coalesce_antipodal(&dirs, &active, &ids, -0.9, 0.1);
+        assert_eq!(signed.len(), 2, "four halves must coalesce into two signed axes");
+        for sd in &signed {
+            assert_eq!(sd.members.len(), 2, "each signed axis merges a ± pair");
+            // Union gate covers both halves' rows (200 active).
+            let active_count = sd.active.iter().filter(|b| **b).count();
+            assert_eq!(active_count, 200);
+        }
+    }
+
+    #[test]
+    fn coalesce_leaves_a_lone_signed_atom_unmerged() {
+        let p = 3usize;
+        let n = 10usize;
+        let mut a = Array1::<f64>::zeros(p);
+        a[0] = 1.0;
+        let dirs = [a.view()];
+        let active = vec![vec![true; n]];
+        let ids = [7usize];
+        let signed = coalesce_antipodal(&dirs, &active, &ids, -0.9, 0.1);
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].members, vec![7]);
+    }
+
+    #[test]
+    fn coalesce_refuses_overlapping_antipodal_gates() {
+        // Opposite directions but the SAME (fully-overlapping) gate — not a
+        // rectified split (that would be a genuine two-sided line), so no merge.
+        let p = 3usize;
+        let n = 10usize;
+        let mut a = Array1::<f64>::zeros(p);
+        a[0] = 1.0;
+        let b = a.mapv(|x| -x);
+        let dirs = [a.view(), b.view()];
+        let active = vec![vec![true; n], vec![true; n]];
+        let ids = [1usize, 2];
+        let signed = coalesce_antipodal(&dirs, &active, &ids, -0.9, 0.1);
+        assert_eq!(signed.len(), 2, "overlapping gates must not coalesce");
+    }
+
+    #[test]
+    fn cooccurrence_counts_and_ranks() {
+        // dir 0 and 1 co-fire on rows 0..6; dir 2 fires elsewhere.
+        let active = vec![
+            (0..10).map(|r| r < 6).collect::<Vec<_>>(),
+            (0..10).map(|r| r < 6).collect::<Vec<_>>(),
+            (0..10).map(|r| r >= 6).collect::<Vec<_>>(),
+        ];
+        let rows: Vec<usize> = (0..10).collect();
+        let pairs = cooccurrence_pairs(&active, &rows, 3);
+        assert_eq!(pairs.first().map(|p| (p.0, p.1, p.2)), Some((0, 1, 6)));
+        // (0,2) and (1,2) never co-fire → excluded by min_cooccur.
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn cooldown_blocks_then_expires() {
+        let mut led = CurlCooldownLedger::new();
+        assert!(!led.blocked(&[3, 1, 2]));
+        led.record(&[1, 2, 3], 2);
+        // Order-independent key.
+        assert!(led.blocked(&[3, 2, 1]));
+        led.tick();
+        assert!(led.blocked(&[1, 2, 3]));
+        led.tick();
+        assert!(!led.blocked(&[1, 2, 3]), "cooldown must expire after c ticks");
     }
 }

@@ -392,6 +392,327 @@ impl BetaPenaltyOp for WhitenedRowGramPenaltyOp {
     }
 }
 
+/// #974 — the frame-factored data-fit β-Hessian UNDER a likelihood-whitening
+/// metric, matrix-free. This is the metric-aware generalization of
+/// [`gam_solve::arrow_schur::FactoredFrameKroneckerOp`], which applies the
+/// SEPARABLE `G_{ij} ⊗ (U_iᵀU_j)` — exact ONLY for the isotropic likelihood.
+/// Under an active per-row metric `M_n = U_n U_nᵀ` the true reduced-space block
+/// is `Σ_n (a_iφ_i)_n (a_jφ_j)_n (U_iᵀ M_n U_j)`, and `U_iᵀ M_n U_j` is
+/// row-dependent so it does NOT pull out of the basis Gram — the separable form
+/// is wrong. The exact operator is the per-row sandwich `Σ_n Φ_nᵀ M_n Φ_n`,
+/// where `Φ_n` expands the ACTIVE atoms' factored coordinates `C` into the
+/// `p`-dim decoded output through each atom's frame `U_k` (`I_p` for an unframed
+/// atom). Each row: expand `u_p = Σ_active a·φ · (U_k · x_k)`, whiten
+/// `u_p ← M_n u_p`, project back `y_k += a·φ · (U_kᵀ u_p)`. Cost
+/// `O(n · k_active · M · p · r)`, memory `O(p)` scratch — NEVER the dense
+/// `(M·p)²` per-atom covariance. With `M_n = I_p` it reduces bit-for-bit to the
+/// isotropic factored operator (pinned by the reduction test), so it is only
+/// installed on the whitening path.
+// TODO(#974): remove once the frames_engaged whitened assembly wiring in
+// construction_arrow_schur_assembly.rs is fully landed and every field/method is
+// exercised — kept temporarily so a partial checkout can't trip -D dead_code and
+// block the shared tree.
+#[allow(dead_code)]
+pub struct WhitenedFactoredFrameOp {
+    /// Decoder output dimension `p`.
+    p: usize,
+    /// Total reduced border dimension `Σ_k M_k · r_k`.
+    dim: usize,
+    /// Per-atom factored border offset (start of atom `k`'s `C_k` block).
+    c_offsets: Vec<usize>,
+    /// Per-atom frame rank `r_k` (equals `p` for an unframed atom).
+    ranks: Vec<usize>,
+    /// Per-atom basis size `M_k`.
+    basis_sizes: Vec<usize>,
+    /// Per-atom output frame `U_k` (`p × r_k`), or `None` for an unframed atom
+    /// (`U_k = I_p`, the full-`p` block riding the identity special case).
+    frames: Vec<Option<Array2<f64>>>,
+    /// Per-row active support: `(atom, basis_col, weight = a_k·φ_k)`.
+    support: Arc<[Vec<(usize, usize, f64)>]>,
+    /// The likelihood-whitening metric `M_n` (always whitening here).
+    metric: gam_problem::RowMetric,
+}
+
+// TODO(#974): drop this allow once the whitened frames_engaged path constructs
+// and drives this operator (then dead_code no longer fires).
+#[allow(dead_code)]
+impl WhitenedFactoredFrameOp {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        p: usize,
+        dim: usize,
+        c_offsets: Vec<usize>,
+        ranks: Vec<usize>,
+        basis_sizes: Vec<usize>,
+        frames: Vec<Option<Array2<f64>>>,
+        support: Arc<[Vec<(usize, usize, f64)>]>,
+        metric: gam_problem::RowMetric,
+    ) -> Self {
+        Self {
+            p,
+            dim,
+            c_offsets,
+            ranks,
+            basis_sizes,
+            frames,
+            support,
+            metric,
+        }
+    }
+
+    #[inline]
+    fn n_rows(&self) -> usize {
+        self.support.len()
+    }
+
+    /// Expand the active atoms' factored coordinates in row `row` into the
+    /// `p`-dim decoded output: `u_p = Σ_active weight · (U_k · x_k[basis, :])`.
+    fn expand_row(&self, row: usize, x: &[f64], u_p: &mut [f64]) {
+        for v in u_p.iter_mut() {
+            *v = 0.0;
+        }
+        for &(atom, basis, w) in self.support[row].iter() {
+            if w == 0.0 {
+                continue;
+            }
+            let r = self.ranks[atom];
+            let cb = self.c_offsets[atom] + basis * r;
+            match &self.frames[atom] {
+                Some(u) => {
+                    for j in 0..self.p {
+                        let mut acc = 0.0;
+                        for a in 0..r {
+                            acc += u[[j, a]] * x[cb + a];
+                        }
+                        u_p[j] += w * acc;
+                    }
+                }
+                None => {
+                    // U_k = I_p ⇒ r = p; the block is the full-p decoder slice.
+                    for j in 0..self.p {
+                        u_p[j] += w * x[cb + j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Project the whitened p-space vector back into each active atom's factored
+    /// coordinates: `y_k += weight · (U_kᵀ mu_p)`.
+    fn project_row(&self, row: usize, mu_p: &[f64], y: &mut [f64]) {
+        for &(atom, basis, w) in self.support[row].iter() {
+            if w == 0.0 {
+                continue;
+            }
+            let r = self.ranks[atom];
+            let cb = self.c_offsets[atom] + basis * r;
+            match &self.frames[atom] {
+                Some(u) => {
+                    for a in 0..r {
+                        let mut acc = 0.0;
+                        for j in 0..self.p {
+                            acc += u[[j, a]] * mu_p[j];
+                        }
+                        y[cb + a] += w * acc;
+                    }
+                }
+                None => {
+                    for j in 0..self.p {
+                        y[cb + j] += w * mu_p[j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-row reduced output Gram `U_kᵀ M_n U_k` (`r_k × r_k`) for one atom,
+    /// used by the diagonal and dense-block preconditioner paths. For an
+    /// unframed atom this is the dense `p × p` `M_n`.
+    fn frame_gram_row(&self, atom: usize, row: usize) -> Array2<f64> {
+        let r = self.ranks[atom];
+        match &self.frames[atom] {
+            Some(u) => {
+                // MU[:, a] = M_n U[:, a]; Gram[a,b] = U[:,a]·MU[:,b].
+                let mut mu = Array2::<f64>::zeros((self.p, r));
+                for a in 0..r {
+                    let col: Vec<f64> = (0..self.p).map(|j| u[[j, a]]).collect();
+                    let m_col = self
+                        .metric
+                        .apply_metric_row(row, ndarray::aview1(&col));
+                    for j in 0..self.p {
+                        mu[[j, a]] = m_col[j];
+                    }
+                }
+                let mut g = Array2::<f64>::zeros((r, r));
+                for a in 0..r {
+                    for b in 0..r {
+                        let mut acc = 0.0;
+                        for j in 0..self.p {
+                            acc += u[[j, a]] * mu[[j, b]];
+                        }
+                        g[[a, b]] = acc;
+                    }
+                }
+                g
+            }
+            None => {
+                // U = I_p: Gram = M_n (p×p).
+                let mut g = Array2::<f64>::zeros((r, r));
+                for b in 0..r {
+                    let mut e = vec![0.0_f64; self.p];
+                    e[b] = 1.0;
+                    let m_col = self
+                        .metric
+                        .apply_metric_row(row, ndarray::aview1(&e));
+                    for a in 0..r {
+                        g[[a, b]] = m_col[a];
+                    }
+                }
+                g
+            }
+        }
+    }
+}
+
+impl BetaPenaltyOp for WhitenedFactoredFrameOp {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        // y += Σ_n Φ_nᵀ M_n Φ_n x, matrix-free through a length-p scratch.
+        let mut u_p = vec![0.0_f64; self.p];
+        for row in 0..self.n_rows() {
+            self.expand_row(row, x, &mut u_p);
+            let mu = self
+                .metric
+                .apply_metric_row(row, ndarray::aview1(&u_p));
+            self.project_row(row, &mu, y);
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        // diag[c_off[k] + basis·r + a] += Σ_n weight² (U_kᵀ M_n U_k)[a,a].
+        for row in 0..self.n_rows() {
+            // Cache the per-atom reduced Gram once per (row, atom) touched.
+            let mut seen: std::collections::BTreeMap<usize, Array2<f64>> =
+                std::collections::BTreeMap::new();
+            for &(atom, basis, w) in self.support[row].iter() {
+                if w == 0.0 {
+                    continue;
+                }
+                let g = seen
+                    .entry(atom)
+                    .or_insert_with(|| self.frame_gram_row(atom, row));
+                let r = self.ranks[atom];
+                let cb = self.c_offsets[atom] + basis * r;
+                let w2 = w * w;
+                for a in 0..r {
+                    diag[cb + a] += w2 * g[[a, a]];
+                }
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        // Dense per-atom block for the block-Jacobi preconditioner. The block
+        // ranges are per-atom `[c_off[k] .. c_off[k] + M_k·r_k]`; find which atom
+        // this range starts at and accumulate its whitened factored block.
+        let range = &offsets[id.0];
+        let atom = match self.c_offsets.iter().position(|&o| o == range.start) {
+            Some(k) => k,
+            None => return,
+        };
+        let r = self.ranks[atom];
+        let m = self.basis_sizes[atom];
+        for row in 0..self.n_rows() {
+            // Support entries for THIS atom in this row: (basis, weight).
+            let entries: Vec<(usize, f64)> = self.support[row]
+                .iter()
+                .filter(|&&(a, _, w)| a == atom && w != 0.0)
+                .map(|&(_, basis, w)| (basis, w))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let g = self.frame_gram_row(atom, row);
+            for &(basis_a, wa) in entries.iter() {
+                for &(basis_b, wb) in entries.iter() {
+                    let w = wa * wb;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let base_a = basis_a * r;
+                    let base_b = basis_b * r;
+                    for a in 0..r {
+                        for b in 0..r {
+                            out[[base_a + a, base_b + b]] += w * g[[a, b]];
+                        }
+                    }
+                }
+            }
+        }
+        let _ = m;
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        // Honest O(dim²) materialization — Direct/small-K fixtures only; the
+        // matrix-free matvec/diagonal carry the production path.
+        let mut out = Array2::<f64>::zeros((self.dim, self.dim));
+        let mut u_p = vec![0.0_f64; self.p];
+        for col in 0..self.dim {
+            let mut e = vec![0.0_f64; self.dim];
+            e[col] = 1.0;
+            let mut y = vec![0.0_f64; self.dim];
+            // One column of the operator = matvec on a unit vector.
+            for row in 0..self.n_rows() {
+                self.expand_row(row, &e, &mut u_p);
+                let mu = self
+                    .metric
+                    .apply_metric_row(row, ndarray::aview1(&u_p));
+                self.project_row(row, &mu, &mut y);
+            }
+            for r in 0..self.dim {
+                out[[r, col]] = y[r];
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("whitened-factored-frame-op-v1");
+        hasher.write_usize(self.dim);
+        hasher.write_usize(self.p);
+        hasher.write_usize(self.n_rows());
+        for (k, r) in self.ranks.iter().enumerate() {
+            hasher.write_usize(*r);
+            hasher.write_usize(self.basis_sizes[k]);
+            hasher.write_usize(self.c_offsets[k]);
+            if let Some(u) = &self.frames[k] {
+                for &v in u.iter() {
+                    hasher.write_f64(v);
+                }
+            }
+        }
+        for row in self.support.iter() {
+            hasher.write_usize(row.len());
+            for &(atom, basis, w) in row.iter() {
+                hasher.write_usize(atom);
+                hasher.write_usize(basis);
+                hasher.write_f64(w);
+            }
+        }
+        hasher.write_usize(self.metric.metric_rank());
+        for tr in self.metric.row_traces().iter() {
+            hasher.write_f64(*tr);
+        }
+    }
+}
+
 /// The `p` metric columns `M_n[:, oc]` for one row, formed factored via
 /// `apply_output_metric_row` on unit vectors: `mcols[oc][oc1] = M_n[oc1, oc]`.
 fn metric_columns(kron: &SaeKroneckerRows, row: usize, p: usize) -> Vec<Vec<f64>> {
@@ -407,9 +728,211 @@ fn metric_columns(kron: &SaeKroneckerRows, row: usize, p: usize) -> Vec<Vec<f64>
 
 #[cfg(test)]
 mod tests {
-    use super::{SaeKroneckerRow, SaeKroneckerRows, WhitenedRowGramPenaltyOp};
-    use gam_solve::arrow_schur::{BetaPenaltyOp, DeviceSaePcgData};
+    use super::{
+        SaeKroneckerRow, SaeKroneckerRows, WhitenedFactoredFrameOp, WhitenedRowGramPenaltyOp,
+    };
+    use gam_solve::arrow_schur::{BetaBlockId, BetaPenaltyOp, DeviceSaePcgData};
     use std::sync::Arc;
+
+    /// Dense reference for the frame-factored whitened β-Hessian: build each row's
+    /// full `p × p` metric `M_n` from the low-rank factor, then sum
+    /// `Φ_nᵀ M_n Φ_n` where `Φ_n` decodes the factored coords through the frames.
+    /// One framed atom (`M` basis fns, frame `U` = `p × r`).
+    fn dense_framed_whitened_reference(
+        p: usize,
+        r: usize,
+        m: usize,
+        u: &ndarray::Array2<f64>,           // p × r frame
+        factor: &ndarray::Array2<f64>,      // n_rows × (p·rank) metric factor
+        rank: usize,
+        support: &[Vec<(usize, usize, f64)>], // per row (atom, basis, weight)
+    ) -> ndarray::Array2<f64> {
+        let dim = m * r;
+        let mut h = ndarray::Array2::<f64>::zeros((dim, dim));
+        for (row, entries) in support.iter().enumerate() {
+            // M_n (p×p) from the factor row: M[i,j] = Σ_k f[i·rank+k] f[j·rank+k].
+            let mut mn = ndarray::Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in 0..p {
+                    let mut acc = 0.0;
+                    for k in 0..rank {
+                        acc += factor[[row, i * rank + k]] * factor[[row, j * rank + k]];
+                    }
+                    mn[[i, j]] = acc;
+                }
+            }
+            // Uᵀ M_n U (r×r).
+            let mut umu = ndarray::Array2::<f64>::zeros((r, r));
+            for a in 0..r {
+                for b in 0..r {
+                    let mut acc = 0.0;
+                    for i in 0..p {
+                        for j in 0..p {
+                            acc += u[[i, a]] * mn[[i, j]] * u[[j, b]];
+                        }
+                    }
+                    umu[[a, b]] = acc;
+                }
+            }
+            // H[(ba,a),(bb,b)] += w[ba] w[bb] (UᵀM_nU)[a,b].
+            for &(_, ba, wa) in entries.iter() {
+                for &(_, bb, wb) in entries.iter() {
+                    let w = wa * wb;
+                    for a in 0..r {
+                        for b in 0..r {
+                            h[[ba * r + a, bb * r + b]] += w * umu[[a, b]];
+                        }
+                    }
+                }
+            }
+        }
+        h
+    }
+
+    /// #974 core: the frame-factored whitened β-Hessian operator must equal the
+    /// dense `Σ_n Φ_nᵀ M_n Φ_n` reference (to_dense + matvec + diagonal + block),
+    /// with the metric genuinely NOT proportional to identity.
+    #[test]
+    fn whitened_factored_frame_op_matches_dense_reference() {
+        let p = 3usize;
+        let r = 2usize;
+        let m = 2usize;
+        let rank = 2usize;
+        // Frame U (p×r), arbitrary (not orthonormal — the op must not assume it).
+        let u = ndarray::Array2::from_shape_vec(
+            (p, r),
+            vec![1.0, 0.0, 0.5, 1.0, -0.3, 0.7],
+        )
+        .unwrap();
+        // Metric factor rows (n_rows × p·rank), anisotropic per row.
+        let factor = ndarray::Array2::from_shape_vec(
+            (3, p * rank),
+            vec![
+                1.0, 0.2, 0.0, 1.0, 0.5, 0.0, // row 0
+                0.3, 1.0, 1.0, 0.1, 0.0, 0.4, // row 1
+                0.9, 0.0, 0.2, 0.6, 1.0, 0.0, // row 2
+            ],
+        )
+        .unwrap();
+        let support: Vec<Vec<(usize, usize, f64)>> = vec![
+            vec![(0, 0, 1.0), (0, 1, 0.5)],
+            vec![(0, 0, -0.3), (0, 1, 0.8)],
+            vec![(0, 0, 0.2), (0, 1, -0.4)],
+        ];
+        let metric =
+            gam_problem::RowMetric::behavioral_fisher(Arc::new(factor.clone()), p, rank).unwrap();
+
+        let dim = m * r;
+        let op = WhitenedFactoredFrameOp::new(
+            p,
+            dim,
+            vec![0],
+            vec![r],
+            vec![m],
+            vec![Some(u.clone())],
+            Arc::from(support.clone().into_boxed_slice()),
+            metric,
+        );
+
+        let reference =
+            dense_framed_whitened_reference(p, r, m, &u, &factor, rank, &support);
+
+        let dense = op.to_dense();
+        for a in 0..dim {
+            for b in 0..dim {
+                assert!(
+                    (dense[[a, b]] - reference[[a, b]]).abs() < 1e-10,
+                    "to_dense mismatch at ({a},{b}): {} vs {}",
+                    dense[[a, b]],
+                    reference[[a, b]]
+                );
+            }
+        }
+        // matvec on a fixed vector equals reference·x.
+        let x = vec![0.7, -0.2, 1.1, 0.3];
+        let mut y = vec![0.0; dim];
+        op.matvec(&x, &mut y);
+        for a in 0..dim {
+            let mut expect = 0.0;
+            for b in 0..dim {
+                expect += reference[[a, b]] * x[b];
+            }
+            assert!((y[a] - expect).abs() < 1e-10, "matvec[{a}] {} vs {expect}", y[a]);
+        }
+        // diagonal matches reference diagonal.
+        let mut d = vec![0.0; dim];
+        op.diagonal(&mut d);
+        for a in 0..dim {
+            assert!(
+                (d[a] - reference[[a, a]]).abs() < 1e-10,
+                "diag[{a}] {} vs {}",
+                d[a],
+                reference[[a, a]]
+            );
+        }
+        // block (single atom, range 0..dim) equals the full reference block.
+        let mut blk = ndarray::Array2::<f64>::zeros((dim, dim));
+        op.block(BetaBlockId(0), &[0..dim], &mut blk);
+        for a in 0..dim {
+            for b in 0..dim {
+                assert!(
+                    (blk[[a, b]] - reference[[a, b]]).abs() < 1e-10,
+                    "block mismatch at ({a},{b})"
+                );
+            }
+        }
+    }
+
+    /// #974 reduction: with an IDENTITY metric and an ORTHONORMAL frame the
+    /// factored whitened op collapses to the isotropic `g ⊗ I_r` block (a
+    /// whitening-OFF fit is unchanged).
+    #[test]
+    fn whitened_factored_frame_op_reduces_to_g_kron_ir_under_identity_metric() {
+        let p = 3usize;
+        let r = 2usize;
+        let m = 1usize;
+        // Orthonormal frame columns e0, e1.
+        let u = ndarray::Array2::from_shape_vec(
+            (p, r),
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        // Identity metric per row: factor = I_p (rank p).
+        let mut factor = ndarray::Array2::<f64>::zeros((2, p * p));
+        for row in 0..2 {
+            for i in 0..p {
+                factor[[row, i * p + i]] = 1.0;
+            }
+        }
+        let support: Vec<Vec<(usize, usize, f64)>> =
+            vec![vec![(0, 0, 1.5)], vec![(0, 0, 0.25)]];
+        let metric =
+            gam_problem::RowMetric::behavioral_fisher(Arc::new(factor), p, p).unwrap();
+        let dim = m * r;
+        let op = WhitenedFactoredFrameOp::new(
+            p,
+            dim,
+            vec![0],
+            vec![r],
+            vec![m],
+            vec![Some(u)],
+            Arc::from(support.clone().into_boxed_slice()),
+            metric,
+        );
+        // g = Σ_rows w² = 1.5² + 0.25² = 2.3125; block should be g·I_r.
+        let g: f64 = support.iter().map(|row| row[0].2 * row[0].2).sum();
+        let dense = op.to_dense();
+        for a in 0..dim {
+            for b in 0..dim {
+                let expect = if a == b { g } else { 0.0 };
+                assert!(
+                    (dense[[a, b]] - expect).abs() < 1e-12,
+                    "g⊗I_r mismatch at ({a},{b}): {} vs {expect}",
+                    dense[[a, b]]
+                );
+            }
+        }
+    }
 
     /// #974 counterexample (the team-lead's spec): one row, one basis fn, `p = 2`,
     /// `M = diag(100, 0)`, `a·φ = 1`. The correct whitened data-fit β-Hessian is

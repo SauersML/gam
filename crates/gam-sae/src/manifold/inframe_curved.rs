@@ -37,7 +37,10 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
-use crate::frames::{GrassmannCrossMoment, GrassmannFrame, SAE_FRAME_RANK_CUTOFF};
+use crate::frames::{
+    GrassmannCrossMoment, GrassmannFrame, SAE_FRAME_ACTIVATION_MARGIN,
+    SAE_FRAME_MIN_AUTO_OUTPUT_DIM, SAE_FRAME_RANK_CUTOFF,
+};
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt};
 use faer::Side;
 
@@ -384,11 +387,26 @@ pub fn activate_residual_frame(
     rows: &[usize],
     config: &InFrameCurvedConfig,
 ) -> Result<Option<usize>, String> {
+    // Same benefit policy as `SaeManifoldAtom::decoder_frame_activation_rank`:
+    // never engage a frame below the minimum output width, and only when the
+    // learned rank materially shrinks the border (`r ≤ p·(1 − margin)`). Below
+    // that the dense full-`p` path is both cheaper and the certified reference,
+    // so the atom stays on it — this also keeps the small-`p` synthetic fits
+    // bit-for-bit unchanged (frames were never beneficial there).
+    let p = residual.ncols();
+    if p < SAE_FRAME_MIN_AUTO_OUTPUT_DIM {
+        atom.decoder_frame = None;
+        return Ok(None);
+    }
     let Some(frame) = residual_span_frame(residual, rows, config)? else {
         atom.decoder_frame = None;
         return Ok(None);
     };
     let r = frame.rank();
+    if (r as f64) > (p as f64) * (1.0 - SAE_FRAME_ACTIVATION_MARGIN) {
+        atom.decoder_frame = None;
+        return Ok(None);
+    }
     let u = frame.frame().to_owned(); // p × r
     // Project the decoder onto the frame so B = C·Uᵀ holds exactly (mirrors
     // maybe_activate_decoder_frame's B ← (B U) Uᵀ convergence guard).

@@ -618,7 +618,25 @@ pub struct SaeManifoldAtom {
     /// carry scale THROUGH the solve until `‖B_k‖` is constrained, so the two
     /// are deliberately coupled.
     pub log_amplitude: f64,
+    /// Row indices of the quadrature subsample the `d ≥ 2` bending Gram is
+    /// assembled from at scale. `None` ⇒ the Gram uses the full active set and
+    /// [`Self::basis_second_jet_values`] is the full `(n, M, d, d)` jet — the
+    /// bitwise-legacy path, taken whenever `n ≤ BENDING_QUADRATURE_CAP`.
+    /// `Some(rows)` ⇒ the second-jet cache is the COMPACT `(rows.len(), M, d, d)`
+    /// jet evaluated ONLY on these rows, and the Gram loop reweights each by
+    /// `n / rows.len()` so the penalty scale (hence λ selection) matches the
+    /// full-set penalty. This is the memory fix: a torus atom's full second jet
+    /// is ~1.5 GB at `n = 10⁶`; the `Q ≈ 4096` compact jet is ~6 MB and still
+    /// oversamples the `≤ M(M+1)/2 ≲ 1.2k`-dof Gram 3–6×.
+    pub bending_quadrature_rows: Option<Vec<usize>>,
 }
+
+/// Quadrature-subsample cap for the `d ≥ 2` bending Gram: above this many active
+/// rows the covariant Gram is assembled from a leverage-stratified subsample of
+/// this many rows rather than the full set (see
+/// [`SaeManifoldAtom::bending_quadrature_rows`]). Below it, the full-set legacy
+/// path is bitwise-preserved.
+pub const BENDING_QUADRATURE_CAP: usize = 4096;
 
 impl SaeManifoldAtom {
     #[must_use = "build error must be handled"]
@@ -680,6 +698,7 @@ impl SaeManifoldAtom {
             chart_canonicalized: false,
             // #2022 — default 0.0 ⇒ exp(s)=1 ⇒ historical `Φ·B` bit-for-bit.
             log_amplitude: 0.0,
+            bending_quadrature_rows: None,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
@@ -889,12 +908,40 @@ impl SaeManifoldAtom {
         // rather than failing the whole basis refresh, so an evaluator that is
         // fine for `Φ`/`∂Φ` but degenerate for `∂²Φ` at some coordinate cannot
         // break the refresh path.
-        let expected = (self.n_obs(), self.basis_size(), self.latent_dim, self.latent_dim);
-        self.basis_second_jet_values = self
-            .basis_second_jet
-            .as_ref()
-            .and_then(|second| second.second_jet(coords).ok())
-            .filter(|hess| hess.dim() == expected);
+        let n = self.n_obs();
+        let m = self.basis_size();
+        let d = self.latent_dim;
+        if d >= 2 && n > BENDING_QUADRATURE_CAP && self.basis_second_jet.is_some() {
+            // At scale the full `(n, M, d, d)` second jet is the OOM risk
+            // (~1.5 GB/atom at n=10⁶). Evaluate it ONLY on a leverage-stratified
+            // quadrature subsample; the Gram reweights by `n/|rows|`.
+            let rows = self.select_bending_quadrature_rows(BENDING_QUADRATURE_CAP);
+            let sub = coords.select(ndarray::Axis(0), &rows);
+            let expected = (rows.len(), m, d, d);
+            let jet = self
+                .basis_second_jet
+                .as_ref()
+                .and_then(|second| second.second_jet(sub.view()).ok())
+                .filter(|hess| hess.dim() == expected);
+            if jet.is_some() {
+                self.basis_second_jet_values = jet;
+                self.bending_quadrature_rows = Some(rows);
+            } else {
+                // Sub-eval failed / mis-shaped: fall back to the raw-Gram path
+                // (no cache) rather than a stale or full-size jet.
+                self.basis_second_jet_values = None;
+                self.bending_quadrature_rows = None;
+            }
+        } else {
+            // Small-`n` or `d = 1`: full jet, bitwise-identical legacy path.
+            let expected = (n, m, d, d);
+            self.basis_second_jet_values = self
+                .basis_second_jet
+                .as_ref()
+                .and_then(|second| second.second_jet(coords).ok())
+                .filter(|hess| hess.dim() == expected);
+            self.bending_quadrature_rows = None;
+        }
         Ok(())
     }
 
@@ -914,7 +961,54 @@ impl SaeManifoldAtom {
             ));
         }
         self.basis_second_jet_values = Some(values);
+        // A caller-installed jet is full-`n` by shape contract, so the Gram uses
+        // the full active set (no quadrature reweight).
+        self.bending_quadrature_rows = None;
         Ok(())
+    }
+
+    /// Leverage-stratified quadrature subsample for the `d ≥ 2` bending Gram.
+    ///
+    /// Returns ≤ `cap` row indices (all rows when `n ≤ cap`). The stratification
+    /// key is each row's tangent energy `Σ_{m,a} (∂_aΦ_m)²` (a cheap
+    /// `O(n·M·d)` proxy for the pullback volume `√det g`, read straight off the
+    /// resident first-jet cache — no decoder pass, no full second jet). Rows are
+    /// ranked by that key and `cap` are taken at evenly-spaced ranks, so the
+    /// subsample spans the whole leverage spectrum (flat AND high-curvature
+    /// regions) rather than clustering — the coverage the covariant Gram needs to
+    /// see every bent direction. Deterministic.
+    fn select_bending_quadrature_rows(&self, cap: usize) -> Vec<usize> {
+        let n = self.n_obs();
+        if n <= cap || cap == 0 {
+            return (0..n).collect();
+        }
+        let m = self.basis_size();
+        let d = self.latent_dim;
+        let mut leverage = vec![0.0_f64; n];
+        for (row, lev) in leverage.iter_mut().enumerate() {
+            let mut acc = 0.0_f64;
+            for coeff in 0..m {
+                for a in 0..d {
+                    let g = self.basis_jacobian[[row, coeff, a]];
+                    acc += g * g;
+                }
+            }
+            *lev = acc;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&i, &j| {
+            leverage[i]
+                .partial_cmp(&leverage[j])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut sel = Vec::with_capacity(cap);
+        for k in 0..cap {
+            let pos = (((k as f64 + 0.5) * n as f64 / cap as f64) as usize).min(n - 1);
+            sel.push(order[pos]);
+        }
+        sel.sort_unstable();
+        sel.dedup();
+        sel
     }
 
     pub fn n_obs(&self) -> usize {
@@ -1730,14 +1824,32 @@ impl SaeManifoldAtom {
             return None;
         }
         let hess = self.basis_second_jet_values.as_ref()?;
-        if hess.dim() != (n, m, d, d) {
+        // Quadrature-subsampled at scale: when `bending_quadrature_rows` is set
+        // the cache is the COMPACT jet over those rows and each row's Gram
+        // contribution is reweighted by `n / |rows|` so the penalty scale (hence
+        // λ selection) matches the full-set penalty. Full-set path (`None`) is
+        // bitwise-legacy: rows = 0..n, weight 1, hess shape (n, M, d, d).
+        let rows_owned: Vec<usize>;
+        let rows: &[usize] = match &self.bending_quadrature_rows {
+            Some(r) => r.as_slice(),
+            None => {
+                rows_owned = (0..n).collect();
+                &rows_owned
+            }
+        };
+        if hess.dim() != (rows.len(), m, d, d) {
             return None;
         }
+        let weight_scale = if self.bending_quadrature_rows.is_some() {
+            n as f64 / rows.len().max(1) as f64
+        } else {
+            1.0
+        };
         let b = &self.decoder_coefficients; // (M, p)
         let volume = matches!(self.bending_measure, SaeBendingMeasure::Volume);
 
         let mut gram = Array2::<f64>::zeros((m, m));
-        for row in 0..n {
+        for (jet_idx, &row) in rows.iter().enumerate() {
             // Ambient tangent frame Dγ (p × d): Dγ[:, a] = Bᵀ ∂_aΦ.
             let mut dgamma = Array2::<f64>::zeros((p, d));
             for a in 0..d {
@@ -1801,15 +1913,18 @@ impl SaeManifoldAtom {
                 }
             }
             // Volume weight ω = √det g (0 on a rank-deficient frame); or ω = 1.
-            let omega = if volume {
-                if full_rank {
-                    (0.5 * logdet).exp()
+            // The quadrature reweight `n/|rows|` folds in here so a subsampled
+            // Gram estimates the full-set Gram (its trace = Σ_i ω_i‖II_i‖²).
+            let omega = weight_scale
+                * if volume {
+                    if full_rank {
+                        (0.5 * logdet).exp()
+                    } else {
+                        0.0
+                    }
                 } else {
-                    0.0
-                }
-            } else {
-                1.0
-            };
+                    1.0
+                };
             if !(omega > 0.0 && omega.is_finite()) {
                 continue;
             }
@@ -1822,7 +1937,7 @@ impl SaeManifoldAtom {
             let mut d2gamma = vec![0.0_f64; p];
             for a in 0..d {
                 for bb in 0..d {
-                    let d2phi = hess.slice(s![row, .., a, bb]); // (M)
+                    let d2phi = hess.slice(s![jet_idx, .., a, bb]); // (M)
                     for slot in d2gamma.iter_mut() {
                         *slot = 0.0;
                     }
@@ -2070,6 +2185,67 @@ mod tests {
         atom.install_bending_second_jet(d2gamma).unwrap();
         atom.refresh_intrinsic_smooth_penalty();
         atom
+    }
+
+    // Quadrature subsampling estimates the full-set bending energy: a paraboloid
+    // over a 40×40 chart grid, full Gram vs a leverage-stratified Q=400 subsample
+    // reweighted by n/Q, agree in total energy to a few percent. This is the
+    // scale fix — the full second jet is never materialized at n≫Q.
+    #[test]
+    fn quadrature_subsample_matches_full_bending_energy() {
+        let side = 40usize;
+        let n = side * side;
+        let p = 3usize;
+        let d = 2usize;
+        let mut dgamma = Array3::<f64>::zeros((n, p, d));
+        let mut d2gamma = Array4::<f64>::zeros((n, p, d, d));
+        for i in 0..side {
+            for j in 0..side {
+                let row = i * side + j;
+                let t0 = -1.0 + 2.0 * (i as f64) / (side as f64 - 1.0);
+                let t1 = -1.0 + 2.0 * (j as f64) / (side as f64 - 1.0);
+                // γ = (t0, t1, ½(t0²+t1²)): ∂γ = [[1,0],[0,1],[t0,t1]], ∂²γ_z = I.
+                dgamma[[row, 0, 0]] = 1.0;
+                dgamma[[row, 1, 1]] = 1.0;
+                dgamma[[row, 2, 0]] = t0;
+                dgamma[[row, 2, 1]] = t1;
+                d2gamma[[row, 2, 0, 0]] = 1.0;
+                d2gamma[[row, 2, 1, 1]] = 1.0;
+            }
+        }
+        // Full-set reference (Data measure ⇒ ω = 1, so energy = Σ_n ‖II‖²).
+        let full = bending_atom(dgamma.clone(), d2gamma.clone(), SaeBendingMeasure::Data);
+        let e_full = bending_energy_of(&full);
+        assert!(e_full > 0.0 && e_full.is_finite());
+        assert!(full.bending_quadrature_rows.is_none(), "small-n harness stays full");
+
+        // Manually drive the subsample path: pick Q rows, keep only their jet
+        // slices, tag the quadrature. try_intrinsic then reweights by n/Q.
+        let q = 400usize;
+        let rows = full.select_bending_quadrature_rows(q);
+        assert!(rows.len() <= q && rows.len() >= q / 2, "got {} rows", rows.len());
+        let mut compact = Array4::<f64>::zeros((rows.len(), p, d, d));
+        for (jet_idx, &r) in rows.iter().enumerate() {
+            compact
+                .slice_mut(s![jet_idx, .., .., ..])
+                .assign(&d2gamma.slice(s![r, .., .., ..]));
+        }
+        let mut sub = bending_atom(dgamma, d2gamma, SaeBendingMeasure::Data);
+        sub.basis_second_jet_values = Some(compact);
+        sub.bending_quadrature_rows = Some(rows.clone());
+        // Memory footprint is O(Q·M·d²), NOT O(n·M·d²): the retained jet holds
+        // only the subsampled rows (Q ≪ n), the OOM-avoiding invariant at scale.
+        let jet_len = sub.basis_second_jet_values.as_ref().unwrap().len();
+        assert_eq!(jet_len, rows.len() * p * d * d, "compact jet must be Q·p·d²");
+        assert!(rows.len() * 3 < n, "subsample Q={} must be ≪ n={n}", rows.len());
+        sub.refresh_intrinsic_smooth_penalty();
+        let e_sub = bending_energy_of(&sub);
+        assert!(e_sub > 0.0 && e_sub.is_finite());
+        let rel = (e_sub - e_full).abs() / e_full;
+        assert!(
+            rel < 0.08,
+            "subsampled bending energy {e_sub} vs full {e_full} (rel {rel:.3}) — reweight off"
+        );
     }
 
     // `tr(Bᵀ S̃ B) = tr(S̃)` for the identity decoder — the total bending energy.

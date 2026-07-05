@@ -2828,23 +2828,27 @@ fn sae_manifold_fit_stagewise<'py>(
         progress_callback.as_mut().map(|callback| {
             callback as &mut gam::terms::sae::manifold::StagewiseProgressCallback<'_>
         });
-    // #2138 — release the GIL for the multi-minute forward-birth + backfit solve
-    // so a slow/hung fit stays interruptible from Python. Inputs are owned or
-    // borrowed data views (no Python objects); the optional progress hook
-    // reacquires the GIL itself via `Python::attach`, so it still calls back.
-    let result = py
-        .allow_threads(|| {
-            gam::terms::sae::manifold::fit_stagewise(
-                base_term,
-                init_rho,
-                z_view,
-                None,
-                weights.as_deref(),
-                &config,
-                progress_hook,
-            )
-        })
-        .map_err(py_value_error)?;
+    // #2138 — with no progress callback, run the whole multi-minute forward-birth
+    // + backfit solve through the GIL-releasing interruptible driver: on a Python
+    // interrupt it sets `cancel_flag`, which the stagewise loop polls per birth /
+    // per backfit sweep to stop the abandoned compose worker promptly. A callback
+    // keeps the direct call — the `&mut dyn` hook is not Ungil (can't cross
+    // `detach`) and already re-enters Python (raising there) each event.
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = match progress_hook {
+        Some(hook) => gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, z_view, None, weights.as_deref(), &config, Some(hook), None),
+        None => {
+            // The worker thread is `'static`, but `z_view` borrows the (Python)
+            // numpy buffer — own the target so nothing non-`'static` crosses in
+            // (the primary fit path owns its target the same way).
+            let target_owned = z_view.to_owned();
+            let worker_cancel = std::sync::Arc::clone(&cancel_flag);
+            run_sae_fit_interruptible(py, "gam-sae-stagewise", &cancel_flag, move || {
+                gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, target_owned.view(), None, weights.as_deref(), &config, None, Some(&*worker_cancel))
+            })?
+        }
+    }
+    .map_err(py_value_error)?;
 
     let term = result.term;
     let rho = result.rho;
@@ -2871,6 +2875,7 @@ fn sae_manifold_fit_stagewise<'py>(
         }
         gam::terms::sae::manifold::StagewiseStop::MaxBirths => "max_births",
         gam::terms::sae::manifold::StagewiseStop::NoResidualStructure => "no_residual_structure",
+        gam::terms::sae::manifold::StagewiseStop::Cancelled => "cancelled",
     };
 
     let log_ard_py = PyList::empty(py);
@@ -2909,54 +2914,6 @@ fn sae_manifold_fit_stagewise<'py>(
     )?;
     out.set_item("log_lambda_sparse", rho.log_lambda_sparse)?;
     Ok(out.unbind())
-}
-
-// #1388 — 512 MiB worker-thread stack for the SAE joint fit. The outer-ρ
-// cascade's serial per-row jet loop builds multi-megabyte `Tower4<16>` frames
-// that overflow Python's modest calling-thread stack → SIGSEGV. Mirror the
-// native CLI's headroom (`CLI_WORKER_STACK_SIZE` in `src/main.rs`).
-const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
-
-/// Run an owned SAE fit closure on a 512 MiB worker thread with the GIL
-/// RELEASED, so a multi-minute Rust solve no longer holds the interpreter lock
-/// for its whole duration (#2138). The calling thread blocks on the result
-/// channel in short GIL-dropped windows and, between them, reacquires the GIL to
-/// run any pending Python signal handler ([`Python::check_signals`]): a
-/// `KeyboardInterrupt` / `signal.alarm` therefore RAISES here mid-solve instead
-/// of only after the fit returns. On interrupt the worker is abandoned — it owns
-/// every input (`'static`), so it finishes and drops on its own thread. `f` MUST
-/// NOT touch any Python object; it returns owned Rust values only.
-fn run_sae_fit_interruptible<T, F>(py: Python<'_>, thread_name: &str, f: F) -> PyResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel::<T>();
-    std::thread::Builder::new()
-        .name(thread_name.to_string())
-        .stack_size(SAE_FIT_WORKER_STACK_SIZE)
-        // On interrupt the receiver is gone, so the send fails and is dropped.
-        .spawn(move || {
-            tx.send(f()).ok();
-        })
-        .map_err(|err| {
-            py_value_error(format!("sae_manifold_fit: spawn fit worker thread: {err}"))
-        })?;
-    loop {
-        // Block up to the poll window with the GIL released (other Python threads
-        // run; the OS delivers signals to the interpreter), then reacquire it to
-        // service any pending handler. 50 ms is negligible next to a multi-minute
-        // solve yet lands an interrupt within a fraction of a second.
-        match py.allow_threads(|| rx.recv_timeout(std::time::Duration::from_millis(50))) {
-            Ok(value) => return Ok(value),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => py.check_signals()?,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(py_value_error(format!(
-                    "{thread_name}: joint-fit worker thread panicked (see prior error output)"
-                )));
-            }
-        }
-    }
 }
 
 fn sae_manifold_fit_inner<'py>(
@@ -3508,12 +3465,14 @@ fn sae_manifold_fit_inner<'py>(
     // multistart insurance: the PCA projection lands each row in the decisive
     // basin and EFS refines the per-atom penalties from there. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
-    // #2138 — run the multi-minute joint solve on the 512 MiB worker with the GIL
-    // RELEASED and the calling thread polling for signals, so a slow/hung fit is
-    // interruptible from Python. `objective` is fully owned (built from
-    // `z_view.to_owned()` + owned config, no lifetime), so it moves into the
-    // worker and is handed back out; nothing in the closure touches Python.
-    let (mut objective, run_result) = run_sae_fit_interruptible(py, "gam-sae-fit", move || {
+    // #2138 — run the multi-minute joint solve on the worker with the GIL
+    // released + signal polling, so a slow/hung fit is interruptible. `objective`
+    // is fully owned (no lifetime), so it moves in and is handed back out. The
+    // shared cancel flag lets an interrupt cooperatively stop the abandoned worker
+    // (the objective bails out of its next outer eval).
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
+    let (mut objective, run_result) = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
         let run_result = if run_outer_rho_search {
             let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
                 .with_initial_rho(init_rho_flat.clone())
@@ -3655,10 +3614,12 @@ fn sae_manifold_fit_inner<'py>(
                     seed_budget: 1,
                     ..Default::default()
                 });
-            // #2138 — same GIL-released, interruptible worker per structured pass.
+            // #2138 — same GIL-released, interruptible + cancellable worker per pass.
+            let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
             let (mut objective, run_result) =
-                run_sae_fit_interruptible(py, "gam-sae-fit-structured", move || {
-                    let run_result = problem.run(&mut objective, "SAE manifold (structured)");
+                run_sae_fit_interruptible(py, "gam-sae-fit-structured", &cancel_flag, move || {
+                    let run_result = problem.run(&mut objective, "SAE manifold (structured)").map(|_| ());
                     (objective, run_result)
                 })?;
             run_result.map_err(estimation_error_to_pyerr)?;
@@ -3869,6 +3830,9 @@ fn sae_manifold_fit_inner<'py>(
             budget,
             max_rounds: structure_max_rounds,
             harvest_params,
+            // Curl/flatten structure moves stay off in the production FFI path
+            // until the killer-demo gate graduates them (INTEGRATION_PLAN §8).
+            curl: None,
         };
         match gam::terms::sae::structure_harvest::run_production_structure_search(
             term,

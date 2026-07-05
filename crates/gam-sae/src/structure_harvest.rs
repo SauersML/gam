@@ -802,6 +802,65 @@ pub fn apply_structure_move(
     }
 }
 
+/// A birth seed the seeded apply-move ([`apply_structure_move_seeded`])
+/// materializes. The residual-factor births carry only a flat decoder (the
+/// topology race in [`born_atom`] then adjudicates line vs circle vs …); a curl
+/// birth (INTEGRATION_PLAN Phase 4) instead carries a fully-formed periodic
+/// circle — decoder, per-row phase, and gate — because a shattered centered
+/// circle leaves NO residual for the race to seed from, so the seed IS the
+/// hypothesis and [`born_circle_atom`] installs it directly for the REML e-gate
+/// to adjudicate.
+#[derive(Clone, Debug)]
+pub enum BirthSeed {
+    /// A whitened residual-factor direction lifted to a flat `(m, p)` decoder;
+    /// born via the topology race (the legacy birth path).
+    ResidualFactor(Array2<f64>),
+    /// A curl circle seed: periodic-harmonic `(m, p)` decoder (`m` odd, `>= 3`),
+    /// per-row phase coordinate `(n, 1)`, and per-row own-presence gate (`n`).
+    Circle {
+        decoder: Array2<f64>,
+        phase_coords: Array2<f64>,
+        gate: Vec<f64>,
+    },
+}
+
+/// Apply one [`StructureMove`] with a heterogeneous birth-seed list — the curl
+/// extension of [`apply_structure_move`]. Non-birth moves are identical; a
+/// `Birth { candidate }` dispatches on the indexed [`BirthSeed`]: a
+/// `ResidualFactor` rides the topology race ([`born_atom`]), a `Circle` is
+/// installed directly as a periodic atom ([`born_circle_atom`]). The legacy
+/// [`apply_structure_move`] is exactly this with an all-`ResidualFactor` seed
+/// list, so bitwise legacy behavior is preserved when no curl seed is present.
+pub fn apply_structure_move_seeded(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    mv: &StructureMove,
+    birth_seeds: &[BirthSeed],
+) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
+    match mv {
+        StructureMove::Birth { candidate } => {
+            let seed = birth_seeds.get(*candidate).ok_or_else(|| {
+                format!(
+                    "apply_structure_move_seeded: birth candidate {candidate} out of range \
+                     ({} birth seeds)",
+                    birth_seeds.len()
+                )
+            })?;
+            match seed {
+                BirthSeed::ResidualFactor(decoder) => born_atom(term, rho, decoder.view()),
+                BirthSeed::Circle {
+                    decoder,
+                    phase_coords,
+                    gate,
+                } => born_circle_atom(term, rho, decoder.clone(), phase_coords.clone(), gate.clone()),
+            }
+        }
+        // Death / Fission / Fusion are seed-independent — delegate to the legacy
+        // apply with an empty decoder list (never indexed for these).
+        other => apply_structure_move(term, rho, other, &[]),
+    }
+}
+
 /// A strongly-negative logit that drives a softmax / gate routing channel to ~0
 /// mass without producing a non-finite value the assignment validator rejects.
 const DEMOTE_LOGIT: f64 = -40.0;
@@ -941,7 +1000,11 @@ fn duplicate_atom(
     coords.push(term.assignment.coords[parent].clone());
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let child = SaeManifoldTerm::new(atoms, assignment)?;
+    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
+    // Score the child on the parent's evidence-charge convention (see the note in
+    // `born_circle_atom`): `SaeManifoldTerm::new` resets `rank_charge_evidence`,
+    // and a birth/split gate must compare like-for-like Laplace complexity.
+    child.set_rank_charge_evidence(term.rank_charge_evidence());
 
     let mut child_rho = rho.clone();
     if parent < child_rho.log_ard.len() {
@@ -1810,7 +1873,11 @@ fn born_atom(
     coords.push(born_coord_block);
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let child = SaeManifoldTerm::new(atoms, assignment)?;
+    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
+    // Score the child on the parent's evidence-charge convention (see the note in
+    // `born_circle_atom`): `SaeManifoldTerm::new` resets `rank_charge_evidence`,
+    // and a birth gate must compare like-for-like Laplace complexity.
+    child.set_rank_charge_evidence(term.rank_charge_evidence());
 
     let mut child_rho = rho.clone();
     // The born atom inherits the template atom's ARD block shape (disabled if
@@ -1853,12 +1920,27 @@ pub(crate) fn born_circle_atom(
     if term.atoms.is_empty() {
         return Err("born_circle_atom: cannot birth from an empty dictionary".to_string());
     }
-    let m = term.atoms[0].basis_size();
+    // The periodic-harmonic width `m` comes from the SEED decoder's own row
+    // count, not the template atom's basis size (#2101 tied it to `atoms[0]`,
+    // which forced every born circle to match atom-0's width). Curl seeds
+    // (`crate::manifold::curl`) carry their own odd harmonic width, and existing
+    // circle-seed callers pass a decoder already shaped to `atoms[0]` (odd, since
+    // `PeriodicHarmonicEvaluator::new` demands it), so deriving `m` here is
+    // backward-compatible AND lets curl birth a circle into a dictionary whose
+    // template atom is linear/even-width. A born atom carries its own
+    // `basis_values`, so a heterogeneous width is well-formed.
+    let m = harmonic_decoder.nrows();
     let p = term.output_dim();
-    if harmonic_decoder.dim() != (m, p) {
+    if m % 2 != 1 || m < 3 {
         return Err(format!(
-            "born_circle_atom: harmonic decoder must be ({m}, {p}); got {:?}",
-            harmonic_decoder.dim()
+            "born_circle_atom: harmonic decoder must have odd height >= 3 (constant + \
+             >= 1 sin/cos harmonic pair); got height {m}"
+        ));
+    }
+    if harmonic_decoder.ncols() != p {
+        return Err(format!(
+            "born_circle_atom: harmonic decoder must have {p} columns (output dim); got {}",
+            harmonic_decoder.ncols()
         ));
     }
     let n = term.assignment.logits.nrows();
@@ -1932,7 +2014,16 @@ pub(crate) fn born_circle_atom(
     coords.push(born_coord_block);
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let child = SaeManifoldTerm::new(atoms, assignment)?;
+    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
+    // Propagate the evidence-charge convention from the parent. `SaeManifoldTerm::
+    // new` resets `rank_charge_evidence` to its default (false); if the incumbent
+    // dictionary is scored on the occupancy-aware BIC rank charge, the born
+    // candidate MUST be scored the same way, or the birth gate compares two REML
+    // values on different Laplace-complexity scales (the raw per-row coordinate
+    // log-det ½log|H_tt| grows ≈ O(n) per atom with no occam offset, so a
+    // htt-charged candidate looks arbitrarily worse than a rank-charged incumbent
+    // and every good birth is rejected at large n).
+    child.set_rank_charge_evidence(term.rank_charge_evidence());
 
     let mut child_rho = rho.clone();
     let inherited = child_rho
@@ -2078,6 +2169,61 @@ pub struct RoundDriverConfig {
     pub max_rounds: usize,
     /// Per-round harvest breadth (max fusions / fissions / births).
     pub harvest_params: HarvestParams,
+    /// Curl/flatten structure moves (INTEGRATION_PLAN Phase 4). `None` (the
+    /// default) disables them entirely — the driver behaves bit-for-bit as
+    /// before (`moves.curl = off`). `Some(cfg)` mines flat-pair→circle
+    /// promotions (and the inverse circle→flat demotions) each round and submits
+    /// their seeds into the SAME birth/race plumbing the residual-factor births
+    /// use, so the REML e-gate remains the only judge.
+    pub curl: Option<CurlConfig>,
+}
+
+/// Configuration for the curl/flatten proposer (INTEGRATION_PLAN Phase 4). All
+/// derived-not-tuned in spirit; the fields are the pipeline's structural knobs,
+/// not statistical dials (the verdict's σ screens and the RD crossover are fixed
+/// in [`crate::manifold::curl`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CurlConfig {
+    /// Decoder-cosine ceiling for two linear atoms to be treated as the
+    /// rectified halves (`±d`) of one signed direction (antipodal coalescing).
+    /// `-0.85` ⇒ at least ~148° apart.
+    pub coalesce_cos_threshold: f64,
+    /// Gate-overlap (Jaccard) ceiling for a coalescing pair to count as
+    /// near-disjoint rectified halves.
+    pub coalesce_max_overlap: f64,
+    /// Minimum co-firing rows (over the subsample) for a signed-direction pair
+    /// to be a curl candidate plane.
+    pub min_cooccurrence: usize,
+    /// Row-subsample cap for co-occurrence counting + the joint-law projection.
+    pub subsample_rows: usize,
+    /// Number of `(sin, cos)` harmonics on the seeded circle decoder (width
+    /// `2·harmonics + 1`; higher harmonics start at zero for the refit to
+    /// sharpen). `>= 1`.
+    pub harmonics: usize,
+    /// Maximum curl births proposed per round (matched to the ISA birth budget
+    /// class).
+    pub max_curls: usize,
+    /// Whether to run the inverse flatten audit on fitted circle atoms each
+    /// round.
+    pub flatten: bool,
+    /// Rounds an atom-set is silenced after a curl or flatten fires on it, so
+    /// `curl → flatten → curl` cannot oscillate (risk #5 hysteresis guard).
+    pub cooldown_rounds: usize,
+}
+
+impl Default for CurlConfig {
+    fn default() -> Self {
+        Self {
+            coalesce_cos_threshold: -0.85,
+            coalesce_max_overlap: 0.15,
+            min_cooccurrence: 8,
+            subsample_rows: 4096,
+            harmonics: 1,
+            max_curls: 4,
+            flatten: true,
+            cooldown_rounds: 2,
+        }
+    }
 }
 
 /// Drive evidence-guarded structure search around a fitted SAE term until a
@@ -2120,15 +2266,20 @@ pub fn run_structure_search_rounds(
         budget,
         max_rounds,
         harvest_params,
+        curl,
     } = config;
     let split = estimation_eval_split(target, n_shards);
     let mut rounds: Vec<SearchLedger> = Vec::new();
+    // Hysteresis ledger for the curl/flatten pair — persists across rounds so a
+    // just-curled atom-set (or just-flattened one) is silenced for a few rounds
+    // and the two moves cannot chase each other (INTEGRATION_PLAN risk #5).
+    let mut cooldown = crate::manifold::CurlCooldownLedger::new();
 
     for _ in 0..max_rounds {
         // Harvest from the current fitted state. Residuals R = target − fitted.
         let fitted = term.try_fitted()?;
         let residuals = &target.to_owned() - &fitted;
-        let report = harvest_move_proposals(&term, &rho, residuals.view(), &harvest_params)?;
+        let mut report = harvest_move_proposals(&term, &rho, residuals.view(), &harvest_params)?;
 
         // #993 item 3: BANK the within-atom carve binding evidence in the
         // ledger. The carve ran on each `d = 2` product-atom fission candidate
@@ -2144,10 +2295,52 @@ pub fn run_structure_search_rounds(
         // evidence resumes across corpus shards. A `None` p-value (the Wald
         // test degenerated) is skipped — no fabricated evidence.
 
-        // Pre-build the birth-decoder list ONCE per round from the residual
-        // factor (the birth candidates index into it), so the apply-move
-        // closure inside the gate is a pure function of the candidate index.
-        let birth_decoders = build_birth_decoders(&term, residuals.view(), &harvest_params)?;
+        // Pre-build the birth-SEED list ONCE per round: the residual-factor
+        // decoders first (indices `0..r`), then — when curl is enabled — the
+        // race-ready circle seeds appended at `r..`, so the apply-move closure
+        // inside the gate is a pure function of the candidate index. The two
+        // channels share ONE index space via `StructureMove::Birth`.
+        let residual_decoders = build_birth_decoders(&term, residuals.view(), &harvest_params)?;
+        let mut birth_seeds: Vec<BirthSeed> =
+            residual_decoders.into_iter().map(BirthSeed::ResidualFactor).collect();
+
+        // Curl / flatten proposals (INTEGRATION_PLAN Phase 4), gated behind the
+        // driver flag and the per-atom-set cooldown. `curl_atoms` maps a curl
+        // birth's candidate index to its donor atom-set (the cooldown key +
+        // certificate donors); `flatten_atoms` is the set of circle atoms a
+        // flatten demotion targets this round.
+        let mut curl_atoms: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut flatten_atoms: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        if let Some(cfg) = curl {
+            for cand in curl_candidates(&term, residuals.view(), &cfg) {
+                if cooldown.blocked(&cand.members) {
+                    continue;
+                }
+                let candidate = birth_seeds.len();
+                birth_seeds.push(cand.seed);
+                curl_atoms.insert(candidate, cand.members.clone());
+                report
+                    .proposals
+                    .push(proposal(&term, StructureMove::Birth { candidate }, cand.net_evidence));
+            }
+            if cfg.flatten {
+                for atom in flatten_candidates(&term) {
+                    if cooldown.blocked(&[atom]) {
+                        continue;
+                    }
+                    // A degenerate circle is retired through the existing death
+                    // path; the e-gate adjudicates. Trigger is `MAX/4` so a
+                    // flatten sorts among deaths, below terminal collapses.
+                    flatten_atoms.insert(atom);
+                    report.proposals.push(proposal(
+                        &term,
+                        StructureMove::Death { atom },
+                        f64::MAX / 4.0,
+                    ));
+                }
+            }
+        }
 
         if report.proposals.is_empty() || split.shards.is_empty() {
             // Nothing to do this round — record an empty ledger (with the live
@@ -2165,7 +2358,7 @@ pub fn run_structure_search_rounds(
         // predictable plug-in the held-out shards are evaluated against.
         type State = (SaeManifoldTerm, SaeManifoldRho);
         let collapse_events = term.collapse_events().to_vec();
-        let decoders = birth_decoders;
+        let decoders = birth_seeds;
         let estimation_rows = split.estimation_rows.clone();
         let outcome: SearchOutcome<State> = search(
             (term, rho),
@@ -2175,7 +2368,7 @@ pub fn run_structure_search_rounds(
             ledger,
             |state: &State, mv: &StructureMove| {
                 let (cand_term, cand_rho) =
-                    apply_structure_move(&state.0, &state.1, mv, &decoders)?;
+                    apply_structure_move_seeded(&state.0, &state.1, mv, &decoders)?;
                 // Refit the restructured candidate on the estimation rows only.
                 Ok(candidate_fit(cand_term, cand_rho, &estimation_rows))
             },
@@ -2196,6 +2389,33 @@ pub fn run_structure_search_rounds(
                     | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             )
         });
+        // Record the atom-sets any APPLIED curl / flatten move fired on into the
+        // cooldown ledger, then advance one round — so the inverse move cannot
+        // re-fire on the same atom-set next round (hysteresis, risk #5).
+        if let Some(cfg) = curl {
+            use gam_solve::structure_search::MoveVerdict;
+            for rec in &round_ledger.moves {
+                let fired = matches!(
+                    rec.verdict,
+                    MoveVerdict::Accepted { .. } | MoveVerdict::Demoted { .. }
+                );
+                if !fired {
+                    continue;
+                }
+                match &rec.mv {
+                    StructureMove::Birth { candidate } => {
+                        if let Some(members) = curl_atoms.get(candidate) {
+                            cooldown.record(members, cfg.cooldown_rounds);
+                        }
+                    }
+                    StructureMove::Death { atom } if flatten_atoms.contains(atom) => {
+                        cooldown.record(&[*atom], cfg.cooldown_rounds);
+                    }
+                    _ => {}
+                }
+            }
+            cooldown.tick();
+        }
         rounds.push(round_ledger);
 
         if applied {
@@ -2261,6 +2481,378 @@ fn build_birth_decoders(
         decoders.push(decoder);
     }
     Ok(decoders)
+}
+
+// ===========================================================================
+// Curl / flatten proposer driver (INTEGRATION_PLAN Phase 4)
+//
+// The pure statistics live in `crate::manifold::curl`; this is the term-level
+// glue: it reads the fitted linear atoms, coalesces their rectified antipodal
+// halves, generates co-firing candidate planes, projects the joint amplitude
+// law, ranks by net evidence, and emits race-ready `BirthSeed::Circle` seeds
+// (curl) plus `Death` demotions of degenerate circles (flatten). No move is
+// accepted here — every seed is submitted to the same REML e-gate the
+// residual-factor births race through.
+// ===========================================================================
+
+/// One curl birth candidate: the donor (coalesced) atom indices, the race-ready
+/// circle seed, and the pre-screen net evidence that ranks it.
+struct CurlCandidate {
+    /// The linear atoms coalesced into the two signed axes of this circle — the
+    /// cooldown key and the donors the race retires if the circle wins.
+    members: Vec<usize>,
+    /// The race-ready periodic circle seed (`BirthSeed::Circle`).
+    seed: BirthSeed,
+    /// `n_eff·ln(R̂/σ) − Δcharge` — the ranking score (NOT a decision).
+    net_evidence: f64,
+}
+
+/// Whether an atom is a flat/linear parse the curl move coalesces over (a
+/// centered circle is parked on these). Curved bases (periodic, torus, sphere,
+/// cylinder, Poincaré) are excluded — they already carry their own curvature.
+fn is_linear_like(kind: &SaeAtomBasisKind) -> bool {
+    matches!(
+        kind,
+        SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch
+    )
+}
+
+/// A linear atom's ambient reconstruction image `G = Φ · B` (`n × p`, before
+/// routing weight) — the geometric locus it parses.
+fn atom_ambient_image(atom: &SaeManifoldAtom) -> Array2<f64> {
+    atom.basis_values.dot(&atom.decoder_coefficients)
+}
+
+/// Top principal direction of the rows of `img` about `center`, restricted to
+/// `active` rows, by a few power iterations on `Σ (g−c)(g−c)ᵀ` (formed
+/// implicitly, so the cost is `O(active·p)` per iteration, never `p²`).
+fn power_iter_top_dir(img: ArrayView2<'_, f64>, center: &Array1<f64>, active: &[usize]) -> Array1<f64> {
+    let p = img.ncols();
+    let mut v = Array1::<f64>::zeros(p);
+    // Seed from the highest-norm centered active row (a strong signal direction).
+    let mut best_norm = 0.0_f64;
+    for &r in active {
+        let mut nrm = 0.0_f64;
+        for j in 0..p {
+            let d = img[[r, j]] - center[j];
+            nrm += d * d;
+        }
+        if nrm > best_norm {
+            best_norm = nrm;
+            for j in 0..p {
+                v[j] = img[[r, j]] - center[j];
+            }
+        }
+    }
+    let vn = v.dot(&v).sqrt();
+    if vn <= 0.0 {
+        return v;
+    }
+    v.mapv_inplace(|x| x / vn);
+    for _ in 0..5 {
+        // w = C v = Σ (g−c) ((g−c)·v)
+        let mut w = Array1::<f64>::zeros(p);
+        for &r in active {
+            let mut dot = 0.0_f64;
+            for j in 0..p {
+                dot += (img[[r, j]] - center[j]) * v[j];
+            }
+            for j in 0..p {
+                w[j] += (img[[r, j]] - center[j]) * dot;
+            }
+        }
+        let wn = w.dot(&w).sqrt();
+        if wn <= 0.0 {
+            break;
+        }
+        w.mapv_inplace(|x| x / wn);
+        v = w;
+    }
+    v
+}
+
+/// Assemble the fitted linear atoms' `(atom index, unit direction, active mask,
+/// ambient image)` — the raw material coalescing and candidate generation read.
+fn linear_atom_frames(
+    term: &SaeManifoldTerm,
+) -> Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)> {
+    let assignments = term.assignment.assignments();
+    let n = assignments.nrows();
+    let k = assignments.ncols();
+    let floor = if k == 0 {
+        0.0
+    } else {
+        ACTIVE_SUPPORT_REL_FLOOR / k as f64
+    };
+    let mut out = Vec::new();
+    for (a, atom) in term.atoms.iter().enumerate() {
+        if !is_linear_like(&atom.basis_kind) {
+            continue;
+        }
+        let active_mask: Vec<bool> = (0..n).map(|r| assignments[[r, a]] > floor).collect();
+        let active_idx: Vec<usize> = (0..n).filter(|&r| active_mask[r]).collect();
+        if active_idx.len() < 2 {
+            continue;
+        }
+        let img = atom_ambient_image(atom);
+        if img.ncols() == 0 {
+            continue;
+        }
+        let p = img.ncols();
+        let mut center = Array1::<f64>::zeros(p);
+        for &r in &active_idx {
+            for j in 0..p {
+                center[j] += img[[r, j]];
+            }
+        }
+        center.mapv_inplace(|x| x / active_idx.len() as f64);
+        let dir = power_iter_top_dir(img.view(), &center, &active_idx);
+        if dir.dot(&dir).sqrt() <= 0.0 {
+            continue;
+        }
+        out.push((a, dir, active_mask, img));
+    }
+    out
+}
+
+/// Mine flat-pair → circle promotion candidates from the fitted dictionary
+/// (INTEGRATION_PLAN Phase 4 items 1–4). Coalesces rectified antipodal halves,
+/// generates co-firing candidate planes over a row subsample, projects the joint
+/// amplitude law, runs the geodict verdict, and returns the RECOMMENDED
+/// candidates ranked by net evidence, deduplicated so no two circles claim the
+/// same donor atom. Deterministic in `(term, residuals, cfg)` so the harvest and
+/// the seed-build agree on candidate order/indices.
+fn curl_candidates(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+    cfg: &CurlConfig,
+) -> Vec<CurlCandidate> {
+    let frames = linear_atom_frames(term);
+    if frames.len() < 2 {
+        return Vec::new();
+    }
+    let n = term.assignment.logits.nrows();
+    let p = term.output_dim();
+
+    // Ambient noise scale for the RD screen: RMS reconstruction residual, floored
+    // off zero (a perfectly-shattered circle leaves ~no residual, which is
+    // exactly why it was invisible — the floor keeps ln(R̂/σ) finite and large).
+    let mut sse = 0.0_f64;
+    let mut cnt = 0usize;
+    for r in 0..residuals.nrows() {
+        for j in 0..residuals.ncols() {
+            sse += residuals[[r, j]] * residuals[[r, j]];
+            cnt += 1;
+        }
+    }
+    let sigma = if cnt > 0 {
+        (sse / cnt as f64).sqrt().max(1e-9)
+    } else {
+        1e-9
+    };
+
+    // Antipodal coalescing over the linear atoms' directions + gates.
+    let dirs: Vec<ArrayView1<f64>> = frames.iter().map(|(_, d, _, _)| d.view()).collect();
+    let actives: Vec<Vec<bool>> = frames.iter().map(|(_, _, m, _)| m.clone()).collect();
+    let ids: Vec<usize> = frames.iter().map(|(a, _, _, _)| *a).collect();
+    let signed = crate::manifold::coalesce_antipodal(
+        &dirs,
+        &actives,
+        &ids,
+        cfg.coalesce_cos_threshold,
+        cfg.coalesce_max_overlap,
+    );
+    if signed.len() < 2 {
+        return Vec::new();
+    }
+
+    // A per-atom → frame index map so a signed direction can gather its members'
+    // ambient images for the plane projection.
+    let frame_of: std::collections::HashMap<usize, usize> =
+        ids.iter().enumerate().map(|(i, a)| (*a, i)).collect();
+    let signed_active: Vec<Vec<bool>> = signed.iter().map(|s| s.active.clone()).collect();
+    // Row subsample for co-occurrence counting (never O(K²)·O(n)).
+    let rows: Vec<usize> = if n <= cfg.subsample_rows {
+        (0..n).collect()
+    } else {
+        let stride = n / cfg.subsample_rows;
+        (0..n).step_by(stride.max(1)).collect()
+    };
+    let pairs = crate::manifold::cooccurrence_pairs(&signed_active, &rows, cfg.min_cooccurrence);
+
+    let mut cands: Vec<CurlCandidate> = Vec::new();
+    for (si, sj, _count) in pairs {
+        let di = &signed[si];
+        let dj = &signed[sj];
+        // Co-firing rows (both signed axes active), capped at the subsample.
+        let mut co_fire: Vec<usize> = (0..n)
+            .filter(|&r| di.active.get(r).copied().unwrap_or(false)
+                && dj.active.get(r).copied().unwrap_or(false))
+            .collect();
+        if co_fire.len() < cfg.min_cooccurrence.max(2) {
+            continue;
+        }
+        if co_fire.len() > cfg.subsample_rows {
+            let stride = (co_fire.len() / cfg.subsample_rows).max(1);
+            co_fire = co_fire.iter().copied().step_by(stride).collect();
+        }
+        // The plane image is the SUM of the two signed axes' member atom images —
+        // isolating the two directions' joint parse from the rest of the fit.
+        let members: Vec<usize> = di.members.iter().chain(dj.members.iter()).copied().collect();
+        let mut x = Array2::<f64>::zeros((co_fire.len(), p));
+        for (row_out, &r) in co_fire.iter().enumerate() {
+            for &atom in &members {
+                if let Some(&fi) = frame_of.get(&atom) {
+                    let img = &frames[fi].3;
+                    for j in 0..p {
+                        x[[row_out, j]] += img[[r, j]];
+                    }
+                }
+            }
+        }
+        let mut center = Array1::<f64>::zeros(p);
+        for row_out in 0..co_fire.len() {
+            for j in 0..p {
+                center[j] += x[[row_out, j]];
+            }
+        }
+        center.mapv_inplace(|v| v / co_fire.len() as f64);
+
+        let (alpha, beta, e1, e2) = match crate::manifold::orthonormal_pair_coords(
+            x.view(),
+            di.dir.view(),
+            dj.dir.view(),
+            center.view(),
+        ) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let n_eff = co_fire.len() as f64;
+        // A mild MDL charge (circle basis rows vs the two linear directions); the
+        // ranking is dominated by the gain, and the REML gate is the real judge.
+        let m_circle = (2 * cfg.harmonics + 1) as f64;
+        let delta_charge = 0.5 * m_circle * n_eff.max(2.0).ln();
+        let verdict = match crate::manifold::curl_verdict(
+            alpha.view(),
+            beta.view(),
+            sigma,
+            n_eff,
+            delta_charge,
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !verdict.recommend_curl {
+            continue;
+        }
+        // Build the race-ready seed from the orthonormal frame + parse.
+        let seed_circle = match crate::manifold::curl_seed(
+            e1.view(),
+            e2.view(),
+            alpha.view(),
+            beta.view(),
+            cfg.harmonics,
+            center.view(),
+        ) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Lift the co-firing phases + own-presence gate to the full row set.
+        let mut phase_coords = Array2::<f64>::zeros((n, 1));
+        let mut gate = vec![f64::NEG_INFINITY; n];
+        let own = verdict.gain_nats_per_row.max(0.5);
+        for (idx, &r) in co_fire.iter().enumerate() {
+            phase_coords[[r, 0]] = seed_circle.theta_turns[idx];
+            gate[r] = own;
+        }
+        cands.push(CurlCandidate {
+            members,
+            seed: BirthSeed::Circle {
+                decoder: seed_circle.decoder,
+                phase_coords,
+                gate,
+            },
+            net_evidence: verdict.net_evidence_nats,
+        });
+    }
+
+    // Rank by net evidence; keep the top budget, deduplicated so two circles
+    // never claim the same donor atom in one round.
+    cands.sort_by(|a, b| b.net_evidence.total_cmp(&a.net_evidence));
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for c in cands {
+        if c.members.iter().any(|a| claimed.contains(a)) {
+            continue;
+        }
+        for a in &c.members {
+            claimed.insert(*a);
+        }
+        out.push(c);
+        if out.len() >= cfg.max_curls {
+            break;
+        }
+    }
+    out
+}
+
+/// Audit fitted circle atoms for degeneration (INTEGRATION_PLAN Phase 4.5). A
+/// circle whose radial law has relaxed to Gaussian fill (κ ≈ 2) or collapsed to
+/// a diameter (second resultant ≈ 1) is no longer carrying rotational structure;
+/// return those atoms for the existing death/demotion path to retire. The
+/// e-gate still owns the decision.
+fn flatten_candidates(term: &SaeManifoldTerm) -> Vec<usize> {
+    let assignments = term.assignment.assignments();
+    let n = assignments.nrows();
+    let k = assignments.ncols();
+    let floor = if k == 0 {
+        0.0
+    } else {
+        ACTIVE_SUPPORT_REL_FLOOR / k as f64
+    };
+    let mut out = Vec::new();
+    for (a, atom) in term.atoms.iter().enumerate() {
+        if !matches!(atom.basis_kind, SaeAtomBasisKind::Periodic) || atom.latent_dim != 1 {
+            continue;
+        }
+        let active_idx: Vec<usize> = (0..n).filter(|&r| assignments[[r, a]] > floor).collect();
+        if active_idx.len() < 8 {
+            continue;
+        }
+        // Per-row polar law: angle from the atom's phase coordinate, radius from
+        // the centered ambient image norm in the atom's own image plane.
+        let img = atom_ambient_image(atom);
+        let p = img.ncols();
+        let mut center = Array1::<f64>::zeros(p);
+        for &r in &active_idx {
+            for j in 0..p {
+                center[j] += img[[r, j]];
+            }
+        }
+        center.mapv_inplace(|x| x / active_idx.len() as f64);
+        let coords = term.assignment.coords[a].as_matrix();
+        if coords.ncols() == 0 {
+            continue;
+        }
+        let mut radii = Array1::<f64>::zeros(active_idx.len());
+        let mut angles = Array1::<f64>::zeros(active_idx.len());
+        for (i, &r) in active_idx.iter().enumerate() {
+            let mut rr = 0.0_f64;
+            for j in 0..p {
+                let d = img[[r, j]] - center[j];
+                rr += d * d;
+            }
+            radii[i] = rr.sqrt();
+            // Phase coordinate is in turns; angle in radians.
+            angles[i] = std::f64::consts::TAU * coords[[r, 0]];
+        }
+        if let Ok(v) = crate::manifold::flatten_verdict(radii.view(), angles.view()) {
+            if v.recommend_flatten {
+                out.push(a);
+            }
+        }
+    }
+    out
 }
 
 /// Per-row Gaussian reconstruction log-likelihood of a shard under the current
@@ -3299,6 +3891,7 @@ mod tests {
                 budget,
                 max_rounds: 2,
                 harvest_params: params,
+                curl: None,
             };
             // Deterministic no-op fit: the scripted gate sees the unrefit
             // candidate (the engine's determinism is what this asserts, not the
@@ -3372,6 +3965,7 @@ mod tests {
                 max_fissions: 2,
                 max_births: 2,
             },
+            curl: None,
         };
         let full_iters = 24usize;
         let run = |scoring_inner_max_iter: usize| {
@@ -3907,5 +4501,316 @@ mod tests {
                 "row 0 col {c} must not be NaN after the fold"
             );
         }
+    }
+
+    // =======================================================================
+    // Curl / flatten Phase-4 killer demo (INTEGRATION_PLAN §8 definition of
+    // done): plant a centered circle, let a NONNEGATIVE-gate linear dictionary
+    // shatter it into four rectified half-atoms (±u, ±v), and show the curl
+    // proposer coalesces them, recovers the circle, and would win on the
+    // evidence the race reads — while a Gaussian-fill plane is NOT curled, a
+    // diameter-collapsed circle flattens, and a healthy ring is left alone.
+    // =======================================================================
+
+    /// A straight-line (Linear) atom whose ambient image is `t ↦ t · dir` over
+    /// the supplied per-row coordinate — `Φ = [1, t]`, decoder rows
+    /// `[0; dir]`. This is the rectified half-atom a nonnegative gate parks on
+    /// one lobe of a centered signed direction.
+    fn linear_line_atom(name: &str, coord: &Array1<f64>, dir: &Array1<f64>) -> SaeManifoldAtom {
+        let n = coord.len();
+        let p = dir.len();
+        let mut phi = Array2::<f64>::zeros((n, 2));
+        let mut jet = ndarray::Array3::<f64>::zeros((n, 2, 1));
+        for r in 0..n {
+            phi[[r, 0]] = 1.0;
+            phi[[r, 1]] = coord[r];
+            jet[[r, 0, 0]] = 0.0;
+            jet[[r, 1, 0]] = 1.0;
+        }
+        let mut decoder = Array2::<f64>::zeros((2, p));
+        for j in 0..p {
+            decoder[[1, j]] = dir[j];
+        }
+        SaeManifoldAtom::new(
+            name.to_string(),
+            SaeAtomBasisKind::Linear,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(2),
+        )
+        .unwrap()
+    }
+
+    /// Build a dictionary of four rectified half-atoms `±u, ±v` parking a
+    /// centered feature in the `(e0, e1)` plane of `R⁴`. When `gaussian` the
+    /// parked feature is an isotropic 2-D Gaussian (κ ≈ 2, no curved gain);
+    /// otherwise a constant-radius circle (κ ≈ 1). Each half is gated on the
+    /// rows where its lobe is positive, so the ± gates are disjoint (the
+    /// coalescer's precondition) and the two signed axes co-fire on every row.
+    fn shattered_plane_term(gaussian: bool) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = 600usize;
+        let radius = 3.0_f64;
+        let u = Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]);
+        let v = Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0]);
+        let neg_u = u.mapv(|x| -x);
+        let neg_v = v.mapv(|x| -x);
+        let mut s = 0xC0FFEE_u64;
+        let lcg = |st: &mut u64| -> f64 {
+            *st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*st >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        // Per-row (x, y) in-plane coordinates the four halves rectify.
+        let mut xs = Array1::<f64>::zeros(n);
+        let mut ys = Array1::<f64>::zeros(n);
+        for r in 0..n {
+            if gaussian {
+                // Box–Muller isotropic Gaussian.
+                let u1 = lcg(&mut s).max(1e-12);
+                let u2 = lcg(&mut s);
+                let g0 = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let g1 = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).sin();
+                xs[r] = radius * g0;
+                ys[r] = radius * g1;
+            } else {
+                let th = std::f64::consts::TAU * (r as f64 + 0.5) / n as f64;
+                xs[r] = radius * th.cos();
+                ys[r] = radius * th.sin();
+            }
+        }
+        // Rectified coordinates per half.
+        let cu: Array1<f64> = xs.mapv(|x| x.max(0.0));
+        let cnu: Array1<f64> = xs.mapv(|x| (-x).max(0.0));
+        let cv: Array1<f64> = ys.mapv(|y| y.max(0.0));
+        let cnv: Array1<f64> = ys.mapv(|y| (-y).max(0.0));
+        let atoms = vec![
+            linear_line_atom("half_+u", &cu, &u),
+            linear_line_atom("half_-u", &cnu, &neg_u),
+            linear_line_atom("half_+v", &cv, &v),
+            linear_line_atom("half_-v", &cnv, &neg_v),
+        ];
+        let coord_blocks = vec![
+            cu.clone().insert_axis(ndarray::Axis(1)),
+            cnu.clone().insert_axis(ndarray::Axis(1)),
+            cv.clone().insert_axis(ndarray::Axis(1)),
+            cnv.clone().insert_axis(ndarray::Axis(1)),
+        ];
+        let k = atoms.len();
+        // Gate each half on the rows where its lobe is active (coordinate > 0).
+        let lobes = [&cu, &cnu, &cv, &cnv];
+        let mut logits = Array2::<f64>::zeros((n, k));
+        for r in 0..n {
+            for (a, lobe) in lobes.iter().enumerate() {
+                logits[[r, a]] = if lobe[r] > 1e-9 { ON } else { OFF };
+            }
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coord_blocks,
+            vec![LatentManifold::Euclidean; k],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        (term, rho)
+    }
+
+    /// KILLER DEMO — the curl proposer recovers a centered circle a linear
+    /// dictionary shattered into four rectified halves: it coalesces the ±
+    /// pairs, reads κ ≈ 1 off the joint amplitude law, recommends the
+    /// promotion, and the seed born through the existing plumbing reconstructs
+    /// the planted ring.
+    #[test]
+    fn curl_recovers_shattered_centered_circle() {
+        let (term, rho) = shattered_plane_term(false);
+        let residuals = residuals_of(&term);
+        let cfg = CurlConfig::default();
+        let cands = curl_candidates(&term, residuals.view(), &cfg);
+        assert!(
+            !cands.is_empty(),
+            "curl must recover the shattered circle (got no candidate)"
+        );
+        let cand = &cands[0];
+        // All four rectified halves coalesced into the two signed axes.
+        let mut members = cand.members.clone();
+        members.sort_unstable();
+        members.dedup();
+        assert_eq!(
+            members,
+            vec![0, 1, 2, 3],
+            "the circle's donor set is all four rectified halves"
+        );
+        assert!(cand.net_evidence > 0.0, "net evidence must favour the circle");
+
+        // Born through the existing birth plumbing → a Periodic circle atom.
+        let mv = StructureMove::Birth { candidate: 0 };
+        let seeds = vec![cand.seed.clone()];
+        let (born, _born_rho) = apply_structure_move_seeded(&term, &rho, &mv, &seeds).unwrap();
+        let circle = born.k_atoms() - 1;
+        assert_eq!(
+            born.atoms[circle].basis_kind,
+            SaeAtomBasisKind::Periodic,
+            "curl births a Periodic (circle) atom"
+        );
+        // The born circle's own reconstruction traces the planted ring: every
+        // active row sits at radius ≈ R about the centre.
+        let img = atom_ambient_image(&born.atoms[circle]);
+        let ncols = img.ncols();
+        let mut center = Array1::<f64>::zeros(ncols);
+        for r in 0..img.nrows() {
+            for j in 0..ncols {
+                center[j] += img[[r, j]];
+            }
+        }
+        center.mapv_inplace(|x| x / img.nrows() as f64);
+        let mut min_r = f64::INFINITY;
+        let mut max_r = 0.0_f64;
+        for r in 0..img.nrows() {
+            let mut rr = 0.0_f64;
+            for j in 0..ncols {
+                let d = img[[r, j]] - center[j];
+                rr += d * d;
+            }
+            let rr = rr.sqrt();
+            min_r = min_r.min(rr);
+            max_r = max_r.max(rr);
+        }
+        // A ring: radius nearly constant across rows (thickness ≪ radius).
+        assert!(
+            max_r > 0.0 && (max_r - min_r) / max_r < 0.1,
+            "born circle must trace a constant-radius ring (min={min_r:.3}, max={max_r:.3})"
+        );
+    }
+
+    /// A Gaussian-fill plane (κ ≈ 2, the zero-gain point of the coding law) is
+    /// NOT curled — the radius law is exactly the flat-parse null.
+    #[test]
+    fn curl_rejects_gaussian_fill_plane() {
+        let (term, _rho) = shattered_plane_term(true);
+        let residuals = residuals_of(&term);
+        let cfg = CurlConfig::default();
+        let cands = curl_candidates(&term, residuals.view(), &cfg);
+        assert!(
+            cands.is_empty(),
+            "a Gaussian-fill plane must not be curled (κ ≈ 2)"
+        );
+    }
+
+    /// Build a single-Periodic-atom term whose phase coordinate takes the given
+    /// per-row turns; the fundamental decoder places the ring in the `(e0, e1)`
+    /// plane at radius `R`.
+    fn single_circle_term(phase_turns: &Array1<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = phase_turns.len();
+        let p = 4usize;
+        let radius = 3.0_f64;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = phase_turns.clone().insert_axis(ndarray::Axis(1));
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut decoder = Array2::<f64>::zeros((3, p));
+        decoder[[2, 0]] = radius; // cos₁ · e0
+        decoder[[1, 1]] = radius; // sin₁ · e1
+        let atom = SaeManifoldAtom::new(
+            "circle".to_string(),
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_second_jet(evaluator.clone());
+        let logits = Array2::<f64>::from_elem((n, 1), ON);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        (term, rho)
+    }
+
+    /// A circle whose angular mass has collapsed to a diameter (phases at 0 and
+    /// ½ turn only) is flagged for flattening; a healthy full-coverage ring is
+    /// not.
+    #[test]
+    fn flatten_flags_diameter_and_spares_healthy_ring() {
+        let n = 400usize;
+        // Diameter: phases alternate 0 / ½ turn → angles {0, π}.
+        let diameter_phases =
+            Array1::from_shape_fn(n, |r| if r % 2 == 0 { 0.0 } else { 0.5 });
+        let (diam_term, _) = single_circle_term(&diameter_phases);
+        let flagged = flatten_candidates(&diam_term);
+        assert_eq!(flagged, vec![0], "a diameter-collapsed circle must flatten");
+
+        // Healthy ring: full angular coverage.
+        let ring_phases = Array1::from_shape_fn(n, |r| r as f64 / n as f64);
+        let (ring_term, _) = single_circle_term(&ring_phases);
+        let flagged = flatten_candidates(&ring_term);
+        assert!(
+            flagged.is_empty(),
+            "a healthy full-coverage ring must NOT be flattened"
+        );
+    }
+
+    /// End-to-end through the round driver: with curl ON the shattered circle
+    /// yields extra Birth proposals into the SAME e-gate the residual births
+    /// race through; with curl OFF (the default) the driver is unchanged. This
+    /// is the flag-gated wiring proof (the REML gate remains the judge; certed
+    /// acceptance of the win additionally rests on the Phase-1 charge ledger).
+    #[test]
+    fn driver_curl_flag_injects_circle_births() {
+        let budget = MoveBudget {
+            max_moves: 4,
+            alpha: 0.05,
+        };
+        // Only curl births — no residual/fusion/fission channels — so the count
+        // difference isolates the curl injection.
+        let harvest_params = HarvestParams {
+            max_fusions: 0,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let count_births = |curl: Option<CurlConfig>| -> usize {
+            let (term, rho) = shattered_plane_term(false);
+            let mut ledger = StructureLedger::new();
+            let config = RoundDriverConfig {
+                n_shards: 3,
+                budget,
+                max_rounds: 1,
+                harvest_params,
+                curl,
+            };
+            let result = run_structure_search_rounds(
+                term,
+                rho,
+                Array2::<f64>::zeros((600, 4)).view(),
+                config,
+                &mut ledger,
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
+            )
+            .unwrap();
+            result
+                .rounds
+                .iter()
+                .flat_map(|r| r.moves.iter())
+                .filter(|m| matches!(m.mv, StructureMove::Birth { .. }))
+                .count()
+        };
+        let off = count_births(None);
+        let on = count_births(Some(CurlConfig::default()));
+        assert_eq!(off, 0, "curl OFF (default) must inject no births");
+        assert!(
+            on >= 1,
+            "curl ON must inject at least one circle Birth into the race (got {on})"
+        );
     }
 }

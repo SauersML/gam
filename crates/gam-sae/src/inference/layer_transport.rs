@@ -1549,6 +1549,11 @@ pub struct TransportLadderReport {
     /// `h_{l→l+2}` with the composition test against the composed adjacent
     /// pair merged in.
     pub two_hop: Vec<LayerTransportReport>,
+    /// O(2) classification (winding/phase/defect) of each adjacent map whose
+    /// endpoints are both circle charts — the Fourier-rigidity report
+    /// ([`crate::inference::transport_class::classify_circle_transport_fit`]).
+    /// Non-circle pairs are omitted; empty when no adjacent pair is circle→circle.
+    pub circle_transports: Vec<crate::inference::transport_class::CircleTransportReport>,
 }
 
 /// Fit the whole transport ladder: adjacent maps, two-hop maps, and the
@@ -1629,7 +1634,28 @@ pub fn transport_ladder(
         );
     }
 
-    Ok(TransportLadderReport { adjacent, two_hop })
+    // O(2) Fourier-rigidity classification of each adjacent circle→circle map,
+    // grid-sampled from the fitted angle map. Additive report; no fitting-path
+    // effect.
+    let mut circle_transports = Vec::new();
+    for k in 0..depth - 1 {
+        if let Some(report) = crate::inference::transport_class::classify_circle_transport_fit(
+            &adjacent_fits[k],
+            topologies[k],
+            topologies[k + 1],
+            layers[k],
+            layers[k + 1],
+            DEFAULT_COMPOSITION_GRID,
+        ) {
+            circle_transports.push(report);
+        }
+    }
+
+    Ok(TransportLadderReport {
+        adjacent,
+        two_hop,
+        circle_transports,
+    })
 }
 
 #[cfg(test)]

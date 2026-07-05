@@ -41,6 +41,16 @@ impl FrameProjection {
         self.basis_sizes.iter().sum::<usize>() * self.p
     }
 
+    /// Owned per-atom output frames (`U_k`, `p × r_k`), `None` for an unframed
+    /// atom (`U_k = I_p`). Handed to the #974 whitened factored β-Hessian
+    /// operator so it can expand the factored coordinates through each frame.
+    // TODO(#974): drop this allow once the whitened frames_engaged assembly path
+    // calls it unconditionally (temporary guard so a partial checkout compiles).
+    #[allow(dead_code)]
+    pub(crate) fn frames_owned(&self) -> Vec<Option<Array2<f64>>> {
+        self.frames.clone()
+    }
+
     pub(crate) fn border_dim(&self) -> usize {
         self.basis_sizes
             .iter()

@@ -271,3 +271,114 @@ fn wide_p_outer_reml_terminates_k3_heavy_2080() {
     assert_eq!(telemetry.mutating_value_probes, 0);
     assert!(ev.is_finite() && ev > 0.15);
 }
+
+/// gamfit#2138 (fit-robustness half) — the curved (periodic) atom's inner
+/// Newton/arrow-Schur solve must CONVERGE on a small (`n = 35`) fold at high
+/// working rank (`m = 9`, all harmonics genuinely excited, so no rank reduction
+/// collapses the design), across the whole smoothing sweep — including the
+/// over-smoothed tail where the undamped Laplace log-det system is worst
+/// conditioned. Before the robustness work an ill-conditioned small-`n`
+/// high-rank probe `ρ` could grind the inner refinement budget and surface a
+/// `RemlConvergenceError` (the theory experiments had to work around it with a
+/// lower rank + fixed smoothing); the inner joint fit's Armijo line search +
+/// proximal-correction LM ridge escalation keeps every step a descent step, so
+/// the fit reaches a finite, materially-positive-EV basin at every ρ instead of
+/// diverging. Each fixed-ρ evaluation must return `Ok` with a finite REML cost
+/// and (for the feasible low-to-mid smoothing range) a materially positive EV.
+#[test]
+fn small_fold_high_rank_circle_inner_solve_converges_2138() {
+    let n = 35usize;
+    let p = 12usize;
+    let harmonics = 4usize;
+    let m = 1 + 2 * harmonics;
+    let mut frames = Array2::<f64>::zeros((2 * harmonics, p));
+    for h in 0..2 * harmonics {
+        for j in 0..p {
+            frames[[h, j]] = deterministic_circle_noise(h, j);
+        }
+    }
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let t = row as f64 / n as f64;
+        for hh in 0..harmonics {
+            let ang = std::f64::consts::TAU * (hh as f64 + 1.0) * t;
+            let (c, s) = (ang.cos(), ang.sin());
+            for j in 0..p {
+                z[[row, j]] += c * frames[[2 * hh, j]] + s * frames[[2 * hh + 1, j]];
+            }
+        }
+    }
+    for j in 0..p {
+        let mean: f64 = (0..n).map(|r| z[[r, j]]).sum::<f64>() / n as f64;
+        let var: f64 = (0..n).map(|r| (z[[r, j]] - mean).powi(2)).sum::<f64>() / n as f64;
+        let sd = var.sqrt().max(1.0e-12);
+        for r in 0..n {
+            z[[r, j]] = (z[[r, j]] - mean) / sd;
+        }
+    }
+    let evaluator: Arc<dyn SaeBasisSecondJet> =
+        Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let seed_coords =
+        sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
+    let coords = seed_coords.slice(s![0, .., 0..1]).to_owned();
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+    let mut xtx = fast_atb(&phi, &phi);
+    for i in 0..m {
+        xtx[[i, i]] += 1.0e-8;
+    }
+    let xtz = fast_atb(&phi, &z);
+    let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
+    let atom = SaeManifoldAtom::new(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(m),
+    )
+    .unwrap()
+    .with_basis_evaluator(evaluator.clone());
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::from_elem((n, 1), 6.0),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::ibp_map(1.0, 1.0, false),
+    )
+    .unwrap();
+    let base = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    // The whole smoothing sweep, from flexible (-8) through the over-smoothed tail
+    // (+8) where the undamped Laplace log-det is worst conditioned.
+    for &smooth in &[-8.0_f64, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0, 8.0] {
+        let mut t = base.clone();
+        let r = SaeManifoldRho::new(0.02_f64.ln(), smooth, vec![array![0.0]]);
+        let evaluated = t
+            .reml_criterion_with_cache(z.view(), &r, None, 60, 0.04, 1.0e-6, 1.0e-6)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "#2138: high-working-rank (m={m}) circle inner solve must converge at a \
+                     small (n={n}) fold, smoothing={smooth}, not diverge into a \
+                     RemlConvergenceError; got: {err}"
+                )
+            });
+        let cost = evaluated.0;
+        let ev = global_ev(z.view(), t.fitted().view());
+        // The design is full working rank (all m columns excited): no rank
+        // reduction should collapse it, so the ill-conditioned regime is real.
+        assert_eq!(
+            t.atoms[0].basis_size(),
+            m,
+            "#2138: the multi-harmonic target must keep the atom at full working rank m={m}",
+        );
+        assert!(
+            cost.is_finite(),
+            "#2138: inner solve returned a non-finite REML cost at smoothing={smooth}",
+        );
+        assert!(
+            ev.is_finite() && ev > 0.30,
+            "#2138: high-working-rank small-fold circle fit must recover a materially positive \
+             EV at smoothing={smooth} (got {ev:.4}), proving the inner solve reached a real \
+             basin rather than a diverged / collapsed state",
+        );
+    }
+}

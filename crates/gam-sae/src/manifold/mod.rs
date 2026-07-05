@@ -205,7 +205,6 @@ mod stagewise;
 mod streaming_plan;
 mod term;
 mod terracini;
-mod transport_class;
 mod wbic_audit;
 
 #[cfg(test)]
@@ -395,5 +394,4 @@ pub use stagewise::*;
 pub use streaming_plan::*;
 pub use term::*;
 pub use terracini::*;
-pub use transport_class::*;
 pub use wbic_audit::*;

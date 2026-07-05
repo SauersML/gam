@@ -151,6 +151,11 @@ approx = "0.5.1"
 gam-predict = { path = "crates/gam-predict" }
 
 [[bench]]
+name = "stagewise_batched_births"
+path = "bench/cargo_benches/stagewise_batched_births.rs"
+harness = false
+
+[[bench]]
 name = "sparse_dict_router_topk"
 path = "bench/cargo_benches/sparse_dict_router_topk.rs"
 harness = false

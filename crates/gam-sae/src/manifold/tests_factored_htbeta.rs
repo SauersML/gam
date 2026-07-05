@@ -439,6 +439,144 @@ pub(crate) fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
     }
 }
 
+/// #974: with a per-row `WhitenedStructured` metric installed, the frames-engaged
+/// factored assembly must (a) STILL engage frames (border `Σ M_k·r_k`, not the
+/// dense `M_k·p`) — proving the old `&& !whitens_likelihood` gate is gone — and
+/// (b) its whitened Newton solve must equal the full-`B` whitened solve projected
+/// into factored coordinates, so the metric-aware factored β-tier
+/// (`WhitenedFactoredFrameOp` β-Gram + whitened `H_tβ` cross-block) matches the
+/// dense-whitened fit where the frame contains the truth.
+#[test]
+pub(crate) fn whitened_frames_974_native_solve_matches_full_b_then_project() {
+    use gam_problem::RowMetric;
+    let k_atoms = 2usize;
+    let m = 4usize;
+    let p = 24usize;
+    let r = 2usize;
+    let n_obs = 5usize;
+    let mut atoms = Vec::with_capacity(k_atoms);
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let mut frame = Array2::<f64>::zeros((p, r));
+        frame[[atom_idx * r, 0]] = 1.0;
+        frame[[atom_idx * r + 1, 1]] = 1.0;
+        let coords = Array2::from_shape_fn((n_obs, 1), |(row, _)| 0.1 * (row + 1) as f64);
+        let mut phi = Array2::<f64>::zeros((n_obs, m));
+        let mut jet = Array3::<f64>::zeros((n_obs, m, 1));
+        for row in 0..n_obs {
+            for basis_col in 0..m {
+                let x = (row + 1) as f64 * (basis_col + 1) as f64;
+                phi[[row, basis_col]] = 0.03 * x + if row % m == basis_col { 1.0 } else { 0.0 };
+                jet[[row, basis_col, 0]] = 0.02 * x;
+            }
+        }
+        let c = Array2::from_shape_fn((m, r), |(basis_col, frame_col)| {
+            0.2 + 0.04 * (basis_col + 2 * frame_col + atom_idx) as f64
+        });
+        let decoder = fast_abt(&c, &frame);
+        let mut atom = SaeManifoldAtom::new(
+            "whitened_frames_974",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(m),
+        )
+        .unwrap();
+        atom.maybe_activate_decoder_frame()
+            .expect("frame activation")
+            .expect("rank-2 atom should activate a frame");
+        atoms.push(atom);
+        coord_blocks.push(coords);
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::from_shape_fn((n_obs, k_atoms), |(row, atom)| {
+            0.15 * (row + 1) as f64 - 0.07 * atom as f64
+        }),
+        coord_blocks,
+        vec![LatentManifold::Euclidean, LatentManifold::Euclidean],
+        AssignmentMode::softmax(0.9),
+    )
+    .unwrap();
+    let mut factored_term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    assert!(factored_term.frames_active());
+    let border_dim = factored_term.factored_border_dim();
+    assert!(border_dim < factored_term.beta_dim());
+
+    // Per-row anisotropic WhitenedStructured metric M_n = U_n U_nᵀ (rank p),
+    // genuinely non-scalar so the whitening materially changes the Hessian.
+    let u = Array2::<f64>::from_shape_fn((n_obs, p * p), |(row, col)| {
+        let i = col / p;
+        let k = col % p;
+        // A row-dependent near-diagonal factor with off-diagonal coupling.
+        let diag = 1.0 + 0.5 * ((row + i) as f64).sin();
+        let off = if i != k { 0.15 * (((row + 1) * (i + k + 1)) as f64).cos() } else { 0.0 };
+        if i == k { diag } else { off }
+    });
+    let metric = RowMetric::whitened_structured(Arc::new(u), p, p).unwrap();
+    assert!(metric.whitens_likelihood(), "fixture metric must whiten");
+    factored_term.set_row_metric(metric).unwrap();
+
+    // Full-B twin: same term + same metric, frames deactivated.
+    let mut full_term = factored_term.clone();
+    for atom in &mut full_term.atoms {
+        atom.deactivate_decoder_frame();
+    }
+    assert!(!full_term.frames_active());
+
+    let rho = SaeManifoldRho::new(
+        0.0,
+        -0.2,
+        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+    );
+    let target = Array2::<f64>::from_shape_fn((n_obs, p), |(row, col)| {
+        0.01 * (row + 1) as f64 - 0.002 * (col + 1) as f64
+    });
+
+    // (a) Frames STILL engage under whitening: factored border, not dense.
+    let native_sys = factored_term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    assert_eq!(
+        native_sys.k, border_dim,
+        "#974: frames must engage under whitening (factored border, not full-B)"
+    );
+    for row in &native_sys.rows {
+        assert_eq!(row.htbeta.ncols(), border_dim);
+    }
+
+    // (b) Whitened native factored solve == full-B whitened solve, projected.
+    let full_sys = full_term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    assert_eq!(full_sys.k, full_term.beta_dim());
+    let mut projected_sys = factored_term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    projected_sys.htbeta_matvec = None;
+    projected_sys.htbeta_transpose_matvec = None;
+    projected_sys.htbeta_dense_supplement = false;
+    for row_idx in 0..n_obs {
+        let htbeta_b = materialize_row_htbeta_for_test(&full_sys, row_idx);
+        projected_sys.rows[row_idx].htbeta =
+            project_row_htbeta_to_factored_for_test(&factored_term, htbeta_b.view());
+    }
+    projected_sys.refresh_row_hessian_fingerprint();
+
+    let ridge_t = 5.0e-1;
+    let (native_dt, native_db, _) = native_sys.solve(ridge_t, 1.0e-8).unwrap();
+    let (projected_dt, projected_db, _) = projected_sys.solve(ridge_t, 1.0e-8).unwrap();
+    assert_eq!(native_dt.len(), projected_dt.len());
+    assert_eq!(native_db.len(), projected_db.len());
+    for idx in 0..native_dt.len() {
+        assert_abs_diff_eq!(native_dt[idx], projected_dt[idx], epsilon = 1.0e-9);
+    }
+    for idx in 0..native_db.len() {
+        assert_abs_diff_eq!(native_db[idx], projected_db[idx], epsilon = 1.0e-9);
+    }
+}
+
 #[test]
 pub(crate) fn factored_row_htbeta_d2_matches_dense_full_b_then_project() {
     let k_atoms = 3usize;

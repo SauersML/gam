@@ -313,7 +313,7 @@ fn behavioral_fisher_metric_survives_stagewise_growth() {
         max_factor_rank: 2,
         structured_whitening: false,
     };
-    let result = fit_stagewise(seeded, rho, z.view(), None, None, &config, None).unwrap();
+    let result = fit_stagewise(seeded, rho, z.view(), None, None, &config, None, None).unwrap();
 
     // The terminal grown term still carries the behavioral-Fisher likelihood
     // weight — the harvest metric priced every stage, seed through births.

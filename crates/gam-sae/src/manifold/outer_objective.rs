@@ -346,6 +346,11 @@ pub struct SaeManifoldOuterObjective {
     /// #2080 — outer probe telemetry (criterion/FD/infeasible counts). Read via
     /// [`Self::probe_telemetry`] after the fit for the wide-`p` acceptance test.
     pub(crate) probe_telemetry: OuterProbeTelemetry,
+    /// #2138 — cooperative cancellation. When the pyffi fit driver sets this after
+    /// a Python interrupt, the next `eval`/`eval_cost` returns a recoverable
+    /// `RemlOptimizationFailed` so an abandoned worker thread unwinds and stops
+    /// rather than running a hung fit to completion. `None` ⇒ historical path.
+    pub(crate) cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SaeManifoldOuterObjective {
@@ -382,7 +387,29 @@ impl SaeManifoldOuterObjective {
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
             routing_frozen: false,
             probe_telemetry: OuterProbeTelemetry::default(),
+            cancel_flag: None,
         }
+    }
+
+    /// #2138 — install a cooperative cancellation flag shared with the pyffi fit
+    /// driver's calling thread. On a Python interrupt the caller sets it, and the
+    /// next outer `eval`/`eval_cost` bails with a recoverable error so the
+    /// detached worker thread terminates instead of finishing a hung fit.
+    pub fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel_flag = Some(flag);
+    }
+
+    /// `Err` if a host cancellation was requested (see [`Self::set_cancel_flag`]);
+    /// a cheap relaxed load, no-op when no flag is installed.
+    fn check_cancelled(&self) -> Result<(), EstimationError> {
+        if let Some(flag) = &self.cancel_flag {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "SAE fit cancelled by host (Python interrupt)".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// #2080 — the accumulated outer probe telemetry (criterion/FD/infeasible
@@ -2083,6 +2110,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.check_cancelled()?;
         // Value-only comparison path (EFS backtracking, seed validation, FD
         // certificate probes): no gradient/Hessian is ever
         // consumed at this iterate, so it takes the cheap probe refine budget
@@ -2115,6 +2143,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
@@ -2364,6 +2393,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
         rho: &Array1<f64>,
         order: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
+        // #2138 — cover the line-search cost-probe lane too: the `Value` order is
+        // called directly by the outer bridge (bypassing `eval`/`eval_cost`), so
+        // without this a cancelled worker parked in a long probe sequence would
+        // keep grinding. Idempotent for the gradient orders (they also delegate to
+        // `eval`, which checks again); no-op when no cancel flag is installed.
+        self.check_cancelled()?;
         match order {
             OuterEvalOrder::Value => {
                 // #1224 — the `Value` order is the BFGS / ARC LINE-SEARCH cost
@@ -2425,6 +2460,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        // #2138 — the Fellner–Schall route is a primary outer descent path with its
+        // own inner solve (bypassing `eval`/`eval_cost`), so cover it too.
+        self.check_cancelled()?;
         self.efs_step(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)
     }
