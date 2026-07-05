@@ -1834,9 +1834,10 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
 ///
 /// A factor-smooth design (`fs`/`re` → `FactorSumToZero`/`FactorSmooth`, a
 /// factor `by=` → `ByVariable`/`BySmooth`, or a categorical tensor margin) gates
-/// its per-level blocks on `value.to_bits() == level_bits` against the saved
-/// levels: a column value that is not bit-identical to a frozen level matches no
-/// block. The summary's representative data (axis-spanning midpoints) therefore
+/// its per-level blocks on `canonical_level_bits(value) == level_bits` against
+/// the saved levels: a column value that is not a (signed-zero/NaN-canonical)
+/// match for a frozen level matches no block. The summary's representative data
+/// (axis-spanning midpoints) therefore
 /// fabricates illegal factor values, and rebuilding the factor design on it
 /// fails — which is why `summary().smooth_terms` came back empty for ANY model
 /// containing a factor-smooth, dragging co-fitted `s(x)` rows down with it

@@ -1080,7 +1080,10 @@ pub struct LinearTermSpec {
     /// Categorical-level gates for a factor-aware `:` interaction.
     ///
     /// Each `(col, level_bits)` multiplies the realized design column by the
-    /// indicator `1[data[row, col].to_bits() == level_bits]`. This is how a
+    /// indicator `1[canonical_level_bits(data[row, col]) == level_bits]` (the
+    /// canonical key collapses `-0.0`/`+0.0` and NaN payloads so numerically
+    /// equal codes name one level; see `gam_data::canonical_level_bits`). This
+    /// is how a
     /// `factor:x` (or `factor:factor`) interaction is expanded: `build_termspec`
     /// emits one `LinearTermSpec` per surviving cell of the categorical
     /// operand(s) (treatment-coded, first level dropped per factor), each
@@ -1126,7 +1129,8 @@ impl LinearTermSpec {
     /// The column is the elementwise product of every numeric feature column
     /// (`effective_feature_cols`) gated by the categorical-level indicators in
     /// `categorical_levels`: each `(col, level_bits)` multiplies the running
-    /// column by `1[data[row, col].to_bits() == level_bits]`. A plain numeric
+    /// column by `1[canonical_level_bits(data[row, col]) == level_bits]` (signed
+    /// zero / NaN canonicalized so numerically equal codes match). A plain numeric
     /// term (no `categorical_levels`) reduces to the bare product, matching the
     /// historical behaviour. A pure categorical interaction (empty
     /// `feature_cols`, non-empty `categorical_levels`) reduces to the cell
