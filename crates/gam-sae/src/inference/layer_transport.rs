@@ -1997,7 +1997,7 @@ mod invert_tests {
     /// the runtime behaviour tested end-to-end in the Python bug-hunt.
     #[test]
     fn composition_defect_var_floor_is_calibrated() {
-        for coord_scale in [std::f64::consts::TAU, 1.0_f64, (5.0 - (-3.0)).abs()] {
+        for coord_scale in [std::f64::consts::TAU, 1.0_f64, (5.0_f64 - (-3.0_f64)).abs()] {
             let floor_std = coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR;
             let repr_defect = coord_scale * 1e-5; // spline-representation scale
             let violation_defect = coord_scale * 1e-2; // a real law violation
