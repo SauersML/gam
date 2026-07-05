@@ -751,61 +751,10 @@ mod tests {
         }
     }
 
-    /// Device-vs-CPU wall-time for the block-gate route at a production-scale
-    /// shape. `#[ignore]` (the repo's `gpu_residency_wallclock_bench` idiom): it
-    /// is a reporting bench, not a correctness gate — explicit `--ignored` on a
-    /// GPU node — so it is NOT a wall-clock BUDGET (nothing fails on a deadline;
-    /// SPEC 18). It first asserts the device selection still equals the CPU
-    /// oracle, then prints the speedup for the report.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "wall-clock bench; run explicitly with --ignored on a GPU node"]
-    fn device_block_route_speedup_bench() {
-        use std::time::Instant;
-        let m = 1024usize;
-        let g = 16_384usize;
-        let b = 3usize;
-        let k = 8usize;
-        let p = 128usize;
-        let krows = g * b;
-        assert!(m * krows >= DEVICE_BLOCK_GATE_MIN_ELEMS);
-        let (rows, decoder) = fixture(m, g, b, p);
-
-        // Warm the device (module compile + first alloc) so the timing is steady-state.
-        let _ = route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Auto);
-
-        let t_cpu = Instant::now();
-        let cpu = route_blocks_cpu(rows.view(), decoder.view(), g, b, k);
-        let cpu_secs = t_cpu.elapsed().as_secs_f64();
-
-        let t_dev = Instant::now();
-        let (routed, path, dtoh) =
-            match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Required)
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    assert!(
-                        gam_gpu::GpuRuntime::global().is_none(),
-                        "Required errored despite a live CUDA runtime: {err}"
-                    );
-                    println!("[block-gate bench] no CUDA runtime; skipping device timing");
-                    return;
-                }
-            };
-        let dev_secs = t_dev.elapsed().as_secs_f64();
-        assert_eq!(path, BlockRoutePath::Device, "bench: device did not engage");
-
-        // Selection parity still holds at bench scale.
-        for (dev_sel, cpu_sel) in routed.iter().zip(&cpu) {
-            assert_eq!(dev_sel.len(), cpu_sel.len());
-            for ((db, _), (cb, _)) in dev_sel.iter().zip(cpu_sel) {
-                assert_eq!(db, cb, "bench: block selection diverged");
-            }
-        }
-        println!(
-            "[block-gate bench] m={m} G={g} b={b} k={k} P={p} (K={krows}): \
-             CPU {cpu_secs:.4}s  device {dev_secs:.4}s  speedup {:.1}x  dtoh={dtoh}B",
-            cpu_secs / dev_secs.max(1e-9)
-        );
-    }
+    // The device-vs-CPU wall-clock *timing* report that lived here as an
+    // `#[ignore]`d `#[test]` was removed: `#[ignore]`d timing benches are banned
+    // by `build.rs` (they belong in `bench/`, not the test tree), and its only
+    // correctness assertion — device block-selection bit-identical to the CPU
+    // oracle at scale — is already the standing gate
+    // `device_block_route_bit_identical_gates_at_scale` above.
 }

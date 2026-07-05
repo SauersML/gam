@@ -66,7 +66,7 @@ fn inner_fit_core_scaling() {
     let reps = 3;
 
     // Warm (allocations, first-touch, factor caches).
-    let _ = sys.solve_with_options(1e-8, 1e-8, &opts);
+    std::hint::black_box(sys.solve_with_options(1e-8, 1e-8, &opts).expect("warm solve"));
 
     // MULTI-CORE context: called from the main (non-rayon) thread, so the
     // `current_thread_index().is_none()` gate opens and the row work fans out over
