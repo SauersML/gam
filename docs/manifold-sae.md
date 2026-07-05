@@ -82,18 +82,23 @@ of typed shapes:
 | `atom_topology` / `atom_basis` | Intrinsic dim `d_atom` | Underlying basis | Shape |
 | --- | --- | --- | --- |
 | `linear` | 1 | affine rank-1 line | true linear atom `gamma(t)=b0+t*b1` |
-| `circle` (aliases `periodic`, `periodic_spline`) | 1 (each axis if `d>1`) | periodic Fourier `cos/sin(2π·h·t)` | closed loop, seamless at the wrap |
+| `circle` (aliases `periodic`, `periodic_spline`) | 1 (each axis if `d>1`) | periodic Fourier, sine-first per harmonic: `[1, sin(2π·h·t), cos(2π·h·t), …]` | closed loop, seamless at the wrap |
 | `euclidean` (alias `euclidean_patch`) | any | monomial / polynomial patch | open Euclidean patch (a "line" at `d_atom=1`) |
 | `duchon` | any | Duchon thin-plate RKHS | open Euclidean patch with the thin-plate roughness Gram |
-| `sphere` | 2 | intrinsic S² (lat, lon) chart | sphere, no pole artefacts |
+| `sphere` | 2 | lat/lon product chart, basis `[1, x, y, z, xy, yz, xz]` | sphere chart with pole singularities (longitude is gauge-degenerate at the poles; the quadratic part is not rotationally invariant) |
 | `torus` | 2 (each axis) | doubly-periodic Fourier | torus, seamless on both axes |
-| `cylinder` (**discovery-only**) | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1. **Not seedable**: cylinder atoms are birth-discovered by the structure search, not accepted as a closed-form `atom_topology` / `atom_basis` seed (the seed path rejects it). |
+| `cylinder` (**discovery-only**) | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1. The line-axis roughness is a canonical `[0,1)` **reference-domain** penalty (not an intrinsic roughness integrated over all of `ℝ`, which would diverge for polynomials), so the line coordinate's scale/origin matter through that reference interval. **Not seedable**: cylinder atoms are birth-discovered by the structure search, not accepted as a closed-form `atom_topology` / `atom_basis` seed (the seed path rejects it). |
 | `poincare` (aliases `hyperbolic`, `poincare_patch`) | any | monomial patch, hyperbolic roughness metric | Poincaré-ball tangent patch at curvature `c = −1` (wiggle measured in hyperbolic arc length) |
 | any other string | any | caller-supplied | `Precomputed`: a precomputed basis you attach yourself |
 
-`duchon` and `euclidean` share the same flat-`ℝᵈ` latent manifold and monomial
-decoder; they differ only in the roughness penalty (`duchon` uses the
-thin-plate RKHS Gram, `euclidean` the polynomial-patch Gram). `poincare`
+`duchon` and `euclidean` share the same flat-`ℝᵈ` latent **domain**, but they
+use *different* decoders as well as different roughness penalties. `euclidean`
+is a monomial/polynomial patch. `duchon` is an RKHS/spline surface: a
+radial-kernel block `Φ_radial(t)·Z` (centered on a fixed set of centers) plus a
+null-space polynomial block `P(t)` (see `DuchonCoordinateEvaluator` in the Rust
+core), penalized by the thin-plate roughness Gram. A `euclidean`-vs-`duchon`
+comparison therefore differs in *both* the basis family and the penalty, not the
+penalty alone. `poincare`
 likewise reuses the Euclidean tangent chart and monomial decoder but penalizes
 roughness in hyperbolic arc length via the Poincaré conformal factor, so it
 differs from the flat patch only where feature density grows toward the ball

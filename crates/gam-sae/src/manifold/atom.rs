@@ -37,12 +37,19 @@ pub enum SaeAtomBasisKind {
     /// Shares the monomial decoder design of [`Self::EuclideanPatch`] — the
     /// latent coordinate `t` is read as a tangent vector at the ball origin
     /// (the wrapped / tangent parameterisation) and the decoder is the same
-    /// polynomial-in-`t` expansion — but its smoothness penalty is the
-    /// conformal-reweighted Dirichlet energy of the Poincaré metric
-    /// (`refresh_intrinsic_smooth_penalty` measures wiggle in *hyperbolic*
-    /// arc length via the `λ(p)` conformal factor). This makes an atom whose
-    /// feature density grows toward the ball boundary (exponential-volume /
-    /// tree-leaf hierarchy) the regime where it differs from the flat patch.
+    /// polynomial-in-`t` expansion — but its smoothness penalty is measured in
+    /// *hyperbolic* arc length rather than flat tangent length
+    /// (`refresh_intrinsic_smooth_penalty`). For the `d = 1` tangent chart the
+    /// coordinate runs at a constant multiple of arc length (geodesic distance
+    /// `= 2|t|`), so the intrinsic reweighting is a *constant* — coinciding with
+    /// the flat arc-length reweighting, since the chart is intrinsically flat in
+    /// 1-D (see `poincare.rs::conformal_dirichlet_penalty`, whose `d = 1` metric
+    /// weight is the constant `G ≡ 1/2`). The genuinely hyperbolic, curvature-
+    /// dependent anisotropy is a `d ≥ 2` matrix effect carried by that pullback,
+    /// not by this scalar `d = 1` path. The decoder is nonetheless the tangent-
+    /// wrapped exp-map parameterisation, so an atom whose feature density grows
+    /// toward the ball boundary (exponential-volume / tree-leaf hierarchy) still
+    /// retracts on the hyperbolic manifold.
     Poincare,
     /// A FINITE-SET (discrete anchor) atom (F2): the latent `t` is CATEGORICAL —
     /// each sample is assigned to one of a finite set of anchors — and the basis
@@ -98,14 +105,21 @@ impl SaeAtomBasisKind {
                     )
                 }
             }
-            // `Sphere` is parameterised via a (lat, lon) intrinsic chart; the
-            // chart evaluator already enforces sphere geometry through its
-            // cos/sin terms (in radians, multiplying lat/lon directly into
-            // `sin`/`cos`), so the latent optimiser sees a 2-D product
-            // manifold: lat is a bounded interval `[-π/2, π/2]` (enforced here
-            // by the `Interval` retraction — its clamp + active-bound tangent
-            // projection — NOT by truncating the chart jet) and lon is an `S^1`
-            // angle wrapped modulo `2π`.
+            // `Sphere` is parameterised via a (lat, lon) *product* chart, NOT an
+            // intrinsic / rotation-invariant `S²` parametrisation: the latent
+            // optimiser sees a 2-D product manifold whose cos/sin terms (in
+            // radians) embed the chart, where lat is a bounded interval
+            // `[-π/2, π/2]` (enforced here by the `Interval` retraction — its
+            // clamp + active-bound tangent projection — NOT by truncating the
+            // chart jet) and lon is an `S^1` angle wrapped modulo `2π`. This chart
+            // carries pole gauge singularities: at the poles `cos(lat) = 0`, all
+            // longitudes collapse to the same physical point, so longitude is a
+            // gauge coordinate there and the longitude jet vanishes; and the
+            // `[xy, yz, xz]` quadratic block is not a rotation-invariant spherical-
+            // harmonic basis (rotating `xy` yields `x² − y²`, outside its span).
+            // Both caveats are documented in full at
+            // `gam_sae::basis::sphere_chart_basis_jet`; do not read this chart as
+            // artefact-free spherical geometry.
             // Treating it as `LatentManifold::Sphere { dim: 2 }` would
             // require ambient unit-vectors of length 2 (impossible for S^2).
             Self::Sphere => LatentManifold::Product(vec![
@@ -1311,40 +1325,69 @@ impl SaeManifoldAtom {
         let mut act = vec![0.0_f64; m];
         let mut num = vec![0.0_f64; m];
         let mut deriv = vec![0.0_f64; p];
-        // Poincaré tangent patch: measure the decoded speed per unit of
-        // *hyperbolic* latent length rather than flat tangent length. A unit
-        // step in the tangent coordinate `t` covers hyperbolic distance
-        // `λ(p(t))` (the conformal factor at the ball point `p = exp₀(t)`), so
-        // the arc-length speed is `‖J‖ / λ` and the squared speed picks up a
-        // `1/λ²` factor. For the monomial patch (`d = 1`) the tangent coordinate
-        // is the linear monomial column (`Φ = [1, t, …]`, so column 1 is `t`).
+        // Poincaré tangent patch (`d = 1`): the latent coordinate `t` is a
+        // tangent vector at the ball origin, and it runs at a *constant* multiple
+        // of hyperbolic arc length. The ball point is `p = exp₀(t)` with
+        // `‖p‖ = tanh|t|` (curvature `c = −1`), so `dp/dt = sech²(t)` and the
+        // arc-length rate is `λ(p)·|dp/dt| = 2cosh²(t)·sech²(t) = 2`, independent
+        // of `t` (the geodesic distance from the origin is `2|t|`). The decoded
+        // speed per unit arc length is therefore `‖J‖ / 2` and the intrinsic
+        // squared speed is `‖J‖² / 4` — a *constant* multiple of the flat-`t`
+        // squared speed. The *key* property — a metric weight that is CONSTANT in
+        // `t`, not `t`-dependent — is the same one the authoritative pullback
+        // `gam_geometry::manifolds::poincare::conformal_dirichlet_penalty` states
+        // for `d = 1` (its constant `G ≡ 1/2`): the chart is intrinsically flat in
+        // 1-D. (The two numeric constants differ — `1/4 = (dt/ds)²` here is the
+        // scalar reparam factor for squared speed, whereas `G = √det h · h⁻¹` is
+        // that module's matrix Dirichlet weight — but both are constant in `t`,
+        // which is all that matters below.)
+        //
+        // The earlier code divided by `λ(p)² = 4cosh⁴(t)`, conflating the *ball*
+        // conformal factor with the *tangent* arc-length rate. That is
+        // `t`-dependent and under-penalised near-boundary roughness by `~cosh⁴(t)`
+        // (~200× at `|t| = 2`, ~10⁴× at `|t| = 3`), manufacturing fake curvature
+        // in a chart that is flat for `d = 1` and corrupting the topology /
+        // evidence / smoothness selection for hyperbolic atoms.
+        //
+        // The geometric-mean centering below divides `speeds` by their center, so
+        // the constant `1/4` cancels exactly and does not move the numbers; it is
+        // applied so `speeds` carries genuine intrinsic squared speed and the
+        // `d = 1` Poincaré reweighting is provably the flat arc-length reweighting
+        // (no spurious `t`-dependence). A `latent_dim > 1` Poincaré atom needs the
+        // non-constant matrix pullback and never reaches this scalar path — the
+        // `latent_dim != 1` early return above leaves it at the raw Gram.
+        //
+        // Convention note (why `1/4` here, not `1/2`): the authoritative
+        // `poincare.rs::conformal_dirichlet_penalty` reports `G ≡ 1/2` for `d = 1`
+        // in the *energy-density* convention `∫ G ‖dg/dt‖² dt`, whose `G` absorbs
+        // the arc-length measure `ds = 2 dt`. This path instead reweights the
+        // *pointwise* squared speed, whose intrinsic factor is `(dt/ds)² = 1/4`.
+        // Both are correct in their own convention, and — crucially — both are
+        // numerically inert below because the geometric-mean centering cancels any
+        // constant. The load-bearing fix is not the value of this constant but
+        // that the reweighting is now CONSTANT in `t` (vs the old per-sample
+        // `λ⁻²`).
+        const POINCARE_D1_ARCLEN_RATE_SQ: f64 = 4.0;
         let hyperbolic = matches!(self.basis_kind, SaeAtomBasisKind::Poincare);
-        let linear_col = if hyperbolic && m >= 2 {
-            Some(1usize)
-        } else {
-            None
-        };
         for row in 0..n {
             self.fill_decoded_derivative_row(row, 0, &mut deriv);
             let mut speed_sq = 0.0_f64;
             for &d in deriv.iter() {
                 speed_sq += d * d;
             }
+            if hyperbolic {
+                // Only reached for `d = 1` (the `latent_dim != 1` early return
+                // above skips this whole routine for `d > 1`, leaving `S̃ = S_raw`
+                // — the safe constant-speed limit, pending a proper non-constant
+                // `Dexp₀ᵀ λ² Dexp₀` matrix pullback for `d > 1`). Constant `1/4`
+                // from the `d = 1` arc-length rate `2` (see above): intrinsic
+                // squared speed = `‖J‖² / rate²`.
+                speed_sq /= POINCARE_D1_ARCLEN_RATE_SQ;
+            }
             // Row `row` of the (N×M) basis design is contiguous; read it once as
             // a 1-D view so the per-coefficient accumulation below has no 2-D
             // index recompute (n-hot: one pass per sample × per atom).
             let phi_row = self.basis_values.row(row);
-            if let Some(col) = linear_col {
-                let t = phi_row[col];
-                // p = exp₀(t) at unit curvature c = −1: ‖p‖ = tanh(|t|), and
-                // λ(p) = 2 / (1 − ‖p‖²) = 2 / (1 − tanh²|t|) = 2·cosh²(t).
-                // speed_sq ← speed_sq / λ².  (cosh is even, so the sign of t
-                // does not matter.)
-                let lambda = 2.0 * t.cosh() * t.cosh();
-                if lambda.is_finite() && lambda > 0.0 {
-                    speed_sq /= lambda * lambda;
-                }
-            }
             for (col, &phi) in phi_row.iter().enumerate() {
                 let w = phi * phi;
                 if w == 0.0 {
@@ -1456,4 +1499,103 @@ pub(crate) fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
     }
     let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
     Ok(evals.iter().filter(|&&v| v <= tol).count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build an atom over the degree-2 monomial basis `[1, t, t²]` at the given
+    // latent coordinates, with decoder `γ(t) = t + t²` (decoded speed `1 + 2t`,
+    // which varies across the samples so the arc-length reweighting is
+    // non-trivial) and a pure second-derivative penalty `diag(0, 0, 1)` (order
+    // `r = 2`, so `β = ½ − r = −3/2 ≠ 0`). The only thing that varies between the
+    // Euclidean-patch and Poincaré cases below is `basis_kind`.
+    fn monomial_atom(kind: SaeAtomBasisKind, ts: &[f64]) -> SaeManifoldAtom {
+        let n = ts.len();
+        let mut phi = Vec::with_capacity(n * 3);
+        let mut jac = Vec::with_capacity(n * 3);
+        for &t in ts {
+            phi.extend_from_slice(&[1.0, t, t * t]);
+            // ∂[1, t, t²]/∂t = [0, 1, 2t].
+            jac.extend_from_slice(&[0.0, 1.0, 2.0 * t]);
+        }
+        let basis_values = Array2::from_shape_vec((n, 3), phi).unwrap();
+        let basis_jacobian = Array3::from_shape_vec((n, 3, 1), jac).unwrap();
+        let decoder = Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 1.0]).unwrap();
+        let mut penalty = Array2::<f64>::zeros((3, 3));
+        penalty[[2, 2]] = 1.0;
+        SaeManifoldAtom::new(
+            "atom",
+            kind,
+            1,
+            basis_values,
+            basis_jacobian,
+            decoder,
+            penalty,
+        )
+        .unwrap()
+    }
+
+    // The Poincaré tangent chart is intrinsically flat for `d = 1`: the latent
+    // coordinate runs at a constant multiple of hyperbolic arc length, so the
+    // intrinsic arc-length reweighting is a *constant* in `t` and must reproduce
+    // the flat Euclidean-patch reweighting exactly — even when the coordinates
+    // reach large `|t|`. The previous code divided the squared speed by
+    // `λ(p)² = 4cosh⁴(t)`, which at `t = 3` is `≈ cosh⁴(3) ≈ 1.0e4` times off from
+    // the correct constant, so it would break this equality by orders of
+    // magnitude. Coordinates are deliberately spread to `|t| = 3` to exercise that
+    // regime.
+    #[test]
+    fn poincare_d1_reweighting_is_constant_and_matches_euclidean() {
+        let ts = [0.1_f64, 1.5, 3.0];
+        let poincare = monomial_atom(SaeAtomBasisKind::Poincare, &ts);
+
+        // The reweighting actually did something: the second-derivative penalty
+        // entry moved away from its raw value of 1.0 (so the equality below is
+        // not vacuously true because reweighting was a no-op).
+        let raw = poincare.smooth_penalty_raw[[2, 2]];
+        assert!((raw - 1.0).abs() < 1e-12);
+        let reweighted = poincare.smooth_penalty[[2, 2]];
+        assert!(
+            (reweighted - 1.0).abs() > 0.05,
+            "arc-length reweighting should be non-trivial; got {reweighted}"
+        );
+
+        // Constant-in-`t` factor ⇒ Poincaré and Euclidean reweightings coincide
+        // exactly. The old `1/λ²` divide (~1e4× at t=3) would make these differ.
+        assert_poincare_tracks_euclidean(&ts);
+    }
+
+    // Assert the `d = 1` Poincaré intrinsic penalty equals its Euclidean-patch
+    // twin (same design/decoder, only `basis_kind` differs) elementwise. Because
+    // the metric factor is a constant in `t`, this must hold at *any* coordinate
+    // concentration; the old per-sample `1/λ²` divide would break it once `|t|`
+    // grows (the divide scales as `cosh⁴(t)`).
+    fn assert_poincare_tracks_euclidean(ts: &[f64]) {
+        let euclidean = monomial_atom(SaeAtomBasisKind::EuclideanPatch, ts);
+        let poincare = monomial_atom(SaeAtomBasisKind::Poincare, ts);
+        for i in 0..3 {
+            for j in 0..3 {
+                let e = euclidean.smooth_penalty[[i, j]];
+                let p = poincare.smooth_penalty[[i, j]];
+                assert!(
+                    (e - p).abs() <= 1e-12 + 1e-9 * e.abs(),
+                    "Poincaré d=1 penalty[{i},{j}]={p} must equal Euclidean {e}"
+                );
+            }
+        }
+    }
+
+    // Small-`|t|` vs large-`|t|` concentration: the Poincaré reweighting tracks
+    // the flat one at BOTH (that invariance across concentrations IS the
+    // constant-in-`t` property). Under the old `1/λ²`, the large-`|t|` case
+    // (`|t| ≈ 3`, `λ² ≈ 4cosh⁴(3) ≈ 1.6e4`) would diverge from its Euclidean twin
+    // by orders of magnitude while the small-`|t|` case stayed close — so the
+    // reweighting shape would depend on where `t` sits, which this test forbids.
+    #[test]
+    fn poincare_reweighting_invariant_to_t_concentration() {
+        assert_poincare_tracks_euclidean(&[0.02_f64, 0.05, 0.1]);
+        assert_poincare_tracks_euclidean(&[2.0_f64, 2.5, 3.0]);
+    }
 }

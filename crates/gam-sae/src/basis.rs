@@ -473,7 +473,22 @@ pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4
 /// `z = sin(lat)`; the returned `jet` has shape `(N, 7, 2)` with the last axis
 /// indexing `[∂/∂lat, ∂/∂lon]`.
 ///
-/// The map and its jet are everywhere `C^∞` in `(lat, lon)`: every column is a
+/// NOTE: this is a lat/lon *product* chart, not an intrinsic / rotation-
+/// invariant `S²` parametrization. Two caveats follow from the chart:
+///   * **Pole gauge degeneracy.** At the poles `cos(lat) = 0`, so
+///     `x = y = xy = yz = xz = 0` and `z = ±1` for *every* longitude — all
+///     longitudes collapse to the same physical point (longitude is a gauge
+///     coordinate there). The longitude jet vanishes at the poles
+///     (`∂x/∂lon = ∂y/∂lon = 0`), so the Hessian carries a longitude gauge
+///     degeneracy while the ARD von-Mises prior can still prefer a longitude —
+///     i.e. the fit is not invariant under pole equivalence.
+///   * **Not rotationally invariant.** The quadratic block `[xy, yz, xz]` is
+///     not a rotation-invariant degree-2 spherical-harmonic basis: rotating
+///     `xy` produces `x² − y²`, which lies outside its span. A proper
+///     atlas / Wahba-style basis is a follow-up; do not read this as intrinsic.
+///
+/// Within a fixed chart the map and its jet are everywhere `C^∞` in
+/// `(lat, lon)`: every column is a
 /// polynomial in `cos`/`sin` of the two coordinates, and `cos`/`sin` are entire,
 /// so the exact analytic derivatives `∂x/∂lat = -sin(lat)cos(lon)`, … are
 /// globally smooth. Latitude is therefore **not** clamped and the latitude
@@ -753,8 +768,10 @@ impl SaeBasisThirdJet for SphereChartEvaluator {
 
 /// Tensor-product periodic harmonic evaluator for a `d`-dimensional torus
 /// `T^d = (S^1)^d`. The basis is the tensor product over each axis of the
-/// 1-D circle basis
-/// `[1, cos(2π·1·t), sin(2π·1·t), …, cos(2π·H·t), sin(2π·H·t)]`
+/// 1-D circle basis, stored **sine-first** within each harmonic (matching the
+/// `evaluate` layout below, `s_idx = 2h-1`, `c_idx = 2h`, and the
+/// `PeriodicHarmonicEvaluator` convention):
+/// `[1, sin(2π·1·t), cos(2π·1·t), …, sin(2π·H·t), cos(2π·H·t)]`
 /// (each axis contributes `2H+1` factors, so the total basis size is
 /// `(2H+1)^d`). The latent coords are angular phases in `[0, 1)` (consistent
 /// with the periodic 1-D atoms).
@@ -1772,7 +1789,16 @@ impl CylinderHarmonicEvaluator {
         }
 
         // Line value Gram Gl and second-derivative Gram Sl on the canonical
-        // interval [0,1).
+        // reference interval [0,1).
+        //
+        // NOTE: despite the cylinder being declared `S¹ × ℝ` (unbounded line
+        // axis) in the latent-manifold spec, this line-factor roughness is a
+        // *compact* [0,1) reference-domain measure, NOT an intrinsic roughness
+        // integrated over all of ℝ (a uniform ∫_ℝ tⁱ⁺ʲ dt would diverge for
+        // polynomials). It is a canonical reference penalty: the line
+        // coordinate's scale and origin therefore matter through this reference
+        // interval — the same monomial coefficients carry a different penalty
+        // if the line axis is rescaled or shifted relative to [0,1).
         let mut gl = Array2::<f64>::zeros((ml, ml));
         let mut sl = Array2::<f64>::zeros((ml, ml));
         for i in 0..ml {

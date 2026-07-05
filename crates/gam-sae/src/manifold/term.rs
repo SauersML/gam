@@ -578,7 +578,11 @@ pub struct SaeManifoldTerm {
     /// [`super::penalties::SaeManifoldTerm::barrier_pair_strength`]). Both the
     /// coactivation and the strength are functions of the frozen design (chart
     /// basis + routing), so freezing them here keeps the barrier value, gradient,
-    /// and curvature reading the SAME weights across an inner line search.
+    /// and curvature reading the SAME weights across an inner line search. The #2
+    /// collinearity GATE is NOT frozen — it is the LIVE, differentiated smoothstep
+    /// `w(o_jk)` of the TRUE decoder subspace overlap
+    /// [`super::penalties::SaeManifoldTerm::decoder_gram_cosine_sq`], moving with
+    /// the trial decoders exactly like the interior-point term it multiplies.
     pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64, f64)>>,
     /// #1801 — STREAMING gate-freeze flag. The collapse-prevention gates
     /// ([`Self::decoder_repulsion_gate`], [`Self::barrier_coactivation_gate`]) are

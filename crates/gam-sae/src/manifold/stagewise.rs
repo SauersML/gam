@@ -686,6 +686,21 @@ fn residual_principal_birth_candidate(
         }
     }
 
+    // TRAILHEAD (identifiability converse to the MP floor): the floor above
+    // certifies "there IS above-noise signal" but NOT that the leading direction
+    // is IDENTIFIABLE. When the top above-floor eigenvalues are ~equal AND share
+    // support (an isotropic/rotationally-degenerate plateau — e.g. a Gaussian
+    // null's leading bulk after linear T1), the sample top eigenvector is a
+    // Davis–Kahan blend fixed by noise, so a rank-1 seed from it is a doomed atom
+    // the inner joint fit can only reject at ΔEV≈0 — the null-calibration birth
+    // thrash. A birth gate that STOPS here would end that thrash, but it must key
+    // on eigenvector STABILITY, not the raw eigengap alone: disjoint equal-energy
+    // blocks (block-diagonal support) have pinned, identifiable eigenvectors and
+    // must still seed (stagewise deflation takes the rest). Calibrating that
+    // stability test (and proving it helps on a real null residual without
+    // suppressing genuine weak births) is deferred — do not gate on a bare
+    // relative-eigengap threshold, which conflates the two regimes.
+
     // Rank-1 fallback (a genuine line, a partially-extracted circle, or a
     // non-periodic template): keep the historical row-0 (DC) seed + topology race.
     let amp = energy.sqrt();

@@ -129,28 +129,26 @@ impl SaeManifoldTerm {
             if !(norm_sq[j] > 0.0 && norm_sq[k] > 0.0) {
                 continue;
             }
-            // Cross-Gram Frobenius energy ‖B_jB_kᵀ‖²_F = Σ_{a,b} C[a,b]² with
-            // C[a,b] = Σ_o B_j[a,o]·B_k[b,o]; normalized by the two norms it
-            // is the squared cosine of the decoder row-spaces ∈ [0, 1].
-            let bj = &self.atoms[j].decoder_coefficients;
-            let bk = &self.atoms[k].decoder_coefficients;
-            let (m_j, p) = (bj.nrows(), bj.ncols());
-            let m_k = bk.nrows();
-            if bk.ncols() != p {
+            // #2 fix — the collinearity GATE keys on the TRUE rank-aware decoder
+            // subspace overlap `o_jk = ‖B_jB_kᵀ‖²_F/(‖B_jB_jᵀ‖_F·‖B_kB_kᵀ‖_F)`
+            // (the squared cosine between the OUTPUT Grams `B_jᵀB_j`, `B_kᵀB_k` in
+            // the Frobenius inner product; see `decoder_gram_cosine_sq`), NOT the
+            // Frobenius-NORM-normalized `‖B_jB_kᵀ‖²_F/(‖B_j‖²_F‖B_k‖²_F)`. The
+            // latter is a true cosine² only for rank-1 blocks and reads `1/r` for
+            // two IDENTICAL rank-r subspaces (e.g. `1/2` for identical 2-row
+            // decoders), which sits at/below the `0.5` gate and so left multi-row
+            // co-collapse undetected. `o_jk ∈ [0,1]`, `= 1` iff the two output
+            // Grams are proportional (genuine co-collapse), so identical subspaces
+            // of any rank now engage the repulsion. (The `norm_sq > 0` guard above
+            // and the Frobenius energy the repulsion OPERATOR then penalizes are
+            // unchanged — only the on/off GATE quantity is corrected.)
+            if self.atoms[j].decoder_coefficients.ncols()
+                != self.atoms[k].decoder_coefficients.ncols()
+            {
                 continue;
             }
-            let mut cross_sq = 0.0_f64;
-            for a in 0..m_j {
-                for b in 0..m_k {
-                    let mut c = 0.0_f64;
-                    for o in 0..p {
-                        c += bj[[a, o]] * bk[[b, o]];
-                    }
-                    cross_sq += c * c;
-                }
-            }
-            let s_jk = cross_sq / (norm_sq[j] * norm_sq[k]);
-            // C1 smoothstep gate: 0 below s0, smooth ramp to 1 at s=1.
+            let s_jk = self.decoder_gram_cosine_sq(j, k);
+            // C1 smoothstep gate: 0 below s0, smooth ramp to 1 at o=1.
             let gate_value = if s_jk <= s0 {
                 0.0
             } else {
@@ -222,7 +220,11 @@ impl SaeManifoldTerm {
         // `q_jk`. `μ_jk` is a function of the frozen design (chart basis + routing)
         // only (see `barrier_pair_strength`), so it is constant across the inner
         // line search and is computed once here rather than per trial. The gates
-        // are read once and shared across every pair's strength computation.
+        // are read once and shared across every pair's strength computation. The #2
+        // collinearity gate `w(o_jk)` is deliberately NOT frozen here — it is a
+        // function of the decoder shapes the barrier is actively separating, so it
+        // stays LIVE and differentiated in the value/gradient (like the
+        // interior-point term), the same design as before this fix.
         let gates = self.assignment.assignments();
         let frozen: Vec<(usize, usize, f64, f64)> = pairs
             .into_iter()
@@ -373,18 +375,33 @@ impl SaeManifoldTerm {
     // search.
 
     /// #1026/#1522 — SPARSE normalized coactivation: the list of `(j, k, q_jk)`
-    /// for `j < k` whose normalized coactivation `q_jk > 0`, i.e. the atom pairs
-    /// that actually co-fire on at least one row. This is the separation barrier's
-    /// only input — every pair with `q_jk = 0` is a strict no-op, so enumerating
-    /// the co-active pairs directly is exactly equivalent to forming the full
-    /// `q_jk = (Σ_i a_ij a_ik)/sqrt(Σa_ij²·Σa_ik²)` matrix and skipping its zeros,
-    /// while avoiding the `O(K²·N)` dense build that is fatal at large K (K=32768).
+    /// for `j < k` whose truncated-support normalized coactivation `q_jk > 0`,
+    /// i.e. the atom pairs that actually co-fire on at least one row. This is the
+    /// separation barrier's only input — every pair that never co-fires is a strict
+    /// no-op — so enumerating the co-active pairs directly avoids the `O(K²·N)`
+    /// dense build that is fatal at large K (K=32768).
     ///
-    /// The numerator `Σ_i a_ij a_ik` for each pair is accumulated in increasing
-    /// row order, so each returned `q_jk` equals the full-matrix entry to the last
-    /// bit. Cost is `O(N·K)` to read the gates plus `O(Σ_row active_row²)` over the
-    /// per-row support; for a sparse (top-k / JumpReLU) assignment the support is
-    /// tiny so this is `O(N·active²)`, linear in the number of co-active pairs.
+    /// #3 fix — the score is the TRUNCATED-SUPPORT normalized coactivation
+    ///   `q_jk = (Σ_{i∈J∩K} a_ij a_ik) / sqrt(Σ_{i∈J} a_ij² · Σ_{i∈K} a_ik²)`,
+    /// where `J = {i : |a_ij| > floor_i}` is atom `j`'s active support (`floor_i =
+    /// SAE_COACTIVE_RELATIVE_MASS_FLOOR·peak_i`). The relative-mass floor exists for
+    /// a real performance reason (SOFTMAX leaves every atom a tiny strictly-positive
+    /// tail mass, so a bare `a ≠ 0` test would mark all `K` atoms active on every
+    /// row and degenerate this scan to the dense `O(N·K²)` all-pairs cost, minutes
+    /// at `K = 10⁴`). The DENOMINATOR energies are therefore accumulated over the
+    /// SAME per-atom active support as the numerator — NOT the full-row energies —
+    /// so the floor is applied consistently to both and the score is a well-defined
+    /// truncated-support cosine `∈ [0, 1]` (`{i∈J∩K} ⊆ J` and `⊆ K` ⇒
+    /// Cauchy–Schwarz bounds it by 1). The PRIOR implementation was a hybrid
+    /// (truncated numerator over `J∩K` but full-row denominators `Σ_all a_ik²`),
+    /// which was NOT the full normalized coactivation NOR the truncated one — it
+    /// systematically UNDER-weighted the barrier for dense-tail (softmax)
+    /// assignments (the full-row denominator inflates the divisor). For structurally
+    /// sparse assignments (JumpReLU hard gate / IBP-MAP) every sub-floor entry is a
+    /// hard zero, so `J` is the full nonzero support, the truncated and full sums
+    /// coincide, and this is EXACTLY the full normalized coactivation to the last
+    /// bit (unchanged from before). Cost is `O(N·K)` to read the gates plus
+    /// `O(Σ_row active_row²)` over the per-row support.
     pub(crate) fn barrier_coactive_pairs(&self) -> Vec<(usize, usize, f64)> {
         let k_atoms = self.k_atoms();
         if k_atoms < 2 {
@@ -392,31 +409,20 @@ impl SaeManifoldTerm {
         }
         let gates = self.assignment.assignments();
         let n = gates.nrows();
-        // Per-column energy Σ_i a_ik² (same as the dense path).
-        let mut energy = vec![0.0_f64; k_atoms];
-        for k in 0..k_atoms {
-            let mut e = 0.0;
-            for row in 0..n {
-                let a = gates[[row, k]];
-                e += a * a;
-            }
-            energy[k] = e;
-        }
-        // Sparse numerator: accumulate Σ_i a_ij a_ik only over the pairs that
-        // co-fire, visiting rows in increasing order so each pair's running sum
-        // matches the dense `Σ_row` loop for the co-firing support.
+        // Sparse numerator `Σ_{i∈J∩K} a_ij a_ik` and truncated-support denominator
+        // energies `Σ_{i∈J} a_ij²` accumulated over the SAME active support (the
+        // `#3` consistency fix): both respect the per-row relative-mass floor, so
+        // the score is a well-defined truncated cosine rather than a hybrid.
         //
         // "Co-firing" on a row means carrying NON-NEGLIGIBLE mass relative to that
         // row's peak (`SAE_COACTIVE_RELATIVE_MASS_FLOOR`), not merely `a ≠ 0`. For
         // structurally sparse modes (JumpReLU/IBP) the active atoms sit far above
         // the floor and the hard zeros are excluded either way, so the support is
-        // unchanged. For SOFTMAX — where normalization leaves every atom a tiny but
-        // strictly positive tail mass — the bare `a ≠ 0` test marked all `K` atoms
-        // active on every row and degenerated this scan to the dense `O(N·K²)`
-        // all-pairs cost (minutes at `K = 10⁴`). A sub-floor atom contributes
-        // `≤ floor·peak` mass, so the co-activation and anti-collapse force it would
-        // register are negligible; dropping it keeps the scan `O(N·active²)` and the
-        // co-active support consistent with the compact row layout's cutoff.
+        // the full nonzero support and the score is the exact full normalized
+        // coactivation. For SOFTMAX the sub-floor tail is dropped from BOTH sums,
+        // keeping the scan `O(N·active²)` and the score consistent with the compact
+        // row layout's cutoff.
+        let mut energy = vec![0.0_f64; k_atoms];
         let mut num: std::collections::BTreeMap<(usize, usize), f64> =
             std::collections::BTreeMap::new();
         let mut active: Vec<usize> = Vec::new();
@@ -434,6 +440,11 @@ impl SaeManifoldTerm {
                 if gates[[row, k]].abs() > floor {
                     active.push(k);
                 }
+            }
+            // Truncated-support energies: only rows where the atom is active.
+            for &k in &active {
+                let a = gates[[row, k]];
+                energy[k] += a * a;
             }
             for ai in 0..active.len() {
                 let j = active[ai];
@@ -485,21 +496,41 @@ impl SaeManifoldTerm {
     ///
     /// DERIVATION. The Gaussian reconstruction NLL is quadratic in the stacked
     /// decoders `B`. Its Hessian (Gauss–Newton) block for atoms `(j, k)` is
-    /// `H_jj = Σ_i a_ij² φ_j(i)ᵀφ_j(i) ⊗ I_p`, `H_jk = Σ_i a_ij a_ik φ_j(i)ᵀφ_k(i) ⊗ I_p`,
-    /// where `φ_·(i)` is the atom's chart-basis row and `a_i·` the (frozen) routing
-    /// mass. Writing `G_j = Σ_i a_ij² φ_jᵀφ_j`, `G_k` likewise, and
-    /// `C = Σ_i a_ij a_ik φ_jᵀφ_k`, the two-atom data Hessian is PD in the aligning
-    /// direction iff the whitened cross operator `G_j^{-1/2} C G_k^{-1/2}` has
-    /// spectral norm `< 1`. That spectral norm IS `γ_jk` (a canonical correlation),
-    /// so `γ_jk → 1` is exactly the data-fit becoming unable to tell the two atoms
-    /// apart — the co-collapse the barrier exists to prevent — and `γ_jk → 0` is a
-    /// pair the data-fit already separates on its own (no safeguard needed).
+    /// `H_jj = Σ_i w_i a_ij² φ_j(i)ᵀφ_j(i) ⊗ I_p`, `H_jk = Σ_i w_i a_ij a_ik φ_j(i)ᵀφ_k(i) ⊗ I_p`,
+    /// where `φ_·(i)` is the atom's chart-basis row, `a_i·` the (frozen) routing
+    /// mass, and `w_i` the per-row reconstruction weight (the #991 design-honesty
+    /// weight [`Self::row_loss_weights`]; `1` when unweighted). Writing
+    /// `G_j = Σ_i w_i a_ij² φ_jᵀφ_j`, `G_k` likewise, and
+    /// `C = Σ_i w_i a_ij a_ik φ_jᵀφ_k`, the two-atom data Hessian is PD in the
+    /// aligning direction iff the whitened cross operator `G_j^{-1/2} C G_k^{-1/2}`
+    /// has spectral norm `< 1`. That spectral norm IS `γ_jk` (a canonical
+    /// correlation), so `γ_jk → 1` is exactly the data-fit becoming unable to tell
+    /// the two atoms apart — the co-collapse the barrier exists to prevent — and
+    /// `γ_jk → 0` is a pair the data-fit already separates on its own.
     ///
-    /// SCALE. `γ_jk` is read from the chart design `φ` and the routing masses `a`
-    /// only — NOT from the decoder magnitudes — so it is invariant under a global
-    /// decoder rescale `B_k → s·B_k` (the reconstruction Hessian in `B` does not
-    /// depend on the current `B`), preserving the barrier's decoder-scale
-    /// invariance while keying the strength to the actual evidence objective.
+    /// #4 fix — the per-row weight `w_i` is threaded through `G_j, G_k, C` so the
+    /// canonical correlation is read from the SAME weighted β-Hessian the fit
+    /// actually assembles (the arrow-Schur assembly applies `√w_i` to the residual,
+    /// latent Jacobian, and β basis load, so each block carries exactly one factor
+    /// of `w_i`). Previously these sums were UNWEIGHTED, so on a weighted fit the
+    /// barrier strength was derived from a Hessian the fit does not use. `w_i` is a
+    /// SCALAR row metric on the reconstruction channel (it reduces to `G_·⊗I_p`
+    /// exactly), so this is the exact weighted inseparability. If a row-DEPENDENT
+    /// output whitening metric `M_i` is additionally active (`row_metric` with
+    /// [`gam_problem::RowMetric::whitens_likelihood`]), the true β-Hessian block is
+    /// `Σ_i w_i a_ij a_ik φ_jᵀφ_k ⊗ M_i`, which does NOT reduce to `G_·⊗I_p`; this
+    /// function then computes the weighted-but-unwhitened `γ_jk` as an EXPLICIT,
+    /// documented approximation (the barrier is a conditioning SAFEGUARD, not the
+    /// objective, and the scalar-weighted blocks capture the dominant per-row
+    /// scaling; the exact row-dependent-metric canonical correlation would require
+    /// the full `M_j·p × M_k·p` generalized eigenproblem).
+    ///
+    /// SCALE. `γ_jk` is read from the chart design `φ`, the routing masses `a`, and
+    /// the row weights `w` only — NOT from the decoder magnitudes — so it is
+    /// invariant under a global decoder rescale `B_k → s·B_k` and under a global
+    /// weight rescale `w → c·w` (both `G` and `C` scale by `c`, cancelling in the
+    /// whitened cross), preserving the barrier's decoder-scale invariance while
+    /// keying the strength to the actual evidence objective.
     ///
     /// Uses the shared spectral cutoff [`SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF`] to
     /// whiten each `G` on its live range (a rank-deficient / never-firing atom
@@ -520,16 +551,24 @@ impl SaeManifoldTerm {
         if n == 0 || mj == 0 || mk == 0 || gates.nrows() != n {
             return 0.0;
         }
+        // #4 — per-row reconstruction weights `w_i` (the same #991 design-honesty
+        // weights the assembly applies as `√w_i`), or the exact unweighted path
+        // when none are installed. A mismatched length falls back to unweighted.
+        let row_w = self
+            .row_loss_weights
+            .as_deref()
+            .filter(|w| w.len() == n);
         // Coactivation-weighted design Grams and cross-Gram (small: M_· × M_·).
         let mut gj = Array2::<f64>::zeros((mj, mj));
         let mut gk = Array2::<f64>::zeros((mk, mk));
         let mut cross = Array2::<f64>::zeros((mj, mk));
         for i in 0..n {
+            let wi = row_w.map_or(1.0, |w| w[i]);
             let aj = gates[[i, j]];
             let ak = gates[[i, k]];
-            let aj2 = aj * aj;
-            let ak2 = ak * ak;
-            let ajk = aj * ak;
+            let aj2 = wi * aj * aj;
+            let ak2 = wi * ak * ak;
+            let ajk = wi * aj * ak;
             if aj2 > 0.0 {
                 for a in 0..mj {
                     let pja = phij[[i, a]];
@@ -759,16 +798,26 @@ impl SaeManifoldTerm {
         // `μ_jk` (falls back to live when no assembly has frozen them) so this value
         // matches the gradient the line search is testing against; the decoder shape
         // `c_jk²` below is still the LIVE cross-Gram, moving with the trial decoders.
+        // #2 fix — the collinearity scalar is the TRUE rank-aware decoder subspace
+        // overlap `o = o_jk` ([`Self::decoder_gram_cosine_sq`]), NOT the
+        // Frobenius-NORM-normalized `‖B_jB_kᵀ‖²_F/(‖B_j‖²_F‖B_k‖²_F)`. The latter
+        // reads `1/r` for two identical rank-r subspaces (`= 1/2` for identical
+        // 2-row decoders), sitting at/below the `0.5` gate so multi-row co-collapse
+        // went undetected; `o ∈ [0,1]` scores `1` for identical subspaces of any
+        // rank and reduces to the squared cosine for rank-1 blocks. Both the gate
+        // `w(o)` and the interior-point `-log(1-o+ε)` are the LIVE, differentiated
+        // functions of `o` (matching the analytic gradient in
+        // `add_sae_separation_barrier`).
         for (j, k, qjk, mu_jk) in self.barrier_coactivation_pairs() {
             if mu_jk == 0.0 || norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
                 continue;
             }
-            let c2 = self.barrier_cross_shape_energy(j, k) / (norm_sq[j] * norm_sq[k]);
-            let (gate, _dgate) = Self::separation_barrier_gate(c2);
+            let o = self.decoder_gram_cosine_sq(j, k);
+            let (gate, _dgate) = Self::separation_barrier_gate(o);
             if gate == 0.0 {
                 continue;
             }
-            let arg = (1.0 - c2 + eps).max(eps);
+            let arg = (1.0 - o + eps).max(eps);
             acc += mu_jk * (-qjk * gate * arg.ln());
         }
         penalty_scale * acc
@@ -797,18 +846,79 @@ impl SaeManifoldTerm {
         cross
     }
 
+    /// Frobenius norm `‖BBᵀ‖_F = sqrt(Σ_{a,a'}(Σ_o B[a,o]B[a',o])²)` of a decoder
+    /// block's own row-Gram. Equal to `‖BᵀB‖_F` (same nonzero spectrum) and to
+    /// `sqrt(Σ_r σ_r⁴)` in the singular values of `B`; `= ‖B‖²_F` only for a
+    /// rank-1 block. The rank-aware normalizer of [`Self::decoder_gram_cosine_sq`].
+    fn decoder_self_gram_frobenius_norm(b: &Array2<f64>) -> f64 {
+        let (m, p) = (b.nrows(), b.ncols());
+        let mut s = 0.0_f64;
+        for a in 0..m {
+            for a2 in 0..m {
+                let mut c = 0.0_f64;
+                for o in 0..p {
+                    c += b[[a, o]] * b[[a2, o]];
+                }
+                s += c * c;
+            }
+        }
+        s.sqrt()
+    }
+
+    /// #2 fix — the TRUE rank-aware decoder subspace overlap `∈ [0, 1]`: the
+    /// squared cosine between the two atoms' OUTPUT Gram operators `B_jᵀB_j` and
+    /// `B_kᵀB_k` in the Frobenius inner product,
+    ///
+    /// ```text
+    ///   o_jk = ‖B_jB_kᵀ‖²_F / (‖B_jB_jᵀ‖_F · ‖B_kB_kᵀ‖_F).
+    /// ```
+    ///
+    /// Because `‖B_jB_kᵀ‖²_F = ⟨B_jᵀB_j, B_kᵀB_k⟩_F`, Cauchy–Schwarz gives
+    /// `o_jk ∈ [0, 1]`, with `o_jk = 1` iff `B_jᵀB_j ∝ B_kᵀB_k` — the two atoms
+    /// occupy the SAME output subspace with a proportional spectrum, i.e. genuine
+    /// co-collapse — and `o_jk = cos²θ` for rank-1 blocks. This REPLACES the
+    /// Frobenius-NORM-normalized `‖B_jB_kᵀ‖²_F/(‖B_j‖²_F‖B_k‖²_F)` as the
+    /// collinearity GATE quantity: that older score is a true cosine² only for
+    /// rank-1 blocks and reads `1/r` for two IDENTICAL rank-r orthonormal
+    /// subspaces (e.g. `B_j = B_k = I₂` → `1/2`), sitting at/below the `0.5` gate
+    /// and so leaving multi-row co-collapse UNDETECTED. `o_jk` scores `1` for
+    /// identical subspaces of any rank while preserving the rank-1 special case
+    /// (and the rank-1 co-collapse limit, where it also → 1). Returns `0` if
+    /// either self-Gram is ~0 (a shapeless / vanishing decoder). It is the LIVE,
+    /// differentiated collinearity scalar of the separation barrier and repulsion
+    /// gate (its analytic gradient is derived in `add_sae_separation_barrier`).
+    pub(crate) fn decoder_gram_cosine_sq(&self, j: usize, k: usize) -> f64 {
+        let bj = &self.atoms[j].decoder_coefficients;
+        let bk = &self.atoms[k].decoder_coefficients;
+        let p = bj.ncols();
+        if bk.ncols() != p || p == 0 {
+            return 0.0;
+        }
+        let cross_sq = self.barrier_cross_shape_energy(j, k);
+        let dj = Self::decoder_self_gram_frobenius_norm(bj);
+        let dk = Self::decoder_self_gram_frobenius_norm(bk);
+        if !(dj > 0.0 && dk > 0.0) {
+            return 0.0;
+        }
+        (cross_sq / (dj * dk)).min(1.0)
+    }
+
     /// #1026/#1522 — accumulate the SEPARATION barrier's analytic gradient into
     /// `sys.gb` and a PSD majorizer into `sys.hbb`, in the full-`B` β layout.
     /// Returns `true` iff anything was written.
     ///
-    /// Per pair `j<k` with `n_j²=‖B_j‖²_F`, `M=B_jB_kᵀ`, `G=‖M‖²_F`,
-    /// `c²=G/(n_j²n_k²)`, `α = μ q_jk/(1-c²+ε) ≥ 0` (`= ∂[-μq·log(1-c²+ε)]/∂c²`):
-    ///   `∂P/∂B_j = 2α[ (M B_k)/(n_j²n_k²) - (c²/n_j²) B_j ]`,
-    ///   `∂P/∂B_k = 2α[ (Mᵀ B_j)/(n_j²n_k²) - (c²/n_k²) B_k ]`.
+    /// #2 — per pair `j<k` on the TRUE rank-aware overlap `o` (see
+    /// [`Self::decoder_gram_cosine_sq`]): `M=B_jB_kᵀ`, `S_·=B_·B_·ᵀ`,
+    /// `D_·=‖S_·‖_F`, `o=‖M‖²_F/(D_jD_k)`, and (gate `w`, `w'`)
+    /// `α = μ q_jk[w/(1-o+ε) - w'·log(1-o+ε)] ≥ 0`:
+    ///   `∂P/∂B_j = 2α[ (M B_k)/(D_jD_k) - (o/D_j²) S_j B_j ]`,
+    ///   `∂P/∂B_k = 2α[ (Mᵀ B_j)/(D_jD_k) - (o/D_k²) S_k B_k ]`.
     /// The exact Hessian is indefinite; a Levenberg PSD majorizer adds the
-    /// positive scalar `2α c²/n_·²` on the moving atom's diagonal block (matching
-    /// the magnitude of the self-shrink gradient term), which is PSD and grows
-    /// without bound as `c²→1`, exactly where separating curvature is needed.
+    /// positive scalar `2α o/D_·` on the moving atom's diagonal block (dominating
+    /// the self-shrink gradient term's operator scale), which is PSD and grows
+    /// without bound as `o→1`, exactly where separating curvature is needed. For
+    /// rank-1 blocks `D_·=‖B_·‖²_F`, `S_·B_·=‖B_·‖²_F·B_·` and `o=c²`, so this
+    /// reduces bit-for-bit to the historical Frobenius squared-cosine barrier.
     pub(crate) fn add_sae_separation_barrier(
         &self,
         sys: &mut ArrowSchurSystem,
@@ -835,7 +945,7 @@ impl SaeManifoldTerm {
         let mut wrote = false;
         // #1625/#1610 — use the FROZEN coactivation `q_jk` AND per-pair evidence
         // strength `μ_jk` (lagged at assembly entry), matching the value path. The
-        // decoder cross matrix / `c_jk²` below are the LIVE decoders, so the
+        // decoder cross matrix / overlap `o` below are the LIVE decoders, so the
         // assembled force still tracks the trial shape; only the routing weight and
         // the data-fit-derived strength are held fixed within the step, which is why
         // no logit-block gradient is owed for this term.
@@ -851,9 +961,8 @@ impl SaeManifoldTerm {
             if pj != p || bk.ncols() != p {
                 continue;
             }
-            let nj2 = norm_sq[j];
-            let nk2 = norm_sq[k];
-            // Cross matrix M = B_j B_kᵀ (shape m_j × m_k).
+            // Cross matrix M = B_j B_kᵀ (m_j × m_k) and the self-Grams
+            // S_j = B_jB_jᵀ (m_j × m_j), S_k likewise.
             let mut cross = Array2::<f64>::zeros((m_j, m_k));
             for a in 0..m_j {
                 for b in 0..m_k {
@@ -864,52 +973,77 @@ impl SaeManifoldTerm {
                     cross[[a, b]] = c;
                 }
             }
+            let s_j = bj.dot(&bj.t());
+            let s_k = bk.dot(&bk.t());
+            // #2 — the TRUE rank-aware decoder subspace overlap
+            //   `o = ‖B_jB_kᵀ‖²_F / (‖B_jB_jᵀ‖_F·‖B_kB_kᵀ‖_F) = ‖M‖²_F/(D_j D_k)`,
+            // scoring 1 for identical subspaces of ANY rank (the Frobenius-norm
+            // score `‖M‖²_F/(‖B_j‖²_F‖B_k‖²_F)` reads `1/r` there and left multi-row
+            // co-collapse ungated). `D_· = ‖S_·‖_F`. It reduces to the Frobenius
+            // squared-cosine `c²` for rank-1 blocks (`D_· = ‖B_·‖²_F`, `S_·B_· =
+            // ‖B_·‖²_F·B_·`), so this whole block is bit-identical to the historical
+            // `c²` path for single-row decoders.
             let g: f64 = cross.iter().map(|v| v * v).sum();
-            let c2 = g / (nj2 * nk2);
-            // #1625 — collinearity-gated barrier `P = -μ q w(c²) log(1-c²+ε)`.
-            // Its force is `α = ∂P/∂c² = μ q [ w(c²)/(1-c²+ε) - w'(c²)·log(1-c²+ε) ]`
-            // (product rule through the smoothstep). Both summands are ≥ 0 — `w,w' ≥ 0`,
-            // `log(1-c²+ε) ≤ 0` — so `α ≥ 0` and the gradient direction `∂c²/∂B` is
-            // unchanged from the ungated form (the gate only scales the magnitude and
-            // zeros it below the threshold). The ungated `μ q/(1-c²+ε)` is the special
-            // case `w≡1, w'≡0`. Below the gate `w=w'=0 ⇒ α=0`, a strict no-op.
-            let (gate, dgate) = Self::separation_barrier_gate(c2);
+            let d_j = s_j.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let d_k = s_k.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if !(d_j > 0.0 && d_k > 0.0) {
+                continue;
+            }
+            let o_overlap = (g / (d_j * d_k)).min(1.0);
+            // #1625 — collinearity-gated barrier `P = -μ q w(o) log(1-o+ε)`, LIVE and
+            // differentiated in `o`. Force `α = ∂P/∂o = μ q [ w(o)/(1-o+ε) - w'(o)·log(1-o+ε) ]`
+            // (product rule through the smoothstep); both summands ≥ 0, so `α ≥ 0`.
+            // Below the gate `w=w'=0 ⇒ α=0`, a strict no-op.
+            let (gate, dgate) = Self::separation_barrier_gate(o_overlap);
             if gate == 0.0 {
                 continue;
             }
-            let arg = (1.0 - c2 + eps).max(eps);
+            let arg = (1.0 - o_overlap + eps).max(eps);
             let alpha = mu * qjk * (gate / arg - dgate * arg.ln());
-            let inv = 1.0 / (nj2 * nk2);
+            let inv = 1.0 / (d_j * d_k);
             let off_j = offsets[j];
             let off_k = offsets[k];
-            // ∂P/∂B_j = 2α[ (M B_k)/(nj²nk²) - (c²/nj²) B_j ].
+            // ∂o/∂B_j = 2[ (M B_k)/(D_j D_k) - (o/D_j²) S_j B_j ], so
+            // ∂P/∂B_j = α · ∂o/∂B_j (and symmetrically for B_k). `S_· B_·` is the
+            // rank-aware analog of the historical self-shrink `‖B_·‖²_F·B_·`.
+            let sh_j = o_overlap / (d_j * d_j);
+            let sh_k = o_overlap / (d_k * d_k);
             for a in 0..m_j {
                 for o in 0..p {
                     let mut mb = 0.0_f64;
                     for b in 0..m_k {
                         mb += cross[[a, b]] * bk[[b, o]];
                     }
-                    let grad = 2.0 * alpha * (mb * inv - (c2 / nj2) * bj[[a, o]]);
+                    let mut sjb = 0.0_f64;
+                    for a2 in 0..m_j {
+                        sjb += s_j[[a, a2]] * bj[[a2, o]];
+                    }
+                    let grad = 2.0 * alpha * (mb * inv - sh_j * sjb);
                     sys.gb[off_j + a * p + o] += grad;
                 }
             }
-            // ∂P/∂B_k = 2α[ (Mᵀ B_j)/(nj²nk²) - (c²/nk²) B_k ].
             for b in 0..m_k {
                 for o in 0..p {
                     let mut mtb = 0.0_f64;
                     for a in 0..m_j {
                         mtb += cross[[a, b]] * bj[[a, o]];
                     }
-                    let grad = 2.0 * alpha * (mtb * inv - (c2 / nk2) * bk[[b, o]]);
+                    let mut skb = 0.0_f64;
+                    for b2 in 0..m_k {
+                        skb += s_k[[b, b2]] * bk[[b2, o]];
+                    }
+                    let grad = 2.0 * alpha * (mtb * inv - sh_k * skb);
                     sys.gb[off_k + b * p + o] += grad;
                 }
             }
             wrote = true;
             // Levenberg PSD majorizer: a positive scalar on each atom's diagonal
-            // block, magnitude `2α c²/n_·²`, growing as c²→1 — exactly the
-            // separating curvature needed at the co-collapse alignment limit.
-            let lev_j = 2.0 * alpha * c2 / nj2;
-            let lev_k = 2.0 * alpha * c2 / nk2;
+            // block, magnitude `2α o/D_·`, growing as o→1 — exactly the separating
+            // curvature needed at the co-collapse limit. It dominates the self-shrink
+            // gradient term (whose operator scale is `(o/D_·²)·σ_max(S_·) ≤ o/D_·`)
+            // and reduces to the historical `2α c²/‖B_·‖²_F` for rank-1 blocks.
+            let lev_j = 2.0 * alpha * o_overlap / d_j;
+            let lev_k = 2.0 * alpha * o_overlap / d_k;
             if dense_beta_curvature {
                 // Dense path: scatter onto the dense `sys.hbb` diagonal — the
                 // block `effective_penalty_op` reads (`DensePenaltyOp(hbb)`).
@@ -2160,4 +2294,356 @@ pub fn sae_row_block_penalty_kinds() -> &'static [&'static str] {
         "block_orthogonality",
         "isometry",
     ]
+}
+
+#[cfg(test)]
+mod tests_findings_234 {
+    use super::*;
+    use crate::manifold::tests::{periodic_basis, small_two_atom_periodic_term, TestPeriodicEvaluator};
+    use ndarray::array;
+
+    /// Build a co-firing (softmax) two-atom term with EXPLICIT decoder blocks of
+    /// shape `(3, p)`, so a test can plant an arbitrary decoder subspace geometry.
+    fn two_atom_term_with_decoders(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm {
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
+        let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let (phi1, jet1) = periodic_basis(&coords1);
+        let atom0 = SaeManifoldAtom::new(
+            "a0",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            dec0,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let atom1 = SaeManifoldAtom::new(
+            "a1",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi1,
+            jet1,
+            dec1,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        // softmax ⇒ every atom carries strictly positive mass on every row ⇒ the
+        // pair co-fires (q_01 > 0) so the barrier / repulsion actually engage.
+        let logits = array![
+            [0.7, -0.2],
+            [0.1, 0.4],
+            [-0.3, 0.5],
+            [0.6, -0.1],
+            [0.2, 0.3]
+        ];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0, coords1],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+    }
+
+    /// The OLD Frobenius-NORM-normalized collinearity score
+    /// `‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` — the metric the #2 fix replaces.
+    fn old_frobenius_cosine_sq(b0: &Array2<f64>, b1: &Array2<f64>) -> f64 {
+        let (m0, p) = (b0.nrows(), b0.ncols());
+        let m1 = b1.nrows();
+        let mut cross = 0.0_f64;
+        for a in 0..m0 {
+            for b in 0..m1 {
+                let mut c = 0.0_f64;
+                for o in 0..p {
+                    c += b0[[a, o]] * b1[[b, o]];
+                }
+                cross += c * c;
+            }
+        }
+        let n0: f64 = b0.iter().map(|v| v * v).sum();
+        let n1: f64 = b1.iter().map(|v| v * v).sum();
+        cross / (n0 * n1)
+    }
+
+    /// #2 — the collinearity metric is now a TRUE rank-aware subspace overlap: two
+    /// atoms sharing an IDENTICAL rank-2 output subspace score 1.0 (and trip BOTH
+    /// the separation barrier and the decoder-repulsion gate), whereas the old
+    /// Frobenius-norm score read exactly 1/2 = the gate threshold and gave them
+    /// ZERO anti-collapse force. Orthogonal subspaces score 0 (strict no-op).
+    #[test]
+    fn true_subspace_overlap_detects_multirow_co_collapse_finding2() {
+        // Identical rank-2 decoders spanning the same 2D output subspace.
+        let ident = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+        let term = two_atom_term_with_decoders(ident.clone(), ident.clone());
+
+        // Old Frobenius-norm score is exactly 1/2 for identical rank-2 blocks — at
+        // the 0.5 gate, so the old gate returned 0 (the undetected-collapse hole).
+        let old = old_frobenius_cosine_sq(&ident, &ident);
+        assert!(
+            (old - 0.5).abs() < 1e-12,
+            "old Frobenius-norm score must read 1/2 for identical rank-2 subspaces (the hole), got {old}"
+        );
+        // New true overlap scores 1.0 → gate fully engaged.
+        let o = term.decoder_gram_cosine_sq(0, 1);
+        assert!(
+            (o - 1.0).abs() < 1e-12,
+            "true subspace overlap must be 1.0 for identical rank-2 subspaces, got {o}"
+        );
+
+        // Separation barrier ENGAGES (positive value + separating gradient) where
+        // the old Frobenius gate (0.5 ≤ s0) would have been a strict no-op.
+        let (value, grad) = term.separation_barrier_value_and_grad_for_test(1.0);
+        assert!(
+            value > 0.0,
+            "identical rank-2 subspaces must carry a positive separation barrier, got {value}"
+        );
+        assert!(
+            grad.iter().any(|&g| g != 0.0),
+            "identical rank-2 subspaces must produce a separating gradient"
+        );
+
+        // Decoder-repulsion gate also engages on the pair.
+        let mut t2 = two_atom_term_with_decoders(ident.clone(), ident.clone());
+        t2.refresh_decoder_repulsion_gate();
+        let gate = t2
+            .decoder_repulsion_gate
+            .as_ref()
+            .expect("identical rank-2 subspaces must ENGAGE the repulsion gate");
+        assert!(
+            gate.iter().any(|&(j, k, w)| j == 0 && k == 1 && w > 0.0),
+            "engaged repulsion gate must carry a positive weight on pair (0,1): {gate:?}"
+        );
+
+        // Orthogonal output subspaces: overlap 0, barrier + repulsion strict no-op.
+        let b_ortho0 = array![[1.0, 0.0], [0.0, 0.0], [0.0, 0.0]];
+        let b_ortho1 = array![[0.0, 1.0], [0.0, 0.0], [0.0, 0.0]];
+        let ortho = two_atom_term_with_decoders(b_ortho0, b_ortho1);
+        assert!(
+            ortho.decoder_gram_cosine_sq(0, 1).abs() < 1e-12,
+            "orthogonal output subspaces must have zero overlap"
+        );
+        let (vo, go) = ortho.separation_barrier_value_and_grad_for_test(1.0);
+        assert_eq!(vo, 0.0, "orthogonal subspaces must carry zero barrier value");
+        assert!(
+            go.iter().all(|&g| g == 0.0),
+            "orthogonal subspaces must produce no separating force"
+        );
+    }
+
+    /// #2 — analytic ∂P_sep/∂B on the new overlap `o` matches a finite difference of
+    /// its OWN value on MULTI-ROW (rank-2) decoders, on the smoothstep interior. The
+    /// existing #1625 FD test covers only single-row (rank-1) blocks — where the new
+    /// barrier reduces bit-for-bit to the historical Frobenius one — so this test
+    /// certifies the genuinely NEW multi-row gradient (the `S_·B_·` self-shrink and
+    /// the `‖B_·B_·ᵀ‖_F` normalizers).
+    #[test]
+    fn separation_barrier_gradient_matches_fd_multirow_finding2() {
+        // Two rank-2 decoders overlapping partially (interior of the gate ramp).
+        let dec0 = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+        let dec1 = array![[0.9, 0.2], [0.1, 0.8], [0.0, 0.0]];
+        let base = two_atom_term_with_decoders(dec0.clone(), dec1.clone());
+        // Precondition: strictly on the smoothstep interior (0.5 < o < 1).
+        let o = base.decoder_gram_cosine_sq(0, 1);
+        assert!(
+            o > SAE_SEPARATION_BARRIER_COLLINEARITY_GATE && o < 1.0,
+            "fixture must sit on the gate ramp, got o={o}"
+        );
+        let (_v, grad) = base.separation_barrier_value_and_grad_for_test(1.0);
+        let offsets = base.beta_offsets();
+        let p = base.output_dim();
+        let h = 1.0e-7;
+        let mut max_rel = 0.0_f64;
+        // FD every coefficient of atom1's decoder block against the value.
+        for a in 0..dec1.nrows() {
+            for col in 0..p {
+                let mut plus = two_atom_term_with_decoders(dec0.clone(), dec1.clone());
+                let mut minus = two_atom_term_with_decoders(dec0.clone(), dec1.clone());
+                plus.atoms[1].decoder_coefficients[[a, col]] += h;
+                minus.atoms[1].decoder_coefficients[[a, col]] -= h;
+                let vp = plus.separation_barrier_value(1.0);
+                let vm = minus.separation_barrier_value(1.0);
+                let fd = (vp - vm) / (2.0 * h);
+                let analytic = grad[offsets[1] + a * p + col];
+                let rel = (fd - analytic).abs() / (1.0 + fd.abs().max(analytic.abs()));
+                max_rel = max_rel.max(rel);
+            }
+        }
+        assert!(
+            max_rel < 1.0e-5,
+            "multi-row analytic ∂P_sep/∂B must match FD of the value: max rel err {max_rel:.3e}"
+        );
+    }
+
+    /// #3 — the coactivation score is now a CONSISTENT truncated-support cosine: the
+    /// denominator energies are summed over the SAME per-atom active support as the
+    /// numerator, not over all rows. On a crafted softmax dense-tail routing (one
+    /// row where atom 1 is sub-floor) the impl matches the truncated-support formula
+    /// to machine precision and DIFFERS materially from the old truncated-numerator /
+    /// full-denominator hybrid.
+    #[test]
+    fn coactivation_is_consistent_truncated_support_finding3() {
+        // Row 0 drives atom 1 just BELOW the relative-mass floor (softmax tail);
+        // the other rows keep atom 1 WEAK but active (a small energy E1). Because
+        // the dropped tail mass is a MATERIAL fraction of that weak energy, the
+        // truncated-support denominator differs visibly from the full-row one (the
+        // gap is otherwise bounded by the floor² ≈ 1e-6 and hides on a strong atom).
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+        let coords1 = array![[0.15], [0.30], [0.65], [0.90]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let (phi1, jet1) = periodic_basis(&coords1);
+        let atom0 = SaeManifoldAtom::new(
+            "a0", SaeAtomBasisKind::Periodic, 1, phi0, jet0,
+            array![[0.25], [-0.35], [0.15]], Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let atom1 = SaeManifoldAtom::new(
+            "a1", SaeAtomBasisKind::Periodic, 1, phi1, jet1,
+            array![[-0.10], [0.20], [0.30]], Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let logits = array![
+            [5.6, 0.0],
+            [5.0, 0.04],
+            [5.0, 0.05],
+            [5.0, 0.03]
+        ];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0, coords1],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+
+        // Reference formulas evaluated directly on the realized gate matrix.
+        let gates = term.assignment.assignments();
+        let n = gates.nrows();
+        let mut num = 0.0_f64; // Σ_{i∈J∩K} a0 a1
+        let mut e0_trunc = 0.0_f64; // Σ_{i∈J} a0²
+        let mut e1_trunc = 0.0_f64; // Σ_{i∈K} a1²
+        let mut e0_all = 0.0_f64; // Σ_all a0²
+        let mut e1_all = 0.0_f64; // Σ_all a1²
+        for i in 0..n {
+            let a0 = gates[[i, 0]];
+            let a1 = gates[[i, 1]];
+            let peak = a0.abs().max(a1.abs());
+            let floor = SAE_COACTIVE_RELATIVE_MASS_FLOOR * peak;
+            let act0 = a0.abs() > floor;
+            let act1 = a1.abs() > floor;
+            if act0 {
+                e0_trunc += a0 * a0;
+            }
+            if act1 {
+                e1_trunc += a1 * a1;
+            }
+            if act0 && act1 {
+                num += a0 * a1;
+            }
+            e0_all += a0 * a0;
+            e1_all += a1 * a1;
+        }
+        let q_truncated = num / (e0_trunc * e1_trunc).sqrt();
+        let q_hybrid = num / (e0_all * e1_all).sqrt();
+
+        let pairs = term.barrier_coactive_pairs();
+        let q_impl = pairs
+            .iter()
+            .find(|&&(j, k, _)| j == 0 && k == 1)
+            .map(|&(_, _, q)| q)
+            .expect("pair (0,1) must co-fire");
+
+        assert!(
+            (q_impl - q_truncated).abs() < 1e-12,
+            "impl must equal the consistent truncated-support score: impl={q_impl} trunc={q_truncated}"
+        );
+        assert!(
+            (q_truncated - q_hybrid).abs() > 1e-6,
+            "the crafted dense-tail case must expose a material hybrid-vs-consistent gap: \
+             trunc={q_truncated} hybrid={q_hybrid}"
+        );
+        // The old hybrid under-weighted the barrier (full-row denominator inflates
+        // the divisor), so the consistent score is strictly larger here.
+        assert!(
+            q_truncated > q_hybrid,
+            "consistent truncated denominator must not under-weight vs the old hybrid"
+        );
+    }
+
+    /// #4 — the data-fit inseparability `γ_jk` is now read from the WEIGHTED
+    /// β-Hessian blocks (per-row weights `w_i` threaded into `G_j, G_k, C`, matching
+    /// the `√w_i` the assembly applies). With single-basis (M=1) atoms the canonical
+    /// correlation has a closed form we check exactly; a global weight rescale leaves
+    /// it invariant, and a non-uniform weighting moves it away from the unweighted
+    /// value.
+    #[test]
+    fn inseparability_uses_weighted_hessian_finding4() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        let n = term.n_obs();
+        // Collapse each atom's chart design to a single (M=1) known column so the
+        // canonical correlation reduces to a scalar closed form.
+        let phi0 = array![[0.5], [-0.3], [0.8], [0.2], [-0.6]];
+        let phi1 = array![[0.4], [0.7], [-0.2], [0.9], [0.1]];
+        term.atoms[0].basis_values = phi0.clone();
+        term.atoms[1].basis_values = phi1.clone();
+        let gates = term.assignment.assignments();
+
+        // Closed-form weighted γ = |Σ w a0 a1 φ0 φ1| / sqrt(Σ w a0²φ0² · Σ w a1²φ1²).
+        let gamma_closed = |w: &[f64]| -> f64 {
+            let (mut c, mut g0, mut g1) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for i in 0..n {
+                let a0 = gates[[i, 0]];
+                let a1 = gates[[i, 1]];
+                let (p0, p1) = (phi0[[i, 0]], phi1[[i, 0]]);
+                c += w[i] * a0 * a1 * p0 * p1;
+                g0 += w[i] * a0 * a0 * p0 * p0;
+                g1 += w[i] * a1 * a1 * p1 * p1;
+            }
+            (c.abs() / (g0 * g1).sqrt()).clamp(0.0, 1.0)
+        };
+
+        // Unweighted baseline.
+        term.row_loss_weights = None;
+        let gamma_none = term.design_inseparability_with_gates(gates.view(), 0, 1);
+        assert!(
+            (gamma_none - gamma_closed(&vec![1.0; n])).abs() < 1e-9,
+            "unweighted γ must match the closed form"
+        );
+
+        // Global rescale (all weights = 3.0) leaves γ invariant.
+        term.row_loss_weights = Some(vec![3.0; n]);
+        let gamma_uniform = term.design_inseparability_with_gates(gates.view(), 0, 1);
+        assert!(
+            (gamma_uniform - gamma_none).abs() < 1e-9,
+            "a global weight rescale must not change γ: {gamma_uniform} vs {gamma_none}"
+        );
+
+        // Non-uniform weights: matches the WEIGHTED closed form and differs from the
+        // unweighted value (proving the weights are actually threaded).
+        let w = vec![2.5_f64, 0.2, 1.7, 0.4, 3.1];
+        term.row_loss_weights = Some(w.clone());
+        let gamma_w = term.design_inseparability_with_gates(gates.view(), 0, 1);
+        assert!(
+            (gamma_w - gamma_closed(&w)).abs() < 1e-9,
+            "weighted γ must match the weighted closed form: impl={gamma_w} closed={}",
+            gamma_closed(&w)
+        );
+        assert!(
+            (gamma_w - gamma_none).abs() > 1e-4,
+            "non-uniform weights must move γ off the unweighted value: w={gamma_w} none={gamma_none}"
+        );
+    }
 }
