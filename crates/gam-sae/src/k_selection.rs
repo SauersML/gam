@@ -138,7 +138,22 @@ pub enum KSelectionMode {
     /// initial (steep-regime) slope.
     Kneedle,
     /// Penalized-EV / MDL: maximize `EV(K) − complexity_penalty · (K / K_max)`.
+    /// The `complexity_penalty` `γ` here is a TUNED dial — see
+    /// [`KSelectionMode::MeasuredMdl`] for the derived, tuning-free replacement.
     PenalizedMdl,
+    /// Measured MDL stopping rule (Theorem 4 of the "Superposed Geometry" memo):
+    /// the tuning-free replacement for `PenalizedMdl`'s `γ`. Stop at the first
+    /// `K` where the marginal EV gain per atom drops below the residual fraction
+    /// times one atom's storage nats over the total coded-scalar count:
+    /// ```text
+    ///   ∂EV/∂K  <  (1 − EV(K)) · ( d_eff,atom · ln n_eff ) / ( N · k̄ · d̄ ).
+    /// ```
+    /// Every quantity on the right is MEASURED by the fit (supplied through
+    /// [`KSelectionConfig::measured_coding`]); there is no free parameter. This
+    /// is the RECOMMENDED path. It reproduces [`KSelectionFlag::NoKnee`] exactly:
+    /// when the inequality never binds up to `K_max`, the largest `K` is
+    /// returned, flagged `NoKnee`.
+    MeasuredMdl,
 }
 
 impl KSelectionMode {
@@ -146,8 +161,9 @@ impl KSelectionMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "kneedle" | "knee" | "elbow" => Ok(Self::Kneedle),
             "mdl" | "penalized" | "penalized_mdl" => Ok(Self::PenalizedMdl),
+            "measured" | "measured_mdl" | "theorem4" | "theorem_4" => Ok(Self::MeasuredMdl),
             other => Err(format!(
-                "K-selection mode must be 'kneedle' or 'mdl'; got {other:?}"
+                "K-selection mode must be 'kneedle', 'mdl', or 'measured'; got {other:?}"
             )),
         }
     }
@@ -156,7 +172,65 @@ impl KSelectionMode {
         match self {
             Self::Kneedle => "kneedle",
             Self::PenalizedMdl => "mdl",
+            Self::MeasuredMdl => "measured",
         }
+    }
+}
+
+/// The fit-measured coding ingredients that make the Theorem-4 stopping rule
+/// ([`KSelectionMode::MeasuredMdl`]) tuning-free. Every field is read off the
+/// fit at its operating point — nothing is tuned.
+///
+/// # Persistence is bits (Theorem D)
+///
+/// Adding an atom lowers the code term by the reconstruction it buys and raises
+/// the dictionary term by exactly one atom's storage, `d_eff,atom · ln n_eff`
+/// nats. That storage is `2·` the per-atom rank charge `½·d_eff·ln n_eff` the
+/// WBIC / rank-charge accounting prices (the factor of two is the
+/// storage-vs-evidence convention). One nat of log-persistence per active row
+/// buys one nat of model evidence per unit codimension — persistence IS bits,
+/// and the LOG-length is the unique parameterisation in which storage is
+/// additive with the likelihood.
+#[derive(Debug, Clone, Copy)]
+pub struct MeasuredCoding {
+    /// Effective dof of the marginal atom, `d_eff,atom = rank_eff · basis_edf`
+    /// (the same product the rank charge prices).
+    pub d_eff_atom: f64,
+    /// Occupancy-corrected effective sample size `n_eff = Σ_row a²` — the SAME
+    /// quantity the MP edge / rank charge use, NOT the global row count. Keeps
+    /// the rule inert-row invariant.
+    pub n_eff: f64,
+    /// Number of coded rows `N`.
+    pub n_rows: f64,
+    /// Mean active atoms per row `k̄` (mean `L0` / occupancy).
+    pub k_bar: f64,
+    /// Mean coded scalars per active atom `d̄` (per-atom coordinate dimension).
+    pub d_bar: f64,
+}
+
+impl MeasuredCoding {
+    /// One atom's storage cost in nats, `d_eff,atom · ln n_eff` — the numerator
+    /// of the Theorem-4 right-hand side. Twice the per-atom rank charge
+    /// `½·d_eff·ln n_eff` (storage-vs-evidence convention).
+    pub fn atom_storage_nats(&self) -> f64 {
+        self.d_eff_atom * self.n_eff.max(1.0).ln()
+    }
+
+    /// Total count of coded scalars `N · k̄ · d̄` over which a marginal residual
+    /// saving is amortised — the denominator of the Theorem-4 right-hand side.
+    pub fn coded_scalar_count(&self) -> f64 {
+        self.n_rows * self.k_bar * self.d_bar
+    }
+
+    /// The measured Theorem-4 right-hand side at explained variance `ev`:
+    /// `(1 − ev) · atom_storage_nats / coded_scalar_count`. This is the smallest
+    /// marginal EV gain per atom that still pays for the atom's storage.
+    pub fn stop_threshold(&self, ev: f64) -> f64 {
+        let denom = self.coded_scalar_count();
+        if !(denom > 0.0) {
+            return f64::INFINITY;
+        }
+        (1.0 - ev).max(0.0) * self.atom_storage_nats() / denom
     }
 }
 
@@ -175,6 +249,11 @@ pub struct KSelectionConfig {
     /// is treated as already saturated ([`KSelectionFlag::Flat`]) and the
     /// smallest `K` is returned.
     pub flat_span_tol: f64,
+    /// The fit-measured coding ingredients for [`KSelectionMode::MeasuredMdl`].
+    /// `None` on the `Kneedle` / `PenalizedMdl` paths (they do not need it). When
+    /// the mode is `MeasuredMdl` but this is `None`, [`select_k`] falls back to
+    /// `Kneedle` (nothing to measure with).
+    pub measured_coding: Option<MeasuredCoding>,
 }
 
 impl Default for KSelectionConfig {
@@ -185,6 +264,20 @@ impl Default for KSelectionConfig {
             knee_slope_fraction: 0.10,
             complexity_penalty: 0.05,
             flat_span_tol: 1.0e-6,
+            measured_coding: None,
+        }
+    }
+}
+
+impl KSelectionConfig {
+    /// The recommended tuning-free config: the Theorem-4 measured MDL stopping
+    /// rule fed the fit's own coding ingredients. Prefer this over a tuned
+    /// `PenalizedMdl` `γ`.
+    pub fn measured(coding: MeasuredCoding) -> Self {
+        Self {
+            mode: KSelectionMode::MeasuredMdl,
+            measured_coding: Some(coding),
+            ..Self::default()
         }
     }
 }
@@ -275,6 +368,56 @@ pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
     match config.mode {
         KSelectionMode::Kneedle => select_kneedle(curve, config, span),
         KSelectionMode::PenalizedMdl => select_mdl(curve, config),
+        KSelectionMode::MeasuredMdl => match config.measured_coding {
+            Some(coding) => select_measured(curve, &coding),
+            // No coding ingredients to measure with: fall back to the knee.
+            None => select_kneedle(curve, config, span),
+        },
+    }
+}
+
+/// The Theorem-4 measured MDL stopping rule ([`KSelectionMode::MeasuredMdl`]).
+///
+/// Walks the frontier and stops at the first `K` whose marginal EV gain PER ATOM
+/// (`(EV_i − EV_{i−1}) / (K_i − K_{i−1})`) falls below the measured
+/// [`MeasuredCoding::stop_threshold`] at that `K`. The selected `K` is the last
+/// atom that still paid for itself — the sample before the first binding one. If
+/// no atom fails the test, the largest `K` is returned flagged
+/// [`KSelectionFlag::NoKnee`], reproducing the tuned-path NoKnee behaviour
+/// exactly. The `score` carries the marginal-vs-threshold ratio at the stop
+/// (`< 1` when the rule bound, `+∞` for the NoKnee case).
+///
+/// This is MODEL-FREE: it compares the MEASURED marginal against the MEASURED
+/// right-hand side at each `K`, assuming no functional form for `EV(K)`.
+fn select_measured(curve: &EvVsKCurve, coding: &MeasuredCoding) -> KSelection {
+    let pts = curve.points();
+    let n = pts.len();
+    for i in 1..n {
+        let dk = (pts[i].k - pts[i - 1].k) as f64;
+        let marginal = (pts[i].ev - pts[i - 1].ev) / dk.max(MIN_DENOM);
+        let threshold = coding.stop_threshold(pts[i].ev);
+        if marginal < threshold {
+            // Atom `i` failed to pay for its storage: stop growing. The accepted
+            // dictionary is everything strictly before it.
+            let ratio = if threshold > 0.0 {
+                marginal / threshold
+            } else {
+                f64::INFINITY
+            };
+            return KSelection {
+                k: pts[i - 1].k,
+                ev: pts[i - 1].ev,
+                flag: KSelectionFlag::Knee,
+                score: ratio,
+            };
+        }
+    }
+    // Never bound: the residual saving still outpays storage at K_max.
+    KSelection {
+        k: curve.k_max(),
+        ev: pts[n - 1].ev,
+        flag: KSelectionFlag::NoKnee,
+        score: f64::INFINITY,
     }
 }
 
@@ -765,7 +908,117 @@ mod k_selection_tests {
             KSelectionMode::parse("MDL").expect("parse"),
             KSelectionMode::PenalizedMdl
         );
+        assert_eq!(
+            KSelectionMode::parse("measured").expect("parse"),
+            KSelectionMode::MeasuredMdl
+        );
+        assert_eq!(
+            KSelectionMode::parse("theorem4").expect("parse"),
+            KSelectionMode::MeasuredMdl
+        );
         assert_eq!(KSelectionMode::Kneedle.as_str(), "kneedle");
+        assert_eq!(KSelectionMode::MeasuredMdl.as_str(), "measured");
         assert!(KSelectionMode::parse("nonsense").is_err());
+    }
+
+    /// Build a saturating EV curve `EV(K) = K/(K+τ)` with constant coding
+    /// ingredients, so the Theorem-4 right-hand side is a constant `c` and the
+    /// stopping `K` has a closed form we can check against.
+    ///
+    /// For `EV(K)=K/(K+τ)`: residual `1−EV = τ/(K+τ)`, marginal
+    /// `EV(K)−EV(K−1) = τ/((K+τ)(K−1+τ))`, ratio marginal/residual `= 1/(K−1+τ)`.
+    /// The stop condition marginal `< (1−EV)·c` is `1/(K−1+τ) < c`, i.e.
+    /// `K > 1/c − τ + 1`. So the FIRST binding K is `⌈1/c − τ + 1⌉` (strict) and
+    /// the selected K (last atom that paid) is that minus one.
+    fn saturating_coding(c: f64) -> (Vec<EvVsKPoint>, MeasuredCoding) {
+        // Set atom_storage_nats / coded_scalar_count == c. Pick n_eff so ln = 2,
+        // d_eff_atom = 1 → storage = 2; then coded = 2/c.
+        let d_eff_atom = 1.0;
+        let n_eff = std::f64::consts::E.powf(2.0);
+        let storage = d_eff_atom * n_eff.ln();
+        let coding = MeasuredCoding {
+            d_eff_atom,
+            n_eff,
+            n_rows: storage / c,
+            k_bar: 1.0,
+            d_bar: 1.0,
+        };
+        (Vec::new(), coding)
+    }
+
+    fn saturating_curve(tau: f64, k_max: usize) -> EvVsKCurve {
+        curve_from_pairs(
+            &(1..=k_max)
+                .map(|k| {
+                    let kf = k as f64;
+                    (k, kf / (kf + tau))
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("saturating curve")
+    }
+
+    #[test]
+    fn measured_rule_stops_at_theory_predicted_k() {
+        // 1/c = 15.5, τ = 5 → K > 15.5 − 5 + 1 = 11.5 → first binding K = 12,
+        // selected K = 11.
+        let (_p, coding) = saturating_coding(1.0 / 15.5);
+        let curve = saturating_curve(5.0, 40);
+        let sel = select_k(&curve, &KSelectionConfig::measured(coding));
+        assert_eq!(sel.flag, KSelectionFlag::Knee, "measured rule should bind");
+        assert_eq!(sel.k, 11, "selected K = last atom that paid for itself");
+        assert!(sel.score < 1.0, "marginal below threshold at the stop");
+    }
+
+    #[test]
+    fn measured_rule_returns_k_max_when_never_binding() {
+        // Tiny c → threshold ≈ 0 → every atom always pays → NoKnee at K_max.
+        let (_p, coding) = saturating_coding(1e-9);
+        let curve = saturating_curve(5.0, 25);
+        let sel = select_k(&curve, &KSelectionConfig::measured(coding));
+        assert_eq!(sel.flag, KSelectionFlag::NoKnee, "must reproduce NoKnee");
+        assert_eq!(sel.k, 25, "NoKnee returns K_max");
+    }
+
+    #[test]
+    fn measured_rule_stops_earlier_when_storage_expensive() {
+        let curve = saturating_curve(5.0, 40);
+        let (_pe, expensive) = saturating_coding(1.0 / 6.5); // K > 2.5 → selected 2
+        let (_pc, cheap) = saturating_coding(1.0 / 15.5); // selected 11
+        let k_exp = select_k(&curve, &KSelectionConfig::measured(expensive)).k;
+        let k_cheap = select_k(&curve, &KSelectionConfig::measured(cheap)).k;
+        assert_eq!(k_exp, 2);
+        assert!(
+            k_exp < k_cheap,
+            "expensive storage must stop earlier: {k_exp} vs {k_cheap}"
+        );
+    }
+
+    #[test]
+    fn measured_mode_without_coding_falls_back_to_knee() {
+        let curve = knee_curve();
+        let cfg = KSelectionConfig {
+            mode: KSelectionMode::MeasuredMdl,
+            measured_coding: None,
+            ..KSelectionConfig::default()
+        };
+        let sel = select_k(&curve, &cfg);
+        // Falls back to Kneedle, which knees this curve at K=4.
+        assert_eq!(sel.k, 4);
+        assert_eq!(sel.flag, KSelectionFlag::Knee);
+    }
+
+    #[test]
+    fn stop_threshold_matches_hand_computation() {
+        let coding = MeasuredCoding {
+            d_eff_atom: 2.0,
+            n_eff: std::f64::consts::E, // ln = 1
+            n_rows: 100.0,
+            k_bar: 2.0,
+            d_bar: 5.0,
+        };
+        // storage = 2·1 = 2; coded = 100·2·5 = 1000; residual at ev=0.75 = 0.25.
+        let expected = 0.25 * 2.0 / 1000.0;
+        assert!((coding.stop_threshold(0.75) - expected).abs() < 1e-15);
     }
 }

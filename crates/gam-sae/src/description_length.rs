@@ -370,6 +370,130 @@ impl DescriptionLength {
     }
 }
 
+// ===========================================================================
+// Rate–distortion currency: the curved-coding gain and the persistence↔evidence
+// exchange rate (Theorem 3 + Corollary E of the "Superposed Geometry" memo).
+// ===========================================================================
+//
+// The knee only means something in a currency. The [`score`] / [`Featurizer`]
+// surface above already measures code / selection / dictionary bits; the pieces
+// below add the two rate–distortion facts that price CURVATURE against that
+// ledger:
+//
+//   1. Curved coding pays a closed-form gain (Theorem 3): coding a firing
+//      against a `d`-dim curved chart in `D`-dim ambient, at tolerance `δ`, beats
+//      the flat `D`-dim Gaussian by `Δ = ((D−d)/2)·log₂(1/δ²) + C` bits — every
+//      pinned-down ambient direction saves `½ log₂(1/δ²)` bits.
+//   2. The persistence ↔ evidence exchange rate (Corollary E): a bar `[b,d)`
+//      supports birthing iff its LOG-length clears an occupancy-driven bar,
+//      bootstrap-free.
+//
+// The κ = 2 Gaussian is the ZERO-GAIN anchor: curved coding pays iff the radial
+// law departs from Gaussian (sub-Gaussian concentration κ<2 dense circle, or
+// super-Gaussian gating κ=1/q>2), so the ISA `(κ−2)²` contrast is EXACTLY a
+// coding-gain detector — see [`kappa_coding_gain_detector`].
+//
+// HONEST RECONCILIATION WITH PREMISE: this gain is ACTIVATION-space compression,
+// measured in bits of reconstruction code. It is ORTHOGONAL to the behavioral
+// nats of the Rung-1/Rung-2 fits — curvature can pay HERE (positive `Δ`) and be
+// behaviorally inert (buy zero next-token evidence). That is by design: two
+// ledgers, kept separate. This section speaks only the bits ledger.
+
+/// The general Theorem-3 per-firing curved coding gain, in bits:
+/// `Δ = ((D − d)/2) · log₂(1/δ²) + C`.
+///
+/// `ambient_d = D`, `intrinsic_d = d`, `delta = δ` the reconstruction tolerance,
+/// `shape_const = C` the shape-dependent constant (`0` for the bare codimension
+/// dividend). Returns `0.0` when the codimension is non-positive (a flat chart
+/// pins nothing down) or `δ ≤ 0`.
+pub fn curved_coding_gain_bits(
+    ambient_d: f64,
+    intrinsic_d: f64,
+    delta: f64,
+    shape_const: f64,
+) -> f64 {
+    let codim = ambient_d - intrinsic_d;
+    if !(codim > 0.0) || !(delta > 0.0) {
+        return 0.0;
+    }
+    // log₂(1/δ²) = −2·log₂(δ); positive when δ < 1 (a real tolerance).
+    (codim / 2.0) * (1.0 / (delta * delta)).log2() + shape_const
+}
+
+/// The EXACT circle coding gain (Theorem 3, circle case), in bits:
+/// `Δ_circle = ½ · log₂( 3 a² / (π² δ²) )`.
+///
+/// `a` is the circle radius, `delta = δ` the tolerance. This is the general
+/// formula at `D − d = 1` with the circle's shape constant folded in.
+pub fn circle_coding_gain_bits(a: f64, delta: f64) -> f64 {
+    if !(a > 0.0) || !(delta > 0.0) {
+        return 0.0;
+    }
+    use std::f64::consts::PI;
+    0.5 * (3.0 * a * a / (PI * PI * delta * delta)).log2()
+}
+
+/// The circle's shape constant `C = ½ log₂(3 a² / π²)`: the additive term that
+/// makes [`curved_coding_gain_bits`] with `D − d = 1` equal
+/// [`circle_coding_gain_bits`]. Exposed so callers can cross-check the two forms.
+pub fn circle_shape_const_bits(a: f64) -> f64 {
+    if !(a > 0.0) {
+        return 0.0;
+    }
+    use std::f64::consts::PI;
+    0.5 * (3.0 * a * a / (PI * PI)).log2()
+}
+
+/// The Corollary-E a-priori bar-significance threshold, in nats of log-persistence:
+/// `( ½ · Δd_eff · log n_eff ) / ( n_eff · (D − d) )`.
+///
+/// A persistence bar must have `log(death/birth)` exceeding this to support
+/// birthing — bootstrap-free. Every input is measured: `delta_d_eff = Δd_eff` the
+/// candidate atom's dof increment, `n_eff` the occupancy-corrected effective
+/// sample size (`Σ_row a²`, NOT the global row count), `codim = D − d` the
+/// codimension the atom pins down. Returns `+∞` (nothing clears it) on a
+/// degenerate codimension or `n_eff`.
+pub fn bar_birth_threshold_nats(delta_d_eff: f64, n_eff: f64, codim: f64) -> f64 {
+    if !(codim > 0.0) || !(n_eff > 0.0) {
+        return f64::INFINITY;
+    }
+    0.5 * delta_d_eff * n_eff.max(1.0).ln() / (n_eff * codim)
+}
+
+/// Whether a persistence bar `[birth, death)` clears the Corollary-E threshold and
+/// so supports birthing an atom — bootstrap-free. Compares the bar's LOG-length
+/// `log(death/birth)` against [`bar_birth_threshold_nats`].
+///
+/// The LOG-length is load-bearing (Theorem D): persistence is additive with the
+/// likelihood only under `log(d/b)`, which is why a bar twice as long in log buys
+/// twice the evidence — `death − birth` would NOT be the right currency.
+pub fn bar_supports_birth(birth: f64, death: f64, delta_d_eff: f64, n_eff: f64, codim: f64) -> bool {
+    if !(birth > 0.0) || !(death > birth) {
+        return false;
+    }
+    (death / birth).ln() > bar_birth_threshold_nats(delta_d_eff, n_eff, codim)
+}
+
+/// The persistence ↔ evidence exchange rate (Theorem D / Corollary E): nats of
+/// model evidence bought per nat of log-persistence, `= n_eff · (D − d)`.
+///
+/// This is the scale that inverts [`bar_birth_threshold_nats`] (up to the
+/// `½·Δd_eff·log n_eff` storage the bar must repay): one nat of log-persistence
+/// per active row buys one nat of evidence per unit codimension.
+pub fn evidence_per_log_persistence(n_eff: f64, codim: f64) -> f64 {
+    n_eff.max(0.0) * codim.max(0.0)
+}
+
+/// The ISA coding-gain detector `(κ − 2)²`. Zero EXACTLY at the Gaussian anchor
+/// `κ = 2` (no curved-coding bits to give); positive as the radial law departs
+/// from Gaussian in EITHER direction — sub-Gaussian concentration (`κ < 2`, dense
+/// circle) or super-Gaussian gating (`κ = 1/q > 2`). The manifold SAE's ISA
+/// contrast term IS this detector: it fires precisely where
+/// [`curved_coding_gain_bits`] has a positive gain to collect.
+pub fn kappa_coding_gain_detector(kappa: f64) -> f64 {
+    (kappa - 2.0).powi(2)
+}
+
 #[cfg(test)]
 #[path = "description_length_tests.rs"]
 mod description_length_tests;

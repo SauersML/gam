@@ -3,10 +3,83 @@
 //! exactly, and the criterion-bits reconciliation invariant must hold.
 
 use super::{
-    Crossover, DescriptionLength, Featurizer, ScoreRow, crossover_firings, reverse_water_filling,
-    scalar_rate_bits, score, selection_bits,
+    Crossover, DescriptionLength, Featurizer, ScoreRow, bar_birth_threshold_nats,
+    bar_supports_birth, circle_coding_gain_bits, circle_shape_const_bits, crossover_firings,
+    curved_coding_gain_bits, evidence_per_log_persistence, kappa_coding_gain_detector,
+    reverse_water_filling, scalar_rate_bits, score, selection_bits,
 };
 use crate::atom_codes::SparseAtomCodes;
+
+#[test]
+fn circle_gain_matches_closed_form() {
+    use std::f64::consts::PI;
+    let a = 1.7;
+    let delta = 0.05;
+    let got = circle_coding_gain_bits(a, delta);
+    let expected = 0.5 * (3.0 * a * a / (PI * PI * delta * delta)).log2();
+    assert!((got - expected).abs() < 1e-12, "got {got} expected {expected}");
+}
+
+#[test]
+fn general_gain_with_circle_shape_const_equals_circle_gain() {
+    // D − d = 1 for the circle; feeding its shape constant into the general
+    // formula must reproduce the exact circle gain.
+    let a = 2.3;
+    let delta = 0.02;
+    let c = circle_shape_const_bits(a);
+    let general = curved_coding_gain_bits(2.0, 1.0, delta, c);
+    let circle = circle_coding_gain_bits(a, delta);
+    assert!(
+        (general - circle).abs() < 1e-12,
+        "general {general} vs circle {circle}"
+    );
+}
+
+#[test]
+fn codimension_dividend_is_half_log_per_direction() {
+    let delta = 0.1;
+    let one = curved_coding_gain_bits(3.0, 2.0, delta, 0.0);
+    let two = curved_coding_gain_bits(4.0, 2.0, delta, 0.0);
+    let per_dir = 0.5 * (1.0 / (delta * delta)).log2();
+    assert!((one - per_dir).abs() < 1e-12);
+    assert!((two - 2.0 * per_dir).abs() < 1e-12);
+}
+
+#[test]
+fn no_gain_without_codimension() {
+    assert_eq!(curved_coding_gain_bits(3.0, 3.0, 0.1, 5.0), 0.0);
+    assert_eq!(curved_coding_gain_bits(2.0, 3.0, 0.1, 5.0), 0.0);
+    assert_eq!(circle_coding_gain_bits(0.0, 0.1), 0.0);
+}
+
+#[test]
+fn bar_threshold_matches_formula_and_gates_correctly() {
+    let delta_d_eff = 4.0;
+    let n_eff = std::f64::consts::E.powf(3.0); // ln = 3
+    let codim = 2.0;
+    let thr = bar_birth_threshold_nats(delta_d_eff, n_eff, codim);
+    // ½·4·3 / (n_eff·2) = 3/n_eff.
+    let expected = 3.0 / n_eff;
+    assert!((thr - expected).abs() < 1e-12, "thr {thr} expected {expected}");
+
+    let birth = 1.0;
+    let death_pass = (thr * 1.01).exp();
+    let death_fail = (thr * 0.99).exp();
+    assert!(bar_supports_birth(birth, death_pass, delta_d_eff, n_eff, codim));
+    assert!(!bar_supports_birth(birth, death_fail, delta_d_eff, n_eff, codim));
+}
+
+#[test]
+fn exchange_rate_is_neff_times_codim() {
+    assert_eq!(evidence_per_log_persistence(128.0, 3.0), 384.0);
+}
+
+#[test]
+fn kappa_detector_zero_only_at_gaussian_anchor() {
+    assert_eq!(kappa_coding_gain_detector(2.0), 0.0);
+    assert!(kappa_coding_gain_detector(1.0) > 0.0); // super-Gaussian gate
+    assert!(kappa_coding_gain_detector(1.5) > 0.0); // sub-Gaussian circle
+}
 
 fn feat(
     name: &str,
