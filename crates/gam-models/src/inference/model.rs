@@ -637,8 +637,9 @@ pub fn append_deployment_extension_columns(
             });
         }
         let col = p_old + tail_idx;
+        let level_bits = gam_data::canonical_level_bits(f64::from_bits(extension.level_bits));
         for row in 0..n {
-            if data[[row, prediction_col]].to_bits() == extension.level_bits {
+            if gam_data::canonical_level_bits(data[[row, prediction_col]]) == level_bits {
                 out[[row, col]] = 1.0;
             }
         }

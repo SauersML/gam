@@ -604,8 +604,9 @@ fn linear_term_derivative_column(
                 linear.name
             )));
         }
+        let level_bits = gam_data::canonical_level_bits(f64::from_bits(level_bits));
         for (row, g) in gate.iter_mut().enumerate() {
-            if data[[row, col]].to_bits() != level_bits {
+            if gam_data::canonical_level_bits(data[[row, col]]) != level_bits {
                 *g = 0.0;
             }
         }
@@ -1444,8 +1445,9 @@ fn build_parametric_constraint_block_for_term(
         }
         let mut c = Array2::<f64>::zeros((n, 1));
         let by = data.column(by_col);
+        let value_bits = gam_data::canonical_level_bits(f64::from_bits(value_bits));
         for (row, &value) in by.iter().enumerate() {
-            if value.to_bits() == value_bits {
+            if gam_data::canonical_level_bits(value) == value_bits {
                 c[[row, 0]] = 1.0;
             }
         }

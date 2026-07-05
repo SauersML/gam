@@ -271,7 +271,7 @@ fn encoded_levels_for_column(ds: &Dataset, col: ColIdx) -> Vec<(u64, String)> {
     let mut seen = BTreeSet::<u64>::new();
     for value in ds.values.column(col.get()) {
         if value.is_finite() {
-            seen.insert(value.to_bits());
+            seen.insert(gam_data::canonical_level_bits(*value));
         }
     }
     let schema_levels = ds

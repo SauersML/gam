@@ -50,6 +50,48 @@ fn sort_levels_canonical(levels: &mut [String]) {
     levels.sort_by(|a, b| natural_level_cmp(a, b));
 }
 
+/// Canonical bit key for a floating-point categorical / grouping level.
+///
+/// Factor dummies, random-effect groups, `by=` gates and factor-smooth blocks
+/// all identify a level by the raw bits of its numeric code — they intern the
+/// observed codes with `f64::to_bits()` and, at fit/predict time, gate each row
+/// by `data_bits == level_bits`. Raw `to_bits()` is a **bit** identity, not the
+/// **numeric** equality IEEE-754 defines, and the two disagree in exactly two
+/// places:
+///
+/// * **Signed zero.** `+0.0` is `0x0000_0000_0000_0000` and `-0.0` is
+///   `0x8000_0000_0000_0000`, yet IEEE-754 guarantees `+0.0 == -0.0`. Keying on
+///   raw bits splits one physical group into two: a row whose code is `-0.0`
+///   matches no `+0.0` dummy, so its factor / random effect silently drops and
+///   the prediction collapses onto the intercept / population mean. Signed zero
+///   arises routinely from ordinary float arithmetic on a computed group column
+///   (`-1.0 * 0.0`, a centred/differenced column landing on `-0.0`, `np.round`
+///   emitting `-0.0`), and the miss is silent — no schema error, `check()` still
+///   reports `ok=True`. See #2145 (random effect) and #2146 (factor dummy).
+/// * **NaN.** Every quiet/signalling NaN payload and sign bit denotes "not a
+///   number", so `2^53`-ish distinct bit patterns would otherwise intern as
+///   distinct levels. (NaN group codes are rejected upstream on most paths, but
+///   canonicalising here keeps the key numerically honest regardless.)
+///
+/// This maps both encodings to a single canonical key while leaving every
+/// ordinary finite value bit-stable, so that
+/// `canonical_level_bits(a) == canonical_level_bits(b)` iff `a` and `b` name the
+/// same real-valued level. Interning and lookup must **both** route through this
+/// function; because it is idempotent, applying it to an already-canonical
+/// frozen level set is a no-op.
+#[inline]
+pub fn canonical_level_bits(v: f64) -> u64 {
+    if v == 0.0 {
+        // Matches both +0.0 and -0.0 (IEEE-754: -0.0 == 0.0); collapse to +0.0.
+        0.0_f64.to_bits()
+    } else if v.is_nan() {
+        // Collapse every NaN payload/sign to one canonical quiet-NaN key.
+        f64::NAN.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed error
 // ---------------------------------------------------------------------------

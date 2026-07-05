@@ -1171,9 +1171,13 @@ impl LinearTermSpec {
 
         for &(col, level_bits) in &self.categorical_levels {
             bounds(col)?;
+            // Canonicalize the stored key once (loop-invariant) so the gate is
+            // robust to level sets interned before signed-zero canonicalization
+            // landed, not just to canonical data rows (#2146).
+            let level_bits = gam_data::canonical_level_bits(f64::from_bits(level_bits));
             let gate = data.column(col);
             for (out, &v) in column.iter_mut().zip(gate.iter()) {
-                if v.to_bits() != level_bits {
+                if gam_data::canonical_level_bits(v) != level_bits {
                     *out = 0.0;
                 }
             }
@@ -5789,12 +5793,18 @@ pub fn build_random_effect_block(
                 spec.name
             );
         }
-        levels.clone()
+        // Canonicalize a possibly-legacy frozen set: a `-0.0` group interned
+        // before signed-zero canonicalization landed would otherwise never match
+        // a canonicalized data row. Idempotent on already-canonical sets (#2145).
+        levels
+            .iter()
+            .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
+            .collect()
     } else {
         let mut seen = BTreeSet::<u64>::new();
         let mut levels = Vec::<u64>::new();
         for &v in col {
-            let bits = v.to_bits();
+            let bits = gam_data::canonical_level_bits(v);
             if seen.insert(bits) {
                 levels.push(bits);
             }
@@ -5829,7 +5839,7 @@ pub fn build_random_effect_block(
     }
     let mut group_ids = Vec::with_capacity(n);
     for &v in col {
-        let bits = v.to_bits();
+        let bits = gam_data::canonical_level_bits(v);
         group_ids.push(level_to_col.get(&bits).copied());
     }
 
@@ -6406,13 +6416,16 @@ pub fn apply_by_variable_to_local_build(
     }
     let weights = match by {
         ByVariableSpec::Numeric => data.column(by_col).to_owned(),
-        ByVariableSpec::Level { value_bits, .. } => data.column(by_col).mapv(|value| {
-            if value.to_bits() == *value_bits {
-                1.0
-            } else {
-                0.0
-            }
-        }),
+        ByVariableSpec::Level { value_bits, .. } => {
+            let value_bits = gam_data::canonical_level_bits(f64::from_bits(*value_bits));
+            data.column(by_col).mapv(|value| {
+                if gam_data::canonical_level_bits(value) == value_bits {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+        }
     };
     if weights.iter().any(|value| !value.is_finite()) {
         crate::bail_invalid_basis!(
@@ -6483,13 +6496,15 @@ pub fn build_by_smooth_local(
             // Collect factor levels: prefer the frozen set (replay path), else
             // scan the data column (first-fit path).
             let level_bits: Vec<u64> = if let Some(fl) = frozen_levels {
-                fl.clone()
+                fl.iter()
+                    .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
+                    .collect()
             } else {
                 let col = data.column(*feature_col);
                 let mut seen = BTreeSet::<u64>::new();
                 for &v in col.iter() {
                     if v.is_finite() {
-                        seen.insert(v.to_bits());
+                        seen.insert(gam_data::canonical_level_bits(v));
                     }
                 }
                 seen.into_iter().collect()
@@ -6516,7 +6531,7 @@ pub fn build_by_smooth_local(
             for (lvl_idx, &bits) in level_bits.iter().enumerate() {
                 let col_start = lvl_idx * p;
                 for row in 0..n {
-                    if data[[row, *feature_col]].to_bits() == bits {
+                    if gam_data::canonical_level_bits(data[[row, *feature_col]]) == bits {
                         combined
                             .slice_mut(s![row, col_start..col_start + p])
                             .assign(&inner_dense.row(row));
@@ -6812,7 +6827,7 @@ pub fn build_factor_smooth(
     // the column block owned by its grouping level, zeros elsewhere.
     let mut dense = Array2::<f64>::zeros((n, q));
     for i in 0..n {
-        let bits = data[[i, group_col]].to_bits();
+        let bits = gam_data::canonical_level_bits(data[[i, group_col]]);
         let level_idx = levels.iter().position(|b| *b == bits).ok_or_else(|| {
             BasisError::InvalidInput(format!(
                 "factor smooth term '{term_name}' saw an unseen grouping level at row {}",
@@ -7045,9 +7060,16 @@ pub fn resolve_factor_smooth_levels(
                 term_name
             );
         }
-        return Ok(frozen.clone());
+        return Ok(frozen
+            .iter()
+            .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
+            .collect());
     }
-    let mut bits: Vec<u64> = data.column(group_col).iter().map(|v| v.to_bits()).collect();
+    let mut bits: Vec<u64> = data
+        .column(group_col)
+        .iter()
+        .map(|v| gam_data::canonical_level_bits(*v))
+        .collect();
     bits.sort_by(|a, b| {
         f64::from_bits(*a)
             .partial_cmp(&f64::from_bits(*b))
@@ -7162,10 +7184,16 @@ pub fn build_single_local_smooth_term(
             let n = base.nrows();
             let p = base.ncols();
             let l_minus_one = levels.len() - 1;
+            // Canonicalize the stored level keys once so signed-zero / NaN codes
+            // match regardless of how the level set was interned (#2145/#2146).
+            let canon_levels: Vec<u64> = levels
+                .iter()
+                .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
+                .collect();
             let mut dense = Array2::<f64>::zeros((n, p * l_minus_one));
             for i in 0..n {
-                let bits = data[[i, *by_col]].to_bits();
-                let level_idx = levels.iter().position(|b| *b == bits).ok_or_else(|| {
+                let bits = gam_data::canonical_level_bits(data[[i, *by_col]]);
+                let level_idx = canon_levels.iter().position(|b| *b == bits).ok_or_else(|| {
                     BasisError::InvalidInput(format!(
                         "sum-to-zero factor smooth term '{}' saw an unseen level at row {}",
                         term.name,
