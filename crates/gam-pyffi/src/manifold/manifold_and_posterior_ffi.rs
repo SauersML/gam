@@ -1971,6 +1971,80 @@ fn representative_data_from_ranges(
     data
 }
 
+/// Dense, space-filling reconstruction of the training inputs for the Wald
+/// design-whitening Gram (#2142). Denser than `representative_data_from_ranges`
+/// so a high-basis univariate smooth gets a full-rank Gram, and with each
+/// continuous column swept in an independent coprime order so multivariate
+/// (tensor) margins are not collinear on the diagonal — the shared-ramp
+/// representative grid samples only the diagonal line and would make every
+/// tensor Gram rank-deficient. `rows` is forced to a power of two so every odd
+/// per-column stride is coprime to it and therefore traverses the full
+/// evenly-spaced grid. Categorical columns keep cycling their frozen levels.
+fn whitening_data_from_ranges(
+    ranges: &[(f64, f64)],
+    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
+    rows: usize,
+) -> Array2<f64> {
+    let rows = rows.max(2);
+    let n_cols = ranges.len();
+    let mut data = Array2::<f64>::zeros((rows, n_cols));
+    for (col, &(lo, hi)) in ranges.iter().enumerate() {
+        if let Some(lv) = factor_levels.get(&col) {
+            if !lv.is_empty() {
+                for row in 0..rows {
+                    data[[row, col]] = f64::from_bits(lv[row % lv.len()]);
+                }
+                continue;
+            }
+        }
+        let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        };
+        // Odd stride is coprime to the power-of-two `rows`, so `(row*stride) %
+        // rows` is a full-period permutation of the evenly-spaced grid — a
+        // different one per column, breaking the diagonal collinearity.
+        let stride = 2 * col + 1;
+        for row in 0..rows {
+            let idx = row.wrapping_mul(stride) % rows;
+            let frac = idx as f64 / (rows - 1) as f64;
+            data[[row, col]] = lo + frac * (hi - lo);
+        }
+    }
+    data
+}
+
+/// Reconstruct the design-whitening Gram `X'X` for the summary Wald smooth test
+/// from the frozen basis (#2142). The persisted summary path drops the fit's
+/// inference block, so the exact weighted Gram `X'WX` is gone; mgcv itself
+/// whitens the Wood (2013) statistic with the *unweighted* prediction-matrix
+/// Gram, so `X'X` at representative inputs is the intended object (and it
+/// reduces to `X'WX` for the Gaussian identity case). Returns the full `p×p`
+/// Gram in the trained coefficient layout, or `None` when the rebuilt design's
+/// column count does not match the trained coefficient count — a stale/mismatched
+/// spec, in which case the test falls back to the un-whitened raw covariance.
+fn summary_whitening_gram(
+    spec: &gam::terms::smooth::TermCollectionSpec,
+    ranges: &[(f64, f64)],
+    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
+    expected_ncols: usize,
+) -> Option<Array2<f64>> {
+    if expected_ncols == 0 {
+        return None;
+    }
+    let rows = (4 * expected_ncols).max(64).next_power_of_two();
+    let data = whitening_data_from_ranges(ranges, factor_levels, rows);
+    let design = gam::terms::smooth::build_term_collection_design(data.view(), spec).ok()?;
+    let x = design.design.to_dense();
+    if x.ncols() != expected_ncols {
+        return None;
+    }
+    // Lower triangle of `X'X` is the true Gram; the whitening eigendecomposition
+    // reads only that side, so no explicit symmetrization is needed.
+    Some(x.t().dot(&x))
+}
+
 /// Build the mgcv-style per-smooth significance table for the FFI summary.
 ///
 /// Mirrors `main.rs::build_model_summary`'s smooth-term loop: random-effect
@@ -2019,6 +2093,17 @@ fn summary_smooth_terms(
     let cov_forwald = fit
         .beta_covariance_corrected()
         .or_else(|| fit.beta_covariance());
+    // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
+    // Prefer the fit's exact weighted Gram `X'WX` when the inference block
+    // survived; on the persisted summary path (inference dropped) reconstruct
+    // the unweighted `X'X` from the frozen basis. `None` → un-whitened fallback.
+    let reconstructed_gram = if fit.weighted_gram().is_none() {
+        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols())
+    } else {
+        None
+    };
+    let whitening_gram_full: Option<&Array2<f64>> =
+        fit.weighted_gram().or(reconstructed_gram.as_ref());
     let family = model.likelihood();
     let scale_is_estimated = matches!(
         family.response,
@@ -2126,13 +2211,12 @@ fn summary_smooth_terms(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
-                    // Wood (2013) whitening Gram `X'WX = H − S(λ)`, in the same
-                    // original coefficient basis as `beta`/`cov` (#2142). Without
-                    // it the rank-r truncation keeps the wrong eigen-subspace and
-                    // a dominant wiggly smooth reads as non-significant. `None` on
-                    // a persisted model whose inference block was dropped, where
-                    // the test degrades to the raw-covariance fallback.
-                    whitening_gram: fit.weighted_gram(),
+                    // Wood (2013) design-whitening Gram in the original
+                    // coefficient basis (#2142): exact `X'WX` when available, else
+                    // the frozen-basis `X'X` reconstruction. Without it the
+                    // rank-r truncation keeps the wrong eigen-subspace and a
+                    // dominant wiggly smooth reads as non-significant.
+                    whitening_gram: whitening_gram_full,
                     coeff_range: global_range.clone(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),
