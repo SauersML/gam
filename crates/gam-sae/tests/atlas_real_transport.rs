@@ -2,12 +2,15 @@
 //!
 //! Turns the abstract contract composer + loop-holonomy instrument into a
 //! measurement on actual model internals. The fixture
-//! `tests/data/qwen3_l11_l17_l23_theta.json` holds the per-row circle-chart
-//! angles `θ` fitted (by gamfit's `sae_manifold_fit`, one cyclic SAE atom per
-//! layer, all three charts anchored to ONE ambient-parallel-transport gauge) at
-//! residual-stream layers L11 / L17 / L23 of Qwen3.5-35B-A3B, from the MSI
-//! activation cache. Provenance is in the fixture header and
-//! `MSI_PROVENANCE.md`.
+//! `tests/data/qwen3_l11_l17_l23_theta.json` holds the per-row circular chart
+//! angle `θ` — the angle in each layer's top-2 principal plane of the real
+//! centered activations — at residual-stream layers L11 / L17 / L23 of
+//! Qwen3.5-35B-A3B, from the MSI activation cache. Each layer's `θ` carries its
+//! own arbitrary plane gauge/orientation; the composition triangle below is a
+//! CLOSED loop, so every per-layer gauge cancels and the holonomy verdict is
+//! gauge-invariant (no cross-layer alignment needed). Full provenance — and why
+//! the top-2 plane angle rather than the K=1 SAE atom (its line search
+//! live-locks at the MSI gamfit) — is in `tests/data/MSI_PROVENANCE.md`.
 //!
 //! From those angles this test fits the three inter-layer transports with the
 //! crate's own REML machinery — the two forward hops `h: L11→L17`, `L17→L23`
