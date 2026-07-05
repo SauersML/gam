@@ -2648,9 +2648,13 @@ pub fn build_smooth_basis(
         "curvature" => {
             // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
             // κ-generic sibling of the intrinsic S² smooth above. The feature
-            // columns are κ-stereographic chart coordinates; `kappa=` is the
-            // fixed sectional curvature (default 0 = flat), and the geometry
+            // columns are κ-stereographic chart coordinates and the geometry
             // comes from `geometry::constant_curvature::ConstantCurvature`.
+            // `kappa=` follows the mgcv-`sp=` convention (gam#2152): an EXPLICIT
+            // value is a FIXED sectional curvature that selects the geometry
+            // (`Sᵈ` for κ>0, `ℝᵈ` for κ=0, `Hᵈ` for κ<0) and is honoured verbatim
+            // by the fit; OMITTING `kappa=` leaves κ free for the #944/#1464
+            // outer ψ-coordinate estimation, seeded at the flat default 0.
             validate_known_options(
                 "curvature",
                 options,
@@ -2671,7 +2675,13 @@ pub fn build_smooth_basis(
                     "__by_col",
                 ],
             )?;
-            let kappa = option_f64(options, "kappa").unwrap_or(0.0);
+            // `kappa=` follows the mgcv-`sp=` convention: an EXPLICIT value pins
+            // the sectional curvature (fixed geometry, honoured verbatim by the
+            // fit — gam#2152); an OMITTED `kappa=` leaves κ free for the
+            // #944/#1464 outer estimation, seeded at the flat default 0.
+            let kappa_opt = option_f64(options, "kappa");
+            let kappa_fixed = kappa_opt.is_some();
+            let kappa = kappa_opt.unwrap_or(0.0);
             if !kappa.is_finite() {
                 return Err("curvature smooth requires a finite kappa".to_string());
             }
@@ -2696,6 +2706,7 @@ pub fn build_smooth_basis(
                         num_centers: centers,
                     },
                     kappa,
+                    kappa_fixed,
                     // 0.0 sentinel = κ-independent auto initialization in the
                     // basis builder (median chart center spacing, doubled).
                     length_scale,

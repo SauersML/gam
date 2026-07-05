@@ -103,9 +103,25 @@ pub struct ConstantCurvatureBasisSpec {
     /// κ-independent (see the module-level κ-contract).
     pub center_strategy: CenterStrategy,
     /// Sectional curvature κ of the latent/feature geometry. Fixed at build
-    /// time; the later ψ-channel stage promotes it to a fitted outer
-    /// coordinate consuming this module's exact κ-jets.
+    /// time; when [`Self::kappa_fixed`] is `false` the later ψ-channel stage
+    /// promotes it to a fitted outer coordinate consuming this module's exact
+    /// κ-jets, and this field is only the seed. When `kappa_fixed` is `true`
+    /// this value is the user's PINNED sectional curvature and the outer loop
+    /// must hold it constant (never re-derive it).
     pub kappa: f64,
+    /// Did the user explicitly pin the sectional curvature (`curv(.., kappa=K)`)?
+    ///
+    /// This is the mgcv-`sp=` convention applied to κ: an explicit `kappa=`
+    /// selects a FIXED geometry (`Sᵈ` for κ>0, `ℝᵈ` for κ=0, `Hᵈ` for κ<0) and
+    /// the fit builds/keeps the design and penalty at exactly that κ; an OMITTED
+    /// `kappa=` leaves κ free, seeded at [`Self::kappa`] (default 0), for the
+    /// #944/#1464 outer ψ-coordinate estimation to fit. The two paths must never
+    /// be confused: honoring the pin is the whole contract of a fixed-curvature
+    /// smooth (gam#2152), while the estimation path is the whole point of the
+    /// κ-inference subsystem. Defaults to `false` (estimate) so the estimand
+    /// machinery and every serialized pre-#2152 model keep their behaviour.
+    #[serde(default)]
+    pub kappa_fixed: bool,
     /// Geodesic kernel range ℓ in `K_κ = exp(−d_κ/ℓ)`. The `0.0` sentinel
     /// requests the κ-independent auto initialization
     /// ([`realized_constant_curvature_length_scale`]); the realized value is
@@ -124,6 +140,7 @@ impl Default for ConstantCurvatureBasisSpec {
         Self {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
             kappa: 0.0,
+            kappa_fixed: false,
             length_scale: 0.0,
             // No double-penalty ridge by default (#1464). The RKHS Gram penalty
             // zᵀKz is strictly PD/full-rank on distinct centers, so it already
