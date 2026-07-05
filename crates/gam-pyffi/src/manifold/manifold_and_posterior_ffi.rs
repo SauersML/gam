@@ -2126,6 +2126,13 @@ fn summary_smooth_terms(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
+                    // Wood (2013) whitening Gram `X'WX = H − S(λ)`, in the same
+                    // original coefficient basis as `beta`/`cov` (#2142). Without
+                    // it the rank-r truncation keeps the wrong eigen-subspace and
+                    // a dominant wiggly smooth reads as non-significant. `None` on
+                    // a persisted model whose inference block was dropped, where
+                    // the test degrades to the raw-covariance fallback.
+                    whitening_gram: fit.weighted_gram(),
                     coeff_range: global_range.clone(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),

@@ -1470,6 +1470,7 @@ pub fn composition_defect(
         beta: fit.beta.view(),
         covariance: &fit.covariance,
         influence_matrix: Some(&fit.influence),
+        whitening_gram: None,
         coeff_range: 0..m,
         edf: fit.edf,
         nullspace_dim: 0,

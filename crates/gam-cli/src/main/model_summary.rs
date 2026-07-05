@@ -269,6 +269,12 @@ pub(crate) fn build_model_summary(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
+                    // Wood (2013) design-whitening Gram `X'WX = H − S(λ)` in the
+                    // original coefficient basis; without it the rank-r cut keeps
+                    // the wrong eigen-subspace and a dominant wiggly smooth reads
+                    // as non-significant (#2142). `None` degrades to the raw
+                    // covariance for a persisted model with no inference block.
+                    whitening_gram: fit.weighted_gram(),
                     coeff_range: global_range.clone(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),

@@ -608,6 +608,7 @@ pub fn head_feature_significance(
                 beta: beta.view(),
                 covariance,
                 influence_matrix: None,
+                whitening_gram: None,
                 coeff_range: idx..idx + 1,
                 edf: 1.0,
                 nullspace_dim: 1,
