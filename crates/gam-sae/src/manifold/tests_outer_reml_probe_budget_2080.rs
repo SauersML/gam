@@ -187,6 +187,40 @@ fn run_wide_outer_fit(
     (ev, telemetry)
 }
 
+/// Same full outer path as `run_wide_outer_fit`, but intentionally starts from
+/// the generated seed rather than pinning `initial_rho`. This is the K=1 cold
+/// path that #2153 exposed: with the optimizer's raw identity iter-0 metric, the
+/// first `-g` step can be orders too large, so Strong-Wolfe spends full
+/// value-probe solves backtracking instead of making progress.
+fn run_k1_generated_seed_outer_fit(
+    n: usize,
+    p: usize,
+    harmonics: usize,
+) -> (f64, OuterProbeTelemetry) {
+    let z = two_circle_wide_target(n, p, 0.05);
+    let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
+    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+        .unwrap();
+    let n_params = init_rho.to_flat().len();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
+    OuterProblem::new(n_params)
+        .with_max_iter(4)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .run(&mut objective, "SAE manifold K=1 generated seed")
+        .expect("#2153 K=1 generated-seed circle fit must terminate");
+    let telemetry = objective.probe_telemetry();
+    let fitted = objective.into_fitted();
+    let ev = global_ev(z.view(), fitted.term.fitted().view());
+    (ev, telemetry)
+}
+
 /// #2080 — the wide-`p` (p=96) K=2 outer REML fit must terminate in a bounded
 /// number of criterion evaluations, run every value probe on a throwaway clone
 /// (zero mutating value probes), and recover a materially positive EV — even
@@ -245,6 +279,41 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
         "wide-p K=2 two-circle outer fit must recover a materially positive EV \
          (got {ev:.4}); two disjoint circles span a rank-4 subspace an honest K=2 \
          dictionary recovers"
+    );
+}
+
+/// #2153 — K=1 manifold fits must not live-lock in Strong-Wolfe line search from
+/// a cold generated seed. The regression is a probe-count assertion, not a
+/// wall-clock deadline: the first BFGS step is normalized by the seed gradient
+/// norm, so the line search should accept a bounded step instead of spending
+/// repeated full inner solves on rejected value probes.
+#[test]
+fn k1_generated_seed_circle_outer_reml_does_not_livelock_2153() {
+    let (ev, telemetry) = run_k1_generated_seed_outer_fit(96, 96, 2);
+    eprintln!(
+        "[#2153] K=1 generated-seed outer fit: ev={ev:.4}, criterion_calls={}, \
+         fd_probe_calls={}, wall_cost_value_probes={}, infeasible_total={}, \
+         mutating_value_probes={}",
+        telemetry.criterion_calls,
+        telemetry.fd_probe_calls,
+        telemetry.wall_cost_value_probes,
+        telemetry.infeasible_total(),
+        telemetry.mutating_value_probes,
+    );
+    assert!(
+        telemetry.criterion_calls <= 40,
+        "#2153 K=1 generated-seed fit issued {} criterion calls; expected a \
+         bounded first-line-search probe budget",
+        telemetry.criterion_calls
+    );
+    assert_eq!(
+        telemetry.mutating_value_probes, 0,
+        "#2153 line-search value probes must not mutate the accepted term basin"
+    );
+    assert!(
+        ev.is_finite() && ev > 0.08,
+        "#2153 K=1 generated-seed circle fit must converge to a real positive-EV \
+         basin (got {ev:.4})"
     );
 }
 

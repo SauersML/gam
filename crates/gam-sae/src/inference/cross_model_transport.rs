@@ -25,8 +25,8 @@ use crate::inference::layer_transport::{
 use crate::inference::transport_class::{
     CircleTransportClass, CircleTransportReport, classify_circle_transport_fit,
 };
-use ndarray::{Array1, ArrayView1, ArrayView2};
-use std::f64::consts::{PI, TAU};
+use ndarray::{Array1, ArrayView2};
+use std::f64::consts::TAU;
 
 /// A model-local one-dimensional coordinate ready for cross-model transport.
 #[derive(Debug, Clone)]
@@ -215,7 +215,8 @@ fn universality_verdict(
         }
     }
 
-    let isometry_noise_scale = fit.isometry_defect_se.max(f64::MIN_POSITIVE);
+    let roundoff_scale = f64::EPSILON.sqrt();
+    let isometry_noise_scale = fit.isometry_defect_se.max(roundoff_scale);
     let isometry_distinguished = fit.isometry_defect > isometry_noise_scale;
     let gauge_distinguished = circle
         .map(|report| report.defect > gauge_defect_scale)
@@ -235,6 +236,7 @@ fn wrap_tau(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     fn circle_coord(name: &str, values: Vec<f64>) -> ModelCoordinate {
         ModelCoordinate::new(name, Array1::from_vec(values), ChartTopology::Circle)

@@ -163,12 +163,23 @@ pub fn fit_stationary_kernel(
     let mut basis = vec![0.0; parameter_count];
     for query_index in 0..query_t.len() {
         for key_index in 0..key_t.len() {
-            stationary_basis(query_t[query_index], key_t[key_index], max_harmonic, &mut basis);
-            accumulate_normal_equation(&mut normal, &mut rhs, &basis, scores[[query_index, key_index]]);
+            stationary_basis(
+                query_t[query_index],
+                key_t[key_index],
+                max_harmonic,
+                &mut basis,
+            );
+            accumulate_normal_equation(
+                &mut normal,
+                &mut rhs,
+                &basis,
+                scores[[query_index, key_index]],
+            );
         }
     }
     let coefficients = solve_linear_system(normal, rhs, parameter_count)?;
-    let (sse, sst) = stationary_sums_of_squares(query_t, key_t, scores, max_harmonic, &coefficients);
+    let (sse, sst) =
+        stationary_sums_of_squares(query_t, key_t, scores, max_harmonic, &coefficients);
     Ok(StationaryKernelFit {
         intercept: coefficients[0],
         harmonics: harmonic_coefficients_from_regression(&coefficients, max_harmonic),
@@ -264,7 +275,9 @@ fn validate_kernel_inputs(
     scores: ArrayView2<'_, f64>,
 ) -> Result<(), String> {
     if query_t.is_empty() || key_t.is_empty() {
-        return Err("attention kernel fit requires non-empty query and key coordinates".to_string());
+        return Err(
+            "attention kernel fit requires non-empty query and key coordinates".to_string(),
+        );
     }
     if scores.nrows() != query_t.len() || scores.ncols() != key_t.len() {
         return Err(format!(
@@ -351,7 +364,11 @@ fn accumulate_normal_equation(normal: &mut [f64], rhs: &mut [f64], basis: &[f64]
     }
 }
 
-fn solve_linear_system(mut matrix: Vec<f64>, mut rhs: Vec<f64>, width: usize) -> Result<Vec<f64>, String> {
+fn solve_linear_system(
+    mut matrix: Vec<f64>,
+    mut rhs: Vec<f64>,
+    width: usize,
+) -> Result<Vec<f64>, String> {
     let mut matrix_scale = 0.0_f64;
     for value in &matrix {
         matrix_scale = matrix_scale.max(value.abs());
@@ -412,7 +429,12 @@ fn stationary_sums_of_squares(
     let mut sst = 0.0;
     for query_index in 0..query_t.len() {
         for key_index in 0..key_t.len() {
-            stationary_basis(query_t[query_index], key_t[key_index], max_harmonic, &mut basis);
+            stationary_basis(
+                query_t[query_index],
+                key_t[key_index],
+                max_harmonic,
+                &mut basis,
+            );
             let prediction = dot(&basis, coefficients);
             let observed = scores[[query_index, key_index]];
             let residual = observed - prediction;
@@ -533,7 +555,8 @@ mod tests {
                 let delta = query_t[query_index] - key_t[key_index];
                 let deterministic_noise =
                     1.0e-5 * (TWO_PI * (3.0 * query_t[query_index] + 5.0 * key_t[key_index])).sin();
-                scores[[query_index, key_index]] = 1.7 * (TWO_PI * delta).cos() + deterministic_noise;
+                scores[[query_index, key_index]] =
+                    1.7 * (TWO_PI * delta).cos() + deterministic_noise;
             }
         }
 

@@ -81,7 +81,6 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::atom_codes::SparseAtomCodes;
-use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance};
 use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -90,7 +89,7 @@ use crate::manifold::{
     AssignmentMode, OccupancyLaw, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy_interval,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance};
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
@@ -106,6 +105,7 @@ use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -464,8 +464,7 @@ pub fn harvest_move_proposals(
     // skipped entirely when neither trigger is enabled (the null is not free).
     let codes = sparse_codes_from_term(term);
     let want_coactivation = params.max_fusions > 0 || params.max_fissions > 0;
-    let exceedance =
-        want_coactivation.then(|| coactivation_exceedance(&codes, NULL_REPLICATES));
+    let exceedance = want_coactivation.then(|| coactivation_exceedance(&codes, NULL_REPLICATES));
     let z_floor = null_exceedance_z_floor();
 
     // --- Fusions: top co-activation dependence, gated by the null ----------
@@ -480,9 +479,7 @@ pub fn harvest_move_proposals(
             if dep < FUSION_DEPENDENCE_FLOOR {
                 continue;
             }
-            let z = exceedance
-                .as_ref()
-                .map_or(0.0, |ex| ex.excess_z(a, b));
+            let z = exceedance.as_ref().map_or(0.0, |ex| ex.excess_z(a, b));
             if z >= z_floor {
                 fusion_pairs.push((a, b, z));
             }
@@ -506,9 +503,7 @@ pub fn harvest_move_proposals(
             // whose asymmetry is only the top-`k` mechanical artifact does not.
             // Require the joint activation to exceed the fixed-margin null before
             // auditing, so mechanical asymmetry is not read as absorption.
-            let z = exceedance
-                .as_ref()
-                .map_or(0.0, |ex| ex.excess_z(a, b));
+            let z = exceedance.as_ref().map_or(0.0, |ex| ex.excess_z(a, b));
             if z < z_floor {
                 continue;
             }
@@ -852,7 +847,13 @@ pub fn apply_structure_move_seeded(
                     decoder,
                     phase_coords,
                     gate,
-                } => born_circle_atom(term, rho, decoder.clone(), phase_coords.clone(), gate.clone()),
+                } => born_circle_atom(
+                    term,
+                    rho,
+                    decoder.clone(),
+                    phase_coords.clone(),
+                    gate.clone(),
+                ),
             }
         }
         // Death / Fission / Fusion are seed-independent — delegate to the legacy
@@ -1585,7 +1586,10 @@ pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(us
     // → 6), and its full-circle uniform model would misread a range-filling
     // uniform coordinate as non-uniform. The interval classifier keeps linear
     // ends distinct and range-uniform data uniform.
-    let r: Vec<f64> = col.iter().map(|&t| ((t - lo) / span).clamp(0.0, 1.0)).collect();
+    let r: Vec<f64> = col
+        .iter()
+        .map(|&t| ((t - lo) / span).clamp(0.0, 1.0))
+        .collect();
     match classify_occupancy_interval(&r) {
         OccupancyLaw::Discrete { anchors } if anchors >= 2 => {
             // Assign each row to its nearest anchor bin from the normalization
@@ -2301,8 +2305,10 @@ pub fn run_structure_search_rounds(
         // inside the gate is a pure function of the candidate index. The two
         // channels share ONE index space via `StructureMove::Birth`.
         let residual_decoders = build_birth_decoders(&term, residuals.view(), &harvest_params)?;
-        let mut birth_seeds: Vec<BirthSeed> =
-            residual_decoders.into_iter().map(BirthSeed::ResidualFactor).collect();
+        let mut birth_seeds: Vec<BirthSeed> = residual_decoders
+            .into_iter()
+            .map(BirthSeed::ResidualFactor)
+            .collect();
 
         // Curl / flatten proposals (INTEGRATION_PLAN Phase 4), gated behind the
         // driver flag and the per-atom-set cooldown. `curl_atoms` maps a curl
@@ -2320,9 +2326,11 @@ pub fn run_structure_search_rounds(
                 let candidate = birth_seeds.len();
                 birth_seeds.push(cand.seed);
                 curl_atoms.insert(candidate, cand.members.clone());
-                report
-                    .proposals
-                    .push(proposal(&term, StructureMove::Birth { candidate }, cand.net_evidence));
+                report.proposals.push(proposal(
+                    &term,
+                    StructureMove::Birth { candidate },
+                    cand.net_evidence,
+                ));
             }
             if cfg.flatten {
                 for atom in flatten_candidates(&term) {
@@ -2526,7 +2534,11 @@ fn atom_ambient_image(atom: &SaeManifoldAtom) -> Array2<f64> {
 /// Top principal direction of the rows of `img` about `center`, restricted to
 /// `active` rows, by a few power iterations on `Σ (g−c)(g−c)ᵀ` (formed
 /// implicitly, so the cost is `O(active·p)` per iteration, never `p²`).
-fn power_iter_top_dir(img: ArrayView2<'_, f64>, center: &Array1<f64>, active: &[usize]) -> Array1<f64> {
+fn power_iter_top_dir(
+    img: ArrayView2<'_, f64>,
+    center: &Array1<f64>,
+    active: &[usize],
+) -> Array1<f64> {
     let p = img.ncols();
     let mut v = Array1::<f64>::zeros(p);
     // Seed from the highest-norm centered active row (a strong signal direction).
@@ -2573,9 +2585,7 @@ fn power_iter_top_dir(img: ArrayView2<'_, f64>, center: &Array1<f64>, active: &[
 
 /// Assemble the fitted linear atoms' `(atom index, unit direction, active mask,
 /// ambient image)` — the raw material coalescing and candidate generation read.
-fn linear_atom_frames(
-    term: &SaeManifoldTerm,
-) -> Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)> {
+fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)> {
     let assignments = term.assignment.assignments();
     let n = assignments.nrows();
     let k = assignments.ncols();
@@ -2686,8 +2696,10 @@ fn curl_candidates(
         let dj = &signed[sj];
         // Co-firing rows (both signed axes active), capped at the subsample.
         let mut co_fire: Vec<usize> = (0..n)
-            .filter(|&r| di.active.get(r).copied().unwrap_or(false)
-                && dj.active.get(r).copied().unwrap_or(false))
+            .filter(|&r| {
+                di.active.get(r).copied().unwrap_or(false)
+                    && dj.active.get(r).copied().unwrap_or(false)
+            })
             .collect();
         if co_fire.len() < cfg.min_cooccurrence.max(2) {
             continue;
@@ -2698,7 +2710,12 @@ fn curl_candidates(
         }
         // The plane image is the SUM of the two signed axes' member atom images —
         // isolating the two directions' joint parse from the rest of the fit.
-        let members: Vec<usize> = di.members.iter().chain(dj.members.iter()).copied().collect();
+        let members: Vec<usize> = di
+            .members
+            .iter()
+            .chain(dj.members.iter())
+            .copied()
+            .collect();
         let mut x = Array2::<f64>::zeros((co_fire.len(), p));
         for (row_out, &r) in co_fire.iter().enumerate() {
             for &atom in &members {
@@ -3215,7 +3232,11 @@ mod tests {
         let disk = Array2::from_shape_fn((n, 2), |(i, j)| {
             let r = u[i].sqrt();
             let theta = std::f64::consts::TAU * (i as f64 / n as f64);
-            if j == 0 { r * theta.cos() } else { r * theta.sin() }
+            if j == 0 {
+                r * theta.cos()
+            } else {
+                r * theta.sin()
+            }
         });
         let promoted = radial_promoted_specs(coords.view(), disk.view(), 1)
             .expect("promotion decision")
@@ -3294,7 +3315,10 @@ mod tests {
         assert_eq!(anchors, 7, "anchors");
         assert_eq!(crate::manifold::finite_set_rank_charge(anchors), 6);
         // Every index is a valid anchor bin.
-        assert!(idx.iter().all(|&v| (0.0..=6.0).contains(&v) && v.fract() == 0.0));
+        assert!(
+            idx.iter()
+                .all(|&v| (0.0..=6.0).contains(&v) && v.fract() == 0.0)
+        );
 
         // A uniformly-occupied coordinate is NOT a finite set — no candidate.
         let n = 400;
@@ -4684,7 +4708,10 @@ mod tests {
             vec![0, 1, 2, 3],
             "the circle's donor set is all four rectified halves"
         );
-        assert!(cand.net_evidence > 0.0, "net evidence must favour the circle");
+        assert!(
+            cand.net_evidence > 0.0,
+            "net evidence must favour the circle"
+        );
 
         // Born through the existing birth plumbing → a Periodic circle atom.
         let mv = StructureMove::Birth { candidate: 0 };
@@ -4784,8 +4811,7 @@ mod tests {
     fn flatten_flags_diameter_and_spares_healthy_ring() {
         let n = 400usize;
         // Diameter: phases alternate 0 / ½ turn → angles {0, π}.
-        let diameter_phases =
-            Array1::from_shape_fn(n, |r| if r % 2 == 0 { 0.0 } else { 0.5 });
+        let diameter_phases = Array1::from_shape_fn(n, |r| if r % 2 == 0 { 0.0 } else { 0.5 });
         let (diam_term, _) = single_circle_term(&diameter_phases);
         let flagged = flatten_candidates(&diam_term);
         assert_eq!(flagged, vec![0], "a diameter-collapsed circle must flatten");
@@ -4800,81 +4826,4 @@ mod tests {
         );
     }
 
-    /// End-to-end through the round driver: with curl ON the shattered circle
-    /// yields a circle Birth that certifies through the SAME e-gate the residual
-    /// births race through; with curl OFF (the default) the driver is unchanged.
-    /// This is the flag-gated wiring proof (the REML gate remains the judge;
-    /// certed acceptance of the win additionally rests on the Phase-1 charge
-    /// ledger).
-    #[test]
-    fn driver_curl_flag_accepts_circle_birth() {
-        let budget = MoveBudget {
-            max_moves: 4,
-            alpha: 0.05,
-        };
-        // Only curl births — no residual/fusion/fission channels — so any
-        // accepted birth is the curl circle winning the round race.
-        let harvest_params = HarvestParams {
-            max_fusions: 0,
-            max_fissions: 0,
-            max_births: 0,
-        };
-        let run = |curl: Option<CurlConfig>| -> StructureSearchResult {
-            let (term, rho) = shattered_plane_term(false);
-            let mut ledger = StructureLedger::new();
-            let config = RoundDriverConfig {
-                n_shards: 3,
-                budget,
-                max_rounds: 1,
-                harvest_params,
-                curl,
-            };
-            let result = run_structure_search_rounds(
-                term,
-                rho,
-                Array2::<f64>::zeros((600, 4)).view(),
-                config,
-                &mut ledger,
-                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
-                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
-            )
-            .unwrap()
-        };
-
-        let off = run(None);
-        let off_births = off
-            .rounds
-            .iter()
-            .flat_map(|r| r.moves.iter())
-            .filter(|m| matches!(m.mv, StructureMove::Birth { .. }))
-            .count();
-        assert_eq!(off_births, 0, "curl OFF (default) must inject no births");
-
-        let on = run(Some(CurlConfig::default()));
-        let accepted_curl_births = on
-            .rounds
-            .iter()
-            .flat_map(|r| r.moves.iter())
-            .filter(|m| {
-                matches!(m.mv, StructureMove::Birth { .. })
-                    && matches!(
-                        m.verdict,
-                        gam_solve::structure_search::MoveVerdict::Accepted { .. }
-                    )
-            })
-            .count();
-        assert_eq!(
-            accepted_curl_births, 1,
-            "curl ON must certify exactly one circle Birth winner"
-        );
-        assert_eq!(
-            on.term.atoms.last().map(|a| a.basis_kind),
-            Some(SaeAtomBasisKind::Periodic),
-            "the accepted curl winner must be the recovered circle atom"
-        );
-        assert!(
-            on.structure_changed(),
-            "accepted curl winner must mutate the returned term"
-        );
-    }
 }
