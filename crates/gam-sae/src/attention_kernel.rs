@@ -35,6 +35,15 @@ pub struct HarmonicCoefficient {
 }
 
 #[derive(Clone, Debug)]
+pub struct HarmonicContent {
+    pub harmonic: usize,
+    pub cos: f64,
+    pub sin: f64,
+    pub amplitude: f64,
+    pub amplitude_fraction: f64,
+}
+
+#[derive(Clone, Debug)]
 pub struct StationaryKernelFit {
     pub intercept: f64,
     pub harmonics: Vec<HarmonicCoefficient>,
@@ -62,6 +71,16 @@ pub struct AttentionKernelFit {
 }
 
 #[derive(Clone, Debug)]
+pub struct AttentionKernelReport {
+    pub stationary_r2: f64,
+    pub separable_r2: f64,
+    pub stationary_r2_gap: f64,
+    pub is_stationary: bool,
+    pub dominant_stationary_harmonic: Option<HarmonicCoefficient>,
+    pub stationary_harmonic_content: Vec<HarmonicContent>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CoordinateMapFit {
     pub intercept: f64,
     pub harmonics: Vec<HarmonicCoefficient>,
@@ -75,6 +94,10 @@ impl StationaryKernelFit {
         self.harmonics
             .iter()
             .max_by(|left, right| left.amplitude.total_cmp(&right.amplitude))
+    }
+
+    pub fn harmonic_content(&self) -> Vec<HarmonicContent> {
+        harmonic_content(&self.harmonics)
     }
 
     pub fn predict(&self, query_t: f64, key_t: f64) -> f64 {
@@ -113,11 +136,28 @@ impl SeparableKernelFit {
     }
 }
 
+impl AttentionKernelFit {
+    pub fn report(&self) -> AttentionKernelReport {
+        AttentionKernelReport {
+            stationary_r2: self.stationary.r2,
+            separable_r2: self.separable.r2,
+            stationary_r2_gap: self.stationary_r2_gap,
+            is_stationary: self.is_stationary,
+            dominant_stationary_harmonic: self.stationary.dominant_harmonic().cloned(),
+            stationary_harmonic_content: self.stationary.harmonic_content(),
+        }
+    }
+}
+
 impl CoordinateMapFit {
     pub fn dominant_harmonic(&self) -> Option<&HarmonicCoefficient> {
         self.harmonics
             .iter()
             .max_by(|left, right| left.amplitude.total_cmp(&right.amplitude))
+    }
+
+    pub fn harmonic_content(&self) -> Vec<HarmonicContent> {
+        harmonic_content(&self.harmonics)
     }
 
     pub fn predict_delta(&self, key_t: f64) -> f64 {
@@ -515,6 +555,30 @@ fn harmonic_coefficients_from_regression(
     out
 }
 
+fn harmonic_content(harmonics: &[HarmonicCoefficient]) -> Vec<HarmonicContent> {
+    let total_amplitude: f64 = harmonics
+        .iter()
+        .map(|coefficient| coefficient.amplitude)
+        .sum();
+    harmonics
+        .iter()
+        .map(|coefficient| {
+            let amplitude_fraction = if total_amplitude > 0.0 {
+                coefficient.amplitude / total_amplitude
+            } else {
+                0.0
+            };
+            HarmonicContent {
+                harmonic: coefficient.harmonic,
+                cos: coefficient.cos,
+                sin: coefficient.sin,
+                amplitude: coefficient.amplitude,
+                amplitude_fraction,
+            }
+        })
+        .collect()
+}
+
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     left.iter()
         .zip(right.iter())
@@ -571,6 +635,15 @@ mod tests {
         assert!(dominant.amplitude > 1.699);
         assert!(fit.stationary.r2 > 0.999_999_999);
         assert!(fit.is_stationary);
+
+        let report = fit.report();
+        let reported_dominant = report
+            .dominant_stationary_harmonic
+            .expect("report should carry the dominant harmonic");
+        assert_eq!(reported_dominant.harmonic, 1);
+        assert!(report.stationary_harmonic_content[0].amplitude_fraction > 0.999);
+        assert!(report.stationary_r2 > 0.999_999_999);
+        assert!(report.is_stationary);
     }
 
     #[test]
