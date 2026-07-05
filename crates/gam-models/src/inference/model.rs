@@ -3726,14 +3726,14 @@ impl FittedModel {
     ///
     /// This is the whitelist the predict/`check` encode paths pass to
     /// [`UnseenCategoryPolicy::encode_unknown_for_columns`]. It intentionally
-    /// covers ONLY explicit random effects (`group(g)`/`re(g)`/`factor(g)` /
-    /// `s(g, bs="re")`). A bare categorical main effect (`+ g`) is auto-promoted
-    /// to a penalized random block internally but is a FIXED parametric factor:
-    /// an unseen level of it must reach the strict schema encode and raise a
-    /// `SchemaMismatchError` rather than be silently averaged to the factor's
-    /// centering point (#2102). Such terms carry `lenient_unseen == false` and
-    /// are excluded here so they hit the strict `UnseenCategoryPolicy::Error`
-    /// arm.
+    /// covers ONLY genuine random effects (`group(g)`/`re(g)`/`s(g, bs="re")`).
+    /// A FIXED categorical factor — a bare `+ g` OR an explicit `factor(g)` —
+    /// is auto-promoted to a penalized random block internally but is still a
+    /// fixed parametric factor: an unseen level of it must reach the strict
+    /// schema encode and raise a `SchemaMismatchError` rather than be silently
+    /// averaged to the factor's centering point (#2102/#2137). Such terms carry
+    /// `lenient_unseen == false` and are excluded here so they hit the strict
+    /// `UnseenCategoryPolicy::Error` arm.
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
@@ -3747,6 +3747,68 @@ impl FittedModel {
                 if let Some(name) = training_headers.get(term.feature_col) {
                     out.insert(name.clone());
                 }
+            }
+        }
+        out
+    }
+
+    /// Frozen level vocabularies for FIXED-factor terms (`factor(g)` or a bare
+    /// `+ g`, i.e. `lenient_unseen == false`) whose feature column is *numeric*
+    /// in the data schema.
+    ///
+    /// A string factor is a `Categorical` schema column, so the strict schema
+    /// re-encode already rejects (and `check` reports) an out-of-vocabulary
+    /// label. A numeric-coded `factor(year)`, however, reaches the model as a
+    /// `Continuous`/`Binary` column with no categorical schema, so the encode
+    /// path has no level set to validate against — the unseen-level guard is
+    /// silently skipped (#2137). This exposes each such column's frozen numeric
+    /// vocabulary (canonical `f64` bit patterns, signed-zero/NaN normalized) so
+    /// the `check`/`predict` schema layer can enforce the same fixed-factor
+    /// contract the design operator (`build_random_effect_block`) enforces.
+    ///
+    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
+    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
+    /// training vocabulary) are returned, matching the operator's strict gate.
+    pub fn numeric_fixed_factor_vocabularies(&self) -> Vec<(String, HashSet<u64>)> {
+        let Some(training_headers) = self.training_headers.as_ref() else {
+            return Vec::new();
+        };
+        let Some(schema) = self.data_schema.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::<(String, HashSet<u64>)>::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.random_effect_terms {
+                if term.lenient_unseen || term.drop_first_level {
+                    continue;
+                }
+                let Some(levels) = term.frozen_levels.as_ref() else {
+                    continue;
+                };
+                let Some(name) = training_headers.get(term.feature_col) else {
+                    continue;
+                };
+                // Skip string factors: they are Categorical in the schema and
+                // are already validated by the typed encode.
+                let is_numeric = schema
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .map(|c| {
+                        matches!(
+                            c.kind,
+                            ColumnKindTag::Continuous | ColumnKindTag::Binary
+                        )
+                    })
+                    .unwrap_or(false);
+                if !is_numeric {
+                    continue;
+                }
+                let vocab: HashSet<u64> = levels
+                    .iter()
+                    .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
+                    .collect();
+                out.push((name.clone(), vocab));
             }
         }
         out

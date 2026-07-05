@@ -1154,6 +1154,42 @@ mod tests {
         .expect_err("surface formula should reject another reserved z coordinate");
         assert!(err.contains("reserves z column 'z3'"));
     }
+
+    /// Extract the single `RandomEffect` term's unseen-level policy from a
+    /// one-term formula, panicking if the term is not a random-effect block.
+    fn random_effect_lenient_unseen(formula: &str) -> bool {
+        let parsed = parse_formula(formula).expect("parse random-effect formula");
+        let re = parsed
+            .terms
+            .iter()
+            .find_map(|t| match t {
+                ParsedTerm::RandomEffect { lenient_unseen, .. } => Some(*lenient_unseen),
+                _ => None,
+            });
+        re.unwrap_or_else(|| panic!("{formula} did not lower to a RandomEffect term"))
+    }
+
+    #[test]
+    fn factor_wrapper_is_strict_on_unseen_levels_while_group_re_are_lenient() {
+        // Regression for #2137 (sibling of #2102): `factor(g)` is a FIXED
+        // categorical factor (R `factor()` / patsy `C()`), so an out-of-vocabulary
+        // level at predict is a schema mismatch that must raise — NOT be shrunk to
+        // the centering point. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine
+        // random effects that tolerate a held-out group (→ population mean). The
+        // parse arm once hardcoded `lenient_unseen: true` for all four wrappers,
+        // so `factor(g)` silently averaged an unseen level. Pin the per-wrapper
+        // policy at the parse layer, where the whole distinction now lives.
+        assert!(
+            !random_effect_lenient_unseen("y ~ factor(g)"),
+            "factor(g) is a fixed categorical factor: strict (lenient_unseen=false) on unseen levels"
+        );
+        for lenient in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
+            assert!(
+                random_effect_lenient_unseen(lenient),
+                "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
