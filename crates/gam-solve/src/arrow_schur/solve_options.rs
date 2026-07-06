@@ -656,38 +656,25 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
 
         let mut left_active = Vec::with_capacity(k);
         let mut right_active = Vec::with_capacity(k);
-        for col in 0..k {
-            let mut left_nz = false;
-            let mut right_nz = false;
-            for row in 0..d {
-                left_nz |= left[[row, col]] != 0.0;
-                right_nz |= right[[row, col]] != 0.0;
-                if left_nz && right_nz {
-                    break;
-                }
-            }
-            if left_nz {
-                left_active.push(col);
-            }
-            if right_nz {
-                right_active.push(col);
-            }
-        }
-        if left_active.is_empty() || right_active.is_empty() {
-            return;
-        }
-
         for c in 0..d {
-            for &a in &left_active {
-                let lca = left[[c, a]];
-                if lca == 0.0 {
-                    continue;
+            left_active.clear();
+            right_active.clear();
+            for col in 0..k {
+                let l = left[[c, col]];
+                let r = right[[c, col]];
+                if l != 0.0 {
+                    left_active.push((col, l));
                 }
-                for &b in &right_active {
-                    let rcb = right[[c, b]];
-                    if rcb != 0.0 {
-                        schur[[a, b]] -= lca * rcb;
-                    }
+                if r != 0.0 {
+                    right_active.push((col, r));
+                }
+            }
+            if left_active.is_empty() || right_active.is_empty() {
+                continue;
+            }
+            for &(a, lca) in &left_active {
+                for &(b, rcb) in &right_active {
+                    schur[[a, b]] -= lca * rcb;
                 }
             }
         }
