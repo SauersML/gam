@@ -173,13 +173,129 @@ impl CascadeMemoryLedger {
 /// Result of the in-frame curved cascade over a set of regions.
 #[derive(Clone, Debug)]
 pub struct InFrameCurvedResult {
-    /// Ambient curved prediction of the residual (`N × p`): accepted regions'
-    /// rows hold the in-frame chart lifted through their frame; every other row
-    /// is zero (the linear stage already explained it).
-    pub curved_prediction: Array2<f64>,
+    /// Accepted curved atom images, stored in their `r`-dimensional frames.
+    /// Ambient `N × p` materialization is intentionally lazy.
+    pub curved_prediction: InFrameCurvedPrediction,
     pub records: Vec<RegionRecord>,
     pub accepted_regions: Vec<usize>,
     pub ledger: CascadeMemoryLedger,
+}
+
+/// Accepted in-frame prediction for one curved region.
+#[derive(Clone, Debug)]
+pub struct InFrameCurvedRegionPrediction {
+    pub rows: Vec<usize>,
+    pub frame: GrassmannFrame,
+    /// Fitted chart image in frame coordinates (`rows.len() × frame.rank()`).
+    pub fitted_coords: Array2<f64>,
+}
+
+impl InFrameCurvedRegionPrediction {
+    pub fn frame_rank(&self) -> usize {
+        self.frame.rank()
+    }
+
+    pub fn inframe_entries(&self) -> usize {
+        self.fitted_coords.len()
+    }
+
+    pub fn ambient_entries_if_materialized(&self) -> usize {
+        self.rows
+            .len()
+            .saturating_mul(self.frame.output_dim())
+    }
+
+    pub fn materialize_ambient(&self) -> Array2<f64> {
+        fast_abt(&self.fitted_coords, &self.frame.frame().to_owned())
+    }
+
+    fn fill_row_into(&self, local_row: usize, out: &mut [f64]) {
+        let u = self.frame.frame();
+        let r = self.frame.rank();
+        for c in 0..self.frame.output_dim() {
+            let mut acc = 0.0;
+            for axis in 0..r {
+                acc += self.fitted_coords[[local_row, axis]] * u[[c, axis]];
+            }
+            out[c] = acc;
+        }
+    }
+}
+
+/// Lazy curved prediction over the full corpus. The hot fit path stores only
+/// accepted `N_g × r_g` images plus frames; callers must ask explicitly for an
+/// ambient slice or full materialization.
+#[derive(Clone, Debug)]
+pub struct InFrameCurvedPrediction {
+    n_rows: usize,
+    output_dim: usize,
+    regions: Vec<InFrameCurvedRegionPrediction>,
+}
+
+impl InFrameCurvedPrediction {
+    pub fn new(
+        n_rows: usize,
+        output_dim: usize,
+        regions: Vec<InFrameCurvedRegionPrediction>,
+    ) -> Self {
+        Self {
+            n_rows,
+            output_dim,
+            regions,
+        }
+    }
+
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    pub fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    pub fn regions(&self) -> &[InFrameCurvedRegionPrediction] {
+        &self.regions
+    }
+
+    pub fn inframe_entries(&self) -> usize {
+        self.regions
+            .iter()
+            .map(InFrameCurvedRegionPrediction::inframe_entries)
+            .sum()
+    }
+
+    pub fn ambient_entries_if_materialized(&self) -> usize {
+        self.n_rows.saturating_mul(self.output_dim)
+    }
+
+    pub fn accepted_ambient_entries_if_eager(&self) -> usize {
+        self.regions
+            .iter()
+            .map(InFrameCurvedRegionPrediction::ambient_entries_if_materialized)
+            .sum()
+    }
+
+    pub fn materialize_rows(&self, rows: &[usize]) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((rows.len(), self.output_dim));
+        let mut row_buf = vec![0.0_f64; self.output_dim];
+        for (out_row, &global_row) in rows.iter().enumerate() {
+            for region in &self.regions {
+                if let Some(local_row) = region.rows.iter().position(|&row| row == global_row) {
+                    region.fill_row_into(local_row, &mut row_buf);
+                    for c in 0..self.output_dim {
+                        out[[out_row, c]] = row_buf[c];
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn materialize_ambient(&self) -> Array2<f64> {
+        let rows: Vec<usize> = (0..self.n_rows).collect();
+        self.materialize_rows(&rows)
+    }
 }
 
 /// Fit the curved stage in learned low-rank ambient frames.
@@ -228,8 +344,9 @@ pub fn fit_inframe_curved_regions(
         }
     }
 
-    // Assemble prediction, records, and the measured memory ledger.
-    let mut curved_prediction = Array2::<f64>::zeros((residual.nrows(), p));
+    // Assemble lazy prediction records and the measured memory ledger. No `N × p`
+    // curved image is formed here; accepted atom images remain `N_g × r_g`.
+    let mut prediction_regions = Vec::new();
     let mut records = Vec::with_capacity(regions.len());
     let mut accepted_regions = Vec::new();
     let mut dense_border = 0usize;
@@ -270,14 +387,11 @@ pub fn fit_inframe_curved_regions(
             .saturating_mul(inframe_border_coeffs)
             .saturating_mul(BYTES_PER_F64);
         frame_charge += 0.5 * manifold_dim as f64 * ln_n;
-        // Lift the fitted in-frame chart back to ambient and write it into the
-        // region's rows (the curved refinement of the residual).
-        let ambient = fast_abt(&fit.fitted_coords, &fit.frame.frame().to_owned());
-        for (local, &row) in region.rows.iter().enumerate() {
-            for c in 0..p {
-                curved_prediction[[row, c]] = ambient[[local, c]];
-            }
-        }
+        prediction_regions.push(InFrameCurvedRegionPrediction {
+            rows: region.rows.clone(),
+            frame: fit.frame.clone(),
+            fitted_coords: fit.fitted_coords.clone(),
+        });
     }
 
     let ledger = CascadeMemoryLedger {
@@ -291,7 +405,7 @@ pub fn fit_inframe_curved_regions(
     };
 
     Ok(InFrameCurvedResult {
-        curved_prediction,
+        curved_prediction: InFrameCurvedPrediction::new(residual.nrows(), p, prediction_regions),
         records,
         accepted_regions,
         ledger,
@@ -310,7 +424,7 @@ pub fn inframe_curved_region_prediction(
     residual: ArrayView2<'_, f64>,
     rows: &[usize],
     config: &InFrameCurvedConfig,
-) -> Result<Option<(usize, Array2<f64>)>, String> {
+) -> Result<Option<InFrameCurvedRegionPrediction>, String> {
     if rows.len() < 2 {
         return Ok(None);
     }
@@ -320,8 +434,11 @@ pub fn inframe_curved_region_prediction(
     };
     let z = fast_ab(&r_g, &frame.frame().to_owned());
     let fitted = fit_radial_all(&z, config.whitening_ridge)?;
-    let ambient = fast_abt(&fitted, &frame.frame().to_owned());
-    Ok(Some((frame.rank(), ambient)))
+    Ok(Some(InFrameCurvedRegionPrediction {
+        rows: rows.to_vec(),
+        frame,
+        fitted_coords: fitted,
+    }))
 }
 
 /// PRODUCTION SEAM. Learn the low-rank ambient frame of a curved region's

@@ -183,9 +183,27 @@ fn planted_low_rank_curved_recovered_inframe_p2048() {
         "in-frame fit at p={p} took {elapsed:?}; should be fast"
     );
 
-    // The lifted curved prediction reconstructs the planted shell (rows nonzero,
-    // radius ~1 in the recovered subspace ⇒ prediction norm ~1).
-    let pred = &result.curved_prediction;
+    assert_eq!(result.curved_prediction.n_rows(), n);
+    assert_eq!(result.curved_prediction.output_dim(), p);
+    assert_eq!(
+        result.curved_prediction.inframe_entries(),
+        n * rec.frame_rank,
+        "hot prediction storage must be the accepted region's N_g x r image"
+    );
+    assert_eq!(
+        result.curved_prediction.accepted_ambient_entries_if_eager(),
+        n * p,
+        "the eager ambient atom image would have been N_g x p"
+    );
+    assert!(
+        result.curved_prediction.inframe_entries()
+            < result.curved_prediction.accepted_ambient_entries_if_eager(),
+        "curved prediction must stay in-frame on the hot path"
+    );
+
+    // The lifted curved prediction reconstructs the planted shell when explicitly
+    // materialized for verification (rows nonzero, radius ~1).
+    let pred = result.curved_prediction.materialize_ambient();
     let mut mean_norm = 0.0;
     for i in 0..n {
         let mut ss = 0.0;
@@ -219,20 +237,27 @@ fn inframe_matches_dense_full_p_when_frame_contains_truth() {
     };
     let rows: Vec<usize> = (0..n).collect();
 
-    let (rank, inframe_pred) = inframe_curved_region_prediction(residual.view(), &rows, &config)
+    let inframe_pred = inframe_curved_region_prediction(residual.view(), &rows, &config)
         .expect("in-frame prediction")
         .expect("frame learned");
+    let rank = inframe_pred.frame_rank();
     assert_eq!(rank, r_true, "frame rank pinned to the true intrinsic rank");
+    assert_eq!(
+        inframe_pred.inframe_entries(),
+        n * r_true,
+        "single-region prediction stays in the learned r-frame"
+    );
 
     let dense_pred =
         dense_ambient_radial_reference(residual.view(), config.whitening_ridge).expect("dense fit");
+    let inframe_ambient = inframe_pred.materialize_ambient();
 
     // Both are n×p ambient predictions of the SAME chart; compare Frobenius.
     let mut diff = 0.0;
     let mut denom = 0.0;
     for i in 0..n {
         for j in 0..p {
-            let d = inframe_pred[[i, j]] - dense_pred[[i, j]];
+            let d = inframe_ambient[[i, j]] - dense_pred[[i, j]];
             diff += d * d;
             denom += dense_pred[[i, j]] * dense_pred[[i, j]];
         }
@@ -489,4 +514,53 @@ fn ledger_shrink_matches_reviewer_frontier_shape() {
         assert!((ledger.border_shrink() - 256.0).abs() < 1.0e-9);
         assert!((ledger.cov_shrink() - 65_536.0).abs() < 1.0e-6);
     }
+}
+
+#[test]
+fn accepted_curved_prediction_hot_path_stays_in_r_frame() {
+    let n = 180;
+    let p = 128;
+    let r_true = 4;
+    let (residual, _q) = planted_curved_residual(n, p, r_true, 0.02, 0.0, 974);
+    let config = InFrameCurvedConfig {
+        frame_rank_min: r_true,
+        frame_rank_max: r_true,
+        min_rows: 16,
+        ..Default::default()
+    };
+    let region = CurvedRegion {
+        rows: (0..n).collect(),
+        basis_size: 5,
+    };
+    let result =
+        fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
+    assert_eq!(result.accepted_regions, vec![0], "planted curved region accepted");
+    let prediction = &result.curved_prediction;
+    assert_eq!(prediction.regions().len(), 1);
+    assert_eq!(prediction.regions()[0].frame_rank(), r_true);
+    assert_eq!(
+        prediction.inframe_entries(),
+        n * r_true,
+        "accepted atom image must be stored as N_g x r"
+    );
+    assert_eq!(
+        prediction.accepted_ambient_entries_if_eager(),
+        n * p,
+        "the forbidden eager atom image would be N_g x p"
+    );
+    assert!(
+        prediction.inframe_entries() * (p / r_true) <= prediction.accepted_ambient_entries_if_eager(),
+        "in-frame storage should scale by r instead of p"
+    );
+
+    let slice = prediction.materialize_rows(&[0, n / 2, n - 1]);
+    assert_eq!(slice.dim(), (3, p));
+    let mut slice_energy = 0.0;
+    for value in slice.iter() {
+        slice_energy += value * value;
+    }
+    assert!(
+        slice_energy > 0.0,
+        "ambient lifting happens only for the requested residual slice"
+    );
 }
