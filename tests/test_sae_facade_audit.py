@@ -770,3 +770,11 @@ def test_from_payload_rejects_chosen_k_mismatch(monkeypatch):
         sae.ManifoldSAE.from_payload(
             x, payload, topology="circle", assignment="softmax", penalties=[]
         )
+
+
+def test_steer_rejects_incoherent_mutated_core_state_before_ffi():
+    fit = _make_fit("softmax", n_atoms=1)
+    fit.decoder_blocks = []
+
+    with pytest.raises(ValueError, match="native steering state is incoherent"):
+        fit.steer(0, [0.0], [1.0])

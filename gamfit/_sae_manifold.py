@@ -1870,6 +1870,61 @@ class ManifoldSAE:
         self.metric_provenance = "OutputFisher"
         return self
 
+    def _validate_steer_native_state(self) -> None:
+        """Validate the fitted state handed to the native steering kernel.
+
+        The Python facade is still a compatibility shell while the model object is
+        migrated fully native. Until then, steering must not trust post-fit Python
+        mutations that make cross-field dimensions incoherent; reject those at the
+        boundary before the Rust kernel receives a partial model.
+        """
+        n_obs, p_out = (int(self.fitted.shape[0]), int(self.fitted.shape[1]))
+        k_atoms = len(self._basis_kinds)
+        fields = {
+            "atom_dims": len(self._atom_dims),
+            "basis_sizes": len(self._basis_sizes),
+            "n_harmonics": len(self._n_harmonics),
+            "decoder_blocks": len(self.decoder_blocks),
+            "coords": len(self.coords),
+            "duchon_centers": len(self._duchon_centers),
+        }
+        bad = {name: count for name, count in fields.items() if count != k_atoms}
+        if bad:
+            raise ValueError(
+                "ManifoldSAE native steering state is incoherent: "
+                f"basis_kinds has K={k_atoms}, but field lengths differ {bad!r}"
+            )
+        logits = np.asarray(self.low_level_logits)
+        if logits.ndim != 2 or logits.shape != (n_obs, k_atoms):
+            raise ValueError(
+                "ManifoldSAE native steering state is incoherent: "
+                f"low_level_logits must have shape {(n_obs, k_atoms)}, got {logits.shape}"
+            )
+        for idx, (block, coords, dim, width) in enumerate(
+            zip(self.decoder_blocks, self.coords, self._atom_dims, self._basis_sizes)
+        ):
+            block_arr = np.asarray(block)
+            coords_arr = np.asarray(coords)
+            if block_arr.ndim != 2 or block_arr.shape != (int(width), p_out):
+                raise ValueError(
+                    "ManifoldSAE native steering state is incoherent: "
+                    f"decoder_blocks[{idx}] must have shape {(int(width), p_out)}, "
+                    f"got {block_arr.shape}"
+                )
+            if coords_arr.ndim != 2 or coords_arr.shape != (n_obs, int(dim)):
+                raise ValueError(
+                    "ManifoldSAE native steering state is incoherent: "
+                    f"coords[{idx}] must have shape {(n_obs, int(dim))}, got {coords_arr.shape}"
+                )
+        if self.fisher_factors is not None:
+            fisher = np.asarray(self.fisher_factors)
+            if fisher.ndim != 3 or fisher.shape[0] != n_obs or fisher.shape[1] != p_out:
+                raise ValueError(
+                    "ManifoldSAE native steering state is incoherent: "
+                    f"fisher_factors must have shape (N={n_obs}, P={p_out}, R), "
+                    f"got {fisher.shape}"
+                )
+
     def steer(self, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
         """Steering plan with output dosimetry for one atom (#980).
 
@@ -1922,6 +1977,7 @@ class ManifoldSAE:
         steers geometry-only with ``predicted_nats`` / ``validity_radius`` ``None``.
         """
         k = self._atom_index(atom_k)
+        self._validate_steer_native_state()
         t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))
         t_to_arr = np.ascontiguousarray(np.asarray(t_to, dtype=np.float64).reshape(-1))
         kind = _canonical_assignment(self.assignment, "assignment")
