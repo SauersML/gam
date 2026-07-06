@@ -152,6 +152,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot,
                 coord_slot,
+                fixed_gate_value: Vec::new(),
                 n_primaries: K,
             };
             // The production channels carry the √w row-loss weight (#977

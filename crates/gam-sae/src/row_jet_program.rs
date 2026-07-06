@@ -1435,6 +1435,7 @@ mod tests {
             gate: RowGate::Softmax { inv_tau },
             logit_slot: vec![Some(0), Some(1)],
             coord_slot: vec![vec![2, 3], vec![4, 5]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 6,
         };
         (prog, inv_tau)
@@ -1520,6 +1521,7 @@ mod tests {
             gate: RowGate::Softmax { inv_tau },
             logit_slot,
             coord_slot,
+            fixed_gate_value: Vec::new(),
             n_primaries: n_atoms * (1 + latent_dim),
         }
     }
@@ -1920,6 +1922,7 @@ mod tests {
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],
             coord_slot: vec![vec![1]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 2,
         };
         let gate = prog.gate_tower::<2, Tower4<2>>(0);
@@ -2136,6 +2139,7 @@ mod tests {
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot: vec![Some(0), Some(1)],
                 coord_slot: vec![vec![2, 3], vec![4, 5]],
+                fixed_gate_value: Vec::new(),
                 n_primaries: 6,
             }
         };
@@ -2250,6 +2254,7 @@ mod tests {
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],
             coord_slot: vec![vec![1]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 2,
         };
         let rows = [mk(), mk(), mk(), mk()];

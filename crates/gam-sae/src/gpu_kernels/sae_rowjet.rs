@@ -267,6 +267,9 @@ fn softmax_program(
         gate: RowGate::Softmax { inv_tau },
         logit_slot: (0..k).map(Some).collect(),
         coord_slot: vec![vec![]; k],
+        // Softmax bottleneck: no ungated / frozen-routing atoms (both reject
+        // softmax), so every gate follows the free-logit softmax law.
+        fixed_gate_value: Vec::new(),
         n_primaries: k,
     }
 }
