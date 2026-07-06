@@ -563,14 +563,7 @@ fn topology_records_from_codes(
                 atom: live[0].block,
                 support_size: verdict.support_size,
                 landmark_count: verdict.landmark_count,
-                covering_side: match verdict.stability_band {
-                    gam::terms::sae::manifold::PersistenceStabilityBand::BelowLandmarkCap => {
-                        "below_covering_number".to_string()
-                    }
-                    gam::terms::sae::manifold::PersistenceStabilityBand::AtLandmarkCap => {
-                        "at_or_above_covering_number".to_string()
-                    }
-                },
+                covering_side: verdict.covering_side.as_str().to_string(),
                 measured_betti: verdict.measured_betti,
                 expected_betti: verdict.expected_betti,
                 contested: verdict.contested,
