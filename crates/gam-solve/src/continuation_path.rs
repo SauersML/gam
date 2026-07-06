@@ -869,11 +869,19 @@ impl ContinuationPath {
         let spine = match self.warm.clone() {
             Some(start) => {
                 self.evals_budgeted += WARM_LEG_EVAL_BUDGET;
+                // The coupled path is still a continuation pre-warm: its only
+                // payload is the converged inner coefficient state carried by
+                // `inner_beta_hint`.  Requesting an outer gradient here repeats
+                // the expensive REML/LAML derivative assembly at every waypoint
+                // even though no line search or stationarity test consumes it;
+                // the real outer optimizer asks for the gradient once after the
+                // path arrives.  `Value` preserves the same inner solve and warm
+                // beta propagation while removing that redundant derivative work.
                 continue_path_from(
                     obj,
                     start,
                     &rho_target,
-                    OuterEvalOrder::ValueAndGradient,
+                    OuterEvalOrder::Value,
                     WARM_LEG_EVAL_BUDGET,
                 )
             }
@@ -884,7 +892,7 @@ impl ContinuationPath {
                     &rho_target,
                     &self.schedules.rho_bounds_upper,
                     initial_beta,
-                    OuterEvalOrder::ValueAndGradient,
+                    OuterEvalOrder::Value,
                 )
             }
         };
@@ -1354,6 +1362,98 @@ mod tests {
         assert_eq!(PathRegime::from_s(0.5), PathRegime::Annealing);
         assert_eq!(PathRegime::from_s(0.9), PathRegime::Heavy);
         assert_eq!(PathRegime::from_s(1.0), PathRegime::Heavy);
+    }
+
+
+    #[derive(Default)]
+    struct RecordingObjective {
+        orders: Vec<OuterEvalOrder>,
+        seed_count: usize,
+    }
+
+    impl OuterObjective for RecordingObjective {
+        fn capability(&self) -> crate::rho_optimizer::OuterCapability {
+            crate::rho_optimizer::OuterCapability {
+                gradient: gam_problem::Derivative::Analytic,
+                hessian: crate::rho_optimizer::DeclaredHessianForm::Unavailable,
+                n_params: 2,
+                psi_dim: 0,
+                fixed_point_available: false,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            }
+        }
+
+        fn eval_cost(
+            &mut self,
+            rho: &Array1<f64>,
+        ) -> Result<f64, crate::model_types::EstimationError> {
+            Ok(rho.iter().map(|v| v * v).sum())
+        }
+
+        fn eval(
+            &mut self,
+            rho: &Array1<f64>,
+        ) -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
+            Ok(gam_problem::OuterEval {
+                cost: self.eval_cost(rho)?,
+                gradient: Array1::zeros(rho.len()),
+                hessian: gam_problem::HessianResult::Unavailable,
+                inner_beta_hint: Some(Array1::from_vec(vec![1.0, self.seed_count as f64])),
+            })
+        }
+
+        fn eval_with_order(
+            &mut self,
+            rho: &Array1<f64>,
+            order: OuterEvalOrder,
+        ) -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
+            self.orders.push(order);
+            let mut eval = self.eval(rho)?;
+            if matches!(order, OuterEvalOrder::Value) {
+                eval.gradient = Array1::zeros(0);
+                eval.hessian = gam_problem::HessianResult::Unavailable;
+            }
+            Ok(eval)
+        }
+
+        fn reset(&mut self) {}
+
+        fn seed_inner_state(
+            &mut self,
+            beta: &Array1<f64>,
+        ) -> Result<crate::rho_optimizer::SeedOutcome, crate::model_types::EstimationError> {
+            self.seed_count += beta.len().max(1);
+            Ok(crate::rho_optimizer::SeedOutcome::Installed)
+        }
+    }
+
+    #[test]
+    fn coupled_path_prewarm_requests_value_only_evals() {
+        let mut path = ContinuationPath::enter(schedules());
+        let mut obj = RecordingObjective::default();
+        let initial_beta = Array1::zeros(0);
+
+        let step = path.step(&mut obj, &initial_beta);
+        assert!(
+            matches!(
+                step,
+                ContinuationStep::Descended { .. } | ContinuationStep::Arrived { .. }
+            ),
+            "recording objective should accept the first coupled-path waypoint"
+        );
+        assert!(
+            !obj.orders.is_empty(),
+            "the coupled path should evaluate at least one rho waypoint"
+        );
+        assert!(
+            obj.orders
+                .iter()
+                .all(|order| matches!(order, OuterEvalOrder::Value)),
+            "coupled continuation pre-warm must not request outer gradients: {:?}",
+            obj.orders
+        );
     }
 
     #[test]
