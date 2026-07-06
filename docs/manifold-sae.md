@@ -131,12 +131,20 @@ smoothing weights selected by REML. Each piece plays a distinct role
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
   is selected by the assignment prior. The three supported kinds are
   `"ibp_map"` (default), `"softmax"`, and `"jumprelu"`. `"ibp_map"`
-  (Indian Buffet Process MAP) adapts the *number* of active atoms per token
-  via a sigmoid gate scaled by a stick-breaking geometric weight. The gate
-  is `σ(ℓ/τ)·π_k(α)`, which is strictly positive at every finite logit, so it
+  (Indian Buffet Process, empirical-Bayes) adapts the *number* of active atoms
+  per token via a sigmoid gate scaled by the ordered stick-breaking **prior
+  mean** `π_k(α) = μ_k = (α/(α+1))^(k+1)`. The gate is `σ(ℓ/τ)·π_k(α)`, which is
+  strictly positive at every finite logit, so it
   produces a **sharply decaying, sparsity-inducing** gate rather than a soft
   simplex — but not exact zeros on its own; **hard zeros require the separate
-  `top_k=` truncation** (#1421). `"softmax"` is a
+  `top_k=` truncation** (#1421). The gate and its analytic sparsity penalty are
+  **one generative model** — `π_k ~ Beta(a_k, 1)`, `z_ik | π_k ~ Bernoulli(π_k)`
+  with `a_k = μ_k/(1−μ_k)` (so `E[π_k] = μ_k`): the gate multiplies the **prior
+  mean** `μ_k`, while the penalty scores the relaxed indicators `z_ik = σ(ℓ/τ)`
+  against the **posterior mean** `π̂_k = (M_k + a_k)/(N + a_k + 1)` of that same
+  `π_k` (empirical Bayes). Despite the `ibp_map` keyword the plug-in is the
+  posterior **mean**, not the MAP/mode — the penalty is the negative
+  log-posterior of the model the gate samples, so fit = one coherent objective. `"softmax"` is a
   dense, simplex-normalized gate; `"jumprelu"` is a hard threshold (its
   cutoff is `jumprelu_threshold=`, default `0.0`). `top_k=` optionally caps
   the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
