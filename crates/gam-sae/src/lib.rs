@@ -15,6 +15,7 @@ pub mod criterion_atoms;
 pub mod description_length;
 pub mod dictionary_artifact;
 pub mod dual_certificate;
+pub mod effect_weight;
 pub mod encode;
 pub mod effect_weight;
 pub mod frames;
