@@ -2130,7 +2130,18 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144
         !term.ibp_low_rank_whiten(),
         "rank-{s} == p={p} metric must NOT engage the low-rank IBP majorizer"
     );
-    rho.log_lambda_sparse = 0.5;
+    // Full-rank whitening does NOT engage the low-rank PSD majorizer
+    // (`ibp_low_rank_whiten() == false`), so the fixed-alpha `ibp_map` joint
+    // Hessian is un-majorized and shares the #1416 non-PD landscape: at
+    // `log_lambda_sparse = 0.5` (the level the low-rank sibling can use because
+    // its majorizer keeps the IBP curvature PD) the reduced Schur complement is
+    // indefinite and setup fails. Sit in the same PD island #1416 uses
+    // (`ρ_sparse ∈ [−1.0, −0.4]`, interior `−0.8`); the diagonal whitening only
+    // amplifies the data curvature there (channel-1 gets `d² = 4×`), so the
+    // island stays solidly PD while `Jᵀ U Uᵀ J ≠ JᵀJ` still discriminates the
+    // whitened row jets from the raw (unpatched) ones. Setup fix only — no
+    // tolerance weakened.
+    rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged full-rank whitened cache");
