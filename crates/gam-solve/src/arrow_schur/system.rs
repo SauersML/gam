@@ -2498,6 +2498,14 @@ pub struct ArrowFactorCache {
     /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
     /// the dense `K × K` factor.
     pub schur_factor: Option<Array2<f64>>,
+    /// True iff `schur_factor` is the reduced Schur complement built from the
+    /// undamped evidence row factors (`H_tt`, no LM ridge) and `ridge_beta = 0`.
+    ///
+    /// A Newton solve may be damped while the cache still carries an undamped
+    /// evidence Schur for logdet / selected-inverse consumers. When this is false,
+    /// consumers must not combine `schur_factor` with [`Self::undamped_factor`]:
+    /// that would mix two different bordered-arrow operators.
+    pub schur_factor_is_undamped: bool,
     /// Exact undamped joint-Hessian log-determinant produced by the dense
     /// factorization path. REML evidence consumes this directly so the Laplace
     /// normalizer cannot miss the log-det even when later cache consumers only
@@ -3229,9 +3237,6 @@ impl ArrowFactorCache {
     }
 
     pub fn compute_undamped_arrow_log_det(&self) -> Option<f64> {
-        if self.ridge_t != 0.0 || self.ridge_beta != 0.0 {
-            return None;
-        }
         // When the shared β block is empty (`k == 0`) the joint Hessian is
         // exactly the block diagonal of the per-row latent blocks: there is no
         // reduced Schur complement to form, so the dense Direct path leaves
@@ -3246,6 +3251,9 @@ impl ArrowFactorCache {
             None if self.k == 0 => None,
             None => return None,
         };
+        if schur.is_some() && !self.schur_factor_is_undamped {
+            return None;
+        }
 
         let mut acc = 0.0_f64;
         for l in self.undamped_factors_iter() {
@@ -3356,48 +3364,22 @@ impl ArrowFactorCache {
             .apply_row_transpose_accumulate(row, v, out, di, self.k, fallback_op)
     }
 
-    /// Undamped arrow log-determinant
-    /// `log|H| = Σ_i log|H_{t_i t_i}| + log|Schur_β|`
-    /// using the evidence factors.
+    /// Authoritative evidence joint log-determinant for the exact operator this
+    /// cache exposes to selected-inverse and adjoint consumers.
     ///
-    /// Returns `(log_det_tt_sum, log_det_schur)` so the caller can decide
-    /// what to do with the Schur piece (e.g. REML evidence wants both;
-    /// some diagnostics want only the per-row sum). `None` for the Schur
-    /// piece means either `k == 0` (no shared β block; the Woodbury correction
-    /// is folded into `log_det_tt_sum`) or an InexactPCG solve that never
-    /// formed/factored the dense `K × K` reduced system.
-    ///
-    /// The per-row term uses [`Self::undamped_factor`], matching
-    /// `arrow_log_det_from_cache`, `apply_cached_arrow_hessian`, and the
-    /// selected-inverse traces. A nonzero ridge means the cached Schur factor is
-    /// a damped solve artifact, not an evidence factor.
-    pub fn arrow_log_det(&self) -> (f64, Option<f64>) {
-        assert!(
-            self.ridge_t == 0.0 && self.ridge_beta == 0.0,
-            "ArrowFactorCache::arrow_log_det requires an undamped evidence cache"
-        );
-        let mut log_det_tt = 0.0_f64;
-        for l in self.undamped_factors_iter() {
-            for i in 0..l.nrows() {
-                log_det_tt += l[[i, i]].ln();
-            }
+    /// The factorization path computes this once into
+    /// [`Self::joint_hessian_log_det`]. This accessor deliberately does not
+    /// reconstruct `Σ_i log|H_tt^(i)| + log|Schur_β|` from loose pieces: a damped
+    /// Newton cache can otherwise pair undamped row factors with a damped Schur
+    /// solve and silently describe no live operator. Returning only the stored
+    /// joint value keeps REML evidence, fixed-state tests, selected inverse, and
+    /// `logdet_theta_adjoint` on the same factorization branch.
+    pub fn arrow_log_det(&self) -> Option<f64> {
+        if self.k > 0 && !self.schur_factor_is_undamped {
+            return None;
         }
-        log_det_tt *= 2.0;
-        let log_det_schur = match self.schur_factor.as_ref() {
-            Some(l) => {
-                let mut s = 0.0_f64;
-                for i in 0..l.nrows() {
-                    s += l[[i, i]].ln();
-                }
-                Some(2.0 * s + self.cross_row_woodbury_log_det())
-            }
-            None if self.k == 0 => {
-                log_det_tt += self.cross_row_woodbury_log_det();
-                None
-            }
-            None => None,
-        };
-        (log_det_tt, log_det_schur)
+        self.joint_hessian_log_det
+            .filter(|log_det| log_det.is_finite())
     }
 
     /// The exact cross-row IBP correction `log det(I_R + D·M)` to add to the
@@ -3466,6 +3448,13 @@ impl ArrowFactorCache {
                     .to_string(),
             });
         };
+        if !self.schur_factor_is_undamped {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "latent_block_inverse_diagonal refuses a Schur factor that was not \
+                         built from the undamped evidence row factors"
+                    .to_string(),
+            });
+        }
         if !self.htbeta_available() {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "latent_block_inverse_diagonal requires the H_tβ coupling, \
@@ -3701,6 +3690,13 @@ impl ArrowFactorCache {
                     .to_string(),
             });
         };
+        if !self.schur_factor_is_undamped {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_apply refuses a Schur factor that was not built from \
+                         the undamped evidence row factors"
+                    .to_string(),
+            });
+        }
         if rhs.len() != self.k {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
@@ -3745,6 +3741,13 @@ impl ArrowFactorCache {
                     .to_string(),
             });
         };
+        if !self.schur_factor_is_undamped {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_block refuses a Schur factor that was not built from \
+                         the undamped evidence row factors"
+                    .to_string(),
+            });
+        }
         if block.end > self.k {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(

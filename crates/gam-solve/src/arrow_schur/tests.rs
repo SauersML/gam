@@ -1911,8 +1911,9 @@ pub(crate) fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
 
     // Cache log-determinant (Σ log|H_tt^i| + log|S_β|) must equal the exact
     // dense log|H|, regardless of conditioning — the whole point.
-    let (log_det_tt, log_det_schur) = cache.arrow_log_det();
-    let log_det_cache = log_det_tt + log_det_schur.expect("dense Schur factor present");
+    let log_det_cache = cache
+        .arrow_log_det()
+        .expect("authoritative joint logdet");
 
     // Dense reference: assemble H and take log|H| = 2 Σ log L_ii.
     let dim = n * d + k;
@@ -2392,8 +2393,9 @@ pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
         dense_logdet += 2.0 * l[[i, i]].ln();
     }
 
-    let (tt, schur) = cache.arrow_log_det();
-    let cache_logdet = tt + schur.expect("direct mode has a Schur factor");
+    let cache_logdet = cache
+        .arrow_log_det()
+        .expect("authoritative Woodbury joint logdet");
     assert!(
         (cache_logdet - dense_logdet).abs() < 1e-9,
         "cache log det H_full {cache_logdet} vs dense {dense_logdet}"
@@ -2629,8 +2631,9 @@ pub(crate) fn ibp_cross_row_woodbury_absent_is_strict_noop() {
     for i in 0..l.nrows() {
         dense_logdet += 2.0 * l[[i, i]].ln();
     }
-    let (tt, schur) = cache.arrow_log_det();
-    let cache_logdet = tt + schur.expect("direct Schur");
+    let cache_logdet = cache
+        .arrow_log_det()
+        .expect("authoritative bare joint logdet");
     assert!(
         (cache_logdet - dense_logdet).abs() < 1e-9,
         "bare cache log det {cache_logdet} vs dense H₀ {dense_logdet}"

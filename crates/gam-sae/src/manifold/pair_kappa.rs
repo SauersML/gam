@@ -126,10 +126,12 @@ pub struct PairVerdict {
     /// `z`-score of `ρ̂ − 1` against the independence null.
     pub z: f64,
     /// Context-conditional residual-gate stability report. This is the structure
-    /// search gate; `ρ` remains evidence, but cannot by itself propose fusion.
+    /// search gate; the pooled coupling certificate protects the weighted
+    /// Pearson statistic, while `rho` remains fourth-moment evidence and cannot
+    /// by itself propose fusion.
     pub conditionality: Option<CoactivationConditionality>,
-    /// True iff the residual-gate directional conditionals are stable across
-    /// contexts and have no centered-association sign flip.
+    /// True iff the residual-gate weighted-Pearson coupling has enough local KL
+    /// margin to dominate continuous-context by-smooth drift.
     pub conditional_stable: bool,
     /// True ⇒ the pair reads as ONE bound structure (a merge proposal).
     pub merge_proposed: bool,
@@ -330,6 +332,11 @@ fn pair_continuous_context(ea: &PlaneEnergies, eb: &PlaneEnergies) -> Vec<f64> {
 }
 
 fn partition_free_conditional_stable(c: &CoactivationConditionality) -> bool {
+    if c.certificate.statistic
+        != crate::coactivation_conditionality::CouplingStatistic::WeightedPearson
+    {
+        return false;
+    }
     let drift = c.native.beta_wiggliness.max(0.0) + c.native.beta_variation.max(0.0);
     if c.certificate.robustness_radius_epsilon.is_infinite() {
         return true;

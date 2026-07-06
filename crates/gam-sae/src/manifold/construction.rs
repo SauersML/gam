@@ -207,6 +207,7 @@ impl SaeManifoldTerm {
             evidence_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
             best_cocollapse_incumbent: None,
+            structural_cocollapse_reseeds: 0,
             decoder_repulsion_gate: None,
             barrier_coactivation_gate: None,
             // #1801 — default false: the dense/full-batch assembly refreshes the
@@ -389,6 +390,7 @@ impl SaeManifoldTerm {
         primary.evidence_gauge_deflation_last_delta_sign = 0;
         primary.dictionary_cocollapse_reseeds = 0;
         primary.best_cocollapse_incumbent = None;
+        primary.structural_cocollapse_reseeds = 0;
         // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
         primary.collapse_events = Vec::new();
         primary.curvature_walk_report = None;
@@ -7929,6 +7931,13 @@ impl SaeManifoldTerm {
         // row-local channel (handled inline via
         // `assignment_prior_hdiag_derivative_entry`) and a cross-row channel
         // (accumulated column-wise after the row loop, below).
+        if cache.arrow_log_det().is_none() {
+            return Err(
+                "logdet_theta_adjoint: cache lacks an authoritative joint-Hessian log-det \
+                 for the selected-inverse operator"
+                    .to_string(),
+            );
+        }
         let n = self.n_obs();
         let total_t = cache.delta_t_len();
         let mut gamma_t = Array1::<f64>::zeros(total_t);

@@ -5,6 +5,7 @@
 use super::tests::*;
 use super::*;
 use gam_linalg::faer_ndarray::fast_ata;
+use gam_solve::evidence::arrow_log_det_from_cache;
 use approx::assert_abs_diff_eq;
 use gam_solve::arrow_schur::{ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics};
 use gam_terms::analytic_penalties::ARDPenalty;
@@ -1110,6 +1111,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(array![[1.0_f64]]),
+        schur_factor_is_undamped: true,
         joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
@@ -1139,6 +1141,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         htt_factors: ArrowFactorSlab::from_blocks(vec![factor]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: None,
+        schur_factor_is_undamped: true,
         joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
@@ -1297,6 +1300,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         htt_factors: htt,
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(schur),
+        schur_factor_is_undamped: true,
         joint_hessian_log_det: None,
         solver_mode: ArrowSolverMode::Direct,
         ridge_t: 0.0,
@@ -1967,8 +1971,7 @@ pub(crate) fn fixed_state_logdet(
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("fixed-state cache");
-    let (tt, beta) = cache.arrow_log_det();
-    tt + beta.expect("dense Schur logdet")
+    arrow_log_det_from_cache(&cache).expect("fixed-state authoritative joint logdet")
 }
 
 // [#780 line-count gate] The #1557 arrow-Schur parallelism-invariance

@@ -531,6 +531,11 @@ pub struct SaeManifoldTerm {
     /// carried alongside the EV so the multi-start can break (near-)equal-EV ties
     /// on coordinate fidelity ([`prefer_candidate_basin`]).
     pub(crate) best_cocollapse_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
+    /// Bounded high-EV structural-collapse reseeds spent by the frame-coherence
+    /// guard in the current optimization. This is separate from total decoder
+    /// co-collapse: these atoms still carry decoder norm and EV, but duplicate an
+    /// occupied output frame.
+    pub(crate) structural_cocollapse_reseeds: usize,
     /// #1026 decoder-repulsion gate, frozen per assembly (lagged-diffusivity
     /// discipline, exactly like [`SaeManifoldAtom::smooth_penalty`]): the
     /// symmetric `(K, K)` matrix of collinearity gate weights
@@ -775,6 +780,7 @@ impl Clone for SaeManifoldTerm {
             // term identity (like `border_hbb_workspace`); a fresh clone starts
             // with no incumbent and rebuilds it if it re-enters co-collapse.
             best_cocollapse_incumbent: None,
+            structural_cocollapse_reseeds: self.structural_cocollapse_reseeds,
             // Transient per-assembly frozen gate — rebuilt at the next assembly.
             decoder_repulsion_gate: None,
             // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
