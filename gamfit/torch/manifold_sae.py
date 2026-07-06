@@ -246,7 +246,11 @@ class ManifoldSAEConfig:
     sparsity: SparsityConfig = field(default_factory=SparsityConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     reml: RemlConfig = field(default_factory=RemlConfig)
-    encoder_hidden: int = 16
+    # Default to the direct linear encoder used by the closed-form/Rust SAE
+    # family. A positive value is an explicit opt-in to an extra nonlinear
+    # PyTorch-only mixer, which can reconstruct well while hiding feature
+    # presence from per-atom amplitudes in routing diagnostics.
+    encoder_hidden: int = 0
     init_scale: float = 0.05
     dtype: Any = field(default=None)
     # ``K`` is constructor sugar for ``n_atoms`` (the spelling the docs and the
@@ -1686,13 +1690,16 @@ class ManifoldSAE(nn.Module):
         reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
         lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)
 
-        # `amplitudes` is the magnitude the decoder actually used (== z), so a
-        # dropped atom reports zero, never its raw pre-mask activation.
+        # `z` is the signed coefficient used by reconstruction. `amplitudes`
+        # is the corresponding activation magnitude: in the multi-atom
+        # softmax-top-k lane a negative least-squares coefficient is phase/sign
+        # information, not feature absence, so routing diagnostics must observe
+        # |z| while reconstruction keeps the signed value.
         return ManifoldSAEOutput(
             z=z,
             x_hat=x_hat,
             positions=positions,
-            amplitudes=z,
+            amplitudes=z.abs(),
             curves=curves,
             gate=gate_pre,
             assignments=assignments,
