@@ -2179,6 +2179,45 @@ fn metric_provenance_label(
     }
 }
 
+#[derive(Clone, Debug)]
+struct StructuredResidualPassDiagnostic {
+    pass: usize,
+    gamma: f64,
+    factor_rank: usize,
+    log_evidence: f64,
+    factor_energy: f64,
+    diagonal_mean: f64,
+    dispersion_before: f64,
+    dispersion_after: f64,
+    log_lambda_smooth_before: Vec<f64>,
+    log_lambda_smooth_after: Vec<f64>,
+}
+
+fn structured_residual_pass_diagnostics_dict<'py>(
+    py: Python<'py>,
+    diagnostics: &[StructuredResidualPassDiagnostic],
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for d in diagnostics {
+        let item = PyDict::new(py);
+        item.set_item("pass", d.pass)?;
+        item.set_item("gamma", d.gamma)?;
+        item.set_item("factor_rank", d.factor_rank)?;
+        item.set_item("log_evidence", d.log_evidence)?;
+        item.set_item("factor_energy", d.factor_energy)?;
+        item.set_item("diagonal_mean", d.diagonal_mean)?;
+        item.set_item("dispersion_before", d.dispersion_before)?;
+        item.set_item("dispersion_after", d.dispersion_after)?;
+        item.set_item(
+            "log_lambda_smooth_before",
+            d.log_lambda_smooth_before.clone(),
+        )?;
+        item.set_item("log_lambda_smooth_after", d.log_lambda_smooth_after.clone())?;
+        out.append(item)?;
+    }
+    Ok(out)
+}
+
 /// #2021 — ceiling on the number of EXTRA whitened-residual refit passes the
 /// structured-residual outer alternation will run after the iid pass-0 fit. The
 /// caller-supplied `structured_residual_passes` kwarg is clamped to this so a
@@ -2286,7 +2325,7 @@ fn sae_structured_residual_model(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 0,
+    structured_residual_passes = 1,
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
@@ -2836,7 +2875,16 @@ fn sae_manifold_fit_stagewise<'py>(
     // `detach`) and already re-enters Python (raising there) each event.
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = match progress_hook {
-        Some(hook) => gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, z_view, None, weights.as_deref(), &config, Some(hook), None),
+        Some(hook) => gam::terms::sae::manifold::fit_stagewise(
+            base_term,
+            init_rho,
+            z_view,
+            None,
+            weights.as_deref(),
+            &config,
+            Some(hook),
+            None,
+        ),
         None => {
             // The worker thread is `'static`, but `z_view` borrows the (Python)
             // numpy buffer — own the target so nothing non-`'static` crosses in
@@ -2844,7 +2892,16 @@ fn sae_manifold_fit_stagewise<'py>(
             let target_owned = z_view.to_owned();
             let worker_cancel = std::sync::Arc::clone(&cancel_flag);
             run_sae_fit_interruptible(py, "gam-sae-stagewise", &cancel_flag, move || {
-                gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, target_owned.view(), None, weights.as_deref(), &config, None, Some(&*worker_cancel))
+                gam::terms::sae::manifold::fit_stagewise(
+                    base_term,
+                    init_rho,
+                    target_owned.view(),
+                    None,
+                    weights.as_deref(),
+                    &config,
+                    None,
+                    Some(&*worker_cancel),
+                )
             })?
         }
     }
@@ -3472,23 +3529,24 @@ fn sae_manifold_fit_inner<'py>(
     // (the objective bails out of its next outer eval).
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
-    let (mut objective, run_result) = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
-        let run_result = if run_outer_rho_search {
-            let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
-                .with_initial_rho(init_rho_flat.clone())
-                .with_seed_config(gam::solver::seeding::SeedConfig {
-                    max_seeds: 1,
-                    seed_budget: 1,
-                    ..Default::default()
-                });
-            problem.run(&mut objective, "SAE manifold").map(|_| ())
-        } else {
-            objective
-                .fit_at_fixed_rho(init_rho_flat.view())
-                .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
-        };
-        (objective, run_result)
-    })?;
+    let (mut objective, run_result) =
+        run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
+            let run_result = if run_outer_rho_search {
+                let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+                    .with_initial_rho(init_rho_flat.clone())
+                    .with_seed_config(gam::solver::seeding::SeedConfig {
+                        max_seeds: 1,
+                        seed_budget: 1,
+                        ..Default::default()
+                    });
+                problem.run(&mut objective, "SAE manifold").map(|_| ())
+            } else {
+                objective
+                    .fit_at_fixed_rho(init_rho_flat.view())
+                    .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
+            };
+            (objective, run_result)
+        })?;
     run_result.map_err(estimation_error_to_pyerr)?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
@@ -3526,6 +3584,7 @@ fn sae_manifold_fit_inner<'py>(
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
     let structured_passes = structured_residual_passes.min(STRUCTURED_RESIDUAL_PASSES_MAX);
+    let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> = None;
         // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
@@ -3585,6 +3644,10 @@ fn sae_manifold_fit_inner<'py>(
                 .row_metric_damped(n_obs, gamma, prev_model.as_ref())
                 .map_err(py_value_error)?;
             let installed_label = metric_provenance_label(metric.provenance());
+            let factor_energy = model.factor().iter().map(|v| v * v).sum::<f64>();
+            let diagonal_mean = model.diagonal().iter().copied().sum::<f64>() / p_out as f64;
+            let dispersion_before = shape_uncertainty.dispersion;
+            let log_lambda_smooth_before = rho.log_lambda_smooth.clone();
             term.set_row_metric(metric).map_err(py_value_error)?;
             // Rebuild the analytic-penalty registry (cheap; `latent_payload` is
             // still owned) and warm-start ρ from the settled fit.
@@ -3619,7 +3682,9 @@ fn sae_manifold_fit_inner<'py>(
             objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
             let (mut objective, run_result) =
                 run_sae_fit_interruptible(py, "gam-sae-fit-structured", &cancel_flag, move || {
-                    let run_result = problem.run(&mut objective, "SAE manifold (structured)").map(|_| ());
+                    let run_result = problem
+                        .run(&mut objective, "SAE manifold (structured)")
+                        .map(|_| ());
                     (objective, run_result)
                 })?;
             run_result.map_err(estimation_error_to_pyerr)?;
@@ -3634,6 +3699,18 @@ fn sae_manifold_fit_inner<'py>(
             term = fitted_result.term;
             rho = fitted_result.rho;
             loss = fitted_result.loss;
+            structured_residual_diagnostics.push(StructuredResidualPassDiagnostic {
+                pass: pass + 1,
+                gamma,
+                factor_rank: model.factor_rank(),
+                log_evidence: model.log_evidence(),
+                factor_energy,
+                diagonal_mean,
+                dispersion_before,
+                dispersion_after: shape_uncertainty.dispersion,
+                log_lambda_smooth_before,
+                log_lambda_smooth_after: rho.log_lambda_smooth.clone(),
+            });
             // Report the geometry actually used by the returned fit.
             metric_provenance = installed_label;
             // #2021 promotion: fold this pass's persisted factor directions into
@@ -4266,6 +4343,10 @@ fn sae_manifold_fit_inner<'py>(
     // "Euclidean" (no shard, bit-identical isotropic path) or "OutputFisher"
     // (a WP-D shard was supplied and `RowMetric::OutputFisher` was installed).
     out.set_item("metric_provenance", metric_provenance)?;
+    out.set_item(
+        "structured_residual_diagnostics",
+        structured_residual_pass_diagnostics_dict(py, &structured_residual_diagnostics)?,
+    )?;
     // Truncation diagnostic: per-row output-Fisher mass `trace(G_n) − Σ_{k≤r} λ_k`
     // that fell off the captured rank-r subspace. Surfaced so a too-small rank is
     // visible, not silent. Present only when a Fisher shard with a mass_residual
@@ -4366,7 +4447,9 @@ fn sae_manifold_fit_inner<'py>(
             );
         ledger.record(&coordinate_fidelity_certificate);
         let topology_persistence_certificate =
-            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(&fit_diagnostics.topology_persistence);
+            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(
+                &fit_diagnostics.topology_persistence,
+            );
         ledger.record(&topology_persistence_certificate);
         if let Some(report) = &fit_diagnostics.incoherence_report {
             ledger.record(report);
