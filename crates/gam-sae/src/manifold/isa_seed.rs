@@ -1,4 +1,4 @@
-//! Independent-subspace (ISA) deflationary birth producer (#2111 hardening).
+//! Independent-subspace (ISA) capture-and-joint-rotation birth producer (#2111 hardening).
 //!
 //! WHY FOURTH ORDER. The stagewise birth path mines the running residual for a
 //! circle's 2-plane. Whitening the above-noise signal subspace EXHAUSTS all
@@ -21,23 +21,22 @@
 //! dense circles at `κ → 1`, super-Gaussian gated circles at `κ = 1/q > 2`) and
 //! zeroed exactly on the blends the producer must refuse.
 //!
-//! PRODUCER. Whiten the above-Marchenko–Pastur signal subspace → partition its
-//! `r` coordinates into `⌊r/2⌋` candidate 2-planes → cyclic 2-plane JACOBI
-//! rotations: every coordinate pair `(i, j)` spanning two different planes is
-//! rotated by the angle maximizing the total contrast `Σ_planes (κ_m − 2)²`,
-//! which is exactly evaluable at any angle from one `O(n)` joint-moment pass
-//! (the rotated moments are closed-form trigonometric polynomials — see
-//! [`PairPolys`]). Multistart (`≥ 6` random orthogonal inits — the
-//! prototype-validated floor for escaping permutation/blend saddles on the
-//! equal-amplitude worst case, where second order gives NO ordering at all)
-//! keeps the best basin. The winning plane is accepted only on the ANALYTIC
-//! contrast certificate (anchors above; no tuned ε), mapped back through the
-//! GENERATIVE unwhitening `EΛ^{1/2}` to the ambient support plane, and DEFLATED
-//! by subtracting the accepted plane's centered residual projection on its
-//! active rows. That operator removes the covariance the next eigensolve would
-//! otherwise keep ranking while preserving off-gate plane noise for sparse
-//! circles; dense all-row circles get a final recentered cleanup because there
-//! are no off rows whose plane noise must be retained.
+//! PRODUCER. Capture the above-Marchenko–Pastur signal subspace and count its
+//! candidate planes (`⌊r/2⌋`). Whitening that captured span exhausts second
+//! order and destroys amplitude ordering, so separation inside it must be
+//! JOINT, not greedy: partition the `r` whitened coordinates into candidate
+//! 2-planes, then run cyclic 2-plane JACOBI rotations over every coordinate
+//! pair `(i, j)` spanning different planes. Each rotation maximizes the total
+//! contrast `Σ_planes (κ_m − 2)²`, exactly evaluable at any angle from one
+//! `O(n)` joint-moment pass (closed-form trigonometric polynomials — see
+//! [`PlanePolys`]). Multistart (`≥ 6` random orthogonal inits — the
+//! prototype-validated floor for escaping permutation/blend saddles) keeps the
+//! best JOINT basin. Every plane in that single jointly rotated basis is then
+//! accepted or refused by the ANALYTIC contrast certificate (anchors above; no
+//! tuned ε) after mapping back through the GENERATIVE unwhitening `EΛ^{1/2}` to
+//! its ambient support plane. Deflation is not a separation method here; it is
+//! retained only as an external/span-capture utility for callers that need to
+//! peel an accepted fitted curve.
 //!
 //! Everything here is derived from the residual spectrum (MP edge, bottom-
 //! quartile noise scale) plus the analytic κ anchors; the only dials are
@@ -468,9 +467,9 @@ fn plane_rows_kappa(y: &Array2<f64>, m: usize) -> f64 {
 }
 
 /// Total ISA contrast `Σ_planes (κ_m − 2)²` of the current rotation state —
-/// the objective the Jacobi sweep ascends and the score used to rank basins
-/// across multistart inits and planes across a single basin (see
-/// [`isa_extract_certified_plane`]). Same Gaussian-anchor logic as
+/// the objective the Jacobi sweep ascends and the score used to rank joint
+/// basins across multistart inits and planes inside a single basin (see
+/// [`isa_extract_certified_planes`]). Same Gaussian-anchor logic as
 /// [`pair_objective`], just summed over all current planes rather than the
 /// two planes touched by one rotation.
 fn total_contrast(y: &Array2<f64>, n_planes: usize) -> f64 {
@@ -580,6 +579,239 @@ fn subsample_columns(n: usize) -> Vec<usize> {
     (0..ISA_SUBSAMPLE_FLOOR)
         .map(|i| i * n / ISA_SUBSAMPLE_FLOOR)
         .collect()
+}
+
+/// Whitened above-floor coordinates, row-major as `(r, n_sub)` for the Jacobi
+/// moment pass. The rotation itself is estimated on the deterministic
+/// concentration-floor subsample; certification still uses all rows.
+fn whitened_subsample(
+    residual: ArrayView2<'_, f64>,
+    parts: &IsaEigenParts,
+) -> Option<Array2<f64>> {
+    let n = residual.nrows();
+    let r = parts.above.len();
+    if r < 2 || n < 2 {
+        return None;
+    }
+    let cols = subsample_columns(n);
+    let mut z = Array2::<f64>::zeros((r, cols.len()));
+    for (a, &k) in parts.above.iter().enumerate() {
+        let inv = 1.0 / parts.evals[k].max(f64::MIN_POSITIVE).sqrt();
+        for (cc, &row) in cols.iter().enumerate() {
+            let mut proj = 0.0_f64;
+            for j in 0..residual.ncols() {
+                proj += (residual[[row, j]] - parts.mean[j]) * parts.evecs[[j, k]];
+            }
+            z[[a, cc]] = proj * inv;
+        }
+    }
+    Some(z)
+}
+
+/// Multistart joint Jacobi basis for the whole captured whitened span. Returns
+/// `(q, y)`, where `y = qᵀ z`; columns `(2m, 2m+1)` of `q` are the separated
+/// whitened-space plane `m`. This is the only separation step: callers may
+/// choose how many certified planes to consume, but they must not recursively
+/// re-separate by greedy deflation inside this captured span.
+fn joint_jacobi_basis(
+    residual: ArrayView2<'_, f64>,
+    parts: &IsaEigenParts,
+    config: &IsaSeedConfig,
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    let z = whitened_subsample(residual, parts)?;
+    let r = z.nrows();
+    let n_planes = r / 2;
+    let mut best: Option<(f64, Array2<f64>, Array2<f64>)> = None;
+    for init in 0..config.n_inits.max(1) {
+        let mut q = Array2::<f64>::eye(r);
+        if init > 0 {
+            // Random orthogonal via Gram-Schmidt of LCG normal columns.
+            let mut state = 0x2111_15A0_u64 ^ ((init as u64) << 32) ^ residual.nrows() as u64;
+            let mut g = Array2::<f64>::from_shape_fn((r, r), |_| lcg_normal(&mut state));
+            for c in 0..r {
+                for prev in 0..c {
+                    let mut dot = 0.0;
+                    for row in 0..r {
+                        dot += g[[row, c]] * g[[row, prev]];
+                    }
+                    for row in 0..r {
+                        let sub = dot * g[[row, prev]];
+                        g[[row, c]] -= sub;
+                    }
+                }
+                let mut nrm = 0.0;
+                for row in 0..r {
+                    nrm += g[[row, c]] * g[[row, c]];
+                }
+                let nrm = nrm.sqrt();
+                if nrm > 1e-12 {
+                    for row in 0..r {
+                        g[[row, c]] /= nrm;
+                    }
+                } else {
+                    for row in 0..r {
+                        g[[row, c]] = if row == c { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+            q = g;
+        }
+        let mut y = q.t().dot(&z);
+        jacobi_optimize(&mut y, &mut q, n_planes, config.max_sweeps);
+        let contrast = total_contrast(&y, n_planes);
+        if best.as_ref().is_none_or(|(bc, _, _)| contrast > *bc) {
+            best = Some((contrast, q, y));
+        }
+    }
+    best.map(|(_, q, y)| (q, y))
+}
+
+fn push_orthogonal_direction(dirs: &mut Vec<Vec<f64>>, mut v: Vec<f64>) -> bool {
+    for q in dirs.iter() {
+        let dot: f64 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+        for (vj, qj) in v.iter_mut().zip(q.iter()) {
+            *vj -= dot * qj;
+        }
+    }
+    let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if !(nrm > 1.0e-8) {
+        return false;
+    }
+    for vj in v.iter_mut() {
+        *vj /= nrm;
+    }
+    dirs.push(v);
+    true
+}
+
+fn column_mean(data: ArrayView2<'_, f64>) -> Array1<f64> {
+    let (n, p) = data.dim();
+    let mut mean = Array1::<f64>::zeros(p);
+    if n == 0 {
+        return mean;
+    }
+    for row in 0..n {
+        for j in 0..p {
+            mean[j] += data[[row, j]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n as f64);
+    mean
+}
+
+fn deflate_support_span(work: &mut Array2<f64>, dirs: &[Vec<f64>], start: usize) {
+    if start >= dirs.len() {
+        return;
+    }
+    let mean = column_mean(work.view());
+    let (n, p) = work.dim();
+    for row in 0..n {
+        for q in &dirs[start..] {
+            let mut proj = 0.0_f64;
+            for j in 0..p {
+                proj += (work[[row, j]] - mean[j]) * q[j];
+            }
+            for j in 0..p {
+                work[[row, j]] -= proj * q[j];
+            }
+        }
+    }
+}
+
+fn captured_parts_from_dirs(
+    residual: ArrayView2<'_, f64>,
+    dirs: &[Vec<f64>],
+    sigma2_cert: f64,
+    mp_edge: f64,
+) -> Result<Option<IsaEigenParts>, String> {
+    let (n, p) = residual.dim();
+    let r = dirs.len();
+    if r < 2 {
+        return Ok(None);
+    }
+    let mean = column_mean(residual);
+    let u = Array2::from_shape_fn((p, r), |(row, col)| dirs[col][row]);
+    let mut scores = Array2::<f64>::zeros((n, r));
+    for row in 0..n {
+        for a in 0..r {
+            let mut v = 0.0_f64;
+            for j in 0..p {
+                v += (residual[[row, j]] - mean[j]) * u[[j, a]];
+            }
+            scores[[row, a]] = v;
+        }
+    }
+    let mut s = Array2::<f64>::zeros((r, r));
+    for row in 0..n {
+        for a in 0..r {
+            let sa = scores[[row, a]];
+            for b in a..r {
+                s[[a, b]] += sa * scores[[row, b]];
+            }
+        }
+    }
+    for a in 0..r {
+        for b in a..r {
+            let v = s[[a, b]] / n as f64;
+            s[[a, b]] = v;
+            s[[b, a]] = v;
+        }
+    }
+    let (evals, small_evecs) = s
+        .eigh(Side::Lower)
+        .map_err(|err| format!("captured_parts_from_dirs: span eigensolve failed: {err:?}"))?;
+    let evecs = u.dot(&small_evecs);
+    let mut above: Vec<usize> = (0..r).collect();
+    above.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
+    Ok(Some(IsaEigenParts {
+        mean,
+        evals,
+        evecs,
+        above,
+        mp_edge,
+        sigma2_cert,
+    }))
+}
+
+fn capture_signal_span(
+    residual: ArrayView2<'_, f64>,
+    max_planes: usize,
+    config: &IsaSeedConfig,
+) -> Result<Option<IsaEigenParts>, String> {
+    if max_planes == 0 {
+        return Ok(None);
+    }
+    let max_dims = 2 * max_planes;
+    let mut work = residual.to_owned();
+    let mut dirs: Vec<Vec<f64>> = Vec::new();
+    let mut noise: Option<(f64, f64)> = None;
+    while dirs.len() < max_dims {
+        let Some(parts) = isa_eigen_parts(work.view())? else {
+            break;
+        };
+        if noise.is_none() {
+            noise = Some((parts.sigma2_cert, parts.mp_edge));
+        }
+        let before = dirs.len();
+        if let Some(cand) = isa_extract_certified_plane(work.view(), &parts, config) {
+            for axis in 0..2 {
+                let v: Vec<f64> = (0..residual.ncols()).map(|j| cand.basis[[j, axis]]).collect();
+                push_orthogonal_direction(&mut dirs, v);
+            }
+        }
+        if dirs.len() == before {
+            break;
+        }
+        deflate_support_span(&mut work, &dirs, before);
+    }
+    if dirs.len() % 2 == 1 {
+        let dropped = dirs.pop();
+        debug_assert!(dropped.is_some());
+    }
+    let Some((sigma2_cert, mp_edge)) = noise else {
+        return Ok(None);
+    };
+    captured_parts_from_dirs(residual, &dirs, sigma2_cert, mp_edge)
 }
 
 /// Analytic κ-contrast certificate + candidate assembly for one whitened-space
@@ -705,83 +937,27 @@ fn certify_plane(
     })
 }
 
-/// Extract ONE certified circle plane from the residual, given its
-/// eigenstructure: whiten the above-floor subspace, run the multistart Jacobi
-/// contrast ascent, then walk the resulting planes in descending contrast order
-/// and return the first that passes the ambient certificate. `None` = the
-/// residual carries no certifiable clean circle (the caller's natural stop or
-/// rank-1 fallback).
-pub fn isa_extract_certified_plane(
+/// Extract all certified circle planes from one captured above-floor span:
+/// whiten the span once, run one JOINT multistart Jacobi rotation over every
+/// candidate plane pair, then certify planes from that joint basis. `max_planes`
+/// is a caller safety bound on how many certified planes to consume, not a
+/// separation mechanism.
+pub fn isa_extract_certified_planes(
     residual: ArrayView2<'_, f64>,
     parts: &IsaEigenParts,
+    max_planes: usize,
     config: &IsaSeedConfig,
-) -> Option<IsaPlaneCandidate> {
-    let n = residual.nrows();
+) -> Vec<IsaPlaneCandidate> {
     let r = parts.above.len();
-    if r < 2 || n < 2 {
-        return None;
+    if r < 2 || max_planes == 0 {
+        return Vec::new();
     }
     let n_planes = r / 2;
-    // Whitened above-floor coordinates, moment-floor subsample of the columns.
-    let cols = subsample_columns(n);
-    let n_sub = cols.len();
-    let mut z = Array2::<f64>::zeros((r, n_sub));
-    for (a, &k) in parts.above.iter().enumerate() {
-        let inv = 1.0 / parts.evals[k].max(f64::MIN_POSITIVE).sqrt();
-        for (cc, &row) in cols.iter().enumerate() {
-            let mut proj = 0.0_f64;
-            for j in 0..residual.ncols() {
-                proj += (residual[[row, j]] - parts.mean[j]) * parts.evecs[[j, k]];
-            }
-            z[[a, cc]] = proj * inv;
-        }
-    }
-    // Multistart Jacobi: identity init + random orthogonal inits, keep the basin
-    // with the largest total contrast. Deterministic (LCG keyed by init + n).
-    let mut best: Option<(f64, Array2<f64>, Array2<f64>)> = None;
-    for init in 0..config.n_inits.max(1) {
-        let mut q = Array2::<f64>::eye(r);
-        if init > 0 {
-            // Random orthogonal via Gram-Schmidt of LCG normal columns.
-            let mut state = 0x2111_15A0_u64 ^ ((init as u64) << 32) ^ n as u64;
-            let mut g = Array2::<f64>::from_shape_fn((r, r), |_| lcg_normal(&mut state));
-            for c in 0..r {
-                for prev in 0..c {
-                    let mut dot = 0.0;
-                    for row in 0..r {
-                        dot += g[[row, c]] * g[[row, prev]];
-                    }
-                    for row in 0..r {
-                        let sub = dot * g[[row, prev]];
-                        g[[row, c]] -= sub;
-                    }
-                }
-                let mut nrm = 0.0;
-                for row in 0..r {
-                    nrm += g[[row, c]] * g[[row, c]];
-                }
-                let nrm = nrm.sqrt();
-                if nrm > 1e-12 {
-                    for row in 0..r {
-                        g[[row, c]] /= nrm;
-                    }
-                } else {
-                    for row in 0..r {
-                        g[[row, c]] = if row == c { 1.0 } else { 0.0 };
-                    }
-                }
-            }
-            q = g;
-        }
-        let mut y = q.t().dot(&z);
-        jacobi_optimize(&mut y, &mut q, n_planes, config.max_sweeps);
-        let contrast = total_contrast(&y, n_planes);
-        if best.as_ref().is_none_or(|(bc, _, _)| contrast > *bc) {
-            best = Some((contrast, q, y));
-        }
-    }
-    let (_, q, y) = best?;
-    // Planes in descending single-plane contrast; first to certify wins.
+    let Some((q, y)) = joint_jacobi_basis(residual, parts, config) else {
+        return Vec::new();
+    };
+    // Planes in descending single-plane contrast, but all come from the same
+    // joint basin. This ordering only selects emission order under max_planes.
     let mut order: Vec<(f64, usize)> = (0..n_planes)
         .map(|m| {
             let k = plane_rows_kappa(&y, m);
@@ -790,6 +966,7 @@ pub fn isa_extract_certified_plane(
         })
         .collect();
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut out = Vec::new();
     for (contrast, m) in order {
         if !(contrast > 0.0) {
             continue;
@@ -800,10 +977,26 @@ pub fn isa_extract_certified_plane(
             w[[row, 1]] = q[[row, 2 * m + 1]];
         }
         if let Some(cand) = certify_plane(residual, parts, &w) {
-            return Some(cand);
+            out.push(cand);
+            if out.len() >= max_planes {
+                break;
+            }
         }
     }
-    None
+    out
+}
+
+/// Extract one certified circle plane from the JOINT split of the current
+/// captured span. This is a compatibility shim for single-birth callers; it
+/// does not perform greedy recursive separation.
+pub fn isa_extract_certified_plane(
+    residual: ArrayView2<'_, f64>,
+    parts: &IsaEigenParts,
+    config: &IsaSeedConfig,
+) -> Option<IsaPlaneCandidate> {
+    isa_extract_certified_planes(residual, parts, 1, config)
+        .into_iter()
+        .next()
 }
 
 /// Subtract an accepted plane's centered residual projection, in place: on each
@@ -861,39 +1054,31 @@ pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandi
     }
 }
 
-/// The producer's harvest: the certified planes in extraction order, and
-/// whether the loop exited NATURALLY (the certificate/noise floor said stop)
-/// rather than by hitting the caller's safety cap.
+/// The producer's harvest: the certified planes from one joint split, and
+/// whether harvest ended before hitting the caller's safety cap.
 pub struct IsaHarvest {
     pub planes: Vec<IsaPlaneCandidate>,
     pub natural_exit: bool,
 }
 
-/// Full deflationary run: extract-certify-deflate until the residual carries no
-/// certifiable circle (natural exit) or `max_planes` (a safety BOUND, not a stop
-/// criterion) is reached. This is the harness/e2e entry; the stagewise birth
-/// path calls [`isa_extract_certified_plane`] once per birth instead, because
-/// its fit-then-residual loop IS the deflation.
+/// Full producer run: use deflation only to capture above-floor support span
+/// and select the plane count, then jointly rotate every candidate plane inside
+/// the accumulated span and certify the resulting planes. Greedy deflation is
+/// deliberately absent from separation: after whitening, amplitude ordering is
+/// gone, so recursive extraction has no mathematical guarantee.
 pub fn isa_deflationary_producer(
     residual: ArrayView2<'_, f64>,
     max_planes: usize,
     config: &IsaSeedConfig,
 ) -> Result<IsaHarvest, String> {
-    let mut work = residual.to_owned();
-    let mut planes = Vec::new();
-    let mut natural_exit = false;
-    while planes.len() < max_planes {
-        let Some(parts) = isa_eigen_parts(work.view())? else {
-            natural_exit = true; // residual is noise — the derived-floor stop
-            break;
-        };
-        let Some(cand) = isa_extract_certified_plane(work.view(), &parts, config) else {
-            natural_exit = true; // nothing certifies — the contrast stop
-            break;
-        };
-        isa_deflate_fitted_curve(&mut work, &cand);
-        planes.push(cand);
-    }
+    let Some(parts) = capture_signal_span(residual, max_planes, config)? else {
+        return Ok(IsaHarvest {
+            planes: Vec::new(),
+            natural_exit: true,
+        });
+    };
+    let planes = isa_extract_certified_planes(residual, &parts, max_planes, config);
+    let natural_exit = planes.len() < max_planes;
     Ok(IsaHarvest {
         planes,
         natural_exit,
@@ -1054,197 +1239,6 @@ mod tests {
     /// fraction of rows lie on the cone at all), yet the plane spanned by its
     /// nonzero rows is still just a 2-plane — support alone still cannot
     /// certify it. κ = 1/q = 4 on the super-Gaussian side of the anchor is
-    #[test]
-    fn zzz_debug_sparse_gated() {
-        let k = 6usize;
-        let amps: Vec<f64> = (0..k).map(|c| 1.0 + 0.1 * c as f64).collect();
-        let (data, truth) = planted_circles(2000, 32, k, 0.25, &amps, 0.05, 0x2111_6A7E_u64);
-        let mut work = data.clone();
-        let cfg = IsaSeedConfig::default();
-        for round in 0..12 {
-            let parts = match isa_eigen_parts(work.view()).unwrap() {
-                Some(p) => p,
-                None => {
-                    eprintln!("round {round}: eigen_parts None (natural exit)");
-                    break;
-                }
-            };
-            eprintln!(
-                "round {round}: above.len()={} mp_edge={:.5} sigma2_cert={:.5} evals_top={:?}",
-                parts.above.len(),
-                parts.mp_edge,
-                parts.sigma2_cert,
-                parts
-                    .above
-                    .iter()
-                    .take(4)
-                    .map(|&i| (parts.evals[i] * 1e4).round() / 1e4)
-                    .collect::<Vec<_>>()
-            );
-            // Inspect the winning basin's per-plane kappa BEFORE certification.
-            let cand = isa_extract_certified_plane(work.view(), &parts, &cfg);
-            match &cand {
-                Some(c) => {
-                    let mut best_ov = 0.0;
-                    for tp in &truth {
-                        let ov = plane_overlap(&c.basis, tp);
-                        if ov > best_ov {
-                            best_ov = ov;
-                        }
-                    }
-                    eprintln!(
-                        "  CERTIFIED: kappa={:.3} q_hat={:.3} best_overlap={:.3}",
-                        c.kappa, c.q_hat, best_ov
-                    );
-                    isa_deflate_fitted_curve(&mut work, c);
-                }
-                None => {
-                    eprintln!("  no certify -> natural exit");
-                    // Show why: replicate the extraction's plane ordering + certify attempt.
-                    debug_extract_why(work.view(), &parts, &cfg, &truth);
-                    break;
-                }
-            }
-        }
-    }
-
-    fn debug_extract_why(
-        residual: ArrayView2<'_, f64>,
-        parts: &IsaEigenParts,
-        config: &IsaSeedConfig,
-        truth: &[Array2<f64>],
-    ) {
-        let n = residual.nrows();
-        let r = parts.above.len();
-        let n_planes = r / 2;
-        let cols = subsample_columns(n);
-        let n_sub = cols.len();
-        let mut z = Array2::<f64>::zeros((r, n_sub));
-        for (a, &kk) in parts.above.iter().enumerate() {
-            let inv = 1.0 / parts.evals[kk].max(f64::MIN_POSITIVE).sqrt();
-            for (cc, &row) in cols.iter().enumerate() {
-                let mut proj = 0.0_f64;
-                for j in 0..residual.ncols() {
-                    proj += (residual[[row, j]] - parts.mean[j]) * parts.evecs[[j, kk]];
-                }
-                z[[a, cc]] = proj * inv;
-            }
-        }
-        let mut best: Option<(f64, Array2<f64>, Array2<f64>)> = None;
-        for init in 0..config.n_inits.max(1) {
-            let mut q = Array2::<f64>::eye(r);
-            if init > 0 {
-                let mut state = 0x2111_15A0_u64 ^ ((init as u64) << 32) ^ n as u64;
-                let mut g = Array2::<f64>::from_shape_fn((r, r), |_| lcg_normal(&mut state));
-                for c in 0..r {
-                    for prev in 0..c {
-                        let mut dot = 0.0;
-                        for row in 0..r {
-                            dot += g[[row, c]] * g[[row, prev]];
-                        }
-                        for row in 0..r {
-                            let sub = dot * g[[row, prev]];
-                            g[[row, c]] -= sub;
-                        }
-                    }
-                    let mut nrm = 0.0;
-                    for row in 0..r {
-                        nrm += g[[row, c]] * g[[row, c]];
-                    }
-                    let nrm = nrm.sqrt();
-                    for row in 0..r {
-                        g[[row, c]] /= nrm;
-                    }
-                }
-                q = g;
-            }
-            let mut y = q.t().dot(&z);
-            jacobi_optimize(&mut y, &mut q, n_planes, config.max_sweeps);
-            let contrast = total_contrast(&y, n_planes);
-            if best.as_ref().is_none_or(|(bc, _, _)| contrast > *bc) {
-                best = Some((contrast, q, y));
-            }
-        }
-        let (tot, q, y) = best.unwrap();
-        eprintln!("    winning basin total_contrast={tot:.4}, per-plane:");
-        let mut order: Vec<(f64, usize)> = (0..n_planes)
-            .map(|m| {
-                let kk = plane_rows_kappa(&y, m);
-                let c = if kk.is_finite() { (kk - 2.0) * (kk - 2.0) } else { 0.0 };
-                (c, m)
-            })
-            .collect();
-        order.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for (contrast, m) in order.iter().take(n_planes) {
-            let m = *m;
-            let mut w = Array2::<f64>::zeros((r, 2));
-            for row in 0..r {
-                w[[row, 0]] = q[[row, 2 * m]];
-                w[[row, 1]] = q[[row, 2 * m + 1]];
-            }
-            let kw = plane_rows_kappa(&y, m);
-            // Certify manually with diagnostics inline.
-            let (kobs, kmod, kbl, qh, best_ov) = certify_diag(residual, parts, &w, truth);
-            eprintln!(
-                "      plane m={m} whit_kappa={kw:.3} contrast={contrast:.4} -> kobs={kobs:.3} kmod={kmod:.3} kbl={kbl:.3} qhat={qh:.3} best_ov={best_ov:.3}"
-            );
-        }
-    }
-
-    fn certify_diag(
-        residual: ArrayView2<'_, f64>,
-        parts: &IsaEigenParts,
-        w: &Array2<f64>,
-        truth: &[Array2<f64>],
-    ) -> (f64, f64, f64, f64, f64) {
-        let (n, p) = residual.dim();
-        let r = parts.above.len();
-        let mut amb = Array2::<f64>::zeros((p, 2));
-        for (a, &kk) in parts.above.iter().enumerate().take(r) {
-            let inv = 1.0 / parts.evals[kk].max(f64::MIN_POSITIVE).sqrt();
-            for j in 0..p {
-                amb[[j, 0]] += parts.evecs[[j, kk]] * inv * w[[a, 0]];
-                amb[[j, 1]] += parts.evecs[[j, kk]] * inv * w[[a, 1]];
-            }
-        }
-        if !orthonormalize2(&mut amb) {
-            return (f64::NAN, 0.0, 0.0, 0.0, 0.0);
-        }
-        let noise_2plane = 2.0 * parts.mp_edge;
-        let (mut r2_sum, mut r4_sum) = (0.0_f64, 0.0_f64);
-        let mut n_active = 0usize;
-        for i in 0..n {
-            let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
-            for j in 0..p {
-                let ri = residual[[i, j]] - parts.mean[j];
-                p1 += ri * amb[[j, 0]];
-                p2 += ri * amb[[j, 1]];
-            }
-            let r2 = p1 * p1 + p2 * p2;
-            r2_sum += r2;
-            r4_sum += r2 * r2;
-            if r2 > noise_2plane {
-                n_active += 1;
-            }
-        }
-        let q_hat = n_active as f64 / n as f64;
-        let m2 = (r2_sum / n as f64).max(f64::MIN_POSITIVE);
-        let kappa_obs = (r4_sum / n as f64) / (m2 * m2);
-        let sig2 = parts.sigma2_cert;
-        let a2t = ((m2 - 2.0 * sig2) / q_hat.max(f64::MIN_POSITIVE)).max(0.0);
-        let common = 8.0 * q_hat * a2t * sig2 + 8.0 * sig2 * sig2;
-        let kappa_model = (q_hat * a2t * a2t + common) / (m2 * m2);
-        let kappa_blend = (1.25 * q_hat * a2t * a2t + common) / (m2 * m2);
-        let mut best_ov = 0.0;
-        for tp in truth {
-            let ov = plane_overlap(&amb, tp);
-            if ov > best_ov {
-                best_ov = ov;
-            }
-        }
-        (kappa_obs, kappa_model, kappa_blend, q_hat, best_ov)
-    }
-
     /// what carries the identification.
     #[test]
     fn isa_producer_gate_sparse_gated() {
@@ -1258,6 +1252,154 @@ mod tests {
             "sparse gated gate: n_distinct={n_distinct} n_real={n_real} n_clean={n_clean} \
              planes={n_planes} natural_exit={natural_exit} (want 6/6/6, 6 planes, natural exit)"
         );
+    }
+
+    fn best_truth_overlaps(planes: &[Array2<f64>], truth: &[Array2<f64>]) -> Vec<f64> {
+        let mut per_truth = vec![0.0_f64; truth.len()];
+        for plane in planes {
+            for (idx, tp) in truth.iter().enumerate() {
+                per_truth[idx] = per_truth[idx].max(plane_overlap(plane, tp));
+            }
+        }
+        per_truth
+    }
+
+    fn candidate_overlaps(
+        planes: &[IsaPlaneCandidate],
+        truth: &[Array2<f64>],
+    ) -> Vec<f64> {
+        let bases: Vec<Array2<f64>> = planes.iter().map(|cand| cand.basis.clone()).collect();
+        best_truth_overlaps(&bases, truth)
+    }
+
+    fn ambient_plane_from_captured_parts(parts: &IsaEigenParts, q: &Array2<f64>, m: usize) -> Array2<f64> {
+        let p = parts.evecs.nrows();
+        let r = parts.above.len();
+        let mut amb = Array2::<f64>::zeros((p, 2));
+        for (a, &k) in parts.above.iter().enumerate().take(r) {
+            let scale = parts.evals[k].max(f64::MIN_POSITIVE).sqrt();
+            for j in 0..p {
+                amb[[j, 0]] += parts.evecs[[j, k]] * scale * q[[a, 2 * m]];
+                amb[[j, 1]] += parts.evecs[[j, k]] * scale * q[[a, 2 * m + 1]];
+            }
+        }
+        assert!(orthonormalize2(&mut amb), "captured joint plane must have rank 2");
+        amb
+    }
+
+    fn greedy_deflation_probe(
+        data: &Array2<f64>,
+        max_planes: usize,
+        config: &IsaSeedConfig,
+    ) -> Vec<IsaPlaneCandidate> {
+        let mut work = data.clone();
+        let mut planes = Vec::new();
+        while planes.len() < max_planes {
+            let Some(parts) = isa_eigen_parts(work.view()).expect("greedy probe eigensolve") else {
+                break;
+            };
+            let Some(cand) = isa_extract_certified_plane(work.view(), &parts, config) else {
+                break;
+            };
+            isa_deflate_fitted_curve(&mut work, &cand);
+            planes.push(cand);
+        }
+        planes
+    }
+
+    #[test]
+    fn isa_joint_rotation_recovers_unequal_gated_circles_where_greedy_collapses() {
+        let k = 6usize;
+        let amps = vec![1.00, 0.86, 0.73, 0.61, 0.50, 0.41];
+        let qs = vec![0.90, 0.65, 0.42, 0.25, 0.14, 0.08];
+        let (data, truth) = planted_circles_unequal_gates(
+            12_000,
+            32,
+            &qs,
+            &amps,
+            0.03,
+            0x2111_15A_u64,
+        );
+        let config = IsaSeedConfig {
+            n_inits: 10,
+            max_sweeps: 80,
+        };
+        let greedy = greedy_deflation_probe(&data, k, &config);
+        let greedy_overlaps = candidate_overlaps(&greedy, &truth);
+        let captured = capture_signal_span(data.view(), k, &config)
+            .expect("capture must run")
+            .expect("capture must find signal span");
+        let (q, _y) = joint_jacobi_basis(data.view(), &captured, &config)
+            .expect("joint basis must optimize captured span");
+        let joint_planes: Vec<Array2<f64>> = (0..k)
+            .map(|m| ambient_plane_from_captured_parts(&captured, &q, m))
+            .collect();
+        let joint_overlaps = best_truth_overlaps(&joint_planes, &truth);
+        eprintln!(
+            "[#2111 unequal gated] greedy overlaps = {:?}; joint overlaps = {:?}",
+            greedy_overlaps, joint_overlaps
+        );
+        assert!(
+            joint_overlaps.iter().all(|&ov| ov > 0.35),
+            "joint ISA must recover every unequal gated plane above the weak-source floor; \
+             overlaps={joint_overlaps:?}"
+        );
+    }
+
+    fn planted_circles_unequal_gates(
+        n: usize,
+        p: usize,
+        qs: &[f64],
+        amps: &[f64],
+        sigma: f64,
+        seed: u64,
+    ) -> (Array2<f64>, Vec<Array2<f64>>) {
+        assert!(qs.len() == amps.len() && p >= 2 * qs.len());
+        let k = qs.len();
+        let mut state = seed;
+        let mut frame = Array2::<f64>::from_shape_fn((p, 2 * k), |_| lcg_normal(&mut state));
+        for c in 0..2 * k {
+            for prev in 0..c {
+                let mut dot = 0.0;
+                for row in 0..p {
+                    dot += frame[[row, c]] * frame[[row, prev]];
+                }
+                for row in 0..p {
+                    let sub = dot * frame[[row, prev]];
+                    frame[[row, c]] -= sub;
+                }
+            }
+            let mut nrm = 0.0;
+            for row in 0..p {
+                nrm += frame[[row, c]] * frame[[row, c]];
+            }
+            let nrm = nrm.sqrt();
+            for row in 0..p {
+                frame[[row, c]] /= nrm;
+            }
+        }
+        let mut data = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..k {
+                if lcg_uniform(&mut state) >= qs[c] {
+                    continue;
+                }
+                let th = std::f64::consts::TAU * lcg_uniform(&mut state);
+                for j in 0..p {
+                    data[[i, j]] += amps[c]
+                        * (th.cos() * frame[[j, 2 * c]] + th.sin() * frame[[j, 2 * c + 1]]);
+                }
+            }
+            for j in 0..p {
+                data[[i, j]] += sigma * lcg_normal(&mut state);
+            }
+        }
+        let true_planes: Vec<Array2<f64>> = (0..k)
+            .map(|c| {
+                Array2::from_shape_fn((p, 2), |(row, col)| frame[[row, 2 * c + col]])
+            })
+            .collect();
+        (data, true_planes)
     }
 
     /// PLANTED-BLEND REJECTION NULL — a low-rank GAUSSIAN factor structure
