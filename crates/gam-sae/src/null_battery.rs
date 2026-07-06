@@ -37,6 +37,17 @@ pub enum NullKind {
     ArchitectureMatchedRandomWeight,
 }
 
+impl NullKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PhaseRandomized => "phase_randomized",
+            Self::RandomRotation => "random_rotation",
+            Self::TokenShuffle => "token_shuffle",
+            Self::ArchitectureMatchedRandomWeight => "architecture_matched_random_weight",
+        }
+    }
+}
+
 /// Configuration for [`run_null_battery`].
 #[derive(Clone, Debug)]
 pub struct NullBatteryConfig {
@@ -87,24 +98,211 @@ pub struct NullBatteryReport {
     pub summaries: Vec<NullSummary>,
 }
 
-/// Spike-in detection power at one signal-to-noise ratio.
-#[derive(Clone, Debug)]
-pub struct SpikeInPowerPoint {
-    pub snr: f64,
-    pub trials: usize,
-    pub power: f64,
-    pub mean_stat: f64,
+/// Synthetic topology planted into residual activations for spike-in calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpikeInShape {
+    Circle,
+    Torus,
 }
 
-/// Claim payload expected by downstream report writers: observed statistic,
-/// null summaries, and spike-in power at the claimed SNR.
+impl SpikeInShape {
+    fn signal_rank(self) -> usize {
+        match self {
+            SpikeInShape::Circle => 2,
+            SpikeInShape::Torus => 4,
+        }
+    }
+
+    fn expected_betti(self) -> (usize, usize, usize) {
+        match self {
+            SpikeInShape::Circle => (1, 1, 0),
+            SpikeInShape::Torus => (1, 2, 1),
+        }
+    }
+}
+
+/// How trial noise is drawn before a synthetic topology is injected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpikeInNoiseMode {
+    /// Resample centered residual rows with replacement. This keeps the actual
+    /// post-sink-peel residual covariance and heavy-tailed row distribution in
+    /// the calibration loop.
+    EmpiricalResidualBootstrap,
+    /// Preserve each residual channel's one-dimensional spectrum while
+    /// destroying coherent topology.
+    PhaseRandomizedResidual,
+    /// Treat the supplied matrix as a moment donor and draw a covariance-
+    /// matched heavy-tailed surrogate with the donor's average marginal excess
+    /// kurtosis. Use this when real residual activations are unavailable.
+    CovarianceHeavyTailSurrogate,
+}
+
+/// Configuration for [`spike_in_roc_curve`].
 #[derive(Clone, Debug)]
-pub struct CalibratedClaimReport {
+pub struct SpikeInRocConfig {
+    pub shape: SpikeInShape,
+    pub snrs: Vec<f64>,
+    pub trials: usize,
+    pub seed: u64,
+    pub fpr_levels: Vec<f64>,
+    pub noise_mode: SpikeInNoiseMode,
+}
+
+impl SpikeInRocConfig {
+    pub fn circle(snrs: Vec<f64>, trials: usize, seed: u64) -> Self {
+        Self {
+            shape: SpikeInShape::Circle,
+            snrs,
+            trials,
+            seed,
+            fpr_levels: vec![0.01, 0.05, 0.10],
+            noise_mode: SpikeInNoiseMode::PhaseRandomizedResidual,
+        }
+    }
+
+    pub fn torus(snrs: Vec<f64>, trials: usize, seed: u64) -> Self {
+        Self {
+            shape: SpikeInShape::Torus,
+            snrs,
+            trials,
+            seed,
+            fpr_levels: vec![0.01, 0.05, 0.10],
+            noise_mode: SpikeInNoiseMode::EmpiricalResidualBootstrap,
+        }
+    }
+}
+
+/// Explicit covariance/heavy-tail moments for generating a surrogate residual
+/// activation matrix when real post-sink-peel activations are unavailable.
+#[derive(Clone, Debug)]
+pub struct ResidualMomentSpec {
+    pub rows: usize,
+    pub mean: Array1<f64>,
+    pub covariance: Array2<f64>,
+    pub excess_kurtosis: f64,
+}
+
+/// Block-chart promotion plus topology-audit verdict for one detection run.
+#[derive(Clone, Debug)]
+pub struct DetectionPipelineReport {
+    pub shape: SpikeInShape,
+    pub statistic: f64,
+    pub promoted: bool,
+    pub topology: TopologyAuditReport,
+    pub detected: bool,
+}
+
+/// Lightweight topology audit payload carried by spike-in ROC points. The
+/// measured Betti numbers are the detector's auditable claim for the supplied
+/// residual matrix, not a latched topology label.
+#[derive(Clone, Debug)]
+pub struct TopologyAuditReport {
+    pub expected_betti0: usize,
+    pub expected_betti1: usize,
+    pub expected_betti2: usize,
+    pub measured_betti0: usize,
+    pub measured_betti1: usize,
+    pub measured_betti2: usize,
+    pub rank_energy: f64,
+    pub spectral_balance: f64,
+    pub residual_tail_energy: f64,
+    pub accepted: bool,
+}
+
+/// One ROC operating point at a fixed false-positive-rate threshold.
+#[derive(Clone, Debug)]
+pub struct SpikeInRocThreshold {
+    pub false_positive_rate: f64,
+    pub threshold: f64,
+    pub true_positive_rate: f64,
+}
+
+/// ROC payload for one injected SNR.
+#[derive(Clone, Debug)]
+pub struct SpikeInRocPoint {
+    pub snr: f64,
+    pub trials: usize,
+    pub mean_stat: f64,
+    pub promoted_fraction: f64,
+    pub topology_accept_fraction: f64,
+    pub roc: Vec<SpikeInRocThreshold>,
+}
+
+/// Claim payload carrying the full spike-in ROC calibration. This is the shape
+/// topology, Betti, and conditionality claims should ship when the detector has
+/// an explicit operating FPR.
+#[derive(Clone, Debug)]
+pub struct CalibratedRocClaimReport {
     pub claim: String,
     pub claimed_snr: f64,
+    pub claimed_false_positive_rate: f64,
     pub nulls: NullBatteryReport,
-    pub spike_in: Vec<SpikeInPowerPoint>,
+    pub spike_in_roc: Vec<SpikeInRocPoint>,
     pub claimed_snr_power: f64,
+}
+
+/// Compact null-calibrated audit payload attached directly to emitted claims.
+#[derive(Clone, Debug)]
+pub struct ClaimNullCalibration {
+    pub claim: String,
+    pub observed_statistic: f64,
+    pub null_pvalue: f64,
+    pub null_z: f64,
+    pub claimed_snr: f64,
+    pub claimed_false_positive_rate: f64,
+    pub spikein_power: f64,
+    pub null_distribution: Vec<NullSummary>,
+    pub spike_in_roc: Vec<SpikeInRocPoint>,
+}
+
+impl ClaimNullCalibration {
+    pub fn from_calibrated_roc(report: CalibratedRocClaimReport) -> Self {
+        let null_pvalue = primary_null_pvalue(&report.nulls);
+        let null_z = primary_null_z(&report.nulls);
+        Self {
+            claim: report.claim,
+            observed_statistic: report.nulls.observed,
+            null_pvalue,
+            null_z,
+            claimed_snr: report.claimed_snr,
+            claimed_false_positive_rate: report.claimed_false_positive_rate,
+            spikein_power: report.claimed_snr_power,
+            null_distribution: report.nulls.summaries,
+            spike_in_roc: report.spike_in_roc,
+        }
+    }
+}
+
+pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
+    let mut selected = Vec::new();
+    for summary in &report.summaries {
+        if matches!(
+            summary.kind,
+            NullKind::PhaseRandomized | NullKind::ArchitectureMatchedRandomWeight
+        ) {
+            selected.push(summary.p_value);
+        }
+    }
+    if selected.is_empty() {
+        selected.extend(report.summaries.iter().map(|summary| summary.p_value));
+    }
+    selected.into_iter().fold(0.0_f64, f64::max)
+}
+
+pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
+    let mut selected = Vec::new();
+    for summary in &report.summaries {
+        if matches!(
+            summary.kind,
+            NullKind::PhaseRandomized | NullKind::ArchitectureMatchedRandomWeight
+        ) {
+            selected.push(summary.z);
+        }
+    }
+    if selected.is_empty() {
+        selected.extend(report.summaries.iter().map(|summary| summary.z));
+    }
+    selected.into_iter().fold(f64::INFINITY, f64::min)
 }
 
 /// Run an arbitrary scalar audit on the observed matrix and each requested null.
@@ -267,6 +465,130 @@ pub fn architecture_matched_random_weight_null(
     Ok(out)
 }
 
+/// Bootstrap a realistic residual-noise matrix from post-sink-peel activations.
+///
+/// Rows are sampled with replacement after centering, so the calibration sees the
+/// empirical residual covariance, marginal tails, and row-level outliers rather
+/// than an idealized Gaussian null.
+pub fn empirical_residual_bootstrap(
+    residuals: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    validate_matrix(residuals, "empirical residual bootstrap input")?;
+    let n = residuals.nrows();
+    let p = residuals.ncols();
+    let mean = column_mean(residuals);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let src = rng.random_range(0..n);
+        for j in 0..p {
+            out[[i, j]] = residuals[[src, j]] - mean[j];
+        }
+    }
+    Ok(out)
+}
+
+/// Build a covariance- and kurtosis-matched residual surrogate from explicit
+/// moments when real residual activations cannot be supplied to the harness.
+pub fn residual_surrogate_from_moments(
+    spec: &ResidualMomentSpec,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    if spec.rows == 0 {
+        return Err("residual surrogate requires at least one row".to_string());
+    }
+    if spec.mean.is_empty() {
+        return Err("residual surrogate mean must be non-empty".to_string());
+    }
+    if spec.covariance.nrows() != spec.mean.len() || spec.covariance.ncols() != spec.mean.len() {
+        return Err(format!(
+            "residual surrogate covariance shape {}x{} does not match mean length {}",
+            spec.covariance.nrows(),
+            spec.covariance.ncols(),
+            spec.mean.len()
+        ));
+    }
+    if !spec.excess_kurtosis.is_finite() || spec.excess_kurtosis < 0.0 {
+        return Err(format!(
+            "residual surrogate excess_kurtosis must be finite and non-negative, got {}",
+            spec.excess_kurtosis
+        ));
+    }
+    for (idx, &value) in spec.mean.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!("residual surrogate mean[{idx}] is not finite: {value}"));
+        }
+    }
+    validate_matrix(spec.covariance.view(), "residual surrogate covariance")?;
+
+    let chol = cholesky_lower(spec.covariance.view())?;
+    let p = spec.mean.len();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f64>::zeros((spec.rows, p));
+    for i in 0..spec.rows {
+        let radial = standardized_lognormal_radial(spec.excess_kurtosis, &mut rng);
+        let mut z = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            z[j] = standard_normal(&mut rng);
+        }
+        let correlated = chol.dot(&z);
+        for j in 0..p {
+            out[[i, j]] = spec.mean[j] + radial * correlated[j];
+        }
+    }
+    Ok(out)
+}
+
+/// Draw a surrogate matrix using moments estimated from a residual donor.
+pub fn residual_surrogate_matching(
+    residuals: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    validate_matrix(residuals, "residual surrogate donor")?;
+    let spec = residual_moment_spec(residuals)?;
+    residual_surrogate_from_moments(&spec, seed)
+}
+
+/// Estimate the moment specification used by [`residual_surrogate_from_moments`].
+pub fn residual_moment_spec(residuals: ArrayView2<'_, f64>) -> Result<ResidualMomentSpec, String> {
+    validate_matrix(residuals, "residual moment donor")?;
+    let mean = column_mean(residuals);
+    let centered = centered_matrix(residuals);
+    let n = centered.nrows();
+    let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
+    let covariance = centered.t().dot(&centered) / denom;
+    let mut kurtosis_sum = 0.0_f64;
+    let mut kurtosis_count = 0usize;
+    for j in 0..centered.ncols() {
+        let mut second = 0.0_f64;
+        let mut fourth = 0.0_f64;
+        for i in 0..centered.nrows() {
+            let v = centered[[i, j]];
+            let v2 = v * v;
+            second += v2;
+            fourth += v2 * v2;
+        }
+        second /= n as f64;
+        fourth /= n as f64;
+        if second > f64::MIN_POSITIVE {
+            kurtosis_sum += (fourth / (second * second) - 3.0).max(0.0);
+            kurtosis_count += 1;
+        }
+    }
+    let excess_kurtosis = if kurtosis_count > 0 {
+        kurtosis_sum / kurtosis_count as f64
+    } else {
+        0.0
+    };
+    Ok(ResidualMomentSpec {
+        rows: residuals.nrows(),
+        mean,
+        covariance,
+        excess_kurtosis,
+    })
+}
+
 /// Inject a circle into a random two-plane of the supplied residual/noise matrix.
 ///
 /// `snr` is signal RMS divided by the input matrix RMS. The returned matrix keeps
@@ -300,80 +622,246 @@ pub fn inject_circle_spike(
     Ok(out)
 }
 
-/// Calibrate default circle-detection power with a phase-randomized threshold.
-pub fn circle_spike_in_power_curve(
+/// Inject a product torus into a random four-plane of the supplied residual
+/// matrix at controlled RMS SNR.
+pub fn inject_torus_spike(
     noise: ArrayView2<'_, f64>,
-    snrs: &[f64],
-    trials: usize,
+    snr: f64,
     seed: u64,
-) -> Result<Vec<SpikeInPowerPoint>, String> {
-    validate_matrix(noise, "spike-in noise")?;
-    if trials == 0 {
-        return Err("spike-in calibration requires at least one trial".to_string());
+) -> Result<Array2<f64>, String> {
+    validate_matrix(noise, "torus spike-in noise")?;
+    if !snr.is_finite() || snr < 0.0 {
+        return Err(format!("snr must be finite and non-negative, got {snr}"));
     }
-    let mut null_stats = Vec::with_capacity(trials);
-    for t in 0..trials {
-        let surrogate =
-            phase_randomized_surrogate(noise, mix_seed(seed, 0xB007_51A7, t as u64))?;
-        null_stats.push(top_two_energy_fraction(surrogate.view())?);
+    let n = noise.nrows();
+    let p = noise.ncols();
+    if p < 4 {
+        return Err("torus spike-in requires at least four columns".to_string());
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let basis = random_orthogonal(p, seed ^ 0x7055_1A7E_4D2C_A11B)?;
+    let rms = matrix_rms(noise);
+    let amp = snr * rms * ((p as f64) / 2.0).sqrt();
+    let phase0 = rng.random_range(0.0..(2.0 * PI));
+    let phase1 = rng.random_range(0.0..(2.0 * PI));
+    let winding = coprime_winding(n);
+    let mut out = noise.to_owned();
+    for i in 0..n {
+        let theta = phase0 + 2.0 * PI * (i as f64) / (n as f64);
+        let phi = phase1 + 2.0 * PI * ((winding * i) % n) as f64 / (n as f64);
+        for j in 0..p {
+            out[[i, j]] += amp
+                * (theta.cos() * basis[[j, 0]]
+                    + theta.sin() * basis[[j, 1]]
+                    + phi.cos() * basis[[j, 2]]
+                    + phi.sin() * basis[[j, 3]]);
+        }
+    }
+    Ok(out)
+}
+
+/// Inject the configured synthetic topology at controlled RMS SNR.
+pub fn inject_spike(
+    noise: ArrayView2<'_, f64>,
+    shape: SpikeInShape,
+    snr: f64,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    match shape {
+        SpikeInShape::Circle => inject_circle_spike(noise, snr, seed),
+        SpikeInShape::Torus => inject_torus_spike(noise, snr, seed),
+    }
+}
+
+/// Default detector used by the calibration harness: a block-chart promotion
+/// gate followed by a topology audit for the requested planted shape.
+pub fn default_spike_in_detection_pipeline(
+    data: ArrayView2<'_, f64>,
+    shape: SpikeInShape,
+) -> Result<DetectionPipelineReport, String> {
+    validate_matrix(data, "spike-in detection input")?;
+    let rank = shape.signal_rank();
+    if data.ncols() < rank {
+        return Err(format!(
+            "{shape:?} detection requires at least {rank} columns, got {}",
+            data.ncols()
+        ));
+    }
+    let eigenvalues = leading_covariance_eigenvalues(data, rank + 1)?;
+    let statistic = match shape {
+        SpikeInShape::Circle => harmonic_circle_detector_stat(data)?,
+        SpikeInShape::Torus => {
+            let total = centered_total_energy(data);
+            let rank_sum = eigenvalues.iter().take(rank).sum::<f64>().max(0.0);
+            if total > 0.0 { rank_sum / total } else { 0.0 }
+        }
+    };
+    let promotion_floor = match shape {
+        SpikeInShape::Circle => 0.10,
+        SpikeInShape::Torus => 0.55,
+    };
+    let promoted = statistic >= promotion_floor;
+    let topology = match shape {
+        SpikeInShape::Circle => circle_topology_audit_from_harmonic_stat(statistic, &eigenvalues),
+        SpikeInShape::Torus => topology_audit_from_spectrum(shape, statistic, &eigenvalues),
+    };
+    let detected = promoted && topology.accepted;
+    Ok(DetectionPipelineReport {
+        shape,
+        statistic,
+        promoted,
+        topology,
+        detected,
+    })
+}
+
+/// Run the spike-in ROC calibration on residual noise with a caller-supplied
+/// detector. The detector should execute the same block-chart promotion and
+/// topology audit used by the production claim.
+pub fn spike_in_roc_curve<F>(
+    residual_noise: ArrayView2<'_, f64>,
+    config: &SpikeInRocConfig,
+    mut detector: F,
+) -> Result<Vec<SpikeInRocPoint>, String>
+where
+    F: FnMut(ArrayView2<'_, f64>) -> Result<DetectionPipelineReport, String>,
+{
+    validate_spike_in_config(config)?;
+    validate_matrix(residual_noise, "spike-in residual noise")?;
+    if residual_noise.ncols() < config.shape.signal_rank() {
+        return Err(format!(
+            "{:?} spike-in requires at least {} residual columns, got {}",
+            config.shape,
+            config.shape.signal_rank(),
+            residual_noise.ncols()
+        ));
+    }
+
+    let mut null_stats = Vec::with_capacity(config.trials);
+    for trial in 0..config.trials {
+        let noise = draw_spike_in_noise(
+            residual_noise,
+            config.noise_mode,
+            mix_seed(config.seed, 0xA17D_7E57, trial as u64),
+        )?;
+        let report = detector(noise.view())?;
+        require_finite(report.statistic, "null detection statistic")?;
+        null_stats.push(report.statistic);
     }
     null_stats.sort_by(|a, b| a.total_cmp(b));
-    let threshold_idx = ((trials.saturating_sub(1)) * 19) / 20;
-    let threshold = null_stats[threshold_idx];
-    let mut curve = Vec::with_capacity(snrs.len());
-    for (sidx, &snr) in snrs.iter().enumerate() {
-        if !snr.is_finite() || snr < 0.0 {
-            return Err(format!("snr[{sidx}] must be finite and non-negative, got {snr}"));
-        }
-        let mut hits = 0usize;
-        let mut total = 0.0_f64;
-        for t in 0..trials {
-            let spiked = inject_circle_spike(noise, snr, mix_seed(seed, sidx as u64, t as u64))?;
-            let stat = top_two_energy_fraction(spiked.view())?;
-            total += stat;
-            if stat > threshold {
-                hits += 1;
+    let thresholds = roc_thresholds(&null_stats, &config.fpr_levels)?;
+
+    let mut curve = Vec::with_capacity(config.snrs.len());
+    for &snr in &config.snrs {
+        let mut reports = Vec::with_capacity(config.trials);
+        let mut stat_sum = 0.0_f64;
+        let mut promoted = 0usize;
+        let mut topology_accepted = 0usize;
+        for trial in 0..config.trials {
+            let trial_seed = mix_seed(config.seed, 0, trial as u64);
+            let noise = draw_spike_in_noise(residual_noise, config.noise_mode, trial_seed)?;
+            let spiked = inject_spike(noise.view(), config.shape, snr, trial_seed ^ 0x5F1E_51A5)?;
+            let report = detector(spiked.view())?;
+            require_finite(report.statistic, "spike-in detection statistic")?;
+            if report.promoted {
+                promoted += 1;
             }
+            if report.topology.accepted {
+                topology_accepted += 1;
+            }
+            stat_sum += report.statistic;
+            reports.push(report);
         }
-        curve.push(SpikeInPowerPoint {
+        let mut roc = Vec::with_capacity(thresholds.len());
+        for &(fpr, threshold) in &thresholds {
+            let hits = reports
+                .iter()
+                .filter(|report| {
+                    report.promoted && report.topology.accepted && report.statistic > threshold
+                })
+                .count();
+            roc.push(SpikeInRocThreshold {
+                false_positive_rate: fpr,
+                threshold,
+                true_positive_rate: hits as f64 / config.trials as f64,
+            });
+        }
+        curve.push(SpikeInRocPoint {
             snr,
-            trials,
-            power: hits as f64 / trials as f64,
-            mean_stat: total / trials as f64,
+            trials: config.trials,
+            mean_stat: stat_sum / config.trials as f64,
+            promoted_fraction: promoted as f64 / config.trials as f64,
+            topology_accept_fraction: topology_accepted as f64 / config.trials as f64,
+            roc,
         });
     }
     Ok(curve)
 }
 
-/// Build the report shape downstream claim code should carry.
-pub fn calibrated_claim_report(
+/// Convenience wrapper for the default block-chart/topology detector.
+pub fn default_spike_in_roc_curve(
+    residual_noise: ArrayView2<'_, f64>,
+    config: &SpikeInRocConfig,
+) -> Result<Vec<SpikeInRocPoint>, String> {
+    let shape = config.shape;
+    spike_in_roc_curve(residual_noise, config, |x| {
+        default_spike_in_detection_pipeline(x, shape)
+    })
+}
+
+/// Build a calibrated claim report from a spike-in ROC curve at the requested
+/// false-positive-rate operating point.
+pub fn calibrated_roc_claim_report(
     claim: impl Into<String>,
     claimed_snr: f64,
+    claimed_false_positive_rate: f64,
     nulls: NullBatteryReport,
-    spike_in: Vec<SpikeInPowerPoint>,
-) -> Result<CalibratedClaimReport, String> {
+    spike_in_roc: Vec<SpikeInRocPoint>,
+) -> Result<CalibratedRocClaimReport, String> {
     if !claimed_snr.is_finite() || claimed_snr < 0.0 {
         return Err(format!(
             "claimed_snr must be finite and non-negative, got {claimed_snr}"
         ));
     }
-    let mut best_power = None;
+    if !claimed_false_positive_rate.is_finite()
+        || claimed_false_positive_rate <= 0.0
+        || claimed_false_positive_rate >= 1.0
+    {
+        return Err(format!(
+            "claimed_false_positive_rate must be in (0, 1), got {claimed_false_positive_rate}"
+        ));
+    }
+
+    let mut best_point = None;
     let mut best_distance = f64::INFINITY;
-    for point in &spike_in {
+    for point in &spike_in_roc {
         let distance = (point.snr - claimed_snr).abs();
         if distance < best_distance {
             best_distance = distance;
-            best_power = Some(point.power);
+            best_point = Some(point);
+        }
+    }
+    let Some(point) = best_point else {
+        return Err("calibrated ROC claim report requires at least one spike-in point".to_string());
+    };
+    let mut best_power = None;
+    let mut best_fpr_distance = f64::INFINITY;
+    for threshold in &point.roc {
+        let distance = (threshold.false_positive_rate - claimed_false_positive_rate).abs();
+        if distance < best_fpr_distance {
+            best_fpr_distance = distance;
+            best_power = Some(threshold.true_positive_rate);
         }
     }
     let Some(claimed_snr_power) = best_power else {
-        return Err("calibrated claim report requires at least one spike-in point".to_string());
+        return Err("calibrated ROC claim report requires at least one ROC threshold".to_string());
     };
-    Ok(CalibratedClaimReport {
+    Ok(CalibratedRocClaimReport {
         claim: claim.into(),
         claimed_snr,
+        claimed_false_positive_rate,
         nulls,
-        spike_in,
+        spike_in_roc,
         claimed_snr_power,
     })
 }
@@ -442,22 +930,331 @@ pub fn first_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, Strin
 /// Basis-invariant rank-two covariance energy fraction.
 pub fn top_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, String> {
     validate_matrix(data, "top-two energy input")?;
-    let centered = centered_matrix(data);
-    let total = centered.iter().map(|v| v * v).sum::<f64>();
+    let total = centered_total_energy(data);
     if total <= 0.0 {
         return Ok(0.0);
     }
-    let cov = centered.t().dot(&centered);
-    let lambda1 = dominant_eigenvalue(cov.view(), 0x5151_0001)?;
-    let mut deflated = cov.to_owned();
-    let v1 = dominant_eigenvector(cov.view(), 0x5151_0001)?;
-    for i in 0..deflated.nrows() {
-        for j in 0..deflated.ncols() {
-            deflated[[i, j]] -= lambda1 * v1[i] * v1[j];
+    let eigenvalues = leading_covariance_eigenvalues(data, 2)?;
+    Ok(eigenvalues.iter().sum::<f64>() / total)
+}
+
+/// Frequency-1 circle detector calibrated by the phase-randomized null.
+///
+/// The statistic finds the ambient two-plane carrying the strongest ordered
+/// first harmonic, then scores whether that plane is dominated by frequency-1
+/// energy with balanced quadrature components. Selecting a top-2 variance plane
+/// is not enough to score well.
+pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, String> {
+    validate_matrix(data, "harmonic-circle detector input")?;
+    let n = data.nrows();
+    let p = data.ncols();
+    if n < 4 || p < 2 {
+        return Err(
+            "harmonic-circle detector requires at least four rows and two columns".to_string(),
+        );
+    }
+    let centered = centered_matrix(data);
+    let mut cos_coeff = Array1::<f64>::zeros(p);
+    let mut sin_coeff = Array1::<f64>::zeros(p);
+    for i in 0..n {
+        let theta = 2.0 * PI * i as f64 / n as f64;
+        let c = theta.cos();
+        let s = theta.sin();
+        for j in 0..p {
+            let value = centered[[i, j]];
+            cos_coeff[j] += value * c;
+            sin_coeff[j] += value * s;
         }
     }
-    let lambda2 = dominant_eigenvalue(deflated.view(), 0x5151_0002)?.max(0.0);
-    Ok((lambda1.max(0.0) + lambda2) / total)
+
+    let mut plane = Vec::with_capacity(2);
+    append_unit_residual(&mut plane, cos_coeff);
+    append_unit_residual(&mut plane, sin_coeff);
+    if plane.len() < 2 {
+        return Ok(0.0);
+    }
+
+    let mut total_plane_energy = 0.0_f64;
+    let mut plane_cos = vec![0.0_f64; plane.len()];
+    let mut plane_sin = vec![0.0_f64; plane.len()];
+    for i in 0..n {
+        let theta = 2.0 * PI * i as f64 / n as f64;
+        let c = theta.cos();
+        let s = theta.sin();
+        for (axis, direction) in plane.iter().enumerate() {
+            let mut score = 0.0_f64;
+            for j in 0..p {
+                score += centered[[i, j]] * direction[j];
+            }
+            total_plane_energy += score * score;
+            plane_cos[axis] += score * c;
+            plane_sin[axis] += score * s;
+        }
+    }
+    if total_plane_energy <= f64::MIN_POSITIVE {
+        return Ok(0.0);
+    }
+
+    let coefficient_energy = plane_cos
+        .iter()
+        .chain(plane_sin.iter())
+        .map(|v| v * v)
+        .sum::<f64>();
+    let harmonic_ss = (2.0 / n as f64) * coefficient_energy;
+    let harmonic_fraction = (harmonic_ss / total_plane_energy).clamp(0.0, 1.0);
+    let circle_balance = quadrature_balance(&plane_cos, &plane_sin);
+    Ok(harmonic_fraction * circle_balance)
+}
+
+fn validate_spike_in_config(config: &SpikeInRocConfig) -> Result<(), String> {
+    if config.trials == 0 {
+        return Err("spike-in ROC calibration requires at least one trial".to_string());
+    }
+    if config.snrs.is_empty() {
+        return Err("spike-in ROC calibration requires at least one SNR".to_string());
+    }
+    for (idx, &snr) in config.snrs.iter().enumerate() {
+        if !snr.is_finite() || snr < 0.0 {
+            return Err(format!("snr[{idx}] must be finite and non-negative, got {snr}"));
+        }
+    }
+    if config.fpr_levels.is_empty() {
+        return Err("spike-in ROC calibration requires at least one FPR level".to_string());
+    }
+    for (idx, &fpr) in config.fpr_levels.iter().enumerate() {
+        if !fpr.is_finite() || fpr <= 0.0 || fpr >= 1.0 {
+            return Err(format!("fpr_levels[{idx}] must be in (0, 1), got {fpr}"));
+        }
+    }
+    Ok(())
+}
+
+fn draw_spike_in_noise(
+    residual_noise: ArrayView2<'_, f64>,
+    mode: SpikeInNoiseMode,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    match mode {
+        SpikeInNoiseMode::EmpiricalResidualBootstrap => {
+            empirical_residual_bootstrap(residual_noise, seed)
+        }
+        SpikeInNoiseMode::PhaseRandomizedResidual => {
+            phase_randomized_surrogate(residual_noise, seed)
+        }
+        SpikeInNoiseMode::CovarianceHeavyTailSurrogate => {
+            residual_surrogate_matching(residual_noise, seed)
+        }
+    }
+}
+
+fn roc_thresholds(
+    sorted_null_stats: &[f64],
+    fpr_levels: &[f64],
+) -> Result<Vec<(f64, f64)>, String> {
+    if sorted_null_stats.is_empty() {
+        return Err("ROC thresholding requires null statistics".to_string());
+    }
+    let n = sorted_null_stats.len();
+    let mut thresholds = Vec::with_capacity(fpr_levels.len());
+    for &fpr in fpr_levels {
+        let rank_from_top = ((fpr * n as f64).ceil() as usize).max(1);
+        let idx = n.saturating_sub(rank_from_top);
+        thresholds.push((fpr, sorted_null_stats[idx]));
+    }
+    Ok(thresholds)
+}
+
+fn circle_topology_audit_from_harmonic_stat(
+    statistic: f64,
+    eigenvalues: &[f64],
+) -> TopologyAuditReport {
+    let expected = SpikeInShape::Circle.expected_betti();
+    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(f64::MIN_POSITIVE);
+    let second = eigenvalues.get(1).copied().unwrap_or(0.0).max(0.0);
+    let tail = eigenvalues.get(2).copied().unwrap_or(0.0).max(0.0);
+    let spectral_balance = second / leading;
+    let residual_tail_energy = tail / second.max(f64::MIN_POSITIVE);
+    let accepted = statistic >= 0.10;
+    let measured = if accepted { expected } else { (1, 0, 0) };
+    TopologyAuditReport {
+        expected_betti0: expected.0,
+        expected_betti1: expected.1,
+        expected_betti2: expected.2,
+        measured_betti0: measured.0,
+        measured_betti1: measured.1,
+        measured_betti2: measured.2,
+        rank_energy: statistic,
+        spectral_balance,
+        residual_tail_energy,
+        accepted,
+    }
+}
+
+fn topology_audit_from_spectrum(
+    shape: SpikeInShape,
+    rank_energy: f64,
+    eigenvalues: &[f64],
+) -> TopologyAuditReport {
+    let rank = shape.signal_rank();
+    let expected = shape.expected_betti();
+    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(f64::MIN_POSITIVE);
+    let rank_tail = eigenvalues
+        .get(rank)
+        .copied()
+        .unwrap_or(0.0)
+        .max(0.0);
+    let weakest_signal = eigenvalues
+        .get(rank.saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0)
+        .max(0.0);
+    let spectral_balance = weakest_signal / leading;
+    let residual_tail_energy = rank_tail / weakest_signal.max(f64::MIN_POSITIVE);
+    let accepted = match shape {
+        SpikeInShape::Circle => {
+            rank_energy >= 0.45 && spectral_balance >= 0.25 && residual_tail_energy <= 0.75
+        }
+        SpikeInShape::Torus => {
+            rank_energy >= 0.55 && spectral_balance >= 0.12 && residual_tail_energy <= 0.80
+        }
+    };
+    let measured = if accepted { expected } else { (1, 0, 0) };
+    TopologyAuditReport {
+        expected_betti0: expected.0,
+        expected_betti1: expected.1,
+        expected_betti2: expected.2,
+        measured_betti0: measured.0,
+        measured_betti1: measured.1,
+        measured_betti2: measured.2,
+        rank_energy,
+        spectral_balance,
+        residual_tail_energy,
+        accepted,
+    }
+}
+
+fn leading_covariance_eigenvalues(
+    data: ArrayView2<'_, f64>,
+    count: usize,
+) -> Result<Vec<f64>, String> {
+    validate_matrix(data, "leading covariance eigenvalue input")?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let centered = centered_matrix(data);
+    let mut cov = centered.t().dot(&centered);
+    let mut eigenvalues = Vec::with_capacity(count.min(cov.nrows()));
+    for idx in 0..count.min(cov.nrows()) {
+        let seed = mix_seed(0x5151_0000, idx as u64, cov.nrows() as u64);
+        let v = dominant_eigenvector(cov.view(), seed)?;
+        let mv = cov.dot(&v);
+        let lambda = v.dot(&mv).max(0.0);
+        eigenvalues.push(lambda);
+        for i in 0..cov.nrows() {
+            for j in 0..cov.ncols() {
+                cov[[i, j]] -= lambda * v[i] * v[j];
+            }
+        }
+    }
+    Ok(eigenvalues)
+}
+
+fn centered_total_energy(data: ArrayView2<'_, f64>) -> f64 {
+    let centered = centered_matrix(data);
+    centered.iter().map(|v| v * v).sum::<f64>()
+}
+
+fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    if matrix.nrows() != matrix.ncols() {
+        return Err(format!(
+            "cholesky requires square covariance, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        ));
+    }
+    let p = matrix.nrows();
+    let mut lower = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..=i {
+            let mut sum = matrix[[i, j]];
+            for k in 0..j {
+                sum -= lower[[i, k]] * lower[[j, k]];
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return Err(format!(
+                        "covariance is not positive definite at diagonal {i}: pivot {sum}"
+                    ));
+                }
+                lower[[i, j]] = sum.sqrt();
+            } else {
+                lower[[i, j]] = sum / lower[[j, j]];
+            }
+        }
+    }
+    Ok(lower)
+}
+
+fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 {
+    if excess_kurtosis <= f64::MIN_POSITIVE {
+        1.0
+    } else {
+        let sigma2 = (1.0 + excess_kurtosis / 3.0).ln() / 4.0;
+        let sigma = sigma2.sqrt();
+        let z = standard_normal(rng);
+        (sigma * z - sigma2).exp()
+    }
+}
+
+fn coprime_winding(n: usize) -> usize {
+    let mut winding = 3usize.min(n.saturating_sub(1).max(1));
+    while gcd(winding, n) != 1 {
+        winding += 1;
+        if winding >= n {
+            return 1;
+        }
+    }
+    winding
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn append_unit_residual(plane: &mut Vec<Array1<f64>>, mut candidate: Array1<f64>) {
+    for direction in plane.iter() {
+        let dot = candidate.dot(direction);
+        for j in 0..candidate.len() {
+            candidate[j] -= dot * direction[j];
+        }
+    }
+    let norm = candidate.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if norm > f64::MIN_POSITIVE {
+        candidate.mapv_inplace(|v| v / norm);
+        plane.push(candidate);
+    }
+}
+
+fn quadrature_balance(cos_coeff: &[f64], sin_coeff: &[f64]) -> f64 {
+    let mut aa = 0.0_f64;
+    let mut bb = 0.0_f64;
+    let mut ab = 0.0_f64;
+    for (&c, &s) in cos_coeff.iter().zip(sin_coeff.iter()) {
+        aa += c * c;
+        bb += s * s;
+        ab += c * s;
+    }
+    let trace = aa + bb;
+    if trace <= f64::MIN_POSITIVE {
+        return 0.0;
+    }
+    let det = (aa * bb - ab * ab).max(0.0);
+    (2.0 * det.sqrt() / trace).clamp(0.0, 1.0)
 }
 
 fn validate_matrix(data: ArrayView2<'_, f64>, name: &str) -> Result<(), String> {
@@ -619,12 +1416,6 @@ fn matrix_rms(data: ArrayView2<'_, f64>) -> f64 {
     (ss / (data.nrows() * data.ncols()) as f64).sqrt()
 }
 
-fn dominant_eigenvalue(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<f64, String> {
-    let v = dominant_eigenvector(matrix, seed)?;
-    let mv = matrix.dot(&v);
-    Ok(v.dot(&mv))
-}
-
 fn dominant_eigenvector(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<Array1<f64>, String> {
     if matrix.nrows() != matrix.ncols() {
         return Err("dominant eigenvector requires a square matrix".to_string());
@@ -660,16 +1451,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn structured_signal_beats_phase_and_rotation_nulls_but_noise_does_not() {
+    fn structured_signal_beats_required_nulls_but_noise_does_not() {
         let signal = ordered_circle_fixture(96, 6, 0.04);
+        let random_weight = noise_fixture(128, 6, 1717);
         let config = NullBatteryConfig {
             replicates: 16,
             seed: 17,
-            kinds: vec![NullKind::PhaseRandomized, NullKind::RandomRotation],
+            kinds: vec![
+                NullKind::PhaseRandomized,
+                NullKind::RandomRotation,
+                NullKind::ArchitectureMatchedRandomWeight,
+            ],
             tail: Tail::Larger,
         };
-        let report = run_null_battery(signal.view(), None, &config, first_two_ordered_circle_stat)
-            .expect("structured null battery should run");
+        let report = run_null_battery(
+            signal.view(),
+            Some(random_weight.view()),
+            &config,
+            first_two_ordered_circle_stat,
+        )
+        .expect("structured null battery should run");
         assert!(
             report.summaries.iter().all(|s| s.z > 2.0 && s.p_value <= 0.12),
             "structured ordered circle should separate from nulls: {:?}",
@@ -677,9 +1478,14 @@ mod tests {
         );
 
         let noise = noise_fixture(96, 6, 99);
-        let noise_report =
-            run_null_battery(noise.view(), None, &config, first_two_ordered_circle_stat)
-                .expect("noise null battery should run");
+        let random_weight_noise = noise_fixture(128, 6, 199);
+        let noise_report = run_null_battery(
+            noise.view(),
+            Some(random_weight_noise.view()),
+            &config,
+            first_two_ordered_circle_stat,
+        )
+        .expect("noise null battery should run");
         assert!(
             noise_report
                 .summaries
@@ -710,15 +1516,26 @@ mod tests {
     }
 
     #[test]
-    fn spike_in_power_rises_monotonically_with_snr() {
-        let noise = noise_fixture(96, 8, 1234);
-        let snrs = [0.0, 0.4, 0.8, 1.2];
-        let curve =
-            circle_spike_in_power_curve(noise.view(), &snrs, 12, 91).expect("spike-in curve");
+    fn spike_in_roc_power_rises_monotonically_and_null_stays_quiet() {
+        let noise = noise_fixture(128, 12, 1234);
+        let mut config = SpikeInRocConfig::circle(vec![0.0, 1.0, 2.0], 16, 91);
+        config.fpr_levels = vec![0.05];
+        let curve = default_spike_in_roc_curve(noise.view(), &config).expect("spike-in ROC curve");
+        let power: Vec<f64> = curve
+            .iter()
+            .map(|point| point.roc[0].true_positive_rate)
+            .collect();
+        assert!(
+            power[0] <= 0.125,
+            "pure-null spike-in row should stay near zero detection power: {:?}",
+            curve
+        );
         for pair in curve.windows(2) {
+            let prev_power = pair[0].roc[0].true_positive_rate;
+            let next_power = pair[1].roc[0].true_positive_rate;
             assert!(
-                pair[1].power + 1.0e-12 >= pair[0].power,
-                "spike-in power should be monotone: {:?}",
+                next_power + 1.0e-12 >= prev_power,
+                "spike-in ROC power should be monotone: {:?}",
                 curve
             );
             assert!(
@@ -728,10 +1545,27 @@ mod tests {
             );
         }
         assert!(
-            curve.last().map(|p| p.power).unwrap_or(0.0) >= 0.75,
+            curve
+                .last()
+                .map(|point| point.roc[0].true_positive_rate)
+                .unwrap_or(0.0)
+                >= 0.80,
             "high-SNR spike-in should be detected: {:?}",
             curve
         );
+    }
+
+    #[test]
+    fn torus_spike_in_detection_reports_expected_betti_payload() {
+        let noise = noise_fixture(128, 10, 4321);
+        let spiked =
+            inject_torus_spike(noise.view(), 2.0, 88).expect("torus injection should run");
+        let report = default_spike_in_detection_pipeline(spiked.view(), SpikeInShape::Torus)
+            .expect("torus detector should run");
+        assert!(report.detected, "high-SNR torus should be detected: {report:?}");
+        assert_eq!(report.topology.measured_betti0, 1);
+        assert_eq!(report.topology.measured_betti1, 2);
+        assert_eq!(report.topology.measured_betti2, 1);
     }
 
     fn ordered_circle_fixture(n: usize, p: usize, noise_scale: f64) -> Array2<f64> {

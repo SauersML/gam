@@ -37,6 +37,7 @@
 
 use super::*;
 use crate::inference::atlas_nerve::AtlasCoveringSide;
+use crate::null_battery::ClaimNullCalibration;
 use std::collections::HashMap;
 
 /// Compute ceiling on the number of points fed to the Vietoris–Rips filtration.
@@ -149,6 +150,8 @@ pub struct AtomTopologyPersistence {
     pub measured_betti: BettiSignature,
     /// Betti signature predicted by the raced topology.
     pub expected_betti: BettiSignature,
+    /// Standing-null and spike-in calibration for the scalar topology claim.
+    pub null_calibration: Option<ClaimNullCalibration>,
     /// Persistence of the most persistent measured loop (`+∞` for an essential
     /// loop, `0` when none).
     pub dominant_h1_persistence: f64,
@@ -888,6 +891,7 @@ fn topology_persistence_verdict_impl(
         support_ess,
         measured_betti,
         expected_betti,
+        null_calibration: None,
         dominant_h1_persistence,
         dominant_h2_persistence,
         h0: diagram.h0,

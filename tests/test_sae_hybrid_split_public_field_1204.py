@@ -46,6 +46,9 @@ def _representative_hybrid_split() -> dict:
                 "curved_evidence_margin": 1.5,
                 "fitted_turning": 3.14159,
                 "train_loao_delta_ev": 0.12,
+                "curved_ev": 0.82,
+                "topm_linear_ev": 0.91,
+                "curved_vs_envelope_ratio": 0.9010989010989011,
             },
             {
                 "atom": "atom_1",
@@ -56,6 +59,9 @@ def _representative_hybrid_split() -> dict:
                 "curved_evidence_margin": -0.3,
                 "fitted_turning": 0.0,
                 "train_loao_delta_ev": 0.03,
+                "curved_ev": 0.18,
+                "topm_linear_ev": 0.42,
+                "curved_vs_envelope_ratio": 0.42857142857142855,
             },
         ],
     }
@@ -115,6 +121,10 @@ def test_to_dict_emits_hybrid_split():
     assert len(d["hybrid_split"]["atoms"]) == 2
     assert d["hybrid_split"]["atoms"][0]["fitted_turning"] == pytest.approx(3.14159)
     assert d["hybrid_split"]["atoms"][1]["train_loao_delta_ev"] == pytest.approx(0.03)
+    assert d["hybrid_split"]["atoms"][0]["topm_linear_ev"] == pytest.approx(0.91)
+    assert d["hybrid_split"]["atoms"][1]["curved_vs_envelope_ratio"] == pytest.approx(
+        0.42857142857142855
+    )
 
 
 def test_to_dict_emits_none_when_absent():
@@ -131,6 +141,11 @@ def test_hybrid_split_round_trips_through_from_dict():
     assert restored.hybrid_split["total_negative_log_evidence"] == pytest.approx(12.5)
     assert restored.hybrid_split["atoms"][0]["curved_evidence_margin"] == pytest.approx(1.5)
     assert restored.hybrid_split["atoms"][0]["kept_curved"] is True
+    assert restored.hybrid_split["atoms"][0]["curved_ev"] == pytest.approx(0.82)
+    assert restored.hybrid_split["atoms"][0]["topm_linear_ev"] == pytest.approx(0.91)
+    assert restored.hybrid_split["atoms"][0]["curved_vs_envelope_ratio"] == pytest.approx(
+        0.9010989010989011
+    )
     assert restored.hybrid_split["atoms"][1]["parameterization"] == "linear"
 
 

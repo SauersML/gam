@@ -35,8 +35,8 @@
 //! accepted or refused by the ANALYTIC contrast certificate (anchors above; no
 //! tuned ε) after mapping back through the GENERATIVE unwhitening `EΛ^{1/2}` to
 //! its ambient support plane. Deflation is not a separation method here; it is
-//! retained only as an external/span-capture utility for callers that need to
-//! peel an accepted fitted curve.
+//! retained only as an external utility for callers that need to peel an
+//! accepted fitted curve.
 //!
 //! Everything here is derived from the residual spectrum (MP edge, bottom-
 //! quartile noise scale) plus the analytic κ anchors; the only dials are
@@ -448,6 +448,79 @@ fn pair_objective_deriv(a: &Option<PlanePolys>, b: &Option<PlanePolys>, theta: f
     dj
 }
 
+fn best_pair_rotation(a: &Option<PlanePolys>, b: &Option<PlanePolys>) -> (f64, f64) {
+    let step = std::f64::consts::PI / ISA_ANGLE_SAMPLES as f64;
+    let mut samples: Vec<(f64, f64, f64)> = Vec::with_capacity(ISA_ANGLE_SAMPLES + 1);
+    for k in 0..=ISA_ANGLE_SAMPLES {
+        let theta = -std::f64::consts::FRAC_PI_2 + step * k as f64;
+        samples.push((
+            theta,
+            pair_objective(a, b, theta),
+            pair_objective_deriv(a, b, theta),
+        ));
+    }
+
+    let mut best_theta = 0.0_f64;
+    let mut best_j = pair_objective(a, b, 0.0);
+    for &(theta, jv, _) in &samples {
+        if jv > best_j {
+            best_j = jv;
+            best_theta = theta;
+        }
+    }
+
+    for k in 0..ISA_ANGLE_SAMPLES {
+        let (mut lo, _, dlo) = samples[k];
+        let (mut hi, _, dhi) = samples[k + 1];
+        if !(dlo.is_finite() && dhi.is_finite()) {
+            continue;
+        }
+        if dlo == 0.0 {
+            let jv = pair_objective(a, b, lo);
+            if jv > best_j {
+                best_j = jv;
+                best_theta = lo;
+            }
+            continue;
+        }
+        if dhi == 0.0 {
+            let jv = pair_objective(a, b, hi);
+            if jv > best_j {
+                best_j = jv;
+                best_theta = hi;
+            }
+            continue;
+        }
+        if dlo.signum() == dhi.signum() {
+            continue;
+        }
+        let mut dlo_cur = dlo;
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            let dmid = pair_objective_deriv(a, b, mid);
+            if dmid == 0.0 {
+                lo = mid;
+                hi = mid;
+                break;
+            }
+            if dmid.signum() == dlo_cur.signum() {
+                lo = mid;
+                dlo_cur = dmid;
+            } else {
+                hi = mid;
+            }
+        }
+        let theta = 0.5 * (lo + hi);
+        let jv = pair_objective(a, b, theta);
+        if jv > best_j {
+            best_j = jv;
+            best_theta = theta;
+        }
+    }
+
+    (best_theta, best_j)
+}
+
 /// κ of the plane made of coordinate rows `(2m, 2m+1)` of `y`, over columns.
 fn plane_rows_kappa(y: &Array2<f64>, m: usize) -> f64 {
     let n = y.ncols();
@@ -510,41 +583,10 @@ fn jacobi_optimize(y: &mut Array2<f64>, q: &mut Array2<f64>, n_planes: usize, ma
                     continue;
                 }
                 let j0 = pair_objective(&pa, &pb, 0.0);
-                // Nyquist-rate scan (derivation at ISA_ANGLE_SAMPLES) + argmax.
-                let mut best_theta = 0.0_f64;
-                let mut best_j = j0;
-                let step = std::f64::consts::PI / ISA_ANGLE_SAMPLES as f64;
-                for k in 0..ISA_ANGLE_SAMPLES {
-                    let theta = -std::f64::consts::FRAC_PI_2 + step * k as f64;
-                    let jv = pair_objective(&pa, &pb, theta);
-                    if jv > best_j {
-                        best_j = jv;
-                        best_theta = theta;
-                    }
-                }
-                // Polish inside the bracketing lattice cell with the exact
-                // derivative (bisection on dJ/dθ — hand-derived, no FD).
-                let (mut lo, mut hi) = (best_theta - step, best_theta + step);
-                let (dlo, dhi) = (
-                    pair_objective_deriv(&pa, &pb, lo),
-                    pair_objective_deriv(&pa, &pb, hi),
-                );
-                if dlo > 0.0 && dhi < 0.0 {
-                    for _ in 0..60 {
-                        let mid = 0.5 * (lo + hi);
-                        if pair_objective_deriv(&pa, &pb, mid) > 0.0 {
-                            lo = mid;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    let polished = 0.5 * (lo + hi);
-                    let jp = pair_objective(&pa, &pb, polished);
-                    if jp > best_j {
-                        best_j = jp;
-                        best_theta = polished;
-                    }
-                }
+                // Nyquist-rate scan over the full period plus all derivative
+                // sign-change roots. The old single-cell polish missed maxima
+                // whose grid winner was not bracketed by `+ → -` derivatives.
+                let (best_theta, best_j) = best_pair_rotation(&pa, &pb);
                 if best_j > j0 * (1.0 + ISA_SWEEP_RTOL) + f64::MIN_POSITIVE {
                     let (c, s) = (best_theta.cos(), best_theta.sin());
                     for col in 0..y.ncols() {
@@ -622,7 +664,12 @@ fn joint_jacobi_basis(
     let r = z.nrows();
     let n_planes = r / 2;
     let mut best: Option<(f64, Array2<f64>, Array2<f64>)> = None;
-    for init in 0..config.n_inits.max(1) {
+    let n_inits = if n_planes == 1 {
+        1
+    } else {
+        config.n_inits.max(1)
+    };
+    for init in 0..n_inits {
         let mut q = Array2::<f64>::eye(r);
         if init > 0 {
             // Random orthogonal via Gram-Schmidt of LCG normal columns.
@@ -666,153 +713,26 @@ fn joint_jacobi_basis(
     best.map(|(_, q, y)| (q, y))
 }
 
-fn push_orthogonal_direction(dirs: &mut Vec<Vec<f64>>, mut v: Vec<f64>) -> bool {
-    for q in dirs.iter() {
-        let dot: f64 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-        for (vj, qj) in v.iter_mut().zip(q.iter()) {
-            *vj -= dot * qj;
-        }
-    }
-    let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if !(nrm > 1.0e-8) {
-        return false;
-    }
-    for vj in v.iter_mut() {
-        *vj /= nrm;
-    }
-    dirs.push(v);
-    true
-}
-
-fn column_mean(data: ArrayView2<'_, f64>) -> Array1<f64> {
-    let (n, p) = data.dim();
-    let mut mean = Array1::<f64>::zeros(p);
-    if n == 0 {
-        return mean;
-    }
-    for row in 0..n {
-        for j in 0..p {
-            mean[j] += data[[row, j]];
-        }
-    }
-    mean.mapv_inplace(|v| v / n as f64);
-    mean
-}
-
-fn deflate_support_span(work: &mut Array2<f64>, dirs: &[Vec<f64>], start: usize) {
-    if start >= dirs.len() {
-        return;
-    }
-    let mean = column_mean(work.view());
-    let (n, p) = work.dim();
-    for row in 0..n {
-        for q in &dirs[start..] {
-            let mut proj = 0.0_f64;
-            for j in 0..p {
-                proj += (work[[row, j]] - mean[j]) * q[j];
-            }
-            for j in 0..p {
-                work[[row, j]] -= proj * q[j];
-            }
-        }
-    }
-}
-
-fn captured_parts_from_dirs(
-    residual: ArrayView2<'_, f64>,
-    dirs: &[Vec<f64>],
-    sigma2_cert: f64,
-    mp_edge: f64,
-) -> Result<Option<IsaEigenParts>, String> {
-    let (n, p) = residual.dim();
-    let r = dirs.len();
-    if r < 2 {
-        return Ok(None);
-    }
-    let mean = column_mean(residual);
-    let u = Array2::from_shape_fn((p, r), |(row, col)| dirs[col][row]);
-    let mut scores = Array2::<f64>::zeros((n, r));
-    for row in 0..n {
-        for a in 0..r {
-            let mut v = 0.0_f64;
-            for j in 0..p {
-                v += (residual[[row, j]] - mean[j]) * u[[j, a]];
-            }
-            scores[[row, a]] = v;
-        }
-    }
-    let mut s = Array2::<f64>::zeros((r, r));
-    for row in 0..n {
-        for a in 0..r {
-            let sa = scores[[row, a]];
-            for b in a..r {
-                s[[a, b]] += sa * scores[[row, b]];
-            }
-        }
-    }
-    for a in 0..r {
-        for b in a..r {
-            let v = s[[a, b]] / n as f64;
-            s[[a, b]] = v;
-            s[[b, a]] = v;
-        }
-    }
-    let (evals, small_evecs) = s
-        .eigh(Side::Lower)
-        .map_err(|err| format!("captured_parts_from_dirs: span eigensolve failed: {err:?}"))?;
-    let evecs = u.dot(&small_evecs);
-    let mut above: Vec<usize> = (0..r).collect();
-    above.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
-    Ok(Some(IsaEigenParts {
-        mean,
-        evals,
-        evecs,
-        above,
-        mp_edge,
-        sigma2_cert,
-    }))
-}
-
 fn capture_signal_span(
     residual: ArrayView2<'_, f64>,
     max_planes: usize,
-    config: &IsaSeedConfig,
 ) -> Result<Option<IsaEigenParts>, String> {
     if max_planes == 0 {
         return Ok(None);
     }
     let max_dims = 2 * max_planes;
-    let mut work = residual.to_owned();
-    let mut dirs: Vec<Vec<f64>> = Vec::new();
-    let mut noise: Option<(f64, f64)> = None;
-    while dirs.len() < max_dims {
-        let Some(parts) = isa_eigen_parts(work.view())? else {
-            break;
-        };
-        if noise.is_none() {
-            noise = Some((parts.sigma2_cert, parts.mp_edge));
-        }
-        let before = dirs.len();
-        if let Some(cand) = isa_extract_certified_plane(work.view(), &parts, config) {
-            for axis in 0..2 {
-                let v: Vec<f64> = (0..residual.ncols()).map(|j| cand.basis[[j, axis]]).collect();
-                push_orthogonal_direction(&mut dirs, v);
-            }
-        }
-        if dirs.len() == before {
-            break;
-        }
-        deflate_support_span(&mut work, &dirs, before);
-    }
-    if dirs.len() % 2 == 1 {
-        // A plane needs two axes; an odd count means one unpaired trailing
-        // direction, so drop it (the odd length guarantees `pop` yields it).
-        dirs.pop();
-    }
-    let Some((sigma2_cert, mp_edge)) = noise else {
+    let Some(mut parts) = isa_eigen_parts(residual)? else {
         return Ok(None);
     };
-    captured_parts_from_dirs(residual, &dirs, sigma2_cert, mp_edge)
+    let mut keep = parts.above.len().min(max_dims);
+    if keep % 2 == 1 {
+        keep -= 1;
+    }
+    if keep < 2 {
+        return Ok(None);
+    }
+    parts.above.truncate(keep);
+    Ok(Some(parts))
 }
 
 /// Analytic κ-contrast certificate + candidate assembly for one whitened-space
@@ -1062,17 +982,17 @@ pub struct IsaHarvest {
     pub natural_exit: bool,
 }
 
-/// Full producer run: use deflation only to capture above-floor support span
-/// and select the plane count, then jointly rotate every candidate plane inside
-/// the accumulated span and certify the resulting planes. Greedy deflation is
-/// deliberately absent from separation: after whitening, amplitude ordering is
-/// gone, so recursive extraction has no mathematical guarantee.
+/// Full producer run: capture the strongest even-dimensional above-floor
+/// support span and its candidate plane count, then jointly rotate every
+/// candidate plane inside that span and certify the resulting planes. Greedy
+/// deflation is deliberately absent from separation: after whitening, amplitude
+/// ordering is gone, so recursive extraction has no mathematical guarantee.
 pub fn isa_deflationary_producer(
     residual: ArrayView2<'_, f64>,
     max_planes: usize,
     config: &IsaSeedConfig,
 ) -> Result<IsaHarvest, String> {
-    let Some(parts) = capture_signal_span(residual, max_planes, config)? else {
+    let Some(parts) = capture_signal_span(residual, max_planes)? else {
         return Ok(IsaHarvest {
             planes: Vec::new(),
             natural_exit: true,
@@ -1327,7 +1247,7 @@ mod tests {
         };
         let greedy = greedy_deflation_probe(&data, k, &config);
         let greedy_overlaps = candidate_overlaps(&greedy, &truth);
-        let captured = capture_signal_span(data.view(), k, &config)
+        let captured = capture_signal_span(data.view(), k)
             .expect("capture must run")
             .expect("capture must find signal span");
         let (q, _y) = joint_jacobi_basis(data.view(), &captured, &config)

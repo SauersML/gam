@@ -11,7 +11,8 @@
 use crate::assignment::SupportMeasure;
 use crate::chart_transfer::TransferCertificate;
 use crate::inference::layer_transport::FittedTransport;
-use crate::manifold::BettiSignature;
+use crate::manifold::{BettiSignature, GraphCompressionKind, GraphCompressionReport};
+use crate::null_battery::ClaimNullCalibration;
 use ndarray::Array1;
 use std::collections::{BTreeSet, HashMap};
 
@@ -127,6 +128,7 @@ pub struct AtlasNerveEdge {
 #[derive(Clone, Debug)]
 pub struct AtlasNerveDiagram {
     pub betti: BettiSignature,
+    pub null_calibration: Option<ClaimNullCalibration>,
     pub n_vertices: usize,
     pub n_edges: usize,
     pub n_triangles: usize,
@@ -136,6 +138,61 @@ pub struct AtlasNerveDiagram {
     pub max_filtration: f64,
     pub edges: Vec<AtlasNerveEdge>,
     pub note: String,
+}
+
+impl AtlasNerveDiagram {
+    /// Certified named compression of the atlas nerve. The name is a codebook
+    /// compression of the exact nerve homology, never an input topology choice.
+    pub fn certified_compression(&self) -> GraphCompressionReport {
+        let max_edges = self
+            .n_vertices
+            .saturating_mul(self.n_vertices.saturating_sub(1))
+            / 2;
+        let max_triangles = if self.n_vertices >= 3 {
+            self.n_vertices * (self.n_vertices - 1) * (self.n_vertices - 2) / 6
+        } else {
+            0
+        };
+        let max_tetrahedra = if self.n_vertices >= 4 {
+            self.n_vertices
+                * (self.n_vertices - 1)
+                * (self.n_vertices - 2)
+                * (self.n_vertices - 3)
+                / 24
+        } else {
+            0
+        };
+        let generic = crate::description_length::selection_bits(
+            max_edges as i64,
+            self.n_edges as i64,
+        )
+            + crate::description_length::selection_bits(
+                max_triangles as i64,
+                self.n_triangles as i64,
+            )
+            + crate::description_length::selection_bits(
+                max_tetrahedra as i64,
+                self.n_tetrahedra as i64,
+            );
+        let log_vertices = (self.n_vertices.max(2) as f64).log2();
+        let named = match (self.betti.b0, self.betti.b1, self.betti.b2) {
+            (1, 2, Some(1)) => {
+                Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
+            }
+            (1, 1, Some(0)) => {
+                Some((GraphCompressionKind::Cylinder, "cylinder", 2.0 * log_vertices))
+            }
+            (1, 0, Some(1)) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
+            _ => None,
+        };
+        if let Some((kind, name, named_bits)) = named {
+            let report = GraphCompressionReport::certified(kind, name, generic, named_bits);
+            if report.bits_saved > 0.0 {
+                return report;
+            }
+        }
+        GraphCompressionReport::unnamed(generic)
+    }
 }
 
 fn validate_charts(charts: &[AtlasChart]) -> Result<usize, String> {
@@ -360,6 +417,7 @@ pub fn build_atlas_nerve(
                 b1: 0,
                 b2: Some(0),
             },
+            null_calibration: None,
             n_vertices: 0,
             n_edges: 0,
             n_triangles: 0,
@@ -491,6 +549,7 @@ pub fn build_atlas_nerve(
 
     Ok(AtlasNerveDiagram {
         betti,
+        null_calibration: None,
         n_vertices: vertices.len(),
         n_edges: edge_simplices.len(),
         n_triangles: triangles.len(),
@@ -510,6 +569,7 @@ mod tests {
     };
     use crate::assignment::SupportMeasure;
     use crate::chart_transfer::certify_square_transfer;
+    use crate::manifold::GraphCompressionKind;
     use ndarray::{Array2, arr2};
     use std::collections::BTreeSet;
 
@@ -614,5 +674,9 @@ mod tests {
         assert_eq!(diagram.betti.b1, 2);
         assert_eq!(diagram.betti.b2, Some(1));
         assert_eq!(diagram.covering_side, AtlasCoveringSide::AtOrAboveCoveringNumber);
+        let compression = diagram.certified_compression();
+        assert_eq!(compression.kind, GraphCompressionKind::Torus);
+        assert_eq!(compression.name, "torus");
+        assert!(compression.bits_saved > 0.0);
     }
 }

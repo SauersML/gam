@@ -107,14 +107,35 @@ def ordered_circle_stat(x: Array) -> float:
     return norm / max(step, np.finfo(np.float64).tiny) / (1.0 + radius_cv)
 
 
-def top_two_energy_fraction(x: Array) -> float:
+def harmonic_circle_stat(x: Array) -> float:
+    if x.shape[1] < 2 or x.shape[0] < 4:
+        raise SystemExit("harmonic-circle statistic requires at least 4 rows and 2 columns")
     z = x - x.mean(axis=0, keepdims=True)
-    total = float(np.sum(z * z))
-    if total == 0.0:
+    theta = 2.0 * np.pi * np.arange(z.shape[0], dtype=np.float64) / z.shape[0]
+    temporal = np.stack([np.cos(theta), np.sin(theta)], axis=0)
+    coeff = temporal @ z
+    _, singular_values, right = np.linalg.svd(coeff, full_matrices=False)
+    rank_tol = np.finfo(np.float64).eps * max(coeff.shape) * float(singular_values[0])
+    rank = int(np.count_nonzero(singular_values > rank_tol))
+    if rank < 2:
         return 0.0
-    cov = z.T @ z
-    vals = np.linalg.eigvalsh(cov)
-    return float(np.sum(vals[-2:]) / total)
+    basis = right[:2].T
+    scores = z @ basis
+    total_plane = float(np.sum(scores * scores))
+    if total_plane <= np.finfo(np.float64).tiny:
+        return 0.0
+    plane_coeff = temporal @ scores
+    harmonic_ss = float((2.0 / z.shape[0]) * np.sum(plane_coeff * plane_coeff))
+    harmonic_fraction = float(np.clip(harmonic_ss / total_plane, 0.0, 1.0))
+    gram = plane_coeff @ plane_coeff.T
+    eig = np.linalg.eigvalsh(gram)
+    trace = float(eig.sum())
+    if trace <= np.finfo(np.float64).tiny:
+        return 0.0
+    balance = float(
+        np.clip(2.0 * np.sqrt(max(float(eig[0] * eig[1]), 0.0)) / trace, 0.0, 1.0)
+    )
+    return harmonic_fraction * balance
 
 
 JsonScalar = Union[float, int, List[float]]
@@ -185,13 +206,24 @@ def spike_in_curve(
     snrs: List[float],
     trials: int,
     seed: int,
+    alpha: float = 0.05,
 ) -> List[Dict[str, Union[float, int]]]:
     rng = np.random.default_rng(seed)
-    null_stats = [top_two_energy_fraction(phase_randomized(noise, rng)) for _rep in range(trials)]
-    threshold = float(np.quantile(np.asarray(null_stats), 0.95))
+    null_stats = [harmonic_circle_stat(phase_randomized(noise, rng)) for _rep in range(trials)]
+    threshold = float(np.quantile(np.asarray(null_stats), 1.0 - alpha))
+    trial_seeds = rng.integers(
+        0,
+        np.iinfo(np.uint64).max,
+        size=trials,
+        dtype=np.uint64,
+    )
     rows: List[Dict[str, Union[float, int]]] = []
     for snr in snrs:
-        stats = [top_two_energy_fraction(inject_circle(noise, snr, rng)) for _rep in range(trials)]
+        stats = []
+        for trial_seed in trial_seeds:
+            trial_rng = np.random.default_rng(int(trial_seed))
+            baseline = phase_randomized(noise, trial_rng)
+            stats.append(harmonic_circle_stat(inject_circle(baseline, snr, trial_rng)))
         hits = sum(v > threshold for v in stats)
         rows.append(
             {
@@ -227,7 +259,11 @@ def main() -> None:
     ap.add_argument("--spike-trials", type=int, default=32)
     ap.add_argument("--snrs", default="0.0,0.25,0.5,0.75,1.0")
     ap.add_argument("--claimed-snr", type=float, default=0.5)
-    ap.add_argument("--stat", choices=("top2", "ordered-circle"), default="top2")
+    ap.add_argument(
+        "--stat",
+        choices=("harmonic-circle", "ordered-circle"),
+        default="harmonic-circle",
+    )
     ap.add_argument("--peel-sink", action="store_true")
     ap.add_argument("--spike-only", action="store_true")
     ap.add_argument("--out", type=Path)
@@ -260,7 +296,7 @@ def main() -> None:
         if args.peel_sink:
             random_weight = peel_leading_sink(random_weight)
 
-    stat = top_two_energy_fraction if args.stat == "top2" else ordered_circle_stat
+    stat = harmonic_circle_stat if args.stat == "harmonic-circle" else ordered_circle_stat
     battery = None
     if not args.spike_only:
         battery = run_battery(

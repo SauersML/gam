@@ -1555,6 +1555,41 @@ mod tests {
         assert!(ratio < 1.0, "headroom ratio must be below the envelope");
     }
 
+    #[test]
+    fn curved_ev_is_bounded_by_topm_linear_envelope() {
+        let n = 8;
+        let p = 5;
+        let basis_size = 2;
+        let assign = Array1::<f64>::ones(n);
+        let mut target = Array2::<f64>::zeros((n, p));
+        let mut decoded = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let x = if row < 4 { -1.0 } else { 1.0 };
+            let y = if row % 4 < 2 { -1.0 } else { 1.0 };
+            let z = if row % 2 == 0 { -1.0 } else { 1.0 };
+            let target_row = [
+                x + 0.25 * z,
+                0.5 * x - 0.75 * y,
+                y + 0.5 * z,
+                0.25 * x + 0.5 * y - z,
+                -0.5 * y + 0.25 * z,
+            ];
+            let decoded_row = [0.7 * x, 0.35 * x - 0.4 * y, 0.6 * y, 0.2 * x, -0.3 * y];
+            for col in 0..p {
+                target[[row, col]] = target_row[col];
+                decoded[[row, col]] = decoded_row[col];
+            }
+        }
+        let metrics =
+            curved_envelope_metrics(assign.view(), decoded.view(), target.view(), basis_size);
+        let curved = metrics.curved_ev.expect("curved EV");
+        let topm = metrics.topm_linear_ev.expect("top-M linear EV");
+        assert!(
+            curved <= topm + 1.0e-12,
+            "one curved atom EV must not exceed the top-M linear envelope: curved={curved}, topm={topm}"
+        );
+    }
+
     /// A straight RESPONSE residual (the atom's data is a line) is explained
     /// equally well by both candidates, so the cheaper linear special case wins.
     /// With `a_k = 1` the curved decoded image is straight too (Θ = 0), so both

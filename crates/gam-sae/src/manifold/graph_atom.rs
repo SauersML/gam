@@ -43,8 +43,10 @@ pub struct GraphTopologyReadout {
 pub enum GraphCompressionKind {
     Circle,
     Interval,
-    Tree,
-    DisconnectedCycles,
+    FiniteSet,
+    Cylinder,
+    Torus,
+    Sphere,
     Graph,
 }
 
@@ -70,7 +72,38 @@ pub struct GraphStructureSelection {
     pub compression: GraphCompressionReport,
 }
 
-/// A first-slice graph atom: anchors with a learned subset of a derived kNN
+impl GraphCompressionReport {
+    pub fn certified(
+        kind: GraphCompressionKind,
+        name: &'static str,
+        generic_edge_bits: f64,
+        named_bits: f64,
+    ) -> Self {
+        Self {
+            kind,
+            name,
+            generic_edge_bits,
+            named_bits,
+            bits_saved: generic_edge_bits - named_bits,
+        }
+    }
+
+    pub fn unnamed(generic_edge_bits: f64) -> Self {
+        Self {
+            kind: GraphCompressionKind::Graph,
+            name: "structure without a standard name",
+            generic_edge_bits,
+            named_bits: generic_edge_bits,
+            bits_saved: 0.0,
+        }
+    }
+
+    pub fn earns_standard_name(&self) -> bool {
+        self.kind != GraphCompressionKind::Graph && self.bits_saved > 0.0
+    }
+}
+
+/// A canonical learned graph atom: anchors with a learned subset of a derived kNN
 /// candidate edge set.
 ///
 /// The smoothness penalty is `beta^T (L_W kron I_r) beta`, where `L_W` is the
@@ -80,7 +113,7 @@ pub struct GraphStructureSelection {
 /// removing it is greater than its one-edge charge. Betti read-out is exact on
 /// surviving edges; named shapes are secondary MDL compressions of the graph.
 #[derive(Debug, Clone)]
-pub struct CycleGraphAtom {
+pub struct LearnedGraphAtom {
     anchor_embeddings: Array2<f64>,
     candidate_edges: Vec<GraphEdge>,
     edge_precisions: Vec<f64>,
@@ -90,7 +123,7 @@ pub struct CycleGraphAtom {
     occupancy: OccupancyLaw,
 }
 
-impl CycleGraphAtom {
+impl LearnedGraphAtom {
     /// Derived k for the anchor-kNN candidate graph. The graph atom is expected to
     /// learn edge survival by ARD; k only supplies a sparse local superset.
     pub fn derived_knn_k(anchors: usize) -> usize {
@@ -98,7 +131,9 @@ impl CycleGraphAtom {
     }
 
     /// Build the derived undirected kNN candidate edge set from anchor embeddings.
-    pub fn knn_candidate_edges(anchor_embeddings: ArrayView2<'_, f64>) -> Result<Vec<GraphEdge>, String> {
+    pub fn knn_candidate_edges(
+        anchor_embeddings: ArrayView2<'_, f64>,
+    ) -> Result<Vec<GraphEdge>, String> {
         validate_anchor_embeddings(anchor_embeddings)?;
         let anchors = anchor_embeddings.nrows();
         let k = Self::derived_knn_k(anchors);
@@ -172,39 +207,39 @@ impl CycleGraphAtom {
         let anchors = anchor_embeddings.nrows();
         let fiber_rank = anchor_embeddings.ncols();
         if candidate_edges.is_empty() {
-            return Err("CycleGraphAtom requires at least one candidate edge".to_string());
+            return Err("LearnedGraphAtom requires at least one candidate edge".to_string());
         }
         if edge_precisions.len() != candidate_edges.len() {
             return Err(format!(
-                "CycleGraphAtom edge_precisions length {} must equal candidate edges {}",
+                "LearnedGraphAtom edge_precisions length {} must equal candidate edges {}",
                 edge_precisions.len(),
                 candidate_edges.len()
             ));
         }
         if edge_delta_loss.len() != candidate_edges.len() {
             return Err(format!(
-                "CycleGraphAtom edge_delta_loss length {} must equal candidate edges {}",
+                "LearnedGraphAtom edge_delta_loss length {} must equal candidate edges {}",
                 edge_delta_loss.len(),
                 candidate_edges.len()
             ));
         }
         if !(n_eff.is_finite() && n_eff > 0.0) {
             return Err(format!(
-                "CycleGraphAtom n_eff must be finite and positive; got {n_eff}"
+                "LearnedGraphAtom n_eff must be finite and positive; got {n_eff}"
             ));
         }
         let mut normalized = Vec::<GraphEdge>::with_capacity(candidate_edges.len());
         for (idx, edge) in candidate_edges.iter().enumerate() {
             if edge.a >= anchors || edge.b >= anchors || edge.a == edge.b {
                 return Err(format!(
-                    "CycleGraphAtom candidate edge {idx} = ({}, {}) is invalid for {anchors} anchors",
+                    "LearnedGraphAtom candidate edge {idx} = ({}, {}) is invalid for {anchors} anchors",
                     edge.a, edge.b
                 ));
             }
             let edge = GraphEdge::new(edge.a, edge.b)?;
             if normalized.contains(&edge) {
                 return Err(format!(
-                    "CycleGraphAtom candidate edge {idx} duplicates ({}, {})",
+                    "LearnedGraphAtom candidate edge {idx} duplicates ({}, {})",
                     edge.a, edge.b
                 ));
             }
@@ -213,14 +248,14 @@ impl CycleGraphAtom {
         for (edge, &precision) in edge_precisions.iter().enumerate() {
             if !(precision.is_finite() && precision >= 0.0) {
                 return Err(format!(
-                    "CycleGraphAtom edge {edge} precision must be finite and nonnegative; got {precision}"
+                    "LearnedGraphAtom edge {edge} precision must be finite and nonnegative; got {precision}"
                 ));
             }
         }
         for (edge, &delta) in edge_delta_loss.iter().enumerate() {
             if !delta.is_finite() {
                 return Err(format!(
-                    "CycleGraphAtom edge {edge} deletion loss must be finite; got {delta}"
+                    "LearnedGraphAtom edge {edge} deletion loss must be finite; got {delta}"
                 ));
             }
         }
@@ -354,48 +389,36 @@ impl CycleGraphAtom {
             readout.surviving_edges as i64,
         );
         let log_vertices = (readout.vertices.max(2) as f64).log2();
-        let named = if readout.b0 == 1 && readout.b1 == 1 && degrees.iter().all(|&d| d == 2) {
+        let named = if readout.b0 == 1
+            && readout.b1 == 1
+            && degrees.iter().all(|&d| d == 2)
+            && self.surviving_edge_weights_are_uniform()
+        {
             Some((GraphCompressionKind::Circle, "circle", log_vertices))
         } else if readout.b0 == 1
             && readout.b1 == 0
             && readout.vertices >= 2
             && degrees.iter().filter(|&&d| d == 1).count() == 2
             && degrees.iter().filter(|&&d| d == 2).count() == readout.vertices.saturating_sub(2)
+            && self.surviving_edge_weights_are_uniform()
         {
             Some((GraphCompressionKind::Interval, "interval", 2.0 * log_vertices))
-        } else if readout.b0 == 1 && readout.b1 == 0 && degrees.iter().any(|&d| d > 2) {
-            Some((GraphCompressionKind::Tree, "tree", log_vertices))
-        } else if readout.b0 > 1
-            && readout.b1 == readout.b0
-            && degrees.iter().all(|&d| d == 2)
+        } else if matches!(
+            self.occupancy,
+            OccupancyLaw::Discrete { anchors } if anchors == readout.vertices
+        ) && readout.b1 == 0
         {
-            Some((
-                GraphCompressionKind::DisconnectedCycles,
-                "disconnected-cycles",
-                readout.b0 as f64 * log_vertices,
-            ))
+            Some((GraphCompressionKind::FiniteSet, "finite_set", log_vertices))
         } else {
             None
         };
         if let Some((kind, name, named_bits)) = named {
-            let bits_saved = generic - named_bits;
-            if bits_saved > 0.0 {
-                return GraphCompressionReport {
-                    kind,
-                    name,
-                    generic_edge_bits: generic,
-                    named_bits,
-                    bits_saved,
-                };
+            let report = GraphCompressionReport::certified(kind, name, generic, named_bits);
+            if report.bits_saved > 0.0 {
+                return report;
             }
         }
-        GraphCompressionReport {
-            kind: GraphCompressionKind::Graph,
-            name: "graph",
-            generic_edge_bits: generic,
-            named_bits: generic,
-            bits_saved: 0.0,
-        }
+        GraphCompressionReport::unnamed(generic)
     }
 
     /// Birth-selection readout: graph existence is paid for by the sum of the
@@ -472,6 +495,25 @@ impl CycleGraphAtom {
         }
         value
     }
+
+    fn surviving_edge_weights_are_uniform(&self) -> bool {
+        let mut min_weight = f64::INFINITY;
+        let mut max_weight = f64::NEG_INFINITY;
+        let mut count = 0usize;
+        for (idx, survives) in self.surviving_edges.iter().enumerate() {
+            if *survives {
+                let weight = self.edge_precisions[idx];
+                min_weight = min_weight.min(weight);
+                max_weight = max_weight.max(weight);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return false;
+        }
+        let scale = max_weight.abs().max(min_weight.abs()).max(1.0);
+        max_weight - min_weight <= f64::EPSILON * scale * count as f64
+    }
 }
 
 fn validate_anchor_embeddings(anchor_embeddings: ArrayView2<'_, f64>) -> Result<(), String> {
@@ -479,14 +521,14 @@ fn validate_anchor_embeddings(anchor_embeddings: ArrayView2<'_, f64>) -> Result<
     let fiber_rank = anchor_embeddings.ncols();
     if anchors < 2 {
         return Err(format!(
-            "CycleGraphAtom requires at least 2 anchors; got {anchors}"
+            "LearnedGraphAtom requires at least 2 anchors; got {anchors}"
         ));
     }
     if fiber_rank == 0 {
-        return Err("CycleGraphAtom requires fiber_rank >= 1".to_string());
+        return Err("LearnedGraphAtom requires fiber_rank >= 1".to_string());
     }
     if anchor_embeddings.iter().any(|v| !v.is_finite()) {
-        return Err("CycleGraphAtom anchor_embeddings contain a non-finite value".to_string());
+        return Err("LearnedGraphAtom anchor_embeddings contain a non-finite value".to_string());
     }
     Ok(())
 }

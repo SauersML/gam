@@ -15,6 +15,7 @@
 
 use gam_solve::row_sampling_measure::{DesignedRowSample, MeasureProvenance, RowSamplingMeasure};
 use gam_terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use crate::null_battery::ClaimNullCalibration;
 use ndarray::{Array1, ArrayView2};
 use std::collections::BTreeMap;
 
@@ -25,6 +26,12 @@ const BRACKET_EXPANSION_LIMIT: usize = 48;
 const BRENT_ITERATION_LIMIT: usize = 96;
 const BRENT_REL_TOL: f64 = 1.0e-8;
 const MIN_RESIDUAL_DF: f64 = 1.0;
+const CONDITIONALITY_NULL_REPLICATES: usize = 8;
+const CONDITIONALITY_SPIKE_TRIALS: usize = 8;
+const CONDITIONALITY_CLAIMED_SNR: f64 = 1.0;
+const CONDITIONALITY_CLAIMED_FPR: f64 = 0.05;
+const CONDITIONALITY_NULL_SEED: u64 = 0xC0A_C7A1;
+const CONDITIONALITY_SPIKE_SEED: u64 = 0xC0A_51C1;
 
 /// Configuration for the native varying-coefficient GAM conditionality fit.
 #[derive(Clone, Copy, Debug)]
@@ -99,6 +106,7 @@ pub struct ContextDiagnostic {
 pub struct CoactivationConditionality {
     pub native: VaryingCoefficientConditionality,
     pub certificate: RobustCouplingCertificate,
+    pub null_calibration: Option<ClaimNullCalibration>,
     /// Scalar intended for merge/fusion ranking. Large values mean the pair has
     /// a robust pooled coupling and little continuous-context coefficient drift.
     pub fusion_gate_score: f64,
@@ -209,9 +217,114 @@ pub fn estimate_on_rows(
     Ok(CoactivationConditionality {
         native,
         certificate,
+        null_calibration: None,
         fusion_gate_score,
         diagnostics,
     })
+}
+
+pub fn estimate_on_rows_with_nulls(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    diagnostic_labels: Option<&[usize]>,
+    rows: &[usize],
+    likelihood_weights: &[f64],
+    config: VaryingCoefficientConfig,
+    random_weight_gate_i: &[f64],
+    random_weight_gate_j: &[f64],
+) -> Result<CoactivationConditionality, String> {
+    let mut report = estimate_on_rows(
+        gate_i,
+        gate_j,
+        continuous_context,
+        diagnostic_labels,
+        rows,
+        likelihood_weights,
+        config,
+    )?;
+    let observed = selected_pair_matrix(gate_i, gate_j, rows)?;
+    let random_weight = selected_pair_matrix(random_weight_gate_i, random_weight_gate_j, rows)?;
+    let null_config = crate::null_battery::NullBatteryConfig {
+        replicates: CONDITIONALITY_NULL_REPLICATES,
+        seed: CONDITIONALITY_NULL_SEED,
+        kinds: vec![
+            crate::null_battery::NullKind::PhaseRandomized,
+            crate::null_battery::NullKind::RandomRotation,
+            crate::null_battery::NullKind::ArchitectureMatchedRandomWeight,
+        ],
+        tail: crate::null_battery::Tail::Larger,
+    };
+    let nulls = crate::null_battery::run_null_battery(
+        observed.view(),
+        Some(random_weight.view()),
+        &null_config,
+        conditionality_matrix_stat,
+    )?;
+    let roc_config = crate::null_battery::SpikeInRocConfig::circle(
+        vec![CONDITIONALITY_CLAIMED_SNR],
+        CONDITIONALITY_SPIKE_TRIALS,
+        CONDITIONALITY_SPIKE_SEED,
+    );
+    let spike_in_roc =
+        crate::null_battery::default_spike_in_roc_curve(observed.view(), &roc_config)?;
+    let calibrated = crate::null_battery::calibrated_roc_claim_report(
+        "conditionality",
+        CONDITIONALITY_CLAIMED_SNR,
+        CONDITIONALITY_CLAIMED_FPR,
+        nulls,
+        spike_in_roc,
+    )?;
+    report.null_calibration = Some(
+        crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated),
+    );
+    Ok(report)
+}
+
+fn selected_pair_matrix(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    rows: &[usize],
+) -> Result<ndarray::Array2<f64>, String> {
+    let mut out = ndarray::Array2::<f64>::zeros((rows.len(), 2));
+    for (slot, &row) in rows.iter().enumerate() {
+        if row >= gate_i.len() || row >= gate_j.len() {
+            return Err(format!("selected_pair_matrix: sampled row {row} out of range"));
+        }
+        out[[slot, 0]] = gate_i[row];
+        out[[slot, 1]] = gate_j[row];
+    }
+    Ok(out)
+}
+
+fn conditionality_matrix_stat(data: ArrayView2<'_, f64>) -> Result<f64, String> {
+    if data.nrows() < 4 || data.ncols() < 2 {
+        return Err(
+            "conditionality null statistic requires at least four rows and two columns".to_string(),
+        );
+    }
+    let mut mean_i = 0.0_f64;
+    let mut mean_j = 0.0_f64;
+    for row in 0..data.nrows() {
+        mean_i += data[[row, 0]];
+        mean_j += data[[row, 1]];
+    }
+    mean_i /= data.nrows() as f64;
+    mean_j /= data.nrows() as f64;
+    let mut var_i = 0.0_f64;
+    let mut var_j = 0.0_f64;
+    let mut cov = 0.0_f64;
+    for row in 0..data.nrows() {
+        let zi = data[[row, 0]] - mean_i;
+        let zj = data[[row, 1]] - mean_j;
+        var_i += zi * zi;
+        var_j += zj * zj;
+        cov += zi * zj;
+    }
+    if !(var_i > 0.0 && var_j > 0.0) {
+        return Ok(0.0);
+    }
+    Ok((cov / (var_i.sqrt() * var_j.sqrt())).abs())
 }
 
 /// Full influence vector for the weighted Pearson coupling statistic.

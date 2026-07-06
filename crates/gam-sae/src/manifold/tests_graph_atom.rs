@@ -1,5 +1,5 @@
 use crate::manifold::{
-    CycleGraphAtom, GraphCompressionKind, GraphEdge, OccupancyLaw, graph_edge_rank_charge,
+    GraphCompressionKind, GraphEdge, LearnedGraphAtom, OccupancyLaw, graph_edge_rank_charge,
 };
 use crate::sparse_dict::{BlockSparseFit, harmonic_measure_coordinates};
 use ndarray::Array2;
@@ -140,6 +140,7 @@ fn harmonic_fit_from_codes(rows: &[Vec<f32>], block_size: usize) -> BlockSparseF
         gamma: 1.0,
         block_utilization: vec![1.0],
         block_stable_rank: vec![2.0],
+        matryoshka_prefix_losses: Vec::new(),
         explained_variance: 1.0,
         epochs: 0,
         converged: true,
@@ -153,12 +154,12 @@ fn graph_atom_reads_continuous_circle_as_one_loop_from_knn_edges() {
     let anchors = WEEKDAY_ANCHORS;
     let rows = continuous_circle_rows(anchors, ROWS_PER_ANCHOR);
     let embeddings = unit_circle_anchor_embeddings(anchors);
-    let edges = CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
+    let edges = LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
     let n_eff = rows.len() as f64;
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_all(edges.len(), charge);
 
-    let atom = CycleGraphAtom::from_reml_candidate_edges(
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
         embeddings.view(),
         &rows,
         n_eff,
@@ -175,6 +176,8 @@ fn graph_atom_reads_continuous_circle_as_one_loop_from_knn_edges() {
     assert_eq!(readout.b1, 1);
     assert_eq!(readout.surviving_edges, anchors);
     assert_eq!(selection.compression.kind, GraphCompressionKind::Circle);
+    assert!(selection.compression.earns_standard_name());
+    assert!(selection.compression.bits_saved > 0.0);
     assert!(selection.selected);
     assert!(
         matches!(atom.occupancy(), OccupancyLaw::Uniform | OccupancyLaw::Continuous),
@@ -189,12 +192,12 @@ fn graph_atom_reads_weekdays_as_atomic_cycle_without_fixed_menu_selection() {
     let anchors = WEEKDAY_ANCHORS;
     let rows = weekday_rows(anchors, ROWS_PER_ANCHOR);
     let embeddings = unit_circle_anchor_embeddings(anchors);
-    let edges = CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
+    let edges = LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
     let n_eff = rows.len() as f64;
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_all(edges.len(), charge);
 
-    let atom = CycleGraphAtom::from_reml_knn_edges(
+    let atom = LearnedGraphAtom::from_reml_knn_edges(
         embeddings.view(),
         &rows,
         n_eff,
@@ -255,7 +258,7 @@ fn learned_graph_reads_path_as_interval() {
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_all(edges.len(), charge);
 
-    let atom = CycleGraphAtom::from_reml_candidate_edges(
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
         embeddings.view(),
         &rows,
         n_eff,
@@ -285,7 +288,7 @@ fn learned_graph_reads_two_disconnected_cycles() {
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_all(edges.len(), charge);
 
-    let atom = CycleGraphAtom::from_reml_candidate_edges(
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
         embeddings.view(),
         &rows,
         n_eff,
@@ -300,8 +303,43 @@ fn learned_graph_reads_two_disconnected_cycles() {
     assert_eq!(readout.b1, 2);
     assert_eq!(
         atom.certified_compression().kind,
-        GraphCompressionKind::DisconnectedCycles
+        GraphCompressionKind::Graph
     );
+    assert_eq!(
+        atom.certified_compression().name,
+        "structure without a standard name"
+    );
+}
+
+#[test]
+fn non_uniform_cycle_reports_no_standard_name() {
+    let anchors = WEEKDAY_ANCHORS;
+    let rows = continuous_circle_rows(anchors, ROWS_PER_ANCHOR);
+    let embeddings = unit_circle_anchor_embeddings(anchors);
+    let edges = cycle_edges(0, anchors);
+    let n_eff = rows.len() as f64;
+    let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
+    let mut precisions = vec![1.0; edges.len()];
+    precisions[0] = 2.0;
+    let deltas = vec![charge * KEEP_MARGIN; edges.len()];
+
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
+        embeddings.view(),
+        &rows,
+        n_eff,
+        &edges,
+        &precisions,
+        &deltas,
+    )
+    .expect("non-uniform cycle graph atom");
+    let readout = atom.topology_readout();
+    let compression = atom.certified_compression();
+
+    assert_eq!(readout.b0, 1);
+    assert_eq!(readout.b1, 1);
+    assert_eq!(compression.kind, GraphCompressionKind::Graph);
+    assert_eq!(compression.name, "structure without a standard name");
+    assert_eq!(compression.bits_saved, 0.0);
 }
 
 #[test]
@@ -316,7 +354,7 @@ fn learned_graph_reads_branching_tree_and_detects_branch_vertex() {
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_with_extra_retired(&edges, &keep, charge);
 
-    let atom = CycleGraphAtom::from_reml_candidate_edges(
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
         embeddings.view(),
         &rows,
         n_eff,
@@ -334,7 +372,11 @@ fn learned_graph_reads_branching_tree_and_detects_branch_vertex() {
         degrees.iter().any(|&degree| degree > 2),
         "branching tree must expose a degree>2 vertex: {degrees:?}"
     );
-    assert_eq!(atom.certified_compression().kind, GraphCompressionKind::Tree);
+    assert_eq!(atom.certified_compression().kind, GraphCompressionKind::Graph);
+    assert_eq!(
+        atom.certified_compression().name,
+        "structure without a standard name"
+    );
 }
 
 #[test]
@@ -342,11 +384,11 @@ fn two_date_modular_synthetic_binds_super_resolution_to_graph_base() {
     let anchors = WEEKDAY_ANCHORS;
     let rows = weekday_rows(anchors, ROWS_PER_ANCHOR);
     let embeddings = unit_circle_anchor_embeddings(anchors);
-    let edges = CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
+    let edges = LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
     let n_eff = rows.len() as f64;
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let (precisions, deltas) = keep_all(edges.len(), charge);
-    let atom = CycleGraphAtom::from_reml_candidate_edges(
+    let atom = LearnedGraphAtom::from_reml_candidate_edges(
         embeddings.view(),
         &rows,
         n_eff,

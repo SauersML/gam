@@ -394,6 +394,7 @@ fn planted_block_subspaces_recovered() {
         block_tile: 8,
         frame_ridge: 1.0e-9,
         aux_k: 3,
+        matryoshka_prefix: false,
         tolerance: 1.0e-10,
     };
     let fit = fit_block_sparse_dictionary(x.view(), &config).expect("block fit");
@@ -448,6 +449,7 @@ fn fitted_block_frames_are_orthonormal() {
         block_tile: 8,
         frame_ridge: 1.0e-9,
         aux_k: 2,
+        matryoshka_prefix: false,
         tolerance: 1.0e-9,
     };
     let fit = fit_block_sparse_dictionary(x.view(), &config).expect("block fit");
@@ -484,6 +486,7 @@ fn utilization_and_stable_rank_reported() {
         block_tile: 8,
         frame_ridge: 1.0e-9,
         aux_k: 2,
+        matryoshka_prefix: false,
         tolerance: 1.0e-9,
     };
     let fit = fit_block_sparse_dictionary(x.view(), &config).expect("block fit");
@@ -515,6 +518,82 @@ fn utilization_and_stable_rank_reported() {
         max_sr > 1.2,
         "a block spanning a genuine 2D subspace should report stable rank > 1.2, got {max_sr}"
     );
+}
+
+#[test]
+fn matryoshka_prefix_losses_are_monotone_and_match_truncated_readout() {
+    let (p, b, n_blocks) = (8usize, 2usize, 4usize);
+    let planted = planted_frames(p, n_blocks, b);
+    let x = planted_data(&planted, n_blocks, b, p, 160);
+    let config = BlockSparseConfig {
+        n_blocks,
+        block_size: b,
+        block_topk: 1,
+        max_epochs: 30,
+        minibatch: 64,
+        block_tile: 8,
+        frame_ridge: 1.0e-9,
+        aux_k: 2,
+        matryoshka_prefix: true,
+        tolerance: 1.0e-9,
+    };
+    let fit = fit_block_sparse_dictionary(x.view(), &config).expect("block fit");
+
+    assert_eq!(
+        fit.matryoshka_prefix_losses
+            .iter()
+            .map(|&(k, _)| k)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 8],
+        "MATRYOSHKA-PREFIX ladder must be log-spaced block-aligned atom prefixes"
+    );
+    for pair in fit.matryoshka_prefix_losses.windows(2) {
+        assert!(
+            pair[1].1 <= pair[0].1 + 1.0e-8,
+            "prefix losses must be monotone non-increasing: {:?}",
+            fit.matryoshka_prefix_losses
+        );
+    }
+
+    let mut independent_best = f64::INFINITY;
+    for &(k_atoms, stored_loss) in fit.matryoshka_prefix_losses.iter() {
+        let prefix_decoder = fit.decoder.slice(ndarray::s![0..k_atoms, ..]);
+        let (blocks, gates, codes) = block_sparse_dictionary_transform(
+            x.view(),
+            prefix_decoder,
+            fit.gamma,
+            b,
+            fit.block_topk,
+            config.block_tile,
+        )
+        .expect("truncated prefix transform");
+        assert_eq!(gates.nrows(), x.nrows(), "truncated prefix gate row count");
+        let recon =
+            reconstruct_block_sparse_rows(prefix_decoder, blocks.view(), codes.view(), b)
+                .expect("truncated prefix reconstruction");
+        let mut loss = 0.0f64;
+        for i in 0..x.nrows() {
+            for c in 0..x.ncols() {
+                let r = x[[i, c]] as f64 - recon[[i, c]] as f64;
+                loss += r * r;
+            }
+        }
+        loss /= x.nrows() as f64;
+        independent_best = independent_best.min(loss);
+
+        let read_loss = fit
+            .read_loss_at_prefix(k_atoms)
+            .expect("stored prefix loss must be readable");
+        assert!(
+            (read_loss - stored_loss).abs() <= 1.0e-12,
+            "accessor must return the stored prefix loss at K={k_atoms}"
+        );
+        assert!(
+            (read_loss - independent_best).abs() <= 1.0e-5 * (1.0 + independent_best.abs()),
+            "single nested fit loss at K={k_atoms} must match independently truncated readout: \
+             stored {read_loss}, independent {independent_best}"
+        );
+    }
 }
 
 #[test]

@@ -352,6 +352,7 @@ def audit_sae(
     activations: Any,
     *,
     codes: Any | None = None,
+    random_weight_codes: Any,
     decoder_key: str | None = None,
     active: int | None = None,
     block_size: int = 1,
@@ -382,8 +383,11 @@ def audit_sae(
     If dense SAE ``codes`` (``N x K``) are supplied, they are audited as the
     frozen external encoder output. If not, the Rust sparse router encodes
     ``activations`` against the frozen decoder with ``active`` atoms per row
-    (default ``1``) before running the audit. All certificate, routability,
-    coordinate-SE, topology, and atlas-nerve quantities are computed by Rust.
+    (default ``1``) before running the audit. ``random_weight_codes`` is an
+    architecture-matched random-weight encoder donor used for the required
+    null battery attached to topology and atlas claims. All certificate,
+    routability, coordinate-SE, topology, and atlas-nerve quantities are
+    computed by Rust.
     """
     dec, checkpoint_meta = _load_decoder_checkpoint(checkpoint, decoder_key)
     acts = _as_2d_f32(activations, "activations")
@@ -414,6 +418,12 @@ def audit_sae(
         raise ValueError(
             f"codes must have shape (N, K)=({acts.shape[0]}, {dec.shape[0]}); got {cod.shape}"
         )
+    rw_cod = _as_2d_f32(random_weight_codes, "random_weight_codes")
+    if rw_cod.shape[1] != dec.shape[0] or rw_cod.shape[0] == 0:
+        raise ValueError(
+            "random_weight_codes must be a non-empty matrix with K="
+            f"{dec.shape[0]} columns; got {rw_cod.shape}"
+        )
     if transport is not None:
         if transport_theta_in is not None or transport_theta_out is not None:
             raise ValueError(
@@ -428,6 +438,7 @@ def audit_sae(
         dec,
         cod,
         acts,
+        rw_cod,
         active,
         block_size,
         block_topk,

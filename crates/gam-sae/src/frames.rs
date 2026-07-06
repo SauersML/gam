@@ -536,6 +536,63 @@ impl GrassmannFrame {
         self.frame.view()
     }
 
+    /// Build a canonical-gauge frame from an already column-orthonormal matrix.
+    ///
+    /// This is for callers that obtained the left image frame through an
+    /// equivalent covariance/eigendecomposition path rather than a direct thin
+    /// SVD. The supplied gauge values must be finite, non-negative, descending,
+    /// and have one value per frame column.
+    pub fn from_orthonormal(
+        frame: Array2<f64>,
+        gauge_singular_values: Array1<f64>,
+    ) -> Result<Self, String> {
+        let (p, r) = frame.dim();
+        if p == 0 || r == 0 {
+            return Err("GrassmannFrame::from_orthonormal: frame must be non-empty".to_string());
+        }
+        if r > p {
+            return Err(format!(
+                "GrassmannFrame::from_orthonormal: frame rank r={r} cannot exceed output dim p={p}"
+            ));
+        }
+        if gauge_singular_values.len() != r {
+            return Err(format!(
+                "GrassmannFrame::from_orthonormal: gauge length {} must equal rank {r}",
+                gauge_singular_values.len()
+            ));
+        }
+        for i in 0..r {
+            let value = gauge_singular_values[i];
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(format!(
+                    "GrassmannFrame::from_orthonormal: gauge value {i} must be finite and non-negative, got {value}"
+                ));
+            }
+            if i > 0 && gauge_singular_values[i - 1] < value {
+                return Err(
+                    "GrassmannFrame::from_orthonormal: gauge values must be descending"
+                        .to_string(),
+                );
+            }
+        }
+        let tol = 1.0e-8_f64;
+        for a in 0..r {
+            for b in a..r {
+                let mut dot = 0.0_f64;
+                for row in 0..p {
+                    dot += frame[[row, a]] * frame[[row, b]];
+                }
+                let target = if a == b { 1.0 } else { 0.0 };
+                if (dot - target).abs() > tol {
+                    return Err(format!(
+                        "GrassmannFrame::from_orthonormal: frame columns are not orthonormal at ({a}, {b}); dot={dot}"
+                    ));
+                }
+            }
+        }
+        Ok(Self::from_oriented(frame, gauge_singular_values))
+    }
+
     /// Grassmann manifold dimension `r·(p − r)` of this frame — the count of
     /// profiled-out degrees of freedom that must enter the Laplace evidence
     /// dimension accounting (issue #972, evidence honesty). A point on the

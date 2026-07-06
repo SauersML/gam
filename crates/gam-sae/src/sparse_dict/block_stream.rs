@@ -302,6 +302,75 @@ impl BlockSparseStreamState {
         })
     }
 
+    /// fit_begin with caller-supplied block frames. This is the large-`K` front
+    /// door for experiments that cannot afford farthest-point seeding over
+    /// `K*N*P`; the supplied decoder is still required to be a `KxP` block
+    /// dictionary with `K = n_blocks*block_size`, and every row must be finite.
+    pub fn new_with_decoder(
+        decoder: Array2<f32>,
+        config: &BlockSparseConfig,
+    ) -> Result<Self, String> {
+        validate_config(config)?;
+        if decoder.nrows() != config.n_blocks * config.block_size {
+            return Err(format!(
+                "BlockSparseStream decoder rows must equal n_blocks*block_size = {}, got {}",
+                config.n_blocks * config.block_size,
+                decoder.nrows()
+            ));
+        }
+        if decoder.ncols() == 0 {
+            return Err("BlockSparseStream decoder must have at least one column".to_string());
+        }
+        if !decoder.iter().all(|v| v.is_finite()) {
+            return Err("BlockSparseStream decoder must be finite".to_string());
+        }
+        if config.block_size > decoder.ncols() {
+            return Err(format!(
+                "BlockSparseStream block_size b={} cannot exceed P={}",
+                config.block_size,
+                decoder.ncols()
+            ));
+        }
+
+        let p = decoder.ncols();
+        let g = config.n_blocks;
+        let b = config.block_size;
+        let k = config.block_topk.min(g).max(1);
+        let cap = config.aux_k.saturating_mul(b).max(1);
+        Ok(Self {
+            config: *config,
+            g,
+            b,
+            k,
+            p,
+            decoder,
+            gamma: 1.0,
+            cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
+            second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+            usage: vec![0; g],
+            touched: vec![false; g],
+            alive_count: 0,
+            gamma_num: 0.0,
+            gamma_den: 0.0,
+            col_sum: vec![0.0; p],
+            col_sumsq: vec![0.0; p],
+            rss: 0.0,
+            row_count: 0,
+            reservoir: ResidualReservoir::new(cap),
+            prev_ev: f64::NEG_INFINITY,
+            last_ev: f64::NEG_INFINITY,
+            epochs_run: 0,
+            last_revived: 0,
+            converged: false,
+            last_util: vec![0.0; g],
+            last_stable: vec![0.0; g],
+            last_second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+            last_usage: vec![0; g],
+            last_rss: 0.0,
+            last_rows: 0,
+        })
+    }
+
     /// partial_fit: route + tied-code one shard against the FROZEN epoch frames/γ
     /// and fold its contributions into this epoch's accumulators. Reuses the exact
     /// block-tiled router/coder of the one-shot lane ([`route_and_code_all`]), so

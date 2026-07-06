@@ -86,7 +86,7 @@ use crate::basis::{
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::manifold::{
-    AssignmentMode, CycleGraphAtom, GraphStructureSelection, OccupancyLaw, SaeAtomBasisKind,
+    AssignmentMode, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw, SaeAtomBasisKind,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, amplitude_concentration_certificate,
     classify_occupancy_interval,
 };
@@ -1656,7 +1656,7 @@ pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(us
 /// charges. Named shapes are only certified compressions of the learned graph.
 #[derive(Clone, Debug)]
 pub struct GraphBirthCandidate {
-    pub atom: CycleGraphAtom,
+    pub atom: LearnedGraphAtom,
     pub selection: GraphStructureSelection,
 }
 
@@ -1671,7 +1671,7 @@ pub fn graph_birth_candidate_for_structure_search(
     edge_precisions: &[f64],
     edge_delta_loss: &[f64],
 ) -> Result<GraphBirthCandidate, String> {
-    let atom = CycleGraphAtom::from_reml_knn_edges(
+    let atom = LearnedGraphAtom::from_reml_knn_edges(
         anchor_embeddings,
         row_coordinates,
         n_eff,
