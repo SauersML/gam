@@ -168,10 +168,10 @@ impl BranchCertificate {
     }
 
     /// Route derivatives through individual eigenpairs only when the spectral
-    /// separation is resolved above eigensolver round-off. At degeneracy the
-    /// smooth object is the invariant-subspace block, with derivatives given by
-    /// the block Daleckii-Krein/Sylvester form; individual eigenpairs have a
-    /// genuine kink and must not be reported as a scalar forward-mode result.
+    /// separation is resolved above eigensolver round-off. At degeneracy this
+    /// module records an unresolved invariant-subspace block and refuses scalar
+    /// derivative reporting. It does not implement the confluent
+    /// Daleckii-Krein/Sylvester block derivative.
     pub fn eigen_derivative_route(&self) -> EigenDerivativeRoute {
         if self.min_eigen_gap.is_finite() && self.min_eigen_gap < self.eigen_gap_threshold {
             EigenDerivativeRoute::InvariantSubspaceBlock
@@ -184,6 +184,7 @@ impl BranchCertificate {
         match self.eigen_derivative_route() {
             EigenDerivativeRoute::IndividualEigenpairs => Ok(()),
             EigenDerivativeRoute::InvariantSubspaceBlock => Err(BranchCertificateMismatch {
+                refusal: BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock,
                 changed_fields: vec!["min_eigen_gap".to_string()],
                 baseline: self.clone(),
                 probe: self.clone(),
@@ -240,8 +241,10 @@ impl BranchCertificate {
         }
         let baseline_eigen_route = self.eigen_derivative_route();
         let probe_eigen_route = probe.eigen_derivative_route();
-        if baseline_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
-            || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
+        let unresolved_invariant_subspace =
+            baseline_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
+                || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock;
+        if unresolved_invariant_subspace
             || baseline_eigen_route != probe_eigen_route
             || self.min_eigen_gap != probe.min_eigen_gap
             || self.eigen_gap_threshold != probe.eigen_gap_threshold
@@ -256,6 +259,11 @@ impl BranchCertificate {
             Ok(())
         } else {
             Err(BranchCertificateMismatch {
+                refusal: if unresolved_invariant_subspace {
+                    BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
+                } else {
+                    BranchCertificateRefusal::BranchChanged
+                },
                 changed_fields,
                 baseline: self.clone(),
                 probe: probe.clone(),
@@ -264,8 +272,15 @@ impl BranchCertificate {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchCertificateRefusal {
+    BranchChanged,
+    UnresolvedInvariantSubspaceBlock,
+}
+
 #[derive(Clone, Debug)]
 pub struct BranchCertificateMismatch {
+    pub refusal: BranchCertificateRefusal,
     pub changed_fields: Vec<String>,
     pub baseline: BranchCertificate,
     pub probe: BranchCertificate,
@@ -273,11 +288,19 @@ pub struct BranchCertificateMismatch {
 
 impl std::fmt::Display for BranchCertificateMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "derivative oracle branch changed in fields {:?}",
-            self.changed_fields
-        )
+        match self.refusal {
+            BranchCertificateRefusal::BranchChanged => write!(
+                f,
+                "derivative oracle branch changed in fields {:?}",
+                self.changed_fields
+            ),
+            BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock => write!(
+                f,
+                "derivative oracle refuses unresolved invariant-subspace eigen branch: \
+                 min_eigen_gap={} threshold={} fields {:?}",
+                self.probe.min_eigen_gap, self.probe.eigen_gap_threshold, self.changed_fields
+            ),
+        }
     }
 }
 
@@ -426,6 +449,7 @@ mod tests {
         let err = baseline
             .assert_same_branch(&probe)
             .expect_err("reanchored majorizer differentiates a different object");
+        assert_eq!(err.refusal, BranchCertificateRefusal::BranchChanged);
         assert_eq!(err.changed_fields, vec!["majorizer_anchor".to_string()]);
     }
 
@@ -462,6 +486,10 @@ mod tests {
         };
         let err = guarded_exact_trace_report(cert, vec![channel])
             .expect_err("individual eigenpair derivative must be refused at a crossing");
+        assert_eq!(
+            err.refusal,
+            BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
+        );
         assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
     }
 
@@ -484,6 +512,10 @@ mod tests {
         let err = cert
             .assert_same_branch(&cert)
             .expect_err("same degenerate eigenpair branch still has no scalar derivative");
+        assert_eq!(
+            err.refusal,
+            BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
+        );
         assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
     }
 
@@ -540,7 +572,7 @@ mod tests {
         );
         assert!(
             beta_exact.is_finite() && report.total_derivative.is_finite(),
-            "dual oracle reports exact finite per-channel derivatives"
+            "dual SPD Cholesky logdet reports exact finite per-channel derivatives"
         );
     }
 }
