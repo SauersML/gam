@@ -49,7 +49,7 @@ fn materialize_chunk_synthesizes_euclidean_patch_evaluator() -> Result<(), Strin
     let chunk_coords = array![[-0.6_f64], [0.1], [0.75]];
     let n_chunk = chunk_coords.nrows();
     let chunk_logits = Array2::<f64>::zeros((n_chunk, 1));
-    let chunk_term = term.materialize_chunk(chunk_logits, vec![chunk_coords.clone()])?;
+    let chunk_term = term.materialize_chunk(chunk_logits, vec![chunk_coords.clone()], None)?;
 
     assert_eq!(chunk_term.atoms.len(), 1);
     let chunk_atom = &chunk_term.atoms[0];

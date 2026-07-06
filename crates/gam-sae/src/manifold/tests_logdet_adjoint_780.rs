@@ -5,7 +5,7 @@
 //! `tests` module.
 
 use super::derivative_oracle::{
-    BranchCertificate, DerivativeTraceChannel, Dual, ExactTraceChannel, ExactTraceReport,
+    BranchCertificate, DerivativeTraceChannel, ExactTraceChannel, ExactTraceReport,
     MajorizerAnchorMode, PivotBranch, dual_spd_logdet, guarded_exact_trace_report,
 };
 use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean};
@@ -274,11 +274,17 @@ fn row_deflation_pushforward_2156(
     assert_eq!(u.ncols(), q, "deflation eigenbasis col count");
     let in_basis = u.t().dot(raw).dot(u);
     let mut pushed = Array2::<f64>::zeros((q, q));
-    let eps = 1.0e-12;
+    let eigen_scale = spec
+        .raw_evals
+        .iter()
+        .chain(spec.cond_evals.iter())
+        .copied()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    let gap_threshold = eigen_gap_threshold(eigen_scale, spec.raw_evals.len());
     for a in 0..q {
         for b in 0..q {
             let denom = spec.raw_evals[a] - spec.raw_evals[b];
-            let factor = if denom.abs() > eps {
+            let factor = if denom.abs() > gap_threshold {
                 (spec.cond_evals[a] - spec.cond_evals[b]) / denom
             } else if spec.cond_evals[a] == spec.raw_evals[a] {
                 1.0
@@ -650,8 +656,8 @@ fn dual_logdet_channel_2156(
     let logdet = dual_spd_logdet(&matrix).expect("dual SPD logdet channel");
     ExactTraceChannel {
         channel,
-        value: logdet.value,
-        derivative: logdet.derivative,
+        value: logdet.re,
+        derivative: logdet.eps,
         certificate,
     }
 }
@@ -748,7 +754,7 @@ fn softmax_logit_dual_channel_report_2156(
     for atom in 0..term.k_atoms() {
         assert_close_2156(
             "dual softmax value",
-            dual_a[atom].value,
+            dual_a[atom].re,
             assignments[atom],
             1.0,
         );
@@ -1078,6 +1084,17 @@ fn configure_decisive_softmax_logits_2156(term: &mut SaeManifoldTerm) {
 }
 
 fn assert_branch_certificate_green_2156(label: &str, certificate: &BranchCertificate) {
+    certificate
+        .assert_derivative_reportable()
+        .unwrap_or_else(|err| panic!("{label} derivative branch must be reportable: {err}"));
+    assert!(
+        certificate
+            .kink_branches
+            .iter()
+            .all(|record| record.branch != DualKinkBranch::Tie),
+        "{label} kink branch certificate must not contain a tie: {:?}",
+        certificate.kink_branches
+    );
     assert_eq!(
         certificate.min_row_pivot_branch,
         PivotBranch::Positive,
@@ -1188,6 +1205,10 @@ fn assert_dual_theta_logdet_parity_2156(
         let (dual, theta_certificate) = dual_logdet_trace_2156("theta", cache, &h, &dh);
         eprintln!(
             "gam#2156 {label} theta row={row} local_pos={local_pos} branch certificate: {theta_certificate:?}"
+        );
+        assert_branch_certificate_green_2156(
+            &format!("{label} theta row={row} local_pos={local_pos}"),
+            &theta_certificate,
         );
         let analytic = gamma.t[cache.row_offsets[row] + local_pos];
         let rel = relative_error_2156(dual, analytic);
@@ -1306,6 +1327,16 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
         "IBP parity fixture must exercise the low-rank metric and IBP Woodbury branch; \
          certificate={low_rank_certificate:?}"
     );
+    let ibp_theta_probes: Vec<(usize, usize)> = (0..ibp_cache.n_rows())
+        .flat_map(|row| (0..ibp_cache.row_dims[row]).map(move |local| (row, local)))
+        .collect();
+    let ibp_theta_max_rel = assert_dual_theta_logdet_parity_2156(
+        "low_rank_metric_ibp",
+        &ibp_term,
+        &ibp_rho,
+        &ibp_cache,
+        &ibp_theta_probes,
+    );
     let ibp_max_rel = assert_dual_rho_logdet_parity_2156(
         "low_rank_metric_ibp",
         &ibp_term,
@@ -1345,6 +1376,16 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
                 .any(|&flag| flag),
         "deflated parity fixture must exercise deflated rows; certificate={deflated_certificate:?}"
     );
+    let deflated_theta_probes: Vec<(usize, usize)> = (0..deflated_cache.n_rows())
+        .flat_map(|row| (0..deflated_cache.row_dims[row]).map(move |local| (row, local)))
+        .collect();
+    let deflated_theta_max_rel = assert_dual_theta_logdet_parity_2156(
+        "deflated_rows_ibp_theta",
+        &deflated_term,
+        &deflated_rho,
+        &deflated_cache,
+        &deflated_theta_probes,
+    );
     let deflated_ard_max_rel = assert_dual_ard_logdet_parity_2156(
         "deflated_rows_ard",
         &deflated_term,
@@ -1353,7 +1394,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     );
 
     eprintln!(
-        "gam#2156/#2144 dual logdet parity max_rel: softmax_theta={softmax_theta_max_rel:.3e}, softmax_rho={softmax_max_rel:.3e}, low_rank_metric_ibp_rho={ibp_max_rel:.3e}, deflated_ard={deflated_ard_max_rel:.3e}"
+        "gam#2156/#2144 dual logdet parity max_rel: softmax_theta={softmax_theta_max_rel:.3e}, softmax_rho={softmax_max_rel:.3e}, low_rank_metric_ibp_theta={ibp_theta_max_rel:.3e}, low_rank_metric_ibp_rho={ibp_max_rel:.3e}, deflated_ibp_theta={deflated_theta_max_rel:.3e}, deflated_ard={deflated_ard_max_rel:.3e}"
     );
 }
 

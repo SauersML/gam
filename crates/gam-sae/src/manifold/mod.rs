@@ -186,6 +186,7 @@ mod coordinate_fidelity;
 mod cross_fit;
 mod curl;
 mod derivative_oracle;
+mod dual;
 mod fit_drivers;
 mod gauge;
 mod graph_atom;

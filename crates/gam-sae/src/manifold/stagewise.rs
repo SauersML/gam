@@ -492,6 +492,12 @@ struct BirthSeed {
     circle_gate: Option<Vec<f64>>,
 }
 
+struct PendingIsaSeed {
+    seed: BirthSeed,
+    residual: Array2<f64>,
+    model: StructuredResidualModel,
+}
+
 fn template_accepts_circle_births(term: &SaeManifoldTerm) -> bool {
     term.atoms
         .first()
@@ -960,7 +966,7 @@ pub fn fit_stagewise(
 
     // ── Phase 1b — forward births ──────────────────────────────────────────────
     let mut birth_round = 0usize;
-    let mut pending_isa_seeds = std::collections::VecDeque::<BirthSeed>::new();
+    let mut pending_isa_seeds = std::collections::VecDeque::<PendingIsaSeed>::new();
     let stopped_reason = loop {
         // #2138 — bail before starting another birth round if the host cancelled.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -996,8 +1002,9 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        // Refit Σ on the current residual and install the whitened metric so the
-        // candidate fits run under the structured covariance from atom one.
+        // Prepare the residual metric for this birth. When a joint ISA split is
+        // queued, reuse that split's residual/model snapshot; otherwise fit Σ on
+        // the current residual before harvesting or falling through to factor seeds.
         emit_stagewise_progress(
             &mut progress,
             StagewiseProgress {
@@ -1019,34 +1026,33 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let Some((residual, model)) = fit_residual_covariance(&term, target, config)? else {
-            break StagewiseStop::NoResidualStructure;
-        };
-        // Primary: anchor-scored SHARED-factor birth seed. Fallback (#2080): when the
-        // factor model is rank-0 (block-diagonal DISJOINT residual — see
-        // `residual_principal_birth_candidate`) but the residual still carries
-        // above-noise variance, seed from its dominant principal direction so growth
-        // is not blocked at k=1 on the easy disjoint case. For ISA-certified circle
-        // residuals, capture the residual span once and queue every jointly-rotated
-        // plane; the serial loop consumes that queue one seed per birth round.
-        let seed = if let Some(seed) = pending_isa_seeds.pop_front() {
-            seed
+        // Certified circle residuals are harvested first: capture the residual span
+        // once, queue every jointly-rotated plane, and consume one seed per serial
+        // birth round. If no circle certifies, use the anchor-scored shared-factor
+        // seed, then the #2080 residual-principal rank-1 fallback.
+        let (seed, residual, model) = if let Some(pending) = pending_isa_seeds.pop_front() {
+            (pending.seed, pending.residual, pending.model)
         } else {
-            let shared_seed = top_factor_birth_decoder(&term, &model, residual.view());
-            if let Some(seed) = shared_seed {
-                seed
+            let Some((residual, model)) = fit_residual_covariance(&term, target, config)? else {
+                break StagewiseStop::NoResidualStructure;
+            };
+            let remaining = config.max_births.saturating_sub(births_accepted);
+            for seed in isa_birth_seed_batch(&term, residual.view(), remaining)? {
+                pending_isa_seeds.push_back(PendingIsaSeed {
+                    seed,
+                    residual: residual.clone(),
+                    model: model.clone(),
+                });
+            }
+            if let Some(pending) = pending_isa_seeds.pop_front() {
+                (pending.seed, pending.residual, pending.model)
             } else {
-                let remaining = config.max_births.saturating_sub(births_accepted);
-                for seed in isa_birth_seed_batch(&term, residual.view(), remaining)? {
-                    pending_isa_seeds.push_back(seed);
-                }
-                let Some(seed) = pending_isa_seeds
-                    .pop_front()
+                let Some(seed) = top_factor_birth_decoder(&term, &model, residual.view())
                     .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
                 else {
                     break StagewiseStop::NoResidualStructure;
                 };
-                seed
+                (seed, residual, model)
             }
         };
         let factor_energy = seed.energy;
