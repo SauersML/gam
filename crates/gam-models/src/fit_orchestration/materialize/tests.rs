@@ -692,6 +692,42 @@ fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispat
 }
 
 #[test]
+fn family_transformation_normal_routes_to_ctn_materializer() {
+    let data = workflow_test_dataset();
+    let config = FitConfig {
+        family: Some("transformation-normal".to_string()),
+        ..FitConfig::default()
+    };
+
+    let mat = materialize("bmi ~ s(age_entry, k=4)", &data, &config)
+        .expect("family='transformation-normal' must materialize as CTN");
+
+    assert!(
+        matches!(mat.request, FitRequest::TransformationNormal(_)),
+        "family='transformation-normal' must not silently fall through to a standard Gaussian GAM"
+    );
+}
+
+#[test]
+fn family_transformation_normal_uses_ctn_conflict_validation() {
+    let data = workflow_test_dataset();
+    let config = FitConfig {
+        family: Some("transformation_normal".to_string()),
+        noise_formula: Some("~ 1".to_string()),
+        ..FitConfig::default()
+    };
+
+    let err = materialize("bmi ~ s(age_entry, k=4)", &data, &config)
+        .expect_err("family='transformation-normal' must reject CTN-incompatible controls");
+
+    assert!(
+        err.to_string()
+            .contains("transformation_normal cannot be combined with noise_formula"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
     let mut data = workflow_test_dataset();
     data.values.column_mut(2).fill(0.0);
