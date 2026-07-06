@@ -4489,7 +4489,7 @@ fn default_duchon_center_count(
     polynomial_cols: usize,
     univariate_floor: usize,
 ) -> usize {
-    // Duchon fits pay a larger setup cost than Matérn/TPS because the
+    // #1757: Duchon fits pay a larger setup cost than Matérn/TPS because the
     // constrained radial block is rotated through its center Gram and several
     // operator-collocation penalties.  The old generic spatial default handed a
     // 2-D Gaussian Duchon at n≈500 more than one hundred centers, so cold fits
@@ -4850,6 +4850,37 @@ mod tests {
         // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
         // the generic n-scaling plan unchanged.
         assert_eq!(default_matern_center_count(200, 2, 40, 0), 40);
+    }
+
+    /// #1757 regression: an omitted `k=`/`centers=` on a 2-D Duchon smooth must
+    /// remain a low-rank representer basis. The generic spatial planner grows
+    /// with `n` (125 centers at n=500), which makes the Duchon center-Gram
+    /// rotation and REML linear algebra scale as dense `O(k^3)` setup work
+    /// before the data-fit iterations even start. The Duchon-specific default
+    /// caps the implicit basis at the thin-plate/Duchon spline rank
+    /// `10 * 3^(d - 1)` (30 in 2-D) while explicit `k=`/`centers=` still bypass
+    /// this helper upstream.
+    #[test]
+    fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
+        let n = 500usize;
+        let d = 2usize;
+        let polynomial_cols = d + 1;
+        let generic_plan = default_num_centers(n, d);
+        let duchon_default = default_duchon_center_count(n, d, generic_plan, polynomial_cols, 0);
+        let spline_rank = 10usize.saturating_mul(3usize.saturating_pow((d - 1) as u32));
+
+        assert!(
+            generic_plan > spline_rank,
+            "precondition: generic spatial plan should be wider than the Duchon low-rank spline rank"
+        );
+        assert_eq!(
+            duchon_default, spline_rank,
+            "2-D Duchon default must use the low-rank spline representer size, not the generic spatial width"
+        );
+        assert!(
+            duchon_default > polynomial_cols,
+            "the capped default must still contain the affine polynomial null space"
+        );
     }
 
     fn continuous_dataset(headers: &[&str], rows: Vec<Vec<f64>>) -> Dataset {
