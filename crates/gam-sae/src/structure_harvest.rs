@@ -336,6 +336,144 @@ fn dedup_most_suspect_per_parent(candidates: Vec<(usize, f64)>) -> Vec<(usize, f
     out
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChartGluePreScreen {
+    a: usize,
+    b: usize,
+    trigger: f64,
+}
+
+fn row_tangent(atom: &SaeManifoldAtom, row: usize) -> Array1<f64> {
+    let p = atom.decoder_coefficients.ncols();
+    let mut out = Array1::<f64>::zeros(p);
+    for basis in 0..atom.decoder_coefficients.nrows() {
+        let dphi = atom.basis_jacobian[[row, basis, 0]];
+        for col in 0..p {
+            out[col] += dphi * atom.decoder_coefficients[[basis, col]];
+        }
+    }
+    out
+}
+
+fn unit_or_none(mut v: Array1<f64>) -> Option<Array1<f64>> {
+    let n = v.dot(&v).sqrt();
+    if n <= f64::EPSILON.sqrt() {
+        return None;
+    }
+    v.mapv_inplace(|x| x / n);
+    Some(v)
+}
+
+/// Geometry/atlas fusion lane for over-tiled one-dimensional charts.
+///
+/// Co-activation is intentionally absent from this pre-screen: disjoint arc
+/// charts on the same manifold have anti-correlated supports, so the statistic
+/// that can see them is the residual-gauge one after #2022's unit-speed slice:
+/// adjacent latent supports whose seam tangents agree up to the residual
+/// orientation sign (`t ↦ ±t + c`).  The numerical equivalence band is the
+/// floating-point resolution of the already-canonical unit-speed gauge
+/// (`√ε`, the standard first-order roundoff scale), not a tuned modelling
+/// threshold; the held-out structure-evidence gate still owns acceptance.
+fn chart_gluing_prescreen(term: &SaeManifoldTerm) -> Vec<ChartGluePreScreen> {
+    let assignments = term.assignment.assignments();
+    let n = assignments.nrows();
+    let k = assignments.ncols();
+    if n == 0 || k < 2 {
+        return Vec::new();
+    }
+    let active_floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
+    let angle_band = f64::EPSILON.sqrt();
+    let mut out = Vec::new();
+    for a in 0..k {
+        let atom_a = &term.atoms[a];
+        if atom_a.latent_dim != 1 || atom_a.basis_kind != SaeAtomBasisKind::Periodic {
+            continue;
+        }
+        for b in (a + 1)..k {
+            let atom_b = &term.atoms[b];
+            if atom_b.latent_dim != 1 || atom_b.basis_kind != SaeAtomBasisKind::Periodic {
+                continue;
+            }
+            let mut a_rows = Vec::new();
+            let mut b_rows = Vec::new();
+            let mut coactive = false;
+            for r in 0..n {
+                let a_on = assignments[[r, a]] > active_floor;
+                let b_on = assignments[[r, b]] > active_floor;
+                if a_on {
+                    a_rows.push(r);
+                }
+                if b_on {
+                    b_rows.push(r);
+                }
+                coactive |= a_on && b_on;
+            }
+            // This lane is for the structurally blind case: chart tiles with
+            // disjoint supports. Overlapping duplicates remain the existing
+            // co-activation lane's responsibility.
+            if coactive || a_rows.is_empty() || b_rows.is_empty() {
+                continue;
+            }
+            let coords_a = &term.assignment.coords[a];
+            let coords_b = &term.assignment.coords[b];
+            let mut best_gap = f64::INFINITY;
+            let mut best = None;
+            for &ra in &a_rows {
+                for &rb in &b_rows {
+                    let gap = (coords_a.row(ra)[0] - coords_b.row(rb)[0]).abs();
+                    if gap < best_gap {
+                        best_gap = gap;
+                        best = Some((ra, rb));
+                    }
+                }
+            }
+            let Some((ra, rb)) = best else { continue };
+            let Some(ta) = unit_or_none(row_tangent(atom_a, ra)) else {
+                continue;
+            };
+            let Some(tb) = unit_or_none(row_tangent(atom_b, rb)) else {
+                continue;
+            };
+            let cos = ta.dot(&tb).abs().min(1.0);
+            let sin_principal_angle = (1.0 - cos * cos).max(0.0).sqrt();
+            if sin_principal_angle > angle_band {
+                continue;
+            }
+            // Adjacent support is measured by the nearest cross-support seam
+            // relative to empirical within-chart spacing. With singleton
+            // supports the spacing is exactly the observed seam gap, so no
+            // arbitrary minimum row count is introduced.
+            let span_scale =
+                |rows: &[usize], coords: &gam_terms::latent::LatentCoordValues| -> f64 {
+                    let mut vals: Vec<f64> = rows.iter().map(|&r| coords.row(r)[0]).collect();
+                    vals.sort_by(f64::total_cmp);
+                    vals.windows(2)
+                        .map(|w| w[1] - w[0])
+                        .filter(|d| *d > 0.0)
+                        .fold(best_gap, f64::max)
+                };
+            let scale = span_scale(&a_rows, coords_a)
+                .max(span_scale(&b_rows, coords_b))
+                .max(f64::EPSILON.sqrt());
+            if best_gap > scale {
+                continue;
+            }
+            out.push(ChartGluePreScreen {
+                a,
+                b,
+                trigger: 1.0 / (angle_band + sin_principal_angle + best_gap / scale),
+            });
+        }
+    }
+    out.sort_by(|x, y| {
+        y.trigger
+            .total_cmp(&x.trigger)
+            .then(x.a.cmp(&y.a))
+            .then(x.b.cmp(&y.b))
+    });
+    out
+}
+
 /// Structural tag for an atom basis kind — the discrete shape identity the
 /// structural hash needs (never coordinates or coefficients).
 fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
@@ -497,6 +635,28 @@ pub fn harvest_move_proposals(
     fusion_pairs.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1)));
     for &(a, b, z) in fusion_pairs.iter().take(params.max_fusions) {
         proposals.push(proposal(term, StructureMove::Fusion { a, b }, z));
+    }
+
+    // --- Fusions: chart-gluing lane for disjoint over-tiling ---------------
+    // This second lane prices the discrete residual-gauge redundancy that the
+    // co-activation statistic cannot observe: adjacent unit-speed charts whose
+    // seam frames are the same up to the residual orientation sign. Canonical
+    // ordering and the downstream structure hash keep duplicate proposals
+    // harmless if both lanes nominate the same pair.
+    let coactivation_fusion_keys: std::collections::HashSet<(usize, usize)> = fusion_pairs
+        .iter()
+        .map(|(a, b, _)| ((*a).min(*b), (*a).max(*b)))
+        .collect();
+    for g in chart_gluing_prescreen(term)
+        .into_iter()
+        .filter(|g| !coactivation_fusion_keys.contains(&(g.a, g.b)))
+        .take(params.max_fusions)
+    {
+        proposals.push(proposal(
+            term,
+            StructureMove::Fusion { a: g.a, b: g.b },
+            g.trigger,
+        ));
     }
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
@@ -3321,12 +3481,15 @@ mod tests {
         assert!(kinds.contains(&AutoTopologyKind::Euclidean), "{kinds:?}");
         // No key collision: each promoted kind appears once.
         assert_eq!(kinds.len(), promoted.len());
-        let expected_radial = standardized_log_birth_amplitudes(birth_row_amplitudes(disk.view()).view())
-            .expect("disk log-amplitude spread");
-        for spec in promoted
-            .iter()
-            .filter(|spec| matches!(spec.kind, AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean))
-        {
+        let expected_radial =
+            standardized_log_birth_amplitudes(birth_row_amplitudes(disk.view()).view())
+                .expect("disk log-amplitude spread");
+        for spec in promoted.iter().filter(|spec| {
+            matches!(
+                spec.kind,
+                AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean
+            )
+        }) {
             for row in 0..n {
                 assert!(
                     (spec.coords[[row, 1]] - expected_radial[row]).abs() < 1.0e-12,
@@ -3550,6 +3713,43 @@ mod tests {
         // residuals for the birth channel.
         let fitted = term.try_fitted().unwrap();
         -&fitted
+    }
+
+    #[test]
+    fn chart_gluing_prescreen_finds_disjoint_arc_tiles_without_coactivation() {
+        let n = 16;
+        let active: Vec<Vec<bool>> = (0..n).map(|r| vec![r < n / 2, r >= n / 2]).collect();
+        let (mut term, rho) = planted_term(&active);
+        term.atoms[1].decoder_coefficients = term.atoms[0].decoder_coefficients.clone();
+
+        let coactive = sparse_codes_from_term(&term).coactive_pair_stats();
+        assert!(
+            coactive.is_empty(),
+            "the planted chart tiles have disjoint supports, so the co-activation lane is structurally blind"
+        );
+
+        let glued = chart_gluing_prescreen(&term);
+        assert_eq!(glued.len(), 1, "one adjacent same-frame chart seam");
+        assert_eq!((glued[0].a, glued[0].b), (0, 1));
+
+        let report = harvest_move_proposals(
+            &term,
+            &rho,
+            residuals_of(&term).view(),
+            &HarvestParams {
+                max_fusions: 1,
+                max_fissions: 0,
+                max_births: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            report
+                .proposals
+                .iter()
+                .any(|p| matches!(p.mv, StructureMove::Fusion { a: 0, b: 1 })),
+            "the chart-gluing lane must propose the fusion that co-activation cannot see"
+        );
     }
 
     /// #977 discovery oracle: with the production birth budget enabled, a fit
@@ -5083,10 +5283,6 @@ mod tests {
         });
         let flatten = crate::manifold::flatten_verdict(radii.view(), angles.view()).unwrap();
         assert!(flatten.recommend_flatten, "diameter must flatten");
-        assert_eq!(
-            flatten.residual_rank, 1,
-            "diameter must flatten to rank 1"
-        );
+        assert_eq!(flatten.residual_rank, 1, "diameter must flatten to rank 1");
     }
-
 }
