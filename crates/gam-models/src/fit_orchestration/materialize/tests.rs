@@ -692,6 +692,37 @@ fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispat
 }
 
 #[test]
+fn bernoulli_marginal_slope_ctn_stage1_recipe_only_dispatches_to_bms_issue_2139() {
+    let data = workflow_test_dataset();
+    let recipe = CtnStage1Recipe::new(
+        "z",
+        "bmi",
+        TransformationNormalConfig::default(),
+        None,
+        None,
+    )
+    .expect("valid CTN Stage-1 recipe");
+    let config = FitConfig {
+        family: Some("bernoulli-marginal-slope".to_string()),
+        ctn_stage1: Some(recipe),
+        ..FitConfig::default()
+    };
+
+    let err = materialize("event ~ bmi", &data, &config)
+        .err()
+        .expect("recipe-only BMS request should reach BMS validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Bernoulli marginal-slope requires logslope_formula"),
+        "recipe-only BMS request should fail with BMS-specific validation, got: {msg}"
+    );
+    assert!(
+        !msg.contains("unknown family"),
+        "family=bernoulli-marginal-slope with ctn_stage1 must not fall through to standard-family dispatch: {msg}"
+    );
+}
+
+#[test]
 fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
     let mut data = workflow_test_dataset();
     data.values.column_mut(2).fill(0.0);
