@@ -1584,6 +1584,56 @@ pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, S
     (term, target, rho)
 }
 
+/// #Bug4 — the ThresholdGate θ-adjoint prior THIRD derivative
+/// (`assignment_prior_hdiag_derivative_entry`) must be ZERO for a FIXED
+/// (ungated / frozen) logit, matching the zeroed assembled `htt` diagonal entry.
+/// A FREE logit inside the smoothing/optimization band carries a nonzero third
+/// derivative (non-vacuous fixture); the ungated atom's must be exactly zero.
+#[test]
+pub(crate) fn threshold_gate_fixed_logit_third_derivative_is_zero_bug4() {
+    use crate::manifold::arrow_solver::SaeLocalRowVar;
+    let (mut term, _target, rho) = small_two_atom_periodic_term();
+    // ThresholdGate mode with atom 1 UNGATED — a fixed/inert logit.
+    term.assignment.mode = AssignmentMode::threshold_gate(1.0, 0.0);
+    term.assignment.ungated = vec![false, true];
+    // Both atoms' logits well inside the optimization band (cutoff is −36), so a
+    // FREE logit genuinely carries a nonzero third derivative.
+    for row in 0..term.n_obs() {
+        term.assignment.logits[[row, 0]] = 0.5;
+        term.assignment.logits[[row, 1]] = 0.5;
+    }
+    assert!(
+        term.assignment.logit_is_fixed(1) && !term.assignment.logit_is_fixed(0),
+        "atom 1 must be fixed (ungated), atom 0 free"
+    );
+
+    // FREE atom 0 inside the band ⇒ nonzero third derivative (fixture is live).
+    let free = term.assignment_prior_hdiag_derivative_entry(
+        &rho,
+        0,
+        0,
+        SaeLocalRowVar::Logit { atom: 0 },
+        None,
+    );
+    assert!(
+        free.abs() > 0.0,
+        "a FREE logit inside the band must carry a nonzero third derivative; got {free}"
+    );
+
+    // FIXED atom 1 ⇒ the θ-adjoint third derivative MUST be exactly zero.
+    let fixed = term.assignment_prior_hdiag_derivative_entry(
+        &rho,
+        0,
+        1,
+        SaeLocalRowVar::Logit { atom: 1 },
+        None,
+    );
+    assert_eq!(
+        fixed, 0.0,
+        "a FIXED (ungated) logit third derivative must be zero; got {fixed}"
+    );
+}
+
 /// #1026 — the per-atom **held-out EV attribution** that pairs with each
 /// atom's fitted turning `Θ` to form the EV-vs-Θ discriminating signal.
 ///

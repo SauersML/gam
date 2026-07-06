@@ -7513,6 +7513,14 @@ impl SaeManifoldTerm {
                 let mut contribution = 0.0_f64;
                 match *var {
                     SaeLocalRowVar::Logit { atom } => {
+                        // #Bug4: a FIXED logit (ungated atom, or every atom under
+                        // frozen routing) is not a free Newton parameter — its
+                        // assembled gradient/Hessian slots are zeroed — so the
+                        // log-α × logit data mixed derivative on that slot must be
+                        // zero too. Skip it (leave `contribution == 0`).
+                        if self.assignment.logit_is_fixed(atom) {
+                            continue;
+                        }
                         let sigma = assignments[atom] / prior[atom];
                         let sigma_jac = sigma * (1.0 - sigma) * inv_tau;
                         let da_dl = sigma_jac * prior[atom];

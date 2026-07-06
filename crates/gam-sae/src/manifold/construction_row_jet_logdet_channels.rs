@@ -10,7 +10,7 @@
 // the same `impl SaeManifoldTerm` surface, and full private-field access.
 
 impl SaeManifoldTerm {
-    fn reconstruction_row_program_for_logdet(
+    pub(crate) fn reconstruction_row_program_for_logdet(
         &self,
         rho: &SaeManifoldRho,
         row: usize,

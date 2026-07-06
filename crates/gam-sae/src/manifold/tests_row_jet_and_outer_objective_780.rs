@@ -378,3 +378,168 @@ pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
     let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
     assert_eq!(obj.capability().gradient, Derivative::Analytic);
 }
+
+/// A trivial n=1, K=2, IBP-MAP term whose atoms carry a single basis function
+/// with a KNOWN value / jacobian / decoder so the reconstruction row program's
+/// value and first-derivative channels are hand-computable. Atom `k` has
+/// `decoded_k = phi_k·dec_k`, `d(decoded_k)/dt = dphi_k·dec_k`. Used to pin the
+/// #1026/#1033 fixed-gate handling in `reconstruction_row_program_for_logdet`.
+fn fixed_gate_probe_term() -> (SaeManifoldTerm, SaeManifoldRho) {
+    use ndarray::{Array1, Array2, Array3};
+    let (n, m, p) = (1usize, 1usize, 1usize);
+    let mk_atom = |name: &str, phi: f64, dphi: f64, dec: f64| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            Array2::from_shape_vec((n, m), vec![phi]).unwrap(),
+            Array3::from_shape_vec((n, m, 1), vec![dphi]).unwrap(),
+            Array2::from_shape_vec((m, p), vec![dec]).unwrap(),
+            Array2::from_shape_vec((m, m), vec![1.0]).unwrap(),
+        )
+        .unwrap()
+    };
+    let atoms = vec![mk_atom("a0", 1.0, 2.0, 1.5), mk_atom("a1", 1.0, 0.5, -0.8)];
+    // Free logits are set to an EXTREME value so any leakage of the free-logit
+    // gate into the (frozen / ungated) fixed path is loud.
+    let logits = Array2::from_shape_vec((n, 2), vec![5.0, -5.0]).unwrap();
+    let coords = vec![
+        Array2::from_shape_vec((n, 1), vec![0.15]).unwrap(),
+        Array2::from_shape_vec((n, 1), vec![0.35]).unwrap(),
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coords,
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::ibp_map(0.8, 1.8, false),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    let rho = SaeManifoldRho::new(
+        0.0,
+        0.0,
+        vec![Array1::from_vec(vec![0.0]), Array1::from_vec(vec![0.0])],
+    );
+    (term, rho)
+}
+
+/// #1033 FROZEN-routing regression: with the free logits at one extreme and the
+/// FROZEN (amortized) logits at the opposite extreme, the row reconstruction
+/// program must gate on the FROZEN routing — every gate is pinned to the active
+/// routing value with an EXACTLY-ZERO logit derivative — and its `logits` field
+/// must read the frozen (not the free) logits. The coordinate derivatives use
+/// the frozen gate, never the stale free-logit gate.
+#[test]
+pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
+    use ndarray::{Array1, Array4};
+    let (mut term, rho) = fixed_gate_probe_term();
+    // Frozen routing = OPPOSITE extreme of the free logits [5, -5].
+    let frozen = ndarray::Array2::from_shape_vec((1, 2), vec![-5.0, 5.0]).unwrap();
+    term.assignment
+        .set_frozen_routing_in_place(frozen.clone())
+        .expect("install frozen routing");
+    assert!(term.assignment.routing_is_frozen());
+    for k in 0..2 {
+        assert!(term.assignment.logit_is_fixed(k), "frozen ⇒ atom {k} fixed");
+    }
+
+    // The active routing gate values the assembly used (arbitrary but distinct;
+    // deliberately NOT what either logit would produce, to prove the program
+    // adopts them verbatim as constant gates).
+    let assignments = Array1::from_vec(vec![0.2_f64, 0.9_f64]);
+    // Layout: logit slots 0,1; coord slots 2,3.
+    let vars = vec![
+        SaeLocalRowVar::Logit { atom: 0 },
+        SaeLocalRowVar::Logit { atom: 1 },
+        SaeLocalRowVar::Coord { atom: 0, axis: 0 },
+        SaeLocalRowVar::Coord { atom: 1, axis: 0 },
+    ];
+    let second_jets = vec![Array4::<f64>::zeros((1, 1, 1, 1)); 2];
+    let prog = term
+        .reconstruction_row_program_for_logdet(&rho, 0, &vars, assignments.view(), &second_jets)
+        .expect("row program");
+
+    // The program reads the FROZEN logits, not the free ones.
+    assert_eq!(prog.logits, vec![-5.0, 5.0], "must read frozen logits");
+    // Every atom is a FIXED gate equal to the active routing value.
+    assert_eq!(
+        prog.fixed_gate_value,
+        vec![Some(0.2), Some(0.9)],
+        "frozen ⇒ all gates pinned to the active routing value"
+    );
+
+    let col = prog.reconstruction_column::<4>(0);
+    // Logit-slot derivatives are exactly zero (gates are frozen constants).
+    assert_eq!(col.g[0], 0.0, "frozen atom-0 logit derivative must be 0");
+    assert_eq!(col.g[1], 0.0, "frozen atom-1 logit derivative must be 0");
+    // Coordinate derivatives use the FROZEN gate value: g[coord_k] = a_k·dphi_k·dec_k.
+    assert!(
+        (col.g[2] - 0.2 * (2.0 * 1.5)).abs() < 1e-12,
+        "atom-0 coord derivative must use frozen gate 0.2: {}",
+        col.g[2]
+    );
+    assert!(
+        (col.g[3] - 0.9 * (0.5 * -0.8)).abs() < 1e-12,
+        "atom-1 coord derivative must use frozen gate 0.9: {}",
+        col.g[3]
+    );
+    // Value = Σ a_k·phi_k·dec_k with the frozen gates.
+    let expected_v = 0.2 * 1.5 + 0.9 * -0.8;
+    assert!((col.v - expected_v).abs() < 1e-12, "frozen reconstruction value");
+}
+
+/// #1026 UNGATED-atom regression: an ungated atom's gate is pinned at 1.0 with a
+/// zero logit derivative (its coordinate derivative uses gate 1.0), while a
+/// sibling GATED atom keeps its free-logit gate and a nonzero logit derivative.
+#[test]
+pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative() {
+    use ndarray::{Array1, Array4};
+    let (mut term, rho) = fixed_gate_probe_term();
+    // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. IBP-MAP
+    // accepts ungated atoms (only Softmax rejects them; see `with_ungated`).
+    term.assignment.ungated = vec![true, false];
+    assert!(!term.assignment.routing_is_frozen());
+    assert!(term.assignment.logit_is_fixed(0), "ungated atom-0 is fixed");
+    assert!(!term.assignment.logit_is_fixed(1), "gated atom-1 is free");
+
+    // Ungated atom's active gate is pinned at 1.0; atom 1's is an arbitrary free
+    // value (its exact number does not matter to this test — only that it moves).
+    let assignments = Array1::from_vec(vec![1.0_f64, 0.6_f64]);
+    let vars = vec![
+        SaeLocalRowVar::Logit { atom: 0 },
+        SaeLocalRowVar::Logit { atom: 1 },
+        SaeLocalRowVar::Coord { atom: 0, axis: 0 },
+        SaeLocalRowVar::Coord { atom: 1, axis: 0 },
+    ];
+    let second_jets = vec![Array4::<f64>::zeros((1, 1, 1, 1)); 2];
+    let prog = term
+        .reconstruction_row_program_for_logdet(&rho, 0, &vars, assignments.view(), &second_jets)
+        .expect("row program");
+
+    // Not frozen ⇒ the program reads the FREE logits; only the ungated atom is a
+    // fixed (unit) gate.
+    assert_eq!(prog.logits, vec![5.0, -5.0], "unfrozen ⇒ reads free logits");
+    assert_eq!(
+        prog.fixed_gate_value,
+        vec![Some(1.0), None],
+        "only the ungated atom carries a fixed (unit) gate"
+    );
+
+    let col = prog.reconstruction_column::<4>(0);
+    // Ungated atom: zero logit derivative, coord derivative at gate 1.0.
+    assert_eq!(col.g[0], 0.0, "ungated atom logit derivative must be exactly 0");
+    assert!(
+        (col.g[2] - 1.0 * (2.0 * 1.5)).abs() < 1e-12,
+        "ungated atom coord derivative must use gate 1.0: {}",
+        col.g[2]
+    );
+    // Gated sibling atom: its logit still moves the reconstruction.
+    assert!(
+        col.g[1].abs() > 1e-9,
+        "gated atom-1 logit derivative must be nonzero: {}",
+        col.g[1]
+    );
+}

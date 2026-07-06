@@ -1791,11 +1791,16 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
         } => {
             let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
-            penalty
+            let mut d = penalty
                 .hessian_diag(target.view(), rho_view.view())
                 .ok_or_else(|| {
                     "softmax assignment log-strength hessian diag unavailable".to_string()
-                })
+                })?;
+            // #Bug4: the softmax array method is not internally column-masked, so
+            // zero any fixed-logit (ungated) column's curvature diagonal to match
+            // `assignment_prior_grad_hdiag`'s post-hoc masking.
+            mask_fixed_logit_entries(assignment, &mut d);
+            Ok(d)
         }
         AssignmentMode::ThresholdGate {
             temperature,
