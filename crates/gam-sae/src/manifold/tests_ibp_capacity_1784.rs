@@ -19,7 +19,10 @@
 //! few MB under the RAM-tight shared build gate.
 
 use super::*;
-use crate::assignment::{default_ibp_concentration_for_k_atoms, ordered_geometric_shrinkage_prior};
+use crate::assignment::{
+    AssignmentModeRequest, admit_assignment_mode_for_size, default_ibp_concentration_for_k_atoms,
+    ordered_geometric_shrinkage_prior,
+};
 use crate::basis::PeriodicHarmonicEvaluator;
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
 use gam_terms::dictionary::{LinearDictionaryConfig, fit_linear_dictionary};
@@ -246,4 +249,63 @@ fn ibp_k_aware_prior_keeps_all_128_atoms_alive_1784() {
         "K-aware prior head/tail span must be <= ~e (got {:.3})",
         prior[0] / prior[k - 1]
     );
+}
+
+#[test]
+fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ibp() {
+    let n = 300_000usize;
+    let k = 32_768usize;
+    let admitted =
+        admit_assignment_mode_for_size(AssignmentModeRequest::Default, n, k, 1.0, 1.0, false, 0.0)
+            .expect("default admission");
+    assert!(
+        matches!(admitted.mode, AssignmentMode::Softmax { .. }),
+        "default admission must choose the top-k softmax lane at large K, got {:?}",
+        admitted.mode
+    );
+    assert_eq!(
+        admitted.top_k,
+        Some(n.div_ceil(k)),
+        "large-K default cap must be derived from rows per atom"
+    );
+
+    let explicit_ibp =
+        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 1.0, 1.0, false, 0.0);
+    assert!(
+        explicit_ibp.is_err(),
+        "IBP-MAP must be refused once large-K top-k admission engages"
+    );
+}
+
+#[test]
+fn ibp_mode_admission_requires_explicit_small_fit_request() {
+    let n = 4096usize;
+    let k = 32usize;
+    let default_admitted =
+        admit_assignment_mode_for_size(AssignmentModeRequest::Default, n, k, 0.7, 1.0, false, 0.0)
+            .expect("default small-fit admission");
+    assert!(
+        matches!(default_admitted.mode, AssignmentMode::Softmax { .. }),
+        "default small-fit admission must still avoid implicit IBP-MAP"
+    );
+    assert_eq!(
+        default_admitted.top_k, None,
+        "small fit should keep dense softmax unless a caller supplies a cap"
+    );
+
+    let ibp =
+        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 0.7, 1.3, true, 0.0)
+            .expect("explicit small-fit IBP admission");
+    assert!(
+        matches!(
+            ibp.mode,
+            AssignmentMode::IBPMap {
+                alpha,
+                learnable_alpha: true,
+                ..
+            } if (alpha - 1.3).abs() < 1.0e-12
+        ),
+        "IBP-MAP is admitted only for the explicit small-fit request"
+    );
+    assert_eq!(ibp.top_k, None);
 }
