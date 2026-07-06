@@ -2087,6 +2087,94 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_low_rank_metric_2144
     }
 }
 
+/// gam#2144 — the log-det row jets must be whitened whenever the metric
+/// `whitens_likelihood()` at ANY rank, not only when rank-deficient. The
+/// arrow-Schur assembly builds the likelihood Hessian from whitened Jacobians
+/// (`Jᵀ U Uᵀ J`) under any whitening factor, so a FULL-RANK non-identity factor
+/// (here `diag(1, 2, 1.5)`, `rank == p == 3`) rescales the output-space
+/// derivatives just like a low-rank sketch does. The pre-fix code gated jet
+/// whitening on `ibp_low_rank_whiten()` (`whitens_likelihood && rank < p`), so
+/// full-rank whitening left the row jets in RAW output space — differentiating
+/// `JᵀJ` against an assembled `Jᵀ U Uᵀ J`. This pins the production
+/// `logdet_theta_adjoint` against a fixed-state central difference of the
+/// authoritative whitened joint `log|H|`; the unpatched (identity-on-the-jet)
+/// path fails it.
+#[test]
+pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144() {
+    use gam_problem::RowMetric;
+    use std::sync::Arc;
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    let n = term.n_obs();
+    let p = term.output_dim();
+    // Full-rank (rank == p) DIAGONAL non-identity whitening factor U = diag(d).
+    // M_n = U Uᵀ = diag(d²) is genuinely non-identity, so the whitened Jacobian
+    // Jᵀ U Uᵀ J ≠ JᵀJ, yet the metric has NO null space — `ibp_low_rank_whiten()`
+    // is false while `whiten_logdet_row_jets()` is true.
+    let d = [1.0_f64, 2.0, 1.5];
+    assert_eq!(p, d.len(), "diagonal whitening factor width must equal p");
+    let s = p;
+    let mut u = Array2::<f64>::zeros((n, p * s));
+    for row in 0..n {
+        for i in 0..p {
+            u[[row, i * s + i]] = d[i];
+        }
+    }
+    term.set_row_metric(RowMetric::behavioral_fisher(Arc::new(u), p, s).unwrap())
+        .unwrap();
+    assert!(
+        term.whiten_logdet_row_jets(),
+        "full-rank whitening metric must whiten the log-det row jets"
+    );
+    assert!(
+        !term.ibp_low_rank_whiten(),
+        "rank-{s} == p={p} metric must NOT engage the low-rank IBP majorizer"
+    );
+    rho.log_lambda_sparse = 0.5;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged full-rank whitened cache");
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let gamma = term
+        .logdet_theta_adjoint(&rho, &cache, &solver)
+        .expect("Gamma");
+    let h = 1.0e-5;
+    let probes_idx = [
+        (0usize, 0usize, SaeLocalRowVar::Logit { atom: 0 }),
+        (4usize, 1usize, SaeLocalRowVar::Logit { atom: 1 }),
+        (1usize, 2usize, SaeLocalRowVar::Coord { atom: 0, axis: 0 }),
+        (6usize, 3usize, SaeLocalRowVar::Coord { atom: 1, axis: 0 }),
+    ];
+    for (row, local_pos, var) in probes_idx {
+        let mut plus = term.clone();
+        let mut minus = term.clone();
+        match var {
+            SaeLocalRowVar::Logit { atom } => {
+                plus.assignment.logits[[row, atom]] += h;
+                minus.assignment.logits[[row, atom]] -= h;
+            }
+            SaeLocalRowVar::Coord { atom, axis } => {
+                let mut flat_p = plus.assignment.coords[atom].as_flat().clone();
+                let mut flat_m = minus.assignment.coords[atom].as_flat().clone();
+                let idx = row * plus.assignment.coords[atom].latent_dim() + axis;
+                flat_p[idx] += h;
+                flat_m[idx] -= h;
+                plus.assignment.coords[atom].set_flat(flat_p.view());
+                minus.assignment.coords[atom].set_flat(flat_m.view());
+            }
+        }
+        let fd = (fixed_state_logdet(plus, &target, &rho)
+            - fixed_state_logdet(minus, &target, &rho))
+            / (2.0 * h);
+        let analytic = gamma.t[cache.row_offsets[row] + local_pos];
+        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
+        assert!(
+            (fd - analytic).abs() <= tol,
+            "full-rank whitened Gamma row={row} local_pos={local_pos}: fd={fd:.8e}, analytic={analytic:.8e}"
+        );
+    }
+}
+
 /// #1416 — the IBP fixed-alpha `ρ_sparse`-trace `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` must
 /// include the FULL cross-row off-diagonal of the rank-one Woodbury source, not
 /// just the diagonal. Under IBP-MAP the per-column empirical-mass `M_k` couples
