@@ -3921,8 +3921,57 @@ fn sae_manifold_fit_inner<'py>(
     // joint-Hessian seed bands are kept (higher quality than the per-atom Laplace
     // approximation).
     if structure_changed || finalization_invalidated_shape_uncertainty {
-        shape_uncertainty.invalidate_bands_for_recompute();
+        // The pre-search `shape_uncertainty` was read off the JOINT-Hessian Schur
+        // factor of the SEED dictionary at the pre-search ρ. A structure move (K
+        // grew / the whole dictionary re-converged at a new ρ) or a finalization
+        // fallback (settled-basin swap / chart canonicalization) makes those bands
+        // stale. Rebuild the JOINT inverse-Hessian bands from the FINAL term + ρ so
+        // the returned band is the documented joint decoder covariance — carrying
+        // the cross-atom covariance and decoder-coordinate Schur couplings, with a
+        // genuine per-output-channel SD — for EVERY atom, seed and born. This
+        // replaces the former per-atom-inner-Hessian recompute, which dropped those
+        // couplings and reported one identical SD across all channels.
+        let joint_registry = build_analytic_penalty_registry_from_json(
+            Some(&latent_payload),
+            analytic_penalties.as_ref(),
+        )
+        .map_err(py_value_error)?;
+        match term.recompute_joint_shape_uncertainty(
+            z_view.view(),
+            &rho,
+            Some(&joint_registry),
+            max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        ) {
+            Ok(joint) => {
+                shape_uncertainty = joint;
+                // The certificate dispersion was seeded from the (now stale)
+                // pre-search φ̂; refresh it to the joint recompute's final value.
+                term.set_certificate_dispersion(shape_uncertainty.dispersion)
+                    .map_err(py_value_error)?;
+            }
+            Err(e) => {
+                // The joint factor could not be reformed at the final state (a
+                // non-PD post-search Hessian / an unadmitted dense Schur). Fall
+                // back to the per-atom Laplace completion: invalidate the stale
+                // joint bands so `complete_born_atom_shape_bands` refills each from
+                // its OWN penalized inner Hessian. That band is a per-atom MARGINAL
+                // (documented as such) — honest, never fabricated — not the joint
+                // covariance; the log line records the degradation.
+                log::warn!(
+                    "[shape-uncertainty] joint band recompute after structure/finalization \
+                     change failed ({e}); falling back to per-atom Laplace bands"
+                );
+                shape_uncertainty.invalidate_bands_for_recompute();
+            }
+        }
     }
+    // Backstop: fill any atom the joint factor left unidentified (all-NaN) — a
+    // structure-search-born atom the pre-search Schur never covered, or a
+    // degenerate joint block — from its own inner Hessian. A no-op after a
+    // successful joint recompute (every covered atom already has a finite band).
     term.complete_born_atom_shape_bands(&mut shape_uncertainty)
         .map_err(py_value_error)?;
 

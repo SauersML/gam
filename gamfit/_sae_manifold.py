@@ -121,6 +121,27 @@ def _sae_fit_admission(n_obs: int, output_dim: int, n_atoms: int) -> dict[str, A
     )
 
 
+def _sae_manifold_reconstruct_native(
+    atom_basis: list[str],
+    atom_dims: list[int],
+    decoder_blocks: list[np.ndarray],
+    coords: list[np.ndarray],
+    assignments: np.ndarray,
+    p_out: int,
+) -> np.ndarray:
+    return np.ascontiguousarray(
+        rust_module().sae_manifold_reconstruct_ffi(
+            list(atom_basis),
+            [int(dim) for dim in atom_dims],
+            [np.ascontiguousarray(block, dtype=np.float64) for block in decoder_blocks],
+            [np.ascontiguousarray(coord, dtype=np.float64) for coord in coords],
+            np.ascontiguousarray(assignments, dtype=np.float64),
+            int(p_out),
+        ),
+        dtype=np.float64,
+    )
+
+
 def _lazy_getattr(owner: Any, lazy_names: set[str], name: str) -> Any:
     if name in lazy_names:
         try:
@@ -1620,7 +1641,8 @@ class ManifoldSAE:
 
         The original input matrix is not retained on fitted results. This method
         rebuilds the fitted dense array from the per-atom coordinates, assignment
-        codes, and decoder blocks only when a caller explicitly requests it.
+        codes, and decoder blocks through the Rust reconstruction kernel only
+        when a caller explicitly requests it.
         """
         assignments = np.asarray(self.assignments, dtype=np.float64)
         if assignments.ndim != 2:
@@ -1632,23 +1654,14 @@ class ManifoldSAE:
                 f"{len(self.decoder_blocks)}"
             )
         p_out = int(self.fitted.shape[1]) if k_atoms == 0 else int(self.decoder_blocks[0].shape[1])
-        out = np.zeros((n_rows, p_out), dtype=np.float64)
-        for atom_idx in range(k_atoms):
-            coords = np.asarray(self.coords[atom_idx], dtype=np.float64)
-            decoder = np.asarray(self.decoder_blocks[atom_idx], dtype=np.float64)
-            phi, _jet, _penalty = _basis_with_jet_for_atom(
-                self.atom_topologies[atom_idx],
-                coords,
-                int(decoder.shape[0]),
-                int(self._atom_dims[atom_idx]),
-            )
-            if phi.shape[1] != decoder.shape[0]:
-                raise ValueError(
-                    f"atom {atom_idx} basis width {phi.shape[1]} does not match "
-                    f"decoder rows {decoder.shape[0]}"
-                )
-            out += assignments[:, atom_idx : atom_idx + 1] * (phi @ decoder)
-        return out
+        return _sae_manifold_reconstruct_native(
+            list(self._basis_kinds),
+            [int(dim) for dim in self._atom_dims],
+            [np.asarray(block, dtype=np.float64) for block in self.decoder_blocks],
+            [np.asarray(coord, dtype=np.float64) for coord in self.coords],
+            assignments,
+            p_out,
+        )
 
     def predict(self, X: Any) -> np.ndarray:
         return self.reconstruct(X)
@@ -2429,6 +2442,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      ibp_alpha: float | None = None,
                      structured_residual_passes: int = 0,
                      promote_from_residual: bool = False,
+                     score_mode: str = "auto",
                      _run_structure_search: bool = True,
                      _run_outer_rho_search: bool = True) -> ManifoldSAE:
     """Fit an SAE-manifold model.
@@ -2563,6 +2577,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         residual passes are promoted into the primary atom tier rather than kept
         as a secondary residual dictionary. Only meaningful when
         ``structured_residual_passes > 0``. Coerced to ``bool``.
+    score_mode
+        Sparse front-door routing residency for the collapsed sparse-code lane.
+        ``"auto"`` (default) uses CUDA only when admitted and otherwise runs the
+        exact CPU router; ``"required"`` preserves fail-closed GPU residency;
+        ``"off"`` is CPU-only.
     learning_rate
         Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
         ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU.
@@ -3003,7 +3022,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             k_atoms,
             active=sparse_active,
             max_epochs=max_iter_total,
-            score_mode="required",
+            score_mode=str(score_mode),
         )
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
@@ -3207,32 +3226,37 @@ class StagewiseSAE:
         """Number of atoms in the composed dictionary."""
         return len(self.atoms)
 
-    def _atom_reconstructions(self) -> list[np.ndarray]:
-        """Per-atom gated reconstructions ``a_k · (Φ_k B_k)`` over the target.
-
-        Applies each fitted decoder through the Rust ``basis_with_jet`` kernel at
-        the atom's recovered coordinates and scales by its returned gate. This is
-        decoder application (linear algebra), not model fitting — the Rust core
-        owns every coefficient; here we only evaluate them.
-        """
-        recons: list[np.ndarray] = []
-        for atom in self.atoms:
-            phi, _jet, _pen = _basis_with_jet_for_atom(
-                atom.topology, atom.coords, int(atom.decoder.shape[0]), atom.latent_dim
-            )
-            curve = phi @ atom.decoder
-            recons.append(atom.assignments[:, None] * curve)
-        return recons
-
     def _in_sample_reconstruction(self) -> np.ndarray:
         """Composed reconstruction ``Σ_k a_k · (Φ_k B_k)`` of the training target.
 
-        The atoms carry their converged coordinates/gates, so this is the exact
-        in-sample reconstruction the SAC fit produced. Returns ``(N, p)``.
+        The atoms carry their converged coordinates/gates; Rust evaluates the
+        bases, applies the decoders, and sums the gated atom contributions.
+        Returns ``(N, p)``.
         """
         if not self.atoms:
             return np.zeros_like(self.training_data, dtype=np.float64)
-        return np.sum(self._atom_reconstructions(), axis=0)
+        decoder_blocks = [
+            np.asarray(atom.decoder, dtype=np.float64) for atom in self.atoms
+        ]
+        coords = [np.asarray(atom.coords, dtype=np.float64) for atom in self.atoms]
+        assignments = np.ascontiguousarray(
+            np.column_stack(
+                [np.asarray(atom.assignments, dtype=np.float64).reshape(-1) for atom in self.atoms]
+            )
+        )
+        atom_basis = [
+            _TOPOLOGY_TO_BASIS.get(_canon_name(atom.topology), _canon_name(atom.topology))
+            for atom in self.atoms
+        ]
+        atom_dims = [int(atom.latent_dim) for atom in self.atoms]
+        return _sae_manifold_reconstruct_native(
+            atom_basis,
+            atom_dims,
+            decoder_blocks,
+            coords,
+            assignments,
+            int(decoder_blocks[0].shape[1]),
+        )
 
     @property
     def fitted(self) -> np.ndarray:

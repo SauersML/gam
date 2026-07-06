@@ -292,9 +292,9 @@ class SparseDictStream:
         Identical hyper-parameters to :func:`sparse_dictionary_fit`. ``max_epochs``
         is advisory here (the driving Python loop decides how many epochs to run);
         it is carried only so :meth:`end_epoch`'s convergence flag matches the
-        one-shot stopping rule. ``score_mode="required"`` fails closed if an
-        admitted route cannot run on the CUDA scorer; use ``"off"`` for deliberate
-        CPU-only runs.
+        one-shot stopping rule. ``score_mode="auto"`` uses CUDA when admitted
+        and otherwise runs the exact CPU router; use ``"required"`` to fail
+        closed or ``"off"`` for deliberate CPU-only runs.
     """
 
     def __init__(
@@ -309,7 +309,7 @@ class SparseDictStream:
         code_ridge: float = 1.0e-6,
         decoder_ridge: float = 1.0e-6,
         tolerance: float = 1.0e-6,
-        score_mode: str = "required",
+        score_mode: str = "auto",
     ) -> None:
         seed_arr = _as_2d_f32(seed, "seed")
         self._handle = rust_module().SparseDictStream(
@@ -1049,7 +1049,7 @@ def sparse_dictionary_fit_begin(
     code_ridge: float = 1.0e-6,
     decoder_ridge: float = 1.0e-6,
     tolerance: float = 1.0e-6,
-    score_mode: str = "required",
+    score_mode: str = "auto",
 ) -> SparseDictStream:
     """Begin a streaming sparse-dictionary fit and return a :class:`SparseDictStream`.
 
@@ -1081,7 +1081,7 @@ def sparse_dictionary_fit(
     code_ridge: float = 1.0e-6,
     decoder_ridge: float = 1.0e-6,
     tolerance: float = 1.0e-6,
-    score_mode: str = "required",
+    score_mode: str = "auto",
 ) -> SparseDictionaryFit:
     """Fit a fixed-``K`` sparse, minibatched linear dictionary to ``X`` (``N x P``).
 
@@ -1097,8 +1097,9 @@ def sparse_dictionary_fit(
     code_ridge, decoder_ridge, tolerance:
         Shared regularisation and stopping controls.
     score_mode:
-        ``"required"`` (default) fails closed when an admitted high-``K`` route
-        cannot run on CUDA. Use ``"off"`` for deliberate CPU-only runs.
+        ``"auto"`` (default) uses CUDA when the route is admitted and falls back
+        to the exact CPU router otherwise. Use ``"required"`` to fail closed
+        instead of falling back, or ``"off"`` for deliberate CPU-only runs.
     """
     x = _as_2d_f32(X, "X")
     payload = rust_module().sparse_dictionary_fit(

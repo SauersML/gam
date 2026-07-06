@@ -10,7 +10,7 @@
 // the same `impl SaeManifoldTerm` surface, and full private-field access.
 
 impl SaeManifoldTerm {
-    fn reconstruction_row_program_for_logdet(
+    pub(crate) fn reconstruction_row_program_for_logdet(
         &self,
         rho: &SaeManifoldRho,
         row: usize,
@@ -106,7 +106,26 @@ impl SaeManifoldTerm {
             })
             .collect();
 
-        let logits = self.assignment.logits.row(row).to_vec();
+        // Read the ACTIVE routing logits (frozen/amortized when routing is
+        // frozen #1033, else the free `self.logits`) — the single source the gate
+        // value is derived from. Reading raw `self.assignment.logits` here would
+        // re-derive free-logit gates that disagree with the value the assembly
+        // used under frozen routing.
+        let logits = self.assignment.routing_logits_row(row).to_vec();
+        // #1026/#1033 — atoms whose logit is NOT a free Newton parameter (ungated
+        // or frozen routing) must gate through a CONSTANT equal to the active
+        // routing value (`assignments[k]`), with zero logit derivative, rather
+        // than re-derive a gate from a stale/pinned logit. `logit_is_fixed`
+        // covers both cases (the same mask the arrow-Schur assembly uses).
+        let fixed_gate_value: Vec<Option<f64>> = (0..k_atoms)
+            .map(|k| {
+                if self.assignment.logit_is_fixed(k) {
+                    Some(assignments[k])
+                } else {
+                    None
+                }
+            })
+            .collect();
         let (gate, gate_shift, gate_scale) = match self.assignment.mode {
             AssignmentMode::Softmax { temperature, .. } => (
                 RowGate::Softmax {
@@ -154,6 +173,7 @@ impl SaeManifoldTerm {
             gate,
             logit_slot,
             coord_slot,
+            fixed_gate_value,
             n_primaries: vars.len(),
         })
     }

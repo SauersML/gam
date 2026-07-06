@@ -238,9 +238,12 @@ pub trait OuterObjective {
     /// be the global optimum of a relaxed problem — can replace the blind
     /// multi-seed multistart with a single predictor-corrector walk from that
     /// anchor to the true objective (#1007). The SAE-manifold objective
-    /// overrides this: its `η = 0` Eckart-Young linear relaxation is convex and
-    /// its optimum is certified by `linear_span_anchor`, so the walk in `η`
-    /// tracks the unique optimal branch to `η = 1`. The walk monitors the
+    /// overrides this: its `η = 0` base-topology relaxation is convex, and a
+    /// genuine low-rank (Eckart-Young / SVD) residual ceiling is certified by
+    /// `linear_span_anchor` — the `η = 0` endpoint is NOT a linear/affine model
+    /// (for curved bases its base columns still embed curvature); "Eckart-Young"
+    /// names the rank ceiling, not the chart. The walk in `η` tracks the unique
+    /// optimal branch to `η = 1`. The walk monitors the
     /// arrow-factor min-pivot and halves the `η` step when it shrinks; a pivot
     /// collapse below tolerance is a DETECTED bifurcation (recorded on the fit
     /// payload, never silent), at which point the objective falls back to the

@@ -100,10 +100,16 @@ core), penalized by the thin-plate roughness Gram. A `euclidean`-vs-`duchon`
 comparison therefore differs in *both* the basis family and the penalty, not the
 penalty alone. `poincare`
 likewise reuses the Euclidean tangent chart and monomial decoder but penalizes
-roughness in hyperbolic arc length via the Poincaré conformal factor, so it
-differs from the flat patch only where feature density grows toward the ball
-boundary (tree-/hierarchy-like structure). String matching is
-case-insensitive and treats `-` and `_` interchangeably.
+roughness in the *hyperbolic* metric: its effective smoothness Gram is the
+conformal Dirichlet energy `∫ gᵃᵇ ∂_a f ∂_b f dμ_g` of the Poincaré ball pulled
+back to the tangent chart (`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`
+at curvature `c = −1`, the single source of truth for the hyperbolic metric),
+wired into the atom's `refresh_intrinsic_smooth_penalty`. It therefore differs
+from the flat patch wherever the conformal factor departs from 1 — growing toward
+the ball boundary (tree-/hierarchy-like structure); for `d = 1` the tangent chart
+is intrinsically flat but runs at half arc length, so the Gram is exactly `½` the
+flat first-jet Dirichlet Gram. String matching is case-insensitive and treats `-`
+and `_` interchangeably.
 
 A `d_atom=1` linear atom is the true rank-1 **line** primitive. A
 `d_atom=1` Euclidean atom is a stronger polynomial patch, not the pure-linear
@@ -125,12 +131,20 @@ smoothing weights selected by REML. Each piece plays a distinct role
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
   is selected by the assignment prior. The three supported kinds are
   `"ibp_map"` (default), `"softmax"`, and `"jumprelu"`. `"ibp_map"`
-  (Indian Buffet Process MAP) adapts the *number* of active atoms per token
-  via a sigmoid gate scaled by a stick-breaking geometric weight. The gate
-  is `σ(ℓ/τ)·π_k(α)`, which is strictly positive at every finite logit, so it
+  (Indian Buffet Process, empirical-Bayes) adapts the *number* of active atoms
+  per token via a sigmoid gate scaled by the ordered stick-breaking **prior
+  mean** `π_k(α) = μ_k = (α/(α+1))^(k+1)`. The gate is `σ(ℓ/τ)·π_k(α)`, which is
+  strictly positive at every finite logit, so it
   produces a **sharply decaying, sparsity-inducing** gate rather than a soft
   simplex — but not exact zeros on its own; **hard zeros require the separate
-  `top_k=` truncation** (#1421). `"softmax"` is a
+  `top_k=` truncation** (#1421). The gate and its analytic sparsity penalty are
+  **one generative model** — `π_k ~ Beta(a_k, 1)`, `z_ik | π_k ~ Bernoulli(π_k)`
+  with `a_k = μ_k/(1−μ_k)` (so `E[π_k] = μ_k`): the gate multiplies the **prior
+  mean** `μ_k`, while the penalty scores the relaxed indicators `z_ik = σ(ℓ/τ)`
+  against the **posterior mean** `π̂_k = (M_k + a_k)/(N + a_k + 1)` of that same
+  `π_k` (empirical Bayes). Despite the `ibp_map` keyword the plug-in is the
+  posterior **mean**, not the MAP/mode — the penalty is the negative
+  log-posterior of the model the gate samples, so fit = one coherent objective. `"softmax"` is a
   dense, simplex-normalized gate; `"jumprelu"` is a hard threshold (its
   cutoff is `jumprelu_threshold=`, default `0.0`). `top_k=` optionally caps
   the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
@@ -178,14 +192,26 @@ smoothing weights selected by REML. Each piece plays a distinct role
 - **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
-  near arc length. It is not required for topology comparison: the Rust core
-  reparameterizes decoder roughness by the pulled-back metric, so
-  `fit.penalized_loss_score` is gauge-invariant under reparameterizing `t`
-  even with `isometry_weight=0.0`. Set the weight to `0.0` to disable the gauge.
+  near arc length. It is not required for topology comparison: the smoothness
+  penalty is measured on the decoded FUNCTION's intrinsic geometry (below), not
+  on the raw coordinate, so `fit.penalized_loss_score` is gauge-invariant under
+  reparameterizing `t` even with `isometry_weight=0.0`. Set the weight to `0.0`
+  to disable the gauge.
 
 - **Smoothness** (`smoothness_weight=1.0`). Roughness penalty on each atom's
-  decoded curve, a fixed finite-/cyclic-difference Gram in the latent
-  coordinate.
+  decoded curve/surface, measured intrinsically so it is invariant to
+  reparameterizing the latent coordinate `t` (SPEC: penalise the final function,
+  not the chart). For a non-Poincaré atom the effective Gram is the total squared
+  SECOND FUNDAMENTAL FORM of the decoded embedding `γ(t) = BᵀΦ(t)`,
+  `∫_M ‖II‖²_g dμ`, at every latent dim `d ≥ 1`; for `d = 1` this is exactly the
+  reparameterization-invariant bending `∫ κ² ds = Σ_i ‖P_N γ''(t_i)‖²/‖γ'(t_i)‖³`
+  (the NORMAL-projected acceleration — a straight segment traced as `γ(t)=t²e₁`
+  scores zero, whereas a raw coordinate second-difference Gram would charge
+  `γ''=2e₁`). Poincaré atoms use the hyperbolic conformal Dirichlet Gram instead
+  (see the topology table). A fixed finite-/cyclic-difference Gram in the latent
+  coordinate is the *base operator*; the intrinsic (function-space) Gram is
+  refreshed from it between assemblies via the current decoder pullback
+  (lagged-diffusivity), so the converged penalty is the true intrinsic roughness.
 
 - **Coordinate-magnitude penalty** (`gate_sparsity="scad"` default; `"l1"` /
   `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**
@@ -249,10 +275,31 @@ reconstruction dispersion `fit.dispersion`, and widens for a poorly-identified
 atom (a near-singular Schur block fans the band out). With many tokens the
 manifold is pinned far more tightly than any single noisy observation.
 
+The band is the **joint** decoder covariance: `Cov(β_k)` is the `k`-th block of
+the joint inverse Hessian, so it carries the cross-atom covariance and the
+decoder↔coordinate Schur couplings, and the per-channel `sd` genuinely varies
+across output features. This holds after **structure search** too — when a
+certified birth / fission / fusion (or a demoted death) re-converges the whole
+dictionary at a new smoothing state, the joint factor is rebuilt at the final
+model, so the reported band still reflects the joint covariance of the returned
+(possibly grown) dictionary, seed and born atoms alike.
+
 !!! note
     The uncertainty arrays are populated only on a **freshly-fit** model.
     A model round-tripped through `save` / `load` (or `to_dict` /
     `from_dict`) drops them, and `shape_uncertainty` then raises `ValueError`.
+
+!!! note "Degenerate atoms and the huge-`p` fallback"
+    A genuinely **unidentified** atom (no active rows, or a non-SPD joint block)
+    keeps an honest `NaN` band rather than a fabricated number. If the joint
+    inverse-Hessian factor cannot be reformed at the final state after a
+    structure move, or the ambient `p` is too large to admit the dense Schur
+    factor, the band for the affected atoms degrades to a **per-atom marginal**
+    `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹ Φ_k(t)` from that atom's own penalized inner
+    Hessian — which omits the cross-atom and coordinate couplings and is
+    identical across output channels — or to a `NaN` band. This is the honest
+    fallback, not the joint covariance; it is used only where the joint factor is
+    unavailable.
 
 ### Typical coordinate range
 

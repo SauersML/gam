@@ -211,7 +211,18 @@ fn fd_partial(row: &GammaRow, a: usize, b: usize) -> f64 {
     if b >= 1 {
         p = p.min(STENCIL_TRUNC[b]);
     }
-    let h = 1e-2;
+    // The fourth-order tensor-product stencil subtracts nearly equal row-NLL
+    // values before dividing by `h^4` (or `h^(a+b)` for mixed entries).  A
+    // `1e-2` step is inside the roundoff-dominated side of that balance for the
+    // p₀⁴ channel of the deterministic fixtures: the Gamma row NLL contains an
+    // `O(1)` log-normalizer, while the p₀⁴ signal is only the
+    // `y·exp(-(p₀+2p₁))` term, so cancellation in the constant-in-p₀ pieces can
+    // exceed the oracle's stated band.  Use a dyadic log-primary step instead:
+    // `2^-5` is still local on the fixture domain (`p ∈ [-0.5, 0.5] ×
+    // [-0.3, 0.3]`, stencil reaches only `±1/16` at the coarse level) but keeps
+    // the fourth-order denominator large enough that the Richardson oracle is
+    // measuring the row expression rather than floating-point cancellation.
+    let h = 1.0 / 32.0;
     let coarse = fd_partial_at(row, a, b, h);
     let fine = fd_partial_at(row, a, b, h * 0.5);
     let two_p = 2f64.powi(p);

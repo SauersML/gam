@@ -1101,6 +1101,13 @@ pub fn fit_residual_cascade_from_formula(
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
+fn family_requests_transformation_normal(family: Option<&str>) -> bool {
+    family
+        .map(|name| name.trim().to_ascii_lowercase().replace('_', "-"))
+        .as_deref()
+        == Some("transformation-normal")
+}
+
 pub fn materialize<'a>(
     formula: &str,
     data: &'a Dataset,
@@ -1109,10 +1116,26 @@ pub fn materialize<'a>(
     gam_gpu::configure_global_policy(config.gpu_policy);
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
+    let family_transformation_normal =
+        family_requests_transformation_normal(config.family.as_deref());
+    let transformation_normal_config;
+    let effective_config = if family_transformation_normal && !config.transformation_normal {
+        // `family="transformation-normal"` is a documented spelling of the CTN
+        // model class, not a Gaussian identity likelihood. Normalize it into the
+        // same orchestration flag used by `transformation_normal=true` before any
+        // dispatch/validation branch can silently treat the request as standard.
+        transformation_normal_config = FitConfig {
+            transformation_normal: true,
+            ..config.clone()
+        };
+        &transformation_normal_config
+    } else {
+        config
+    };
 
     if let Some((left_col, right_col, event_col)) = parse_surv_interval_response(&parsed.response)?
     {
-        if config.transformation_normal {
+        if effective_config.transformation_normal {
             return Err(WorkflowError::InvalidConfig {
                 reason:
                     "transformation_normal cannot be combined with a SurvInterval(...) response"
@@ -1130,14 +1153,14 @@ pub fn materialize<'a>(
             &parsed,
             data,
             &col_map,
-            config,
+            effective_config,
             None,
             &left_col,
             &event_col,
             Some(&right_col),
         )
     } else if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
-        if config.transformation_normal {
+        if effective_config.transformation_normal {
             return Err(WorkflowError::InvalidConfig {
                 reason: "transformation_normal cannot be combined with a Surv(...) response"
                     .to_string(),
@@ -1151,7 +1174,7 @@ pub fn materialize<'a>(
             &parsed,
             data,
             &col_map,
-            config,
+            effective_config,
             entry_col.as_deref(),
             &exit_col,
             &event_col,
@@ -1173,28 +1196,28 @@ pub fn materialize<'a>(
         // non-survival branch a non-default value (e.g. "weibull") would be
         // discarded and the fit would silently degrade to an ordinary GAM
         // (#1767). Reject it at the same chokepoint.
-        reject_survival_likelihood_for_nonsurvival(config)?;
-        if config.transformation_normal {
+        reject_survival_likelihood_for_nonsurvival(effective_config)?;
+        if effective_config.transformation_normal {
             // Issue #789A: a Bernoulli marginal-slope request with
             // `transformation_normal=true` used to dispatch as a CTN fit while
             // retaining marginal-slope controls, leaving the transformation path
             // in a non-advancing loop. CTN score calibration now uses the
             // explicit `ctn_stage1` recipe instead, so the legacy boolean is a
             // hard configuration error for marginal-slope requests.
-            reject_marginal_slope_controls_for_transformation_normal(config)?;
-            if config.noise_formula.is_some() {
+            reject_marginal_slope_controls_for_transformation_normal(effective_config)?;
+            if effective_config.noise_formula.is_some() {
                 return Err(WorkflowError::InvalidConfig {
                     reason: "transformation_normal cannot be combined with noise_formula"
                         .to_string(),
                 });
             }
-            materialize_transformation_normal(&parsed, data, &col_map, config)
-        } else if requests_bernoulli_marginal_slope(config) {
-            materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
-        } else if config.noise_formula.is_some() {
-            materialize_location_scale(&parsed, data, &col_map, config)
+            materialize_transformation_normal(&parsed, data, &col_map, effective_config)
+        } else if requests_bernoulli_marginal_slope(effective_config) {
+            materialize_bernoulli_marginal_slope(&parsed, data, &col_map, effective_config)
+        } else if effective_config.noise_formula.is_some() {
+            materialize_location_scale(&parsed, data, &col_map, effective_config)
         } else {
-            materialize_standard(&parsed, data, &col_map, config)
+            materialize_standard(&parsed, data, &col_map, effective_config)
         }
     }
 }

@@ -15,10 +15,23 @@ pub const SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES: usize = 1 << 24;
 
 /// Posterior uncertainty of one fitted atom's manifold shape.
 ///
-/// Produced by [`SaeManifoldTerm::assemble_shape_uncertainty`]. The covariance
-/// is the φ-scaled β-block of the joint inverse Hessian (coordinates
-/// marginalized out); the band is its closed-form push-forward through the
-/// linear basis→ambient map `m_k(t) = Φ_k(t)·B_k`.
+/// In the primary path — [`SaeManifoldTerm::assemble_shape_uncertainty`], and
+/// after a structure/finalization change its final-state twin
+/// [`SaeManifoldTerm::recompute_joint_shape_uncertainty`] — the covariance is
+/// the φ-scaled β-block of the JOINT inverse Hessian (coordinates marginalized
+/// out); the band is its closed-form push-forward through the linear
+/// basis→ambient map `m_k(t) = Φ_k(t)·B_k`. This is what the production fit
+/// returns.
+///
+/// Two reachable fallbacks produce a WEAKER band and say so honestly at the
+/// field level (`decoder_covariance: None`, and the `band_sd` doc below): the
+/// per-atom Laplace marginal [`SaeManifoldTerm::complete_born_atom_shape_bands`]
+/// fills (used only when the joint factor genuinely could not cover an atom —
+/// it DROPS cross-atom covariance and the decoder-coordinate Schur couplings, so
+/// its `band_sd` is identical across output channels), and the all-NaN
+/// [`SaeManifoldTerm::shape_uncertainty_without_decoder_covariance`] (LLM-scale
+/// fits with no dense joint Schur). Neither is silently dressed up as the joint
+/// covariance.
 #[derive(Debug, Clone)]
 pub struct SaeAtomShapeUncertainty {
     /// φ-scaled posterior covariance of this atom's decoder coefficients,
@@ -72,7 +85,8 @@ pub struct SaeShapeUncertainty {
 }
 
 impl SaeShapeUncertainty {
-    /// #1230 — invalidate every PRE-search seed band so it is recomputed from the
+    /// #1230 — invalidate every PRE-search seed band as the FALLBACK recompute
+    /// path, when the joint inverse-Hessian factor cannot be reformed at the
     /// FINAL post-structure-search model state.
     ///
     /// The production fit assembles these bands from the joint Hessian at the ρ
@@ -80,17 +94,26 @@ impl SaeShapeUncertainty {
     /// When a structure move lands (a certified birth/fission/fusion, or a demoted
     /// death), the warm refit re-converges the WHOLE dictionary at a new ρ, so the
     /// seed atoms' decoders / coordinates / inner curvature change and their
-    /// pre-search joint-Hessian bands no longer describe the returned model. This
+    /// pre-search joint-Hessian bands no longer describe the returned model. The
+    /// PRIMARY response is to rebuild the JOINT bands at the final state via
+    /// [`SaeManifoldTerm::recompute_joint_shape_uncertainty`], which preserves the
+    /// cross-atom covariance and coordinate-Schur couplings and the per-channel
+    /// variance.
+    ///
+    /// This method is the fallback for when that joint recompute is unavailable
+    /// (a non-PD post-search Hessian, or a huge-`p` fit with no dense Schur). It
     /// resets each existing band's posterior `band_sd` to `NaN` and drops the
     /// stale dense `decoder_covariance`, so the subsequent
     /// [`SaeManifoldTerm::complete_born_atom_shape_bands`] pass — which fills every
     /// `NaN` band from each atom's OWN final penalized inner Hessian
     /// `H_k = Φ_kᵀ W_k Φ_k + S̃_k` harvested at the settled post-search state —
-    /// recomputes the band for EVERY atom (seed and born) against the final model,
-    /// not just the born atoms. A genuinely-degenerate atom keeps an honest `NaN`
-    /// band rather than a stale fabricated one. `band_coords` / `band_mean` are
-    /// re-derived directly from the final fitted atom by the completion pass, so
-    /// they stay consistent too.
+    /// recomputes a PER-ATOM MARGINAL band for EVERY atom (seed and born) against
+    /// the final model. That marginal drops the cross-atom / coordinate couplings
+    /// and is identical across output channels, so it is a strict approximation to
+    /// the joint covariance the primary path returns — honest, never fabricated. A
+    /// genuinely-degenerate atom keeps an honest `NaN` band rather than a stale
+    /// fabricated one. `band_coords` / `band_mean` are re-derived directly from the
+    /// final fitted atom by the completion pass, so they stay consistent too.
     ///
     /// No-op when the structure did not change (every atom keeps its exact
     /// joint-Hessian band, which is still valid and strictly higher quality than

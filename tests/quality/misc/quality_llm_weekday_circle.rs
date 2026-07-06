@@ -105,6 +105,11 @@ const ANGULAR_SPREAD: f64 = 0.9;
 /// that the SAME production adjudicator selects as a circle decisively.
 const RADIAL_JITTER: f64 = 0.083;
 
+fn weekday_mode_harmonic_amplitude() -> f64 {
+    let mode_count = N_WEEKDAYS as f64;
+    (-0.5 * (mode_count * ANGULAR_SPREAD).powi(2)).exp()
+}
+
 // ===========================================================================
 // Arm 1 — the weekday ring and its shape adjudication.
 // ===========================================================================
@@ -241,6 +246,13 @@ fn weekday_circle_beats_the_seven_cluster_null_with_an_evidence_margin() {
     let seeds = [11_u64, 41, 97];
     for &seed in &seeds {
         let activations = sample_weekday_ring(seed);
+        let seventh_harmonic = weekday_mode_harmonic_amplitude();
+        assert!(
+            seventh_harmonic <= f64::EPSILON.sqrt(),
+            "seed {seed}: the weekday plant must be a continuous ring, not \
+             seven resolvable angular modes (7th harmonic amplitude \
+             {seventh_harmonic:.3e})"
+        );
         let v = race_shape(&activations);
 
         assert!(

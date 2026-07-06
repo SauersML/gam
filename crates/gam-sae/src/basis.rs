@@ -19,13 +19,23 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
-    /// Column split for the curvature homotopy `Phi_eta = [linear, eta*curved]`.
+    /// Column split for the curvature homotopy `Phi_eta = [base, eta*curved]`.
     ///
-    /// The default is a flat linear basis. Curved atom evaluators override this
-    /// with their topology-specific split; callers pass `n_basis` so the split is
-    /// checked against the concrete design width currently being evaluated.
+    /// `base` columns are held FIXED as `eta` walks `0 → 1`; `curved` columns are
+    /// scaled by `eta`. The `eta = 0` endpoint is therefore the *base-topology*
+    /// relaxation — the atom evaluated on its base (η-invariant) columns only —
+    /// NOT a linear/affine model: for the harmonic and sphere-chart bases the
+    /// base block already carries extrinsic curvature (a first-harmonic
+    /// `[sin, cos]` pair traces a circle, the sphere chart's `[x, y, z]` block
+    /// traces the unit sphere). "Base" names "does not scale with η", never
+    /// "curvature-free". See [`PhiEtaSplit`].
+    ///
+    /// The default is a flat (genuinely affine) monomial-style basis where every
+    /// column is a base column. Curved atom evaluators override this with their
+    /// topology-specific split; callers pass `n_basis` so the split is checked
+    /// against the concrete design width currently being evaluated.
     fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
-        Ok(PhiEtaSplit::all_linear(n_basis))
+        Ok(PhiEtaSplit::all_base(n_basis))
     }
 
     /// Per-factor basis sizes `(M₁, M₂)` of a `d = 2` TENSOR-PRODUCT evaluator
@@ -110,32 +120,43 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>>;
 }
 
+/// Curvature-homotopy column split `Phi_eta = [base, eta*curved]`.
+///
+/// `curved_cols` are the columns scaled by the dial `eta`; `base_cols` are the
+/// columns held fixed across the whole walk. "Base" means "η-invariant", NOT
+/// "linear/curvature-free": for the harmonic and sphere-chart bases the base
+/// block already embeds curvature (first-harmonic `[sin, cos]`, the sphere
+/// chart's `[x, y, z]`). The `eta = 0` endpoint is thus the base-topology
+/// relaxation, not an affine/Eckart-Young linear model. The genuine
+/// low-rank (Eckart-Young / PCA) certificate lives in
+/// [`crate::manifold::outer_objective::linear_span_anchor`] and is a rank
+/// ceiling that bounds every `eta`, independent of this split.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhiEtaSplit {
-    pub linear_cols: Vec<usize>,
+    pub base_cols: Vec<usize>,
     pub curved_cols: Vec<usize>,
 }
 
 impl PhiEtaSplit {
-    pub fn all_linear(n_basis: usize) -> Self {
+    pub fn all_base(n_basis: usize) -> Self {
         Self {
-            linear_cols: (0..n_basis).collect(),
+            base_cols: (0..n_basis).collect(),
             curved_cols: Vec::new(),
         }
     }
 
     fn from_curved_mask(mask: Vec<bool>) -> Self {
-        let mut linear_cols = Vec::new();
+        let mut base_cols = Vec::new();
         let mut curved_cols = Vec::new();
         for (col, curved) in mask.into_iter().enumerate() {
             if curved {
                 curved_cols.push(col);
             } else {
-                linear_cols.push(col);
+                base_cols.push(col);
             }
         }
         Self {
-            linear_cols,
+            base_cols,
             curved_cols,
         }
     }
@@ -260,6 +281,10 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
                 self.num_basis
             ));
         }
+        // Base (η-invariant) columns: constant `1` plus the FIRST-harmonic
+        // `[sin 2πt, cos 2πt]`. These are not linear — the first-harmonic pair
+        // already traces the unit circle — but they define the base topology the
+        // homotopy relaxes onto; only harmonics ≥ 2 scale with `eta`.
         let mut curved = vec![false; n_basis];
         for h in 2..=(n_basis - 1) / 2 {
             curved[2 * h - 1] = true;
@@ -407,7 +432,11 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
                 "RawPeriodicCircleEvaluator::phi_eta_split: n_basis {n_basis} != 2"
             ));
         }
-        Ok(PhiEtaSplit::all_linear(n_basis))
+        // Both raw circle columns `[cos, sin]` are base (η-invariant) columns:
+        // the homotopy has nothing to dial because the base topology IS the full
+        // basis. These columns embed a curved unit circle, so this is a
+        // base-topology relaxation, not a linear one.
+        Ok(PhiEtaSplit::all_base(n_basis))
     }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
@@ -458,8 +487,9 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 ///
 /// The columns are `[1, x, y, z, xy, yz, xz]`; the constant column carries a
 /// numerically-negligible ridge (`1e-8`) so the penalty stays positive
-/// definite, the three linear columns are penalized at unit weight, and the
-/// three bilinear columns at weight `4` (their second-order angular content).
+/// definite, the three degree-one columns `[x, y, z]` are penalized at unit
+/// weight, and the three bilinear columns at weight `4` (their second-order
+/// angular content).
 /// This is the single source of truth for the chart penalty shared between the
 /// core SAE path and the PyFFI `sphere_chart_basis_with_jet` helper.
 pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0];
@@ -567,6 +597,11 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
                 "SphereChartEvaluator::phi_eta_split: n_basis {n_basis} != 7"
             ));
         }
+        // Base (η-invariant) columns `[1, x, y, z]`; the quadratic cross-terms
+        // `[xy, yz, xz]` scale with `eta`. The `[x, y, z]` block is NOT linear in
+        // the chart — evaluated on the sphere it traces the unit sphere (the base
+        // topology). So `eta = 0` is the base-topology relaxation, not an affine
+        // model.
         let mut curved = vec![false; n_basis];
         for col in 4..7 {
             curved[col] = true;
@@ -820,6 +855,11 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
                 "TorusHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {expected}"
             ));
         }
+        // Base (η-invariant) columns: the constant plus each single-axis
+        // first-harmonic `[sin, cos]` (one non-constant axis, harmonic ≤ 1).
+        // These embed the per-axis circles — the torus base topology — so they
+        // are curved, not linear; only higher harmonics and cross-axis products
+        // scale with `eta`. `eta = 0` is thus the base-topology relaxation.
         let d = self.latent_dim;
         let axis_m = self.axis_basis_size();
         let mut curved = Vec::with_capacity(n_basis);
@@ -1122,7 +1162,10 @@ impl SaeBasisEvaluator for AffineCoordinateEvaluator {
                 "AffineCoordinateEvaluator::phi_eta_split: n_basis {n_basis} != {expected}"
             ));
         }
-        Ok(PhiEtaSplit::all_linear(n_basis))
+        // The affine `[1, x, y, z]` basis is genuinely linear, so every column is
+        // a base column and the base-topology relaxation coincides with a true
+        // linear model here (the one basis where the two notions agree).
+        Ok(PhiEtaSplit::all_base(n_basis))
     }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
@@ -1852,13 +1895,14 @@ impl SaeBasisEvaluator for CylinderHarmonicEvaluator {
             ));
         }
         let ml = self.line_basis_size();
-        // A product column `[c, l]` is curved iff either factor carries
-        // curvature: the circle factor is curved on any harmonic above the
-        // first (`c > 2`, the 2nd-and-higher sin/cos), and the line factor is
-        // curved on any monomial of degree ≥ 2 (`l > 1`). The first-harmonic
-        // circle columns crossed with the affine line columns span the linear
-        // relaxation, matching the `eta`-homotopy split of the two parent
-        // evaluators.
+        // A product column `[c, l]` is curved (η-dialed) iff either factor
+        // carries dialed curvature: the circle factor on any harmonic above the
+        // first (`c > 2`, the 2nd-and-higher sin/cos), the line factor on any
+        // monomial of degree ≥ 2 (`l > 1`). The first-harmonic circle columns
+        // crossed with the affine line columns are the base (η-invariant) block
+        // and span the base-topology relaxation — the base circle columns still
+        // embed the unit circle, so this block is not linear — matching the
+        // `eta`-homotopy split of the two parent evaluators.
         let mut curved = vec![false; expected];
         for c in 0..self.circle_basis_size() {
             for l in 0..ml {

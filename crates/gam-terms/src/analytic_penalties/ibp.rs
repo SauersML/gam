@@ -1,6 +1,7 @@
 use super::*;
 
-/// IBP-MAP active-set prior over SAE-manifold assignment logits.
+/// IBP active-set prior over SAE-manifold assignment logits (posterior-mean
+/// plug-in; NOT a MAP — see [`SPEC.md`] line 3).
 ///
 /// Infinite GPFA / IBP-GPFA in neuroscience uses an Indian Buffet Process
 /// prior over factor loadings to infer both a potentially unbounded factor
@@ -8,17 +9,33 @@ use super::*;
 /// diagnosis carries over directly to SAE-manifold assignment: ordinary ARD
 /// selects one global factor set for all observations, not a different set
 /// for each observation. A per-row IBP active set is the established GPFA
-/// remedy, adapted here to gamfit's REML/MAP engine with a finite truncation
+/// remedy, adapted here to gamfit's REML/LAML engine with a finite truncation
 /// and deterministic concrete relaxation.
 ///
-/// The target is row-major `(N, K)` logits. For MAP we use a deterministic
+/// # One model shared with the forward gate
+///
+/// This penalty is the negative-log-**posterior** of the SAME generative model
+/// the forward gate (`gam_sae::assignment::ibp_map_row`) implements, so the
+/// fit objective (reconstruction + this penalty) is the neg-log-posterior of a
+/// single model rather than two mismatched priors. The per-atom activation rate
+/// is `π_k ~ Beta(a_k, 1)` whose **prior mean**
+/// `E[π_k] = a_k/(a_k+1) = μ_k = (α/(α+1))^(k+1)` is exactly the ordered
+/// stick-breaking prior mean the forward gate multiplies in
+/// (`z_ik = σ(ℓ_ik/τ)·μ_k`); we take `a_k = μ_k/(1−μ_k)`. The gate applies the
+/// **prior mean** `μ_k`; this penalty scores the relaxed indicators against the
+/// **posterior mean** `π̂_k` of the same `π_k` — the empirical-Bayes / mean-field
+/// structure, one model, prior-vs-posterior mean.
+///
+/// The target is row-major `(N, K)` logits. We use a deterministic
 /// binary-concrete score `z_ik = sigmoid(logit_ik / tau)`, with optional
-/// Gumbel temperature annealing across outer iterations. Each column has
-/// `pi_k ~ Beta(alpha / K, 1)` and `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in
-/// the columnwise Beta-Bernoulli MAP `pi_k` from the relaxed active mass, so
-/// the penalty is a gauge-fixing prior: it breaks the per-row
-/// interchangeability of atom indices by making each row choose a sparse
+/// Gumbel temperature annealing across outer iterations, and
+/// `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in the columnwise Beta-Bernoulli
+/// **posterior mean** `pi_k = (M_k + a_k)/(N + a_k + 1)` from the relaxed active
+/// mass `M_k = Σ_i z_ik`, so the penalty is a gauge-fixing prior: it breaks the
+/// per-row interchangeability of atom indices by making each row choose a sparse
 /// binary-ish subset rather than assigning every atom a soft nonzero weight.
+/// As `α → 0` every `μ_k → 0`, so the prior collapses the active set toward the
+/// null (SPEC.md line 13); `α` is learnable for an empirical-Bayes fit.
 #[derive(Debug, Clone)]
 pub struct IBPAssignmentPenalty {
     pub k_max: usize,
@@ -28,6 +45,13 @@ pub struct IBPAssignmentPenalty {
     pub learnable_alpha: bool,
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
+    /// Optional per-column (per-atom, length `k_max`) mask of FIXED columns that
+    /// are INERT in this prior — their logits are held constant (an ungated /
+    /// frozen SAE atom), so they contribute nothing to the value, gradient, or
+    /// curvature and their per-column Beta normalizer is excluded. `None`
+    /// (the default) scores every column, bit-for-bit the historical path. Set
+    /// via a plain field assignment, like `weight`. (#Bug4)
+    pub fixed_columns: Option<Vec<bool>>,
 }
 
 impl IBPAssignmentPenalty {
@@ -44,7 +68,54 @@ impl IBPAssignmentPenalty {
             learnable_alpha,
             weight: 1.0,
             weight_schedule: None,
+            fixed_columns: None,
         }
+    }
+
+    /// Whether column (atom) `k` is a FIXED / inert column excluded from this
+    /// prior (see [`Self::fixed_columns`]). `false` for every column when no mask
+    /// is set.
+    #[inline]
+    fn column_is_fixed(&self, k: usize) -> bool {
+        self.fixed_columns
+            .as_ref()
+            .and_then(|m| m.get(k).copied())
+            .unwrap_or(false)
+    }
+
+    /// Per-column Beta(`a_k`, 1) shapes and their prior means `μ_k`.
+    ///
+    /// `μ_k = (α/(α+1))^(k+1)` is the ordered stick-breaking prior mean the
+    /// forward gate (`ibp_map_row`) multiplies in, and `a_k = μ_k/(1−μ_k)` is the
+    /// Beta shape whose prior mean `a_k/(a_k+1) = μ_k` matches it — so the gate's
+    /// multiplicative π and this penalty's Beta prior are ONE model. Returns
+    /// `(a_col, mu)`, each length `K`. `μ_k` is floored at the smallest positive
+    /// normal (mirroring the gate's `ordered_geometric_shrinkage_prior`) so every
+    /// atom keeps a live gradient path; the sparsity ordering is preserved.
+    fn column_beta_shapes(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
+        let log_ratio = (alpha / (alpha + 1.0)).ln();
+        let mut a_col = Array1::<f64>::zeros(self.k_max);
+        let mut mu = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let m = (((k + 1) as f64) * log_ratio).exp().max(f64::MIN_POSITIVE);
+            mu[k] = m;
+            a_col[k] = m / (1.0 - m);
+        }
+        (a_col, mu)
+    }
+
+    /// `∂a_k/∂ρ` with `ρ = logα` and `α = α_base·e^ρ`, for the learnable-α
+    /// channels. With `μ_k = (α/(α+1))^(k+1)` we have `∂μ_k/∂ρ = μ_k·(k+1)/(α+1)`
+    /// (the SAME `dπ_k/dρ` the forward gate's α-data derivative uses), and
+    /// `a_k = μ_k/(1−μ_k)` gives `∂a_k/∂ρ = (∂μ_k/∂ρ)/(1−μ_k)²`.
+    fn column_beta_shape_rho_deriv(&self, alpha: f64, mu: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut da = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let m = mu[k];
+            let dmu = m * ((k + 1) as f64) / (alpha + 1.0);
+            da[k] = dmu / ((1.0 - m) * (1.0 - m));
+        }
+        da
     }
 
     #[must_use]
@@ -83,23 +154,30 @@ impl IBPAssignmentPenalty {
         out
     }
 
-    fn pi_map(&self, z: ArrayView1<'_, f64>, alpha: f64) -> Array1<f64> {
+    /// Columnwise Beta-Bernoulli **posterior mean** `π̂_k = (M_k + a_k)/(N + a_k + 1)`
+    /// of the per-atom activation rate `π_k ~ Beta(a_k, 1)`, with `M_k = Σ_i z_ik`
+    /// the relaxed active mass and `a_col` the per-column Beta shapes from
+    /// [`Self::column_beta_shapes`]. This is a genuine posterior MEAN (SPEC.md
+    /// line 3), NOT a MAP: the mode `(M_k + a_k − 1)/(N + a_k − 1)` is pinned to the
+    /// zero boundary whenever `a_k < 1` and the fitted mass is sparse, which would
+    /// make `∂π̂_k/∂M_k = 0` and drop the IBP cross-row Woodbury curvature for
+    /// precisely the active-sparsity regimes this prior is meant to model. The
+    /// prior mean `E[π_k] = a_k/(a_k+1) = μ_k` is the forward gate's multiplier, so
+    /// gate and penalty are one model (prior-vs-posterior mean).
+    fn pi_posterior_mean(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_col: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
         let n = z.len() / self.k_max;
-        let a = alpha / self.k_max as f64;
-        // Use the Beta-Bernoulli posterior mean, `(M_k + a)/(N + a + 1)`, as
-        // the smooth empirical-π plug-in.  The old MAP plug-in
-        // `(M_k + a - 1)/(N + a - 1)` is pinned to the zero boundary whenever
-        // `a < 1` and the fitted mass is sparse, which incorrectly makes
-        // `∂π_k/∂M_k = 0` and drops the IBP cross-row Woodbury curvature for
-        // precisely the active-sparsity regimes this prior is meant to model.
         let mut pi = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let mut active_mass = 0.0;
             for row in 0..n {
                 active_mass += z[row * self.k_max + k];
             }
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
-            let raw = (active_mass + a) / denom;
+            let denom = (n as f64 + a_col[k] + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let raw = (active_mass + a_col[k]) / denom;
             pi[k] = raw.clamp(IBP_INTERIOR_TOL, 1.0 - IBP_INTERIOR_TOL);
         }
         pi
@@ -156,14 +234,15 @@ impl IBPAssignmentPenalty {
         majorize: bool,
     ) -> IbpHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta(a_k, 1) shapes whose prior mean is the forward gate's
+        // ordered stick-breaking μ_k — the single-model reconciliation.
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -177,6 +256,8 @@ impl IBPAssignmentPenalty {
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut score_second_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -333,12 +414,14 @@ impl IBPAssignmentPenalty {
             return out;
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta shapes a_k and their ρ-derivatives da_k/dρ (single-model
+        // reconciliation: prior mean a_k/(a_k+1) = μ_k = the forward gate's π_k).
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -348,13 +431,16 @@ impl IBPAssignmentPenalty {
         }
         let n_f = n as f64;
         // mixed[i·K+k] = ∂(grad_rho)/∂ℓ_ik = ∂²F/∂ρ∂ℓ_ik. With grad_rho's per-column
-        // summand G_k = pi_score_k·(a(N+1−M_k)/D²) + a·(−1/a − ln π_k) and ℓ_ik's only
-        // reach through M_k (∂M_k/∂ℓ_ik = J_ik), this is (∂G_k/∂M_k)·J_ik:
-        //   ∂G_k/∂M_k = (a/D²)·[ PSD_k·(N+1−M_k) − pi_score_k ] − a·pi_jac/π_k,
-        // where PSD_k = ∂pi_score_k/∂M_k. Must track grad_rho: the earlier
-        // `−w·a·pi_jac·J/π` matched only the old (stationary-mode) grad_rho.
+        // summand G_k = pi_score_k·(a_k'(N+1−M_k)/D_k²) + a_k'·(−1/a_k − ln π_k),
+        // where a_k' = ∂a_k/∂ρ, and ℓ_ik's only reach through M_k (∂M_k/∂ℓ_ik =
+        // J_ik), this is (∂G_k/∂M_k)·J_ik:
+        //   ∂G_k/∂M_k = (a_k'/D_k²)·[ PSD_k·(N+1−M_k) − pi_score_k ] − a_k'·pi_jac/π_k,
+        // where PSD_k = ∂pi_score_k/∂M_k (D_k, a_k both ρ-quantities, constant in M).
         let mut d_g_dm = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
@@ -366,7 +452,7 @@ impl IBPAssignmentPenalty {
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            d_g_dm[k] = (a / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - a * pj / pk;
+            d_g_dm[k] = (da / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - da * pj / pk;
         }
         for row in 0..n {
             let start = row * self.k_max;
@@ -407,12 +493,18 @@ impl IBPAssignmentPenalty {
             return (d_score, d_score_derivative);
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta shapes a_k and da_k/dρ. With a_k=μ_k/(1−μ_k),
+        // μ_k=(α/(α+1))^(k+1), D_k=N+a_k+1 so dD_k/dρ=da_k/dρ, and
+        //   π' = (da_k/dρ)·(N+1−M)/D_k²   (=∂π/∂ρ),
+        //   pj' = −(da_k/dρ)/D_k²         (=∂(1/D_k)/∂ρ).
+        // The leading da/dρ factor is the per-column da_col[k]; explicit value-a
+        // is a_col[k]. (Previously a_k=α/K gave da/dρ=a.)
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let n_f = n as f64;
-        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -421,6 +513,9 @@ impl IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
@@ -429,13 +524,13 @@ impl IBPAssignmentPenalty {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let one_minus = 1.0 - pk;
             let pj = 1.0 / denom;
-            let pi_p = a * (n_f + 1.0 - mass) / (denom * denom); // ∂π/∂ρ
-            let pj_p = -a / (denom * denom); // ∂(1/D)/∂ρ
+            let pi_p = da * (n_f + 1.0 - mass) / (denom * denom); // ∂π/∂ρ
+            let pj_p = -da / (denom * denom); // ∂(1/D)/∂ρ
             // direct_z_score = ln((1−π)/π); pi_score = ∂F/∂π (BCE + Beta).
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let pi_score_p = pi_p / (pk * pk) * (mass + a - 1.0)
                 + (n_f - mass) * pi_p / (one_minus * one_minus)
-                - a / pk;
+                - da / pk;
             // score = direct_z_score + pi_score·pi_jac.
             d_score[k] = (-1.0 / pk - 1.0 / one_minus) * pi_p + pi_score_p * pj + pi_score * pj_p;
             // score_derivative = pi_jac·(D1 + PSD), D1 = −1/π − 1/(1−π).
@@ -443,7 +538,7 @@ impl IBPAssignmentPenalty {
             let d1_p = pi_p / (pk * pk) - pi_p / (one_minus * one_minus);
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            let psd_p = pi_p / (pk * pk) + a * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
+            let psd_p = pi_p / (pk * pk) + da * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
                 - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
                 - pi_p / (one_minus * one_minus)
                 + (n_f - mass) * pj_p / (one_minus * one_minus)
@@ -540,24 +635,34 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta(a_k, 1) shapes; prior mean a_k/(a_k+1) = μ_k = the
+        // forward gate's ordered stick-breaking π_k (one model).
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let mut acc = 0.0;
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: a fixed/inert column contributes nothing to the energy.
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 acc -= zk * pk.ln() + (1.0 - zk) * (1.0 - pk).ln();
             }
         }
         for k in 0..self.k_max {
-            // Normalized Beta(a,1) density is a*pi^(a-1), so its negative
-            // log contribution is -ln(a) - (a - 1) ln(pi). The normalizer is
-            // constant only for fixed alpha; keep it in both modes so the energy
-            // has one mathematical definition across configurations.
+            // Normalized Beta(a_k, 1) density is a_k*pi^(a_k-1), so its negative
+            // log contribution is -ln(a_k) - (a_k - 1) ln(pi). Kept in both modes
+            // so the energy has one mathematical definition across configurations.
+            // #Bug4: skip the per-column normalizer of fixed/inert columns too.
+            if self.column_is_fixed(k) {
+                continue;
+            }
+            let a = a_col[k];
             acc -= a.ln();
             acc -= (a - 1.0) * pi[k].ln();
         }
@@ -566,12 +671,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut out = Array1::<f64>::zeros(target.len());
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -583,6 +687,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut pi_score = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -613,14 +719,13 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (tau * tau);
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -632,6 +737,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut pi_score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -677,14 +784,13 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             "IBPAssignmentPenalty::hvp dimension mismatch"
         );
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         // Column aggregates (active_mass, pi_jac, pi_score, pi_score_derivative,
         // score, score_derivative). These are identical to hessian_diag and
@@ -700,6 +806,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut score = Array1::<f64>::zeros(self.k_max);
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -768,12 +876,15 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             return Array1::<f64>::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta(a_k, 1) shapes a_k = μ_k/(1−μ_k) whose prior mean μ_k is
+        // the forward gate's ordered stick-breaking multiplier, and their ρ
+        // derivatives da_k/dρ — the single-model reconciliation (#4).
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let n_f = n as f64;
-        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -781,27 +892,36 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 active_mass[k] += z[start + k];
             }
         }
-        // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ so dα/dρ=α and da/dρ=a. The plug-in
-        // π_k=(M_k+a)/(N+a+1) is the posterior MEAN, so it is NOT stationary for
-        // the energy (the mode (M_k+a−1)/(N+a−1) is); the implicit-π channel does
-        // not vanish and must be carried alongside the explicit Beta(a,1) channel:
-        //   ∂F/∂ρ = Σ_k [ (∂F/∂π_k)·(∂π_k/∂ρ)  +  (∂F/∂a)·(da/dρ) ],
-        //   ∂F/∂π_k = pi_score_k,  ∂π_k/∂ρ = a·(N+1−M_k)/D² (0 at the clamp),
-        //   ∂F/∂a  = −1/a − ln π_k,  da/dρ = a.
-        // The previous closed form kept only the explicit channel (valid solely at
-        // the stationary mode), disagreeing with the FD of `value`.
+        // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ. Each column has its OWN Beta shape
+        // a_k=μ_k/(1−μ_k) (μ_k=(α/(α+1))^(k+1) = the gate's prior mean), so
+        // D_k=N+a_k+1 and da_k/dρ = column_beta_shape_rho_deriv. The plug-in π̂_k =
+        // (M_k+a_k)/D_k is the posterior MEAN, NOT the mode, so the implicit-π
+        // channel does not vanish and rides alongside the explicit Beta(a_k,1) one:
+        //   ∂F/∂ρ = Σ_k [ (∂F/∂π̂_k)·(∂π̂_k/∂ρ)  +  (∂F/∂a_k)·(da_k/dρ) ],
+        //   ∂F/∂π̂_k = pi_score_k,  ∂π̂_k/∂ρ = (da_k/dρ)·(N+1−M_k)/D_k² (0 at clamp),
+        //   ∂F/∂a_k = −1/a_k − ln π̂_k.
+        // (Previously a_k=α/K gave the scalar da/dρ=a; the per-column da_k/dρ makes
+        // this the exact α-gradient of the reconciled single model.)
         let mut acc = 0.0;
         for k in 0..self.k_max {
+            // #Bug4: a fixed/inert column contributes nothing to ∂F/∂ρ (its logits
+            // are held constant), matching its exclusion from `value`.
+            if self.column_is_fixed(k) {
+                continue;
+            }
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let dpi_drho = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
-                a * (n_f + 1.0 - mass) / (denom * denom)
+                da * (n_f + 1.0 - mass) / (denom * denom)
             } else {
                 0.0
             };
             let pi_score = -mass / pk + (n_f - mass) / (1.0 - pk) - (a - 1.0) / pk;
-            acc += pi_score * dpi_drho + (-1.0 / a - pk.ln()) * a;
+            acc += pi_score * dpi_drho + (-1.0 / a - pk.ln()) * da;
         }
         Array1::from_vec(vec![self.weight * acc])
     }

@@ -2479,6 +2479,46 @@ pub(crate) fn streaming_cross_row_woodbury_log_det_honors_pd_floor_1795() {
     );
 }
 
+
+/// #1795 — the cross-row IBP preconditioner builder is another reduced-Schur
+/// factorization entry point. It must use the same spectral PD-floor as the
+/// direct dense solve, rather than a raw Cholesky, because the preconditioner
+/// inverts the same collapsed decoder subspace before CG handles the explicit
+/// cross-row Woodbury coupling.
+#[test]
+pub(crate) fn cross_row_preconditioner_build_honors_pd_floor_1795() {
+    let backend = CpuBatchedBlockSolver;
+    let mut sys = diagonal_arrow_fixture(2.0, 1.0);
+    // With zero H_tβ blocks, the reduced Schur is exactly H_ββ. This matrix has
+    // eigenvalues {+3, −1}: a bare Cholesky must reject it, while the #1038
+    // spectral floor unit-deflates the collapsed direction relative to λ_max=3.
+    sys.hbb = array![[1.0_f64, 2.0], [2.0, 1.0]];
+
+    let unfloored = ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, false, &backend);
+    assert!(
+        matches!(unfloored, Err(ArrowSchurError::SchurFactorFailed { .. })),
+        "un-floored cross-row preconditioner must surface the non-PD Schur"
+    );
+
+    let floored = ArrowBlockDiagInverse::build(
+        &sys,
+        0.0,
+        0.0,
+        Some(SPECTRAL_DEFLATION_REL_FLOOR),
+        false,
+        &backend,
+    )
+    .expect("cross-row preconditioner must honor the spectral PD-floor");
+
+    let rhs_t = Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]);
+    let rhs_beta = array![0.25_f64, -0.5];
+    let (_sol_t, sol_beta) = floored.apply(rhs_t.view(), rhs_beta.view());
+    assert!(
+        sol_beta.iter().all(|v| v.is_finite()),
+        "floored cross-row preconditioner solve must produce finite beta components, got {sol_beta:?}"
+    );
+}
+
 #[test]
 pub(crate) fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
     let (mut sys, source, zprime) = build_ibp_woodbury_fixture();

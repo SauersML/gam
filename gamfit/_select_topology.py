@@ -30,7 +30,6 @@ from ._compare import (
 )
 from ._tables import PreNormalizedTable, normalize_table, table_columns
 from .smooth import (
-    BSpline,
     Duchon,
     LatentCoord,
     PeriodicSplineCurve,
@@ -68,6 +67,10 @@ class _TopologyRustModule(Protocol):
         names: list[str],
         log_density_rows: list[list[float]],
     ) -> str: ...
+
+    def topology_bic_score(
+        self, fit: Any, n_obs: int, basis_size: int
+    ) -> float: ...
 
 
 BasisSpec: TypeAlias = Smooth
@@ -319,7 +322,7 @@ def select_topology(
         if not math.isfinite(reml_score):
             raise ValueError(f"degenerate REML score {reml_score!r}")
         basis_size = _basis_size(model)
-        null_dim = _fitted_or_candidate_null_dim(model, candidate, basis_size)
+        null_dim = _fitted_null_dim(model)
         raw_score = _score_for_kind(model, score_kind, n_obs, basis_size, null_dim)
         screen_score = _scale_score(raw_score, score_scale_kind, n_obs, _effective_dim(model))
         return _comparison_score(screen_score, score_kind)
@@ -363,11 +366,7 @@ def select_topology(
     }
     n_obs_by_candidate = {name: n_obs for name in fits}
     null_dims = {
-        candidate.name: _fitted_or_candidate_null_dim(
-            fits[candidate.name],
-            candidate,
-            basis_sizes[candidate.name],
-        )
+        candidate.name: _fitted_null_dim(fits[candidate.name])
         for candidate in survivors
         if candidate.name in fits
     }
@@ -580,6 +579,10 @@ def stack_topologies(
 
 
 def _gaussian_logpdf(y: float, mean: float, sd: float) -> float:
+    # Generic scalar Gaussian algebra used only to populate the held-out
+    # log-density matrix before the Rust stacking solve consumes it. There is no
+    # family-specific scoring or penalty math here, and crossing the FFI once
+    # per row would make the boundary noisier than the computation.
     z = (y - mean) / sd
     return -0.5 * math.log(2.0 * math.pi) - math.log(sd) - 0.5 * z * z
 
@@ -815,55 +818,14 @@ def _candidate_required_dim(topo: Smooth) -> int | None:
     return None
 
 
-def _fitted_or_candidate_null_dim(
-    fit_obj: Any, candidate: _Candidate, basis_size: int
-) -> float:
+def _fitted_null_dim(fit_obj: Any) -> float:
     null_dim = _extract_null_dim(fit_obj)
     if null_dim is not None:
         return null_dim
-    return _candidate_null_dim(candidate, basis_size)
-
-
-def _candidate_null_dim(candidate: _Candidate, basis_size: int) -> float:
-    topo = candidate.topology
-    if getattr(topo, "double_penalty", False):
-        return 0.0
-    if isinstance(topo, PeriodicSplineCurve):
-        return 1.0
-    if isinstance(topo, Sphere):
-        return 1.0
-    if isinstance(topo, TensorBSpline):
-        null_dim = 1
-        for marginal in topo.marginals:
-            null_dim *= _bspline_marginal_nullity(marginal)
-        identifiability = str(getattr(topo, "_gamfit_tensor_identifiability", "sum_tozero"))
-        if identifiability.lower().replace("-", "_") != "none":
-            null_dim = max(null_dim - 1, 0)
-        return float(min(max(null_dim, 0), basis_size))
-    if isinstance(topo, Duchon):
-        periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
-        if periodic and all(periodic):
-            return 1.0
-        dim = _candidate_required_dim(topo)
-        if dim is None:
-            dim = _centers_dim(topo.centers)
-        if dim is None:
-            dim = 1
-        nonperiodic_dim = sum(1 for value in periodic if not value) if periodic else dim
-        null_dim = math.comb(
-            nonperiodic_dim + _duchon_formula_order(topo),
-            nonperiodic_dim,
-        )
-        return float(min(max(null_dim, 0), basis_size))
-    return 0.0
-
-
-def _bspline_marginal_nullity(marginal: BSpline) -> int:
-    return 1 if marginal.periodic else max(0, int(marginal.penalty_order))
-
-
-def _duchon_formula_order(topo: Duchon) -> int:
-    return max(0, int(topo.m) - 1)
+    raise ValueError(
+        "Topology selection requires Rust null-dimension metadata; "
+        "fit summary is missing null_dim"
+    )
 
 
 def _centers_dim(centers: Any) -> int | None:
@@ -974,53 +936,11 @@ def _tk_score_from_parts(
 
 
 def _extract_null_dim(fit_obj: Any) -> float | None:
-    null_dim = _extract_float_field(fit_obj, ("null_dim",))
-    if null_dim is not None:
-        return null_dim
-
-    nullity = _extract_float_field(
-        fit_obj,
-        ("nullity", "penalty_nullity", "cache_nullity"),
-    )
-    if nullity is not None:
-        return nullity * _extract_output_dim(fit_obj)
-
-    dim_h = _extract_float_field(
-        fit_obj,
-        ("effective_dim", "dim_h", "dim_H", "hessian_dim"),
-    )
-    penalty_rank = _extract_float_field(
-        fit_obj,
-        ("penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"),
-    )
-    if dim_h is not None and penalty_rank is not None:
-        return dim_h - penalty_rank
-    return None
+    return _extract_float_field(fit_obj, ("null_dim",))
 
 
 def _extract_null_hessian_logdet(fit_obj: Any) -> float | None:
     return _extract_float_field(fit_obj, _NULL_HESSIAN_LOGDET_KEYS)
-
-
-def _extract_output_dim(fit_obj: Any) -> float:
-    coefficients = _coefficients_metadata(fit_obj)
-    shape = getattr(coefficients, "shape", None)
-    if shape is not None and len(shape) >= 2:
-        return float(shape[1])
-    return 1.0
-
-
-def _coefficients_metadata(fit_obj: Any) -> Any | None:
-    payload = _summary_payload(fit_obj)
-    if payload is not None:
-        coefficients = payload.get("coefficients")
-        if coefficients is not None:
-            return coefficients
-    if isinstance(fit_obj, Mapping):
-        coefficients = fit_obj.get("coefficients")
-        if coefficients is not None:
-            return coefficients
-    return getattr(fit_obj, "coefficients", None)
 
 
 def _comparison_score(score: float, score_kind: ScoreKind) -> float:
@@ -1070,12 +990,9 @@ def _extract_laml_score(fit_obj: Any) -> float:
 
 
 def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
-    if n_obs <= 1:
-        raise ValueError("BIC scoring requires at least two observations")
-    deviance = _extract_float_field(fit_obj, ("deviance",))
-    if deviance is None:
-        raise ValueError("BIC scoring requires fit.summary()['deviance']")
-    return float(deviance) + math.log(float(n_obs)) * float(basis_size)
+    return float(
+        _topology_rust().topology_bic_score(fit_obj, int(n_obs), int(basis_size))
+    )
 
 
 def _basis_size(fit_obj: Any) -> int:

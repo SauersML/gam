@@ -1264,8 +1264,8 @@ impl<'a> RemlState<'a> {
         // so it is harmless in production (default off) and captured by a
         // test-installed logger in the #1271 probe.
         if log::log_enabled!(log::Level::Info) {
-            use gam_linalg::faer_ndarray::FaerEigh;
             use faer::Side;
+            use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
             let (h_above_one, h_min, h_max) = match h_for_operator.as_ref().eigh(Side::Lower) {
                 Ok((evals, _)) => {
@@ -1634,8 +1634,8 @@ impl<'a> RemlState<'a> {
         // logdet internals per dense original-basis evaluation. Pure logging via
         // log::info! (default-off in production, no numeric behavior change).
         if log::log_enabled!(log::Level::Info) {
-            use gam_linalg::faer_ndarray::FaerEigh;
             use faer::Side;
+            use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
             let (h_above_one, h_min, h_max, h_eig_str) = match h_total_original.eigh(Side::Lower) {
                 Ok((evals, _)) => {
@@ -1872,11 +1872,7 @@ impl<'a> RemlState<'a> {
             Ok(x) => x,
             Err(_) => return false,
         };
-        unpenalized_hat_bound_below_threshold(
-            x.as_ref(),
-            self.weights,
-            ALO_MAX_LEVERAGE_THRESHOLD,
-        )
+        unpenalized_hat_bound_below_threshold(x.as_ref(), self.weights, ALO_MAX_LEVERAGE_THRESHOLD)
     }
 
     pub(crate) fn alo_stabilization_eval(
@@ -2152,10 +2148,7 @@ impl<'a> RemlState<'a> {
             {
                 Ok(chol) => {
                     let sensitivity =
-                        crate::sensitivity::FitSensitivity::from_faer_cholesky(
-                            &chol,
-                            x.ncols(),
-                        );
+                        crate::sensitivity::FitSensitivity::from_faer_cholesky(&chol, x.ncols());
                     let h_inv_xt = sensitivity.leverage_block(&x);
                     self.alo_stabilization_gradient(
                         rho,
@@ -3493,7 +3486,7 @@ pub(crate) fn unpenalized_hat_bound_below_threshold(
 ) -> bool {
     let n = x.nrows();
     let p = x.ncols();
-    if n == 0 || p == 0 || weights.len() != n {
+    if n == 0 || p == 0 || weights.len() != n || !(threshold.is_finite() && threshold > 0.0) {
         return false;
     }
     // Unpenalized weighted Gram G = XᵀWX. Any non-finite or negative weight
@@ -3564,7 +3557,6 @@ pub(crate) fn positive_penalty_rank_and_logdet(eigenvalues: &[f64]) -> (usize, f
 #[cfg(test)]
 mod tk_math_tests {
     use super::*;
-    use gam_linalg::faer_ndarray::FaerCholesky;
     use crate::mixture_link::{
         beta_logistic_inverse_link_jet, beta_logistic_inverse_link_pdffourth_derivative,
         beta_logistic_inverse_link_pdfthird_derivative, inverse_link_jet_for_inverse_link,
@@ -3574,8 +3566,9 @@ mod tk_math_tests {
         sas_inverse_link_pdfthird_derivative, state_fromspec,
     };
     use crate::pirls::{VarianceJet, e_obs_from_jets};
-    use gam_problem::{LinkComponent, MixtureLinkSpec};
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerCholesky;
+    use gam_problem::{LinkComponent, MixtureLinkSpec};
     use ndarray::array;
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
@@ -3694,6 +3687,18 @@ mod tk_math_tests {
     }
 
     #[test]
+    pub(crate) fn nonpositive_or_nonfinite_threshold_cannot_certify_inactive() {
+        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]];
+        let weights = Array1::<f64>::ones(x.nrows());
+        for threshold in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                !unpenalized_hat_bound_below_threshold(&x, weights.view(), threshold),
+                "invalid threshold {threshold} must not certify ALO inactivity"
+            );
+        }
+    }
+
+    #[test]
     pub(crate) fn firth_default_pc_prior_fills_flat_holes() {
         let pc = firth_default_pc_prior();
         let configured = RhoPrior::Normal { mean: 0.1, sd: 2.0 };
@@ -3708,11 +3713,8 @@ mod tk_math_tests {
         // An explicitly-configured prior is honored unchanged (no override).
         assert_eq!(*resolve_effective_rho_prior(&configured), configured);
         // Only flat coordinates of an Independent prior inherit the PC.
-        let indep = RhoPrior::Independent(vec![
-            RhoPrior::Flat,
-            configured.clone(),
-            flat_gamma.clone(),
-        ]);
+        let indep =
+            RhoPrior::Independent(vec![RhoPrior::Flat, configured.clone(), flat_gamma.clone()]);
         assert_eq!(
             *resolve_effective_rho_prior(&indep),
             RhoPrior::Independent(vec![pc.clone(), configured.clone(), pc.clone()])
@@ -4425,8 +4427,8 @@ mod adaptive_lm_lambda_tests {
 #[cfg(test)]
 mod ift_warm_start_tests {
     use super::*;
-    use gam_terms::construction::CanonicalPenalty;
     use gam_linalg::matrix::SymmetricMatrix;
+    use gam_terms::construction::CanonicalPenalty;
     use ndarray::Array2;
 
     #[test]
@@ -4499,8 +4501,8 @@ mod ift_warm_start_tests {
     /// taking its eigendecomposition and packing the positive-eigenvalue
     /// components into the `rank × p` root.
     pub(crate) fn dense_canonical_from_local(local: Array2<f64>, p: usize) -> CanonicalPenalty {
-        use gam_linalg::faer_ndarray::FaerEigh;
         use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
         let (evals, evecs) = local.eigh(Side::Lower).expect("eigh penalty");
         let mut rows: Vec<Array1<f64>> = Vec::new();
         let mut positive_eigenvalues: Vec<f64> = Vec::new();

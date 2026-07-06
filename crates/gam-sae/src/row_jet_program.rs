@@ -195,6 +195,16 @@ pub struct SaeReconstructionRowProgram {
     pub logit_slot: Vec<Option<usize>>,
     /// Tower slot of atom `k`'s latent axis `j` primary (`coord_slot[k][j]`).
     pub coord_slot: Vec<Vec<usize>>,
+    /// Per-atom FIXED-gate override (#1026/#1033). `Some(value)` pins atom `k`'s
+    /// gate `ζ_k` to a CONSTANT equal to `value` — the active-routing gate the
+    /// value assembly used — with its logit derivative (and every higher gate
+    /// channel) identically zero. This covers both an UNGATED atom (`a_k ≡ 1`,
+    /// #1026) and FROZEN/amortized routing (`a_k ≡ predicted`, #1033): in either
+    /// case the logit is NOT a free Newton parameter, so the gate must not
+    /// re-derive from a stale free logit. `None` (or an out-of-range / empty
+    /// vector) leaves the atom on the free-logit gate law. Length is `K` when
+    /// populated; an empty vector means "no fixed gates" (the historical path).
+    pub fixed_gate_value: Vec<Option<f64>>,
     /// Total number of seeded primaries (= `K` of the tower).
     pub n_primaries: usize,
 }
@@ -205,7 +215,23 @@ impl SaeReconstructionRowProgram {
     /// Σ_j exp(ℓ_j·inv_tau)`; the per-atom logistic is `σ((ℓ_k − shift_k)·
     /// inv_tau)` depending only on its own logit. Both carry every derivative
     /// channel automatically.
+    /// The fixed-gate constant for atom `k`, if its gate is pinned
+    /// ([`Self::fixed_gate_value`]). Returns a `constant` tower — value equal to
+    /// the pinned active-routing gate, all derivative channels zero — so ungated
+    /// (#1026) and frozen-routing (#1033) atoms carry no logit sensitivity.
+    #[inline]
+    fn fixed_gate<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> Option<S> {
+        self.fixed_gate_value
+            .get(atom)
+            .copied()
+            .flatten()
+            .map(S::constant)
+    }
+
     fn gate_tower<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> S {
+        if let Some(fixed) = self.fixed_gate::<K, S>(atom) {
+            return fixed;
+        }
         match self.gate {
             RowGate::Softmax { inv_tau } => {
                 // Build exp(ℓ_j·inv_tau − shift) for every atom that has a free
@@ -1409,6 +1435,7 @@ mod tests {
             gate: RowGate::Softmax { inv_tau },
             logit_slot: vec![Some(0), Some(1)],
             coord_slot: vec![vec![2, 3], vec![4, 5]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 6,
         };
         (prog, inv_tau)
@@ -1494,6 +1521,7 @@ mod tests {
             gate: RowGate::Softmax { inv_tau },
             logit_slot,
             coord_slot,
+            fixed_gate_value: Vec::new(),
             n_primaries: n_atoms * (1 + latent_dim),
         }
     }
@@ -1894,6 +1922,7 @@ mod tests {
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],
             coord_slot: vec![vec![1]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 2,
         };
         let gate = prog.gate_tower::<2, Tower4<2>>(0);
@@ -1907,6 +1936,86 @@ mod tests {
             gate.h[0][0],
             d2
         );
+    }
+
+    /// #1026/#1033 fixed-gate handling: an atom whose logit is pinned
+    /// (`fixed_gate_value[k] = Some(v)`) must gate through the CONSTANT `v` — the
+    /// active-routing value the assembly used — with EVERY gate derivative
+    /// channel (and hence the logit-slot derivative of the reconstruction)
+    /// identically zero, while its COORDINATE derivative remains the plain
+    /// contribution scaled by the fixed gate. A sibling FREE atom must be
+    /// unaffected (its own logit still moves the gate). This pins the gate-tower
+    /// short-circuit that the ungated / frozen-routing row programs rely on.
+    #[test]
+    fn fixed_gate_atom_is_constant_free_atom_unchanged() {
+        const K: usize = 4;
+        let inv_tau = 1.3;
+        // Atom 0 is PINNED to 0.75 even though its logit (3.0) would give a very
+        // different logistic gate; atom 1 is free at logit −0.5.
+        let fixed_val = 0.75_f64;
+        let free_logit = -0.5_f64;
+        let free_shift = 0.1_f64;
+        let mk_atom = |phi: f64, dphi: f64, dec: f64| AtomRowBasisJet {
+            phi: vec![phi],
+            d_phi: vec![vec![dphi]],
+            d2_phi: vec![vec![vec![0.0]]],
+            decoder: vec![vec![dec]],
+            latent_dim: 1,
+        };
+        // free-atom logistic gate value at (free_logit − free_shift)·inv_tau.
+        let x = (free_logit - free_shift) * inv_tau;
+        let sigma_free = 1.0 / (1.0 + (-x).exp());
+        let prog = SaeReconstructionRowProgram {
+            atoms: vec![mk_atom(1.0, 2.0, 1.5), mk_atom(1.0, 0.5, -0.8)],
+            // gate_value is the reported (active) gate: fixed for atom 0.
+            gate_value: vec![fixed_val, sigma_free],
+            logits: vec![3.0, free_logit],
+            gate_scale: vec![1.0, 1.0],
+            gate_shift: vec![0.0, free_shift],
+            gate: RowGate::PerAtomLogistic { inv_tau },
+            // Layout: logit slots 0,1; coord slots 2,3.
+            logit_slot: vec![Some(0), Some(1)],
+            coord_slot: vec![vec![2], vec![3]],
+            fixed_gate_value: vec![Some(fixed_val), None],
+            n_primaries: K,
+        };
+
+        // Atom 0's gate is a CONSTANT equal to the pinned value: value == fixed,
+        // and every gradient / Hessian channel is exactly zero.
+        let g0 = prog.gate_tower::<K, Tower4<K>>(0);
+        assert!((g0.v - fixed_val).abs() < 1e-15, "fixed gate value {}", g0.v);
+        for a in 0..K {
+            assert_eq!(g0.g[a], 0.0, "fixed gate ∂/∂p{a} must be exactly 0");
+            for b in 0..K {
+                assert_eq!(g0.h[a][b], 0.0, "fixed gate ∂²/∂p{a}∂p{b} must be 0");
+            }
+        }
+
+        // Atom 1 (free) is unchanged: it reproduces the logistic gate and its own
+        // logit derivative is nonzero.
+        let g1 = prog.gate_tower::<K, Tower4<K>>(1);
+        assert!((g1.v - sigma_free).abs() < 1e-12, "free gate value");
+        let d1 = sigma_free * (1.0 - sigma_free) * inv_tau;
+        assert!((g1.g[1] - d1).abs() < 1e-9, "free gate σ'");
+        assert!(g1.g[1].abs() > 1e-6, "free gate must depend on its logit");
+
+        // The reconstruction column: atom-0's LOGIT-slot derivative is zero (the
+        // gate is constant), while its COORDINATE-slot derivative is the plain
+        // decoded slope scaled by the FIXED gate (0.75 · d(decoded_0)/dt).
+        let col = prog.reconstruction_column::<K>(0);
+        assert_eq!(
+            col.g[0], 0.0,
+            "fixed atom's logit-slot reconstruction derivative must be exactly 0"
+        );
+        let decoded0_slope = 2.0 * 1.5; // d_phi · decoder
+        assert!(
+            (col.g[2] - fixed_val * decoded0_slope).abs() < 1e-12,
+            "fixed atom coord derivative must use gate {fixed_val}: got {}",
+            col.g[2]
+        );
+        // Value = fixed·decoded_0 + free·decoded_1.
+        let expected_v = fixed_val * (1.0 * 1.5) + sigma_free * (1.0 * -0.8);
+        assert!((col.v - expected_v).abs() < 1e-12, "reconstruction value");
     }
 
     /// #932 cutover pin: the PRODUCTION packed [`Order2`] reconstruction path
@@ -2110,6 +2219,7 @@ mod tests {
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot: vec![Some(0), Some(1)],
                 coord_slot: vec![vec![2, 3], vec![4, 5]],
+                fixed_gate_value: Vec::new(),
                 n_primaries: 6,
             }
         };
@@ -2224,6 +2334,7 @@ mod tests {
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],
             coord_slot: vec![vec![1]],
+            fixed_gate_value: Vec::new(),
             n_primaries: 2,
         };
         let rows = [mk(), mk(), mk(), mk()];

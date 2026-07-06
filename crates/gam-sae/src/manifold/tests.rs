@@ -40,7 +40,7 @@ pub(crate) fn assert_eta_one_parity(
     assert_matrix_same_bits(&eta.phi, &phi);
     assert_tensor3_same_bits(&eta.jet, &jet);
     assert_eq!(eta.split.curved_cols.len(), expected_curved);
-    for &col in &eta.split.linear_cols {
+    for &col in &eta.split.base_cols {
         for row in 0..phi.nrows() {
             assert_eq!(eta.dphi_deta[[row, col]], 0.0);
             for axis in 0..jet.shape()[2] {
@@ -1582,6 +1582,56 @@ pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, S
         vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
     );
     (term, target, rho)
+}
+
+/// #Bug4 — the ThresholdGate θ-adjoint prior THIRD derivative
+/// (`assignment_prior_hdiag_derivative_entry`) must be ZERO for a FIXED
+/// (ungated / frozen) logit, matching the zeroed assembled `htt` diagonal entry.
+/// A FREE logit inside the smoothing/optimization band carries a nonzero third
+/// derivative (non-vacuous fixture); the ungated atom's must be exactly zero.
+#[test]
+pub(crate) fn threshold_gate_fixed_logit_third_derivative_is_zero_bug4() {
+    use crate::manifold::arrow_solver::SaeLocalRowVar;
+    let (mut term, _target, rho) = small_two_atom_periodic_term();
+    // ThresholdGate mode with atom 1 UNGATED — a fixed/inert logit.
+    term.assignment.mode = AssignmentMode::threshold_gate(1.0, 0.0);
+    term.assignment.ungated = vec![false, true];
+    // Both atoms' logits well inside the optimization band (cutoff is −36), so a
+    // FREE logit genuinely carries a nonzero third derivative.
+    for row in 0..term.n_obs() {
+        term.assignment.logits[[row, 0]] = 0.5;
+        term.assignment.logits[[row, 1]] = 0.5;
+    }
+    assert!(
+        term.assignment.logit_is_fixed(1) && !term.assignment.logit_is_fixed(0),
+        "atom 1 must be fixed (ungated), atom 0 free"
+    );
+
+    // FREE atom 0 inside the band ⇒ nonzero third derivative (fixture is live).
+    let free = term.assignment_prior_hdiag_derivative_entry(
+        &rho,
+        0,
+        0,
+        SaeLocalRowVar::Logit { atom: 0 },
+        None,
+    );
+    assert!(
+        free.abs() > 0.0,
+        "a FREE logit inside the band must carry a nonzero third derivative; got {free}"
+    );
+
+    // FIXED atom 1 ⇒ the θ-adjoint third derivative MUST be exactly zero.
+    let fixed = term.assignment_prior_hdiag_derivative_entry(
+        &rho,
+        0,
+        1,
+        SaeLocalRowVar::Logit { atom: 1 },
+        None,
+    );
+    assert_eq!(
+        fixed, 0.0,
+        "a FIXED (ungated) logit third derivative must be zero; got {fixed}"
+    );
 }
 
 /// #1026 — the per-atom **held-out EV attribution** that pairs with each
@@ -4033,7 +4083,7 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
         Array1::from_vec(vec![0.001, 0.002, 0.0005]),
     ];
     let layout =
-        SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full);
+        SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full, None);
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
     assert_eq!(layout.active_atoms[1], vec![0, 1]);
     // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
@@ -4092,6 +4142,7 @@ pub(crate) fn from_dense_weights_large_k_support_proposal_1450() {
         1e-3,
         vec![d; k_atoms],
         coord_offsets,
+        None,
     );
     for row in 0..n {
         assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
@@ -4135,6 +4186,7 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
         relative_cutoff,
         coord_dims,
         coord_offsets_full,
+        None,
     );
     for row in 0..n {
         // Exact support recovery: the proposal must return exactly the planted

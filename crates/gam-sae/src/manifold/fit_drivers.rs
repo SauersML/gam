@@ -1828,7 +1828,9 @@ impl SaeManifoldTerm {
 
     /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
     /// the default `η = 1` the basis is the full curved basis; `η = 0` is the
-    /// linear (Eckart-Young) relaxation. The next `refresh_basis` — which every
+    /// base-topology relaxation (the atom on its base, η-invariant columns only —
+    /// not a linear/affine model for curved bases, whose base columns still embed
+    /// curvature). The next `refresh_basis` — which every
     /// joint-fit entry point runs — installs the dialed basis, so the dial takes
     /// effect on the following corrector solve. Errors on a non-finite or
     /// out-of-range `η`.
@@ -1879,8 +1881,10 @@ impl SaeManifoldTerm {
     /// True when the curvature-homotopy `η` dial cannot move the basis: no
     /// atom evaluator declares curved columns (caller-managed atoms have no
     /// evaluator, hence no split — equally immovable). A one-harmonic periodic
-    /// bank (`M = 3`) is the canonical case: constant + fundamental are all
-    /// linear columns. Combined with an all-zero isometry ramp this makes the
+    /// bank (`M = 3`) is the canonical case: constant + fundamental are all base
+    /// (η-invariant) columns — the fundamental `[sin, cos]` is itself curved (it
+    /// traces the circle), so "base" here means "nothing left to dial", not
+    /// "linear". Combined with an all-zero isometry ramp this makes the
     /// entry walk's corrector problem η-invariant, which
     /// [`SaeManifoldOuterObjective::run_curvature_homotopy_entry_at_rho`] uses
     /// to collapse the η-grid to its first corrector.
@@ -1900,7 +1904,7 @@ impl SaeManifoldTerm {
 
     /// Per-atom curved-column basis derivative `∂Φ^η/∂η` (#1007): the raw
     /// (un-dialed) basis on each evaluator's *curved* columns and zero on the
-    /// linear columns and on caller-managed atoms (no evaluator → no split).
+    /// base (η-invariant) columns and on caller-managed atoms (no evaluator → no split).
     /// This is the η-independent derivative channel, so it is exact at any
     /// current `η`.
     pub(crate) fn curvature_basis_eta_derivatives(&self) -> Result<Vec<Array2<f64>>, String> {
@@ -1934,7 +1938,7 @@ impl SaeManifoldTerm {
     /// (W = I for the Gaussian reconstruction channel)
     /// `∂g_β/∂η[k,μ,c] = Σ_i a_ik (∂Φ^η_k[i,μ]/∂η) r_i[c]`
     /// `              + Σ_i a_ik Φ^η_k[i,μ] (∂r_i[c]/∂η)`,
-    /// with `∂Φ^η/∂η` the raw curved-column basis (zero on linear columns) and
+    /// with `∂Φ^η/∂η` the raw curved-column basis (zero on base columns) and
     /// `∂r_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η) · B_{k'}`. The smoothness and
     /// ARD penalties do not depend on `η`, so they contribute nothing. The
     /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor.
@@ -2015,7 +2019,7 @@ impl SaeManifoldTerm {
     /// `∂fitted_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η)·B_{k'}` exactly as in the
     /// β predictor. Supplying this as `w_t` (instead of the historical `w_t = 0`)
     /// lets the predictor move coordinates as curvature turns on, so the homotopy
-    /// corrector tracks onto the curved branch rather than the linear shadow.
+    /// corrector tracks onto the curved branch rather than the base-topology shadow.
     /// Returns a zero vector for a curvature-inert dictionary (no curved columns).
     pub(crate) fn curvature_t_gradient_eta_derivative(
         &self,

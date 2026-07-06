@@ -169,3 +169,22 @@ def _selftest_softmax_topk_honors_target_k() -> None:
 
 def test_softmax_topk_honors_target_k() -> None:
     _selftest_softmax_topk_honors_target_k()
+
+
+def test_duchon_centers_nd_uses_rust_low_discrepancy_lift() -> None:
+    """The product-patch Duchon lift is Rust-owned and preserves the legacy R_d cloud."""
+    from gamfit.torch.manifold_sae import _duchon_centers_nd
+
+    centers = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    lifted = _duchon_centers_nd(centers, 3)
+    expected = torch.tensor(
+        [
+            [0.0, 0.2548776662466927, 0.06984029099805333],
+            [1.0 / 3.0, 0.009755332493385449, 0.6396805819961064],
+            [2.0 / 3.0, 0.764632998740078, 0.20952087299415956],
+            [1.0, 0.5195106649867709, 0.7793611639922129],
+        ],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(lifted, expected, rtol=0.0, atol=2.0e-16)
+    assert lifted.dtype == centers.dtype

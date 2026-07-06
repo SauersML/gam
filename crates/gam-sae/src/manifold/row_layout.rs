@@ -60,8 +60,20 @@ use super::*;
 /// top-`k` projection is then a no-op at the optimum.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
-    /// `active_atoms[row]` — sorted indices of active atoms for that row.
+    /// `active_atoms[row]` — sorted indices of active atoms for that row. Every
+    /// active atom carries a coord block; not every one carries a free logit slot
+    /// (see `logit_atoms`).
     pub active_atoms: Vec<Vec<usize>>,
+    /// `logit_atoms[row]` — the subset of `active_atoms[row]` (same ascending
+    /// order) carrying a FREE assignment-logit slot. Equals `active_atoms` for the
+    /// column-separable modes (IBP-MAP / JumpReLU). For SOFTMAX the reduced chart
+    /// has only `K−1` free logits: the reference atom `K−1` (pinned to zero, no
+    /// logit coordinate) is excluded. Since `K−1` is the largest atom and
+    /// `active_atoms` is sorted, the reference (when active) is always last, so
+    /// `logit_atoms[row] == active_atoms[row][..n_logit_active(row)]`. The compact
+    /// block is `[one slot per logit atom]` then `[one coord block per active
+    /// atom]`. (#Bug1)
+    pub logit_atoms: Vec<Vec<usize>>,
     /// For row `i`, active atom `active_atoms[i][j]` has its coord block
     /// starting at compressed position `coord_starts[i][j]`.
     pub coord_starts: Vec<Vec<usize>>,
@@ -85,10 +97,19 @@ pub(crate) struct JumpReluLayoutParams<'a> {
     pub threshold: f64,
     /// Gate temperature `τ`.
     pub temperature: f64,
-    /// `(n × k_atoms)` per-row logits.
+    /// `(n × k_atoms)` per-row EFFECTIVE ROUTING logits (frozen-aware): the hard
+    /// gate and in-band membership are decided on these, NOT the raw free
+    /// `self.logits`. Under frozen routing these are the predicted logits; when not
+    /// frozen they equal the free logits. (#Bug3)
     pub logits: &'a Array2<f64>,
-    /// `(n × k_atoms)` per-row separable-diagonal gradient magnitudes.
+    /// `(n × k_atoms)` per-row EFFECTIVE gate mass `a_{n,k}` (data-fit coupling),
+    /// NOT the separable prior gradient — the #2071 / #Bug7 block-size contract.
     pub contribution: &'a Array2<f64>,
+    /// Per-atom mask (length `k_atoms`) of UNGATED (#1026 background-tier) atoms
+    /// whose effective gate is pinned at `1.0` regardless of their logit. These are
+    /// force-included in the hard active set — they contribute a nonzero
+    /// reconstruction gate, so they MUST be in the compact support. (#Bug3)
+    pub ungated: &'a [bool],
     /// Cap on the per-row active-set size.
     pub k_active_cap: usize,
     /// Relative (per-row-peak) cutoff below which gated-off atoms are dropped.
@@ -124,13 +145,22 @@ impl SaeRowLayout {
     /// `K·(1+d)`, violating the `O(k_active)` contract on the very lane meant
     /// for large `K`.
     ///
-    /// `contribution[row, k]` is the exact magnitude of atom `k`'s separable
-    /// diagonal GRADIENT sub-vector at that row (`|∂P/∂logit| + Σ_axis
-    /// |∂ARD/∂t|`) — i.e. precisely the piece of `g_t` that leaves the row block
-    /// when `k` is dropped. Atoms are kept when they are hard-gated OR their
-    /// contribution exceeds `relative_cutoff · row_peak`, capped at
+    /// #Bug7 / #2071: `contribution[row, k]` is the atom's DATA-FIT COUPLING
+    /// magnitude — the EFFECTIVE gate mass `a_{n,k}` — NOT its separable prior
+    /// gradient. This is the load-bearing choice for the `O(k_active)` block-size
+    /// contract: gate mass is EXACTLY zero for every gated-off atom, so the
+    /// relative cutoff drops precisely the gated-off tail and the per-token block
+    /// stays `k_active·(1+d)` independent of `K`. (Scoring membership by the
+    /// separable prior gradient — which is `O(1)` for the many gated-off logits
+    /// sitting near the threshold — would re-bloat the block to `K·(1+d)`; see the
+    /// `AssignmentMode::ThresholdGate` assembly-plan comment.) A dropped gated-off
+    /// atom's separable diagonal prior term changes the assembled gradient by less
+    /// than the cutoff and leaves the OBJECTIVE VALUE bit-identical (the loss sums
+    /// the full −36 band independently of this layout). Atoms are kept when they
+    /// are hard-gated (nonzero effective gate, including every ungated atom) OR
+    /// their gate mass exceeds `relative_cutoff · row_peak`, capped at
     /// `k_active_cap` (hard-gated atoms are never dropped; the remaining budget
-    /// is filled by the highest-contribution gated-off atoms). Dropping an atom
+    /// is filled by the highest-mass gated-off atoms). Dropping an atom
     /// therefore changes the assembled gradient by less than the cutoff, and
     /// leaves the OBJECTIVE VALUE bit-identical (the loss's
     /// `assignment_prior_value` / `ard_value` sum the full −36 band
@@ -145,6 +175,7 @@ impl SaeRowLayout {
             temperature,
             logits,
             contribution,
+            ungated,
             k_active_cap,
             relative_cutoff,
             coord_dims,
@@ -163,10 +194,14 @@ impl SaeRowLayout {
                     temperature,
                 )
             };
-            // Hard forward gate: nonzero assignment mass ⇒ data-fit coupling in
-            // the joint block. Always retained.
+            // Hard forward gate: nonzero EFFECTIVE assignment mass ⇒ data-fit
+            // coupling in the joint block. Always retained. `logits` is the
+            // effective routing (frozen-aware), and #Bug3: an UNGATED atom has its
+            // gate pinned at 1.0 regardless of its logit, so it is always active in
+            // the reconstruction and MUST be in the compact support even when its
+            // raw logit sits below the threshold.
             let hard: Vec<usize> = (0..k_atoms)
-                .filter(|&k| row_logits[k] > threshold)
+                .filter(|&k| ungated[k] || row_logits[k] > threshold)
                 .collect();
             // Relative-cutoff base: the largest separable contribution over all
             // in-band atoms in this row.
@@ -240,12 +275,15 @@ impl SaeRowLayout {
     /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
     /// The active set is always non-empty (the single largest-magnitude atom is
     /// retained even if below cutoff) so every row keeps a valid block.
+    /// `reference_atom` is `Some(K−1)` for the reduced SOFTMAX chart (that atom
+    /// gets a coord block but no free logit slot) and `None` for IBP-MAP. (#Bug1)
     pub(crate) fn from_dense_weights(
         assignments: &[Array1<f64>],
         k_active_cap: usize,
         relative_cutoff: f64,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
+        reference_atom: Option<usize>,
     ) -> Self {
         let cap = k_active_cap.max(1);
         let mut per_row = Vec::with_capacity(assignments.len());
@@ -289,53 +327,96 @@ impl SaeRowLayout {
             active.sort_unstable();
             per_row.push(active);
         }
-        Self::from_active_atoms(per_row, coord_dims, coord_offsets_full)
+        Self::from_active_atoms_with_reference(
+            per_row,
+            coord_dims,
+            coord_offsets_full,
+            reference_atom,
+        )
     }
 
-    /// Build from explicit per-row active-atom index lists.
+    /// Build from explicit per-row active-atom index lists. Every active atom is
+    /// logit-bearing (the column-separable IBP-MAP / JumpReLU chart). For the
+    /// reduced SOFTMAX chart use [`Self::from_active_atoms_with_reference`].
     pub(crate) fn from_active_atoms(
         active_atoms: Vec<Vec<usize>>,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
+        Self::from_active_atoms_with_reference(active_atoms, coord_dims, coord_offsets_full, None)
+    }
+
+    /// Build honoring an optional `reference_atom` that carries a COORD block but
+    /// NO free logit slot (softmax's pinned reference `K−1`). When a row's active
+    /// set contains it, it is excluded from `logit_atoms` but kept in
+    /// `active_atoms`. Since the reference is the largest atom and `active_atoms`
+    /// is sorted, it is always the last active element, so the leading
+    /// `logit_atoms.len()` compact slots are the logit slots. (#Bug1)
+    pub(crate) fn from_active_atoms_with_reference(
+        active_atoms: Vec<Vec<usize>>,
+        coord_dims: Vec<usize>,
+        coord_offsets_full: Vec<usize>,
+        reference_atom: Option<usize>,
+    ) -> Self {
+        let mut logit_atoms_all = Vec::with_capacity(active_atoms.len());
         let mut coord_starts_all = Vec::with_capacity(active_atoms.len());
         for active in &active_atoms {
+            let logit_atoms: Vec<usize> = active
+                .iter()
+                .copied()
+                .filter(|&k| Some(k) != reference_atom)
+                .collect();
             let mut starts = Vec::with_capacity(active.len());
-            let mut cursor = active.len();
+            // Coord blocks start AFTER the logit slots.
+            let mut cursor = logit_atoms.len();
             for &k in active {
                 starts.push(cursor);
                 cursor += coord_dims[k];
             }
+            logit_atoms_all.push(logit_atoms);
             coord_starts_all.push(starts);
         }
         Self {
             active_atoms,
+            logit_atoms: logit_atoms_all,
             coord_starts: coord_starts_all,
             coord_offsets_full,
             coord_dims,
         }
     }
 
-    /// Per-row compressed dim.
+    /// Number of FREE logit slots in row `row`'s compact block (the leading
+    /// slots). Equals `active_atoms[row].len()` except on a softmax row whose
+    /// active set includes the reference atom, where it is one fewer. (#Bug1)
+    pub fn n_logit_active(&self, row: usize) -> usize {
+        self.logit_atoms[row].len()
+    }
+
+    /// Per-row compressed dim: free logit slots + coord blocks for every active
+    /// atom.
     pub fn row_q_active(&self, row: usize) -> usize {
         let active = &self.active_atoms[row];
         let coord_sum: usize = active.iter().map(|&k| self.coord_dims[k]).sum();
-        active.len() + coord_sum
+        self.logit_atoms[row].len() + coord_sum
     }
 
     /// Expand a compact `delta_t` row slice back into full-q, zeros for inactive.
+    /// The softmax reference atom has no logit slot (its logit position does not
+    /// exist in the reduced chart), so only its coord block is written. (#Bug1)
     pub fn expand_row(&self, row: usize, delta_t_row: &[f64], out: &mut [f64]) {
         for v in out.iter_mut() {
             *v = 0.0;
         }
+        for (j, &k) in self.logit_atoms[row].iter().enumerate() {
+            out[k] = delta_t_row[j];
+        }
         let active = &self.active_atoms[row];
         let starts = &self.coord_starts[row];
-        for (j, &k) in active.iter().enumerate() {
-            out[k] = delta_t_row[j];
+        for (pos, &k) in active.iter().enumerate() {
             let d = self.coord_dims[k];
             let full_off = self.coord_offsets_full[k];
             for axis in 0..d {
-                out[full_off + axis] = delta_t_row[starts[j] + axis];
+                out[full_off + axis] = delta_t_row[starts[pos] + axis];
             }
         }
     }
@@ -403,6 +484,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: k,
             relative_cutoff: 1.0e-3,
             coord_dims: coord_dims.clone(),
@@ -426,6 +508,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: 2,
             relative_cutoff: 1.0e-3,
             coord_dims,
@@ -523,6 +606,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: k,
             relative_cutoff: 1.0e-3,
             coord_dims,
@@ -630,5 +714,112 @@ mod jumprelu_hard_gate_tests {
         // Tolerance is met with margin: dropped atoms' separable contribution
         // (~e^{-28..-35}) is far below the 1e-8 gate.
         assert!(max_diff < 1.0e-8, "max full-q gradient diff {max_diff:e}");
+    }
+}
+
+#[cfg(test)]
+mod softmax_reference_chart_tests {
+    //! #Bug1 — a SOFTMAX compact active set containing the reference atom `K−1`
+    //! must give it a COORD block but NO free logit slot, and `expand_row` must
+    //! never write a phantom reference logit into a coordinate position.
+    use super::SaeRowLayout;
+
+    #[test]
+    fn softmax_reference_atom_has_coords_but_no_logit_slot() {
+        // K=3, each atom coord dim 1. Full softmax chart (row_block_dim=5):
+        // full 0,1 = free logits (atoms 0,1); full 2,3,4 = coords (atoms 0,1,2).
+        // Atom 2 is the reference (K−1) with NO logit position.
+        let coord_dims = vec![1usize, 1, 1];
+        let coord_offsets_full = vec![2usize, 3, 4];
+        let active = vec![vec![0usize, 2], vec![2usize]];
+        let layout = SaeRowLayout::from_active_atoms_with_reference(
+            active,
+            coord_dims,
+            coord_offsets_full,
+            Some(2),
+        );
+        assert_eq!(layout.logit_atoms[0], vec![0]);
+        assert_eq!(layout.n_logit_active(0), 1);
+        assert_eq!(layout.row_q_active(0), 3); // 1 logit + coords(atom0)+coords(atom2)
+        assert_eq!(layout.logit_atoms[1], Vec::<usize>::new());
+        assert_eq!(layout.n_logit_active(1), 0);
+        assert_eq!(layout.row_q_active(1), 1);
+        // expand_row: compact [logit(atom0), coord(atom0), coord(atom2)] must land
+        // as logit0→full0, coord atom0→full2, coord atom2→full4 — full index 2
+        // (=coord atom 0) must receive the coordinate, never a phantom reference
+        // logit.
+        let mut out = vec![0.0_f64; 5];
+        layout.expand_row(0, &[10.0, 20.0, 30.0], &mut out);
+        assert_eq!(out, vec![10.0, 0.0, 20.0, 0.0, 30.0]);
+        for (j, &k) in layout.logit_atoms[0].iter().enumerate() {
+            assert_ne!(k, 2, "logit slot {j} must not be the reference atom");
+        }
+    }
+
+    /// #Bug1 — the production entry point: `from_dense_weights` with the softmax
+    /// `reference_atom = Some(K−1)`, forcing the REFERENCE atom to be the LARGEST
+    /// assignment weight (so it is always selected into the compact active set).
+    /// The existing direct-`from_active_atoms_with_reference` test does not
+    /// exercise this softmax-weight path, and the sibling `from_dense_weights`
+    /// unit test uses the IBP/JumpReLU K-slot layout (`reference_atom = None`).
+    /// Asserts: the reference atom gets a coord block but NO free logit slot, and
+    /// `expand_row` never writes a reference-logit delta into atom 0's coordinate
+    /// offset.
+    #[test]
+    fn from_dense_weights_softmax_reference_largest_weight_has_no_logit_slot() {
+        use ndarray::Array1;
+        // K=3 softmax reduced chart. Full-q layout = [logit(atom0), logit(atom1),
+        // coord(atom0), coord(atom1), coord(atom2)]; atom 2 = reference (K−1).
+        let coord_dims = vec![1usize, 1, 1];
+        let coord_offsets_full = vec![2usize, 3, 4];
+        // Row 0: reference atom 2 is the LARGEST weight (would be selected first).
+        // Row 1: reference and atom 0 both large; all three above the relative
+        // cutoff so every atom is active (the reference-logit exclusion, not any
+        // truncation, is what this test pins).
+        let assignments = vec![
+            Array1::from_vec(vec![0.1_f64, 0.05, 0.85]),
+            Array1::from_vec(vec![0.45_f64, 0.001, 0.55]),
+        ];
+        let layout = SaeRowLayout::from_dense_weights(
+            &assignments,
+            /* k_active_cap */ 3,
+            /* relative_cutoff */ 1.0e-3,
+            coord_dims,
+            coord_offsets_full,
+            /* reference_atom */ Some(2),
+        );
+        // The reference atom, though the largest weight, must be active (coord
+        // block) but carry NO free logit slot in any row.
+        for row in 0..assignments.len() {
+            assert!(
+                layout.active_atoms[row].contains(&2),
+                "row {row}: reference atom must be in the active (coord) set"
+            );
+            for (j, &k) in layout.logit_atoms[row].iter().enumerate() {
+                assert_ne!(
+                    k, 2,
+                    "row {row} logit slot {j}: reference atom K−1 must have no logit slot"
+                );
+            }
+            // n_logit_active is exactly one fewer than active_atoms when the
+            // reference is active.
+            assert_eq!(
+                layout.n_logit_active(row),
+                layout.active_atoms[row].len() - 1,
+                "row {row}: reference atom must reduce the free-logit count by one"
+            );
+        }
+        // Row 0 active = {0,1,2}: compact [logit0, logit1, coord0, coord1, coord2].
+        // expand_row must place coord0 at full offset 2 (atom 0's coord slot) — the
+        // slot the pre-fix code corrupted with a phantom reference logit.
+        assert_eq!(layout.active_atoms[0], vec![0, 1, 2]);
+        assert_eq!(layout.logit_atoms[0], vec![0, 1]);
+        let mut out = vec![0.0_f64; 5];
+        layout.expand_row(0, &[1.0, 2.0, 3.0, 4.0, 5.0], &mut out);
+        // logit0→full0, logit1→full1, coord0→full2, coord1→full3, coord2→full4.
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Explicit: atom 0's coordinate offset (full index 2) holds the coord
+        // delta (3.0), NOT a reference-logit delta.
+        assert_eq!(out[2], 3.0, "atom 0 coord slot must not be a reference logit");
     }
 }

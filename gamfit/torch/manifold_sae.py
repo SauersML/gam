@@ -556,35 +556,10 @@ def _basis_rust(
 
 
 def _duchon_centers_nd(centers_1d: torch.Tensor, d: int) -> torch.Tensor:
-    """Lift the ``(K,)`` 1-D Duchon centers to a ``(K, d)`` cloud in ``[0, 1]^d``.
-
-    Axis 0 keeps the caller's 1-D centers (so the periodic/leading coordinate of
-    a cylinder or product patch is seeded exactly as in the 1-D case). The
-    remaining ``d - 1`` axes are filled by an additive-recurrence (Kronecker /
-    generalized-golden-ratio) low-discrepancy sequence keyed only to ``(K, d)``:
-    deterministic, buffer-free, and non-degenerate (the centers do not collapse
-    onto a diagonal, so the multi-axis Duchon kernel is well-conditioned). The
-    centers are a *fixed* design the decoder learns against, so any deterministic
-    well-spread placement is admissible; this one is reproducible and stable
-    across forward calls without enlarging the serialized state.
-    """
-    base = centers_1d.reshape(-1, 1)
-    k = int(base.shape[0])
-    dtype = base.dtype
-    device = base.device
-    if d <= 1 or k == 0:
-        return base
-    # Generalized golden ratio phi_d: the real root of x^{d} = x + 1; its
-    # reciprocal powers give the canonical R_d low-discrepancy generators.
-    phi = 2.0
-    for _ in range(32):
-        phi = (1.0 + phi) ** (1.0 / float(d))
-    alphas = [((1.0 / phi) ** (j + 1)) % 1.0 for j in range(d - 1)]
-    idx = torch.arange(1, k + 1, dtype=dtype, device=device).reshape(-1, 1)
-    extra = torch.empty((k, d - 1), dtype=dtype, device=device)
-    for j, a in enumerate(alphas):
-        extra[:, j] = torch.remainder(idx[:, 0] * float(a) + 0.5, 1.0)
-    return torch.cat([base, extra], dim=-1)
+    """Rust-owned lift of ``(K,)`` 1-D Duchon centers to ``(K, d)``."""
+    centers_np = to_numpy_f64(centers_1d.reshape(-1))
+    lifted = rust_module().sae_duchon_centers_nd(centers_np, int(d))
+    return from_numpy_like(lifted, centers_1d)
 
 
 def _eval_basis_on_manifold(

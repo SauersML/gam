@@ -29,6 +29,7 @@ pub mod null_sampler;
 pub mod null_battery;
 pub mod routability;
 pub mod row_jet_program;
+pub mod saebench_metrics;
 pub mod sparse_dict;
 pub mod spectrometer;
 pub mod structure_harvest;
