@@ -307,6 +307,7 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
     eta: ArrayView1<'_, f64>,
     mean: ArrayView1<'_, f64>,
     sigma: ArrayView1<'_, f64>,
+    mean_standard_error: Option<ArrayView1<'_, f64>>,
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
 ) -> CliResult<()> {
@@ -320,22 +321,36 @@ pub(crate) fn write_gaussian_location_scale_prediction_csv(
         (GAUSSIAN_LOCATION_SCALE_BASE_COLUMNS[2], &sigma_v),
     ];
 
+    let se_v: Vec<f64>;
     let lo_v: Vec<f64>;
     let hi_v: Vec<f64>;
-    if let Some(lo) = mean_lower {
-        lo_v = lo.to_vec();
-        hi_v = mean_upper
+    if let Some(se) = mean_standard_error {
+        se_v = se.to_vec();
+        lo_v = mean_lower
             .ok_or_else(|| CliError::Internal {
-                reason: "internal error: mean_upper missing while mean_lower is present"
-                    .to_string(),
+                reason: "internal error: mean_lower missing while std_error is present".to_string(),
             })?
             .to_vec();
+        hi_v = mean_upper
+            .ok_or_else(|| CliError::Internal {
+                reason: "internal error: mean_upper missing while std_error is present".to_string(),
+            })?
+            .to_vec();
+        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
         cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
         cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
+    } else if let (Some(lo), Some(hi)) = (mean_lower, mean_upper) {
+        lo_v = lo.to_vec();
+        hi_v = hi.to_vec();
+        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
+        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
+    } else if mean_lower.is_some() {
+        return Err(CliError::Internal {
+            reason: "internal error: mean_upper missing while mean_lower is present".to_string(),
+        });
     } else if mean_upper.is_some() {
         return Err(CliError::Internal {
-            reason: "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
-                .to_string(),
+            reason: "internal error: mean_lower missing while mean_upper is present".to_string(),
         });
     }
 

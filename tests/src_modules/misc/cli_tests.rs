@@ -4693,6 +4693,7 @@ fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
         sigma.view(),
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -4731,6 +4732,7 @@ fn gaussian_location_scale_prediction_csv_includes_boundswhen_present() {
         eta.view(),
         mean.view(),
         sigma.view(),
+        None,
         Some(mean_lower.view()),
         Some(mean_upper.view()),
     )
@@ -4753,6 +4755,55 @@ fn gaussian_location_scale_prediction_csv_includes_boundswhen_present() {
 }
 
 #[test]
+fn gaussian_location_scale_prediction_csv_includes_std_error_before_bounds_when_present() {
+    let mut path = std::env::temp_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
+    path.push(format!("gam_gaussian_loc_scale_pred_se_{ts}.csv"));
+
+    let eta = array![1.0];
+    let mean = array![1.0];
+    let sigma = array![0.4];
+    let std_error = array![0.3];
+    let mean_lower = array![0.2];
+    let mean_upper = array![1.8];
+    write_gaussian_location_scale_prediction_csv(
+        &path,
+        eta.view(),
+        mean.view(),
+        sigma.view(),
+        Some(std_error.view()),
+        Some(mean_lower.view()),
+        Some(mean_upper.view()),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write gaussian location-scale prediction csv with std_error", e
+        )
+    });
+
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some("eta,mean,sigma,std_error,mean_lower,mean_upper"),
+        "gaussian location-scale uncertainty output must preserve the computed mean SE"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(
+            "1.000000000000,1.000000000000,0.400000000000,0.300000000000,0.200000000000,1.800000000000"
+        )
+    );
+
+    fs::remove_file(&path).ok();
+}
+
+#[test]
 fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
     // Directly test the CSV output for Gaussian location-scale predictions.
     // This model class now always goes through the unified PredictableModel path.
@@ -4768,6 +4819,7 @@ fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
         eta.view(),
         mean.view(),
         sigma.view(),
+        None,
         None,
         None,
     )
