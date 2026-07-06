@@ -8,6 +8,140 @@
 
 use super::*;
 
+fn persisted_atom_basis_values(
+    kind: &SaeAtomBasisKind,
+    coords: ArrayView2<'_, f64>,
+    decoder_width: usize,
+    latent_dim: usize,
+    atom_idx: usize,
+) -> Result<Array2<f64>, String> {
+    match kind {
+        SaeAtomBasisKind::Periodic => {
+            if decoder_width == 0 || decoder_width % 2 == 0 {
+                return Err(format!(
+                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} decoder width \
+                     must be odd and positive; got {decoder_width}"
+                ));
+            }
+            if coords.ncols() == 0 {
+                return Err(format!(
+                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} needs at least \
+                     one coordinate column"
+                ));
+            }
+            if latent_dim != 1 {
+                return Err(format!(
+                    "reconstruct_persisted_atom_set: periodic atom {atom_idx} expects \
+                     latent_dim=1, got {latent_dim}"
+                ));
+            }
+            let evaluator = PeriodicHarmonicEvaluator::new(decoder_width)?;
+            let (phi, _jet) = evaluator.evaluate(coords.slice(s![.., 0..1]))?;
+            Ok(phi)
+        }
+        SaeAtomBasisKind::Sphere => {
+            if decoder_width != 7 {
+                return Err(format!(
+                    "reconstruct_persisted_atom_set: sphere atom {atom_idx} decoder width \
+                     must be 7, got {decoder_width}"
+                ));
+            }
+            if latent_dim != 2 {
+                return Err(format!(
+                    "reconstruct_persisted_atom_set: sphere atom {atom_idx} expects \
+                     latent_dim=2, got {latent_dim}"
+                ));
+            }
+            let (phi, _jet) = SphereChartEvaluator.evaluate(coords)?;
+            Ok(phi)
+        }
+        other => Err(format!(
+            "reconstruct_persisted_atom_set: atom {atom_idx} basis {other:?} is not a \
+             centers-free analytic persisted basis; rebuild a SaeManifoldTerm for this topology"
+        )),
+    }
+}
+
+/// Reconstruct a persisted SAE-manifold atom set from frozen coordinates,
+/// assignment masses, and decoder blocks.
+///
+/// This is the stateless counterpart to [`SaeManifoldTerm::try_fitted`]: Python
+/// artifacts that intentionally dropped the full term still carry enough
+/// persisted atom state to materialize `Σ_k a_ik · Φ_k(t_ik)B_k`. Keeping the
+/// basis evaluation, GEMM, and weighted atom sum here prevents the Python facade
+/// from becoming a second decoder implementation.
+pub fn reconstruct_persisted_atom_set(
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dims: &[usize],
+    decoder_blocks: &[ArrayView2<'_, f64>],
+    coords: &[ArrayView2<'_, f64>],
+    assignments: ArrayView2<'_, f64>,
+    p_out: usize,
+) -> Result<Array2<f64>, String> {
+    let k_atoms = basis_kinds.len();
+    if atom_dims.len() != k_atoms || decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
+        return Err(format!(
+            "reconstruct_persisted_atom_set: metadata lengths must all equal K={k_atoms} \
+             (atom_dims={}, decoder_blocks={}, coords={})",
+            atom_dims.len(),
+            decoder_blocks.len(),
+            coords.len()
+        ));
+    }
+    let n_rows = assignments.nrows();
+    if assignments.ncols() != k_atoms {
+        return Err(format!(
+            "reconstruct_persisted_atom_set: assignments {:?} must have K={k_atoms} columns",
+            assignments.dim()
+        ));
+    }
+    if p_out == 0 {
+        return Err("reconstruct_persisted_atom_set: p_out must be positive".to_string());
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, p_out));
+    for atom_idx in 0..k_atoms {
+        let decoder = decoder_blocks[atom_idx];
+        let (basis_width, decoder_p) = decoder.dim();
+        if decoder_p != p_out {
+            return Err(format!(
+                "reconstruct_persisted_atom_set: atom {atom_idx} decoder output width \
+                 {decoder_p} != p_out {p_out}"
+            ));
+        }
+        let atom_coords = coords[atom_idx];
+        if atom_coords.nrows() != n_rows {
+            return Err(format!(
+                "reconstruct_persisted_atom_set: atom {atom_idx} coords rows {} != {n_rows}",
+                atom_coords.nrows()
+            ));
+        }
+        let phi = persisted_atom_basis_values(
+            &basis_kinds[atom_idx],
+            atom_coords,
+            basis_width,
+            atom_dims[atom_idx],
+            atom_idx,
+        )?;
+        if phi.dim() != (n_rows, basis_width) {
+            return Err(format!(
+                "reconstruct_persisted_atom_set: atom {atom_idx} basis {:?} != ({n_rows}, {basis_width})",
+                phi.dim()
+            ));
+        }
+        let decoded = phi.dot(&decoder);
+        for row in 0..n_rows {
+            let gate = assignments[[row, atom_idx]];
+            if gate == 0.0 {
+                continue;
+            }
+            for col in 0..p_out {
+                out[[row, col]] += gate * decoded[[row, col]];
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl SaeManifoldTerm {
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
     /// unscaled inverse-Hessian β-block `S_β⁻¹` into a posterior covariance
@@ -248,10 +382,88 @@ impl SaeManifoldTerm {
         Ok(SaeShapeUncertainty { dispersion, atoms })
     }
 
-    /// #977 — complete the per-atom shape band for any atom the pre-search
-    /// Schur factor could not cover (a structure-search-BORN atom, whose index
-    /// is ≥ the seed `K` the Schur cache was assembled at), from that atom's OWN
-    /// fitted penalized inner Hessian.
+    /// Recompute the JOINT inverse-Hessian shape bands at the CURRENT (final)
+    /// term + ρ state — the same joint covariance
+    /// [`Self::assemble_shape_uncertainty`] forms, but rebuilt AFTER a
+    /// structure-changing or finalization move invalidated the pre-search Schur
+    /// factor.
+    ///
+    /// [`super::SaeManifoldOuterObjective::decoder_shape_uncertainty`] reads the
+    /// joint factor off the outer objective BEFORE `into_fitted` consumes it, so
+    /// the bands it returns describe the PRE-search dictionary at the settled ρ.
+    /// When evidence-guarded structure search grows / re-converges the whole
+    /// dictionary (a certified birth / fission / fusion or a demoted death), or a
+    /// finalization fallback swaps the settled basin / canonicalizes charts, that
+    /// factor no longer describes the returned model. This rebuilds the undamped
+    /// Direct joint-Hessian factor from THIS (final) term at `rho` — the exact
+    /// factor the REML criterion forms at the inner optimum — and reads the
+    /// per-atom covariance and bands off its Schur factor, scaling by the
+    /// reconstruction dispersion `φ̂`. The result is the DOCUMENTED joint
+    /// covariance: it carries the cross-atom covariance and the decoder-coordinate
+    /// Schur couplings, and its per-channel band varies across output channels —
+    /// unlike the per-atom inner-Hessian marginal
+    /// [`Self::complete_born_atom_shape_bands`] falls back to. Every atom is
+    /// covered, seed AND structure-search-born, because the factor is assembled at
+    /// the final dictionary's `k_atoms()`.
+    ///
+    /// The term is already at its optimum, so the inner re-solve converges
+    /// immediately. Mirrors `decoder_shape_uncertainty`'s admission fallback: when
+    /// the streaming plan cannot admit the dense Direct factor (LLM-scale fits
+    /// with no dense Schur), it returns
+    /// [`Self::shape_uncertainty_without_decoder_covariance`] — honest NaN bands,
+    /// never a fabricated number. Call before [`Self::into_fitted`] has run is not
+    /// required; it takes the fitted `term`/`rho` directly.
+    pub fn recompute_joint_shape_uncertainty(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeShapeUncertainty, String> {
+        let plan = self.streaming_plan().admitted_or_error(
+            self.n_obs(),
+            self.output_dim(),
+            self.k_atoms(),
+        )?;
+        if !plan.direct_logdet_admitted() {
+            // No dense Direct Schur factor at this scale: the joint covariance
+            // cannot be materialized. Report the honest without-covariance bands
+            // (NaN sd) rather than a per-atom stand-in dressed up as joint.
+            let loss = self.loss(target, rho)?;
+            let n_scalar = (self.n_obs().saturating_mul(self.output_dim())).max(1) as f64;
+            let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
+            return Ok(self.shape_uncertainty_without_decoder_covariance(dispersion));
+        }
+        let (_cost, loss, cache) = self.reml_criterion_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+        let dispersion = self.reconstruction_dispersion(&loss, &cache, rho)?;
+        self.assemble_shape_uncertainty(&cache, dispersion)
+    }
+
+    /// #977 — complete the per-atom shape band for any atom the joint Schur
+    /// factor could not cover (a structure-search-BORN atom whose index is ≥ the
+    /// seed `K` a pre-search cache was assembled at, or an atom whose joint block
+    /// came back non-finite), from that atom's OWN fitted penalized inner Hessian.
+    ///
+    /// NOTE: the band this fills is a per-atom MARGINAL, NOT the joint covariance.
+    /// It is `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹ Φ_k(t)` from the atom's own inner
+    /// Hessian `H_k = Φ_kᵀ W_k Φ_k + S̃_k`, so it DROPS the cross-atom covariance
+    /// and the decoder-coordinate Schur couplings the joint factor carries, and is
+    /// identical across output channels (the inner Hessian is shared across
+    /// channels; the decoder differs only in the mean). The production fit
+    /// recomputes the JOINT bands via [`Self::recompute_joint_shape_uncertainty`]
+    /// after a structure / finalization change, so this completion runs only as a
+    /// backstop for atoms the joint factor genuinely left unidentified (all-NaN).
     ///
     /// The Schur path ([`Self::assemble_shape_uncertainty`]) reads the joint
     /// inverse-Hessian β-block per atom, but that factor is assembled ONCE before
