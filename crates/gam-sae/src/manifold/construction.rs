@@ -5609,8 +5609,9 @@ impl SaeManifoldTerm {
             };
             let stalled = new_loss_total.is_finite()
                 && relative_decrease.is_finite()
-                && (relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                    || captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION);
+                && captured_fraction.is_finite()
+                && relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                && captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION;
             previous_loss_total = new_loss_total;
             if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
                 let stationary_sys = self
@@ -5636,13 +5637,16 @@ impl SaeManifoldTerm {
                     {
                         return Ok(stationary_cache);
                     }
-                    return Err(format!(
-                        "SaeManifoldTerm::reml_criterion: objective stalled but the stalled \
-                         point is not stationary (‖g‖={stationary_grad_norm:.6e}, \
-                         ‖Π⊥gauge g‖={stationary_quotient_grad_norm:.6e}, \
-                         tol {grad_tolerance:.6e}); refusing to rank an off-optimum \
-                         Laplace criterion"
-                    ));
+                    // A flat objective round is only a convergence shortcut when
+                    // the KKT certificate above is stationary. If not, keep using
+                    // the deterministic refinement budget: either later rounds
+                    // reach stationarity, or the normal `total_inner_iter >=
+                    // refine_limit` branch reports non-convergence without
+                    // ranking an off-optimum Laplace criterion. Returning `Err`
+                    // here was too strong for K=1 circle fits: one weakly
+                    // identified round could abort a still-descending solve and
+                    // poison the outer BFGS line search with a false value-probe
+                    // refusal.
                 }
                 // Stagnated AND the undamped factor still fails: this is the
                 // numerical fixed point of the inner solve under rank-deficient
