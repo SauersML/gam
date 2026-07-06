@@ -1904,7 +1904,7 @@ impl SaeManifoldTerm {
 
     /// Per-atom curved-column basis derivative `∂Φ^η/∂η` (#1007): the raw
     /// (un-dialed) basis on each evaluator's *curved* columns and zero on the
-    /// linear columns and on caller-managed atoms (no evaluator → no split).
+    /// base (η-invariant) columns and on caller-managed atoms (no evaluator → no split).
     /// This is the η-independent derivative channel, so it is exact at any
     /// current `η`.
     pub(crate) fn curvature_basis_eta_derivatives(&self) -> Result<Vec<Array2<f64>>, String> {
@@ -1938,7 +1938,7 @@ impl SaeManifoldTerm {
     /// (W = I for the Gaussian reconstruction channel)
     /// `∂g_β/∂η[k,μ,c] = Σ_i a_ik (∂Φ^η_k[i,μ]/∂η) r_i[c]`
     /// `              + Σ_i a_ik Φ^η_k[i,μ] (∂r_i[c]/∂η)`,
-    /// with `∂Φ^η/∂η` the raw curved-column basis (zero on linear columns) and
+    /// with `∂Φ^η/∂η` the raw curved-column basis (zero on base columns) and
     /// `∂r_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η) · B_{k'}`. The smoothness and
     /// ARD penalties do not depend on `η`, so they contribute nothing. The
     /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor.
@@ -2019,7 +2019,7 @@ impl SaeManifoldTerm {
     /// `∂fitted_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η)·B_{k'}` exactly as in the
     /// β predictor. Supplying this as `w_t` (instead of the historical `w_t = 0`)
     /// lets the predictor move coordinates as curvature turns on, so the homotopy
-    /// corrector tracks onto the curved branch rather than the linear shadow.
+    /// corrector tracks onto the curved branch rather than the base-topology shadow.
     /// Returns a zero vector for a curvature-inert dictionary (no curved columns).
     pub(crate) fn curvature_t_gradient_eta_derivative(
         &self,
