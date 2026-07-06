@@ -231,32 +231,22 @@ pub(crate) fn run_predict_unified(
             Some(pred.mean_upper),
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
-        // Mirror the `--uncertainty` arm's covariance-mode handling so the
-        // posterior-mean credible interval includes smoothing-parameter
-        // uncertainty by default (issue #812), instead of the bare conditional.
+        // Point-only curved-link prediction still needs the posterior mean
+        // `E[link⁻¹(X·β)]`, but it must not ask the posterior-mean backend for
+        // interval quantities. Passing a confidence level is the switch that
+        // populates `mean_standard_error`/bounds, and the CSV writer emits any
+        // populated optionals. Keep the default point estimate identical to the
+        // `--uncertainty` arm while leaving SE/band columns absent unless the
+        // user requested them (#2136).
         let pm_options = PosteriorMeanOptions {
-            confidence_level: Some(args.level),
+            confidence_level: None,
             covariance_mode: infer_covariance_mode(args.covariance_mode),
             include_observation_interval: false,
         };
         let pm = predictor
             .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-        (
-            pm.eta,
-            pm.mean,
-            // Response-scale `std_error` (#1536): the posterior-mean path
-            // populates `mean_standard_error` whenever a confidence level is
-            // requested (it is here); fall back to the link-scale SE only for
-            // the unreachable point-only case.
-            Some(
-                pm.mean_standard_error
-                    .clone()
-                    .unwrap_or(pm.eta_standard_error),
-            ),
-            pm.mean_lower,
-            pm.mean_upper,
-        )
+        (pm.eta, pm.mean, None, None, None)
     } else {
         let pred = predictor
             .predict_plugin_response(pred_input)
