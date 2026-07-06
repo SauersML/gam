@@ -8,6 +8,7 @@ from gamfit._response_geometry import (
     closure,
     clr,
     geometry_log_map,
+    inverse_alr,
     simplex_exp_map,
     simplex_frechet_mean,
     sphere_exp_map,
@@ -47,6 +48,24 @@ def test_simplex_clr_and_alr_roundtrip_at_frechet_base() -> None:
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+def test_inverse_alr_accepts_single_coordinate_vector_roundtrip() -> None:
+    x = np.array([0.2, 0.5, 0.3], dtype=float)
+    expected = closure(x)
+
+    for reference in (-1, 0, 1):
+        coords = alr(x, reference=reference)
+        reconstructed = inverse_alr(coords, reference=reference)
+
+        assert coords.shape == (2,)
+        assert reconstructed.shape == x.shape
+        np.testing.assert_allclose(
+            reconstructed,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
 
 def test_sphere_frechet_mean_is_intrinsic_and_log_exp_roundtrip() -> None:
