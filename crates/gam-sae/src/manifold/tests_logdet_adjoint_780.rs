@@ -5,7 +5,7 @@
 //! `tests` module.
 
 use super::derivative_oracle::{
-    BranchCertificate, DerivativeTraceChannel, ExactTraceChannel, ExactTraceReport,
+    DerivativeTraceChannel, ExactTraceChannel, ExactTraceReport,
     MajorizerAnchorMode, PivotBranch, dual_spd_logdet, guarded_exact_trace_report,
 };
 use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean};
