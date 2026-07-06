@@ -369,6 +369,7 @@ impl SaeManifoldOuterObjective {
         term.evidence_gauge_deflation_last_delta_sign = 0;
         term.dictionary_cocollapse_reseeds = 0;
         term.best_cocollapse_incumbent = None;
+        term.structural_cocollapse_reseeds = 0;
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         Self {

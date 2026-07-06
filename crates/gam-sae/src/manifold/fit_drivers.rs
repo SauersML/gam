@@ -3104,15 +3104,23 @@ impl SaeManifoldTerm {
     pub(crate) fn structural_coherence_collapse_detected(
         &self,
     ) -> Result<Option<(usize, usize, f64)>, String> {
+        Ok(self
+            .structural_coherence_collapsed_pairs()?
+            .into_iter()
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(j, kk, coherence, _bar)| (j, kk, coherence)))
+    }
+
+    fn structural_coherence_collapsed_pairs(&self) -> Result<Vec<(usize, usize, f64, f64)>, String> {
         let k = self.k_atoms();
         let p = self.output_dim();
         if k < 2 || p == 0 {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
-        let mut worst: Option<(usize, usize, f64)> = None;
+        let mut collapsed = Vec::new();
         for j in 0..k {
             for kk in (j + 1)..k {
                 let rj = frames[j].ncols();
@@ -3129,12 +3137,123 @@ impl SaeManifoldTerm {
                 let b = rk as f64 / p as f64;
                 let mu_null = (a * (1.0 - b)).max(0.0).sqrt() + (b * (1.0 - a)).max(0.0).sqrt();
                 let bar = 0.5 * (mu_null.min(1.0) + 1.0);
-                if coherence > bar && worst.as_ref().is_none_or(|&(_, _, c)| coherence > c) {
-                    worst = Some((j, kk, coherence));
+                if coherence > bar {
+                    collapsed.push((j, kk, coherence, bar));
                 }
             }
         }
-        Ok(worst)
+        Ok(collapsed)
+    }
+
+    /// High-EV structural co-collapse guard. Decoder-norm and EV guards catch atoms
+    /// that vanish; this one catches atoms that keep norm and EV while occupying the
+    /// same output frame. Those states must not be treated as healthy reconstruction
+    /// incumbents, and a bounded residual-PC reseed gives the fit a separated basin to
+    /// descend from instead of cycling through restore -> duplicate -> restore.
+    pub(crate) fn enforce_structural_coherence_guard(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        iteration: usize,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        if !self.guards_enabled || self.k_atoms() < 2 {
+            return Ok(());
+        }
+        let mut pairs = self.structural_coherence_collapsed_pairs()?;
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let k = self.k_atoms();
+        let decoder_norms: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| {
+                atom.decoder_coefficients
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
+        let mut selected = vec![false; k];
+        let mut floor_by_atom = vec![0.0_f64; k];
+        let mut coherence_by_atom = vec![0.0_f64; k];
+        for &(j, kk, coherence, bar) in &pairs {
+            let atom = if selected[j] && selected[kk] {
+                continue;
+            } else if selected[j] {
+                kk
+            } else if selected[kk] {
+                j
+            } else if decoder_norms[j] < decoder_norms[kk] {
+                j
+            } else if decoder_norms[kk] < decoder_norms[j] {
+                kk
+            } else {
+                kk
+            };
+            selected[atom] = true;
+            floor_by_atom[atom] = bar;
+            coherence_by_atom[atom] = coherence;
+        }
+        let mut to_reseed = Vec::new();
+        for atom in 0..k {
+            if !selected[atom] {
+                continue;
+            }
+            let reseeds_used = self
+                .collapse_events
+                .iter()
+                .filter(|event| event.atom == atom && event.action == CollapseAction::Reseeded)
+                .count();
+            if reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET
+                && self.structural_cocollapse_reseeds < SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET
+            {
+                to_reseed.push(atom);
+                self.collapse_events.push(CollapseEvent {
+                    iteration,
+                    atom,
+                    max_active_mass: coherence_by_atom[atom],
+                    floor: floor_by_atom[atom],
+                    action: CollapseAction::Reseeded,
+                });
+            } else {
+                let already_terminal = self
+                    .collapse_events
+                    .iter()
+                    .any(|event| event.atom == atom && event.action == CollapseAction::Terminal);
+                if !already_terminal {
+                    self.collapse_events.push(CollapseEvent {
+                        iteration,
+                        atom,
+                        max_active_mass: coherence_by_atom[atom],
+                        floor: floor_by_atom[atom],
+                        action: CollapseAction::Terminal,
+                    });
+                }
+            }
+        }
+        if to_reseed.is_empty() {
+            return Ok(());
+        }
+        self.structural_cocollapse_reseeds += 1;
+        log::warn!(
+            "SaeManifoldTerm: structural coherence collapse — reseeding {} duplicate-output \
+             atom(s) onto residual PCs (structural multi-start \
+             {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET})",
+            to_reseed.len(),
+            self.structural_cocollapse_reseeds
+        );
+        let pc_pair_offset = self.structural_cocollapse_reseeds.saturating_sub(1);
+        self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho, pc_pair_offset)?;
+        for &atom in &to_reseed {
+            self.reseed_collapsed_atom_logits(atom);
+        }
+        self.refit_decoder_sequential_deflation(target, rho)?;
+        self.anchor_logits_to_residual_ownership(target)?;
+        self.refit_decoder_sequential_deflation(target, rho)?;
+        Ok(())
     }
 
     /// #2027 cold-start SEQUENTIAL CHART deflation — seed each atom's CHART *and*
@@ -4033,16 +4152,19 @@ impl SaeManifoldTerm {
         let mut best_reconstruction_ev = self
             .dictionary_reconstruction_ev(target, rho)
             .unwrap_or(f64::NEG_INFINITY);
+        let initial_reconstruction_is_structurally_healthy = best_reconstruction_ev.is_finite()
+            && self.structural_coherence_collapse_detected()?.is_none();
         // #2081 — the incumbent carries its coordinate-uniformity score alongside
         // EV so the keep-best can break (near-)equal-EV ties on coordinate fidelity.
-        let mut best_reconstruction_uniformity = if best_reconstruction_ev.is_finite() {
+        let mut best_reconstruction_uniformity = if initial_reconstruction_is_structurally_healthy {
             self.coordinate_uniformity_aggregate()
         } else {
             None
         };
-        let mut best_reconstruction_state = if best_reconstruction_ev.is_finite() {
+        let mut best_reconstruction_state = if initial_reconstruction_is_structurally_healthy {
             Some(self.snapshot_mutable_state())
         } else {
+            best_reconstruction_ev = f64::NEG_INFINITY;
             None
         };
         // #2100/#1117 — objective-stagnation convergence for the JOINT outer loop,
@@ -4394,6 +4516,7 @@ impl SaeManifoldTerm {
                 rho,
                 Some(&target_col_stats),
             )?;
+            self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). When the co-collapse
             // multi-start budget is fully spent yet the dictionary is STILL at or
@@ -4512,17 +4635,19 @@ impl SaeManifoldTerm {
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2081 — keep the best basin on EV FIRST and, at (near-)equal EV,
                 // on the coordinate-uniformity certificate ([`prefer_candidate_basin`]).
-                let candidate_uniformity = self.coordinate_uniformity_aggregate();
-                if prefer_candidate_basin(
-                    ev,
-                    candidate_uniformity,
-                    best_reconstruction_ev,
-                    best_reconstruction_uniformity,
-                    SAE_FINAL_EV_DEGRADATION_TOL,
-                ) {
-                    best_reconstruction_ev = ev;
-                    best_reconstruction_uniformity = candidate_uniformity;
-                    best_reconstruction_state = Some(self.snapshot_mutable_state());
+                if self.structural_coherence_collapse_detected()?.is_none() {
+                    let candidate_uniformity = self.coordinate_uniformity_aggregate();
+                    if prefer_candidate_basin(
+                        ev,
+                        candidate_uniformity,
+                        best_reconstruction_ev,
+                        best_reconstruction_uniformity,
+                        SAE_FINAL_EV_DEGRADATION_TOL,
+                    ) {
+                        best_reconstruction_ev = ev;
+                        best_reconstruction_uniformity = candidate_uniformity;
+                        best_reconstruction_state = Some(self.snapshot_mutable_state());
+                    }
                 }
             }
         }
