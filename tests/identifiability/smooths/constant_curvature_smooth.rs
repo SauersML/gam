@@ -148,6 +148,7 @@ fn basis_is_continuous_through_kappa_zero() {
         let spec = ConstantCurvatureBasisSpec {
             center_strategy: CenterStrategy::UserProvided(pts.clone()),
             kappa,
+            kappa_fixed: false,
             length_scale: LENGTH_SCALE,
             double_penalty: false,
             identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
@@ -245,6 +246,7 @@ fn penalty_is_constrained_kernel_gram() {
     let spec = ConstantCurvatureBasisSpec {
         center_strategy: CenterStrategy::UserProvided(pts.clone()),
         kappa,
+        kappa_fixed: false,
         length_scale: LENGTH_SCALE,
         double_penalty: true,
         identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,

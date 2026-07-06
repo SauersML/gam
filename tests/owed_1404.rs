@@ -124,6 +124,7 @@ fn realized_design_uses_effective_length_kernel_gram_1404() {
     let spec = ConstantCurvatureBasisSpec {
         center_strategy: CenterStrategy::UserProvided(pts.clone()),
         kappa,
+        kappa_fixed: false,
         length_scale: LENGTH_SCALE,
         double_penalty: false,
         identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
@@ -193,6 +194,7 @@ fn primary_penalty_is_raw_kernel_gram_no_ridge_1404() {
     let spec = ConstantCurvatureBasisSpec {
         center_strategy: CenterStrategy::UserProvided(pts.clone()),
         kappa,
+        kappa_fixed: false,
         length_scale: LENGTH_SCALE,
         double_penalty: false,
         identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,

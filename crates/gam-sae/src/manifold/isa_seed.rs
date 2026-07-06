@@ -805,8 +805,9 @@ fn capture_signal_span(
         deflate_support_span(&mut work, &dirs, before);
     }
     if dirs.len() % 2 == 1 {
-        let dropped = dirs.pop();
-        debug_assert!(dropped.is_some());
+        // A plane needs two axes; an odd count means one unpaired trailing
+        // direction, so drop it (the odd length guarantees `pop` yields it).
+        dirs.pop();
     }
     let Some((sigma2_cert, mp_edge)) = noise else {
         return Ok(None);

@@ -141,6 +141,7 @@ fn argmin_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
             // cheap across the grid while still resolving the radial signal.
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
             kappa,
+            kappa_fixed: false,
             length_scale: ell_ref,
             // No ridge: the curvature-blind double penalty defeats sign
             // identification (#1464). The RKHS Gram alone is full-rank PD.

@@ -86,6 +86,7 @@ fn base_spec(kappa: f64) -> ConstantCurvatureBasisSpec {
     ConstantCurvatureBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
         kappa,
+        kappa_fixed: false,
         length_scale: 0.0,
         double_penalty: false,
         identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,

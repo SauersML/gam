@@ -84,6 +84,7 @@ fn honest_argmin(feats: &Array2<f64>, y: &Array1<f64>) -> f64 {
         let spec = ConstantCurvatureBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
             kappa,
+            kappa_fixed: false,
             length_scale: 0.0,
             double_penalty: false,
             identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
