@@ -119,6 +119,29 @@ def test_build_info_reports_real_extension() -> None:
     ]
 
 
+def test_derive_ivae_aux_scale_matches_old_numpy_formula() -> None:
+    aux = np.array(
+        [
+            [1.0, 2.0, 5.0],
+            [2.5, -1.0, 5.0],
+            [-0.5, 4.0, 5.0],
+            [3.0, 0.5, 5.0],
+        ],
+        dtype=float,
+    )
+    amplitude = 0.4
+    aux2d = np.ascontiguousarray(aux)
+    col_mean = aux2d.mean(axis=0, keepdims=True)
+    col_std = aux2d.std(axis=0, keepdims=True)
+    safe_std = np.where(col_std > 0.0, col_std, 1.0)
+    z = (aux2d - col_mean) / safe_std
+    freq = np.arange(1, aux2d.shape[1] + 1, dtype=float).reshape(1, -1)
+    expected = np.ascontiguousarray(np.exp(amplitude * np.tanh(freq * z)))
+
+    actual = np.asarray(gamfit.derive_ivae_aux_scale(aux2d, amplitude, 1.0))
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-12)
+
+
 def test_validate_formula_reports_model_metadata() -> None:
     # Explicit Gaussian family: the toy fixture's integer-shaped y would be
     # auto-detected as Poisson under #1065, but this test is about generic

@@ -249,10 +249,31 @@ reconstruction dispersion `fit.dispersion`, and widens for a poorly-identified
 atom (a near-singular Schur block fans the band out). With many tokens the
 manifold is pinned far more tightly than any single noisy observation.
 
+The band is the **joint** decoder covariance: `Cov(β_k)` is the `k`-th block of
+the joint inverse Hessian, so it carries the cross-atom covariance and the
+decoder↔coordinate Schur couplings, and the per-channel `sd` genuinely varies
+across output features. This holds after **structure search** too — when a
+certified birth / fission / fusion (or a demoted death) re-converges the whole
+dictionary at a new smoothing state, the joint factor is rebuilt at the final
+model, so the reported band still reflects the joint covariance of the returned
+(possibly grown) dictionary, seed and born atoms alike.
+
 !!! note
     The uncertainty arrays are populated only on a **freshly-fit** model.
     A model round-tripped through `save` / `load` (or `to_dict` /
     `from_dict`) drops them, and `shape_uncertainty` then raises `ValueError`.
+
+!!! note "Degenerate atoms and the huge-`p` fallback"
+    A genuinely **unidentified** atom (no active rows, or a non-SPD joint block)
+    keeps an honest `NaN` band rather than a fabricated number. If the joint
+    inverse-Hessian factor cannot be reformed at the final state after a
+    structure move, or the ambient `p` is too large to admit the dense Schur
+    factor, the band for the affected atoms degrades to a **per-atom marginal**
+    `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹ Φ_k(t)` from that atom's own penalized inner
+    Hessian — which omits the cross-atom and coordinate couplings and is
+    identical across output channels — or to a `NaN` band. This is the honest
+    fallback, not the joint covariance; it is used only where the joint factor is
+    unavailable.
 
 ### Typical coordinate range
 

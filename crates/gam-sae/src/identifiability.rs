@@ -322,6 +322,45 @@ impl ConditionalPriorIvae {
     }
 }
 
+/// Derive the iVAE auxiliary-conditional scale `σ(u)` from the auxiliary table.
+///
+/// Each auxiliary column is population-standardized across rows, then mapped as
+/// `log σ_j(u) = log_amplitude * tanh(frequency_scale * (j + 1) * z_j)`.
+/// Constant columns standardize to zero, so their derived scale is exactly one
+/// and the downstream [`ConditionalPriorIvae::new`] rank check reports the
+/// resulting non-identifiability instead of fabricating variation.
+pub fn derive_ivae_aux_scale(
+    aux: ArrayView2<f64>,
+    log_amplitude: f64,
+    frequency_scale: f64,
+) -> Array2<f64> {
+    let (n_rows, n_cols) = aux.dim();
+    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+    let n = n_rows as f64;
+    for col in 0..n_cols {
+        let mut mean = 0.0;
+        for row in 0..n_rows {
+            mean += aux[[row, col]];
+        }
+        mean /= n;
+
+        let mut var = 0.0;
+        for row in 0..n_rows {
+            let centered = aux[[row, col]] - mean;
+            var += centered * centered;
+        }
+        let std = (var / n).sqrt();
+        let safe_std = if std > 0.0 { std } else { 1.0 };
+        let freq = frequency_scale * (col + 1) as f64;
+        for row in 0..n_rows {
+            let z = (aux[[row, col]] - mean) / safe_std;
+            let log_sigma = log_amplitude * (freq * z).tanh();
+            out[[row, col]] = log_sigma.exp();
+        }
+    }
+    out
+}
+
 /// Helper: evaluate a piecewise-linear "smooth" `f(u)` columnwise, given a
 /// (k_centres, latent_dim) coefficient table and a (n_rows,) auxiliary vector
 /// `u`. Used by the Python wrapper to back the iVAE per-latent (μ_i(u), σ_i(u))
@@ -3665,6 +3704,31 @@ mod tests {
         for &gv in g.iter() {
             assert!(gv.abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn derive_ivae_aux_scale_matches_numpy_formula() {
+        let aux = array![
+            [1.0_f64, 2.0, 5.0],
+            [2.5, -1.0, 5.0],
+            [-0.5, 4.0, 5.0],
+            [3.0, 0.5, 5.0],
+        ];
+        let scale = derive_ivae_aux_scale(aux.view(), 0.4, 1.0);
+        let expected = array![
+            [0.8694483838365188_f64, 1.2655369552163311, 1.0],
+            [1.2831253020529474, 0.6734640022297076, 1.0],
+            [0.6982995444784196, 1.4877547448810657, 1.0],
+            [1.376498244165498, 0.7443881970243742, 1.0],
+        ];
+        let mut max_abs = 0.0_f64;
+        for (actual, reference) in scale.iter().zip(expected.iter()) {
+            max_abs = max_abs.max((actual - reference).abs());
+        }
+        assert!(
+            max_abs < 1.0e-12,
+            "Rust iVAE aux-scale derivation differs from the old NumPy formula by {max_abs}"
+        );
     }
 
     #[test]

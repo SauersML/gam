@@ -56,6 +56,7 @@ from ._api import (
     cuda_subprocess_env,
     cuda_subprocess_library_dirs,
     cuda_diagnostics,
+    derive_ivae_aux_scale,
     duchon_basis,
     duchon_function_norm_penalty,
     matern_basis,

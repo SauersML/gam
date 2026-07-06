@@ -593,16 +593,11 @@ def _derive_aux_scale(aux_np: np.ndarray) -> np.ndarray:
     """
 
     aux2d = np.ascontiguousarray(np.asarray(aux_np, dtype=float))
-    col_mean = aux2d.mean(axis=0, keepdims=True)
-    col_std = aux2d.std(axis=0, keepdims=True)
-    # A constant column has zero spread; standardising it to 0 keeps σ = 1
-    # there so the (now provably) rank-deficient signature is surfaced by the
-    # Rust theorem check instead of being masked.
-    safe_std = np.where(col_std > 0.0, col_std, 1.0)
-    z = (aux2d - col_mean) / safe_std
-    freq = np.arange(1, aux2d.shape[1] + 1, dtype=float).reshape(1, -1)
-    log_sigma = _IVAE_AUX_SCALE_LOG_AMPLITUDE * np.tanh(freq * z)
-    return np.ascontiguousarray(np.exp(log_sigma))
+    return np.ascontiguousarray(
+        rust_module().derive_ivae_aux_scale(
+            aux2d, float(_IVAE_AUX_SCALE_LOG_AMPLITUDE), 1.0
+        )
+    )
 
 
 def _one_fit(

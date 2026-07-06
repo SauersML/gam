@@ -4379,6 +4379,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(mechanism_sparsity_jacobian, module)?)?;
+    module.add_function(wrap_pyfunction!(derive_ivae_aux_scale, module)?)?;
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_aux_richness, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_jacobian_sparsity, module)?)?;
@@ -4478,6 +4479,22 @@ fn mechanism_sparsity_jacobian<'py>(
         .map_err(py_value_error)?;
     let (value, grad) = pen.value_and_grad(w.as_array());
     Ok((value, grad.into_pyarray(py).unbind()))
+}
+
+/// Derive the iVAE auxiliary-conditional scale σ(u) from the auxiliary table.
+#[pyfunction(signature = (aux, log_amplitude, frequency_scale))]
+fn derive_ivae_aux_scale<'py>(
+    py: Python<'py>,
+    aux: PyReadonlyArray2<'py, f64>,
+    log_amplitude: f64,
+    frequency_scale: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let scale = gam::terms::sae::identifiability::derive_ivae_aux_scale(
+        aux.as_array(),
+        log_amplitude,
+        frequency_scale,
+    );
+    Ok(scale.into_pyarray(py).unbind())
 }
 
 /// iVAE conditional-Gaussian log-prior. Given per-row `(mean, scale)` arrays
