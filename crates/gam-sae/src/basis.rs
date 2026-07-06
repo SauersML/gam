@@ -261,7 +261,7 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
             ));
         }
         let mut curved = vec![false; n_basis];
-        for h in 2..=(n_basis - 1) / 2 {
+        for h in 1..=(n_basis - 1) / 2 {
             curved[2 * h - 1] = true;
             curved[2 * h] = true;
         }

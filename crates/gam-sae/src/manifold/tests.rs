@@ -68,7 +68,7 @@ pub(crate) fn assert_eta_one_parity(
 pub(crate) fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
     let periodic_coords = array![[0.0_f64], [0.125], [0.4]];
     let periodic = PeriodicHarmonicEvaluator::new(7).unwrap();
-    assert_eta_one_parity(&periodic, periodic_coords.view(), 4);
+    assert_eta_one_parity(&periodic, periodic_coords.view(), 6);
 
     let raw_circle_coords = array![[0.0_f64], [0.3], [1.1]];
     let raw_circle = RawPeriodicCircleEvaluator::new(1).unwrap();
@@ -107,6 +107,24 @@ pub(crate) fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
         .filter(|alpha| alpha.iter().sum::<usize>() <= 1)
         .count();
     assert_eta_one_parity(&euclidean, duchon_coords.view(), total_cols - linear_cols);
+}
+
+#[test]
+pub(crate) fn periodic_first_harmonic_is_curved_for_homotopy_1026() {
+    let periodic = PeriodicHarmonicEvaluator::new(3).unwrap();
+    let split = periodic.phi_eta_split(3).unwrap();
+    assert_eq!(
+        split.linear_cols,
+        vec![0],
+        "only the constant column is η-inert for a first-harmonic circle"
+    );
+    assert_eq!(
+        split.curved_cols,
+        vec![1, 2],
+        "the constant column is η-inert, but both first-harmonic sin/cos columns \
+         have nonzero second derivatives and must be on the curved side of the \
+         homotopy; otherwise a K=1 circle is treated as a linear atom"
+    );
 }
 
 /// Minimal K=1 term for direct unit tests of term-state machinery that does
