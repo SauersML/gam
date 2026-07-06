@@ -80,7 +80,16 @@ def load_model(model_path: str, device: str, dtype_name: str):
 
     dtype = getattr(torch, dtype_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype).to(device).eval()
+    load_kwargs = {"dtype": dtype, "low_cpu_mem_usage": True}
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, torch_dtype=dtype, low_cpu_mem_usage=True
+        )
+    if device != "cpu":
+        model = model.to(device)
+    model = model.eval()
     return tokenizer, model
 
 

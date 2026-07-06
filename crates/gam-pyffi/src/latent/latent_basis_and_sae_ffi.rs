@@ -4665,7 +4665,8 @@ fn sae_hybrid_split_dict<'py>(
     d.set_item("is_pure_curved", report.selection.is_pure_curved())?;
     d.set_item(
         "envelope_note",
-        "curved_vs_envelope_ratio near 1 means the K=1 chart is at the top-M \
+        "chart_efficiency_eta = EV_curved / EV_lin(top-M). Eta near 1 means \
+         the K=1 chart is at the top-M \
          linear information ceiling; much below 1 means convergence headroom. \
          Curvature-is-identifiability is a claim about sparse sums of charts \
          over strata, so K=1 on the raw stream is the wrong test; compare \
@@ -4716,6 +4717,10 @@ fn sae_hybrid_split_dict<'py>(
         match verdict.curved_vs_envelope_ratio {
             Some(ratio) => a.set_item("curved_vs_envelope_ratio", ratio)?,
             None => a.set_item("curved_vs_envelope_ratio", py.None())?,
+        }
+        match verdict.chart_efficiency_eta {
+            Some(eta) => a.set_item("chart_efficiency_eta", eta)?,
+            None => a.set_item("chart_efficiency_eta", py.None())?,
         }
         // #1228 — the fitted straight sub-model `b₀ + (t − t̄)·b₁` for a slot the
         // verdict collapsed to LINEAR. Serialized so a held-out reconstruction

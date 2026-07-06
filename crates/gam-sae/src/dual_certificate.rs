@@ -465,7 +465,9 @@ pub fn block_dual_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse_dict::{BlockSparseFit, SparseDictFit, ScoreRouteStats};
+    use crate::sparse_dict::{
+        BlockSparseFit, DecoderSolveStats, ScoreRouteStats, SparseDictFit,
+    };
     use ndarray::{Array2, Array3};
 
     /// Tiny deterministic LCG so the synthetic dictionaries need no rng crate in
@@ -533,6 +535,7 @@ mod tests {
             converged: true,
             active,
             score_route_stats: ScoreRouteStats::default(),
+            decoder_solve_stats: DecoderSolveStats::default(),
         }
     }
 

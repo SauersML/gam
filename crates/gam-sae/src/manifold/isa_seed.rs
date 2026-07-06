@@ -713,7 +713,7 @@ fn joint_jacobi_basis(
     best.map(|(_, q, y)| (q, y))
 }
 
-fn capture_signal_span(
+pub(crate) fn capture_signal_span(
     residual: ArrayView2<'_, f64>,
     max_planes: usize,
 ) -> Result<Option<IsaEigenParts>, String> {

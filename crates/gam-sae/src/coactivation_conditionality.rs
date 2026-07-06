@@ -429,7 +429,7 @@ pub fn coupling_influence_values(
     for &row in rows {
         let zi = (gate_i[row] - mean_i) / sd_i;
         let zj = (gate_j[row] - mean_j) / sd_j;
-        let value = zi * zj - rho - 0.5 * rho * (zi * zi - 1.0 + zj * zj - 1.0);
+        let value = zi * zj - 0.5 * rho * (zi * zi + zj * zj);
         psi.push(value);
     }
     Ok(CouplingInfluence {
@@ -1244,6 +1244,121 @@ mod tests {
     }
 
     #[test]
+    fn weighted_correlation_influence_matches_leave_one_out_jackknife() {
+        let n = 701usize;
+        let mut gate_i = Vec::with_capacity(n);
+        let mut gate_j = Vec::with_capacity(n);
+        let mut weights = Vec::with_capacity(n);
+        for row in 0..n {
+            let t = row as f64 / (n - 1) as f64;
+            let low = (2.0 * std::f64::consts::PI * t).sin();
+            let mid = (10.0 * std::f64::consts::PI * t).cos();
+            let high = (row as f64 * 0.173).sin();
+            gate_i.push(0.3 + 0.7 * low + 0.19 * mid);
+            gate_j.push(-0.2 + 0.45 * low - 0.31 * mid + 0.23 * high);
+            weights.push(0.75 + 0.35 * (row % 11) as f64 / 10.0);
+        }
+        let rows: Vec<usize> = (0..n).collect();
+        let influence = coupling_influence_values(&gate_i, &gate_j, &rows, &weights)
+            .expect("weighted correlation influence");
+        let rho = weighted_correlation_stat_excluding(&gate_i, &gate_j, &rows, &weights, None)
+            .expect("weighted correlation statistic");
+        assert!((rho - influence.rho).abs() < 1.0e-14);
+
+        let mut max_closed_form_diff = 0.0_f64;
+        let mut max_jackknife_diff = 0.0_f64;
+        let mut jackknife_sse = 0.0_f64;
+        let mut weighted_mean = 0.0_f64;
+        let (mean_i, mean_j, sd_i, sd_j) =
+            weighted_standardization(&gate_i, &gate_j, &rows, &weights, None)
+                .expect("weighted standardization");
+        for slot in 0..n {
+            let row = rows[slot];
+            let zi = (gate_i[row] - mean_i) / sd_i;
+            let zj = (gate_j[row] - mean_j) / sd_j;
+            let closed_form = zi * zj - 0.5 * influence.rho * (zi * zi + zj * zj);
+            let closed_form_diff = (closed_form - influence.psi[slot]).abs();
+            max_closed_form_diff = max_closed_form_diff.max(closed_form_diff);
+            weighted_mean += influence.normalized_weights[slot] * influence.psi[slot];
+
+            let leave_one_out =
+                weighted_correlation_stat_excluding(&gate_i, &gate_j, &rows, &weights, Some(slot))
+                    .expect("leave-one-out weighted correlation");
+            let q = influence.normalized_weights[slot];
+            let jackknife = ((1.0 - q) / q) * (influence.rho - leave_one_out);
+            let diff = jackknife - influence.psi[slot];
+            max_jackknife_diff = max_jackknife_diff.max(diff.abs());
+            jackknife_sse += diff * diff;
+        }
+        let jackknife_rms = (jackknife_sse / n as f64).sqrt();
+        println!(
+            "case=weighted_corr_if rho={:.6e} max_closed_form_diff={:.6e} mean_psi={:.6e} max_jackknife_diff={:.6e} jackknife_rms={:.6e}",
+            influence.rho,
+            max_closed_form_diff,
+            weighted_mean,
+            max_jackknife_diff,
+            jackknife_rms
+        );
+        assert!(max_closed_form_diff < 1.0e-14);
+        assert!(weighted_mean.abs() < 1.0e-14);
+        assert!(max_jackknife_diff < 1.2e-2);
+        assert!(jackknife_rms < 3.0e-3);
+    }
+
+    #[test]
+    fn conditional_coupling_influence_matches_leave_one_out_jackknife() {
+        let n = 907usize;
+        let mut active_i = Vec::with_capacity(n);
+        let mut active_j = Vec::with_capacity(n);
+        let mut weights = Vec::with_capacity(n);
+        for row in 0..n {
+            let phase = row as f64 * 0.037;
+            let gate_i_on = row % 5 == 0 || row % 17 == 3 || phase.sin() > 0.72;
+            let gate_j_on =
+                (gate_i_on && (row % 7 != 1 || phase.cos() > 0.1)) || row % 41 == 8;
+            active_i.push(gate_i_on);
+            active_j.push(gate_j_on);
+            weights.push(0.8 + 0.4 * (row % 13) as f64 / 12.0);
+        }
+        let pi = conditional_coupling_stat_excluding(&active_i, &active_j, &weights, None)
+            .expect("conditional coupling statistic");
+        let mass_i = weighted_active_mass_excluding(&active_i, &weights, None)
+            .expect("conditioning mass");
+
+        let total_weight: f64 = weights.iter().sum();
+        let mut max_jackknife_diff = 0.0_f64;
+        let mut jackknife_sse = 0.0_f64;
+        let mut weighted_mean = 0.0_f64;
+        for slot in 0..n {
+            let ai = if active_i[slot] { 1.0 } else { 0.0 };
+            let aj = if active_j[slot] { 1.0 } else { 0.0 };
+            let psi = ai * (aj - pi) / mass_i;
+            weighted_mean += (weights[slot] / total_weight) * psi;
+
+            let leave_one_out =
+                conditional_coupling_stat_excluding(&active_i, &active_j, &weights, Some(slot))
+                    .expect("leave-one-out conditional coupling");
+            let q = weights[slot] / total_weight;
+            let jackknife = ((1.0 - q) / q) * (pi - leave_one_out);
+            let diff = jackknife - psi;
+            max_jackknife_diff = max_jackknife_diff.max(diff.abs());
+            jackknife_sse += diff * diff;
+        }
+        let jackknife_rms = (jackknife_sse / n as f64).sqrt();
+        println!(
+            "case=conditional_coupling_if pi={:.6e} mass_i={:.6e} mean_psi={:.6e} max_jackknife_diff={:.6e} jackknife_rms={:.6e}",
+            pi,
+            mass_i,
+            weighted_mean,
+            max_jackknife_diff,
+            jackknife_rms
+        );
+        assert!(weighted_mean.abs() < 1.0e-14);
+        assert!(max_jackknife_diff < 7.0e-3);
+        assert!(jackknife_rms < 2.0e-3);
+    }
+
+    #[test]
     fn residual_gate_denominator_removes_same_chart_anchor_binding() {
         let n = 12usize;
         let chart_gate: Vec<f64> = (0..n)
@@ -1261,6 +1376,126 @@ mod tests {
         .unwrap();
         assert!(residual.active_i.iter().all(|&active| !active));
         assert!(residual.active_j.iter().all(|&active| !active));
+    }
+
+    fn weighted_correlation_stat_excluding(
+        gate_i: &[f64],
+        gate_j: &[f64],
+        rows: &[usize],
+        weights: &[f64],
+        excluded_slot: Option<usize>,
+    ) -> Result<f64, String> {
+        let (mean_i, mean_j, sd_i, sd_j) =
+            weighted_standardization(gate_i, gate_j, rows, weights, excluded_slot)?;
+        let mut total_weight = 0.0_f64;
+        let mut covariance = 0.0_f64;
+        for slot in 0..rows.len() {
+            if excluded_slot == Some(slot) {
+                continue;
+            }
+            let row = rows[slot];
+            let weight = weights[slot];
+            total_weight += weight;
+            covariance += weight * (gate_i[row] - mean_i) * (gate_j[row] - mean_j);
+        }
+        Ok(covariance / total_weight / (sd_i * sd_j))
+    }
+
+    fn weighted_standardization(
+        gate_i: &[f64],
+        gate_j: &[f64],
+        rows: &[usize],
+        weights: &[f64],
+        excluded_slot: Option<usize>,
+    ) -> Result<(f64, f64, f64, f64), String> {
+        let mut total_weight = 0.0_f64;
+        let mut mean_i = 0.0_f64;
+        let mut mean_j = 0.0_f64;
+        for slot in 0..rows.len() {
+            if excluded_slot == Some(slot) {
+                continue;
+            }
+            let row = rows[slot];
+            let weight = weights[slot];
+            total_weight += weight;
+            mean_i += weight * gate_i[row];
+            mean_j += weight * gate_j[row];
+        }
+        if !(total_weight > 0.0) {
+            return Err("weighted_standardization: empty retained sample".to_string());
+        }
+        mean_i /= total_weight;
+        mean_j /= total_weight;
+        let mut var_i = 0.0_f64;
+        let mut var_j = 0.0_f64;
+        for slot in 0..rows.len() {
+            if excluded_slot == Some(slot) {
+                continue;
+            }
+            let row = rows[slot];
+            let weight = weights[slot];
+            let zi = gate_i[row] - mean_i;
+            let zj = gate_j[row] - mean_j;
+            var_i += weight * zi * zi;
+            var_j += weight * zj * zj;
+        }
+        var_i /= total_weight;
+        var_j /= total_weight;
+        if !(var_i > 0.0 && var_j > 0.0) {
+            return Err("weighted_standardization: zero variance".to_string());
+        }
+        Ok((mean_i, mean_j, var_i.sqrt(), var_j.sqrt()))
+    }
+
+    fn conditional_coupling_stat_excluding(
+        active_i: &[bool],
+        active_j: &[bool],
+        weights: &[f64],
+        excluded_slot: Option<usize>,
+    ) -> Result<f64, String> {
+        let mut conditioning_mass = 0.0_f64;
+        let mut joint_mass = 0.0_f64;
+        let mut total_weight = 0.0_f64;
+        for slot in 0..active_i.len() {
+            if excluded_slot == Some(slot) {
+                continue;
+            }
+            let weight = weights[slot];
+            total_weight += weight;
+            if active_i[slot] {
+                conditioning_mass += weight;
+                if active_j[slot] {
+                    joint_mass += weight;
+                }
+            }
+        }
+        if !(total_weight > 0.0 && conditioning_mass > 0.0) {
+            return Err("conditional_coupling_stat_excluding: empty conditioning set".to_string());
+        }
+        Ok(joint_mass / conditioning_mass)
+    }
+
+    fn weighted_active_mass_excluding(
+        active: &[bool],
+        weights: &[f64],
+        excluded_slot: Option<usize>,
+    ) -> Result<f64, String> {
+        let mut active_mass = 0.0_f64;
+        let mut total_weight = 0.0_f64;
+        for slot in 0..active.len() {
+            if excluded_slot == Some(slot) {
+                continue;
+            }
+            let weight = weights[slot];
+            total_weight += weight;
+            if active[slot] {
+                active_mass += weight;
+            }
+        }
+        if !(total_weight > 0.0) {
+            return Err("weighted_active_mass_excluding: empty retained sample".to_string());
+        }
+        Ok(active_mass / total_weight)
     }
 
     fn direct_exponential_tilt_radius_to_kill(

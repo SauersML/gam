@@ -32,7 +32,6 @@ struct NpyHeader {
     data_offset: usize,
 }
 
-#[derive(Clone, Debug)]
 struct NpyMatrix {
     mmap: Mmap,
     header: NpyHeader,
@@ -127,6 +126,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             row0 += take;
         }
         let stats = state.end_epoch()?;
+        let solve = stats.decoder_solve_stats;
+        let cg_rate_bound_base = solve.cg_kappa_hat.map(|kappa| {
+            let root = kappa.sqrt();
+            (root - 1.0) / (root + 1.0)
+        });
         last_ev = stats.explained_variance;
         epoch_reports.push(json!({
             "epoch": epoch_index + 1,
@@ -136,6 +140,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "dead": stats.dead,
             "gamma": stats.gamma,
             "converged": stats.converged,
+            "refresh_solver": {
+                "default": "matrix_free_cg_streamed_sparse_mod",
+                "tiny_component_solver": "dense_cholesky",
+                "mean_cofiring_degree": solve.mean_cofiring_degree,
+                "giant_component_fraction": solve.giant_component_fraction,
+                "component_count": solve.component_count,
+                "max_component_size": solve.max_component_size,
+                "cg_columns": solve.cg_columns,
+                "cg_iterations": solve.cg_iterations,
+                "cg_kappa_hat": solve.cg_kappa_hat,
+                "cg_rate_bound_base": cg_rate_bound_base,
+                "cg_relative_residual": solve.cg_relative_residual,
+                "cg_residual_stop": solve.cg_residual_stop,
+                "stopping_rule": "relative normal-equation residual <= frame_ridge rank-charge floor",
+                "minibatch_admission": "refresh atom k only when n_k >= (z_alpha*sigma/(a_bar_k*margin_k))^2; otherwise accumulate",
+            },
             "shards": shard_reports.len(),
         }));
         if stats.converged {
@@ -205,6 +225,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = started.elapsed().as_secs_f64();
+    let last_refresh_solver = epoch_reports
+        .last()
+        .map(|epoch| epoch["refresh_solver"].clone())
+        .unwrap_or_else(|| json!({}));
     let result = json!({
         "experiment": "scale_k_curved_block_front_door",
         "input": args.input.display().to_string(),
@@ -268,6 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "linear_atoms": linear_blocks * args.block_size,
             "inactive_or_rejected_atoms": inactive_or_rejected_blocks * args.block_size,
         },
+        "last_refresh_solver": last_refresh_solver,
         "epochs": epoch_reports,
     });
 
@@ -622,10 +647,17 @@ fn bytes_nxp(n: usize, p: usize) -> u64 {
 fn expected_payload_upper_bytes(args: &Args, rows: usize, p: usize) -> u64 {
     let blocks = args.atoms / args.block_size;
     let decoder = bytes_nxp(args.atoms, p);
-    let cross = blocks
+    let normal_rhs = blocks
         .saturating_mul(p)
         .saturating_mul(args.block_size)
         .saturating_mul(std::mem::size_of::<f64>()) as u64;
+    let cofiring_edges = blocks
+        .saturating_mul(args.block_topk)
+        .saturating_mul(args.block_topk.saturating_sub(1))
+        .saturating_div(2)
+        .saturating_mul(args.block_size)
+        .saturating_mul(args.block_size)
+        .saturating_mul(std::mem::size_of::<((u32, u32), f64)>()) as u64;
     let second = blocks
         .saturating_mul(args.block_size)
         .saturating_mul(args.block_size)
@@ -641,7 +673,7 @@ fn expected_payload_upper_bytes(args: &Args, rows: usize, p: usize) -> u64 {
         .saturating_mul(args.block_topk)
         .saturating_mul(args.block_size + 2)
         .saturating_mul(std::mem::size_of::<f32>()) as u64;
-    decoder + cross + second + shard + scores + codes
+    decoder + normal_rhs + cofiring_edges + second + shard + scores + codes
 }
 
 fn render_markdown(value: &serde_json::Value) -> String {
@@ -650,6 +682,15 @@ fn render_markdown(value: &serde_json::Value) -> String {
     let timing = &value["timing"];
     let front = &value["front_door"];
     let peel = &value["peel"];
+    let solver = &value["last_refresh_solver"];
+    let cg_kappa_hat = solver["cg_kappa_hat"]
+        .as_f64()
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "null".to_string());
+    let cg_rate_bound_base = solver["cg_rate_bound_base"]
+        .as_f64()
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "null".to_string());
     format!(
         "# Curved Atoms at Scale\n\n\
          Input: `{}`\n\n\
@@ -675,6 +716,12 @@ fn render_markdown(value: &serde_json::Value) -> String {
          - Peak RSS below dense N x K payload: `{}`.\n\
          - Peak RSS below streaming payload plus one full N x P margin: `{}`.\n\
          - The streaming path stores block routes shard-local only; it does not persist an N x K assignment or a second full response matrix.\n\n\
+         ## Refresh Solver\n\n\
+         - Default: `{}`; tiny components use `{}`.\n\
+         - Stopping rule: `{}`.\n\
+         - Routability admission: `{}`.\n\
+         - Mean co-firing degree: `{:.6}`; giant-component fraction: `{:.6}`; CG kappa-hat: `{}`; rate bound base: `{}`.\n\
+         - CG columns: `{}`; CG iterations: `{}`; relative residual: `{:.6e}`; residual stop: `{:.6e}`.\n\n\
          ## Position-0 Peel\n\n\
          Method: {}. Absorbed centered fraction: {:.8}. Peel seconds: {:.3}.\n\n\
          ## Notes\n\n\
@@ -708,6 +755,18 @@ fn render_markdown(value: &serde_json::Value) -> String {
         value["invariants"]["no_second_full_nxp_by_payload_bound"]
             .as_bool()
             .unwrap_or(false),
+        solver["default"].as_str().unwrap_or(""),
+        solver["tiny_component_solver"].as_str().unwrap_or(""),
+        solver["stopping_rule"].as_str().unwrap_or(""),
+        solver["minibatch_admission"].as_str().unwrap_or(""),
+        solver["mean_cofiring_degree"].as_f64().unwrap_or(0.0),
+        solver["giant_component_fraction"].as_f64().unwrap_or(0.0),
+        cg_kappa_hat,
+        cg_rate_bound_base,
+        solver["cg_columns"].as_u64().unwrap_or(0),
+        solver["cg_iterations"].as_u64().unwrap_or(0),
+        solver["cg_relative_residual"].as_f64().unwrap_or(0.0),
+        solver["cg_residual_stop"].as_f64().unwrap_or(0.0),
         peel["method"].as_str().unwrap_or(""),
         peel["absorbed_centered_fraction"].as_f64().unwrap_or(0.0),
         peel["seconds"].as_f64().unwrap_or(0.0),

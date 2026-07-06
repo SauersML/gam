@@ -7,23 +7,18 @@
 //! normal equations are `D (CᵀC + ρI) = CᵀX`, where `C` is the (sparse, never
 //! materialised) `N×K` code matrix. We accumulate `A = CᵀC` (`K×K`, but only
 //! the few entries touched by co-active atoms are non-zero) and `B = CᵀX`
-//! (`K×P`) by streaming minibatches, then solve **exactly**. For a clean
-//! `top_s = 1` lane `A` is diagonal and the refresh is a per-atom rescaled mean
-//! — exactly MOD / k-SVD's dictionary step. For the general `s > 1` case the
-//! coupling `A` is non-diagonal, but it is still SPARSE: only atoms that co-fire
-//! in some row are coupled, so after permuting the atoms by the connected
-//! components of the co-firing graph `A + ρI` is BLOCK-DIAGONAL. We therefore
-//! solve the normal equations EXACTLY (to numerical tolerance) by solving each
-//! connected component independently — a small dense SPD Cholesky for ordinary
-//! blocks (with a tiny-ridge bump fallback for near-singular blocks, the same
-//! robustness as the per-row code solve), or a conjugate-gradient solve iterated
-//! to a relative normal-equation residual `‖(A+ρI)x − b‖/‖b‖ ≤ 1e-10` (with a
-//! generous iteration cap as a safety backstop) for any rare oversized block.
-//! Because distinct components carry no coupling, solving them separately is the
-//! exact solution of the full system, and the per-component work keeps the cost
-//! off `K²` (each block is only as large as a cluster of mutually co-firing
-//! atoms). The `s == 1` / decoupled lane is the singleton-block special case and
-//! remains a one-shot exact diagonal solve.
+//! (`K×P`) by streaming minibatches, then solve **to the rank-charge floor**.
+//! For a clean `top_s = 1` lane `A` is diagonal and the refresh is a per-atom
+//! rescaled mean — exactly MOD / k-SVD's dictionary step. For the general
+//! `s > 1` case the coupling `A` is non-diagonal, and the co-firing graph
+//! percolates at realistic scale, so connected components are diagnostics rather
+//! than a useful dense-solve decomposition. The default coupled solve is
+//! therefore matrix-free conjugate gradients: every Gram-vector product touches
+//! only the streamed sparse normal equations (`O(K + nnz)`) and no dense `K×K`
+//! block is formed. Dense Cholesky is retained only for genuinely tiny connected
+//! components. CG stops when the relative normal-equation residual is below the
+//! ridge/charge floor, and its Lanczos tridiagonal supplies the condition
+//! estimate reported with the epoch diagnostics.
 
 use super::codes::{SparseCode, solve_row_codes};
 use super::scoring::{ScoreRouteStats, TileScorer};
@@ -89,9 +84,11 @@ pub(super) fn run(
 
     let scorer = TileScorer::new(s, config.score_tile);
     let mut score_route_stats = ScoreRouteStats::default();
+    let mut pending_eq = DecoderNormalEq::zeros(k, p);
     let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut epochs_run = 0usize;
+    let mut decoder_solve_stats = DecoderSolveStats::default();
 
     // (a)+(b) route + sparse codes for every row against the seeded, unit-normed
     // decoder, in minibatches: each minibatch is routed by one batched score block
@@ -113,10 +110,19 @@ pub(super) fn run(
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
 
-        // (c) decoder refresh: solve the sparse decoder normal equations EXACTLY
-        // (to tolerance) from the current codes — block-diagonal Cholesky over the
-        // co-firing components, see `refresh_decoder`.
-        refresh_decoder(x, &codes, &mut decoder, k, p, config);
+        // (c) decoder refresh: stream the current codes into each atom's pending
+        // normal equations, then refresh only atoms whose evidence clears the
+        // routability SE gate. Deferred atoms keep accumulating across epochs.
+        pending_eq.accumulate(x, &codes);
+        let sigma = residual_scale(x, &codes, decoder.view());
+        let (stats, gate) = solve_decoder_with_routability_gate(
+            &mut decoder,
+            &pending_eq,
+            config.decoder_ridge as f64,
+            sigma,
+        );
+        decoder_solve_stats = stats;
+        pending_eq.clear_refreshed_atoms(&gate);
 
         // (d) unit-norm projection (identifies code scale) + stable sign.
         unit_norm_rows(&mut decoder);
@@ -190,6 +196,7 @@ pub(super) fn run(
         converged,
         active: s,
         score_route_stats,
+        decoder_solve_stats,
     })
 }
 
@@ -288,6 +295,10 @@ pub(super) struct DecoderNormalEq {
     pub(super) b: Array2<f64>,
     /// Off-diagonal couplings `A_{kl}` keyed by `(k, l)` with `k < l`.
     pub(super) off: HashMap<(u32, u32), f64>,
+    /// Non-zero code firings per atom over the accumulated refresh window.
+    pub(super) firings: Vec<usize>,
+    /// Sum of absolute code amplitudes per atom over the accumulated window.
+    pub(super) amplitude_sum: Vec<f64>,
 }
 
 impl DecoderNormalEq {
@@ -299,6 +310,8 @@ impl DecoderNormalEq {
             diag: vec![0.0f64; k],
             b: Array2::<f64>::zeros((k, p)),
             off: HashMap::new(),
+            firings: vec![0; k],
+            amplitude_sum: vec![0.0; k],
         }
     }
 
@@ -318,6 +331,8 @@ impl DecoderNormalEq {
                     continue;
                 }
                 let ka = code.indices[a];
+                self.firings[ka as usize] += 1;
+                self.amplitude_sum[ka as usize] += ca.abs();
                 self.diag[ka as usize] += ca * ca;
                 let brow = ka as usize;
                 let mut brow_view = self.b.row_mut(brow);
@@ -349,6 +364,24 @@ impl DecoderNormalEq {
             }
         }
     }
+
+    /// Drop accumulated rows for atoms that just refreshed. Deferred atoms keep
+    /// their diagonal/right-hand-side statistics streaming; couplings touching a
+    /// refreshed atom are discarded because one endpoint's decoder row changed.
+    pub(super) fn clear_refreshed_atoms(&mut self, gate: &[RoutabilityGateDecision]) {
+        for decision in gate.iter() {
+            if !decision.refresh {
+                continue;
+            }
+            let atom = decision.atom;
+            self.diag[atom] = 0.0;
+            self.firings[atom] = 0;
+            self.amplitude_sum[atom] = 0.0;
+            self.b.row_mut(atom).fill(0.0);
+        }
+        self.off
+            .retain(|&(a, b), _| !gate[a as usize].refresh && !gate[b as usize].refresh);
+    }
 }
 
 /// Assemble the sparse decoder normal equations `(A + ρI) D = B` from the fixed
@@ -364,6 +397,8 @@ fn assemble_normal_eq(
     let mut diag = vec![0.0f64; k];
     let mut b = Array2::<f64>::zeros((k, p));
     let mut off: HashMap<(u32, u32), f64> = HashMap::new();
+    let mut firings = vec![0usize; k];
+    let mut amplitude_sum = vec![0.0f64; k];
 
     for (row_idx, code) in codes.iter().enumerate() {
         let xi = x.row(row_idx);
@@ -376,6 +411,8 @@ fn assemble_normal_eq(
                 continue;
             }
             let ka = code.indices[a];
+            firings[ka as usize] += 1;
+            amplitude_sum[ka as usize] += ca.abs();
             diag[ka as usize] += ca * ca;
             let brow = ka as usize;
             // B_{ka,:} += ca · x_row. Accumulate over contiguous row slices so LLVM
@@ -416,7 +453,13 @@ fn assemble_normal_eq(
         }
     }
 
-    DecoderNormalEq { diag, b, off }
+    DecoderNormalEq {
+        diag,
+        b,
+        off,
+        firings,
+        amplitude_sum,
+    }
 }
 
 /// An atom is "dead" this epoch when its regularised self-energy `A_kk + ρ` is
@@ -425,39 +468,158 @@ fn assemble_normal_eq(
 /// seeded direction so a later epoch can still route rows to them.
 pub(super) const DEAD_DENOM: f64 = 1.0e-12;
 
-/// Connected-component blocks above this size are solved by conjugate gradient
-/// rather than a dense Cholesky, to keep the per-block cost off `O(m³)`/`O(m²)`
-/// memory. Mutually co-firing atom clusters are tiny in practice, so the dense
-/// path is the norm and this is only a safety valve.
-const MAX_DIRECT_BLOCK: usize = 512;
+/// Coupled components this small are solved by dense Cholesky. Anything larger
+/// uses matrix-free CG because realistic co-firing graphs percolate into one
+/// giant component.
+const MAX_DIRECT_BLOCK: usize = 8;
 
-/// Relative normal-equation residual `‖(A+ρI)x − b‖/‖b‖` the CG block solver
-/// drives below before stopping — well under the 1e-8 exactness contract.
-const CG_REL_TOL: f64 = 1.0e-10;
+/// Solver/percolation certificate for one decoder MOD refresh.
+#[derive(Clone, Copy, Debug)]
+pub struct DecoderSolveStats {
+    /// Mean degree of the co-firing graph, `2|E|/K`.
+    pub mean_cofiring_degree: f64,
+    /// Largest connected component size divided by `K`.
+    pub giant_component_fraction: f64,
+    /// Number of connected components in the co-firing graph, including isolated
+    /// singleton atoms.
+    pub component_count: usize,
+    /// Largest connected component size.
+    pub max_component_size: usize,
+    /// Decoder columns solved by CG.
+    pub cg_columns: usize,
+    /// Total CG iterations across solved columns.
+    pub cg_iterations: usize,
+    /// Largest condition estimate recovered from CG's Lanczos tridiagonal.
+    pub cg_kappa_hat: Option<f64>,
+    /// Largest final relative normal-equation residual among CG solves.
+    pub cg_relative_residual: f64,
+    /// Relative residual threshold used by CG, derived from the ridge/charge
+    /// floor rather than an arbitrary numerical tolerance.
+    pub cg_residual_stop: f64,
+}
 
-/// Refresh the decoder by solving the sparse normal equations `(A + ρI) D = B`
-/// EXACTLY (to numerical tolerance), not by a fixed number of approximate sweeps.
-///
-/// `A + ρI` is symmetric PD and, crucially, BLOCK-DIAGONAL once the atoms are
-/// grouped by the connected components of the co-firing graph (atoms in distinct
-/// components are uncoupled). We therefore solve each component independently:
-/// the solution of every block is, jointly, the exact solution of the whole
-/// system. Singletons (`s == 1`, or any atom that never co-fires) are a one-shot
-/// diagonal solve `D_k = B_k / (A_kk + ρ)`; small components are a dense SPD
-/// Cholesky with a tiny-ridge bump fallback for near-singular blocks; rare large
-/// components fall back to CG iterated to [`CG_REL_TOL`]. Dead atoms keep their
-/// seeded direction. Per-component work keeps the cost off `K²`.
-fn refresh_decoder(
-    x: ArrayView2<'_, f32>,
-    codes: &[SparseCode],
+impl Default for DecoderSolveStats {
+    fn default() -> Self {
+        Self {
+            mean_cofiring_degree: 0.0,
+            giant_component_fraction: 0.0,
+            component_count: 0,
+            max_component_size: 0,
+            cg_columns: 0,
+            cg_iterations: 0,
+            cg_kappa_hat: None,
+            cg_relative_residual: 0.0,
+            cg_residual_stop: 0.0,
+        }
+    }
+}
+
+impl DecoderSolveStats {
+    fn record_cg(&mut self, result: &CgSolveResult) {
+        self.cg_columns += 1;
+        self.cg_iterations += result.iterations;
+        self.cg_relative_residual = self.cg_relative_residual.max(result.relative_residual);
+        if let Some(kappa) = result.kappa_hat {
+            self.cg_kappa_hat = Some(self.cg_kappa_hat.map_or(kappa, |old| old.max(kappa)));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RoutabilityGateDecision {
+    pub(super) atom: usize,
+    pub(super) refresh: bool,
+    pub(super) firings: usize,
+    pub(super) mean_amplitude: f64,
+    pub(super) z_alpha: f64,
+    pub(super) margin: f64,
+    pub(super) threshold: f64,
+    pub(super) standard_error: f64,
+}
+
+fn routability_z_alpha(firings: usize) -> f64 {
+    // BIC's one-parameter charge is `0.5 ln n`; equating it to a Gaussian
+    // tail exponent `z^2/2` gives the confidence radius without a tuned knob.
+    (firings.max(2) as f64).ln().sqrt()
+}
+
+pub(super) fn routability_gate_decisions(
+    eq: &DecoderNormalEq,
+    residual_scale: f64,
+) -> Vec<RoutabilityGateDecision> {
+    (0..eq.diag.len())
+        .map(|atom| {
+            let firings = eq.firings[atom];
+            if firings == 0 || eq.diag[atom] <= DEAD_DENOM {
+                return RoutabilityGateDecision {
+                    atom,
+                    refresh: false,
+                    firings,
+                    mean_amplitude: 0.0,
+                    z_alpha: routability_z_alpha(firings),
+                    margin: 0.0,
+                    threshold: f64::INFINITY,
+                    standard_error: f64::INFINITY,
+                };
+            }
+            let n = firings as f64;
+            let mean_amplitude = eq.amplitude_sum[atom] / n;
+            let z_alpha = routability_z_alpha(firings);
+            let charge_floor = if residual_scale > 0.0 {
+                residual_scale * z_alpha / n.sqrt()
+            } else {
+                0.0
+            };
+            let margin = if mean_amplitude > 0.0 {
+                1.0 - charge_floor / mean_amplitude
+            } else {
+                f64::NEG_INFINITY
+            };
+            let standard_error = if residual_scale > 0.0 && mean_amplitude > 0.0 {
+                residual_scale / (mean_amplitude * n.sqrt())
+            } else if mean_amplitude > 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+            let threshold = if margin > 0.0 && mean_amplitude > 0.0 {
+                let denom = mean_amplitude * margin;
+                (z_alpha * residual_scale / denom).powi(2)
+            } else {
+                f64::INFINITY
+            };
+            RoutabilityGateDecision {
+                atom,
+                refresh: n >= threshold,
+                firings,
+                mean_amplitude,
+                z_alpha,
+                margin,
+                threshold,
+                standard_error,
+            }
+        })
+        .collect()
+}
+
+pub(super) fn solve_decoder_with_routability_gate(
     decoder: &mut Array2<f32>,
-    k: usize,
-    p: usize,
-    config: &SparseDictConfig,
-) {
-    let ridge = config.decoder_ridge as f64;
-    let eq = assemble_normal_eq(x, codes, k, p);
-    solve_decoder(decoder, &eq, ridge);
+    eq: &DecoderNormalEq,
+    ridge: f64,
+    residual_scale: f64,
+) -> (DecoderSolveStats, Vec<RoutabilityGateDecision>) {
+    let gate = routability_gate_decisions(eq, residual_scale);
+    let mut candidate = decoder.clone();
+    let stats = solve_decoder(&mut candidate, eq, ridge);
+    for decision in gate.iter() {
+        if !decision.refresh {
+            continue;
+        }
+        let src = candidate.row(decision.atom);
+        let mut dst = decoder.row_mut(decision.atom);
+        dst.assign(&src);
+    }
+    (stats, gate)
 }
 
 /// Re-seed atoms that fired for no row this epoch (dead atoms) onto the current
@@ -562,7 +724,11 @@ fn revive_dead_atoms(
 /// sorted (canonical order) before solving so the result is bit-reproducible
 /// regardless of `HashMap` iteration order. Dead atoms ([`DEAD_DENOM`]) and
 /// atoms with no co-firing partner keep / take the trivial solve.
-pub(super) fn solve_decoder(decoder: &mut Array2<f32>, eq: &DecoderNormalEq, ridge: f64) {
+pub(super) fn solve_decoder(
+    decoder: &mut Array2<f32>,
+    eq: &DecoderNormalEq,
+    ridge: f64,
+) -> DecoderSolveStats {
     let k = eq.diag.len();
     let p = eq.b.ncols();
 
@@ -576,6 +742,16 @@ pub(super) fn solve_decoder(decoder: &mut Array2<f32>, eq: &DecoderNormalEq, rid
         list.sort_by_key(|&(nb, _)| nb);
     }
 
+    let mut stats = DecoderSolveStats {
+        mean_cofiring_degree: if k == 0 {
+            0.0
+        } else {
+            2.0 * eq.off.len() as f64 / k as f64
+        },
+        cg_residual_stop: ridge.max(DEAD_DENOM),
+        ..DecoderSolveStats::default()
+    };
+
     let mut visited = vec![false; k];
     for start in 0..k {
         if visited[start] {
@@ -584,6 +760,8 @@ pub(super) fn solve_decoder(decoder: &mut Array2<f32>, eq: &DecoderNormalEq, rid
         if neigh[start].is_empty() {
             // Isolated atom: diagonal (singleton) solve, exact in one shot.
             visited[start] = true;
+            stats.component_count += 1;
+            stats.max_component_size = stats.max_component_size.max(1);
             let denom = eq.diag[start] + ridge;
             if denom <= DEAD_DENOM {
                 // Dead atom: keep its seeded direction (no permanent collapse).
@@ -610,8 +788,14 @@ pub(super) fn solve_decoder(decoder: &mut Array2<f32>, eq: &DecoderNormalEq, rid
             }
         }
         comp.sort_unstable();
-        solve_component(decoder, eq, ridge, &comp, &neigh, p);
+        stats.component_count += 1;
+        stats.max_component_size = stats.max_component_size.max(comp.len());
+        solve_component(decoder, eq, ridge, &comp, &neigh, p, &mut stats);
     }
+    if k > 0 {
+        stats.giant_component_fraction = stats.max_component_size as f64 / k as f64;
+    }
+    stats
 }
 
 /// Solve one connected component's block exactly: dense SPD Cholesky when the
@@ -624,6 +808,7 @@ fn solve_component(
     comp: &[usize],
     neigh: &[Vec<(u32, f64)>],
     p: usize,
+    stats: &mut DecoderSolveStats,
 ) {
     let m = comp.len();
     // Local atom -> block-row index map (comp is sorted, so this is canonical).
@@ -657,8 +842,9 @@ fn solve_component(
         return;
     }
 
-    // Oversized block: solve each column by CG to the residual tolerance. The
-    // operator is the component-restricted symmetric mat-vec.
+    // Default coupled path: solve each column by matrix-free CG. The operator is
+    // the component-restricted symmetric mat-vec and touches only stored sparse
+    // co-firing entries.
     let matvec = |xloc: &[f64]| -> Vec<f64> {
         let mut y = vec![0.0f64; m];
         for (i, &a) in comp.iter().enumerate() {
@@ -672,8 +858,10 @@ fn solve_component(
         }
         y
     };
-    // Generous safety cap: CG converges in <= m steps in exact arithmetic.
-    let cap = m.saturating_mul(20).saturating_add(100);
+    let charge_floor = ridge.max(DEAD_DENOM);
+    // CG converges in <= m steps in exact arithmetic; the extra pass allowance is
+    // only for f64 round-off on ill-conditioned sparse Grams.
+    let cap = m.saturating_mul(2).saturating_add(16);
     for c in 0..p {
         let mut bvec = vec![0.0f64; m];
         let mut bnorm2 = 0.0f64;
@@ -689,38 +877,133 @@ fn solve_component(
             }
             continue;
         }
-        // CG from a zero start: r0 = b - A*0 = b.
-        let mut r = bvec;
-        let mut pdir = r.clone();
-        let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
-        for _ in 0..cap {
-            let ap = matvec(&pdir);
-            let mut pap = 0.0f64;
-            for i in 0..m {
-                pap += pdir[i] * ap[i];
-            }
-            if pap <= 0.0 {
-                break; // not happen for SPD; guard against round-off breakdown.
-            }
-            let alpha = rs_old / pap;
-            for i in 0..m {
-                xvec[i] += alpha * pdir[i];
-                r[i] -= alpha * ap[i];
-            }
-            let rnorm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if rnorm / bnorm <= CG_REL_TOL {
-                break;
-            }
-            let rs_new: f64 = r.iter().map(|v| v * v).sum();
-            let beta = rs_new / rs_old;
-            for i in 0..m {
-                pdir[i] = r[i] + beta * pdir[i];
-            }
-            rs_old = rs_new;
-        }
+        let result = cg_solve(&matvec, &bvec, charge_floor, cap);
+        xvec = result.x.clone();
+        stats.record_cg(&result);
         for (i, &a) in comp.iter().enumerate() {
             decoder[[a, c]] = xvec[i] as f32;
         }
+    }
+}
+
+struct CgSolveResult {
+    x: Vec<f64>,
+    iterations: usize,
+    relative_residual: f64,
+    kappa_hat: Option<f64>,
+}
+
+fn cg_solve<F>(matvec: &F, b: &[f64], charge_floor: f64, cap: usize) -> CgSolveResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let n = b.len();
+    let bnorm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if bnorm <= DEAD_DENOM {
+        return CgSolveResult {
+            x: vec![0.0; n],
+            iterations: 0,
+            relative_residual: 0.0,
+            kappa_hat: None,
+        };
+    }
+
+    let mut x = vec![0.0f64; n];
+    let mut r = b.to_vec();
+    let mut pdir = r.clone();
+    let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
+    let mut alphas = Vec::new();
+    let mut betas = Vec::new();
+    let mut relative_residual = 1.0;
+
+    for iter in 0..cap {
+        let ap = matvec(&pdir);
+        let mut pap = 0.0f64;
+        for i in 0..n {
+            pap += pdir[i] * ap[i];
+        }
+        if pap <= 0.0 || !pap.is_finite() {
+            return CgSolveResult {
+                x,
+                iterations: iter,
+                relative_residual,
+                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+            };
+        }
+        let alpha = rs_old / pap;
+        alphas.push(alpha);
+        for i in 0..n {
+            x[i] += alpha * pdir[i];
+            r[i] -= alpha * ap[i];
+        }
+        let rs_new: f64 = r.iter().map(|v| v * v).sum();
+        relative_residual = rs_new.sqrt() / bnorm;
+        if relative_residual <= charge_floor {
+            return CgSolveResult {
+                x,
+                iterations: iter + 1,
+                relative_residual,
+                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+            };
+        }
+        let beta = rs_new / rs_old;
+        if !beta.is_finite() {
+            return CgSolveResult {
+                x,
+                iterations: iter + 1,
+                relative_residual,
+                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+            };
+        }
+        betas.push(beta);
+        for i in 0..n {
+            pdir[i] = r[i] + beta * pdir[i];
+        }
+        rs_old = rs_new;
+    }
+
+    CgSolveResult {
+        x,
+        iterations: cap,
+        relative_residual,
+        kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+    }
+}
+
+fn kappa_from_cg_tridiagonal(alphas: &[f64], betas: &[f64]) -> Option<f64> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    let n = alphas.len();
+    if n == 0 {
+        return None;
+    }
+    let mut tri = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        let mut diag = 1.0 / alphas[i];
+        if i > 0 {
+            diag += betas[i - 1] / alphas[i - 1];
+            let off = betas[i - 1].sqrt() / alphas[i - 1];
+            tri[[i - 1, i]] = off;
+            tri[[i, i - 1]] = off;
+        }
+        tri[[i, i]] = diag;
+    }
+    let Ok((evals, _evecs)) = tri.eigh(Side::Lower) else {
+        return None;
+    };
+    let mut min_eval = f64::INFINITY;
+    let mut max_eval = 0.0f64;
+    for &eval in evals.iter() {
+        if eval.is_finite() && eval > 0.0 {
+            min_eval = min_eval.min(eval);
+            max_eval = max_eval.max(eval);
+        }
+    }
+    if min_eval.is_finite() && max_eval >= min_eval {
+        Some(max_eval / min_eval)
+    } else {
+        None
     }
 }
 
@@ -828,6 +1111,39 @@ fn explained_variance(
     }
 }
 
+fn residual_scale(
+    x: ArrayView2<'_, f32>,
+    codes: &[SparseCode],
+    decoder: ArrayView2<'_, f32>,
+) -> f64 {
+    let n = x.nrows();
+    let p = x.ncols();
+    let mut rss = 0.0f64;
+    let mut recon = vec![0.0f64; p];
+    for i in 0..n {
+        for c in 0..p {
+            recon[c] = 0.0;
+        }
+        let code = &codes[i];
+        for j in 0..code.indices.len() {
+            let cj = code.codes[j] as f64;
+            if cj == 0.0 {
+                continue;
+            }
+            let drow = decoder.row(code.indices[j] as usize);
+            for c in 0..p {
+                recon[c] += cj * drow[c] as f64;
+            }
+        }
+        let xi = x.row(i);
+        for c in 0..p {
+            let r = xi[c] as f64 - recon[c];
+            rss += r * r;
+        }
+    }
+    (rss / (n * p) as f64).sqrt()
+}
+
 fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<f32>) {
     let mut indices = Array2::<u32>::zeros((n, s));
     let mut code_mat = Array2::<f32>::zeros((n, s));
@@ -843,7 +1159,8 @@ fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<
 #[cfg(test)]
 mod exact_solve_tests {
     use super::{
-        DecoderNormalEq, assemble_normal_eq, explained_variance, route_and_code_all, solve_decoder,
+        DecoderNormalEq, assemble_normal_eq, cg_solve, explained_variance, route_and_code_all,
+        solve_decoder, solve_decoder_with_routability_gate,
     };
     use crate::sparse_dict::codes::SparseCode;
     use crate::sparse_dict::scoring::TileScorer;
@@ -904,6 +1221,27 @@ mod exact_solve_tests {
         (x, codes, k, p)
     }
 
+    fn accumulate_constant_rows(
+        eq: &mut DecoderNormalEq,
+        atom: u32,
+        rows: usize,
+        code: f32,
+        row: [f32; 2],
+    ) {
+        let mut x = Array2::<f32>::zeros((rows, 2));
+        for i in 0..rows {
+            x[[i, 0]] = row[0];
+            x[[i, 1]] = row[1];
+        }
+        let codes: Vec<SparseCode> = (0..rows)
+            .map(|_| SparseCode {
+                indices: vec![atom],
+                codes: vec![code],
+            })
+            .collect();
+        eq.accumulate(x.view(), &codes);
+    }
+
     /// Relative normal-equation residual `‖(A+ρI)D − B‖_F / ‖B‖_F`, summed over all
     /// decoder columns, using the same sparse operator the solver uses.
     fn normal_eq_residual(eq: &DecoderNormalEq, decoder: &Array2<f32>, ridge: f64) -> f64 {
@@ -921,6 +1259,119 @@ mod exact_solve_tests {
             }
         }
         if bss <= 0.0 { 0.0 } else { (rss / bss).sqrt() }
+    }
+
+    #[test]
+    fn routability_gate_refreshes_well_fired_and_defers_starved_atom() {
+        let mut eq = DecoderNormalEq::zeros(2, 2);
+        accumulate_constant_rows(&mut eq, 0, 64, 1.0, [2.0, 0.0]);
+        accumulate_constant_rows(&mut eq, 1, 1, 1.0, [0.0, 3.0]);
+
+        let mut decoder = Array2::<f32>::zeros((2, 2));
+        decoder[[0, 1]] = 1.0;
+        decoder[[1, 0]] = 1.0;
+        let (_stats, gate) = solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+
+        eprintln!(
+            "[routability synthetic] atom0 refresh={} n={} mean={:.3} z={:.3} margin={:.3} se={:.3} threshold={:.3}; atom1 refresh={} n={} mean={:.3} z={:.3} margin={:.3} se={:.3} threshold={:.3}",
+            gate[0].refresh,
+            gate[0].firings,
+            gate[0].mean_amplitude,
+            gate[0].z_alpha,
+            gate[0].margin,
+            gate[0].standard_error,
+            gate[0].threshold,
+            gate[1].refresh,
+            gate[1].firings,
+            gate[1].mean_amplitude,
+            gate[1].z_alpha,
+            gate[1].margin,
+            gate[1].standard_error,
+            gate[1].threshold
+        );
+
+        assert!(gate[0].refresh, "well-fired atom must refresh");
+        assert!(
+            gate[0].standard_error <= gate[0].margin,
+            "well-fired atom should clear the SE-to-margin gate"
+        );
+        assert!(!gate[1].refresh, "starved atom must defer");
+        assert!(
+            gate[1].standard_error > gate[1].margin,
+            "starved atom's refresh SE should exceed its charge-floor margin"
+        );
+        assert!(
+            decoder[[0, 0]] > 1.9 && decoder[[0, 1]].abs() < 1.0e-6,
+            "admitted atom should take its MOD row"
+        );
+        assert!(
+            decoder[[1, 0]] > 0.9 && decoder[[1, 1]].abs() < 1.0e-6,
+            "deferred atom should keep its previous row"
+        );
+    }
+
+    #[test]
+    fn deferred_atom_accumulates_until_routability_threshold_crosses() {
+        let mut eq = DecoderNormalEq::zeros(1, 2);
+        let mut decoder = Array2::<f32>::zeros((1, 2));
+        decoder[[0, 1]] = 1.0;
+
+        accumulate_constant_rows(&mut eq, 0, 1, 1.0, [3.0, 0.0]);
+        let (_stats_first, first_gate) =
+            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+        eq.clear_refreshed_atoms(&first_gate);
+
+        assert!(!first_gate[0].refresh, "single firing should defer");
+        assert_eq!(
+            eq.firings[0], 1,
+            "deferred atom's firing evidence must remain accumulated"
+        );
+        assert!(
+            decoder[[0, 1]] > 0.9,
+            "deferred atom must keep its old decoder direction"
+        );
+
+        accumulate_constant_rows(&mut eq, 0, 63, 1.0, [3.0, 0.0]);
+        let (_stats_second, second_gate) =
+            solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
+        eq.clear_refreshed_atoms(&second_gate);
+
+        assert!(
+            second_gate[0].refresh,
+            "accumulated firings should cross the routability threshold"
+        );
+        assert_eq!(
+            eq.firings[0], 0,
+            "refreshed atom's consumed evidence should be cleared"
+        );
+        assert!(
+            decoder[[0, 0]] > 2.9 && decoder[[0, 1]].abs() < 1.0e-6,
+            "eventually admitted atom should install its MOD row"
+        );
+    }
+
+    fn connected_tridiagonal_eq(k: usize, p: usize) -> DecoderNormalEq {
+        let mut diag = vec![0.0f64; k];
+        for (i, d) in diag.iter_mut().enumerate() {
+            *d = 1.8 + 0.03 * i as f64;
+        }
+        let mut off = std::collections::HashMap::new();
+        for i in 0..(k - 1) {
+            off.insert((i as u32, (i + 1) as u32), -0.25);
+        }
+        let mut b = Array2::<f64>::zeros((k, p));
+        for i in 0..k {
+            for c in 0..p {
+                b[[i, c]] = ((i * 5 + c * 7 + 3) % 17) as f64 / 11.0 - 0.6;
+            }
+        }
+        DecoderNormalEq {
+            diag,
+            b,
+            off,
+            firings: vec![4; k],
+            amplitude_sum: vec![4.0; k],
+        }
     }
 
     #[test]
@@ -992,6 +1443,78 @@ mod exact_solve_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn matrix_free_cg_matches_dense_solve_to_charge_floor() {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerCholesky;
+
+        let k = 12usize;
+        let p = 3usize;
+        let ridge = 1.0e-5f64;
+        let eq = connected_tridiagonal_eq(k, p);
+        let mut decoder = Array2::<f32>::zeros((k, p));
+        let stats = solve_decoder(&mut decoder, &eq, ridge);
+        assert_eq!(stats.component_count, 1);
+        assert_eq!(stats.max_component_size, k);
+        assert_eq!(stats.cg_columns, p);
+        assert!(
+            stats.cg_relative_residual <= ridge,
+            "CG residual {} must stop below charge floor {ridge}",
+            stats.cg_relative_residual
+        );
+
+        let mut mat = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            mat[[i, i]] = eq.diag[i] + ridge;
+        }
+        for (&(a, b), &val) in eq.off.iter() {
+            mat[[a as usize, b as usize]] = val;
+            mat[[b as usize, a as usize]] = val;
+        }
+        let dense = mat
+            .cholesky(Side::Lower)
+            .expect("dense SPD system")
+            .solve_mat(&eq.b);
+        let mut diff2 = 0.0f64;
+        let mut dense2 = 0.0f64;
+        for i in 0..k {
+            for c in 0..p {
+                let diff = decoder[[i, c]] as f64 - dense[[i, c]];
+                diff2 += diff * diff;
+                dense2 += dense[[i, c]] * dense[[i, c]];
+            }
+        }
+        let rel = (diff2 / dense2).sqrt();
+        assert!(
+            rel <= 5.0 * ridge,
+            "CG decoder must match dense solve to the charge floor, rel={rel}, floor={ridge}"
+        );
+        assert!(
+            stats.cg_kappa_hat.is_some(),
+            "CG path must report a Lanczos condition estimate"
+        );
+    }
+
+    #[test]
+    fn cg_lanczos_kappa_matches_true_condition_number() {
+        let eigenvalues = [1.0f64, 1.7, 2.9, 4.6, 8.0, 13.0];
+        let b = vec![1.0f64; eigenvalues.len()];
+        let matvec = |x: &[f64]| -> Vec<f64> {
+            eigenvalues
+                .iter()
+                .zip(x.iter())
+                .map(|(&lambda, &xi)| lambda * xi)
+                .collect()
+        };
+        let result = cg_solve(&matvec, &b, 1.0e-14, eigenvalues.len() + 2);
+        let got = result.kappa_hat.expect("Lanczos kappa");
+        let want = eigenvalues[eigenvalues.len() - 1] / eigenvalues[0];
+        assert!(
+            (got - want).abs() <= 1.0e-8 * want,
+            "Lanczos κ̂ {got} must match true condition {want}"
+        );
     }
 
     #[test]

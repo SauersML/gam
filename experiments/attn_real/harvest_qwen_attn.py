@@ -65,6 +65,88 @@ def qwen_model_body(model: Any) -> Any:
     raise SystemExit("could not locate the model body on the loaded Qwen model")
 
 
+def load_attention_weights(model_path: Path, layer: int) -> dict[str, np.ndarray]:
+    from safetensors import safe_open
+
+    index_path = model_path / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weight_map = index["weight_map"]
+    prefix = f"model.layers.{layer}.self_attn."
+    keys = {
+        "q_proj": prefix + "q_proj.weight",
+        "k_proj": prefix + "k_proj.weight",
+        "v_proj": prefix + "v_proj.weight",
+        "o_proj": prefix + "o_proj.weight",
+        "q_norm": prefix + "q_norm.weight",
+        "k_norm": prefix + "k_norm.weight",
+    }
+    by_file: dict[str, list[tuple[str, str]]] = {}
+    for short, key in keys.items():
+        shard = weight_map.get(key)
+        if shard is None:
+            if short.endswith("_norm"):
+                continue
+            raise SystemExit(f"missing weight {key} in {index_path}")
+        by_file.setdefault(shard, []).append((short, key))
+    out: dict[str, np.ndarray] = {}
+    for shard, shard_keys in by_file.items():
+        with safe_open(str(model_path / shard), framework="pt", device="cpu") as handle:
+            for short, key in shard_keys:
+                out[short] = handle.get_tensor(key).float().cpu().numpy()
+    return out
+
+
+def rms_norm_heads(x: np.ndarray, weight: np.ndarray | None) -> np.ndarray:
+    if weight is None:
+        return x
+    denom = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1.0e-6)
+    return (x / denom) * weight.reshape(1, 1, -1)
+
+
+def peel_top_direction(x: np.ndarray, iterations: int) -> tuple[np.ndarray, float]:
+    centered = x - x.mean(axis=0, keepdims=True)
+    direction = centered[0].copy()
+    norm = float(np.linalg.norm(direction))
+    if norm == 0.0:
+        direction = np.ones(centered.shape[1], dtype=np.float32)
+        norm = float(np.linalg.norm(direction))
+    direction = direction / norm
+    for _step in range(iterations):
+        scores = centered @ direction
+        direction = centered.T @ scores
+        norm = float(np.linalg.norm(direction))
+        if norm == 0.0:
+            break
+        direction = direction / norm
+    scores = centered @ direction
+    removed = np.outer(scores, direction)
+    total = float(np.sum(centered * centered))
+    absorbed = float(np.sum(removed * removed) / max(total, 1.0e-30))
+    return (x - removed).astype(np.float32), absorbed
+
+
+def apply_rope_numpy(q: np.ndarray, k: np.ndarray, positions: np.ndarray, theta: float) -> tuple[np.ndarray, np.ndarray]:
+    head_dim = q.shape[-1]
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+    angles = positions.astype(np.float32)[:, None] * inv_freq[None, :]
+    cos = np.cos(angles)[:, None, :]
+    sin = np.sin(angles)[:, None, :]
+
+    def rotate(x: np.ndarray) -> np.ndarray:
+        first = x[..., :half]
+        second = x[..., half:]
+        return np.concatenate([first * cos - second * sin, second * cos + first * sin], axis=-1)
+
+    return rotate(q), rotate(k)
+
+
+def repeat_kv_numpy(x: np.ndarray, n_rep: int) -> np.ndarray:
+    if n_rep == 1:
+        return x
+    return np.repeat(x, n_rep, axis=1)
+
+
 def apply_qwen_rope(model_body: Any, q: Any, k: Any, hidden: Any, position_ids: Any) -> tuple[Any, Any]:
     import torch
 
@@ -129,6 +211,59 @@ def head_ov_vectors(v_head: np.ndarray, o_weight: np.ndarray, head: int, head_di
     stop = start + head_dim
     block = o_weight[:, start:stop]
     return v_head @ block.T
+
+
+def summarize_head_numpy(
+    args: argparse.Namespace,
+    layer_index: int,
+    head: int,
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    o_weight: np.ndarray,
+    t_np: np.ndarray,
+    phase_beta: np.ndarray,
+    phase_intercept: np.ndarray,
+    phase_probe_r2: float,
+) -> dict[str, Any]:
+    scaling = 1.0 / math.sqrt(int(q.shape[-1]))
+    scores_np = (q[:, head, :] @ k[:, head, :].T) * scaling
+    period = args.period
+    bins = (np.arange(q.shape[0]) % period).astype(np.int64)
+    score_sum = np.zeros((period, period), dtype=np.float64)
+    score_count = np.zeros((period, period), dtype=np.int64)
+    for query_index, qb in enumerate(bins):
+        for key_index, kb in enumerate(bins):
+            score_sum[int(qb), int(kb)] += float(scores_np[query_index, key_index])
+            score_count[int(qb), int(kb)] += 1
+    if np.any(score_count == 0):
+        raise SystemExit(f"head {head}: positional grid has empty QK cells")
+    mean_scores = score_sum / score_count
+
+    head_dim = int(q.shape[-1])
+    ov = head_ov_vectors(v[:, head, :], o_weight, head, head_dim)
+    ov_t = phase_from_probe(ov, phase_beta, phase_intercept)
+    delta = circular_delta(ov_t, t_np)
+    delta_by_bin = np.zeros(period, dtype=np.float64)
+    count_by_bin = np.zeros(period, dtype=np.int64)
+    for index, bin_index in enumerate(bins):
+        delta_by_bin[int(bin_index)] += float(delta[index])
+        count_by_bin[int(bin_index)] += 1
+    delta_by_bin /= count_by_bin
+
+    return {
+        "layer": int(layer_index),
+        "head": int(head),
+        "period": int(period),
+        "query_t": [float(i / period) for i in range(period)],
+        "key_t": [float(i / period) for i in range(period)],
+        "scores": mean_scores.tolist(),
+        "ov_key_t": [float(i / period) for i in range(period)],
+        "ov_delta_t": delta_by_bin.tolist(),
+        "phase_probe_r2": float(phase_probe_r2),
+        "qk_cells_per_head": int(period * period),
+        "qk_observations": int(score_count.sum()),
+    }
 
 
 def summarize_head(
@@ -200,11 +335,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--resid", type=Path)
     parser.add_argument("--layer", type=int, default=18)
     parser.add_argument("--heads", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--max-rows", type=int, default=2048)
     parser.add_argument("--period", type=int, default=16)
     parser.add_argument("--ridge", type=float, default=1.0e-3)
+    parser.add_argument("--rope-theta", type=float, default=1000000.0)
+    parser.add_argument("--sink-peel-iters", type=int, default=12)
     parser.add_argument(
         "--token-texts",
         default=" the| of| and| to| in| a| is| that",
@@ -214,10 +353,13 @@ def main() -> None:
     if args.seq_len < args.period * 2:
         raise SystemExit("--seq-len must cover at least two periods")
 
+    heads = parse_heads(args.heads)
+    if args.resid is not None:
+        run_existing_residual_harvest(args, heads)
+        return
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    heads = parse_heads(args.heads)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -301,6 +443,73 @@ def main() -> None:
         "period": int(args.period),
         "token_ids": token_ids,
         "phase_probe_r2": float(phase_probe_r2),
+        "observations": head_rows,
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, indent=2) + "\n")
+    log(f"wrote {args.out}")
+
+
+def run_existing_residual_harvest(args: argparse.Namespace, heads: list[int]) -> None:
+    model_path = Path(args.model)
+    config = json.loads((model_path / "config.json").read_text())
+    num_heads = int(config["num_attention_heads"])
+    num_kv_heads = int(config.get("num_key_value_heads", num_heads))
+    hidden_size = int(config["hidden_size"])
+    head_dim = hidden_size // num_heads
+    if any(head < 0 or head >= num_heads for head in heads):
+        raise SystemExit(f"requested heads {heads} outside [0, {num_heads})")
+    rows = min(args.max_rows, args.seq_len * max(2, args.max_rows // max(args.seq_len, 1)))
+    resid = np.load(args.resid, mmap_mode="r")
+    if resid.shape[1] != hidden_size:
+        raise SystemExit(f"residual width {resid.shape[1]} does not match hidden_size {hidden_size}")
+    x = np.asarray(resid[:rows], dtype=np.float32)
+    peeled_x, absorbed = peel_top_direction(x, args.sink_peel_iters)
+    log(f"loaded {rows} rows from {args.resid}; top-direction absorbed fraction={absorbed:.6f}")
+    weights = load_attention_weights(model_path, args.layer)
+    q_flat = peeled_x @ weights["q_proj"].T
+    k_flat = peeled_x @ weights["k_proj"].T
+    v_flat = peeled_x @ weights["v_proj"].T
+    q = q_flat.reshape(rows, num_heads, head_dim)
+    k = k_flat.reshape(rows, num_kv_heads, head_dim)
+    v = v_flat.reshape(rows, num_kv_heads, head_dim)
+    q = rms_norm_heads(q, weights.get("q_norm"))
+    k = rms_norm_heads(k, weights.get("k_norm"))
+    positions = np.arange(rows, dtype=np.float32)
+    q, k = apply_rope_numpy(q, k, positions, args.rope_theta)
+    groups = num_heads // num_kv_heads
+    k = repeat_kv_numpy(k, groups)
+    v = repeat_kv_numpy(v, groups)
+    t_np = (np.arange(rows, dtype=np.float64) % args.period) / float(args.period)
+    phase_beta, phase_intercept, phase_probe_r2 = fit_phase_probe(peeled_x, t_np, args.ridge)
+    log(f"row-order phase probe R2={phase_probe_r2:.6f}")
+    head_rows = [
+        summarize_head_numpy(
+            args,
+            args.layer,
+            head,
+            q,
+            k,
+            v,
+            weights["o_proj"],
+            t_np,
+            phase_beta,
+            phase_intercept,
+            phase_probe_r2,
+        )
+        for head in heads
+    ]
+    payload = {
+        "experiment": "attn_real_qwen3_8b_existing_residual_qk_ov",
+        "model": args.model,
+        "resid": str(args.resid),
+        "layer": int(args.layer),
+        "heads": heads,
+        "rows": int(rows),
+        "period": int(args.period),
+        "sink_peel_absorbed_fraction": float(absorbed),
+        "phase_probe_r2": float(phase_probe_r2),
+        "chart": "row_index_mod_period_after_top_direction_peel",
         "observations": head_rows,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
