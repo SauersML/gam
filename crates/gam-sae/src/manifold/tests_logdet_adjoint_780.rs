@@ -7,6 +7,134 @@
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 use super::*;
 
+#[derive(Clone, Copy)]
+struct TinyComplex {
+    re: f64,
+    im: f64,
+}
+
+impl TinyComplex {
+    fn real(re: f64) -> Self {
+        Self { re, im: 0.0 }
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            re: self.re + other.re,
+            im: self.im + other.im,
+        }
+    }
+
+    fn mul(self, other: Self) -> Self {
+        Self {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
+    }
+
+    fn div(self, other: Self) -> Self {
+        let denom = other.re * other.re + other.im * other.im;
+        Self {
+            re: (self.re * other.re + self.im * other.im) / denom,
+            im: (self.im * other.re - self.re * other.im) / denom,
+        }
+    }
+
+    fn exp(self) -> Self {
+        let e = self.re.exp();
+        Self {
+            re: e * self.im.cos(),
+            im: e * self.im.sin(),
+        }
+    }
+}
+
+fn real_softmax(logits: &[f64], tau: f64) -> Vec<f64> {
+    let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut weights: Vec<f64> = logits
+        .iter()
+        .map(|&z| ((z - max_logit) / tau).exp())
+        .collect();
+    let sum: f64 = weights.iter().sum();
+    for weight in weights.iter_mut() {
+        *weight /= sum;
+    }
+    weights
+}
+
+fn complex_softmax_weight_product_derivative(
+    logits: &[f64],
+    tau: f64,
+    atom_a: usize,
+    atom_b: usize,
+    atom_w: usize,
+    block_inner: f64,
+) -> f64 {
+    let h = 1.0e-30;
+    let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut denom = TinyComplex::real(0.0);
+    let mut numer_a = TinyComplex::real(0.0);
+    let mut numer_b = TinyComplex::real(0.0);
+    for (atom, &logit) in logits.iter().enumerate() {
+        let z = TinyComplex {
+            re: (logit - max_logit) / tau,
+            im: if atom == atom_w { h / tau } else { 0.0 },
+        };
+        let exp_z = z.exp();
+        denom = denom.add(exp_z);
+        if atom == atom_a {
+            numer_a = exp_z;
+        }
+        if atom == atom_b {
+            numer_b = exp_z;
+        }
+    }
+    let a = numer_a.div(denom);
+    let b = numer_b.div(denom);
+    a.mul(b).mul(TinyComplex::real(block_inner)).im / h
+}
+
+#[test]
+pub(crate) fn softmax_tt_weight_product_logit_adjoint_hits_both_factors_2156() {
+    let logits = [0.31_f64, -0.27, 0.14, -0.08];
+    let tau = 0.73_f64;
+    let inv_tau = 1.0 / tau;
+    let assignments = real_softmax(&logits, tau);
+    let block_inner = 1.417_f64;
+
+    for (atom_a, atom_b, atom_w) in [(0usize, 2usize, 1usize), (2usize, 2usize, 2usize)] {
+        let h_ab = assignments[atom_a] * assignments[atom_b] * block_inner;
+        let one_factor = h_ab
+            * (if atom_w == atom_a { 1.0 } else { 0.0 } - assignments[atom_w])
+            * inv_tau;
+        let fixed = h_ab
+            * SaeManifoldTerm::softmax_data_weight_product_logit_factor(
+                &assignments,
+                atom_a,
+                atom_b,
+                atom_w,
+                inv_tau,
+            );
+        let complex_step = complex_softmax_weight_product_derivative(
+            &logits,
+            tau,
+            atom_a,
+            atom_b,
+            atom_w,
+            block_inner,
+        );
+        let ratio = fixed / one_factor;
+        assert!(
+            (ratio - 2.0).abs() <= 1.0e-12,
+            "one-factor softmax product derivative must be 2x low: got ratio {ratio:.12}"
+        );
+        assert!(
+            (fixed - complex_step).abs() <= 1.0e-6 * (1.0 + complex_step.abs()),
+            "fixed softmax product derivative must match complex-step: fixed={fixed:.12e}, complex={complex_step:.12e}"
+        );
+    }
+}
+
 /// #1416 exact NUMERICAL ORACLE for the IBP cross-row log-det derivatives.
 ///
 /// The issue pins a two-row, one-column interior example with a clean,
