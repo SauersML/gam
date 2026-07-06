@@ -40,6 +40,12 @@ where
     }
 }
 
+impl SpatialKernelEvaluator for Arc<dyn SpatialKernelEvaluator> {
+    fn eval(&self, x: &[f64], c: &[f64]) -> f64 {
+        self.as_ref().eval(x, c)
+    }
+}
+
 /// Chunked kernel design operator for spatial smooths (TPS, Matérn, Duchon).
 ///
 /// Instead of storing a dense n × k matrix, evaluates K(data[i], center[j])
