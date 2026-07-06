@@ -706,43 +706,87 @@ fn smallest_linkage_component(distances: &Array2<f64>, scale: f64) -> usize {
 }
 
 fn dominant_persistence(bars: &[PersistenceBar]) -> f64 {
-    bars.iter()
-        .map(|b| b.persistence())
-        .fold(0.0_f64, f64::max)
+    bars.iter().map(|b| b.persistence()).fold(0.0_f64, f64::max)
 }
 
-fn dominant_gap_bar_count(bars: &[PersistenceBar], within_scale: f64) -> usize {
+fn dominant_gap_bar_count(bars: &[PersistenceBar]) -> usize {
     let essential = bars.iter().filter(|b| b.is_essential()).count();
-    let mut lengths: Vec<f64> = bars
+    let finite: Vec<PersistenceBar> = bars
         .iter()
-        .map(|b| b.persistence())
-        .filter(|p| p.is_finite() && *p > 0.0)
+        .copied()
+        .filter(|b| b.birth.is_finite() && b.death.is_finite() && b.death > b.birth)
         .collect();
-    if lengths.is_empty() {
+    if finite.is_empty() {
         return essential;
     }
-    lengths.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    if lengths.len() == 1 {
-        return essential + usize::from(lengths[0] > within_scale);
+
+    // Count the Pareto frontier of the birth/death diagram.  A genuine sampled
+    // homology generator is not made less valid merely because the H0 covering
+    // scale is larger than its lifetime; what distinguishes diagram noise is
+    // that it is born no earlier and dies no later than a more persistent class.
+    // This partial-order rule is scale-free and uses only the diagram geometry:
+    // dominated bars cannot represent additional stable topology, while each
+    // undominated bar witnesses an independent class on some filtration band.
+    let mut frontier = 0usize;
+    'candidate: for (idx, bar) in finite.iter().enumerate() {
+        for (other_idx, other) in finite.iter().enumerate() {
+            if idx == other_idx {
+                continue;
+            }
+            let born_no_later = other.birth <= bar.birth;
+            let dies_no_earlier = other.death >= bar.death;
+            let strictly_better = other.birth < bar.birth || other.death > bar.death;
+            if born_no_later && dies_no_earlier && strictly_better {
+                continue 'candidate;
+            }
+        }
+        frontier += 1;
     }
-    let logs: Vec<f64> = lengths.iter().map(|d| d.ln()).collect();
-    let gaps: Vec<f64> = (0..lengths.len() - 1)
-        .map(|i| logs[i] - logs[i + 1])
+
+    essential + frontier
+}
+
+fn shell_plateau_bar_count(bars: &[PersistenceBar]) -> usize {
+    let essential = bars.iter().filter(|b| b.is_essential()).count();
+    let finite: Vec<PersistenceBar> = bars
+        .iter()
+        .copied()
+        .filter(|b| b.birth.is_finite() && b.death.is_finite() && b.death > b.birth)
         .collect();
-    let mut gmax = f64::NEG_INFINITY;
-    let mut gmax_idx = 0usize;
-    for (i, &g) in gaps.iter().enumerate() {
-        if g > gmax {
-            gmax = g;
-            gmax_idx = i;
+    if finite.is_empty() {
+        return essential;
+    }
+    let mut critical = Vec::with_capacity(finite.len() * 2);
+    for bar in &finite {
+        critical.push(bar.birth);
+        critical.push(bar.death);
+    }
+    critical.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    critical.dedup_by(|a, b| *a == *b);
+    let mut best = essential;
+    let mut best_width = f64::NEG_INFINITY;
+    for window in critical.windows(2) {
+        let lo = window[0];
+        let hi = window[1];
+        if !(hi > lo) {
+            continue;
+        }
+        let probe = if lo > 0.0 { (lo * hi).sqrt() } else { hi / 2.0 };
+        let count = essential
+            + finite
+                .iter()
+                .filter(|bar| bar.birth < probe && probe < bar.death)
+                .count();
+        if count == 0 {
+            continue;
+        }
+        let width = if lo > 0.0 { (hi / lo).ln() } else { hi - lo };
+        if width > best_width || (width == best_width && count < best) {
+            best_width = width;
+            best = count;
         }
     }
-    let sum_others: f64 = gaps.iter().sum::<f64>() - gmax;
-    if gmax > sum_others.max(std::f64::consts::LN_2) {
-        essential + gmax_idx + 1
-    } else {
-        essential + lengths.iter().filter(|&&p| p > within_scale).count()
-    }
+    best
 }
 
 fn support_summary(weights: Option<ArrayView1<'_, f64>>, full: usize) -> (f64, f64, f64) {
@@ -816,25 +860,20 @@ fn topology_persistence_verdict_impl(
         .copied()
         .filter(|b| !b.is_essential())
         .collect();
-    let distances = dtm_weighted_distances(
-        sub.view(),
-        sub_weights.as_ref().map(|w| w.view()),
-    );
-    let (n_components, within_scale) = components_and_scale(&finite_h0, &distances);
+    let distances = dtm_weighted_distances(sub.view(), sub_weights.as_ref().map(|w| w.view()));
+    let (n_components, _) = components_and_scale(&finite_h0, &distances);
 
     let measured_betti = BettiSignature {
         b0: n_components,
-        b1: dominant_gap_bar_count(&diagram.h1, within_scale),
-        b2: expected_betti
-            .b2
-            .map(|expected_h2| {
-                let counted = dominant_gap_bar_count(&diagram.h2, within_scale);
-                if expected_h2 == 0 && counted == 0 {
-                    0
-                } else {
-                    counted
-                }
-            }),
+        b1: dominant_gap_bar_count(&diagram.h1),
+        b2: expected_betti.b2.map(|expected_h2| {
+            let counted = shell_plateau_bar_count(&diagram.h2);
+            if expected_h2 == 0 && counted == 0 {
+                0
+            } else {
+                counted
+            }
+        }),
     };
     let dominant_h1_persistence = dominant_persistence(&diagram.h1);
     let dominant_h2_persistence = dominant_persistence(&diagram.h2);
@@ -1087,7 +1126,7 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{components_and_scale, dtm_weighted_distances, PersistenceBar};
+    use super::{PersistenceBar, components_and_scale, dtm_weighted_distances};
     use ndarray::Array2;
 
     fn bars(deaths: &[f64]) -> Vec<PersistenceBar> {
@@ -1159,8 +1198,14 @@ mod tests {
         let pts = line_points(&[0.0, 0.1, 0.2, 50.0, 50.1]);
         let distances = dtm_weighted_distances(pts.view(), None);
         let (n, within) = components_and_scale(&bars(&deaths), &distances);
-        assert_eq!(n, 2, "a real inter-cluster gap with ≥2 per side must still split");
-        assert!((within - 0.1).abs() < 1e-12, "within-scale is the coarsest sub-cut merge");
+        assert_eq!(
+            n, 2,
+            "a real inter-cluster gap with ≥2 per side must still split"
+        );
+        assert!(
+            (within - 0.1).abs() < 1e-12,
+            "within-scale is the coarsest sub-cut merge"
+        );
     }
 
     #[test]
