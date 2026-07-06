@@ -481,9 +481,13 @@ pub fn spd_frechet_mean(
             return Ok(best_p);
         }
     }
-    Err(GeometryError::Singular(
-        "SPD Fréchet mean did not reach stationarity tolerance within max_iter",
-    ))
+    // Budget exhausted while still descending: keep the best (least-residual)
+    // iterate rather than discarding it. Consistent with the two other
+    // non-`tol` exits above (stall, rejected step) and with the generic
+    // `response_frechet_mean` driver (#2140) — `best_p` is a valid SPD point and
+    // a usable approximate Fréchet mean; erroring would needlessly abort a fit
+    // over a mere iteration-budget shortfall on the geodesically convex cone.
+    Ok(best_p)
 }
 
 #[cfg(test)]
@@ -706,5 +710,35 @@ mod frechet_mean_tests {
                 "mean does not minimize dispersion: V(mean)={v_mean:.6e}"
             );
         }
+    }
+
+    #[test]
+    fn spd_frechet_mean_budget_shortfall_returns_best_iterate_not_error() {
+        // Consistency with the generic response_frechet_mean driver (#2140): a
+        // `max_iter` too small to reach the requested `tol` must STILL return
+        // the best (least-residual) SPD iterate, matching the stall and
+        // rejected-step exits — never a "did not reach stationarity within
+        // max_iter" error over a mere budget shortfall on the convex cone.
+        let n = 2;
+        let rows = [
+            diag_flat(&[4.0, 0.25]),
+            Array1::from(vec![1.0, 0.5, 0.5, 3.0]),
+            diag_flat(&[0.3, 6.0]),
+        ];
+        let m = rows.len();
+        let p = spd_frechet_mean(n, stack(&rows).view(), None, 1e-14, 1)
+            .expect("budget=1 must return the best iterate, not an error");
+
+        // The returned point is a genuine SPD matrix (a valid mean / chart
+        // origin): symmetric with strictly positive eigenvalues.
+        assert_eq!(p.len(), n * n);
+        assert!(p.iter().all(|c| c.is_finite()));
+        assert!((p[1] - p[2]).abs() < 1e-12, "SPD mean must be symmetric");
+        let spd = SpdManifold::new(n);
+        // `log_map` is only defined at an SPD base point, so its success is a
+        // positive-definiteness certificate for the returned iterate.
+        let w = vec![1.0 / m as f64; m];
+        let r = residual(&spd, &p, &rows, &w);
+        assert!(r.is_finite(), "residual at the returned mean must be finite");
     }
 }
