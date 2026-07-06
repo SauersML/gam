@@ -5937,6 +5937,7 @@ fn fit_dataset_impl(
             expectile_result.wiggle_knots.map(|knots| knots.to_vec()),
             expectile_result.wiggle_degree,
             expectile_result.wiggle_saved_warp_beta,
+            expectile_result.link_wiggle_index_shift,
         )?;
         payload.group_metadata = fit_config.group_metadata.clone();
         payload.training_table_kind = training_table_kind;
@@ -6049,6 +6050,7 @@ fn fit_dataset_impl(
                 standard_result.wiggle_knots.map(|knots| knots.to_vec()),
                 standard_result.wiggle_degree,
                 standard_result.wiggle_saved_warp_beta,
+                standard_result.link_wiggle_index_shift,
             )?
         }
         FitRequest::TransformationNormal(tn_request) => {

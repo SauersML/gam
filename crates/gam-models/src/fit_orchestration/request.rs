@@ -175,6 +175,7 @@ pub struct StandardFitResult {
     /// fit's coefficients stay in the reduced `γ` coordinate; this lift is
     /// persisted into the payload's `beta_link_wiggle`.
     pub wiggle_saved_warp_beta: Option<Vec<f64>>,
+    pub link_wiggle_index_shift: Option<Vec<f64>>,
 }
 
 pub struct SurvivalLocationScaleFitResult {

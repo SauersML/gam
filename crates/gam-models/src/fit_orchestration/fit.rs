@@ -698,6 +698,7 @@ pub(crate) fn fit_standard_model(
         wiggle_knots: None,
         wiggle_degree: None,
         wiggle_saved_warp_beta: None,
+        link_wiggle_index_shift: None,
     };
 
     let Some(wiggle) = request.wiggle else {
@@ -793,6 +794,7 @@ pub(crate) fn fit_standard_model(
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
         wiggle_saved_warp_beta: solved.saved_warp_beta,
+        link_wiggle_index_shift: solved.link_wiggle_index_shift,
     })
 }
 

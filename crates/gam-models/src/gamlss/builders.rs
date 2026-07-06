@@ -870,6 +870,8 @@ pub struct BinomialMeanWiggleTermFitResult {
     /// coefficients stay in the reduced, identifiable `γ` coordinate; this is the
     /// out-of-band full-width lift consumed by `beta_link_wiggle`.
     pub saved_warp_beta: Option<Vec<f64>>,
+    /// Mean-block coefficient shift `A·β_w` needed to replay the frozen warp index.
+    pub link_wiggle_index_shift: Option<Vec<f64>>,
 }
 
 pub(crate) struct BlockwiseTermWiggleFitResultParts {
@@ -1172,7 +1174,7 @@ pub struct GaussianLocationScaleFitResult {
 pub(crate) fn fit_binomial_mean_wiggle(
     spec: BinomialMeanWiggleSpec,
     options: &BlockwiseFitOptions,
-) -> Result<(UnifiedFitResult, Option<Vec<f64>>), String> {
+) -> Result<(UnifiedFitResult, Option<Vec<f64>>, Option<Vec<f64>>), String> {
     let n = spec.y.len();
     validate_len_match("weights vs y", n, spec.weights.len())?;
     validateweights(&spec.weights, "fit_binomial_mean_wiggle")?;
@@ -1509,10 +1511,12 @@ pub(crate) fn fit_binomial_mean_wiggle(
             }
         }
     }
+    let mut index_shift: Option<Vec<f64>> = None;
     if let (Some(alias), Some(beta_w)) = (last_alias.as_ref(), saved_warp_beta.as_ref()) {
         let gamma = Array1::from_vec(beta_w.clone());
         if alias.ncols() == gamma.len() && alias.nrows() == eta_block_input.design.ncols() {
             let shift = alias.dot(&gamma);
+            index_shift = Some(shift.to_vec());
             if let Some(block) = fit.blocks.get_mut(BinomialMeanWiggleFamily::BLOCK_ETA) {
                 if block.beta.len() == shift.len() {
                     block.beta -= &shift;
@@ -1534,7 +1538,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             }
         }
     }
-    Ok((fit, saved_warp_beta))
+    Ok((fit, saved_warp_beta, index_shift))
 }
 
 /// Densify a wiggle-block penalty spec to its full `p×p` matrix for the
@@ -2903,7 +2907,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
 
     let spatial_terms = spatial_length_scale_term_indices(pilot_spec);
     if spatial_terms.is_empty() {
-        let (fit, saved_warp_beta) = fit_binomial_mean_wiggle(
+        let (fit, saved_warp_beta, link_wiggle_index_shift) = fit_binomial_mean_wiggle(
             BinomialMeanWiggleSpec {
                 y: y.clone(),
                 weights: weights.clone(),
@@ -2937,6 +2941,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             wiggle_knots,
             wiggle_degree,
             saved_warp_beta,
+            link_wiggle_index_shift,
         });
     }
 
@@ -3413,7 +3418,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         },
         options,
     )?;
-    let (fit, saved_warp_beta) = fit;
+    let (fit, saved_warp_beta, link_wiggle_index_shift) = fit;
 
     Ok(BinomialMeanWiggleTermFitResult {
         fit,
@@ -3422,5 +3427,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         wiggle_knots,
         wiggle_degree,
         saved_warp_beta,
+        link_wiggle_index_shift,
     })
 }

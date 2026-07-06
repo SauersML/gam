@@ -315,6 +315,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub beta_link_wiggle: Option<Vec<f64>>,
     #[serde(default)]
+    pub link_wiggle_index_shift: Option<Vec<f64>>,
+    #[serde(default)]
     pub baseline_timewiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
     pub baseline_timewiggle_degree: Option<usize>,
@@ -697,6 +699,7 @@ impl FittedModelPayload {
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
+            link_wiggle_index_shift: None,
             baseline_timewiggle_knots: None,
             baseline_timewiggle_degree: None,
             baseline_timewiggle_penalty_orders: None,
@@ -925,6 +928,7 @@ pub struct SavedLinkWiggleRuntime {
     pub knots: Vec<f64>,
     pub degree: usize,
     pub beta: Vec<f64>,
+    pub index_shift: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1392,11 +1396,19 @@ impl SavedLinkWiggleRuntime {
         Ok(x.row(0).to_owned())
     }
 
-    pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
-        self.validate_monotone_derivative(q0)?;
-        let xwiggle = self.constrained_basis(q0, BasisOptions::value())?;
+    pub fn apply_at_index(
+        &self,
+        q0: &Array1<f64>,
+        warp_index: &Array1<f64>,
+    ) -> Result<Array1<f64>, FittedModelError> {
+        self.validate_monotone_derivative(warp_index)?;
+        let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
         Ok(q0 + &xwiggle.dot(&beta_link_wiggle))
+    }
+
+    pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
+        self.apply_at_index(q0, q0)
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -2938,6 +2950,7 @@ impl FittedModel {
             knots,
             degree,
             beta,
+            index_shift: payload.link_wiggle_index_shift.clone(),
         }))
     }
 

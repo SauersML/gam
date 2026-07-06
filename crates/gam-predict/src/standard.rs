@@ -55,6 +55,35 @@ impl StandardPredictor {
 }
 
 impl StandardPredictor {
+    fn eta_base_and_warp_index(&self, input: &PredictInput) -> (Array1<f64>, Array1<f64>) {
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
+        let warp_index = self
+            .link_wiggle
+            .as_ref()
+            .and_then(|runtime| runtime.index_shift.as_ref())
+            .map(|shift| {
+                let shift_beta = Array1::from_vec(shift.clone());
+                &eta_base + &input.design.dot(&shift_beta)
+            })
+            .unwrap_or_else(|| eta_base.clone());
+        (eta_base, warp_index)
+    }
+
+    fn apply_link_wiggle(
+        &self,
+        input: &PredictInput,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let (eta_base, warp_index) = self.eta_base_and_warp_index(input);
+        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
+            runtime
+                .apply_at_index(&eta_base, &warp_index)
+                .map_err(EstimationError::from)?
+        } else {
+            eta_base.clone()
+        };
+        Ok((eta_base, warp_index, eta))
+    }
+
     /// Full-uncertainty η/mean point and standard errors for the link-wiggle
     /// path, computed from an arbitrary covariance `backend` (so the caller can
     /// select conditional vs. smoothing-corrected covariance). Mirrors the
@@ -70,8 +99,7 @@ impl StandardPredictor {
                 "standard link-wiggle uncertainty requires a link wiggle".to_string(),
             )
         })?;
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let eta = runtime.apply(&eta_base).map_err(EstimationError::from)?;
+        let (_eta_base, warp_index, eta) = self.apply_link_wiggle(input)?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let (mean, dmu_deta) = inverse_link_mean_and_d1(&strategy, eta.view())?;
         let p_main = self.beta.len();
@@ -81,7 +109,7 @@ impl StandardPredictor {
             backend,
             eta.len(),
             &input.design,
-            &eta_base,
+            &warp_index,
             runtime,
             LinkWiggleGradientLayout {
                 p_main,
@@ -109,7 +137,7 @@ impl StandardPredictor {
             )
         })?;
         let plugin = self.predict_plugin_response(input)?;
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
+        let (_eta_base, warp_index) = self.eta_base_and_warp_index(input);
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let Some(backend) = posterior_mean_backend_or_warn(
             fit,
@@ -145,7 +173,7 @@ impl StandardPredictor {
             &backend,
             plugin.eta.len(),
             &input.design,
-            &eta_base,
+            &warp_index,
             runtime,
             LinkWiggleGradientLayout {
                 p_main,
@@ -278,12 +306,7 @@ impl PredictableModel for StandardPredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictResult, EstimationError> {
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            runtime.apply(&eta_base).map_err(EstimationError::from)?
-        } else {
-            eta_base
-        };
+        let (_eta_base, _warp_index, eta) = self.apply_link_wiggle(input)?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         let mean = strategy.inverse_link_array(eta.view())?;
         Ok(PredictResult { eta, mean })
@@ -297,12 +320,7 @@ impl PredictableModel for StandardPredictor {
         // inverse-link mean and `dmu/deta` so the delta-method SE below can
         // reuse the d1 array instead of re-evaluating the (often nonlinear)
         // jet a second time.
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            runtime.apply(&eta_base).map_err(EstimationError::from)?
-        } else {
-            eta_base
-        };
+        let (_eta_base, _warp_index, eta) = self.apply_link_wiggle(input)?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         // Cache d1 from the same jet that produces mean so we do not recompute it
         // in `delta_method_mean_se` below.
@@ -315,7 +333,7 @@ impl PredictableModel for StandardPredictor {
                 // from `result.eta` only when a wiggle is active, so we
                 // recompute it here to avoid the double matvec on the
                 // common no-wiggle path.
-                let eta_base = input.design.dot(&self.beta) + &input.offset;
+                let (_eta_base, warp_index) = self.eta_base_and_warp_index(input);
                 let p_main = self.beta.len();
                 let p_w = runtime.beta.len();
                 let p_total = p_main + p_w;
@@ -323,7 +341,7 @@ impl PredictableModel for StandardPredictor {
                     &backend,
                     result.eta.len(),
                     &input.design,
-                    &eta_base,
+                    &warp_index,
                     runtime,
                     LinkWiggleGradientLayout {
                         p_main,
