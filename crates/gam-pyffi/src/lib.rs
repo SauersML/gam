@@ -33,6 +33,9 @@ mod sklearn;
 
 mod manifold;
 
+#[path = "latent/topology_persistence_ffi.rs"]
+mod topology_persistence_ffi;
+
 // Re-export the foundation modules at the crate root. The concern modules
 // (and the `#[pyfunction]`s in the included fragments) reach the exception
 // classes / converters and the `PyObject` alias through their bare crate-root
@@ -62,6 +65,7 @@ pub(crate) use sklearn::sklearn_metadata;
 include!("model/model_ffi.rs");
 include!("model/fidelity_ffi.rs");
 include!("latent/latent_basis_and_sae_ffi.rs");
+include!("latent/latent_basis_and_sae_ffi_tail.rs");
 include!("latent/reml_latent_fit_ffi.rs");
 include!("latent/sae_spectral_ffi.rs");
 include!("manifold/geometry_ffi.rs");

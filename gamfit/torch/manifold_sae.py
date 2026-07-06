@@ -2215,7 +2215,7 @@ class ManifoldSAE(nn.Module):
 def _topology_for_manifold(manifold: str) -> str:
     return {
         "circle": "circle",
-        "cylinder": "torus",
+        "cylinder": "cylinder",
         "sphere": "sphere",
         "product": "euclidean",
     }[manifold]

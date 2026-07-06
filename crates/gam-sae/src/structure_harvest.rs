@@ -1132,9 +1132,11 @@ fn topology_candidates_for_dim(
         return Ok(Vec::new());
     }
     // Project the seed coordinates onto the candidate's intrinsic dimension. A
-    // d=1 candidate uses the first column; a d=2 candidate uses the first two
-    // (padding the second from the first when the seed carries only one column,
-    // so a 1-D seed can still present a 2-D candidate to the race).
+    // d=1 candidate uses the first column; a d=2 candidate uses the first two.
+    // When the caller has only a 1-D seed, this generic builder repeats the seed
+    // column; radial promotion overwrites that second coordinate with the
+    // standardized log-amplitude below so promoted cylinder/disk candidates carry
+    // the radial signal rather than a duplicate angle.
     let coords_d = |d: usize| -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((n, d));
         for row in 0..n {
@@ -1482,6 +1484,34 @@ fn birth_row_amplitudes(target: ArrayView2<'_, f64>) -> Array1<f64> {
     amps
 }
 
+fn standardized_log_birth_amplitudes(amps: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
+    let n = amps.len();
+    if n == 0 {
+        return None;
+    }
+    let mut logs = Array1::<f64>::zeros(n);
+    for (i, &amp) in amps.iter().enumerate() {
+        if !amp.is_finite() || amp < 0.0 {
+            return None;
+        }
+        logs[i] = amp.max(f64::MIN_POSITIVE).ln();
+    }
+    let mean = logs.sum() / n as f64;
+    let mut var = 0.0_f64;
+    for &value in logs.iter() {
+        let centered = value - mean;
+        var += centered * centered;
+    }
+    let std = (var / n as f64).sqrt();
+    if !std.is_finite() || std <= 0.0 {
+        return None;
+    }
+    for value in logs.iter_mut() {
+        *value = (*value - mean) / std;
+    }
+    Some(logs)
+}
+
 /// When a `d = 1` birth's realized amplitude is CONTINUOUS (a hidden radial axis,
 /// per the amplitude-concentration certificate), build the promoted
 /// circle-vs-cylinder(radial)-vs-disk candidate set so the race adjudicates the
@@ -1505,6 +1535,8 @@ fn radial_promoted_specs(
     if !cert.recommends_radial_axis() {
         return Ok(None);
     }
+    let log_amp_coord = standardized_log_birth_amplitudes(amps.view())
+        .ok_or_else(|| "radial_promoted_specs: degenerate log-amplitude spread".to_string())?;
     // The circle from the d=1 set (the un-promoted alternative the evidence must
     // still be free to prefer) plus the d=2 radial two-manifolds.
     let mut promoted: Vec<TopologyCandidateSpec> = Vec::with_capacity(3);
@@ -1513,11 +1545,14 @@ fn radial_promoted_specs(
             promoted.push(spec);
         }
     }
-    for spec in topology_candidates_for_dim(coords, 2)? {
+    for mut spec in topology_candidates_for_dim(coords, 2)? {
         if matches!(
             spec.kind,
             AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean
         ) {
+            for row in 0..spec.coords.nrows() {
+                spec.coords[[row, 1]] = log_amp_coord[row];
+            }
             promoted.push(spec);
         }
     }
@@ -3252,6 +3287,20 @@ mod tests {
         assert!(kinds.contains(&AutoTopologyKind::Euclidean), "{kinds:?}");
         // No key collision: each promoted kind appears once.
         assert_eq!(kinds.len(), promoted.len());
+        let expected_radial = standardized_log_birth_amplitudes(birth_row_amplitudes(disk.view()).view())
+            .expect("disk log-amplitude spread");
+        for spec in promoted
+            .iter()
+            .filter(|spec| matches!(spec.kind, AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean))
+        {
+            for row in 0..n {
+                assert!(
+                    (spec.coords[[row, 1]] - expected_radial[row]).abs() < 1.0e-12,
+                    "promoted {:?} row {row} axis 1 must be standardized log-amplitude",
+                    spec.kind
+                );
+            }
+        }
 
         // Present/absent circle: half the rows on the unit circle (amplitude 1),
         // half at the origin (amplitude 0) ⇒ bimodal ⇒ spike ⇒ NO promotion.
@@ -3275,6 +3324,63 @@ mod tests {
             radial_promoted_specs(coords.view(), disk.view(), 2)
                 .expect("promotion decision")
                 .is_none()
+        );
+    }
+
+    fn topology_fit_sse(fit: &TopologyRaceFit, target: ArrayView2<'_, f64>) -> f64 {
+        let fitted = fit.phi.dot(&fit.decoder);
+        let mut sse = 0.0_f64;
+        for row in 0..target.nrows() {
+            for col in 0..target.ncols() {
+                let err = target[[row, col]] - fitted[[row, col]];
+                sse += err * err;
+            }
+        }
+        sse
+    }
+
+    #[test]
+    fn radial_promotion_seed_coordinate_expresses_annulus_radius() {
+        let n_angles = 16;
+        let n_radii = 25;
+        let n = n_angles * n_radii;
+        let radial = vdc(n_radii);
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| {
+            let angle_idx = row / n_radii;
+            angle_idx as f64 / n_angles as f64
+        });
+        let annulus = Array2::from_shape_fn((n, 2), |(row, col)| {
+            let angle_idx = row / n_radii;
+            let radius_idx = row % n_radii;
+            let theta = std::f64::consts::TAU * (angle_idx as f64 / n_angles as f64);
+            let radius = 0.3 + 0.7 * radial[radius_idx].sqrt();
+            if col == 0 {
+                radius * theta.cos()
+            } else {
+                radius * theta.sin()
+            }
+        });
+        let promoted = radial_promoted_specs(coords.view(), annulus.view(), 1)
+            .expect("promotion decision")
+            .expect("annulus radius spread promotes a radial axis");
+        let circle = promoted
+            .iter()
+            .find(|spec| spec.kind == AutoTopologyKind::Circle)
+            .expect("promoted race includes the circle alternative");
+        let cylinder = promoted
+            .iter()
+            .find(|spec| spec.kind == AutoTopologyKind::Cylinder)
+            .expect("promoted race includes the cylinder alternative");
+        let weights = Array1::<f64>::ones(n);
+        let circle_fit =
+            fit_topology_candidate(circle, annulus.view(), weights.view()).expect("circle fit");
+        let cylinder_fit =
+            fit_topology_candidate(cylinder, annulus.view(), weights.view()).expect("cylinder fit");
+        let circle_sse = topology_fit_sse(&circle_fit.fit_handle, annulus.view());
+        let cylinder_sse = topology_fit_sse(&cylinder_fit.fit_handle, annulus.view());
+        assert!(
+            cylinder_sse < 0.75 * circle_sse,
+            "radial seed should let cylinder express radius variation: cylinder_sse={cylinder_sse}, circle_sse={circle_sse}"
         );
     }
 
