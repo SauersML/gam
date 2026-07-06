@@ -5060,6 +5060,7 @@ fn sparse_dictionary_reconstruct_ffi<'py>(
     block_tile = 1024,
     frame_ridge = 1.0e-9,
     aux_k = 0,
+    matryoshka_prefix = false,
     tolerance = 1.0e-6
 ))]
 fn block_sparse_dictionary_fit<'py>(
@@ -5073,6 +5074,7 @@ fn block_sparse_dictionary_fit<'py>(
     block_tile: usize,
     frame_ridge: f64,
     aux_k: usize,
+    matryoshka_prefix: bool,
     tolerance: f64,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
@@ -5085,6 +5087,7 @@ fn block_sparse_dictionary_fit<'py>(
         block_tile,
         frame_ridge,
         aux_k,
+        matryoshka_prefix,
         tolerance,
     };
     let (fit, dual_cert) = detach_py_result(py, "block_sparse_dictionary_fit", move || {
@@ -5108,6 +5111,7 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("gamma", fit.gamma)?;
     out.set_item("block_utilization", fit.block_utilization)?;
     out.set_item("block_stable_rank", fit.block_stable_rank)?;
+    out.set_item("matryoshka_prefix_losses", fit.matryoshka_prefix_losses)?;
     out.set_item("explained_variance", fit.explained_variance)?;
     out.set_item("epochs", fit.epochs)?;
     out.set_item("converged", fit.converged)?;
@@ -5684,6 +5688,7 @@ impl BlockSparseDictStream {
             block_tile,
             frame_ridge,
             aux_k,
+            matryoshka_prefix: false,
             tolerance,
         };
         let inner = py

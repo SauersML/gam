@@ -854,6 +854,7 @@ mod tests {
             gamma: 1.0,
             block_utilization: vec![1.0],
             block_stable_rank: vec![1.0],
+            matryoshka_prefix_losses: Vec::new(),
             explained_variance: 1.0,
             epochs: 1,
             converged: true,

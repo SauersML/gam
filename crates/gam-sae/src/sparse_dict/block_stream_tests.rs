@@ -123,6 +123,7 @@ fn config(g: usize, b: usize, k: usize) -> BlockSparseConfig {
         block_tile: 8,
         frame_ridge: 1.0e-9,
         aux_k: g,
+        matryoshka_prefix: false,
         tolerance: 1.0e-10,
     }
 }

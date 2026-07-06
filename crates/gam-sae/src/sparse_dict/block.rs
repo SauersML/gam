@@ -77,6 +77,10 @@ pub struct BlockSparseConfig {
     /// AuxK dead-block revival budget `k_aux`: at most this many worst-utilised
     /// (effectively dead) blocks are reseeded per epoch onto worst-residual rows.
     pub aux_k: usize,
+    /// Flag-gated MATRYOSHKA-PREFIX readout. When enabled, the returned fit
+    /// carries log-spaced prefix losses over the final block ordering so an
+    /// MDL/spectrometer K-ladder can read `L(K)` from one nested artifact.
+    pub matryoshka_prefix: bool,
     /// Relative explained-variance improvement below which training stops.
     pub tolerance: f64,
 }
@@ -108,6 +112,7 @@ impl Default for BlockSparseConfig {
             block_tile: 1024,
             frame_ridge: 1.0e-9,
             aux_k: 0,
+            matryoshka_prefix: false,
             tolerance: 1.0e-6,
         }
     }
@@ -142,6 +147,11 @@ pub struct BlockSparseFit {
     /// a block used along a single direction has stable rank → 1, one used fully
     /// across its `b` axes → `b`.
     pub block_stable_rank: Vec<f32>,
+    /// Optional MATRYOSHKA-PREFIX loss ladder `(K_atoms, mean squared loss)`.
+    /// Prefix sizes are log-spaced atom counts aligned to block boundaries
+    /// (`K = prefix_blocks * block_size`) and include the full dictionary width.
+    /// Empty when [`BlockSparseConfig::matryoshka_prefix`] is false.
+    pub matryoshka_prefix_losses: Vec<(usize, f64)>,
     /// Final held-in explained variance (`1 − RSS/TSS`).
     pub explained_variance: f64,
     /// Number of epochs actually run.
@@ -178,6 +188,28 @@ impl BlockSparseFit {
             }
         }
         out
+    }
+
+    /// Read the MATRYOSHKA-PREFIX reconstruction loss at atom prefix `K`.
+    ///
+    /// `K` must be one of the logged prefix atom counts in
+    /// [`Self::matryoshka_prefix_losses`]. The readout is intentionally exact:
+    /// callers asking for an unlogged rung should choose the ladder up front
+    /// rather than silently interpolating or refitting.
+    pub fn read_loss_at_prefix(&self, k_atoms: usize) -> Result<f64, String> {
+        self.matryoshka_prefix_losses
+            .iter()
+            .find(|&&(k, _)| k == k_atoms)
+            .map(|&(_, loss)| loss)
+            .ok_or_else(|| {
+                format!(
+                    "BlockSparseFit has no MATRYOSHKA-PREFIX loss at K={k_atoms}; logged prefixes: {:?}",
+                    self.matryoshka_prefix_losses
+                        .iter()
+                        .map(|&(k, _)| k)
+                        .collect::<Vec<_>>()
+                )
+            })
     }
 }
 
@@ -857,6 +889,108 @@ fn explained_variance(
     }
 }
 
+fn log_spaced_prefix_atom_counts(n_blocks: usize, b: usize) -> Vec<usize> {
+    let mut prefixes = Vec::new();
+    let mut blocks = 1usize;
+    while blocks < n_blocks {
+        prefixes.push(blocks * b);
+        blocks = blocks.saturating_mul(2);
+    }
+    prefixes.push(n_blocks * b);
+    prefixes
+}
+
+fn prefix_reconstruction_loss(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    block_topk: usize,
+    minibatch: usize,
+    block_tile: usize,
+) -> f64 {
+    let n_blocks = decoder.nrows() / b;
+    let k = block_topk.min(n_blocks).max(1);
+    let codes = route_and_code_all(x, decoder, gamma, n_blocks, b, k, minibatch, block_tile);
+    let mut acc = 0.0f64;
+    for (i, code) in codes.iter().enumerate() {
+        let xi = x.row(i);
+        let selected: Vec<u32> = code
+            .blocks
+            .iter()
+            .zip(code.gates.iter())
+            .filter(|&(_, &gate)| gate != 0.0)
+            .map(|(&block, _)| block)
+            .collect();
+        acc += row_loss(xi, decoder, &selected, gamma, b);
+    }
+    acc / x.nrows() as f64
+}
+
+fn matryoshka_prefix_losses(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    n_blocks: usize,
+    b: usize,
+    block_topk: usize,
+    minibatch: usize,
+    block_tile: usize,
+) -> Vec<(usize, f64)> {
+    let mut out = Vec::new();
+    let mut best = f64::INFINITY;
+    for k_atoms in log_spaced_prefix_atom_counts(n_blocks, b) {
+        let prefix_decoder = decoder.slice(ndarray::s![0..k_atoms, ..]);
+        let loss = prefix_reconstruction_loss(
+            x,
+            prefix_decoder,
+            gamma,
+            b,
+            block_topk,
+            minibatch,
+            block_tile,
+        );
+        best = best.min(loss);
+        out.push((k_atoms, best));
+    }
+    out
+}
+
+fn matryoshka_block_order(codes: &[RowBlockCode], n_blocks: usize, b: usize) -> Vec<usize> {
+    let mut energy = vec![0.0f64; n_blocks];
+    for code in codes {
+        for (slot, &block) in code.blocks.iter().enumerate() {
+            if code.gates[slot] == 0.0 {
+                continue;
+            }
+            let block_index = block as usize;
+            for r in 0..b {
+                let z = code.codes[slot * b + r] as f64;
+                energy[block_index] += z * z;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..n_blocks).collect();
+    order.sort_by(|&left, &right| {
+        energy[right]
+            .partial_cmp(&energy[left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.cmp(&right))
+    });
+    order
+}
+
+fn reorder_decoder_blocks(decoder: &mut Array2<f32>, order: &[usize], b: usize) {
+    let old = decoder.clone();
+    for (new_block, &old_block) in order.iter().enumerate() {
+        for r in 0..b {
+            for c in 0..decoder.ncols() {
+                decoder[[new_block * b + r, c]] = old[[old_block * b + r, c]];
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reporting: per-block utilisation + stable rank.
 // ---------------------------------------------------------------------------
@@ -1055,8 +1189,36 @@ pub fn fit_block_sparse_dictionary(
     // One final γ refresh against the last routing so the returned scalar is the
     // exact least-squares fit to the returned frames + codes.
     gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
+    if config.matryoshka_prefix {
+        let order = matryoshka_block_order(&codes, g, b);
+        reorder_decoder_blocks(&mut decoder, &order, b);
+        codes = route_and_code_all(
+            x,
+            decoder.view(),
+            gamma,
+            g,
+            b,
+            k,
+            config.minibatch,
+            config.block_tile,
+        );
+    }
     let final_ev = explained_variance(x, &codes, decoder.view(), gamma, b);
     let (block_utilization, block_stable_rank) = block_reports(&codes, g, b, n);
+    let prefix_losses = if config.matryoshka_prefix {
+        matryoshka_prefix_losses(
+            x,
+            decoder.view(),
+            gamma,
+            g,
+            b,
+            k,
+            config.minibatch,
+            config.block_tile,
+        )
+    } else {
+        Vec::new()
+    };
 
     // Pack the fixed-width sparse routing. The gate is recomputed as the group
     // ℓ₂ `‖z_g‖₂ = γ·‖x D_gᵀ‖₂` under the FINAL γ + frames (the codes were last
@@ -1083,6 +1245,7 @@ pub fn fit_block_sparse_dictionary(
         gamma,
         block_utilization,
         block_stable_rank,
+        matryoshka_prefix_losses: prefix_losses,
         explained_variance: final_ev,
         epochs: epochs_run,
         converged,

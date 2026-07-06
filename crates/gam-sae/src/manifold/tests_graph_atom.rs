@@ -140,6 +140,7 @@ fn harmonic_fit_from_codes(rows: &[Vec<f32>], block_size: usize) -> BlockSparseF
         gamma: 1.0,
         block_utilization: vec![1.0],
         block_stable_rank: vec![2.0],
+        matryoshka_prefix_losses: Vec::new(),
         explained_variance: 1.0,
         epochs: 0,
         converged: true,

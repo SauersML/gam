@@ -54,7 +54,7 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("covering_side", report.covering_side.as_str())?;
                 atom.set_item("measured_betti", betti_signature_dict(py, report.measured_betti)?)?;
                 atom.set_item("expected_betti", betti_signature_dict(py, report.expected_betti)?)?;
-                atom.set_item("inferred_kind", inferred)?;
+                atom.set_item("kind", inferred)?;
                 atom.set_item("persistence_summary", summary)?;
                 atom.set_item("contested", report.contested)?;
                 atom.set_item("note", &report.note)?;
@@ -67,7 +67,7 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("covering_side", py.None())?;
                 atom.set_item("measured_betti", py.None())?;
                 atom.set_item("expected_betti", py.None())?;
-                atom.set_item("inferred_kind", py.None())?;
+                atom.set_item("kind", py.None())?;
                 atom.set_item("contested", py.None())?;
             }
         }
@@ -135,8 +135,16 @@ mod tests {
                 .extract::<String>()
                 .expect("covering_side string");
             assert_eq!(covering_side, "at_or_above_covering_number");
+            let kind = atom
+                .get_item("kind")
+                .expect("read kind")
+                .expect("kind present")
+                .extract::<String>()
+                .expect("kind string");
+            assert_eq!(kind, "loop");
             assert!(atom.get_item("measured_betti").expect("read measured_betti").is_some());
             assert!(atom.get_item("expected_betti").expect("read expected_betti").is_some());
+            assert!(atom.get_item("contested").expect("read contested").is_some());
         });
     }
 }
