@@ -795,7 +795,12 @@ class ManifoldSAE:
     # (one entry per eligible d=1 atom, each ``{"atom": str, "kept_curved": bool,
     # "parameterization": str, "negative_log_evidence": float, "num_parameters":
     # int, "curved_evidence_margin": float, "fitted_turning": float | None,
-    # "train_loao_delta_ev": float | None}``). NOTE (#1226): ``train_loao_delta_ev``
+    # "train_loao_delta_ev": float | None, "curved_ev": float | None,
+    # "topm_linear_ev": float | None, "curved_vs_envelope_ratio": float | None}``).
+    # ``topm_linear_ev`` is the one-SVD top-M linear/PCA envelope on the same
+    # atom response data, with M equal to the atom basis size; ratio near 1 means
+    # the one-chart fit is at its information ceiling, while much below 1 means
+    # convergence headroom. NOTE (#1226): ``train_loao_delta_ev``
     # is the per-atom IN-SAMPLE leave-one-atom-out ΔEV (computed on the training
     # matrix during the fit), NOT a held-out generalization number. This is a
     # common-data curved-vs-linear evidence

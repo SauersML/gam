@@ -21,9 +21,9 @@ The facade is thin over Rust. If `codes` are supplied, Rust audits those frozen 
 Required crate-local gate:
 
 ```text
-cd /projects/standard/hsiehph/sauer354/gam_cx_audit
+cd <DATA_ROOT>/gam_cx_audit
 . $HOME/.config/gam-build-env
-export CARGO_TARGET_DIR=/projects/standard/hsiehph/sauer354/scratch/target_shared
+export CARGO_TARGET_DIR=<DATA_ROOT>/scratch/target_shared
 cargo check -p gam-sae
 ```
 
