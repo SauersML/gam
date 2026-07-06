@@ -869,6 +869,20 @@ pub fn isa_extract_certified_planes(
     max_planes: usize,
     config: &IsaSeedConfig,
 ) -> Vec<IsaPlaneCandidate> {
+    let single_parts;
+    let parts = if max_planes == 1 && parts.above.len() > 2 {
+        single_parts = IsaEigenParts {
+            mean: parts.mean.clone(),
+            evals: parts.evals.clone(),
+            evecs: parts.evecs.clone(),
+            above: parts.above.iter().take(2).copied().collect(),
+            mp_edge: parts.mp_edge,
+            sigma2_cert: parts.sigma2_cert,
+        };
+        &single_parts
+    } else {
+        parts
+    };
     let r = parts.above.len();
     if r < 2 || max_planes == 0 {
         return Vec::new();
@@ -982,23 +996,38 @@ pub struct IsaHarvest {
     pub natural_exit: bool,
 }
 
-/// Full producer run: capture the strongest even-dimensional above-floor
-/// support span and its candidate plane count, then jointly rotate every
-/// candidate plane inside that span and certify the resulting planes. Greedy
-/// deflation is deliberately absent from separation: after whitening, amplitude
-/// ordering is gone, so recursive extraction has no mathematical guarantee.
+/// Full producer run: capture an even-dimensional above-floor support span,
+/// jointly rotate every candidate plane inside that span, emit every certified
+/// plane from that joint split, then remove accepted support before the next
+/// capture round. Deflation only advances the residual snapshot between certified
+/// joint splits; it is not a greedy separator inside a captured whitened span.
 pub fn isa_deflationary_producer(
     residual: ArrayView2<'_, f64>,
     max_planes: usize,
     config: &IsaSeedConfig,
 ) -> Result<IsaHarvest, String> {
-    let Some(parts) = capture_signal_span(residual, max_planes)? else {
+    if max_planes == 0 {
         return Ok(IsaHarvest {
             planes: Vec::new(),
             natural_exit: true,
         });
-    };
-    let planes = isa_extract_certified_planes(residual, &parts, max_planes, config);
+    }
+    let mut work = residual.to_owned();
+    let mut planes = Vec::new();
+    while planes.len() < max_planes {
+        let remaining = max_planes - planes.len();
+        let Some(parts) = capture_signal_span(work.view(), remaining)? else {
+            break;
+        };
+        let mut round = isa_extract_certified_planes(work.view(), &parts, remaining, config);
+        if round.is_empty() {
+            break;
+        }
+        for cand in &round {
+            isa_deflate_fitted_curve(&mut work, cand);
+        }
+        planes.append(&mut round);
+    }
     let natural_exit = planes.len() < max_planes;
     Ok(IsaHarvest {
         planes,

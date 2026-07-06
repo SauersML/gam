@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   hunt:
+    if: false  # disabled: do not run
     runs-on: ubuntu-latest
     timeout-minutes: 330
 

@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   check_unreleased:
+    if: false  # disabled: do not run
     # Gate: the agent only has work when `main` has advanced since the
     # last release. On scheduled runs with nothing new to ship, skip the
     # heavy job so we don't burn a runner just to have Claude exit.

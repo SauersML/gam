@@ -7132,24 +7132,6 @@ impl SaeManifoldTerm {
         acc
     }
 
-    fn deflated_unit_stiffening_contraction(d_mat: &Array2<f64>, dirs: &[Array1<f64>]) -> f64 {
-        let q = d_mat.nrows();
-        let mut acc = 0.0_f64;
-        for v in dirs {
-            for a in 0..q {
-                let va = if a < v.len() { v[a] } else { 0.0 };
-                if va == 0.0 {
-                    continue;
-                }
-                for b in 0..q {
-                    let vb = if b < v.len() { v[b] } else { 0.0 };
-                    acc += va * vb * d_mat[[a, b]];
-                }
-            }
-        }
-        acc
-    }
-
     /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
     ///
     /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with the #614
@@ -8024,14 +8006,16 @@ impl SaeManifoldTerm {
         };
         // Per active logit site: row, atom, global t-index, raw selected-inverse
         // diagonal. The raw diagonal drives the empirical-M contraction and the
-        // cross-row Woodbury self-subtraction. Daleckii-Krein row-deflation
-        // corrections are applied only in the row-local `dh_mat` contractions.
+        // cross-row Woodbury self-subtraction. The cached unit-diagonal
+        // Daleckii-Krein weight lets the later empirical-M pass correct only the
+        // no-self row-base derivative, leaving the Woodbury self derivative raw.
         #[derive(Clone, Copy)]
         struct IbpLogitSite {
             row: usize,
             atom: usize,
             t_index: usize,
             raw_diag: f64,
+            no_self_diag_deflation_weight: f64,
         }
         let mut ibp_logit_sites: Vec<IbpLogitSite> = Vec::new();
 
@@ -8096,17 +8080,55 @@ impl SaeManifoldTerm {
                 (inv_vv, inv_vbeta)
             };
 
+            // Per-row UNIT-stiffness deflated directions: the selected inverse
+            // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each
+            // `vᵢ`), so every `inv_vv`-weighted t–t contraction of `∂H/∂θ_w`
+            // below spuriously contracts the RAW derivative where the re-deflating
+            // criterion uses the deflation-map derivative `DΦ`. The kept-subspace Γ
+            // subtracts `tr(inv_vv·(D − DΦ[D]))` over the t–t block via the same
+            // Daleckii–Krein helper the ρ-traces use (the t–β / β–β blocks are not
+            // deflated). IBP cross-row Woodbury caches factor the no-self base, so
+            // the correction matrix below removes the local self derivative before
+            // applying `DΦ`; the full self/off-row rank-one derivative stays in the
+            // ordinary raw contractions.
+            let defl_dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let defl_spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+
             // Record each active logit's column, global t-index, and raw
-            // selected-inverse diagonal for the IBP cross-row passes.
+            // selected-inverse diagonal for the IBP cross-row passes. Also cache
+            // the per-slot Daleckii-Krein weight for a unit diagonal derivative:
+            // the empirical-M `m_channel` later splits into a no-self row-base
+            // derivative plus a rank-one self derivative, and only the no-self
+            // piece belongs under the row deflation map.
             if ibp_channels.is_some() {
                 for (pos, var) in jets.vars.iter().enumerate() {
                     if let SaeLocalRowVar::Logit { atom } = *var {
                         let raw_diag = inv_vv[[pos, pos]];
+                        let no_self_diag_deflation_weight = if defl_dirs.is_empty() {
+                            0.0
+                        } else {
+                            let mut unit_diag = Array2::<f64>::zeros((q, q));
+                            unit_diag[[pos, pos]] = 1.0;
+                            Self::deflation_block_correction(
+                                &inv_vv,
+                                &unit_diag,
+                                defl_dirs,
+                                defl_spectrum,
+                            )
+                        };
                         ibp_logit_sites.push(IbpLogitSite {
                             row,
                             atom,
                             t_index: base + pos,
                             raw_diag,
+                            no_self_diag_deflation_weight,
                         });
                     }
                 }
@@ -8142,43 +8164,6 @@ impl SaeManifoldTerm {
                     }
                     _ => None,
                 };
-            // Per-row UNIT-stiffness deflated directions: the selected inverse
-            // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each
-            // `vᵢ`), so every `inv_vv`-weighted t–t contraction of `∂H/∂θ_w`
-            // below spuriously contracts the RAW derivative where the re-deflating
-            // criterion uses the deflation-map derivative `DΦ`. The kept-subspace Γ
-            // subtracts `tr(inv_vv·(D − DΦ[D]))` over the t–t block via the same
-            // Daleckii–Krein helper the ρ-traces use (the t–β / β–β blocks are not
-            // deflated). `θ` enters only the per-row block (no cross-row Woodbury
-            // self-downdate on the θ path), so the raw t–t derivative `D` is used
-            // directly.
-            let defl_dirs = cache
-                .deflated_row_directions
-                .get(row)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let defl_spectrum = cache
-                .deflation_row_spectra
-                .get(row)
-                .and_then(Option::as_ref);
-            let softmax_kept_inv_vv = if !defl_dirs.is_empty() && softmax_adjoint_row.is_some() {
-                let mut kept = inv_vv.clone();
-                for v in defl_dirs {
-                    for a in 0..q {
-                        let va = if a < v.len() { v[a] } else { 0.0 };
-                        if va == 0.0 {
-                            continue;
-                        }
-                        for b in 0..q {
-                            let vb = if b < v.len() { v[b] } else { 0.0 };
-                            kept[[a, b]] -= va * vb;
-                        }
-                    }
-                }
-                Some(kept)
-            } else {
-                None
-            };
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
@@ -8269,52 +8254,23 @@ impl SaeManifoldTerm {
                             }
                         }
                         deflated_base_dh_mat[[a, b]] = deflated_base_dh;
-                        // gam#2156: softmax-logit traces differentiate the same
-                        // undamped evidence operator exposed by
-                        // `ArrowFactorCache::arrow_log_det` and
-                        // `arrow_log_det_from_cache`. For deflated rows, contract
-                        // the softmax logit t-t derivative against the kept
-                        // selected inverse `(H⁻¹)_tt - Σ_i v_i v_iᵀ`; the
-                        // Daleckii-Krein correction below then supplies the
-                        // remaining `DΦ` rotation term. Non-deflated rows keep the
-                        // exact old contraction path.
-                        let inv_entry = if let (Some(kept), Some(_)) =
-                            (softmax_kept_inv_vv.as_ref(), softmax_d_dw)
-                        {
-                            kept[[b, a]]
-                        } else {
-                            inv_vv[[b, a]]
-                        };
-                        gamma += inv_entry * dh;
+                        gamma += inv_vv[[b, a]] * dh;
                     }
                 }
                 if !defl_dirs.is_empty() {
-                    // Low-rank IBP metric channels already arrive as the symmetric
-                    // Daleckii-Krein derivative of the metric block. Applying the
-                    // generic row-deflation correction here patches the same
-                    // active-null pairs a second time.
-                    if !majorize_ibp {
-                        let correction = Self::deflation_block_correction(
-                            &inv_vv,
-                            &deflated_base_dh_mat,
-                            defl_dirs,
-                            defl_spectrum,
-                        );
-                        if softmax_d_dw.is_some() {
-                            // The direct softmax-logit contraction above already
-                            // removed the unit-stiffening block `Σ_i v_i v_iᵀ`.
-                            // Subtract only the residual DK deflation-map term:
-                            // `tr(inv_vv·(D-DΦ[D])) - Σ_i v_iᵀDv_i`, i.e. the
-                            // z-derivative/rotation of the deflation map.
-                            gamma -= correction
-                                - Self::deflated_unit_stiffening_contraction(
-                                    &deflated_base_dh_mat,
-                                    defl_dirs,
-                                );
-                        } else {
-                            gamma -= correction;
-                        }
-                    }
+                    // The row factor/log-det operator is the spectrally
+                    // conditioned `Φ(H_tt)`, while the local theta channels above
+                    // assemble the raw row derivative `D`. Subtract
+                    // `tr(inv_vv · (D - DΦ[D]))` for every deflated row, including
+                    // the low-rank IBP majorizer path, so the theta adjoint
+                    // differentiates the same operator as `arrow_log_det`,
+                    // `apply_cached_arrow_hessian`, and the selected inverse.
+                    gamma -= Self::deflation_block_correction(
+                        &inv_vv,
+                        &deflated_base_dh_mat,
+                        defl_dirs,
+                        defl_spectrum,
+                    );
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
@@ -8369,19 +8325,19 @@ impl SaeManifoldTerm {
         //   Γ_wk += [ Σ_i (H⁻¹)_ik,ik · ∂_M H_ik ] · J_wk = C_k · J_wk,
         // where ∂_M H_ik = `m_channel[i*K+k]` and J_wk = `z_jac[w*K+k]`. The
         // row-local direct-`z` channel was already added inline above; this pass
-        // owns the empirical-mass branch, with the Daleckii-Krein subtraction below
-        // restricted to the Woodbury-downdated no-self base.
+        // owns the empirical-mass branch. The no-self part of `m_channel` is a
+        // derivative of the deflated row base `H₀'`, so it receives the same
+        // Daleckii-Krein `DΦ` correction as the row-local channel; the rank-one
+        // self part stays raw and is paired with the off-row Woodbury derivative.
         if let Some(channels) = ibp_channels.as_ref() {
-            // gam#2144: contract the empirical-M diagonal channel against the raw
-            // selected-inverse diagonal only. The row-local `dh_mat` pass has already
-            // applied the Daleckii-Krein derivative of the deflated row block; adding
-            // another per-slot DK patch here counts the active-null cross pairs a
-            // second time. The Woodbury pass below owns the rank-one off-row
-            // derivative.
             let mut col_coeff = vec![0.0_f64; k_atoms];
             for site in &ibp_logit_sites {
                 let idx = site.row * k_atoms + site.atom;
-                col_coeff[site.atom] += site.raw_diag * channels.m_channel[idx];
+                let j = channels.z_jac[idx];
+                let self_mass = channels.cross_row_dd[site.atom] * j * j;
+                let no_self_mass = channels.m_channel[idx] - self_mass;
+                col_coeff[site.atom] += site.raw_diag * channels.m_channel[idx]
+                    - site.no_self_diag_deflation_weight * no_self_mass;
             }
             for site in &ibp_logit_sites {
                 let idx = site.row * k_atoms + site.atom;
