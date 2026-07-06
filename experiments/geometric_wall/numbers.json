@@ -1,0 +1,10 @@
+{
+  "status": "blocked",
+  "blockers": [
+    "MSI is not authenticated for gated google/gemma-2-2b model weights; the GPU smoke run failed with 401 Unauthorized while resolving config.json.",
+    "After the mandated git fetch/reset in /projects/standard/hsiehph/sauer354/gam_cx_wallexp, Cargo.toml contains gam-core and gam-pyffi but no gam-sae package, so cargo check -p gam-sae cannot run."
+  ],
+  "experiment_numbers": null,
+  "sink_fractions": null,
+  "curvature_drop_correlation": null
+}
