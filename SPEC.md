@@ -5,7 +5,7 @@
 - Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
-- Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch.
+- Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch. Exception: analysis of results or examples in the proper, non-production directories.
 - The program must never run out of memory on reasonably-resourced computers.
 - REML (or LAML) always used for fitting, never GCV.
 - Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
@@ -17,4 +17,4 @@
 - Grid search is never allowed.
 - Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.
 - Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible.
-- Parallelizing a greedy/sequential fit must not change its result. A batched acceptance of several candidates from one snapshot is permitted ONLY when the candidates are provably independent (e.g. block-orthogonal designs — disjoint gate supports under an independent gate — so the batch equals the serial greedy sequence up to order); overlapping/dependent candidates must yield to the best and be requeued against the updated state. The independence criterion must be derived (a support/orthogonality test), never a tuned coherence threshold; per-round fan-out is a safety bound, not a knob. A serial-vs-batched parity test is the license for any such parallelism.
+- 
