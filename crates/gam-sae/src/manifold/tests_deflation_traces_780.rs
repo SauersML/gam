@@ -221,7 +221,7 @@ pub(crate) fn learnable_ibp_data_logdet_trace_zeroes_ungated_atom_1026() {
 #[test]
 pub(crate) fn assignment_log_strength_trace_ignores_fixed_logit_bug4() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
     // Atom 1 is the #1026 ungated background tier: a FIXED (inert) logit.
     term.assignment = term
         .assignment
