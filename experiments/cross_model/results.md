@@ -14,9 +14,9 @@ positions instead of unrelated activation banks.
 - Layers: Qwen3-8B L18 of 36, Qwen3.6-35B-A3B L20 of 40.
 - Coordinate: model-local top-2 PCA activation-plane angle after peeling the
   top PCA direction in each model.
-- MSI outputs: large `.npy` arrays are in
-  `${GAM_MSI_DATA}/scratch/cross_model_matched_harvest`;
-  committed numbers are in `numbers.json`.
+- MSI outputs: large `.npy` arrays are kept off-repo in the run's scratch
+  directory (`cross_model_matched_harvest/`); committed numbers are in
+  `numbers.json`.
 
 ## Peel diagnostics
 

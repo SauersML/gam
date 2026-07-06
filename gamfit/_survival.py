@@ -537,10 +537,15 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface("survival")
         if grid is not None and surface is not None:
             include_ids = self.id_column is not None and self.row_ids is not None
-            # Same extrapolation law as the in-memory survival path (#1595):
-            # S(t<=0)=1, S(t->inf) flat-held at the last fitted value, never
-            # forced to 0. The Rust CSV writer used to hardcode (1.0, 0.0).
-            left_value, right_value = _extrapolation_for("survival")
+            # This is the streaming counterpart of ``survival_at``: it reads the
+            # SAME fitted FFI surface, so it must apply the SAME extrapolation law
+            # and clip to emit byte-for-byte the numbers ``survival_at`` returns.
+            # We thread both from the single authoritative source used by the
+            # in-memory path (``_SURVIVAL_EXTRAPOLATION`` and ``survival_at``'s
+            # ``clip=(0.0, 1.0)``) rather than have the Rust writer hardcode a
+            # second copy (issue #2154): S(t<=0)=1, finite past-grid flat-clamp
+            # (#1595), S(+inf)=0 (#965), survival probabilities in [0, 1].
+            left_value, right_value, inf_value = _extrapolation_for("survival")
             return str(
                 rust_module().write_survival_csv(
                     str(path),
@@ -553,6 +558,9 @@ class SurvivalPrediction:
                     time_grid_chunk,
                     left_value,
                     right_value,
+                    inf_value,
+                    0.0,
+                    1.0,
                 )
             )
 

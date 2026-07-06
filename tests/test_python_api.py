@@ -1057,6 +1057,86 @@ def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> 
     assert values[2] < values[0]
 
 
+def test_survival_prediction_write_csv_matches_survival_at_at_extrapolation_edges(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The streaming CSV writer must equal ``survival_at`` on the FITTED-SURFACE
+    arm, including where the extrapolation law bites (issue #2154).
+
+    ``write_survival_at_csv`` is the streaming counterpart of ``survival_at``:
+    for the same fitted surface they must return byte-for-byte the same numbers.
+    The bug was Python->Rust drift on the extrapolation law -- the writer's arm
+    that reads a stored surface raised unconditionally, and the (now completed)
+    refactor threads the boundary law ``(left, right, inf) = (1.0, None, 0.0)``
+    plus clip ``(0.0, 1.0)`` from the ONE authoritative table so the two paths
+    cannot diverge. The other survival-CSV tests build predictions WITHOUT a
+    stored surface, so they only exercise the pure-Python fallback and never hit
+    this arm; this one supplies a surface and probes the three edges the law
+    governs:
+
+      * below the grid (``t < t_min``) -> ``S = 1`` (left asymptote), which here
+        differs from the nearest grid value (``S(t_min) = 0.9``), so a dropped
+        ``left_value`` would be caught;
+      * a FINITE time past the grid (``t > t_max``) -> flat-clamp to the last
+        fitted value (``right_value = None``), NOT the ``t->inf`` asymptote 0
+        (regressing to a hardcoded ``0.0`` right edge would be caught); and
+      * ``t = +inf`` -> the genuine asymptote ``S = 0`` (``inf_value``), distinct
+        from the finite flat-clamp, so a two-value unpack that dropped the third
+        ``inf_value`` field would be caught.
+    """
+    grid = np.array([1.0, 2.0, 3.0], dtype=float)
+    # Two rows with distinct, strictly decreasing survival curves. Crucially the
+    # first grid value is 0.9 (NOT 1.0) so the below-grid left asymptote (1.0) is
+    # numerically distinguishable from a nearest-endpoint fallback.
+    survival = np.array([[0.9, 0.5, 0.2], [0.8, 0.4, 0.1]], dtype=float)
+    cumulative = -np.log(survival)
+
+    query_times = np.array([0.5, 1.0, 1.5, 3.0, 10.0, np.inf], dtype=float)
+
+    def check(id_column: object, row_ids: object, header_prefix: list[str]) -> None:
+        pred = gamfit.SurvivalPrediction(
+            model_class="survival",
+            parameters=np.zeros((2, 1), dtype=float),
+            parameter_names=("linear_predictor",),
+            times=grid,
+            survival=survival,
+            cumulative_hazard=cumulative,
+            hazard=np.zeros_like(survival),
+            id_column=id_column,
+            row_ids=row_ids,
+        )
+
+        # Authoritative in-memory answer for the same surface + query times.
+        in_memory = np.asarray(pred.survival_at(query_times), dtype=float)
+        assert in_memory.shape == (2, query_times.size)
+
+        # Pin the extrapolation semantics independently of survival_at so a
+        # correlated regression in BOTH paths cannot hide.
+        # row0 below-grid -> 1.0; interior t=1.5 -> midpoint(0.9,0.5)=0.7;
+        # t=3.0 -> last node 0.2; finite t=10 past grid -> flat-clamp 0.2;
+        # t=+inf -> genuine asymptote 0.0.
+        np.testing.assert_allclose(in_memory[0], [1.0, 0.9, 0.7, 0.2, 0.2, 0.0])
+        np.testing.assert_allclose(in_memory[1], [1.0, 0.8, 0.6, 0.1, 0.1, 0.0])
+
+        out = pred.write_survival_at_csv(
+            tmp_path / f"edges_{header_prefix[-1]}.csv",
+            query_times,
+            people_chunk=1,
+            time_grid_chunk=2,
+        )
+        lines = pathlib.Path(out).read_text(encoding="utf-8").splitlines()
+        assert lines[0].split(",") == header_prefix + ["time", "survival"]
+        surv_idx = len(header_prefix) + 1
+        csv_values = np.array(
+            [float(line.split(",")[surv_idx]) for line in lines[1:]], dtype=float
+        )
+        # Row-major over (person, time): must equal the in-memory surface.
+        np.testing.assert_allclose(csv_values, in_memory.reshape(-1), atol=1e-12)
+
+    check(None, None, ["row"])
+    check("person_id", ("subject-a", "subject-b"), ["row", "person_id"])
+
+
 def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: pathlib.Path) -> None:
     pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
