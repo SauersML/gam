@@ -331,6 +331,7 @@ mod selected_inverse_row_blocks_oracle_tests {
             htt_factors: htt,
             htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(schur),
+            schur_factor_is_undamped: true,
             joint_hessian_log_det: None,
             solver_mode: ArrowSolverMode::Direct,
             ridge_t: 0.0,
@@ -487,6 +488,12 @@ pub(crate) fn apply_cached_arrow_hessian(
                     .to_string(),
             );
         };
+        if !cache.schur_factor_is_undamped {
+            return Err(
+                "apply_cached_arrow_hessian: Schur factor was not built from the undamped evidence row factors"
+                    .to_string(),
+            );
+        }
         let schur_v = cholesky_factor_apply(schur_factor.view(), v_beta);
         for i in 0..cache.k {
             out_beta[i] += schur_v[i];

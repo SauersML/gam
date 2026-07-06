@@ -7931,6 +7931,13 @@ impl SaeManifoldTerm {
         // row-local channel (handled inline via
         // `assignment_prior_hdiag_derivative_entry`) and a cross-row channel
         // (accumulated column-wise after the row loop, below).
+        if cache.arrow_log_det().is_none() {
+            return Err(
+                "logdet_theta_adjoint: cache lacks an authoritative joint-Hessian log-det \
+                 for the selected-inverse operator"
+                    .to_string(),
+            );
+        }
         let n = self.n_obs();
         let total_t = cache.delta_t_len();
         let mut gamma_t = Array1::<f64>::zeros(total_t);

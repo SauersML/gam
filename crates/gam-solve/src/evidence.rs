@@ -2100,80 +2100,24 @@ const fn splitmix64(state: &mut u64) -> u64 {
     gam_linalg::utils::splitmix64(state)
 }
 
-/// Sum of per-row arrow log-determinants plus the Schur log-det.
+/// Authoritative factored-arrow evidence log-determinant.
 ///
-/// `log|H| = Σ_i log|H_uu_i| + log|A|` using the undamped Cholesky
-/// factors of `H_uu_i` and the cached Schur Cholesky factor.
-///
-/// Returns `None` if `cache.schur_factor` is absent (InexactPCG path) or
-/// if a damped/incoherent cache is supplied. [`evidence_hessian_log_det`]
-/// routes such matrix-free cases to an explicit HVP fallback.
+/// This reads the stored joint value that cache construction records for the
+/// operator used by selected-inverse/adjointers. It intentionally does not
+/// reconstruct a determinant from row and Schur pieces for damped caches; if
+/// construction did not record an exact joint log-det, evidence must refuse the
+/// cache and route to an explicit matrix-free fallback.
 pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
-    if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 {
-        // Per proposal §6.4 / §6.5 — evidence must use the undamped
-        // operator. The cache's Schur factor here was assembled under
-        // ridge damping, which is a different operator. Reject loudly.
-        return None;
-    }
     if let Some(log_det) = cache.joint_hessian_log_det {
         return log_det.is_finite().then_some(log_det);
     }
-    // A `k == 0` cache has no shared β block, so the dense Direct path forms no
-    // reduced Schur complement and `schur_factor` is legitimately `None` (the
-    // joint Hessian is block-diagonal in the latent rows). Its log-det is the
-    // per-row sum with no Schur term. Only reject when `k > 0` and the factor
-    // is absent — the InexactPCG case that never built the dense `K×K` factor.
-    // (#1132 euclidean K=4: a β-profiled atom reaches here with `k == 0`.)
-    let schur = match cache.schur_factor.as_ref() {
-        Some(schur) => Some(schur),
-        None if cache.k == 0 => None,
-        None => return None,
-    };
-
-    let mut acc = 0.0_f64;
-    // Per-row arrow blocks: log|H_uu_i| = 2 Σ log diag(L_i).
-    for l in cache.undamped_factors_iter() {
-        acc += 2.0 * log_det_from_chol_lower(l);
-    }
-    // Schur block: log|A| = 2 Σ log diag(L_schur). Empty for the `k == 0` case.
-    if let Some(schur) = schur {
-        acc += 2.0 * log_det_from_chol_lower(schur.view());
-    }
-    // #1038 cross-row IBP: when the cache carries an exact rank-`R` Woodbury,
-    // the per-row + Schur factors above are of the NO-SELF base `H₀'`, so the
-    // exact `log det H_full = log det H₀' + log det(I_R + D Uᵀ H₀'⁻¹ U)`. The
-    // correction is zero (no-op) for every non-IBP cache.
-    let woodbury_correction = cache.cross_row_woodbury_log_det();
-    if !woodbury_correction.is_finite() {
-        // A non-PD capacitance (negative determinant) is a value↔gradient
-        // desync the evidence must reject loudly, not paper over.
+    if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 {
         return None;
     }
-    acc += woodbury_correction;
-    Some(acc)
-}
-
-/// Twice-the-diagonal-log sum for a lower-triangular Cholesky factor.
-fn log_det_from_chol_lower(l: ArrayView2<'_, f64>) -> f64 {
-    let n = l.nrows();
-    let mut acc = 0.0_f64;
-    for i in 0..n {
-        let d = l[[i, i]];
-        if d > 0.0 {
-            acc += d.ln();
-        } else {
-            // SAFETY: a valid lower-triangular Cholesky factor has a strictly
-            // positive diagonal by construction. A non-positive diagonal means
-            // the caller passed a corrupted / non-SPD factor — surface it loudly
-            // rather than papering over with a corrupting NaN that silently
-            // poisons the evidence log-det (callers do not check is_nan).
-            panic!(
-                "log_det_from_chol_lower: non-positive Cholesky diagonal {d} at index {i}; \
-                 caller passed a corrupted or non-SPD factor"
-            );
-        }
+    if cache.k > 0 && !cache.schur_factor_is_undamped {
+        return None;
     }
-    acc
+    cache.compute_undamped_arrow_log_det()
 }
 
 // ---------------------------------------------------------------------------
@@ -2341,7 +2285,7 @@ pub fn ift_dbeta_drho(
     cache: &ArrowFactorCache,
     dg_red_drho: ArrayView2<'_, f64>,
 ) -> Option<Array2<f64>> {
-    if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 {
+    if !cache.schur_factor_is_undamped {
         return None;
     }
     let schur = cache.schur_factor.as_ref()?;
@@ -2490,6 +2434,12 @@ pub fn evidence_grad_rho(
             return out;
         }
     };
+    if !cache.schur_factor_is_undamped {
+        for a in 0..r {
+            out[a] = f64::NAN;
+        }
+        return out;
+    }
 
     // Precompute Y_i = H_uu_i⁻¹ H_uβ_i (di × K). Used by both the Schur
     // derivative formula (§3.5) and the row trace `tr(H_uu_i⁻¹ ∂H_uu_i)`.
@@ -3384,10 +3334,11 @@ mod tests {
         let l_huu = Array2::from_shape_vec((1, 1), vec![std::f64::consts::SQRT_2]).unwrap();
         let l_schur = Array2::from_shape_vec((1, 1), vec![(1.875_f64).sqrt()]).unwrap();
         let htbeta = Array2::from_shape_vec((1, 1), vec![0.5]).unwrap();
-        ArrowFactorCache {
+        let mut cache = ArrowFactorCache {
             htt_factors: ArrowFactorSlab::from_blocks(vec![l_huu]),
             htt_factors_undamped: crate::arrow_schur::ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(l_schur),
+            schur_factor_is_undamped: true,
             joint_hessian_log_det: None,
             solver_mode: crate::arrow_schur::ArrowSolverMode::Direct,
             ridge_t: 0.0,
@@ -3407,7 +3358,9 @@ mod tests {
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),
             cross_row_woodbury: None,
-        }
+        };
+        cache.joint_hessian_log_det = cache.compute_undamped_arrow_log_det();
+        cache
     }
 
     #[test]
@@ -3441,10 +3394,11 @@ mod tests {
     /// at ridge=0 Direct mode". Now it returns `Some(Σ_i log|H_tt^(i)|)`.
     fn k0_direct_cache_no_schur(latent_diag: f64) -> ArrowFactorCache {
         let l_huu = Array2::from_shape_vec((1, 1), vec![latent_diag.sqrt()]).unwrap();
-        ArrowFactorCache {
+        let mut cache = ArrowFactorCache {
             htt_factors: ArrowFactorSlab::from_blocks(vec![l_huu]),
             htt_factors_undamped: crate::arrow_schur::ArrowUndampedFactors::SameAsDamped,
             schur_factor: None,
+            schur_factor_is_undamped: true,
             joint_hessian_log_det: None,
             solver_mode: crate::arrow_schur::ArrowSolverMode::Direct,
             ridge_t: 0.0,
@@ -3461,7 +3415,9 @@ mod tests {
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),
             cross_row_woodbury: None,
-        }
+        };
+        cache.joint_hessian_log_det = cache.compute_undamped_arrow_log_det();
+        cache
     }
 
     #[test]
@@ -3488,14 +3444,16 @@ mod tests {
         let mut cache = k0_direct_cache_no_schur(3.0);
         cache.k = 1;
         cache.solver_mode = crate::arrow_schur::ArrowSolverMode::InexactPCG;
+        cache.joint_hessian_log_det = None;
         assert!(arrow_log_det_from_cache(&cache).is_none());
         assert!(cache.compute_undamped_arrow_log_det().is_none());
     }
 
     #[test]
-    fn laplace_evidence_nan_when_ridge_is_nonzero() {
+    fn laplace_evidence_nan_when_authoritative_logdet_missing() {
         let mut cache = make_minimal_cache();
         cache.ridge_t = 1e-3;
+        cache.joint_hessian_log_det = None;
         assert!(
             laplace_evidence(
                 EvidenceLogDetSource::FactoredArrow {
@@ -3512,9 +3470,10 @@ mod tests {
     }
 
     #[test]
-    fn laplace_evidence_uses_hvp_fallback_without_schur_factor() {
+    fn laplace_evidence_uses_hvp_fallback_without_authoritative_logdet() {
         let mut cache = make_minimal_cache();
         cache.schur_factor = None;
+        cache.joint_hessian_log_det = None;
         let hvp = |x: &[f64]| -> Vec<f64> { vec![2.0 * x[0], 1.875 * x[1]] };
         let v = laplace_evidence(
             EvidenceLogDetSource::FactoredArrow {

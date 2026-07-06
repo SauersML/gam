@@ -107,6 +107,8 @@ pub fn solve_arrow_newton_step_with_options(
     // can alias htt_factors directly; otherwise pay a second per-row
     // Cholesky (O(N d³), same complexity class as the Newton solve).
     let htt_factors = step.htt_factors;
+    let mut schur_factor = step.schur_factor;
+    let schur_log_det_override = step.schur_log_det_override;
     // The per-row deflated directions must describe the factors the gradient's
     // selected-inverse actually uses. For the ridge-0 evidence cache the damped
     // and undamped factors coincide, so the step's directions apply directly;
@@ -133,10 +135,25 @@ pub fn solve_arrow_newton_step_with_options(
             undamped.deflation_row_spectra,
         )
     };
+    let mut schur_factor_is_undamped = sys.k == 0 || (ridge_t == 0.0 && ridge_beta == 0.0);
+    if sys.k > 0 && !schur_factor_is_undamped {
+        let evidence_htt_factors = match &htt_factors_undamped {
+            ArrowUndampedFactors::SameAsDamped => &htt_factors,
+            ArrowUndampedFactors::Owned(factors) => factors,
+        };
+        let evidence_schur = build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend)?;
+        let (evidence_schur_factor, floored_evidence_schur) =
+            factor_dense_reduced_schur(&evidence_schur, options.schur_pd_floor, true)?;
+        drop(floored_evidence_schur);
+        schur_factor = Some(evidence_schur_factor);
+        schur_factor_is_undamped = true;
+    }
+
     let mut cache = ArrowFactorCache {
         htt_factors,
         htt_factors_undamped,
-        schur_factor: step.schur_factor,
+        schur_factor,
+        schur_factor_is_undamped,
         joint_hessian_log_det: None,
         solver_mode: options.mode,
         ridge_t,
@@ -181,8 +198,11 @@ pub fn solve_arrow_newton_step_with_options(
     // Quadrature (no dense `k × k` Cholesky was formed, so `schur_factor` is
     // `None`); fold it into the joint log-det directly. Every other path has a
     // dense `schur_factor` (or `k == 0`) and uses the exact diagonal-sum form.
-    cache.joint_hessian_log_det = match step.schur_log_det_override {
-        Some(schur_log_det) => cache.undamped_arrow_log_det_with_schur(schur_log_det),
+    cache.joint_hessian_log_det = match schur_log_det_override {
+        Some(schur_log_det) if ridge_t == 0.0 && ridge_beta == 0.0 => {
+            cache.undamped_arrow_log_det_with_schur(schur_log_det)
+        }
+        Some(_) => cache.compute_undamped_arrow_log_det(),
         None => cache.compute_undamped_arrow_log_det(),
     };
     Ok((delta_t, delta_beta, cache))
