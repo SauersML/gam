@@ -60,6 +60,7 @@ fn block_sparse_fit_from_arrays(
         gamma: 1.0,
         block_utilization: Vec::new(),
         block_stable_rank: Vec::new(),
+        matryoshka_prefix_losses: Vec::new(),
         explained_variance: 0.0,
         epochs: 0,
         converged: false,
@@ -1199,6 +1200,113 @@ fn audit_sae<'py>(
         None => out.set_item("transport", py.None())?,
     }
     Ok(out.unbind())
+}
+
+#[cfg(test)]
+mod sae_spectral_ffi_tests {
+    use super::*;
+
+    fn assert_dict_has_key(dict: &Bound<'_, PyDict>, key: &str) {
+        assert!(
+            dict.get_item(key)
+                .unwrap_or_else(|err| panic!("read {key}: {err}"))
+                .is_some(),
+            "missing key {key}"
+        );
+    }
+
+    #[test]
+    fn audit_sae_round_trip_surfaces_external_dictionary_diagnostics() {
+        Python::attach(|py| {
+            let decoder = ndarray::array![[1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32]];
+            let codes = ndarray::array![
+                [1.0_f32, 0.0_f32],
+                [0.0_f32, 1.0_f32],
+                [0.5_f32, 0.5_f32],
+                [1.0_f32, 1.0_f32],
+                [0.25_f32, 0.75_f32],
+                [0.75_f32, 0.25_f32],
+                [0.2_f32, 0.0_f32],
+                [0.0_f32, 0.2_f32],
+            ];
+            let data = codes.clone();
+            let theta_in = ndarray::array![
+                0.0_f64,
+                std::f64::consts::FRAC_PI_4,
+                std::f64::consts::FRAC_PI_2,
+                3.0 * std::f64::consts::FRAC_PI_4,
+                std::f64::consts::PI,
+                5.0 * std::f64::consts::FRAC_PI_4,
+                3.0 * std::f64::consts::FRAC_PI_2,
+                7.0 * std::f64::consts::FRAC_PI_4,
+            ];
+            let theta_out = theta_in.mapv(|theta| theta + 0.25);
+
+            let decoder_py = decoder.into_pyarray(py);
+            let codes_py = codes.into_pyarray(py);
+            let data_py = data.into_pyarray(py);
+            let theta_in_py = theta_in.into_pyarray(py);
+            let theta_out_py = theta_out.into_pyarray(py);
+
+            let payload = audit_sae(
+                py,
+                decoder_py.readonly(),
+                codes_py.readonly(),
+                data_py.readonly(),
+                None,
+                1,
+                None,
+                0.05,
+                Some(vec![0.5, 0.9]),
+                4,
+                None,
+                0.0,
+                4,
+                Some(theta_in_py.readonly()),
+                Some(theta_out_py.readonly()),
+                3,
+                4,
+            )
+            .expect("audit_sae FFI round-trip");
+
+            let report = payload.bind(py);
+            for key in [
+                "dual_certificate",
+                "routability",
+                "coordinate_se",
+                "absorption",
+                "transport",
+                "topology",
+                "atlas_nerve",
+            ] {
+                assert_dict_has_key(report, key);
+            }
+            let transport = report
+                .get_item("transport")
+                .expect("read transport")
+                .expect("transport present")
+                .cast::<PyDict>()
+                .expect("transport dict");
+            assert_eq!(
+                transport
+                    .get_item("class")
+                    .expect("read transport class")
+                    .expect("transport class present")
+                    .extract::<String>()
+                    .expect("transport class string"),
+                "shift"
+            );
+            assert_eq!(
+                transport
+                    .get_item("n_samples")
+                    .expect("read transport n_samples")
+                    .expect("transport n_samples present")
+                    .extract::<usize>()
+                    .expect("transport n_samples usize"),
+                8
+            );
+        });
+    }
 }
 
 /// Compose a chain of component contracts into one end-to-end shadowing bound.

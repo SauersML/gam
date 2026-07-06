@@ -1,393 +1,252 @@
 #!/usr/bin/env python3
-"""Geometric-Wall closure test on existing Qwen residual activations.
+"""Qwen geometric-wall closure rerun with real GAM block-chart promotion.
 
-This script is intentionally numpy-only. It samples rows from pre-harvested
-activation arrays, peels the leading PCA sink direction, then compares
-matched-parameter flat and quadratic local reconstructions.
+This driver consumes pre-harvested Qwen residual arrays and order-matched
+within-document position arrays. It first runs the nuisance-atlas position-0
+peel, then compares a linear GAM block-SAE baseline against GAM's real curved
+block-chart promotion lane at exactly matched parameter count.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
-import math
-import time
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any
 
 import numpy as np
 
-
-class LayerSpec(NamedTuple):
-    label: str
-    path: Path
-
-
-class PcaSketch(NamedTuple):
-    mean: np.ndarray
-    components: np.ndarray
-    singular_values: np.ndarray
-    total_energy: float
-
-
-def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+from wall_closure_common import (
+    LayerSpec,
+    build_strata,
+    correlation,
+    fit_stratum,
+    log,
+    matched_curved_blocks,
+    parse_layer_specs,
+    parse_position_specs,
+    position0_nuisance_peel,
+    sample_rows_with_positions,
+    write_json,
+)
 
 
-def parse_layer_specs(raw_specs: List[str]) -> List[LayerSpec]:
-    specs = []  # type: List[LayerSpec]
-    for raw in raw_specs:
-        if ":" not in raw:
-            raise SystemExit(f"layer spec must be LABEL:PATH, got {raw!r}")
-        label, path = raw.split(":", 1)
-        label = label.strip()
-        if not label:
-            raise SystemExit(f"layer label is empty in {raw!r}")
-        specs.append(LayerSpec(label=label, path=Path(path)))
-    if not specs:
-        raise SystemExit("at least one --layer is required")
-    return specs
-
-
-def sample_rows(path: Path, n_rows: int, seed: int) -> np.ndarray:
-    arr = np.load(path, mmap_mode="r")
-    if arr.ndim != 2:
-        raise SystemExit(f"{path} must be a rank-2 array, got shape {arr.shape}")
-    take = min(n_rows, int(arr.shape[0]))
-    rng = np.random.default_rng(seed)
-    indices = np.sort(rng.choice(arr.shape[0], size=take, replace=False))
-    return np.asarray(arr[indices], dtype=np.float32)
-
-
-def randomized_pca(
-    x: np.ndarray,
-    n_components: int,
-    oversample: int,
-    power_iter: int,
-    seed: int,
-) -> PcaSketch:
-    mean = x.mean(axis=0, dtype=np.float64).astype(np.float32)
-    xc = x.astype(np.float32, copy=True)
-    xc -= mean
-    total_energy = float(np.sum(xc.astype(np.float64) * xc.astype(np.float64)))
-    rank = min(n_components + oversample, xc.shape[0] - 1, xc.shape[1])
-    rng = np.random.default_rng(seed)
-    omega = rng.standard_normal((xc.shape[1], rank)).astype(np.float32)
-    y = xc @ omega
-    for _iteration in range(power_iter):
-        z = xc.T @ y
-        y = xc @ z
-    q, _r = np.linalg.qr(y, mode="reduced")
-    b = q.T @ xc
-    _u, s, vt = np.linalg.svd(b, full_matrices=False)
-    keep = min(n_components, vt.shape[0])
-    return PcaSketch(
-        mean=mean,
-        components=vt[:keep].astype(np.float32),
-        singular_values=s[:keep].astype(np.float64),
-        total_energy=total_energy,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--layer", action="append", required=True, help="LABEL:PATH residual .npy")
+    parser.add_argument(
+        "--positions",
+        action="append",
+        required=True,
+        help="LABEL:PATH int position .npy, with labels matching --layer",
     )
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--sample-rows", type=int, default=30_000)
+    parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument("--min-position0-rows", type=int, default=8)
+    parser.add_argument("--min-stratum-rows", type=int, default=512)
+    parser.add_argument("--flat-blocks", type=int, default=24)
+    parser.add_argument("--curved-blocks", type=int, default=0)
+    parser.add_argument("--block-size", type=int, default=4)
+    parser.add_argument("--chart-basis", type=int, default=4)
+    parser.add_argument("--block-topk", type=int, default=2)
+    parser.add_argument("--max-epochs", type=int, default=8)
+    parser.add_argument("--minibatch", type=int, default=512)
+    parser.add_argument("--block-tile", type=int, default=512)
+    parser.add_argument("--frame-ridge", type=float, default=1.0e-9)
+    parser.add_argument("--tolerance", type=float, default=1.0e-5)
+    parser.add_argument("--min-firings", type=int, default=32)
+    parser.add_argument("--max-chart-blocks", type=int, default=256)
+    parser.add_argument("--crossfit-folds", type=int, default=2)
+    parser.add_argument("--alpha", type=float, default=0.10)
+    parser.add_argument("--whitening-ridge", type=float, default=1.0e-8)
+    parser.add_argument("--pair-screen", action="store_true")
+    parser.add_argument("--pair-top-blocks", type=int, default=64)
+    parser.add_argument("--max-pairs", type=int, default=128)
+    parser.add_argument("--pair-min-cofirings", type=int, default=64)
+    parser.add_argument("--pair-min-score", type=float, default=0.20)
+    return parser.parse_args()
 
 
-def peel_sink(x: np.ndarray, sketch: PcaSketch) -> Tuple[np.ndarray, float]:
-    centered = x.astype(np.float32, copy=True)
-    centered -= sketch.mean
-    sink = sketch.components[0]
-    sink_scores = centered @ sink
-    centered -= sink_scores[:, None] * sink[None, :]
-    sink_fraction = float((sketch.singular_values[0] ** 2) / max(sketch.total_energy, 1e-30))
-    return centered, sink_fraction
-
-
-def quadratic_features(z: np.ndarray) -> np.ndarray:
-    q = z.shape[1]
-    cols = [z[:, i] * z[:, j] for i in range(q) for j in range(i, q)]
-    return np.stack(cols, axis=1).astype(np.float32)
-
-
-def ridge_coefficients(design: np.ndarray, target: np.ndarray, ridge_scale: float) -> np.ndarray:
-    x64 = design.astype(np.float64)
-    y64 = target.astype(np.float64)
-    gram = x64.T @ x64
-    scale = float(np.trace(gram) / max(gram.shape[0], 1))
-    ridge = ridge_scale * max(scale, 1e-30)
-    rhs = x64.T @ y64
-    gram.flat[:: gram.shape[0] + 1] += ridge
-    return np.linalg.solve(gram, rhs).astype(np.float32)
-
-
-def pca_basis(x: np.ndarray, rank: int) -> np.ndarray:
-    x32 = x.astype(np.float32)
-    gram = x32 @ x32.T
-    values, vectors = np.linalg.eigh(gram)
-    order = np.argsort(values)[::-1]
-    values = values[order]
-    vectors = vectors[:, order]
-    keep = min(rank, int(np.count_nonzero(values > max(values[0], 0.0) * 1e-12)))
-    if keep == 0:
-        return np.zeros((0, x.shape[1]), dtype=np.float32)
-    scaled = vectors[:, :keep].T @ x32
-    scaled /= np.sqrt(values[:keep])[:, None]
-    return scaled.astype(np.float32)
-
-
-def neighborhood_floors(
-    train: np.ndarray,
-    test: np.ndarray,
-    tangent_rank: int,
-    flat_rank: int,
-    ridge_scale: float,
-) -> Tuple[float, float, float]:
-    mean = train.mean(axis=0, dtype=np.float64).astype(np.float32)
-    train_centered = train.astype(np.float32) - mean
-    test_centered = test.astype(np.float32) - mean
-    basis = pca_basis(train_centered, flat_rank)
-    flat_scores = test_centered @ basis.T
-    flat_recon = flat_scores @ basis
-    flat = energy_ratio(test_centered - flat_recon, test_centered)
-    tangent = basis[:tangent_rank]
-    z_train = train_centered @ tangent.T
-    z_test = test_centered @ tangent.T
-    train_linear = z_train @ tangent
-    test_linear = z_test @ tangent
-    train_resid = train_centered - train_linear
-    phi_train = quadratic_features(z_train)
-    phi_mean = phi_train.mean(axis=0, dtype=np.float64).astype(np.float32)
-    phi_train -= phi_mean
-    beta = ridge_coefficients(phi_train, train_resid, ridge_scale)
-    phi_test = quadratic_features(z_test)
-    phi_test -= phi_mean
-    correction = phi_test @ beta
-    resid = test_centered - test_linear - correction
-    floor = energy_ratio(resid, test_centered)
-    curvature = math.sqrt(
-        float(np.sum(correction.astype(np.float64) * correction.astype(np.float64)))
-        / max(float(np.sum(test_centered.astype(np.float64) * test_centered.astype(np.float64))), 1e-30)
+def fit_layer(args: argparse.Namespace, layer_index: int, label: str, path: Path, positions_path: Path) -> dict[str, Any]:
+    log(f"{label}: loading sampled residuals and positions")
+    sampled = sample_rows_with_positions(
+        layer=LayerSpec(label=label, path=path),
+        positions_path=positions_path,
+        n_rows=args.sample_rows,
+        seed=args.seed + 1009 * layer_index,
     )
-    return flat, floor, curvature
-
-
-def energy_ratio(resid: np.ndarray, target: np.ndarray) -> float:
-    num = float(np.sum(resid.astype(np.float64) * resid.astype(np.float64)))
-    den = float(np.sum(target.astype(np.float64) * target.astype(np.float64)))
-    return num / max(den, 1e-30)
-
-
-def standardized_scores(x: np.ndarray, basis: np.ndarray) -> np.ndarray:
-    scores = x @ basis.T
-    scale = scores.std(axis=0, dtype=np.float64).astype(np.float32)
-    scale = np.maximum(scale, 1e-8)
-    return (scores / scale).astype(np.float32)
-
-
-def neighborhood_indices(
-    scores: np.ndarray,
-    n_neighborhoods: int,
-    neighborhood_size: int,
-    seed: int,
-) -> List[np.ndarray]:
-    rng = np.random.default_rng(seed)
-    anchors = rng.choice(scores.shape[0], size=min(n_neighborhoods, scores.shape[0]), replace=False)
-    neighborhoods = []  # type: List[np.ndarray]
-    for anchor in anchors:
-        delta = scores - scores[int(anchor)]
-        distances = np.sum(delta.astype(np.float64) * delta.astype(np.float64), axis=1)
-        take = min(neighborhood_size, scores.shape[0])
-        idx = np.argpartition(distances, take - 1)[:take]
-        neighborhoods.append(idx.astype(np.int64))
-    return neighborhoods
-
-
-def split_neighborhood(idx: np.ndarray, train_fraction: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    perm = idx.copy()
-    rng.shuffle(perm)
-    split = int(round(train_fraction * perm.shape[0]))
-    split = min(max(split, 2), perm.shape[0] - 1)
-    return perm[:split], perm[split:]
-
-
-def correlation(xs: List[float], ys: List[float]) -> Optional[float]:
-    if len(xs) < 2:
-        return None
-    x = np.asarray(xs, dtype=np.float64)
-    y = np.asarray(ys, dtype=np.float64)
-    x -= x.mean()
-    y -= y.mean()
-    denom = float(np.linalg.norm(x) * np.linalg.norm(y))
-    if denom <= 0.0:
-        return None
-    return float(np.dot(x, y) / denom)
-
-
-def layer_experiment(args: argparse.Namespace, spec: LayerSpec, layer_index: int) -> Dict[str, Any]:
-    log(f"{spec.label}: loading deterministic sample")
-    x = sample_rows(spec.path, args.sample_rows, args.seed + 1009 * layer_index)
-    q = args.tangent_rank
-    quad_cols = q * (q + 1) // 2
-    flat_rank = q + quad_cols
-    needed_components = max(flat_rank + 1, args.neighbor_dims + 1)
-    log(f"{spec.label}: randomized PCA for sink and neighborhood coordinates")
-    sketch = randomized_pca(
-        x,
-        n_components=needed_components,
-        oversample=args.pca_oversample,
-        power_iter=args.power_iter,
-        seed=args.seed + 7919 * (layer_index + 1),
+    peeled, peel_stats = position0_nuisance_peel(
+        sampled.x,
+        sampled.positions,
+        min_position0_rows=args.min_position0_rows,
     )
-    peeled, sink_fraction = peel_sink(x, sketch)
-    basis = sketch.components[1 : args.neighbor_dims + 1]
-    scores = standardized_scores(peeled, basis)
-    neighborhoods = neighborhood_indices(
-        scores,
-        args.neighborhoods,
-        args.neighborhood_size,
-        args.seed + 3571 * (layer_index + 1),
+    log(
+        f"{label}: position-0 nuisance absorbed "
+        f"{peel_stats['absorbed_centered_fraction']:.6f} of centered energy"
     )
-    rows = []  # type: List[Dict[str, float]]
-    log(f"{spec.label}: fitting {len(neighborhoods)} local flat/curved closures")
-    progress_stride = max(1, len(neighborhoods) // 6)
-    for i, idx in enumerate(neighborhoods):
-        train_idx, test_idx = split_neighborhood(
-            idx,
-            args.train_fraction,
-            args.seed + 104729 * (layer_index + 1) + i,
-        )
-        train = peeled[train_idx]
-        test = peeled[test_idx]
-        flat, curved, curv = neighborhood_floors(train, test, q, flat_rank, args.ridge_scale)
-        rows.append(
-            {
-                "flat_floor": float(flat),
-                "curved_floor": float(curved),
-                "drop": float(flat - curved),
-                "curvature_proxy": float(curv),
-            }
-        )
-        if (i + 1) % progress_stride == 0 or i + 1 == len(neighborhoods):
-            log(f"{spec.label}: completed {i + 1}/{len(neighborhoods)} neighborhoods")
-    flat_values = [row["flat_floor"] for row in rows]
-    curved_values = [row["curved_floor"] for row in rows]
-    drop_values = [row["drop"] for row in rows]
-    curvature_values = [row["curvature_proxy"] for row in rows]
+    strata = build_strata(peeled)
+    curved_blocks = matched_curved_blocks(
+        args.flat_blocks,
+        args.block_size,
+        args.chart_basis,
+        args.curved_blocks,
+    )
+    fitted: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for spec in strata:
+        if spec.n_rows < args.min_stratum_rows:
+            skipped.append(
+                {
+                    "stratum": int(spec.index),
+                    "n_rows": int(spec.n_rows),
+                    "exp_lo": int(spec.exp_lo),
+                    "exp_hi": int(spec.exp_hi),
+                    "reason": "below_min_stratum_rows",
+                }
+            )
+            continue
+        try:
+            fitted.append(
+                fit_stratum(label, spec, peeled, args.flat_blocks, curved_blocks, args)
+            )
+        except Exception as exc:
+            skipped.append(
+                {
+                    "stratum": int(spec.index),
+                    "n_rows": int(spec.n_rows),
+                    "exp_lo": int(spec.exp_lo),
+                    "exp_hi": int(spec.exp_hi),
+                    "reason": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
+    if not fitted:
+        raise SystemExit(f"{label}: no strata were fitted")
+    flat_rss = sum(row["flat_floor"] * row["target_energy"] for row in fitted)
+    curved_rss = sum(row["curved_floor"] * row["target_energy"] for row in fitted)
+    total_energy = sum(row["target_energy"] for row in fitted)
+    drops = [float(row["drop"]) for row in fitted]
+    curvatures = [float(row["curvature_proxy"]) for row in fitted]
     return {
-        "label": spec.label,
-        "path": str(spec.path),
-        "source_shape": [int(v) for v in np.load(spec.path, mmap_mode="r").shape],
-        "sample_rows": int(x.shape[0]),
-        "dimension": int(x.shape[1]),
-        "sink_top_pc_fraction": sink_fraction,
-        "tangent_rank": int(q),
-        "quadratic_columns": int(quad_cols),
-        "matched_flat_rank": int(flat_rank),
-        "neighborhoods": int(len(rows)),
-        "neighborhood_size": int(args.neighborhood_size),
-        "train_fraction": float(args.train_fraction),
-        "flat_floor_mean": float(np.mean(flat_values)),
-        "flat_floor_median": float(np.median(flat_values)),
-        "curved_floor_mean": float(np.mean(curved_values)),
-        "curved_floor_median": float(np.median(curved_values)),
-        "drop_mean": float(np.mean(drop_values)),
-        "drop_median": float(np.median(drop_values)),
-        "curvature_proxy_mean": float(np.mean(curvature_values)),
-        "curvature_proxy_median": float(np.median(curvature_values)),
-        "curvature_drop_correlation": correlation(curvature_values, drop_values),
-        "neighborhood_results": rows,
+        "label": label,
+        "path": str(path),
+        "positions_path": str(positions_path),
+        "source_shape": sampled.source_shape,
+        "sample_rows": int(sampled.x.shape[0]),
+        "dimension": int(sampled.x.shape[1]),
+        "nuisance_peel": peel_stats,
+        "strata_total": int(len(strata)),
+        "strata_fitted": int(len(fitted)),
+        "strata_skipped": skipped,
+        "covered_rows": int(sum(row["n_rows"] for row in fitted)),
+        "flat_blocks": int(args.flat_blocks),
+        "curved_blocks": int(curved_blocks),
+        "block_size": int(args.block_size),
+        "chart_basis": int(args.chart_basis),
+        "flat_total_params": int(args.flat_blocks * args.block_size * sampled.x.shape[1]),
+        "curved_total_params": int(curved_blocks * (args.block_size + args.chart_basis) * sampled.x.shape[1]),
+        "pooled_flat_floor": float(flat_rss / max(total_energy, 1.0e-30)),
+        "pooled_curved_floor": float(curved_rss / max(total_energy, 1.0e-30)),
+        "pooled_drop": float((flat_rss - curved_rss) / max(total_energy, 1.0e-30)),
+        "mean_flat_floor": float(np.mean([row["flat_floor"] for row in fitted])),
+        "mean_curved_floor": float(np.mean([row["curved_floor"] for row in fitted])),
+        "mean_drop": float(np.mean(drops)),
+        "mean_curvature_proxy": float(np.mean(curvatures)),
+        "curvature_drop_correlation": correlation(curvatures, drops),
+        "strata": fitted,
     }
 
 
-def write_report(out_dir: Path, payload: Dict[str, Any]) -> None:
+def write_report(payload: dict[str, Any], out_dir: Path) -> None:
     lines = [
-        "# Qwen Geometric-Wall Closure Test",
+        "# Qwen Geometric-Wall Closure Rerun",
         "",
-        "This run uses existing Qwen activation arrays and numpy-only local fits.",
-        "Each layer is deterministically subsampled, centered, and peeled along its top PCA sink direction.",
-        "",
-        "Flat uses held-out local PCA with rank `q + q(q+1)/2`.",
-        "Curved uses rank-`q` tangent PCA plus all centered quadratic tangent products.",
-        "Both lanes therefore have the same output-parameter budget per local neighborhood.",
+        "This is the decisive rerun design, not the matched-quadratic proxy.",
+        "Each Qwen layer is sampled with its order-matched positions, residualized against the nuisance-atlas position-0 atom, then fit with GAM's real block-chart promotion lane.",
         "",
         "## Settings",
         "",
-        f"- sample rows per layer: {payload['settings']['sample_rows']}",
-        f"- neighborhoods per layer: {payload['settings']['neighborhoods']}",
-        f"- neighborhood size: {payload['settings']['neighborhood_size']}",
-        f"- tangent rank q: {payload['settings']['tangent_rank']}",
-        f"- matched flat rank: {payload['settings']['matched_flat_rank']}",
-        f"- train fraction: {payload['settings']['train_fraction']}",
-        f"- ridge scale: {payload['settings']['ridge_scale']}",
-        "",
-        "## Layer Results",
-        "",
-        "| layer | sink frac | flat floor | curved floor | drop | curvature proxy | curvature/drop r |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for row in payload["layers"]:
-        corr = row["curvature_drop_correlation"]
-        corr_text = "null" if corr is None else f"{corr:.6f}"
+    for key, value in payload["settings"].items():
+        lines.append(f"- {key}: {value}")
+    lines.extend(
+        [
+            "",
+            "## Pooled Layer Floors",
+            "",
+            "| layer | pos0 absorbed | fitted strata | rows | flat params | curved params | flat floor | curved floor | drop | curvature/drop r |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for layer in payload["layers"]:
+        corr = layer["curvature_drop_correlation"]
+        corr_s = "NA" if corr is None else f"{corr:.6f}"
         lines.append(
-            "| {label} | {sink_top_pc_fraction:.6f} | {flat_floor_mean:.6f} | "
-            "{curved_floor_mean:.6f} | {drop_mean:.6f} | "
-            "{curvature_proxy_mean:.6f} | ".format(**row)
-            + corr_text
-            + " |"
+            "| {label} | {absorbed:.6f} | {strata_fitted}/{strata_total} | {covered_rows} | "
+            "{flat_total_params} | {curved_total_params} | {pooled_flat_floor:.6f} | "
+            "{pooled_curved_floor:.6f} | {pooled_drop:.6f} | {corr} |".format(
+                **layer,
+                absorbed=layer["nuisance_peel"]["absorbed_centered_fraction"],
+                corr=corr_s,
+            )
         )
     lines.extend(
         [
             "",
-            "## Interpretation",
+            "## Decisive Prediction",
             "",
-            "- Floors are held-out residual-energy fractions in post-sink local neighborhoods.",
-            "- Drop is `flat_floor_mean - curved_floor_mean`; positive values mean the curved chart lowers the floor.",
-            "- The curvature proxy is the RMS quadratic correction energy divided by held-out local energy.",
-            "- The reported correlation is across neighborhoods within each layer.",
+            "- Curved-residual theory is confirmed if the post-peel curved floor is below the matched linear floor, with positive pooled drop and larger drops in strata with larger accepted chart-correction energy.",
+            "- Density-only theory is supported if the post-peel curved and linear floors are statistically indistinguishable, or if curved remains higher, despite accepted chart opportunities.",
+            "- The expected curved-residual scale is a floor drop proportional to kappa^2 * ell^4 / tile; the table reports the empirical drop and the RMS chart-correction proxy needed to check that ordering.",
         ]
     )
     (out_dir / "results.md").write_text("\n".join(lines) + "\n")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--layer", action="append", required=True, help="LABEL:PATH activation npy")
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--sample-rows", type=int, default=30_000)
-    ap.add_argument("--neighborhoods", type=int, default=24)
-    ap.add_argument("--neighborhood-size", type=int, default=240)
-    ap.add_argument("--neighbor-dims", type=int, default=32)
-    ap.add_argument("--tangent-rank", type=int, default=10)
-    ap.add_argument("--train-fraction", type=float, default=0.75)
-    ap.add_argument("--ridge-scale", type=float, default=1e-6)
-    ap.add_argument("--pca-oversample", type=int, default=24)
-    ap.add_argument("--power-iter", type=int, default=1)
-    ap.add_argument("--seed", type=int, default=1729)
-    args = ap.parse_args()
-
+    args = parse_args()
     specs = parse_layer_specs(args.layer)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    q = args.tangent_rank
-    matched_flat_rank = q + q * (q + 1) // 2
-    payload = {  # type: Dict[str, Any]
-        "experiment": "qwen_wall_closure",
-        "settings": {
-            "sample_rows": int(args.sample_rows),
-            "neighborhoods": int(args.neighborhoods),
-            "neighborhood_size": int(args.neighborhood_size),
-            "neighbor_dims": int(args.neighbor_dims),
-            "tangent_rank": int(q),
-            "matched_flat_rank": int(matched_flat_rank),
-            "train_fraction": float(args.train_fraction),
-            "ridge_scale": float(args.ridge_scale),
-            "pca_oversample": int(args.pca_oversample),
-            "power_iter": int(args.power_iter),
-            "seed": int(args.seed),
-        },
-        "layers": [],
+    position_specs = parse_position_specs(args.positions)
+    missing = sorted(spec.label for spec in specs if spec.label not in position_specs)
+    if missing:
+        raise SystemExit(f"missing --positions for labels: {', '.join(missing)}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    layers = [
+        fit_layer(args, i, spec.label, spec.path, position_specs[spec.label])
+        for i, spec in enumerate(specs)
+    ]
+    settings = {
+        "sample_rows": int(args.sample_rows),
+        "seed": int(args.seed),
+        "min_position0_rows": int(args.min_position0_rows),
+        "min_stratum_rows": int(args.min_stratum_rows),
+        "flat_blocks": int(args.flat_blocks),
+        "curved_blocks": int(layers[0]["curved_blocks"]),
+        "block_size": int(args.block_size),
+        "chart_basis": int(args.chart_basis),
+        "block_topk": int(args.block_topk),
+        "max_epochs": int(args.max_epochs),
+        "minibatch": int(args.minibatch),
+        "block_tile": int(args.block_tile),
+        "frame_ridge": float(args.frame_ridge),
+        "tolerance": float(args.tolerance),
+        "min_firings": int(args.min_firings),
+        "max_chart_blocks": int(args.max_chart_blocks),
+        "crossfit_folds": int(args.crossfit_folds),
+        "alpha": float(args.alpha),
+        "whitening_ridge": float(args.whitening_ridge),
+        "pair_screen": bool(args.pair_screen),
     }
-    for layer_index, spec in enumerate(specs):
-        payload["layers"].append(layer_experiment(args, spec, layer_index))
-    with (out_dir / "numbers.json").open("w") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-    write_report(out_dir, payload)
+    payload = {
+        "experiment": "qwen_wall_closure_real_block_chart_post_pos0_peel",
+        "engine": "gamfit.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
+        "nuisance_peel": "OLS nuisance atlas design [intercept, position0_indicator]",
+        "settings": settings,
+        "layers": layers,
+    }
+    write_json(args.out_dir / "numbers.json", payload)
+    write_report(payload, args.out_dir)
     print("RESULTS_JSON " + json.dumps(payload))
 
 

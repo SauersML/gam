@@ -7163,6 +7163,24 @@ impl SaeManifoldTerm {
         acc
     }
 
+    fn deflated_unit_stiffening_contraction(d_mat: &Array2<f64>, dirs: &[Array1<f64>]) -> f64 {
+        let q = d_mat.nrows();
+        let mut acc = 0.0_f64;
+        for v in dirs {
+            for a in 0..q {
+                let va = if a < v.len() { v[a] } else { 0.0 };
+                if va == 0.0 {
+                    continue;
+                }
+                for b in 0..q {
+                    let vb = if b < v.len() { v[b] } else { 0.0 };
+                    acc += va * vb * d_mat[[a, b]];
+                }
+            }
+        }
+        acc
+    }
+
     /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
     ///
     /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with the #614
@@ -7267,9 +7285,12 @@ impl SaeManifoldTerm {
                     &mut jet_window,
                 )?;
             }
-            let jets = jet_window
+            let mut jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
+            if self.ibp_low_rank_whiten() {
+                self.whiten_logdet_row_jets_for_low_rank_metric(row, &mut jets)?;
+            }
             // Atom index (k-weight) of each local t-var.
             let var_atom: Vec<usize> = jets
                 .vars
@@ -8171,6 +8192,24 @@ impl SaeManifoldTerm {
                 .deflation_row_spectra
                 .get(row)
                 .and_then(Option::as_ref);
+            let softmax_kept_inv_vv = if !defl_dirs.is_empty() && softmax_adjoint_row.is_some() {
+                let mut kept = inv_vv.clone();
+                for v in defl_dirs {
+                    for a in 0..q {
+                        let va = if a < v.len() { v[a] } else { 0.0 };
+                        if va == 0.0 {
+                            continue;
+                        }
+                        for b in 0..q {
+                            let vb = if b < v.len() { v[b] } else { 0.0 };
+                            kept[[a, b]] -= va * vb;
+                        }
+                    }
+                }
+                Some(kept)
+            } else {
+                None
+            };
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
@@ -8261,7 +8300,22 @@ impl SaeManifoldTerm {
                             }
                         }
                         deflated_base_dh_mat[[a, b]] = deflated_base_dh;
-                        gamma += inv_vv[[b, a]] * dh;
+                        // gam#2156: softmax-logit traces must differentiate the
+                        // damped evidence log-det, not the auxiliary
+                        // unit-stiffened row block. For deflated rows, contract
+                        // the softmax logit t-t derivative against the kept
+                        // selected inverse `(H⁻¹)_tt - Σ_i v_i v_iᵀ`; the
+                        // Daleckii-Krein correction below then supplies the
+                        // remaining `DΦ` rotation term. Non-deflated rows keep the
+                        // exact old contraction path.
+                        let inv_entry = if let (Some(kept), Some(_)) =
+                            (softmax_kept_inv_vv.as_ref(), softmax_d_dw)
+                        {
+                            kept[[b, a]]
+                        } else {
+                            inv_vv[[b, a]]
+                        };
+                        gamma += inv_entry * dh;
                     }
                 }
                 if !defl_dirs.is_empty() {
@@ -8270,12 +8324,26 @@ impl SaeManifoldTerm {
                     // generic row-deflation correction here patches the same
                     // active-null pairs a second time.
                     if !majorize_ibp {
-                        gamma -= Self::deflation_block_correction(
+                        let correction = Self::deflation_block_correction(
                             &inv_vv,
                             &deflated_base_dh_mat,
                             defl_dirs,
                             defl_spectrum,
                         );
+                        if softmax_d_dw.is_some() {
+                            // The direct softmax-logit contraction above already
+                            // removed the unit-stiffening block `Σ_i v_i v_iᵀ`.
+                            // Subtract only the residual DK deflation-map term:
+                            // `tr(inv_vv·(D-DΦ[D])) - Σ_i v_iᵀDv_i`, i.e. the
+                            // z-derivative/rotation of the deflation map.
+                            gamma -= correction
+                                - Self::deflated_unit_stiffening_contraction(
+                                    &deflated_base_dh_mat,
+                                    defl_dirs,
+                                );
+                        } else {
+                            gamma -= correction;
+                        }
                     }
                 }
                 for a in 0..q {
