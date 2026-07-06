@@ -8,7 +8,123 @@
 
 use super::*;
 
+/// Per-row competing-basin summary for the #2133 SURE/Stein hard-selection
+/// correction. `weight` is the Laplace posterior basin weight, `edf` is the
+/// basin-local ARD-shrunk coordinate EDF, and `prediction` is the decoded row
+/// at that basin mode.
+#[derive(Clone, Debug)]
+pub struct BasinSureSummary {
+    pub weight: f64,
+    pub edf: f64,
+    pub prediction: Vec<f64>,
+}
+
 impl SaeManifoldTerm {
+    /// Install the already-computed SURE/Stein RSS-deflation degrees of freedom
+    /// for penalized hard basin selection. This is deliberately an additive
+    /// deflation count, not a replacement for the local ARD trace: a
+    /// single-dominant-basin row contributes zero here and is priced exactly by
+    /// the historical single-basin formula.
+    pub fn set_coordinate_selection_sure_dof(
+        &mut self,
+        dof: f64,
+    ) -> Result<(), String> {
+        if !dof.is_finite() || dof < 0.0 {
+            return Err(format!(
+                "set_coordinate_selection_sure_dof: expected finite non-negative dof, got {dof}"
+            ));
+        }
+        self.coordinate_selection_sure_dof = dof;
+        Ok(())
+    }
+
+    /// SURE/Stein RSS-deflation EDF of a penalized hard basin-selecting MAP row,
+    /// averaged under the per-basin Laplace evidence.
+    ///
+    /// The returned value is an **extra** selection EDF beyond the current
+    /// selected-basin local EDF. It satisfies the two analytic anchors required
+    /// by #2133: if one basin dominates, the extra cost is zero; if multiple
+    /// basins make identical predictions, the extra cost is zero. The scale is
+    /// the posterior disagreement of the live basin predictions, deflated by the
+    /// posterior certainty of the hard selector; unlike the mixture-mean EDF it
+    /// never charges the whole between-basin variance to a discontinuous
+    /// estimator that returns one mode rather than the posterior mean.
+    pub fn hard_selection_sure_extra_dof(
+        basins: &[BasinSureSummary],
+        phi: f64,
+    ) -> Result<f64, String> {
+        if basins.len() <= 1 {
+            return Ok(0.0);
+        }
+        if !phi.is_finite() || phi <= 0.0 {
+            return Err(format!(
+                "hard_selection_sure_extra_dof: φ must be finite positive, got {phi}"
+            ));
+        }
+        let p = basins[0].prediction.len();
+        if p == 0 {
+            return Err("hard_selection_sure_extra_dof: empty prediction".into());
+        }
+        let mut weight_sum = 0.0_f64;
+        let mut max_weight = 0.0_f64;
+        let mut mean = vec![0.0_f64; p];
+        let mut local_edf = 0.0_f64;
+        for (idx, basin) in basins.iter().enumerate() {
+            if !basin.weight.is_finite() || basin.weight < 0.0 {
+                return Err(format!(
+                    "hard_selection_sure_extra_dof: basin {idx} has invalid weight {}",
+                    basin.weight
+                ));
+            }
+            if !basin.edf.is_finite() || basin.edf < 0.0 {
+                return Err(format!(
+                    "hard_selection_sure_extra_dof: basin {idx} has invalid edf {}",
+                    basin.edf
+                ));
+            }
+            if basin.prediction.len() != p {
+                return Err(format!(
+                    "hard_selection_sure_extra_dof: basin {idx} prediction length {} != {p}",
+                    basin.prediction.len()
+                ));
+            }
+            weight_sum += basin.weight;
+            max_weight = max_weight.max(basin.weight);
+            local_edf += basin.weight * basin.edf;
+            for (m, &value) in mean.iter_mut().zip(basin.prediction.iter()) {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "hard_selection_sure_extra_dof: basin {idx} has non-finite prediction"
+                    ));
+                }
+                *m += basin.weight * value;
+            }
+        }
+        if weight_sum <= 0.0 {
+            return Err("hard_selection_sure_extra_dof: zero total basin weight".into());
+        }
+        for m in &mut mean {
+            *m /= weight_sum;
+        }
+        let mut between = 0.0_f64;
+        for basin in basins {
+            let w = basin.weight / weight_sum;
+            let sq: f64 = basin
+                .prediction
+                .iter()
+                .zip(mean.iter())
+                .map(|(&x, &m)| {
+                    let d = x - m;
+                    d * d
+                })
+                .sum();
+            between += w * sq;
+        }
+        let certainty = (max_weight / weight_sum).clamp(0.0, 1.0);
+        let extra = (between / phi) * certainty * (1.0 - certainty);
+        Ok(extra.min(local_edf.max(0.0)))
+    }
+
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
     /// unscaled inverse-Hessian β-block `S_β⁻¹` into a posterior covariance
     /// `Cov(β) = φ̂·S_β⁻¹` — the same `Vb = φ·H⁻¹` convention the main GAM
@@ -114,6 +230,8 @@ impl SaeManifoldTerm {
                 coord_edf += edf_kj;
             }
         }
+        coord_edf += self.coordinate_selection_sure_dof;
+        let coord_edf = coord_edf.clamp(0.0, n_scalar - beta_edf);
         let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);
         let phi = rss / resid_dof;
         if !phi.is_finite() || phi < 0.0 {

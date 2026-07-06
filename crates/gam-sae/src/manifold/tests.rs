@@ -2956,6 +2956,110 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
 }
 
 #[test]
+pub(crate) fn hard_selection_sure_extra_dof_has_required_anchors() {
+    let one = vec![BasinSureSummary {
+        weight: 1.0,
+        edf: 0.7,
+        prediction: vec![1.0, -2.0],
+    }];
+    assert_abs_diff_eq!(
+        SaeManifoldTerm::hard_selection_sure_extra_dof(&one, 0.5).unwrap(),
+        0.0,
+        epsilon = 0.0
+    );
+
+    let identical = vec![
+        BasinSureSummary {
+            weight: 0.5,
+            edf: 0.6,
+            prediction: vec![1.0, -2.0],
+        },
+        BasinSureSummary {
+            weight: 0.5,
+            edf: 0.6,
+            prediction: vec![1.0, -2.0],
+        },
+    ];
+    assert_abs_diff_eq!(
+        SaeManifoldTerm::hard_selection_sure_extra_dof(&identical, 0.5).unwrap(),
+        0.0,
+        epsilon = 0.0
+    );
+
+    let separated = vec![
+        BasinSureSummary {
+            weight: 0.5,
+            edf: 0.6,
+            prediction: vec![1.0, 0.0],
+        },
+        BasinSureSummary {
+            weight: 0.5,
+            edf: 0.6,
+            prediction: vec![-1.0, 0.0],
+        },
+    ];
+    let extra = SaeManifoldTerm::hard_selection_sure_extra_dof(&separated, 1.0).unwrap();
+    let mixture_mean_between_edf = 1.0_f64;
+    assert!(extra > 0.0, "ambiguous separated basins must add selection dof");
+    assert!(
+        extra < mixture_mean_between_edf,
+        "hard MAP SURE dof must not charge the mixture-mean between-basin edf"
+    );
+}
+
+#[test]
+pub(crate) fn reconstruction_dispersion_includes_hard_selection_sure_dof() {
+    let n = 24usize;
+    let p = 2usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let atom = SaeManifoldAtom::new(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let target = Array2::from_shape_fn((n, p), |(row, col)| {
+        let x = (row as f64 + 0.5) / n as f64;
+        if col == 0 {
+            0.45 * (std::f64::consts::TAU * x).sin() + 0.07
+        } else {
+            -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
+        }
+    });
+    let alpha = 250.0_f64;
+    let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![alpha.ln()]]);
+    let loss = term.loss(target.view(), &rho).unwrap();
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+
+    let base = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    term.set_coordinate_selection_sure_dof(2.0).unwrap();
+    let corrected = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    assert!(
+        corrected > base,
+        "extra SURE hard-selection dof must increase φ̂ by reducing residual dof"
+    );
+}
+
+#[test]
 pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     // The matrix-free Hutchinson estimator of `diag((H⁻¹)_tt)` (the #1777 fold
     // that replaces the exact `O(total_t·K²)` selected-inverse diagonal at

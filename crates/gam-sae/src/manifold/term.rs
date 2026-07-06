@@ -479,6 +479,11 @@ pub struct SaeManifoldTerm {
     /// incoherence/curvature certificate-input report. `None` for synthetic terms
     /// or legacy internal callers that have not computed post-fit dispersion.
     pub(crate) certificate_dispersion: Option<f64>,
+    /// #2133 — additional SURE/Stein RSS-deflation degrees of freedom from
+    /// penalized hard basin selection, beyond the local single-basin ARD trace.
+    /// The producer must compute this from actual competing-basin evidence; the
+    /// default is zero so single-basin fits are bit-identical.
+    pub(crate) coordinate_selection_sure_dof: f64,
     /// Outcome of the most recent curvature-homotopy entry walk (#1007), or
     /// `None` when no walk has run (the seed cascade entry, or any consumer that
     /// never invokes the tracker). Recorded on the fit payload so the bifurcation
@@ -770,6 +775,7 @@ impl Clone for SaeManifoldTerm {
             softmax_active_cap: self.softmax_active_cap,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: self.certificate_dispersion,
+            coordinate_selection_sure_dof: self.coordinate_selection_sure_dof,
             curvature_walk_report: self.curvature_walk_report.clone(),
             expected_evidence_gauge_deflated_directions: self
                 .expected_evidence_gauge_deflated_directions,

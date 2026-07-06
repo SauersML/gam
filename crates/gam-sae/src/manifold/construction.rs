@@ -201,6 +201,7 @@ impl SaeManifoldTerm {
             softmax_active_cap: None,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: None,
+            coordinate_selection_sure_dof: 0.0,
             curvature_walk_report: None,
             expected_evidence_gauge_deflated_directions: None,
             evidence_gauge_deflation_reanchors: 0,
