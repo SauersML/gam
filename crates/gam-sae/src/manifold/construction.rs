@@ -7110,11 +7110,16 @@ impl SaeManifoldTerm {
         let w = u.t().dot(inv_vv).dot(u);
         // correction = Σ_{m,l} W[m,l]·M[m,l]·(1 − F[m,l]).
         let mut acc = 0.0_f64;
-        let eps = 1.0e-12;
+        let eigen_scale = raw
+            .iter()
+            .chain(cond.iter())
+            .copied()
+            .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+        let gap_threshold = eigen_gap_threshold(eigen_scale, raw.len());
         for a in 0..q {
             for b in 0..q {
                 let denom = raw[a] - raw[b];
-                let f1 = if denom.abs() > eps {
+                let f1 = if denom.abs() > gap_threshold {
                     (cond[a] - cond[b]) / denom
                 } else if cond[a] == raw[a] {
                     1.0

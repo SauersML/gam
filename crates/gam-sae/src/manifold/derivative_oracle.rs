@@ -1,197 +1,5 @@
 use super::{ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot};
-use std::ops::{Add, Div, Mul, Neg, Sub};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Dual {
-    pub value: f64,
-    pub derivative: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DualKinkOp {
-    Abs,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DualKinkBranch {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DualKinkBranchRecord {
-    pub op: DualKinkOp,
-    pub branch: DualKinkBranch,
-    pub at_kink: bool,
-    pub left_value: f64,
-    pub right_value: f64,
-}
-
-impl Dual {
-    pub fn constant(value: f64) -> Self {
-        Self {
-            value,
-            derivative: 0.0,
-        }
-    }
-
-    pub fn with_derivative(value: f64, derivative: f64) -> Self {
-        Self { value, derivative }
-    }
-
-    pub fn ln(self) -> Self {
-        Self {
-            value: self.value.ln(),
-            derivative: self.derivative / self.value,
-        }
-    }
-
-    pub fn sqrt(self) -> Self {
-        let root = self.value.sqrt();
-        Self {
-            value: root,
-            derivative: self.derivative / (2.0 * root),
-        }
-    }
-
-    pub fn recip(self) -> Self {
-        Self {
-            value: self.value.recip(),
-            derivative: -self.derivative / (self.value * self.value),
-        }
-    }
-
-    pub fn abs(self, certificate: &mut BranchCertificate) -> Self {
-        self.select_max_branch(-self, DualKinkOp::Abs, certificate)
-    }
-
-    pub fn max(self, rhs: Self, certificate: &mut BranchCertificate) -> Self {
-        self.select_max_branch(rhs, DualKinkOp::Max, certificate)
-    }
-
-    fn select_max_branch(
-        self,
-        rhs: Self,
-        op: DualKinkOp,
-        certificate: &mut BranchCertificate,
-    ) -> Self {
-        let at_kink = self.value == rhs.value;
-        let branch = if self.value >= rhs.value {
-            DualKinkBranch::Left
-        } else {
-            DualKinkBranch::Right
-        };
-        certificate.record_kink_branch(DualKinkBranchRecord {
-            op,
-            branch,
-            at_kink,
-            left_value: self.value,
-            right_value: rhs.value,
-        });
-        if branch == DualKinkBranch::Left {
-            self
-        } else {
-            rhs
-        }
-    }
-}
-
-impl Add for Dual {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            value: self.value + rhs.value,
-            derivative: self.derivative + rhs.derivative,
-        }
-    }
-}
-
-impl Add<f64> for Dual {
-    type Output = Self;
-
-    fn add(self, rhs: f64) -> Self::Output {
-        Self {
-            value: self.value + rhs,
-            derivative: self.derivative,
-        }
-    }
-}
-
-impl Sub for Dual {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self {
-            value: self.value - rhs.value,
-            derivative: self.derivative - rhs.derivative,
-        }
-    }
-}
-
-impl Sub<f64> for Dual {
-    type Output = Self;
-
-    fn sub(self, rhs: f64) -> Self::Output {
-        Self {
-            value: self.value - rhs,
-            derivative: self.derivative,
-        }
-    }
-}
-
-impl Mul for Dual {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self {
-            value: self.value * rhs.value,
-            derivative: self.derivative.mul_add(rhs.value, self.value * rhs.derivative),
-        }
-    }
-}
-
-impl Mul<f64> for Dual {
-    type Output = Self;
-
-    fn mul(self, rhs: f64) -> Self::Output {
-        Self {
-            value: self.value * rhs,
-            derivative: self.derivative * rhs,
-        }
-    }
-}
-
-impl Div for Dual {
-    type Output = Self;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        self * rhs.recip()
-    }
-}
-
-impl Div<f64> for Dual {
-    type Output = Self;
-
-    fn div(self, rhs: f64) -> Self::Output {
-        Self {
-            value: self.value / rhs,
-            derivative: self.derivative / rhs,
-        }
-    }
-}
-
-impl Neg for Dual {
-    type Output = Self;
-
-    fn neg(self) -> Self::Output {
-        Self {
-            value: -self.value,
-            derivative: -self.derivative,
-        }
-    }
-}
+use super::dual::{Dual, DualKinkBranchRecord};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MajorizerAnchorMode {
@@ -543,10 +351,10 @@ pub fn dual_spd_logdet(matrix: &[Vec<Dual>]) -> Result<Dual, String> {
                 sum = sum - lower[row][inner] * lower[col][inner];
             }
             if row == col {
-                if !(sum.value.is_finite() && sum.value > 0.0) {
+                if !(sum.re.is_finite() && sum.re > 0.0) {
                     return Err(format!(
                         "dual_spd_logdet: non-positive branch pivot at row {row}: {}",
-                        sum.value
+                        sum.re
                     ));
                 }
                 lower[row][col] = sum.sqrt();
@@ -559,10 +367,10 @@ pub fn dual_spd_logdet(matrix: &[Vec<Dual>]) -> Result<Dual, String> {
     let mut logdet = Dual::constant(0.0);
     for (idx, row) in lower.iter().enumerate() {
         let diag = row[idx];
-        if !(diag.value.is_finite() && diag.value > 0.0) {
+        if !(diag.re.is_finite() && diag.re > 0.0) {
             return Err(format!(
                 "dual_spd_logdet: non-positive Cholesky diagonal at row {idx}: {}",
-                diag.value
+                diag.re
             ));
         }
         logdet = logdet + diag.ln() * 2.0;
@@ -578,8 +386,8 @@ pub fn exact_logdet_channel(
     let dual = dual_spd_logdet(matrix)?;
     Ok(ExactTraceChannel {
         channel,
-        value: dual.value,
-        derivative: dual.derivative,
+        value: dual.re,
+        derivative: dual.eps,
         certificate,
     })
 }
@@ -677,31 +485,6 @@ mod tests {
             .assert_same_branch(&cert)
             .expect_err("same degenerate eigenpair branch still has no scalar derivative");
         assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
-    }
-
-    #[test]
-    fn dual_max_records_tie_subgradient_branch_in_certificate() {
-        let mut cert = certificate(MajorizerAnchorMode::FrozenAnchor);
-        let left = Dual::with_derivative(1.0, 2.0);
-        let right = Dual::with_derivative(1.0, -3.0);
-        let chosen = left.max(right, &mut cert);
-        assert_eq!(chosen, left);
-        assert_eq!(cert.kink_branches.len(), 1);
-        assert_eq!(cert.kink_branches[0].op, DualKinkOp::Max);
-        assert_eq!(cert.kink_branches[0].branch, DualKinkBranch::Left);
-        assert!(cert.kink_branches[0].at_kink);
-    }
-
-    #[test]
-    fn dual_abs_records_zero_subgradient_sign_in_certificate() {
-        let mut cert = certificate(MajorizerAnchorMode::FrozenAnchor);
-        let dual = Dual::with_derivative(0.0, 7.0);
-        let chosen = dual.abs(&mut cert);
-        assert_eq!(chosen.derivative, 7.0);
-        assert_eq!(cert.kink_branches.len(), 1);
-        assert_eq!(cert.kink_branches[0].op, DualKinkOp::Abs);
-        assert_eq!(cert.kink_branches[0].branch, DualKinkBranch::Left);
-        assert!(cert.kink_branches[0].at_kink);
     }
 
     #[test]
