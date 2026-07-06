@@ -4392,6 +4392,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_reconstruct_ffi, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_reconstruct_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
         block_sparse_dictionary_transform_ffi,
@@ -5037,6 +5038,57 @@ fn sparse_dictionary_reconstruct_ffi<'py>(
             decoder_values.view(),
             index_values.view(),
             code_values.view(),
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (
+    atom_basis,
+    atom_dim,
+    decoder_blocks,
+    coords,
+    assignments,
+    p_out,
+))]
+fn sae_manifold_reconstruct_ffi<'py>(
+    py: Python<'py>,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
+    coords: Vec<PyReadonlyArray2<'py, f64>>,
+    assignments: PyReadonlyArray2<'py, f64>,
+    p_out: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let basis_kinds = atom_basis
+        .iter()
+        .map(|name| sae_atom_basis_kind_from_str(name))
+        .collect::<Vec<_>>();
+    let decoder_values = decoder_blocks
+        .iter()
+        .map(|block| block.as_array().to_owned())
+        .collect::<Vec<_>>();
+    let coord_values = coords
+        .iter()
+        .map(|coord| coord.as_array().to_owned())
+        .collect::<Vec<_>>();
+    let assignment_values = assignments.as_array().to_owned();
+    let out = detach_py_result(py, "sae_manifold_reconstruct", move || {
+        let decoder_views = decoder_values
+            .iter()
+            .map(|block| block.view())
+            .collect::<Vec<_>>();
+        let coord_views = coord_values
+            .iter()
+            .map(|coord| coord.view())
+            .collect::<Vec<_>>();
+        gam::terms::sae::manifold::reconstruct_persisted_atom_set(
+            &basis_kinds,
+            &atom_dim,
+            &decoder_views,
+            &coord_views,
+            assignment_values.view(),
+            p_out,
         )
     })?;
     Ok(out.into_pyarray(py).unbind())
