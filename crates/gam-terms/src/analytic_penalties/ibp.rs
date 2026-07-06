@@ -234,14 +234,15 @@ impl IBPAssignmentPenalty {
         majorize: bool,
     ) -> IbpHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta(a_k, 1) shapes whose prior mean is the forward gate's
+        // ordered stick-breaking μ_k — the single-model reconciliation.
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -255,6 +256,8 @@ impl IBPAssignmentPenalty {
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut score_second_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -411,12 +414,14 @@ impl IBPAssignmentPenalty {
             return out;
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta shapes a_k and their ρ-derivatives da_k/dρ (single-model
+        // reconciliation: prior mean a_k/(a_k+1) = μ_k = the forward gate's π_k).
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -426,13 +431,16 @@ impl IBPAssignmentPenalty {
         }
         let n_f = n as f64;
         // mixed[i·K+k] = ∂(grad_rho)/∂ℓ_ik = ∂²F/∂ρ∂ℓ_ik. With grad_rho's per-column
-        // summand G_k = pi_score_k·(a(N+1−M_k)/D²) + a·(−1/a − ln π_k) and ℓ_ik's only
-        // reach through M_k (∂M_k/∂ℓ_ik = J_ik), this is (∂G_k/∂M_k)·J_ik:
-        //   ∂G_k/∂M_k = (a/D²)·[ PSD_k·(N+1−M_k) − pi_score_k ] − a·pi_jac/π_k,
-        // where PSD_k = ∂pi_score_k/∂M_k. Must track grad_rho: the earlier
-        // `−w·a·pi_jac·J/π` matched only the old (stationary-mode) grad_rho.
+        // summand G_k = pi_score_k·(a_k'(N+1−M_k)/D_k²) + a_k'·(−1/a_k − ln π_k),
+        // where a_k' = ∂a_k/∂ρ, and ℓ_ik's only reach through M_k (∂M_k/∂ℓ_ik =
+        // J_ik), this is (∂G_k/∂M_k)·J_ik:
+        //   ∂G_k/∂M_k = (a_k'/D_k²)·[ PSD_k·(N+1−M_k) − pi_score_k ] − a_k'·pi_jac/π_k,
+        // where PSD_k = ∂pi_score_k/∂M_k (D_k, a_k both ρ-quantities, constant in M).
         let mut d_g_dm = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
@@ -444,7 +452,7 @@ impl IBPAssignmentPenalty {
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            d_g_dm[k] = (a / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - a * pj / pk;
+            d_g_dm[k] = (da / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - da * pj / pk;
         }
         for row in 0..n {
             let start = row * self.k_max;
@@ -485,12 +493,18 @@ impl IBPAssignmentPenalty {
             return (d_score, d_score_derivative);
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta shapes a_k and da_k/dρ. With a_k=μ_k/(1−μ_k),
+        // μ_k=(α/(α+1))^(k+1), D_k=N+a_k+1 so dD_k/dρ=da_k/dρ, and
+        //   π' = (da_k/dρ)·(N+1−M)/D_k²   (=∂π/∂ρ),
+        //   pj' = −(da_k/dρ)/D_k²         (=∂(1/D_k)/∂ρ).
+        // The leading da/dρ factor is the per-column da_col[k]; explicit value-a
+        // is a_col[k]. (Previously a_k=α/K gave da/dρ=a.)
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let n_f = n as f64;
-        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -499,6 +513,9 @@ impl IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw <= IBP_INTERIOR_TOL || raw >= 1.0 - IBP_INTERIOR_TOL {
@@ -507,13 +524,13 @@ impl IBPAssignmentPenalty {
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let one_minus = 1.0 - pk;
             let pj = 1.0 / denom;
-            let pi_p = a * (n_f + 1.0 - mass) / (denom * denom); // ∂π/∂ρ
-            let pj_p = -a / (denom * denom); // ∂(1/D)/∂ρ
+            let pi_p = da * (n_f + 1.0 - mass) / (denom * denom); // ∂π/∂ρ
+            let pj_p = -da / (denom * denom); // ∂(1/D)/∂ρ
             // direct_z_score = ln((1−π)/π); pi_score = ∂F/∂π (BCE + Beta).
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let pi_score_p = pi_p / (pk * pk) * (mass + a - 1.0)
                 + (n_f - mass) * pi_p / (one_minus * one_minus)
-                - a / pk;
+                - da / pk;
             // score = direct_z_score + pi_score·pi_jac.
             d_score[k] = (-1.0 / pk - 1.0 / one_minus) * pi_p + pi_score_p * pj + pi_score * pj_p;
             // score_derivative = pi_jac·(D1 + PSD), D1 = −1/π − 1/(1−π).
@@ -521,7 +538,7 @@ impl IBPAssignmentPenalty {
             let d1_p = pi_p / (pk * pk) - pi_p / (one_minus * one_minus);
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            let psd_p = pi_p / (pk * pk) + a * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
+            let psd_p = pi_p / (pk * pk) + da * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
                 - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
                 - pi_p / (one_minus * one_minus)
                 + (n_f - mass) * pj_p / (one_minus * one_minus)
@@ -618,9 +635,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        // Per-column Beta(a_k, 1) shapes; prior mean a_k/(a_k+1) = μ_k = the
+        // forward gate's ordered stick-breaking π_k (one model).
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let mut acc = 0.0;
         for row in 0..n {
@@ -636,14 +655,14 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
-            // Normalized Beta(a,1) density is a*pi^(a-1), so its negative
-            // log contribution is -ln(a) - (a - 1) ln(pi). The normalizer is
-            // constant only for fixed alpha; keep it in both modes so the energy
-            // has one mathematical definition across configurations.
+            // Normalized Beta(a_k, 1) density is a_k*pi^(a_k-1), so its negative
+            // log contribution is -ln(a_k) - (a_k - 1) ln(pi). Kept in both modes
+            // so the energy has one mathematical definition across configurations.
             // #Bug4: skip the per-column normalizer of fixed/inert columns too.
             if self.column_is_fixed(k) {
                 continue;
             }
+            let a = a_col[k];
             acc -= a.ln();
             acc -= (a - 1.0) * pi[k].ln();
         }
@@ -652,12 +671,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut out = Array1::<f64>::zeros(target.len());
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
@@ -669,6 +687,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut pi_score = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -699,14 +719,13 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (tau * tau);
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -718,6 +737,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut pi_score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -763,14 +784,13 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             "IBPAssignmentPenalty::hvp dimension mismatch"
         );
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let inv_tau = 1.0 / tau;
         let inv_tau2 = inv_tau * inv_tau;
-        let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
 
         // Column aggregates (active_mass, pi_jac, pi_score, pi_score_derivative,
         // score, score_derivative). These are identical to hessian_diag and
@@ -786,6 +806,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut score = Array1::<f64>::zeros(self.k_max);
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            let a = a_col[k];
+            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -854,12 +876,12 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             return Array1::<f64>::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
-        let a = alpha / self.k_max as f64;
+        let (a_col, mu) = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
-        let pi = self.pi_map(z.view(), alpha);
+        let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let n_f = n as f64;
-        let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
         let mut active_mass = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
@@ -867,32 +889,33 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 active_mass[k] += z[start + k];
             }
         }
-        // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ so dα/dρ=α and da/dρ=a. The plug-in
-        // π_k=(M_k+a)/(N+a+1) is the posterior MEAN, so it is NOT stationary for
-        // the energy (the mode (M_k+a−1)/(N+a−1) is); the implicit-π channel does
-        // not vanish and must be carried alongside the explicit Beta(a,1) channel:
-        //   ∂F/∂ρ = Σ_k [ (∂F/∂π_k)·(∂π_k/∂ρ)  +  (∂F/∂a)·(da/dρ) ],
-        //   ∂F/∂π_k = pi_score_k,  ∂π_k/∂ρ = a·(N+1−M_k)/D² (0 at the clamp),
-        //   ∂F/∂a  = −1/a − ln π_k,  da/dρ = a.
-        // The previous closed form kept only the explicit channel (valid solely at
-        // the stationary mode), disagreeing with the FD of `value`.
+        // Per-column a_k = mu_k/(1-mu_k), mu_k=(alpha/(alpha+1))^(k+1), so da_k/drho
+        // = da_col[k] (NOT the scalar a of the old exchangeable Beta(alpha/K,1)
+        // model). pi_hat_k=(M_k+a_k)/(N+a_k+1) is the posterior MEAN (not
+        // stationary), so the implicit-pi channel is carried with the explicit
+        // Beta(a_k,1) channel:
+        //   dF/drho = sum_k [ pi_score_k*(dpi_k/da_k)*(da_k/drho) + (dF/da_k)*(da_k/drho) ],
+        //   dpi_k/da_k = (N+1-M_k)/D^2 (0 at clamp),  dF/da_k = -1/a_k - ln pi_k.
         let mut acc = 0.0;
         for k in 0..self.k_max {
-            // #Bug4: a fixed/inert column contributes nothing to ∂F/∂ρ (its logits
+            // #Bug4: a fixed/inert column contributes nothing to dF/drho (its logits
             // are held constant), matching its exclusion from `value`.
             if self.column_is_fixed(k) {
                 continue;
             }
+            let a = a_col[k];
+            let da = da_col[k];
+            let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let dpi_drho = if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
-                a * (n_f + 1.0 - mass) / (denom * denom)
+                da * (n_f + 1.0 - mass) / (denom * denom)
             } else {
                 0.0
             };
             let pi_score = -mass / pk + (n_f - mass) / (1.0 - pk) - (a - 1.0) / pk;
-            acc += pi_score * dpi_drho + (-1.0 / a - pk.ln()) * a;
+            acc += pi_score * dpi_drho + (-1.0 / a - pk.ln()) * da;
         }
         Array1::from_vec(vec![self.weight * acc])
     }
