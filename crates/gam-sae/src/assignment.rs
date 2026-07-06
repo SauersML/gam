@@ -1727,10 +1727,13 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
+    let mut routed_logits = Array2::<f64>::zeros((assignment.n_obs(), assignment.k_atoms()));
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)?;
+        let logits = assignment.routing_logits_row(row);
+        validate_finite_logits(logits, row)?;
+        routed_logits.row_mut(row).assign(&logits);
     }
-    let target = flat_logits(assignment.logits.view());
+    let target = flat_logits(routed_logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
         return Ok(Array1::<f64>::zeros(target.len()));
     }
@@ -1796,10 +1799,13 @@ pub(crate) fn assignment_prior_log_strength_target_mixed(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
+    let mut routed_logits = Array2::<f64>::zeros((assignment.n_obs(), assignment.k_atoms()));
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)?;
+        let logits = assignment.routing_logits_row(row);
+        validate_finite_logits(logits, row)?;
+        routed_logits.row_mut(row).assign(&logits);
     }
-    let target = flat_logits(assignment.logits.view());
+    let target = flat_logits(routed_logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
         return Ok(Array1::<f64>::zeros(target.len()));
     }
@@ -1821,10 +1827,13 @@ pub(crate) fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let mut routed_logits = Array2::<f64>::zeros((assignment.n_obs(), assignment.k_atoms()));
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)?;
+        let logits = assignment.routing_logits_row(row);
+        validate_finite_logits(logits, row)?;
+        routed_logits.row_mut(row).assign(&logits);
     }
-    let target = flat_logits(assignment.logits.view());
+    let target = flat_logits(routed_logits.view());
     let mut grad = Array1::<f64>::zeros(target.len());
     let mut diag = Array1::<f64>::zeros(target.len());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
@@ -1950,10 +1959,13 @@ pub(crate) fn ibp_assignment_third_channels(
     else {
         return Ok(None);
     };
+    let mut routed_logits = Array2::<f64>::zeros((assignment.n_obs(), assignment.k_atoms()));
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)?;
+        let logits = assignment.routing_logits_row(row);
+        validate_finite_logits(logits, row)?;
+        routed_logits.row_mut(row).assign(&logits);
     }
-    let target = flat_logits(assignment.logits.view());
+    let target = flat_logits(routed_logits.view());
     let mut penalty =
         IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
     // Mirror assignment_prior_grad_hdiag exactly: when alpha is learnable the
@@ -1982,12 +1994,17 @@ pub(crate) fn ibp_assignment_third_channels(
                 channels.logit_curvature[idx] = 0.0;
             }
         }
-        for atom in 0..k {
-            if assignment.logit_is_fixed(atom) {
-                channels.cross_row_d[atom] = 0.0;
-                channels.cross_row_dd[atom] = 0.0;
-            }
-        }
+        // Do NOT zero `cross_row_d`: it is the value coefficient
+        // `d_k = w·s'_k` of the shared empirical-mass rank-one block, not a local
+        // logit derivative.  Fixed logit slots are made inert by the zeroed
+        // `z_jac` entries above; destroying `d_k` as well silently removes the
+        // Woodbury source from consumers that need the value operator.
+        //
+        // `cross_row_dd` is a derivative of `d_k` with respect to the empirical
+        // mass and is only used after multiplication by a logit Jacobian on the
+        // θ-adjoint path, so leaving it at its analytic value is harmless for
+        // fixed slots and keeps this channel the exact derivative of
+        // `cross_row_d` for any live slots in the same column.
     }
     Ok(Some(channels))
 }
