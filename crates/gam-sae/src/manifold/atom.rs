@@ -533,11 +533,14 @@ pub struct SaeManifoldAtom {
     /// Roughness operator order `r` of [`Self::smooth_penalty_raw`], recovered
     /// once at construction as its null-space dimension (an order-`r`
     /// difference / Duchon penalty annihilates the degree-`<r` polynomials, so
-    /// `nullity(S) = r`). Sets the arc-length reweighting exponent
-    /// `β = ½ − r` (`β = −3/2` for the standard second-derivative penalty):
-    /// the metric-speed power that converts raw-`t` roughness into intrinsic
-    /// arc-length roughness. `0` when the raw Gram is empty/zero (no
-    /// reweighting).
+    /// `nullity(S) = r`). `0` when the raw Gram is empty/zero.
+    ///
+    /// Provenance only: the effective [`Self::smooth_penalty`] is now the
+    /// intrinsic bending / conformal-Dirichlet Gram (whose rank and log-det every
+    /// REML consumer reads off the matrix directly), so this field no longer
+    /// drives any reweighting — the historical scalar-speed `β = ½ − r`
+    /// arc-length exponent was replaced by the reparameterisation-invariant
+    /// `∫κ²ds` bending Gram for `d = 1`.
     pub smooth_penalty_order: usize,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
@@ -551,18 +554,19 @@ pub struct SaeManifoldAtom {
     pub basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
     /// Cached VALUES of the analytic second jet
     /// `H[n, m, a, c] = ∂²Φ_m(t_n) / (∂t_a ∂t_c)`, shape `(N, M, d, d)`, at the
-    /// atom's CURRENT latent coordinates. The `d ≥ 2` intrinsic bending Gram
-    /// ([`Self::refresh_intrinsic_smooth_penalty`]) needs `∂²Φ` — which, unlike
-    /// the `d = 1` scalar-speed reweighting, is NOT recoverable from `Φ` and
-    /// `∂Φ` alone — but `refresh_intrinsic_smooth_penalty` takes no coordinates,
-    /// so the values are cached here alongside `basis_values` / `basis_jacobian`
-    /// and refreshed on the same coordinate change. Populated by
+    /// atom's CURRENT latent coordinates. The intrinsic bending Gram
+    /// ([`Self::refresh_intrinsic_smooth_penalty`], every latent dim `d ≥ 1`)
+    /// needs `∂²Φ` — which is NOT recoverable from `Φ` and `∂Φ` alone — but
+    /// `refresh_intrinsic_smooth_penalty` takes no coordinates, so the values are
+    /// cached here alongside `basis_values` / `basis_jacobian` and refreshed on
+    /// the same coordinate change. Populated by
     /// [`Self::refresh_basis`] (from [`Self::basis_second_jet`]), transported by
     /// [`Self::reduce_basis_to_subspace`] (the `M`-axis `Q` congruence), or
     /// installed directly via [`Self::install_bending_second_jet`]. `None` ⇒ no
     /// second jet available (a caller-managed or first-jet-only atom); the
-    /// `d ≥ 2` bending path then falls back to the raw Gram, so no atom
-    /// regresses relative to the historical flat-`d>1` fallback.
+    /// bending path then falls back to the raw Gram, so no atom regresses
+    /// relative to the historical flat fallback. (Poincaré atoms use the
+    /// first-jet conformal-Dirichlet Gram instead and do not consult this cache.)
     ///
     /// Frozen at the current iterate (`∂²Φ` depends only on the coordinates, not
     /// the decoder), so it obeys the same lagged-diffusivity contract as the
@@ -1591,207 +1595,80 @@ impl SaeManifoldAtom {
             self.smooth_penalty.assign(&self.smooth_penalty_raw);
             return;
         }
-        // `d ≥ 2`: the gauge-invariant target is the total squared second
-        // fundamental form, not the raw coefficient-`t` Gram. Delegate to the
-        // bending builder; fall back to the raw Gram only when the second jet is
-        // unavailable or the geometry is degenerate (no regression vs the old
-        // flat-`d>1` fallback).
-        if self.latent_dim >= 2 {
-            match self.try_intrinsic_bending_gram() {
+        // Poincaré: the documented penalty is the hyperbolic conformal Dirichlet
+        // roughness (the ball metric pulled back to the tangent chart), a
+        // function of the latent `t`. Delegate to the single-source geometry
+        // primitive; fall back to the raw Gram only when the coordinates are
+        // unavailable (a caller-managed / never-refreshed atom) or the assembly
+        // is degenerate.
+        if matches!(self.basis_kind, SaeAtomBasisKind::Poincare) {
+            match self.try_poincare_conformal_gram() {
                 Some(gram) => self.smooth_penalty.assign(&gram),
                 None => self.smooth_penalty.assign(&self.smooth_penalty_raw),
             }
             return;
         }
-        // `d = 1` scalar-speed arc-length reweighting (unchanged). No reweighting
-        // when there is no penalty operator order to invert into arc length.
-        if self.smooth_penalty_order == 0 {
-            self.smooth_penalty.assign(&self.smooth_penalty_raw);
-            return;
-        }
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let beta = 0.5 - self.smooth_penalty_order as f64;
-
-        // Per-sample squared speed m_n = ‖J(t_n)‖², J(t_n) = Φ'(t_n) B (axis 0,
-        // the single latent axis), and the basis-activation accumulators
-        // act_μ = Σ_n Φ_μ(t_n)² and num_μ = Σ_n Φ_μ(t_n)² m_n.
-        let mut act = vec![0.0_f64; m];
-        let mut num = vec![0.0_f64; m];
-        let mut deriv = vec![0.0_f64; p];
-        // Poincaré tangent patch (`d = 1`): the latent coordinate `t` is a
-        // tangent vector at the ball origin, and it runs at a *constant* multiple
-        // of hyperbolic arc length. The ball point is `p = exp₀(t)` with
-        // `‖p‖ = tanh|t|` (curvature `c = −1`), so `dp/dt = sech²(t)` and the
-        // arc-length rate is `λ(p)·|dp/dt| = 2cosh²(t)·sech²(t) = 2`, independent
-        // of `t` (the geodesic distance from the origin is `2|t|`). The decoded
-        // speed per unit arc length is therefore `‖J‖ / 2` and the intrinsic
-        // squared speed is `‖J‖² / 4` — a *constant* multiple of the flat-`t`
-        // squared speed. The *key* property — a metric weight that is CONSTANT in
-        // `t`, not `t`-dependent — is the same one the authoritative pullback
-        // `gam_geometry::manifolds::poincare::conformal_dirichlet_penalty` states
-        // for `d = 1` (its constant `G ≡ 1/2`): the chart is intrinsically flat in
-        // 1-D. (The two numeric constants differ — `1/4 = (dt/ds)²` here is the
-        // scalar reparam factor for squared speed, whereas `G = √det h · h⁻¹` is
-        // that module's matrix Dirichlet weight — but both are constant in `t`,
-        // which is all that matters below.)
-        //
-        // The earlier code divided by `λ(p)² = 4cosh⁴(t)`, conflating the *ball*
-        // conformal factor with the *tangent* arc-length rate. That is
-        // `t`-dependent and under-penalised near-boundary roughness by `~cosh⁴(t)`
-        // (~200× at `|t| = 2`, ~10⁴× at `|t| = 3`), manufacturing fake curvature
-        // in a chart that is flat for `d = 1` and corrupting the topology /
-        // evidence / smoothness selection for hyperbolic atoms.
-        //
-        // The geometric-mean centering below divides `speeds` by their center, so
-        // the constant `1/4` cancels exactly and does not move the numbers; it is
-        // applied so `speeds` carries genuine intrinsic squared speed and the
-        // `d = 1` Poincaré reweighting is provably the flat arc-length reweighting
-        // (no spurious `t`-dependence). A `latent_dim > 1` Poincaré atom needs the
-        // non-constant matrix pullback and never reaches this scalar path — the
-        // `latent_dim != 1` early return above leaves it at the raw Gram.
-        //
-        // Convention note (why `1/4` here, not `1/2`): the authoritative
-        // `poincare.rs::conformal_dirichlet_penalty` reports `G ≡ 1/2` for `d = 1`
-        // in the *energy-density* convention `∫ G ‖dg/dt‖² dt`, whose `G` absorbs
-        // the arc-length measure `ds = 2 dt`. This path instead reweights the
-        // *pointwise* squared speed, whose intrinsic factor is `(dt/ds)² = 1/4`.
-        // Both are correct in their own convention, and — crucially — both are
-        // numerically inert below because the geometric-mean centering cancels any
-        // constant. The load-bearing fix is not the value of this constant but
-        // that the reweighting is now CONSTANT in `t` (vs the old per-sample
-        // `λ⁻²`).
-        //
-        // TRAILHEAD (Poincaré true hyperbolic Gram, secondary of the Superposed-
-        // Geometry batch): this `d = 1` path reweights the EUCLIDEAN monomial
-        // second-derivative raw Gram by a constant, which is correct for the
-        // intrinsically-flat `d = 1` tangent chart but is NOT the documented
-        // hyperbolic pullback roughness. The authoritative Gram is
-        // `gam_geometry::manifolds::poincare::conformal_dirichlet_penalty(coords,
-        // basis_jacobian, curvature = -1.0)` — an ORDER-1 (Dirichlet) energy
-        // `S = Σ_n Φ'ᵀ G(t_n) Φ'`, `G = √det h · h⁻¹` (`G ≡ 1/2` for `d = 1`,
-        // the anisotropic `Dexp₀ᵀλ²Dexp₀` matrix for `d ≥ 2`). Wiring it here is
-        // deferred, not trivial, for two coupled reasons:
-        //   1. It needs the latent `coords`, which `refresh_intrinsic_smooth_
-        //      penalty` does not receive. Route them the SAME way the `d ≥ 2`
-        //      bending path does — cache them alongside `basis_second_jet_values`
-        //      in `refresh_basis` (add a `poincare_coords: Option<Array2<f64>>`
-        //      field), so the frozen-metric contract is preserved.
-        //   2. It is a DIFFERENT operator order (Dirichlet, `r = 1`) than the
-        //      atom's second-derivative raw Gram (`r = 2`), so adopting it must
-        //      also update `smooth_penalty_order` and re-derive the REML
-        //      rank/log-det Occam accounting — otherwise the evidence term is
-        //      inconsistent. Prefer installing it as a NEW `smooth_penalty_raw`
-        //      at construction (so `smooth_penalty_nullity` recovers `r = 1`
-        //      once) rather than reweighting inside this refresh.
-        // Until then the constant reweighting below is the honest `d = 1`
-        // limit (flat chart ⇒ constant `G`), and `d ≥ 2` Poincaré atoms are
-        // handled by the bending Gram above (which reads the true metric `g`
-        // from the decoder pullback, not from `conformal_dirichlet_penalty`).
-        const POINCARE_D1_ARCLEN_RATE_SQ: f64 = 4.0;
-        let hyperbolic = matches!(self.basis_kind, SaeAtomBasisKind::Poincare);
-        for row in 0..n {
-            self.fill_decoded_derivative_row(row, 0, &mut deriv);
-            let mut speed_sq = 0.0_f64;
-            for &d in deriv.iter() {
-                speed_sq += d * d;
-            }
-            if hyperbolic {
-                // Only reached for `d = 1` (the `latent_dim != 1` early return
-                // above skips this whole routine for `d > 1`, leaving `S̃ = S_raw`
-                // — the safe constant-speed limit, pending a proper non-constant
-                // `Dexp₀ᵀ λ² Dexp₀` matrix pullback for `d > 1`). Constant `1/4`
-                // from the `d = 1` arc-length rate `2` (see above): intrinsic
-                // squared speed = `‖J‖² / rate²`.
-                speed_sq /= POINCARE_D1_ARCLEN_RATE_SQ;
-            }
-            // Row `row` of the (N×M) basis design is contiguous; read it once as
-            // a 1-D view so the per-coefficient accumulation below has no 2-D
-            // index recompute (n-hot: one pass per sample × per atom).
-            let phi_row = self.basis_values.row(row);
-            for (col, &phi) in phi_row.iter().enumerate() {
-                let w = phi * phi;
-                if w == 0.0 {
-                    continue;
-                }
-                act[col] += w;
-                num[col] += w * speed_sq;
-            }
-        }
-
-        // Representative squared speed per coefficient, and the geometric-mean
-        // center of the finite positive speeds. Only finite positive speeds
-        // enter the center so a degenerate (inf/NaN) sample cannot corrupt it.
-        let mut speeds = vec![0.0_f64; m];
-        let mut log_acc = 0.0_f64;
-        let mut log_cnt = 0usize;
-        for col in 0..m {
-            let s = if act[col] > 0.0 {
-                num[col] / act[col]
-            } else {
-                0.0
-            };
-            speeds[col] = s;
-            if s > 0.0 && s.is_finite() {
-                log_acc += s.ln();
-                log_cnt += 1;
-            }
-        }
-        let center = if log_cnt > 0 {
-            (log_acc / log_cnt as f64).exp()
-        } else {
-            0.0
-        };
-        // Degenerate curve (no finite positive speed anywhere, or a non-finite
-        // center): the pullback metric carries no usable scale, so leave the
-        // penalty at its raw Gram — exactly `S̃ = S_raw`, matching the
-        // constant-speed limit with no spurious magnitude inflation.
-        if !(center > 0.0 && center.is_finite()) {
-            self.smooth_penalty.assign(&self.smooth_penalty_raw);
-            return;
-        }
-
-        // Reweight relative to the center so the congruence is a *scale-free*
-        // shape reweighting: the geometric mean of `w_μ` is 1, so a
-        // constant-speed atom (every `s_μ = center`) gives `w_μ ≡ 1` and hence
-        // `S̃ = S_raw` exactly — periodic atoms are untouched and no overall
-        // magnitude (which `λ` already owns) leaks in. The relative floor keeps
-        // a vanishing-speed coefficient at a small fraction of the typical
-        // speed rather than a singular negative power, and clamps any non-finite
-        // ratio back to a finite weight.
-        const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
-        const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
-        let mut root_w = vec![0.0_f64; m];
-        for col in 0..m {
-            // Normalised squared speed (ratio to the geometric-mean center),
-            // clamped to `[1e-6, 1e6]` so a vanishing-/diverging-speed
-            // coefficient is treated as a bounded fraction/multiple of the
-            // typical speed rather than a singular negative power, and any
-            // non-finite ratio (e.g. an overflowed speed) maps to the ceiling.
-            // The symmetric clamp keeps every weight finite and centered near 1
-            // so the REML numerical-rank eigencutoff cannot drift.
-            let ratio = speeds[col] / center;
-            let ratio = if ratio.is_finite() {
-                ratio.clamp(RELATIVE_SPEED_FLOOR, RELATIVE_SPEED_CEIL)
-            } else {
-                RELATIVE_SPEED_CEIL
-            };
-            // w_μ = ratio^β; the congruence uses W^{½}, so store ratio^{β/2}.
-            root_w[col] = ratio.powf(0.5 * beta);
-        }
-
-        // S̃ = W^{½} S_raw W^{½}: scale row i and column j by root_w.
-        for i in 0..m {
-            let ri = root_w[i];
-            for j in 0..m {
-                self.smooth_penalty[[i, j]] = ri * self.smooth_penalty_raw[[i, j]] * root_w[j];
-            }
+        // Every other manifold: the gauge-invariant target is the total squared
+        // second fundamental form of the decoded function, for EVERY latent dim
+        // `d ≥ 1`. For `d = 1` this is the ∫κ²ds bending of the decoded curve —
+        // the NORMAL-projected acceleration, invariant to reparameterising `t`
+        // (a straight segment scores zero in any chart); for `d ≥ 2` it is the
+        // volume-weighted `‖II‖²_g`. Delegate to the bending builder; fall back
+        // to the raw Gram only when the second jet is unavailable or the geometry
+        // is degenerate (no regression vs the old flat fallback).
+        match self.try_intrinsic_bending_gram() {
+            Some(gram) => self.smooth_penalty.assign(&gram),
+            None => self.smooth_penalty.assign(&self.smooth_penalty_raw),
         }
     }
 
-    /// Build the `d ≥ 2` gauge-invariant intrinsic bending Gram `S̃` (`M × M`),
-    /// whose decoder trace is exactly the total squared second fundamental form
+    /// Hyperbolic conformal Dirichlet roughness Gram for a Poincaré atom
+    /// (`curvature = −1`): `S = Σ_n Φ'(t_n)ᵀ G(t_n) Φ'(t_n)`,
+    /// `G = √det h · h⁻¹`, `h` the exp-map pullback of the ball metric — see
+    /// [`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`], the
+    /// single source of truth for the hyperbolic metric. The Poincaré atom is
+    /// defined at unit curvature (the tangent-wrapped exp-map chart), so the
+    /// metric is fixed, never a free knob.
+    ///
+    /// Returns `None` (raw-Gram fallback) when the latent coordinates are not
+    /// cached (a caller-managed / never-refreshed atom), their shape disagrees
+    /// with the basis Jacobian, or the geometry primitive rejects the input; a
+    /// non-finite Gram is likewise rejected.
+    fn try_poincare_conformal_gram(&self) -> Option<Array2<f64>> {
+        let coords = self.latent_coords.as_ref()?;
+        let (n, d) = coords.dim();
+        let m = self.basis_size();
+        if d != self.latent_dim || d == 0 || n == 0 || m == 0 {
+            return None;
+        }
+        if self.basis_jacobian.dim() != (n, m, d) {
+            return None;
+        }
+        let gram = gam_geometry::manifolds::poincare::conformal_dirichlet_penalty(
+            coords.view(),
+            self.basis_jacobian.view(),
+            -1.0,
+        )
+        .ok()?;
+        if gram.dim() == (m, m) && gram.iter().all(|v| v.is_finite()) {
+            Some(gram)
+        } else {
+            None
+        }
+    }
+
+    /// Build the gauge-invariant intrinsic bending Gram `S̃` (`M × M`) for any
+    /// latent dim `d ≥ 1`, whose decoder trace is exactly the total squared
+    /// second fundamental form
     ///   `tr(Bᵀ S̃ B) = Σ_i ω_i ‖II(t_i)‖²_g`.
+    ///
+    /// For `d = 1` the second fundamental form is the normal-projected curve
+    /// acceleration and, under the default volume measure `ω = √det g = ‖γ'‖`,
+    /// the trace is the reparameterisation-invariant `∫ κ² ds =
+    /// Σ_i ‖P_N γ''(t_i)‖² / ‖γ'(t_i)‖³` (the tangential acceleration a chart
+    /// reparameterisation manufactures is removed by the Christoffel/normal
+    /// projection below, so a straight segment scores exactly zero in any chart).
+    /// For `d ≥ 2` it is the Riemannian-area/volume-weighted `‖II‖²_g`.
     ///
     /// # Geometry (Gauss formula — no Christoffel-from-metric-derivatives)
     ///
@@ -1861,7 +1738,7 @@ impl SaeManifoldAtom {
         let m = self.basis_size();
         let n = self.n_obs();
         let p = self.output_dim();
-        if d < 2 || m == 0 || n == 0 || p == 0 {
+        if d < 1 || m == 0 || n == 0 || p == 0 {
             return None;
         }
         let hess = self.basis_second_jet_values.as_ref()?;
