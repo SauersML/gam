@@ -7922,6 +7922,19 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    pub(crate) fn softmax_data_weight_product_logit_factor(
+        assignments: &[f64],
+        atom_a: usize,
+        atom_b: usize,
+        atom_w: usize,
+        inv_tau: f64,
+    ) -> f64 {
+        let a_w = assignments[atom_w];
+        let left = if atom_w == atom_a { 1.0 } else { 0.0 } - a_w;
+        let right = if atom_w == atom_b { 1.0 } else { 0.0 } - a_w;
+        (left + right) * inv_tau
+    }
+
     pub(crate) fn logdet_theta_adjoint(
         &self,
         rho: &SaeManifoldRho,
@@ -8191,8 +8204,23 @@ impl SaeManifoldTerm {
                 let mut deflated_base_dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
-                        let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
-                            + sae_dot(&jets.first[a], &jets.second[b][w]);
+                        let mut dh = match (softmax_d_dw, jets.vars[a], jets.vars[b]) {
+                            (
+                                Some((a_soft, _m, _scale, inv_tau, atom_w)),
+                                SaeLocalRowVar::Coord { atom: atom_a, .. },
+                                SaeLocalRowVar::Coord { atom: atom_b, .. },
+                            ) => {
+                                let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                                h_ab
+                                    * Self::softmax_data_weight_product_logit_factor(
+                                        a_soft, atom_a, atom_b, atom_w, inv_tau,
+                                    )
+                            }
+                            _ => {
+                                sae_dot(&jets.second[a][w], &jets.first[b])
+                                    + sae_dot(&jets.first[a], &jets.second[b][w])
+                            }
+                        };
                         // `∂D/∂z_w` is diagonal, so it contributes only when the two
                         // logit slots are the SAME atom (`atom_a == atom_b`).
                         if let (

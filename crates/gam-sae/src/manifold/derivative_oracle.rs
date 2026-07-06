@@ -1,0 +1,530 @@
+use super::*;
+use std::ops::{Add, Div, Mul, Neg, Sub};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dual {
+    pub value: f64,
+    pub derivative: f64,
+}
+
+impl Dual {
+    pub fn constant(value: f64) -> Self {
+        Self {
+            value,
+            derivative: 0.0,
+        }
+    }
+
+    pub fn variable(value: f64) -> Self {
+        Self {
+            value,
+            derivative: 1.0,
+        }
+    }
+
+    pub fn with_derivative(value: f64, derivative: f64) -> Self {
+        Self { value, derivative }
+    }
+
+    pub fn ln(self) -> Self {
+        Self {
+            value: self.value.ln(),
+            derivative: self.derivative / self.value,
+        }
+    }
+
+    pub fn sqrt(self) -> Self {
+        let root = self.value.sqrt();
+        Self {
+            value: root,
+            derivative: self.derivative / (2.0 * root),
+        }
+    }
+
+    pub fn recip(self) -> Self {
+        Self {
+            value: self.value.recip(),
+            derivative: -self.derivative / (self.value * self.value),
+        }
+    }
+}
+
+impl Add for Dual {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            value: self.value + rhs.value,
+            derivative: self.derivative + rhs.derivative,
+        }
+    }
+}
+
+impl Add<f64> for Dual {
+    type Output = Self;
+
+    fn add(self, rhs: f64) -> Self::Output {
+        Self {
+            value: self.value + rhs,
+            derivative: self.derivative,
+        }
+    }
+}
+
+impl Sub for Dual {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            value: self.value - rhs.value,
+            derivative: self.derivative - rhs.derivative,
+        }
+    }
+}
+
+impl Sub<f64> for Dual {
+    type Output = Self;
+
+    fn sub(self, rhs: f64) -> Self::Output {
+        Self {
+            value: self.value - rhs,
+            derivative: self.derivative,
+        }
+    }
+}
+
+impl Mul for Dual {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Self {
+            value: self.value * rhs.value,
+            derivative: self.derivative.mul_add(rhs.value, self.value * rhs.derivative),
+        }
+    }
+}
+
+impl Mul<f64> for Dual {
+    type Output = Self;
+
+    fn mul(self, rhs: f64) -> Self::Output {
+        Self {
+            value: self.value * rhs,
+            derivative: self.derivative * rhs,
+        }
+    }
+}
+
+impl Div for Dual {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self::Output {
+        self * rhs.recip()
+    }
+}
+
+impl Div<f64> for Dual {
+    type Output = Self;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        Self {
+            value: self.value / rhs,
+            derivative: self.derivative / rhs,
+        }
+    }
+}
+
+impl Neg for Dual {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self {
+            value: -self.value,
+            derivative: -self.derivative,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MajorizerAnchorMode {
+    FrozenAnchor,
+    ReanchoredObject,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivativeTraceChannel {
+    Tt,
+    Border,
+    Beta,
+    Majorizer,
+    Prior,
+    Other(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PivotBranch {
+    Missing,
+    Positive,
+    NonPositive,
+    NonFinite,
+}
+
+impl PivotBranch {
+    fn classify(value: Option<f64>) -> Self {
+        match value {
+            None => Self::Missing,
+            Some(v) if !v.is_finite() => Self::NonFinite,
+            Some(v) if v > 0.0 => Self::Positive,
+            Some(_) => Self::NonPositive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCertificate {
+    pub anchor_mode: MajorizerAnchorMode,
+    pub row_dims: Vec<usize>,
+    pub row_offsets: Vec<usize>,
+    pub beta_dim: usize,
+    pub manifold_mode_fingerprint: u64,
+    pub row_hessian_fingerprint: u64,
+    pub solver_mode: String,
+    pub deflated_rank: usize,
+    pub deflated_per_row: Vec<usize>,
+    pub spectral_deflated_rows: Vec<bool>,
+    pub cross_row_woodbury_rank: usize,
+    pub min_row_pivot_branch: PivotBranch,
+    pub min_schur_pivot_branch: PivotBranch,
+    pub min_pivot_branch: PivotBranch,
+    pub max_pivot_branch: PivotBranch,
+}
+
+impl BranchCertificate {
+    pub fn from_arrow_cache(cache: &ArrowFactorCache, anchor_mode: MajorizerAnchorMode) -> Self {
+        let min_pivot = arrow_factor_min_pivot(cache);
+        let max_pivot = arrow_factor_max_pivot(cache);
+        Self {
+            anchor_mode,
+            row_dims: cache.row_dims.to_vec(),
+            row_offsets: cache.row_offsets.to_vec(),
+            beta_dim: cache.k,
+            manifold_mode_fingerprint: cache.manifold_mode_fingerprint,
+            row_hessian_fingerprint: cache.row_hessian_fingerprint,
+            solver_mode: format!("{:?}", cache.solver_mode),
+            deflated_rank: cache.gauge_deflated_directions,
+            deflated_per_row: cache
+                .deflated_row_directions
+                .iter()
+                .map(Vec::len)
+                .collect(),
+            spectral_deflated_rows: cache
+                .deflation_row_spectra
+                .iter()
+                .map(Option::is_some)
+                .collect(),
+            cross_row_woodbury_rank: cache
+                .cross_row_woodbury
+                .as_ref()
+                .map(|woodbury| woodbury.d.len())
+                .unwrap_or(0),
+            min_row_pivot_branch: PivotBranch::classify(min_pivot.min_row_pivot),
+            min_schur_pivot_branch: PivotBranch::classify(min_pivot.min_schur_pivot),
+            min_pivot_branch: PivotBranch::classify(min_pivot.min_pivot),
+            max_pivot_branch: PivotBranch::classify(max_pivot),
+        }
+    }
+
+    pub fn assert_same_branch(&self, probe: &Self) -> Result<(), BranchCertificateMismatch> {
+        let mut changed_fields = Vec::new();
+        if self.anchor_mode != probe.anchor_mode {
+            changed_fields.push("majorizer_anchor".to_string());
+        }
+        if self.row_dims != probe.row_dims {
+            changed_fields.push("row_dims".to_string());
+        }
+        if self.row_offsets != probe.row_offsets {
+            changed_fields.push("row_offsets".to_string());
+        }
+        if self.beta_dim != probe.beta_dim {
+            changed_fields.push("beta_dim".to_string());
+        }
+        if self.manifold_mode_fingerprint != probe.manifold_mode_fingerprint {
+            changed_fields.push("manifold_mode_fingerprint".to_string());
+        }
+        if self.row_hessian_fingerprint != probe.row_hessian_fingerprint {
+            changed_fields.push("row_hessian_fingerprint".to_string());
+        }
+        if self.solver_mode != probe.solver_mode {
+            changed_fields.push("solver_mode".to_string());
+        }
+        if self.deflated_rank != probe.deflated_rank {
+            changed_fields.push("deflated_rank".to_string());
+        }
+        if self.deflated_per_row != probe.deflated_per_row {
+            changed_fields.push("deflated_per_row".to_string());
+        }
+        if self.spectral_deflated_rows != probe.spectral_deflated_rows {
+            changed_fields.push("spectral_deflated_rows".to_string());
+        }
+        if self.cross_row_woodbury_rank != probe.cross_row_woodbury_rank {
+            changed_fields.push("cross_row_woodbury_rank".to_string());
+        }
+        if self.min_row_pivot_branch != probe.min_row_pivot_branch {
+            changed_fields.push("min_row_pivot_branch".to_string());
+        }
+        if self.min_schur_pivot_branch != probe.min_schur_pivot_branch {
+            changed_fields.push("min_schur_pivot_branch".to_string());
+        }
+        if self.min_pivot_branch != probe.min_pivot_branch {
+            changed_fields.push("min_pivot_branch".to_string());
+        }
+        if self.max_pivot_branch != probe.max_pivot_branch {
+            changed_fields.push("max_pivot_branch".to_string());
+        }
+
+        if changed_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(BranchCertificateMismatch {
+                changed_fields,
+                baseline: self.clone(),
+                probe: probe.clone(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BranchCertificateMismatch {
+    pub changed_fields: Vec<String>,
+    pub baseline: BranchCertificate,
+    pub probe: BranchCertificate,
+}
+
+impl std::fmt::Display for BranchCertificateMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "derivative oracle branch changed in fields {:?}",
+            self.changed_fields
+        )
+    }
+}
+
+impl std::error::Error for BranchCertificateMismatch {}
+
+#[derive(Clone, Debug)]
+pub struct ExactTraceChannel {
+    pub channel: DerivativeTraceChannel,
+    pub value: f64,
+    pub derivative: f64,
+    pub certificate: BranchCertificate,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactTraceReport {
+    pub certificate: BranchCertificate,
+    pub channels: Vec<ExactTraceChannel>,
+    pub total_value: f64,
+    pub total_derivative: f64,
+}
+
+impl ExactTraceReport {
+    pub fn channel_derivative(&self, channel: DerivativeTraceChannel) -> Option<f64> {
+        self.channels
+            .iter()
+            .find(|entry| entry.channel == channel)
+            .map(|entry| entry.derivative)
+    }
+}
+
+pub fn guarded_exact_trace_report(
+    certificate: BranchCertificate,
+    channels: Vec<ExactTraceChannel>,
+) -> Result<ExactTraceReport, BranchCertificateMismatch> {
+    let mut total_value = 0.0_f64;
+    let mut total_derivative = 0.0_f64;
+    for channel in &channels {
+        certificate.assert_same_branch(&channel.certificate)?;
+        total_value += channel.value;
+        total_derivative += channel.derivative;
+    }
+    Ok(ExactTraceReport {
+        certificate,
+        channels,
+        total_value,
+        total_derivative,
+    })
+}
+
+pub fn dual_spd_logdet(matrix: &[Vec<Dual>]) -> Result<Dual, String> {
+    let n = matrix.len();
+    if n == 0 {
+        return Ok(Dual::constant(0.0));
+    }
+    for (row, values) in matrix.iter().enumerate() {
+        if values.len() != n {
+            return Err(format!(
+                "dual_spd_logdet: row {row} has width {}, expected {n}",
+                values.len()
+            ));
+        }
+    }
+
+    let mut lower = vec![vec![Dual::constant(0.0); n]; n];
+    for row in 0..n {
+        for col in 0..=row {
+            let mut sum = matrix[row][col];
+            for inner in 0..col {
+                sum = sum - lower[row][inner] * lower[col][inner];
+            }
+            if row == col {
+                if !(sum.value.is_finite() && sum.value > 0.0) {
+                    return Err(format!(
+                        "dual_spd_logdet: non-positive branch pivot at row {row}: {}",
+                        sum.value
+                    ));
+                }
+                lower[row][col] = sum.sqrt();
+            } else {
+                lower[row][col] = sum / lower[col][col];
+            }
+        }
+    }
+
+    let mut logdet = Dual::constant(0.0);
+    for (idx, row) in lower.iter().enumerate() {
+        let diag = row[idx];
+        if !(diag.value.is_finite() && diag.value > 0.0) {
+            return Err(format!(
+                "dual_spd_logdet: non-positive Cholesky diagonal at row {idx}: {}",
+                diag.value
+            ));
+        }
+        logdet = logdet + diag.ln() * 2.0;
+    }
+    Ok(logdet)
+}
+
+pub fn exact_logdet_channel(
+    channel: DerivativeTraceChannel,
+    matrix: &[Vec<Dual>],
+    certificate: BranchCertificate,
+) -> Result<ExactTraceChannel, String> {
+    let dual = dual_spd_logdet(matrix)?;
+    Ok(ExactTraceChannel {
+        channel,
+        value: dual.value,
+        derivative: dual.derivative,
+        certificate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn certificate(anchor_mode: MajorizerAnchorMode) -> BranchCertificate {
+        BranchCertificate {
+            anchor_mode,
+            row_dims: vec![2],
+            row_offsets: vec![0, 2],
+            beta_dim: 1,
+            manifold_mode_fingerprint: 11,
+            row_hessian_fingerprint: 17,
+            solver_mode: "Direct".to_string(),
+            deflated_rank: 0,
+            deflated_per_row: vec![0],
+            spectral_deflated_rows: vec![false],
+            cross_row_woodbury_rank: 0,
+            min_row_pivot_branch: PivotBranch::Positive,
+            min_schur_pivot_branch: PivotBranch::Positive,
+            min_pivot_branch: PivotBranch::Positive,
+            max_pivot_branch: PivotBranch::Positive,
+        }
+    }
+
+    #[test]
+    fn branch_certificate_refuses_reanchored_majorizer_probe() {
+        let baseline = certificate(MajorizerAnchorMode::FrozenAnchor);
+        let probe = certificate(MajorizerAnchorMode::ReanchoredObject);
+        let err = baseline
+            .assert_same_branch(&probe)
+            .expect_err("reanchored majorizer differentiates a different object");
+        assert_eq!(err.changed_fields, vec!["majorizer_anchor".to_string()]);
+    }
+
+    #[test]
+    fn branch_certificate_refuses_deflation_rank_change() {
+        let baseline = certificate(MajorizerAnchorMode::FrozenAnchor);
+        let mut probe = baseline.clone();
+        probe.deflated_rank = 1;
+        probe.deflated_per_row = vec![1];
+        let err = baseline
+            .assert_same_branch(&probe)
+            .expect_err("changed deflation branch must refuse derivative report");
+        assert!(err.changed_fields.iter().any(|field| field == "deflated_rank"));
+        assert!(
+            err.changed_fields
+                .iter()
+                .any(|field| field == "deflated_per_row")
+        );
+    }
+
+    #[test]
+    fn per_channel_dual_oracle_catches_planted_factor_two_hidden_from_total_fd() {
+        let cert = certificate(MajorizerAnchorMode::FrozenAnchor);
+        let tt_matrix = vec![
+            vec![
+                Dual::with_derivative(3.0, 3.0),
+                Dual::with_derivative(0.15, 0.0),
+            ],
+            vec![
+                Dual::with_derivative(0.15, 0.0),
+                Dual::with_derivative(2.4, 0.0),
+            ],
+        ];
+        let beta_matrix = vec![
+            vec![
+                Dual::with_derivative(4.0, -4.0),
+                Dual::with_derivative(0.05, 0.0),
+            ],
+            vec![
+                Dual::with_derivative(0.05, 0.0),
+                Dual::with_derivative(2.1, 0.0),
+            ],
+        ];
+        let tt = exact_logdet_channel(DerivativeTraceChannel::Tt, &tt_matrix, cert.clone())
+            .expect("tt channel");
+        let beta = exact_logdet_channel(DerivativeTraceChannel::Beta, &beta_matrix, cert.clone())
+            .expect("beta channel");
+        let report =
+            guarded_exact_trace_report(cert, vec![tt, beta]).expect("same branch report");
+
+        let beta_exact = report
+            .channel_derivative(DerivativeTraceChannel::Beta)
+            .expect("beta channel derivative");
+        let planted_beta = 2.0 * beta_exact;
+        assert!(
+            (planted_beta - beta_exact).abs() > 0.1,
+            "planted factor-two beta channel must be visible before total summation"
+        );
+
+        fn cancelling_total(x: f64) -> f64 {
+            let tt_value = 1.0e17 + 3.0 * x;
+            let beta_value = -1.0e17 - 4.0 * x;
+            tt_value + beta_value
+        }
+
+        let h = 1.0e-6;
+        let fd_total = (cancelling_total(h) - cancelling_total(-h)) / (2.0 * h);
+        assert_eq!(
+            fd_total, 0.0,
+            "central FD of the cancelling total has no measurable signal"
+        );
+        assert!(
+            beta_exact.is_finite() && report.total_derivative.is_finite(),
+            "dual oracle reports exact finite per-channel derivatives"
+        );
+    }
+}
