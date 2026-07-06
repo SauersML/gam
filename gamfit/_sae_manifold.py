@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,6 +18,126 @@ from ._penalty_bridge import (
 )
 from ._sparse_dictionary import sparse_dictionary_fit
 from ._sae_trust import atom_trust_scores, coerce_sae_trust_diagnostics
+
+
+class _SaeLazyFitArtifact:
+    """Lazy backing store for dense SAE result arrays.
+
+    The facade keeps this small handle instead of retaining duplicate dense
+    result arrays in every public slot. Values may be arrays, callables, or
+    sparse-code records shaped like ``{"indices", "values", "shape"}``.
+    """
+
+    __slots__ = ("_values", "_cache")
+
+    def __init__(self, values: Mapping[str, Any] | None = None) -> None:
+        self._values: dict[str, Any] = dict(values or {})
+        self._cache: dict[str, Any] = {}
+
+    def materialize(self, name: str) -> Any:
+        if name in self._cache:
+            return self._cache[name]
+        if name not in self._values:
+            raise AttributeError(f"SAE lazy artifact has no field {name!r}")
+        value = self._values[name]
+        if callable(value):
+            value = value()
+        elif isinstance(value, Mapping) and {"indices", "values", "shape"} <= set(value):
+            value = self._dense_from_sparse(value)
+        self._cache[name] = value
+        return value
+
+    def set(self, name: str, value: Any) -> None:
+        self._values[name] = value
+        self._cache.pop(name, None)
+
+    @staticmethod
+    def _dense_from_sparse(record: Mapping[str, Any]) -> np.ndarray:
+        shape = tuple(int(v) for v in record["shape"])
+        out = np.zeros(shape, dtype=float)
+        indices = np.asarray(record["indices"])
+        values = np.asarray(record["values"], dtype=float)
+        if indices.shape != values.shape:
+            raise ValueError(
+                f"sparse SAE code indices {indices.shape} and values {values.shape} must match"
+            )
+        if len(shape) != 2 or indices.ndim != 2:
+            raise ValueError(
+                "sparse SAE dense reconstruction expects indices/values with shape (N, active)"
+            )
+        rows = np.arange(indices.shape[0])[:, None]
+        out[rows, indices.astype(np.intp)] = values
+        return out
+
+
+class _SaeTrainingDataHandle:
+    """Metadata-only public handle for training data that is not retained."""
+
+    __slots__ = ("shape", "dtype")
+
+    def __init__(self, shape: tuple[int, ...], dtype: Any) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        self.dtype = np.dtype(dtype)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    @property
+    def size(self) -> int:
+        return 0
+
+    @property
+    def nbytes(self) -> int:
+        return 0
+
+    def __array__(self, dtype: Any | None = None) -> np.ndarray:
+        raise ValueError(
+            "ManifoldSAE.training_data is not retained. Pass activations explicitly "
+            "or call reconstruct_training() to materialize the fitted reconstruction."
+        )
+
+    def copy(self) -> np.ndarray:
+        return np.asarray(self).copy()
+
+    def tolist(self) -> list[Any]:
+        return np.asarray(self).tolist()
+
+    def __repr__(self) -> str:
+        return f"<training data not retained shape={self.shape} dtype={self.dtype}>"
+
+
+def _training_data_handle(x: np.ndarray) -> _SaeTrainingDataHandle:
+    return _SaeTrainingDataHandle(tuple(int(v) for v in x.shape), x.dtype)
+
+
+def _lazy_getattr(owner: Any, lazy_names: set[str], name: str) -> Any:
+    if name in lazy_names:
+        try:
+            artifact = object.__getattribute__(owner, "_lazy_artifact")
+        except AttributeError:
+            artifact = None
+        if artifact is not None:
+            return artifact.materialize(name)
+    return object.__getattribute__(owner, name)
+
+
+def _lazy_setattr(owner: Any, lazy_names: set[str], name: str, value: Any) -> None:
+    if name in lazy_names:
+        try:
+            artifact = object.__getattribute__(owner, "_lazy_artifact")
+        except AttributeError:
+            artifact = None
+        if artifact is not None:
+            artifact.set(name, value)
+            object.__setattr__(owner, name, None)
+            return
+    object.__setattr__(owner, name, value)
+
+
+_ATOM_LAZY_FIELDS = {"assignments", "coords"}
+_LOW_LEVEL_LAZY_FIELDS = {"fitted", "assignments", "coords"}
+_MODEL_LAZY_FIELDS = {"fitted", "assignments", "coords", "training_data", "low_level_logits"}
 
 
 # #1777 — the hard-sigmoid gate family's primary token is ``"threshold_gate"``
@@ -272,13 +392,13 @@ def _canonical_public_assignment(value: str) -> str:
 
 
 # Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
-# explicit value (including the default ``assignment="ibp_map"``).
+# explicit value.
 _ASSIGNMENT_PRIOR_UNSET = object()
 
 # Sentinel so ``alpha`` can tell "not supplied" apart from an explicit
 # ``alpha=1.0``. When the caller does not set ``alpha`` and the assignment is
-# ``ibp_map``, the concentration defaults to the K-aware value below rather than
-# the historical fixed ``1.0`` (see #1784).
+# an explicit ``ibp_map``, the concentration defaults to the K-aware value below
+# rather than the historical fixed ``1.0`` (see #1784).
 _ALPHA_UNSET: Any = object()
 
 
@@ -302,6 +422,16 @@ def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
     """
     k = float(max(int(k_atoms), 1))
     return max(1.0, 1.0 / (math.expm1(1.0 / k)))
+
+
+def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
+    n = int(n_obs)
+    k = int(k_atoms)
+    if n <= 0 or k <= 1:
+        return None
+    if n >= k * k:
+        return None
+    return max(1, min(k - 1, math.ceil(n / k)))
 
 
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
@@ -437,6 +567,24 @@ class SaeManifoldAtomFit:
     # ``coords``, unless the certificate verdict is ``arclength_honest``. Use
     # :meth:`ManifoldSAE.atom_angle_coordinate` for the certificate-gated reader.
     coords_u_arc: np.ndarray | None = None
+    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._lazy_artifact is not None:
+            return
+        values = {
+            "assignments": object.__getattribute__(self, "assignments"),
+            "coords": object.__getattribute__(self, "coords"),
+        }
+        object.__setattr__(self, "_lazy_artifact", _SaeLazyFitArtifact(values))
+        object.__setattr__(self, "assignments", None)
+        object.__setattr__(self, "coords", None)
+
+    def __getattribute__(self, name: str) -> Any:
+        return _lazy_getattr(self, _ATOM_LAZY_FIELDS, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        _lazy_setattr(self, _ATOM_LAZY_FIELDS, name, value)
 
 
 @dataclass(slots=True)
@@ -449,27 +597,49 @@ class SaeManifoldFitResult:
     assignments: np.ndarray
     coords: list[np.ndarray]
     reml_score: float
+    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._lazy_artifact is not None:
+            return
+        values = {
+            "fitted": object.__getattribute__(self, "fitted"),
+            "assignments": object.__getattribute__(self, "assignments"),
+            "coords": object.__getattribute__(self, "coords"),
+        }
+        object.__setattr__(self, "_lazy_artifact", _SaeLazyFitArtifact(values))
+        object.__setattr__(self, "fitted", None)
+        object.__setattr__(self, "assignments", None)
+        object.__setattr__(self, "coords", None)
+
+    def __getattribute__(self, name: str) -> Any:
+        return _lazy_getattr(self, _LOW_LEVEL_LAZY_FIELDS, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        _lazy_setattr(self, _LOW_LEVEL_LAZY_FIELDS, name, value)
 
 
 @dataclass(slots=True)
 class ManifoldSAE:
     """Fitted SAE-manifold model returned by :func:`sae_manifold_fit`.
 
-    The main result arrays are ``fitted`` ``(N, p)``, ``assignments`` ``(N, K)``,
-    ``coords`` as a list of per-atom ``(N, d_k)`` arrays, ``decoder_blocks`` as
-    per-atom ``(M_k, p)`` decoder matrices, and ``atoms`` as detailed
+    The main result arrays are exposed as ``fitted`` ``(N, p)``,
+    ``assignments`` ``(N, K)``, ``coords`` as a list of per-atom ``(N, d_k)``
+    arrays, ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices, and
+    ``atoms`` as detailed
     :class:`SaeManifoldAtomFit` payloads. Metadata records the resolved
     ``assignment`` kind, per-atom topology/basis information, score fields
     (``penalized_loss_score`` -- a negative penalized-loss objective, NOT REML;
     ``reml_score`` is retained as a deprecated read alias --,
     ``reconstruction_r2``, ``dispersion``), fit controls
     (``alpha``, ``learnable_alpha``, ``tau``, ``top_k``,
-    ``jumprelu_threshold``), and cached training data used for exact
-    training-set predictions.
+    ``jumprelu_threshold``), and metadata for the training data. New fits do not
+    retain the input matrix; ``training_data`` is a metadata-only handle, while
+    dense result attributes are lazy and materialize when accessed.
 
     Public helpers include :meth:`predict`/:meth:`reconstruct`,
-    :meth:`encode`, :meth:`converged_latents`, :meth:`project`, and
-    :meth:`shape_uncertainty`.
+    :meth:`reconstruct_training`, :meth:`encode`, :meth:`converged_latents`,
+    :meth:`project`, and :meth:`shape_uncertainty`.
     """
 
     atoms: list[SaeManifoldAtomFit]
@@ -559,6 +729,10 @@ class ManifoldSAE:
     # this reports it. Atoms without a d=1 circle/interval chart carry a null
     # ``topology``.
     coordinate_fidelity: dict[str, Any] | None = None
+    # Per-atom persistent-homology topology audit. ``atoms[k]`` carries measured
+    # Betti numbers, inferred coarse topology, persistence bars, and a
+    # ``contested`` flag when the measured topology disagrees with the raced kind.
+    topology_persistence: dict[str, Any] | None = None
     # Per-atom smooth-functional inference (#1097 / #1103): one entry per fitted
     # atom, ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
     # "smooth_significance": {"log_e_nonconstant": float | None} | None}``. The
@@ -622,6 +796,31 @@ class ManifoldSAE:
     # object. ``None`` when no eligible d=1 atom existed (nothing to adjudicate) or
     # for payloads predating the report.
     hybrid_split: dict[str, Any] | None = None
+    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._lazy_artifact is not None:
+            return
+        values = {
+            "fitted": object.__getattribute__(self, "fitted"),
+            "assignments": object.__getattribute__(self, "assignments"),
+            "coords": object.__getattribute__(self, "coords"),
+            "training_data": object.__getattribute__(self, "training_data"),
+            "low_level_logits": object.__getattribute__(self, "low_level_logits"),
+        }
+        artifact = _SaeLazyFitArtifact(values)
+        object.__setattr__(self, "_lazy_artifact", artifact)
+        for name in _MODEL_LAZY_FIELDS:
+            object.__setattr__(self, name, None)
+        low = object.__getattribute__(self, "low_level")
+        if isinstance(low, SaeManifoldFitResult):
+            object.__setattr__(low, "_lazy_artifact", artifact)
+
+    def __getattribute__(self, name: str) -> Any:
+        return _lazy_getattr(self, _MODEL_LAZY_FIELDS, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        _lazy_setattr(self, _MODEL_LAZY_FIELDS, name, value)
 
     @property
     def chosen_k(self) -> int:
@@ -683,7 +882,7 @@ class ManifoldSAE:
                 "emitted; the discovered K must thread through every field"
             )
         for field in ("assignments_z", "logits"):
-            arr = np.asarray(payload[field], dtype=float)
+            arr = np.asarray(payload[field])
             if arr.ndim != 2 or arr.shape[1] != k_discovered:
                 raise ValueError(
                     f"SAE payload '{field}' must be (N, K=={k_discovered}); "
@@ -756,6 +955,15 @@ class ManifoldSAE:
                 _opt_arr(atom, "shape_band_sd"),
             )
 
+        assignments_cache: dict[str, np.ndarray] = {}
+
+        def _assignments_array() -> np.ndarray:
+            cached = assignments_cache.get("value")
+            if cached is None:
+                cached = np.asarray(payload["assignments_z"], dtype=float)
+                assignments_cache["value"] = cached
+            return cached
+
         atoms: list[SaeManifoldAtomFit] = []
         for atom_idx, atom in enumerate(payload_atoms):
             shape_band_coords, shape_band_mean, shape_band_sd = _shape_band_arrays(
@@ -766,8 +974,14 @@ class ManifoldSAE:
             atoms.append(SaeManifoldAtomFit(
                 basis=str(atom["basis_kind"]),
                 decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
-                assignments=np.asarray(atom["assignments_z"], dtype=float),
-                coords=np.asarray(atom["on_atom_coords_t"], dtype=float),
+                assignments=(
+                    lambda idx=atom_idx: _assignments_array()[:, idx]
+                ),
+                coords=(
+                    lambda atom_payload=atom: np.asarray(
+                        atom_payload["on_atom_coords_t"], dtype=float
+                    )
+                ),
                 evidence=_penalized_loss_score(payload),
                 active_dim=int(atom["active_dim"]),
                 decoder_covariance=_opt_arr(atom, "decoder_covariance"),
@@ -777,11 +991,11 @@ class ManifoldSAE:
                 functional_evidence=functional_evidence,
                 coords_u_arc=_opt_arr(atom, "on_atom_coords_u_arc"),
             ))
-        fitted = np.asarray(payload["fitted"], dtype=float)
-        assigns = np.asarray(payload["assignments_z"], dtype=float)
-        logits = np.asarray(payload["logits"], dtype=float)
+        fitted = lambda: np.asarray(payload["fitted"], dtype=float)
+        assigns = _assignments_array
+        logits = lambda: np.asarray(payload["logits"], dtype=float)
         diagnostics = coerce_sae_trust_diagnostics(payload)
-        coords = [atom.coords.copy() for atom in atoms]
+        coords = lambda: [atom.coords for atom in atoms]
         score = _penalized_loss_score(payload)
         chosen_k = int(payload["chosen_k"])
         low = SaeManifoldFitResult(atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score)
@@ -821,8 +1035,8 @@ class ManifoldSAE:
             fitted=fitted, assignments=assigns, coords=coords,
             decoder_blocks=[a.decoder_coefficients.copy() for a in atoms],
             basis_specs=kinds, penalized_loss_score=score,
-            reconstruction_r2=float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
-            training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
+            reconstruction_r2=float(payload["reconstruction_r2"]),
+            training_mean=x.mean(axis=0), training_data=_training_data_handle(x), low_level=low,
             low_level_logits=logits,
             diagnostics=diagnostics,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
@@ -883,6 +1097,11 @@ class ManifoldSAE:
                 None
                 if payload.get("coordinate_fidelity") is None
                 else dict(payload["coordinate_fidelity"])
+            ),
+            topology_persistence=(
+                None
+                if payload.get("topology_persistence") is None
+                else dict(payload["topology_persistence"])
             ),
             atom_inference_reports=atom_inference_reports,
             certificates=(
@@ -1125,6 +1344,25 @@ class ManifoldSAE:
             )
         return dict(rows[k])
 
+    def topology_persistence_report(self) -> list[dict[str, Any]]:
+        """Per-atom persistent-homology topology audit."""
+        if self.topology_persistence is None:
+            raise ValueError(
+                "this fitted model carries no SAE topology-persistence report; refit to obtain one"
+            )
+        return [dict(atom) for atom in self.topology_persistence.get("atoms", [])]
+
+    def atom_topology_persistence(self, atom: int) -> dict[str, Any]:
+        """Topology-persistence audit record for one atom."""
+        k = self._atom_index(atom)
+        rows = self.topology_persistence_report()
+        if k >= len(rows):
+            raise ValueError(
+                f"topology-persistence report has {len(rows)} atom rows but model has "
+                f"{len(self.atoms)} atoms"
+            )
+        return dict(rows[k])
+
     def atom_angle_coordinate(self, atom: int) -> np.ndarray:
         """The certificate-gated honest coordinate for one ``d = 1`` atom (#2081).
 
@@ -1282,6 +1520,8 @@ class ManifoldSAE:
         use tolerance equality (``np.allclose``) for model semantics.
         """
         td = self.training_data
+        if isinstance(td, _SaeTrainingDataHandle):
+            return False
         if x is td:
             return True
         return (
@@ -1326,6 +1566,12 @@ class ManifoldSAE:
                 for k in range(len(self._atom_dims))
             ]
         if target_norm_bound is None:
+            if isinstance(self.training_data, _SaeTrainingDataHandle):
+                raise ValueError(
+                    "build_encode_atlas(target_norm_bound=None) requires retained "
+                    "training data, but ManifoldSAE no longer stores the input matrix; "
+                    "pass target_norm_bound explicitly."
+                )
             td = np.asarray(self.training_data, dtype=float)
             target_norm_bound = (
                 float(np.max(np.sqrt(np.sum(td * td, axis=1)))) if td.size else 1.0
@@ -1349,6 +1595,41 @@ class ManifoldSAE:
             return self.fitted.copy()
         payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
         return np.asarray(payload["fitted"], dtype=float)
+
+    def reconstruct_training(self) -> np.ndarray:
+        """Materialize the in-sample dense reconstruction from stored codes.
+
+        The original input matrix is not retained on fitted results. This method
+        rebuilds the fitted dense array from the per-atom coordinates, assignment
+        codes, and decoder blocks only when a caller explicitly requests it.
+        """
+        assignments = np.asarray(self.assignments, dtype=np.float64)
+        if assignments.ndim != 2:
+            raise ValueError(f"assignments must be 2D; got shape {assignments.shape}")
+        n_rows, k_atoms = assignments.shape
+        if k_atoms != len(self.decoder_blocks):
+            raise ValueError(
+                f"assignment columns {k_atoms} must equal decoder block count "
+                f"{len(self.decoder_blocks)}"
+            )
+        p_out = int(self.fitted.shape[1]) if k_atoms == 0 else int(self.decoder_blocks[0].shape[1])
+        out = np.zeros((n_rows, p_out), dtype=np.float64)
+        for atom_idx in range(k_atoms):
+            coords = np.asarray(self.coords[atom_idx], dtype=np.float64)
+            decoder = np.asarray(self.decoder_blocks[atom_idx], dtype=np.float64)
+            phi, _jet, _penalty = _basis_with_jet_for_atom(
+                self.atom_topologies[atom_idx],
+                coords,
+                int(decoder.shape[0]),
+                int(self._atom_dims[atom_idx]),
+            )
+            if phi.shape[1] != decoder.shape[0]:
+                raise ValueError(
+                    f"atom {atom_idx} basis width {phi.shape[1]} does not match "
+                    f"decoder rows {decoder.shape[0]}"
+                )
+            out += assignments[:, atom_idx : atom_idx + 1] * (phi @ decoder)
+        return out
 
     def predict(self, X: Any) -> np.ndarray:
         return self.reconstruct(X)
@@ -1451,6 +1732,12 @@ class ManifoldSAE:
         ``SaeAmortizedEncoder`` learns the closed-form, evidence-selected map
         ``x -> (logits, coords, amplitudes)``. A thin marshalling wrapper — all
         math lives in Rust (SPEC)."""
+        if isinstance(self.training_data, _SaeTrainingDataHandle):
+            raise ValueError(
+                "encode_amortized requires the training input matrix, but "
+                "ManifoldSAE no longer retains it. Use distill_encoder(X, ...) "
+                "with explicit training activations."
+            )
         rust = rust_module()
         return rust.SaeAmortizedEncoder(
             np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64)),
@@ -1806,7 +2093,8 @@ class ManifoldSAE:
             ),
             "reconstruction_r2": float(self.reconstruction_r2),
             "training_mean": self.training_mean.tolist(),
-            "training_data": self.training_data.tolist(),
+            "training_data": None,
+            "training_data_retained": False,
             "fitted": self.fitted.tolist(),
             "assignments": self.assignments.tolist(),
             "logits": self.low_level_logits.tolist(),
@@ -1850,6 +2138,11 @@ class ManifoldSAE:
                 None
                 if self.coordinate_fidelity is None
                 else _jsonable(self.coordinate_fidelity)
+            ),
+            "topology_persistence": (
+                None
+                if self.topology_persistence is None
+                else _jsonable(self.topology_persistence)
             ),
             "atom_inference": (
                 None
@@ -1927,6 +2220,12 @@ class ManifoldSAE:
         diagnostics = coerce_sae_trust_diagnostics(payload)
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
+        training_raw = payload.get("training_data")
+        training_data = (
+            _SaeTrainingDataHandle(tuple(fitted.shape), fitted.dtype)
+            if training_raw is None
+            else np.asarray(training_raw, dtype=float)
+        )
         # #1231: accept the new primary key, fall back to the deprecated
         # "reml_score" alias for dicts written by older versions. ``None`` is a
         # valid value (closed-form shortcut payloads).
@@ -1956,7 +2255,7 @@ class ManifoldSAE:
             penalized_loss_score=score,
             reconstruction_r2=float(payload["reconstruction_r2"]),
             training_mean=np.asarray(payload["training_mean"], dtype=float),
-            training_data=np.asarray(payload["training_data"], dtype=float),
+            training_data=training_data,
             low_level=low,
             low_level_logits=logits,
             diagnostics=diagnostics,
@@ -2015,6 +2314,11 @@ class ManifoldSAE:
                 None
                 if payload.get("coordinate_fidelity") is None
                 else dict(payload["coordinate_fidelity"])
+            ),
+            topology_persistence=(
+                None
+                if payload.get("topology_persistence") is None
+                else dict(payload["topology_persistence"])
             ),
             atom_inference_reports=_coerce_atom_inference(payload.get("atom_inference")),
             # F: round-trip the unified certificate ledger. to_dict() writes it,
@@ -2086,7 +2390,7 @@ _COORD_SPARSITY_UNSET: Any = object()
 
 
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
-                     assignment: str = "ibp_map", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
+                     assignment: str = "softmax", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      assignment_prior: Any = _ASSIGNMENT_PRIOR_UNSET, n_atoms: int | None = None,
@@ -2137,8 +2441,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         affine atom ``{1, t}``; the same candidate is used by the hybrid-split
         LINEAR verdicts (see :attr:`ManifoldSAE.hybrid_split`).
     assignment
-        Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
-        ``"softmax"`` uses soft mixture masses, and ``"threshold_gate"`` uses the
+        Assignment/gating family. ``"softmax"`` uses soft mixture masses and is
+        the production default; at large ``K`` the fit derives a train-time
+        ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
+        ``"ibp_map"`` uses the IBP-MAP gate path as an explicit small-fit
+        research mode, and ``"threshold_gate"`` uses the
         hard-sigmoid gate family (#1777, renamed from ``"jumprelu"``). Public
         aliases are accepted (#159):
         ``"ibp"``/``"ibp-map"``/``"ibp_map"`` -> ``"ibp_map"``,
@@ -2218,7 +2525,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Assignment-prior concentration/scale. Pass a float for a fixed value or
         ``"auto"`` to mark alpha learnable in the Rust solve; returned metadata
         records ``alpha=1.0`` and ``learnable_alpha=True`` in that case. If left
-        unset with the (default) ``ibp_map`` gate, the concentration defaults to
+        unset with an explicit ``ibp_map`` gate, the concentration defaults to
         the K-aware ``default_ibp_concentration_for_k_atoms(K) ≈ K − 1/2`` (#1784)
         so the ordered stick-breaking prior spans the whole dictionary instead of
         masking every atom past the first few (which underfit an equal-K linear
@@ -2315,8 +2622,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
         and ``assignment_label``, ``penalized_loss_score`` (``reml_score`` is a
         deprecated read alias), ``reconstruction_r2``,
-        ``dispersion``, ``training_mean``, ``training_data``,
-        ``low_level_logits``, and fit-control metadata including ``alpha``,
+        ``dispersion``, ``training_mean``, metadata-only ``training_data``,
+        lazy ``low_level_logits``, and fit-control metadata including ``alpha``,
         ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
         ``learning_rate``, ``max_iter``, ``random_state``, ``top_k``, and
         ``jumprelu_threshold``. Each atom exposes ``basis``,
@@ -2326,9 +2633,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(G, d_k)``, ``shape_band_mean`` ``(G, p)``, and ``shape_band_sd``
         ``(G, p)`` when the Rust payload includes posterior shape uncertainty.
 
-        Useful public methods include ``predict``/``reconstruct``, ``encode``,
-        ``converged_latents``, ``project``, ``per_atom_active_set``,
-        ``per_atom_latent_for``, and ``shape_uncertainty(atom=..., n_sd=...)``.
+        Useful public methods include ``predict``/``reconstruct``,
+        ``reconstruct_training``, ``encode``, ``converged_latents``,
+        ``project``, ``per_atom_active_set``, ``per_atom_latent_for``, and
+        ``shape_uncertainty(atom=..., n_sd=...)``.
     """
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
@@ -2573,8 +2881,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
     kind = _resolve_public_assignment(assignment, assignment_prior)
     # #1784 — K-aware default IBP concentration. When the caller does not set
-    # `alpha` and the assignment is the (default) ordered stick-breaking `ibp_map`
-    # gate, default the concentration to `default_ibp_concentration_for_k_atoms(K)`
+    # `alpha` and explicitly chooses the ordered stick-breaking `ibp_map` gate,
+    # default the concentration to `default_ibp_concentration_for_k_atoms(K)`
     # so the prior SPANS the whole dictionary instead of collapsing to a near-hard
     # mask past the first ~3 atoms (the fixed `alpha=1.0` failure that made the
     # manifold underfit an equal-K linear dictionary and left late atoms massless,
@@ -2643,7 +2951,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # active-set cap. Normalize ``0`` to ``None`` (disabled) BEFORE the
     # ``[1, K]`` range check so ``top_k=0`` is accepted rather than rejected.
     if top_k is None or int(top_k) == 0:
-        top_k_arg = None
+        top_k_arg = (
+            _default_top_k_for_large_dictionary(n_obs, k_atoms)
+            if kind == "softmax"
+            else None
+        )
     else:
         top_k_int = int(top_k)
         if top_k_int < 1 or top_k_int > k_atoms:
@@ -3980,14 +4292,18 @@ def _default_research_k(n_obs: int) -> int:
 
 def _trust_scores(model: ManifoldSAE, activations: np.ndarray | None = None) -> dict[str, Any]:
     """Per-row and per-atom trust scores derived from atom diagnostics."""
-    x = model.training_data if activations is None else _as_2d_float(activations, "activations")
-    n_rows = int(x.shape[0])
     atom_trust = atom_trust_scores(model.diagnostics)
     n_atoms = int(atom_trust.shape[0])
-    if activations is None or model._is_training_data(x):
+    if activations is None:
         assignments = np.asarray(model.assignments, dtype=float)
+        n_rows = int(assignments.shape[0])
     else:
-        assignments = np.asarray(model.encode(x), dtype=float)
+        x = _as_2d_float(activations, "activations")
+        n_rows = int(x.shape[0])
+        if model._is_training_data(x):
+            assignments = np.asarray(model.assignments, dtype=float)
+        else:
+            assignments = np.asarray(model.encode(x), dtype=float)
     if assignments.shape != (n_rows, n_atoms):
         raise ValueError(
             "trust score assignments shape mismatch: "

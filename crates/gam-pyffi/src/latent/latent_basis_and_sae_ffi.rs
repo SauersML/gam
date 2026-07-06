@@ -4168,12 +4168,36 @@ fn sae_manifold_fit_inner<'py>(
     let active_mask: Vec<bool> = (0..k_atoms)
         .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
         .collect();
+    let mut means = vec![0.0_f64; p_out];
+    for row in 0..n_obs {
+        for out_col in 0..p_out {
+            means[out_col] += z_view[[row, out_col]];
+        }
+    }
+    if n_obs > 0 {
+        let inv_n = 1.0 / n_obs as f64;
+        for mean in means.iter_mut() {
+            *mean *= inv_n;
+        }
+    }
+    let mut rss = 0.0_f64;
+    let mut tss = 0.0_f64;
+    for row in 0..n_obs {
+        for out_col in 0..p_out {
+            let residual = z_view[[row, out_col]] - fitted[[row, out_col]];
+            let centered = z_view[[row, out_col]] - means[out_col];
+            rss += residual * residual;
+            tss += centered * centered;
+        }
+    }
+    let reconstruction_r2 = if tss > 0.0 { 1.0 - rss / tss } else { 0.0 };
     let out = PyDict::new(py);
     out.set_item("atoms", atoms_py)?;
     out.set_item("assignments_z", assignments.into_pyarray(py))?;
     out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("reconstruction_r2", reconstruction_r2)?;
     // #1231 / #1232 — in-sample fit: the score is the negative penalized loss,
     // surfaced honestly as `penalized_loss_score` (NOT `reml_score`) with a
     // breakdown. The top-level payload describes ONE coherent model: when a hard
@@ -4315,6 +4339,14 @@ fn sae_manifold_fit_inner<'py>(
         "coordinate_fidelity",
         sae_coordinate_fidelity_dict(py, &fit_diagnostics.coordinate_fidelity)?,
     )?;
+    // Reviewer-F3 — per-atom persistent-homology topology audit. This is a pure
+    // read of assigned-row decoder images: measured Betti numbers and inferred
+    // topology are exposed per atom, with `contested` raised when the measured
+    // persistence disagrees with the raced topology.
+    out.set_item(
+        "topology_persistence",
+        sae_topology_persistence_dict(py, &fit_diagnostics.topology_persistence)?,
+    )?;
     // #16 — ONE coherent certificate ledger. Every certificate this fit produced
     // implements the shared claim+evidence+conservative-verdict contract
     // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
@@ -4334,6 +4366,11 @@ fn sae_manifold_fit_inner<'py>(
                 &fit_diagnostics.coordinate_fidelity,
             );
         ledger.record(&coordinate_fidelity_certificate);
+        let topology_persistence_certificate =
+            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(
+                &fit_diagnostics.topology_persistence,
+            );
+        ledger.record(&topology_persistence_certificate);
         if let Some(report) = &fit_diagnostics.incoherence_report {
             ledger.record(report);
         }
@@ -4925,6 +4962,107 @@ fn sae_coordinate_fidelity_dict<'py>(
             }
         }
         atoms.append(a)?;
+    }
+    d.set_item("atoms", atoms)?;
+    Ok(d)
+}
+
+fn sae_persistence_bar_list<'py>(
+    py: Python<'py>,
+    bars: &[gam::terms::sae::manifold::PersistenceBar],
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for bar in bars {
+        let d = PyDict::new(py);
+        d.set_item("birth", bar.birth)?;
+        d.set_item("death", bar.death)?;
+        d.set_item("persistence", bar.persistence())?;
+        d.set_item("essential", bar.is_essential())?;
+        out.append(d)?;
+    }
+    Ok(out)
+}
+
+fn sae_betti_signature_dict<'py>(
+    py: Python<'py>,
+    betti: gam::terms::sae::manifold::BettiSignature,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("b0", betti.b0)?;
+    d.set_item("b1", betti.b1)?;
+    match betti.b2 {
+        Some(b2) => d.set_item("b2", b2)?,
+        None => d.set_item("b2", py.None())?,
+    }
+    Ok(d)
+}
+
+fn topology_persistence_inferred_kind(
+    report: &gam::terms::sae::manifold::AtomTopologyPersistence,
+) -> &'static str {
+    if report.measured_betti.b0 != 1 {
+        "disconnected"
+    } else if report.measured_betti.b2 == Some(1) && report.measured_betti.b1 == 0 {
+        "sphere"
+    } else if report.measured_betti.b1 == 2 {
+        "torus"
+    } else if report.measured_betti.b1 == 1 {
+        "loop"
+    } else {
+        "contractible"
+    }
+}
+
+/// Build the result-dict entry for the reviewer-F3 persistent-homology topology
+/// audit. One entry per atom in atom order; unaudited atoms carry null topology.
+fn sae_topology_persistence_dict<'py>(
+    py: Python<'py>,
+    persistence: &[Option<gam::terms::sae::manifold::AtomTopologyPersistence>],
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item(
+        "note",
+        "SAE per-atom topology-persistence audit. `measured_betti` reports the \
+         persistent H0/H1/H2 summary inferred from support-weighted decoder \
+         images; `expected_betti` is the raced topology signature, and \
+         `contested` is true when the two signatures disagree.",
+    )?;
+    let atoms = PyList::empty(py);
+    for (atom_idx, entry) in persistence.iter().enumerate() {
+        let atom = PyDict::new(py);
+        atom.set_item("atom", atom_idx)?;
+        match entry {
+            Some(report) => {
+                atom.set_item("raced_kind", sae_atom_basis_kind_name(&report.raced_kind))?;
+                atom.set_item("support_size", report.support_size)?;
+                atom.set_item("landmark_count", report.landmark_count)?;
+                atom.set_item("stability_band", report.stability_band.as_str())?;
+                atom.set_item("support_mass", report.support_mass)?;
+                atom.set_item("effective_n", report.effective_n)?;
+                atom.set_item("support_ess", report.support_ess)?;
+                atom.set_item("measured_betti", sae_betti_signature_dict(py, report.measured_betti)?)?;
+                atom.set_item("expected_betti", sae_betti_signature_dict(py, report.expected_betti)?)?;
+                atom.set_item("inferred_kind", topology_persistence_inferred_kind(report))?;
+                atom.set_item("dominant_h1_persistence", report.dominant_h1_persistence)?;
+                atom.set_item("dominant_h2_persistence", report.dominant_h2_persistence)?;
+                atom.set_item("h0", sae_persistence_bar_list(py, &report.h0)?)?;
+                atom.set_item("h1", sae_persistence_bar_list(py, &report.h1)?)?;
+                atom.set_item("h2", sae_persistence_bar_list(py, &report.h2)?)?;
+                atom.set_item("contested", report.contested)?;
+                atom.set_item("note", &report.note)?;
+            }
+            None => {
+                atom.set_item("raced_kind", py.None())?;
+                atom.set_item("support_size", py.None())?;
+                atom.set_item("landmark_count", py.None())?;
+                atom.set_item("stability_band", py.None())?;
+                atom.set_item("measured_betti", py.None())?;
+                atom.set_item("expected_betti", py.None())?;
+                atom.set_item("inferred_kind", py.None())?;
+                atom.set_item("contested", py.None())?;
+            }
+        }
+        atoms.append(atom)?;
     }
     d.set_item("atoms", atoms)?;
     Ok(d)

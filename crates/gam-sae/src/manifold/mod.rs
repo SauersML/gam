@@ -187,6 +187,7 @@ mod cross_fit;
 mod curl;
 mod fit_drivers;
 mod gauge;
+mod graph_atom;
 mod inframe_curved;
 mod isa_seed;
 mod kronecker;
@@ -310,6 +311,9 @@ mod tests_device_engage_1783;
 mod tests_frame_refresh_alpha_grad;
 
 #[cfg(test)]
+mod tests_graph_atom;
+
+#[cfg(test)]
 mod tests_cocollapse_disjoint_2027;
 
 #[cfg(test)]
@@ -376,6 +380,7 @@ pub use coordinate_fidelity::*;
 pub use cross_fit::*;
 pub use curl::*;
 pub use gauge::*;
+pub use graph_atom::*;
 pub use inframe_curved::*;
 pub use isa_seed::*;
 pub(crate) use kronecker::*;

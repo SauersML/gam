@@ -16,6 +16,7 @@ pub mod dictionary_artifact;
 pub mod dual_certificate;
 pub mod encode;
 pub mod frames;
+pub mod front_door;
 pub mod gpu_kernels;
 pub mod hybrid_split;
 pub mod identifiability;

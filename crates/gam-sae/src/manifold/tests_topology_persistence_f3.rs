@@ -59,6 +59,37 @@ fn line_points(n: usize, length: f64) -> Array2<f64> {
     pts
 }
 
+/// Product-circle grid embedded as a flat Clifford torus in R4.
+fn torus_points(nu: usize, nv: usize) -> Array2<f64> {
+    let mut pts = Array2::<f64>::zeros((nu * nv, 4));
+    let mut row = 0usize;
+    for i in 0..nu {
+        let u = std::f64::consts::TAU * (i as f64) / (nu as f64);
+        for j in 0..nv {
+            let v = std::f64::consts::TAU * (j as f64) / (nv as f64);
+            pts[[row, 0]] = u.cos();
+            pts[[row, 1]] = u.sin();
+            pts[[row, 2]] = v.cos();
+            pts[[row, 3]] = v.sin();
+            row += 1;
+        }
+    }
+    pts
+}
+
+/// Six vertices of the octahedron on S2. Its VR complex has one dominant H2
+/// shell before the opposite-vertex edges fill it.
+fn octahedron_sphere_points() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (6, 3),
+        vec![
+            1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, -1.0,
+        ],
+    )
+    .unwrap()
+}
+
 #[test]
 fn vietoris_rips_finds_the_circle_loop() {
     let pts = circle_points(24, 1.0);
@@ -84,9 +115,9 @@ fn circle_cloud_agrees_with_a_raced_circle() {
     let pts = circle_points(40, 2.0);
     let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
-    assert_eq!(verdict.n_components, 1, "circle is connected");
-    assert!(verdict.has_loop, "circle must show a loop");
-    assert!(verdict.expected_loop, "periodic type predicts a loop");
+    assert_eq!(verdict.measured_betti.b0, 1, "circle is connected");
+    assert_eq!(verdict.measured_betti.b1, 1, "circle must show one loop");
+    assert_eq!(verdict.expected_betti.b1, 1, "periodic type predicts one loop");
     assert!(
         !verdict.contested,
         "a true circle raced as a circle is not contested: {}",
@@ -101,7 +132,7 @@ fn seven_cluster_ring_forced_through_circle_is_contested() {
     let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
     assert_eq!(
-        verdict.n_components, 7,
+        verdict.measured_betti.b0, 7,
         "the seven blobs must register as seven H₀ components: {}",
         verdict.note
     );
@@ -118,8 +149,8 @@ fn line_is_clean_against_a_line_and_contested_against_a_circle() {
     // Raced as the (loop-free) linear patch: clean.
     let as_line = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Linear)
         .expect("linear atom has a topology prediction");
-    assert_eq!(as_line.n_components, 1, "a line is one component");
-    assert!(!as_line.has_loop, "a line has no loop");
+    assert_eq!(as_line.measured_betti.b0, 1, "a line is one component");
+    assert_eq!(as_line.measured_betti.b1, 0, "a line has no loop");
     assert!(
         !as_line.contested,
         "a line raced as a line is clean: {}",
@@ -129,12 +160,50 @@ fn line_is_clean_against_a_line_and_contested_against_a_circle() {
     // The SAME line raced as a circle: the predicted loop is absent → contested.
     let as_circle = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
         .expect("periodic atom has a topology prediction");
-    assert!(as_circle.expected_loop, "periodic predicts a loop");
-    assert!(!as_circle.has_loop, "the line has no loop to find");
+    assert_eq!(as_circle.expected_betti.b1, 1, "periodic predicts a loop");
+    assert_eq!(as_circle.measured_betti.b1, 0, "the line has no loop to find");
     assert!(
         as_circle.contested,
         "a circle fit on a line is contested: {}",
         as_circle.note
+    );
+}
+
+#[test]
+fn torus_signature_requires_two_independent_loops() {
+    let pts = torus_points(4, 4);
+    let as_torus = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Torus)
+        .expect("torus atom has a topology prediction");
+    assert_eq!(as_torus.measured_betti.b0, 1, "torus is connected");
+    assert_eq!(as_torus.measured_betti.b1, 2, "torus must show two H1 loops");
+    assert_eq!(as_torus.expected_betti.b1, 2, "torus predicts two H1 loops");
+
+    let as_circle = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
+        .expect("periodic atom has a topology prediction");
+    assert_eq!(
+        as_circle.measured_betti.b1, 2,
+        "same cloud still measures two loops"
+    );
+    assert_eq!(as_circle.expected_betti.b1, 1, "circle predicts one loop");
+    assert!(
+        as_circle.contested,
+        "a circle candidate on torus support must be contested: {}",
+        as_circle.note
+    );
+}
+
+#[test]
+fn sphere_signature_measures_h2_shell() {
+    let pts = octahedron_sphere_points();
+    let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Sphere)
+        .expect("sphere atom has a topology prediction");
+    assert_eq!(verdict.measured_betti.b0, 1, "sphere is connected");
+    assert_eq!(verdict.measured_betti.b1, 0, "sphere has no H1 loop");
+    assert_eq!(verdict.measured_betti.b2, Some(1), "sphere has one H2 shell");
+    assert!(
+        !verdict.contested,
+        "octahedron sphere should match the sphere signature: {}",
+        verdict.note
     );
 }
 
