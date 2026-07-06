@@ -7,8 +7,14 @@ use ndarray::{Array2, Array3};
 
 use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
 use super::inframe_curved::{
-    CurvedRegion, InFrameCurvedConfig, activate_residual_frame, dense_ambient_radial_reference,
-    fit_inframe_curved_regions, inframe_curved_region_prediction, residual_span_frame,
+    ChartOccupancyStatus, CurvedRegion, InFrameCurvedConfig, WeightFrameOccupancy,
+    activate_residual_frame, dense_ambient_radial_reference, fit_inframe_curved_regions,
+    fit_inframe_curved_weight_frame_catalog, inframe_curved_region_prediction,
+    residual_span_frame,
+};
+use super::weight_frame_catalog::{
+    WeightFrameCatalogConfig, WeightFrameMatrix, WeightFrameSource,
+    frame_catalog_from_weight_matrices,
 };
 
 /// Deterministic LCG in `[-1, 1)` so the tests are reproducible without an RNG
@@ -101,6 +107,205 @@ fn planted_curved_residual(
         }
     }
     (residual, q)
+}
+
+fn project_matrix_onto_frame(matrix: &Array2<f64>, frame: &Array2<f64>) -> Array2<f64> {
+    frame.dot(&frame.t().dot(matrix))
+}
+
+fn relative_frobenius(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    let mut diff = 0.0;
+    let mut denom = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = x - y;
+        diff += d * d;
+        denom += y * y;
+    }
+    (diff / denom.max(1.0e-30)).sqrt()
+}
+
+#[test]
+fn weight_frame_catalog_spans_component_column_images() {
+    let p = 24;
+    let q_ov = random_orthonormal(p, 2, 1001);
+    let q_mlp = random_orthonormal(p, 2, 1002);
+
+    let mut w_v = Array2::<f64>::zeros((2, p));
+    for j in 0..p {
+        w_v[[0, j]] = 0.7 * (j as f64 + 1.0);
+        w_v[[1, j]] = if j % 2 == 0 { 1.0 } else { -0.5 };
+    }
+    let ov = q_ov.dot(&w_v);
+
+    let mut down_coeff = Array2::<f64>::zeros((2, 5));
+    for j in 0..5 {
+        down_coeff[[0, j]] = 1.0 + j as f64;
+        down_coeff[[1, j]] = if j % 2 == 0 { 2.0 } else { -1.0 };
+    }
+    let w_down = q_mlp.dot(&down_coeff);
+
+    let components = vec![
+        WeightFrameMatrix::attention_head_ov(3, 14, q_ov.view(), w_v.view()).expect("OV builds"),
+        WeightFrameMatrix::mlp_down_projection(3, w_down.view()),
+    ];
+    let catalog = frame_catalog_from_weight_matrices(
+        &components,
+        &WeightFrameCatalogConfig {
+            frame_rank_min: 2,
+            frame_rank_max: 2,
+            ..Default::default()
+        },
+    )
+    .expect("catalog builds");
+
+    assert_eq!(catalog.entries().len(), 2);
+    assert_eq!(
+        catalog.entries()[0].source,
+        WeightFrameSource::AttentionHeadOv { layer: 3, head: 14 }
+    );
+    assert_eq!(
+        catalog.entries()[1].source,
+        WeightFrameSource::MlpDownProjection { layer: 3 }
+    );
+
+    let ov_frame = catalog.entries()[0].frame.frame().to_owned();
+    let mlp_frame = catalog.entries()[1].frame.frame().to_owned();
+    let ov_projected = project_matrix_onto_frame(&ov, &ov_frame);
+    let mlp_projected = project_matrix_onto_frame(&w_down, &mlp_frame);
+    assert!(
+        relative_frobenius(&ov_projected, &ov) < 1.0e-10,
+        "OV catalog frame must span exactly the OV column image"
+    );
+    assert!(
+        relative_frobenius(&mlp_projected, &w_down) < 1.0e-10,
+        "MLP catalog frame must span exactly the W_down column image"
+    );
+}
+
+#[test]
+fn weight_sourced_atom_fit_is_tagged_with_component_source() {
+    let n = 240;
+    let p = 96;
+    let r = 4;
+    let (residual, q) = planted_curved_residual(n, p, r, 0.02, 0.0, 1414);
+    let mut w_v = Array2::<f64>::zeros((r, p));
+    for j in 0..p {
+        for k in 0..r {
+            w_v[[k, j]] = ((j + 1 + k) as f64).sin();
+        }
+    }
+    let components =
+        vec![WeightFrameMatrix::attention_head_ov(2, 14, q.view(), w_v.view()).expect("OV")];
+    let catalog = frame_catalog_from_weight_matrices(
+        &components,
+        &WeightFrameCatalogConfig {
+            frame_rank_min: r,
+            frame_rank_max: r,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let config = InFrameCurvedConfig {
+        frame_rank_min: r,
+        frame_rank_max: r,
+        min_rows: 16,
+        alpha: 1.0,
+        ..Default::default()
+    };
+    let result = fit_inframe_curved_weight_frame_catalog(
+        residual.view(),
+        &catalog,
+        &[WeightFrameOccupancy {
+            frame_index: 0,
+            rows: (0..n).collect(),
+            basis_size: 5,
+        }],
+        n,
+        &config,
+    )
+    .expect("weight-frame fit");
+
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].occupancy_status, ChartOccupancyStatus::Occupied);
+    assert_eq!(
+        result.records[0].frame_source,
+        Some(WeightFrameSource::AttentionHeadOv { layer: 2, head: 14 }),
+        "occupied atom record must carry native mechanism attribution"
+    );
+    if !result.curved_prediction.regions().is_empty() {
+        assert_eq!(
+            result.curved_prediction.regions()[0].frame_source(),
+            Some(&WeightFrameSource::AttentionHeadOv { layer: 2, head: 14 })
+        );
+    }
+}
+
+#[test]
+fn zero_occupancy_weight_frame_is_reported_chartable_unoccupied() {
+    let n = 160;
+    let p = 64;
+    let r = 3;
+    let (residual, q_used) = planted_curved_residual(n, p, r, 0.03, 0.0, 5150);
+    let q_unused = random_orthonormal(p, r, 5151);
+    let mut coeff = Array2::<f64>::zeros((r, p));
+    for j in 0..p {
+        for k in 0..r {
+            coeff[[k, j]] = ((j + 2 * k + 1) as f64).cos();
+        }
+    }
+    let components = vec![
+        WeightFrameMatrix::attention_head_ov(6, 1, q_used.view(), coeff.view()).expect("OV"),
+        WeightFrameMatrix::mlp_down_projection(6, q_unused.view()),
+    ];
+    let catalog = frame_catalog_from_weight_matrices(
+        &components,
+        &WeightFrameCatalogConfig {
+            frame_rank_min: r,
+            frame_rank_max: r,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let config = InFrameCurvedConfig {
+        frame_rank_min: r,
+        frame_rank_max: r,
+        min_rows: 16,
+        alpha: 1.0,
+        ..Default::default()
+    };
+    let result = fit_inframe_curved_weight_frame_catalog(
+        residual.view(),
+        &catalog,
+        &[
+            WeightFrameOccupancy {
+                frame_index: 0,
+                rows: (0..n).collect(),
+                basis_size: 4,
+            },
+            WeightFrameOccupancy {
+                frame_index: 1,
+                rows: Vec::new(),
+                basis_size: 4,
+            },
+        ],
+        n,
+        &config,
+    )
+    .expect("weight-frame atlas");
+
+    assert_eq!(result.records.len(), 2);
+    let unoccupied = &result.records[1];
+    assert_eq!(
+        unoccupied.occupancy_status,
+        ChartOccupancyStatus::ChartableUnoccupied,
+        "unused weight frame remains in the atlas as chartable but unoccupied here"
+    );
+    assert_eq!(
+        unoccupied.frame_source,
+        Some(WeightFrameSource::MlpDownProjection { layer: 6 })
+    );
+    assert_eq!(unoccupied.evidence.n_rows, 0);
+    assert!(!unoccupied.evidence.accepted);
 }
 
 #[test]
