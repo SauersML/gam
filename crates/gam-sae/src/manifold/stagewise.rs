@@ -677,7 +677,7 @@ fn residual_principal_birth_candidate(
     }
     let m = term.atoms[0].basis_size();
 
-    // #2101 / #2111 CIRCLE SEED via the ISA deflationary producer. A disjoint
+    // #2101 / #2111 CIRCLE SEED via the ISA joint-rotation producer. A disjoint
     // circle occupies a rank-2 PLANE (its cos/sin axes carry ~equal variance),
     // so the residual's dominant structure is a 2-plane, not one direction; and
     // on a DENSE product-of-circles residual whitening exhausts second order,
@@ -688,10 +688,10 @@ fn residual_principal_birth_candidate(
     // contrast `(kappa - 2)^2` (dense clean circle kappa ~ 1, gated circle 1/q,
     // Gaussian blend exactly 2), and accepts only on the analytic-anchor
     // certificate — see `isa_seed` for the math and derivations. ONE clean
-    // circle per birth; the stagewise fit+subtract loop is the deflation
-    // (deflate-by-fitted-curve, which is what refitting on the new residual
-    // does). A residual carrying only blends/saddles certifies nothing and
-    // falls through to the rank-1 seed (no hallucinated circle birth).
+    // circle per single-birth call; the batched path below consumes every
+    // certified plane from one joint split. A residual carrying only
+    // blends/saddles certifies nothing and falls through to the rank-1 seed
+    // (no hallucinated circle birth).
     let template_is_circle =
         matches!(term.atoms[0].basis_kind, SaeAtomBasisKind::Periodic) && m >= 3;
     if template_is_circle && parts.above.len() >= 2 {
@@ -1553,7 +1553,7 @@ pub fn fit_stagewise(
 //
 // [`fit_stagewise_batched`] exploits that: from ONE residual snapshot it
 // harvests MANY candidate seeds (the [`isa_deflationary_producer`] extracts every
-// certifiable circle 2-plane in one deflationary pass — exactly the seed sequence
+// certifiable circle 2-plane from one joint split — exactly the seed set
 // the serial loop would mine one-per-round), RACES their K=1 fits concurrently
 // across cores (rayon), and accepts a DISJOINT batch in one round.
 //
@@ -1610,8 +1610,8 @@ pub fn fit_stagewise(
 // fan-out is a safety BOUND (`max_candidates_per_round`), not a tuning knob.
 
 /// Cost BOUND on the parallel candidate fan-out per batched birth round: the
-/// deflationary producer harvests at most this many certified planes from one
-/// residual snapshot, and they are raced concurrently. A safety bound (like
+/// ISA producer harvests at most this many certified planes from one jointly
+/// rotated residual snapshot, and they are raced concurrently. A safety bound (like
 /// [`StagewiseConfig::max_births`]), NOT a tuning knob — a larger value only
 /// exposes more of the residual's already-present structure to one parallel pass.
 #[derive(Clone, Copy, Debug)]
@@ -1871,8 +1871,8 @@ fn select_disjoint_batch(
 
 /// Batched forward-birth SAC: the parallel-racing counterpart of [`fit_stagewise`]
 /// Phase 1. Each round harvests MANY candidate seeds from one residual snapshot
-/// (the [`isa_deflationary_producer`] deflation sequence, i.e. the seeds the
-/// serial loop would mine one-per-round), RACES their K=1 fits concurrently, and
+/// (the [`isa_deflationary_producer`] joint split, i.e. the seeds the serial
+/// loop would mine one-per-round), RACES their K=1 fits concurrently, and
 /// accepts a maximal DISJOINT-support batch (the batch-OMP orthogonality
 /// criterion documented above). Overlapping passing candidates are requeued to
 /// the next round's residual. Phases 2 (backfitting) and 3 (terminal evidence)
