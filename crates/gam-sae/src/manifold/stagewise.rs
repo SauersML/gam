@@ -492,6 +492,13 @@ struct BirthSeed {
     circle_gate: Option<Vec<f64>>,
 }
 
+fn template_accepts_circle_births(term: &SaeManifoldTerm) -> bool {
+    term.atoms
+        .first()
+        .map(|atom| atom.basis_kind == SaeAtomBasisKind::Periodic && atom.basis_size() >= 3)
+        .unwrap_or(false)
+}
+
 /// Lift a residual-factor direction to an `(m, p)` birth decoder in atom 0's basis:
 /// the `p`-vector direction placed on the constant (row-0) basis row, exactly the
 /// contract [`crate::structure_harvest::apply_structure_move`]'s `Birth` expects
@@ -692,11 +699,13 @@ fn residual_principal_birth_candidate(
     // certified plane from one joint split. A residual carrying only
     // blends/saddles certifies nothing and falls through to the rank-1 seed
     // (no hallucinated circle birth).
-    let template_is_circle =
-        matches!(term.atoms[0].basis_kind, SaeAtomBasisKind::Periodic) && m >= 3;
-    if template_is_circle && parts.above.len() >= 2 {
-        if let Some(cand) =
-            isa_extract_certified_plane(residual, &parts, &IsaSeedConfig::default())
+    if template_accepts_circle_births(term) && parts.above.len() >= 2 {
+        let single_plane_parts = capture_signal_span(residual, 1).ok().flatten();
+        if let Some(cand) = single_plane_parts
+            .as_ref()
+            .and_then(|single| {
+                isa_extract_certified_plane(residual, single, &IsaSeedConfig::default())
+            })
         {
             // Decoder on the cos/sin harmonic rows at the LS harmonic
             // amplitudes; phase chart + own-presence gate carried through
@@ -743,6 +752,22 @@ fn residual_principal_birth_candidate(
         circle_coords: None,
         circle_gate: None,
     })
+}
+
+fn isa_birth_seed_batch(
+    term: &SaeManifoldTerm,
+    residual: ArrayView2<'_, f64>,
+    max_planes: usize,
+) -> Result<Vec<BirthSeed>, String> {
+    if max_planes == 0 || !template_accepts_circle_births(term) {
+        return Ok(Vec::new());
+    }
+    let harvest = isa_deflationary_producer(residual, max_planes, &IsaSeedConfig::default())?;
+    Ok(harvest
+        .planes
+        .iter()
+        .map(|cand| plane_to_birth_seed(term, cand))
+        .collect())
 }
 
 /// Refit a SINGLE atom `k` in place on its leave-one-atom-out partial residual —
@@ -935,6 +960,7 @@ pub fn fit_stagewise(
 
     // ── Phase 1b — forward births ──────────────────────────────────────────────
     let mut birth_round = 0usize;
+    let mut pending_isa_seeds = std::collections::VecDeque::<BirthSeed>::new();
     let stopped_reason = loop {
         // #2138 — bail before starting another birth round if the host cancelled.
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -1000,14 +1026,28 @@ pub fn fit_stagewise(
         // factor model is rank-0 (block-diagonal DISJOINT residual — see
         // `residual_principal_birth_candidate`) but the residual still carries
         // above-noise variance, seed from its dominant principal direction so growth
-        // is not blocked at k=1 on the easy disjoint case. The derived Marchenko–Pastur
-        // noise floor inside the fallback is now the stop criterion (residual is noise
-        // ⇒ `None` ⇒ stop), not `factor_rank == 0`; the evidence gate below stays the
-        // birth-or-stop quality control, so a variance-seeded candidate is safe.
-        let Some(seed) = top_factor_birth_decoder(&term, &model, residual.view())
-            .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
-        else {
-            break StagewiseStop::NoResidualStructure;
+        // is not blocked at k=1 on the easy disjoint case. For ISA-certified circle
+        // residuals, capture the residual span once and queue every jointly-rotated
+        // plane; the serial loop consumes that queue one seed per birth round.
+        let seed = if let Some(seed) = pending_isa_seeds.pop_front() {
+            seed
+        } else {
+            let shared_seed = top_factor_birth_decoder(&term, &model, residual.view());
+            if let Some(seed) = shared_seed {
+                seed
+            } else {
+                let remaining = config.max_births.saturating_sub(births_accepted);
+                for seed in isa_birth_seed_batch(&term, residual.view(), remaining)? {
+                    pending_isa_seeds.push_back(seed);
+                }
+                let Some(seed) = pending_isa_seeds
+                    .pop_front()
+                    .or_else(|| residual_principal_birth_candidate(&term, residual.view()))
+                else {
+                    break StagewiseStop::NoResidualStructure;
+                };
+                seed
+            }
         };
         let factor_energy = seed.energy;
         if config.structured_whitening {

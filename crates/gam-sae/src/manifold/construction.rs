@@ -5364,63 +5364,15 @@ impl SaeManifoldTerm {
                 .sum::<f64>()
                 + sys.gb.iter().map(|&v| v * v).sum::<f64>();
             let grad_norm = grad_norm_sq.sqrt();
-            // Quotient KKT-gradient (#1117): the raw joint gradient retains a
-            // persistent small component in the chart-gauge orbit and the
-            // rank-deficient decoder β-null even at a stationary fit, so the raw
-            // grad gate never clears on a rank-deficient circle and the inner
-            // refine loop crawls until the (large) progress budget dies — the
-            // 2-min stall. Measure the gradient on the SAME identified quotient
-            // the step gate already uses: a fit whose only remaining gradient
-            // lives in those flat directions is stationary on the quotient, so
-            // ranking the Laplace criterion there is correct. The dense per-row
-            // g_t is laid into the `n·q` coordinate layout the gauge basis spans;
-            // non-dense/heterogeneous systems fall back to the raw norm.
-            let quotient_grad_norm = {
-                let n = self.n_obs();
-                let q = self.assignment.row_block_dim();
-                let dense_len = n.saturating_mul(q);
-                let mut grad_ext_coord = Array1::<f64>::zeros(dense_len);
-                let mut dense_layout_ok = sys.rows.len() == n;
-                if dense_layout_ok {
-                    for (row_idx, row) in sys.rows.iter().enumerate() {
-                        let base = sys.row_offsets[row_idx];
-                        let di = sys.row_dims[row_idx];
-                        if base + di > dense_len || row.gt.len() < di {
-                            dense_layout_ok = false;
-                            break;
-                        }
-                        for axis in 0..di {
-                            grad_ext_coord[base + axis] = row.gt[axis];
-                        }
-                    }
-                }
-                if dense_layout_ok {
-                    self.quotient_gradient_norm_sq(
-                        grad_ext_coord.view(),
-                        sys.gb.view(),
-                        grad_norm_sq,
-                        &rho_fixed.lambda_smooth_vec(),
-                    )
-                    .map(|v| v.sqrt())
-                    .unwrap_or(grad_norm)
-                } else {
-                    grad_norm
-                }
-            };
+            let lambda_smooth = rho_fixed.lambda_smooth_vec();
+            let quotient_grad_norm =
+                self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
             let iterate_scale = self.inner_iterate_scale();
-            // Relative parameter-step tolerance for Δ (well-conditioned charts)
-            // and a scaled KKT-gradient tolerance. Convergence is accepted on
-            // EITHER a small KKT gradient OR a small undamped Newton step: SAE
-            // manifold fits contain gauge-like coordinate/decoder directions (the
-            // circle's rotation gauge, decoder column-space rotations) where the
-            // shared-block Hessian is near-singular, so the undamped step can stay
-            // large in that flat direction even at a genuine stationary point; the
-            // gradient, which is not amplified by the inverse, recognises it. With
-            // the isometry Gauss-Newton block now a coherent PSD pullback (no
-            // indefinite Schur pivot), the inner solve reaches true stationarity,
-            // so the gradient tolerance is a standard relative KKT residual rather
-            // than the 0.1.154-regression band-aid (3e-3) that masked the
-            // non-convergence the indefinite curvature caused.
+            // Relative parameter-step tolerance for diagnostics and a scaled
+            // KKT-gradient tolerance for stationarity. Convergence is accepted
+            // only on raw or quotient gradient stationarity; the Newton step is
+            // kept in diagnostics because it can collapse along the chart gauge
+            // before the quotient residual is small.
             let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             if !grad_norm_sq.is_finite() {
@@ -5560,13 +5512,10 @@ impl SaeManifoldTerm {
                     }
                 };
             // The Laplace normaliser ½log|H| is only the correct REML criterion at
-            // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
-            // gradient (KKT stationarity) OR a small undamped Newton step; the
-            // solve is only rejected as non-converged when BOTH are large, i.e.
-            // the iterate is neither stationary nor about to move negligibly. That
-            // disjunction is what keeps an ill-conditioned-but-stationary fit
-            // (small g, large Δ) from being rejected while still refusing to rank
-            // an off-optimum Laplace criterion that is genuinely mid-flight.
+            // the inner optimum (t̂, β̂). Convergence is judged only by raw or
+            // quotient KKT stationarity. The quotient Newton step is diagnostic:
+            // on K=1 near-isotropic clouds it can vanish along the chart gauge
+            // while the objective remains non-stationary.
             let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
                 + delta_beta.iter().map(|&v| v * v).sum::<f64>();
             if !step_norm_sq.is_finite() {
@@ -5581,19 +5530,10 @@ impl SaeManifoldTerm {
                 delta_t.view(),
                 delta_beta.view(),
                 step_norm_sq,
-                &rho_fixed.lambda_smooth_vec(),
+                &lambda_smooth,
             )?;
             let quotient_step_norm = quotient_step_norm_sq.sqrt();
-            // Converge on ANY of: the raw KKT gradient (well-conditioned fit),
-            // the QUOTIENT KKT gradient (#1117 — rank-deficient fit whose only
-            // residual gradient is gauge/null flat-direction crawl), or the
-            // quotient Newton step. The quotient-gradient disjunct is what lets
-            // a rank-deficient K=1 circle terminate in budget instead of crawling
-            // the weakly-identified valley until the refine budget dies.
-            if grad_norm <= grad_tolerance
-                || quotient_grad_norm <= grad_tolerance
-                || quotient_step_norm <= step_tolerance
-            {
+            if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
                 return Ok(cache);
             }
             let refine_limit = Self::refine_iteration_limit(
@@ -5610,10 +5550,11 @@ impl SaeManifoldTerm {
                 // (gradient / quotient-step norms and tolerances) to the caller.
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                     neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
-                     the quotient Newton step ‖Π⊥gauge Δ‖={quotient_step_norm:.6e} \
-                     (raw ‖Δ‖={step_norm:.6e}, tol {step_tolerance:.6e}) met \
-                     tolerance after {total_inner_iter} inner iterations. Refusing to rank an \
+                     neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
+                     ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e}; \
+                     quotient Newton step ‖Π⊥gauge Δ‖={quotient_step_norm:.6e} \
+                     (raw ‖Δ‖={step_norm:.6e}, step tol {step_tolerance:.6e}) is diagnostic only \
+                     after {total_inner_iter} inner iterations. Refusing to rank an \
                      off-optimum Laplace criterion."
                 ));
             }
@@ -5676,7 +5617,30 @@ impl SaeManifoldTerm {
                 if let Ok((_dt, _db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {
-                    return Ok(stationary_cache);
+                    let stationary_grad_norm_sq: f64 = stationary_sys
+                        .rows
+                        .iter()
+                        .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
+                        .sum::<f64>()
+                        + stationary_sys.gb.iter().map(|&v| v * v).sum::<f64>();
+                    let stationary_grad_norm = stationary_grad_norm_sq.sqrt();
+                    let stationary_quotient_grad_norm = self.quotient_gradient_norm_from_system(
+                        &stationary_sys,
+                        stationary_grad_norm_sq,
+                        &lambda_smooth,
+                    );
+                    if stationary_grad_norm <= grad_tolerance
+                        || stationary_quotient_grad_norm <= grad_tolerance
+                    {
+                        return Ok(stationary_cache);
+                    }
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: objective stalled but the stalled \
+                         point is not stationary (‖g‖={stationary_grad_norm:.6e}, \
+                         ‖Π⊥gauge g‖={stationary_quotient_grad_norm:.6e}, \
+                         tol {grad_tolerance:.6e}); refusing to rank an off-optimum \
+                         Laplace criterion"
+                    ));
                 }
                 // Stagnated AND the undamped factor still fails: this is the
                 // numerical fixed point of the inner solve under rank-deficient
@@ -8300,9 +8264,10 @@ impl SaeManifoldTerm {
                             }
                         }
                         deflated_base_dh_mat[[a, b]] = deflated_base_dh;
-                        // gam#2156: softmax-logit traces must differentiate the
-                        // damped evidence log-det, not the auxiliary
-                        // unit-stiffened row block. For deflated rows, contract
+                        // gam#2156: softmax-logit traces differentiate the same
+                        // undamped evidence operator exposed by
+                        // `ArrowFactorCache::arrow_log_det` and
+                        // `arrow_log_det_from_cache`. For deflated rows, contract
                         // the softmax logit t-t derivative against the kept
                         // selected inverse `(H⁻¹)_tt - Σ_i v_i v_iᵀ`; the
                         // Daleckii-Krein correction below then supplies the

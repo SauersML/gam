@@ -1,4 +1,4 @@
-use super::*;
+use super::{ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7,18 +7,32 @@ pub struct Dual {
     pub derivative: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualKinkOp {
+    Abs,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualKinkBranch {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DualKinkBranchRecord {
+    pub op: DualKinkOp,
+    pub branch: DualKinkBranch,
+    pub at_kink: bool,
+    pub left_value: f64,
+    pub right_value: f64,
+}
+
 impl Dual {
     pub fn constant(value: f64) -> Self {
         Self {
             value,
             derivative: 0.0,
-        }
-    }
-
-    pub fn variable(value: f64) -> Self {
-        Self {
-            value,
-            derivative: 1.0,
         }
     }
 
@@ -45,6 +59,40 @@ impl Dual {
         Self {
             value: self.value.recip(),
             derivative: -self.derivative / (self.value * self.value),
+        }
+    }
+
+    pub fn abs(self, certificate: &mut BranchCertificate) -> Self {
+        self.select_max_branch(-self, DualKinkOp::Abs, certificate)
+    }
+
+    pub fn max(self, rhs: Self, certificate: &mut BranchCertificate) -> Self {
+        self.select_max_branch(rhs, DualKinkOp::Max, certificate)
+    }
+
+    fn select_max_branch(
+        self,
+        rhs: Self,
+        op: DualKinkOp,
+        certificate: &mut BranchCertificate,
+    ) -> Self {
+        let at_kink = self.value == rhs.value;
+        let branch = if self.value >= rhs.value {
+            DualKinkBranch::Left
+        } else {
+            DualKinkBranch::Right
+        };
+        certificate.record_kink_branch(DualKinkBranchRecord {
+            op,
+            branch,
+            at_kink,
+            left_value: self.value,
+            right_value: rhs.value,
+        });
+        if branch == DualKinkBranch::Left {
+            self
+        } else {
+            rhs
         }
     }
 }
@@ -180,7 +228,46 @@ impl PivotBranch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EigenDerivativeRoute {
+    IndividualEigenpairs,
+    InvariantSubspaceBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EigenGapCertificate {
+    pub min_eigen_gap: f64,
+    pub threshold: f64,
+    pub scale: f64,
+}
+
+pub fn eigen_gap_threshold(eigen_scale: f64, eigen_count: usize) -> f64 {
+    f64::EPSILON * (eigen_count.max(1) as f64) * eigen_scale.abs().max(1.0)
+}
+
+pub fn eigen_gap_certificate(eigenvalues: &[f64]) -> EigenGapCertificate {
+    let mut finite = eigenvalues
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    finite.sort_by(|left, right| left.total_cmp(right));
+    let scale = finite
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let mut min_eigen_gap = f64::INFINITY;
+    for pair in finite.windows(2) {
+        min_eigen_gap = min_eigen_gap.min((pair[1] - pair[0]).abs());
+    }
+    EigenGapCertificate {
+        min_eigen_gap,
+        threshold: eigen_gap_threshold(scale, finite.len()),
+        scale,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct BranchCertificate {
     pub anchor_mode: MajorizerAnchorMode,
     pub row_dims: Vec<usize>,
@@ -197,12 +284,16 @@ pub struct BranchCertificate {
     pub min_schur_pivot_branch: PivotBranch,
     pub min_pivot_branch: PivotBranch,
     pub max_pivot_branch: PivotBranch,
+    pub min_eigen_gap: f64,
+    pub eigen_gap_threshold: f64,
+    pub kink_branches: Vec<DualKinkBranchRecord>,
 }
 
 impl BranchCertificate {
     pub fn from_arrow_cache(cache: &ArrowFactorCache, anchor_mode: MajorizerAnchorMode) -> Self {
         let min_pivot = arrow_factor_min_pivot(cache);
         let max_pivot = arrow_factor_max_pivot(cache);
+        let eigen_gap = Self::eigen_gap_from_arrow_cache(cache);
         Self {
             anchor_mode,
             row_dims: cache.row_dims.to_vec(),
@@ -231,6 +322,64 @@ impl BranchCertificate {
             min_schur_pivot_branch: PivotBranch::classify(min_pivot.min_schur_pivot),
             min_pivot_branch: PivotBranch::classify(min_pivot.min_pivot),
             max_pivot_branch: PivotBranch::classify(max_pivot),
+            min_eigen_gap: eigen_gap.min_eigen_gap,
+            eigen_gap_threshold: eigen_gap.threshold,
+            kink_branches: Vec::new(),
+        }
+    }
+
+    fn eigen_gap_from_arrow_cache(cache: &ArrowFactorCache) -> EigenGapCertificate {
+        let mut min_eigen_gap = f64::INFINITY;
+        let mut max_scale = 0.0_f64;
+        let mut max_count = 0_usize;
+        for spectrum in cache.deflation_row_spectra.iter().flatten() {
+            let raw = spectrum
+                .raw_evals
+                .as_slice()
+                .expect("row deflation spectrum eigenvalues are contiguous");
+            let gap = eigen_gap_certificate(raw);
+            min_eigen_gap = min_eigen_gap.min(gap.min_eigen_gap);
+            max_scale = max_scale.max(gap.scale);
+            max_count = max_count.max(raw.len());
+        }
+        EigenGapCertificate {
+            min_eigen_gap,
+            threshold: eigen_gap_threshold(max_scale, max_count),
+            scale: max_scale,
+        }
+    }
+
+    pub fn with_eigen_gap(mut self, gap: EigenGapCertificate) -> Self {
+        self.min_eigen_gap = gap.min_eigen_gap;
+        self.eigen_gap_threshold = gap.threshold;
+        self
+    }
+
+    pub fn record_kink_branch(&mut self, record: DualKinkBranchRecord) {
+        self.kink_branches.push(record);
+    }
+
+    /// Route derivatives through individual eigenpairs only when the spectral
+    /// separation is resolved above eigensolver round-off. At degeneracy the
+    /// smooth object is the invariant-subspace block, with derivatives given by
+    /// the block Daleckii-Krein/Sylvester form; individual eigenpairs have a
+    /// genuine kink and must not be reported as a scalar forward-mode result.
+    pub fn eigen_derivative_route(&self) -> EigenDerivativeRoute {
+        if self.min_eigen_gap.is_finite() && self.min_eigen_gap < self.eigen_gap_threshold {
+            EigenDerivativeRoute::InvariantSubspaceBlock
+        } else {
+            EigenDerivativeRoute::IndividualEigenpairs
+        }
+    }
+
+    pub fn assert_derivative_reportable(&self) -> Result<(), BranchCertificateMismatch> {
+        match self.eigen_derivative_route() {
+            EigenDerivativeRoute::IndividualEigenpairs => Ok(()),
+            EigenDerivativeRoute::InvariantSubspaceBlock => Err(BranchCertificateMismatch {
+                changed_fields: vec!["min_eigen_gap".to_string()],
+                baseline: self.clone(),
+                probe: self.clone(),
+            }),
         }
     }
 
@@ -280,6 +429,19 @@ impl BranchCertificate {
         }
         if self.max_pivot_branch != probe.max_pivot_branch {
             changed_fields.push("max_pivot_branch".to_string());
+        }
+        let baseline_eigen_route = self.eigen_derivative_route();
+        let probe_eigen_route = probe.eigen_derivative_route();
+        if baseline_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
+            || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
+            || baseline_eigen_route != probe_eigen_route
+            || self.min_eigen_gap != probe.min_eigen_gap
+            || self.eigen_gap_threshold != probe.eigen_gap_threshold
+        {
+            changed_fields.push("min_eigen_gap".to_string());
+        }
+        if self.kink_branches != probe.kink_branches {
+            changed_fields.push("kink_branches".to_string());
         }
 
         if changed_fields.is_empty() {
@@ -342,10 +504,12 @@ pub fn guarded_exact_trace_report(
     certificate: BranchCertificate,
     channels: Vec<ExactTraceChannel>,
 ) -> Result<ExactTraceReport, BranchCertificateMismatch> {
+    certificate.assert_derivative_reportable()?;
     let mut total_value = 0.0_f64;
     let mut total_derivative = 0.0_f64;
     for channel in &channels {
         certificate.assert_same_branch(&channel.certificate)?;
+        channel.certificate.assert_derivative_reportable()?;
         total_value += channel.value;
         total_derivative += channel.derivative;
     }
@@ -441,6 +605,9 @@ mod tests {
             min_schur_pivot_branch: PivotBranch::Positive,
             min_pivot_branch: PivotBranch::Positive,
             max_pivot_branch: PivotBranch::Positive,
+            min_eigen_gap: f64::INFINITY,
+            eigen_gap_threshold: eigen_gap_threshold(1.0, 0),
+            kink_branches: Vec::new(),
         }
     }
 
@@ -469,6 +636,72 @@ mod tests {
                 .iter()
                 .any(|field| field == "deflated_per_row")
         );
+    }
+
+    #[test]
+    fn planted_eigen_crossing_routes_to_invariant_subspace_block_and_refuses_report() {
+        let near_crossing = eigen_gap_certificate(&[2.0, 2.0]);
+        let cert = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(near_crossing);
+        assert_eq!(
+            cert.eigen_derivative_route(),
+            EigenDerivativeRoute::InvariantSubspaceBlock
+        );
+        let channel = ExactTraceChannel {
+            channel: DerivativeTraceChannel::Other("crossing"),
+            value: 0.0,
+            derivative: 1.044,
+            certificate: cert.clone(),
+        };
+        let err = guarded_exact_trace_report(cert, vec![channel])
+            .expect_err("individual eigenpair derivative must be refused at a crossing");
+        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+    }
+
+    #[test]
+    fn well_separated_spectrum_keeps_individual_eigenpair_route() {
+        let separated = eigen_gap_certificate(&[1.0, 1.5, 3.0]);
+        let cert = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(separated);
+        assert_eq!(
+            cert.eigen_derivative_route(),
+            EigenDerivativeRoute::IndividualEigenpairs
+        );
+        cert.assert_derivative_reportable()
+            .expect("well-separated spectrum is smooth for individual eigenpairs");
+    }
+
+    #[test]
+    fn branch_certificate_refuses_same_near_degenerate_eigen_branch() {
+        let near_crossing = eigen_gap_certificate(&[2.0, 2.0]);
+        let cert = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(near_crossing);
+        let err = cert
+            .assert_same_branch(&cert)
+            .expect_err("same degenerate eigenpair branch still has no scalar derivative");
+        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+    }
+
+    #[test]
+    fn dual_max_records_tie_subgradient_branch_in_certificate() {
+        let mut cert = certificate(MajorizerAnchorMode::FrozenAnchor);
+        let left = Dual::with_derivative(1.0, 2.0);
+        let right = Dual::with_derivative(1.0, -3.0);
+        let chosen = left.max(right, &mut cert);
+        assert_eq!(chosen, left);
+        assert_eq!(cert.kink_branches.len(), 1);
+        assert_eq!(cert.kink_branches[0].op, DualKinkOp::Max);
+        assert_eq!(cert.kink_branches[0].branch, DualKinkBranch::Left);
+        assert!(cert.kink_branches[0].at_kink);
+    }
+
+    #[test]
+    fn dual_abs_records_zero_subgradient_sign_in_certificate() {
+        let mut cert = certificate(MajorizerAnchorMode::FrozenAnchor);
+        let dual = Dual::with_derivative(0.0, 7.0);
+        let chosen = dual.abs(&mut cert);
+        assert_eq!(chosen.derivative, 7.0);
+        assert_eq!(cert.kink_branches.len(), 1);
+        assert_eq!(cert.kink_branches[0].op, DualKinkOp::Abs);
+        assert_eq!(cert.kink_branches[0].branch, DualKinkBranch::Left);
+        assert!(cert.kink_branches[0].at_kink);
     }
 
     #[test]

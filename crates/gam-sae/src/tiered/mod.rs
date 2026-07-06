@@ -64,7 +64,7 @@ use ndarray::{Array1, Array2, ArrayView2, Axis};
 
 use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator};
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, finite_set_rank_charge};
-use crate::sparse_dict::{SparseDictConfig, SparseDictFit};
+use crate::sparse_dict::{DecoderSolveStats, SparseDictConfig, SparseDictFit};
 
 /// Tier-0: the single shared mean μ (length `p`). The global DC lives here, not
 /// duplicated across `K` per-atom intercepts.
@@ -824,6 +824,7 @@ mod tests {
             converged: true,
             active: 2,
             score_route_stats: Default::default(),
+            decoder_solve_stats: DecoderSolveStats::default(),
         };
         let sub = interference_subspace(&fit, Some(2)).expect("subspace");
         assert_eq!(sub.q.dim(), (3, 2));
@@ -884,6 +885,7 @@ mod tests {
             converged: true,
             active: 2,
             score_route_stats: Default::default(),
+            decoder_solve_stats: DecoderSolveStats::default(),
         };
         let sub = interference_subspace(&fit, Some(2)).expect("subspace");
         // The circle's plane (e0, e1) lives ENTIRELY inside Q: ‖Qᵀ e_j‖ ≈ 1.

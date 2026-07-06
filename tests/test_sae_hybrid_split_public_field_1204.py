@@ -49,6 +49,7 @@ def _representative_hybrid_split() -> dict:
                 "curved_ev": 0.82,
                 "topm_linear_ev": 0.91,
                 "curved_vs_envelope_ratio": 0.9010989010989011,
+                "chart_efficiency_eta": 0.9010989010989011,
             },
             {
                 "atom": "atom_1",
@@ -62,6 +63,7 @@ def _representative_hybrid_split() -> dict:
                 "curved_ev": 0.18,
                 "topm_linear_ev": 0.42,
                 "curved_vs_envelope_ratio": 0.42857142857142855,
+                "chart_efficiency_eta": 0.42857142857142855,
             },
         ],
     }
@@ -125,6 +127,9 @@ def test_to_dict_emits_hybrid_split():
     assert d["hybrid_split"]["atoms"][1]["curved_vs_envelope_ratio"] == pytest.approx(
         0.42857142857142855
     )
+    assert d["hybrid_split"]["atoms"][0]["chart_efficiency_eta"] == pytest.approx(
+        0.9010989010989011
+    )
 
 
 def test_to_dict_emits_none_when_absent():
@@ -145,6 +150,9 @@ def test_hybrid_split_round_trips_through_from_dict():
     assert restored.hybrid_split["atoms"][0]["topm_linear_ev"] == pytest.approx(0.91)
     assert restored.hybrid_split["atoms"][0]["curved_vs_envelope_ratio"] == pytest.approx(
         0.9010989010989011
+    )
+    assert restored.hybrid_split["atoms"][1]["chart_efficiency_eta"] == pytest.approx(
+        0.42857142857142855
     )
     assert restored.hybrid_split["atoms"][1]["parameterization"] == "linear"
 

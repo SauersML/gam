@@ -6,23 +6,53 @@ pub struct Dual {
     pub eps: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualKinkOp {
+    Abs,
+    Max,
+    Min,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualKinkBranch {
+    Left,
+    Right,
+    Tie,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DualKinkBranchRecord {
+    pub op: DualKinkOp,
+    pub branch: DualKinkBranch,
+    pub left_re: f64,
+    pub right_re: f64,
+}
+
 impl Dual {
-    pub(crate) fn constant(re: f64) -> Self {
+    pub fn constant(re: f64) -> Self {
         Self { re, eps: 0.0 }
     }
 
-    pub(crate) fn with_eps(re: f64, eps: f64) -> Self {
+    pub fn variable(re: f64) -> Self {
+        Self { re, eps: 1.0 }
+    }
+
+    pub fn with_eps(re: f64, eps: f64) -> Self {
         Self { re, eps }
     }
 
-    pub(crate) fn ln(self) -> Self {
+    pub fn with_derivative(re: f64, eps: f64) -> Self {
+        Self { re, eps }
+    }
+
+    pub fn ln(self) -> Self {
         Self {
             re: self.re.ln(),
             eps: self.eps / self.re,
         }
     }
 
-    pub(crate) fn sqrt(self) -> Self {
+    pub fn sqrt(self) -> Self {
         let root = self.re.sqrt();
         Self {
             re: root,
@@ -30,19 +60,62 @@ impl Dual {
         }
     }
 
-    pub(crate) fn recip(self) -> Self {
+    pub fn recip(self) -> Self {
         Self {
             re: self.re.recip(),
             eps: -self.eps / (self.re * self.re),
         }
     }
 
-    pub(crate) fn abs(self) -> Self {
-        self.max(-self)
+    pub fn abs_with_branch(self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
+        self.choose_max_with_branch(-self, DualKinkOp::Abs, branches)
     }
 
-    pub(crate) fn max(self, rhs: Self) -> Self {
-        if self.re >= rhs.re {
+    pub fn max_with_branch(self, rhs: Self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
+        self.choose_max_with_branch(rhs, DualKinkOp::Max, branches)
+    }
+
+    fn choose_max_with_branch(
+        self,
+        rhs: Self,
+        op: DualKinkOp,
+        branches: &mut Vec<DualKinkBranchRecord>,
+    ) -> Self {
+        let branch = if self.re > rhs.re {
+            DualKinkBranch::Left
+        } else if self.re < rhs.re {
+            DualKinkBranch::Right
+        } else {
+            DualKinkBranch::Tie
+        };
+        branches.push(DualKinkBranchRecord {
+            op,
+            branch,
+            left_re: self.re,
+            right_re: rhs.re,
+        });
+        if matches!(branch, DualKinkBranch::Left | DualKinkBranch::Tie) {
+            self
+        } else {
+            rhs
+        }
+    }
+
+    pub fn min_with_branch(self, rhs: Self, branches: &mut Vec<DualKinkBranchRecord>) -> Self {
+        let branch = if self.re < rhs.re {
+            DualKinkBranch::Left
+        } else if self.re > rhs.re {
+            DualKinkBranch::Right
+        } else {
+            DualKinkBranch::Tie
+        };
+        branches.push(DualKinkBranchRecord {
+            op: DualKinkOp::Min,
+            branch,
+            left_re: self.re,
+            right_re: rhs.re,
+        });
+        if matches!(branch, DualKinkBranch::Left | DualKinkBranch::Tie) {
             self
         } else {
             rhs
