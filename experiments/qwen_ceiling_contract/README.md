@@ -22,3 +22,16 @@ The verdict tree is:
 - `eta below near-one band` and failing gradient certificate -> `RESIDUAL_ADJOINT_BUG`.
 
 This makes the K=1 ceiling experiment interpretable after sink peeling: a raw run can be dominated by the position-0 sink, while a peeled run tests whether the single-chart image is already at its top-`M` linear envelope.
+
+The scale/ceiling harness refuses raw activation matrices by default. Run the
+scale experiment on a post-peel, PCA-reduced `.npy` and declare that contract:
+
+```text
+cargo run -p gam-sae --example scale_k -- <post_peel_pca.npy> <out-dir> \
+  --post-peel --n-peeled 1 --pca-dim <D> [--rows N] [--atoms K] [--epochs N]
+```
+
+An intentional raw/full-width run must pass `--raw-ok`; otherwise the harness
+errors before allocating the `K x p` decoder. `numbers.json` records the run
+contract as `N`, `p`, `K`, `post_peel`, `n_peeled`, `pca_dim`, and `peak_rss`,
+with the peak-RSS no-`N x K` allocation invariant surfaced beside it.
