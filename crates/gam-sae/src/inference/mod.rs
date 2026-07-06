@@ -9,6 +9,7 @@
 
 pub mod atom_geometry;
 pub mod atom_lens;
+pub mod atlas_nerve;
 pub mod checkpoint_dynamics;
 pub mod contracts;
 pub mod cross_model_transport;
