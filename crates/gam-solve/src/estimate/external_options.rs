@@ -106,6 +106,15 @@ pub(crate) fn resolve_external_family(
         | (ResponseFamily::Binomial, LinkFunction::Logit)
         | (ResponseFamily::Binomial, LinkFunction::Probit)
         | (ResponseFamily::Binomial, LinkFunction::CLogLog)
+        // LogLog and Cauchit are ordinary state-less probability links: they
+        // narrow into `StandardLink` (gam-spec), carry a full 5-jet Fisher
+        // weight (`fisher_weight_jet5` → `component_fisher_weight_jet5` for
+        // LinkComponent::{LogLog,Cauchit}), and their inverse-link jets live
+        // in `mixture_link.rs` — the exact same external-design/P-IRLS
+        // machinery probit/cloglog ride. #2104 un-gated them at validation
+        // (`link_legal_for_family`); this is the fitting half of that wiring.
+        | (ResponseFamily::Binomial, LinkFunction::LogLog)
+        | (ResponseFamily::Binomial, LinkFunction::Cauchit)
         | (ResponseFamily::Binomial, LinkFunction::Sas)
         | (ResponseFamily::Binomial, LinkFunction::BetaLogistic) => true,
         // Beta regression with a constant precision φ is a genuine-dispersion
@@ -122,7 +131,7 @@ pub(crate) fn resolve_external_family(
     if !external_glm_supported {
         crate::bail_invalid_estim!(
             "optimize_external_design requires a supported standard GLM family/link; got {}. \
-             The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/SAS/Beta-Logistic), \
+             The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/loglog/cauchit/SAS/Beta-Logistic), \
              Beta(logit), and Poisson/Gamma/Tweedie/Negative-Binomial(log). For Beta precision modeling \
              add a noise_formula to upgrade to the dispersion-location-scale route",
             family.pretty_name(),
