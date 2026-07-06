@@ -15,10 +15,23 @@ pub const SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES: usize = 1 << 24;
 
 /// Posterior uncertainty of one fitted atom's manifold shape.
 ///
-/// Produced by [`SaeManifoldTerm::assemble_shape_uncertainty`]. The covariance
-/// is the φ-scaled β-block of the joint inverse Hessian (coordinates
-/// marginalized out); the band is its closed-form push-forward through the
-/// linear basis→ambient map `m_k(t) = Φ_k(t)·B_k`.
+/// In the primary path — [`SaeManifoldTerm::assemble_shape_uncertainty`], and
+/// after a structure/finalization change its final-state twin
+/// [`SaeManifoldTerm::recompute_joint_shape_uncertainty`] — the covariance is
+/// the φ-scaled β-block of the JOINT inverse Hessian (coordinates marginalized
+/// out); the band is its closed-form push-forward through the linear
+/// basis→ambient map `m_k(t) = Φ_k(t)·B_k`. This is what the production fit
+/// returns.
+///
+/// Two reachable fallbacks produce a WEAKER band and say so honestly at the
+/// field level (`decoder_covariance: None`, and the `band_sd` doc below): the
+/// per-atom Laplace marginal [`SaeManifoldTerm::complete_born_atom_shape_bands`]
+/// fills (used only when the joint factor genuinely could not cover an atom —
+/// it DROPS cross-atom covariance and the decoder-coordinate Schur couplings, so
+/// its `band_sd` is identical across output channels), and the all-NaN
+/// [`SaeManifoldTerm::shape_uncertainty_without_decoder_covariance`] (LLM-scale
+/// fits with no dense joint Schur). Neither is silently dressed up as the joint
+/// covariance.
 #[derive(Debug, Clone)]
 pub struct SaeAtomShapeUncertainty {
     /// φ-scaled posterior covariance of this atom's decoder coefficients,
