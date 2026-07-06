@@ -573,6 +573,52 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
 }
 
 #[test]
+fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
+    // #2087/#1416 root cause guard: the IBP log-det θ-adjoint differentiates the
+    // same cross-row rank-one coefficient `d_k = w·score'_k` that the Hessian
+    // assembly puts into the Woodbury block. Its mass channel must therefore be
+    // `∂d_k/∂M_k = w·score''_k`, not a hand-expanded surrogate with a missing
+    // posterior-π Jacobian factor. Perturbing every row in one column by the same
+    // concrete-probability amount gives a direct central difference of `d_k` with
+    // respect to the empirical mass `M_k`.
+    let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
+    let t = array![
+        0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
+    ];
+    let rho = Array1::<f64>::zeros(0);
+    let raw = pen.hessian_diag_logit_third_channels(t.view(), rho.view(), false);
+    let eps = 1.0e-6_f64;
+    let tau = 0.8_f64;
+    let z = t.mapv(|logit| 1.0 / (1.0 + (-logit / tau).exp()));
+    let n = t.len() / pen.k_max;
+    for col in 0..pen.k_max {
+        let mut plus = t.clone();
+        let mut minus = t.clone();
+        for row in 0..n {
+            let idx = row * pen.k_max + col;
+            // Convert a probability-space perturbation `±eps` to the logit-space
+            // perturbation that realizes it to first order: dz = J dℓ. The
+            // fixture is comfortably interior, so every Jacobian is nonzero.
+            let jac = z[idx] * (1.0 - z[idx]) / tau;
+            plus[idx] += eps / jac;
+            minus[idx] -= eps / jac;
+        }
+        let d_plus = pen
+            .hessian_diag_logit_third_channels(plus.view(), rho.view(), false)
+            .cross_row_d[col];
+        let d_minus = pen
+            .hessian_diag_logit_third_channels(minus.view(), rho.view(), false)
+            .cross_row_d[col];
+        let fd = (d_plus - d_minus) / (2.0 * eps * n as f64);
+        assert!(
+            (raw.cross_row_dd[col] - fd).abs() <= 2.0e-6,
+            "column {col}: cross_row_dd={} must match ∂cross_row_d/∂M={fd}",
+            raw.cross_row_dd[col]
+        );
+    }
+}
+
+#[test]
 fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
     let t = array![
