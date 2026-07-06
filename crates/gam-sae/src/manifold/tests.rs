@@ -40,7 +40,7 @@ pub(crate) fn assert_eta_one_parity(
     assert_matrix_same_bits(&eta.phi, &phi);
     assert_tensor3_same_bits(&eta.jet, &jet);
     assert_eq!(eta.split.curved_cols.len(), expected_curved);
-    for &col in &eta.split.linear_cols {
+    for &col in &eta.split.base_cols {
         for row in 0..phi.nrows() {
             assert_eq!(eta.dphi_deta[[row, col]], 0.0);
             for axis in 0..jet.shape()[2] {
