@@ -63,7 +63,8 @@
 //! No magic ε.
 
 use crate::coactivation_conditionality::{
-    CoactivationConditionality, estimate_on_rows, residual_gate_activities,
+    CoactivationConditionality, VaryingCoefficientConfig, estimate_on_rows,
+    residual_gate_activities,
 };
 use ndarray::{Array1, ArrayView2};
 
@@ -190,10 +191,12 @@ pub fn screen_pair_with_contexts(
     let eb = plane_energies(data, mean, cand_b);
     let n = ea.r2.len();
     let n_co_active = (0..n).filter(|&i| ea.active[i] && eb.active[i]).count();
-    let conditionality = residual_conditionality(&ea, &eb, context_labels, shared_chart);
+    let continuous_context = pair_continuous_context(&ea, &eb);
+    let conditionality =
+        residual_conditionality(&ea, &eb, &continuous_context, context_labels, shared_chart);
     let conditional_stable = conditionality
         .as_ref()
-        .map(|c| c.stable_for_structure_search)
+        .map(partition_free_conditional_stable)
         .unwrap_or(false);
     let unresolved = PairVerdict {
         atom_a,
@@ -286,11 +289,12 @@ pub fn screen_all_pairs(
 fn residual_conditionality(
     ea: &PlaneEnergies,
     eb: &PlaneEnergies,
+    continuous_context: &[f64],
     context_labels: &[usize],
     shared_chart: Option<ArrayView2<'_, f64>>,
 ) -> Option<CoactivationConditionality> {
     let n = ea.active.len();
-    if context_labels.len() != n {
+    if context_labels.len() != n || continuous_context.len() != n {
         return None;
     }
     let rows: Vec<usize> = (0..n).collect();
@@ -307,13 +311,31 @@ fn residual_conditionality(
         .collect();
     let activities = residual_gate_activities(&gate_a, &gate_b, shared_chart, &weights, 0.0).ok()?;
     estimate_on_rows(
-        &activities.active_i,
-        &activities.active_j,
-        context_labels,
+        &activities.residual_i,
+        &activities.residual_j,
+        continuous_context,
+        Some(context_labels),
         &rows,
         &weights,
+        VaryingCoefficientConfig::default(),
     )
     .ok()
+}
+
+fn pair_continuous_context(ea: &PlaneEnergies, eb: &PlaneEnergies) -> Vec<f64> {
+    ea.r2.iter()
+        .zip(eb.r2.iter())
+        .map(|(&a, &b)| (a + b).ln_1p())
+        .collect()
+}
+
+fn partition_free_conditional_stable(c: &CoactivationConditionality) -> bool {
+    let drift = c.native.beta_wiggliness.max(0.0) + c.native.beta_variation.max(0.0);
+    if c.certificate.robustness_radius_epsilon.is_infinite() {
+        return true;
+    }
+    c.certificate.robustness_radius_epsilon.is_finite()
+        && c.certificate.robustness_radius_epsilon > drift
 }
 
 #[cfg(test)]

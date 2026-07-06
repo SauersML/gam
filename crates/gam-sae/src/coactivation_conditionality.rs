@@ -1,45 +1,108 @@
-//! Context-conditional coactivation diagnostics for structure search.
+//! Partition-free coactivation conditionality for structure search.
 //!
-//! Pooled coactivation is a marginal statistic: it cannot distinguish an
-//! invariant binding from a pair of atoms that only co-occur in one partition of
-//! the corpus. This module estimates the directional conditional
-//! `P(j active | i active, context)` on the same designed row reservoirs used by
-//! the certifiers, carrying Horvitz-Thompson row weights through every count.
+//! The definition here has two parts:
 //!
-//! The intended gate is the dispersion across contexts, not the pooled
-//! correlation. Low directional variance reads as structural binding; a sign
-//! flip in the centered association across contexts is reported as direct
-//! evidence that the pooled statistic was a partition artifact.
+//! * a native varying-coefficient GAM, `gate_j ~ beta(x) * gate_i`, where `x` is
+//!   a continuous context summary and the `by=` design columns are the spline
+//!   basis for `x` multiplied rowwise by `gate_i`;
+//! * a distribution-free KL certificate for the pooled coupling statistic.  If
+//!   `psi` is the per-row influence contribution for the weighted correlation
+//!   `rho`, then any first-order distribution shift with KL budget `epsilon`
+//!   changes `rho` by at most `sqrt(2 * epsilon * Var(psi))`.
+//!
+//! Discrete context labels are accepted only by the diagnostic naming helper at
+//! the bottom of the module. They are not part of the conditionality metric.
 
 use gam_solve::row_sampling_measure::{DesignedRowSample, MeasureProvenance, RowSamplingMeasure};
-use ndarray::ArrayView2;
+use gam_terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use ndarray::{Array1, ArrayView2};
 use std::collections::BTreeMap;
 
-/// One context's weighted directional conditional estimates.
+const DEFAULT_SPLINE_DEGREE: usize = 3;
+const DEFAULT_INTERNAL_KNOTS: usize = 5;
+const DEFAULT_PENALTY_ORDER: usize = 1;
+const BRACKET_EXPANSION_LIMIT: usize = 48;
+const BRENT_ITERATION_LIMIT: usize = 96;
+const BRENT_REL_TOL: f64 = 1.0e-8;
+const MIN_RESIDUAL_DF: f64 = 1.0;
+
+/// Configuration for the native varying-coefficient GAM conditionality fit.
+#[derive(Clone, Copy, Debug)]
+pub struct VaryingCoefficientConfig {
+    pub spline_degree: usize,
+    pub num_internal_knots: usize,
+    /// Difference penalty order on the varying coefficient. Order 1 makes the
+    /// penalty nullspace exactly the constant-coupling model.
+    pub penalty_order: usize,
+}
+
+impl Default for VaryingCoefficientConfig {
+    fn default() -> Self {
+        Self {
+            spline_degree: DEFAULT_SPLINE_DEGREE,
+            num_internal_knots: DEFAULT_INTERNAL_KNOTS,
+            penalty_order: DEFAULT_PENALTY_ORDER,
+        }
+    }
+}
+
+/// Native partition-free conditionality: a by-smooth coefficient beta(x).
 #[derive(Clone, Debug)]
-pub struct ContextConditional {
+pub struct VaryingCoefficientConditionality {
+    pub selected_log_smoothing: f64,
+    pub reml_score: f64,
+    pub effective_degrees: f64,
+    pub beta_wiggliness: f64,
+    pub beta_variation: f64,
+    pub beta_mean: f64,
+    pub coefficients: Vec<f64>,
+    pub beta_at_rows: Vec<f64>,
+}
+
+/// Influence-function KL certificate for the pooled coupling.
+#[derive(Clone, Debug)]
+pub struct RobustCouplingCertificate {
+    pub rho: f64,
+    pub influence_variance: f64,
+    pub robustness_radius_epsilon: f64,
+    pub influence_mean_abs: f64,
+}
+
+impl RobustCouplingCertificate {
+    /// First-order lower bound on the coupling after an arbitrary KL-`epsilon`
+    /// distribution shift.
+    pub fn worst_case_coupling(&self, epsilon: f64) -> Result<f64, String> {
+        if !(epsilon.is_finite() && epsilon >= 0.0) {
+            return Err(format!(
+                "worst_case_coupling: epsilon must be finite and >= 0, got {epsilon}"
+            ));
+        }
+        Ok(self.rho - (2.0 * epsilon * self.influence_variance).sqrt())
+    }
+}
+
+/// Optional diagnostic that names where a continuous coupling varies after the
+/// metric has already been computed.
+#[derive(Clone, Debug)]
+pub struct ContextDiagnostic {
     pub context: usize,
     pub rows: usize,
     pub mass: f64,
-    pub denom_i: f64,
-    pub denom_j: f64,
-    pub pi_j_given_i: Option<f64>,
-    pub pi_i_given_j: Option<f64>,
+    pub mean_gate_i: f64,
+    pub mean_gate_j: f64,
+    pub mean_beta: f64,
     pub centered_association: f64,
 }
 
-/// Across-context conditionality report for one ordered pair and its reverse.
+/// Partition-free conditionality report for one ordered pair.
 #[derive(Clone, Debug)]
 pub struct CoactivationConditionality {
-    pub contexts: Vec<ContextConditional>,
-    pub var_j_given_i: f64,
-    pub var_i_given_j: f64,
-    pub sampling_var_j_given_i: f64,
-    pub sampling_var_i_given_j: f64,
-    pub sign_instability: bool,
-    pub stable_for_structure_search: bool,
-    pub valid_j_given_i_contexts: usize,
-    pub valid_i_given_j_contexts: usize,
+    pub native: VaryingCoefficientConditionality,
+    pub certificate: RobustCouplingCertificate,
+    /// Scalar intended for merge/fusion ranking. Large values mean the pair has
+    /// a robust pooled coupling and little continuous-context coefficient drift.
+    pub fusion_gate_score: f64,
+    pub diagnostics: Vec<ContextDiagnostic>,
 }
 
 /// Residual-gate materialization after the shared chart has been projected out.
@@ -51,124 +114,215 @@ pub struct ResidualGateActivities {
     pub active_j: Vec<bool>,
 }
 
-/// Evaluate conditionality on a deterministic designed subsample from a
-/// [`RowSamplingMeasure`]. The returned estimate uses exactly the sample rows
-/// and `1/pi` honesty weights produced by the measure.
+/// Evaluate partition-free conditionality on a deterministic designed subsample
+/// from a [`RowSamplingMeasure`].
 pub fn estimate_from_measure(
-    active_i: &[bool],
-    active_j: &[bool],
-    context_labels: &[usize],
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    diagnostic_labels: Option<&[usize]>,
     measure: &RowSamplingMeasure,
     budget: usize,
     seed: u64,
+    config: VaryingCoefficientConfig,
 ) -> Result<CoactivationConditionality, String> {
-    if measure.n_rows() != active_i.len() {
+    if measure.n_rows() != gate_i.len() {
         return Err(format!(
             "estimate_from_measure: measure has {} rows, gates have {}",
             measure.n_rows(),
-            active_i.len()
+            gate_i.len()
         ));
     }
     let sample = measure.designed_subsample(budget, seed);
-    estimate_from_designed_sample(active_i, active_j, context_labels, &sample)
-}
-
-/// Evaluate conditionality on an already-drawn designed sample.
-pub fn estimate_from_designed_sample(
-    active_i: &[bool],
-    active_j: &[bool],
-    context_labels: &[usize],
-    sample: &DesignedRowSample,
-) -> Result<CoactivationConditionality, String> {
-    estimate_on_rows(
-        active_i,
-        active_j,
-        context_labels,
-        &sample.rows,
-        &sample.likelihood_weights,
+    estimate_from_designed_sample(
+        gate_i,
+        gate_j,
+        continuous_context,
+        diagnostic_labels,
+        &sample,
+        config,
     )
 }
 
-/// Evaluate conditionality on explicit selected rows and per-row honesty
-/// weights. This is the common implementation used by both synthetic tests and
-/// production designed reservoirs.
+/// Evaluate partition-free conditionality on an already-drawn designed sample.
+pub fn estimate_from_designed_sample(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    diagnostic_labels: Option<&[usize]>,
+    sample: &DesignedRowSample,
+    config: VaryingCoefficientConfig,
+) -> Result<CoactivationConditionality, String> {
+    estimate_on_rows(
+        gate_i,
+        gate_j,
+        continuous_context,
+        diagnostic_labels,
+        &sample.rows,
+        &sample.likelihood_weights,
+        config,
+    )
+}
+
+/// Evaluate partition-free conditionality on explicit selected rows and per-row
+/// honesty weights.
 pub fn estimate_on_rows(
-    active_i: &[bool],
-    active_j: &[bool],
-    context_labels: &[usize],
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    diagnostic_labels: Option<&[usize]>,
     rows: &[usize],
     likelihood_weights: &[f64],
+    config: VaryingCoefficientConfig,
 ) -> Result<CoactivationConditionality, String> {
-    validate_inputs(active_i, active_j, context_labels, rows, likelihood_weights)?;
-
-    let mut accum: BTreeMap<usize, ContextAccum> = BTreeMap::new();
-    for (slot, &row) in rows.iter().enumerate() {
-        let w = likelihood_weights[slot];
-        let entry = accum.entry(context_labels[row]).or_default();
-        entry.rows += 1;
-        entry.mass += w;
-        let ai = active_i[row];
-        let aj = active_j[row];
-        if ai {
-            entry.i += w;
-            entry.i_sq += w * w;
-        }
-        if aj {
-            entry.j += w;
-            entry.j_sq += w * w;
-        }
-        if ai && aj {
-            entry.ij += w;
-        }
-    }
-
-    let total_mass: f64 = accum.values().map(|a| a.mass).sum();
-    let mut contexts = Vec::with_capacity(accum.len());
-    let mut positives = 0usize;
-    let mut negatives = 0usize;
-
-    for (&context, a) in accum.iter() {
-        let pi = if a.mass > 0.0 { a.i / a.mass } else { 0.0 };
-        let pj = if a.mass > 0.0 { a.j / a.mass } else { 0.0 };
-        let pij = if a.mass > 0.0 { a.ij / a.mass } else { 0.0 };
-        let association = pij - pi * pj;
-        if association > association_sign_floor(a.mass, total_mass) {
-            positives += 1;
-        }
-        if association < -association_sign_floor(a.mass, total_mass) {
-            negatives += 1;
-        }
-        contexts.push(ContextConditional {
-            context,
-            rows: a.rows,
-            mass: a.mass,
-            denom_i: a.i,
-            denom_j: a.j,
-            pi_j_given_i: (a.i > 0.0).then_some(a.ij / a.i),
-            pi_i_given_j: (a.j > 0.0).then_some(a.ij / a.j),
-            centered_association: association,
-        });
-    }
-
-    let stats_j_given_i = directional_stats(&contexts, accum.values(), Direction::JGivenI);
-    let stats_i_given_j = directional_stats(&contexts, accum.values(), Direction::IGivenJ);
-    let sign_instability = positives > 0 && negatives > 0;
-    let stable_for_structure_search = stats_j_given_i.valid_contexts > 0
-        && stats_i_given_j.valid_contexts > 0
-        && !sign_instability
-        && stats_j_given_i.observed_var <= stats_j_given_i.sampling_var
-        && stats_i_given_j.observed_var <= stats_i_given_j.sampling_var;
-
+    validate_partition_free_inputs(
+        gate_i,
+        gate_j,
+        continuous_context,
+        diagnostic_labels,
+        rows,
+        likelihood_weights,
+    )?;
+    let native = fit_varying_coefficient_gam(
+        gate_i,
+        gate_j,
+        continuous_context,
+        rows,
+        likelihood_weights,
+        config,
+    )?;
+    let influence = coupling_influence_values(gate_i, gate_j, rows, likelihood_weights)?;
+    let certificate = influence.certificate();
+    let fusion_gate_score = certificate.robustness_radius_epsilon
+        / (1.0 + native.beta_wiggliness.max(0.0) + native.beta_variation.max(0.0));
+    let diagnostics = match diagnostic_labels {
+        Some(labels) => diagnose_context_labels(
+            gate_i,
+            gate_j,
+            labels,
+            rows,
+            likelihood_weights,
+            &native.beta_at_rows,
+        )?,
+        None => Vec::new(),
+    };
     Ok(CoactivationConditionality {
-        contexts,
-        var_j_given_i: stats_j_given_i.observed_var,
-        var_i_given_j: stats_i_given_j.observed_var,
-        sampling_var_j_given_i: stats_j_given_i.sampling_var,
-        sampling_var_i_given_j: stats_i_given_j.sampling_var,
-        sign_instability,
-        stable_for_structure_search,
-        valid_j_given_i_contexts: stats_j_given_i.valid_contexts,
-        valid_i_given_j_contexts: stats_i_given_j.valid_contexts,
+        native,
+        certificate,
+        fusion_gate_score,
+        diagnostics,
+    })
+}
+
+/// Full influence vector for the weighted Pearson coupling statistic.
+#[derive(Clone, Debug)]
+pub struct CouplingInfluence {
+    pub rho: f64,
+    pub psi: Vec<f64>,
+    pub normalized_weights: Vec<f64>,
+}
+
+impl CouplingInfluence {
+    pub fn certificate(&self) -> RobustCouplingCertificate {
+        let mut variance = 0.0_f64;
+        let mut mean_abs = 0.0_f64;
+        for slot in 0..self.psi.len() {
+            let q = self.normalized_weights[slot];
+            let psi = self.psi[slot];
+            variance += q * psi * psi;
+            mean_abs += q * psi.abs();
+        }
+        let robustness_radius_epsilon = if variance > 0.0 {
+            self.rho * self.rho / (2.0 * variance)
+        } else if self.rho == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+        RobustCouplingCertificate {
+            rho: self.rho,
+            influence_variance: variance,
+            robustness_radius_epsilon,
+            influence_mean_abs: mean_abs,
+        }
+    }
+}
+
+/// Per-row influence contributions for the weighted Pearson correlation between
+/// the two gate streams over the selected sample.
+pub fn coupling_influence_values(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    rows: &[usize],
+    likelihood_weights: &[f64],
+) -> Result<CouplingInfluence, String> {
+    if rows.len() != likelihood_weights.len() {
+        return Err(format!(
+            "coupling_influence_values: {} rows but {} weights",
+            rows.len(),
+            likelihood_weights.len()
+        ));
+    }
+    if rows.is_empty() {
+        return Err("coupling_influence_values: need at least one sampled row".to_string());
+    }
+    let mut total_weight = 0.0_f64;
+    for (slot, &row) in rows.iter().enumerate() {
+        if row >= gate_i.len() || row >= gate_j.len() {
+            return Err(format!(
+                "coupling_influence_values: sampled row {row} out of range"
+            ));
+        }
+        let w = likelihood_weights[slot];
+        if !(w.is_finite() && w > 0.0) {
+            return Err(format!(
+                "coupling_influence_values: sampled row {row} has invalid weight {w}"
+            ));
+        }
+        total_weight += w;
+    }
+    let normalized_weights: Vec<f64> = likelihood_weights
+        .iter()
+        .map(|&w| w / total_weight)
+        .collect();
+
+    let mut mean_i = 0.0_f64;
+    let mut mean_j = 0.0_f64;
+    for (slot, &row) in rows.iter().enumerate() {
+        let q = normalized_weights[slot];
+        mean_i += q * gate_i[row];
+        mean_j += q * gate_j[row];
+    }
+    let mut var_i = 0.0_f64;
+    let mut var_j = 0.0_f64;
+    let mut cov = 0.0_f64;
+    for (slot, &row) in rows.iter().enumerate() {
+        let q = normalized_weights[slot];
+        let zi = gate_i[row] - mean_i;
+        let zj = gate_j[row] - mean_j;
+        var_i += q * zi * zi;
+        var_j += q * zj * zj;
+        cov += q * zi * zj;
+    }
+    if !(var_i > 0.0 && var_j > 0.0) {
+        return Err(
+            "coupling_influence_values: both gates need positive weighted variance".to_string(),
+        );
+    }
+    let sd_i = var_i.sqrt();
+    let sd_j = var_j.sqrt();
+    let rho = (cov / (sd_i * sd_j)).clamp(-1.0, 1.0);
+    let mut psi = Vec::with_capacity(rows.len());
+    for &row in rows {
+        let zi = (gate_i[row] - mean_i) / sd_i;
+        let zj = (gate_j[row] - mean_j) / sd_j;
+        let value = zi * zj - rho - 0.5 * rho * (zi * zi - 1.0 + zj * zj - 1.0);
+        psi.push(value);
+    }
+    Ok(CouplingInfluence {
+        rho,
+        psi,
+        normalized_weights,
     })
 }
 
@@ -218,9 +372,8 @@ pub fn residual_gate_activities(
     })
 }
 
-/// Deterministic residual-cluster labels from explicit centroids. This accepts
-/// centroids instead of learning them so structure search can use the same
-/// chart/residual summaries that produced its strata.
+/// Deterministic residual-cluster labels from explicit centroids. These labels
+/// are naming diagnostics only; they never define conditionality.
 pub fn derive_residual_cluster_labels(
     residuals: ArrayView2<'_, f64>,
     centroids: ArrayView2<'_, f64>,
@@ -265,43 +418,29 @@ pub fn full_pass_rows(n: usize) -> DesignedRowSample {
     }
 }
 
-#[derive(Default)]
-struct ContextAccum {
-    rows: usize,
-    mass: f64,
-    i: f64,
-    i_sq: f64,
-    j: f64,
-    j_sq: f64,
-    ij: f64,
-}
-
-#[derive(Clone, Copy)]
-enum Direction {
-    JGivenI,
-    IGivenJ,
-}
-
-struct DirectionalStats {
-    observed_var: f64,
-    sampling_var: f64,
-    valid_contexts: usize,
-}
-
-fn validate_inputs(
-    active_i: &[bool],
-    active_j: &[bool],
-    context_labels: &[usize],
+fn validate_partition_free_inputs(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    diagnostic_labels: Option<&[usize]>,
     rows: &[usize],
     likelihood_weights: &[f64],
 ) -> Result<(), String> {
-    let n = active_i.len();
-    if active_j.len() != n || context_labels.len() != n {
+    let n = gate_i.len();
+    if gate_j.len() != n || continuous_context.len() != n {
         return Err(format!(
-            "coactivation conditionality: lengths differ active_i={} active_j={} labels={}",
-            active_i.len(),
-            active_j.len(),
-            context_labels.len()
+            "coactivation conditionality: lengths differ gate_i={} gate_j={} context={}",
+            gate_i.len(),
+            gate_j.len(),
+            continuous_context.len()
+        ));
+    }
+    if let Some(labels) = diagnostic_labels
+        && labels.len() != n
+    {
+        return Err(format!(
+            "coactivation conditionality: diagnostic labels length {} != gates {n}",
+            labels.len()
         ));
     }
     if rows.len() != likelihood_weights.len() {
@@ -326,83 +465,372 @@ fn validate_inputs(
                 "coactivation conditionality: sampled row {row} has invalid weight {w}"
             ));
         }
+        let gi = gate_i[row];
+        let gj = gate_j[row];
+        let x = continuous_context[row];
+        if !(gi.is_finite() && gj.is_finite() && x.is_finite()) {
+            return Err(format!(
+                "coactivation conditionality: sampled row {row} has non-finite gate/context"
+            ));
+        }
     }
     Ok(())
 }
 
-fn directional_stats<'a>(
-    contexts: &[ContextConditional],
-    accum: impl Iterator<Item = &'a ContextAccum>,
-    direction: Direction,
-) -> DirectionalStats {
-    let accums: Vec<&ContextAccum> = accum.collect();
-    let total_context_mass: f64 = contexts.iter().map(|c| c.mass).sum();
-    let mut valid_mass = 0.0;
-    let mut mean = 0.0;
-    let mut valid_contexts = 0usize;
-    for context in contexts {
-        let value = match direction {
-            Direction::JGivenI => context.pi_j_given_i,
-            Direction::IGivenJ => context.pi_i_given_j,
-        };
-        if let Some(v) = value {
-            valid_contexts += 1;
-            valid_mass += context.mass;
-            mean += context.mass * v;
+fn fit_varying_coefficient_gam(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    continuous_context: &[f64],
+    rows: &[usize],
+    likelihood_weights: &[f64],
+    config: VaryingCoefficientConfig,
+) -> Result<VaryingCoefficientConditionality, String> {
+    if config.spline_degree < 1 {
+        return Err(format!(
+            "fit_varying_coefficient_gam: spline degree must be >= 1, got {}",
+            config.spline_degree
+        ));
+    }
+    if config.penalty_order == 0 {
+        return Err("fit_varying_coefficient_gam: penalty order must be >= 1".to_string());
+    }
+
+    let x_sample: Vec<f64> = rows.iter().map(|&row| continuous_context[row]).collect();
+    let x_min = x_sample.iter().copied().fold(f64::INFINITY, f64::min);
+    let x_max = x_sample.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !(x_max > x_min) {
+        return Err("fit_varying_coefficient_gam: context needs positive range".to_string());
+    }
+    let x_array = Array1::from_vec(x_sample);
+    let (basis_arc, knot_vector) = create_basis::<Dense>(
+        x_array.view(),
+        KnotSource::Generate {
+            data_range: (x_min, x_max),
+            num_internal_knots: config.num_internal_knots,
+        },
+        config.spline_degree,
+        BasisOptions::value(),
+    )
+    .map_err(|e| format!("fit_varying_coefficient_gam: basis build failed: {e}"))?;
+    if knot_vector.len() <= config.spline_degree {
+        return Err(format!(
+            "fit_varying_coefficient_gam: knot vector has {} entries for degree {}",
+            knot_vector.len(),
+            config.spline_degree
+        ));
+    }
+    let basis = basis_arc.as_ref();
+    let n = rows.len();
+    let beta_cols = basis.ncols();
+    if beta_cols <= config.penalty_order {
+        return Err(format!(
+            "fit_varying_coefficient_gam: basis has {beta_cols} columns but penalty order is {}",
+            config.penalty_order
+        ));
+    }
+    let design_cols = beta_cols + 1;
+    let mut design = vec![vec![0.0_f64; design_cols]; n];
+    for slot in 0..n {
+        let row = rows[slot];
+        design[slot][0] = 1.0;
+        for col in 0..beta_cols {
+            design[slot][col + 1] = gate_i[row] * basis[[slot, col]];
         }
     }
-    if !(valid_mass > 0.0) {
-        return DirectionalStats {
-            observed_var: f64::INFINITY,
-            sampling_var: 0.0,
-            valid_contexts,
-        };
+    let penalty_beta = difference_penalty(beta_cols, config.penalty_order)?;
+    let mut penalty = vec![vec![0.0_f64; design_cols]; design_cols];
+    for r in 0..beta_cols {
+        for c in 0..beta_cols {
+            penalty[r + 1][c + 1] = penalty_beta[r][c];
+        }
     }
-    mean /= valid_mass;
+    let y: Vec<f64> = rows.iter().map(|&row| gate_j[row]).collect();
+    let fit_for_log_lambda = |log_lambda: f64| -> Result<PenalizedFit, String> {
+        penalized_gaussian_fit(&design, &y, likelihood_weights, &penalty, log_lambda)
+    };
+    let selected_log_smoothing = minimize_reml_log_smoothing(fit_for_log_lambda)?;
+    let final_fit =
+        penalized_gaussian_fit(&design, &y, likelihood_weights, &penalty, selected_log_smoothing)?;
+    let mut coefficients = vec![0.0_f64; beta_cols];
+    coefficients.copy_from_slice(&final_fit.coef[1..]);
+    let mut beta_at_rows = Vec::with_capacity(n);
+    for slot in 0..n {
+        let mut beta = 0.0_f64;
+        for col in 0..beta_cols {
+            beta += basis[[slot, col]] * coefficients[col];
+        }
+        beta_at_rows.push(beta);
+    }
+    let total_weight: f64 = likelihood_weights.iter().sum();
+    let beta_mean = beta_at_rows
+        .iter()
+        .zip(likelihood_weights.iter())
+        .map(|(&b, &w)| w * b)
+        .sum::<f64>()
+        / total_weight;
+    let beta_variation = beta_at_rows
+        .iter()
+        .zip(likelihood_weights.iter())
+        .map(|(&b, &w)| {
+            let d = b - beta_mean;
+            w * d * d
+        })
+        .sum::<f64>()
+        / total_weight;
+    let penalty_energy = quadratic_form(&coefficients, &penalty_beta);
+    let beta_norm = coefficients.iter().map(|v| v * v).sum::<f64>();
+    let beta_wiggliness = if beta_norm > 0.0 {
+        penalty_energy / beta_norm
+    } else {
+        0.0
+    };
+    Ok(VaryingCoefficientConditionality {
+        selected_log_smoothing,
+        reml_score: final_fit.reml_score,
+        effective_degrees: final_fit.effective_degrees,
+        beta_wiggliness,
+        beta_variation,
+        beta_mean,
+        coefficients,
+        beta_at_rows,
+    })
+}
 
-    let mut observed_var = 0.0;
-    let mut sampling_var = 0.0;
-    for (idx, context) in contexts.iter().enumerate() {
-        let value = match direction {
-            Direction::JGivenI => context.pi_j_given_i,
-            Direction::IGivenJ => context.pi_i_given_j,
-        };
-        if let Some(v) = value {
-            let context_prob = if total_context_mass > 0.0 {
-                context.mass / total_context_mass
-            } else {
-                0.0
-            };
-            let d = v - mean;
-            observed_var += context_prob * d * d;
-            let a = accums[idx];
-            let (denom, denom_sq) = match direction {
-                Direction::JGivenI => (a.i, a.i_sq),
-                Direction::IGivenJ => (a.j, a.j_sq),
-            };
-            let n_eff = if denom_sq > 0.0 {
-                denom * denom / denom_sq
-            } else {
-                0.0
-            };
-            if n_eff > 0.0 {
-                sampling_var += context_prob * v * (1.0 - v) / n_eff;
+#[derive(Clone, Debug)]
+struct PenalizedFit {
+    coef: Vec<f64>,
+    reml_score: f64,
+    effective_degrees: f64,
+}
+
+fn penalized_gaussian_fit(
+    design: &[Vec<f64>],
+    y: &[f64],
+    weights: &[f64],
+    penalty: &[Vec<f64>],
+    log_lambda: f64,
+) -> Result<PenalizedFit, String> {
+    let n = design.len();
+    let p = design
+        .first()
+        .map(|row| row.len())
+        .ok_or_else(|| "penalized_gaussian_fit: empty design".to_string())?;
+    let lambda = log_lambda.exp();
+    let mut xtwx = vec![vec![0.0_f64; p]; p];
+    let mut xtwy = vec![0.0_f64; p];
+    let mut ywy = 0.0_f64;
+    for row in 0..n {
+        let w = weights[row];
+        let yy = y[row];
+        ywy += w * yy * yy;
+        for a in 0..p {
+            let xa = design[row][a];
+            xtwy[a] += w * xa * yy;
+            for b in 0..p {
+                xtwx[a][b] += w * xa * design[row][b];
             }
         }
     }
-    DirectionalStats {
-        observed_var,
-        sampling_var,
-        valid_contexts,
+    let mut a = xtwx.clone();
+    for r in 0..p {
+        for c in 0..p {
+            a[r][c] += lambda * penalty[r][c];
+        }
     }
+    let factor = cholesky_decompose(&a)?;
+    let coef = cholesky_solve(&factor, &xtwy);
+    let xty_beta = dot(&xtwy, &coef);
+    let penalty_energy = quadratic_form(&coef, penalty);
+    let sse = (ywy - 2.0 * xty_beta + quadratic_form_matrix(&coef, &xtwx)).max(0.0);
+    let penalized_sse = (sse + lambda * penalty_energy).max(f64::MIN_POSITIVE);
+    let mut effective_degrees = 0.0_f64;
+    for col in 0..p {
+        let mut rhs = vec![0.0_f64; p];
+        for row in 0..p {
+            rhs[row] = xtwx[row][col];
+        }
+        let solved = cholesky_solve(&factor, &rhs);
+        effective_degrees += solved[col];
+    }
+    let penalty_rank = penalty_rank_from_diagonal(penalty);
+    let df = (n as f64 - effective_degrees).max(MIN_RESIDUAL_DF);
+    let logdet = cholesky_logdet(&factor);
+    let reml_score = logdet - penalty_rank as f64 * log_lambda + df * (penalized_sse / df).ln();
+    Ok(PenalizedFit {
+        coef,
+        reml_score,
+        effective_degrees,
+    })
 }
 
-fn association_sign_floor(context_mass: f64, total_mass: f64) -> f64 {
-    if total_mass > 0.0 {
-        f64::EPSILON * (1.0 + total_mass / context_mass.max(f64::MIN_POSITIVE))
-    } else {
-        f64::EPSILON
+fn minimize_reml_log_smoothing<F>(mut evaluate: F) -> Result<f64, String>
+where
+    F: FnMut(f64) -> Result<PenalizedFit, String>,
+{
+    let mut center = 0.0_f64;
+    let mut step = 1.0_f64;
+    let mut f_center = evaluate(center)?.reml_score;
+    let mut left = center - step;
+    let mut right = center + step;
+    let mut f_left = evaluate(left)?.reml_score;
+    let mut f_right = evaluate(right)?.reml_score;
+    for _iteration in 0..BRACKET_EXPANSION_LIMIT {
+        if f_left >= f_center && f_right >= f_center {
+            return golden_section_minimize(&mut evaluate, left, right);
+        }
+        if f_left < f_center {
+            right = center;
+            center = left;
+            f_center = f_left;
+            step *= 2.0;
+            left = center - step;
+            f_left = evaluate(left)?.reml_score;
+            f_right = evaluate(right)?.reml_score;
+        } else {
+            left = center;
+            center = right;
+            f_center = f_right;
+            step *= 2.0;
+            right = center + step;
+            f_right = evaluate(right)?.reml_score;
+            f_left = evaluate(left)?.reml_score;
+        }
     }
+    golden_section_minimize(&mut evaluate, left, right)
+}
+
+fn golden_section_minimize<F>(evaluate: &mut F, mut left: f64, mut right: f64) -> Result<f64, String>
+where
+    F: FnMut(f64) -> Result<PenalizedFit, String>,
+{
+    let inv_phi = (5.0_f64.sqrt() - 1.0) * 0.5;
+    let mut c = right - inv_phi * (right - left);
+    let mut d = left + inv_phi * (right - left);
+    let mut f_c = evaluate(c)?.reml_score;
+    let mut f_d = evaluate(d)?.reml_score;
+    for _iteration in 0..BRENT_ITERATION_LIMIT {
+        let scale = 1.0 + left.abs().max(right.abs());
+        if (right - left).abs() <= BRENT_REL_TOL * scale {
+            break;
+        }
+        if f_c <= f_d {
+            right = d;
+            d = c;
+            f_d = f_c;
+            c = right - inv_phi * (right - left);
+            f_c = evaluate(c)?.reml_score;
+        } else {
+            left = c;
+            c = d;
+            f_c = f_d;
+            d = left + inv_phi * (right - left);
+            f_d = evaluate(d)?.reml_score;
+        }
+    }
+    Ok(0.5 * (left + right))
+}
+
+fn difference_penalty(width: usize, order: usize) -> Result<Vec<Vec<f64>>, String> {
+    if order == 0 || width <= order {
+        return Err(format!(
+            "difference_penalty: width {width} cannot support order {order}"
+        ));
+    }
+    let rows = width - order;
+    let mut diff = vec![vec![0.0_f64; width]; rows];
+    let coeff = difference_coefficients(order);
+    for r in 0..rows {
+        for c in 0..=order {
+            diff[r][r + c] = coeff[c];
+        }
+    }
+    let mut penalty = vec![vec![0.0_f64; width]; width];
+    for r in 0..rows {
+        for a in 0..width {
+            for b in 0..width {
+                penalty[a][b] += diff[r][a] * diff[r][b];
+            }
+        }
+    }
+    Ok(penalty)
+}
+
+fn difference_coefficients(order: usize) -> Vec<f64> {
+    let mut coeff = vec![1.0_f64];
+    for _ in 0..order {
+        let mut next = vec![0.0_f64; coeff.len() + 1];
+        for (idx, &value) in coeff.iter().enumerate() {
+            next[idx] -= value;
+            next[idx + 1] += value;
+        }
+        coeff = next;
+    }
+    coeff
+}
+
+fn penalty_rank_from_diagonal(penalty: &[Vec<f64>]) -> usize {
+    let diag_max = penalty
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| row[idx].abs())
+        .fold(0.0_f64, f64::max);
+    let floor = f64::EPSILON * penalty.len().max(1) as f64 * diag_max.max(1.0);
+    penalty
+        .iter()
+        .enumerate()
+        .filter(|(idx, row)| row[*idx].abs() > floor)
+        .count()
+}
+
+fn diagnose_context_labels(
+    gate_i: &[f64],
+    gate_j: &[f64],
+    labels: &[usize],
+    rows: &[usize],
+    likelihood_weights: &[f64],
+    beta_at_rows: &[f64],
+) -> Result<Vec<ContextDiagnostic>, String> {
+    let mut accum: BTreeMap<usize, DiagnosticAccum> = BTreeMap::new();
+    for (slot, &row) in rows.iter().enumerate() {
+        let w = likelihood_weights[slot];
+        let entry = accum.entry(labels[row]).or_default();
+        entry.rows += 1;
+        entry.mass += w;
+        entry.sum_i += w * gate_i[row];
+        entry.sum_j += w * gate_j[row];
+        entry.sum_ij += w * gate_i[row] * gate_j[row];
+        entry.sum_beta += w * beta_at_rows[slot];
+    }
+    let mut diagnostics = Vec::with_capacity(accum.len());
+    for (&context, a) in accum.iter() {
+        if !(a.mass > 0.0) {
+            return Err(format!(
+                "diagnose_context_labels: context {context} has non-positive mass"
+            ));
+        }
+        let mean_i = a.sum_i / a.mass;
+        let mean_j = a.sum_j / a.mass;
+        diagnostics.push(ContextDiagnostic {
+            context,
+            rows: a.rows,
+            mass: a.mass,
+            mean_gate_i: mean_i,
+            mean_gate_j: mean_j,
+            mean_beta: a.sum_beta / a.mass,
+            centered_association: a.sum_ij / a.mass - mean_i * mean_j,
+        });
+    }
+    Ok(diagnostics)
+}
+
+#[derive(Default)]
+struct DiagnosticAccum {
+    rows: usize,
+    mass: f64,
+    sum_i: f64,
+    sum_j: f64,
+    sum_ij: f64,
+    sum_beta: f64,
 }
 
 fn residualize_gate(
@@ -511,65 +939,204 @@ fn solve_symmetric_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Result<Vec<f
     Ok(x)
 }
 
+fn cholesky_decompose(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+    let n = a.len();
+    let mut l = vec![vec![0.0_f64; n]; n];
+    let scale = a
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| row[idx].abs())
+        .fold(1.0_f64, f64::max);
+    let floor = f64::EPSILON * n.max(1) as f64 * scale;
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if !(sum > floor) {
+                    return Err(format!(
+                        "cholesky_decompose: non-SPD matrix at diagonal {i} with value {sum}"
+                    ));
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    Ok(l)
+}
+
+fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let n = b.len();
+    let mut y = vec![0.0_f64; n];
+    for i in 0..n {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[i][k] * y[k];
+        }
+        y[i] = sum / l[i][i];
+    }
+    let mut x = vec![0.0_f64; n];
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for k in (i + 1)..n {
+            sum -= l[k][i] * x[k];
+        }
+        x[i] = sum / l[i][i];
+    }
+    x
+}
+
+fn cholesky_logdet(l: &[Vec<f64>]) -> f64 {
+    2.0 * l
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| row[idx].ln())
+        .sum::<f64>()
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+fn quadratic_form(x: &[f64], a: &[Vec<f64>]) -> f64 {
+    quadratic_form_matrix(x, a)
+}
+
+fn quadratic_form_matrix(x: &[f64], a: &[Vec<f64>]) -> f64 {
+    let mut value = 0.0_f64;
+    for r in 0..x.len() {
+        for c in 0..x.len() {
+            value += x[r] * a[r][c] * x[c];
+        }
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::Array2;
 
     #[test]
-    fn invariant_cofire_has_low_conditional_variance() {
-        let n = 12usize;
-        let labels: Vec<usize> = (0..n).map(|row| row % 3).collect();
-        let active_i = vec![true; n];
-        let active_j = vec![true; n];
+    fn invariant_coupling_selects_constant_beta_and_large_radius() {
+        let n = 96usize;
+        let mut x = Vec::with_capacity(n);
+        let mut gate_i = Vec::with_capacity(n);
+        let mut gate_j = Vec::with_capacity(n);
+        for row in 0..n {
+            let t = row as f64 / (n - 1) as f64;
+            x.push(t);
+            let gi = 0.8 + 0.3 * (2.0 * std::f64::consts::PI * t).sin();
+            gate_i.push(gi);
+            gate_j.push(0.2 + 1.7 * gi);
+        }
         let sample = full_pass_rows(n);
-        let report =
-            estimate_from_designed_sample(&active_i, &active_j, &labels, &sample).unwrap();
-        assert_eq!(report.var_j_given_i, 0.0);
-        assert_eq!(report.var_i_given_j, 0.0);
-        assert!(!report.sign_instability);
-        assert!(report.stable_for_structure_search);
+        let report = estimate_from_designed_sample(
+            &gate_i,
+            &gate_j,
+            &x,
+            None,
+            &sample,
+            VaryingCoefficientConfig::default(),
+        )
+        .expect("partition-free conditionality");
+        println!(
+            "case=invariant beta_wiggliness={:.6e} beta_variation={:.6e} epsilon_star={:.6e} rho={:.6e}",
+            report.native.beta_wiggliness,
+            report.native.beta_variation,
+            report.certificate.robustness_radius_epsilon,
+            report.certificate.rho
+        );
+        assert!(report.native.beta_wiggliness < 1.0e-6);
+        assert!(report.native.beta_variation < 1.0e-8);
+        assert!(report.certificate.robustness_radius_epsilon > 1.0e10);
     }
 
     #[test]
-    fn context_specific_cofire_and_anticorrelation_is_unstable() {
-        let n = 16usize;
-        let mut labels = vec![0usize; n];
-        for label in labels.iter_mut().skip(n / 2) {
-            *label = 1;
+    fn context_varying_coupling_selects_wiggly_beta_and_small_radius() {
+        let n = 120usize;
+        let mut x = Vec::with_capacity(n);
+        let mut gate_i = Vec::with_capacity(n);
+        let mut gate_j = Vec::with_capacity(n);
+        for row in 0..n {
+            let t = row as f64 / (n - 1) as f64;
+            x.push(t);
+            let gi = 0.8 + 0.25 * (6.0 * std::f64::consts::PI * t).cos();
+            let beta = if t < 0.5 { 1.8 } else { -1.8 };
+            gate_i.push(gi);
+            gate_j.push(0.1 + beta * gi);
         }
-        let mut active_i = vec![false; n];
-        let mut active_j = vec![false; n];
-        for row in 0..(n / 2) {
-            let on = row % 2 == 0;
-            active_i[row] = on;
-            active_j[row] = on;
-        }
-        for row in (n / 2)..n {
-            active_i[row] = row % 2 == 0;
-            active_j[row] = !active_i[row];
-        }
+        let labels: Vec<usize> = x.iter().map(|&t| if t >= 0.5 { 1 } else { 0 }).collect();
         let sample = full_pass_rows(n);
-        let report =
-            estimate_from_designed_sample(&active_i, &active_j, &labels, &sample).unwrap();
-        assert!(report.var_j_given_i > 0.20);
-        assert!(report.var_i_given_j > 0.20);
-        assert!(report.sign_instability);
-        assert!(!report.stable_for_structure_search);
+        let report = estimate_from_designed_sample(
+            &gate_i,
+            &gate_j,
+            &x,
+            Some(&labels),
+            &sample,
+            VaryingCoefficientConfig::default(),
+        )
+        .expect("partition-free conditionality");
+        println!(
+            "case=context_varying beta_wiggliness={:.6e} beta_variation={:.6e} epsilon_star={:.6e} rho={:.6e} diagnostics={}",
+            report.native.beta_wiggliness,
+            report.native.beta_variation,
+            report.certificate.robustness_radius_epsilon,
+            report.certificate.rho,
+            report.diagnostics.len()
+        );
+        assert!(report.native.beta_wiggliness > 1.0e-2);
+        assert!(report.native.beta_variation > 0.5);
+        assert!(report.certificate.robustness_radius_epsilon < 0.05);
+        assert_eq!(report.diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn robustness_radius_matches_direct_adversarial_reweighting_search() {
+        let n = 400usize;
+        let mut gate_i = Vec::with_capacity(n);
+        let mut gate_j = Vec::with_capacity(n);
+        for row in 0..n {
+            let t = row as f64 / n as f64;
+            let a = (2.0 * std::f64::consts::PI * t).sin();
+            let b = (4.0 * std::f64::consts::PI * t).cos();
+            gate_i.push(a + 0.35 * b);
+            gate_j.push(0.06 * a + b);
+        }
+        let rows: Vec<usize> = (0..n).collect();
+        let weights = vec![1.0_f64; n];
+        let influence = coupling_influence_values(&gate_i, &gate_j, &rows, &weights)
+            .expect("influence values");
+        let certificate = influence.certificate();
+        let direct = direct_exponential_tilt_radius_to_kill(
+            certificate.rho,
+            &influence.psi,
+            &influence.normalized_weights,
+        )
+        .expect("direct tilt radius");
+        println!(
+            "case=adversarial formula_epsilon_star={:.6e} direct_epsilon={:.6e} rho={:.6e} var_psi={:.6e}",
+            certificate.robustness_radius_epsilon,
+            direct,
+            certificate.rho,
+            certificate.influence_variance
+        );
+        let rel = (direct - certificate.robustness_radius_epsilon).abs()
+            / certificate.robustness_radius_epsilon.max(1.0e-12);
+        assert!(rel < 0.08, "relative error {rel}");
     }
 
     #[test]
     fn residual_gate_denominator_removes_same_chart_anchor_binding() {
         let n = 12usize;
-        let labels: Vec<usize> = (0..n).map(|row| row % 2).collect();
         let chart_gate: Vec<f64> = (0..n)
             .map(|row| if row % 3 == 0 { 1.0 } else { 0.0 })
             .collect();
-        let raw_active: Vec<bool> = chart_gate.iter().map(|&g| g > 0.5).collect();
         let sample = full_pass_rows(n);
-        let raw =
-            estimate_from_designed_sample(&raw_active, &raw_active, &labels, &sample).unwrap();
-
         let chart = Array2::from_shape_vec((n, 1), chart_gate.clone()).unwrap();
         let residual = residual_gate_activities(
             &chart_gate,
@@ -579,17 +1146,67 @@ mod tests {
             0.0,
         )
         .unwrap();
-        let adjusted = estimate_from_designed_sample(
-            &residual.active_i,
-            &residual.active_j,
-            &labels,
-            &sample,
-        )
-        .unwrap();
-        assert!(raw.stable_for_structure_search);
-        assert_eq!(adjusted.valid_j_given_i_contexts, 0);
-        assert!(!adjusted.stable_for_structure_search);
         assert!(residual.active_i.iter().all(|&active| !active));
         assert!(residual.active_j.iter().all(|&active| !active));
+    }
+
+    fn direct_exponential_tilt_radius_to_kill(
+        rho: f64,
+        psi: &[f64],
+        weights: &[f64],
+    ) -> Result<f64, String> {
+        if rho == 0.0 {
+            return Ok(0.0);
+        }
+        let direction = if rho > 0.0 { -1.0 } else { 1.0 };
+        let target = -rho;
+        let shifted_mean = |eta: f64| -> (f64, f64) {
+            let mut log_terms = Vec::with_capacity(psi.len());
+            for &value in psi {
+                log_terms.push(direction * eta * value);
+            }
+            let max_log = log_terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut z = 0.0_f64;
+            let mut mean = 0.0_f64;
+            for slot in 0..psi.len() {
+                let un = weights[slot] * (log_terms[slot] - max_log).exp();
+                z += un;
+                mean += un * psi[slot];
+            }
+            mean /= z;
+            let log_z = max_log + z.ln();
+            let kl = direction * eta * mean - log_z;
+            (mean, kl)
+        };
+        let mut lo = 0.0_f64;
+        let mut hi = 1.0_f64;
+        let mut hi_mean = shifted_mean(hi).0;
+        for _iteration in 0..64 {
+            let crossed = if rho > 0.0 {
+                hi_mean <= target
+            } else {
+                hi_mean >= target
+            };
+            if crossed {
+                break;
+            }
+            hi *= 2.0;
+            hi_mean = shifted_mean(hi).0;
+        }
+        for _iteration in 0..96 {
+            let mid = 0.5 * (lo + hi);
+            let mid_mean = shifted_mean(mid).0;
+            let crossed = if rho > 0.0 {
+                mid_mean <= target
+            } else {
+                mid_mean >= target
+            };
+            if crossed {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(shifted_mean(hi).1)
     }
 }
