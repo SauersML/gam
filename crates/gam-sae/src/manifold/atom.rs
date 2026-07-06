@@ -2004,66 +2004,177 @@ mod tests {
         .unwrap()
     }
 
-    // The Poincaré tangent chart is intrinsically flat for `d = 1`: the latent
-    // coordinate runs at a constant multiple of hyperbolic arc length, so the
-    // intrinsic arc-length reweighting is a *constant* in `t` and must reproduce
-    // the flat Euclidean-patch reweighting exactly — even when the coordinates
-    // reach large `|t|`. The previous code divided the squared speed by
-    // `λ(p)² = 4cosh⁴(t)`, which at `t = 3` is `≈ cosh⁴(3) ≈ 1.0e4` times off from
-    // the correct constant, so it would break this equality by orders of
-    // magnitude. Coordinates are deliberately spread to `|t| = 3` to exercise that
-    // regime.
+    // DEFECT 2 — a Poincaré atom's intrinsic smoothness is the HYPERBOLIC
+    // conformal Dirichlet roughness (the ball metric pulled back to the tangent
+    // chart), delegated to the single-source geometry primitive
+    // `conformal_dirichlet_penalty(coords, ∂Φ, curvature = −1)`, NOT the flat
+    // Euclidean second-derivative reweighting the code used before. The
+    // coordinates are supplied through the `latent_coords` cache exactly as
+    // `refresh_basis` populates it in production.
     #[test]
-    fn poincare_d1_reweighting_is_constant_and_matches_euclidean() {
+    fn poincare_d1_uses_hyperbolic_conformal_dirichlet() {
         let ts = [0.1_f64, 1.5, 3.0];
-        let poincare = monomial_atom(SaeAtomBasisKind::Poincare, &ts);
+        let mut poincare = monomial_atom(SaeAtomBasisKind::Poincare, &ts);
+        let coords = Array2::from_shape_vec((ts.len(), 1), ts.to_vec()).unwrap();
+        poincare.latent_coords = Some(coords.clone());
+        poincare.refresh_intrinsic_smooth_penalty();
 
-        // The reweighting actually did something: the second-derivative penalty
-        // entry moved away from its raw value of 1.0 (so the equality below is
-        // not vacuously true because reweighting was a no-op).
-        let raw = poincare.smooth_penalty_raw[[2, 2]];
-        assert!((raw - 1.0).abs() < 1e-12);
-        let reweighted = poincare.smooth_penalty[[2, 2]];
-        assert!(
-            (reweighted - 1.0).abs() > 0.05,
-            "arc-length reweighting should be non-trivial; got {reweighted}"
-        );
-
-        // Constant-in-`t` factor ⇒ Poincaré and Euclidean reweightings coincide
-        // exactly. The old `1/λ²` divide (~1e4× at t=3) would make these differ.
-        assert_poincare_tracks_euclidean(&ts);
-    }
-
-    // Assert the `d = 1` Poincaré intrinsic penalty equals its Euclidean-patch
-    // twin (same design/decoder, only `basis_kind` differs) elementwise. Because
-    // the metric factor is a constant in `t`, this must hold at *any* coordinate
-    // concentration; the old per-sample `1/λ²` divide would break it once `|t|`
-    // grows (the divide scales as `cosh⁴(t)`).
-    fn assert_poincare_tracks_euclidean(ts: &[f64]) {
-        let euclidean = monomial_atom(SaeAtomBasisKind::EuclideanPatch, ts);
-        let poincare = monomial_atom(SaeAtomBasisKind::Poincare, ts);
+        // Exact wiring: the effective Gram IS the geometry crate's hyperbolic
+        // conformal Dirichlet Gram at unit curvature.
+        let expected = gam_geometry::manifolds::poincare::conformal_dirichlet_penalty(
+            coords.view(),
+            poincare.basis_jacobian.view(),
+            -1.0,
+        )
+        .unwrap();
         for i in 0..3 {
             for j in 0..3 {
-                let e = euclidean.smooth_penalty[[i, j]];
-                let p = poincare.smooth_penalty[[i, j]];
                 assert!(
-                    (e - p).abs() <= 1e-12 + 1e-9 * e.abs(),
-                    "Poincaré d=1 penalty[{i},{j}]={p} must equal Euclidean {e}"
+                    (poincare.smooth_penalty[[i, j]] - expected[[i, j]]).abs() <= 1e-12,
+                    "Poincaré penalty[{i},{j}]={} must equal conformal-Dirichlet {}",
+                    poincare.smooth_penalty[[i, j]],
+                    expected[[i, j]]
                 );
             }
         }
+
+        // The `d = 1` hyperbolic pullback is the ORDER-1 Dirichlet Gram of the
+        // flat first jet scaled by the constant `G ≡ 1/2` (the tangent chart is
+        // intrinsically flat but the coordinate runs at half arc length,
+        // geodesic distance `= 2|t|`). Verify `S = ½ Σ_n ∂Φ(t_n) ∂Φ(t_n)ᵀ`
+        // exactly — a precise check that the hyperbolic metric (not the raw
+        // order-2 second-derivative Gram, whose only nonzero entry is [2,2]=1)
+        // is what got installed.
+        let jac = &poincare.basis_jacobian;
+        let mut flat = Array2::<f64>::zeros((3, 3));
+        for row in 0..ts.len() {
+            for i in 0..3 {
+                for j in 0..3 {
+                    flat[[i, j]] += jac[[row, i, 0]] * jac[[row, j, 0]];
+                }
+            }
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (expected[[i, j]] - 0.5 * flat[[i, j]]).abs() <= 1e-9 * (1.0 + flat[[i, j]].abs()),
+                    "d=1 hyperbolic Dirichlet Gram[{i},{j}]={} must equal ½·flat {}",
+                    expected[[i, j]],
+                    0.5 * flat[[i, j]]
+                );
+            }
+        }
+        // Non-vacuous: it moved off the raw order-2 Gram (raw[2,2]=1, raw[1,1]=0).
+        assert!((poincare.smooth_penalty_raw[[2, 2]] - 1.0).abs() < 1e-12);
+        assert!(
+            poincare.smooth_penalty[[1, 1]] > 1e-6,
+            "Dirichlet roughness must charge the linear column; got {}",
+            poincare.smooth_penalty[[1, 1]]
+        );
     }
 
-    // Small-`|t|` vs large-`|t|` concentration: the Poincaré reweighting tracks
-    // the flat one at BOTH (that invariance across concentrations IS the
-    // constant-in-`t` property). Under the old `1/λ²`, the large-`|t|` case
-    // (`|t| ≈ 3`, `λ² ≈ 4cosh⁴(3) ≈ 1.6e4`) would diverge from its Euclidean twin
-    // by orders of magnitude while the small-`|t|` case stayed close — so the
-    // reweighting shape would depend on where `t` sits, which this test forbids.
+    // DEFECT 1 — a straight decoded segment seen through a NONLINEAR `d = 1`
+    // chart carries zero intrinsic bending, even though the raw coordinate
+    // Hessian is nonzero. `γ(t) = t²·e₁` traces the SAME straight segment as
+    // `γ(s) = s·e₁`; its normal-projected acceleration (`∫κ²ds`) is exactly zero,
+    // whereas the old raw order-2 penalty charged `γ''(t) = 2·e₁ ≠ 0`. This is
+    // the counterexample the fix must satisfy.
     #[test]
-    fn poincare_reweighting_invariant_to_t_concentration() {
-        assert_poincare_tracks_euclidean(&[0.02_f64, 0.05, 0.1]);
-        assert_poincare_tracks_euclidean(&[2.0_f64, 2.5, 3.0]);
+    fn bending_d1_straight_segment_through_nonlinear_chart_is_zero() {
+        // p = 2 ambient, d = 1. γ(t) = (t², 0): ∂γ = (2t, 0), ∂²γ = (2, 0).
+        let ts = [0.3_f64, 0.7, 1.1, 1.6, 2.2];
+        let n = ts.len();
+        let mut dgamma = Array3::<f64>::zeros((n, 2, 1));
+        let mut d2gamma = Array4::<f64>::zeros((n, 2, 1, 1));
+        for (i, &t) in ts.iter().enumerate() {
+            dgamma[[i, 0, 0]] = 2.0 * t;
+            d2gamma[[i, 0, 0, 0]] = 2.0;
+        }
+        // Raw Hessian energy is sizeable, so a zero result is a genuine
+        // cancellation by the normal projection, not an empty input.
+        assert!(raw_hessian_energy(&d2gamma) > 1.0);
+        for &measure in &[SaeBendingMeasure::Data, SaeBendingMeasure::Volume] {
+            let atom = bending_atom(dgamma.clone(), d2gamma.clone(), measure);
+            let e = bending_energy_of(&atom);
+            assert!(
+                e.abs() < 1e-9,
+                "straight segment must have zero intrinsic bending; got {e} ({measure:?})"
+            );
+        }
+    }
+
+    // DEFECT 1 — a genuinely curved `d = 1` decoder matches the independent
+    // ambient `∫κ²ds` reference to machine precision (both measures), and a
+    // NONLINEAR reparameterisation of the SAME curve at MATCHED material points
+    // gives the SAME pointwise-invariant bending under the data measure. This is
+    // the reparameterisation invariance the old scalar-speed reweighting only
+    // approximated.
+    #[test]
+    fn bending_d1_curve_matches_ambient_and_is_reparam_invariant() {
+        // Unit circle arc γ(θ) = (cos θ, sin θ): ‖γ'‖ = 1, κ = 1. ∂γ = (−sin,
+        // cos), ∂²γ = (−cos, −sin).
+        let build = |ths: &[f64]| -> (Array3<f64>, Array4<f64>) {
+            let n = ths.len();
+            let mut dg = Array3::<f64>::zeros((n, 2, 1));
+            let mut d2 = Array4::<f64>::zeros((n, 2, 1, 1));
+            for (i, &th) in ths.iter().enumerate() {
+                dg[[i, 0, 0]] = -th.sin();
+                dg[[i, 1, 0]] = th.cos();
+                d2[[i, 0, 0, 0]] = -th.cos();
+                d2[[i, 1, 0, 0]] = -th.sin();
+            }
+            (dg, d2)
+        };
+        let thetas = [0.2_f64, 0.6, 1.0, 1.5, 2.1, 2.7];
+        let (dg, d2) = build(&thetas);
+        for &volume in &[false, true] {
+            let measure = if volume {
+                SaeBendingMeasure::Volume
+            } else {
+                SaeBendingMeasure::Data
+            };
+            let atom = bending_atom(dg.clone(), d2.clone(), measure);
+            let got = bending_energy_of(&atom);
+            let want = ambient_bending_energy(&dg, &d2, volume);
+            assert!(want > 0.5, "reference d=1 bending should be sizeable: {want}");
+            assert!(
+                (got - want).abs() <= 1e-9 * want.max(1.0),
+                "volume={volume}: d=1 coefficient bending {got} != ambient reference {want}"
+            );
+        }
+
+        // Reparameterise the SAME circle by θ = φ(u) = u + 0.4u² (a nonlinear
+        // diffeo) at matched material points, via the exact chain rule:
+        //   ∂γ/∂u   = γ'(θ)·φ'(u)
+        //   ∂²γ/∂u² = γ''(θ)·φ'(u)² + γ'(θ)·φ''(u).
+        let us = [0.2_f64, 0.5, 0.8, 1.05, 1.3, 1.55];
+        let n = us.len();
+        let mut dg_u = Array3::<f64>::zeros((n, 2, 1));
+        let mut d2_u = Array4::<f64>::zeros((n, 2, 1, 1));
+        let mut thetas_matched = Vec::with_capacity(n);
+        for (i, &u) in us.iter().enumerate() {
+            let th = u + 0.4 * u * u;
+            thetas_matched.push(th);
+            let dphi = 1.0 + 0.8 * u;
+            let d2phi = 0.8;
+            let (g1x, g1y) = (-th.sin(), th.cos()); // γ'(θ)
+            let (g2x, g2y) = (-th.cos(), -th.sin()); // γ''(θ)
+            dg_u[[i, 0, 0]] = g1x * dphi;
+            dg_u[[i, 1, 0]] = g1y * dphi;
+            d2_u[[i, 0, 0, 0]] = g2x * dphi * dphi + g1x * d2phi;
+            d2_u[[i, 1, 0, 0]] = g2y * dphi * dphi + g1y * d2phi;
+        }
+        // Identity chart hitting the SAME physical points θ = φ(u).
+        let (dg_x, d2_x) = build(&thetas_matched);
+        let warped = bending_atom(dg_u, d2_u, SaeBendingMeasure::Data);
+        let identity = bending_atom(dg_x, d2_x, SaeBendingMeasure::Data);
+        let e_warped = bending_energy_of(&warped);
+        let e_identity = bending_energy_of(&identity);
+        assert!(e_identity > 0.5, "identity-chart d=1 energy sanity: {e_identity}");
+        assert!(
+            (e_warped - e_identity).abs() <= 1e-9 * e_identity,
+            "d=1 bending must be reparam-invariant at matched points: warped {e_warped} vs identity {e_identity}"
+        );
     }
 
     // ---- d ≥ 2 intrinsic bending Gram (Contribution 1) --------------------
