@@ -205,7 +205,7 @@ pub fn screen_pair_with_contexts(
         kappa_b: f64::NAN,
         rho_se: f64::NAN,
         z: 0.0,
-        conditionality,
+        conditionality: conditionality.clone(),
         conditional_stable,
         merge_proposed: false,
     };
