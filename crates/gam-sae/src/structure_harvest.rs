@@ -89,7 +89,7 @@ use crate::manifold::{
     AssignmentMode, OccupancyLaw, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy_interval,
 };
-use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance};
+use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
@@ -464,7 +464,18 @@ pub fn harvest_move_proposals(
     // skipped entirely when neither trigger is enabled (the null is not free).
     let codes = sparse_codes_from_term(term);
     let want_coactivation = params.max_fusions > 0 || params.max_fissions > 0;
-    let exceedance = want_coactivation.then(|| coactivation_exceedance(&codes, NULL_REPLICATES));
+    let coactive_pairs = if want_coactivation {
+        codes.coactive_pair_stats()
+    } else {
+        Vec::new()
+    };
+    let coactive_pair_keys: Vec<(usize, usize)> =
+        coactive_pairs.iter().map(|(a, b, _)| (*a, *b)).collect();
+    let exceedance_z = if want_coactivation {
+        coactivation_exceedance_for_pairs(&codes, &coactive_pair_keys, NULL_REPLICATES)
+    } else {
+        Vec::new()
+    };
     let z_floor = null_exceedance_z_floor();
 
     // --- Fusions: top co-activation dependence, gated by the null ----------
@@ -472,17 +483,14 @@ pub fn harvest_move_proposals(
     // not the raw dependence: the raw floor only pre-selects genuinely co-firing
     // pairs, and the fixed-margin null strips the mechanical top-`k` coupling.
     let mut fusion_pairs: Vec<(usize, usize, f64)> = Vec::new();
-    for a in 0..k {
-        for b in (a + 1)..k {
-            let stats = codes.coactivation(a, b);
-            let dep = stats.dependence();
-            if dep < FUSION_DEPENDENCE_FLOOR {
-                continue;
-            }
-            let z = exceedance.as_ref().map_or(0.0, |ex| ex.excess_z(a, b));
-            if z >= z_floor {
-                fusion_pairs.push((a, b, z));
-            }
+    for (pair_idx, &(a, b, stats)) in coactive_pairs.iter().enumerate() {
+        let dep = stats.dependence();
+        if dep < FUSION_DEPENDENCE_FLOOR {
+            continue;
+        }
+        let z = exceedance_z[pair_idx];
+        if z >= z_floor {
+            fusion_pairs.push((a, b, z));
         }
     }
     fusion_pairs.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1)));
@@ -492,35 +500,32 @@ pub fn harvest_move_proposals(
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
-    for a in 0..k {
-        for b in (a + 1)..k {
-            let stats = codes.coactivation(a, b);
-            let asym = stats.absorption_asymmetry();
-            if asym < ABSORPTION_ASYMMETRY_FLOOR {
-                continue;
-            }
-            // A nested (absorbed) pair co-fires ABOVE its fixed margins; a pair
-            // whose asymmetry is only the top-`k` mechanical artifact does not.
-            // Require the joint activation to exceed the fixed-margin null before
-            // auditing, so mechanical asymmetry is not read as absorption.
-            let z = exceedance.as_ref().map_or(0.0, |ex| ex.excess_z(a, b));
-            if z < z_floor {
-                continue;
-            }
-            // The parent (the conditioned-on atom whose support nests the
-            // child) is the one whose `P(parent|child) ≈ 1`. Audit the
-            // parent for the absorbed substructure.
-            let parent = if stats.p_a_given_b >= stats.p_b_given_a {
-                a
-            } else {
-                b
-            };
-            // Fission trigger is audit significance ASCENDING; map a high
-            // asymmetry to a low significance proxy `1 − asym` so the most
-            // asymmetric (most suspect) pair sorts first.
-            let significance = (1.0 - asym).max(0.0);
-            fission_atoms.push((parent, significance));
+    for (pair_idx, &(a, b, stats)) in coactive_pairs.iter().enumerate() {
+        let asym = stats.absorption_asymmetry();
+        if asym < ABSORPTION_ASYMMETRY_FLOOR {
+            continue;
         }
+        // A nested (absorbed) pair co-fires ABOVE its fixed margins; a pair
+        // whose asymmetry is only the top-`k` mechanical artifact does not.
+        // Require the joint activation to exceed the fixed-margin null before
+        // auditing, so mechanical asymmetry is not read as absorption.
+        let z = exceedance_z[pair_idx];
+        if z < z_floor {
+            continue;
+        }
+        // The parent (the conditioned-on atom whose support nests the child) is
+        // the one whose `P(parent|child) ≈ 1`. Audit the parent for the absorbed
+        // substructure.
+        let parent = if stats.p_a_given_b >= stats.p_b_given_a {
+            a
+        } else {
+            b
+        };
+        // Fission trigger is audit significance ASCENDING; map a high asymmetry
+        // to a low significance proxy `1 − asym` so the most asymmetric (most
+        // suspect) pair sorts first.
+        let significance = (1.0 - asym).max(0.0);
+        fission_atoms.push((parent, significance));
     }
     // Keep the most-suspect (lowest significance) audit per parent atom.
     let fission_atoms = dedup_most_suspect_per_parent(fission_atoms);

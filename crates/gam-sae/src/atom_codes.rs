@@ -41,6 +41,8 @@
 //! couples to *only the active subset* `S_n` of decoder borders, not to all
 //! K of them. That is the structural fact this module records.
 
+use std::collections::BTreeMap;
+
 use ndarray::Array1;
 
 /// Minimal bit-vector. Backing storage is `Vec<u64>` words.
@@ -292,28 +294,82 @@ impl SparseAtomCodes {
             n_b += usize::from(on_b);
             n_joint += usize::from(on_a && on_b);
         }
-        let cond = |joint: usize, marg: usize| {
-            if marg == 0 {
-                0.0
-            } else {
-                joint as f64 / marg as f64
-            }
-        };
-        let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
-            0.0
-        } else {
-            (n_joint as f64 * n_obs as f64) / (n_a as f64 * n_b as f64)
-        };
-        CoactivationStats {
+        CoactivationStats::from_counts(
             n_obs,
             n_a,
             n_b,
             n_joint,
-            p_a_given_b: cond(n_joint, n_b),
-            p_b_given_a: cond(n_joint, n_a),
-            lift,
-            weight_correlation: self.weight_codependence(a, b),
+            self.weight_codependence(a, b),
+        )
+    }
+
+    /// All atom pairs that co-fire at least once, with their support and
+    /// amplitude-code statistics, computed in one sparse pass over row supports.
+    ///
+    /// This is the structure-search candidate index: rows contribute only their
+    /// active-set pairs, so the producer cost is `Σ_row |S_row|²` and the output
+    /// is bounded by observed co-firings, not by `K²`.
+    pub fn coactive_pair_stats(&self) -> Vec<(usize, usize, CoactivationStats)> {
+        #[derive(Clone, Copy, Debug, Default)]
+        struct PairAccum {
+            n_joint: usize,
+            sum_a: f64,
+            sum_b: f64,
+            sum_a2: f64,
+            sum_b2: f64,
+            sum_ab: f64,
         }
+
+        let n_obs = self.n_obs();
+        let mut marg = vec![0usize; self.k_atoms];
+        let mut pairs: BTreeMap<(usize, usize), PairAccum> = BTreeMap::new();
+        for code in &self.codes {
+            let active: Vec<usize> = code.active_mask.iter_ones().collect();
+            for &atom in &active {
+                marg[atom] += 1;
+            }
+            for (idx, &u) in active.iter().enumerate() {
+                for &v in &active[idx + 1..] {
+                    let (a, b) = if u < v { (u, v) } else { (v, u) };
+                    let wa = code.weights[a];
+                    let wb = code.weights[b];
+                    let acc = pairs.entry((a, b)).or_default();
+                    acc.n_joint += 1;
+                    acc.sum_a += wa;
+                    acc.sum_b += wb;
+                    acc.sum_a2 += wa * wa;
+                    acc.sum_b2 += wb * wb;
+                    acc.sum_ab += wa * wb;
+                }
+            }
+        }
+
+        pairs
+            .into_iter()
+            .map(|((a, b), acc)| {
+                let weight_correlation = if acc.n_joint < 2 {
+                    0.0
+                } else {
+                    let n = acc.n_joint as f64;
+                    let cov = acc.sum_ab - acc.sum_a * acc.sum_b / n;
+                    let var_a = acc.sum_a2 - acc.sum_a * acc.sum_a / n;
+                    let var_b = acc.sum_b2 - acc.sum_b * acc.sum_b / n;
+                    if var_a > 0.0 && var_b > 0.0 {
+                        (cov / (var_a.sqrt() * var_b.sqrt())).clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                };
+                let stats = CoactivationStats::from_counts(
+                    n_obs,
+                    marg[a],
+                    marg[b],
+                    acc.n_joint,
+                    weight_correlation,
+                );
+                (a, b, stats)
+            })
+            .collect()
     }
 
     /// #976 — the AMPLITUDE half of the fusion criterion: the Pearson
@@ -605,6 +661,37 @@ pub struct CoactivationStats {
 }
 
 impl CoactivationStats {
+    fn from_counts(
+        n_obs: usize,
+        n_a: usize,
+        n_b: usize,
+        n_joint: usize,
+        weight_correlation: f64,
+    ) -> Self {
+        let cond = |joint: usize, marg: usize| {
+            if marg == 0 {
+                0.0
+            } else {
+                joint as f64 / marg as f64
+            }
+        };
+        let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
+            0.0
+        } else {
+            (n_joint as f64 * n_obs as f64) / (n_a as f64 * n_b as f64)
+        };
+        Self {
+            n_obs,
+            n_a,
+            n_b,
+            n_joint,
+            p_a_given_b: cond(n_joint, n_b),
+            p_b_given_a: cond(n_joint, n_a),
+            lift,
+            weight_correlation,
+        }
+    }
+
     /// Symmetric code dependence `min(P(a|b), P(b|a))` — the canonical-order
     /// trigger for FUSION proposals (descending). Near 0 for independent or
     /// disjoint atoms; near 1 only when the two supports essentially coincide,

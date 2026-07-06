@@ -45,6 +45,7 @@
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::collections::BTreeMap;
 
 use crate::atom_codes::SparseAtomCodes;
 
@@ -195,6 +196,27 @@ impl CurveballSampler {
             }
         }
     }
+
+    /// Accumulate joint counts only for the requested unordered pairs. This is
+    /// the sparse structure-search path: once proposal candidates are restricted
+    /// to observed co-firing pairs, the fixed-margin null must not reintroduce a
+    /// dense `K²` buffer just to score them.
+    fn accumulate_selected(
+        &self,
+        pair_to_pos: &BTreeMap<(usize, usize), usize>,
+        joint: &mut [f64],
+    ) {
+        for row in &self.rows {
+            for (idx, &u) in row.iter().enumerate() {
+                for &v in &row[idx + 1..] {
+                    let key = if u < v { (u, v) } else { (v, u) };
+                    if let Some(&pos) = pair_to_pos.get(&key) {
+                        joint[pos] += 1.0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Per-pair co-activation exceedance over the fixed-margin (curveball) null.
@@ -335,6 +357,81 @@ pub fn coactivation_exceedance(codes: &SparseAtomCodes, replicates: usize) -> Co
     }
 
     CoactivationExceedance { g, n_obs, obs, null_mean, z }
+}
+
+/// Sparse fixed-margin exceedance for a pre-indexed candidate pair set.
+///
+/// Returns standardized excess values aligned with `pairs`. Unlike
+/// [`coactivation_exceedance`], this never allocates or scans a dense `K²` pair
+/// table; every replicate accumulates only co-firing pairs that are present in
+/// `pairs`.
+pub fn coactivation_exceedance_for_pairs(
+    codes: &SparseAtomCodes,
+    pairs: &[(usize, usize)],
+    replicates: usize,
+) -> Vec<f64> {
+    let g = codes.k_atoms();
+    let n_obs = codes.n_obs();
+    let mut pair_to_pos = BTreeMap::new();
+    let mut canonical = Vec::with_capacity(pairs.len());
+    for &(a, b) in pairs {
+        if a == b || a >= g || b >= g {
+            canonical.push(None);
+            continue;
+        }
+        let key = if a < b { (a, b) } else { (b, a) };
+        let next = pair_to_pos.len();
+        let pos = *pair_to_pos.entry(key).or_insert(next);
+        canonical.push(Some(pos));
+    }
+    let m = pair_to_pos.len();
+    if m == 0 {
+        return vec![0.0; pairs.len()];
+    }
+
+    let mut obs = vec![0.0_f64; m];
+    let sampler = CurveballSampler::from_codes(codes);
+    sampler.accumulate_selected(&pair_to_pos, &mut obs);
+    if g < 2 || n_obs < 2 || replicates == 0 {
+        return vec![0.0; pairs.len()];
+    }
+
+    let mut sampler = CurveballSampler::from_codes(codes);
+    let sweep = sampler.n_ones().max(sampler.n_rows());
+    sampler.mix(sweep);
+    let mut mean = vec![0.0_f64; m];
+    let mut m2 = vec![0.0_f64; m];
+    let mut scratch = vec![0.0_f64; m];
+    for r in 0..replicates {
+        sampler.mix(sweep);
+        for value in scratch.iter_mut() {
+            *value = 0.0;
+        }
+        sampler.accumulate_selected(&pair_to_pos, &mut scratch);
+        let count = (r + 1) as f64;
+        for pos in 0..m {
+            let x = scratch[pos];
+            let delta = x - mean[pos];
+            mean[pos] += delta / count;
+            m2[pos] += delta * (x - mean[pos]);
+        }
+    }
+
+    let denom = (replicates.saturating_sub(1)).max(1) as f64;
+    let mut sparse_z = vec![0.0_f64; m];
+    for pos in 0..m {
+        let var = m2[pos] / denom;
+        let sd = var.max(0.0).sqrt();
+        sparse_z[pos] = if sd > NULL_SD_FLOOR {
+            (obs[pos] - mean[pos]) / sd
+        } else {
+            0.0
+        };
+    }
+    canonical
+        .into_iter()
+        .map(|pos| pos.map_or(0.0, |idx| sparse_z[idx]))
+        .collect()
 }
 
 #[cfg(test)]
