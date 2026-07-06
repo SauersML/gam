@@ -1128,12 +1128,13 @@ impl SaeManifoldOuterObjective {
         }
         // Arrival quality floor (#1117). "Arrived" is only a usable certificate
         // if the η = 1 reconstruction is actually good — the predictor-corrector
-        // walk from the Eckart-Young LINEAR anchor can track into a degenerate
+        // walk from the base-topology anchor can track into a degenerate
         // basin that is stationary on the gauge/decoder-null quotient (so the
         // inner solve legitimately converges there) yet reconstructs the data
-        // badly (a NEGATIVE explained variance: worse than the data mean). For a
-        // K = 1 PERIODIC (circle) atom the linear anchor IS that wrong basin — a
-        // straight chord through the arc — and neither the IFT predictor nor the
+        // badly (a NEGATIVE explained variance: worse than the data mean). When
+        // the base chart is the genuinely-affine Euclidean/Duchon fallback, a
+        // K = 1 circle target's anchor IS that wrong basin — a straight chord
+        // through the arc — and neither the IFT predictor nor the
         // decoder-LSQ polish (which alternates a decoder LSQ with a coordinate
         // re-projection ONTO that same bad decoder) can escape it: it is a fixed
         // point. The walk then reported `arrived = true` on EV = -0.59.
@@ -1142,7 +1143,7 @@ impl SaeManifoldOuterObjective {
         // (a value-only / frozen-inner configuration), so neither the cascade
         // `eval` NOR `into_fitted`'s basin re-solve runs a real joint Newton fit
         // — only the homotopy + polish produce any fit, and they are stuck on the
-        // linear anchor. Demoting to a bifurcation alone therefore does NOT
+        // base-topology anchor. Demoting to a bifurcation alone therefore does NOT
         // recover the circle (the cascade re-freezes at the cold seed). So the
         // recovery itself must run a REAL bounded joint Newton fit from the
         // pristine baseline term (which carries the circle-aware PCA seed the

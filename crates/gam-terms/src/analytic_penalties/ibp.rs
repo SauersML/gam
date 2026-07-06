@@ -1,6 +1,7 @@
 use super::*;
 
-/// IBP-MAP active-set prior over SAE-manifold assignment logits.
+/// IBP active-set prior over SAE-manifold assignment logits (posterior-mean
+/// plug-in; NOT a MAP — see [`SPEC.md`] line 3).
 ///
 /// Infinite GPFA / IBP-GPFA in neuroscience uses an Indian Buffet Process
 /// prior over factor loadings to infer both a potentially unbounded factor
@@ -8,17 +9,33 @@ use super::*;
 /// diagnosis carries over directly to SAE-manifold assignment: ordinary ARD
 /// selects one global factor set for all observations, not a different set
 /// for each observation. A per-row IBP active set is the established GPFA
-/// remedy, adapted here to gamfit's REML/MAP engine with a finite truncation
+/// remedy, adapted here to gamfit's REML/LAML engine with a finite truncation
 /// and deterministic concrete relaxation.
 ///
-/// The target is row-major `(N, K)` logits. For MAP we use a deterministic
+/// # One model shared with the forward gate
+///
+/// This penalty is the negative-log-**posterior** of the SAME generative model
+/// the forward gate (`gam_sae::assignment::ibp_map_row`) implements, so the
+/// fit objective (reconstruction + this penalty) is the neg-log-posterior of a
+/// single model rather than two mismatched priors. The per-atom activation rate
+/// is `π_k ~ Beta(a_k, 1)` whose **prior mean**
+/// `E[π_k] = a_k/(a_k+1) = μ_k = (α/(α+1))^(k+1)` is exactly the ordered
+/// stick-breaking prior mean the forward gate multiplies in
+/// (`z_ik = σ(ℓ_ik/τ)·μ_k`); we take `a_k = μ_k/(1−μ_k)`. The gate applies the
+/// **prior mean** `μ_k`; this penalty scores the relaxed indicators against the
+/// **posterior mean** `π̂_k` of the same `π_k` — the empirical-Bayes / mean-field
+/// structure, one model, prior-vs-posterior mean.
+///
+/// The target is row-major `(N, K)` logits. We use a deterministic
 /// binary-concrete score `z_ik = sigmoid(logit_ik / tau)`, with optional
-/// Gumbel temperature annealing across outer iterations. Each column has
-/// `pi_k ~ Beta(alpha / K, 1)` and `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in
-/// the columnwise Beta-Bernoulli MAP `pi_k` from the relaxed active mass, so
-/// the penalty is a gauge-fixing prior: it breaks the per-row
-/// interchangeability of atom indices by making each row choose a sparse
+/// Gumbel temperature annealing across outer iterations, and
+/// `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in the columnwise Beta-Bernoulli
+/// **posterior mean** `pi_k = (M_k + a_k)/(N + a_k + 1)` from the relaxed active
+/// mass `M_k = Σ_i z_ik`, so the penalty is a gauge-fixing prior: it breaks the
+/// per-row interchangeability of atom indices by making each row choose a sparse
 /// binary-ish subset rather than assigning every atom a soft nonzero weight.
+/// As `α → 0` every `μ_k → 0`, so the prior collapses the active set toward the
+/// null (SPEC.md line 13); `α` is learnable for an empirical-Bayes fit.
 #[derive(Debug, Clone)]
 pub struct IBPAssignmentPenalty {
     pub k_max: usize,
@@ -66,6 +83,41 @@ impl IBPAssignmentPenalty {
             .unwrap_or(false)
     }
 
+    /// Per-column Beta(`a_k`, 1) shapes and their prior means `μ_k`.
+    ///
+    /// `μ_k = (α/(α+1))^(k+1)` is the ordered stick-breaking prior mean the
+    /// forward gate (`ibp_map_row`) multiplies in, and `a_k = μ_k/(1−μ_k)` is the
+    /// Beta shape whose prior mean `a_k/(a_k+1) = μ_k` matches it — so the gate's
+    /// multiplicative π and this penalty's Beta prior are ONE model. Returns
+    /// `(a_col, mu)`, each length `K`. `μ_k` is floored at the smallest positive
+    /// normal (mirroring the gate's `ordered_geometric_shrinkage_prior`) so every
+    /// atom keeps a live gradient path; the sparsity ordering is preserved.
+    fn column_beta_shapes(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
+        let log_ratio = (alpha / (alpha + 1.0)).ln();
+        let mut a_col = Array1::<f64>::zeros(self.k_max);
+        let mut mu = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let m = (((k + 1) as f64) * log_ratio).exp().max(f64::MIN_POSITIVE);
+            mu[k] = m;
+            a_col[k] = m / (1.0 - m);
+        }
+        (a_col, mu)
+    }
+
+    /// `∂a_k/∂ρ` with `ρ = logα` and `α = α_base·e^ρ`, for the learnable-α
+    /// channels. With `μ_k = (α/(α+1))^(k+1)` we have `∂μ_k/∂ρ = μ_k·(k+1)/(α+1)`
+    /// (the SAME `dπ_k/dρ` the forward gate's α-data derivative uses), and
+    /// `a_k = μ_k/(1−μ_k)` gives `∂a_k/∂ρ = (∂μ_k/∂ρ)/(1−μ_k)²`.
+    fn column_beta_shape_rho_deriv(&self, alpha: f64, mu: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut da = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let m = mu[k];
+            let dmu = m * ((k + 1) as f64) / (alpha + 1.0);
+            da[k] = dmu / ((1.0 - m) * (1.0 - m));
+        }
+        da
+    }
+
     #[must_use]
     pub fn with_temperature_schedule(mut self, schedule: GumbelTemperatureSchedule) -> Self {
         self.tau = schedule.current_tau(schedule.iter_count);
@@ -102,23 +154,30 @@ impl IBPAssignmentPenalty {
         out
     }
 
-    fn pi_map(&self, z: ArrayView1<'_, f64>, alpha: f64) -> Array1<f64> {
+    /// Columnwise Beta-Bernoulli **posterior mean** `π̂_k = (M_k + a_k)/(N + a_k + 1)`
+    /// of the per-atom activation rate `π_k ~ Beta(a_k, 1)`, with `M_k = Σ_i z_ik`
+    /// the relaxed active mass and `a_col` the per-column Beta shapes from
+    /// [`Self::column_beta_shapes`]. This is a genuine posterior MEAN (SPEC.md
+    /// line 3), NOT a MAP: the mode `(M_k + a_k − 1)/(N + a_k − 1)` is pinned to the
+    /// zero boundary whenever `a_k < 1` and the fitted mass is sparse, which would
+    /// make `∂π̂_k/∂M_k = 0` and drop the IBP cross-row Woodbury curvature for
+    /// precisely the active-sparsity regimes this prior is meant to model. The
+    /// prior mean `E[π_k] = a_k/(a_k+1) = μ_k` is the forward gate's multiplier, so
+    /// gate and penalty are one model (prior-vs-posterior mean).
+    fn pi_posterior_mean(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_col: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
         let n = z.len() / self.k_max;
-        let a = alpha / self.k_max as f64;
-        // Use the Beta-Bernoulli posterior mean, `(M_k + a)/(N + a + 1)`, as
-        // the smooth empirical-π plug-in.  The old MAP plug-in
-        // `(M_k + a - 1)/(N + a - 1)` is pinned to the zero boundary whenever
-        // `a < 1` and the fitted mass is sparse, which incorrectly makes
-        // `∂π_k/∂M_k = 0` and drops the IBP cross-row Woodbury curvature for
-        // precisely the active-sparsity regimes this prior is meant to model.
         let mut pi = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let mut active_mass = 0.0;
             for row in 0..n {
                 active_mass += z[row * self.k_max + k];
             }
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
-            let raw = (active_mass + a) / denom;
+            let denom = (n as f64 + a_col[k] + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let raw = (active_mass + a_col[k]) / denom;
             pi[k] = raw.clamp(IBP_INTERIOR_TOL, 1.0 - IBP_INTERIOR_TOL);
         }
         pi

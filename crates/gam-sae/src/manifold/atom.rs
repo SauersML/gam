@@ -1519,61 +1519,57 @@ impl SaeManifoldAtom {
         // penalty is decoder-magnitude-independent and must survive the peel.
     }
 
-    /// Recompute the intrinsic (arc-length) roughness Gram
+    /// Recompute the intrinsic (gauge-invariant) roughness Gram
     /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
-    /// basis Jacobian, and the current decoder coefficients (issue #673).
+    /// basis Jacobian / second jet, and the current decoder coefficients
+    /// (issue #673).
     ///
     /// The raw penalty `0.5·λ·tr(BᵀS B)` measures roughness per unit of the raw
     /// latent coordinate `t`, so it is *not* invariant under reparameterizing
     /// `t` — and the model evidence that ranks an atom's topology (circle vs
-    /// line) inherits that gauge dependence. The decoder curve is
-    /// `g(t) = Φ(t) B` and its pulled-back metric is the scalar squared speed
-    /// `m(t) = ‖g'(t)‖² = ‖J(t)‖²` with `J(t) = Φ'(t) B` (the decoder
-    /// Jacobian, [`Self::fill_decoded_derivative_row`]). The arc-length
-    /// roughness of an order-`r` operator reweights the raw-`t` derivative
-    /// energy density by `m^{½−r}` (`= m^{−3/2}` for the standard
-    /// second-derivative penalty), which removes the gauge dependence.
+    /// line) inherits that gauge dependence. The gauge-invariant target is the
+    /// roughness of the decoded FUNCTION itself, read off its intrinsic geometry
+    /// rather than the chart (SPEC: penalise the final function, not the
+    /// coefficients). Two closed forms realise it, dispatched on the manifold:
     ///
-    /// Realised as a per-coefficient symmetric congruence
-    /// `S̃ = W^{½} S W^{½}`, `W = diag(w_μ)`, `w_μ = m̄_μ^{β}`, `β = ½ − r`,
-    /// where `m̄_μ` is the basis-activation-weighted average squared speed
-    /// localised to coefficient `μ`,
-    /// `m̄_μ = (Σ_n Φ_μ(t_n)² m_n) / Σ_n Φ_μ(t_n)²`, `m_n = ‖J(t_n)‖²`. The
-    /// congruence keeps `S̃` symmetric PSD with the same rank as `S` (Sylvester
-    /// inertia), so the Kronecker Hessian `S̃ ⊗ I_p` and the REML
-    /// `rank(S)`-Occam term are structurally unchanged; only the metric-aware
-    /// log-det / quadratic value move, which is exactly the gauge correction.
+    /// * **Poincaré** — the hyperbolic conformal Dirichlet energy
+    ///   `E_g[f] = ∫ gᵃᵇ ∂_a f ∂_b f dμ_g` measured in the ball metric pulled
+    ///   back to the tangent chart, delegated to
+    ///   [`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`]
+    ///   (`curvature = −1`, the single source of truth for the hyperbolic
+    ///   metric). Needs the cached [`Self::latent_coords`] and the first-jet
+    ///   [`Self::basis_jacobian`]; absent coordinates fall back to the raw Gram.
+    ///   This is an ORDER-1 (Dirichlet) operator — a different order than the
+    ///   atom's second-derivative `smooth_penalty_raw` — but the effective Gram
+    ///   is installed DIRECTLY into `smooth_penalty`, so every downstream
+    ///   consumer (the REML rank / log-det Occam term, the Kronecker Hessian)
+    ///   reads the correct order off the matrix itself; no separate accounting is
+    ///   needed. See [`Self::try_poincare_conformal_gram`].
     ///
-    /// The metric weight is frozen at the current `B` (lagged-diffusivity /
-    /// IRLS surrogate): within one inner solve the penalty stays a quadratic
-    /// Gram form, and refreshing `W` between assemblies makes the *converged*
-    /// penalty the true arc-length roughness. The per-coefficient weight is
-    /// centered (its geometric mean is 1), so constant-speed atoms (the
-    /// periodic sin/cos basis, `m̄_μ ≡ c`) get `w_μ ≡ 1` and hence `S̃ = S`
-    /// exactly — periodic atoms are unaffected and no overall magnitude (which
-    /// `λ` already owns) leaks into the penalty.
+    /// * **All other manifolds** — the total squared SECOND FUNDAMENTAL FORM
+    ///   `∫_M ‖II‖²_g dμ` of the decoded embedding `γ(t) = BᵀΦ(t)`, delegated to
+    ///   [`Self::try_intrinsic_bending_gram`] for EVERY latent dim `d ≥ 1`. For
+    ///   `d = 1` this is exactly the reparameterisation-invariant curve bending
+    ///   `∫ κ² ds = Σ_i ‖P_N γ''(t_i)‖² / ‖γ'(t_i)‖³` — the NORMAL-projected
+    ///   acceleration weighted by the arc-length element `ds = ‖γ'‖ dt`, which
+    ///   zeroes the tangential part a chart reparameterisation manufactures (e.g.
+    ///   `γ(u) = u²e₁` and `γ(s) = s e₁` are the SAME straight segment and both
+    ///   score zero, whereas the old raw order-2 Gram charged `γ(u)'' = 2e₁ > 0`
+    ///   spuriously). For `d ≥ 2` it is the Riemannian-volume-weighted `‖II‖²_g`.
+    ///   It needs the cached analytic second jet
+    ///   ([`Self::basis_second_jet_values`]); if that is absent (a caller-managed
+    ///   / first-jet-only atom) the raw Gram is left untouched, so no atom
+    ///   regresses relative to the old flat fallback.
     ///
-    /// # `d = 1` (this scalar-speed path) vs `d ≥ 2` (the bending Gram)
+    /// A degenerate (empty/zero) raw Gram leaves `S̃ = S` untouched.
     ///
-    /// The scalar-speed reweighting below is the genuine arc-length
-    /// normalisation only for a 1-D latent (the circle-vs-line case the issue is
-    /// about): a curve has a single squared speed `m(t)` and the intrinsic
-    /// roughness is `∫ ‖g''(s)‖² ds` with `ds = √m dt`, which the `m^{½−r}`
-    /// density reweighting realises. For `d ≥ 2` the pullback metric is a
-    /// `d × d` MATRIX, arc length is replaced by the Riemannian area/volume
-    /// form, and — crucially — the raw coefficient-`t` Gram charges spurious
-    /// roughness on a FLAT atom merely seen through a CURVED chart (the Diff(M)
-    /// gauge leak the whole chart-honesty program, #673 / #1019, exists to
-    /// close). The correct gauge-invariant target is the total squared SECOND
-    /// FUNDAMENTAL FORM `∫_M ‖II‖²_g dμ`, delegated to
-    /// [`Self::try_intrinsic_bending_gram`]; this SUPERSEDES the historical
-    /// `latent_dim != 1` flat fallback. It requires the cached analytic second
-    /// jet ([`Self::basis_second_jet_values`]); if that is absent (a
-    /// caller-managed / first-jet-only atom) the raw Gram is left untouched, so
-    /// no atom regresses relative to the old fallback.
-    ///
-    /// A degenerate (empty/zero) raw Gram, or `smooth_penalty_order == 0` on a
-    /// `d = 1` atom, also leaves `S̃ = S` untouched.
+    /// The intrinsic geometry `(g, Γ)` / latent coordinates are FROZEN at the
+    /// current iterate (lagged-diffusivity / IRLS surrogate): within one inner
+    /// solve the penalty stays a fixed quadratic Gram, and refreshing between
+    /// assemblies makes the *converged* penalty the true intrinsic roughness. A
+    /// geodesic (zero-bending) image — the periodic sin/cos basis on `S¹`, a
+    /// straight decoder — carries no intrinsic roughness, so no overall magnitude
+    /// (which `λ` already owns) leaks into the penalty.
     ///
     /// # Curvature is identifiability (Scott / Thm B)
     ///

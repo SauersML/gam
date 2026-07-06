@@ -2240,11 +2240,31 @@ impl SaeManifoldTerm {
     /// θ-adjoint / ρ-trace contractions read this to differentiate the SAME
     /// majorized operator the evidence log-det factors. `false` (bit-identical
     /// legacy path) for the identity metric (`rank == p`) or no metric.
+    ///
+    /// NOTE: this gates the low-rank PSD *majorization* ONLY. Whitening of the
+    /// log-det row jets is a separate concern — the assembly whitens the
+    /// likelihood Hessian (`JᵀU UᵀJ`) whenever the metric `whitens_likelihood()`,
+    /// at ANY rank, so the row jets must be whitened under the same predicate
+    /// (`whiten_logdet_row_jets()`), NOT only when rank-deficient. A full-rank
+    /// non-identity whitening factor (e.g. `diag(1,2)`) still rescales the
+    /// output-space derivatives; gating whitening on rank-deficiency alone would
+    /// differentiate `JᵀJ` against an assembled `JᵀU UᵀJ`.
     pub(crate) fn ibp_low_rank_whiten(&self) -> bool {
         let p = self.output_dim();
         self.row_metric
             .as_ref()
             .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < p)
+    }
+
+    /// gam#2144 — `true` when the installed row metric whitens the likelihood at
+    /// ANY rank. Drives whitening of the log-det row jets so they differentiate
+    /// the SAME whitened operator (`JᵀU UᵀJ`) the assembly builds. Independent of
+    /// [`ibp_low_rank_whiten`], which additionally requires rank-deficiency for
+    /// the PSD majorization. `false` for the identity metric or no metric.
+    pub(crate) fn whiten_logdet_row_jets(&self) -> bool {
+        self.row_metric
+            .as_ref()
+            .is_some_and(|m| m.whitens_likelihood())
     }
 
     pub fn beta_dim(&self) -> usize {
@@ -7279,8 +7299,8 @@ impl SaeManifoldTerm {
             let mut jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
-            if self.ibp_low_rank_whiten() {
-                self.whiten_logdet_row_jets_for_low_rank_metric(row, &mut jets)?;
+            if self.whiten_logdet_row_jets() {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
             }
             // Atom index (k-weight) of each local t-var.
             let var_atom: Vec<usize> = jets
@@ -7688,6 +7708,15 @@ impl SaeManifoldTerm {
         let SaeLocalRowVar::Logit { atom: wrt_atom } = wrt else {
             return 0.0;
         };
+        // #Bug4: a FIXED logit (ungated atom, or every atom under frozen routing)
+        // has its assembled `htt` diagonal entry ZEROED (see
+        // `assignment_prior_grad_hdiag`), so the θ-adjoint third derivative of that
+        // zeroed entry must also be zero. Mirror the IBP channel zeroing in
+        // `ibp_assignment_third_channels`. The ThresholdGate/IBP branches below are
+        // both diagonal (`diag_atom == wrt_atom`), so masking on `wrt_atom` suffices.
+        if self.assignment.logit_is_fixed(wrt_atom) {
+            return 0.0;
+        }
         match self.assignment.mode {
             AssignmentMode::Softmax { .. } => {
                 // #1038: the softmax entropy Hessian is now stored DENSE in
@@ -7907,7 +7936,12 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    fn whiten_logdet_row_jets_for_low_rank_metric(
+    /// Whiten every log-det row-jet channel by the row metric factor
+    /// (`values ← Uᵀ values`), matching the assembly's whitened likelihood
+    /// Hessian. Applies at any rank (full-rank ⇒ `rank == p`, length preserved;
+    /// low-rank ⇒ `rank < p`, channels shrink to the whitened dim). Gated by
+    /// [`whiten_logdet_row_jets`] at the call sites.
+    fn apply_whiten_to_logdet_row_jets(
         &self,
         row: usize,
         jets: &mut SaeRowJets,
@@ -7915,7 +7949,7 @@ impl SaeManifoldTerm {
         let metric = self
             .row_metric
             .as_ref()
-            .ok_or_else(|| "logdet_theta_adjoint: low-rank whitening metric absent".to_string())?;
+            .ok_or_else(|| "logdet_theta_adjoint: whitening metric absent".to_string())?;
         let p = self.output_dim();
         for first in jets.first.iter_mut() {
             Self::whiten_logdet_metric_vec(metric, row, p, first)?;
@@ -8029,6 +8063,12 @@ impl SaeManifoldTerm {
         // gradient desyncs from the majorized evidence log-det. Bit-identical
         // (`false`) on the identity/no-metric path.
         let majorize_ibp = self.ibp_low_rank_whiten();
+        // gam#2144: whitening of the row jets tracks `whitens_likelihood()` at ANY
+        // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike),
+        // whereas `majorize_ibp` additionally requires rank-deficiency for the PSD
+        // majorization. Split the two so a full-rank non-identity metric still
+        // whitens the jets.
+        let whiten_row_jets = self.whiten_logdet_row_jets();
         let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, majorize_ibp)?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
@@ -8103,8 +8143,8 @@ impl SaeManifoldTerm {
             let mut jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
-            if majorize_ibp {
-                self.whiten_logdet_row_jets_for_low_rank_metric(row, &mut jets)?;
+            if whiten_row_jets {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
             }
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row

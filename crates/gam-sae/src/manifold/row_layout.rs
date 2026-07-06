@@ -755,4 +755,71 @@ mod softmax_reference_chart_tests {
             assert_ne!(k, 2, "logit slot {j} must not be the reference atom");
         }
     }
+
+    /// #Bug1 — the production entry point: `from_dense_weights` with the softmax
+    /// `reference_atom = Some(K−1)`, forcing the REFERENCE atom to be the LARGEST
+    /// assignment weight (so it is always selected into the compact active set).
+    /// The existing direct-`from_active_atoms_with_reference` test does not
+    /// exercise this softmax-weight path, and the sibling `from_dense_weights`
+    /// unit test uses the IBP/JumpReLU K-slot layout (`reference_atom = None`).
+    /// Asserts: the reference atom gets a coord block but NO free logit slot, and
+    /// `expand_row` never writes a reference-logit delta into atom 0's coordinate
+    /// offset.
+    #[test]
+    fn from_dense_weights_softmax_reference_largest_weight_has_no_logit_slot() {
+        use ndarray::Array1;
+        // K=3 softmax reduced chart. Full-q layout = [logit(atom0), logit(atom1),
+        // coord(atom0), coord(atom1), coord(atom2)]; atom 2 = reference (K−1).
+        let coord_dims = vec![1usize, 1, 1];
+        let coord_offsets_full = vec![2usize, 3, 4];
+        // Row 0: reference atom 2 is the LARGEST weight (would be selected first).
+        // Row 1: reference and atom 0 both large; all three above the relative
+        // cutoff so every atom is active (the reference-logit exclusion, not any
+        // truncation, is what this test pins).
+        let assignments = vec![
+            Array1::from_vec(vec![0.1_f64, 0.05, 0.85]),
+            Array1::from_vec(vec![0.45_f64, 0.001, 0.55]),
+        ];
+        let layout = SaeRowLayout::from_dense_weights(
+            &assignments,
+            /* k_active_cap */ 3,
+            /* relative_cutoff */ 1.0e-3,
+            coord_dims,
+            coord_offsets_full,
+            /* reference_atom */ Some(2),
+        );
+        // The reference atom, though the largest weight, must be active (coord
+        // block) but carry NO free logit slot in any row.
+        for row in 0..assignments.len() {
+            assert!(
+                layout.active_atoms[row].contains(&2),
+                "row {row}: reference atom must be in the active (coord) set"
+            );
+            for (j, &k) in layout.logit_atoms[row].iter().enumerate() {
+                assert_ne!(
+                    k, 2,
+                    "row {row} logit slot {j}: reference atom K−1 must have no logit slot"
+                );
+            }
+            // n_logit_active is exactly one fewer than active_atoms when the
+            // reference is active.
+            assert_eq!(
+                layout.n_logit_active(row),
+                layout.active_atoms[row].len() - 1,
+                "row {row}: reference atom must reduce the free-logit count by one"
+            );
+        }
+        // Row 0 active = {0,1,2}: compact [logit0, logit1, coord0, coord1, coord2].
+        // expand_row must place coord0 at full offset 2 (atom 0's coord slot) — the
+        // slot the pre-fix code corrupted with a phantom reference logit.
+        assert_eq!(layout.active_atoms[0], vec![0, 1, 2]);
+        assert_eq!(layout.logit_atoms[0], vec![0, 1]);
+        let mut out = vec![0.0_f64; 5];
+        layout.expand_row(0, &[1.0, 2.0, 3.0, 4.0, 5.0], &mut out);
+        // logit0→full0, logit1→full1, coord0→full2, coord1→full3, coord2→full4.
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        // Explicit: atom 0's coordinate offset (full index 2) holds the coord
+        // delta (3.0), NOT a reference-logit delta.
+        assert_eq!(out[2], 3.0, "atom 0 coord slot must not be a reference logit");
+    }
 }

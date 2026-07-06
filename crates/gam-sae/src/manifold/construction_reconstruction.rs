@@ -893,3 +893,48 @@ impl SaeManifoldTerm {
         })
     }
 }
+
+#[cfg(test)]
+mod persisted_reconstruct_tests {
+    use super::*;
+
+    // Exercises `reconstruct_persisted_atom_set` (and, transitively,
+    // `persisted_atom_basis_values`): a stateless K=1 periodic-atom round trip that
+    // must equal `a_i · (Φ(t_i) · B)` computed directly from the same evaluator.
+    #[test]
+    fn reconstruct_persisted_periodic_atom_matches_direct_decode() {
+        let n_rows = 4usize;
+        let p_out = 2usize;
+        let width = 3usize; // odd decoder width required for periodic
+        let coords = Array2::from_shape_vec((n_rows, 1), vec![0.1, 0.7, 1.9, 2.8]).unwrap();
+        let decoder =
+            Array2::from_shape_vec((width, p_out), vec![0.5, -0.2, 0.3, 0.9, -0.4, 0.1]).unwrap();
+        let assignments =
+            Array2::from_shape_vec((n_rows, 1), vec![1.0, 0.5, 0.8, 0.2]).unwrap();
+
+        let out = reconstruct_persisted_atom_set(
+            &[SaeAtomBasisKind::Periodic],
+            &[1usize],
+            &[decoder.view()],
+            &[coords.view()],
+            assignments.view(),
+            p_out,
+        )
+        .expect("reconstruct persisted periodic atom");
+        assert_eq!(out.dim(), (n_rows, p_out));
+
+        let evaluator = PeriodicHarmonicEvaluator::new(width).unwrap();
+        let (phi, _jet) = evaluator.evaluate(coords.view()).unwrap();
+        let decoded = phi.dot(&decoder);
+        for i in 0..n_rows {
+            for j in 0..p_out {
+                let expected = assignments[[i, 0]] * decoded[[i, j]];
+                assert!(
+                    (out[[i, j]] - expected).abs() < 1.0e-9,
+                    "row {i} col {j}: got {} expected {expected}",
+                    out[[i, j]]
+                );
+            }
+        }
+    }
+}

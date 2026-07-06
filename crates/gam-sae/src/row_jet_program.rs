@@ -195,6 +195,16 @@ pub struct SaeReconstructionRowProgram {
     pub logit_slot: Vec<Option<usize>>,
     /// Tower slot of atom `k`'s latent axis `j` primary (`coord_slot[k][j]`).
     pub coord_slot: Vec<Vec<usize>>,
+    /// Per-atom FIXED-gate override (#1026/#1033). `Some(value)` pins atom `k`'s
+    /// gate `ζ_k` to a CONSTANT equal to `value` — the active-routing gate the
+    /// value assembly used — with its logit derivative (and every higher gate
+    /// channel) identically zero. This covers both an UNGATED atom (`a_k ≡ 1`,
+    /// #1026) and FROZEN/amortized routing (`a_k ≡ predicted`, #1033): in either
+    /// case the logit is NOT a free Newton parameter, so the gate must not
+    /// re-derive from a stale free logit. `None` (or an out-of-range / empty
+    /// vector) leaves the atom on the free-logit gate law. Length is `K` when
+    /// populated; an empty vector means "no fixed gates" (the historical path).
+    pub fixed_gate_value: Vec<Option<f64>>,
     /// Total number of seeded primaries (= `K` of the tower).
     pub n_primaries: usize,
 }
@@ -205,7 +215,23 @@ impl SaeReconstructionRowProgram {
     /// Σ_j exp(ℓ_j·inv_tau)`; the per-atom logistic is `σ((ℓ_k − shift_k)·
     /// inv_tau)` depending only on its own logit. Both carry every derivative
     /// channel automatically.
+    /// The fixed-gate constant for atom `k`, if its gate is pinned
+    /// ([`Self::fixed_gate_value`]). Returns a `constant` tower — value equal to
+    /// the pinned active-routing gate, all derivative channels zero — so ungated
+    /// (#1026) and frozen-routing (#1033) atoms carry no logit sensitivity.
+    #[inline]
+    fn fixed_gate<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> Option<S> {
+        self.fixed_gate_value
+            .get(atom)
+            .copied()
+            .flatten()
+            .map(S::constant)
+    }
+
     fn gate_tower<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> S {
+        if let Some(fixed) = self.fixed_gate::<K, S>(atom) {
+            return fixed;
+        }
         match self.gate {
             RowGate::Softmax { inv_tau } => {
                 // Build exp(ℓ_j·inv_tau − shift) for every atom that has a free

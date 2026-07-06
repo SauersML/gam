@@ -842,6 +842,16 @@ pub fn tk_normalized_score(
     }
 }
 
+pub fn bic_score(deviance: f64, n_obs: usize, basis_size: usize) -> Result<f64, String> {
+    if n_obs <= 1 {
+        return Err("BIC scoring requires at least two observations".to_string());
+    }
+    if !deviance.is_finite() {
+        return Err("BIC scoring requires finite deviance".to_string());
+    }
+    Ok(deviance + (n_obs as f64).ln() * basis_size as f64)
+}
+
 // ===========================================================================
 // Discrete-mixture rung + cross-class adjudication (Object 3a / WP-C)
 // ===========================================================================

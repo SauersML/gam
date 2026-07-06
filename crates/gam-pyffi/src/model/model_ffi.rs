@@ -3321,6 +3321,22 @@ fn tierney_kadane_normalized_score(
     .map_err(PyValueError::new_err)
 }
 
+#[pyfunction]
+fn topology_bic_score(
+    py: Python<'_>,
+    fit: Py<PyAny>,
+    n_obs: usize,
+    basis_size: usize,
+) -> PyResult<f64> {
+    let fit = fit.bind(py);
+    let view = reml_fit_view(py, fit)?;
+    let deviance = extract_float_metadata_from_view(&view, DEVIANCE_KEYS)?.ok_or_else(|| {
+        py_value_error("BIC scoring requires fit.summary()['deviance']".to_string())
+    })?;
+    gam::solver::topology_selector::bic_score(deviance, n_obs, basis_size)
+        .map_err(PyValueError::new_err)
+}
+
 /// String dispatch for the torch fit entry — translate a Python `Smooth`
 /// subclass name into the matching torch entry kind string.
 #[pyfunction]
@@ -3621,6 +3637,8 @@ const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
+
+const DEVIANCE_KEYS: &[&str] = &["deviance"];
 
 const LOG_LIK_KEYS: &[&str] = &["log_likelihood", "loglik", "log_lik"];
 // Response-family tag, used only by the compare_models comparability guard
