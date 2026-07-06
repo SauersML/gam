@@ -1828,7 +1828,9 @@ impl SaeManifoldTerm {
 
     /// Set the curvature-homotopy dial `η ∈ [0, 1]` on every atom (#1007). At
     /// the default `η = 1` the basis is the full curved basis; `η = 0` is the
-    /// linear (Eckart-Young) relaxation. The next `refresh_basis` — which every
+    /// base-topology relaxation (the atom on its base, η-invariant columns only —
+    /// not a linear/affine model for curved bases, whose base columns still embed
+    /// curvature). The next `refresh_basis` — which every
     /// joint-fit entry point runs — installs the dialed basis, so the dial takes
     /// effect on the following corrector solve. Errors on a non-finite or
     /// out-of-range `η`.
@@ -1879,8 +1881,10 @@ impl SaeManifoldTerm {
     /// True when the curvature-homotopy `η` dial cannot move the basis: no
     /// atom evaluator declares curved columns (caller-managed atoms have no
     /// evaluator, hence no split — equally immovable). A one-harmonic periodic
-    /// bank (`M = 3`) is the canonical case: constant + fundamental are all
-    /// linear columns. Combined with an all-zero isometry ramp this makes the
+    /// bank (`M = 3`) is the canonical case: constant + fundamental are all base
+    /// (η-invariant) columns — the fundamental `[sin, cos]` is itself curved (it
+    /// traces the circle), so "base" here means "nothing left to dial", not
+    /// "linear". Combined with an all-zero isometry ramp this makes the
     /// entry walk's corrector problem η-invariant, which
     /// [`SaeManifoldOuterObjective::run_curvature_homotopy_entry_at_rho`] uses
     /// to collapse the η-grid to its first corrector.
