@@ -1330,7 +1330,8 @@ mod lever_wiring_2072_tests {
 
 #[cfg(test)]
 mod shape_uncertainty_joint_recompute_tests {
-    use crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture;
+    use super::*;
+    use crate::manifold::tests::gamma_fd_tiny_fixture;
 
     /// After a structure-search / finalization change, the shape bands are
     /// rebuilt at the FINAL state by `recompute_joint_shape_uncertainty`, which
@@ -1344,42 +1345,32 @@ mod shape_uncertainty_joint_recompute_tests {
     ///      marginal with the joint recompute genuinely changes the reported band.
     #[test]
     fn recompute_reproduces_joint_and_differs_from_per_atom_marginal() {
-        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
-        // Perturb the target off the model manifold so the inner optimum has a
-        // real residual (a meaningful dispersion / nonzero bands), and raise the
-        // penalty strengths off the fixture's near-zero defaults.
-        let (n, p) = (target.nrows(), target.ncols());
-        for row in 0..n {
-            for col in 0..p {
-                let phase = (row as f64 + 0.35) / n as f64;
-                let theta = std::f64::consts::TAU * phase;
-                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
-            }
-        }
-        rho.log_lambda_sparse = -0.5;
-        for value in rho.log_lambda_smooth.iter_mut() {
-            *value = -1.0;
-        }
-        for axis in rho.log_ard.iter_mut() {
-            for v in axis.iter_mut() {
-                *v = -0.5;
-            }
-        }
+        // A reliably-converging tiny state: the fixture target was assembled under
+        // a softmax gate, so switching to an IBP-MAP gate at the PD-region ρ
+        // (`log_lambda_sparse = 0.5`, the deflation-regression config) leaves a
+        // genuine reconstruction residual — a real dispersion and nonzero bands —
+        // while the state stays near its inner optimum so the undamped joint
+        // factor converges in a few steps.
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+        rho.log_lambda_sparse = 0.5;
 
         // Reference joint bands via the direct Schur path.
         let (_c, loss, cache) = term
-            .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged joint cache");
         let dispersion = term
             .reconstruction_dispersion(&loss, &cache, &rho)
             .expect("dispersion");
+        assert!(dispersion > 0.0, "a real residual ⇒ positive dispersion");
         let joint = term
             .assemble_shape_uncertainty(&cache, dispersion)
             .expect("direct joint bands");
 
-        // Property 1: the final-state recompute reproduces the joint path.
+        // Property 1: the final-state recompute reproduces the joint path (it IS
+        // the joint path, rebuilt from the term + ρ rather than a cached factor).
         let recomputed = term
-            .recompute_joint_shape_uncertainty(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .recompute_joint_shape_uncertainty(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("joint recompute");
         assert_eq!(recomputed.atoms.len(), joint.atoms.len());
         for (k, (a, b)) in recomputed.atoms.iter().zip(joint.atoms.iter()).enumerate() {
@@ -1394,24 +1385,31 @@ mod shape_uncertainty_joint_recompute_tests {
 
         // The joint per-channel SD genuinely varies across the p output channels
         // (the coordinate-Schur coupling makes each channel's decoder covariance
-        // differ) — a per-atom marginal `φ·Φᵀ H_k⁻¹ Φ` is constant across channels.
+        // differ) — a per-atom marginal `φ·Φᵀ H_k⁻¹ Φ` is IDENTICAL across
+        // channels. Measured scale-free as the within-row max/min ratio so a tiny
+        // dispersion (which scales every band equally) does not hide the spread.
         let mut joint_channel_spread = 0.0_f64;
         for atom in &joint.atoms {
             for gi in 0..atom.band_sd.nrows() {
                 let row = atom.band_sd.row(gi);
                 let min = row.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                joint_channel_spread = joint_channel_spread.max((max - min) / (1.0 + max.abs()));
+                if max > 0.0 {
+                    joint_channel_spread = joint_channel_spread.max((max - min) / max);
+                }
             }
         }
         assert!(
             joint_channel_spread > 1e-6,
-            "the JOINT band must carry per-output-channel variance (spread {joint_channel_spread:.3e}); \
-             a constant-across-channel band is the per-atom marginal the fix replaced"
+            "the JOINT band must carry per-output-channel variance (relative spread \
+             {joint_channel_spread:.3e}); a constant-across-channel band is the per-atom \
+             marginal the fix replaced"
         );
 
         // Property 2 (non-vacuity): the per-atom inner-Hessian marginal the
-        // fallback produces DIFFERS materially from the joint band.
+        // fallback produces DIFFERS materially from the joint band. Compared
+        // scale-free (both scale by the same dispersion), so the gap reflects the
+        // dropped cross-atom / coordinate couplings, not the dispersion.
         term.set_atom_inner_fits(target.view(), &rho, dispersion)
             .expect("inner fits harvested");
         let mut marginal = joint.clone();
@@ -1422,13 +1420,16 @@ mod shape_uncertainty_joint_recompute_tests {
         let mut compared = 0usize;
         for (a, b) in marginal.atoms.iter().zip(joint.atoms.iter()) {
             for (x, y) in a.band_sd.iter().zip(b.band_sd.iter()) {
-                if x.is_finite() && y.is_finite() {
-                    max_rel_gap = max_rel_gap.max((x - y).abs() / (1.0 + y.abs()));
+                if x.is_finite() && y.is_finite() && *y > 0.0 {
+                    max_rel_gap = max_rel_gap.max((x - y).abs() / y);
                     compared += 1;
                 }
             }
         }
-        assert!(compared > 0, "the per-atom marginal must fill finite bands to compare");
+        assert!(
+            compared > 0,
+            "the per-atom marginal must fill finite bands to compare"
+        );
         assert!(
             max_rel_gap > 1e-3,
             "the per-atom marginal must differ materially from the joint band \
