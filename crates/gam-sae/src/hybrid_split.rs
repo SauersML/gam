@@ -68,7 +68,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::chart_canonicalization::d1_atom_fitted_turning;
 use crate::manifold::{SaeManifoldAtom, solve_design_least_squares};
-use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_solve::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
@@ -307,6 +307,18 @@ pub struct AtomHybridVerdict {
     /// genuine linear-tail direction; a high-`Θ` atom with large `ΔEV` is a
     /// genuine curved family. `None` iff the caller did not supply LOAO EV.
     pub train_loao_delta_ev: Option<f64>,
+    /// Realized reconstruction explained variance of this atom's curved
+    /// contribution `a_k·γ_k(t)` against the same leave-this-atom-out response
+    /// residual `y_resp` used by the curved-vs-linear adjudication.
+    pub curved_ev: Option<f64>,
+    /// PCA/SVD envelope: explained variance of the top-`M` centered linear
+    /// subspace on the same response residual, where `M` is this atom's decoder
+    /// basis size. A single chart's image lies in a row-space of dimension at
+    /// most `M`, so the realized curved EV cannot beat this bound.
+    pub topm_linear_ev: Option<f64>,
+    /// `curved_ev / topm_linear_ev`. Near 1 means the one-chart fit is at its
+    /// information ceiling; well below 1 means solver/convergence headroom.
+    pub curved_vs_envelope_ratio: Option<f64>,
     /// The fitted straight sub-model for this slot, present iff the verdict
     /// selected LINEAR (`kept_curved == false`). The collapsed reconstruction
     /// substitutes this for the atom's curved decoded image, making the verdict
@@ -394,6 +406,114 @@ const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 /// `Σ_k max(Δ_k, 0)`) on top of the per-atom gate; see there for what that guard
 /// does and does not prove.
 const SAE_HYBRID_COLLAPSE_MAX_EV_LOSS: f64 = 1.0e-3;
+
+#[derive(Clone, Copy, Debug)]
+struct CurvedEnvelopeMetrics {
+    curved_ev: Option<f64>,
+    topm_linear_ev: Option<f64>,
+    curved_vs_envelope_ratio: Option<f64>,
+}
+
+fn reconstruction_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> Option<f64> {
+    if target.dim() != fitted.dim() {
+        return None;
+    }
+    let (n, p) = target.dim();
+    if n == 0 || p == 0 {
+        return None;
+    }
+    let mut means = vec![0.0_f64; p];
+    for col in 0..p {
+        for row in 0..n {
+            means[col] += target[[row, col]];
+        }
+        means[col] /= n as f64;
+    }
+    let mut rss = 0.0_f64;
+    let mut sst = 0.0_f64;
+    for row in 0..n {
+        for col in 0..p {
+            let residual = target[[row, col]] - fitted[[row, col]];
+            rss += residual * residual;
+            let centered = target[[row, col]] - means[col];
+            sst += centered * centered;
+        }
+    }
+    if rss.is_finite() && sst.is_finite() && sst > f64::MIN_POSITIVE {
+        Some(1.0 - rss / sst)
+    } else {
+        None
+    }
+}
+
+fn top_m_linear_ev(target: ArrayView2<'_, f64>, basis_size: usize) -> Option<f64> {
+    let (n, p) = target.dim();
+    if n == 0 || p == 0 || basis_size == 0 {
+        return None;
+    }
+    let mut means = vec![0.0_f64; p];
+    for col in 0..p {
+        for row in 0..n {
+            means[col] += target[[row, col]];
+        }
+        means[col] /= n as f64;
+    }
+    let mut centered = Array2::<f64>::zeros((n, p));
+    let mut sst = 0.0_f64;
+    for row in 0..n {
+        for col in 0..p {
+            let v = target[[row, col]] - means[col];
+            centered[[row, col]] = v;
+            sst += v * v;
+        }
+    }
+    if !(sst.is_finite() && sst > f64::MIN_POSITIVE) {
+        return None;
+    }
+    let (_u, sigma, _vt) = centered.svd(false, false).ok()?;
+    let keep = basis_size.min(sigma.len());
+    let mut captured = 0.0_f64;
+    for idx in 0..keep {
+        captured += sigma[idx] * sigma[idx];
+    }
+    if captured.is_finite() {
+        Some((captured / sst).min(1.0))
+    } else {
+        None
+    }
+}
+
+fn curved_envelope_metrics(
+    assign: ArrayView1<'_, f64>,
+    decoded: ArrayView2<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
+    basis_size: usize,
+) -> CurvedEnvelopeMetrics {
+    let n = assign.len();
+    let p = decoded.ncols();
+    let mut curved_fit = Array2::<f64>::zeros((n, p));
+    if decoded.nrows() == n && target_resid.dim() == (n, p) {
+        for row in 0..n {
+            let a = assign[row];
+            for col in 0..p {
+                curved_fit[[row, col]] = a * decoded[[row, col]];
+            }
+        }
+    }
+    let curved_ev = reconstruction_ev(target_resid, curved_fit.view());
+    let topm_linear_ev = top_m_linear_ev(target_resid, basis_size);
+    let curved_vs_envelope_ratio = match (curved_ev, topm_linear_ev) {
+        (Some(curved), Some(topm)) if topm.is_finite() && topm > f64::MIN_POSITIVE => {
+            Some(curved / topm)
+        }
+        _ => None,
+    };
+    CurvedEnvelopeMetrics {
+        curved_ev,
+        topm_linear_ev,
+        curved_vs_envelope_ratio,
+    }
+}
 
 /// The full-reconstruction SSR INCREASE from collapsing one `d = 1` atom to its
 /// fitted straight sub-model: `linear_rss − curved_rss`, where both arms are
@@ -1129,6 +1249,7 @@ where
     // so the geometry/EV pairing is structured report data, not a log line.
     let mut turnings: Vec<Option<f64>> = Vec::new();
     let mut delta_evs: Vec<Option<f64>> = Vec::new();
+    let mut envelope_metrics: Vec<CurvedEnvelopeMetrics> = Vec::new();
     // #1026 item-2 — per-slot collapse loss `Δ_k = linear_rss − curved_rss` for the
     // GLOBAL EV-preservation guard below. `Some(Δ_k)` for a curveable slot that
     // retained a curved alternative (so a chosen collapse there can be rolled back);
@@ -1151,6 +1272,13 @@ where
         let target_resid = target_resid_for(atom_idx);
         // Curved parameter price = the decoder's `M · p` coefficients.
         let curved_num_params = atom.decoder_coefficients.len();
+        let basis_size = atom.decoder_coefficients.nrows();
+        let envelope = curved_envelope_metrics(
+            assign.view(),
+            decoded.view(),
+            target_resid.view(),
+            basis_size,
+        );
         let fitted_turning = atom.basis_evaluator.as_ref().and_then(|evaluator| {
             d1_atom_fitted_turning(
                 evaluator.as_ref(),
@@ -1249,6 +1377,7 @@ where
                 manifolds.push(manifold);
                 turnings.push(fitted_turning);
                 delta_evs.push(delta_ev_for(atom_idx));
+                envelope_metrics.push(envelope);
                 deltas.push(delta);
                 linear_images.push(image);
             }
@@ -1278,6 +1407,7 @@ where
                     manifolds.push(manifold);
                     turnings.push(fitted_turning);
                     delta_evs.push(delta_ev_for(atom_idx));
+                    envelope_metrics.push(envelope);
                     deltas.push(delta);
                     linear_images.push(image);
                 }
@@ -1344,32 +1474,29 @@ where
         }
     }
 
-    let verdicts: Vec<AtomHybridVerdict> = names
-        .into_iter()
-        .zip(selection.atoms.iter().copied())
-        .zip(linear_images.into_iter())
-        .zip(turnings.into_iter())
-        .zip(delta_evs.into_iter())
-        .map(
-            |((((atom_name, choice), linear_image), fitted_turning), train_loao_delta_ev)| {
-                let kept_curved = !choice.param.is_linear();
-                AtomHybridVerdict {
-                    atom_name,
-                    choice,
-                    kept_curved,
-                    fitted_turning,
-                    train_loao_delta_ev,
-                    // Carry the straight sub-model only when the verdict collapses
-                    // this slot to linear — the curved slots keep their fitted image.
-                    linear_image: if kept_curved {
-                        None
-                    } else {
-                        Some(linear_image)
-                    },
-                }
+    let mut verdicts: Vec<AtomHybridVerdict> = Vec::with_capacity(names.len());
+    for slot in 0..names.len() {
+        let choice = selection.atoms[slot];
+        let kept_curved = !choice.param.is_linear();
+        let envelope = envelope_metrics[slot];
+        verdicts.push(AtomHybridVerdict {
+            atom_name: names[slot].clone(),
+            choice,
+            kept_curved,
+            fitted_turning: turnings[slot],
+            train_loao_delta_ev: delta_evs[slot],
+            curved_ev: envelope.curved_ev,
+            topm_linear_ev: envelope.topm_linear_ev,
+            curved_vs_envelope_ratio: envelope.curved_vs_envelope_ratio,
+            // Carry the straight sub-model only when the verdict collapses this
+            // slot to linear — the curved slots keep their fitted image.
+            linear_image: if kept_curved {
+                None
+            } else {
+                Some(linear_images[slot].clone())
             },
-        )
-        .collect();
+        });
+    }
 
     Ok(Some(SaeHybridSplitReport {
         verdicts,
@@ -1381,6 +1508,52 @@ where
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    #[test]
+    fn envelope_ratio_is_one_at_topm_linear_ceiling() {
+        let n = 4;
+        let assign = Array1::<f64>::ones(n);
+        let mut target = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let x = if row < 2 { -1.0 } else { 1.0 };
+            target[[row, 0]] = x;
+            target[[row, 1]] = 0.5 * x;
+        }
+        let metrics = curved_envelope_metrics(assign.view(), target.view(), target.view(), 1);
+        let curved = metrics.curved_ev.expect("curved EV");
+        let topm = metrics.topm_linear_ev.expect("top-M linear EV");
+        let ratio = metrics
+            .curved_vs_envelope_ratio
+            .expect("curved/envelope ratio");
+        assert!((curved - 1.0).abs() < 1.0e-12, "curved EV {curved}");
+        assert!((topm - 1.0).abs() < 1.0e-12, "top-M EV {topm}");
+        assert!((ratio - 1.0).abs() < 1.0e-12, "ratio {ratio}");
+    }
+
+    #[test]
+    fn envelope_ratio_reports_headroom_below_topm_linear() {
+        let n = 4;
+        let assign = Array1::<f64>::ones(n);
+        let mut target = Array2::<f64>::zeros((n, 2));
+        let mut decoded = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let x = if row < 2 { -1.0 } else { 1.0 };
+            let y = if row % 2 == 0 { -1.0 } else { 1.0 };
+            target[[row, 0]] = x;
+            target[[row, 1]] = y;
+            decoded[[row, 0]] = 0.5 * x;
+        }
+        let metrics = curved_envelope_metrics(assign.view(), decoded.view(), target.view(), 1);
+        let curved = metrics.curved_ev.expect("curved EV");
+        let topm = metrics.topm_linear_ev.expect("top-M linear EV");
+        let ratio = metrics
+            .curved_vs_envelope_ratio
+            .expect("curved/envelope ratio");
+        assert!((curved - 0.375).abs() < 1.0e-12, "curved EV {curved}");
+        assert!((topm - 0.5).abs() < 1.0e-12, "top-M EV {topm}");
+        assert!((ratio - 0.75).abs() < 1.0e-12, "ratio {ratio}");
+        assert!(ratio < 1.0, "headroom ratio must be below the envelope");
+    }
 
     /// A straight RESPONSE residual (the atom's data is a line) is explained
     /// equally well by both candidates, so the cheaper linear special case wins.
