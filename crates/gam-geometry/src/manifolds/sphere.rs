@@ -944,6 +944,85 @@ pub fn sphere_frechet_mean(
     Err("spherical Fréchet mean is not identifiable for these points".to_string())
 }
 
+/// Convert concept-restricted next-token probabilities to the behavior block's
+/// Hellinger-sphere chart response.
+///
+/// The steering/behavior-anchored SAE block is fitted in `q = sqrt(p)` rather
+/// than directly in probability coordinates.  For closed probability rows,
+/// `q` lies on the positive orthant of the unit sphere and the Fisher-Rao line
+/// element satisfies `ds_FR^2 = 4 ||dq||^2`; consequently a unit-speed chart in
+/// `q`-space has the local calibration `KL(t -> t + δ) = 2 δ^2 + O(δ^3)`.
+/// This helper is the single Rust-owned preprocessing seam for that block:
+/// validate and close the probabilities, take the square-root embedding,
+/// choose (or accept) the spherical Fréchet base point, and return the tangent
+/// log-map rows at that base.  The returned tangent coordinates are ambient
+/// sphere tangent vectors; callers can stack them as the second response block
+/// while sharing gates and latent `t` with the activation block.
+pub fn hellinger_behavior_tangent_block(
+    probabilities: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    base: Option<ArrayView1<'_, f64>>,
+    tol: f64,
+    max_iter: usize,
+) -> Result<(Array2<f64>, Array1<f64>), String> {
+    let (n, d) = probabilities.dim();
+    if n == 0 || d == 0 {
+        return Err("behavior probabilities must be a non-empty matrix".to_string());
+    }
+    let mut q = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut row_sum = 0.0_f64;
+        for col in 0..d {
+            let value = probabilities[[row, col]];
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "behavior probabilities must be finite and non-negative; got {value} \
+                     at ({row}, {col})"
+                ));
+            }
+            row_sum += value;
+        }
+        if !(row_sum.is_finite() && row_sum > 0.0) {
+            return Err(format!(
+                "behavior probability row {row} must have positive finite mass"
+            ));
+        }
+        let inv_sum = row_sum.recip();
+        for col in 0..d {
+            q[[row, col]] = (probabilities[[row, col]] * inv_sum).sqrt();
+        }
+    }
+    let base_point = match base {
+        Some(b) => {
+            if b.len() != d {
+                return Err(format!(
+                    "behavior base dimension {} does not match probability width {d}",
+                    b.len()
+                ));
+            }
+            normalize_sphere_matrix(Array2::from_shape_fn((1, d), |(_, j)| b[j]).view())?
+                .row(0)
+                .to_owned()
+        }
+        None => Array1::from(sphere_frechet_mean(q.view(), weights, tol, max_iter)?),
+    };
+    let tangent = response_sphere_log_map(q.view(), base_point.view())?;
+    Ok((tangent, base_point))
+}
+
+/// Local KL/nats calibration for a unit-speed Hellinger-sphere chart step.
+///
+/// Since `KL(p(t) || p(t + δ)) = 2 δ² + O(δ³)` when the chart has unit speed in
+/// `q = sqrt(p)` space, this is the scalar used by behavior-pinned steering
+/// reports for an already unit-gauged coordinate.  Non-finite deltas are
+/// rejected so diagnostics cannot silently publish fabricated nats.
+pub fn hellinger_unit_speed_predicted_nats(delta: f64) -> Result<f64, String> {
+    if !delta.is_finite() {
+        return Err("behavior chart delta must be finite".to_string());
+    }
+    Ok(2.0 * delta * delta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,6 +1107,36 @@ mod tests {
         let mean = sphere_frechet_mean(values.view(), None, 1.0e-12, 256).unwrap();
         // Mean should be close to e1 (dominant direction), not on the equator.
         assert!(mean[0] > 0.9, "expected near-e1 mean, got {mean:?}");
+    }
+
+    #[test]
+    fn hellinger_behavior_block_closes_sqrt_embeds_and_logs_at_base() {
+        let probs = array![
+            [4.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0],
+            [1.0, 1.0, 2.0],
+        ];
+        let base = array![1.0, 0.0, 0.0];
+        let (tangent, returned_base) =
+            hellinger_behavior_tangent_block(probs.view(), None, Some(base.view()), 1.0e-12, 256)
+                .expect("valid probability rows must produce a tangent block");
+        assert_eq!(returned_base.to_vec(), vec![1.0, 0.0, 0.0]);
+        // Row 0 closes to p=(1,0,0), hence q equals the base and the tangent is
+        // exactly zero.
+        assert!(tangent.row(0).iter().all(|v| v.abs() < 1.0e-12));
+        // Row 1 closes to p=(0,1,0), q=e2, whose spherical log at e1 is
+        // (π/2)e2 in ambient tangent coordinates.
+        assert!(tangent[[1, 0]].abs() < 1.0e-12);
+        assert!((tangent[[1, 1]] - std::f64::consts::FRAC_PI_2).abs() < 1.0e-12);
+        assert!(tangent[[1, 2]].abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn hellinger_unit_speed_nats_uses_fisher_rao_calibration() {
+        let delta = 0.125_f64;
+        let nats = hellinger_unit_speed_predicted_nats(delta).unwrap();
+        assert_eq!(nats, 2.0 * delta * delta);
+        assert!(hellinger_unit_speed_predicted_nats(f64::NAN).is_err());
     }
 
     #[test]
