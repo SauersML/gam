@@ -223,30 +223,42 @@ fn heuristic_lambdas_are_used_as_initial_rho_for_reml() {
 
 #[test]
 fn fitted_link_state_returns_none_for_standard_links() {
-    let (x, y, w, offset, s) = tiny_problem();
-    let opts = base_opts();
-    let family = LikelihoodSpec::new(
-        ResponseFamily::Binomial,
-        InverseLink::Standard(StandardLink::Logit),
-    );
-    let fit = fit_gam(
-        x.view(),
-        y.view(),
-        w.view(),
-        offset.view(),
-        &s,
-        family.clone(),
-        &opts,
-    )
-    .expect("fit should succeed");
+    // #2158: every state-less binomial probability link — logit/probit/cloglog
+    // AND loglog/cauchit — must decode to `Standard(None)`. Before the fix,
+    // loglog/cauchit fell to `fitted_link_state`'s `(Binomial, _)` catch-all and
+    // errored with "unsupported (binomial, link) combination", which broke the
+    // predict posterior-mean path (the fit succeeded but could not be predicted
+    // from). This drives the exact decode the predict round-trip depends on.
+    for link in [
+        StandardLink::Logit,
+        StandardLink::Probit,
+        StandardLink::CLogLog,
+        StandardLink::LogLog,
+        StandardLink::Cauchit,
+    ] {
+        let (x, y, w, offset, s) = tiny_problem();
+        let opts = base_opts();
+        let family = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link));
+        let fit = fit_gam(
+            x.view(),
+            y.view(),
+            w.view(),
+            offset.view(),
+            &s,
+            family.clone(),
+            &opts,
+        )
+        .unwrap_or_else(|e| panic!("fit under {link:?} should succeed: {e}"));
 
-    assert!(
-        matches!(
-            fit.fitted_link_state(&family).expect("state should decode"),
-            FittedLinkState::Standard(None)
-        ),
-        "expected fitted_link_state to return None payload for standard links"
-    );
+        assert!(
+            matches!(
+                fit.fitted_link_state(&family)
+                    .unwrap_or_else(|e| panic!("{link:?}: state should decode, got {e}")),
+                FittedLinkState::Standard(None)
+            ),
+            "{link:?}: expected fitted_link_state to return None payload for a state-less link"
+        );
+    }
 }
 
 #[test]
