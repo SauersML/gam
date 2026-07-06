@@ -1,6 +1,7 @@
 use crate::manifold::{
     CycleGraphAtom, GraphCompressionKind, GraphEdge, OccupancyLaw, graph_edge_rank_charge,
 };
+use crate::sparse_dict::{BlockSparseFit, harmonic_measure_coordinates};
 use ndarray::Array2;
 
 const WEEKDAY_ANCHORS: usize = 7;
@@ -98,6 +99,53 @@ fn keep_with_extra_retired(
         })
         .collect();
     (precisions, deltas)
+}
+
+fn circ_err(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+fn harmonic_code(spikes: &[(f64, f32)], h_count: usize) -> Vec<f32> {
+    let mut code = Vec::with_capacity(2 * h_count);
+    for h in 1..=h_count {
+        let mut cos_sum = 0.0_f32;
+        let mut sin_sum = 0.0_f32;
+        for &(t, amp) in spikes {
+            let phase = std::f64::consts::TAU * h as f64 * t;
+            cos_sum += amp * phase.cos() as f32;
+            sin_sum += amp * phase.sin() as f32;
+        }
+        code.push(cos_sum);
+        code.push(sin_sum);
+    }
+    code
+}
+
+fn harmonic_fit_from_codes(rows: &[Vec<f32>], block_size: usize) -> BlockSparseFit {
+    let n = rows.len();
+    let mut x = Array2::<f32>::zeros((n, block_size));
+    let mut codes = ndarray::Array3::<f32>::zeros((n, 1, block_size));
+    for row in 0..n {
+        for col in 0..block_size {
+            x[[row, col]] = rows[row][col];
+            codes[[row, 0, col]] = rows[row][col];
+        }
+    }
+    BlockSparseFit {
+        decoder: Array2::<f32>::eye(block_size),
+        blocks: Array2::<u32>::zeros((n, 1)),
+        gates: Array2::<f32>::ones((n, 1)),
+        codes,
+        gamma: 1.0,
+        block_utilization: vec![1.0],
+        block_stable_rank: vec![2.0],
+        explained_variance: 1.0,
+        epochs: 0,
+        converged: true,
+        block_topk: 1,
+        block_size,
+    }
 }
 
 #[test]
@@ -287,4 +335,69 @@ fn learned_graph_reads_branching_tree_and_detects_branch_vertex() {
         "branching tree must expose a degree>2 vertex: {degrees:?}"
     );
     assert_eq!(atom.certified_compression().kind, GraphCompressionKind::Tree);
+}
+
+#[test]
+fn two_date_modular_synthetic_binds_super_resolution_to_graph_base() {
+    let anchors = WEEKDAY_ANCHORS;
+    let rows = weekday_rows(anchors, ROWS_PER_ANCHOR);
+    let embeddings = unit_circle_anchor_embeddings(anchors);
+    let edges = CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
+    let n_eff = rows.len() as f64;
+    let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
+    let (precisions, deltas) = keep_all(edges.len(), charge);
+    let atom = CycleGraphAtom::from_reml_candidate_edges(
+        embeddings.view(),
+        &rows,
+        n_eff,
+        &edges,
+        &precisions,
+        &deltas,
+    )
+    .expect("weekday graph base");
+
+    let selection = atom.structure_selection();
+    assert!(selection.selected, "graph base must be selected before binding");
+    assert_eq!(selection.topology.b0, 1);
+    assert_eq!(selection.topology.b1, 1);
+    assert_eq!(selection.occupancy, OccupancyLaw::Discrete { anchors });
+
+    let h_count = 8usize;
+    let first_date = 1.0 / anchors as f64;
+    let second_date = 4.0 / anchors as f64;
+    assert!(
+        circ_err(first_date, second_date) > crate::super_resolution::separation_limit(h_count),
+        "two modular dates must clear the Prony separation guarantee"
+    );
+    let code_rows = vec![
+        harmonic_code(&[(first_date, 1.0), (second_date, 0.75)], h_count),
+        harmonic_code(&[(2.0 / anchors as f64, 0.9)], h_count),
+    ];
+    let fit = harmonic_fit_from_codes(&code_rows, 2 * h_count);
+    let report = harmonic_measure_coordinates(&fit, 0).expect("measure readout");
+    let row0 = report
+        .firings
+        .iter()
+        .find(|firing| firing.row == 0)
+        .expect("row 0 measure");
+
+    assert!(
+        row0.used_super_resolution,
+        "two-date graph-base code must invoke Prony/matrix-pencil recovery"
+    );
+    assert_eq!(row0.spikes.len(), 2);
+    assert!(
+        row0
+            .spikes
+            .iter()
+            .any(|spike| circ_err(spike.coordinate, first_date) < 1.0e-8),
+        "missing first modular date"
+    );
+    assert!(
+        row0
+            .spikes
+            .iter()
+            .any(|spike| circ_err(spike.coordinate, second_date) < 1.0e-8),
+        "missing second modular date"
+    );
 }
