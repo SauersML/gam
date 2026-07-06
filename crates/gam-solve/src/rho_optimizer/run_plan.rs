@@ -1761,13 +1761,34 @@ pub(crate) fn run_outer_with_plan(
                             // (#NaN-outer-loop): every line-search cost probe at
                             // this seed was infeasible, so BFGS would have spent
                             // its entire max_iterations budget on inner solves
-                            // that all fail. Route as a seed rejection so the
-                            // cascade tries the next seed instead of propagating
-                            // a fatal error.
-                            Err(EstimationError::RemlOptimizationFailed(format!(
-                                "BFGS aborted: globally infeasible neighbourhood \
-                                 at seed (probe-refusal guard): {message}"
-                            )))
+                            // that all fail. The seed itself, however, was a
+                            // finite value-and-gradient evaluation registered in
+                            // `CostStallGuard::observe_seed` before BFGS started.
+                            // Rejecting that finite incumbent confuses
+                            // "undefined neighbouring probes" with "invalid
+                            // dictionary" and can make a single-seed REML path
+                            // abort even though it has a usable best-so-far
+                            // point. Return the published incumbent as
+                            // NON-converged instead: this bounds the probe loop
+                            // without fabricating stationarity, while preserving
+                            // genuine startup-validation rejection for seeds that
+                            // never produced a finite incumbent.
+                            let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
+                            match exit {
+                                Some(exit) => Ok(outer_result_with_gradient_norm(
+                                    exit.rho,
+                                    exit.value,
+                                    exit.iterations,
+                                    Some(exit.grad_norm),
+                                    false,
+                                    *the_plan,
+                                )),
+                                None => Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "BFGS aborted: globally infeasible neighbourhood \
+                                     at seed without a finite incumbent \
+                                     (probe-refusal guard): {message}"
+                                ))),
+                            }
                         }
                         Err(BfgsError::ObjectiveFailed { message }) => {
                             Err(EstimationError::RemlOptimizationFailed(format!(

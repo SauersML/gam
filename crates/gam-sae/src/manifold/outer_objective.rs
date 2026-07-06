@@ -1640,6 +1640,9 @@ impl SaeManifoldOuterObjective {
     pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
         err.contains("inner solve did not converge at fixed ρ")
             || err.contains(
+                "objective stalled but the stalled point is not stationary",
+            )
+            || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
             )
             // A probed ρ whose cross-row IBP joint Hessian is non-PD has an

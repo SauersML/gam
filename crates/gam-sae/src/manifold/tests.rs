@@ -2432,6 +2432,11 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     );
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
+            "SaeManifoldTerm::reml_criterion: objective stalled but the stalled point is not stationary (‖g‖=1.0e0, ‖Π⊥gauge g‖=1.0e0, tol 1.0e-6); refusing to rank an off-optimum Laplace criterion"
+        )
+    );
+    assert!(
+        SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
             "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );

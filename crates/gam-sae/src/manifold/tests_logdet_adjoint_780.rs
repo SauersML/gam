@@ -214,6 +214,7 @@ fn dual_half_logdet_trace_2156(cache: &ArrowFactorCache, h: &Array2<f64>, dh: &A
     0.5 * report.total_derivative
 }
 
+#[allow(dead_code)]
 fn dual_logdet_trace_2156(
     label: &'static str,
     cache: &ArrowFactorCache,
