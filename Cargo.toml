@@ -275,6 +275,10 @@ path = "examples/cyl_family_repro.rs"
 name = "binomial_pspline_perf_1575"
 path = "examples/binomial_pspline_perf_1575.rs"
 
+[[test]]
+name = "calibration"
+path = "tests/quality/calibration/main.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
