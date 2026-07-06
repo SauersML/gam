@@ -4012,10 +4012,70 @@ pub(crate) fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change
     );
 }
 
+/// #1610 — the separation barrier's PSD majorizer must survive the production
+/// matrix-free / framed β-tier. The dense path writes a per-atom scalar ridge onto
+/// `sys.hbb`; the deferred path must return the SAME scalar through `atom_curv` so
+/// assembly can fold it into the structured penalty operator instead of silently
+/// dropping collapse-prevention curvature.
+#[test]
+pub(crate) fn separation_barrier_deferred_curvature_matches_dense_hbb_1610() {
+    let (term, _target, _rho) = small_two_atom_periodic_term();
+    let beta_dim = term.beta_dim();
+    let mut dense = ArrowSchurSystem::new(0, 0, beta_dim);
+    dense.gb = Array1::<f64>::zeros(beta_dim);
+    dense.hbb = Array2::<f64>::zeros((beta_dim, beta_dim));
+    let mut dense_atom_curv = vec![0.0_f64; term.k_atoms()];
+    assert!(
+        term.add_sae_separation_barrier(&mut dense, 1.0, true, &mut dense_atom_curv),
+        "fixture must activate the co-collapse separation barrier on the dense path"
+    );
+    assert!(
+        dense_atom_curv.iter().all(|v| *v == 0.0),
+        "dense path writes curvature directly to hbb, not the deferred atom accumulator"
+    );
+
+    let mut deferred = ArrowSchurSystem::new(0, 0, beta_dim);
+    deferred.gb = Array1::<f64>::zeros(beta_dim);
+    deferred.hbb = Array2::<f64>::zeros((0, 0));
+    let mut atom_curv = vec![0.0_f64; term.k_atoms()];
+    assert!(
+        term.add_sae_separation_barrier(&mut deferred, 1.0, false, &mut atom_curv),
+        "fixture must activate the co-collapse separation barrier on the deferred path"
+    );
+
+    for idx in 0..beta_dim {
+        assert!(
+            (dense.gb[idx] - deferred.gb[idx]).abs() <= 1.0e-12,
+            "dense and deferred paths must assemble the same barrier gradient at β[{idx}]"
+        );
+    }
+
+    let offsets = term.beta_offsets();
+    for atom_idx in 0..term.k_atoms() {
+        let start = offsets[atom_idx];
+        let end = if atom_idx + 1 < offsets.len() {
+            offsets[atom_idx + 1]
+        } else {
+            beta_dim
+        };
+        assert!(
+            atom_curv[atom_idx] > 0.0,
+            "deferred path must export positive per-atom collapse-prevention curvature"
+        );
+        for idx in start..end {
+            assert!(
+                (dense.hbb[[idx, idx]] - atom_curv[atom_idx]).abs() <= 1.0e-12,
+                "deferred atom curvature must equal the dense hbb diagonal for atom {atom_idx}"
+            );
+        }
+    }
+}
+
 /// `SaeRowLayout::from_dense_weights` must keep, per row, the
 /// top-`k_active_cap` atoms above the magnitude cutoff (always at least
 /// one), with compact coord starts that reproduce the `expand_row`
 /// round-trip back to full-q positions.
+
 #[test]
 pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
     // 3 atoms, coord dims [2, 1, 2] ⇒ full q = 3 + 5 = 8.
