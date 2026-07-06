@@ -2576,8 +2576,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
-    /// Eckart-Young linear relaxation is convex with a global optimum certified
-    /// by [`linear_span_anchor`]. Run the predictor-corrector `η`-walk from that
+    /// base-topology relaxation is convex, with a genuine low-rank (Eckart-Young)
+    /// residual ceiling certified by [`linear_span_anchor`] — the endpoint itself
+    /// is not linear for curved bases. Run the predictor-corrector `η`-walk from that
     /// anchor before blind multistart. On arrival the inner state is warm
     /// at the certified `η = 1` solution for the active seed; on a
     /// degenerate anchor or a detected bifurcation the term is left at the full
@@ -2807,8 +2808,9 @@ pub struct CurvatureBifurcation {
 pub struct CurvatureWalkReport {
     /// Whether the walk reached `η = 1` on the certified optimal branch.
     pub arrived: bool,
-    /// Eckart-Young anchor residual energy at `η = 0` (the certificate the
-    /// linear relaxation is solved to).
+    /// Eckart-Young (SVD low-rank) residual-ceiling energy at `η = 0`: the
+    /// certified rank bound the base-topology relaxation is solved against (a
+    /// lower bound on the residual at every η, not a linearity claim).
     pub anchor_residual_norm_sq: f64,
     /// First detected branch bifurcation (pivot collapse), or `None` when the
     /// pivot stayed strictly positive across the whole walk.
@@ -2841,12 +2843,16 @@ pub struct LinearSpanAnchor {
     pub residual_norm_sq: f64,
 }
 
-/// Curvature-homotopy linear-span anchor at `eta = 0`.
+/// Curvature-homotopy output linear-span (low-rank / Eckart-Young) anchor.
 ///
-/// This stage-1 primitive solves the neutral-gate linear relaxation by
-/// sequential Eckart-Young residual SVDs and canonicalizes every recovered output
-/// subspace through the same [`GrassmannFrame`] gauge used by the #972 frame
-/// machinery. It does not mutate `term` or replace the existing seed cascade.
+/// This stage-1 primitive certifies the rank-`Σ basis_size` Eckart-Young residual
+/// CEILING of the target by sequential residual SVDs, canonicalizing every
+/// recovered output *linear subspace* (the span of the top singular vectors — the
+/// "linear span" this anchor names) through the same [`GrassmannFrame`] gauge used
+/// by the #972 frame machinery. The ceiling is a lower bound on the residual at
+/// every `eta`; it is NOT a claim that the `eta = 0` parametric endpoint is a
+/// linear/affine model (for curved bases that base-topology chart still embeds
+/// curvature). It does not mutate `term` or replace the existing seed cascade.
 pub fn linear_span_anchor(
     term: &SaeManifoldTerm,
     targets: ArrayView2<'_, f64>,
