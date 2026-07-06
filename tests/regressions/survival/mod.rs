@@ -9,5 +9,6 @@ mod survival_surface_independent_of_predict_exit;
 mod transformation_survival_python_path_aborts_on_outer_trial;
 mod weibull_by_factor_per_group_baseline;
 mod weibull_cli_predict_baseline_double_counted_2129;
+mod weibull_cli_predict_baseline_regimes_2129;
 mod weibull_saved_baseline_scale_matches_anchor;
 mod weibull_survival_predict_not_degenerate;
