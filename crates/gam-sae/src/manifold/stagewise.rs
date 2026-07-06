@@ -339,15 +339,13 @@ fn fit_residual_covariance(
     }
     let activity = activity_of(term);
     let max_rank = config.max_factor_rank.min(p.saturating_sub(1)).max(1);
-    match StructuredResidualModel::fit(ResidualFactorInput {
+    StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residual.view(),
         activity: activity.view(),
         max_factor_rank: max_rank,
-    }) {
-        Ok(model) => Ok(Some((residual, model))),
-        // A degenerate residual fit is a stop signal, not an error.
-        Err(_) => Ok(None),
-    }
+    })
+    .map(|model| Some((residual, model)))
+    .map_err(|err| format!("fit_residual_covariance: structured residual fit failed: {err}"))
 }
 
 fn fit_single_atom_response_in_place(
@@ -2298,6 +2296,31 @@ mod tests {
             let tol = 1e-9 * (1.0 + w[0].abs());
             w[1] >= w[0] - tol
         })
+    }
+
+    /// A structured-residual fit error is a data/solver contract violation, not
+    /// "no residual structure".  The stagewise driver may stop cleanly on an
+    /// empty/single-channel residual, but it must not silently swallow a
+    /// non-finite residual and continue as if the residual producer merely found
+    /// nothing useful.
+    #[test]
+    fn residual_covariance_propagates_invalid_residual_errors() {
+        let n = 8usize;
+        let p = 2usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (atom0, cb0) = circle_atom("seed", &evaluator, &coords, 0, 1, p);
+        let (term, _rho) = build_term(vec![atom0], vec![cb0], &vec![vec![true]; n]);
+        let mut target = Array2::<f64>::zeros((n, p));
+        target[[3, 1]] = f64::NAN;
+
+        let err = fit_residual_covariance(&term, target.view(), &test_config())
+            .expect_err("non-finite residuals must be reported, not downgraded to None");
+        assert!(
+            err.contains("structured residual fit failed")
+                && err.contains("residuals must be finite"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Planted two-circles: the target is a genuine two-atom dictionary image, but
