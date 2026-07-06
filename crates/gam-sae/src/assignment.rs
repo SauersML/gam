@@ -877,6 +877,25 @@ impl SaeAssignment {
         self.mode.resolved_ibp_alpha(rho, self.ibp_alpha_override)
     }
 
+    /// Whether the truncated-IBP concentration α is a FREE outer parameter that
+    /// varies with ρ (`rho.log_lambda_sparse`). α is learnable ONLY when the mode
+    /// requests it AND no override (per-fit #1777 or the deprecated process-global
+    /// one) pins it: an override forces the fixed value and bypasses the learnable
+    /// schedule (see [`AssignmentMode::resolved_ibp_alpha`]), so α's ρ-derivatives
+    /// are then identically zero and every prior / log-det / IFT term must treat α
+    /// as a constant to stay consistent with the forward gate. `false` for non-IBP
+    /// modes. (#Bug6)
+    pub(crate) fn effective_alpha_is_learnable(&self) -> bool {
+        match self.mode {
+            AssignmentMode::IBPMap { learnable_alpha, .. } => {
+                learnable_alpha
+                    && self.ibp_alpha_override.is_none()
+                    && ibp_alpha_override().is_none()
+            }
+            _ => false,
+        }
+    }
+
     /// #1777 — install (or clear, with `None`) the PER-FIT IBP-α override on this
     /// assignment. Source of truth used by [`Self::resolved_ibp_alpha`]; the FFI
     /// reaches it through the term's `set_fit_config`.
@@ -1626,6 +1645,40 @@ pub(crate) fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
     out
 }
 
+/// Build the IBP sparsity penalty used by every assignment-prior term at `rho`,
+/// honoring #Bug6 (α is FIXED to the forward-gate value whenever an override
+/// pins it — `effective_alpha_is_learnable`, `resolved_ibp_alpha`) and #Bug4
+/// (ungated atoms are inert columns excluded from value/gradient/curvature).
+/// Returns `(penalty, rho_view)`; the fixed-α branch uses the `lambda_sparse`
+/// weight convention with an empty `rho_view`.
+fn ibp_prior_penalty(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    base_alpha: f64,
+    temperature: f64,
+) -> (IBPAssignmentPenalty, Array1<f64>) {
+    let learnable = assignment.effective_alpha_is_learnable();
+    let alpha_eff = if learnable {
+        base_alpha
+    } else {
+        assignment.resolved_ibp_alpha(rho).unwrap_or(base_alpha)
+    };
+    let mut penalty =
+        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable);
+    // #Bug4: ungated atoms have a pinned unit gate and a held-constant logit — they
+    // are inert columns excluded from the sparsity energy and all its derivatives.
+    if assignment.has_ungated() {
+        penalty.fixed_columns = Some(assignment.ungated.clone());
+    }
+    let rho_view = if learnable {
+        Array1::from_vec(vec![rho.log_lambda_sparse])
+    } else {
+        penalty.weight = rho.lambda_sparse();
+        Array1::zeros(0)
+    };
+    (penalty, rho_view)
+}
+
 pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)
@@ -1633,6 +1686,13 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
     }
     let target = flat_logits(assignment.logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return 0.0;
+    }
+    // #Bug4: under FROZEN routing every logit is inert (the gates come from the
+    // ρ-invariant frozen predictor, not `self.logits`), so the whole assignment
+    // sparsity prior is a constant with zero gradient/curvature — score it as 0 to
+    // match the derivative-side treatment. (Softmax rejects frozen routing.)
+    if assignment.routing_is_frozen() {
         return 0.0;
     }
     match assignment.mode {
@@ -1645,25 +1705,9 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::IBPMap {
-            temperature,
-            alpha,
-            learnable_alpha,
+            temperature, alpha, ..
         } => {
-            let mut penalty = IBPAssignmentPenalty::new(
-                assignment.k_atoms(),
-                alpha,
-                temperature,
-                learnable_alpha,
-            );
-            let rho_view = if learnable_alpha {
-                Array1::from_vec(vec![rho.log_lambda_sparse])
-            } else {
-                // Keep the fixed-alpha value path on the same weighting branch as
-                // assignment_prior_grad_hdiag; that gradient path owns the
-                // lambda_sparse convention for IBP assignment sparsity.
-                penalty.weight = rho.lambda_sparse();
-                Array1::zeros(0)
-            };
+            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::ThresholdGate {
@@ -1674,8 +1718,13 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             // machine-precision support as its gradient/Hessian. Data-fit
             // reconstruction remains hard-gated by `jumprelu_row`.
             let sparsity_strength = rho.lambda_sparse();
+            let k = assignment.k_atoms();
             let mut acc = 0.0;
-            for &logit in target.iter() {
+            for (idx, &logit) in target.iter().enumerate() {
+                // #Bug4: skip ungated (inert) atoms' logits.
+                if assignment.logit_is_fixed(idx % k) {
+                    continue;
+                }
                 if jumprelu_in_optimization_band(logit, threshold, temperature) {
                     acc += gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
                 }
@@ -1697,27 +1746,24 @@ pub(crate) fn assignment_prior_log_strength_derivative(
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
         return 0.0;
     }
+    // #Bug4: frozen routing ⇒ inert prior ⇒ zero ρ-derivative.
+    if assignment.routing_is_frozen() {
+        return 0.0;
+    }
     match assignment.mode {
         AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. } => {
             assignment_prior_value(assignment, rho)
         }
         AssignmentMode::IBPMap {
-            temperature,
-            alpha,
-            learnable_alpha,
+            temperature, alpha, ..
         } => {
-            let mut penalty = IBPAssignmentPenalty::new(
-                assignment.k_atoms(),
-                alpha,
-                temperature,
-                learnable_alpha,
-            );
-            if learnable_alpha {
-                let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
+            // #Bug6: `ibp_prior_penalty` picks the effective-α learnability (an
+            // override forces the fixed-α value branch) and the #Bug4 ungated mask.
+            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            if penalty.learnable_alpha {
                 penalty.grad_rho(target.view(), rho_view.view())[0]
             } else {
-                penalty.weight = rho.lambda_sparse();
-                penalty.value(target.view(), Array1::<f64>::zeros(0).view())
+                penalty.value(target.view(), rho_view.view())
             }
         }
     }
@@ -1732,6 +1778,10 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
     }
     let target = flat_logits(assignment.logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return Ok(Array1::<f64>::zeros(target.len()));
+    }
+    // #Bug4: frozen routing ⇒ inert prior ⇒ zero curvature everywhere.
+    if assignment.routing_is_frozen() {
         return Ok(Array1::<f64>::zeros(target.len()));
     }
     match assignment.mode {
@@ -1754,8 +1804,13 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
             let sparsity_strength = rho.lambda_sparse();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
+            let k = assignment.k_atoms();
             let mut d = Array1::<f64>::zeros(target.len());
             for idx in 0..target.len() {
+                // #Bug4: ungated (inert) atoms carry no curvature.
+                if assignment.logit_is_fixed(idx % k) {
+                    continue;
+                }
                 let logit = target[idx];
                 if !jumprelu_in_optimization_band(logit, threshold, temperature) {
                     continue;
@@ -1767,27 +1822,38 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
             Ok(d)
         }
         AssignmentMode::IBPMap {
-            temperature,
-            alpha,
-            learnable_alpha,
+            temperature, alpha, ..
         } => {
-            let mut penalty = IBPAssignmentPenalty::new(
-                assignment.k_atoms(),
-                alpha,
-                temperature,
-                learnable_alpha,
-            );
-            if learnable_alpha {
-                let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
-                Ok(penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view()))
+            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let mut d = if penalty.learnable_alpha {
+                penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view())
             } else {
-                penalty.weight = rho.lambda_sparse();
                 penalty
-                    .hessian_diag(target.view(), Array1::<f64>::zeros(0).view())
+                    .hessian_diag(target.view(), rho_view.view())
                     .ok_or_else(|| {
                         "IBP assignment log-strength hessian diag unavailable".to_string()
-                    })
-            }
+                    })?
+            };
+            // #Bug4: zero the curvature diagonal of ungated (inert) columns so the
+            // log-det ρ-trace never charges them (the array methods are not
+            // internally column-masked).
+            mask_fixed_logit_entries(assignment, &mut d);
+            Ok(d)
+        }
+    }
+}
+
+/// Zero the entries of a flat `(n·K)` per-(row, atom) array whose atom is a FIXED
+/// (ungated / frozen) logit, so an inert atom contributes nothing to the term.
+/// (#Bug4) No-op when nothing is fixed.
+fn mask_fixed_logit_entries(assignment: &SaeAssignment, arr: &mut Array1<f64>) {
+    if !(assignment.has_ungated() || assignment.routing_is_frozen()) {
+        return;
+    }
+    let k = assignment.k_atoms();
+    for idx in 0..arr.len() {
+        if assignment.logit_is_fixed(idx % k) {
+            arr[idx] = 0.0;
         }
     }
 }
@@ -1803,15 +1869,23 @@ pub(crate) fn assignment_prior_log_strength_target_mixed(
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
         return Ok(Array1::<f64>::zeros(target.len()));
     }
+    // #Bug4: frozen routing ⇒ inert prior ⇒ zero mixed derivative.
+    if assignment.routing_is_frozen() {
+        return Ok(Array1::<f64>::zeros(target.len()));
+    }
+    // #Bug6: the α-target mixed derivative only exists when α is EFFECTIVELY
+    // learnable (mode-learnable AND not pinned by an override); otherwise α is a
+    // constant and there is no log-α channel, so fall through to the grad_hdiag
+    // (fixed-α) path.
     match assignment.mode {
         AssignmentMode::IBPMap {
-            temperature,
-            alpha,
-            learnable_alpha: true,
-        } => {
-            let penalty = IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, true);
-            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse]);
-            Ok(penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view()))
+            temperature, alpha, ..
+        } if assignment.effective_alpha_is_learnable() => {
+            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let mut d = penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view());
+            // #Bug4: inert columns carry no mixed derivative.
+            mask_fixed_logit_entries(assignment, &mut d);
+            Ok(d)
         }
         _ => Ok(assignment_prior_grad_hdiag(assignment, rho)?.0),
     }
@@ -1844,40 +1918,17 @@ pub(crate) fn assignment_prior_grad_hdiag(
             (g, d)
         }
         AssignmentMode::IBPMap {
-            temperature,
-            alpha,
-            learnable_alpha,
+            temperature, alpha, ..
         } => {
-            // Scale the IBP assignment-sparsity prior by `lambda_sparse`, exactly
-            // like the Softmax and JumpReLU branches do (Softmax folds it into the
-            // penalty's rho coordinate, JumpReLU multiplies `sparsity_strength`).
-            // Previously the IBP penalty used its hardcoded `weight = 1.0` and the
-            // `rho.log_lambda_sparse` coordinate never reached it (the rho_view was
-            // empty for the common `learnable_alpha = false` config), so the prior
-            // ran at full strength with no way to dial it down — and its
-            // Beta-Bernoulli BCE energy `−mass·ln π_k − (n−mass)·ln(1−π_k)` toward
-            // the self-referential empirical active fraction `π_k` has its global
-            // minimum at the all-off gate, so at full weight it over-shrank the
-            // assignment off both atoms even with a truth-seeded decoder (#853).
-            // Routing `lambda_sparse` into the penalty weight makes the prior a
-            // genuine, user-controllable lever balanced against the data fit.
-            let mut penalty = IBPAssignmentPenalty::new(
-                assignment.k_atoms(),
-                alpha,
-                temperature,
-                learnable_alpha,
-            );
-            // When `alpha` is learnable, `log_lambda_sparse` already modulates
-            // it through `resolved_alpha(rho)`, so the weight stays 1.0 to avoid
-            // double-counting that coordinate. Only when `alpha` is fixed (so the
-            // sparse coordinate would otherwise be ignored entirely) does
-            // `lambda_sparse` become the prior's weight lever.
-            let rho_view = if learnable_alpha {
-                Array1::from_vec(vec![rho.log_lambda_sparse])
-            } else {
-                penalty.weight = rho.lambda_sparse();
-                Array1::zeros(0)
-            };
+            // Scale the IBP assignment-sparsity prior by `lambda_sparse` in the
+            // fixed-α branch (Softmax folds it into the penalty's rho coordinate;
+            // JumpReLU multiplies `sparsity_strength`). #Bug6: `ibp_prior_penalty`
+            // picks the EFFECTIVE-α learnability — an override pins α so the prior
+            // uses the fixed-α weight convention and the resolved (override) α,
+            // matching the forward gate — and installs the #Bug4 ungated mask. The
+            // per-atom fixed-logit columns are additionally zeroed post-hoc below,
+            // so the array (grad/hessian) methods need no internal column mask.
+            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
@@ -1943,9 +1994,7 @@ pub(crate) fn ibp_assignment_third_channels(
     majorize: bool,
 ) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
     let AssignmentMode::IBPMap {
-        temperature,
-        alpha,
-        learnable_alpha,
+        temperature, alpha, ..
     } = assignment.mode
     else {
         return Ok(None);
@@ -1954,17 +2003,11 @@ pub(crate) fn ibp_assignment_third_channels(
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
     let target = flat_logits(assignment.logits.view());
-    let mut penalty =
-        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
-    // Mirror assignment_prior_grad_hdiag exactly: when alpha is learnable the
-    // sparse coordinate already modulates it through resolved_alpha(rho), so the
-    // weight stays 1.0; otherwise lambda_sparse becomes the prior's weight lever.
-    let rho_view = if learnable_alpha {
-        Array1::from_vec(vec![rho.log_lambda_sparse])
-    } else {
-        penalty.weight = rho.lambda_sparse();
-        Array1::zeros(0)
-    };
+    // #Bug6: build with the EFFECTIVE-α learnability and weight convention that
+    // `assignment_prior_grad_hdiag` uses, so an α override differentiates the same
+    // fixed-α operator. Fixed-logit columns are zeroed post-hoc below (the channel
+    // arrays are not internally column-masked).
+    let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
     let mut channels =
         penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit

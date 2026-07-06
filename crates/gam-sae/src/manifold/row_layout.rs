@@ -85,10 +85,19 @@ pub(crate) struct JumpReluLayoutParams<'a> {
     pub threshold: f64,
     /// Gate temperature `τ`.
     pub temperature: f64,
-    /// `(n × k_atoms)` per-row logits.
+    /// `(n × k_atoms)` per-row EFFECTIVE ROUTING logits (frozen-aware): the hard
+    /// gate and in-band membership are decided on these, NOT the raw free
+    /// `self.logits`. Under frozen routing these are the predicted logits; when not
+    /// frozen they equal the free logits. (#Bug3)
     pub logits: &'a Array2<f64>,
-    /// `(n × k_atoms)` per-row separable-diagonal gradient magnitudes.
+    /// `(n × k_atoms)` per-row EFFECTIVE gate mass `a_{n,k}` (data-fit coupling),
+    /// NOT the separable prior gradient — the #2071 / #Bug7 block-size contract.
     pub contribution: &'a Array2<f64>,
+    /// Per-atom mask (length `k_atoms`) of UNGATED (#1026 background-tier) atoms
+    /// whose effective gate is pinned at `1.0` regardless of their logit. These are
+    /// force-included in the hard active set — they contribute a nonzero
+    /// reconstruction gate, so they MUST be in the compact support. (#Bug3)
+    pub ungated: &'a [bool],
     /// Cap on the per-row active-set size.
     pub k_active_cap: usize,
     /// Relative (per-row-peak) cutoff below which gated-off atoms are dropped.
@@ -124,13 +133,22 @@ impl SaeRowLayout {
     /// `K·(1+d)`, violating the `O(k_active)` contract on the very lane meant
     /// for large `K`.
     ///
-    /// `contribution[row, k]` is the exact magnitude of atom `k`'s separable
-    /// diagonal GRADIENT sub-vector at that row (`|∂P/∂logit| + Σ_axis
-    /// |∂ARD/∂t|`) — i.e. precisely the piece of `g_t` that leaves the row block
-    /// when `k` is dropped. Atoms are kept when they are hard-gated OR their
-    /// contribution exceeds `relative_cutoff · row_peak`, capped at
+    /// #Bug7 / #2071: `contribution[row, k]` is the atom's DATA-FIT COUPLING
+    /// magnitude — the EFFECTIVE gate mass `a_{n,k}` — NOT its separable prior
+    /// gradient. This is the load-bearing choice for the `O(k_active)` block-size
+    /// contract: gate mass is EXACTLY zero for every gated-off atom, so the
+    /// relative cutoff drops precisely the gated-off tail and the per-token block
+    /// stays `k_active·(1+d)` independent of `K`. (Scoring membership by the
+    /// separable prior gradient — which is `O(1)` for the many gated-off logits
+    /// sitting near the threshold — would re-bloat the block to `K·(1+d)`; see the
+    /// `AssignmentMode::ThresholdGate` assembly-plan comment.) A dropped gated-off
+    /// atom's separable diagonal prior term changes the assembled gradient by less
+    /// than the cutoff and leaves the OBJECTIVE VALUE bit-identical (the loss sums
+    /// the full −36 band independently of this layout). Atoms are kept when they
+    /// are hard-gated (nonzero effective gate, including every ungated atom) OR
+    /// their gate mass exceeds `relative_cutoff · row_peak`, capped at
     /// `k_active_cap` (hard-gated atoms are never dropped; the remaining budget
-    /// is filled by the highest-contribution gated-off atoms). Dropping an atom
+    /// is filled by the highest-mass gated-off atoms). Dropping an atom
     /// therefore changes the assembled gradient by less than the cutoff, and
     /// leaves the OBJECTIVE VALUE bit-identical (the loss's
     /// `assignment_prior_value` / `ard_value` sum the full −36 band
@@ -145,6 +163,7 @@ impl SaeRowLayout {
             temperature,
             logits,
             contribution,
+            ungated,
             k_active_cap,
             relative_cutoff,
             coord_dims,
@@ -163,10 +182,14 @@ impl SaeRowLayout {
                     temperature,
                 )
             };
-            // Hard forward gate: nonzero assignment mass ⇒ data-fit coupling in
-            // the joint block. Always retained.
+            // Hard forward gate: nonzero EFFECTIVE assignment mass ⇒ data-fit
+            // coupling in the joint block. Always retained. `logits` is the
+            // effective routing (frozen-aware), and #Bug3: an UNGATED atom has its
+            // gate pinned at 1.0 regardless of its logit, so it is always active in
+            // the reconstruction and MUST be in the compact support even when its
+            // raw logit sits below the threshold.
             let hard: Vec<usize> = (0..k_atoms)
-                .filter(|&k| row_logits[k] > threshold)
+                .filter(|&k| ungated[k] || row_logits[k] > threshold)
                 .collect();
             // Relative-cutoff base: the largest separable contribution over all
             // in-band atoms in this row.
@@ -403,6 +426,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: k,
             relative_cutoff: 1.0e-3,
             coord_dims: coord_dims.clone(),
@@ -426,6 +450,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: 2,
             relative_cutoff: 1.0e-3,
             coord_dims,
@@ -523,6 +548,7 @@ mod jumprelu_hard_gate_tests {
             temperature,
             logits: &logits,
             contribution: &contribution,
+            ungated: &vec![false; k],
             k_active_cap: k,
             relative_cutoff: 1.0e-3,
             coord_dims,

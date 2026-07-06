@@ -28,6 +28,13 @@ pub struct IBPAssignmentPenalty {
     pub learnable_alpha: bool,
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
+    /// Optional per-column (per-atom, length `k_max`) mask of FIXED columns that
+    /// are INERT in this prior — their logits are held constant (an ungated /
+    /// frozen SAE atom), so they contribute nothing to the value, gradient, or
+    /// curvature and their per-column Beta normalizer is excluded. `None`
+    /// (the default) scores every column, bit-for-bit the historical path. Set
+    /// via a plain field assignment, like `weight`. (#Bug4)
+    pub fixed_columns: Option<Vec<bool>>,
 }
 
 impl IBPAssignmentPenalty {
@@ -44,7 +51,19 @@ impl IBPAssignmentPenalty {
             learnable_alpha,
             weight: 1.0,
             weight_schedule: None,
+            fixed_columns: None,
         }
+    }
+
+    /// Whether column (atom) `k` is a FIXED / inert column excluded from this
+    /// prior (see [`Self::fixed_columns`]). `false` for every column when no mask
+    /// is set.
+    #[inline]
+    fn column_is_fixed(&self, k: usize) -> bool {
+        self.fixed_columns
+            .as_ref()
+            .and_then(|m| m.get(k).copied())
+            .unwrap_or(false)
     }
 
     #[must_use]
@@ -548,6 +567,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: a fixed/inert column contributes nothing to the energy.
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 acc -= zk * pk.ln() + (1.0 - zk) * (1.0 - pk).ln();
@@ -558,6 +581,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             // log contribution is -ln(a) - (a - 1) ln(pi). The normalizer is
             // constant only for fixed alpha; keep it in both modes so the energy
             // has one mathematical definition across configurations.
+            // #Bug4: skip the per-column normalizer of fixed/inert columns too.
+            if self.column_is_fixed(k) {
+                continue;
+            }
             acc -= a.ln();
             acc -= (a - 1.0) * pi[k].ln();
         }
@@ -792,6 +819,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         // the stationary mode), disagreeing with the FD of `value`.
         let mut acc = 0.0;
         for k in 0..self.k_max {
+            // #Bug4: a fixed/inert column contributes nothing to ∂F/∂ρ (its logits
+            // are held constant), matching its exclusion from `value`.
+            if self.column_is_fixed(k) {
+                continue;
+            }
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);

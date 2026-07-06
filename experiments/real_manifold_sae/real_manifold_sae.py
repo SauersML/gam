@@ -5,7 +5,14 @@ does its structure search DISCOVER unsupervised? Report reconstruction EV + atom
 Small (6k rows) first for a fast signal.
 """
 import json, os, time, numpy as np
-R=os.environ["GAM_DATA_ROOT"]  # required: data/scratch root (was a hardcoded cluster path)
+
+def required_env(name, message):
+    try:
+        return os.environ[name]
+    except KeyError as exc:
+        raise SystemExit(message) from exc
+
+R=required_env("GAM_MSI_DATA", "set GAM_MSI_DATA to the activation-harvest root")
 OUT=f"{R}/gam_ceiling_fable/experiments/real_manifold_sae"; os.makedirs(OUT, exist_ok=True)
 import gamfit
 

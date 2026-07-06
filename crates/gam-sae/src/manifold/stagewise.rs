@@ -700,17 +700,20 @@ fn residual_principal_birth_candidate(
     // runs multistart 2-plane Jacobi rotations maximizing the independence
     // contrast `(kappa - 2)^2` (dense clean circle kappa ~ 1, gated circle 1/q,
     // Gaussian blend exactly 2), and accepts only on the analytic-anchor
-    // certificate — see `isa_seed` for the math and derivations. ONE clean
-    // circle per single-birth call; the batched path below consumes every
-    // certified plane from one joint split. A residual carrying only
+    // certificate — see `isa_seed` for the math and derivations. The single-birth
+    // path still captures the full above-floor span and emits only the first
+    // certified plane from that resolved joint queue; the batched path below
+    // consumes every certified plane from one joint split. A residual carrying only
     // blends/saddles certifies nothing and falls through to the rank-1 seed
     // (no hallucinated circle birth).
     if template_accepts_circle_births(term) && parts.above.len() >= 2 {
-        let single_plane_parts = capture_signal_span(residual, 1).ok().flatten();
-        if let Some(cand) = single_plane_parts
+        let joint_span_parts = capture_signal_span(residual, parts.above.len())
+            .ok()
+            .flatten();
+        if let Some(cand) = joint_span_parts
             .as_ref()
-            .and_then(|single| {
-                isa_extract_certified_plane(residual, single, &IsaSeedConfig::default())
+            .and_then(|span| {
+                isa_extract_certified_plane(residual, span, &IsaSeedConfig::default())
             })
         {
             // Decoder on the cos/sin harmonic rows at the LS harmonic

@@ -390,15 +390,34 @@ impl SaeManifoldTerm {
                     // of peak (coarser gradient, smaller block); `1e-4` retains more
                     // near-threshold atoms (finer gradient, larger block).
                     const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
+                    // `assignments()` are the EFFECTIVE gates: ungated atoms pinned
+                    // to 1.0 and frozen routing read from `frozen_logits`. Gate mass
+                    // is the data-fit coupling contribution (the #2071 block-size
+                    // contract), and is already routing-aware.
                     let gates = self.assignment.assignments();
                     let contribution = gates.mapv(f64::abs);
+                    // #Bug3: select the compact support from the EFFECTIVE routing
+                    // logits (frozen-aware), NOT the raw free `self.logits`, so a
+                    // frozen atom's true gate decides membership. Ungated atoms are
+                    // force-included by `from_jumprelu` via the `ungated` mask.
+                    let routing = {
+                        let mut m = Array2::<f64>::zeros((n, k_atoms));
+                        for row in 0..n {
+                            let r = self.assignment.routing_logits_row(row);
+                            for k in 0..k_atoms {
+                                m[[row, k]] = r[k];
+                            }
+                        }
+                        m
+                    };
                     Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
                         n,
                         k_atoms,
                         threshold,
                         temperature,
-                        logits: &self.assignment.logits,
+                        logits: &routing,
                         contribution: &contribution,
+                        ungated: &self.assignment.ungated,
                         // Cap: rely on the relative cutoff to bound the active set;
                         // a memory-budget cap can be layered in like
                         // `sparse_active_plan` without changing the contract.

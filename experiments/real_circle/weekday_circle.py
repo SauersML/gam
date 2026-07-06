@@ -7,9 +7,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import os
 torch.set_num_threads(64)
-R = os.environ["GAM_DATA_ROOT"]  # required: data/model root (was a hardcoded cluster path)
-MODEL = os.path.join(R, "models", "qwen3-8b")
-OUT = os.path.join(R, "gam_ceiling_fable", "experiments", "real_circle")
+
+def required_env(name, message):
+    try:
+        return os.environ[name]
+    except KeyError as exc:
+        raise SystemExit(message) from exc
+
+DATA_ROOT = required_env("GAM_MSI_DATA", "set GAM_MSI_DATA to the activation-harvest root")
+MODEL = required_env("GAM_MODEL_DIR", "set GAM_MODEL_DIR to the model directory")
+OUT = os.path.join(DATA_ROOT, "gam_ceiling_fable", "experiments", "real_circle")
 os.makedirs(OUT, exist_ok=True)
 
 DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
