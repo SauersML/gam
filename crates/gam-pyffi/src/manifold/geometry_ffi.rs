@@ -594,6 +594,17 @@ fn response_geometry_fit_curvature<'py>(
 }
 
 #[pyfunction]
+fn sae_duchon_centers_nd<'py>(
+    py: Python<'py>,
+    centers_1d: PyReadonlyArray1<'py, f64>,
+    d: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let centers_owned = centers_1d.as_array().to_owned();
+    let out = py.detach(move || sae_duchon_centers_nd_impl(centers_owned.view(), d));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
     Ok(out.into_pyarray(py).unbind())
@@ -4226,6 +4237,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         response_geometry_sphere_normalize_base,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
