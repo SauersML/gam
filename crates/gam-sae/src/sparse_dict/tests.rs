@@ -343,6 +343,30 @@ fn sparse_transform_with_explicit_mode_reports_cpu_route_stats() {
     );
 }
 
+
+#[test]
+fn sparse_fit_default_auto_uses_cpu_below_device_floor() {
+    let (k, p, n) = (8usize, 10usize, 64usize);
+    let (x, _atoms) = planted(k, p, n, 0.1);
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: 1,
+        minibatch: 16,
+        max_epochs: 1,
+        score_tile: 8,
+        ..SparseDictConfig::new(k)
+    };
+
+    let fit = fit_sparse_dictionary(x.view(), &config)
+        .expect("default Auto mode must not require a subfloor CUDA route");
+
+    assert_eq!(config.score_mode, gam_gpu::GpuMode::Auto);
+    assert_eq!(fit.score_route_stats.minibatches, 8);
+    assert_eq!(fit.score_route_stats.cpu_minibatches, 8);
+    assert_eq!(fit.score_route_stats.device_minibatches, 0);
+    assert_eq!(fit.score_route_stats.admitted_minibatches, 0);
+}
+
 #[test]
 fn sparse_fit_records_score_route_stats() {
     let (k, p, n) = (8usize, 10usize, 64usize);

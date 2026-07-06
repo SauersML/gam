@@ -2429,6 +2429,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      ibp_alpha: float | None = None,
                      structured_residual_passes: int = 0,
                      promote_from_residual: bool = False,
+                     score_mode: str = "auto",
                      _run_structure_search: bool = True,
                      _run_outer_rho_search: bool = True) -> ManifoldSAE:
     """Fit an SAE-manifold model.
@@ -2563,6 +2564,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         residual passes are promoted into the primary atom tier rather than kept
         as a secondary residual dictionary. Only meaningful when
         ``structured_residual_passes > 0``. Coerced to ``bool``.
+    score_mode
+        Sparse front-door routing residency for the collapsed sparse-code lane.
+        ``"auto"`` (default) uses CUDA only when admitted and otherwise runs the
+        exact CPU router; ``"required"`` preserves fail-closed GPU residency;
+        ``"off"`` is CPU-only.
     learning_rate
         Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
         ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU.
@@ -3003,7 +3009,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             k_atoms,
             active=sparse_active,
             max_epochs=max_iter_total,
-            score_mode="required",
+            score_mode=str(score_mode),
         )
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an

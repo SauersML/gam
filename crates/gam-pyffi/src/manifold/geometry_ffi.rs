@@ -4916,7 +4916,7 @@ const SPARSE_DICT_DUAL_CERT_MAX_BIRTHS: usize = 16;
     code_ridge = 1.0e-6,
     decoder_ridge = 1.0e-6,
     tolerance = 1.0e-6,
-    score_mode = "required"
+    score_mode = "auto"
 ))]
 fn sparse_dictionary_fit<'py>(
     py: Python<'py>,
@@ -4988,7 +4988,7 @@ fn sparse_dictionary_fit<'py>(
     active,
     score_tile = 4096,
     code_ridge = 1.0e-6,
-    score_mode = "required"
+    score_mode = "auto"
 ))]
 fn sparse_dictionary_transform_ffi<'py>(
     py: Python<'py>,
@@ -5530,7 +5530,7 @@ impl SparseDictStream {
         code_ridge = 1.0e-6,
         decoder_ridge = 1.0e-6,
         tolerance = 1.0e-6,
-        score_mode = "required"
+        score_mode = "auto"
     ))]
     fn new(
         py: Python<'_>,
