@@ -172,9 +172,11 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 /// real OLMo-3-32B activations.
 ///
 /// The production entry of record for a K >= 2 dictionary is the #1007
-/// certified curvature-homotopy walk from the Eckart-Young LINEAR anchor. On
+/// certified curvature-homotopy walk from the base-topology anchor (whose
+/// residual is certified against the Eckart-Young SVD rank ceiling — the anchor
+/// endpoint itself is not linear for curved bases). On
 /// the long-tailed real spectrum the best achievable reconstruction EV at K
-/// atoms is bounded by the cumulative linear (PCA) ceiling — well under any
+/// atoms is bounded by the cumulative low-rank (PCA) ceiling — well under any
 /// fixed absolute EV target. The pre-#1189 absolute floor rejected EVERY genuine
 /// anchor arrival, the fit fell through to the blind seed cascade, and the
 /// cascade collapsed into the degenerate basin (in-sample EV <=
@@ -239,9 +241,11 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
         1.0e-6,
     );
 
-    // The certified Eckart-Young anchor IS the achievable linear ceiling on this
-    // data: anchor_ev = 1 - ||anchor residual||^2 / SST. This is exactly what the
-    // relative #1189 arrival floor is keyed to (`linear_span_anchor` is the same
+    // The certified Eckart-Young (SVD low-rank) projection IS the achievable rank
+    // ceiling on this data: anchor_ev = 1 - ||anchor residual||^2 / SST — a linear
+    // subspace projection, distinct from the η=0 parametric endpoint (which is the
+    // base-topology relaxation, not linear for curved bases). This is exactly what
+    // the relative #1189 arrival floor is keyed to (`linear_span_anchor` is the same
     // certificate `run_curvature_homotopy_entry_at_rho` reads, computed from SVDs
     // only — fast and solve-free).
     let anchor = linear_span_anchor(&objective.term, z_train.view())
@@ -265,8 +269,8 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
         s
     };
     let anchor_ev = 1.0 - anchor.residual_norm_sq / sst;
-    // The certified linear anchor is recoverable and meaningful on the real
-    // fixture (the certificate `run_curvature_homotopy_entry_at_rho` reads).
+    // The certified low-rank (SVD) anchor ceiling is recoverable and meaningful on
+    // the real fixture (the certificate `run_curvature_homotopy_entry_at_rho` reads).
     assert!(
         anchor_ev.is_finite() && anchor_ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
         "real-data Eckart-Young anchor ceiling {anchor_ev:.5} is degenerate (#1189)."
