@@ -8,9 +8,6 @@ use super::derivative_oracle::{
     BranchCertificate, DerivativeTraceChannel, Dual, ExactTraceChannel, ExactTraceReport,
     MajorizerAnchorMode, PivotBranch, dual_spd_logdet, guarded_exact_trace_report,
 };
-use super::construction::{
-    active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean,
-};
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 use super::*;
 

@@ -232,12 +232,10 @@ def summarize_head_numpy(
     bins = (np.arange(q.shape[0]) % period).astype(np.int64)
     score_sum = np.zeros((period, period), dtype=np.float64)
     score_count = np.zeros((period, period), dtype=np.int64)
-    bin_indices = [np.flatnonzero(bins == bin_index) for bin_index in range(period)]
-    for qb, query_indices in enumerate(bin_indices):
-        for kb, key_indices in enumerate(bin_indices):
-            block = scores_np[np.ix_(query_indices, key_indices)]
-            score_sum[qb, kb] = float(block.sum())
-            score_count[qb, kb] = int(block.size)
+    for query_index, qb in enumerate(bins):
+        for key_index, kb in enumerate(bins):
+            score_sum[int(qb), int(kb)] += float(scores_np[query_index, key_index])
+            score_count[int(qb), int(kb)] += 1
     if np.any(score_count == 0):
         raise SystemExit(f"head {head}: positional grid has empty QK cells")
     mean_scores = score_sum / score_count
