@@ -487,8 +487,9 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 ///
 /// The columns are `[1, x, y, z, xy, yz, xz]`; the constant column carries a
 /// numerically-negligible ridge (`1e-8`) so the penalty stays positive
-/// definite, the three linear columns are penalized at unit weight, and the
-/// three bilinear columns at weight `4` (their second-order angular content).
+/// definite, the three degree-one columns `[x, y, z]` are penalized at unit
+/// weight, and the three bilinear columns at weight `4` (their second-order
+/// angular content).
 /// This is the single source of truth for the chart penalty shared between the
 /// core SAE path and the PyFFI `sphere_chart_basis_with_jet` helper.
 pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0];
