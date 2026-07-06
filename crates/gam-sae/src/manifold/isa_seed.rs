@@ -36,7 +36,10 @@
 //! tuned ε) after mapping back through the GENERATIVE unwhitening `EΛ^{1/2}` to
 //! its ambient support plane. Deflation is not a separation method here; it is
 //! retained only as an external utility for callers that need to peel an
-//! accepted fitted curve.
+//! accepted fitted curve. That utility removes the accepted ambient plane's
+//! centered covariance projection across the residual rows; certification gates
+//! describe seed evidence, not which rows are allowed to retain accepted-plane
+//! energy during residual peeling.
 //!
 //! Everything here is derived from the residual spectrum (MP edge, bottom-
 //! quartile noise scale) plus the analytic κ anchors; the only dials are
@@ -720,11 +723,10 @@ pub(crate) fn capture_signal_span(
     if max_planes == 0 {
         return Ok(None);
     }
-    let max_dims = 2 * max_planes;
     let Some(mut parts) = isa_eigen_parts(residual)? else {
         return Ok(None);
     };
-    let mut keep = parts.above.len().min(max_dims);
+    let mut keep = parts.above.len();
     if keep % 2 == 1 {
         keep -= 1;
     }
@@ -869,20 +871,6 @@ pub fn isa_extract_certified_planes(
     max_planes: usize,
     config: &IsaSeedConfig,
 ) -> Vec<IsaPlaneCandidate> {
-    let single_parts;
-    let parts = if max_planes == 1 && parts.above.len() > 2 {
-        single_parts = IsaEigenParts {
-            mean: parts.mean.clone(),
-            evals: parts.evals.clone(),
-            evecs: parts.evecs.clone(),
-            above: parts.above.iter().take(2).copied().collect(),
-            mp_edge: parts.mp_edge,
-            sigma2_cert: parts.sigma2_cert,
-        };
-        &single_parts
-    } else {
-        parts
-    };
     let r = parts.above.len();
     if r < 2 || max_planes == 0 {
         return Vec::new();
@@ -934,13 +922,15 @@ pub fn isa_extract_certified_plane(
         .next()
 }
 
-/// Subtract an accepted plane's centered residual projection, in place: on each
-/// active row (finite gate) remove the residual component in the certified
-/// ambient SUPPORT plane. Certification still emits the LS harmonic amplitudes
-/// used by the birth seed; harvest deflation must zero the accepted plane's
-/// covariance so the next eigendecomposition surfaces the next circle.
+/// Subtract an accepted plane's centered residual projection, in place. Gates
+/// certify seed evidence only; deflation removes the certified ambient SUPPORT
+/// plane from every centered row so accepted-plane covariance is actually gone
+/// before the next eigendecomposition.
 pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandidate) {
     let (n, p) = residual.dim();
+    if n == 0 {
+        return;
+    }
     let mut mean = Array1::<f64>::zeros(p);
     for i in 0..n {
         for j in 0..p {
@@ -949,9 +939,6 @@ pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandi
     }
     mean.mapv_inplace(|v| v / n as f64);
     for i in 0..n {
-        if !cand.gate_logits[i].is_finite() {
-            continue;
-        }
         let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
         for j in 0..p {
             let ri = residual[[i, j]] - mean[j];
@@ -960,31 +947,6 @@ pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandi
         }
         for j in 0..p {
             residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
-        }
-    }
-    if cand.gate_logits.iter().all(|g| g.is_finite()) {
-        // Dense circles are present on every row, so after the first pass the
-        // accepted support plane should carry only roundoff. Recenter and remove
-        // that last numerical component explicitly; this is a no-op for sparse
-        // gates, where off-row plane noise must remain available to the noise
-        // floor rather than being silently deleted.
-        mean.fill(0.0);
-        for i in 0..n {
-            for j in 0..p {
-                mean[j] += residual[[i, j]];
-            }
-        }
-        mean.mapv_inplace(|v| v / n as f64);
-        for i in 0..n {
-            let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
-            for j in 0..p {
-                let ri = residual[[i, j]] - mean[j];
-                p1 += ri * cand.basis[[j, 0]];
-                p2 += ri * cand.basis[[j, 1]];
-            }
-            for j in 0..p {
-                residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
-            }
         }
     }
 }
@@ -1114,19 +1076,56 @@ mod tests {
         m.iter().map(|x| x * x).sum::<f64>() / 2.0
     }
 
+    const PLANE_OVERLAP_REAL_FLOOR: f64 = 0.9;
+    const PLANE_OVERLAP_BLEND_CEIL: f64 = 0.2;
+
+    #[derive(Debug)]
+    struct ProducerGateMetrics {
+        n_distinct: usize,
+        n_real: usize,
+        n_clean: usize,
+        n_planes: usize,
+        natural_exit: bool,
+        signal_span_dim: usize,
+        power_plane_count: usize,
+        residual_power_dim: usize,
+        residual_excess_energy: f64,
+        truth_overlaps: Vec<f64>,
+        best_overlaps: Vec<f64>,
+        second_overlaps: Vec<f64>,
+    }
+
+    fn residual_power_metrics(data: &Array2<f64>) -> (usize, f64) {
+        let Some(parts) = isa_eigen_parts(data.view()).expect("residual eigensolve must run") else {
+            return (0, 0.0);
+        };
+        let excess = parts
+            .above
+            .iter()
+            .map(|&idx| (parts.evals[idx] - parts.mp_edge).max(0.0))
+            .sum();
+        (parts.above.len(), excess)
+    }
+
     /// The DONE gate of #2111: run the producer, match each extracted plane to
     /// its best true plane, and count (distinct, real, clean). "Real" = best
     /// overlap ≥ 0.9; "clean" = additionally NOT spread onto a second circle
     /// (second-best overlap ≤ 0.2).
-    fn producer_gate(
+    fn producer_gate_metrics(
         data: &Array2<f64>,
         true_planes: &[Array2<f64>],
         max_planes: usize,
-    ) -> (usize, usize, usize, usize, bool) {
+    ) -> ProducerGateMetrics {
+        let captured = capture_signal_span(data.view(), max_planes)
+            .expect("initial capture must run")
+            .expect("fixture must have an above-threshold signal span");
+        let signal_span_dim = captured.above.len();
+        let power_plane_count = signal_span_dim / 2;
         let harvest = isa_deflationary_producer(data.view(), max_planes, &IsaSeedConfig::default())
             .expect("producer must run");
         let mut claimed = std::collections::HashSet::new();
         let (mut n_real, mut n_clean) = (0usize, 0usize);
+        let (mut best_overlaps, mut second_overlaps) = (Vec::new(), Vec::new());
         for cand in &harvest.planes {
             let mut overlaps: Vec<(f64, usize)> = true_planes
                 .iter()
@@ -1135,20 +1134,68 @@ mod tests {
                 .collect();
             overlaps.sort_by(|a, b| b.0.total_cmp(&a.0));
             claimed.insert(overlaps[0].1);
-            if overlaps[0].0 >= 0.9 {
+            best_overlaps.push(overlaps[0].0);
+            let second = overlaps.get(1).map_or(0.0, |(ov, _)| *ov);
+            second_overlaps.push(second);
+            if overlaps[0].0 >= PLANE_OVERLAP_REAL_FLOOR {
                 n_real += 1;
-                if overlaps.len() < 2 || overlaps[1].0 <= 0.2 {
+                if second <= PLANE_OVERLAP_BLEND_CEIL {
                     n_clean += 1;
                 }
             }
         }
-        (
-            claimed.len(),
+        let mut deflated = data.clone();
+        for cand in &harvest.planes {
+            isa_deflate_fitted_curve(&mut deflated, cand);
+        }
+        let (residual_power_dim, residual_excess_energy) = residual_power_metrics(&deflated);
+        let truth_overlaps = candidate_overlaps(&harvest.planes, true_planes);
+        ProducerGateMetrics {
+            n_distinct: claimed.len(),
             n_real,
             n_clean,
-            harvest.planes.len(),
-            harvest.natural_exit,
-        )
+            n_planes: harvest.planes.len(),
+            natural_exit: harvest.natural_exit,
+            signal_span_dim,
+            power_plane_count,
+            residual_power_dim,
+            residual_excess_energy,
+            truth_overlaps,
+            best_overlaps,
+            second_overlaps,
+        }
+    }
+
+    fn assert_producer_gate_margins(label: &str, metrics: &ProducerGateMetrics, k: usize) {
+        assert!(
+            metrics.signal_span_dim >= 2 * k && metrics.power_plane_count >= k,
+            "{label}: underpowered fixture before producer: metrics={metrics:?}"
+        );
+        assert!(
+            metrics
+                .truth_overlaps
+                .iter()
+                .all(|&ov| ov >= PLANE_OVERLAP_REAL_FLOOR),
+            "{label}: at least one true circle lacks a recovered plane: metrics={metrics:?}"
+        );
+        assert!(
+            metrics
+                .best_overlaps
+                .iter()
+                .all(|&ov| ov >= PLANE_OVERLAP_REAL_FLOOR),
+            "{label}: at least one emitted plane is not real: metrics={metrics:?}"
+        );
+        assert!(
+            metrics
+                .second_overlaps
+                .iter()
+                .all(|&ov| ov <= PLANE_OVERLAP_BLEND_CEIL),
+            "{label}: at least one emitted plane remains blended: metrics={metrics:?}"
+        );
+        assert!(
+            metrics.residual_power_dim == 0 && metrics.residual_excess_energy == 0.0,
+            "{label}: accepted-plane deflation left above-MP residual energy: metrics={metrics:?}"
+        );
     }
 
     /// DENSE TORUS, EQUAL AMPLITUDES — the load-bearing worst case: all six
@@ -1170,13 +1217,15 @@ mod tests {
         let k = 6usize;
         let amps = vec![1.0_f64; k];
         let (data, truth) = planted_circles(2000, 32, k, 1.0, &amps, 0.05, 0x2111_D07A_u64);
-        let (n_distinct, n_real, n_clean, n_planes, natural_exit) =
-            producer_gate(&data, &truth, 2 * k);
+        let metrics = producer_gate_metrics(&data, &truth, 2 * k);
+        assert_producer_gate_margins("dense equal-amplitude torus gate", &metrics, k);
         assert!(
-            n_distinct == k && n_real == k && n_clean == k && n_planes == k && natural_exit,
-            "dense equal-amplitude torus gate: n_distinct={n_distinct} n_real={n_real} \
-             n_clean={n_clean} planes={n_planes} natural_exit={natural_exit} (want 6/6/6, \
-             6 planes, natural exit)"
+            metrics.n_distinct == k
+                && metrics.n_real == k
+                && metrics.n_clean == k
+                && metrics.n_planes == k
+                && metrics.natural_exit,
+            "dense equal-amplitude torus gate exact all-six stress failed: metrics={metrics:?}"
         );
     }
 
@@ -1195,12 +1244,15 @@ mod tests {
         let k = 6usize;
         let amps: Vec<f64> = (0..k).map(|c| 1.0 + 0.1 * c as f64).collect();
         let (data, truth) = planted_circles(2000, 32, k, 0.25, &amps, 0.05, 0x2111_6A7E_u64);
-        let (n_distinct, n_real, n_clean, n_planes, natural_exit) =
-            producer_gate(&data, &truth, 2 * k);
+        let metrics = producer_gate_metrics(&data, &truth, 2 * k);
+        assert_producer_gate_margins("sparse gated gate", &metrics, k);
         assert!(
-            n_distinct == k && n_real == k && n_clean == k && n_planes == k && natural_exit,
-            "sparse gated gate: n_distinct={n_distinct} n_real={n_real} n_clean={n_clean} \
-             planes={n_planes} natural_exit={natural_exit} (want 6/6/6, 6 planes, natural exit)"
+            metrics.n_distinct == k
+                && metrics.n_real == k
+                && metrics.n_clean == k
+                && metrics.n_planes == k
+                && metrics.natural_exit,
+            "sparse gated gate exact all-six stress failed: metrics={metrics:?}"
         );
     }
 
