@@ -411,6 +411,10 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    path, grid, surface, times, id_column, row_ids, people_chunk, time_grid_chunk,
+    left_value = None, right_value = None, inf_value = None, clip_lo = None, clip_hi = None
+))]
 pub(crate) fn write_survival_csv(
     py: Python<'_>,
     path: &str,
@@ -421,6 +425,21 @@ pub(crate) fn write_survival_csv(
     row_ids: Option<Vec<String>>,
     people_chunk: usize,
     time_grid_chunk: usize,
+    // Boundary/clip policy, threaded from the single authoritative table in
+    // `gamfit._survival._SURVIVAL_EXTRAPOLATION` (issue #2154). This writer is
+    // the streaming counterpart of `survival_at`, and both must read the SAME
+    // fitted surface with the SAME extrapolation law so the CSV is byte-for-byte
+    // the numbers `survival_at` returns -- guaranteed by sharing one policy
+    // source and the `survival_csv_interpolate` / `clip_survival_surface_value`
+    // primitives (the same kernel behavior `interpolate_rows` uses), NOT by two
+    // hand-copied `(1.0, None, 0.0)` constants happening to agree. Defaults
+    // mirror `interpolate_rows`: `None` => nearest-endpoint / unclamped, so the
+    // caller (the Python wrapper) owns the survival law.
+    left_value: Option<f64>,
+    right_value: Option<f64>,
+    inf_value: Option<f64>,
+    clip_lo: Option<f64>,
+    clip_hi: Option<f64>,
 ) -> PyResult<String> {
     if people_chunk == 0 {
         return Err(py_value_error("people_chunk must be positive".to_string()));
@@ -492,21 +511,28 @@ pub(crate) fn write_survival_csv(
                 let time_stop = (time_start + time_grid_chunk).min(times_values.len());
                 for row_idx in row_start..row_stop {
                     for query_value in &times_values[time_start..time_stop] {
-                        let survival = survival_csv_interpolate(
-                            &surface_values,
-                            n_cols,
-                            &sorted_grid,
-                            &sorted_indices,
-                            row_idx,
-                            *query_value,
-                            // Same unified policy as the query path (#965):
-                            // S(t<=0)=1, finite past-grid flat-clamp (None),
-                            // S(+inf)=0.
-                            Some(1.0),
-                            None,
-                            Some(0.0),
-                        )
-                        .clamp(0.0, 1.0);
+                        // Interpolate + clip with the caller-supplied policy so
+                        // the stream matches `survival_at` exactly (issue #2154).
+                        // For the survival surface the Python wrapper threads
+                        // `(1.0, None, 0.0)` and clip `(0.0, 1.0)`, so this
+                        // reproduces the old unified query-path behavior
+                        // (#965/#1595: S(t<=0)=1, finite past-grid flat-clamp,
+                        // S(+inf)=0) -- now from one policy source, not a copy.
+                        let survival = clip_survival_surface_value(
+                            survival_csv_interpolate(
+                                &surface_values,
+                                n_cols,
+                                &sorted_grid,
+                                &sorted_indices,
+                                row_idx,
+                                *query_value,
+                                left_value,
+                                right_value,
+                                inf_value,
+                            ),
+                            clip_lo,
+                            clip_hi,
+                        );
                         match (id_column.as_ref(), row_ids.as_ref()) {
                             (Some(_column), Some(ids)) => {
                                 write!(writer, "{row_idx},")?;
