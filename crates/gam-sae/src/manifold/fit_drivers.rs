@@ -4590,31 +4590,25 @@ impl SaeManifoldTerm {
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
             self.retract_unit_speed_charts_in_loop()?;
-            // #1939 cone-atom RECOVERY retraction (Design B) — at this accepted
-            // OUTER-iterate boundary, retract ONLY the atoms whose decoder has
-            // COLLAPSED relative to its dictionary peers (breach vs peer median),
-            // folding the vanished ‖B_k‖ into s_k so the paired amplitude solve can
-            // re-home it — recovering a co-vanished born decoder (the K≥2
-            // 0.7255→0.0023 collapse) — while leaving HEALTHY atoms' scale in B.
-            //
-            // Shared by two flags, both breach-gated at this settled boundary:
-            //   * `cone_atom_recovery` (#1939) — recover a co-vanished born decoder.
-            //   * `quotient_scale` (#2022 SCALE-gauge) — after #2100 removed the
-            //     detonating per-β-Newton fold at `apply_newton_step_impl` (which
-            //     forced ‖B_k‖≡1 on EVERY atom every TRIAL and blew a healthy K=2
-            //     fit to EV→−1e128), the #2022 unit-Frobenius retraction lives HERE
-            //     instead: at the ACCEPTED iterate where the norms have settled, and
-            //     gated to the COLLAPSED atoms only. On a healthy dictionary nothing
-            //     breaches ⇒ strict no-op ⇒ EV preserved (healthy K=2 back to ~+0.43);
-            //     K<2 is a no-op inside the helper (the K=1 low-amp fit is untouched).
-            // Either flag does ONLY the breach-gated boundary retraction and never a
-            // per-Newton fold, so neither can detonate. K<2 / all-zero-median are
-            // no-ops inside the helper. Run the paired amplitude solve solely when an
-            // atom was actually retracted, so a fit with no collapsed atom is a strict
-            // no-op (bit-for-bit the flag-off path).
-            if (self.cone_atom_recovery || self.quotient_scale)
-                && self.retract_collapsed_decoders_in_loop() > 0
-            {
+            // #2022 SCALE quotient and #1939 cone-atom recovery live at the
+            // ACCEPTED-iterate boundary, never inside a line-search trial.  The two
+            // flags intentionally differ:
+            //   * `quotient_scale` is the hard quotient: every decoder frame is
+            //     retracted to unit Frobenius and its removed magnitude is carried by
+            //     `log_amplitude`, so the terminal dictionary cannot represent the
+            //     decoder-scale ↔ amplitude gauge ray.
+            //   * `cone_atom_recovery` (without the quotient flag) is the narrower
+            //     recovery path: retract only peer-collapsed atoms, then solve their
+            //     explicit amplitudes.
+            // In both cases the paired amplitude solve profiles the positive
+            // amplitudes against the fit's own weighted/whitened reconstruction
+            // metric.  Running it after the image-frozen peel keeps healthy fits on
+            // the same reconstruction while making the converged state live on the
+            // quotient rather than relying on PD floors in the gauge direction.
+            if self.quotient_scale {
+                self.retract_decoder_gauge_in_loop();
+                self.optimize_log_amplitudes_closed_form(target, rho)?;
+            } else if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
             }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
