@@ -215,6 +215,17 @@ fn dense_block_topk(
     Ok((blocks, gates, block_codes, width))
 }
 
+/// Build the fit-report sub-dict for a [`DualCertificateReport`] — the lane's
+/// global-optimality certificate channel: the certified fraction of rows, the
+/// per-row optimality-ratio quantiles, and the top strictly-improving
+/// `(row, atom, η)` birth candidates. Emitted on every lane fit so the global
+/// -optimality certificate sits beside the reconstruction/EV report the way the
+/// first-order LAML audit sits beside the exact-manifold fit.
+///
+/// This is the single crate-root definition, shared (by bare name, via the
+/// `include!`-flat namespace) with the sparse-dictionary / block entrypoints in
+/// `manifold/geometry_ffi.rs`. Returns a borrowed `Bound` handle; callers that
+/// need an owned `Py<PyDict>` `.unbind()` it, and `set_item` accepts either.
 fn dual_certificate_report_dict<'py>(
     py: Python<'py>,
     report: &gam::terms::sae::dual_certificate::DualCertificateReport,

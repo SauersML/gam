@@ -4899,26 +4899,12 @@ fn parse_sparse_dict_score_mode(score_mode: &str) -> PyResult<gam::gpu::GpuMode>
 /// tuned selection knob (the birth threshold itself is the derived `1`).
 const SPARSE_DICT_DUAL_CERT_MAX_BIRTHS: usize = 16;
 
-/// Build the fit-report sub-dict for a sparse-dictionary [`DualCertificateReport`]
-/// — the lane's global-optimality certificate channel: the certified fraction of
-/// rows, the per-row optimality-ratio quantiles, and the top strictly-improving
-/// `(row, atom, η)` birth candidates. Emitted on every lane fit so the global
-/// -optimality certificate sits beside the reconstruction/EV report the way the
-/// first-order LAML audit sits beside the exact-manifold fit.
-fn dual_certificate_report_dict(
-    py: Python<'_>,
-    report: &gam::terms::sae::dual_certificate::DualCertificateReport,
-) -> PyResult<Py<PyDict>> {
-    let out = PyDict::new(py);
-    out.set_item("n_rows", report.n_rows)?;
-    out.set_item("frac_certified", report.frac_certified)?;
-    out.set_item(
-        "optimality_ratio_quantiles",
-        report.optimality_ratio_quantiles.clone(),
-    )?;
-    out.set_item("birth_candidates", report.birth_candidates.clone())?;
-    Ok(out.unbind())
-}
+// The `DualCertificateReport` → PyDict builder shared by this lane's fits and the
+// SAE-spectral diagnostics lane lives once, as `dual_certificate_report_dict` in
+// `latent/sae_spectral_ffi.rs`. Both files are `include!`d into the crate root
+// (lib.rs) and share one namespace, so the entrypoints below reach it by bare
+// name. Keeping a single definition avoids the duplicate crate-root free function
+// that would otherwise make the crate (and the gamfit wheel) fail to compile.
 
 #[pyfunction(signature = (
     x,

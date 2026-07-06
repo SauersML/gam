@@ -6911,7 +6911,3 @@ fn sae_build_padded_basis_stacks(
         coord_blocks,
     ))
 }
-
-/// Build [`SaeAtomBuildPlan`]s from `(z, atom_basis, atom_dim)` + per-atom
-/// PCA seed. Periodic atoms get `n_harmonics = max(1, d_atom)`; Duchon atoms
-/// get deterministic center indices from the PCA seed.

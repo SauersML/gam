@@ -1,3 +1,6 @@
+/// Build [`SaeAtomBuildPlan`]s from `(z, atom_basis, atom_dim)` + per-atom
+/// PCA seed. Periodic atoms get `n_harmonics = max(1, d_atom)`; Duchon atoms
+/// get deterministic center indices from the PCA seed.
 fn sae_build_atom_plans(
     z: ArrayView2<'_, f64>,
     atom_basis: &[String],
