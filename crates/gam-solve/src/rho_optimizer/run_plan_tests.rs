@@ -548,6 +548,23 @@ fn plan_prefer_gradient_only_does_not_hide_analytic_hessian() {
 }
 
 #[test]
+fn plan_penalty_like_fixed_point_takes_efs_even_with_exact_hessian() {
+    let cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: DeclaredHessianForm::Either,
+        n_params: 3,
+        psi_dim: 0,
+        fixed_point_available: true,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let p = plan(&cap);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+}
+
+#[test]
 fn plan_survival_baseline_exact_hessian_selects_arc() {
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
@@ -629,6 +646,23 @@ fn plan_cost_only_many_params_with_fixed_point_still_efs() {
         gradient: Derivative::Unavailable,
         hessian: DeclaredHessianForm::Unavailable,
         n_params: 20,
+        psi_dim: 0,
+        fixed_point_available: true,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let p = plan(&cap);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+}
+
+#[test]
+fn plan_cost_only_few_penalty_params_with_fixed_point_uses_efs() {
+    let cap = OuterCapability {
+        gradient: Derivative::Unavailable,
+        hessian: DeclaredHessianForm::Unavailable,
+        n_params: 3,
         psi_dim: 0,
         fixed_point_available: true,
         barrier_config: None,
@@ -728,7 +762,7 @@ fn plan_penalty_like_without_fixed_point_stays_bfgs() {
 }
 
 #[test]
-fn plan_efs_not_selected_few_params_even_if_penalty_like() {
+fn plan_efs_selected_few_params_when_penalty_like() {
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -740,12 +774,12 @@ fn plan_efs_not_selected_few_params_even_if_penalty_like() {
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
 }
 
 #[test]
-fn plan_efs_not_selected_with_analytic_hessian() {
+fn plan_efs_selected_with_analytic_hessian_for_penalty_like_rho() {
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Either,
@@ -757,8 +791,8 @@ fn plan_efs_not_selected_with_analytic_hessian() {
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    // Arc is always preferred when analytic Hessian is available.
-    assert_eq!(p.solver, Solver::Arc);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
 }
 
 #[test]
@@ -2609,15 +2643,12 @@ fn automatic_fallbacks_without_gradient_stop_at_fixed_point_status() {
 }
 
 #[test]
-fn automatic_fallbacks_do_not_repeat_arc_when_fixed_point_is_irrelevant() {
-    // The contract here is that the cascade does not lateral-hop ARC
-    // through the EFS planner arm when `fixed_point_available=true` is
-    // incidentally set on an (Analytic, Analytic) capability that the
-    // planner already chose ARC for. Combined with the
-    // analytic-Hessian-preservation contract enforced by
-    // `automatic_fallbacks_preserve_analytic_hessian_for_arc_primary`,
-    // the ARC primary now has zero degraded fallbacks — the runner's
-    // ARC budget-bump retry ladder owns recovery.
+fn automatic_fallbacks_degrade_efs_to_first_order_once() {
+    // A penalty-only REML block with an EFS implementation must use that
+    // stationarity solver even if exact Hessians are available for other
+    // consumers. If the EFS attempt itself requests fallback, the automatic
+    // cascade disables fixed-point once and exposes the analytic gradient to
+    // the standalone first-order route.
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Either,
@@ -2628,14 +2659,12 @@ fn automatic_fallbacks_do_not_repeat_arc_when_fixed_point_is_irrelevant() {
         prefer_gradient_only: false,
         disable_fixed_point: false,
     };
-    assert_eq!(plan(&cap).solver, Solver::Arc);
+    assert_eq!(plan(&cap).solver, Solver::Efs);
 
     let attempts = automatic_fallback_attempts(&cap);
-    assert!(
-        attempts.is_empty(),
-        "ARC primary with incidental fixed_point_available must not \
-             cascade through the EFS arm or lateral-demote to BFGS",
-    );
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].disable_fixed_point);
+    assert_eq!(plan(&attempts[0]).solver, Solver::Arc);
 }
 
 #[test]

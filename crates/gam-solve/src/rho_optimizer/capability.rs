@@ -219,10 +219,7 @@ impl OuterCapability {
     }
 
     fn efs_plan_eligible(&self) -> bool {
-        self.fixed_point_available
-            && !self.disable_fixed_point
-            && self.all_penalty_like()
-            && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
+        self.fixed_point_available && !self.disable_fixed_point && self.all_penalty_like()
     }
 
     fn hybrid_efs_plan_eligible(&self) -> bool {
@@ -352,19 +349,24 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
     use Solver as S;
 
     match (cap.gradient, cap.declared_hessian_for_planning()) {
-        (Analytic, Analytic) => OuterPlan {
-            solver: S::Arc,
-            hessian_source: H::Analytic,
-        },
-        // EFS: all penalty-like coords, no analytic Hessian, many params.
+        // EFS: all penalty-like coords with an available fixed-point lane.
         // Multiplicative fixed-point needs only traces — no gradient evals.
-        // Much cheaper than BFGS for k=10-50 smoothing parameters.
+        // Much cheaper than generic BFGS/ARC probing for smoothing parameters.
+        // It is also the mathematically native REML smoothing-parameter
+        // stationarity solve when an analytic Hessian is available: the Hessian
+        // is useful for uncertainty diagnostics, but it should not force the
+        // production optimizer onto generic ARC probes that re-solve the full
+        // inner problem many times for a penalty-only rho block.
         //
         // When a log-barrier is present (monotonicity constraints), EFS is
         // still selected here. The EFS iteration loop in `run_outer` performs
         // a quantitative check each step via `barrier_curvature_is_significant`
         // and bails out early if the barrier curvature becomes non-negligible
         // relative to the penalized Hessian diagonal.
+        (Analytic, Analytic) if cap.efs_plan_eligible() => OuterPlan {
+            solver: S::Efs,
+            hessian_source: H::EfsFixedPoint,
+        },
         (Analytic, Unavailable) if cap.efs_plan_eligible() => OuterPlan {
             solver: S::Efs,
             hessian_source: H::EfsFixedPoint,
@@ -372,6 +374,11 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
         (Unavailable, Unavailable) if cap.efs_plan_eligible() => OuterPlan {
             solver: S::Efs,
             hessian_source: H::EfsFixedPoint,
+        },
+
+        (Analytic, Analytic) => OuterPlan {
+            solver: S::Arc,
+            hessian_source: H::Analytic,
         },
 
         // Hybrid EFS: ψ (design-moving) coords present alongside ρ coords.
