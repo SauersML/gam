@@ -9,7 +9,7 @@
 
 ## Protocol
 
-- Model: `/projects/standard/hsiehph/sauer354/models/qwen3-8b`
+- Model: `qwen3-8b`
 - Feature: `weekday` with 7 periodic labels
 - Patched block: module index `17` (hidden-state L18)
 - Atom fit: one periodic harmonic decoder, harmonics `2`, ridge `0.001`

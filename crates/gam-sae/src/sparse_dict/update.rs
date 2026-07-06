@@ -317,7 +317,8 @@ impl DecoderNormalEq {
 
     /// Stream one shard's `(x, codes)` into the running normal equations,
     /// adding its `CᵀC` / `CᵀX` contributions. Summing a corpus's shards this
-    /// way yields exactly the same `(A, B)` as [`assemble_normal_eq`] over the
+    /// way yields exactly the same `(A, B)` as `assemble_normal_eq` (the
+    /// test-only full-batch reference implementation) over the
     /// concatenation (addition is associative; the per-row contributions are
     /// independent), so the streaming decoder refresh equals the full-batch one.
     pub(super) fn accumulate(&mut self, x: ArrayView2<'_, f32>, codes: &[SparseCode]) {
@@ -381,84 +382,6 @@ impl DecoderNormalEq {
         }
         self.off
             .retain(|&(a, b), _| !gate[a as usize].refresh && !gate[b as usize].refresh);
-    }
-}
-
-/// Assemble the sparse decoder normal equations `(A + ρI) D = B` from the fixed
-/// codes/supports (`ρ` is applied at solve time, so this returns the bare
-/// `A`/`B`). Streams the rows once, accumulating only the entries the codes
-/// touch — never an `N×K` or dense `K×K` object.
-fn assemble_normal_eq(
-    x: ArrayView2<'_, f32>,
-    codes: &[SparseCode],
-    k: usize,
-    p: usize,
-) -> DecoderNormalEq {
-    let mut diag = vec![0.0f64; k];
-    let mut b = Array2::<f64>::zeros((k, p));
-    let mut off: HashMap<(u32, u32), f64> = HashMap::new();
-    let mut firings = vec![0usize; k];
-    let mut amplitude_sum = vec![0.0f64; k];
-
-    for (row_idx, code) in codes.iter().enumerate() {
-        let xi = x.row(row_idx);
-        // Contiguous row slice of the input when possible (standard layout); `None`
-        // only for a non-contiguous view, which takes the strided fallback below.
-        let xi_slice = xi.as_slice();
-        for a in 0..code.indices.len() {
-            let ca = code.codes[a] as f64;
-            if ca == 0.0 {
-                continue;
-            }
-            let ka = code.indices[a];
-            firings[ka as usize] += 1;
-            amplitude_sum[ka as usize] += ca.abs();
-            diag[ka as usize] += ca * ca;
-            let brow = ka as usize;
-            // B_{ka,:} += ca · x_row. Accumulate over contiguous row slices so LLVM
-            // autovectorizes the widening f32→f64 FMA — verified in the emitted code
-            // as unrolled NEON `fcvtl` + `fmul.2d` + `fadd.2d` with the bounds check
-            // hoisted out of the loop (the ndarray 2D-index form defeats that because
-            // the stride is opaque). Bit-identical to the strided form (same values,
-            // same per-`(brow,c)` accumulation order), so determinism is preserved.
-            // `b` is freshly allocated row-major, so its row slice is always `Some`;
-            // the strided arm only runs when the *input* view is non-contiguous.
-            let mut brow_view = b.row_mut(brow);
-            match (brow_view.as_slice_mut(), xi_slice) {
-                (Some(bs), Some(xs)) => {
-                    for (bref, &xv) in bs.iter_mut().zip(xs.iter()) {
-                        *bref += ca * xv as f64;
-                    }
-                }
-                _ => {
-                    for c in 0..p {
-                        brow_view[c] += ca * xi[c] as f64;
-                    }
-                }
-            }
-            for bsel in (a + 1)..code.indices.len() {
-                let cb = code.codes[bsel] as f64;
-                if cb == 0.0 {
-                    continue;
-                }
-                let kb = code.indices[bsel];
-                if ka == kb {
-                    // Same atom appearing twice (padding) — fold into diagonal.
-                    diag[ka as usize] += 2.0 * ca * cb;
-                    continue;
-                }
-                let key = if ka < kb { (ka, kb) } else { (kb, ka) };
-                *off.entry(key).or_insert(0.0) += ca * cb;
-            }
-        }
-    }
-
-    DecoderNormalEq {
-        diag,
-        b,
-        off,
-        firings,
-        amplitude_sum,
     }
 }
 
@@ -613,6 +536,23 @@ pub(super) fn solve_decoder_with_routability_gate(
     let stats = solve_decoder(&mut candidate, eq, ridge);
     for decision in gate.iter() {
         if !decision.refresh {
+            // A deferred atom keeps its previous decoder row and accumulates
+            // firing evidence across epochs. Surface the routability evidence
+            // trail so a persistently-held-back atom is diagnosable without a
+            // debugger: `n < threshold` because the mean amplitude cannot yet
+            // clear the `z_alpha * residual_scale` charge floor by the required
+            // `margin` (see `routability_gate_decisions`).
+            log::debug!(
+                "[SAE routability] atom {} deferred: firings={} mean_amplitude={:.4} \
+                 z_alpha={:.4} margin={:.4} standard_error={:.4} threshold={:.4}",
+                decision.atom,
+                decision.firings,
+                decision.mean_amplitude,
+                decision.z_alpha,
+                decision.margin,
+                decision.standard_error,
+                decision.threshold,
+            );
             continue;
         }
         let src = candidate.row(decision.atom);
@@ -1159,13 +1099,84 @@ fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<
 #[cfg(test)]
 mod exact_solve_tests {
     use super::{
-        DecoderNormalEq, assemble_normal_eq, cg_solve, explained_variance, route_and_code_all,
-        solve_decoder, solve_decoder_with_routability_gate,
+        DecoderNormalEq, cg_solve, explained_variance, route_and_code_all, solve_decoder,
+        solve_decoder_with_routability_gate,
     };
     use crate::sparse_dict::codes::SparseCode;
     use crate::sparse_dict::scoring::TileScorer;
     use crate::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
-    use ndarray::Array2;
+    use ndarray::{Array2, ArrayView2};
+    use std::collections::HashMap;
+
+    /// Full-batch reference assembly of the sparse decoder normal equations
+    /// `(A + ρI) D = B` from the fixed codes/supports (`ρ` is applied at solve
+    /// time, so this returns the bare `A`/`B`). Kept only as an independent
+    /// oracle for the streaming [`DecoderNormalEq::accumulate`] path that
+    /// production uses — summing a corpus's shards through `accumulate` must
+    /// yield exactly this batch `(A, B)`.
+    fn assemble_normal_eq(
+        x: ArrayView2<'_, f32>,
+        codes: &[SparseCode],
+        k: usize,
+        p: usize,
+    ) -> DecoderNormalEq {
+        let mut diag = vec![0.0f64; k];
+        let mut b = Array2::<f64>::zeros((k, p));
+        let mut off: HashMap<(u32, u32), f64> = HashMap::new();
+        let mut firings = vec![0usize; k];
+        let mut amplitude_sum = vec![0.0f64; k];
+
+        for (row_idx, code) in codes.iter().enumerate() {
+            let xi = x.row(row_idx);
+            let xi_slice = xi.as_slice();
+            for a in 0..code.indices.len() {
+                let ca = code.codes[a] as f64;
+                if ca == 0.0 {
+                    continue;
+                }
+                let ka = code.indices[a];
+                firings[ka as usize] += 1;
+                amplitude_sum[ka as usize] += ca.abs();
+                diag[ka as usize] += ca * ca;
+                let brow = ka as usize;
+                let mut brow_view = b.row_mut(brow);
+                match (brow_view.as_slice_mut(), xi_slice) {
+                    (Some(bs), Some(xs)) => {
+                        for (bref, &xv) in bs.iter_mut().zip(xs.iter()) {
+                            *bref += ca * xv as f64;
+                        }
+                    }
+                    _ => {
+                        for c in 0..p {
+                            brow_view[c] += ca * xi[c] as f64;
+                        }
+                    }
+                }
+                for bsel in (a + 1)..code.indices.len() {
+                    let cb = code.codes[bsel] as f64;
+                    if cb == 0.0 {
+                        continue;
+                    }
+                    let kb = code.indices[bsel];
+                    if ka == kb {
+                        // Same atom appearing twice (padding) — fold into diagonal.
+                        diag[ka as usize] += 2.0 * ca * cb;
+                        continue;
+                    }
+                    let key = if ka < kb { (ka, kb) } else { (kb, ka) };
+                    *off.entry(key).or_insert(0.0) += ca * cb;
+                }
+            }
+        }
+
+        DecoderNormalEq {
+            diag,
+            b,
+            off,
+            firings,
+            amplitude_sum,
+        }
+    }
 
     impl DecoderNormalEq {
         /// Symmetric sparse mat-vec `y = (A + ρI) x` for one decoder column `x`
@@ -1271,24 +1282,6 @@ mod exact_solve_tests {
         decoder[[0, 1]] = 1.0;
         decoder[[1, 0]] = 1.0;
         let (_stats, gate) = solve_decoder_with_routability_gate(&mut decoder, &eq, 0.0, 1.0);
-
-        eprintln!(
-            "[routability synthetic] atom0 refresh={} n={} mean={:.3} z={:.3} margin={:.3} se={:.3} threshold={:.3}; atom1 refresh={} n={} mean={:.3} z={:.3} margin={:.3} se={:.3} threshold={:.3}",
-            gate[0].refresh,
-            gate[0].firings,
-            gate[0].mean_amplitude,
-            gate[0].z_alpha,
-            gate[0].margin,
-            gate[0].standard_error,
-            gate[0].threshold,
-            gate[1].refresh,
-            gate[1].firings,
-            gate[1].mean_amplitude,
-            gate[1].z_alpha,
-            gate[1].margin,
-            gate[1].standard_error,
-            gate[1].threshold
-        );
 
         assert!(gate[0].refresh, "well-fired atom must refresh");
         assert!(

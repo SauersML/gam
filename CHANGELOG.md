@@ -1,3 +1,92 @@
+## v0.3.148 — gam 0.3.148 / gamfit 0.1.250 (2026-07-06)
+
+A correctness release on top of 0.3.147, concentrated in three areas: **honest
+deviance and evidence reporting**, **response-geometry robustness** (the curved
+`response_geometry=` families no longer abort on widely-spread data), and
+**survival/CLI round-trip fidelity**. A large batch of work also landed on the
+experimental, default-off SAE latent-manifold engine, and the published `gamfit`
+wheel build — briefly broken on `main` by a merge that duplicated an internal
+type — is restored.
+
+### Deviance, evidence & inference
+- **Unscaled deviance in summaries (#2126, #2131).** Gamma and Tweedie summaries
+  now report the raw unscaled deviance `D`, not `D/φ̂`, matching every other
+  family and R/mgcv; a scaled-vs-unscaled regression pins it.
+- **Akaike evidence ratio (#2124).** Model-comparison output reports the evidence
+  ratio `exp(-ΔAIC/2)`, not its square `exp(-ΔAIC)`.
+- **Gamma REML gain-ratio scaling (#2128).** The inner P-IRLS gain-ratio
+  objective is scaled by the family dispersion, and the omitting-constants
+  Gamma log-likelihood keeps its shape scaling, so a penalized Gamma smooth no
+  longer drives REML to a non-finite cost.
+- **`te(x,z)` EDF/SE row-order invariance (#2123).** The penalized-block reparam
+  spectrum is stabilised via a root SVD and the posterior covariance is made
+  ridge-free, killing the extreme-λ objective cliff that made a tensor-smooth's
+  EDF and standard errors depend on input row order.
+- **Design-whitened Wald smooth test (#2142).** The summary Wald test
+  reconstructs the design-whitening Gram and uses the conditional `Vb`, not the
+  smoothing-corrected `Vc` (Wood 2013).
+
+### Response geometry & bases
+- **Curved response geometries no longer abort on spread data (#2140).** The
+  generic Karcher-mean driver behind `response_geometry=stiefel/grassmann/spd/
+  poincare/constant_curvature` discarded its best iterate on a budget shortfall
+  and failed the whole fit with "did not reach stationarity within max_iter" —
+  even though `stiefel(k=1)` *is* the sphere, which fit the identical data. All
+  exit paths now keep the best on-manifold iterate, with multistart over
+  admissible seeds for the positively-curved (locally-non-unique) geometries;
+  the SPD driver carried the same defect and is fixed to match. End-to-end
+  `stiefel(k=1)⇄sphere` parity regression added.
+- **Rotation-invariant `sphere()` (#2127).** Geodesic farthest-point centers make
+  the default sphere Sobolev smooth invariant under a general `SO(3)` rotation,
+  not just about the pole.
+- **`matern(x,z)` retreats instead of collapsing (#2122).** A stalled joint
+  spatial solve now falls back to a data-adaptive geometry rather than silently
+  collapsing to the mean.
+- **Weighted response-geometry linearization (#2125).** The weighted fit
+  linearizes around the weighted Fréchet mean.
+- **Pinned curvature honoured (#2152).** `curv()` threads a fixed `kappa=`
+  through the whole fit orchestration via a new `kappa_fixed` pin flag.
+- Measure-jet gap extrapolation follows the trend rather than the mean (#1845),
+  weekday cyclic effects fit a genuine `S¹` continuum (#1849), the `d=1` seed
+  tie-break prices chart arc-length defect (#2081), and cubic-cell boundary
+  continuity is tightened (#2073).
+
+### Families, encoding & survival
+- **Binomial `loglog`/`cauchit` links (#2155, #2158).** These links are now wired
+  through the external-design fit route and the joint link-wiggle solver, and the
+  fitted-link state round-trips through predict.
+- **Strict unseen levels for numeric-coded factors (#2137).** `factor(year)` and
+  other numeric-coded fixed categorical factors raise on an unseen level in both
+  `fit` and `check()`, instead of silently averaging.
+- **Canonical float level keys (#2145, #2146).** Signed-zero and NaN float level
+  keys are canonicalized so `-0.0`/`+0.0` map to one level.
+- **Survival CSV honours the extrapolation law (#2154).** `write_survival_at_csv`
+  now emits byte-for-byte what `survival_at` returns — both read one authoritative
+  boundary/clip policy through the shared interpolation primitives — instead of
+  crashing on any model with a stored surface.
+- **Weibull baseline no longer double-counted in survival CLI predict (#2129).**
+- **Bounded merit-descent veto for the survival marginal-slope stall (#979).**
+
+### Performance
+- **Batched Firth gram assembly (#1575).** Binomial/logit Firth gram assembly is
+  `O(k·n²·p) → O(n²·p)`.
+
+### SAE latent-manifold engine (experimental, default-off)
+- Large batch: branch-guarded dual-number derivative oracle and softmax/IBP
+  θ-adjoint corrections (#2156, #2144), capture-then-joint-rotate ISA (#2111),
+  partition-free coactivation conditionality, certificate-gated atlas nerve,
+  cycle graph atoms, Betti/persistence topology signatures, cross-model `O(2)`
+  transport, finite-sample Terracini certificate, and a `gamfit.audit_sae`
+  external frozen-dictionary audit surface, plus the FFI to reach all of it.
+
+### Build
+- **Restored the `gamfit` wheel build.** A merge duplicated the internal `Dual`
+  type across two modules (ambiguous glob re-export + dead code) and drifted
+  three `gam-pyffi` FFI construction/borrow sites away from struct changes in
+  `gam-sae` — invisible to a `gam`-crate-only check but fatal to the wheel. All
+  fixed at the root (no lint suppression), with the routability gate's evidence
+  now surfaced as a `log::debug!` observability trail.
+
 ## v0.3.147 — gam 0.3.147 / gamfit 0.1.249 (2026-07-04)
 
 A broad correctness release cut from ~130 root-cause fixes on top of 0.3.146.

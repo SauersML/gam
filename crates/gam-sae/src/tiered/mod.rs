@@ -64,7 +64,7 @@ use ndarray::{Array1, Array2, ArrayView2, Axis};
 
 use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator};
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, finite_set_rank_charge};
-use crate::sparse_dict::{DecoderSolveStats, SparseDictConfig, SparseDictFit};
+use crate::sparse_dict::{SparseDictConfig, SparseDictFit};
 
 /// Tier-0: the single shared mean μ (length `p`). The global DC lives here, not
 /// duplicated across `K` per-atom intercepts.
@@ -790,6 +790,7 @@ pub fn explained_variance_vs_mean(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparse_dict::DecoderSolveStats;
     use ndarray::array;
 
     #[test]

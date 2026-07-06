@@ -118,6 +118,7 @@ mod tests {
                 h2: Vec::new(),
                 contested: false,
                 note: "topology agrees".to_string(),
+                null_calibration: None,
             };
             let payload = sae_topology_persistence_dict(py, &[Some(report)])
                 .expect("topology persistence payload");

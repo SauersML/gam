@@ -288,6 +288,30 @@ impl ResponseManifold {
         }
     }
 
+    /// Whether the intrinsic Fréchet (Karcher) mean of manifold-valued responses
+    /// can have MORE THAN ONE local minimizer — i.e. whether the geometry is
+    /// positively curved somewhere, so a single safeguarded descent can stall in
+    /// a suboptimal basin and a multistart is worth the extra restarts.
+    ///
+    /// - `Spd` and `Poincare` are Hadamard manifolds (globally non-positively
+    ///   curved / CAT(0)): the dispersion `V(P)=Σ wᵢ d(P,Xᵢ)²` is globally,
+    ///   strictly geodesically convex, so the Fréchet mean is unique and one
+    ///   descent reaches it — no restart can improve on it.
+    /// - `Stiefel` (`St(n,1)=Sⁿ⁻¹`, and `k>1` with the canonical metric) and
+    ///   `Grassmann` (`Gr(1,n)=ℝPⁿ⁻¹`) carry non-negative sectional curvature:
+    ///   for a cloud whose spread approaches the injectivity radius the mean is
+    ///   only *locally* unique and several basins can coexist, so a
+    ///   different-seed restart can land a strictly lower-dispersion mean.
+    /// - `ConstantCurvature` is positively curved exactly when `κ > 0`
+    ///   (spherical); `κ ≤ 0` is flat/hyperbolic and Hadamard.
+    fn frechet_mean_can_be_nonunique(&self) -> bool {
+        match self {
+            Self::Spd { .. } | Self::Poincare { .. } => false,
+            Self::Grassmann { .. } | Self::Stiefel { .. } => true,
+            Self::ConstantCurvature { kappa, .. } => *kappa > 0.0,
+        }
+    }
+
     /// Build the underlying [`RiemannianManifold`] for the matrix geometries.
     /// `None` for Poincaré, whose primitives are free functions parameterised
     /// by curvature rather than a trait object.
@@ -719,24 +743,147 @@ pub fn response_frechet_mean(
         Ok(acc)
     };
 
-    // Seed the Karcher iteration at a sample whose tangent star is fully
-    // defined, then take one Riemannian averaging step for an interior start.
+    const STALL_REL: f64 = 5.0e-3;
+    const STALL_PATIENCE: usize = 10;
+    const ARMIJO_C1: f64 = 1.0e-4;
+    const MAX_BACKTRACK_HALVINGS: usize = 60;
+    const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
+    // Cap on how many admissible interior starts we descend from before giving
+    // up on finding a strictly better basin. Only reached on a positively
+    // curved manifold whose data spread makes the mean weakly identified; a
+    // small constant keeps the multistart cost `O(1)` in the sample count.
+    const MULTISTART_MAX: usize = 8;
+
+    // Safeguarded Riemannian gradient descent on the dispersion `V(P)` from one
+    // interior start. Returns the BEST iterate found (least metric-gradient
+    // norm), its gradient norm, and its dispersion. It NEVER fails on a budget
+    // or stall shortfall: on a positively curved manifold (`St(n,1)=Sⁿ⁻¹`,
+    // `Gr(1,n)=ℝPⁿ⁻¹`) a widely spread cloud makes `V` nearly flat, so the
+    // descent converges only linearly and can exhaust `max_iter` while still
+    // making monotone progress — yet the least-gradient iterate in hand is a
+    // perfectly good approximate Fréchet mean and a valid chart origin.
+    // Historically the budget-exhausted branch DISCARDED that iterate and
+    // returned `Err`, aborting fits that `sphere_frechet_mean` — the SAME
+    // manifold reached through a different driver — completes (#2140). All exit
+    // conditions (stationarity, stall, rejected step, budget, a moved iterate
+    // reaching a sample's cut locus) now agree: keep the best iterate.
+    let descend = |start: Array1<f64>| -> (Array1<f64>, f64, f64) {
+        let mut p = start;
+        let mut f_cur = match dispersion(p.view()) {
+            Ok(f) => f,
+            // An admissible start has a defined dispersion; guard defensively.
+            Err(_) => return (p.clone(), f64::INFINITY, f64::INFINITY),
+        };
+        let mut best_p = p.clone();
+        let mut best_grad = f64::INFINITY;
+        let mut best_disp = f_cur;
+        let mut stall = 0_usize;
+        for _ in 0..max_iter {
+            // Riemannian gradient direction ξ = Σ wᵢ log_p(xᵢ) = −½ grad V.
+            let mut xi = Array1::<f64>::zeros(ambient);
+            let mut log_ok = true;
+            for (i, x) in samples.iter().enumerate() {
+                match manifold.log_point(p.view(), x.view()) {
+                    Ok(lg) => xi.scaled_add(w[i], &lg),
+                    // A moved iterate reached a sample's cut locus: stop at the
+                    // best iterate held so far rather than aborting the mean.
+                    Err(_) => {
+                        log_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !log_ok {
+                break;
+            }
+            let grad_norm = match manifold.sq_metric_norm(p.view(), xi.view()) {
+                Ok(g) => g.sqrt(),
+                Err(_) => break,
+            };
+            // Track the best (least-gradient) iterate. `improved` is measured
+            // against the PRIOR best so a long linear tail eventually trips the
+            // stall guard even while the raw gradient keeps inching down.
+            let improved = grad_norm < best_grad * (1.0 - STALL_REL);
+            if grad_norm < best_grad {
+                best_grad = grad_norm;
+                best_p.assign(&p);
+                best_disp = f_cur;
+            }
+            if grad_norm <= tol {
+                break;
+            }
+            if improved {
+                stall = 0;
+            } else {
+                stall += 1;
+                if stall >= STALL_PATIENCE {
+                    break;
+                }
+            }
+
+            // Armijo-backtracked unit Karcher step exp_p(t·ξ).
+            let pred = grad_norm * grad_norm;
+            let f_tol = ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + f_cur.abs());
+            let mut t = 1.0_f64;
+            let mut accepted = false;
+            for _ in 0..MAX_BACKTRACK_HALVINGS {
+                let step = &xi * t;
+                let cand = match manifold.exp_point(p.view(), step.view()) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // The step left the manifold's domain (e.g. a Poincaré
+                        // overshoot past the ball boundary); shrink and retry.
+                        t *= 0.5;
+                        continue;
+                    }
+                };
+                let f_cand = match dispersion(cand.view()) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        t *= 0.5;
+                        continue;
+                    }
+                };
+                if f_cand <= f_cur - 2.0 * ARMIJO_C1 * t * pred + f_tol {
+                    p = cand;
+                    f_cur = f_cand;
+                    accepted = true;
+                    break;
+                }
+                t *= 0.5;
+            }
+            if !accepted {
+                break;
+            }
+        }
+        (best_p, best_grad, best_disp)
+    };
+
+    // Multistart over admissible interior starts, keeping the mean with the
+    // lowest Fréchet dispersion — the generic analogue of `sphere_frechet_mean`.
     //
-    // A fixed seed at `samples[0]` is fragile: if any *other* sample lies at
-    // that seed's cut locus the seeding log is undefined and the whole mean
-    // aborts, even though the Fréchet mean itself is well defined. On
-    // `Gr(1,n) = ℝP^{n-1}` two orthogonal lines (principal angle π/2) are
-    // exactly such a cut-locus pair, so a design whose first response happens
-    // to be orthogonal to another could never be averaged. Instead, try each
-    // sample as the seed and keep the first whose log-tangents to *every*
-    // sample land: the safeguarded descent below converges to the same mean
-    // from any admissible seed, so this only changes which interior point the
-    // iteration starts from — and the very first sample is chosen whenever it
-    // is admissible (so SPD/Stiefel/Poincaré data with no cut-locus pair seed
-    // exactly as before). A design where every sample sits at another's cut
-    // locus has a genuinely ambiguous mean and is reported as such.
-    let mut seeded: Option<Array1<f64>> = None;
+    // Each seed sample is turned into an interior start by one Karcher averaging
+    // step (`exp_seed(Σ wᵢ log_seed xᵢ)`). A fixed seed at `samples[0]` is
+    // fragile: if any *other* sample lies at that seed's cut locus the seeding
+    // log is undefined even though the mean is well defined — on `Gr(1,n)` two
+    // orthogonal lines (principal angle π/2) are exactly such a pair — so we try
+    // each sample and skip inadmissible ones.
+    //
+    // On a Hadamard geometry (`Spd`/`Poincare`) `V` is globally geodesically
+    // convex with a UNIQUE minimizer and no cut locus, so the first admissible
+    // descent settles the mean (converged → the mean; stalled → its best
+    // approximant) and no restart can improve it — one descent, exactly as
+    // before. On a positively curved geometry the mean is only LOCALLY unique:
+    // a converged descent may sit in a suboptimal basin, so — like
+    // `sphere_frechet_mean`, which scores every candidate — we descend up to
+    // `MULTISTART_MAX` admissible starts and keep the globally lowest-dispersion
+    // one rather than stopping at the first that reaches `tol`. The mean is
+    // computed once per fit to set the chart origin, so the bounded extra
+    // restarts are amortized.
+    let multistart = manifold.frechet_mean_can_be_nonunique();
+    let mut best: Option<(Array1<f64>, f64, f64)> = None;
     let mut last_seed_err = String::new();
+    let mut descents = 0_usize;
     for seed in &samples {
         let base = match manifold.exp_point(seed.view(), Array1::<f64>::zeros(ambient).view()) {
             Ok(base) => base,
@@ -760,98 +907,42 @@ pub fn response_frechet_mean(
         if !admissible {
             continue;
         }
-        match manifold.exp_point(base.view(), xi.view()) {
-            Ok(stepped) => {
-                seeded = Some(stepped);
-                break;
-            }
+        let start = match manifold.exp_point(base.view(), xi.view()) {
+            Ok(stepped) => stepped,
             Err(e) => {
                 last_seed_err = e.to_string();
+                continue;
             }
-        }
-    }
-    let mut p = seeded.ok_or_else(|| {
-        format!(
-            "response geometry Fréchet mean init: no admissible seed among samples \
-             (every sample lies at another's cut locus; last error: {last_seed_err})"
-        )
-    })?;
+        };
 
-    let mut f_cur = dispersion(p.view())?;
-    let mut best_p = p.clone();
-    let mut best_grad = f64::INFINITY;
-    const STALL_REL: f64 = 5.0e-3;
-    const STALL_PATIENCE: usize = 10;
-    let mut stall = 0_usize;
-    const ARMIJO_C1: f64 = 1.0e-4;
-    const MAX_BACKTRACK_HALVINGS: usize = 60;
-    const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
-
-    for _ in 0..max_iter {
-        let mut xi = Array1::<f64>::zeros(ambient);
-        for (i, x) in samples.iter().enumerate() {
-            let lg = manifold
-                .log_point(p.view(), x.view())
-                .map_err(|e| format!("response geometry Fréchet mean log map: {e}"))?;
-            xi.scaled_add(w[i], &lg);
-        }
-        let grad_norm = manifold
-            .sq_metric_norm(p.view(), xi.view())
-            .map_err(|e| format!("response geometry Fréchet mean metric: {e}"))?
-            .sqrt();
-        if grad_norm <= tol {
+        let (p, grad, disp) = descend(start);
+        descents += 1;
+        if !multistart {
+            // Hadamard: the unique global mean (or its best approximant on a
+            // budget shortfall) — a single descent settles it.
             return Ok(p);
         }
-
-        let improved = grad_norm < best_grad * (1.0 - STALL_REL);
-        if grad_norm < best_grad {
-            best_grad = grad_norm;
-            best_p.assign(&p);
+        // Positively curved: a converged descent is only a local minimizer, so
+        // keep scoring basins by dispersion and return the global best.
+        let keep = match &best {
+            Some((_, _, best_disp)) => disp < *best_disp,
+            None => true,
+        };
+        if keep {
+            best = Some((p, grad, disp));
         }
-        if improved {
-            stall = 0;
-        } else {
-            stall += 1;
-            if stall >= STALL_PATIENCE {
-                return Ok(best_p);
-            }
-        }
-
-        let pred = grad_norm * grad_norm;
-        let f_tol = ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + f_cur.abs());
-        let mut t = 1.0_f64;
-        let mut accepted = false;
-        for _ in 0..MAX_BACKTRACK_HALVINGS {
-            let step = &xi * t;
-            let cand = match manifold.exp_point(p.view(), step.view()) {
-                Ok(c) => c,
-                Err(_) => {
-                    // The step left the manifold's domain (e.g. a Poincaré
-                    // overshoot past the ball boundary); shrink and retry.
-                    t *= 0.5;
-                    continue;
-                }
-            };
-            let f_cand = match dispersion(cand.view()) {
-                Ok(f) => f,
-                Err(_) => {
-                    t *= 0.5;
-                    continue;
-                }
-            };
-            if f_cand <= f_cur - 2.0 * ARMIJO_C1 * t * pred + f_tol {
-                p = cand;
-                f_cur = f_cand;
-                accepted = true;
-                break;
-            }
-            t *= 0.5;
-        }
-        if !accepted {
-            return Ok(best_p);
+        if descents >= MULTISTART_MAX {
+            break;
         }
     }
-    Err("response geometry Fréchet mean did not reach stationarity within max_iter".into())
+
+    match best {
+        Some((p, _, _)) => Ok(p),
+        None => Err(format!(
+            "response geometry Fréchet mean init: no admissible seed among samples \
+             (every sample lies at another's cut locus; last error: {last_seed_err})"
+        )),
+    }
 }
 
 // ── Curvature as an estimand on the response geometry (#944 stage 4 / #1104) ──
@@ -1407,6 +1498,162 @@ mod tests {
             },
             values,
         );
+    }
+
+    /// Deterministic Fibonacci-lattice cover of S² (== `St(3,1)` == `Gr(1,3)`
+    /// projectively), spread over the WHOLE sphere. This is the widely spread
+    /// cloud that makes the Fréchet objective nearly flat, so a single-seed
+    /// Karcher descent converges only linearly and exhausts a `max_iter=256`
+    /// budget — the #2140 trigger.
+    fn fibonacci_sphere(n: usize) -> Array2<f64> {
+        let mut v = Array2::<f64>::zeros((n, 3));
+        let golden = std::f64::consts::PI * (1.0 + 5.0_f64.sqrt());
+        for idx in 0..n {
+            let i = idx as f64 + 0.5;
+            let phi = (1.0 - 2.0 * i / n as f64).acos();
+            let theta = golden * i;
+            v[[idx, 0]] = theta.cos() * phi.sin();
+            v[[idx, 1]] = theta.sin() * phi.sin();
+            v[[idx, 2]] = phi.cos();
+        }
+        v
+    }
+
+    /// Uniform-weight Fréchet objective `(1/M) Σ ‖log_p Xᵢ‖²_p` — the dispersion
+    /// the driver minimizes. Lower is a better mean. Uses the module-private
+    /// per-point primitives directly (available inside this child module).
+    fn frechet_objective(
+        manifold: ResponseManifold,
+        values: ArrayView2<'_, f64>,
+        p: ArrayView1<'_, f64>,
+    ) -> f64 {
+        let mut acc = 0.0;
+        for row in 0..values.nrows() {
+            let lg = manifold.log_point(p, values.row(row)).expect("log map");
+            acc += manifold
+                .sq_metric_norm(p, lg.view())
+                .expect("metric norm");
+        }
+        acc / values.nrows() as f64
+    }
+
+    #[test]
+    fn stiefel_k1_frechet_mean_accepts_widely_spread_sphere_cloud() {
+        // #2140: `St(3,1)` IS S²; a widely spread cloud makes the single-seed
+        // generic Karcher descent exhaust its `max_iter=256` budget while still
+        // inching downhill. The driver used to DISCARD the best iterate and
+        // return `Err`, aborting the whole fit — even though `response_geometry
+        // ="sphere"` on the identical data succeeds. It must instead return the
+        // best (near-stationary) on-manifold mean.
+        let values = fibonacci_sphere(80);
+        let manifold = ResponseManifold::Stiefel { k: 1, n: 3 };
+        let mean = response_frechet_mean(manifold, values.view(), None, 1.0e-12, 256)
+            .expect("widely spread sphere cloud must yield a Fréchet mean, not a budget error");
+
+        // On-manifold: a genuine unit vector (a valid chart origin the tangent
+        // regression can expand around).
+        assert_eq!(mean.len(), 3);
+        let nrm = (mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]).sqrt();
+        assert!((nrm - 1.0).abs() < 1e-9, "mean must be unit-norm, got {nrm}");
+        assert!(mean.iter().all(|c| c.is_finite()), "mean must be finite");
+
+        // And it is a genuine minimizer, not just any on-manifold point: its
+        // dispersion beats an arbitrary data point's.
+        let obj_mean = frechet_objective(manifold, values.view(), mean.view());
+        let obj_pt0 = frechet_objective(manifold, values.view(), values.row(0));
+        assert!(
+            obj_mean < obj_pt0,
+            "Fréchet mean dispersion {obj_mean} must beat a data point's {obj_pt0}"
+        );
+    }
+
+    #[test]
+    fn stiefel_k1_and_sphere_drivers_agree_on_widely_spread_cloud() {
+        // `stiefel(k=1)` (generic driver) and `sphere` (dedicated driver) are
+        // the SAME manifold; on the identical widely spread cloud the generic
+        // driver's mean must be essentially as good as the sphere driver's —
+        // proof the returned budget-exhausted iterate is a true near-mean, not a
+        // degraded surrogate.
+        let values = fibonacci_sphere(80);
+        let stiefel = ResponseManifold::Stiefel { k: 1, n: 3 };
+        let generic = response_frechet_mean(stiefel, values.view(), None, 1.0e-12, 256)
+            .expect("generic driver must return a mean");
+        let sphere = crate::manifolds::sphere::sphere_frechet_mean(values.view(), None, 1.0e-12, 256)
+            .expect("sphere driver must return a mean");
+        let sphere = Array1::from(sphere);
+
+        let obj_generic = frechet_objective(stiefel, values.view(), generic.view());
+        let obj_sphere = frechet_objective(stiefel, values.view(), sphere.view());
+        assert!(
+            obj_generic <= obj_sphere + 1e-3,
+            "generic-driver dispersion {obj_generic} must match the sphere driver's {obj_sphere}"
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_generic_frechet_returns_best_iterate_not_error() {
+        // Directly pin the fixed branch: a `max_iter` too small to ever reach
+        // stationarity must STILL return the best on-manifold iterate (matching
+        // the stall and rejected-step exits), never the historical
+        // "did not reach stationarity within max_iter" error.
+        let values = fibonacci_sphere(60);
+        for manifold in [
+            ResponseManifold::Stiefel { k: 1, n: 3 },
+            ResponseManifold::Grassmann { k: 1, n: 3 },
+        ] {
+            let mean = response_frechet_mean(manifold, values.view(), None, 1.0e-12, 1)
+                .unwrap_or_else(|e| panic!("{manifold:?} budget=1 must return best iterate: {e}"));
+            assert!(
+                mean.iter().all(|c| c.is_finite()),
+                "{manifold:?} best iterate must be finite"
+            );
+            let nrm = mean.iter().map(|c| c * c).sum::<f64>().sqrt();
+            assert!(
+                (nrm - 1.0).abs() < 1e-9,
+                "{manifold:?} best iterate must stay on-manifold (unit-norm), got {nrm}"
+            );
+        }
+    }
+
+    #[test]
+    fn hadamard_frechet_mean_uses_single_descent_fast_path() {
+        // Spd/Poincaré are Hadamard: the mean is unique, so `multistart` must be
+        // OFF and a well-clustered cloud converges to `grad ≤ tol` on the first
+        // seed. Guard the classifier and the fast path together.
+        assert!(!ResponseManifold::Spd { n: 2 }.frechet_mean_can_be_nonunique());
+        assert!(
+            !ResponseManifold::Poincare {
+                dim: 2,
+                curvature: -1.0
+            }
+            .frechet_mean_can_be_nonunique()
+        );
+        assert!(ResponseManifold::Stiefel { k: 1, n: 3 }.frechet_mean_can_be_nonunique());
+        assert!(ResponseManifold::Grassmann { k: 1, n: 4 }.frechet_mean_can_be_nonunique());
+        assert!(
+            ResponseManifold::ConstantCurvature {
+                dim: 2,
+                kappa: 3.0
+            }
+            .frechet_mean_can_be_nonunique()
+        );
+        assert!(
+            !ResponseManifold::ConstantCurvature {
+                dim: 2,
+                kappa: -3.0
+            }
+            .frechet_mean_can_be_nonunique()
+        );
+
+        // A tight SPD cluster still converges to the unique Karcher mean.
+        let values = array![
+            [2.0, 0.0, 0.0, 1.0],
+            [2.1, 0.05, 0.05, 1.02],
+            [1.95, -0.03, -0.03, 0.98],
+        ];
+        let mean = response_frechet_mean(ResponseManifold::Spd { n: 2 }, values.view(), None, 1e-12, 500)
+            .expect("SPD cluster must converge");
+        assert!(mean.iter().all(|c| c.is_finite()));
     }
 
     #[test]

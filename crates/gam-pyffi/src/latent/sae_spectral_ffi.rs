@@ -37,6 +37,7 @@ fn sparse_dict_fit_from_arrays(
         converged: false,
         active,
         score_route_stats: gam::terms::sae::sparse_dict::ScoreRouteStats::default(),
+        decoder_solve_stats: gam::terms::sae::sparse_dict::DecoderSolveStats::default(),
     }
 }
 
@@ -1281,12 +1282,11 @@ mod sae_spectral_ffi_tests {
             ] {
                 assert_dict_has_key(report, key);
             }
-            let transport = report
+            let transport_any = report
                 .get_item("transport")
                 .expect("read transport")
-                .expect("transport present")
-                .cast::<PyDict>()
-                .expect("transport dict");
+                .expect("transport present");
+            let transport = transport_any.cast::<PyDict>().expect("transport dict");
             assert_eq!(
                 transport
                     .get_item("class")
