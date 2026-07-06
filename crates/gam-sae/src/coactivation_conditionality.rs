@@ -5,10 +5,11 @@
 //! * a native varying-coefficient GAM, `gate_j ~ beta(x) * gate_i`, where `x` is
 //!   a continuous context summary and the `by=` design columns are the spline
 //!   basis for `x` multiplied rowwise by `gate_i`;
-//! * a distribution-free KL certificate for the pooled coupling statistic.  If
-//!   `psi` is the per-row influence contribution for the weighted correlation
-//!   `rho`, then any first-order distribution shift with KL budget `epsilon`
-//!   changes `rho` by at most `sqrt(2 * epsilon * Var(psi))`.
+//! * a distribution-free KL certificate for the pooled weighted-Pearson
+//!   coupling statistic.  If `psi` is the per-row influence contribution for
+//!   the weighted correlation `rho`, then any first-order distribution shift
+//!   with KL budget `epsilon` changes `rho` by at most
+//!   `sqrt(2 * epsilon * Var(psi))`.
 //!
 //! Discrete context labels are accepted only by the diagnostic naming helper at
 //! the bottom of the module. They are not part of the conditionality metric.
@@ -66,9 +67,17 @@ pub struct VaryingCoefficientConditionality {
     pub beta_at_rows: Vec<f64>,
 }
 
-/// Influence-function KL certificate for the pooled coupling.
+/// Statistic protected by a [`RobustCouplingCertificate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CouplingStatistic {
+    /// Weighted Pearson correlation between the two selected gate streams.
+    WeightedPearson,
+}
+
+/// Influence-function KL certificate for the pooled weighted-Pearson coupling.
 #[derive(Clone, Debug)]
 pub struct RobustCouplingCertificate {
+    pub statistic: CouplingStatistic,
     pub rho: f64,
     pub influence_variance: f64,
     pub robustness_radius_epsilon: f64,
@@ -76,8 +85,8 @@ pub struct RobustCouplingCertificate {
 }
 
 impl RobustCouplingCertificate {
-    /// First-order lower bound on the coupling after an arbitrary KL-`epsilon`
-    /// distribution shift.
+    /// First-order lower bound on the weighted-Pearson coupling after an
+    /// arbitrary KL-`epsilon` distribution shift.
     pub fn worst_case_coupling(&self, epsilon: f64) -> Result<f64, String> {
         if !(epsilon.is_finite() && epsilon >= 0.0) {
             return Err(format!(
@@ -108,7 +117,8 @@ pub struct CoactivationConditionality {
     pub certificate: RobustCouplingCertificate,
     pub null_calibration: Option<ClaimNullCalibration>,
     /// Scalar intended for merge/fusion ranking. Large values mean the pair has
-    /// a robust pooled coupling and little continuous-context coefficient drift.
+    /// a robust pooled weighted-Pearson coupling and little continuous-context
+    /// coefficient drift.
     pub fusion_gate_score: f64,
     pub diagnostics: Vec<ContextDiagnostic>,
 }
@@ -327,9 +337,10 @@ fn conditionality_matrix_stat(data: ArrayView2<'_, f64>) -> Result<f64, String> 
     Ok((cov / (var_i.sqrt() * var_j.sqrt())).abs())
 }
 
-/// Full influence vector for the weighted Pearson coupling statistic.
+/// Full influence vector for the weighted-Pearson coupling statistic.
 #[derive(Clone, Debug)]
 pub struct CouplingInfluence {
+    pub statistic: CouplingStatistic,
     pub rho: f64,
     pub psi: Vec<f64>,
     pub normalized_weights: Vec<f64>,
@@ -353,6 +364,7 @@ impl CouplingInfluence {
             f64::INFINITY
         };
         RobustCouplingCertificate {
+            statistic: self.statistic,
             rho: self.rho,
             influence_variance: variance,
             robustness_radius_epsilon,
@@ -433,6 +445,7 @@ pub fn coupling_influence_values(
         psi.push(value);
     }
     Ok(CouplingInfluence {
+        statistic: CouplingStatistic::WeightedPearson,
         rho,
         psi,
         normalized_weights,
@@ -1261,6 +1274,11 @@ mod tests {
         let rows: Vec<usize> = (0..n).collect();
         let influence = coupling_influence_values(&gate_i, &gate_j, &rows, &weights)
             .expect("weighted correlation influence");
+        assert_eq!(influence.statistic, CouplingStatistic::WeightedPearson);
+        assert_eq!(
+            influence.certificate().statistic,
+            CouplingStatistic::WeightedPearson
+        );
         let rho = weighted_correlation_stat_excluding(&gate_i, &gate_j, &rows, &weights, None)
             .expect("weighted correlation statistic");
         assert!((rho - influence.rho).abs() < 1.0e-14);
@@ -1303,59 +1321,6 @@ mod tests {
         assert!(weighted_mean.abs() < 1.0e-14);
         assert!(max_jackknife_diff < 1.2e-2);
         assert!(jackknife_rms < 3.0e-3);
-    }
-
-    #[test]
-    fn conditional_coupling_influence_matches_leave_one_out_jackknife() {
-        let n = 907usize;
-        let mut active_i = Vec::with_capacity(n);
-        let mut active_j = Vec::with_capacity(n);
-        let mut weights = Vec::with_capacity(n);
-        for row in 0..n {
-            let phase = row as f64 * 0.037;
-            let gate_i_on = row % 5 == 0 || row % 17 == 3 || phase.sin() > 0.72;
-            let gate_j_on =
-                (gate_i_on && (row % 7 != 1 || phase.cos() > 0.1)) || row % 41 == 8;
-            active_i.push(gate_i_on);
-            active_j.push(gate_j_on);
-            weights.push(0.8 + 0.4 * (row % 13) as f64 / 12.0);
-        }
-        let pi = conditional_coupling_stat_excluding(&active_i, &active_j, &weights, None)
-            .expect("conditional coupling statistic");
-        let mass_i = weighted_active_mass_excluding(&active_i, &weights, None)
-            .expect("conditioning mass");
-
-        let total_weight: f64 = weights.iter().sum();
-        let mut max_jackknife_diff = 0.0_f64;
-        let mut jackknife_sse = 0.0_f64;
-        let mut weighted_mean = 0.0_f64;
-        for slot in 0..n {
-            let ai = if active_i[slot] { 1.0 } else { 0.0 };
-            let aj = if active_j[slot] { 1.0 } else { 0.0 };
-            let psi = ai * (aj - pi) / mass_i;
-            weighted_mean += (weights[slot] / total_weight) * psi;
-
-            let leave_one_out =
-                conditional_coupling_stat_excluding(&active_i, &active_j, &weights, Some(slot))
-                    .expect("leave-one-out conditional coupling");
-            let q = weights[slot] / total_weight;
-            let jackknife = ((1.0 - q) / q) * (pi - leave_one_out);
-            let diff = jackknife - psi;
-            max_jackknife_diff = max_jackknife_diff.max(diff.abs());
-            jackknife_sse += diff * diff;
-        }
-        let jackknife_rms = (jackknife_sse / n as f64).sqrt();
-        println!(
-            "case=conditional_coupling_if pi={:.6e} mass_i={:.6e} mean_psi={:.6e} max_jackknife_diff={:.6e} jackknife_rms={:.6e}",
-            pi,
-            mass_i,
-            weighted_mean,
-            max_jackknife_diff,
-            jackknife_rms
-        );
-        assert!(weighted_mean.abs() < 1.0e-14);
-        assert!(max_jackknife_diff < 7.0e-3);
-        assert!(jackknife_rms < 2.0e-3);
     }
 
     #[test]
@@ -1445,57 +1410,6 @@ mod tests {
             return Err("weighted_standardization: zero variance".to_string());
         }
         Ok((mean_i, mean_j, var_i.sqrt(), var_j.sqrt()))
-    }
-
-    fn conditional_coupling_stat_excluding(
-        active_i: &[bool],
-        active_j: &[bool],
-        weights: &[f64],
-        excluded_slot: Option<usize>,
-    ) -> Result<f64, String> {
-        let mut conditioning_mass = 0.0_f64;
-        let mut joint_mass = 0.0_f64;
-        let mut total_weight = 0.0_f64;
-        for slot in 0..active_i.len() {
-            if excluded_slot == Some(slot) {
-                continue;
-            }
-            let weight = weights[slot];
-            total_weight += weight;
-            if active_i[slot] {
-                conditioning_mass += weight;
-                if active_j[slot] {
-                    joint_mass += weight;
-                }
-            }
-        }
-        if !(total_weight > 0.0 && conditioning_mass > 0.0) {
-            return Err("conditional_coupling_stat_excluding: empty conditioning set".to_string());
-        }
-        Ok(joint_mass / conditioning_mass)
-    }
-
-    fn weighted_active_mass_excluding(
-        active: &[bool],
-        weights: &[f64],
-        excluded_slot: Option<usize>,
-    ) -> Result<f64, String> {
-        let mut active_mass = 0.0_f64;
-        let mut total_weight = 0.0_f64;
-        for slot in 0..active.len() {
-            if excluded_slot == Some(slot) {
-                continue;
-            }
-            let weight = weights[slot];
-            total_weight += weight;
-            if active[slot] {
-                active_mass += weight;
-            }
-        }
-        if !(total_weight > 0.0) {
-            return Err("weighted_active_mass_excluding: empty retained sample".to_string());
-        }
-        Ok(active_mass / total_weight)
     }
 
     fn direct_exponential_tilt_radius_to_kill(
