@@ -844,6 +844,13 @@ pub struct FitArtifacts {
     /// λ, per-class EDF, and the influence matrix `F = I − H⁻¹ S_λ`.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub joint_log_lambdas: Option<Array1<f64>>,
+    /// Diagnostic-only labels aligned 1:1 with [`UnifiedFitResult::lambdas`]
+    /// and [`FitInference::penalty_block_trace`].  The smoothing-forensics
+    /// report uses these labels to split each penalty trace into range-space
+    /// (`Primary`) and double-penalty null-space contributions without
+    /// re-inferring source roles from numeric matrices after the fit.
+    #[serde(default)]
+    pub penalty_source_labels: Vec<String>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -874,6 +881,7 @@ impl std::fmt::Debug for FitArtifacts {
                 "joint_log_lambdas",
                 &self.joint_log_lambdas.as_ref().map(|v| v.len()),
             )
+            .field("penalty_source_labels", &self.penalty_source_labels)
             .finish()
     }
 }

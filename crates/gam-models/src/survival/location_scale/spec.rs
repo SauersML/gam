@@ -712,6 +712,7 @@ pub fn survival_fit_from_parts(
             rho_posterior_escalation: None,
             rho_covariance: None,
             joint_log_lambdas: None,
+            penalty_source_labels: Vec::new(),
         },
         inner_cycles: 0,
     })

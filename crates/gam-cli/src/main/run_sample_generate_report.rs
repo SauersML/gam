@@ -365,6 +365,29 @@ fn smoothing_forensics_rows(
 ) -> Vec<report::SmoothingForensicsRow> {
     let sigma2 = (fit.standard_deviation * fit.standard_deviation).max(0.0);
     let assembly_edfs = fit.edf_by_block();
+    let penalty_traces = fit
+        .inference
+        .as_ref()
+        .map(|inf| inf.penalty_block_trace.as_slice())
+        .unwrap_or(&[]);
+    let sources = fit.artifacts.penalty_source_labels.as_slice();
+    let source_aligned = sources.len() == penalty_traces.len();
+    let (range_trace_total, null_trace_total) = if source_aligned {
+        penalty_traces.iter().zip(sources.iter()).fold(
+            (0.0, 0.0),
+            |(range_acc, null_acc), (trace, source)| {
+                if source == "DoublePenaltyNullspace" {
+                    (range_acc, null_acc + trace)
+                } else if source == "Primary" {
+                    (range_acc + trace, null_acc)
+                } else {
+                    (range_acc, null_acc)
+                }
+            },
+        )
+    } else {
+        (0.0, 0.0)
+    };
     fit.blocks
         .iter()
         .enumerate()
@@ -383,14 +406,10 @@ fn smoothing_forensics_rows(
                 sigma2_path: vec![sigma2],
                 edf_criterion,
                 edf_assembly,
-                double_penalty_range: None,
-                double_penalty_null_space: fit.artifacts.null_space_dim.and_then(|dim| {
-                    if dim > 0 && block_idx == 0 {
-                        Some(dim as f64)
-                    } else {
-                        None
-                    }
-                }),
+                double_penalty_range: (source_aligned && block_idx == 0)
+                    .then_some(range_trace_total),
+                double_penalty_null_space: (source_aligned && block_idx == 0)
+                    .then_some(null_trace_total),
                 seed_screening: Vec::new(),
             }
         })
