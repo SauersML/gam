@@ -26,6 +26,7 @@ pub mod k_selection;
 pub mod manifold;
 pub mod nuisance_atlas;
 pub mod null_sampler;
+pub mod null_battery;
 pub mod routability;
 pub mod row_jet_program;
 pub mod sparse_dict;
