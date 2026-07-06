@@ -267,6 +267,92 @@ fn routing_is_gamma_invariant() {
 }
 
 #[test]
+fn splitting_dynamics_theorem_group_l2_kills_splitting_gradient() {
+    fn group_l2_penalty(blocks: &[&[f64]], lambda: f64) -> f64 {
+        lambda
+            * blocks
+                .iter()
+                .map(|block| block.iter().map(|value| value * value).sum::<f64>().sqrt())
+                .sum::<f64>()
+    }
+
+    fn l1_penalty(values: &[f64], lambda: f64) -> f64 {
+        lambda * values.iter().map(|value| value.abs()).sum::<f64>()
+    }
+
+    fn log2_choose(n: usize, k: usize) -> f64 {
+        assert!(k <= n, "cannot choose {k} items from {n}");
+        let kk = k.min(n - k);
+        (1..=kk)
+            .map(|i| ((n + 1 - i) as f64 / i as f64).ln())
+            .sum::<f64>()
+            / std::f64::consts::LN_2
+    }
+
+    let lambda = 0.17f64;
+    let block_code = [3.0f64, -4.0, 12.0];
+    let rotation = [
+        [0.6f64, -0.8, 0.0],
+        [0.8f64, 0.6, 0.0],
+        [0.0f64, 0.0, -1.0],
+    ];
+    let rotated = [
+        rotation[0][0] * block_code[0]
+            + rotation[0][1] * block_code[1]
+            + rotation[0][2] * block_code[2],
+        rotation[1][0] * block_code[0]
+            + rotation[1][1] * block_code[1]
+            + rotation[1][2] * block_code[2],
+        rotation[2][0] * block_code[0]
+            + rotation[2][1] * block_code[1]
+            + rotation[2][2] * block_code[2],
+    ];
+
+    let penalty_before = group_l2_penalty(&[&block_code], lambda);
+    let penalty_after = group_l2_penalty(&[&rotated], lambda);
+    assert!(
+        (penalty_before - penalty_after).abs() <= 1.0e-12 * (1.0 + penalty_before.abs()),
+        "group-l2 penalty must be O(b)-invariant: {penalty_before} vs {penalty_after}"
+    );
+
+    let block_reconstruction = block_code;
+    let singleton_reconstruction = [block_code[0], block_code[1], block_code[2]];
+    for coordinate in 0..block_reconstruction.len() {
+        assert!(
+            (block_reconstruction[coordinate] - singleton_reconstruction[coordinate]).abs()
+                <= f64::EPSILON,
+            "block and singleton decompositions must have equal reconstruction"
+        );
+    }
+
+    let n_blocks = 11usize;
+    let active_blocks = 1usize;
+    let block_size = block_code.len();
+    let selection_weight = 0.04f64;
+    let block_selection_bits = log2_choose(n_blocks, active_blocks);
+    let split_selection_bits = log2_choose(n_blocks * block_size, active_blocks * block_size);
+    assert!(
+        split_selection_bits > block_selection_bits,
+        "atom-level split support catalogue must cost more bits"
+    );
+
+    let block_sparsity = group_l2_penalty(&[&block_code], lambda);
+    let split_sparsity = l1_penalty(&block_code, lambda);
+    assert!(
+        split_sparsity > block_sparsity,
+        "lasso singleton split must cost more than group-l2 for a multi-axis block"
+    );
+
+    let block_cost = block_sparsity + selection_weight * block_selection_bits;
+    let split_cost = split_sparsity + selection_weight * split_selection_bits;
+    assert!(
+        split_cost > block_cost,
+        "splitting one block into singleton atoms must strictly raise equal-fit cost: \
+         block {block_cost}, split {split_cost}"
+    );
+}
+
+#[test]
 fn near_orthogonal_row_is_orphaned_by_gate_floor() {
     let (n_blocks, b, p, k) = (2usize, 2usize, 4usize, 2usize);
     let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));

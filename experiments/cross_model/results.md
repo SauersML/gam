@@ -15,7 +15,7 @@ positions instead of unrelated activation banks.
 - Coordinate: model-local top-2 PCA activation-plane angle after peeling the
   top PCA direction in each model.
 - MSI outputs: large `.npy` arrays are in
-  `/projects/standard/hsiehph/sauer354/scratch/cross_model_matched_harvest`;
+  `${GAM_MSI_DATA}/scratch/cross_model_matched_harvest`;
   committed numbers are in `numbers.json`.
 
 ## Peel diagnostics

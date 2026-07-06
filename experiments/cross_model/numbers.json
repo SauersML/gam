@@ -1,8 +1,8 @@
 {
   "model_a": "Qwen3-8B L18",
   "model_b": "Qwen3.6-35B-A3B L20",
-  "model_a_path": "/projects/standard/hsiehph/sauer354/models/qwen3-8b",
-  "model_b_path": "/projects/standard/hsiehph/sauer354/models/qwen3.6-35b-a3b",
+  "model_a_path": "${GAM_MSI_DATA}/models/qwen3-8b",
+  "model_b_path": "${GAM_MSI_DATA}/models/qwen3.6-35b-a3b",
   "layer_a": 18,
   "layer_b": 20,
   "dataset": "Salesforce/wikitext/wikitext-103-raw-v1/train",

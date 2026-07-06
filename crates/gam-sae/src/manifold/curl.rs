@@ -678,11 +678,6 @@ mod tests {
         }
         // occupancy high, charge modest so the RD screen pays.
         let v = curl_verdict(alpha.view(), beta.view(), sigma, n as f64, 50.0).unwrap();
-        eprintln!(
-            "[curl ring] κ={:.4}±{:.4} z={:.2} R1={:.3} R2={:.3} R̂={:.3} net={:.1} rec={}",
-            v.kappa, v.kappa_se, v.z_below_gaussian, v.resultant1, v.resultant2, v.radius,
-            v.net_evidence_nats, v.recommend_curl
-        );
         assert!((v.kappa - 1.0).abs() < 0.1, "ring κ≈1, got {}", v.kappa);
         assert!(v.recommend_curl, "clean ring must be recommended");
     }
@@ -699,10 +694,6 @@ mod tests {
             beta[i] = 2.0 * lcg_normal(&mut s);
         }
         let v = curl_verdict(alpha.view(), beta.view(), sigma, n as f64, 50.0).unwrap();
-        eprintln!(
-            "[curl gauss] κ={:.4}±{:.4} z={:.2} rec={}",
-            v.kappa, v.kappa_se, v.z_below_gaussian, v.recommend_curl
-        );
         assert!((v.kappa - 2.0).abs() < 0.15, "Gaussian fill κ≈2, got {}", v.kappa);
         assert!(!v.recommend_curl, "Gaussian fill must be rejected");
     }
@@ -756,7 +747,6 @@ mod tests {
             angles[i] = b.atan2(a);
         }
         let v = flatten_verdict(radii.view(), angles.view()).unwrap();
-        eprintln!("[flatten gauss] κ={:.3} R2={:.3} rank={} rec={}", v.kappa, v.resultant2, v.residual_rank, v.recommend_flatten);
         assert!(v.recommend_flatten);
         assert_eq!(v.residual_rank, 2);
     }
@@ -774,7 +764,6 @@ mod tests {
             angles[i] = if g >= 0.0 { 0.0 } else { PI };
         }
         let v = flatten_verdict(radii.view(), angles.view()).unwrap();
-        eprintln!("[flatten diam] κ={:.3} R2={:.3} rank={}", v.kappa, v.resultant2, v.residual_rank);
         assert!(v.recommend_flatten);
         assert_eq!(v.residual_rank, 1);
     }

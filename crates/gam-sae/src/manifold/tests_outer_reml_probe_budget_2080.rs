@@ -86,6 +86,53 @@ fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     z
 }
 
+/// A single centered circle embedded in `p` standardized ambient channels. This
+/// is the cheap K=1 #2153 regression target; unlike the two-circle fixture, the
+/// model is correctly specified, so any long Strong-Wolfe probe train is solver
+/// pathology rather than target mismatch.
+fn one_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
+    let mut frame = Array2::<f64>::zeros((2, p));
+    for j in 0..p {
+        frame[[0, j]] = deterministic_circle_noise(j, 0);
+        frame[[1, j]] = deterministic_circle_noise(j, 1);
+    }
+    for r in 0..2 {
+        let nrm = (0..p)
+            .map(|j| frame[[r, j]] * frame[[r, j]])
+            .sum::<f64>()
+            .sqrt();
+        for j in 0..p {
+            frame[[r, j]] /= nrm.max(1.0e-300);
+        }
+    }
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let t = std::f64::consts::TAU * (row as f64) / (n as f64);
+        let (c, s) = (t.cos(), t.sin());
+        for j in 0..p {
+            z[[row, j]] =
+                c * frame[[0, j]] + s * frame[[1, j]] + sigma * deterministic_circle_noise(row, j + 7);
+        }
+    }
+    for j in 0..p {
+        let mut mean = 0.0_f64;
+        for row in 0..n {
+            mean += z[[row, j]];
+        }
+        mean /= n as f64;
+        let mut var = 0.0_f64;
+        for row in 0..n {
+            let d = z[[row, j]] - mean;
+            var += d * d;
+        }
+        let sd = (var / n as f64).sqrt().max(1.0e-12);
+        for row in 0..n {
+            z[[row, j]] = (z[[row, j]] - mean) / sd;
+        }
+    }
+    z
+}
+
 /// Build a K-atom, d=1 periodic SAE term seeded the way the production cold path
 /// does (PCA-seed the per-atom coordinates, ridge-LSQ each per-atom decoder), with
 /// IBP-MAP assignment. Returns the term and the seed reconstruction dispersion the
@@ -161,7 +208,7 @@ fn run_wide_outer_fit(
     k: usize,
     harmonics: usize,
 ) -> (f64, OuterProbeTelemetry) {
-    let z = two_circle_wide_target(n, p, 0.05);
+    let z = two_circle_wide_target(n, p, 0.03);
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, harmonics);
     let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
@@ -197,7 +244,7 @@ fn run_k1_generated_seed_outer_fit(
     p: usize,
     harmonics: usize,
 ) -> (f64, OuterProbeTelemetry) {
-    let z = two_circle_wide_target(n, p, 0.05);
+    let z = one_circle_wide_target(n, p, 0.05);
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
     let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
@@ -289,7 +336,7 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
 /// repeated full inner solves on rejected value probes.
 #[test]
 fn k1_generated_seed_circle_outer_reml_does_not_livelock_2153() {
-    let (ev, telemetry) = run_k1_generated_seed_outer_fit(96, 96, 2);
+    let (ev, telemetry) = run_k1_generated_seed_outer_fit(32, 24, 1);
     eprintln!(
         "[#2153] K=1 generated-seed outer fit: ev={ev:.4}, criterion_calls={}, \
          fd_probe_calls={}, wall_cost_value_probes={}, infeasible_total={}, \
@@ -301,7 +348,7 @@ fn k1_generated_seed_circle_outer_reml_does_not_livelock_2153() {
         telemetry.mutating_value_probes,
     );
     assert!(
-        telemetry.criterion_calls <= 40,
+        telemetry.criterion_calls <= 32,
         "#2153 K=1 generated-seed fit issued {} criterion calls; expected a \
          bounded first-line-search probe budget",
         telemetry.criterion_calls
@@ -311,7 +358,7 @@ fn k1_generated_seed_circle_outer_reml_does_not_livelock_2153() {
         "#2153 line-search value probes must not mutate the accepted term basin"
     );
     assert!(
-        ev.is_finite() && ev > 0.08,
+        ev.is_finite() && ev > 0.30,
         "#2153 K=1 generated-seed circle fit must converge to a real positive-EV \
          basin (got {ev:.4})"
     );

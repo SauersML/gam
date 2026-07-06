@@ -511,7 +511,7 @@ fn separable_sums_of_squares(
             sst += centered * centered;
         }
     }
-    debug_assert_eq!(row_basis.len(), basis_width * basis_width);
+    assert_eq!(row_basis.len(), basis_width * basis_width);
     (sse, sst)
 }
 

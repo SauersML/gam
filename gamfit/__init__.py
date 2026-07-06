@@ -119,6 +119,7 @@ from ._sae_spectral import (
     RoutabilityFloor,
     SpectrometerReport,
     SpikeRecovery,
+    audit_sae,
     block_firing_coordinates,
     compose_contracts,
     dimension_spectrometer,

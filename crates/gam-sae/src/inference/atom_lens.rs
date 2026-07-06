@@ -24,15 +24,15 @@
 //! For each atom `k`:
 //!
 //! * **presence** (representational, activation-side, *Fisher-free*): how
-//!   strongly the atom is encoded *in the activations*. Mean active mass on the
-//!   rows where the atom is truly active, times an amplitude-weighted decoder
-//!   norm. This is a pure reconstruction-side quantity: it does not touch the
+//!   strongly the atom is encoded *in the activations*. The support-weighted
+//!   mean assignment mass `Σw²/Σw`, times an amplitude-weighted decoder norm.
+//!   This is a pure reconstruction-side quantity: it does not touch the
 //!   `RowMetric` at all, so it is identical whether or not output-Fisher factors
 //!   were supplied. *Everything represented survives* — a loud-but-inert atom is
 //!   just as present as a quiet load-bearing one.
 //! * **coupling** (behavioral, *the only place Fisher enters*): the output-Fisher
-//!   mass along the atom's decoder tangent `dg_k/dt`, averaged over the atom's
-//!   active rows. This is computed through
+//!   mass along the atom's decoder tangent `dg_k/dt`, averaged over the same
+//!   support measure. This is computed through
 //!   [`RowMetric::fisher_mass`](gam_problem::RowMetric::fisher_mass)
 //!   — a *reported* score, never folded into a loss or criterion. Under a
 //!   Euclidean / no-Fisher provenance the coupling is **not available** (`None`),
@@ -51,15 +51,12 @@
 
 use ndarray::{ArrayView1, ArrayView2};
 
-use crate::manifold::SaeManifoldTerm;
+use crate::manifold::{SaeManifoldTerm, SupportMeasure};
 use gam_problem::{MetricProvenance, RowMetric};
 
-/// Below this active mass a row is not "truly active" for an atom, so it
-/// contributes to neither the presence average nor the coupling average. The
-/// assignment masses are convex weights in `[0, 1]`; this floor excludes rows
-/// where the atom is essentially off (numerical dust) from the per-atom
-/// averages, so a globally-near-zero atom does not get a spuriously large
-/// amplitude-per-active-row.
+/// Legacy active-row floor used by geometry-only summaries and reseed heuristics
+/// that still report a count of materially active rows. Behavior lens scores
+/// consume [`SupportMeasure`] directly and do not threshold support.
 pub const SAE_TRUST_ACTIVE_MASS_FLOOR: f64 = 1e-6;
 
 /// One atom's lens entry.
@@ -67,12 +64,12 @@ pub const SAE_TRUST_ACTIVE_MASS_FLOOR: f64 = 1e-6;
 pub struct AtomLensEntry {
     /// The atom's name (mirrors [`crate::manifold::SaeManifoldAtom::name`]).
     pub name: String,
-    /// **presence** (representational, activation-side, Fisher-free): mean active
-    /// mass on truly-active rows × amplitude-weighted decoder norm. Always
+    /// **presence** (representational, activation-side, Fisher-free): support-
+    /// weighted mean assignment mass × amplitude-weighted decoder norm. Always
     /// available — it reads only the activation-side fit.
     pub presence: f64,
-    /// **coupling** (behavioral): mean output-Fisher mass of the decoder tangent
-    /// `dg_k/dt` over the atom's active rows. `None` under a Euclidean /
+    /// **coupling** (behavioral): support-weighted mean output-Fisher mass of the
+    /// decoder tangent `dg_k/dt`. `None` under a Euclidean /
     /// no-Fisher provenance (the metric carries no behavioral information, so the
     /// score is *not available* — not zero, not an error).
     pub coupling: Option<f64>,
@@ -175,7 +172,7 @@ pub fn atom_two_lens(
     model: &SaeManifoldTerm,
     metric: &RowMetric,
     assignments_override: Option<ArrayView2<'_, f64>>,
-) -> AtomTwoLensReport {
+) -> Result<AtomTwoLensReport, String> {
     let n = model.n_obs();
     let k = model.k_atoms();
     let provenance = metric.provenance();
@@ -198,6 +195,12 @@ pub fn atom_two_lens(
             assignments_owned.view()
         }
     };
+    if assignments.dim() != (n, k) {
+        return Err(format!(
+            "atom_two_lens: assignments shape {:?} must be ({n}, {k})",
+            assignments.dim()
+        ));
+    }
 
     let mut presence = vec![0.0_f64; k];
     let mut coupling_raw = vec![0.0_f64; k];
@@ -219,22 +222,20 @@ pub fn atom_two_lens(
 
         let latent_dim = atom.latent_dim;
 
-        let mut active_mass_sum = 0.0_f64;
-        let mut active_row_count = 0.0_f64;
+        let support = SupportMeasure::from_assignment_matrix(assignments, atom_idx)?;
+        let support_mass = support.mass();
         let mut coupling_sum = 0.0_f64;
 
-        for row in 0..n {
-            let mass = assignments[[row, atom_idx]];
-            if !(mass > SAE_TRUST_ACTIVE_MASS_FLOOR) {
+        for row in 0..support.len() {
+            let mass = support.weight(row);
+            if !(mass > 0.0) {
                 continue;
             }
-            active_mass_sum += mass;
-            active_row_count += 1.0;
 
             if coupling_axis_available {
-                // Behavioral coupling on this active row: the output-Fisher mass
+                // Behavioral coupling on this supported row: the output-Fisher mass
                 // of the decoder tangent dg_k/dt summed over the atom's latent
-                // axes, weighted by the active mass (so a barely-active row
+                // axes, weighted by the support mass (so a barely-supported row
                 // contributes proportionally less behavioral evidence, matching
                 // the presence weighting). This is the ONLY place the Fisher
                 // metric enters; `fisher_mass` reads no loss / criterion.
@@ -249,17 +250,15 @@ pub fn atom_two_lens(
             }
         }
 
-        // Mean active mass on truly-active rows (0 if the atom is active nowhere).
-        let mean_active_mass = if active_row_count > 0.0 {
-            active_mass_sum / active_row_count
+        let mean_support_mass = if support_mass > 0.0 {
+            support.fisher_n() / support_mass
         } else {
             0.0
         };
-        presence[atom_idx] = mean_active_mass * decoder_norm;
+        presence[atom_idx] = mean_support_mass * decoder_norm;
 
-        // Mean behavioral coupling over the atom's active rows.
-        if coupling_axis_available && active_row_count > 0.0 {
-            coupling_raw[atom_idx] = coupling_sum / active_row_count;
+        if coupling_axis_available && support_mass > 0.0 {
+            coupling_raw[atom_idx] = coupling_sum / support_mass;
         }
     }
 
@@ -305,8 +304,8 @@ pub fn atom_two_lens(
         });
     }
 
-    AtomTwoLensReport {
+    Ok(AtomTwoLensReport {
         atoms: entries,
         coupling_provenance: Some(provenance),
-    }
+    })
 }

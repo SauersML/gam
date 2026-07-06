@@ -31,14 +31,13 @@
 //! prototype-validated floor for escaping permutation/blend saddles on the
 //! equal-amplitude worst case, where second order gives NO ordering at all)
 //! keeps the best basin. The winning plane is accepted only on the ANALYTIC
-//! contrast certificate (anchors above; no tuned ε), and the accepted circle is
-//! DEFLATED by subtracting its FITTED CURVE — the least-squares harmonic
-//! `â₁cosθ·u₁ + â₂sinθ·u₂` on its active rows — NOT its plane projection.
-//! Subtracting the plane would also delete the plane's noise energy and the
-//! overlap other structure may share with it, biasing every later round;
-//! subtracting the fitted curve removes exactly the model the born atom will
-//! carry, which is also what the stagewise fit-then-residual loop does — so the
-//! in-fit deflation and this producer's harness deflation are the same operator.
+//! contrast certificate (anchors above; no tuned ε), mapped back through the
+//! GENERATIVE unwhitening `EΛ^{1/2}` to the ambient support plane, and DEFLATED
+//! by subtracting the accepted plane's centered residual projection on its
+//! active rows. That operator removes the covariance the next eigensolve would
+//! otherwise keep ranking while preserving off-gate plane noise for sparse
+//! circles; dense all-row circles get a final recentered cleanup because there
+//! are no off rows whose plane noise must be retained.
 //!
 //! Everything here is derived from the residual spectrum (MP edge, bottom-
 //! quartile noise scale) plus the analytic κ anchors; the only dials are
@@ -618,14 +617,19 @@ fn certify_plane(
 ) -> Option<IsaPlaneCandidate> {
     let (n, p) = residual.dim();
     let r = parts.above.len();
-    // Un-whiten to ambient: u_a / √λ_a per above-floor direction, then restore
-    // orthonormality (whitening skews the frame).
+    // Un-whiten to the ambient SUPPORT plane: a whitened source direction `w`
+    // generates ambient variation as `E Λ^{1/2} w`. The reciprocal
+    // `E Λ^{-1/2} w` is the score functional used to READ the whitened
+    // coordinate, not the Euclidean support plane to birth/deflate. On unequal
+    // circle amplitudes the two maps span different mixed planes; using the
+    // score plane leaves the accepted strong circle's covariance behind, so
+    // later rounds keep seeing it instead of the weaker circles.
     let mut amb = Array2::<f64>::zeros((p, 2));
     for (a, &k) in parts.above.iter().enumerate().take(r) {
-        let inv = 1.0 / parts.evals[k].max(f64::MIN_POSITIVE).sqrt();
+        let scale = parts.evals[k].max(f64::MIN_POSITIVE).sqrt();
         for j in 0..p {
-            amb[[j, 0]] += parts.evecs[[j, k]] * inv * w[[a, 0]];
-            amb[[j, 1]] += parts.evecs[[j, k]] * inv * w[[a, 1]];
+            amb[[j, 0]] += parts.evecs[[j, k]] * scale * w[[a, 0]];
+            amb[[j, 1]] += parts.evecs[[j, k]] * scale * w[[a, 1]];
         }
     }
     if !orthonormalize2(&mut amb) {
@@ -802,11 +806,11 @@ pub fn isa_extract_certified_plane(
     None
 }
 
-/// Subtract an accepted plane's fitted residual projection, in place: on each
-/// active row (finite gate) remove the centered residual component in the
-/// certified plane. Certification still emits the LS harmonic amplitudes used by
-/// the birth seed; harvest deflation must instead zero the accepted plane's
-/// energy so the next eigendecomposition surfaces the next circle.
+/// Subtract an accepted plane's centered residual projection, in place: on each
+/// active row (finite gate) remove the residual component in the certified
+/// ambient SUPPORT plane. Certification still emits the LS harmonic amplitudes
+/// used by the birth seed; harvest deflation must zero the accepted plane's
+/// covariance so the next eigendecomposition surfaces the next circle.
 pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandidate) {
     let (n, p) = residual.dim();
     let mut mean = Array1::<f64>::zeros(p);
@@ -828,6 +832,31 @@ pub fn isa_deflate_fitted_curve(residual: &mut Array2<f64>, cand: &IsaPlaneCandi
         }
         for j in 0..p {
             residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
+        }
+    }
+    if cand.gate_logits.iter().all(|g| g.is_finite()) {
+        // Dense circles are present on every row, so after the first pass the
+        // accepted support plane should carry only roundoff. Recenter and remove
+        // that last numerical component explicitly; this is a no-op for sparse
+        // gates, where off-row plane noise must remain available to the noise
+        // floor rather than being silently deleted.
+        mean.fill(0.0);
+        for i in 0..n {
+            for j in 0..p {
+                mean[j] += residual[[i, j]];
+            }
+        }
+        mean.mapv_inplace(|v| v / n as f64);
+        for i in 0..n {
+            let (mut p1, mut p2) = (0.0_f64, 0.0_f64);
+            for j in 0..p {
+                let ri = residual[[i, j]] - mean[j];
+                p1 += ri * cand.basis[[j, 0]];
+                p2 += ri * cand.basis[[j, 1]];
+            }
+            for j in 0..p {
+                residual[[i, j]] -= p1 * cand.basis[[j, 0]] + p2 * cand.basis[[j, 1]];
+            }
         }
     }
 }

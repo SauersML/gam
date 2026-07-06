@@ -36,6 +36,15 @@ def _as_2d_u32(values: Any, label: str) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+def _as_optional_1d_f64(values: Any | None, label: str) -> np.ndarray | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{label} must be a 1-D array; got shape {arr.shape}")
+    return np.ascontiguousarray(arr)
+
+
 # --------------------------------------------------------------------------- #
 # Dimension spectrometer
 # --------------------------------------------------------------------------- #
@@ -274,6 +283,66 @@ def sparse_dict_dual_certificate(
             (int(r), int(a), float(e)) for r, a, e in payload["birth_candidates"]
         ],
     )
+
+
+def audit_sae(
+    decoder: Any,
+    codes: Any,
+    activations: Any,
+    *,
+    active: int | None = None,
+    block_size: int = 1,
+    block_topk: int | None = None,
+    delta: float = 0.05,
+    quantile_levels: tuple[float, ...] | None = (0.5, 0.9, 0.99),
+    max_candidates: int = 16,
+    coordinate_blocks: list[int] | tuple[int, ...] | None = None,
+    activation_threshold: float = 0.0,
+    max_absorption_pairs: int = 32,
+    transport: tuple[Any, Any] | None = None,
+    transport_theta_in: Any | None = None,
+    transport_theta_out: Any | None = None,
+    transport_layer_from: int = 0,
+    transport_layer_to: int = 1,
+) -> dict[str, Any]:
+    """Run GAM diagnostics on a frozen external SAE dictionary.
+
+    Parameters are a decoder matrix ``K x P``, dense SAE activations/codes
+    ``N x K``, and source activations ``N x P``. The Rust FFI derives the sparse
+    or block routing views from those frozen codes; it does not fit a dictionary.
+    """
+    dec = _as_2d_f32(decoder, "decoder")
+    cod = _as_2d_f32(codes, "codes")
+    acts = _as_2d_f32(activations, "activations")
+    if transport is not None:
+        if transport_theta_in is not None or transport_theta_out is not None:
+            raise ValueError(
+                "pass either transport=(theta_in, theta_out) or transport_theta_in/transport_theta_out"
+            )
+        transport_theta_in, transport_theta_out = transport
+    theta_in = _as_optional_1d_f64(transport_theta_in, "transport_theta_in")
+    theta_out = _as_optional_1d_f64(transport_theta_out, "transport_theta_out")
+    q_levels = None if quantile_levels is None else [float(q) for q in quantile_levels]
+    blocks = None if coordinate_blocks is None else [int(block) for block in coordinate_blocks]
+    payload = rust_module().audit_sae(
+        dec,
+        cod,
+        acts,
+        active,
+        block_size,
+        block_topk,
+        delta,
+        q_levels,
+        max_candidates,
+        blocks,
+        activation_threshold,
+        max_absorption_pairs,
+        theta_in,
+        theta_out,
+        transport_layer_from,
+        transport_layer_to,
+    )
+    return dict(payload)
 
 
 # --------------------------------------------------------------------------- #

@@ -67,7 +67,7 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::encode::EncodeAtlas;
-use crate::manifold::SaeManifoldTerm;
+use crate::manifold::{SaeManifoldTerm, SupportMeasure};
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::log_e_from_p_calibrator;
 
@@ -82,10 +82,6 @@ const STEER_PATH_STEPS: usize = 64;
 /// At `0.1` we trust the linearization while the curved-path dose stays within
 /// 10% of the chord dose.
 const VALIDITY_DIVERGENCE_FRACTION: f64 = 0.1;
-
-/// Active-mass floor below which a row is "off" for an atom and excluded from the
-/// representative-row / amplitude selection. Mirrors `atom_lens::ACTIVE_MASS_FLOOR`.
-const ACTIVE_MASS_FLOOR: f64 = 1e-6;
 
 /// The actionable output of a steering query over one atom.
 #[derive(Clone, Debug, PartialEq)]
@@ -386,33 +382,25 @@ fn steer_delta_impl(
     })?;
 
     // --- amplitude & the row the dose is measured through -------------------
-    // The amplitude is the atom's mean active assignment mass (how loudly the
-    // atom is expressed), mirroring the presence weighting in `atom_lens`. The
-    // measured row is the atom's single most-active row: the per-row metric
-    // there is the most representative behavioral inner product for "this atom
-    // is on". Both fall back gracefully when the atom is active nowhere.
-    let assignments = model.assignment.assignments();
+    // The amplitude and measured row come from the shared atom support measure.
+    // Hard 0/1 support gives amplitude 1 on non-empty support, matching the old
+    // active-mask limit; diffuse support scales by its support-weighted mass.
+    let support = SupportMeasure::from_assignment(&model.assignment, atom_k)?;
     let n = model.n_obs();
-    let mut mass_sum = 0.0_f64;
-    let mut active_count = 0.0_f64;
     let mut best_row = 0usize;
     let mut best_mass = f64::NEG_INFINITY;
-    for row in 0..n {
-        let mass = assignments[[row, atom_k]];
+    for row in 0..support.len() {
+        let mass = support.weight(row);
         if mass > best_mass {
             best_mass = mass;
             best_row = row;
         }
-        if mass > ACTIVE_MASS_FLOOR {
-            mass_sum += mass;
-            active_count += 1.0;
-        }
     }
     let amplitude = amplitude_override.unwrap_or_else(|| {
-        if active_count > 0.0 {
-            mass_sum / active_count
+        if support.mass() > 0.0 {
+            support.fisher_n() / support.mass()
         } else {
-            1.0
+            0.0
         }
     });
 

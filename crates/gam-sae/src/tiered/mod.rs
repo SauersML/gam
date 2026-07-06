@@ -14,6 +14,9 @@
 //! This module owns the coordinate-descent machinery + fixed effect for fitting
 //! that one model at large `K`:
 //! - [`Tier0Mean`] — the shared intercept `μ` (schedule stage "Tier-0").
+//! - [`Tier05SinkAtom`] — a flag-gated finite-anchor attention-sink atom
+//!   (schedule stage "Tier-0.5") for fixed known supports such as position 0
+//!   and delimiter classes.
 //! - a linear sparse-dictionary bulk (schedule stage "Tier-1") whose atoms are
 //!   the criterion-selected rank-1 special case.
 //! - an evidence-selected curved refinement (schedule stage "Tier-2") fit on the
@@ -27,6 +30,10 @@
 //!     class (issue #10 / #1893): on the de-meaned data the all-atoms-equal-to-
 //!     mean state reconstructs zero, so it is EV-invisible and gets pruned rather
 //!     than rewarded and PC-reseeded.
+//!   * [`Tier05SinkAtom`] — a finite-set atom for known attention-sink support.
+//!     It is typed structure, not a nuisance scalar: the atom keeps its
+//!     fixed-support anchors and decoder rows, is charged as a finite set, and
+//!     only the residual after peeling it is handed to semantic charting.
 //!   * [`TieredConfig`] — the composed-fit knobs.
 //!   * [`interference_subspace`] — Tier-1's active subspace `Q` (what the linear
 //!     dictionary already explains) and its orthogonal complement `Q⊥`. Per the
@@ -49,11 +56,14 @@
 //! scale-out (one K=1 curved chart per orthonormal Tier-1 block) consumes the
 //! block frames on the block-sparse fit directly; see `sparse_dict::block`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
+use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator};
+use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, finite_set_rank_charge};
 use crate::sparse_dict::{SparseDictConfig, SparseDictFit};
 
 /// Tier-0: the single shared mean μ (length `p`). The global DC lives here, not
@@ -195,6 +205,360 @@ impl PerContextMean {
     }
 }
 
+/// Fixed delimiter classes that may be charted as Tier-0.5 sink anchors.
+///
+/// The class is supplied by the caller from tokenizer/template metadata. The
+/// sink fitter never discovers delimiter support from activations, so the atom's
+/// support is fixed before reconstruction is fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SinkDelimiterClass {
+    Bos,
+    Eos,
+    Newline,
+    ChatBoundary,
+    Separator,
+}
+
+impl SinkDelimiterClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bos => "bos",
+            Self::Eos => "eos",
+            Self::Newline => "newline",
+            Self::ChatBoundary => "chat_boundary",
+            Self::Separator => "separator",
+        }
+    }
+}
+
+/// One finite support anchor in the Tier-0.5 attention-sink atom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SinkAnchor {
+    /// Reference/background category: rows that are neither position 0 nor one
+    /// of the configured delimiter classes.
+    Semantic,
+    /// The known first-token attention sink.
+    PositionZero,
+    /// A configured delimiter class with fixed tokenizer/template support.
+    Delimiter(SinkDelimiterClass),
+}
+
+impl SinkAnchor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic_reference",
+            Self::PositionZero => "position_0",
+            Self::Delimiter(class) => class.label(),
+        }
+    }
+
+    fn is_sink(self) -> bool {
+        !matches!(self, Self::Semantic)
+    }
+}
+
+/// Flag-gated Tier-0.5 sink-atom configuration.
+#[derive(Clone, Debug)]
+pub struct Tier05SinkAtomConfig {
+    /// Disabled by default: callers must opt in after supplying row support.
+    pub enabled: bool,
+    /// Include the fixed position-0 support anchor.
+    pub include_position_zero: bool,
+    /// Include fixed delimiter-class support anchors.
+    pub delimiter_classes: Vec<SinkDelimiterClass>,
+}
+
+impl Default for Tier05SinkAtomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_position_zero: true,
+            delimiter_classes: Vec::new(),
+        }
+    }
+}
+
+impl Tier05SinkAtomConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            include_position_zero: true,
+            delimiter_classes: Vec::new(),
+        }
+    }
+
+    pub fn position_zero() -> Self {
+        Self {
+            enabled: true,
+            include_position_zero: true,
+            delimiter_classes: Vec::new(),
+        }
+    }
+
+    pub fn anchors(&self) -> Result<Vec<SinkAnchor>, String> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        if !self.include_position_zero && self.delimiter_classes.is_empty() {
+            return Err(
+                "Tier05SinkAtomConfig::anchors: enabled sink atom needs position-0 or delimiter support"
+                    .to_string(),
+            );
+        }
+        let mut anchors = vec![SinkAnchor::Semantic];
+        if self.include_position_zero {
+            anchors.push(SinkAnchor::PositionZero);
+        }
+        let unique: BTreeSet<SinkDelimiterClass> = self.delimiter_classes.iter().copied().collect();
+        for class in unique {
+            anchors.push(SinkAnchor::Delimiter(class));
+        }
+        Ok(anchors)
+    }
+}
+
+/// Tier-0.5 finite-set attention-sink atom.
+///
+/// This is the typed counterpart to a nuisance regress-out: the basis kind is
+/// [`SaeAtomBasisKind::FiniteSet`], the basis is a one-hot
+/// [`AnchorIndicatorEvaluator`], and the row support is fixed from known
+/// positions/delimiter metadata before the decoder is fit. The atom is additive:
+/// downstream semantic charting sees `residual_after_sink`, while reconstruction
+/// adds the sink contribution back.
+#[derive(Clone, Debug)]
+pub struct Tier05SinkAtom {
+    pub atom: SaeManifoldAtom,
+    pub anchors: Vec<SinkAnchor>,
+    pub anchor_counts: Vec<usize>,
+    pub rank_charge: usize,
+    pub variance_absorbed: f64,
+}
+
+impl Tier05SinkAtom {
+    /// Dense training reconstruction of the sink atom (`N×P`).
+    pub fn reconstruction(&self) -> Array2<f64> {
+        self.atom
+            .basis_values
+            .dot(&self.atom.decoder_coefficients)
+    }
+
+    /// Peel the sink from a same-row residual matrix before semantic charting.
+    pub fn residual_after_sink(&self, residual: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
+        if residual.dim() != expected {
+            return Err(format!(
+                "Tier05SinkAtom::residual_after_sink: residual shape {:?} incompatible with atom rows/output ({}, {})",
+                residual.dim(),
+                self.atom.basis_values.nrows(),
+                self.atom.output_dim()
+            ));
+        }
+        Ok(&residual - &self.reconstruction())
+    }
+
+    /// Add the sink contribution back to a semantic reconstruction.
+    pub fn reconstruct_with_sink(
+        &self,
+        semantic_recon: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
+        if semantic_recon.dim() != expected {
+            return Err(format!(
+                "Tier05SinkAtom::reconstruct_with_sink: reconstruction shape {:?} incompatible with atom rows/output ({}, {})",
+                semantic_recon.dim(),
+                self.atom.basis_values.nrows(),
+                self.atom.output_dim()
+            ));
+        }
+        Ok(&semantic_recon + &self.reconstruction())
+    }
+}
+
+/// Fit the Tier-0.5 sink atom on a post-Tier-0 residual.
+///
+/// `positions` are within-sequence token positions. `delimiter_classes` is either
+/// empty (no delimiter support supplied) or length `N`; entries not listed in
+/// `config.delimiter_classes` remain in the semantic reference anchor. Position
+/// 0 takes precedence over delimiter labels, because the measured confound is
+/// the first-token sink itself.
+pub fn fit_tier05_sink_atom(
+    residual: ArrayView2<'_, f64>,
+    positions: &[i64],
+    delimiter_classes: &[Option<SinkDelimiterClass>],
+    config: &Tier05SinkAtomConfig,
+) -> Result<Option<Tier05SinkAtom>, String> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let n = residual.nrows();
+    let p = residual.ncols();
+    if n == 0 || p == 0 {
+        return Err("fit_tier05_sink_atom: residual must be a non-empty N×P matrix".to_string());
+    }
+    if positions.len() != n {
+        return Err(format!(
+            "fit_tier05_sink_atom: positions length {} != N {n}",
+            positions.len()
+        ));
+    }
+    if !delimiter_classes.is_empty() && delimiter_classes.len() != n {
+        return Err(format!(
+            "fit_tier05_sink_atom: delimiter_classes length {} must be 0 or N {n}",
+            delimiter_classes.len()
+        ));
+    }
+    if !config.delimiter_classes.is_empty() && delimiter_classes.is_empty() {
+        return Err(
+            "fit_tier05_sink_atom: delimiter classes configured but no per-row delimiter labels supplied"
+                .to_string(),
+        );
+    }
+
+    let anchors = config.anchors()?;
+    let delimiter_set: BTreeSet<SinkDelimiterClass> =
+        config.delimiter_classes.iter().copied().collect();
+    let mut anchor_lookup = BTreeMap::new();
+    for (idx, anchor) in anchors.iter().copied().enumerate() {
+        anchor_lookup.insert(anchor, idx);
+    }
+
+    let mut coords = Array2::<f64>::zeros((n, 1));
+    let mut counts = vec![0usize; anchors.len()];
+    for row in 0..n {
+        let delimiter = if delimiter_classes.is_empty() {
+            None
+        } else {
+            delimiter_classes[row]
+        };
+        let anchor = if config.include_position_zero && positions[row] == 0 {
+            SinkAnchor::PositionZero
+        } else if let Some(class) = delimiter {
+            if delimiter_set.contains(&class) {
+                SinkAnchor::Delimiter(class)
+            } else {
+                SinkAnchor::Semantic
+            }
+        } else {
+            SinkAnchor::Semantic
+        };
+        let idx = anchor_lookup.get(&anchor).copied().ok_or_else(|| {
+            format!(
+                "fit_tier05_sink_atom: support anchor {} was not configured",
+                anchor.label()
+            )
+        })?;
+        coords[[row, 0]] = idx as f64;
+        counts[idx] += 1;
+    }
+
+    let sink_rows: usize = anchors
+        .iter()
+        .zip(counts.iter())
+        .filter(|(anchor, _count)| anchor.is_sink())
+        .map(|(_anchor, &count)| count)
+        .sum();
+    if sink_rows == 0 {
+        return Err("fit_tier05_sink_atom: enabled sink atom has no sink-supported rows".to_string());
+    }
+
+    let evaluator = Arc::new(AnchorIndicatorEvaluator::new(anchors.len())?);
+    let (basis_values, basis_jacobian) = evaluator.evaluate(coords.view())?;
+    let mut decoder = Array2::<f64>::zeros((anchors.len(), p));
+    for row in 0..n {
+        let anchor = coords[[row, 0]] as usize;
+        for col in 0..p {
+            decoder[[anchor, col]] += residual[[row, col]];
+        }
+    }
+    for anchor in 0..anchors.len() {
+        if counts[anchor] > 0 {
+            let scale = 1.0 / counts[anchor] as f64;
+            for col in 0..p {
+                decoder[[anchor, col]] *= scale;
+            }
+        }
+    }
+    let smooth_penalty = Array2::<f64>::zeros((anchors.len(), anchors.len()));
+    let atom = SaeManifoldAtom::new(
+        "tier0_5_attention_sink",
+        SaeAtomBasisKind::FiniteSet,
+        1,
+        basis_values,
+        basis_jacobian,
+        decoder,
+        smooth_penalty,
+    )?
+    .with_basis_second_jet(evaluator);
+
+    let reconstruction = atom.basis_values.dot(&atom.decoder_coefficients);
+    let mut rss = 0.0f64;
+    let mut tss = 0.0f64;
+    for row in 0..n {
+        for col in 0..p {
+            let r = residual[[row, col]] - reconstruction[[row, col]];
+            rss += r * r;
+            let v = residual[[row, col]];
+            tss += v * v;
+        }
+    }
+    let variance_absorbed = if tss <= 0.0 { 0.0 } else { 1.0 - rss / tss };
+
+    Ok(Some(Tier05SinkAtom {
+        atom,
+        anchors,
+        anchor_counts: counts,
+        rank_charge: finite_set_rank_charge(anchor_lookup.len()),
+        variance_absorbed,
+    }))
+}
+
+/// Position-only convenience wrapper for the measured position-0 sink.
+pub fn fit_position0_sink_atom(
+    residual: ArrayView2<'_, f64>,
+    positions: &[i64],
+) -> Result<Tier05SinkAtom, String> {
+    let config = Tier05SinkAtomConfig::position_zero();
+    fit_tier05_sink_atom(residual, positions, &[], &config)?
+        .ok_or_else(|| "fit_position0_sink_atom: position-0 sink config unexpectedly disabled".to_string())
+}
+
+/// Pre-chart residual after Tier-0 and optional Tier-0.5 peeling.
+#[derive(Clone, Debug)]
+pub struct TieredPrechartResidual {
+    pub tier0: Tier0Mean,
+    pub tier05_sink: Option<Tier05SinkAtom>,
+    /// Residual handed to semantic Tier-1/Tier-2 charting.
+    pub residual: Array2<f64>,
+}
+
+/// Apply the additive pre-chart path: Tier-0 mean first, then the optional
+/// Tier-0.5 finite-anchor sink atom, then hand only the residual to semantic
+/// dictionary/chart fitting.
+pub fn prechart_residual(
+    z: ArrayView2<'_, f64>,
+    positions: &[i64],
+    delimiter_classes: &[Option<SinkDelimiterClass>],
+    config: &TieredConfig,
+) -> Result<TieredPrechartResidual, String> {
+    let tier0 = Tier0Mean::fit(z)?;
+    let after_tier0 = tier0.apply(z)?;
+    let tier05_sink = fit_tier05_sink_atom(
+        after_tier0.view(),
+        positions,
+        delimiter_classes,
+        &config.tier05_sink,
+    )?;
+    let residual = match &tier05_sink {
+        Some(sink) => sink.residual_after_sink(after_tier0.view())?,
+        None => after_tier0,
+    };
+    Ok(TieredPrechartResidual {
+        tier0,
+        tier05_sink,
+        residual,
+    })
+}
+
 /// Knobs for a composed tiered fit.
 #[derive(Clone, Debug)]
 pub struct TieredConfig {
@@ -207,6 +571,9 @@ pub struct TieredConfig {
     /// Whether to run the Tier-2 curved tier at all (`false` ⇒ Tier-0 + Tier-1
     /// only, the linear-bulk baseline).
     pub tier2_enabled: bool,
+    /// Optional Tier-0.5 finite-anchor attention-sink atom, peeled after Tier-0
+    /// and before semantic Tier-1/Tier-2 charting.
+    pub tier05_sink: Tier05SinkAtomConfig,
 }
 
 impl TieredConfig {
@@ -216,6 +583,7 @@ impl TieredConfig {
             tier1: SparseDictConfig::new(k_linear),
             lambda_seed_rank: None,
             tier2_enabled: false,
+            tier05_sink: Tier05SinkAtomConfig::disabled(),
         }
     }
 }
@@ -362,8 +730,10 @@ pub fn interference_subspace(
 /// see [`InterferenceSubspace`]).
 #[derive(Clone, Debug)]
 pub struct WhitenedResidualHandoff {
-    /// Post-Tier-1 residual `R = (z − μ) − T1.reconstruct()`, `N×P`, f64. Tier-2
-    /// fits this RAW residual directly.
+    /// Post-Tier-1 residual, `N×P`, f64. Without Tier-0.5 this is
+    /// `R = (z − μ) − T1.reconstruct()`; with a sink atom it is
+    /// `R = (z − μ − sink) − T1.reconstruct()`. Tier-2 fits this RAW residual
+    /// directly.
     pub residual: Array2<f64>,
     /// Tier-1's active subspace (`q`, `q_perp`, `scale`) — DIAGNOSTIC only.
     pub interference: InterferenceSubspace,
@@ -371,6 +741,9 @@ pub struct WhitenedResidualHandoff {
     pub tier1_decoder: Array2<f32>,
     /// The Tier-0 shared mean μ, length `P`.
     pub mean: Array1<f64>,
+    /// Optional Tier-0.5 finite-anchor attention-sink atom already peeled from
+    /// `residual`; downstream reconstruction adds it back before Tier-0.
+    pub tier05_sink: Option<Tier05SinkAtom>,
 }
 
 /// The composed tiered artifact. Generic over the Tier-2 artifact `T2` (defined
@@ -381,6 +754,8 @@ pub struct WhitenedResidualHandoff {
 pub struct TieredSaeFit<T2> {
     /// Tier-0 shared mean.
     pub tier0: Tier0Mean,
+    /// Optional Tier-0.5 finite-anchor attention-sink atom.
+    pub tier05_sink: Option<Tier05SinkAtom>,
     /// Tier-1 linear sparse-dictionary bulk.
     pub tier1: SparseDictFit,
     /// Tier-2 curved artifact (owner-defined), if present.

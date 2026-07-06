@@ -284,26 +284,26 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     // This is a setup fix that makes the comparison point EXIST; no tolerance is
     // weakened.
     rho.log_lambda_sparse = 0.5;
-    // Converge to a well-conditioned PD state, then apply a SMALL differential
-    // nudge to the logits to move OFF the Gershgorin |·|-majorizer kink WITHOUT
-    // leaving the PD well. At the softmax fit optimum an entropy-Hessian
-    // off-diagonal can sit exactly at a sign-flip (`|H_kj| = 0`), where the central
-    // FD of `log|H|` straddles two subgradient branches and is meaningless (acn116
-    // pre-fix: fwd=-3.95 vs bwd=-19.16 on row 0, central their average). The
-    // analytic θ-adjoint is a VALID subgradient there, but no FD can verify it at
-    // the kink. A small per-row DIFFERENTIAL nudge (softmax is shift-invariant, so
-    // it must change the atom DIFFERENCE, not a common offset) shifts every `|H_kj|`
-    // a definite amount off 0 while staying near the converged PD state — the
-    // majorizer is then locally smooth and the central FD is a clean O(h²) oracle
-    // again. (A large decisive override instead pushed the state near a PD boundary,
-    // fd≈+56.) The θ-adjoint is a fixed-state quantity, so this remains valid; no
-    // tolerance weakened, `row_psd_majorizer_logit_derivative` untouched.
+    // Converge to a well-conditioned PD state, then replace only the softmax
+    // logits by a deterministic, moderately decisive fixture. At the fitted
+    // optimum an entropy-Hessian off-diagonal can sit exactly at the Gershgorin
+    // `|H_kj|` sign-flip kink (acn116: fwd=-3.95, bwd=-19.16, central their
+    // average), where no finite-difference stencil validates a subgradient. These
+    // row-varying logit margins keep the softmax away from that kink without
+    // saturating the row to a near-boundary PD block, so the fixed-state central
+    // difference below differentiates a locally smooth majorizer branch.
     term.reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     for r in 0..term.n_obs() {
-        let d = 0.15 + 0.03 * (r as f64);
-        term.assignment.logits[[r, 0]] += d;
-        term.assignment.logits[[r, 1]] -= d;
+        let center = 0.05 * (r as f64);
+        let margin = 1.55 + 0.04 * (r as f64);
+        if r % 2 == 0 {
+            term.assignment.logits[[r, 0]] = center + margin;
+            term.assignment.logits[[r, 1]] = center - margin;
+        } else {
+            term.assignment.logits[[r, 0]] = center - 0.85 * margin;
+            term.assignment.logits[[r, 1]] = center + 0.85 * margin;
+        }
     }
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
@@ -322,9 +322,9 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
         // softmax entropy curvature written into `htt` is the Gershgorin
         // `|·|`-majorizer `D = diag(Σ_j|H_kj|)`, whose logit-derivative is
         // PIECEWISE (the `sign(H_kj)` flips where a `H_kj` crosses zero). A
-        // *higher-order* stencil is therefore counterproductive — sampling at
-        // `±2h` straddles a majorizer kink more often than `±h` — so keep the
-        // 2-point difference (narrowest stencil) here.
+        // *higher-order* stencil is therefore counterproductive; after the
+        // decisive fixture above the narrow 2-point central difference is the
+        // strongest smooth-branch oracle.
         let (logit_atom, coord_atom, coord_axis) = match var {
             SaeLocalRowVar::Logit { atom } => (Some(atom), None, 0usize),
             SaeLocalRowVar::Coord { atom, axis } => (None, Some(atom), axis),
@@ -341,7 +341,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
             }
             fixed_state_logdet(t, &target, &rho)
         };
-        let fd = (at(h) - at(0.0)) / h;
+        let fd = (at(h) - at(-h)) / (2.0 * h);
         let analytic = gamma.t[cache.row_offsets[row] + local_pos];
         let tol = 2.0e-3 * (1.0 + fd.abs().max(analytic.abs()));
         assert!(

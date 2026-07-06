@@ -1346,7 +1346,7 @@ impl SaeManifoldTerm {
         }
         let metric = self.diagnostic_metric()?;
         let atom_two_lens =
-            crate::inference::atom_lens::atom_two_lens(self, &metric, assignments_override);
+            crate::inference::atom_lens::atom_two_lens(self, &metric, assignments_override)?;
 
         let (certificate_model, streamed_curvature) =
             self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;
@@ -8188,7 +8188,7 @@ impl SaeManifoldTerm {
                         }
                         _ => None,
                     };
-                let mut dh_mat = Array2::<f64>::zeros((q, q));
+                let mut deflated_base_dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
@@ -8223,14 +8223,42 @@ impl SaeManifoldTerm {
                                 _ => 0.0,
                             };
                         }
-                        dh_mat[[a, b]] = dh;
+                        let mut deflated_base_dh = dh;
+                        // #2144: the row factor that spectral deflation conditions is
+                        // the IBP no-self base `H0'`, because
+                        // `solve_arrow_newton_step_with_options` downdates the
+                        // row-local `d_k J_ik^2` self curvature before factoring and
+                        // re-adds the full rank-one column through Woodbury. The trace
+                        // above still contracts the derivative of the full diagonal
+                        // against the full selected inverse; only the Daleckii-Krein
+                        // deflation-map correction must see the derivative of the
+                        // actually deflated row block. Therefore remove just the
+                        // direct-local derivative of the downdated IBP self term from
+                        // the matrix passed to `deflation_block_correction`. The
+                        // empirical-M and off-row Woodbury channels remain in their
+                        // existing passes.
+                        if let (
+                            Some(channels),
+                            SaeLocalRowVar::Logit { atom: diag_atom },
+                            SaeLocalRowVar::Logit { atom: wrt_atom },
+                        ) = (ibp_channels.as_ref(), jets.vars[a], jets.vars[w])
+                        {
+                            if a == b && diag_atom == wrt_atom {
+                                let idx = row * k_atoms + diag_atom;
+                                deflated_base_dh -= 2.0
+                                    * channels.cross_row_d[diag_atom]
+                                    * channels.z_jac[idx]
+                                    * channels.logit_curvature[idx];
+                            }
+                        }
+                        deflated_base_dh_mat[[a, b]] = deflated_base_dh;
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
                 if !defl_dirs.is_empty() {
                     gamma -= Self::deflation_block_correction(
                         &inv_vv,
-                        &dh_mat,
+                        &deflated_base_dh_mat,
                         defl_dirs,
                         defl_spectrum,
                     );

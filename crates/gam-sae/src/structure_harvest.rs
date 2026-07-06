@@ -4937,4 +4937,122 @@ mod tests {
         );
     }
 
+    /// KILLER DEMO — end-to-end through the round driver: with curl ON the
+    /// shattered centered circle yields a circle Birth that certifies through
+    /// the same e-gate the residual births race through; with curl OFF (the
+    /// default) the driver is unchanged. The paired null checks pin the
+    /// structural boundary: Gaussian fill is not curled, and a diameter
+    /// collapse flattens to rank 1.
+    #[test]
+    fn curl_killer_demo_planted_circle_wins_race() {
+        let (term, _rho) = shattered_plane_term(false);
+        let residuals = residuals_of(&term);
+        let cands = curl_candidates(&term, residuals.view(), &CurlConfig::default());
+        assert!(
+            !cands.is_empty(),
+            "curl must recover the shattered circle before the race"
+        );
+        let mut members = cands[0].members.clone();
+        members.sort_unstable();
+        members.dedup();
+        assert_eq!(
+            members,
+            vec![0, 1, 2, 3],
+            "the recovered circle must claim all four rectified halves"
+        );
+
+        let budget = MoveBudget {
+            max_moves: 4,
+            alpha: 0.05,
+        };
+        let harvest_params = HarvestParams {
+            max_fusions: 0,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let run = |curl: Option<CurlConfig>| -> StructureSearchResult {
+            let (term, rho) = shattered_plane_term(false);
+            let target = 2.0 * term.try_fitted().unwrap();
+            let mut ledger = StructureLedger::new();
+            let config = RoundDriverConfig {
+                n_shards: 3,
+                budget,
+                max_rounds: 1,
+                harvest_params,
+                curl,
+            };
+            run_structure_search_rounds(
+                term,
+                rho,
+                target.view(),
+                config,
+                &mut ledger,
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
+            )
+            .unwrap()
+        };
+
+        let off = run(None);
+        let off_births = off
+            .rounds
+            .iter()
+            .flat_map(|r| r.moves.iter())
+            .filter(|m| matches!(m.mv, StructureMove::Birth { .. }))
+            .count();
+        assert_eq!(off_births, 0, "curl OFF (default) must inject no births");
+
+        let on = run(Some(CurlConfig::default()));
+        let accepted_curl_births = on
+            .rounds
+            .iter()
+            .flat_map(|r| r.moves.iter())
+            .filter(|m| {
+                matches!(m.mv, StructureMove::Birth { .. })
+                    && matches!(
+                        m.verdict,
+                        gam_solve::structure_search::MoveVerdict::Accepted { .. }
+                    )
+            })
+            .count();
+        assert_eq!(
+            accepted_curl_births, 1,
+            "curl ON must certify exactly one circle Birth winner"
+        );
+        assert_eq!(
+            on.term.atoms.last().map(|a| &a.basis_kind),
+            Some(&SaeAtomBasisKind::Periodic),
+            "the accepted curl winner must be the recovered circle atom"
+        );
+        assert!(
+            on.structure_changed(),
+            "accepted curl winner must mutate the returned term"
+        );
+
+        let (gauss_term, _) = shattered_plane_term(true);
+        let gauss_residuals = residuals_of(&gauss_term);
+        let gauss_cands =
+            curl_candidates(&gauss_term, gauss_residuals.view(), &CurlConfig::default());
+        assert!(
+            gauss_cands.is_empty(),
+            "a Gaussian-fill plane must not be curled"
+        );
+
+        let n = 400usize;
+        let radii = Array1::<f64>::from_elem(n, 3.0);
+        let angles = Array1::<f64>::from_shape_fn(n, |r| {
+            if r % 2 == 0 {
+                0.0
+            } else {
+                std::f64::consts::PI
+            }
+        });
+        let flatten = crate::manifold::flatten_verdict(radii.view(), angles.view()).unwrap();
+        assert!(flatten.recommend_flatten, "diameter must flatten");
+        assert_eq!(
+            flatten.residual_rank, 1,
+            "diameter must flatten to rank 1"
+        );
+    }
+
 }
