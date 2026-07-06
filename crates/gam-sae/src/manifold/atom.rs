@@ -6,27 +6,39 @@ use super::*;
 /// This enum records the user-facing topology choice so downstream diagnostics
 /// and Python wrappers can round-trip whether the atom was a Duchon patch,
 /// periodic curve, sphere, or a caller-supplied precomputed basis.
-/// Integration measure `ω_i` for the `d ≥ 2` intrinsic bending Gram
+/// Integration measure `ω_i` for the intrinsic bending Gram
 /// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`].
 ///
 /// The bending penalty is a discrete quadrature of the total squared second
-/// fundamental form `∫_M ‖II‖²_g dμ`. The measure is the quadrature weight
-/// `ω_i` attached to each shape-band grid point:
+/// fundamental form `∫_M ‖II‖²_g dμ` over the grid points `t_i`. The measure is
+/// the quadrature weight `ω_i` attached to each shape-band grid point:
 ///
 /// * [`Self::Volume`] — `ω_i = √det g_i`, the Riemannian volume element. This
-///   is the DEFAULT and the geometrically honest choice: the penalty is then a
-///   Monte-Carlo estimate of `∫_M ‖II‖²_g dV_g`, invariant of the chart's
-///   sampling density (a chart that piles grid points where `det g` is tiny
-///   cannot manufacture roughness), and it closes the "wiggle where no data
-///   lives" loophole (a region the chart barely covers carries near-zero
-///   volume and cannot be bent for free). The volume weight also bounds the
-///   cost of near-boundary blow-ups the raw-`t` measure would over-count.
+///   is the DEFAULT: the penalty is the local-VOLUME-weighted bending sum
+///   `Σ_i √det g_i ‖II(t_i)‖²_g`, weighting each sample's bending by the
+///   Riemannian volume its chart cell carries. Two consequences, stated
+///   honestly:
+///   * A region the chart barely covers (small `√det g`) is CHEAP to bend, not
+///     expensive — its contribution `ω_i ‖II_i‖²` is scaled toward zero. That
+///     is the INTENDED prior: do not spend penalty budget keeping flat a region
+///     that carries little volume (hence little data); reserve the roughness
+///     budget for the high-volume, data-rich part of the manifold. (The volume
+///     weight also bounds the cost of the near-boundary chart blow-ups the
+///     raw-`t` measure would over-count.)
+///   * This sum is NOT sampling-density invariant on its own: it approximates
+///     `∫_M ‖II‖²_g dV_g` only up to the density `q(t_i)` of the grid points —
+///     an unbiased estimate would need an importance weight `1/q(t_i)` or
+///     explicit quadrature-cell widths. In practice the grid points ARE the
+///     fitting-data locations, so `√det g` measures bending relative to the
+///     data density: a deliberate data-adaptive prior, not a chart-independent
+///     invariant.
 /// * [`Self::Data`] — `ω_i = 1`, the raw counting measure over the sample
 ///   rows. Because `‖II(t_i)‖²_g` is a POINTWISE chart-invariant scalar (a
 ///   full `g`-contraction of a normal-bundle-valued `(0,2)`-tensor), summing it
-///   with unit weights over *matched material points* is EXACTLY gauge
-///   invariant — this is the measure the gauge-invariance test uses. Offered as
-///   an option for callers that supply their own (already volume-weighted or
+///   with unit weights over *matched material points* is EXACTLY invariant
+///   under any reparameterisation that keeps those same physical points — this
+///   is the measure the gauge-invariance test uses. Offered as an option for
+///   callers that supply their own (already volume-weighted or
 ///   importance-sampled) grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaeBendingMeasure {
@@ -1806,9 +1818,11 @@ impl SaeManifoldAtom {
     /// # Measure
     ///
     /// `ω_i` is [`Self::bending_measure`]: the DEFAULT Riemannian volume element
-    /// `√det g_i` (bounds cost and closes the "wiggle where no data lives"
-    /// loophole — a chart region of near-zero volume cannot be bent for free),
-    /// or the counting measure `ω_i = 1`. A grid point with a rank-deficient
+    /// `√det g_i` (a local-VOLUME-weighted quadrature — a chart region of
+    /// near-zero volume is CHEAP to bend, so the penalty budget is not spent
+    /// keeping flat a region that carries little volume/data; this weighting is
+    /// NOT sampling-density invariant on its own, see [`SaeBendingMeasure`]), or
+    /// the counting measure `ω_i = 1`. A grid point with a rank-deficient
     /// tangent frame has `det g = 0` and contributes nothing under the volume
     /// measure.
     ///
