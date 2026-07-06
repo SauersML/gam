@@ -570,11 +570,28 @@ pub struct SaeManifoldAtom {
     /// between assemblies so the CONVERGED penalty is the true intrinsic bending
     /// energy.
     pub basis_second_jet_values: Option<Array4<f64>>,
-    /// Quadrature measure `ω_i` for the `d ≥ 2` bending Gram; see
-    /// [`SaeBendingMeasure`]. Default [`SaeBendingMeasure::Volume`] (the
-    /// Riemannian volume element `√det g_i`). Ignored for `d = 1` atoms (which
-    /// use the scalar-speed arc-length reweighting) and for atoms with no
-    /// second-jet cache (raw-Gram fallback).
+    /// Cached latent coordinates `t[n, a]` (shape `(N, d)`) at the atom's CURRENT
+    /// chart, populated by [`Self::refresh_basis`] on every coordinate change.
+    ///
+    /// Needed by the Poincaré branch of
+    /// [`Self::refresh_intrinsic_smooth_penalty`]: the hyperbolic conformal
+    /// Dirichlet roughness Gram
+    /// [`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`] is a
+    /// function of the latent `t` (through the exp-map pullback metric), which
+    /// `refresh_intrinsic_smooth_penalty` does not otherwise receive. Cached here
+    /// alongside `basis_values` / `basis_jacobian` and refreshed on the same
+    /// coordinate change (the lagged-diffusivity freeze). `None` for a
+    /// caller-managed / never-refreshed atom (the Poincaré branch then falls back
+    /// to the raw Gram). Unchanged by [`Self::reduce_basis_to_subspace`] (the
+    /// `M`-axis congruence leaves the `(N, d)` coordinates untouched).
+    pub latent_coords: Option<Array2<f64>>,
+    /// Quadrature measure `ω_i` for the intrinsic bending Gram (every latent
+    /// dim `d ≥ 1`); see [`SaeBendingMeasure`]. Default
+    /// [`SaeBendingMeasure::Volume`] (the Riemannian volume element `√det g_i`;
+    /// for `d = 1` this is the arc-length element `ds = ‖γ'‖ dt`, so the penalty
+    /// is `∫ κ² ds`). Ignored for Poincaré atoms (which use the conformal
+    /// Dirichlet Gram) and for atoms with no second-jet cache (raw-Gram
+    /// fallback).
     pub bending_measure: SaeBendingMeasure,
     /// Profiled low-rank Grassmann decoder frame `U_k` (`p × r`), issue #972.
     ///
@@ -591,15 +608,21 @@ pub struct SaeManifoldAtom {
     pub decoder_frame: Option<GrassmannFrame>,
     /// Curvature-homotopy dial `η ∈ [0, 1]` (#1007). [`Self::refresh_basis`]
     /// scales every *curved* basis column (per
-    /// [`SaeBasisEvaluator::phi_eta_split`]) by `η`, leaving the *linear*
-    /// columns untouched, so `η = 0` is the Eckart-Young linear relaxation (a
-    /// convex decoder problem whose global optimum [`linear_span_anchor`]
-    /// certifies) and `η = 1` is the full curved basis. The certified tracker
-    /// walks `η` from `0 → 1`; every other caller sees the default `1.0`, which
-    /// makes [`Self::refresh_basis`] bit-for-bit identical to the un-dialed
-    /// `evaluate` path (`evaluate_phi_eta` at `η = 1` returns the unscaled
-    /// basis). Caller-managed atoms (no installed evaluator) ignore the dial —
-    /// there is no curved/linear split without an evaluator to provide it.
+    /// [`SaeBasisEvaluator::phi_eta_split`]) by `η`, leaving the *base*
+    /// (η-invariant) columns untouched, so `η = 0` is the base-topology
+    /// relaxation — the atom on its base columns only — and `η = 1` is the full
+    /// curved basis. The base endpoint is NOT in general a linear/affine model:
+    /// for the harmonic and sphere-chart bases the base block already carries
+    /// extrinsic curvature (a first-harmonic `[sin, cos]` traces a circle, the
+    /// sphere chart's `[x, y, z]` traces the sphere). Its decoder sub-problem is
+    /// still convex, and a genuine low-rank (Eckart-Young / PCA) residual ceiling
+    /// is certified by [`linear_span_anchor`] — a rank bound on every `η`, not a
+    /// claim that `η = 0` is curvature-free. The certified tracker walks `η`
+    /// from `0 → 1`; every other caller sees the default `1.0`, which makes
+    /// [`Self::refresh_basis`] bit-for-bit identical to the un-dialed `evaluate`
+    /// path (`evaluate_phi_eta` at `η = 1` returns the unscaled basis).
+    /// Caller-managed atoms (no installed evaluator) ignore the dial — there is
+    /// no curved/base split without an evaluator to provide it.
     pub homotopy_eta: f64,
     /// #1019: `true` once the post-fit chart canonicalization has been
     /// applied to this atom — the latent chart is then the canonical
@@ -704,6 +727,7 @@ impl SaeManifoldAtom {
             basis_evaluator: None,
             basis_second_jet: None,
             basis_second_jet_values: None,
+            latent_coords: None,
             bending_measure: SaeBendingMeasure::Volume,
             decoder_frame: None,
             homotopy_eta: 1.0,
@@ -881,7 +905,7 @@ impl SaeManifoldAtom {
         // Curvature-homotopy dial (#1007): at the default `η = 1` this is the
         // un-dialed basis (`evaluate_phi_eta` returns the unscaled Φ / jet
         // bit-for-bit), so the production path is unchanged. For `η < 1` the
-        // tracker scales the curved columns toward the linear relaxation; the
+        // tracker scales the curved columns toward the base-topology relaxation; the
         // `dphi_deta` / `djet_deta` channels are discarded here (the predictor
         // forms `∂g/∂η` separately from a dedicated evaluation).
         let (phi, jet) = if self.homotopy_eta == 1.0 {
@@ -906,6 +930,12 @@ impl SaeManifoldAtom {
         }
         self.basis_values = phi;
         self.basis_jacobian = jet;
+        // Cache the latent coordinates on the same coordinate change: the
+        // Poincaré conformal-Dirichlet roughness Gram is a function of `t`
+        // (through the exp-map pullback metric) and
+        // `refresh_intrinsic_smooth_penalty` receives no coordinates. Frozen at
+        // the current iterate exactly like the second-jet cache below.
+        self.latent_coords = Some(coords.to_owned());
         // Refresh the cached second-jet VALUES on the same coordinate change so
         // the `d ≥ 2` intrinsic bending Gram sees `∂²Φ` at the current chart
         // (the lagged-diffusivity freeze the metric obeys). Only an evaluator
@@ -1402,8 +1432,9 @@ impl SaeManifoldAtom {
     /// only the curved columns. This is the coordinate-channel analog of the
     /// β-predictor's `curvature_basis_eta_derivatives`, and supplies the missing
     /// `w_t = ∂g_t/∂η` forcing that lets the homotopy walk track onto the curved
-    /// branch instead of riding the linear shadow. `curved_cols` are the atom's
-    /// `phi_eta_split` curved column indices; a linear-only atom writes zeros.
+    /// branch instead of riding the base-topology shadow. `curved_cols` are the
+    /// atom's `phi_eta_split` curved column indices; a base-only atom (no dialed
+    /// columns) writes zeros.
     pub fn fill_decoded_curved_derivative_row(
         &self,
         row: usize,
