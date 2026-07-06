@@ -922,6 +922,21 @@ impl SaeManifoldOuterObjective {
         // per-atom-share floor alone cannot deliver (it only TRIGGERS recovery; it
         // never restores the base-topology optimum when recovery also fails).
         let anchor_floor_state = self.term.snapshot_mutable_state();
+        // The base-topology anchor's ACTUAL reconstruction EV (η = 0, the state just
+        // snapshotted). The dominance floor below must compare against this, NOT the
+        // Eckart-Young SVD ceiling `anchor_ev`: for curved bases the η = 0 state uses
+        // only the base columns (rank ≤ base-count < basis-size), so it does not in
+        // general attain the full-rank SVD ceiling. Keying the restore on the ceiling
+        // would wrongly assume `η = 0` is the linear/Eckart-Young optimum and could
+        // restore a state WORSE than the current one. Keying on the state's own EV
+        // makes `F_returned ≤ F_current` hold for every basis.
+        let anchor_state_ev = self
+            .term
+            .try_fitted_for_rho(&rho)
+            .ok()
+            .and_then(|fit| {
+                reconstruction_explained_variance(self.target.view(), fit.view())
+            });
 
         let mut eta = 0.0_f64;
         let mut eta_step = CURVATURE_WALK_INITIAL_ETA_STEP;
@@ -1153,18 +1168,19 @@ impl SaeManifoldOuterObjective {
         // branch); otherwise we demote to a recorded bifurcation so the cascade
         // takes over from the pristine baseline. A genuinely good arrival (the
         // common case, every fit already passing) never enters this block.
-        // #1189 — the arrival floor is RELATIVE to the certified linear ceiling,
-        // never an absolute EV target. On real high-dim data whose signal sits on a
-        // long-tailed spectrum the best achievable EV at K atoms is bounded by the
-        // cumulative linear (PCA) ceiling — well under any fixed floor on real LLM
-        // activations — so an absolute floor would reject EVERY genuine arrival, the
-        // fit would fall to the blind cascade, and the cascade would collapse to the
-        // `1e12` data-collapse sentinel (the #1189 bug). The Eckart-Young anchor's
-        // OWN reconstruction EV is exactly that achievable linear ceiling
-        // (`anchor_ev = 1 − ‖residual‖² / SST`); the arrival floor below is a
-        // share of it (see there), so a curved arrival that recovers within one
+        // #1189 — the arrival floor is RELATIVE to the certified rank (Eckart-Young /
+        // PCA) ceiling, never an absolute EV target. On real high-dim data whose
+        // signal sits on a long-tailed spectrum the best achievable EV at K atoms is
+        // bounded by the cumulative low-rank (PCA) ceiling — well under any fixed
+        // floor on real LLM activations — so an absolute floor would reject EVERY
+        // genuine arrival, the fit would fall to the blind cascade, and the cascade
+        // would collapse to the `1e12` data-collapse sentinel (the #1189 bug). The
+        // Eckart-Young SVD projection's OWN reconstruction EV is exactly that
+        // achievable rank ceiling (`anchor_ev = 1 − ‖residual‖² / SST`) — a bound on
+        // every η, not a linearity claim about the η=0 chart; the arrival floor below
+        // is a share of it (see there), so a curved arrival that recovers within one
         // atom's share of the anchor has, by construction, NOT tracked into a worse
-        // basin than the convex linear optimum it started on.
+        // basin than the convex base-topology optimum it started on.
         let target_sst = {
             let (n, p) = self.target.dim();
             let mut means = vec![0.0_f64; p];
@@ -1192,10 +1208,10 @@ impl SaeManifoldOuterObjective {
             SAE_FIT_DATA_COLLAPSE_EV_FLOOR
         };
         // Arrival floor (#1189 / #1026): accept the curved arrival when its
-        // reconstruction EV recovers the linear PCA ceiling `anchor_ev` minus at
+        // reconstruction EV recovers the rank (PCA) ceiling `anchor_ev` minus at
         // most ONE atom's share of it. Sequential Eckart-Young deflation gives each
-        // atom ~1/K of the cumulative linear optimum (`anchor_ev` is the
-        // certified CUMULATIVE ceiling across all K atoms), so a single atom that
+        // atom ~1/K of the cumulative rank ceiling (`anchor_ev` is the
+        // certified CUMULATIVE SVD ceiling across all K atoms), so a single atom that
         // curves trades at most 1/K of the ceiling for the geometry it gains: the
         // whole-dictionary curved EV need only stay within 1/K, i.e.
         // `>= anchor_ev * (K - 1)/K`. This is exactly the achievable, data-derived
@@ -1279,23 +1295,28 @@ impl SaeManifoldOuterObjective {
                 }
             }
         }
-        // #1026 LINEAR-DOMINANCE FLOOR (final, path-independent). Whatever the walk
+        // #1026 BASE-DOMINANCE FLOOR (final, path-independent). Whatever the walk
         // did — early bifurcation, or arrived-but-recovery-failed — the term must not
-        // be left reconstructing BELOW the certified linear (PCA) ceiling it relaxed
+        // be left reconstructing WORSE than the convex base-topology anchor it relaxed
         // from. When the current state is under the (already per-atom-share-relaxed)
         // arrival floor AND the η=0 anchor reconstructs strictly better, restore the
-        // anchor: curvature that cannot beat the convex linear optimum returns that
-        // optimum. The anchor is a real linear model (not a reconstruction-time
-        // substitution), so this generalizes to held-out data. Conservative by
-        // construction: a genuine curved arrival (EV ≥ arrival_floor, the synthetic-
-        // harmonic regime) never enters this block, so curved branches that beat
-        // linear are untouched.
+        // anchor: curvature that cannot beat the convex base-topology optimum returns
+        // that optimum. The anchor is a real parametric model state (decoder + coords,
+        // not a reconstruction-time substitution), so this generalizes to held-out
+        // data. The comparison uses the anchor's OWN reconstruction EV
+        // (`anchor_state_ev`), not the Eckart-Young SVD ceiling `anchor_ev`: the η = 0
+        // state is NOT linear and does not attain that full-rank ceiling for curved
+        // bases, so keying on `anchor_state_ev` is what makes `F_returned ≤ F_current`
+        // hold. Conservative by construction: a genuine curved arrival
+        // (EV ≥ arrival_floor) never enters this block, so curved branches that beat
+        // the anchor are untouched.
         if let Ok(cur_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(cur_ev) =
                 reconstruction_explained_variance(self.target.view(), cur_fit.view())
-            && anchor_ev.is_finite()
+            && let Some(anchor_state_ev) = anchor_state_ev
+            && anchor_state_ev.is_finite()
             && cur_ev < arrival_floor
-            && anchor_ev > cur_ev
+            && anchor_state_ev > cur_ev
         {
             self.term.restore_mutable_state(&anchor_floor_state);
             self.term.set_homotopy_eta(0.0).ok();
@@ -1306,9 +1327,9 @@ impl SaeManifoldOuterObjective {
             arrived = true;
             bifurcation = None;
             log::info!(
-                "[#1026] linear-dominance floor: curved EV {cur_ev:.4} < arrival floor \
-                 {arrival_floor:.4}; restored certified η=0 PCA anchor (EV {anchor_ev:.4}) — \
-                 F_returned ≤ F_linear"
+                "[#1026] base-dominance floor: curved EV {cur_ev:.4} < arrival floor \
+                 {arrival_floor:.4}; restored convex η=0 base-topology anchor \
+                 (EV {anchor_state_ev:.4}) — F_returned ≤ F_current"
             );
         }
         let collapse_events = self.term.collapse_events().len();
