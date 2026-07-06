@@ -1327,3 +1327,112 @@ mod lever_wiring_2072_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shape_uncertainty_joint_recompute_tests {
+    use crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture;
+
+    /// After a structure-search / finalization change, the shape bands are
+    /// rebuilt at the FINAL state by `recompute_joint_shape_uncertainty`, which
+    /// must return the JOINT inverse-Hessian covariance — NOT the per-atom
+    /// inner-Hessian marginal the pre-fix path fell back to. Two properties
+    /// distinguish the two and are pinned here:
+    ///   1. the recompute reproduces the direct-Schur `assemble_shape_uncertainty`
+    ///      bands (it IS the joint path); and
+    ///   2. the joint band carries per-output-channel variance AND differs
+    ///      materially from the per-atom-marginal completion — so replacing the
+    ///      marginal with the joint recompute genuinely changes the reported band.
+    #[test]
+    fn recompute_reproduces_joint_and_differs_from_per_atom_marginal() {
+        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+        // Perturb the target off the model manifold so the inner optimum has a
+        // real residual (a meaningful dispersion / nonzero bands), and raise the
+        // penalty strengths off the fixture's near-zero defaults.
+        let (n, p) = (target.nrows(), target.ncols());
+        for row in 0..n {
+            for col in 0..p {
+                let phase = (row as f64 + 0.35) / n as f64;
+                let theta = std::f64::consts::TAU * phase;
+                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+            }
+        }
+        rho.log_lambda_sparse = -0.5;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for v in axis.iter_mut() {
+                *v = -0.5;
+            }
+        }
+
+        // Reference joint bands via the direct Schur path.
+        let (_c, loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged joint cache");
+        let dispersion = term
+            .reconstruction_dispersion(&loss, &cache, &rho)
+            .expect("dispersion");
+        let joint = term
+            .assemble_shape_uncertainty(&cache, dispersion)
+            .expect("direct joint bands");
+
+        // Property 1: the final-state recompute reproduces the joint path.
+        let recomputed = term
+            .recompute_joint_shape_uncertainty(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .expect("joint recompute");
+        assert_eq!(recomputed.atoms.len(), joint.atoms.len());
+        for (k, (a, b)) in recomputed.atoms.iter().zip(joint.atoms.iter()).enumerate() {
+            assert_eq!(a.band_sd.dim(), b.band_sd.dim(), "atom {k} band shape");
+            for (x, y) in a.band_sd.iter().zip(b.band_sd.iter()) {
+                assert!(
+                    (x - y).abs() <= 1e-9 * (1.0 + y.abs()),
+                    "atom {k}: recompute must reproduce the joint band ({x} vs {y})"
+                );
+            }
+        }
+
+        // The joint per-channel SD genuinely varies across the p output channels
+        // (the coordinate-Schur coupling makes each channel's decoder covariance
+        // differ) — a per-atom marginal `φ·Φᵀ H_k⁻¹ Φ` is constant across channels.
+        let mut joint_channel_spread = 0.0_f64;
+        for atom in &joint.atoms {
+            for gi in 0..atom.band_sd.nrows() {
+                let row = atom.band_sd.row(gi);
+                let min = row.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                joint_channel_spread = joint_channel_spread.max((max - min) / (1.0 + max.abs()));
+            }
+        }
+        assert!(
+            joint_channel_spread > 1e-6,
+            "the JOINT band must carry per-output-channel variance (spread {joint_channel_spread:.3e}); \
+             a constant-across-channel band is the per-atom marginal the fix replaced"
+        );
+
+        // Property 2 (non-vacuity): the per-atom inner-Hessian marginal the
+        // fallback produces DIFFERS materially from the joint band.
+        term.set_atom_inner_fits(target.view(), &rho, dispersion)
+            .expect("inner fits harvested");
+        let mut marginal = joint.clone();
+        marginal.invalidate_bands_for_recompute();
+        term.complete_born_atom_shape_bands(&mut marginal)
+            .expect("per-atom marginal completion");
+        let mut max_rel_gap = 0.0_f64;
+        let mut compared = 0usize;
+        for (a, b) in marginal.atoms.iter().zip(joint.atoms.iter()) {
+            for (x, y) in a.band_sd.iter().zip(b.band_sd.iter()) {
+                if x.is_finite() && y.is_finite() {
+                    max_rel_gap = max_rel_gap.max((x - y).abs() / (1.0 + y.abs()));
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 0, "the per-atom marginal must fill finite bands to compare");
+        assert!(
+            max_rel_gap > 1e-3,
+            "the per-atom marginal must differ materially from the joint band \
+             (max rel gap {max_rel_gap:.3e}); otherwise the joint recompute changes nothing"
+        );
+    }
+}
