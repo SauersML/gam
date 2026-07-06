@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 use pyo3::Bound;
 
 fn betti_signature_dict<'py>(
@@ -14,67 +14,6 @@ fn betti_signature_dict<'py>(
         None => d.set_item("b2", py.None())?,
     }
     Ok(d)
-}
-
-fn null_distribution_dict<'py>(
-    py: Python<'py>,
-    calibration: &gam::terms::sae::null_battery::ClaimNullCalibration,
-) -> PyResult<Bound<'py, PyDict>> {
-    let out = PyDict::new(py);
-    out.set_item("claim", &calibration.claim)?;
-    out.set_item("observed_statistic", calibration.observed_statistic)?;
-    out.set_item("null_pvalue", calibration.null_pvalue)?;
-    out.set_item("null_z", calibration.null_z)?;
-    out.set_item("claimed_snr", calibration.claimed_snr)?;
-    out.set_item(
-        "claimed_false_positive_rate",
-        calibration.claimed_false_positive_rate,
-    )?;
-    out.set_item("spikein_power", calibration.spikein_power)?;
-    let nulls = PyList::empty(py);
-    for summary in &calibration.null_distribution {
-        let row = PyDict::new(py);
-        row.set_item("kind", summary.kind.as_str())?;
-        row.set_item("observed", summary.observed)?;
-        row.set_item("n", summary.n)?;
-        row.set_item("mean", summary.mean)?;
-        row.set_item("sd", summary.sd)?;
-        row.set_item("min", summary.min)?;
-        row.set_item("q25", summary.q25)?;
-        row.set_item("median", summary.median)?;
-        row.set_item("q75", summary.q75)?;
-        row.set_item("max", summary.max)?;
-        row.set_item("z", summary.z)?;
-        row.set_item("p_value", summary.p_value)?;
-        row.set_item("samples", summary.samples.clone())?;
-        nulls.append(row)?;
-    }
-    out.set_item("null_distribution", nulls)?;
-    Ok(out)
-}
-
-fn attach_null_fields<'py>(
-    py: Python<'py>,
-    atom: &Bound<'py, PyDict>,
-    calibration: Option<&gam::terms::sae::null_battery::ClaimNullCalibration>,
-) -> PyResult<()> {
-    match calibration {
-        Some(calibration) => {
-            atom.set_item("observed_statistic", calibration.observed_statistic)?;
-            atom.set_item("null_pvalue", calibration.null_pvalue)?;
-            atom.set_item("null_z", calibration.null_z)?;
-            atom.set_item("spikein_power", calibration.spikein_power)?;
-            atom.set_item("null_calibration", null_distribution_dict(py, calibration)?)?;
-        }
-        None => {
-            atom.set_item("observed_statistic", py.None())?;
-            atom.set_item("null_pvalue", py.None())?;
-            atom.set_item("null_z", py.None())?;
-            atom.set_item("spikein_power", py.None())?;
-            atom.set_item("null_calibration", py.None())?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn sae_topology_persistence_dict<'py>(
@@ -115,7 +54,6 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("covering_side", report.covering_side.as_str())?;
                 atom.set_item("measured_betti", betti_signature_dict(py, report.measured_betti)?)?;
                 atom.set_item("expected_betti", betti_signature_dict(py, report.expected_betti)?)?;
-                attach_null_fields(py, &atom, report.null_calibration.as_ref())?;
                 atom.set_item("kind", inferred)?;
                 atom.set_item("persistence_summary", summary)?;
                 atom.set_item("contested", report.contested)?;
@@ -129,7 +67,6 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("covering_side", py.None())?;
                 atom.set_item("measured_betti", py.None())?;
                 atom.set_item("expected_betti", py.None())?;
-                attach_null_fields(py, &atom, None)?;
                 atom.set_item("kind", py.None())?;
                 atom.set_item("contested", py.None())?;
             }
@@ -143,9 +80,6 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::terms::sae::null_battery::{
-        ClaimNullCalibration, NullKind, NullSummary, SpikeInRocPoint, SpikeInRocThreshold,
-    };
     use gam::terms::sae::manifold::{
         AtlasCoveringSide, AtomTopologyPersistence, BettiSignature, PersistenceBar,
         PersistenceStabilityBand, SaeAtomBasisKind,
@@ -174,42 +108,6 @@ mod tests {
                     b1: 1,
                     b2: None,
                 },
-                null_calibration: Some(ClaimNullCalibration {
-                    claim: "atom 0 topology".to_string(),
-                    observed_statistic: 0.91,
-                    null_pvalue: 0.02,
-                    null_z: 3.4,
-                    claimed_snr: 1.0,
-                    claimed_false_positive_rate: 0.05,
-                    spikein_power: 0.875,
-                    null_distribution: vec![NullSummary {
-                        kind: NullKind::PhaseRandomized,
-                        observed: 0.91,
-                        n: 4,
-                        mean: 0.12,
-                        sd: 0.04,
-                        min: 0.08,
-                        q25: 0.10,
-                        median: 0.12,
-                        q75: 0.14,
-                        max: 0.16,
-                        z: 19.75,
-                        p_value: 0.02,
-                        samples: vec![0.08, 0.11, 0.13, 0.16],
-                    }],
-                    spike_in_roc: vec![SpikeInRocPoint {
-                        snr: 1.0,
-                        trials: 8,
-                        mean_stat: 0.8,
-                        promoted_fraction: 1.0,
-                        topology_accept_fraction: 0.875,
-                        roc: vec![SpikeInRocThreshold {
-                            false_positive_rate: 0.05,
-                            threshold: 0.3,
-                            true_positive_rate: 0.875,
-                        }],
-                    }],
-                }),
                 dominant_h1_persistence: f64::INFINITY,
                 dominant_h2_persistence: 0.0,
                 h0: vec![PersistenceBar {
@@ -237,20 +135,6 @@ mod tests {
                 .extract::<String>()
                 .expect("covering_side string");
             assert_eq!(covering_side, "at_or_above_covering_number");
-            let null_pvalue = atom
-                .get_item("null_pvalue")
-                .expect("read null_pvalue")
-                .expect("null_pvalue present")
-                .extract::<f64>()
-                .expect("null_pvalue f64");
-            assert_eq!(null_pvalue, 0.02);
-            let spikein_power = atom
-                .get_item("spikein_power")
-                .expect("read spikein_power")
-                .expect("spikein_power present")
-                .extract::<f64>()
-                .expect("spikein_power f64");
-            assert_eq!(spikein_power, 0.875);
             let kind = atom
                 .get_item("kind")
                 .expect("read kind")

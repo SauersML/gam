@@ -392,7 +392,7 @@ fn assert_axis_circle_topology(fixture: &CalendarFixture, axis: usize) {
     let embeddings = recovered_calendar_axis_anchor_embeddings(fixture, axis);
     let rows = calendar_axis_rows(fixture, axis);
     let candidate_edges =
-        LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("calendar kNN graph");
+        CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("calendar kNN graph");
     let n_eff = rows.len() as f64;
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let precisions = vec![1.0; candidate_edges.len()];

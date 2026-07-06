@@ -411,7 +411,6 @@ struct AuditTopologyRecord {
     covering_side: String,
     measured_betti: gam::terms::sae::manifold::BettiSignature,
     expected_betti: gam::terms::sae::manifold::BettiSignature,
-    null_calibration: Option<gam::terms::sae::null_battery::ClaimNullCalibration>,
     contested: bool,
     dominant_h1_persistence: f64,
     dominant_h2_persistence: f64,
@@ -435,67 +434,6 @@ fn betti_signature_dict<'py>(
         None => out.set_item("b2", py.None())?,
     }
     Ok(out)
-}
-
-fn null_calibration_dict<'py>(
-    py: Python<'py>,
-    calibration: &gam::terms::sae::null_battery::ClaimNullCalibration,
-) -> PyResult<Bound<'py, PyDict>> {
-    let out = PyDict::new(py);
-    out.set_item("claim", &calibration.claim)?;
-    out.set_item("observed_statistic", calibration.observed_statistic)?;
-    out.set_item("null_pvalue", calibration.null_pvalue)?;
-    out.set_item("null_z", calibration.null_z)?;
-    out.set_item("claimed_snr", calibration.claimed_snr)?;
-    out.set_item(
-        "claimed_false_positive_rate",
-        calibration.claimed_false_positive_rate,
-    )?;
-    out.set_item("spikein_power", calibration.spikein_power)?;
-    let nulls = PyList::empty(py);
-    for summary in &calibration.null_distribution {
-        let row = PyDict::new(py);
-        row.set_item("kind", summary.kind.as_str())?;
-        row.set_item("observed", summary.observed)?;
-        row.set_item("n", summary.n)?;
-        row.set_item("mean", summary.mean)?;
-        row.set_item("sd", summary.sd)?;
-        row.set_item("min", summary.min)?;
-        row.set_item("q25", summary.q25)?;
-        row.set_item("median", summary.median)?;
-        row.set_item("q75", summary.q75)?;
-        row.set_item("max", summary.max)?;
-        row.set_item("z", summary.z)?;
-        row.set_item("p_value", summary.p_value)?;
-        row.set_item("samples", summary.samples.clone())?;
-        nulls.append(row)?;
-    }
-    out.set_item("null_distribution", nulls)?;
-    Ok(out)
-}
-
-fn set_claim_null_fields<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    calibration: Option<&gam::terms::sae::null_battery::ClaimNullCalibration>,
-) -> PyResult<()> {
-    match calibration {
-        Some(calibration) => {
-            out.set_item("observed_statistic", calibration.observed_statistic)?;
-            out.set_item("null_pvalue", calibration.null_pvalue)?;
-            out.set_item("null_z", calibration.null_z)?;
-            out.set_item("spikein_power", calibration.spikein_power)?;
-            out.set_item("null_calibration", null_calibration_dict(py, calibration)?)?;
-        }
-        None => {
-            out.set_item("observed_statistic", py.None())?;
-            out.set_item("null_pvalue", py.None())?;
-            out.set_item("null_z", py.None())?;
-            out.set_item("spikein_power", py.None())?;
-            out.set_item("null_calibration", py.None())?;
-        }
-    }
-    Ok(())
 }
 
 fn topology_records_dict<'py>(
@@ -526,7 +464,6 @@ fn topology_records_dict<'py>(
         row.set_item("covering_side", &record.covering_side)?;
         row.set_item("measured_betti", betti_signature_dict(py, record.measured_betti)?)?;
         row.set_item("expected_betti", betti_signature_dict(py, record.expected_betti)?)?;
-        set_claim_null_fields(py, &row, record.null_calibration.as_ref())?;
         row.set_item("contested", record.contested)?;
         row.set_item("dominant_h1_persistence", record.dominant_h1_persistence)?;
         row.set_item("dominant_h2_persistence", record.dominant_h2_persistence)?;
@@ -547,172 +484,53 @@ fn topology_records_dict<'py>(
     Ok(out)
 }
 
-const AUDIT_NULL_REPLICATES: usize = 8;
-const AUDIT_SPIKE_TRIALS: usize = 8;
-const AUDIT_CLAIMED_SNR: f64 = 1.0;
-const AUDIT_CLAIMED_FPR: f64 = 0.05;
-
-fn harmonic_claim_null_calibration(
-    claim: String,
-    observed: ndarray::ArrayView2<'_, f64>,
-    random_weight: ndarray::ArrayView2<'_, f64>,
-    seed: u64,
-) -> Result<gam::terms::sae::null_battery::ClaimNullCalibration, String> {
-    let null_config = gam::terms::sae::null_battery::NullBatteryConfig {
-        replicates: AUDIT_NULL_REPLICATES,
-        seed,
-        kinds: vec![
-            gam::terms::sae::null_battery::NullKind::PhaseRandomized,
-            gam::terms::sae::null_battery::NullKind::RandomRotation,
-            gam::terms::sae::null_battery::NullKind::ArchitectureMatchedRandomWeight,
-        ],
-        tail: gam::terms::sae::null_battery::Tail::Larger,
-    };
-    let nulls = gam::terms::sae::null_battery::run_null_battery(
-        observed,
-        Some(random_weight),
-        &null_config,
-        gam::terms::sae::null_battery::harmonic_circle_detector_stat,
-    )?;
-    let roc_config = gam::terms::sae::null_battery::SpikeInRocConfig::circle(
-        vec![AUDIT_CLAIMED_SNR],
-        AUDIT_SPIKE_TRIALS,
-        seed ^ 0x51C1_E000,
-    );
-    let spike_in_roc =
-        gam::terms::sae::null_battery::default_spike_in_roc_curve(observed, &roc_config)?;
-    let report = gam::terms::sae::null_battery::calibrated_roc_claim_report(
-        claim,
-        AUDIT_CLAIMED_SNR,
-        AUDIT_CLAIMED_FPR,
-        nulls,
-        spike_in_roc,
-    )?;
-    Ok(gam::terms::sae::null_battery::ClaimNullCalibration::from_calibrated_roc(report))
-}
-
-fn block_code_matrix(
-    codes: ndarray::ArrayView2<'_, f32>,
-    rows: &[usize],
-    block: usize,
-    block_size: usize,
-) -> ndarray::Array2<f64> {
-    let mut out = ndarray::Array2::<f64>::zeros((rows.len(), block_size));
-    for (dst, &row) in rows.iter().enumerate() {
-        for offset in 0..block_size {
-            out[[dst, offset]] = codes[[row, block * block_size + offset]] as f64;
-        }
-    }
-    out
-}
-
-fn block_random_weight_matrix(
-    codes: ndarray::ArrayView2<'_, f32>,
-    block: usize,
-    block_size: usize,
-) -> ndarray::Array2<f64> {
-    let mut out = ndarray::Array2::<f64>::zeros((codes.nrows(), block_size));
-    for row in 0..codes.nrows() {
-        for offset in 0..block_size {
-            out[[row, offset]] = codes[[row, block * block_size + offset]] as f64;
-        }
-    }
-    out
-}
-
-fn atlas_support_matrix(
-    codes: ndarray::ArrayView2<'_, f32>,
-    chart_blocks: &[usize],
-    block_size: usize,
-) -> ndarray::Array2<f64> {
-    let mut out = ndarray::Array2::<f64>::zeros((codes.nrows(), chart_blocks.len()));
-    for row in 0..codes.nrows() {
-        for (col, &block) in chart_blocks.iter().enumerate() {
-            let mut norm2 = 0.0_f64;
-            for offset in 0..block_size {
-                let value = codes[[row, block * block_size + offset]] as f64;
-                norm2 += value * value;
-            }
-            out[[row, col]] = norm2.sqrt();
-        }
-    }
-    out
-}
-
-fn atlas_nerve_stat_from_supports(supports: ndarray::ArrayView2<'_, f64>) -> Result<f64, String> {
-    let mut charts = Vec::with_capacity(supports.ncols());
-    for chart_idx in 0..supports.ncols() {
-        let weights = supports.column(chart_idx).mapv(f64::abs);
-        charts.push(gam::terms::sae::inference::atlas_nerve::AtlasChart::from_weights(
-            chart_idx, weights,
-        )?);
-    }
-    let mut gates = Vec::new();
-    for a in 0..supports.ncols() {
-        for b in (a + 1)..supports.ncols() {
-            gates.push(gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
-                a,
-                b,
-                valid: true,
-                transport_defect: 0.0,
-                equivariance_defect: 0.0,
-            });
-        }
-    }
-    let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
-    Ok(diagram.betti.b1 as f64 + diagram.betti.b2.unwrap_or(0) as f64)
-}
-
-fn atlas_claim_null_calibration(
-    observed: ndarray::ArrayView2<'_, f64>,
-    random_weight: ndarray::ArrayView2<'_, f64>,
-    seed: u64,
-) -> Result<gam::terms::sae::null_battery::ClaimNullCalibration, String> {
-    let null_config = gam::terms::sae::null_battery::NullBatteryConfig {
-        replicates: AUDIT_NULL_REPLICATES,
-        seed,
-        kinds: vec![
-            gam::terms::sae::null_battery::NullKind::PhaseRandomized,
-            gam::terms::sae::null_battery::NullKind::RandomRotation,
-            gam::terms::sae::null_battery::NullKind::ArchitectureMatchedRandomWeight,
-        ],
-        tail: gam::terms::sae::null_battery::Tail::Larger,
-    };
-    let nulls = gam::terms::sae::null_battery::run_null_battery(
-        observed,
-        Some(random_weight),
-        &null_config,
-        atlas_nerve_stat_from_supports,
-    )?;
-    let roc_config = gam::terms::sae::null_battery::SpikeInRocConfig::circle(
-        vec![AUDIT_CLAIMED_SNR],
-        AUDIT_SPIKE_TRIALS,
-        seed ^ 0xA71A_5000,
-    );
-    let spike_in_roc =
-        gam::terms::sae::null_battery::default_spike_in_roc_curve(observed, &roc_config)?;
-    let report = gam::terms::sae::null_battery::calibrated_roc_claim_report(
-        "atlas_nerve",
-        AUDIT_CLAIMED_SNR,
-        AUDIT_CLAIMED_FPR,
-        nulls,
-        spike_in_roc,
-    )?;
-    Ok(gam::terms::sae::null_battery::ClaimNullCalibration::from_calibrated_roc(report))
-}
-
 fn topology_records_from_codes(
     codes: ndarray::ArrayView2<'_, f32>,
-    random_weight_codes: ndarray::ArrayView2<'_, f32>,
     coordinate_reports: &[gam::terms::sae::sparse_dict::BlockCoordinateReport],
     block_size: usize,
     activation_threshold: f32,
-) -> Result<Vec<AuditTopologyRecord>, String> {
+) -> Vec<AuditTopologyRecord> {
     let threshold = activation_threshold as f64;
     if block_size == 1 {
-        return Ok(Vec::new());
+        let mut records = Vec::with_capacity(codes.ncols());
+        for atom in 0..codes.ncols() {
+            let support_size = codes
+                .column(atom)
+                .iter()
+                .filter(|value| (**value).abs() as f64 > threshold)
+                .count();
+            let b0 = if support_size > 0 { 1 } else { 0 };
+            let betti = gam::terms::sae::manifold::BettiSignature {
+                b0,
+                b1: 0,
+                b2: None,
+            };
+            records.push(AuditTopologyRecord {
+                atom,
+                support_size,
+                landmark_count: support_size.min(1),
+                covering_side: if support_size > 0 {
+                    "at_or_above_covering_number".to_string()
+                } else {
+                    "below_covering_number".to_string()
+                },
+                measured_betti: betti,
+                expected_betti: betti,
+                contested: false,
+                dominant_h1_persistence: 0.0,
+                dominant_h2_persistence: 0.0,
+                note: "scalar external SAE feature: frozen dictionary exposes a point/line chart"
+                    .to_string(),
+            });
+        }
+        return records;
     }
 
+    let expected = gam::terms::sae::manifold::BettiSignature {
+        b0: 1,
+        b1: 1,
+        b2: None,
+    };
     let mut records = Vec::with_capacity(coordinate_reports.len());
     for report in coordinate_reports {
         let live: Vec<_> = report
@@ -721,6 +539,24 @@ fn topology_records_from_codes(
             .filter(|firing| firing.amplitude > threshold)
             .collect();
         if live.len() < 4 {
+            let measured = gam::terms::sae::manifold::BettiSignature {
+                b0: if live.is_empty() { 0 } else { 1 },
+                b1: 0,
+                b2: None,
+            };
+            records.push(AuditTopologyRecord {
+                atom: report.firings.first().map_or(0, |firing| firing.block),
+                support_size: live.len(),
+                landmark_count: live.len(),
+                covering_side: "below_covering_number".to_string(),
+                measured_betti: measured,
+                expected_betti: expected,
+                contested: measured != expected,
+                dominant_h1_persistence: 0.0,
+                dominant_h2_persistence: 0.0,
+                note: "under-resolved harmonic-circle block: fewer than four firing coordinates"
+                    .to_string(),
+            });
             continue;
         }
 
@@ -735,24 +571,13 @@ fn topology_records_from_codes(
             points.view(),
             &gam::terms::sae::manifold::SaeAtomBasisKind::Periodic,
         ) {
-            let block = live[0].block;
-            let rows: Vec<usize> = live.iter().map(|firing| firing.row).collect();
-            let observed = block_code_matrix(codes, &rows, block, block_size);
-            let random_weight = block_random_weight_matrix(random_weight_codes, block, block_size);
-            let null_calibration = harmonic_claim_null_calibration(
-                format!("topology_persistence atom {block}"),
-                observed.view(),
-                random_weight.view(),
-                0xA17D_7000 ^ block as u64,
-            )?;
             records.push(AuditTopologyRecord {
-                atom: block,
+                atom: live[0].block,
                 support_size: verdict.support_size,
                 landmark_count: verdict.landmark_count,
                 covering_side: verdict.covering_side.as_str().to_string(),
                 measured_betti: verdict.measured_betti,
                 expected_betti: verdict.expected_betti,
-                null_calibration: Some(null_calibration),
                 contested: verdict.contested,
                 dominant_h1_persistence: verdict.dominant_h1_persistence,
                 dominant_h2_persistence: verdict.dominant_h2_persistence,
@@ -760,12 +585,11 @@ fn topology_records_from_codes(
             });
         }
     }
-    Ok(records)
+    records
 }
 
 fn atlas_nerve_from_codes(
     codes: ndarray::ArrayView2<'_, f32>,
-    random_weight_codes: ndarray::ArrayView2<'_, f32>,
     block_size: usize,
     activation_threshold: f32,
     requested_blocks: Option<&[usize]>,
@@ -820,14 +644,7 @@ fn atlas_nerve_from_codes(
             });
         }
     }
-    let mut diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
-    let observed_supports = atlas_support_matrix(codes, &chart_blocks, block_size);
-    let random_weight_supports = atlas_support_matrix(random_weight_codes, &chart_blocks, block_size);
-    diagram.null_calibration = Some(atlas_claim_null_calibration(
-        observed_supports.view(),
-        random_weight_supports.view(),
-        0xA71A_0000 ^ chart_blocks.len() as u64,
-    )?);
+    let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
     Ok(Some(AuditAtlasReport {
         chart_blocks,
         diagram,
@@ -843,7 +660,6 @@ fn atlas_nerve_dict<'py>(
     let Some(report) = report else {
         out.set_item("computed", false)?;
         out.set_item("reason", skipped_reason)?;
-        set_claim_null_fields(py, &out, None)?;
         return Ok(out);
     };
     let diagram = &report.diagram;
@@ -857,7 +673,6 @@ fn atlas_nerve_dict<'py>(
     out.set_item("sampled_support_size", diagram.sampled_support_size)?;
     out.set_item("covering_side", diagram.covering_side.as_str())?;
     out.set_item("max_filtration", diagram.max_filtration)?;
-    set_claim_null_fields(py, &out, diagram.null_calibration.as_ref())?;
     out.set_item("note", &diagram.note)?;
     Ok(out)
 }
@@ -1129,7 +944,6 @@ fn sparse_dict_dual_certificate<'py>(
     decoder,
     codes,
     data,
-    random_weight_codes,
     active = None,
     block_size = 1,
     block_topk = None,
@@ -1149,7 +963,6 @@ fn audit_sae<'py>(
     decoder: PyReadonlyArray2<'py, f32>,
     codes: PyReadonlyArray2<'py, f32>,
     data: PyReadonlyArray2<'py, f32>,
-    random_weight_codes: PyReadonlyArray2<'py, f32>,
     active: Option<usize>,
     block_size: usize,
     block_topk: Option<usize>,
@@ -1167,7 +980,6 @@ fn audit_sae<'py>(
     let decoder_values = decoder.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
     let data_values = data.as_array().to_owned();
-    let random_weight_code_values = random_weight_codes.as_array().to_owned();
     if decoder_values.nrows() == 0 || decoder_values.ncols() == 0 {
         return Err(PyValueError::new_err(
             "audit_sae requires a non-empty decoder matrix",
@@ -1186,13 +998,6 @@ fn audit_sae<'py>(
             data_values.dim(),
             code_values.dim(),
             decoder_values.dim()
-        )));
-    }
-    if random_weight_code_values.ncols() != code_values.ncols() || random_weight_code_values.nrows() == 0 {
-        return Err(PyValueError::new_err(format!(
-            "audit_sae random_weight_codes shape {:?} incompatible with observed codes {:?}",
-            random_weight_code_values.dim(),
-            code_values.dim()
         )));
     }
     if block_size == 0 {
@@ -1283,14 +1088,12 @@ fn audit_sae<'py>(
 
         let topology_records = topology_records_from_codes(
             code_values.view(),
-            random_weight_code_values.view(),
             &coordinate_reports,
             block_size,
             activation_threshold,
-        )?;
+        );
         let atlas_nerve = atlas_nerve_from_codes(
             code_values.view(),
-            random_weight_code_values.view(),
             block_size,
             activation_threshold,
             coordinate_blocks.as_deref(),
@@ -1427,7 +1230,6 @@ mod sae_spectral_ffi_tests {
                 [0.0_f32, 0.2_f32],
             ];
             let data = codes.clone();
-            let random_weight_codes = codes.mapv(|value| 0.37 - 0.5 * value);
             let theta_in = ndarray::array![
                 0.0_f64,
                 std::f64::consts::FRAC_PI_4,
@@ -1443,7 +1245,6 @@ mod sae_spectral_ffi_tests {
             let decoder_py = decoder.into_pyarray(py);
             let codes_py = codes.into_pyarray(py);
             let data_py = data.into_pyarray(py);
-            let random_weight_codes_py = random_weight_codes.into_pyarray(py);
             let theta_in_py = theta_in.into_pyarray(py);
             let theta_out_py = theta_out.into_pyarray(py);
 
@@ -1452,7 +1253,6 @@ mod sae_spectral_ffi_tests {
                 decoder_py.readonly(),
                 codes_py.readonly(),
                 data_py.readonly(),
-                random_weight_codes_py.readonly(),
                 None,
                 1,
                 None,
@@ -1481,14 +1281,6 @@ mod sae_spectral_ffi_tests {
             ] {
                 assert_dict_has_key(report, key);
             }
-            let atlas = report
-                .get_item("atlas_nerve")
-                .expect("read atlas nerve")
-                .expect("atlas nerve present")
-                .cast::<PyDict>()
-                .expect("atlas nerve dict");
-            assert_dict_has_key(atlas, "null_pvalue");
-            assert_dict_has_key(atlas, "spikein_power");
             let transport = report
                 .get_item("transport")
                 .expect("read transport")

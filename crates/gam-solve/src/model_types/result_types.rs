@@ -2358,15 +2358,26 @@ impl UnifiedFitResult {
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
             (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
-                Ok(FittedLinkState::Standard(None))
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
-                Ok(FittedLinkState::Standard(None))
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
-                Ok(FittedLinkState::Standard(None))
-            }
+            // Every state-less binomial probability link decodes to the bare
+            // `Standard(None)` payload — the concrete `StandardLink` lives on the
+            // family/spec, not in the fitted-link record. LogLog and Cauchit
+            // belong here alongside Logit/Probit/CLogLog: they are ordinary
+            // state-less links (#2158), so omitting them dropped a fully-fitted
+            // model into the `(Binomial, _)` "unsupported combination" error at
+            // predict time, breaking the fit→predict round-trip. The
+            // state-bearing links (SAS/BetaLogistic/Mixture/LatentCLogLog) are
+            // handled by the arms below; the identity/log standard links are not
+            // legal binomial cells and correctly fall to the catch-all.
+            (
+                ResponseFamily::Binomial,
+                InverseLink::Standard(
+                    StandardLink::Logit
+                    | StandardLink::Probit
+                    | StandardLink::CLogLog
+                    | StandardLink::LogLog
+                    | StandardLink::Cauchit,
+                ),
+            ) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {
                 FittedLinkState::LatentCLogLog { state } => {
                     Ok(FittedLinkState::LatentCLogLog { state: *state })
