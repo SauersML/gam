@@ -326,30 +326,78 @@ fn build_duchon_basis_uncached(
             )))
         } else {
             let coeffs = coeffs.clone();
-            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let r = stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                let raw = if let Some(ppc) = pure_poly_coeff {
-                    ppc.eval(r)
-                } else {
-                    duchon_matern_kernel_general_from_distance(
-                        r,
-                        length_scale,
-                        p_order,
-                        s_order_int.expect("hybrid Duchon requires integer power"),
-                        d,
-                        coeffs.as_ref(),
-                    )
-                    .expect("validated Duchon inputs should not fail")
-                };
-                raw * kernel_amp
+            let make_kernel = || {
+                let coeffs = coeffs.clone();
+                let pure_poly_coeff = pure_poly_coeff;
+                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                    let r =
+                        stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
+                    let raw = if let Some(ppc) = pure_poly_coeff {
+                        ppc.eval(r)
+                    } else {
+                        duchon_matern_kernel_general_from_distance(
+                            r,
+                            length_scale,
+                            p_order,
+                            s_order_int.expect("hybrid Duchon requires integer power"),
+                            d,
+                            coeffs.as_ref(),
+                        )
+                        .expect("validated Duchon inputs should not fail")
+                    };
+                    raw * kernel_amp
+                }) as Arc<dyn crate::chunked_kernel_design::SpatialKernelEvaluator>
             };
+            let operators_active = matches!(
+                spec.operator_penalties.mass,
+                OperatorPenaltySpec::Active { .. }
+            ) || matches!(
+                spec.operator_penalties.tension,
+                OperatorPenaltySpec::Active { .. }
+            ) || matches!(
+                spec.operator_penalties.stiffness,
+                OperatorPenaltySpec::Active { .. }
+            );
+            if frozen_radial_reparam.is_none() && !operators_active {
+                let raw_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
+                    kernel_transform.clone(),
+                ]));
+                let raw_op = ChunkedKernelDesignOperator::new(
+                    shared_data.clone(),
+                    Arc::new(centers.clone()),
+                    make_kernel(),
+                    Some(raw_gauge),
+                    Some(Arc::new(poly_block.clone())),
+                )
+                .map_err(BasisError::InvalidInput)?;
+                let ones = Array1::<f64>::ones(raw_op.nrows());
+                let raw_gram = raw_op.diag_xtw_x(&ones).map_err(BasisError::InvalidInput)?;
+                let kernel_cols = kernel_transform.ncols();
+                let design_gram = symmetrize_penalty(
+                    &raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned(),
+                );
+                let omega_constrained = duchon_constrained_bending_penalty(
+                    centers.view(),
+                    spec.length_scale,
+                    spec.power,
+                    effective_nullspace_order,
+                    aniso.as_deref(),
+                    &kernel_transform,
+                )?;
+                let (v, _mu) =
+                    thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
+                if v.ncols() > 0 {
+                    kernel_transform = fast_ab(&kernel_transform, &v);
+                    frozen_radial_reparam = Some(v);
+                }
+            }
             let kernel_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
                 kernel_transform.clone(),
             ]));
             let base_op = ChunkedKernelDesignOperator::new(
                 shared_data,
                 Arc::new(centers.clone()),
-                kernel,
+                make_kernel(),
                 Some(kernel_gauge),
                 Some(Arc::new(poly_block)),
             )

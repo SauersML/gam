@@ -28,7 +28,7 @@ use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::{ProblemHints, ResourcePolicy};
+use gam::ResourcePolicy;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -66,6 +66,26 @@ fn encode_xzy(x: &[f64], z: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
 fn fit_gaussian(formula: &str, ds: &gam::data::EncodedDataset) -> gam::StandardFitResult {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(formula, ds, &cfg)
+        .unwrap_or_else(|e| panic!("gam duchon fit failed for `{formula}`: {e}"));
+    match result {
+        FitResult::Standard(fit) => fit,
+        _ => panic!("expected a standard GAM fit for a gaussian Duchon smooth: `{formula}`"),
+    }
+}
+
+/// Fit with the strict analytic-operator policy so the basis builder must use
+/// its operator-backed spatial path whenever the design crosses the derived
+/// single-materialization budget.
+fn fit_gaussian_operator_required(
+    formula: &str,
+    ds: &gam::data::EncodedDataset,
+) -> gam::StandardFitResult {
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        resource_policy: Some(ResourcePolicy::analytic_operator_required()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, ds, &cfg)
@@ -250,10 +270,10 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     // This test forces the MEMORY-SAVING lazy chunked design operator
     // (`ChunkedKernelDesignOperator`, gated by `should_use_lazy_spatial_design`)
     // and asserts the streamed path is still correct. The lazy path activates
-    // when the would-be dense `n × p` design exceeds the auto-derived policy's
-    // `max_single_materialization_bytes`. The fit path derives that policy via
-    // `ResourcePolicy::for_problem(n_rows, 0, ProblemHints::default())`; below
-    // the large-scale row threshold this is the 256 MiB default budget.
+    // when the would-be dense `n × p` design exceeds the active policy's
+    // `max_single_materialization_bytes`. The test fit uses
+    // `ResourcePolicy::analytic_operator_required()`, whose derived
+    // single-materialization budget is the strict operator-path budget.
     //
     // n = 40_000, k = 900. WHY THESE NUMBERS: the design has p ≈ k centers (plus
     // a 2-column affine null space). dense_bytes = n·p·8 ≈ 40_000·902·8
@@ -273,7 +293,7 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     // would-be dense width used by the lazy gate is on the order of k; use a
     // conservative lower bound (k itself) so the assertion can only UNDER-count,
     // never falsely claim the lazy path triggers.
-    let policy = ResourcePolicy::for_problem(n, 0, ProblemHints::default());
+    let policy = ResourcePolicy::analytic_operator_required();
     let dense_bytes_lower_bound = n
         .saturating_mul(k)
         .saturating_mul(std::mem::size_of::<f64>());
@@ -300,7 +320,7 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
 
     let ds = encode_xy(&x, &y);
     let x_idx = ds.column_map()["x"];
-    let fit = fit_gaussian(&format!("y ~ duchon(x, k={k})"), &ds);
+    let fit = fit_gaussian_operator_required(&format!("y ~ duchon(x, k={k})"), &ds);
 
     let train_fitted: Vec<f64> = fit.design.design.apply(&fit.fit.beta).to_vec();
     assert!(
