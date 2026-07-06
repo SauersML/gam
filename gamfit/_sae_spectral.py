@@ -15,6 +15,7 @@ linear / block lanes these diagnostics read.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -285,11 +286,73 @@ def sparse_dict_dual_certificate(
     )
 
 
+def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[np.ndarray, dict[str, Any]]:
+    if isinstance(checkpoint, np.ndarray):
+        return _as_2d_f32(checkpoint, "checkpoint decoder"), {
+            "format": "array",
+            "decoder_key": None,
+        }
+    if isinstance(checkpoint, dict):
+        key = decoder_key or "decoder"
+        if key not in checkpoint:
+            raise KeyError(f"checkpoint dict does not contain decoder key {key!r}")
+        return _as_2d_f32(checkpoint[key], f"checkpoint[{key!r}]"), {
+            "format": "mapping",
+            "decoder_key": key,
+        }
+
+    path = Path(checkpoint)
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        return _as_2d_f32(np.load(path), str(path)), {
+            "format": "npy",
+            "path": str(path),
+            "decoder_key": None,
+        }
+    if suffix == ".npz":
+        archive = np.load(path)
+        key = decoder_key or "decoder"
+        if key not in archive.files:
+            raise KeyError(f"{path} does not contain decoder array {key!r}")
+        return _as_2d_f32(archive[key], f"{path}:{key}"), {
+            "format": "npz",
+            "path": str(path),
+            "decoder_key": key,
+        }
+    if suffix == ".safetensors":
+        try:
+            from safetensors.numpy import load_file as load_safetensors
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "reading .safetensors checkpoints requires the safetensors package"
+            ) from exc
+        tensors = load_safetensors(str(path))
+        key = decoder_key or "decoder"
+        if key not in tensors:
+            raise KeyError(f"{path} does not contain decoder tensor {key!r}")
+        return _as_2d_f32(tensors[key], f"{path}:{key}"), {
+            "format": "safetensors",
+            "path": str(path),
+            "decoder_key": key,
+        }
+    raise ValueError(
+        f"unsupported SAE checkpoint format {suffix!r}; expected .npy, .npz, or .safetensors"
+    )
+
+
+def _dense_codes_from_sparse(indices: np.ndarray, sparse_codes: np.ndarray, k: int) -> np.ndarray:
+    dense = np.zeros((indices.shape[0], k), dtype=np.float32)
+    rows = np.arange(indices.shape[0])[:, None]
+    dense[rows, indices] = sparse_codes
+    return np.ascontiguousarray(dense)
+
+
 def audit_sae(
-    decoder: Any,
-    codes: Any,
+    checkpoint: Any,
     activations: Any,
     *,
+    codes: Any | None = None,
+    decoder_key: str | None = None,
     active: int | None = None,
     block_size: int = 1,
     block_topk: int | None = None,
@@ -304,16 +367,53 @@ def audit_sae(
     transport_theta_out: Any | None = None,
     transport_layer_from: int = 0,
     transport_layer_to: int = 1,
+    score_tile: int = 4096,
+    code_ridge: float = 1.0e-6,
+    score_mode: str = "required",
 ) -> dict[str, Any]:
     """Run GAM diagnostics on a frozen external SAE dictionary.
 
-    Parameters are a decoder matrix ``K x P``, dense SAE activations/codes
-    ``N x K``, and source activations ``N x P``. The Rust FFI derives the sparse
-    or block routing views from those frozen codes; it does not fit a dictionary.
+    ``checkpoint`` may be a decoder array, a ``.npy`` decoder matrix, a ``.npz``
+    archive containing ``decoder`` (or ``decoder_key``), a safetensors file with
+    that tensor, or a mapping with that key. The expected decoder shape is
+    ``K x P``: one dictionary row per atom and one column per activation
+    dimension. ``activations`` is ``N x P``.
+
+    If dense SAE ``codes`` (``N x K``) are supplied, they are audited as the
+    frozen external encoder output. If not, the Rust sparse router encodes
+    ``activations`` against the frozen decoder with ``active`` atoms per row
+    (default ``1``) before running the audit. All certificate, routability,
+    coordinate-SE, topology, and atlas-nerve quantities are computed by Rust.
     """
-    dec = _as_2d_f32(decoder, "decoder")
-    cod = _as_2d_f32(codes, "codes")
+    dec, checkpoint_meta = _load_decoder_checkpoint(checkpoint, decoder_key)
     acts = _as_2d_f32(activations, "activations")
+    if acts.shape[1] != dec.shape[1]:
+        raise ValueError(
+            f"activations have P={acts.shape[1]} columns but decoder has P={dec.shape[1]}"
+        )
+    if codes is None:
+        route_active = 1 if active is None else int(active)
+        routed = rust_module().sparse_dictionary_transform_ffi(
+            acts,
+            dec,
+            route_active,
+            int(score_tile),
+            float(code_ridge),
+            score_mode,
+        )
+        cod = _dense_codes_from_sparse(routed["indices"], routed["codes"], dec.shape[0])
+        route_meta: dict[str, Any] = {
+            "source": "rust_sparse_router",
+            "active": route_active,
+            "score_route_stats": dict(routed.get("score_route_stats", {})),
+        }
+    else:
+        cod = _as_2d_f32(codes, "codes")
+        route_meta = {"source": "external_codes"}
+    if cod.shape != (acts.shape[0], dec.shape[0]):
+        raise ValueError(
+            f"codes must have shape (N, K)=({acts.shape[0]}, {dec.shape[0]}); got {cod.shape}"
+        )
     if transport is not None:
         if transport_theta_in is not None or transport_theta_out is not None:
             raise ValueError(
@@ -342,7 +442,11 @@ def audit_sae(
         transport_layer_from,
         transport_layer_to,
     )
-    return dict(payload)
+    report = dict(payload)
+    report["checkpoint"] = checkpoint_meta
+    report["route_source"] = route_meta
+    report["api"] = "gamfit.audit_sae"
+    return report
 
 
 # --------------------------------------------------------------------------- #

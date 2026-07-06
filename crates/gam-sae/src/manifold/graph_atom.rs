@@ -1,6 +1,26 @@
 use super::*;
 
-/// Per-edge rank charge for a learned cycle-graph edge.
+/// One undirected candidate edge between graph anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GraphEdge {
+    pub a: usize,
+    pub b: usize,
+}
+
+impl GraphEdge {
+    pub fn new(a: usize, b: usize) -> Result<Self, String> {
+        if a == b {
+            return Err(format!("GraphEdge cannot join vertex {a} to itself"));
+        }
+        Ok(if a < b {
+            Self { a, b }
+        } else {
+            Self { a: b, b: a }
+        })
+    }
+}
+
+/// Per-edge rank charge for a learned graph edge.
 ///
 /// This is the tiered spine's BIC/Laplace currency applied to one edge:
 /// `0.5 * d_eff * ln(n_eff)`. For a graph atom edge, `d_eff` is the number of
@@ -18,17 +38,51 @@ pub struct GraphTopologyReadout {
     pub b1: usize,
 }
 
-/// A first-slice graph atom: `m` anchors initialized as the cycle `C_m`, with a
-/// nonnegative ARD precision per cycle edge.
+/// Named-shape compression certified after the graph has been learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphCompressionKind {
+    Circle,
+    Interval,
+    Tree,
+    DisconnectedCycles,
+    Graph,
+}
+
+/// MDL read-out for whether the learned edge set earns a standard name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphCompressionReport {
+    pub kind: GraphCompressionKind,
+    pub name: &'static str,
+    pub generic_edge_bits: f64,
+    pub named_bits: f64,
+    pub bits_saved: f64,
+}
+
+/// The structure-search birth currency for a graph atom.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphStructureSelection {
+    pub selected: bool,
+    pub total_edge_delta_loss: f64,
+    pub total_edge_charge: f64,
+    pub margin: f64,
+    pub topology: GraphTopologyReadout,
+    pub occupancy: OccupancyLaw,
+    pub compression: GraphCompressionReport,
+}
+
+/// A first-slice graph atom: anchors with a learned subset of a derived kNN
+/// candidate edge set.
 ///
 /// The smoothness penalty is `beta^T (L_W kron I_r) beta`, where `L_W` is the
-/// weighted graph Laplacian of the cycle and `r` is the fiber rank. Edge survival
-/// is read from the same rank-charge discipline used by tiered births/deaths:
-/// an edge survives only when the REML loss increase from removing it is greater
-/// than its one-edge charge.
+/// weighted graph Laplacian of the surviving graph and `r` is the fiber rank.
+/// Edge survival is read from the same rank-charge discipline used by tiered
+/// births/deaths: an edge survives only when the REML loss increase from
+/// removing it is greater than its one-edge charge. Betti read-out is exact on
+/// surviving edges; named shapes are secondary MDL compressions of the graph.
 #[derive(Debug, Clone)]
 pub struct CycleGraphAtom {
     anchor_embeddings: Array2<f64>,
+    candidate_edges: Vec<GraphEdge>,
     edge_precisions: Vec<f64>,
     edge_delta_loss: Vec<f64>,
     surviving_edges: Vec<bool>,
@@ -37,41 +91,101 @@ pub struct CycleGraphAtom {
 }
 
 impl CycleGraphAtom {
-    /// Build a cycle graph atom from REML-selected per-edge precisions and
-    /// per-edge deletion losses.
-    ///
-    /// `anchor_embeddings` is `(m, r)`, one fiber vector per anchor. The cycle
-    /// edges are `(0,1), (1,2), ..., (m-2,m-1), (m-1,0)`, so
-    /// `edge_precisions` and `edge_delta_loss` must both have length `m`.
-    /// `row_coordinates` are folded onto the unit circle and sent through the
-    /// existing coordinate-fidelity occupancy classifier.
-    pub fn from_reml_cycle_edges(
+    /// Derived k for the anchor-kNN candidate graph. The graph atom is expected to
+    /// learn edge survival by ARD; k only supplies a sparse local superset.
+    pub fn derived_knn_k(anchors: usize) -> usize {
+        anchors.saturating_sub(1).min(2)
+    }
+
+    /// Build the derived undirected kNN candidate edge set from anchor embeddings.
+    pub fn knn_candidate_edges(anchor_embeddings: ArrayView2<'_, f64>) -> Result<Vec<GraphEdge>, String> {
+        validate_anchor_embeddings(anchor_embeddings)?;
+        let anchors = anchor_embeddings.nrows();
+        let k = Self::derived_knn_k(anchors);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut edges = Vec::new();
+        for a in 0..anchors {
+            let mut distances = Vec::<(f64, usize)>::with_capacity(anchors.saturating_sub(1));
+            for b in 0..anchors {
+                if a == b {
+                    continue;
+                }
+                let mut dist2 = 0.0_f64;
+                for c in 0..anchor_embeddings.ncols() {
+                    let d = anchor_embeddings[[a, c]] - anchor_embeddings[[b, c]];
+                    dist2 += d * d;
+                }
+                distances.push((dist2, b));
+            }
+            distances.sort_by(|left, right| {
+                left.0
+                    .partial_cmp(&right.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            for &(_, b) in distances.iter().take(k) {
+                let edge = GraphEdge::new(a, b)?;
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+        edges.sort_by_key(|edge| (edge.a, edge.b));
+        Ok(edges)
+    }
+
+    /// Build a learned graph atom from the derived kNN candidate edge set.
+    pub fn from_reml_knn_edges(
         anchor_embeddings: ArrayView2<'_, f64>,
         row_coordinates: &[f64],
         n_eff: f64,
         edge_precisions: &[f64],
         edge_delta_loss: &[f64],
     ) -> Result<Self, String> {
+        let candidate_edges = Self::knn_candidate_edges(anchor_embeddings)?;
+        Self::from_reml_candidate_edges(
+            anchor_embeddings,
+            row_coordinates,
+            n_eff,
+            &candidate_edges,
+            edge_precisions,
+            edge_delta_loss,
+        )
+    }
+
+    /// Build a graph atom from a caller-supplied candidate edge set.
+    ///
+    /// Production births should pass the kNN set from [`Self::knn_candidate_edges`].
+    /// Tests and certified imports use this form to make the candidate superset
+    /// explicit while preserving the same ARD survival rule.
+    pub fn from_reml_candidate_edges(
+        anchor_embeddings: ArrayView2<'_, f64>,
+        row_coordinates: &[f64],
+        n_eff: f64,
+        candidate_edges: &[GraphEdge],
+        edge_precisions: &[f64],
+        edge_delta_loss: &[f64],
+    ) -> Result<Self, String> {
+        validate_anchor_embeddings(anchor_embeddings)?;
         let anchors = anchor_embeddings.nrows();
         let fiber_rank = anchor_embeddings.ncols();
-        if anchors < 3 {
+        if candidate_edges.is_empty() {
+            return Err("CycleGraphAtom requires at least one candidate edge".to_string());
+        }
+        if edge_precisions.len() != candidate_edges.len() {
             return Err(format!(
-                "CycleGraphAtom requires at least 3 anchors for C_m; got {anchors}"
+                "CycleGraphAtom edge_precisions length {} must equal candidate edges {}",
+                edge_precisions.len(),
+                candidate_edges.len()
             ));
         }
-        if fiber_rank == 0 {
-            return Err("CycleGraphAtom requires fiber_rank >= 1".to_string());
-        }
-        if edge_precisions.len() != anchors {
+        if edge_delta_loss.len() != candidate_edges.len() {
             return Err(format!(
-                "CycleGraphAtom edge_precisions length {} must equal anchors {anchors}",
-                edge_precisions.len()
-            ));
-        }
-        if edge_delta_loss.len() != anchors {
-            return Err(format!(
-                "CycleGraphAtom edge_delta_loss length {} must equal anchors {anchors}",
-                edge_delta_loss.len()
+                "CycleGraphAtom edge_delta_loss length {} must equal candidate edges {}",
+                edge_delta_loss.len(),
+                candidate_edges.len()
             ));
         }
         if !(n_eff.is_finite() && n_eff > 0.0) {
@@ -79,8 +193,22 @@ impl CycleGraphAtom {
                 "CycleGraphAtom n_eff must be finite and positive; got {n_eff}"
             ));
         }
-        if anchor_embeddings.iter().any(|v| !v.is_finite()) {
-            return Err("CycleGraphAtom anchor_embeddings contain a non-finite value".to_string());
+        let mut normalized = Vec::<GraphEdge>::with_capacity(candidate_edges.len());
+        for (idx, edge) in candidate_edges.iter().enumerate() {
+            if edge.a >= anchors || edge.b >= anchors || edge.a == edge.b {
+                return Err(format!(
+                    "CycleGraphAtom candidate edge {idx} = ({}, {}) is invalid for {anchors} anchors",
+                    edge.a, edge.b
+                ));
+            }
+            let edge = GraphEdge::new(edge.a, edge.b)?;
+            if normalized.contains(&edge) {
+                return Err(format!(
+                    "CycleGraphAtom candidate edge {idx} duplicates ({}, {})",
+                    edge.a, edge.b
+                ));
+            }
+            normalized.push(edge);
         }
         for (edge, &precision) in edge_precisions.iter().enumerate() {
             if !(precision.is_finite() && precision >= 0.0) {
@@ -106,6 +234,7 @@ impl CycleGraphAtom {
 
         Ok(Self {
             anchor_embeddings: anchor_embeddings.to_owned(),
+            candidate_edges: normalized,
             edge_precisions: edge_precisions.to_vec(),
             edge_delta_loss: edge_delta_loss.to_vec(),
             surviving_edges,
@@ -130,8 +259,16 @@ impl CycleGraphAtom {
         graph_edge_rank_charge(self.n_eff, self.fiber_rank())
     }
 
+    pub fn summed_edge_charge(&self) -> f64 {
+        self.one_edge_charge() * self.topology_readout().surviving_edges as f64
+    }
+
     pub fn occupancy(&self) -> OccupancyLaw {
         self.occupancy
+    }
+
+    pub fn candidate_edges(&self) -> &[GraphEdge] {
+        &self.candidate_edges
     }
 
     pub fn edge_precisions(&self) -> &[f64] {
@@ -146,14 +283,26 @@ impl CycleGraphAtom {
         &self.surviving_edges
     }
 
-    /// Weighted cycle Laplacian `L_W` over all non-retired edges.
+    /// Vertex degrees in the surviving graph.
+    pub fn surviving_degrees(&self) -> Vec<usize> {
+        let mut degrees = vec![0usize; self.anchors()];
+        for (idx, edge) in self.candidate_edges.iter().enumerate() {
+            if self.surviving_edges[idx] {
+                degrees[edge.a] += 1;
+                degrees[edge.b] += 1;
+            }
+        }
+        degrees
+    }
+
+    /// Weighted graph Laplacian `L_W` over all non-retired edges.
     pub fn surviving_laplacian(&self) -> Array2<f64> {
         self.weighted_laplacian_from_mask(&self.surviving_edges)
     }
 
-    /// Weighted cycle Laplacian `L_W` before edge retirement.
+    /// Weighted graph Laplacian `L_W` before edge retirement.
     pub fn full_laplacian(&self) -> Array2<f64> {
-        let all_edges = vec![true; self.anchors()];
+        let all_edges = vec![true; self.candidate_edges.len()];
         self.weighted_laplacian_from_mask(&all_edges)
     }
 
@@ -170,12 +319,10 @@ impl CycleGraphAtom {
         let mut parent: Vec<usize> = (0..vertices).collect();
         let mut surviving_edges = 0usize;
 
-        for edge in 0..vertices {
-            if self.surviving_edges[edge] {
+        for (idx, edge) in self.candidate_edges.iter().enumerate() {
+            if self.surviving_edges[idx] {
                 surviving_edges += 1;
-                let a = edge;
-                let b = (edge + 1) % vertices;
-                graph_union(&mut parent, a, b);
+                graph_union(&mut parent, edge.a, edge.b);
             }
         }
 
@@ -196,6 +343,84 @@ impl CycleGraphAtom {
         }
     }
 
+    /// Certified named compression of the learned graph. A positive bit saving
+    /// returns the named shape; otherwise the structure remains an unnamed graph.
+    pub fn certified_compression(&self) -> GraphCompressionReport {
+        let readout = self.topology_readout();
+        let degrees = self.surviving_degrees();
+        let max_edges = readout.vertices.saturating_mul(readout.vertices.saturating_sub(1)) / 2;
+        let generic = crate::description_length::selection_bits(
+            max_edges as i64,
+            readout.surviving_edges as i64,
+        );
+        let log_vertices = (readout.vertices.max(2) as f64).log2();
+        let named = if readout.b0 == 1 && readout.b1 == 1 && degrees.iter().all(|&d| d == 2) {
+            Some((GraphCompressionKind::Circle, "circle", log_vertices))
+        } else if readout.b0 == 1
+            && readout.b1 == 0
+            && readout.vertices >= 2
+            && degrees.iter().filter(|&&d| d == 1).count() == 2
+            && degrees.iter().filter(|&&d| d == 2).count() == readout.vertices.saturating_sub(2)
+        {
+            Some((GraphCompressionKind::Interval, "interval", 2.0 * log_vertices))
+        } else if readout.b0 == 1 && readout.b1 == 0 && degrees.iter().any(|&d| d > 2) {
+            Some((GraphCompressionKind::Tree, "tree", log_vertices))
+        } else if readout.b0 > 1
+            && readout.b1 == readout.b0
+            && degrees.iter().all(|&d| d == 2)
+        {
+            Some((
+                GraphCompressionKind::DisconnectedCycles,
+                "disconnected-cycles",
+                readout.b0 as f64 * log_vertices,
+            ))
+        } else {
+            None
+        };
+        if let Some((kind, name, named_bits)) = named {
+            let bits_saved = generic - named_bits;
+            if bits_saved > 0.0 {
+                return GraphCompressionReport {
+                    kind,
+                    name,
+                    generic_edge_bits: generic,
+                    named_bits,
+                    bits_saved,
+                };
+            }
+        }
+        GraphCompressionReport {
+            kind: GraphCompressionKind::Graph,
+            name: "graph",
+            generic_edge_bits: generic,
+            named_bits: generic,
+            bits_saved: 0.0,
+        }
+    }
+
+    /// Birth-selection readout: graph existence is paid for by the sum of the
+    /// surviving one-edge charges, not by a fixed topology menu.
+    pub fn structure_selection(&self) -> GraphStructureSelection {
+        let topology = self.topology_readout();
+        let total_edge_delta_loss = self
+            .edge_delta_loss
+            .iter()
+            .zip(self.surviving_edges.iter())
+            .filter_map(|(&delta, &survives)| survives.then_some(delta))
+            .sum::<f64>();
+        let total_edge_charge = self.one_edge_charge() * topology.surviving_edges as f64;
+        let margin = total_edge_delta_loss - total_edge_charge;
+        GraphStructureSelection {
+            selected: topology.surviving_edges > 0 && margin > 0.0,
+            total_edge_delta_loss,
+            total_edge_charge,
+            margin,
+            topology,
+            occupancy: self.occupancy,
+            compression: self.certified_compression(),
+        }
+    }
+
     pub fn surviving_penalty_op(
         &self,
         global_offset: usize,
@@ -212,46 +437,58 @@ impl CycleGraphAtom {
     fn weighted_laplacian_from_mask(&self, active_edges: &[bool]) -> Array2<f64> {
         let anchors = self.anchors();
         let mut laplacian = Array2::<f64>::zeros((anchors, anchors));
-        for edge in 0..anchors {
-            if !active_edges[edge] {
+        for (idx, edge) in self.candidate_edges.iter().enumerate() {
+            if !active_edges[idx] {
                 continue;
             }
-            let w = self.edge_precisions[edge];
+            let w = self.edge_precisions[idx];
             if w == 0.0 {
                 continue;
             }
-            let a = edge;
-            let b = (edge + 1) % anchors;
-            laplacian[[a, a]] += w;
-            laplacian[[b, b]] += w;
-            laplacian[[a, b]] -= w;
-            laplacian[[b, a]] -= w;
+            laplacian[[edge.a, edge.a]] += w;
+            laplacian[[edge.b, edge.b]] += w;
+            laplacian[[edge.a, edge.b]] -= w;
+            laplacian[[edge.b, edge.a]] -= w;
         }
         laplacian
     }
 
     fn smoothness_value_from_mask(&self, active_edges: &[bool]) -> f64 {
-        let anchors = self.anchors();
         let fiber_rank = self.fiber_rank();
         let mut value = 0.0_f64;
-        for edge in 0..anchors {
-            if !active_edges[edge] {
+        for (idx, edge) in self.candidate_edges.iter().enumerate() {
+            if !active_edges[idx] {
                 continue;
             }
-            let w = self.edge_precisions[edge];
+            let w = self.edge_precisions[idx];
             if w == 0.0 {
                 continue;
             }
-            let a = edge;
-            let b = (edge + 1) % anchors;
             for channel in 0..fiber_rank {
-                let diff =
-                    self.anchor_embeddings[[a, channel]] - self.anchor_embeddings[[b, channel]];
+                let diff = self.anchor_embeddings[[edge.a, channel]]
+                    - self.anchor_embeddings[[edge.b, channel]];
                 value += w * diff * diff;
             }
         }
         value
     }
+}
+
+fn validate_anchor_embeddings(anchor_embeddings: ArrayView2<'_, f64>) -> Result<(), String> {
+    let anchors = anchor_embeddings.nrows();
+    let fiber_rank = anchor_embeddings.ncols();
+    if anchors < 2 {
+        return Err(format!(
+            "CycleGraphAtom requires at least 2 anchors; got {anchors}"
+        ));
+    }
+    if fiber_rank == 0 {
+        return Err("CycleGraphAtom requires fiber_rank >= 1".to_string());
+    }
+    if anchor_embeddings.iter().any(|v| !v.is_finite()) {
+        return Err("CycleGraphAtom anchor_embeddings contain a non-finite value".to_string());
+    }
+    Ok(())
 }
 
 fn graph_find(parent: &mut [usize], x: usize) -> usize {

@@ -377,6 +377,7 @@ pub fn rank_charge_dof(
 }
 
 pub use coordinate_fidelity::*;
+pub use crate::inference::atlas_nerve::AtlasCoveringSide;
 pub use cross_fit::*;
 pub use curl::*;
 pub use gauge::*;

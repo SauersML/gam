@@ -51,6 +51,7 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("support_mass", report.support_mass)?;
                 atom.set_item("effective_n", report.effective_n)?;
                 atom.set_item("support_ess", report.support_ess)?;
+                atom.set_item("covering_side", report.covering_side.as_str())?;
                 atom.set_item("measured_betti", betti_signature_dict(py, report.measured_betti)?)?;
                 atom.set_item("expected_betti", betti_signature_dict(py, report.expected_betti)?)?;
                 atom.set_item("inferred_kind", inferred)?;
@@ -63,6 +64,7 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("support_size", py.None())?;
                 atom.set_item("landmark_count", py.None())?;
                 atom.set_item("stability_band", py.None())?;
+                atom.set_item("covering_side", py.None())?;
                 atom.set_item("measured_betti", py.None())?;
                 atom.set_item("expected_betti", py.None())?;
                 atom.set_item("inferred_kind", py.None())?;
@@ -73,4 +75,68 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
     }
     d.set_item("atoms", atoms)?;
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam::terms::sae::manifold::{
+        AtlasCoveringSide, AtomTopologyPersistence, BettiSignature, PersistenceBar,
+        PersistenceStabilityBand, SaeAtomBasisKind,
+    };
+    use pyo3::types::PyList;
+
+    #[test]
+    fn topology_persistence_payload_surfaces_covering_side() {
+        Python::attach(|py| {
+            let report = AtomTopologyPersistence {
+                raced_kind: SaeAtomBasisKind::Periodic,
+                support_size: 48,
+                landmark_count: 48,
+                stability_band: PersistenceStabilityBand::BelowLandmarkCap,
+                covering_side: AtlasCoveringSide::AtOrAboveCoveringNumber,
+                support_mass: 48.0,
+                effective_n: 48.0,
+                support_ess: 48.0,
+                measured_betti: BettiSignature {
+                    b0: 1,
+                    b1: 1,
+                    b2: None,
+                },
+                expected_betti: BettiSignature {
+                    b0: 1,
+                    b1: 1,
+                    b2: None,
+                },
+                dominant_h1_persistence: f64::INFINITY,
+                dominant_h2_persistence: 0.0,
+                h0: vec![PersistenceBar {
+                    birth: 0.0,
+                    death: f64::INFINITY,
+                }],
+                h1: Vec::new(),
+                h2: Vec::new(),
+                contested: false,
+                note: "topology agrees".to_string(),
+            };
+            let payload = sae_topology_persistence_dict(py, &[Some(report)])
+                .expect("topology persistence payload");
+            let atoms_any = payload
+                .get_item("atoms")
+                .expect("read atoms key")
+                .expect("atoms key present");
+            let atoms = atoms_any.cast::<PyList>().expect("atoms list");
+            let atom_any = atoms.get_item(0).expect("first atom row");
+            let atom = atom_any.cast::<PyDict>().expect("atom row dict");
+            let covering_side = atom
+                .get_item("covering_side")
+                .expect("read covering_side")
+                .expect("covering_side present")
+                .extract::<String>()
+                .expect("covering_side string");
+            assert_eq!(covering_side, "at_or_above_covering_number");
+            assert!(atom.get_item("measured_betti").expect("read measured_betti").is_some());
+            assert!(atom.get_item("expected_betti").expect("read expected_betti").is_some());
+        });
+    }
 }

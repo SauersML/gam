@@ -512,6 +512,31 @@ def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
     assert restored.atoms[0].functional_evidence == evidence
 
 
+def test_topology_persistence_report_surfaces_covering_side():
+    fit = _make_fit("softmax", n_atoms=1)
+    fit.topology_persistence = {
+        "atoms": [
+            {
+                "atom": 0,
+                "raced_kind": "periodic",
+                "support_size": 48,
+                "landmark_count": 48,
+                "stability_band": "below_landmark_cap",
+                "covering_side": "at_or_above_covering_number",
+                "measured_betti": {"b0": 1, "b1": 1, "b2": None},
+                "expected_betti": {"b0": 1, "b1": 1, "b2": None},
+                "inferred_kind": "loop",
+                "contested": False,
+            }
+        ]
+    }
+
+    row = fit.topology_persistence_report()[0]
+    assert row["covering_side"] == "at_or_above_covering_number"
+    assert row["measured_betti"] == {"b0": 1, "b1": 1, "b2": None}
+    assert row["expected_betti"] == {"b0": 1, "b1": 1, "b2": None}
+
+
 # ---------------------------------------------------------------------------
 # #608 — mixed-topology fits report "mixed" and expose per-atom topologies.
 # ---------------------------------------------------------------------------

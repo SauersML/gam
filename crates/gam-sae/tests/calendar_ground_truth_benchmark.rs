@@ -3,12 +3,12 @@
 //! Engels et al. report labeled GPT-2 SAE calendar clusters for days of week,
 //! months, and years, and the accompanying PCA observation that the leading
 //! intensity coordinate is the radial coordinate of the circle. This harness
-//! pins that contract on deterministic GPT-2-style planted data, with an
-//! optional real-index fixture path at:
+//! pins the geometric contract on deterministic GPT-2-style planted data, then
+//! requires the committed external-index fixture at:
 //!
 //! `crates/gam-sae/tests/data/engels_gpt2_calendar_sae_indices.json`
 //!
-//! Expected optional schema:
+//! Expected fixture schema:
 //!
 //! ```json
 //! {
@@ -24,8 +24,11 @@ use gam_sae::sparse_dict::{
     BlockChartComposeConfig, BlockCoordinateReport, BlockSparseFit, block_firing_coordinates,
     compose_block_coordinate_charts,
 };
+use gam_sae::manifold::{CycleGraphAtom, GraphCompressionKind, OccupancyLaw, graph_edge_rank_charge};
+use gam_sae::structure_harvest::graph_birth_candidate_for_structure_search;
 use ndarray::{Array2, Array3};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::f64::consts::TAU;
 use std::path::PathBuf;
 
@@ -53,7 +56,7 @@ struct CalendarFixture {
 #[derive(Clone, Debug)]
 struct GroundTruthCluster {
     name: String,
-    feature_count: usize,
+    feature_indices: Vec<u64>,
     label_count: usize,
 }
 
@@ -195,6 +198,103 @@ fn assert_calendar_circles_promoted(fixture: &CalendarFixture) {
     }
 }
 
+fn calendar_axis_anchor_embeddings(axis: usize) -> Array2<f64> {
+    let anchors = LABEL_COUNTS[axis];
+    Array2::<f64>::from_shape_fn((anchors, 2), |(label, col)| {
+        let phase = (label as f64 / anchors as f64 + axis_offset(axis)).fract();
+        let (sin_phase, cos_phase) = (TAU * phase).sin_cos();
+        if col == 0 { cos_phase } else { sin_phase }
+    })
+}
+
+fn calendar_axis_rows(fixture: &CalendarFixture, axis: usize) -> Vec<f64> {
+    let anchors = LABEL_COUNTS[axis];
+    fixture
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(row, labels)| {
+            let jitter_rank = row % anchors;
+            let jitter = jitter_rank as f64 / (ROWS * anchors * anchors) as f64;
+            (labels[axis] as f64 / anchors as f64 + jitter).rem_euclid(1.0)
+        })
+        .collect()
+}
+
+fn assert_calendar_graph_atoms_selected(fixture: &CalendarFixture) {
+    for axis in 0..AXES {
+        let embeddings = calendar_axis_anchor_embeddings(axis);
+        let rows = calendar_axis_rows(fixture, axis);
+        let candidate_edges =
+            CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("calendar kNN graph");
+        let n_eff = rows.len() as f64;
+        let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
+        let precisions = vec![1.0; candidate_edges.len()];
+        let deltas = vec![charge * 1.4; candidate_edges.len()];
+        let candidate = graph_birth_candidate_for_structure_search(
+            embeddings.view(),
+            &rows,
+            n_eff,
+            &precisions,
+            &deltas,
+        )
+        .unwrap_or_else(|err| panic!("{} graph birth candidate failed: {err}", AXIS_NAMES[axis]));
+        let readout = &candidate.selection.topology;
+
+        assert!(
+            candidate.selection.selected,
+            "{} cluster must be selected as a graph atom by summed edge charge",
+            AXIS_NAMES[axis]
+        );
+        assert_eq!(readout.b0, 1, "{} graph b0", AXIS_NAMES[axis]);
+        assert_eq!(readout.b1, 1, "{} graph b1", AXIS_NAMES[axis]);
+        assert_eq!(
+            candidate.selection.occupancy,
+            OccupancyLaw::Discrete {
+                anchors: LABEL_COUNTS[axis]
+            },
+            "{} calendar occupancy must be atomic/discrete",
+            AXIS_NAMES[axis]
+        );
+        assert_eq!(
+            candidate.selection.compression.kind,
+            GraphCompressionKind::Circle,
+            "{} graph can certify a circle name only after graph selection",
+            AXIS_NAMES[axis]
+        );
+    }
+}
+
+fn assert_calendar_continuous_control_is_not_atomic() {
+    let embeddings = calendar_axis_anchor_embeddings(DAY_AXIS);
+    let rows = (0..ROWS)
+        .map(|row| row as f64 / ROWS as f64)
+        .collect::<Vec<_>>();
+    let candidate_edges =
+        CycleGraphAtom::knn_candidate_edges(embeddings.view()).expect("continuous kNN graph");
+    let n_eff = rows.len() as f64;
+    let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
+    let precisions = vec![1.0; candidate_edges.len()];
+    let deltas = vec![charge * 1.4; candidate_edges.len()];
+    let candidate = graph_birth_candidate_for_structure_search(
+        embeddings.view(),
+        &rows,
+        n_eff,
+        &precisions,
+        &deltas,
+    )
+    .expect("continuous graph birth candidate");
+
+    assert!(
+        matches!(
+            candidate.selection.occupancy,
+            OccupancyLaw::Uniform | OccupancyLaw::Continuous
+        ),
+        "dense phase control must remain continuous/uniform, got {:?}",
+        candidate.selection.occupancy
+    );
+}
+
 fn circular_forward_delta(anchor: f64, phase: f64) -> f64 {
     (phase - anchor).rem_euclid(1.0)
 }
@@ -300,17 +400,19 @@ fn assert_report_radius_matches_pc1(
     }
 }
 
-fn optional_engels_fixture_path() -> PathBuf {
+fn engels_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join("engels_gpt2_calendar_sae_indices.json")
 }
 
-fn load_optional_engels_clusters() -> Option<Vec<GroundTruthCluster>> {
-    let path = optional_engels_fixture_path();
-    if !path.exists() {
-        return None;
-    }
+fn load_engels_clusters() -> Vec<GroundTruthCluster> {
+    let path = engels_fixture_path();
+    assert!(
+        path.exists(),
+        "missing committed Engels GPT-2 SAE calendar fixture at {}",
+        path.display()
+    );
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let value: Value = serde_json::from_str(&raw)
@@ -319,12 +421,10 @@ fn load_optional_engels_clusters() -> Option<Vec<GroundTruthCluster>> {
         .get("clusters")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("{} must contain a clusters array", path.display()));
-    Some(
-        clusters
-            .iter()
-            .map(|cluster| parse_ground_truth_cluster(cluster, &path))
-            .collect(),
-    )
+    clusters
+        .iter()
+        .map(|cluster| parse_ground_truth_cluster(cluster, &path))
+        .collect()
 }
 
 fn parse_ground_truth_cluster(cluster: &Value, path: &PathBuf) -> GroundTruthCluster {
@@ -333,24 +433,38 @@ fn parse_ground_truth_cluster(cluster: &Value, path: &PathBuf) -> GroundTruthClu
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("{} cluster is missing a string name", path.display()))
         .to_string();
-    let feature_count = cluster
+    let feature_indices = cluster
         .get("feature_indices")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("{name} in {} is missing feature_indices", path.display()))
-        .len();
+        .iter()
+        .map(|entry| {
+            entry.as_u64().unwrap_or_else(|| {
+                panic!("{name} in {} has a non-integer feature index", path.display())
+            })
+        })
+        .collect::<Vec<_>>();
+    let unique_indices = feature_indices.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        unique_indices.len(),
+        feature_indices.len(),
+        "{name} in {} has duplicate GPT-2 SAE feature indices",
+        path.display()
+    );
     let label_count = cluster
         .get("labels")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("{name} in {} is missing labels", path.display()))
         .len();
     assert!(
-        feature_count >= label_count,
-        "{name} in {} has fewer GPT-2 SAE feature indices ({feature_count}) than labels ({label_count})",
-        path.display()
+        feature_indices.len() >= label_count,
+        "{name} in {} has fewer GPT-2 SAE feature indices ({}) than labels ({label_count})",
+        path.display(),
+        feature_indices.len()
     );
     GroundTruthCluster {
         name,
-        feature_count,
+        feature_indices,
         label_count,
     }
 }
@@ -370,7 +484,7 @@ fn assert_ground_truth_cluster(
         cluster.label_count
     );
     assert!(
-        cluster.feature_count >= cluster.label_count,
+        cluster.feature_indices.len() >= cluster.label_count,
         "{name} cluster must have labeled GPT-2 SAE feature indices"
     );
 }
@@ -379,6 +493,13 @@ fn assert_ground_truth_cluster(
 fn planted_calendar_block_chart_promotion_recovers_circle_atoms() {
     let fixture = planted_calendar_fixture();
     assert_calendar_circles_promoted(&fixture);
+}
+
+#[test]
+fn planted_calendar_structure_search_selects_graph_atoms() {
+    let fixture = planted_calendar_fixture();
+    assert_calendar_graph_atoms_selected(&fixture);
+    assert_calendar_continuous_control_is_not_atomic();
 }
 
 #[test]
@@ -394,16 +515,15 @@ fn planted_calendar_pc1_intensity_is_circle_radius() {
 }
 
 #[test]
-fn optional_engels_gpt2_sae_indices_feed_the_same_calendar_contract() {
-    let Some(clusters) = load_optional_engels_clusters() else {
-        return;
-    };
+fn engels_gpt2_sae_indices_feed_the_same_calendar_contract() {
+    let clusters = load_engels_clusters();
     assert_ground_truth_cluster(&clusters, "days", DAY_COUNT);
     assert_ground_truth_cluster(&clusters, "months", MONTH_COUNT);
-    assert_ground_truth_cluster(&clusters, "years", 2);
+    assert_ground_truth_cluster(&clusters, "years", YEAR_COUNT);
 
     let fixture = planted_calendar_fixture();
     assert_calendar_circles_promoted(&fixture);
+    assert_calendar_graph_atoms_selected(&fixture);
     assert_day_phase_order_and_closed_form_se(&fixture);
     assert_pc1_intensity_equals_circle_radius(&fixture);
 }

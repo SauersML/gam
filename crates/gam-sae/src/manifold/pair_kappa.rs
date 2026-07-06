@@ -62,6 +62,9 @@
 //! ISA sub-sample floor is derived at ([`super::isa_seed`] `ISA_SUBSAMPLE_FLOOR`).
 //! No magic ε.
 
+use crate::coactivation_conditionality::{
+    CoactivationConditionality, estimate_on_rows, residual_gate_activities,
+};
 use ndarray::{Array1, ArrayView2};
 
 use super::isa_seed::IsaPlaneCandidate;
@@ -121,6 +124,12 @@ pub struct PairVerdict {
     pub rho_se: f64,
     /// `z`-score of `ρ̂ − 1` against the independence null.
     pub z: f64,
+    /// Context-conditional residual-gate stability report. This is the structure
+    /// search gate; `ρ` remains evidence, but cannot by itself propose fusion.
+    pub conditionality: Option<CoactivationConditionality>,
+    /// True iff the residual-gate directional conditionals are stable across
+    /// contexts and have no centered-association sign flip.
+    pub conditional_stable: bool,
     /// True ⇒ the pair reads as ONE bound structure (a merge proposal).
     pub merge_proposed: bool,
 }
@@ -150,10 +159,42 @@ pub fn screen_pair(
     cand_a: &IsaPlaneCandidate,
     cand_b: &IsaPlaneCandidate,
 ) -> PairVerdict {
+    let n = data.nrows();
+    let contexts = vec![0usize; n];
+    screen_pair_with_contexts(
+        data,
+        mean,
+        atom_a,
+        atom_b,
+        cand_a,
+        cand_b,
+        &contexts,
+        None,
+    )
+}
+
+/// Screen one atom pair, additionally conditioning the residual-gate
+/// coactivation on caller-provided context labels and an optional shared-chart
+/// design matrix to regress out before forming denominators.
+pub fn screen_pair_with_contexts(
+    data: ArrayView2<'_, f64>,
+    mean: &Array1<f64>,
+    atom_a: usize,
+    atom_b: usize,
+    cand_a: &IsaPlaneCandidate,
+    cand_b: &IsaPlaneCandidate,
+    context_labels: &[usize],
+    shared_chart: Option<ArrayView2<'_, f64>>,
+) -> PairVerdict {
     let ea = plane_energies(data, mean, cand_a);
     let eb = plane_energies(data, mean, cand_b);
     let n = ea.r2.len();
     let n_co_active = (0..n).filter(|&i| ea.active[i] && eb.active[i]).count();
+    let conditionality = residual_conditionality(&ea, &eb, context_labels, shared_chart);
+    let conditional_stable = conditionality
+        .as_ref()
+        .map(|c| c.stable_for_structure_search)
+        .unwrap_or(false);
     let unresolved = PairVerdict {
         atom_a,
         atom_b,
@@ -164,6 +205,8 @@ pub fn screen_pair(
         kappa_b: f64::NAN,
         rho_se: f64::NAN,
         z: 0.0,
+        conditionality,
+        conditional_stable,
         merge_proposed: false,
     };
     if n < PAIR_ROW_FLOOR {
@@ -202,7 +245,7 @@ pub fn screen_pair(
     } else {
         0.0
     };
-    let merge_proposed = z > PAIR_Z;
+    let merge_proposed = z > PAIR_Z && conditional_stable;
     PairVerdict {
         atom_a,
         atom_b,
@@ -213,6 +256,8 @@ pub fn screen_pair(
         kappa_b,
         rho_se,
         z,
+        conditionality,
+        conditional_stable,
         merge_proposed,
     }
 }
@@ -236,6 +281,39 @@ pub fn screen_all_pairs(
         }
     }
     out
+}
+
+fn residual_conditionality(
+    ea: &PlaneEnergies,
+    eb: &PlaneEnergies,
+    context_labels: &[usize],
+    shared_chart: Option<ArrayView2<'_, f64>>,
+) -> Option<CoactivationConditionality> {
+    let n = ea.active.len();
+    if context_labels.len() != n {
+        return None;
+    }
+    let rows: Vec<usize> = (0..n).collect();
+    let weights = vec![1.0_f64; n];
+    let gate_a: Vec<f64> = ea
+        .active
+        .iter()
+        .map(|&active| if active { 1.0 } else { 0.0 })
+        .collect();
+    let gate_b: Vec<f64> = eb
+        .active
+        .iter()
+        .map(|&active| if active { 1.0 } else { 0.0 })
+        .collect();
+    let activities = residual_gate_activities(&gate_a, &gate_b, shared_chart, &weights, 0.0).ok()?;
+    estimate_on_rows(
+        &activities.active_i,
+        &activities.active_j,
+        context_labels,
+        &rows,
+        &weights,
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -312,10 +390,6 @@ mod tests {
         let ca = axis_candidate(p, 0, 1, &act_a);
         let cb = axis_candidate(p, 2, 3, &act_b);
         let v = screen_pair(data.view(), &mean, 0, 1, &ca, &cb);
-        eprintln!(
-            "[pair-κ indep] n_rows={} co_active={} ρ={:.4} κ_A={:.3} κ_B={:.3} SE={:.4} z={:.3} merge={}",
-            v.n_rows, v.n_co_active, v.rho, v.kappa_a, v.kappa_b, v.rho_se, v.z, v.merge_proposed
-        );
         assert!(
             !v.merge_proposed,
             "two INDEPENDENT circles must NOT be flagged: ρ={:.4} z={:.3}",
@@ -359,10 +433,6 @@ mod tests {
         let ca = axis_candidate(p, 0, 1, &act);
         let cb = axis_candidate(p, 2, 3, &act);
         let v = screen_pair(data.view(), &mean, 0, 1, &ca, &cb);
-        eprintln!(
-            "[pair-κ torus] n_rows={} co_active={} ρ={:.4} κ_A={:.3} κ_B={:.3} SE={:.4} z={:.3} merge={}",
-            v.n_rows, v.n_co_active, v.rho, v.kappa_a, v.kappa_b, v.rho_se, v.z, v.merge_proposed
-        );
         assert!(
             v.merge_proposed,
             "a gated torus split into two atoms MUST be flagged: ρ={:.4} z={:.3}",
@@ -415,13 +485,6 @@ mod tests {
             axis_candidate(p, 4, 5, &act_bc), // 2: torus factor
         ];
         let flags = screen_all_pairs(data.view(), &mean, &cands);
-        eprintln!(
-            "[pair-κ all] proposals: {:?}",
-            flags
-                .iter()
-                .map(|v| (v.atom_a, v.atom_b, (v.rho * 100.0).round() / 100.0))
-                .collect::<Vec<_>>()
-        );
         assert_eq!(flags.len(), 1, "exactly one bound pair expected");
         assert!(
             flags[0].atom_a == 1 && flags[0].atom_b == 2,

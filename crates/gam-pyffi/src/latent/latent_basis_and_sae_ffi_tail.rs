@@ -315,6 +315,20 @@ fn sae_manifold_fit_minimal<'py>(
             "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
         ));
     }
+    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, z_view.ncols(), k_atoms)
+        .map_err(py_value_error)?;
+    if admission.uses_sparse_codes() {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit_minimal: dense certification lane refused for N={}, P={}, K={} \
+             because N*K={} exceeds N*P={}; call sae_manifold_fit so the public front door \
+             routes to the sparse-code lane",
+            admission.n_obs,
+            admission.output_dim,
+            admission.n_atoms,
+            admission.dense_assignment_cells,
+            admission.response_cells
+        )));
+    }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
             "sae_manifold_fit_minimal: z contains non-finite values".into(),

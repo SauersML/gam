@@ -391,6 +391,287 @@ fn transport_report_dict<'py>(
     Ok(out)
 }
 
+#[derive(Clone)]
+struct AuditTopologyRecord {
+    atom: usize,
+    support_size: usize,
+    landmark_count: usize,
+    covering_side: String,
+    measured_betti: gam::terms::sae::manifold::BettiSignature,
+    expected_betti: gam::terms::sae::manifold::BettiSignature,
+    contested: bool,
+    dominant_h1_persistence: f64,
+    dominant_h2_persistence: f64,
+    note: String,
+}
+
+struct AuditAtlasReport {
+    chart_blocks: Vec<usize>,
+    diagram: gam::terms::sae::inference::atlas_nerve::AtlasNerveDiagram,
+}
+
+fn betti_signature_dict<'py>(
+    py: Python<'py>,
+    betti: gam::terms::sae::manifold::BettiSignature,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("b0", betti.b0)?;
+    out.set_item("b1", betti.b1)?;
+    match betti.b2 {
+        Some(value) => out.set_item("b2", value)?,
+        None => out.set_item("b2", py.None())?,
+    }
+    Ok(out)
+}
+
+fn topology_records_dict<'py>(
+    py: Python<'py>,
+    records: &[AuditTopologyRecord],
+) -> PyResult<Bound<'py, PyDict>> {
+    let atoms = PyList::empty(py);
+    let mut circles = 0usize;
+    let mut tori = 0usize;
+    let mut lines_or_points = 0usize;
+    let mut contested = 0usize;
+    for record in records {
+        if record.contested {
+            contested += 1;
+        }
+        if record.measured_betti.b1 == 2 && record.measured_betti.b2 == Some(1) {
+            tori += 1;
+        } else if record.measured_betti.b1 == 1 {
+            circles += 1;
+        } else if record.measured_betti.b1 == 0 {
+            lines_or_points += 1;
+        }
+
+        let row = PyDict::new(py);
+        row.set_item("atom", record.atom)?;
+        row.set_item("support_size", record.support_size)?;
+        row.set_item("landmark_count", record.landmark_count)?;
+        row.set_item("covering_side", &record.covering_side)?;
+        row.set_item("measured_betti", betti_signature_dict(py, record.measured_betti)?)?;
+        row.set_item("expected_betti", betti_signature_dict(py, record.expected_betti)?)?;
+        row.set_item("contested", record.contested)?;
+        row.set_item("dominant_h1_persistence", record.dominant_h1_persistence)?;
+        row.set_item("dominant_h2_persistence", record.dominant_h2_persistence)?;
+        row.set_item("note", &record.note)?;
+        atoms.append(row)?;
+    }
+
+    let summary = PyDict::new(py);
+    summary.set_item("n_atoms", records.len())?;
+    summary.set_item("circles", circles)?;
+    summary.set_item("tori", tori)?;
+    summary.set_item("lines_or_points", lines_or_points)?;
+    summary.set_item("contested", contested)?;
+
+    let out = PyDict::new(py);
+    out.set_item("summary", summary)?;
+    out.set_item("atoms", atoms)?;
+    Ok(out)
+}
+
+fn topology_records_from_codes(
+    codes: ndarray::ArrayView2<'_, f32>,
+    coordinate_reports: &[gam::terms::sae::sparse_dict::BlockCoordinateReport],
+    block_size: usize,
+    activation_threshold: f32,
+) -> Vec<AuditTopologyRecord> {
+    let threshold = activation_threshold as f64;
+    if block_size == 1 {
+        let mut records = Vec::with_capacity(codes.ncols());
+        for atom in 0..codes.ncols() {
+            let support_size = codes
+                .column(atom)
+                .iter()
+                .filter(|value| (**value).abs() as f64 > threshold)
+                .count();
+            let b0 = if support_size > 0 { 1 } else { 0 };
+            let betti = gam::terms::sae::manifold::BettiSignature {
+                b0,
+                b1: 0,
+                b2: None,
+            };
+            records.push(AuditTopologyRecord {
+                atom,
+                support_size,
+                landmark_count: support_size.min(1),
+                covering_side: if support_size > 0 {
+                    "at_or_above_covering_number".to_string()
+                } else {
+                    "below_covering_number".to_string()
+                },
+                measured_betti: betti,
+                expected_betti: betti,
+                contested: false,
+                dominant_h1_persistence: 0.0,
+                dominant_h2_persistence: 0.0,
+                note: "scalar external SAE feature: frozen dictionary exposes a point/line chart"
+                    .to_string(),
+            });
+        }
+        return records;
+    }
+
+    let expected = gam::terms::sae::manifold::BettiSignature {
+        b0: 1,
+        b1: 1,
+        b2: None,
+    };
+    let mut records = Vec::with_capacity(coordinate_reports.len());
+    for report in coordinate_reports {
+        let live: Vec<_> = report
+            .firings
+            .iter()
+            .filter(|firing| firing.amplitude > threshold)
+            .collect();
+        if live.len() < 4 {
+            let measured = gam::terms::sae::manifold::BettiSignature {
+                b0: if live.is_empty() { 0 } else { 1 },
+                b1: 0,
+                b2: None,
+            };
+            records.push(AuditTopologyRecord {
+                atom: report.firings.first().map_or(0, |firing| firing.block),
+                support_size: live.len(),
+                landmark_count: live.len(),
+                covering_side: "below_covering_number".to_string(),
+                measured_betti: measured,
+                expected_betti: expected,
+                contested: measured != expected,
+                dominant_h1_persistence: 0.0,
+                dominant_h2_persistence: 0.0,
+                note: "under-resolved harmonic-circle block: fewer than four firing coordinates"
+                    .to_string(),
+            });
+            continue;
+        }
+
+        let mut points = ndarray::Array2::<f64>::zeros((live.len(), 2));
+        for (row_idx, firing) in live.iter().enumerate() {
+            let phase = std::f64::consts::TAU * firing.t;
+            let (sin_phase, cos_phase) = phase.sin_cos();
+            points[[row_idx, 0]] = cos_phase;
+            points[[row_idx, 1]] = sin_phase;
+        }
+        if let Some(verdict) = gam::terms::sae::manifold::topology_persistence_verdict(
+            points.view(),
+            &gam::terms::sae::manifold::SaeAtomBasisKind::Periodic,
+        ) {
+            records.push(AuditTopologyRecord {
+                atom: live[0].block,
+                support_size: verdict.support_size,
+                landmark_count: verdict.landmark_count,
+                covering_side: match verdict.stability_band {
+                    gam::terms::sae::manifold::PersistenceStabilityBand::BelowLandmarkCap => {
+                        "below_covering_number".to_string()
+                    }
+                    gam::terms::sae::manifold::PersistenceStabilityBand::AtLandmarkCap => {
+                        "at_or_above_covering_number".to_string()
+                    }
+                },
+                measured_betti: verdict.measured_betti,
+                expected_betti: verdict.expected_betti,
+                contested: verdict.contested,
+                dominant_h1_persistence: verdict.dominant_h1_persistence,
+                dominant_h2_persistence: verdict.dominant_h2_persistence,
+                note: verdict.note,
+            });
+        }
+    }
+    records
+}
+
+fn atlas_nerve_from_codes(
+    codes: ndarray::ArrayView2<'_, f32>,
+    block_size: usize,
+    activation_threshold: f32,
+    requested_blocks: Option<&[usize]>,
+    max_charts: usize,
+) -> Result<Option<AuditAtlasReport>, String> {
+    if block_size == 1 || codes.ncols() % block_size != 0 {
+        return Ok(None);
+    }
+    let n_blocks = codes.ncols() / block_size;
+    let chart_blocks: Vec<usize> = match requested_blocks {
+        Some(blocks) => blocks.to_vec(),
+        None if n_blocks <= max_charts => (0..n_blocks).collect(),
+        None => return Ok(None),
+    };
+    if chart_blocks.len() < 2 {
+        return Ok(None);
+    }
+    let mut charts = Vec::with_capacity(chart_blocks.len());
+    for (chart_idx, &block) in chart_blocks.iter().enumerate() {
+        if block >= n_blocks {
+            return Err(format!(
+                "audit_sae atlas block {block} out of range 0..{n_blocks}"
+            ));
+        }
+        let mut weights = ndarray::Array1::<f64>::zeros(codes.nrows());
+        for row in 0..codes.nrows() {
+            let mut norm2 = 0.0f64;
+            for offset in 0..block_size {
+                let value = codes[[row, block * block_size + offset]] as f64;
+                norm2 += value * value;
+            }
+            let norm = norm2.sqrt();
+            if norm > activation_threshold as f64 {
+                weights[row] = norm;
+            }
+        }
+        charts.push(
+            gam::terms::sae::inference::atlas_nerve::AtlasChart::from_weights(
+                chart_idx, weights,
+            )?,
+        );
+    }
+    let mut gates = Vec::new();
+    for a in 0..chart_blocks.len() {
+        for b in (a + 1)..chart_blocks.len() {
+            gates.push(gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
+                a,
+                b,
+                valid: true,
+                transport_defect: 0.0,
+                equivariance_defect: 0.0,
+            });
+        }
+    }
+    let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
+    Ok(Some(AuditAtlasReport {
+        chart_blocks,
+        diagram,
+    }))
+}
+
+fn atlas_nerve_dict<'py>(
+    py: Python<'py>,
+    report: Option<&AuditAtlasReport>,
+    skipped_reason: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    let Some(report) = report else {
+        out.set_item("computed", false)?;
+        out.set_item("reason", skipped_reason)?;
+        return Ok(out);
+    };
+    let diagram = &report.diagram;
+    out.set_item("computed", true)?;
+    out.set_item("chart_blocks", report.chart_blocks.clone())?;
+    out.set_item("betti", betti_signature_dict(py, diagram.betti)?)?;
+    out.set_item("n_vertices", diagram.n_vertices)?;
+    out.set_item("n_edges", diagram.n_edges)?;
+    out.set_item("n_triangles", diagram.n_triangles)?;
+    out.set_item("n_tetrahedra", diagram.n_tetrahedra)?;
+    out.set_item("sampled_support_size", diagram.sampled_support_size)?;
+    out.set_item("covering_side", diagram.covering_side.as_str())?;
+    out.set_item("max_filtration", diagram.max_filtration)?;
+    out.set_item("note", &diagram.note)?;
+    Ok(out)
+}
+
 /// Dimension spectrometer: fit a single-atom (`s = 1`) sparse dictionary at each
 /// rung of the doubling ladder `k_min·2^j`, `j = 0..=n_doublings`, and invert the
 /// fitted reconstruction-loss scaling law `L(K) − σ² ∝ K^{-2/d}` into an
@@ -783,7 +1064,9 @@ fn audit_sae<'py>(
             let mut coordinates = Vec::new();
             if block_size >= 2 && block_size % 2 == 0 {
                 let total_blocks = decoder_values.nrows() / block_size;
-                let blocks = coordinate_blocks.unwrap_or_else(|| (0..total_blocks).collect());
+                let blocks = coordinate_blocks
+                    .clone()
+                    .unwrap_or_else(|| (0..total_blocks).collect());
                 for block in blocks {
                     if block >= total_blocks {
                         return Err(format!(
@@ -797,6 +1080,20 @@ fn audit_sae<'py>(
             }
             (report, coordinates)
         };
+
+        let topology_records = topology_records_from_codes(
+            code_values.view(),
+            &coordinate_reports,
+            block_size,
+            activation_threshold,
+        );
+        let atlas_nerve = atlas_nerve_from_codes(
+            code_values.view(),
+            block_size,
+            activation_threshold,
+            coordinate_blocks.as_deref(),
+            max_absorption_pairs,
+        )?;
 
         let transport = match (theta_in_values, theta_out_values) {
             (Some(theta_in), Some(theta_out)) => Some(
@@ -820,13 +1117,24 @@ fn audit_sae<'py>(
             routability,
             dual,
             coordinate_reports,
+            topology_records,
+            atlas_nerve,
             transport,
             decoder_values,
             code_values,
         ))
     })?;
 
-    let (routability, dual, coordinate_reports, transport, decoder_values, code_values) = audit;
+    let (
+        routability,
+        dual,
+        coordinate_reports,
+        topology_records,
+        atlas_nerve,
+        transport,
+        decoder_values,
+        code_values,
+    ) = audit;
     let out = PyDict::new(py);
     out.set_item("decoder_shape", (decoder_values.nrows(), decoder_values.ncols()))?;
     out.set_item("codes_shape", (code_values.nrows(), code_values.ncols()))?;
@@ -853,6 +1161,7 @@ fn audit_sae<'py>(
     routability_dict.set_item("confidence_quantile", routability.confidence_quantile)?;
     routability_dict.set_item("coherence_excess", routability.coherence_excess)?;
     routability_dict.set_item("fraction_below_floor", routability.fraction_below_floor)?;
+    routability_dict.set_item("dark_matter_fraction", 1.0 - routability.fraction_below_floor)?;
     out.set_item("routability", routability_dict)?;
     out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual)?)?;
     out.set_item(
@@ -871,6 +1180,15 @@ fn audit_sae<'py>(
         coordinate_list.append(block_coordinate_report_dict(py, report)?)?;
     }
     out.set_item("coordinate_se", coordinate_list)?;
+    out.set_item("topology", topology_records_dict(py, &topology_records)?)?;
+    out.set_item(
+        "atlas_nerve",
+        atlas_nerve_dict(
+            py,
+            atlas_nerve.as_ref(),
+            "atlas nerve requires a block dictionary with at least two selected charts",
+        )?,
+    )?;
 
     match transport {
         Some(report) => out.set_item("transport", transport_report_dict(py, &report)?)?,

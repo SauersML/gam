@@ -125,6 +125,11 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.audit_sae
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ## Fitted model
 
 ::: gamfit.Model

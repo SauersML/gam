@@ -101,7 +101,7 @@ class SparseDictionaryTransform:
     score_route_stats: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SparseDictionaryFit:
     """Result of a collapsed-linear-lane fit.
 
@@ -114,7 +114,9 @@ class SparseDictionaryFit:
     codes:
         ``N x active`` sparse codes aligned with ``indices`` (FP32).
     fitted:
-        ``N x P`` dense reconstruction of the training rows (FP32).
+        Lazy ``N x P`` dense reconstruction of the training rows (FP32).
+        Accessing it allocates the reconstruction; the fit artifact does not
+        retain a second dense copy of the training matrix.
     explained_variance:
         Held-in EV (``1 - RSS/TSS``) of the fitted reconstruction.
     epochs, converged, active:
@@ -124,12 +126,27 @@ class SparseDictionaryFit:
     decoder: np.ndarray
     indices: np.ndarray
     codes: np.ndarray
-    fitted: np.ndarray
     explained_variance: float
     epochs: int
     converged: bool
     active: int
     score_route_stats: dict[str, Any]
+
+    @property
+    def fitted(self) -> np.ndarray:
+        """Materialize the training reconstruction from sparse codes."""
+        return self.reconstruct()
+
+    @property
+    def retained_training_payload_cells(self) -> int:
+        """Cells retained per training row, excluding the ``K x P`` decoder.
+
+        This is the public size invariant for the front-door sparse lane: the
+        result carries ``indices[N, active]`` and ``codes[N, active]`` only. It
+        therefore cannot hide an ``N x K`` assignment matrix or a second
+        ``N x P`` reconstruction.
+        """
+        return int(self.indices.size + self.codes.size)
 
     def reconstruct(self, indices: Any | None = None, codes: Any | None = None) -> np.ndarray:
         """Dense reconstruct from a sparse ``(indices, codes)`` routing.
@@ -1083,7 +1100,6 @@ def sparse_dictionary_fit(
         decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
         indices=np.ascontiguousarray(data["indices"], dtype=np.uint32),
         codes=np.ascontiguousarray(data["codes"], dtype=np.float32),
-        fitted=np.ascontiguousarray(data["fitted"], dtype=np.float32),
         explained_variance=float(data["explained_variance"]),
         epochs=int(data["epochs"]),
         converged=bool(data["converged"]),

@@ -365,6 +365,7 @@ from .layer_transport import (
     layer_transport_ladder,
 )
 from .checkpoint_dynamics import sae_checkpoint_dynamics
+from ._sae_spectral import audit_sae
 from .geometry import (
     CircleManifold,
     EuclideanManifold,

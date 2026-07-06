@@ -111,6 +111,16 @@ def _training_data_handle(x: np.ndarray) -> _SaeTrainingDataHandle:
     return _SaeTrainingDataHandle(tuple(int(v) for v in x.shape), x.dtype)
 
 
+def _sae_fit_admission(n_obs: int, output_dim: int, n_atoms: int) -> dict[str, Any]:
+    return dict(
+        rust_module().sae_fit_admission(
+            int(n_obs),
+            int(output_dim),
+            int(n_atoms),
+        )
+    )
+
+
 def _lazy_getattr(owner: Any, lazy_names: set[str], name: str) -> Any:
     if name in lazy_names:
         try:
@@ -730,8 +740,9 @@ class ManifoldSAE:
     # ``topology``.
     coordinate_fidelity: dict[str, Any] | None = None
     # Per-atom persistent-homology topology audit. ``atoms[k]`` carries measured
-    # Betti numbers, inferred coarse topology, persistence bars, and a
-    # ``contested`` flag when the measured topology disagrees with the raced kind.
+    # Betti numbers, expected Betti numbers, the ``covering_side`` honesty band,
+    # inferred coarse topology, persistence bars, and a ``contested`` flag when
+    # the measured topology disagrees with the raced kind.
     topology_persistence: dict[str, Any] | None = None
     # Per-atom smooth-functional inference (#1097 / #1103): one entry per fitted
     # atom, ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
@@ -2967,10 +2978,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             top_k_arg = top_k_int
     # Front-door lane admission: the dense exact manifold engine is the small-K
     # certification lane only. Once its `N x K` assignment state would exceed the
-    # response matrix scale `N x P` (equivalently K > P), route to the sparse-code
-    # trainer before constructing dense logits / coordinates. The returned object
-    # carries canonical `(indices, codes)` state and no dense assignment matrix.
-    if k_atoms > int(x.shape[1]):
+    # response matrix scale `N x P`, route to the sparse-code trainer before
+    # constructing dense logits / coordinates. The admission decision is owned by
+    # the Rust front door so the Python public entry and FFI boundary share one
+    # K-vs-P rule.
+    admission = _sae_fit_admission(n_obs, int(x.shape[1]), k_atoms)
+    if admission["lane"] == "sparse_codes":
         if a_init is not None or t_init is not None:
             raise ValueError(
                 "sae_manifold_fit sparse front-door lane does not accept dense "

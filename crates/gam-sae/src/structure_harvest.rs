@@ -86,8 +86,9 @@ use crate::basis::{
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::manifold::{
-    AssignmentMode, OccupancyLaw, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, amplitude_concentration_certificate, classify_occupancy_interval,
+    AssignmentMode, CycleGraphAtom, GraphStructureSelection, OccupancyLaw, SaeAtomBasisKind,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, amplitude_concentration_certificate,
+    classify_occupancy_interval,
 };
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_runtime::warm_start::Fingerprinter;
@@ -1646,6 +1647,39 @@ pub fn finite_set_candidate_for_birth(coords: ArrayView2<'_, f64>) -> Option<(us
         }
         _ => None,
     }
+}
+
+/// A graph birth candidate enrolled in structure search.
+///
+/// The candidate edge set is the derived anchor-kNN graph; REML per-edge losses
+/// decide survival, and the selection currency is the SUM of surviving one-edge
+/// charges. Named shapes are only certified compressions of the learned graph.
+#[derive(Clone, Debug)]
+pub struct GraphBirthCandidate {
+    pub atom: CycleGraphAtom,
+    pub selection: GraphStructureSelection,
+}
+
+/// Build the graph-atom birth candidate that the structure search scores. This
+/// is the graph counterpart to the fixed topology menu: the caller supplies
+/// REML per-edge deletion losses for the kNN edge set, and selection is paid in
+/// summed edge charge rather than by promoting to a circle/line first.
+pub fn graph_birth_candidate_for_structure_search(
+    anchor_embeddings: ArrayView2<'_, f64>,
+    row_coordinates: &[f64],
+    n_eff: f64,
+    edge_precisions: &[f64],
+    edge_delta_loss: &[f64],
+) -> Result<GraphBirthCandidate, String> {
+    let atom = CycleGraphAtom::from_reml_knn_edges(
+        anchor_embeddings,
+        row_coordinates,
+        n_eff,
+        edge_precisions,
+        edge_delta_loss,
+    )?;
+    let selection = atom.structure_selection();
+    Ok(GraphBirthCandidate { atom, selection })
 }
 
 fn race_birth_topology(

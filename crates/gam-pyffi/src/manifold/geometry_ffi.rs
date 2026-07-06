@@ -30,6 +30,29 @@ fn sae_set_ibp_alpha(alpha: f64) {
     gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
 }
 
+#[pyfunction]
+fn sae_fit_admission<'py>(
+    py: Python<'py>,
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+) -> PyResult<Py<PyDict>> {
+    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, output_dim, n_atoms)
+        .map_err(py_value_error)?;
+    let lane = match admission.lane {
+        gam::terms::sae::front_door::SaeFitLane::DenseCertification => "dense_certification",
+        gam::terms::sae::front_door::SaeFitLane::SparseCodes => "sparse_codes",
+    };
+    let out = PyDict::new(py);
+    out.set_item("lane", lane)?;
+    out.set_item("n_obs", admission.n_obs)?;
+    out.set_item("output_dim", admission.output_dim)?;
+    out.set_item("n_atoms", admission.n_atoms)?;
+    out.set_item("dense_assignment_cells", admission.dense_assignment_cells)?;
+    out.set_item("response_cells", admission.response_cells)?;
+    Ok(out.unbind())
+}
+
 #[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_select_k(
     py: Python<'_>,
@@ -4365,6 +4388,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_fit_admission, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_reconstruct_ffi, module)?)?;
@@ -4923,6 +4947,9 @@ fn sparse_dictionary_fit<'py>(
 ) -> PyResult<Py<PyDict>> {
     let score_mode = parse_sparse_dict_score_mode(score_mode)?;
     let x_values = x.as_array().to_owned();
+    let admission =
+        gam::terms::sae::front_door::admit_sae_fit(x_values.nrows(), x_values.ncols(), k)
+            .map_err(py_value_error)?;
     let config = SparseDictConfig {
         n_atoms: k,
         active,
@@ -4945,12 +4972,15 @@ fn sparse_dictionary_fit<'py>(
         )?;
         Ok::<_, String>((fit, dual_cert))
     })?;
-    let fitted = fit.reconstruct();
     let out = PyDict::new(py);
+    let lane = match admission.lane {
+        gam::terms::sae::front_door::SaeFitLane::DenseCertification => "dense_certification",
+        gam::terms::sae::front_door::SaeFitLane::SparseCodes => "sparse_codes",
+    };
+    out.set_item("front_door_lane", lane)?;
     out.set_item("decoder", fit.decoder.into_pyarray(py))?;
     out.set_item("indices", fit.indices.into_pyarray(py))?;
     out.set_item("codes", fit.codes.into_pyarray(py))?;
-    out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("explained_variance", fit.explained_variance)?;
     out.set_item("epochs", fit.epochs)?;
     out.set_item("converged", fit.converged)?;

@@ -1,0 +1,30 @@
+{
+  "provenance": {
+    "paper": "Engels, Liao, Michaud, Gurnee, and Tegmark, Not All Language Model Features Are Linear, arXiv:2405.14860",
+    "source_url": "https://github.com/joshengels/multidimensionalfeatures",
+    "source_note": "README section 'SAE feature search experiments' lists the GPT-2 layer-7 SAE feature indices for the Figure 1 days, months, and years clusters.",
+    "model": "gpt-2",
+    "sae_layer": 7,
+    "cluster_artifact": "sae_multid_feature_discovery/gpt-2_layer_7_clusters_spectral_n1000.pkl"
+  },
+  "clusters": [
+    {
+      "name": "days",
+      "calendar_axis": "day_of_week",
+      "feature_indices": [2592, 4445, 4663, 4733, 6531, 8179, 9566, 20927, 24185],
+      "labels": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    },
+    {
+      "name": "months",
+      "calendar_axis": "month_of_year",
+      "feature_indices": [3977, 4140, 5993, 7299, 9104, 9401, 10449, 11196, 12661, 14715, 17068, 17528, 19589, 21033, 22043, 23304],
+      "labels": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    },
+    {
+      "name": "years",
+      "calendar_axis": "twentieth_century_years",
+      "feature_indices": [1052, 2753, 4427, 6382, 8314, 9576, 9606, 13551, 19734, 20349],
+      "labels": ["1900s", "1910s", "1920s", "1930s", "1940s", "1950s", "1960s", "1970s", "1980s", "1990s"]
+    }
+  ]
+}

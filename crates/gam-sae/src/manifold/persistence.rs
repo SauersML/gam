@@ -36,6 +36,7 @@
 //! band ceiling. Topology is invariant to it above the covering number.
 
 use super::*;
+use crate::inference::atlas_nerve::AtlasCoveringSide;
 use std::collections::HashMap;
 
 /// Compute ceiling on the number of points fed to the Vietoris–Rips filtration.
@@ -133,6 +134,9 @@ pub struct AtomTopologyPersistence {
     pub landmark_count: usize,
     /// Which side of the landmark cap this atom's support lies on.
     pub stability_band: PersistenceStabilityBand,
+    /// Whether the atom support is below or at/above the topology covering
+    /// count used by the atlas-nerve honesty band.
+    pub covering_side: AtlasCoveringSide,
     /// Soft occupancy mass `Σ_i w_i` from the shared atom support measure.
     pub support_mass: f64,
     /// Reconstruction-information effective count `Σ_i w_i²` from the shared
@@ -867,12 +871,18 @@ fn topology_persistence_verdict_impl(
     } else {
         PersistenceStabilityBand::BelowLandmarkCap
     };
+    let covering_side = if full >= PERSISTENCE_MAX_POINTS {
+        AtlasCoveringSide::AtOrAboveCoveringNumber
+    } else {
+        AtlasCoveringSide::BelowCoveringNumber
+    };
 
     Some(AtomTopologyPersistence {
         raced_kind: raced_kind.clone(),
         support_size: full,
         landmark_count: landmarks.len(),
         stability_band,
+        covering_side,
         support_mass,
         effective_n,
         support_ess,
@@ -966,6 +976,9 @@ pub struct AtlasNerveReport {
     /// First Betti number `b₁ = E − V + C` (the graph cycle rank): the number
     /// of independent loops in the recovered manifold.
     pub b1: i64,
+    /// Whether the sampled support is below or at/above the atlas covering
+    /// count. Below-covering reports are measurements, but marked under-resolved.
+    pub covering_side: AtlasCoveringSide,
 }
 
 impl AtlasNerveReport {
@@ -1009,6 +1022,7 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
             n_edges: 0,
             n_components: 0,
             b1: 0,
+            covering_side: AtlasCoveringSide::BelowCoveringNumber,
         };
     }
     let n_charts = ((n as f64).sqrt().ceil() as usize).max(3).min(n);
@@ -1053,11 +1067,17 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
     }
     let n_components = roots.len();
     let b1 = n_edges as i64 - v as i64 + n_components as i64;
+    let covering_side = if n >= v {
+        AtlasCoveringSide::AtOrAboveCoveringNumber
+    } else {
+        AtlasCoveringSide::BelowCoveringNumber
+    };
     AtlasNerveReport {
         n_charts: v,
         n_edges,
         n_components,
         b1,
+        covering_side,
     }
 }
 
