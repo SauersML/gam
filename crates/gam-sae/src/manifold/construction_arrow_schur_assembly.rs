@@ -957,14 +957,17 @@ impl SaeManifoldTerm {
                         //   * Otherwise (small K): the dense uniform-q layout.
                         let (q_row, mut local_jac_row) = if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
+                            let logit_atoms = &layout.logit_atoms[row];
                             let starts = &layout.coord_starts[row];
                             let q_active = layout.row_q_active(row);
                             let mut jac_compact = Array2::<f64>::zeros((q_active, p));
-                            // Logit JVP rows for active atoms only, using the per-mode
-                            // assignment sensitivity `da_k/dl_k` contracted into the
-                            // decoded / fitted-corrected output direction.
+                            // Logit JVP rows for the FREE-logit atoms only. Softmax's
+                            // reference atom (K−1, always last) has coords but no logit
+                            // slot; `logit_atoms == active` for the column-separable
+                            // modes, and the logit slot `j` still coincides with the
+                            // active-set position, so `decoded.row(j)` is correct. (#Bug1)
                             let logits_row = self.assignment.logits.row(row);
-                            for (j, &k) in active.iter().enumerate() {
+                            for (j, &k) in logit_atoms.iter().enumerate() {
                                 fill_active_atom_logit_jvp(
                                     ActiveAtomLogitJvp {
                                         mode: self.assignment.mode,
@@ -1142,7 +1145,10 @@ impl SaeManifoldTerm {
                         // (#1416/#1641), so value and gradient stay on one operator.
                         let assignment_base = row * k_atoms;
                         if let Some(layout) = row_layout.as_ref() {
-                            let active = &layout.active_atoms[row];
+                            // #Bug1: iterate FREE-logit atoms — softmax's reference
+                            // atom has no logit gt/htt slot (matching the dense K−1
+                            // chart); `logit_atoms == active` for separable modes.
+                            let active = &layout.logit_atoms[row];
                             // #1408/#1409 softmax compact curvature: the entropy
                             // Hessian diagonal in `assignment_hdiag` is INDEFINITE,
                             // so on a compact softmax layout write the Gershgorin

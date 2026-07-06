@@ -4597,12 +4597,14 @@ impl SaeManifoldTerm {
         layout: &SaeRowLayout,
     ) -> (LatentManifold, Array1<f64>) {
         let active = &layout.active_atoms[row];
+        let logit_atoms = &layout.logit_atoms[row];
         let q_active = layout.row_q_active(row);
-        let mut parts: Vec<LatentManifold> = Vec::with_capacity(active.len() + active.len());
+        let mut parts: Vec<LatentManifold> = Vec::with_capacity(logit_atoms.len() + active.len());
         let mut point = Array1::<f64>::zeros(q_active);
-        // Logit slots: one Euclidean part per active atom, in `active` order.
+        // Logit slots: one Euclidean part per FREE-logit atom (softmax's reference
+        // atom has coords but no logit slot; `logit_atoms == active` otherwise). (#Bug1)
         let logits_row = self.assignment.logits.row(row);
-        for (j, &k) in active.iter().enumerate() {
+        for (j, &k) in logit_atoms.iter().enumerate() {
             parts.push(LatentManifold::Euclidean);
             point[j] = logits_row[k];
         }
@@ -6681,10 +6683,13 @@ impl SaeManifoldTerm {
                         );
                         let a = a.as_slice().expect("softmax row must be contiguous");
                         let m = softmax_majorizer_log_mean(a);
-                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                        // #Bug1: only FREE-logit atoms carry a compact logit slot; the
+                        // softmax reference atom (last active) has none — matching the
+                        // dense branch which sums only the K−1 free logit slots.
+                        for (j, &atom) in layout.logit_atoms[row].iter().enumerate() {
                             let d_atom =
                                 active_softmax_gershgorin_majorizer_entry(a, atom, m, scale);
-                            trace += inv_diag[row_base + pos] * d_atom;
+                            trace += inv_diag[row_base + j] * d_atom;
                         }
                     }
                     None => {
@@ -7555,8 +7560,12 @@ impl SaeManifoldTerm {
         let mut vars: Vec<Option<SaeLocalRowVar>> = vec![None; q_row];
         match self.last_row_layout {
             Some(ref layout) => {
+                // #Bug1: logit vars go on the leading free-logit slots; the softmax
+                // reference atom takes a coord block but no logit slot.
+                for (j, &atom) in layout.logit_atoms[row].iter().enumerate() {
+                    vars[j] = Some(SaeLocalRowVar::Logit { atom });
+                }
                 for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                    vars[pos] = Some(SaeLocalRowVar::Logit { atom });
                     let start = layout.coord_starts[row][pos];
                     let d = self.assignment.coords[atom].latent_dim();
                     for axis in 0..d {
@@ -7760,8 +7769,11 @@ impl SaeManifoldTerm {
                 let assignment_base = row * k_atoms;
                 match self.last_row_layout {
                     Some(ref layout) => {
-                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            t[base + pos] = assignment_grad[assignment_base + atom];
+                        // #Bug1: assignment log-strength gradient lands on FREE logit
+                        // slots only; softmax's reference atom has none (matching the
+                        // dense `0..assignment_dim` = K−1 branch).
+                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
+                            t[base + slot] = assignment_grad[assignment_base + atom];
                         }
                     }
                     None => {
