@@ -146,15 +146,15 @@ fn profile_pspline_1d_n400() {
         r < 0.06,
         "ps-1d-n400: truth-recovery RMSE regressed to {r:.4} (expected < 0.06)"
     );
-    // Outer-loop work guard (the #1689 regression sentinel). A healthy
-    // single-term Gaussian P-spline REML search settles in a handful of outer
-    // iterations; the per-eval ALO-diagnostic blow-up this test guards against
-    // manifested as a runaway cost-eval / inner-solve count. These caps are
-    // ~3x the observed converged work so ordinary jitter never reddens them
-    // while a genuine re-inflation does.
+    // Outer-loop work guard (the #1689 regression sentinel). `outer_cost_evals`
+    // counts optimizer requests, including cheap cache-hit probes; the expensive
+    // quantity is `inner_pirls_solves`, which counts actual full-n inner solves.
+    // Keep the request cap above the deterministic cache-hit request count while
+    // retaining the tighter inner-solve cap that catches the original ALO
+    // diagnostic blow-up.
     assert!(
-        f.outer_cost_evals <= 120,
-        "ps-1d-n400: outer_cost_evals={} exceeds cap 120 (outer-loop work re-inflated)",
+        f.outer_cost_evals <= 150,
+        "ps-1d-n400: outer_cost_evals={} exceeds cap 150 (outer-loop work re-inflated)",
         f.outer_cost_evals
     );
     assert!(
