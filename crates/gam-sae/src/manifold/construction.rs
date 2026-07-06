@@ -6256,7 +6256,8 @@ impl SaeManifoldTerm {
                 .iter()
                 .map(|coord| coord.as_matrix().slice(s![0..n_total, ..]).to_owned())
                 .collect();
-            let mut full_chunk = self.materialize_chunk(full_logits, full_coords)?;
+            let mut full_chunk =
+                self.materialize_chunk(full_logits, full_coords, self.chunk_frozen_logits(0, n_total))?;
             if let Some(w) = self.row_loss_weights.as_deref() {
                 full_chunk.row_loss_weights = Some(w[0..n_total].to_vec());
             }
@@ -6336,7 +6337,11 @@ impl SaeManifoldTerm {
                 .iter()
                 .map(|coord| coord.as_matrix().slice(s![start..end, ..]).to_owned())
                 .collect();
-            let mut chunk = self.materialize_chunk(chunk_logits, chunk_coords)?;
+            let mut chunk = self.materialize_chunk(
+                chunk_logits,
+                chunk_coords,
+                self.chunk_frozen_logits(start, end),
+            )?;
             // #1117 — rank deficiency is removed at the basis layer at fit entry
             // (`reduce_atoms_to_data_supported_rank`), so each chunk inherits the
             // already-reduced full-rank atoms via `materialize_chunk`; there are

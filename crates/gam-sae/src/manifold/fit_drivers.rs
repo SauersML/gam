@@ -4944,10 +4944,22 @@ impl SaeManifoldTerm {
     /// Errors if any atom lacks a basis evaluator (a streaming fit must be able
     /// to re-evaluate `Φ(t)` at the per-chunk coordinates) or if the supplied
     /// shapes disagree with the term's atom layout.
+    /// The resident term's frozen routing (#1033) restricted to the contiguous
+    /// row range `[start, end)`, or `None` when routing is not frozen. Passed to
+    /// [`Self::materialize_chunk`] so a chunk's gates read the same frozen logits
+    /// as the dense path instead of thawing back to the free logits.
+    pub(crate) fn chunk_frozen_logits(&self, start: usize, end: usize) -> Option<Array2<f64>> {
+        self.assignment
+            .frozen_logits
+            .as_ref()
+            .map(|f| f.slice(ndarray::s![start..end, ..]).to_owned())
+    }
+
     pub fn materialize_chunk(
         &self,
         chunk_logits: Array2<f64>,
         chunk_coords: Vec<Array2<f64>>,
+        chunk_frozen_logits: Option<Array2<f64>>,
     ) -> Result<SaeManifoldTerm, String> {
         let k_atoms = self.k_atoms();
         if chunk_logits.ncols() != k_atoms {
@@ -5060,8 +5072,30 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let assignment =
+        let mut assignment =
             SaeAssignment::with_mode(chunk_logits, coord_values, self.assignment.mode)?;
+        // Carry the assignment-defining metadata that `with_mode` resets to
+        // defaults, so the chunk computes the SAME model as the resident term.
+        // Without this the streaming/chunked path silently diverges from the dense
+        // path: ungated atoms revert to their raw-logit gate instead of the fixed
+        // unit gate (#1026), frozen routing thaws back to the free logits (#1033),
+        // and the per-fit truncated-IBP α override is dropped (#1777). All three
+        // change the forward gate map, hence the loss, gradient, and log-det.
+        //   * `ungated` is per-atom (length K) — row-independent.
+        //   * `ibp_alpha_override` is scalar — row-independent.
+        //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
+        //     rows and passes it as `chunk_frozen_logits`.
+        assignment.ungated = self.assignment.ungated.clone();
+        assignment.ibp_alpha_override = self.assignment.ibp_alpha_override;
+        if let Some(frozen) = chunk_frozen_logits {
+            if frozen.dim() != (n_chunk, k_atoms) {
+                return Err(format!(
+                    "SaeManifoldTerm::materialize_chunk: chunk_frozen_logits shape {:?} != ({n_chunk}, {k_atoms})",
+                    frozen.dim()
+                ));
+            }
+            assignment.frozen_logits = Some(frozen);
+        }
         let mut term = SaeManifoldTerm::new(atoms, assignment)?;
         // The temperature schedule is global outer state; the chunk term is
         // assembled at the schedule's current temperature, which the caller
@@ -5174,7 +5208,8 @@ impl SaeManifoldTerm {
             while start < n_total {
                 let end = (start + chunk_size).min(n_total);
                 let (logits, coords, _z_chunk) = chunk_init(start, end)?;
-                let chunk = self.materialize_chunk(logits, coords)?;
+                let chunk =
+                    self.materialize_chunk(logits, coords, self.chunk_frozen_logits(start, end))?;
                 chunk.accumulate_decoder_gram(&mut grams);
                 start = end;
             }
@@ -5233,7 +5268,8 @@ impl SaeManifoldTerm {
                         self.output_dim()
                     ));
                 }
-                let mut chunk = self.materialize_chunk(logits, coords)?;
+                let mut chunk =
+                    self.materialize_chunk(logits, coords, self.chunk_frozen_logits(start, end))?;
                 // #991: inherit the design honesty weight slice (see
                 // streaming_exact_arrow_log_det for the no-renormalize rule).
                 if let Some(w) = self.row_loss_weights.as_deref() {
@@ -5491,7 +5527,8 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let mut chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk =
+                self.materialize_chunk(logits, coords, self.chunk_frozen_logits(start, end))?;
             // #991: inherit the design honesty weight slice (global mean-1
             // normalization preserved; see streaming_exact_arrow_log_det).
             if let Some(w) = self.row_loss_weights.as_deref() {
@@ -5532,7 +5569,8 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let mut chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk =
+                self.materialize_chunk(logits, coords, self.chunk_frozen_logits(start, end))?;
             // #991: inherit the design honesty weight slice (global mean-1
             // normalization preserved; see streaming_exact_arrow_log_det).
             if let Some(w) = self.row_loss_weights.as_deref() {
