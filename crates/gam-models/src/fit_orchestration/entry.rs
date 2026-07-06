@@ -164,8 +164,7 @@ pub(crate) fn resolved_resource_policy(
 
 pub(crate) fn marginal_slope_hints(config: &FitConfig) -> gam_runtime::resource::ProblemHints {
     gam_runtime::resource::ProblemHints {
-        marginal_slope_large_scale_active: config.logslope_formula.is_some()
-            || config.z_column.is_some(),
+        marginal_slope_large_scale_active: requests_bernoulli_marginal_slope(config),
     }
 }
 /// Parse, materialize, and fit a model in one call.
@@ -1213,9 +1212,7 @@ pub fn materialize<'a>(
                 });
             }
             materialize_transformation_normal(&parsed, data, &col_map, effective_config)
-        } else if effective_config.logslope_formula.is_some()
-            || effective_config.z_column.is_some()
-        {
+        } else if requests_bernoulli_marginal_slope(effective_config) {
             materialize_bernoulli_marginal_slope(&parsed, data, &col_map, effective_config)
         } else if effective_config.noise_formula.is_some() {
             materialize_location_scale(&parsed, data, &col_map, effective_config)
