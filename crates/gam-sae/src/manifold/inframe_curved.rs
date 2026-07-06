@@ -41,6 +41,7 @@ use crate::frames::{
     GrassmannCrossMoment, GrassmannFrame, SAE_FRAME_ACTIVATION_MARGIN,
     SAE_FRAME_MIN_AUTO_OUTPUT_DIM, SAE_FRAME_RANK_CUTOFF,
 };
+use super::weight_frame_catalog::{WeightFrameCatalog, WeightFrameSource};
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt};
 use faer::Side;
 
@@ -121,10 +122,27 @@ pub struct RegionEvidence {
     pub accepted: bool,
 }
 
+/// Whether a chartable frame was occupied by this corpus slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChartOccupancyStatus {
+    /// Data rows occupied the frame and a chart fit was scored.
+    Occupied,
+    /// The weight-sourced frame exists, but no corpus rows landed in it here.
+    ChartableUnoccupied,
+    /// The frame has rows, but not enough to score the curved chart honestly.
+    InsufficientOccupancy,
+}
+
 /// Per-region record: its learned frame, evidence, and in-frame footprint.
 #[derive(Clone, Debug)]
 pub struct RegionRecord {
     pub region: usize,
+    /// Source component for weight-sourced frames; `None` for data-sourced
+    /// residual-span frames.
+    pub frame_source: Option<WeightFrameSource>,
+    /// Index into the source frame catalog when this record came from weights.
+    pub frame_catalog_index: Option<usize>,
+    pub occupancy_status: ChartOccupancyStatus,
     pub basis_size: usize,
     pub frame_rank: usize,
     /// `r(p − r)` Grassmann DOF this region's frame profiled out — charged once
@@ -181,11 +199,23 @@ pub struct InFrameCurvedResult {
     pub ledger: CascadeMemoryLedger,
 }
 
+/// Data occupancy for one weight-sourced catalog frame.
+#[derive(Clone, Debug)]
+pub struct WeightFrameOccupancy {
+    /// Index into [`WeightFrameCatalog::entries`].
+    pub frame_index: usize,
+    /// Corpus rows whose residual coordinates occupy this weight frame.
+    pub rows: Vec<usize>,
+    /// Atom basis size `M_k` for the chart to fit in this frame.
+    pub basis_size: usize,
+}
+
 /// Accepted in-frame prediction for one curved region.
 #[derive(Clone, Debug)]
 pub struct InFrameCurvedRegionPrediction {
     pub rows: Vec<usize>,
     pub frame: GrassmannFrame,
+    pub frame_source: Option<WeightFrameSource>,
     /// Fitted chart image in frame coordinates (`rows.len() × frame.rank()`).
     pub fitted_coords: Array2<f64>,
 }
@@ -193,6 +223,10 @@ pub struct InFrameCurvedRegionPrediction {
 impl InFrameCurvedRegionPrediction {
     pub fn frame_rank(&self) -> usize {
         self.frame.rank()
+    }
+
+    pub fn frame_source(&self) -> Option<&WeightFrameSource> {
+        self.frame_source.as_ref()
     }
 
     pub fn inframe_entries(&self) -> usize {
@@ -367,6 +401,9 @@ pub fn fit_inframe_curved_regions(
         let manifold_dim = r.saturating_mul(p.saturating_sub(r));
         records.push(RegionRecord {
             region: i,
+            frame_source: None,
+            frame_catalog_index: None,
+            occupancy_status: ChartOccupancyStatus::Occupied,
             basis_size: m,
             frame_rank: r,
             frame_manifold_dim: manifold_dim,
@@ -390,6 +427,7 @@ pub fn fit_inframe_curved_regions(
         prediction_regions.push(InFrameCurvedRegionPrediction {
             rows: region.rows.clone(),
             frame: fit.frame.clone(),
+            frame_source: None,
             fitted_coords: fit.fitted_coords.clone(),
         });
     }
@@ -409,6 +447,155 @@ pub fn fit_inframe_curved_regions(
         records,
         accepted_regions,
         ledger,
+    })
+}
+
+/// Fit curved charts inside a weight-sourced frame catalog.
+///
+/// The catalog determines chartability and mechanism attribution. The supplied
+/// occupancies are the only data-dependent part: rows decide whether a frame is
+/// occupied here and provide the coordinates for evidence scoring. A catalog
+/// frame with zero rows still emits a [`RegionRecord`] with
+/// [`ChartOccupancyStatus::ChartableUnoccupied`].
+pub fn fit_inframe_curved_weight_frame_catalog(
+    residual: ArrayView2<'_, f64>,
+    catalog: &WeightFrameCatalog,
+    occupancies: &[WeightFrameOccupancy],
+    n_tokens_total: usize,
+    config: &InFrameCurvedConfig,
+) -> Result<InFrameCurvedResult, String> {
+    let p = residual.ncols();
+    if p == 0 {
+        return Err("fit_inframe_curved_weight_frame_catalog: residual must have p >= 1".to_string());
+    }
+    if catalog.output_dim() != p {
+        return Err(format!(
+            "fit_inframe_curved_weight_frame_catalog: catalog output dim {} != residual dim {p}",
+            catalog.output_dim()
+        ));
+    }
+    if !(config.alpha > 0.0 && config.alpha <= 1.0) {
+        return Err(
+            "fit_inframe_curved_weight_frame_catalog: alpha must be in (0, 1]".to_string(),
+        );
+    }
+
+    let mut fits: Vec<Option<RegionFit>> = Vec::with_capacity(occupancies.len());
+    let mut statuses = Vec::with_capacity(occupancies.len());
+    for occupancy in occupancies {
+        let entry = catalog.entry(occupancy.frame_index).ok_or_else(|| {
+            format!(
+                "fit_inframe_curved_weight_frame_catalog: frame index {} out of range",
+                occupancy.frame_index
+            )
+        })?;
+        if occupancy.rows.is_empty() {
+            fits.push(None);
+            statuses.push(ChartOccupancyStatus::ChartableUnoccupied);
+            continue;
+        }
+        let region = CurvedRegion {
+            rows: occupancy.rows.clone(),
+            basis_size: occupancy.basis_size,
+        };
+        let fit = fit_one_region_in_frame(residual, &region, &entry.frame, config)?;
+        let status = if fit.is_some() {
+            ChartOccupancyStatus::Occupied
+        } else {
+            ChartOccupancyStatus::InsufficientOccupancy
+        };
+        fits.push(fit);
+        statuses.push(status);
+    }
+
+    let mut logs = Vec::new();
+    let mut refs = Vec::new();
+    for (i, fit) in fits.iter().enumerate() {
+        if let Some(f) = fit {
+            if f.evidence.accepted_pre_ebh && f.evidence.margin >= config.min_effect {
+                logs.push(f.evidence.log_e_value);
+                refs.push(i);
+            }
+        }
+    }
+    let keep = ebh(&logs, config.alpha);
+    for (&ok, &i) in keep.iter().zip(refs.iter()) {
+        if let Some(f) = fits[i].as_mut() {
+            f.evidence.accepted = ok;
+        }
+    }
+
+    let mut prediction_regions = Vec::new();
+    let mut records = Vec::with_capacity(occupancies.len());
+    let mut accepted_regions = Vec::new();
+    let mut dense_border = 0usize;
+    let mut inframe_border = 0usize;
+    let mut dense_cov = 0usize;
+    let mut inframe_cov = 0usize;
+    let mut frame_charge = 0.0f64;
+    let ln_n = (n_tokens_total.max(2) as f64).ln();
+
+    for (i, occupancy) in occupancies.iter().enumerate() {
+        let entry = catalog.entry(occupancy.frame_index).expect("validated catalog index");
+        let r = entry.frame.rank();
+        let m = occupancy.basis_size;
+        let inframe_border_coeffs = m.saturating_mul(r);
+        let dense_border_coeffs = m.saturating_mul(p);
+        let manifold_dim = r.saturating_mul(p.saturating_sub(r));
+        let evidence = fits[i]
+            .as_ref()
+            .map(|fit| fit.evidence.clone())
+            .unwrap_or_else(|| empty_evidence(occupancy.rows.len(), r));
+        records.push(RegionRecord {
+            region: i,
+            frame_source: Some(entry.source.clone()),
+            frame_catalog_index: Some(occupancy.frame_index),
+            occupancy_status: statuses[i].clone(),
+            basis_size: m,
+            frame_rank: r,
+            frame_manifold_dim: manifold_dim,
+            evidence,
+            inframe_border_coeffs,
+            dense_border_coeffs,
+        });
+        let Some(fit) = fits[i].as_ref() else {
+            continue;
+        };
+        if !fit.evidence.accepted {
+            continue;
+        }
+        accepted_regions.push(i);
+        dense_border += dense_border_coeffs;
+        inframe_border += inframe_border_coeffs;
+        dense_cov += dense_border_coeffs
+            .saturating_mul(dense_border_coeffs)
+            .saturating_mul(BYTES_PER_F64);
+        inframe_cov += inframe_border_coeffs
+            .saturating_mul(inframe_border_coeffs)
+            .saturating_mul(BYTES_PER_F64);
+        frame_charge += 0.5 * manifold_dim as f64 * ln_n;
+        prediction_regions.push(InFrameCurvedRegionPrediction {
+            rows: occupancy.rows.clone(),
+            frame: fit.frame.clone(),
+            frame_source: Some(entry.source.clone()),
+            fitted_coords: fit.fitted_coords.clone(),
+        });
+    }
+
+    let n_regions_accepted = accepted_regions.len();
+    Ok(InFrameCurvedResult {
+        curved_prediction: InFrameCurvedPrediction::new(residual.nrows(), p, prediction_regions),
+        records,
+        accepted_regions,
+        ledger: CascadeMemoryLedger {
+            p,
+            n_regions_accepted,
+            dense_border_coeffs: dense_border,
+            inframe_border_coeffs: inframe_border,
+            dense_cov_bytes: dense_cov,
+            inframe_cov_bytes: inframe_cov,
+            global_frame_charge: frame_charge,
+        },
     })
 }
 
@@ -437,6 +624,7 @@ pub fn inframe_curved_region_prediction(
     Ok(Some(InFrameCurvedRegionPrediction {
         rows: rows.to_vec(),
         frame,
+        frame_source: None,
         fitted_coords: fitted,
     }))
 }
@@ -592,6 +780,54 @@ fn fit_one_region(
         fitted_coords,
         evidence,
     }))
+}
+
+fn fit_one_region_in_frame(
+    residual: ArrayView2<'_, f64>,
+    region: &CurvedRegion,
+    frame: &GrassmannFrame,
+    config: &InFrameCurvedConfig,
+) -> Result<Option<RegionFit>, String> {
+    let n_g = region.rows.len();
+    if n_g < config.min_rows || n_g < 2 * config.crossfit_folds.max(2) {
+        return Ok(None);
+    }
+    if frame.output_dim() != residual.ncols() {
+        return Err(format!(
+            "fit_one_region_in_frame: frame output dim {} != residual dim {}",
+            frame.output_dim(),
+            residual.ncols()
+        ));
+    }
+    let r_g = take_rows(residual, &region.rows);
+    let z = fast_ab(&r_g, &frame.frame().to_owned());
+    let evidence = crossfit_evidence(&z, config, n_g)?;
+    let fitted_coords = fit_radial_all(&z, config.whitening_ridge)?;
+    Ok(Some(RegionFit {
+        frame: frame.clone(),
+        frame_rank: frame.rank(),
+        fitted_coords,
+        evidence,
+    }))
+}
+
+fn empty_evidence(n_rows: usize, frame_rank: usize) -> RegionEvidence {
+    RegionEvidence {
+        n_rows,
+        n_effective: n_rows as f64,
+        frame_rank,
+        linear_loss: 0.0,
+        chart_loss: 0.0,
+        deviance_gain: 0.0,
+        mean_delta: 0.0,
+        se: f64::INFINITY,
+        ci_low: f64::NEG_INFINITY,
+        charge: 0.0,
+        margin: 0.0,
+        log_e_value: 0.0,
+        accepted_pre_ebh: false,
+        accepted: false,
+    }
 }
 
 /// Learn the region's ambient frame from its residual span: the top-`r` right

@@ -207,6 +207,7 @@ mod stagewise;
 mod streaming_plan;
 mod term;
 mod terracini;
+mod weight_frame_catalog;
 mod wbic_audit;
 
 #[cfg(test)]
@@ -402,4 +403,5 @@ pub use stagewise::*;
 pub use streaming_plan::*;
 pub use term::*;
 pub use terracini::*;
+pub use weight_frame_catalog::*;
 pub use wbic_audit::*;
