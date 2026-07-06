@@ -716,3 +716,43 @@ mod jumprelu_hard_gate_tests {
         assert!(max_diff < 1.0e-8, "max full-q gradient diff {max_diff:e}");
     }
 }
+
+#[cfg(test)]
+mod softmax_reference_chart_tests {
+    //! #Bug1 — a SOFTMAX compact active set containing the reference atom `K−1`
+    //! must give it a COORD block but NO free logit slot, and `expand_row` must
+    //! never write a phantom reference logit into a coordinate position.
+    use super::SaeRowLayout;
+
+    #[test]
+    fn softmax_reference_atom_has_coords_but_no_logit_slot() {
+        // K=3, each atom coord dim 1. Full softmax chart (row_block_dim=5):
+        // full 0,1 = free logits (atoms 0,1); full 2,3,4 = coords (atoms 0,1,2).
+        // Atom 2 is the reference (K−1) with NO logit position.
+        let coord_dims = vec![1usize, 1, 1];
+        let coord_offsets_full = vec![2usize, 3, 4];
+        let active = vec![vec![0usize, 2], vec![2usize]];
+        let layout = SaeRowLayout::from_active_atoms_with_reference(
+            active,
+            coord_dims,
+            coord_offsets_full,
+            Some(2),
+        );
+        assert_eq!(layout.logit_atoms[0], vec![0]);
+        assert_eq!(layout.n_logit_active(0), 1);
+        assert_eq!(layout.row_q_active(0), 3); // 1 logit + coords(atom0)+coords(atom2)
+        assert_eq!(layout.logit_atoms[1], Vec::<usize>::new());
+        assert_eq!(layout.n_logit_active(1), 0);
+        assert_eq!(layout.row_q_active(1), 1);
+        // expand_row: compact [logit(atom0), coord(atom0), coord(atom2)] must land
+        // as logit0→full0, coord atom0→full2, coord atom2→full4 — full index 2
+        // (=coord atom 0) must receive the coordinate, never a phantom reference
+        // logit.
+        let mut out = vec![0.0_f64; 5];
+        layout.expand_row(0, &[10.0, 20.0, 30.0], &mut out);
+        assert_eq!(out, vec![10.0, 0.0, 20.0, 0.0, 30.0]);
+        for (j, &k) in layout.logit_atoms[0].iter().enumerate() {
+            assert_ne!(k, 2, "logit slot {j} must not be the reference atom");
+        }
+    }
+}

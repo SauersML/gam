@@ -3989,6 +3989,19 @@ impl SaeManifoldTerm {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
+        // #Bug2: reconstruct over the SAME per-row active support the compact
+        // Arrow-Schur assembly used, so this scalar objective value and the
+        // assembled Newton gradient/Hessian are derivatives of ONE truncated
+        // reconstruction. When a compact layout is engaged (softmax top-k /
+        // large-K IBP), the assembly forms `fitted` from the row's active atoms
+        // only; summing all K here would make `loss_scaled` a DIFFERENT objective
+        // than the Newton step descends whenever dropped atoms carry mass. `None`
+        // (dense layout) ⇒ the historical full-K sum, bit-for-bit. Guarded on the
+        // row count so a stale/foreign layout is never mis-indexed.
+        let recon_layout = self
+            .last_row_layout
+            .as_ref()
+            .filter(|l| l.active_atoms.len() == n);
         // #1017: the data-fit is the dominant per-line-search-trial cost (it
         // re-runs every Armijo halving × every inner Newton iteration × every
         // outer ρ evaluation). The old path materialised the whole `n × p`
@@ -4021,11 +4034,26 @@ impl SaeManifoldTerm {
             for slot in fitted_row.iter_mut() {
                 *slot = 0.0;
             }
-            for atom_idx in 0..k_atoms {
-                self.atoms[atom_idx].fill_decoded_row(row, g_buf);
-                let a_k = a[atom_idx];
-                for out_col in 0..p {
-                    fitted_row[out_col] += a_k * g_buf[out_col];
+            match recon_layout {
+                // Compact active support: reconstruct only the row's active atoms,
+                // exactly as the compact assembly forms `fitted`.
+                Some(layout) => {
+                    for &atom_idx in &layout.active_atoms[row] {
+                        self.atoms[atom_idx].fill_decoded_row(row, g_buf);
+                        let a_k = a[atom_idx];
+                        for out_col in 0..p {
+                            fitted_row[out_col] += a_k * g_buf[out_col];
+                        }
+                    }
+                }
+                None => {
+                    for atom_idx in 0..k_atoms {
+                        self.atoms[atom_idx].fill_decoded_row(row, g_buf);
+                        let a_k = a[atom_idx];
+                        for out_col in 0..p {
+                            fitted_row[out_col] += a_k * g_buf[out_col];
+                        }
+                    }
                 }
             }
             for out_col in 0..p {
