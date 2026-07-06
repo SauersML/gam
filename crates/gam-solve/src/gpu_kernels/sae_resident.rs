@@ -310,9 +310,14 @@ impl DeviceResidentArrowWorkspace {
             .flat_map(|row| row.gt.iter().copied())
             .collect();
         let g_beta: Vec<f64> = sys.gb.iter().copied().collect();
+        // This is a SINGLE resident solve at one frozen gate/basis frame — the
+        // frame's constant Hessian factors are held resident and only the
+        // gradient is uploaded — so the truthful classifier is
+        // `GpuResidentLinearization`, not `GpuResidentFull` (which denotes the
+        // full multi-step device-resident inner Newton loop in `device_fit`).
         frame
             .solve_gradient(&g_t, &g_beta)
-            .map(|solution| self.finish_step(solution, ExecutionPath::GpuResidentFull))
+            .map(|solution| self.finish_step(solution, ExecutionPath::GpuResidentLinearization))
             .map_err(map_gpu_error)
     }
 
@@ -1980,14 +1985,17 @@ mod tests {
             );
 
             // The public single-iteration API must use the same resident-frame
-            // mechanism as device_fit, not the re-uploading arrow-Schur entry.
+            // mechanism as device_fit (constant factors held resident, only the
+            // gradient uploaded), not the re-uploading arrow-Schur entry. Because
+            // it is a SINGLE solve at one frozen frame, the truthful path is
+            // `GpuResidentLinearization`, not the full inner-loop `GpuResidentFull`.
             let one = ws
                 .one_inner_iteration(opts.initial_ridge_t, opts.initial_ridge_beta)
                 .expect("resident one_inner_iteration");
             assert_eq!(
                 one.execution_path,
-                ExecutionPath::GpuResidentFull,
-                "one_inner_iteration must report full device residency"
+                ExecutionPath::GpuResidentLinearization,
+                "one_inner_iteration must report resident single-linearization residency"
             );
 
             // The resident frame's single-gradient solve must also match a full
