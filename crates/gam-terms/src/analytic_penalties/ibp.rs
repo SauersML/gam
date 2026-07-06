@@ -876,6 +876,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             return Array1::<f64>::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
+        // Per-column Beta(a_k, 1) shapes a_k = μ_k/(1−μ_k) whose prior mean μ_k is
+        // the forward gate's ordered stick-breaking multiplier, and their ρ
+        // derivatives da_k/dρ — the single-model reconciliation (#4).
         let (a_col, mu) = self.column_beta_shapes(alpha);
         let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
@@ -889,16 +892,19 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 active_mass[k] += z[start + k];
             }
         }
-        // Per-column a_k = mu_k/(1-mu_k), mu_k=(alpha/(alpha+1))^(k+1), so da_k/drho
-        // = da_col[k] (NOT the scalar a of the old exchangeable Beta(alpha/K,1)
-        // model). pi_hat_k=(M_k+a_k)/(N+a_k+1) is the posterior MEAN (not
-        // stationary), so the implicit-pi channel is carried with the explicit
-        // Beta(a_k,1) channel:
-        //   dF/drho = sum_k [ pi_score_k*(dpi_k/da_k)*(da_k/drho) + (dF/da_k)*(da_k/drho) ],
-        //   dpi_k/da_k = (N+1-M_k)/D^2 (0 at clamp),  dF/da_k = -1/a_k - ln pi_k.
+        // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ. Each column has its OWN Beta shape
+        // a_k=μ_k/(1−μ_k) (μ_k=(α/(α+1))^(k+1) = the gate's prior mean), so
+        // D_k=N+a_k+1 and da_k/dρ = column_beta_shape_rho_deriv. The plug-in π̂_k =
+        // (M_k+a_k)/D_k is the posterior MEAN, NOT the mode, so the implicit-π
+        // channel does not vanish and rides alongside the explicit Beta(a_k,1) one:
+        //   ∂F/∂ρ = Σ_k [ (∂F/∂π̂_k)·(∂π̂_k/∂ρ)  +  (∂F/∂a_k)·(da_k/dρ) ],
+        //   ∂F/∂π̂_k = pi_score_k,  ∂π̂_k/∂ρ = (da_k/dρ)·(N+1−M_k)/D_k² (0 at clamp),
+        //   ∂F/∂a_k = −1/a_k − ln π̂_k.
+        // (Previously a_k=α/K gave the scalar da/dρ=a; the per-column da_k/dρ makes
+        // this the exact α-gradient of the reconciled single model.)
         let mut acc = 0.0;
         for k in 0..self.k_max {
-            // #Bug4: a fixed/inert column contributes nothing to dF/drho (its logits
+            // #Bug4: a fixed/inert column contributes nothing to ∂F/∂ρ (its logits
             // are held constant), matching its exclusion from `value`.
             if self.column_is_fixed(k) {
                 continue;
