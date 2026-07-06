@@ -1093,16 +1093,20 @@ impl SaeManifoldTerm {
         self.rank_dof_from_grams(&grams, &n_eff, rho, dispersion_r)
     }
 
-    /// Per-atom effective sample size `N_eff,k = Σ_i a_{ik}²` — the occupancy-aware
-    /// Fisher information a gated atom k actually accumulates. This is the honest
-    /// BIC/Laplace log-sample-size for the #2a rank charge (NOT the global row count
-    /// `n_obs`): a row on which atom k's gate is OFF contributes `a²=0`, so appending
-    /// such rows leaves `N_eff,k` — and hence atom k's charge — unchanged (inert-row
-    /// invariance). Matches the `ri.n_eff` the #9 streaming log-det pass accumulates.
+    /// Per-atom effective sample size `N_eff,k = Σ_i w_{ik}²` read through the
+    /// shared [`SupportMeasure`] — the occupancy-aware Fisher information a gated
+    /// atom k actually accumulates. This is the honest BIC/Laplace log-sample-size
+    /// for the #2a rank charge (NOT the global row count `n_obs`): a row on which
+    /// atom k's support is OFF contributes `w²=0`, so appending such rows leaves
+    /// `N_eff,k` — and hence atom k's charge — unchanged (inert-row invariance).
+    /// Matches the `ri.n_eff` the #9 streaming log-det pass accumulates.
     pub(crate) fn per_atom_effective_sample_size(&self) -> Vec<f64> {
-        let assignments = self.assignment.assignments();
         (0..self.k_atoms())
-            .map(|k| assignments.column(k).iter().map(|&a| a * a).sum())
+            .map(|k| {
+                SupportMeasure::from_assignment(&self.assignment, k)
+                    .map(|support| support.fisher_n())
+                    .expect("term assignment shape must match atom count")
+            })
             .collect()
     }
 
@@ -1418,7 +1422,7 @@ impl SaeManifoldTerm {
 
         // Reviewer-F3 persistent-homology topology audit (one entry per atom,
         // `None` for caller-supplied or under-sampled atoms). A pure read of the
-        // fitted decoder image and hard assignment; never gated by a flag and
+        // fitted decoder image and shared soft support measure; never gated by a flag and
         // feeds nothing back into the loss/criterion.
         let topology_persistence = (0..self.k_atoms())
             .map(|atom_idx| atom_topology_persistence(self, atom_idx))
@@ -1443,8 +1447,9 @@ impl SaeManifoldTerm {
     ///
     /// `assignments` is supplied by the payload assembly site so top-k projection,
     /// when requested, is reflected in coverage/frequency and in the tangent
-    /// spectra. The active threshold is shared with the atom lens so all
-    /// assignment-support diagnostics agree on what "active" means.
+    /// spectra. Each atom's support is read through [`SupportMeasure`] so the
+    /// trust scores use the same occupancy/effective-N convention as coordinate
+    /// fidelity, persistence, and rank charge.
     pub fn trust_diagnostics_report(
         &self,
         assignments: ArrayView2<'_, f64>,
@@ -1461,36 +1466,23 @@ impl SaeManifoldTerm {
             return Err("trust_diagnostics_report: assignments must be finite".to_string());
         }
         let metric = self.diagnostic_metric()?;
-        let active_threshold = crate::inference::atom_lens::SAE_TRUST_ACTIVE_MASS_FLOOR;
         let mut atoms = Vec::with_capacity(k_atoms);
         let mut atom_trust = Vec::with_capacity(k_atoms);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let mut active_token_count = 0usize;
-            let mut activation_sum = 0.0_f64;
-            for row in 0..n {
-                let mass = assignments[[row, atom_idx]];
-                activation_sum += mass;
-                if mass > active_threshold {
-                    active_token_count += 1;
-                }
-            }
+            let support = SupportMeasure::from_assignment_matrix(assignments, atom_idx)?;
+            let active_token_count = support.positive_rows().len();
             let coverage = if n > 0 {
-                active_token_count as f64 / n as f64
+                support.ess() / n as f64
             } else {
                 0.0
             };
             let activation_frequency = if n > 0 {
-                activation_sum / n as f64
+                support.mass() / n as f64
             } else {
                 0.0
             };
             let (sigma_min_tangent, sigma_max_tangent) = self
-                .atom_tangent_spectrum_from_assignments(
-                    atom_idx,
-                    assignments,
-                    &metric,
-                    active_threshold,
-                )?;
+                .atom_tangent_spectrum_from_assignments(atom_idx, &support, &metric)?;
             let tangent_condition_score = if sigma_max_tangent > 0.0 {
                 (sigma_min_tangent / sigma_max_tangent).clamp(0.0, 1.0)
             } else {
@@ -1511,6 +1503,9 @@ impl SaeManifoldTerm {
                 tangent_condition_score,
                 coverage,
                 activation_frequency,
+                support_mass: support.mass(),
+                effective_n: support.fisher_n(),
+                support_ess: support.ess(),
                 untyped: matches!(atom.basis_kind, SaeAtomBasisKind::Precomputed(_)),
                 active_token_count,
             });
@@ -1521,9 +1516,8 @@ impl SaeManifoldTerm {
     pub(crate) fn atom_tangent_spectrum_from_assignments(
         &self,
         atom_idx: usize,
-        assignments: ArrayView2<'_, f64>,
+        support: &SupportMeasure,
         metric: &gam_problem::RowMetric,
-        active_threshold: f64,
     ) -> Result<(f64, f64), String> {
         let atom = &self.atoms[atom_idx];
         let d = atom.latent_dim;
@@ -1531,12 +1525,20 @@ impl SaeManifoldTerm {
         if d == 0 || p == 0 {
             return Ok((0.0, 0.0));
         }
+        if support.len() != self.n_obs() || support.atom_idx() != atom_idx {
+            return Err(format!(
+                "atom_tangent_spectrum_from_assignments: support atom/rows ({}, {}) != ({atom_idx}, {})",
+                support.atom_idx(),
+                support.len(),
+                self.n_obs()
+            ));
+        }
         let mut gram = Array2::<f64>::zeros((d, d));
         let mut active_mass_sum = 0.0_f64;
         let mut jac_row = vec![0.0_f64; p * d];
         for row in 0..self.n_obs() {
-            let mass = assignments[[row, atom_idx]];
-            if !(mass > active_threshold) {
+            let mass = support.weight(row);
+            if !(mass > 0.0) {
                 continue;
             }
             active_mass_sum += mass;
@@ -6298,7 +6300,9 @@ impl SaeManifoldTerm {
                 full_chunk.accumulate_decoder_gram(&mut ri.grams);
                 let asg = full_chunk.assignment.assignments();
                 for k in 0..ri.n_eff.len() {
-                    ri.n_eff[k] += asg.column(k).iter().map(|&a| a * a).sum::<f64>();
+                    let support = SupportMeasure::from_assignment_matrix(asg.view(), k)
+                        .expect("streaming full-rank chunk assignment shape must match atoms");
+                    ri.n_eff[k] += support.fisher_n();
                 }
             }
             // Full penalty (`penalty_scale = 1.0`): one chunk carries the whole
@@ -6384,7 +6388,9 @@ impl SaeManifoldTerm {
                 chunk.accumulate_decoder_gram(&mut ri.grams);
                 let asg = chunk.assignment.assignments();
                 for k in 0..ri.n_eff.len() {
-                    ri.n_eff[k] += asg.column(k).iter().map(|&a| a * a).sum::<f64>();
+                    let support = SupportMeasure::from_assignment_matrix(asg.view(), k)
+                        .expect("streaming chunk assignment shape must match atoms");
+                    ri.n_eff[k] += support.fisher_n();
                 }
             }
             let z_chunk = target.slice(s![start..end, ..]);

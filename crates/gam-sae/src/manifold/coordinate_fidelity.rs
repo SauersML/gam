@@ -58,7 +58,7 @@ use crate::chart_canonicalization::{
     UNIT_SPEED_INLOOP_DEFECT_TOL, chart_arclength_coordinates,
 };
 
-use super::SaeManifoldTerm;
+use super::{SaeManifoldTerm, SupportMeasure};
 
 /// #2081 — the certified verdict on whether a fitted `d = 1` atom carries an
 /// honest angle/position coordinate. A downstream angle / dose-in-nats /
@@ -226,6 +226,25 @@ pub fn coordinate_uniformity(
     coords: ArrayView1<'_, f64>,
     topology: &CanonicalChartTopology,
 ) -> Option<WatsonUniformity> {
+    coordinate_uniformity_impl(coords, None, topology)
+}
+
+pub fn coordinate_uniformity_weighted(
+    coords: ArrayView1<'_, f64>,
+    support: &SupportMeasure,
+    topology: &CanonicalChartTopology,
+) -> Option<WatsonUniformity> {
+    if support.len() != coords.len() {
+        return None;
+    }
+    coordinate_uniformity_impl(coords, Some(support.weights()), topology)
+}
+
+fn coordinate_uniformity_impl(
+    coords: ArrayView1<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    topology: &CanonicalChartTopology,
+) -> Option<WatsonUniformity> {
     let n = coords.len();
     if n < 2 {
         return None;
@@ -258,7 +277,62 @@ pub fn coordinate_uniformity(
             coords.iter().map(|&t| (t - lo) / span).collect()
         }
     };
-    Some(watson_u2_uniform(&u))
+    match weights {
+        Some(w) => watson_u2_uniform_weighted(&u, w),
+        None => Some(watson_u2_uniform(&u)),
+    }
+}
+
+/// Weighted Watson `U²` against the uniform invariant measure. `weights` are the
+/// unnormalised support masses for the same rows as `u`; zero-weight rows do not
+/// contribute. For equal unit weights this reduces to [`watson_u2_uniform`].
+pub fn watson_u2_uniform_weighted(
+    u: &[f64],
+    weights: ArrayView1<'_, f64>,
+) -> Option<WatsonUniformity> {
+    if u.len() != weights.len() {
+        return None;
+    }
+    let mut pairs: Vec<(f64, f64)> = u
+        .iter()
+        .copied()
+        .zip(weights.iter().copied())
+        .filter_map(|(x, w)| {
+            if x.is_finite() && w.is_finite() && w > 0.0 {
+                let f = x - x.floor();
+                Some((if f >= 1.0 { 0.0 } else { f }, w))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mass: f64 = pairs.iter().map(|(_, w)| *w).sum();
+    let fisher_n: f64 = pairs.iter().map(|(_, w)| *w * *w).sum();
+    if !(mass > 0.0 && fisher_n > 0.0) {
+        return None;
+    }
+    let ess = (mass * mass) / fisher_n;
+    let mut cumulative = 0.0_f64;
+    let mut cvm_core = 0.0_f64;
+    let mut mean = 0.0_f64;
+    for (ui, wi_raw) in pairs.iter().copied() {
+        let wi = wi_raw / mass;
+        let midpoint = cumulative + 0.5 * wi;
+        let d = ui - midpoint;
+        cvm_core += wi * d * d;
+        mean += wi * ui;
+        cumulative += wi;
+    }
+    let u2 = ess * cvm_core + 1.0 / (12.0 * ess) - ess * (mean - 0.5) * (mean - 0.5);
+    Some(WatsonUniformity {
+        statistic: u2,
+        p_value: watson_u2_pvalue(u2),
+        n: pairs.len(),
+    })
 }
 
 // ===========================================================================
@@ -361,6 +435,13 @@ pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
     classify_occupancy_impl(u, true)
 }
 
+/// Weighted circular occupancy law. `weights` must be the same atom support
+/// masses used by coordinate fidelity and persistence; zero-mass rows are absent.
+/// Hard 0/1 support reproduces [`classify_occupancy`].
+pub fn classify_occupancy_weighted(u: &[f64], weights: ArrayView1<'_, f64>) -> OccupancyLaw {
+    classify_occupancy_weighted_impl(u, weights, true)
+}
+
 /// Occupancy law for an INTERVAL (non-wrapping) coordinate `u ∈ [0, 1]`: the same
 /// evidence race, but on the LINE rather than the circle, so the extreme values
 /// `0` and `1` are NOT cyclically adjacent. Use this for interval-topology
@@ -370,6 +451,14 @@ pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
 /// circular counterpart for genuinely cyclic (circle-chart) coordinates.
 pub fn classify_occupancy_interval(u: &[f64]) -> OccupancyLaw {
     classify_occupancy_impl(u, false)
+}
+
+/// Weighted interval counterpart of [`classify_occupancy_interval`].
+pub fn classify_occupancy_interval_weighted(
+    u: &[f64],
+    weights: ArrayView1<'_, f64>,
+) -> OccupancyLaw {
+    classify_occupancy_weighted_impl(u, weights, false)
 }
 
 /// Shared occupancy adjudicator. `circular` selects the geometry: `true` folds
@@ -425,6 +514,91 @@ fn classify_occupancy_impl(u: &[f64], circular: bool) -> OccupancyLaw {
             break;
         }
         if let Some(bic) = wrapped_gaussian_mixture_bic(&pts, k, sigma_floor, ln_n, circular) {
+            if bic < best_bic {
+                best_bic = bic;
+                best_law = OccupancyLaw::Discrete { anchors: k };
+            }
+        }
+    }
+    best_law
+}
+
+fn classify_occupancy_weighted_impl(
+    u: &[f64],
+    weights: ArrayView1<'_, f64>,
+    circular: bool,
+) -> OccupancyLaw {
+    if u.len() != weights.len() {
+        return OccupancyLaw::Indeterminate;
+    }
+    let mut pairs: Vec<(f64, f64)> = u
+        .iter()
+        .copied()
+        .zip(weights.iter().copied())
+        .filter_map(|(x, w)| {
+            if x.is_finite() && w.is_finite() && w > 0.0 {
+                let folded = if circular {
+                    let f = x - x.floor();
+                    if f >= 1.0 { 0.0 } else { f }
+                } else {
+                    x.clamp(0.0, 1.0)
+                };
+                Some((folded, w))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if pairs.len() < 4 {
+        return OccupancyLaw::Indeterminate;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let pts: Vec<f64> = pairs.iter().map(|(x, _)| *x).collect();
+    let w: Vec<f64> = pairs.iter().map(|(_, weight)| *weight).collect();
+    let support = match SupportMeasure::from_weights(0, Array1::from_vec(w.clone())) {
+        Ok(support) => support,
+        Err(_) => return OccupancyLaw::Indeterminate,
+    };
+    let mass = support.mass();
+    let ess = support.ess();
+    if !(mass > 0.0 && ess >= 4.0) {
+        return OccupancyLaw::Indeterminate;
+    }
+    let ln_n = ess.ln();
+    let bic_uniform = 0.0_f64;
+    let sigma_floor = 1.0 / (2.0 * ess);
+
+    let single = wrapped_gaussian_mixture_bic_weighted(
+        &pts,
+        &w,
+        1,
+        sigma_floor,
+        ln_n,
+        circular,
+        mass,
+    );
+
+    let mut best_law = OccupancyLaw::Uniform;
+    let mut best_bic = bic_uniform;
+    if let Some(bic) = single {
+        if bic < best_bic {
+            best_bic = bic;
+            best_law = OccupancyLaw::Continuous;
+        }
+    }
+    for &k in OCCUPANCY_ANCHOR_LADDER {
+        if k >= pairs.len() {
+            break;
+        }
+        if let Some(bic) = wrapped_gaussian_mixture_bic_weighted(
+            &pts,
+            &w,
+            k,
+            sigma_floor,
+            ln_n,
+            circular,
+            mass,
+        ) {
             if bic < best_bic {
                 best_bic = bic;
                 best_law = OccupancyLaw::Discrete { anchors: k };
@@ -586,6 +760,152 @@ fn wrapped_gaussian_mixture_bic(
     Some(-2.0 * loglik + p_free * ln_n)
 }
 
+fn wrapped_gaussian_mixture_bic_weighted(
+    pts: &[f64],
+    weights_in: &[f64],
+    k: usize,
+    sigma_floor: f64,
+    ln_n: f64,
+    circular: bool,
+    total_mass: f64,
+) -> Option<f64> {
+    let n = pts.len();
+    if k == 0 || k > n || weights_in.len() != n || !(total_mass > 0.0) {
+        return None;
+    }
+    let circ_dist = |a: f64, b: f64| -> f64 {
+        if circular {
+            let d = (a - b).rem_euclid(1.0);
+            d.min(1.0 - d)
+        } else {
+            (a - b).abs()
+        }
+    };
+    let mut means = weighted_quantile_initial_means(pts, weights_in, k, total_mass);
+    let mut assign = vec![0usize; n];
+    for _ in 0..100 {
+        let mut changed = false;
+        for (i, &p) in pts.iter().enumerate() {
+            let mut best_j = 0usize;
+            let mut best_d = f64::INFINITY;
+            for (j, &m) in means.iter().enumerate() {
+                let d = circ_dist(p, m);
+                if d < best_d {
+                    best_d = d;
+                    best_j = j;
+                }
+            }
+            if assign[i] != best_j {
+                assign[i] = best_j;
+                changed = true;
+            }
+        }
+        for (j, m) in means.iter_mut().enumerate() {
+            if circular {
+                let (mut sx, mut sy, mut mass_j) = (0.0_f64, 0.0_f64, 0.0_f64);
+                for (i, &p) in pts.iter().enumerate() {
+                    if assign[i] == j {
+                        let wi = weights_in[i];
+                        let ang = std::f64::consts::TAU * p;
+                        sx += wi * ang.cos();
+                        sy += wi * ang.sin();
+                        mass_j += wi;
+                    }
+                }
+                if mass_j > 0.0 && (sx * sx + sy * sy) > 0.0 {
+                    *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
+                }
+            } else {
+                let (mut sum, mut mass_j) = (0.0_f64, 0.0_f64);
+                for (i, &p) in pts.iter().enumerate() {
+                    if assign[i] == j {
+                        let wi = weights_in[i];
+                        sum += wi * p;
+                        mass_j += wi;
+                    }
+                }
+                if mass_j > 0.0 {
+                    *m = sum / mass_j;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut mixture_weights = vec![0.0_f64; k];
+    let mut total_ss = 0.0_f64;
+    for (i, &p) in pts.iter().enumerate() {
+        let j = assign[i];
+        let wi = weights_in[i];
+        mixture_weights[j] += wi;
+        let d = if circular {
+            let raw = (p - means[j]).rem_euclid(1.0);
+            if raw > 0.5 { raw - 1.0 } else { raw }
+        } else {
+            p - means[j]
+        };
+        total_ss += wi * d * d;
+    }
+    for weight in &mut mixture_weights {
+        *weight /= total_mass;
+    }
+    let shared_sigma = (total_ss / total_mass).sqrt().max(sigma_floor);
+    let sigmas = vec![shared_sigma; k];
+
+    let inv_sqrt_2pi = 1.0 / (std::f64::consts::TAU).sqrt();
+    let mut loglik = 0.0_f64;
+    for (i, &p) in pts.iter().enumerate() {
+        let mut dens = 0.0_f64;
+        for j in 0..k {
+            if mixture_weights[j] <= 0.0 {
+                continue;
+            }
+            let s = sigmas[j];
+            let mut g = 0.0_f64;
+            let (lo_img, hi_img) = if circular { (-1_i32, 1_i32) } else { (0, 0) };
+            for m in lo_img..=hi_img {
+                let d = p - means[j] + m as f64;
+                g += (-0.5 * (d / s) * (d / s)).exp();
+            }
+            dens += mixture_weights[j] * inv_sqrt_2pi / s * g;
+        }
+        if !(dens > 0.0) {
+            return None;
+        }
+        loglik += weights_in[i] * dens.ln();
+    }
+    if !loglik.is_finite() {
+        return None;
+    }
+    let p_free = (2 * k) as f64;
+    Some(-2.0 * loglik + p_free * ln_n)
+}
+
+fn weighted_quantile_initial_means(
+    pts: &[f64],
+    weights: &[f64],
+    k: usize,
+    total_mass: f64,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(k);
+    for j in 0..k {
+        let target = (j as f64 / k as f64) * total_mass;
+        let mut acc = 0.0_f64;
+        let mut chosen = pts[0];
+        for (&p, &w) in pts.iter().zip(weights.iter()) {
+            acc += w;
+            if acc >= target {
+                chosen = p;
+                break;
+            }
+        }
+        out.push(chosen);
+    }
+    out
+}
+
 /// The per-atom coordinate-fidelity certificate: a reported, calibrated summary
 /// of whether one fitted `d = 1` atom's latent coordinate is an honest reading
 /// of its manifold. Produced by [`atom_coordinate_fidelity`]; `None` for atoms
@@ -609,6 +929,14 @@ pub struct AtomCoordinateFidelity {
     pub arclength_defect: f64,
     /// Number of fitted coordinates the uniformity statistic was computed from.
     pub n_coords: usize,
+    /// Soft occupancy mass `Σ_i w_i` from the shared atom support measure.
+    pub support_mass: f64,
+    /// Reconstruction-information effective count `Σ_i w_i²` from the shared
+    /// atom support measure.
+    pub effective_n: f64,
+    /// Kish effective support `(Σ_i w_i)² / Σ_i w_i²`, the number of equally
+    /// weighted rows represented by this atom's support distribution.
+    pub support_ess: f64,
     /// The certified verdict on whether an honest coordinate is available and
     /// which one to read ([`AngleFidelityVerdict`]).
     pub verdict: AngleFidelityVerdict,
@@ -697,13 +1025,20 @@ pub fn atom_coordinate_fidelity(
         return Ok(None);
     }
     let row_coords = coords.column(0);
-    let uniformity = coordinate_uniformity(row_coords, &topology);
+    let support = SupportMeasure::from_assignment(&term.assignment, atom_idx)?;
+    let uniformity = coordinate_uniformity_weighted(row_coords, &support, &topology);
     // Occupancy law (F2): classified from the SAME folded coordinates the
     // uniformity statistic reads, but adjudicated by evidence rather than the
     // uniform-null p-value. Reported separately from chart honesty so a discrete
     // measure on an honest chart is not read as a fidelity failure.
-    let occupancy_law = fold_for_occupancy(row_coords, &topology)
-        .map(|folded| classify_occupancy(&folded))
+    let occupancy_law = fold_for_occupancy_weighted(row_coords, support.weights(), &topology)
+        .map(|(folded, folded_weights)| {
+            if matches!(topology, CanonicalChartTopology::Circle { .. }) {
+                classify_occupancy_weighted(&folded, folded_weights.view())
+            } else {
+                classify_occupancy_interval_weighted(&folded, folded_weights.view())
+            }
+        })
         .unwrap_or(OccupancyLaw::Indeterminate);
     let atom = &term.atoms[atom_idx];
     let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
@@ -743,8 +1078,13 @@ pub fn atom_coordinate_fidelity(
             // A well-conditioned chart: raw t is honest iff already unit-speed,
             // otherwise the coordinate is recoverable via `u_arc`.
             let verdict = angle_fidelity_verdict(Some(&r));
-            let (rms, max) =
-                raw_vs_arclength_defect(row_coords, r.coords_u_arc.view(), &topology, is_circle);
+            let (rms, max) = raw_vs_arclength_defect_weighted(
+                row_coords,
+                r.coords_u_arc.view(),
+                support.weights(),
+                &topology,
+                is_circle,
+            );
             (
                 verdict,
                 Some(r.coords_u_arc),
@@ -783,6 +1123,9 @@ pub fn atom_coordinate_fidelity(
         uniformity_p_value: uniformity.as_ref().map(|u| u.p_value).unwrap_or(f64::NAN),
         arclength_defect: defect.unwrap_or(f64::NAN),
         n_coords: uniformity.as_ref().map(|u| u.n).unwrap_or(row_coords.len()),
+        support_mass: support.mass(),
+        effective_n: support.fisher_n(),
+        support_ess: support.ess(),
         verdict,
         certified: verdict.certified(),
         coords_u_arc,
@@ -798,15 +1141,14 @@ pub fn atom_coordinate_fidelity(
     }))
 }
 
-/// Fold the fitted `d = 1` coordinates onto the unit interval `[0, 1)` for the
-/// occupancy classifier, using the SAME per-topology mapping as
-/// [`coordinate_uniformity`] (circle wraps modulo its period; interval is range
-/// normalized). Returns `None` when the mapping is ill-defined (non-finite
-/// coordinate, non-positive period, collapsed interval range).
-fn fold_for_occupancy(
+fn fold_for_occupancy_weighted(
     coords: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
     topology: &CanonicalChartTopology,
-) -> Option<Vec<f64>> {
+) -> Option<(Vec<f64>, Array1<f64>)> {
+    if coords.len() != weights.len() {
+        return None;
+    }
     if coords.len() < 2 || coords.iter().any(|t| !t.is_finite()) {
         return None;
     }
@@ -815,12 +1157,23 @@ fn fold_for_occupancy(
             if !(period.is_finite() && *period > 0.0) {
                 return None;
             }
-            Some(coords.iter().map(|&t| t.rem_euclid(*period) / *period).collect())
+            let mut folded = Vec::new();
+            let mut folded_weights = Vec::new();
+            for (&t, &w) in coords.iter().zip(weights.iter()) {
+                if w > 0.0 {
+                    folded.push(t.rem_euclid(*period) / *period);
+                    folded_weights.push(w);
+                }
+            }
+            Some((folded, Array1::from_vec(folded_weights)))
         }
         CanonicalChartTopology::Interval => {
             let mut lo = f64::INFINITY;
             let mut hi = f64::NEG_INFINITY;
-            for &t in coords.iter() {
+            for (&t, &w) in coords.iter().zip(weights.iter()) {
+                if !(w > 0.0) {
+                    continue;
+                }
                 lo = lo.min(t);
                 hi = hi.max(t);
             }
@@ -829,28 +1182,32 @@ fn fold_for_occupancy(
             if !(span > 1.0e-12 * scale) {
                 return None;
             }
-            Some(coords.iter().map(|&t| (t - lo) / span).collect())
+            let mut folded = Vec::new();
+            let mut folded_weights = Vec::new();
+            for (&t, &w) in coords.iter().zip(weights.iter()) {
+                if w > 0.0 {
+                    folded.push((t - lo) / span);
+                    folded_weights.push(w);
+                }
+            }
+            Some((folded, Array1::from_vec(folded_weights)))
         }
     }
 }
 
-/// The (circular, for a circle) distance between the raw normalized coordinate
-/// `t_i / span` and its arc-length image `u_i`, minimized over the residual
-/// gauge — a base-point shift `c` and an orientation flip `s ∈ {+1, −1}` — and
-/// summarized as `(rms, max)` over the rows. On a circle the residual gauge is
-/// the full `O(2)` (rotation + reflection), so the best rotation is the circular
-/// mean of `u_i − s·r_i`; on an interval it is reflection + translation, so the
-/// best shift is the ordinary mean. `0` ⟺ the raw coordinate already equals the
-/// arc-length coordinate up to that gauge (an honest, unit-speed chart at the
-/// data rows).
-fn raw_vs_arclength_defect(
+/// The support-weighted (circular, for a circle) distance between the raw
+/// normalized coordinate `t_i / span` and its arc-length image `u_i`, minimized
+/// over the residual gauge — a base-point shift `c` and an orientation flip
+/// `s ∈ {+1, −1}` — and summarized as `(rms, max)` over the rows.
+fn raw_vs_arclength_defect_weighted(
     raw: ArrayView1<'_, f64>,
     u_arc: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
     topology: &CanonicalChartTopology,
     is_circle: bool,
 ) -> (f64, f64) {
     let n = raw.len();
-    if n == 0 {
+    if n == 0 || u_arc.len() != n || weights.len() != n {
         return (f64::NAN, f64::NAN);
     }
     // Raw coordinate normalized to `[0, 1)` (circle) / `[0, 1]` (interval),
@@ -862,7 +1219,10 @@ fn raw_vs_arclength_defect(
         CanonicalChartTopology::Interval => {
             let mut lo = f64::INFINITY;
             let mut hi = f64::NEG_INFINITY;
-            for &t in raw.iter() {
+            for (&t, &w) in raw.iter().zip(weights.iter()) {
+                if !(w > 0.0) {
+                    continue;
+                }
                 lo = lo.min(t);
                 hi = hi.max(t);
             }
@@ -888,33 +1248,50 @@ fn raw_vs_arclength_defect(
         // mean on an interval.
         let c = if is_circle {
             let (mut sx, mut sy) = (0.0_f64, 0.0_f64);
-            for (ui, ri) in u_arc.iter().zip(r.iter()) {
+            for ((ui, ri), wi) in u_arc.iter().zip(r.iter()).zip(weights.iter()) {
+                if !(*wi > 0.0) {
+                    continue;
+                }
                 let diff = ui - s * ri;
                 let ang = std::f64::consts::TAU * diff;
-                sx += ang.cos();
-                sy += ang.sin();
+                sx += *wi * ang.cos();
+                sy += *wi * ang.sin();
             }
             sy.atan2(sx) / std::f64::consts::TAU
         } else {
             let mut acc = 0.0_f64;
-            for (ui, ri) in u_arc.iter().zip(r.iter()) {
-                acc += ui - s * ri;
+            let mut mass = 0.0_f64;
+            for ((ui, ri), wi) in u_arc.iter().zip(r.iter()).zip(weights.iter()) {
+                if !(*wi > 0.0) {
+                    continue;
+                }
+                acc += *wi * (ui - s * ri);
+                mass += *wi;
             }
-            acc / n as f64
+            if mass > 0.0 { acc / mass } else { 0.0 }
         };
         let mut sum_sq = 0.0_f64;
         let mut max = 0.0_f64;
-        for (ui, ri) in u_arc.iter().zip(r.iter()) {
+        let mut mass = 0.0_f64;
+        for ((ui, ri), wi) in u_arc.iter().zip(r.iter()).zip(weights.iter()) {
+            if !(*wi > 0.0) {
+                continue;
+            }
             let aligned = s * ri + c;
             let d = if is_circle {
                 circ_dist(*ui, aligned)
             } else {
                 (ui - aligned).abs()
             };
-            sum_sq += d * d;
+            sum_sq += *wi * d * d;
+            mass += *wi;
             max = max.max(d);
         }
-        let rms = (sum_sq / n as f64).sqrt();
+        let rms = if mass > 0.0 {
+            (sum_sq / mass).sqrt()
+        } else {
+            f64::NAN
+        };
         if rms < best_rms {
             best_rms = rms;
             best_max = max;
@@ -1174,6 +1551,35 @@ mod coordinate_fidelity_tests {
         // Monotone decreasing in the statistic.
         assert!(watson_u2_pvalue(0.05) > watson_u2_pvalue(0.15));
         assert!(watson_u2_pvalue(0.15) > watson_u2_pvalue(0.30));
+    }
+
+    #[test]
+    fn weighted_watson_matches_unweighted_for_unit_support() {
+        let coords = Array1::from_vec(vec![0.0, 0.25, 0.5, 0.75]);
+        let support = SupportMeasure::from_weights(0, Array1::ones(coords.len())).unwrap();
+        let unweighted = coordinate_uniformity(coords.view(), &circle()).unwrap();
+        let weighted = coordinate_uniformity_weighted(coords.view(), &support, &circle()).unwrap();
+        assert!((weighted.statistic - unweighted.statistic).abs() < 1e-12);
+        assert!((weighted.p_value - unweighted.p_value).abs() < 1e-12);
+        assert_eq!(weighted.n, unweighted.n);
+    }
+
+    #[test]
+    fn support_metrics_are_shared_by_fidelity_occupancy_and_persistence_reads() {
+        let weights = Array1::from_vec(vec![1.0, 1.0, 0.5, 0.0]);
+        let support = SupportMeasure::from_weights(0, weights).unwrap();
+        let coords = Array1::from_vec(vec![0.0, 0.25, 0.5, 0.9]);
+        let fidelity = coordinate_uniformity_weighted(coords.view(), &support, &circle()).unwrap();
+        let (occupancy_rows, occupancy_weights) =
+            fold_for_occupancy_weighted(coords.view(), support.weights(), &circle()).unwrap();
+        let persistence_rows = support.positive_rows();
+
+        assert_eq!(fidelity.n, occupancy_rows.len());
+        assert_eq!(fidelity.n, occupancy_weights.len());
+        assert_eq!(fidelity.n, persistence_rows.len());
+        assert!((support.mass() - 2.5).abs() < 1e-12);
+        assert!((support.fisher_n() - 2.25).abs() < 1e-12);
+        assert!((support.ess() - (2.5_f64 * 2.5 / 2.25)).abs() < 1e-12);
     }
 
     /// CALIBRATION: uniform planted angles land in the null range (not flagged);
@@ -1450,8 +1856,14 @@ mod coordinate_fidelity_tests {
             angle_fidelity_verdict(Some(&reading)),
             AngleFidelityVerdict::ArcLengthHonest
         );
-        let (rms, max) =
-            raw_vs_arclength_defect(rows.view(), reading.coords_u_arc.view(), &circle(), true);
+        let unit = Array1::<f64>::ones(rows.len());
+        let (rms, max) = raw_vs_arclength_defect_weighted(
+            rows.view(),
+            reading.coords_u_arc.view(),
+            unit.view(),
+            &circle(),
+            true,
+        );
         assert!(
             rms < 1e-6 && max < 1e-6,
             "honest chart has ~zero raw defect: rms={rms} max={max}"
@@ -1524,8 +1936,14 @@ mod coordinate_fidelity_tests {
             angle_fidelity_verdict(Some(&reading)),
             AngleFidelityVerdict::RecoverableViaArcLength
         );
-        let (rms, _max) =
-            raw_vs_arclength_defect(rows.view(), reading.coords_u_arc.view(), &circle(), true);
+        let unit = Array1::<f64>::ones(rows.len());
+        let (rms, _max) = raw_vs_arclength_defect_weighted(
+            rows.view(),
+            reading.coords_u_arc.view(),
+            unit.view(),
+            &circle(),
+            true,
+        );
         assert!(
             rms > 1e-2,
             "u_arc must materially differ from raw t on a squished chart, got rms={rms}"
@@ -1609,13 +2027,27 @@ mod coordinate_fidelity_tests {
         let n = 80;
         let raw = Array1::linspace(0.0, 1.0 - 1.0 / n as f64, n);
         let u_arc = Array1::from_iter(raw.iter().map(|&t| (0.5 * t * t + 0.5 * t).rem_euclid(1.0)));
-        let (rms0, _) = raw_vs_arclength_defect(raw.view(), u_arc.view(), &circle(), true);
+        let unit = Array1::<f64>::ones(raw.len());
+        let (rms0, _) =
+            raw_vs_arclength_defect_weighted(raw.view(), u_arc.view(), unit.view(), &circle(), true);
         // Rotate the raw base point and reflect its orientation: both are the
         // circle's residual gauge, so the aligned defect must not change.
         let rotated = Array1::from_iter(raw.iter().map(|&t| (t + 0.31).rem_euclid(1.0)));
         let reflected = Array1::from_iter(raw.iter().map(|&t| (1.0 - t).rem_euclid(1.0)));
-        let (rms_rot, _) = raw_vs_arclength_defect(rotated.view(), u_arc.view(), &circle(), true);
-        let (rms_ref, _) = raw_vs_arclength_defect(reflected.view(), u_arc.view(), &circle(), true);
+        let (rms_rot, _) = raw_vs_arclength_defect_weighted(
+            rotated.view(),
+            u_arc.view(),
+            unit.view(),
+            &circle(),
+            true,
+        );
+        let (rms_ref, _) = raw_vs_arclength_defect_weighted(
+            reflected.view(),
+            u_arc.view(),
+            unit.view(),
+            &circle(),
+            true,
+        );
         assert!(
             (rms0 - rms_rot).abs() < 1e-9,
             "rotation must not change the defect: {rms0} vs {rms_rot}"

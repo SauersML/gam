@@ -308,6 +308,9 @@ pub struct SaeAtomTrustDiagnostics {
     pub tangent_condition_score: f64,
     pub coverage: f64,
     pub activation_frequency: f64,
+    pub support_mass: f64,
+    pub effective_n: f64,
+    pub support_ess: f64,
     pub untyped: bool,
     pub active_token_count: usize,
 }
@@ -359,14 +362,13 @@ pub fn dictionary_incoherence_report_with_dispersion(
     let mut per_atom_mean_activity = Vec::with_capacity(k_atoms);
     let mut per_atom_peak_activity = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
-        let mut sum = 0.0_f64;
-        let mut peak = 0.0_f64;
-        for row in 0..n {
-            let value = assignments[[row, atom_idx]];
-            sum += value;
-            peak = peak.max(value);
-        }
-        per_atom_mean_activity.push(if n > 0 { sum / n as f64 } else { 0.0 });
+        let support = SupportMeasure::from_assignment_matrix(assignments.view(), atom_idx)?;
+        let peak = support.weights().iter().copied().fold(0.0_f64, f64::max);
+        per_atom_mean_activity.push(if n > 0 {
+            support.mass() / n as f64
+        } else {
+            0.0
+        });
         per_atom_peak_activity.push(peak);
     }
     let mean_activity_floor = per_atom_mean_activity

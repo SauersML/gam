@@ -206,6 +206,9 @@ impl<'a> Certificate for CoordinateFidelityCertificate<'a> {
         let mut max_raw_max = f64::NEG_INFINITY;
         let mut max_uniformity = f64::NEG_INFINITY;
         let mut min_p = f64::INFINITY;
+        let mut support_masses = Vec::new();
+        let mut effective_ns = Vec::new();
+        let mut support_esses = Vec::new();
         let mut worst = "unavailable";
 
         for atom in self.atoms.iter().flatten() {
@@ -234,6 +237,9 @@ impl<'a> Certificate for CoordinateFidelityCertificate<'a> {
             if atom.uniformity_p_value.is_finite() {
                 min_p = min_p.min(atom.uniformity_p_value);
             }
+            support_masses.push(atom.support_mass);
+            effective_ns.push(atom.effective_n);
+            support_esses.push(atom.support_ess);
         }
 
         e.insert("atom_count", self.atoms.len().into());
@@ -246,6 +252,9 @@ impl<'a> Certificate for CoordinateFidelityCertificate<'a> {
         put_finite(&mut e, "max_raw_arclength_defect_max", max_raw_max);
         put_finite(&mut e, "max_uniformity_statistic", max_uniformity);
         put_finite(&mut e, "min_uniformity_p_value", min_p);
+        e.insert("support_mass", support_masses.into());
+        e.insert("effective_n", effective_ns.into());
+        e.insert("support_ess", support_esses.into());
         e
     }
 
