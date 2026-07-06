@@ -60,8 +60,20 @@ use super::*;
 /// top-`k` projection is then a no-op at the optimum.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
-    /// `active_atoms[row]` — sorted indices of active atoms for that row.
+    /// `active_atoms[row]` — sorted indices of active atoms for that row. Every
+    /// active atom carries a coord block; not every one carries a free logit slot
+    /// (see `logit_atoms`).
     pub active_atoms: Vec<Vec<usize>>,
+    /// `logit_atoms[row]` — the subset of `active_atoms[row]` (same ascending
+    /// order) carrying a FREE assignment-logit slot. Equals `active_atoms` for the
+    /// column-separable modes (IBP-MAP / JumpReLU). For SOFTMAX the reduced chart
+    /// has only `K−1` free logits: the reference atom `K−1` (pinned to zero, no
+    /// logit coordinate) is excluded. Since `K−1` is the largest atom and
+    /// `active_atoms` is sorted, the reference (when active) is always last, so
+    /// `logit_atoms[row] == active_atoms[row][..n_logit_active(row)]`. The compact
+    /// block is `[one slot per logit atom]` then `[one coord block per active
+    /// atom]`. (#Bug1)
+    pub logit_atoms: Vec<Vec<usize>>,
     /// For row `i`, active atom `active_atoms[i][j]` has its coord block
     /// starting at compressed position `coord_starts[i][j]`.
     pub coord_starts: Vec<Vec<usize>>,
@@ -263,12 +275,15 @@ impl SaeRowLayout {
     /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
     /// The active set is always non-empty (the single largest-magnitude atom is
     /// retained even if below cutoff) so every row keeps a valid block.
+    /// `reference_atom` is `Some(K−1)` for the reduced SOFTMAX chart (that atom
+    /// gets a coord block but no free logit slot) and `None` for IBP-MAP. (#Bug1)
     pub(crate) fn from_dense_weights(
         assignments: &[Array1<f64>],
         k_active_cap: usize,
         relative_cutoff: f64,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
+        reference_atom: Option<usize>,
     ) -> Self {
         let cap = k_active_cap.max(1);
         let mut per_row = Vec::with_capacity(assignments.len());
@@ -312,53 +327,96 @@ impl SaeRowLayout {
             active.sort_unstable();
             per_row.push(active);
         }
-        Self::from_active_atoms(per_row, coord_dims, coord_offsets_full)
+        Self::from_active_atoms_with_reference(
+            per_row,
+            coord_dims,
+            coord_offsets_full,
+            reference_atom,
+        )
     }
 
-    /// Build from explicit per-row active-atom index lists.
+    /// Build from explicit per-row active-atom index lists. Every active atom is
+    /// logit-bearing (the column-separable IBP-MAP / JumpReLU chart). For the
+    /// reduced SOFTMAX chart use [`Self::from_active_atoms_with_reference`].
     pub(crate) fn from_active_atoms(
         active_atoms: Vec<Vec<usize>>,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
+        Self::from_active_atoms_with_reference(active_atoms, coord_dims, coord_offsets_full, None)
+    }
+
+    /// Build honoring an optional `reference_atom` that carries a COORD block but
+    /// NO free logit slot (softmax's pinned reference `K−1`). When a row's active
+    /// set contains it, it is excluded from `logit_atoms` but kept in
+    /// `active_atoms`. Since the reference is the largest atom and `active_atoms`
+    /// is sorted, it is always the last active element, so the leading
+    /// `logit_atoms.len()` compact slots are the logit slots. (#Bug1)
+    pub(crate) fn from_active_atoms_with_reference(
+        active_atoms: Vec<Vec<usize>>,
+        coord_dims: Vec<usize>,
+        coord_offsets_full: Vec<usize>,
+        reference_atom: Option<usize>,
+    ) -> Self {
+        let mut logit_atoms_all = Vec::with_capacity(active_atoms.len());
         let mut coord_starts_all = Vec::with_capacity(active_atoms.len());
         for active in &active_atoms {
+            let logit_atoms: Vec<usize> = active
+                .iter()
+                .copied()
+                .filter(|&k| Some(k) != reference_atom)
+                .collect();
             let mut starts = Vec::with_capacity(active.len());
-            let mut cursor = active.len();
+            // Coord blocks start AFTER the logit slots.
+            let mut cursor = logit_atoms.len();
             for &k in active {
                 starts.push(cursor);
                 cursor += coord_dims[k];
             }
+            logit_atoms_all.push(logit_atoms);
             coord_starts_all.push(starts);
         }
         Self {
             active_atoms,
+            logit_atoms: logit_atoms_all,
             coord_starts: coord_starts_all,
             coord_offsets_full,
             coord_dims,
         }
     }
 
-    /// Per-row compressed dim.
+    /// Number of FREE logit slots in row `row`'s compact block (the leading
+    /// slots). Equals `active_atoms[row].len()` except on a softmax row whose
+    /// active set includes the reference atom, where it is one fewer. (#Bug1)
+    pub fn n_logit_active(&self, row: usize) -> usize {
+        self.logit_atoms[row].len()
+    }
+
+    /// Per-row compressed dim: free logit slots + coord blocks for every active
+    /// atom.
     pub fn row_q_active(&self, row: usize) -> usize {
         let active = &self.active_atoms[row];
         let coord_sum: usize = active.iter().map(|&k| self.coord_dims[k]).sum();
-        active.len() + coord_sum
+        self.logit_atoms[row].len() + coord_sum
     }
 
     /// Expand a compact `delta_t` row slice back into full-q, zeros for inactive.
+    /// The softmax reference atom has no logit slot (its logit position does not
+    /// exist in the reduced chart), so only its coord block is written. (#Bug1)
     pub fn expand_row(&self, row: usize, delta_t_row: &[f64], out: &mut [f64]) {
         for v in out.iter_mut() {
             *v = 0.0;
         }
+        for (j, &k) in self.logit_atoms[row].iter().enumerate() {
+            out[k] = delta_t_row[j];
+        }
         let active = &self.active_atoms[row];
         let starts = &self.coord_starts[row];
-        for (j, &k) in active.iter().enumerate() {
-            out[k] = delta_t_row[j];
+        for (pos, &k) in active.iter().enumerate() {
             let d = self.coord_dims[k];
             let full_off = self.coord_offsets_full[k];
             for axis in 0..d {
-                out[full_off + axis] = delta_t_row[starts[j] + axis];
+                out[full_off + axis] = delta_t_row[starts[pos] + axis];
             }
         }
     }

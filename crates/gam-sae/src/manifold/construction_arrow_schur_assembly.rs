@@ -462,6 +462,9 @@ impl SaeManifoldTerm {
                             relative_cutoff,
                             coord_dims.clone(),
                             self.assignment.coord_offsets(),
+                            // Softmax reduced chart: atom K−1 is the pinned reference
+                            // (coord block but no free logit slot). (#Bug1)
+                            Some(k_atoms - 1),
                         ))
                     }
                     None => None,
@@ -491,6 +494,8 @@ impl SaeManifoldTerm {
                                 relative_cutoff,
                                 coord_dims.clone(),
                                 self.assignment.coord_offsets(),
+                                // IBP-MAP is column-separable: no reference atom.
+                                None,
                             ))
                         }
                         None => None,

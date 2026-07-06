@@ -4033,7 +4033,7 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
         Array1::from_vec(vec![0.001, 0.002, 0.0005]),
     ];
     let layout =
-        SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full);
+        SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full, None);
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
     assert_eq!(layout.active_atoms[1], vec![0, 1]);
     // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
@@ -4092,6 +4092,7 @@ pub(crate) fn from_dense_weights_large_k_support_proposal_1450() {
         1e-3,
         vec![d; k_atoms],
         coord_offsets,
+        None,
     );
     for row in 0..n {
         assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
@@ -4135,6 +4136,7 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
         relative_cutoff,
         coord_dims,
         coord_offsets_full,
+        None,
     );
     for row in 0..n {
         // Exact support recovery: the proposal must return exactly the planted
