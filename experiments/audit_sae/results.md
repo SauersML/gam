@@ -30,12 +30,8 @@ cargo check -p gam-sae
 Result: exit code 0. Last lines captured in `/tmp/gam_cx_audit_check.log`:
 
 ```text
-Some errors have detailed explanations: E0432, E0463.
-For more information about an error, try `rustc --explain E0432`.
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.65s
 ```
-
-The two diagnostics are stale/unrelated `gam-solve` messages emitted before Cargo reported `Finished`; the command exit status was 0.
 
 ## Gemma Scope 2 audit
 
