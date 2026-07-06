@@ -38,7 +38,8 @@
 
 use super::scoring::TileScorer;
 use super::update::{
-    DEAD_DENOM, DecoderNormalEq, route_and_code_all, seed_decoder, solve_decoder, unit_norm_rows,
+    DEAD_DENOM, DecoderNormalEq, DecoderSolveStats, route_and_code_all, seed_decoder,
+    solve_decoder_with_routability_gate, unit_norm_rows,
 };
 use super::{ScoreRouteStats, SparseDictConfig};
 use ndarray::{Array2, ArrayView2};
@@ -77,6 +78,8 @@ pub struct EpochStats {
     pub converged: bool,
     /// Epochs completed so far (this one inclusive).
     pub epoch: usize,
+    /// Decoder refresh percolation/CG certificate for this epoch.
+    pub decoder_solve_stats: DecoderSolveStats,
 }
 
 /// One candidate row for dead-atom revival: its residual vector (under the
@@ -203,6 +206,7 @@ pub struct SparseDictStreamState {
     last_revived: usize,
     converged: bool,
     score_route_stats: ScoreRouteStats,
+    last_decoder_solve_stats: DecoderSolveStats,
 }
 
 impl SparseDictStreamState {
@@ -251,6 +255,7 @@ impl SparseDictStreamState {
             last_revived: 0,
             converged: false,
             score_route_stats: ScoreRouteStats::default(),
+            last_decoder_solve_stats: DecoderSolveStats::default(),
         })
     }
 
@@ -377,13 +382,16 @@ impl SparseDictStreamState {
             1.0 - self.rss / tss
         };
 
-        // (c) exact decoder refresh from this epoch's normal equations, then (d)
-        // unit-norm. Dead atoms keep their current direction inside solve_decoder.
-        solve_decoder(
+        // (c) routability-gated decoder refresh from accumulated normal equations,
+        // then (d) unit-norm. Deferred atoms keep their evidence streaming.
+        let sigma = (self.rss / (self.row_count * self.p) as f64).sqrt();
+        let (decoder_solve_stats, gate) = solve_decoder_with_routability_gate(
             &mut self.decoder,
             &self.eq,
             self.config.decoder_ridge as f64,
+            sigma,
         );
+        self.eq.clear_refreshed_atoms(&gate);
         unit_norm_rows(&mut self.decoder);
 
         // (e) dead-atom revival onto worst-reconstructed residual rows (never PCs).
@@ -405,6 +413,7 @@ impl SparseDictStreamState {
         self.last_revived = revived;
         self.converged = converged;
         self.epochs_run += 1;
+        self.last_decoder_solve_stats = decoder_solve_stats;
         let epoch = self.epochs_run;
 
         self.reset_epoch();
@@ -415,6 +424,7 @@ impl SparseDictStreamState {
             dead,
             converged,
             epoch,
+            decoder_solve_stats,
         })
     }
 
@@ -454,8 +464,6 @@ impl SparseDictStreamState {
     }
 
     fn reset_epoch(&mut self) {
-        let k = self.decoder.nrows();
-        self.eq = DecoderNormalEq::zeros(k, self.p);
         for a in self.alive.iter_mut() {
             *a = false;
         }
@@ -481,6 +489,7 @@ impl SparseDictStreamState {
             explained_variance: self.last_ev,
             converged: self.converged,
             score_route_stats: self.score_route_stats,
+            decoder_solve_stats: self.last_decoder_solve_stats,
         }
     }
 
@@ -518,6 +527,8 @@ pub struct SparseDictArtifact {
     pub converged: bool,
     /// Aggregate CPU/GPU scoring counters across streamed shards.
     pub score_route_stats: ScoreRouteStats,
+    /// Decoder refresh percolation/CG certificate from the final epoch.
+    pub decoder_solve_stats: DecoderSolveStats,
 }
 
 fn validate_config(config: &SparseDictConfig) -> Result<(), String> {
@@ -801,6 +812,47 @@ mod stream_tests {
         assert!(
             post_cos_e2 > 0.999,
             "a revived atom must equal e2, got |cos|={post_cos_e2}"
+        );
+    }
+
+    #[test]
+    fn epoch_report_carries_percolation_and_cg_kappa() {
+        let k = 12usize;
+        let p = 12usize;
+        let mut seed = Array2::<f32>::zeros((k, p));
+        for i in 0..k {
+            seed[[i, i]] = 1.0;
+        }
+        let mut shard = Array2::<f32>::zeros((k, p));
+        for i in 0..k {
+            shard[[i, i]] = 1.0;
+            shard[[i, (i + 1) % k]] = 0.8;
+        }
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active: 2,
+            minibatch: k,
+            max_epochs: 1,
+            score_tile: k,
+            code_ridge: 1.0e-8,
+            decoder_ridge: 1.0e-6,
+            tolerance: 1.0e-12,
+            score_mode: gam_gpu::GpuMode::Off,
+        };
+        let mut state = SparseDictStreamState::new(seed.view(), &config).expect("fit_begin");
+        state.partial_fit(shard.view()).expect("partial_fit");
+        let stats = state.end_epoch().expect("end_epoch");
+        assert!(
+            stats.decoder_solve_stats.mean_cofiring_degree > 0.0,
+            "epoch report must carry measured co-firing degree"
+        );
+        assert!(
+            stats.decoder_solve_stats.component_count > 0,
+            "epoch report must carry component count"
+        );
+        assert!(
+            stats.decoder_solve_stats.cg_kappa_hat.is_some(),
+            "connected active graph must carry CG Lanczos κ̂"
         );
     }
 }

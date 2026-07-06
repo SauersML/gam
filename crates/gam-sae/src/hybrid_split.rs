@@ -319,6 +319,10 @@ pub struct AtomHybridVerdict {
     /// `curved_ev / topm_linear_ev`. Near 1 means the one-chart fit is at its
     /// information ceiling; well below 1 means solver/convergence headroom.
     pub curved_vs_envelope_ratio: Option<f64>,
+    /// Chart efficiency `η = EV_curved / EV_lin(top-M)`. This is the same value
+    /// as [`Self::curved_vs_envelope_ratio`] under the theorem-shaped name used
+    /// by the K=1 ceiling contract.
+    pub chart_efficiency_eta: Option<f64>,
     /// The fitted straight sub-model for this slot, present iff the verdict
     /// selected LINEAR (`kept_curved == false`). The collapsed reconstruction
     /// substitutes this for the atom's curved decoded image, making the verdict
@@ -1488,6 +1492,7 @@ where
             curved_ev: envelope.curved_ev,
             topm_linear_ev: envelope.topm_linear_ev,
             curved_vs_envelope_ratio: envelope.curved_vs_envelope_ratio,
+            chart_efficiency_eta: envelope.curved_vs_envelope_ratio,
             // Carry the straight sub-model only when the verdict collapses this
             // slot to linear — the curved slots keep their fitted image.
             linear_image: if kept_curved {

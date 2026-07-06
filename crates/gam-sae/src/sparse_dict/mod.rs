@@ -76,6 +76,7 @@ pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
+pub use update::DecoderSolveStats;
 
 use ndarray::{Array2, ArrayView2};
 
@@ -167,6 +168,8 @@ pub struct SparseDictFit {
     pub active: usize,
     /// Aggregate CPU/GPU scoring counters over every route pass in the fit.
     pub score_route_stats: ScoreRouteStats,
+    /// Decoder refresh percolation/CG certificate from the final MOD update.
+    pub decoder_solve_stats: DecoderSolveStats,
 }
 
 impl SparseDictFit {

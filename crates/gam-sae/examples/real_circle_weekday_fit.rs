@@ -486,22 +486,22 @@ fn write_svg_chart(
         "#2f6fbb", "#ca4d36", "#2f8f4e", "#8b55b5", "#b98222", "#168a92", "#6f6f6f",
     ];
     let mut svg = String::new();
-    svg.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430">"#);
-    svg.push_str(r#"<rect width="960" height="430" fill="#ffffff"/>"#);
-    svg.push_str(r#"<text x="40" y="32" font-family="sans-serif" font-size="18" fill="#1f2933">Qwen weekday circle: fitted coordinate recovery</text>"#);
-    svg.push_str(r#"<line x1="70" y1="360" x2="450" y2="360" stroke="#20242a" stroke-width="1"/>"#);
-    svg.push_str(r#"<line x1="70" y1="70" x2="70" y2="360" stroke="#20242a" stroke-width="1"/>"#);
-    svg.push_str(r#"<text x="185" y="405" font-family="sans-serif" font-size="13" fill="#20242a">true weekday index</text>"#);
-    svg.push_str(r#"<text x="14" y="210" transform="rotate(-90 14 210)" font-family="sans-serif" font-size="13" fill="#20242a">aligned fitted t × 7</text>"#);
+    svg.push_str(r##"<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430">"##);
+    svg.push_str(r##"<rect width="960" height="430" fill="#ffffff"/>"##);
+    svg.push_str(r##"<text x="40" y="32" font-family="sans-serif" font-size="18" fill="#1f2933">Qwen weekday circle: fitted coordinate recovery</text>"##);
+    svg.push_str(r##"<line x1="70" y1="360" x2="450" y2="360" stroke="#20242a" stroke-width="1"/>"##);
+    svg.push_str(r##"<line x1="70" y1="70" x2="70" y2="360" stroke="#20242a" stroke-width="1"/>"##);
+    svg.push_str(r##"<text x="185" y="405" font-family="sans-serif" font-size="13" fill="#20242a">true weekday index</text>"##);
+    svg.push_str(r##"<text x="14" y="210" transform="rotate(-90 14 210)" font-family="sans-serif" font-size="13" fill="#20242a">aligned fitted t × 7</text>"##);
     for tick in 0..=6 {
         let x = 70.0 + tick as f64 * (380.0 / 6.0);
         let y = 360.0 - tick as f64 * (290.0 / 6.0);
         svg.push_str(&format!(
-            r#"<line x1="{x:.1}" y1="360" x2="{x:.1}" y2="365" stroke="#20242a"/><text x="{:.1}" y="382" font-family="sans-serif" font-size="11" fill="#20242a">{tick}</text>"#,
+            r##"<line x1="{x:.1}" y1="360" x2="{x:.1}" y2="365" stroke="#20242a"/><text x="{:.1}" y="382" font-family="sans-serif" font-size="11" fill="#20242a">{tick}</text>"##,
             x - 3.0
         ));
         svg.push_str(&format!(
-            r#"<line x1="65" y1="{y:.1}" x2="70" y2="{y:.1}" stroke="#20242a"/><text x="45" y="{:.1}" font-family="sans-serif" font-size="11" fill="#20242a">{tick}</text>"#,
+            r##"<line x1="65" y1="{y:.1}" x2="70" y2="{y:.1}" stroke="#20242a"/><text x="45" y="{:.1}" font-family="sans-serif" font-size="11" fill="#20242a">{tick}</text>"##,
             y + 4.0
         ));
     }
@@ -510,25 +510,25 @@ fn write_svg_chart(
         let x = 70.0 + labels[row] as f64 * (380.0 / 6.0) + jitter;
         let y = 360.0 - (aligned_t[row] * 7.0) * (290.0 / 6.0);
         svg.push_str(&format!(
-            r#"<circle cx="{x:.1}" cy="{y:.1}" r="4.0" fill="{}" fill-opacity="0.82"/>"#,
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="4.0" fill="{}" fill-opacity="0.82"/>"##,
             colors[labels[row]]
         ));
     }
-    svg.push_str(r#"<circle cx="705" cy="215" r="125" fill="none" stroke="#20242a" stroke-width="1"/>"#);
-    svg.push_str(r#"<text x="625" y="388" font-family="sans-serif" font-size="13" fill="#20242a">recovered circle by raw t</text>"#);
+    svg.push_str(r##"<circle cx="705" cy="215" r="125" fill="none" stroke="#20242a" stroke-width="1"/>"##);
+    svg.push_str(r##"<text x="625" y="388" font-family="sans-serif" font-size="13" fill="#20242a">recovered circle by raw t</text>"##);
     for row in 0..labels.len() {
         let angle = TAU * raw_t[row];
         let x = 705.0 + 125.0 * angle.cos();
         let y = 215.0 - 125.0 * angle.sin();
         svg.push_str(&format!(
-            r#"<circle cx="{x:.1}" cy="{y:.1}" r="4.0" fill="{}" fill-opacity="0.82"/>"#,
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="4.0" fill="{}" fill-opacity="0.82"/>"##,
             colors[labels[row]]
         ));
     }
     for (idx, name) in WEEKDAYS.iter().enumerate() {
         let y = 62 + idx * 20;
         svg.push_str(&format!(
-            r#"<circle cx="505" cy="{y}" r="5" fill="{}"/><text x="518" y="{}" font-family="sans-serif" font-size="12" fill="#20242a">{}</text>"#,
+            r##"<circle cx="505" cy="{y}" r="5" fill="{}"/><text x="518" y="{}" font-family="sans-serif" font-size="12" fill="#20242a">{}</text>"##,
             colors[idx],
             y + 4,
             name

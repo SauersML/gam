@@ -3356,33 +3356,47 @@ impl ArrowFactorCache {
             .apply_row_transpose_accumulate(row, v, out, di, self.k, fallback_op)
     }
 
-    /// Arrow log-determinant
+    /// Undamped arrow log-determinant
     /// `log|H| = Σ_i log|H_{t_i t_i}| + log|Schur_β|`
-    /// using the cached (damped) factors.
+    /// using the evidence factors.
     ///
     /// Returns `(log_det_tt_sum, log_det_schur)` so the caller can decide
     /// what to do with the Schur piece (e.g. REML evidence wants both;
     /// some diagnostics want only the per-row sum). `None` for the Schur
-    /// piece signals that the cache was produced by an InexactPCG solve
-    /// and never formed/factored the dense `K × K` reduced system.
+    /// piece means either `k == 0` (no shared β block; the Woodbury correction
+    /// is folded into `log_det_tt_sum`) or an InexactPCG solve that never
+    /// formed/factored the dense `K × K` reduced system.
     ///
-    /// The log-determinant of a Cholesky factor `L` of `M` is
-    /// `2 Σ log L_ii`.
+    /// The per-row term uses [`Self::undamped_factor`], matching
+    /// `arrow_log_det_from_cache`, `apply_cached_arrow_hessian`, and the
+    /// selected-inverse traces. A nonzero ridge means the cached Schur factor is
+    /// a damped solve artifact, not an evidence factor.
     pub fn arrow_log_det(&self) -> (f64, Option<f64>) {
+        assert!(
+            self.ridge_t == 0.0 && self.ridge_beta == 0.0,
+            "ArrowFactorCache::arrow_log_det requires an undamped evidence cache"
+        );
         let mut log_det_tt = 0.0_f64;
-        for l in self.htt_factors.iter() {
+        for l in self.undamped_factors_iter() {
             for i in 0..l.nrows() {
                 log_det_tt += l[[i, i]].ln();
             }
         }
         log_det_tt *= 2.0;
-        let log_det_schur = self.schur_factor.as_ref().map(|l| {
-            let mut s = 0.0_f64;
-            for i in 0..l.nrows() {
-                s += l[[i, i]].ln();
+        let log_det_schur = match self.schur_factor.as_ref() {
+            Some(l) => {
+                let mut s = 0.0_f64;
+                for i in 0..l.nrows() {
+                    s += l[[i, i]].ln();
+                }
+                Some(2.0 * s + self.cross_row_woodbury_log_det())
             }
-            2.0 * s + self.cross_row_woodbury_log_det()
-        });
+            None if self.k == 0 => {
+                log_det_tt += self.cross_row_woodbury_log_det();
+                None
+            }
+            None => None,
+        };
         (log_det_tt, log_det_schur)
     }
 

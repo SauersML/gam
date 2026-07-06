@@ -1350,6 +1350,45 @@ impl SaeManifoldTerm {
         })
     }
 
+    pub(crate) fn quotient_gradient_norm_from_system(
+        &self,
+        sys: &ArrowSchurSystem,
+        raw_grad_norm_sq: f64,
+        penalized_gram_scale: &[f64],
+    ) -> f64 {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let dense_len = n.saturating_mul(q);
+        let mut grad_ext_coord = Array1::<f64>::zeros(dense_len);
+        let mut dense_layout_ok = sys.rows.len() == n && sys.row_offsets.len() == n + 1;
+        if dense_layout_ok {
+            for (row_idx, row) in sys.rows.iter().enumerate() {
+                let base = sys.row_offsets[row_idx];
+                let di = sys.row_dims[row_idx];
+                if base + di > dense_len || row.gt.len() < di {
+                    dense_layout_ok = false;
+                    break;
+                }
+                for axis in 0..di {
+                    grad_ext_coord[base + axis] = row.gt[axis];
+                }
+            }
+        }
+        let raw_grad_norm = raw_grad_norm_sq.sqrt();
+        if dense_layout_ok {
+            self.quotient_gradient_norm_sq(
+                grad_ext_coord.view(),
+                sys.gb.view(),
+                raw_grad_norm_sq,
+                penalized_gram_scale,
+            )
+            .map(|v| v.sqrt())
+            .unwrap_or(raw_grad_norm)
+        } else {
+            raw_grad_norm
+        }
+    }
+
     pub(crate) fn dense_step_gauge_vectors(&self) -> Result<Vec<Array1<f64>>, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
@@ -4075,14 +4114,9 @@ impl SaeManifoldTerm {
             // factor-failure error variants so legitimate, non-recoverable
             // errors (PCG divergence with no factor failure, adaptive-step
             // exhaustion, …) still surface immediately.
-            let (delta_ext_coord, delta_beta, _diag) =
+            let (mut delta_ext_coord, mut delta_beta, _diag) =
                 solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &solve_options)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            let directional_decrease = sae_manifold_newton_directional_decrease(
-                &sys,
-                delta_ext_coord.view(),
-                delta_beta.view(),
-            );
             // Relative-scale floor on the directional decrease. When the
             // gradient is nearly orthogonal to the Newton step (ill-conditioned
             // near-convergence), `directional_decrease` collapses to O(machine
@@ -4107,19 +4141,16 @@ impl SaeManifoldTerm {
             let iterate_scale = self.inner_iterate_scale();
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
-            // Harmonize convergence gate with reml_criterion (see
-            // converge_inner_for_undamped_logdet): accept on raw/quotient grad
-            // OR quotient step. Unconditional grad check ensures a point that
-            // makes run_joint_fit return "converged" will also pass the first
-            // undamped stationarity gate in the REML evidence path (fixes cases
-            // where plain joint succeeds but reml_criterion refuses inside
-            // cotrained probes). Good warm-starts make this faster/tighter.
-            if grad_norm <= grad_tolerance {
+            let lambda_smooth = rho.lambda_smooth_vec();
+            let quotient_grad_norm =
+                self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
+            // Stop only on stationarity in the raw chart or on the identified
+            // quotient. A tiny quotient Newton step is a globalization diagnostic,
+            // not a KKT certificate: on K=1 near-isotropic clouds it can be tiny
+            // along the chart gauge while the outer residual remains large.
+            if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
                 break;
             }
-            // (Quotient-grad uses dense gt layout from sys; here we conservatively
-            // keep raw grad for the fast pre-step gate. The step gate below uses
-            // the computed delta's quotient; reml will recheck with undamped.)
             let mut step_norm_sq = 0.0;
             for &v in delta_ext_coord.iter() {
                 step_norm_sq += v * v;
@@ -4127,7 +4158,7 @@ impl SaeManifoldTerm {
             for &v in delta_beta.iter() {
                 step_norm_sq += v * v;
             }
-            // #1051 — gauge/null-aware stationarity. ...
+            let mut quotient_step_norm = step_norm_sq.sqrt();
             if delta_ext_coord.len() == self.n_obs() * self.assignment.row_block_dim()
                 && delta_beta.len() == self.beta_dim()
             {
@@ -4135,12 +4166,36 @@ impl SaeManifoldTerm {
                     delta_ext_coord.view(),
                     delta_beta.view(),
                     step_norm_sq,
-                    &rho.lambda_smooth_vec(),
+                    &lambda_smooth,
                 )?;
-                if quotient_step_norm_sq.sqrt() <= step_tolerance {
-                    break;
+                quotient_step_norm = quotient_step_norm_sq.sqrt();
+                let trust_radius = solve_options.trust_region.radius;
+                if quotient_step_norm > trust_radius
+                    && trust_radius.is_finite()
+                    && trust_radius > 0.0
+                {
+                    let scale = trust_radius / quotient_step_norm;
+                    delta_ext_coord.mapv_inplace(|v| v * scale);
+                    delta_beta.mapv_inplace(|v| v * scale);
+                    step_norm_sq *= scale * scale;
+                    quotient_step_norm = trust_radius;
                 }
             }
+            if quotient_step_norm <= step_tolerance {
+                log::debug!(
+                    "SAE inner quotient step {:.3e} <= tol {:.3e} with non-stationary gradient \
+                     raw={:.3e}, quotient={:.3e}; continuing after quotient trust-region gate",
+                    quotient_step_norm,
+                    step_tolerance,
+                    grad_norm,
+                    quotient_grad_norm
+                );
+            }
+            let directional_decrease = sae_manifold_newton_directional_decrease(
+                &sys,
+                delta_ext_coord.view(),
+                delta_beta.view(),
+            );
             let directional_decrease_floor = SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR
                 * grad_norm_sq.sqrt()
                 * step_norm_sq.sqrt();

@@ -18,16 +18,17 @@ The facade is thin over Rust. If `codes` are supplied, Rust audits those frozen 
 
 ## MSI verification
 
-Required crate-local gate:
+Required crate-local gate, captured by `experiments/audit_sae/verification_gate.sh`:
 
 ```text
 cd <DATA_ROOT>/gam_cx_audit
 . $HOME/.config/gam-build-env
-export CARGO_TARGET_DIR=<DATA_ROOT>/scratch/target_shared
-cargo check -p gam-sae
+cargo check -p gam-sae --target-dir <DATA_ROOT>/scratch/target_shared
 ```
 
-Result: exit code 0. Last lines captured in `/tmp/gam_cx_audit_check.log`:
+Result: exit code 0. The gate harness captures stdout and stderr separately and refuses to write the `results.md` verdict unless both captured streams are free of Rust compiler diagnostics.
+
+Certified gate stderr excerpt:
 
 ```text
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.65s
@@ -40,5 +41,5 @@ Blocked before producing audit numbers.
 What blocked it:
 
 - The available MSI gamfit virtualenvs expose neither `gamfit.audit_sae` nor the Rust `audit_sae` pyfunction.
-- Building the updated `gam-pyffi` extension on MSI is the right path, but `cargo check -p gam-pyffi` enters the root `gam` build script and spent more than 25 minutes in `build-script-build` with no log progress. I stopped that extra check to avoid leaving a runaway build. The required `gam-sae` check above was already green.
+- No extension-build output is part of this verification artifact. The only certified gate here is the crate-local `gam-sae` check captured above.
 - Because the updated Python extension was not available, I did not run the Gemma Scope 2 audit and did not fabricate dual-certified atom counts, dark-matter fractions, or Betti distributions.
