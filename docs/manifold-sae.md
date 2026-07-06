@@ -100,10 +100,16 @@ core), penalized by the thin-plate roughness Gram. A `euclidean`-vs-`duchon`
 comparison therefore differs in *both* the basis family and the penalty, not the
 penalty alone. `poincare`
 likewise reuses the Euclidean tangent chart and monomial decoder but penalizes
-roughness in hyperbolic arc length via the Poincaré conformal factor, so it
-differs from the flat patch only where feature density grows toward the ball
-boundary (tree-/hierarchy-like structure). String matching is
-case-insensitive and treats `-` and `_` interchangeably.
+roughness in the *hyperbolic* metric: its effective smoothness Gram is the
+conformal Dirichlet energy `∫ gᵃᵇ ∂_a f ∂_b f dμ_g` of the Poincaré ball pulled
+back to the tangent chart (`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`
+at curvature `c = −1`, the single source of truth for the hyperbolic metric),
+wired into the atom's `refresh_intrinsic_smooth_penalty`. It therefore differs
+from the flat patch wherever the conformal factor departs from 1 — growing toward
+the ball boundary (tree-/hierarchy-like structure); for `d = 1` the tangent chart
+is intrinsically flat but runs at half arc length, so the Gram is exactly `½` the
+flat first-jet Dirichlet Gram. String matching is case-insensitive and treats `-`
+and `_` interchangeably.
 
 A `d_atom=1` linear atom is the true rank-1 **line** primitive. A
 `d_atom=1` Euclidean atom is a stronger polynomial patch, not the pure-linear
@@ -178,14 +184,26 @@ smoothing weights selected by REML. Each piece plays a distinct role
 - **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
-  near arc length. It is not required for topology comparison: the Rust core
-  reparameterizes decoder roughness by the pulled-back metric, so
-  `fit.penalized_loss_score` is gauge-invariant under reparameterizing `t`
-  even with `isometry_weight=0.0`. Set the weight to `0.0` to disable the gauge.
+  near arc length. It is not required for topology comparison: the smoothness
+  penalty is measured on the decoded FUNCTION's intrinsic geometry (below), not
+  on the raw coordinate, so `fit.penalized_loss_score` is gauge-invariant under
+  reparameterizing `t` even with `isometry_weight=0.0`. Set the weight to `0.0`
+  to disable the gauge.
 
 - **Smoothness** (`smoothness_weight=1.0`). Roughness penalty on each atom's
-  decoded curve, a fixed finite-/cyclic-difference Gram in the latent
-  coordinate.
+  decoded curve/surface, measured intrinsically so it is invariant to
+  reparameterizing the latent coordinate `t` (SPEC: penalise the final function,
+  not the chart). For a non-Poincaré atom the effective Gram is the total squared
+  SECOND FUNDAMENTAL FORM of the decoded embedding `γ(t) = BᵀΦ(t)`,
+  `∫_M ‖II‖²_g dμ`, at every latent dim `d ≥ 1`; for `d = 1` this is exactly the
+  reparameterization-invariant bending `∫ κ² ds = Σ_i ‖P_N γ''(t_i)‖²/‖γ'(t_i)‖³`
+  (the NORMAL-projected acceleration — a straight segment traced as `γ(t)=t²e₁`
+  scores zero, whereas a raw coordinate second-difference Gram would charge
+  `γ''=2e₁`). Poincaré atoms use the hyperbolic conformal Dirichlet Gram instead
+  (see the topology table). A fixed finite-/cyclic-difference Gram in the latent
+  coordinate is the *base operator*; the intrinsic (function-space) Gram is
+  refreshed from it between assemblies via the current decoder pullback
+  (lagged-diffusivity), so the converged penalty is the true intrinsic roughness.
 
 - **Coordinate-magnitude penalty** (`gate_sparsity="scad"` default; `"l1"` /
   `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**
