@@ -11,6 +11,141 @@ use gam_terms::analytic_penalties::{
 };
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 
+/// Shared per-atom row support measure.
+///
+/// The weights are the fitted assignment masses `w_i = a_{ik}` for one atom:
+/// non-negative, unnormalised, and on the same scale as the reconstruction gate.
+/// Diagnostics should read atom occupancy through this object instead of
+/// re-deriving hard owner sets or local soft-mass sums. Three sizes are exposed
+/// because they answer different questions:
+///
+/// * [`Self::mass`] is the soft occupancy `Σ_i w_i`.
+/// * [`Self::fisher_n`] is the reconstruction-information count `Σ_i w_i²`,
+///   matching the rank-charge Gram `Φᵀdiag(w²)Φ`.
+/// * [`Self::ess`] is the scale-invariant Kish effective support
+///   `(Σ_i w_i)² / Σ_i w_i²`, the number of equally weighted rows represented by
+///   the support distribution.
+#[derive(Clone, Debug)]
+pub struct SupportMeasure {
+    atom_idx: usize,
+    weights: Array1<f64>,
+    mass: f64,
+    fisher_n: f64,
+}
+
+impl SupportMeasure {
+    #[must_use = "support construction error must be handled"]
+    pub fn from_assignment(assignment: &SaeAssignment, atom_idx: usize) -> Result<Self, String> {
+        let assignments = assignment.assignments();
+        Self::from_assignment_matrix(assignments.view(), atom_idx)
+    }
+
+    #[must_use = "support construction error must be handled"]
+    pub fn from_assignment_matrix(
+        assignments: ArrayView2<'_, f64>,
+        atom_idx: usize,
+    ) -> Result<Self, String> {
+        let (_n, k) = assignments.dim();
+        if atom_idx >= k {
+            return Err(format!(
+                "SupportMeasure::from_assignment_matrix: atom {atom_idx} out of range K={k}"
+            ));
+        }
+        let weights = assignments.column(atom_idx).to_owned();
+        Self::from_weights(atom_idx, weights)
+    }
+
+    #[must_use = "support construction error must be handled"]
+    pub fn from_argmax_owners(
+        owners: &[usize],
+        atom_idx: usize,
+        k_atoms: usize,
+    ) -> Result<Self, String> {
+        if atom_idx >= k_atoms {
+            return Err(format!(
+                "SupportMeasure::from_argmax_owners: atom {atom_idx} out of range K={k_atoms}"
+            ));
+        }
+        let mut weights = Array1::<f64>::zeros(owners.len());
+        for (row, &owner) in owners.iter().enumerate() {
+            if owner >= k_atoms {
+                return Err(format!(
+                    "SupportMeasure::from_argmax_owners: row {row} owner {owner} out of range K={k_atoms}"
+                ));
+            }
+            if owner == atom_idx {
+                weights[row] = 1.0;
+            }
+        }
+        Self::from_weights(atom_idx, weights)
+    }
+
+    #[must_use = "support construction error must be handled"]
+    pub fn from_weights(atom_idx: usize, weights: Array1<f64>) -> Result<Self, String> {
+        let mut mass = 0.0_f64;
+        let mut fisher_n = 0.0_f64;
+        for (row, &w) in weights.iter().enumerate() {
+            if !(w.is_finite() && w >= 0.0) {
+                return Err(format!(
+                    "SupportMeasure::from_weights: row {row} has invalid support weight {w}"
+                ));
+            }
+            mass += w;
+            fisher_n += w * w;
+        }
+        Ok(Self {
+            atom_idx,
+            weights,
+            mass,
+            fisher_n,
+        })
+    }
+
+    pub fn atom_idx(&self) -> usize {
+        self.atom_idx
+    }
+
+    pub fn weights(&self) -> ArrayView1<'_, f64> {
+        self.weights.view()
+    }
+
+    pub fn len(&self) -> usize {
+        self.weights.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.weights.is_empty()
+    }
+
+    pub fn mass(&self) -> f64 {
+        self.mass
+    }
+
+    pub fn fisher_n(&self) -> f64 {
+        self.fisher_n
+    }
+
+    pub fn ess(&self) -> f64 {
+        if self.fisher_n > 0.0 {
+            (self.mass * self.mass) / self.fisher_n
+        } else {
+            0.0
+        }
+    }
+
+    pub fn weight(&self, row: usize) -> f64 {
+        self.weights[row]
+    }
+
+    pub fn positive_rows(&self) -> Vec<usize> {
+        self.weights
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &w)| if w > 0.0 { Some(row) } else { None })
+            .collect()
+    }
+}
+
 /// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
 /// update, in units of the gate temperature τ (the gate's natural length
 /// scale — every assignment mode reads logits through `σ(·/τ)` /
@@ -2103,6 +2238,43 @@ mod frozen_routing_1033_tests {
             a.freeze_routing_from_current_logits().is_err(),
             "frozen routing under Softmax must be rejected (simplex entropy-majorizer coupling)"
         );
+    }
+}
+
+#[cfg(test)]
+mod support_measure_tests {
+    use super::*;
+
+    #[test]
+    fn support_measure_matches_hard_and_diffuse_semantics() {
+        let hard_weights = Array1::from_vec(vec![1.0, 1.0, 0.0, 1.0, 0.0]);
+        let hard = SupportMeasure::from_weights(0, hard_weights).unwrap();
+        assert_eq!(hard.mass(), 3.0);
+        assert_eq!(hard.fisher_n(), 3.0);
+        assert_eq!(hard.ess(), 3.0);
+        assert_eq!(hard.positive_rows(), vec![0usize, 1, 3]);
+        let from_owners = SupportMeasure::from_argmax_owners(&[0, 0, 1, 0, 1], 0, 2).unwrap();
+        assert_eq!(from_owners.mass(), hard.mass());
+        assert_eq!(from_owners.fisher_n(), hard.fisher_n());
+        assert_eq!(from_owners.ess(), hard.ess());
+        assert_eq!(from_owners.positive_rows(), hard.positive_rows());
+
+        let diffuse_weights = Array1::from_vec(vec![0.5, 0.5, 0.5, 0.5]);
+        let diffuse = SupportMeasure::from_weights(1, diffuse_weights).unwrap();
+        assert_eq!(diffuse.mass(), 2.0);
+        assert_eq!(diffuse.fisher_n(), 1.0);
+        assert_eq!(diffuse.ess(), 4.0);
+    }
+
+    #[test]
+    fn support_measure_reads_assignment_column() {
+        let assignments =
+            Array2::from_shape_vec((3, 2), vec![0.8, 0.2, 0.4, 0.6, 0.0, 1.0]).unwrap();
+        let support = SupportMeasure::from_assignment_matrix(assignments.view(), 1).unwrap();
+        assert!((support.mass() - 1.8).abs() < 1e-12);
+        assert!((support.fisher_n() - 1.4).abs() < 1e-12);
+        assert!((support.ess() - (1.8_f64 * 1.8 / 1.4)).abs() < 1e-12);
+        assert_eq!(support.positive_rows(), vec![0usize, 1, 2]);
     }
 }
 
