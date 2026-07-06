@@ -869,14 +869,17 @@ pub fn response_frechet_mean(
     // orthogonal lines (principal angle π/2) are exactly such a pair — so we try
     // each sample and skip inadmissible ones.
     //
-    // The FIRST admissible start whose descent reaches stationarity is returned
-    // immediately: on a Hadamard geometry (`Spd`/`Poincare`) `V` is globally
-    // geodesically convex, so one descent finds the unique global mean and no
-    // restart can improve it; well-clustered positively curved data likewise.
-    // Only when no descent reaches `tol` AND the geometry can host multiple
-    // basins (`frechet_mean_can_be_nonunique`) do we spend further restarts and
-    // keep the best approximate mean. The common path is therefore a single
-    // descent, exactly as before.
+    // On a Hadamard geometry (`Spd`/`Poincare`) `V` is globally geodesically
+    // convex with a UNIQUE minimizer and no cut locus, so the first admissible
+    // descent settles the mean (converged → the mean; stalled → its best
+    // approximant) and no restart can improve it — one descent, exactly as
+    // before. On a positively curved geometry the mean is only LOCALLY unique:
+    // a converged descent may sit in a suboptimal basin, so — like
+    // `sphere_frechet_mean`, which scores every candidate — we descend up to
+    // `MULTISTART_MAX` admissible starts and keep the globally lowest-dispersion
+    // one rather than stopping at the first that reaches `tol`. The mean is
+    // computed once per fit to set the chart origin, so the bounded extra
+    // restarts are amortized.
     let multistart = manifold.frechet_mean_can_be_nonunique();
     let mut best: Option<(Array1<f64>, f64, f64)> = None;
     let mut last_seed_err = String::new();
@@ -914,11 +917,13 @@ pub fn response_frechet_mean(
 
         let (p, grad, disp) = descend(start);
         descents += 1;
-        if grad <= tol {
-            // A genuine stationary point: unique on a Hadamard manifold, and the
-            // exact Fréchet mean on a positively curved one within its ball.
+        if !multistart {
+            // Hadamard: the unique global mean (or its best approximant on a
+            // budget shortfall) — a single descent settles it.
             return Ok(p);
         }
+        // Positively curved: a converged descent is only a local minimizer, so
+        // keep scoring basins by dispersion and return the global best.
         let keep = match &best {
             Some((_, _, best_disp)) => disp < *best_disp,
             None => true,
@@ -926,9 +931,7 @@ pub fn response_frechet_mean(
         if keep {
             best = Some((p, grad, disp));
         }
-        // A single descent settles the mean unless the geometry can host several
-        // basins; only then is another restart worth the cost.
-        if !multistart || descents >= MULTISTART_MAX {
+        if descents >= MULTISTART_MAX {
             break;
         }
     }
