@@ -5,10 +5,12 @@ Self-contained. CPU. Saves weekday_ring.png + weekday_numbers.json.
 import json, sys, numpy as np, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import os
 torch.set_num_threads(64)
-MODEL = "/projects/standard/hsiehph/sauer354/models/qwen3-8b"
-OUT = "/projects/standard/hsiehph/sauer354/gam_ceiling_fable/experiments/real_circle"
-import os; os.makedirs(OUT, exist_ok=True)
+R = os.environ["GAM_DATA_ROOT"]  # required: data/model root (was a hardcoded cluster path)
+MODEL = os.path.join(R, "models", "qwen3-8b")
+OUT = os.path.join(R, "gam_ceiling_fable", "experiments", "real_circle")
+os.makedirs(OUT, exist_ok=True)
 
 DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 # context templates that place the day word mid-sentence (varied contexts)

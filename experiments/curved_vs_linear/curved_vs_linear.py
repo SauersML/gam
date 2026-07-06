@@ -6,7 +6,7 @@ is exploitable on real data; if not, it's a real negative. Also tries the actual
 Saves curved_vs_linear.png + curved_vs_linear.json.
 """
 import json, os, numpy as np
-R="/projects/standard/hsiehph/sauer354"
+R=os.environ["GAM_DATA_ROOT"]  # required: data/scratch root (was a hardcoded cluster path)
 OUT=f"{R}/gam_ceiling_fable/experiments/curved_vs_linear"; os.makedirs(OUT, exist_ok=True)
 os.environ["MPLCONFIGDIR"]=f"{R}/scratch/mplcache"; os.makedirs(f"{R}/scratch/mplcache",exist_ok=True)
 
