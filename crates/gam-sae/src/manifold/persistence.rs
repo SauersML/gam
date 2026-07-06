@@ -6,14 +6,15 @@
 //! **measured property**. For each accepted atom it reads the atom's assigned
 //! rows' in-atom residual-space positions — the decoded image points
 //! `g_k(t_{ik}) = Φ_k(t_{ik}) B_k` of the rows this atom explains — and computes
-//! their Vietoris–Rips persistent homology (H₀ = connected components, H₁ =
-//! loops). The measured diagram is then confronted with what the *raced* type
-//! predicts:
+//! their distance-to-measure weighted Vietoris–Rips persistent homology (H₀ =
+//! connected components, H₁ = loops, H₂ = shells for sphere/torus candidates).
+//! The measured diagram is then confronted with what the *raced* type predicts:
 //!
-//! * a circle / torus / cylinder should show ≥1 persistent H₁ loop and exactly
-//!   one connected component;
-//! * a line / Duchon patch / Euclidean patch / sphere-chart should show no
-//!   persistent H₁ and one component;
+//! * a circle / cylinder should show Betti `(b₀=1, b₁=1)`;
+//! * a torus should show Betti `(b₀=1, b₁=2, b₂=1)`;
+//! * a sphere should show Betti `(b₀=1, b₁=0, b₂=1)`;
+//! * a line / Duchon patch / Euclidean patch / sphere-chart should show Betti
+//!   `(b₀=1, b₁=0)`;
 //! * a set that is really `c` clusters (e.g. a 7-point ring forced through a
 //!   circle fit) shows `c` persistent H₀ bars — disagreeing with *every*
 //!   connected candidate in the library.
@@ -24,29 +25,29 @@
 //!
 //! # No magic constants (SPEC.md)
 //!
-//! The filtration values ARE the exact pairwise distances (no scale grid, no
-//! bucketing), so the persistence diagram is computed exactly. "How many
-//! components / is there a loop" is decided by a **dominant-gap** test on the
-//! bar lengths (a single log-gap that outweighs all the others combined), which
-//! carries no threshold. The only compute-side ceiling is the farthest-point
-//! subsample cap [`PERSISTENCE_MAX_POINTS`] — a budget on the `O(m³)` triangle
-//! enumeration, above the covering number of any modest atom, mirroring the
-//! in-tree [`crate::manifold::shape_uncertainty::SHAPE_BAND_MAX_POINTS`] band
-//! ceiling. Topology is invariant to it above the covering number.
+//! The filtration values ARE exact DTM-weighted pairwise distances (no scale
+//! grid, no bucketing), so the persistence diagram is computed exactly. "How
+//! many components / loops / shells" is decided by a **dominant-gap** test on
+//! the bar lengths (a single log-gap that outweighs all the others combined),
+//! which carries no threshold. The only compute-side ceiling is the
+//! farthest-point subsample cap [`PERSISTENCE_MAX_POINTS`] — a budget on the
+//! simplex enumeration, above the covering number of any modest atom, mirroring
+//! the in-tree [`crate::manifold::shape_uncertainty::SHAPE_BAND_MAX_POINTS`]
+//! band ceiling. Topology is invariant to it above the covering number.
 
 use super::*;
 use std::collections::HashMap;
 
 /// Compute ceiling on the number of points fed to the Vietoris–Rips filtration.
 ///
-/// The VR-2 complex has `O(m³)` triangles; the boundary reduction is quadratic
-/// in the simplex count, so an uncapped atom (tens of thousands of assigned
-/// rows) is intractable and — more importantly — pointless: the persistent
-/// topology of a point cloud is fixed once the sample covers the manifold, and
-/// a farthest-point subsample to a few dozen landmarks already covers any
-/// modest atom. This is a compute budget, not a model knob: raising it only
-/// spends more time confirming the same diagram. Kept in the same spirit (and
-/// rough magnitude class, scaled down for the cubic cost) as
+/// The H₂ audit includes `O(m⁴)` tetrahedra for sphere/torus candidates; the
+/// boundary reduction is quadratic in the simplex count, so an uncapped atom
+/// (tens of thousands of assigned rows) is intractable and — more importantly —
+/// pointless: the persistent topology of a point cloud is fixed once the sample
+/// covers the manifold, and a farthest-point subsample to a few dozen landmarks
+/// already covers any modest atom. This is a compute budget, not a model knob:
+/// raising it only spends more time confirming the same diagram. Kept in the
+/// same spirit (and rough magnitude class, scaled down for the cubic cost) as
 /// [`crate::manifold::shape_uncertainty::SHAPE_BAND_MAX_POINTS`].
 pub const PERSISTENCE_MAX_POINTS: usize = 48;
 
@@ -72,15 +73,51 @@ impl PersistenceBar {
     }
 }
 
-/// The H₀/H₁ persistence diagram of a point cloud. `h0` always contains exactly
-/// one essential bar (VR on a finite cloud is connected at its diameter); the
-/// finite H₀ bars are the merge events. `h1` holds the loops (finite loops die
-/// when their disk fills; an essential loop is never filled at any sampled
-/// scale).
+/// The H₀/H₁/H₂ persistence diagram of a point cloud. `h0` always contains
+/// exactly one essential bar (VR on a finite cloud is connected at its
+/// diameter); the finite H₀ bars are the merge events. `h1` holds the loops
+/// (finite loops die when their disk fills), and `h2` holds shells when the
+/// caller asks for sphere/torus homology.
 #[derive(Clone, Debug)]
 pub struct PersistenceDiagram {
     pub h0: Vec<PersistenceBar>,
     pub h1: Vec<PersistenceBar>,
+    pub h2: Vec<PersistenceBar>,
+}
+
+/// Betti signature used by the topology audit. `b2 = None` means H₂ was not
+/// computed for this raced topology because it has no H₂ claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BettiSignature {
+    pub b0: usize,
+    pub b1: usize,
+    pub b2: Option<usize>,
+}
+
+impl BettiSignature {
+    fn matches_expected(self, expected: Self) -> bool {
+        self.b0 == expected.b0
+            && self.b1 == expected.b1
+            && expected.b2.map_or(true, |b2| self.b2 == Some(b2))
+    }
+}
+
+/// Which side of the persistence landmark cap this atom's sampled support is
+/// on. At the cap, the audit reads a fixed-size farthest-point cover; below it,
+/// every positive-support row is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistenceStabilityBand {
+    BelowLandmarkCap,
+    AtLandmarkCap,
+}
+
+impl PersistenceStabilityBand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowLandmarkCap => "below_landmark_cap",
+            Self::AtLandmarkCap => "at_landmark_cap",
+        }
+    }
 }
 
 /// The per-atom topology audit certificate: the measured persistence summary of
@@ -90,53 +127,98 @@ pub struct PersistenceDiagram {
 pub struct AtomTopologyPersistence {
     /// The raced basis/topology tag whose prediction is under audit.
     pub raced_kind: SaeAtomBasisKind,
+    /// Number of positive-support rows before persistence subsampling.
+    pub support_size: usize,
     /// Number of image points actually persisted (post-subsample).
-    pub n_points: usize,
-    /// Measured number of connected components (dominant-gap partition of the
-    /// finite H₀ bars, plus the one essential component). A connected manifold
-    /// predicts `1`; a `c`-cluster set measures `c`.
-    pub n_components: usize,
-    /// Whether a persistent H₁ loop was measured (a bar whose persistence
-    /// exceeds the within-component point-spacing scale, or an essential loop).
-    pub has_loop: bool,
-    /// Whether the raced type predicts a loop.
-    pub expected_loop: bool,
+    pub landmark_count: usize,
+    /// Which side of the landmark cap this atom's support lies on.
+    pub stability_band: PersistenceStabilityBand,
+    /// Soft occupancy mass `Σ_i w_i` from the shared atom support measure.
+    pub support_mass: f64,
+    /// Reconstruction-information effective count `Σ_i w_i²` from the shared
+    /// atom support measure.
+    pub effective_n: f64,
+    /// Kish effective support `(Σ_i w_i)² / Σ_i w_i²`, the number of equally
+    /// weighted rows represented by this atom's support distribution.
+    pub support_ess: f64,
+    /// Measured Betti signature.
+    pub measured_betti: BettiSignature,
+    /// Betti signature predicted by the raced topology.
+    pub expected_betti: BettiSignature,
     /// Persistence of the most persistent measured loop (`+∞` for an essential
     /// loop, `0` when none).
     pub dominant_h1_persistence: f64,
+    /// Persistence of the most persistent measured H₂ shell (`+∞` for an
+    /// essential class, `0` when H₂ was not computed or none was measured).
+    pub dominant_h2_persistence: f64,
     /// The measured H₀ bars (essential bar included).
     pub h0: Vec<PersistenceBar>,
     /// The measured H₁ bars.
     pub h1: Vec<PersistenceBar>,
+    /// The measured H₂ bars. Empty unless the raced topology is sphere/torus.
+    pub h2: Vec<PersistenceBar>,
     /// The certificate flag: the measured topology disagrees with the raced
-    /// type (extra components, a missing predicted loop, or a loop where none
-    /// was predicted). Fed to the probe planner.
+    /// type's expected Betti signature. Fed to the probe planner.
     pub contested: bool,
     /// Human-readable summary.
     pub note: String,
 }
 
-/// Whether the raced topology tag predicts a persistent H₁ loop. `None` for a
-/// [`SaeAtomBasisKind::Precomputed`] atom whose topology is caller-supplied and
-/// carries no library prediction to audit against.
-fn kind_expects_loop(kind: &SaeAtomBasisKind) -> Option<bool> {
+/// Aggregate certificate adapter for the unified certificate ledger.
+///
+/// The full per-atom persistence records stay in the typed
+/// `topology_persistence` payload. This adapter contributes the conservative
+/// dictionary-level claim to the shared certificate ledger: every audited atom's
+/// measured persistent topology must agree with its raced topology.
+#[derive(Debug, Clone, Copy)]
+pub struct TopologyPersistenceCertificate<'a> {
+    pub atoms: &'a [Option<AtomTopologyPersistence>],
+}
+
+impl<'a> TopologyPersistenceCertificate<'a> {
+    pub fn new(atoms: &'a [Option<AtomTopologyPersistence>]) -> Self {
+        Self { atoms }
+    }
+}
+
+/// Betti signature predicted by the raced topology. `finite_set_components`
+/// supplies the anchor count for [`SaeAtomBasisKind::FiniteSet`], whose enum tag
+/// is intentionally unit-shaped; caller-supplied precomputed bases carry no
+/// library prediction to audit against.
+fn expected_betti_signature(
+    kind: &SaeAtomBasisKind,
+    finite_set_components: Option<usize>,
+) -> Option<BettiSignature> {
     match kind {
-        // Circle / torus / cylinder charts carry non-trivial H₁.
-        SaeAtomBasisKind::Periodic
-        | SaeAtomBasisKind::Torus
-        | SaeAtomBasisKind::Cylinder => Some(true),
-        // The (lat, lon) sphere chart is topologically S², whose H₁ is trivial;
-        // the contractible patch/curve charts likewise carry no loop.
-        SaeAtomBasisKind::Sphere
-        | SaeAtomBasisKind::Linear
+        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Cylinder => Some(BettiSignature {
+            b0: 1,
+            b1: 1,
+            b2: None,
+        }),
+        SaeAtomBasisKind::Torus => Some(BettiSignature {
+            b0: 1,
+            b1: 2,
+            b2: Some(1),
+        }),
+        SaeAtomBasisKind::Sphere => Some(BettiSignature {
+            b0: 1,
+            b1: 0,
+            b2: Some(1),
+        }),
+        SaeAtomBasisKind::Linear
         | SaeAtomBasisKind::Duchon
         | SaeAtomBasisKind::EuclideanPatch
-        | SaeAtomBasisKind::Poincare => Some(false),
-        // Caller-supplied basis: no library prediction, nothing to contest. A
-        // finite-set atom's loop structure (e.g. weekday cyclic adjacency) is a
-        // property of the fitted anchor DATA, not a fixed chart topology, so the
-        // library makes no H₁ prediction to contest either.
-        SaeAtomBasisKind::Precomputed(_) | SaeAtomBasisKind::FiniteSet => None,
+        | SaeAtomBasisKind::Poincare => Some(BettiSignature {
+            b0: 1,
+            b1: 0,
+            b2: None,
+        }),
+        SaeAtomBasisKind::FiniteSet => finite_set_components.map(|b0| BettiSignature {
+            b0,
+            b1: 0,
+            b2: None,
+        }),
+        SaeAtomBasisKind::Precomputed(_) => None,
     }
 }
 
@@ -152,19 +234,43 @@ fn point_distance(points: ArrayView2<'_, f64>, i: usize, j: usize) -> f64 {
 /// Deterministic farthest-point subsample to `target` landmarks (seeded at row
 /// `0`), returning the chosen row indices. Returns all rows when `n <= target`.
 fn farthest_point_subsample(points: ArrayView2<'_, f64>, target: usize) -> Vec<usize> {
+    farthest_point_subsample_weighted(points, None, target)
+}
+
+fn farthest_point_subsample_weighted(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    target: usize,
+) -> Vec<usize> {
     let n = points.nrows();
     if n <= target {
         return (0..n).collect();
     }
     let mut chosen = Vec::with_capacity(target);
-    chosen.push(0usize);
-    let mut min_dist: Vec<f64> = (0..n).map(|i| point_distance(points, i, 0)).collect();
+    let mut first = 0usize;
+    if let Some(w) = weights {
+        let mut best_w = f64::NEG_INFINITY;
+        for (row, &weight) in w.iter().enumerate() {
+            if weight > best_w {
+                best_w = weight;
+                first = row;
+            }
+        }
+    }
+    chosen.push(first);
+    let mean_weight = match weights {
+        Some(w) => w.iter().copied().sum::<f64>() / w.len().max(1) as f64,
+        None => 1.0,
+    };
+    let mut min_dist: Vec<f64> = (0..n).map(|i| point_distance(points, i, first)).collect();
     while chosen.len() < target {
         let mut best = 0usize;
-        let mut best_dist = -1.0_f64;
+        let mut best_score = -1.0_f64;
         for (i, &d) in min_dist.iter().enumerate() {
-            if d > best_dist {
-                best_dist = d;
+            let weight_factor = weights.map(|w| w[i] / mean_weight).unwrap_or(1.0);
+            let score = d * weight_factor;
+            if score > best_score {
+                best_score = score;
                 best = i;
             }
         }
@@ -187,39 +293,105 @@ struct Simplex {
     dim: usize,
 }
 
-/// Exact Vietoris–Rips persistent homology up to H₁ (needs 2-simplices to kill
-/// loops). Filtration values are the exact pairwise distances — no scale grid.
+/// Distance-to-measure radii for the selected support. The mass source is this
+/// atom's assignment-mass vector today; this function is the single swap point
+/// for a first-class support measure carrying density-corrected row masses.
+fn dtm_radii(points: ArrayView2<'_, f64>, weights: Option<ArrayView1<'_, f64>>) -> Vec<f64> {
+    let m = points.nrows();
+    if m <= 1 {
+        return vec![0.0; m];
+    }
+    let local_weights = weights
+        .map(|w| w.to_owned())
+        .unwrap_or_else(|| Array1::<f64>::ones(m));
+    let total = local_weights.iter().copied().sum::<f64>();
+    if !(total.is_finite() && total > 0.0) {
+        return vec![0.0; m];
+    }
+    let target_mass = total / m as f64;
+    let mut radii = vec![0.0_f64; m];
+    for i in 0..m {
+        let mut neighbors: Vec<(f64, f64)> = Vec::with_capacity(m - 1);
+        for j in 0..m {
+            let weight = local_weights[j];
+            if i != j && weight.is_finite() && weight > 0.0 {
+                neighbors.push((point_distance(points, i, j), weight));
+            }
+        }
+        neighbors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut mass = 0.0_f64;
+        let mut moment = 0.0_f64;
+        for (dist, weight) in neighbors {
+            let take = (target_mass - mass).min(weight);
+            if take > 0.0 {
+                moment += take * dist * dist;
+                mass += take;
+            }
+            if mass >= target_mass {
+                break;
+            }
+        }
+        if mass > 0.0 {
+            radii[i] = (moment / mass).sqrt();
+        }
+    }
+    radii
+}
+
+fn dtm_weighted_distances(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Array2<f64> {
+    let m = points.nrows();
+    let dtm = dtm_radii(points, weights);
+    let mut dist = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let d = point_distance(points, i, j).max(dtm[i]).max(dtm[j]);
+            dist[[i, j]] = d;
+            dist[[j, i]] = d;
+        }
+    }
+    dist
+}
+
+/// Exact DTM-weighted Vietoris–Rips persistent homology up to H₁ (needs
+/// 2-simplices to kill loops). Filtration values are exact weighted pairwise
+/// distances — no scale grid.
 ///
 /// Reduction is the standard GF(2) boundary-matrix reduction: simplices are
 /// ordered by `(filtration, dimension)`, each column is reduced against earlier
 /// pivots, and a persistence pair `(birth-face, death-simplex)` is emitted when
 /// a column's lowest surviving entry matches an existing pivot.
 pub fn vietoris_rips_persistence(points: ArrayView2<'_, f64>) -> PersistenceDiagram {
+    dtm_vietoris_rips_persistence(points, None, 1)
+}
+
+fn dtm_vietoris_rips_persistence(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    max_homology_dim: usize,
+) -> PersistenceDiagram {
     let m = points.nrows();
     let mut h0 = Vec::new();
     let mut h1 = Vec::new();
+    let mut h2 = Vec::new();
     if m == 0 {
-        return PersistenceDiagram { h0, h1 };
+        return PersistenceDiagram { h0, h1, h2 };
     }
     if m == 1 {
         h0.push(PersistenceBar {
             birth: 0.0,
             death: f64::INFINITY,
         });
-        return PersistenceDiagram { h0, h1 };
+        return PersistenceDiagram { h0, h1, h2 };
     }
 
-    // Pairwise distances.
-    let mut dist = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let d = point_distance(points, i, j);
-            dist[[i, j]] = d;
-            dist[[j, i]] = d;
-        }
-    }
+    let dist = dtm_weighted_distances(points, weights);
 
-    // Build simplices up to dimension 2.
+    // Build simplices up to the coface dimension needed by the requested
+    // homology: H₁ needs triangles, H₂ needs tetrahedra.
+    let max_simplex_dim = (max_homology_dim + 1).min(3);
     let mut simplices: Vec<Simplex> = Vec::new();
     for i in 0..m {
         simplices.push(Simplex {
@@ -237,15 +409,38 @@ pub fn vietoris_rips_persistence(points: ArrayView2<'_, f64>) -> PersistenceDiag
             });
         }
     }
-    for i in 0..m {
-        for j in (i + 1)..m {
-            for k in (j + 1)..m {
-                let filt = dist[[i, j]].max(dist[[i, k]]).max(dist[[j, k]]);
-                simplices.push(Simplex {
-                    verts: vec![i, j, k],
-                    filt,
-                    dim: 2,
-                });
+    if max_simplex_dim >= 2 {
+        for i in 0..m {
+            for j in (i + 1)..m {
+                for k in (j + 1)..m {
+                    let filt = dist[[i, j]].max(dist[[i, k]]).max(dist[[j, k]]);
+                    simplices.push(Simplex {
+                        verts: vec![i, j, k],
+                        filt,
+                        dim: 2,
+                    });
+                }
+            }
+        }
+    }
+    if max_simplex_dim >= 3 {
+        for i in 0..m {
+            for j in (i + 1)..m {
+                for k in (j + 1)..m {
+                    for l in (k + 1)..m {
+                        let filt = dist[[i, j]]
+                            .max(dist[[i, k]])
+                            .max(dist[[i, l]])
+                            .max(dist[[j, k]])
+                            .max(dist[[j, l]])
+                            .max(dist[[k, l]]);
+                        simplices.push(Simplex {
+                            verts: vec![i, j, k, l],
+                            filt,
+                            dim: 3,
+                        });
+                    }
+                }
             }
         }
     }
@@ -336,15 +531,20 @@ pub fn vietoris_rips_persistence(points: ArrayView2<'_, f64>) -> PersistenceDiag
                         h1.push(bar);
                     }
                 }
+                2 => {
+                    if max_homology_dim >= 2 && death > birth {
+                        h2.push(bar);
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    // Essential classes: empty (fully reduced) columns that were never consumed
-    // as a birth.
+    // Essential classes: fully reduced zero columns that were never consumed as
+    // a birth.
     for j in 0..n {
-        if boundary[j].is_empty() && reduced[j].is_empty() && !paired_birth[j] {
+        if reduced[j].is_empty() && !paired_birth[j] {
             let bar = PersistenceBar {
                 birth: ordered_filt[j],
                 death: f64::INFINITY,
@@ -352,12 +552,13 @@ pub fn vietoris_rips_persistence(points: ArrayView2<'_, f64>) -> PersistenceDiag
             match ordered_dim[j] {
                 0 => h0.push(bar),
                 1 => h1.push(bar),
+                2 if max_homology_dim >= 2 => h2.push(bar),
                 _ => {}
             }
         }
     }
 
-    PersistenceDiagram { h0, h1 }
+    PersistenceDiagram { h0, h1, h2 }
 }
 
 fn symmetric_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
@@ -417,11 +618,11 @@ fn symmetric_difference(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// row (a chart artifact), not a second sampled manifold component. The clusters
 /// the dominant cut separates are exactly the single-linkage components just
 /// below the smallest inter-cluster merge scale `deaths[gmax_idx]` (VR H₀ deaths
-/// ARE the single-linkage merge heights), so the guard reuses the same landmark
-/// filtration on `points`.
+/// ARE the single-linkage merge heights), so the guard reuses the same
+/// DTM-weighted landmark distances as the filtration.
 ///
 /// Returns `(n_components, within_component_scale)`.
-fn components_and_scale(finite_h0: &[PersistenceBar], points: ArrayView2<'_, f64>) -> (usize, f64) {
+fn components_and_scale(finite_h0: &[PersistenceBar], distances: &Array2<f64>) -> (usize, f64) {
     let mut deaths: Vec<f64> = finite_h0
         .iter()
         .map(|b| b.death)
@@ -454,7 +655,7 @@ fn components_and_scale(finite_h0: &[PersistenceBar], points: ArrayView2<'_, f64
     // within-manifold log-gaps are `≤ ln 2` by construction). The floor kills the
     // near-uniform-spacing tie degeneracy that otherwise fires on clean atoms.
     let split_floor = sum_others.max(std::f64::consts::LN_2);
-    if gmax > split_floor && smallest_linkage_component(points, deaths[gmax_idx]) >= 2 {
+    if gmax > split_floor && smallest_linkage_component(distances, deaths[gmax_idx]) >= 2 {
         // Bars 0..=gmax_idx are inter-cluster merges: gmax_idx + 1 of them, so
         // gmax_idx + 2 components (the extra essential one). The within-cluster
         // scale is the largest death below the cut. The linkage guard above has
@@ -472,15 +673,15 @@ fn components_and_scale(finite_h0: &[PersistenceBar], points: ArrayView2<'_, f64
 /// landmark pairs closer than `scale` are unioned, and the least-populated
 /// resulting component is returned. Used to reject a dominant-gap split that
 /// would carve off a lone outlier (a component of one landmark).
-fn smallest_linkage_component(points: ArrayView2<'_, f64>, scale: f64) -> usize {
-    let m = points.nrows();
+fn smallest_linkage_component(distances: &Array2<f64>, scale: f64) -> usize {
+    let m = distances.nrows();
     if m == 0 {
         return 0;
     }
     let mut parent: Vec<usize> = (0..m).collect();
     for i in 0..m {
         for j in (i + 1)..m {
-            if point_distance(points, i, j) < scale {
+            if distances[[i, j]] < scale {
                 let ri = nerve_find(&mut parent, i);
                 let rj = nerve_find(&mut parent, j);
                 if ri != rj {
@@ -497,6 +698,71 @@ fn smallest_linkage_component(points: ArrayView2<'_, f64>, scale: f64) -> usize 
     sizes.values().copied().min().unwrap_or(0)
 }
 
+fn dominant_persistence(bars: &[PersistenceBar]) -> f64 {
+    bars.iter()
+        .map(|b| b.persistence())
+        .fold(0.0_f64, f64::max)
+}
+
+fn dominant_gap_bar_count(bars: &[PersistenceBar], within_scale: f64) -> usize {
+    let essential = bars.iter().filter(|b| b.is_essential()).count();
+    let mut lengths: Vec<f64> = bars
+        .iter()
+        .map(|b| b.persistence())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .collect();
+    if lengths.is_empty() {
+        return essential;
+    }
+    lengths.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    if lengths.len() == 1 {
+        return essential + usize::from(lengths[0] > within_scale);
+    }
+    let logs: Vec<f64> = lengths.iter().map(|d| d.ln()).collect();
+    let gaps: Vec<f64> = (0..lengths.len() - 1)
+        .map(|i| logs[i] - logs[i + 1])
+        .collect();
+    let mut gmax = f64::NEG_INFINITY;
+    let mut gmax_idx = 0usize;
+    for (i, &g) in gaps.iter().enumerate() {
+        if g > gmax {
+            gmax = g;
+            gmax_idx = i;
+        }
+    }
+    let sum_others: f64 = gaps.iter().sum::<f64>() - gmax;
+    if gmax > sum_others.max(std::f64::consts::LN_2) {
+        essential + gmax_idx + 1
+    } else {
+        essential + lengths.iter().filter(|&&p| p > within_scale).count()
+    }
+}
+
+fn support_summary(weights: Option<ArrayView1<'_, f64>>, full: usize) -> (f64, f64, f64) {
+    match weights {
+        Some(w) => {
+            let mut mass = 0.0_f64;
+            let mut fisher_n = 0.0_f64;
+            for &weight in w.iter() {
+                if weight.is_finite() && weight > 0.0 {
+                    mass += weight;
+                    fisher_n += weight * weight;
+                }
+            }
+            let ess = if fisher_n > 0.0 {
+                (mass * mass) / fisher_n
+            } else {
+                0.0
+            };
+            (mass, fisher_n, ess)
+        }
+        None => {
+            let n = full as f64;
+            (n, n, n)
+        }
+    }
+}
+
 /// Audit a raced atom's topology against the persistent homology of a point
 /// cloud (its assigned-row image points). Returns `None` when the raced type
 /// carries no library prediction ([`SaeAtomBasisKind::Precomputed`]) or the
@@ -506,14 +772,36 @@ pub fn topology_persistence_verdict(
     points: ArrayView2<'_, f64>,
     raced_kind: &SaeAtomBasisKind,
 ) -> Option<AtomTopologyPersistence> {
-    let expected_loop = kind_expects_loop(raced_kind)?;
+    topology_persistence_verdict_impl(points, None, raced_kind, None)
+}
+
+fn topology_persistence_verdict_impl(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    raced_kind: &SaeAtomBasisKind,
+    finite_set_components: Option<usize>,
+) -> Option<AtomTopologyPersistence> {
+    let expected_betti = expected_betti_signature(raced_kind, finite_set_components)?;
     let full = points.nrows();
     if full < 4 {
         return None;
     }
-    let landmarks = farthest_point_subsample(points, PERSISTENCE_MAX_POINTS);
+    let landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_MAX_POINTS);
     let sub = points.select(ndarray::Axis(0), &landmarks);
-    let diagram = vietoris_rips_persistence(sub.view());
+    let sub_weights = weights.map(|w| {
+        let mut selected = Array1::<f64>::zeros(landmarks.len());
+        for (idx, &row) in landmarks.iter().enumerate() {
+            selected[idx] = w[row];
+        }
+        selected
+    });
+    let max_homology_dim = if expected_betti.b2.is_some() { 2 } else { 1 };
+    let diagram = dtm_vietoris_rips_persistence(
+        sub.view(),
+        sub_weights.as_ref().map(|w| w.view()),
+        max_homology_dim,
+    );
+    let (support_mass, effective_n, support_ess) = support_summary(weights, full);
 
     let finite_h0: Vec<PersistenceBar> = diagram
         .h0
@@ -521,63 +809,93 @@ pub fn topology_persistence_verdict(
         .copied()
         .filter(|b| !b.is_essential())
         .collect();
-    let (n_components, within_scale) = components_and_scale(&finite_h0, sub.view());
+    let distances = dtm_weighted_distances(
+        sub.view(),
+        sub_weights.as_ref().map(|w| w.view()),
+    );
+    let (n_components, within_scale) = components_and_scale(&finite_h0, &distances);
 
-    // A measured loop is persistent when it outlives the within-component point
-    // spacing (or is essential — an unfilled loop at every sampled scale).
-    let dominant_h1_persistence = diagram
-        .h1
-        .iter()
-        .map(|b| b.persistence())
-        .fold(0.0_f64, f64::max);
-    let has_loop = diagram
-        .h1
-        .iter()
-        .any(|b| b.is_essential() || b.persistence() > within_scale);
-
-    let contested = n_components != 1 || has_loop != expected_loop;
+    let measured_betti = BettiSignature {
+        b0: n_components,
+        b1: dominant_gap_bar_count(&diagram.h1, within_scale),
+        b2: expected_betti
+            .b2
+            .map(|expected_h2| {
+                let counted = dominant_gap_bar_count(&diagram.h2, within_scale);
+                if expected_h2 == 0 && counted == 0 {
+                    0
+                } else {
+                    counted
+                }
+            }),
+    };
+    let dominant_h1_persistence = dominant_persistence(&diagram.h1);
+    let dominant_h2_persistence = dominant_persistence(&diagram.h2);
+    let contested = !measured_betti.matches_expected(expected_betti);
 
     let note = if contested {
         let mut reasons = Vec::new();
-        if n_components != 1 {
+        if measured_betti.b0 != expected_betti.b0 {
             reasons.push(format!(
-                "measured {n_components} components (raced type is a connected manifold)"
+                "measured b0={} but raced type predicts b0={}",
+                measured_betti.b0, expected_betti.b0
             ));
         }
-        if has_loop && !expected_loop {
-            reasons.push("measured a loop the raced type does not predict".to_string());
+        if measured_betti.b1 != expected_betti.b1 {
+            reasons.push(format!(
+                "measured b1={} but raced type predicts b1={}",
+                measured_betti.b1, expected_betti.b1
+            ));
         }
-        if !has_loop && expected_loop {
-            reasons.push("no persistent loop where the raced type predicts one".to_string());
+        if let Some(expected_h2) = expected_betti.b2 {
+            if measured_betti.b2 != Some(expected_h2) {
+                reasons.push(format!(
+                    "measured b2={} but raced type predicts b2={expected_h2}",
+                    measured_betti.b2.unwrap_or(0)
+                ));
+            }
         }
         format!("CONTESTED topology: {}", reasons.join("; "))
     } else {
         format!(
-            "topology agrees: {n_components} component(s), loop={has_loop} (predicted {expected_loop})"
+            "topology agrees: measured Betti {:?} matches raced Betti {:?}",
+            measured_betti, expected_betti
         )
+    };
+    let stability_band = if full > PERSISTENCE_MAX_POINTS {
+        PersistenceStabilityBand::AtLandmarkCap
+    } else {
+        PersistenceStabilityBand::BelowLandmarkCap
     };
 
     Some(AtomTopologyPersistence {
         raced_kind: raced_kind.clone(),
-        n_points: landmarks.len(),
-        n_components,
-        has_loop,
-        expected_loop,
+        support_size: full,
+        landmark_count: landmarks.len(),
+        stability_band,
+        support_mass,
+        effective_n,
+        support_ess,
+        measured_betti,
+        expected_betti,
         dominant_h1_persistence,
+        dominant_h2_persistence,
         h0: diagram.h0,
         h1: diagram.h1,
+        h2: diagram.h2,
         contested,
         note,
     })
 }
 
-/// Gather one atom's assigned-row image points and audit its raced topology.
+/// Gather one atom's positive-support image points and audit its raced topology.
 ///
-/// A row is *assigned* to an atom when that atom carries the row's largest
-/// assignment mass (hard argmax) — the rows the atom actually explains. Each
-/// assigned row's in-atom residual-space position is the decoded image
-/// `g_k(t_{ik}) = Φ_k(t_{ik}) B_k`. Returns `None` when the atom's topology is
-/// caller-supplied or too few rows are assigned to resolve H₁.
+/// The row weights come from the shared [`SupportMeasure`] (`w_i = a_ik`), so
+/// the persistence audit reads the same atom support as coordinate fidelity,
+/// trust diagnostics, and rank charge. Each supported row's in-atom
+/// residual-space position is the decoded image `g_k(t_{ik}) = Φ_k(t_{ik}) B_k`.
+/// Returns `None` when the atom's topology is caller-supplied or too few
+/// positive-support rows are present to resolve H₁.
 pub fn atom_topology_persistence(
     term: &SaeManifoldTerm,
     atom_idx: usize,
@@ -589,34 +907,39 @@ pub fn atom_topology_persistence(
     if n == 0 || atom_idx >= k {
         return None;
     }
-    // Hard argmax assignment: the rows this atom owns.
-    let mut assigned_rows: Vec<usize> = Vec::new();
+    let mut supported_rows = Vec::new();
+    let mut support_weights = Vec::new();
     for row in 0..n {
-        let mut best = 0usize;
-        let mut best_mass = f64::NEG_INFINITY;
-        for col in 0..k {
-            let mass = assignments[[row, col]];
-            if mass > best_mass {
-                best_mass = mass;
-                best = col;
-            }
-        }
-        if best == atom_idx && best_mass > 0.0 {
-            assigned_rows.push(row);
+        let mass = assignments[[row, atom_idx]];
+        if mass.is_finite() && mass > 0.0 {
+            supported_rows.push(row);
+            support_weights.push(mass);
         }
     }
-    if assigned_rows.len() < 4 || assigned_rows.iter().any(|&r| r >= atom.n_obs()) {
+    if supported_rows.len() < 4 || supported_rows.iter().any(|&r| r >= atom.n_obs()) {
         return None;
     }
     let p = atom.output_dim();
-    let mut points = Array2::<f64>::zeros((assigned_rows.len(), p));
-    for (i, &row) in assigned_rows.iter().enumerate() {
+    let mut points = Array2::<f64>::zeros((supported_rows.len(), p));
+    let mut weights = Array1::<f64>::zeros(supported_rows.len());
+    for (i, &row) in supported_rows.iter().enumerate() {
         let image = atom.decoded_row(row);
         for col in 0..p {
             points[[i, col]] = image[col];
         }
+        weights[i] = support_weights[i];
     }
-    topology_persistence_verdict(points.view(), &atom.basis_kind)
+    let finite_set_components = if matches!(atom.basis_kind, SaeAtomBasisKind::FiniteSet) {
+        Some(atom.basis_size())
+    } else {
+        None
+    };
+    topology_persistence_verdict_impl(
+        points.view(),
+        Some(weights.view()),
+        &atom.basis_kind,
+        finite_set_components,
+    )
 }
 
 /// The topology read off a typed-free local-chart atlas by its NERVE (reviewer
@@ -740,7 +1063,7 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{components_and_scale, PersistenceBar};
+    use super::{components_and_scale, dtm_weighted_distances, PersistenceBar};
     use ndarray::Array2;
 
     fn bars(deaths: &[f64]) -> Vec<PersistenceBar> {
@@ -790,8 +1113,13 @@ mod tests {
             );
             // The floor rejects the split before the guard is consulted; points
             // are a well-separated cloud so they cannot be what keeps it connected.
-            let pts = line_points(&(0..deaths.len() + 1).map(|i| i as f64 * 100.0).collect::<Vec<_>>());
-            let (n, _) = components_and_scale(&bars(&deaths), pts.view());
+            let pts = line_points(
+                &(0..deaths.len() + 1)
+                    .map(|i| i as f64 * 100.0)
+                    .collect::<Vec<_>>(),
+            );
+            let distances = dtm_weighted_distances(pts.view(), None);
+            let (n, _) = components_and_scale(&bars(&deaths), &distances);
             assert_eq!(n, 1, "ln2 floor should keep {deaths:?} connected");
         }
     }
@@ -805,7 +1133,8 @@ mod tests {
         let deaths = vec![10.0, 0.1, 0.09, 0.08];
         assert!(old_rule_splits(&deaths));
         let pts = line_points(&[0.0, 0.1, 0.2, 50.0, 50.1]);
-        let (n, within) = components_and_scale(&bars(&deaths), pts.view());
+        let distances = dtm_weighted_distances(pts.view(), None);
+        let (n, within) = components_and_scale(&bars(&deaths), &distances);
         assert_eq!(n, 2, "a real inter-cluster gap with ≥2 per side must still split");
         assert!((within - 0.1).abs() < 1e-12, "within-scale is the coarsest sub-cut merge");
     }
@@ -820,7 +1149,8 @@ mod tests {
         let deaths = vec![10.0, 0.1, 0.09];
         assert!(old_rule_splits(&deaths));
         let pts = line_points(&[0.0, 0.1, 0.2, 50.0]);
-        let (n, _) = components_and_scale(&bars(&deaths), pts.view());
+        let distances = dtm_weighted_distances(pts.view(), None);
+        let (n, _) = components_and_scale(&bars(&deaths), &distances);
         assert_eq!(n, 1, "a cut isolating one landmark must be rejected");
     }
 }
