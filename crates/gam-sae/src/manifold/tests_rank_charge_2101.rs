@@ -131,11 +131,12 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
 fn rank_charge_flag_off_is_inert() {
     let (mut term, rho) = fitted_circle_term(80, 16);
     let tgt = unit_target(&term);
-    // default (flag off)
+    // Explicitly disable the rank-charge switch to audit the historical ledger.
+    term.set_rank_charge_evidence(false);
     let (v_off, _, _) = term
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    // explicitly set off — still identical
+    // Re-applying off is still identical.
     term.set_rank_charge_evidence(false);
     let (v_off2, _, _) = term
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)

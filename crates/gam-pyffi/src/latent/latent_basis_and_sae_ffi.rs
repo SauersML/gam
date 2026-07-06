@@ -2292,6 +2292,9 @@ fn sae_structured_residual_model(
     run_outer_rho_search = true,
     quotient_scale = false,
     data_row_reseed = false,
+    // #1893: production Python fits use the realised-rank REML/Laplace
+    // complexity ledger by default; callers can set false for historical A/B.
+    rank_charge_evidence = true,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -2346,6 +2349,7 @@ fn sae_manifold_fit<'py>(
     run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
+    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -2405,6 +2409,7 @@ fn sae_manifold_fit<'py>(
         run_outer_rho_search,
         quotient_scale,
         data_row_reseed,
+        rank_charge_evidence,
     )
 }
 
@@ -2594,7 +2599,7 @@ fn stagewise_progress_py<'py>(
     cone_atom_recovery = false,
     // #5/(B) — appended LAST (after cone_atom_recovery) so the signature stays
     // strictly additive: existing positional/kwarg callers are byte-unaffected.
-    rank_charge_evidence = false,
+    rank_charge_evidence = true,
     // Rung 1 (B4) — the harvest-emitted output-Fisher factor stack `(n, p, r)` and
     // its provenance tag. Appended LAST so the signature stays strictly additive.
     // Presence installs the metric on the seed term (carried across every birth /
@@ -2716,8 +2721,8 @@ fn sae_manifold_fit_stagewise<'py>(
     // from `quotient_scale` (which the stagewise entry never sets): this only arms
     // the stable breach-gated boundary retraction, never the #2022 per-Newton fold.
     base_term.set_cone_atom_recovery(cone_atom_recovery);
-    // #5/(B) — rank-charge evidence criterion (default false ⇒ bit-for-bit
-    // historical). Replaces the coord-block ½log|H_tt| with the realised-rank BIC.
+    // #5/(B) — rank-charge evidence criterion (default true: the valid realised-rank
+    // REML/Laplace complexity ledger). Replaces the coord-block ½log|H_tt| with the realised-rank BIC.
     base_term.set_rank_charge_evidence(rank_charge_evidence);
     // Rung 1 (B4) — install the harvest-emitted output-Fisher `RowMetric` on the
     // seed term BEFORE the fit consumes it. `fit_stagewise` carries the seed's
@@ -2836,7 +2841,16 @@ fn sae_manifold_fit_stagewise<'py>(
     // `detach`) and already re-enters Python (raising there) each event.
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let result = match progress_hook {
-        Some(hook) => gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, z_view, None, weights.as_deref(), &config, Some(hook), None),
+        Some(hook) => gam::terms::sae::manifold::fit_stagewise(
+            base_term,
+            init_rho,
+            z_view,
+            None,
+            weights.as_deref(),
+            &config,
+            Some(hook),
+            None,
+        ),
         None => {
             // The worker thread is `'static`, but `z_view` borrows the (Python)
             // numpy buffer — own the target so nothing non-`'static` crosses in
@@ -2844,7 +2858,16 @@ fn sae_manifold_fit_stagewise<'py>(
             let target_owned = z_view.to_owned();
             let worker_cancel = std::sync::Arc::clone(&cancel_flag);
             run_sae_fit_interruptible(py, "gam-sae-stagewise", &cancel_flag, move || {
-                gam::terms::sae::manifold::fit_stagewise(base_term, init_rho, target_owned.view(), None, weights.as_deref(), &config, None, Some(&*worker_cancel))
+                gam::terms::sae::manifold::fit_stagewise(
+                    base_term,
+                    init_rho,
+                    target_owned.view(),
+                    None,
+                    weights.as_deref(),
+                    &config,
+                    None,
+                    Some(&*worker_cancel),
+                )
             })?
         }
     }
@@ -2982,6 +3005,7 @@ fn sae_manifold_fit_inner<'py>(
     run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
+    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -3236,10 +3260,13 @@ fn sae_manifold_fit_inner<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
-    // #2022/#2023 — install the typed per-fit opt-ins before the fit consumes the
-    // term. Default false ⇒ bit-for-bit historical path.
+    // #2022/#2023/#1893 — install typed per-fit switches before the fit consumes
+    // the term. The quotient/data-row recovery levers remain opt-in; the Python
+    // surface defaults the rank-charge evidence ledger on because the historical
+    // coordinate-block Laplace charge mis-prices vanishing/co-collapsed atoms.
     base_term.set_quotient_scale(quotient_scale);
     base_term.set_data_row_reseed(data_row_reseed);
+    base_term.set_rank_charge_evidence(rank_charge_evidence);
     // #2022 SEED peel — moved here from the (env-free) padded-blocks builder.
     // Quotient on ⇒ gauge-fix each seed decoder onto the unit Frobenius sphere
     // with its magnitude in the explicit log-amplitude (reconstruction preserved:
@@ -3472,23 +3499,24 @@ fn sae_manifold_fit_inner<'py>(
     // (the objective bails out of its next outer eval).
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
-    let (mut objective, run_result) = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
-        let run_result = if run_outer_rho_search {
-            let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
-                .with_initial_rho(init_rho_flat.clone())
-                .with_seed_config(gam::solver::seeding::SeedConfig {
-                    max_seeds: 1,
-                    seed_budget: 1,
-                    ..Default::default()
-                });
-            problem.run(&mut objective, "SAE manifold").map(|_| ())
-        } else {
-            objective
-                .fit_at_fixed_rho(init_rho_flat.view())
-                .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
-        };
-        (objective, run_result)
-    })?;
+    let (mut objective, run_result) =
+        run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
+            let run_result = if run_outer_rho_search {
+                let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+                    .with_initial_rho(init_rho_flat.clone())
+                    .with_seed_config(gam::solver::seeding::SeedConfig {
+                        max_seeds: 1,
+                        seed_budget: 1,
+                        ..Default::default()
+                    });
+                problem.run(&mut objective, "SAE manifold").map(|_| ())
+            } else {
+                objective
+                    .fit_at_fixed_rho(init_rho_flat.view())
+                    .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
+            };
+            (objective, run_result)
+        })?;
     run_result.map_err(estimation_error_to_pyerr)?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
@@ -3619,7 +3647,9 @@ fn sae_manifold_fit_inner<'py>(
             objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
             let (mut objective, run_result) =
                 run_sae_fit_interruptible(py, "gam-sae-fit-structured", &cancel_flag, move || {
-                    let run_result = problem.run(&mut objective, "SAE manifold (structured)").map(|_| ());
+                    let run_result = problem
+                        .run(&mut objective, "SAE manifold (structured)")
+                        .map(|_| ());
                     (objective, run_result)
                 })?;
             run_result.map_err(estimation_error_to_pyerr)?;
@@ -4366,7 +4396,9 @@ fn sae_manifold_fit_inner<'py>(
             );
         ledger.record(&coordinate_fidelity_certificate);
         let topology_persistence_certificate =
-            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(&fit_diagnostics.topology_persistence);
+            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(
+                &fit_diagnostics.topology_persistence,
+            );
         ledger.record(&topology_persistence_certificate);
         if let Some(report) = &fit_diagnostics.incoherence_report {
             ledger.record(report);
@@ -5134,6 +5166,7 @@ fn sae_manifold_fit_ibp<'py>(
         true,
         false,
         false,
+        true,
     )
 }
 
