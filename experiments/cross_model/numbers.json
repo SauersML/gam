@@ -1,0 +1,44 @@
+{
+  "model_a": "Qwen3-8B L18",
+  "model_b": "Qwen3.6-35B-A3B L20",
+  "model_a_path": "/projects/standard/hsiehph/sauer354/models/qwen3-8b",
+  "model_b_path": "/projects/standard/hsiehph/sauer354/models/qwen3.6-35b-a3b",
+  "layer_a": 18,
+  "layer_b": 20,
+  "dataset": "Salesforce/wikitext/wikitext-103-raw-v1/train",
+  "max_length": 384,
+  "alignment": "exact shared tokenizer character spans in the same WikiText documents",
+  "pca_a": {
+    "mean_norm": 99.31133297467109,
+    "top_pc_variance_fraction": 0.9913113171379451,
+    "score_plane_norm": 6155.310379618656,
+    "qr_first_column_norm": 0.9999999999999999
+  },
+  "pca_b": {
+    "mean_norm": 1.9722608110097974,
+    "top_pc_variance_fraction": 0.5707718148865626,
+    "score_plane_norm": 104.25016195693992,
+    "qr_first_column_norm": 0.9999999999999999
+  },
+  "transport": {
+    "n_matched": 30000,
+    "degree": -1,
+    "degree_concentration": 0.35979394350013066,
+    "degree_phase": -2.3254915316458935,
+    "winding": -1,
+    "phase": -2.3254915316458935,
+    "phase_degrees": -133.24085005672322,
+    "o2_defect": 0.6402060564998693,
+    "o2_resultant_shift": 0.3539602982519815,
+    "o2_resultant_reflect": 0.35979394350013066,
+    "gauge_defect_scale": 0.011547005383792516,
+    "rigid_class": "mixing",
+    "topology_preserved": false,
+    "verdict": "not a shared feature by this coordinate",
+    "smooth_isometry_defect": 1.1478045838842152,
+    "smooth_residual_rms": 1.3495862232859355,
+    "smooth_min_directional_derivative": -3.340591978108529,
+    "smooth_fourier_harmonics": 10,
+    "smooth_ridge_lambda": 3.0
+  }
+}
