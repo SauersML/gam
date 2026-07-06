@@ -1533,6 +1533,18 @@ pub fn require_likelihood_spec_supports_joint_wiggle(
     }
 }
 
+/// Family-agnostic capability of the joint link-wiggle machinery: which base
+/// inverse links a monotone warp can be fit over AND reconstructed from at
+/// predict time. Every state-less standard link qualifies — the warp fit and
+/// its saved-model reconstruction evaluate the base inverse link purely through
+/// the generic `inverse_link_jet_for_inverse_link` jet dispatch, which carries
+/// LogLog and Cauchit exactly as it does Logit/Probit/CLogLog. LogLog/Cauchit
+/// were previously omitted, so a binomial `flexible(loglog)`/`flexible(cauchit)`
+/// fit that this-gate-agnostically *converged* (see
+/// `binomial_inverse_link_supports_joint_wiggle`) then failed at predict when
+/// `FittedModel::saved_link_wiggle` re-checked the saved link here (#2155). The
+/// state-bearing links (SAS/BetaLogistic/Mixture/LatentCLogLog) carry fitted
+/// warp/skew state of their own and are intentionally excluded.
 pub const fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
@@ -1541,6 +1553,8 @@ pub const fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
             | InverseLink::Standard(StandardLink::Logit)
             | InverseLink::Standard(StandardLink::Probit)
             | InverseLink::Standard(StandardLink::CLogLog)
+            | InverseLink::Standard(StandardLink::LogLog)
+            | InverseLink::Standard(StandardLink::Cauchit)
     )
 }
 
@@ -1555,12 +1569,25 @@ pub fn require_inverse_link_supports_joint_wiggle(
     }
 }
 
+/// Which binomial base links the joint link-wiggle (flexible-link) solver can
+/// fit. All five standard binomial probability links qualify: the wiggle kernel
+/// (`BinomialMeanWiggleFamily`) evaluates the base inverse link purely through
+/// the generic `inverse_link_jet_for_inverse_link` dispatch, which carries full
+/// jets for LogLog and Cauchit exactly as it does for Logit/Probit/CLogLog — so
+/// `flexible(loglog)` / `flexible(cauchit)` fit through the same machinery
+/// (#2155). Previously this gate listed only logit/probit/cloglog while the
+/// permissive parse gate `linkname_supports_joint_wiggle` admitted loglog/cauchit,
+/// so the config was accepted then aborted deep in the solver. The state-bearing
+/// links (SAS/BetaLogistic/Mixture/LatentCLogLog) and identity/log stay out: the
+/// warp is defined only over a fixed state-less base probability link.
 pub const fn binomial_inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
         InverseLink::Standard(StandardLink::Logit)
             | InverseLink::Standard(StandardLink::Probit)
             | InverseLink::Standard(StandardLink::CLogLog)
+            | InverseLink::Standard(StandardLink::LogLog)
+            | InverseLink::Standard(StandardLink::Cauchit)
     )
 }
 
@@ -1573,7 +1600,7 @@ pub fn require_binomial_inverse_link_supports_joint_wiggle(
     } else {
         Err(FormulaDslError::IncompatibleTerm {
             reason: format!(
-                "{context} does not support identity, log, latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted logit/probit/cloglog links"
+                "{context} does not support identity, log, latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted standard binomial probability links (logit/probit/cloglog/loglog/cauchit)"
             ),
         }
         .into())
