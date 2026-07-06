@@ -16,6 +16,7 @@ from ._penalty_bridge import (
     GumbelTemperatureSchedule,
     validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
 )
+from ._sparse_dictionary import sparse_dictionary_fit
 from ._sae_trust import atom_trust_scores, coerce_sae_trust_diagnostics
 
 
@@ -2652,6 +2653,25 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             )
         else:
             top_k_arg = top_k_int
+    # Front-door lane admission: the dense exact manifold engine is the small-K
+    # certification lane only. Once its `N x K` assignment state would exceed the
+    # response matrix scale `N x P` (equivalently K > P), route to the sparse-code
+    # trainer before constructing dense logits / coordinates. The returned object
+    # carries canonical `(indices, codes)` state and no dense assignment matrix.
+    if k_atoms > int(x.shape[1]):
+        if a_init is not None or t_init is not None:
+            raise ValueError(
+                "sae_manifold_fit sparse front-door lane does not accept dense "
+                "a_init/t_init warm starts; provide sparse dictionary state instead."
+            )
+        sparse_active = int(top_k_arg if top_k_arg is not None else 1)
+        return sparse_dictionary_fit(
+            np.ascontiguousarray(x, dtype=np.float32),
+            k_atoms,
+            active=sparse_active,
+            max_epochs=max_iter_total,
+            score_mode="required",
+        )
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
     # amortized encoder can predict `(a_init, t_init)` and have the joint solver

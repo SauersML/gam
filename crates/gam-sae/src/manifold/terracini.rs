@@ -52,14 +52,20 @@
 //! ⇒ margin 1, excess 0; collision ⇒ margin → 0, risks diverge; overcomplete
 //! `Σ(d_k+1) > p` is refused with the Terracini bound named.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_solve::row_sampling_measure::RowSamplingMeasure;
 use ndarray::{Array1, Array2, ArrayView2};
 
 use faer::Side;
 
 use super::{SaeManifoldAtom, SaeManifoldTerm};
+
+/// Designed certification target per atom. This is the reviewer's requested
+/// `~10^4` scale, expressed as a named certifier policy rather than an
+/// allocation-side threshold.
+pub const TERRACINI_CERTIFIER_ROWS_PER_ATOM: usize = 10_000;
 
 /// One atom's contribution to a parse: its value `g_k(t)` and its
 /// amplitude-scaled tangent block `a_k · ∂g_k`.
@@ -317,6 +323,9 @@ pub struct TerraciniConfig {
     pub pair_pass: bool,
     /// Per-atom margin reservoir size for the quantile estimate.
     pub reservoir_cap: usize,
+    /// Per-atom designed rows gathered before certification. The selected row
+    /// set is sparse/reservoir state, never a dense `N×K` materialization.
+    pub reservoir_rows_per_atom: usize,
 }
 
 impl Default for TerraciniConfig {
@@ -329,6 +338,7 @@ impl Default for TerraciniConfig {
             max_clique_atoms: 16,
             pair_pass: true,
             reservoir_cap: 256,
+            reservoir_rows_per_atom: TERRACINI_CERTIFIER_ROWS_PER_ATOM,
         }
     }
 }
@@ -676,6 +686,105 @@ pub fn stratified_rows_for_coverage(
         .collect()
 }
 
+/// Designed row reservoir for Terracini certification.
+///
+/// The first pass draws a measure-designed sample carrying the same row-design
+/// object used by the honesty-weighted fit path; the second pass actively tops
+/// up rare atoms by round-robin coverage so low-occupancy atoms are not audited
+/// on weaker evidence merely because their rows were scarce under the global
+/// measure. Returned rows are sorted and unique.
+pub fn designed_reservoir_rows_for_coverage(
+    rows_with_patterns: &[(usize, Vec<usize>)],
+    measure: Option<&RowSamplingMeasure>,
+    q: usize,
+    cap: usize,
+    seed: u64,
+) -> Result<Vec<usize>, String> {
+    if rows_with_patterns.is_empty() || q == 0 || cap == 0 {
+        return Ok(Vec::new());
+    }
+    let mut selected = BTreeSet::new();
+    if let Some(measure) = measure {
+        let n_rows = rows_with_patterns
+            .iter()
+            .map(|(row, _)| *row)
+            .max()
+            .map_or(0usize, |row| row + 1);
+        if measure.n_rows() != n_rows {
+            return Err(format!(
+                "designed_reservoir_rows_for_coverage: measure covers {} rows but patterns cover {n_rows}",
+                measure.n_rows()
+            ));
+        }
+        let sample = measure.designed_subsample(cap, seed);
+        let eligible: BTreeSet<usize> = rows_with_patterns.iter().map(|(row, _)| *row).collect();
+        for row in sample.rows {
+            if eligible.contains(&row) {
+                selected.insert(row);
+            }
+        }
+    }
+
+    let topup = stratified_rows_for_coverage(rows_with_patterns, q, cap);
+    for row in topup {
+        if selected.len() >= cap {
+            break;
+        }
+        selected.insert(row);
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn sparse_rows_with_patterns(
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    k_atoms: usize,
+) -> Result<Vec<(usize, Vec<usize>)>, String> {
+    if indices.dim() != codes.dim() {
+        return Err(format!(
+            "sparse_rows_with_patterns: indices shape {:?} != codes shape {:?}",
+            indices.dim(),
+            codes.dim()
+        ));
+    }
+    let mut rows = Vec::new();
+    for row in 0..indices.nrows() {
+        let mut atoms = BTreeSet::new();
+        for slot in 0..indices.ncols() {
+            let code = codes[[row, slot]];
+            if code == 0.0 {
+                continue;
+            }
+            let atom = indices[[row, slot]] as usize;
+            if atom >= k_atoms {
+                return Err(format!(
+                    "sparse_rows_with_patterns: atom index {atom} out of range 0..{k_atoms}"
+                ));
+            }
+            atoms.insert(atom);
+        }
+        if atoms.len() >= 2 {
+            rows.push((row, atoms.into_iter().collect()));
+        }
+    }
+    Ok(rows)
+}
+
+fn sparse_code_amplitude(
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    row: usize,
+    atom: usize,
+) -> f64 {
+    let mut amplitude = 0.0_f64;
+    for slot in 0..indices.ncols() {
+        if indices[[row, slot]] as usize == atom {
+            amplitude += codes[[row, slot]] as f64;
+        }
+    }
+    amplitude
+}
+
 /// Scan a set of sampled rows and produce the terracini report.
 ///
 /// `rows_with_patterns` are the sampled `(row, active-atoms)`; `amplitudes` is
@@ -729,6 +838,87 @@ pub fn terracini_scan(
         }
     }
     agg.finish()
+}
+
+/// Reservoir-sized Terracini scan from the canonical sparse-code state.
+///
+/// `indices/codes` are the sparse `N×s` routing state. Certification first
+/// gathers a designed, per-atom-covered row reservoir and then evaluates only
+/// those rows, with amplitudes read from the sparse code slots. No dense `N×K`
+/// assignment matrix or `N×P` curved-prediction cache is constructed.
+pub fn terracini_scan_sparse_codes(
+    term: &SaeManifoldTerm,
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    measure: Option<&RowSamplingMeasure>,
+    seed: u64,
+    cfg: &TerraciniConfig,
+) -> Result<TerraciniReport, String> {
+    if cfg.mode == TerraciniMode::Off {
+        return Ok(TerraciniAggregator::new(cfg.flag_margin, cfg.reservoir_cap, cfg.mode).finish());
+    }
+    if indices.nrows() != term.n_obs() {
+        return Err(format!(
+            "terracini_scan_sparse_codes: sparse codes have {} rows but term has {}",
+            indices.nrows(),
+            term.n_obs()
+        ));
+    }
+    let rows_with_patterns = sparse_rows_with_patterns(indices, codes, term.k_atoms())?;
+    let cap = cfg
+        .reservoir_rows_per_atom
+        .saturating_mul(term.k_atoms())
+        .min(rows_with_patterns.len());
+    let rows = designed_reservoir_rows_for_coverage(
+        &rows_with_patterns,
+        measure,
+        cfg.reservoir_rows_per_atom,
+        cap,
+        seed,
+    )?;
+    let selected: BTreeSet<usize> = rows.into_iter().collect();
+    let mut agg = TerraciniAggregator::new(cfg.flag_margin, cfg.reservoir_cap, cfg.mode);
+    for (row, pattern) in rows_with_patterns {
+        if !selected.contains(&row) {
+            continue;
+        }
+        agg.note_row();
+        let blocks: Vec<ParseBlock> = pattern
+            .iter()
+            .map(|&k| {
+                parse_block_from_term(
+                    term,
+                    k,
+                    row,
+                    sparse_code_amplitude(indices, codes, row, k),
+                )
+            })
+            .collect();
+        if cfg.pair_pass {
+            for i in 0..blocks.len() {
+                for j in (i + 1)..blocks.len() {
+                    if let Ok(cert) = parse_certificate(
+                        &[blocks[i].clone(), blocks[j].clone()],
+                        cfg.noise_var,
+                        cfg.ridge,
+                    ) {
+                        agg.record_pair(
+                            blocks[i].atom,
+                            blocks[j].atom,
+                            cert.margin,
+                            cert.amplification,
+                        );
+                    }
+                }
+            }
+        }
+        if pattern.len() <= cfg.max_clique_atoms {
+            if let Ok(cert) = parse_certificate(&blocks, cfg.noise_var, cfg.ridge) {
+                agg.record_clique(row, &cert);
+            }
+        }
+    }
+    Ok(agg.finish())
 }
 
 #[cfg(test)]
