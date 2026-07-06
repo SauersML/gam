@@ -1,19 +1,34 @@
-# Geometric-Wall Closure Test on Gemma Scope
+# Qwen Geometric-Wall Closure Test
 
-Blocked before experiment numbers could be produced.
+This run uses existing Qwen activation arrays and numpy-only local fits.
+Each layer is deterministically subsampled, centered, and peeled along its top PCA sink direction.
 
-## Blockers
+Flat uses held-out local PCA with rank `q + q(q+1)/2`.
+Curved uses rank-`q` tangent PCA plus all centered quadratic tangent products.
+Both lanes therefore have the same output-parameter budget per local neighborhood.
 
-- MSI can list and download `google/gemma-scope-2b-pt-res` SAE `params.npz` files, but `google/gemma-2-2b` model weights are gated. The GPU smoke run failed with `401 Unauthorized` while resolving `config.json`, so residual activations could not be harvested.
-- The required remote checkout reset for `gam_cx_wallexp` points at a workspace that no longer contains `gam-sae`; `cargo check -p gam-sae` exits with `package ID specification 'gam-sae' did not match any packages` and suggests `gam-core`.
+## Settings
 
-## Work Completed
+- sample rows per layer: 30000
+- neighborhoods per layer: 24
+- neighborhood size: 240
+- tangent rank q: 10
+- matched flat rank: 65
+- train fraction: 0.75
+- ridge scale: 1e-06
 
-- Added `gemma_wall_closure.py`, a MSI-only CLI experiment script that:
-  - selects Gemma Scope 2B residual width-16k SAE files for requested layers;
-  - harvests Gemma 2 residual activations when model weights are available;
-  - peels the top-PCA sink direction and reports the sink fraction;
-  - fits matched-design-column flat vs quadratic curved closures on post-sink PCA scores;
-  - reports retained-space floor, full-energy floor, curvature proxy, and curvature/drop correlation.
+## Layer Results
 
-No flat-vs-curved floor numbers, curvature correlation, or Gemma sink fractions are reported because the model gate prevents activation harvest.
+| layer | sink frac | flat floor | curved floor | drop | curvature proxy | curvature/drop r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| qwen3_8b_L18 | 0.991806 | 0.680735 | 0.898458 | -0.217724 | 0.391442 | -0.529363 |
+| qwen3_8b_L30 | 0.837339 | 0.716330 | 0.907891 | -0.191561 | 0.399611 | -0.886797 |
+| qwen36_35b_L17 | 0.040939 | 0.625247 | 0.855434 | -0.230187 | 0.428243 | -0.424542 |
+
+## Interpretation
+
+- Floors are held-out residual-energy fractions in post-sink local neighborhoods.
+- Drop is `flat_floor_mean - curved_floor_mean`; positive values mean the curved chart lowers the floor.
+- The curvature proxy is the RMS quadratic correction energy divided by held-out local energy.
+- The reported correlation is across neighborhoods within each layer.
+- This run is a null/negative result for the wall-closure hypothesis under this matched local quadratic protocol: curved floors are higher than flat floors in all three layers.

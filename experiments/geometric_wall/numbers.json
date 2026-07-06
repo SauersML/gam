@@ -1,10 +1,534 @@
 {
-  "status": "blocked",
-  "blockers": [
-    "MSI is not authenticated for gated google/gemma-2-2b model weights; the GPU smoke run failed with 401 Unauthorized while resolving config.json.",
-    "After the mandated git fetch/reset in <DATA_ROOT>/gam_cx_wallexp, Cargo.toml contains gam-core and gam-pyffi but no gam-sae package, so cargo check -p gam-sae cannot run."
-  ],
-  "experiment_numbers": null,
-  "sink_fractions": null,
-  "curvature_drop_correlation": null
+  "experiment": "qwen_wall_closure",
+  "settings": {
+    "sample_rows": 30000,
+    "neighborhoods": 24,
+    "neighborhood_size": 240,
+    "neighbor_dims": 32,
+    "tangent_rank": 10,
+    "matched_flat_rank": 65,
+    "train_fraction": 0.75,
+    "ridge_scale": 1e-06,
+    "pca_oversample": 24,
+    "power_iter": 1,
+    "seed": 1729
+  },
+  "layers": [
+    {
+      "label": "qwen3_8b_L18",
+      "path": "<DATA_ROOT>/harvest_out/qwen3_8b_wikitext/resid_L18.npy",
+      "source_shape": [
+        300000,
+        4096
+      ],
+      "sample_rows": 30000,
+      "dimension": 4096,
+      "sink_top_pc_fraction": 0.9918056479433954,
+      "tangent_rank": 10,
+      "quadratic_columns": 55,
+      "matched_flat_rank": 65,
+      "neighborhoods": 24,
+      "neighborhood_size": 240,
+      "train_fraction": 0.75,
+      "flat_floor_mean": 0.6807347522770241,
+      "flat_floor_median": 0.6852236325099026,
+      "curved_floor_mean": 0.8984582960364579,
+      "curved_floor_median": 0.9023789765956545,
+      "drop_mean": -0.21772354375943379,
+      "drop_median": -0.20974051774334634,
+      "curvature_proxy_mean": 0.3914419732095959,
+      "curvature_proxy_median": 0.3814964558411904,
+      "curvature_drop_correlation": -0.5293632562300641,
+      "neighborhood_results": [
+        {
+          "flat_floor": 0.6734507792619873,
+          "curved_floor": 0.9009894075089574,
+          "drop": -0.22753862824697013,
+          "curvature_proxy": 0.3854282469225916
+        },
+        {
+          "flat_floor": 0.7465837380663124,
+          "curved_floor": 0.9552173431887422,
+          "drop": -0.2086336051224298,
+          "curvature_proxy": 0.35369839718328655
+        },
+        {
+          "flat_floor": 0.6230089413913908,
+          "curved_floor": 0.8945182240862417,
+          "drop": -0.27150928269485086,
+          "curvature_proxy": 0.3851598538905311
+        },
+        {
+          "flat_floor": 0.6833296352715301,
+          "curved_floor": 0.9037685456823515,
+          "drop": -0.22043891041082142,
+          "curvature_proxy": 0.43204186807013717
+        },
+        {
+          "flat_floor": 0.6792849731418281,
+          "curved_floor": 0.8818689461565182,
+          "drop": -0.2025839730146901,
+          "curvature_proxy": 0.41188784795809436
+        },
+        {
+          "flat_floor": 0.5149441958346721,
+          "curved_floor": 0.7407334727872164,
+          "drop": -0.22578927695254425,
+          "curvature_proxy": 0.45341517705079026
+        },
+        {
+          "flat_floor": 0.7417753834149574,
+          "curved_floor": 0.9498320055189802,
+          "drop": -0.20805662210402276,
+          "curvature_proxy": 0.3641961976235787
+        },
+        {
+          "flat_floor": 0.6853225309966089,
+          "curved_floor": 0.8932745905317727,
+          "drop": -0.20795205953516382,
+          "curvature_proxy": 0.37783305779184967
+        },
+        {
+          "flat_floor": 0.7353058413936611,
+          "curved_floor": 0.9450577186262947,
+          "drop": -0.20975187723263367,
+          "curvature_proxy": 0.3662229771239577
+        },
+        {
+          "flat_floor": 0.6851247340231964,
+          "curved_floor": 0.9216572075366599,
+          "drop": -0.23653247351346351,
+          "curvature_proxy": 0.39165357272175144
+        },
+        {
+          "flat_floor": 0.6404609547269647,
+          "curved_floor": 0.9236547632030812,
+          "drop": -0.2831938084761164,
+          "curvature_proxy": 0.4399797206744062
+        },
+        {
+          "flat_floor": 0.5199516790448729,
+          "curved_floor": 0.7840189558115062,
+          "drop": -0.2640672767666332,
+          "curvature_proxy": 0.4721838241228788
+        },
+        {
+          "flat_floor": 0.7341766664381812,
+          "curved_floor": 0.94859478935662,
+          "drop": -0.21441812291843876,
+          "curvature_proxy": 0.3890027196075307
+        },
+        {
+          "flat_floor": 0.6435750320304122,
+          "curved_floor": 0.8501950945197208,
+          "drop": -0.20662006248930853,
+          "curvature_proxy": 0.425564486816062
+        },
+        {
+          "flat_floor": 0.6806585189392356,
+          "curved_floor": 0.8989144345419784,
+          "drop": -0.21825591560274282,
+          "curvature_proxy": 0.37084999697610027
+        },
+        {
+          "flat_floor": 0.6129034233582957,
+          "curved_floor": 0.8311401548798437,
+          "drop": -0.218236731521548,
+          "curvature_proxy": 0.43282269762433123
+        },
+        {
+          "flat_floor": 0.6963171516478419,
+          "curved_floor": 0.8976395196337758,
+          "drop": -0.20132236798593384,
+          "curvature_proxy": 0.37646927846813644
+        },
+        {
+          "flat_floor": 0.7207272332271377,
+          "curved_floor": 0.9304563914811967,
+          "drop": -0.20972915825405902,
+          "curvature_proxy": 0.3486151135346149
+        },
+        {
+          "flat_floor": 0.75060447373962,
+          "curved_floor": 0.9685239500467445,
+          "drop": -0.2179194763071245,
+          "curvature_proxy": 0.3741769905043722
+        },
+        {
+          "flat_floor": 0.656080670606584,
+          "curved_floor": 0.8357539506011938,
+          "drop": -0.1796732799946098,
+          "curvature_proxy": 0.3870328307876884
+        },
+        {
+          "flat_floor": 0.7368550146250431,
+          "curved_floor": 0.946106616754837,
+          "drop": -0.20925160212979388,
+          "curvature_proxy": 0.37309387136597133
+        },
+        {
+          "flat_floor": 0.7290728161921993,
+          "curved_floor": 0.9286333991024914,
+          "drop": -0.1995605829102921,
+          "curvature_proxy": 0.346491580865241
+        },
+        {
+          "flat_floor": 0.7049631828523578,
+          "curved_floor": 0.8884618863639723,
+          "drop": -0.18349870351161446,
+          "curvature_proxy": 0.3658744371378176
+        },
+        {
+          "flat_floor": 0.743156484423688,
+          "curved_floor": 0.9439877369542934,
+          "drop": -0.2008312525306054,
+          "curvature_proxy": 0.37091261220858085
+        }
+      ]
+    },
+    {
+      "label": "qwen3_8b_L30",
+      "path": "<DATA_ROOT>/harvest_out/qwen3_8b_wikitext/resid_L30.npy",
+      "source_shape": [
+        300000,
+        4096
+      ],
+      "sample_rows": 30000,
+      "dimension": 4096,
+      "sink_top_pc_fraction": 0.8373386808932243,
+      "tangent_rank": 10,
+      "quadratic_columns": 55,
+      "matched_flat_rank": 65,
+      "neighborhoods": 24,
+      "neighborhood_size": 240,
+      "train_fraction": 0.75,
+      "flat_floor_mean": 0.7163297349992318,
+      "flat_floor_median": 0.7273910718919752,
+      "curved_floor_mean": 0.9078911635913425,
+      "curved_floor_median": 0.9232941576639391,
+      "drop_mean": -0.19156142859211078,
+      "drop_median": -0.18511399623901498,
+      "curvature_proxy_mean": 0.39961125649608453,
+      "curvature_proxy_median": 0.3901881484652201,
+      "curvature_drop_correlation": -0.8867972936795734,
+      "neighborhood_results": [
+        {
+          "flat_floor": 0.810504313867669,
+          "curved_floor": 0.9952588080460044,
+          "drop": -0.18475449417833545,
+          "curvature_proxy": 0.412031709496538
+        },
+        {
+          "flat_floor": 0.7688433491692338,
+          "curved_floor": 0.9331749846876531,
+          "drop": -0.16433163551841934,
+          "curvature_proxy": 0.31156237817452126
+        },
+        {
+          "flat_floor": 0.8342162741048174,
+          "curved_floor": 0.9662530500226751,
+          "drop": -0.13203677591785778,
+          "curvature_proxy": 0.29852961370884545
+        },
+        {
+          "flat_floor": 0.6980917179912245,
+          "curved_floor": 0.9346995383206079,
+          "drop": -0.23660782032938343,
+          "curvature_proxy": 0.448482678166531
+        },
+        {
+          "flat_floor": 0.6637101995471612,
+          "curved_floor": 0.8721897732703455,
+          "drop": -0.20847957372318437,
+          "curvature_proxy": 0.42371536526400627
+        },
+        {
+          "flat_floor": 0.5476429409777106,
+          "curved_floor": 0.7622267557451465,
+          "drop": -0.21458381476743593,
+          "curvature_proxy": 0.5032236354584859
+        },
+        {
+          "flat_floor": 0.7637666518896202,
+          "curved_floor": 0.9318774957500419,
+          "drop": -0.16811084386042163,
+          "curvature_proxy": 0.36496529289951507
+        },
+        {
+          "flat_floor": 0.6740627301541311,
+          "curved_floor": 0.9522275575375457,
+          "drop": -0.27816482738341464,
+          "curvature_proxy": 0.457483707288016
+        },
+        {
+          "flat_floor": 0.7659816937630073,
+          "curved_floor": 0.9239332581745845,
+          "drop": -0.1579515644115772,
+          "curvature_proxy": 0.35967886608906635
+        },
+        {
+          "flat_floor": 0.8365993325767892,
+          "curved_floor": 1.0015689726030077,
+          "drop": -0.1649696400262185,
+          "curvature_proxy": 0.37655824874875105
+        },
+        {
+          "flat_floor": 0.5190441470353906,
+          "curved_floor": 0.7767712855047891,
+          "drop": -0.25772713846939854,
+          "curvature_proxy": 0.49042723759787754
+        },
+        {
+          "flat_floor": 0.7014956888932334,
+          "curved_floor": 0.9535109974412096,
+          "drop": -0.25201530854797616,
+          "curvature_proxy": 0.5007360196412263
+        },
+        {
+          "flat_floor": 0.7450306415973865,
+          "curved_floor": 0.9205138108663046,
+          "drop": -0.17548316926891805,
+          "curvature_proxy": 0.3914053035318897
+        },
+        {
+          "flat_floor": 0.5641688981998191,
+          "curved_floor": 0.773337547604842,
+          "drop": -0.2091686494050229,
+          "curvature_proxy": 0.4355113900029808
+        },
+        {
+          "flat_floor": 0.7174763292434486,
+          "curved_floor": 0.9302137791847124,
+          "drop": -0.21273744994126376,
+          "curvature_proxy": 0.4033969945571924
+        },
+        {
+          "flat_floor": 0.6054232870082148,
+          "curved_floor": 0.8425406183512522,
+          "drop": -0.23711733134303736,
+          "curvature_proxy": 0.48394141754458697
+        },
+        {
+          "flat_floor": 0.688773658695568,
+          "curved_floor": 0.8742471569952625,
+          "drop": -0.1854734982996945,
+          "curvature_proxy": 0.3715472319483304
+        },
+        {
+          "flat_floor": 0.7411244571783843,
+          "curved_floor": 0.9206700648129107,
+          "drop": -0.17954560763452643,
+          "curvature_proxy": 0.3696196306912454
+        },
+        {
+          "flat_floor": 0.7325633068148661,
+          "curved_floor": 0.9148009216778488,
+          "drop": -0.18223761486298262,
+          "curvature_proxy": 0.38897099339855057
+        },
+        {
+          "flat_floor": 0.6645554890729999,
+          "curved_floor": 0.8525024807135264,
+          "drop": -0.18794699164052653,
+          "curvature_proxy": 0.4276890438087921
+        },
+        {
+          "flat_floor": 0.8507926121361538,
+          "curved_floor": 0.9690562106919106,
+          "drop": -0.11826359855575685,
+          "curvature_proxy": 0.2976199546507826
+        },
+        {
+          "flat_floor": 0.7550810188660202,
+          "curved_floor": 0.9059758352678532,
+          "drop": -0.150894816401833,
+          "curvature_proxy": 0.37391870079665657
+        },
+        {
+          "flat_floor": 0.7222188369690843,
+          "curved_floor": 0.9226550571532938,
+          "drop": -0.20043622018420948,
+          "curvature_proxy": 0.37616262780424803
+        },
+        {
+          "flat_floor": 0.8207460642296286,
+          "curved_floor": 0.9591819657688929,
+          "drop": -0.13843590153926433,
+          "curvature_proxy": 0.32349211463739386
+        }
+      ]
+    },
+    {
+      "label": "qwen36_35b_L17",
+      "path": "<DATA_ROOT>/msae_l17/L17_train.f32.npy",
+      "source_shape": [
+        1204602,
+        2048
+      ],
+      "sample_rows": 30000,
+      "dimension": 2048,
+      "sink_top_pc_fraction": 0.040939236240234385,
+      "tangent_rank": 10,
+      "quadratic_columns": 55,
+      "matched_flat_rank": 65,
+      "neighborhoods": 24,
+      "neighborhood_size": 240,
+      "train_fraction": 0.75,
+      "flat_floor_mean": 0.625246588367301,
+      "flat_floor_median": 0.6368905613325972,
+      "curved_floor_mean": 0.855433859240153,
+      "curved_floor_median": 0.8645571327526388,
+      "drop_mean": -0.23018727087285207,
+      "drop_median": -0.2262096247778012,
+      "curvature_proxy_mean": 0.4282427367120632,
+      "curvature_proxy_median": 0.42349743549588215,
+      "curvature_drop_correlation": -0.42454245772152976,
+      "neighborhood_results": [
+        {
+          "flat_floor": 0.5841737217799672,
+          "curved_floor": 0.7922177955718102,
+          "drop": -0.20804407379184298,
+          "curvature_proxy": 0.42157202986415765
+        },
+        {
+          "flat_floor": 0.5435698078766935,
+          "curved_floor": 0.7681726306610368,
+          "drop": -0.2246028227843433,
+          "curvature_proxy": 0.46433488098881015
+        },
+        {
+          "flat_floor": 0.6752960608095239,
+          "curved_floor": 0.8904093801860594,
+          "drop": -0.21511331937653555,
+          "curvature_proxy": 0.3937085017996162
+        },
+        {
+          "flat_floor": 0.6527941612129688,
+          "curved_floor": 0.8637127941155176,
+          "drop": -0.21091863290254875,
+          "curvature_proxy": 0.4223701042839549
+        },
+        {
+          "flat_floor": 0.6727210927006053,
+          "curved_floor": 0.9262360406795801,
+          "drop": -0.2535149479789748,
+          "curvature_proxy": 0.4231600317477472
+        },
+        {
+          "flat_floor": 0.569188082873469,
+          "curved_floor": 0.8475201447007327,
+          "drop": -0.27833206182726367,
+          "curvature_proxy": 0.5301452921566077
+        },
+        {
+          "flat_floor": 0.7052772667764999,
+          "curved_floor": 0.9134048142641049,
+          "drop": -0.20812754748760498,
+          "curvature_proxy": 0.3707244077844806
+        },
+        {
+          "flat_floor": 0.6777016336336271,
+          "curved_floor": 0.8982778214414484,
+          "drop": -0.2205761878078213,
+          "curvature_proxy": 0.3790737702644172
+        },
+        {
+          "flat_floor": 0.6707020122471045,
+          "curved_floor": 0.9039449012724352,
+          "drop": -0.23324288902533075,
+          "curvature_proxy": 0.3741778505298928
+        },
+        {
+          "flat_floor": 0.6617308609460895,
+          "curved_floor": 0.8736946883190144,
+          "drop": -0.21196382737292496,
+          "curvature_proxy": 0.4102600976847777
+        },
+        {
+          "flat_floor": 0.621411216891536,
+          "curved_floor": 0.7984993834078804,
+          "drop": -0.1770881665163444,
+          "curvature_proxy": 0.416981323123383
+        },
+        {
+          "flat_floor": 0.6122529079572921,
+          "curved_floor": 0.8324004684228379,
+          "drop": -0.22014756046554573,
+          "curvature_proxy": 0.42383483924401705
+        },
+        {
+          "flat_floor": 0.49826104196814613,
+          "curved_floor": 0.7420209556496203,
+          "drop": -0.2437599136814742,
+          "curvature_proxy": 0.4773023112609978
+        },
+        {
+          "flat_floor": 0.6183276205370346,
+          "curved_floor": 0.8553714368985114,
+          "drop": -0.23704381636147676,
+          "curvature_proxy": 0.43760829920773636
+        },
+        {
+          "flat_floor": 0.548291093802032,
+          "curved_floor": 0.7933745022527845,
+          "drop": -0.2450834084507525,
+          "curvature_proxy": 0.4388221899323307
+        },
+        {
+          "flat_floor": 0.6565937195444319,
+          "curved_floor": 0.90271099710969,
+          "drop": -0.24611727756525814,
+          "curvature_proxy": 0.3976110883031203
+        },
+        {
+          "flat_floor": 0.6644837925247331,
+          "curved_floor": 0.9124932305754491,
+          "drop": -0.24800943805071596,
+          "curvature_proxy": 0.4386114752117013
+        },
+        {
+          "flat_floor": 0.6361960780466935,
+          "curved_floor": 0.8539103720836099,
+          "drop": -0.21771429403691633,
+          "curvature_proxy": 0.44524643352300963
+        },
+        {
+          "flat_floor": 0.6099783137694389,
+          "curved_floor": 0.8344420210031168,
+          "drop": -0.22446370723367792,
+          "curvature_proxy": 0.42805036839937416
+        },
+        {
+          "flat_floor": 0.6193303748082302,
+          "curved_floor": 0.871302331845835,
+          "drop": -0.2519719570376049,
+          "curvature_proxy": 0.41676226961879786
+        },
+        {
+          "flat_floor": 0.5583824637855376,
+          "curved_floor": 0.7636504569958332,
+          "drop": -0.20526799321029565,
+          "curvature_proxy": 0.47170045066388355
+        },
+        {
+          "flat_floor": 0.642551332494558,
+          "curved_floor": 0.8994989876827494,
+          "drop": -0.2569476551881914,
+          "curvature_proxy": 0.43991709302157495
+        },
+        {
+          "flat_floor": 0.6691184192105095,
+          "curved_floor": 0.9277449952342548,
+          "drop": -0.2586265760237453,
+          "curvature_proxy": 0.4447232470296538
+        },
+        {
+          "flat_floor": 0.6375850446185009,
+          "curved_floor": 0.86540147138976,
+          "drop": -0.22781642677125913,
+          "curvature_proxy": 0.41112732544547614
+        }
+      ]
+    }
+  ]
 }
