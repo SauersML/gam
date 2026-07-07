@@ -2522,8 +2522,12 @@ fn stagewise_atoms_py<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
+            // #2135 — emit the FULL-width decoder `B = Q B̃` so a reloaded
+            // checkpoint carries the canonical `M × p` block on the standard inner
+            // basis; the #1117 reduced frame is a fit-internal device and must not
+            // escape. Unchanged for un-reduced atoms.
             "decoder_B",
-            atom.decoder_coefficients.clone().into_pyarray(py),
+            atom.full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
         atom_dict.set_item("latent_dim", atom.latent_dim)?;
@@ -4240,8 +4244,14 @@ fn sae_manifold_fit_inner<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
+            // #2135 — emit the FULL-width decoder `B = Q B̃` (`M × p`). When this
+            // atom was #1117 rank-reduced, `decoder_coefficients` is the reduced
+            // `B̃` (`r × p`) in a fit-internal eigenvector frame; the OOS / steer /
+            // reconstruct consumers rebuild the standard `M`-column inner basis, so
+            // they must receive the re-expanded decoder that decodes that design.
+            // `full_width_decoder` is the stored block unchanged for un-reduced atoms.
             "decoder_B",
-            atom.decoder_coefficients.clone().into_pyarray(py),
+            atom.full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
         atom_dict.set_item("basis_centers", py.None())?;
@@ -4295,7 +4305,15 @@ fn sae_manifold_fit_inner<'py>(
             // budget — the python reader treats the key as optional and the band
             // quantities below remain exact.
             if let Some(cov) = &unc.decoder_covariance {
-                atom_dict.set_item("decoder_covariance", cov.clone().into_pyarray(py))?;
+                // #2135 — the emitted decoder is the FULL-width `M × p` block, so
+                // its covariance must live in the same `M`-frame. For a #1117
+                // rank-reduced atom the assembled covariance is the reduced
+                // `(r·p)²`; lift it by the `(Q ⊗ I_p)` congruence to the exact
+                // `(M·p)²` posterior of `Q B̃`. Identity clone for un-reduced atoms.
+                let cov_full = atom
+                    .lift_reduced_decoder_covariance(cov, p_out)
+                    .map_err(py_value_error)?;
+                atom_dict.set_item("decoder_covariance", cov_full.into_pyarray(py))?;
             }
             atom_dict.set_item(
                 "shape_band_coords",
@@ -4539,7 +4557,13 @@ fn sae_manifold_fit_inner<'py>(
         let entry = PyDict::new(py);
         let kind = &atom.basis_kind;
         let latent_dim = atom.latent_dim;
-        let basis_size = atom.basis_size();
+        // #2135 — report the FULL inner-basis width `M` (== `basis_size` for an
+        // un-reduced atom, `Q.nrows()` for a #1117 rank-reduced one). This MUST
+        // match the re-expanded `M × p` decoder emitted above and the standard
+        // inner basis the OOS / reconstruct paths rebuild; emitting the reduced
+        // `r` here (with the full decoder) would desync the `n_harmonics` /
+        // `basis_size` round-trip from the decoder width.
+        let basis_size = atom.full_basis_size();
         let kind_name = sae_atom_basis_kind_name(kind);
         // Recover the per-(axis-)harmonic order from the fitted basis width for
         // the harmonic families; 0 for the non-harmonic kinds (the python reader

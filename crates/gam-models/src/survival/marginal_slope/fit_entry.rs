@@ -2,17 +2,44 @@
 
 use super::*;
 
-/// Fixed log-λ pinned on the marginal/logslope null-space (polynomial-trend)
-/// smoothing parameters as a numerical-identifiability floor (gam#979). The
-/// builder's `DoublePenaltyNullspace` block is unit-Frobenius normalised, so
-/// `λ = e^0 = 1` places O(1) curvature on the trend direction — enough to hold
-/// the penalized-Hessian condition number bounded (cond ≤ ~λ_max ≈ 1e6 ≪ 1/√eps
-/// at the penalty-dominated operating point), while remaining far too mild to
-/// bias a trend the data already identifies. REML is barred from lowering it
-/// (degenerate `pinned_rho_slots` box), so the trend can never collapse back to
-/// the flat, deadlock-forming mode; statistical shrinkage still runs through the
-/// surface's primary wiggliness penalty.
+/// `ln` of the #1082 rank tolerance `KKT_REFUSAL_RANK_TOL = 1e-10` — the ratio
+/// `γ/λ_max` below which the coupled joint-Newton's spectral step drops a mode
+/// as near-null gauge. The marginal/logslope null-space identifiability floor
+/// (gam#979) is derived from this: a mode is dropped iff its curvature falls
+/// below `rank_tol · λ_max`, so pinning the null-space ridge above that keeps
+/// the trend direction resolved. Mirrors `joint_newton.rs::KKT_REFUSAL_RANK_TOL`.
+const NULLSPACE_DEADLOCK_RANK_TOL_LN: f64 = -23.025_850_929_940_457; // ln(1e-10)
+
+/// `ln` of the conditioning-headroom margin `M` the identifiability floor sits
+/// above the bare `rank_tol · λ_max` deadlock threshold (gam#979). `M = 100`
+/// (two orders) is numerical headroom, not a fit-tuned knob: it absorbs the gap
+/// between the setup-time λ_max proxy (raw design Gram) and the trust-metric-
+/// whitened λ_max the inner solver actually thresholds against, while staying
+/// far below any level that would shrink a data-identified trend.
+const NULLSPACE_IDENTIFIABILITY_MARGIN_LN: f64 = 4.605_170_185_988_091; // ln(100)
+
+/// Fallback pinned log-λ used only when the λ_max proxy cannot be estimated
+/// (empty design or a non-finite Gram). `λ = e^0 = 1` on the unit-Frobenius
+/// `DoublePenaltyNullspace` block — a mild, always-safe identifiability ridge.
 const NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA: f64 = 0.0;
+
+/// Estimate `λ_max(XᵀX)` for a surface design as the setup-time proxy for the
+/// penalized-Hessian curvature scale that the #1082 null_cutoff thresholds
+/// against (gam#979). Materializes the (small-`p`) design and reads the top
+/// eigenvalue of its Gram. Returns `None` when the design is empty or the Gram
+/// spectrum is not finite, so the caller falls back to the mild fixed floor.
+fn surface_gram_lambda_max(design: &DesignMatrix, label: &str) -> Option<f64> {
+    let dense = design
+        .try_to_dense_by_chunks_budgeted(label, PREFLIGHT_MATERIALIZATION_BUDGET_BYTES)
+        .ok()?;
+    if dense.ncols() == 0 || dense.nrows() == 0 {
+        return None;
+    }
+    let gram = dense.t().dot(&dense);
+    gam_linalg::utils::symmetric_extremes(&gram)
+        .map(|(_lambda_min, lambda_max)| lambda_max)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
@@ -706,22 +733,44 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // wiggliness penalty.
     {
         use gam_terms::basis::PenaltySource;
+        // Derive the pinned floor from THIS fit's curvature scale so it clears
+        // the #1082 deadlock threshold `rank_tol · λ_max` (with margin M) for
+        // any λ_max, rather than a fixed λ=1 that is too low on a stiff Hessian
+        // (gam#979). `λ_max` is proxied at setup by the largest eigenvalue of
+        // the surface design Grams (the whitened operating-point λ_max the inner
+        // solver thresholds against is only available mid-PIRLS; the margin M
+        // absorbs the proxy gap). floor = ln(M) + ln(rank_tol) + ln(λ_max),
+        // clamped into the interior of the ρ box so the pin stays feasible.
+        let lambda_max_proxy = [
+            surface_gram_lambda_max(&marginal_design.design, "smgs #979 marginal gram"),
+            surface_gram_lambda_max(&logslope_design.design, "smgs #979 logslope gram"),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0.0_f64, f64::max);
+        let floor_log_lambda = if lambda_max_proxy > 0.0 {
+            (NULLSPACE_IDENTIFIABILITY_MARGIN_LN
+                + NULLSPACE_DEADLOCK_RANK_TOL_LN
+                + lambda_max_proxy.ln())
+            .clamp(NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA, 11.0)
+        } else {
+            NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA
+        };
+        log::info!(
+            "[survival-marginal-slope] gam#979 null-space identifiability floor: λ_max_proxy={:.3e} pinned_log_lambda={:.3}",
+            lambda_max_proxy,
+            floor_log_lambda,
+        );
         let marginal_offset = time_penalties_len;
         for info in marginal_design.penaltyinfo.iter() {
             if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
-                pinned_rho_slots.push((
-                    marginal_offset + info.global_index,
-                    NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA,
-                ));
+                pinned_rho_slots.push((marginal_offset + info.global_index, floor_log_lambda));
             }
         }
         let logslope_offset = time_penalties_len + marginal_design.penalties.len();
         for info in logslope_design.penaltyinfo.iter() {
             if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
-                pinned_rho_slots.push((
-                    logslope_offset + info.global_index,
-                    NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA,
-                ));
+                pinned_rho_slots.push((logslope_offset + info.global_index, floor_log_lambda));
             }
         }
     }
