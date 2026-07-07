@@ -190,11 +190,38 @@ pub fn recover_spikes(
         .collect();
 
     let threshold = order_threshold(&singular_values, rows, cols, sigma);
-    let model_order = singular_values
+    let threshold_order = singular_values
         .iter()
         .filter(|&&s| s > threshold)
         .count()
         .min(max_order);
+
+    // Scale-invariant rank refinement. When the singular spectrum shows an
+    // unambiguous relative collapse `σ_{k+1}/σ_k < DRAMATIC_GAP`, that gap pins the
+    // true model order regardless of the supplied `sigma`. This makes the decoder
+    // robust to a mis-specified noise level in either direction: a caller passing a
+    // conservative (over-large) population sigma would otherwise under-select and
+    // drop genuine spikes, while f32-quantised inputs leave a numerical shelf
+    // (`σ ≈ 1e-7·σ_1`) far above the f64 numerical floor that would otherwise be
+    // over-selected. A dramatic gap only ever occurs between signal and the
+    // quantisation/round-off shelf, never within a genuinely noisy spectrum (whose
+    // signal→noise drop is far shallower), so honest GD order selection is
+    // preserved when no such gap exists.
+    const DRAMATIC_GAP: f64 = 1e-4;
+    let gap_order = {
+        let mut order = None;
+        for k in 1..max_order.min(singular_values.len()) {
+            if singular_values[k - 1] <= 0.0 {
+                break;
+            }
+            if singular_values[k] / singular_values[k - 1] < DRAMATIC_GAP {
+                order = Some(k);
+                break;
+            }
+        }
+        order
+    };
+    let model_order = gap_order.unwrap_or(threshold_order);
 
     if model_order == 0 {
         // Pure noise / no resolvable spike: the whole signal is the residual.
@@ -220,12 +247,19 @@ pub fn recover_spikes(
         .eigenvalues()
         .map_err(|e| format!("matrix-pencil eigenproblem failed: {e:?}"))?;
 
-    // Unit-modulus phasors and circle positions t = arg(z)/(2π) mod 1.
+    // Unit-modulus phasors and circle positions t = arg(z)/(2π) mod 1. The pencil
+    // is built from `svd.V()`, whose columns span the conjugate of the Hankel row
+    // space (faer returns `V` for the decomposition `A = U S Vᴴ`), so the pencil
+    // eigenvalues come out as the conjugate phasors `z̄ = 1/z` — arg-negated, i.e.
+    // reflected positions `1 − t`. Conjugating here recovers the generating phasor
+    // `z = e^{2πi t}` for both the position read AND the downstream Vandermonde
+    // amplitude solve (which otherwise fits the wrong frequencies and leaves a
+    // large residual). See `exact_recovery_two_spikes_no_noise`.
     let phasors: Vec<c64> = roots
         .iter()
         .map(|z| {
             let norm = z.norm();
-            if norm > 0.0 { z / norm } else { c64::new(1.0, 0.0) }
+            if norm > 0.0 { z.conj() / norm } else { c64::new(1.0, 0.0) }
         })
         .collect();
     let positions: Vec<f64> = phasors

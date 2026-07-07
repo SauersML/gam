@@ -365,27 +365,14 @@ fn maybe_super_resolve(z: &[f64], sigma: f64) -> (Vec<MeasureSpikeCoordinate>, f
     let min_sep = separation_limit(h_count);
     let single_residual_coeffs = coeffs_from_code(&single_residual);
     let eta = harmonic_dual_birth_eta(&single_residual_coeffs, single.amplitude);
-    let residual_modes = count_separated_positive_modes(&single_residual, min_sep);
-    let code_modes = count_separated_positive_modes(z, min_sep);
-    let residual_is_multimodal = residual_modes > 1;
-    let code_is_multimodal = code_modes > 1;
+    let residual_is_multimodal = count_separated_positive_modes(&single_residual, min_sep) > 1;
+    let code_is_multimodal = count_separated_positive_modes(z, min_sep) > 1;
     if eta <= 1.0 && !residual_is_multimodal && !code_is_multimodal {
         return (vec![single], eta, false);
     }
 
-    // Prony order selection: pass the noiseless numerical-rank path rather than
-    // the population radial-scatter `sigma`. `sigma` (from `radius_and_sigma`) is
-    // the scatter of `‖z‖` across firings, so it is inflated by amplitude spread
-    // between rows and is deliberately conservative (see
-    // `amplitude_readout_and_conservative_sigma`). Feeding it as the per-coefficient
-    // noise to the Gavish–Donoho threshold pushes genuine spikes below the order
-    // floor and collapses super-resolution to the single-coordinate readout. The
-    // entry gate above (dual η / matched-filter multimodality) is the statistical
-    // multiplicity test; here we take the exact algebraic rank and then cap the
-    // accepted multiplicity by the number of separated matched-filter modes so a
-    // noisy block cannot over-select up to ⌊H/2⌋ spurious spikes.
     let coeffs = coeffs_from_code(z);
-    let recovery = match recover_spikes(&coeffs, 0.0) {
+    let recovery = match recover_spikes(&coeffs, sigma) {
         Ok(recovery) => recovery,
         Err(_err) => return (vec![single], eta, false),
     };
@@ -393,15 +380,11 @@ fn maybe_super_resolve(z: &[f64], sigma: f64) -> (Vec<MeasureSpikeCoordinate>, f
         return (vec![single], eta, false);
     }
 
-    // Detected multiplicity: modes visible in the code, plus the one spike the
-    // single-fit already removed (which the single residual's modes expose).
-    let detected_modes = code_modes.max(residual_modes + 1).max(1);
     let max_by_separation = if min_sep.is_finite() && min_sep > 0.0 {
         (1.0 / min_sep).floor().max(1.0) as usize
     } else {
         recovery.spikes.len()
     };
-    let max_by_separation = detected_modes.min(max_by_separation);
     let mut sorted = recovery.spikes;
     sorted.sort_by(|a, b| b.amplitude.total_cmp(&a.amplitude));
     let mut accepted = Vec::new();
@@ -1088,66 +1071,6 @@ mod tests {
             .into_iter()
             .map(|v| v as f32)
             .collect()
-    }
-
-    #[test]
-    fn debug_dump_super_resolve_internals() {
-        let h_count = 8;
-        let t1 = 0.20;
-        let t2 = 0.55;
-        let z: Vec<f64> = harmonic_code(&[(t1, 1.0), (t2, 0.7)], h_count)
-            .iter()
-            .map(|&v| v as f64)
-            .collect();
-        let min_sep = separation_limit(h_count);
-        let (single, single_residual, single_residual_norm) = single_harmonic_spike(&z, 0.0);
-        let code_modes = count_separated_positive_modes(&z, min_sep);
-        let residual_modes = count_separated_positive_modes(&single_residual, min_sep);
-        let eta =
-            harmonic_dual_birth_eta(&coeffs_from_code(&single_residual), single.amplitude);
-        eprintln!(
-            "DBG min_sep={min_sep} single_coord={} single_amp={} single_res_norm={} \
-             code_modes={code_modes} residual_modes={residual_modes} eta={eta}",
-            single.coordinate, single.amplitude, single_residual_norm
-        );
-        let coeffs = coeffs_from_code(&z);
-        // Inline replica of super_resolution::coeffs_from_spikes for comparison.
-        let inline = |spikes: &[(f64, f64)]| -> Vec<(f64, f64)> {
-            (1..=h_count)
-                .map(|h| {
-                    let mut c = 0.0;
-                    let mut s = 0.0;
-                    for &(t, a) in spikes {
-                        let phase = TAU * (h as f64) * t;
-                        c += a * phase.cos();
-                        s += a * phase.sin();
-                    }
-                    (c, s)
-                })
-                .collect()
-        };
-        let inline_055 = inline(&[(0.20, 1.0), (0.55, 0.7)]);
-        let inline_045 = inline(&[(0.20, 1.0), (0.45, 0.7)]);
-        eprintln!("DBG coeffs_from_code={:?}", coeffs);
-        eprintln!("DBG inline_055     ={inline_055:?}");
-        for (label, cf) in [
-            ("code", &coeffs),
-            ("inline055", &inline_055),
-            ("inline045", &inline_045),
-        ] {
-            match crate::super_resolution::recover_spikes(cf, 0.0) {
-                Ok(rec) => eprintln!(
-                    "DBG recover[{label}]: order={} residual={:.4} spikes={:?}",
-                    rec.model_order,
-                    rec.residual,
-                    rec.spikes
-                        .iter()
-                        .map(|s| (format!("{:.4}", s.t), format!("{:.4}", s.amplitude)))
-                        .collect::<Vec<_>>()
-                ),
-                Err(e) => eprintln!("DBG recover[{label}] ERR: {e}"),
-            }
-        }
     }
 
     fn row_matrix(rows: &[Vec<f32>]) -> Array2<f32> {
