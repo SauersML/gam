@@ -3605,11 +3605,12 @@ impl SaeManifoldTerm {
 
     /// #1026 — the fitted per-row assignment masses `a[i,k]` (the activation
     /// amplitudes `z_k` the amortized encode recovers `t` against), as an
-    /// `n × K` matrix. These are exactly the masses
-    /// [`Self::try_fitted_with_rho`] assembles the reconstruction from, so
-    /// feeding them to [`Self::amortized_encode_target`] re-encodes the SAME
-    /// inference the dictionary was fit against — the self-consistency the
-    /// distilled encoder is supervised to approximate.
+    /// `n × K` matrix. These are the realised positive intensities
+    /// `a_{ik}·exp(s_k)` that [`Self::try_fitted_with_rho`] multiplies into each
+    /// atom's unit-shape decoded row.  The gate `a_{ik}` remains the existence
+    /// posterior/indicator, while the atom log-amplitude `s_k` is the radial
+    /// intensity scale; feeding the product to [`Self::amortized_encode_target`]
+    /// re-encodes the SAME inference the dictionary was fit against.
     pub fn fitted_assignment_amplitudes(
         &self,
         rho: &SaeManifoldRho,
@@ -3620,7 +3621,8 @@ impl SaeManifoldTerm {
         for row in 0..n {
             let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
             for atom_idx in 0..k_atoms {
-                amplitudes[[row, atom_idx]] = a[atom_idx];
+                amplitudes[[row, atom_idx]] =
+                    a[atom_idx] * self.atoms[atom_idx].log_amplitude.exp();
             }
         }
         Ok(amplitudes)
