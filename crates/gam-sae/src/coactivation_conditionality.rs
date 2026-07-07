@@ -934,6 +934,9 @@ fn golden_section_minimize<F>(evaluate: &mut F, mut left: f64, mut right: f64) -
 where
     F: FnMut(f64) -> Result<PenalizedFit, String>,
 {
+    // inv_phi = (sqrt(5) - 1)/2, the reciprocal golden ratio 1/phi; golden-section
+    // search shrinks the bracket by this factor each step so the two interior
+    // probes can be reused across iterations.
     let inv_phi = (5.0_f64.sqrt() - 1.0) * 0.5;
     let mut c = right - inv_phi * (right - left);
     let mut d = left + inv_phi * (right - left);
