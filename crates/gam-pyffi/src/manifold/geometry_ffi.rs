@@ -30,24 +30,6 @@ fn sae_set_ibp_alpha(alpha: f64) {
     gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
 }
 
-/// K-aware default IBP concentration `α` (#1784) from the Rust source of truth
-/// `assignment::default_ibp_concentration_for_k_atoms`. Exposed so the Python
-/// facade calls the core formula (`α = max(1, 1/(exp(1/K) − 1))`) instead of
-/// mirroring it — the thin-wrapper SPEC: no numeric policy lives in Python.
-#[pyfunction]
-fn sae_default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
-    gam::terms::sae::assignment::default_ibp_concentration_for_k_atoms(k_atoms)
-}
-
-/// Default large-K active cap from the data-per-atom ratio, from the Rust source
-/// of truth `assignment::default_top_k_for_large_dictionary`. Returns Python
-/// `None` when the dense softmax path is admitted (`N/K ≥ K`, or `K ≤ 1`), and
-/// otherwise the per-row cap `clamp(ceil(N/K), 1, K−1)`.
-#[pyfunction]
-fn sae_default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Option<usize> {
-    gam::terms::sae::assignment::default_top_k_for_large_dictionary(n_obs, k_atoms)
-}
-
 #[pyfunction]
 fn sae_fit_admission<'py>(
     py: Python<'py>,
@@ -4278,14 +4260,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_ibp_alpha, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        sae_default_ibp_concentration_for_k_atoms,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        sae_default_top_k_for_large_dictionary,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
@@ -4298,7 +4272,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySaeAmortizedEncoder>()?;
     module.add_function(wrap_pyfunction!(sae_steer_delta, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
-    module.add_function(wrap_pyfunction!(render_sae_dossier_html, module)?)?;
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_fit, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_ladder, module)?)?;
@@ -4499,7 +4472,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(routability_audit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dict_dual_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(audit_sae, module)?)?;
-    module.add_function(wrap_pyfunction!(atlas_nerve_diagram, module)?)?;
     module.add_function(wrap_pyfunction!(separation_limit, module)?)?;
     module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
     module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;

@@ -11,15 +11,6 @@
 use serde_json::Value;
 use std::fmt::Write as _;
 
-/// Append a formatted fragment to a `String` buffer. Writing to a `String` is
-/// infallible, so the `write!` `Result` is discarded via `.ok()` (an underscore
-/// discard binding is banned repo-wide, hence this macro).
-macro_rules! wr {
-    ($buf:expr, $($arg:tt)*) => {
-        write!($buf, $($arg)*).ok()
-    };
-}
-
 /// Escape a string for safe inclusion in HTML text / attribute content.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -71,11 +62,11 @@ fn convergence_section(conv: &Value) -> String {
     } else {
         "<span class=\"badge warn big\">REVIEW — guard fired or certificate open</span>"
     };
-    wr!(s, "<section class=\"card\"><h2>Convergence dossier {clean_badge}</h2>");
+    let _ = write!(s, "<section class=\"card\"><h2>Convergence dossier {clean_badge}</h2>");
 
     // Optimality certificate.
     if let Some(opt) = conv.get("optimality").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>optimality passes</span>{}</div>\
@@ -93,12 +84,12 @@ fn convergence_section(conv: &Value) -> String {
             num(opt.get("analytic_directional")),
         );
     } else if let Some(err) = conv.get("optimality_error").and_then(Value::as_str) {
-        wr!(s, "<p class=\"muted\">optimality certificate unavailable: {}</p>", esc(err));
+        let _ = write!(s, "<p class=\"muted\">optimality certificate unavailable: {}</p>", esc(err));
     }
 
     // Guard verdict + probe telemetry.
     if let Some(g) = conv.get("guard_verdict") {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>returned outer state verbatim</span>{}</div>\
@@ -113,7 +104,7 @@ fn convergence_section(conv: &Value) -> String {
         );
     }
     if let Some(p) = conv.get("outer_probe") {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>criterion calls</span><b>{}</b></div>\
@@ -128,7 +119,7 @@ fn convergence_section(conv: &Value) -> String {
         );
     }
     if let Some(w) = conv.get("curvature_walk").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>curvature walk arrived (η=1)</span>{}</div>\
@@ -150,9 +141,9 @@ fn convergence_section(conv: &Value) -> String {
         .and_then(Value::as_array)
         .unwrap_or(&empty);
     if collapse.is_empty() {
-        wr!(s, "<p class=\"muted\">collapse ledger: empty (no active-mass breaches)</p>");
+        let _ = write!(s, "<p class=\"muted\">collapse ledger: empty (no active-mass breaches)</p>");
     } else {
-        wr!(s, "<p class=\"muted\">collapse ledger: {} event(s)</p>", collapse.len());
+        let _ = write!(s, "<p class=\"muted\">collapse ledger: {} event(s)</p>", collapse.len());
     }
     s.push_str("</section>");
     s
@@ -173,10 +164,10 @@ fn atom_card(atom: &Value) -> String {
     } else {
         ""
     };
-    wr!(s, "<div class=\"atom\"><h3>#{idx} · {name}{flag}</h3><div class=\"grid\">");
+    let _ = write!(s, "<div class=\"atom\"><h3>#{idx} · {name}{flag}</h3><div class=\"grid\">");
 
     if let Some(t) = atom.get("trust").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>trust score</span><b>{}</b></div>\
              <div class=\"kv\"><span>tangent cond</span><b>{}</b></div>\
@@ -189,7 +180,7 @@ fn atom_card(atom: &Value) -> String {
         );
     }
     if let Some(l) = atom.get("lens").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>presence</span><b>{}</b></div>\
              <div class=\"kv\"><span>coupling</span><b>{}</b></div>\
@@ -202,7 +193,7 @@ fn atom_card(atom: &Value) -> String {
         );
     }
     if let Some(sh) = atom.get("shape_band").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>mean band sd</span><b>{}</b></div>\
              <div class=\"kv\"><span>max band sd</span><b>{}</b></div>",
@@ -211,7 +202,7 @@ fn atom_card(atom: &Value) -> String {
         );
     }
     if let Some(tp) = atom.get("topology").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>measured Betti</span><b>{}</b></div>\
              <div class=\"kv\"><span>expected Betti</span><b>{}</b></div>\
@@ -221,7 +212,7 @@ fn atom_card(atom: &Value) -> String {
             num(tp.get("dominant_h1_persistence")),
         );
         if let Some(nc) = tp.get("null_calibration").filter(|v| !v.is_null()) {
-            wr!(
+            let _ = write!(
                 s,
                 "<div class=\"kv\"><span>null p-value</span><b>{}</b></div>\
                  <div class=\"kv\"><span>spike-in power</span><b>{}</b></div>",
@@ -231,7 +222,7 @@ fn atom_card(atom: &Value) -> String {
         }
     }
     if let Some(inf) = atom.get("inference").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>decoder variation</span><b>{}</b></div>\
              <div class=\"kv\"><span>log-e non-constant</span><b>{}</b></div>",
@@ -240,7 +231,7 @@ fn atom_card(atom: &Value) -> String {
         );
     }
     if let Some(st) = atom.get("steering").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>steering nats/Δt</span><b>{}</b></div>\
              <div class=\"kv\"><span>validity radius</span><b>{}</b></div>",
@@ -249,7 +240,7 @@ fn atom_card(atom: &Value) -> String {
         );
     }
     if let Some(cf) = atom.get("coordinate_fidelity").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"kv\"><span>uniformity p</span><b>{}</b></div>\
              <div class=\"kv\"><span>arclength defect</span><b>{}</b></div>",
@@ -259,7 +250,7 @@ fn atom_card(atom: &Value) -> String {
     }
     s.push_str("</div>");
     if let Some(cp) = atom.get("contested_probe").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             s,
             "<div class=\"probe\"><b>designed probe:</b> {}<br><span class=\"muted\">{}</span></div>",
             str_field(cp.get("claim")),
@@ -284,9 +275,9 @@ pub fn render_dossier_html(feature: &Value, convergence: Option<&Value>, title: 
 
     // Feature-dossier header.
     let n_atoms = feature.get("n_atoms").and_then(Value::as_u64).unwrap_or(0);
-    wr!(body, "<section class=\"card\"><h2>Certified feature dossier · {n_atoms} atoms</h2>");
+    let _ = write!(body, "<section class=\"card\"><h2>Certified feature dossier · {n_atoms} atoms</h2>");
     if let Some(g) = feature.get("residual_gauge") {
-        wr!(
+        let _ = write!(
             body,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>gauge group</span><b>{}</b></div>\
@@ -301,7 +292,7 @@ pub fn render_dossier_html(feature: &Value, convergence: Option<&Value>, title: 
         );
     }
     if let Some(dl) = feature.get("description_length").filter(|v| !v.is_null()) {
-        wr!(
+        let _ = write!(
             body,
             "<div class=\"grid\">\
              <div class=\"kv\"><span>total bits</span><b>{}</b></div>\

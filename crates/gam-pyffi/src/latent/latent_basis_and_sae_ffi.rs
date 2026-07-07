@@ -3589,15 +3589,7 @@ fn sae_manifold_fit_inner<'py>(
     let mut shape_uncertainty = objective
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
-    // M6 — assemble the convergence dossier from the settled objective. The
-    // dossier snapshots the outer-probe / warm-start telemetry and evaluates the
-    // FD optimality certificate BEFORE consuming the objective (cheap: four
-    // value-path probes on a cold clone), then folds in the fitted term's
-    // collapse ledger and post-fit guard verdicts. Reflects the pass-0 (iid) fit;
-    // an optional structured-residual alternation below refines the payload but
-    // the convergence provenance of the primary solve is captured here.
-    let (fitted_result, convergence_dossier) = objective.into_fitted_with_dossier();
-    let convergence_dossier_json: Option<String> = convergence_dossier.to_json().ok();
+    let fitted_result = objective.into_fitted();
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
     let mut term = fitted_result.term;
@@ -4475,31 +4467,6 @@ fn sae_manifold_fit_inner<'py>(
         "residual_gauge",
         sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
     )?;
-    // App A + M6 — the Certified Feature Dossier and the Convergence Dossier as
-    // single JSON strings the Python `ManifoldSAE` mirrors. The feature dossier
-    // re-projects the diagnostics already built above (lens, gauge, topology +
-    // null, coordinate fidelity, inference, trust) per atom and adds the per-atom
-    // steering dose + shape bands; the convergence dossier was assembled from the
-    // settled objective at `into_fitted` above. Both are grep-able artifacts, not
-    // new computation — the feature dossier recomputes nothing, it only re-lays
-    // out reports that already flow to Python field-by-field.
-    let feature_dossier = term.certified_feature_dossier(
-        &fit_diagnostics,
-        &trust_diagnostics,
-        Some(&shape_uncertainty),
-        None,
-    );
-    match feature_dossier.to_json() {
-        Ok(json) => out.set_item("feature_dossier", json)?,
-        Err(err) => {
-            log::debug!("[SAE/App-A] feature dossier serialization skipped: {err}");
-            out.set_item("feature_dossier", py.None())?;
-        }
-    }
-    match &convergence_dossier_json {
-        Some(json) => out.set_item("convergence_dossier", json.as_str())?,
-        None => out.set_item("convergence_dossier", py.None())?,
-    }
     // #1026 — the load-bearing curved-vs-linear hybrid-split verdict: per d=1
     // atom, whether its fitted curved image beats its straight (linear
     // special-case) secant on the common Laplace evidence scale. Present
