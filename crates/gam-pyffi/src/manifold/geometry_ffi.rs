@@ -5354,7 +5354,8 @@ fn block_sparse_dictionary_firings_ffi<'py>(
     residual_target = true,
     n_basis_chart = 4,
     include_bases = true,
-    name_prefix = "block"
+    name_prefix = "block",
+    block_tile = 1024
 ))]
 fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     py: Python<'py>,
@@ -5371,6 +5372,7 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     n_basis_chart: usize,
     include_bases: bool,
     name_prefix: &str,
+    block_tile: usize,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
@@ -5385,6 +5387,7 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
         n_basis_chart,
         include_bases,
         name_prefix: name_prefix.to_string(),
+        block_tile,
     };
     let manifest = detach_py_result(py, "block_sparse_dictionary_seed_manifest", move || {
         block_sparse_dictionary_seed_manifest(
@@ -5419,7 +5422,8 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     pair_top_blocks = 64,
     max_pairs = 128,
     pair_min_cofirings = 64,
-    pair_min_score = 0.20
+    pair_min_score = 0.20,
+    block_tile = 1024
 ))]
 fn block_coordinate_chart_compose_ffi<'py>(
     py: Python<'py>,
@@ -5442,6 +5446,7 @@ fn block_coordinate_chart_compose_ffi<'py>(
     max_pairs: usize,
     pair_min_cofirings: usize,
     pair_min_score: f64,
+    block_tile: usize,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
@@ -5463,6 +5468,7 @@ fn block_coordinate_chart_compose_ffi<'py>(
         max_pairs,
         pair_min_cofirings,
         pair_min_score,
+        block_tile,
     };
     let result = detach_py_result(py, "block_coordinate_chart_compose", move || {
         compose_block_coordinate_charts(

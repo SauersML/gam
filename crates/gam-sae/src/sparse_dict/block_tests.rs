@@ -622,6 +622,7 @@ fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
         n_basis_chart: 4,
         include_bases: true,
         name_prefix: "block".to_string(),
+        block_tile: 2,
     };
     let manifest = block_sparse_dictionary_seed_manifest(
         x.view(),
@@ -681,6 +682,7 @@ fn block_coordinate_chart_pair_screen_accepts_split_circle() {
         max_pairs: 1,
         pair_min_cofirings: 8,
         pair_min_score: 0.0,
+        block_tile: 2,
     };
     let result = compose_block_coordinate_charts(
         x.view(),
