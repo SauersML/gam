@@ -2437,7 +2437,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
-                     structured_residual_passes: int = 1,
+                     structured_residual_passes: int = 0,
                      promote_from_residual: bool = False,
                      _run_structure_search: bool = True,
                      _run_outer_rho_search: bool = True) -> ManifoldSAE:
@@ -2562,12 +2562,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         or the global ``sae_set_ibp_alpha`` setter still overrides it.
     structured_residual_passes
         Number of structured-residual sculpting passes run after the primary
-        joint fit. Defaults to ``1`` (on for the production iid→structured refit). Each
-        pass fits the current reconstruction residual and folds the recovered structure back into the
+        joint fit. Defaults to ``0`` (off). Each pass fits the current
+        reconstruction residual and folds the recovered structure back into the
         atom dictionary. Must be a non-negative int; the native core clamps the
         effective count to ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``),
-        so larger values behave like ``4``. Pass ``0`` explicitly to recover the
-        pre-#2021 iid-only behavior.
+        so larger values behave like ``4``. An explicit, typed opt-in — with the
+        default ``0`` the fit is bit-identical to the pre-existing behavior. The
+        default-on iid→structured refit is deferred to #2080.
     promote_from_residual
         When ``True`` (default ``False``), atoms discovered in the structured
         residual passes are promoted into the primary atom tier rather than kept
