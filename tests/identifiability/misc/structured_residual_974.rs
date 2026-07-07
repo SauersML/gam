@@ -21,9 +21,14 @@
 //!
 //!   4. **Value↔gradient consistency through the whitening seam.** With a
 //!      `WhitenedStructured` `RowMetric` installed on a real SAE term, the
-//!      whitened data-fit VALUE (`loss().data_fit`) finite-differences to the
-//!      assembled β data-fit GRADIENT (`sys.gb`) — proving the single seam feeds
-//!      both the value and the gradient (the objective↔gradient-desync cure).
+//!      whitened PENALIZED-OBJECTIVE VALUE (`penalized_objective_total`, whose
+//!      data-fit component is the whitened `½ rᵀMr`) finite-differences to the
+//!      assembled β GRADIENT (`sys.gb`) — proving the single seam feeds both the
+//!      value and the gradient of the exact objective the inner Newton step
+//!      descends (the objective↔gradient-desync cure). `sys.gb` is the gradient
+//!      of that full objective — data-fit PLUS the always-on collapse-prevention
+//!      barriers the assembly folds in — so the FD must use the same objective,
+//!      not the barrier-free `loss().total()`.
 //!
 //! No `let _`, no `#[allow(...)]`, no env vars, no new public knobs. Fixed seeds.
 
@@ -435,8 +440,13 @@ fn build_sae_term(
         SaeAssignment::from_blocks_with_mode(logits, coord_blocks, AssignmentMode::softmax(1.0))
             .expect("assignment builds");
     let term = SaeManifoldTerm::new(atoms, assignment).expect("term builds");
-    // Smoothness off (very negative log-λ) and ARD off (empty) so the ONLY
-    // β-dependent objective term is the whitened data-fit — isolating the seam.
+    // Smoothness ρ-suppressed (very negative log-λ) so the smoothness penalty is
+    // machine-negligible; the β-dependent objective is then the whitened data-fit
+    // plus the always-on, data-driven collapse-prevention barriers (decoder
+    // repulsion + separation/amplitude barrier) the assembly folds into `sys.gb`.
+    // ARD acts on the latent coordinates, not β, so it is β-independent regardless
+    // of its strength. The FD in the test uses `penalized_objective_total`, which
+    // carries exactly the same terms as `sys.gb`.
     let log_ard: Vec<Array1<f64>> = (0..k_atoms).map(|_| Array1::from_elem(d, 0.0)).collect();
     let rho = SaeManifoldRho::new(0.0, -40.0, log_ard);
     (term, target, rho)
@@ -472,9 +482,22 @@ fn whitened_data_fit_value_matches_assembled_beta_gradient_fd() {
         .expect("assemble");
     let analytic_gb = sys.gb.clone();
 
-    // Central-difference the whitened data-fit VALUE wrt each β coordinate. With
-    // smoothness/ARD off, loss.total()'s β-dependence is purely the whitened
-    // data-fit, so ∂(loss.total)/∂β must equal the assembled β gradient.
+    // Central-difference the whitened PENALIZED-OBJECTIVE VALUE wrt each β
+    // coordinate. `sys.gb` is the β gradient of the exact scalar the inner Newton
+    // line search descends — `penalized_objective_total` — NOT of the bare
+    // `loss().total()`. Besides the whitened data-fit (and the ρ-suppressed
+    // smoothness), that objective carries the always-on, data-driven
+    // collapse-prevention terms the assembly folds straight into `sys.gb`: the
+    // collinearity-gated decoder repulsion (`add_sae_decoder_repulsion`, #1026)
+    // and the interior-point separation/amplitude barriers
+    // (`add_sae_separation_barrier`, #1522/#1610). Those are β-dependent and are
+    // present in `penalized_objective_total` (via `decoder_repulsion_value` +
+    // `separation_barrier_value`) but absent from `loss().total()`, so FDing the
+    // bare loss would spuriously disagree with `sys.gb` at any coordinate the
+    // barriers touch. FDing the SAME penalized objective the gradient is derived
+    // from is the value↔gradient-desync cure the seam claims: the whitening still
+    // enters through the data-fit component of that objective on BOTH sides, so a
+    // genuine whitening desync is still caught.
     let beta0 = term.flatten_beta();
     let h = 1e-6;
     let mut max_rel_err = 0.0_f64;
@@ -485,11 +508,15 @@ fn whitened_data_fit_value_matches_assembled_beta_gradient_fd() {
         let mut bp = beta0.clone();
         bp[idx] += h;
         term.set_flat_beta(bp.view()).expect("set +h");
-        let lp = term.loss(target.view(), &rho).expect("loss +h").total();
+        let lp = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("penalized objective +h");
         let mut bm = beta0.clone();
         bm[idx] -= h;
         term.set_flat_beta(bm.view()).expect("set -h");
-        let lm = term.loss(target.view(), &rho).expect("loss -h").total();
+        let lm = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .expect("penalized objective -h");
         term.set_flat_beta(beta0.view()).expect("restore");
         let fd = (lp - lm) / (2.0 * h);
         let an = analytic_gb[idx];
@@ -502,9 +529,9 @@ fn whitened_data_fit_value_matches_assembled_beta_gradient_fd() {
     }
     assert!(
         max_rel_err < 1e-4,
-        "whitened data-fit VALUE must finite-difference to the assembled β data-fit \
-         GRADIENT (single-seam value↔gradient consistency): worst coord {} analytic \
-         {} fd {} (max rel err {max_rel_err})",
+        "whitened penalized-objective VALUE must finite-difference to the assembled β \
+         GRADIENT (single-seam value↔gradient consistency; the whitening enters via the \
+         data-fit component): worst coord {} analytic {} fd {} (max rel err {max_rel_err})",
         worst.0,
         worst.1,
         worst.2

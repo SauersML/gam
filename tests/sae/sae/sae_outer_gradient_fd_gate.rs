@@ -324,3 +324,119 @@ fn sae_outer_rho_gradient_components_match_centered_fd_ibp_map() {
     let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
     assert_full_gradient_matches_fd("ibp_map", &f);
 }
+
+/// Centered finite difference of the FROZEN-θ penalized loss `loss.total()` at
+/// `ρ̂ ± h` along one outer coordinate. [`SaeManifoldTerm::loss`] borrows `&self`
+/// and never re-solves the inner (t, β) problem, so the inner state stays pinned
+/// at the converged `θ̂` and this difference isolates the DIRECT ρ-derivative of
+/// the data-fit + priors — exactly the analytic `explicit` channel — with no
+/// envelope / IFT term. FD-OK: audit instrument only (SPEC), never a production
+/// path; the analytic channel is authoritative.
+fn frozen_explicit_fd(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    template: &SaeManifoldRho,
+    coord: usize,
+) -> f64 {
+    let h = 2.0e-4;
+    let mut plus = template.to_flat();
+    let mut minus = template.to_flat();
+    plus[coord] += h;
+    minus[coord] -= h;
+    let rho_plus = template.from_flat(plus.view());
+    let rho_minus = template.from_flat(minus.view());
+    let lp = term
+        .loss(target.view(), &rho_plus)
+        .expect("frozen-θ loss +h")
+        .total();
+    let lm = term
+        .loss(target.view(), &rho_minus)
+        .expect("frozen-θ loss -h")
+        .total();
+    (lp - lm) / (2.0 * h)
+}
+
+/// #2087 — per-CHANNEL FD decomposition of the outer-ρ gradient, so a
+/// gradient↔objective desync is localized to a NAMED analytic channel rather
+/// than only reported as "the summed gradient disagrees with the FD".
+///
+/// The full analytic gradient is
+/// `explicit + logdet_trace + occam + third_order`. This test finite-differences
+/// the two independently-recoverable value sub-paths and attributes each:
+///
+///   * `explicit` is the direct ρ-derivative of the frozen-θ penalized loss
+///     `loss.total()` (inner state pinned at `θ̂`), recovered EXACTLY by
+///     [`frozen_explicit_fd`]. A match rules the data-fit / prior channel OUT.
+///   * the remaining `log|H|`-block `(logdet_trace + occam + third_order)` is the
+///     envelope FD of the RE-SOLVED criterion MINUS the frozen-θ `explicit` FD.
+///     A mismatch localizes the defect to the Hessian log-det derivative — the
+///     direct trace `½ tr(H⁻¹ ∂H/∂ρ)` and/or the θ-adjoint `Γ` that feeds the
+///     #1006 third-order correction (the cross-row IBP Woodbury / empirical-`M`
+///     channel of `logdet_theta_adjoint`).
+///
+/// This is the durable localization artifact for the #1798/#1795/#2087 cross-row
+/// IBP Woodbury logdet genus: a red run PRINTS the per-coordinate channel split
+/// and its assertion message NAMES the culprit block.
+fn assert_channel_decomposition(label: &str, f: &Fixture) {
+    let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
+    let components = converged
+        .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
+        .expect("analytic components");
+    let n_params = f.rho.to_flat().len();
+
+    for coord in 0..n_params {
+        let explicit_a = components.explicit[coord];
+        let logdet_a = components.logdet_trace[coord];
+        let occam_a = components.occam[coord];
+        let third_a = components.third_order_correction[coord];
+
+        // Direct (frozen-θ) FD of loss.total() ≡ the analytic `explicit` channel.
+        let explicit_fd = frozen_explicit_fd(&converged, &f.target, &f.rho, coord);
+        // Envelope FD of the RE-SOLVED criterion ≡ the FULL analytic gradient.
+        let total_fd = centered_fd(&converged, &f.target, &f.rho, coord, 8);
+        // The log|H|-block is the envelope FD minus the frozen-θ explicit FD.
+        let block_fd = total_fd - explicit_fd;
+        let block_a = logdet_a + occam_a + third_a;
+
+        eprintln!(
+            "[{label}] coord {coord}: EXPLICIT fd={explicit_fd:.6e} an={explicit_a:.6e} | \
+             logH-BLOCK fd={block_fd:.6e} an={block_a:.6e} \
+             (= logdet_trace {logdet_a:.6e} + occam {occam_a:.6e} + third_order {third_a:.6e})"
+        );
+
+        let expl_tol = 2.5e-3 * (1.0 + explicit_fd.abs().max(explicit_a.abs()));
+        assert!(
+            (explicit_fd - explicit_a).abs() <= expl_tol,
+            "[{label}] EXPLICIT channel coord {coord} desync: frozen-θ loss FD {explicit_fd:.8e} \
+             vs analytic explicit {explicit_a:.8e} — the direct data-fit/prior ρ-derivative is wrong"
+        );
+        let block_tol = 2.5e-3 * (1.0 + block_fd.abs().max(block_a.abs()));
+        assert!(
+            (block_fd - block_a).abs() <= block_tol,
+            "[{label}] log|H|-BLOCK coord {coord} desync: envelope-minus-explicit FD {block_fd:.8e} \
+             vs analytic (logdet_trace {logdet_a:.8e} + occam {occam_a:.8e} + third_order {third_a:.8e}) \
+             = {block_a:.8e}. The direct prior/data-fit channel is clean (asserted above), so the \
+             defect is in the Hessian log-det derivative: the direct trace ½tr(H⁻¹∂H/∂ρ) and/or the \
+             θ-adjoint Γ feeding the #1006 third-order (cross-row IBP Woodbury / empirical-M channel)."
+        );
+    }
+}
+
+#[test]
+fn sae_outer_rho_gradient_channel_decomposition_softmax_2087() {
+    // Control arm: softmax carries no cross-row IBP log-det channel, so BOTH the
+    // explicit and the log|H|-block FD attributions must hold — this pins that the
+    // decomposition instrument itself is sound before it is read on the IBP arm.
+    let f = fixture(AssignmentMode::softmax(0.7), -8.0);
+    assert_channel_decomposition("softmax", &f);
+}
+
+#[test]
+fn sae_outer_rho_gradient_channel_decomposition_ibp_map_2087() {
+    // Suspect arm: IBP-MAP drives the cross-row empirical-`M` / Woodbury log-det
+    // channels of `logdet_theta_adjoint`. The decomposition pins whether a #2087
+    // desync lives in the explicit prior channel or the Hessian log-det block —
+    // the located artifact a build-capable seat consumes to fix the θ-adjoint.
+    let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
+    assert_channel_decomposition("ibp_map", &f);
+}
