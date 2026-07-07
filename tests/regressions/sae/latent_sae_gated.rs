@@ -298,7 +298,18 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
         [-2.0, 1.0e-5],
         [0.5, -1.0e-5]
     ];
-    let target = array![[0.4], [1.1], [-0.7], [0.2]];
+    // `build_collapse_probe_term`'s identity decoder B = I_2 routes latent axis
+    // j → output channel j, so `output_dim = 2` and the target MUST be (n, 2)
+    // (a 1-column target indexes past the reconstruction's second channel during
+    // per-row assembly). Channel 0 carries a real signal so the reconstruction
+    // residual — and hence the dispersion φ̂ — is nonzero, keeping the ARD α
+    // finite. Channel 1 carries the same small-but-identified ±0.01 signal the
+    // sibling `reml_criterion_keeps_alpha_finite_on_collapsing_axis` uses to hold
+    // axis 1 near collapse (‖t_·1‖² → ~0 while its decoder column stays nonzero,
+    // so the axis keeps real data curvature): exactly the regime where the FS
+    // denominator on axis 1 is dominated by the posterior-variance trace
+    // tr_1(H⁻¹) that this test exercises.
+    let target = array![[0.4, 0.01], [1.1, -0.01], [-0.7, 0.01], [0.2, -0.01]];
     let term = build_collapse_probe_term(coords);
 
     let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]]);

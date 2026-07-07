@@ -849,6 +849,7 @@ where
                         lb,
                         &mut newton_direction,
                         bound_active_hint.as_mut(),
+                        None,
                     )
                 } else if let Some(arrow_cfg) = options.arrow_schur.as_ref() {
                     // Arrow-Schur structured-inner-solve path. The

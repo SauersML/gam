@@ -7535,6 +7535,7 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         RidgePolicy::explicit_stabilization_full(),
         &[Some(constraints.clone())],
         None,
+        None,
     )
     .expect("stationarity projection should succeed");
     assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
@@ -7566,9 +7567,83 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         RidgePolicy::explicit_stabilization_full(),
         &[Some(constraints)],
         None,
+        None,
     )
     .expect("stationarity projection should succeed");
     assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
+}
+
+/// gam#979: the stationarity certificate must project out the KKT multipliers of
+/// ACTIVE SIMPLE LOWER BOUNDS (the box-bound analog of the linear-constraint
+/// projection) — but ONLY when the sign is valid. A coordinate at its lower
+/// bound whose objective-gradient residual pushes INTO the bound (residual ≥ 0,
+/// a nonnegative multiplier) is at a valid constrained optimum and is projected
+/// to zero; a coordinate at its bound whose residual is NEGATIVE (wants to LEAVE
+/// the bound) is NOT optimal and MUST remain in the residual so the certificate
+/// still refuses. This regresses the survival marginal-slope hang, where the
+/// monotone-baseline-hazard block sat at its ≥0 bound with a large valid
+/// multiplier that the (linear-only) projection left in the residual, mis-
+/// refusing a genuinely-optimal constrained iterate.
+#[test]
+pub(crate) fn stationarity_projects_valid_lower_bound_multiplier_but_keeps_wrong_sign_979() {
+    // One block, width 2, β pinned at its lower bound [0, 0].
+    let spec = ParameterBlockSpec {
+        name: "box-bound".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0, 0.0],
+            [0.0, 1.0]
+        ])),
+        offset: array![0.0, 0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0, 0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let state = ParameterBlockState {
+        beta: array![0.0, 0.0],
+        eta: array![0.0, 0.0],
+    };
+    let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+    let lower_bounds = array![0.0_f64, 0.0_f64];
+
+    // residual = Sβ − gradient = −gradient (S=0). Coord 0: residual=+626 (valid
+    // nonneg lower-bound multiplier, the bound holds) → projected out. Coord 1:
+    // residual=−5 (wants to LEAVE the bound) → NOT optimal, must survive.
+    let gradient = array![-626.0_f64, 5.0_f64];
+    let inf = exact_newton_joint_stationarity_inf_norm_from_gradient(
+        &gradient,
+        std::slice::from_ref(&state),
+        std::slice::from_ref(&spec),
+        &s_lambdas,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[None],
+        None,
+        Some(&lower_bounds),
+    )
+    .expect("box-bound stationarity projection should succeed");
+    // The valid +626 multiplier is projected out; the wrong-signed −5 remains.
+    assert_relative_eq!(inf, 5.0_f64, epsilon = 1e-12);
+
+    // Without the bounds (None) the certificate has no box path and reads the
+    // raw 626 — the pre-fix behaviour that mis-refused the constrained optimum.
+    let inf_no_bounds = exact_newton_joint_stationarity_inf_norm_from_gradient(
+        &gradient,
+        std::slice::from_ref(&state),
+        std::slice::from_ref(&spec),
+        &s_lambdas,
+        0.0,
+        RidgePolicy::explicit_stabilization_full(),
+        &[None],
+        None,
+        None,
+    )
+    .expect("stationarity projection should succeed");
+    assert_relative_eq!(inf_no_bounds, 626.0_f64, epsilon = 1e-12);
 }
 
 #[test]

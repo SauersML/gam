@@ -750,6 +750,17 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
+    // gam#979: per-coordinate simple lower bounds (`f64::NEG_INFINITY` where
+    // unbounded, length = total joint p), from `extract_simple_lower_bounds` on
+    // the joint constraints. Used to project out the KKT multipliers of ACTIVE
+    // simple lower bounds — the box-bound analog of the linear-constraint
+    // projection that `projected_stationarity_inf_norm` already does. Without it
+    // the stationarity test on a `solve_quadratic_with_simple_lower_bounds`-
+    // constrained block (survival monotone baseline hazard, monotone smooths)
+    // reads the raw bound-multiplier mass (e.g. the 626 on `time_surface`) and
+    // mis-refuses a genuinely-optimal constrained iterate. `None` ⇒ no box path
+    // (byte-identical to the pre-fix / linear-constraint behaviour).
+    joint_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<f64, String> {
     if states.len() != specs.len() || states.len() != s_lambdas.len() {
         return Err(
@@ -804,6 +815,35 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
             s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![offset..offset + width]);
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
+        }
+        // gam#979 box-bound (simple lower bound) KKT residual. `residual` here is
+        // the objective gradient `r = Sβ − ∇ℓ`. The correct stationarity measure
+        // for `β_j ≥ L_j` is the PROJECTED GRADIENT
+        //     pg_j = β_j − Π_{[L_j,∞)}(β_j − r_j) = β_j − max(L_j, β_j − r_j),
+        // which (a) is byte-identical to `r_j` on any coordinate whose gradient
+        // step stays feasible (interior, or a bound that wants to be left), and
+        // (b) collapses a VALID lower-bound multiplier to the mere distance to
+        // the bound: at `β_j = L_j + ε` with `r_j ≥ 0` (gradient pushing INTO the
+        // bound), `pg_j = min(r_j, ε) = ε → 0` as the (possibly damped) iterate
+        // reaches `L_j`. This is why the certificate no longer mis-reads the huge
+        // pushing-into-bound multiplier (the 626 on the survival monotone-hazard
+        // `time_surface` coeff pinned near its ≥0 bound) as a stationarity defect
+        // — the failure mode noted just above (slack-based detection missing a
+        // damped binding row at `β = L + ε` with ε over tol). The SIGN CHECK is
+        // INTRINSIC, not a separate slack test: a coordinate at its bound whose
+        // `r_j < 0` (wants to INCREASE β_j, i.e. LEAVE the bound) has `β_j − r_j >
+        // β_j ≥ L_j`, so `pg_j = r_j` is UNCHANGED and the cert still (correctly)
+        // refuses a non-optimal point. Blocks with no simple lower bound skip this
+        // and are byte-identical to before.
+        if let Some(lowers) = joint_lower_bounds {
+            for j in 0..width {
+                let lower = lowers[offset + j];
+                if !lower.is_finite() {
+                    continue;
+                }
+                let beta_j = states[b].beta[j];
+                residual[j] = beta_j - (beta_j - residual[j]).max(lower);
+            }
         }
         let block_active_hint = block_active_sets
             .and_then(|sets| sets.get(b))

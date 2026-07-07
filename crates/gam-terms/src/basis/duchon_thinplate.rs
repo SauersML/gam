@@ -2873,7 +2873,11 @@ mod gc_spectrum_diag_1757_tests {
         x
     }
 
-    fn report(label: &str, n: usize, seed: u64) {
+    /// Returns `(p, kk, cond)`: number of positive Gram eigenvalues, knot count,
+    /// and condition number `λ_max / λ_min⁺`. The caller asserts the design-Gram
+    /// invariants (`1 ≤ p ≤ kk`, `cond` finite and `≥ 1`); the printed spectrum is
+    /// the diagnostic signal.
+    fn report(label: &str, n: usize, seed: u64) -> (usize, usize, f64) {
         let x = scatter(n, seed);
         let k = default_num_centers(n, 2);
         let knots = select_thin_plate_knots(x.view(), k).expect("knot selection");
@@ -2895,7 +2899,7 @@ mod gc_spectrum_diag_1757_tests {
         let m = ev.len();
         if m == 0 {
             eprintln!("[GC-DIAG-1757] {label} n={n}: empty spectrum");
-            return;
+            return (0, kk, f64::INFINITY);
         }
         let lam_max = ev[0];
         let eps_floor = (kk as f64) * f64::EPSILON * lam_max; // current whitening floor
@@ -2929,12 +2933,28 @@ mod gc_spectrum_diag_1757_tests {
             "[GC-DIAG-1757] {label} log10(rel eigenvalue) sampled: {}",
             sampled.join(" ")
         );
+        (m, kk, lam_max / ev[m - 1])
     }
 
     #[test]
     fn gc_spectrum_duchon_thinplate_repro_sizes() {
-        report("duchon_n500", 500, 42);
-        report("duchon_n1220", 1220, 43);
-        report("thinplate_n1200", 1200, 7);
+        // The redundancy-tail answer is left to the printed spectrum; these are
+        // structural design-Gram invariants a broken Gram/knot/kernel would
+        // violate (they do NOT presuppose the cliff-vs-power-law verdict).
+        for (label, n, seed) in [
+            ("duchon_n500", 500usize, 42u64),
+            ("duchon_n1220", 1220, 43),
+            ("thinplate_n1200", 1200, 7),
+        ] {
+            let (p, kk, cond) = report(label, n, seed);
+            assert!(
+                p >= 1 && p <= kk,
+                "{label}: positive-eigenvalue count {p} must be in 1..={kk}"
+            );
+            assert!(
+                cond.is_finite() && cond >= 1.0,
+                "{label}: condition number {cond} must be finite and >= 1"
+            );
+        }
     }
 }

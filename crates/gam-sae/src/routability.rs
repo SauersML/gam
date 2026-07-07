@@ -262,7 +262,22 @@ pub fn routability_audit(
     }
     let n_rows = per_row.len();
     if n_rows == 0 {
-        return Err("routability_audit: no residual rows with positive norm".to_string());
+        // Every residual row has (near-)zero norm: the dictionary reconstructs the
+        // data exactly, so there is no residual mass left to (mis)route. This is
+        // the ideal — fully routable — case, not an error: zero unroutable mass at
+        // every confidence level. Report a defined audit against the (geometry-only)
+        // floor with all empirical cross-gates at 0 and the full residual mass
+        // (trivially) at or below the floor.
+        return Ok(RoutabilityAudit {
+            n_rows: 0,
+            floor,
+            quantiles: quantile_levels.iter().map(|&level| (level, 0.0)).collect(),
+            empirical_mean: 0.0,
+            empirical_max: 0.0,
+            confidence_quantile: 0.0,
+            coherence_excess: 0.0,
+            fraction_below_floor: 1.0,
+        });
     }
 
     let mut sorted = per_row.clone();

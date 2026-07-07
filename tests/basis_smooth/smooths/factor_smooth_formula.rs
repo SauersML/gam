@@ -5,7 +5,7 @@ use gam::basis::BSplineKnotSpec;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::smooth::{ByVarKind, FactorSmoothFlavour, SmoothBasisSpec};
+use gam::smooth::{BySmoothKind, FactorSmoothFlavour, SmoothBasisSpec};
 use gam::terms::term_builder::build_termspec;
 
 #[test]
@@ -134,6 +134,14 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
     let cmap = ds.column_map();
     let mut notes = Vec::new();
 
+    // Unordered categorical `by=` expands to one independent per-level
+    // `ByVariable { Level }` smooth per training level (#1981, resolving
+    // #1887): production deliberately emits per-level ownership rather than a
+    // single `BySmooth { Factor }` envelope, so later hierarchy /
+    // identifiability passes see each level's block explicitly. `fac` has two
+    // levels, so the term expands to two per-level smooths. A bare `+ fac`
+    // categorical is auto-promoted to the penalized random block that owns the
+    // level offsets, so no extra fixed main effect is added here (#1457).
     let parsed = parse_formula("y ~ s(x, by=fac) + fac").unwrap();
     let spec = build_termspec(
         &parsed.terms,
@@ -143,16 +151,20 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
         &ResourcePolicy::default_library(),
     )
     .unwrap();
-    match &spec.smooth_terms[0].basis {
-        SmoothBasisSpec::BySmooth {
-            by_kind: ByVarKind::Factor { frozen_levels, .. },
-            ..
-        } => {
-            assert_eq!(frozen_levels.as_ref().unwrap().len(), 2);
-        }
-        other => panic!("expected factor by smooth, got {other:?}"),
-    }
+    assert_eq!(spec.smooth_terms.len(), 2);
+    assert!(
+        spec.smooth_terms.iter().all(|term| matches!(
+            term.basis,
+            SmoothBasisSpec::ByVariable {
+                kind: BySmoothKind::Level { .. },
+                ..
+            }
+        )),
+        "factor by= must expand to per-level ByVariable::Level smooths"
+    );
 
+    // A numeric (continuous) `by=` gates the smooth by the covariate value:
+    // a single `ByVariable { Numeric }` smooth (#1981).
     let parsed = parse_formula("y ~ s(x, by=z)").unwrap();
     let spec = build_termspec(
         &parsed.terms,
@@ -164,8 +176,8 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
     .unwrap();
     assert!(matches!(
         spec.smooth_terms[0].basis,
-        SmoothBasisSpec::BySmooth {
-            by_kind: ByVarKind::Numeric { .. },
+        SmoothBasisSpec::ByVariable {
+            kind: BySmoothKind::Numeric,
             ..
         }
     ));

@@ -1,10 +1,14 @@
 //! TARGET behavior of the redesigned non-periodic Euclidean Duchon penalty:
 //! the "Hilbert scale of FUNCTION penalties, all on by default" contract.
 //!
-//! The redesign has LANDED and these are LIVE regression guards on `main` (they
-//! pass): the default `duchon(...)` emits the full Hilbert scale of function
-//! penalties and REML deselects the unhelpful blocks. They are no longer
-//! forward-specs awaiting the core. The contract under test:
+//! The redesign's penalty CORE has landed — the default `duchon(...)` emits the
+//! full Hilbert scale of function penalties (`Primary` + `OperatorTension` +
+//! `OperatorMass` + `DoublePenaltyNullspace`). But these are NOT yet all-green:
+//! the REML-DESELECTION half of the contract is still honest-red. `null_recovery`
+//! currently FAILS — REML does not yet collapse the all-on Hilbert scale to
+//! ~zero amplitude when `x` is irrelevant, so the smooth still chases noise.
+//! That is a real, unfixed defect, not a passing guard: do NOT read this file as
+//! green until REML shrinks the unhelpful blocks. The contract under test:
 //!
 //! A default `duchon(x, k=...)` smooth (no `magnitude=`) emits a Hilbert scale
 //! of FUNCTION penalties, ALL ON BY DEFAULT, with REML deselecting the unused
