@@ -529,6 +529,7 @@ fn sae_manifold_fit_minimal<'py>(
         ibp_alpha_override.unwrap_or(alpha),
         tau,
         jumprelu_threshold,
+        top_k,
     )
     .map_err(py_value_error)?;
     // `plan_latent_dim` (computed above) is the optimizer's per-atom latent

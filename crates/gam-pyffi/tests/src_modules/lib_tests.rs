@@ -59,6 +59,44 @@ fn pyffi_sources_use_canonical_gam_module_paths() {
 }
 
 #[test]
+fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
+    let n = 4usize;
+    let k_atoms = 2usize;
+    let mut basis = ndarray::Array3::<f64>::zeros((k_atoms, n, 1));
+    for atom_idx in 0..k_atoms {
+        for row in 0..n {
+            basis[[atom_idx, row, 0]] = 1.0;
+        }
+    }
+    let z = array![[1.0], [1.0], [-1.0], [-1.0]];
+    let logits = array![[8.0, -8.0], [8.0, -8.0], [-8.0, 8.0], [-8.0, 8.0]];
+
+    let decoder = sae_decoder_lsq_init(
+        basis.view(),
+        &[1, 1],
+        z.view(),
+        logits.view(),
+        "softmax",
+        1.0,
+        1.0,
+        0.0,
+        Some(1),
+    )
+    .expect("top-k softmax seed LSQ succeeds");
+
+    assert!(
+        decoder[[0, 0, 0]] > 0.99,
+        "top_k=1 must fit atom 0 only on its selected positive rows, got {}",
+        decoder[[0, 0, 0]]
+    );
+    assert!(
+        decoder[[1, 0, 0]] < -0.99,
+        "top_k=1 must fit atom 1 only on its selected negative rows, got {}",
+        decoder[[1, 0, 0]]
+    );
+}
+
+#[test]
 fn symmetric_curvature_solve_preserves_negative_modes() {
     let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
     let rhs = array![8.0, -8.0, 1.0];
@@ -1435,6 +1473,7 @@ fn sae_decoder_lsq_init_produces_nontrivial_seed() {
         1.0, // alpha (IBP concentration; canonical default)
         0.7, // tau
         0.0, // jumprelu_threshold (unused for ibp_map)
+        None,
     )
     .expect("LSQ seed must succeed");
     assert_eq!(decoder.shape(), &[k, m, p]);
