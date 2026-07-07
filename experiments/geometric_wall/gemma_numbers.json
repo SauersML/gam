@@ -27,11 +27,11 @@
         "position0_atom_energy_fraction": 0.009003040197059735,
         "position0_rows": 179
       },
-      "path": "/projects/standard/hsiehph/sauer354/wallclosure_out/gemma/acts_L12.npy",
+      "path": "wallclosure_out/gemma/acts_L12.npy",
       "pooled_curved_floor": 0.6644258594757153,
       "pooled_drop": -0.036230701295202054,
       "pooled_flat_floor": 0.6281951581805133,
-      "positions_path": "/projects/standard/hsiehph/sauer354/wallclosure_out/gemma/positions.npy",
+      "positions_path": "wallclosure_out/gemma/positions.npy",
       "source_shape": [
         30000,
         2304
@@ -663,11 +663,11 @@
         "position0_atom_energy_fraction": 0.012660531914303589,
         "position0_rows": 179
       },
-      "path": "/projects/standard/hsiehph/sauer354/wallclosure_out/gemma/acts_L25.npy",
+      "path": "wallclosure_out/gemma/acts_L25.npy",
       "pooled_curved_floor": 0.43049978809838285,
       "pooled_drop": -0.03151883957055846,
       "pooled_flat_floor": 0.3989809485278244,
-      "positions_path": "/projects/standard/hsiehph/sauer354/wallclosure_out/gemma/positions.npy",
+      "positions_path": "wallclosure_out/gemma/positions.npy",
       "source_shape": [
         30000,
         2304
