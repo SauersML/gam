@@ -772,6 +772,59 @@ def jumprelu_bounded_gate(
     return apply(logits, thresholds, float(temperature))
 
 
+class _TopKActivationFn(torch.autograd.Function):
+    """Top-k SAE activation — a pure-torch, on-device transcription of Rust.
+
+    Forward returns the per-atom **independent**, strictly non-negative
+    activation ``a_k = τ·softplus(l_k/τ)`` the ``softmax_topk`` gate scores atoms
+    with. The math is transcribed from the Rust source of truth
+    ``gam_sae::assignment::topk_activation_row_value_grad`` and computed directly
+    in torch, so no ``(N, K)`` matrix ever crosses the Python↔Rust boundary and
+    dtype/device are preserved (works on GPU without a CPU/float64 round-trip).
+    Backward multiplies the upstream gradient by the diagonal derivative
+    ``da/dl_k = σ(l_k/τ)`` (the temperature cancels in the chain rule since
+    ``a = τ·softplus(l/τ)``). The hard top-k *selection* and its masked gradient
+    are applied by the caller on the tape — this Function owns only the smooth
+    activation and its exact derivative, the single-source-of-truth counterpart
+    to the closed-form family's ``ibp_map`` / ``jumprelu`` activations.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        # Pure-torch, on-device transcription of the Rust source of truth
+        # `gam_sae::assignment::topk_activation_row_value_grad`
+        # (crates/gam-sae/src/assignment.rs). With ``inv_tau = 1/τ`` (matching the
+        # Rust multiply order for bit-parity):
+        #   ``scaled = l · inv_tau``
+        #   ``value  = τ · softplus(scaled)`` (stable_softplus ≡ softplus)
+        #   ``grad   = σ(scaled)``          (stable_logistic ≡ torch.sigmoid)
+        # No CPU/float64 round-trip: dtype and device are preserved.
+        inv_tau = 1.0 / temperature
+        scaled = logits * inv_tau
+        value = temperature * torch.nn.functional.softplus(scaled)
+        grad = torch.sigmoid(scaled)
+        ctx.save_for_backward(grad)
+        return value
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (jac_diag,) = ctx.saved_tensors
+        return grad_output * jac_diag, None
+
+
+def topk_activation(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Differentiable top-k SAE activation via the Rust value+grad kernel.
+
+    Returns ``τ·softplus(logits/τ)`` with the Rust-defined diagonal derivative
+    ``σ(logits/τ)`` on the backward. The hard top-k mask/STE stays on the caller's
+    tape; this owns only the smooth non-negative activation.
+    """
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError("topk_activation logits must be a torch.Tensor")
+    apply = cast(Callable[..., torch.Tensor], _TopKActivationFn.apply)
+    return apply(logits, float(temperature))
+
+
 class RiemannianRetraction(Optimizer):
     """Optimizer that retracts Euclidean gradient steps onto a manifold."""
 

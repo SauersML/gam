@@ -72,9 +72,115 @@
 //! fitted Frobenius-normalized precision first (`λ_phys = λ_tilde / c`). Family
 //! dispersion scaling remains outside this pure spectrum-side kernel.
 
-use ndarray::ArrayView1;
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 use super::BasisError;
+
+/// Analytic ambient gradient `∇f̂(x★)` of a frozen measure-jet term's fitted
+/// contribution to the linear predictor, in the (standardized) ambient
+/// coordinates the frozen geometry lives in.
+///
+/// The term's fitted contribution is the augmented representer expansion
+/// `f̂(x) = Σ_i z_i · K(x, c_i)  +  Σ_h h_h · (xᵀ T)_h`, where
+/// `K(x, c_i) = exp(−‖x − c_i‖² / (2 ℓ²))` is the Gaussian representer, `z`
+/// the raw-space representer coefficients (`z_full[..m]`), `T` the
+/// ambient-linear head lift (`d × head_rank`) and `h` the raw-space head
+/// coefficients (`z_full[m..]`). Both coefficient blocks are the raw (pre-gauge)
+/// coefficients — lift the fitted reduced coefficients through the frozen
+/// identifiability transform first (`β_raw = Z · β̂`).
+///
+/// Differentiating in `x` (exact, hand-derived — no FD, no autodiff):
+///
+/// ```text
+///   ∂K(x, c_i)/∂x_a = K(x, c_i) · (c_{i,a} − x_a) / ℓ² ,
+///   ∂(xᵀ T)_h/∂x_a  = T_{a,h} ,
+/// ```
+///
+/// so the ambient gradient is
+///
+/// ```text
+///   ∇f̂(x)_a = Σ_i z_i · K(x, c_i) · (c_{i,a} − x_a) / ℓ²  +  Σ_h h_h · T_{a,h} .
+/// ```
+///
+/// This is the first-order (jet) term of the measure-jet expansion the frame
+/// notes already carry; here it is read out in closed form for the
+/// errors-in-variables predictive-variance term
+/// `Var_input(x★) = ∇f̂(x★)ᵀ Σ_x ∇f̂(x★)` (issue #2225). `head_transform`/
+/// `head_coeffs` are `None`/empty when the term carries no ambient-linear head.
+pub fn measure_jet_ambient_gradient(
+    query: ArrayView1<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    representer_coeffs: ArrayView1<'_, f64>,
+    length_scale: f64,
+    head_transform: Option<ArrayView2<'_, f64>>,
+    head_coeffs: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, BasisError> {
+    let d = query.len();
+    let m = centers.nrows();
+    if centers.ncols() != d {
+        crate::bail_dim_basis!(
+            "measure-jet ambient gradient: query dimension {d} disagrees with centers ({} × {})",
+            m,
+            centers.ncols()
+        );
+    }
+    if representer_coeffs.len() != m {
+        crate::bail_dim_basis!(
+            "measure-jet ambient gradient: {} representer coefficients for {m} centers",
+            representer_coeffs.len()
+        );
+    }
+    if !(length_scale.is_finite() && length_scale > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet ambient gradient needs a positive finite length_scale; got {length_scale}"
+        );
+    }
+    let inv_l2 = 1.0 / (length_scale * length_scale);
+    let mut grad = Array1::<f64>::zeros(d);
+    for i in 0..m {
+        let center = centers.row(i);
+        let mut sq = 0.0_f64;
+        for a in 0..d {
+            let delta = query[a] - center[a];
+            sq += delta * delta;
+        }
+        let k = (-0.5 * sq * inv_l2).exp();
+        let coeff = representer_coeffs[i] * k * inv_l2;
+        for a in 0..d {
+            // ∂K/∂x_a = K · (c_{i,a} − x_a) / ℓ².
+            grad[a] += coeff * (center[a] - query[a]);
+        }
+    }
+    if let Some(t) = head_transform {
+        let head_rank = t.ncols();
+        if head_coeffs.len() != head_rank {
+            crate::bail_dim_basis!(
+                "measure-jet ambient gradient: {} head coefficients for a head lift with \
+                 {head_rank} columns",
+                head_coeffs.len()
+            );
+        }
+        if t.nrows() != d {
+            crate::bail_dim_basis!(
+                "measure-jet ambient gradient: head lift has {} rows but ambient dimension is {d}",
+                t.nrows()
+            );
+        }
+        for a in 0..d {
+            let mut acc = 0.0_f64;
+            for h in 0..head_rank {
+                acc += head_coeffs[h] * t[(a, h)];
+            }
+            grad[a] += acc;
+        }
+    } else if !head_coeffs.is_empty() {
+        crate::bail_dim_basis!(
+            "measure-jet ambient gradient: {} head coefficients supplied without a head lift",
+            head_coeffs.len()
+        );
+    }
+    Ok(grad)
+}
 
 #[derive(Clone, Copy)]
 pub enum MeasureJetExtrapolationSpectrum<'a> {
@@ -497,6 +603,137 @@ mod tests {
         assert!(
             (v_covered - expected).abs() <= 1e-15,
             "fused band must use the best covered level once: {v_covered} vs {expected}"
+        );
+    }
+
+    /// Closed-form `f̂(x)`: the augmented representer expansion the analytic
+    /// gradient differentiates — used only as the finite-difference oracle.
+    fn eval_fitted(
+        query: ArrayView1<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        length_scale: f64,
+        head: Option<ArrayView2<'_, f64>>,
+        head_coeffs: ArrayView1<'_, f64>,
+    ) -> f64 {
+        let inv_two_l2 = 1.0 / (2.0 * length_scale * length_scale);
+        let mut val = 0.0_f64;
+        for i in 0..centers.nrows() {
+            let mut sq = 0.0_f64;
+            for a in 0..query.len() {
+                let dlt = query[a] - centers[(i, a)];
+                sq += dlt * dlt;
+            }
+            val += z[i] * (-sq * inv_two_l2).exp();
+        }
+        if let Some(t) = head {
+            for h in 0..t.ncols() {
+                let mut proj = 0.0_f64;
+                for a in 0..query.len() {
+                    proj += query[a] * t[(a, h)];
+                }
+                val += head_coeffs[h] * proj;
+            }
+        }
+        val
+    }
+
+    /// The analytic ambient gradient matches a central finite difference of the
+    /// fitted surface to FD accuracy — the delta-method propagator #2225 wires
+    /// into the predictive variance is the true ∇f̂ (representers + head).
+    #[test]
+    pub(crate) fn ambient_gradient_matches_central_difference() {
+        use ndarray::{arr1, arr2};
+        let centers = arr2(&[[0.0, 0.0], [1.0, 0.5], [-0.7, 0.9], [0.4, -1.1]]);
+        let z = arr1(&[0.8, -1.3, 0.5, 2.0]);
+        let length_scale = 0.6;
+        // A rank-2 ambient-linear head lift T (d=2, head_rank=2).
+        let t = arr2(&[[1.0, 0.2], [-0.3, 0.9]]);
+        let head_coeffs = arr1(&[0.7, -0.4]);
+        let query = arr1(&[0.15, -0.2]);
+
+        let grad = measure_jet_ambient_gradient(
+            query.view(),
+            centers.view(),
+            z.view(),
+            length_scale,
+            Some(t.view()),
+            head_coeffs.view(),
+        )
+        .expect("valid gradient");
+
+        let h = 1e-6;
+        for a in 0..query.len() {
+            let mut qp = query.clone();
+            let mut qm = query.clone();
+            qp[a] += h;
+            qm[a] -= h;
+            let fp = eval_fitted(
+                qp.view(),
+                centers.view(),
+                z.view(),
+                length_scale,
+                Some(t.view()),
+                head_coeffs.view(),
+            );
+            let fm = eval_fitted(
+                qm.view(),
+                centers.view(),
+                z.view(),
+                length_scale,
+                Some(t.view()),
+                head_coeffs.view(),
+            );
+            let fd = (fp - fm) / (2.0 * h);
+            assert!(
+                (grad[a] - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+                "axis {a}: analytic {} vs central FD {fd}",
+                grad[a]
+            );
+        }
+    }
+
+    /// No head: the representer-only gradient still matches FD, and a stray
+    /// head coefficient without a lift is rejected.
+    #[test]
+    pub(crate) fn ambient_gradient_representer_only_and_head_guard() {
+        use ndarray::{arr1, arr2};
+        let centers = arr2(&[[0.0], [0.5], [-0.4]]);
+        let z = arr1(&[1.0, -2.0, 0.5]);
+        let length_scale = 0.3;
+        let query = arr1(&[0.1]);
+        let empty = Array1::<f64>::zeros(0);
+        let grad = measure_jet_ambient_gradient(
+            query.view(),
+            centers.view(),
+            z.view(),
+            length_scale,
+            None,
+            empty.view(),
+        )
+        .expect("valid gradient");
+        let h = 1e-6;
+        let mut qp = query.clone();
+        let mut qm = query.clone();
+        qp[0] += h;
+        qm[0] -= h;
+        let fd = (eval_fitted(qp.view(), centers.view(), z.view(), length_scale, None, empty.view())
+            - eval_fitted(qm.view(), centers.view(), z.view(), length_scale, None, empty.view()))
+            / (2.0 * h);
+        assert!((grad[0] - fd).abs() <= 1e-6 * (1.0 + fd.abs()));
+
+        let stray = arr1(&[1.0]);
+        assert!(
+            measure_jet_ambient_gradient(
+                query.view(),
+                centers.view(),
+                z.view(),
+                length_scale,
+                None,
+                stray.view(),
+            )
+            .is_err(),
+            "head coefficients without a head lift must be rejected"
         );
     }
 }

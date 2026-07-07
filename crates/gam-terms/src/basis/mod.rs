@@ -79,7 +79,8 @@ pub use measure_jet_moments::{
 };
 
 pub use measure_jet_predict::{
-    MeasureJetExtrapolationSpectrum, measure_jet_extrapolation_variance,
+    MeasureJetExtrapolationSpectrum, measure_jet_ambient_gradient,
+    measure_jet_extrapolation_variance,
 };
 
 pub use measure_jet_smooth::{
