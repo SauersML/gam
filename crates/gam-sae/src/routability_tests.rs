@@ -212,6 +212,46 @@ fn phase_transition_at_floor() {
 }
 
 #[test]
+fn perfect_reconstruction_zero_residual_is_a_defined_audit_not_an_error() {
+    // A dictionary that reconstructs the data exactly leaves an all-zero residual:
+    // there is no residual mass left to (mis)route. That is the ideal — fully
+    // routable — case and must return a DEFINED audit, not an error. (Regression:
+    // the empty-`per_row` branch used to `Err("... no residual rows with positive
+    // norm")`, which made a perfect SAE reconstruction unauditable.)
+    let (p, k, n) = (4usize, 6usize, 10usize);
+    let decoder = unit_rows(k, p, 0xDEAD_BEEF);
+    // Residuals identically zero (float 0.0 → norm 0 → every row skipped).
+    let residuals = Array2::<f32>::zeros((n, p));
+
+    let audit = routability_audit(decoder.view(), residuals.view(), 1, 0.05, &[0.5, 0.9])
+        .expect("all-zero residual is a valid perfect-reconstruction audit, not an error");
+
+    // No residual rows were audited, but the floor (geometry only) is still real.
+    assert_eq!(audit.n_rows, 0);
+    let expected_floor = routability_floor(p, k, 1, 0.05);
+    assert!((audit.floor.floor - expected_floor.floor).abs() < 1.0e-12);
+    // Zero unroutable mass: every empirical cross-gate is 0, and the full (zero)
+    // residual mass sits trivially at/below the floor.
+    assert_eq!(audit.empirical_mean, 0.0);
+    assert_eq!(audit.empirical_max, 0.0);
+    assert_eq!(audit.confidence_quantile, 0.0);
+    assert_eq!(audit.coherence_excess, 0.0);
+    assert_eq!(audit.fraction_below_floor, 1.0);
+    for &(level, value) in &audit.quantiles {
+        assert_eq!(value, 0.0, "quantile at level {level} must be 0 with no residual");
+    }
+    assert_eq!(audit.quantiles.len(), 2);
+
+    // Near-zero (below the 1e-12 skip threshold) residuals behave identically.
+    // Per-element 1e-13 over p=4 columns → row norm 2e-13 < 1e-12, so every row skips.
+    let tiny = Array2::<f32>::from_elem((n, p), 1.0e-13_f32);
+    let tiny_audit = routability_audit(decoder.view(), tiny.view(), 1, 0.05, &[0.5, 0.9])
+        .expect("sub-threshold residual is still a defined audit");
+    assert_eq!(tiny_audit.n_rows, 0);
+    assert_eq!(tiny_audit.fraction_below_floor, 1.0);
+}
+
+#[test]
 fn block_variant_floor_and_audit() {
     // Block lane, b=2 orthonormal frames. The b_max=2 floor at δ=0.01 must bound
     // the empirical max block cross-gate for ≥99% of rows, and the audit must
