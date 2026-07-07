@@ -637,11 +637,26 @@ mod tests {
     ) -> (Array2<f64>, Vec<usize>) {
         let mut rows = Array2::<f64>::zeros((n, p));
         let mut ctr = 1u64;
-        // Deterministically spread the rare rows across the corpus.
-        let stride = (n / rare_rows.max(1)).max(1);
-        let mut rare_idx: Vec<usize> = (0..rare_rows).map(|j| (j * stride).min(n - 1)).collect();
+        // Scatter the rare rows at pseudo-random DISTINCT positions. A fixed
+        // stride (`n / rare_rows`) aliases with the Horvitz–Thompson design's
+        // Madow SYSTEMATIC selection: a uniform π = budget/n subsample picks
+        // every ⌊n/budget⌋-th row, so periodic rare rows land on that grid and
+        // are surfaced by the uniform baseline TOO — which collapses the
+        // stratification-vs-uniform contrast this test asserts. Deterministic
+        // pseudo-random placement makes the uniform baseline draw rare rows ∝
+        // frequency (≈ f·rare rows), as the statistical claim requires, while
+        // the residual-energy census still surfaces all of them by their energy.
+        let mut rare_idx: Vec<usize> = Vec::with_capacity(rare_rows.min(n));
+        let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut probe = 0u64;
+        while rare_idx.len() < rare_rows.min(n) {
+            let idx = (splitmix64_hash(probe ^ 0x5236_9E11_A73C_D0F5) as usize) % n;
+            probe = probe.wrapping_add(1);
+            if seen.insert(idx) {
+                rare_idx.push(idx);
+            }
+        }
         rare_idx.sort_unstable();
-        rare_idx.dedup();
         let rare_set: std::collections::BTreeSet<usize> = rare_idx.iter().copied().collect();
 
         for i in 0..n {
