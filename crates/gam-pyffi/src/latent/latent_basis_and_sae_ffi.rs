@@ -2403,7 +2403,23 @@ fn sae_manifold_fit<'py>(
     let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
     let row_w = row_loss_weights.as_ref().map(|w| w.as_array());
-    sae_manifold_fit_inner(
+    // Front-door admission (#985 / E1): route the PUBLIC precomputed-basis fit
+    // through the single `admit_sae_fit` gate, so every public entry carries one
+    // auditable lane decision (and a degenerate N/P/K shape is refused at the
+    // door). A large-K fit (N*K > N*P) is admitted only on the sparse-code lane;
+    // the dense N×K assignment state is never constructed on this path. The
+    // decision rides out on the returned checkpoint (`front_door_*`) for audit.
+    let (front_door_n, front_door_p) = {
+        let z_arr = z.as_array();
+        (z_arr.nrows(), z_arr.ncols())
+    };
+    let front_door_admission = gam::terms::sae::front_door::admit_sae_fit(
+        front_door_n,
+        front_door_p,
+        atom_basis.len(),
+    )
+    .map_err(py_value_error)?;
+    let front_door_result = sae_manifold_fit_inner(
         py,
         z.as_array(),
         &atom_basis,
@@ -2449,7 +2465,29 @@ fn sae_manifold_fit<'py>(
         quotient_scale,
         data_row_reseed,
         rank_charge_evidence,
-    )
+    )?;
+    // Attach the front-door lane record to the returned checkpoint so the public
+    // fit's admission is auditable from Python without recomputing shapes.
+    {
+        let checkpoint = front_door_result.bind(py);
+        checkpoint.set_item(
+            "front_door_lane",
+            if front_door_admission.uses_sparse_codes() {
+                "sparse_codes"
+            } else {
+                "dense_certification"
+            },
+        )?;
+        checkpoint.set_item(
+            "front_door_dense_assignment_cells",
+            front_door_admission.dense_assignment_cells,
+        )?;
+        checkpoint.set_item(
+            "front_door_response_cells",
+            front_door_admission.response_cells,
+        )?;
+    }
+    Ok(front_door_result)
 }
 
 /// Structural string tag for a fitted atom's basis kind (the discrete topology
