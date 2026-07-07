@@ -48,6 +48,8 @@ from __future__ import annotations
 import contextlib
 import importlib
 import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -131,4 +133,62 @@ def test_curv_fixed_kappa_changes_the_fit() -> None:
     assert flat_vs_sph > 1e-6, (
         "fixed curv() kappa= has no effect: flat kappa=0 and spherical kappa=+3 "
         f"fits are identical (max|Δ| = {flat_vs_sph:.3e})"
+    )
+
+
+def test_curv_fixed_kappa_changes_the_cli_fit(tmp_path: Path) -> None:
+    """The shared ``gam`` CLI must also preserve explicit fixed curvature.
+
+    The original report was reproduced through ``gam fit``/``gam predict``; this
+    keeps that user-visible surface pinned in addition to the Python engine path.
+    """
+    gam_bin = Path(__file__).resolve().parent.parent / "target" / "release" / "gam"
+    if not gam_bin.exists():
+        pytest.skip("release `gam` CLI binary not built (target/release/gam absent)")
+
+    train, grid = _make_data()
+    train_path = tmp_path / "ball.csv"
+    grid_path = tmp_path / "g.csv"
+    train.to_csv(train_path, index=False)
+    grid.to_csv(grid_path, index=False)
+
+    def fit_predict(kappa: float) -> np.ndarray:
+        model_path = tmp_path / f"m_{kappa}.gam"
+        pred_path = tmp_path / f"p_{kappa}.csv"
+        fit = subprocess.run(
+            [
+                str(gam_bin),
+                "fit",
+                str(train_path),
+                f"y ~ curv(x, z, kappa={kappa})",
+                "--out",
+                str(model_path),
+                "-q",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert fit.returncode == 0, f"gam fit kappa={kappa} failed:\n{fit.stdout}\n{fit.stderr}"
+        pred = subprocess.run(
+            [
+                str(gam_bin),
+                "predict",
+                str(model_path),
+                str(grid_path),
+                "--out",
+                str(pred_path),
+                "-q",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert pred.returncode == 0, f"gam predict kappa={kappa} failed:\n{pred.stdout}\n{pred.stderr}"
+        return pd.read_csv(pred_path)["mean"].to_numpy(dtype=float)
+
+    pred_sph = fit_predict(3.0)
+    pred_hyp = fit_predict(-3.0)
+    delta = float(np.max(np.abs(pred_sph - pred_hyp)))
+    assert delta > 1e-6, (
+        "CLI fixed curv() kappa= has no effect: kappa=+3 and kappa=-3 "
+        f"predictions are identical/indistinguishable (max|Δ| = {delta:.3e})"
     )
