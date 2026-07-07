@@ -1111,21 +1111,22 @@ mod tests {
             single.coordinate, single.amplitude, single_residual_norm
         );
         let coeffs = coeffs_from_code(&z);
-        match crate::super_resolution::recover_spikes(&coeffs, 0.0) {
-            Ok(rec) => eprintln!(
-                "DBG recover sigma=0: model_order={} residual={} spikes={:?}",
-                rec.model_order,
-                rec.residual,
-                rec.spikes
-                    .iter()
-                    .map(|s| (s.t, s.amplitude))
-                    .collect::<Vec<_>>()
-            ),
-            Err(e) => eprintln!("DBG recover sigma=0 ERR: {e}"),
+        if let Ok(rec) = crate::super_resolution::recover_spikes(&coeffs, 0.0) {
+            eprintln!("DBG singular_values={:?}", rec.hankel_singular_values);
         }
-        for g in 0..(4 * h_count) {
-            let t = g as f64 / (4 * h_count) as f64;
-            eprintln!("DBG grid t={t:.4} f={:.4}", harmonic_f(&z, t));
+        for &sg in &[0.0f64, 1e-9, 1e-6, 1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.3, 0.5, 1.0] {
+            match crate::super_resolution::recover_spikes(&coeffs, sg) {
+                Ok(rec) => eprintln!(
+                    "DBG sigma={sg:.0e}: order={} residual={:.4} spikes={:?}",
+                    rec.model_order,
+                    rec.residual,
+                    rec.spikes
+                        .iter()
+                        .map(|s| (format!("{:.4}", s.t), format!("{:.4}", s.amplitude)))
+                        .collect::<Vec<_>>()
+                ),
+                Err(e) => eprintln!("DBG sigma={sg:.0e} ERR: {e}"),
+            }
         }
     }
 
