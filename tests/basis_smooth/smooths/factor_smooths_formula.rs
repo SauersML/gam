@@ -2,7 +2,7 @@ use gam::ResourcePolicy;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::smooth::{ByVarKind, FactorSmoothFlavour, SmoothBasisSpec, build_term_collection_design};
+use gam::smooth::{BySmoothKind, FactorSmoothFlavour, SmoothBasisSpec, build_term_collection_design};
 use gam::term_builder::build_termspec;
 use ndarray::Array2;
 
@@ -104,25 +104,31 @@ fn termspec_routes_new_constructs_to_new_variants() {
     let col_map = data.column_map();
     let policy = ResourcePolicy::default_library();
 
+    // A numeric `by=` gates the smooth by covariate value: `ByVariable::Numeric`
+    // (#1981, resolving #1887).
     let parsed = parse_formula("y ~ s(x, by=z)").unwrap();
     let spec = build_termspec(&parsed.terms, &data, &col_map, &mut vec![], &policy).unwrap();
     assert!(matches!(
         spec.smooth_terms[0].basis,
-        SmoothBasisSpec::BySmooth {
-            by_kind: ByVarKind::Numeric { .. },
+        SmoothBasisSpec::ByVariable {
+            kind: BySmoothKind::Numeric,
             ..
         }
     ));
 
+    // Unordered categorical `by=` expands to one independent per-level
+    // `ByVariable::Level` smooth per training level (#1981) — `fac` here has
+    // three levels {0, 1, 2}.
     let parsed = parse_formula("y ~ s(x, by=fac)").unwrap();
     let spec = build_termspec(&parsed.terms, &data, &col_map, &mut vec![], &policy).unwrap();
-    assert!(matches!(
-        spec.smooth_terms[0].basis,
-        SmoothBasisSpec::BySmooth {
-            by_kind: ByVarKind::Factor { .. },
+    assert_eq!(spec.smooth_terms.len(), 3);
+    assert!(spec.smooth_terms.iter().all(|term| matches!(
+        term.basis,
+        SmoothBasisSpec::ByVariable {
+            kind: BySmoothKind::Level { .. },
             ..
         }
-    ));
+    )));
 
     let parsed = parse_formula("y ~ fs(x, fac)").unwrap();
     let spec = build_termspec(&parsed.terms, &data, &col_map, &mut vec![], &policy).unwrap();
