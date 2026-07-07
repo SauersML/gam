@@ -1218,6 +1218,7 @@ mod sae_spectral_ffi_tests {
 
     #[test]
     fn audit_sae_round_trip_surfaces_external_dictionary_diagnostics() {
+        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let decoder = ndarray::array![[1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32]];
             let codes = ndarray::array![
