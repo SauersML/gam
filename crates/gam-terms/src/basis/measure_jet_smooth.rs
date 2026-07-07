@@ -1818,6 +1818,9 @@ pub fn build_measure_jet_basis(
     }
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
+    // #2225: compute the errors-in-variables input-noise scale while `centers`
+    // is still owned; it is moved into the metadata `centers` field below.
+    let sigma_coord = measure_jet_input_noise_scale(data, centers.view())?;
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -1843,7 +1846,7 @@ pub fn build_measure_jet_basis(
             constraint_transform: Some(z),
             // Perpendicular off-manifold residual scale of the fit rows in the
             // centers' frame — the errors-in-variables input-noise scale (#2225).
-            sigma_coord: measure_jet_input_noise_scale(data, centers.view())?,
+            sigma_coord,
         },
         kronecker_factored: None,
         ops,
