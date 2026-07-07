@@ -92,6 +92,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let mut design_specs = Vec::with_capacity(1 + logslope_specs_input.len());
     design_specs.push(spec.marginalspec.clone());
     design_specs.extend(logslope_specs_input.iter().cloned());
+    // gam#979: give the marginal + logslope smooth surfaces the Marra & Wood
+    // double penalty so their polynomial-trend null space is identified rather
+    // than left flat. Without it that trend direction is a large-signal /
+    // tiny-curvature mode that deadlocks the inner joint-Newton (the spectral
+    // step drops it #1082 while the certificate requires it #1449) — the
+    // survival marginal-slope hang. Applied before the build so the flag is
+    // frozen into `joint_specs` and honoured by every subsequent probe / frozen
+    // / kappa rebuild. Mirrors the time block's
+    // `install_time_nullspace_shrinkage_penalty`, via the ordinary builder so
+    // the layered penalty representation stays self-consistent.
+    for surface_spec in design_specs.iter_mut() {
+        enable_surface_identifiability_double_penalty(surface_spec);
+    }
     let (_raw_joint_designs, mut joint_specs) =
         build_term_collection_designs_and_freeze_joint(data, &design_specs)
             .map_err(|e| e.to_string())?;
