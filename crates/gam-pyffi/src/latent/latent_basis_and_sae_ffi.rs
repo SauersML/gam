@@ -2325,7 +2325,7 @@ fn sae_structured_residual_model(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 1,
+    structured_residual_passes = 0,
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
