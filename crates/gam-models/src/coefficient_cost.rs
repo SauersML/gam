@@ -77,6 +77,13 @@ mod tests {
     const MIN_ROWS: u64 = 50_000;
     const MIN_DIM_AT_LARGE_N: u64 = 128;
 
+    fn dense_sentinel_cost() -> u64 {
+        // Derived from the wide-problem shape band instead of spelling out
+        // floor(sqrt(512)) as the literal `22`; this keeps the test sentinel in
+        // sync with the matrix-free gate's `MIN_DIM` boundary.
+        (MIN_DIM as f64).sqrt().floor() as u64
+    }
+
     fn spec_with_ncols(p: usize) -> ParameterBlockSpec {
         ParameterBlockSpec {
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, p)))),
@@ -90,7 +97,7 @@ mod tests {
         let p = 4;
         let n = 100;
         let mf = 11;
-        let dense = 22;
+        let dense = dense_sentinel_cost();
         assert!(!use_joint_matrix_free_path(p as usize, n as usize));
         assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), dense);
     }
@@ -101,7 +108,7 @@ mod tests {
         let p = MIN_DIM;
         let n = 1;
         let mf = 11;
-        let dense = 22;
+        let dense = dense_sentinel_cost();
         assert!(use_joint_matrix_free_path(p as usize, n as usize));
         assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), mf);
     }

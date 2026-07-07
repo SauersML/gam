@@ -226,6 +226,15 @@ impl SaeManifoldTerm {
             .collect();
         let (assignment_grad, assignment_hdiag) =
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
+        // Per-atom per-axis periodicity, hoisted out of the row loop. Selects
+        // the smooth von-Mises coordinate prior on wrapped (Circle) axes and
+        // the Gaussian prior on Euclidean axes; see `ArdAxisPrior`.
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
 
         // #1038 softmax entropy: the exact per-row Hessian in logits is dense
         // (`H_kj = (λ/τ²) a_k[δ_kj(m−L_k−1)+a_j(L_k+L_j+1−2m)]`), not just the
@@ -346,52 +355,45 @@ impl SaeManifoldTerm {
                     threshold,
                     temperature,
                 } => {
-                    // #1801 — size the JumpReLU joint block by the HARD FORWARD GATE.
-                    // The joint (cross-coupling) row block only ever needs the atoms
-                    // that actually DATA-FIT COUPLE: a gated-off atom (`logit ≤ θ`,
-                    // `a_k = 0`) has a hard-zero reconstruction contribution and a
-                    // hard-zero data-fit logit JVP, so it never couples with the
-                    // decoder or any on atom. Its ONLY footprint is a column-
-                    // SEPARABLE diagonal prior (its own sparsity-logit + ARD-coord
-                    // gradient/curvature), which a diagonal-only atom carries without
-                    // a joint-block slot; profiling it out leaves the reduced β /
-                    // decoder Schur system and its Δβ Newton step unchanged, and the
-                    // OBJECTIVE VALUE is layout-independent (the loss sums the full
-                    // −36 optimization band regardless of this layout).
-                    //
-                    // `contribution[row, k]` is therefore the atom's DATA-FIT
-                    // coupling magnitude — the gate mass `a_{n,k}` — NOT its separable
-                    // prior gradient. `a_{n,k}` is EXACTLY zero for every gated-off
-                    // atom (the JumpReLU hard gate) and positive only above the
-                    // threshold, so `from_jumprelu`'s relative cutoff drops all
-                    // gated-off atoms and the block collapses from `K·(1+d)` to the
-                    // hard-gate `k_active·(1+d)`, independent of K. (The prior layout
-                    // scored membership by the SEPARABLE prior gradient, which is O(1)
-                    // for gated-off logits sitting near the threshold, so essentially
-                    // all K atoms were retained and the per-token block ballooned to
-                    // `K·(1+d)` — the bug pinned by
-                    // `sae_streaming_arrow_schur_contract::per_token_block_dim_is_independent_of_k_at_fixed_active`.)
-                    // PRICED (#2071), with the exact-gradient alternative stated.
-                    // `from_jumprelu` drops atoms whose contribution ≤ cutoff · (max
-                    // contribution). Gated-off atoms have `a_{n,k}` EXACTLY 0, so
-                    // ANY cutoff in `(0, min_active_contribution]` drops precisely the
-                    // gated-off set and the assembled gradient is EXACT. `1e-3`
-                    // additionally drops ACTIVE atoms whose coupling is < 0.1 % of the
-                    // row's peak — this is the gradient approximation, traded for a
-                    // per-token block bounded at `k_active·(1+d)` even when many atoms
-                    // sit just above the JumpReLU threshold with tiny mass.
-                    // Exact-gradient alternative: a numerical-zero cutoff (~a few ULP,
-                    // dropping only the exact zeros) makes the gradient exact but lets
-                    // the block grow to the FULL above-threshold set, whose size near
-                    // the threshold is not bounded independently of that near-threshold
-                    // population — a memory/exactness design choice at K = 32k scale,
-                    // not a free tuning dial, so it is left priced pending that
-                    // validation. What breaks at 10×: `1e-2` drops couplings up to 1 %
-                    // of peak (coarser gradient, smaller block); `1e-4` retains more
-                    // near-threshold atoms (finer gradient, larger block).
-                    const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
-                    let gates = self.assignment.assignments();
-                    let contribution = gates.mapv(f64::abs);
+                    // #1801/#2071 — build the JumpReLU compact block from the
+                    // exact row-local coupling/gradient support. Hard-gated atoms
+                    // (`logit > θ`) carry data-fit coupling and are always retained.
+                    // Gated-off atoms have zero data-fit coupling, but may still carry
+                    // column-separable sparsity/ARD prior gradient over the smooth
+                    // optimization band; those atoms must be retained whenever that
+                    // omitted gradient is nonzero, otherwise the objective value and
+                    // assembled gradient describe different operators.
+                    // #2071 — exact-gradient JumpReLU layout.  `from_jumprelu`
+                    // drops atoms whose contribution is `<= relative_cutoff * row_peak`.
+                    // The production contribution is the exact row-local prior-gradient
+                    // magnitude that would otherwise leave the compact block: the
+                    // sparsity-logit gradient plus the ARD coordinate gradients.  The
+                    // only cutoff derivable without gradient approximation is zero, so
+                    // the layout drops only atoms whose omitted gradient is exactly zero;
+                    // every nonzero separable-gradient atom stays in the row block.
+                    // Hard-gated atoms are always retained separately because they carry
+                    // data-fit coupling even if their prior contribution is zero.
+                    const JUMPRELU_RELATIVE_CUTOFF: f64 = 0.0;
+                    let contribution = Array2::from_shape_fn((n, k_atoms), |(row, atom)| {
+                        let mut mag = assignment_grad[row * k_atoms + atom].abs();
+                        let coord = &self.assignment.coords[atom];
+                        let d = coord.latent_dim();
+                        if !rho.log_ard[atom].is_empty() && rho.log_ard[atom].len() == d {
+                            let row_t = coord.row(row);
+                            for axis in 0..d {
+                                let alpha = SaeManifoldRho::stable_exp_strength(
+                                    rho.log_ard[atom][axis],
+                                );
+                                let prior = ArdAxisPrior::eval(
+                                    alpha,
+                                    row_t[axis],
+                                    ard_axis_periods[atom][axis],
+                                );
+                                mag += prior.grad.abs();
+                            }
+                        }
+                        mag
+                    });
                     Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
                         n,
                         k_atoms,
@@ -399,9 +401,9 @@ impl SaeManifoldTerm {
                         temperature,
                         logits: &self.assignment.logits,
                         contribution: &contribution,
-                        // Cap: rely on the relative cutoff to bound the active set;
-                        // a memory-budget cap can be layered in like
-                        // `sparse_active_plan` without changing the contract.
+                        // No tuned cap in the exact-gradient JumpReLU path: retain the
+                        // full nonzero support derived above. A future memory-budget cap
+                        // would need to preserve the omitted diagonal gradient exactly.
                         k_active_cap: k_atoms,
                         relative_cutoff: JUMPRELU_RELATIVE_CUTOFF,
                         coord_dims: coord_dims.clone(),
@@ -675,15 +677,6 @@ impl SaeManifoldTerm {
         // Dense full-support index `[0, k_atoms)`, used by the row loop when no
         // compact layout is engaged so the active-atom iteration is uniform.
         let all_atoms_index: Vec<usize> = (0..k_atoms).collect();
-        // Per-atom per-axis periodicity, hoisted out of the row loop. Selects
-        // the smooth von-Mises coordinate prior on wrapped (Circle) axes and
-        // the Gaussian prior on Euclidean axes; see `ArdAxisPrior`.
-        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
-            .assignment
-            .coords
-            .iter()
-            .map(|coord| coord.effective_axis_periods())
-            .collect();
         struct SaeAssemblyRow {
             pub(crate) row: usize,
             pub(crate) block: ArrowRowBlock,

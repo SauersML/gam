@@ -214,20 +214,6 @@ fn dual_half_logdet_trace_2156(cache: &ArrowFactorCache, h: &Array2<f64>, dh: &A
     0.5 * report.total_derivative
 }
 
-fn dual_logdet_trace_2156(
-    label: &'static str,
-    cache: &ArrowFactorCache,
-    h: &Array2<f64>,
-    dh: &Array2<f64>,
-) -> (f64, BranchCertificate) {
-    let report = dual_trace_report_2156(
-        cache,
-        h,
-        vec![(DerivativeTraceChannel::Other(label), dh.clone())],
-    );
-    (report.total_derivative, report.certificate)
-}
-
 fn relative_error_2156(exact: f64, production: f64) -> f64 {
     (exact - production).abs() / exact.abs().max(production.abs()).max(1.0)
 }
