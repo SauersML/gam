@@ -2982,33 +2982,6 @@ fn sae_manifold_fit_stagewise<'py>(
     Ok(out.unbind())
 }
 
-/// Front-door enforcement guard for the dense manifold engine (#985 / E1).
-///
-/// The dense `SaeManifoldTerm` / `SaeAssignment` path is the small-K certification
-/// lane only. Returns `Ok(())` when `admit_sae_fit(n_obs, output_dim, n_atoms)`
-/// admits the `DenseCertification` lane (`N·K ≤ N·P`, i.e. `K ≤ P`), and an `Err`
-/// naming the sparse front door when it demotes to the `SparseCodes` lane
-/// (`K > P`) — the shape whose dense `N×K` state the front door exists to avoid.
-/// A degenerate `N`/`P`/`K` is rejected here too (propagated from `admit_sae_fit`).
-/// Pure in its three shape args, so it is unit-testable without a GIL or arrays.
-fn refuse_sparse_lane_for_dense_engine(
-    n_obs: usize,
-    output_dim: usize,
-    n_atoms: usize,
-) -> Result<(), String> {
-    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, output_dim, n_atoms)?;
-    if admission.uses_sparse_codes() {
-        return Err(format!(
-            "sae_manifold_fit: the dense manifold engine is the small-K certification lane \
-             (admitted only while N*K <= N*P, i.e. K <= P); N={n_obs}, P={output_dim}, K={n_atoms} \
-             gives N*K={} > N*P={} — route this fit through the sparse front door (the public \
-             facade's sparse-code lane) rather than building the dense N×K assignment state",
-            admission.dense_assignment_cells, admission.response_cells
-        ));
-    }
-    Ok(())
-}
-
 fn sae_manifold_fit_inner<'py>(
     py: Python<'py>,
     z_view: ArrayView2<'_, f64>,
@@ -3114,8 +3087,11 @@ fn sae_manifold_fit_inner<'py>(
     // bypassed the Python facade's front-door routing — would silently build the
     // very `N×K` state the front door exists to avoid, so refuse it and point at
     // the sparse front door. The dense-cert path (K ≤ P) passes unchanged; this is
-    // refuse-on-SPARSE, never refuse-on-dense.
-    refuse_sparse_lane_for_dense_engine(n_obs, p_out, k_atoms).map_err(py_value_error)?;
+    // refuse-on-SPARSE, never refuse-on-dense. The guard + its boundary test live in
+    // gam-sae `front_door` (a lib-testable crate; gam-pyffi is an extension module
+    // that cannot link a `cargo test` harness).
+    gam::terms::sae::front_door::admit_dense_certification(n_obs, p_out, k_atoms)
+        .map_err(py_value_error)?;
     // The "t" block addresses the per-row latent coordinates (n_obs × d_max,
     // tier=Psi) — ARD, Isometry, BlockOrthogonality, etc. target this. The
     // "beta" block addresses the decoder coefficient matrix. `flatten_beta`
@@ -7167,38 +7143,4 @@ fn sae_build_padded_basis_stacks(
         basis_sizes,
         coord_blocks,
     ))
-}
-
-#[cfg(test)]
-mod front_door_guard_tests {
-    use super::refuse_sparse_lane_for_dense_engine;
-
-    /// The dense manifold engine's front-door guard (#985 / E1) admits the small-K
-    /// certification lane (K ≤ P) and refuses the sparse lane (K > P), pointing the
-    /// caller at the sparse front door — the direct-FFI misuse path this closes.
-    #[test]
-    fn dense_engine_guard_admits_k_le_p_and_refuses_k_gt_p() {
-        // K ≤ P — the dense-certification lane — passes unchanged.
-        assert!(refuse_sparse_lane_for_dense_engine(1024, 4096, 128).is_ok());
-        assert!(
-            refuse_sparse_lane_for_dense_engine(64, 8, 8).is_ok(),
-            "K == P is the DenseCertification boundary and must pass"
-        );
-
-        // K > P — the sparse lane — is refused with a route-to-sparse message. This
-        // is the p=4096, K=32000 acceptance shape: the dense N×K state is never built.
-        let err = refuse_sparse_lane_for_dense_engine(1_000_000, 4096, 32_000)
-            .expect_err("K > P must be refused by the dense manifold engine guard");
-        assert!(
-            err.contains("sparse front door"),
-            "the refusal must point at the sparse front door; got: {err}"
-        );
-
-        // The crossover is exact: K == P passes, K == P + 1 is refused.
-        assert!(refuse_sparse_lane_for_dense_engine(10, 100, 100).is_ok());
-        assert!(refuse_sparse_lane_for_dense_engine(10, 100, 101).is_err());
-
-        // A degenerate N/P/K is rejected at the door (propagated from admit_sae_fit).
-        assert!(refuse_sparse_lane_for_dense_engine(0, 4, 3).is_err());
-    }
 }
