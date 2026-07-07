@@ -58,6 +58,7 @@ fn sae_build_atom_plans(
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: 1,
                     n_harmonics,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -76,6 +77,7 @@ fn sae_build_atom_plans(
                     kind: SaeAtomBasisKind::Sphere,
                     latent_dim: 2,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size: SAE_SPHERE_BASIS_SIZE,
                 });
@@ -98,6 +100,7 @@ fn sae_build_atom_plans(
                     kind: SaeAtomBasisKind::Torus,
                     latent_dim: d,
                     n_harmonics: h,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -150,6 +153,7 @@ fn sae_build_atom_plans(
                     kind,
                     latent_dim: d,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: Some(centers),
                     basis_size,
                 });
@@ -734,12 +738,23 @@ fn sae_manifold_predict_oos<'py>(
                 // `n_harmonics_list[k]` is supplied. Force the optimizer
                 // latent dimension to 1 so the analytic harmonic evaluator
                 // remains live during OOS prediction.
-                let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
-                let basis_size = sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?;
+                let trained_m = decoder_blocks[atom_idx].as_array().nrows();
+                let periodic_without_intercept = trained_m == 2;
+                let n_harmonics = if periodic_without_intercept {
+                    1
+                } else {
+                    n_harmonics_list[atom_idx].unwrap_or(d.max(1))
+                };
+                let basis_size = if periodic_without_intercept {
+                    trained_m
+                } else {
+                    sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?
+                };
                 plans.push(SaeAtomBuildPlan {
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: 1,
                     n_harmonics,
+                    periodic_without_intercept,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -754,6 +769,7 @@ fn sae_manifold_predict_oos<'py>(
                     kind: SaeAtomBasisKind::Sphere,
                     latent_dim: 2,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size: SAE_SPHERE_BASIS_SIZE,
                 });
@@ -766,6 +782,7 @@ fn sae_manifold_predict_oos<'py>(
                     kind: SaeAtomBasisKind::Torus,
                     latent_dim: d,
                     n_harmonics: h,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -822,6 +839,7 @@ fn sae_manifold_predict_oos<'py>(
                     kind,
                     latent_dim: d,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: Some(centers),
                     basis_size,
                 });
@@ -1687,6 +1705,7 @@ fn sae_steer_delta<'py>(
                     kind: SaeAtomBasisKind::Periodic,
                     latent_dim: 1,
                     n_harmonics,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -1701,6 +1720,7 @@ fn sae_steer_delta<'py>(
                     kind: SaeAtomBasisKind::Sphere,
                     latent_dim: 2,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size: SAE_SPHERE_BASIS_SIZE,
                 });
@@ -1713,6 +1733,7 @@ fn sae_steer_delta<'py>(
                     kind: SaeAtomBasisKind::Torus,
                     latent_dim: d,
                     n_harmonics: h,
+                    periodic_without_intercept: false,
                     duchon_centers: None,
                     basis_size,
                 });
@@ -1758,6 +1779,7 @@ fn sae_steer_delta<'py>(
                     kind,
                     latent_dim: d,
                     n_harmonics: 0,
+                    periodic_without_intercept: false,
                     duchon_centers: Some(centers),
                     basis_size,
                 });

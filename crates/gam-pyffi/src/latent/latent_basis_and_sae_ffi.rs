@@ -1,3 +1,6 @@
+use gam::terms::sae::basis::{PhiEtaSplit, SaeBasisThirdJet};
+use ndarray::Array5;
+
 fn latent_basis_kind(value: &str) -> Result<&'static str, String> {
     match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
         "duchon" | "duchonspline" => Ok("duchon"),
@@ -2019,6 +2022,7 @@ fn build_sae_basis_evaluators(
         // `with_basis_second_jet`, which is the slot the #1117 rank-revealing
         // reduction reads to reparametrize a rank-deficient decoder.
         let evaluator: Arc<dyn SaeBasisSecondJet> = match &basis_kinds[k] {
+            SaeAtomBasisKind::Periodic if d == 1 && m == 2 => Arc::new(FundamentalCircleEvaluator),
             SaeAtomBasisKind::Periodic if d == 1 && m % 2 == 1 => {
                 Arc::new(PeriodicHarmonicEvaluator::new(m)?)
             }
@@ -5147,12 +5151,87 @@ struct SaeAtomBuildPlan {
     kind: SaeAtomBasisKind,
     latent_dim: usize,
     n_harmonics: usize,
+    periodic_without_intercept: bool,
     duchon_centers: Option<Array2<f64>>,
     basis_size: usize,
 }
 
 fn sae_atom_basis_size(plan: &SaeAtomBuildPlan) -> usize {
     plan.basis_size
+}
+
+#[derive(Debug, Clone)]
+struct FundamentalCircleEvaluator;
+
+impl SaeBasisEvaluator for FundamentalCircleEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        if n_basis != 2 {
+            return Err(format!(
+                "FundamentalCircleEvaluator::phi_eta_split: expected n_basis == 2, got {n_basis}"
+            ));
+        }
+        Ok(PhiEtaSplit::all_linear(n_basis))
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != 1 {
+            return Err(format!(
+                "FundamentalCircleEvaluator::evaluate: expected latent_dim == 1, got {}",
+                coords.ncols()
+            ));
+        }
+        let t = coords.column(0).to_owned();
+        let (phi, jet, _penalty) = sae_build_periodic_atom_without_intercept(t.view())?;
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for FundamentalCircleEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        if coords.ncols() != 1 {
+            return Err(format!(
+                "FundamentalCircleEvaluator::second_jet: expected latent_dim == 1, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let mut h = Array4::<f64>::zeros((n, 2, 1, 1));
+        let freq2 = std::f64::consts::TAU * std::f64::consts::TAU;
+        for row in 0..n {
+            let angle = std::f64::consts::TAU * coords[[row, 0]].rem_euclid(1.0);
+            h[[row, 0, 0, 0]] = -freq2 * angle.sin();
+            h[[row, 1, 0, 0]] = -freq2 * angle.cos();
+        }
+        Ok(h)
+    }
+}
+
+impl SaeBasisThirdJet for FundamentalCircleEvaluator {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        if coords.ncols() != 1 {
+            return Err(format!(
+                "FundamentalCircleEvaluator::third_jet: expected latent_dim == 1, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let mut third = Array5::<f64>::zeros((n, 2, 1, 1, 1));
+        let freq3 = std::f64::consts::TAU * std::f64::consts::TAU * std::f64::consts::TAU;
+        for row in 0..n {
+            let angle = std::f64::consts::TAU * coords[[row, 0]].rem_euclid(1.0);
+            third[[row, 0, 0, 0, 0]] = -freq3 * angle.cos();
+            third[[row, 1, 0, 0, 0]] = freq3 * angle.sin();
+        }
+        Ok(third)
+    }
 }
 
 const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
@@ -6425,6 +6504,36 @@ fn sae_build_periodic_atom(
     Ok((phi, jet, penalty))
 }
 
+/// Evaluate the reduced fundamental circle basis `[sin(2πt), cos(2πt)]`.
+///
+/// Some trained SAE circle artifacts store the centered/fundamental chart after
+/// the constant Fourier row has been quotiented out, so the frozen decoder has
+/// exactly two rows.  OOS prediction must replay that trained design instead of
+/// inflating it to the generic three-row `[1, sin, cos]` periodic basis.
+fn sae_build_periodic_atom_without_intercept(
+    t: ArrayView1<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
+    if t.iter().any(|value| !value.is_finite()) {
+        return Err("sae_build_periodic_atom_without_intercept requires finite t values".to_string());
+    }
+    let n_rows = t.len();
+    let mut phi = Array2::<f64>::zeros((n_rows, 2));
+    let mut jet = Array3::<f64>::zeros((n_rows, 2, 1));
+    let mut penalty = Array2::<f64>::zeros((2, 2));
+    penalty[[0, 0]] = 1.0;
+    penalty[[1, 1]] = 1.0;
+    for row in 0..n_rows {
+        let angle = std::f64::consts::TAU * t[row].rem_euclid(1.0);
+        let sin_value = angle.sin();
+        let cos_value = angle.cos();
+        phi[[row, 0]] = sin_value;
+        phi[[row, 1]] = cos_value;
+        jet[[row, 0, 0]] = std::f64::consts::TAU * cos_value;
+        jet[[row, 1, 0]] = -std::f64::consts::TAU * sin_value;
+    }
+    Ok((phi, jet, penalty))
+}
+
 /// Compute the per-axis basis size `axis_m = (m)^(1/d)` for a torus atom and
 /// verify that `m = axis_m^d` with `axis_m` odd (i.e. `2H+1`). Returns
 /// `axis_m`.
@@ -6734,7 +6843,11 @@ fn sae_build_padded_basis_stacks(
                 } else {
                     Array1::<f64>::zeros(n_obs)
                 };
-                let (phi, jet, penalty) = sae_build_periodic_atom(t.view(), plan.n_harmonics)?;
+                let (phi, jet, penalty) = if plan.periodic_without_intercept {
+                    sae_build_periodic_atom_without_intercept(t.view())?
+                } else {
+                    sae_build_periodic_atom(t.view(), plan.n_harmonics)?
+                };
                 let m = phi.ncols();
                 if phi.nrows() != n_obs || m != basis_sizes[atom_idx] {
                     return Err(format!(

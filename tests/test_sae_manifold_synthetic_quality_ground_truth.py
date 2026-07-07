@@ -108,6 +108,35 @@ def test_periodic_basis_public_entrypoints_agree_after_wrapping() -> None:
     )
 
 
+
+def test_oos_fixed_decoder_replays_reduced_fundamental_circle_design() -> None:
+    """A trained two-row circle decoder is the authoritative OOS basis contract."""
+    t = np.linspace(0.0, 1.0, 12, endpoint=False, dtype=float)
+    x = np.column_stack([np.sin(2.0 * np.pi * t), np.cos(2.0 * np.pi * t)])
+    decoder = np.eye(2, dtype=float)
+    payload = rust_module().sae_manifold_predict_oos(
+        np.ascontiguousarray(x),
+        ["periodic"],
+        [1],
+        [np.ascontiguousarray(decoder)],
+        [None],
+        [1],
+        [2],
+        alpha=1.0,
+        tau=0.25,
+        assignment_kind="softmax",
+        sparsity_strength=0.0,
+        smoothness=0.0,
+        max_iter=3,
+        learning_rate=1.0,
+    )
+    fitted = np.asarray(payload["fitted"], dtype=float)
+
+    assert fitted.shape == x.shape
+    assert np.all(np.isfinite(fitted))
+    assert _r2(x, fitted) >= 0.98
+
+
 def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
     """Known decoder, known one-hot atoms: OOS should recover routing."""
     x, truth, _t = _planted_one_hot_periodic(n=16, seed=0, noise=0.0)
