@@ -197,7 +197,6 @@ mod kronecker;
 mod loss;
 mod outer_objective;
 mod pair_kappa;
-mod pair_phase;
 mod pca_seed;
 mod penalties;
 mod persistence;

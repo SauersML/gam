@@ -2140,11 +2140,9 @@ impl SaeManifoldTerm {
                     full[idx] += v;
                 }
                 let vc = frame_projection.project_border_vec(full.view());
-                let sparse: Vec<(usize, f64)> = vc
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &v)| v != 0.0)
-                    .map(|(i, &v)| (i, v))
+                let sparse: Vec<(usize, f64)> = (0..vc.len())
+                    .filter(|&i| vc[i] != 0.0)
+                    .map(|i| (i, vc[i]))
                     .collect();
                 if !sparse.is_empty() {
                     ops.push(Arc::new(SparseRankOnePenaltyOp {
