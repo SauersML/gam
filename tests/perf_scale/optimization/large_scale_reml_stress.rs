@@ -53,7 +53,14 @@ const PC_DIM: usize = 6;
 const K_CENTERS: usize = 500;
 const NOISE_SD: f64 = 0.30;
 const SEED_BASE: u64 = 0xB10B_0001_0001_0001;
-const N_COVERAGE_SIMS: usize = 20;
+// The coverage claim is a POOLED statistic: every per-row interval from every
+// sim is aggregated into one `total_in / total_pts` fraction. With
+// `N_COVERAGE_SIMS × N_COVERAGE_HOLDOUT` = 8 × 400 = 3200 pooled points, the
+// empirical-coverage standard error is √(0.95·0.05/3200) ≈ 0.004, so the
+// `coverage > 0.85` bound (true coverage ≈ 0.95) keeps a >20·SE margin. Reduced
+// from 20 to 8 sims to keep this test under the 300s nextest SLOW budget; the
+// pooled coverage estimate stays tight and the assertion is unchanged.
+const N_COVERAGE_SIMS: usize = 8;
 const N_COVERAGE_TRAIN: usize = 4_000;
 const N_COVERAGE_HOLDOUT: usize = 400;
 const K_COVERAGE: usize = 80;

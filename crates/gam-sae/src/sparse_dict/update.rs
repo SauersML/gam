@@ -1554,6 +1554,28 @@ mod exact_solve_tests {
     }
 
     #[test]
+    fn direct_solve_threshold_tracks_percolation_scale_not_a_constant() {
+        use super::direct_solve_size_threshold;
+        // The exact-solve ceiling is the Erdős–Rényi critical-component scale
+        // ⌈K^{2/3}⌉ — it MUST move with K (no frozen magic block size), and it
+        // must sit strictly below K for any coupled dictionary so a single giant
+        // component is never dense-factorised.
+        assert_eq!(direct_solve_size_threshold(0), 0);
+        assert_eq!(direct_solve_size_threshold(1), 1);
+        for &k in &[8usize, 12, 64, 1024, 100_000] {
+            let tau = direct_solve_size_threshold(k);
+            let want = (k as f64).powf(2.0 / 3.0).ceil() as usize;
+            assert_eq!(tau, want, "threshold must equal ⌈K^{{2/3}}⌉ for K={k}");
+            assert!(
+                tau < k,
+                "a giant (size-K) component must exceed the dense threshold at K={k} (got {tau})"
+            );
+        }
+        // It is genuinely a function of K, not a constant: the value grows with K.
+        assert!(direct_solve_size_threshold(100_000) > direct_solve_size_threshold(12));
+    }
+
+    #[test]
     fn cg_lanczos_kappa_matches_true_condition_number() {
         let eigenvalues = [1.0f64, 1.7, 2.9, 4.6, 8.0, 13.0];
         let b = vec![1.0f64; eigenvalues.len()];

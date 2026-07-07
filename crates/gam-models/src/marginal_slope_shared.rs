@@ -1649,16 +1649,48 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
     }
 }
 
+/// Process-stable worker-count estimate used for **chunk-boundary sizing only**.
+///
+/// Reproducibility contract (#1045): the boundaries of the row-reduction chunks
+/// — and therefore the floating-point association of the per-chunk sums that
+/// feed the marginal-slope REML optimum — must NOT depend on the size of the
+/// rayon worker pool that happens to be executing the fit. Sizing chunks to the
+/// live `rayon::current_num_threads()` broke that contract: installing a
+/// narrower worker pool (exactly the #1045 perf lever — shrink the pool so the
+/// per-fit `crossbeam_epoch` bookkeeping stops dominating small-`n` loops)
+/// regrouped the per-chunk row sums and, through the iterative REML optimizer
+/// near a flat optimum, steered the fit to a different `(ρ, λ)`. That is a
+/// reproducibility defect, not a perf win.
+///
+/// This returns the machine parallelism captured once for the process — a fixed
+/// deployment property, independent of how many workers a scoped
+/// `ThreadPool::install` exposes — so shrinking (or widening) the executing
+/// pool leaves the chunk boundaries, the reduction tree, and hence the fit
+/// unchanged. rayon still fans the fixed chunks across whatever workers are
+/// present, so parallelism is fully preserved. In production, where gam owns a
+/// single global pool sized to the machine, this equals the previous
+/// `current_num_threads()` value, so the fit's numerics are preserved.
+pub(crate) fn reproducible_chunk_parallelism() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
 /// Deterministic-order parallel reduction over a row-index slice.
 ///
 /// Splits `rows` into contiguous chunks sized to saturate the rayon pool
 /// (several chunks per worker, floored so small `n` stays coarse), processes
 /// each chunk sequentially in parallel via `process_row`, and combines the
 /// per-chunk accumulators in chunk-index order via `combine` on the calling
-/// thread. The chunk count is a pure function of `(rows.len(), worker_count)`;
-/// the worker count is fixed for the process (one global pool), so the
-/// reduction tree is fixed across calls regardless of rayon's work-stealing
-/// decisions.
+/// thread. The chunk count is a pure function of `(rows.len(),
+/// reproducible_chunk_parallelism())` — the latter a process constant, NOT the
+/// live scoped-pool worker count — so the reduction tree is fixed across calls
+/// and across pool sizes regardless of rayon's work-stealing decisions.
 ///
 /// `try_fold/try_reduce` over `rows.into_par_iter()` does **not** have
 /// this property: rayon's adaptive splitter sets chunk boundaries based
@@ -1695,14 +1727,15 @@ where
     // keeps load balanced across an uneven row-cost tail (work-stealing still
     // moves whole chunks, never partial sums) without flooding the sequential
     // `combine` with tiny partials. The count is a pure function of
-    // `(rows.len(), worker_count)`; the worker count is fixed for the process
-    // (one global pool, gam owns its threads), so chunk boundaries are stable
-    // across calls and the ordered `Vec` collect + sequential `combine` keep the
-    // reduction bit-for-bit deterministic regardless of work-stealing.
+    // `(rows.len(), reproducible_chunk_parallelism())`; the latter is the
+    // process-stable machine parallelism (NOT the live scoped-pool worker
+    // count), so chunk boundaries are invariant to the executing pool size and
+    // the ordered `Vec` collect + sequential `combine` keep the reduction
+    // bit-for-bit deterministic regardless of pool size or work-stealing.
     const CHUNKS_PER_WORKER: usize = 4;
     const MIN_CHUNK_COUNT: usize = 32;
     const MIN_ROWS_PER_CHUNK: usize = 64;
-    let workers = rayon::current_num_threads().max(1);
+    let workers = reproducible_chunk_parallelism();
     let target_chunk_count = workers
         .saturating_mul(CHUNKS_PER_WORKER)
         .max(MIN_CHUNK_COUNT);

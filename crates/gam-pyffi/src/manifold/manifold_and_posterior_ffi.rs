@@ -3232,6 +3232,40 @@ fn sae_jumprelu_batch_value_grad<'py>(
     Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
 }
 
+/// Top-k SAE activation value+grad over an `(N, K)` logit matrix — the single
+/// source of truth for `gamfit.torch`'s `softmax_topk` activation.
+///
+/// Returns `(a, da_dl)`, each `(N, K)`, where `a[i,k] = τ·softplus(l/τ)` is the
+/// per-atom **independent**, strictly non-negative activation the top-k gate
+/// scores with, and `da_dl[i,k] = σ(l/τ)` is its diagonal logit derivative
+/// (temperature cancels in the chain). The hard top-k *selection* and its masked
+/// gradient stay on the torch tape; only this activation crosses the boundary.
+#[pyfunction(signature = (logits, temperature))]
+fn sae_topk_activation_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    temperature: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_topk_activation_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    for ((row, col), &v) in logits_view.indexed_iter() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_topk_activation_value_grad: non-finite logit at row {row} atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae::assignment::topk_activation_batch_value_grad(
+        logits_view.view(),
+        temperature,
+    );
+    Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
+}
+
 #[pyfunction(signature = (
     latents_json,
     penalties_json,

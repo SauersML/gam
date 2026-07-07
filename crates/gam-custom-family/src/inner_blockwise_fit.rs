@@ -1540,8 +1540,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             // failing-test capture; the cond/nullity/diagnosis come from
                             // the existing `format_structured_log` at the refused exit.
                             log::warn!(
-                                "[gam#979 constrained-QP] cycle={} active_set_rows={} beta_inf={:.4e}",
+                                "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
                                 cycle,
+                                if lower_bounds.is_some() { "simple" } else { "linear" },
+                                warm_joint_active.as_ref().map_or(0, |v| v.len()),
                                 active_set.len(),
                                 beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
                             );
