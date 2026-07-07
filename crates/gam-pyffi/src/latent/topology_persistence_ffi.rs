@@ -88,11 +88,6 @@ mod tests {
 
     #[test]
     fn topology_persistence_payload_surfaces_covering_side() {
-        // pyo3 gates `prepare_freethreaded_python` OUT under `extension-module`
-        // (host interpreter owns init there); only initialize when we link libpython
-        // ourselves (bare cargo test / --no-default-features). #2224 follow-up.
-        #[cfg(not(feature = "extension-module"))]
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let report = AtomTopologyPersistence {
                 raced_kind: SaeAtomBasisKind::Periodic,
