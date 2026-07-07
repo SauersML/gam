@@ -8646,23 +8646,30 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             (fit, score)
         })
     });
-    // #1074: when the multi-start pre-scan already placed the seed in a good,
-    // finite basin, a HARD joint-solve failure (e.g. a NaN covariance from κ
-    // railing into the kernel-collapse corner during the local polish) must not
-    // sink the whole fit — the pre-scan geometry is itself a valid κ-optimized
-    // result (ρ profiled at the best-scoring fixed κ). Fall back to it, exactly
-    // as the NonConverged / worsened-score gates inside the joint solver already
-    // fall back to the frozen baseline. Only the local polish (a fraction of a
-    // REML nat) is forgone. Scoped to the pre-scan-improved case so ordinary
-    // joint failures keep raising as before.
-    let exact_joint = if prescan_improved && !matches!(joint_result, Ok(Some(_))) {
+    // #1074 / #2162: when the fixed-κ profiled seed is in a good, finite basin,
+    // a HARD joint-solve failure caused only by inference-matrix finiteness (for
+    // example a NaN frequentist covariance from κ railing into the
+    // kernel-collapse corner during local polish) must not sink the whole fit.
+    // The trial-evaluation path already classifies that exact condition as a
+    // recoverable infeasible κ point and retreats; apply the same semantics to
+    // the terminal polish by returning the finite frozen/pre-scan geometry with
+    // ρ profiled at fixed κ. Keep unrelated errors fatal, and keep the older
+    // pre-scan-improved rescue for cases where the multi-start scan found a
+    // strictly better fixed-κ basin but the final polish produced no candidate.
+    let terminal_joint_recoverable = matches!(
+        &joint_result,
+        Err(err) if is_recoverable_trial_point_error(err)
+    );
+    let exact_joint = if (prescan_improved && !matches!(joint_result, Ok(Some(_))))
+        || terminal_joint_recoverable
+    {
         let reason = match &joint_result {
             Err(e) => format!("error: {e}"),
             _ => "unavailable".to_string(),
         };
         log::info!(
-            "[spatial-kappa] #1074 joint polish yielded no usable candidate \
-             ({reason}); returning the multi-start pre-scan geometry (REML {initial_score:.5})"
+            "[spatial-kappa] #1074/#2162 joint polish yielded no usable candidate \
+             ({reason}); returning the fixed-κ profiled geometry (REML {initial_score:.5})"
         );
         FittedTermCollectionWithSpec {
             fit: best.fit,
