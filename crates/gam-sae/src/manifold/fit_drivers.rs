@@ -3290,21 +3290,64 @@ impl SaeManifoldTerm {
         if n == 0 || k == 0 {
             return Ok(());
         }
+        // #2080/#2023 — JOINT (independence) chart separation for entangled factors.
+        // The per-atom PCA-residual seed below separates by VARIANCE, so an
+        // entangled product-of-circles (equal-variance factors on overlapping
+        // frames) has every atom read the SAME dominant mixed direction → shared
+        // decoder subspace → μ̂ = 1.0 co-collapse (EV-invisible). Capture the signal
+        // span ONCE and run the joint Jacobi ISA split to separate up to K circle
+        // planes SIMULTANEOUSLY by kurtosis contrast (statistical independence),
+        // not variance. Each certified plane already carries its per-row
+        // `phases_turns` in the exact `[0, 1)` chart-seed format the Periodic PCA
+        // seed emits (see `certify_plane`), so only the chart SOURCE changes; the
+        // decoder LS + `quotient_scale` peel + residual deflation below are
+        // unchanged. When the span carries fewer than K κ-certified circle planes
+        // (non-circle atom, or too little independent structure) the remaining
+        // atoms fall back to the PCA peel, so peelable/disjoint fixtures are
+        // untouched — the κ certificate itself is the gate, never a tuned knob.
+        let joint_planes: Vec<super::isa_seed::IsaPlaneCandidate> =
+            match super::isa_seed::capture_signal_span(target, k)? {
+                Some(parts) => super::isa_seed::isa_extract_certified_planes(
+                    target,
+                    &parts,
+                    k,
+                    &super::isa_seed::IsaSeedConfig::default(),
+                ),
+                None => Vec::new(),
+            };
+        let mut next_isa_plane = joint_planes.into_iter();
+
         let mut residual = target.to_owned();
         for atom in 0..k {
-            // 1. Re-seed THIS atom's chart from the current residual's leading
-            //    structure (one-atom PCA seed on the residual left by prior atoms).
+            // 1. Seed THIS atom's chart. Prefer a jointly-separated ISA circle
+            //    plane (independence contrast); otherwise re-seed from the current
+            //    residual's leading structure (one-atom PCA seed on the residual
+            //    left by prior atoms).
             let kind = self.atoms[atom].basis_kind.clone();
             let dim = self.atoms[atom].latent_dim;
-            let seeded = sae_pca_seed_initial_coords(
-                residual.view(),
-                std::slice::from_ref(&kind),
-                std::slice::from_ref(&dim),
-            )?;
+            let isa_plane = if dim > 0 && matches!(kind, SaeAtomBasisKind::Periodic) {
+                next_isa_plane.next()
+            } else {
+                None
+            };
             let mut flat = Array1::<f64>::zeros(n * dim);
-            for row in 0..n {
-                for axis in 0..dim {
-                    flat[row * dim + axis] = seeded[[0, row, axis]];
+            if let Some(plane) = isa_plane {
+                // The certified per-row phase (turns, `[0, 1)`) IS the circle chart
+                // seed on axis 0; higher axes stay zero, matching the Periodic PCA
+                // seed which only writes axis 0.
+                for row in 0..n {
+                    flat[row * dim] = plane.phases_turns[[row, 0]];
+                }
+            } else {
+                let seeded = sae_pca_seed_initial_coords(
+                    residual.view(),
+                    std::slice::from_ref(&kind),
+                    std::slice::from_ref(&dim),
+                )?;
+                for row in 0..n {
+                    for axis in 0..dim {
+                        flat[row * dim + axis] = seeded[[0, row, axis]];
+                    }
                 }
             }
             self.assignment.coords[atom].set_flat(flat.view());
