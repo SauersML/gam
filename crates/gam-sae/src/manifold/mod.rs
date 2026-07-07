@@ -109,6 +109,7 @@ pub(crate) use gam_solve::arrow_schur::{
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
+    SparseRankOnePenaltyOp,
     StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
     solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
     streaming_cross_row_woodbury_log_det,
@@ -196,6 +197,7 @@ mod kronecker;
 mod loss;
 mod outer_objective;
 mod pair_kappa;
+mod pair_phase;
 mod pca_seed;
 mod penalties;
 mod persistence;

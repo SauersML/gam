@@ -928,6 +928,7 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         dense_beta_curvature: bool,
         atom_curv: &mut [f64],
+        sep_rank1: &mut Vec<(f64, Vec<(usize, f64)>)>,
     ) -> bool {
         if penalty_scale == 0.0 {
             return false;
@@ -1110,22 +1111,29 @@ impl SaeManifoldTerm {
                 // in factored coordinates. Hand the per-atom scalar back to the
                 // assembler, which folds it into `smooth_scaled_s[k]` — the single
                 // source for the CPU composite penalty op AND the device smooth
-                // blocks — so the curvature reaches the operator on every path
+                // blocks — so the bounded majorizer reaches the operator on every path
                 // (CPU dense-Direct, CPU PCG, device PCG) with no divergence.
                 //
-                // #1038 SECOND INCREMENT (real-OLMo path): the exact self-concordant
-                // rank-1 `d2·(∂o/∂B)(∂o/∂B)ᵀ` carried on the dense path above has no
-                // scalar-per-atom projection here — it couples the (j,k) blocks along
-                // a single `∂o` direction, not an isotropic ridge. It needs a Woodbury
-                // rank-1 carrier attached to the structured `penalty_op` (the #1038
-                // capacitance machinery). Until that lands, this path keeps the bounded
-                // per-atom Levenberg ridge (still PSD, still separating, just not the
-                // tight self-concordant curvature), so it never regresses.
+                // #1038 — the EXACT self-concordant rank-1 `d2·(∂o/∂B)(∂o/∂B)ᵀ` that
+                // the dense path scatters into `hbb` has no scalar-per-atom projection
+                // here: it couples the (j,k) blocks along a single `∂o` direction, not
+                // an isotropic ridge, so the scalar `atom_curv` ridge alone lets the
+                // dictionary co-collapse (indefinite reduced Schur → non-PD → the
+                // criterion refines forever). Hand the rank-1 carrier `(d2, ∂o/∂B)` in
+                // the full-`B` layout back to the assembler, which installs it as a
+                // `SparseRankOnePenaltyOp` on the structured `penalty_op` (projected to
+                // factored border coords `Φᵀv` on the framed path — still rank-1). The
+                // bounded Levenberg ridge is KEPT alongside it for the orthogonal
+                // `∂²o/∂B²` part, exactly as the dense path keeps `lev·I` beside the
+                // rank-1.
                 if lev_j > 0.0 {
                     atom_curv[j] += lev_j;
                 }
                 if lev_k > 0.0 {
                     atom_curv[k] += lev_k;
+                }
+                if d2 > 0.0 {
+                    sep_rank1.push((d2, do_db));
                 }
             }
         }
@@ -1397,7 +1405,14 @@ impl SaeManifoldTerm {
         sys.gb = Array1::<f64>::zeros(self.beta_dim());
         sys.hbb = Array2::<f64>::zeros((0, 0));
         let mut atom_curv = vec![0.0_f64; self.k_atoms()];
-        self.add_sae_separation_barrier(&mut sys, penalty_scale, false, &mut atom_curv);
+        let mut sep_rank1 = Vec::new();
+        self.add_sae_separation_barrier(
+            &mut sys,
+            penalty_scale,
+            false,
+            &mut atom_curv,
+            &mut sep_rank1,
+        );
         (self.separation_barrier_value(penalty_scale), sys.gb)
     }
 }

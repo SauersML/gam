@@ -415,6 +415,115 @@ impl BetaPenaltyOp for DensePenaltyOp {
     }
 }
 
+/// Rank-1 PSD penalty operator `scale · v vᵀ` with a SPARSE carrier `v`
+/// (nonzero on only a few atom decoder blocks). Carries the SAE separation
+/// barrier's EXACT self-concordant curvature `∂²P/∂o² · (∂o/∂B)(∂o/∂B)ᵀ` into the
+/// matrix-free / framed penalty operator (#1038), where the per-atom scalar ridge
+/// cannot represent the cross-atom rank-1 coupling: on that path the missing
+/// curvature let the dictionary co-collapse (indefinite reduced Schur → non-PD →
+/// the criterion refines forever). `scale = d2 = ∂²P/∂o² ≥ 0` on the gated
+/// interior ⇒ this rank-1 is PSD, so adding it to any PSD penalty op keeps the
+/// operator PD. The carrier is expressed in whatever coordinate space the operator
+/// runs in (full-`B` on the non-frames path; factored border coords on the framed
+/// path, where the full-`B` `v` is projected `v_c = Φᵀ v` before construction —
+/// still a rank-1 because `Φ` is linear).
+pub struct SparseRankOnePenaltyOp {
+    /// Full β dimension `K` of the coordinate space the carrier lives in.
+    pub k: usize,
+    /// Nonnegative curvature scale `d2 = ∂²P/∂o²`.
+    pub scale: f64,
+    /// Sparse carrier `v`: `(global_index, value)` with every `index < k`.
+    pub carrier: Vec<(usize, f64)>,
+}
+
+impl BetaPenaltyOp for SparseRankOnePenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        // y += scale · v (vᵀ x)
+        let mut dot = 0.0_f64;
+        for &(idx, val) in &self.carrier {
+            dot += val * x[idx];
+        }
+        let s = self.scale * dot;
+        for &(idx, val) in &self.carrier {
+            y[idx] += s * val;
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        let mut dot = 0.0_f64;
+        for &(idx, val) in &self.carrier {
+            dot += val * beta[idx];
+        }
+        let s = self.scale * dot;
+        for &(idx, val) in &self.carrier {
+            out[idx] += s * val;
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        for &(idx, val) in &self.carrier {
+            diag[idx] += self.scale * val * val;
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        // Only the intra-block sub-outer-product contributes to this block-Jacobi
+        // sub-block (the cross-block coupling is invisible to the preconditioner,
+        // exactly as for any operator with off-block entries).
+        let range = &offsets[id.0];
+        for &(gi, vi) in &self.carrier {
+            if gi < range.start || gi >= range.end {
+                continue;
+            }
+            let bi = gi - range.start;
+            for &(gj, vj) in &self.carrier {
+                if gj < range.start || gj >= range.end {
+                    continue;
+                }
+                out[[bi, gj - range.start]] += self.scale * vi * vj;
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for &(gi, vi) in &self.carrier {
+            for &(gj, vj) in &self.carrier {
+                out[[gi, gj]] += self.scale * vi * vj;
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("sparse-rank-one-penalty-op-v1");
+        hasher.write_usize(self.k);
+        hasher.write_f64(self.scale);
+        hasher.write_usize(self.carrier.len());
+        for &(idx, val) in &self.carrier {
+            hasher.write_usize(idx);
+            hasher.write_f64(val);
+        }
+    }
+
+    fn row_abs_sums(&self) -> Array1<f64> {
+        // Row `gi` of `scale·v vᵀ` is `scale·v_gi·vᵀ`, so its ∞-row sum is
+        // `scale·|v_gi|·Σ_j|v_j|`. Fold the sparse carrier directly — NEVER
+        // materialize the dense `K×K` (the SAE border critical path, #1017).
+        let mut out = Array1::<f64>::zeros(self.k);
+        let abs_sum: f64 = self.carrier.iter().map(|&(_, v)| v.abs()).sum();
+        let s = self.scale * abs_sum;
+        for &(gi, vi) in &self.carrier {
+            out[gi] += s * vi.abs();
+        }
+        out
+    }
+}
+
 /// Block-local penalty operator: applies per-block penalty matrices
 /// (matching `ParameterBlockSpec` boundaries) without materialising a
 /// full `K×K` dense matrix.
