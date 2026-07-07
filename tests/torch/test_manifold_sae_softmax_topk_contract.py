@@ -171,6 +171,45 @@ def test_softmax_topk_honors_target_k() -> None:
     _selftest_softmax_topk_honors_target_k()
 
 
+def test_topk_activation_matches_rust_value_grad() -> None:
+    """The ``softmax_topk`` activation is single-sourced on the Rust value+grad.
+
+    ``gamfit.torch``'s ``topk_activation`` transcribes the Rust source of truth
+    ``gam_sae::assignment::topk_activation_batch_value_grad`` on-device (so it
+    runs on GPU without a CPU round-trip). This pins the transcription: the torch
+    forward value and the torch autograd backward (the diagonal derivative
+    ``σ(l/τ)``) must both equal the Rust kernel to full double precision — the
+    same parity contract ``ibp_map`` / ``jumprelu_bounded_gate`` satisfy.
+    """
+    from gamfit._binding import rust_module
+    from gamfit.torch.penalties import topk_activation
+
+    torch.manual_seed(0)
+    tau = 0.37
+    logits = torch.randn(6, 5, dtype=torch.float64, requires_grad=True)
+
+    value = topk_activation(logits, tau)
+    # A non-uniform upstream so the backward exercises the diagonal Jacobian.
+    upstream = torch.arange(1, value.numel() + 1, dtype=torch.float64).reshape_as(value)
+    value.backward(upstream)
+
+    rust_value, rust_grad = rust_module().sae_topk_activation_value_grad(
+        logits.detach().numpy(), tau
+    )
+    # torch's `softplus`/`sigmoid` and Rust's `stable_softplus`/`stable_logistic`
+    # are algebraically-identical but distinct FP rearrangements, so they agree to
+    # full working precision (~1e-13), not bit-for-bit. A real defect (wrong
+    # derivative, τ not cancelling, softmax competition) would deviate by O(0.1)+,
+    # far above this bound.
+    torch.testing.assert_close(
+        value.detach(), torch.from_numpy(rust_value), rtol=0.0, atol=1e-12
+    )
+    # logits.grad = upstream * σ(l/τ); Rust returns the diagonal derivative σ(l/τ).
+    expected_grad = upstream * torch.from_numpy(rust_grad)
+    assert logits.grad is not None
+    torch.testing.assert_close(logits.grad, expected_grad, rtol=0.0, atol=1e-12)
+
+
 def test_duchon_centers_nd_uses_rust_low_discrepancy_lift() -> None:
     """The product-patch Duchon lift is Rust-owned and preserves the legacy R_d cloud."""
     from gamfit.torch.manifold_sae import _duchon_centers_nd
