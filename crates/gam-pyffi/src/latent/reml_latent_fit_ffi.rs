@@ -1557,27 +1557,45 @@ fn gaussian_reml_fit_formula_table_impl(
     // Eigenvectors of the symmetric PSD Gram via its SVD: for a symmetric PSD
     // matrix the left singular vectors ARE the eigenvectors, already ordered by
     // descending eigenvalue.
-    let (u_opt, _svals, _vt) = gram
+    let (u_opt, svals, _vt) = gram
         .svd(true, false)
         .map_err(|err| format!("shared-tangent output-frame SVD failed: {err}"))?;
     let mut v_rot = u_opt.ok_or_else(|| {
         "shared-tangent output-frame SVD returned no left singular vectors".to_string()
     })?;
-    // Pin each eigenvector's sign frame-COVARIANTLY: make its projection on the
-    // pooled mean output direction non-negative. Both the eigenvector and the
-    // mean direction rotate by `R` under `Y ↦ Y Rᵀ`, so this inner-product sign
-    // is preserved and `V ↦ R V` holds exactly (for distinct eigenvalues),
-    // cancelling the SVD's arbitrary per-column sign.
-    for j in 0..d {
-        let mut dot = 0.0;
-        for a in 0..d {
-            dot += v_rot[[a, j]] * mean_dir[a];
-        }
-        if dot < 0.0 {
+    // Eigenvector directions are only well-conditioned when consecutive
+    // eigenvalues are separated by more than the sqrt(ε) resolvability floor:
+    // the perturbation of an eigenvector scales as ‖ΔG‖ / gap, so a gap near the
+    // float noise leaves `V` defined only up to an internal rotation of the
+    // (near-)degenerate eigenspace, and the frame-covariance `V(R G Rᵀ) = R·V(G)`
+    // that this rewrite relies on can silently fail there. In exactly that
+    // regime the response is rotationally symmetric within the degenerate
+    // subspace, so output-frame equivariance is ill-defined and the frame choice
+    // cannot matter for a well-posed target. Fall back to the identity (fit in
+    // the caller's original frame — an exact no-op reparameterization) rather
+    // than risk an unstable rotation. `svals` are sorted descending by the SVD.
+    let s_max = svals.iter().copied().fold(0.0_f64, f64::max);
+    let gap_floor = f64::EPSILON.sqrt() * s_max.max(1.0);
+    let well_separated = (1..d).all(|j| svals[j - 1] - svals[j] > gap_floor);
+    if well_separated {
+        // Pin each eigenvector's sign frame-COVARIANTLY: make its projection on
+        // the pooled mean output direction non-negative. Both the eigenvector and
+        // the mean direction rotate by `R` under `Y ↦ Y Rᵀ`, so this
+        // inner-product sign is preserved and `V ↦ R V` holds exactly,
+        // cancelling the SVD's arbitrary per-column sign.
+        for j in 0..d {
+            let mut dot = 0.0;
             for a in 0..d {
-                v_rot[[a, j]] = -v_rot[[a, j]];
+                dot += v_rot[[a, j]] * mean_dir[a];
+            }
+            if dot < 0.0 {
+                for a in 0..d {
+                    v_rot[[a, j]] = -v_rot[[a, j]];
+                }
             }
         }
+    } else {
+        v_rot = Array2::<f64>::eye(d);
     }
     // Canonical (frame-invariant) response `Y V` and metric `Vᵀ M V`. Shadow the
     // originals so the whole fit below runs in the canonical frame; the
