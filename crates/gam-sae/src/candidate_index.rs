@@ -81,6 +81,48 @@ pub fn auto_candidate_budget(num_atoms: usize) -> usize {
     (8 * log2).clamp(CANDIDATE_BUDGET_MIN, CANDIDATE_BUDGET_MAX)
 }
 
+/// Two-stage routing shortlist size (stage-1 candidate budget `C`) DERIVED from
+/// the **routability floor** (#985 / E1) — no magic constant.
+///
+/// The default large-`K` route is two-stage: an LSH shortlist of size `C` (stage
+/// 1, sublinear) is exactly rescored on the frame gate (stage 2). This function
+/// sizes that shortlist from the interference floor rather than a hand-tuned band.
+///
+/// The routability floor's **union-bound term** ([`crate::routability`]) is
+/// `u = √(2·ln(K/δ)/p)`: the deviation, in target-to-clutter units, at which the
+/// EXPECTED number of off-target atoms whose random-projection gate exceeds a
+/// routable target's gate equals `δ`, because `K·exp(−p·u²/2) = δ` under the same
+/// Gaussian–Lipschitz union bound that sets the floor. Isolating the `s` genuine
+/// top-`s` winners among `K` atoms down to that floor, at confidence `1 − δ`,
+/// costs a shortlist that additionally covers the confusable band, whose
+/// log-multiplicity is exactly `p·u² = 2·ln(K/δ)`:
+///
+/// ```text
+///     C  =  s  +  ⌈ p·u² ⌉  =  s + ⌈ 2·ln(K/δ) ⌉.
+/// ```
+///
+/// The term `p·u²` is read straight off [`crate::routability::routability_floor`]
+/// (union = `floor − √(1/p)`), so the shortlist and the interference floor move
+/// together. `C` is LOGARITHMIC (sublinear) in `K`, monotone non-decreasing in
+/// `K`, and widens as the confidence tightens (`δ → 0`); it is clamped to
+/// `[s+1, K]`. The recall license
+/// ([`SaeCandidateIndex::proposal_recall_report`]) then certifies empirically that
+/// at this `C` the two-stage route recovers the exact top-`s` for the routable
+/// rows — the "matches exhaustive top-s to a derived bound" acceptance.
+pub fn routability_shortlist_size(p: usize, num_atoms: usize, top_s: usize, delta: f64) -> usize {
+    let k = num_atoms.max(1);
+    // The closed-form floor for the linear atom lane (b_max = 1). Reading it back
+    // out ties the shortlist to the exact quantity the router's floor is built on.
+    let floor = crate::routability::routability_floor(p.max(1), k, 1, delta);
+    // Peel the subspace term √(b_max/p) = √(1/p) to recover the union term u.
+    let subspace = (1.0 / p.max(1) as f64).sqrt();
+    let union = (floor.floor - subspace).max(0.0);
+    // Confusable-band log-multiplicity p·u² = 2·ln(K/δ).
+    let band = (p.max(1) as f64) * union * union;
+    let c = top_s.saturating_add(band.ceil() as usize);
+    c.clamp(top_s.saturating_add(1), k)
+}
+
 // ---------------------------------------------------------------------------
 // Sketch interface
 // ---------------------------------------------------------------------------
@@ -1910,6 +1952,111 @@ mod tests {
             r2.total_true - r2.total_recovered,
             r2.misses.len(),
             "null (zero-direction) rows must still account for every miss"
+        );
+    }
+
+    /// The routability-derived shortlist size is well-formed: monotone
+    /// non-decreasing and only LOGARITHMIC (sublinear) in `K`, widens as the
+    /// confidence tightens, and reconstructs `p·u² = 2·ln(K/δ)` from the floor.
+    #[test]
+    fn routability_shortlist_size_is_logarithmic_and_floor_derived() {
+        let p = 48usize;
+        let s = 1usize;
+        let delta = 0.2;
+        let mut prev = 0usize;
+        for &k in &[64usize, 256, 1024, 4096, 65_536, 1_000_000] {
+            let c = routability_shortlist_size(p, k, s, delta);
+            assert!(c >= prev, "shortlist size must be monotone in K: {c} < {prev}");
+            assert!(c >= s + 1, "shortlist must exceed the top-s winner count");
+            assert!(c <= k, "shortlist can never exceed the dictionary");
+            // Logarithmic, not linear: at a million atoms the shortlist stays a
+            // tiny constant-times-log(K), never a fraction of K.
+            assert!(
+                (c as f64) < 4.0 * (k as f64).ln(),
+                "K={k}: shortlist {c} must stay logarithmic in K"
+            );
+            // Reconstruct the band directly: C − s == ⌈2·ln(K/δ)⌉.
+            let want_band = (2.0 * (k as f64 / delta).ln()).ceil() as usize;
+            assert_eq!(
+                c - s,
+                want_band.clamp(1, k - s),
+                "K={k}: shortlist band must equal ⌈2·ln(K/δ)⌉ = p·u²"
+            );
+            prev = c;
+        }
+        // Tighter confidence (smaller δ) widens the shortlist.
+        let c_loose = routability_shortlist_size(p, 4096, s, 0.5);
+        let c_tight = routability_shortlist_size(p, 4096, s, 1e-4);
+        assert!(
+            c_tight > c_loose,
+            "tightening δ must widen the shortlist: {c_tight} !> {c_loose}"
+        );
+    }
+
+    /// E1 acceptance: at the routability-DERIVED shortlist size `C`, the default
+    /// two-stage route (LSH shortlist → exact frame rescore) MATCHES the
+    /// exhaustive exact top-`s` selection for the routable rows, to the recall
+    /// bound `1 − δ` set by the SAME `δ` that sizes `C` and the floor — no magic
+    /// threshold anywhere. The rows are planted well above the routability floor
+    /// (target-to-clutter `a/ν = 1/0.15 ≈ 6.7 ≫ floor`), so they are routable by
+    /// construction; the gather touches only a sublinear slice; every miss is
+    /// logged.
+    #[test]
+    fn two_stage_route_matches_exact_top_s_at_routability_derived_shortlist() {
+        let k = 2000usize;
+        let p = 48usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 2026);
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 4242).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 4242);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+
+        // One δ drives the floor, the shortlist size, and the recall bound.
+        let delta = 0.2;
+        let s = 1usize;
+        let shortlist = routability_shortlist_size(p, k, s, delta);
+
+        // The floor certifies these planted rows are routable: a/ν ≫ floor.
+        let floor = crate::routability::routability_floor(p, k, 1, delta).floor;
+        let planted_ratio = 1.0 / 0.15;
+        assert!(
+            planted_ratio > floor,
+            "planted target-to-clutter {planted_ratio:.2} must clear the floor {floor:.3}"
+        );
+
+        let rows = planted_rows(&dirs, 200, 31337);
+        let directions: Vec<Array1<f64>> = rows.into_iter().map(|(d, _)| d).collect();
+        let report =
+            index.proposal_recall_report(&sketch, &directions, s, shortlist, cfg.multiprobe);
+
+        // Sublinear gather: the two-stage route touched only a small slice of K.
+        assert!(
+            report.sublinearity_ratio() < 0.5,
+            "two-stage gather was not sublinear: ratio {:.3}",
+            report.sublinearity_ratio()
+        );
+        // The derived recall bound, tied to δ (NOT a literal): routable rows are
+        // recovered at ≥ 1 − δ.
+        let bound = 1.0 - delta;
+        assert!(
+            report.recall >= bound,
+            "top-{s} recall {:.3} below the derived bound {bound:.3} at shortlist C={shortlist}; \
+             {} misses (first: {:?})",
+            report.recall,
+            report.misses.len(),
+            report
+                .misses
+                .iter()
+                .take(5)
+                .map(|m| (m.row, m.atom, m.reason, m.alignment))
+                .collect::<Vec<_>>()
+        );
+        // No silent truncation: the miss ledger accounts for every unrecovered slot.
+        assert_eq!(
+            report.total_true - report.total_recovered,
+            report.misses.len(),
+            "the miss ledger must account for every unrecovered exact-top-s atom"
         );
     }
 }

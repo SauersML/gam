@@ -443,3 +443,97 @@ fn two_date_modular_synthetic_binds_super_resolution_to_graph_base() {
         "missing second modular date"
     );
 }
+
+/// E1 graph-atom ENROLLMENT round-trip (#985): a discovered co-fire graph is
+/// enrolled as a first-class graph atom and its Betti numbers read back.
+///
+/// Plant a ring of `V` atoms whose adjacent members co-fire (each row activates
+/// one adjacent pair `(i, i+1 mod V)`), so the ONLY co-firing pairs are the `V`
+/// ring edges. `coactive_pair_stats` discovers them; `enroll_from_coactivation`
+/// enrolls the co-fire graph, the built-in ARD survival rule keeps the edges
+/// whose co-fire evidence beats the one-edge charge, and `topology_readout`
+/// reads the cycle Betti signature `(b0, b1) = (1, 1)`. Enroll → fit → read Betti,
+/// end to end.
+#[test]
+fn coactivation_ring_enrolls_as_graph_atom_with_cycle_betti() {
+    use crate::atom_codes::SparseAtomCodes;
+
+    let vertices = 6usize;
+    let reps = 120usize; // rows per ring edge
+    let n = vertices * reps;
+    let mut codes = SparseAtomCodes::empty(n, vertices);
+    let mut row_coords = Vec::with_capacity(n);
+    let mut row = 0usize;
+    for edge in 0..vertices {
+        let a = edge;
+        let b = (edge + 1) % vertices;
+        for _ in 0..reps {
+            codes.row_mut(row).assign(a, 1.0);
+            codes.row_mut(row).assign(b, 1.0);
+            row_coords.push(edge as f64);
+            row += 1;
+        }
+    }
+
+    // Discovery: the sparse co-fire pass returns exactly the V ring edges (no
+    // non-adjacent atoms ever co-fire), each at symmetric dependence 0.5.
+    let pairs = codes.coactive_pair_stats();
+    assert_eq!(pairs.len(), vertices, "only the ring edges co-fire");
+    for (a, b, stats) in &pairs {
+        assert!(
+            (stats.dependence() - 0.5).abs() < 1e-9,
+            "ring edge ({a},{b}) dependence {} != 0.5",
+            stats.dependence()
+        );
+    }
+
+    // Enrollment: vertices are atoms, candidate edges are the co-fire pairs above
+    // the dependence floor. Vertices sit on a circle so the fiber embedding is
+    // rank 2 and the surviving edge weights are uniform (a named circle).
+    let embeddings = unit_circle_anchor_embeddings(vertices);
+    let n_eff = n as f64;
+    let atom = LearnedGraphAtom::enroll_from_coactivation(
+        embeddings.view(),
+        &row_coords,
+        n_eff,
+        &pairs,
+        0.3, // keeps ring edges (0.5); would drop any incidental weak co-fire
+    )
+    .expect("ring co-fire graph enrolls as a graph atom");
+
+    // Fit is the ARD survival applied inside the constructor; read Betti back.
+    let topo = atom.topology_readout();
+    assert_eq!(topo.vertices, vertices);
+    assert_eq!(
+        topo.surviving_edges, vertices,
+        "the whole ring must clear the one-edge charge"
+    );
+    assert_eq!(topo.b0, 1, "a ring is connected: b0 = 1");
+    assert_eq!(topo.b1, 1, "a ring has exactly one independent cycle: b1 = 1");
+
+    // The enrolled structure is SELECTED: summed co-fire evidence beats the summed
+    // edge charge, and every edge's evidence is n_eff·MI over its one-edge charge.
+    let selection = atom.structure_selection();
+    assert!(
+        selection.selected,
+        "the enrolled ring must be selected (margin {})",
+        selection.margin
+    );
+    let charge = graph_edge_rank_charge(n_eff, atom.fiber_rank());
+    for (a, b, stats) in &pairs {
+        let (_, delta) = crate::manifold::coactivation_edge_evidence(stats, n_eff);
+        assert!(
+            delta > charge,
+            "ring edge ({a},{b}) evidence {delta} must exceed the one-edge charge {charge}"
+        );
+    }
+
+    // A uniform-weight degree-2 ring compresses to the named circle.
+    assert!(
+        matches!(
+            atom.certified_compression().kind,
+            GraphCompressionKind::Circle
+        ),
+        "the enrolled ring compresses to the named circle"
+    );
+}

@@ -29,6 +29,54 @@ pub fn graph_edge_rank_charge(n_eff: f64, fiber_rank: usize) -> f64 {
     0.5 * fiber_rank as f64 * n_eff.max(2.0).ln()
 }
 
+/// Pairwise mutual information in NATS of two atoms' binary co-activation
+/// indicators, from the `2×2` table implied by a [`crate::atom_codes::CoactivationStats`]
+/// (its `n_obs`, `n_a`, `n_b`, `n_joint` counts). The `0·log 0` cells are dropped;
+/// the value is non-negative up to floating-point noise. This is the co-fire
+/// coupling strength the graph-atom enrollment reads.
+pub fn coactivation_mi_nats(stats: &crate::atom_codes::CoactivationStats) -> f64 {
+    let n = stats.n_obs as f64;
+    if n <= 0.0 {
+        return 0.0;
+    }
+    let p1x = stats.n_a as f64 / n;
+    let px1 = stats.n_b as f64 / n;
+    let p11 = stats.n_joint as f64 / n;
+    let p10 = (p1x - p11).max(0.0);
+    let p01 = (px1 - p11).max(0.0);
+    let p00 = (1.0 - p11 - p10 - p01).max(0.0);
+    let cell = |p: f64, pa: f64, pb: f64| -> f64 {
+        if p > 0.0 && pa > 0.0 && pb > 0.0 {
+            p * (p / (pa * pb)).ln()
+        } else {
+            0.0
+        }
+    };
+    (cell(p11, p1x, px1)
+        + cell(p10, p1x, 1.0 - px1)
+        + cell(p01, 1.0 - p1x, px1)
+        + cell(p00, 1.0 - p1x, 1.0 - px1))
+    .max(0.0)
+}
+
+/// Per-edge enrollment evidence for one discovered co-fire pair: the tuple
+/// `(precision, delta_loss)` the graph-atom ARD survival rule consumes.
+///
+/// The edge **precision** (the graph-Laplacian weight) is the pair's mutual
+/// information in nats — its co-fire coupling strength. The **delta-loss** (the
+/// REML currency [`LearnedGraphAtom::from_reml_candidate_edges`] compares to the
+/// one-edge [`graph_edge_rank_charge`]) is `n_eff · MI_nats`: the edge's
+/// likelihood-ratio evidence, i.e. the `G²/2` deviance of its `2×2`
+/// co-activation table. A pair with no statistical dependence carries zero
+/// evidence and cannot survive enrollment.
+pub fn coactivation_edge_evidence(
+    stats: &crate::atom_codes::CoactivationStats,
+    n_eff: f64,
+) -> (f64, f64) {
+    let mi = coactivation_mi_nats(stats);
+    (mi, n_eff.max(0.0) * mi)
+}
+
 /// Exact read-out of the surviving graph topology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphTopologyReadout {
@@ -276,6 +324,72 @@ impl LearnedGraphAtom {
             n_eff,
             occupancy: classify_occupancy(row_coordinates),
         })
+    }
+
+    /// ENROLL a discovered co-fire graph structure as a first-class graph atom
+    /// (#985 / E1), rather than only detecting it.
+    ///
+    /// The **vertices are the atoms** and the **candidate edges are the co-firing
+    /// pairs** returned by
+    /// [`crate::atom_codes::SparseAtomCodes::coactive_pair_stats`] whose symmetric
+    /// code dependence ([`crate::atom_codes::CoactivationStats::dependence`])
+    /// clears `dependence_floor` — the sparse candidate superset, the co-fire
+    /// analogue of the anchor-kNN edge set. Each surviving candidate edge's
+    /// precision and REML deletion loss are supplied by
+    /// [`coactivation_edge_evidence`]. The SAME rank-charge ARD survival rule as
+    /// every other graph atom then keeps only the edges whose co-fire evidence
+    /// (`n_eff·MI`) outweighs the one-edge charge, so enrollment *proposes* the
+    /// co-fire graph and the REML currency *disposes*: the structure is enrolled
+    /// into the dictionary as a `LearnedGraphAtom`, and its Betti numbers are read
+    /// back from the surviving edges via [`Self::topology_readout`].
+    ///
+    /// `anchor_embeddings` is `n_atoms × r` (one fiber-`r` vertex embedding per
+    /// atom); `row_coordinates` classifies the occupancy law as for any graph
+    /// atom. Errors when a co-fire pair indexes a non-existent atom or no pair
+    /// clears the dependence floor (nothing to enroll).
+    pub fn enroll_from_coactivation(
+        anchor_embeddings: ArrayView2<'_, f64>,
+        row_coordinates: &[f64],
+        n_eff: f64,
+        coactive_pairs: &[(usize, usize, crate::atom_codes::CoactivationStats)],
+        dependence_floor: f64,
+    ) -> Result<Self, String> {
+        validate_anchor_embeddings(anchor_embeddings)?;
+        let anchors = anchor_embeddings.nrows();
+        let mut candidate_edges = Vec::new();
+        let mut edge_precisions = Vec::new();
+        let mut edge_delta_loss = Vec::new();
+        for (a, b, stats) in coactive_pairs {
+            if stats.dependence() < dependence_floor {
+                continue;
+            }
+            if *a >= anchors || *b >= anchors || a == b {
+                return Err(format!(
+                    "enroll_from_coactivation: co-fire pair ({a}, {b}) is invalid for {anchors} atoms"
+                ));
+            }
+            let edge = GraphEdge::new(*a, *b)?;
+            if candidate_edges.contains(&edge) {
+                continue;
+            }
+            let (precision, delta) = coactivation_edge_evidence(stats, n_eff);
+            candidate_edges.push(edge);
+            edge_precisions.push(precision);
+            edge_delta_loss.push(delta);
+        }
+        if candidate_edges.is_empty() {
+            return Err(format!(
+                "enroll_from_coactivation: no co-fire pair cleared the dependence floor {dependence_floor}"
+            ));
+        }
+        Self::from_reml_candidate_edges(
+            anchor_embeddings,
+            row_coordinates,
+            n_eff,
+            &candidate_edges,
+            &edge_precisions,
+            &edge_delta_loss,
+        )
     }
 
     pub fn anchors(&self) -> usize {
