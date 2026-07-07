@@ -19,18 +19,44 @@ then a FLAT linear block-SAE is compared against the CURVED block-chart lane
 fractions** (`||x - x_hat||^2 / ||x||^2`). **Lower floor = better fit**, so
 `explained variance = 1 - floor`, and
 `pooled_drop = pooled_flat_floor - pooled_curved_floor` is **positive only if
-curvature helps**. A negative drop means the linear baseline wins. This matches
-the README's decisive criterion: positive drop confirms wall-closure, negative
-drop refutes it.
+curvature helps under this metric**. A negative drop means the linear baseline
+reconstructs the ambient residual marginally better. Caveat (see Verdict): a
+negative drop here does **not** refute the manifold thesis — this additive-residual
+EV comparison is insensitive to it by construction, so it can only ever produce a
+tie or a small-sample parameter tax, never a detectable curvature win. Treat the
+sign as diagnostic of the *metric*, not of the geometry.
 
 ## Verdict
 
-**Curvature does NOT close the wall on reconstruction — corroborated cross-model.**
-At matched capacity the flat linear baseline reconstructs the pos0-peeled Gemma
-residual stream *better* than the curved block-chart lane on **both** layers.
-This is a clean NULL for the curvature-helps-reconstruction hypothesis and
-corroborates the Qwen 3.6 primary negative, consistent with the
-"Geometric Wall is observational" positioning.
+**Flat and curved TIE on reconstruction — and this metric cannot detect a curvature
+win even if the thesis is true.** At matched capacity the flat linear baseline
+reconstructs the pos0-peeled Gemma residual stream *marginally* better than the curved
+block-chart lane on both layers (drop −0.036 / −0.032). This is **not** a null for the
+manifold thesis; it is a comparison that is **insensitive to the manifold hypothesis by
+construction**, for the same four reasons documented in the Qwen 3.6 primary
+(`experiments/real_manifold_sae/results.md`):
+
+1. **Residual-orthogonality trap** — the curved charts fit the LS-orthogonal residual of
+   the flat linear tier, from which the tangent and curvature have already been absorbed
+   into atom placement; what is left is high-frequency quantization noise a smooth chart
+   cannot represent.
+2. **Saturation** — the flat dictionary is already near its reconstruction ceiling, so
+   little headroom remains for any second tier.
+3. **Matched-EV, not matched-bits** — the arms are matched on parameter budget and scored
+   in additive-residual EV, the wrong currency for an *informational* thesis (manifold =
+   redundancy in the CODES, measured in bits/token).
+4. **Curved given half the blocks** — 24 flat blocks vs 12 curved blocks × (4+4 chart
+   basis), so curvature is charged twice (params and coverage).
+
+The two layers agree with each other and with the Qwen 3.6 primary, but what they agree
+on is that **the additive-residual EV metric is the wrong currency** — not that curvature
+is absent. The small flat lead is the same **small-sample parameter tax on a
+structure-free residual** seen in the Qwen strata (where the deficit decays monotonically
+toward zero with rows and never flips sign). Consistent with the "Geometric Wall is
+observational" positioning; the correct test of the thesis is the code-space
+rate–distortion pipeline (`experiments/code_space_manifold/`), which measures bits/token.
+Note also that the block-chart curved fits predate the barrier/grind fix (81d3900f4), so
+the curved arm here may be **underfit**.
 
 | model / layer | pos0 absorbed | fitted strata | rows | flat params | curved params | flat floor | curved floor | drop (flat−curved) | flat EV | curved EV | verdict |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
