@@ -1500,6 +1500,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             },
                         );
                     }
+                    // Keep the TRUE (un-reflected) curvature for the KKT release
+                    // test (gam#979). The reflected `lhs` bounds the STEP, but a
+                    // monotone-hazard bound aligned with a negative-curvature mode
+                    // gets its dual multiplier sign-flipped by the reflection —
+                    // released spuriously, then re-added on the next outer cycle
+                    // (the active-set zigzag that ground the survival fit for 30
+                    // cycles). The release must be judged on the real curvature.
+                    let lhs_true_kkt = lhs.clone();
                     let lhs = lhs_reflected;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
@@ -1509,6 +1517,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             &beta_joint,
                             bounds,
                             warm_joint_active.as_deref(),
+                            Some(&lhs_true_kkt),
                         )
                     } else {
                         solve_quadratic_with_linear_constraints(
@@ -6582,6 +6591,9 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                     &beta_joint,
                     bounds,
                     warm.as_deref(),
+                    // Polish path is not curvature-reflected: same Hessian for
+                    // step and KKT test (gam#979).
+                    None,
                 ) {
                     Ok((beta_new, _active)) => &beta_new - &beta_joint,
                     Err(_) => break,

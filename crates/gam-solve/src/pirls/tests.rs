@@ -2381,6 +2381,7 @@ mod tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
+            None,
         )
         .expect("lower-bound active-set solve should succeed");
 
@@ -2388,6 +2389,83 @@ mod tests {
         let projected = &beta + &direction;
         assert_relative_eq!(projected[0], beta[0], epsilon = 1e-14);
         assert!(active_hint.is_empty());
+    }
+
+    /// gam#979: the active-set release (dual-feasibility) test must be judged on
+    /// the TRUE curvature, not the step-conditioned Hessian. When a caller
+    /// reflects negative-curvature modes to keep the QP step bounded (survival
+    /// joint-Newton), the reflection can flip the sign of the KKT multiplier of a
+    /// bound aligned with that mode, so the bound is released spuriously — the
+    /// freed coefficient then steps far off the bound, only to be re-added on the
+    /// next outer re-linearization (the active-set zigzag that ground the n=3000
+    /// survival marginal-slope fit for 30 cycles). Threading the true Hessian via
+    /// `kkt_hessian` makes the release honor the real curvature.
+    ///
+    /// The two matrices are chosen so the release decision FLIPS between them:
+    /// with only coord 1 active (β₁ pinned at its lower bound, d₁=0) the free
+    /// step is d₀ = −g₀/H₀₀ = −1, and the coord-1 multiplier λ₁ = g₁ + (H·d)₁ =
+    /// g₁ + H₁₀·d₀ depends on the off-diagonal H₁₀, which the reflection changes.
+    #[test]
+    pub(crate) fn lower_bound_release_uses_true_curvature_not_reflected_step_979() {
+        // Step Hessian (stands in for the reflected, PD model used for the step).
+        let h_step = array![[2.0, 3.0], [3.0, 5.0]];
+        // True (un-reflected) curvature: indefinite, with a smaller off-diagonal
+        // so the coord-1 multiplier stays positive (bound genuinely binds).
+        let h_kkt = array![[2.0, 0.5], [0.5, -3.0]];
+        let gradient = array![2.0, 1.0];
+        let beta = array![0.0, 0.0];
+        let lower_bounds = array![f64::NEG_INFINITY, 0.0];
+
+        // WITH the true-curvature KKT test: λ₁ = 1 + 0.5·(−1) = 0.5 > 0, so the
+        // bound is KEPT. β₁ stays pinned at its lower bound (no zigzag).
+        let mut dir_fixed = Array1::zeros(2);
+        let mut active_fixed = vec![1];
+        solve_newton_directionwith_lower_bounds(
+            &h_step,
+            &gradient,
+            &beta,
+            &lower_bounds,
+            &mut dir_fixed,
+            Some(&mut active_fixed),
+            Some(&h_kkt),
+        )
+        .expect("true-curvature bounded solve should succeed");
+        assert_eq!(
+            active_fixed,
+            vec![1],
+            "true-curvature release must KEEP the genuinely-binding bound active"
+        );
+        assert!(
+            (beta[1] + dir_fixed[1]).abs() < 1e-12,
+            "coord 1 must stay pinned at its lower bound; got {}",
+            beta[1] + dir_fixed[1]
+        );
+
+        // WITHOUT it (kkt=None ⇒ the release test uses the STEP Hessian, the old
+        // behavior): λ₁ = 1 + 3·(−1) = −2 < 0, so the bound is released
+        // spuriously and coord 1 flies off to 4.0 — the overshoot the outer loop
+        // then has to walk back, cycle after cycle.
+        let mut dir_bug = Array1::zeros(2);
+        let mut active_bug = vec![1];
+        solve_newton_directionwith_lower_bounds(
+            &h_step,
+            &gradient,
+            &beta,
+            &lower_bounds,
+            &mut dir_bug,
+            Some(&mut active_bug),
+            None,
+        )
+        .expect("step-curvature bounded solve should succeed");
+        assert!(
+            active_bug.is_empty(),
+            "sanity: with the step Hessian the bound is (wrongly) released"
+        );
+        assert!(
+            (beta[1] + dir_bug[1]) > 1.0,
+            "sanity: the spuriously-freed coord overshoots its bound; got {}",
+            beta[1] + dir_bug[1]
+        );
     }
 
     #[test]
@@ -2483,6 +2561,7 @@ mod tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
+            None,
         )
         .expect("stale warm lower-bound hint should be releasable");
 
@@ -2861,6 +2940,7 @@ mod root_cause_tests {
             &lower_bounds,
             &mut direction,
             Some(&mut active_hint),
+            None,
         )
         .expect("solve should succeed");
 
