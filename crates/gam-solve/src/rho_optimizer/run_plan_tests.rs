@@ -4012,6 +4012,13 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         ),
         1
     );
+    // #1689/#1757: Arc + Gaussian is floored to a single seed (the analytic
+    // initial.sp seed lands the correct basin, so the second full outer solve is
+    // redundant), regardless of the requested budget.
+    assert_eq!(
+        effective_seed_budget(3, Solver::Arc, gam_problem::SeedRiskProfile::Gaussian),
+        1
+    );
     assert_eq!(
         effective_seed_budget(
             3,

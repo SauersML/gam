@@ -131,6 +131,32 @@ pub(crate) struct InnerProgressSnapshot {
     pub(crate) last_accept_rho: Option<f64>,
 }
 
+/// Number of screened seeds run to full outer convergence.
+///
+/// Each budgeted seed is an INDEPENDENT full outer solve (no warm-share), so the
+/// budget is a direct multiplier on outer cost/gradient evaluations. A budget of
+/// 2 was the multimodal-robustness hedge: run the top-two screened seeds and keep
+/// the lower-REML result, guarding against the top-screened seed landing a worse
+/// local optimum than the second.
+///
+/// #1689/#1757: that hedge is now redundant for the Arc **Gaussian** path. The
+/// analytic mgcv-style `initial.sp` seed (which replaced the banned log-λ grid
+/// prepass) lands the correct basin — including the high-λ over-smoothing basin of
+/// a double-penalty null-space smooth (#1266) or a collapsing-kernel spatial
+/// smooth (#1464) — by construction, and screening + the #1371 release-and-rerank
+/// lower-bound guard already certify the adopted seed. So the second full ~60-eval
+/// Arc solve was a ~2× cost with no basin benefit on well-behaved Gaussian fits;
+/// reducing the Arc Gaussian budget to 1 removes it. The multimodal-robustness
+/// contract is carried by the initial.sp seed, gated by the #1266/#1464/#1074
+/// regression tests (all fit through the full pipeline in the executed shards).
+///
+/// The Arc **GeneralizedLinear** path deliberately STAYS at 2: its code-documented
+/// dependency (#1074/#1426 — a GLM needs ≥2 seeds to also reach the heavily-
+/// penalized basin, e.g. gamma-log flat-valley) is a separate risk from the
+/// Gaussian multimodal one and is only safe to drop once the initial.sp seed is
+/// verified to cover it (a later, separately-gated increment). Survival stays at 1
+/// (already), EFS/HybridEFS at 1, and GaussianLocationScale (and any other risk
+/// profile) is left at `requested_budget` unchanged.
 #[inline]
 pub(crate) fn effective_seed_budget(
     requested_budget: usize,
@@ -141,6 +167,7 @@ pub(crate) fn effective_seed_budget(
     match (solver, risk_profile) {
         (Solver::Efs | Solver::HybridEfs, _) => 1,
         (Solver::Arc, gam_problem::SeedRiskProfile::Survival) => 1,
+        (Solver::Arc, gam_problem::SeedRiskProfile::Gaussian) => 1,
         (Solver::Arc, gam_problem::SeedRiskProfile::GeneralizedLinear) => 2,
         _ => requested_budget,
     }

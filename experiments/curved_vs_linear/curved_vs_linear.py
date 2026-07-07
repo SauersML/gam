@@ -24,6 +24,15 @@ import argparse, json, os, numpy as np
 
 PMAX = 512  # harvest seq_len / truncation length (matches qwen_nuisance_msi.py)
 
+# Reporting-only default (SPEC line 19: no magic knobs in the peel decision). The peel is
+# gated by a PERMUTATION TEST, not a variance quantile: peel iff the observed positional
+# absorption exceeds every permuted-position replicate. The only free number is the
+# replicate count, which sets the achievable significance 1/(R+1) -- a reporting
+# resolution, not a threshold. This is what makes the peel "recover the null" (SPEC
+# line 13): on sink-free data the observed absorption is exchangeable with the nulls, so
+# nothing is peeled.
+NULL_PERMUTATION_REPLICATES = 200  # reporting-only: permutation-null resolution (p < 1/201)
+
 
 def required_env(name, message):
     try:
@@ -82,15 +91,36 @@ def absorbed_r2(Xc, Z):
     return 0.0 if ss_tot <= 0.0 else 1.0 - ss_res / ss_tot
 
 
-def sink_peel(Xc, positions, mode, seed=0):
-    """Peel the positional sink and return (Xp, audit). `audit` records the removed
-    direction's correlation with PC1, the pos0 / combined absorbed R², and the
-    permuted-position null -- so the peel is an auditable claim, not a quantile."""
-    Z, label = peel_design(positions, mode)
-    Xp, B = regress_out(Xc, Z)
+def null_permutation_absorbed(Xc, Z, replicates, seed):
+    """Permuted-position null distribution of absorbed R²: shuffle the design rows
+    (positions) against the activations `replicates` times. Under no positional signal
+    the true-position absorption is exchangeable with these; under a real sink it is not."""
+    rng = np.random.default_rng(seed)
+    n = Xc.shape[0]
+    return np.array([absorbed_r2(Xc, Z[rng.permutation(n)]) for _ in range(replicates)])
 
-    # sink direction = the first-token indicator's fitted offset (last col of a pos0
-    # design; for `combined` re-fit pos0 alone to name the sink direction cleanly).
+
+def sink_peel(Xc, positions, mode, null_replicates=NULL_PERMUTATION_REPLICATES, seed=0):
+    """Peel the positional sink IFF it is causally real, and return (Xp, audit).
+
+    Decision (SPEC line 13/19 compliant): peel iff the observed positional absorption
+    exceeds every one of `null_replicates` permuted-position replicates (permutation
+    p < 1/(R+1)). On sink-free data the observed absorption is exchangeable with the
+    nulls -> the gate fails -> ZERO directions peeled, recovering the null. No variance
+    quantile, no cap, no magic threshold.
+
+    `audit` records the removed direction's correlation with PC1, the pos0/peel absorbed
+    R², the permutation null, the decision, and how many directions were removed -- so the
+    peel is an auditable claim rather than a quantile."""
+    Z, label = peel_design(positions, mode)
+    observed = absorbed_r2(Xc, Z)
+    null_dist = null_permutation_absorbed(Xc, Z, null_replicates, seed)
+    null_max = float(null_dist.max())
+    null_mean = float(null_dist.mean())
+    peel_is_causal = observed > null_max  # exact permutation test, sig < 1/(R+1)
+
+    # sink direction = the first-token indicator's fitted offset (named from a pos0 design
+    # so `combined` still points at the sink cleanly).
     Zp0, _ = peel_design(positions, "pos0")
     _, Bp0 = regress_out(Xc, Zp0)
     sink_dir = Bp0[-1]
@@ -99,16 +129,25 @@ def sink_peel(Xc, positions, mode, seed=0):
     pc1 = np.linalg.svd(Xc, full_matrices=False)[2][0]
     cos_sink_pc1 = float(abs(sink_dir @ pc1) / sn) if sn > 0 else 0.0
 
-    rng = np.random.default_rng(seed)
-    Z_null = Z[rng.permutation(Xc.shape[0])]  # positions shuffled vs activations
+    if peel_is_causal:
+        Xp, _ = regress_out(Xc, Z)
+        n_peeled = int(Z.shape[1] - 1)  # non-intercept design columns
+    else:
+        Xp = Xc.copy()  # recover the null: no positional sink detected, peel nothing
+        n_peeled = 0
 
     audit = dict(
         peel_mode=mode,
         peel_design=label,
         n_design_cols=int(Z.shape[1]),
+        n_directions_peeled=n_peeled,
+        peel_is_causal=bool(peel_is_causal),
+        absorbed_observed=float(observed),
         absorbed_pos0=absorbed_r2(Xc, Zp0),
-        absorbed_peel=absorbed_r2(Xc, Z),
-        absorbed_permuted_null=absorbed_r2(Xc, Z_null),
+        absorbed_permuted_null_max=null_max,
+        absorbed_permuted_null_mean=null_mean,
+        null_replicates=int(null_replicates),
+        permutation_significance=1.0 / (null_replicates + 1),
         cos_sink_dir_pc1=cos_sink_pc1,
         frac_rows_pos0=float((positions == 0).mean()),
         var_frac_top_pc_before=float((sv ** 2)[0] / (sv ** 2).sum()),
@@ -180,39 +219,52 @@ def head_to_head(Xp):
     return lin, atlas, compare
 
 
-def _selftest():
-    """Plant a position-0 sink into synthetic data; assert the peel removes it and the
-    permuted-position null collapses. Runs with no cluster data (the local proof)."""
-    rng = np.random.default_rng(0)
+def _synth(with_sink, seed=0):
+    """Synthetic activations: 3-dim semantic structure, optionally with a DOMINANT
+    first-token sink (position 0 only). Real attention sinks are ~1000x per-row; on
+    ~1/512 of rows that still absorbs ~90% of variance, so the plant must be large to
+    reproduce the L18 regime (91% from one indicator)."""
+    rng = np.random.default_rng(seed)
     N, D = 40000, 64
-    positions = (np.arange(N) % (PMAX)).astype(np.int32)  # 0..511 repeating
-    # small semantic structure on a 3-dim subspace
+    positions = (np.arange(N) % PMAX).astype(np.int32)  # 0..511 repeating
     sem = rng.standard_normal((N, 3)) @ rng.standard_normal((3, D))
-    # DOMINANT first-token sink along one direction (position 0 only). Real attention
-    # sinks are ~1000x per-row; on ~1/512 of rows that still absorbs ~90% of variance,
-    # so the plant has to be large to reproduce the L18 regime (91% from one indicator).
     sink_dir = rng.standard_normal(D)
     sink_dir /= np.linalg.norm(sink_dir)
-    X = sem + 600.0 * (positions == 0)[:, None] * sink_dir[None, :] + 0.05 * rng.standard_normal((N, D))
-    Xc = X - X.mean(0)
-    var_before = (np.linalg.svd(Xc, compute_uv=False) ** 2)
-    top_frac_before = var_before[0] / var_before.sum()
-    Xp, audit = sink_peel(Xc, positions, "pos0")
-    # variance ALONG the true sink direction: must be ~annihilated by the peel.
+    sink = 600.0 * (positions == 0)[:, None] * sink_dir[None, :] if with_sink else 0.0
+    X = sem + sink + 0.05 * rng.standard_normal((N, D))
+    return X - X.mean(0), positions, sink_dir
+
+
+def _selftest():
+    """Two-regime acceptance (SPEC line 13): a planted position-0 sink must be peeled
+    (exactly one direction, null collapsed); sink-free data must peel ZERO directions."""
+    # --- regime 1: dominant planted sink -> peel exactly one direction ---
+    Xc, positions, sink_dir = _synth(with_sink=True)
     var_sink_before = float(((Xc @ sink_dir) ** 2).sum())
+    Xp, audit = sink_peel(Xc, positions, "pos0")
     var_sink_after = float(((Xp @ sink_dir) ** 2).sum())
-    print(f"[selftest] top var frac before={top_frac_before:.3f}; "
-          f"variance along sink dir {var_sink_before:.3e} -> {var_sink_after:.3e}")
-    print(f"[selftest] absorbed_pos0={audit['absorbed_pos0']:.4f} "
-          f"null={audit['absorbed_permuted_null']:.5f} cos(sink,PC1)={audit['cos_sink_dir_pc1']:.3f}")
-    assert audit["absorbed_pos0"] > 0.5, audit
-    assert audit["absorbed_permuted_null"] < 0.05, audit
+    print(f"[selftest/sink] peeled={audit['n_directions_peeled']} "
+          f"observed={audit['absorbed_observed']:.4f} null_max={audit['absorbed_permuted_null_max']:.5f} "
+          f"cos(sink,PC1)={audit['cos_sink_dir_pc1']:.3f}; sink var {var_sink_before:.3e}->{var_sink_after:.3e}")
+    assert audit["peel_is_causal"] is True, audit
+    assert audit["n_directions_peeled"] == 1, audit
+    assert audit["absorbed_observed"] > 0.5, audit
+    assert audit["absorbed_permuted_null_max"] < 0.05, audit
     assert audit["cos_sink_dir_pc1"] > 0.9, audit
     assert var_sink_after < var_sink_before / 100, (var_sink_before, var_sink_after)
-    # head-to-head still runs on the residual
     lin, atlas, compare = head_to_head(Xp)
     assert compare, "head-to-head produced no comparison"
-    print("[selftest] OK: sink peeled, null collapsed, head-to-head runs")
+
+    # --- regime 2: sink-free -> peel ZERO directions, recover the null (SPEC line 13) ---
+    Xc0, positions0, _ = _synth(with_sink=False, seed=1)
+    Xp0, audit0 = sink_peel(Xc0, positions0, "pos0")
+    print(f"[selftest/null] peeled={audit0['n_directions_peeled']} "
+          f"observed={audit0['absorbed_observed']:.5f} null_max={audit0['absorbed_permuted_null_max']:.5f} "
+          f"causal={audit0['peel_is_causal']}")
+    assert audit0["peel_is_causal"] is False, audit0
+    assert audit0["n_directions_peeled"] == 0, audit0
+    assert np.array_equal(Xp0, Xc0), "sink-free peel must be an identity (recover the null)"
+    print("[selftest] OK: sink peeled (1 dir, null collapsed); sink-free peels 0 dirs")
 
 
 def main():
@@ -271,12 +323,14 @@ def main():
             raise SystemExit(f"positions ({positions.shape[0]}) shorter than harvest rows ({n_rows})")
         positions = positions[:n_rows][idx]  # same subsample as the activations
         Xp, audit = sink_peel(Xc, positions, args.peel)
-        print(f"peeled sink via {audit['peel_design']}: absorbed_pos0={audit['absorbed_pos0']:.4f} "
-              f"absorbed_peel={audit['absorbed_peel']:.4f} permuted_null={audit['absorbed_permuted_null']:.5f} "
+        print(f"peel via {audit['peel_design']}: peeled {audit['n_directions_peeled']} dir(s) "
+              f"(causal={audit['peel_is_causal']}); observed={audit['absorbed_observed']:.4f} "
+              f"null_max={audit['absorbed_permuted_null_max']:.5f} "
               f"cos(sink,PC1)={audit['cos_sink_dir_pc1']:.3f}", flush=True)
-        if audit["absorbed_permuted_null"] > 0.05:
-            print("WARNING permuted-position null did not collapse (<0.05); the peel may be "
-                  "fitting a low-rank artifact rather than a causal positional sink.", flush=True)
+        if not audit["peel_is_causal"]:
+            print("NOTE positional absorption did not beat the permuted-position null; no sink "
+                  "peeled (the layer recovers the null). Head-to-head runs on raw centred acts.",
+                  flush=True)
 
     # ---- head-to-head on the peeled residual ----
     lin, atlas, compare = head_to_head(Xp)
