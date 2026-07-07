@@ -197,24 +197,33 @@ pub fn recover_spikes(
         .min(max_order);
 
     // Scale-invariant rank refinement. When the singular spectrum shows an
-    // unambiguous relative collapse `σ_{k+1}/σ_k < DRAMATIC_GAP`, that gap pins the
-    // true model order regardless of the supplied `sigma`. This makes the decoder
+    // unambiguous *relative* collapse `σ_{k+1}/σ_k < dramatic_gap`, that gap pins
+    // the true model order regardless of the supplied `sigma`, making the decoder
     // robust to a mis-specified noise level in either direction: a caller passing a
     // conservative (over-large) population sigma would otherwise under-select and
-    // drop genuine spikes, while f32-quantised inputs leave a numerical shelf
-    // (`σ ≈ 1e-7·σ_1`) far above the f64 numerical floor that would otherwise be
-    // over-selected. A dramatic gap only ever occurs between signal and the
-    // quantisation/round-off shelf, never within a genuinely noisy spectrum (whose
-    // signal→noise drop is far shallower), so honest GD order selection is
-    // preserved when no such gap exists.
-    const DRAMATIC_GAP: f64 = 1e-4;
+    // drop genuine spikes, while f32-quantised inputs leave a numerical shelf that
+    // sits far above the f64 numerical floor and would otherwise be over-selected.
+    //
+    // The threshold is derived, not tuned: it is `√(ε_f32)`, the geometric mean
+    // between the f32 quantisation shelf and unity. When the codes are f32 the
+    // Hankel's round-off/quantisation singular values sit at `≈ ε_f32·σ_1` relative
+    // to the top singular value (`ε_f32 ≈ 1.19e-7`), so a relative drop of `√ε_f32
+    // ≈ 3.4e-4` is a full ~3.5 orders of magnitude above that shelf yet far below
+    // any signal structure (distinct spike amplitudes differ by O(1) ratios) or a
+    // genuinely noisy spectrum (whose signal→noise relative drop equals the passed
+    // noise level, which the Gavish–Donoho path already handles and which is `≫
+    // √ε_f32` for any noise a caller would bother modelling). Only the quantisation
+    // shelf collapses below `√ε_f32`, so honest GD selection is preserved whenever
+    // no such gap exists. `√ε` also matches the Newton step tolerance used in the
+    // argmax polish elsewhere in this module.
+    let dramatic_gap = (f32::EPSILON as f64).sqrt();
     let gap_order = {
         let mut order = None;
         for k in 1..max_order.min(singular_values.len()) {
             if singular_values[k - 1] <= 0.0 {
                 break;
             }
-            if singular_values[k] / singular_values[k - 1] < DRAMATIC_GAP {
+            if singular_values[k] / singular_values[k - 1] < dramatic_gap {
                 order = Some(k);
                 break;
             }
