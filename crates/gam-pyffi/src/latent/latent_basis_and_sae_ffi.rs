@@ -3294,6 +3294,13 @@ fn sae_manifold_fit_inner<'py>(
             .set_temperature_schedule(schedule)
             .map_err(py_value_error)?;
     }
+    // #2132 — the active-set cap is part of the model being optimized, so the
+    // cold routing refinement must see the same top-k softmax support as the
+    // subsequent Arrow-Schur solve. Installing it only after the EM seed let
+    // the seed decoder LSQ train every atom on every row under dense softmax
+    // responsibilities; with top_k=1 planted mixtures that reintroduced the
+    // uniform co-collapse saddle before the capped solver ever ran.
+    base_term.set_softmax_active_cap(top_k);
 
     // Cold-start routing seed refinement (#629, #630). The cold residual-logit
     // seed is computed at the cold (shared-across-atoms) coordinates and cannot
@@ -3316,6 +3323,7 @@ fn sae_manifold_fit_inner<'py>(
             tau,
             jumprelu_threshold,
             seed_refine_random_state,
+            top_k,
         )
         .map_err(py_value_error)?;
     }
@@ -3425,7 +3433,6 @@ fn sae_manifold_fit_inner<'py>(
     // atoms (the FFI's after-the-fit top-`k` projection below then collapses to a
     // no-op at the optimum). A no-op for `top_k >= K`, `None`, and non-softmax
     // modes (set_softmax_active_cap clamps to `1 <= k < K` and ignores non-softmax).
-    base_term.set_softmax_active_cap(top_k);
     let seed_dispersion = base_term
         .seed_reconstruction_dispersion(z_view)
         .map_err(py_value_error)?;
@@ -6168,6 +6175,7 @@ fn sae_decoder_lsq_init(
     alpha: f64,
     tau: f64,
     jumprelu_threshold: f64,
+    top_k: Option<usize>,
 ) -> Result<Array3<f64>, String> {
     let k_atoms = basis_sizes.len();
     let (n_obs, p_out) = z.dim();
@@ -6198,6 +6206,13 @@ fn sae_decoder_lsq_init(
     let mut a_init = Array2::<f64>::zeros((n_obs, k_atoms));
     match assignment_kind {
         "softmax" => {
+            if let Some(k_top) = top_k {
+                if k_top == 0 || k_top > k_atoms {
+                    return Err(format!(
+                        "sae_decoder_lsq_init: top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
+                    ));
+                }
+            }
             let inv_tau = 1.0 / tau;
             for row in 0..n_obs {
                 let mut max_logit = f64::NEG_INFINITY;
@@ -6217,6 +6232,38 @@ fn sae_decoder_lsq_init(
                 if sum > 0.0 && sum.is_finite() {
                     for k in 0..k_atoms {
                         a_init[[row, k]] = buf[k] / sum;
+                    }
+                }
+                if let Some(k_top) = top_k {
+                    if k_top < k_atoms {
+                        let mut paired: Vec<(f64, usize)> =
+                            (0..k_atoms).map(|k| (a_init[[row, k]], k)).collect();
+                        let cmp = |a: &(f64, usize), b: &(f64, usize)| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.1.cmp(&b.1))
+                        };
+                        paired.select_nth_unstable_by(k_top - 1, cmp);
+                        let mut keep = vec![false; k_atoms];
+                        for &(_, atom_idx) in paired.iter().take(k_top) {
+                            keep[atom_idx] = true;
+                        }
+                        let kept_sum: f64 = (0..k_atoms)
+                            .filter(|&atom_idx| keep[atom_idx])
+                            .map(|atom_idx| a_init[[row, atom_idx]])
+                            .sum();
+                        if !(kept_sum.is_finite() && kept_sum > 0.0) {
+                            return Err(format!(
+                                "sae_decoder_lsq_init: top_k softmax projection has non-positive kept mass on row {row}"
+                            ));
+                        }
+                        for atom_idx in 0..k_atoms {
+                            a_init[[row, atom_idx]] = if keep[atom_idx] {
+                                a_init[[row, atom_idx]] / kept_sum
+                            } else {
+                                0.0
+                            };
+                        }
                     }
                 }
             }
@@ -6402,6 +6449,7 @@ fn sae_em_refine_routing_seed(
     tau: f64,
     jumprelu_threshold: f64,
     random_state: u64,
+    top_k: Option<usize>,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
@@ -6453,6 +6501,7 @@ fn sae_em_refine_routing_seed(
             alpha,
             tau,
             jumprelu_threshold,
+            top_k,
         )?;
         for atom_idx in 0..k_atoms {
             let m_k = basis_sizes[atom_idx];
