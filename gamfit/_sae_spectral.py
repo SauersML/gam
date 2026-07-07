@@ -548,3 +548,173 @@ def loop_holonomy(
         is_trivial=bool(payload["is_trivial"]),
         angle_tolerance=float(payload["angle_tolerance"]),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Coactivation conditionality (influence function + robustness certificate)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ConditionalCoactivationInfluence:
+    """Per-row influence contributions for the conditional coactivation
+    probability ``P(gate_j active | gate_i active)`` over the selected sample."""
+
+    conditional_probability: float
+    active_mass_i: float
+    psi: list[float]
+    normalized_weights: list[float]
+
+
+def conditional_coactivation_influence(
+    active_i: Any,
+    active_j: Any,
+    rows: Any,
+    likelihood_weights: Any,
+) -> ConditionalCoactivationInfluence:
+    """Weighted conditional coactivation probability and its per-row influence
+    values over the selected ``rows`` with honesty ``likelihood_weights``."""
+    payload = rust_module().conditional_coactivation_influence(
+        [bool(v) for v in active_i],
+        [bool(v) for v in active_j],
+        [int(v) for v in rows],
+        [float(v) for v in likelihood_weights],
+    )
+    return ConditionalCoactivationInfluence(
+        conditional_probability=float(payload["conditional_probability"]),
+        active_mass_i=float(payload["active_mass_i"]),
+        psi=[float(v) for v in payload["psi"]],
+        normalized_weights=[float(v) for v in payload["normalized_weights"]],
+    )
+
+
+@dataclass(frozen=True)
+class CouplingRobustnessCertificate:
+    """Weighted-Pearson coupling influence and its KL-robustness certificate.
+
+    ``robustness_radius_epsilon`` is the certified radius ``epsilon*`` and
+    ``worst_case_coupling`` the first-order lower bound after a KL-``epsilon``
+    distribution shift.
+    """
+
+    rho: float
+    psi: list[float]
+    normalized_weights: list[float]
+    influence_variance: float
+    influence_mean_abs: float
+    robustness_radius_epsilon: float
+    epsilon: float
+    worst_case_coupling: float
+
+
+def coupling_robustness_certificate(
+    gate_i: Any,
+    gate_j: Any,
+    rows: Any,
+    likelihood_weights: Any,
+    epsilon: float = 0.0,
+) -> CouplingRobustnessCertificate:
+    """Weighted-Pearson coupling ``rho``, its influence function, and the
+    KL-robustness certificate (radius ``epsilon*`` + worst-case coupling)."""
+    payload = rust_module().coupling_robustness_certificate(
+        [float(v) for v in gate_i],
+        [float(v) for v in gate_j],
+        [int(v) for v in rows],
+        [float(v) for v in likelihood_weights],
+        float(epsilon),
+    )
+    return CouplingRobustnessCertificate(
+        rho=float(payload["rho"]),
+        psi=[float(v) for v in payload["psi"]],
+        normalized_weights=[float(v) for v in payload["normalized_weights"]],
+        influence_variance=float(payload["influence_variance"]),
+        influence_mean_abs=float(payload["influence_mean_abs"]),
+        robustness_radius_epsilon=float(payload["robustness_radius_epsilon"]),
+        epsilon=float(payload["epsilon"]),
+        worst_case_coupling=float(payload["worst_case_coupling"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Effect-weighted retention ledger (variance charge OR Fisher local-KL effect)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class VarianceChargeEvidence:
+    """Reconstruction charge ledger for one atom (all quantities in nats)."""
+
+    delta_deviance: float
+    charge: float
+    margin: float
+
+
+@dataclass(frozen=True)
+class FisherEffectEvidence:
+    """Streaming Fisher local-KL effect ledger for one atom (nats)."""
+
+    atom: int
+    mean_fisher_quadratic_kl_nats: float
+    max_fisher_quadratic_kl_nats: float
+    n_firings: int
+    threshold_nats: float
+    margin: float
+
+
+@dataclass(frozen=True)
+class AtomRetentionEvidence:
+    """Per-atom retention verdict: an OR of the variance and Fisher ledgers."""
+
+    atom: int
+    variance: VarianceChargeEvidence | None
+    effect: FisherEffectEvidence | None
+    retained_by_variance: bool
+    retained_by_effect: bool
+    retained: bool
+
+
+def effect_weighted_retention(
+    variance: list[tuple[float, float] | None],
+    firings: list[tuple[int, float]],
+) -> list[AtomRetentionEvidence]:
+    """Per-atom effect-weighted retention. ``variance[a]`` is the optional
+    ``(delta_deviance_nats, charge_nats)`` charge evidence for atom ``a`` (list
+    length = atom count); ``firings`` are streamed ``(atom, fisher_local_kl_nats)``
+    contributions that build the Fisher effect ledger. Retention is the OR of the
+    variance margin and the Fisher-effect margin (per-atom BIC price)."""
+    variance_payload = [
+        None if entry is None else (float(entry[0]), float(entry[1]))
+        for entry in variance
+    ]
+    firings_payload = [(int(atom), float(kl)) for atom, kl in firings]
+    payload = rust_module().effect_weighted_retention(variance_payload, firings_payload)
+    out: list[AtomRetentionEvidence] = []
+    for row in payload["atoms"]:
+        variance_row = row["variance"]
+        effect_row = row["effect"]
+        out.append(
+            AtomRetentionEvidence(
+                atom=int(row["atom"]),
+                variance=None
+                if variance_row is None
+                else VarianceChargeEvidence(
+                    delta_deviance=float(variance_row["delta_deviance"]),
+                    charge=float(variance_row["charge"]),
+                    margin=float(variance_row["margin"]),
+                ),
+                effect=None
+                if effect_row is None
+                else FisherEffectEvidence(
+                    atom=int(effect_row["atom"]),
+                    mean_fisher_quadratic_kl_nats=float(
+                        effect_row["mean_fisher_quadratic_kl_nats"]
+                    ),
+                    max_fisher_quadratic_kl_nats=float(
+                        effect_row["max_fisher_quadratic_kl_nats"]
+                    ),
+                    n_firings=int(effect_row["n_firings"]),
+                    threshold_nats=float(effect_row["threshold_nats"]),
+                    margin=float(effect_row["margin"]),
+                ),
+                retained_by_variance=bool(row["retained_by_variance"]),
+                retained_by_effect=bool(row["retained_by_effect"]),
+                retained=bool(row["retained"]),
+            )
+        )
+    return out
