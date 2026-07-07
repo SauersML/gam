@@ -241,3 +241,92 @@ fn profile_thinplate_2d_n1200() {
         f.inner_pirls_solves
     );
 }
+
+/// #1757 duchon eval-count profile. The issue reports duchon(x1,x2) 14-23x
+/// slower than mgcv and HYPOTHESISED an O(n^3) center-Gram bottleneck. This test
+/// is the measurement that decides the true root: it prints `outer_cost_evals` /
+/// `inner_pirls_solves` (outer-loop work) alongside `p` (basis width) and wall
+/// time, so we can tell whether duchon is CONSTRUCTION-bound (large p, few evals)
+/// or OUTER-LOOP bound (moderate p, many evals — the #1575 genus). A numpy Gc
+/// replica + the non-monotonic issue timings (n1220=408s > n2000=261s) already
+/// point to outer-loop; this confirms it in-gam and post-ROOT-1 (the initial.sp
+/// seed that replaced the banned grid prepass, c9e1fba/ddd8af9). n=500 only:
+/// n=1220 is ~400s pre-fix, too slow for the standard suite — use
+/// `examples/repro1757_duchon_perf.rs` for the larger sizes.
+#[test]
+fn profile_duchon_2d_n500() {
+    init_parallelism();
+    // Mirror examples/repro1757_duchon_perf.rs (the issue's repro): n=500,
+    // x1,x2 ~ U(-1,1), y = sin(2 x1) + cos(1.5 x2) + N(0, 0.1).
+    let n = 500usize;
+    let mut rng = StdRng::seed_from_u64(42);
+    let u = Uniform::new(-1.0_f64, 1.0).expect("uniform");
+    let noise = Normal::new(0.0, 0.1).expect("normal");
+    let truth = |x1: f64, x2: f64| (2.0 * x1).sin() + (1.5 * x2).cos();
+
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|_| {
+            let x1 = u.sample(&mut rng);
+            let x2 = u.sample(&mut rng);
+            let yi = truth(x1, x2) + noise.sample(&mut rng);
+            StringRecord::from(vec![x1.to_string(), x2.to_string(), yi.to_string()])
+        })
+        .collect();
+    let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode duchon dataset");
+    let col = ds.column_map();
+    let (x1_idx, x2_idx) = (col["x1"], col["x2"]);
+
+    // 30x30 truth-recovery grid over [-1, 1]^2.
+    let g = 30usize;
+    let coord = |i: usize| -1.0 + 2.0 * i as f64 / (g as f64 - 1.0);
+    let mut gx = Vec::new();
+    let mut gz = Vec::new();
+    let mut ft = Vec::new();
+    for i in 0..g {
+        for j in 0..g {
+            let (x1, x2) = (coord(i), coord(j));
+            gx.push(x1);
+            gz.push(x2);
+            ft.push(truth(x1, x2));
+        }
+    }
+    let m = gx.len();
+    let mut grid = Array2::<f64>::zeros((m, ds.headers.len()));
+    for i in 0..m {
+        grid[[i, x1_idx]] = gx[i];
+        grid[[i, x2_idx]] = gz[i];
+    }
+
+    let (fit, fitted, fs, ps) = fit_and_predict("y ~ duchon(x1, x2)", &ds, &grid);
+    let r = rmse(&fitted, &ft);
+    report("duchon-2d-n500", &fit, fs, ps, r);
+    let f = &fit.fit;
+    // Explicit grep marker for the perf-cluster measurement round.
+    eprintln!(
+        "[EVALCOUNT-1757] duchon-2d-n500 p={} outer_iter={} outer_cost_evals={} \
+         inner_pirls_solves={} fit={:.3}s total={:.3}s rmse={:.4}",
+        f.beta.len(),
+        f.outer_iterations,
+        f.outer_cost_evals,
+        f.inner_pirls_solves,
+        fs,
+        fs + ps,
+        r,
+    );
+
+    assert!(
+        f.outer_converged,
+        "duchon-2d-n500: outer REML must converge (outer_converged=false after \
+         {} iters / {} cost evals)",
+        f.outer_iterations, f.outer_cost_evals
+    );
+    // Truth recovery on sin+cos over [-1,1]^2 (σ=0.1, n=500). A converged duchon
+    // fit recovers this smooth surface comfortably; 0.15 is a generous sanity
+    // floor (this is a profiling/measurement test, not the tight #1757 match-or-
+    // beat quality gate) that still catches a gross under-recovery regression.
+    assert!(
+        r < 0.15,
+        "duchon-2d-n500: truth-recovery RMSE regressed to {r:.4} (expected < 0.15)"
+    );
+}
