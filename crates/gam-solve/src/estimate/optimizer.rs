@@ -899,37 +899,74 @@ where
                 // search; `(lo, hi)` already widens `hi` to `RHO_BOUND` so a
                 // genuinely large `λ_j` is not clipped to the seed band. The seed is
                 // order-independent, so no canonical permutation is needed.
-                let candidate = reml_state
-                    .analytic_initial_sp_rho(&base, (lo, hi))
-                    .unwrap_or_else(|| base.clone());
-                // Adopt the analytic candidate only when it STRICTLY lowers the true
-                // REML/LAML cost against the anchor — exactly the criterion the old
-                // grid used, but scoring one principled candidate instead of a
-                // lattice. This keeps a healthy warm start byte-identical (the
-                // candidate does not beat it → not adopted) yet still jumps a warm
-                // seed TRAPPED in a shallow under-smoothing basin into the analytic
-                // high-λ basin (#1266 double-penalty null-space, #1464 collapsing-
-                // kernel spatial). Two scored inner solves replace the grid's ~30.
+                // Two principled, data-derived candidates are scored against the
+                // anchor, each adopted only when it STRICTLY lowers the true
+                // REML/LAML cost — exactly the criterion the old grid used, but
+                // scoring a handful of hand-derived candidates instead of a
+                // lattice. A healthy warm start stays byte-identical (no candidate
+                // beats it → none adopted).
+                //
+                //   1. The mgcv-style analytic `initial.sp` seed
+                //      `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` (#2069/#1575) — a
+                //      commensurate-curvature start that jumps a warm seed
+                //      trapped in a shallow UNDER-smoothing basin into the
+                //      analytic high-λ basin (#1266 double-penalty null-space,
+                //      #1464 collapsing-kernel spatial).
+                //
+                //   2. The Demmler–Reinsch closed-form GLOBAL Gaussian-identity
+                //      REML optimum `ρ*` over the summed penalty `Σ_j S_j`. The
+                //      profiled Gaussian REML criterion is an explicit scalar
+                //      `V(ρ)` whose derivative decays to zero on the high-λ
+                //      shelf, so a descent method (mgcv included) rails to an
+                //      over-smoothed λ̂ there even though a finite-λ basin has a
+                //      strictly lower REML (sin8 k=40: shelf edf≈2 vs basin
+                //      edf≈39). The closed form SELECTS the global minimiser from
+                //      one eigendecomposition rather than descending `V`, so it
+                //      lands the correct basin; setting every block coordinate to
+                //      `ρ*` reproduces `e^{ρ*}·Σ_j S_j` exactly, so its scored
+                //      cost is the closed form's global optimum. Only fires for a
+                //      dense Gaussian-identity design (see
+                //      `analytic_gaussian_closed_form_rho`).
+                //
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
+                let initial_sp = reml_state.analytic_initial_sp_rho(&base, (lo, hi));
+                let closed_form = reml_state
+                    .analytic_gaussian_closed_form_rho((lo, hi))
+                    .map(|rho_star| {
+                        // Set only the leading penalty coordinates to ρ*; any
+                        // trailing ext/ψ coordinates in `base` are not smoothing
+                        // parameters and pass through unchanged (the same 1:1
+                        // layout `analytic_initial_sp_rho` uses).
+                        let mut seed = base.clone();
+                        let n_pen = reml_state.canonical_penalties.len().min(seed.len());
+                        for coord in seed.iter_mut().take(n_pen) {
+                            *coord = rho_star.clamp(lo, hi);
+                        }
+                        seed
+                    });
                 let base_cost = reml_state
                     .compute_cost(&base)
                     .ok()
                     .filter(|c| c.is_finite());
-                let candidate_cost = reml_state
-                    .compute_cost(&candidate)
-                    .ok()
-                    .filter(|c| c.is_finite());
-                let candidate_beats_base = match (candidate_cost, base_cost) {
-                    (Some(cc), Some(bc)) => cc < bc,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                let refined = if candidate_beats_base {
-                    candidate
-                } else {
-                    base.clone()
-                };
+                // Keep the strictly-cheapest of {anchor, initial.sp, closed-form}.
+                let mut refined = base.clone();
+                let mut best_cost = base_cost;
+                for candidate in [initial_sp, closed_form].into_iter().flatten() {
+                    let candidate_cost = reml_state
+                        .compute_cost(&candidate)
+                        .ok()
+                        .filter(|c| c.is_finite());
+                    let candidate_beats_best = match (candidate_cost, best_cost) {
+                        (Some(cc), Some(bc)) => cc < bc,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if candidate_beats_best {
+                        refined = candidate;
+                        best_cost = candidate_cost;
+                    }
+                }
                 // The lowest-cost sample seen, kept as the #1371 release-and-rerank
                 // lower bound the certified optimum must not be worse than.
                 release_rerank_seed = Some(refined.clone());
