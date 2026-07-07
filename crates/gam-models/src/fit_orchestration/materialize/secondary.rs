@@ -27,7 +27,9 @@ use super::*;
 /// bases that DEFAULT the Marra & Wood penalty on (`bspline`/`tps`/`matern`) are
 /// affected; `duchon` is excluded because it has no such penalty to disable and its
 /// builder rejects a `double_penalty=` key outright. An explicit user
-/// `double_penalty=` always wins.
+/// `double_penalty=` always wins, as does the mgcv shrinkage spline alias
+/// `bs="cs"`, because that alias is itself an explicit request for null-space
+/// shrinkage rather than a default inherited from `s()`.
 pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: usize) {
     for term in terms.iter_mut() {
         if let ParsedTerm::Smooth {
@@ -47,10 +49,8 @@ pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm]
             // reproducing-norm penalty plus a null-space ridge) and its builder
             // rejects a `double_penalty=` key outright, so injecting one here
             // would abort an otherwise-valid scale-block Duchon fit.
-            if matches!(canonical.as_str(), "bspline" | "tps" | "matern") {
-                options
-                    .entry("double_penalty".to_string())
-                    .or_insert_with(|| "false".to_string());
+            if secondary_smooth_should_disable_default_double_penalty(&canonical, options) {
+                options.insert("double_penalty".to_string(), "false".to_string());
             }
 
             if !smooth_type_uses_spatial_center_heuristic(&canonical)
@@ -61,5 +61,60 @@ pub(super) fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm]
             let cap = gam_terms::basis::conservative_secondary_centers(n_rows, vars.len());
             options.insert(SECONDARY_CENTER_CAP_OPTION.to_string(), cap.to_string());
         }
+    }
+}
+
+
+fn secondary_smooth_should_disable_default_double_penalty(
+    canonical: &str,
+    options: &BTreeMap<String, String>,
+) -> bool {
+    if options.contains_key("double_penalty") {
+        return false;
+    }
+
+    let selector = options
+        .get("bs")
+        .or_else(|| options.get("type"))
+        .map(|raw| raw.trim().to_ascii_lowercase());
+    if matches!(selector.as_deref(), Some("cs")) {
+        // `cs` is mgcv's shrinkage cubic-regression spline. It is not a silent
+        // default double penalty; it is the user's basis choice, equivalent to
+        // selecting the cubic-regression span plus null-space shrinkage.
+        return false;
+    }
+
+    matches!(canonical, "bspline" | "tps" | "matern")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn secondary_double_penalty_default_off_preserves_explicit_cs_shrinkage() {
+        assert!(secondary_smooth_should_disable_default_double_penalty(
+            "bspline",
+            &opts(&[])
+        ));
+        assert!(!secondary_smooth_should_disable_default_double_penalty(
+            "bspline",
+            &opts(&[("bs", "cs")])
+        ));
+        assert!(!secondary_smooth_should_disable_default_double_penalty(
+            "bspline",
+            &opts(&[("double_penalty", "true")])
+        ));
+        assert!(!secondary_smooth_should_disable_default_double_penalty(
+            "duchon",
+            &opts(&[])
+        ));
     }
 }
