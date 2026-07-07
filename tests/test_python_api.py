@@ -2353,7 +2353,13 @@ def test_smooth_dataclass_subclasses_construct_with_shape_constraint() -> None:
             )
             # Common base-class fields must default sanely.
             assert obj.by is None
-            assert obj.double_penalty is False
+            # `double_penalty` is tri-state (`bool | None`) since #2149/#2219:
+            # the default `None` means "defer to the formula/engine default"
+            # (true), so shape-reparameterized null-space columns stay penalized.
+            # An explicit `False` would be the old buggy default that left them
+            # unpenalized. None of these factories pass `double_penalty`, so the
+            # correct constructed default is `None`, not `False`.
+            assert obj.double_penalty is None
             assert obj.name is None
 
 
