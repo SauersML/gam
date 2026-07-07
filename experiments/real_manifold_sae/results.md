@@ -75,8 +75,9 @@ residual (self-concordance / collapse-barrier metric bug — 75+ min silent on 4
 so the stagewise arms above never completed. This section reports the real number via
 the **block-chart compose lane** (`gamfit.block_sparse_dictionary_fit` +
 `BlockSparseDictionaryFit.compose_block_charts`) — the SAME engine route2 used to close
-the geometric wall on Qwen-8B L18 (there curved beat flat, +0.047). Here it runs to
-completion on the 32B in ~4 min.
+the geometric wall on Qwen-8B L18 (there FLAT beat curved, +0.047 EV — a curvature
+negative; those +0.047 numbers are energy floors, lower=better, flat floor 0.7411 <
+curved floor 0.7886). Here it runs to completion on the 32B in ~4 min.
 
 - model: **Qwen3-30B-A3B (MoE, 32B) L17**, `L17_train.f32.npy` (1,204,602 × 2048)
 - centering: **tier0_recentered**; EV baseline "zero" (tier-0 origin == train mean)
@@ -116,8 +117,11 @@ params in **every** fitted stratum:
 The compose lane **is** promoting curvature (up to 12 accepted charts/stratum, large
 deviance gains, curvature proxy up to 0.20) — yet even in those strata the flat 24-block
 dictionary reconstructs better than the 12-block-curved base + chart corrections at equal
-budget. This is a genuine **negative for curvature on the 32B**, opposite to the Qwen-8B
-L18 wall closure (+0.047) under the identical matched scheme. Honest, either sign.
+budget. This is a genuine **negative for curvature on the 32B**, CONSISTENT with the
+Qwen-8B L18 wall closure, which ALSO shows flat beats curved (flat wins +0.047 EV) under
+the identical matched scheme — both real fits are curvature-negative; the only positive
+was the discarded k-means proxy. A unanimous negative across both models. Honest, either
+sign.
 
 ### Provenance
 - Driver: `experiments/real_manifold_sae/run_curved_vs_flat_32b_blockchart.py`
