@@ -224,6 +224,16 @@ pub struct MeasureJetFrozenQuadrature {
     /// Frobenius scale of the single fused primary penalty. `None` in per-level
     /// mode.
     pub fused_penalty_normalization_scale: Option<f64>,
+    /// Ambient input-measurement-error scale `σ_coord` (issue #2225): the
+    /// perpendicular off-manifold residual spread of the fit-time empirical
+    /// measure, in the frozen centers' (standardized) coordinate frame. Frozen
+    /// so the predict-time errors-in-variables variance term
+    /// `Var_input = σ_coord²·‖∇f̂‖²` uses the same input-noise scale the fit
+    /// saw. `None` when it could not be estimated (no cell spanned a tangent),
+    /// leaving `Var_input` disabled. Defaults to `None` for models persisted
+    /// before the term existed.
+    #[serde(default)]
+    pub sigma_coord: Option<f64>,
 }
 
 /// Serde default for [`MeasureJetBasisSpec::learn_length_scale`]: freeze ℓ at
@@ -1503,6 +1513,114 @@ pub(crate) fn realize_measure_jet_geometry(
     })
 }
 
+/// Estimate the ambient input-measurement-error scale `σ_coord` — the
+/// perpendicular off-manifold residual spread of the empirical measure — for
+/// the errors-in-variables predictive-variance term `Var_input = ∇f̂ᵀΣ_x∇f̂`,
+/// `Σ_x = σ_coord²·I` (issue #2225).
+///
+/// The measure-jet models data concentrated near an unknown low-intrinsic-
+/// dimension set sampled with isotropic ambient coordinate noise. In a
+/// neighborhood the set is locally affine, so the noise lives in the ambient
+/// directions ORTHOGONAL to the local tangent — exactly the smallest principal
+/// directions of the local data covariance. This is the standard local-PCA
+/// noise floor: for each center's nearest-assignment cell with enough points to
+/// span a tangent (`≥ d + 1`, the linear-algebra rank requirement — not a tuned
+/// knob), the smallest eigenvalue of the cell-local covariance estimates the
+/// perpendicular variance `σ_coord²`; averaging over cells (weighted by the
+/// cell count) pools the estimate. No response values, no smoothing dial, and
+/// no magic constant enter — it is a pure function of the ambient point cloud
+/// and the frozen centers, in the centers' (standardized) coordinate frame.
+///
+/// Returns `None` when no cell can span a tangent (e.g. `d`-dimensional data
+/// with fewer than `d + 1` points per cell, or a full-dimensional stratum with
+/// no separable perpendicular direction) — the caller then leaves `Var_input`
+/// disabled rather than invent a scale.
+pub fn measure_jet_input_noise_scale(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<Option<f64>, BasisError> {
+    let d = data.ncols();
+    let m = centers.nrows();
+    if d == 0 || m == 0 || data.nrows() == 0 {
+        return Ok(None);
+    }
+    if centers.ncols() != d {
+        crate::bail_dim_basis!(
+            "measure-jet input-noise estimate: data d={d} disagrees with centers d={}",
+            centers.ncols()
+        );
+    }
+    validate_finite_points(data, "data")?;
+    validate_finite_points(centers, "centers")?;
+    // Nearest-center assignment (the same rule that lumps the quadrature
+    // masses): the squared-distance Gram, argmin per row.
+    let sq = pairwise_sq_dists(data, centers);
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for (j, row) in sq.axis_iter(Axis(0)).enumerate() {
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (i, &dij) in row.iter().enumerate() {
+            if dij < best_d {
+                best_d = dij;
+                best = i;
+            }
+        }
+        members[best].push(j);
+    }
+    let mut weighted_sum = 0.0_f64;
+    let mut weight = 0.0_f64;
+    for cell in &members {
+        let n_i = cell.len();
+        // A cell needs at least d + 1 points to define a full-rank local
+        // covariance; otherwise its smallest eigenvalue is a spurious zero.
+        if n_i < d + 1 {
+            continue;
+        }
+        // Cell-local mean and covariance in ambient coordinates.
+        let mut mean = Array1::<f64>::zeros(d);
+        for &j in cell {
+            mean += &data.row(j);
+        }
+        mean /= n_i as f64;
+        let mut cov = Array2::<f64>::zeros((d, d));
+        for &j in cell {
+            let mut centered = data.row(j).to_owned();
+            centered -= &mean;
+            for a in 0..d {
+                for b in 0..d {
+                    cov[(a, b)] += centered[a] * centered[b];
+                }
+            }
+        }
+        cov /= n_i as f64;
+        // Symmetrize against accumulation asymmetry, then read the smallest
+        // eigenvalue = the perpendicular (noise) principal variance.
+        let cov_sym = (&cov + &cov.t()) * 0.5;
+        let (evals, _) = cov_sym.eigh(Side::Lower).map_err(|e| {
+            BasisError::InvalidInput(format!(
+                "measure-jet input-noise estimate: local covariance eigendecomposition failed: {e}"
+            ))
+        })?;
+        let smallest = evals
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, |acc, v| acc.min(v))
+            .max(0.0);
+        if smallest.is_finite() {
+            weighted_sum += n_i as f64 * smallest;
+            weight += n_i as f64;
+        }
+    }
+    if weight <= 0.0 {
+        return Ok(None);
+    }
+    let sigma2 = weighted_sum / weight;
+    if !(sigma2.is_finite() && sigma2 > 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(sigma2.sqrt()))
+}
+
 /// Whether a measure-jet spec runs in multiscale mode (per-scale spectral
 /// penalties + `(α, ln τ)` ψ dials + the affine-preserving ridge). The single
 /// source of truth for the mode decision, shared by the builder and the
@@ -1721,6 +1839,9 @@ pub fn build_measure_jet_basis(
             raw_penalty_normalization_scales,
             fused_penalty_normalization_scale,
             constraint_transform: Some(z),
+            // Perpendicular off-manifold residual scale of the fit rows in the
+            // centers' frame — the errors-in-variables input-noise scale (#2225).
+            sigma_coord: measure_jet_input_noise_scale(data, centers.view())?,
         },
         kronecker_factored: None,
         ops,
@@ -2012,6 +2133,77 @@ pub fn build_measure_jet_basis_psi_derivatives(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic Box–Muller standard normal from a 64-bit LCG state — a
+    /// self-contained noise generator (no external RNG dependency).
+    fn lcg_normal(state: &mut u64) -> f64 {
+        let mut next = || {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Top 53 bits → uniform (0, 1).
+            (((*state >> 11) as f64) + 0.5) / (1u64 << 53) as f64
+        };
+        let u1 = next();
+        let u2 = next();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// The perpendicular off-manifold residual estimator recovers a KNOWN
+    /// ambient noise scale on a 1-D manifold (a line) embedded in 2-D: points
+    /// sampled along the tangent with isotropic-perpendicular Gaussian noise of
+    /// scale σ, centers spaced along the line. The local-PCA smallest-eigenvalue
+    /// floor must return ≈ σ (#2225).
+    #[test]
+    pub(crate) fn input_noise_scale_recovers_known_perpendicular_sigma() {
+        // Line direction (unit) and its perpendicular in 2-D.
+        let tang = [1.0 / 5f64.sqrt(), 2.0 / 5f64.sqrt()];
+        let perp = [2.0 / 5f64.sqrt(), -1.0 / 5f64.sqrt()];
+        let sigma = 0.05_f64;
+        let n = 600usize;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for j in 0..n {
+            // Tangential coordinate marches deterministically over [0, 3].
+            let t = 3.0 * (j as f64) / (n as f64 - 1.0);
+            let noise = sigma * lcg_normal(&mut state);
+            for a in 0..2 {
+                data[(j, a)] = t * tang[a] + noise * perp[a];
+            }
+        }
+        // Centers along the line (on the noiseless manifold): plenty of points
+        // per cell to span the tangent.
+        let n_centers = 8usize;
+        let mut centers = Array2::<f64>::zeros((n_centers, 2));
+        for i in 0..n_centers {
+            let t = 3.0 * (i as f64 + 0.5) / (n_centers as f64);
+            for a in 0..2 {
+                centers[(i, a)] = t * tang[a];
+            }
+        }
+        let est = measure_jet_input_noise_scale(data.view(), centers.view())
+            .expect("estimate ok")
+            .expect("noise scale present");
+        // Sample smallest-eigenvalue floor is mildly downward-biased; require it
+        // within 40% of the truth (central estimate, not a tuned tolerance).
+        assert!(
+            (est - sigma).abs() <= 0.4 * sigma,
+            "estimated σ_coord {est} far from true {sigma}"
+        );
+    }
+
+    /// Too few points per cell (cannot span a d-dim tangent) ⇒ no estimate,
+    /// so the caller leaves Var_input disabled rather than invent a scale.
+    #[test]
+    pub(crate) fn input_noise_scale_none_when_cells_too_small() {
+        let data = array![[0.0, 0.0], [1.0, 2.0], [2.0, 4.0]];
+        let centers = array![[0.0, 0.0], [1.0, 2.0], [2.0, 4.0]];
+        // Each point is its own nearest center (1 point per cell < d + 1 = 3).
+        assert!(
+            measure_jet_input_noise_scale(data.view(), centers.view())
+                .expect("estimate ok")
+                .is_none()
+        );
+    }
+
     pub(crate) fn two_cluster_centers() -> (ndarray::Array2<f64>, ndarray::Array1<f64>) {
         let centers = array![
             [0.00, 0.00],
@@ -2484,6 +2676,7 @@ mod tests {
                 penalty_normalization_scales: penalty_normalization_scales.clone(),
                 raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
                 fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
+                sigma_coord: None,
             }),
         };
         (data, frozen)
@@ -2739,6 +2932,7 @@ mod tests {
                 penalty_normalization_scales: penalty_normalization_scales.clone(),
                 raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
                 fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
+                sigma_coord: None,
             }),
         };
         // Per-level (auto-sentinel) mode: one candidate per band scale plus
