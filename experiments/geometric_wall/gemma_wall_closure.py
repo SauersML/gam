@@ -60,14 +60,14 @@ def hidden_size_from_model(model: Any) -> int:
 
 
 def harvest(args: argparse.Namespace, layers: list[int], out_dir: Path) -> tuple[dict[int, Path], Path]:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     paths = {layer: out_dir / f"acts_L{layer}.npy" for layer in layers}
     pos_path = out_dir / "positions.npy"
     if all(path.exists() for path in paths.values()) and pos_path.exists():
         log("using cached activation arrays")
         return paths, pos_path
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=args.cache_dir)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
