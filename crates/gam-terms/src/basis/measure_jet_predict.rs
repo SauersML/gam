@@ -25,12 +25,14 @@
 //! The second line is the §5 statement: the total prior ignorance of the
 //! spectrum minus the part the query's coverage recovers — the recovered sum
 //! runs over the covered levels `ε_ℓ ≥ ε★` exactly as written in the charter.
-//! In fused mode the band has one precision, so the same coverage idea reduces
-//! to one charge: `λ_fused⁻¹` if no level clears its floor, otherwise
-//! `(1 − max_ℓ a_ℓ(x★)) · λ_fused⁻¹`.
+//! In fused mode the band has one precision shared by every normalized level
+//! in the collapsed band.  Because that collapse does not identify which
+//! level's innovation has been recovered, the honest fused statement is
+//! conservative: only full support at every level recovers the spectrum;
+//! otherwise the full `n_levels · λ_fused⁻¹` finite-support variance is charged.
 //! On-web queries (ε★ = ε_0, a_ℓ ≈ 1 everywhere) recover the full spectrum
 //! and pay ≈ 0 extra; far-off queries recover (almost) nothing and pay the
-//! full Σ_ℓ λ̂_ℓ⁻¹. Levels FINER than the first covering scale get no credit
+//! full band ignorance. Levels FINER than the first covering scale get no credit
 //! for stray sub-floor kernel mass: below ε★ the prediction is a jet
 //! extension, not an interpolation, so those innovations are charged as pure
 //! ignorance.
@@ -39,11 +41,12 @@
 //!
 //! If no band level clears the coverage floor (ε★ lies past the band), the
 //! covered set is EMPTY: in per-level mode every level contributes its full
-//! λ̂_ℓ⁻¹ and `Var_extrap = Σ_ℓ λ̂_ℓ⁻¹`; in fused mode the single band
-//! amplitude contributes once. The variance saturates at the spectrum's total
-//! prior ignorance instead of growing without bound, which is the honest
-//! statement: the model's coefficient prior is the only information it ever
-//! claimed about such a point.
+//! λ̂_ℓ⁻¹ and `Var_extrap = Σ_ℓ λ̂_ℓ⁻¹`; in fused mode every normalized level
+//! contributes with the common fitted precision, `n_levels · λ_fused⁻¹`. The
+//! variance saturates at the spectrum's total prior ignorance instead of
+//! growing without bound, which is the honest statement: the model's
+//! coefficient prior is the only information it ever claimed about such a
+//! point.
 //!
 //! # Monotonicity (the distance-honesty theorem)
 //!
@@ -190,16 +193,23 @@ pub fn measure_jet_extrapolation_variance(
                     "measure-jet fused amplitude must be finite and positive (physical precision)"
                 );
             }
-            let mut best_coverage = 0.0_f64;
-            let mut covered = false;
-            for (&q, &q_bar) in support_row.iter().zip(support_means.iter()) {
-                let coverage = (q / q_bar).min(1.0);
-                best_coverage = best_coverage.max(coverage);
-                if q >= coverage_floor * q_bar {
-                    covered = true;
-                }
-            }
-            let weight = if covered { 1.0 - best_coverage } else { 1.0 };
+            let fully_recovered = support_row
+                .iter()
+                .zip(support_means.iter())
+                .all(|(&q, &q_bar)| q >= q_bar);
+            let weight = if fully_recovered {
+                0.0
+            } else {
+                n_levels as f64
+            };
+            // Fused mode estimates one common precision for all normalized
+            // scale levels but has no fitted per-level amplitudes. Partial
+            // support therefore cannot be allocated to recovered vs. missing
+            // levels without inventing a spectrum. The conservative identifiable
+            // rule is all-or-full: exact full support recovers the shared
+            // spectrum; any finite-support deficit pays every level once. This
+            // avoids the previous best-level shortcut, where a coarse kernel
+            // erased missing fine-scale support and under-dispersed intervals.
             Ok(weight / lambda_hat)
         }
     }
@@ -465,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn fused_extrapolation_charges_single_band_amplitude_once() {
+    pub(crate) fn fused_extrapolation_charges_common_precision_per_uncovered_level() {
         let eps = band();
         let q_bar = support_means(&eps);
         let lam = 2.5;
@@ -480,8 +490,8 @@ mod tests {
         .expect("valid inputs");
         assert_eq!(
             v_zero,
-            1.0 / lam,
-            "never-covered fused band must pay one amplitude, not one per level"
+            eps.len() as f64 / lam,
+            "never-covered fused band must pay the common amplitude at every level"
         );
 
         let covered = arr1(&[0.01, 0.2, 0.4, 0.75, 0.5]);
@@ -493,10 +503,10 @@ mod tests {
             FLOOR,
         )
         .expect("valid inputs");
-        let expected = (1.0 - 0.75) / lam;
+        let expected = eps.len() as f64 / lam;
         assert!(
             (v_covered - expected).abs() <= 1e-15,
-            "fused band must use the best covered level once: {v_covered} vs {expected}"
+            "fused band must use the gated common-precision uncovered support: {v_covered} vs {expected}"
         );
     }
 }
