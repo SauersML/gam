@@ -5744,45 +5744,22 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     }
 
     /// True when this realizer carries exactly ONE spatial smooth term whose
-    /// frozen basis geometry (`BasisMetadata::Duchon`/`ThinPlate`)
-    /// admits an EXACT, n-free penalty rebuild at a new length-scale (#1033).
-    /// The κ-loop fast path gates its design-realization skip on this: the skip
-    /// leaves `reset_surface` un-run, so it is only sound when `S(ψ_new)` can be
-    /// re-keyed n-free from the frozen geometry (centers + identifiability
-    /// transform + operator collocation points), never from the data rows, AND
-    /// the re-keyed penalty's block topology is IDENTICAL to the one the frozen
-    /// design carries.
+    /// frozen basis geometry (`BasisMetadata::Duchon`/`ThinPlate`/`Matern`)
+    /// admits an EXACT, n-free penalty rebuild at a new length-scale (#1033,
+    /// #1274). The κ-loop fast path gates its design-realization skip on this:
+    /// the skip leaves `reset_surface` un-run, so it is only sound when
+    /// `S(ψ_new)` can be re-keyed n-free from frozen term geometry (centers +
+    /// identifiability transform + operator collocation metadata), never from
+    /// the data rows, AND the re-keyed penalty's block topology is IDENTICAL to
+    /// the one the frozen design carries.
     ///
-    /// Matérn stays on the exact slow re-key path here, but NOT for the reason
-    /// #1270 originally pinned. The operator-triplet penalty re-key (#1274) IS
-    /// fully landed: `canonical_penalties_at_psi` and
-    /// `canonical_penalty_derivatives_at_psi` both rebuild the realized Matérn
-    /// `{mass, tension, stiffness}` triplet (and its analytic ψ-derivative)
-    /// n-free from the frozen collocation geometry, routed through the SAME
-    /// shared `matern_operator_penalty_triplet_at_length_scale` builder the
-    /// design uses — so the block topology is ψ-stable by construction and the
-    /// surface is byte-identical to the slow path across the ψ window (pinned
-    /// to <1e-10 by `matern_nfree_rekey_topology_tests`). The historical
-    /// "the re-key cannot reproduce the operator triplet" rationale is resolved.
-    ///
-    /// Re-admission is nonetheless withheld because it is net-negative on the
-    /// CURRENT architecture, for two independent reasons the #1274 acceptance
-    /// gates surface:
-    ///   1. NO SPEED WIN. Even with the penalty re-keyed, the #1264
-    ///      reduced-basis-rotation soundness gate (`psi_gram_tensor_covers_skip`)
-    ///      refuses Matérn's rotating collocation geometry, so the design-
-    ///      realization skip still falls to the exact O(n) `reset_surface`
-    ///      re-realization every trial — admitting the penalty rekey alone buys
-    ///      no n-independence. Closing this needs an n-free re-key of the Matérn
-    ///      *design* (Chebyshev-in-ψ Gram over the rotating basis), which is the
-    ///      remaining design-scope work, not a flag flip.
-    ///   2. QUALITY REGRESSION. Re-admitting Matérn (as #1033 `6a5a2e1` did,
-    ///      reverted by `feb0eb5`) perturbs the selected fit enough to miss the
-    ///      mgcv/GP truth-recovery bar (`matern_nu_sweep_*`) — slower AND worse.
-    ///
-    /// So Matérn is deliberately "slow-but-right". Duchon/ThinPlate are the
-    /// #1033 acceptance lane. `matern_nfree_rekey_topology_tests` test (b) pins
-    /// this negative admission contract: a flip must first re-clear both gates.
+    /// Matérn is admitted here because its realized penalty topology is the
+    /// operator triplet `{mass, tension, stiffness}` and
+    /// `canonical_penalties_at_psi` rebuilds that same triplet through the
+    /// shared `matern_operator_penalty_triplet_at_length_scale` builder used by
+    /// the slow design path. This avoids the old unsound projected-kernel
+    /// double-penalty re-key, whose block count did not match the frozen
+    /// Matérn design.
     fn supports_nfree_penalty_rekey(&self, spatial_terms: &[usize]) -> bool {
         if spatial_terms.len() != 1 {
             return false;
@@ -5790,7 +5767,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let term_idx = spatial_terms[0];
         matches!(
             self.design.smooth.terms.get(term_idx).map(|t| &t.metadata),
-            Some(BasisMetadata::Duchon { .. } | BasisMetadata::ThinPlate { .. })
+            Some(
+                BasisMetadata::Duchon { .. }
+                    | BasisMetadata::ThinPlate { .. }
+                    | BasisMetadata::Matern { .. }
+            )
         )
     }
 

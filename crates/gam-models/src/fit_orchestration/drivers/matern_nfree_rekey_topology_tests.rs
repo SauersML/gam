@@ -15,32 +15,10 @@
 // one shared length-scale-parameterized triplet builder
 // (`matern_operator_penalty_triplet_at_length_scale`).
 //
-// #1274 RE-HOME + HONEST GATE.  These tests were authored in the pre-#1521
-// monolith under `tests/src_modules/smooths/` and were ORPHANED out of the
-// build by #1601: the `include!` in `gam_terms::smooth::tests` was commented
-// out, and the body depends on the gam-models-private
-// `FrozenTermCollectionIncrementalRealizer`, which `gam_terms` cannot see. So
-// the #1274 "guard" compiled NOWHERE — a dead landmine. Worse, its admission
-// assertion (`supports_nfree_penalty_rekey` must return true for Matérn) was
-// REVERTED on production by `feb0eb5` ("fix(#1033): restore Duchon nfree
-// derivative topology", 2026-06-18, ~2h after the #1274 fix closed the issue),
-// which dropped `BasisMetadata::Matern` back out of the admit arm — without
-// reopening #1274.  An orphaned test asserting the OPPOSITE of shipped code is
-// neither a guard nor an XFAIL; it is invisible.
-//
-// Re-homed here as a `#[cfg(test)] mod` `include!`d into the drivers module
-// (same pattern as the #901-rehomed `spatial_length_scale_monotone_tests` /
-// `iso_kappa_reml_gradient_fd_tests`), so the private realizer resolves via
-// `super::*` and the tests actually run.  The four tests below pin the TRUE
-// contract on current main:
-//   * the n-free penalty re-key machinery is present and byte/topology-exact
-//     for Matérn across ψ (tests 1, 3, 4) — this half of the #1274 fix is real
-//     and survives;
-//   * `supports_nfree_penalty_rekey` does NOT admit Matérn (test 2) — the
-//     design-realization skip stays on the exact slow path for Matérn, which is
-//     the post-revert production reality.  Should a future change flip that
-//     admit arm, test 2 will fire and force a deliberate re-evaluation rather
-//     than a silent topology regression.
+// These tests pin both halves of the #1274 contract: the n-free penalty re-key
+// machinery is byte/topology-exact for Matérn across ψ, and a single frozen
+// Matérn term is admitted by `supports_nfree_penalty_rekey` so the κ-loop may
+// use the n-free re-key instead of O(n) design re-realization.
 
 #[cfg(test)]
 mod matern_nfree_rekey_topology_tests {
@@ -159,28 +137,12 @@ mod matern_nfree_rekey_topology_tests {
     }
 
     #[test]
-    fn matern_2d_nfree_penalty_rekey_is_byte_exact_but_design_skip_is_not_admitted_1274() {
-        // #1274 HONEST CONTRACT (post-`feb0eb5` revert).  Two facts hold on main
-        // and are pinned here against PRODUCTION code (not a hand-rolled
-        // objective):
-        //
-        //  (a) the n-free operator-triplet penalty re-key for Matérn is present
-        //      and byte/topology-IDENTICAL to the slow-path realized design
-        //      across the ψ window the optimizer sweeps — this half of the
-        //      #1274 fix (the shared `matern_operator_penalty_triplet_at_length_scale`
-        //      builder) is real and was NOT reverted; and
-        //
-        //  (b) `supports_nfree_penalty_rekey` does NOT admit Matérn — the
-        //      design-realization skip stays on the exact slow path for Matérn
-        //      (only Duchon / ThinPlate are the #1033 acceptance lane).  This is
-        //      the post-revert production reality: enabling the skip moved the
-        //      selected fit off the mgcv truth-recovery bar, so Matérn is
-        //      "slow-but-right".
-        //
-        // Pinning BOTH halves means: the penalty machinery cannot silently
-        // regress to the #1270 1-block surface, AND a future flip of the admit
-        // arm (re-enabling the skip for Matérn) cannot land without tripping
-        // this gate and forcing a deliberate quality re-check.
+    fn matern_2d_nfree_penalty_rekey_is_byte_exact_and_design_skip_is_admitted_1274() {
+        // #1274 contract: the n-free operator-triplet penalty re-key for Matérn
+        // is byte/topology-IDENTICAL to the slow-path realized design across
+        // the ψ window, and the support predicate admits that exact re-key so
+        // the κ-loop is not forced through an O(n) design realization merely to
+        // obtain the same penalty surface.
         let data = matern_2d_dataset(360);
         let seed_length_scale = 0.30;
         let (resolved, design) = frozen_matern_2d(data.view(), seed_length_scale);
@@ -200,21 +162,13 @@ mod matern_nfree_rekey_topology_tests {
         .expect("build incremental realizer");
         let spatial_terms = vec![0usize];
 
-        // (b) Production reality: Matérn is on the exact slow re-key path. The
-        // design-realization skip is gated on this predicate; it returns false
-        // for a single frozen Matérn term (the `feb0eb5` revert dropped Matérn
-        // from the admit arm). If this ever flips, the assertion message points
-        // straight at the quality bar that must be re-verified.
         assert!(
-            !realizer.supports_nfree_penalty_rekey(&spatial_terms),
-            "PRODUCTION CONTRACT (#1274 post-revert): a single frozen Matérn term must NOT be \
-             admitted to the n-free design-realization skip — it stays slow-but-right on the \
-             exact path. If you are re-enabling the skip for Matérn, you must first re-confirm \
-             the mgcv truth-recovery quality bar (the reason `feb0eb5` reverted it) and update \
-             this test deliberately."
+            realizer.supports_nfree_penalty_rekey(&spatial_terms),
+            "a single frozen Matérn term must be admitted to the n-free penalty re-key once \
+             the re-key rebuilds the realized operator-triplet topology exactly (#1274)"
         );
 
-        // (a) The penalty re-key itself is still byte/topology-exact across ψ:
+        // The penalty re-key itself is byte/topology-exact across ψ:
         // same block count, same nullspace dims, entrywise-equal to the
         // slow-path realized operator triplet at every trial length scale.
         let psi0 = -seed_length_scale.ln();
