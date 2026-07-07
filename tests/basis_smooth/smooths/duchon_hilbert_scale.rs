@@ -1,9 +1,10 @@
 //! TARGET behavior of the redesigned non-periodic Euclidean Duchon penalty:
 //! the "Hilbert scale of FUNCTION penalties, all on by default" contract.
 //!
-//! These tests pin down the EVENTUAL behavior of the redesign now being built.
-//! They will FAIL until the core lands — that is honest red, not a bug in the
-//! tests. The contract under test:
+//! The redesign has LANDED and these are LIVE regression guards on `main` (they
+//! pass): the default `duchon(...)` emits the full Hilbert scale of function
+//! penalties and REML deselects the unhelpful blocks. They are no longer
+//! forward-specs awaiting the core. The contract under test:
 //!
 //! A default `duchon(x, k=...)` smooth (no `magnitude=`) emits a Hilbert scale
 //! of FUNCTION penalties, ALL ON BY DEFAULT, with REML deselecting the unused
