@@ -880,6 +880,31 @@ mod step2_quotient_scale_tests {
         );
     }
 
+    /// #2099 — collapse guards must measure the atom's physical contribution
+    /// scale `exp(s_k)‖B_k‖_F`, not the raw decoder norm alone. After the quotient
+    /// peels both decoders to unit Frobenius, `‖B_k‖` cannot distinguish a live atom
+    /// from one whose explicit log-amplitude has collapsed.
+    #[test]
+    fn quotient_collapse_scale_tracks_log_amplitude_not_unit_decoder_norm() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        for atom in term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+        let live_scale = term.atoms[0].contribution_frobenius_scale();
+        term.atoms[1].log_amplitude = term.atoms[0].log_amplitude - 4.0_f64.ln();
+        let collapsed_scale = term.atoms[1].contribution_frobenius_scale();
+
+        assert!(
+            (frob(&term.atoms[0].decoder_coefficients) - 1.0).abs() <= 1e-9
+                && (frob(&term.atoms[1].decoder_coefficients) - 1.0).abs() <= 1e-9,
+            "fixture must exercise equal unit decoders"
+        );
+        assert!(
+            collapsed_scale < live_scale,
+            "physical scale must see the explicit-amplitude collapse: live={live_scale}, collapsed={collapsed_scale}"
+        );
+    }
+
     /// #2022 gate (i) — lever DEFAULT-OFF ⇒ the step never peels ⇒ `s` stays 0 ⇒
     /// bit-for-bit. Verified by construction: `absorb_*` is only invoked from the
     /// step under the `quotient_scale` kwarg (default false) and from the gated

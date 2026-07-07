@@ -1523,6 +1523,25 @@ impl SaeManifoldAtom {
         // penalty is decoder-magnitude-independent and must survive the peel.
     }
 
+    /// Physical atom scale in the represented contribution
+    /// `exp(s_k) · Φ_k · B_k`.
+    ///
+    /// Decoder-collapse logic must use this gauge-invariant scale once the
+    /// quotient has moved magnitude from `B_k` into `s_k`; otherwise a
+    /// unit-Frobenius decoder would make every atom look equally alive even when
+    /// its explicit amplitude has collapsed.
+    pub(crate) fn contribution_frobenius_scale(&self) -> f64 {
+        let decoder_norm = self
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let amplitude = self.log_amplitude.exp();
+        let scale = amplitude * decoder_norm;
+        if scale.is_finite() { scale } else { 0.0 }
+    }
+
     /// Recompute the intrinsic (gauge-invariant) roughness Gram
     /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
     /// basis Jacobian / second jet, and the current decoder coefficients

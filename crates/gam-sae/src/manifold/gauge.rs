@@ -495,17 +495,13 @@ impl SaeManifoldTerm {
         if k < 2 {
             return 0;
         }
-        let mut norms = vec![0.0_f64; k];
-        for (idx, atom) in self.atoms.iter().enumerate() {
-            norms[idx] = atom
-                .decoder_coefficients
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt();
-        }
+        let norms: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.contribution_frobenius_scale())
+            .collect();
         // "Healthy dictionary scale" to measure collapse against = the MAX decoder
-        // norm (definitionally a surviving atom). NOT the median: the median is the
+        // scale (definitionally a surviving atom). NOT the median: the median is the
         // guard's statistic but it DEGENERATES whenever the MAJORITY of atoms
         // collapse, because the collapsed atoms THEMSELVES set the median. At K=3
         // with two co-vanished atoms (real IBP data: ‖B‖=[2.6, ~0, ~0]) the median
@@ -557,7 +553,9 @@ impl SaeManifoldTerm {
         // collapse at `1e-3` is retracted (`retracted>0`), a collapse at `1e-16` is
         // an `unretractable_zero` (Design B correctly no-ops → needs a backfit
         // reseed, not this). Under a healthy dictionary nothing breaches and this is
-        // a bit-for-bit no-op with a benign one-line trace.
+        // a bit-for-bit no-op with a benign one-line trace. The printed `norms` are
+        // physical contribution scales `exp(s_k)‖B_k‖_F`, so the diagnostic keeps
+        // its meaning under the scale quotient.
         let norms_fmt: Vec<String> = norms.iter().map(|v| format!("{v:.6e}")).collect();
         log::warn!(
             "[#1939 cone-atom] k={k} norms=[{}] median={median:.6e} reference={reference:.6e} \
