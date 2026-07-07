@@ -1090,6 +1090,45 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn debug_dump_super_resolve_internals() {
+        let h_count = 8;
+        let t1 = 0.20;
+        let t2 = 0.55;
+        let z: Vec<f64> = harmonic_code(&[(t1, 1.0), (t2, 0.7)], h_count)
+            .iter()
+            .map(|&v| v as f64)
+            .collect();
+        let min_sep = separation_limit(h_count);
+        let (single, single_residual, single_residual_norm) = single_harmonic_spike(&z, 0.0);
+        let code_modes = count_separated_positive_modes(&z, min_sep);
+        let residual_modes = count_separated_positive_modes(&single_residual, min_sep);
+        let eta =
+            harmonic_dual_birth_eta(&coeffs_from_code(&single_residual), single.amplitude);
+        eprintln!(
+            "DBG min_sep={min_sep} single_coord={} single_amp={} single_res_norm={} \
+             code_modes={code_modes} residual_modes={residual_modes} eta={eta}",
+            single.coordinate, single.amplitude, single_residual_norm
+        );
+        let coeffs = coeffs_from_code(&z);
+        match crate::super_resolution::recover_spikes(&coeffs, 0.0) {
+            Ok(rec) => eprintln!(
+                "DBG recover sigma=0: model_order={} residual={} spikes={:?}",
+                rec.model_order,
+                rec.residual,
+                rec.spikes
+                    .iter()
+                    .map(|s| (s.t, s.amplitude))
+                    .collect::<Vec<_>>()
+            ),
+            Err(e) => eprintln!("DBG recover sigma=0 ERR: {e}"),
+        }
+        for g in 0..(4 * h_count) {
+            let t = g as f64 / (4 * h_count) as f64;
+            eprintln!("DBG grid t={t:.4} f={:.4}", harmonic_f(&z, t));
+        }
+    }
+
     fn row_matrix(rows: &[Vec<f32>]) -> Array2<f32> {
         let n = rows.len();
         let p = rows[0].len();
