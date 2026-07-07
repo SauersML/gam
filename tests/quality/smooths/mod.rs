@@ -7,6 +7,7 @@ mod quality_vs_lme4_mgcv_random_intercept_by_smooth;
 mod quality_vs_mgcv_cyclic_cubic;
 mod quality_vs_mgcv_cylinder_tensor_cc_ps;
 mod quality_vs_mgcv_duchon_2d;
+mod quality_vs_mgcv_duchon_default_rank;
 mod quality_vs_mgcv_duchon_regimes;
 mod quality_vs_mgcv_duchon_smooth;
 mod quality_vs_mgcv_factor_smooth_fs;
