@@ -2658,8 +2658,22 @@ where
             const COV_FULL_INVERSE_MAX_P: usize = 10_000;
             if p_orig <= COV_FULL_INVERSE_MAX_P {
                 let h_orig = map_hessian_to_original_basis(&pirls_res)?;
+                // Use the SAME inverse the influence matrix `F = I − H⁻¹S` is
+                // built from (`posterior_covariance_inverse`, below), not the bare
+                // ridged `matrix_inversewith_regularization`. In the near-linear /
+                // large-λ regime `H` is ill-conditioned, so the regularized inverse
+                // is materially perturbed by its ridge (`inverse_identity_defect >
+                // 1e-6`) and `posterior_covariance_inverse` falls back to the
+                // ridge-free spectral inverse. `F` (and hence `tr(F)`) takes that
+                // spectral branch while this reconciliation, on the bare ridged
+                // inverse, did not — so `tr_kk = λ_kk·tr(H⁻¹S_kk)` was contracted
+                // against a DIFFERENT `H⁻¹` than `F`, breaking the exact identity
+                // `edf_total = p − Σ tr_kk = tr(F)` by the ridge perturbation (the
+                // #1027 basis/PSD-floor inconsistency, ~2.4e-5 on a heavily-smoothed
+                // `s(x)`). Sharing `posterior_covariance_inverse` makes both traces
+                // read the identical `H⁻¹`, restoring the identity to round-off.
                 if let Some(h_inv) =
-                    matrix_inversewith_regularization(&h_orig, "edf reconciliation")
+                    posterior_covariance_inverse(&h_orig, "edf reconciliation")
                 {
                     let qs = &pirls_res.reparam_result.qs;
                     let p_t = qs.ncols();
