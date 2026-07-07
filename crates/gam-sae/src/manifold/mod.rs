@@ -211,6 +211,7 @@ mod term;
 mod terracini;
 mod weight_frame_catalog;
 mod wbic_audit;
+mod wbic_dynamics;
 
 #[cfg(test)]
 mod tests;
@@ -408,3 +409,4 @@ pub use term::*;
 pub use terracini::*;
 pub use weight_frame_catalog::*;
 pub use wbic_audit::*;
+pub use wbic_dynamics::*;
