@@ -491,39 +491,15 @@ pub fn build_termspec(
                     policy,
                     smooth_coordinate_count,
                 )?;
-                let inner_basis = match inner_basis {
-                    SmoothBasisSpec::FactorSmooth {
-                        spec:
-                            FactorSmoothSpec {
-                                continuous_cols,
-                                group_col,
-                                marginal,
-                                flavour: FactorSmoothFlavour::Sz,
-                                frozen_global_orthogonality,
-                                ..
-                            },
-                    } => {
-                        if continuous_cols.len() != 1 {
-                            return Err(TermBuilderError::incompatible_config(format!(
-                                "sz factor-smooth currently expects exactly one continuous covariate, found {}",
-                                continuous_cols.len()
-                            )));
-                        }
-                        SmoothBasisSpec::FactorSumToZero {
-                            inner: Box::new(SmoothBasisSpec::BSpline1D {
-                                feature_col: continuous_cols[0],
-                                spec: marginal,
-                            }),
-                            by_col: group_col,
-                            levels: encoded_levels_for_column(ds, ColIdx::new(group_col))
-                                .into_iter()
-                                .map(|(bits, _)| bits)
-                                .collect(),
-                            frozen_global_orthogonality,
-                        }
-                    }
-                    other => other,
-                };
+                // `bs="sz"` deliberately stays typed as `SmoothBasisSpec::FactorSmooth
+                // { Sz }` (#1403, owner-confirmed in #1887): the `FactorSumToZero`
+                // envelope is the *legacy, mis-typed* representation. `build_factor_smooth`
+                // reuses the sum-to-zero construction internally as its single source of
+                // truth for the zero-sum geometry (term_specs.rs) while keeping the
+                // freeze-consistent `FactorSmooth` metadata shape shared by fs/sz/re, so
+                // there is no reason to re-wrap the spec into the legacy envelope here —
+                // doing so (#1981) mis-typed `sz(fac, x)` back to `FactorSumToZero` and
+                // broke the refit/predict freeze path's `(FactorSmooth, …)` metadata match.
                 if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
                     match ds.column_kinds.get(by_col).copied().ok_or_else(|| {

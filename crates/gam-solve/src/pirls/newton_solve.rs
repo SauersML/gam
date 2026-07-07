@@ -1526,6 +1526,13 @@ pub fn solve_newton_directionwith_lower_bounds(
         if free_idx.is_empty() {
             let hd = fast_av(kkt_h, direction_out);
             if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
+                if kkt_hessian.is_some() {
+                    let hd_ref = fast_av(hessian, direction_out);
+                    log::warn!(
+                        "[gam#979 simple-release/allactive] it={it} idx={idx} beta={:.4e} lower={:.4e} lambda_true={:.4e} lambda_refl={:.4e}",
+                        beta[idx], lower_bounds[idx], gradient[idx] + hd[idx], gradient[idx] + hd_ref[idx],
+                    );
+                }
                 active[idx] = false;
                 continue;
             }
@@ -1591,6 +1598,13 @@ pub fn solve_newton_directionwith_lower_bounds(
         // released on a sign-flipped multiplier (gam#979).
         let hd = fast_av(kkt_h, direction_out);
         if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
+            if kkt_hessian.is_some() {
+                let hd_ref = fast_av(hessian, direction_out);
+                log::warn!(
+                    "[gam#979 simple-release] it={it} idx={idx} beta={:.4e} lower={:.4e} lambda_true={:.4e} lambda_refl={:.4e} n_free={n_free} n_active={}",
+                    beta[idx], lower_bounds[idx], gradient[idx] + hd[idx], gradient[idx] + hd_ref[idx], active_idx.len(),
+                );
+            }
             active[idx] = false;
             continue;
         }
