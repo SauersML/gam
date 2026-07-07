@@ -767,6 +767,27 @@ pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> 
     (w, c, d)
 }
 
+/// Gamma family with log link: `V(μ)=μ²`, `μ=exp(η)`.
+///
+/// For a Gamma exponential-dispersion model the negative log-likelihood
+/// second derivative with respect to `η` is exactly `y / (φ μ)`.  The generic
+/// observed-information formula computes the same value as
+/// `W_Fisher - (y - μ)·B`; with `V=μ²` and log-link derivatives this subtracts
+/// two `1/φ`-scale terms to leave the small positive `y/(φμ)` tail, and its
+/// intermediate `V²`/`V³` products overflow for large trial `η`.  This
+/// closed form is algebraically identical but cancellation- and overflow-free.
+///
+/// ```text
+/// w_obs =  ω y / (φ μ)
+/// c_obs = -ω y / (φ μ)
+/// d_obs =  ω y / (φ μ)
+/// ```
+#[inline]
+pub fn observed_weight_gamma_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
+    let w = pw * y / (phi * mu);
+    (w, -w, w)
+}
+
 #[inline]
 pub(crate) fn observed_weight_binomial_logit_from_jet(
     n_trials: f64,
@@ -849,6 +870,9 @@ pub fn observed_weight_dispatch(
         }
         (WeightFamily::Gaussian, WeightLink::Inverse) => {
             observed_weight_gaussian_inverse(y, eta, phi, prior_weight)
+        }
+        (WeightFamily::Gamma, WeightLink::Log) => {
+            observed_weight_gamma_log(y, mu, phi, prior_weight)
         }
         (WeightFamily::Binomial, WeightLink::Logit) => {
             observed_weight_binomial_logit_from_jet(1.0, jet, prior_weight)

@@ -14,12 +14,14 @@ mod tests {
     use super::reweight::madsen_lm_accept_factor;
     use super::{
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
-        PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance, calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
-        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        fit_model_for_fixed_rho, select_active_set_release, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, tweedie_log_weight_mu_power, update_glmvectors,
+        PirlsProblem, PirlsWorkspace, WeightFamily, WeightLink, WorkingDerivativeBuffersMut,
+        bernoulli_geometry_from_jet, calculate_deviance, calculate_loglikelihood,
+        calculate_loglikelihood_omitting_constants, compute_constraint_kkt_diagnostics,
+        compute_observed_hessian_curvature_arrays, fit_model_for_fixed_rho,
+        observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        tweedie_log_weight_mu_power, update_glmvectors, variance_jet_for_weight_family,
         write_gamma_log_working_state, write_negative_binomial_log_working_state,
         write_poisson_log_working_state, write_tweedie_log_working_state,
     };
@@ -1833,6 +1835,55 @@ mod tests {
             assert_relative_eq!(c_obs[i], -expected_w, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(d_obs[i], expected_w, epsilon = 1e-12, max_relative = 1e-12);
         }
+    }
+
+    #[test]
+    pub(crate) fn gamma_log_observed_curvature_dispatch_avoids_generic_overflow() {
+        let y = 1.25;
+        let phi = 0.5;
+        let prior_weight = 1.75;
+        let eta: f64 = 400.0;
+        let mu = eta.exp();
+        let jet = MixtureInverseLinkJet {
+            mu,
+            d1: mu,
+            d2: mu,
+            d3: mu,
+        };
+        let h4 = mu;
+
+        let generic = observed_weight_noncanonical(
+            y,
+            mu,
+            jet.d1,
+            jet.d2,
+            jet.d3,
+            h4,
+            variance_jet_for_weight_family(WeightFamily::Gamma, mu),
+            phi,
+            prior_weight,
+        );
+        assert!(
+            !generic.0.is_finite() || !generic.1.is_finite() || !generic.2.is_finite(),
+            "generic Gamma-log curvature should expose the overflow/cancellation-prone path at eta={eta}: {generic:?}"
+        );
+
+        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+            WeightFamily::Gamma,
+            WeightLink::Log,
+            eta,
+            y,
+            mu,
+            phi,
+            prior_weight,
+            jet,
+            h4,
+        );
+        let expected_w = prior_weight * y / (phi * mu);
+        assert!(w_obs.is_finite() && c_obs.is_finite() && d_obs.is_finite());
+        assert_relative_eq!(w_obs, expected_w, epsilon = 0.0, max_relative = 1e-12);
+        assert_relative_eq!(c_obs, -expected_w, epsilon = 0.0, max_relative = 1e-12);
+        assert_relative_eq!(d_obs, expected_w, epsilon = 0.0, max_relative = 1e-12);
     }
 
     #[test]
