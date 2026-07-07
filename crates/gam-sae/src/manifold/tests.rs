@@ -1957,6 +1957,77 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
     assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
 }
 
+/// F5 — the per-fit separation-barrier override (#1777) must isolate two
+/// genuinely CONCURRENT in-process fits: two threads that each build a term,
+/// set a DIFFERENT `μ_sep` via [`SaeFitConfig`], and hammer
+/// [`SaeManifoldTerm::separation_barrier_strength`] must each keep reading their
+/// OWN strength for the whole run, and the process-global barrier atomic must
+/// stay unset throughout (the field, not the global, is the source of truth).
+///
+/// This is the concurrency safety the process-global `set_sae_barrier_overrides`
+/// atomic could NOT provide (last-writer-wins across threads leaks the override
+/// between fits): a parallel candidate/rung/layer sweep is now safe because the
+/// strength lives on the term, so there is no shared cell to race on. The
+/// pre-#1777 global-atomic path would fail this test — thread B's `store` would
+/// be observed by thread A's `separation_barrier_strength` read.
+#[test]
+pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
+    // Neither thread touches a global setter, so the global fallback must stay
+    // unset for the whole run — assert the precondition up front.
+    assert!(
+        super::term::sae_separation_barrier_override().is_none(),
+        "test must not depend on a preset global barrier override"
+    );
+
+    // Two distinct per-fit strengths, one per worker. Chosen far apart so a leak
+    // between threads (either direction) is unambiguous.
+    let strengths = [0.125_f64, 7.5_f64];
+    let iters = 4000usize;
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = strengths
+            .iter()
+            .map(|&mu| {
+                scope.spawn(move || {
+                    // Each thread owns its term (a distinct concurrent "fit").
+                    let (mut term, _t, _rho) = small_two_atom_ibp_term();
+                    term.set_fit_config(SaeFitConfig {
+                        separation_barrier_strength_override: Some(mu),
+                        ibp_alpha_override: None,
+                    });
+                    // Hammer the barrier-strength read while the sibling thread
+                    // hammers its own with a different μ. The per-fit field is
+                    // the source of truth, so every read is this thread's μ and
+                    // the global stays unset — under the old global atomic the
+                    // sibling's `store` would be visible here.
+                    for _ in 0..iters {
+                        assert_eq!(
+                            term.separation_barrier_strength(),
+                            mu,
+                            "concurrent fit read a leaked barrier strength (expected {mu})"
+                        );
+                        assert!(
+                            super::term::sae_separation_barrier_override().is_none(),
+                            "a per-fit override must never write the process-global atomic"
+                        );
+                    }
+                    mu
+                })
+            })
+            .collect();
+        for (handle, &mu) in handles.into_iter().zip(strengths.iter()) {
+            assert_eq!(handle.join().unwrap(), mu);
+        }
+    });
+
+    // Post-condition: the global barrier atomic is still unset — no thread leaked
+    // its per-fit strength into the process-global cell.
+    assert!(
+        super::term::sae_separation_barrier_override().is_none(),
+        "the process-global barrier atomic must remain unset after concurrent per-fit fits"
+    );
+}
+
 /// #1777 GOAL 3 — the assignment mode is the accurately-named `ThresholdGate`
 /// (a hard-sigmoid gate, NOT the literature JumpReLU magnitude activation); the
 /// legacy `jumprelu` constructor remains a back-compat alias producing the SAME
