@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// Fixed log-λ pinned on the marginal/logslope null-space (polynomial-trend)
+/// smoothing parameters as a numerical-identifiability floor (gam#979). The
+/// builder's `DoublePenaltyNullspace` block is unit-Frobenius normalised, so
+/// `λ = e^0 = 1` places O(1) curvature on the trend direction — enough to hold
+/// the penalized-Hessian condition number bounded (cond ≤ ~λ_max ≈ 1e6 ≪ 1/√eps
+/// at the penalty-dominated operating point), while remaining far too mild to
+/// bias a trend the data already identifies. REML is barred from lowering it
+/// (degenerate `pinned_rho_slots` box), so the trend can never collapse back to
+/// the flat, deadlock-forming mode; statistical shrinkage still runs through the
+/// surface's primary wiggliness penalty.
+const NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA: f64 = 0.0;
+
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -671,6 +683,48 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         out
     };
+    // gam#979: pin the null-space identifiability floor on the marginal +
+    // logslope surfaces. `enable_surface_identifiability_double_penalty` makes
+    // the builder emit a Frobenius-normalized ZZᵀ ridge on each surface's
+    // polynomial-trend null space, but that ridge's REML-selected λ is driven
+    // low whenever the trend carries real signal (REML will not shrink a used
+    // direction) — leaving the trend flat, which re-forms the large-signal /
+    // tiny-curvature mode the inner joint-Newton deadlocks on (the spectral
+    // step drops it as near-null gauge #1082 while the certificate requires it
+    // #1449, so the solve neither progresses nor certifies and grinds to the
+    // cycle cap: the measured n=3000 hang). Pinning the null-space λ to a fixed
+    // conditioning floor — REML cannot lower it, via the same degenerate-box
+    // `pinned_rho_slots` path the #461 influence absorber uses — guarantees the
+    // trend direction always carries curvature, so cond(H_pen) stays bounded
+    // and no cond>1e10 gauge mode can form. This is a numerical-identifiability
+    // floor (a prior toward no effect), not a learned surface: the ZZᵀ block is
+    // unit-Frobenius normalised, so λ = e^0 = 1 gives the trend O(1) curvature —
+    // ample to hold cond ≤ ~λ_max ≈ 1e6 (≪ 1/√eps) at the penalty-dominated
+    // operating point, yet far too mild to bias a genuinely data-identified
+    // trend (whose own data curvature dominates 1). Statistical shrinkage of the
+    // trend beyond the floor still runs through the surface's primary
+    // wiggliness penalty.
+    {
+        use gam_terms::basis::PenaltySource;
+        let marginal_offset = time_penalties_len;
+        for info in marginal_design.penaltyinfo.iter() {
+            if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
+                pinned_rho_slots.push((
+                    marginal_offset + info.global_index,
+                    NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA,
+                ));
+            }
+        }
+        let logslope_offset = time_penalties_len + marginal_design.penalties.len();
+        for info in logslope_design.penaltyinfo.iter() {
+            if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
+                pinned_rho_slots.push((
+                    logslope_offset + info.global_index,
+                    NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA,
+                ));
+            }
+        }
+    }
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
