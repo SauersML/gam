@@ -26,6 +26,7 @@ use super::{SparseDictConfig, SparseDictFit};
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Route + sparse-code every row of `x`, processing the rows in minibatches of
 /// `config.minibatch` so the peak score working set is `minibatch × score_tile`
@@ -109,6 +110,7 @@ pub(super) fn run(
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
+        let epoch_start = Instant::now();
 
         // (c) decoder refresh: stream the current codes into each atom's pending
         // normal equations, then refresh only atoms whose evidence clears the
@@ -123,6 +125,7 @@ pub(super) fn run(
         );
         decoder_solve_stats = stats;
         pending_eq.clear_refreshed_atoms(&gate);
+        let refresh_secs = epoch_start.elapsed().as_secs_f64();
 
         // (d) unit-norm projection (identifies code scale) + stable sign.
         unit_norm_rows(&mut decoder);
@@ -159,9 +162,33 @@ pub(super) fn run(
             Some(&mut score_route_stats),
         )?;
 
+        let route_secs = epoch_start.elapsed().as_secs_f64() - refresh_secs;
+
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
         let ev = explained_variance(x, &codes, decoder.view());
         let improve = ev - prev_ev;
+
+        // Per-epoch heartbeat (info-per-minute): a hang in the refresh or route is
+        // visible immediately, and the CG certificate (giant component size, the
+        // a-priori κ bound, any typed non-convergence) is on the same line. Under
+        // `RUST_LOG=info` this is the phase-level progress trace for a long fit.
+        log::info!(
+            "[SAE epoch {}/{}] ev={:.6} improve={:.3e} revived={} refresh_s={:.2} \
+             route_s={:.2} max_component={} cg_columns={} cg_nonconverged={} \
+             cg_kappa_bound={:?} cg_relative_residual={:.3e}",
+            epochs_run,
+            config.max_epochs,
+            ev,
+            improve,
+            revived,
+            refresh_secs,
+            route_secs,
+            decoder_solve_stats.max_component_size,
+            decoder_solve_stats.cg_columns,
+            decoder_solve_stats.cg_nonconverged_columns,
+            decoder_solve_stats.cg_kappa_bound,
+            decoder_solve_stats.cg_relative_residual,
+        );
         // #1026 — do NOT declare convergence while dead atoms are still being
         // revived. Revival runs at most one atom per row per epoch, so a large
         // dictionary populates its tail over SEVERAL epochs; a one-epoch EV
@@ -444,6 +471,17 @@ pub struct DecoderSolveStats {
     /// Relative residual threshold used by CG, derived from the ridge/charge
     /// floor rather than an arbitrary numerical tolerance.
     pub cg_residual_stop: f64,
+    /// Decoder columns whose CG did NOT reach the charge floor before the
+    /// conditioning-derived iteration cap (or broke down on a non-SPD step).
+    /// Non-zero means at least one giant-scale co-firing block was too
+    /// ill-conditioned to solve to tolerance and fell back to the ridge-diagonal
+    /// best effort — a TYPED non-convergence, surfaced instead of a silent spin.
+    pub cg_nonconverged_columns: usize,
+    /// Largest a-priori Gershgorin condition-number bound over the CG-solved
+    /// components. This is the `κ̂` that sets the derived iteration cap
+    /// `⌈½√κ̂·ln(2√κ̂/ε)⌉` before any CG step runs, so an ill-conditioned block is
+    /// diagnosable up front (not only after the Lanczos estimate matures).
+    pub cg_kappa_bound: Option<f64>,
 }
 
 impl Default for DecoderSolveStats {
@@ -458,6 +496,8 @@ impl Default for DecoderSolveStats {
             cg_kappa_hat: None,
             cg_relative_residual: 0.0,
             cg_residual_stop: 0.0,
+            cg_nonconverged_columns: 0,
+            cg_kappa_bound: None,
         }
     }
 }
@@ -467,9 +507,16 @@ impl DecoderSolveStats {
         self.cg_columns += 1;
         self.cg_iterations += result.iterations;
         self.cg_relative_residual = self.cg_relative_residual.max(result.relative_residual);
+        if result.stop != CgStop::Converged {
+            self.cg_nonconverged_columns += 1;
+        }
         if let Some(kappa) = result.kappa_hat {
             self.cg_kappa_hat = Some(self.cg_kappa_hat.map_or(kappa, |old| old.max(kappa)));
         }
+    }
+
+    fn record_kappa_bound(&mut self, bound: f64) {
+        self.cg_kappa_bound = Some(self.cg_kappa_bound.map_or(bound, |old| old.max(bound)));
     }
 }
 
@@ -518,10 +565,18 @@ pub(super) fn routability_gate_decisions(
             } else {
                 0.0
             };
+            // The routability margin is the fraction of the mean amplitude that
+            // survives the charge floor. A starved atom (mean_amplitude below the
+            // floor) has NO surviving margin: clamp at zero so the quantity is
+            // `>= 0` by construction and can never enter a downstream expression as
+            // a negative shrink. Semantically identical to the previous negative /
+            // NEG_INFINITY value — a non-positive margin already forces
+            // `threshold = +INF` below, deferring the atom — but it removes the
+            // sign hazard entirely: the gate can defer or refresh, never negate.
             let margin = if mean_amplitude > 0.0 {
-                1.0 - charge_floor / mean_amplitude
+                (1.0 - charge_floor / mean_amplitude).max(0.0)
             } else {
-                f64::NEG_INFINITY
+                0.0
             };
             let standard_error = if residual_scale > 0.0 && mean_amplitude > 0.0 {
                 residual_scale / (mean_amplitude * n.sqrt())
@@ -783,8 +838,8 @@ pub(super) fn solve_decoder(
     log::debug!(
         "[SAE percolation] K={k} mean_degree={:.4} giant_fraction={:.4} \
          components={} max_component={} direct_threshold={direct_threshold} \
-         cg_columns={} cg_iterations={} cg_kappa_hat={:?} \
-         cg_relative_residual={:.3e} cg_residual_stop={:.3e}",
+         cg_columns={} cg_iterations={} cg_kappa_hat={:?} cg_kappa_bound={:?} \
+         cg_nonconverged_columns={} cg_relative_residual={:.3e} cg_residual_stop={:.3e}",
         stats.mean_cofiring_degree,
         stats.giant_component_fraction,
         stats.component_count,
@@ -792,6 +847,8 @@ pub(super) fn solve_decoder(
         stats.cg_columns,
         stats.cg_iterations,
         stats.cg_kappa_hat,
+        stats.cg_kappa_bound,
+        stats.cg_nonconverged_columns,
         stats.cg_relative_residual,
         stats.cg_residual_stop,
     );
@@ -862,9 +919,47 @@ fn solve_component(
         y
     };
     let charge_floor = ridge.max(DEAD_DENOM);
-    // CG converges in <= m steps in exact arithmetic; the extra pass allowance is
-    // only for f64 round-off on ill-conditioned sparse Grams.
-    let cap = m.saturating_mul(2).saturating_add(16);
+
+    // A-priori spectral bounds of the component operator M = A_sub + ρI via
+    // Gershgorin discs over the stored (in-component) co-firing entries. M is SPD
+    // with M ⪰ ρI, so the true smallest eigenvalue is at least the regularisation
+    // floor; Gershgorin caps the largest. Their ratio is a rigorous condition
+    // bound κ̂ ≥ κ(M) that sets a DERIVED iteration cap, so CG cannot spin
+    // unbounded on a near-singular giant block (near-duplicate atoms in an
+    // overcomplete dictionary over a low-dim post-peel space).
+    let mut lambda_max_bound = 0.0f64;
+    let mut lambda_min_bound = f64::INFINITY;
+    for &a in comp {
+        let mut off_abs = 0.0f64;
+        for &(nb, val) in &neigh[a] {
+            if local.contains_key(&(nb as usize)) {
+                off_abs += val.abs();
+            }
+        }
+        let center = eq.diag[a] + ridge;
+        lambda_max_bound = lambda_max_bound.max(center + off_abs);
+        lambda_min_bound = lambda_min_bound.min(center - off_abs);
+    }
+    let lambda_min = lambda_min_bound.max(ridge).max(DEAD_DENOM);
+    let kappa_bound = (lambda_max_bound / lambda_min).max(1.0);
+    stats.record_kappa_bound(kappa_bound);
+    let root = kappa_bound.sqrt();
+    // ⌈½√κ·ln(2√κ/ε)⌉: CG's Chebyshev bound on the steps to reach relative 2-norm
+    // residual ε = charge_floor. The √κ inside the log is the A-norm→2-norm
+    // residual correction, making this a genuine UPPER bound on the iterations
+    // needed — a well-conditioned block still converges well inside it (no early
+    // cut, since κ̂ ≥ κ), while a giant near-singular block is bounded instead of
+    // spinning. Exact CG also terminates in ≤ m steps; keep the historical +16
+    // round-off allowance and never exceed that finite-termination bound.
+    let chebyshev = 0.5 * root * (2.0 * root / charge_floor).ln();
+    let finite = m.saturating_mul(2).saturating_add(16);
+    let round_off_grace = 16usize;
+    let cap = (chebyshev.max(0.0).ceil() as usize)
+        .saturating_add(round_off_grace)
+        .min(finite)
+        .max(1);
+
+    let mut component_failed = false;
     for c in 0..p {
         let mut bvec = vec![0.0f64; m];
         let mut bnorm2 = 0.0f64;
@@ -872,21 +967,79 @@ fn solve_component(
             bvec[i] = eq.b[[a, c]];
             bnorm2 += bvec[i] * bvec[i];
         }
-        let bnorm = bnorm2.sqrt();
-        let mut xvec = vec![0.0f64; m];
-        if bnorm <= DEAD_DENOM {
+        if bnorm2.sqrt() <= DEAD_DENOM {
             for &a in comp {
                 decoder[[a, c]] = 0.0;
             }
             continue;
         }
+        if component_failed {
+            // A prior column already proved this block un-solvable to tolerance;
+            // do not grind CG on every remaining column — take the ridge-diagonal
+            // best effort (exact if the block were decoupled) so the epoch still
+            // makes progress rather than repeating the same non-converging spin.
+            write_diagonal_column(decoder, eq, ridge, comp, c);
+            continue;
+        }
         let result = cg_solve(&matvec, &bvec, charge_floor, cap);
-        xvec = result.x.clone();
         stats.record_cg(&result);
-        for (i, &a) in comp.iter().enumerate() {
-            decoder[[a, c]] = xvec[i] as f32;
+        if result.stop == CgStop::Converged {
+            for (i, &a) in comp.iter().enumerate() {
+                decoder[[a, c]] = result.x[i] as f32;
+            }
+        } else {
+            // TYPED non-convergence: the derived cap was hit or CG broke down on a
+            // non-SPD step for a near-singular block. Surface it loudly (once per
+            // component) and fall back to the ridge-diagonal solve for this and all
+            // remaining columns instead of a silent unbounded spin.
+            component_failed = true;
+            log::warn!(
+                "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
+                 rel_residual={:.3e} charge_floor={:.3e} kappa_bound={:.3e} cap={cap}; \
+                 falling back to ridge-diagonal for remaining columns",
+                result.stop,
+                result.iterations,
+                result.relative_residual,
+                charge_floor,
+                kappa_bound,
+            );
+            write_diagonal_column(decoder, eq, ridge, comp, c);
         }
     }
+}
+
+/// Ridge-diagonal best-effort solve of one decoder column over a component: the
+/// exact solve if the block were decoupled (`d_a = b_a / (A_aa + ρ)`), used as
+/// the honest fallback once matrix-free CG is known not to reach the charge floor
+/// on an ill-conditioned block.
+fn write_diagonal_column(
+    decoder: &mut Array2<f32>,
+    eq: &DecoderNormalEq,
+    ridge: f64,
+    comp: &[usize],
+    c: usize,
+) {
+    for &a in comp {
+        let denom = eq.diag[a] + ridge;
+        decoder[[a, c]] = if denom > DEAD_DENOM {
+            (eq.b[[a, c]] / denom) as f32
+        } else {
+            0.0
+        };
+    }
+}
+
+/// Why a CG solve returned. Only [`CgStop::Converged`] means the column reached
+/// the charge floor; the others are TYPED non-convergence the caller surfaces and
+/// falls back on rather than spinning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgStop {
+    /// Relative normal-equation residual fell to/below the charge floor.
+    Converged,
+    /// A non-SPD / non-finite curvature step (`pᵀAp ≤ 0`) or a non-finite `β`.
+    Breakdown,
+    /// The conditioning-derived iteration cap was hit before the charge floor.
+    CapReached,
 }
 
 struct CgSolveResult {
@@ -894,6 +1047,7 @@ struct CgSolveResult {
     iterations: usize,
     relative_residual: f64,
     kappa_hat: Option<f64>,
+    stop: CgStop,
 }
 
 fn cg_solve<F>(matvec: &F, b: &[f64], charge_floor: f64, cap: usize) -> CgSolveResult
@@ -908,6 +1062,7 @@ where
             iterations: 0,
             relative_residual: 0.0,
             kappa_hat: None,
+            stop: CgStop::Converged,
         };
     }
 
@@ -931,6 +1086,7 @@ where
                 iterations: iter,
                 relative_residual,
                 kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+                stop: CgStop::Breakdown,
             };
         }
         let alpha = rs_old / pap;
@@ -947,6 +1103,7 @@ where
                 iterations: iter + 1,
                 relative_residual,
                 kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+                stop: CgStop::Converged,
             };
         }
         let beta = rs_new / rs_old;
@@ -956,6 +1113,7 @@ where
                 iterations: iter + 1,
                 relative_residual,
                 kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+                stop: CgStop::Breakdown,
             };
         }
         betas.push(beta);
@@ -970,6 +1128,7 @@ where
         iterations: cap,
         relative_residual,
         kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
+        stop: CgStop::CapReached,
     }
 }
 
@@ -1162,7 +1321,7 @@ fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<
 #[cfg(test)]
 mod exact_solve_tests {
     use super::{
-        DecoderNormalEq, cg_solve, explained_variance, route_and_code_all, solve_decoder,
+        CgStop, DecoderNormalEq, cg_solve, explained_variance, route_and_code_all, solve_decoder,
         solve_decoder_with_routability_gate,
     };
     use crate::sparse_dict::codes::SparseCode;
@@ -1592,6 +1751,96 @@ mod exact_solve_tests {
         assert!(
             (got - want).abs() <= 1.0e-8 * want,
             "Lanczos κ̂ {got} must match true condition {want}"
+        );
+    }
+
+    #[test]
+    fn cg_reports_cap_reached_when_iterations_exhausted() {
+        // A spread SPD spectrum needs several CG steps; a cap of 1 must return the
+        // TYPED `CapReached` (not a silent partial), with iterations == cap and a
+        // finite iterate — the signal the refresh uses to fall back instead of
+        // spinning.
+        let eigenvalues = [1.0f64, 5.0, 25.0, 125.0, 625.0];
+        let b = vec![1.0f64; eigenvalues.len()];
+        let matvec = |x: &[f64]| -> Vec<f64> {
+            eigenvalues.iter().zip(x.iter()).map(|(&l, &xi)| l * xi).collect()
+        };
+        let result = cg_solve(&matvec, &b, 1.0e-12, 1);
+        assert_eq!(result.stop, CgStop::CapReached);
+        assert_eq!(result.iterations, 1);
+        assert!(result.x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn cg_reports_breakdown_on_indefinite_operator() {
+        // A non-SPD operator (a negative eigenvalue) makes some pᵀAp ≤ 0; CG must
+        // return a TYPED `Breakdown` rather than iterate on negative curvature.
+        let eigenvalues = [1.0f64, -3.0, 2.0];
+        let b = vec![1.0f64, 1.0, 1.0];
+        let matvec = |x: &[f64]| -> Vec<f64> {
+            eigenvalues.iter().zip(x.iter()).map(|(&l, &xi)| l * xi).collect()
+        };
+        let result = cg_solve(&matvec, &b, 1.0e-12, 64);
+        assert_eq!(result.stop, CgStop::Breakdown);
+        assert!(result.iterations <= 64);
+        assert!(result.x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn near_singular_giant_component_terminates_with_typed_failure() {
+        // A path-graph (chain) co-firing Gram with coupling 0.5 is the symmetric
+        // tridiagonal Toeplitz `tridiag(0.5, 1, 0.5)`, whose eigenvalues fill
+        // `(0, 2)` densely — the smallest is `≈ ½(π/(k+1))²`, so at k=200 the
+        // condition number is `~10⁴`. A GENERIC right-hand side excites the whole
+        // spread spectrum (the worst case for CG), so reaching the 1e-9 charge
+        // floor needs `~½√κ·ln(2/ε) ≈ 1.3e3` iterations — far beyond the derived
+        // cap `≤ 2m+16 = 416`. The solve must therefore (i) bound the iterations
+        // (no unbounded spin), (ii) report the large a-priori κ bound, (iii)
+        // register a TYPED non-convergence, and (iv) leave a FINITE decoder via the
+        // ridge-diagonal fallback.
+        let k = 200usize;
+        let p = 2usize;
+        let diag = vec![1.0f64; k];
+        let mut off = HashMap::new();
+        for a in 0..(k - 1) {
+            off.insert((a as u32, (a + 1) as u32), 0.5);
+        }
+        let mut b = Array2::<f64>::zeros((k, p));
+        for i in 0..k {
+            // Generic RHS spanning the whole spectrum (not an eigenvector, so CG
+            // cannot shortcut on a clustered spectrum).
+            b[[i, 0]] = ((i * 7 + 3) % 11) as f64 - 5.0;
+            b[[i, 1]] = ((i * 5 + 1) % 13) as f64 - 6.0;
+        }
+        let eq = DecoderNormalEq {
+            diag,
+            b,
+            off,
+            firings: vec![4; k],
+            amplitude_sum: vec![4.0; k],
+        };
+        let mut decoder = Array2::<f32>::zeros((k, p));
+        let ridge = 1.0e-9f64;
+        let stats = solve_decoder(&mut decoder, &eq, ridge);
+
+        assert_eq!(stats.max_component_size, k, "path graph is one giant component");
+        let kappa_bound = stats.cg_kappa_bound.expect("a-priori kappa bound recorded");
+        assert!(
+            kappa_bound > 1.0e6,
+            "near-singular block must report a large a-priori kappa bound, got {kappa_bound}"
+        );
+        assert!(
+            stats.cg_nonconverged_columns >= 1,
+            "an under-resolved column must be a TYPED non-convergence, not a silent spin"
+        );
+        assert!(
+            stats.cg_iterations <= (2 * k + 16) * p,
+            "iterations must be bounded by the derived cap, got {}",
+            stats.cg_iterations
+        );
+        assert!(
+            decoder.iter().all(|v| v.is_finite()),
+            "the ridge-diagonal fallback must leave a finite decoder"
         );
     }
 
