@@ -193,12 +193,20 @@ fn bms_matern_fit_is_invariant_to_worker_pool_size() {
     let (data, spec) = build(n, centers);
 
     // Wide pool: as many workers as the host gives the global pool (the status
-    // quo). Narrow pool: a single NUMA-node-sized slice — the #1045 candidate.
-    let wide = rayon::current_num_threads().max(2);
-    let narrow = 8usize.min(wide);
+    // quo), floored at 4 so the gate always has room for a strictly-narrower
+    // pool even on the small (4-vCPU) CI runners. Narrow pool: the #1045
+    // candidate — a shrunk worker pool. Both pools are ≥2 workers so both fits
+    // take the *parallel* row-reduction path (a `narrow == 1` pool would instead
+    // fork onto the serial fold, testing serial-vs-parallel rather than the
+    // pool-size invariance #1045 actually needs). `wide` is a rayon worker count,
+    // not a core count, so building it does not require that many physical cores;
+    // `narrow < wide` therefore holds on every host with ≥1 core and the
+    // invariance assertions below always run.
+    let wide = rayon::current_num_threads().max(4);
+    let narrow = 2usize;
     assert!(
         narrow < wide,
-        "host must expose >{narrow} threads to exercise the invariance gate (got {wide})"
+        "wide worker pool ({wide}) must exceed the narrow pool ({narrow}) to exercise the invariance gate"
     );
 
     let a = fit_on_pool(wide, &data, &spec);

@@ -257,6 +257,7 @@ fn freeze_smooth_basis_from_metadata(
                 raw_penalty_normalization_scales,
                 fused_penalty_normalization_scale,
                 constraint_transform,
+                sigma_coord,
             },
         ) => {
             s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -278,6 +279,7 @@ fn freeze_smooth_basis_from_metadata(
                 penalty_normalization_scales: penalty_normalization_scales.clone(),
                 raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
                 fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
+                sigma_coord: *sigma_coord,
             });
             // #532 pattern: freeze the composed `z · z_parametric` so the
             // rebuild replays the fit-time realized transform verbatim.

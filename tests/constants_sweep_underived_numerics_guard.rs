@@ -43,6 +43,7 @@ const TARGET_FILES: &[&str] = &[
     "crates/gam-sae/src/dual_certificate.rs",
     "crates/gam-sae/src/front_door.rs",
     "crates/gam-sae/src/null_battery.rs",
+    "crates/gam-sae/src/coactivation_conditionality.rs",
     "crates/gam-sae/examples/scale_k.rs",
 ];
 

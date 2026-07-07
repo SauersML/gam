@@ -2539,14 +2539,19 @@ fn build_birth_decoders(
     let assignments = term.assignment.assignments();
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
     let max_rank = params.max_births.min(p.saturating_sub(1));
-    let model = match StructuredResidualModel::fit(ResidualFactorInput {
+    // Propagate a genuine fit failure instead of degrading to "no births".
+    // The evidence ladder already includes the rank-0 rung, so a true "no
+    // structure to harvest" outcome returns `Ok` (an empty/zero-rank factor);
+    // an `Err` here signals a numerical/degenerate failure (non-finite inputs,
+    // an empty ladder, a broken alternation), and swallowing it into
+    // `Ok(Vec::new())` would silently paper over that non-convergence
+    // (the #2069/#2070 accept-on-failure genus). Surface it.
+    let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals,
         activity: activity.view(),
         max_factor_rank: max_rank,
-    }) {
-        Ok(m) => m,
-        Err(_) => return Ok(Vec::new()),
-    };
+    })
+    .map_err(|e| format!("build_birth_decoders: structured-residual fit failed: {e}"))?;
     let factor = model.factor();
     let r = factor.ncols();
     let m = term.atoms[0].basis_size();

@@ -48,7 +48,6 @@ from typing import Any, Callable, Literal, Mapping, cast
 
 import numpy as np
 import torch
-import torch.nn.functional as F_torch
 from torch import nn
 
 from .._binding import rust_module
@@ -65,6 +64,7 @@ from .penalties import (
     MonotonicityPenalty,
     ibp_map,
     jumprelu_bounded_gate,
+    topk_activation,
 )
 
 
@@ -776,8 +776,13 @@ class _SparsityLayer(nn.Module):
         return assignments, logits
 
     def _topk_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        # Thin wrapper over the Rust source of truth
+        # (`gam_sae::assignment::topk_activation_row_value_grad`): the per-atom
+        # independent, non-negative activation `τ·softplus(logits/τ)` with the
+        # Rust-defined diagonal derivative `σ(logits/τ)` on the backward. The hard
+        # top-k mask stays on the tape here (see `_topk_gate` / `_topk_mask`).
         tau = max(float(self.tau.item()), 1e-6)
-        return tau * F_torch.softplus(logits / tau)
+        return topk_activation(logits, tau)
 
     def _topk_mask(self, scores: torch.Tensor) -> torch.Tensor:
         k = min(self.target_k, scores.shape[-1])
