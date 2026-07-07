@@ -1,5 +1,6 @@
 //! Generic testing utilities.
 
+pub mod calibration;
 pub mod cli_harness;
 pub mod fd_checker;
 pub mod reference;
