@@ -1,0 +1,69 @@
+{
+  "K": 32000,
+  "P": 2048,
+  "active": 32,
+  "N_tokens": 200000,
+  "seed": 0,
+  "flat_active_recon_ev": 0.773487981883892,
+  "frac_sweep": [
+    0.0005,
+    0.0002,
+    0.0001,
+    5e-05,
+    2e-05
+  ],
+  "headline_frac": 0.0001,
+  "n_calendar_cycle_groups": 0,
+  "calendar": [],
+  "sweep_brief": [
+    {
+      "frac": 0.0005,
+      "n_groups": 2,
+      "frac_firings_secant": 0.0035690625,
+      "manifold_maxfidelity_ev": 0.7712597620489932,
+      "recode_distortion_ev_drop": 0.002228219834898848,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.125
+    },
+    {
+      "frac": 0.0002,
+      "n_groups": 8,
+      "frac_firings_secant": 0.0123453125,
+      "manifold_maxfidelity_ev": 0.7431248037500138,
+      "recode_distortion_ev_drop": 0.030363178133878233,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.10810810810810811
+    },
+    {
+      "frac": 0.0001,
+      "n_groups": 29,
+      "frac_firings_secant": 0.03018125,
+      "manifold_maxfidelity_ev": 0.7092729635595849,
+      "recode_distortion_ev_drop": 0.0642150183243071,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.08356545961002786
+    },
+    {
+      "frac": 5e-05,
+      "n_groups": 46,
+      "frac_firings_secant": 0.0158165625,
+      "manifold_maxfidelity_ev": 0.7580434188700509,
+      "recode_distortion_ev_drop": 0.015444563013841117,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.01935483870967742
+    },
+    {
+      "frac": 2e-05,
+      "n_groups": 228,
+      "frac_firings_secant": 0.02265875,
+      "manifold_maxfidelity_ev": 0.7590806584035172,
+      "recode_distortion_ev_drop": 0.014407323480374767,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.004251700680272109
+    }
+  ],
+  "wall_s": 535.9802353382111,
+  "decoder": "/projects/standard/hsiehph/sauer354/msae_l17/t1_out/decoder_K32000.npy",
+  "tier0": "/projects/standard/hsiehph/sauer354/msae_l17/tier0_recentered.json",
+  "data": "/projects/standard/hsiehph/sauer354/msae_l17/L17_train.f32.npy"
+}
