@@ -633,6 +633,128 @@ fn wide_p_outer_reml_terminates_k3_heavy_2080() {
     assert!(ev.is_finite() && ev > 0.15);
 }
 
+/// #2080 ENTANGLED two-circle target — two equal-variance circles on OVERLAPPING
+/// (dense, all-column) 2-frames, unlike `two_circle_wide_target`'s even/odd
+/// DISJOINT split. Equal variance in a shared 4-D signal subspace makes the
+/// pairing rotation-AMBIGUOUS to PCA (any orthonormal rotation of the 4 leading
+/// PCs has the same variance), so the PCA-residual chart seed hands both atoms a
+/// MIXTURE of the two circles → they fit the same mixed subspace → `μ̂ = 1.0`
+/// co-collapse. Fourth-order (kurtosis) independence — the joint-Jacobi ISA seed —
+/// is what resolves the rotation. This is the minimal faithful repro of the
+/// issue's entangled product-of-circles co-collapse.
+fn entangled_two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
+    let mut fa = Array2::<f64>::zeros((2, p));
+    let mut fb = Array2::<f64>::zeros((2, p));
+    for j in 0..p {
+        fa[[0, j]] = deterministic_circle_noise(j, 0);
+        fa[[1, j]] = deterministic_circle_noise(j, 1);
+        fb[[0, j]] = deterministic_circle_noise(j, 2);
+        fb[[1, j]] = deterministic_circle_noise(j, 3);
+    }
+    for f in [&mut fa, &mut fb] {
+        for r in 0..2 {
+            let nrm = (0..p).map(|j| f[[r, j]] * f[[r, j]]).sum::<f64>().sqrt();
+            for j in 0..p {
+                f[[r, j]] /= nrm.max(1.0e-300);
+            }
+        }
+    }
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
+        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        let (ca, sa) = (ta.cos(), ta.sin());
+        let (cb, sb) = (tb.cos(), tb.sin());
+        for j in 0..p {
+            z[[row, j]] = ca * fa[[0, j]]
+                + sa * fa[[1, j]]
+                + cb * fb[[0, j]]
+                + sb * fb[[1, j]]
+                + sigma * deterministic_circle_noise(row, j + 7);
+        }
+    }
+    for j in 0..p {
+        let mut mean = 0.0_f64;
+        for row in 0..n {
+            mean += z[[row, j]];
+        }
+        mean /= n as f64;
+        let mut var = 0.0_f64;
+        for row in 0..n {
+            let d = z[[row, j]] - mean;
+            var += d * d;
+        }
+        let sd = (var / n as f64).sqrt().max(1.0e-12);
+        for row in 0..n {
+            z[[row, j]] = (z[[row, j]] - mean) / sd;
+        }
+    }
+    z
+}
+
+/// #2080/#2023 — the ENTANGLED co-collapse regression (fails-before / passes-after
+/// the joint-Jacobi ISA chart seed). Matched K=2 on the overlapping-frame two-circle
+/// target: with the PCA-residual seed both atoms co-collapse onto the same mixed
+/// subspace (the outer solver then thrashes infeasible probes to a `Fatal` abort);
+/// with the independence-separating ISA seed the two circles land on DISTINCT atoms.
+/// Collapse is EV-INVISIBLE, so a positive EV alone is not enough — the load-bearing
+/// assertion is that BOTH atoms carry material decoder norm (a weakest/strongest
+/// ratio well above the ~0.13 collapse regime and inside the ~0.42 healthy regime
+/// measured on this shape).
+#[test]
+fn entangled_two_circle_outer_reml_separates_2080() {
+    let n = 240usize;
+    let p = 96usize;
+    let k = 2usize;
+    let harmonics = 2usize;
+    let z = entangled_two_circle_wide_target(n, p, 0.03);
+    let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, harmonics);
+    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+        .unwrap();
+    let seed = init_rho.to_flat();
+    let n_params = seed.len();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
+    OuterProblem::new(n_params)
+        .with_initial_rho(seed)
+        .with_max_iter(4)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .run(&mut objective, "SAE manifold entangled two-circle")
+        .expect("#2080 entangled two-circle outer REML fit must terminate, not abort");
+    let fitted = objective.into_fitted();
+    let ev = global_ev(z.view(), fitted.term.fitted().view());
+    let mut norms = vec![0.0_f64; k];
+    for (i, atom) in fitted.term.atoms.iter().enumerate() {
+        norms[i] = atom
+            .decoder_coefficients
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+    }
+    let hi = norms.iter().copied().fold(0.0_f64, f64::max);
+    let lo = norms.iter().copied().fold(f64::INFINITY, f64::min);
+    let ratio = lo / hi.max(1.0e-300);
+    eprintln!("[#2080 entangled] ev={ev:.4}, decoder_norms={norms:?}, ratio={ratio:.3}");
+    assert!(
+        ev.is_finite() && ev > 0.20,
+        "entangled K=2 fit must recover a materially positive EV (got {ev:.4})"
+    );
+    assert!(hi > 0.0, "at least one atom must carry decoder norm");
+    assert!(
+        ratio > 0.30,
+        "both entangled circles must be recovered on DISTINCT atoms (no co-collapse); \
+         norms={norms:?} ratio={ratio:.3} — a ratio near the ~0.13 collapse regime is the \
+         μ̂ = 1.0 shared-subspace collapse the joint-Jacobi ISA seed must prevent"
+    );
+}
+
 /// gamfit#2138 (fit-robustness half) — the curved (periodic) atom's inner
 /// Newton/arrow-Schur solve must CONVERGE on a small (`n = 35`) fold at high
 /// working rank (`m = 9`, all harmonics genuinely excited, so no rank reduction
