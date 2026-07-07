@@ -748,6 +748,27 @@ pub struct TorusIsometryFlowReparameterization {
 /// Speed-uniformity defect above which the in-loop unit-speed retraction fires.
 /// Below it the chart is already ~arc-length and re-gauging is skipped (keeps the
 /// per-refresh cost negligible and makes the retraction idempotent at a boundary).
+///
+/// PRICED (#2071): the defect is a coefficient of variation
+/// `stddev(âÎ³'â)/mean(âÎ³'â)` â dimensionless, `0` âº exactly unit-speed â so
+/// this is a numerical-idempotency FLOOR, not a modeling knob. The retraction is
+/// objective-invariant for data-fit and intrinsic smoothness (image-frozen,
+/// `BáµSB` transported); ONLY the ARD coordinate prior re-evaluates at the
+/// canonical `tÌ`, so the threshold governs a single question: is the chart far
+/// enough from arc-length that re-gauging would move the prior's evaluation point
+/// measurably? The reparameterization is built by integrating the sampled speed
+/// field, so it cannot itself drive the CV below its own quadrature/interpolation
+/// resolution â many orders above machine eps (`~2e-16`) yet far below any
+/// non-uniformity that perturbs the ARD prior. `1e-6` sits in that gap (same
+/// numerical genus as the sibling [`CHART_RECOMPOSITION_REL_TOL`] `1e-9`
+/// image-scale honesty tolerance, loosened to CV scale because the defect is a
+/// first-derivative statistic): below it the retraction is a numerical no-op (its
+/// own residual-CV floor), above it there is genuine, correctable non-uniformity.
+/// What breaks at 10Ã: at `1e-5` a chart with a real, removable `~1e-5` speed CV
+/// is skipped, so the ARD coordinate prior is evaluated on a slightly
+/// non-arc-length gauge; at `1e-7` the early-out almost never fires and the
+/// reparam is attempted on charts already uniform to its own resolution (a
+/// wasted, idempotent re-gauge each refresh boundary).
 pub const UNIT_SPEED_INLOOP_DEFECT_TOL: f64 = 1.0e-6;
 
 /// Coefficient of variation `stddev(‖γ'‖)/mean(‖γ'‖)` of the decoder-curve speed
