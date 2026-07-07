@@ -529,7 +529,19 @@ pub fn set_ibp_alpha_override(alpha: f64) {
     IBP_ALPHA_OVERRIDE_BITS.store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Per-row latent assignment state.
+/// Per-row latent assignment state — the DENSE-CERTIFICATION / debug-and-research
+/// lane state only (#985 / E1), NOT the production route.
+///
+/// This is the dense `N×K` routing representation. The production SAE path is the
+/// sparse-code lane ([`crate::sparse_dict`]), whose per-row state is fixed-width
+/// `(indices, codes)` and never materializes an `N×K` assignment; large-K public
+/// fits are routed there by the front door ([`crate::front_door::admit_sae_fit`] /
+/// [`crate::front_door::admit_dense_certification`], #14). The dense manifold
+/// engine that owns this type is reached only for the small-`K` certification lane
+/// (`K ≤ P`) and for overcomplete research fits at small `N`. A source-guard test
+/// (`sparse_lane_constructs_no_dense_assignment`) locks the invariant that the
+/// sparse lane constructs zero `SaeAssignment`s; `#[doc(hidden)]` keeps this dense
+/// state off the public API surface to match the demotion.
 ///
 /// The stored assignment parameter is `logits`; non-negative assignments are
 /// derived by row-wise softmax, independent IBP-MAP sigmoid active indicators,
@@ -538,6 +550,7 @@ pub fn set_ibp_alpha_override(alpha: f64) {
 /// first `K - 1` logits (`0` coordinates for `K = 1`). Gate-style modes keep
 /// all `K` logits as identifiable scalar parameters. `coords[k]` holds
 /// `t_{.,k}` for atom `k`.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct SaeAssignment {
     pub logits: Array2<f64>,

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run -p gam-sae --example qwen_l18_ceiling -- \
-//!   <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--out-dir DIR]
+//!   <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--positions positions.npy] [--out-dir DIR]
 //! ```
 
 use faer::Side;
@@ -58,6 +58,7 @@ struct Args {
     outer_iters: usize,
     inner_iters: usize,
     raw_ok: bool,
+    positions: Option<PathBuf>,
     out_dir: PathBuf,
 }
 
@@ -68,10 +69,17 @@ impl Args {
         let mut path = None;
         let mut positional = Vec::new();
         let mut raw_ok = false;
+        let mut positions = None;
         let mut out_dir = PathBuf::from(".");
         while let Some(arg) = raw.next() {
             match arg.as_str() {
                 "--raw-ok" => raw_ok = true,
+                "--positions" => {
+                    let Some(value) = raw.next() else {
+                        return Err("--positions requires a path to a token-position .npy".to_string());
+                    };
+                    positions = Some(PathBuf::from(value));
+                }
                 "--out-dir" => {
                     let Some(value) = raw.next() else {
                         return Err("--out-dir requires a directory".to_string());
@@ -85,12 +93,12 @@ impl Args {
         }
         let Some(path) = path else {
             return Err(format!(
-                "usage: {program} <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--out-dir DIR]"
+                "usage: {program} <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--positions positions.npy] [--out-dir DIR]"
             ));
         };
         if positional.len() > 4 {
             return Err(format!(
-                "usage: {program} <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--out-dir DIR]"
+                "usage: {program} <post_peel_pca.npy> [max_rows] [harmonics] [outer_iters] [inner_iters] [--raw-ok] [--positions positions.npy] [--out-dir DIR]"
             ));
         }
         Ok(Self {
@@ -116,6 +124,7 @@ impl Args {
                 "inner_iters",
             )?,
             raw_ok,
+            positions,
             out_dir,
         })
     }
@@ -170,17 +179,23 @@ fn run(args: &Args) -> Result<(), String> {
     let (n_full, p_raw, raw) = read_npy_subsample_f64(&args.path, args.max_rows)?;
     let basis_size = 1 + 2 * args.harmonics;
     let top_sink_ev;
+    let pos0_absorbed;
+    let peel_mode: &'static str;
     let pre_report;
     let post_peel_region;
     let post_report;
+    let post_peel_status: &'static str;
     if post_peel_input {
         top_sink_ev = f64::NAN;
+        pos0_absorbed = f64::NAN;
+        peel_mode = "upstream_post_peel";
+        post_peel_status = "post_peel";
         pre_report = None;
         post_peel_region = raw;
         post_report = fit_ceiling_region(
             "post_peel",
             post_peel_region.view(),
-            "post_peel",
+            post_peel_status,
             args.harmonics,
             args.outer_iters,
             args.inner_iters,
@@ -188,26 +203,63 @@ fn run(args: &Args) -> Result<(), String> {
     } else {
         if raw.ncols() < 9 {
             return Err(format!(
-                "raw --raw-ok sink-peel contract requires at least 9 residual dimensions, got {}",
+                "raw sink-peel contract requires at least 9 residual dimensions, got {}",
                 raw.ncols()
             ));
         }
+        // Pre-peel reduced region (top-9 PCs of the raw residual, sink included):
+        // this is the unpeeled reference the peeled region must dominate.
         let scores = thin_svd_scores(raw.view(), 9)?;
-        let pre_peel_region = scores.clone();
-        post_peel_region = scores.slice(s![.., 1..9]).to_owned();
         top_sink_ev = score_ev(scores.view(), 0)?;
         pre_report = Some(fit_ceiling_region(
             "pre_peel",
-            pre_peel_region.view(),
+            scores.view(),
             "raw",
             args.harmonics,
             args.outer_iters,
             args.inner_iters,
         )?);
+
+        // Peel to the 8-D semantic region. The NATIVE path is a position-0
+        // causal peel: regress out the pos-0 indicator (the attention-sink
+        // anchor) and keep the top-8 PCs of the residual. This is layer/model
+        // agnostic — it removes the sink direction wherever it lives, not merely
+        // whichever direction happens to carry the most variance. The variance
+        // score-0 self-peel (drop PC0) is retained only as an explicit escape
+        // hatch, and is valid ONLY when the sink coincides with the top PC
+        // (true for Qwen3-8B L18, where cos(sink, PC0) ≈ 1, but not in general).
+        if let Some(pos_path) = args.positions.as_ref() {
+            let positions = read_npy_positions_subsample(pos_path, args.max_rows)?;
+            if positions.len() != raw.nrows() {
+                return Err(format!(
+                    "positions length {} does not match subsampled residual rows {}; the \
+                     positions .npy must be row-aligned with the activation .npy (same N, same \
+                     stride)",
+                    positions.len(),
+                    raw.nrows()
+                ));
+            }
+            let (peeled8, absorbed) = pos0_peel_reduce(raw.view(), &positions, 8)?;
+            post_peel_region = peeled8;
+            pos0_absorbed = absorbed;
+            peel_mode = "pos0_causal";
+            post_peel_status = "pos0_peel";
+        } else {
+            println!(
+                "[warn] no --positions supplied: falling back to the variance score-0 self-peel \
+                 (drop top PC). This assumes the attention sink is the top principal component \
+                 and is valid ONLY for layers/models where that holds (e.g. Qwen3-8B L18). Pass \
+                 --positions <token_positions.npy> for the native, layer-agnostic pos-0 causal peel."
+            );
+            post_peel_region = scores.slice(s![.., 1..9]).to_owned();
+            pos0_absorbed = f64::NAN;
+            peel_mode = "variance_score0";
+            post_peel_status = "post_peel";
+        }
         post_report = fit_ceiling_region(
             "post_peel",
             post_peel_region.view(),
-            "post_peel",
+            post_peel_status,
             args.harmonics,
             args.outer_iters,
             args.inner_iters,
@@ -219,7 +271,9 @@ fn run(args: &Args) -> Result<(), String> {
     println!("source_dim={p_raw}");
     println!("subsample_rows={}", post_peel_region.nrows());
     println!("basis_size={basis_size}");
+    println!("peel_mode={peel_mode}");
     println!("top_sink_ev_pre_peel={top_sink_ev:.9}");
+    println!("pos0_absorbed_fraction={pos0_absorbed:.9}");
     println!(
         "decision_tree=eta~1 -> information ceiling (not solver failure, not thesis failure); eta<<1 with clean gradient cert -> landscape/gauge-orbit pathology; eta<<1 with failing cert -> residual adjoint bug"
     );
@@ -785,6 +839,204 @@ fn read_npy_subsample_f64(path: &Path, cap: usize) -> Result<(usize, usize, Arra
         }
     }
     Ok((n_full, p, out))
+}
+
+/// Position-0 causal peel + PCA reduction. Regresses the position-0 indicator
+/// `d_i = 1[position_i == 0]` out of the column-centred residual — removing the
+/// attention-sink direction wherever it lives in feature space (the sink is a
+/// mean shift that position-0 tokens carry) — then returns the top-`keep` PCs of
+/// the peeled residual and the fraction of centred energy the pos-0 indicator
+/// absorbed. Unlike the variance score-0 self-peel, this does not assume the sink
+/// is the top principal component, so it generalises across layers/models.
+fn pos0_peel_reduce(
+    raw: ArrayView2<'_, f64>,
+    positions: &[i64],
+    keep: usize,
+) -> Result<(Array2<f64>, f64), String> {
+    let (n, p) = raw.dim();
+    if positions.len() != n {
+        return Err(format!(
+            "pos0_peel_reduce: positions length {} != residual rows {n}",
+            positions.len()
+        ));
+    }
+    if keep == 0 || keep > n.min(p) {
+        return Err(format!(
+            "pos0_peel_reduce: keep={keep} out of range for n={n}, p={p}"
+        ));
+    }
+    let indicator: Vec<f64> = positions
+        .iter()
+        .map(|&pos| if pos == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let indicator_mean = indicator.iter().sum::<f64>() / n as f64;
+    if !(indicator_mean > 0.0 && indicator_mean < 1.0) {
+        return Err(format!(
+            "pos0_peel_reduce: position-0 indicator is degenerate (mean {indicator_mean}); the \
+             subsample must contain both position-0 and non-position-0 rows for the causal peel"
+        ));
+    }
+    let centred_indicator: Vec<f64> = indicator.iter().map(|v| v - indicator_mean).collect();
+    let indicator_gram: f64 = centred_indicator.iter().map(|v| v * v).sum();
+
+    let mut col_mean = vec![0.0f64; p];
+    for i in 0..n {
+        for c in 0..p {
+            col_mean[c] += raw[[i, c]];
+        }
+    }
+    for c in 0..p {
+        col_mean[c] /= n as f64;
+    }
+
+    // Per-column regression coefficient b_c = <d_c, X_c> / <d_c, d_c>, then the
+    // peeled residual R_{ic} = (X_{ic} - mean_c) - d_c,i · b_c.
+    let mut coeff = vec![0.0f64; p];
+    for c in 0..p {
+        let mut dot = 0.0;
+        for i in 0..n {
+            dot += centred_indicator[i] * (raw[[i, c]] - col_mean[c]);
+        }
+        coeff[c] = dot / indicator_gram;
+    }
+
+    let mut residual = Array2::<f64>::zeros((n, p));
+    let mut centred_energy = 0.0f64;
+    let mut residual_energy = 0.0f64;
+    for i in 0..n {
+        for c in 0..p {
+            let centred = raw[[i, c]] - col_mean[c];
+            centred_energy += centred * centred;
+            let peeled = centred - centred_indicator[i] * coeff[c];
+            residual[[i, c]] = peeled;
+            residual_energy += peeled * peeled;
+        }
+    }
+    let absorbed = if centred_energy > 0.0 {
+        1.0 - residual_energy / centred_energy
+    } else {
+        0.0
+    };
+    let scores = thin_svd_scores(residual.view(), keep)?;
+    Ok((scores, absorbed))
+}
+
+/// Read token positions from a 1-D (or `(N, 1)`) integer/float `.npy`, subsampled
+/// with the SAME stride as [`read_npy_subsample_f64`] so the returned positions
+/// are row-aligned with the activation residual rows.
+fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        std::fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let mut head = vec![0u8; 512];
+    file.read_exact(&mut head)
+        .map_err(|err| format!("read header {}: {err}", path.display()))?;
+    if head.len() <= 12 || &head[0..6] != b"\x93NUMPY" {
+        return Err(format!("{}: not a .npy file", path.display()));
+    }
+    let major = head[6];
+    let (header_len, data_off) = if major >= 2 {
+        let header_len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        (header_len, 12 + header_len)
+    } else {
+        let header_len = u16::from_le_bytes([head[8], head[9]]) as usize;
+        (header_len, 10 + header_len)
+    };
+    if data_off > head.len() {
+        return Err(format!("{}: positions header exceeds initial read buffer", path.display()));
+    }
+    let header = std::str::from_utf8(&head[data_off - header_len..data_off])
+        .map_err(|err| format!("{}: header is not utf8: {err}", path.display()))?;
+    if !(header.contains("'fortran_order': False") || header.contains("\"fortran_order\": false")) {
+        return Err(format!("{}: expected C-order positions; header: {header}", path.display()));
+    }
+    // Element decoder from the numpy descr (little-endian / byte-order-agnostic
+    // integer or float scalar). Positions are token indices, so integer dtypes
+    // are the common case; float dtypes are accepted and rounded.
+    let descr_tail = header
+        .find("'descr':")
+        .map(|start| &header[start + "'descr':".len()..])
+        .ok_or_else(|| format!("{}: missing descr key; header: {header}", path.display()))?;
+    // Isolate the quoted descr value (e.g. `'<i4'`) so dtype matching cannot pick
+    // up characters from the trailing shape / flags in the header.
+    let quote = descr_tail
+        .find(['\'', '"'])
+        .ok_or_else(|| format!("{}: malformed descr; header: {header}", path.display()))?;
+    let rest = &descr_tail[quote + 1..];
+    let end = rest
+        .find(['\'', '"'])
+        .ok_or_else(|| format!("{}: unterminated descr; header: {header}", path.display()))?;
+    let descr = &rest[..end];
+    let kind_size = |tag: &str| descr.contains(tag);
+    let (elem, decode): (usize, fn(&[u8]) -> i64) = if kind_size("i8") {
+        (8, |b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    } else if kind_size("i4") {
+        (4, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+    } else if kind_size("i2") {
+        (2, |b| i16::from_le_bytes([b[0], b[1]]) as i64)
+    } else if kind_size("i1") {
+        (1, |b| b[0] as i8 as i64)
+    } else if kind_size("u8") {
+        (8, |b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i64)
+    } else if kind_size("u4") {
+        (4, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+    } else if kind_size("u2") {
+        (2, |b| u16::from_le_bytes([b[0], b[1]]) as i64)
+    } else if kind_size("u1") {
+        (1, |b| b[0] as i64)
+    } else if kind_size("f8") {
+        (8, |b| {
+            f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).round() as i64
+        })
+    } else if kind_size("f4") {
+        (4, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).round() as i64)
+    } else {
+        return Err(format!(
+            "{}: unsupported positions dtype; expected an integer or float scalar; header: {header}",
+            path.display()
+        ));
+    };
+    // Shape: first dim is the token count; any trailing dims must multiply to 1
+    // (accept `(N,)` and `(N, 1)`).
+    let shape_open = header
+        .find("'shape':")
+        .and_then(|start| header[start..].find('(').map(|o| start + o + 1))
+        .ok_or_else(|| format!("{}: missing positions shape; header: {header}", path.display()))?;
+    let shape_close = header[shape_open..]
+        .find(')')
+        .map(|c| shape_open + c)
+        .ok_or_else(|| format!("{}: missing positions shape close; header: {header}", path.display()))?;
+    let dims: Vec<usize> = header[shape_open..shape_close]
+        .split(',')
+        .filter_map(|token| token.trim().parse::<usize>().ok())
+        .collect();
+    if dims.is_empty() {
+        return Err(format!("{}: empty positions shape; header: {header}", path.display()));
+    }
+    let n_full = dims[0];
+    let trailing: usize = dims[1..].iter().product();
+    if !dims[1..].is_empty() && trailing != 1 {
+        return Err(format!(
+            "{}: expected 1-D positions or (N, 1), got shape {dims:?}",
+            path.display()
+        ));
+    }
+
+    let take = cap.min(n_full);
+    let stride = (n_full / take.max(1)).max(1);
+    let mut out = Vec::with_capacity(take);
+    let mut buf = vec![0u8; elem];
+    for i in 0..take {
+        let src_row = i * stride;
+        let off = data_off as u64 + (src_row as u64) * (elem as u64);
+        file.seek(SeekFrom::Start(off))
+            .map_err(|err| format!("seek positions {}: {err}", path.display()))?;
+        file.read_exact(&mut buf)
+            .map_err(|err| format!("read position {src_row} {}: {err}", path.display()))?;
+        out.push(decode(&buf));
+    }
+    Ok(out)
 }
 
 fn f16_to_f32(h: u16) -> f32 {

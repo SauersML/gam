@@ -3,19 +3,23 @@
 //! shrinks exactly that level's own bending null space.
 //!
 //! A factor-`by` smooth emits one `Primary` (bending) + one `DoublePenaltyNullspace`
-//! (ridge) penalty PER LEVEL, each confined to that level's disjoint
-//! `[lvl·p .. lvl·p + p]` diagonal coefficient block (#1427, independent per-level
-//! λ). The central #1476 chart-rebuild in `design_construction` (commit 2afdb5ca1)
-//! originally rebuilt EVERY ridge from the FIRST `Primary` it found — correct for a
-//! single smooth term, but for a `by=factor` term it placed every level's ridge in
-//! level 0's coefficient block (commit 1ea40395e pairs each ridge with the Primary
-//! sharing its support instead).
+//! (ridge) penalty PER LEVEL, each shrinking exactly that level's own bending null
+//! space (#1427, independent per-level λ). The central #1476 chart-rebuild in
+//! `design_construction` (commit 2afdb5ca1) originally rebuilt EVERY ridge from the
+//! FIRST `Primary` it found — correct for a single smooth term, but for a
+//! `by=factor` term it placed every level's ridge in level 0's coefficient block
+//! (commit 1ea40395e pairs each ridge with the Primary sharing its support).
 //!
-//! Contract pinned on the realized constrained `penalties_local`: for EVERY level
-//! block, the double-penalty ridge living in that block annihilates the bending
-//! penalty living in the SAME block (`ridge·bending ≈ 0`) — complementary
-//! subspaces. The wrong-block rebuild leaves a ridge in the wrong coefficient
-//! range, so it does NOT annihilate the bending penalty co-located with it.
+//! Since #1981 (3b110d9bc) a factor-`by` smooth is realized as an INDEPENDENT
+//! smooth term PER LEVEL (`term_builder.rs`: "Unordered factor-by smooths are
+//! independent level-specific smooths"), each carrying its own single Primary +
+//! ridge pair and its own λ — so the per-level pairs live in DISTINCT terms rather
+//! than as disjoint blocks in one term. This test tracks that architecture: it
+//! gathers every by-factor level term and pins, PER TERM, that the double-penalty
+//! ridge annihilates the co-located bending penalty (`ridge·bending ≈ 0`) —
+//! complementary subspaces. A wrong-block rebuild would leave a ridge whose support
+//! misses its co-located bending block; a regression that collapsed or dropped
+//! levels would fail the ≥2-per-level-terms premise.
 
 use csv::StringRecord;
 use gam::basis::PenaltySource;
@@ -83,70 +87,93 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
         panic!("expected a standard Gaussian fit");
     };
 
-    // The s(x, by=g) smooth is the term carrying the per-level penalty blocks.
-    let term = fit
+    // #1981 changed a factor-`by` smooth from ONE term carrying per-level
+    // coefficient blocks to a SEPARATE per-level smooth term (term_builder.rs,
+    // "Unordered factor-by smooths are independent level-specific smooths"), each
+    // with its own independent λ (#1427). So the per-level Primary+ridge pairs
+    // now live in DISTINCT terms — one per factor level — not as ≥2 blocks inside
+    // a single term. Gather every by-factor level term (each carries exactly one
+    // Primary bending penalty and one DoublePenaltyNullspace ridge) and check the
+    // #1476 contract PER LEVEL: the ridge annihilates the co-located bending.
+    // In this fixture the `s(x, by=g)` smooth is the only penalized smooth, so
+    // every double-penalty term IS one of its level replicas.
+    let level_terms: Vec<_> = fit
         .design
         .smooth
         .terms
         .iter()
-        .find(|t| {
+        .filter(|t| {
             t.penaltyinfo_local
                 .iter()
                 .any(|i| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
         })
-        .expect("a by-factor double-penalty smooth term with a null-space ridge");
-
-    let primaries: Vec<&Array2<f64>> = term
-        .penalties_local
-        .iter()
-        .zip(term.penaltyinfo_local.iter())
-        .filter(|(_, i)| matches!(i.source, PenaltySource::Primary))
-        .map(|(s, _)| s)
-        .collect();
-    let ridges: Vec<&Array2<f64>> = term
-        .penalties_local
-        .iter()
-        .zip(term.penaltyinfo_local.iter())
-        .filter(|(_, i)| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
-        .map(|(s, _)| s)
         .collect();
 
-    // Premise: a 3-level by-factor double-penalty smooth must emit ≥2 Primary
-    // blocks (one per level) so the per-level pairing is actually exercised.
+    // Premise: the 3-level by-factor smooth must emit ≥2 INDEPENDENT per-level
+    // double-penalty terms so the per-level pairing is actually exercised. A
+    // regression that collapsed the levels into one term — or dropped levels —
+    // trips this rather than silently passing.
     assert!(
-        primaries.len() >= 2 && ridges.len() >= 2,
-        "fixture must produce ≥2 per-level Primary+ridge pairs; got {} primaries, {} ridges",
-        primaries.len(),
-        ridges.len()
+        level_terms.len() >= 2,
+        "fixture must produce ≥2 independent per-level by-factor double-penalty terms; got {}",
+        level_terms.len()
     );
 
-    // For EACH ridge, the bending penalty co-located in the SAME coefficient
-    // block must be annihilated by it (complementary subspaces in the constrained
-    // chart). The wrong-block rebuild puts a ridge where its support does not
-    // overlap the co-located primary, so this product is large.
-    for (r, ridge) in ridges.iter().enumerate() {
-        let (rlo, rhi) = support(ridge);
-        let owner = primaries
+    // For EACH per-level term, the double-penalty ridge must annihilate the
+    // bending penalty co-located in the SAME coefficient block (complementary
+    // subspaces in the constrained chart). The #1476 wrong-block rebuild puts a
+    // ridge where its support does not overlap the co-located primary, so the
+    // product is large.
+    for (t_idx, term) in level_terms.iter().enumerate() {
+        let primaries: Vec<&Array2<f64>> = term
+            .penalties_local
             .iter()
-            .find(|p| {
-                let (plo, phi) = support(p);
-                plo <= rlo && rhi <= phi
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "ridge {r} (support [{rlo},{rhi})) has no co-located Primary bending block — \
-                     it was rebuilt in the wrong coefficient block (#1476 by-factor regression)."
-                )
-            });
-        let rn = frob(ridge);
-        let pn = frob(owner);
-        assert!(rn > 0.0 && pn > 0.0, "ridge {r}: degenerate ridge/primary");
-        let rel = frob(&(**ridge).dot(&**owner)) / (rn * pn);
+            .zip(term.penaltyinfo_local.iter())
+            .filter(|(_, i)| matches!(i.source, PenaltySource::Primary))
+            .map(|(s, _)| s)
+            .collect();
+        let ridges: Vec<&Array2<f64>> = term
+            .penalties_local
+            .iter()
+            .zip(term.penaltyinfo_local.iter())
+            .filter(|(_, i)| matches!(i.source, PenaltySource::DoublePenaltyNullspace))
+            .map(|(s, _)| s)
+            .collect();
         assert!(
-            rel < 1e-8,
-            "ridge {r}: per-level double-penalty ridge does not annihilate its co-located \
-             bending block (‖ridge·bending‖/(‖ridge‖‖bending‖) = {rel:.3e} ≥ 1e-8); the ridge \
-             is in the wrong constrained chart / coefficient block (#1476 by-factor regression)."
+            !primaries.is_empty() && !ridges.is_empty(),
+            "per-level term {t_idx} must carry both a Primary bending block and a ridge; \
+             got {} primaries, {} ridges",
+            primaries.len(),
+            ridges.len()
         );
+        for (r, ridge) in ridges.iter().enumerate() {
+            let (rlo, rhi) = support(ridge);
+            let owner = primaries
+                .iter()
+                .find(|p| {
+                    let (plo, phi) = support(p);
+                    plo <= rlo && rhi <= phi
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "per-level term {t_idx} ridge {r} (support [{rlo},{rhi})) has no co-located \
+                         Primary bending block — it was rebuilt in the wrong coefficient block \
+                         (#1476 by-factor regression)."
+                    )
+                });
+            let rn = frob(ridge);
+            let pn = frob(owner);
+            assert!(
+                rn > 0.0 && pn > 0.0,
+                "per-level term {t_idx} ridge {r}: degenerate ridge/primary"
+            );
+            let rel = frob(&(**ridge).dot(&**owner)) / (rn * pn);
+            assert!(
+                rel < 1e-8,
+                "per-level term {t_idx} ridge {r}: per-level double-penalty ridge does not annihilate \
+                 its co-located bending block (‖ridge·bending‖/(‖ridge‖‖bending‖) = {rel:.3e} ≥ 1e-8); \
+                 the ridge is in the wrong constrained chart / coefficient block (#1476 by-factor regression)."
+            );
+        }
     }
 }

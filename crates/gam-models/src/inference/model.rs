@@ -2658,6 +2658,22 @@ impl FittedModel {
 
     fn synchronize_stateful_link_metadata(&mut self) {
         let payload = self.payload_mut();
+        // `fit_result` and `unified` are two names for the SAME canonical
+        // UnifiedFitResult — every production builder (run_fit, the
+        // model_payload_builders) sets both to the identical fit. Consumers and
+        // the mutual-exclusivity persistence checks read `fit_result.or(unified)`,
+        // but the dense-path persistence gate and the marginal-slope serialization
+        // key on `fit_result` alone (`self.fit_result.as_ref().expect("checked
+        // above")`). A payload constructed directly from just a `unified` fit
+        // (nothing wrong with that — it is the same value) would then fail
+        // `validate_for_persistence` with "missing canonical fit_result payload".
+        // Mirror the two so whichever the caller populated, the canonical
+        // `fit_result` slot (and its `unified` alias) is always present.
+        match (payload.fit_result.is_none(), payload.unified.is_none()) {
+            (true, false) => payload.fit_result = payload.unified.clone(),
+            (false, true) => payload.unified = payload.fit_result.clone(),
+            _ => {}
+        }
         payload.used_device = payload
             .fit_result
             .as_ref()

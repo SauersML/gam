@@ -700,12 +700,22 @@ impl<const K: usize> O2x4<K> {
         for i in 0..K {
             out.g[i] = l_add(l_mul(a.v, b.g[i]), l_mul(a.g[i], b.v));
         }
+        // Upper-triangle-then-mirror, EXACTLY as the scalar `Tower2::mul`
+        // (`for j in i..K { hij = …; h[i][j] = h[j][i] = hij }`). The scalar tower
+        // never fills the lower triangle independently — it copies the upper one —
+        // so a per-`(i,j)` recomputation here diverges by ULPs on `h[j][i]`: the two
+        // cross terms `a.g·b.g` accumulate in the opposite order for `(j,i)` vs
+        // `(i,j)`, and `b`'s own Hessian is only ULP-symmetric (its `compose_unary`
+        // fills each `(i,j)` independently). Mirroring makes every lane
+        // `to_bits`-identical to the scalar row path.
         for i in 0..K {
-            for j in 0..K {
+            for j in i..K {
                 let t0 = l_mul(a.v, b.h[i][j]);
                 let t1 = l_add(t0, l_mul(a.g[i], b.g[j]));
                 let t2 = l_add(t1, l_mul(a.g[j], b.g[i]));
-                out.h[i][j] = l_add(t2, l_mul(a.h[i][j], b.v));
+                let hij = l_add(t2, l_mul(a.h[i][j], b.v));
+                out.h[i][j] = hij;
+                out.h[j][i] = hij;
             }
         }
         out

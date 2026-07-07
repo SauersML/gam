@@ -464,7 +464,9 @@ fn build_duchon_basis_uncached(
                     workspace,
                 )?;
                 let kernel_block = raw.basis.slice(s![.., 0..kernel_cols]);
-                let design_gram = symmetrize_penalty(&fast_atb(&kernel_block, &kernel_block));
+                // Canonical row order so the realized Gram (and the near-degenerate
+                // reparam it feeds) is bit-identical under a pure row permutation (#1378).
+                let design_gram = data_metric_design_gram(kernel_block);
                 let omega_constrained = duchon_constrained_bending_penalty(
                     centers.view(),
                     spec.length_scale,
@@ -803,6 +805,40 @@ pub(crate) fn thin_plate_polynomial_block(points: ArrayView2<'_, f64>) -> Array2
 
 pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
+}
+
+/// Row-order-canonical realized design Gram `symmetrize(KᵀK)` for the data-metric
+/// radial reparam (#1347/#1355).
+///
+/// `KᵀK = Σ_row (row)ᵀ(row)` is mathematically invariant to a pure row
+/// permutation of the training data, but `fast_atb` accumulates the outer
+/// products in the kernel block's stored (data) row order, so floating-point
+/// non-associativity lets a reordering perturb the Gram by an ulp. The reparam
+/// eigendecomposition fed by this Gram is near-degenerate (the thin-plate radial
+/// spectrum has a long low-curvature tail), so that ulp rotates its eigenvectors
+/// and makes the fitted `s(x, bs="tp")` basis — and hence the curve — depend on
+/// row order. That is the residual ~2e-7 row-permutation drift owed under
+/// gam#1378 that survives the value-anchored knot set and centroid seed (the
+/// local `bs="cr"/"ps"` bases never form this data-metric radial Gram, so they
+/// stayed bit-stable). Summing the rows in a canonical lexicographic (`total_cmp`)
+/// order gives the identical addition sequence for every permutation of the same
+/// unordered row set — the rows are a pure function of the data and genuinely
+/// equal rows contribute equal, order-free terms — so the Gram, its
+/// eigendecomposition, and the reparam become bit-identical across row order.
+fn data_metric_design_gram(kernel_block: ArrayView2<'_, f64>) -> Array2<f64> {
+    let n = kernel_block.nrows();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        for c in 0..kernel_block.ncols() {
+            match kernel_block[[a, c]].total_cmp(&kernel_block[[b, c]]) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let sorted = kernel_block.select(Axis(0), &order);
+    symmetrize_penalty(&fast_atb(&sorted, &sorted))
 }
 
 /// Selects which radial penalty eigenmodes to expose as basis columns.
@@ -1588,7 +1624,8 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         // spectrum acquires mgcv's cliff (curvature per unit data-variance),
         // rather than the cliff-less raw knot-Gram spectrum that lets REML buy
         // near-free wiggle on near-linear data. G_c = (K Z)ᵀ (K Z).
-        let design_gram = symmetrize_penalty(&fast_atb(&kernel_constrained, &kernel_constrained));
+        // Canonical row order so the Gram is row-permutation invariant (#1378).
+        let design_gram = data_metric_design_gram(kernel_constrained.view());
         thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?
     };
     let kernel_cols = radial_eigvals.len();

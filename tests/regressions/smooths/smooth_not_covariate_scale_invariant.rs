@@ -90,16 +90,27 @@ fn fit_grid_predictions(formula: &str, a: f64, n: usize) -> Vec<f64> {
     }
 }
 
-/// Selected `log λ` for the exact spline-scan (`bs="cr"`) path.
+/// Selected `log λ` for the exact spline-scan path. `bs="cr"`
+/// (`NaturalCubicRegression`) is DELIBERATELY routed off the scan onto the dense
+/// path (#1844 `cb11c502f` / #1957 `d99528cd1`): cr is a finite regression-spline
+/// basis, not the scan's full smoothing-spline state-space posterior, so the scan
+/// would solve a different model and return a non-`Standard` result predict cannot
+/// replay. The scan's covariate-rescaling equivariance (the `spline_scan.rs`
+/// log-λ-bracket anchoring fix this loop guards) is therefore exercised through
+/// the single-penalty free B-spline `s(x, double_penalty=false)`, which is exactly
+/// what auto-routes to the exact O(n) scan (see `spline_scan_fast_path` /
+/// `spline_scan_workflow_equivalence`).
 fn fit_scan_log_lambda(a: f64, n: usize) -> f64 {
     let data = dataset_with_covariate_scale(a, n);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    match fit_from_formula("y ~ s(x, bs=\"cr\")", &data, &cfg).expect("fit ok") {
+    match fit_from_formula("y ~ s(x, double_penalty=false)", &data, &cfg).expect("fit ok") {
         FitResult::SplineScan(scan) => scan.log_lambda,
-        _ => panic!("expected cr default to route to the exact spline scan"),
+        _ => panic!(
+            "expected the single-penalty free B-spline to route to the exact spline scan"
+        ),
     }
 }
 
@@ -184,15 +195,18 @@ fn cr_smooth_is_invariant_to_covariate_rescaling() {
         );
     }
 
-    // λ̂ must co-transform: for the order-m = 2 (cubic) spline scan,
-    // log λ(a·x) = log λ(x) + (2m−1)·log a = log λ(x) + 3·log a.
+    // λ̂ must co-transform on the exact spline-scan path (the `spline_scan.rs`
+    // log-λ-bracket anchoring fix). cr is now routed off the scan (#1844/#1957),
+    // so this equivariance is exercised through the single-penalty free B-spline
+    // `s(x, double_penalty=false)`, which auto-routes to the order-m = 2 (cubic)
+    // scan: log λ(a·x) = log λ(x) + (2m−1)·log a = log λ(x) + 3·log a.
     let base_ll = fit_scan_log_lambda(1.0, n);
     for &a in &[1.0e3, 1.0e-3] {
         let got = fit_scan_log_lambda(a, n);
         let expected = base_ll + 3.0 * a.ln();
         assert!(
             (got - expected).abs() < 1.0e-3,
-            "s(x, bs=\"cr\") log λ̂ not equivariant under covariate rescale a={a:.0e}: \
+            "spline-scan log λ̂ not equivariant under covariate rescale a={a:.0e}: \
              got {got:.6}, expected {expected:.6} (= log λ̂(1) + 3·ln a)."
         );
     }

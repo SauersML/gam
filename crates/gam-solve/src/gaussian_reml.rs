@@ -388,6 +388,50 @@ fn scalar_result_from_multi(
     })
 }
 
+/// Point evaluation of the closed-form Gaussian REML objective at a FIXED
+/// log-smoothing parameter, with no optimization. Exposes the same REML score,
+/// effective df, σ², and posterior-mean coefficients the optimizer sees at that
+/// `rho`, so callers can trace the REML score surface as a function of `rho`
+/// (e.g. to audit λ-selection against a reference tool).
+#[derive(Clone, Debug)]
+pub struct GaussianRemlPointEval {
+    pub rho: f64,
+    pub lambda: f64,
+    pub reml_score: f64,
+    pub edf: f64,
+    pub sigma2: f64,
+    pub coefficients: Array1<f64>,
+}
+
+/// Evaluate the scalar closed-form Gaussian REML objective at a fixed `rho`
+/// (`= ln λ`). This is the exact score/edf/σ²/β the `optimize_rho` grid would
+/// see at that point; it performs no search. Diagnostic surface for cross-tool
+/// λ-selection audits — the production optimizer is unchanged.
+pub fn gaussian_reml_point_eval_at_rho(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    rho: f64,
+) -> Result<GaussianRemlPointEval, EstimationError> {
+    let y2 = y.insert_axis(Axis(1));
+    let prepared =
+        prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
+    let eval = prepared.evaluate(rho);
+    let lambda = rho.exp();
+    let coefficients = prepared.coefficients(lambda).column(0).to_owned();
+    let sigma2 = prepared.sigma2(lambda)[0];
+    Ok(GaussianRemlPointEval {
+        rho,
+        lambda,
+        reml_score: eval.cost,
+        edf: eval.edf,
+        sigma2,
+        coefficients,
+    })
+}
+
 pub fn gaussian_reml_multi_closed_form(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,

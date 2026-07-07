@@ -368,8 +368,34 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
                 && l >= 0.0
                 && u <= 1.0)
     );
-    assert!(pred.observation_lower.is_none());
-    assert!(pred.observation_upper.is_none());
+    // A binomial fit with `includeobservation_interval: true` DOES emit a
+    // response-scale observation (prediction) band: the observation-interval
+    // feature's symmetric-driver binomial arm (#811/#812) folds the conditional
+    // Bernoulli variance p(1−p) into the mean SE and clamps to the [0,1] response
+    // support. The band must therefore be present and well-shaped — finite,
+    // ordered, and inside the probability support on every row (the earlier
+    // `is_none()` expectation predated the observation-interval feature and was
+    // masked by vacuous CI).
+    let obs_lower = pred
+        .observation_lower
+        .as_ref()
+        .expect("binomial observation band must be emitted when requested");
+    let obs_upper = pred
+        .observation_upper
+        .as_ref()
+        .expect("binomial observation band must be emitted when requested");
+    assert_eq!(obs_lower.len(), n);
+    assert_eq!(obs_upper.len(), n);
+    assert!(
+        obs_lower
+            .iter()
+            .zip(obs_upper.iter())
+            .all(|(&l, &u): (&f64, &f64)| l.is_finite()
+                && u.is_finite()
+                && l <= u
+                && l >= 0.0
+                && u <= 1.0)
+    );
 }
 
 #[test]

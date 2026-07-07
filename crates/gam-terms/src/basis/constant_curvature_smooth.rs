@@ -962,7 +962,14 @@ fn constant_curvature_profile_design_penalty(
         crate::bail_invalid_basis!("constant-curvature profile score needs a finite kappa");
     }
     validate_chart_points(data, spec.kappa, "data")?;
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Pole-aware centers, IDENTICAL to `build_constant_curvature_basis` (#1464):
+    // the realized design/penalty this scan scores must be built on the SAME
+    // center set the value builder produces, or the κ-profile criterion scores a
+    // different design than the one that selected κ̂ (a criterion↔estimate desync
+    // that mis-sizes the CI/flatness statistics). `select_constant_curvature_centers`
+    // is deterministic on the training data, so this reproduces the frozen build's
+    // centers byte-for-byte at κ = 0 and every κ probe.
+    let centers = select_constant_curvature_centers(data, &spec.center_strategy)?;
     if centers.nrows() < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint {
             found: centers.nrows(),
@@ -1185,7 +1192,15 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
         crate::bail_invalid_basis!("constant-curvature smooth needs a finite kappa");
     }
     validate_chart_points(data, spec.kappa, "data")?;
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Pole-aware centers, IDENTICAL to `build_constant_curvature_basis` (#1464):
+    // this bundle's whole contract is that the design/penalty whose κ-derivatives
+    // it returns are byte-for-byte the SAME construction the value path produced
+    // (see the doc above). The value builder replaces the near-origin center with
+    // the exact pole for sign identifiability; if this bundle re-derived plain
+    // farthest-point centers instead, ∂X/∂κ would be the derivative of a DIFFERENT
+    // design than the frozen one the outer criterion is built on, desyncing the
+    // analytic κ-gradient from the finite difference of the cost.
+    let centers = select_constant_curvature_centers(data, &spec.center_strategy)?;
     if centers.nrows() < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint {
             found: centers.nrows(),

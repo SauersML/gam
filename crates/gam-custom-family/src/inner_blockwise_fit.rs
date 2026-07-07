@@ -2348,7 +2348,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let within_trust = qp_step_norm.is_finite()
                         && joint_trust_radius.is_finite()
                         && qp_step_norm <= joint_trust_radius;
-                    let alpha_would_crush = if search_joint_active_set.is_some() && within_trust {
+                    let alpha_would_crush = if search_joint_active_set.is_some() {
                         match compute_joint_feasibility_alpha(
                             family,
                             &states,
@@ -2364,10 +2364,44 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     } else {
                         false
                     };
-                    if search_joint_active_set.is_some() && within_trust && alpha_would_crush {
+                    if search_joint_active_set.is_some() && alpha_would_crush {
+                        // gam#979 survival n3000 grind. The constrained active-set QP
+                        // returns a FEASIBLE point and the monotone cone is convex, so a
+                        // step that would trip the fraction-to-boundary α-crush (α below
+                        // threshold) must NOT be per-block-truncated: per-block truncation
+                        // pushes the joint iterate OFF the cone face, and the α-crush then
+                        // collapses it to ~1e-2, freezing β while a huge time-block
+                        // gradient persists → the 30-cycle budget grind. Instead skip the
+                        // α-crush (feasible by construction) and:
+                        //   * within trust      → take the untruncated feasible QP step;
+                        //   * exceeds the radius → scale the WHOLE joint step by a SINGLE
+                        //     global scalar to the block radii, which stays feasible by
+                        //     cone convexity (β and β+δ both feasible ⇒ β+αδ feasible),
+                        //     unlike per-block truncation which breaks it.
+                        // A feasible boundary step with ρ≈1 then lets the TR GROW the
+                        // radius back, curing the collapse-and-grind after one bad
+                        // far-field-nonlinear step shrank it. (Reached only on the
+                        // observable pathology — constrained candidate whose α WOULD
+                        // crush — so every healthy/converging constrained arm is
+                        // untouched.)
                         qp_feasible_bypass = true;
                         trial_delta = search_delta.clone();
-                        qp_norms
+                        if within_trust {
+                            qp_norms
+                        } else {
+                            let alpha_trust = qp_norms
+                                .iter()
+                                .zip(joint_block_trust_radii.iter())
+                                .filter(|(norm, _)| norm.is_finite() && **norm > 0.0)
+                                .map(|(norm, radius)| (radius / norm).min(1.0))
+                                .fold(1.0_f64, f64::min);
+                            if alpha_trust.is_finite() && alpha_trust < 1.0 {
+                                trial_delta.mapv_inplace(|v| v * alpha_trust);
+                                qp_norms.iter().map(|n| n * alpha_trust).collect()
+                            } else {
+                                qp_norms
+                            }
+                        }
                     } else {
                         trial_delta = search_delta.clone();
                         truncate_joint_step_to_block_metric_radii(

@@ -16,7 +16,7 @@
 //! ```
 //!
 //! All heavy state lives here, native-side: the warm-started block frames, the
-//! epoch's accumulated atom-level sparse MOD normal equations, the streaming γ
+//! epoch's accumulated per-block MOD cross-moments (`M_g`, `P×b`), the streaming γ
 //! numerator/denominator, per-block usage + within-block code second moments (for
 //! the utilisation / stable-rank report), the streaming TSS/RSS moments, and the
 //! worst-reconstructed-row reservoir feeding AuxK dead-block revival. A shard
@@ -26,9 +26,13 @@
 //!
 //! **Equivalence to one-shot.** During an epoch the block frames and the shared
 //! scalar γ are FROZEN at their epoch-start values; every shard is routed against
-//! them and its sparse normal-equation / γ / moment contributions are summed (all
-//! additive), so the assembled MOD system and (num, den) are exactly those of a
-//! full-batch refresh over the concatenation, up to f32 rounding. As with the atom
+//! them and its cross-moment / γ / moment contributions are summed (all additive),
+//! so the assembled `M_g` and (num, den) — and therefore the refreshed frames and
+//! γ — are exactly those of a full-batch refresh over the concatenation, up to f32
+//! rounding. The per-block frame step is an EXACT polar (orthogonal-Procrustes)
+//! update of `M_g`, the same one the one-shot lane runs — a block is a small `b×b`
+//! orthonormal frame, so this is exact and cheap (the matrix-free CG-default solver
+//! serves the atom/dict lane, whose co-firing graph percolates). As with the atom
 //! lane, revival residuals are
 //! measured under the decoder in force during the pass (the pre-refresh frames),
 //! the only deliberate difference from one-shot; the two coincide once the
@@ -39,10 +43,8 @@
 
 use super::BlockSparseConfig;
 use super::block::{gram_schmidt_rows, route_and_code_all, seed_frames, stable_rank_symmetric};
-use super::codes::SparseCode;
-use super::update::{
-    DecoderNormalEq, DecoderSolveStats, solve_decoder, solve_decoder_with_routability_gate,
-};
+use super::update::DecoderSolveStats;
+use crate::frames::GrassmannFrame;
 use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -80,8 +82,10 @@ pub struct BlockEpochStats {
     pub converged: bool,
     /// Epochs completed so far (this one inclusive).
     pub epoch: usize,
-    /// Matrix-free MOD refresh certificate from the block coefficients lifted to
-    /// atom-level sparse normal equations.
+    /// Solve certificate placeholder. The block lane refreshes its small `b×b`
+    /// frames by an exact polar step (no matrix-free CG/percolation solve), so this
+    /// carries the default (zeroed) certificate; the CG/percolation stats are the
+    /// atom/dict lane's ([`super::update::DecoderSolveStats`]).
     pub decoder_solve_stats: DecoderSolveStats,
 }
 
@@ -171,25 +175,6 @@ impl ResidualReservoir {
     }
 }
 
-fn block_code_as_atom_sparse_code(code: &super::block::RowBlockCode, b: usize) -> SparseCode {
-    let mut indices = Vec::with_capacity(code.blocks.len() * b);
-    let mut values = Vec::with_capacity(code.blocks.len() * b);
-    for (slot, &block) in code.blocks.iter().enumerate() {
-        if code.gates[slot] == 0.0 {
-            continue;
-        }
-        let base = block * b as u32;
-        for rr in 0..b {
-            indices.push(base + rr as u32);
-            values.push(code.codes[slot * b + rr]);
-        }
-    }
-    SparseCode {
-        indices,
-        codes: values,
-    }
-}
-
 /// Resumable state for a streaming block-sparse fit. Construct with [`Self::new`]
 /// (fit_begin), feed shards with [`Self::partial_fit`], close each epoch with
 /// [`Self::end_epoch`], and read the frames out with [`Self::finalize`]. The block
@@ -205,7 +190,7 @@ pub struct BlockSparseStreamState {
 
     // ---- accumulators reset at each end_epoch (frozen frames/γ used to fill) ----
     second: Vec<Array2<f64>>, // per-block within-block code 2nd moment (b×b)
-    atom_eq: DecoderNormalEq,
+    cross: Vec<Array2<f64>>,  // per-block MOD cross-moment M_g (P×b), refreshed by a polar step
     usage: Vec<usize>,
     alive_count: usize,
     gamma_num: f64,
@@ -221,11 +206,6 @@ pub struct BlockSparseStreamState {
     last_ev: f64,
     epochs_run: usize,
     last_revived: usize,
-    // Blocks that were dead and reseeded by AuxK revival and have not yet had a
-    // refresh take hold. Such a block must be exempted from the routability gate
-    // on the epoch it first fires (see the force-refresh note in `end_epoch`);
-    // this flag is cross-epoch state (never reset with the accumulators).
-    revival_pending: Vec<bool>,
     converged: bool,
     last_util: Vec<f32>,
     last_stable: Vec<f32>,
@@ -306,7 +286,7 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            atom_eq: DecoderNormalEq::zeros(g * b, p),
+            cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -320,7 +300,6 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             epochs_run: 0,
             last_revived: 0,
-            revival_pending: vec![false; g],
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -376,7 +355,7 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            atom_eq: DecoderNormalEq::zeros(g * b, p),
+            cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -390,7 +369,6 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             epochs_run: 0,
             last_revived: 0,
-            revival_pending: vec![false; g],
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -441,12 +419,6 @@ impl BlockSparseStreamState {
             self.config.minibatch,
             self.config.block_tile,
         );
-        let atom_codes: Vec<SparseCode> = codes
-            .iter()
-            .map(|code| block_code_as_atom_sparse_code(code, b))
-            .collect();
-        self.atom_eq.accumulate(shard, &atom_codes);
-
         let base_index = self.row_count as u64;
         let mut shard_rss = 0.0f64;
         for (r, code) in codes.iter().enumerate() {
@@ -460,7 +432,7 @@ impl BlockSparseStreamState {
             // Per selected block: its within-block code z (b) and its γ-free
             // subspace contribution proj = Σ_r w_r D_g[r] (P). Accumulate x̂ = γ·Σ proj
             // and the γ-free projection sum p_i = Σ proj (for the γ least-squares).
-            let mut sel: Vec<(usize, Vec<f32>)> = Vec::with_capacity(self.k);
+            let mut sel: Vec<(usize, Vec<f32>, Vec<f32>)> = Vec::with_capacity(self.k);
             let mut xhat = vec![0.0f32; p];
             let mut proj_sum = vec![0.0f32; p];
             for j in 0..code.blocks.len() {
@@ -492,7 +464,7 @@ impl BlockSparseStreamState {
                     proj_sum[c] += proj[c];
                 }
                 let z: Vec<f32> = w.iter().map(|v| gamma * v).collect();
-                sel.push((gg, z));
+                sel.push((gg, z, proj));
             }
 
             // Full residual under the frozen model + streaming RSS/reservoir.
@@ -514,16 +486,29 @@ impl BlockSparseStreamState {
                 self.gamma_den += proj_sum[c] as f64 * proj_sum[c] as f64;
             }
 
-            // Per-block within-block code 2nd moment for the stable-rank report.
-            // The MOD refresh itself is handled by the atom-level sparse normal
-            // equations accumulated above, so large percolated systems use the
-            // shared matrix-free CG path.
-            for (gg, z) in sel.iter() {
+            // Per-block MOD cross-moment M_g += r_ig ⊗ z (P×b) and the within-block
+            // code 2nd moment for the stable-rank report. The block lane's frames
+            // are small b×b orthonormal blocks, so the refresh is an EXACT polar
+            // (orthogonal-Procrustes) step over M_g in `end_epoch` — the same update
+            // the one-shot lane uses (block.rs `refresh_frames`), which the streamed
+            // shards reproduce exactly because M_g / γ / moments are all additive.
+            // (The atom/dict lane's percolating co-firing graph is where the
+            // matrix-free CG-default solver lives; a block frame is small and exact.)
+            for (gg, z, proj) in sel.iter() {
                 let gg = *gg;
                 if self.usage[gg] == 0 {
                     self.alive_count += 1;
                 }
                 self.usage[gg] += 1;
+                // r_ig = full residual with THIS block's own contribution added back
+                // (leave-one-block-out), so the polar step sees the target subspace.
+                let mg = &mut self.cross[gg];
+                for c in 0..p {
+                    let r_ig_c = residual[c] as f64 + (gamma * proj[c]) as f64;
+                    for (rr, &zr) in z.iter().enumerate() {
+                        mg[[c, rr]] += r_ig_c * zr as f64;
+                    }
+                }
                 let sg = &mut self.second[gg];
                 for r1 in 0..b {
                     for r2 in 0..b {
@@ -576,78 +561,44 @@ impl BlockSparseStreamState {
             (self.gamma_num / self.gamma_den) as f32
         };
 
-        // (frames) MOD refresh from the accumulated atom-level sparse normal
-        // equations. Each selected block contributes its `b` signed coefficients
-        // as ordinary atom codes, so the same percolation-aware matrix-free CG
-        // solver handles the large coupled system. The routability gate refreshes
-        // atom `k` only after n_k >= (z_alpha*sigma/(a_bar_k*margin_k))^2; atoms
-        // below that evidence threshold remain accumulated across epochs.
-        let residual_denom = (self.row_count.max(1) * p).max(1) as f64;
-        let residual_scale = (self.rss / residual_denom).sqrt();
-        let (decoder_solve_stats, gate) = solve_decoder_with_routability_gate(
-            &mut self.decoder,
-            &self.atom_eq,
-            self.config.frame_ridge,
-            residual_scale,
-        );
-        let mut refreshed_blocks = vec![false; self.g];
-        for decision in gate.iter() {
-            if decision.refresh {
-                refreshed_blocks[decision.atom / b] = true;
-            }
-        }
-
-        // Revival-lock-in: a block that AuxK reseeded (dead → residual direction)
-        // can DEADLOCK against the routability gate. While the reseeded block is
-        // still unfit it inflates the global residual scale σ̂, which raises every
-        // atom's charge floor, so the block's fresh firing evidence can never
-        // clear the gate; it is never MOD-refreshed, σ̂ never drops, and the reseed
-        // never takes hold (chicken-and-egg). Revival is a DELIBERATE structural
-        // reseed, not a noise-driven refresh, so it must be exempt from the
-        // evidence gate: on the first epoch a pending revived block actually fires,
-        // force ONE ungated MOD refresh so the reseed locks in. Thereafter the
-        // block's residual drops and it clears the gate on its own. Without this,
-        // dead-block revival plateaus below reconstruction parity even though the
-        // reseed direction is correct (revival_reseeds_dead_block_from_worst_residual_row).
-        let forced: Vec<usize> = (0..self.g)
-            .filter(|&gg| self.revival_pending[gg] && self.usage[gg] > 0 && !refreshed_blocks[gg])
-            .collect();
-        if !forced.is_empty() {
-            let mut ungated = self.decoder.clone();
-            solve_decoder(&mut ungated, &self.atom_eq, self.config.frame_ridge);
-            for &gg in &forced {
-                for rr in 0..b {
-                    for c in 0..p {
-                        self.decoder[[gg * b + rr, c]] = ungated[[gg * b + rr, c]];
-                    }
-                }
-                refreshed_blocks[gg] = true;
-            }
-        }
-        // A block that refreshed this epoch (via the gate or the forced path) has
-        // taken hold — clear its revival lock so the gate governs it normally.
+        // (frames) EXACT polar refresh of every block that fired this epoch, over
+        // its accumulated cross-moment `M_g` (P×b). `GrassmannFrame::polar_update`
+        // returns the closest column-orthonormal frame to `M_g` (the orthogonal-
+        // Procrustes / MOD-on-the-Stiefel-manifold optimum) — the SAME update the
+        // one-shot lane runs (block.rs `refresh_frames`), so the streamed shards
+        // reproduce the full-batch frames exactly (M_g is additive). This is the
+        // block lane's native solver: a block is a small b×b orthonormal frame, so
+        // the polar step is exact and O(b³) cheap — no routability gate and no
+        // atom-level MOD approximation, both of which ceilinged reconstruction
+        // below one-shot parity and deadlocked dead-block revival.
+        let ridge = self.config.frame_ridge;
         for gg in 0..self.g {
-            if refreshed_blocks[gg] {
-                self.revival_pending[gg] = false;
-            }
-        }
-
-        self.atom_eq.clear_refreshed_atoms(&gate);
-        for gg in 0..self.g {
-            if !refreshed_blocks[gg] {
+            if self.usage[gg] == 0 {
                 continue;
             }
-            let mut block = self
-                .decoder
-                .slice(ndarray::s![gg * b..gg * b + b, ..])
-                .to_owned();
-            gram_schmidt_rows(&mut block);
-            for rr in 0..b {
-                for c in 0..p {
-                    self.decoder[[gg * b + rr, c]] = block[[rr, c]];
+            if ridge > 0.0 {
+                for rr in 0..b {
+                    for c in 0..p {
+                        self.cross[gg][[c, rr]] += ridge * self.decoder[[gg * b + rr, c]] as f64;
+                    }
+                }
+            }
+            if let Ok(frame) = GrassmannFrame::polar_update(self.cross[gg].view()) {
+                let u = frame.frame(); // P×b column-orthonormal
+                let sv = frame.gauge_singular_values();
+                let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
+                if full_rank && u.ncols() == b {
+                    for rr in 0..b {
+                        for c in 0..p {
+                            self.decoder[[gg * b + rr, c]] = u[[c, rr]] as f32;
+                        }
+                    }
                 }
             }
         }
+        // The block lane's exact polar frames carry no matrix-free CG/percolation
+        // certificate (that solver serves the atom/dict lane); report a default.
+        let decoder_solve_stats = DecoderSolveStats::default();
 
         // (revival) AuxK dead-block reseeding from worst-reconstructed rows.
         let dead: usize = self.usage.iter().filter(|&&u| u == 0).count();
@@ -734,10 +685,6 @@ impl BlockSparseStreamState {
                     self.decoder[[gg * b + rr, c]] = seed[[rr, c]];
                 }
             }
-            // Mark the reseed so the next epoch it fires it is force-refreshed
-            // past the routability gate (see `end_epoch`); otherwise the gate can
-            // deadlock the revived block below reconstruction parity.
-            self.revival_pending[gg] = true;
             revived += 1;
         }
         revived
@@ -746,6 +693,9 @@ impl BlockSparseStreamState {
     fn reset_epoch(&mut self) {
         for sg in self.second.iter_mut() {
             sg.fill(0.0);
+        }
+        for mg in self.cross.iter_mut() {
+            mg.fill(0.0);
         }
         for u in self.usage.iter_mut() {
             *u = 0;
@@ -896,7 +846,9 @@ pub struct BlockSparseStreamArtifact {
     pub explained_variance: f64,
     /// Whether the streaming loop met the convergence rule.
     pub converged: bool,
-    /// Decoder refresh percolation/CG certificate from the final closed epoch.
+    /// Solve certificate placeholder (default/zeroed): the block lane refreshes its
+    /// small `b×b` frames by an exact polar step, not the matrix-free CG/percolation
+    /// solver that serves the atom/dict lane.
     pub decoder_solve_stats: DecoderSolveStats,
 }
 

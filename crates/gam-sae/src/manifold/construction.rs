@@ -5712,17 +5712,13 @@ impl SaeManifoldTerm {
                 // burning the extended `progress_refine_iter` budget indefinitely.
                 consecutive_stall_factor_fail += 1;
                 if consecutive_stall_factor_fail >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
-                    let dbg_events = self.collapse_events().len();
-                    let dbg_dict = self.dictionary_cocollapse_reseeds;
-                    let dbg_struct = self.structural_cocollapse_reseeds;
                     return Err(format!(
                         "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                          objective stalled for {consecutive_stall_factor_fail} consecutive refine \
                          rounds (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) and the undamped \
                          evidence factorization failed at each stall point — the iterate is at the \
                          numerical fixed point under rank-deficient geometry (#{consecutive_stall_factor_fail} \
-                         stall-factor-fail rounds; refusing to rank an off-optimum Laplace criterion) \
-                         [RESEED-DIAG collapse_events={dbg_events} dict_reseeds={dbg_dict} struct_reseeds={dbg_struct}]"
+                         stall-factor-fail rounds; refusing to rank an off-optimum Laplace criterion)"
                     ));
                 }
             } else {
