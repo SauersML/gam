@@ -1,3 +1,4 @@
+pub mod dossier;
 pub mod sparkline;
 
 use std::fs;
