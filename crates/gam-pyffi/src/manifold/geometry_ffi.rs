@@ -4476,6 +4476,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
     module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;
     module.add_function(wrap_pyfunction!(loop_holonomy, module)?)?;
+    module.add_function(wrap_pyfunction!(conditional_coactivation_influence, module)?)?;
+    module.add_function(wrap_pyfunction!(coupling_robustness_certificate, module)?)?;
+    module.add_function(wrap_pyfunction!(effect_weighted_retention, module)?)?;
     Ok(())
 }
 

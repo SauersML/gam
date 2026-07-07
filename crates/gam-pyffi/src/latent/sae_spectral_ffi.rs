@@ -1402,3 +1402,244 @@ fn loop_holonomy(
     out.set_item("angle_tolerance", report.angle_tolerance)?;
     Ok(out.unbind())
 }
+
+/// Per-row influence contributions for the conditional coactivation probability
+/// `P(gate_j active | gate_i active)` over the selected sample. `active_i` /
+/// `active_j` are the two gate activity streams; `rows` selects the sampled row
+/// indices and `likelihood_weights` their honesty weights. Closed form — the
+/// engine computes every number, the FFI only marshals arrays/dict. Returns the
+/// weighted conditional probability, gate-i active mass, the per-row influence
+/// values `psi`, and the normalized weights.
+#[pyfunction(signature = (active_i, active_j, rows, likelihood_weights))]
+fn conditional_coactivation_influence(
+    py: Python<'_>,
+    active_i: Vec<bool>,
+    active_j: Vec<bool>,
+    rows: Vec<usize>,
+    likelihood_weights: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let report = detach_py_result(py, "conditional_coactivation_influence", move || {
+        gam::terms::sae::coactivation_conditionality::conditional_coactivation_influence_values(
+            &active_i,
+            &active_j,
+            &rows,
+            &likelihood_weights,
+        )
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("conditional_probability", report.conditional_probability)?;
+    out.set_item("active_mass_i", report.active_mass_i)?;
+    out.set_item("psi", report.psi)?;
+    out.set_item("normalized_weights", report.normalized_weights)?;
+    Ok(out.unbind())
+}
+
+/// Weighted-Pearson coupling influence and its KL-robustness certificate over
+/// the selected sample. Computes the closed-form influence values
+/// `psi_i = g̃_i·h̃_i − (rho/2)(g̃_i² + h̃_i²)`, the pooled coupling `rho`, the
+/// influence variance / mean-abs, the robustness radius `epsilon*`, and the
+/// first-order worst-case coupling after an arbitrary KL-`epsilon` shift.
+#[pyfunction(signature = (gate_i, gate_j, rows, likelihood_weights, epsilon = 0.0))]
+fn coupling_robustness_certificate(
+    py: Python<'_>,
+    gate_i: Vec<f64>,
+    gate_j: Vec<f64>,
+    rows: Vec<usize>,
+    likelihood_weights: Vec<f64>,
+    epsilon: f64,
+) -> PyResult<Py<PyDict>> {
+    let (influence, certificate, worst_case) =
+        detach_py_result(py, "coupling_robustness_certificate", move || {
+            let influence =
+                gam::terms::sae::coactivation_conditionality::coupling_influence_values(
+                    &gate_i,
+                    &gate_j,
+                    &rows,
+                    &likelihood_weights,
+                )?;
+            let certificate = influence.certificate();
+            let worst_case = certificate.worst_case_coupling(epsilon)?;
+            Ok((influence, certificate, worst_case))
+        })?;
+    let out = PyDict::new(py);
+    out.set_item("rho", influence.rho)?;
+    out.set_item("psi", influence.psi)?;
+    out.set_item("normalized_weights", influence.normalized_weights)?;
+    out.set_item("influence_variance", certificate.influence_variance)?;
+    out.set_item("influence_mean_abs", certificate.influence_mean_abs)?;
+    out.set_item("robustness_radius_epsilon", certificate.robustness_radius_epsilon)?;
+    out.set_item("epsilon", epsilon)?;
+    out.set_item("worst_case_coupling", worst_case)?;
+    Ok(out.unbind())
+}
+
+/// Effect-weighted atom retention ledger. `variance[a]` is the optional
+/// reconstruction charge evidence `(delta_deviance_nats, charge_nats)` for atom
+/// `a` (the list length is the atom count); `firings` are streamed
+/// `(atom, fisher_quadratic_kl_nats)` ablated-firing contributions that build the
+/// Fisher local-KL effect ledger through the real streaming accumulator.
+/// Retention is an OR of the variance margin (`delta_deviance − charge`) and the
+/// Fisher-effect margin (mean local-KL over the per-atom one-degree BIC price).
+/// Returns per-atom `{atom, variance, effect, retained_by_variance,
+/// retained_by_effect, retained}` under `atoms`.
+#[pyfunction(signature = (variance, firings))]
+fn effect_weighted_retention(
+    py: Python<'_>,
+    variance: Vec<Option<(f64, f64)>>,
+    firings: Vec<(usize, f64)>,
+) -> PyResult<Py<PyDict>> {
+    let evidence = detach_py_result(py, "effect_weighted_retention", move || {
+        let atom_count = variance.len();
+        let variance_evidence: Vec<Option<gam::terms::sae::effect_weight::VarianceChargeEvidence>> =
+            variance
+                .iter()
+                .map(|entry| {
+                    entry.map(|(delta_deviance, charge)| {
+                        gam::terms::sae::effect_weight::VarianceChargeEvidence {
+                            delta_deviance,
+                            charge,
+                        }
+                    })
+                })
+                .collect();
+        let mut accumulator =
+            gam::terms::sae::effect_weight::StreamingFisherEffectAccumulator::new(atom_count);
+        for (atom, fisher_quadratic_kl_nats) in &firings {
+            accumulator.accumulate_firing_local_kl(*atom, *fisher_quadratic_kl_nats)?;
+        }
+        let effect = accumulator.finish();
+        gam::terms::sae::effect_weight::effect_weighted_retention(&variance_evidence, &effect)
+    })?;
+    let atoms = pyo3::types::PyList::empty(py);
+    for ev in &evidence {
+        let d = PyDict::new(py);
+        d.set_item("atom", ev.atom)?;
+        d.set_item("retained_by_variance", ev.retained_by_variance)?;
+        d.set_item("retained_by_effect", ev.retained_by_effect)?;
+        d.set_item("retained", ev.retained)?;
+        match ev.variance {
+            Some(v) => {
+                let vd = PyDict::new(py);
+                vd.set_item("delta_deviance", v.delta_deviance)?;
+                vd.set_item("charge", v.charge)?;
+                vd.set_item("margin", v.margin())?;
+                d.set_item("variance", vd)?;
+            }
+            None => d.set_item("variance", py.None())?,
+        }
+        match ev.effect {
+            Some(e) => {
+                let ed = PyDict::new(py);
+                ed.set_item("atom", e.atom)?;
+                ed.set_item("mean_fisher_quadratic_kl_nats", e.mean_fisher_quadratic_kl_nats)?;
+                ed.set_item("max_fisher_quadratic_kl_nats", e.max_fisher_quadratic_kl_nats)?;
+                ed.set_item("n_firings", e.n_firings)?;
+                ed.set_item("threshold_nats", e.threshold_nats)?;
+                ed.set_item("margin", e.margin())?;
+                d.set_item("effect", ed)?;
+            }
+            None => d.set_item("effect", py.None())?,
+        }
+        atoms.append(d)?;
+    }
+    let out = PyDict::new(py);
+    out.set_item("atoms", atoms)?;
+    Ok(out.unbind())
+}
+
+#[cfg(test)]
+mod ffi_completeness_tests {
+    use super::*;
+
+    #[test]
+    fn conditional_coactivation_influence_surfaces_conditional_probability() {
+        Python::attach(|py| {
+            // Rows 0,1 fire gate i; only row 0 also fires gate j. With equal
+            // weights, P(j|i) = joint_mass / active_mass_i = (1/3)/(2/3) = 0.5.
+            let out = conditional_coactivation_influence(
+                py,
+                vec![true, true, false],
+                vec![true, false, false],
+                vec![0, 1, 2],
+                vec![1.0, 1.0, 1.0],
+            )
+            .expect("conditional coactivation influence");
+            let d = out.bind(py);
+            let cp: f64 = d
+                .get_item("conditional_probability")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((cp - 0.5).abs() < 1e-12, "conditional_probability = {cp}");
+            let mass: f64 = d.get_item("active_mass_i").unwrap().unwrap().extract().unwrap();
+            assert!((mass - 2.0 / 3.0).abs() < 1e-12, "active_mass_i = {mass}");
+            let psi: Vec<f64> = d.get_item("psi").unwrap().unwrap().extract().unwrap();
+            assert_eq!(psi.len(), 3);
+        });
+    }
+
+    #[test]
+    fn coupling_robustness_certificate_surfaces_worst_case_coupling() {
+        Python::attach(|py| {
+            // Perfectly correlated gate streams -> rho = 1; at epsilon = 0 the
+            // worst-case coupling equals rho (no distribution shift budget).
+            let out = coupling_robustness_certificate(
+                py,
+                vec![0.0, 1.0, 0.0, 1.0],
+                vec![0.0, 1.0, 0.0, 1.0],
+                vec![0, 1, 2, 3],
+                vec![1.0, 1.0, 1.0, 1.0],
+                0.0,
+            )
+            .expect("coupling robustness certificate");
+            let d = out.bind(py);
+            let rho: f64 = d.get_item("rho").unwrap().unwrap().extract().unwrap();
+            assert!((rho - 1.0).abs() < 1e-9, "rho = {rho}");
+            let wc: f64 = d
+                .get_item("worst_case_coupling")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((wc - rho).abs() < 1e-12, "worst_case_coupling = {wc}");
+            assert!(d.get_item("influence_variance").unwrap().is_some());
+            assert!(d.get_item("robustness_radius_epsilon").unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn effect_weighted_retention_ors_variance_and_effect_margins() {
+        Python::attach(|py| {
+            // Atom 0: variance margin 2.0-0.5>0 and two firings of local-KL 1.0
+            // clear the BIC price -> retained. Atom 1: no variance, one firing of
+            // 0.01 below the price -> not retained.
+            let out = effect_weighted_retention(
+                py,
+                vec![Some((2.0, 0.5)), None],
+                vec![(0, 1.0), (0, 1.0), (1, 0.01)],
+            )
+            .expect("effect weighted retention");
+            let d = out.bind(py);
+            let atoms_any = d.get_item("atoms").unwrap().unwrap();
+            let atoms = atoms_any.cast::<pyo3::types::PyList>().unwrap();
+            assert_eq!(atoms.len(), 2);
+            let a0 = atoms.get_item(0).unwrap();
+            let a0 = a0.cast::<PyDict>().unwrap();
+            let r0: bool = a0.get_item("retained").unwrap().unwrap().extract().unwrap();
+            assert!(r0, "atom 0 should be retained");
+            let rv0: bool = a0
+                .get_item("retained_by_variance")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(rv0, "atom 0 retained by variance");
+            let a1 = atoms.get_item(1).unwrap();
+            let a1 = a1.cast::<PyDict>().unwrap();
+            let r1: bool = a1.get_item("retained").unwrap().unwrap().extract().unwrap();
+            assert!(!r1, "atom 1 should not be retained");
+            assert!(a1.get_item("variance").unwrap().unwrap().is_none());
+        });
+    }
+}
