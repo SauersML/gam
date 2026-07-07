@@ -9,8 +9,12 @@
 //! is meant to. This file guards that the collocation sample is well-conditioned
 //! by probing the EMITTED penalty.
 //!
-//! This is a test of the EVENTUAL redesigned behavior; it will FAIL until the
-//! core lands (honest red).
+//! The redesigned core has LANDED: `build_duchon_collocation_operator_matrices`
+//! emits D0/D1/D2 including the polynomial null-space value/gradient/Hessian, so
+//! the Hilbert-scale function penalties act on the full β-basis and the emitted
+//! `OperatorTension` block resolves every basis direction. This is now a LIVE
+//! regression guard on that conditioning contract (it passes on `main`), not a
+//! forward-spec awaiting the core.
 //!
 //! METHODOLOGY (coordinate-free, mirroring `duchon_structural_seminorms.rs`).
 //! The emitted penalty `S` acts on the design's own coefficient space: for a
