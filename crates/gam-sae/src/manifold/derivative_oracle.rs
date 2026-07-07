@@ -494,6 +494,41 @@ mod tests {
     }
 
     #[test]
+    fn eigen_gap_threshold_is_the_exact_refusal_boundary() {
+        // A gap one machine epsilon wide sits below the round-off threshold and
+        // must refuse rather than leak a scalar eigenvalue derivative, while a
+        // gap several epsilons wide resolves and keeps the individual route.
+        // This pins the threshold as the decision boundary so no wrong
+        // derivative slips through in the near-degenerate regime.
+        let just_below = eigen_gap_certificate(&[1.0, 1.0 + f64::EPSILON]);
+        assert!(just_below.min_eigen_gap < just_below.threshold);
+        let refused = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(just_below);
+        assert_eq!(
+            refused.eigen_derivative_route(),
+            EigenDerivativeRoute::InvariantSubspaceBlock
+        );
+        let err = refused
+            .assert_derivative_reportable()
+            .expect_err("gap below round-off must refuse a scalar derivative");
+        assert_eq!(
+            err.refusal,
+            BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
+        );
+        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+
+        let just_above = eigen_gap_certificate(&[1.0, 1.0 + 16.0 * f64::EPSILON]);
+        assert!(just_above.min_eigen_gap > just_above.threshold);
+        let resolved = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(just_above);
+        assert_eq!(
+            resolved.eigen_derivative_route(),
+            EigenDerivativeRoute::IndividualEigenpairs
+        );
+        resolved
+            .assert_derivative_reportable()
+            .expect("gap above round-off resolves to the individual eigenpair route");
+    }
+
+    #[test]
     fn well_separated_spectrum_keeps_individual_eigenpair_route() {
         let separated = eigen_gap_certificate(&[1.0, 1.5, 3.0]);
         let cert = certificate(MajorizerAnchorMode::FrozenAnchor).with_eigen_gap(separated);
