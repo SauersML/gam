@@ -38,6 +38,13 @@ __all__ = [
     "run_interventions",
     "save_intervention_shard",
     "load_intervention_shard",
+    "MeasureSpikeEdit",
+    "harmonic_code_features",
+    "synthesize_measure_code",
+    "apply_spike_edit",
+    "spike_edit_code_delta",
+    "spike_edit_delta_x",
+    "build_spike_intervention_plan",
 ]
 
 
@@ -247,4 +254,178 @@ def load_intervention_shard(path: str | Path) -> InterventionShardData:
         is_control=np.asarray(npz["is_control"], dtype=bool),
         layer=int(npz["layer"].item()),
         seed=int(npz["seed"].item()),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Spike-level measure edits (App C — binding / multiplicity)
+# --------------------------------------------------------------------------- #
+# A harmonic-circle atom stores, per firing, the within-block code
+# ``z = Σ_j a_j u(t_j) ∈ ℝ^{2H}`` — the *superposition* of ``m`` point masses on
+# the circle (see ``gam_sae::super_resolution``). Super-resolution recovers the
+# measure ``{(a_j, t_j)}``; this section is its causal inverse: edit ONE point
+# mass (remove / move / rescale it), re-synthesize the block code, and lift the
+# code change through the atom's decoder ``D`` (``2H × p``) into a p-space delta
+# ``Δx`` ready for :func:`run_interventions`. Because the edit touches a single
+# spike, the injected ``Δx`` is the contribution of that one *instance* alone —
+# the other instances of the same feature are provably untouched, which is the
+# claim a linear SAE cannot even express (it has no per-instance handle).
+
+
+@dataclass(frozen=True)
+class MeasureSpikeEdit:
+    """A single-spike edit of a recovered circle measure.
+
+    Attributes
+    ----------
+    kind
+        ``"remove"`` (delete the spike), ``"move"`` (retune its position to
+        ``new_t``), or ``"scale"`` (multiply its amplitude by ``factor``).
+    spike_index
+        Index into the row's spike list (positions sorted ascending, matching
+        the Rust readout's ordering).
+    new_t
+        Target circle position for ``"move"`` (in ``[0, 1)``); ignored otherwise.
+    factor
+        Amplitude multiplier for ``"scale"`` (``0`` reproduces ``"remove"``);
+        ignored otherwise.
+    """
+
+    kind: str
+    spike_index: int
+    new_t: float | None = None
+    factor: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("remove", "move", "scale"):
+            raise ValueError(f"kind must be remove|move|scale; got {self.kind!r}")
+        if self.spike_index < 0:
+            raise ValueError("spike_index must be non-negative")
+        if self.kind == "move" and self.new_t is None:
+            raise ValueError("move edit requires new_t")
+        if self.kind == "scale" and self.factor is None:
+            raise ValueError("scale edit requires factor")
+
+
+def harmonic_code_features(t: Any, n_harmonics: int) -> np.ndarray:
+    """Harmonic frame row(s) ``u(t) = [cos 2πt, sin 2πt, ..., cos 2πHt,
+    sin 2πHt]`` for harmonics ``1..H``. Scalar ``t`` returns ``(2H,)``; a ``(k,)``
+    array returns ``(k, 2H)``. This is the exact convention
+    ``gam_sae::sparse_dict::coordinate`` uses for the ``(c_h, s_h)`` code."""
+    t_arr = np.asarray(t, dtype=np.float64)
+    scalar = t_arr.ndim == 0
+    t_col = np.atleast_1d(t_arr)
+    cols = []
+    for h in range(1, n_harmonics + 1):
+        cols.append(np.cos(2.0 * np.pi * h * t_col))
+        cols.append(np.sin(2.0 * np.pi * h * t_col))
+    feats = np.stack(cols, axis=1)  # (k, 2H)
+    return feats[0] if scalar else feats
+
+
+def synthesize_measure_code(spikes: Any, n_harmonics: int) -> np.ndarray:
+    """Re-synthesize the ``2H`` within-block code ``z = Σ_j a_j u(t_j)`` from a
+    list of ``(amplitude, t)`` point masses. The exact forward map super-
+    resolution inverts; an empty measure yields the zero code."""
+    z = np.zeros(2 * n_harmonics, dtype=np.float64)
+    for amplitude, t in spikes:
+        z += float(amplitude) * harmonic_code_features(float(t), n_harmonics)
+    return z
+
+
+def apply_spike_edit(spikes: Any, edit: MeasureSpikeEdit) -> list[tuple[float, float]]:
+    """Return a new ``(amplitude, t)`` measure with ``edit`` applied to one spike.
+    The input is left unmodified; ``"remove"`` drops the spike, ``"move"`` retunes
+    its position, ``"scale"`` multiplies its amplitude."""
+    out = [(float(a), float(t)) for a, t in spikes]
+    if edit.spike_index >= len(out):
+        raise IndexError(
+            f"spike_index {edit.spike_index} out of range for {len(out)} spikes"
+        )
+    a, t = out[edit.spike_index]
+    if edit.kind == "remove":
+        del out[edit.spike_index]
+    elif edit.kind == "move":
+        out[edit.spike_index] = (a, float(edit.new_t) % 1.0)
+    else:  # scale
+        out[edit.spike_index] = (a * float(edit.factor), t)
+    return out
+
+
+def spike_edit_code_delta(spikes: Any, edit: MeasureSpikeEdit, n_harmonics: int) -> np.ndarray:
+    """The ``2H`` change ``Δz = synth(edited) − synth(original)`` for a single-
+    spike edit. For ``"remove"`` this is exactly ``−a_j u(t_j)`` — the isolated
+    contribution of the removed instance, nothing else."""
+    before = synthesize_measure_code(spikes, n_harmonics)
+    after = synthesize_measure_code(apply_spike_edit(spikes, edit), n_harmonics)
+    return after - before
+
+
+def spike_edit_delta_x(decoder: Any, spikes: Any, edit: MeasureSpikeEdit) -> np.ndarray:
+    """Lift a single-spike code edit into the atom's ambient p-space:
+    ``Δx = Δz · D`` where ``decoder`` is the ``2H × p`` block decoder (code →
+    activation). The returned ``(p,)`` vector is the p-space move that removes /
+    moves / rescales exactly one instance of the circle feature; add it to the
+    token's activation to inject the edit. If the atom lives in a reduced basis
+    (e.g. sink-peeled PCA), map this through that basis to reach the model's
+    residual stream — see the App C design note."""
+    D = np.asarray(decoder, dtype=np.float64)
+    if D.ndim != 2:
+        raise ValueError(f"decoder must be 2-D (2H x p); got shape {D.shape}")
+    n_harmonics = D.shape[0] // 2
+    if 2 * n_harmonics != D.shape[0]:
+        raise ValueError(f"decoder rows {D.shape[0]} must be even (2H)")
+    delta_z = spike_edit_code_delta(spikes, edit, n_harmonics)
+    return delta_z @ D
+
+
+def build_spike_intervention_plan(
+    decoder: Any,
+    rows: Any,
+    measures: Any,
+    edits: Any,
+    *,
+    basis: Any | None = None,
+    atom: int = 0,
+    group: Any | None = None,
+) -> InterventionPlan:
+    """Assemble an :class:`InterventionPlan` of single-spike edits.
+
+    ``rows`` are the token rows to edit; ``measures[i]`` is row ``i``'s recovered
+    ``(amplitude, t)`` spike list; ``edits[i]`` is its :class:`MeasureSpikeEdit`.
+    Each record's ``delta_x`` is the p-space single-spike move
+    (:func:`spike_edit_delta_x`); when ``basis`` (``p_frame × p_model``) is given
+    the move is mapped ``Δx_model = Δx_frame · basis`` so it lands in the model's
+    residual stream. ``dose`` records ``[Δt]`` (the position change, ``0`` for
+    remove/scale) and ``nu_hat_1`` is left ``0`` (this plan measures realized KL,
+    not a Rung-1 prediction). Feed the result straight to
+    :func:`run_interventions`."""
+    rows = np.asarray(rows, dtype=np.int64)
+    m = rows.shape[0]
+    if len(measures) != m or len(edits) != m:
+        raise ValueError("rows, measures, edits must share length m")
+    deltas = []
+    doses = []
+    for i in range(m):
+        dx = spike_edit_delta_x(decoder, measures[i], edits[i])
+        if basis is not None:
+            dx = dx @ np.asarray(basis, dtype=np.float64)
+        deltas.append(dx)
+        edit = edits[i]
+        if edit.kind == "move":
+            a, t = measures[i][edit.spike_index]
+            doses.append([float(edit.new_t) % 1.0 - float(t)])
+        else:
+            doses.append([0.0])
+    delta_x = np.asarray(deltas, dtype=np.float64)
+    dose = np.asarray(doses, dtype=np.float64)
+    grp = np.arange(m, dtype=np.int64) if group is None else np.asarray(group, dtype=np.int64)
+    return InterventionPlan(
+        row=rows,
+        delta_x=delta_x,
+        atom=np.full((m,), int(atom), dtype=np.int64),
+        dose=dose,
+        nu_hat_1=np.zeros((m,), dtype=np.float64),
+        nu_hat_2=None,
+        group=grp,
     )
