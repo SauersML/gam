@@ -2828,3 +2828,113 @@ mod retained_radial_indices_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gc_spectrum_diag_1757_tests {
+    // ROOT-2 measurement for the perf cluster (#1757 duchon / #1689 thin-plate):
+    // does the design Gram Gc = KᵀK (radial kernel evaluated at the selected
+    // knots) have a REDUNDANCY CLIFF — a capacity-preserving low-rank truncation
+    // à la Wood-2003, where dropping near-duplicate radial columns shrinks the
+    // final basis dimension p WITHOUT removing function-space capacity — or only
+    // a smooth power-law tail, in which case no magic-free p-reduction exists and
+    // the current machine-eps whitening floor already keeps everything meaningful.
+    //
+    // This is a DIAGNOSTIC (no behavioural assertion beyond "it ran"): it prints
+    // the Gc spectrum for the #1757/#1689 repro sizes so CI can grep the shard
+    // log. It uses the PRODUCTION knot selector (`select_thin_plate_knots`,
+    // farthest-point) and the PRODUCTION thin-plate kernel
+    // (`thin_plate_kernel_from_dist2`), so the spectrum matches what the real
+    // basis builder forms (the polynomial-null constraint Z removes only 3 dims
+    // and cannot create or erase a spectral cliff, so the raw KᵀK Gram answers
+    // the redundancy-tail question).
+    use super::{select_thin_plate_knots, thin_plate_kernel_from_dist2};
+    use crate::basis::default_num_centers;
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use ndarray::Array2;
+
+    // Deterministic uniform scatter in [-1, 1]^2 (SplitMix64; no `rand`
+    // dependency, so the printed spectrum is reproducible across machines).
+    fn scatter(n: usize, seed: u64) -> Array2<f64> {
+        let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            ((z >> 11) as f64) / ((1u64 << 53) as f64) // in [0, 1)
+        };
+        let mut x = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            x[[i, 0]] = 2.0 * next() - 1.0;
+            x[[i, 1]] = 2.0 * next() - 1.0;
+        }
+        x
+    }
+
+    fn report(label: &str, n: usize, seed: u64) {
+        let x = scatter(n, seed);
+        let k = default_num_centers(n, 2);
+        let knots = select_thin_plate_knots(x.view(), k).expect("knot selection");
+        let kk = knots.nrows();
+        // Design K (n x kk): K[i,c] = phi(||x_i - knot_c||^2), thin-plate d=2.
+        let mut kdes = Array2::<f64>::zeros((n, kk));
+        for i in 0..n {
+            for c in 0..kk {
+                let dx = x[[i, 0]] - knots[[c, 0]];
+                let dy = x[[i, 1]] - knots[[c, 1]];
+                let d2 = dx * dx + dy * dy;
+                kdes[[i, c]] = thin_plate_kernel_from_dist2(d2, 2).expect("kernel");
+            }
+        }
+        let gc = kdes.t().dot(&kdes); // kk x kk design Gram
+        let (evals, _evecs) = FaerEigh::eigh(&gc, Side::Lower).expect("eigh");
+        let mut ev: Vec<f64> = evals.iter().copied().filter(|v| *v > 0.0).collect();
+        ev.sort_by(|a, b| b.partial_cmp(a).unwrap()); // descending
+        let m = ev.len();
+        if m == 0 {
+            eprintln!("[GC-DIAG-1757] {label} n={n}: empty spectrum");
+            return;
+        }
+        let lam_max = ev[0];
+        let eps_floor = (kk as f64) * f64::EPSILON * lam_max; // current whitening floor
+        let eps_kept = ev.iter().filter(|v| **v > eps_floor).count();
+        let count_rel = |t: f64| ev.iter().filter(|v| **v / lam_max > t).count();
+        // Largest multiplicative gap in the sorted spectrum (eigengap estimator).
+        let mut best_gap = 0.0_f64;
+        let mut gap_keep = m;
+        for j in 0..m - 1 {
+            let g = (ev[j] / ev[j + 1]).ln();
+            if g > best_gap {
+                best_gap = g;
+                gap_keep = j + 1;
+            }
+        }
+        eprintln!(
+            "[GC-DIAG-1757] {label} n={n} k_req={k} kk={kk} p={m} cond={:.2e} eps_kept={eps_kept} eigengap_keep={gap_keep} log_gap={:.2} | #rel> 1e-2:{} 1e-4:{} 1e-6:{} 1e-8:{} 1e-10:{}",
+            lam_max / ev[m - 1],
+            best_gap,
+            count_rel(1e-2),
+            count_rel(1e-4),
+            count_rel(1e-6),
+            count_rel(1e-8),
+            count_rel(1e-10),
+        );
+        let sampled: Vec<String> = (0..m)
+            .step_by((m / 20).max(1))
+            .map(|i| format!("{:.1}", (ev[i] / lam_max).log10()))
+            .collect();
+        eprintln!(
+            "[GC-DIAG-1757] {label} log10(rel eigenvalue) sampled: {}",
+            sampled.join(" ")
+        );
+    }
+
+    #[test]
+    fn gc_spectrum_duchon_thinplate_repro_sizes() {
+        report("duchon_n500", 500, 42);
+        report("duchon_n1220", 1220, 43);
+        report("thinplate_n1200", 1200, 7);
+    }
+}
