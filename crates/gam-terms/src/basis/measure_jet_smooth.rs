@@ -1260,8 +1260,10 @@ pub fn measure_jet_design_matrix(
 /// the keep/drop decision; the constant component of `points · T` is removed
 /// downstream by the global parametric orthogonalization). `T` is a
 /// deterministic function of the frozen centers + masses, so the frozen replay
-/// path reconstructs the identical head with no persisted state.
-fn measure_jet_affine_head_transform(
+/// path reconstructs the identical head with no persisted state. Public so the
+/// predict-side errors-in-variables gradient (#2225) can reconstruct the head
+/// lift `T` from the frozen centers + masses to differentiate the head block.
+pub fn measure_jet_affine_head_transform(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
 ) -> Array2<f64> {
