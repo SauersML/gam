@@ -580,14 +580,11 @@ where
 
     // Term/margin-order invariance (#1538/#1539). The per-ρ-coordinate canonical
     // keys label each coordinate by its placement-independent (penalty + data)
-    // content; the induced canonical permutation lets BOTH the objective-grid
-    // seed prepass AND the outer optimizer operate in an identical canonical
-    // coordinate layout for every term order. `None` when the coordinate count
-    // does not match the ρ-dimension (legacy native-order path, unchanged).
+    // content, letting the outer optimizer operate in an identical canonical
+    // coordinate layout for every term order (attached via
+    // `with_rho_canonical_keys` below). `None` when the coordinate count does not
+    // match the ρ-dimension (legacy native-order path, unchanged).
     let canon_keys = reml_state.canonical_rho_keys(k);
-    let canon_perm: Option<Vec<usize>> = canon_keys
-        .as_ref()
-        .and_then(|keys| crate::rho_optimizer::canonical_permutation(keys));
 
     let reml_seed_config = external_reml_seed_config(k, cfg.link_function());
     let reml_tol = cfg.reml_convergence_tolerance;
@@ -822,11 +819,11 @@ where
             let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
             // A caller-supplied rho seed (`init_rhos`/`heuristic_lambdas`, now in
             // rho-space) is an explicit warm-start installed via `with_initial_rho`
-            // above. It still ANCHORS the objective-grid prepass below rather than
-            // short-circuiting it: the grid is criterion-ranked and only adopts a
-            // candidate that STRICTLY lowers the true REML/LAML cost, so a healthy
-            // warm seed is returned unchanged (the grid never beats it → byte-
-            // identical behaviour). What the anchor-and-rank rescues is a warm seed
+            // above. It still ANCHORS the initial.sp prepass below rather than
+            // short-circuiting it: the prepass only adopts its analytic candidate
+            // when that STRICTLY lowers the true REML/LAML cost, so a healthy warm
+            // seed is returned unchanged (the candidate never beats it → byte-
+            // identical behaviour). What the anchor-and-adopt rescues is a warm seed
             // TRAPPED in a shallow under-smoothing local basin: when the design's
             // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
             // at a trial κ on the +chart side — the geodesic-exponential kernel's
@@ -835,41 +832,19 @@ where
             // from into the spurious low-λ optimum). The shallow optimum's
             // spuriously-low deviance made the κ outer objective monotone toward the
             // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
-            // as spherical); anchoring the global grid at the warm seed lets the
+            // as spherical); the analytic high-λ `initial.sp` candidate lets the
             // prepass jump into the correct high-λ basin so the per-κ REML cost
             // matches the textbook profiled-REML and the curvature SIGN is
             // identifiable. Same machinery as the gam#1266 double-penalty rescue.
             let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
-            // The grid prepass's lowest-cost sample, kept for the #1371
+            // The initial.sp prepass's lowest-cost sample, kept for the #1371
             // release-and-rerank guard even when it is not adopted as the initial
-            // seed (i.e. the grid did not strictly move). It is a known-good lower
-            // bound on the achievable REML cost, scored with the SAME functional.
-            // Unconditionally assigned inside the prepass block below (before its
-            // first read by the #1371 guard), so it carries no dead initializer.
+            // seed (i.e. the candidate did not strictly beat the anchor). It is a
+            // known-good lower bound on the achievable REML cost, scored with the
+            // SAME functional. Unconditionally assigned inside the prepass block
+            // below (before its first read by the #1371 guard), so it carries no
+            // dead initializer.
             let release_rerank_seed: Option<Array1<f64>>;
-            // #1548: the well-determined Marra-Wood double-penalty null-space
-            // selection coordinates, recognised exactly as the #1266 shrink-out
-            // escape recognises them (the relaxed `Normal(0, sd=15)` degeneracy
-            // prior, gated by `n ≥ 2·p`). A SUPPORTED such coordinate has a deep
-            // low-λ_null "keep" basin AND a flat high-λ_null annihilation shelf; the
-            // objective-grid prepass below probes the keep corner for exactly these
-            // coordinates so it can seed the well-conditioned keep basin directly
-            // rather than the shelf — see the keep-saturation probe in
-            // `select_objective_seed_on_log_lambda_grid`.
-            let nullspace_seed_coords: Vec<usize> = if n_design_rows >= 2 * p {
-                match reml_state.effective_rho_prior().as_ref() {
-                    gam_problem::RhoPrior::Independent(per_coord) => (0..k)
-                        .filter(|&i| {
-                            per_coord
-                                .get(i)
-                                .is_some_and(gam_terms::smooth::is_nullspace_degeneracy_prior)
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
             let prepass_seed: Option<Array1<f64>> = {
                 let bnds = reml_seed_config.bounds;
                 let (lo, hi_seed) = if bnds.0 <= bnds.1 {
@@ -904,84 +879,72 @@ where
                     SeedRiskProfile::GeneralizedLinear => 1.0,
                     SeedRiskProfile::Survival => 2.0,
                 };
-                // Anchor the grid at the caller-supplied `heuristic_lambdas` when one
-                // is present (it is already in rho-space, used as-is) — the grid then
-                // searches relative to the warm start and keeps it unless a candidate
-                // is strictly better. Otherwise anchor the default risk-shift origin
-                // to the weight scale (issue #877).
+                // Anchor the prepass at the caller-supplied `heuristic_lambdas` when
+                // one is present (it is already in rho-space, used as-is) — the
+                // analytic candidate is scored relative to the warm start and keeps
+                // it unless it is strictly better. Otherwise anchor the default
+                // risk-shift origin to the weight scale (issue #877).
                 let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
                     Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
                 } else {
                     Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
                 };
-                // Run the objective-grid seed search in CANONICAL coordinate order
-                // (#1538/#1539) so its greedy per-axis / pairwise-saturation
-                // refinement — which is order-dependent in native layout — explores
-                // the SAME axes for every term order. The grid builds canonical
-                // candidates; the eval closure maps each back to native order before
-                // scoring with the true `compute_cost`, and the refined seed is
-                // mapped native again for `with_initial_rho`. Without a permutation
-                // this is the identity, so the native-order path is byte-for-byte
-                // unchanged.
-                let refined = if let Some(perm) = canon_perm.as_ref() {
-                    let to_native = |canon: &Array1<f64>| -> Array1<f64> {
-                        let mut out = Array1::zeros(canon.len());
-                        for (c, &i) in perm.iter().enumerate() {
-                            out[i] = canon[c];
-                        }
-                        out
-                    };
-                    let base_canon = Array1::from_iter(perm.iter().map(|&i| base[i]));
-                    // Canonical slot `c` carries native coordinate `perm[c]`; a
-                    // null-space coordinate must be probed in whichever slot it
-                    // occupies in the canonical layout the grid refines.
-                    let nullspace_canon: Vec<usize> = (0..k)
-                        .filter(|&c| nullspace_seed_coords.contains(&perm[c]))
-                        .collect();
-                    let refined_canon = crate::seeding::select_objective_seed_on_log_lambda_grid(
-                        &base_canon,
-                        (lo, hi),
-                        k,
-                        &nullspace_canon,
-                        |canon_rho| {
-                            let native = to_native(canon_rho);
-                            reml_state
-                                .compute_cost(&native)
-                                .ok()
-                                .filter(|c| c.is_finite())
-                        },
-                    );
-                    to_native(&refined_canon)
-                } else {
-                    crate::seeding::select_objective_seed_on_log_lambda_grid(
-                        &base,
-                        (lo, hi),
-                        k,
-                        &nullspace_seed_coords,
-                        |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
-                    )
+                // #2069 / #1575: the analytic mgcv-style `initial.sp` seed
+                // replaces the banned log-λ grid prepass. One commensurate-
+                // curvature estimate — `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` — proposes a
+                // single candidate relative to `base` (the caller warm-start or the
+                // weight-anchored origin). A smooth whose penalized subspace carries
+                // little data support gets a large `λ_j` by construction, so the
+                // #1266/#1464 high-λ basin is reached analytically without a lattice
+                // search; `(lo, hi)` already widens `hi` to `RHO_BOUND` so a
+                // genuinely large `λ_j` is not clipped to the seed band. The seed is
+                // order-independent, so no canonical permutation is needed.
+                let candidate = reml_state
+                    .analytic_initial_sp_rho(&base, (lo, hi))
+                    .unwrap_or_else(|| base.clone());
+                // Adopt the analytic candidate only when it STRICTLY lowers the true
+                // REML/LAML cost against the anchor — exactly the criterion the old
+                // grid used, but scoring one principled candidate instead of a
+                // lattice. This keeps a healthy warm start byte-identical (the
+                // candidate does not beat it → not adopted) yet still jumps a warm
+                // seed TRAPPED in a shallow under-smoothing basin into the analytic
+                // high-λ basin (#1266 double-penalty null-space, #1464 collapsing-
+                // kernel spatial). Two scored inner solves replace the grid's ~30.
+                // The generated-seed screen (`generate_rho_candidates` +
+                // `rank_seeds_with_screening`) remains the multi-basin backstop.
+                let base_cost = reml_state
+                    .compute_cost(&base)
+                    .ok()
+                    .filter(|c| c.is_finite());
+                let candidate_cost = reml_state
+                    .compute_cost(&candidate)
+                    .ok()
+                    .filter(|c| c.is_finite());
+                let candidate_beats_base = match (candidate_cost, base_cost) {
+                    (Some(cc), Some(bc)) => cc < bc,
+                    (Some(_), None) => true,
+                    _ => false,
                 };
-                // Emit the seed when the grid moved it, or — on the Gaussian
-                // weight-anchored path — whenever the anchored `base` is itself
-                // offset from the unanchored origin (so the shifted optimum is
-                // actually seeded even if the coarse grid leaves `base` unchanged).
-                // Record the grid's best sample for the release-and-rerank guard
-                // unconditionally — whether or not it is strong enough to override
-                // the optimizer's own cold start, it is still a scored lower bound
-                // the certified optimum must not be worse than (#1371).
+                let refined = if candidate_beats_base {
+                    candidate
+                } else {
+                    base.clone()
+                };
+                // The lowest-cost sample seen, kept as the #1371 release-and-rerank
+                // lower bound the certified optimum must not be worse than.
                 release_rerank_seed = Some(refined.clone());
-                let grid_moved = refined
+                let seed_moved = refined
                     .iter()
                     .zip(base.iter())
                     .any(|(&a, &b)| (a - b).abs() > 1e-12);
-                // For a caller-seeded fit, adopt the grid result only when it
-                // STRICTLY moved the warm seed (i.e. found a strictly-cheaper basin);
-                // an unmoved grid leaves the warm start exactly as installed above, so
+                // For a caller-seeded fit, adopt the analytic result only when it
+                // strictly moved the warm seed (found a strictly-cheaper basin); an
+                // unmoved result leaves the warm start exactly as installed above, so
                 // healthy warm-started fits stay byte-identical. The Gaussian
                 // weight-anchored emit only applies on the non-caller-seeded origin.
-                if grid_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
+                if seed_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
                     log::info!(
-                        "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
+                        "[OUTER] standard REML initial.sp selected seed: {:?} -> {:?}",
                         base.as_slice().unwrap_or(&[]),
                         refined.as_slice().unwrap_or(&[])
                     );

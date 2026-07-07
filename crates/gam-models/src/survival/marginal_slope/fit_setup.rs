@@ -546,6 +546,54 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     Ok(true)
 }
 
+/// Enable the Marra & Wood double penalty — a null-space shrinkage ridge with
+/// its own REML-selected smoothing parameter — on every smooth in `spec` whose
+/// basis carries an unpenalized polynomial null space, so that "trend"
+/// direction is identified rather than left flat.
+///
+/// gam#979: the survival marginal-slope marginal/logslope smooth surfaces are
+/// built with `double_penalty=false` (the default), so the general basis
+/// builder leaves their penalty null space (the polynomial trend the
+/// wiggliness penalty does not touch) unpenalized. At the REML optimum that
+/// trend direction is then a large-signal / tiny-curvature mode, and the inner
+/// joint-Newton deadlocks on it: the spectral trust-region step DROPS it as a
+/// near-null gauge direction (gam#1082) while the convergence certificate
+/// REQUIRES it be resolved (gam#1449) — so the solve can neither progress nor
+/// certify and grinds to the cycle cap on every outer ρ-evaluation (the
+/// measured n=3000 ~1976 s hang). The survival TIME block already avoids this
+/// via [`install_time_nullspace_shrinkage_penalty`]; this brings the
+/// marginal/logslope surfaces to the same footing through the ordinary basis
+/// builder (which keeps the layered penalty representation self-consistent
+/// across every probe/frozen/kappa rebuild). Duchon bases are skipped because
+/// their function-norm penalty already spans the polynomial null space (and
+/// they carry no `double_penalty` field); factor/measure/tensor/PCA bases have
+/// no simple trend null space to shrink here and are left untouched.
+pub(crate) fn enable_surface_identifiability_double_penalty(spec: &mut TermCollectionSpec) {
+    for term in spec.smooth_terms.iter_mut() {
+        enable_double_penalty_on_basis(&mut term.basis);
+    }
+}
+
+fn enable_double_penalty_on_basis(basis: &mut gam_terms::smooth::SmoothBasisSpec) {
+    use gam_terms::smooth::SmoothBasisSpec as B;
+    match basis {
+        B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
+            enable_double_penalty_on_basis(inner)
+        }
+        B::BySmooth { smooth, .. } => enable_double_penalty_on_basis(smooth),
+        B::BSpline1D { spec, .. } => spec.double_penalty = true,
+        B::ThinPlate { spec, .. } => spec.double_penalty = true,
+        B::Matern { spec, .. } => spec.double_penalty = true,
+        B::Sphere { spec, .. } => spec.double_penalty = true,
+        B::ConstantCurvature { spec, .. } => spec.double_penalty = true,
+        B::Duchon { .. }
+        | B::MeasureJet { .. }
+        | B::Pca { .. }
+        | B::TensorBSpline { .. }
+        | B::FactorSmooth { .. } => {}
+    }
+}
+
 pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollectionSpec {
     let mut out = TermCollectionSpec {
         linear_terms: Vec::new(),

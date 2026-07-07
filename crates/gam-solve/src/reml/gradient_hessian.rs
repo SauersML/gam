@@ -3880,6 +3880,72 @@ impl<'a> RemlState<'a> {
         if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
+    /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
+    ///
+    /// For each penalty block `j` this sets
+    /// `ρ_j = ln( tr(XᵀWX over block j's columns) / tr(S_j) )` — the
+    /// *commensurate-curvature* start that balances the Fisher-information block
+    /// against the penalty block, so `λ_j S_j` and the data curvature enter the
+    /// penalized Hessian `XᵀWX + λ_j S_j` at the same scale. Because `tr(XᵀWX)`
+    /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
+    /// scaled `λ_j` (no separate weight anchoring needed).
+    ///
+    /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
+    /// data-derived estimate, no lattice search. A smooth whose penalized
+    /// subspace carries little data support has a small `tr(XᵀWX)` there and so
+    /// receives a *large* `λ_j` by construction — landing the high-λ
+    /// (over-smoothing) basin of a double-penalty null-space smooth (#1266) or a
+    /// collapsing-kernel spatial smooth (#1464) analytically, which is exactly
+    /// what the grid was bolted on to reach.
+    ///
+    /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
+    /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
+    /// `base` are not smoothing parameters and are passed through unchanged.
+    /// Returns `None` (caller keeps `base`) when the design Gram is unavailable
+    /// or its width does not match `p`.
+    pub(crate) fn analytic_initial_sp_rho(
+        &self,
+        base: &Array1<f64>,
+        bounds: (f64, f64),
+    ) -> Option<Array1<f64>> {
+        let n_pen = self.canonical_penalties.len();
+        let n_rho = base.len().min(n_pen);
+        if n_rho == 0 {
+            return None;
+        }
+        let weights = self.weights.to_owned();
+        let gram_diag = self.x.diag_gram(&weights).ok()?;
+        if gram_diag.len() != self.p {
+            return None;
+        }
+        let (lo, hi) = if bounds.0 <= bounds.1 {
+            bounds
+        } else {
+            (bounds.1, bounds.0)
+        };
+        let mut rho = base.clone();
+        for j in 0..n_rho {
+            let pen = &self.canonical_penalties[j];
+            // tr(S_j): the penalty is PSD, so its trace is the sum of its
+            // positive eigenvalues (cached at construction).
+            let tr_s: f64 = pen.positive_eigenvalues.iter().sum();
+            // tr(XᵀWX) restricted to this penalty's coefficient columns.
+            let mut tr_xwx = 0.0_f64;
+            for c in pen.col_range.clone() {
+                if let Some(&d) = gram_diag.get(c) {
+                    tr_xwx += d;
+                }
+            }
+            if tr_s > 0.0 && tr_xwx > 0.0 && tr_xwx.is_finite() {
+                let rho_j = (tr_xwx / tr_s).ln();
+                if rho_j.is_finite() {
+                    rho[j] = rho_j.clamp(lo, hi);
+                }
+            }
+        }
+        Some(rho)
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
