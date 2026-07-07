@@ -4046,6 +4046,10 @@ fn sae_manifold_fit_inner<'py>(
             analytic_penalties.as_ref(),
         )
         .map_err(py_value_error)?;
+        // Snapshot the fitted term: the optional joint recompute mutates `term`
+        // while re-solving, so a recoverable refusal must not leave the actual
+        // fitted model perturbed. Restore it before degrading to per-atom bands.
+        let saved_term_for_shape_recompute = term.clone();
         match term.recompute_joint_shape_uncertainty(
             z_view.view(),
             &rho,
@@ -4063,6 +4067,7 @@ fn sae_manifold_fit_inner<'py>(
                     .map_err(py_value_error)?;
             }
             Err(e) => {
+                term = saved_term_for_shape_recompute;
                 // The joint factor could not be reformed at the final state (a
                 // non-PD post-search Hessian / an unadmitted dense Schur). Fall
                 // back to the per-atom Laplace completion: invalidate the stale

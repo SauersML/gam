@@ -806,15 +806,30 @@ impl SaeManifoldOuterObjective {
             self.term.output_dim(),
             self.term.k_atoms(),
         )?;
-        if !plan.direct_logdet_admitted() {
-            let loss = self.term.loss(self.target.view(), &rho)?;
-            let n_scalar = (self.term.n_obs().saturating_mul(self.term.output_dim())).max(1) as f64;
+        // Honest no-joint-covariance shape bands: per-atom Laplace marginals only,
+        // scaled by the Gaussian reconstruction dispersion φ̂. Used both when the
+        // Direct log-det factor is not admitted and when the optional joint
+        // re-solve refuses recoverably (see below).
+        let fallback_without_joint_covariance = |term: &SaeManifoldTerm| {
+            let loss = term.loss(self.target.view(), &rho)?;
+            let n_scalar = (term.n_obs().saturating_mul(term.output_dim())).max(1) as f64;
             let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
-            return Ok(self
-                .term
-                .shape_uncertainty_without_decoder_covariance(dispersion));
+            Ok(term.shape_uncertainty_without_decoder_covariance(dispersion))
+        };
+        if !plan.direct_logdet_admitted() {
+            return fallback_without_joint_covariance(&self.term);
         }
-        let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
+        // This optional post-fit covariance recompute re-enters the strict undamped
+        // Laplace inner solve at the settled ρ. Although the term is at the outer
+        // optimum, that re-solve can still refuse to certify the full-budget joint
+        // factor (the same recoverable "inner solve did not converge at fixed ρ"
+        // class the value/gradient/EFS lanes map to a finite wall). This path is
+        // optional — a recoverable refusal must degrade to no-covariance shape
+        // bands, NOT abort the public fit. `reml_criterion_with_cache` mutates
+        // `self.term` while re-solving, so snapshot and restore the fitted term
+        // before falling back.
+        let saved_term = self.term.clone();
+        let evaluated = self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -822,7 +837,22 @@ impl SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
-        )?;
+        );
+        let (_cost, loss, cache) = match evaluated {
+            Ok(evaluated) => evaluated,
+            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                self.term = saved_term;
+                log::warn!(
+                    "[shape-uncertainty] joint decoder covariance unavailable ({err}); \
+                     returning no-covariance per-atom shape bands"
+                );
+                return fallback_without_joint_covariance(&self.term);
+            }
+            Err(err) => {
+                self.term = saved_term;
+                return Err(err);
+            }
+        };
         let dispersion = self.term.reconstruction_dispersion(&loss, &cache, &rho)?;
         self.term.assemble_shape_uncertainty(&cache, dispersion)
     }

@@ -3477,7 +3477,7 @@ Tests:
 - fix(survival): Royston–Parmar monotonicity is enforced at every observed exit time; structural model construction is split from the ≥1-event fittability check so all fit modes share one validation chokepoint.
 - fix(multinomial): the matrix-free Hessian diagonal mirrors the dense path's parallel reduction order, restoring bit-identical agreement under IEEE-754 non-associativity.
 - fix(reml): the TK-refinement scale gate is aligned with the outer Firth gate.
-- fix(#795): `sae_manifold_fit` defaults `isometry_weight=0.0`, so the single-planted-circle quickstart converges (the MeanProfiled isometry energy is not scale-invariant and was saturating the arrow-Schur proximal ridge); pass `isometry_weight > 0` to opt back in. Adds a default-exercising regression test.
+- fix(#795): `sae_manifold_fit` converges on the single-planted-circle quickstart at the default `isometry_weight=1.0` (the MeanProfiled isometry energy is now scale-invariant and no longer saturates the arrow-Schur proximal ridge); pass `isometry_weight=0.0` to disable the isometry prior. Adds a default-exercising regression test.
 - chore: removed accidentally-committed repro scripts / build log from the tree (and the gamfit sdist).
 
 ## gam v0.3.102 / gamfit v0.1.176

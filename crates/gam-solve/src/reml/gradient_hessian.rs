@@ -3946,6 +3946,105 @@ impl<'a> RemlState<'a> {
         Some(rho)
     }
 
+    /// Exact global Gaussian-identity REML smoothing parameter via the
+    /// Demmler–Reinsch closed form — the structural cure for the high-λ shelf.
+    ///
+    /// For a Gaussian/identity fit the profiled REML criterion, written in the
+    /// pencil `(S, XᵀWX)` eigenbasis, is an EXPLICIT scalar `V(ρ)`. Every term's
+    /// ρ-derivative decays like `e^{-ρ}` as `ρ→∞`, so `V'(ρ)→0` at large λ for
+    /// EVERY dataset: the over-smoothing shelf is a structural stationary region
+    /// at infinity, not a data pathology. A descent method on ρ (Newton /
+    /// quasi-Newton, mgcv's `newton`/`efs` included) that starts on — or is
+    /// pushed onto — that plateau declares convergence there and rails to an
+    /// over-smoothed `λ̂` even though the true global optimum sits in a
+    /// finite-λ basin with a strictly lower REML (measured for sin8 k=40: shelf
+    /// edf≈2 REML≈+252 vs basin edf≈39 REML≈−104). The closed form does not
+    /// descend `V`; it selects the global minimiser over the whole ρ range from
+    /// the one eigendecomposition of the pencil, so the shelf cannot capture it.
+    ///
+    /// This returns the single shared-λ optimum `ρ*` over `S = Σ_j S_j` (all
+    /// penalty blocks summed). It is consumed as ONE scored seed for the
+    /// multi-λ outer search: setting every block coordinate to `ρ*` reproduces
+    /// the closed form's penalization `e^{ρ*}·Σ_j S_j` exactly, so its REML cost
+    /// equals the closed form's global optimum, and the keep-best seed screen
+    /// adopts it only when it strictly beats the mgcv-style `initial.sp` anchor.
+    /// The outer optimizer then refines each block's λ independently from this
+    /// good-basin start, so a genuinely multi-λ surface is never worsened.
+    ///
+    /// Returns `None` (caller keeps its other seeds) whenever the closed form's
+    /// assumptions do not hold: a non-Gaussian/identity likelihood, a
+    /// constrained fit (inequality constraints, coefficient bounds, mixture/SAS
+    /// link states) whose profiled ridge the closed form does not model, no
+    /// penalties, or a sparse design (skipped rather than densified so a huge
+    /// random-effects design never pays an `n×p` materialization).
+    pub(crate) fn analytic_gaussian_closed_form_rho(&self, bounds: (f64, f64)) -> Option<f64> {
+        if !reml_is_gaussian_identity(&self.config.likelihood) {
+            return None;
+        }
+        // The closed form solves an unconstrained ridge `min ‖W^½(y−Xβ)‖² +
+        // λβᵀSβ`; it models none of these side conditions, so defer to the
+        // general seeds when any are present.
+        if self.linear_constraints.is_some()
+            || self.coefficient_lower_bounds.is_some()
+            || self.runtime_mixture_link_state.is_some()
+            || self.runtime_sas_link_state.is_some()
+        {
+            return None;
+        }
+        if self.canonical_penalties.is_empty() {
+            return None;
+        }
+        // Densify only an already-dense design: a sparse (e.g. large
+        // random-effects) design is skipped rather than materialized, so this
+        // prepass never allocates an `n×p` dense block behind the caller's back.
+        if !matches!(self.x, DesignMatrix::Dense(_)) {
+            return None;
+        }
+        let x_dense = self
+            .x
+            .try_to_dense_by_chunks("gaussian_closed_form_seed")
+            .ok()?;
+        let p = self.p;
+        if x_dense.ncols() != p {
+            return None;
+        }
+        // S = Σ_j scatter(local_j) — the single summed penalty at λ = 1.
+        let mut s = Array2::<f64>::zeros((p, p));
+        for pen in self.canonical_penalties.iter() {
+            let r = pen.col_range.clone();
+            for (li, gi) in r.clone().enumerate() {
+                for (lj, gj) in r.clone().enumerate() {
+                    s[[gi, gj]] += pen.local[[li, lj]];
+                }
+            }
+        }
+        // The closed form fits `y ~ Xβ` with no offset term, so fold any offset
+        // into the response.
+        let mut y_eff = self.y.to_owned();
+        if self.offset.len() == y_eff.len() {
+            y_eff -= &self.offset;
+        }
+        let weights = self.weights.to_owned();
+        let cf = crate::gaussian_reml::gaussian_reml_closed_form(
+            x_dense.view(),
+            y_eff.view(),
+            s.view(),
+            Some(weights.view()),
+            None,
+        )
+        .ok()?;
+        let (lo, hi) = if bounds.0 <= bounds.1 {
+            bounds
+        } else {
+            (bounds.1, bounds.0)
+        };
+        if cf.rho.is_finite() {
+            Some(cf.rho.clamp(lo, hi))
+        } else {
+            None
+        }
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
