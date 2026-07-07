@@ -63,7 +63,8 @@ fn compact_layout(
     }
 
     SaeRowLayout {
-        active_atoms,
+        active_atoms: active_atoms.clone(),
+        logit_atoms: active_atoms,
         coord_starts,
         coord_offsets_full,
         coord_dims,
@@ -185,7 +186,8 @@ fn compact_scratch_sized_by_worst_case_row_1410() {
     }
 
     let layout = SaeRowLayout {
-        active_atoms,
+        active_atoms: active_atoms.clone(),
+        logit_atoms: active_atoms,
         coord_starts,
         coord_offsets_full,
         coord_dims,
