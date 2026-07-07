@@ -816,19 +816,25 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
-        // gam#979 box-bound (simple lower bound) KKT projection. `residual` here
-        // is the objective gradient `Sβ − ∇ℓ`. At a lower bound `β_j ≥ L_j`,
-        // the constrained-optimality condition is a NONNEGATIVE multiplier:
-        // `residual_j ≥ 0` (the objective wants to push β_j below L_j, and the
-        // bound holds it). So a coordinate sitting at its active lower bound with
-        // `residual_j ≥ 0` is at a valid constrained optimum on that coordinate —
-        // zero it, exactly as `projected_stationarity_inf_norm` zeroes an active
-        // LINEAR-constraint multiplier. The SIGN CHECK is load-bearing: a
-        // coordinate at the bound whose `residual_j < 0` (the objective wants to
-        // INCREASE β_j, i.e. LEAVE the bound) is NOT optimal — the bound should be
-        // released — so it STAYS in the residual and the certificate still
-        // (correctly) refuses. Adds only the box path; blocks with no simple
-        // lower bound are byte-identical to before.
+        // gam#979 box-bound (simple lower bound) KKT residual. `residual` here is
+        // the objective gradient `r = Sβ − ∇ℓ`. The correct stationarity measure
+        // for `β_j ≥ L_j` is the PROJECTED GRADIENT
+        //     pg_j = β_j − Π_{[L_j,∞)}(β_j − r_j) = β_j − max(L_j, β_j − r_j),
+        // which (a) is byte-identical to `r_j` on any coordinate whose gradient
+        // step stays feasible (interior, or a bound that wants to be left), and
+        // (b) collapses a VALID lower-bound multiplier to the mere distance to
+        // the bound: at `β_j = L_j + ε` with `r_j ≥ 0` (gradient pushing INTO the
+        // bound), `pg_j = min(r_j, ε) = ε → 0` as the (possibly damped) iterate
+        // reaches `L_j`. This is why the certificate no longer mis-reads the huge
+        // pushing-into-bound multiplier (the 626 on the survival monotone-hazard
+        // `time_surface` coeff pinned near its ≥0 bound) as a stationarity defect
+        // — the failure mode noted just above (slack-based detection missing a
+        // damped binding row at `β = L + ε` with ε over tol). The SIGN CHECK is
+        // INTRINSIC, not a separate slack test: a coordinate at its bound whose
+        // `r_j < 0` (wants to INCREASE β_j, i.e. LEAVE the bound) has `β_j − r_j >
+        // β_j ≥ L_j`, so `pg_j = r_j` is UNCHANGED and the cert still (correctly)
+        // refuses a non-optimal point. Blocks with no simple lower bound skip this
+        // and are byte-identical to before.
         if let Some(lowers) = joint_lower_bounds {
             for j in 0..width {
                 let lower = lowers[offset + j];
@@ -836,11 +842,7 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
                     continue;
                 }
                 let beta_j = states[b].beta[j];
-                let scale = beta_j.abs().max(lower.abs()).max(1.0);
-                let bound_tol = 1e-6 * scale + 1e-10;
-                if beta_j <= lower + bound_tol && residual[j] >= 0.0 {
-                    residual[j] = 0.0;
-                }
+                residual[j] = beta_j - (beta_j - residual[j]).max(lower);
             }
         }
         let block_active_hint = block_active_sets
