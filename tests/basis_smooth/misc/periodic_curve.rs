@@ -184,7 +184,15 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap();
     assert_eq!(design.smooth.terms.len(), 1);
-    assert_eq!(design.smooth.terms[0].penalties_local.len(), 2);
+    // A cyclic P-spline is a SINGLE-penalty smooth even under `double_penalty`
+    // (#874, matching mgcv's `bs="cc"`): the cyclic difference penalty's only
+    // null direction is the constant, which the periodic sum-to-zero
+    // identifiability constraint removes wholesale. The null-space ("double")
+    // penalty is the projector onto exactly that constant, so after the
+    // constraint transform it is identically zero — an unidentified λ that
+    // makes the outer REML objective flat and prevents convergence. The builder
+    // therefore emits only the wiggliness penalty (see bspline_build.rs).
+    assert_eq!(design.smooth.terms[0].penalties_local.len(), 1);
 
     let built = build_bspline_basis_1d(
         x.view(),
