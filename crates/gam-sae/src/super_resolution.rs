@@ -274,7 +274,7 @@ pub fn recover_spikes(
         .iter()
         .map(|z| {
             let norm = z.norm();
-            if norm > 0.0 { z / norm } else { c64::new(1.0, 0.0) }
+            if norm > 0.0 { *z / norm } else { c64::new(1.0, 0.0) }
         })
         .collect();
     let positions: Vec<f64> = phasors
