@@ -79,10 +79,19 @@ fn store_lookup_returns_inserted_payload_at_same_key() {
 #[test]
 fn eviction_prefers_recently_hit_entries_under_budget_pressure() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // Budget must admit exactly two entries but not three, so that inserting the
+    // third forces one eviction — the "budget pressure" this test names. Each
+    // entry's on-disk footprint is its 600-byte payload PLUS its metadata JSON
+    // (~336 bytes: checksum, stamps, kind, ...), which also counts against the
+    // budget (see `concurrent_writes_..._budget_is_respected`, which asserts on
+    // meta+bin bytes). So an entry is ~936 bytes: two fit (~1872), three do not
+    // (~2808). 2400 sits centrally between those with margin for meta-size drift.
+    // A too-small budget (e.g. 1600) evicts `a` on the *second* save — before it
+    // is ever hit — so the recency scenario below would never be exercised.
     let store = WarmStartStore::open(
         dir.path().to_path_buf(),
         StoreOptions {
-            size_budget_bytes: 1600,
+            size_budget_bytes: 2400,
             ttl: Duration::from_secs(60),
         },
     )
