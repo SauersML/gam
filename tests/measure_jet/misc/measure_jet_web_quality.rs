@@ -563,7 +563,41 @@ fn measure_jet_web_quality_contracts() {
     // must approximately cover the TRUE mean at held-out on-web points.
     // Held-out ON-WEB points outside the gap: coverage is a claim about
     // interpolation honesty; gap extrapolation has its own (bias) gate.
-    let coverage_test: Vec<WebPoint> = sample_web(140, 46, true);
+    //
+    // The query points are placed at their CLEAN on-web ambient locations
+    // (`embed_latent` with no coordinate noise), keeping the same seeded
+    // t/strand draws (seed 46, gap dropped) as everywhere else. This is
+    // deliberate and load-bearing for the interval-honesty contract:
+    // `beta_covariance_corrected` is a mean-CI covariance — the mgcv
+    // `predict(se.fit = TRUE)` analog — whose promise is coverage of the
+    // TRUE mean AT THE EVALUATED QUERY LOCATION, under the assumption that
+    // the query covariates are known exactly (mgcv makes the same
+    // assumption). Evaluating the band at a NOISE-PERTURBED query `z+ε`
+    // while comparing to the truth `f(z)` at the un-perturbed location `z`
+    // is an errors-in-variables (EIV) confound the band never promised to
+    // cover: the web-tangent component of ε moves along arc-length, so the
+    // intrinsic truth there differs from `f(z)` by (arc-length slope)·ε_tan,
+    // injecting ~0.03 of pure query-location error that no mean-CI
+    // covariance contains (and that the measure-jet extrapolation term,
+    // which prices only PERPENDICULAR off-web ignorance, correctly does not
+    // charge either). That EIV capability — a genuine `Var_input =
+    // ∇f̂ᵀ Σ_x ∇f̂` term keyed to an estimated ambient sampling-noise scale
+    // — is tracked separately (#1845 follow-up); it is NOT what this
+    // interpolation-honesty gate tests. Fixing the location mismatch is a
+    // test-semantics correction, not a loosened bound.
+    let e_web = embedding();
+    let coverage_test: Vec<WebPoint> = sample_web(140, 46, true)
+        .into_iter()
+        .map(|p| {
+            let (z, truth) = latent_point(p.strand, p.t);
+            WebPoint {
+                coords: embed_latent(&e_web, z),
+                truth,
+                strand: p.strand,
+                t: p.t,
+            }
+        })
+        .collect();
 
     let interval_fit = fit_web(MJS_INTERVAL_FORMULA, &data, "gaussian");
     let m = ambient_matrix(&data, &coverage_test);
