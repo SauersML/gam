@@ -668,6 +668,27 @@ pub struct SaeManifoldAtom {
     /// is ~1.5 GB at `n = 10⁶`; the `Q ≈ 4096` compact jet is ~6 MB and still
     /// oversamples the `≤ M(M+1)/2 ≲ 1.2k`-dof Gram 3–6×.
     pub bending_quadrature_rows: Option<Vec<usize>>,
+    /// Orthonormal column map `Q` (`M × r`) frozen by the #1117 rank-revealing
+    /// reduction [`Self::reduce_basis_to_subspace`]. `Some` iff this atom's
+    /// fixed-width inner basis was reparametrized onto its data-supported
+    /// subspace: [`Self::decoder_coefficients`] is then the REDUCED
+    /// `B̃ = Qᵀ B` (`r × p`), [`Self::basis_values`] the reduced `Φ̃ = Φ Q`
+    /// (`n × r`), and the live evaluator a [`SubspaceReducedEvaluator`] emitting
+    /// `Φ̃` on every refresh — so the reduced design is full-rank BY
+    /// CONSTRUCTION for the whole fit.
+    ///
+    /// The reduction is a purely INTERNAL fit-conditioning device and must not
+    /// escape to a consumer that rebuilds the standard fixed-width inner basis
+    /// from emitted metadata (out-of-sample predict / steer / reconstruction,
+    /// issue #2135): such a consumer re-emits the full `M`-column inner design
+    /// (`[1, sin, cos, …]`), against which the correct decoder is the full-width
+    /// pre-image `B = Q B̃` (`M × p`), NOT the reduced `B̃`. Decoding the full
+    /// design by the reduced block mismatches widths (`M` vs `r`) and is the
+    /// #2135 "decoder_blocks[k] has M=2 but rebuilt basis has M=3" defect.
+    /// [`Self::full_width_decoder`] / [`Self::full_basis_size`] re-expand the
+    /// reduced frame at the emission boundary so it never leaks. `None` ⇒ the
+    /// atom was never reduced and the stored decoder is already full-width.
+    pub reduced_column_map: Option<Array2<f64>>,
 }
 
 /// Quadrature-subsample cap for the `d ≥ 2` bending Gram: above this many active
@@ -739,6 +760,9 @@ impl SaeManifoldAtom {
             // #2022 — default 0.0 ⇒ exp(s)=1 ⇒ historical `Φ·B` bit-for-bit.
             log_amplitude: 0.0,
             bending_quadrature_rows: None,
+            // Set only by `reduce_basis_to_subspace`; a freshly-built atom is
+            // full-width (its decoder is already the un-reduced `M × p` block).
+            reduced_column_map: None,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
@@ -890,7 +914,109 @@ impl SaeManifoldAtom {
         // (`basis_values`, `decoder_coefficients`, `smooth_penalty_raw`,
         // `smooth_penalty_order`, `basis_kind`, `latent_dim`) are now set.
         self.refresh_intrinsic_smooth_penalty();
+        // Record the inner→reduced column map so the reduced frame can be
+        // re-expanded at the emission boundary (#2135). If this atom was ALREADY
+        // reduced (`prev`: `M × r_prev`) and is being reduced again against its
+        // now-`r_prev`-wide inner basis (`q`: `r_prev × r`), compose so the
+        // stored map stays the true inner-width `M × r` congruence
+        // `Φ_inner (Q_prev Q) = Φ̃`. (In practice the reduced design is full-rank
+        // by construction, so a second reduction is a no-op skip; the
+        // composition is defensive.)
+        self.reduced_column_map = Some(match self.reduced_column_map.take() {
+            Some(prev) => prev.dot(q),
+            None => q.clone(),
+        });
         Ok(())
+    }
+
+    /// Full-width decoder `B = Q B̃` (`M × p`) on this atom's UN-reduced inner
+    /// basis. After a #1117 rank reduction the stored
+    /// [`Self::decoder_coefficients`] is the reduced `B̃ = Qᵀ B` (`r × p`);
+    /// re-expanding by the frozen column map `Q` recovers the minimum-norm
+    /// full-width pre-image, which reconstructs IDENTICALLY on the standard
+    /// inner basis: `Φ_inner (Q B̃) = (Φ_inner Q) B̃ = Φ̃ B̃`. Consumers that
+    /// rebuild the fixed-width inner basis from emitted metadata (out-of-sample
+    /// predict / steer / reconstruction) must decode against THIS so the reduced
+    /// fit-conditioning frame never escapes (issue #2135). Returns a clone of the
+    /// stored decoder unchanged when the atom was not reduced.
+    pub fn full_width_decoder(&self) -> Array2<f64> {
+        match &self.reduced_column_map {
+            Some(q) => q.dot(&self.decoder_coefficients),
+            None => self.decoder_coefficients.clone(),
+        }
+    }
+
+    /// Full inner-basis width `M` — the row count of
+    /// [`Self::full_width_decoder`]. Equals [`Self::basis_size`] unless the atom
+    /// was #1117 rank-reduced, in which case it is the un-reduced inner width
+    /// `M = Q.nrows()` (`basis_size` is then the reduced `r`).
+    pub fn full_basis_size(&self) -> usize {
+        match &self.reduced_column_map {
+            Some(q) => q.nrows(),
+            None => self.basis_size(),
+        }
+    }
+
+    /// Lift a reduced-frame decoder covariance `Cov(vec B̃)`
+    /// (`(r·p) × (r·p)`, basis-major flat layout `b·p + c`, matching
+    /// `assemble_shape_uncertainty`) to the full inner-basis frame
+    /// `Cov(vec B) = (Q ⊗ I_p) Cov(vec B̃) (Q ⊗ I_p)ᵀ` (`(M·p) × (M·p)`) — the
+    /// exact posterior covariance of [`Self::full_width_decoder`], so the emitted
+    /// covariance stays width-consistent with the re-expanded decoder (#2135).
+    /// Returns the input unchanged when the atom was not reduced. `p` is the
+    /// ambient output dimension the covariance is laid out against.
+    pub fn lift_reduced_decoder_covariance(
+        &self,
+        cov_reduced: &Array2<f64>,
+        p: usize,
+    ) -> Result<Array2<f64>, String> {
+        let Some(q) = self.reduced_column_map.as_ref() else {
+            return Ok(cov_reduced.clone());
+        };
+        let (m, r) = q.dim();
+        if p == 0 {
+            return Err(
+                "SaeManifoldAtom::lift_reduced_decoder_covariance: p must be positive".to_string(),
+            );
+        }
+        if cov_reduced.dim() != (r * p, r * p) {
+            return Err(format!(
+                "SaeManifoldAtom::lift_reduced_decoder_covariance: covariance dim {:?} != reduced ({}, {})",
+                cov_reduced.dim(),
+                r * p,
+                r * p
+            ));
+        }
+        // First contract the left basis index: T[m1·p+c1, r2·p+c2]
+        //   = Σ_{r1} Q[m1,r1] · Cov[r1·p+c1, r2·p+c2].
+        let mut tmp = Array2::<f64>::zeros((m * p, r * p));
+        for m1 in 0..m {
+            for c1 in 0..p {
+                let out_row = m1 * p + c1;
+                for col in 0..(r * p) {
+                    let mut acc = 0.0_f64;
+                    for r1 in 0..r {
+                        acc += q[[m1, r1]] * cov_reduced[[r1 * p + c1, col]];
+                    }
+                    tmp[[out_row, col]] = acc;
+                }
+            }
+        }
+        // Then the right basis index: Cov_full[row, m2·p+c2]
+        //   = Σ_{r2} T[row, r2·p+c2] · Q[m2,r2].
+        let mut lifted = Array2::<f64>::zeros((m * p, m * p));
+        for row in 0..(m * p) {
+            for m2 in 0..m {
+                for c2 in 0..p {
+                    let mut acc = 0.0_f64;
+                    for r2 in 0..r {
+                        acc += tmp[[row, r2 * p + c2]] * q[[m2, r2]];
+                    }
+                    lifted[[row, m2 * p + c2]] = acc;
+                }
+            }
+        }
+        Ok(lifted)
     }
 
     pub fn refresh_basis(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
@@ -2021,6 +2147,165 @@ mod tests {
             penalty,
         )
         .unwrap()
+    }
+
+    // #2135 — a #1117 rank-reduced circle/periodic atom stores a REDUCED decoder
+    // `B̃ = Qᵀ B` (`r × p`) in a fit-internal eigenvector frame `Q` (`M × r`),
+    // while every out-of-sample / reconstruct consumer rebuilds the STANDARD
+    // `M`-column inner design `[1, sin, cos]`. The reduced frame must be
+    // re-expanded at the emission boundary (`full_width_decoder` / `full_basis_size`)
+    // so held-out reconstruction on the full inner basis is IDENTICAL to the
+    // reduced fit and the decoder width matches the rebuilt basis width — not the
+    // "M=2 vs M=3" mismatch the raw reduced block produced.
+    #[test]
+    fn reduced_periodic_decoder_re_expands_for_full_basis_oos() {
+        // Inner circle basis `[1, sin 2πt, cos 2πt]` (M = 3), evaluated on a
+        // training grid; the atom is built directly on that design.
+        let eval = PeriodicHarmonicEvaluator::new(3).unwrap();
+        let train_t = Array2::from_shape_vec((5, 1), vec![0.05, 0.23, 0.41, 0.66, 0.88]).unwrap();
+        let (phi_train, jac_train) = eval.evaluate(train_t.view()).unwrap();
+        let p = 2usize;
+        // Arbitrary full-width decoder `B` (M = 3 rows, p = 2 cols).
+        let decoder = Array2::from_shape_vec(
+            (3, p),
+            vec![0.5, -0.2, 1.3, 0.7, -0.9, 0.4],
+        )
+        .unwrap();
+        let mut penalty = Array2::<f64>::zeros((3, 3));
+        penalty[[1, 1]] = 1.0;
+        penalty[[2, 2]] = 1.0;
+        let mut atom = SaeManifoldAtom::new(
+            "circle",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi_train,
+            jac_train,
+            decoder.clone(),
+            penalty,
+        )
+        .unwrap()
+        .with_basis_second_jet(Arc::new(eval.clone()));
+
+        // A GENUINE non-axis-aligned orthonormal column map `Q` (M = 3, r = 2),
+        // built by Gram–Schmidt on two non-basis directions — the analogue of the
+        // eigenvector remix `reduce_atoms_to_data_supported_rank` freezes, NOT an
+        // axis-aligned `[sin, cos]` selector (the fabricated frame #2218 was
+        // rejected for).
+        let v1 = [1.0_f64, 1.0, 0.0];
+        let v2 = [0.0_f64, 1.0, 1.0];
+        let n1 = (v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2]).sqrt();
+        let u1 = [v1[0] / n1, v1[1] / n1, v1[2] / n1];
+        let dot = v2[0] * u1[0] + v2[1] * u1[1] + v2[2] * u1[2];
+        let w2 = [v2[0] - dot * u1[0], v2[1] - dot * u1[1], v2[2] - dot * u1[2]];
+        let n2 = (w2[0] * w2[0] + w2[1] * w2[1] + w2[2] * w2[2]).sqrt();
+        let u2 = [w2[0] / n2, w2[1] / n2, w2[2] / n2];
+        let q = Array2::from_shape_vec((3, 2), vec![u1[0], u2[0], u1[1], u2[1], u1[2], u2[2]])
+            .unwrap();
+
+        atom.reduce_basis_to_subspace(&q).unwrap();
+
+        // After reduction the stored decoder is the reduced `r = 2` block, but the
+        // full inner width is still `M = 3`.
+        assert_eq!(atom.basis_size(), 2, "reduced design width r");
+        assert_eq!(atom.full_basis_size(), 3, "un-reduced inner width M");
+        let full = atom.full_width_decoder();
+        assert_eq!(full.dim(), (3, p), "full-width decoder is M×p");
+        // `full == Q · B̃` exactly.
+        let expected_full = q.dot(&atom.decoder_coefficients);
+        for i in 0..3 {
+            for c in 0..p {
+                assert!(
+                    (full[[i, c]] - expected_full[[i, c]]).abs() <= 1e-14,
+                    "full_width_decoder[{i},{c}] must equal (Q·B̃)"
+                );
+            }
+        }
+        // The reduced block width (2) does NOT match the rebuilt inner basis width
+        // (3): decoding the standard `[1,sin,cos]` design by `B̃` is the exact
+        // "M=2 vs M=3" defect; the full-width decoder resolves it.
+        assert_ne!(atom.decoder_coefficients.nrows(), 3);
+        assert_eq!(full.nrows(), 3);
+
+        // HELD-OUT reconstruction fidelity: on a fresh OOS grid, decoding the
+        // rebuilt full inner design by `full_width_decoder` reproduces the reduced
+        // fit's reconstruction `Φ̃ · B̃` bit-for-bit.
+        let oos_t = Array2::from_shape_vec((4, 1), vec![0.13, 0.37, 0.59, 0.95]).unwrap();
+        let (phi_oos, _) = eval.evaluate(oos_t.view()).unwrap();
+        let recon_full = phi_oos.dot(&full); // (4 × p) on full inner basis
+        let phi_tilde = phi_oos.dot(&q); // reduced design Φ̃ = Φ·Q
+        let recon_reduced = phi_tilde.dot(&atom.decoder_coefficients); // (4 × p)
+        for i in 0..4 {
+            for c in 0..p {
+                assert!(
+                    (recon_full[[i, c]] - recon_reduced[[i, c]]).abs() <= 1e-12,
+                    "OOS reconstruction[{i},{c}]: full-basis {} != reduced fit {}",
+                    recon_full[[i, c]],
+                    recon_reduced[[i, c]]
+                );
+            }
+        }
+
+        // Covariance lift `(Q ⊗ I_p)` keeps the emitted covariance width-consistent
+        // with the full decoder and preserves the exact posterior band variance.
+        // A fixed SPD reduced covariance `(r·p = 4)²`.
+        let a = Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                1.0, 0.2, 0.0, 0.1, //
+                0.2, 1.5, 0.3, 0.0, //
+                0.0, 0.3, 2.0, 0.4, //
+                0.1, 0.0, 0.4, 1.2, //
+            ],
+        )
+        .unwrap();
+        let cov_red = a.dot(&a.t()); // SPD (r·p × r·p)
+        let lifted = atom.lift_reduced_decoder_covariance(&cov_red, p).unwrap();
+        assert_eq!(lifted.dim(), (3 * p, 3 * p), "lifted covariance is (M·p)²");
+        // Explicit `K = Q ⊗ I_p` congruence check.
+        let mut k = Array2::<f64>::zeros((3 * p, 2 * p));
+        for m in 0..3 {
+            for r in 0..2 {
+                for c in 0..p {
+                    k[[m * p + c, r * p + c]] = q[[m, r]];
+                }
+            }
+        }
+        let expected_cov = k.dot(&cov_red).dot(&k.t());
+        for i in 0..(3 * p) {
+            for j in 0..(3 * p) {
+                assert!(
+                    (lifted[[i, j]] - expected_cov[[i, j]]).abs() <= 1e-12,
+                    "lifted covariance[{i},{j}] must equal (Q⊗I)·cov·(Q⊗I)ᵀ"
+                );
+            }
+        }
+        // Band variance is invariant under the lift: for the first OOS row the
+        // per-channel variance in the reduced frame (Φ̃, cov_red) equals the full
+        // frame (Φ_inner, lifted).
+        let phi_inner_row = phi_oos.row(0);
+        let phi_tilde_row = phi_tilde.row(0);
+        for c in 0..p {
+            let mut var_red = 0.0_f64;
+            for r1 in 0..2 {
+                for r2 in 0..2 {
+                    var_red += phi_tilde_row[r1]
+                        * phi_tilde_row[r2]
+                        * cov_red[[r1 * p + c, r2 * p + c]];
+                }
+            }
+            let mut var_full = 0.0_f64;
+            for m1 in 0..3 {
+                for m2 in 0..3 {
+                    var_full += phi_inner_row[m1]
+                        * phi_inner_row[m2]
+                        * lifted[[m1 * p + c, m2 * p + c]];
+                }
+            }
+            assert!(
+                (var_red - var_full).abs() <= 1e-12,
+                "channel {c} band variance must be invariant under the lift: {var_red} vs {var_full}"
+            );
+        }
     }
 
     // DEFECT 2 — a Poincaré atom's intrinsic smoothness is the HYPERBOLIC
