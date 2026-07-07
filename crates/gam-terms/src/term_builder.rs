@@ -3128,15 +3128,16 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
-            // Formula-level `duchon(...)` is the native Duchon reproducing-norm
-            // smoother: the always-on Primary Gram plus the polynomial trend
-            // ridge. Do not silently add collocated mass/tension penalties here.
-            // They add extra REML hyperparameters and an O(k)-support quadrature
-            // build to the default 2-D path, making `duchon(x, z)` materially
-            // slower than the equivalent thin-plate fit without a principled
-            // accuracy gain (gam#1718). Lower-order Hilbert-scale penalties remain
-            // available to callers that construct an explicit DuchonBasisSpec.
-            let operator_penalties = DuchonOperatorPenaltySpec::all_disabled();
+            // Formula-level `duchon(...)` must honor the type-level Duchon
+            // default: the all-on Hilbert scale of function penalties. The
+            // Primary curvature Gram and null-space trend ridge are always
+            // present, while the lower-order mass/tension blocks are emitted as
+            // separate REML-controlled function penalties so the optimizer can
+            // deselect whichever rungs the data do not support. Keeping the
+            // formula path on `DuchonOperatorPenaltySpec::default()` avoids a
+            // split-brain default where explicit specs get the redesign but the
+            // user-facing formula silently falls back to native-only Duchon.
+            let operator_penalties = DuchonOperatorPenaltySpec::default();
             // For a 1-D periodic Duchon with no EXPLICIT period, anchor the wrap
             // to the covariate DATA range rather than letting the basis builder
             // derive it from the (k-subsampled) center span. The center span is a
@@ -5725,7 +5726,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_duchon_default_does_not_enable_collocation_operators() {
+    fn formula_duchon_default_enables_hilbert_scale_operators() {
         let ds = continuous_dataset(
             &["y", "x", "z"],
             (0..40)
@@ -5752,11 +5753,11 @@ mod tests {
         };
         assert!(matches!(
             spec.operator_penalties.mass,
-            OperatorPenaltySpec::Disabled
+            OperatorPenaltySpec::Active { .. }
         ));
         assert!(matches!(
             spec.operator_penalties.tension,
-            OperatorPenaltySpec::Disabled
+            OperatorPenaltySpec::Active { .. }
         ));
         assert!(matches!(
             spec.operator_penalties.stiffness,

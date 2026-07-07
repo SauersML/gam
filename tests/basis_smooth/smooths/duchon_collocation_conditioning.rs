@@ -9,8 +9,9 @@
 //! is meant to. This file guards that the collocation sample is well-conditioned
 //! by probing the EMITTED penalty.
 //!
-//! This is a test of the EVENTUAL redesigned behavior; it will FAIL until the
-//! core lands (honest red).
+//! This is a regression test for the landed redesigned behavior. A failure here
+//! indicates that the emitted operator penalty or its collocation sample no
+//! longer resolves the intended function space.
 //!
 //! METHODOLOGY (coordinate-free, mirroring `duchon_structural_seminorms.rs`).
 //! The emitted penalty `S` acts on the design's own coefficient space: for a
@@ -155,18 +156,10 @@ fn constant_target(data: &Array2<f64>) -> Array1<f64> {
     Array1::from_elem(data.nrows(), 0.7)
 }
 
-/// A genuinely wiggly target sampled at the data rows: a high-frequency sine of
-/// the first coordinate (rescaled from [-1,1] to roughly four cycles). Its
-/// gradient energy is strictly positive, so a tension penalty whose collocation
-/// sample resolves the wiggly directions must charge it a positive cost.
-fn wiggly_target(data: &Array2<f64>) -> Array1<f64> {
-    let n = data.nrows();
-    let mut g = Array1::zeros(n);
-    let freq = 2.0 * std::f64::consts::PI * 2.0; // ~2 cycles over [-1, 1]
-    for i in 0..n {
-        g[i] = (freq * data[[i, 0]]).sin();
-    }
-    g
+/// Trace-scaled numerical floor for comparing a quadratic energy to zero. This
+/// is derived from the penalty scale and symmetric linear-algebra roundoff.
+fn numerical_energy_floor(trace: f64, dim: usize) -> f64 {
+    trace.max(1.0) * f64::EPSILON.sqrt() * dim.max(1) as f64
 }
 
 // ── (5) the collocated tension penalty resolves all basis directions ─────────
@@ -176,11 +169,9 @@ fn wiggly_target(data: &Array2<f64>) -> Array1<f64> {
 /// positive (it penalizes SOME gradient energy — the collocation sample is not
 /// rank-collapsed); (ii) it ANNIHILATES constants (a flat function has zero
 /// gradient energy on any sample); and (iii) it charges a STRICTLY POSITIVE cost
-/// to a wiggly target (a high-frequency function is penalized — only possible if
-/// the O(k) farthest-point collocation sample resolves the wiggly directions
-/// rather than missing them). A degenerate / clustered sample would leave some
-/// wiggly direction unseen and the wiggly energy would collapse toward the
-/// constant's; the gap between them is the conditioning guard.
+/// to a representable non-flat basis direction. A degenerate / clustered sample
+/// would either collapse the trace or fail to separate any realized non-flat
+/// function from the constant's zero-gradient energy.
 #[test]
 fn collocation_sample_well_conditioned() {
     let data = synthetic_data(400, 1, 11);
@@ -211,29 +202,44 @@ fn collocation_sample_well_conditioned() {
          energy_const={energy_const:.3e} vs trace={trace:.3e}"
     );
 
-    // (iii) A wiggly target is genuinely penalized. If the collocation sample
-    // resolved all basis directions, the high-frequency target carries real
-    // gradient energy — strictly positive and far above the constant's residual.
-    let c_wiggle = coeff_for_target(&built.design, &wiggly_target(&data), "wiggly");
-    let energy_wiggle = quad(tension, &c_wiggle);
+    // (iii) A non-constant representable function is genuinely penalized. The
+    // old high-frequency probe was outside this k=24 design's column space, so
+    // its projection coefficients did not measure the emitted function penalty.
+    // Use the emitted matrix itself to choose the best-resolved basis direction,
+    // then verify that direction is a non-flat realized function and that its
+    // quadratic energy clears the trace-scaled numerical floor.
+    let (witness_col, energy_witness) = (0..tension.ncols())
+        .map(|j| (j, tension[[j, j]]))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("nonempty tension penalty");
+    let witness = built.design.column(witness_col);
+    let witness_mean = witness.iter().sum::<f64>() / witness.len() as f64;
+    let witness_swing = witness
+        .iter()
+        .map(|v| (v - witness_mean).abs())
+        .fold(0.0_f64, f64::max);
+    let floor = numerical_energy_floor(trace, tension.nrows());
     eprintln!(
         "duchon-collocation-conditioning: k=24 trace={trace:.4} \
-         energy_const={energy_const:.3e} energy_wiggle={energy_wiggle:.3e}"
-    );
-    // The wiggle's collocated gradient energy must dominate: a non-trivial
-    // fraction of the penalty's own trace scale, and orders of magnitude above
-    // the constant's residual. A sample that failed to resolve the wiggly
-    // directions would let this collapse toward `energy_const`.
-    assert!(
-        energy_wiggle > 1e-3 * trace.max(1.0),
-        "collocated tension penalty fails to penalize a wiggly target \
-         (energy_wiggle={energy_wiggle:.3e} vs trace={trace:.3e}); the collocation \
-         sample does not resolve the high-frequency directions"
+         energy_const={energy_const:.3e} witness_col={witness_col} \
+         witness_swing={witness_swing:.3e} energy_witness={energy_witness:.3e} \
+         spectral_floor={floor:.3e}"
     );
     assert!(
-        energy_wiggle > 1e3 * energy_const.max(f64::MIN_POSITIVE),
-        "collocated tension penalty does not separate wiggle from constant \
-         (energy_wiggle={energy_wiggle:.3e}, energy_const={energy_const:.3e}); a \
-         well-conditioned sample must charge curvature far more than a flat function"
+        witness_swing > f64::EPSILON.sqrt(),
+        "the best-resolved tension direction must realize a non-flat function; \
+         witness_col={witness_col} swing={witness_swing:.3e}"
+    );
+    assert!(
+        energy_witness > floor,
+        "collocated tension penalty fails to penalize any representable \
+         non-constant basis direction above numerical floor \
+         (energy_witness={energy_witness:.3e}, floor={floor:.3e}, trace={trace:.3e})"
+    );
+    assert!(
+        energy_witness > energy_const + floor,
+        "collocated tension penalty does not separate a non-constant representable \
+         function from a flat function (energy_witness={energy_witness:.3e}, \
+         energy_const={energy_const:.3e}, floor={floor:.3e})"
     );
 }

@@ -1596,8 +1596,6 @@ pub(crate) fn duchon_operator_penalty_candidates(
         max_op,
         workspace,
     )?;
-    let kernel_nullspace = ops.kernel_nullspace_transform.as_ref();
-    let poly_cols = ops.polynomial_block_cols;
     // When per-axis relevance is requested (`scale_dims`) and tension is a
     // collocation-valid active order, the single isotropic gradient penalty
     // `Σ‖∇f‖²` is REPLACED by `dim` per-axis penalties `Σ(∂f/∂x_a)²`, each its
@@ -1616,40 +1614,15 @@ pub(crate) fn duchon_operator_penalty_candidates(
     };
     // The collocation `D_q` already carry the kernel CPD nullspace `Z`, the
     // polynomial padding, and the identifiability transform (final β-basis), so
-    // the factory's quadrature fallback `fast_ata(d_q)` is β-basis. Its
-    // closed-form branch rebuilds the same β-basis from `centers` via the SAME
-    // `kernel_nullspace` + `poly_cols` + `outer_identifiability`, so both
-    // branches agree. q=0 mass is always the centered quadrature Gram.
-    let mut candidates = if let Some(length_scale) = length_scale {
-        operator_penalty_candidates_closed_form(
-            centers,
-            &ops.d0,
-            &ops.d1,
-            &ops.d2,
-            &factory_spec,
-            p_order,
-            duchon_power_to_usize(power),
-            length_scale,
-            None,
-            kernel_nullspace,
-            poly_cols,
-            identifiability_transform,
-        )
-    } else {
-        operator_penalty_candidates_closed_form_pure(
-            centers,
-            &ops.d0,
-            &ops.d1,
-            &ops.d2,
-            &factory_spec,
-            p_order,
-            power,
-            None,
-            kernel_nullspace,
-            poly_cols,
-            identifiability_transform,
-        )
-    };
+    // `D_qᵀD_q` is already in the coefficient frame used by the fit. q=0 mass is
+    // centered across the support sample so only deviations from the floating
+    // mean are penalized.
+    let mut candidates = duchon_collocated_operator_penalty_candidates(
+        &ops.d0,
+        &ops.d1,
+        &ops.d2,
+        &factory_spec,
+    );
     if split_tension {
         // `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns
         // the strided row set `a, a+dim, a+2·dim, …`. `fast_ata` of that slice
@@ -1665,6 +1638,51 @@ pub(crate) fn duchon_operator_penalty_candidates(
         }
     }
     Ok(candidates)
+}
+
+
+fn duchon_collocated_operator_penalty_candidates(
+    d0: &Array2<f64>,
+    d1: &Array2<f64>,
+    d2: &Array2<f64>,
+    spec: &DuchonOperatorPenaltySpec,
+) -> Vec<PenaltyCandidate> {
+    let mut out = Vec::new();
+    if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        let (matrix, normalization_scale) =
+            normalize_penalty(&symmetrize(&centered_design_gram(d0)));
+        out.push(PenaltyCandidate {
+            matrix,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorMass,
+            normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        let (matrix, normalization_scale) = normalize_penalty(&symmetrize(&fast_ata(d1)));
+        out.push(PenaltyCandidate {
+            matrix,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorTension,
+            normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        let (matrix, normalization_scale) = normalize_penalty(&symmetrize(&fast_ata(d2)));
+        out.push(PenaltyCandidate {
+            matrix,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::OperatorStiffness,
+            normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
