@@ -88,6 +88,7 @@ mod tests {
 
     #[test]
     fn topology_persistence_payload_surfaces_covering_side() {
+        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let report = AtomTopologyPersistence {
                 raced_kind: SaeAtomBasisKind::Periodic,
