@@ -2058,7 +2058,14 @@ pub fn build_smooth_basis(
     }
 
     match type_opt.as_str() {
-        "cyclic" | "cc" | "cp" | "cyclic-ps" => {
+        // `periodic` is the generic spelling for a periodic (wrap-continuous)
+        // B-spline; it names the SAME `SmoothBasisSpec::BSpline1D {
+        // PeriodicUniform }` the mgcv-style cyclic selectors (`cc`/`cp`/`cyclic`)
+        // build, and is already recognized as that basis kind by the JSON /
+        // override path (`smooth_overrides`) and accepted by the formula parser.
+        // Route it through the cyclic arm so the formula path agrees with the
+        // rest of the codebase instead of rejecting it as an unsupported type.
+        "cyclic" | "cc" | "cp" | "cyclic-ps" | "periodic" => {
             validate_known_options(
                 "cyclic",
                 options,
