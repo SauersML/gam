@@ -231,7 +231,11 @@ fn numeric_literals(code: &str) -> Vec<NumLit> {
             }
             k
         };
-        let core = code[start..core_end].to_string();
+        // A Rust literal may place a `_` separator right before its type suffix
+        // (`0.0_f64`, `100_000_usize`); the digit/fraction runs above swallow that
+        // trailing `_`, so strip it back off — the numeric *value* never ends in a
+        // separator, and leaving it on would make `0.0_` miss the trivial set.
+        let core = code[start..core_end].trim_end_matches('_').to_string();
         // consume any trailing type-suffix letters/digits so the outer loop
         // resumes past the whole token.
         i = core_end;
@@ -351,6 +355,14 @@ fn scanner_recognizes_flags_and_exemptions() {
 
     // Numerals inside strings/comments are masked out.
     assert!(numeric_literals(&strip_code("    log(\"snr=0.37 dB\"); // note 0.99")).is_empty());
+
+    // A suffixed float literal `0.0_f64` tokenizes to the trivial core `0.0`
+    // (the `_` separator before the suffix must be stripped, not kept as `0.0_`).
+    let suffixed = numeric_literals(&strip_code("    let mut acc = 0.0_f64;"));
+    assert_eq!(suffixed.len(), 1);
+    assert_eq!(suffixed[0].core, "0.0");
+    assert!(is_trivial_core(&suffixed[0].core));
+    assert!(is_trivial_core(&numeric_literals(&strip_code("let n = 1_000usize;"))[0].core));
 
     // Range and tuple access do not spawn literals beyond the leading `0`.
     let range = numeric_literals(&strip_code("    for i in 0..n {"));

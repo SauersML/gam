@@ -5373,7 +5373,26 @@ impl SaeManifoldTerm {
         // to within `√εmach` of its scale IS the numerical inner optimum; ranking
         // the Laplace criterion there is correct. We accept that fixed point
         // instead of grinding the budget.
-        let entry_loss_total = loss.total();
+        // #1798/#1795 — the stagnation gate must measure the SAME objective the
+        // inner Newton step / line search descends and the KKT ‖g‖ certifies:
+        // `penalized_objective_total` (data-fit + priors + smoothness + ard +
+        // analytic penalties + decoder-repulsion + interior-point collapse-
+        // prevention **barrier**), NOT `loss.total()`. `SaeManifoldLoss::total()`
+        // OMITS the barrier / repulsion / analytic penalties (loss.rs:14), but the
+        // assembled system's gradient (‖g‖, the convergence gate below) INCLUDES
+        // them. On a near-collapse fixture (tiny latent coords ⇒ an ACTIVE
+        // separation barrier) `loss.total()` flattens the moment the deviance
+        // converges while the barrier is still pushing the atoms apart — so the
+        // bare-loss stall detector declared "objective stalled" and REFUSED
+        // (`is_undamped_evidence_row_non_pd` at the still-non-stationary iterate)
+        // even though the barrier-augmented objective the step actually minimises
+        // was still decreasing and ‖g‖ still falling. Measuring the barrier-
+        // inclusive objective here makes the stall gate consistent with the ‖g‖
+        // gate: a genuinely stalled full objective is still caught, but a fit that
+        // is only crawling in `loss.total()` while the barrier works is allowed to
+        // keep refining to stationarity instead of false-refusing.
+        let entry_loss_total =
+            self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
         let mut previous_loss_total = entry_loss_total;
         let mut refine_rounds: usize = 0;
         // Consecutive stall rounds: counts how many successive refine rounds
@@ -5639,7 +5658,13 @@ impl SaeManifoldTerm {
             // Requires a few completed refine rounds (so the fraction baseline is
             // meaningful) but is NOT gated behind the full refine budget — the
             // whole point is to terminate the crawl long before that.
-            let new_loss_total = loss.total();
+            // #1798/#1795 — barrier-inclusive objective (see `entry_loss_total`),
+            // NOT `loss.total()`, so the stall test matches the ‖g‖ gate and the
+            // line search. `*loss` was refreshed by the `run_joint_fit` above, so
+            // `self`'s decoders are at this round's iterate and the barrier /
+            // repulsion / analytic terms are evaluated there.
+            let new_loss_total =
+                self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
             // achieved since entry — the fit has captured essentially all the
@@ -5664,6 +5689,20 @@ impl SaeManifoldTerm {
                 && captured_fraction.is_finite()
                 && relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 && captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION;
+            {
+                use std::io::Write;
+                if let Ok(mut wf) = std::fs::OpenOptions::new().create(true).append(true).open(
+                    "/private/tmp/claude-501/-Users-user-gam/727cd8a6-e818-4ee4-ab82-50a390f720c1/scratchpad/witness_1798.txt",
+                ) {
+                    writeln!(
+                        wf,
+                        "round={refine_rounds} g={grad_norm:.6e} qg={quotient_grad_norm:.6e} tol={grad_tolerance:.6e} step={step_norm:.6e} qstep={quotient_step_norm:.6e} reldec={relative_decrease:.6e} capfrac={captured_fraction:.6e} stalled={stalled} loss_total={:.6e} penalized={new_loss_total:.6e} gauge_defl={}",
+                        loss.total(),
+                        cache.gauge_deflated_directions
+                    )
+                    .ok();
+                }
+            }
             previous_loss_total = new_loss_total;
             if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
                 let stationary_sys = self
