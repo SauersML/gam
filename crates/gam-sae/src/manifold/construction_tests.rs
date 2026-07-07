@@ -49,17 +49,21 @@ mod amortized_encoder_tests {
         }
     }
 
-    /// The fitted amplitudes the encoder derives are exactly the assignment
-    /// masses the reconstruction is assembled from — feeding them back is the
-    /// self-consistency the distilled map is supervised against.
+    /// The fitted amplitudes the encoder derives are the realised intensity
+    /// coordinates the reconstruction uses: the existence gate times the explicit
+    /// cone radial scale.  Returning the bare gate would silently re-couple
+    /// presence and intensity for amortized encoding as soon as `log_amplitude`
+    /// moves away from zero.
     #[test]
-    fn fitted_assignment_amplitudes_match_the_assignment_masses() {
-        let (term, _target, rho) = small_two_atom_periodic_term();
+    fn fitted_assignment_amplitudes_include_explicit_log_amplitude_1939() {
+        let (mut term, _target, rho) = small_two_atom_periodic_term();
+        term.atoms[0].log_amplitude = 2.0_f64.ln();
+        term.atoms[1].log_amplitude = 0.25_f64.ln();
         let n = term.n_obs();
         let k = term.k_atoms();
         let amplitudes = term
             .fitted_assignment_amplitudes(&rho)
-            .expect("fitted amplitudes derive from the assignment");
+            .expect("fitted amplitudes derive from assignment and cone scale");
         assert_eq!(amplitudes.dim(), (n, k));
         for row in 0..n {
             let a = term
@@ -67,10 +71,11 @@ mod amortized_encoder_tests {
                 .try_assignments_row_for_rho(row, &rho)
                 .expect("assignment row resolves");
             for atom_idx in 0..k {
+                let expected = a[atom_idx] * term.atoms[atom_idx].log_amplitude.exp();
                 assert_eq!(
                     amplitudes[[row, atom_idx]],
-                    a[atom_idx],
-                    "amplitude[{row},{atom_idx}] must equal the assignment mass"
+                    expected,
+                    "amplitude[{row},{atom_idx}] must equal gate times explicit cone scale"
                 );
             }
         }
