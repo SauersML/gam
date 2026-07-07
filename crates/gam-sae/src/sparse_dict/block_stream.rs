@@ -41,7 +41,7 @@ use super::BlockSparseConfig;
 use super::block::{gram_schmidt_rows, route_and_code_all, seed_frames, stable_rank_symmetric};
 use super::codes::SparseCode;
 use super::update::{
-    DecoderNormalEq, DecoderSolveStats, solve_decoder_with_routability_gate,
+    DecoderNormalEq, DecoderSolveStats, solve_decoder, solve_decoder_with_routability_gate,
 };
 use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
@@ -221,6 +221,11 @@ pub struct BlockSparseStreamState {
     last_ev: f64,
     epochs_run: usize,
     last_revived: usize,
+    // Blocks that were dead and reseeded by AuxK revival and have not yet had a
+    // refresh take hold. Such a block must be exempted from the routability gate
+    // on the epoch it first fires (see the force-refresh note in `end_epoch`);
+    // this flag is cross-epoch state (never reset with the accumulators).
+    revival_pending: Vec<bool>,
     converged: bool,
     last_util: Vec<f32>,
     last_stable: Vec<f32>,
@@ -315,6 +320,7 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             epochs_run: 0,
             last_revived: 0,
+            revival_pending: vec![false; g],
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -384,6 +390,7 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             epochs_run: 0,
             last_revived: 0,
+            revival_pending: vec![false; g],
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -589,6 +596,42 @@ impl BlockSparseStreamState {
                 refreshed_blocks[decision.atom / b] = true;
             }
         }
+
+        // Revival-lock-in: a block that AuxK reseeded (dead → residual direction)
+        // can DEADLOCK against the routability gate. While the reseeded block is
+        // still unfit it inflates the global residual scale σ̂, which raises every
+        // atom's charge floor, so the block's fresh firing evidence can never
+        // clear the gate; it is never MOD-refreshed, σ̂ never drops, and the reseed
+        // never takes hold (chicken-and-egg). Revival is a DELIBERATE structural
+        // reseed, not a noise-driven refresh, so it must be exempt from the
+        // evidence gate: on the first epoch a pending revived block actually fires,
+        // force ONE ungated MOD refresh so the reseed locks in. Thereafter the
+        // block's residual drops and it clears the gate on its own. Without this,
+        // dead-block revival plateaus below reconstruction parity even though the
+        // reseed direction is correct (revival_reseeds_dead_block_from_worst_residual_row).
+        let forced: Vec<usize> = (0..self.g)
+            .filter(|&gg| self.revival_pending[gg] && self.usage[gg] > 0 && !refreshed_blocks[gg])
+            .collect();
+        if !forced.is_empty() {
+            let mut ungated = self.decoder.clone();
+            solve_decoder(&mut ungated, &self.atom_eq, self.config.frame_ridge);
+            for &gg in &forced {
+                for rr in 0..b {
+                    for c in 0..p {
+                        self.decoder[[gg * b + rr, c]] = ungated[[gg * b + rr, c]];
+                    }
+                }
+                refreshed_blocks[gg] = true;
+            }
+        }
+        // A block that refreshed this epoch (via the gate or the forced path) has
+        // taken hold — clear its revival lock so the gate governs it normally.
+        for gg in 0..self.g {
+            if refreshed_blocks[gg] {
+                self.revival_pending[gg] = false;
+            }
+        }
+
         self.atom_eq.clear_refreshed_atoms(&gate);
         for gg in 0..self.g {
             if !refreshed_blocks[gg] {
@@ -691,6 +734,10 @@ impl BlockSparseStreamState {
                     self.decoder[[gg * b + rr, c]] = seed[[rr, c]];
                 }
             }
+            // Mark the reseed so the next epoch it fires it is force-refreshed
+            // past the routability gate (see `end_epoch`); otherwise the gate can
+            // deadlock the revived block below reconstruction parity.
+            self.revival_pending[gg] = true;
             revived += 1;
         }
         revived
