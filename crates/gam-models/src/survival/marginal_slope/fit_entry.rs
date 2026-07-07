@@ -10,6 +10,9 @@ use super::*;
 /// (diagnostics logged below).
 const NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA: f64 = 0.0;
 
+/// Byte budget for dense materialization of a survival design during the gam#979 preflight λ_max read.
+const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
 /// Estimate `λ_max(XᵀX)` for a surface design — a setup-time read on the raw
 /// (un-whitened, un-penalized) curvature scale of the surface, logged as a
 /// gam#979 diagnostic to compare against the inner solver's whitened λ_max.
@@ -209,7 +212,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             // densification refusal — the downstream
             // `canonicalize_for_identifiability` audit remains the source of
             // truth for the same diagnostic.
-            const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
             let mut dq0 = spec
                 .time_block
                 .design_entry
