@@ -576,6 +576,94 @@ impl SaeCandidateIndex {
         }
     }
 
+    /// The two-stage routing **LICENSE** (#985 / E1): the fraction of the EXACT
+    /// top-`s` atoms (the true rescore winners, [`brute_force_top_s`]) that the
+    /// sublinear two-stage proposal ([`SaeCandidateIndex::propose`] at
+    /// `candidate_budget = C`) recovers, per row and in aggregate, with EVERY miss
+    /// logged (never silent).
+    ///
+    /// This is the *license* the default two-stage router runs under. Unlike
+    /// [`SaeCandidateIndex::recall_report`] it needs NO planted ground truth: the
+    /// reference is the exact rescore itself, so it can be run over any sample of
+    /// real row directions to certify that dropping from the `O(K)` exact scan to
+    /// the `O(C)` proposal did not lose the atoms the exact router would have kept.
+    /// A run with `recall = 1.0` licenses the proposal for that regime; misses (and
+    /// their reason — [`MissReason::NotGathered`] = an LSH recall miss, widen tables
+    /// / probes; [`MissReason::TruncatedByBudget`] = widen the budget) name exactly
+    /// where and why to widen.
+    ///
+    /// `directions` is one query direction per row (length `sketch.output_dim()`).
+    /// `top_s` is the sparse routing width `s`. The returned
+    /// [`ProposalRecallReport`] also carries the mean gathered-candidate count as
+    /// the sublinearity witness (compare against `num_atoms`).
+    pub fn proposal_recall_report<S: AtomFrameSketch>(
+        &self,
+        sketch: &S,
+        directions: &[Array1<f64>],
+        top_s: usize,
+        candidate_budget: usize,
+        multiprobe: bool,
+    ) -> ProposalRecallReport {
+        let mut total_true: usize = 0;
+        let mut total_recovered: usize = 0;
+        let mut total_gathered: usize = 0;
+        let mut misses: Vec<RecallMiss> = Vec::new();
+
+        for (row_idx, direction) in directions.iter().enumerate() {
+            // The exact rescore top-s over the WHOLE dictionary — the reference.
+            let exact = brute_force_top_s(sketch, direction.view(), top_s);
+            // The sublinear two-stage proposal for the same row.
+            let proposal = self.propose(sketch, direction.view(), candidate_budget, multiprobe);
+            total_gathered += proposal.gathered_count;
+            let proposed_set: HashSet<usize> = proposal.proposed.iter().copied().collect();
+            let dropped_set: HashSet<usize> = proposal.dropped_for_budget.iter().copied().collect();
+
+            for &atom in &exact {
+                total_true += 1;
+                if proposed_set.contains(&atom) {
+                    total_recovered += 1;
+                } else {
+                    // A true-top-s atom the proposal dropped: gathered-but-budgeted
+                    // (widen C) vs never-gathered (an LSH miss). Both logged.
+                    let reason = if dropped_set.contains(&atom) {
+                        MissReason::TruncatedByBudget
+                    } else {
+                        MissReason::NotGathered
+                    };
+                    misses.push(RecallMiss {
+                        row: row_idx,
+                        atom,
+                        alignment: sketch.alignment(atom, direction.view()),
+                        reason,
+                    });
+                }
+            }
+        }
+
+        let recall = if total_true == 0 {
+            1.0
+        } else {
+            total_recovered as f64 / total_true as f64
+        };
+        let avg_gathered = if directions.is_empty() {
+            0.0
+        } else {
+            total_gathered as f64 / directions.len() as f64
+        };
+
+        ProposalRecallReport {
+            candidate_budget,
+            top_s,
+            num_rows: directions.len(),
+            total_true,
+            total_recovered,
+            recall,
+            avg_candidates_gathered: avg_gathered,
+            num_atoms: self.num_atoms,
+            misses,
+        }
+    }
+
     /// EXACT routing (#1777 / roadmap "real exact-routing guarantee"): return the
     /// **global argmax** of the routing score over the WHOLE dictionary — the atom
     /// whose frame best aligns with `direction` — with a guarantee that no
@@ -689,6 +777,35 @@ pub fn brute_force_best_atom<S: AtomFrameSketch>(
     best
 }
 
+/// EXACT top-`s` reference: the `s` atoms of GREATEST frame alignment with
+/// `direction` over the WHOLE dictionary (brute force, `O(K·p)`). This is the
+/// ground truth the sublinear two-stage proposal's recall is licensed against —
+/// the "true top-s" of the E1 acceptance (#985): the atoms the exact rescore
+/// router would select for a row. Ties break to the LOWEST id, matching
+/// [`SaeCandidateIndex::propose`]'s id-ascending tie-break so the two rank
+/// identically wherever alignments coincide; non-finite alignments are skipped.
+/// Returns up to `s` atom ids in descending-alignment order (fewer only when the
+/// dictionary has fewer than `s` finite-scoring atoms).
+pub fn brute_force_top_s<S: AtomFrameSketch>(
+    sketch: &S,
+    direction: ArrayView1<f64>,
+    s: usize,
+) -> Vec<usize> {
+    let mut scored: Vec<(usize, f64)> = (0..sketch.num_atoms())
+        .filter_map(|id| {
+            let a = sketch.alignment(id, direction);
+            a.is_finite().then_some((id, a))
+        })
+        .collect();
+    // Descending by alignment; ties broken by id — identical policy to `propose`.
+    scored.sort_by(|x, y| {
+        y.1.partial_cmp(&x.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(x.0.cmp(&y.0))
+    });
+    scored.into_iter().take(s).map(|(id, _)| id).collect()
+}
+
 /// Result of [`SaeCandidateIndex::route_exact`]: the certified-or-exact global
 /// argmax of the routing score for one row, plus how it was obtained.
 #[derive(Clone, Copy, Debug)]
@@ -768,6 +885,48 @@ impl RecallReport {
     /// Convenience: ratio of mean gathered candidates to dictionary size. A
     /// value far below `1.0` is the evidence that proposal touched a sublinear
     /// slice of the dictionary.
+    pub fn sublinearity_ratio(&self) -> f64 {
+        if self.num_atoms == 0 {
+            0.0
+        } else {
+            self.avg_candidates_gathered / self.num_atoms as f64
+        }
+    }
+}
+
+/// Result of [`SaeCandidateIndex::proposal_recall_report`] — the two-stage
+/// routing license: how much of the EXACT top-`s` rescore the sublinear proposal
+/// recovered, plus every miss.
+#[derive(Clone, Debug)]
+pub struct ProposalRecallReport {
+    /// Candidate budget `C` the proposal ran at.
+    pub candidate_budget: usize,
+    /// Sparse routing width `s` (the top-s the recall is measured over).
+    pub top_s: usize,
+    /// Number of row directions evaluated.
+    pub num_rows: usize,
+    /// Total exact-top-s slots across all rows (`Σ_row min(s, finite-scoring atoms)`).
+    pub total_true: usize,
+    /// How many of those exact-top-s atoms the proposal recovered.
+    pub total_recovered: usize,
+    /// `recall@s` = recovered / true (`1.0` when there was nothing to recover — a
+    /// null row set or `s = 0`). At `1.0` the proposal is licensed to stand in for
+    /// the exact rescore over this regime.
+    pub recall: f64,
+    /// Mean gathered-candidate count per row — the sublinearity witness; compare
+    /// against `num_atoms` (see [`ProposalRecallReport::sublinearity_ratio`]).
+    pub avg_candidates_gathered: f64,
+    /// Total atoms in the index (for the sublinearity ratio).
+    pub num_atoms: usize,
+    /// Every miss (true-top-s atom the proposal dropped), with row, atom,
+    /// alignment, and reason. No silent drops — the license's honesty contract.
+    pub misses: Vec<RecallMiss>,
+}
+
+impl ProposalRecallReport {
+    /// Ratio of mean gathered candidates to dictionary size. Far below `1.0` is the
+    /// evidence the proposal touched a sublinear slice of the dictionary — the
+    /// `O(C)` vs `O(K)` witness that pairs with `recall`.
     pub fn sublinearity_ratio(&self) -> f64 {
         if self.num_atoms == 0 {
             0.0
@@ -1548,5 +1707,209 @@ mod tests {
         let report = index.recall_report(&sketch, &rows, 8, true);
         assert_eq!(report.recall, 1.0);
         assert!(report.misses.is_empty());
+    }
+
+    /// `brute_force_top_s` is the exact rescore reference: the `s` highest-aligned
+    /// atoms, descending, id-broken ties — matching `propose`'s ranking policy.
+    #[test]
+    fn brute_force_top_s_returns_exact_descending_winners() {
+        let (blocks, dirs) = synthetic_dictionary(64, 24, 4);
+        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 16, 9).unwrap();
+        // A direction equal to atom 7's column: atom 7 must be the #1 winner.
+        let top = brute_force_top_s(&sketch, dirs[7].view(), 5);
+        assert_eq!(top.len(), 5, "must return exactly s winners");
+        assert_eq!(top[0], 7, "the in-range atom is the top-1 exact winner");
+        // Alignments are non-increasing along the returned order.
+        let mut prev = f64::INFINITY;
+        for &id in &top {
+            let a = sketch.alignment(id, dirs[7].view());
+            assert!(a <= prev + 1e-12, "top-s must be descending by alignment");
+            prev = a;
+        }
+        // Asking for more than the dictionary holds returns the whole dictionary.
+        let all = brute_force_top_s(&sketch, dirs[0].view(), 1000);
+        assert_eq!(all.len(), 64);
+    }
+
+    /// The two-stage routing LICENSE at a frontier-shaped dictionary: the sublinear
+    /// proposal recovers the EXACT top-s rescore for the large majority of rows at
+    /// the derived budget `C = 8⌈log2 K⌉`, touches only a sublinear slice, and every
+    /// miss is logged with a reason (no silent drop).
+    #[test]
+    fn proposal_recall_license_recovers_exact_top_s_at_frontier_k() {
+        let k = 2000usize;
+        let p = 48usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 2026);
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 4242).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 4242);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+
+        // Row directions dominated by one atom (plus a little cross-talk); reuse the
+        // planted-row generator but keep only the directions — the license needs no
+        // ground-truth actives, it references the exact rescore itself.
+        let rows = planted_rows(&dirs, 200, 31337);
+        let directions: Vec<Array1<f64>> = rows.into_iter().map(|(d, _)| d).collect();
+        let budget = auto_candidate_budget(k);
+
+        // Recall floor at s = 1: each row's exact top-1 IS its dominant atom, and the
+        // proposal must recover it for the large majority — the meaningful license
+        // (a row dominated by one atom has no genuine 2nd/3rd; higher-s fillers are
+        // arbitrary near-zero-alignment atoms no sublinear gather targets, so a recall
+        // floor only carries content at s = 1).
+        let report = index.proposal_recall_report(&sketch, &directions, 1, budget, cfg.multiprobe);
+        assert!(
+            report.sublinearity_ratio() < 0.5,
+            "license gather was not sublinear: avg {} of {} atoms (ratio {:.3})",
+            report.avg_candidates_gathered,
+            report.num_atoms,
+            report.sublinearity_ratio()
+        );
+        let floor = 0.80;
+        assert!(
+            report.recall >= floor,
+            "top-1 recall {:.3} below floor {floor}; {} misses (first: {:?})",
+            report.recall,
+            report.misses.len(),
+            report
+                .misses
+                .iter()
+                .take(5)
+                .map(|m| (m.row, m.atom, m.reason, m.alignment))
+                .collect::<Vec<_>>()
+        );
+        // No-silent-truncation: the miss list accounts for every unrecovered slot.
+        assert_eq!(
+            report.total_true - report.total_recovered,
+            report.misses.len(),
+            "license miss list must account for every unrecovered true-top-s atom"
+        );
+
+        // Top-s machinery (s = 4): the report is well-formed and the miss ledger is
+        // exact regardless of whether the arbitrary higher-s fillers are recovered.
+        // `total_true` is exactly `s` per row (the million-plus dictionary always has
+        // ≥ s finite-scoring atoms), and recall stays a valid fraction.
+        let s = 4usize;
+        let multi = index.proposal_recall_report(&sketch, &directions, s, budget, cfg.multiprobe);
+        assert_eq!(multi.total_true, s * directions.len());
+        assert!(multi.recall.is_finite() && (0.0..=1.0).contains(&multi.recall));
+        assert_eq!(
+            multi.total_true - multi.total_recovered,
+            multi.misses.len(),
+            "top-s miss ledger must account for every unrecovered slot at s>1"
+        );
+    }
+
+    /// The acceptance-scale routing license: **K = 10^6** routing. Building the
+    /// index is sublinear-query by construction; this pins that at a million atoms
+    /// the two-stage proposal recovers the exact top-s for the bulk of rows while
+    /// GATHERING only a vanishing fraction of the dictionary (the `O(C)`-not-`O(K)`
+    /// witness), and logs every miss. Kept lean (small `p`, few rows) so the exact
+    /// brute-force reference stays cheap.
+    #[test]
+    fn proposal_recall_license_at_one_million_atoms() {
+        let k = 1_000_000usize;
+        // A well-separated, finely-bucketed geometry (the frontier test's proven
+        // params): at K=10^6 the ~log2(K)=20-bit signatures give ~2^20≈K buckets, so
+        // bucket occupancy stays O(1) and the gather is a vanishing slice of the
+        // dictionary. (A too-small `p` over-packs a million atoms into a low-dim
+        // ambient, collapsing the buckets and inflating the gather.)
+        let p = 48usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 7);
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 21).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 21);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+
+        // A handful of rows, each dominated by one scattered atom's column.
+        let n_rows = 24usize;
+        let mut directions: Vec<Array1<f64>> = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let primary = (r * 2_654_435_761usize) % k;
+            directions.push(dirs[primary].clone());
+        }
+        let budget = auto_candidate_budget(k);
+        assert_eq!(budget, CANDIDATE_BUDGET_MAX, "K=10^6 sits at the budget cap");
+        // s = 1: each row's exact top-1 is its planted dominant atom (recall floor
+        // carries content only at s = 1 — see the frontier test's note).
+        let s = 1usize;
+        let report = index.proposal_recall_report(&sketch, &directions, s, budget, cfg.multiprobe);
+
+        // The gather touched a vanishing slice of a million atoms — the routing is
+        // O(C), not O(K). (Far tighter than the frontier test's 0.5 ceiling; a few %
+        // of a million atoms still leaves a decisive sublinear margin.)
+        assert!(
+            report.sublinearity_ratio() < 0.05,
+            "million-atom gather touched {:.3}% of the dictionary (avg {} of {})",
+            report.sublinearity_ratio() * 100.0,
+            report.avg_candidates_gathered,
+            report.num_atoms
+        );
+        // Each row's dominant atom is its exact top-1; the proposal must recover it
+        // for the large majority. Misses (if any) are all logged with a reason.
+        let floor = 0.75;
+        assert!(
+            report.recall >= floor,
+            "K=10^6 top-s recall {:.3} below floor {floor}; {} misses logged",
+            report.recall,
+            report.misses.len()
+        );
+        assert_eq!(
+            report.total_true - report.total_recovered,
+            report.misses.len(),
+            "every unrecovered true-top-s atom must be logged at K=10^6"
+        );
+        eprintln!(
+            "[e1-license] K={k} C={budget} s={s} recall@s={:.3} avg_gathered={:.1} \
+             sublinearity={:.5}% misses={}",
+            report.recall,
+            report.avg_candidates_gathered,
+            report.sublinearity_ratio() * 100.0,
+            report.misses.len()
+        );
+    }
+
+    /// SPEC 13 — the license RECOVERS THE NULL: on structureless / degenerate input
+    /// it returns the trivial answer rather than fabricating recovery, and never
+    /// panics. Three null faces: an empty row set, `s = 0`, and zero-norm query
+    /// directions (no signal to route).
+    #[test]
+    fn proposal_recall_license_recovers_the_null() {
+        let k = 128usize;
+        let p = 16usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 3);
+        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 12, 5).unwrap();
+        let cfg = IndexConfig::auto(12, k, 5);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+        let budget = auto_candidate_budget(k);
+
+        // Null face 1: no rows → nothing to recover → perfect, empty misses.
+        let empty: Vec<Array1<f64>> = Vec::new();
+        let r0 = index.proposal_recall_report(&sketch, &empty, 4, budget, cfg.multiprobe);
+        assert_eq!(r0.recall, 1.0);
+        assert_eq!(r0.total_true, 0);
+        assert!(r0.misses.is_empty());
+        assert_eq!(r0.sublinearity_ratio(), 0.0);
+
+        // Null face 2: s = 0 → no top-s slots → trivially licensed on real rows.
+        let real: Vec<Array1<f64>> = dirs.iter().take(8).cloned().collect();
+        let r1 = index.proposal_recall_report(&sketch, &real, 0, budget, cfg.multiprobe);
+        assert_eq!(r1.recall, 1.0);
+        assert_eq!(r1.total_true, 0);
+        assert!(r1.misses.is_empty());
+
+        // Null face 3: zero-norm directions carry no signal. The exact rescore is a
+        // degenerate all-zero-alignment tie broken to the lowest ids; the report is
+        // finite and defined, no panic, and every unrecovered slot is still logged.
+        let zeros: Vec<Array1<f64>> = (0..5).map(|_| Array1::<f64>::zeros(p)).collect();
+        let r2 = index.proposal_recall_report(&sketch, &zeros, 4, budget, cfg.multiprobe);
+        assert!(r2.recall.is_finite() && (0.0..=1.0).contains(&r2.recall));
+        assert_eq!(
+            r2.total_true - r2.total_recovered,
+            r2.misses.len(),
+            "null (zero-direction) rows must still account for every miss"
+        );
     }
 }
