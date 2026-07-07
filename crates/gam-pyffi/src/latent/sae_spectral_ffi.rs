@@ -1218,6 +1218,10 @@ mod sae_spectral_ffi_tests {
 
     #[test]
     fn audit_sae_round_trip_surfaces_external_dictionary_diagnostics() {
+        // pyo3 gates `prepare_freethreaded_python` OUT under `extension-module`
+        // (host interpreter owns init there); only initialize when we link libpython
+        // ourselves (bare cargo test / --no-default-features). #2224 follow-up.
+        #[cfg(not(feature = "extension-module"))]
         pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let decoder = ndarray::array![[1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32]];
