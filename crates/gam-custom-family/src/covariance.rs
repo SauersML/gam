@@ -750,6 +750,17 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
+    // gam#979: per-coordinate simple lower bounds (`f64::NEG_INFINITY` where
+    // unbounded, length = total joint p), from `extract_simple_lower_bounds` on
+    // the joint constraints. Used to project out the KKT multipliers of ACTIVE
+    // simple lower bounds — the box-bound analog of the linear-constraint
+    // projection that `projected_stationarity_inf_norm` already does. Without it
+    // the stationarity test on a `solve_quadratic_with_simple_lower_bounds`-
+    // constrained block (survival monotone baseline hazard, monotone smooths)
+    // reads the raw bound-multiplier mass (e.g. the 626 on `time_surface`) and
+    // mis-refuses a genuinely-optimal constrained iterate. `None` ⇒ no box path
+    // (byte-identical to the pre-fix / linear-constraint behaviour).
+    joint_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<f64, String> {
     if states.len() != specs.len() || states.len() != s_lambdas.len() {
         return Err(
@@ -804,6 +815,33 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
             s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![offset..offset + width]);
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
+        }
+        // gam#979 box-bound (simple lower bound) KKT projection. `residual` here
+        // is the objective gradient `Sβ − ∇ℓ`. At a lower bound `β_j ≥ L_j`,
+        // the constrained-optimality condition is a NONNEGATIVE multiplier:
+        // `residual_j ≥ 0` (the objective wants to push β_j below L_j, and the
+        // bound holds it). So a coordinate sitting at its active lower bound with
+        // `residual_j ≥ 0` is at a valid constrained optimum on that coordinate —
+        // zero it, exactly as `projected_stationarity_inf_norm` zeroes an active
+        // LINEAR-constraint multiplier. The SIGN CHECK is load-bearing: a
+        // coordinate at the bound whose `residual_j < 0` (the objective wants to
+        // INCREASE β_j, i.e. LEAVE the bound) is NOT optimal — the bound should be
+        // released — so it STAYS in the residual and the certificate still
+        // (correctly) refuses. Adds only the box path; blocks with no simple
+        // lower bound are byte-identical to before.
+        if let Some(lowers) = joint_lower_bounds {
+            for j in 0..width {
+                let lower = lowers[offset + j];
+                if !lower.is_finite() {
+                    continue;
+                }
+                let beta_j = states[b].beta[j];
+                let scale = beta_j.abs().max(lower.abs()).max(1.0);
+                let bound_tol = 1e-6 * scale + 1e-10;
+                if beta_j <= lower + bound_tol && residual[j] >= 0.0 {
+                    residual[j] = 0.0;
+                }
+            }
         }
         let block_active_hint = block_active_sets
             .and_then(|sets| sets.get(b))
