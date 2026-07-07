@@ -1943,7 +1943,7 @@ pub(super) const EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL: f64 = 1e-14;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
-/// This is also a hard *ceiling* the pool-aware [`bms_row_chunk_size`] must
+/// This is also a hard *ceiling* the [`bms_row_chunk_size`] chunk sizing must
 /// respect: several per-chunk fast paths (block-Hessian / block-gradient
 /// assembly) allocate fixed `[0.0f64; ROW_CHUNK_SIZE]` stack buffers and index
 /// them by the chunk's local row position, so a chunk may never carry more than
@@ -1978,20 +1978,24 @@ pub(super) const ROW_CHUNKS_PER_WORKER: usize = 4;
 ///   the worker count, so the clamp costs nothing there;
 /// * the `ROW_CHUNK_MIN` floor stops sub-floor fan-out at tiny `n`.
 ///
-/// The worker count is fixed for the process (one global pool; gam owns its
-/// threads), so for a given `n` the returned chunk size — and therefore the
-/// chunk boundaries `chunk_idx·chunk → (chunk_idx+1)·chunk` — is stable across
-/// calls regardless of rayon work-stealing. The `try_fold`/`try_reduce` callers
-/// already round-trip through these fixed boundaries, so swapping the divisor
-/// changes only the chunk *count*, never how a chunk's rows are summed; any
-/// bit-for-bit reduction-order property they had (same `n` ⇒ same boundaries ⇒
-/// same tree) is preserved.
+/// Reproducibility contract (#1045): the worker count used here is the
+/// process-stable machine parallelism (`reproducible_chunk_parallelism`), NOT
+/// the live `rayon::current_num_threads()` of the executing (possibly scoped,
+/// possibly shrunk) pool. Keying the chunk *count* — and hence the chunk
+/// boundaries `chunk_idx·chunk → (chunk_idx+1)·chunk` — to the transient pool
+/// size made the per-chunk row sums regroup when the pool was narrowed, so a
+/// fit reduced over these chunks and fed into the iterative REML optimizer moved
+/// its `(ρ, λ)` selection with the pool size. Anchoring to a process constant
+/// makes the boundaries — and therefore the `try_fold`/`try_reduce` reduction
+/// tree that round-trips through them — invariant to how many workers run the
+/// fit, while rayon still fans the chunks across whatever workers exist. For a
+/// given `n` the returned chunk size is stable across calls and pool sizes.
 #[inline]
 pub(super) fn bms_row_chunk_size(n: usize) -> usize {
     if n == 0 {
         return ROW_CHUNK_SIZE;
     }
-    let workers = rayon::current_num_threads().max(1);
+    let workers = crate::marginal_slope_shared::reproducible_chunk_parallelism();
     let target_chunks = workers.saturating_mul(ROW_CHUNKS_PER_WORKER).max(1);
     // Rows per chunk that yields ≈ `target_chunks` chunks, clamped into
     // `[ROW_CHUNK_MIN, ROW_CHUNK_SIZE]`.
