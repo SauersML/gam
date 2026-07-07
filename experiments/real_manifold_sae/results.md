@@ -27,12 +27,38 @@ K, same `top_k` active-set cap, `d_atom=1`, differing ONLY in `atom_topology`:
 - **Curved SAE** — `atom_topology="circle"` (plus a small-K structure-search run that
   selects among Circle/Torus/Sphere for "which typed manifolds get chosen").
 
-| arm | K | top_k | EV |
-|---|---|---|---|
-| linear SAE (atom_topology=linear) | _TBD_ | _TBD_ | _TBD_ |
-| curved SAE (atom_topology=circle) | _TBD_ | _TBD_ | _TBD_ |
+> NOTE: the `sae_manifold_fit` / stagewise arms below **never completed** — that lane
+> HANGS on the 32B L17 residual (self-concordance / collapse-barrier metric bug). The
+> real, product-faithful numbers were obtained via the **block-chart compose lane**
+> instead; see the HEADLINE (LANDED) section at the bottom. The table below is filled
+> from the block-chart STAGE-2 run (job 12710386, N=40k) for the matched flat-vs-curved
+> comparison. K here is the overcomplete T1 base K (block-chart T2 sits on the residual;
+> "top_k" = per-row T1 active support).
 
-Curved chart types selected (small-K structure search): _TBD_
+| arm | K (T1) | top_k | composed EV |
+|---|---|---|---|
+| T1 alone (overcomplete, ridge-LS) | 32000 (15.6×) | 32 | 0.8505 |
+| flat SAE (block-chart, 24 linear blocks) | 32000 | 32 | **0.8612** |
+| curved SAE (block-chart, 12 circle × (4+4)) | 32000 | 32 | **0.8586** |
+
+**ΔEV(curved − flat) = −0.00258** (pooled-residual floor drop = −0.0173) → **FLAT WINS;
+curvature does NOT help** at matched params, negative in every one of the 10 fitted strata
+(drop −0.01 to −0.15; larger strata → smaller gap: stratum 13 @21k rows −0.0115, stratum 8
+@590 rows −0.149).
+
+Curved chart types selected (small-K structure search): **not run** — the block-chart
+compose lane has no typed (Circle/Torus/Sphere) structure search; it promotes per-block
+circle charts via `compose_block_charts`. Charts ARE promoted (up to 12 accepted/stratum,
+curvature proxy up to 0.20), yet curved still loses at matched budget.
+
+## Verdict
+
+On the **32B MoE** (Qwen3-30B-A3B L17), overcomplete **K=32000**, **block-chart compose**,
+**matched params** — **CURVATURE DOES NOT WIN**: flat beats curved by 0.0026 EV pooled,
+negative in every stratum. This is consistent with the Qwen-8B geometric-wall closure
+(flat +0.047) and the Run-1 ceiling; the only positive curvature signal was the discarded
+k-means proxy. Provenance: ridge-LS T1 (NOT dot-product), tier0_recentered, block-chart
+compose (NOT stagewise), gamfit 0.1.250, job 12710386.
 
 ## Provenance
 
