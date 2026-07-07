@@ -2891,15 +2891,13 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
     // the halving gate passes and both retries proceed; ARC still
     // cannot reach the optimum in three single-iter attempts.
     //
-    // The risk profile MUST be `Gaussian` here: `effective_seed_budget`
-    // floors ARC+GeneralizedLinear to 2 (#1074/#1426 — a GLM needs ≥2
-    // seeds to find the heavily-penalized basin), which would defeat the
-    // `seed_budget == 1` screening-skip and let the always-injected neutral
-    // baseline seed `[0.0]` (the EXACT global minimum of x⁴, cost 0) be
-    // screened in and win — ARC would then start already-optimal and report
-    // converged in 0 iters, never exercising the ladder. Gaussian keeps the
-    // effective budget at 1 so `initial_rho = [5.0]` is the sole authoritative
-    // start and the budget-bump retry ladder is genuinely exercised.
+    // Arc + Gaussian has `effective_seed_budget == 1`, so `initial_rho = [5.0]`
+    // is the sole authoritative start: no second budgeted seed lets the always-
+    // injected neutral baseline `[0.0]` (the EXACT global minimum of x⁴, cost 0)
+    // screen in and win — which would make ARC start already-optimal, report
+    // converged in 0 iters, and never exercise the retry ladder this test drives.
+    // (Any effective-budget-1 profile works; Arc Gaussian and GLM are both floored
+    // to 1 now — see `effective_seed_budget`.)
     let mut seed_config = gam_problem::SeedConfig::default();
     seed_config.seed_budget = 1;
     seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
@@ -3498,13 +3496,11 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
     seed_config.seed_budget = 1;
     // This test asserts the `initial_rho + seed_budget==1` screening-skip
     // (`explicit_initial_rho_owns_single_seed_budget`) fires. That skip keys off
-    // the EFFECTIVE budget, not the requested one. `effective_seed_budget` floors
-    // `(Arc, GeneralizedLinear)` to 2 (#1074/#1426 — a GLM needs ≥2 seeds to also
-    // reach the heavily-penalized basin), so a GeneralizedLinear fixture would
-    // have effective budget 2, the `seed_budget == 1` skip guard would be false,
-    // and screening would run (the observed 5 screening solves). Pin the fixture
-    // to Gaussian, whose effective budget equals the requested 1, so the skip is
-    // genuinely exercised — the behaviour this test is meant to guard.
+    // the EFFECTIVE budget, not the requested one. Pin the fixture to Gaussian,
+    // whose `effective_seed_budget` is 1, so the `seed_budget == 1` skip guard is
+    // true and the skip is genuinely exercised — the behaviour this test guards.
+    // (A profile whose effective budget were > 1 would make the guard false and
+    // let screening run instead; Arc Gaussian and GLM are both floored to 1.)
     seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let screening_calls = Arc::new(AtomicUsize::new(0));
@@ -3988,13 +3984,16 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         ),
         1
     );
+    // #1575/#1074/#1426: Arc + GeneralizedLinear is floored to a single seed too
+    // (the initial.sp seed reaches the heavily-penalized GLM basin), regardless of
+    // the requested budget.
     assert_eq!(
         effective_seed_budget(
             3,
             Solver::Arc,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
         ),
-        2
+        1
     );
     assert_eq!(
         effective_seed_budget(
@@ -4002,7 +4001,7 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
             Solver::Arc,
             gam_problem::SeedRiskProfile::GeneralizedLinear,
         ),
-        2
+        1
     );
     assert_eq!(
         effective_seed_budget(

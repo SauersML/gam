@@ -101,9 +101,19 @@ fn aniso_input_location_gradient_matches_forward_finite_difference() {
             vec![0.9, -0.3],
         ),
         // d = 3, asymmetric anisotropy that does not sum to zero (exercises the
-        // centering convention).
+        // centering convention). Four well-separated rows keep the 3-center
+        // kernel block full column rank: with fewer data rows than centers the
+        // realized design (and the input-location jet, which mirrors the forward
+        // RRQR center reduction, #755/#1937) would drop a collinear center, so the
+        // fixed `0..centers.nrows()` comparison below would index a center that no
+        // longer exists in the reduced basis.
         (
-            array![[0.2, 0.5, -0.1], [0.7, -0.3, 0.4]],
+            array![
+                [0.2, 0.5, -0.1],
+                [0.7, -0.3, 0.4],
+                [-0.4, 0.1, 0.6],
+                [0.9, 0.8, -0.5]
+            ],
             array![[0.0, 0.0, 0.0], [0.6, 0.4, -0.2], [-0.3, 0.5, 0.7]],
             1.1,
             vec![0.7, -0.2, 0.15],
@@ -328,7 +338,19 @@ fn aniso_jet_differs_from_isotropic_and_only_aniso_matches_fd() {
 /// hijacked into an anisotropic metric — proving the override no longer fires.
 #[test]
 fn explicit_zero_aniso_jet_is_isotropic_and_matches_forward_fd() {
-    let points = array![[0.3, 0.65], [0.72, 0.18], [0.48, 0.93]];
+    // Six well-separated rows (spanning the wide center cloud) keep all four
+    // centers in the realized full-rank basis: with fewer data rows than centers
+    // the forward RRQR reduction (and the mirroring input-location jet,
+    // #755/#1937) would drop a collinear center, desyncing the fixed
+    // `0..centers.nrows()` comparison from the reduced column geometry.
+    let points = array![
+        [0.3, 0.65],
+        [0.72, 0.18],
+        [0.48, 0.93],
+        [2.1, 0.0],
+        [3.9, -0.2],
+        [1.1, 0.5]
+    ];
     // Deliberately anisotropic center cloud (wider spread along x): the geometry
     // the discarded override would have turned into a data-driven metric.
     let centers = array![[0.0, 0.0], [2.0, 0.1], [4.0, -0.1], [1.0, 0.6]];

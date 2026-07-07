@@ -877,6 +877,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
+            // gam#979: joint simple lower bounds, when the joint constraints are
+            // all axis-aligned lower bounds (the survival monotone-baseline-hazard
+            // / monotone-smooth case). Threaded into the stationarity certificate
+            // so ACTIVE simple-lower-bound multipliers are projected out (the
+            // box-bound analog of the linear-constraint projection), instead of
+            // their multiplier mass being mis-read as a stationarity defect and
+            // mis-refusing a genuinely-optimal constrained iterate.
+            let joint_lower_bounds: Option<Array1<f64>> = joint_constraints
+                .as_ref()
+                .and_then(|c| extract_simple_lower_bounds(c, total_p).ok().flatten())
+                .map(|b| b.lower_bounds);
             if cycle_log && cycle == 0 {
                 log::info!(
                     "[STAGE] PIRLS/inner step=cycle0 block+joint constraints elapsed={:.3}s n={} p={}",
@@ -1182,6 +1193,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options.ridge_policy,
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
+                joint_lower_bounds.as_ref(),
             )?;
             if current_kkt_norm.is_finite() {
                 min_certified_residual = min_certified_residual.min(current_kkt_norm);
@@ -1488,6 +1500,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             },
                         );
                     }
+                    // Keep the TRUE (un-reflected) curvature for the KKT release
+                    // test (gam#979). The reflected `lhs` bounds the STEP, but a
+                    // monotone-hazard bound aligned with a negative-curvature mode
+                    // gets its dual multiplier sign-flipped by the reflection —
+                    // released spuriously, then re-added on the next outer cycle
+                    // (the active-set zigzag that ground the survival fit for 30
+                    // cycles). The release must be judged on the real curvature.
+                    let lhs_true_kkt = lhs.clone();
                     let lhs = lhs_reflected;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
@@ -1497,6 +1517,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             &beta_joint,
                             bounds,
                             warm_joint_active.as_deref(),
+                            Some(&lhs_true_kkt),
                         )
                     } else {
                         solve_quadratic_with_linear_constraints(
@@ -1509,7 +1530,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .map_err(|e| e.to_string())
                     };
                     match solve_result {
-                        Ok((beta_new, active_set)) => (beta_new, Some(active_set), 0usize),
+                        Ok((beta_new, active_set)) => {
+                            // gam#979 constrained-QP probe (temporary): per-cycle
+                            // active-set size + ‖β‖∞ so the failing survival pytest's
+                            // captured WARN output distinguishes (a) a THRASHING active
+                            // set (rows change every cycle → the QP never settles) from
+                            // (c) a STABLE set with a blowing-up free direction
+                            // (near-separation: ‖β‖∞ grows unbounded). WARN reaches the
+                            // failing-test capture; the cond/nullity/diagnosis come from
+                            // the existing `format_structured_log` at the refused exit.
+                            log::warn!(
+                                "[gam#979 constrained-QP] cycle={} active_set_rows={} beta_inf={:.4e}",
+                                cycle,
+                                active_set.len(),
+                                beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                            );
+                            (beta_new, Some(active_set), 0usize)
+                        }
                         Err(_) => break,
                     }
                 } else {
@@ -3597,6 +3634,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options.ridge_policy,
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
+                joint_lower_bounds.as_ref(),
             )?;
             prev_kkt_norm = Some(residual);
             // Record this cycle's KKT residual for the steady-geometric-descent
@@ -6553,6 +6591,9 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                     &beta_joint,
                     bounds,
                     warm.as_deref(),
+                    // Polish path is not curvature-reflected: same Hessian for
+                    // step and KKT test (gam#979).
+                    None,
                 ) {
                     Ok((beta_new, _active)) => &beta_new - &beta_joint,
                     Err(_) => break,

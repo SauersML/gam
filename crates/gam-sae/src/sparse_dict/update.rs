@@ -391,10 +391,35 @@ impl DecoderNormalEq {
 /// seeded direction so a later epoch can still route rows to them.
 pub(super) const DEAD_DENOM: f64 = 1.0e-12;
 
-/// Coupled components this small are solved by dense Cholesky. Anything larger
-/// uses matrix-free CG because realistic co-firing graphs percolate into one
-/// giant component.
-const MAX_DIRECT_BLOCK: usize = 8;
+/// Percolation-derived size ceiling for the exact dense-Cholesky path.
+///
+/// The co-firing graph is, at realistic scale, an Erdős–Rényi graph `G(K, p)`:
+/// each of the `N` rows lights `s` atoms, depositing `C(s,2)` co-firing edges,
+/// so the mean degree is `D = 2|E|/K ≈ N·s²/K`. Erdős–Rényi's theorem places the
+/// **giant-component birth exactly at mean degree `D = 1`**, and *at that
+/// critical point the largest component has size `Θ(K^{2/3})`*: strictly below
+/// criticality every component is smaller, and strictly above it anything of
+/// size `≫ K^{2/3}` has been swallowed by the single giant. `K^{2/3}` is thus
+/// the intrinsic size scale of the percolation transition — the frontier that
+/// separates the genuinely-small sub/critical debris (whose exact dense
+/// Cholesky costs at most `O((K^{2/3})³) = O(K²)`, i.e. never more than forming
+/// the ambient `K×K` normal equations themselves) from giant-scale blocks, where
+/// a per-component dense factorisation is fiction and matrix-free CG is the only
+/// honest solve. We therefore route components of size `≤ ⌈K^{2/3}⌉` to dense
+/// Cholesky and everything larger to CG. No tuned constant enters: the exponent
+/// `2/3` is the Erdős–Rényi critical-component exponent (`θ = 2/3`, a theorem,
+/// not a knob), and the threshold is that critical-window component scaling
+/// evaluated at the live `K` — it moves with the problem, so there is no magic
+/// block size to outgrow.
+pub(super) fn direct_solve_size_threshold(k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    // ⌈K^{2/3}⌉: the critical-window largest-component scale. `ceil` keeps the
+    // smallest coupled blocks (a single co-firing edge, `K^{2/3} ≥ 1`) on the
+    // exact path where dense factorisation is unconditionally cheapest.
+    (k as f64).powf(2.0 / 3.0).ceil() as usize
+}
 
 /// Solver/percolation certificate for one decoder MOD refresh.
 #[derive(Clone, Copy, Debug)]
@@ -692,6 +717,11 @@ pub(super) fn solve_decoder(
         ..DecoderSolveStats::default()
     };
 
+    // Exact dense Cholesky is confined to components below the percolation
+    // critical-component scale; everything larger is a giant-scale block solved
+    // matrix-free by CG (see `direct_solve_size_threshold`).
+    let direct_threshold = direct_solve_size_threshold(k);
+
     let mut visited = vec![false; k];
     for start in 0..k {
         if visited[start] {
@@ -730,17 +760,49 @@ pub(super) fn solve_decoder(
         comp.sort_unstable();
         stats.component_count += 1;
         stats.max_component_size = stats.max_component_size.max(comp.len());
-        solve_component(decoder, eq, ridge, &comp, &neigh, p, &mut stats);
+        solve_component(
+            decoder,
+            eq,
+            ridge,
+            &comp,
+            &neigh,
+            p,
+            direct_threshold,
+            &mut stats,
+        );
     }
     if k > 0 {
         stats.giant_component_fraction = stats.max_component_size as f64 / k as f64;
     }
+
+    // Percolation + conditioning certificate for this refresh. Surfacing the
+    // giant-component fraction, mean degree, and the CG Lanczos κ̂ every epoch
+    // makes the percolating-regime diagnosis (and any ill-conditioned block)
+    // readable without a debugger — the co-firing graph is one giant component
+    // at scale, so the exact-solve threshold `⌈K^{2/3}⌉` is expected to bind.
+    log::debug!(
+        "[SAE percolation] K={k} mean_degree={:.4} giant_fraction={:.4} \
+         components={} max_component={} direct_threshold={direct_threshold} \
+         cg_columns={} cg_iterations={} cg_kappa_hat={:?} \
+         cg_relative_residual={:.3e} cg_residual_stop={:.3e}",
+        stats.mean_cofiring_degree,
+        stats.giant_component_fraction,
+        stats.component_count,
+        stats.max_component_size,
+        stats.cg_columns,
+        stats.cg_iterations,
+        stats.cg_kappa_hat,
+        stats.cg_relative_residual,
+        stats.cg_residual_stop,
+    );
     stats
 }
 
-/// Solve one connected component's block exactly: dense SPD Cholesky when the
-/// block is small ([`MAX_DIRECT_BLOCK`]), else CG. `comp` is the component's
-/// atom indices in ascending order; `neigh` is the global sorted adjacency.
+/// Solve one connected component's block: dense SPD Cholesky when the block is
+/// below the percolation critical-component scale (`direct_threshold`, see
+/// [`direct_solve_size_threshold`]), else matrix-free CG. `comp` is the
+/// component's atom indices in ascending order; `neigh` is the global sorted
+/// adjacency.
 fn solve_component(
     decoder: &mut Array2<f32>,
     eq: &DecoderNormalEq,
@@ -748,6 +810,7 @@ fn solve_component(
     comp: &[usize],
     neigh: &[Vec<(u32, f64)>],
     p: usize,
+    direct_threshold: usize,
     stats: &mut DecoderSolveStats,
 ) {
     let m = comp.len();
@@ -757,7 +820,7 @@ fn solve_component(
         local.insert(a, i);
     }
 
-    if m <= MAX_DIRECT_BLOCK {
+    if m <= direct_threshold {
         // Assemble the dense block (A_sub + ρI) and the m×P right-hand side, then
         // solve all P columns from one Cholesky factor.
         let mut mat = Array2::<f64>::zeros((m, m));

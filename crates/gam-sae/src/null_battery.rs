@@ -155,6 +155,7 @@ impl SpikeInRocConfig {
             snrs,
             trials,
             seed,
+            // reporting-only: FPR operating points at which spike-in ROC TPR is reported.
             fpr_levels: vec![0.01, 0.05, 0.10],
             noise_mode: SpikeInNoiseMode::PhaseRandomizedResidual,
         }
@@ -166,6 +167,7 @@ impl SpikeInRocConfig {
             snrs,
             trials,
             seed,
+            // reporting-only: FPR operating points at which spike-in ROC TPR is reported.
             fpr_levels: vec![0.01, 0.05, 0.10],
             noise_mode: SpikeInNoiseMode::EmpiricalResidualBootstrap,
         }
@@ -696,9 +698,11 @@ pub fn default_spike_in_detection_pipeline(
             if total > 0.0 { rank_sum / total } else { 0.0 }
         }
     };
+    // reporting-only: heuristic promotion floors on the shape detector statistic;
+    // they gate the reported promote/hold verdict, not any estimated quantity.
     let promotion_floor = match shape {
-        SpikeInShape::Circle => 0.10,
-        SpikeInShape::Torus => 0.55,
+        SpikeInShape::Circle => 0.10, // reporting-only
+        SpikeInShape::Torus => 0.55,  // reporting-only
     };
     let promoted = statistic >= promotion_floor;
     let topology = match shape {
@@ -1074,7 +1078,7 @@ fn circle_topology_audit_from_harmonic_stat(
     let tail = eigenvalues.get(2).copied().unwrap_or(0.0).max(0.0);
     let spectral_balance = second / leading;
     let residual_tail_energy = tail / second.max(f64::MIN_POSITIVE);
-    let accepted = statistic >= 0.10;
+    let accepted = statistic >= 0.10; // reporting-only: heuristic acceptance floor for the reported Betti verdict.
     let measured = if accepted { expected } else { (1, 0, 0) };
     TopologyAuditReport {
         expected_betti0: expected.0,
@@ -1110,11 +1114,15 @@ fn topology_audit_from_spectrum(
         .max(0.0);
     let spectral_balance = weakest_signal / leading;
     let residual_tail_energy = rank_tail / weakest_signal.max(f64::MIN_POSITIVE);
+    // reporting-only: heuristic spectral operating points gating the reported
+    // topology-audit verdict; not derived and not used as numeric estimates.
     let accepted = match shape {
         SpikeInShape::Circle => {
+            // reporting-only
             rank_energy >= 0.45 && spectral_balance >= 0.25 && residual_tail_energy <= 0.75
         }
         SpikeInShape::Torus => {
+            // reporting-only
             rank_energy >= 0.55 && spectral_balance >= 0.12 && residual_tail_energy <= 0.80
         }
     };
@@ -1199,6 +1207,10 @@ fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 
     if excess_kurtosis <= f64::MIN_POSITIVE {
         1.0
     } else {
+        // Moment match: for a unit-mean log-normal radius exp(sigma*z - sigma^2/2),
+        // the excess kurtosis is a monotone function of sigma^2; this inverts its
+        // leading term, so sigma^2 = ln(1 + excess_kurtosis/3)/4 reproduces the
+        // requested tail weight (the /3 and /4 are the leading kurtosis coefficients).
         let sigma2 = (1.0 + excess_kurtosis / 3.0).ln() / 4.0;
         let sigma = sigma2.sqrt();
         let z = standard_normal(rng);

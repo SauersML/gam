@@ -2450,9 +2450,23 @@ pub(crate) mod whitened_spectrum {
         pub(crate) d_inv_sqrt: Array1<f64>,
         /// `max_k |γ_k|` (the curvature scale; `D`-whitened).
         pub(crate) lambda_max_abs: f64,
-        /// Curvature magnitude at/below which a direction is treated as genuinely
-        /// unidentified (penalty null space) and dropped from the step.
+        /// Curvature magnitude at/below which a direction is treated as
+        /// numerically unidentified for the CONVERGENCE CERTIFICATE and the
+        /// gauge diagnostics (`newton_decrement` / `null_residual_inf`):
+        /// `null_cutoff = max(rank_tol·λ_max, numerical_floor)`.
         pub(crate) null_cutoff: f64,
+        /// Machine-rank floor `λ_max·√p·ε` — the curvature magnitude at/below
+        /// which a direction carries NO resolvable curvature (pure numerical
+        /// null). This is the threshold the STEP drops at (gam#979/#1449): the
+        /// modified-Newton step resolves every mode above it, including the
+        /// weakly-identified band `numerical_floor < |γ| ≤ null_cutoff` that
+        /// `null_cutoff` (inflated by an over-selected penalty λ_max) would
+        /// otherwise swallow — the drop that deadlocked the coupled solve
+        /// against the `weakly_identified_decrement` certificate. Keeping the
+        /// step floor at the machine-rank cutoff while the certificate keeps
+        /// `null_cutoff` closes that step/cert gap without chasing a genuine
+        /// numerical-null direction (which stays below this floor).
+        pub(crate) numerical_floor: f64,
     }
 
     impl WhitenedHessianSpectrum {
@@ -2530,6 +2544,30 @@ pub(crate) mod whitened_spectrum {
             let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
             let rank_cutoff = rank_tol * lambda_max_abs;
             let null_cutoff = rank_cutoff.max(numerical_floor);
+            // gam#979 diagnostic (WARN survives the default INFO filter that
+            // hides passing-test stdout). Fires ONLY when a mode lands in the
+            // weakly-identified band `numerical_floor < |γ| ≤ null_cutoff` — i.e.
+            // a direction with condition number > 1/rank_tol (=1e10) relative to
+            // λ_max, the ill-conditioned signature of the #979 step/cert
+            // deadlock (an over-selected penalty inflating `rank_tol·λ_max` until
+            // it swallows a real mode). Well-conditioned solves have an empty
+            // band and stay silent. The step now RESOLVES this band (the fix),
+            // so the line surfaces the inflated λ_max the deadlock hinged on.
+            let band_modes = gamma
+                .iter()
+                .filter(|g| g.abs() > numerical_floor && g.abs() <= null_cutoff)
+                .count();
+            if band_modes > 0 {
+                let cert_null_modes = gamma.iter().filter(|g| g.abs() <= null_cutoff).count();
+                log::warn!(
+                    "[joint-newton spectrum gam#979] λ_max={:.6e} null_cutoff={:.6e} numerical_floor={:.6e} band_modes={} cert_null_modes={} (band now resolved by the step; cert still classifies on null_cutoff)",
+                    lambda_max_abs,
+                    null_cutoff,
+                    numerical_floor,
+                    band_modes,
+                    cert_null_modes,
+                );
+            }
             Ok(Self {
                 gamma,
                 evecs,
@@ -2537,6 +2575,7 @@ pub(crate) mod whitened_spectrum {
                 d_inv_sqrt,
                 lambda_max_abs,
                 null_cutoff,
+                numerical_floor,
             })
         }
 
@@ -2547,7 +2586,10 @@ pub(crate) mod whitened_spectrum {
         pub(crate) fn step_norm_sq(&self, lambda: f64) -> f64 {
             let mut acc = 0.0;
             for k in 0..self.gamma.len() {
-                if self.gamma[k].abs() <= self.null_cutoff {
+                // Step floor: resolve every mode above the machine-rank floor
+                // (gam#979/#1449), not just those above the penalty-inflated
+                // `null_cutoff`.
+                if self.gamma[k].abs() <= self.numerical_floor {
                     continue;
                 }
                 let denom = self.gamma[k] + lambda;
@@ -2681,7 +2723,15 @@ pub(crate) mod whitened_spectrum {
             let mut most_negative = 0.0_f64;
             for k in 0..p {
                 let g = self.gamma[k];
-                if g.abs() <= self.null_cutoff {
+                // Step floor: drop only genuine numerical-null directions
+                // (`|γ| ≤ numerical_floor`), and RESOLVE the weakly-identified
+                // band `numerical_floor < |γ| ≤ null_cutoff` via the regularized
+                // modified-Newton coefficient below (gam#979/#1449 — the band
+                // the penalty-inflated `null_cutoff` previously swallowed, which
+                // deadlocked the coupled solve against the certificate). The
+                // reported `nullity`/`null_rhs_inf` therefore track the step's
+                // true (machine-rank) null space, consistent with what it drops.
+                if g.abs() <= self.numerical_floor {
                     nullity += 1;
                     null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
                     continue;
@@ -2733,7 +2783,11 @@ pub(crate) mod whitened_spectrum {
             let mut gamma_min_id = f64::INFINITY;
             let mut any_identified = false;
             for k in 0..self.gamma.len() {
-                if self.gamma[k].abs() <= self.null_cutoff {
+                // Step floor (gam#979/#1449): the identified set for the
+                // Moré–Sorensen subproblem is everything above the machine-rank
+                // floor, so the weakly-identified band is resolved (λ regularizes
+                // the small-γ modes) rather than dropped.
+                if self.gamma[k].abs() <= self.numerical_floor {
                     continue;
                 }
                 any_identified = true;
@@ -2769,7 +2823,9 @@ pub(crate) mod whitened_spectrum {
             let mut hard_case_component_sq = 0.0;
             let mut k_min_witness = None;
             for k in 0..self.gamma.len() {
-                if self.gamma[k].abs() <= self.null_cutoff {
+                // Step floor (gam#979/#1449): identified set is above the
+                // machine-rank floor.
+                if self.gamma[k].abs() <= self.numerical_floor {
                     continue;
                 }
                 if (self.gamma[k] - gamma_min_id).abs() <= min_mode_tol {
@@ -2828,7 +2884,10 @@ pub(crate) mod whitened_spectrum {
                 // q'(λ) = -2 Σ c_k²/(γ_k+λ)³ ⇒ d/dλ (1/norm) = -½ q^{-3/2} q'.
                 let mut q_prime = 0.0;
                 for k in 0..self.gamma.len() {
-                    if self.gamma[k].abs() <= self.null_cutoff {
+                    // Step floor (gam#979/#1449): match the identified set used
+                    // by `step_norm_sq` above so the secular derivative is
+                    // consistent with the norm it differentiates.
+                    if self.gamma[k].abs() <= self.numerical_floor {
                         continue;
                     }
                     let denom = self.gamma[k] + lambda;
@@ -2870,7 +2929,10 @@ pub(crate) mod whitened_spectrum {
             let mut most_negative = 0.0_f64;
             for k in 0..p {
                 let g = self.gamma[k];
-                if g.abs() <= self.null_cutoff {
+                // Step floor (gam#979/#1449): mirror `assemble` — resolve every
+                // mode above the machine-rank floor, drop only genuine
+                // numerical-null directions.
+                if g.abs() <= self.numerical_floor {
                     nullity += 1;
                     null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
                     continue;
@@ -3031,53 +3093,73 @@ mod trust_region_subproblem_tests {
         assert!(step.delta[1].abs() < 1e-10, "null coordinate left at 0");
     }
 
-    /// Near-null directions below the public rank tolerance must be treated the
-    /// same way as exact null directions. Regresses the #1082 gauge-drift crawl:
-    /// using `min(rank_cutoff, numerical_floor)` classified this mode as
-    /// identified, so the step and Newton-decrement certificate chased a
-    /// rank-tolerance-null gauge direction instead of dropping it.
+    /// gam#979/#1449 (completes #1082): a weakly-identified mode below the
+    /// penalty-inflated `null_cutoff` but ABOVE the machine-rank
+    /// `numerical_floor` is now RESOLVED by the modified-Newton STEP (the
+    /// regularized coefficient the Moré–Sorensen λ bounds), while the
+    /// convergence CERTIFICATE (`newton_decrement` / `null_residual_inf`) still
+    /// classifies it as gauge on `null_cutoff`. That asymmetry is exactly the
+    /// fix: the step moves the mode the certificate would otherwise wait on
+    /// forever, closing the step/cert deadlock. (Pre-#979 the STEP dropped it —
+    /// the #1082 over-conservative half — which against the hardened #1449
+    /// certificate deadlocked the coupled solve at the cycle cap.)
     #[test]
-    pub(crate) fn rank_tolerance_null_direction_is_dropped_from_step_and_decrement() {
+    pub(crate) fn rank_tolerance_band_mode_resolved_by_step_kept_out_of_cert_979() {
         let h = array![[1.0, 0.0], [0.0, 1e-12]];
         let rhs = array![1.0, 0.5];
         let d = array![1.0, 1.0];
         let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
 
+        // γ=1e-12 sits in the weakly-identified band:
+        // numerical_floor (≈3.1e-16) < 1e-12 ≤ null_cutoff (=1e-10).
         assert!(
             spec.null_cutoff >= KKT_REFUSAL_RANK_TOL,
             "rank tolerance must set the null cutoff; got {}",
             spec.null_cutoff
         );
-
-        let step = spec.trust_region_step(1e6);
-        assert_eq!(step.nullity, 1, "near-null direction expected");
         assert!(
-            step.null_rhs_inf >= 0.5 - 1e-9,
-            "near-null rhs component must be reported, got {}",
+            spec.numerical_floor < 1e-12 && 1e-12 <= spec.null_cutoff,
+            "γ=1e-12 must be in the band (numerical_floor={} null_cutoff={})",
+            spec.numerical_floor,
+            spec.null_cutoff
+        );
+
+        // STEP side: the band mode is RESOLVED, not dropped. `nullity` counts
+        // only the (empty) machine-rank null space, nothing is excluded from
+        // the step, coordinate 1 carries a real component, and the Moré–Sorensen
+        // λ holds the step on the trust boundary (finite — not the ~5e11 raw
+        // Newton step for a 1e-12 curvature).
+        let step = spec.trust_region_step(1e6);
+        assert_eq!(step.nullity, 0, "no machine-rank-null direction here");
+        assert!(
+            step.null_rhs_inf < 1e-9,
+            "the step excludes no residual now; got {}",
             step.null_rhs_inf
         );
-        assert!((step.delta[0] - 1.0).abs() < 1e-10);
         assert!(
-            step.delta[1].abs() < 1e-10,
-            "rank-tolerance-null coordinate must be dropped, got {}",
+            step.delta[1].abs() > 1e-9,
+            "the band mode must be resolved (non-zero step component); got {}",
             step.delta[1]
         );
+        let step_norm =
+            (step.delta[0] * step.delta[0] + step.delta[1] * step.delta[1]).sqrt();
+        assert!(
+            step_norm > 0.9e6 && step_norm < 1.1e6,
+            "the regularized step sits on the trust boundary, ‖δ‖={step_norm}"
+        );
 
+        // CERT side UNCHANGED (still keyed on null_cutoff): the decrement
+        // excludes the band mode and the audit witness reports its residual, so
+        // the decrement-only stopping decision is byte-identical to before.
         let decrement = spec.newton_decrement();
         assert!(
             (decrement - 0.5).abs() < 1e-10,
-            "decrement must exclude the near-null gauge mode; got {decrement}"
+            "decrement still excludes the near-null gauge mode; got {decrement}"
         );
-
-        // The mass the decrement excluded must be reported by the audit witness:
-        // the near-null mode here carries rhs component |c| = 0.5, so a
-        // certificate firing on this spectrum is auditably discarding 0.5 of
-        // gauge residual. `null_residual_inf` exposes exactly that, and must NOT
-        // change the (decrement-only) stopping decision.
         let excluded = spec.null_residual_inf();
         assert!(
             (excluded - 0.5).abs() < 1e-10,
-            "excluded near-null residual mass must be observable; got {excluded}"
+            "excluded near-null residual still observable by the cert audit; got {excluded}"
         );
     }
 
@@ -3167,32 +3249,26 @@ mod trust_region_subproblem_tests {
         );
     }
 
-    /// gam#1449 — end-to-end validation in the BADLY-SCALED regime the issue
-    /// names: `null_cutoff = max(rank_tol·λ_max, numerical_floor)` scales with
-    /// `λ_max`, so on an ill-conditioned penalized Hessian `rank_tol·λ_max` can
-    /// grow large enough to swallow a mode with small-but-REAL curvature AND real
-    /// signal — a genuinely weakly-identified direction misclassified as
-    /// gauge-null and excluded from BOTH the modified-Newton step and the raw
-    /// Newton-decrement certificate.
+    /// gam#979/#1449 (completes #1082) — end-to-end in the BADLY-SCALED regime:
+    /// `null_cutoff = max(rank_tol·λ_max, numerical_floor)` scales with `λ_max`,
+    /// so on an ill-conditioned penalized Hessian `rank_tol·λ_max` grows large
+    /// enough to swallow a mode with small-but-REAL curvature AND real signal.
+    /// The CERTIFICATE keeps that (conservative) `null_cutoff` classification —
+    /// but the STEP now resolves the mode at the machine-rank `numerical_floor`,
+    /// taking its exact Newton component. That is the fix: the step moves the
+    /// mode, so `weakly_identified_decrement` → 0 and the certificate clears,
+    /// instead of the pre-#979 deadlock (step dropped it — #1082 — while the
+    /// hardened #1449 gate refused to certify it).
     ///
-    /// Concrete regime: `H = diag(1e12, 1.0)`, identity metric `D = I` (so the
-    /// whitened spectrum equals `H`), `rhs = (1, 0.5)`. Then
-    ///   λ_max          = 1e12
-    ///   numerical_floor = 1e12·√2·ε ≈ 3.1e-4   (machine-rank cutoff)
-    ///   null_cutoff     = max(1e-10·1e12, 3.1e-4) = 100.
-    /// The mode `γ = 1.0` is genuinely curved (a quadrillion times above the
-    /// machine-rank floor) and carries real signal `c = 0.5`, yet `1.0 ≤ 100`
-    /// so it is classified as null.
-    ///
-    /// This test PROVES the discard is real and material — the truncated step
-    /// zeroes a coordinate the un-truncated linear solve `H δ = rhs` resolves to
-    /// `0.5` — and PINS that the conditioning-robust gate (`weakly_identified_
-    /// decrement`, gam#1449) recovers the real mode's achievable improvement so
-    /// the decrement certificate is blocked, where the raw decrement alone would
-    /// have falsely certified convergence. Outcome (a): a real regime where the
-    /// raw `null_cutoff` discards a real mode, caught by the hardened gate.
+    /// Concrete regime: `H = diag(1e12, 1.0)`, `D = I` (whitened spectrum == H),
+    /// `rhs = (1, 0.5)`. Then `λ_max = 1e12`, `numerical_floor = 1e12·√2·ε ≈
+    /// 3.1e-4`, `null_cutoff = max(1e-10·1e12, 3.1e-4) = 100`. The `γ = 1.0` mode
+    /// is a quadrillion times above the machine-rank floor and carries real
+    /// signal `c = 0.5`, so the STEP resolves it to `c/γ = 0.5`; the CERT still
+    /// excludes it (`1.0 ≤ 100`) and the conditioning-robust decrement recovers
+    /// its `c²/(2γ) = 0.125` improvement.
     #[test]
-    pub(crate) fn badly_scaled_null_cutoff_discards_real_mode_but_robust_gate_catches_it() {
+    pub(crate) fn badly_scaled_band_mode_now_resolved_by_step_cert_stays_robust_979() {
         // Badly-scaled: λ_max = 1e12 inflates rank_tol·λ_max to 100.
         let h = array![[1.0e12, 0.0], [0.0, 1.0]];
         let rhs = array![1.0, 0.5];
@@ -3200,7 +3276,7 @@ mod trust_region_subproblem_tests {
         let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
 
         // 1. The cutoff is driven by rank_tol·λ_max (NOT the machine floor), and
-        //    it is large enough to swallow the γ = 1.0 mode.
+        //    it is large enough to swallow the γ = 1.0 mode for the CERTIFICATE.
         let numerical_floor = 1.0e12 * (2.0_f64).sqrt() * f64::EPSILON;
         assert!(
             spec.null_cutoff >= 1.0,
@@ -3217,33 +3293,21 @@ mod trust_region_subproblem_tests {
             numerical_floor,
         );
 
-        // 2. The real, weakly-identified mode IS discarded from the step: the
-        //    unconstrained modified-Newton step leaves coordinate 1 at zero.
-        let truncated = spec.trust_region_step(f64::INFINITY);
+        // 2. STEP side (gam#979 fix): the γ=1 mode is RESOLVED, not discarded.
+        //    Unconstrained, the modified-Newton step takes its exact component
+        //    δ[1] = c/γ = 0.5/1 = 0.5, and nullity counts only the (empty)
+        //    machine-rank null space — γ=1 ≫ numerical_floor.
+        let untruncated_delta1 = rhs[1] / h[[1, 1]]; // diagonal ⇒ exact = 0.5
+        let step = spec.trust_region_step(f64::INFINITY);
         assert_eq!(
-            truncated.nullity, 1,
-            "the γ=1 real mode is misclassified as null"
+            step.nullity, 0,
+            "γ=1 ≫ numerical_floor is resolved, not classified null"
         );
         assert!(
-            truncated.delta[1].abs() < 1e-10,
-            "the discarded real mode carries no step component; got δ[1]={}",
-            truncated.delta[1],
-        );
-
-        // 3. ...but the un-truncated linear solve H δ = rhs resolves that
-        //    coordinate to a MATERIALLY different value (c/γ = 0.5/1 = 0.5). So
-        //    the truncation is not a harmless gauge drop — it is a real
-        //    coefficient the certified solve would silently get wrong.
-        let untruncated_delta1 = rhs[1] / h[[1, 1]]; // diagonal ⇒ exact
-        assert!(
-            (untruncated_delta1 - 0.5).abs() < 1e-12,
-            "un-truncated solve along the weak mode = {untruncated_delta1}"
-        );
-        let discard_gap = (untruncated_delta1 - truncated.delta[1]).abs();
-        assert!(
-            discard_gap > 0.4,
-            "the discarded mode must be MATERIALLY wrong vs the un-truncated \
-             solve; gap={discard_gap}"
+            (step.delta[1] - untruncated_delta1).abs() < 1e-10,
+            "the step now resolves the real mode to its exact value \
+             {untruncated_delta1}; got δ[1]={}",
+            step.delta[1],
         );
 
         // 4. The raw Newton decrement IGNORES the discarded mode entirely, so on

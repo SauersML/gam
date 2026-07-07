@@ -3043,24 +3043,22 @@ pub fn build_smooth_basis(
                             // and crashes the fit (historically a non-finite
                             // eigendecomposition; now a fit-time validation error).
                             //
-                            // Rather than emit the fractional cubic and let it truncate
-                            // into an inadmissible kernel, resolve the SMALLEST
-                            // admissible integer `(nullspace, s)` at the requested
-                            // nullspace order. The formula default is the same
-                            // native-Gram Duchon smoother as the scale-free path, so
-                            // there is no collocation-operator floor to honor here.
-                            // Users that opt into operator penalties get the stricter
-                            // gate at basis-build time from the requested operators.
-                            let max_op = crate::basis::duchon_max_active_operator_derivative_order(
-                                &DuchonOperatorPenaltySpec::all_disabled(),
-                            );
-                            let (ns, s) = crate::basis::resolve_duchon_orders(
-                                cols.len(),
-                                requested_nullspace_order,
-                                max_op,
-                                length_scale,
-                            );
-                            (ns, s as f64)
+                            // Resolve to the same structural cubic default the
+                            // scale-free path uses (affine `Linear` null space, `r³`
+                            // kernel, fractional power `s = (d-1)/2`) but take the
+                            // largest admissible INTEGER at or below it — `⌊(d-1)/2⌋`.
+                            // For odd `d` this is exactly the cubic power (the hybrid
+                            // default then agrees with the scale-free cubic default);
+                            // for even `d` it is the nearest integer below. Either way
+                            // `p = 2` (affine) gives spectral order
+                            // `2(p+s) = d+3` (odd `d`) or `d+2` (even `d`), which
+                            // clears both kernel existence `2(p+s) > d` and the D1
+                            // collocation floor `2(p+s) > d+1` for every `d ≥ 1`.
+                            // Flooring here at the request layer avoids the
+                            // `power_as_usize` truncation-to-zero on the fractional
+                            // half-integer.
+                            let (ns, s_frac) = crate::basis::duchon_cubic_default(cols.len());
+                            (ns, s_frac.floor())
                         }
                     }
                 }

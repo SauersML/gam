@@ -277,6 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "pc_iters": args.pc_iters,
             "centered_energy": peel.centered_energy,
             "sink_energy": peel.sink_energy,
+            // 1.0e-30 is a divide-by-zero floor on the denominator, well below any real energy.
             "absorbed_centered_fraction": peel.sink_energy / peel.centered_energy.max(1.0e-30),
             "seconds": peel_seconds,
         },
@@ -286,6 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "train_seconds": train_seconds,
             "charge_seconds": charge_seconds,
             "wall_seconds": elapsed,
+            // 1.0e-30 is a divide-by-zero floor on the elapsed-seconds denominator.
             "rows_per_train_second": n_used as f64 * state.epochs_run() as f64 / train_seconds.max(1.0e-30),
         },
         "rss": {
@@ -345,15 +347,15 @@ fn parse_args() -> Result<Args, String> {
         input: PathBuf::from(&raw[1]),
         out_dir: PathBuf::from(&raw[2]),
         rows: usize::MAX,
-        atoms: 100_000,
+        atoms: 100_000, // reporting-only: demo default dictionary size for the scaling example.
         block_size: 4,
         block_topk: 2,
         epochs: 1,
         minibatch: 128,
         block_tile: 1024,
         pc_iters: 3,
-        frame_ridge: 1.0e-9,
-        tolerance: 1.0e-5,
+        frame_ridge: 1.0e-9, // reporting-only: demo default frame ridge for the scaling example.
+        tolerance: 1.0e-5,   // reporting-only: demo default convergence tolerance.
         aux_k: 0,
         raw_ok: false,
         post_peel: false,
@@ -490,6 +492,7 @@ fn open_npy(path: &Path) -> Result<NpyMatrix, String> {
 }
 
 fn parse_npy_header(bytes: &[u8], path: &Path) -> Result<NpyHeader, String> {
+    // 12 = npy fixed preamble: 6-byte magic + 2 version bytes + 4-byte (v2/v3) header length.
     if bytes.len() < 12 || &bytes[0..6] != b"\x93NUMPY" {
         return Err(format!("{} is not a .npy file", path.display()));
     }
@@ -499,7 +502,7 @@ fn parse_npy_header(bytes: &[u8], path: &Path) -> Result<NpyHeader, String> {
         (len, 10usize + len)
     } else if major == 2 || major == 3 {
         let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-        (len, 12usize + len)
+        (len, 12usize + len) // 12 = npy v2/v3 preamble length before the header dict.
     } else {
         return Err(format!("unsupported npy version {}.{}", major, bytes[7]));
     };
@@ -668,6 +671,7 @@ fn deterministic_unit_vector(p: usize) -> Vec<f64> {
 }
 
 fn normalize(v: &mut [f64]) {
+    // 1.0e-30 is a divide-by-zero floor on the vector norm before normalization.
     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1.0e-30);
     for value in v {
         *value /= norm;
