@@ -738,38 +738,41 @@ impl SaeManifoldTerm {
         SAE_DECODER_REPULSION_BARRIER_RATIO * self.separation_barrier_strength()
     }
 
-    /// #1625 — the SEPARATION barrier's C1 collinearity gate
-    /// `w(c²) ∈ [0,1]` and its derivative `w'(c²)`, evaluated together so the
-    /// value and the analytic gradient/curvature differentiate one shared
-    /// smoothstep. Exactly `(0, 0)` below
-    /// [`SAE_SEPARATION_BARRIER_COLLINEARITY_GATE`] `s0` (the barrier is a strict
-    /// no-op on well-separated atoms), ramping as the Hermite smoothstep
-    /// `w = t²(3−2t)`, `t = (c²−s0)/(1−s0)`, to `(1, 0)` at `c² = 1` — so the
-    /// barrier's interior-point divergence `−log(1−c²+ε)` is recovered at the
-    /// collapse limit while moderate collinearity is untaxed. `w'` carries the
-    /// chain-rule `dt/dc² = 1/(1−s0)` so the returned pair is the exact gradient of
-    /// the SAME `w` the value uses (no value/gradient desync across the line
+    /// #1625 — the SEPARATION barrier's C2 collinearity gate
+    /// `w(c²) ∈ [0,1]`, its derivative `w'(c²)`, and its second derivative
+    /// `w''(c²)`, evaluated together so the value, the analytic gradient, and the
+    /// self-concordant curvature all differentiate one shared smoothstep. Exactly
+    /// `(0, 0, 0)` below [`SAE_SEPARATION_BARRIER_COLLINEARITY_GATE`] `s0` (the
+    /// barrier is a strict no-op on well-separated atoms), ramping as the Hermite
+    /// smoothstep `w = t²(3−2t)`, `t = (c²−s0)/(1−s0)`, to `(1, 0, 0)` at `c² = 1`
+    /// — so the barrier's interior-point divergence `−log(1−c²+ε)` is recovered at
+    /// the collapse limit while moderate collinearity is untaxed. `w'` and `w''`
+    /// carry the chain-rule `dt/dc² = 1/(1−s0)` (and `d²t/dc²² = 0`, `t` affine in
+    /// `c²`) so the returned triple is the exact 0th/1st/2nd derivative of the SAME
+    /// `w` the value uses (no value/gradient/curvature desync across the line
     /// search). Mirrors the decoder-repulsion smoothstep in
     /// [`Self::refresh_decoder_repulsion_gate`].
-    fn separation_barrier_gate(c2: f64) -> (f64, f64) {
+    fn separation_barrier_gate(c2: f64) -> (f64, f64, f64) {
         let s0 = SAE_SEPARATION_BARRIER_COLLINEARITY_GATE;
         if c2 <= s0 {
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0.0);
         }
         let span = 1.0 - s0;
         if !(span > 0.0) {
             // Degenerate gate (s0 ≥ 1): treat as fully engaged with no ramp.
-            return (1.0, 0.0);
+            return (1.0, 0.0, 0.0);
         }
         let t = ((c2 - s0) / span).min(1.0);
         let w = t * t * (3.0 - 2.0 * t);
         // dw/dc² = (6t − 6t²) · dt/dc² = 6t(1−t)/span; flat (0) once t saturates.
-        let dw = if t >= 1.0 {
-            0.0
+        // d²w/dc²² = d/dc²[6t(1−t)/span] = 6(1−2t)·(dt/dc²)/span = 6(1−2t)/span²;
+        // also flat (0) past saturation. `t` is affine in `c²` so no `d²t/dc²²`.
+        let (dw, ddw) = if t >= 1.0 {
+            (0.0, 0.0)
         } else {
-            6.0 * t * (1.0 - t) / span
+            (6.0 * t * (1.0 - t) / span, 6.0 * (1.0 - 2.0 * t) / (span * span))
         };
-        (w, dw)
+        (w, dw, ddw)
     }
 
     /// #1026/#1522/#1625/#1610 SEPARATION barrier value
@@ -813,7 +816,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             let o = self.decoder_gram_cosine_sq(j, k);
-            let (gate, _dgate) = Self::separation_barrier_gate(o);
+            let (gate, _dgate, _ddgate) = Self::separation_barrier_gate(o);
             if gate == 0.0 {
                 continue;
             }
@@ -990,24 +993,43 @@ impl SaeManifoldTerm {
                 continue;
             }
             let o_overlap = (g / (d_j * d_k)).min(1.0);
-            // #1625 — collinearity-gated barrier `P = -μ q w(o) log(1-o+ε)`, LIVE and
-            // differentiated in `o`. Force `α = ∂P/∂o = μ q [ w(o)/(1-o+ε) - w'(o)·log(1-o+ε) ]`
-            // (product rule through the smoothstep); both summands ≥ 0, so `α ≥ 0`.
-            // Below the gate `w=w'=0 ⇒ α=0`, a strict no-op.
-            let (gate, dgate) = Self::separation_barrier_gate(o_overlap);
+            // #1625 — collinearity-gated barrier `P = -μq·w(o)·log(1-o+ε)`, LIVE and
+            // differentiated in `o`. Force `α = ∂P/∂o = μq[ w(o)/arg - w'(o)·log arg ]`
+            // (product rule through the smoothstep), `arg = 1-o+ε`; both summands ≥ 0,
+            // so `α ≥ 0`. Below the gate `w=w'=0 ⇒ α=0`, a strict no-op.
+            let (gate, dgate, ddgate) = Self::separation_barrier_gate(o_overlap);
             if gate == 0.0 {
                 continue;
             }
             let arg = (1.0 - o_overlap + eps).max(eps);
-            let alpha = mu * qjk * (gate / arg - dgate * arg.ln());
+            let ln_arg = arg.ln();
+            let mq = mu * qjk;
+            let alpha = mq * (gate / arg - dgate * ln_arg);
+            // #1795/#2080 self-concordant curvature `d2 = ∂²P/∂o²`. With `L=log arg`,
+            // `L'=-1/arg`, `L''=-1/arg²` and `P=-μq·w·L`:
+            //   ∂²P/∂o² = -μq[ w''L + 2w'L' + wL'' ]
+            //           =  μq[ w/arg² + 2w'/arg - w''·L ].
+            // The `w/arg²` term grows like `1/(1-o)²` (one power faster than the
+            // bounded Levenberg majorizer `2αo/D_· ~ 1/(1-o)`), i.e. the TRUE
+            // interior-point curvature of the barrier along the overlap direction.
+            // It is `> 0` on the gated interior (`w/arg²` and `2w'/arg` dominate the
+            // bounded `-w''·L` residual once the ramp engages, where `arg` is small),
+            // so the exact rank-1 `d2·(∂o/∂B)(∂o/∂B)ᵀ` is PSD and cannot turn any PSD
+            // majorizer non-PD — the ±f32::MAX non-PD pivot failure vanishes at
+            // assembly. The `d2 > 0` guard below preserves that PSD property with no
+            // magic constant even if a degenerate gate/ε ever drove `d2 ≤ 0`.
+            let d2 = mq * (gate / (arg * arg) + 2.0 * dgate / arg - ddgate * ln_arg);
             let inv = 1.0 / (d_j * d_k);
             let off_j = offsets[j];
             let off_k = offsets[k];
             // ∂o/∂B_j = 2[ (M B_k)/(D_j D_k) - (o/D_j²) S_j B_j ], so
             // ∂P/∂B_j = α · ∂o/∂B_j (and symmetrically for B_k). `S_· B_·` is the
-            // rank-aware analog of the historical self-shrink `‖B_·‖²_F·B_·`.
+            // rank-aware analog of the historical self-shrink `‖B_·‖²_F·B_·`. Capture
+            // `∂o/∂B` (global index, value) so the SAME vector drives the gradient and
+            // the exact curvature rank-1 (no gradient/curvature desync).
             let sh_j = o_overlap / (d_j * d_j);
             let sh_k = o_overlap / (d_k * d_k);
+            let mut do_db: Vec<(usize, f64)> = Vec::with_capacity(m_j * p + m_k * p);
             for a in 0..m_j {
                 for o in 0..p {
                     let mut mb = 0.0_f64;
@@ -1018,8 +1040,9 @@ impl SaeManifoldTerm {
                     for a2 in 0..m_j {
                         sjb += s_j[[a, a2]] * bj[[a2, o]];
                     }
-                    let grad = 2.0 * alpha * (mb * inv - sh_j * sjb);
-                    sys.gb[off_j + a * p + o] += grad;
+                    let do_j = 2.0 * (mb * inv - sh_j * sjb);
+                    sys.gb[off_j + a * p + o] += alpha * do_j;
+                    do_db.push((off_j + a * p + o, do_j));
                 }
             }
             for b in 0..m_k {
@@ -1032,21 +1055,25 @@ impl SaeManifoldTerm {
                     for b2 in 0..m_k {
                         skb += s_k[[b, b2]] * bk[[b2, o]];
                     }
-                    let grad = 2.0 * alpha * (mtb * inv - sh_k * skb);
-                    sys.gb[off_k + b * p + o] += grad;
+                    let do_k = 2.0 * (mtb * inv - sh_k * skb);
+                    sys.gb[off_k + b * p + o] += alpha * do_k;
+                    do_db.push((off_k + b * p + o, do_k));
                 }
             }
             wrote = true;
-            // Levenberg PSD majorizer: a positive scalar on each atom's diagonal
-            // block, magnitude `2α o/D_·`, growing as o→1 — exactly the separating
-            // curvature needed at the co-collapse limit. It dominates the self-shrink
-            // gradient term (whose operator scale is `(o/D_·²)·σ_max(S_·) ≤ o/D_·`)
-            // and reduces to the historical `2α c²/‖B_·‖²_F` for rank-1 blocks.
+            // Levenberg PSD majorizer for the ORTHOGONAL indefinite part `α·∂²o/∂B²`
+            // (the overlap-functional curvature): a positive scalar on each atom's
+            // diagonal block, magnitude `2α o/D_·`, growing as o→1. It dominates the
+            // self-shrink gradient term (operator scale `(o/D_·²)·σ_max(S_·) ≤ o/D_·`)
+            // and reduces to the historical `2α c²/‖B_·‖²_F` for rank-1 blocks. The
+            // self-concordant `d2·(∂o/∂B)(∂o/∂B)ᵀ` rank-1 carries the remaining
+            // `∂²P/∂o²` direction EXACTLY, so together they majorize the full barrier
+            // Hessian without ever going non-PD.
             let lev_j = 2.0 * alpha * o_overlap / d_j;
             let lev_k = 2.0 * alpha * o_overlap / d_k;
             if dense_beta_curvature {
-                // Dense path: scatter onto the dense `sys.hbb` diagonal — the
-                // block `effective_penalty_op` reads (`DensePenaltyOp(hbb)`).
+                // Dense path: scatter onto the dense `sys.hbb` — the block
+                // `effective_penalty_op` reads (`DensePenaltyOp(hbb)`).
                 if lev_j > 0.0 {
                     for idx in 0..(m_j * p) {
                         let g_i = off_j + idx;
@@ -1057,6 +1084,19 @@ impl SaeManifoldTerm {
                     for idx in 0..(m_k * p) {
                         let g_i = off_k + idx;
                         sys.hbb[[g_i, g_i]] += lev_k;
+                    }
+                }
+                // Exact self-concordant rank-1 `d2·v vᵀ`, `v = ∂o/∂B` over the stacked
+                // (j,k) decoder block. Written as a single PSD rank-1 (both diagonal
+                // jj/kk AND the true cross jk/kj coupling), symmetric by construction
+                // (the double loop visits (gi,gj) and (gj,gi)). Because `d2 > 0` this
+                // is PSD ⇒ adding it to the PSD Levenberg ridge keeps `sys.hbb` PD.
+                if d2 > 0.0 {
+                    for &(gi, vi) in &do_db {
+                        let dvi = d2 * vi;
+                        for &(gj, vj) in &do_db {
+                            sys.hbb[[gi, gj]] += dvi * vj;
+                        }
                     }
                 }
             } else {
@@ -1072,6 +1112,15 @@ impl SaeManifoldTerm {
                 // source for the CPU composite penalty op AND the device smooth
                 // blocks — so the curvature reaches the operator on every path
                 // (CPU dense-Direct, CPU PCG, device PCG) with no divergence.
+                //
+                // #1038 SECOND INCREMENT (real-OLMo path): the exact self-concordant
+                // rank-1 `d2·(∂o/∂B)(∂o/∂B)ᵀ` carried on the dense path above has no
+                // scalar-per-atom projection here — it couples the (j,k) blocks along
+                // a single `∂o` direction, not an isotropic ridge. It needs a Woodbury
+                // rank-1 carrier attached to the structured `penalty_op` (the #1038
+                // capacitance machinery). Until that lands, this path keeps the bounded
+                // per-atom Levenberg ridge (still PSD, still separating, just not the
+                // tight self-concordant curvature), so it never regresses.
                 if lev_j > 0.0 {
                     atom_curv[j] += lev_j;
                 }
