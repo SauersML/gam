@@ -1,12 +1,17 @@
 # Geometric-Wall Closure Results
 
-Real, non-proxy verdict. Production LLM residual streams are fit with GAM's
-actual block-chart promotion lane (`gamfit.block_sparse_dictionary_fit` +
-`BlockSparseDictionaryFit.compose_block_charts`, gamfit 0.1.250), not the earlier
-numpy-k-means matched-quadratic proxy. Each layer is residualized against the
-nuisance-atlas position-0 atom (pos0 peel), then a FLAT linear block-SAE is
-compared against the CURVED block-chart lane **at exactly matched parameter
-count**, pooled over energy strata.
+Real, non-proxy cross-model check. A production LLM residual stream (Gemma-2-2B)
+is fit with GAM's actual block-chart promotion lane
+(`gamfit.block_sparse_dictionary_fit` + `BlockSparseDictionaryFit.compose_block_charts`,
+gamfit 0.1.250), not the earlier numpy-k-means matched-quadratic proxy. Each
+layer is residualized against the nuisance-atlas position-0 atom (pos0 peel),
+then a FLAT linear block-SAE is compared against the CURVED block-chart lane
+**at exactly matched parameter count**, pooled over energy strata.
+
+> **Primary result lives elsewhere.** The headline overcomplete curved-vs-flat
+> result is on **Qwen 3.6 (Qwen3-30B-A3B MoE)** — see
+> `experiments/real_manifold_sae/results.md`. This file is the Gemma-2-2B
+> cross-model corroboration.
 
 ## Metric semantics (read this first)
 
@@ -15,62 +20,50 @@ fractions** (`||x - x_hat||^2 / ||x||^2`). **Lower floor = better fit**, so
 `explained variance = 1 - floor`, and
 `pooled_drop = pooled_flat_floor - pooled_curved_floor` is **positive only if
 curvature helps**. A negative drop means the linear baseline wins. This matches
-the README's decisive criterion exactly: positive drop confirms wall-closure,
-negative drop refutes it.
+the README's decisive criterion: positive drop confirms wall-closure, negative
+drop refutes it.
 
 ## Verdict
 
-**Curvature does NOT close the wall on reconstruction.** At matched capacity the
-flat linear baseline reconstructs the pos0-peeled residual stream *better* than
-the curved block-chart lane. This is a clean NULL for the
-curvature-helps-reconstruction hypothesis, consistent with Run-1's ceiling
-(curved sat below the linear envelope) and the "Geometric Wall is observational"
-positioning.
+**Curvature does NOT close the wall on reconstruction — corroborated cross-model.**
+At matched capacity the flat linear baseline reconstructs the pos0-peeled Gemma
+residual stream *better* than the curved block-chart lane on **both** layers.
+This is a clean NULL for the curvature-helps-reconstruction hypothesis and
+corroborates the Qwen 3.6 primary negative, consistent with the
+"Geometric Wall is observational" positioning.
 
 | model / layer | pos0 absorbed | fitted strata | rows | flat params | curved params | flat floor | curved floor | drop (flat−curved) | flat EV | curved EV | verdict |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| Qwen3-8B L18 | 0.9276 | 2/15 | 29728 | 393216 | 393216 | 0.741080 | 0.788604 | **−0.047524** | 0.258920 | 0.211396 | flat wins; curvature loses |
-| Gemma-2-2B L12 | _pending job 12709803_ | | | 221184 | 221184 | | | | | | |
-| Gemma-2-2B L25 | _pending job 12709803_ | | | 221184 | 221184 | | | | | | |
+| Gemma-2-2B L12 | 0.008949 | 2/5 | 29519 | 221184 | 221184 | 0.628195 | 0.664426 | **−0.036231** | 0.371805 | 0.335574 | flat wins; curvature loses |
+| Gemma-2-2B L25 | 0.012585 | 4/7 | 29803 | 221184 | 221184 | 0.398981 | 0.430500 | **−0.031519** | 0.601019 | 0.569500 | flat wins; curvature loses |
 
 Matched params per layer: 24 flat blocks × block_size 4 == 12 curved blocks ×
-(4 + 4 chart basis) = 96 units × model dimension `d` (Qwen `d`=4096 →
-96·4096=393216; Gemma `d`=2304 → 96·2304=221184).
-
-### Qwen3-8B L18 detail (per stratum)
-
-| stratum | rows | flat floor | curved floor | drop | flat EV | curved base EV | accepted charts |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 28701 | 0.75467 | 0.79918 | −0.04451 | 0.2435 | 0.2077 | 12 |
-| 1 | 1027 | 0.55666 | 0.64509 | −0.08844 | 0.3909 | 0.3154 | 12 |
-
-The curved lane's accepted chart corrections are real (12 accepted per stratum),
-but even with them the fewer-blocks-plus-charts allocation loses to
-more-flat-blocks at matched capacity in every stratum. Charts slightly *helped*
-the curved base in the small high-energy stratum (+0.04 EV) and slightly *hurt*
-in the large low-energy stratum (−0.007 EV); neither closes the gap to flat.
+(4 + 4 chart basis) = 96 units × model dimension `d`=2304 → 96·2304 = 221184.
+Gemma's position-0 sink is weak (absorbs ~1% of centered energy, unlike the
+Qwen sink), so the peel barely changes the target; curvature still loses.
 
 ## Provenance
 
-- models: `Qwen/Qwen3-8B` L18 and `google/gemma-2-2b` L12/L25, residuals taken
-  at `hidden_states[layer+1]`. Gemma was harvested from an architecturally
-  identical ungated mirror (no HF token for the gated repo on MSI); see
-  `harvest_out/gemma2_2b_wikitext/manifest.json`.
+- model: `google/gemma-2-2b` L12 / L25, residuals at `hidden_states[layer+1]`,
+  harvested from an architecturally identical ungated mirror (no HF token for
+  the gated repo on MSI); see `harvest_out/gemma2_2b_wikitext/manifest.json`.
 - corpus: Salesforce/wikitext wikitext-103-raw-v1, `add_special_tokens=False`,
-  within-document positions restart at 0 per document.
-- tokens per layer: 30000; pos0 nuisance peel via OLS design
-  `[intercept, position0_indicator]` (Qwen L18 pos0 absorbed 92.76% of centered
-  energy). Only strata meeting `min_stratum_rows=512` are fitted (Qwen: 2 of 15).
+  within-document positions restart at 0 per document; 30000 tokens per layer.
+- pos0 nuisance peel via OLS design `[intercept, position0_indicator]`; only
+  strata meeting `min_stratum_rows=512` are fitted (L12: 2 of 5, L25: 4 of 7).
 - engine: `gamfit.block_sparse_dictionary_fit` +
   `BlockSparseDictionaryFit.compose_block_charts`, gamfit 0.1.250.
 - run harness: MSI msismall, 32 cores, `wallclosure_venv` (CPU-only, no torch;
-  harvested activations consumed from cache).
-- raw numbers: `qwen_numbers.json` (and `gemma_numbers.json` once it lands).
+  harvested activations consumed from cache — the driver's cache-hit path
+  short-circuits before any torch import).
+- raw numbers: `gemma_numbers.json`.
 
-## This supersedes the Run-2 matched-quadratic proxy
+## Model-scope note and superseded proxy
 
-The earlier Run-2 result was a **numpy k-means matched-quadratic proxy, not the
-real fitter** — tangent-PCA plus quadratic features, not GAM's
-`compose_block_charts` lane. With the real block-chart compose lane at matched
-capacity, the sign does not go curvature's way: curvature does **not** win on
-reconstruction. The proxy is superseded for decision purposes.
+An earlier Qwen-3-8B arm was run and then **removed per a model-scope decision
+(8B is out; the primary is Qwen 3.6 / A3B)**; its activation data was deleted, so
+no 8B result is retained here. Separately, the Run-2 result was a **numpy k-means
+matched-quadratic proxy, not the real fitter** (tangent-PCA plus quadratic
+features, not `compose_block_charts`). With the real block-chart compose lane at
+matched capacity, curvature does **not** win on reconstruction — the proxy is
+superseded for decision purposes.
