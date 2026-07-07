@@ -195,6 +195,19 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
     let period = end - start;
     let knots = cyclic_uniform_knot_vector(start, end, degree, num_basis);
 
+    // Anchor the cardinal-basis phase to the SAME canonical grid the knot vector
+    // uses (#1593). `cyclic_uniform_knot_vector` snaps the knots to the absolute
+    // grid `{ m·h }` via `cyclic_knot_anchor`, so `start` is NOT where the knots
+    // sit — the anchor is. The periodic evaluator centers its cardinal functions
+    // at `origin + m·h`, so passing the raw `start` (not a knot for a sub-knot
+    // seam) phase-shifted the evaluated basis by `start − anchor` relative to the
+    // knot grid it is supposed to realize — an internal inconsistency that made
+    // the fitted function space rotate by a sub-knot amount with `period_start`
+    // (#1593 seam-gauge dependence). Feeding the canonical `anchor` as the origin
+    // pins the cardinals to the absolute grid, so two seam anchors describe the
+    // identical (up to a whole-column cyclic relabel) periodic function space.
+    let (anchor, _h) = cyclic_knot_anchor(start, period, num_basis);
+
     // Evaluate the cyclic cardinal basis directly on the circle rather than
     // folding an open B-spline design and summing columns modulo `num_basis`.
     // The open-knot construction is sensitive to its half-open endpoint
@@ -210,7 +223,7 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
             degree,
             num_basis,
             period,
-            origin: start,
+            origin: anchor,
             // The value evaluator does not use the penalty order; pass the
             // standard cyclic smooth order so spec validation remains shared.
             penalty_order: 2.min(num_basis - 1),
