@@ -669,7 +669,8 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         TermCollectionSpec,
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
         FittedLinkState,
-        Option<(Vec<f64>, usize)>,
+        // (knots, degree, frozen-index shift #2141)
+        Option<(Vec<f64>, usize, Option<Vec<f64>>)>,
     ) = if fit_config.firth && !firth_redundant_for_bounded {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -923,7 +924,9 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             fitted.adaptive_diagnostics,
             fitted.saved_link_state,
             match (fitted.wiggle_knots, fitted.wiggle_degree) {
-                (Some(knots), Some(degree)) => Some((knots.to_vec(), degree)),
+                (Some(knots), Some(degree)) => {
+                    Some((knots.to_vec(), degree, fitted.wiggle_saved_index_shift))
+                }
                 _ => None,
             },
         )
@@ -935,7 +938,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     let mut saved_fit = fit.clone();
     saved_fit.fitted_link = standard_saved_link_state.clone();
     let saved_termspec = frozenspec.clone();
-    if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta.as_ref() {
+    if let Some((wiggle_knots, wiggle_degree, _)) = standard_wiggle_meta.as_ref() {
         let beta_eta = fit
             .block_by_role(BlockRole::Mean)
             .ok_or_else(|| "standard wiggle fit is missing eta block".to_string())?
@@ -985,9 +988,13 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
         payload.link = inverse_link_from_fitted_link_state(&saved_fit.fitted_link);
-        if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta {
+        if let Some((wiggle_knots, wiggle_degree, index_shift)) = standard_wiggle_meta {
             payload.linkwiggle_knots = Some(wiggle_knots);
             payload.linkwiggle_degree = Some(wiggle_degree);
+            // #2141: persist the frozen-index shift so CLI-saved standard
+            // link-warp models reconstruct the fitted `q` at predict time,
+            // matching the FFI save path (`build_standard_payload`).
+            payload.link_wiggle_index_shift = index_shift;
         }
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {

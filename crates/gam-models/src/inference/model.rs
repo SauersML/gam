@@ -314,6 +314,15 @@ pub struct FittedModelPayload {
     pub linkwiggle_degree: Option<usize>,
     #[serde(default)]
     pub beta_link_wiggle: Option<Vec<f64>>,
+    /// Frozen-index mean-coordinate shift `s` for the standard binomial-mean
+    /// link-warp predict runtime (#2141). Predict evaluates the warp basis at
+    /// the frozen index `η̂ = X·(β_saved + s)` the fit pinned `B` at, rather than
+    /// at the de-aliased base predictor `X·β_saved` — reproducing the fitted `q`
+    /// (and thus the fitted deviance) at predict time. `None` for models whose
+    /// warp path never de-aliased (location-scale / dynamic-basis), where the
+    /// base predictor already is the warp index (back-compatible serde default).
+    #[serde(default)]
+    pub link_wiggle_index_shift: Option<Vec<f64>>,
     #[serde(default)]
     pub baseline_timewiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
@@ -697,6 +706,7 @@ impl FittedModelPayload {
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             beta_link_wiggle: None,
+            link_wiggle_index_shift: None,
             baseline_timewiggle_knots: None,
             baseline_timewiggle_degree: None,
             baseline_timewiggle_penalty_orders: None,
@@ -925,6 +935,13 @@ pub struct SavedLinkWiggleRuntime {
     pub knots: Vec<f64>,
     pub degree: usize,
     pub beta: Vec<f64>,
+    /// Frozen-index mean-coordinate shift `s` (#2141). When present the predict
+    /// layer evaluates the warp basis at the frozen index
+    /// `η̂ = base + X·s` rather than at the de-aliased base predictor `base`, so
+    /// predict reproduces the exact `q` (and deviance) the fit computed. `None`
+    /// for warp paths that never de-aliased (location-scale / dynamic-basis),
+    /// where the base predictor already is the warp index.
+    pub index_shift: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1393,10 +1410,36 @@ impl SavedLinkWiggleRuntime {
     }
 
     pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
-        self.validate_monotone_derivative(q0)?;
-        let xwiggle = self.constrained_basis(q0, BasisOptions::value())?;
+        self.apply_with_index(q0, q0)
+    }
+
+    /// Apply the warp with the additive base predictor `base` and the warp basis
+    /// evaluated at a possibly distinct index `warp_index` (#2141):
+    /// `q = base + B(warp_index)·β`. The frozen-basis de-aliased binomial-mean
+    /// link fit pins `B` at the frozen index `η̂`, which differs from the
+    /// de-aliased base predictor `base` by `X·s`; evaluating `B` at `warp_index`
+    /// (= `base + X·s`) reproduces the exact `q` the fit scored. Monotonicity is
+    /// certified at `warp_index`, where the link's `dq/dη = 1 + B'(warp_index)·β`
+    /// is defined. When no shift is active `warp_index == base` and this reduces
+    /// to the original `q = q0 + B(q0)·β`.
+    pub fn apply_with_index(
+        &self,
+        base: &Array1<f64>,
+        warp_index: &Array1<f64>,
+    ) -> Result<Array1<f64>, FittedModelError> {
+        if base.len() != warp_index.len() {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "link-wiggle base predictor has {} rows but warp index has {}",
+                    base.len(),
+                    warp_index.len()
+                ),
+            });
+        }
+        self.validate_monotone_derivative(warp_index)?;
+        let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(q0 + &xwiggle.dot(&beta_link_wiggle))
+        Ok(base + &xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -2934,10 +2977,16 @@ impl FittedModel {
                             .to_string(),
                 })?,
         };
+        // #2141: the frozen-index shift lets predict evaluate the warp basis at
+        // the index `η̂` the fit pinned `B` at (`base + X·s`). `None` for
+        // pre-#2141 saves and for non-de-aliased warp paths, where the base
+        // predictor already is the warp index.
+        let index_shift = payload.link_wiggle_index_shift.clone();
         Ok(Some(SavedLinkWiggleRuntime {
             knots,
             degree,
             beta,
+            index_shift,
         }))
     }
 
@@ -4426,6 +4475,9 @@ impl FittedModel {
         }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
             validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
+        }
+        if let Some(v) = self.link_wiggle_index_shift.as_ref() {
+            validate_all_finite("link_wiggle_index_shift", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_baseline_timewiggle.as_ref() {
             validate_all_finite("beta_baseline_timewiggle", v.iter().copied()).map_err(corrupt)?;

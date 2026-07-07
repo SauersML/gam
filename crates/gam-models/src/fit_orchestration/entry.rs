@@ -345,6 +345,7 @@ fn constant_gaussian_standard_fit(
         wiggle_knots: None,
         wiggle_degree: None,
         wiggle_saved_warp_beta: None,
+        wiggle_saved_index_shift: None,
     })
 }
 
