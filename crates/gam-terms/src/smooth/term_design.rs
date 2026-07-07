@@ -1843,6 +1843,7 @@ fn with_identifiability_transform(
             raw_penalty_normalization_scales,
             fused_penalty_normalization_scale,
             constraint_transform,
+            sigma_coord,
         } => Ok(BasisMetadata::MeasureJet {
             centers: centers.clone(),
             input_scales: input_scales.clone(),
@@ -1860,6 +1861,7 @@ fn with_identifiability_transform(
                 constraint_transform.as_ref(),
                 transform,
             )?,
+            sigma_coord: *sigma_coord,
         }),
         BasisMetadata::Matern {
             centers,

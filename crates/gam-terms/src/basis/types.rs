@@ -1270,6 +1270,11 @@ pub enum BasisMetadata {
         raw_penalty_normalization_scales: Vec<f64>,
         fused_penalty_normalization_scale: Option<f64>,
         constraint_transform: Option<Array2<f64>>,
+        /// Ambient input-measurement-error scale `σ_coord` (issue #2225): the
+        /// perpendicular off-manifold residual spread of the fit rows, in the
+        /// centers' (standardized) frame. `None` when it could not be estimated.
+        /// Carried into `MeasureJetFrozenQuadrature::sigma_coord` at freeze time.
+        sigma_coord: Option<f64>,
     },
     Matern {
         centers: Array2<f64>,

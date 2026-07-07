@@ -33,7 +33,9 @@
 //!    on-web points.
 
 use csv::StringRecord;
-use gam::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
+use gam::basis::{
+    CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability, PenaltySource,
+};
 use gam::matrix::LinearOperator;
 use gam::smooth::{SmoothBasisSpec, build_term_collection_design};
 use gam::{
@@ -643,5 +645,146 @@ fn measure_jet_web_quality_contracts() {
         "measure-jet 95% interval coverage {coverage:.4} outside the honest window [0.85, 1.0] \
          ({hits}/{} held-out on-web points)",
         coverage_test.len()
+    );
+}
+
+/// Contract 6 (#2225) — errors-in-variables input-measurement-error term. The
+/// measure-jet paradigm samples an intrinsic function with ambient coordinate
+/// noise `σ_coord` (the `COORD_NOISE_SIGMA` of this fixture), so the honest
+/// predictive variance of a query carries a THIRD additive term beyond the
+/// posterior-mean and finite-support terms:
+///   `Var_input(x★) = σ_coord² · ‖∇f̂(x★)‖²`  (delta-method input-noise propagation).
+///
+/// Two things must hold for that term to be honest — this end-to-end gate pins
+/// both against a REAL gaussian fit:
+///  1. `σ_coord` is ESTIMATED at fit (perpendicular off-manifold residual scale)
+///     and frozen — no hand-set constant, no dial.
+///  2. The `∇f̂` the term consumes IS the fitted surface's true ambient slope:
+///     the analytic `measure_jet_ambient_gradient` (representers + reconstructed
+///     affine head, coefficients lifted through the frozen identifiability
+///     transform) matches a central finite difference of the fit's own linear
+///     predictor `η = X·β` in every ambient axis. Fails-before: without the EIV
+///     machinery there is no `∇f̂` and `Var_input ≡ 0`.
+#[test]
+fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
+    init_parallelism();
+    let train_points = sample_web(400, 41, true);
+    let data = encode_training(&train_points, 42);
+    let fit = fit_web(MJS_INTERVAL_FORMULA, &data, "gaussian");
+
+    // Held-out on-web query draws.
+    let test: Vec<WebPoint> = sample_web(12, 71, true);
+    let raw = ambient_matrix(&data, &test);
+
+    // The single measure-jet term and its frozen geometry.
+    let term = fit
+        .resolvedspec
+        .smooth_terms
+        .iter()
+        .find(|t| matches!(t.basis, SmoothBasisSpec::MeasureJet { .. }))
+        .expect("measure-jet term present");
+    let SmoothBasisSpec::MeasureJet {
+        feature_cols,
+        spec,
+        input_scales,
+    } = &term.basis
+    else {
+        unreachable!("filtered to MeasureJet above")
+    };
+    let frozen = spec
+        .frozen_quadrature
+        .as_ref()
+        .expect("frozen quadrature after fit");
+    let CenterStrategy::UserProvided(centers) = &spec.center_strategy else {
+        panic!("frozen measure-jet centers")
+    };
+    // (1) σ_coord was estimated + frozen, magic-free, and is positive on a
+    // fixture with genuine COORD_NOISE_SIGMA ambient noise.
+    let sigma_coord = frozen
+        .sigma_coord
+        .expect("σ_coord estimated + frozen at fit (#2225)");
+    assert!(
+        sigma_coord.is_finite() && sigma_coord > 0.0,
+        "σ_coord must be a positive finite estimate, got {sigma_coord}"
+    );
+    let MeasureJetIdentifiability::FrozenTransform { transform } = &spec.identifiability else {
+        panic!("frozen identifiability transform")
+    };
+
+    // Lift the term's fitted reduced coefficients to raw representer+head space.
+    let full_cols = fit.design.design.ncols();
+    assert_eq!(fit.fit.beta.len(), full_cols, "β length vs design columns");
+    let smooth_start = full_cols - fit.design.smooth.total_smooth_cols();
+    let term_cols = transform.ncols();
+    let beta_term = fit
+        .fit
+        .beta
+        .slice(ndarray::s![smooth_start..smooth_start + term_cols])
+        .to_owned();
+    let z_full = transform.dot(&beta_term);
+    let m = centers.nrows();
+    let head_rank = transform.nrows() - m;
+    let rep = z_full.slice(ndarray::s![..m]).to_owned();
+    let head_coeffs = z_full.slice(ndarray::s![m..]).to_owned();
+    let head_t = (head_rank > 0)
+        .then(|| gam::basis::measure_jet_affine_head_transform(centers.view(), frozen.masses.view()));
+
+    // Central-FD of the fit's own η along a single RAW ambient axis, via the
+    // frozen design replay (the same path `predict_with_fit` uses).
+    let eta_at = |perturb: Option<(usize, usize, f64)>| -> f64 {
+        let (qi, _, _) = perturb.unwrap_or((0, 0, 0.0));
+        let mut mrow = Array2::<f64>::zeros((1, data.headers.len()));
+        mrow.row_mut(0).assign(&raw.row(qi));
+        if let Some((_, col, dh)) = perturb {
+            mrow[[0, col]] += dh;
+        }
+        let d = build_term_collection_design(mrow.view(), &fit.resolvedspec)
+            .expect("frozen design replay");
+        d.design.apply(&fit.fit.beta)[0]
+    };
+
+    let h = 1e-5;
+    let mut max_input_var = 0.0_f64;
+    for qi in 0..test.len() {
+        // Standardized query for the term axes (frozen input scales).
+        let mut q_std = Array1::<f64>::zeros(feature_cols.len());
+        for (a, &col) in feature_cols.iter().enumerate() {
+            let scale = input_scales.as_ref().map_or(1.0, |s| s[a]);
+            q_std[a] = raw[[qi, col]] / scale;
+        }
+        let grad = gam::basis::measure_jet_ambient_gradient(
+            q_std.view(),
+            centers.view(),
+            rep.view(),
+            spec.length_scale,
+            head_t.as_ref().map(|t| t.view()),
+            head_coeffs.view(),
+        )
+        .expect("analytic ambient gradient");
+
+        for (a, &col) in feature_cols.iter().enumerate() {
+            let scale = input_scales.as_ref().map_or(1.0, |s| s[a]);
+            let eta_p = eta_at(Some((qi, col, h)));
+            let eta_m = eta_at(Some((qi, col, -h)));
+            // ∂η/∂x_std = scale · ∂η/∂x_raw (the design standardizes the axis).
+            let fd_std = (eta_p - eta_m) / (2.0 * h) * scale;
+            assert!(
+                (grad[a] - fd_std).abs() <= 1e-4 * (1.0 + fd_std.abs()),
+                "axis {a} query {qi}: analytic ∇f̂ {} vs FD-of-fit {fd_std}",
+                grad[a]
+            );
+        }
+
+        let norm_sq: f64 = grad.iter().map(|g| g * g).sum();
+        assert!(norm_sq.is_finite(), "gradient norm must be finite");
+        max_input_var = max_input_var.max(sigma_coord * sigma_coord * norm_sq);
+    }
+
+    // (2) The term is non-vacuous: at least one on-web query has genuine slope,
+    // so `Var_input = σ_coord²·‖∇f̂‖²` prices a strictly positive input-noise
+    // variance — the capability that was missing before #2225.
+    assert!(
+        max_input_var > 0.0,
+        "EIV input-measurement-error term priced zero variance everywhere on-web"
     );
 }

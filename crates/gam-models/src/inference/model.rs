@@ -3406,7 +3406,10 @@ impl FittedModel {
         data: ndarray::ArrayView2<'_, f64>,
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
-        use gam_terms::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
+        use gam_terms::basis::{
+            CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
+            PenaltySource,
+        };
         use gam_terms::smooth::build_term_collection_design;
         use gam_terms::smooth::SmoothBasisSpec;
         let Some(saved_spec) = self.resolved_termspec.as_ref() else {
@@ -3459,7 +3462,7 @@ impl FittedModel {
         let phi_scale = fit.coefficient_covariance_scale();
         let mut total = Array1::<f64>::zeros(data.nrows());
         let mut contributed = false;
-        for term in &spec.smooth_terms {
+        for (smooth_idx, term) in spec.smooth_terms.iter().enumerate() {
             let SmoothBasisSpec::MeasureJet {
                 feature_cols,
                 spec: mj,
@@ -3640,6 +3643,130 @@ impl FittedModel {
                 total[i] += phi_scale * v;
             }
             contributed = true;
+            // #2225 errors-in-variables input-measurement-error term. When the
+            // fit froze an ambient input-noise scale σ_coord, price the
+            // delta-method propagation of that input noise through the fitted
+            // surface: `Var_input(x★) = σ_coord²·‖∇f̂(x★)‖²`, evaluated with the
+            // analytic ambient gradient ∇f̂ (representers + head). This prices the
+            // TANGENTIAL movement of a noisy query along the manifold — where the
+            // intrinsic response genuinely changes — complementary to the
+            // PERPENDICULAR off-web ignorance the extrapolation term prices. It is
+            // a pure propagation of the point estimate, so — unlike the
+            // λ̂⁻¹-scaled extrapolation term — it carries NO φ̂ factor. Everything
+            // is in the frozen centers' (standardized) frame: `queries`, centers,
+            // `mj.length_scale`, and σ_coord are all standardized consistently.
+            if let Some(sigma_coord) = frozen.sigma_coord {
+                'input_var: {
+                    let MeasureJetIdentifiability::FrozenTransform { transform } =
+                        &mj.identifiability
+                    else {
+                        log::warn!(
+                            "measure-jet term '{}': identifiability is not a frozen transform; \
+                             skipping its input-measurement-error variance",
+                            term.name
+                        );
+                        break 'input_var;
+                    };
+                    let full_cols = design.design.ncols();
+                    if fit.beta.len() != full_cols {
+                        log::warn!(
+                            "measure-jet term '{}': joint coefficient vector length {} disagrees \
+                             with the replayed design's {} columns; skipping its \
+                             input-measurement-error variance",
+                            term.name,
+                            fit.beta.len(),
+                            full_cols
+                        );
+                        break 'input_var;
+                    }
+                    if design.smooth.term_designs.len() != spec.smooth_terms.len() {
+                        log::warn!(
+                            "measure-jet term '{}': smooth design/term count mismatch ({} vs {}); \
+                             skipping its input-measurement-error variance",
+                            term.name,
+                            design.smooth.term_designs.len(),
+                            spec.smooth_terms.len()
+                        );
+                        break 'input_var;
+                    }
+                    let m = centers.nrows();
+                    let m_aug = transform.nrows();
+                    let reduced = transform.ncols();
+                    let term_cols = design.smooth.term_designs[smooth_idx].ncols();
+                    if term_cols != reduced {
+                        log::warn!(
+                            "measure-jet term '{}': replayed reduced width {term_cols} disagrees \
+                             with the frozen transform ({m_aug}×{reduced}); skipping its \
+                             input-measurement-error variance",
+                            term.name
+                        );
+                        break 'input_var;
+                    }
+                    // Reduced-coefficient block of this term inside the joint β̂.
+                    let smooth_start = full_cols - design.smooth.total_smooth_cols();
+                    let offset_in_smooth: usize = design.smooth.term_designs[..smooth_idx]
+                        .iter()
+                        .map(|d| d.ncols())
+                        .sum();
+                    let g0 = smooth_start + offset_in_smooth;
+                    let beta_term = fit.beta.slice(ndarray::s![g0..g0 + term_cols]).to_owned();
+                    // Lift to raw representer+head coefficients z_full = Z·β̂_term.
+                    let z_full = transform.dot(&beta_term);
+                    let head_rank = m_aug - m;
+                    let rep = z_full.slice(ndarray::s![..m]).to_owned();
+                    let head_coeffs = z_full.slice(ndarray::s![m..]).to_owned();
+                    let head_t = if head_rank > 0 {
+                        Some(gam_terms::basis::measure_jet_affine_head_transform(
+                            centers.view(),
+                            frozen.masses.view(),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(t) = head_t.as_ref() {
+                        if t.ncols() != head_rank {
+                            log::warn!(
+                                "measure-jet term '{}': reconstructed head lift rank {} disagrees \
+                                 with the frozen head block {head_rank}; skipping its \
+                                 input-measurement-error variance",
+                                term.name,
+                                t.ncols()
+                            );
+                            break 'input_var;
+                        }
+                    }
+                    let sigma2 = sigma_coord * sigma_coord;
+                    let mut input_var = Array1::<f64>::zeros(data.nrows());
+                    let mut ok = true;
+                    for i in 0..data.nrows() {
+                        match gam_terms::basis::measure_jet_ambient_gradient(
+                            queries.row(i),
+                            centers.view(),
+                            rep.view(),
+                            mj.length_scale,
+                            head_t.as_ref().map(|t| t.view()),
+                            head_coeffs.view(),
+                        ) {
+                            Ok(grad) => {
+                                let norm_sq: f64 = grad.iter().map(|g| g * g).sum();
+                                input_var[i] = sigma2 * norm_sq;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "measure-jet term '{}': ambient gradient failed ({e}); \
+                                     skipping its input-measurement-error variance",
+                                    term.name
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        total += &input_var;
+                    }
+                }
+            }
         }
         Ok(contributed.then_some(total))
     }

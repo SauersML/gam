@@ -111,6 +111,129 @@ fn max_abs_err(yhat: &[f64], y: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+fn mgcv_duchon_diag(data: &gam::data::EncodedDataset, k: usize) -> (f64, f64) {
+    // Returns (sum_edf, sp) for mgcv bs="ds", m=c(2,0), REML on the training data.
+    let x_col = data.column_map()["x"];
+    let y_col = data.column_map()["y"];
+    let x_all = data.values.column(x_col).to_vec();
+    let y_all = data.values.column(y_col).to_vec();
+    let r = run_r(
+        &[Column::new("x", &x_all), Column::new("y", &y_all)],
+        &format!(
+            r#"
+            suppressPackageStartupMessages(library(mgcv))
+            m <- gam(y ~ s(x, bs = "ds", k = {k}, m = c(2, 0)), data = df, method = "REML")
+            emit("edf", as.numeric(sum(m$edf)))
+            emit("sp",  as.numeric(m$sp))
+            "#
+        ),
+    );
+    (r.vector("edf")[0], r.vector("sp")[0])
+}
+
+#[test]
+fn zz_measure_lambda_gap() {
+    use gam::smooth::build_term_collection_design;
+    use gam::solver::gaussian_reml::gaussian_reml_closed_form;
+    use ndarray::Array1;
+
+    init_parallelism();
+    let data = make_sin_dataset(8.0, 0.10, 240, 11);
+    let x_test: Vec<f64> = (0..400).map(|i| 0.001 + 0.998 * i as f64 / 399.0).collect();
+    let y_truth: Vec<f64> = x_test
+        .iter()
+        .map(|t| (2.0 * std::f64::consts::PI * 8.0 * t).sin())
+        .collect();
+
+    for (label, body, k) in [
+        ("duchon-default", "duchon(x)", 40usize),
+        ("duchon-centers50", "duchon(x, centers=50)", 50),
+    ] {
+        // ---- production gam fit ----
+        let cfg = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        let result = fit_from_formula(&format!("y ~ {body}"), &data, &cfg).expect("fit");
+        let FitResult::Standard(fit) = result else {
+            panic!("standard")
+        };
+        let prod_lambdas = fit.fit.lambdas.to_vec();
+        let prod_loglam = fit.fit.log_lambdas.to_vec();
+        let prod_edf = fit.fit.inference.as_ref().map(|i| i.edf_total);
+
+        // predictions on truth grid
+        let n_t = x_test.len();
+        let mut mt = Array2::<f64>::zeros((n_t, data.headers.len()));
+        let x_col = data.column_map()["x"];
+        for (i, &t) in x_test.iter().enumerate() {
+            mt[[i, x_col]] = t;
+        }
+        let test_design = build_term_collection_design(mt.view(), &fit.resolvedspec)
+            .expect("test design");
+        let prod_pred = test_design.design.apply(&fit.fit.beta).to_vec();
+        let prod_max = max_abs_err(&prod_pred, &y_truth);
+        let prod_amp = prod_pred.iter().cloned().fold(f64::MIN, f64::max)
+            - prod_pred.iter().cloned().fold(f64::MAX, f64::min);
+
+        // ---- reconstruct train design X + penalty S from frozen spec ----
+        let n_tr = data.values.nrows();
+        let mut mtr = Array2::<f64>::zeros((n_tr, data.headers.len()));
+        for i in 0..n_tr {
+            mtr[[i, x_col]] = data.values[[i, x_col]];
+        }
+        let train_design = build_term_collection_design(mtr.view(), &fit.resolvedspec)
+            .expect("train design");
+        let x_dense = train_design.design.to_dense();
+        let p = x_dense.ncols();
+        let mut s = Array2::<f64>::zeros((p, p));
+        for bp in &train_design.penalties {
+            let r = bp.col_range.clone();
+            for (li, gi) in r.clone().enumerate() {
+                for (lj, gj) in r.clone().enumerate() {
+                    s[[gi, gj]] += bp.local[[li, lj]];
+                }
+            }
+        }
+        let nulldim: usize = train_design.nullspace_dims.iter().sum();
+        let y_tr = data.values.column(data.column_map()["y"]).to_owned();
+
+        // gam's OWN global-grid REML optimum on this basis (single summed penalty)
+        let cf = gaussian_reml_closed_form(
+            x_dense.view(),
+            y_tr.view(),
+            s.view(),
+            None,
+            None,
+        )
+        .expect("closed form");
+        // predict closed-form coefficients on truth grid
+        let xt = test_design.design.to_dense();
+        let cf_beta = Array1::from(cf.coefficients.to_vec());
+        let cf_pred = xt.dot(&cf_beta).to_vec();
+        let cf_max = max_abs_err(&cf_pred, &y_truth);
+        let cf_amp = cf_pred.iter().cloned().fold(f64::MIN, f64::max)
+            - cf_pred.iter().cloned().fold(f64::MAX, f64::min);
+
+        // ---- mgcv ----
+        let (mgcv_edf, mgcv_sp) = mgcv_duchon_diag(&data, k);
+        let mgcv_pred = mgcv_duchon_predict(&data, &x_test, k);
+        let mgcv_max = max_abs_err(&mgcv_pred, &y_truth);
+        let mgcv_amp = mgcv_pred.iter().cloned().fold(f64::MIN, f64::max)
+            - mgcv_pred.iter().cloned().fold(f64::MAX, f64::min);
+
+        eprintln!("\n===== [{label}] p={p} nulldim={nulldim} n_penalties={} =====",
+            train_design.penalties.len());
+        eprintln!("  PROD  gam: log_lambda={prod_loglam:?} lambda={prod_lambdas:?} edf={prod_edf:?}");
+        eprintln!("        max_err={prod_max:.4} amp(pp)={prod_amp:.4}");
+        eprintln!("  CF    gam closed-form global-REML: rho={:.4} lambda={:.4e} edf={:.3} score={:.4}",
+            cf.rho, cf.lambda, cf.edf, cf.reml_score);
+        eprintln!("        max_err={cf_max:.4} amp(pp)={cf_amp:.4}");
+        eprintln!("  MGCV  ds k={k}: sp={mgcv_sp:.4e} edf={mgcv_edf:.3}");
+        eprintln!("        max_err={mgcv_max:.4} amp(pp)={mgcv_amp:.4}");
+    }
+}
+
 #[test]
 fn duchon_sin8_max_error_within_budget() {
     init_parallelism();
