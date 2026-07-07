@@ -103,7 +103,7 @@ pub fn run_sbc<M: SbcModel>(
             let truth = model.draw_prior(&mut rng);
             let posterior =
                 model.simulate_and_posterior_draws(truth, posterior_draws_per_rep, &mut rng);
-            debug_assert_eq!(posterior.len(), posterior_draws_per_rep);
+            assert_eq!(posterior.len(), posterior_draws_per_rep);
             sbc_rank(truth, &posterior)
         })
         .collect()
