@@ -1519,6 +1519,82 @@ fn gaussian_reml_fit_formula_table_impl(
         validate_dense_fisher_w(n, d, *w)?;
     }
 
+    // Fit in the response's own principal-axis frame so the shared-λ tangent fit
+    // is EXACTLY output-rotation equivariant (issue #967), not just equivariant
+    // to the REML optimizer's flat-valley convergence slop.
+    //
+    // At a FIXED smoothing parameter the joint system's hat operator is
+    // `H_X(λ) ⊗ I_D`, which commutes with any output rotation `I_n ⊗ R`, so the
+    // coefficients are already exactly equivariant. The one non-equivariant step
+    // is REML λ-selection: the two frame-related responses `Y` and `Y Rᵀ` feed
+    // the multi-start optimizer arrays that differ at the float epsilon, so it
+    // can settle at different points on the (near-flat) LAML valley — a ≈1e-5
+    // wander in λ that shows up as ≈1e-6 in the coefficients even though the
+    // objective `tr(Yᵀ M(λ) Y)` is analytically rotation-invariant.
+    //
+    // Remove the frame dependence at the source: rotate `Y` (and any Fisher–Rao
+    // metric) into the eigenbasis `V` of the pooled output Gram
+    // `G = Σ_row w_row · y_row y_rowᵀ`, run the identical fit there, then rotate
+    // the coefficients back by `Vᵀ`. Under `Y ↦ Y Rᵀ` the Gram maps
+    // `G ↦ R G Rᵀ`, so its eigenbasis maps `V ↦ R V` (the per-vector sign is
+    // pinned frame-covariantly below), hence the canonical response `Y V` is
+    // frame-invariant to the float floor and every downstream quantity — the
+    // multi-start seeds, the λ optimum, the coefficients — is identical for the
+    // two frames. `V` is orthogonal, so this is an EXACT reparameterization: it
+    // does not change the fit for any single frame, it only makes the numerics
+    // frame-stable (`B(Y·Rᵀ) = B(Y)·Rᵀ` to ~1e-12).
+    let mut gram = Array2::<f64>::zeros((d, d));
+    let mut mean_dir = Array1::<f64>::zeros(d);
+    for row in 0..n {
+        let w = weights[row];
+        for a in 0..d {
+            mean_dir[a] += w * y[[row, a]];
+            for b in 0..d {
+                gram[[a, b]] += w * y[[row, a]] * y[[row, b]];
+            }
+        }
+    }
+    // Eigenvectors of the symmetric PSD Gram via its SVD: for a symmetric PSD
+    // matrix the left singular vectors ARE the eigenvectors, already ordered by
+    // descending eigenvalue.
+    let (u_opt, _svals, _vt) = gram
+        .svd(true, false)
+        .map_err(|err| format!("shared-tangent output-frame SVD failed: {err}"))?;
+    let mut v_rot = u_opt.ok_or_else(|| {
+        "shared-tangent output-frame SVD returned no left singular vectors".to_string()
+    })?;
+    // Pin each eigenvector's sign frame-COVARIANTLY: make its projection on the
+    // pooled mean output direction non-negative. Both the eigenvector and the
+    // mean direction rotate by `R` under `Y ↦ Y Rᵀ`, so this inner-product sign
+    // is preserved and `V ↦ R V` holds exactly (for distinct eigenvalues),
+    // cancelling the SVD's arbitrary per-column sign.
+    for j in 0..d {
+        let mut dot = 0.0;
+        for a in 0..d {
+            dot += v_rot[[a, j]] * mean_dir[a];
+        }
+        if dot < 0.0 {
+            for a in 0..d {
+                v_rot[[a, j]] = -v_rot[[a, j]];
+            }
+        }
+    }
+    // Canonical (frame-invariant) response `Y V` and metric `Vᵀ M V`. Shadow the
+    // originals so the whole fit below runs in the canonical frame; the
+    // coefficients and fitted values are rotated back by `Vᵀ` at each return.
+    let y_canon_owned = y.dot(&v_rot);
+    let fisher_canon_owned: Option<Array3<f64>> = fisher_rao_w.as_ref().map(|w| {
+        let mut out = Array3::<f64>::zeros((n, d, d));
+        for row in 0..n {
+            let m = w.slice(s![row, .., ..]);
+            let vtmv = v_rot.t().dot(&m.dot(&v_rot));
+            out.slice_mut(s![row, .., ..]).assign(&vtmv);
+        }
+        out
+    });
+    let y = y_canon_owned.view();
+    let fisher_rao_w = fisher_canon_owned.as_ref().map(|a| a.view());
+
     // Build the joint multi-output system with a SHARED smoothing parameter per
     // formula smooth, common to all `D` tangent output coordinates. This is what
     // makes the fit frame-equivariant: the tangent vector field `f: x ↦ T_μ M` is
@@ -1636,7 +1712,12 @@ fn gaussian_reml_fit_formula_table_impl(
         // model this is the constant Fréchet-mean fit — at the intrinsic Fréchet
         // (Karcher) mean base point `Σ_i log_base(Y_i) = 0`, so the fitted tangent
         // intercept is `0` and `exp_base(0) = base` recovers the intrinsic mean.
-        return direct_parametric_shared_tangent_fit(&joint_x, joint_y.view(), &x, y, weights, k, d);
+        let mut result =
+            direct_parametric_shared_tangent_fit(&joint_x, joint_y.view(), &x, y, weights, k, d)?;
+        // Rotate the canonical-frame fit back to the caller's output frame.
+        result.coefficients = result.coefficients.dot(&v_rot.t());
+        result.fitted = result.fitted.dot(&v_rot.t());
+        return Ok(result);
     }
 
     let offset_zero = Array1::<f64>::zeros(n * d);
@@ -1780,6 +1861,13 @@ fn gaussian_reml_fit_formula_table_impl(
         }
     }
     let sigma2 = Array1::<f64>::from_elem(1, ss / denom);
+
+    // Rotate the canonical-frame fit back to the caller's output frame: the
+    // canonical coefficients `B_canon` predict `Y V`, so `B = B_canon Vᵀ` and
+    // `fitted = fitted_canon Vᵀ`. The scale/λ/edf are frame-invariant scalars and
+    // `sigma2` was already accumulated in the (invariant) canonical residuals.
+    let coefficients = coefficients.dot(&v_rot.t());
+    let fitted = fitted.dot(&v_rot.t());
 
     Ok(TangentRemlMultiResult {
         coefficients,
