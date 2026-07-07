@@ -1,16 +1,16 @@
-# Real overcomplete ManifoldSAE on Qwen3-30B-A3B (32B MoE) L17
+# Real overcomplete ManifoldSAE on Qwen 3.6 (A3B MoE, q36b) L17
 
 _Draft — numbers filled after the MSI a100 run completes._
 
 ## What this is
 
-The **real** gamfit ManifoldSAE product run on **real** Qwen3-30B-A3B (MoE, "q36b")
+The **real** gamfit ManifoldSAE product run on **real** Qwen 3.6 (A3B MoE, q36b)
 L17 residual activations — an honest **flat-vs-curved** comparison at matched
 **overcomplete** K and matched sparsity, using the **same `sae_manifold_fit`
 machinery** for both arms (only the atom manifold type differs). This supersedes
 the earlier 8B / global-PCA / k-means toy setup.
 
-- Model / layer: Qwen3-30B-A3B (MoE) residual stream layer 17
+- Model / layer: Qwen 3.6 (A3B MoE, q36b) residual stream layer 17
 - Data: `msae_l17/L17_train.f32.npy`, shape (1204602, 2048); subsample N (see below)
 - Tier-0 space: `tier0_recentered.json`, `x' = (x - per_dim_mean)/global_rms_scale`
   (scale 0.0710, per-dim mean = true streamed col mean fixing the L2~1.07 offset;
@@ -53,7 +53,7 @@ curvature proxy up to 0.20), yet curved still loses at matched budget.
 
 ## Verdict
 
-On the **32B MoE** (Qwen3-30B-A3B L17), overcomplete **K=32000**, **block-chart compose**,
+On the **Qwen 3.6 (A3B MoE, q36b) L17**, overcomplete **K=32000**, **block-chart compose**,
 **matched params** — **CURVATURE DOES NOT WIN**: flat beats curved by 0.0026 EV pooled,
 negative in every stratum. This is consistent with the Qwen-8B geometric-wall closure
 (flat +0.047) and the Run-1 ceiling; the only positive curvature signal was the discarded
@@ -79,7 +79,7 @@ the geometric wall on Qwen-8B L18 (there FLAT beat curved, +0.047 EV — a curva
 negative; those +0.047 numbers are energy floors, lower=better, flat floor 0.7411 <
 curved floor 0.7886). Here it runs to completion on the 32B in ~4 min.
 
-- model: **Qwen3-30B-A3B (MoE, 32B) L17**, `L17_train.f32.npy` (1,204,602 × 2048)
+- model: **Qwen 3.6 (A3B MoE, q36b) L17**, `L17_train.f32.npy` (1,204,602 × 2048)
 - centering: **tier0_recentered**; EV baseline "zero" (tier-0 origin == train mean)
 - T1: **frozen overcomplete `decoder_K32000.npy`** (K=32000 = **15.6× p**, unit-norm),
   reconstructed with the frozen **RIDGE-LS** transform (per-row top-|score| active=32
