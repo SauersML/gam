@@ -18,12 +18,21 @@ turning Theta, stopped_reason, collapse events, and a small-K structure-search
 sae_manifold_fit chart-type selection breakdown (which typed manifolds get chosen).
 """
 import argparse, json, os, sys, time, numpy as np
+from pathlib import Path
 from collections import Counter
 
-ROOT = os.environ.get("GAM_MSI_DATA", "/projects/standard/hsiehph/sauer354")
-sys.path.insert(0, f"{ROOT}/msae_l17/driver")
-import compose_l17_stagewise as C  # the SHIPPING product driver
 import gamfit
+
+C = None
+
+
+def load_product_driver(root):
+    """Load the frozen product driver from the caller-supplied data root."""
+    global C
+    driver_dir = root / "msae_l17" / "driver"
+    sys.path.insert(0, str(driver_dir))
+    import compose_l17_stagewise as product_driver
+    C = product_driver
 
 
 def t1_ridge_recon(X, dec, active, ridge=1e-6, chunk=4096):
@@ -109,10 +118,12 @@ def run_t2(residual, topo, args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--root", required=True,
+                    help="Root directory containing the frozen msae_l17 product files")
     ap.add_argument("--rows", type=int, default=60000)
-    ap.add_argument("--t1-decoder", default=f"{ROOT}/msae_l17/t1_out/decoder_K32000.npy")
+    ap.add_argument("--t1-decoder")
     ap.add_argument("--t1-active", type=int, default=32)
-    ap.add_argument("--tier0", default=f"{ROOT}/msae_l17/tier0_recentered.json")
+    ap.add_argument("--tier0")
     ap.add_argument("--d-atom", type=int, default=1)
     ap.add_argument("--max-births", type=int, default=16)
     ap.add_argument("--n-iter", type=int, default=64)
@@ -122,6 +133,12 @@ def main():
     ap.add_argument("--skip-typed", action="store_true")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    root = Path(args.root).expanduser()
+    load_product_driver(root)
+    if args.t1_decoder is None:
+        args.t1_decoder = str(root / "msae_l17" / "t1_out" / "decoder_K32000.npy")
+    if args.tier0 is None:
+        args.tier0 = str(root / "msae_l17" / "tier0_recentered.json")
     os.makedirs(args.out, exist_ok=True)
     ver = getattr(gamfit, "__version__", "?")
 
@@ -129,7 +146,7 @@ def main():
     t0meta = json.load(open(args.tier0))
     mean = np.asarray(t0meta["per_dim_mean"], dtype=np.float64)
     scale = float(t0meta["global_rms_scale"])
-    train = f"{ROOT}/msae_l17/L17_train.f32.npy"
+    train = str(root / "msae_l17" / "L17_train.f32.npy")
     Xmm = np.load(train, mmap_mode="r")
     n_rows, D = Xmm.shape
     N = min(args.rows, n_rows)

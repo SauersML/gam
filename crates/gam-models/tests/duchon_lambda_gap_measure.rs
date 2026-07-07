@@ -12,6 +12,7 @@
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
+use gam_linalg::matrix::LinearOperator;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_solve::gaussian_reml::gaussian_reml_closed_form;
 use gam_terms::smooth::build_term_collection_design;

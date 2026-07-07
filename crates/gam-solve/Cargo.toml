@@ -44,4 +44,5 @@ gam-test-support = { path = "../gam-test-support" }
 # workspace crate so the carved tests compile against the same APIs.
 num-dual = "0.13.6"
 rand = "0.10.1"
+rand_distr = "0.6.0"
 tempfile = "3.27.0"

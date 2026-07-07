@@ -113,9 +113,20 @@ fn zz_measure_duchon_sin8_reml_surface() {
         let cf = gaussian_reml_closed_form(xd.view(), y_arr.view(), s.view(), None, None)
             .expect("closed form");
         let cf_fit = xd.dot(&cf.coefficients).to_vec();
+        assert!(
+            cf.rho.is_finite()
+                && cf.lambda.is_finite()
+                && cf.edf.is_finite()
+                && cf.reml_score.is_finite(),
+            "closed-form REML diagnostics must be finite"
+        );
 
         // mgcv reference
         let (mgcv_edf, mgcv_sp, mgcv_fit) = mgcv_ds(&x, &y, k);
+        assert!(
+            mgcv_edf.is_finite() && mgcv_sp.is_finite(),
+            "mgcv reference diagnostics must be finite"
+        );
 
         eprintln!(
             "\n===== duchon sin8 k={k}: p={p} nulldim={nulldim} n_pen={} truth_amp_pp=2.0 =====",
