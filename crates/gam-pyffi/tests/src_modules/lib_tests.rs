@@ -69,7 +69,18 @@ fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
         }
     }
     let z = array![[1.0], [1.0], [-1.0], [-1.0]];
-    let logits = array![[8.0, -8.0], [8.0, -8.0], [-8.0, 8.0], [-8.0, 8.0]];
+    // Deliberately MODERATE logits (±0.5): the dense softmax responsibilities are
+    // genuinely soft (≈[0.73, 0.27]), so every atom gets non-trivial weight on
+    // every row. That is what makes this a real regression: if the top_k support
+    // projection were a no-op, atoms 0 and 1 would remain coupled across all four
+    // rows and the joint LSQ would fit each decoder to coth(0.5) ≈ 2.16 (the
+    // symmetric dense solution), not ±1. Only projecting the responsibilities onto
+    // the top-1 support (rows 0,1 → atom 0, rows 2,3 → atom 1) decouples them so
+    // each atom fits exactly its two selected rows, giving ±1 (±the seed ridge,
+    // spectral_scale·1e-4). With near-hard logits (e.g. ±8) the dense and
+    // projected fits are indistinguishable, so such a test would pass even against
+    // a no-op projection — hence the moderate magnitude here.
+    let logits = array![[0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, 0.5]];
 
     let decoder = sae_decoder_lsq_init(
         basis.view(),
@@ -84,15 +95,39 @@ fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
     )
     .expect("top-k softmax seed LSQ succeeds");
 
+    // Projected onto top-1 support each atom fits only its two selected rows,
+    // recovering ±1 up to the tiny mean-relative seed ridge (~1e-4).
     assert!(
-        decoder[[0, 0, 0]] > 0.99,
-        "top_k=1 must fit atom 0 only on its selected positive rows, got {}",
+        (decoder[[0, 0, 0]] - 1.0).abs() < 1.0e-3,
+        "top_k=1 must fit atom 0 only on its selected positive rows (expected ≈1.0), got {}",
         decoder[[0, 0, 0]]
     );
     assert!(
-        decoder[[1, 0, 0]] < -0.99,
-        "top_k=1 must fit atom 1 only on its selected negative rows, got {}",
+        (decoder[[1, 0, 0]] + 1.0).abs() < 1.0e-3,
+        "top_k=1 must fit atom 1 only on its selected negative rows (expected ≈-1.0), got {}",
         decoder[[1, 0, 0]]
+    );
+
+    // Baseline arm: the SAME data with no top-k cap (dense softmax) keeps the
+    // atoms coupled, so the decoders land far from ±1 (≈±2.16). This proves the
+    // projection is load-bearing on this fixture — the assertions above cannot be
+    // satisfied by a no-op that ignores `top_k`.
+    let decoder_dense = sae_decoder_lsq_init(
+        basis.view(),
+        &[1, 1],
+        z.view(),
+        logits.view(),
+        "softmax",
+        1.0,
+        1.0,
+        0.0,
+        None,
+    )
+    .expect("dense softmax seed LSQ succeeds");
+    assert!(
+        (decoder_dense[[0, 0, 0]] - 1.0).abs() > 0.5,
+        "dense (no top_k) softmax seed must stay coupled and miss ±1, got {}",
+        decoder_dense[[0, 0, 0]]
     );
 }
 
