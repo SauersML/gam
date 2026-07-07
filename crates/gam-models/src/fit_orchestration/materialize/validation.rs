@@ -1,18 +1,21 @@
 use super::*;
 use gam_terms::inference::formula_dsl::LinkMode;
 
-pub(crate) fn reject_marginal_slope_controls_for_transformation_normal(
-    config: &FitConfig,
-) -> Result<(), WorkflowError> {
+pub(crate) fn requests_bernoulli_marginal_slope(config: &FitConfig) -> bool {
     let family_requests_marginal_slope = config.family.as_deref().is_some_and(|family| {
         let canonical = family.to_ascii_lowercase().replace('_', "-");
         canonical == "bernoulli-marginal-slope" || canonical == "binary-marginal-slope"
     });
-    if family_requests_marginal_slope
+    family_requests_marginal_slope
         || config.logslope_formula.is_some()
         || config.z_column.is_some()
         || config.ctn_stage1.is_some()
-    {
+}
+
+pub(crate) fn reject_marginal_slope_controls_for_transformation_normal(
+    config: &FitConfig,
+) -> Result<(), WorkflowError> {
+    if requests_bernoulli_marginal_slope(config) {
         return Err(WorkflowError::InvalidConfig {
             reason: "transformation_normal cannot be combined with marginal-slope family controls"
                 .to_string(),

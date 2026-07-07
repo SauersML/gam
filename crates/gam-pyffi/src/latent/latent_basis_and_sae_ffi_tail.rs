@@ -249,6 +249,9 @@ fn sae_build_atom_plans(
     run_outer_rho_search = true,
     quotient_scale = false,
     data_row_reseed = false,
+    // #1893: default Python auto fits to the realised-rank REML/Laplace
+    // complexity ledger; callers can set false for historical A/B.
+    rank_charge_evidence = true,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -300,6 +303,7 @@ fn sae_manifold_fit_minimal<'py>(
     run_outer_rho_search: bool,
     quotient_scale: bool,
     data_row_reseed: bool,
+    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -529,6 +533,7 @@ fn sae_manifold_fit_minimal<'py>(
         ibp_alpha_override.unwrap_or(alpha),
         tau,
         jumprelu_threshold,
+        top_k,
     )
     .map_err(py_value_error)?;
     // `plan_latent_dim` (computed above) is the optimizer's per-atom latent
@@ -595,6 +600,7 @@ fn sae_manifold_fit_minimal<'py>(
         run_outer_rho_search,
         quotient_scale,
         data_row_reseed,
+        rank_charge_evidence,
     )?;
     // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
     // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the

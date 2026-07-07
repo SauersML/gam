@@ -2295,16 +2295,14 @@ impl SaeManifoldTerm {
         if n == 0 || k < 2 {
             return Ok(());
         }
-        let mut norms = vec![0.0_f64; k];
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let mut acc = 0.0_f64;
-            for &value in atom.decoder_coefficients.iter() {
-                acc += value * value;
-            }
-            norms[atom_idx] = acc.sqrt();
-        }
-        // Median decoder norm: the robust dictionary scale. (A mean would let a
-        // few large atoms mask a cluster of collapsed ones.)
+        let norms: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.contribution_frobenius_scale())
+            .collect();
+        // Median physical contribution scale: the robust dictionary scale. This is
+        // `exp(s_k)‖B_k‖_F`, not just `‖B_k‖_F`, so the same guard remains live after
+        // the quotient representation moves magnitude into `s_k`.
         let mut sorted = norms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if k % 2 == 1 {

@@ -448,6 +448,37 @@ jobs:
         with:
           name: nx-pyffi-archive
 
+      # The gam-pyffi unit tests are archived with `--no-default-features`, so
+      # PyO3's `extension-module` is OFF and the harness LINKS libpython. With
+      # the crate's default-off-here `auto-initialize` feature, `Python::attach`
+      # initializes that SAME system `python3` the `build` job linked the archive
+      # against (nothing sets PYO3_PYTHON, so both jobs resolve `/usr/bin/python3`
+      # on the identical ubuntu-latest image). Two tests drive the NumPy C-API
+      # via `numpy::IntoPyArray::into_pyarray`
+      # (audit_sae_round_trip_surfaces_external_dictionary_diagnostics,
+      # topology_persistence_ffi), which fetches the NumPy array-API capsule by
+      # IMPORTING numpy at runtime. The runner's system interpreter ships no
+      # numpy, so without this those tests fail with "Failed to access NumPy
+      # array API capsule: ModuleNotFoundError: No module named 'numpy'". This is
+      # a genuine missing test dependency (the same reason the rust-test shards
+      # provision the reference tool stack), NOT an interpreter-init defect — a
+      # raw `Py_InitializeEx`/`prepare_freethreaded_python` would initialize the
+      # very same numpy-less interpreter. Install numpy into that system
+      # interpreter (its dist-packages sit on the linked interpreter's sys.path)
+      # so the capsule import succeeds.
+      - name: Provide NumPy to the linked system interpreter
+        shell: bash
+        run: |
+          set -uo pipefail
+          if python3 -m pip install --break-system-packages --upgrade "numpy<2"; then
+            :
+          else
+            sudo apt-get update && sudo apt-get install -y python3-numpy
+          fi
+          # Hard-fail here (not deep inside a test) if numpy is still not
+          # importable by the interpreter the archive is linked against.
+          python3 -c "import numpy; print('numpy', numpy.__version__, numpy.get_include())"
+
       - name: Run gam-pyffi unit tests
         shell: bash
         run: |

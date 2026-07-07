@@ -90,7 +90,8 @@ mod tests {
         let p = 4;
         let n = 100;
         let mf = 11;
-        let dense = 22;
+        // #2071: derive the dense sentinel instead of hardcoding it — floor(sqrt(MIN_DIM=512))=22.
+        let dense = (MIN_DIM as f64).sqrt().floor() as u64;
         assert!(!use_joint_matrix_free_path(p as usize, n as usize));
         assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), dense);
     }
@@ -101,7 +102,8 @@ mod tests {
         let p = MIN_DIM;
         let n = 1;
         let mf = 11;
-        let dense = 22;
+        // #2071: derive the dense sentinel instead of hardcoding it — floor(sqrt(MIN_DIM=512))=22.
+        let dense = (MIN_DIM as f64).sqrt().floor() as u64;
         assert!(use_joint_matrix_free_path(p as usize, n as usize));
         assert_eq!(operator_aware_hessian_cost(p, n, mf, dense), mf);
     }

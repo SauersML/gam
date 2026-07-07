@@ -22,6 +22,9 @@ pub struct BlockChartComposeConfig {
     pub max_pairs: usize,
     pub pair_min_cofirings: usize,
     pub pair_min_score: f64,
+    /// Router tile width for block-coordinate projection. This is a memory-budget
+    /// parameter owned by the caller, not a hidden constant inside composition.
+    pub block_tile: usize,
 }
 
 impl Default for BlockChartComposeConfig {
@@ -42,6 +45,7 @@ impl Default for BlockChartComposeConfig {
             max_pairs: 128,
             pair_min_cofirings: 64,
             pair_min_score: 0.20,
+            block_tile: 1024,
         }
     }
 }
@@ -91,6 +95,8 @@ pub struct BlockSeedManifestConfig {
     pub n_basis_chart: usize,
     pub include_bases: bool,
     pub name_prefix: String,
+    /// Router tile width used when residual-target seed coordinates are emitted.
+    pub block_tile: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -477,6 +483,9 @@ fn validate_inputs(
     if !(config.alpha > 0.0 && config.alpha <= 1.0) {
         return Err("block chart compose: alpha must be in (0, 1]".to_string());
     }
+    if config.block_tile == 0 {
+        return Err("block chart compose: block_tile must be >= 1".to_string());
+    }
     Ok(())
 }
 
@@ -493,7 +502,7 @@ fn block_coords_for_config(
             config.gamma,
             config.block_size,
             config.block_topk,
-            1024,
+            config.block_tile,
             block,
         )
     } else {
@@ -514,7 +523,7 @@ fn block_coords_for_seed_config(
             config.gamma,
             config.block_size,
             config.block_topk,
-            1024,
+            config.block_tile,
             block,
         )
     } else {

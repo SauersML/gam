@@ -268,6 +268,7 @@ pub(crate) fn run_predict_unified(
                 eta.view(),
                 mean.view(),
                 sigma.view(),
+                se_opt.as_ref().map(|a| a.view()),
                 mean_lo.as_ref().map(|a| a.view()),
                 mean_hi.as_ref().map(|a| a.view()),
             )?;

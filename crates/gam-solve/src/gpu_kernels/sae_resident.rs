@@ -300,7 +300,23 @@ impl DeviceResidentArrowWorkspace {
             });
         }
         let sys = self.to_arrow_system();
-        solve_arrow_newton_step(&sys, ridge_t, ridge_beta)
+        let frame = crate::gpu_kernels::arrow_schur::ResidentArrowFrameHandle::new(
+            &sys, ridge_t, ridge_beta,
+        )
+        .map_err(map_gpu_error)?;
+        let g_t: Vec<f64> = sys
+            .rows
+            .iter()
+            .flat_map(|row| row.gt.iter().copied())
+            .collect();
+        let g_beta: Vec<f64> = sys.gb.iter().copied().collect();
+        // This is a SINGLE resident solve at one frozen gate/basis frame — the
+        // frame's constant Hessian factors are held resident and only the
+        // gradient is uploaded — so the truthful classifier is
+        // `GpuResidentLinearization`, not `GpuResidentFull` (which denotes the
+        // full multi-step device-resident inner Newton loop in `device_fit`).
+        frame
+            .solve_gradient(&g_t, &g_beta)
             .map(|solution| self.finish_step(solution, ExecutionPath::GpuResidentLinearization))
             .map_err(map_gpu_error)
     }
@@ -1966,6 +1982,20 @@ mod tests {
             assert!(
                 max_rel < 1e-9,
                 "resident device fit must match CPU reference (rel {max_rel:e})"
+            );
+
+            // The public single-iteration API must use the same resident-frame
+            // mechanism as device_fit (constant factors held resident, only the
+            // gradient uploaded), not the re-uploading arrow-Schur entry. Because
+            // it is a SINGLE solve at one frozen frame, the truthful path is
+            // `GpuResidentLinearization`, not the full inner-loop `GpuResidentFull`.
+            let one = ws
+                .one_inner_iteration(opts.initial_ridge_t, opts.initial_ridge_beta)
+                .expect("resident one_inner_iteration");
+            assert_eq!(
+                one.execution_path,
+                ExecutionPath::GpuResidentLinearization,
+                "one_inner_iteration must report resident single-linearization residency"
             );
 
             // The resident frame's single-gradient solve must also match a full

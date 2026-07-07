@@ -85,11 +85,16 @@ def alr(values: Any, *, reference: int = -1) -> Any:
 
 
 def inverse_alr(coords: Any, *, reference: int = -1) -> Any:
-    """Map ALR coordinates back to the simplex."""
+    """Map ALR coordinates back to the simplex.
+
+    Accepts either a 2-D ``(rows, parts - 1)`` ALR-coordinate batch or a single
+    1-D ALR-coordinate vector; a 1-D input yields the reconstructed 1-D
+    composition matching the corresponding batch row.
+    """
     np = _np()
-    return _ffi(
-        "response_geometry_inverse_alr", np.asarray(coords, dtype=float), int(reference)
-    )
+    rows, was_1d = _composition_rows(np, coords)
+    out = _ffi("response_geometry_inverse_alr", rows, int(reference))
+    return np.asarray(out)[0] if was_1d else out
 
 
 def simplex_frechet_mean(values: Any, weights: Any | None = None) -> Any:

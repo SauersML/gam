@@ -99,6 +99,7 @@ def test_write_survival_at_csv_emits_valid_csv() -> None:
     out_path = Path(tempfile.mkdtemp()) / "survival_at.csv"
     returned = pred.write_survival_at_csv(str(out_path), query_times)
 
+    assert returned == str(out_path)
     assert out_path.exists() and out_path.stat().st_size > 0, (
         "write_survival_at_csv must create a non-empty CSV; "
         f"returned={returned!r}"

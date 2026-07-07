@@ -3464,6 +3464,33 @@ impl NfreeSkipGateStatus {
     }
 }
 
+fn nfree_skip_gate_status_from_parts(
+    shape: bool,
+    covers_value: bool,
+    covers_skip: bool,
+    covers_gradient: bool,
+    penalty: bool,
+    revision: bool,
+    allow_second_order: bool,
+    require_gradient: bool,
+) -> NfreeSkipGateStatus {
+    NfreeSkipGateStatus {
+        shape,
+        // A value-only cost probe consumes only the Chebyshev Gram value; it
+        // does not expose a beta/row-space object, so the #1264 reduced-basis
+        // skip witness is not part of the value soundness certificate. Requiring
+        // `covers_skip` here forces harmless cost probes across basis-rotation
+        // seams onto `reset_surface`, reintroducing an O(n) pass into the κ
+        // trial loop. Gradient probes still require the skip witness because
+        // they return a stationary beta/gradient in the frozen reduced basis.
+        value: shape && covers_value && (!require_gradient || covers_skip),
+        gradient: shape && (!require_gradient || covers_gradient),
+        penalty,
+        revision,
+        second_order: allow_second_order,
+    }
+}
+
 impl<'d> SpatialJointContext<'d> {
     fn nfree_skip_gate_status(
         &self,
@@ -3472,24 +3499,26 @@ impl<'d> SpatialJointContext<'d> {
         require_gradient: bool,
     ) -> NfreeSkipGateStatus {
         let shape = theta.len() == self.rho_dim + 1;
-        let (value, gradient) = if shape {
+        let (covers_value, covers_skip, covers_gradient) = if shape {
             let psi = theta[self.rho_dim];
             (
-                self.evaluator.psi_gram_tensor_covers(psi)
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi),
-                !require_gradient || self.evaluator.psi_gram_tensor_covers_gradient(psi),
+                self.evaluator.psi_gram_tensor_covers(psi),
+                self.evaluator.psi_gram_tensor_covers_skip(psi),
+                self.evaluator.psi_gram_tensor_covers_gradient(psi),
             )
         } else {
-            (false, false)
+            (false, false, false)
         };
-        NfreeSkipGateStatus {
+        nfree_skip_gate_status_from_parts(
             shape,
-            value,
-            gradient,
-            penalty: self.evaluator.supports_nfree_penalty_rekey(),
-            revision: self.evaluator.nfree_fast_path_revision().is_some(),
-            second_order: allow_second_order,
-        }
+            covers_value,
+            covers_skip,
+            covers_gradient,
+            self.evaluator.supports_nfree_penalty_rekey(),
+            self.evaluator.nfree_fast_path_revision().is_some(),
+            allow_second_order,
+            require_gradient,
+        )
     }
 
     fn frozen_glm_working_state(
@@ -8646,23 +8675,30 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             (fit, score)
         })
     });
-    // #1074: when the multi-start pre-scan already placed the seed in a good,
-    // finite basin, a HARD joint-solve failure (e.g. a NaN covariance from κ
-    // railing into the kernel-collapse corner during the local polish) must not
-    // sink the whole fit — the pre-scan geometry is itself a valid κ-optimized
-    // result (ρ profiled at the best-scoring fixed κ). Fall back to it, exactly
-    // as the NonConverged / worsened-score gates inside the joint solver already
-    // fall back to the frozen baseline. Only the local polish (a fraction of a
-    // REML nat) is forgone. Scoped to the pre-scan-improved case so ordinary
-    // joint failures keep raising as before.
-    let exact_joint = if prescan_improved && !matches!(joint_result, Ok(Some(_))) {
+    // #1074 / #2162: when the fixed-κ profiled seed is in a good, finite basin,
+    // a HARD joint-solve failure caused only by inference-matrix finiteness (for
+    // example a NaN frequentist covariance from κ railing into the
+    // kernel-collapse corner during local polish) must not sink the whole fit.
+    // The trial-evaluation path already classifies that exact condition as a
+    // recoverable infeasible κ point and retreats; apply the same semantics to
+    // the terminal polish by returning the finite frozen/pre-scan geometry with
+    // ρ profiled at fixed κ. Keep unrelated errors fatal, and keep the older
+    // pre-scan-improved rescue for cases where the multi-start scan found a
+    // strictly better fixed-κ basin but the final polish produced no candidate.
+    let terminal_joint_recoverable = matches!(
+        &joint_result,
+        Err(err) if is_recoverable_trial_point_error(err)
+    );
+    let exact_joint = if (prescan_improved && !matches!(joint_result, Ok(Some(_))))
+        || terminal_joint_recoverable
+    {
         let reason = match &joint_result {
             Err(e) => format!("error: {e}"),
             _ => "unavailable".to_string(),
         };
         log::info!(
-            "[spatial-kappa] #1074 joint polish yielded no usable candidate \
-             ({reason}); returning the multi-start pre-scan geometry (REML {initial_score:.5})"
+            "[spatial-kappa] #1074/#2162 joint polish yielded no usable candidate \
+             ({reason}); returning the fixed-κ profiled geometry (REML {initial_score:.5})"
         );
         FittedTermCollectionWithSpec {
             fit: best.fit,
@@ -9508,4 +9544,40 @@ fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>
     let tr2 = block.dot(&block).diag().sum();
     (tr.is_finite() && tr2.is_finite() && tr > 0.0)
         .then(|| (2.0 * tr - tr2).max(tr).max(1e-12))
+}
+
+#[cfg(test)]
+mod nfree_gate_tests {
+    use super::nfree_skip_gate_status_from_parts;
+
+    #[test]
+    fn value_only_nfree_gate_does_not_require_basis_skip_witness() {
+        let gate = nfree_skip_gate_status_from_parts(
+            true,  // shape
+            true,  // Chebyshev Gram value covers this ψ
+            false, // reduced-basis skip witness absent across a rotation seam
+            false, // gradient coverage irrelevant for a value-only cost probe
+            true,  // penalty can be re-keyed without rows
+            true,  // design revision is pinned
+            false, // no Hessian request
+            false, // value-only cost probe
+        );
+        assert!(
+            gate.would_skip(false),
+            "value-only κ cost probes must stay n-free when the Gram value is certified; \
+             the reduced-basis skip witness is required only for beta/gradient probes"
+        );
+    }
+
+    #[test]
+    fn gradient_nfree_gate_still_requires_basis_skip_witness() {
+        let gate = nfree_skip_gate_status_from_parts(
+            true, true, false, true, true, true, false, true,
+        );
+        assert!(
+            !gate.would_skip(true),
+            "gradient probes return beta/gradient objects in a reduced basis and must not \
+             skip the row lane without the reduced-basis witness"
+        );
+    }
 }

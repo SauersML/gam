@@ -49,17 +49,21 @@ mod amortized_encoder_tests {
         }
     }
 
-    /// The fitted amplitudes the encoder derives are exactly the assignment
-    /// masses the reconstruction is assembled from — feeding them back is the
-    /// self-consistency the distilled map is supervised against.
+    /// The fitted amplitudes the encoder derives are the realised intensity
+    /// coordinates the reconstruction uses: the existence gate times the explicit
+    /// cone radial scale.  Returning the bare gate would silently re-couple
+    /// presence and intensity for amortized encoding as soon as `log_amplitude`
+    /// moves away from zero.
     #[test]
-    fn fitted_assignment_amplitudes_match_the_assignment_masses() {
-        let (term, _target, rho) = small_two_atom_periodic_term();
+    fn fitted_assignment_amplitudes_include_explicit_log_amplitude_1939() {
+        let (mut term, _target, rho) = small_two_atom_periodic_term();
+        term.atoms[0].log_amplitude = 2.0_f64.ln();
+        term.atoms[1].log_amplitude = 0.25_f64.ln();
         let n = term.n_obs();
         let k = term.k_atoms();
         let amplitudes = term
             .fitted_assignment_amplitudes(&rho)
-            .expect("fitted amplitudes derive from the assignment");
+            .expect("fitted amplitudes derive from assignment and cone scale");
         assert_eq!(amplitudes.dim(), (n, k));
         for row in 0..n {
             let a = term
@@ -67,10 +71,11 @@ mod amortized_encoder_tests {
                 .try_assignments_row_for_rho(row, &rho)
                 .expect("assignment row resolves");
             for atom_idx in 0..k {
+                let expected = a[atom_idx] * term.atoms[atom_idx].log_amplitude.exp();
                 assert_eq!(
                     amplitudes[[row, atom_idx]],
-                    a[atom_idx],
-                    "amplitude[{row},{atom_idx}] must equal the assignment mass"
+                    expected,
+                    "amplitude[{row},{atom_idx}] must equal gate times explicit cone scale"
                 );
             }
         }
@@ -872,6 +877,31 @@ mod step2_quotient_scale_tests {
              materially increase loss: {} -> {}",
             loss_peeled.total(),
             loss_step.total()
+        );
+    }
+
+    /// #2099 — collapse guards must measure the atom's physical contribution
+    /// scale `exp(s_k)‖B_k‖_F`, not the raw decoder norm alone. After the quotient
+    /// peels both decoders to unit Frobenius, `‖B_k‖` cannot distinguish a live atom
+    /// from one whose explicit log-amplitude has collapsed.
+    #[test]
+    fn quotient_collapse_scale_tracks_log_amplitude_not_unit_decoder_norm() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        for atom in term.atoms.iter_mut() {
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+        let live_scale = term.atoms[0].contribution_frobenius_scale();
+        term.atoms[1].log_amplitude = term.atoms[0].log_amplitude - 4.0_f64.ln();
+        let collapsed_scale = term.atoms[1].contribution_frobenius_scale();
+
+        assert!(
+            (frob(&term.atoms[0].decoder_coefficients) - 1.0).abs() <= 1e-9
+                && (frob(&term.atoms[1].decoder_coefficients) - 1.0).abs() <= 1e-9,
+            "fixture must exercise equal unit decoders"
+        );
+        assert!(
+            collapsed_scale < live_scale,
+            "physical scale must see the explicit-amplitude collapse: live={live_scale}, collapsed={collapsed_scale}"
         );
     }
 

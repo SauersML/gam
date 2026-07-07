@@ -618,6 +618,7 @@ class BlockSparseDictionaryFit:
         residual_target: bool = True,
         include_bases: bool = True,
         name_prefix: str = "block",
+        block_tile: int = 1024,
     ) -> dict:
         """A JSON-serialisable Tier-1 -> Tier-2 hand-off manifest: per-block basis,
         coordinate statistics, firing counts, and MDL featurizer rows, plus a flat
@@ -644,6 +645,7 @@ class BlockSparseDictionaryFit:
                 n_basis_chart=int(n_basis_chart),
                 include_bases=bool(include_bases),
                 name_prefix=str(name_prefix),
+                block_tile=int(block_tile),
             )
         )
 
@@ -663,6 +665,7 @@ class BlockSparseDictionaryFit:
         max_pairs: int = 128,
         pair_min_cofirings: int = 64,
         pair_min_score: float = 0.20,
+        block_tile: int = 1024,
     ) -> dict[str, Any]:
         """Compose Rust-owned block-coordinate charts over this T1 dictionary.
 
@@ -692,6 +695,7 @@ class BlockSparseDictionaryFit:
                 max_pairs=int(max_pairs),
                 pair_min_cofirings=int(pair_min_cofirings),
                 pair_min_score=float(pair_min_score),
+                block_tile=int(block_tile),
             )
         )
 

@@ -281,6 +281,7 @@ fn block_fit(fixture: &CalendarFixture) -> BlockSparseFit {
 fn chart_config() -> BlockChartComposeConfig {
     BlockChartComposeConfig {
         block_size: BLOCK_SIZE,
+        block_tile: BLOCK_SIZE,
         block_topk: AXES,
         gamma: 1.0,
         residual_target: false,

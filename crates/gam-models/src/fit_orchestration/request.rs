@@ -175,6 +175,11 @@ pub struct StandardFitResult {
     /// fit's coefficients stay in the reduced `γ` coordinate; this lift is
     /// persisted into the payload's `beta_link_wiggle`.
     pub wiggle_saved_warp_beta: Option<Vec<f64>>,
+    /// Frozen-index mean-coordinate shift for the predict runtime (#2141),
+    /// persisted into the payload's `link_wiggle_index_shift`. Lets predict
+    /// evaluate the warp basis at the frozen index `η̂` the fit pinned it at,
+    /// rather than at the de-aliased base predictor.
+    pub wiggle_saved_index_shift: Option<Vec<f64>>,
 }
 
 pub struct SurvivalLocationScaleFitResult {
