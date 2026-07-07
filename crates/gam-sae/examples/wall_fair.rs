@@ -488,6 +488,7 @@ fn fit_stratum(
     let curved_base = curved.reconstruct();
     let chart_cfg = BlockChartComposeConfig {
         block_size: args.block_size,
+        block_tile: args.block_tile,
         block_topk: args.block_topk,
         gamma: curved.gamma,
         residual_target: true,
