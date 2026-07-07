@@ -434,27 +434,18 @@ fn build_duchon_basis_uncached(
         // mass/tension/stiffness operator penalties): those operators build
         // their own collocation Grams in the un-rotated `Z` frame, so rotating
         // only the native penalty would desync the operator penalty columns.
-        // Operators are off for the default `duchon(x1,x2)` (the #1355 collapse),
-        // so this gate keeps the fix scoped to where it is needed and sound.
-        let operators_active = matches!(
-            spec.operator_penalties.mass,
-            OperatorPenaltySpec::Active { .. }
-        ) || matches!(
-            spec.operator_penalties.tension,
-            OperatorPenaltySpec::Active { .. }
-        ) || matches!(
-            spec.operator_penalties.stiffness,
-            OperatorPenaltySpec::Active { .. }
-        );
+        // Default Duchon terms have mass+tension active, so they deliberately
+        // bypass this fused native-only path; `all_disabled()` is the opt-in
+        // configuration that reaches it.
+        let operators_active = spec.operator_penalties.has_active_operator_penalty();
         // When the fresh data-metric reparam is computed, its `raw` (un-rotated)
         // design is built here from a full `n×k` kernel evaluation. That SAME
         // realized design is the base of the final basis — rotating it by the
         // adopted `V` gives the fit-time design without a second kernel pass —
         // so carry it forward instead of rebuilding it below (#1718). This
-        // halves the cold-build kernel work for the default `duchon(x, z)`,
-        // which is the only configuration that hits this branch (native Gram,
-        // no operators, no frozen reparam), closing the wall-time gap to
-        // `thinplate(x, z)`.
+        // halves the cold-build kernel work for explicit native-only Duchon
+        // configurations (`all_disabled()`, no frozen reparam), closing their
+        // wall-time gap to `thinplate(x, z)` without changing default terms.
         let mut prebuilt_raw_basis: Option<Array2<f64>> = None;
         if frozen_radial_reparam.is_none() && !operators_active {
             let kernel_cols = kernel_transform.ncols();
@@ -2738,6 +2729,37 @@ mod knot_selection_invariance_tests {
             canonical(&knots),
             canonical(&knots_perm),
             "reordering rows must not change the selected knot set (gh#1378)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod duchon_operator_gate_tests {
+    use super::{DuchonOperatorPenaltySpec, OperatorPenaltySpec};
+
+    #[test]
+    fn default_duchon_operator_penalties_are_active() {
+        let default_spec = DuchonOperatorPenaltySpec::default();
+
+        assert!(
+            default_spec.has_active_operator_penalty(),
+            "default Duchon terms must bypass the native-only fused radial path"
+        );
+        assert!(
+            matches!(default_spec.mass, OperatorPenaltySpec::Active { .. })
+                && matches!(default_spec.tension, OperatorPenaltySpec::Active { .. })
+                && matches!(default_spec.stiffness, OperatorPenaltySpec::Disabled),
+            "the default is mass+tension active with stiffness disabled"
+        );
+    }
+
+    #[test]
+    fn all_disabled_duchon_operator_penalties_are_native_only() {
+        let native_only = DuchonOperatorPenaltySpec::all_disabled();
+
+        assert!(
+            !native_only.has_active_operator_penalty(),
+            "all_disabled() is the explicit native-Gram-only configuration"
         );
     }
 }

@@ -996,6 +996,12 @@ impl Default for DuchonOperatorPenaltySpec {
 }
 
 impl DuchonOperatorPenaltySpec {
+    pub fn has_active_operator_penalty(&self) -> bool {
+        matches!(self.mass, OperatorPenaltySpec::Active { .. })
+            || matches!(self.tension, OperatorPenaltySpec::Active { .. })
+            || matches!(self.stiffness, OperatorPenaltySpec::Active { .. })
+    }
+
     pub fn all_disabled() -> Self {
         Self {
             mass: OperatorPenaltySpec::Disabled,
