@@ -33,6 +33,12 @@ PMAX = 512  # harvest seq_len / truncation length (matches qwen_nuisance_msi.py)
 # nothing is peeled.
 NULL_PERMUTATION_REPLICATES = 200  # reporting-only: permutation-null resolution (p < 1/201)
 
+# Reporting-only (SPEC line 19): number of common bit-budgets on which the two codes'
+# rate-distortion curves are sampled for the figure/curve. It sets the plotting
+# resolution of the MDL sweep, NOT any decision -- the matched-bits headline is computed
+# by exact bisection at the derived operating point, independent of this grid.
+MDL_SWEEP_POINTS = 48  # reporting-only: EV-vs-bits curve resolution
+
 
 def required_env(name, message):
     try:
@@ -219,6 +225,172 @@ def head_to_head(Xp):
     return lin, atlas, compare
 
 
+# ---------------------------------------------------------------------------
+# MDL-fair matching: compare the two codes at EQUAL DESCRIPTION LENGTH (bits),
+# not equal coords/row. Both codes are scored by reverse water-filling over their
+# relevant eigen-spectrum: to reach a common distortion floor D*, component i is
+# allocated rate R_i = 1/2 * max(0, log2(lambda_i / D*)) bits and suffers residual
+# distortion min(lambda_i, D*). This is the exact Gaussian rate-distortion solution,
+# so "bits" and "explained variance" are two readouts of the SAME D* -- no free knob
+# beyond D*, which is itself DERIVED (the noise floor), never hand-set.
+#
+#   linear code : the global covariance spectrum {lambda_i}, one code for all rows.
+#   curved atlas: K local charts; the relevant spectrum is the POOLED within-chart
+#                 spectrum {lambda_{k,j}} weighted by chart occupancy n_k/N, plus a
+#                 GATE cost of H(occupancy) bits/row to name a row's chart. The
+#                 between-chart structure the gate buys is then reconstructed for
+#                 free (it lives in the chart means / dictionary), so both codes'
+#                 EV share the GLOBAL total variance as denominator -- a fair head
+#                 -to-head. At the gate-only budget the atlas already explains the
+#                 between-chart variance; every coding bit above that buys within
+#                 -chart detail.
+# ---------------------------------------------------------------------------
+def _centred_spectrum(Xin):
+    """Per-component variances (covariance eigenvalues) of row-set Xin."""
+    n = len(Xin)
+    Cc = Xin - Xin.mean(0)
+    s = np.linalg.svd(Cc, compute_uv=False, full_matrices=False)
+    return (s ** 2) / n
+
+
+def _atlas_spectrum(Xp, K, seed=0):
+    """Pooled within-chart eigen-spectrum + occupancy gate for a K-chart atlas.
+    Returns (eigs, weights, gate_bits): `eigs` are local per-component variances, each
+    carrying weight n_k/N (chart occupancy); `gate_bits` = occupancy entropy (bits/row),
+    the cost of naming which chart a row lands in."""
+    N = len(Xp)
+    lab = kmeans_np(Xp, K, seed=seed)
+    counts = np.bincount(lab, minlength=K)
+    p = counts[counts > 0].astype(np.float64) / N
+    gate_bits = float(-(p * np.log2(p)).sum()) if p.size else 0.0
+    eigs, wts = [], []
+    for k in range(K):
+        nk = int(counts[k])
+        if nk < 2:
+            continue  # <2 rows: zero within-chart variance, coded with 0 bits
+        lam = _centred_spectrum(Xp[lab == k])
+        eigs.append(lam)
+        wts.append(np.full(lam.shape[0], nk / N))
+    eigs = np.concatenate(eigs) if eigs else np.zeros(0)
+    wts = np.concatenate(wts) if wts else np.zeros(0)
+    return eigs, wts, gate_bits
+
+
+def _wf_bits(eigs, wts, Dstar):
+    """Reverse-water-filling rate (bits/row) to distortion floor Dstar over a weighted
+    spectrum: sum_i w_i * 1/2 * max(0, log2(lambda_i / Dstar))."""
+    if eigs.size == 0:
+        return 0.0
+    return float((wts * 0.5 * np.maximum(0.0, np.log2(eigs / Dstar))).sum())
+
+
+def _wf_ev(eigs, wts, Dstar, totvar):
+    """Explained variance at distortion floor Dstar: 1 - (coded residual)/totvar, where
+    the residual is sum_i w_i * min(lambda_i, Dstar). `totvar` is the GLOBAL variance so
+    linear and atlas share a denominator (the atlas is credited its between-chart mass)."""
+    if totvar <= 0.0:
+        return 0.0
+    dist = float((wts * np.minimum(eigs, Dstar)).sum()) if eigs.size else 0.0
+    return 1.0 - dist / totvar
+
+
+def _invert_bits(eigs, wts, target_bits, extra=0.0):
+    """Distortion floor D* whose total rate extra + _wf_bits(eigs,wts,D*) == target_bits.
+    The rate is continuous and strictly decreasing in D* over its active range, so a
+    bisection (root-finding, NOT grid search) inverts it. The target is clamped to the
+    achievable coding range so a caller never extrapolates past the spectrum."""
+    if eigs.size == 0:
+        return 1.0
+    lo, hi = float(eigs.min()) * 1e-12, float(eigs.max())
+    coding = target_bits - extra
+    if coding <= 0.0:
+        return hi                       # no coding budget -> code nothing (D* = lambda_max)
+    if coding >= _wf_bits(eigs, wts, lo):
+        return lo                       # full budget -> code down to the smallest component
+    for _ in range(100):                # ~1e-30 relative precision on D*
+        mid = np.sqrt(lo * hi)
+        if _wf_bits(eigs, wts, mid) > coding:
+            lo = mid
+        else:
+            hi = mid
+    return float(np.sqrt(lo * hi))
+
+
+def head_to_head_mdl(Xp, Ks=(8, 16, 32, 64), seed=0, sweep_points=MDL_SWEEP_POINTS):
+    """MDL-fair head-to-head: linear vs curved atlas at EQUAL total bits.
+
+    D* is DERIVED as the noise floor = the smallest global covariance eigenvalue (the
+    variance no principal component beats; below it a component is indistinguishable from
+    noise and earns zero rate). At that common D* each code has a total description length
+    and an EV; we then quote the OTHER code's EV at the SAME total bits (bisection), so the
+    comparison is always at an identical budget. Reported from both anchors (linear's spend,
+    atlas's spend) so neither side picks the operating point."""
+    Xc = Xp - Xp.mean(0)
+    lin_eigs = _centred_spectrum(Xc)
+    lin_wts = np.ones_like(lin_eigs)
+    V = float(lin_eigs.sum())                       # global total variance (shared denominator)
+    pos = lin_eigs[lin_eigs > 0]
+    floor = float(pos.min()) if pos.size else 1.0   # derived noise-floor D* (no magic constant)
+
+    def lin_ev_at_bits(B):
+        return _wf_ev(lin_eigs, lin_wts, _invert_bits(lin_eigs, lin_wts, B), V) if B > 0 else 0.0
+
+    lin_bits_floor = _wf_bits(lin_eigs, lin_wts, floor)  # linear's spend to code to the noise floor
+    lin_ev_floor = _wf_ev(lin_eigs, lin_wts, floor, V)
+
+    # common bit-budget grid for the RD curves (data-derived span; resolution is reporting-only)
+    max_bits = lin_bits_floor
+    budgets = np.linspace(0.0, max_bits, sweep_points)
+    lin_curve = [dict(bits=float(B), ev=float(lin_ev_at_bits(B))) for B in budgets]
+
+    per_K = []
+    for K in Ks:
+        eigs, wts, gate = _atlas_spectrum(Xp, K, seed=seed)
+
+        def atl_ev_at_bits(B, eigs=eigs, wts=wts, gate=gate):
+            if B < gate:
+                return 0.0                          # cannot even afford the chart index
+            return _wf_ev(eigs, wts, _invert_bits(eigs, wts, B, extra=gate), V)
+
+        atlas_bits_floor = gate + _wf_bits(eigs, wts, floor)   # atlas spend to the same D*
+        atlas_ev_floor = _wf_ev(eigs, wts, floor, V)
+        # anchor A: match linear TO the atlas's total spend -> compare EV at atlas_bits_floor
+        lin_ev_at_atlas_bits = lin_ev_at_bits(atlas_bits_floor)
+        gain_atlas_anchor = atlas_ev_floor - lin_ev_at_atlas_bits
+        # anchor B: match atlas TO the linear's total spend -> compare EV at lin_bits_floor
+        atlas_ev_at_lin_bits = atl_ev_at_bits(lin_bits_floor)
+        gain_linear_anchor = atlas_ev_at_lin_bits - lin_ev_floor
+
+        per_K.append(dict(
+            K=K, gate_bits=gate,
+            atlas_bits_floor=float(atlas_bits_floor), atlas_ev_floor=float(atlas_ev_floor),
+            linear_ev_at_atlas_bits=float(lin_ev_at_atlas_bits),
+            matched_bits_atlas_anchor=float(atlas_bits_floor),
+            mdl_gain_atlas_anchor=float(gain_atlas_anchor),
+            linear_bits_floor=float(lin_bits_floor), linear_ev_floor=float(lin_ev_floor),
+            atlas_ev_at_lin_bits=float(atlas_ev_at_lin_bits),
+            matched_bits_linear_anchor=float(lin_bits_floor),
+            mdl_gain_linear_anchor=float(gain_linear_anchor),
+            atlas_curve=[dict(bits=float(B), ev=float(atl_ev_at_bits(B))) for B in budgets],
+        ))
+
+    best = max(per_K, key=lambda r: r["mdl_gain_atlas_anchor"])
+    return dict(
+        distortion_level_Dstar=floor,
+        distortion_level_note=("D* = smallest global covariance eigenvalue (the noise floor); "
+                               "reverse water-filling allocates R_i=0.5*max(0,log2(lambda_i/D*)) "
+                               "bits/component. Both codes scored at this common D*, then EV is "
+                               "re-quoted at matched total bits."),
+        total_variance=V,
+        linear_bits_floor=float(lin_bits_floor), linear_ev_floor=float(lin_ev_floor),
+        linear_rd_curve=lin_curve,
+        per_K=per_K,
+        best=dict(K=best["K"], matched_bits=best["matched_bits_atlas_anchor"],
+                  atlas_ev=best["atlas_ev_floor"], linear_ev=best["linear_ev_at_atlas_bits"],
+                  mdl_gain=best["mdl_gain_atlas_anchor"]),
+    )
+
+
 def _synth(with_sink, seed=0):
     """Synthetic activations: 3-dim semantic structure, optionally with a DOMINANT
     first-token sink (position 0 only). Real attention sinks are ~1000x per-row; on
@@ -254,6 +426,32 @@ def _selftest():
     assert var_sink_after < var_sink_before / 100, (var_sink_before, var_sink_after)
     lin, atlas, compare = head_to_head(Xp)
     assert compare, "head-to-head produced no comparison"
+
+    # --- MDL-fair matching: reverse water-filling at EQUAL total bits ---
+    mdl = head_to_head_mdl(Xp)
+    D = mdl["distortion_level_Dstar"]
+    assert np.isfinite(D) and D > 0.0, mdl                       # D* derived, not magic
+    # (a) more bits => weakly-monotone EV on every RD curve (linear + each atlas-K)
+    def _monotone(curve, tag):
+        b = np.array([p["bits"] for p in curve]); e = np.array([p["ev"] for p in curve])
+        assert np.all(np.diff(b) >= -1e-12), (tag, "bits not sorted")
+        assert np.all(np.diff(e) >= -1e-9), (tag, "EV not weakly-monotone in bits", e)
+        assert np.all((e >= -1e-9) & (e <= 1.0 + 1e-9)), (tag, "EV out of [0,1]", e)
+    _monotone(mdl["linear_rd_curve"], "linear")
+    for rec in mdl["per_K"]:
+        _monotone(rec["atlas_curve"], f"atlas K={rec['K']}")
+        # (b) atlas and linear are compared at the SAME bit budget on both anchors
+        assert rec["matched_bits_atlas_anchor"] == rec["atlas_bits_floor"], rec
+        assert rec["matched_bits_linear_anchor"] == mdl["linear_bits_floor"], rec
+        assert np.isfinite(rec["mdl_gain_atlas_anchor"]), rec
+        assert np.isfinite(rec["mdl_gain_linear_anchor"]), rec
+        # gate is a proper cost; atlas at gate-only budget explains only between-chart mass
+        assert rec["gate_bits"] > 0.0, rec
+    b = mdl["best"]
+    print(f"[selftest/mdl] D*={D:.3e} bits(lin@floor)={mdl['linear_bits_floor']:.2f} "
+          f"best atlas K={b['K']} @ {b['matched_bits']:.2f} bits: "
+          f"atlas EV={b['atlas_ev']:.3f} vs linear EV={b['linear_ev']:.3f} "
+          f"(MDL gain {b['mdl_gain']:+.3f})")
 
     # --- regime 2: sink-free -> peel ZERO directions, recover the null (SPEC line 13) ---
     Xc0, positions0, _ = _synth(with_sink=False, seed=1)
@@ -340,6 +538,18 @@ def main():
               f"gain={r['curved_gain']:+.3f}", flush=True)
     best = compare[0]
 
+    # ---- MDL-fair matching: linear vs atlas at EQUAL total bits (reverse water-filling) ----
+    mdl = head_to_head_mdl(Xp)
+    mb = mdl["best"]
+    print(f"\nMDL-FAIR (equal total bits, D*={mdl['distortion_level_Dstar']:.3e} = noise floor):",
+          flush=True)
+    for r in sorted(mdl["per_K"], key=lambda z: -z["mdl_gain_atlas_anchor"]):
+        print(f"  K={r['K']}: at {r['atlas_bits_floor']:.2f} bits/row  atlas EV={r['atlas_ev_floor']:.3f} "
+              f"vs linear EV={r['linear_ev_at_atlas_bits']:.3f}  gain={r['mdl_gain_atlas_anchor']:+.3f} "
+              f"(gate={r['gate_bits']:.2f} bits)", flush=True)
+    print(f"  best MDL gain: {mb['mdl_gain']:+.3f} EV at {mb['matched_bits']:.2f} bits/row "
+          f"(atlas K={mb['K']})", flush=True)
+
     # ---- try the ACTUAL gamfit manifold SAE if available ----
     try:
         import gamfit
@@ -356,18 +566,41 @@ def main():
     ds = [1, 2]
     lin_pts = [lin[d]["ev"] for d in ds]
     atl_pts = [max(a["ev"] for (K, dd), a in atlas.items() if dd == d) for d in ds]
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.5, 4.6))
+    # left panel: matched coords/row (the original currency)
     ax.plot(ds, lin_pts, "o-", label="linear (global PCA)", color="#c0392b", lw=2, ms=9)
     ax.plot(ds, atl_pts, "s-", label="curved atlas (best K local charts)", color="#2471a3", lw=2, ms=9)
     for d, l, a in zip(ds, lin_pts, atl_pts):
         ax.annotate(f"+{a - l:.3f}", (d, (a + l) / 2), fontsize=9, color="#2471a3")
     ax.set_xlabel("coordinates per row (sparse: 1 atom active)")
     ax.set_ylabel(f"explained variance (sink-peeled L{args.layer})")
-    ax.set_title(f"Qwen3-8B L{args.layer}: curved atlas vs linear, matched sparse capacity\n"
-                 f"best curved gain = {best['curved_gain']:+.3f} EV at d={best['d']}, K={best['K']}")
+    ax.set_title(f"matched coords/row\nbest curved gain = {best['curved_gain']:+.3f} EV "
+                 f"at d={best['d']}, K={best['K']}")
     ax.set_xticks(ds)
     ax.legend()
     ax.grid(alpha=.3)
+    # right panel: matched DESCRIPTION LENGTH (bits) -- reverse water-filling RD curves
+    lb = np.array([p["bits"] for p in mdl["linear_rd_curve"]])
+    le = np.array([p["ev"] for p in mdl["linear_rd_curve"]])
+    ax2.plot(lb, le, "-", label="linear (global PCA)", color="#c0392b", lw=2)
+    bestK = mb["K"]
+    brec = next(r for r in mdl["per_K"] if r["K"] == bestK)
+    ab = np.array([p["bits"] for p in brec["atlas_curve"]])
+    ae = np.array([p["ev"] for p in brec["atlas_curve"]])
+    ax2.plot(ab, ae, "-", label=f"curved atlas (K={bestK})", color="#2471a3", lw=2)
+    ax2.axvline(mb["matched_bits"], color="#7f8c8d", ls="--", lw=1)
+    ax2.plot([mb["matched_bits"]], [mb["atlas_ev"]], "s", color="#2471a3", ms=9)
+    ax2.plot([mb["matched_bits"]], [mb["linear_ev"]], "o", color="#c0392b", ms=9)
+    ax2.annotate(f"{mb['mdl_gain']:+.3f} @ {mb['matched_bits']:.1f} bits",
+                 (mb["matched_bits"], (mb["atlas_ev"] + mb["linear_ev"]) / 2),
+                 fontsize=9, color="#2471a3")
+    ax2.set_xlabel("description length (bits / row, reverse water-filling)")
+    ax2.set_ylabel("explained variance")
+    ax2.set_title(f"matched bits (MDL-fair)\nbest MDL gain = {mb['mdl_gain']:+.3f} EV "
+                  f"at K={bestK}, D*={mdl['distortion_level_Dstar']:.2e}")
+    ax2.legend()
+    ax2.grid(alpha=.3)
+    fig.suptitle(f"Qwen3-8B L{args.layer}: curved atlas vs linear under BOTH capacity currencies")
     plt.tight_layout()
     plt.savefig(f"{OUT}/curved_vs_linear.png", dpi=140)
     print(f"saved {OUT}/curved_vs_linear.png", flush=True)
@@ -380,15 +613,22 @@ def main():
     summary = dict(
         layer=f"L{args.layer}", N=N, peel=audit, linear=lin,
         atlas={f"K{K}_d{d}": a for (K, d), a in atlas.items()},
-        head_to_head=compare, best=best, gamfit=gamfit_result,
-        capacity_note=("matched at coords/row d (per-row code); linear per-row cost = M scalars, "
-                       "atlas per-row cost = 1 gate + d coords. Matched-MDL comparison via "
-                       "reverse water-filling is the referee-proof framing and is still owed."),
+        head_to_head=compare,               # back-compat alias for head_to_head_coords
+        head_to_head_coords=compare, best=best,
+        head_to_head_mdl=mdl, best_mdl=mdl["best"],
+        gamfit=gamfit_result,
+        capacity_note=("reported under BOTH currencies: (1) matched coords/row d -- linear per-row "
+                       "cost = M scalars, atlas per-row cost = 1 gate + d coords; (2) matched "
+                       "description length (bits) via reverse water-filling to a derived noise-floor "
+                       "D*, comparing EV at EQUAL total bits. Neither currency is privileged."),
     )
     json.dump(summary, open(f"{OUT}/curved_vs_linear.json", "w"), indent=1)
     print("\n==== RESULT ====", flush=True)
-    print(f"best curved gain over linear at matched sparse capacity: {best['curved_gain']:+.3f} EV "
+    print(f"matched coords/row: best curved gain {best['curved_gain']:+.3f} EV "
           f"(atlas K={best['K']} d={best['d']}: {best['atlas_ev']:.3f} vs linear {best['linear_ev']:.3f})",
+          flush=True)
+    print(f"matched bits (MDL): best curved gain {mb['mdl_gain']:+.3f} EV at {mb['matched_bits']:.2f} "
+          f"bits/row (atlas K={mb['K']}: {mb['atlas_ev']:.3f} vs linear {mb['linear_ev']:.3f})",
           flush=True)
 
 
