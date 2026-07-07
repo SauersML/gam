@@ -877,6 +877,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
+            // gam#979: joint simple lower bounds, when the joint constraints are
+            // all axis-aligned lower bounds (the survival monotone-baseline-hazard
+            // / monotone-smooth case). Threaded into the stationarity certificate
+            // so ACTIVE simple-lower-bound multipliers are projected out (the
+            // box-bound analog of the linear-constraint projection), instead of
+            // their multiplier mass being mis-read as a stationarity defect and
+            // mis-refusing a genuinely-optimal constrained iterate.
+            let joint_lower_bounds: Option<Array1<f64>> = joint_constraints
+                .as_ref()
+                .and_then(|c| extract_simple_lower_bounds(c, total_p).ok().flatten())
+                .map(|b| b.lower_bounds);
             if cycle_log && cycle == 0 {
                 log::info!(
                     "[STAGE] PIRLS/inner step=cycle0 block+joint constraints elapsed={:.3}s n={} p={}",
@@ -1182,6 +1193,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options.ridge_policy,
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
+                joint_lower_bounds.as_ref(),
             )?;
             if current_kkt_norm.is_finite() {
                 min_certified_residual = min_certified_residual.min(current_kkt_norm);
@@ -3613,6 +3625,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 options.ridge_policy,
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
+                joint_lower_bounds.as_ref(),
             )?;
             prev_kkt_norm = Some(residual);
             // Record this cycle's KKT residual for the steady-geometric-descent
