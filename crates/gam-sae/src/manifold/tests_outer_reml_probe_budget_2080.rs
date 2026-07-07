@@ -659,18 +659,37 @@ fn entangled_two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f6
             }
         }
     }
+    // Tile the 2-TORUS on an independent grid: θ_a and θ_b must be STATISTICALLY
+    // INDEPENDENT (a genuine product of two circles). A dependent parameterization
+    // (θ_b = 2θ_a, the previous `2*row`) is a single 1-D Lissajous/(1,2)-knot curve
+    // with only ONE true latent factor — a K=2 fit then CORRECTLY leaves one atom
+    // redundant, which no seed can split and which is not the co-collapse we are
+    // testing. ISA separates independent subspaces, so the fixture must contain two.
+    // n1 = largest divisor of n at or below √n; (i = row mod n1, j = row / n1) is a
+    // bijection onto the n1×n2 grid, so (θ_a, θ_b) is jointly uniform ⇒ independent.
+    let mut n1 = 1usize;
+    let root = (n as f64).sqrt() as usize;
+    for d in 1..=root.max(1) {
+        if n % d == 0 {
+            n1 = d;
+        }
+    }
+    let n1 = n1.max(1);
+    let n2 = (n / n1).max(1);
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
-        let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
-        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        let i = row % n1;
+        let j = (row / n1) % n2;
+        let ta = std::f64::consts::TAU * (i as f64) / (n1 as f64);
+        let tb = std::f64::consts::TAU * (j as f64) / (n2 as f64);
         let (ca, sa) = (ta.cos(), ta.sin());
         let (cb, sb) = (tb.cos(), tb.sin());
-        for j in 0..p {
-            z[[row, j]] = ca * fa[[0, j]]
-                + sa * fa[[1, j]]
-                + cb * fb[[0, j]]
-                + sb * fb[[1, j]]
-                + sigma * deterministic_circle_noise(row, j + 7);
+        for jj in 0..p {
+            z[[row, jj]] = ca * fa[[0, jj]]
+                + sa * fa[[1, jj]]
+                + cb * fb[[0, jj]]
+                + sb * fb[[1, jj]]
+                + sigma * deterministic_circle_noise(row, jj + 7);
         }
     }
     for j in 0..p {
@@ -708,6 +727,20 @@ fn entangled_two_circle_outer_reml_separates_2080() {
     let k = 2usize;
     let harmonics = 2usize;
     let z = entangled_two_circle_wide_target(n, p, 0.03);
+    // Diagnostic: how many independent circle planes does the joint-Jacobi ISA
+    // split κ-CERTIFY on this target? If < k, the seed falls back to the PCA peel
+    // and cannot separate — distinguishing "certificate failed" from "engaged but
+    // under-separated" (the two contingencies for a co-collapse red).
+    let isa_certified = match super::isa_seed::capture_signal_span(z.view(), k) {
+        Ok(Some(parts)) => super::isa_seed::isa_extract_certified_planes(
+            z.view(),
+            &parts,
+            k,
+            &super::isa_seed::IsaSeedConfig::default(),
+        )
+        .len(),
+        _ => 0,
+    };
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, harmonics);
     let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
@@ -741,7 +774,10 @@ fn entangled_two_circle_outer_reml_separates_2080() {
     let hi = norms.iter().copied().fold(0.0_f64, f64::max);
     let lo = norms.iter().copied().fold(f64::INFINITY, f64::min);
     let ratio = lo / hi.max(1.0e-300);
-    eprintln!("[#2080 entangled] ev={ev:.4}, decoder_norms={norms:?}, ratio={ratio:.3}");
+    eprintln!(
+        "[#2080 entangled] isa_certified_planes={isa_certified}/{k}, ev={ev:.4}, \
+         decoder_norms={norms:?}, ratio={ratio:.3}"
+    );
     assert!(
         ev.is_finite() && ev > 0.20,
         "entangled K=2 fit must recover a materially positive EV (got {ev:.4})"
