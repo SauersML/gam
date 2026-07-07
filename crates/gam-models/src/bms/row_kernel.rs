@@ -837,7 +837,11 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
     const OVERSUBSCRIBE: usize = 4;
     const MIN_CHUNK_ROWS: usize = 2_048;
     const MAX_CHUNK_ROWS: usize = 16_384;
-    let workers = rayon::current_num_threads().max(1);
+    // Reproducibility contract (#1045): size the Gram chunk boundaries to the
+    // process-stable machine parallelism, not the live scoped-pool worker count,
+    // so the per-chunk `Xᵀdiag(w)X` partials — and the tree that reduces them —
+    // do not regroup when the executing rayon pool is narrowed/widened.
+    let workers = crate::marginal_slope_shared::reproducible_chunk_parallelism();
     let target_chunks = (workers * OVERSUBSCRIBE).max(1);
     let by_target = n.div_ceil(target_chunks);
     by_target.clamp(MIN_CHUNK_ROWS, MAX_CHUNK_ROWS).max(1)
