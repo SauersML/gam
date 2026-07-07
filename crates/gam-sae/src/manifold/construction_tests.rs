@@ -567,26 +567,6 @@ mod exact_stationarity_solve_1418_tests {
              Woodbury — otherwise the bug is unreachable on this path"
         );
 
-        // [#1798 DIAG — TEMP] Separate ‖d‖ (coupling D=w·s'_k) from ‖U‖ (concrete
-        // logit JVP z'_ik) to pin whether ‖UDUᵀv‖≈0 is (a) d zeroed vs (c) U≈0
-        // (saturated assignments ⇒ z'≈0). w = lambda_sparse = exp(log_lambda_sparse).
-        {
-            let w = cache.cross_row_woodbury.as_ref().unwrap();
-            let r = w.d.len();
-            let tt = cache.delta_t_len();
-            let d_l2: f64 = w.d.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            let u_fro: f64 = w.u.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            eprintln!(
-                "[#1798 DIAG] r={r} total_t={tt} ‖d‖₂={d_l2:.6e} ‖U‖_F={u_fro:.6e} lambda_sparse={:.6e}",
-                rho.lambda_sparse()
-            );
-            for k in 0..r {
-                let uk: f64 = (0..tt).map(|g| w.u[[g, k]] * w.u[[g, k]]).sum::<f64>().sqrt();
-                eprintln!("[#1798 DIAG]   atom {k}: d_k={:.6e}  ‖u_k‖₂={uk:.6e}  s'_k(=d_k/w)={:.6e}",
-                    w.d[k], w.d[k] / rho.lambda_sparse().max(1e-300));
-            }
-        }
-
         let total_t = cache.delta_t_len();
         let kdim = cache.k;
         let m = total_t + kdim;
