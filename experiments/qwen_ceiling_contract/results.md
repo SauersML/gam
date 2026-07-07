@@ -59,3 +59,32 @@ is a planned follow-up to confirm the two verdicts agree on L18.
 sbatch $R/scratch/ceiling_run.sbatch    # a100-4, gpu:1
 # runs: qwen_l18_ceiling  resid_L18.npy  20000 1 12 8  --raw-ok  --out-dir $R/scratch/ceiling_out
 ```
+
+## Cross-check: pos0 causal peel -> PCA8 (non-raw path) — VERDICTS AGREE
+
+Follow-up requested to confirm the `--raw-ok` variance self-peel and the pos0
+null-gated causal peel give the same verdict on L18. Produced a pos0-peeled ->
+top-8-PCA input on the SAME strided 20000 rows (stride 15, matching the ceiling
+subsampler) and fed it through the **non-raw p<=8 post_peel path**
+(job 12672490, rc=0, A100).
+
+pos0 peel audit on those rows: **cos(sink_dir, PC1) = 0.999854**, pos0_absorbed =
+0.8922, frac_pos0 = 0.00635 — i.e. the pos0 indicator is (numerically) PC1.
+
+```json
+{"verdict":"INFORMATION_CEILING","EV_curved":0.9679661797473188,"EV_lin_top_m_envelope":0.9945583385889945,"chart_efficiency_eta":0.9732623438868326,"gradient_certificate":"clean","peel_status":"post_peel"}
+```
+
+| peel method                    | dim | EV_curved | EV_lin_top_M | eta      | grad cert | verdict             |
+|--------------------------------|-----|-----------|--------------|----------|-----------|---------------------|
+| variance self-peel (`--raw-ok`) | 8   | 0.81724   | 0.87716      | 0.93169  | clean     | INFORMATION_CEILING |
+| pos0 causal peel -> PCA8         | 8   | 0.96797   | 0.99456      | 0.97326  | clean     | INFORMATION_CEILING |
+
+**Both agree on the verdict (INFORMATION_CEILING) and on a clean gradient
+certificate.** eta is even closer to 1 under the pos0 peel (0.973 vs 0.932),
+strengthening the information-ceiling reading. The absolute EVs differ because
+the two peels span slightly different 8-dim subspaces (top-8 PCs of the
+pos0-residual vs thin-SVD scores 2..9 of the raw), but the conclusion is
+identical. This closes the L18 half of task #9: threading pos0 into the example
+natively is still wanted for L6/L30/other models where sink != PC1, but on L18
+the shortcut is verified sound. (post_peel=true in numbers.json for this run.)
