@@ -284,25 +284,22 @@ def _canonical_n_harmonics(
 
 
 def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
-    """e-BH confirmed set, mirroring `inference::structure_evidence::e_benjamini_hochberg`.
+    """e-BH confirmed-claim set, via the Rust source of truth.
 
-    Sort claims by descending log e-value; confirm the prefix up to the largest
-    rank `k` whose k-th-largest log e-value clears `ln(m) - ln(alpha) - ln(k)`
-    (i.e. `e_(k) >= m / (alpha * k)`). FDR <= alpha over the confirmed set under
-    arbitrary dependence; valid at any stopping time.
+    Thin wrapper over ``inference::structure_evidence::e_benjamini_hochberg``
+    (FFI ``e_bh_dictionary_certificate``): the whole selection procedure — sort by
+    descending log e-value, confirm the prefix up to the largest rank ``k`` whose
+    k-th-largest log e-value clears ``ln(m) − ln(alpha) − ln(k)`` — runs once in
+    the core, never mirrored in Python. Returns the indices of the confirmed
+    claims (FDR ≤ ``alpha`` under arbitrary dependence, valid at any stopping
+    time). Guards the degenerate inputs the FFI does not accept (``m == 0`` or a
+    non-positive ``alpha``) as the empty set, matching the previous contract.
     """
-    import math
-
-    m = len(log_e_values)
-    if m == 0 or not (alpha > 0.0):
+    if len(log_e_values) == 0 or not (alpha > 0.0):
         return []
-    order = sorted(range(m), key=lambda i: log_e_values[i], reverse=True)
-    k_star = 0
-    for rank0, idx in enumerate(order):
-        k = rank0 + 1
-        if log_e_values[idx] >= math.log(m) - math.log(alpha) - math.log(k):
-            k_star = rank0 + 1
-    return order[:k_star]
+    return [int(i) for i in rust_module().e_bh_dictionary_certificate(
+        [float(v) for v in log_e_values], float(alpha)
+    )]
 
 
 def _structure_claim_label(kind: Any) -> str:
@@ -436,33 +433,28 @@ _ALPHA_UNSET: Any = object()
 def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
     """K-aware default IBP concentration ``α`` (#1784).
 
-    Mirror of the Rust source of truth
-    ``gam_sae::manifold::assignment::default_ibp_concentration_for_k_atoms``.
-    The ordered stick-breaking prior mean ``π_k = (α/(α+1))^{k+1}`` decays
-    GEOMETRICALLY in the atom index, so the historical fixed default ``α = 1``
-    (the ``(0.5)^{k+1}`` schedule) collapses to a near-hard mask past atom ~3: a
-    K-atom dictionary can then only place mass on its first handful of atoms,
-    which is why the manifold SAE underfit a linear dictionary of equal K on real
-    activations and why its late atoms carried zero mass — leaving the per-row
-    joint Hessian rank-deficient (the K = 128 ``RemlConvergenceError``). Choosing
-    ``α`` so the LAST atom retains prior mass ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}``
-    makes the prior SPAN the whole dictionary while staying a monotone, honest
-    ordered stick-breaking prior (no atom structurally masked). Solving
-    ``(α/(α+1))^K = e^{-1}`` gives ``α = 1/(exp(1/K) − 1) ≈ K − 1/2``; floored at
-    ``1.0`` so ``K = 1`` keeps the historical ``α = 1``.
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_ibp_concentration_for_k_atoms`` (FFI
+    ``sae_default_ibp_concentration_for_k_atoms``): the formula
+    ``α = max(1, 1/(exp(1/K) − 1))`` is computed once in the core, never mirrored
+    in Python. Choosing ``α`` so the last atom retains prior mass
+    ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered stick-breaking prior SPAN
+    the whole dictionary (no atom structurally masked); floored at ``1.0`` so
+    ``K = 1`` keeps the historical ``α = 1``.
     """
-    k = float(max(int(k_atoms), 1))
-    return max(1.0, 1.0 / (math.expm1(1.0 / k)))
+    return float(rust_module().sae_default_ibp_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
 
 
 def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
-    n = int(n_obs)
-    k = int(k_atoms)
-    if n <= 0 or k <= 1:
-        return None
-    if n >= k * k:
-        return None
-    return max(1, min(k - 1, math.ceil(n / k)))
+    """Default large-K active cap from the data-per-atom ratio.
+
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_top_k_for_large_dictionary`` (FFI
+    ``sae_default_top_k_for_large_dictionary``): ``None`` when the dense softmax
+    path is admitted, else the per-row cap ``clamp(ceil(N/K), 1, K−1)``.
+    """
+    cap = rust_module().sae_default_top_k_for_large_dictionary(int(n_obs), int(k_atoms))
+    return None if cap is None else int(cap)
 
 
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
@@ -795,6 +787,21 @@ class ManifoldSAE:
     # Surfaced via :meth:`structure_certificate`. ``None`` only for payloads
     # predating the certificate.
     structure_certificate_json: str | None = None
+    # App A — the Certified Feature Dossier (JSON string). One certified entry per
+    # atom re-projecting the diagnostics above (shape band, two-score lens,
+    # persistent-homology topology + standing-null calibration + contested flag,
+    # coordinate fidelity, Riesz functionals + split-LRT e-value, tangent-condition
+    # trust) plus the per-atom behavioral steering dose (nats/Δt) and a designed
+    # contested probe, under a model-level residual-gauge header. Surfaced via
+    # :meth:`feature_dossier`. ``None`` only for payloads predating the dossier.
+    feature_dossier_json: str | None = None
+    # M6 — the Convergence Dossier (JSON string). One grep-able aggregate of the
+    # fit's convergence provenance: outer-probe telemetry, warm-start tally,
+    # curvature-walk report, the FD optimality certificate, the collapse ledger,
+    # and the post-fit guard verdicts, with a single ``converged_clean`` headline.
+    # Surfaced via :meth:`convergence_dossier`. ``None`` only for payloads
+    # predating the dossier.
+    convergence_dossier_json: str | None = None
     # Co-trained amortized-encoder diagnostics (#1154), emitted by the Rust
     # fit payload when the Design-A REML + encoder-consistency fold is active.
     # Keys: recon_consistency, uncertified_fraction, n_uncertified, n_encodes.
@@ -1161,6 +1168,16 @@ class ManifoldSAE:
                 if payload.get("structure_certificate") is None
                 else str(payload["structure_certificate"])
             ),
+            feature_dossier_json=(
+                None
+                if payload.get("feature_dossier") is None
+                else str(payload["feature_dossier"])
+            ),
+            convergence_dossier_json=(
+                None
+                if payload.get("convergence_dossier") is None
+                else str(payload["convergence_dossier"])
+            ),
             cotrain=cotrain,
             # #1204: the per-atom curved-vs-linear hybrid-split frontier the FFI
             # emits under ``hybrid_split``. Read it through verbatim so callers can
@@ -1171,6 +1188,72 @@ class ManifoldSAE:
                 if payload.get("hybrid_split") is None
                 else dict(payload["hybrid_split"])
             ),
+        )
+
+    def feature_dossier(self) -> dict[str, Any]:
+        """App A — the Certified Feature Dossier as a parsed dict.
+
+        One certified entry per atom (``atoms[k]``) re-projecting the post-fit
+        diagnostics — shape band, two-score lens, persistent-homology topology +
+        standing-null calibration + ``contested`` flag, coordinate fidelity, Riesz
+        functionals + split-LRT non-constancy e-value, tangent-condition trust —
+        plus the per-atom behavioral steering dose (``steering.predicted_nats``)
+        and, for any atom whose measured topology disagrees with its raced kind, a
+        designed ``contested_probe``. The header carries the model-level
+        residual-gauge group and (when the fit supplied the criterion nats) the
+        description-length decomposition. A pure re-projection: it recomputes
+        nothing, it re-lays-out reports that also flow to Python field-by-field.
+
+        Raises
+        ------
+        ValueError
+            If the payload predates App A (no dossier emitted).
+        """
+        if self.feature_dossier_json is None:
+            raise ValueError(
+                "this fitted model carries no feature dossier (payload predates "
+                "App A); refit to obtain one"
+            )
+        return json.loads(self.feature_dossier_json)
+
+    def convergence_dossier(self) -> dict[str, Any]:
+        """M6 — the Convergence Dossier as a parsed dict.
+
+        One grep-able aggregate of the fit's convergence provenance: outer-probe
+        telemetry, warm-start tally, curvature-walk report, the FD optimality
+        certificate, the collapse ledger, and the post-fit guard verdicts, with a
+        single ``converged_clean`` headline (true iff the optimality certificate
+        passed, the outer state was returned verbatim with no guard rescue, and
+        there is no residual mutating-probe or terminal-collapse regression).
+
+        Raises
+        ------
+        ValueError
+            If the payload predates M6 (no dossier emitted).
+        """
+        if self.convergence_dossier_json is None:
+            raise ValueError(
+                "this fitted model carries no convergence dossier (payload "
+                "predates M6); refit to obtain one"
+            )
+        return json.loads(self.convergence_dossier_json)
+
+    def dossier_html(self, *, title: str = "SAE dossier") -> str:
+        """Render both dossiers to one self-contained HTML document.
+
+        Delegates to the ``gam-report`` renderer through the Rust FFI, so the
+        HTML surface is the same one the report crate produces. Requires the
+        feature dossier; the convergence dossier is folded in when present.
+        """
+        if self.feature_dossier_json is None:
+            raise ValueError(
+                "this fitted model carries no feature dossier (payload predates "
+                "App A); refit to obtain one"
+            )
+        return rust_module.render_sae_dossier_html(
+            self.feature_dossier_json,
+            self.convergence_dossier_json,
+            title,
         )
 
     def structure_certificate(self, *, alpha: float | None = None) -> dict[str, Any]:

@@ -322,20 +322,14 @@ fn sae_manifold_fit_minimal<'py>(
             "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
         ));
     }
-    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, z_view.ncols(), k_atoms)
+    // Front-door enforcement through the single shared seam (#985 / E1): the dense
+    // manifold engine is the small-K CERTIFICATION lane only. `admit_dense_certification`
+    // is the ONE refuse-on-sparse implementation both dense entry points route through
+    // (`sae_manifold_fit` and this minimal path), so a K > P shape cannot reach the
+    // dense N×K `SaeAssignment` build from either door — and the refusal wording,
+    // pointing the caller at the sparse-code lane, stays defined once in `front_door`.
+    gam::terms::sae::front_door::admit_dense_certification(n_obs, z_view.ncols(), k_atoms)
         .map_err(py_value_error)?;
-    if admission.uses_sparse_codes() {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_minimal: dense certification lane refused for N={}, P={}, K={} \
-             because N*K={} exceeds N*P={}; call sae_manifold_fit so the public front door \
-             routes to the sparse-code lane",
-            admission.n_obs,
-            admission.output_dim,
-            admission.n_atoms,
-            admission.dense_assignment_cells,
-            admission.response_cells
-        )));
-    }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
             "sae_manifold_fit_minimal: z contains non-finite values".into(),
@@ -3122,4 +3116,34 @@ mod sae_linear_atom_tests {
             }
         }
     }
+}
+
+/// Render the SAE dossiers to a single self-contained HTML document.
+///
+/// `feature_json` is the App A Certified Feature Dossier JSON (the `feature_dossier`
+/// field of the fit result); `convergence_json` is the optional M6 Convergence
+/// Dossier JSON (the `convergence_dossier` field). Both are the exact strings the
+/// fit surfaces to Python. Delegates to `gam::report::dossier::render_dossier_html`,
+/// so the HTML surface stays in the report crate and Python is one FFI call.
+#[pyfunction]
+#[pyo3(signature = (feature_json, convergence_json=None, title="SAE dossier"))]
+fn render_sae_dossier_html(
+    feature_json: &str,
+    convergence_json: Option<&str>,
+    title: &str,
+) -> PyResult<String> {
+    let feature: serde_json::Value = serde_json::from_str(feature_json).map_err(|e| {
+        py_value_error(format!("render_sae_dossier_html: feature_json parse: {e}"))
+    })?;
+    let convergence: Option<serde_json::Value> = match convergence_json {
+        Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+            py_value_error(format!("render_sae_dossier_html: convergence_json parse: {e}"))
+        })?),
+        None => None,
+    };
+    Ok(gam::report::dossier::render_dossier_html(
+        &feature,
+        convergence.as_ref(),
+        title,
+    ))
 }
