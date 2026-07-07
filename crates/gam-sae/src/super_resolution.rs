@@ -256,19 +256,25 @@ pub fn recover_spikes(
         .eigenvalues()
         .map_err(|e| format!("matrix-pencil eigenproblem failed: {e:?}"))?;
 
-    // Unit-modulus phasors and circle positions t = arg(z)/(2π) mod 1. The pencil
-    // is built from `svd.V()`, whose columns span the conjugate of the Hankel row
-    // space (faer returns `V` for the decomposition `A = U S Vᴴ`), so the pencil
-    // eigenvalues come out as the conjugate phasors `z̄ = 1/z` — arg-negated, i.e.
-    // reflected positions `1 − t`. Conjugating here recovers the generating phasor
-    // `z = e^{2πi t}` for both the position read AND the downstream Vandermonde
-    // amplitude solve (which otherwise fits the wrong frequencies and leaves a
-    // large residual). See `exact_recovery_two_spikes_no_noise`.
+    // Unit-modulus phasors and circle positions t = arg(z)/(2π) mod 1. The
+    // shift-invariance pencil `Φ = V1⁺V2` built from `svd.V()` has eigenvalues
+    // equal to the GENERATING phasors `z_j = e^{2πi t_j}` directly: faer's `V`
+    // columns span the Hankel row space `span{(z_j^k)_k}` itself (the shift
+    // relation `V2 = V1·diag(z_j)` reads off `z_j`, not its conjugate). Only the
+    // magnitude is normalised to the unit circle; NO conjugation is applied.
+    //
+    // A spurious `z̄ = conj(z)` here arg-NEGATES every phasor and reports the
+    // reflected circle position `1 − t`, and — because the downstream Vandermonde
+    // amplitude solve then fits the reflected frequencies — inflates the residual
+    // so much that the measure readout rejects the multi-spike result and falls
+    // back to the single-coordinate path. That reflection was the
+    // `exact_recovery_two_spikes_no_noise` failure: planted {0.20, 0.45} came back
+    // as {0.55, 0.80}, a position error of exactly the reflection distance 0.35.
     let phasors: Vec<c64> = roots
         .iter()
         .map(|z| {
             let norm = z.norm();
-            if norm > 0.0 { z.conj() / norm } else { c64::new(1.0, 0.0) }
+            if norm > 0.0 { z / norm } else { c64::new(1.0, 0.0) }
         })
         .collect();
     let positions: Vec<f64> = phasors
