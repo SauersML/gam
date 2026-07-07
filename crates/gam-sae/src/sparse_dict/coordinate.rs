@@ -1111,13 +1111,33 @@ mod tests {
             single.coordinate, single.amplitude, single_residual_norm
         );
         let coeffs = coeffs_from_code(&z);
-        if let Ok(rec) = crate::super_resolution::recover_spikes(&coeffs, 0.0) {
-            eprintln!("DBG singular_values={:?}", rec.hankel_singular_values);
-        }
-        for &sg in &[0.0f64, 1e-9, 1e-6, 1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.3, 0.5, 1.0] {
-            match crate::super_resolution::recover_spikes(&coeffs, sg) {
+        // Inline replica of super_resolution::coeffs_from_spikes for comparison.
+        let inline = |spikes: &[(f64, f64)]| -> Vec<(f64, f64)> {
+            (1..=h_count)
+                .map(|h| {
+                    let mut c = 0.0;
+                    let mut s = 0.0;
+                    for &(t, a) in spikes {
+                        let phase = TAU * (h as f64) * t;
+                        c += a * phase.cos();
+                        s += a * phase.sin();
+                    }
+                    (c, s)
+                })
+                .collect()
+        };
+        let inline_055 = inline(&[(0.20, 1.0), (0.55, 0.7)]);
+        let inline_045 = inline(&[(0.20, 1.0), (0.45, 0.7)]);
+        eprintln!("DBG coeffs_from_code={:?}", coeffs);
+        eprintln!("DBG inline_055     ={inline_055:?}");
+        for (label, cf) in [
+            ("code", &coeffs),
+            ("inline055", &inline_055),
+            ("inline045", &inline_045),
+        ] {
+            match crate::super_resolution::recover_spikes(cf, 0.0) {
                 Ok(rec) => eprintln!(
-                    "DBG sigma={sg:.0e}: order={} residual={:.4} spikes={:?}",
+                    "DBG recover[{label}]: order={} residual={:.4} spikes={:?}",
                     rec.model_order,
                     rec.residual,
                     rec.spikes
@@ -1125,7 +1145,7 @@ mod tests {
                         .map(|s| (format!("{:.4}", s.t), format!("{:.4}", s.amplitude)))
                         .collect::<Vec<_>>()
                 ),
-                Err(e) => eprintln!("DBG sigma={sg:.0e} ERR: {e}"),
+                Err(e) => eprintln!("DBG recover[{label}] ERR: {e}"),
             }
         }
     }
