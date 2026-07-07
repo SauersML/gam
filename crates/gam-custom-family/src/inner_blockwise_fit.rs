@@ -1509,7 +1509,23 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .map_err(|e| e.to_string())
                     };
                     match solve_result {
-                        Ok((beta_new, active_set)) => (beta_new, Some(active_set), 0usize),
+                        Ok((beta_new, active_set)) => {
+                            // gam#979 constrained-QP probe (temporary): per-cycle
+                            // active-set size + ‖β‖∞ so the failing survival pytest's
+                            // captured WARN output distinguishes (a) a THRASHING active
+                            // set (rows change every cycle → the QP never settles) from
+                            // (c) a STABLE set with a blowing-up free direction
+                            // (near-separation: ‖β‖∞ grows unbounded). WARN reaches the
+                            // failing-test capture; the cond/nullity/diagnosis come from
+                            // the existing `format_structured_log` at the refused exit.
+                            log::warn!(
+                                "[gam#979 constrained-QP] cycle={} active_set_rows={} beta_inf={:.4e}",
+                                cycle,
+                                active_set.len(),
+                                beta_new.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+                            );
+                            (beta_new, Some(active_set), 0usize)
+                        }
                         Err(_) => break,
                     }
                 } else {
