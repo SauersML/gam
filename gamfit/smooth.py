@@ -98,10 +98,10 @@ class Smooth(_BasisDescriptor):
         layer). Mathematically equivalent to ``by · s(x)`` in the additive
         model. When the underlying basis is a column-block of the joint
         design, ``by`` multiplies every column in the block per row.
-    double_penalty : if True, add a ridge-shrinkage penalty on the null
-        space of the main penalty (mgcv ``bs="..."`` ``select=TRUE`` style).
-        Useful when the smooth might be entirely redundant and you want
-        REML to shrink it out.
+    double_penalty : optional bool. ``None`` (the default) defers to the
+        Rust/formula default for the smooth kind, keeping descriptor lowering
+        bit-identical to the formula DSL. Pass ``True`` or ``False`` to
+        explicitly enable or disable the null-space shrinkage penalty.
     shape_constraint : optional shape constraint on the fitted function.
         One of ``None`` / ``"none"`` (unconstrained, the default),
         ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
@@ -126,7 +126,7 @@ class Smooth(_BasisDescriptor):
 
     name: str | None = None
     by: Any | None = None
-    double_penalty: bool = False
+    double_penalty: bool | None = None
     shape_constraint: ShapeConstraintLiteral | None = None
     _gamfit_topology_dim: int | None = field(default=None, init=False, repr=False)
     _gamfit_tensor_k: tuple[int, int] | None = field(default=None, init=False, repr=False)
@@ -167,13 +167,10 @@ class Smooth(_BasisDescriptor):
             out["name"] = str(self.name)
         if self.shape_constraint is not None:
             out["shape_constraint"] = str(self.shape_constraint)
-        # Emit ``double_penalty`` for BOTH True and False so the flag is
-        # actually toggle-able through the ``smooths={}`` descriptor bridge
-        # (issue #1565). A plain-``bool`` field (base, BSpline, …) is never
-        # None, so it always emits its concrete value; subclasses that
-        # redefine the field as ``bool | None`` (e.g. MeasureJet) keep their
-        # tri-state semantics — ``None`` means "defer to engine" and emits
-        # no key.
+        # Emit ``double_penalty`` only when the user explicitly pins it.
+        # ``None`` means "defer to the Rust/formula default", which keeps the
+        # descriptor bridge bit-identical to the formula DSL while preserving
+        # issue #1565's ability to transmit an explicit ``False``.
         if self.double_penalty is not None:
             out["double_penalty"] = bool(self.double_penalty)
         if self.by is not None:
@@ -526,9 +523,6 @@ class MeasureJet(Smooth):
     scales: int | None = None
     length_scale: float | None = None
     learn_length_scale: bool | None = None
-    # Tri-state override of the base ``bool = False`` field: the engine
-    # default for measure-jet is double-penalty ON, so ``None`` must mean
-    # "defer to the engine" and an explicit ``False`` must be emitted.
     double_penalty: bool | None = None
 
     def to_rust_descriptor(self) -> dict[str, Any]:
