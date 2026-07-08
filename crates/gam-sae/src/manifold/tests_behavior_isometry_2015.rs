@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use crate::manifold::{
     AssignmentMode, BehaviorBlock, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment,
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, atom_behavior_isometry,
-    reconstruction_explained_variance,
+    SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    atom_behavior_isometry, reconstruction_explained_variance,
 };
 
 /// Numerically stable softmax — the planted behavior law.
