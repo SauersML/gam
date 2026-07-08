@@ -132,10 +132,13 @@ fn matched_dl_planted_circle_gives_closed_form_bit_count() {
     assert!((dl.dl_per_ev - expected_total / ev).abs() < 1e-6);
 
     // Matched-DL delta vs the flat / line atom (1 column, 1 amplitude per firing at
-    // the same SE rule): both arms transmit ONE scalar per firing so the coding
-    // bits cancel, and the curved chart pays 2H extra columns of parameter charge —
-    // at large p the flat atom is the shorter code here (delta < 0 — the honest
-    // "curvature doesn't pay at these firings" verdict).
+    // the SAME SE): both arms transmit ONE scalar per firing at the same SE so the
+    // coding bits cancel, and the curved chart pays 2H extra columns of parameter
+    // charge — at large p the flat atom is the shorter code here (delta < 0 — the
+    // honest "curvature doesn't pay at these firings" verdict). This is the
+    // primitive's equal-SE behavior; the real per-arm phase-vs-amplitude SE
+    // distinction (the 2π factor) is pinned in
+    // `matched_dl_per_arm_phase_vs_amplitude_rate_removes_pro_chart_bias`.
     let flat = matched_dl(1, 1, p, l_param, &ses, ev);
     let delta = matched_dl_delta(&flat, &dl);
     let expected_delta = flat.total_dl_bits - dl.total_dl_bits;
@@ -167,6 +170,80 @@ fn matched_dl_planted_circle_gives_closed_form_bit_count() {
         economy_delta > 0.0,
         "at 250 firings the chart's per-firing economy beats its extra columns"
     );
+}
+
+#[test]
+fn matched_dl_per_arm_phase_vs_amplitude_rate_removes_pro_chart_bias() {
+    use std::f64::consts::TAU;
+    // The S5 fix: a circle chart codes ONE phase per firing at the phase SE
+    // σ̂/(2π‖z‖); a flat b-block codes b AMPLITUDES per firing at the amplitude SE
+    // σ̂/‖z‖ = 2π·SE_phase. Pricing the flat amplitudes at the finer PHASE SE (the
+    // old shared-list arithmetic) overcharged the flat arm by log₂(2π) bits per
+    // coded scalar — a pro-chart bias. Pin the corrected closed form and the SIGN
+    // of the correction relative to the biased delta.
+    let p = 64i64;
+    let l_param = 3.0;
+    let b = 4i64; // flat block coordinates per firing
+    let f = 200usize; // firings
+    let ev = 0.5;
+    let sigma = 0.3; // radial scatter σ̂
+    let radius = 2.0; // firing radius ‖z‖ (constant ⇒ a clean closed form)
+    let se_phase = sigma / (TAU * radius); // σ̂/(2π‖z‖)
+    let se_amp = sigma / radius; // σ̂/‖z‖ = 2π·SE_phase
+    assert!((se_amp - TAU * se_phase).abs() < 1e-12);
+
+    let phase_ses = vec![se_phase; f];
+    let amp_ses = vec![se_amp; f];
+
+    // Corrected arms: flat codes its b amplitudes at SE_amp, chart its 1 phase at
+    // SE_phase — each at its OWN resolution.
+    let flat = matched_dl(b, b, p, l_param, &amp_ses, ev);
+    let chart = matched_dl(1, 1, p, l_param, &phase_ses, ev);
+
+    let phase_bits = se_resolution_bits(se_phase);
+    let amp_bits = se_resolution_bits(se_amp);
+    // Closed form: coding = coords_per_firing · f · se_resolution_bits(SE).
+    assert!(
+        (flat.coding_bits - b as f64 * f as f64 * amp_bits).abs() < 1e-6,
+        "flat codes b amplitudes at the amplitude SE: {}",
+        flat.coding_bits
+    );
+    assert!(
+        (chart.coding_bits - f as f64 * phase_bits).abs() < 1e-6,
+        "chart codes 1 phase at the phase SE: {}",
+        chart.coding_bits
+    );
+    // The per-coordinate phase↔amplitude gap is EXACTLY log₂(2π): the phase, read
+    // over the circumference 2π‖z‖, resolves 2π finer than an amplitude over ‖z‖.
+    assert!(
+        (phase_bits - amp_bits - TAU.log2()).abs() < 1e-9,
+        "phase SE is 2π finer than amplitude SE ⇒ log₂(2π) more bits per coordinate"
+    );
+
+    let corrected_delta = matched_dl_delta(&flat, &chart); // flat − chart, bits
+
+    // The OLD biased arithmetic priced the flat amplitudes at the PHASE SE too.
+    let flat_biased = matched_dl(b, b, p, l_param, &phase_ses, ev);
+    let biased_delta = matched_dl_delta(&flat_biased, &chart);
+
+    // Sign of the correction: matched_dl_delta = flat − chart (positive ⇒ chart is
+    // the shorter code). Overcharging the flat amplitudes inflated flat.total, which
+    // inflated flat − chart — i.e. OVERSTATED the chart's advantage. Coding each
+    // amplitude at its own (coarser) SE removes exactly b·f·log₂(2π) bits from the
+    // flat arm, so the corrected delta is LOWER by that bias.
+    let removed_bias = b as f64 * f as f64 * TAU.log2();
+    assert!(
+        (corrected_delta - (biased_delta - removed_bias)).abs() < 1e-6,
+        "corrected delta must drop by the removed bias: {corrected_delta} vs {}",
+        biased_delta - removed_bias
+    );
+    assert!(
+        corrected_delta < biased_delta,
+        "the correction removes a PRO-CHART bias, so flat − chart must DROP: {corrected_delta} !< {biased_delta}"
+    );
+    // Parameter-column ledger is untouched by the coding-rate correction.
+    assert!((flat.param_bits - b as f64 * p as f64 * l_param).abs() < 1e-9);
+    assert!((chart.param_bits - 1.0 * p as f64 * l_param).abs() < 1e-9);
 }
 
 #[test]

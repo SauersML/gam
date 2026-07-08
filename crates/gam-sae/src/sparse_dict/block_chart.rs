@@ -55,15 +55,26 @@ impl Default for BlockChartComposeConfig {
 pub struct ChartEvidence {
     pub n_rows: usize,
     pub n_effective: f64,
+    /// Total held-out SSE of the linear (rank-1 PCA) comparator (squared-coord).
     pub linear_loss: f64,
+    /// Total held-out SSE of the curved (radial chart) predictor (squared-coord).
     pub chart_loss: f64,
+    /// Profiled-Gaussian held-out deviance gain in NATS,
+    /// `(n_eff/2)·ln(SSE_lin/SSE_chart)` — scale-invariant, same currency as the
+    /// complexity charge (the S4 fix; formerly the scale-dependent SSE difference).
     pub deviance_gain: f64,
+    /// Mean per-row profiled deviance contribution in NATS (the half-log-ratio
+    /// deviance); `ci_low/ci_high` are its ±1.96·se interval, also in nats.
     pub mean_delta: f64,
     pub se: f64,
     pub ci_low: f64,
     pub ci_high: f64,
+    /// Complexity charge `½·d_eff·ln(n_eff)` in NATS.
     pub charge: f64,
+    /// `deviance_gain − charge` in NATS — scale-invariant.
     pub margin: f64,
+    /// `margin.max(0)` in NATS: an `exp(margin)` BIC-style e-value's log, needing
+    /// no per-unit rescale (the S4 fix; formerly `margin / mean_SSE`).
     pub log_e_value: f64,
     pub accepted_pre_ebh: bool,
     pub accepted: bool,
@@ -476,16 +487,22 @@ pub fn block_sparse_dictionary_seed_manifest(
 /// Matched description length (bits) of the flat/linear block vs the curved circle
 /// chart for one block, from its per-firing coordinates.
 ///
-/// Per firing, the radial scatter noise `σ̂` (unbiased SD of the firing radii `‖z‖`)
-/// and radius give the coordinate SE `σ̂/(2π‖z‖)`
-/// ([`super::coordinate::phase_coordinate_se`]); each transmitted scalar is coded
-/// at the uniform-quantization rule
-/// [`crate::description_length::se_resolution_bits`] — the SAME per-scalar rate
-/// on both arms (matched distortion). The arms differ in BOTH ledgers: per firing
-/// the flat block transmits `block_size` coefficients where the circle chart
-/// transmits one phase coordinate (the code-economy axis), and per dictionary the
-/// column charge is `block_size` vs `n_basis_chart` columns of `p` ambient
-/// scalars at the distortion-matched per-scalar precision.
+/// Per firing, the radial-scatter noise `σ̂` (unbiased SD of the firing radii `‖z‖`)
+/// sets each coordinate's standard error, but the two arms transmit DIFFERENT kinds
+/// of coordinate and are coded at their OWN resolution (the S5 fix). The circle
+/// chart transmits one PHASE `t = θ/(2π)`, whose arc position ranges over the
+/// circumference `2π‖z‖`, so `SE_phase = σ̂/(2π‖z‖)`
+/// ([`super::coordinate::phase_coordinate_se`]). The flat block transmits
+/// `block_size` AMPLITUDE coefficients, each ranging over the radius `‖z‖`, so
+/// `SE_amp = σ̂/‖z‖ = 2π·SE_phase` — a factor `2π` LARGER, hence `log₂(2π)` bits
+/// CHEAPER per coordinate. Pricing the flat block's amplitudes at the finer phase
+/// rate (as a shared SE did) was an ≈ `block_size·log₂(2π)`-bit-per-firing
+/// pro-chart bias; each scalar is now coded at
+/// [`crate::description_length::se_resolution_bits`] of its OWN SE. The arms differ
+/// in BOTH ledgers: per firing the flat block transmits `block_size` amplitudes
+/// where the chart transmits one phase (the code-economy axis), and per dictionary
+/// the column charge is `block_size` vs `n_basis_chart` columns of `p` ambient
+/// scalars at each arm's own distortion-matched per-scalar precision.
 fn matched_dl_for_block(
     firing_coords: &Array2<f32>,
     config: &BlockSeedManifestConfig,
@@ -509,37 +526,50 @@ fn matched_dl_for_block(
     } else {
         0.0
     };
-    let ses: Vec<f64> = norms
+    // PER-ARM per-scalar resolution. Both arms derive from the SAME σ̂ and radii,
+    // but transmit different coordinates: the chart a phase over the circumference
+    // `2π‖z‖` (SE_phase = σ̂/(2π‖z‖)), the flat block amplitudes over the radius
+    // `‖z‖` (SE_amp = σ̂/‖z‖ = 2π·SE_phase). se_resolution_bits floors a zero-norm /
+    // unidentified firing to 0 bits, so a `+∞` amplitude SE needs no clamp.
+    let phase_ses: Vec<f64> = norms
         .iter()
         .map(|&nz| super::coordinate::phase_coordinate_se(sigma_hat, nz))
         .collect();
-    // Distortion-matched per-scalar precision: the mean per-firing coding rate (the
-    // rate a decoder weight is quantised to, matching a coded coordinate — the
-    // `description_length::score` convention). Zero firings ⇒ no coding, zero precision.
-    let l_param_bits = if ses.is_empty() {
-        0.0
-    } else {
-        ses.iter().map(|&se| se_resolution_bits(se)).sum::<f64>() / ses.len() as f64
+    let amp_ses: Vec<f64> = norms
+        .iter()
+        .map(|&nz| if nz > 0.0 { sigma_hat / nz } else { f64::INFINITY })
+        .collect();
+    // Distortion-matched per-scalar decoder precision, PER ARM: the mean per-firing
+    // coding rate of THAT arm's coordinate (the `description_length::score`
+    // convention — a decoder weight quantised to match its coded coordinate). The
+    // flat arm's columns store amplitude directions (amplitude rate); the chart's
+    // store harmonic rows read out by the phase (phase rate). Empty ⇒ zero precision.
+    let mean_rate = |ses: &[f64]| -> f64 {
+        if ses.is_empty() {
+            0.0
+        } else {
+            ses.iter().map(|&se| se_resolution_bits(se)).sum::<f64>() / ses.len() as f64
+        }
     };
+    let l_param_flat = mean_rate(&amp_ses);
+    let l_param_chart = mean_rate(&phase_ses);
     // Per-firing multiplicity is where the code economy lives: the flat block
-    // transmits every one of its `block_size` coefficients per firing, the circle
-    // chart transmits ONE phase coordinate — both at the same per-scalar
-    // resolution (matched distortion), so the chart saves `block_size − 1` coded
-    // scalars per firing before the parameter-column charge is even compared.
+    // transmits every one of its `block_size` amplitude coefficients per firing, the
+    // circle chart transmits ONE phase coordinate — now each at ITS OWN resolution.
     let flat = matched_dl(
         config.block_size as i64,
         config.block_size as i64,
         ambient_p as i64,
-        l_param_bits,
-        &ses,
+        l_param_flat,
+        &amp_ses,
         ev,
     );
     let chart = matched_dl(
         config.n_basis_chart as i64,
         1,
         ambient_p as i64,
-        l_param_bits,
-        &ses,
+        l_param_chart,
+        &phase_ses,
         ev,
     );
     (flat, chart)
@@ -725,26 +755,54 @@ fn crossfit_evidence(
             chart_loss[row] = row_sse(&eval_f, &chart_pred, pos);
         }
     }
-    let delta = linear_loss
-        .iter()
-        .zip(chart_loss.iter())
-        .map(|(l, c)| l - c)
-        .collect::<Vec<_>>();
-    let n_eff = autocorr_ess(&delta);
-    let mean_delta = delta.iter().sum::<f64>() / n as f64;
-    let se = newey_west_se(&delta);
-    let ci_low = mean_delta - 1.959963984540054 * se;
-    let ci_high = mean_delta + 1.959963984540054 * se;
+    // Held-out losses are SSE (squared coordinate units). Under a coordinate
+    // rescale z → c·z every SSE scales by c² while the ½·d_eff·ln(n_eff) complexity
+    // charge is dimensionless, so a raw `margin = Σ(SSE_lin − SSE_chart) − charge`
+    // MIXES CURRENCIES and lets the measurement units decide acceptance — rescale
+    // the coordinates, flip the verdict. The fix scores in the DEVIANCE currency
+    // (nats), where the gain lives in the same units as the charge and is
+    // scale-invariant.
+    //
+    // Profiled-Gaussian per-row deviance. With profiled variances
+    // ŝ²_lin = SSE_lin/n and ŝ²_chart = SSE_chart/n, row i's Gaussian negative
+    // log-likelihood under each model is ½·ln(2π ŝ²) + eᵢ/(2 ŝ²) (eᵢ the row SSE),
+    // so the per-row log-loss difference (linear − chart) is
+    //
+    //   dᵢ = ½·ln(ŝ²_lin / ŝ²_chart) + e_lin,ᵢ/(2 ŝ²_lin) − e_chart,ᵢ/(2 ŝ²_chart).
+    //
+    // dᵢ is dimensionless (each eᵢ/ŝ² is scale-free; the log is of a ratio), so the
+    // whole evidence — mean, se, CI, n_eff and gain — is scale-invariant. It also
+    // telescopes: Σ e_lin,ᵢ/(2 ŝ²_lin) = Σ e_chart,ᵢ/(2 ŝ²_chart) = n/2, hence
+    // Σ dᵢ = (n/2)·ln(SSE_lin/SSE_chart) and the per-sample mean is exactly the
+    // profiled half-log-ratio deviance. Variances are floored RELATIVELY (a
+    // fraction of the larger SSE) so a perfect chart fit yields a large finite gain,
+    // not ln(∞), while every quantity stays scale-invariant.
     let linear_total = linear_loss.iter().sum::<f64>();
     let chart_total = chart_loss.iter().sum::<f64>();
-    let gain = linear_total - chart_total;
+    let s2_floor = 1.0e-12 * (linear_total.max(chart_total) / n as f64).max(1.0e-300);
+    let s2_lin = (linear_total / n as f64).max(s2_floor);
+    let s2_chart = (chart_total / n as f64).max(s2_floor);
+    let half_log_ratio = 0.5 * (s2_lin / s2_chart).ln();
+    let deviance: Vec<f64> = (0..n)
+        .map(|i| {
+            half_log_ratio + linear_loss[i] / (2.0 * s2_lin) - chart_loss[i] / (2.0 * s2_chart)
+        })
+        .collect();
+    let n_eff = autocorr_ess(&deviance);
+    let mean_delta = deviance.iter().sum::<f64>() / n as f64;
+    let se = newey_west_se(&deviance);
+    let ci_low = mean_delta - 1.959963984540054 * se;
+    let ci_high = mean_delta + 1.959963984540054 * se;
+    // Profiled held-out deviance gain in NATS: (n_eff/2)·ln(SSE_lin/SSE_chart)
+    // = n_eff · mean_delta. Uses the effective (autocorrelation-deflated) sample
+    // count so cross-fit fold correlation cannot inflate the evidence.
     let d_eff = (2 * coords.ncols()).max(1) as f64;
+    let gain = n_eff.max(2.0) * mean_delta;
     let charge = 0.5 * d_eff * n_eff.max(2.0).ln();
     let margin = gain - charge;
-    let scale = (linear_total / n as f64)
-        .max(chart_total / n as f64)
-        .max(1.0e-12);
-    let log_e_value = (margin / scale).max(0.0);
+    // Both terms are nats; the log-e-value is the margin directly (an exp(margin)
+    // BIC-style e-value) — no per-unit rescale, and so scale-invariant.
+    let log_e_value = margin.max(0.0);
     Ok(ChartEvidence {
         n_rows: n,
         n_effective: n_eff,
@@ -1275,5 +1333,94 @@ fn add_lifted_coords(
         for c in 0..out.ncols() {
             out[[row, c]] += code * atom[c];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-uniform in `[0, 1)` from a counter (no RNG dependency).
+    fn unif(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as f64 / (1u64 << 31) as f64
+    }
+
+    /// A 2-D annulus (ring): points near radius 1 with a full spread of angles and
+    /// mild radial jitter. The radial (curved) chart predicts each point onto the
+    /// mean-radius circle and fits it well, while a rank-1 linear PCA cannot capture
+    /// a ring — so the chart genuinely beats the linear comparator (a real ACCEPT).
+    fn annulus(n: usize) -> Array2<f32> {
+        let mut st = 0x1234_5678u64;
+        let mut z = Array2::<f32>::zeros((n, 2));
+        for i in 0..n {
+            let theta = std::f64::consts::TAU * (i as f64 / n as f64) + 0.01 * unif(&mut st);
+            let r = 1.0 + 0.05 * (unif(&mut st) - 0.5);
+            z[[i, 0]] = (r * theta.cos()) as f32;
+            z[[i, 1]] = (r * theta.sin()) as f32;
+        }
+        z
+    }
+
+    #[test]
+    fn crossfit_evidence_verdict_and_e_value_are_scale_invariant() {
+        // The S4 currency fix: the acceptance margin and e-value are scored in the
+        // profiled-deviance currency (nats), so rescaling the coordinates cannot
+        // change the verdict. Ridge = 0 makes the whitening's eigenvalue floor
+        // relative (EPSILON·max_eval), so the whole pipeline is exactly
+        // scale-equivariant and the invariance is pinned to f64 rounding.
+        let coords = annulus(400);
+        let config = BlockChartComposeConfig {
+            whitening_ridge: 0.0,
+            ..Default::default()
+        };
+        let base = crossfit_evidence(&coords, &config).expect("evidence");
+
+        // The ring is a genuine curved structure: the chart must beat the linear
+        // comparator (a meaningful ACCEPT, not a trivial tie).
+        assert!(base.deviance_gain > 0.0, "chart must beat linear on a ring");
+        assert!(base.accepted_pre_ebh, "the ring must be accepted pre-eBH");
+
+        // Rescale every coordinate by 10 (SSE ×100). Deviance-scale scoring must
+        // leave the verdict AND the e-value unchanged.
+        let mut scaled = coords.clone();
+        scaled.mapv_inplace(|v| v * 10.0);
+        let big = crossfit_evidence(&scaled, &config).expect("evidence scaled");
+
+        assert_eq!(
+            base.accepted_pre_ebh, big.accepted_pre_ebh,
+            "accept/reject verdict must be scale-invariant"
+        );
+        assert!(
+            (base.log_e_value - big.log_e_value).abs() < 1e-6,
+            "e-value must be scale-invariant: {} vs {}",
+            base.log_e_value,
+            big.log_e_value
+        );
+        assert!(
+            (base.margin - big.margin).abs() < 1e-6,
+            "margin must be scale-invariant: {} vs {}",
+            base.margin,
+            big.margin
+        );
+        assert!(
+            (base.deviance_gain - big.deviance_gain).abs() < 1e-6,
+            "deviance gain must be scale-invariant"
+        );
+        assert!(
+            (base.ci_low - big.ci_low).abs() < 1e-6 && (base.ci_high - big.ci_high).abs() < 1e-6,
+            "the deviance-scale CI must be scale-invariant"
+        );
+
+        // Contrast: the OLD raw-SSE gain (linear_total − chart_total) scales by 100
+        // under ×10 — exactly the scale-dependence the deviance currency removes.
+        let old_gain_base = base.linear_loss - base.chart_loss;
+        let old_gain_big = big.linear_loss - big.chart_loss;
+        assert!(
+            (old_gain_big - 100.0 * old_gain_base).abs() < 1e-3 * old_gain_big.abs().max(1.0),
+            "raw SSE gain is scale-dependent (×100) — the currency the fix replaces"
+        );
     }
 }
