@@ -1321,15 +1321,21 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
-    if !(fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14) {
-        // Graceful degradation: when λ saturates, K = XᵀWX + λS is
-        // effectively rank-deficient and the analytic VJP is undefined.
-        // Return zero gradients (the correct shrink-out limit) instead of
-        // raising — production training at large F can have individual
-        // atoms saturate λ in early batches and must not blow up here.
-        warn_ill_conditioned_backward_once(p, d, f64::INFINITY);
-        return Ok(zero_backward_result(n, p, d));
-    }
+    // The implicit-function channel dλ̂/d(inputs) = −V_ρθ/V_ρρ is the derivative
+    // of an INTERIOR stationary root only. Two selections break its premise:
+    //  * ρ̂ railed at a box endpoint (±RHO bound): the selection is locally the
+    //    constant projection, so dλ̂/d(inputs) = 0 exactly — applying the
+    //    interior formula there emits enormous wrong gradients;
+    //  * unusable ρ-curvature (flat or rank-zero penalty): λ̂ is not identified.
+    // Neither invalidates the FIXED-ρ explicit VJPs — coefficients/fitted still
+    // depend on X, y, W at the selected λ — so only the λ̂-root channel is
+    // suppressed below. (The old gate zeroed the WHOLE backward here, silently
+    // dropping real coefficient gradients on unpenalized/flat-penalty fits.)
+    let rho_hat = lambda.ln();
+    let rho_at_bound =
+        (rho_hat - RHO_UPPER).abs() <= 1.0e-9 || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
+    let implicit_rho_usable =
+        fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14 && !rho_at_bound;
     let weight = gaussian_reml_weights(n, weights)?;
     let inverse_hessian = match gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda) {
         Ok(inv) => inv,
@@ -1351,6 +1357,7 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
         upstream_fitted,
         upstream_reml_score,
         upstream_edf,
+        implicit_rho_usable,
         n,
         p,
         d,
@@ -1369,6 +1376,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
     upstream_edf: f64,
+    implicit_rho_usable: bool,
     n: usize,
     p: usize,
     d: usize,
@@ -1458,7 +1466,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         );
     }
 
-    if lambda_adjoint != 0.0 {
+    if lambda_adjoint != 0.0 && implicit_rho_usable {
         let root_scale = -lambda_adjoint * lambda / fit.reml_hess_rho;
         add_reml_rho_gradient_vjp(
             root_scale,
@@ -1547,6 +1555,16 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 }
                 Err(err) => return Err(err),
             };
+            // Same selection-validity rule as the single-problem entry above:
+            // the implicit λ̂-root channel is usable only for an INTERIOR
+            // stationary root with usable ρ-curvature (a ρ̂ railed at a box
+            // endpoint is locally the constant projection — its channel is 0).
+            let rho_hat = problem.fit.lambda.ln();
+            let rho_at_bound = (rho_hat - RHO_UPPER).abs() <= 1.0e-9
+                || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
+            let implicit_rho_usable = problem.fit.reml_hess_rho.is_finite()
+                && problem.fit.reml_hess_rho.abs() > 1.0e-14
+                && !rho_at_bound;
             gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
                 problem.x.view(),
                 problem.y.view(),
@@ -1559,6 +1577,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 problem.grad_fitted.as_ref().map(|g| g.view()),
                 problem.grad_reml_score,
                 problem.grad_edf,
+                implicit_rho_usable,
                 n,
                 p,
                 d,
