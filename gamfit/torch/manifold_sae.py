@@ -1415,32 +1415,23 @@ class _SparsityLayer(nn.Module):
         (each atom claims ``N/F`` of the total assignment mass). This is the
         Sinkhorn projection of the row-stochastic responsibility matrix onto the
         doubly-balanced transport polytope with a uniform atom marginal; a few
-        fixed-point sweeps converge it. The potentials are computed under
-        ``no_grad`` and treated as constants in the M-step — they only steer the
-        *assignment*, the reconstruction gradient still flows through the
-        residual-driven ``log_scores``.
+        fixed-point sweeps converge it.
+
+        The fixed-point sweep itself is a Rust kernel
+        (``gam::geometry::sae_routing::sinkhorn_balance_bias``): Python marshals
+        the detached scores across the FFI and receives the per-atom potential
+        ``b``. Adding ``b`` back to ``log_scores`` keeps the reconstruction
+        gradient flowing through the residual-driven ``log_scores`` while ``b``
+        enters as the detached constant the M-step treats it as.
         """
         n_atoms = log_scores.shape[-1]
         if n_atoms < 2:
             return log_scores
         with torch.no_grad():
-            bias = torch.zeros(
-                n_atoms, dtype=log_scores.dtype, device=log_scores.device
+            bias_np = rust_module().sae_sinkhorn_balance_bias(
+                to_numpy_f64(log_scores), int(iters)
             )
-            target = torch.log(
-                torch.tensor(
-                    1.0 / float(n_atoms),
-                    dtype=log_scores.dtype,
-                    device=log_scores.device,
-                )
-            )
-            for _ in range(iters):
-                resp = torch.softmax(log_scores + bias, dim=-1)
-                # Mean assignment mass per atom (row-marginal already 1).
-                usage = resp.mean(dim=0).clamp_min(1e-12)
-                # Multiplicative Sinkhorn update toward the uniform marginal.
-                bias = bias + (target - torch.log(usage))
-                bias = bias - bias.mean()
+            bias = from_numpy_like(bias_np, log_scores)
         return log_scores + bias
 
     def penalty(self, logits: torch.Tensor) -> torch.Tensor:

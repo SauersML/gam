@@ -664,6 +664,23 @@ fn sae_duchon_centers_nd<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Sinkhorn per-atom log-bias potentials that balance atom usage across the
+/// batch (torch-lane routing helper for `ManifoldSAE`). Given the row-wise
+/// log-responsibilities `log_scores[n, k]`, returns the additive potential
+/// `b_k`; the Python caller forms the balanced responsibilities as
+/// `log_scores + b`, keeping `log_scores` on the autograd tape while `b` is a
+/// detached constant. See `gam::geometry::sae_routing::sinkhorn_balance_bias`.
+#[pyfunction]
+fn sae_sinkhorn_balance_bias<'py>(
+    py: Python<'py>,
+    log_scores: PyReadonlyArray2<'py, f64>,
+    iters: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let scores_owned = log_scores.as_array().to_owned();
+    let out = py.detach(move || sae_sinkhorn_balance_bias_impl(scores_owned.view(), iters));
+    Ok(out.into_pyarray(py).unbind())
+}
+
 #[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
@@ -4300,6 +4317,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
