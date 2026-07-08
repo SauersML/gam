@@ -1,0 +1,69 @@
+{
+  "L11": {
+    "raw": {
+      "ring_corr": 0.6064086628648429,
+      "perm_p": 0.0027498625068746564,
+      "top2D_var": 0.5043954896225084,
+      "angular_order": [
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun",
+        "Mon",
+        "Tue",
+        "Wed"
+      ],
+      "calendar_cyclic": true
+    }
+  },
+  "L17": {
+    "raw": {
+      "ring_corr": 0.6603165638684642,
+      "perm_p": 0.002049897505124744,
+      "top2D_var": 0.503111993429085,
+      "angular_order": [
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun",
+        "Mon",
+        "Tue",
+        "Wed"
+      ],
+      "calendar_cyclic": true
+    },
+    "code": {
+      "ring_corr": 0.46936963679891525,
+      "perm_p": 0.0009499525023748813,
+      "top2D_var": 0.5236451625823975,
+      "angular_order": [
+        "Sun",
+        "Sat",
+        "Thu",
+        "Fri",
+        "Wed",
+        "Tue",
+        "Mon"
+      ],
+      "calendar_cyclic": false,
+      "recon_ev": 0.25680940066528113
+    }
+  },
+  "L23": {
+    "raw": {
+      "ring_corr": 0.677444146141173,
+      "perm_p": 0.0023998800059997,
+      "top2D_var": 0.4640203364143061,
+      "angular_order": [
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat",
+        "Sun",
+        "Mon",
+        "Tue"
+      ],
+      "calendar_cyclic": true
+    }
+  }
+}

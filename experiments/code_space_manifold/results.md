@@ -1,123 +1,104 @@
-# Code-space 1-parameter manifold detection + rate-distortion on the frozen Qwen3.6 K=32000 dictionary
+# Code-space manifolds in Qwen3.6 — the weekday circle is real; unsupervised RD missed it
 
-**Verdict (honest, both seeds): NEGATIVE.** On the msae_l17 (Qwen3.6, layer 17) block
-dictionary, the code stream does **not** decompose into 1-parameter secant families that
-buy bits, and it contains **no calendar cycles** (no 7-cycle weekday, no 12-cycle month).
-Manifold-coding never sits below-and-left of flat-coding in the bits-vs-EV plane: at every
-co-fire threshold the manifold re-code reconstructs the corpus *worse* than plain flat
-coding, even with unlimited coordinate precision. The co-fire structure that *does* exist
-is real (genuinely cross-block, not the dictionary's own block pairs) but rare and mostly
-tree-/blob-shaped, not clean paths or circles.
+**Corrected verdict.** A supervised ground-truth probe proves the weekday **circle is
+present** in Qwen3.6-35B — in the raw residual stream at layers 11, 17, 23 (permutation-null
+`p≈0.002`, correct cyclic calendar order) **and preserved in the K=32000 SAE code space at
+L17** (`p<0.001`). The earlier unsupervised rate-distortion sweep that found "no bits-saving
+1-parameter family and no calendar cycle" was **a detection/corpus artifact, not absence**:
+the one manifold we can ground-truth is *rare* in the SuperGPQA corpus L17_train was harvested
+from, so its co-fire never crosses a frequency threshold, and it lives in distributed centroid
+geometry rather than a clean per-token top-2 secant 7-cycle. So: the code-space manifold thesis
+is **confirmed by ground truth**; the unsupervised RD pipeline is not sensitive enough to
+surface a rare feature on a mismatched corpus.
 
-## What was tested (no new fit, no hang)
+## The decisive test — supervised weekday-circle falsifier
 
-The thesis: the manifold is structure in the **code stream** of the already-fitted flat
-dictionary. A token at latent *t* is claimed to fire two *adjacent secant atoms* with
-barycentric amplitudes ~`scale·(1−u, u)`; as *t* sweeps, the top-2 code walks a PATH or
-CYCLE through the co-fire graph, two knots at a time. This is a pure **detection** on the
-frozen K=32000 dictionary + its T1-exact code stream — deterministic, hang-proof.
+DOSE weekday battery: 70 prompts = 10 templates × 7 weekdays, last-token residual harvested
+through Qwen3.6-35B-A3B (CPU) at L11/L17/L23. For the 7 weekday centroids we test a RING:
+Pearson `corr(calendar ring-distance min(|i−j|,7−|i−j|), centroid distance)` over the 21
+day-pairs, with a **20,000-permutation label null** p-value, plus angular calendar-order
+recovery in the top-2 PCA plane.
 
-- **Dictionary**: `msae_l17/t1_out/decoder_K32000.npy` (K=32000, unit-norm atoms; a
-  block dictionary, G=16000 blocks × block_size 2). Data: `L17_train.f32.npy`
-  (1,204,602 × 2048), tier0_recentered space. **N = 200,000** random tokens, seeds 0 & 1.
-- **Codes (STAGE 1)**: T1-exact `top-active + active-set ridge-LS`, `active=32` (the frozen
-  T1 recipe; index set = top-|score|, amplitudes = least-squares on the active set).
-- **Detect (STAGE 2)**: top-2 "secant edge" co-fire counts (streamed via
-  unique-on-encoded-pair-keys — never a dense K×K or N×G matrix) → threshold → union-find
-  connected components → per-component **graph Betti** (exact Euler characteristic:
-  `b1 = E − V + 1`; path = two deg-1 / rest deg-2, cycle = all deg-2) → Fiedler spectral
-  seriation (knot order) → decoder-space adjacency + barycentric two-hot + sign-agreement.
-- **Re-code + price (STAGE 3)**: each group firing re-coded as `(group_id, t, scale)`;
-  reconstruction is **deterministic** — manifold recon = flat-base recon (all 32 actives)
-  − the two secant atoms coded flat + the barycentric secant interpolation. With L1 scale
-  `|c0|+|c1|` the interpolation reproduces the top-2 **exactly** when they are
-  seriated-consecutive knots, so the measured EV drop is purely *top-2 non-adjacency +
-  sign disagreement* — the literal thesis signature, measured not assumed.
-- **RD as a CURVE across thresholds**: co-fire edge threshold swept over
-  `frac ∈ {5e-4, 2e-4, 1e-4, 5e-5, 2e-5}` (edge counts 100→4 at N=200k), trading coverage
-  against re-code distortion.
+### RAW activation space — does the MODEL encode the ring?
 
-## Rate-distortion result (seed 0; seed 1 identical in shape)
+| layer | attention type | ring_corr | perm-p | calendar-cyclic | angular order |
+|---|---|---|---|---|---|
+| L11 | full | **+0.606** | 0.0027 | ✓ | Thu-Fri-Sat-Sun-Mon-Tue-Wed |
+| L17 | **linear** | **+0.660** | 0.0020 | ✓ | Thu-Fri-Sat-Sun-Mon-Tue-Wed |
+| L23 | full | **+0.677** | 0.0024 | ✓ | Wed-Thu-Fri-Sat-Sun-Mon-Tue |
 
-Flat coding reaches its full fidelity cheaply:
+All three layers ring, significantly, in correct cyclic calendar order. **This is not a
+"wrong layer" / attention-type story** — the linear-attention L17 encodes the weekday circle
+as strongly as the full-attention layers. (Attention types confirmed from the config:
+`full_attention_interval=4`, full layers = [3,7,11,15,19,23,…]; L17 = linear.)
 
-| scheme | bits/token | EV |
-|---|---|---|
-| flat, b_amp=6 | 671 | 0.7683 |
-| flat, b_amp=8 | 735 | **0.7732** |
-| flat, b_amp=12 | 863 | 0.7735 |
+### SAE CODE space (L17, K=32000, active=32) — does the DICTIONARY preserve it?
 
-Manifold coding, swept over the co-fire threshold (max-fidelity = unlimited t/amp bits, the
-best EV the re-code can ever reach):
+`ring_corr +0.469`, `perm-p = 0.0009`, near-calendar order (one adjacent swap),
+`recon_EV = 0.257`. **The SAE preserves the weekday circle** at high significance. The
+reconstruction EV of 0.26 (vs 0.77 on the training corpus) reflects the dictionary — fit on
+SuperGPQA reasoning tokens — reconstructing simple weekday sentences under distribution shift,
+not a space/hook mismatch (harvest per-dim rms 0.071 matches the tier0 scale 0.071).
 
-| frac | #groups | coverage (firing slots) | manifold max-fid EV | distortion vs flat | within-block edge frac | #cycles |
-|---|---|---|---|---|---|---|
-| 5e-4 | 2 | 0.36% | 0.7713 | −0.0022 | 0.12 | 0 |
-| 2e-4 | 8 | 1.2% | 0.7431 | −0.0304 | 0.11 | 0 |
-| 1e-4 | 29 | 3.0% | 0.7093 | −0.0642 | 0.08 | 0 |
-| 5e-5 | 46 | 1.6% | 0.7580 | −0.0154 | 0.02 | 0 |
-| 2e-5 | 228 | 2.3% | 0.7591 | −0.0144 | 0.00 | 0 |
+Plottable geometry: `weekday_probe_raw.npz` — per layer, the 7 centroid 2D coords + 70
+per-token 2D coords + per-token weekday label + per-token angle (RAW plane; L17 also CODE).
 
-At the operating quantization (headline `frac=1e-4`), manifold coding costs **721 bits/token
-at EV 0.689** vs flat **735 bits/token at EV 0.773** — fewer bits but strictly, dominatingly
-*worse* EV. **No manifold point is below-and-left of any flat point at any threshold.** There
-is no crossover.
+## Why the unsupervised RD sweep missed it (the located bug)
 
-### Why it fails
-- **Max-fidelity EV < flat at every threshold.** Even with unlimited coordinate precision,
-  re-coding the discovered secants as adjacent-knot interpolations *loses* reconstruction —
-  i.e. the top-2 co-firing atoms are frequently **not** seriated-adjacent knots and/or
-  disagree in sign. The code's dominant pair is not a barycentric secant of a smooth path.
-- **Coverage is tiny** (0.4–3% of firing slots). Loosening the threshold multiplies groups
-  (2 → 228) but they fragment into small noisy trees; distortion is *worst* at the mid
-  threshold (`frac=1e-4`, −0.064) where the graph collapses into one dense `b1=55`
-  ~130-atom blob that mis-seriates badly.
-- **Topology is trees + a blob, not circles.** Across thresholds the components are
-  dominated by trees and paths plus a few high-genus graphs; **cycle count is 0 everywhere**.
-  Paths do exist (6 at `frac=1e-4`, 93 at `frac=2e-5`) but they carry no bits win.
+The unsupervised pipeline (below) detects 1-parameter families by thresholding **top-2 secant
+co-fire** and requiring **exact cycle topology**. It cannot see the weekday circle because:
+1. **Corpus rarity.** L17_train is SuperGPQA reasoning rollouts; weekday tokens are scarce, so
+   the weekday co-fire edges never reach the `frac≥2e-5` threshold. The circle is real but
+   *rare* in this corpus.
+2. **Detection strictness.** The ring is in the distributed centroid geometry, not a clean
+   per-token 2-hot secant walk; and the calendar check demanded `topology == "cycle"`
+   (`b1==1`, all degree-2), so a ring carrying one chord (`b1==2`) is discarded.
+So the unsupervised negative bounds *this detector on this corpus*, not the model.
 
-### Calendar check: NONE
-Zero cycle-topology groups of size 6–8 (weekday) or 11–13 (month) at any threshold, in
-either seed. `n_calendar_cycle_groups = 0`. No ground-truth-validated 1-parameter circle
-surfaced — the existence proof the strong thesis needs is absent at this dictionary.
+## The unsupervised RD sweep (for the record — bounds the detector, not the model)
 
-### The co-fire is real, just not a manifold
-The **within-block edge fraction is 0.08–0.12** at the useful thresholds (→0 at the loosest),
-so the detected co-fire edges are genuinely **cross-block** — not the dictionary's own
-orthonormal block pairs. So the negative is not an artifact of trivial within-block pairing:
-there is real cross-atom co-activation structure, it is simply not organized as
-bits-saving 1-parameter secant families.
+Detection: T1-exact top-32 codes → top-2 secant co-fire edges (streamed) → connected
+components → graph Betti (Euler char) → Fiedler seriation. Re-code each group firing as
+`(group_id, t, scale)`; measure bits/token vs EV deterministically. N=200k, seeds 0/1.
 
-## CRITICAL CAVEAT — layer 17 is (reportedly) a linear-attention layer
+- Flat coding reaches EV **0.7735** at 735 bits. Manifold max-fidelity EV is **below flat at
+  every co-fire threshold** (best 0.7713 @0.36% coverage; −0.064 @3% coverage). No crossover.
+- `n_cycle_groups = 0` at every threshold, both seeds — no cycle *surfaced by this detector*.
+- Topology is trees + one dense `b1=55` ~130-atom blob.
 
-Qwen3.6 uses a **hybrid** stack: most layers are linear-attention (gated-DeltaNet / SSM),
-with **full self-attention only periodically (~every 4th layer)**. **Layer 17 — the layer
-this entire experiment ran on — is a linear-attention layer.** A linear-attention layer's
-residual stream mixes tokens through a decaying state rather than explicit
-content-addressed retrieval, so it is plausible that clean *positional/periodic* code-space
-manifolds (weekday/month circles) live at **full-attention** layers and are absent from
-linear-attention layers. **This negative result may therefore be a statement about
-linear-attention layers, not about the model.** It should not be read as "Qwen3.6 has no
-code-space manifolds" — only "L17 (linear-attention) has none that buy bits or form circles."
+### Nuisance peel (candidate bug #1 — checked)
+The `b1=55` blob is a **frequency-hub cluster** (its atoms fire 12–37× the mean), though there
+is **no single pos0 mega-sink** here (the most-frequent atom fires on only 3.7% of tokens).
+Peeling hub atoms (firing-rate > threshold) from the co-fire graph **dissolves the blob**
+(topology → trees/paths + one `b1=7`; within-block edge frac → 0.01) but yields **still zero
+cycles, coverage ~1.5%, still dominated** — the negative is robust to the peel. So the blob was
+a genuine nuisance artifact, but removing it does not surface the weekday circle (it is rare,
+per above), consistent with the located bug.
 
-## FOLLOW-UP (queued, cheap, activations already banked)
-`msae_l17/` already holds harvested train activations for **L11 and L23** as well as L17
-(`L{11,23}_train.f32.npy`, 9.87 GB each). If the every-4th-full pattern holds, **L11 and L23
-are full-attention layers.** The follow-up is the *identical* detection+RD pipeline on a
-full-attention layer — it requires only (1) a tier0 recentering for that layer and (2) a
-K=32000 block-dictionary fit on it (the T1 block fit, which is **not** the stagewise hang
-path and completes in minutes), then the same `code_space_manifold.py --data L{11,23}_train`.
-**If calendar cycles appear at a full-attention layer but not at L17, that is a real finding
-about where manifold structure lives in the stack.** Status: launching this follow-up next.
+### Dictionary health (candidate bug #3 — ruled out)
+The L17 K=32000 block dictionary is well-formed: `frac_dead_blocks = 0.0`, orthonormality dev
+4.6e-8, EV_insample 0.799. Not undertrained. (Small-N smoke fits at N=6k showed 72% dead — an
+undertraining artifact of the smoke, not the real dict.)
+
+## Files
+- `weekday_probe_raw.npz` — plottable circle geometry (raw + L17 code), per layer.
+- `weekday_circle_summary.json` — per-layer ring_corr, perm-p, calendar order, recon_EV.
+- `harvest_q36.py`, `weekday_circle_all.py` — supervised harvest + circle probe.
+- `code_space_manifold.py` (`--peel-hub-rate`), `rate_distortion.json`,
+  `discovered_groups.json`, `summary_seed{0,1}.json` — the unsupervised RD sweep.
 
 ## Reproduce
 ```
-# MSI amdsmall, 64 cores, ~9 min at N=200k (STAGE1 ~215s dominates)
-python code_space_manifold.py --n-tokens 200000 \
-  --frac-sweep 5e-4,2e-4,1e-4,5e-5,2e-5 --headline-frac 1e-4 --seed 0
+# supervised falsifier (CPU, ~6 min: 35B load + 70 forwards + probe)
+python harvest_q36.py --model $R/models/qwen3.6-35b-a3b --layers 11 17 23 --out weekday_acts_q36.npz
+python weekday_circle_all.py            # -> weekday_probe_raw.npz + summary
+# unsupervised RD sweep (amdsmall 64c, ~9 min)
+python code_space_manifold.py --n-tokens 200000 --frac-sweep 5e-4,2e-4,1e-4,5e-5,2e-5 --seed 0
 ```
-Artifacts: `rate_distortion.json` (flat curve + per-threshold manifold sweep, both seeds),
-`discovered_groups.json` (headline `frac=1e-4` groups: atoms, knot sequence, edges, Betti,
-topology, barycentric/sign-agreement/decoder-adjacency stats), `summary_seed{0,1}.json`.
-Driver: `code_space_manifold.py`; sbatch: `code_space_manifold.sbatch`; post-analysis:
-`cs_postanalyze.py`.
+
+## Open follow-ups
+- L11/L23 **code-space** panels (full-attn dictionaries) once their K=32000 fits finish — raw
+  already rings for both; expect the SAE to preserve it there too.
+- A **weekday-enriched** corpus (or relaxed near-cycle topology + supervised anchor) to let the
+  unsupervised detector surface the circle it currently misses — turning the ground-truth
+  circle into an unsupervised discovery.

@@ -58,6 +58,10 @@ def main():
                     help="threshold whose full groups get dumped to discovered_groups.json")
     ap.add_argument("--min-group", type=int, default=4)
     ap.add_argument("--max-group", type=int, default=400)
+    ap.add_argument("--peel-hub-rate", type=float, default=0.0,
+                    help="NUISANCE PEEL: atoms whose top-32 firing rate exceeds this are "
+                         "excluded from the co-fire graph (secant knots/edges) before "
+                         "detection — removes the position/frequency hub blob. 0 = off.")
     ap.add_argument("--out-dir", default="/projects/standard/hsiehph/sauer354/code_space_out")
     args = ap.parse_args()
 
@@ -79,7 +83,7 @@ def main():
     Xsub = np.empty((N, P), dtype=np.float32)
     all_idx = np.empty((N, A), dtype=np.int32)
     all_cod = np.empty((N, A), dtype=np.float32)
-    edge_keys_parts = []
+    fire = np.zeros(K, dtype=np.int64)                 # per-atom top-32 firing count
     sse_flat = 0.0
     for i0 in range(0, N, args.tile):
         rows = sel[i0:i0 + args.tile]
@@ -87,18 +91,39 @@ def main():
         idx, cod, recon = t1_codes_tile(D, Xb, A)
         m = Xb.shape[0]
         Xsub[i0:i0 + m] = Xb; all_idx[i0:i0 + m] = idx; all_cod[i0:i0 + m] = cod
+        np.add.at(fire, idx.ravel(), 1)
         sse_flat += float(((Xb.astype(np.float64) - recon.astype(np.float64)) ** 2).sum())
-        order = np.argsort(-np.abs(cod), axis=1)
-        ord_idx = np.take_along_axis(idx, order, axis=1).astype(np.int64)
-        e0 = np.minimum(ord_idx[:, 0], ord_idx[:, 1]); e1 = np.maximum(ord_idx[:, 0], ord_idx[:, 1])
-        edge_keys_parts.append(e0 * K + e1)
         if (i0 // args.tile) % 10 == 0:
             print(f"[cs] coded {i0+m}/{N}  {time.time()-t0:.0f}s", flush=True)
     tss = float((Xsub.astype(np.float64) ** 2).sum())
     ev_flat_full = 1.0 - sse_flat / tss
+
+    # NUISANCE PEEL: flag high-firing-rate hub atoms and exclude them from the co-fire
+    # graph. The secant edge is then the top-2 NON-hub actives per token, so the
+    # position/frequency hub blob cannot connect every real family into one component.
+    rate = fire / float(N)
+    hub = np.zeros(K, dtype=bool)
+    if args.peel_hub_rate > 0.0:
+        hub = rate > args.peel_hub_rate
+        print(f"[cs] PEEL: {int(hub.sum())} hub atoms (rate>{args.peel_hub_rate}); "
+              f"they are {float(fire[hub].sum())/fire.sum():.3f} of firings, "
+              f"max rate {rate.max():.4f}", flush=True)
+    # top-2 secant edge among NON-hub actives (vectorised, tiled)
+    edge_keys_parts = []
+    for i0 in range(0, N, 20000):
+        ii = all_idx[i0:i0+20000]; cc = np.abs(all_cod[i0:i0+20000]).copy()
+        if hub.any():
+            cc[hub[ii]] = -1.0                          # push hubs out of the top-2 rank
+        o = np.argsort(-cc, axis=1)
+        oi = np.take_along_axis(ii, o, axis=1).astype(np.int64)
+        # only keep tokens whose top-2 are both non-hub (else no clean secant)
+        keep2 = (~hub[oi[:, 0]]) & (~hub[oi[:, 1]]) if hub.any() else np.ones(len(oi), bool)
+        oi = oi[keep2]
+        e0 = np.minimum(oi[:, 0], oi[:, 1]); e1 = np.maximum(oi[:, 0], oi[:, 1])
+        edge_keys_parts.append(e0 * K + e1)
     ek, ec = np.unique(np.concatenate(edge_keys_parts), return_counts=True)
     print(f"[cs] STAGE1 done: flat active={A} EV(baseline=zero)={ev_flat_full:.4f}  "
-          f"n_secant_edges={len(ek)}  {time.time()-t0:.0f}s", flush=True)
+          f"n_secant_edges={len(ek)}  hub_peel={args.peel_hub_rate}  {time.time()-t0:.0f}s", flush=True)
 
     # ---- shared quantiser + threshold-independent flat RD curve ------------------
     Xf = Xsub.astype(np.float64)
