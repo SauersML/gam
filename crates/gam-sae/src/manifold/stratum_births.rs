@@ -74,6 +74,19 @@ pub struct StratumLocalPick {
     pub min_routable_energy: f64,
     /// Rank of the chosen stratum in descending mean energy (`0` = highest-energy).
     pub stratum_rank: usize,
+    /// Kish effective sample size of the chosen stratum's row energies,
+    /// `(Σ eᵢ)² / Σ eᵢ²` — the number of independent samples its dominant
+    /// direction is estimated from. A single-row (or one-row-dominated) stratum
+    /// has ESS ≈ 1; the birth floor below rejects it because a rank-1 selection's
+    /// dominant-energy fraction is IDENTICALLY 1 and clears any router floor with
+    /// noise alone.
+    pub effective_sample_size: f64,
+    /// The null-model ESS floor [`min_effective_rows_for_birth`] the chosen
+    /// stratum cleared: the smallest effective sample size at which a genuine
+    /// dominant direction is distinguishable from the noise-only dominant
+    /// fraction at this router width. `effective_sample_size ≥ min_effective_rows`
+    /// holds for every admitted pick.
+    pub min_effective_rows: f64,
 }
 
 /// Dominant-direction energy fraction of the residual restricted to `rows`:
@@ -146,6 +159,85 @@ fn power_iteration_top_eigenvalue(
     lambda
 }
 
+/// Minimum effective sample size a stratum must carry before its dominant
+/// direction may propose a birth — the null-model floor that stops a too-small
+/// stratum from clearing the router with noise alone.
+///
+/// # Why an unguarded per-exponent stratum is a false positive
+///
+/// [`dominant_energy_fraction`] of an `m × p` residual block is
+/// `φ = λ_max(RᵀR) / ‖R‖_F²`. A SINGLE row is rank-1: its whole energy lies in
+/// one direction, so `φ ≡ 1` — it clears ANY floor, even when that row is pure
+/// noise. Per-exponent strata have no minimum population, so a 1-row noise band
+/// (a lone high-residual outlier in its own factor-of-two energy bin) always
+/// "clears" the router and seeds a birth from a single noise row. More generally,
+/// for an isotropic (noise) `m × p` block the leading singular value obeys the
+/// Bai–Yin edge `σ_max² ≈ σ²(√m + √p)²` while `‖R‖_F² ≈ σ² m p`, so the NULL
+/// (noise-only) dominant fraction is
+///
+/// ```text
+///   φ₀(m, p) = (√m + √p)² / (m p),
+/// ```
+///
+/// which is ≈ 1 at `m = 1` and decays to the ambient floor `1/p` as `m → ∞`. A
+/// stratum can only carry EVIDENCE of a real dominant direction once this
+/// noise-only fraction sits below the router's own
+/// [`minimum_routable_energy`] `ρ` — otherwise a birth mined there is
+/// indistinguishable from the artifact of too few rows, no matter how the
+/// fitter routes it.
+///
+/// # The derived floor (no magic constant)
+///
+/// Require `φ₀(m, p) ≤ ρ`. Writing `u = √m`, `q = √p`, this is
+/// `(ρp − 1)·u² − 2q·u − q² ≥ 0`; for `ρp > 1` its positive root gives the
+/// smallest admissible effective sample size
+///
+/// ```text
+///   m_min(p, ρ) = p · (1 + √(ρp))² / (ρp − 1)².
+/// ```
+///
+/// Every input is derived: `p` is the router width, `ρ = minimum_routable_energy`
+/// is the closed form of `(K, p, δ)` the router already exposes. The floor is
+/// self-scaling — small `K` (an easy floor, large `ρ`) needs only a handful of
+/// rows, frontier `K` (a tight floor) needs hundreds. When `ρp ≤ 1` the ambient
+/// noise floor `1/p` itself exceeds `ρ`, so NO row count can separate signal from
+/// noise at this router width and the screen declines every stratum (`+∞`).
+pub fn min_effective_rows_for_birth(p: usize, min_routable: f64) -> f64 {
+    if p == 0 || !(min_routable > 0.0) {
+        return f64::INFINITY;
+    }
+    let pf = p as f64;
+    let rho_p = min_routable * pf;
+    if rho_p <= 1.0 {
+        return f64::INFINITY;
+    }
+    pf * (1.0 + rho_p.sqrt()).powi(2) / (rho_p - 1.0).powi(2)
+}
+
+/// Kish effective sample size of the residual restricted to `rows`, computed on
+/// the per-row energies `eᵢ = ‖rᵢ‖²`: `ESS = (Σ eᵢ)² / Σ eᵢ²`.
+///
+/// `ESS ∈ [1, |rows|]`: it equals the row count when every row carries comparable
+/// energy (a genuine multi-row band whose dominant direction is estimated from
+/// many samples) and collapses toward `1` for a stratum dominated by a single
+/// high-energy row — exactly the one-row(-equivalent) false positive the birth
+/// floor must reject. Using ESS rather than the raw row count also guards a
+/// merged low-energy band that is effectively one big row plus dust. Returns
+/// `0.0` for an empty / zero-energy selection.
+fn effective_sample_size(residual: ArrayView2<'_, f64>, rows: &[usize]) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut sumsq = 0.0_f64;
+    for &i in rows {
+        let e: f64 = residual.row(i).iter().map(|&v| v * v).sum();
+        sum += e;
+        sumsq += e * e;
+    }
+    if sumsq <= 0.0 {
+        return 0.0;
+    }
+    sum * sum / sumsq
+}
+
 /// Screen the pooled residual for a stratum-local birth. Stratifies the rows by
 /// residual energy, then — in DESCENDING stratum mean energy — returns the first
 /// stratum whose local [`dominant_energy_fraction`] clears the routing floor's
@@ -177,23 +269,39 @@ pub fn stratum_local_birth_residual(
             .partial_cmp(&a.mean_energy)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // The null-model effective-sample-size floor: a stratum whose dominant
+    // fraction clears the router must ALSO carry enough independent samples that a
+    // real dominant direction is distinguishable from the noise-only fraction of a
+    // block that small (see [`min_effective_rows_for_birth`]). Without it a 1-row
+    // (rank-1, φ ≡ 1) noise band clears any floor and seeds a birth from one row.
+    let min_effective_rows = min_effective_rows_for_birth(p, min_routable);
     for (rank, stratum) in strata.iter().enumerate() {
         let local = dominant_energy_fraction(residual, &stratum.rows);
-        if local >= min_routable {
-            // Mask the residual to this stratum's rows (others zeroed).
-            let mut masked = Array2::<f64>::zeros((n, p));
-            for &i in &stratum.rows {
-                masked.row_mut(i).assign(&residual.row(i));
-            }
-            return Some(StratumLocalPick {
-                rows: stratum.rows.clone(),
-                masked_residual: masked,
-                local_fraction: local,
-                pooled_fraction,
-                min_routable_energy: min_routable,
-                stratum_rank: rank,
-            });
+        if local < min_routable {
+            continue;
         }
+        let ess = effective_sample_size(residual, &stratum.rows);
+        if ess < min_effective_rows {
+            // Clears the fraction floor but not on enough independent samples — the
+            // fraction is the too-few-rows artifact, not evidence. Skip to a
+            // larger stratum; if none qualifies the caller keeps the pooled path.
+            continue;
+        }
+        // Mask the residual to this stratum's rows (others zeroed).
+        let mut masked = Array2::<f64>::zeros((n, p));
+        for &i in &stratum.rows {
+            masked.row_mut(i).assign(&residual.row(i));
+        }
+        return Some(StratumLocalPick {
+            rows: stratum.rows.clone(),
+            masked_residual: masked,
+            local_fraction: local,
+            pooled_fraction,
+            min_routable_energy: min_routable,
+            stratum_rank: rank,
+            effective_sample_size: ess,
+            min_effective_rows,
+        });
     }
     None
 }
@@ -282,6 +390,14 @@ mod tests {
             pick.local_fraction,
             pick.pooled_fraction
         );
+        // The admitted stratum must clear the ESS floor: the fraction is carried by
+        // enough independent samples to be real, not the artifact of too few rows.
+        assert!(
+            pick.effective_sample_size >= pick.min_effective_rows,
+            "admitted stratum ESS {} must clear the floor {}",
+            pick.effective_sample_size,
+            pick.min_effective_rows
+        );
         // The chosen stratum must actually contain the planted (high-energy) rows.
         let planted: std::collections::BTreeSet<usize> = (0..n_signal).collect();
         let overlap = pick.rows.iter().filter(|i| planted.contains(i)).count();
@@ -338,6 +454,130 @@ mod tests {
         assert!(
             pooled >= min_routable,
             "an easy floor with a dominant signal must route pooled: {pooled} ≥ {min_routable}"
+        );
+    }
+
+    #[test]
+    fn ess_floor_closed_form_and_kish_sample_size() {
+        // The derived floor m_min = p·(1+√(ρp))²/(ρp−1)² and the Kish ESS
+        // (Σe)²/Σe² are pinned in closed form, including the two limits the birth
+        // guard turns on: ESS = 1 for a single row, ESS = m for equal-energy rows.
+        let p = 256usize;
+        let floor = routability_floor(p, 32_000, 1, 1.0);
+        let rho = minimum_routable_energy(&floor);
+        let rho_p = rho * p as f64;
+        assert!(rho_p > 1.0, "frontier floor must admit a finite m_min");
+        let expected = p as f64 * (1.0 + rho_p.sqrt()).powi(2) / (rho_p - 1.0).powi(2);
+        let got = min_effective_rows_for_birth(p, rho);
+        assert!((got - expected).abs() < 1e-9, "m_min {got} vs {expected}");
+        assert!(got > 1.0, "a nontrivial router width must demand > 1 row");
+
+        // ρp ≤ 1 ⇒ the ambient noise floor 1/p exceeds ρ ⇒ no row count separates
+        // signal from noise ⇒ the floor is +∞ (decline every stratum).
+        assert!(min_effective_rows_for_birth(p, 0.5 / p as f64).is_infinite());
+        assert!(min_effective_rows_for_birth(0, 0.5).is_infinite());
+
+        // Kish ESS: a single row is ESS 1 (the rank-1 false positive); m equal-
+        // energy rows are ESS m; a one-row-dominated selection collapses toward 1.
+        let mut r = Array2::<f64>::zeros((5, 4));
+        for j in 0..4 {
+            r[[0, j]] = 1.0; // row 0 energy 4
+            r[[1, j]] = 1.0; // row 1 energy 4
+            r[[2, j]] = 1.0;
+            r[[3, j]] = 1.0;
+        }
+        r[[4, 0]] = 100.0; // row 4 energy 10000 (dominates)
+        assert!((effective_sample_size(r.view(), &[0]) - 1.0).abs() < 1e-12);
+        assert!((effective_sample_size(r.view(), &[0, 1, 2, 3]) - 4.0).abs() < 1e-12);
+        // Four unit rows plus the huge outlier: ESS ≈ 1 (outlier owns the energy).
+        assert!(
+            effective_sample_size(r.view(), &[0, 1, 2, 3, 4]) < 1.01,
+            "a one-row-dominated selection must have ESS ≈ 1"
+        );
+        assert_eq!(effective_sample_size(r.view(), &[]), 0.0);
+    }
+
+    #[test]
+    fn one_row_stratum_proposes_nothing_adequate_stratum_proposes() {
+        // (a) A single high-energy noise outlier forms its own exponent bin: a
+        // 1-row stratum with dominant fraction ≡ 1 that clears the router floor.
+        // Bulk is many unit-norm noise rows (one energy band, dominant fraction far
+        // below the floor). The ESS floor rejects the outlier (ESS = 1) and the
+        // bulk fails the fraction floor, so the screen proposes NOTHING.
+        let n = 1000usize;
+        let p = 64usize;
+        let k_router = 32_000usize; // frontier: tight floor
+        let mut ctr = 42u64;
+        let mut r = Array2::<f64>::zeros((n + 1, p));
+        // Bulk: unit-norm isotropic noise rows (all energy ≈ 1 ⇒ one exponent bin).
+        for i in 0..n {
+            let mut e = 0.0_f64;
+            for j in 0..p {
+                let v = gauss(&mut ctr);
+                r[[i, j]] = v;
+                e += v * v;
+            }
+            let s = e.sqrt();
+            for j in 0..p {
+                r[[i, j]] /= s;
+            }
+        }
+        // One giant outlier in a random direction: energy ≈ 1000, its own bin.
+        let mut e = 0.0_f64;
+        for j in 0..p {
+            let v = gauss(&mut ctr);
+            r[[n, j]] = v;
+            e += v * v;
+        }
+        let s = e.sqrt();
+        for j in 0..p {
+            r[[n, j]] = r[[n, j]] / s * 1000.0_f64.sqrt();
+        }
+
+        let floor = routability_floor(p, k_router, 1, 1.0);
+        let min_routable = minimum_routable_energy(&floor);
+        // The lone outlier as its own stratum WOULD clear the fraction floor…
+        assert!(dominant_energy_fraction(r.view(), &[n]) >= min_routable);
+        // …but its ESS is 1, far below the derived floor, so it must be rejected.
+        assert!(effective_sample_size(r.view(), &[n]) < min_effective_rows_for_birth(p, min_routable));
+        // The screen proposes nothing: no adequately-sized stratum clears locally.
+        assert!(
+            stratum_local_birth_residual(r.view(), &floor).is_none(),
+            "a 1-row noise outlier must not seed a birth"
+        );
+
+        // (b) Now add a genuine, adequately-sized planted stratum: ~50 rows of a
+        // coherent rank-1 direction at high energy. It clears BOTH the fraction
+        // floor and the ESS floor, so the screen proposes it.
+        let n_signal = 50usize;
+        let mut dir = vec![0.0_f64; p];
+        for d in dir.iter_mut() {
+            *d = gauss(&mut ctr);
+        }
+        let dn = dir.iter().map(|x| x * x).sum::<f64>().sqrt();
+        for d in dir.iter_mut() {
+            *d /= dn;
+        }
+        // Overwrite the first n_signal bulk rows with a strong coherent signal in
+        // dir (energy ≈ 25 ⇒ a distinct high-energy band, well above unit bulk).
+        for i in 0..n_signal {
+            let a = 5.0;
+            for j in 0..p {
+                r[[i, j]] = a * dir[j] + 0.05 * gauss(&mut ctr);
+            }
+        }
+        let pick = stratum_local_birth_residual(r.view(), &floor)
+            .expect("an adequately-sized planted stratum must propose a birth");
+        assert!(pick.local_fraction >= pick.min_routable_energy);
+        assert!(
+            pick.effective_sample_size >= pick.min_effective_rows,
+            "the proposed stratum must clear the ESS floor: {} < {}",
+            pick.effective_sample_size,
+            pick.min_effective_rows
+        );
+        assert!(
+            pick.effective_sample_size > 1.5,
+            "the proposed stratum must be a genuine multi-row band, not a lone row"
         );
     }
 }
