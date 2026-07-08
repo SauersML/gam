@@ -46,7 +46,9 @@ def load_slice(root: Path, category: str, n_rows: int, seed: int, cache_dir: Pat
     z = np.asarray(acts[idx], dtype=np.float32)
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(f".tmp{os.getpid()}")
+        # np.save appends ".npy" unless the name already ends with it — the tmp
+        # name must carry the suffix or the atomic rename source never exists.
+        tmp = cache.with_suffix(f".tmp{os.getpid()}.npy")
         np.save(tmp, z)
         os.replace(tmp, cache)  # atomic: concurrent writers race harmlessly
     return z
