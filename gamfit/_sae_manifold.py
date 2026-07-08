@@ -257,6 +257,63 @@ def _active_threshold_for_assignment(assignment: str, k_atoms: int) -> float:
     return 1.0e-8
 
 
+def _channel_cov_factors(
+    decoder_covariance: np.ndarray | None, m_basis: int
+) -> list | None:
+    """Compact per-channel covariance factor a shape band consumes for save/load.
+
+    The dense phi-scaled decoder covariance is ``(M_k·p, M_k·p)`` in row-major
+    ``(basis, channel)`` flat layout (flat index ``b·p + c``). The posterior
+    shape band reads ONLY the same-channel blocks ``Cov[(b1,c),(b2,c)]`` — its
+    variance is ``Var_c(t) = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]`` — so those
+    ``p`` blocks of ``M_k × M_k`` are the complete, compact factor the band
+    needs. This extracts them as a ``(p, M_k, M_k)`` array (pure reshaping /
+    diagonal slicing — no numerical decomposition), replacing the dense
+    ``(M_k·p)²`` joint covariance in the on-disk format. ``None`` when the fit
+    carries no covariance (e.g. an LLM-scale ``p`` where even the fresh fit omits
+    the dense lift); the band's stored ``shape_band_sd`` still round-trips.
+    """
+    if decoder_covariance is None:
+        return None
+    cov = np.asarray(decoder_covariance, dtype=float)
+    m = int(m_basis)
+    total = cov.shape[0]
+    if m <= 0 or total % m != 0:
+        # Layout does not match an (M_k, p) decoder; refuse to guess — drop the
+        # factor rather than emit a mislabeled one (band sd still round-trips).
+        return None
+    p = total // m
+    # cov4[b1, c1, b2, c2]; the band consumes the c1 == c2 diagonal.
+    cov4 = cov.reshape(m, p, m, p)
+    diag = np.diagonal(cov4, axis1=1, axis2=3)  # (M_k, M_k, p)
+    blocks = np.ascontiguousarray(np.transpose(diag, (2, 0, 1)))  # (p, M_k, M_k)
+    return blocks.tolist()
+
+
+def _channel_cov_from_factors(factors: Any) -> np.ndarray | None:
+    """Rebuild the full-shape ``(M_k·p, M_k·p)`` decoder covariance from the
+    compact per-channel factor written by :func:`_channel_cov_factors`.
+
+    The result is block-diagonal across channels: the same-channel ``M_k × M_k``
+    blocks are restored exactly and the cross-channel entries (which no band
+    reads) are zero. Reproduces the shape band ``Σ Φ Φ Cov[(·,c),(·,c)]`` to
+    machine precision. ``None`` when no factor was stored.
+    """
+    if factors is None:
+        return None
+    blocks = np.asarray(factors, dtype=float)
+    if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+        raise ValueError(
+            "decoder_covariance_channel_factors must be a (p, M_k, M_k) array; "
+            f"got shape {blocks.shape}"
+        )
+    p, m, _ = blocks.shape
+    cov4 = np.zeros((m, p, m, p), dtype=float)
+    for c in range(p):
+        cov4[:, c, :, c] = blocks[c]
+    return np.ascontiguousarray(cov4.reshape(m * p, m * p))
+
+
 def _canonical_n_harmonics(
     basis_kinds: list[str],
     raw_n_harmonics: list[int],
@@ -552,6 +609,11 @@ class SaeManifoldAtomFit:
         coefficients, shape ``(M_k * p, M_k * p)`` in row-major
         ``(basis, channel)`` layout. Entries have squared ``X`` units. Present
         on fresh fits when the Rust payload includes posterior uncertainty.
+        Across :meth:`ManifoldSAE.save` / :meth:`ManifoldSAE.load` only the
+        band-relevant same-channel Schur blocks are persisted (the compact
+        per-atom factor), so a restored covariance is block-diagonal across
+        channels: every quantity the shape band reads is reproduced exactly, and
+        the cross-channel entries the band never touches are zero.
     shape_band_coords
         Optional coordinate grid for the posterior shape band, shape
         ``(G, d_k)``, in the same latent-coordinate units as ``coords``.

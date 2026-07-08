@@ -659,12 +659,12 @@ pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
 /// A token is coded by (1) naming which `k_active` of `g_dict` atoms fired —
 /// `selection_bits(g_dict, k_active)` bits — and (2) transmitting each firing's
 /// `coord_dim` latent coordinates. A unit-variance coordinate coded to the
-/// achieved RELATIVE distortion `1 − ev` costs
-/// `scalar_rate_bits(1, 1 − ev) = ½·log₂(1/(1 − ev))` bits — reverse-water-
-/// filling at the fit's operating EV: a higher EV means a finer distortion
-/// floor and therefore MORE code bits, the honest rate–distortion trade the
-/// matched-EV comparison hides. The decoder is stored once,
-/// `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
+/// achieved RELATIVE distortion `1 − ev` costs `scalar_rate_bits(1, 1 − ev)`
+/// bits — the numerically-kind reverse-water-filling rate `½·log₂(1 + 1/(1−ev))`
+/// (≈ `½·log₂(1/(1−ev))` once `ev` is high) at the fit's operating EV: a higher
+/// EV means a finer distortion floor and therefore MORE code bits, the honest
+/// rate–distortion trade the matched-EV comparison hides. The decoder is stored
+/// once, `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
 ///
 /// `bits_per_token = total_bits / n_tokens` is the headline. It is the code
 /// length per token of the WHOLE representation (codes + amortised dictionary),
