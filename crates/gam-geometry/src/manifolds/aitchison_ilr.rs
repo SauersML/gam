@@ -694,6 +694,179 @@ mod tests {
         });
     }
 
+    /// Pinned-output parity with the pre-migration Python twins.
+    ///
+    /// The `expected_*` literals below are the outputs of the ORIGINAL
+    /// pure-torch `gamfit/torch/geometry.py` (commit d4aa7b85e~1, f64) on these
+    /// deterministic fixtures, generated before the torch surface was reduced
+    /// to FFI marshalling. Where a NumPy twin existed
+    /// (`gamfit._response_geometry`, already Rust-routed) the generator also
+    /// asserted torch-vs-numpy agreement at ≤ 4.5e-16, so one set of literals
+    /// pins BOTH pre-migration Python surfaces. Tolerance 1e-12.
+    #[test]
+    fn pinned_python_twin_parity_fixtures() {
+        let x = array![
+            [0.2_f64, 0.5, 0.3],
+            [0.1, 0.1, 0.8],
+            [0.25, 0.4, 0.35]
+        ];
+        let base = array![0.25_f64, 0.35, 0.40];
+        let w = array![0.2_f64, 0.3, 0.5];
+        let z2 = array![[0.4_f64, -0.2], [0.1, 0.7], [-0.3, 0.05]];
+        let z3 = array![
+            [0.1_f64, -0.05, -0.05],
+            [0.2, 0.1, -0.3],
+            [0.0, 0.05, -0.05]
+        ];
+        let sphere_base = array![0.0_f64, 0.0, 1.0];
+        let sphere_tangent = array![[0.05_f64, -0.03, 0.0], [0.3, 0.4, 0.0], [-0.2, 0.1, 0.0]];
+        let sphere_values = array![[0.6_f64, 0.8, 0.0], [0.0, 0.6, 0.8], [1.0, 0.0, 0.0]];
+
+        let expected_clr = array![
+            [-0.44058527999410635_f64, 0.47570545188004865, -0.035120171885942186],
+            [-0.6931471805599452, -0.6931471805599452, 1.3862943611198906],
+            [-0.2688252886223159, 0.20117834062341966, 0.06764694799889681]
+        ];
+        let expected_ilr = array![
+            [-0.6479153900465996_f64, 0.0430132503996988],
+            [-2.3655649367851632e-17, -1.6978569090206654],
+            [-0.3323427534219476, -0.08285025262694215]
+        ];
+        let expected_inv_ilr_roundtrip = array![
+            [0.2_f64, 0.5, 0.29999999999999993],
+            [0.10000000000000002, 0.10000000000000002, 0.8],
+            [0.25, 0.4, 0.3499999999999999]
+        ];
+        let expected_alr = array![
+            [-0.4054651081081643_f64, 0.5108256237659907],
+            [-2.0794415416798357, -2.0794415416798357],
+            [-0.3364722366212129, 0.13353139262452277]
+        ];
+        let expected_inv_alr = array![
+            [0.45062670595568977_f64, 0.24730917976320385, 0.3020641142811064],
+            [0.2683154674734019, 0.48890265771885366, 0.24278187480774446],
+            [0.2653275510048439, 0.37651771737869627, 0.3581547316164598]
+        ];
+        let expected_gram = array![
+            [0.6666666666666667_f64, -0.3333333333333333],
+            [-0.3333333333333333, 0.6666666666666667]
+        ];
+        let expected_frechet =
+            array![0.20350911397742996_f64, 0.3091945687314347, 0.4872963172911353];
+        let expected_log_ilr = array![
+            [-0.4099935898507355_f64, 0.28940539131330195],
+            [0.2379218001958641, -1.4514647681070623],
+            [-0.09442095322608346, 0.163541888286661]
+        ];
+        let expected_log_clr = array![
+            [-0.1717599913717902_f64, 0.40805850388115206, -0.23629851250936162],
+            [-0.42432189193762904, -0.7607941285588418, 1.185116020496471],
+            [2.220446049250313e-16, 0.13353139262452307, -0.13353139262452263]
+        ];
+        let expected_log_alr = array![
+            [0.0645385211375713_f64, 0.6443570163905135],
+            [-1.6094379124341, -1.945910149055313],
+            [0.13353139262452268, 0.2670627852490455]
+        ];
+        let expected_exp_ilr = array![
+            [0.29979044135614885_f64, 0.23838106660410166, 0.4618284920397494],
+            [0.351135641326721, 0.4267607158491462, 0.2221036428241327],
+            [0.19998199702310523, 0.42793172119833767, 0.3720862817785571]
+        ];
+        let expected_exp_clr = array![
+            [0.2791639875514708_f64, 0.3363901391426469, 0.3844458733058823],
+            [0.30890688767827745, 0.3913147149244714, 0.29977839739725126],
+            [0.25039144858679213, 0.36852100975062485, 0.381087541662583]
+        ];
+        let expected_exp_alr = array![
+            [0.35200752444440936_f64, 0.27046015557084196, 0.3775323199847487],
+            [0.20005176581886308, 0.5103253169698176, 0.2896229172113192],
+            [0.19430799370114754, 0.38603063561098605, 0.4196613706878664]
+        ];
+        let expected_sphere_log = array![
+            [0.9424777960769379_f64, 1.2566370614359172, 0.0],
+            [0.0, 0.6435011087932844, 0.0],
+            [1.5707963267948966, 0.0, 0.0]
+        ];
+        let expected_sphere_exp = array![
+            [0.04997167148294343_f64, -0.029983002889766058, 0.9983004816120811],
+            [0.2876553231625218, 0.3835404308833624, 0.8775825618903728],
+            [-0.19833749504312567, 0.09916874752156284, 0.9751039932104795]
+        ];
+
+        let tol = 1e-12_f64;
+        let assert_close = |label: &str, got: &Array2<f64>, want: &Array2<f64>| {
+            assert_eq!(got.dim(), want.dim(), "{label}: shape mismatch");
+            let mut max_d = 0.0_f64;
+            for (g, w) in got.iter().zip(want.iter()) {
+                let d = (g - w).abs();
+                if d > max_d {
+                    max_d = d;
+                }
+            }
+            assert!(
+                max_d <= tol,
+                "{label}: max |rust − pinned-python| = {max_d} exceeds {tol}"
+            );
+        };
+
+        assert_close("clr", &simplex::clr(x.view()).unwrap(), &expected_clr);
+        let ilr_out = ilr(x.view()).unwrap();
+        assert_close("ilr", &ilr_out, &expected_ilr);
+        assert_close(
+            "inverse_ilr(ilr(x))",
+            &inverse_ilr(ilr_out.view()).unwrap(),
+            &expected_inv_ilr_roundtrip,
+        );
+        assert_close("alr", &simplex::alr(x.view(), -1).unwrap(), &expected_alr);
+        assert_close(
+            "inverse_alr",
+            &simplex::inverse_alr(z2.view(), -1).unwrap(),
+            &expected_inv_alr,
+        );
+        assert_close(
+            "aitchison_metric",
+            &aitchison_metric(3).unwrap(),
+            &expected_gram,
+        );
+        let frechet = simplex::simplex_frechet_mean(x.view(), Some(w.view())).unwrap();
+        for (col, want) in expected_frechet.iter().enumerate() {
+            assert!(
+                (frechet[col] - want).abs() <= tol,
+                "frechet[{col}]: {} vs pinned {want}",
+                frechet[col]
+            );
+        }
+        for (label, coord, want) in [
+            ("log_map ilr", LogRatioCoord::Ilr, &expected_log_ilr),
+            ("log_map clr", LogRatioCoord::Clr, &expected_log_clr),
+            ("log_map alr", LogRatioCoord::Alr, &expected_log_alr),
+        ] {
+            let (value, _) = simplex_log_map_jet(x.view(), base.view(), coord, -1).unwrap();
+            assert_close(label, &value, want);
+        }
+        for (label, coord, tangent, want) in [
+            ("exp_map ilr", LogRatioCoord::Ilr, &z2, &expected_exp_ilr),
+            ("exp_map clr", LogRatioCoord::Clr, &z3, &expected_exp_clr),
+            ("exp_map alr", LogRatioCoord::Alr, &z2, &expected_exp_alr),
+        ] {
+            let (value, _) = simplex_exp_map_jet(tangent.view(), base.view(), coord, -1).unwrap();
+            assert_close(label, &value, want);
+        }
+        assert_close(
+            "sphere_log_map",
+            &super::super::sphere::response_sphere_log_map(
+                sphere_values.view(),
+                sphere_base.view(),
+            )
+            .unwrap(),
+            &expected_sphere_log,
+        );
+        let (sphere_exp, _) =
+            sphere_exp_map_jet(sphere_tangent.view(), sphere_base.view()).unwrap();
+        assert_close("sphere_exp_map", &sphere_exp, &expected_sphere_exp);
+    }
+
     #[test]
     fn parse_log_ratio_coord_maps_simplex_to_ilr() {
         assert_eq!(parse_log_ratio_coord("simplex").unwrap(), LogRatioCoord::Ilr);
