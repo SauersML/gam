@@ -454,13 +454,22 @@ def _fit_ours_torch(
         atom_manifold=atom_manifold,
         atom_basis=atom_basis,
         sparsity={"kind": "softmax_topk", "target_k": top_k},
+        # fp32 for the GPU TRAINING lane: the library default is float64
+        # (f64-first everywhere else), but B200-class GPUs have token FP64
+        # throughput — the fp64 default measured 0.07 steps/s on the paper
+        # config (~24 h/run) with the SAME math available ~40x faster in
+        # fp32. The FFI basis kernels already compute their jets in f64
+        # internally and cast back, and all downstream RD/EV metrics are
+        # f64 numpy on the exported arrays, so lane accuracy is unaffected.
+        dtype=torch.float32,
     )
     model = ManifoldSAE(cfg).to(device)
-    x_all = torch.as_tensor(np.asarray(train_x, dtype=np.float64), device=device)
+    x_all = torch.as_tensor(np.asarray(train_x, dtype=np.float32), device=device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
     t0 = time.perf_counter()
     model.train()
+    last_log = t0
     for step in range(steps):
         idx = rng.integers(0, x_all.shape[0], size=min(batch_size, x_all.shape[0]))
         batch = x_all[idx]
@@ -469,29 +478,37 @@ def _fit_ours_torch(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        if step % 200 == 0 or step == steps - 1:
-            rate = (step + 1) / max(time.perf_counter() - t0, 1e-9)
+        now = time.perf_counter()
+        # Time-based heartbeat (plus the periodic/final step): a slow lane must
+        # never be log-silent — the fp64 paper lane sat 7 h with one line
+        # because step 201 (the next `% 200` hit) was ~48 min away at best, so
+        # "stalled" and "alive but slow" were indistinguishable from the log.
+        if step % 200 == 0 or step == steps - 1 or now - last_log >= 30.0:
+            rate = (step + 1) / max(now - t0, 1e-9)
             print(
                 f"[ours_torch] step {step + 1}/{steps} loss={float(loss.detach()):.5f} "
                 f"({rate:.2f} steps/s)",
                 flush=True,
             )
+            last_log = now
     fit_seconds = time.perf_counter() - t0
     model.eval()
     zs, curves_all, recons, positions = [], [], [], []
     with torch.no_grad():
-        xt = torch.as_tensor(np.asarray(test_x, dtype=np.float64), device=device)
+        xt = torch.as_tensor(np.asarray(test_x, dtype=np.float32), device=device)
         for start in range(0, xt.shape[0], 8192):
             out = model(xt[start:start + 8192])
             zs.append(out.z.cpu().numpy())
             curves_all.append(out.curves.cpu().numpy())
             recons.append(out.x_hat.cpu().numpy())
             positions.append(out.positions.cpu().numpy())
-    z = np.concatenate(zs, axis=0)
-    curves = np.concatenate(curves_all, axis=0)  # (N, F, n_basis)
-    recon = np.concatenate(recons, axis=0)
-    pos = np.concatenate(positions, axis=0)  # (N, F, rank_embed)
-    dec = model.decoder_blocks.detach().cpu().numpy()  # (F, n_basis, d)
+    # Metrics stay f64: lift the fp32 lane exports once, here, so every
+    # downstream EV/bits accumulation runs in float64 numpy as before.
+    z = np.concatenate(zs, axis=0).astype(np.float64)
+    curves = np.concatenate(curves_all, axis=0).astype(np.float64)  # (N, F, n_basis)
+    recon = np.concatenate(recons, axis=0).astype(np.float64)
+    pos = np.concatenate(positions, axis=0).astype(np.float64)  # (N, F, rank_embed)
+    dec = model.decoder_blocks.detach().cpu().numpy().astype(np.float64)  # (F, n_basis, d)
 
     def contribution(g: int) -> np.ndarray:
         return z[:, g:g + 1] * (curves[:, g, :] @ dec[g])

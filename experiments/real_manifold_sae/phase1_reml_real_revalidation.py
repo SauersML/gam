@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -140,6 +141,14 @@ def run_config(z: np.ndarray, cfg: dict) -> dict:
         out["status"] = type(exc).__name__
         out["error"] = str(exc)[:2000]
         out["traceback_tail"] = traceback.format_exc()[-1500:]
+        # HARNESS bugs are not scientific refusals: a typed gamfit abort
+        # (RuntimeError/ValueError) is a recorded RESULT (the repro family's
+        # expected pre-fix outcome), but AttributeError/TypeError/KeyError etc.
+        # mean THIS SCRIPT is broken against the wheel's surface — that must
+        # fail the job, never exit 0 with empty rows (the r3 silent-green).
+        out["harness_fatal"] = isinstance(
+            exc, (AttributeError, TypeError, KeyError, NameError, ImportError)
+        )
     out["wall_seconds"] = round(time.time() - t0, 2)
     return out
 
@@ -201,6 +210,7 @@ def main() -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     pca = PcaCache(z_raw, args.device)
+    harness_fatal: list[str] = []
     for cfg in configs:
         proj, ev_frac = pca.project(cfg["d_pca"])
         cfg["pca_ev_fraction"] = round(ev_frac, 4)
@@ -215,7 +225,20 @@ def main() -> None:
             f"r2={result.get('reconstruction_r2')} t={result['wall_seconds']}s",
             flush=True,
         )
+        if result["status"] != "survived":
+            # Surface the WHY in the job log, not only the jsonl: the r3 wave
+            # printed bare 'AttributeError r2=None' and exited green, so the
+            # failure was invisible until someone opened the jsonl.
+            print(f"[phase1] {cfg['name']}: error={result.get('error')}", flush=True)
+            print(f"[phase1] {cfg['name']}: traceback tail:\n"
+                  f"{result.get('traceback_tail')}", flush=True)
+        if result.get("harness_fatal"):
+            harness_fatal.append(cfg["name"])
     print("[phase1] ALL CONFIGS DONE", flush=True)
+    if harness_fatal:
+        print(f"[phase1] HARNESS-FATAL configs (script/wheel surface mismatch): "
+              f"{harness_fatal} — exiting nonzero", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

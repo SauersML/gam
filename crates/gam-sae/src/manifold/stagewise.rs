@@ -269,6 +269,32 @@ fn emit_stagewise_progress(
     progress: &mut Option<&mut StagewiseProgressCallback<'_>>,
     event: StagewiseProgress<'_>,
 ) -> Result<(), String> {
+    // Birth-round OUTCOMES are additionally logged at the default-visible level
+    // (the same grade the #1026 incumbent-restore and shape-uncertainty
+    // fallback lines use; the crate's default filter is Warn): a stagewise fit
+    // on real data is a multi-hour loop of exactly `births + rejections` such
+    // events, and a driver that wires no progress callback (the pyffi
+    // `sae_manifold_fit_stagewise` path) was LOG-SILENT for the whole fit — a
+    // 7 h T2 circle run produced zero lines, so a live fit was
+    // indistinguishable from a hang. Cadence is bounded by `max_births + 2`
+    // per fit, so this is not a per-row/per-iteration hot-path log.
+    match event.event {
+        StagewiseEventKind::BirthAccepted | StagewiseEventKind::BirthRejected => {
+            let fmt = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.4}"));
+            log::warn!(
+                "[stagewise] birth round {} {:?}: K={} accepted={} rejected={} ev={} reml {} -> {}",
+                event.birth_round,
+                event.event,
+                event.k_atoms,
+                event.births_accepted,
+                event.births_rejected,
+                fmt(event.ev),
+                fmt(event.joint_reml_before),
+                fmt(event.joint_reml_after),
+            );
+        }
+        _ => {}
+    }
     if let Some(callback) = progress.as_deref_mut() {
         callback(event)?;
     }
