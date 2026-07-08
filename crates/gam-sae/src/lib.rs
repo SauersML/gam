@@ -4,6 +4,7 @@ pub mod front_door;
 pub mod attention_kernel;
 pub mod atom_codes;
 pub mod basis;
+pub mod basis_gpu;
 pub mod candidate_index;
 pub mod certificate_impls;
 pub mod certificates;

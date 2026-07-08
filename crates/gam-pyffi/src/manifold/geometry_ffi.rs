@@ -681,6 +681,39 @@ fn sae_sinkhorn_balance_bias<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Device-resident periodic basis+jet for the torch manifold-SAE lane.
+///
+/// `t_dev_ptr`, `phi_dev_ptr`, `jet_dev_ptr` are RAW CUDA device addresses of
+/// caller-owned (torch) float64 tensors on device `ordinal`: `t` is `(n,)` (or
+/// any contiguous layout of `n` doubles), `phi` and `jet` are contiguous
+/// `(n, 2*n_harmonics + 1)` buffers the kernel fills in place. The caller must
+/// have synchronized the producing stream (`torch.cuda.synchronize()`); the
+/// kernel's stream is synchronized before this returns. Mirrors the CPU
+/// `basis_with_jet("periodic", ...)` exactly — the d = 1 jet `(n, m, 1)` is
+/// contiguous as `(n, m)`. See `gam_sae::basis_gpu`.
+#[pyfunction]
+fn sae_periodic_basis_with_jet_cuda(
+    py: Python<'_>,
+    ordinal: usize,
+    t_dev_ptr: u64,
+    n: usize,
+    n_harmonics: usize,
+    phi_dev_ptr: u64,
+    jet_dev_ptr: u64,
+) -> PyResult<()> {
+    py.detach(move || {
+        gam::terms::sae::basis_gpu::sae_periodic_basis_with_jet_device(
+            ordinal,
+            t_dev_ptr,
+            n,
+            n_harmonics,
+            phi_dev_ptr,
+            jet_dev_ptr,
+        )
+    })
+    .map_err(PyValueError::new_err)
+}
+
 #[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
@@ -4318,6 +4351,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;

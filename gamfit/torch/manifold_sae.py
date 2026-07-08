@@ -444,6 +444,30 @@ class _BasisWithJetFn(torch.autograd.Function):
         params_json: str,
     ) -> torch.Tensor:
         params = _decode_params_json(params_json)
+        if t.is_cuda and kind == "periodic":
+            # Device-resident lane: the Rust NVRTC kernel
+            # (`gam_sae::basis_gpu`) writes phi/jet straight into torch-owned
+            # CUDA buffers — no host round-trip, and the basis math stays
+            # single-sourced in Rust (the CPU path below is the parity oracle).
+            # The pre-call synchronize orders torch's producing stream before
+            # the kernel's stream; the FFI synchronizes its own stream before
+            # returning, so the outputs are visible to any subsequent reader.
+            n_harm = int(params["n_harmonics"])
+            m = 2 * n_harm + 1
+            t64 = t.detach().to(dtype=torch.float64).contiguous()
+            phi = torch.empty((t64.shape[0], m), dtype=torch.float64, device=t.device)
+            jet = torch.empty((t64.shape[0], m, 1), dtype=torch.float64, device=t.device)
+            torch.cuda.synchronize(t.device)
+            rust_module().sae_periodic_basis_with_jet_cuda(
+                int(t.device.index or 0),
+                t64.data_ptr(),
+                int(t64.shape[0]),
+                n_harm,
+                phi.data_ptr(),
+                jet.data_ptr(),
+            )
+            ctx.save_for_backward(jet.to(dtype=t.dtype))
+            return phi.to(dtype=t.dtype)
         phi_np, jet_np, _penalty_np = rust_module().basis_with_jet(
             kind, to_numpy_f64(t), params
         )
