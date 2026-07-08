@@ -61,6 +61,41 @@ pub struct AmortizedCode {
     pub amplitudes: Array2<f64>,
 }
 
+/// Per-axis PERIODICITY of one atom's latent coordinates, one entry per latent
+/// axis (its length equals the atom's `latent_dim`): `Some(period)` marks a
+/// PERIODIC (circle-phase) axis whose coordinate wraps modulo `period` — `1.0`
+/// for the fraction-of-period convention the periodic/torus/cylinder bases use,
+/// `TAU` for a longitude in radians — and `None` marks a flat (Euclidean or
+/// bounded-interval) axis with no wrap. This is a STRUCTURAL property, read from
+/// the atom's basis kind / [`LatentManifold`] (`Circle { period }` ⇒
+/// `Some(period)`; `Euclidean`/`Interval` ⇒ `None`), never inferred from the
+/// coordinate values.
+pub type AxisPeriods = Vec<Option<f64>>;
+
+// ── Why periodic coordinates MUST be regressed through a circular embedding ──
+//
+// A circle coordinate `t ∈ [0, period)` identifies `0` with `period`: the seam
+// is a labelling artefact, not a feature of the geometry. When the chart seam
+// lands INSIDE the data cloud, the supervision targets for `t` straddle it —
+// some rows carry `t ≈ 0⁺`, physically-adjacent rows carry `t ≈ period⁻`. A raw
+// least-squares regression of `t` estimates the conditional ARITHMETIC mean
+// `E[t | x]`, which for such a straddling conditional collapses to the midpoint
+// (`mean(0.02·P, 0.98·P) = 0.5·P`) — the ANTIPODE of the true location, the
+// single most-wrong point on the circle. Raw regression is therefore not merely
+// noisy on periodic axes; it is antipode-BIASED wherever the seam is in-cloud.
+//
+// The population-consistent estimator on the circle regresses the EMBEDDING
+// `θ ↦ (cos θ, sin θ)`, `θ = 2π t / period`. Each embedding coordinate is an
+// ordinary (seam-invariant) scalar, so `E[cos θ | x]` and `E[sin θ | x]` are
+// well-posed linear-regression targets; `atan2(Ê[sin], Ê[cos])` recovers the
+// conditional MEAN DIRECTION — the Fréchet mean of the circular conditional
+// under the chord metric — which is exactly the intrinsic circular mean and is
+// invariant to where the seam is drawn. Squared error in the embedding equals
+// `2(1 − cos Δθ)`, the squared chordal distance, a monotone wrap-aware loss,
+// unlike the raw `(Δt)²` that charges a `0.02`-vs-`0.98` pair its full `0.96`.
+// Scoring mirrors this: per-axis coordinate error is wrapped by the period,
+// `err = min(|Δ| mod P, P − (|Δ| mod P))`, before it is squared or quantiled.
+
 /// The reconstruction-independent half of the amortization-gap artifact: how far
 /// the amortized (one-matmul) prediction sits from the exact per-row solution in
 /// coordinate, gate, and amplitude space. The explained-variance halves
@@ -429,6 +464,12 @@ pub struct LearnedAmortizedEncoder {
     target_std: Standardizer,
     k_atoms: usize,
     coord_dims: Vec<usize>,
+    /// Per-atom, per-axis periodicity of the latent coordinates. A `Some(period)`
+    /// axis was regressed through its circular embedding `(cos, sin)` and is
+    /// inverted back to `[0, period)` by `atan2` on `predict`; a `None` axis was
+    /// regressed and is emitted RAW. Length `K`; inner length = the atom's
+    /// latent dim.
+    coord_periods: Vec<AxisPeriods>,
     /// Pooled log marginal likelihood of the winning feature map (the capacity
     /// the evidence justified). Reported in the artifact.
     pub log_evidence: f64,
@@ -443,11 +484,20 @@ pub struct LearnedAmortizedEncoder {
 
 impl LearnedAmortizedEncoder {
     /// Assemble the `n × T` standardized target matrix from the exact solver's
-    /// per-row solution: `K` gate logits, `Σ_k d_k` coordinates, `K` amplitudes.
+    /// per-row solution: `K` gate logits, the coordinate block, then `K`
+    /// amplitudes. A NON-PERIODIC axis contributes one raw-`t` target column; a
+    /// PERIODIC axis (`coord_periods[atom][axis] = Some(period)`) contributes TWO
+    /// columns — its circular embedding `(cos 2πt/period, sin 2πt/period)` — so
+    /// the regression estimates the seam-invariant conditional mean direction
+    /// rather than the antipode-biased arithmetic mean of the wrapped angle (see
+    /// the module-level derivation above the `AxisPeriods` alias). Returns the
+    /// target matrix and the ORIGINAL per-atom coordinate dims (the emitted
+    /// coordinate width, not the embedded target width).
     fn stack_targets(
         logits: ArrayView2<'_, f64>,
         coords: &[Array2<f64>],
         amplitudes: ArrayView2<'_, f64>,
+        coord_periods: &[AxisPeriods],
     ) -> Result<(Array2<f64>, Vec<usize>), String> {
         let (n, k) = logits.dim();
         if amplitudes.dim() != (n, k) {
@@ -462,9 +512,36 @@ impl LearnedAmortizedEncoder {
                 coords.len()
             ));
         }
+        if coord_periods.len() != k {
+            return Err(format!(
+                "LearnedAmortizedEncoder: {} axis-period blocks but K={k}",
+                coord_periods.len()
+            ));
+        }
         let coord_dims: Vec<usize> = coords.iter().map(|c| c.ncols()).collect();
-        let coord_total: usize = coord_dims.iter().sum();
-        let t_dim = 2 * k + coord_total;
+        // Target width: one column per flat axis, TWO per periodic axis.
+        let mut coord_target_width = 0usize;
+        for (atom, &d) in coord_dims.iter().enumerate() {
+            if coord_periods[atom].len() != d {
+                return Err(format!(
+                    "LearnedAmortizedEncoder: atom {atom} has {} axis periods but latent dim {d}",
+                    coord_periods[atom].len()
+                ));
+            }
+            for axis in 0..d {
+                if let Some(period) = coord_periods[atom][axis] {
+                    if !(period.is_finite() && period > 0.0) {
+                        return Err(format!(
+                            "LearnedAmortizedEncoder: atom {atom} axis {axis} period {period} must be finite and positive"
+                        ));
+                    }
+                    coord_target_width += 2;
+                } else {
+                    coord_target_width += 1;
+                }
+            }
+        }
+        let t_dim = 2 * k + coord_target_width;
         let mut targets = Array2::<f64>::zeros((n, t_dim));
         for col in 0..k {
             for row in 0..n {
@@ -481,11 +558,24 @@ impl LearnedAmortizedEncoder {
             }
             let d = coord_dims[atom];
             for axis in 0..d {
-                for row in 0..n {
-                    targets[[row, offset + axis]] = coord[[row, axis]];
+                match coord_periods[atom][axis] {
+                    Some(period) => {
+                        let w = std::f64::consts::TAU / period;
+                        for row in 0..n {
+                            let ang = coord[[row, axis]] * w;
+                            targets[[row, offset]] = ang.cos();
+                            targets[[row, offset + 1]] = ang.sin();
+                        }
+                        offset += 2;
+                    }
+                    None => {
+                        for row in 0..n {
+                            targets[[row, offset]] = coord[[row, axis]];
+                        }
+                        offset += 1;
+                    }
                 }
             }
-            offset += d;
         }
         for col in 0..k {
             for row in 0..n {
@@ -496,21 +586,48 @@ impl LearnedAmortizedEncoder {
     }
 
     /// Fit the distilled encoder against the exact solver's training-stream
-    /// solution. `x` is the `n × p` ambient corpus; `logits`/`amplitudes` are
-    /// `n × K`; `coords` is one `n × d_k` block per atom. The evidence chooses
-    /// between the linear and the diagonal-quadratic feature map.
+    /// solution, treating EVERY latent axis as flat (Euclidean). `x` is the
+    /// `n × p` ambient corpus; `logits`/`amplitudes` are `n × K`; `coords` is one
+    /// `n × d_k` block per atom. The evidence chooses between the linear and the
+    /// diagonal-quadratic feature map.
+    ///
+    /// Atoms with PERIODIC (circle-phase) axes — periodic/torus/cylinder/sphere-
+    /// longitude — MUST instead use [`Self::fit_with_axis_periods`], which
+    /// regresses those axes through their circular embedding; a raw fit of a
+    /// periodic coordinate whose seam lands in-cloud is antipode-biased (see the
+    /// module-level derivation). This entry point is the all-flat special case.
     pub fn fit(
         x: ArrayView2<'_, f64>,
         logits: ArrayView2<'_, f64>,
         coords: &[Array2<f64>],
         amplitudes: ArrayView2<'_, f64>,
     ) -> Result<Self, String> {
+        let coord_periods: Vec<AxisPeriods> =
+            coords.iter().map(|c| vec![None; c.ncols()]).collect();
+        Self::fit_with_axis_periods(x, logits, coords, amplitudes, &coord_periods)
+    }
+
+    /// Fit the distilled encoder with per-atom, per-axis PERIODICITY threaded
+    /// from the atoms' basis kinds (`Circle { period } ⇒ Some(period)`,
+    /// `Euclidean`/`Interval ⇒ None`). Periodic axes are regressed through their
+    /// circular embedding `(cos, sin)` and inverted to `[0, period)` on
+    /// `predict`; flat axes are regressed raw and behave EXACTLY as [`Self::fit`].
+    /// `coord_periods` has one [`AxisPeriods`] per atom, each of length equal to
+    /// that atom's latent dim.
+    pub fn fit_with_axis_periods(
+        x: ArrayView2<'_, f64>,
+        logits: ArrayView2<'_, f64>,
+        coords: &[Array2<f64>],
+        amplitudes: ArrayView2<'_, f64>,
+        coord_periods: &[AxisPeriods],
+    ) -> Result<Self, String> {
         let (n, _p) = x.dim();
         let k_atoms = logits.ncols();
         if n == 0 {
             return Err("LearnedAmortizedEncoder::fit: empty training corpus".to_string());
         }
-        let (targets, coord_dims) = Self::stack_targets(logits, coords, amplitudes)?;
+        let (targets, coord_dims) =
+            Self::stack_targets(logits, coords, amplitudes, coord_periods)?;
         let target_std = Standardizer::fit(targets.view());
         let targets_std = target_std.apply(targets.view());
 
@@ -555,6 +672,7 @@ impl LearnedAmortizedEncoder {
             target_std,
             k_atoms,
             coord_dims,
+            coord_periods: coord_periods.to_vec(),
             log_evidence: fit.log_evidence,
             feature_dim,
             effective_dof: fit.effective_dof,
@@ -595,15 +713,32 @@ impl LearnedAmortizedEncoder {
         }
         let mut coords = Vec::with_capacity(k);
         let mut offset = k;
-        for &d in &self.coord_dims {
+        for (atom, &d) in self.coord_dims.iter().enumerate() {
             let mut block = Array2::<f64>::zeros((m, d));
             for axis in 0..d {
-                for row in 0..m {
-                    block[[row, axis]] = pred[[row, offset + axis]];
+                match self.coord_periods[atom][axis] {
+                    // Periodic axis: two predicted columns (ĉ, ŝ) estimate the
+                    // conditional mean direction; invert via atan2 and wrap into
+                    // `[0, period)`. `rem_euclid` maps the `(-period/2, period/2]`
+                    // principal branch onto the canonical `[0, period)` chart.
+                    Some(period) => {
+                        let w = std::f64::consts::TAU / period;
+                        for row in 0..m {
+                            let c = pred[[row, offset]];
+                            let s = pred[[row, offset + 1]];
+                            block[[row, axis]] = (s.atan2(c) / w).rem_euclid(period);
+                        }
+                        offset += 2;
+                    }
+                    None => {
+                        for row in 0..m {
+                            block[[row, axis]] = pred[[row, offset]];
+                        }
+                        offset += 1;
+                    }
                 }
             }
             coords.push(block);
-            offset += d;
         }
         let mut amplitudes = Array2::<f64>::zeros((m, k));
         for col in 0..k {
@@ -633,6 +768,35 @@ impl LearnedAmortizedEncoder {
         exact_coords: &[Array2<f64>],
         exact_amplitudes: ArrayView2<'_, f64>,
     ) -> Result<AmortizationErrorStats, String> {
+        let coord_periods: Vec<AxisPeriods> = predicted
+            .coords
+            .iter()
+            .map(|c| vec![None; c.ncols()])
+            .collect();
+        Self::error_stats_wrapped(
+            predicted,
+            exact_logits,
+            exact_coords,
+            exact_amplitudes,
+            &coord_periods,
+        )
+    }
+
+    /// Wrap-aware amortization-gap statistics: identical to [`Self::error_stats`]
+    /// except each per-axis coordinate error is WRAPPED by the axis period before
+    /// it is squared or quantiled — `err = min(|Δ| mod P, P − (|Δ| mod P))` — so a
+    /// `t̂ = 0.98` against `t = 0.02` on a unit circle scores `0.04`, not `0.96`.
+    /// A `None` axis is scored on the raw magnitude, so passing all-`None`
+    /// reproduces [`Self::error_stats`] bit-for-bit. `coord_periods` carries one
+    /// [`AxisPeriods`] per atom (length = that atom's latent dim), the same
+    /// structural periodicity the encoder was fit with.
+    pub fn error_stats_wrapped(
+        predicted: &AmortizedCode,
+        exact_logits: ArrayView2<'_, f64>,
+        exact_coords: &[Array2<f64>],
+        exact_amplitudes: ArrayView2<'_, f64>,
+        coord_periods: &[AxisPeriods],
+    ) -> Result<AmortizationErrorStats, String> {
         let (n, k) = predicted.logits.dim();
         if exact_logits.dim() != (n, k) || exact_amplitudes.dim() != (n, k) {
             return Err("error_stats: exact logits/amplitudes shape mismatch".to_string());
@@ -640,7 +804,12 @@ impl LearnedAmortizedEncoder {
         if predicted.coords.len() != k || exact_coords.len() != k {
             return Err("error_stats: coord block count mismatch".to_string());
         }
-        // Coordinate absolute errors pooled over (row, atom, axis).
+        if coord_periods.len() != k {
+            return Err("error_stats: axis-period block count mismatch".to_string());
+        }
+        // Coordinate absolute errors pooled over (row, atom, axis), wrapped by the
+        // axis period so a wrap-around discrepancy is charged its true geodesic
+        // magnitude on the circle rather than its raw seam-crossing magnitude.
         let mut abs_errs: Vec<f64> = Vec::new();
         let mut coord_sq = 0.0_f64;
         let mut coord_cnt = 0usize;
@@ -650,9 +819,19 @@ impl LearnedAmortizedEncoder {
             if pc.dim() != ec.dim() {
                 return Err(format!("error_stats: coord block {atom} shape mismatch"));
             }
+            if coord_periods[atom].len() != pc.ncols() {
+                return Err(format!("error_stats: axis-period width mismatch on atom {atom}"));
+            }
             for row in 0..pc.nrows() {
                 for axis in 0..pc.ncols() {
-                    let e = (pc[[row, axis]] - ec[[row, axis]]).abs();
+                    let raw = (pc[[row, axis]] - ec[[row, axis]]).abs();
+                    let e = match coord_periods[atom][axis] {
+                        Some(period) => {
+                            let m = raw.rem_euclid(period);
+                            m.min(period - m)
+                        }
+                        None => raw,
+                    };
                     abs_errs.push(e);
                     coord_sq += e * e;
                     coord_cnt += 1;
@@ -920,6 +1099,264 @@ mod tests {
         assert!(
             pvar < 0.25,
             "on pure noise the encoder must shrink to the mean (pred var={pvar} should be «1)"
+        );
+    }
+
+    /// Ranks of a sample (0-based dense position on the sort), ties broken by
+    /// original order — sufficient for the continuous, tie-free coordinates here.
+    fn ranks(v: &[f64]) -> Vec<f64> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&i, &j| v[i].partial_cmp(&v[j]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut r = vec![0.0; v.len()];
+        for (rank, &i) in idx.iter().enumerate() {
+            r[i] = rank as f64;
+        }
+        r
+    }
+
+    /// Pearson correlation of two equal-length samples.
+    fn pearson(a: &[f64], b: &[f64]) -> f64 {
+        let n = a.len() as f64;
+        let ma = a.iter().sum::<f64>() / n;
+        let mb = b.iter().sum::<f64>() / n;
+        let mut cov = 0.0;
+        let mut va = 0.0;
+        let mut vb = 0.0;
+        for i in 0..a.len() {
+            let da = a[i] - ma;
+            let db = b[i] - mb;
+            cov += da * db;
+            va += da * da;
+            vb += db * db;
+        }
+        cov / (va.sqrt() * vb.sqrt())
+    }
+
+    /// Spearman rank correlation.
+    fn spearman(a: &[f64], b: &[f64]) -> f64 {
+        pearson(&ranks(a), &ranks(b))
+    }
+
+    /// PERIODIC-AXIS REGRESSION (the F-6 fix). A planted circle whose chart seam
+    /// lands INSIDE the data cloud: the coordinate `t ∈ [0, 1)` is uniform, so
+    /// rows straddle the `0/1` seam. The ambient features carry the circular
+    /// embedding `[cos 2πt, sin 2πt]`, so the embedding regression is exactly
+    /// linear and recovers `t` (rank correlation ≈ 1, small wrapped RMSE), while
+    /// the RAW regression of `t` — the OLD behavior — is antipode-biased: the
+    /// best linear predictor of the sawtooth `t` from `(cos, sin)` is pulled to
+    /// the interior `0.5 − const·sin 2πt`, never reaching the seam, so its wrapped
+    /// error is large. The embedding path must beat it by a wide margin.
+    #[test]
+    fn periodic_axis_recovered_by_embedding_while_raw_is_antipode_biased() {
+        let mut rng = Lcg(20250708);
+        let p = 4usize;
+        let make = |rng: &mut Lcg, n: usize| {
+            let mut x = Array2::<f64>::zeros((n, p));
+            let mut t = Array2::<f64>::zeros((n, 1));
+            for row in 0..n {
+                let ti = rng.next_f64(); // uniform in [0,1): seam is in-cloud
+                t[[row, 0]] = ti;
+                let ang = std::f64::consts::TAU * ti;
+                // Embedding features + two mild noise columns.
+                x[[row, 0]] = ang.cos() + 0.01 * rng.normal();
+                x[[row, 1]] = ang.sin() + 0.01 * rng.normal();
+                x[[row, 2]] = 0.01 * rng.normal();
+                x[[row, 3]] = 0.01 * rng.normal();
+            }
+            let logits = Array2::<f64>::from_elem((n, 1), 1.0);
+            let amplitudes = Array2::<f64>::from_elem((n, 1), 1.0);
+            (x, logits, vec![t], amplitudes)
+        };
+        let (x_tr, lg_tr, co_tr, am_tr) = make(&mut rng, 500);
+        let periods: Vec<AxisPeriods> = vec![vec![Some(1.0)]];
+        let enc = LearnedAmortizedEncoder::fit_with_axis_periods(
+            x_tr.view(),
+            lg_tr.view(),
+            &co_tr,
+            am_tr.view(),
+            &periods,
+        )
+        .expect("embedding encoder fits");
+        // The raw (old-behavior) encoder on the SAME supervision.
+        let enc_raw = LearnedAmortizedEncoder::fit(x_tr.view(), lg_tr.view(), &co_tr, am_tr.view())
+            .expect("raw encoder fits");
+
+        let (x_te, lg_te, co_te, am_te) = make(&mut rng, 300);
+        let code = enc.predict(x_te.view()).expect("embedding predict");
+        let code_raw = enc_raw.predict(x_te.view()).expect("raw predict");
+
+        // Recovered coordinates stay on the chart `[0, 1)`.
+        for row in 0..code.coords[0].nrows() {
+            let th = code.coords[0][[row, 0]];
+            assert!(
+                (0.0..1.0).contains(&th),
+                "embedding-recovered coord must be wrapped into [0,1), got {th}"
+            );
+        }
+
+        // Wrapped RMSE: embedding recovers the circle, raw does not.
+        let stats = LearnedAmortizedEncoder::error_stats_wrapped(
+            &code,
+            lg_te.view(),
+            &co_te,
+            am_te.view(),
+            &periods,
+        )
+        .expect("wrapped stats");
+        let stats_raw = LearnedAmortizedEncoder::error_stats_wrapped(
+            &code_raw,
+            lg_te.view(),
+            &co_te,
+            am_te.view(),
+            &periods,
+        )
+        .expect("wrapped stats raw");
+        assert!(
+            stats.coord_rmse < 0.05,
+            "embedding regression must recover the circle: wrapped rmse={} (< 0.05)",
+            stats.coord_rmse
+        );
+        assert!(
+            stats_raw.coord_rmse > 0.15,
+            "raw regression must be antipode-biased on the in-cloud seam: wrapped rmse={} (> 0.15)",
+            stats_raw.coord_rmse
+        );
+        assert!(
+            stats.coord_rmse < 0.25 * stats_raw.coord_rmse,
+            "embedding must beat raw by a wide margin: {} vs {}",
+            stats.coord_rmse,
+            stats_raw.coord_rmse
+        );
+
+        // Rank correlation of recovered vs true coordinate ≈ 1 for the embedding
+        // path (near-identity recovery). The raw path's antipode bias is already
+        // pinned by the wide RMSE margin above; the intrinsic recovery is what the
+        // rank correlation certifies here.
+        let t_true: Vec<f64> = (0..co_te[0].nrows()).map(|r| co_te[0][[r, 0]]).collect();
+        let t_hat: Vec<f64> = (0..code.coords[0].nrows())
+            .map(|r| code.coords[0][[r, 0]])
+            .collect();
+        let rho = spearman(&t_true, &t_hat);
+        assert!(
+            rho > 0.9,
+            "embedding-recovered coordinate must be rank-consistent with truth: spearman={rho}"
+        );
+    }
+
+    /// A NON-PERIODIC (all-`None`) fit is bit-identical to the previous raw
+    /// behavior: `fit` and `fit_with_axis_periods(..all None..)` produce the same
+    /// prediction, and — crucially — the coordinates pass THROUGH raw (no `atan2`
+    /// wrap), so a target with magnitude far outside `[0, 1)` is reproduced at its
+    /// true scale (an `atan2`-inverted path could never emit `|t| > period/2`).
+    #[test]
+    fn non_periodic_axis_is_bit_identical_raw_passthrough() {
+        let mut rng = Lcg(4242);
+        let n = 300usize;
+        let p = 5usize;
+        let k = 2usize;
+        // Linear map to a wide-range coordinate (well outside [0,1)).
+        let w_coord = Array::from_shape_fn((p, k), |_| 3.0 * rng.normal());
+        let make = |rng: &mut Lcg, n: usize| {
+            let x = Array::from_shape_fn((n, p), |_| rng.normal());
+            let coords_flat = x.dot(&w_coord);
+            let coords: Vec<Array2<f64>> = (0..k)
+                .map(|a| {
+                    let mut c = Array2::<f64>::zeros((n, 1));
+                    for row in 0..n {
+                        c[[row, 0]] = coords_flat[[row, a]];
+                    }
+                    c
+                })
+                .collect();
+            let logits = Array2::<f64>::from_elem((n, k), 1.0);
+            let amplitudes = Array2::<f64>::from_elem((n, k), 1.0);
+            (x, logits, coords, amplitudes)
+        };
+        let (x_tr, lg_tr, co_tr, am_tr) = make(&mut rng, n);
+        let enc_default =
+            LearnedAmortizedEncoder::fit(x_tr.view(), lg_tr.view(), &co_tr, am_tr.view())
+                .expect("default fit");
+        let all_none: Vec<AxisPeriods> = co_tr.iter().map(|c| vec![None; c.ncols()]).collect();
+        let enc_none = LearnedAmortizedEncoder::fit_with_axis_periods(
+            x_tr.view(),
+            lg_tr.view(),
+            &co_tr,
+            am_tr.view(),
+            &all_none,
+        )
+        .expect("all-none fit");
+
+        let (x_te, ..) = make(&mut rng, 120);
+        let code_default = enc_default.predict(x_te.view()).expect("predict default");
+        let code_none = enc_none.predict(x_te.view()).expect("predict none");
+        let mut saw_out_of_unit = false;
+        for atom in 0..k {
+            for row in 0..code_default.coords[atom].nrows() {
+                let a = code_default.coords[atom][[row, 0]];
+                let b = code_none.coords[atom][[row, 0]];
+                assert!(
+                    a == b,
+                    "all-None periods must reproduce the raw fit bit-for-bit: {a} vs {b}"
+                );
+                if a.abs() > 1.0 {
+                    saw_out_of_unit = true;
+                }
+            }
+        }
+        assert!(
+            saw_out_of_unit,
+            "a flat axis must pass through raw (out-of-[0,1) coords survive, not atan2-wrapped)"
+        );
+    }
+
+    /// WRAP-AWARE SCORING (the F-6 fix, scoring half). A `t̂ = 0.98` prediction
+    /// against a `t = 0.02` exact coordinate on a unit-period circle is a `0.04`
+    /// geodesic discrepancy, not `0.96`: the wrapped scorer charges the short arc.
+    /// The raw scorer (all-`None`) still charges the full `0.96`, pinning the
+    /// difference the fix makes.
+    #[test]
+    fn wrap_aware_scoring_charges_the_short_arc() {
+        let predicted = AmortizedCode {
+            logits: Array2::<f64>::from_elem((1, 1), 1.0),
+            coords: vec![Array2::from_shape_vec((1, 1), vec![0.98]).unwrap()],
+            amplitudes: Array2::<f64>::from_elem((1, 1), 1.0),
+        };
+        let exact_logits = Array2::<f64>::from_elem((1, 1), 1.0);
+        let exact_coords = vec![Array2::from_shape_vec((1, 1), vec![0.02]).unwrap()];
+        let exact_amp = Array2::<f64>::from_elem((1, 1), 1.0);
+        let periods: Vec<AxisPeriods> = vec![vec![Some(1.0)]];
+
+        let wrapped = LearnedAmortizedEncoder::error_stats_wrapped(
+            &predicted,
+            exact_logits.view(),
+            &exact_coords,
+            exact_amp.view(),
+            &periods,
+        )
+        .expect("wrapped stats");
+        assert!(
+            (wrapped.coord_rmse - 0.04).abs() < 1.0e-12,
+            "0.98 vs 0.02 on period 1 must score as the 0.04 short arc, got {}",
+            wrapped.coord_rmse
+        );
+        assert!(
+            (wrapped.coord_abs_err_quantiles[4] - 0.04).abs() < 1.0e-12,
+            "the max wrapped abs error must be the 0.04 short arc, got {}",
+            wrapped.coord_abs_err_quantiles[4]
+        );
+
+        // The raw scorer (no period) charges the full seam-crossing distance.
+        let raw = LearnedAmortizedEncoder::error_stats(
+            &predicted,
+            exact_logits.view(),
+            &exact_coords,
+            exact_amp.view(),
+        )
+        .expect("raw stats");
+        assert!(
+            (raw.coord_rmse - 0.96).abs() < 1.0e-12,
+            "the unwrapped scorer must charge the full 0.96, got {}",
+            raw.coord_rmse
         );
     }
 }
