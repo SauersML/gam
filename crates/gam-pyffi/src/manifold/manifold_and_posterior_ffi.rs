@@ -7231,6 +7231,50 @@ fn decoder_cov_from_channel_factors<'py>(
     Ok(cov.into_pyarray(py).unbind())
 }
 
+/// Canonicalize stale/degenerate periodic `n_harmonics` at ManifoldSAE ingestion
+/// (issue #2091 / #1132 — the harmonic-count repair that used to be reimplemented
+/// in the Python facade's `_canonical_n_harmonics`).
+///
+/// A periodic-family atom's basis width is `M = 2H + 1` with `H ≥ 1`. A stored
+/// plan value that collapsed to `≤ 0` (a born/fissioned atom recovered with a
+/// degenerate constant-only width) is floored to the harmonic count implied by
+/// the trained decoder width, `H = max(1, (M − 1) / 2)`. Non-periodic atoms, and
+/// periodic atoms whose stored `H` is already positive, pass through unchanged.
+/// Ingesting the canonical value makes OOS reconstruct / steer use the recovered
+/// harmonic count rather than the raw (possibly 0/stale) plan value.
+#[pyfunction(signature = (basis_kinds, raw_n_harmonics, decoder_widths))]
+fn sae_canonical_n_harmonics(
+    basis_kinds: Vec<String>,
+    raw_n_harmonics: Vec<i64>,
+    decoder_widths: Vec<i64>,
+) -> PyResult<Vec<i64>> {
+    if basis_kinds.len() != raw_n_harmonics.len() || basis_kinds.len() != decoder_widths.len() {
+        return Err(py_value_error(format!(
+            "sae_canonical_n_harmonics: basis_kinds ({}), raw_n_harmonics ({}), and \
+             decoder_widths ({}) must have equal length",
+            basis_kinds.len(),
+            raw_n_harmonics.len(),
+            decoder_widths.len()
+        )));
+    }
+    Ok(basis_kinds
+        .iter()
+        .zip(&raw_n_harmonics)
+        .zip(&decoder_widths)
+        .map(|((bk, &h), &width)| {
+            let kind = bk.to_lowercase().replace('-', "_");
+            if matches!(kind.as_str(), "periodic" | "periodic_spline" | "circle") && h <= 0 {
+                // floor((width − 1) / 2), then floor at 1. `width` is a decoder
+                // row count (≥ 1 in practice); the max(1, …) makes the degenerate
+                // width == 0 case land on 1 regardless of division rounding.
+                ((width - 1) / 2).max(1)
+            } else {
+                h
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 #[path = "../../tests/src_modules/lib_tests.rs"]
 mod tests;

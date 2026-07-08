@@ -327,20 +327,20 @@ def _canonical_n_harmonics(
     A periodic atom's basis width is ``M = 2H + 1`` with ``H >= 1``. A plan
     value that collapsed to ``<= 0`` (a born/fissioned atom recovered with a
     degenerate constant-only width) is floored to the harmonic count implied by
-    the trained decoder width, mirroring ``_functional_basis_params`` /
-    ``_periodic_shape_band``. Canonicalizing ``self._n_harmonics`` at ingestion
-    ensures OOS reconstruct and :meth:`ManifoldSAE.steer` use the recovered
-    value rather than the raw (possibly 0/stale) plan value. Non-periodic atoms
-    pass through unchanged.
+    the trained decoder width. The repair formula lives in the Rust owner
+    (#2091, SPEC thin-wrapper rule 8); canonicalizing ``self._n_harmonics`` at
+    ingestion ensures OOS reconstruct and :meth:`ManifoldSAE.steer` use the
+    recovered value rather than the raw (possibly 0/stale) plan value.
+    Non-periodic atoms pass through unchanged.
     """
-    out: list[int] = []
-    for bk, h, width in zip(basis_kinds, raw_n_harmonics, decoder_widths):
-        kind = str(bk).lower().replace("-", "_")
-        value = int(h)
-        if kind in {"periodic", "periodic_spline", "circle"} and value <= 0:
-            value = max(1, (int(width) - 1) // 2)
-        out.append(value)
-    return out
+    return [
+        int(h)
+        for h in rust_module().sae_canonical_n_harmonics(
+            [str(bk) for bk in basis_kinds],
+            [int(h) for h in raw_n_harmonics],
+            [int(w) for w in decoder_widths],
+        )
+    ]
 
 
 def _jsonable_value(value: Any) -> Any:
