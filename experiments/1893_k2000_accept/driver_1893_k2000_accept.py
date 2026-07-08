@@ -89,6 +89,42 @@ def load_digits() -> np.ndarray:
     return np.ascontiguousarray(_ld().data, dtype=np.float32)
 
 
+def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int) -> np.ndarray:
+    """Load a directory of `chunk_*.npy` activation shards (e.g. the creditscope
+    Qwen3.5-35B-A3B L30 residual set: 8 float16 shards, ~360k tokens total).
+
+    The shards are memory-mapped (never fully materialized); a deterministic
+    `max_rows`-row subsample is gathered per shard by fancy-index and only THEN
+    cast to float32, so the peak footprint is `max_rows × p` f32, not the full
+    corpus. `p` is read from the shard shape (it is the model d_model — never
+    hardcoded)."""
+    import glob
+    import os
+
+    files = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.npy")))
+    if not files:
+        raise SystemExit(f"no chunk_*.npy shards in {chunk_dir}")
+    mms = [np.load(f, mmap_mode="r") for f in files]
+    p = int(mms[0].shape[1])
+    for m in mms:
+        if int(m.shape[1]) != p:
+            raise SystemExit(f"inconsistent p across shards: {p} vs {m.shape[1]}")
+    counts = [int(m.shape[0]) for m in mms]
+    offsets = np.cumsum([0] + counts)
+    total = int(offsets[-1])
+    rng = np.random.default_rng(seed)
+    take = min(max_rows, total)
+    idx = np.sort(rng.choice(total, take, replace=False))
+    parts = []
+    for c, m in enumerate(mms):
+        sel = idx[(idx >= offsets[c]) & (idx < offsets[c + 1])] - offsets[c]
+        if sel.size:
+            parts.append(np.asarray(m[sel], dtype=np.float32))
+    out = np.concatenate(parts, axis=0)
+    rng.shuffle(out)  # de-correlate the split from shard/document order
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 # --------------------------------------------------------------------------- #
 # Live external TopK SAE baseline (Gao et al. TopK) on the SAME split.
 # --------------------------------------------------------------------------- #
@@ -129,10 +165,14 @@ def external_topk_ev_live(
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-mode", choices=["npz", "harvest_pythia70m", "digits"], default="npz")
+    ap.add_argument("--data-mode", choices=["chunkdir", "npz", "harvest_pythia70m", "digits"],
+                    default="chunkdir")
+    ap.add_argument("--chunk-dir", default=None, help="dir of chunk_*.npy activation shards")
+    ap.add_argument("--max-rows", type=int, default=120_000,
+                    help="deterministic row budget (train+held-out) subsampled from the corpus")
     ap.add_argument("--npz", default=None)
     ap.add_argument("--npz-key", default="acts")
-    ap.add_argument("--n-tokens", type=int, default=200_000)
+    ap.add_argument("--n-tokens", type=int, default=200_000, help="pythia-harvest token cap")
     ap.add_argument("--layer", type=int, default=4)
     ap.add_argument("--K", type=int, default=2000)
     ap.add_argument("--top-k", type=int, default=32)
@@ -151,7 +191,11 @@ def main() -> int:
     import gamfit
 
     rng = np.random.default_rng(args.seed)
-    if args.data_mode == "npz":
+    if args.data_mode == "chunkdir":
+        if not args.chunk_dir:
+            raise SystemExit("--data-mode chunkdir requires --chunk-dir DIR")
+        X = load_chunk_dir(args.chunk_dir, args.max_rows, args.seed)
+    elif args.data_mode == "npz":
         if not args.npz:
             raise SystemExit("--data-mode npz requires --npz PATH")
         X = load_npz(args.npz, args.npz_key)
@@ -160,8 +204,9 @@ def main() -> int:
     else:
         X = load_digits()
 
-    if X.shape[0] > args.n_tokens:
-        X = np.ascontiguousarray(X[rng.choice(X.shape[0], args.n_tokens, replace=False)])
+    # Cap any mode to the row budget (chunkdir already subsampled to --max-rows).
+    if X.shape[0] > args.max_rows:
+        X = np.ascontiguousarray(X[rng.choice(X.shape[0], args.max_rows, replace=False)])
     n, p = X.shape
 
     perm = rng.permutation(n)

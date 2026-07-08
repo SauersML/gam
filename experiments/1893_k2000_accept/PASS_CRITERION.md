@@ -36,14 +36,19 @@ SAE, at usable throughput? PASS iff ALL THREE legs hold (the driver prints
 - **Venv is PINNED per-job**: a fresh `python3 -m venv` + `pip install
   gamfit==$GAMFIT_VERSION numpy scikit-learn torch` — never trusts a shared venv's
   wheel. Submit with `GAMFIT_VERSION=<the ≥0.1.252 wheel>`.
-- **Data is MSI-resident + fail-loud**: `NPZ` must point at a real-activation file
-  on `/projects`; the sbatch `test -f`s it and aborts (rc 2) rather than degrading to
-  a synthetic fallback. Do NOT rely on in-job pythia harvesting (compute-node
-  internet is not guaranteed); `--data-mode harvest_pythia70m` stays available for a
-  later internet-capable run.
+- **Data is MSI-resident + fail-loud**: `CHUNK_DIR` defaults to the creditscope
+  Qwen3.5-35B-A3B **layer-30 residual** set —
+  `/projects/standard/hsiehph/sauer354/creditscope_acts/activations/layer_30_residual_post/`,
+  8 float16 `chunk_0000..0007.npy` shards, 360,002 tokens total (also the set the
+  #1026 close bar names). The sbatch `test -f`s `chunk_0000.npy` and aborts (rc 2)
+  rather than degrading to a synthetic fallback. The driver memory-maps the shards
+  and gathers a deterministic `--max-rows` (default 120k = ~100k train + 20k
+  held-out) subsample, casting to float32 only after subsetting; `p` (= the 35B
+  `d_model`) is read from the shard shape, never hardcoded. Do NOT rely on in-job
+  pythia harvesting (compute-node internet is not guaranteed); `--data-mode
+  harvest_pythia70m` / `--data-mode npz` stay available for other runs.
 
-## Operator-confirm items (not resolvable from the repo)
+## Operator-confirm item (not resolvable from the repo)
 
-- The exact MSI activation file + npz key (the #1942 map names emotions p=512 N=60k
-  and OLMo L18 PCA-64; pick the p≈512-or-more set that exists on `/projects`).
-- `GAMFIT_VERSION` — the published wheel to pin (lead sets it when PyPI serves it).
+- `GAMFIT_VERSION` — the published wheel to pin (lead sets it when PyPI serves the
+  `>= 2d86f98bb` wheel). Everything else defaults to the creditscope set.
