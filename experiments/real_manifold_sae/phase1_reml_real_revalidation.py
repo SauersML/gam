@@ -111,6 +111,18 @@ def run_config(z: np.ndarray, cfg: dict) -> dict:
             random_state=cfg.get("random_state", 0),
         )
         out["status"] = "survived"
+        out["fit_type"] = type(model).__name__
+        if not hasattr(model, "reconstruction_r2"):
+            # K>P front-door admission routes to the collapsed-LINEAR sparse-code
+            # trainer (SparseDictionaryFit) — the dense exact manifold engine is
+            # the small-K certification lane. Record the linear-lane numbers and
+            # label the lane so nobody mistakes this for a curved-REML survival.
+            out["lane"] = "sparse_linear"
+            out["explained_variance"] = float(model.explained_variance)
+            out["converged"] = bool(model.converged)
+            out["active"] = int(model.active)
+            return out | {"wall_seconds": round(time.time() - t0, 2)}
+        out["lane"] = "dense_manifold"
         out["reconstruction_r2"] = float(model.reconstruction_r2)
         out["penalized_loss_score"] = (
             None if model.penalized_loss_score is None else float(model.penalized_loss_score)
@@ -166,6 +178,10 @@ def main() -> None:
         dict(name="oc_D32_K128", d_pca=32, K=128, top_k=4, n_iter=40),
         dict(name="oc_D32_K256", d_pca=32, K=256, top_k=4, n_iter=30),
         dict(name="oc_D64_K512", d_pca=64, K=512, top_k=8, n_iter=30),
+        # Largest shapes the dense exact-manifold engine admits (K <= P): the
+        # curved-REML stress family — many atoms, top_k-sparse rows.
+        dict(name="dense_D64_K48", d_pca=64, K=48, top_k=4, n_iter=30),
+        dict(name="dense_D128_K96", d_pca=128, K=96, top_k=4, n_iter=30),
     ]
     if args.only:
         wanted = set(args.only.split(","))
