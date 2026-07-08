@@ -118,16 +118,26 @@ struct RowCertificate {
 ///
 /// `residual_coeffs[h] = (c_{h+1}, s_{h+1})` stores the Fourier residual after
 /// subtracting the current measure on one block. The dual polynomial is
-/// `η(t) = <r, u(t)> / λ`; this returns `sup_t η(t)` scaled by the active
-/// measure mass. Values above `1` are the threshold-free multiplicity/birth
-/// trigger from convex duality.
+/// `η(t) = <r, u(t)> / λ` with `u(t)` the atom signature
+/// `(cos 2πht, sin 2πht)_{h=1..H}`, and — like the linear and block lanes — λ is
+/// read in MASS units, so the numerator must be too: the optimal new spike's
+/// amplitude is the matched filter `<r, u(t)> / ‖u(t)‖² = <r, u(t)> / H`
+/// (`‖u(t)‖² = H`; equivalently, unit-normalising the atoms to `u/√H` rescales
+/// the active mass to `a√H` and lands on the same `1/H`). Without it η is
+/// inflated by `H` relative to the other lanes' `optimal-new-mass / weakest-
+/// active-mass` convention and the derived unit threshold means `a_new > a/H`,
+/// not `a_new > a`. This returns `sup_t η(t)` against the active measure mass;
+/// values above `1` are the threshold-free multiplicity/birth trigger from
+/// convex duality.
 pub fn harmonic_dual_birth_eta(residual_coeffs: &[(f64, f64)], active_mass: f64) -> f64 {
     if residual_coeffs.is_empty() {
         return 0.0;
     }
     let lambda = active_mass.max(LAMBDA_FLOOR);
     let (t, _curvature) = harmonic_dual_argmax(residual_coeffs);
-    harmonic_dual_value(residual_coeffs, t).max(0.0) / lambda
+    let matched_amplitude =
+        harmonic_dual_value(residual_coeffs, t).max(0.0) / residual_coeffs.len() as f64;
+    matched_amplitude / lambda
 }
 
 fn harmonic_dual_value(coeffs: &[(f64, f64)], t: f64) -> f64 {

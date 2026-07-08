@@ -215,7 +215,7 @@ pub fn recover_spikes(
     // √ε_f32` for any noise a caller would bother modelling). Only the quantisation
     // shelf collapses below `√ε_f32`, so honest GD selection is preserved whenever
     // no such gap exists. `√ε` also matches the Newton step tolerance used in the
-    // argmax polish elsewhere in this module.
+    // dual-polynomial argmax polish in `crate::dual_certificate`.
     let dramatic_gap = (f32::EPSILON as f64).sqrt();
     let gap_order = {
         let mut order = None;

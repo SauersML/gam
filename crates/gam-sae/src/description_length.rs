@@ -684,8 +684,9 @@ pub struct ManifoldFitDl {
     pub g_dict: i64,
     /// Decoder scalar count `n_params = Σ_k M_k·p` charged at `l_param_bits`.
     pub n_params: i64,
-    /// Per-coordinate code rate `½·log₂(1/(1 − ev))` (bits): the reverse-water-
-    /// filling rate to code one unit-variance coordinate to the achieved floor.
+    /// Per-coordinate code rate `½·log₂(1 + 1/(1 − ev))` (bits): the numerically-
+    /// kind rate to code one unit-variance coordinate to the achieved floor
+    /// (`≈ ½·log₂(1/(1 − ev))` once `ev` is high).
     pub coordinate_rate_bits: f64,
     /// Bits per stored dictionary scalar (`l_param_bits`); defaults to the
     /// distortion-matched precision `coordinate_rate_bits`.
