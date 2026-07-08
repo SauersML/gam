@@ -1291,6 +1291,48 @@ pub(crate) fn d_canonical_tps_infeasible(dimension: usize, num_centers: usize) -
     num_centers < thin_plate_polynomial_basis_dimension(dimension)
 }
 
+/// Whether canonical thin-plate splines are infeasible at THESE specific
+/// centers — the single governing feasibility test for the auto-promotion gate.
+///
+/// Canonical TPS requires the polynomial nullspace block `P(C)` (`k × M(d)`) to
+/// have full column rank `M(d)`; otherwise the side constraint `P(C)ᵀα = 0` is
+/// overdetermined (count-short) or rank-deficient (degenerate geometry), and
+/// `thin_plate_kernel_constraint_nullspace` hard-errors. There are two failure
+/// modes and rank subsumes both:
+///   * too few centers — `k < M(d)` (the cheap count short-circuit, which also
+///     avoids materialising an oversized `k × M(d)` block when `M(d)` explodes
+///     in high dimension, e.g. `M(16) = 735_471`); and
+///   * enough centers but geometrically DEGENERATE — the selected centers are
+///     affinely/polynomially dependent, so `rank P(C) < M(d)` even though
+///     `k ≥ M(d)` (e.g. coplanar points in 3-D).
+///
+/// The prior gate tested only the count, so a degenerate-but-sufficient center
+/// set slipped past it into canonical TPS and hard-errored instead of promoting
+/// to the Duchon generalisation (which handles a rank-deficient nullspace
+/// gracefully — it takes the RRQR nullspace at the *actual* rank and downgrades
+/// the effective nullspace order). Making rank the test keeps the promotion gate
+/// from drifting out of sync with the linear-algebra feasibility the builder
+/// enforces downstream.
+pub(crate) fn thin_plate_canonical_infeasible_at_centers(centers: ArrayView2<'_, f64>) -> bool {
+    let dimension = centers.ncols();
+    // Cheap count short-circuit; also guards high `d`, where forming the
+    // `k × M(d)` polynomial block is itself intractable.
+    if d_canonical_tps_infeasible(dimension, centers.nrows()) {
+        return true;
+    }
+    // Enough centers by count (`M(d) ≤ k`), so the block is small enough to
+    // form: check the ACTUAL rank so a degenerate center geometry promotes to
+    // Duchon rather than hard-erroring in canonical TPS.
+    let poly_block = thin_plate_polynomial_block(centers);
+    let poly_cols = poly_block.ncols();
+    match rrqr_nullspace_basis(&poly_block, default_rrqr_rank_alpha()) {
+        Ok((_, rank)) => rank < poly_cols,
+        // If the rank probe itself fails, defer to the canonical path, which
+        // surfaces a precise error rather than silently promoting.
+        Err(_) => false,
+    }
+}
+
 /// Pick Duchon parameters for the TPS auto-promotion at infeasible (d, k).
 /// Returns `Some((nullspace_order, power))` when a hybrid-Duchon spec exists
 /// satisfying the collocation gate `2(p + s) > d + max_op` for max_op = 2

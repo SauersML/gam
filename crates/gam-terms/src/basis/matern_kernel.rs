@@ -99,7 +99,12 @@ pub fn build_thin_plate_basiswithworkspace(
     // the smallest s satisfying the gate. Hybrid (length_scale=Some) is used
     // rather than pure Duchon so the spatial-scale optimizer's log-κ
     // derivatives have a tunable kernel parameter (pure Duchon has none).
-    if d_canonical_tps_infeasible(data.ncols(), centers.nrows())
+    // Rank — not just count — is the feasibility test: `k ≥ M(d)` centers that
+    // are geometrically DEGENERATE (affinely dependent → `rank P(C) < M(d)`,
+    // e.g. coplanar points in 3-D) also make canonical TPS infeasible, and must
+    // promote to Duchon rather than hard-error downstream in
+    // `thin_plate_kernel_constraint_nullspace`.
+    if thin_plate_canonical_infeasible_at_centers(centers.view())
         && let Some((nullspace_order, s)) =
             duchon_thin_plate_fallback_params(data.ncols(), centers.nrows())
     {
