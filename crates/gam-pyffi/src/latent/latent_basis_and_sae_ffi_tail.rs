@@ -667,6 +667,7 @@ fn sae_manifold_fit_minimal<'py>(
     log_lambda_sparse = None,
     log_lambda_smooth = None,
     log_ard = None,
+    learnable_alpha = false,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -729,6 +730,13 @@ fn sae_manifold_predict_oos<'py>(
     log_lambda_sparse: Option<f64>,
     log_lambda_smooth: Option<Vec<f64>>,
     log_ard: Option<Vec<Vec<f64>>>,
+    // #2132 — whether the TRAINING fit's IBP-MAP concentration α was a learnable
+    // outer parameter. When true the OOS gate resolution reads the SAME
+    // `resolve_learnable_weight(alpha, ρ.log_lambda_sparse)` schedule the fit
+    // converged under (with the terminal `log_lambda_sparse` threaded above);
+    // `false` (default) keeps the historical fixed-α path. Ignored outside
+    // IBP-MAP mode.
+    learnable_alpha: bool,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -1014,7 +1022,11 @@ fn sae_manifold_predict_oos<'py>(
 
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, false),
+        // #2132 — carry the fit's learnable-α flag so a learnable-IBP fit's OOS
+        // gates resolve through the SAME α schedule
+        // (`resolve_learnable_weight(alpha, ρ.log_lambda_sparse)`, with the
+        // terminal `log_lambda_sparse` threaded below) the training gates used.
+        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
         "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
         "topk" => {
             let k_top = top_k.ok_or_else(|| {
@@ -1124,7 +1136,21 @@ fn sae_manifold_predict_oos<'py>(
     if !logits_are_warm && assignment_kind == "softmax" {
         seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
     } else if !logits_are_warm && assignment_kind == "ibp_map" {
-        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, alpha);
+        // #2132 — seed the IBP logits with the SAME resolved α the gate
+        // resolution below uses: a learnable-α fit resolves α through the
+        // terminal `log_lambda_sparse` (`resolve_learnable_weight`, the exact
+        // schedule `AssignmentMode::resolved_ibp_alpha` applies); a fixed-α fit
+        // keeps the supplied α. Seeding at the initial α while the gates read
+        // the learnable α would seed against a different prior schedule.
+        let seed_alpha = if learnable_alpha {
+            gam::terms::sae::manifold::resolve_learnable_weight(
+                alpha,
+                log_lambda_sparse.unwrap_or_else(|| sparsity_strength.ln()),
+            )
+        } else {
+            alpha
+        };
+        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, seed_alpha);
     }
     // #2132 — assemble the OOS ρ from the TRAINED terminal hyperparameters when
     // supplied, so the frozen-decoder solve descends the SAME penalized

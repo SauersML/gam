@@ -1615,6 +1615,9 @@ class ManifoldSAE:
                 if self.selected_log_ard is None
                 else [[float(v) for v in np.asarray(a, dtype=float).ravel()] for a in self.selected_log_ard]
             ),
+            # #2132 — a learnable-IBP fit's OOS gates must resolve α through the
+            # same learnable schedule (terminal log_lambda_sparse) as training.
+            learnable_alpha=bool(self.learnable_alpha),
         )
         return dict(payload)
 
