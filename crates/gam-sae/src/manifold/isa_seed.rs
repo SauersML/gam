@@ -182,15 +182,53 @@ pub fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<IsaEigenP
     }
     let mut ascending: Vec<f64> = evals.iter().copied().collect();
     ascending.sort_by(|a, b| a.total_cmp(b));
-    let mid = ascending.len() / 2;
-    let sigma2 = if ascending.len() % 2 == 1 {
-        ascending[mid]
-    } else {
-        0.5 * (ascending[mid - 1] + ascending[mid])
-    }
-    .max(f64::MIN_POSITIVE);
     let gamma = p as f64 / n as f64;
-    let mp_edge = sigma2 * (1.0 + gamma.sqrt()).powi(2);
+    let mp_factor = (1.0 + gamma.sqrt()).powi(2);
+    // Robust noise floor under MAJORITY signal. A plain median of the spectrum
+    // estimates σ² only while signal directions are a MINORITY; on a DENSE
+    // product-of-circles residual the signal dims are the majority — a k-torus
+    // carries 2k signal eigenvalues (each ≈ a²/2) and 2k > p/2 once the torus is
+    // dense in its frame (the p=16, k=6 `probe_2101` fixture has 12 signal dims of
+    // 16). Then the median lands in the SIGNAL bulk and `λ₊ = σ̂²(1+√γ)²` inflates
+    // to admit only the few strongest circles — the observed 3-of-6 stall (`first
+    // three at overlap≈0.99, circles 4-6 never surface`), while the p=32 producer
+    // gates (12 of 32 = minority) are unaffected because their median already sits
+    // in noise. Estimate σ² instead by a monotone fixed point: σ̂² = median of the
+    // eigenvalues at-or-below the current edge, iterated. The candidate noise band
+    // is a prefix of the ascending spectrum and only shrinks (the edge is
+    // non-increasing because a shorter prefix of a sorted vector has a
+    // non-greater median), so it converges in ≤ p steps to the largest prefix
+    // self-consistently below its own MP edge — the true noise band, whatever
+    // fraction of directions are signal. On a signal-MINORITY spectrum the very
+    // first median is already in noise and the iterate is a no-op (bit-identical
+    // to the old median floor); on pure noise the whole spectrum is the fixed
+    // point and nothing clears the edge (the natural-stop is preserved).
+    let median_prefix = |xs: &[f64]| -> f64 {
+        let m = xs.len();
+        if m == 0 {
+            return f64::MIN_POSITIVE;
+        }
+        if m % 2 == 1 {
+            xs[m / 2]
+        } else {
+            0.5 * (xs[m / 2 - 1] + xs[m / 2])
+        }
+        .max(f64::MIN_POSITIVE)
+    };
+    let mut noise_len = ascending.len();
+    let mut sigma2 = median_prefix(&ascending[..noise_len]);
+    loop {
+        let edge = sigma2 * mp_factor;
+        // Eigenvalues at-or-below the edge form the candidate noise band (a prefix
+        // of the ascending spectrum, since `e <= edge` is true-then-false on it).
+        let new_len = ascending.partition_point(|&e| e <= edge);
+        if new_len == 0 || new_len == noise_len {
+            break;
+        }
+        noise_len = new_len;
+        sigma2 = median_prefix(&ascending[..noise_len]);
+    }
+    let mp_edge = sigma2 * mp_factor;
     let mut above: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > mp_edge).collect();
     above.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
     if above.is_empty() {
