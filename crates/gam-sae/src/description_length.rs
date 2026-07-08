@@ -494,6 +494,152 @@ pub fn kappa_coding_gain_detector(kappa: f64) -> f64 {
     (kappa - 2.0).powi(2)
 }
 
+// ===========================================================================
+// Matched description length (curved-vs-flat in bits): the honest headline
+// currency for a birth. EV alone is not comparable across topologies — a circle
+// chart and a line atom that reach the same EV pay DIFFERENT description lengths,
+// so the fair comparison is total bits, parameter charge PLUS per-firing coding.
+// ===========================================================================
+//
+// # The uniform-quantization coding argument (per-firing coordinate bits)
+//
+// A firing's coordinate — a circle chart's PHASE `t ∈ [0, 1)`, or a flat atom's
+// AMPLITUDE on its unit range — is recovered with a delta-method standard error
+// `SE = σ / (2π·‖z‖)` (the already-computed coordinate SE; `σ` the per-component
+// residual scale, `‖z‖` the firing radius). To TRANSMIT that coordinate we quantize
+// it with a uniform quantizer of cell width `Δ`. A uniform quantizer of width `Δ`
+// has quantization-noise variance `Δ²/12` (the variance of `U(−Δ/2, Δ/2)`). There
+// is no point resolving the coordinate finer than the estimator's own uncertainty,
+// so we MATCH the quantizer to the estimate — set the quantization noise equal to
+// the estimation variance, `Δ²/12 = SE²`, i.e. cell width `Δ = SE·√12` (a `±SE·√12/2`
+// uniform resolution). Coding a coordinate that ranges over a unit interval at that
+// resolution costs
+//
+// ```text
+//   bits(SE) = log₂(range / Δ) = log₂(1 / (SE·√12)) = −½·log₂(12·SE²)
+//            = ½·log₂( 1 / (12·SE²) ).
+// ```
+//
+// The cost is floored at 0: once `SE ≥ 1/√12` (the SD of `U(0,1)` — the maximum-
+// entropy prior on a unit-range coordinate, exactly the phase-SE ceiling the
+// coordinate readout clamps to), the coordinate is not localized beyond its prior
+// and carries no code bits.
+//
+// # The matched description length of a chart / atom
+//
+// A featurizer that stores `C` dictionary columns in ambient dim `p`, each scalar
+// quantized to `l_param` bits, and fires `f` times, has description length
+//
+// ```text
+//   total_dl_bits = C·p·l_param            (parameter-column charge)
+//                 + Σ_{i=1..f} bits(SE_i)  (per-firing coordinate coding)
+// ```
+//
+// A **circle chart** of harmonic order `H` charges `C = 2H + 1` columns (a cos and
+// a sin row per harmonic, plus the constant/DC row) and per-firing PHASE bits. A
+// **line / flat atom** charges `C = 1` column and per-firing AMPLITUDE bits under
+// the same `bits(SE)` rule. The curved-vs-flat comparison then reads directly in
+// bits via [`matched_dl_delta`] (flat − chart; positive ⇒ the curved chart is the
+// shorter code) and per-chart [`MatchedDl::dl_per_ev`].
+
+/// SD of the uniform distribution on a unit-range coordinate, `√(1/12)` — the
+/// phase-SE ceiling above which a coordinate carries no code bits beyond its prior.
+pub fn uniform_unit_range_sd() -> f64 {
+    (1.0f64 / 12.0).sqrt()
+}
+
+/// Uniform-quantization coding cost, in bits, of one unit-range coordinate known to
+/// standard error `se`: `½·log₂(1/(12·se²))`, floored at 0.
+///
+/// Derived in the module note: matching a uniform quantizer's noise variance
+/// `Δ²/12` to the estimation variance `se²` gives cell width `Δ = se·√12` and cost
+/// `log₂(1/Δ) = ½·log₂(1/(12·se²))`. Returns `0` for `se ≥ 1/√12` (the coordinate
+/// is not localized beyond its `U(0,1)` prior) and `+∞` for a perfectly-known
+/// `se = 0` (an exact continuous value needs unbounded bits). A non-finite or
+/// negative `se` is treated as unidentified (`0` bits).
+pub fn se_resolution_bits(se: f64) -> f64 {
+    if !se.is_finite() || se < 0.0 {
+        return 0.0;
+    }
+    if se == 0.0 {
+        return f64::INFINITY;
+    }
+    let bits = -0.5 * (12.0 * se * se).log2();
+    bits.max(0.0)
+}
+
+/// Dictionary-column count a circle chart of harmonic order `H` charges: `2H + 1`
+/// (a cos and a sin row per harmonic plus the constant/DC row). `H = 0` degenerates
+/// to the single constant column (`1`).
+pub fn circle_chart_columns(harmonic_order: usize) -> i64 {
+    2 * harmonic_order as i64 + 1
+}
+
+/// The matched description length of one chart / atom, in bits: the parameter-column
+/// charge plus the summed per-firing coordinate coding bits (see the module note).
+#[derive(Clone, Copy, Debug)]
+pub struct MatchedDl {
+    /// Dictionary columns charged (`2H+1` for a circle chart, `1` for a flat atom).
+    pub coded_columns: i64,
+    /// Ambient dimension `p` each stored column spans.
+    pub ambient_p: i64,
+    /// Bits per stored dictionary scalar.
+    pub l_param_bits: f64,
+    /// Parameter-column charge `C·p·l_param` (bits).
+    pub param_bits: f64,
+    /// Summed per-firing coordinate coding bits `Σ_i bits(SE_i)`.
+    pub coding_bits: f64,
+    /// Number of firings coded.
+    pub n_firings: i64,
+    /// Total description length `param_bits + coding_bits` (bits).
+    pub total_dl_bits: f64,
+    /// Explained variance the chart / atom achieves (the reported dose).
+    pub ev: f64,
+    /// Matched-DL cost per unit EV, `total_dl_bits / ev` (`+∞` when `ev ≤ 0`).
+    pub dl_per_ev: f64,
+}
+
+/// Assemble the matched description length of a chart / atom from its column count,
+/// ambient dim, per-scalar precision, per-firing coordinate SEs, and achieved EV.
+///
+/// `coded_columns` is `2H+1` for a circle chart ([`circle_chart_columns`]) or `1`
+/// for a flat / line atom. `per_firing_se` are the delta-method coordinate SEs
+/// (`σ/(2π‖z‖)`), one per firing; each is coded at [`se_resolution_bits`]. The
+/// total is `coded_columns·ambient_p·l_param_bits + Σ_i se_resolution_bits(SE_i)`.
+pub fn matched_dl(
+    coded_columns: i64,
+    ambient_p: i64,
+    l_param_bits: f64,
+    per_firing_se: &[f64],
+    ev: f64,
+) -> MatchedDl {
+    let coded_columns = coded_columns.max(0);
+    let ambient_p = ambient_p.max(0);
+    let param_bits = coded_columns as f64 * ambient_p as f64 * l_param_bits.max(0.0);
+    let coding_bits: f64 = per_firing_se.iter().map(|&se| se_resolution_bits(se)).sum();
+    let total = param_bits + coding_bits;
+    let dl_per_ev = if ev > 0.0 { total / ev } else { f64::INFINITY };
+    MatchedDl {
+        coded_columns,
+        ambient_p,
+        l_param_bits,
+        param_bits,
+        coding_bits,
+        n_firings: per_firing_se.len() as i64,
+        total_dl_bits: total,
+        ev,
+        dl_per_ev,
+    }
+}
+
+/// Matched-DL delta `flat − chart`, in bits: the description length the curved chart
+/// SAVES over the flat/line atom at the SAME firings. Positive ⇒ the curved chart is
+/// the shorter code (curvature pays in bits); negative ⇒ the flat atom is cheaper
+/// (the honest "curvature does not pay here" verdict).
+pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
+    flat.total_dl_bits - chart.total_dl_bits
+}
+
 #[cfg(test)]
 #[path = "description_length_tests.rs"]
 mod description_length_tests;

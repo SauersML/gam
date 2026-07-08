@@ -4,11 +4,85 @@
 
 use super::{
     Crossover, DescriptionLength, Featurizer, ScoreRow, bar_birth_threshold_nats,
-    bar_supports_birth, circle_coding_gain_bits, circle_shape_const_bits, crossover_firings,
-    curved_coding_gain_bits, evidence_per_log_persistence, kappa_coding_gain_detector,
-    reverse_water_filling, scalar_rate_bits, score, selection_bits,
+    bar_supports_birth, circle_chart_columns, circle_coding_gain_bits, circle_shape_const_bits,
+    crossover_firings, curved_coding_gain_bits, evidence_per_log_persistence,
+    kappa_coding_gain_detector, matched_dl, matched_dl_delta, reverse_water_filling,
+    scalar_rate_bits, score, se_resolution_bits, selection_bits, uniform_unit_range_sd,
 };
 use crate::atom_codes::SparseAtomCodes;
+
+#[test]
+fn se_resolution_bits_is_the_uniform_quantization_cost() {
+    // The closed form ½·log₂(1/(12·SE²)): a coordinate known to SE = 0.01 on a unit
+    // range costs exactly −½·log₂(12·0.01²) bits.
+    let se = 0.01;
+    let got = se_resolution_bits(se);
+    let expected = -0.5 * (12.0 * se * se).log2();
+    assert!((got - expected).abs() < 1e-12, "got {got} expected {expected}");
+    assert!(got > 0.0, "a well-localized coordinate must carry positive bits");
+    // At the uniform-prior ceiling SE = 1/√12 the cost is exactly 0 (no info beyond
+    // the U(0,1) prior); above it, still 0 (floored).
+    let ceil = uniform_unit_range_sd();
+    assert!(se_resolution_bits(ceil).abs() < 1e-12, "ceiling SE must cost 0 bits");
+    assert_eq!(se_resolution_bits(2.0 * ceil), 0.0, "above-ceiling SE costs 0 bits");
+    // Halving SE adds exactly one bit (a factor-2 finer resolution).
+    let d = se_resolution_bits(se / 2.0) - se_resolution_bits(se);
+    assert!((d - 1.0).abs() < 1e-12, "halving SE must add exactly 1 bit, got {d}");
+}
+
+#[test]
+fn matched_dl_planted_circle_gives_closed_form_bit_count() {
+    // A planted circle chart of known harmonic order H fired f times, each firing at
+    // a known coordinate SE, in ambient p, at l_param bits/scalar. The matched
+    // description length must equal the hand-computed closed form exactly:
+    //   total = (2H+1)·p·l_param  +  f · ½log₂(1/(12·SE²)).
+    let h = 3usize; // harmonic order
+    let p = 64i64; // ambient dim
+    let l_param = 4.0; // bits per stored scalar
+    let se = 0.02; // per-firing coordinate SE (σ/(2π‖z‖))
+    let f = 250usize; // firings
+    let columns = circle_chart_columns(h);
+    assert_eq!(columns, 7, "2H+1 = 7 for H=3");
+
+    let ses = vec![se; f];
+    let ev = 0.4;
+    let dl = matched_dl(columns, p, l_param, &ses, ev);
+
+    let expected_param = 7.0 * 64.0 * 4.0;
+    let expected_coding = f as f64 * (-0.5 * (12.0 * se * se).log2());
+    let expected_total = expected_param + expected_coding;
+    assert!(
+        (dl.param_bits - expected_param).abs() < 1e-9,
+        "param bits {} vs {expected_param}",
+        dl.param_bits
+    );
+    assert!(
+        (dl.coding_bits - expected_coding).abs() < 1e-6,
+        "coding bits {} vs {expected_coding}",
+        dl.coding_bits
+    );
+    assert!(
+        (dl.total_dl_bits - expected_total).abs() < 1e-6,
+        "total DL bits {} vs {expected_total}",
+        dl.total_dl_bits
+    );
+    assert_eq!(dl.n_firings, f as i64);
+    assert!((dl.dl_per_ev - expected_total / ev).abs() < 1e-6);
+
+    // Matched-DL delta vs the flat / line atom (1 column, amplitude bits at the same
+    // SE rule): the curved chart pays 2H extra columns of parameter charge but codes
+    // the SAME per-firing bits, so at large p the flat atom is the shorter code here
+    // (delta < 0 — the honest "curvature doesn't pay at these firings" verdict).
+    let flat = matched_dl(1, p, l_param, &ses, ev);
+    let delta = matched_dl_delta(&flat, &dl);
+    let expected_delta = flat.total_dl_bits - dl.total_dl_bits;
+    assert!((delta - expected_delta).abs() < 1e-9);
+    assert!(
+        (delta - (1.0 - 7.0) * 64.0 * 4.0).abs() < 1e-6,
+        "delta must be the pure param-column difference (coding bits cancel): {delta}"
+    );
+    assert!(delta < 0.0, "flat cheaper than a 7-column chart at equal firings");
+}
 
 #[test]
 fn circle_gain_matches_closed_form() {
