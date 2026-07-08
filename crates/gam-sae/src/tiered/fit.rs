@@ -283,4 +283,64 @@ mod fit_tests {
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
     }
+
+    /// Planted 6-circle + linear-bulk mixture (#2023 acceptance): the tiered fit
+    /// (Tier-1 linear bulk + Tier-2 curved co-fit on the residual) must beat the
+    /// pure-linear Tier-1 EV, and the migration ledger must record at least one
+    /// promotion (a linear block / residual factor turned into a curved chart).
+    #[test]
+    fn tiered_beats_linear_on_six_circle_mixture_and_records_a_promotion() {
+        // P = 16: six circles in disjoint 2-D subspaces (cols 0..12) + a linear
+        // bulk direction (cols 12,13); cols 14,15 carry light noise.
+        let n = 240usize;
+        let p = 16usize;
+        let n_circles = 6usize;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let ph = (i as f64) * 0.261_799; // ~15° step, decorrelates the phases
+            for c in 0..n_circles {
+                let theta = ph * (1.0 + c as f64 * 0.37) + c as f64;
+                z[[i, 2 * c]] = theta.cos();
+                z[[i, 2 * c + 1]] = theta.sin();
+            }
+            // Linear bulk: a straight ramp direction the linear tier explains fully.
+            let t = i as f64 / n as f64;
+            z[[i, 12]] = 2.0 * t - 1.0;
+            z[[i, 13]] = 1.0 - 2.0 * t;
+            // Light deterministic wobble so cols 14,15 are not exactly zero.
+            z[[i, 14]] = 0.01 * (ph * 2.0).sin();
+            z[[i, 15]] = 0.01 * (ph * 3.0).cos();
+        }
+
+        // Tier-1 only (linear bulk baseline): 8 blocks of size 2, budget covers
+        // all six circles plus the bulk.
+        let mut lin = TieredFitConfig::linear_bulk(8, 2);
+        lin.tier1.block_topk = 7;
+        lin.tier1.max_epochs = 20;
+        let lin_report = fit_tiered(z.view(), &lin).expect("linear-bulk fit runs");
+        let ev_lin = lin_report.explained_variance;
+
+        // Tiered (Tier-1 + Tier-2 curved co-fit on the residual): same Tier-1.
+        let mut tiered = TieredFitConfig::tiered(8, 2);
+        tiered.tier1.block_topk = 7;
+        tiered.tier1.max_epochs = 20;
+        let report = fit_tiered(z.view(), &tiered).expect("tiered fit runs");
+
+        assert_eq!(
+            report.ledger.pc_reseed_events, 0,
+            "the tiered path must never PC-reseed"
+        );
+        assert!(
+            report.ledger.n_promotions >= 1,
+            "the migration ledger must record >=1 curved promotion; got {} (moves: {:?})",
+            report.ledger.n_promotions,
+            report.ledger.moves
+        );
+        assert!(
+            report.explained_variance > ev_lin,
+            "tiered EV {} must beat pure-linear EV {}",
+            report.explained_variance,
+            ev_lin
+        );
+    }
 }

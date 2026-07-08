@@ -118,6 +118,104 @@ def dimension_spectrometer(
 
 
 # --------------------------------------------------------------------------- #
+# Tiered SAE fit (#2023)
+# --------------------------------------------------------------------------- #
+# Migration-move kind legend for ``TieredFitResult.ledger_move_kind``.
+TIERED_MOVE_PROMOTION = 0
+TIERED_MOVE_DEMOTION = 1
+TIERED_MOVE_DEATH = 2
+
+
+@dataclass(frozen=True)
+class TieredFitResult:
+    """End-to-end tiered SAE fit: Tier-0 mean, Tier-1 block-sparse linear bulk,
+    Tier-2 curved co-fit on the Tier-1 residual, and the migration ledger.
+
+    ``ledger_move_kind`` uses the ``TIERED_MOVE_*`` legend
+    (``0`` promotion, ``1`` demotion, ``2`` death); a ``ledger_move_round`` of
+    ``-1`` marks the Tier-1 structural death tally. ``ledger_pc_reseed_events`` is
+    ``0`` by construction on this path (the curved tier seeds from the Tier-1
+    routing / residual, never principal components).
+    """
+
+    explained_variance: float
+    tier0_mean: np.ndarray
+    tier1_decoder: np.ndarray
+    tier1_blocks: np.ndarray
+    tier1_gamma: float
+    tier1_block_utilization: np.ndarray
+    tier1_explained_variance: float
+    tier1_epochs: int
+    tier1_converged: bool
+    tier2_enabled: bool
+    tier2_explained_variance: float
+    tier2_n_rounds: int
+    tier2_n_accepted_charts: int
+    ledger_pc_reseed_events: int
+    ledger_n_promotions: int
+    ledger_n_demotions: int
+    ledger_n_deaths: int
+    ledger_move_kind: np.ndarray
+    ledger_move_round: np.ndarray
+    ledger_move_count: np.ndarray
+    ledger_move_dl_bits: np.ndarray
+    ledger_move_objective: np.ndarray
+
+
+def sae_manifold_fit_tiered(
+    data: Any,
+    *,
+    n_blocks: int,
+    block_size: int = 2,
+    block_topk: int = 1,
+    max_epochs: int = 30,
+    tier2_enabled: bool = True,
+    cofit_max_rounds: int = 6,
+    cofit_rel_tol: float = 1.0e-4,
+    cofit_code_ridge: float = 1.0e-6,
+) -> TieredFitResult:
+    """Fit the tiered decomposition (#2023): Tier-0 mean peel → Tier-1
+    block-sparse linear bulk → Tier-2 curved co-fit on the Tier-1 residual, with
+    a migration ledger that replaces principal-component reseeding."""
+    x = _as_2d_f32(data, "data")
+    payload = rust_module().sae_manifold_fit_tiered(
+        x,
+        n_blocks,
+        block_size,
+        block_topk,
+        max_epochs,
+        tier2_enabled,
+        cofit_max_rounds,
+        cofit_rel_tol,
+        cofit_code_ridge,
+    )
+    return TieredFitResult(
+        explained_variance=float(payload["explained_variance"]),
+        tier0_mean=np.asarray(payload["tier0_mean"]),
+        tier1_decoder=np.asarray(payload["tier1_decoder"]),
+        tier1_blocks=np.asarray(payload["tier1_blocks"]),
+        tier1_gamma=float(payload["tier1_gamma"]),
+        tier1_block_utilization=np.asarray(payload["tier1_block_utilization"]),
+        tier1_explained_variance=float(payload["tier1_explained_variance"]),
+        tier1_epochs=int(payload["tier1_epochs"]),
+        tier1_converged=bool(payload["tier1_converged"]),
+        tier2_enabled=bool(payload["tier2_enabled"]),
+        tier2_explained_variance=float(payload["tier2_explained_variance"]),
+        tier2_n_rounds=int(payload["tier2_n_rounds"]),
+        tier2_n_accepted_charts=int(payload["tier2_n_accepted_charts"]),
+        ledger_pc_reseed_events=int(payload["ledger_pc_reseed_events"]),
+        ledger_n_promotions=int(payload["ledger_n_promotions"]),
+        ledger_n_demotions=int(payload["ledger_n_demotions"]),
+        ledger_n_deaths=int(payload["ledger_n_deaths"]),
+        ledger_move_kind=np.asarray(payload["ledger_move_kind"]),
+        ledger_move_round=np.asarray(payload["ledger_move_round"]),
+        ledger_move_count=np.asarray(payload["ledger_move_count"]),
+        ledger_move_dl_bits=np.asarray(payload["ledger_move_dl_bits"]),
+        ledger_move_objective=np.asarray(payload["ledger_move_objective"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Block-firing circle coordinates
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)

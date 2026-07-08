@@ -4845,6 +4845,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NuclearNormPenalty>()?;
     module.add_class::<MechanismSparsityPenalty>()?;
     module.add_function(wrap_pyfunction!(dimension_spectrometer, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_tiered, module)?)?;
     module.add_function(wrap_pyfunction!(block_firing_coordinates, module)?)?;
     module.add_function(wrap_pyfunction!(routability_floor, module)?)?;
     module.add_function(wrap_pyfunction!(routability_audit, module)?)?;
