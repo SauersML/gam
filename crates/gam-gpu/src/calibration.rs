@@ -17,6 +17,18 @@ const POTRF_DIMS: [usize; 3] = [64, 128, 256];
 const XTWX_DIMS: [(usize, usize); 3] = [(2048, 32), (4096, 64), (8192, 96)];
 const GPU_WIN_RATIO: f64 = 0.95;
 
+// Pin the pre-probe admission floors to the smallest calibration measurements:
+// `crossover_flops` / `crossover_rows` can lower `gemm_min_flops` /
+// `potrf_min_p` at most to the smallest measured GEMM's flop count / smallest
+// POTRF dimension. `DispatchOp::admissible_under_any_policy` (and every
+// pre-probe size gate built on these constants) relies on that bound, so a
+// change to the measurement grid must consciously update the constants.
+const _: () = assert!(
+    2 * (GEMM_DIMS[0] as u128) * (GEMM_DIMS[0] as u128) * (GEMM_DIMS[0] as u128)
+        == GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+);
+const _: () = assert!(POTRF_DIMS[0] == GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCalibration {
     schema_version: u32,
