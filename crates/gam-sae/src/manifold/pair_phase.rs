@@ -260,15 +260,23 @@ pub struct PhaseVerdict {
 /// floor is `1/(B+1)`.
 pub const PHASE_NULL_REPLICATES: usize = 200;
 
-/// Complementary-energy tolerance for the case-1 fuse-race: the coefficient of
-/// variation of `r_A² + r_B²` on co-active rows must sit below this for the total
-/// energy to read as CONSTANT (one circle's radius split across two frames).
-const FUSE_TOTAL_ENERGY_CV_MAX: f64 = 0.20;
+/// Screening level for the phase-family size-controlled gates (#2071). The same
+/// conventional `0.05` the standing structure battery uses (e.g. the
+/// `NULL_EXCEEDANCE_ALPHA` / `PROBE_DESIGN_ALPHA` construction-time level): a
+/// single shared false-positive rate, not a per-gate tuned scalar. Consumed by
+/// the fuse-race energy screens ([`screen_pair_phase`], as exact-null lower-tail
+/// p-values against the phase-randomised surrogate battery, replacing the former
+/// fixed `FUSE_RHO_MAX = 0.85` / `FUSE_TOTAL_ENERGY_CV_MAX = 0.20`) and by the
+/// dose presence F-test ([`certify_phase_circuit`], via `WALD_Z_ALPHA`,
+/// replacing the former fixed `CIRCUIT_DOSE_R2_MIN = 0.5` floor).
+const PHASE_SCREEN_ALPHA: f64 = 0.05;
 
-/// Upper bound on the co-active energy cross-moment `ρ` for the fuse-race: a split
-/// single circle has anti-correlated diameters, `ρ ≈ 1/2 < 1`. The screen requires
-/// `ρ` strictly below the independence null to call fragmentation.
-const FUSE_RHO_MAX: f64 = 0.85;
+/// Two-sided Wald critical value `z = Φ⁻¹(1 − α/2)` at [`PHASE_SCREEN_ALPHA`]
+/// (`= Φ⁻¹(0.975)`). Fixed alongside `α`: if `PHASE_SCREEN_ALPHA` changes this
+/// normal quantile must change with it (gam-math exposes `normal_cdf` but no
+/// inverse, so the quantile of the shared level is pinned here as the derived
+/// constant it is, not recomputed).
+const WALD_Z_ALPHA: f64 = 1.959_963_984_540_054;
 
 /// Admissible p-to-e calibrator `e = ½·p^{−½}` (`κ = ½`): `∫₀¹ κ p^{κ−1} dp = 1`
 /// and it is decreasing in `p`, so it is a valid e-value for any valid p-value.
@@ -389,6 +397,12 @@ pub fn screen_pair_phase(
             )
         });
     let mut null_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(replicates); channels_all.len()];
+    // #2071 — the fuse-race energy screens are calibrated against the SAME
+    // phase-randomised surrogate battery (identical draws/seeds) rather than the
+    // former fixed `FUSE_RHO_MAX` / `FUSE_TOTAL_ENERGY_CV_MAX` round numbers: each
+    // surrogate contributes a null `(energy_ρ, energy_CV)` on the co-active rows.
+    let mut null_energy_rho: Vec<f64> = Vec::with_capacity(replicates);
+    let mut null_energy_cv: Vec<f64> = Vec::with_capacity(replicates);
     for rep in 0..replicates {
         let rep_seed = mix_seed(seed, rep as u64);
         let surrogate = phase_randomized_surrogate(null_data.view(), rep_seed)?;
@@ -397,6 +411,13 @@ pub fn screen_pair_phase(
         for (ci, &ch) in channels_all.iter().enumerate() {
             let (t, _) = resultant(ch, &sa.theta, &sb.theta, &w);
             null_samples[ci].push(t);
+        }
+        let (s_rho, s_cv) = coactive_energy_stats(&sa.r2, &sb.r2, &w);
+        if s_rho.is_finite() {
+            null_energy_rho.push(s_rho);
+        }
+        if s_cv.is_finite() {
+            null_energy_cv.push(s_cv);
         }
     }
 
@@ -444,8 +465,33 @@ pub fn screen_pair_phase(
     // Lower-tail fuse-race diagnostics on the co-active rows: energy cross-moment
     // and the coefficient of variation of the total energy.
     let (energy_rho, total_energy_cv) = coactive_energy_stats(&pa.r2, &pb.r2, &w);
+    // #2071 — size-controlled fuse-race: a split single circle reads as energy
+    // that is more anti-correlated (low ρ) AND more constant (low CV) than chance.
+    // Instead of the former fixed `ρ < 0.85` / `CV < 0.20`, compare the observed
+    // statistics to the phase-randomised surrogate battery drawn above, using the
+    // same exact-null lower-tail p-value idiom as the channel screens
+    // (`(1 + #{null ≤ obs}) / (B + 1)`, floor `1/(B+1)`). Propose the fuse only
+    // when BOTH statistics sit in the α lower tail of the phase-scrambled null.
+    let rho_p = {
+        let b = null_energy_rho.len();
+        if !energy_rho.is_finite() || b == 0 {
+            1.0
+        } else {
+            (1 + null_energy_rho.iter().filter(|&&s| s <= energy_rho).count()) as f64
+                / (b + 1) as f64
+        }
+    };
+    let cv_p = {
+        let b = null_energy_cv.len();
+        if !total_energy_cv.is_finite() || b == 0 {
+            1.0
+        } else {
+            (1 + null_energy_cv.iter().filter(|&&s| s <= total_energy_cv).count()) as f64
+                / (b + 1) as f64
+        }
+    };
     let fuse_race_proposed =
-        n_co_active >= 2 && energy_rho < FUSE_RHO_MAX && total_energy_cv < FUSE_TOTAL_ENERGY_CV_MAX;
+        n_co_active >= 2 && rho_p <= PHASE_SCREEN_ALPHA && cv_p <= PHASE_SCREEN_ALPHA;
 
     Ok(PhaseVerdict {
         atom_a,
@@ -893,8 +939,10 @@ pub struct PhaseCircuitCertificate {
     pub dose_slope: f64,
     /// Fraction of intervention-response variance the predicted dose explains.
     pub dose_r2: f64,
-    /// True ⇒ a certified phase circuit: rotation transport with small defects and
-    /// a dose-response that tracks the prediction (slope near 1, high `R²`).
+    /// True ⇒ a certified phase circuit: a near-orthogonal transfer whose
+    /// through-origin dose slope sits in the identity band and is significantly
+    /// nonzero — the presence F-test `|β̂| > z·SE` at [`PHASE_SCREEN_ALPHA`]
+    /// (the transfer really tracks the prediction, not noise).
     pub certified: bool,
 }
 
@@ -919,11 +967,28 @@ fn wrap_pi(x: f64) -> f64 {
     y
 }
 
-/// Thresholds for certifying a phase circuit.
+/// Coarse orthogonality prefilter for the phase circuit: `transport_defect =
+/// ‖OᵀO − I‖_F` (departure of the fitted 2×2 transfer from an isometry). A
+/// genuine phase circuit is a rotation, so `OᵀO ≈ I`; this rejects grossly
+/// non-orthogonal operators before the dose test decides certification. `0.35`
+/// corresponds to a singular-value stretch of `√(1 ± 0.35/√2) ≈ 1 ± 0.12`, i.e.
+/// it tolerates ≤ ~12% metric distortion. It is a documented coarse prefilter,
+/// not a fabricated null: the exact size-controlled bound would need the
+/// transfer operator's own sampling covariance across the co-firing rows, which
+/// is not estimated here (a single operator is fit, not the token-wise variance).
 const CIRCUIT_TRANSPORT_DEFECT_MAX: f64 = 0.35;
+
+/// Coarse identity band on the through-origin dose slope: a faithful transfer
+/// steers B by the predicted amount, `slope ≈ 1`. Kept as a coarse ±40% band
+/// (not tightened to a size-controlled Wald test of `slope = 1`): the dose shard
+/// is a deterministic function of the FITTED operator, so at large `n` a tight
+/// slope-CI would flag the operator's own estimation error as a significant
+/// departure from 1 — that is operator uncertainty, not circuit infidelity, and
+/// bounding it correctly needs the operator covariance this function does not
+/// carry. The size-controlled part of the gate is the PRESENCE F-test below
+/// (`dose_present`), which replaced the former fixed `R² ≥ 0.5` floor.
 const CIRCUIT_DOSE_SLOPE_LO: f64 = 0.6;
 const CIRCUIT_DOSE_SLOPE_HI: f64 = 1.4;
-const CIRCUIT_DOSE_R2_MIN: f64 = 0.5;
 
 /// Certify a phase circuit from the co-firing angles and an intervention shard.
 ///
@@ -975,11 +1040,32 @@ pub fn certify_phase_circuit(
         0.0
     };
 
+    // #2071 — size-controlled PRESENCE test, replacing the former fixed
+    // `R² ≥ 0.5` floor. Through-origin OLS fits one parameter, so the residual
+    // carries `dof = n − 1` and `Var(β̂) = σ̂²/S_xx` with `σ̂² = SS_res/(n−1)`;
+    // `SE = √(σ̂²/S_xx)`. The dose actually explains variance iff the slope is
+    // significantly nonzero, `|β̂| > z·SE` (`z = WALD_Z_ALPHA` at
+    // `PHASE_SCREEN_ALPHA`) — the F-test form of "the regression is real", which
+    // scales with `n` and the residual noise instead of a round `R²` number and
+    // robustly rejects the independent-circles case (slope ≈ 0, wide SE). A
+    // numerically exact fit (`SE = 0`) leaves any nonzero slope trivially
+    // present. Degenerate shards (`n < 2`, `S_xx ≤ 0`, non-finite `SS_res`) fail
+    // closed. The identity check stays the coarse `CIRCUIT_DOSE_SLOPE_*` band
+    // (see its definition for why a tight slope-CI is not used here).
+    let n_dose = predicted_dtheta_b.len();
+    let dose_present = if n_dose >= 2 && sxx > 0.0 && ss_res.is_finite() && ss_res >= 0.0 {
+        let sigma2 = ss_res / (n_dose as f64 - 1.0);
+        let se = (sigma2 / sxx).sqrt();
+        dose_slope.abs() > WALD_Z_ALPHA * se
+    } else {
+        false
+    };
+
     let certified = orientation == 1
         && cert.transport_defect <= CIRCUIT_TRANSPORT_DEFECT_MAX
         && dose_slope >= CIRCUIT_DOSE_SLOPE_LO
         && dose_slope <= CIRCUIT_DOSE_SLOPE_HI
-        && dose_r2 >= CIRCUIT_DOSE_R2_MIN;
+        && dose_present;
 
     Ok(PhaseCircuitCertificate {
         transfer_angle,

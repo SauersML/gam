@@ -3677,20 +3677,43 @@ fn sae_manifold_fit_inner<'py>(
         // structured_passes, so a 3-pass budget with min-dwell 3 could never
         // promote); 2 is the floor of the concept.
         const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
-        // PROMOTION_ALIGN_MIN — PRICED. The |cos| a lineage's Λ direction must
-        // hold with the previous pass's to count as the SAME structure. No
-        // first-principles value exists (it trades false-merge vs false-split of
-        // lineages), so it is priced against the null: two independent unit
-        // directions in the r-dim residual signal subspace align at
-        // E|cos| ≈ sqrt(2/(π·r)) — roughly 0.3–0.4 for the few-dim SAE residual —
-        // so 0.9 sits well above chance (near-collinear). What breaks at 10×
-        // either way: toward the ~0.35 null floor, noise-aligned directions merge
-        // into spurious lineages and promote junk; toward 1.0, only numerically
-        // identical directions survive and genuine structure that rotates slightly
-        // between passes never matures. 0.9 keeps a wide margin over the null while
-        // tolerating the small inter-pass rotation a real direction undergoes as
-        // the metric anneals.
-        const PROMOTION_ALIGN_MIN: f64 = 0.9;
+        // PROMOTION_ALIGN_MIN — DERIVED (#2071), no longer the fixed `0.9`. The
+        // |cos| a lineage's Λ direction must hold with the previous pass's to
+        // count as the SAME structure is the (1 − α) quantile of the random-
+        // alignment null keyed to the residual signal-subspace dimension `r`
+        // (`model.factor_rank()`): for two independent unit directions in an
+        // r-dim subspace, `cos²θ ~ Beta(½, (r−1)/2)`, so the α-level threshold is
+        //   align_min(r) = sqrt( Beta⁻¹_{1−α}(½, (r−1)/2) ),
+        // i.e. the |cos| that phase-independent directions exceed only with
+        // probability α (a false-merge rate), computed per pass from the current
+        // factor rank via [`promotion_align_min`]. This self-scales: at small r
+        // (a genuinely few-dim residual) random directions align strongly, so the
+        // bar is near 1; as r grows the bar drops toward the `sqrt(2/(π·r))` null
+        // mean. `α` is the shared screening level [`PROMOTION_ALIGN_ALPHA`].
+        //
+        // The same conventional `0.05` false-birth level the structure battery
+        // uses; here it is the per-pass false-MERGE rate of two independent
+        // residual-factor directions.
+        const PROMOTION_ALIGN_ALPHA: f64 = 0.05;
+        // align_min(r) = sqrt(Beta⁻¹_{1−α}(½, (r−1)/2)); r = residual factor rank.
+        // r ≤ 1 is degenerate (a 1-D subspace has a single direction up to sign,
+        // so any two align at |cos| = 1): fall back to r = 2, the smallest rank
+        // at which alignment carries information. Non-finite/NaN quantiles (only
+        // possible from a degenerate shape) clamp the gate open-safe at 1.0 so a
+        // bad estimate never promotes on a spurious near-collinear match.
+        fn promotion_align_min(factor_rank: usize) -> f64 {
+            let r = factor_rank.max(2) as f64;
+            let cos2 = gam::inference::probability::beta_quantile(
+                1.0 - PROMOTION_ALIGN_ALPHA,
+                0.5,
+                (r - 1.0) / 2.0,
+            );
+            if cos2.is_finite() {
+                cos2.sqrt().clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        }
         // `promote_from_residual` is the typed pyfunction kwarg (default false);
         // opt-in, default-off ⇒ whitening runs without growth unless set.
         let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
@@ -3783,18 +3806,18 @@ fn sae_manifold_fit_inner<'py>(
                 None
             };
             if let Some(prev) = prev_for_promotion {
+                // Per-pass derived alignment threshold from the current residual
+                // factor rank (#2071); used identically by the producer-side
+                // candidate gate and the nursery lineage-dedup below.
+                let align_min = promotion_align_min(model.factor_rank());
                 let cands = model
-                    .promotion_candidates(
-                        Some(prev),
-                        PROMOTION_ALIGN_MIN,
-                        PROMOTION_ENERGY_FLOOR_MULT,
-                    )
+                    .promotion_candidates(Some(prev), align_min, PROMOTION_ENERGY_FLOOR_MULT)
                     .map_err(py_value_error)?;
                 let mut seen = vec![false; nursery.len()];
                 for cand in &cands {
                     let hit = nursery
                         .iter()
-                        .position(|(d, _)| cand.direction.dot(d).abs() >= PROMOTION_ALIGN_MIN);
+                        .position(|(d, _)| cand.direction.dot(d).abs() >= align_min);
                     match hit {
                         Some(i) => {
                             nursery[i].0 = cand.direction.clone();
@@ -3842,7 +3865,7 @@ fn sae_manifold_fit_inner<'py>(
                     // Drop the promoted lineage so it is not re-promoted; the next
                     // pass rebuilds the objective from the grown `term`/`rho` and
                     // `warm_flat.len()` picks up the enlarged ρ automatically.
-                    nursery.retain(|(d, _)| d.dot(&dir).abs() < PROMOTION_ALIGN_MIN);
+                    nursery.retain(|(d, _)| d.dot(&dir).abs() < align_min);
                 }
             }
             // Carry this pass's model forward as the next pass's damping anchor.

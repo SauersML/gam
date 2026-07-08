@@ -288,7 +288,21 @@ fn fuse_race_flags_split_single_circle() {
     // diameter of the single circle in dims (0,1).
     let ca = axis_candidate(p, 0, 2, &active);
     let cb = axis_candidate(p, 1, 3, &active);
-    let v = screen_pair_phase(data.view(), &mean, 0, 1, &ca, &cb, 30, 0xF5).unwrap();
+    // #2071 — `fuse_race_proposed` is now an exact-null lower-tail p-value on both
+    // energy statistics against the phase-randomised surrogate battery (≤ α each),
+    // so the replicate budget must resolve α = 0.05: use the production
+    // `PHASE_NULL_REPLICATES` count for clean p-value headroom (min p = 1/(B+1)).
+    let v = screen_pair_phase(
+        data.view(),
+        &mean,
+        0,
+        1,
+        &ca,
+        &cb,
+        PHASE_NULL_REPLICATES,
+        0xF5,
+    )
+    .unwrap();
     eprintln!(
         "[fuse-race] rho={:.3} total_cv={:.3} fuse_race={}",
         v.energy_rho, v.total_energy_cv, v.fuse_race_proposed
