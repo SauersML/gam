@@ -38,18 +38,31 @@ def load_slice(root: Path, category: str, n_rows: int, seed: int) -> np.ndarray:
     return z
 
 
-def gpu_pca(z: np.ndarray, d: int, device: str) -> np.ndarray:
-    """Center + project to the top-d principal subspace (GPU SVD when available)."""
-    import torch
+class PcaCache:
+    """One SVD for the whole sweep; every config slices its top-d projection.
 
-    with torch.no_grad():
-        t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
-        t -= t.mean(dim=0, keepdim=True)
-        # Economy SVD of (n, D): top-d right singular vectors span the PCA basis.
-        _, s, vh = torch.linalg.svd(t, full_matrices=False)
-        proj = (t @ vh[:d].T).cpu().numpy().astype(np.float64)
-        ev_frac = float((s[:d] ** 2).sum() / (s**2).sum())
-    return proj, ev_frac
+    The economy SVD of the (n, 7168) slice is the dominant preprocessing cost —
+    recomputing it per config multiplied it by the config count for no reason.
+    """
+
+    def __init__(self, z: np.ndarray, device: str) -> None:
+        import torch
+
+        with torch.no_grad():
+            t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
+            t -= t.mean(dim=0, keepdim=True)
+            _, s, vh = torch.linalg.svd(t, full_matrices=False)
+            self._t = t
+            self._s = s
+            self._vh = vh
+
+    def project(self, d: int):
+        import torch
+
+        with torch.no_grad():
+            proj = (self._t @ self._vh[:d].T).cpu().numpy().astype(np.float64)
+            ev_frac = float((self._s[:d] ** 2).sum() / (self._s**2).sum())
+        return proj, ev_frac
 
 
 def run_config(z: np.ndarray, cfg: dict) -> dict:
@@ -131,8 +144,9 @@ def main() -> None:
     print(f"[phase1] slice {z_raw.shape} dtype={z_raw.dtype}", flush=True)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    pca = PcaCache(z_raw, args.device)
     for cfg in configs:
-        proj, ev_frac = gpu_pca(z_raw, cfg["d_pca"], args.device)
+        proj, ev_frac = pca.project(cfg["d_pca"])
         cfg["pca_ev_fraction"] = round(ev_frac, 4)
         cfg["category"] = args.category
         cfg["n_rows"] = int(proj.shape[0])
