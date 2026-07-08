@@ -534,6 +534,78 @@ pub fn radial_input_location_jet_nd(
 /// `t` is `(n_rows, dim)`, `centers` is `(n_centers, dim)`. Returns
 /// `(Φ, jet)` with `Φ` shape `(n_rows, n_kernel + n_poly)` and `jet` shape
 /// `(n_rows, n_kernel + n_poly, dim)`.
+/// Host-side parameter pack for the DEVICE Duchon SAE basis kernel
+/// (`gam_sae::basis_gpu`): everything [`duchon_sae_atom_basis_with_jet`]
+/// derives from the centers alone, extracted once so the GPU lane's per-step
+/// work is a single kernel launch over the coordinates. Field-for-field the
+/// same objects the CPU path builds — the device kernel is pinned to the CPU
+/// evaluator by the torch parity test, so any drift here is a red test, not a
+/// silent divergence.
+pub struct DuchonSaeDeviceParams {
+    /// `(n_centers, n_kernel)` polynomial-constraint nullspace `Z`.
+    pub z: Array2<f64>,
+    /// Scalar kernel amplification `α` applied to the radial block + its jet.
+    pub kernel_amp: f64,
+    /// Polyharmonic coefficient: `φ(r) = c · r^power · [ln r if is_log]`.
+    pub coeff_c: f64,
+    pub coeff_power: f64,
+    pub coeff_is_log: bool,
+    /// `φ(0)` limit (the CPU `origin_limit`), BEFORE amplification.
+    pub origin_value: f64,
+    /// Monomial exponents of the polynomial tail columns, `(n_poly, dim)` —
+    /// the SAME enumeration `duchon_polynomial_first_derivative_nd` pairs with
+    /// `polynomial_block_from_order`, so device values and jets share the CPU
+    /// column order.
+    pub exponents: Vec<Vec<usize>>,
+}
+
+/// Extract the center-derived parameters of the pure scale-free Duchon SAE
+/// atom basis for a device evaluator. Mirrors the prelude of
+/// [`duchon_sae_atom_basis_with_jet`] exactly.
+pub fn duchon_sae_atom_device_params(
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<DuchonSaeDeviceParams, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_device_params: centers must have at least one column"
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+    let max_degree = match effective_order {
+        DuchonNullspaceOrder::Zero => 0usize,
+        DuchonNullspaceOrder::Linear => 1usize,
+        DuchonNullspaceOrder::Degree(k) => k,
+    };
+    let exponents = monomial_exponents(dim, max_degree);
+    Ok(DuchonSaeDeviceParams {
+        z,
+        kernel_amp,
+        coeff_c: pure_poly_coeff.c,
+        coeff_power: pure_poly_coeff.power,
+        coeff_is_log: pure_poly_coeff.is_log_case,
+        origin_value: pure_poly_coeff.origin_limit(),
+        exponents,
+    })
+}
+
 pub fn duchon_sae_atom_basis_with_jet(
     t: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,

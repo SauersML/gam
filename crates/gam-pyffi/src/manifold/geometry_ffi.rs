@@ -714,6 +714,60 @@ fn sae_periodic_basis_with_jet_cuda(
     .map_err(PyValueError::new_err)
 }
 
+/// Width `(n_kernel + n_poly)` of the device Duchon basis for these centers —
+/// the torch bridge allocates its output tensors with exactly this width
+/// before calling [`sae_duchon_basis_with_jet_cuda`]. Also warms the device
+/// cache (uploads centers/Z once).
+#[pyfunction]
+fn sae_duchon_device_basis_width(
+    py: Python<'_>,
+    ordinal: usize,
+    centers: PyReadonlyArray2<'_, f64>,
+    m: usize,
+) -> PyResult<usize> {
+    let centers_owned = centers.as_array().to_owned();
+    py.detach(move || {
+        gam::terms::sae::basis_gpu::sae_duchon_device_basis_width(
+            ordinal,
+            centers_owned.view(),
+            m,
+        )
+    })
+    .map_err(PyValueError::new_err)
+}
+
+/// Device-resident Duchon basis+jet for the torch manifold-SAE lane — the
+/// multi-`d` sibling of [`sae_periodic_basis_with_jet_cuda`] with the same
+/// pointer and synchronization contract. `t` is `(n, dim)` doubles on device
+/// `ordinal`; `phi` is `(n, width)` and `jet` is `(n, width, dim)` with
+/// `width` from [`sae_duchon_device_basis_width`]. Center-derived state
+/// (`Z`, amplification, polyharmonic coefficient, monomial exponents) is
+/// cached on device per (centers, m). Returns the width actually written.
+#[pyfunction]
+fn sae_duchon_basis_with_jet_cuda(
+    py: Python<'_>,
+    ordinal: usize,
+    device_ptrs: (u64, u64, u64),
+    n: usize,
+    centers: PyReadonlyArray2<'_, f64>,
+    m: usize,
+) -> PyResult<usize> {
+    let (t_dev_ptr, phi_dev_ptr, jet_dev_ptr) = device_ptrs;
+    let centers_owned = centers.as_array().to_owned();
+    py.detach(move || {
+        gam::terms::sae::basis_gpu::sae_duchon_basis_with_jet_device(
+            ordinal,
+            t_dev_ptr,
+            n,
+            centers_owned.view(),
+            m,
+            phi_dev_ptr,
+            jet_dev_ptr,
+        )
+    })
+    .map_err(PyValueError::new_err)
+}
+
 #[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
     let out = py.detach(move || sinkhorn_circular_cost_impl(m));
@@ -4352,6 +4406,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_duchon_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;

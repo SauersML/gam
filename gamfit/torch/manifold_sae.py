@@ -468,6 +468,38 @@ class _BasisWithJetFn(torch.autograd.Function):
             )
             ctx.save_for_backward(jet.to(dtype=t.dtype))
             return phi.to(dtype=t.dtype)
+        if t.is_cuda and kind == "duchon":
+            # Multi-d sibling of the periodic device lane: same Rust-owned
+            # kernel math, same pointer/synchronization contract. The
+            # center-derived state (Z, amplification, coefficient, monomial
+            # exponents) is cached device-side per (centers, m), so the
+            # per-step cost is one launch.
+            centers_np = np.asarray(params["centers"], dtype=np.float64)
+            if centers_np.ndim == 1:
+                centers_np = centers_np.reshape(-1, 1)
+            m_order = int(params["m"])
+            dim = int(t.shape[1])
+            t64 = t.detach().to(dtype=torch.float64).contiguous()
+            ordinal = int(t.device.index or 0)
+            width = rust_module().sae_duchon_device_basis_width(
+                ordinal, centers_np, m_order
+            )
+            phi = torch.empty(
+                (t64.shape[0], width), dtype=torch.float64, device=t.device
+            )
+            jet = torch.empty(
+                (t64.shape[0], width, dim), dtype=torch.float64, device=t.device
+            )
+            torch.cuda.synchronize(t.device)
+            rust_module().sae_duchon_basis_with_jet_cuda(
+                ordinal,
+                (t64.data_ptr(), phi.data_ptr(), jet.data_ptr()),
+                int(t64.shape[0]),
+                centers_np,
+                m_order,
+            )
+            ctx.save_for_backward(jet.to(dtype=t.dtype))
+            return phi.to(dtype=t.dtype)
         phi_np, jet_np, _penalty_np = rust_module().basis_with_jet(
             kind, to_numpy_f64(t), params
         )
