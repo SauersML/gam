@@ -4778,6 +4778,29 @@ impl SaeManifoldTerm {
                         best_reconstruction_uniformity = candidate_uniformity;
                         best_reconstruction_state = Some(self.snapshot_mutable_state());
                     }
+                    // Fit-LEVEL keep-best (`best_fit_incumbent`): the in-call
+                    // ledger above dies with this call, but the outer ρ search
+                    // re-enters this driver once per probe and each probe's walk
+                    // can drag the shared warm-start state into a collapse basin
+                    // — across calls the good basin is unrecoverable. Bank it on
+                    // the term under the same ordering, floor-gated so a
+                    // sub-collapse basin never becomes the fit's incumbent.
+                    if ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR {
+                        let bank = match self.best_fit_incumbent.as_ref() {
+                            None => ev.is_finite(),
+                            Some((best_ev, best_uniformity, _)) => prefer_candidate_basin(
+                                ev,
+                                candidate_uniformity,
+                                *best_ev,
+                                *best_uniformity,
+                                SAE_FINAL_EV_DEGRADATION_TOL,
+                            ),
+                        };
+                        if bank {
+                            self.best_fit_incumbent =
+                                Some((ev, candidate_uniformity, self.snapshot_mutable_state()));
+                        }
+                    }
                 }
             }
         }

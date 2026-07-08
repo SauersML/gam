@@ -519,6 +519,22 @@ pub struct SaeManifoldTerm {
     /// carried alongside the EV so the multi-start can break (near-)equal-EV ties
     /// on coordinate fidelity ([`prefer_candidate_basin`]).
     pub(crate) best_cocollapse_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
+    /// Fit-level keep-best across the WHOLE outer ρ search (#1026 lifted one
+    /// level). The per-call incumbent inside `run_joint_fit_arrow_schur` only
+    /// protects one call: an outer probe sequence that walks the warm-start
+    /// state into a collapse basin loses the earlier good basin across calls
+    /// (measured on the manifold-zoo arena: in-call incumbents decayed
+    /// 0.77 → 0.54 → 0.38 while every call ended in an EV-degraded restore, and
+    /// the terminal model reconstructed held-out data at R² 0.18 against its own
+    /// best-visited 0.77). This banks the best (EV, uniformity, state) at every
+    /// ACCEPTED outer iterate — same [`prefer_candidate_basin`] ordering and
+    /// `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` gate as the co-collapse ledger — and
+    /// `into_fitted` restores it when the terminal state reconstructs strictly
+    /// worse. Transient like `best_cocollapse_incumbent` (never persisted;
+    /// cleared at each outer-optimization entry). Snapshot states are row-count
+    /// bound, so a subsampled search term's bank dies with that term and never
+    /// crosses the full-row seam.
+    pub(crate) best_fit_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
     /// Bounded high-EV structural-collapse reseeds spent by the frame-coherence
     /// guard in the current optimization. This is separate from total decoder
     /// co-collapse: these atoms still carry decoder norm and EV, but duplicate an
@@ -768,6 +784,7 @@ impl Clone for SaeManifoldTerm {
             // term identity (like `border_hbb_workspace`); a fresh clone starts
             // with no incumbent and rebuilds it if it re-enters co-collapse.
             best_cocollapse_incumbent: None,
+            best_fit_incumbent: None,
             structural_cocollapse_reseeds: self.structural_cocollapse_reseeds,
             // Transient per-assembly frozen gate — rebuilt at the next assembly.
             decoder_repulsion_gate: None,

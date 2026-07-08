@@ -207,6 +207,7 @@ impl SaeManifoldTerm {
             evidence_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
             best_cocollapse_incumbent: None,
+            best_fit_incumbent: None,
             structural_cocollapse_reseeds: 0,
             decoder_repulsion_gate: None,
             barrier_coactivation_gate: None,
@@ -390,6 +391,7 @@ impl SaeManifoldTerm {
         primary.evidence_gauge_deflation_last_delta_sign = 0;
         primary.dictionary_cocollapse_reseeds = 0;
         primary.best_cocollapse_incumbent = None;
+        primary.best_fit_incumbent = None;
         primary.structural_cocollapse_reseeds = 0;
         // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
         primary.collapse_events = Vec::new();

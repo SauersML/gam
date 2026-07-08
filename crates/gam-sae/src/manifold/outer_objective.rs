@@ -795,7 +795,7 @@ impl SaeManifoldOuterObjective {
         // swapped back (warm-started from the search-fitted decoder) here.
         self.restore_full_rows_for_final_fit();
         let Self {
-            term,
+            mut term,
             mut baseline_term,
             target,
             registry,
@@ -811,13 +811,55 @@ impl SaeManifoldOuterObjective {
         let pristine_seed_term = baseline_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
-        let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
+        // Fit-level keep-best consult (`best_fit_incumbent`): if the terminal
+        // outer state reconstructs strictly worse than the best basin any
+        // accepted iterate visited during the WHOLE ρ search, restore that basin
+        // BEFORE the seed-vs-settled arbitration below, so every downstream
+        // guard (seed refit, pristine-seed comparison, canonicalization) sees
+        // the search's real best rather than its last collapse. The banked
+        // snapshot is row-count bound to THIS term (a subsampled search term's
+        // bank died with it), so the restore is always shape-consistent.
+        let mut fit_incumbent_restored = false;
+        if let Some((incumbent_ev, _incumbent_uniformity, incumbent_state)) =
+            term.best_fit_incumbent.take()
+        {
+            let terminal_ev = term
+                .try_fitted_for_rho(&fitted_rho)
+                .ok()
+                .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
+            let restore = match terminal_ev {
+                Some(current_ev) => {
+                    incumbent_ev.is_finite()
+                        && current_ev.is_finite()
+                        && current_ev + SAE_FINAL_EV_DEGRADATION_TOL < incumbent_ev
+                }
+                None => incumbent_ev.is_finite(),
+            };
+            if restore {
+                log::warn!(
+                    "[#1026] restoring FIT-LEVEL reconstruction incumbent: terminal state \
+                     EV={terminal_ev:?} vs best-visited EV={incumbent_ev:.4} across the outer \
+                     ρ search"
+                );
+                term.restore_mutable_state(&incumbent_state);
+                fit_incumbent_restored = true;
+            }
+        }
+        let mut loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
             data_fit: 0.0,
             assignment_sparsity: 0.0,
             smoothness: 0.0,
             ard: 0.0,
             evidence_gauge_deflated_directions: 0,
         });
+        // The terminal `last_loss` described the pre-restore state; re-read the
+        // frozen-state loss at the settled ρ so the reported loss matches the
+        // restored incumbent.
+        if fit_incumbent_restored
+            && let Ok(recomputed) = term.loss(target.view(), &fitted_rho)
+        {
+            loss = recomputed;
+        }
         // Basin guard against the multi-atom routing-collapse failure mode
         // (#629 #630). The outer ρ cascade mutates `term` cumulatively across
         // candidate ρ evaluations and never restores it between evals, so a
