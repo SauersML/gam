@@ -4989,6 +4989,34 @@ impl SaeManifoldTerm {
         //    the undamped (`ridge = 0`) factorization succeeds — the streaming
         //    log-det path reuses the identical driver so both rank the same
         //    converged Laplace optimum and stay bit-identical.
+        //
+        //    #2080 COST NOTE — why the dense `log|Schur_β|` is NOT rank-updated
+        //    across outer ρ probes from a cached factor. The tempting identity
+        //    is the matrix-determinant / pencil form: with the smooth penalty
+        //    entering the border block linearly in λ = e^ρ (block-diagonal
+        //    `Σ_k λ_k · (S_k ⊗ I_p)` on the full-`B` layout, `Σ_k λ_k · S̃_k` on
+        //    the framed layout — see `assemble_arrow_schur` /
+        //    `construction_arrow_schur_assembly.rs`), a probe at ρ' would give
+        //        S(ρ') = S(ρ) + Σ_k (e^{ρ'_k} − e^{ρ_k}) · P_k ,
+        //    and `log|S(ρ')|` would follow exactly from the cached generalized
+        //    eigendecomposition of the pencil `(S(ρ), P)`. That identity is an
+        //    EXACT algebraic statement ONLY at a FIXED inner state `(t̂, β̂)`.
+        //    The criterion is defined at the RE-CONVERGED inner optimum of each
+        //    probed ρ (this driver refuses to rank an off-optimum Laplace
+        //    value), and the converged state moves with ρ by the implicit-
+        //    function law `dθ̂/dρ = −H⁻¹ · ∂g/∂ρ`, so every Gauss-Newton block
+        //    of S — `H_ββ(t̂, β̂)` AND the eliminated `Σ_i H_βt H_tt⁻¹ H_tβ`
+        //    downdate — changes DENSELY between probes, not by a low-rank or
+        //    scaled-block term. A pencil update across probes would therefore
+        //    be an approximation, which the exactness doctrine bans from this
+        //    criterion. The one lane whose premise DOES hold — the frozen
+        //    `inner_max_iter == 0` warm-start reuse, where `(t̂, β̂)` is pinned
+        //    by contract — already factors exactly once per evaluation, so
+        //    there is no second factorization for the identity to replace.
+        //    The structural saving that IS exact — factoring the dense border
+        //    Schur once per evaluation (at the stationary iterate) instead of
+        //    once per refine round — lives inside
+        //    `converge_inner_for_undamped_logdet`.
         let options = ArrowSolveOptions::direct()
             .with_ill_conditioning_tolerated()
             .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
@@ -5455,12 +5483,11 @@ impl SaeManifoldTerm {
             let quotient_grad_norm =
                 self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
             let iterate_scale = self.inner_iterate_scale();
-            // Relative parameter-step tolerance for diagnostics and a scaled
-            // KKT-gradient tolerance for stationarity. Convergence is accepted
-            // only on raw or quotient gradient stationarity; the Newton step is
-            // kept in diagnostics because it can collapse along the chart gauge
-            // before the quotient residual is small.
-            let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
+            // Scaled KKT-gradient tolerance for stationarity. Convergence is
+            // accepted only on raw or quotient gradient stationarity; the Newton
+            // step can collapse along the chart gauge before the quotient
+            // residual is small, so it never gates convergence (it is only
+            // computed — and logged — at the accepted stationary factorization).
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             if !grad_norm_sq.is_finite() {
                 return Err(format!(
@@ -5469,11 +5496,43 @@ impl SaeManifoldTerm {
                      factorisation is degenerate at this ρ"
                 ));
             }
-            let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
-                match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
-                    Ok(factored) => factored,
-                    Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
-                        if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
+            // #2080 criterion-cost restructure — the Laplace normaliser ½log|H|
+            // is the REML criterion ONLY at the inner KKT optimum, so the FULL
+            // undamped Direct factorization (dense border β-Schur assembly
+            // `O(n·q·k²)` plus the `O(k³)` border Cholesky / eigen-floor, with
+            // `k = border_dim = Σ_k M_k·p`) is taken exactly ONCE — at the
+            // stationary iterate whose cache is returned. Historically it was
+            // ALSO taken on every non-stationary refine round and immediately
+            // discarded: the pre-stationarity Newton step Δ = H⁻¹g was never
+            // applied (the refinement below re-enters `run_joint_fit_arrow_schur`
+            // from the same state) and convergence is judged on the
+            // factorisation-independent KKT gradient alone, so the dense border
+            // factor bought nothing at a non-stationary iterate. That discarded
+            // cubic factor was the dominant wide-`p` criterion cost (#2080).
+            //
+            // A non-stationary round needs exactly ONE bit from the
+            // factorization: whether the undamped per-row H_tt blocks are PD —
+            // the infeasible-ρ signal that drives the #2080 probe fast-refusal
+            // and the refine-budget escalation below.
+            // `probe_undamped_evidence_row_factors` surfaces that identical
+            // verdict (same #1038 IBP self-term downdate, same gauge/spectral
+            // deflation policy, same `factor_one_row` error text) at the
+            // per-row-only `O(N·q³)` cost, never forming the border Schur.
+            //
+            // EXACTNESS: the refinement trajectory is unchanged (the same
+            // sequence of `run_joint_fit_arrow_schur` calls runs between the
+            // same assembled systems), the stationary iterate is unchanged, and
+            // the returned cache is the factorization of the same system at
+            // that iterate — identical to what the historical loop returned —
+            // so the criterion VALUE is untouched. Only work whose result was
+            // provably discarded is removed.
+            let gradient_stationary =
+                grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance;
+            if gradient_stationary {
+                let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
+                    match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
+                        Ok(factored) => factored,
+                        Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
                             // K>1: the softmax/IBP logit–coordinate Gauss-Newton
                             // cross-terms (H_zt = J_z^T J_t, assembled row-locally from
                             // the assignment JVP × basis JVP) can make a per-row H_tt
@@ -5508,120 +5567,135 @@ impl SaeManifoldTerm {
                                  {err}"
                             ));
                         }
-                        // #2080 — a non-PD per-row H_tt block means the undamped
-                        // Laplace log-det is UNDEFINED at this ρ: the ρ is
-                        // infeasible. For a PROBE (line-search value / FD /
-                        // seed-validation lane, `refine_progress_extension == false`)
-                        // the caller only needs a typed infeasible verdict so the
-                        // outer search steers back into the PD region — refining the
-                        // inner solve to try to CROSS the indefinite basin is the
-                        // accepted-iterate's job, not a probe's. Grinding the probe
-                        // refine budget (up to `4×inner_max_iter`, and historically
-                        // the accepted `16×/64×` via `reml_criterion_with_cache`) on
-                        // every overshooting line-search / FD probe is exactly the
-                        // wide-`p` outer REML hang (#2080). Return the typed refusal
-                        // after this single diagnostic factor pass;
-                        // `is_recoverable_value_probe_refusal` maps it to the finite
-                        // infeasibility wall.
-                        if !refine_progress_extension {
-                            return Err(format!(
-                                "SaeManifoldTerm::reml_criterion: undamped evidence \
-                                 factorization hit a non-PD per-row H_tt block before KKT \
-                                 stationarity at an infeasible-ρ probe (‖g‖={grad_norm:.6e}, \
-                                 tol {grad_tolerance:.6e}); returning the typed infeasible \
-                                 refusal without grinding the probe refinement budget; {err}"
-                            ));
+                        Err(err) => {
+                            return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
                         }
-                        let refine_limit = Self::refine_iteration_limit(
-                            total_inner_iter,
-                            base_refine_iter,
-                            progress_refine_iter,
-                            previous_refine_grad_norm,
-                            grad_norm,
-                            saw_refine_progress,
-                        );
-                        if total_inner_iter >= refine_limit {
-                            // #1117/#1118 — pre-stationarity genuinely-indefinite
-                            // non-gauge H_tt under K>1 IBP/softmax row-sharing. The
-                            // logit × coordinate Gauss-Newton cross term H_zt = J_zᵀJ_t
-                            // can drive a shared row's H_tt Schur complement NEGATIVE off
-                            // the gauge orbit; the LM-escalated refinement above cannot
-                            // always cross the indefinite basin into the PD region within
-                            // the descent-extended budget.
-                            //
-                            // The undamped (ridge=0) evidence factor already conditions
-                            // that block the PRINCIPLED way: `factor_spectral_deflated_
-                            // evidence_row` discovers the negative/flat eigen-direction
-                            // and stiffens it to UNIT curvature (eigenvalue → +1), a
-                            // ρ-INDEPENDENT log 1 = 0 evidence contribution — so the
-                            // `Ok(factored)` arm above accepts the indefinite block and
-                            // returns a finite, monotone-comparable value to the outer
-                            // BFGS WITHOUT a ρ-dependent bias. Reaching THIS arm means
-                            // even that spectral deflation declined (a non-finite block
-                            // or a failed eigendecomposition): the iterate is genuinely
-                            // broken, so we surface the hard refusal and let the outer
-                            // BFGS treat this ρ as an INFINITY probe.
-                            //
-                            // We must NOT ridge-damp here: a `+ridge·I` evidence
-                            // fallback injects a ρ-dependent ½·log|I + ridge·H_tt⁻¹|
-                            // bias into the VALUE that the analytic ρ-gradient (built
-                            // for the undamped Laplace log-det) never sees, desyncing
-                            // the outer line-search — the multi-atom non-convergence this
-                            // fix removes. K=1 (and any already-PD or spectral-deflatable
-                            // K>1 row) never reaches this branch.
-                            return Err(format!(
-                                "SaeManifoldTerm::reml_criterion: undamped evidence \
-                                 factorization hit a non-PD per-row H_tt block before KKT \
-                                 stationarity (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) \
-                                 and the refinement budget was exhausted after \
-                                 {total_inner_iter} inner iterations; {err}"
-                            ));
-                        }
-                        let remaining = refine_limit - total_inner_iter;
-                        let refine_iter = inner_max_iter.max(1).min(remaining);
-                        saw_refine_progress |=
-                            Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
-                        previous_refine_grad_norm = Some(grad_norm);
-                        *loss = self.run_joint_fit_arrow_schur(
-                            target,
-                            rho_fixed,
-                            registry,
-                            refine_iter,
-                            learning_rate,
-                            ridge_ext_coord,
-                            ridge_beta,
-                        )?;
-                        total_inner_iter += refine_iter;
-                        continue;
-                    }
-                    Err(err) => {
-                        return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
-                    }
-                };
-            // The Laplace normaliser ½log|H| is only the correct REML criterion at
-            // the inner optimum (t̂, β̂). Convergence is judged only by raw or
-            // quotient KKT stationarity. The quotient Newton step is diagnostic:
-            // on K=1 near-isotropic clouds it can vanish along the chart gauge
-            // while the objective remains non-stationary.
-            let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
-                + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-            if !step_norm_sq.is_finite() {
-                return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
-                     the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
-                     Hessian factorisation is degenerate at this ρ"
-                ));
-            }
-            let step_norm = step_norm_sq.sqrt();
-            let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
-                delta_t.view(),
-                delta_beta.view(),
-                step_norm_sq,
-                &lambda_smooth,
-            )?;
-            let quotient_step_norm = quotient_step_norm_sq.sqrt();
-            if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
+                    };
+                // Only the factor cache is consumed (the stationary Newton step Δ
+                // is discarded), but the full solve above still computes Δ, so
+                // the historical degenerate-factorisation witnesses stay armed at
+                // the ACCEPTED iterate: a non-finite undamped step, or a failed
+                // quotient-step projection, refuses exactly as before.
+                let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
+                    + delta_beta.iter().map(|&v| v * v).sum::<f64>();
+                if !step_norm_sq.is_finite() {
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
+                         the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
+                         Hessian factorisation is degenerate at this ρ"
+                    ));
+                }
+                let quotient_step_norm_sq = self.quotient_newton_step_norm_sq(
+                    delta_t.view(),
+                    delta_beta.view(),
+                    step_norm_sq,
+                    &lambda_smooth,
+                )?;
+                log::debug!(
+                    "SAE evidence factor accepted at KKT stationarity: ‖g‖={grad_norm:.6e} \
+                     ‖Π⊥gauge g‖={quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
+                     ‖Δ‖={:.6e} ‖Π⊥gauge Δ‖={:.6e} after {total_inner_iter} inner iterations",
+                    step_norm_sq.sqrt(),
+                    quotient_step_norm_sq.sqrt(),
+                );
                 return Ok(cache);
+            }
+            // NON-stationary refine round: per-row-only undamped feasibility
+            // probe in place of the historically-discarded full factorization
+            // (see the #2080 block comment above).
+            match probe_undamped_evidence_row_factors(&sys, options) {
+                Ok(()) => {}
+                Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
+                    // #2080 — a non-PD per-row H_tt block means the undamped
+                    // Laplace log-det is UNDEFINED at this ρ: the ρ is
+                    // infeasible. For a PROBE (line-search value / FD /
+                    // seed-validation lane, `refine_progress_extension == false`)
+                    // the caller only needs a typed infeasible verdict so the
+                    // outer search steers back into the PD region — refining the
+                    // inner solve to try to CROSS the indefinite basin is the
+                    // accepted-iterate's job, not a probe's. Grinding the probe
+                    // refine budget (up to `4×inner_max_iter`, and historically
+                    // the accepted `16×/64×` via `reml_criterion_with_cache`) on
+                    // every overshooting line-search / FD probe is exactly the
+                    // wide-`p` outer REML hang (#2080). Return the typed refusal
+                    // after this single diagnostic factor pass;
+                    // `is_recoverable_value_probe_refusal` maps it to the finite
+                    // infeasibility wall.
+                    if !refine_progress_extension {
+                        return Err(format!(
+                            "SaeManifoldTerm::reml_criterion: undamped evidence \
+                             factorization hit a non-PD per-row H_tt block before KKT \
+                             stationarity at an infeasible-ρ probe (‖g‖={grad_norm:.6e}, \
+                             tol {grad_tolerance:.6e}); returning the typed infeasible \
+                             refusal without grinding the probe refinement budget; {err}"
+                        ));
+                    }
+                    let refine_limit = Self::refine_iteration_limit(
+                        total_inner_iter,
+                        base_refine_iter,
+                        progress_refine_iter,
+                        previous_refine_grad_norm,
+                        grad_norm,
+                        saw_refine_progress,
+                    );
+                    if total_inner_iter >= refine_limit {
+                        // #1117/#1118 — pre-stationarity genuinely-indefinite
+                        // non-gauge H_tt under K>1 IBP/softmax row-sharing. The
+                        // logit × coordinate Gauss-Newton cross term H_zt = J_zᵀJ_t
+                        // can drive a shared row's H_tt Schur complement NEGATIVE off
+                        // the gauge orbit; the LM-escalated refinement above cannot
+                        // always cross the indefinite basin into the PD region within
+                        // the descent-extended budget.
+                        //
+                        // The undamped (ridge=0) evidence factor already conditions
+                        // that block the PRINCIPLED way: `factor_spectral_deflated_
+                        // evidence_row` discovers the negative/flat eigen-direction
+                        // and stiffens it to UNIT curvature (eigenvalue → +1), a
+                        // ρ-INDEPENDENT log 1 = 0 evidence contribution — so a
+                        // spectral-deflatable indefinite block factors fine (both
+                        // here and in the stationary factorization above) and
+                        // returns a finite, monotone-comparable value to the outer
+                        // BFGS WITHOUT a ρ-dependent bias. Reaching THIS arm means
+                        // even that spectral deflation declined (a non-finite block
+                        // or a failed eigendecomposition): the iterate is genuinely
+                        // broken, so we surface the hard refusal and let the outer
+                        // BFGS treat this ρ as an INFINITY probe.
+                        //
+                        // We must NOT ridge-damp here: a `+ridge·I` evidence
+                        // fallback injects a ρ-dependent ½·log|I + ridge·H_tt⁻¹|
+                        // bias into the VALUE that the analytic ρ-gradient (built
+                        // for the undamped Laplace log-det) never sees, desyncing
+                        // the outer line-search — the multi-atom non-convergence this
+                        // fix removes. K=1 (and any already-PD or spectral-deflatable
+                        // K>1 row) never reaches this branch.
+                        return Err(format!(
+                            "SaeManifoldTerm::reml_criterion: undamped evidence \
+                             factorization hit a non-PD per-row H_tt block before KKT \
+                             stationarity (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) \
+                             and the refinement budget was exhausted after \
+                             {total_inner_iter} inner iterations; {err}"
+                        ));
+                    }
+                    let remaining = refine_limit - total_inner_iter;
+                    let refine_iter = inner_max_iter.max(1).min(remaining);
+                    saw_refine_progress |=
+                        Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
+                    previous_refine_grad_norm = Some(grad_norm);
+                    *loss = self.run_joint_fit_arrow_schur(
+                        target,
+                        rho_fixed,
+                        registry,
+                        refine_iter,
+                        learning_rate,
+                        ridge_ext_coord,
+                        ridge_beta,
+                    )?;
+                    total_inner_iter += refine_iter;
+                    continue;
+                }
+                Err(err) => {
+                    return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
+                }
             }
             let refine_limit = Self::refine_iteration_limit(
                 total_inner_iter,
@@ -5633,14 +5707,18 @@ impl SaeManifoldTerm {
             );
             if total_inner_iter >= refine_limit {
                 // Inner solve did not converge in reml_criterion; the returned
-                // Err below carries the full non-convergence diagnostic
-                // (gradient / quotient-step norms and tolerances) to the caller.
+                // Err below carries the non-convergence diagnostic (gradient /
+                // quotient-gradient norms and the tolerance) to the caller. The
+                // historical quotient-Newton-step figures are no longer printed:
+                // the pre-stationarity Newton step was ALWAYS diagnostic-only
+                // (convergence is judged on the factorisation-independent KKT
+                // gradient), and the #2080 restructure above no longer pays the
+                // full dense factorization that produced it at non-stationary
+                // rounds.
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                      neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
-                     ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e}; \
-                     quotient Newton step ‖Π⊥gauge Δ‖={quotient_step_norm:.6e} \
-                     (raw ‖Δ‖={step_norm:.6e}, step tol {step_tolerance:.6e}) is diagnostic only \
+                     ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e} \
                      after {total_inner_iter} inner iterations. Refusing to rank an \
                      off-optimum Laplace criterion."
                 ));

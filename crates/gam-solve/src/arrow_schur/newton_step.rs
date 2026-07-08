@@ -56,27 +56,14 @@ pub fn solve_arrow_newton_step_with_options(
     // resulting cache. The Newton step is corrected to `H_full⁻¹(−g)` below so the
     // returned step and the reported curvature describe the SAME `H_full`.
     let downdated_owner;
-    let (sys, ibp_source): (&ArrowSchurSystem, Option<&IbpCrossRowSource>) =
-        match sys.ibp_cross_row.as_ref() {
-            Some(source) => {
-                let mut downdated = sys.clone();
-                let total_len = downdated.row_offsets[downdated.rows.len()];
-                let down = source.self_term_downdate(total_len);
-                let offsets = Arc::clone(&downdated.row_offsets);
-                for (i, row) in downdated.rows.iter_mut().enumerate() {
-                    let base = offsets[i];
-                    let di = row.htt.nrows();
-                    for j in 0..di {
-                        row.htt[[j, j]] -= down[base + j];
-                    }
-                }
-                // The downdated rows carry a new curvature fingerprint.
-                downdated.refresh_row_hessian_fingerprint();
-                downdated_owner = downdated;
-                (&downdated_owner, Some(source))
-            }
-            None => (sys, None),
-        };
+    let ibp_source: Option<&IbpCrossRowSource> = sys.ibp_cross_row.as_ref();
+    let sys: &ArrowSchurSystem = match ibp_self_term_downdated_system(sys) {
+        Some(downdated) => {
+            downdated_owner = downdated;
+            &downdated_owner
+        }
+        None => sys,
+    };
     let step = solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)?;
     let backend = CpuBatchedBlockSolver;
 
@@ -206,6 +193,91 @@ pub fn solve_arrow_newton_step_with_options(
         None => cache.compute_undamped_arrow_log_det(),
     };
     Ok((delta_t, delta_beta, cache))
+}
+
+/// #1038 — build the NO-SELF `H₀'` system for an IBP cross-row source: clone the
+/// system and downdate each per-row logit-slot diagonal by the self term
+/// `d_k·z'_ik²`, so factoring against it plus the exact rank-`R` Woodbury
+/// `U D Uᵀ` correction never double-counts the `i = j` diagonal. Returns `None`
+/// when the system carries no `ibp_cross_row` source (factor the system as-is).
+/// Single source of the downdate arithmetic for the full evidence entry
+/// ([`solve_arrow_newton_step_with_options`]) and the per-row feasibility probe
+/// ([`probe_undamped_evidence_row_factors`]), so both always factor the SAME
+/// per-row blocks and reach the identical PD / non-PD verdict.
+pub(crate) fn ibp_self_term_downdated_system(sys: &ArrowSchurSystem) -> Option<ArrowSchurSystem> {
+    let source = sys.ibp_cross_row.as_ref()?;
+    let mut downdated = sys.clone();
+    let total_len = downdated.row_offsets[downdated.rows.len()];
+    let down = source.self_term_downdate(total_len);
+    let offsets = Arc::clone(&downdated.row_offsets);
+    for (i, row) in downdated.rows.iter_mut().enumerate() {
+        let base = offsets[i];
+        let di = row.htt.nrows();
+        for j in 0..di {
+            row.htt[[j, j]] -= down[base + j];
+        }
+    }
+    // The downdated rows carry a new curvature fingerprint.
+    downdated.refresh_row_hessian_fingerprint();
+    Some(downdated)
+}
+
+/// #2080 — per-row-only UNDAMPED evidence feasibility factorization.
+///
+/// Factors ONLY the per-row `H_tt^(i)` blocks at `ridge_t = 0` — with the same
+/// IBP self-term downdate ([`ibp_self_term_downdated_system`]) and the same
+/// gauge / spectral deflation policy ([`factor_blocks_for_system`]) the full
+/// evidence entry `solve_arrow_newton_step_with_options(sys, 0.0, 0.0, options)`
+/// applies as its FIRST stage — then discards the factors. It never forms the
+/// reduced border (β-Schur) system, so it costs `O(Σ_i d_i³)` per-row work
+/// instead of the full `O(n·d·k²)` Schur assembly plus the `O(k³/3)` dense
+/// border Cholesky the full entry pays.
+///
+/// Purpose: the SAE inner-refinement loop
+/// (`converge_inner_for_undamped_logdet`) needs the full undamped factor cache
+/// ONLY at the KKT-stationary iterate — the Laplace normaliser `½log|H|` is the
+/// REML criterion only at the inner optimum, and every pre-stationarity factor
+/// was built and immediately discarded. What a NON-stationary refine round does
+/// need is exactly one bit: whether the undamped per-row blocks are PD (the
+/// infeasible-ρ signal, [`ArrowSchurError::PerRowFactorFailed`], which drives
+/// the #2080 probe fast-refusal and the refine-budget escalation). This probe
+/// surfaces that signal with the IDENTICAL error (same `factor_one_row` text,
+/// same deflation policy, same downdated blocks) without the cubic border work.
+///
+/// Semantics: `Ok(())` means "no per-row infeasibility detected"; it makes NO
+/// claim about the reduced Schur factor (that is only ever formed — and its
+/// failures surfaced — at the stationary iterate's full factorization).
+/// Cross-row-penalty systems route the full solve through matrix-free CG,
+/// where no per-row-only verdict exists, so they return `Ok(())` here; the SAE
+/// evidence path never carries `cross_row_penalties` (its IBP coupling is the
+/// separate `ibp_cross_row` Woodbury source, which IS downdated and checked).
+pub fn probe_undamped_evidence_row_factors(
+    sys: &ArrowSchurSystem,
+    options: &ArrowSolveOptions,
+) -> Result<(), ArrowSchurError> {
+    if options.streaming_chunk_size.is_some() {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: "streaming Arrow-Schur solve does not materialize the per-row factors \
+                     required by the undamped evidence feasibility probe"
+                .to_string(),
+        });
+    }
+    if !sys.cross_row_penalties.is_empty() {
+        // The cross-row route factors nothing per-row at ridge 0 in isolation
+        // (it runs matrix-free CG on the full joint system), so there is no
+        // cheap per-row verdict to surface; the caller's stationary-point full
+        // factorization remains the authority.
+        return Ok(());
+    }
+    let downdated_owner;
+    let sys: &ArrowSchurSystem = match ibp_self_term_downdated_system(sys) {
+        Some(downdated) => {
+            downdated_owner = downdated;
+            &downdated_owner
+        }
+        None => sys,
+    };
+    factor_blocks_for_system(sys, 0.0, options, &CpuBatchedBlockSolver).map(|_| ())
 }
 
 pub(crate) fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {

@@ -288,6 +288,252 @@ impl SaeStreamingPlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Overcomplete curved TopK lane — admission arithmetic.
+//
+// The front door ([`crate::front_door::admit_topk_manifold`]) routes a hard
+// TopK-support fit ([`crate::assignment::AssignmentMode::TopK`]) at K > P to
+// the CURVED framed/streaming engine instead of the linear sparse-code
+// trainer. This section owns that lane's memory ledger. The honest shape is:
+//
+//   * assignment state  O(N · k_active): per-row TopK active sets — `k` active
+//     indices + `k` gate values + `k · d_max` on-manifold coordinates per row.
+//     TopK logits are read-only routing inputs (never live Newton state), so
+//     no dense `N×K` gate state exists in this lane.
+//   * routing window    O(chunk_rows · K): dense scores are materialized one
+//     row chunk at a time to select each row's top-k support, then dropped.
+//   * framed decoder    O(K · M · r): per-atom decoder blocks in the reduced
+//     Grassmann frame (`M_k × r_k`, re-expanded through `U_k` only at
+//     emission — issue #972 / #2135), never the full `K · M · P` slab.
+//   * border workspace  O(K · M · r · vectors): the framed arrow-Schur border
+//     solve's Krylov vectors, at the crate-wide
+//     `SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER` convention.
+// ---------------------------------------------------------------------------
+
+/// Admission-time bound on the framed decoder rank `r` per atom. Mirrors the
+/// in-frame curved cascade's learned-rank upper clamp
+/// (`InFrameCurvedConfig::frame_rank_max = 32`, bracketing the reviewer's
+/// `r ≈ 8–32` band): a framed atom's border block is `M_k × min(P, r)`, so the
+/// admission ledger charges `min(P, 32)` per output direction.
+pub(crate) const SAE_TOPK_ADMISSION_FRAME_RANK_BOUND: usize = 32;
+
+/// Admission-time upper bound on a seedable atom's basis size `M_k`, from the
+/// `d_max` the front door knows before any basis is built. Covers every kind
+/// `sae_build_atom_plans` can seed:
+///
+///   * periodic: `2·n_harmonics + 1` with `n_harmonics = d` → `2·d_max + 1`;
+///   * sphere: fixed 7 (`≤ 32 + …` below);
+///   * duchon / euclidean patch / linear: at most the center ceiling (32) plus
+///     the quadratic polynomial patch `(d+1)(d+2)/2` (degree ≤ 2 monomials);
+///   * torus: tensor harmonics can exceed this bound, but the plan builder
+///     already rejects runaway torus designs at its own dense limit, so the
+///     admission ledger stays a bound for every design that can reach a fit.
+pub(crate) const fn sae_topk_admission_atom_basis_bound(d_max: usize) -> usize {
+    let periodic = 2 * d_max + 1;
+    let patch = 32 + ((d_max + 1) * (d_max + 2)) / 2;
+    if periodic > patch { periodic } else { patch }
+}
+
+/// Memory ledger for one overcomplete curved TopK fit shape, as decided at the
+/// front door. All byte figures use the documented formulas above; `admitted`
+/// flags are pure functions of `(shape, in_core_budget_bytes)` so the decision
+/// is reproducible and testable without a live memory probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaeTopKCurvedBudget {
+    /// Observations `N`.
+    pub n_obs: usize,
+    /// Output dimension `P`.
+    pub output_dim: usize,
+    /// Atom count `K` (> `P` in the overcomplete regime this lane exists for).
+    pub n_atoms: usize,
+    /// Hard per-row support size `k_active`.
+    pub support_k: usize,
+    /// Maximum per-atom latent dimension.
+    pub d_max: usize,
+    /// `N·K·(1+d_max)·8` — the dense routing-logit + coordinate seed the
+    /// resident driver materializes today at the FFI seam. Gates the RESIDENT
+    /// sub-lane; the chunked-seed driver (integration seam below) removes it.
+    pub resident_seed_bytes: usize,
+    /// `N·k_active·(2+d_max)·8` — per-row TopK active sets (indices + gate
+    /// values + coordinates), the honest `O(N·k_active)` assignment state.
+    pub active_state_bytes: usize,
+    /// `seed_chunk_rows·K·8` — the transient dense-score window used to select
+    /// each chunk's top-k support; never `N·K` resident.
+    pub routing_window_bytes: usize,
+    /// `K·M̂·r̂·8` — framed per-atom decoder blocks at the admission bounds
+    /// `M̂ = sae_topk_admission_atom_basis_bound(d_max)`,
+    /// `r̂ = min(P, SAE_TOPK_ADMISSION_FRAME_RANK_BOUND)`.
+    pub framed_decoder_bytes: usize,
+    /// `K·M̂·r̂·8·SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER` — the framed
+    /// border solve's Krylov vector workspace.
+    pub border_vector_bytes: usize,
+    /// Streaming-lane peak: `active_state + routing_window + framed_decoder +
+    /// border_vector` bytes.
+    pub streaming_peak_bytes: usize,
+    /// Budget the streaming peak is admitted against:
+    /// `max(in_core_budget_bytes, SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES)`,
+    /// the same starved-box floor convention as the matrix-free plan.
+    pub streaming_budget_bytes: usize,
+    /// The un-floored in-core budget the resident seed is gated on.
+    pub in_core_budget_bytes: usize,
+    /// True when the dense resident seed fits the in-core budget: today's
+    /// engine runs this shape in core.
+    pub resident_seed_admitted: bool,
+    /// True when the streaming peak fits the (floored) streaming budget: the
+    /// chunked-seed curved lane can run this shape once the driver seam is
+    /// wired, without ever holding the dense `N×K` seed.
+    pub streaming_admitted: bool,
+}
+
+impl SaeTopKCurvedBudget {
+    /// Rows per routing chunk for the chunked-seed driver: sized so one dense
+    /// score window stays inside the cache-multiple chunk convention
+    /// (`SAE_CPU_L2_CACHE_BYTES · SAE_CHUNK_CACHE_MULTIPLE`), floored at
+    /// `SAE_MIN_STREAMING_CHUNK_ROWS` and capped at `N`.
+    pub fn seed_chunk_rows(&self) -> usize {
+        let per_row_bytes = self.n_atoms.saturating_mul(SAE_BYTES_PER_F64).max(1);
+        ((SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE) / per_row_bytes)
+            .max(SAE_MIN_STREAMING_CHUNK_ROWS)
+            .min(self.n_obs.max(1))
+    }
+}
+
+/// Pure admission arithmetic for the overcomplete curved TopK lane. See the
+/// section comment and [`SaeTopKCurvedBudget`] field docs for every formula.
+pub(crate) fn sae_topk_curved_budget_from_budget(
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    d_max: usize,
+    support_k: usize,
+    in_core_budget_bytes: usize,
+) -> SaeTopKCurvedBudget {
+    let resident_seed_bytes = n_obs
+        .saturating_mul(n_atoms)
+        .saturating_mul(1usize.saturating_add(d_max))
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let active_state_bytes = n_obs
+        .saturating_mul(support_k)
+        .saturating_mul(2usize.saturating_add(d_max))
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let basis_bound = sae_topk_admission_atom_basis_bound(d_max);
+    let rank_bound = output_dim.min(SAE_TOPK_ADMISSION_FRAME_RANK_BOUND);
+    let framed_decoder_bytes = n_atoms
+        .saturating_mul(basis_bound)
+        .saturating_mul(rank_bound)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let border_vector_bytes =
+        framed_decoder_bytes.saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER);
+    let mut budget = SaeTopKCurvedBudget {
+        n_obs,
+        output_dim,
+        n_atoms,
+        support_k,
+        d_max,
+        resident_seed_bytes,
+        active_state_bytes,
+        routing_window_bytes: 0,
+        framed_decoder_bytes,
+        border_vector_bytes,
+        streaming_peak_bytes: 0,
+        streaming_budget_bytes: in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES),
+        in_core_budget_bytes,
+        resident_seed_admitted: resident_seed_bytes <= in_core_budget_bytes,
+        streaming_admitted: false,
+    };
+    budget.routing_window_bytes = budget
+        .seed_chunk_rows()
+        .saturating_mul(n_atoms)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    budget.streaming_peak_bytes = budget
+        .active_state_bytes
+        .saturating_add(budget.routing_window_bytes)
+        .saturating_add(budget.framed_decoder_bytes)
+        .saturating_add(budget.border_vector_bytes);
+    budget.streaming_admitted = budget.streaming_peak_bytes <= budget.streaming_budget_bytes;
+    budget
+}
+
+/// INTEGRATION SEAM (overcomplete curved TopK lane — orchestrator wiring).
+///
+/// This is the ONE call the owned driver files must make to run a `K > P`
+/// hard-TopK curved fit without the dense `N×K` seed. Specifically,
+/// `fit_drivers.rs` (and the FFI seed builder it serves) must, whenever the
+/// assignment mode is [`crate::assignment::AssignmentMode::TopK`] and
+/// `n_atoms > output_dim`, call
+///
+/// ```ignore
+/// let lane = crate::manifold::admit_topk_curved_lane(
+///     n_obs, output_dim, n_atoms, d_max, support_k,
+/// )?;
+/// ```
+///
+/// BEFORE allocating any `(N, K)` routing-logit or `(K, N, d_max)` coordinate
+/// seed, and then:
+///
+///   * if `lane.resident_seed_admitted` — proceed exactly as today (the dense
+///     seed fits in core; behavior unchanged);
+///   * otherwise (`lane.streaming_admitted`) — build the routing seed in row
+///     chunks of `lane.seed_chunk_rows()` rows, retain per row ONLY the
+///     `support_k` active indices / gate values / coordinates
+///     (`lane.active_state_bytes` total), and hand the framed
+///     `SparseRankOnePenaltyOp` carriers the per-chunk active sets. The dense
+///     window (`lane.routing_window_bytes`) is dropped after each chunk.
+///
+/// Until that wiring lands, the front door refuses the
+/// `!resident_seed_admitted && streaming_admitted` region with an actionable
+/// error naming this function, so no admitted shape can OOM on the dense seed.
+///
+/// Returns the full ledger on admission (resident OR streaming); a typed `Err`
+/// when the shape exceeds even the streaming budget — a TopK manifold request
+/// is never silently substituted with the linear sparse-code lane.
+pub fn admit_topk_curved_lane(
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    d_max: usize,
+    support_k: usize,
+) -> Result<SaeTopKCurvedBudget, String> {
+    if n_obs == 0 || output_dim == 0 || n_atoms == 0 {
+        return Err(format!(
+            "admit_topk_curved_lane requires positive N, P, and K; got N={n_obs}, P={output_dim}, K={n_atoms}"
+        ));
+    }
+    if d_max == 0 {
+        return Err("admit_topk_curved_lane requires d_max >= 1".to_string());
+    }
+    if support_k == 0 || support_k > n_atoms {
+        return Err(format!(
+            "admit_topk_curved_lane requires 1 <= support_k <= K={n_atoms}; got {support_k}"
+        ));
+    }
+    let (in_core_budget_bytes, host_available) = sae_host_in_core_budget_bytes();
+    let budget = sae_topk_curved_budget_from_budget(
+        n_obs,
+        output_dim,
+        n_atoms,
+        d_max,
+        support_k,
+        in_core_budget_bytes,
+    );
+    if budget.resident_seed_admitted || budget.streaming_admitted {
+        return Ok(budget);
+    }
+    Err(format!(
+        "topk curved lane refused: streaming peak {} bytes (active sets {} + routing window {} \
+         + framed decoder {} + border workspace {}) exceeds the streaming budget {} bytes \
+         (host available {host_available}) at N={n_obs}, P={output_dim}, K={n_atoms}, \
+         k_active={support_k}, d_max={d_max}. Reduce n_obs or support_k — a TOPK MANIFOLD \
+         request is never silently substituted with the linear sparse-code lane",
+        budget.streaming_peak_bytes,
+        budget.active_state_bytes,
+        budget.routing_window_bytes,
+        budget.framed_decoder_bytes,
+        budget.border_vector_bytes,
+        budget.streaming_budget_bytes,
+    ))
+}
+
 pub(crate) fn sae_host_available_memory_bytes() -> usize {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
@@ -538,6 +784,105 @@ mod host_in_core_budget_tests {
             !large.direct_admitted,
             "a large dense plan must stay gated on the (collapsed) budget and stream, \
              not be admitted by the tiny-plan relaxation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod topk_curved_budget_tests {
+    use super::*;
+
+    /// Every byte figure in the ledger follows its documented formula exactly.
+    #[test]
+    fn topk_curved_budget_formulas_are_the_documented_arithmetic() {
+        let (n, p, k, d, s) = (4096usize, 512usize, 32_000usize, 1usize, 8usize);
+        let budget_bytes = 16 * 1024 * 1024 * 1024usize;
+        let ledger = sae_topk_curved_budget_from_budget(n, p, k, d, s, budget_bytes);
+
+        assert_eq!(
+            ledger.resident_seed_bytes,
+            n * k * (1 + d) * SAE_BYTES_PER_F64
+        );
+        assert_eq!(
+            ledger.active_state_bytes,
+            n * s * (2 + d) * SAE_BYTES_PER_F64
+        );
+        let m_hat = sae_topk_admission_atom_basis_bound(d);
+        assert_eq!(
+            m_hat,
+            32 + 3,
+            "d_max=1: patch bound 32 + (2·3)/2 dominates 2d+1=3"
+        );
+        let r_hat = p.min(SAE_TOPK_ADMISSION_FRAME_RANK_BOUND);
+        assert_eq!(
+            ledger.framed_decoder_bytes,
+            k * m_hat * r_hat * SAE_BYTES_PER_F64
+        );
+        assert_eq!(
+            ledger.border_vector_bytes,
+            ledger.framed_decoder_bytes * SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER
+        );
+        assert_eq!(
+            ledger.routing_window_bytes,
+            ledger.seed_chunk_rows() * k * SAE_BYTES_PER_F64
+        );
+        assert_eq!(
+            ledger.streaming_peak_bytes,
+            ledger.active_state_bytes
+                + ledger.routing_window_bytes
+                + ledger.framed_decoder_bytes
+                + ledger.border_vector_bytes
+        );
+        assert_eq!(
+            ledger.streaming_budget_bytes,
+            budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES)
+        );
+        // The honest assignment state is O(N·k_active): orders of magnitude
+        // below the dense N·K seed in the overcomplete regime.
+        assert!(ledger.active_state_bytes * 100 < ledger.resident_seed_bytes);
+        // This shape fits both sub-lanes at a 4 GiB budget.
+        assert!(ledger.resident_seed_admitted);
+        assert!(ledger.streaming_admitted);
+    }
+
+    /// The streaming lane admits shapes whose DENSE seed is over budget — the
+    /// exact region the chunked-seed integration seam exists for — and the
+    /// seam refuses only past the streaming budget, with the no-substitution
+    /// contract in the message.
+    #[test]
+    fn topk_streaming_admits_beyond_resident_and_seam_validates() {
+        let (n, p, k, d, s) = (1_000_000usize, 512usize, 32_000usize, 1usize, 8usize);
+        // Resident seed = 1e6 · 32000 · 2 · 8 = 512 GB: never in core. The
+        // streamed peak is ~9.7 GB, dominated by the framed border workspace
+        // (K·M̂·r̂·8·32 ≈ 8.5 GiB), so a 16 GiB budget admits streaming.
+        let budget_bytes = 16 * 1024 * 1024 * 1024usize;
+        let ledger = sae_topk_curved_budget_from_budget(n, p, k, d, s, budget_bytes);
+        assert!(!ledger.resident_seed_admitted);
+        assert!(
+            ledger.streaming_admitted,
+            "streaming peak {} must fit the 16 GiB budget: the O(N·k_active) state is small",
+            ledger.streaming_peak_bytes
+        );
+        // Chunk sizing: floored at the minimum streaming chunk and capped at N.
+        assert!(ledger.seed_chunk_rows() >= SAE_MIN_STREAMING_CHUNK_ROWS);
+        assert!(ledger.seed_chunk_rows() <= n);
+
+        // Degenerate shapes are caller errors at the seam.
+        assert!(admit_topk_curved_lane(0, p, k, d, s).is_err());
+        assert!(admit_topk_curved_lane(n, p, k, 0, s).is_err());
+        assert!(admit_topk_curved_lane(n, p, k, d, 0).is_err());
+        assert!(admit_topk_curved_lane(n, p, k, d, k + 1).is_err());
+
+        // Past the streaming budget the ledger refuses; the refusal must carry
+        // the no-substitution contract.
+        let starved = sae_topk_curved_budget_from_budget(n, p, k, d, s, 0);
+        assert_eq!(
+            starved.streaming_budget_bytes,
+            SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES
+        );
+        assert!(
+            !starved.streaming_admitted,
+            "the framed decoder + border workspace exceed the 64 MiB streaming floor at K=32000"
         );
     }
 }

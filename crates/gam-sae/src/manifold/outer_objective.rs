@@ -388,6 +388,27 @@ pub struct OuterProbeTelemetry {
     pub subsample_rows: usize,
     pub subsample_full_rows: usize,
     pub subsample_probe_calls: usize,
+    /// Eisenstat–Walker inexact-probe engagement: line-search value probes
+    /// (`eval_with_order(Value)`) whose inner `(t, β)` solve was ACCEPTED at the
+    /// loosened forcing gate `max(η_j·‖g_inner,entry‖, τ_full)` while the inner
+    /// KKT residual was still strictly ABOVE the full tolerance `τ_full` — i.e.
+    /// probes that genuinely stopped early under the forcing sequence (see
+    /// [`ProbeForcingState`]). A probe that met `τ_full` anyway (or fell back to
+    /// the full-tolerance evaluator) is NOT counted. `0` on the always-tight
+    /// path (forcing disabled, or before two accepted-gradient evaluations have
+    /// established the forcing ratio).
+    pub loosened_probe_calls: usize,
+    /// Inner Newton iteration GRANTS issued by the line-search value-probe lane
+    /// (`forced_probe_criterion`): the sum of `run_joint_fit_arrow_schur`
+    /// iteration budgets handed out across its chunks, in BOTH the forced and
+    /// the always-tight (η disabled) modes — the two arms share the one counted
+    /// lane, so this figure is directly comparable across a forcing-on vs
+    /// forcing-off run of the same problem (the forcing acceptance test asserts
+    /// strictly fewer grants under forcing). Grants spent inside the historical
+    /// fallback evaluator (streaming regime, `inner_max_iter == 0` freeze, or a
+    /// probe that exhausted the probe budget without meeting its gate) are not
+    /// observable from this lane and are excluded identically in both modes.
+    pub probe_inner_iterations: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -410,6 +431,234 @@ impl OuterProbeTelemetry {
             + self.infeasible_schur
             + self.infeasible_inner_not_converged
     }
+}
+
+/// #2080 (a) — probe→accepted warm-start handoff.
+///
+/// The generic outer line search evaluates its cost probes through the
+/// value-only lane (`eval_with_order(Value)` / `eval_cost` →
+/// `evaluate_value_probe_with_refine_policy`), each of which drives the FULL
+/// inner `(t, β)` Newton solve to KKT convergence at the probed ρ — starting
+/// from the accepted basin — and then RESTORES the accepted term, discarding
+/// that converged state. The accepted point of a successful line search is
+/// always the ρ of its last successful value probe, and the engine then
+/// re-evaluates it through the gradient lane (`eval`), which historically
+/// re-ran the identical deterministic inner convergence from the identical
+/// accepted basin — a full redundant inner solve per outer iteration.
+///
+/// This handoff retains the probe's converged term (a move, not a clone: it is
+/// swapped out against the restored saved term) keyed by the BITWISE probed ρ.
+/// The next criterion-driving call TAKES it unconditionally — so it can never
+/// survive past any other evaluation that might move the accepted basin — and
+/// installs it as the inner warm start only when its ρ matches bitwise.
+///
+/// WHY THE CRITERION VALUE IS UNCHANGED: the Laplace criterion is defined at
+/// the inner KKT optimum at the evaluated ρ (`converge_inner_for_undamped_logdet`
+/// refuses to rank an off-optimum state). The probe reached that optimum by the
+/// exact deterministic iteration sequence the accepted evaluation would have
+/// re-run (same entry state — the accepted basin — same ρ, same solver
+/// configuration), so installing the probe's converged state warm-starts the
+/// accepted evaluation AT the same converged optimum; the criterion's own
+/// convergence loop still runs (its KKT gate passes immediately) and the single
+/// stationary factorization prices the same log|H|. Same converged optimum,
+/// fewer iterations to reach it.
+struct ProbeConvergedHandoff {
+    /// Flattened ρ of the probe, compared BITWISE (`f64::to_bits`) so only an
+    /// exact re-evaluation of the same probed point consumes the state.
+    rho_flat: Array1<f64>,
+    /// The probe's converged term state at `rho_flat`. Under the Eisenstat–
+    /// Walker forcing lane this state may be η-INEXACT (converged only to the
+    /// loosened forcing gate, see [`ProbeForcingState`]); that is still a valid
+    /// handoff because the receiving evaluation treats it purely as a WARM
+    /// START — the accepted lane's own criterion convergence loop
+    /// (`converge_inner_for_undamped_logdet`, full KKT tolerance) still
+    /// adjudicates stationarity before any value or gradient is priced, so the
+    /// accepted-iterate quantities remain full-tolerance regardless of how
+    /// loose the probe that produced this state ran.
+    term: SaeManifoldTerm,
+}
+
+// ─── Eisenstat–Walker line-search probe forcing ─────────────────────────────
+//
+// The outer REML ρ-search converges the inner `(t, β)` Newton solve at EVERY
+// criterion evaluation. But a LINE-SEARCH VALUE PROBE (`eval_with_order(Value)`)
+// only feeds an Armijo/Wolfe accept-reject comparison against the sufficient-
+// decrease bound — it needs the criterion accurately enough to RANK candidate
+// ρ steps, not to full inner tolerance. This is exactly the inexact-Newton
+// setting: the inner KKT system is the "linear solve" whose residual may be
+// left at a forcing tolerance η_j tied to the OUTER optimality measure, with
+// the classical guarantees that overall convergence is preserved as long as
+// η_j is bounded away from 1 and driven to 0 as the outer gradient vanishes.
+//
+// Forcing sequence (every constant is a published Eisenstat–Walker choice; no
+// tuned magic values):
+//
+//   η_j = min(η_max, γ·(‖g_j‖ / ‖g_{j−1}‖)^α),      α = 2
+//
+// — "Choice 2" of S. C. Eisenstat and H. F. Walker, *Choosing the forcing
+// terms in an inexact Newton method*, SIAM J. Sci. Comput. 17(1):16–32, 1996,
+// §2.2, with their recommended γ = 0.9 and α = 2 (the exponent pair they use
+// in the reported experiments; any α ∈ (1, 2] carries their q-superlinear
+// local theory). `g_j` is the analytic outer ρ-gradient at the j-th
+// accepted-gradient evaluation — the outer optimality measure, the direct
+// analog of ‖F(x_j)‖ in EW96.
+//
+// Safeguards (also published, same sources):
+//
+//   * η_j ← max(η_j, γ·η_{j−1}^α) whenever γ·η_{j−1}^α > 0.1 — the EW96 §2.2
+//     Choice-2 safeguard against a one-step collapse of the forcing term after
+//     an accidentally large residual ratio (the 0.1 activation threshold is
+//     theirs, verbatim).
+//   * η_j ≤ η_max = 0.9 — the uniform bound η_j ≤ η_max < 1 required for
+//     local convergence by R. S. Dembo, S. C. Eisenstat and T. Steihaug,
+//     *Inexact Newton methods*, SIAM J. Numer. Anal. 19(2):400–408, 1982
+//     (Thm 2.3); 0.9 is the published default forcing bound of M. Pernice and
+//     H. F. Walker, *NITSOL: a Newton iterative solver for nonlinear systems*,
+//     SIAM J. Sci. Comput. 19(1):302–318, 1998.
+//   * η_j never loosens below the inner solver's own full tolerance: the
+//     realized probe gate is `max(η_j·r_entry, τ_full)` (never DEMANDS more
+//     than the always-tight path either), and before two accepted-gradient
+//     evaluations exist there is no ratio, so probes run tight.
+//
+// Realization: the forcing gate is applied to the inner KKT residual of the
+// probe's joint `(t, β)` solve — `‖g_inner‖ ≤ max(η_j·r_entry, τ_full)` where
+// `r_entry` is the inner KKT residual of the warm-start state at the PROBED ρ
+// (the ‖F(x)‖ analog of the inexact-Newton condition ‖F + F′s‖ ≤ η‖F‖) and
+// `τ_full = SAE_MANIFOLD_INNER_GRAD_REL_TOL·iterate_scale` is the identical
+// stationarity gate `converge_inner_for_undamped_logdet` uses. The criterion
+// at the η-stationary iterate is then priced by the sanctioned freeze
+// evaluation (`inner_max_iter == 0`: one undamped factorization at the frozen
+// state). The criterion-value error this admits is controlled by the inner
+// residual — the penalized-loss part is second-order in it (inner
+// stationarity), the ½log|H| part first-order — and the forcing ties it to
+// the outer gradient, so probes become exact precisely as the outer search
+// converges (and the terminal acceptance never uses this lane at all).
+//
+// WHAT STAYS FULL-TOLERANCE, unconditionally: gradient evaluations at accepted
+// iterates (`eval` / `ValueAndGradient` / `ValueGradientHessian`), the
+// cross-seed ranking / EFS value lane (`eval_cost`), the FD-safeguard and
+// certificate probes (`probe_outer_criterion_value`, `optimality_certificate`),
+// the finalize re-evaluation, and the returned fit (`into_fitted` /
+// `fit_at_fixed_rho`). Only the Armijo/Wolfe comparison probes inside the line
+// search are ever loosened, so the outer KKT test and the FD gates are
+// untouched.
+
+/// EW96 Choice-2 multiplier γ (see the module block above for the citation).
+const EW_FORCING_GAMMA: f64 = 0.9;
+/// DES82 / NITSOL uniform forcing bound η_max < 1.
+const EW_FORCING_ETA_MAX: f64 = 0.9;
+/// EW96 Choice-2 safeguard activation threshold on γ·η_{j−1}^α.
+const EW_FORCING_SAFEGUARD_ACTIVATION: f64 = 0.1;
+
+/// Eisenstat–Walker forcing state for the line-search value-probe lane (see
+/// the block comment above [`EW_FORCING_GAMMA`]). Owned by the objective so no
+/// driver-side plumbing is needed: the objective itself computes the outer
+/// gradient at every accepted-gradient evaluation, which is exactly the
+/// optimality measure the forcing sequence consumes.
+struct ProbeForcingState {
+    /// Whether the forcing lane may loosen probes at all. `false` is the
+    /// ALWAYS-TIGHT arm: value probes still run through the counted lane
+    /// (`forced_probe_criterion` with `eta = None`, whose gate is exactly the
+    /// full inner tolerance), so the probe-lane iteration telemetry stays
+    /// comparable across the two arms while the tight arm's inner solves are
+    /// converged to the identical stationarity measure as the historical path.
+    enabled: bool,
+    /// Flattened ρ of the most recent accepted-gradient evaluation, compared
+    /// bitwise so a RE-evaluation at the same outer iterate (e.g. the finalize
+    /// re-installation) does not masquerade as a new outer step with ratio 1.
+    last_grad_rho: Option<Array1<f64>>,
+    /// ‖g_{j−1}‖ — the previous accepted-gradient norm.
+    g_prev: Option<f64>,
+    /// ‖g_j‖ — the most recent accepted-gradient norm.
+    g_curr: Option<f64>,
+    /// The current forcing term η_j, or `None` before two accepted-gradient
+    /// evaluations exist (probes then run tight — the conservative start).
+    eta: Option<f64>,
+}
+
+impl ProbeForcingState {
+    fn new() -> Self {
+        Self {
+            enabled: true,
+            last_grad_rho: None,
+            g_prev: None,
+            g_curr: None,
+            eta: None,
+        }
+    }
+
+    /// Forget the gradient history (multi-start reset, subsample→full-N swap):
+    /// the next line searches run tight until two accepted-gradient
+    /// evaluations of the NEW objective state re-establish the ratio.
+    fn clear_history(&mut self) {
+        self.last_grad_rho = None;
+        self.g_prev = None;
+        self.g_curr = None;
+        self.eta = None;
+    }
+
+    /// Record the accepted-gradient norm at outer iterate `rho_flat` and
+    /// update the forcing term per EW96 Choice 2 with the published
+    /// safeguards (see the module block above [`EW_FORCING_GAMMA`]).
+    fn observe_accepted_gradient(&mut self, rho_flat: &Array1<f64>, g_norm: f64) {
+        if !(g_norm.is_finite() && g_norm > 0.0) {
+            return;
+        }
+        if let Some(prev_rho) = &self.last_grad_rho
+            && prev_rho.len() == rho_flat.len()
+            && prev_rho
+                .iter()
+                .zip(rho_flat.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        {
+            // Re-evaluation at the same outer iterate (finalize / convergence
+            // guard), not a new outer step: a ratio of ‖g_j‖/‖g_j‖ = 1 would
+            // spuriously reset η to γ — keep the forcing state as-is.
+            return;
+        }
+        self.last_grad_rho = Some(rho_flat.clone());
+        self.g_prev = self.g_curr;
+        self.g_curr = Some(g_norm);
+        let (Some(g_prev), Some(g_curr)) = (self.g_prev, self.g_curr) else {
+            return;
+        };
+        if !(g_prev.is_finite() && g_prev > 0.0) {
+            return;
+        }
+        // EW96 Choice 2: η_j = γ·(‖g_j‖/‖g_{j−1}‖)^α with γ = 0.9, α = 2.
+        let ratio = g_curr / g_prev;
+        let mut eta = EW_FORCING_GAMMA * ratio * ratio;
+        // EW96 Choice-2 safeguard: η_j ← max(η_j, γ·η_{j−1}^α) when
+        // γ·η_{j−1}^α > 0.1, so an accidentally tiny ratio cannot collapse the
+        // forcing term in one step.
+        if let Some(eta_prev) = self.eta {
+            let carry = EW_FORCING_GAMMA * eta_prev * eta_prev;
+            if carry > EW_FORCING_SAFEGUARD_ACTIVATION {
+                eta = eta.max(carry);
+            }
+        }
+        // DES82 / NITSOL uniform bound η_j ≤ η_max < 1.
+        self.eta = Some(eta.min(EW_FORCING_ETA_MAX));
+    }
+
+    /// The forcing term for the NEXT line search's value probes, or `None`
+    /// when probes must run tight (forcing disabled, or no ratio yet).
+    fn line_search_eta(&self) -> Option<f64> {
+        if self.enabled { self.eta } else { None }
+    }
+}
+
+/// How a criterion evaluation drives the inner `(t, β)` solve.
+enum ProbeInnerDrive {
+    /// Historical path: hand the whole inner drive to
+    /// `reml_criterion_with_refine_policy` (accepted-basin evaluations, the
+    /// cross-seed ranking / EFS value lane, streaming fits).
+    Criterion { refine_progress_extension: bool },
+    /// Eisenstat–Walker line-search probe lane (`forced_probe_criterion`):
+    /// chunked inner Newton with the loosened stationarity gate
+    /// `max(η·r_entry, τ_full)` and probe-lane iteration telemetry. `eta =
+    /// None` is the counted ALWAYS-TIGHT gate (`τ_full` exactly).
+    ForcedLineSearchProbe { eta: Option<f64> },
 }
 
 pub struct SaeManifoldOuterObjective {
@@ -459,6 +708,15 @@ pub struct SaeManifoldOuterObjective {
     /// search runs at full `N` (small/medium problems, or when a subsampled term
     /// could not be materialized), byte-identical to the pre-subsampling path.
     row_subsample: Option<OuterRowSubsample>,
+    /// #2080 (a) — the last successful value probe's converged inner state (see
+    /// [`ProbeConvergedHandoff`]). Single-shot: taken by the next
+    /// criterion-driving call and cleared by every state-swapping seam
+    /// (`reset`, seed installation, subsample engage/restore, homotopy entry).
+    probe_converged_handoff: Option<ProbeConvergedHandoff>,
+    /// Eisenstat–Walker forcing state for line-search value probes (see the
+    /// block comment above [`EW_FORCING_GAMMA`]). Updated at every accepted-
+    /// gradient evaluation; consumed only by the `eval_with_order(Value)` lane.
+    forcing: ProbeForcingState,
 }
 
 impl SaeManifoldOuterObjective {
@@ -498,6 +756,8 @@ impl SaeManifoldOuterObjective {
             probe_telemetry: OuterProbeTelemetry::default(),
             cancel_flag: None,
             row_subsample: None,
+            probe_converged_handoff: None,
+            forcing: ProbeForcingState::new(),
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all
@@ -569,6 +829,9 @@ impl SaeManifoldOuterObjective {
         let full_term = std::mem::replace(&mut self.term, sub_term.clone());
         let full_baseline_term = std::mem::replace(&mut self.baseline_term, sub_term);
         let full_target = std::mem::replace(&mut self.target, sub_target);
+        // #2080 (a) — the accepted basin just changed row support; any pending
+        // probe handoff (full-N state) is invalid against the subsampled term.
+        self.probe_converged_handoff = None;
         self.probe_telemetry.subsample_rows = n_sub;
         self.probe_telemetry.subsample_full_rows = n_full;
         self.row_subsample = Some(OuterRowSubsample {
@@ -682,6 +945,14 @@ impl SaeManifoldOuterObjective {
         self.term = state.full_term;
         self.baseline_term = state.full_baseline_term;
         self.target = state.full_target;
+        // #2080 (a) — a probe handoff captured on the subsampled rows must never
+        // warm-start a full-`N` evaluation.
+        self.probe_converged_handoff = None;
+        // The subsample→full-`N` swap changes the criterion's scale, so the
+        // subsampled gradient decay is not the full-`N` optimality measure:
+        // drop the Eisenstat–Walker ratio. (The ρ search is over by now anyway
+        // — everything after this point is terminal and full-tolerance.)
+        self.forcing.clear_history();
         if searched_beta.len() == self.term.beta_dim()
             && self.term.set_flat_beta(searched_beta.view()).is_ok()
         {
@@ -732,6 +1003,19 @@ impl SaeManifoldOuterObjective {
     /// bounded (a PROBE-COUNT budget, per SPEC's ban on wall-clock budgets).
     pub fn probe_telemetry(&self) -> OuterProbeTelemetry {
         self.probe_telemetry
+    }
+
+    /// Enable/disable the Eisenstat–Walker inexact line-search probes (see the
+    /// block comment above [`EW_FORCING_GAMMA`]). Enabled by default. When
+    /// disabled, value probes still run through the counted probe lane but
+    /// with the gate pinned to the FULL inner tolerance — the always-tight
+    /// arm the forcing acceptance test compares against (its probe values are
+    /// converged to the identical stationarity measure as the historical
+    /// path, and the probe-lane iteration telemetry stays comparable).
+    /// Terminal quantities are full-tolerance in BOTH modes, so the returned
+    /// fit is unaffected by this switch.
+    pub fn set_probe_forcing_enabled(&mut self, enabled: bool) {
+        self.forcing.enabled = enabled;
     }
 
     /// #1033 — opt into AMORTIZED (frozen) routing for the ρ-search: freeze the
@@ -1071,6 +1355,9 @@ impl SaeManifoldOuterObjective {
         // restore full rows first (idempotent) — the subsampled surrogate is not
         // the objective the reported fit optimizes.
         self.restore_full_rows_for_final_fit();
+        // #2080 (a) — this diagnostic commits its own inner solves to the
+        // accepted basin; drop any pending probe handoff.
+        self.probe_converged_handoff = None;
         let rho_hat_flat = self.current_rho.to_flat();
         let dir = deterministic_probe_direction(rho_hat_flat.view());
         let h = probe_step(rho_hat_flat.view());
@@ -1167,6 +1454,9 @@ impl SaeManifoldOuterObjective {
         // Shape bands are a reported quantity: restore full `N` (idempotent) so
         // the posterior covariance is read from the full-data joint-Hessian factor.
         self.restore_full_rows_for_final_fit();
+        // #2080 (a) — this diagnostic runs its own inner solves against the
+        // accepted basin; drop any pending probe handoff.
+        self.probe_converged_handoff = None;
         let rho = self.current_rho.clone();
         let plan = self.term.streaming_plan().admitted_or_error(
             self.term.n_obs(),
@@ -1273,6 +1563,9 @@ impl SaeManifoldOuterObjective {
     ) -> Result<bool, String> {
         let rho = rho.clone();
         self.current_rho = rho.clone();
+        // #2080 (a) — the homotopy walk mutates the accepted basin through its
+        // own corrector solves; drop any pending probe handoff.
+        self.probe_converged_handoff = None;
         let isometry_targets = self
             .registry
             .as_ref()
@@ -2134,6 +2427,26 @@ impl SaeManifoldOuterObjective {
             || err.contains("did not escape total co-collapse")
     }
 
+    /// #2080 (a) — take the single-shot probe handoff, returning its converged
+    /// term ONLY when the stored ρ matches `rho_flat` BITWISE. The take is
+    /// unconditional (match or not), so a handoff can never survive past any
+    /// criterion-driving call and go stale against a moved accepted basin: the
+    /// only state it can ever warm-start is the very next evaluation, and only
+    /// at the exact ρ whose converged optimum it holds.
+    fn take_probe_converged_handoff(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+    ) -> Option<SaeManifoldTerm> {
+        let handoff = self.probe_converged_handoff.take()?;
+        let matches = handoff.rho_flat.len() == rho_flat.len()
+            && handoff
+                .rho_flat
+                .iter()
+                .zip(rho_flat.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if matches { Some(handoff.term) } else { None }
+    }
+
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
@@ -2150,7 +2463,49 @@ impl SaeManifoldOuterObjective {
         refine_progress_extension: bool,
         fold_cotrain: bool,
     ) -> Result<(f64, Array1<f64>), String> {
+        self.evaluate_with_inner_drive(
+            rho_flat,
+            ProbeInnerDrive::Criterion {
+                refine_progress_extension,
+            },
+            fold_cotrain,
+        )
+    }
+
+    /// As [`Self::evaluate_with_refine_policy`], but with the inner `(t, β)`
+    /// drive selected by [`ProbeInnerDrive`]: the historical criterion drive,
+    /// or the Eisenstat–Walker forced line-search probe lane
+    /// ([`Self::forced_probe_criterion`]). Everything around the inner drive —
+    /// the probe handoff install, seeded-β warm start, amortized latent warm
+    /// start, the co-training fold, and the collapse wall — is shared, so the
+    /// two drives evaluate the SAME criterion and differ only in how far the
+    /// inner solve is converged before pricing it.
+    fn evaluate_with_inner_drive(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        drive: ProbeInnerDrive,
+        fold_cotrain: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
+        // #2080 (a) — install the last value probe's converged inner state when
+        // this evaluation re-visits the exact same ρ (the line-search accept
+        // pattern). The state IS the inner KKT optimum this solve would converge
+        // to from the accepted basin (see `ProbeConvergedHandoff`), so the
+        // criterion value is unchanged — the solve below merely reaches its
+        // stationarity gate immediately instead of re-tracing the probe's
+        // deterministic Newton trajectory. The pending seeded-β hint (if any)
+        // was already applied by the probe before it converged, so it must not
+        // be re-applied on top of the converged state; likewise the amortized
+        // latent warm-start is skipped — it is a basin-ENTRY heuristic, and the
+        // installed state is already AT the converged optimum for this ρ.
+        let probe_handoff_installed =
+            if let Some(converged) = self.take_probe_converged_handoff(rho_flat) {
+                self.term = converged;
+                self.seeded_beta = None;
+                true
+            } else {
+                false
+            };
         if let Some(beta) = self.seeded_beta.take() {
             // Warm-start the inner decoder coefficients before the solve.
             if beta.len() == self.term.beta_dim() {
@@ -2167,20 +2522,29 @@ impl SaeManifoldOuterObjective {
         // the criterion evaluation, so the warm-start is advisory only. #1207 —
         // the outcome is recorded (and a failure logged) so the cold fallback is
         // observable, never silently swallowed.
-        let warm_start_outcome = self
-            .term
-            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
-        self.record_warm_start(warm_start_outcome);
-        let (reml_cost, loss) = self.term.reml_criterion_with_refine_policy(
-            self.target.view(),
-            &rho,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-            refine_progress_extension,
-        )?;
+        if !probe_handoff_installed {
+            let warm_start_outcome = self
+                .term
+                .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
+            self.record_warm_start(warm_start_outcome);
+        }
+        let (reml_cost, loss) = match drive {
+            ProbeInnerDrive::Criterion {
+                refine_progress_extension,
+            } => self.term.reml_criterion_with_refine_policy(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+                refine_progress_extension,
+            )?,
+            ProbeInnerDrive::ForcedLineSearchProbe { eta } => {
+                self.forced_probe_criterion(&rho, eta)?
+            }
+        };
         let beta_hat = self.term.flatten_beta();
         // #1154 — co-train the amortized encoder with the dictionary + λ: rank ρ
         // by the REML criterion PLUS the amortized-encoder consistency penalty,
@@ -2214,6 +2578,232 @@ impl SaeManifoldOuterObjective {
         Ok((cost, beta_hat))
     }
 
+    /// Joint inner KKT gradient norm² read straight off the assembled system —
+    /// bit-identical arithmetic to the stationarity residual
+    /// `converge_inner_for_undamped_logdet` computes (Σᵢ‖g_t⁽ⁱ⁾‖² + ‖g_β‖²),
+    /// so the forced-probe gate and the historical gate measure the same
+    /// quantity.
+    fn inner_kkt_grad_norm_sq(sys: &ArrowSchurSystem) -> f64 {
+        sys.rows
+            .iter()
+            .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
+            .sum::<f64>()
+            + sys.gb.iter().map(|&v| v * v).sum::<f64>()
+    }
+
+    /// Line-search value-probe criterion under the Eisenstat–Walker forcing
+    /// lane (see the block comment above [`EW_FORCING_GAMMA`] for the forcing
+    /// sequence, its citations, and the exactness invariants).
+    ///
+    /// Structure — a faithful, counted port of the historical probe drive
+    /// (`reml_criterion_with_cache_refine_policy` at
+    /// `refine_progress_extension == false`), differing ONLY in the
+    /// stationarity gate:
+    ///
+    /// 1. Chunks of the SAME inner Newton driver
+    ///    (`run_joint_fit_arrow_schur`), chunk width `inner_max_iter` and the
+    ///    identical total probe budget `max(4·inner_max_iter, 16)` the
+    ///    historical probe refine loop grants.
+    /// 2. Between chunks, the same assembled-system KKT residual and quotient
+    ///    residual the historical loop gates on, against
+    ///    `gate = max(η_j·r_entry, τ_full)` — with `eta = None` (the
+    ///    always-tight arm) the gate is EXACTLY the historical `τ_full`, so
+    ///    the tight arm converges probes to the identical stationarity
+    ///    measure.
+    /// 3. The same #2080 per-row non-PD fast-refusal between chunks, so an
+    ///    infeasible-ρ probe still refuses after one diagnostic pass instead
+    ///    of grinding the budget.
+    /// 4. At an (η-)stationary iterate, the criterion is priced through the
+    ///    sanctioned FREEZE evaluation (`inner_max_iter == 0`: one undamped
+    ///    factorization at the frozen state) — the same evidence convention as
+    ///    the historical loop's stationary factorization.
+    /// 5. If the gate is not met within the probe budget, adjudication is
+    ///    handed back verbatim to the historical evaluator (which owns the
+    ///    #1051 objective-stagnation acceptance and the typed
+    ///    "did not converge" refusal), warm from the partially refined state —
+    ///    the forcing lane can therefore never introduce a NEW refusal class,
+    ///    only stop earlier on probes the historical path would also accept.
+    ///
+    /// Regimes with no dense per-round assembly (streaming / matrix-free) and
+    /// the `inner_max_iter == 0` freeze contract bypass the lane entirely and
+    /// keep the historical evaluator byte-for-byte.
+    fn forced_probe_criterion(
+        &mut self,
+        rho: &SaeManifoldRho,
+        eta: Option<f64>,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
+        let plan = self.term.streaming_plan();
+        let admitted = plan.admitted_or_error(
+            self.term.n_obs(),
+            self.term.output_dim(),
+            self.term.k_atoms(),
+        )?;
+        if self.inner_max_iter == 0 || admitted.streaming || !plan.direct_logdet_admitted() {
+            return self.term.reml_criterion_with_refine_policy(
+                self.target.view(),
+                rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+                false,
+            );
+        }
+        let options = ArrowSolveOptions::direct()
+            .with_ill_conditioning_tolerated()
+            .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+        // Entry inner KKT residual at the PROBED ρ — the ‖F(x)‖ analog of the
+        // inexact-Newton forcing condition ‖F(x) + F′(x)s‖ ≤ η‖F(x)‖ (Dembo–
+        // Eisenstat–Steihaug 1982): the probe's inner solve must reduce the
+        // inner KKT residual by at least the factor η_j relative to the
+        // warm-start state it entered with. Only measured when a forcing η is
+        // active (the tight arm gates on the absolute τ_full alone).
+        let r_entry = match eta {
+            Some(_) => {
+                let sys = self.term.assemble_arrow_schur(
+                    self.target.view(),
+                    rho,
+                    self.registry.as_ref(),
+                )?;
+                let grad_norm_sq = Self::inner_kkt_grad_norm_sq(&sys);
+                if !grad_norm_sq.is_finite() {
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is \
+                         non-finite at the forced line-search probe entry \
+                         (‖g‖²={grad_norm_sq}); the joint Hessian assembly is degenerate at \
+                         this ρ"
+                    ));
+                }
+                Some(grad_norm_sq.sqrt())
+            }
+            None => None,
+        };
+        // Identical chunk width and total budget as the historical PROBE path:
+        // `reml_criterion_with_cache_refine_policy` grants `inner_max_iter`
+        // up front, then refine rounds of `inner_max_iter` each, up to the
+        // probe refine limit `value_probe_base_refine_iter =
+        // max(4·inner_max_iter, 16)`.
+        let chunk = self.inner_max_iter.max(1);
+        let budget = chunk.saturating_mul(4).max(16);
+        let mut spent = 0usize;
+        let mut rho_fixed = rho.clone();
+        loop {
+            let grant = chunk.min(budget - spent);
+            self.term.run_joint_fit_arrow_schur(
+                self.target.view(),
+                &mut rho_fixed,
+                self.registry.as_ref(),
+                grant,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )?;
+            spent += grant;
+            self.probe_telemetry.probe_inner_iterations = self
+                .probe_telemetry
+                .probe_inner_iterations
+                .saturating_add(grant);
+            let sys =
+                self.term
+                    .assemble_arrow_schur(self.target.view(), rho, self.registry.as_ref())?;
+            let grad_norm_sq = Self::inner_kkt_grad_norm_sq(&sys);
+            if !grad_norm_sq.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is non-finite \
+                     at the forced line-search probe iterate (‖g‖²={grad_norm_sq}); the joint \
+                     Hessian assembly is degenerate at this ρ"
+                ));
+            }
+            let grad_norm = grad_norm_sq.sqrt();
+            let lambda_smooth = rho_fixed.lambda_smooth_vec();
+            let quotient_grad_norm = self.term.quotient_gradient_norm_from_system(
+                &sys,
+                grad_norm_sq,
+                &lambda_smooth,
+            );
+            // The same full stationarity tolerance the historical loop uses
+            // (`SAE_MANIFOLD_INNER_GRAD_REL_TOL × iterate scale`), loosened —
+            // never tightened — by the forcing term: the gate can only sit
+            // BETWEEN τ_full and the η_j-relative entry-residual reduction.
+            let tol_full = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
+            let gate = match (eta, r_entry) {
+                (Some(eta_j), Some(entry_residual)) => (eta_j * entry_residual).max(tol_full),
+                _ => tol_full,
+            };
+            // #2080 probe fast-refusal parity: a non-PD per-row H_tt block
+            // before FULL stationarity means the undamped Laplace log-det is
+            // undefined at this ρ — an infeasible-ρ probe verdict the outer
+            // search maps to the finite wall. Adjudicated on EVERY round —
+            // including a gate-met round whose iterate is η-truncated (still
+            // pre-KKT), where the freeze pricing below would otherwise surface
+            // the raw factor error outside the typed recoverable-refusal
+            // class. Refuse after this single per-row diagnostic pass exactly
+            // like the historical probe loop.
+            match probe_undamped_evidence_row_factors(&sys, &options) {
+                Ok(()) => {}
+                Err(err) if SaeManifoldTerm::is_undamped_evidence_row_non_pd(&err) => {
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a \
+                         non-PD per-row H_tt block before KKT stationarity at an infeasible-ρ \
+                         probe (forced line-search lane, ‖g‖={grad_norm:.6e}, gate \
+                         {gate:.6e}); returning the typed infeasible refusal without grinding \
+                         the probe refinement budget; {err}"
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
+                }
+            }
+            if grad_norm <= gate || quotient_grad_norm <= gate {
+                if eta.is_some() && grad_norm > tol_full && quotient_grad_norm > tol_full {
+                    // A genuine early stop: the forcing gate accepted an
+                    // iterate the full-tolerance gate would have kept
+                    // refining. Observable per the telemetry contract.
+                    self.probe_telemetry.loosened_probe_calls = self
+                        .probe_telemetry
+                        .loosened_probe_calls
+                        .saturating_add(1);
+                }
+                // Price the criterion at the (η-)stationary iterate through the
+                // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
+                // undamped factorization at the frozen state, the same evidence
+                // convention as the historical loop's stationary factorization.
+                // Its remaining refusal classes (border Schur non-PD, cross-row
+                // non-PD) are the typed recoverable probe refusals the outer
+                // bridge already maps to the finite wall.
+                return self.term.reml_criterion_with_refine_policy(
+                    self.target.view(),
+                    rho,
+                    self.registry.as_ref(),
+                    0,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                    false,
+                );
+            }
+            if spent >= budget {
+                // Gate not met within the probe budget: hand adjudication back
+                // to the historical evaluator — which owns the #1051
+                // objective-stagnation acceptance and the canonical typed
+                // "did not converge" refusal — warm from the current
+                // partially-refined state. The forcing lane thus never mints a
+                // refusal of its own for this class.
+                return self.term.reml_criterion_with_refine_policy(
+                    self.target.view(),
+                    rho,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                    false,
+                );
+            }
+        }
+    }
+
     /// Fit the SAE inner problem once at a caller-selected rho, committing the
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
@@ -2236,12 +2826,55 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
         fold_cotrain: bool,
     ) -> Result<(f64, Array1<f64>), String> {
+        self.evaluate_value_probe_with_drive(
+            rho_flat,
+            fold_cotrain,
+            ProbeInnerDrive::Criterion {
+                refine_progress_extension: false,
+            },
+        )
+    }
+
+    /// As [`Self::evaluate_value_probe_with_refine_policy`], with the inner
+    /// drive selected by the caller: the line-search lane
+    /// (`eval_with_order(Value)`) passes the Eisenstat–Walker forced-probe
+    /// drive, every other value lane the historical criterion drive.
+    fn evaluate_value_probe_with_drive(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        fold_cotrain: bool,
+        drive: ProbeInnerDrive,
+    ) -> Result<(f64, Array1<f64>), String> {
         let saved_term = self.term.clone();
         let saved_rho = self.current_rho.clone();
         let saved_loss = self.last_loss.clone();
         let saved_seeded_beta = self.seeded_beta.clone();
-        let result = self.evaluate_with_refine_policy(rho_flat, false, fold_cotrain);
-        self.term = saved_term;
+        let result = self.evaluate_with_inner_drive(rho_flat, drive, fold_cotrain);
+        // #2080 (a) — instead of discarding the probe's converged inner state,
+        // hand it off (a move: swapped against the restored `saved_term`, no
+        // extra clone) to the next evaluation at this exact ρ — the line-search
+        // accept pattern re-evaluates the accepted point at the ρ of its last
+        // successful value probe. Only a genuinely converged, non-wall value is
+        // worth handing off: a collapse-wall probe's state is a degenerate basin
+        // the accepted lane must not inherit, and a refused probe never
+        // converged at all. Under the Eisenstat–Walker forced drive the state
+        // may be η-INEXACT (stopped at the loosened gate); that is still a
+        // valid handoff because the receiver treats it purely as a warm start —
+        // the accepted lane's own full-tolerance convergence loop adjudicates
+        // stationarity before pricing any value or gradient (see
+        // [`ProbeConvergedHandoff`]).
+        match &result {
+            Ok((cost, _beta)) if !Self::probe_value_is_wall(*cost) => {
+                let converged = std::mem::replace(&mut self.term, saved_term);
+                self.probe_converged_handoff = Some(ProbeConvergedHandoff {
+                    rho_flat: rho_flat.to_owned(),
+                    term: converged,
+                });
+            }
+            _ => {
+                self.term = saved_term;
+            }
+        }
         self.current_rho = saved_rho;
         self.last_loss = saved_loss;
         self.seeded_beta = saved_seeded_beta;
@@ -2305,6 +2938,11 @@ impl SaeManifoldOuterObjective {
     ///   the cost path when EFS is not the active lane for that coord).
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
         self.probe_telemetry.criterion_calls += 1;
+        // #2080 (a) — this lane commits a new accepted basin below; drop any
+        // pending probe handoff so it can never be installed across that
+        // mutation (the handoff is only valid against the basin its probe ran
+        // from).
+        self.probe_converged_handoff = None;
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
@@ -2652,6 +3290,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 inner_beta_hint: None,
             });
         }
+        // #2080 (a) — the accepted gradient point is evaluated at the exact ρ of
+        // the line search's last successful value probe; when that probe's
+        // converged inner state was handed off, install it so the criterion's
+        // convergence loop opens AT the inner KKT optimum instead of re-tracing
+        // the probe's deterministic Newton trajectory from the accepted basin.
+        // Same converged optimum ⇒ identical criterion value and identical
+        // stationary factor cache for the analytic gradient below (see
+        // `ProbeConvergedHandoff`). The pending seeded-β hint was already applied
+        // by that probe pre-convergence, so it is consumed with the handoff.
+        let probe_handoff_installed =
+            if let Some(converged) = self.take_probe_converged_handoff(rho.view()) {
+                self.term = converged;
+                self.seeded_beta = None;
+                true
+            } else {
+                false
+            };
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
         {
@@ -2668,10 +3323,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // root. Advisory: a degenerate atlas certifies/warm-starts nothing and
         // leaves the cold path byte-for-byte unchanged. #1207 — the outcome is
         // recorded (failure logged) so a silent cold fallback is observable.
-        let warm_start_outcome = self
-            .term
-            .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
-        self.record_warm_start(warm_start_outcome);
+        // Skipped under a #2080 (a) handoff: the installed state is already AT
+        // the converged optimum for this ρ, and the encoder warm-start is a
+        // basin-ENTRY heuristic that would only move latents off it.
+        if !probe_handoff_installed {
+            let warm_start_outcome = self
+                .term
+                .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
+            self.record_warm_start(warm_start_outcome);
+        }
         // The analytic gradient lane (`eval`) reads the dense joint-Hessian cache.
         // In the matrix-free regime that cache does not exist, but SAE never
         // descends ρ with this gradient lane there: the outer plan routes to the
@@ -2841,6 +3501,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let gradient = self
             .value_consistent_outer_gradient(&rho_state, cost, gradient)
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        // Eisenstat–Walker forcing update: this gradient lane runs only at
+        // accepted iterates (plus the seed and the finalize re-installation,
+        // which the bitwise same-ρ check inside filters out), so its ‖g‖ is
+        // the outer optimality measure the forcing sequence consumes. Wall-
+        // cost and refusal returns above never reach here, so a degenerate
+        // zero gradient can never poison the ratio.
+        let gradient_norm = gradient.dot(&gradient).sqrt();
+        self.forcing.observe_accepted_gradient(rho, gradient_norm);
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
         Ok(OuterEval {
@@ -2872,8 +3540,20 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // Armijo/Wolfe sufficient-decrease test mixes `f+c` with `∇f` and
                 // can stall or wander. The fold is carried only by the value-only
                 // cross-seed ranking lane (`eval_cost`).
+                // Eisenstat–Walker forced-probe drive (see the block comment
+                // above `EW_FORCING_GAMMA`): this lane — and ONLY this lane —
+                // is the Armijo/Wolfe line-search comparison probe, whose
+                // criterion value merely ranks candidate ρ steps, so its inner
+                // solve may stop at the forcing gate `max(η_j·r_entry, τ_full)`
+                // tied to the outer optimality measure. `line_search_eta()` is
+                // `None` (a full-tolerance counted gate) until two accepted-
+                // gradient evaluations establish the EW ratio, and always
+                // `None` when forcing is disabled.
+                let drive = ProbeInnerDrive::ForcedLineSearchProbe {
+                    eta: self.forcing.line_search_eta(),
+                };
                 let (cost, _beta_hat) =
-                    match self.evaluate_value_probe_with_refine_policy(rho.view(), false) {
+                    match self.evaluate_value_probe_with_drive(rho.view(), false, drive) {
                         Ok(evaluated) => evaluated,
                         // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
                         // log-det) presents to the line search as the SAME finite
@@ -2935,6 +3615,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
         self.seeded_beta = None;
+        // #2080 (a) — a reset replaces the accepted basin; a probe handoff from
+        // the previous seed's basin must not warm-start the new one.
+        self.probe_converged_handoff = None;
+        // A multi-start reset starts a NEW outer walk: the previous seed's
+        // gradient decay is meaningless for it, so the Eisenstat–Walker ratio
+        // is re-established from scratch (probes run tight until then).
+        self.forcing.clear_history();
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
@@ -2961,6 +3648,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             )));
         }
         self.seeded_beta = Some(beta.clone());
+        // #2080 (a) — a freshly installed β seed is a NEW instruction the pending
+        // probe trajectory never saw; drop the handoff so the next evaluation
+        // applies the seed instead of a converged state that predates it.
+        self.probe_converged_handoff = None;
         Ok(SeedOutcome::Installed)
     }
 

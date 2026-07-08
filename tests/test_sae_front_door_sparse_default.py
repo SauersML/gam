@@ -3,24 +3,63 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from gamfit import _sae_manifold
 from gamfit import _sparse_dictionary
 from gamfit._sparse_dictionary import SparseDictionaryFit
 
 
+class _ReachedCurvedEngine(RuntimeError):
+    """Sentinel: the facade handed the fit to the curved manifold FFI."""
+
+
 class _AdmissionRust:
-    def sae_fit_admission(self, n_obs: int, output_dim: int, n_atoms: int) -> dict[str, Any]:
+    """Fake of the Rust front door mirroring its lane rule: penalty-gated
+    K > P demotes to sparse codes; a hard top-k support request at K > P is
+    admitted to the curved framed/streaming lane."""
+
+    def __init__(self) -> None:
+        self.admission_calls: list[dict[str, Any]] = []
+
+    def sae_fit_admission(
+        self,
+        n_obs: int,
+        output_dim: int,
+        n_atoms: int,
+        d_max: int = 1,
+        topk_support: int | None = None,
+    ) -> dict[str, Any]:
+        self.admission_calls.append(
+            {
+                "n_obs": int(n_obs),
+                "output_dim": int(output_dim),
+                "n_atoms": int(n_atoms),
+                "d_max": int(d_max),
+                "topk_support": None if topk_support is None else int(topk_support),
+            }
+        )
         dense_assignment_cells = int(n_obs) * int(n_atoms)
         response_cells = int(n_obs) * int(output_dim)
+        if dense_assignment_cells <= response_cells:
+            lane = "dense_certification"
+        elif topk_support is not None:
+            lane = "curved_streaming"
+        else:
+            lane = "sparse_codes"
         return {
-            "lane": "sparse_codes",
+            "lane": lane,
             "n_obs": int(n_obs),
             "output_dim": int(output_dim),
             "n_atoms": int(n_atoms),
             "dense_assignment_cells": dense_assignment_cells,
             "response_cells": response_cells,
         }
+
+    def sae_manifold_fit_minimal(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise _ReachedCurvedEngine(
+            f"curved engine invoked with top_k={kwargs.get('top_k')!r}"
+        )
 
 
 def test_public_sae_fit_uses_sparse_artifact_above_front_door_crossover(monkeypatch: Any) -> None:
@@ -67,6 +106,56 @@ def test_public_sae_fit_uses_sparse_artifact_above_front_door_crossover(monkeypa
     assert fit.retained_training_payload_cells <= n_obs * output_dim
     assert "fitted" not in SparseDictionaryFit.__dataclass_fields__
     assert not hasattr(fit, "__dict__")
+
+
+def test_topk_assignment_above_crossover_reaches_curved_engine(monkeypatch: Any) -> None:
+    """K > P with assignment='topk' is admitted to the CURVED lane.
+
+    The facade must pass the hard support size to the front-door admission
+    (topk_support), receive the 'curved_streaming' lane, and hand the fit to
+    the curved manifold FFI — never to the linear sparse-code trainer.
+    """
+
+    rust = _AdmissionRust()
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: rust)
+
+    def forbidden_sparse_fit(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(
+            "a topk manifold request must never reroute to sparse_dictionary_fit"
+        )
+
+    monkeypatch.setattr(_sae_manifold, "sparse_dictionary_fit", forbidden_sparse_fit)
+
+    n_obs = 16
+    output_dim = 4
+    n_atoms = 9
+    x = np.zeros((n_obs, output_dim), dtype=np.float32)
+    with pytest.raises(_ReachedCurvedEngine):
+        _sae_manifold.sae_manifold_fit(
+            x, K=n_atoms, assignment="topk", top_k=2, n_iter=1
+        )
+
+    assert rust.admission_calls, "the front-door admission must be consulted"
+    call = rust.admission_calls[0]
+    assert call["n_obs"] == n_obs
+    assert call["output_dim"] == output_dim
+    assert call["n_atoms"] == n_atoms
+    assert call["topk_support"] == 2
+    assert call["d_max"] == 2  # default d_atom
+
+
+def test_topk_assignment_requires_explicit_support_size(monkeypatch: Any) -> None:
+    """assignment='topk' without top_k fails eagerly with an actionable error,
+    before any admission or fit call — a support-less topk request must never
+    fall through to the penalty-gated sparse reroute."""
+
+    rust = _AdmissionRust()
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: rust)
+
+    x = np.zeros((16, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="requires top_k"):
+        _sae_manifold.sae_manifold_fit(x, K=9, assignment="topk", n_iter=1)
+    assert rust.admission_calls == []
 
 
 def test_sparse_dictionary_facade_accepts_no_eager_fitted_payload(monkeypatch: Any) -> None:

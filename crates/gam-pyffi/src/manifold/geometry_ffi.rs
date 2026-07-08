@@ -73,6 +73,7 @@ fn sae_fit_admission<'py>(
     let lane = match admission.lane {
         gam::terms::sae::front_door::SaeFitLane::DenseCertification => "dense_certification",
         gam::terms::sae::front_door::SaeFitLane::SparseCodes => "sparse_codes",
+        gam::terms::sae::front_door::SaeFitLane::CurvedStreaming => "curved_streaming",
     };
     let out = PyDict::new(py);
     out.set_item("lane", lane)?;
@@ -691,6 +692,56 @@ fn sae_sinkhorn_balance_bias<'py>(
 ) -> PyResult<Py<PyArray1<f64>>> {
     let scores_owned = log_scores.as_array().to_owned();
     let out = py.detach(move || sae_sinkhorn_balance_bias_impl(scores_owned.view(), iters));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Batched rank-1 chart-coordinate E-step solver for the torch `ManifoldSAE`
+/// `softmax_topk` lane (#2011-style Python→Rust trainer-math migration). For
+/// every `(row, atom)` pair it solves the on-manifold coordinate by projecting
+/// the target onto the atom's CURRENT decoded curve, amplitude profiled out,
+/// over a grid of `8·K` points derived from the basis width. The solved
+/// coordinates are E-step constants on the torch tape; the decoder gradient
+/// still flows through the basis evaluation at those coordinates.
+///
+/// * `x` — `(N, D)` observations.
+/// * `decoders` — `(F, K, D)` decoder blocks.
+/// * `n_harmonics` — periodic (Fourier) basis harmonic count; the basis width
+///   is `2·n_harmonics + 1` and must equal the decoder `K`.
+/// * `prev_positions` / `gate_weights` — optional `(N, F)` matrices; when BOTH
+///   are supplied the solver targets the leave-one-out residual
+///   `x − Σ_{g≠f} gate_g · m_g(t_g)` (second sweep). When either is omitted the
+///   plain target `x` is used (first sweep).
+///
+/// Returns solved coordinates `(N, F)` in `[0, 1)`. See
+/// `gam_sae::chart_coordinate_solve::solve_chart_coordinates`.
+#[pyfunction]
+#[pyo3(signature = (x, decoders, n_harmonics, prev_positions = None, gate_weights = None))]
+fn sae_solve_chart_coordinates<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    decoders: PyReadonlyArray3<'py, f64>,
+    n_harmonics: usize,
+    prev_positions: Option<PyReadonlyArray2<'py, f64>>,
+    gate_weights: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let x_owned = x.as_array().to_owned();
+    let dec_owned = decoders.as_array().to_owned();
+    let prev_owned = prev_positions.map(|p| p.as_array().to_owned());
+    let gate_owned = gate_weights.map(|w| w.as_array().to_owned());
+    let out = py
+        .detach(move || {
+            let basis = gam::terms::sae::chart_coordinate_solve::ChartBasisKind::Periodic {
+                n_harmonics,
+            };
+            gam::terms::sae::chart_coordinate_solve::solve_chart_coordinates(
+                x_owned.view(),
+                dec_owned.view(),
+                basis,
+                prev_owned.as_ref().map(|p| p.view()),
+                gate_owned.as_ref().map(|w| w.view()),
+            )
+        })
+        .map_err(PyValueError::new_err)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -4307,6 +4358,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_weighted_ridge_batch_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(skip_transcoder_reml_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(skip_transcoder_select_reml, module)?)?;
@@ -4317,6 +4372,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
     module.add_function(wrap_pyfunction!(rank_topology_candidates, module)?)?;
     module.add_function(wrap_pyfunction!(stacking_weights_from_log_density, module)?)?;
+    module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_edf, module)?)?;
@@ -4418,6 +4474,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_solve_chart_coordinates, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_basis_with_jet_cuda, module)?)?;
@@ -5194,6 +5251,9 @@ fn sparse_dictionary_fit<'py>(
     let lane = match admission.lane {
         gam::terms::sae::front_door::SaeFitLane::DenseCertification => "dense_certification",
         gam::terms::sae::front_door::SaeFitLane::SparseCodes => "sparse_codes",
+        // Unreachable from `admit_sae_fit` (the curved lane is TopK-only), but
+        // the label is kept coherent with the admission FFI.
+        gam::terms::sae::front_door::SaeFitLane::CurvedStreaming => "curved_streaming",
     };
     out.set_item("front_door_lane", lane)?;
     out.set_item("decoder", fit.decoder.into_pyarray(py))?;
