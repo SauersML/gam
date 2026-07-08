@@ -126,8 +126,8 @@ def fig_leaderboard(results: list[dict[str, Any]], out: Path) -> None:
     if oracle is not None:
         ceiling = oracle["recovery_r2_mean"]
         ax.axvline(ceiling, color=ORACLE_COLOR, linewidth=1.2, linestyle=(0, (4, 3)))
-        ax.text(ceiling, len(order) - 0.35, f" oracle {ceiling:.3f}",
-                fontsize=8.5, color=INK_2, ha="left", va="bottom")
+        ax.text(ceiling - 0.012, float(ys[0]) + 0.42, f"oracle {ceiling:.3f}",
+                fontsize=8.5, color=INK_2, ha="right", va="bottom")
     ax.set_xlim(0, 1.06)
     ax.set_yticks([])
     ax.set_xlabel("per-factor contribution R² (matched atom alone, held out)",
@@ -239,7 +239,8 @@ def fig_mdl(results: list[dict[str, Any]], out: Path) -> None:
     ax.set_ylabel("description length (bits / token)", fontsize=9.5, color=INK_2)
     ax.set_title("Description length: fewer bits at every distortion floor",
                  fontsize=12, color=INK, loc="left", pad=10)
-    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
+    if len(order) > 1:
+        ax.legend(frameon=False, fontsize=8.5, loc="upper right")
     fig.tight_layout()
     fig.savefig(out, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
