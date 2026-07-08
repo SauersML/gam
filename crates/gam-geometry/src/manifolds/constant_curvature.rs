@@ -802,6 +802,26 @@ impl RiemannianManifold for ConstantCurvature {
         self.check_len("constant-curvature sectional u", tangent_pair.0.len())?;
         self.check_len("constant-curvature sectional v", tangent_pair.1.len())?;
         self.chart_gauge(point)?;
+        // Sectional curvature is a property of a tangent 2-PLANE: a 1-D
+        // manifold has none, and a degenerate (collinear) pair spans none —
+        // the space-form identity K = κ·D/D is 0/0 there, not κ. The metric
+        // is conformal (λ²·g_euclid), so 2-plane degeneracy is exactly
+        // Euclidean Gram degeneracy: D = ⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩².
+        if self.dim < 2 {
+            return Err(GeometryError::Singular(
+                "sectional curvature undefined below dimension 2 (no tangent 2-plane)",
+            ));
+        }
+        let (u, v) = tangent_pair;
+        let uu = u.dot(&u);
+        let vv = v.dot(&v);
+        let uv = u.dot(&v);
+        let gram_det = uu * vv - uv * uv;
+        if !(gram_det > f64::EPSILON * uu * vv) {
+            return Err(GeometryError::Singular(
+                "sectional curvature undefined on a degenerate (collinear or zero) tangent pair",
+            ));
+        }
         Ok(self.kappa)
     }
 

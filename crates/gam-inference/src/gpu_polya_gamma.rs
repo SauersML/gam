@@ -953,9 +953,11 @@ extern "C" __global__ void normal_kernel(
         var  = b / 24.0;
     } else {
         mean = b * tanh(0.5 * c) / (2.0 * c);
-        double cosh_c = cosh(c);
-        double sinh_c = sinh(c);
-        var = b * (sinh_c - c) / (2.0 * c * c * c * (1.0 + cosh_c));
+        // (sinh c - c)/(1 + cosh c) == tanh(c/2) - c/(1 + cosh c): stable when
+        // cosh overflows (tanh saturates, second term -> 0), unlike the raw
+        // form's inf/inf = NaN. Matches the Rust pg_variance helper.
+        double ratio = tanh(0.5 * c) - c / (1.0 + cosh(c));
+        var = b * ratio / (2.0 * c * c * c);
     }
     double sd = sqrt(var);
     double draw = mean + sd * xorwow_norm(&st);

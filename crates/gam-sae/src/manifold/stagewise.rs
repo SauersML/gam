@@ -304,8 +304,18 @@ fn refresh_terminal_row_metric(
         return Ok(());
     }
     let residual = current_residual(term, target)?;
-    if let Some((_, model)) = fit_residual_covariance_on(term, residual, config)? {
-        term.set_row_metric(model.row_metric(target.nrows())?)?;
+    match fit_residual_covariance_on(term, residual, config) {
+        Ok(Some((_, model))) => term.set_row_metric(model.row_metric(target.nrows())?)?,
+        // No factor structure left in the final residual — nothing to refresh.
+        Ok(None) => {}
+        // A DEGENERATE final residual (e.g. a fully-explained target leaves
+        // R ≈ 0, whose factor solve hits a non-PD pivot) is the same
+        // nothing-to-refresh case, not a fit failure: keep the running metric
+        // the last birth installed rather than aborting a converged fit at the
+        // terminal bookkeeping step.
+        Err(err) => {
+            log::debug!("stagewise terminal Σ refresh skipped (degenerate final residual): {err}");
+        }
     }
     Ok(())
 }

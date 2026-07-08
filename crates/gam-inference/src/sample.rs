@@ -734,20 +734,20 @@ fn sample_standard_truncated(
         );
     }
     // The saved standard fit exports the unscaled user-scale penalised Hessian
-    // `H`; the truncated sampler whitens with its Cholesky and re-applies √φ so
-    // the posterior covariance is `φ·H⁻¹`, identical to the unconstrained
-    // Gaussian/bounded paths. Fixed-scale families (Binomial / Poisson) have
-    // φ = 1.
+    // `H`; the truncated sampler whitens with its Cholesky and re-applies the
+    // √(coefficient covariance scale) so the posterior covariance is
+    // `cov_scale·H⁻¹`, identical to the unconstrained Gaussian/bounded paths
+    // (#679): the scale is φ for Gaussian-like families and 1 for
+    // Gamma/Tweedie/NB, whose IRLS weights already carry the full Fisher
+    // information — re-applying the response φ there would shrink or inflate
+    // every constrained interval by √φ.
     let penalized_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard constrained model")?;
-    let sqrt_phi = {
-        use gam_problem::dispersion_cov::DispersionExt as _;
-        fit.dispersion().unwrap_or_default().sqrt_phi()
-    };
+    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
     let samples = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
         &mode,
         &penalized_hessian,
-        sqrt_phi,
+        sqrt_cov_scale,
         constraints,
         cfg.n_samples,
         cfg.n_chains,

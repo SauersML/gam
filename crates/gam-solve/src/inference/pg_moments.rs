@@ -57,9 +57,13 @@ pub fn pg_variance(b: f64, c: f64) -> f64 {
     if c_abs < 1e-6 {
         b / 24.0
     } else {
-        let cosh_c = c_abs.cosh();
-        let sinh_c = c_abs.sinh();
-        b * (sinh_c - c_abs) / (2.0 * c_abs * c_abs * c_abs * (1.0 + cosh_c))
+        // (sinh c − c)/(1 + cosh c) ≡ tanh(c/2) − c/(1 + cosh c): the raw form
+        // is inf/inf = NaN once sinh/cosh overflow (|c| ≳ 710, reachable from
+        // large logits at b > NORMAL_MIN_B); the identity is unconditionally
+        // stable — tanh saturates to 1 and c/(1+cosh c) underflows to 0, giving
+        // the correct b/(2c³) asymptote.
+        let ratio = (0.5 * c_abs).tanh() - c_abs / (1.0 + c_abs.cosh());
+        b * ratio / (2.0 * c_abs * c_abs * c_abs)
     }
 }
 
