@@ -2053,6 +2053,37 @@ class ManifoldSAE(nn.Module):
             return None
         return None if self._last_fit.cotrain is None else dict(self._last_fit.cotrain)
 
+    def summary(self) -> dict[str, Any]:
+        """Fit summary LED by the honest headline currency, bits/token.
+
+        Delegates to the cached closed-form fit
+        (:class:`gamfit._sae_manifold.ManifoldSAE`), whose ``summary()`` leads
+        with ``bits_per_token`` and the description-length decomposition (code /
+        selection / dictionary) and keeps explained variance as a demoted line —
+        matched-EV is insensitive to the manifold hypothesis by construction
+        (``experiments/real_manifold_sae/results.md``), bits/token is not.
+
+        Raises ``RuntimeError`` before a closed-form solve has run (no fit to
+        report).
+        """
+        if self._last_fit is None:
+            raise RuntimeError(
+                "ManifoldSAE.summary() requires a completed closed-form fit; "
+                "call .fit(x) first."
+            )
+        return self._last_fit.summary()
+
+    def description_length(self, *, l_param_bits: float | None = None) -> dict[str, Any] | None:
+        """Fit-level bits/token description length of the cached closed-form fit.
+
+        Thin delegate to
+        :meth:`gamfit._sae_manifold.ManifoldSAE.description_length`. Returns
+        ``None`` when no closed-form fit is cached.
+        """
+        if self._last_fit is None:
+            return None
+        return self._last_fit.description_length(l_param_bits=l_param_bits)
+
     @torch.no_grad()
     def extract_feature_curves(self, grid_size: int = 128) -> dict[int, torch.Tensor]:
         """Per-atom reconstruction curve over a manifold grid.
