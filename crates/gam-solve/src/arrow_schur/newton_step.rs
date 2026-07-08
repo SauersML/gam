@@ -388,7 +388,6 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
         return None;
     }
-    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
     // #1017 Phase-1 call-site re-key: the reduced-Schur matvec is `O(n · d · k)`
     // per apply and the PCG runs `cg_iters` applies over device-resident frames,
     // so the offload becomes profitable on the CG-AMORTISED batched work — the
@@ -398,16 +397,30 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     // launches with (`pcg.max_iterations.min(trust_region.max_iterations)`).
     // `try_device_arrow_direct` deliberately keeps the dense gate — that path is
     // one large factorization, not the amortised matvec.
+    //
+    // Size gate BEFORE the device probe (startup-tax ordering fix):
+    // `reduced_schur_matvec_should_offload` reads only associated constants
+    // (`DEVICE_LOOP_MIN_P`, the matvec offload floors) — never a calibrated
+    // policy field — so evaluating it on the pre-probe default policy is
+    // IDENTICAL to evaluating it on the probed runtime's policy. A shape it
+    // rejects therefore skips `GpuRuntime::global()` (whose first call creates
+    // a CUDA primary context on every GPU); an admitted shape probes exactly as
+    // before.
     let cg_iters = options
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    if !runtime
-        .policy()
-        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
-    {
+    if !gam_gpu::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+        sys.rows.len(),
+        sys.k,
+        sys.d,
+        cg_iters,
+    ) {
         return None;
     }
+    // Require a live device before assembling the GPU matvec backend; the
+    // runtime handle itself is not needed here, only its presence.
+    gam_gpu::device_runtime::GpuRuntime::global()?;
     let matvec =
         crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()?;
     let mut device_options = options.clone();
@@ -462,6 +475,23 @@ pub(crate) fn try_device_arrow_direct(
         || sys.hbb_matvec.is_some()
         || sys.htbeta_matvec.is_some()
         || sys.penalty_op.is_some()
+    {
+        return None;
+    }
+    // Size gate BEFORE the device probe (startup-tax ordering fix): the probed
+    // admission below is `dense_hessian_work_target_is_gpu(n, k)` — `k ≥
+    // DEVICE_LOOP_MIN_P` (an associated constant) and `2·n·k²` over the
+    // policy's dense-reduction flop floor, which no reachable policy can
+    // calibrate below `MIN_CALIBRATABLE_GEMM_FLOPS`. A shape failing this
+    // most-permissive bound is refused by EVERY policy, so it returns to the
+    // CPU dense path without `GpuRuntime::global()` (whose first call creates a
+    // CUDA primary context on every GPU). Shapes clearing it probe and face the
+    // runtime's real (possibly calibrated) gate exactly as before.
+    let n_rows = sys.rows.len();
+    let dense_work = 2u128 * (n_rows as u128) * (sys.k as u128) * (sys.k as u128);
+    if n_rows == 0
+        || sys.k < gam_gpu::GpuDispatchPolicy::DEVICE_LOOP_MIN_P
+        || dense_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
     {
         return None;
     }
@@ -589,22 +619,26 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         );
         return None;
     }
-    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
-        trace_decline!("no GpuRuntime::global() (CPU-only host or probe failed)");
-        return None;
-    };
     // CG-amortised work gate (same predicate the InexactPCG matvec-offload site
     // uses): the SAE reduced-Schur apply is `O(n · k · d)` reused over the CG
     // iteration budget, so it registers the real batched arithmetic the cold
     // single-launch dense floor misses.
+    //
+    // Evaluated BEFORE the device probe (startup-tax ordering fix): the
+    // predicate reads only associated constants — never a calibrated policy
+    // field — so the pre-probe default policy decides identically to the probed
+    // runtime's policy, and a rejected shape skips `GpuRuntime::global()`
+    // (whose first call creates a CUDA primary context on every GPU) entirely.
     let cg_iters = options
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    if !runtime
-        .policy()
-        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
-    {
+    if !gam_gpu::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+        sys.rows.len(),
+        sys.k,
+        sys.d,
+        cg_iters,
+    ) {
         trace_decline!(
             "offload predicate rejected shape (n={}, k={}, d={}, cg_iters={})",
             sys.rows.len(),
@@ -612,6 +646,10 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
             sys.d,
             cg_iters
         );
+        return None;
+    }
+    if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+        trace_decline!("no GpuRuntime::global() (CPU-only host or probe failed)");
         return None;
     }
     log::debug!(

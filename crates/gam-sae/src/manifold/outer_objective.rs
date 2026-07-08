@@ -3805,6 +3805,31 @@ pub(crate) fn batched_smooth_sb(
     // per-tile decline.
     let cpu_one = |idx: usize| -> Array2<f64> { s_mats[idx].dot(&sb_inputs[idx].1) };
 
+    // Size gate BEFORE the device probe (startup-tax ordering fix): each device
+    // tile issues one strided-batched GEMM over (a subset of) a uniform-shape
+    // group, whose flop count is at most the whole group's `Σ 2·m²·p`. Every
+    // reachable dispatch policy refuses a batched GEMM below
+    // `MIN_CALIBRATABLE_GEMM_FLOPS`, so when even the LARGEST group in
+    // aggregate is under the floor, every tile on every device would decline
+    // and each atom would take `cpu_one` — the exact result this early return
+    // produces without calling `GpuRuntime::global()` (whose first call creates
+    // a CUDA primary context on every GPU). Shapes with an admissible group
+    // probe and scatter exactly as before.
+    {
+        let mut group_flops: std::collections::BTreeMap<(usize, usize), u128> =
+            std::collections::BTreeMap::new();
+        for (idx, (_, b)) in sb_inputs.iter().enumerate() {
+            let m = s_mats[idx].nrows();
+            let p = b.ncols();
+            *group_flops.entry((m, p)).or_insert(0) +=
+                2u128 * (m as u128) * (m as u128) * (p as u128);
+        }
+        let max_group = group_flops.values().copied().max().unwrap_or(0);
+        if max_group < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
+            return (0..n_atoms).map(cpu_one).collect();
+        }
+    }
+
     let rt = match crate::gpu::device_runtime::GpuRuntime::global() {
         Some(rt) => rt,
         None => return (0..n_atoms).map(cpu_one).collect(),

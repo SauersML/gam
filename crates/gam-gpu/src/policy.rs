@@ -86,6 +86,14 @@ impl GpuDispatchPolicy {
     /// `p` below this is inadmissible under every reachable policy.
     pub const MIN_CALIBRATABLE_POTRF_P: usize = 64;
 
+    /// The smallest `row_kernel_min_n` / `xtwx_n_min` ANY production dispatch
+    /// policy can carry: the smallest XtWX calibration row count
+    /// (`calibration::XTWX_DIMS[0].0`, pinned by a compile-time assert there).
+    /// A row-kernel workload with fewer rows is inadmissible under every
+    /// reachable policy, so per-fit GPU-eligibility deciders may refuse it
+    /// BEFORE probing the device.
+    pub const MIN_CALIBRATABLE_ROW_KERNEL_N: usize = 2_048;
+
     /// Minimum problem dimension for the fp32+refinement path.
     ///
     /// Below this threshold the fp64 GEMV needed for the residual check costs

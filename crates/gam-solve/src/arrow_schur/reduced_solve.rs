@@ -114,9 +114,26 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let n = sys.rows.len();
     let k = sys.k;
 
-    let tiles = gam_gpu::device_runtime::GpuRuntime::global()
-        .map(|rt| gam_gpu::pool::balanced_partition(rt, n))
-        .filter(|tiles| tiles.len() > 1);
+    // Size gate BEFORE the device probe (startup-tax ordering fix): the
+    // multi-GPU tile path exists to overlap the per-row `leftᵀ·right` GEMMs
+    // (≈ `2·d·k²` flops each, `2·n·d·k²` total) across the pool, and each
+    // tile's GEMMs still pass through the policy-gated dispatch shims — which
+    // refuse every op when the WHOLE assembly is below
+    // `MIN_CALIBRATABLE_GEMM_FLOPS`, the smallest floor any reachable policy
+    // can carry. Such a shape would only inherit the tile split's inter-tile
+    // reassociation (the documented, tolerance-bounded departure) while doing
+    // 100% CPU work, so route it to the serial/rayon reference path below
+    // WITHOUT calling `GpuRuntime::global()` (whose first call creates a CUDA
+    // primary context on every GPU). Shapes clearing the floor probe and tile
+    // exactly as before.
+    let assembly_work = 2u128 * (n as u128) * (sys.d as u128) * (k as u128) * (k as u128);
+    let tiles = if assembly_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
+        None
+    } else {
+        gam_gpu::device_runtime::GpuRuntime::global()
+            .map(|rt| gam_gpu::pool::balanced_partition(rt, n))
+            .filter(|tiles| tiles.len() > 1)
+    };
 
     let Some(tiles) = tiles else {
         // Single-device / CPU. The per-row contributions `-Σ_i leftᵀ·right` fold

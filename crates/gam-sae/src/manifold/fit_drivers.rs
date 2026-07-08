@@ -5051,7 +5051,30 @@ impl SaeManifoldTerm {
             }
         };
 
-        let rt = crate::gpu::device_runtime::GpuRuntime::global();
+        // Size gate BEFORE the device probe (startup-tax ordering fix): the
+        // device path runs one `XtDiagX { n, p: m_k }` per atom, and every
+        // reachable dispatch policy refuses that op below
+        // `MIN_CALIBRATABLE_GEMM_FLOPS` — so when even the LARGEST per-atom
+        // Gram is under the floor, every device attempt would decline and the
+        // scatter would reproduce the CPU path exactly. Take the CPU path
+        // directly without calling `GpuRuntime::global()` (whose first call
+        // creates a CUDA primary context on every GPU). Shapes with at least
+        // one admissible atom probe and scatter exactly as before.
+        let max_atom_gram_flops: u128 = self
+            .atoms
+            .iter()
+            .map(|atom| {
+                let m = atom.basis_size() as u128;
+                2u128 * (n as u128) * m * m
+            })
+            .max()
+            .unwrap_or(0);
+        let rt = if max_atom_gram_flops < crate::gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+        {
+            None
+        } else {
+            crate::gpu::device_runtime::GpuRuntime::global()
+        };
         match rt {
             None => {
                 for atom_idx in 0..self.atoms.len() {

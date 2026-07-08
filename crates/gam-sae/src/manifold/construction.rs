@@ -2728,16 +2728,19 @@ impl SaeManifoldTerm {
         // so the engagement regression can pin a small budget without allocating
         // a multi-GB dense Gram.
         // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering):
-        // decide against the host in-core budget first. If the dense data Gram
-        // already fits the host budget the plan keeps the dense full-support
-        // layout (`None`); because the aggregate pooled device budget the probe
-        // would return is at least the host budget in the multi-GPU production
-        // regime, a present device cannot flip that verdict, so we return
-        // without creating any CUDA context. Only a dense Gram that OVERFLOWS
-        // the host budget needs the larger pooled device budget — and only then
-        // do we pay for the probe.
+        // decide against `min(host budget, conservative device-pool floor)`
+        // first. `sparse_active_plan_for_budget` returns `None` (keep the dense
+        // full-support layout) exactly when the dense data Gram fits the
+        // budget, and that verdict is monotone in the budget — so a Gram that
+        // fits the PESSIMISTIC budget also fits the host budget AND any probed
+        // device pool's budget (every real pool clears
+        // `SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES`). The probe could not flip
+        // the decision, so we return without creating any CUDA context. Only a
+        // Gram that overflows the pessimistic budget needs the real (possibly
+        // pooled-device) budget — and only then do we pay for the probe.
         let host_budget = sae_host_in_core_budget_bytes().0;
-        if self.sparse_active_plan_for_budget(host_budget).is_none() {
+        let pessimistic = host_budget.min(SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES);
+        if self.sparse_active_plan_for_budget(pessimistic).is_none() {
             return None;
         }
         let budget = match crate::gpu::device_runtime::GpuRuntime::global() {

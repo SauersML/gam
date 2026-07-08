@@ -64,6 +64,22 @@ pub(crate) fn try_factor_blocks_batched(
     {
         return None;
     }
+    // Size gate BEFORE the device probe (startup-tax ordering fix): the batched
+    // POTRF below routes through `try_cholesky_batched_lower_inplace`, whose
+    // admission is `SmallDenseBatchedPotrf { p: d, batch }` or
+    // `Potrf { p: d, batch }`. When NO reachable dispatch policy could admit
+    // either op, the shim is guaranteed to decline, so return to the exact
+    // per-row CPU path without calling `is_available()` — whose first call
+    // probes the driver and creates a CUDA primary context on every GPU.
+    // Admissible shapes probe and dispatch exactly as before.
+    let batch = rows.len();
+    if !(gam_gpu::linalg_dispatch::DispatchOp::SmallDenseBatchedPotrf { p: d, batch })
+        .admissible_under_any_policy()
+        && !(gam_gpu::linalg_dispatch::DispatchOp::Potrf { p: d, batch })
+            .admissible_under_any_policy()
+    {
+        return None;
+    }
     // No device → let the CPU path own the work (it is the exact fallback).
     if !gam_gpu::device_runtime::GpuRuntime::is_available() {
         return None;

@@ -56,6 +56,11 @@
 //! scale-out (one K=1 curved chart per orthonormal Tier-1 block) consumes the
 //! block frames on the block-sparse fit directly; see `sparse_dict::block`.
 
+mod fit;
+pub use fit::{
+    MigrationLedger, TieredFitConfig, TieredFitReport, TieredLedgerMove, TieredMoveKind, fit_tiered,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

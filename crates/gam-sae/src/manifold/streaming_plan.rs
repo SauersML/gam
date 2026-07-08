@@ -201,18 +201,21 @@ pub fn sae_streaming_plan_for_shape(
     d_max: usize,
     border_dim: usize,
 ) -> SaeStreamingPlan {
-    // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): build
-    // the plan against `min(host budget, conservative device-pool floor)`. If
-    // the direct plan is admitted even under that pessimistic budget, NO real
-    // budget — host-only or any probed device pool (see
-    // `SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES`) — could refuse it, and a
-    // direct-admitted plan's functional outputs are budget-independent
-    // (`chunk_size == n_obs`, `streaming == false`; the chunk window is
-    // consumed only on the streaming path). So return this plan without
-    // touching `GpuRuntime::global()`, i.e. without creating a CUDA primary
-    // context on every GPU for a fit that stays on the CPU. Shapes that need
-    // more than the pessimistic budget fall through to the exact probed-budget
-    // logic below, bit-for-bit as before.
+    // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): decide
+    // admission against `min(host budget, conservative device-pool floor)`
+    // first. If the direct plan is admitted even under that pessimistic budget,
+    // NO real budget — host-only or any probed device pool (see
+    // `SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES`) — could refuse it, so the
+    // probe cannot change the admission, the chunking (`chunk_size == n_obs`,
+    // `streaming == false` for every direct plan), or any downstream
+    // budget-comparison branch (a `≤ 64 MiB` working set is below every
+    // consumer's threshold whichever budget is installed). Return the
+    // HOST-budget plan — carrying the honest CPU-fit budget in
+    // `in_core_budget_bytes` for downstream gates like the #2080 escalation
+    // ledger — without touching `GpuRuntime::global()`, i.e. without creating a
+    // CUDA primary context on every GPU for a fit that stays on the CPU. Larger
+    // shapes fall through to the exact probed-budget logic below, bit-for-bit
+    // as before.
     let (host_budget, host_available) = sae_host_in_core_budget_bytes();
     let host_window = SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE;
     let pessimistic_plan = sae_streaming_plan_from_budget(
@@ -225,8 +228,28 @@ pub fn sae_streaming_plan_for_shape(
         host_window,
         host_available,
     );
-    if pessimistic_plan.direct_admitted {
-        return pessimistic_plan;
+    if pessimistic_plan.direct_admitted
+        && pessimistic_plan.estimated_dense_schur_bytes <= host_budget
+    {
+        // Direct admission is monotone in the budget, so the host-budget plan
+        // is direct-admitted too and functionally identical (same chunk_size,
+        // same admission flags); only the recorded budget/diagnostic fields
+        // reflect the honest host figure instead of the 64 MiB decision floor.
+        // The extra dense-Schur ≤ host-budget guard keeps the downstream
+        // `estimated_dense_schur_bytes > in_core_budget_bytes` consumers
+        // (dense-vs-SLQ evidence routing) on the same branch a probed budget
+        // would have chosen — on a starved host whose budget collapsed below
+        // even a tiny Schur, fall through to the exact probed logic.
+        return sae_streaming_plan_from_budget(
+            n_obs,
+            total_basis,
+            k_atoms,
+            d_max,
+            border_dim,
+            host_budget,
+            host_window,
+            host_available,
+        );
     }
     let (budget, chunk_window, host_available) =
         match crate::gpu::device_runtime::GpuRuntime::global() {
@@ -671,6 +694,71 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
 pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
     let available = sae_host_available_memory_bytes();
     (sae_host_in_core_budget_from_available(available), available)
+}
+
+#[cfg(test)]
+mod cpu_sized_plan_laziness_tests {
+    //! Pins the CUDA startup-tax fix at the SAE fit's front budgeting step:
+    //! planning a CPU-sized manifold fit (the profiled K=6 / N=700 / d=24 class
+    //! of shapes, whose whole working set is a few MiB) must take the
+    //! size-gated early return and NEVER call `GpuRuntime::global()` — the call
+    //! whose first execution probes the driver and creates a CUDA primary
+    //! context on every GPU (`cuDevicePrimaryCtxRetain`, ~10% of the profiled
+    //! small-fit wall clock on an 8×B200 node). Runs on any host: the invariant
+    //! is the control-flow ordering, observed via the process-wide
+    //! `global_call_count` counter (nextest = one process per test).
+    use super::*;
+    use crate::gpu::device_runtime::GpuRuntime;
+
+    #[test]
+    fn cpu_sized_streaming_plan_never_probes_the_device() {
+        let before = GpuRuntime::global_call_count();
+        // The profiled small-fit shape class: N=700 rows, K=6 atoms, a few
+        // dozen basis columns, d_max=2, border ≈ K·d ≈ 144. Working set is a
+        // couple of MiB — direct-admitted under ANY budget.
+        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144);
+        assert!(
+            plan.direct_admitted,
+            "the CPU-sized fixture must be direct-admitted (peak {} B)",
+            plan.estimated_direct_peak_bytes
+        );
+        assert!(!plan.streaming);
+        assert_eq!(plan.chunk_size, 700);
+        assert_eq!(
+            GpuRuntime::global_call_count(),
+            before,
+            "planning a CPU-sized SAE fit must short-circuit BEFORE \
+             GpuRuntime::global(), so no CUDA context is ever created"
+        );
+    }
+
+    #[test]
+    fn oversized_streaming_plan_still_consults_the_device_budget() {
+        // A shape whose working set overflows the pessimistic floor must fall
+        // through to the probed-budget logic (GPU-sized behaviour unchanged).
+        let before = GpuRuntime::global_call_count();
+        // The plan itself is irrelevant here; the test asserts the side effect
+        // that computing it consulted the device budget.
+        drop(sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768));
+        assert!(
+            GpuRuntime::global_call_count() > before,
+            "an oversized plan must consult GpuRuntime::global() for the \
+             pooled device budget exactly as before"
+        );
+    }
+
+    #[test]
+    fn early_return_carries_the_host_budget_not_the_decision_floor() {
+        // The early-returned plan must record the honest host in-core budget
+        // (downstream gates like the #2080 escalation ledger compare against
+        // it), not the 64 MiB pessimistic decision floor.
+        let plan = sae_streaming_plan_for_shape(700, 60, 6, 2, 144);
+        let (host_budget, _) = sae_host_in_core_budget_bytes();
+        assert_eq!(
+            plan.in_core_budget_bytes, host_budget,
+            "direct early-return must install the host budget"
+        );
+    }
 }
 
 #[cfg(test)]
