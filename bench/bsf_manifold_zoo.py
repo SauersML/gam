@@ -384,9 +384,23 @@ def _fit_ours_rust(
     native_train_r2 = _r2_of(train_x, np.asarray(fit.fitted, dtype=float))
     train_payload = fit.converged_latents(train_x)
     reenc_train_r2 = _r2_of(train_x, np.asarray(train_payload["fitted"], dtype=float))
+    # Warm re-encode: seed the SAME frozen-decoder OOS solve with the training
+    # fit's own converged coords/logits. Recovering the native number here
+    # proves the solver is sound and localizes the cold-path loss to
+    # seeding/routing; staying collapsed indicts the solve itself.
+    d_max = max(int(np.asarray(c).shape[1]) for c in fit.coords)
+    t_init = np.zeros((len(fit.coords), train_x.shape[0], d_max))
+    for k, c in enumerate(fit.coords):
+        c = np.asarray(c, dtype=float)
+        t_init[k, :, : c.shape[1]] = c
+    warm_payload = fit.converged_latents(
+        train_x, t_init=t_init, a_init=np.asarray(fit.low_level_logits, dtype=float)
+    )
+    warm_train_r2 = _r2_of(train_x, np.asarray(warm_payload["fitted"], dtype=float))
     print(
         f"[ours_rust] native train r2 {native_train_r2:.4f} | "
-        f"re-encode(train) r2 {reenc_train_r2:.4f}",
+        f"re-encode(train) COLD r2 {reenc_train_r2:.4f} | "
+        f"re-encode(train) WARM r2 {warm_train_r2:.4f}",
         flush=True,
     )
     payload = fit.converged_latents(test_x)
