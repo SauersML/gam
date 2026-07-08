@@ -931,8 +931,7 @@ fn profile_wide_p_criterion_cost_2080() {
         let mut ta = term.clone();
         let mut rho_a = rho.clone();
         let a0 = std::time::Instant::now();
-        let _inner_fit = ta
-            .run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
+        ta.run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
             .expect("inner solve");
         let dt_a = a0.elapsed().as_secs_f64();
 
