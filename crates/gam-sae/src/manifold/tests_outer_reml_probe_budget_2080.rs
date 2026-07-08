@@ -901,3 +901,57 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         );
     }
 }
+
+/// #2080 COST-LANE PROFILER (ignored — run explicitly with `--ignored --nocapture`).
+/// Measures how a SINGLE outer REML criterion evaluation scales in ambient width
+/// `p` for the correctly-specified K=1 circle (no co-collapse). Splits the wall
+/// time into: (A) the damped inner (t,β) Newton solve `run_joint_fit_arrow_schur`
+/// and (B) the residual = the undamped-logdet re-converge + dense β-Schur factor
+/// that `reml_criterion_with_cache_refine_policy` adds on top. This localizes the
+/// cubic-in-p term the issue tracks.
+#[test]
+#[ignore]
+fn profile_wide_p_criterion_cost_2080() {
+    let harmonics = 2usize; // m = 1 + 2*2 = 5 basis columns per atom
+    for &p in &[16usize, 32, 48, 64, 96, 128] {
+        let n = 96usize;
+        let z = one_circle_wide_target(n, p, 0.05);
+        let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
+        let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+        let rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+            .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+            .unwrap();
+        let beta_dim = term.beta_dim();
+
+        // Phase A: damped inner solve alone.
+        let mut ta = term.clone();
+        let mut rho_a = rho.clone();
+        let a0 = std::time::Instant::now();
+        let _ = ta
+            .run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
+            .expect("inner solve");
+        let dt_a = a0.elapsed().as_secs_f64();
+
+        // Phase A+B: full criterion (inner solve + undamped logdet + dense Schur).
+        let mut tb = term.clone();
+        let b0 = std::time::Instant::now();
+        let evaluated = tb
+            .reml_criterion_with_cache_refine_policy(
+                z.view(),
+                &rho,
+                None,
+                8,
+                0.04,
+                1.0e-6,
+                1.0e-6,
+                true,
+            )
+            .expect("full criterion");
+        let dt_full = b0.elapsed().as_secs_f64();
+        let dt_b = (dt_full - dt_a).max(0.0);
+        eprintln!(
+            "[#2080 profile] p={p:>3} beta_dim={beta_dim:>4} | inner_solve={dt_a:8.3}s | logdet_phase={dt_b:8.3}s | full={dt_full:8.3}s | cost={:.4}",
+            evaluated.0
+        );
+    }
+}
