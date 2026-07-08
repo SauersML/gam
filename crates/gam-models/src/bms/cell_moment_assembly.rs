@@ -4764,6 +4764,108 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
+    /// #932 BMS-flex cutover INC-1(b) GATE: the per-denested-cell MOMENT
+    /// FACTORIZATION `flex_grid_calibration_derivs_factored` (production path)
+    /// reproduces the retained hand per-node twin `flex_grid_calibration_derivs_hand`
+    /// on the FULL calibration-derivative moment arrays (`f_u`, `f_au`, `f_uv`,
+    /// `f_aa`) to ≤1e-9 — over score-warp AND link-deviation, `b>0` AND `b<0`, the
+    /// fitted grid AND a sparse grid that forces single-node and EMPTY denested
+    /// cells (the degenerate moment paths where a factored accumulator typically
+    /// diverges from a loop). The fixture routes the `GlobalEmpirical` branch
+    /// (asserted) — exactly the production path the cutover replaces.
+    #[test]
+    fn flex_grid_calibration_derivs_factored_matches_hand_932() {
+        // Sparse grid: only 4 nodes over `score_splits+link_splits+1` denested
+        // cells ⇒ several cells hold zero nodes (empty buckets) and at least one
+        // holds exactly one node.
+        let sparse = crate::bms::EmpiricalZGrid::new(
+            vec![-2.0, -0.1, 0.1, 2.0],
+            vec![0.25, 0.25, 0.25, 0.25],
+            "flex factored oracle sparse",
+        )
+        .expect("sparse grid");
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            // Pin the branch: the fixture MUST route the GlobalEmpirical grid path
+            // the cutover targets, so a routing change cannot silently green this.
+            assert!(
+                fx.family
+                    .latent_measure
+                    .empirical_grid_for_training_row(0)
+                    .expect("measure query")
+                    .is_some(),
+                "fixture must exercise the GlobalEmpirical grid branch"
+            );
+            let r = fx.primary.total;
+            let beta: Array1<f64> = fx.beta_dev.clone();
+            let (beta_h, beta_w) = if is_score_warp {
+                (Some(&beta), None)
+            } else {
+                (None, Some(&beta))
+            };
+            let scale = fx.family.probit_frailty_scale();
+            let grids = [fx.grid.clone(), sparse.clone()];
+            let label = if is_score_warp { "score-warp" } else { "link-dev" };
+            for b0 in [0.35_f64, -0.4_f64] {
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                    0.2,
+                )
+                .expect("link map");
+                let a0 = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
+                for grid in &grids {
+                    let mut fu_h = Array1::zeros(r);
+                    let mut fau_h = Array1::zeros(r);
+                    let mut fuv_h = Array2::zeros((r, r));
+                    let faa_h = fx
+                        .family
+                        .flex_grid_calibration_derivs_hand(
+                            grid, &fx.primary, a0, b0, beta_h, beta_w, true, &mut fu_h, &mut fau_h,
+                            &mut fuv_h,
+                        )
+                        .expect("hand grid derivs");
+                    let mut fu_f = Array1::zeros(r);
+                    let mut fau_f = Array1::zeros(r);
+                    let mut fuv_f = Array2::zeros((r, r));
+                    let faa_f = fx
+                        .family
+                        .flex_grid_calibration_derivs_factored(
+                            grid, &fx.primary, a0, b0, beta_h, beta_w, true, &mut fu_f, &mut fau_f,
+                            &mut fuv_f,
+                        )
+                        .expect("factored grid derivs");
+                    let tol = |x: f64| 1e-9 * x.abs().max(1.0);
+                    assert!(
+                        (faa_h - faa_f).abs() <= tol(faa_f),
+                        "{label} b={b0} f_aa: hand {faa_h:+.12e} != factored {faa_f:+.12e}"
+                    );
+                    for u in 0..r {
+                        assert!(
+                            (fu_h[u] - fu_f[u]).abs() <= tol(fu_f[u]),
+                            "{label} b={b0} f_u[{u}]: hand {:+.12e} != factored {:+.12e}",
+                            fu_h[u],
+                            fu_f[u]
+                        );
+                        assert!(
+                            (fau_h[u] - fau_f[u]).abs() <= tol(fau_f[u]),
+                            "{label} b={b0} f_au[{u}]: hand {:+.12e} != factored {:+.12e}",
+                            fau_h[u],
+                            fau_f[u]
+                        );
+                        for v in 0..r {
+                            assert!(
+                                (fuv_h[[u, v]] - fuv_f[[u, v]]).abs() <= tol(fuv_f[[u, v]]),
+                                "{label} b={b0} f_uv[{u},{v}]: hand {:+.12e} != factored {:+.12e}",
+                                fuv_h[[u, v]],
+                                fuv_f[[u, v]]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // NOTE: the #932 hand-vs-jet2 timing baseline (`flex_handpath_vs_jet2_timing_932`)
     // was removed — `#[ignore]`d timing benches are banned by `build.rs`. The
     // *correctness* of `empirical_flex_row_nll_jet2` against the production hand
