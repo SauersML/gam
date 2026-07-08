@@ -1001,10 +1001,13 @@ impl SaeManifoldTerm {
     /// exact rank-1 carriers `(λ_r, w_r)`, `w_r = Σ_a e_r[a] v_a`, each PSD. For a
     /// single-edge component this reduces to one rank-1 `∂²P/∂o²·v vᵀ`,
     /// bit-compatible with the historical self-concordant rank-1. The remaining
-    /// indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part is bounded by the same per-atom
-    /// Levenberg ridge `2|α_e|·o_e/D_·` (dominating the `≤ o_e/D_·` operator scale
-    /// of `∂²o_e/∂B²`), so the total majorizer is PSD — the exact-curvature damped
-    /// Newton metric, un-weakened.
+    /// indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part is handled by the per-atom
+    /// Levenberg ridge `2|α_e|·o_e/D_·`, which dominates its NEGATIVE part: the
+    /// negative curvature of the cosine² overlap only appears past `o > ½` and
+    /// scales like `2(2o−1)⁺·|α_e|/D_· ≤ 2o·|α_e|/D_·` (at small `o` the overlap
+    /// sits at its minimum, so the dropped term is PSD and needs no domination —
+    /// the metric merely under-counts positive curvature there, which the line
+    /// search absorbs). The total metric GN + ridge is PSD by construction.
     pub(crate) fn add_sae_separation_barrier(
         &self,
         sys: &mut ArrowSchurSystem,
@@ -1047,9 +1050,14 @@ impl SaeManifoldTerm {
                 Ok((_, sv, Some(vt))) => (sv, vt),
                 _ => continue,
             };
-            // G = Σ_i (1/max(λ_i,ε)) vᵢ vᵢᵀ — the ε-floored inverse of the PSD F
-            // (the derivative-consistent generalized inverse of the floored log det,
-            // so the value's floored `log det` and this `G` share one factorization).
+            // G = Σ_i (1/max(λ_i,ε)) vᵢ vᵢᵀ — the ε-floored inverse of the PSD F,
+            // sharing one factorization with the value's floored `log det`. Above
+            // the floor this is the exact derivative; BELOW it the slope is
+            // deliberately CLAMPED at 1/ε rather than the floored value's literal
+            // zero (an interior-point barrier must keep a bounded restoring force
+            // at the pole — a zero sub-ε gradient would flat-line the collapse
+            // state instead of pushing out of it; the mismatch only makes the
+            // Armijo check conservative in the sub-ε regime).
             let mut g = Array2::<f64>::zeros((s, s));
             for (i, &lam) in sv.iter().enumerate() {
                 let inv = 1.0 / lam.max(eps);
