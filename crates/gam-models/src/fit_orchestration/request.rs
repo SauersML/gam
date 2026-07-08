@@ -510,6 +510,17 @@ pub struct FitConfig {
     /// `FitConfig → FitOptions → ExternalOptimOptions` down to the standard
     /// `RemlState`, which then calls `enable_persistent_warm_start_disk()`.
     pub persist_warm_start_disk: bool,
+    /// Saturation-escalation level for 2-D+ spatial smooths (#1689). In-process
+    /// plumbing ONLY — never a user flag/env var: the `fit_from_formula` refit
+    /// loop sets it (0, 1, 2, …) and re-materializes, and the spatial term build
+    /// resolves each 2-D+ smooth's center count to
+    /// `gam_terms::basis::escalated_num_centers(n, d, level)` instead of the
+    /// worst-case `default_num_centers`. Level 0 is the modest mgcv-parity start;
+    /// the loop grows the level only while a fitted spatial term's edf says its
+    /// basis is saturated and its count is still below the `default_num_centers`
+    /// ceiling (so a saturated fit converges back to today's basis size — the
+    /// accuracy fixed point). Default 0 for every fit.
+    pub spatial_escalation_level: u32,
 }
 
 impl Default for FitConfig {
@@ -559,6 +570,7 @@ impl Default for FitConfig {
             topology_auto_selector: None,
             smooth_overrides: None,
             persist_warm_start_disk: false,
+            spatial_escalation_level: 0,
         }
     }
 }

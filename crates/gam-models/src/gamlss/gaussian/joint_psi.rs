@@ -644,8 +644,10 @@ pub(crate) fn gaussian_joint_first_directionalweights(
     for i in 0..nobs {
         let wi = scalars.w[i];
         let mi = scalars.m[i];
+        let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
         let ai = scalars.obs_weight[i];
         let dm = dotmu[i];
         let de = dot_eta[i];
@@ -654,8 +656,14 @@ pub(crate) fn gaussian_joint_first_directionalweights(
         w_u[i].write(-2.0 * wi * sde);
         // + 2·κ'·m·de: dκ/dη chain-rule from σ = b + e^η.
         c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
-        // Directional derivative of Fisher E[H_{ls,ls}]=2κ²a: 4κκ'a·de (#566).
-        d_u[i].write(4.0 * ki * kpi * ai * de);
+        // Directional derivative of the OBSERVED h_ll = κ'(a−n) + 2κ²n:
+        //   ∂h/∂η_μ = −2m(2κ²−κ'),
+        //   ∂h/∂η_ls = κ''(a−n) + 6κκ'n − 4κ³n.
+        let a_coef = 2.0 * ki * ki - kpi;
+        d_u[i].write(
+            -2.0 * mi * a_coef * dm
+                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * de,
+        );
     }
     // SAFETY: every slot of `w_u`, `c_u`, `d_u` was written exactly once
     // inside the loop above (one `.write(...)` per index per array).
@@ -698,9 +706,25 @@ pub(crate) fn gaussian_jointsecond_directionalweights(
                 - 2.0 * wi * kpi * de_sym
                 + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_eta,
         );
-        // d²/du dv of Fisher E[H_{ls,ls}]=2κ²a: bilinear in fixed directions
-        // u,v, no μ dependence ⇒ 4a(κ'²+κκ'')·deu·dev (#566).
-        d_uv[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * de_eta);
+        // d²/du dv of the OBSERVED h_ll = κ'(a−n) + 2κ²n (β-directions are
+        // linear, so no direction-curvature terms). With A = 2κ²−κ',
+        // E = 6κκ'−4κ³−κ'', and the logb-link identity κ''' = κ''(1−2κ)−2κ'²:
+        //   ∂²h/∂η_μ²      = 2wA,
+        //   ∂²h/∂η_μ∂η_ls  = m(8κ³ − 12κκ' + 2κ'')   (≡ ∂²h_μls/∂η_ls², ∂³ℓ symmetry),
+        //   ∂²h/∂η_ls²     = κ'''a − 2κnE + n(6κ'² + 6κκ'' − 12κ²κ' − κ''').
+        let ni = scalars.n[i];
+        let a_coef = 2.0 * ki * ki - kpi;
+        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
+        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        d_uv[i].write(
+            2.0 * wi * a_coef * (dmu * dmv)
+                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * de_sym
+                + (ktp * ai - 2.0 * ki * ni * e_coef
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
+                        - 12.0 * ki * ki * kpi
+                        - ktp))
+                    * de_eta,
+        );
     }
     // SAFETY: every slot of `w_uv`, `c_uv`, `d_uv` was written exactly once
     // inside the loop above.
@@ -938,27 +962,34 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     }
 }
 
-/// Canonical Gaussian location-scale Fisher (expected) joint-Hessian row
-/// coefficients `(mm, ml, ll)` — the SINGLE source of truth for this curvature,
-/// shared by every representation that assembles the value Hessian (the dense
+/// Canonical Gaussian location-scale OBSERVED joint-Hessian row coefficients
+/// `(mm, ml, ll)` — the SINGLE source of truth for this curvature, shared by
+/// every representation that assembles the value Hessian (the dense
 /// `exact_newton_joint_hessian_from_designs` and the matrix-free
-/// `GaussianLocationScaleHessianWorkspace`). The (μ, log σ) information is
-/// block-diagonal because location and scale are information-orthogonal:
-///   `ml = E[H_{μ,ls}] = 2κ·E[m] = 2κ·E[r]·w/σ² = 0`  (E[r]=0 at any β; #684),
-/// and the (log σ, log σ) block is the residual-free Fisher form
-///   `ll = E[H_{ls,ls}] = 2κ²a`  (a = obs_weight; #566).
-/// Routing both paths through this one constructor makes the cross-block drift
-/// that caused #684 — one representation using the observed `2κm`, another the
-/// Fisher 0 — structurally impossible: they cannot disagree because they read
-/// the same coefficients. The observed SCORE still drives the Newton step
-/// (Fisher scoring → exact joint MLE); only the curvature feeding the REML
-/// determinant / Newton metric is the orthogonal expectation.
-pub(crate) fn gaussian_locscale_fisher_joint_row_coeffs(
+/// `GaussianLocationScaleHessianWorkspace`). Exact second derivatives of the
+/// row NLL (`r = y−μ`, `w = a/σ²`, `m = rw`, `n = r²w`, `κ = dlogσ/dη`):
+///   `mm = ∂²ℓ/∂η_μ²      = w`             (observed ≡ expected — exact),
+///   `ml = ∂²ℓ/∂η_μ∂η_ls  = 2κm`           (expectation 0 at the truth),
+///   `ll = ∂²ℓ/∂η_ls²     = κ′(a−n) + 2κ²n` (expectation 2κ²a).
+/// The LAML criterion `−½log|H+S|` requires the OBSERVED penalized Hessian at
+/// β̂ (Wood–Pya–Säfken 2016): the earlier block-Fisher object (#684/#566)
+/// zeroed `ml` and expected `ll`, which drops the cross-block Schur deficit
+/// `H_σμ(H_μμ+S_μ)⁻¹H_μσ` and the fitted-residual shrinkage `E[n̂]≈a(1−h_μ)`
+/// — both overstate σ-block information and bias λ̂_σ upward on the flat scale
+/// surface (#1561: log-σ over-smoothing; same dof genus as #2133). At a
+/// true-null/flat σ surface `n→a`, `m→0`, so observed → Fisher and null
+/// behavior is unchanged (SPEC: defaults recover the null). Indefiniteness of
+/// the observed joint Hessian is handled by the existing #365 modified-Newton
+/// reflection on the inner path and the spectral PD-floor on the criterion
+/// log-det. Routing every path through this one constructor keeps the #684
+/// cross-block drift structurally impossible.
+pub(crate) fn gaussian_locscale_observed_joint_row_coeffs(
     rows: &GaussianJointRowScalars,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let mm = rows.w.clone();
-    let ml = Array1::<f64>::zeros(rows.kappa.len());
-    let ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
+    let ml = 2.0 * &rows.kappa * &rows.m;
+    let ll = &rows.kappa_prime * (&rows.obs_weight - &rows.n)
+        + 2.0 * &rows.kappa * &rows.kappa * &rows.n;
     (mm, ml, ll)
 }
 
