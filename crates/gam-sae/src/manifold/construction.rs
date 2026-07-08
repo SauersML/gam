@@ -5806,9 +5806,43 @@ impl SaeManifoldTerm {
                 && captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION;
             previous_loss_total = new_loss_total;
             if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
-                let stationary_sys = self
+                let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+                // #1095/#2228 — decouple stall ACCEPTANCE from undamped-factor
+                // success. Both stationarity certificates below (the KKT grad-norm
+                // and the #2226 affine Newton-decrement ½λ²) and the returned
+                // evidence log-det are read from the ridge-0 factorization of this
+                // stationary system. On a chart that is over-parametrized for its
+                // intrinsic data dimension — d_atom=2 on an intrinsic 1-D circle,
+                // so every per-row H_tt carries a rank-1 radial null — that
+                // undamped per-row Cholesky is non-PD BY CONSTRUCTION, so without
+                // spectral deflation `solve_arrow_newton_step_with_options` errors,
+                // the whole `if let Ok(..)` is skipped, and a perfectly good fit is
+                // refused to the non-convergence sentinel (#1095: public
+                // sae_manifold_fit K=1 circle → GamError at every N).
+                //
+                // Ensure the stationary EVIDENCE system opts into per-row spectral
+                // discovery (installing an empty-per-row `row_gauge_deflation` is
+                // exactly the #974 low-rank-whiten seam): an intrinsic flat /
+                // indefinite direction is then deflated to UNIT stiffness (log 1 = 0,
+                // ρ-independent — the quotient pseudo-determinant convention the
+                // gauge / #1273 / #974 deflations already use), so the ridge-0
+                // factor is PD-by-deflation, the log-det is finite, and the affine
+                // ½λ² below is measured on the IDENTIFIABLE subspace (the deflated
+                // null direction contributes a bounded step, not a Schur-amplified
+                // blow-up). A full-rank block has no eigenvalue below the spectral
+                // floor and is returned bit-for-bit unchanged, so healthy fits are
+                // untouched — this only makes acceptance REACHABLE on a
+                // rank-deficient chart. The UNDAMPED (non-deflated) per-row verdict
+                // remains the #2080 infeasible-ρ probe upstream
+                // (`probe_undamped_evidence_row_factors` on the loop `sys`), which
+                // this does not touch: it is a probe signal, not an acceptance gate.
+                if stationary_sys.row_gauge_deflation.is_none() {
+                    let n_rows = stationary_sys.rows.len();
+                    stationary_sys
+                        .set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
+                }
                 if let Ok((stationary_dt, stationary_db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {
