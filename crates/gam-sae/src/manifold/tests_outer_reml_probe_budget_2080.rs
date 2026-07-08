@@ -902,18 +902,22 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
     }
 }
 
-/// #2080 COST-LANE PROFILER (ignored — run explicitly with `--ignored --nocapture`).
+/// #2080 COST-LANE PROFILER + criterion-finiteness gate.
 /// Measures how a SINGLE outer REML criterion evaluation scales in ambient width
 /// `p` for the correctly-specified K=1 circle (no co-collapse). Splits the wall
 /// time into: (A) the damped inner (t,β) Newton solve `run_joint_fit_arrow_schur`
 /// and (B) the residual = the undamped-logdet re-converge + dense β-Schur factor
 /// that `reml_criterion_with_cache_refine_policy` adds on top. This localizes the
-/// cubic-in-p term the issue tracks.
+/// cubic-in-p term the issue tracks. Asserted invariant: the inner solve
+/// converges finitely and the full criterion is FINITE (rankable) at every
+/// width — a non-finite criterion on this correctly-specified probe is the
+/// #1094-class outer refusal. Widths kept small enough for the standard shard;
+/// the wide tail (64/96/128) is profiling territory for the #2080 owner's
+/// dedicated runs.
 #[test]
-#[ignore]
 fn profile_wide_p_criterion_cost_2080() {
     let harmonics = 2usize; // m = 1 + 2*2 = 5 basis columns per atom
-    for &p in &[16usize, 32, 48, 64, 96, 128] {
+    for &p in &[16usize, 32, 48] {
         let n = 96usize;
         let z = one_circle_wide_target(n, p, 0.05);
         let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, harmonics);
@@ -927,7 +931,7 @@ fn profile_wide_p_criterion_cost_2080() {
         let mut ta = term.clone();
         let mut rho_a = rho.clone();
         let a0 = std::time::Instant::now();
-        let _ = ta
+        let _inner_fit = ta
             .run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
             .expect("inner solve");
         let dt_a = a0.elapsed().as_secs_f64();
@@ -949,6 +953,13 @@ fn profile_wide_p_criterion_cost_2080() {
             .expect("full criterion");
         let dt_full = b0.elapsed().as_secs_f64();
         let dt_b = (dt_full - dt_a).max(0.0);
+        assert!(
+            evaluated.0.is_finite(),
+            "#2080/#1094: the outer REML criterion must be RANKABLE (finite) on a \
+             correctly-specified K=1 wide-p circle at p={p}; a non-finite value here \
+             is the probe-refusal failure class (got {})",
+            evaluated.0
+        );
         eprintln!(
             "[#2080 profile] p={p:>3} beta_dim={beta_dim:>4} | inner_solve={dt_a:8.3}s | logdet_phase={dt_b:8.3}s | full={dt_full:8.3}s | cost={:.4}",
             evaluated.0
