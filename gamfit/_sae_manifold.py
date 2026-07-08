@@ -287,19 +287,12 @@ def _channel_cov_factors(
     """
     if decoder_covariance is None:
         return None
-    cov = np.asarray(decoder_covariance, dtype=float)
-    m = int(m_basis)
-    total = cov.shape[0]
-    if m <= 0 or total % m != 0:
-        # Layout does not match an (M_k, p) decoder; refuse to guess — drop the
-        # factor rather than emit a mislabeled one (band sd still round-trips).
-        return None
-    p = total // m
-    # cov4[b1, c1, b2, c2]; the band consumes the c1 == c2 diagonal.
-    cov4 = cov.reshape(m, p, m, p)
-    diag = np.diagonal(cov4, axis1=1, axis2=3)  # (M_k, M_k, p)
-    blocks = np.ascontiguousarray(np.transpose(diag, (2, 0, 1)))  # (p, M_k, M_k)
-    return blocks.tolist()
+    cov = np.ascontiguousarray(np.asarray(decoder_covariance, dtype=float))
+    # Reshaping / diagonal-slicing math (#2091) lives in the Rust owner. `None`
+    # (layout does not match an (M_k, p) decoder) round-trips as before — the
+    # band's stored `shape_band_sd` still recovers.
+    blocks = rust_module().decoder_channel_cov_factors(cov, int(m_basis))
+    return None if blocks is None else blocks.tolist()
 
 
 def _channel_cov_from_factors(factors: Any) -> np.ndarray | None:
@@ -313,17 +306,15 @@ def _channel_cov_from_factors(factors: Any) -> np.ndarray | None:
     """
     if factors is None:
         return None
-    blocks = np.asarray(factors, dtype=float)
-    if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+    blocks = np.ascontiguousarray(np.asarray(factors, dtype=float))
+    if blocks.ndim != 3:
         raise ValueError(
             "decoder_covariance_channel_factors must be a (p, M_k, M_k) array; "
             f"got shape {blocks.shape}"
         )
-    p, m, _ = blocks.shape
-    cov4 = np.zeros((m, p, m, p), dtype=float)
-    for c in range(p):
-        cov4[:, c, :, c] = blocks[c]
-    return np.ascontiguousarray(cov4.reshape(m * p, m * p))
+    # Block-diagonal reassembly math (#2091) lives in the Rust owner; it raises
+    # on a non-square trailing pair, matching the previous contract.
+    return rust_module().decoder_cov_from_channel_factors(blocks)
 
 
 def _canonical_n_harmonics(

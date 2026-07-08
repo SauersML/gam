@@ -7155,6 +7155,82 @@ fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
     matrices.iter().map(matrix_to_nested).collect()
 }
 
+/// Compact per-channel decoder-covariance factor a posterior shape band consumes
+/// (issue #2091 — migrate the ManifoldSAE serialization math out of Python into
+/// the Rust owner).
+///
+/// The dense φ-scaled decoder covariance is `(M·p, M·p)` in row-major
+/// `(basis, channel)` flat layout (flat index `b·p + c`). The posterior shape
+/// band reads ONLY the same-channel blocks `Cov[(b1,c),(b2,c)]` — its variance is
+/// `Var_c(t) = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]` — so those `p` blocks of
+/// `M × M` are the complete, compact factor the band needs. This extracts them as
+/// a `(p, M, M)` array (pure reshaping / diagonal slicing — no numerical
+/// decomposition), replacing the dense `(M·p)²` joint covariance in the on-disk
+/// format. Returns `None` when the layout does not match an `(M, p)` decoder
+/// (`m_basis <= 0`, or the covariance side length is not a multiple of it): the
+/// factor is dropped rather than mislabeled, mirroring the pre-migration Python
+/// contract where the band's stored `shape_band_sd` still round-trips.
+#[pyfunction(signature = (decoder_covariance, m_basis))]
+fn decoder_channel_cov_factors<'py>(
+    py: Python<'py>,
+    decoder_covariance: PyReadonlyArray2<'py, f64>,
+    m_basis: i64,
+) -> Option<Py<PyArray3<f64>>> {
+    let cov = decoder_covariance.as_array();
+    let total = cov.nrows();
+    if m_basis <= 0 {
+        return None;
+    }
+    let m = m_basis as usize;
+    if total == 0 || total % m != 0 {
+        return None;
+    }
+    let p = total / m;
+    // blocks[c, b1, b2] = cov[b1·p + c, b2·p + c] — the same-channel diagonal of
+    // the reshaped `cov4[b1, c1, b2, c2]`.
+    let mut blocks = Array3::<f64>::zeros((p, m, m));
+    for c in 0..p {
+        for b1 in 0..m {
+            for b2 in 0..m {
+                blocks[[c, b1, b2]] = cov[[b1 * p + c, b2 * p + c]];
+            }
+        }
+    }
+    Some(blocks.into_pyarray(py).unbind())
+}
+
+/// Rebuild the full-shape `(M·p, M·p)` decoder covariance from the compact
+/// per-channel factor written by [`decoder_channel_cov_factors`] (issue #2091).
+///
+/// The result is block-diagonal across channels: the same-channel `M × M` blocks
+/// are restored exactly and the cross-channel entries (which no band reads) are
+/// zero. Reproduces the shape band `Σ Φ Φ Cov[(·,c),(·,c)]` to machine precision.
+/// `factors` is the `(p, M, M)` array; a non-square trailing pair is rejected.
+#[pyfunction(signature = (factors))]
+fn decoder_cov_from_channel_factors<'py>(
+    py: Python<'py>,
+    factors: PyReadonlyArray3<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let blocks = factors.as_array();
+    let (p, m, m2) = blocks.dim();
+    if m != m2 {
+        return Err(py_value_error(format!(
+            "decoder_covariance_channel_factors must be a (p, M_k, M_k) array; \
+             got trailing dims {m} x {m2}"
+        )));
+    }
+    let side = m * p;
+    let mut cov = Array2::<f64>::zeros((side, side));
+    for c in 0..p {
+        for b1 in 0..m {
+            for b2 in 0..m {
+                cov[[b1 * p + c, b2 * p + c]] = blocks[[c, b1, b2]];
+            }
+        }
+    }
+    Ok(cov.into_pyarray(py).unbind())
+}
+
 #[cfg(test)]
 #[path = "../../tests/src_modules/lib_tests.rs"]
 mod tests;

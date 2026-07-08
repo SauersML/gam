@@ -5413,9 +5413,24 @@ impl SaeManifoldTerm {
         // #1026 decoder-LSQ polish that would otherwise refit β off the seed — so
         // `self` is at the warm-start β here.
         if inner_max_iter == 0 {
-            let sys = self
+            let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+            // #1095/#2228 — same decoupling as the stall / gradient-stationary
+            // acceptance paths. This frozen warm-start evidence log-det is read from
+            // the ridge-0 factor below, which is non-PD BY CONSTRUCTION on an
+            // over-parametrized chart (a rank-1 radial null per row). Per-row
+            // spectral deflation only fires when `row_gauge_deflation.is_some()`, and
+            // the decoded-derivative gauge floor (`tangent·tangent > 1e-24`) can
+            // leave it None on exactly the flat axis that carries the null — so
+            // force the evidence system to opt into per-row spectral discovery: the
+            // null is unit-stiffness deflated (`log 1 = 0`, ρ-independent) and the
+            // frozen log-det is finite, instead of refusing a rescuable warm-start
+            // reuse. A full-rank block has no sub-floor eigenvalue and is untouched.
+            if sys.row_gauge_deflation.is_none() {
+                let n_rows = sys.rows.len();
+                sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
+            }
             let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // The frozen-state Newton step (factored.0, factored.1) is discarded
@@ -5479,7 +5494,7 @@ impl SaeManifoldTerm {
         // de-facto converged (R²≈0.99).
         let mut stalled_finite_cache: Option<ArrowFactorCache> = None;
         loop {
-            let sys = self
+            let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
@@ -5558,6 +5573,23 @@ impl SaeManifoldTerm {
             let gradient_stationary =
                 grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance;
             if gradient_stationary {
+                // #1095/#2228 — decouple this ACCEPT from undamped-factor success,
+                // the same acceptance-local pattern as the stall path below. A
+                // cleanly-fit over-parametrized chart (d_atom=2 on intrinsic 1-D
+                // data) is gradient-STATIONARY — the tangent is fit and the rank-1
+                // radial null contributes ZERO gradient — so it lands HERE rather
+                // than the objective-stall path, yet its ridge-0 per-row H_tt is
+                // non-PD by construction. Force the acceptance factor to opt into
+                // per-row spectral discovery so the null is unit-stiffness deflated
+                // (`log 1 = 0`, ρ-independent) and the evidence log-det is finite.
+                // This does NOT touch the undamped #2080 probe: the probe runs only
+                // in the non-stationary branch below, which THIS block never reaches
+                // (every arm returns), and a non-stationary iteration never installs
+                // this deflation — so `sys` stays undamped for the probe.
+                if sys.row_gauge_deflation.is_none() {
+                    let n_rows = sys.rows.len();
+                    sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
+                }
                 let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                     match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
                         Ok(factored) => factored,
@@ -5570,24 +5602,29 @@ impl SaeManifoldTerm {
                             // Schur complement of the logit block goes negative even
                             // though the priors and the full-joint GN term are PSD.
                             //
-                            // The undamped evidence factor already conditions that
-                            // block the PRINCIPLED way: `factor_spectral_deflated_
-                            // evidence_row` discovers the negative/flat eigen-direction
-                            // and stiffens it to UNIT curvature (eigenvalue → +1), so it
-                            // contributes a ρ-INDEPENDENT log 1 = 0 to the evidence —
-                            // the same quotient pseudo-determinant convention the gauge
-                            // (#1037) and data-null (#1117) deflations use. Reaching
-                            // THIS arm at stationarity therefore means even the spectral
-                            // deflation declined (a non-finite block or a failed
-                            // eigendecomposition): the state is genuinely broken, so we
-                            // surface the hard refusal and let the outer BFGS treat this
-                            // ρ as an INFINITY probe (`is_recoverable_value_probe_
-                            // refusal`). We must NOT ridge-damp here: a `+ridge·I`
-                            // fallback injects a ρ-dependent ½·log|I + ridge·H_tt⁻¹|
-                            // bias into the VALUE that the analytic ρ-gradient (built
-                            // for the undamped Laplace log-det) never sees, desyncing
-                            // the outer line-search — the multi-atom non-convergence
-                            // this fix (#1117) removes.
+                            // The undamped evidence factor conditions that block the
+                            // PRINCIPLED way: with per-row spectral discovery now
+                            // force-enabled above (`row_gauge_deflation` installed),
+                            // `factor_spectral_deflated_evidence_row` discovers the
+                            // negative/flat eigen-direction — including the #1095/#2228
+                            // radial null the decoded-derivative gauge floor
+                            // (`tangent·tangent > 1e-24`) would otherwise have excluded
+                            // from the gauge list — and stiffens it to UNIT curvature
+                            // (eigenvalue → +1), a ρ-INDEPENDENT log 1 = 0 evidence
+                            // contribution (the quotient pseudo-determinant convention
+                            // of the #1037 gauge and #1117 data-null deflations).
+                            // Reaching THIS arm therefore no longer means "deflation was
+                            // never enabled" (the old #1095 refusal, now fixed) — it
+                            // means the deflation was ATTEMPTED and genuinely DECLINED
+                            // (a non-finite block or a failed eigendecomposition), so
+                            // the state is broken: surface the hard refusal and let the
+                            // outer BFGS treat this ρ as an INFINITY probe
+                            // (`is_recoverable_value_probe_refusal`). We must NOT
+                            // ridge-damp here: a `+ridge·I` fallback injects a
+                            // ρ-dependent ½·log|I + ridge·H_tt⁻¹| bias into the VALUE
+                            // that the analytic ρ-gradient (built for the undamped
+                            // Laplace log-det) never sees, desyncing the outer
+                            // line-search — the multi-atom non-convergence #1117 removes.
                             return Err(format!(
                                 "SaeManifoldTerm::reml_criterion: stationary undamped \
                                  evidence factorization has a non-PD per-row H_tt block \
