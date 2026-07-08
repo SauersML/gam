@@ -325,8 +325,14 @@ fn activity_of(term: &SaeManifoldTerm) -> Array1<f64> {
     (0..n).map(|r| assignments.row(r).sum()).collect()
 }
 
-/// Fit the running structured residual-covariance `Σ` on `R = target − fitted`.
+/// Fit the running structured residual-covariance `Σ` on the pooled `R = target − fitted`.
 /// Returns `None` when the residual is empty/single-channel (no factor subspace).
+///
+/// The stagewise loop no longer mines the pooled residual directly — it routes through
+/// [`birth_mining_residual`], which applies the [`stratum_local_birth_residual`] floor
+/// screen before calling [`fit_residual_covariance_on`]. This unscreened pooled path is
+/// retained only as the covariance oracle the stratum-local tests compare against.
+#[cfg(test)]
 fn fit_residual_covariance(
     term: &SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
