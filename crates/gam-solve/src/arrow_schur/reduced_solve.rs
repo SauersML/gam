@@ -2300,7 +2300,6 @@ pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
     backend: &B,
     cols: &[usize],
 ) -> Array2<f64> {
-    let d = sys.d;
     let b = cols.len();
     let mut s_block = Array2::<f64>::zeros((b, b));
     // Initialise from H_ββ via penalty_subblock_add (#296): routes through
@@ -2310,24 +2309,33 @@ pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
         s_block[[bi, bi]] += ridge_beta;
     }
     let cluster_row_into = |row_idx: usize, row: &ArrowRowBlock, acc: &mut Array2<f64>| {
-        let mut col_vec = Array1::<f64>::zeros(d);
-        let mut solved_cols = Array2::<f64>::zeros((d, b));
+        // Materialize the b needed cross-block columns through the ROUTED
+        // `H_tβ` convention (`sys_htbeta_apply_row`: matrix-free operator plus
+        // any dense supplement) at the row's OWN width `di` — never a raw
+        // `row.htbeta` read at the global `sys.d`: matvec-backed rows carry
+        // absent/zero-sized slabs by contract (a raw read is wrong or panics),
+        // and per-row widths vary.
+        let di = sys.row_dims[row_idx];
+        let mut e_g = Array1::<f64>::zeros(sys.k);
+        let mut col_i = Array1::<f64>::zeros(di);
+        let mut cols_mat = Array2::<f64>::zeros((di, b));
+        let mut solved_cols = Array2::<f64>::zeros((di, b));
         for bj in 0..b {
             let gj = cols[bj];
-            for c in 0..d {
-                col_vec[c] = row.htbeta[[c, gj]];
-            }
-            let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
-            for c in 0..d {
+            e_g[gj] = 1.0;
+            sys_htbeta_apply_row(sys, row_idx, row, e_g.view(), &mut col_i);
+            e_g[gj] = 0.0;
+            let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_i.view());
+            for c in 0..di {
+                cols_mat[[c, bj]] = col_i[c];
                 solved_cols[[c, bj]] = solved[c];
             }
         }
         for bi in 0..b {
-            let gi = cols[bi];
             for bj in 0..b {
                 let mut dot = 0.0;
-                for c in 0..d {
-                    dot += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                for c in 0..di {
+                    dot += cols_mat[[c, bi]] * solved_cols[[c, bj]];
                 }
                 acc[[bi, bj]] -= dot;
             }
@@ -3284,28 +3292,32 @@ pub(crate) fn build_schur_scalar_inv<B: BatchedBlockSolver>(
     backend: &B,
     cols: &[usize],
 ) -> Result<Vec<f64>, ArrowSchurError> {
-    let d = sys.d;
     let mut result = Vec::with_capacity(cols.len());
-    let mut col_vec = Array1::<f64>::zeros(d);
     // Extract the penalty diagonal for all K columns once, then index per-column.
     let mut full_diag = Array1::<f64>::zeros(sys.k);
     {
         let diag_slice = full_diag.as_slice_mut().expect("full_diag contiguous");
         sys.penalty_diagonal_add(diag_slice);
     }
+    // Probe each needed column through the ROUTED `H_tβ` convention at each
+    // row's own width (see `assemble_local_schur_block` for why a raw
+    // `row.htbeta` read at the global `sys.d` is wrong here).
+    let mut e_g = Array1::<f64>::zeros(sys.k);
     for &gi in cols {
         let mut s = full_diag[gi] + ridge_beta;
+        e_g[gi] = 1.0;
         for (row_idx, row) in sys.rows.iter().enumerate() {
-            for c in 0..d {
-                col_vec[c] = row.htbeta[[c, gi]];
-            }
+            let di = sys.row_dims[row_idx];
+            let mut col_vec = Array1::<f64>::zeros(di);
+            sys_htbeta_apply_row(sys, row_idx, row, e_g.view(), &mut col_vec);
             let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
             let mut acc = 0.0;
-            for c in 0..d {
+            for c in 0..di {
                 acc += col_vec[c] * solved[c];
             }
             s -= acc;
         }
+        e_g[gi] = 0.0;
         if !s.is_finite() || s <= JACOBI_DIAGONAL_PD_FLOOR {
             return Err(ArrowSchurError::PcgFailed {
                 reason: format!(
