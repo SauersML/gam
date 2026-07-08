@@ -87,7 +87,15 @@ pub(crate) fn materialize_standard<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
-        Some(config.spatial_escalation_level),
+        // #1689: keep escalation DORMANT (worst-case `default_num_centers`
+        // provisioning) until the fit→measure-edf→re-materialize refit loop that
+        // climbs `spatial_escalation_level` actually exists. Passing
+        // `Some(level)` here with `level` pinned at its 0 default (nothing raises
+        // it) would cap every 2-D spatial smooth at the k≈30 start with no path
+        // back up — a silent accuracy regression (wiggly truths need k≈136). The
+        // start count is the accuracy fixed point ONLY when saturation escalation
+        // can grow it; without the loop, `None` is the correct default.
+        None,
     )?;
     // #1074: the Duchon default penalty is a Hilbert scale (curvature +
     // mass/tension operator dials). REML deselects the lower orders faithfully
