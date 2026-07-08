@@ -22,6 +22,7 @@
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 use super::device_runtime::GpuRuntime;
+use super::policy::GpuDispatchPolicy;
 
 pub struct CudaGemmDispatch;
 

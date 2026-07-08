@@ -179,6 +179,24 @@ pub(crate) fn sae_fd_total_loss(
 pub(crate) fn sae_fd_check_case(label: &str) -> SaeFdBlockReport {
     let epsilon = 1.0e-6;
     let (term, target, rho) = sae_fd_term(label);
+    // Freeze the intrinsic bending Gram S̃ at the base (B, t) exactly as the
+    // production assembly entry does (`assemble_arrow_schur` calls
+    // `refresh_intrinsic_smooth_penalty` on every atom before assembling gb, the
+    // #673 lagged-diffusivity chokepoint). Production's value path (Armijo/
+    // criterion `loss()`) and its assembled gradient then read the SAME frozen
+    // `atom.smooth_penalty` field, so they price one objective; the lag means gb
+    // does NOT differentiate through S̃'s coord-dependence. This fixture was
+    // written under the pre-3a9b9b40c seed-Gram convention: it FD-differenced
+    // `loss()` on the un-refreshed `term` (Gram still the seed I) while `gb` came
+    // from an `assembled` clone whose Gram had been refreshed to the ∫κ²ds
+    // bending Gram (κ ≠ 0 for the d1 circle) — a fixture-only mismatch of ~λ(S̃−I)B.
+    // Refreshing the base term aligns the fixture with the production ordering.
+    let mut term = term;
+    sae_fd_refresh(&mut term);
+    for atom in &mut term.atoms {
+        atom.refresh_intrinsic_smooth_penalty();
+    }
+    let term = term;
     let base_loss = sae_fd_total_loss(&term, &target, &rho);
     assert!(base_loss.is_finite(), "{label}: base loss is not finite");
 
