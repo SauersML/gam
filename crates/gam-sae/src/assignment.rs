@@ -1475,7 +1475,7 @@ pub fn ibp_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f6
 pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_seed: f64) -> f64 {
     const THETA_LO: f64 = -12.0; // α ≈ 6e-6
     const THETA_HI: f64 = 16.0; // α ≈ 8.9e6
-    const MAX_ITERS: usize = 100;
+    const NEWTON_MAX_ITERS: usize = 100;
     const STEP_TR: f64 = 1.0; // trust region on |Δθ| per iterate
     const TOL: f64 = 1.0e-10;
     if !(n_obs > 0.0) || occupancy.is_empty() {
@@ -1487,7 +1487,7 @@ pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_s
         1.0
     };
     let mut theta = seed.ln().clamp(THETA_LO, THETA_HI);
-    for _ in 0..MAX_ITERS {
+    for _ in 0..NEWTON_MAX_ITERS {
         let (s, h) = ibp_eb_alpha_score_hess(occupancy, n_obs, theta.exp());
         if !s.is_finite() || s.abs() < TOL {
             break;

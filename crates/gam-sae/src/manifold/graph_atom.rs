@@ -975,14 +975,31 @@ impl SaeBasisEvaluator for NystromSpectralEvaluator {
         self.basis.nystrom_coordinates(coords)
     }
 
-    fn second_jet_dyn(&self, _coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        // A mismatched query width is a caller bug, not a missing capability:
+        // surface it as an error exactly like `nystrom_coordinates` would,
+        // instead of a silent "no jet" that sends the caller down a fallback.
+        let r = self.basis.anchor_embeddings.ncols();
+        if coords.ncols() != r {
+            return Some(Err(format!(
+                "NystromSpectralEvaluator::second_jet_dyn: query has {} features but graph anchors have {r}",
+                coords.ncols()
+            )));
+        }
         None
     }
 
     fn third_jet_dyn(
         &self,
-        _coords: ArrayView2<'_, f64>,
+        coords: ArrayView2<'_, f64>,
     ) -> Option<Result<ndarray::Array5<f64>, String>> {
+        let r = self.basis.anchor_embeddings.ncols();
+        if coords.ncols() != r {
+            return Some(Err(format!(
+                "NystromSpectralEvaluator::third_jet_dyn: query has {} features but graph anchors have {r}",
+                coords.ncols()
+            )));
+        }
         None
     }
 }

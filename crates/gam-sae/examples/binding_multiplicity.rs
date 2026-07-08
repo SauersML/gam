@@ -126,7 +126,7 @@ struct TrialOutcome {
     sigma: f64,
     quantize_f32: bool,
     sep_factor: f64,
-    true_m: usize,
+    m_true: usize,
     /// Raw matrix-pencil model order (order selection alone).
     prony_order: usize,
     /// Gated production count (the per-firing readout's returned support size).
@@ -135,7 +135,7 @@ struct TrialOutcome {
     used_super_resolution: bool,
     /// Single-spike BLASSO dual birth ratio (multiplicity trigger; > 1 = birth).
     dual_eta: f64,
-    /// Max wrap-around position error when gated_count == true_m (else NaN).
+    /// Max wrap-around position error when gated_count == m_true (else NaN).
     position_error: f64,
 }
 
@@ -160,20 +160,20 @@ fn part_a_fixture_sweep() -> Vec<Value> {
         for &sigma in &noises {
             for &quantize in &quant {
                 for &sep_factor in &sep_factors {
-                    for true_m in 1..=3usize {
+                    for m_true in 1..=3usize {
                         // Skip m the atom cannot host: Prony resolves at most ⌊H/2⌋.
-                        if true_m > h / 2 {
+                        if m_true > h / 2 {
                             continue;
                         }
                         // Feasibility: m spikes need pairwise sep ≤ 1/m on the
                         // unit circle. Cap the target so the sampler never stalls.
-                        let target = (sep_factor * limit).min(0.95 / true_m as f64);
+                        let target = (sep_factor * limit).min(0.95 / m_true as f64);
                         let mut outcomes = Vec::with_capacity(trials_per_cell);
                         for trial in 0..trials_per_cell {
-                            let seed = mix_seed(h, sigma, quantize, true_m, trial)
+                            let seed = mix_seed(h, sigma, quantize, m_true, trial)
                                 ^ ((sep_factor * 1000.0) as u64).wrapping_mul(0x1000193);
                             outcomes.push(run_trial(
-                                h, sigma, quantize, sep_factor, true_m, target, seed,
+                                h, sigma, quantize, sep_factor, m_true, target, seed,
                             ));
                         }
                         rows.push(cell_report(&outcomes));
@@ -228,12 +228,12 @@ fn run_trial(
     sigma: f64,
     quantize_f32: bool,
     sep_factor: f64,
-    true_m: usize,
+    m_true: usize,
     min_sep: f64,
     seed: u64,
 ) -> TrialOutcome {
     let mut rng = StdRng::seed_from_u64(seed);
-    let planted = sample_separated_spikes(&mut rng, true_m, min_sep);
+    let planted = sample_separated_spikes(&mut rng, m_true, min_sep);
     let mut coeffs = coeffs_from_spikes(&planted, h);
     if sigma > 0.0 {
         add_noise(&mut coeffs, sigma, &mut rng);
@@ -257,7 +257,7 @@ fn run_trial(
     let (spikes, dual_eta, used_sr) = recover_measure_from_code(&z, sigma);
     let gated_count = spikes.len();
 
-    let position_error = if gated_count == true_m {
+    let position_error = if gated_count == m_true {
         let recovered: Vec<(f64, f64)> =
             spikes.iter().map(|s| (s.coordinate, s.amplitude)).collect();
         matched_position_error(&recovered, &planted)
@@ -270,7 +270,7 @@ fn run_trial(
         sigma,
         quantize_f32,
         sep_factor,
-        true_m,
+        m_true,
         prony_order,
         gated_count,
         used_super_resolution: used_sr,
@@ -282,10 +282,10 @@ fn run_trial(
 fn cell_report(outcomes: &[TrialOutcome]) -> Value {
     let n = outcomes.len() as f64;
     let first = &outcomes[0];
-    let true_m = first.true_m;
+    let m_true = first.m_true;
 
-    let gated_correct = outcomes.iter().filter(|o| o.gated_count == true_m).count();
-    let prony_correct = outcomes.iter().filter(|o| o.prony_order == true_m).count();
+    let gated_correct = outcomes.iter().filter(|o| o.gated_count == m_true).count();
+    let prony_correct = outcomes.iter().filter(|o| o.prony_order == m_true).count();
     // Confusion over predicted gated counts 0..=4.
     let mut confusion = [0usize; 5];
     for o in outcomes {
@@ -309,7 +309,7 @@ fn cell_report(outcomes: &[TrialOutcome]) -> Value {
         "sigma": first.sigma,
         "quantize_f32": first.quantize_f32,
         "sep_factor": first.sep_factor,
-        "true_m": true_m,
+        "m_true": m_true,
         "trials": outcomes.len(),
         "gated_count_accuracy": gated_correct as f64 / n,
         "prony_order_accuracy": prony_correct as f64 / n,
@@ -342,7 +342,7 @@ fn summarize_fixture(cells: &[Value]) -> Value {
     let mut false_binding_den = 0usize;
 
     for cell in cells {
-        let m = cell["true_m"].as_u64().unwrap_or(0) as usize;
+        let m = cell["m_true"].as_u64().unwrap_or(0) as usize;
         let sigma = cell["sigma"].as_f64().unwrap_or(-1.0);
         let sep = cell["sep_factor"].as_f64().unwrap_or(-1.0);
         let gated = cell["gated_count_accuracy"].as_f64().unwrap_or(0.0);
