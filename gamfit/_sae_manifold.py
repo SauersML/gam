@@ -2635,10 +2635,17 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
         ``"ibp_map"`` uses the IBP-MAP gate path as an explicit small-fit
         research mode, and ``"threshold_gate"`` uses the
-        hard-sigmoid gate family (#1777, renamed from ``"jumprelu"``). Public
-        aliases are accepted (#159):
+        hard-sigmoid gate family (#1777, renamed from ``"jumprelu"``).
+        ``"topk"`` is the hard per-row support gate (``AssignmentMode::TopK``):
+        it requires an explicit ``top_k`` (the fixed active-set size), carries
+        no live gate coordinates, and is therefore the one assignment admitted
+        to the CURVED framed/streaming manifold lane in the overcomplete
+        ``K > P`` regime (within the host memory budget; refused with an
+        actionable error over it) instead of the penalty-gated sparse-code
+        reroute. Public aliases are accepted (#159):
         ``"ibp"``/``"ibp-map"``/``"ibp_map"`` -> ``"ibp_map"``,
         ``"softmax"`` -> ``"softmax"``,
+        ``"topk"``/``"top_k"`` -> ``"topk"``,
         ``"threshold_gate"`` (primary) and the deprecated
         ``"gated"``/``"jump_relu"``/``"jumprelu"`` -> ``"threshold_gate"``.
         ``assignment_prior`` is an alias for ``assignment`` and normalizes
@@ -3165,12 +3172,27 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             )
         else:
             top_k_arg = top_k_int
-    # Front-door lane admission: the dense exact manifold engine is the small-K
-    # certification lane only. Once its `N x K` assignment state would exceed the
-    # response matrix scale `N x P`, route to the sparse-code trainer before
-    # constructing dense logits / coordinates. The admission decision is owned by
-    # the Rust front door so the Python public entry and FFI boundary share one
-    # K-vs-P rule.
+    # The hard top-k support gate (`AssignmentMode::TopK`) has no default
+    # support size: its per-row active set IS the model. Require it eagerly so
+    # a K > P topk request can never fall through to the penalty-gated K-vs-P
+    # rule below (which would reroute a MANIFOLD request to the linear trainer
+    # — the exact silent substitution the front door exists to prevent).
+    if kind == "topk" and top_k_arg is None:
+        raise ValueError(
+            f"sae_manifold_fit: assignment='topk' requires top_k (the fixed per-row "
+            f"active-set size, in [1, K={k_atoms}])"
+        )
+    # Front-door lane admission, owned by the Rust front door so the Python
+    # public entry and the FFI boundary share one rule:
+    #   * penalty-gated assignments (softmax / ibp_map / threshold_gate) carry
+    #     live N x K Newton logits, so the dense exact manifold engine is their
+    #     small-K certification lane only: once K > P they route to the
+    #     sparse-code trainer before constructing dense logits / coordinates;
+    #   * assignment='topk' carries NO gate coordinates (read-only routing,
+    #     per-row active sets of size top_k), so K > P is admitted to the
+    #     CURVED framed/streaming lane ("curved_streaming") within the host
+    #     memory budget, and refused with an actionable error over it — never
+    #     substituted with the linear lane.
     admission = _sae_fit_admission(
         n_obs,
         int(x.shape[1]),
@@ -3179,19 +3201,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         topk_support=(top_k_arg if kind == "topk" else None),
     )
     if admission["lane"] == "sparse_codes":
-        # The silent linear substitution is DEAD (2026-07-08): for the project's
-        # whole history this branch returned a linear SparseDictionaryFit through
-        # the manifold entry, so every "massive-K manifold" fit was linear and
-        # every manifold feature died downstream with AttributeError. A manifold
-        # request now either runs the TRUE engine or fails loudly with the
-        # honest alternatives.
-        raise ValueError(
-            f"sae_manifold_fit: K={k_atoms} > P={int(x.shape[1])} exceeds the dense "
-            "manifold engine's architectural lane for penalty-gated assignments. "
-            "Honest options: assignment='topk' runs the TRUE manifold engine at any "
-            "overcompleteness within the host memory budget (reduce n_obs if refused); "
-            "or reduce K to <= P; or call block_sparse_dictionary_fit / "
-            "sparse_dictionary_fit explicitly if a LINEAR dictionary is what you want."
+        if a_init is not None or t_init is not None:
+            raise ValueError(
+                "sae_manifold_fit sparse front-door lane does not accept dense "
+                "a_init/t_init warm starts; provide sparse dictionary state instead."
+            )
+        sparse_active = int(top_k_arg if top_k_arg is not None else 1)
+        return sparse_dictionary_fit(
+            np.ascontiguousarray(x, dtype=np.float32),
+            k_atoms,
+            active=sparse_active,
+            max_epochs=max_iter_total,
+            score_mode=str(score_mode),
         )
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
@@ -3589,12 +3610,19 @@ class StagewiseSAE:
         return self.to_manifold_sae().encode(X, **kwargs)
 
     def reconstruction_ev(self) -> float:
-        """Centered explained variance of the in-sample reconstruction."""
-        x = np.asarray(self.training_data, dtype=np.float64)
-        recon = self._in_sample_reconstruction()
-        rss = float(np.sum((x - recon) ** 2))
-        tss = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
-        return 1.0 - rss / tss if tss > 0.0 else 0.0
+        """Centered explained variance of the in-sample reconstruction.
+
+        The coefficient of determination ``R² = 1 − SSR/SST`` (column-mean-centered
+        SST, residual SSR) is a numeric kernel owned by the Rust core —
+        ``sae_manifold_reconstruction_r2``, the same FFI
+        :class:`gamfit.crosscoder` reports — so the SSR/SST reduction, the
+        ``SST == 0 → NaN`` convention, and the non-finite guards live there rather
+        than being re-derived in Python (SPEC thin-wrapper rule). Marshals the
+        target and composed reconstruction as contiguous ``f64`` and forwards.
+        """
+        x = np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64))
+        recon = np.ascontiguousarray(self._in_sample_reconstruction())
+        return float(rust_module().sae_manifold_reconstruction_r2(x, recon))
 
 
 def _basis_with_jet_for_atom(
