@@ -123,6 +123,23 @@ pub struct AtomGeometryEntry {
     pub nonlinearity: Option<f64>,
     /// Mean physical arc speed `‖a · g_k'(t)‖` over the atom's active rows.
     pub tangent_speed_mean: Option<f64>,
+    /// Fourier energy fractions of the decoded curve, PERIODIC basis only.
+    ///
+    /// The basis rows are `[1, sin(2π·1·t), cos(2π·1·t), …, sin(2π·H·t),
+    /// cos(2π·H·t)]`, so the decoded curve's harmonic-`h` component is
+    /// `sin(2πht)·β_{2h−1} + cos(2πht)·β_{2h}` and its mean-square energy under
+    /// the uniform coordinate measure is `½·E_h` with `E_h = ‖β_{2h−1}‖² +
+    /// ‖β_{2h}‖²` (rows of the decoder). Entry `h−1` holds `E_h / Σ_g E_g` for
+    /// `h = 1..H`; the constant row is excluded (it is the atom's offset, not
+    /// shape). `None` for non-periodic bases or when all non-constant rows
+    /// carry zero energy.
+    pub harmonic_energy_fractions: Option<Vec<f64>>,
+    /// `argmax_h E_h` (1-based). A dominant `h = 2` is the 180°-wraparound
+    /// signature: the decoded curve is invariant under `t ↦ t + ½`.
+    pub dominant_harmonic: Option<usize>,
+    /// `E_2 / E_1` — the classic second-harmonic diagnostic. `None` when `H <
+    /// 2` or `E_1 = 0`.
+    pub second_harmonic_ratio: Option<f64>,
     /// Coefficient of variation of the arc speed across active rows: `0` ⇒ a
     /// perfectly arc-length-uniform parameterisation, larger ⇒ the latent
     /// coordinate bunches the curve.
@@ -287,6 +304,41 @@ pub fn atom_geometry_entry_from_parts(
         speed2_w += w * speed * speed;
     }
 
+    // Harmonic spectrum of the decoded curve (periodic basis only): the basis
+    // rows pair up as (sin, cos) of each harmonic, so `E_h = ‖β_{2h−1}‖² +
+    // ‖β_{2h}‖²` is (twice) the harmonic-h mean-square energy under the uniform
+    // coordinate measure — a property of the fitted curve itself, independent of
+    // where the data sits on it.
+    let mut harmonic_energy_fractions = None;
+    let mut dominant_harmonic = None;
+    let mut second_harmonic_ratio = None;
+    if matches!(basis_kind, SaeAtomBasisKind::Periodic) && m >= 3 && m % 2 == 1 {
+        let h_max = (m - 1) / 2;
+        let mut energies = Vec::with_capacity(h_max);
+        for h in 1..=h_max {
+            let mut e_h = 0.0_f64;
+            for &row in &[2 * h - 1, 2 * h] {
+                let beta = decoder.slice(s![row, ..]);
+                e_h += beta.dot(&beta);
+            }
+            energies.push(e_h);
+        }
+        let total: f64 = energies.iter().sum();
+        if total > 0.0 {
+            let (dom_idx, _) = energies
+                .iter()
+                .enumerate()
+                .fold((0usize, f64::NEG_INFINITY), |acc, (i, &e)| {
+                    if e > acc.1 { (i, e) } else { acc }
+                });
+            dominant_harmonic = Some(dom_idx + 1);
+            if h_max >= 2 && energies[0] > 0.0 {
+                second_harmonic_ratio = Some(energies[1] / energies[0]);
+            }
+            harmonic_energy_fractions = Some(energies.iter().map(|e| e / total).collect());
+        }
+    }
+
     let mut entry = AtomGeometryEntry {
         name,
         topology: topology.clone(),
@@ -299,6 +351,9 @@ pub fn atom_geometry_entry_from_parts(
         nonlinearity: None,
         tangent_speed_mean: None,
         speed_cv: None,
+        harmonic_energy_fractions,
+        dominant_harmonic,
+        second_harmonic_ratio,
     };
 
     // Speeds need only a positive active mass.
@@ -510,12 +565,74 @@ mod tests {
             "circle nonlinearity ≈ ½, got {nl}"
         );
         assert!(!entry.is_effectively_linear());
+        // Pure first-harmonic curve: all Fourier energy on h = 1.
+        let fracs = entry
+            .harmonic_energy_fractions
+            .as_ref()
+            .expect("periodic atom carries a harmonic spectrum");
+        assert_eq!(fracs.len(), 1);
+        assert!((fracs[0] - 1.0).abs() < 1.0e-12);
+        assert_eq!(entry.dominant_harmonic, Some(1));
+        assert_eq!(entry.second_harmonic_ratio, None);
         // Constant-speed parameterisation ⇒ CV ≈ 0; speed = a·radius·1 = 2.
         assert!(
             entry.speed_cv.unwrap() < 1.0e-6,
             "circle arc speed is uniform"
         );
         assert!((entry.tangent_speed_mean.unwrap() - 2.0).abs() < 1.0e-6);
+    }
+
+    /// Mixed two-harmonic curve `γ(θ) = r₁·e₁(θ) ⊕ r₂·e₂(2θ)` on disjoint output
+    /// planes: the spectrum splits `E_h ∝ r_h²`, the 180°-wraparound harmonic
+    /// dominates when `r₂ > r₁`, and the second-harmonic ratio is `(r₂/r₁)²` —
+    /// the certified version of the InceptionV1 curve-detector harmonics.
+    #[test]
+    fn two_harmonic_curve_spectrum_splits_by_energy() {
+        let n = 96usize;
+        let m = 5usize;
+        let p = 4usize;
+        let (r1, r2) = (1.0_f64, 2.0_f64);
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jac = Array3::<f64>::zeros((n, m, 1));
+        for row in 0..n {
+            let theta = std::f64::consts::TAU * (row as f64) / (n as f64);
+            phi[[row, 0]] = 1.0;
+            phi[[row, 1]] = theta.sin();
+            phi[[row, 2]] = theta.cos();
+            phi[[row, 3]] = (2.0 * theta).sin();
+            phi[[row, 4]] = (2.0 * theta).cos();
+            jac[[row, 1, 0]] = theta.cos();
+            jac[[row, 2, 0]] = -theta.sin();
+            jac[[row, 3, 0]] = 2.0 * (2.0 * theta).cos();
+            jac[[row, 4, 0]] = -2.0 * (2.0 * theta).sin();
+        }
+        let mut dec = Array2::<f64>::zeros((m, p));
+        dec[[1, 0]] = r1;
+        dec[[2, 1]] = r1;
+        dec[[3, 2]] = r2;
+        dec[[4, 3]] = r2;
+        let masses = Array1::<f64>::ones(n);
+        let entry = atom_geometry_entry_from_parts(
+            "h2".into(),
+            &SaeAtomBasisKind::Periodic,
+            0.0,
+            phi.view(),
+            jac.view(),
+            dec.view(),
+            masses.view(),
+        );
+        let fracs = entry
+            .harmonic_energy_fractions
+            .as_ref()
+            .expect("periodic atom carries a harmonic spectrum");
+        assert_eq!(fracs.len(), 2);
+        let e1 = 2.0 * r1 * r1;
+        let e2 = 2.0 * r2 * r2;
+        assert!((fracs[0] - e1 / (e1 + e2)).abs() < 1.0e-12);
+        assert!((fracs[1] - e2 / (e1 + e2)).abs() < 1.0e-12);
+        assert_eq!(entry.dominant_harmonic, Some(2));
+        let ratio = entry.second_harmonic_ratio.expect("both harmonics carry energy");
+        assert!((ratio - (r2 / r1).powi(2)).abs() < 1.0e-12);
     }
 
     #[test]
