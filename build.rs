@@ -61,9 +61,8 @@ fn main() {
     assert_warnings_are_denied(&manifest_dir);
 
     // HARD ban (always fatal, independent of the demoted aggregate scanner
-    // below): no non-experiment tracked file may leak the absolute cluster
-    // scratch path segment or the SLURM batch directive keyword. Run first and
-    // exit(1) on any hit.
+    // below): no tracked file may leak the absolute cluster scratch path segment
+    // or the SLURM batch directive keyword. Run first and exit(1) on any hit.
     scan_for_cluster_infra_leaks(&manifest_dir);
 
     emit_python_penalty_manifest(&manifest_dir)
@@ -4061,21 +4060,18 @@ fn cluster_leak_needles() -> [String; 2] {
     [needle_a, needle_b]
 }
 
-/// HARD-FAIL ban: no git-tracked file outside `experiments/` (source OR not)
-/// may contain the absolute cluster scratch path segment or the SLURM batch
-/// directive keyword. These are cluster-local infra leaks (absolute compute-node
-/// paths + SLURM job directives) that must never be committed outside
-/// experiment artifacts. Scans only tracked text files (from the git index),
-/// skips binaries, and fails the build naming every offender. This is a
-/// separate, always-fatal gate — independent of the demoted aggregate
-/// ban-scanner below — so the leak can never ship outside `experiments/`.
+/// HARD-FAIL ban: no git-tracked file (source OR not) may contain the absolute
+/// cluster scratch path segment or the SLURM batch directive keyword. These are
+/// cluster-local infra leaks (absolute compute-node paths + SLURM job
+/// directives) that must never be committed — cluster/sbatch scripts live under
+/// /Users/user/, not in the repo. Scans only tracked text files (from the git
+/// index), skips binaries, and fails the build naming every offender. This is
+/// a separate, always-fatal gate — independent of the demoted aggregate
+/// ban-scanner below — so the leak can never ship.
 fn scan_for_cluster_infra_leaks(root: &Path) {
     let needles = cluster_leak_needles();
     let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     for rel in collect_repo_files(root) {
-        if rel.starts_with("experiments") {
-            continue;
-        }
         let path = root.join(rel);
         let content = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -4101,9 +4097,9 @@ fn scan_for_cluster_infra_leaks(root: &Path) {
     }
     eprintln!(
         "\n=== BANNED cluster/SLURM INFRA LEAK in tracked file(s) ===\n\
-         No tracked file outside experiments/ may contain the absolute cluster scratch path segment or the \
+         No tracked file may contain the absolute cluster scratch path segment or the \
          SLURM batch directive keyword. These are cluster-local infra leaks; cluster/sbatch \
-         scripts outside experiments/ belong under /Users/user/, not in the repo. Offenders:"
+         scripts belong under /Users/user/, not in the repo. Offenders:"
     );
     for (rel, lineno, needle) in &offenders {
         eprintln!(
