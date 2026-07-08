@@ -325,7 +325,22 @@ impl SaeReconstructionRowProgram {
                     exps.push(ej);
                 }
                 let inv = recip(&denom);
-                exps.iter().map(|e| e.mul(&inv)).collect()
+                // The SAME fixed-gate override the per-atom `gate_tower` applies
+                // (#1026/#1033): a pinned atom's gate is a CONSTANT (the active-
+                // routing value, every derivative channel zero) and must not
+                // re-derive from the softmax — including the cross-sensitivity to
+                // OTHER atoms' free logits it would otherwise pick up through the
+                // shared denominator. Free atoms keep the pinned atom's exp in
+                // their denominator exactly as `gate_tower` does (it enters as a
+                // constant, `logit_slot` is `None` for a fixed logit), so free
+                // gates are bit-identical between the two paths and this override
+                // restores bit-identity for the pinned gates too.
+                (0..n)
+                    .map(|atom| {
+                        self.fixed_gate::<K, S>(atom)
+                            .unwrap_or_else(|| exps[atom].mul(&inv))
+                    })
+                    .collect()
             }
             // Per-atom logistic gates are independent (each depends only on its
             // own logit); there is no shared denominator to hoist, so this is the
