@@ -224,8 +224,9 @@ impl IBPAssignmentPenalty {
     /// differentiates — the rank-one/`s'` pieces by the per-column `s'>0`, the
     /// diagonal/`s·c` pieces by the per-slot `s·c>0`. This is the metric-first
     /// consistency partner of the assembly's `ibp_psd_majorized_hdiag` + clamped
-    /// Woodbury `d`, so under low-rank whitening the θ-adjoint/ρ-trace
-    /// differentiate the SAME majorized operator the evidence log-det factors.
+    /// Woodbury `d`; the majorization is UNCONDITIONAL (#2144/#1038), so the
+    /// θ-adjoint/ρ-trace differentiate the SAME majorized operator the evidence
+    /// log-det factors on every IBP path.
     #[must_use]
     pub fn hessian_diag_logit_third_channels(
         &self,

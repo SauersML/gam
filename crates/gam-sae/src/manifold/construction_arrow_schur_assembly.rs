@@ -642,20 +642,25 @@ impl SaeManifoldTerm {
         // (`rank == p`) and no-metric paths keep `low_rank_whiten == false` and
         // are bit-for-bit unchanged.
         let low_rank_whiten = whitens_likelihood && w_dim < p;
-        // #2144 — under a low-rank whitening metric, PSD-majorize the IBP
-        // assignment-prior curvature (see `ibp_psd_majorized_hdiag`) so the per-row
-        // `H_tt` and the cross-row Woodbury capacitance stay PD and the undamped
-        // evidence log-det is defined. `None` on every non-IBP mode (the third
-        // channels only exist for IBP-MAP) and whenever the metric is full-rank, so
-        // the identity/no-metric assembly is bit-identical.
+        // #2144/#1038 — PSD-majorize the IBP assignment-prior curvature
+        // UNCONDITIONALLY (see `ibp_psd_majorized_hdiag`), exactly as softmax's
+        // Gershgorin majorizer (#1419) and ARD's `max(V'',0)` already are. The raw
+        // IBP pieces (`w·s'` rank-one, `w·s·c` diagonal) are not sign-definite, so
+        // the raw operator's cross-row capacitance `C = I + D·M` goes indefinite by
+        // design on weakly-identified fits — `log|H|` is then not a Laplace
+        // normalizer at all (det H < 0), the outer-ρ criterion is undefined along
+        // parts of the ρ-path, and the FD gates measure a desync (#2087). The
+        // majorized operator keeps `D ⪰ 0` hence `det C ≥ 1` — the evidence is
+        // defined EVERYWHERE — and the Newton metric is PSD, which removes the
+        // undamped step-divergence mode on indefinite fixtures. The prior's exact
+        // GRADIENT is untouched, so stationary points do not move; the ρ-trace and
+        // θ-adjoint differentiate this SAME majorized operator (their sites clamp
+        // identically), keeping value/trace/adjoint on one branch. `None` on every
+        // non-IBP mode (the third channels only exist for IBP-MAP).
         // RAW channels: `ibp_psd_majorized_hdiag` and the source-`d` clamp below do
         // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
         // un-majorized channel set.
-        let ibp_majorizer = if low_rank_whiten {
-            ibp_assignment_third_channels(&self.assignment, rho, false)?
-        } else {
-            None
-        };
+        let ibp_majorizer = ibp_assignment_third_channels(&self.assignment, rho, false)?;
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
         // output channels and identical in each: with the flat β layout
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
@@ -2384,18 +2389,14 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            // #2144: under a low-rank whitening metric, clamp the rank-one
-            // coefficient `d_k = w·s'_k` to its positive part — the SAME
-            // `max(w·s',0)` the per-row diagonal majorizer (`ibp_psd_majorized_hdiag`)
-            // uses. The source's `d` drives BOTH the self-term downdate and the
-            // rank-one re-add, so the clamped `d` keeps `H₀'`'s diagonal at
-            // `max(w·s·c,0) ⪰ 0` and the capacitance `C = I + D·Uᵀ H₀'⁻¹ U ⪰ I`
-            // PD — one operator. Full-rank / no-metric paths keep the exact `d`.
-            let d = if low_rank_whiten {
-                channels.cross_row_d.mapv(|x| x.max(0.0))
-            } else {
-                channels.cross_row_d.clone()
-            };
+            // #2144/#1038: clamp the rank-one coefficient `d_k = w·s'_k` to its
+            // positive part UNCONDITIONALLY — the SAME `max(w·s',0)` the per-row
+            // diagonal majorizer (`ibp_psd_majorized_hdiag`) uses. The source's `d`
+            // drives BOTH the self-term downdate and the rank-one re-add, so the
+            // clamped `d` keeps `H₀'`'s diagonal at `max(w·s·c,0) ⪰ 0` and the
+            // capacitance `C = I + D·Uᵀ H₀'⁻¹ U ⪰ I` PD — one operator, evidence
+            // log-det defined at every ρ (the streaming value reads THIS `d` too).
+            let d = channels.cross_row_d.mapv(|x| x.max(0.0));
             let source = IbpCrossRowSource {
                 r: k_atoms,
                 d,

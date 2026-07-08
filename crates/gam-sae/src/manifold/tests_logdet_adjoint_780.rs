@@ -366,23 +366,23 @@ fn ibp_sparse_rho_derivative_matrix_2156(
     let mut channels = ibp_assignment_third_channels(&term.assignment, rho, false)
         .expect("IBP channels")
         .expect("IBP sparse derivative requires IBP channels");
-    if term.ibp_low_rank_whiten() {
-        for row in 0..term.n_obs() {
-            for atom in 0..k_atoms {
-                let slot = row * k_atoms + atom;
-                hdiag[slot] = ibp_majorized_hdiag_2156(
-                    &channels,
-                    row,
-                    k_atoms,
-                    atom,
-                    hdiag[slot],
-                );
-            }
-        }
+    // #2144/#1038: the production assembly PSD-majorizes the IBP curvature
+    // UNCONDITIONALLY, so this mirror does too.
+    for row in 0..term.n_obs() {
         for atom in 0..k_atoms {
-            if channels.cross_row_d[atom] < 0.0 {
-                channels.cross_row_d[atom] = 0.0;
-            }
+            let slot = row * k_atoms + atom;
+            hdiag[slot] = ibp_majorized_hdiag_2156(
+                &channels,
+                row,
+                k_atoms,
+                atom,
+                hdiag[slot],
+            );
+        }
+    }
+    for atom in 0..k_atoms {
+        if channels.cross_row_d[atom] < 0.0 {
+            channels.cross_row_d[atom] = 0.0;
         }
     }
 
@@ -689,8 +689,9 @@ fn install_low_rank_ibp_metric_2156(term: &mut SaeManifoldTerm) {
     term.set_row_metric(RowMetric::behavioral_fisher(Arc::new(u), p, s).expect("row metric"))
         .expect("install low-rank metric");
     assert!(
-        term.ibp_low_rank_whiten(),
-        "rank-{s} metric on p={p} must engage the low-rank IBP majorizer"
+        term.row_metric()
+            .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < p),
+        "rank-{s} metric on p={p} must be a genuinely rank-deficient whitening metric"
     );
 }
 
@@ -796,7 +797,7 @@ fn ibp_logalpha_dual_channel_report_2156(
         let mut jets = term
             .row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)
             .expect("IBP row jets");
-        if term.ibp_low_rank_whiten() {
+        if term.whiten_logdet_row_jets() {
             whiten_row_jets_for_low_rank_metric_2156(term, row, &mut jets);
         }
         let var_atom: Vec<usize> = jets
@@ -839,19 +840,18 @@ fn ibp_logalpha_dual_channel_report_2156(
     let mut channels = ibp_assignment_third_channels(&term.assignment, rho, false)
         .expect("IBP channels")
         .expect("IBP channels present");
-    if term.ibp_low_rank_whiten() {
-        for row in 0..term.n_obs() {
-            for atom in 0..k_atoms {
-                let slot = row * k_atoms + atom;
-                hdiag[slot] =
-                    ibp_majorized_hdiag_2156(&channels, row, k_atoms, atom, hdiag[slot]);
-            }
-        }
+    // #2144/#1038: unconditional PSD majorization, mirroring production.
+    for row in 0..term.n_obs() {
         for atom in 0..k_atoms {
-            if channels.cross_row_d[atom] < 0.0 {
-                channels.cross_row_d[atom] = 0.0;
-                channels.cross_row_d_logalpha[atom] = 0.0;
-            }
+            let slot = row * k_atoms + atom;
+            hdiag[slot] =
+                ibp_majorized_hdiag_2156(&channels, row, k_atoms, atom, hdiag[slot]);
+        }
+    }
+    for atom in 0..k_atoms {
+        if channels.cross_row_d[atom] < 0.0 {
+            channels.cross_row_d[atom] = 0.0;
+            channels.cross_row_d_logalpha[atom] = 0.0;
         }
     }
 
@@ -1185,7 +1185,10 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     let low_rank_certificate =
         BranchCertificate::from_arrow_cache(&ibp_cache, MajorizerAnchorMode::FrozenAnchor);
     assert!(
-        ibp_term.ibp_low_rank_whiten() && low_rank_certificate.cross_row_woodbury_rank > 0,
+        ibp_term
+            .row_metric()
+            .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < ibp_term.output_dim())
+            && low_rank_certificate.cross_row_woodbury_rank > 0,
         "IBP parity fixture must exercise the low-rank metric and IBP Woodbury branch; \
          certificate={low_rank_certificate:?}"
     );
@@ -2000,16 +2003,16 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
     }
 }
 
-/// gam#2144 consistency: under a RANK-DEFICIENT whitening metric the assembly
-/// PSD-majorizes the IBP curvature (`ibp_psd_majorized_hdiag` + clamped Woodbury
-/// `d`), so the θ-adjoint must differentiate that SAME majorized operator. This is
-/// the metric-first analogue of `..._ibp_map`: install a rank-2 BehavioralFisher
-/// metric (`s = 2 < p = 3`, so `ibp_low_rank_whiten()` engages) on the IBP tiny
+/// gam#2144/#1038 consistency: the assembly PSD-majorizes the IBP curvature
+/// (`ibp_psd_majorized_hdiag` + clamped Woodbury `d`) UNCONDITIONALLY, so the
+/// θ-adjoint must differentiate that SAME majorized operator. This is the
+/// metric-first analogue of `..._ibp_map`: install a rank-2 BehavioralFisher
+/// metric (`s = 2 < p = 3`, a genuinely rank-deficient whitening) on the IBP tiny
 /// fixture and check the analytic `Γ` matches the fixed-state dense FD of `log|H|`
 /// — both flow through the majorized assembly (`fixed_state_logdet` rebuilds the
-/// SAME majorized `H`). The current FD adjoint tests use NO metric, so this is the
-/// only guard that the majorized θ-adjoint channels agree with the majorized
-/// evidence log-det; without the gam#2144 contraction gating it disagrees.
+/// SAME majorized `H`). This guards the majorized θ-adjoint channels against the
+/// majorized evidence log-det in the whitened+rank-deficient regime, where the
+/// whitened data curvature cannot dominate the raw indefinite prior pieces.
 #[test]
 pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_low_rank_metric_2144() {
     use gam_problem::{RowMetric, pack_probe_factors};
@@ -2039,8 +2042,9 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_low_rank_metric_2144
     term.set_row_metric(RowMetric::behavioral_fisher(Arc::new(u), p, s).unwrap())
         .unwrap();
     assert!(
-        term.ibp_low_rank_whiten(),
-        "rank-{s} metric on p={p} must engage the gam#2144 low-rank IBP majorizer"
+        term.row_metric()
+            .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < p),
+        "rank-{s} metric on p={p} must be a genuinely rank-deficient whitening metric"
     );
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
@@ -2109,8 +2113,8 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144
     let p = term.output_dim();
     // Full-rank (rank == p) DIAGONAL non-identity whitening factor U = diag(d).
     // M_n = U Uᵀ = diag(d²) is genuinely non-identity, so the whitened Jacobian
-    // Jᵀ U Uᵀ J ≠ JᵀJ, yet the metric has NO null space — `ibp_low_rank_whiten()`
-    // is false while `whiten_logdet_row_jets()` is true.
+    // Jᵀ U Uᵀ J ≠ JᵀJ, yet the metric has NO null space — whitening engages with
+    // no rank-deficiency in play.
     let d = [1.0_f64, 2.0, 1.5];
     assert_eq!(p, d.len(), "diagonal whitening factor width must equal p");
     let s = p;
@@ -2127,20 +2131,17 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144
         "full-rank whitening metric must whiten the log-det row jets"
     );
     assert!(
-        !term.ibp_low_rank_whiten(),
-        "rank-{s} == p={p} metric must NOT engage the low-rank IBP majorizer"
+        term.row_metric().is_some_and(|m| m.metric_rank() == p),
+        "rank-{s} == p={p} metric must be genuinely full-rank (this test discriminates \
+         jet whitening from rank-deficiency handling)"
     );
-    // Full-rank whitening does NOT engage the low-rank PSD majorizer
-    // (`ibp_low_rank_whiten() == false`), so the fixed-alpha `ibp_map` joint
-    // Hessian is un-majorized and shares the #1416 non-PD landscape: at
-    // `log_lambda_sparse = 0.5` (the level the low-rank sibling can use because
-    // its majorizer keeps the IBP curvature PD) the reduced Schur complement is
-    // indefinite and setup fails. Sit in the same PD island #1416 uses
-    // (`ρ_sparse ∈ [−1.0, −0.4]`, interior `−0.8`); the diagonal whitening only
-    // amplifies the data curvature there (channel-1 gets `d² = 4×`), so the
-    // island stays solidly PD while `Jᵀ U Uᵀ J ≠ JᵀJ` still discriminates the
-    // whitened row jets from the raw (unpatched) ones. Setup fix only — no
-    // tolerance weakened.
+    // #2144/#1038: the IBP PSD majorization is now UNCONDITIONAL (any rank, any
+    // metric), so the joint Hessian here is the majorized operator too — the
+    // historical #1416 non-PD landscape at `log_lambda_sparse = 0.5` no longer
+    // exists. Keep the historical PD-island level `−0.8` for continuity (the
+    // discriminating property of this test is unchanged either way:
+    // `Jᵀ U Uᵀ J ≠ JᵀJ` separates whitened row jets from raw ones, which is
+    // what the fixed-state FD comparison pins).
     rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
         .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
