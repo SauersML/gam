@@ -158,8 +158,8 @@ html = model.report()             # returns the HTML string
 ```
 
 The report is a self-contained HTML document containing the summary
-table, coefficient table, and EDF-by-block table rendered by
-`src/report.rs`. Python `Model.report()` currently omits data-dependent
+table, coefficient table, and EDF-by-block table rendered by the
+`gam-report` crate (`crates/gam-report/src/lib.rs`). Python `Model.report()` currently omits data-dependent
 diagnostics and smooth plots. The HTML is also used as `Model._repr_html_`
 for notebook display.
 

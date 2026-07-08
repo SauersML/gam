@@ -24,13 +24,13 @@ import gamfit; CUDA probing happens lazily at runtime.
 
 ## Accelerated Paths
 
-`src/solver/gpu/pirls_gpu.rs` owns the dense PIRLS Newton step. It uploads the dense design and working weights through pinned host buffers, scales rows with cuBLAS `Ddgmm`, forms `X'WX` with cuBLAS `Dgemm`, adds the penalty Hessian with cuBLAS `Dgeam`, and factors the penalized Hessian with cuSOLVER `Dpotrf`. Newton directions use cuSOLVER `Dpotrs`; the log determinant is read from the Cholesky diagonal.
+`crates/gam-solve/src/gpu/pirls_gpu.rs` owns the dense PIRLS Newton step. It uploads the dense design and working weights through pinned host buffers, scales rows with cuBLAS `Ddgmm`, forms `X'WX` with cuBLAS `Dgemm`, adds the penalty Hessian with cuBLAS `Dgeam`, and factors the penalized Hessian with cuSOLVER `Dpotrf`. Newton directions use cuSOLVER `Dpotrs`; the log determinant is read from the Cholesky diagonal.
 
-`src/solver/gpu/reml_gpu.rs` owns dense REML evidence derivatives. It computes `log|H|` from the same cuSOLVER Cholesky path and evaluates score terms as `0.5 * tr(H^-1 dH/drho)` by solving multi-RHS systems on the device.
+`crates/gam-solve/src/gpu/reml_gpu.rs` owns dense REML evidence derivatives. It computes `log|H|` from the same cuSOLVER Cholesky path and evaluates score terms as `0.5 * tr(H^-1 dH/drho)` by solving multi-RHS systems on the device.
 
-`src/solver/gpu/arrow_schur_gpu.rs` owns the arrow-Schur latent-coordinate CUDA helpers. Dense Direct/SqrtBA solves use CUDA row-block Cholesky, Schur accumulation into the shared beta block, cuSOLVER for the reduced beta step, and row-local GPU back-substitution. Large matrix-free systems use the GPU Schur matvec hook instead of forming a dense shared beta factor.
+`crates/gam-solve/src/gpu/arrow_schur_gpu.rs` owns the arrow-Schur latent-coordinate CUDA helpers. Dense Direct/SqrtBA solves use CUDA row-block Cholesky, Schur accumulation into the shared beta block, cuSOLVER for the reduced beta step, and row-local GPU back-substitution. Large matrix-free systems use the GPU Schur matvec hook instead of forming a dense shared beta factor.
 
-`src/families/bms/gpu/` owns the Bernoulli marginal-slope FLEX
+`crates/gam-models/src/bms/gpu/` owns the Bernoulli marginal-slope FLEX
 row-primary Hessian assembly. When
 `row_primary_hessian_decision(n, r).use_gpu` is true and the latent
 measure is standard-normal, the BMS row path packs per-row cell
@@ -42,7 +42,7 @@ writes the symmetric row Hessian back to host-pinned storage.
 
 ## Dispatch
 
-CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` probes lazily at runtime whether a CUDA device is available. The probe also discovers every usable CUDA device into a pool (`src/gpu/pool.rs`, `scatter_batched` / `balanced_partition`), so multi-GPU work is fanned across devices by score.
+CUDA is not behind a Cargo feature gate in this crate; `cudarc` is linked with `fallback-dynamic-loading`, and `GpuRuntime::global()` probes lazily at runtime whether a CUDA device is available. The probe also discovers every usable CUDA device into a pool (`crates/gam-gpu/src/pool.rs`, `scatter_batched` / `balanced_partition`), so multi-GPU work is fanned across devices by score.
 
 ```toml
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
@@ -88,4 +88,4 @@ Each benchmark builds deterministic large-scale-shaped synthetic inputs and repo
 
 ## Numerical Stability
 
-`tests/gpu_numerical_stability.rs` compares CPU and CUDA outputs across more than 20 deterministic SPD/PIRLS/REML cases when CUDA is available. The asserted tolerance is `1e-8` relative-or-absolute for Hessians, directions, log determinants, and REML score components.
+`tests/arrow_gpu/gpu/gpu_numerical_stability.rs` compares CPU and CUDA outputs across more than 20 deterministic SPD/PIRLS/REML cases when CUDA is available. The asserted tolerance is `1e-8` relative-or-absolute for Hessians, directions, log determinants, and REML score components.

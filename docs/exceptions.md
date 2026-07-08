@@ -7,7 +7,8 @@ from `ValueError`; the Rust extension unavailable case remains an
 
 ## Hierarchy
 
-The classes are defined in Rust (`crates/gam-pyffi/src/ffi_errors.rs`,
+The classes are defined in Rust (`crates/gam-pyffi/src/ffi/ffi_errors.rs`,
+with a few geometry classes in `crates/gam-pyffi/src/manifold/geometry_ffi.rs`,
 via `pyo3::create_exception!`) and re-exported from `gamfit` by
 `gamfit/_exceptions.py`. `GamError` is the umbrella base for every
 engine error and itself inherits from `ValueError`; the only exception

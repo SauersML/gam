@@ -71,7 +71,7 @@ reps = model.posterior_predict(train_df, n_draws=200, seed=42)
 
 ## Sampler dispatch
 
-The dispatch is in `src/inference/sample.rs::sample_saved_model`:
+The dispatch is in `crates/gam-inference/src/sample.rs::sample_saved_model`:
 
 | Model class | Sampler |
 | --- | --- |
@@ -252,7 +252,7 @@ uses the R-hat threshold only. If a NUTS run looks unhealthy:
 
 ## Default sampling parameters
 
-`NutsConfig::for_dimension` in `src/inference/hmc.rs` derives defaults
+`NutsConfig::for_dimension` in `crates/gam-inference/src/hmc_io.rs` derives defaults
 from the coefficient count `p`:
 
 | Parameter | Rule |

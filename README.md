@@ -339,8 +339,9 @@ install a torch build whose CUDA suffix matches (`+cu12x`).
 
 | Path | Contents |
 | --- | --- |
-| `src/` | Rust engine: fitting, inference, smooth construction, survival, CLI. |
+| `crates/gam-*/` | Rust engine, split across ~20 workspace crates: fitting/solve (`gam-solve`), inference (`gam-inference`), families/models (`gam-models`, `gam-model-api`), smooth construction (`gam-terms`, `gam-geometry`), manifold SAE (`gam-sae`), prediction (`gam-predict`), GPU (`gam-gpu`), reports (`gam-report`), CLI (`gam-cli`), and more. |
 | `crates/gam-pyffi/` | PyO3 bindings (`gamfit._rust`). |
+| `src/` | Thin workspace-root shell (`lib.rs`, shared types, macros) over the crates. |
 | `gamfit/` | Python public API on top of the bindings. |
 | `docs/` | MkDocs/Material documentation sources. |
 | `tests/` | Rust and Python integration tests. |
