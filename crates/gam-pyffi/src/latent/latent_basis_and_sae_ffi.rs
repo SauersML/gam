@@ -2384,8 +2384,8 @@ fn sae_manifold_fit<'py>(
     // atomic setter (or the compiled default). See `SaeManifoldTerm::set_fit_config`.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — opt-in count of extra whitened-residual structured-alternation
-    // passes (default 0 = historical iid-only path, bit-for-bit).
+    // #2021 — count of extra whitened-residual structured-alternation passes
+    // (default 2: production whitens; 0 restores the historical iid-only path).
     structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
