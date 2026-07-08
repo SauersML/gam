@@ -674,18 +674,31 @@ fn kappa_micro_2point_n_independence() {
     }
 }
 
-#[test]
-fn kappa_outer_loop_is_n_independent() {
+/// One rung of the #1033 n-independence acceptance gate at a fixed `n`.
+///
+/// This is the per-`n` body factored out of the former monolithic
+/// `kappa_outer_loop_is_n_independent`, so each rung can be its own `#[test]`
+/// case with its OWN nextest slow-timeout budget. Structurally the old
+/// single-`#[test]` ran a warm fit plus THREE full iso-κ fits (n=1k/4k/16k)
+/// serially; on a shared node the 16k rung alone could push the whole function
+/// past nextest's 600s SIGKILL, so the DETERMINISTIC `touches == 0` assertion
+/// was structurally unreachable in the standard shard. Splitting per-`n` does
+/// NOT weaken anything: every hard assertion below was already applied inside a
+/// PER-`n` loop (`non_rotation_resets == 0`, `slow_path_resets <= CAP`,
+/// `touches == 0`, `calls > 0`) — there was NO asserted cross-`n` quantity. The
+/// old cross-`n` per-callback wall-clock ratio was report-only `eprintln!`, and
+/// is preserved (still report-only) in
+/// `kappa_outer_loop_is_n_independent_fast_ladder`.
+fn assert_kappa_n_free_at(n: usize) {
     // ISOTROPIC path (`aniso=false`, `aniso_log_scales=None`): the single
     // design-moving coordinate ψ=log κ on a Gaussian-identity fit — exactly the
     // `PsiGramTensor` eligibility (`coord_dim==1` ∧ Gaussian + identity). The
     // tensor auto-installs over the optimizer's ψ window, so every in-window
     // trial's `XᵀWX(ψ)`/`XᵀWz(ψ)` and ψ-gradient come from the k-space Chebyshev
-    // representation rather than an O(n) design re-stream. The aniso path
-    // (placeholder in the original draft) routes the per-axis optimizer that
-    // bypasses the tensor entirely, so it would NOT measure this lane. Now that
-    // the iso-1D κ outer converges across n (#1053/#1066/#1069 fixed, calibrated
-    // n-scaled profiled REML), this is the measurement path.
+    // representation rather than an O(n) design re-stream. The aniso path routes
+    // the per-axis optimizer that bypasses the tensor entirely, so it would NOT
+    // measure this lane. Now that the iso-1D κ outer converges across n
+    // (#1053/#1066/#1069 fixed), this is the measurement path.
     let (aniso, bounds) = (false, (1e-2, 1e2));
     let warm = run_fit(1000, true, aniso, bounds).unwrap_or_else(|reason| {
         panic!(
@@ -695,123 +708,48 @@ fn kappa_outer_loop_is_n_independent() {
         )
     });
     eprintln!(
-        "[kappa-n-scaling] warm-up fit primed caches in {:.4}s",
+        "[kappa-n-scaling] n={n} warm-up fit primed caches in {:.4}s",
         warm.wall_s
     );
 
-    // #1033 acceptance sweep. Historically 1e3 → 320k, because the OLD gate read
-    // a noisy per-callback WALL-CLOCK ratio that only rose above shared-node
-    // timing jitter across a ~320× n lever — and that 320k rung took ~2.2 h to
-    // run (the O(n) loop is itself what made the large-n rungs slow). The gate is
-    // now the DETERMINISTIC `nfree_skip_row_touches` counter (an exact integer
-    // that must be 0 at every n; see the assertion below), so a large-n lever is
-    // no longer needed to discriminate O(n) from O(1): an integer that must be 0
-    // cannot hide a linear term behind a small constant, and 2 points already pin
-    // n-independence exactly. The ladder is kept multi-point only to ALSO exercise
-    // the report-only wall-clock trend and the slow-path-reset soundness gate at
-    // a real (16×) scale, while completing in seconds instead of hours.
-    let ns = [1_000usize, 4_000, 16_000];
-    let mut kappa_phase = Vec::with_capacity(ns.len());
-    let mut kappa_calls = Vec::with_capacity(ns.len());
-    let mut kappa_resets = Vec::with_capacity(ns.len());
-    let mut kappa_skip_touches = Vec::with_capacity(ns.len());
-    let mut kappa_timings = Vec::with_capacity(ns.len());
-
+    let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+    let timing = kappa.kappa_timing.unwrap();
+    let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
+    let calls = timing.cost_calls + timing.eval_calls + timing.efs_calls;
     eprintln!(
-        "[kappa-n-scaling] {:>9}  {:>10}  {:>12}  {:>12}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9}  {:>9}  {:>9}",
-        "n",
-        "t_kappa_s",
-        "kappa_sum_s",
-        "callback_s",
-        "resets",
-        "revs",
-        "cost",
-        "eval",
-        "efs",
-        "cost_s",
-        "eval_s",
-        "efs_s"
+        "[kappa-n-scaling-touch] n={n} nfree_skip_row_touches={} (÷n={:.3}) calls={} per_callback_touches={:.3}",
+        timing.nfree_skip_row_touches,
+        timing.nfree_skip_row_touches as f64 / n as f64,
+        calls,
+        if calls == 0 {
+            0.0
+        } else {
+            timing.nfree_skip_row_touches as f64 / calls as f64
+        },
     );
-    for &n in &ns {
-        let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
-        let timing = kappa.kappa_timing.unwrap();
-        let phase = timing.trial_total_s().max(0.0);
-        let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
-        let calls = timing.cost_calls + timing.eval_calls + timing.efs_calls;
-        kappa_phase.push(phase);
-        kappa_calls.push(calls);
-        kappa_resets.push(timing.slow_path_resets);
-        kappa_skip_touches.push(timing.nfree_skip_row_touches);
-        kappa_timings.push(timing);
-        eprintln!(
-            "[kappa-n-scaling-touch] n={n} nfree_skip_row_touches={} (÷n={:.3}) calls={} per_callback_touches={:.3}",
-            timing.nfree_skip_row_touches,
-            timing.nfree_skip_row_touches as f64 / n as f64,
-            calls,
-            if calls == 0 {
-                0.0
-            } else {
-                timing.nfree_skip_row_touches as f64 / calls as f64
-            },
-        );
-        eprintln!(
-            "[kappa-n-scaling] {n:>9}  {:>10.4}  {:>12.4}  {:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
-            kappa.wall_s,
-            timing.trial_total_s(),
-            callback_avg,
-            timing.slow_path_resets,
-            timing.design_revision_delta,
-            timing.cost_calls,
-            timing.eval_calls,
-            timing.efs_calls,
-            timing.cost_total_s,
-            timing.eval_total_s,
-            timing.efs_total_s
-        );
-        eprintln!(
-            "[kappa-n-scaling-miss] n={n} shape={} value={} gradient={} penalty={} revision={} second_order={} other={}",
-            timing.nfree_miss_shape,
-            timing.nfree_miss_value,
-            timing.nfree_miss_gradient,
-            timing.nfree_miss_penalty,
-            timing.nfree_miss_revision,
-            timing.nfree_miss_second_order,
-            timing.nfree_miss_other,
-        );
-    }
-
-    // #1033 acceptance is PER-CALLBACK k-only cost, not summed wall-time. The
-    // architectural invariant the issue states is: "the rho/kappa/psi outer loop
-    // manipulates only k×k objects (O(k³) per trial = microseconds)". A SUMMED
-    // total (count × per-call) can stay bounded while each call is still O(n), or
-    // grow merely because the optimizer took more (cheap) steps — neither tells
-    // us whether a callback touches only k-dim objects. The honest discriminant
-    // is the AVERAGE callback cost: it must stay flat as n grows, since a single
-    // n-free trial costs O(D²k³) regardless of n. So the asserted quantity is the
-    // per-callback average, decomposed below.
-    let callback_avg: Vec<f64> = kappa_phase
-        .iter()
-        .zip(&kappa_calls)
-        .map(|(&total, &calls)| {
-            if calls == 0 {
-                0.0
-            } else {
-                total / calls as f64
-            }
-        })
-        .collect();
-    let first_cb = callback_avg.first().copied().unwrap_or(0.0).max(1e-6);
-    let last_cb = callback_avg.last().copied().unwrap_or(0.0).max(1e-6);
-    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 320
-    let cb_ratio = last_cb / first_cb;
-    // Summed total reported for context (the OLD, weaker metric) — not asserted.
-    let first_sum = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
-    let last_sum = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
     eprintln!(
-        "[kappa-n-scaling] n grew {n_ratio:.0}× ; PER-CALLBACK avg grew {cb_ratio:.2}× \
-         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) ; summed-total grew {:.2}× (context only)",
-        last_sum / first_sum
+        "[kappa-n-scaling] n={n:>9}  t_kappa={:>10.4}  kappa_sum={:>12.4}  callback={:>12.6}  \
+         resets={:>4}  revs={:>4}  cost={:>4}  eval={:>4}  efs={:>4}",
+        kappa.wall_s,
+        timing.trial_total_s(),
+        callback_avg,
+        timing.slow_path_resets,
+        timing.design_revision_delta,
+        timing.cost_calls,
+        timing.eval_calls,
+        timing.efs_calls,
     );
+    eprintln!(
+        "[kappa-n-scaling-miss] n={n} shape={} value={} gradient={} penalty={} revision={} second_order={} other={}",
+        timing.nfree_miss_shape,
+        timing.nfree_miss_value,
+        timing.nfree_miss_gradient,
+        timing.nfree_miss_penalty,
+        timing.nfree_miss_revision,
+        timing.nfree_miss_second_order,
+        timing.nfree_miss_other,
+    );
+
     // SOUNDNESS GATE (n-independence of the exact-lane fallback COUNT): the
     // n-free skip must actually fire for essentially every trial. The only
     // permitted exact-lane fallbacks are the bounded, correctness-mandated #1264
@@ -819,66 +757,75 @@ fn kappa_outer_loop_is_n_independent() {
     // (observed 0–4 across n=1k–16k), NOT the per-callback O(n) synthesis (pinned
     // to zero by the `nfree_skip_row_touches` gate below). A fallback of any
     // OTHER kind, or a count above the n-independent cap, means the skip is not
-    // firing. This replaces the old `resets_last <= resets_first + 2` flat-reset
-    // assumption, which was false for the production rotating-Duchon geometry the
-    // fixture exercises (see `NFREE_ROTATION_FALLBACK_CAP`).
-    for (&n, timing) in ns.iter().zip(&kappa_timings) {
-        assert_eq!(
-            non_rotation_resets(timing),
-            0,
-            "n={n}: {} non-rotation skip miss(es) (shape/grad/pen/rev/2nd/other) — the #1033 \
-             n-free skip fell through for a reason other than a #1264 basis rotation; the skip \
-             logic is broken, not merely paying the bounded rotation fallback",
-            non_rotation_resets(timing),
-        );
-        assert!(
-            timing.slow_path_resets <= NFREE_ROTATION_FALLBACK_CAP,
-            "n={n}: slow_path_resets={} exceeds the bounded #1264 basis-rotation cap \
-             ({NFREE_ROTATION_FALLBACK_CAP}) — every moved-ψ trial is re-entering the O(n) \
-             reset_surface lane (a disarmed skip resets on ≈every κ trial), so the per-callback \
-             cost cannot be n-independent",
-            timing.slow_path_resets,
-        );
-    }
-    // #1868 DETERMINISTIC n-independence bar (replaces the old wall-clock
-    // `cb_ratio <= 8×` gate, which was noisy enough to need a 320× n lever and a
-    // ~2.2 h 320k rung to surface the regression). `nfree_skip_row_touches` is the
+    // firing.
+    assert_eq!(
+        non_rotation_resets(&timing),
+        0,
+        "n={n}: {} non-rotation skip miss(es) (shape/grad/pen/rev/2nd/other) — the #1033 \
+         n-free skip fell through for a reason other than a #1264 basis rotation; the skip \
+         logic is broken, not merely paying the bounded rotation fallback",
+        non_rotation_resets(&timing),
+    );
+    assert!(
+        timing.slow_path_resets <= NFREE_ROTATION_FALLBACK_CAP,
+        "n={n}: slow_path_resets={} exceeds the bounded #1264 basis-rotation cap \
+         ({NFREE_ROTATION_FALLBACK_CAP}) — every moved-ψ trial is re-entering the O(n) \
+         reset_surface lane (a disarmed skip resets on ≈every κ trial), so the per-callback \
+         cost cannot be n-independent",
+        timing.slow_path_resets,
+    );
+    // #1868 DETERMINISTIC n-independence bar. `nfree_skip_row_touches` is the
     // exact integer count of length-`n` row-element touches the Gaussian inner
     // synthesis performed on the #1033 n-free κ-trial skip path. The
     // architectural invariant — "each in-window hyperparameter trial touches only
     // k×k objects" — is literally `touches == 0`, at every n. Together with the
     // slow-path-reset soundness gate above (which certifies the *design*
     // re-realization O(n) lane also stayed off), this pins BOTH O(n) lanes of the
-    // κ trial to zero deterministically:
-    //   • reset_surface / design re-realization  → `slow_path_resets` flat, and
-    //   • stale-row inner synthesis (offset/y/w + working-weight derivs + owned
-    //     PirlsResult row fields)                → `nfree_skip_row_touches == 0`.
-    // A non-zero, n-scaling touch count is exactly the #1868 O(n)-per-callback
-    // regression. This is strictly stronger than the timing ratio (exact, not
+    // κ trial to zero deterministically. A non-zero, n-scaling touch count is
+    // exactly the #1868 O(n)-per-callback regression. This is exact (not
     // thresholded) and verifiable in milliseconds — no large-n lever required.
     assert!(
-        kappa_calls.iter().sum::<usize>() > 0,
-        "no κ-trial callbacks were recorded — the n-independence gate would be \
+        calls > 0,
+        "n={n}: no κ-trial callbacks were recorded — the n-independence gate would be \
          vacuous (the optimizer never entered the measured trial phase)"
     );
-    for (&n, &touches) in ns.iter().zip(&kappa_skip_touches) {
-        assert_eq!(
-            touches,
-            0,
-            "kappa outer-loop performed {touches} length-n row touches (≈{:.1}×n) on the \
-             #1033 n-free κ-trial skip path at n={n} — the PsiGramTensor \
-             sufficient-statistic lane is STILL doing O(n) work inside each trial callback \
-             (the architectural invariant requires each hyperparameter trial to touch only \
-             k×k objects; the stale-row placeholders must be shared O(1) from the frozen \
-             row bundle, not re-materialised per callback). This is the #1868 regression.",
-            touches as f64 / n as f64,
-        );
-    }
-    // Report-only wall-clock context (the OLD, noisier gate) — no longer asserted.
-    eprintln!(
-        "[kappa-n-scaling] (report-only) PER-CALLBACK wall-clock grew {cb_ratio:.2}× across \
-         {n_ratio:.0}× n — secondary signal that the k-space trial cost is flat"
+    assert_eq!(
+        timing.nfree_skip_row_touches,
+        0,
+        "kappa outer-loop performed {} length-n row touches (≈{:.1}×n) on the \
+         #1033 n-free κ-trial skip path at n={n} — the PsiGramTensor \
+         sufficient-statistic lane is STILL doing O(n) work inside each trial callback \
+         (the architectural invariant requires each hyperparameter trial to touch only \
+         k×k objects; the stale-row placeholders must be shared O(1) from the frozen \
+         row bundle, not re-materialised per callback). This is the #1868 regression.",
+        timing.nfree_skip_row_touches,
+        timing.nfree_skip_row_touches as f64 / n as f64,
     );
+}
+
+// #1033 acceptance gate, split PER-`n` so each rung has its own nextest
+// slow-timeout budget (the former single monolithic `#[test]` ran all three
+// fits serially and the 16k rung could push the whole function past the 600s
+// SIGKILL, making the deterministic `touches == 0` assertion structurally
+// unreachable in the standard shard). The `touches == 0` integer gate already
+// pins n-independence EXACTLY at each individual n — a value that must be 0
+// cannot hide a linear term behind a constant — so the multi-point ladder was
+// never load-bearing for the hard assertion; it fed only a report-only
+// wall-clock trend (preserved in `_fast_ladder`). Two points (1k, 16k) already
+// pin the exact n-independence; the 4k rung is kept as an interior witness.
+#[test]
+fn kappa_outer_loop_is_n_independent_n1000() {
+    assert_kappa_n_free_at(1_000);
+}
+
+#[test]
+fn kappa_outer_loop_is_n_independent_n4000() {
+    assert_kappa_n_free_at(4_000);
+}
+
+#[test]
+fn kappa_outer_loop_is_n_independent_n16000() {
+    assert_kappa_n_free_at(16_000);
 }
 
 // ───────────────────────── GLM (non-Gaussian) κ-loop ─────────────────────────
