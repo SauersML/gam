@@ -440,3 +440,81 @@ fn sae_outer_rho_gradient_channel_decomposition_ibp_map_2087() {
     let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
     assert_channel_decomposition("ibp_map", &f);
 }
+
+/// #2087 discriminator — is the `third_order` channel (−15.49 on the softmax
+/// arm, larger than and cancelling the verified-correct `logdet_trace`) a REAL
+/// envelope term the small-`h` FD misses, or spurious amplification through a
+/// near-singular adjoint solve?
+///
+/// Two instruments, printed per step:
+///
+///   1. **Did the FD probes move θ̂ at all?** At `ρ ± h` the probe re-solve
+///      warm-starts from `θ̂(ρ)`; if its stationarity gate already passes, it
+///      returns the SAME state and the "envelope" FD is exactly the frozen-θ
+///      difference — i.e. `explicit + logdet_trace`, NO third-order content.
+///      Fingerprint: re-solved loss vs frozen-θ loss at the same `ρ + h`.
+///   2. **h-sweep.** If the analytic third-order is real, the envelope FD must
+///      drift from `logdet_trace` toward `logdet_trace + third_order` as `h`
+///      grows past the inner tolerance; if it stays glued to `logdet_trace`,
+///      the true θ̂-response term is ≈ 0 and the analytic third-order value is
+///      the defect (Γ / θ̂_ρ amplification through weakly-identified inner
+///      directions).
+///
+/// Diagnostic instrument for the #1795/#1798/#2087 genus: it asserts only
+/// finiteness; its printed table is the artifact the fix consumes.
+#[test]
+fn zz_2087_third_order_envelope_discriminator_softmax() {
+    let f = fixture(AssignmentMode::softmax(0.7), -8.0);
+    let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
+    let components = converged
+        .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
+        .expect("analytic components");
+    let coord = 0usize;
+    let explicit_a = components.explicit[coord];
+    let logdet_a = components.logdet_trace[coord];
+    let third_a = components.third_order_correction[coord];
+    eprintln!(
+        "[2087-diag] analytic: explicit={explicit_a:.6e} logdet_trace={logdet_a:.6e} \
+         occam={:.6e} third_order={third_a:.6e}",
+        components.occam[coord]
+    );
+
+    // (1) θ̂-motion fingerprint at the gate's own h.
+    let h_small = 2.0e-4;
+    let mut plus = f.rho.to_flat();
+    plus[coord] += h_small;
+    let rho_plus = f.rho.from_flat(plus.view());
+    let frozen_plus = converged
+        .loss(f.target.view(), &rho_plus)
+        .expect("frozen-θ loss at rho+h")
+        .total();
+    let (_, _, resolved_plus, _) = evaluate(&converged, &f.target, &rho_plus, 8);
+    let moved = (resolved_plus.total() - frozen_plus).abs();
+    eprintln!(
+        "[2087-diag] θ̂-motion fingerprint at h={h_small:.1e}: \
+         |loss(θ̂(ρ+h)) − loss(θ̂(ρ))| = {moved:.6e} \
+         ({} — a re-solve that returns the warm start gives exactly 0)",
+        if moved == 0.0 { "θ̂ DID NOT MOVE" } else { "θ̂ moved" }
+    );
+
+    // (2) h-sweep with a deep probe budget so the inner response can express.
+    for h in [2.0e-4_f64, 2.0e-3, 1.0e-2, 5.0e-2] {
+        let mut p = f.rho.to_flat();
+        let mut m_ = f.rho.to_flat();
+        p[coord] += h;
+        m_[coord] -= h;
+        let rho_p = f.rho.from_flat(p.view());
+        let rho_m = f.rho.from_flat(m_.view());
+        let (_, vp, _, _) = evaluate(&converged, &f.target, &rho_p, 64);
+        let (_, vm, _, _) = evaluate(&converged, &f.target, &rho_m, 64);
+        let fd = (vp - vm) / (2.0 * h);
+        let block_fd = fd - explicit_a;
+        assert!(fd.is_finite(), "envelope FD non-finite at h={h:.1e}");
+        eprintln!(
+            "[2087-diag] h={h:.1e} (deep probes): envelope FD={fd:.6e} → block \
+             (FD−explicit)={block_fd:.6e} | trace-only predicts {logdet_a:.6e}, \
+             trace+third predicts {:.6e}",
+            logdet_a + third_a
+        );
+    }
+}
