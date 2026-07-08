@@ -189,7 +189,21 @@ impl SaeManifoldTerm {
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let p = self.output_dim();
-        let n_scalar = (n * p) as f64;
+        // Scalar-observation count for the residual dof, kept on the SAME scale as
+        // `rss = Σᵢ wᵢ·‖rᵢ‖²` below. Under the outer-criterion Horvitz–Thompson row
+        // subsample an un-normalized inverse-inclusion weight `wᵢ = N / n_sub` lifts
+        // the weighted residual sum back to full-`N` scale (see
+        // `set_uniform_inclusion_weight`); the effective observation count must be
+        // lifted the same way — `Σᵢ wᵢ·p ≈ N·p` — or `φ̂ = rss / resid_dof` inflates
+        // by exactly `N / n_sub` (the RSS numerator is full-`N` while the
+        // denominator is the `n_sub·p` subproblem). Single-sourcing the count from
+        // the installed weights makes the three regimes consistent by construction:
+        // `None` and the mean-1 design-honesty weights both sum to `n`, so
+        // `n_scalar = n·p` there, bit-for-bit the historical count.
+        let n_scalar = match self.row_loss_weights() {
+            Some(w) => w.iter().sum::<f64>() * p as f64,
+            None => (n * p) as f64,
+        };
         let rss = 2.0 * loss.data_fit;
         let smooth_edf: f64 = self
             .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec())
