@@ -146,18 +146,22 @@ fn topology_curved_seed_initial_coords(
             }
         }
     }
-    let mut lap = Array2::<f64>::zeros((m, m));
+    // Degrees once (O(m²)), not per nonzero entry (O(m) row-sum each, O(m²·k)
+    // total): the Laplacian reads √(deg_i·deg_j) for every kNN edge.
+    let mut deg = vec![0.0_f64; m];
     for i in 0..m {
-        let deg: f64 = w.row(i).sum();
-        if deg <= 0.0 || !deg.is_finite() {
+        deg[i] = w.row(i).sum();
+        if deg[i] <= 0.0 || !deg[i].is_finite() {
             return Ok(None);
         }
+    }
+    let mut lap = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
         lap[[i, i]] = 1.0;
-        let inv_sqrt = 1.0 / deg.sqrt();
+        let inv_sqrt = 1.0 / deg[i].sqrt();
         for j in 0..m {
             if i != j && w[[i, j]] != 0.0 {
-                let deg_j: f64 = w.row(j).sum();
-                lap[[i, j]] = -w[[i, j]] * inv_sqrt / deg_j.sqrt();
+                lap[[i, j]] = -w[[i, j]] * inv_sqrt / deg[j].sqrt();
             }
         }
     }
@@ -172,10 +176,21 @@ fn topology_curved_seed_initial_coords(
     // nearest subsample points — the vertices of a barycentric simplex for a
     // `d`-dimensional atom chart — derived from the atom dimension rather than a
     // hardcoded 3-NN (#2065). Bounded by the subsample size `m`.
+    //
+    // The neighbor set depends only on the ROW, not on which harmonic is being
+    // interpolated, so the `O(m·p)` nearest-subsample scan is done ONCE per row
+    // here rather than once per `(atom, chart function, row)` interp call — the
+    // per-call rescan multiplied the dominant seed cost by `Σ_atoms need_fns`
+    // (≈ 2K at K curved atoms) for bit-identical output.
     let interp_k = (d_max + 1).max(2).min(m);
-    let interp = |sample_values: &Array1<f64>, row: usize| -> f64 {
-        if let Some(pos) = rows.iter().position(|&r| r == row) {
-            return sample_values[pos];
+    let mut pos_of_row = vec![usize::MAX; z.nrows()];
+    for (pos, &r) in rows.iter().enumerate() {
+        pos_of_row[r] = pos;
+    }
+    let mut row_neighbors: Vec<Vec<(f64, usize)>> = vec![Vec::new(); z.nrows()];
+    for (row, neighbors) in row_neighbors.iter_mut().enumerate() {
+        if pos_of_row[row] != usize::MAX {
+            continue;
         }
         let mut best: Vec<(f64, usize)> = vec![(f64::INFINITY, 0usize); interp_k];
         for (i, &r) in rows.iter().enumerate() {
@@ -185,10 +200,21 @@ fn topology_curved_seed_initial_coords(
                 best.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
         }
+        // Store the inverse-distance weights directly; the normalizing sum is
+        // fn-independent too.
+        *neighbors = best
+            .into_iter()
+            .map(|(d, i)| (1.0 / d.max(1.0e-24), i))
+            .collect();
+    }
+    let interp = |sample_values: &Array1<f64>, row: usize| -> f64 {
+        let pos = pos_of_row[row];
+        if pos != usize::MAX {
+            return sample_values[pos];
+        }
         let mut num = 0.0;
         let mut den = 0.0;
-        for (d, i) in best {
-            let ww = 1.0 / d.max(1.0e-24);
+        for &(ww, i) in &row_neighbors[row] {
             num += ww * sample_values[i];
             den += ww;
         }
