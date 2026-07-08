@@ -2,6 +2,7 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 
 use super::block::{
     block_sparse_dictionary_block_coords, block_sparse_dictionary_project_residual,
+    block_sparse_dictionary_project_residual_with_codes,
     reconstruct_block_sparse_rows,
 };
 
@@ -180,11 +181,11 @@ pub fn compose_block_coordinate_charts(
 ) -> Result<BlockChartComposeResult, String> {
     validate_inputs(x, decoder, blocks, codes, config)?;
     let base = reconstruct_block_sparse_rows(decoder, blocks, codes, config.block_size)?;
-    let selected = select_blocks(x, decoder, blocks, config)?;
+    let selected = select_blocks(x, decoder, blocks, codes, config)?;
     let mut singles = Vec::new();
     for &g in &selected {
         let rows = rows_for_block(blocks, g);
-        let coords_all = block_coords_for_config(x, decoder, config, g)?;
+        let coords_all = block_coords_for_config(x, decoder, blocks, codes, config, g)?;
         let coords = take_rows(&coords_all, &rows);
         let evidence = crossfit_evidence(&coords, config)?;
         let fitted_coords = fit_radial_chart_all(&coords, config.whitening_ridge)?;
@@ -199,14 +200,14 @@ pub fn compose_block_coordinate_charts(
 
     let mut pairs = Vec::new();
     if config.pair_screen {
-        let screens = screen_pairs(x, decoder, blocks, config, &selected)?;
+        let screens = screen_pairs(x, decoder, blocks, codes, config, &selected)?;
         for (g0, g1, score) in screens {
             if score < config.pair_min_score {
                 continue;
             }
             let rows = rows_for_pair(blocks, g0, g1);
-            let coords0_all = block_coords_for_config(x, decoder, config, g0)?;
-            let coords1_all = block_coords_for_config(x, decoder, config, g1)?;
+            let coords0_all = block_coords_for_config(x, decoder, blocks, codes, config, g0)?;
+            let coords1_all = block_coords_for_config(x, decoder, blocks, codes, config, g1)?;
             let coords0 = take_rows(&coords0_all, &rows);
             let coords1 = take_rows(&coords1_all, &rows);
             let coords = hstack(&coords0, &coords1);
@@ -590,17 +591,23 @@ fn validate_inputs(
 fn block_coords_for_config(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
     block: usize,
 ) -> Result<Array2<f32>, String> {
     if config.residual_target {
-        block_sparse_dictionary_project_residual(
+        // Leave-one-block-out residual from the CALLER's codes — the same
+        // linear tier `base` reconstructs from — so chart subproblems and the
+        // composed objective price one linear state (the co-fit alternation
+        // refits codes between passes; a fresh tied re-transform here would
+        // target a stale tier).
+        block_sparse_dictionary_project_residual_with_codes(
             x,
             decoder,
-            config.gamma,
+            blocks,
+            codes,
             config.block_size,
-            config.block_topk,
-            config.block_tile,
             block,
         )
     } else {
@@ -633,6 +640,7 @@ fn select_blocks(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
 ) -> Result<Vec<usize>, String> {
     let g_total = decoder.nrows() / config.block_size;
@@ -642,7 +650,7 @@ fn select_blocks(
         if rows.len() < config.min_firings {
             continue;
         }
-        let coords_all = block_coords_for_config(x, decoder, config, g)?;
+        let coords_all = block_coords_for_config(x, decoder, blocks, codes, config, g)?;
         let coords = take_rows(&coords_all, &rows);
         let energy = centered_energy(&coords);
         scored.push((energy, rows.len(), g));
@@ -656,6 +664,7 @@ fn screen_pairs(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
     selected: &[usize],
 ) -> Result<Vec<(usize, usize, f64)>, String> {
@@ -663,14 +672,14 @@ fn screen_pairs(
     let mut out = Vec::new();
     for i in 0..top {
         let g0 = selected[i];
-        let z0_all = block_coords_for_config(x, decoder, config, g0)?;
+        let z0_all = block_coords_for_config(x, decoder, blocks, codes, config, g0)?;
         for &g1 in selected.iter().take(top).skip(i + 1) {
             let rows = rows_for_pair(blocks, g0, g1);
             if rows.len() < config.pair_min_cofirings {
                 continue;
             }
             let z0 = take_rows(&z0_all, &rows);
-            let z1_all = block_coords_for_config(x, decoder, config, g1)?;
+            let z1_all = block_coords_for_config(x, decoder, blocks, codes, config, g1)?;
             let z1 = take_rows(&z1_all, &rows);
             out.push((g0, g1, pair_score(&z0, &z1)?));
         }

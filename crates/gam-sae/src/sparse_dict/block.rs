@@ -1491,6 +1491,45 @@ pub fn block_sparse_dictionary_lift_block(
 }
 
 /// Leave-one-block-out residual target projected into block coordinates.
+/// [`block_sparse_dictionary_project_residual`] with the leave-one-block-out
+/// base taken from CALLER-SUPPLIED codes instead of a fresh tied transform.
+/// The co-fit alternation refits the linear codes between chart passes; a chart
+/// subproblem for block `g` must then be solved against `x − L_{−g}(codes)`
+/// built from THOSE codes — re-deriving tied codes from `x` here would hand the
+/// chart a residual belonging to a different (stale) linear tier, so the block
+/// coordinate-descent would not be minimizing its stated objective.
+pub fn block_sparse_dictionary_project_residual_with_codes(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    block_size: usize,
+    block: usize,
+) -> Result<Array2<f32>, String> {
+    let xhat = reconstruct_block_sparse_rows(decoder, blocks, codes, block_size)?;
+    let mut residual = x.to_owned();
+    residual -= &xhat;
+    let b = block_size;
+    for i in 0..x.nrows() {
+        for j in 0..blocks.ncols() {
+            if blocks[[i, j]] as usize != block {
+                continue;
+            }
+            for r in 0..b {
+                let code = codes[[i, j, r]];
+                if code == 0.0 {
+                    continue;
+                }
+                let atom = decoder.row(block * b + r);
+                for c in 0..x.ncols() {
+                    residual[[i, c]] += code * atom[c];
+                }
+            }
+        }
+    }
+    block_sparse_dictionary_block_coords(residual.view(), decoder, block_size, block)
+}
+
 pub fn block_sparse_dictionary_project_residual(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
