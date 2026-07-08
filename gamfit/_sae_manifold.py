@@ -2584,7 +2584,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
-                     structured_residual_passes: int = 0,
+                     structured_residual_passes: int = 2,
                      promote_from_residual: bool = False,
                      score_mode: str = "auto",
                      _run_structure_search: bool = True,
@@ -2709,14 +2709,19 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
         or the global ``sae_set_ibp_alpha`` setter still overrides it.
     structured_residual_passes
-        Number of structured-residual sculpting passes run after the primary
-        joint fit. Defaults to ``0`` (off). Each pass fits the current
-        reconstruction residual and folds the recovered structure back into the
-        atom dictionary. Must be a non-negative int; the native core clamps the
-        effective count to ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``),
-        so larger values behave like ``4``. An explicit, typed opt-in — with the
-        default ``0`` the fit is bit-identical to the pre-existing behavior. The
-        default-on iid→structured refit is deferred to #2080.
+        Number of structured-residual whitening passes run after the primary
+        joint fit. Defaults to ``2`` (#2021 — ON by default; "magic by default":
+        the superposition-aware whitened metric is the best-known behavior, not
+        an opt-in). Each pass fits the current reconstruction residual's
+        structured covariance and installs the Σ-damped per-row metric under the
+        annealed schedule ``γ_p = (p+1)/(N+1)``, so with the default ``N = 2``
+        the final pass installs a majority-structured metric (``γ = 2/3``); ``2``
+        is also the ``PROMOTION_NURSERY_MIN_PASSES`` dwell, so the default budget
+        is coherent with the (opt-in) residual-atom promotion. Pass ``0`` to
+        force the legacy iid fit (bit-identical to the pre-#2021 behavior). Must
+        be a non-negative int; the native core clamps the effective count to
+        ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``), so larger values
+        behave like ``4``.
     promote_from_residual
         When ``True`` (default ``False``), atoms discovered in the structured
         residual passes are promoted into the primary atom tier rather than kept

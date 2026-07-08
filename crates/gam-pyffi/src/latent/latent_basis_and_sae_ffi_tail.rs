@@ -243,7 +243,7 @@ fn sae_build_atom_plans(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 0,
+    structured_residual_passes = 2,
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
@@ -295,8 +295,9 @@ fn sae_manifold_fit_minimal<'py>(
     // the high-level Python `sae_manifold_fit` facade routes through.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — opt-in count of extra whitened-residual structured-alternation
-    // passes (default 0 = historical iid-only path, bit-for-bit).
+    // #2021 — count of extra whitened-residual structured-alternation passes.
+    // Default-ON at `2` ("magic by default"); pass `0` for the historical
+    // iid-only path, bit-for-bit.
     structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
