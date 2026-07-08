@@ -67,16 +67,21 @@ use ndarray::{Array1, Array2, ArrayView2};
 /// `κ̂ = m̂₄/m̂₂²` of a gated circle (`r² = a²·Bernoulli(q)`) has
 /// `Var(κ̂) = (1 − q)/(q³ n)`, and the certificate must resolve the gated
 /// anchor `1/q` from the Gaussian-blend anchor `2`, a gap of `1/q − 2`, at the
-/// conventional `z = 3` level: `z·SE ≤ (1/q − 2)/2 ⇒ n ≥ 4z²·q(1 − q)/(1 − 2q)²`.
-/// The bound is increasing in `q` and diverges at `q → ½` (a half-gated circle
-/// has `κ = 2` — genuinely indistinguishable from a blend by κ alone), so the
-/// floor is set at the practical design edge `q = 0.43`:
-/// `n ≥ 4·9·0.43·0.57/0.14² ≈ 450 → 500`. Sparser gates and dense circles
-/// concentrate strictly faster, so 500 covers the whole certifiable range.
-/// (This also retires the old `n = 80`-class fixtures: any harness exercising
-/// the fourth-order certificate needs `n ≥ 300` to be out of the small-sample
-/// floor even in the easy dense case.)
-const ISA_SUBSAMPLE_FLOOR: usize = 500;
+/// conventional `z = 3` level: `z·SE ≤ (1/q − 2)/2 = (1 − 2q)/(2q)`, i.e.
+/// `z²·(1 − q)/(q³n) ≤ (1 − 2q)²/(4q²) ⇒ n ≥ 4z²·(1 − q)/(q·(1 − 2q)²)`.
+/// The bound diverges at BOTH edges — at `q → ½` (a half-gated circle has
+/// `κ = 2`, genuinely indistinguishable from a blend by κ alone) and at
+/// `q → 0` (vanishing active mass: `Var(κ̂) ∼ 1/(q³n)`) — so the floor is set
+/// at the dense-side practical design edge `q = 0.43`:
+/// `n ≥ 4·9·0.57/(0.43·0.14²) ≈ 2435 → 2500`. On the sparse side the same
+/// 2500 resolves gates down to `q ≈ 0.0155` (where the bound re-crosses 2500),
+/// and the certificate's `ln²n` active-count floor already refuses gates in
+/// that duty range at the sample sizes where subsampling engages at all; dense
+/// circles concentrate strictly faster. (This also retires the old
+/// `n = 80`-class fixtures: any harness exercising the fourth-order
+/// certificate needs `n ≥ 300` to be out of the small-sample floor even in the
+/// easy dense case.)
+const ISA_SUBSAMPLE_FLOOR: usize = 2500;
 
 /// Angle samples for one Jacobi pair — DERIVED from the harmonic degree of the
 /// objective, not tuned. In `φ = 2θ` each plane's `E[r²]` is a degree-1 and
@@ -136,10 +141,14 @@ pub struct IsaEigenParts {
     /// median eigenvalue — robust while signal directions are a minority.
     pub mp_edge: f64,
     /// Noise scale for the κ certificate: the median of the smallest-quartile
-    /// eigenvalues, where white noise provably sits regardless of how many
-    /// directions are signal. (The global median that sets the MP edge lands in
-    /// the SIGNAL bulk on a dense multi-circle residual and would inflate the
-    /// clean anchor past the blend anchor, rejecting even a clean circle.)
+    /// SURVIVING eigenvalues — numerically-zero directions (deflated planes,
+    /// `n ≤ p` rank deficiency) are excluded first, since those are rank
+    /// deficiencies rather than noise observations and would read σ̂² ≈ 0 in
+    /// producer rounds ≥ 2. The quartile sits where white noise provably lives
+    /// regardless of how many directions are signal. (The global median that
+    /// sets the MP edge lands in the SIGNAL bulk on a dense multi-circle
+    /// residual and would inflate the clean anchor past the blend anchor,
+    /// rejecting even a clean circle.)
     pub sigma2_cert: f64,
 }
 
@@ -184,6 +193,27 @@ pub fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<IsaEigenP
     ascending.sort_by(|a, b| a.total_cmp(b));
     let gamma = p as f64 / n as f64;
     let mp_factor = (1.0 + gamma.sqrt()).powi(2);
+    // Numerical-rank screen BEFORE any noise estimation. Deflation
+    // (`isa_deflate_fitted_curve`) removes each accepted plane's two variance
+    // dimensions EXACTLY, so in producer rounds ≥ 2 the bottom of the spectrum
+    // carries one numerically-zero eigenvalue per deflated dimension (and a
+    // rank-deficient `n ≤ p` sample covariance plants them on round 1). Those
+    // are rank deficiencies, not noise observations: left in, the bottom-
+    // quartile certificate scale reads a deflated zero, `σ̂²_cert ≈ 0`
+    // collapses the χ²₂ gate floor to `2·MIN_POSITIVE·ln n`, every row gates
+    // active (`q̂ = 1`, `κ_model = 1`, `gate_mid = 1.125`), genuinely gated
+    // circles left in the residual (`κ_obs ≈ 1/q ≫ 1.125`) are REFUSED, and
+    // any accepted dense circle ships saturated `gate_logits` for all rows.
+    // Both noise estimators below therefore run on the SURVIVING spectrum —
+    // eigenvalues above the eigensolve's numerical-rank threshold. The MP edge
+    // aspect stays `p/n`: for `n ≤ p` the nonzero Wishart bulk still tops out
+    // at `σ²(1 + √(p/n))²`, and after deflation `p/n` is (mildly) conservative.
+    let rank_tol = ascending.last().copied().unwrap_or(0.0).max(0.0) * f64::EPSILON * p as f64;
+    let n_rank_deficient = ascending.partition_point(|&e| e <= rank_tol);
+    let surviving = &ascending[n_rank_deficient..];
+    if surviving.is_empty() {
+        return Ok(None);
+    }
     // Robust noise floor under MAJORITY signal. A plain median of the spectrum
     // estimates σ² only while signal directions are a MINORITY; on a DENSE
     // product-of-circles residual the signal dims are the majority — a k-torus
@@ -215,18 +245,19 @@ pub fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<IsaEigenP
         }
         .max(f64::MIN_POSITIVE)
     };
-    let mut noise_len = ascending.len();
-    let mut sigma2 = median_prefix(&ascending[..noise_len]);
+    let mut noise_len = surviving.len();
+    let mut sigma2 = median_prefix(&surviving[..noise_len]);
     loop {
         let edge = sigma2 * mp_factor;
         // Eigenvalues at-or-below the edge form the candidate noise band (a prefix
-        // of the ascending spectrum, since `e <= edge` is true-then-false on it).
-        let new_len = ascending.partition_point(|&e| e <= edge);
+        // of the ascending surviving spectrum, since `e <= edge` is true-then-false
+        // on it).
+        let new_len = surviving.partition_point(|&e| e <= edge);
         if new_len == 0 || new_len == noise_len {
             break;
         }
         noise_len = new_len;
-        sigma2 = median_prefix(&ascending[..noise_len]);
+        sigma2 = median_prefix(&surviving[..noise_len]);
     }
     let mp_edge = sigma2 * mp_factor;
     let mut above: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > mp_edge).collect();
@@ -234,8 +265,8 @@ pub fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<IsaEigenP
     if above.is_empty() {
         return Ok(None);
     }
-    let q = (evals.len() / 4).max(1);
-    let sigma2_cert = evals[(q - 1) / 2].max(0.0);
+    let q = (surviving.len() / 4).max(1);
+    let sigma2_cert = surviving[(q - 1) / 2];
     Ok(Some(IsaEigenParts {
         mean,
         evals,

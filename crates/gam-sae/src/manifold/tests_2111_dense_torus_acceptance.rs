@@ -7,8 +7,10 @@
 //! EVERY circle (density 6 — the degenerate regime where single-plane ring-ness
 //! fails and only 4th-order ISA separates the factors), distinct amplitudes
 //! `1.0 … 0.55`, independent angles, small isotropic noise. This is the
-//! `probe_2101_birth_locus_disjoint_6circle_ibp` structure at the sample size the
-//! ISA fourth-order certificate needs (`n ≥ ISA_SUBSAMPLE_FLOOR`).
+//! `probe_2101_birth_locus_disjoint_6circle_ibp` structure at a sample size
+//! (`n = 700`) clear of the dense-case small-sample floor (`n ≥ 300`; the
+//! gated-edge `ISA_SUBSAMPLE_FLOOR` resolution bound concerns `q → ½` gates,
+//! not this density-1 fixture).
 //!
 //! PIPELINE. Seed a single K=1 circle atom on circle 0's true coordinate, then run
 //! the integrated forward-birth + backfit engine [`fit_stagewise`]. On a disjoint

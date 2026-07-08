@@ -146,10 +146,14 @@ pub struct PairVerdict {
 /// standard-normal contrast, shared with the birth certificate's design edge.
 const PAIR_Z: f64 = 3.0;
 
-/// The minimum row count for the delta-method SE to be trustworthy — the SAME
-/// moment-concentration floor the ISA κ certificate uses ([`super::isa_seed`]
-/// `ISA_SUBSAMPLE_FLOOR = 500`). Below it a pair cannot be adjudicated (returned
-/// with `merge_proposed = false`, `z = 0`).
+/// The minimum row count for the delta-method SE to be trustworthy. Unlike the
+/// ISA κ certificate's `ISA_SUBSAMPLE_FLOOR` ([`super::isa_seed`]) — a
+/// RESOLUTION bound at the gated `q = 0.43` design edge — this is only a
+/// first-order-expansion validity floor: the `z = 3` contrast already
+/// self-scales its SE with `N`, so all the floor must exclude is the small-`N`
+/// regime where the delta-method variance itself is untrustworthy. Below it a
+/// pair cannot be adjudicated (returned with `merge_proposed = false`,
+/// `z = 0`).
 const PAIR_ROW_FLOOR: usize = 500;
 
 /// Screen one atom pair for a merge proposal. `data` is the ambient matrix the
