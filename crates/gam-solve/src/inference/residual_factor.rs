@@ -930,7 +930,16 @@ fn factor_coordinates(
     let d_inv: Vec<f64> = (0..p)
         .map(|i| {
             let d = diagonal[i];
-            if d > 0.0 && d.is_finite() { 1.0 / d } else { 0.0 }
+            if !(d > 0.0 && d.is_finite()) {
+                return 0.0;
+            }
+            // A subnormal-floored variance (the zero-residual case floors the
+            // scale reference at f64::MIN_POSITIVE) passes `d > 0` but its
+            // reciprocal OVERFLOWS to ∞ — the same NaN poisoning through the
+            // second door. A non-finite weight is the same degenerate-channel
+            // verdict: drop it.
+            let w = d.recip();
+            if w.is_finite() { w } else { 0.0 }
         })
         .collect();
     // Normal matrix ΛᵀD^{-1}Λ (+ tiny ridge for invertibility).
