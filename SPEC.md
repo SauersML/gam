@@ -17,4 +17,3 @@
 - Grid search is never allowed.
 - Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.
 - Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible.
-- Critical directions are carried exactly. Wherever an objective has a pole, boundary, exponential, or flat-at-infinity direction, the local model must carry that direction's true structure exactly — as metric (poles: self-concordant Hessian with damped-Newton steps), as prox (exponentials and cones: closed-form proximal maps, e.g. Lambert-W, PAVA), or as algebra (one-dimensional criteria: stationary-point enumeration). Majorization is licensed only where the third-order structure is tame. Unbounded refinement loops are permitted only when a convergence theorem bounds them; assertions that the theorem's preconditions hold (finite barrier at initialization, fixed pivot order) replace timeouts and heuristic witnesses.
