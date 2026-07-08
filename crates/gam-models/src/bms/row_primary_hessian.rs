@@ -2599,146 +2599,6 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    /// #932 BMS-flex cutover: RETAINED HAND TWIN of the empirical-grid calibration
-    /// derivative accumulation — the verbatim per-node loop that production used
-    /// before the moment factorization. Kept ONLY as the `#[cfg(test)]` oracle
-    /// reference for `flex_grid_calibration_derivs_factored`; production no longer
-    /// calls it. Writes `f_u`/`f_au`/`f_uv` (`= scratch.m_u/m_au/m_uv`) and returns
-    /// `f_aa`. `O(G·r²)`.
-    #[cfg(test)]
-    pub(super) fn flex_grid_calibration_derivs_hand(
-        &self,
-        empirical_grid: &crate::bms::EmpiricalZGrid,
-        primary: &PrimarySlices,
-        a: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        need_hessian: bool,
-        f_u: &mut Array1<f64>,
-        f_au: &mut Array1<f64>,
-        f_uv: &mut Array2<f64>,
-    ) -> Result<f64, String> {
-        let r = primary.total;
-        let scale = self.probit_frailty_scale();
-        let h_range = primary.h.as_ref();
-        let w_range = primary.w.as_ref();
-        let score_runtime = self.score_warp.as_ref();
-        let link_runtime = self.link_dev.as_ref();
-        let zero_family = vec![[0.0f64; 4]; r];
-        let mut coeff_u = vec![[0.0f64; 4]; r];
-        let mut coeff_au = vec![[0.0f64; 4]; r];
-        let mut coeff_bu = vec![[0.0f64; 4]; r];
-        let mut eta_u_cell = vec![0.0f64; r];
-        let mut f_aa = 0.0f64;
-        use super::exact_kernel as exact;
-        for (&node, &weight) in empirical_grid.nodes.iter().zip(empirical_grid.weights.iter()) {
-            coeff_u.iter_mut().for_each(|c| *c = [0.0; 4]);
-            if need_hessian {
-                coeff_au.iter_mut().for_each(|c| *c = [0.0; 4]);
-                coeff_bu.iter_mut().for_each(|c| *c = [0.0; 4]);
-            }
-            let obs = self.observed_denested_cell_partials_at_z(node, a, b, beta_h, beta_w)?;
-            let eta = eval_coeff4_at(&obs.coeff, node);
-            let eta_a = eval_coeff4_at(&obs.dc_da, node);
-            let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
-            let phi = normal_pdf(eta);
-            if need_hessian {
-                f_aa += weight * phi * (eta_aa - eta * eta_a * eta_a);
-            }
-            coeff_u[1] = obs.dc_db;
-            if need_hessian {
-                coeff_au[1] = obs.dc_dab;
-                coeff_bu[1] = obs.dc_dbb;
-            }
-            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-                Self::for_each_deviation_basis_cubic_at(
-                    runtime,
-                    h_range,
-                    node,
-                    "score-warp",
-                    |_, idx, basis_span| {
-                        coeff_u[idx] =
-                            scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                        if need_hessian {
-                            coeff_bu[idx] = scale_coeff4(
-                                exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                scale,
-                            );
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-                let u_node = a + b * node;
-                Self::for_each_deviation_basis_cubic_at(
-                    runtime,
-                    w_range,
-                    u_node,
-                    "link-wiggle",
-                    |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
-                            scale,
-                        );
-                        if need_hessian {
-                            let (dc_aw_raw, dc_bw_raw) =
-                                exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                            coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                            coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        }
-                        Ok(())
-                    },
-                )?;
-            }
-            for idx in 0..r {
-                eta_u_cell[idx] = eval_coeff4_at(&coeff_u[idx], node);
-            }
-            for u in 1..r {
-                f_u[u] += weight * phi * eta_u_cell[u];
-                if need_hessian {
-                    let eta_au = eval_coeff4_at(&coeff_au[u], node);
-                    f_au[u] += weight * phi * (eta_au - eta * eta_a * eta_u_cell[u]);
-                }
-            }
-            if need_hessian {
-                let coeff_jet = SparsePrimaryCoeffJetView::new(
-                    1,
-                    h_range,
-                    w_range,
-                    coeff_u.as_slice(),
-                    coeff_au.as_slice(),
-                    coeff_bu.as_slice(),
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                );
-                for u in 1..r {
-                    for v in u..r {
-                        let second_coeff = coeff_jet.pair_from_b_family(
-                            coeff_jet.b_first,
-                            u,
-                            v,
-                            COEFF_SUPPORT_BHW,
-                        );
-                        let eta_uv = eval_coeff4_at(&second_coeff, node);
-                        let val = weight * phi * (eta_uv - eta * eta_u_cell[u] * eta_u_cell[v]);
-                        f_uv[[u, v]] += val;
-                        if u != v {
-                            f_uv[[v, u]] += val;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(f_aa)
-    }
-
     /// #932 BMS-flex cutover: per-denested-cell MOMENT FACTORIZATION of the
     /// empirical-grid calibration derivatives — the production path.
     ///
@@ -2996,9 +2856,12 @@ impl BernoulliMarginalSlopeFamily {
             // #932 BMS-flex cutover: production routes the empirical-grid
             // calibration derivatives through the per-denested-cell moment
             // factorization (`O(G)` accumulate + `O(cells·r²)` contract), NOT the
-            // hand per-node `O(G·r²)` loop. The hand loop is retained verbatim as
-            // the `#[cfg(test)]` oracle twin `flex_grid_calibration_derivs_hand`
-            // and pinned against this factored path at ≤1e-9 by the moment oracle.
+            // former hand per-node `O(G·r²)` loop. This factored path is pinned
+            // at ≤1e-9 against the independent `empirical_flex_row_nll_jet2` grid
+            // jet AND an independent finite difference
+            // (`empirical_flex_row_nll_jet2_matches_hand_path_932`,
+            // `flex_factored_matches_jet2_degenerate_grids_932`,
+            // `hand_flex_grad_hess_matches_independent_fd_*_932`).
             f_aa = self.flex_grid_calibration_derivs_factored(
                 &*empirical_grid,
                 primary,
