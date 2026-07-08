@@ -113,10 +113,12 @@ fn power_iteration_top_eigenvalue(
     // Deterministic unit seed.
     let mut v = vec![1.0_f64 / (p as f64).sqrt(); p];
     let mut lambda = 0.0_f64;
-    // 64 iterations: the leading eigenvalue converges geometrically at rate
+    // 24 iterations: the leading eigenvalue converges geometrically at rate
     // (λ₂/λ₁)ᵏ; a dominant birth direction has a clear gap, and this is a screen,
-    // not a solve. A fixed count keeps it allocation- and branch-stable.
-    for _ in 0..64 {
+    // not a solve. A fixed, small count keeps the per-birth cost O(iters·|rows|·p)
+    // bounded at frontier width while resolving the dominant fraction to well within
+    // the floor margin.
+    for _ in 0..24 {
         // w = Rₛ v  (one scalar per selected row).
         // u = Rₛᵀ w  (p-vector) = Rₛᵀ Rₛ v.
         let mut u = vec![0.0_f64; p];
