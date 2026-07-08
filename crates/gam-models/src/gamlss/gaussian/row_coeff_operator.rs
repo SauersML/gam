@@ -648,10 +648,10 @@ impl GaussianLocationScaleHessianWorkspace {
         let eta_ls = &block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
         let rows = family.get_or_compute_row_scalars(etamu, eta_ls)?;
         // Single source of truth shared with the dense
-        // `exact_newton_joint_hessian_from_designs`: μ ⊥ σ ⇒ cross = 0 (#684),
-        // (ls,ls) = 2κ²a (#566). Reading the same coefficients as the dense path
-        // makes the cross-block drift that caused #684 structurally impossible.
-        let (coeff_mm, coeff_ml, coeff_ll) = gaussian_locscale_fisher_joint_row_coeffs(&rows);
+        // `exact_newton_joint_hessian_from_designs`: observed joint Hessian
+        // (mm=w, ml=2κm, ll=κ'(a−n)+2κ²n; #1561). Reading the same coefficients
+        // as the dense path makes cross-block drift structurally impossible.
+        let (coeff_mm, coeff_ml, coeff_ll) = gaussian_locscale_observed_joint_row_coeffs(&rows);
         Ok(Self {
             family,
             block_states,

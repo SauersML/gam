@@ -146,6 +146,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
     prune_unidentified_linear_terms_for_marginal_slope(
         &mut marginalspec,
@@ -161,6 +162,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
     prune_unidentified_linear_terms_for_marginal_slope(
         &mut logslopespec,

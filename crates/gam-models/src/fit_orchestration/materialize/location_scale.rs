@@ -61,6 +61,7 @@ pub(crate) fn materialize_location_scale<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
     let log_sigmaspec = build_termspec_with_geometry_and_overrides(
         &noise_parsed.terms,
@@ -70,6 +71,7 @@ pub(crate) fn materialize_location_scale<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
     // Sample size vs basis rank, summed across the mean and log-σ smooths
     // (#309). Both designs share the same n_rows.

@@ -1298,55 +1298,36 @@ pub(crate) fn exp_sigma_derivs_up_to_fourth_array(
 }
 
 #[cfg(test)]
-mod fisher_single_source_oracle_tests {
-    //! #932 doctrine oracle for the Gaussian location-scale joint Fisher tower.
+mod observed_single_source_oracle_tests {
+    //! #932 doctrine oracle for the Gaussian location-scale OBSERVED joint
+    //! Hessian tower (#1561 cutover from block-Fisher).
     //!
-    //! The production joint Hessian is the EXPECTED (Fisher) information, built
-    //! from hand-written closed-form row coefficients
-    //! (`gaussian_locscale_fisher_joint_row_coeffs`: `mm = a/σ²`, cross `≡ 0`,
-    //! `ll = 2κ²a`) and their β-directional drifts
+    //! The production joint Hessian is the OBSERVED information, built from
+    //! hand-written closed-form row coefficients
+    //! (`gaussian_locscale_observed_joint_row_coeffs`: `mm = w`, `ml = 2κm`,
+    //! `ll = κ'(a−n)+2κ²n`) and their β-directional drifts
     //! (`gaussian_joint_first_directionalweights` /
     //! `gaussian_jointsecond_directionalweights`). Those hand forms are FAST and
     //! STAY in production — but, like every other #932 family, they must be
     //! pinned bit-for-bit to a MECHANICAL single source so a future edit that
     //! drops or mis-weights a term (the #736/#947 bug genus) is caught here
-    //! rather than in a silently wrong outer Hessian. This is the `wiggle`
-    //! `betaw_cross_channel_expansions_match_single_source` treatment applied to
-    //! the Gaussian location-scale tower.
+    //! rather than in a silently wrong outer Hessian.
     //!
     //! MECHANICAL SOURCE (no hand math reused):
     //!  * The per-row negative log-likelihood is `ρ(μ,η)=−ℓ(μ,η)`, evaluated by
     //!    the production row kernel `gaussian_diagonal_row_kernel`.
     //!  * Its OBSERVED 2×2 Hessian in `(μ,η_ls)` is taken by central finite
     //!    differences of that kernel — a derivative the test computes from the
-    //!    likelihood ALONE, never from the Fisher coefficients under test.
-    //!  * The FISHER information is `E_y[H_obs]` with `y∼N(μ,σ²)`. `H_obs` is a
-    //!    polynomial of degree ≤ 2 in the residual `r=y−μ`, so a 3-node
-    //!    Gauss–Hermite rule integrates that expectation EXACTLY. The only
-    //!    residual error is the FD truncation of `H_obs` (≈1e-7), hence the
-    //!    `1e-6` tolerance on the curvature blocks.
-    //!  * The cross block falls out BIT-EXACTLY zero: every cross contribution is
-    //!    odd (linear) in `r`, and the GH nodes are symmetric about `μ`, so the
-    //!    weighted sum cancels to a true `0.0`. That is the Fisher-orthogonality
-    //!    `E[H_{μ,ls}] ≡ 0` PROVEN, not assumed.
+    //!    likelihood ALONE, never from the hand coefficients under test.
     //!  * The directional / second-directional drifts are pinned to central
-    //!    finite differences of the (independently re-derived) Fisher coefficients
-    //!    along the same β-direction.
+    //!    finite differences of the production observed coefficients along the
+    //!    same β-direction.
 
     use super::*;
     use ndarray::array;
 
-    const FLOOR: f64 = crate::sigma_link::LOGB_SIGMA_FLOOR;
-
-    fn sigma_of(eta_ls: f64) -> f64 {
-        FLOOR + eta_ls.exp()
-    }
-    fn kappa_of(eta_ls: f64) -> f64 {
-        eta_ls.exp() / sigma_of(eta_ls)
-    }
-
     /// Row negative log-likelihood from the production kernel (likelihood only,
-    /// no Fisher coefficients involved).
+    /// no curvature coefficients involved).
     fn row_nll(y: f64, mu: f64, eta_ls: f64, a: f64) -> f64 {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         -gaussian_diagonal_row_kernel(y, mu, eta_ls, a, ln2pi).log_likelihood
@@ -1354,7 +1335,7 @@ mod fisher_single_source_oracle_tests {
 
     /// Observed 2×2 Hessian of the row NLL in `(μ, η_ls)` by central FD.
     /// Returns `(H_μμ, H_{μ,ls}, H_{ls,ls})`.
-    fn observed_hessian(y: f64, mu: f64, eta_ls: f64, a: f64, h: f64) -> (f64, f64, f64) {
+    fn observed_hessian_fd(y: f64, mu: f64, eta_ls: f64, a: f64, h: f64) -> (f64, f64, f64) {
         let hmm = (row_nll(y, mu + h, eta_ls, a) - 2.0 * row_nll(y, mu, eta_ls, a)
             + row_nll(y, mu - h, eta_ls, a))
             / (h * h);
@@ -1369,131 +1350,80 @@ mod fisher_single_source_oracle_tests {
         (hmm, hml, hll)
     }
 
-    /// Mechanical FISHER information per row: `E_y[H_obs]` via exact 3-node
-    /// Gauss–Hermite quadrature (the integrand is degree ≤ 2 in `r`).
-    fn fisher_via_gauss_hermite(mu: f64, eta_ls: f64, a: f64) -> (f64, f64, f64) {
-        // 3-node physicists' Gauss–Hermite (weight e^{-x²}).
-        let nodes = [-1.224_744_871_391_589_0_f64, 0.0, 1.224_744_871_391_589_0];
-        let wts = [
-            0.295_408_975_150_919_3_f64,
-            1.181_635_900_603_677_4,
-            0.295_408_975_150_919_3,
+    /// Production observed joint-Hessian coefficients for a single row.
+    fn production_observed_row(y: f64, mu: f64, eta_ls: f64, a: f64) -> (f64, f64, f64) {
+        let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+            .expect("row scalars");
+        let (mm, ml, ll) = gaussian_locscale_observed_joint_row_coeffs(&rows);
+        (mm[0], ml[0], ll[0])
+    }
+
+    #[test]
+    fn observed_joint_row_coeffs_match_likelihood_fd_single_source() {
+        // Residual-dependent cases: y ≠ μ so the cross and (ls,ls) observed
+        // weights are material (not the Fisher limit m→0, n→a).
+        let cases = [
+            (0.3_f64, -0.4_f64, 1.0_f64, 0.55_f64),
+            (-1.2, 0.7, 2.5, -0.9),
+            (0.0, 1.5, 0.4, 0.35),
+            (2.4, -1.1, 0.8, 1.7),
+            (-0.6, 0.2, 3.3, -1.1),
         ];
-        let sqpi = std::f64::consts::PI.sqrt();
-        let s = sigma_of(eta_ls);
         let h = 1e-4;
-        let (mut mm, mut ml, mut ll) = (0.0, 0.0, 0.0);
-        for k in 0..3 {
-            // y = μ + σ·√2·x_k maps N(μ,σ²) onto the GH weight.
-            let y = mu + s * std::f64::consts::SQRT_2 * nodes[k];
-            let (hmm, hml, hll) = observed_hessian(y, mu, eta_ls, a, h);
-            let ww = wts[k] / sqpi;
-            mm += ww * hmm;
-            ml += ww * hml;
-            ll += ww * hll;
-        }
-        (mm, ml, ll)
-    }
-
-    /// The production hand Fisher coefficients for a single row, evaluated
-    /// through the actual production constructors.
-    fn production_fisher_row(mu: f64, eta_ls: f64, a: f64) -> (f64, f64, f64) {
-        let rows = gaussian_jointrow_scalars(
-            &array![mu * 0.0 + 0.3137 + mu], // y arbitrary; r enters only the discarded observed cross
-            &array![mu],
-            &array![eta_ls],
-            &array![a],
-        )
-        .expect("row scalars");
-        let (mm, cross, ll) = gaussian_locscale_fisher_joint_row_coeffs(&rows);
-        (mm[0], cross[0], ll[0])
-    }
-
-    #[test]
-    fn fisher_joint_row_coeffs_match_gauss_hermite_single_source() {
-        let cases = [
-            (0.3_f64, -0.4_f64, 1.0_f64),
-            (-1.2, 0.7, 2.5),
-            (0.0, 1.5, 0.4),
-            (2.4, -1.1, 0.8),
-            (-0.6, 0.2, 3.3),
-        ];
-        for &(mu, eta_ls, a) in &cases {
-            let (mm_hand, cross_hand, ll_hand) = production_fisher_row(mu, eta_ls, a);
-            let (mm_mc, ml_mc, ll_mc) = fisher_via_gauss_hermite(mu, eta_ls, a);
-            // Curvature blocks: FD-truncation-limited match.
+        for &(mu, eta_ls, a, y) in &cases {
+            let (mm_hand, ml_hand, ll_hand) = production_observed_row(y, mu, eta_ls, a);
+            let (mm_fd, ml_fd, ll_fd) = observed_hessian_fd(y, mu, eta_ls, a, h);
             assert!(
-                (mm_hand - mm_mc).abs() <= 1e-6 * mm_hand.abs().max(1.0),
-                "H_μμ Fisher drift μ={mu} η={eta_ls}: hand={mm_hand} mech={mm_mc}"
+                (mm_hand - mm_fd).abs() <= 1e-5 * mm_hand.abs().max(1.0),
+                "H_μμ observed μ={mu} η={eta_ls} y={y}: hand={mm_hand} fd={mm_fd}"
             );
             assert!(
-                (ll_hand - ll_mc).abs() <= 1e-6 * ll_hand.abs().max(1.0),
-                "H_lsls Fisher drift μ={mu} η={eta_ls}: hand={ll_hand} mech={ll_mc}"
+                (ml_hand - ml_fd).abs() <= 1e-5 * ml_hand.abs().max(1.0),
+                "H_μls observed μ={mu} η={eta_ls} y={y}: hand={ml_hand} fd={ml_fd}"
             );
-            // Fisher-orthogonality `E[H_{μ,ls}] ≡ 0`, PROVEN two ways:
-            //  * the production cross coefficient is structurally, BIT-EXACTLY
-            //    zero (it is the literal `Array1::zeros` in
-            //    `gaussian_locscale_fisher_joint_row_coeffs`); and
-            //  * the mechanical GH cross vanishes by a genuine cancellation —
-            //    every cross contribution is odd (linear) in `r`, so the two
-            //    symmetric outer GH nodes carry equal-and-opposite `H_{μ,ls}`
-            //    and the centre node (r = 0) contributes nothing. The residual
-            //    is pure central-FD truncation of the mixed second difference
-            //    (O(h²) ≈ 1e-8), NOT a real coupling term, so it is bounded —
-            //    not asserted bit-zero. A genuine non-zero Fisher cross would be
-            //    O(1) here and blow this bound, catching a #736/#947-style
-            //    dropped-orthogonality regression.
-            assert_eq!(cross_hand, 0.0, "production cross block must be exactly 0");
             assert!(
-                ml_mc.abs() <= 1e-6,
-                "Gauss–Hermite Fisher cross block must cancel to ~0 \
-                 (genuine coupling would be O(1)): μ={mu} η={eta_ls} ml={ml_mc:.3e}"
+                (ll_hand - ll_fd).abs() <= 1e-5 * ll_hand.abs().max(1.0),
+                "H_lsls observed μ={mu} η={eta_ls} y={y}: hand={ll_hand} fd={ll_fd}"
             );
         }
     }
 
     #[test]
-    fn first_directional_weights_match_fisher_finite_difference() {
-        // The assembled directional Hessian uses (w_u, 0, d_u): the μμ and lsls
-        // Fisher-coefficient drifts plus a structurally-zero cross. Pin w_u and
-        // d_u to a central FD of the Fisher coefficients along the β-direction
-        // (μ += t·ξμ, η_ls += t·ξls).
+    fn first_directional_weights_match_observed_finite_difference() {
+        // Pin (w_u, c_u, d_u) to a central FD of the observed coefficients
+        // along the β-direction (μ += t·ξμ, η_ls += t·ξls).
         let cases = [
-            (0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64),
-            (-1.2, 0.7, 2.5, 1.1, 0.3),
-            (0.0, 1.5, 0.4, -0.2, 0.9),
-            (2.4, -1.1, 0.8, 0.6, -0.4),
+            (0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64, 0.55_f64),
+            (-1.2, 0.7, 2.5, 1.1, 0.3, -0.9),
+            (0.0, 1.5, 0.4, -0.2, 0.9, 0.35),
+            (2.4, -1.1, 0.8, 0.6, -0.4, 1.7),
         ];
         let t = 1e-6;
-        for &(mu, eta_ls, a, xi_mu, xi_ls) in &cases {
-            let rows = gaussian_jointrow_scalars(
-                &array![mu + 0.137], // y arbitrary
-                &array![mu],
-                &array![eta_ls],
-                &array![a],
-            )
-            .expect("row scalars");
-            let (w_u, _c_u, d_u) =
+        for &(mu, eta_ls, a, xi_mu, xi_ls, y) in &cases {
+            let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                .expect("row scalars");
+            let (w_u, c_u, d_u) =
                 gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
-            // FD of Fisher mm and ll along the direction.
-            let mm = |_m: f64, e: f64| a / (sigma_of(e) * sigma_of(e));
-            let ll = |_m: f64, e: f64| {
-                let k = kappa_of(e);
-                2.0 * k * k * a
+            let coeffs_at = |m: f64, e: f64| -> (f64, f64, f64) {
+                production_observed_row(y, m, e, a)
             };
-            let fd_w = (mm(mu + t * xi_mu, eta_ls + t * xi_ls)
-                - mm(mu - t * xi_mu, eta_ls - t * xi_ls))
-                / (2.0 * t);
-            let fd_d = (ll(mu + t * xi_mu, eta_ls + t * xi_ls)
-                - ll(mu - t * xi_mu, eta_ls - t * xi_ls))
-                / (2.0 * t);
+            let (mmp, mlp, llp) = coeffs_at(mu + t * xi_mu, eta_ls + t * xi_ls);
+            let (mmm, mlm, llm) = coeffs_at(mu - t * xi_mu, eta_ls - t * xi_ls);
+            let fd_w = (mmp - mmm) / (2.0 * t);
+            let fd_c = (mlp - mlm) / (2.0 * t);
+            let fd_d = (llp - llm) / (2.0 * t);
             assert!(
-                (w_u[0] - fd_w).abs() <= 1e-6 * fd_w.abs().max(1.0),
+                (w_u[0] - fd_w).abs() <= 1e-5 * fd_w.abs().max(1.0),
                 "dH_μμ drift μ={mu} η={eta_ls}: hand={} fd={fd_w}",
                 w_u[0]
             );
             assert!(
-                (d_u[0] - fd_d).abs() <= 1e-6 * fd_d.abs().max(1.0),
+                (c_u[0] - fd_c).abs() <= 1e-5 * fd_c.abs().max(1.0),
+                "dH_μls drift μ={mu} η={eta_ls}: hand={} fd={fd_c}",
+                c_u[0]
+            );
+            assert!(
+                (d_u[0] - fd_d).abs() <= 1e-5 * fd_d.abs().max(1.0),
                 "dH_lsls drift μ={mu} η={eta_ls}: hand={} fd={fd_d}",
                 d_u[0]
             );
@@ -1502,59 +1432,50 @@ mod fisher_single_source_oracle_tests {
 
     #[test]
     fn second_directional_weights_match_first_directional_finite_difference() {
-        // The second-directional Hessian uses (w_uv, 0, d_uv). Pin w_uv and d_uv
-        // to a central FD of the FIRST-directional Fisher drifts (w_u, d_u) along
-        // the v-direction — i.e. the mixed second derivative of the Fisher
-        // coefficients, assembled mechanically from the already-pinned
-        // first-directional single source.
+        // Pin (w_uv, c_uv, d_uv) to a central FD of the FIRST-directional
+        // observed drifts along the v-direction.
         let cases = [
             (
-                0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64, 0.8_f64, 0.2_f64,
+                0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64, 0.8_f64, 0.2_f64, 0.55_f64,
             ),
-            (-1.2, 0.7, 2.5, 1.1, 0.3, -0.6, 0.9),
-            (0.0, 1.5, 0.4, -0.2, 0.9, 0.4, -0.5),
+            (-1.2, 0.7, 2.5, 1.1, 0.3, -0.6, 0.9, -0.9),
+            (0.0, 1.5, 0.4, -0.2, 0.9, 0.4, -0.5, 0.35),
         ];
         let t = 1e-5;
-        for &(mu, eta_ls, a, xi_mu_u, xi_ls_u, xi_mu_v, xi_ls_v) in &cases {
-            let rows = gaussian_jointrow_scalars(
-                &array![mu + 0.137],
-                &array![mu],
-                &array![eta_ls],
-                &array![a],
-            )
-            .expect("row scalars");
-            let (w_uv, _c_uv, d_uv) = gaussian_jointsecond_directionalweights(
+        for &(mu, eta_ls, a, xi_mu_u, xi_ls_u, xi_mu_v, xi_ls_v, y) in &cases {
+            let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                .expect("row scalars");
+            let (w_uv, c_uv, d_uv) = gaussian_jointsecond_directionalweights(
                 &rows,
                 &array![xi_mu_u],
                 &array![xi_ls_u],
                 &array![xi_mu_v],
                 &array![xi_ls_v],
             );
-            // First-directional weights (u-direction) as a function of (μ, η_ls),
-            // evaluated through the production constructor at shifted states.
-            let first_w_and_d = |m: f64, e: f64| -> (f64, f64) {
-                let r = gaussian_jointrow_scalars(
-                    &array![m + 0.137],
-                    &array![m],
-                    &array![e],
-                    &array![a],
-                )
-                .expect("row scalars");
-                let (w_u, _c, d_u) =
+            let first_at = |m: f64, e: f64| -> (f64, f64, f64) {
+                let r = gaussian_jointrow_scalars(&array![y], &array![m], &array![e], &array![a])
+                    .expect("row scalars");
+                let (w_u, c_u, d_u) =
                     gaussian_joint_first_directionalweights(&r, &array![xi_mu_u], &array![xi_ls_u]);
-                (w_u[0], d_u[0])
+                (w_u[0], c_u[0], d_u[0])
             };
-            let (wp, dp) = first_w_and_d(mu + t * xi_mu_v, eta_ls + t * xi_ls_v);
-            let (wm, dm) = first_w_and_d(mu - t * xi_mu_v, eta_ls - t * xi_ls_v);
+            let (wp, cp, dp) = first_at(mu + t * xi_mu_v, eta_ls + t * xi_ls_v);
+            let (wm, cm, dm) = first_at(mu - t * xi_mu_v, eta_ls - t * xi_ls_v);
             let fd_w = (wp - wm) / (2.0 * t);
+            let fd_c = (cp - cm) / (2.0 * t);
             let fd_d = (dp - dm) / (2.0 * t);
             assert!(
-                (w_uv[0] - fd_w).abs() <= 1e-5 * fd_w.abs().max(1.0),
+                (w_uv[0] - fd_w).abs() <= 1e-4 * fd_w.abs().max(1.0),
                 "d²H_μμ drift μ={mu} η={eta_ls}: hand={} fd={fd_w}",
                 w_uv[0]
             );
             assert!(
-                (d_uv[0] - fd_d).abs() <= 1e-5 * fd_d.abs().max(1.0),
+                (c_uv[0] - fd_c).abs() <= 1e-4 * fd_c.abs().max(1.0),
+                "d²H_μls drift μ={mu} η={eta_ls}: hand={} fd={fd_c}",
+                c_uv[0]
+            );
+            assert!(
+                (d_uv[0] - fd_d).abs() <= 1e-4 * fd_d.abs().max(1.0),
                 "d²H_lsls drift μ={mu} η={eta_ls}: hand={} fd={fd_d}",
                 d_uv[0]
             );

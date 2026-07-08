@@ -30,7 +30,9 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     // (applied just below) still wins. An explicit formula `centers=`/`k=` is
     // honored via the parsed-term options provenance inside the helper. `None`
     // leaves the worst-case `default_num_centers` provisioning untouched.
-    apply_spatial_saturation_start(&mut spec, terms, data, col_map, spatial_escalation);
+    if let Some(level) = spatial_escalation {
+        apply_spatial_saturation_start(&mut spec, terms, data, col_map, level);
+    }
     if let Some(overrides) = smooth_overrides {
         gam_terms::smooth_overrides::apply_smooth_overrides(
             &mut spec,
@@ -113,15 +115,27 @@ fn spatial_center_strategy_mut(
             spatial_center_strategy_mut(inner)
         }
         B::BySmooth { smooth, .. } => spatial_center_strategy_mut(smooth),
-        B::ThinPlate { feature_cols, spec } => {
+        B::ThinPlate {
+            feature_cols,
+            spec,
+            input_scales: _,
+        } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
         }
-        B::Duchon { feature_cols, spec } => {
+        B::Duchon {
+            feature_cols,
+            spec,
+            input_scales: _,
+        } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
         }
-        B::Matern { feature_cols, spec } => {
+        B::Matern {
+            feature_cols,
+            spec,
+            input_scales: _,
+        } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
         }
@@ -129,7 +143,11 @@ fn spatial_center_strategy_mut(
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
         }
-        B::MeasureJet { feature_cols, spec } => {
+        B::MeasureJet {
+            feature_cols,
+            spec,
+            input_scales: _,
+        } => {
             let cols = feature_cols.clone();
             Some((&mut spec.center_strategy, cols))
         }

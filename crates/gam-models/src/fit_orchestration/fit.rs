@@ -3425,6 +3425,7 @@ pub(crate) fn crossfit_score_calibration(
         false,
         policy,
         None,
+        None,
     )
     .map_err(|e| e.to_string())?;
     let full_cov_design = build_term_collection_design(data.values.view(), &covariate_spec_raw)

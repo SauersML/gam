@@ -46,6 +46,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;

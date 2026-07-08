@@ -401,6 +401,7 @@ pub(crate) fn materialize_survival<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )?;
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         prune_unidentified_linear_terms_for_marginal_slope(
@@ -463,6 +464,7 @@ pub(crate) fn materialize_survival<'a>(
             config.scale_dimensions,
             &policy,
             config.smooth_overrides.as_ref(),
+            None,
         )?
     } else {
         // No `noise_formula` ⇒ default to an empty log-σ spec for every
@@ -563,6 +565,7 @@ pub(crate) fn materialize_survival<'a>(
                     config.scale_dimensions,
                     &policy,
                     config.smooth_overrides.as_ref(),
+                    None,
                 )?;
                 prune_unidentified_linear_terms_for_marginal_slope(
                     &mut spec,
@@ -635,6 +638,7 @@ pub(crate) fn materialize_survival<'a>(
                     config.scale_dimensions,
                     &policy,
                     config.smooth_overrides.as_ref(),
+                    None,
                 )?;
                 prune_unidentified_linear_terms_for_marginal_slope(
                     &mut spec,

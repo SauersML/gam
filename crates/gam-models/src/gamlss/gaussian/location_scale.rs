@@ -425,11 +425,11 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        // Block-diagonal Gaussian Fisher curvature (μ ⊥ σ ⇒ cross = 0, #684;
-        // (ls,ls) = 2κ²a, #566), built from the shared single-source-of-truth
+        // Observed joint Hessian (Wood–Pya–Säfken 2016 LAML object; #1561):
+        // mm = w, ml = 2κm, ll = κ'(a−n)+2κ²n. Shared single-source-of-truth
         // constructor so this dense path and the matrix-free workspace can never
-        // disagree on the cross block. See `gaussian_locscale_fisher_joint_row_coeffs`.
-        let (mm, cross, scale) = gaussian_locscale_fisher_joint_row_coeffs(&rows);
+        // disagree on the cross block. See `gaussian_locscale_observed_joint_row_coeffs`.
+        let (mm, cross, scale) = gaussian_locscale_observed_joint_row_coeffs(&rows);
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &mm, &cross, &scale,
         )?))
@@ -1140,19 +1140,17 @@ impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
 }
 
 impl CustomFamily for GaussianLocationScaleFamily {
-    /// The Gaussian location-scale joint curvature is the EXACT FISHER
-    /// (expected) information, which is block-diagonal: μ ⊥ log σ so the
-    /// cross block E[H_{μ,log σ}] ≡ 0, the (μ,μ) block weight is a/σ², and the
-    /// (log σ,log σ) block weight is 2κ²a (κ = dlog σ/dη); see
-    /// `gaussian_locscale_fisher_joint_row_coeffs` and #684/#566. (The earlier
-    /// observed Hessian — with residual-dependent row scalars m = r·w, n = r²·w
-    /// in the cross and (log σ,log σ) blocks — was replaced by this Fisher
-    /// information; the row scalars still carry m/n but the curvature
-    /// constructor discards them.) Both Fisher weights depend on β through the
-    /// scale predictor (σ = σ(η_{log σ}), κ = κ(η_{log σ})), so the curvature
-    /// moves when β_{log σ} moves — hence this override is `true`. It does NOT
-    /// depend on β_μ. The β-dependence is essential for correct M_j[u] drift
-    /// corrections when ψ hyperparameters move the design matrices.
+    /// The Gaussian location-scale joint curvature is the OBSERVED joint
+    /// Hessian (Wood–Pya–Säfken 2016 LAML object; #1561): (μ,μ) weight `w = a/σ²`,
+    /// cross `2κm`, (log σ,log σ) `κ'(a−n)+2κ²n` — see
+    /// `gaussian_locscale_observed_joint_row_coeffs`. Residual-dependent cross /
+    /// scale weights supply the Schur deficit and fitted-residual shrinkage the
+    /// block-Fisher object (#684/#566) dropped, which had biased λ̂_σ upward on
+    /// flat scale surfaces. Both observed weights depend on β through μ (via the
+    /// residual in m,n) and through the scale predictor (σ,κ), so the curvature
+    /// moves when either block moves — hence this override is `true`. The
+    /// β-dependence is essential for correct M_j[u] drift corrections when ψ
+    /// hyperparameters move the design matrices.
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }

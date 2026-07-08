@@ -3365,6 +3365,39 @@ impl<'a> RemlState<'a> {
         mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         self.reject_firth_link_ext()?;
+        // #1876 / #2062: SAS/mixture link-parameter outer gradients (ε, log δ,
+        // mixture weights) are hypersensitive to a non-exact-KKT inner β̂ —
+        // `coord.g = ∂²(−ℓ)/∂β∂ε` is O(1e4), so a ~1e-4 β̂ error collapses
+        // `coord.a` from O(10) to ~0 and freezes skewness near its init. The
+        // outer first-order bridge caps PIRLS to 3–10 iters early via
+        // `first_order_inner_cap_schedule`; that is fine for ordinary ρ-only
+        // progress but fatally corrupts the link-parameter gradient. Force
+        // full inner convergence for every link-ext evaluation (cost and
+        // gradient share this entry so the trust-region ratio stays
+        // consistent). Ordinary ρ-only fits never enter this function and keep
+        // their cap schedule byte-unchanged. Rejected alternative: fabricate a
+        // stationary-mode gradient from a capped β̂ via the KKT-residual
+        // envelope `Ṽ = V − ½ rᵀH⁻¹r` (ae590fb74) — that papered over
+        // non-convergence rather than solving the mode (#2062).
+        let previous_cap = self.outer_inner_cap.swap(0, Ordering::Relaxed);
+        if previous_cap != 0 {
+            // Drop any eval bundle built under the coarse cap so the inner
+            // solve below re-runs to full stationarity for this ρ.
+            self.cache_manager.invalidate_eval_bundle();
+        }
+        let result = self.evaluate_unified_with_link_ext_inner(rho, mode);
+        self.outer_inner_cap.store(previous_cap, Ordering::Relaxed);
+        // Leave the fully-converged bundle cached: it is a valid superseding
+        // solve under any coarser cap and accelerates the next link-ext probe
+        // at the same ρ.
+        result
+    }
+
+    fn evaluate_unified_with_link_ext_inner(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::reml_outer_engine::EvalMode,
+    ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         let mut ext_coords = self.build_link_ext_coords(&bundle)?;
 
@@ -3420,6 +3453,22 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<gam_problem::EfsEval, EstimationError> {
         self.reject_firth_link_ext()?;
+        // Same full-inner-convergence gate as `evaluate_unified_with_link_ext`
+        // (#1876 / #2062): the EFS link-ext step must see a stationary-mode
+        // gradient for the hypersensitive link coordinates.
+        let previous_cap = self.outer_inner_cap.swap(0, Ordering::Relaxed);
+        if previous_cap != 0 {
+            self.cache_manager.invalidate_eval_bundle();
+        }
+        let result = self.compute_efs_steps_with_link_ext_inner(rho);
+        self.outer_inner_cap.store(previous_cap, Ordering::Relaxed);
+        result
+    }
+
+    fn compute_efs_steps_with_link_ext_inner(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
         let mut ext_coords = self.build_link_ext_coords(&bundle)?;
 

@@ -1794,6 +1794,7 @@ fn build_formula_design_for_multinomial(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+        None,
     )
     .map_err(|err| {
         EstimationError::InvalidInput(format!("multinomial fit: build termspec: {err}"))
