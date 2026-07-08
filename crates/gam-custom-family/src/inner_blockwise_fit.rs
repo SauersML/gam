@@ -2271,42 +2271,97 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // a feasible, within-trust QP step (see the gated bypass below).
                 let mut qp_feasible_bypass = false;
                 let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
-                    // Exact Moré–Sorensen trust-region step at the current radius
-                    // (gam#979). The step already lies in the `D`-metric ball, so
-                    // no dogleg blend or box-truncation is applied: on a shrink the
-                    // direction is RE-SOLVED (bending toward the gradient), the
-                    // property the dogleg/truncation lacked. Re-solving reuses the
-                    // cached factorization at O(p) cost. On the constrained path the
-                    // resulting (unconstrained) step is projected back onto the cone
-                    // just below (gam#1108), preserving this step's fast convergence
-                    // while keeping every accepted iterate feasible.
+                    // CONSTRAINED-PATH REFLECTED-QP RESCUE (gam#979 n3000 grind).
                     //
-                    // If the already-computed Newton/QP step lies inside the
-                    // current global trust ball, take it directly instead of asking
-                    // the trust-region solver to recover the boundary solution at
-                    // `r == ‖δ_N‖`. The boundary multiplier is mathematically zero
-                    // in that case, but finite precision can produce a tiny positive
-                    // multiplier and perturb an exact quadratic one-step solve by
-                    // O(1e-6), which is large relative to the inner KKT floor. The
-                    // direct step is the exact unconstrained minimizer of the local
-                    // model and is still trust-region feasible.
-                    let search_norm = joint_trust_region_metric_step_norm(
-                        &search_delta,
-                        &joint_trust_metric_diag,
-                    );
-                    if search_norm.is_finite()
-                        && joint_trust_radius.is_finite()
-                        && search_norm <= joint_trust_radius * (1.0 + 1e-12)
-                    {
-                        trial_delta = search_delta.clone();
-                    } else {
+                    // On the constrained path `search_delta` is the *reflected*
+                    // active-set QP step: the QP convexifies the indefinite
+                    // survival-marginal-slope penalized Hessian by reflecting its
+                    // negative-curvature modes to `|γ|` (`symmetric_negative_
+                    // curvature_reflected`, line ~1490). The reflection changes
+                    // WHICH monotone-derivative-guard rows bind, so the QP settles
+                    // to a step whose active set is INCOMPLETE relative to the true
+                    // KKT (`active_set_incomplete`): the huge time-block stationarity
+                    // residual is never absorbed by the reported multipliers, and
+                    // taking that step and then globally α-crushing it (the
+                    // `apply_joint_feasibility_limit` fraction-to-boundary below)
+                    // collapses β to ~1e-4/cycle, grinding the whole 30-cycle budget
+                    // (the measured 478s Weibull-n3000 hang / 600s CI TIMEOUTs).
+                    //
+                    // The gam#979 `qp_feasible_bypass` rescue that skips the α-crush
+                    // lived only in the box-truncation branch below, which became
+                    // UNREACHABLE once the decrement diagnostic started populating
+                    // `joint_spectrum` on the constrained path (line ~1488) — routing
+                    // it into this branch. Resurrect the rescue here, but with the
+                    // EXACT Moré–Sorensen step from the UNREFLECTED penalized Hessian
+                    // (`spectrum`, decomposed from the true `lhs` at line ~1482): it
+                    // handles the indefiniteness rigorously (no reflection, no
+                    // incomplete active set), and the convex monotone cone projection
+                    // just below (gam#1108) restores feasibility. Because the cone is
+                    // convex the projected iterate is feasible, so the α-crush is
+                    // skipped (`qp_feasible_bypass`). GATED on the α-crush pathology
+                    // (α below the crush threshold) exactly as the original bypass
+                    // was, so every healthy constrained arm (α≈1, the binary BMS
+                    // score-warp monotonicity fit) takes the byte-identical
+                    // reflected-QP-step path unchanged.
+                    let constrained_alpha_would_crush = search_joint_active_set.is_some()
+                        && match compute_joint_feasibility_alpha(
+                            family,
+                            &states,
+                            &ranges,
+                            &search_delta,
+                        ) {
+                            Ok((alpha, _)) => alpha < JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD,
+                            // Err = current iterate infeasible / no positive step;
+                            // fall through to the reflected-QP step, which surfaces the
+                            // same Err downstream and shrinks the radius.
+                            Err(_) => false,
+                        };
+                    if constrained_alpha_would_crush {
+                        qp_feasible_bypass = true;
                         trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                        joint_trust_region_block_metric_norms(
+                            &trial_delta,
+                            &ranges,
+                            &joint_trust_metric_diag,
+                        )
+                    } else {
+                        // Exact Moré–Sorensen trust-region step at the current radius
+                        // (gam#979). The step already lies in the `D`-metric ball, so
+                        // no dogleg blend or box-truncation is applied: on a shrink the
+                        // direction is RE-SOLVED (bending toward the gradient), the
+                        // property the dogleg/truncation lacked. Re-solving reuses the
+                        // cached factorization at O(p) cost. On the constrained path the
+                        // resulting (unconstrained) step is projected back onto the cone
+                        // just below (gam#1108), preserving this step's fast convergence
+                        // while keeping every accepted iterate feasible.
+                        //
+                        // If the already-computed Newton/QP step lies inside the
+                        // current global trust ball, take it directly instead of asking
+                        // the trust-region solver to recover the boundary solution at
+                        // `r == ‖δ_N‖`. The boundary multiplier is mathematically zero
+                        // in that case, but finite precision can produce a tiny positive
+                        // multiplier and perturb an exact quadratic one-step solve by
+                        // O(1e-6), which is large relative to the inner KKT floor. The
+                        // direct step is the exact unconstrained minimizer of the local
+                        // model and is still trust-region feasible.
+                        let search_norm = joint_trust_region_metric_step_norm(
+                            &search_delta,
+                            &joint_trust_metric_diag,
+                        );
+                        if search_norm.is_finite()
+                            && joint_trust_radius.is_finite()
+                            && search_norm <= joint_trust_radius * (1.0 + 1e-12)
+                        {
+                            trial_delta = search_delta.clone();
+                        } else {
+                            trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                        }
+                        joint_trust_region_block_metric_norms(
+                            &trial_delta,
+                            &ranges,
+                            &joint_trust_metric_diag,
+                        )
                     }
-                    joint_trust_region_block_metric_norms(
-                        &trial_delta,
-                        &ranges,
-                        &joint_trust_metric_diag,
-                    )
                 } else if let Some(cauchy) = dogleg_cauchy.as_ref()
                     && !tried_preconditioned_descent
                 {
