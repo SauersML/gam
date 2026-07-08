@@ -664,6 +664,9 @@ fn sae_manifold_fit_minimal<'py>(
     jumprelu_threshold = 0.0,
     top_k = None,
     hybrid_linear_images = None,
+    log_lambda_sparse = None,
+    log_lambda_smooth = None,
+    log_ard = None,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -705,6 +708,27 @@ fn sae_manifold_predict_oos<'py>(
             Option<PyReadonlyArray1<'py, f64>>,
         )>,
     >,
+    // #2132 — the TRAINING fit's terminal REML-selected penalized-objective
+    // hyperparameters. The frozen-decoder OOS Newton solve descends the same
+    // penalized objective the training state converged under, so re-encoding
+    // the training rows warm-started at the trained state is (approximately) a
+    // fixed point. Historically the OOS solve rebuilt ρ from the INITIAL
+    // `sparsity_strength` / `smoothness` / zero ARD; that different objective
+    // pulled coordinates toward the chart origin and re-mixed the gates, so a
+    // warm start at the trained optimum decayed BELOW the cold start (the
+    // 0.75-native → 0.20-cold / 0.02-warm re-encode collapse). `None` keeps the
+    // legacy scalar fallback for callers without a trained ρ.
+    //   * `log_lambda_sparse` — terminal `ρ.log_lambda_sparse` (softmax entropy /
+    //     gated-L1 strength, or the learnable IBP log-α offset).
+    //   * `log_lambda_smooth` — terminal per-atom `ρ.log_lambda_smooth` (len K).
+    //     With the decoder frozen this term is constant in the optimized
+    //     variables, but it keeps the reported `oos_penalized_loss` on the same
+    //     scale as the training score.
+    //   * `log_ard` — terminal per-atom, per-axis ARD strengths (len K; entry
+    //     `k` has len `d_k`, or 0 when native ARD was off for that atom).
+    log_lambda_sparse: Option<f64>,
+    log_lambda_smooth: Option<Vec<f64>>,
+    log_ard: Option<Vec<Vec<f64>>>,
 ) -> PyResult<Py<PyDict>> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -1102,11 +1126,67 @@ fn sae_manifold_predict_oos<'py>(
     } else if !logits_are_warm && assignment_kind == "ibp_map" {
         seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, alpha);
     }
-    let log_ard: Vec<Array1<f64>> = effective_atom_dim
-        .iter()
-        .map(|&d| Array1::<f64>::zeros(d))
-        .collect();
-    let mut rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
+    // #2132 — assemble the OOS ρ from the TRAINED terminal hyperparameters when
+    // supplied, so the frozen-decoder solve descends the SAME penalized
+    // objective the training state converged under (see the parameter docs
+    // above). Each `None` falls back to the legacy initial-scalar seed.
+    let log_ard_vec: Vec<Array1<f64>> = match &log_ard {
+        Some(list) => {
+            if list.len() != k_atoms {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: log_ard must have K={k_atoms} per-atom entries; got {}",
+                    list.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(k_atoms);
+            for (atom_idx, entry) in list.iter().enumerate() {
+                let d = effective_atom_dim[atom_idx];
+                if !(entry.is_empty() || entry.len() == d) {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_predict_oos: log_ard[{atom_idx}] must be empty (ARD off) or \
+                         have the atom's latent dimension {d}; got {}",
+                        entry.len()
+                    )));
+                }
+                if !entry.iter().all(|v| v.is_finite()) {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_predict_oos: log_ard[{atom_idx}] contains non-finite values"
+                    )));
+                }
+                out.push(Array1::from(entry.clone()));
+            }
+            out
+        }
+        None => effective_atom_dim
+            .iter()
+            .map(|&d| Array1::<f64>::zeros(d))
+            .collect(),
+    };
+    if let Some(value) = log_lambda_sparse {
+        if !value.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: log_lambda_sparse must be finite; got {value}"
+            )));
+        }
+    }
+    let log_lambda_sparse_value = log_lambda_sparse.unwrap_or_else(|| sparsity_strength.ln());
+    let mut rho = match log_lambda_smooth {
+        Some(per_atom) => {
+            if per_atom.len() != k_atoms {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: log_lambda_smooth must have K={k_atoms} entries; got {}",
+                    per_atom.len()
+                )));
+            }
+            if !per_atom.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: log_lambda_smooth contains non-finite values".into(),
+                ));
+            }
+            SaeManifoldRho::with_per_atom_smooth(log_lambda_sparse_value, per_atom, log_ard_vec)
+        }
+        None => SaeManifoldRho::new(log_lambda_sparse_value, smoothness.ln(), log_ard_vec),
+    };
     let loss = term
         .run_fixed_decoder_arrow_schur(
             x_view,

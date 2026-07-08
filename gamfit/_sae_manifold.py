@@ -906,6 +906,17 @@ class ManifoldSAE:
     # object. ``None`` when no eligible d=1 atom existed (nothing to adjudicate) or
     # for payloads predating the report.
     hybrid_split: dict[str, Any] | None = None
+    # #2132 — the training fit's TERMINAL REML-selected penalized-objective
+    # hyperparameters (``ρ*``), retained so the frozen-decoder OOS encode
+    # (:meth:`_oos_payload`) descends the SAME objective the training state
+    # converged under. ``sparsity_strength`` / ``smoothness`` above are the
+    # INITIAL seeds the outer ρ search started from; feeding those back into the
+    # OOS solve made it optimize a different model, so re-encoding the training
+    # rows collapsed (warm-started at the trained optimum it walked AWAY).
+    # ``None`` (payloads predating the keys) falls back to the initial scalars.
+    selected_log_lambda_sparse: float | None = None
+    selected_log_lambda_smooth: np.ndarray | None = None
+    selected_log_ard: list[np.ndarray] | None = None
     _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1224,6 +1235,23 @@ class ManifoldSAE:
                 None
                 if payload.get("hybrid_split") is None
                 else dict(payload["hybrid_split"])
+            ),
+            # #2132 — retain the terminal REML-selected ρ* so OOS encode
+            # optimizes the SAME penalized objective the fit converged under.
+            selected_log_lambda_sparse=(
+                None
+                if payload.get("log_lambda_sparse") is None
+                else float(payload["log_lambda_sparse"])
+            ),
+            selected_log_lambda_smooth=(
+                None
+                if payload.get("log_lambda_smooth") is None
+                else np.asarray(payload["log_lambda_smooth"], dtype=float)
+            ),
+            selected_log_ard=(
+                None
+                if payload.get("log_ard") is None
+                else [np.asarray(a, dtype=float) for a in payload["log_ard"]]
             ),
         )
 
@@ -1569,6 +1597,24 @@ class ManifoldSAE:
             # sub-models so the held-out reconstruction decodes verdict-linear
             # d=1 slots by the SAME linear image the training reconstruction used.
             hybrid_linear_images=self._hybrid_linear_images_for_oos(),
+            # #2132 — thread the trained TERMINAL ρ* so the frozen-decoder OOS
+            # Newton solve descends the SAME penalized objective the training
+            # state converged under. Without these the solve rebuilt ρ from the
+            # INITIAL sparsity/smoothness scalars and zero ARD — a different
+            # objective under which the trained optimum is not stationary, so
+            # re-encoding the training rows collapsed (warm start decayed BELOW
+            # the cold start). ``None`` entries keep the legacy fallback.
+            log_lambda_sparse=self.selected_log_lambda_sparse,
+            log_lambda_smooth=(
+                None
+                if self.selected_log_lambda_smooth is None
+                else [float(v) for v in np.asarray(self.selected_log_lambda_smooth, dtype=float)]
+            ),
+            log_ard=(
+                None
+                if self.selected_log_ard is None
+                else [[float(v) for v in np.asarray(a, dtype=float).ravel()] for a in self.selected_log_ard]
+            ),
         )
         return dict(payload)
 
@@ -2324,6 +2370,19 @@ class ManifoldSAE:
             ),
             "metric_provenance": str(self.metric_provenance),
             "fisher_mass_residual": _optional_list(self.fisher_mass_residual),
+            # #2132 — terminal REML-selected ρ*, round-tripped so a reloaded
+            # model's OOS encode optimizes the SAME objective the fit selected.
+            "selected_log_lambda_sparse": (
+                None
+                if self.selected_log_lambda_sparse is None
+                else float(self.selected_log_lambda_sparse)
+            ),
+            "selected_log_lambda_smooth": _optional_list(self.selected_log_lambda_smooth),
+            "selected_log_ard": (
+                None
+                if self.selected_log_ard is None
+                else [np.asarray(a, dtype=float).ravel().tolist() for a in self.selected_log_ard]
+            ),
         }
 
     def save(self, path: str | Path) -> None:
@@ -2528,6 +2587,24 @@ class ManifoldSAE:
             structured_residual_diagnostics=[
                 dict(item) for item in payload.get("structured_residual_diagnostics", [])
             ],
+            # #2132 — restore the terminal REML-selected ρ* so a loaded model's
+            # OOS encode optimizes the SAME objective the fit selected. Legacy
+            # dicts lack these keys and load with the initial-scalar fallback.
+            selected_log_lambda_sparse=(
+                None
+                if payload.get("selected_log_lambda_sparse") is None
+                else float(payload["selected_log_lambda_sparse"])
+            ),
+            selected_log_lambda_smooth=(
+                None
+                if payload.get("selected_log_lambda_smooth") is None
+                else np.asarray(payload["selected_log_lambda_smooth"], dtype=float)
+            ),
+            selected_log_ard=(
+                None
+                if payload.get("selected_log_ard") is None
+                else [np.asarray(a, dtype=float) for a in payload["selected_log_ard"]]
+            ),
         )
 
     @classmethod

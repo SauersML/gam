@@ -4452,6 +4452,14 @@ fn sae_manifold_fit_inner<'py>(
     // negligible allocation that matches every other still-live-owner field
     // emission in this file (`lambdas.clone()`, `class_levels.clone()`, …).
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth.clone())?;
+    // #2132 — the terminal REML-selected sparsity strength, alongside the
+    // per-atom `log_lambda_smooth` / `log_ard` above. The OOS fixed-decoder
+    // encode (`sae_manifold_predict_oos`) must optimize the SAME penalized
+    // objective the training state converged under; without this key Python
+    // could only feed the INITIAL `sparsity_strength` back in, so the OOS
+    // Newton solve descended a different objective and walked the warm-started
+    // trained optimum away from itself (the cold re-encode collapse).
+    out.set_item("log_lambda_sparse", rho.log_lambda_sparse)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
     out.set_item(
