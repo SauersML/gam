@@ -121,6 +121,17 @@ fn build_term(
                         -3.0
                     }
                 }
+                // TopK routes each row to its highest-logit atoms: the same
+                // round-robin favored-atom seed keeps every atom carrying mass
+                // (no degenerate symmetry, no duplicate atoms), and the margin
+                // makes the per-row top-k selection deterministic.
+                AssignmentMode::TopK { .. } => {
+                    if atom == row % k {
+                        3.0
+                    } else {
+                        0.0
+                    }
+                }
             };
         }
     }
