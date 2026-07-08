@@ -49,14 +49,27 @@ fn sae_default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Optio
 }
 
 #[pyfunction]
+#[pyo3(signature = (n_obs, output_dim, n_atoms, d_max=1, topk_support=None))]
 fn sae_fit_admission<'py>(
     py: Python<'py>,
     n_obs: usize,
     output_dim: usize,
     n_atoms: usize,
+    d_max: usize,
+    topk_support: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
-    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, output_dim, n_atoms)
-        .map_err(py_value_error)?;
+    // Mode-aware: a hard top-k support request is admitted by the CONCRETE
+    // in-core memory budget (the TRUE manifold engine at any K > P within
+    // budget; a typed refusal over budget — never a silent linear
+    // substitution). Penalty-gated modes keep the architectural K ≤ P rule.
+    let admission = match topk_support {
+        Some(support) => gam::terms::sae::front_door::admit_topk_manifold(
+            n_obs, output_dim, n_atoms, d_max, support,
+        )
+        .map_err(py_value_error)?,
+        None => gam::terms::sae::front_door::admit_sae_fit(n_obs, output_dim, n_atoms)
+            .map_err(py_value_error)?,
+    };
     let lane = match admission.lane {
         gam::terms::sae::front_door::SaeFitLane::DenseCertification => "dense_certification",
         gam::terms::sae::front_door::SaeFitLane::SparseCodes => "sparse_codes",

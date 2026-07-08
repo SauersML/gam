@@ -111,12 +111,20 @@ def _training_data_handle(x: np.ndarray) -> _SaeTrainingDataHandle:
     return _SaeTrainingDataHandle(tuple(int(v) for v in x.shape), x.dtype)
 
 
-def _sae_fit_admission(n_obs: int, output_dim: int, n_atoms: int) -> dict[str, Any]:
+def _sae_fit_admission(
+    n_obs: int,
+    output_dim: int,
+    n_atoms: int,
+    d_max: int = 1,
+    topk_support: int | None = None,
+) -> dict[str, Any]:
     return dict(
         rust_module().sae_fit_admission(
             int(n_obs),
             int(output_dim),
             int(n_atoms),
+            int(d_max),
+            None if topk_support is None else int(topk_support),
         )
     )
 
@@ -3163,20 +3171,27 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # constructing dense logits / coordinates. The admission decision is owned by
     # the Rust front door so the Python public entry and FFI boundary share one
     # K-vs-P rule.
-    admission = _sae_fit_admission(n_obs, int(x.shape[1]), k_atoms)
+    admission = _sae_fit_admission(
+        n_obs,
+        int(x.shape[1]),
+        k_atoms,
+        d_max=max(dims),
+        topk_support=(top_k_arg if kind == "topk" else None),
+    )
     if admission["lane"] == "sparse_codes":
-        if a_init is not None or t_init is not None:
-            raise ValueError(
-                "sae_manifold_fit sparse front-door lane does not accept dense "
-                "a_init/t_init warm starts; provide sparse dictionary state instead."
-            )
-        sparse_active = int(top_k_arg if top_k_arg is not None else 1)
-        return sparse_dictionary_fit(
-            np.ascontiguousarray(x, dtype=np.float32),
-            k_atoms,
-            active=sparse_active,
-            max_epochs=max_iter_total,
-            score_mode=str(score_mode),
+        # The silent linear substitution is DEAD (2026-07-08): for the project's
+        # whole history this branch returned a linear SparseDictionaryFit through
+        # the manifold entry, so every "massive-K manifold" fit was linear and
+        # every manifold feature died downstream with AttributeError. A manifold
+        # request now either runs the TRUE engine or fails loudly with the
+        # honest alternatives.
+        raise ValueError(
+            f"sae_manifold_fit: K={k_atoms} > P={int(x.shape[1])} exceeds the dense "
+            "manifold engine's architectural lane for penalty-gated assignments. "
+            "Honest options: assignment='topk' runs the TRUE manifold engine at any "
+            "overcompleteness within the host memory budget (reduce n_obs if refused); "
+            "or reduce K to <= P; or call block_sparse_dictionary_fit / "
+            "sparse_dictionary_fit explicitly if a LINEAR dictionary is what you want."
         )
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an

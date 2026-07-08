@@ -324,13 +324,33 @@ fn sae_manifold_fit_minimal<'py>(
         ));
     }
     // Front-door enforcement through the single shared seam (#985 / E1): the dense
-    // manifold engine is the small-K CERTIFICATION lane only. `admit_dense_certification`
-    // is the ONE refuse-on-sparse implementation both dense entry points route through
-    // (`sae_manifold_fit` and this minimal path), so a K > P shape cannot reach the
-    // dense N×K `SaeAssignment` build from either door — and the refusal wording,
-    // pointing the caller at the sparse-code lane, stays defined once in `front_door`.
-    gam::terms::sae::front_door::admit_dense_certification(n_obs, z_view.ncols(), k_atoms)
+    // manifold engine is the small-K CERTIFICATION lane for penalty-gated modes,
+    // whose N×K logits are live Newton state. The hard TOP-K SUPPORT mode carries
+    // no gate coordinates, so its admission is the CONCRETE in-core memory budget
+    // (`admit_topk_manifold`): within budget the TRUE manifold engine runs at any
+    // overcompleteness K > P; over budget it refuses with a typed error — a topk
+    // manifold request is never silently substituted with the linear lane.
+    if assignment_kind == "topk" {
+        let support = top_k.ok_or_else(|| {
+            py_value_error(
+                "sae_manifold_fit_minimal: assignment_kind 'topk' requires the top_k \
+                 argument (the fixed per-row support size)"
+                    .to_string(),
+            )
+        })?;
+        let d_max = atom_dim.iter().copied().max().unwrap_or(1);
+        gam::terms::sae::front_door::admit_topk_manifold(
+            n_obs,
+            z_view.ncols(),
+            k_atoms,
+            d_max,
+            support,
+        )
         .map_err(py_value_error)?;
+    } else {
+        gam::terms::sae::front_door::admit_dense_certification(n_obs, z_view.ncols(), k_atoms)
+            .map_err(py_value_error)?;
+    }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
             "sae_manifold_fit_minimal: z contains non-finite values".into(),

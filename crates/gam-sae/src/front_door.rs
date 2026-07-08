@@ -72,6 +72,77 @@ pub fn admit_sae_fit(
     })
 }
 
+/// Mode-aware admission for the HARD TOP-K SUPPORT gate
+/// ([`crate::assignment::AssignmentMode::TopK`]).
+///
+/// The `K ≤ P` rule guards the no-`N×K` ARCHITECTURE for penalty-gated modes,
+/// whose `N×K` logits are live Newton state. The TopK mode carries NO gate
+/// coordinates (its logits are read-only routing inputs and its per-token
+/// blocks are `k·(1+d)` by construction), so its admission question is not
+/// architectural but CONCRETE MEMORY: does the dense state — `N·K` routing
+/// logits plus `N·K·d_max` per-atom coordinates, 8 bytes each — fit the host
+/// in-core budget ([`crate::manifold::streaming_plan`]'s available-memory
+/// convention, SPEC "never OOM")? Within budget ⇒ the TRUE manifold engine is
+/// admitted at any overcompleteness `K > P`. Over budget ⇒ a typed Err: for a
+/// caller who asked for TOPK MANIFOLD atoms, silently substituting the linear
+/// sparse-code lane is the exact failure mode this front door exists to
+/// prevent (witnessed 2026-07-08: K>P fits returned `SparseDictionaryFit`
+/// through the manifold entry for the project's whole history). The caller
+/// reduces `n_obs` or awaits the support-sparse lane; nothing is substituted.
+pub fn admit_topk_manifold(
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    d_max: usize,
+    support_k: usize,
+) -> Result<SaeFitAdmission, String> {
+    let budget_bytes = crate::manifold::sae_host_in_core_budget_bytes().0;
+    admit_topk_manifold_with_budget(n_obs, output_dim, n_atoms, d_max, support_k, budget_bytes)
+}
+
+/// Budget-parameterized core of [`admit_topk_manifold`] (testable without the
+/// host memory probe).
+pub(crate) fn admit_topk_manifold_with_budget(
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    d_max: usize,
+    support_k: usize,
+    budget_bytes: usize,
+) -> Result<SaeFitAdmission, String> {
+    let admission = admit_sae_fit(n_obs, output_dim, n_atoms)?;
+    if support_k == 0 || support_k > n_atoms {
+        return Err(format!(
+            "admit_topk_manifold requires 1 <= support_k <= K={n_atoms}; got {support_k}"
+        ));
+    }
+    if d_max == 0 {
+        return Err("admit_topk_manifold requires d_max >= 1".to_string());
+    }
+    if admission.lane == SaeFitLane::DenseCertification {
+        // K ≤ P: the historical certification lane already admits this shape.
+        return Ok(admission);
+    }
+    let state_cells = n_obs
+        .saturating_mul(n_atoms)
+        .saturating_mul(1 + d_max);
+    let state_bytes = state_cells.saturating_mul(std::mem::size_of::<f64>());
+    if state_bytes <= budget_bytes {
+        return Ok(SaeFitAdmission {
+            lane: SaeFitLane::DenseCertification,
+            ..admission
+        });
+    }
+    Err(format!(
+        "topk manifold engine refused: the dense state (N*K logits + N*K*d_max coords = \
+         {state_bytes} bytes at N={n_obs}, K={n_atoms}, d_max={d_max}) exceeds the host \
+         in-core budget ({budget_bytes} bytes). Reduce n_obs (row-subsample; the HT outer \
+         subsampling keeps the criterion honest) or wait for the support-sparse massive-K \
+         lane — a TOPK MANIFOLD request is never silently substituted with the linear \
+         sparse-code lane"
+    ))
+}
+
 /// Front-door enforcement for the DENSE manifold engine (#985 / E1): admit the
 /// dense-certification lane, or REFUSE the sparse lane.
 ///
@@ -107,6 +178,38 @@ pub fn admit_dense_certification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topk_manifold_admits_overcomplete_within_budget_and_refuses_over() {
+        // K >> P (the massively-overcomplete shape) with a state that fits the
+        // budget: N=4096, K=32000, d=1 → (1+1)·4096·32000·8 = 2.1 GB.
+        let bytes = 2 * 4096usize * 32_000 * 8;
+        let ok = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, bytes)
+            .expect("within-budget topk admission");
+        assert_eq!(
+            ok.lane,
+            SaeFitLane::DenseCertification,
+            "TopK within budget admits the TRUE manifold engine at K > P"
+        );
+
+        // One byte under the state size: refused with the typed no-substitution
+        // error, never silently demoted to the linear sparse-code lane.
+        let err = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, bytes - 1)
+            .expect_err("over-budget topk must refuse");
+        assert!(
+            err.contains("never silently substituted"),
+            "refusal must state the no-substitution contract; got: {err}"
+        );
+
+        // K ≤ P passes through the historical certification admission untouched.
+        let small = admit_topk_manifold_with_budget(1024, 4096, 128, 2, 4, 0)
+            .expect("K <= P is admitted regardless of budget");
+        assert_eq!(small.lane, SaeFitLane::DenseCertification);
+
+        // Degenerate support sizes are caller errors.
+        assert!(admit_topk_manifold_with_budget(64, 8, 16, 1, 0, bytes).is_err());
+        assert!(admit_topk_manifold_with_budget(64, 8, 16, 1, 17, bytes).is_err());
+    }
 
     #[test]
     fn admission_demotes_dense_when_assignment_state_exceeds_response() {
