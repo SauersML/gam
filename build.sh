@@ -252,6 +252,15 @@ scan_surface_files0() {
           -o -name '*.yaml' -o -name '*.sh' -o -name '*.bash' -o -name '*.json' \
           -o -name Makefile \) -print0 2>/dev/null \)
 }
+# SHA-1 helper: macOS ships `shasum` (perl) but not `sha1sum`; minimal Linux
+# images (e.g. HPC compute nodes) ship `sha1sum` but not `shasum`. A missing
+# hasher must be a hard error, never an empty string: an empty digest collapses
+# EVERY cache key to one shared entry, so every request — any args, any tree —
+# serves the same stale exit code and log (observed on MSI compute nodes: a
+# whole CI loop fake-greened by one cached `cargo update` log).
+if command -v shasum >/dev/null 2>&1; then SHA1_BIN=shasum
+elif command -v sha1sum >/dev/null 2>&1; then SHA1_BIN=sha1sum
+else echo "[build.sh] FATAL: neither shasum nor sha1sum on PATH — cache keys would collapse" >&2; exit 70; fi
 tree_hash() {
   # Source signature from file METADATA (mtime+size+path), NOT content. A full
   # content shasum reads every one of ~2.5k scanned files on EACH call; with a
@@ -260,14 +269,14 @@ tree_hash() {
   # edit bumps mtime (and Cargo.lock is included so dep bumps invalidate) an agent
   # always sees its own change. Set GAM_CONTENT_HASH=1 to force exact content hash.
   if [[ -n "${GAM_CONTENT_HASH:-}" ]]; then
-    { scan_surface_files0 | sort -z | xargs -0 shasum 2>/dev/null
-      shasum "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+    { scan_surface_files0 | sort -z | xargs -0 "$SHA1_BIN" 2>/dev/null
+      "$SHA1_BIN" "$REPO/Cargo.lock" 2>/dev/null; } | "$SHA1_BIN" | cut -d' ' -f1
   else
     { scan_surface_files0 | sort -z | xargs -0 stat "${STAT_ARGS[@]}" 2>/dev/null
-      stat "${STAT_ARGS[@]}" "$REPO/Cargo.lock" 2>/dev/null; } | shasum | cut -d' ' -f1
+      stat "${STAT_ARGS[@]}" "$REPO/Cargo.lock" 2>/dev/null; } | "$SHA1_BIN" | cut -d' ' -f1
   fi
 }
-sha_str() { printf '%s' "$1" | shasum | cut -d' ' -f1; }
+sha_str() { printf '%s' "$1" | "$SHA1_BIN" | cut -d' ' -f1; }
 normalize_req() {
   # Canonical request identity for LIVE coalescing. Persistent cache keys remain
   # content-sensitive; this only decides whether two currently in-flight callers
@@ -520,6 +529,11 @@ run_request() {
   banscan_fast_fail
   REQNORM="$(normalize_req "$REQ")"; REQHASH="$(sha_str "$REQNORM")"
   TREE="$(tree_hash)"; KEY="$(sha_str "$REQ"$'\n'"$TREE")"
+  # An empty digest must never become a cache path: KEY="" makes CACHE=$CACHEDIR
+  # itself, one shared entry for every request (the fake-green failure mode).
+  if [[ -z "$KEY" || -z "$REQHASH" ]]; then
+    echo "[build.sh] FATAL: empty cache key (hasher failed) — refusing to serve/write shared cache" >&2; exit 70
+  fi
   CACHE="$CACHEDIR/$KEY"
 
   # Forced run: skip cache-read + coalescing, execute, then refresh the cache.
