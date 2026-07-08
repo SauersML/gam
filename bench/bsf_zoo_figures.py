@@ -156,13 +156,13 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
     for path in files:
         npz = np.load(path)
         stores[_cloud_meta(npz)["featurizer"]] = npz
-    col_order = [k for k in ("ours_rust", "ours_torch", "flat_topk") if k in stores]
+    col_order = [k for k in ("ours_rust", "ours_torch", "flat_topk", "oracle") if k in stores]
     if not col_order:
         return
     ref = stores[col_order[0]]
     factors = [m for m in _cloud_meta(ref)["factors"]][:max_factors]
     n_rows, n_cols = len(factors), 1 + len(col_order)
-    fig = plt.figure(figsize=(2.5 * n_cols, 2.35 * n_rows), dpi=200)
+    fig = plt.figure(figsize=(2.4 * n_cols, 2.0 * n_rows), dpi=200)
     fig.patch.set_facecolor(SURFACE)
     for r, meta in enumerate(factors):
         i = meta["factor"]
@@ -175,6 +175,11 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
             store = stores[name]
             key = f"rec_{i}"
             panels.append((name, store[key] if key in store else None))
+        # One shared cube per row, sized by the TRUE cloud, so a recovered
+        # cloud's near-zero residual directions cannot be autoscaled into
+        # fake-looking noise.
+        true_cloud = panels[0][1]
+        lim = float(np.max(np.abs(true_cloud))) * 1.08 + 1e-9
         for c, (name, cloud) in enumerate(panels):
             ax = fig.add_subplot(n_rows, n_cols, r * n_cols + c + 1, projection="3d")
             ax.set_facecolor(SURFACE)
@@ -183,6 +188,9 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
                            cloud[:, 2] if cloud.shape[1] > 2 else np.zeros(len(cloud)),
                            c=hue[: len(cloud)], cmap=cmap, s=2.2, alpha=0.75,
                            linewidths=0)
+                ax.set_xlim(-lim, lim)
+                ax.set_ylim(-lim, lim)
+                ax.set_zlim(-lim, lim)
             else:
                 ax.text2D(0.5, 0.5, "n/a", transform=ax.transAxes, ha="center",
                           color=INK_MUTED, fontsize=9)
@@ -196,7 +204,8 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
                           fontsize=8.5, color=INK_2)
     fig.suptitle("Recovered concept manifolds — hue is the TRUE intrinsic coordinate",
                  fontsize=12.5, color=INK, x=0.02, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.01,
+                        hspace=0.02, wspace=0.02)
     fig.savefig(out, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
 
