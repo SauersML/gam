@@ -173,7 +173,6 @@ impl SaeManifoldTerm {
             Ok(jets) => jets,
             Err(_) => return Ok(0.0),
         };
-        let coord_offsets = self.assignment.coord_offsets();
         let ard_axis_periods: Vec<Vec<Option<f64>>> = self
             .assignment
             .coords
