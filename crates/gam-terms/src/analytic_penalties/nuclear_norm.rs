@@ -148,8 +148,7 @@ impl NuclearNormPenalty {
         self.max_rank.unwrap_or(thin_rank).min(thin_rank)
     }
 
-    /// PSD-floored squared smoothed singular value `max(σ² + ε², eig_floor)`,
-    /// with `eig_floor = max(ε², 1e-15)`.
+    /// Shift-regularized squared smoothed singular value `σ² + max(ε², 1e-15)`.
     ///
     /// This is the single regularized spectrum shared by `value`, `grad_target`
     /// and the HVP's right-Gram filter, so that the smoothed nuclear norm
@@ -163,9 +162,16 @@ impl NuclearNormPenalty {
     /// PSD-roundoff robustness (651d827e6); applying it everywhere preserves
     /// that protection without reintroducing the desync.
     fn regularized_sigma_sq(&self, sigma_sq: f64) -> f64 {
+        // Pure SHIFT, never a clamp: `σ² + max(ε², 1e-15)`. A clamp
+        // (`max(σ²+ε², floor)`) makes the value constant in σ on the clamped
+        // branch while the σ/√(·) gradient and the spectral HVP filters keep
+        // their smooth-branch slopes — a value/gradient/HVP desync whenever
+        // ε² < 1e-15. The shift is affine in σ², so every consumer (value,
+        // gradient, divided-difference filters) differentiates it exactly, and
+        // for ε² ≥ 1e-15 it is bit-identical to the old clamp (which never
+        // bound there).
         let eps2 = self.smoothing_eps * self.smoothing_eps;
-        let eig_floor = eps2.max(1.0e-15);
-        (sigma_sq + eps2).max(eig_floor)
+        sigma_sq + eps2.max(1.0e-15)
     }
 
     /// Number of leading right-Gram eigen-directions (top singular values) the

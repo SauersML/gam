@@ -328,9 +328,17 @@ impl SaeManifoldRho {
     /// finite-normal band, so the resulting strength is always a finite,
     /// strictly-positive `f64` (no overflow to `inf`, no underflow to `0.0`).
     pub(crate) fn stable_exp_strength(log_strength: f64) -> f64 {
+        Self::clamped_log_strength(log_strength).exp()
+    }
+
+    /// The clamped log-strength [`Self::stable_exp_strength`] exponentiates.
+    /// Every consumer that needs the strength in LOG space (e.g. the REML
+    /// smoothing-Occam normalizer `½·d·log λ`) must read THIS, not the raw
+    /// coordinate, so value and log conventions describe the same λ_eff.
+    pub(crate) fn clamped_log_strength(log_strength: f64) -> f64 {
         const MAX_LOG_STRENGTH: f64 = 700.0;
         const MIN_LOG_STRENGTH: f64 = -700.0;
-        log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH).exp()
+        log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH)
     }
 
     /// Flatten ρ into the contiguous outer-coordinate vector the generic

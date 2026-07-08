@@ -286,6 +286,30 @@ fn current_residual(
 /// Frozen (`inner_max_iter == 0`, the #850 freeze) joint REML criterion of a term
 /// at its current `(t, β)` — evaluate-don't-optimize. This is the joint-Laplace
 /// evidence at a fixed converged state (`loss.total() + extra penalties + ½
+
+/// Refresh the structured per-row metric on the FINAL residual before a
+/// terminal frozen joint evidence: the birth loop installs Σ⁻¹ fitted BEFORE
+/// each birth, so after the last accepted birth the installed metric still
+/// describes the PREVIOUS dictionary's residual. Scoring the terminal composed
+/// tier under that stale Σ prices the data term as ½·R_{t+1}ᵀ·M_t·R_{t+1};
+/// the stated convention is the running covariance of the residual actually
+/// being scored. No-op when structured whitening is off or the final residual
+/// carries no factor structure.
+fn refresh_terminal_row_metric(
+    term: &mut SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    config: &StagewiseConfig,
+) -> Result<(), String> {
+    if !config.structured_whitening {
+        return Ok(());
+    }
+    let residual = current_residual(term, target)?;
+    if let Some((_, model)) = fit_residual_covariance_on(term, residual, config)? {
+        term.set_row_metric(model.row_metric(target.nrows())?)?;
+    }
+    Ok(())
+}
+
 /// log|H| − Occam`), the quantity the birth evidence gate and the terminal
 /// assembly compare on. Lower is better evidence.
 pub fn frozen_joint_evidence(
@@ -1593,6 +1617,7 @@ pub fn fit_stagewise(
     }
 
     // ── Phase 3 — terminal frozen joint evidence of the composed tier ──────────
+    refresh_terminal_row_metric(&mut term, target, config)?;
     let (terminal_joint_reml, terminal_joint_loss) =
         frozen_joint_evidence(&mut term, target, &rho, registry, config)?;
 
@@ -2190,6 +2215,7 @@ pub fn fit_stagewise_batched(
     }
 
     // ── Phase 3 — terminal frozen joint evidence of the composed tier ───────────
+    refresh_terminal_row_metric(&mut term, target, base)?;
     let (terminal_joint_reml, terminal_joint_loss) =
         frozen_joint_evidence(&mut term, target, &rho, registry, base)?;
     term.set_guards_enabled(true);

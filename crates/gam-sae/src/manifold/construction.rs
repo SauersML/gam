@@ -2275,32 +2275,14 @@ impl SaeManifoldTerm {
         self.atoms[0].output_dim()
     }
 
-    /// gam#2144 — `true` when a rank-deficient whitening metric (`metric_rank < p`)
-    /// is installed, so the assembly PSD-majorizes the IBP curvature. The
-    /// θ-adjoint / ρ-trace contractions read this to differentiate the SAME
-    /// majorized operator the evidence log-det factors. `false` (bit-identical
-    /// legacy path) for the identity metric (`rank == p`) or no metric.
-    ///
-    /// NOTE: this gates the low-rank PSD *majorization* ONLY. Whitening of the
-    /// log-det row jets is a separate concern — the assembly whitens the
-    /// likelihood Hessian (`JᵀU UᵀJ`) whenever the metric `whitens_likelihood()`,
-    /// at ANY rank, so the row jets must be whitened under the same predicate
-    /// (`whiten_logdet_row_jets()`), NOT only when rank-deficient. A full-rank
-    /// non-identity whitening factor (e.g. `diag(1,2)`) still rescales the
-    /// output-space derivatives; gating whitening on rank-deficiency alone would
-    /// differentiate `JᵀJ` against an assembled `JᵀU UᵀJ`.
-    pub(crate) fn ibp_low_rank_whiten(&self) -> bool {
-        let p = self.output_dim();
-        self.row_metric
-            .as_ref()
-            .is_some_and(|m| m.whitens_likelihood() && m.metric_rank() < p)
-    }
-
     /// gam#2144 — `true` when the installed row metric whitens the likelihood at
     /// ANY rank. Drives whitening of the log-det row jets so they differentiate
     /// the SAME whitened operator (`JᵀU UᵀJ`) the assembly builds. Independent of
-    /// [`ibp_low_rank_whiten`], which additionally requires rank-deficiency for
-    /// the PSD majorization. `false` for the identity metric or no metric.
+    /// the IBP PSD majorization, which (#2144/#1038) is UNCONDITIONAL — the
+    /// assembly, evidence log-det, ρ-trace, and θ-adjoint all carry the majorized
+    /// IBP curvature on every path, whitened or not, so there is no rank-gated
+    /// majorization predicate anymore. `false` for the identity metric or no
+    /// metric.
     pub(crate) fn whiten_logdet_row_jets(&self) -> bool {
         self.row_metric
             .as_ref()
@@ -6155,7 +6137,14 @@ impl SaeManifoldTerm {
             // Penalized decoder dimension: `r_k` coordinate channels carry the
             // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            let log_lambda = rho.log_lambda_smooth[atom_idx];
+            // The SAME clamped log-strength the penalty/Hessian channels
+            // exponentiate: past the ±700 band λ_eff is constant, so the
+            // normalizer must be too — a raw coordinate would let the criterion
+            // drift linearly while the model it scores is frozen. (The outer
+            // walk is bounded at |ρ| ≤ 30, so the band is unreachable in
+            // production; this keeps the two conventions identical anyway.)
+            let log_lambda =
+                SaeManifoldRho::clamped_log_strength(rho.log_lambda_smooth[atom_idx]);
             acc += 0.5 * (penalized_channel_dim as f64) * log_lambda;
         }
         // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer.
@@ -6163,16 +6152,26 @@ impl SaeManifoldTerm {
     }
 
     /// Per-atom derivative `∂(occam)/∂log λ_smooth[k]` (#1556): atom `k`'s entry
-    /// is `½·r_k·rank(S_k)`, matching the per-atom Occam term in
-    /// [`Self::reml_occam_term`] (the unpenalized-frame `frame_dim` term carries
-    /// no `log λ` dependence and is therefore absent from both). Returns one
-    /// entry per atom in atom order.
-    pub(crate) fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<Vec<f64>, String> {
+    /// is `½·r_k·rank(S_k)` inside the ±700 clamp band and `0` outside it
+    /// (where [`Self::reml_occam_term`] reads the clamped, constant
+    /// log-strength), matching the per-atom Occam term exactly. The
+    /// unpenalized-frame `frame_dim` term carries no `log λ` dependence and is
+    /// absent from both. Returns one entry per atom in atom order.
+    pub(crate) fn reml_occam_log_lambda_smooth_derivative(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<f64>, String> {
         let mut out = Vec::with_capacity(self.atoms.len());
-        for atom in &self.atoms {
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            out.push(0.5 * (penalized_channel_dim as f64));
+            let raw = rho.log_lambda_smooth[atom_idx];
+            let inside_band = SaeManifoldRho::clamped_log_strength(raw) == raw;
+            out.push(if inside_band {
+                0.5 * (penalized_channel_dim as f64)
+            } else {
+                0.0
+            });
         }
         Ok(out)
     }
@@ -6911,28 +6910,27 @@ impl SaeManifoldTerm {
                 ..
             }
         );
-        // gam#2144: under low-rank whitening the assembled `H` carries the
-        // PSD-majorized IBP curvature (`ibp_psd_majorized_hdiag` + clamped Woodbury
-        // `d`). Differentiate the SAME operator: overwrite the per-slot diagonal
-        // with its majorizer and clamp the rank-one coefficient (`cross_row_d`, and
-        // its learnable-α derivative) to `max(·,0)`. `self_curv`, the diagonal
-        // trace, and the cross-row off-diagonal pass all read these, so the whole
-        // ρ-trace stays on the majorized operator. No-op (bit-identical) otherwise.
-        if self.ibp_low_rank_whiten() {
-            if let Some(ch) = cross_channels.as_mut() {
-                for row in 0..self.n_obs() {
-                    for atom in 0..k_atoms {
-                        let slot = row * k_atoms + atom;
-                        hdiag[slot] = super::construction_arrow_schur_assembly::ibp_psd_majorized_hdiag(
-                            ch, row, k_atoms, atom, hdiag[slot],
-                        );
-                    }
+        // gam#2144/#1038: the assembled `H` carries the PSD-majorized IBP
+        // curvature UNCONDITIONALLY (`ibp_psd_majorized_hdiag` + clamped Woodbury
+        // `d` — the same doctrine as softmax's #1419 Gershgorin). Differentiate the
+        // SAME operator: overwrite the per-slot diagonal with its majorizer and
+        // clamp the rank-one coefficient (`cross_row_d`, and its learnable-α
+        // derivative) to `max(·,0)`. `self_curv`, the diagonal trace, and the
+        // cross-row off-diagonal pass all read these, so the whole ρ-trace stays on
+        // the majorized operator the evidence log-det factors.
+        if let Some(ch) = cross_channels.as_mut() {
+            for row in 0..self.n_obs() {
+                for atom in 0..k_atoms {
+                    let slot = row * k_atoms + atom;
+                    hdiag[slot] = super::construction_arrow_schur_assembly::ibp_psd_majorized_hdiag(
+                        ch, row, k_atoms, atom, hdiag[slot],
+                    );
                 }
-                for k in 0..k_atoms {
-                    if ch.cross_row_d[k] < 0.0 {
-                        ch.cross_row_d[k] = 0.0;
-                        ch.cross_row_d_logalpha[k] = 0.0;
-                    }
+            }
+            for k in 0..k_atoms {
+                if ch.cross_row_d[k] < 0.0 {
+                    ch.cross_row_d[k] = 0.0;
+                    ch.cross_row_d_logalpha[k] = 0.0;
                 }
             }
         }
@@ -8160,20 +8158,17 @@ impl SaeManifoldTerm {
         // `logit_curvature`) contracts the `∂/∂ℓ_w (d_k·J_ik·J_jk)` rank-one
         // derivative — so value, logdet, ρ-trace, and θ-adjoint all differentiate
         // the one operator `H = H₀ + Σ_k d_k u_k u_kᵀ`.
-        // gam#2144: under a low-rank whitening metric the assembly PSD-majorizes
-        // the IBP curvature, so the θ-adjoint must differentiate the MAJORIZED
-        // channels (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
-        // `local_logit_third`) and the majorized diagonal — else the outer-REML
-        // gradient desyncs from the majorized evidence log-det. Bit-identical
-        // (`false`) on the identity/no-metric path.
-        let majorize_ibp = self.ibp_low_rank_whiten();
+        // gam#2144/#1038: the assembly PSD-majorizes the IBP curvature
+        // UNCONDITIONALLY, so the θ-adjoint differentiates the MAJORIZED channels
+        // (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
+        // `local_logit_third`) — the exact derivative of the operator the evidence
+        // log-det factors, on every IBP path. Anything else desyncs the outer-REML
+        // gradient from the evidence (#2087).
         // gam#2144: whitening of the row jets tracks `whitens_likelihood()` at ANY
-        // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike),
-        // whereas `majorize_ibp` additionally requires rank-deficiency for the PSD
-        // majorization. Split the two so a full-rank non-identity metric still
-        // whitens the jets.
+        // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike) and is
+        // independent of the PSD majorization.
         let whiten_row_jets = self.whiten_logdet_row_jets();
-        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, majorize_ibp)?;
+        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, true)?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
         // `block.htt` has off-diagonal logit terms whose θ-derivative the adjoint

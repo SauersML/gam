@@ -1179,11 +1179,16 @@ impl LearnedGraphAtom {
         .map_err(|e| {
             format!("LearnedGraphAtom::spectral_race_candidate: REML decode fit: {e:?}")
         })?;
-        let q = basis.selected_q();
         Ok(SpectralGraphRaceCandidate {
             basis_kind: SaeAtomBasisKind::Precomputed("spectral_graph".to_string()),
             manifold: LatentManifold::Euclidean,
-            latent_dim: q,
+            // The candidate's coordinates ARE the ambient row embeddings (n × r),
+            // and the Nyström jet differentiates w.r.t. those r embedding
+            // channels — so the declared latent dimension is r, matching
+            // `row_coords`/`jet`, NOT the spectral basis width q (which lives in
+            // `phi`/`decoder`/`rank_charge_dof`). Declaring q here handed
+            // consumers a `(n, q, r)` jet labelled `(n, q, q)`.
+            latent_dim: row_embeddings.ncols(),
             row_coords: row_embeddings.to_owned(),
             phi,
             jet,

@@ -880,11 +880,16 @@ impl SaeManifoldTerm {
                 Ok((_, sv, _)) => sv,
                 Err(_) => continue,
             };
-            // −½ log det F = −½ Σ log λ_i (F is symmetric PSD ⇒ eigenvalues = its
-            // singular values; floored at ε so exact collapse is a bounded −½ log ε).
+            // −½ log det(F + εI), identity-referenced: the ε-SHIFTED Jeffreys
+            // barrier. Shifting (rather than flooring) keeps the pole bounded
+            // (an exactly-collapsed direction contributes −½·ln ε) while the
+            // gradient (F + εI)⁻¹ is the EXACT derivative of this value
+            // everywhere — no sub-floor value/gradient mismatch, no Armijo
+            // conservatism at the pole. The per-eigenvalue −ln(1+ε) reference
+            // keeps a mutually-orthogonal co-active set (F = I) at exactly 0.
             let mut logdet = 0.0_f64;
             for &lam in sv.iter() {
-                logdet += lam.max(eps).ln();
+                logdet += (lam + eps).ln() - (1.0 + eps).ln();
             }
             acc += -0.5 * logdet;
         }
@@ -1050,17 +1055,16 @@ impl SaeManifoldTerm {
                 Ok((_, sv, Some(vt))) => (sv, vt),
                 _ => continue,
             };
-            // G = Σ_i (1/max(λ_i,ε)) vᵢ vᵢᵀ — the ε-floored inverse of the PSD F,
-            // sharing one factorization with the value's floored `log det`. Above
-            // the floor this is the exact derivative; BELOW it the slope is
-            // deliberately CLAMPED at 1/ε rather than the floored value's literal
-            // zero (an interior-point barrier must keep a bounded restoring force
-            // at the pole — a zero sub-ε gradient would flat-line the collapse
-            // state instead of pushing out of it; the mismatch only makes the
-            // Armijo check conservative in the sub-ε regime).
+            // G = (F + εI)⁻¹ = Σ_i vᵢ vᵢᵀ/(λ_i + ε) — the EXACT derivative of the
+            // ε-shifted value −½·Σ ln(λ+ε), sharing one factorization with it.
+            // The shift keeps the interior-point desideratum the old floor bought
+            // (a bounded restoring force ≤ 1/ε at the pole — a collapsed state is
+            // still pushed out of, never flat-lined) with zero value/gradient
+            // mismatch, so the line search's Armijo contract is exact at the pole
+            // too.
             let mut g = Array2::<f64>::zeros((s, s));
             for (i, &lam) in sv.iter().enumerate() {
-                let inv = 1.0 / lam.max(eps);
+                let inv = 1.0 / (lam + eps);
                 for a in 0..s {
                     let va = vt[[i, a]];
                     if va == 0.0 {

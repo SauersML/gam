@@ -337,7 +337,7 @@ impl SaeManifoldTerm {
                 reason: format!("analytic_outer_rho_gradient_components: {err}"),
             })?;
         let smooth_occam = self
-            .reml_occam_log_lambda_smooth_derivative()
+            .reml_occam_log_lambda_smooth_derivative(rho)
             .map_err(OuterGradientError::internal)?;
         for atom_idx in 0..k_smooth {
             explicit[1 + atom_idx] = smooth_explicit[atom_idx];
