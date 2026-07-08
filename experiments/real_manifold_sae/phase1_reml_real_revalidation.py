@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import traceback
 from pathlib import Path
@@ -29,13 +30,40 @@ from pathlib import Path
 import numpy as np
 
 
-def load_slice(root: Path, category: str, n_rows: int, seed: int) -> np.ndarray:
+def load_slice(root: Path, category: str, n_rows: int, seed: int, cache_dir: Path | None) -> np.ndarray:
+    """Row-sample the activation memmap, with an atomic shared cache so parallel
+    jobs and restarts pay the 700GB-memmap gather exactly once per slice key."""
+    cache = None
+    if cache_dir is not None:
+        cache = cache_dir / f"slice_{category}_n{n_rows}_s{seed}.npy"
+        if cache.exists():
+            print(f"[phase1] slice cache hit: {cache}", flush=True)
+            return np.load(cache)
     acts = np.load(root / category / "activations.npy", mmap_mode="r")
     n_total = acts.shape[0]
     rng = np.random.default_rng(seed)
     idx = np.sort(rng.choice(n_total, size=min(n_rows, n_total), replace=False))
     z = np.asarray(acts[idx], dtype=np.float32)
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(f".tmp{os.getpid()}")
+        np.save(tmp, z)
+        os.replace(tmp, cache)  # atomic: concurrent writers race harmlessly
     return z
+
+
+def already_done(out: Path) -> set[str]:
+    """Config names already recorded in the output JSONL — the resume set."""
+    done: set[str] = set()
+    if out.exists():
+        for line in out.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("name"):
+                done.add(rec["name"])
+    return done
 
 
 class PcaCache:
@@ -111,6 +139,8 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", type=Path, default=Path("phase1_results.jsonl"))
     ap.add_argument("--only", default=None, help="comma-separated config names to run")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="shared dir for the sampled-slice cache (resume + cross-job reuse)")
     args = ap.parse_args()
 
     # Three families:
@@ -139,8 +169,16 @@ def main() -> None:
         wanted = set(args.only.split(","))
         configs = [c for c in configs if c["name"] in wanted]
 
+    done = already_done(args.out)
+    configs = [c for c in configs if c["name"] not in done]
+    if done:
+        print(f"[phase1] resume: skipping {sorted(done)}", flush=True)
+    if not configs:
+        print("[phase1] ALL CONFIGS DONE (resume: nothing left)", flush=True)
+        return
+
     print(f"[phase1] loading {args.n_rows} rows from {args.root}/{args.category}", flush=True)
-    z_raw = load_slice(args.root, args.category, args.n_rows, args.seed)
+    z_raw = load_slice(args.root, args.category, args.n_rows, args.seed, args.cache_dir)
     print(f"[phase1] slice {z_raw.shape} dtype={z_raw.dtype}", flush=True)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
