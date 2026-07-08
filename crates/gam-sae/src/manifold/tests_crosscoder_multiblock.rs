@@ -183,6 +183,16 @@ fn diag_crosscoder_sweep_sensitivity() {
             "DIAG sweeps={sweeps}: anchor_EV={ev_a:.4} layer2_EV={ev_2:.4} logλ2={:.4} conv={}",
             report.blocks[0].log_lambda, report.converged
         );
+        assert!(
+            ev_a.is_finite() && ev_2.is_finite() && report.blocks[0].log_lambda.is_finite(),
+            "sweeps={sweeps}: crosscoder sweep produced non-finite diagnostics \
+             (anchor_EV={ev_a}, layer2_EV={ev_2}, logλ2={})",
+            report.blocks[0].log_lambda
+        );
+        assert!(
+            ev_2 > -1.0,
+            "sweeps={sweeps}: layer2 EV diverged catastrophically ({ev_2})"
+        );
     }
 }
 

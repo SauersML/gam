@@ -6456,6 +6456,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
         None,
         None,
         2,
+        None,
         &mut workspace,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "plus ops", e));
@@ -6469,6 +6470,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
         None,
         None,
         2,
+        None,
         &mut workspace,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus ops", e));
@@ -6561,6 +6563,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         None,
         None,
         2,
+        None,
         &mut workspace,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "base ops", e));
@@ -6577,6 +6580,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         None,
         None,
         2,
+        None,
         &mut workspace,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "plus ops", e));
@@ -6590,6 +6594,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         None,
         None,
         2,
+        None,
         &mut workspace,
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus ops", e));

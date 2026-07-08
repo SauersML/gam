@@ -488,7 +488,6 @@ fn topology_records_dict<'py>(
 }
 
 fn topology_records_from_codes(
-    codes: ndarray::ArrayView2<'_, f32>,
     coordinate_reports: &[gam::terms::sae::sparse_dict::BlockCoordinateReport],
     block_size: usize,
     activation_threshold: f32,
@@ -1126,6 +1125,7 @@ fn standing_null_calibration(
 /// long-standing keyword defaults; [`SaeAuditOptions::from_pydict`] overlays
 /// caller-provided keys on top of them and hard-errors on unknown keys so a
 /// typo can never silently fall back to a default.
+#[derive(Debug)]
 struct SaeAuditOptions {
     active: Option<usize>,
     block_size: usize,
@@ -1550,7 +1550,6 @@ fn audit_sae<'py>(
         };
 
         let topology_records = topology_records_from_codes(
-            code_values.view(),
             &coordinate_reports,
             block_size,
             activation_threshold,
