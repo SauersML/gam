@@ -543,6 +543,12 @@ pub(crate) fn pair_trig_decoder_sup(
     (0.5 * (trace + disc)).sqrt()
 }
 
+/// Per-harmonic reconstruction jet sups of a periodic atom. `decoder` MUST be
+/// the FULL-width decoder on the standard `[1, sin 2πt, cos 2πt, …]` inner
+/// basis: the row pairing below identifies rows `(2h−1, 2h)` as the harmonic-`h`
+/// `(sin, cos)` pair and prices them at `ω = 2πh`. A #1117 rank-reduced decoder
+/// `B̃ = Qᵀ B` has NO such row meaning (each reduced row mixes all harmonics),
+/// so callers re-expand through `Q` first — see [`reconstruction_jet_sups`].
 pub(crate) fn periodic_reconstruction_jet_sups(
     decoder: ArrayView2<'_, f64>,
 ) -> ReconstructionJetSups {
@@ -584,10 +590,23 @@ pub(crate) fn reconstruction_jet_sups(
     atom: &SaeManifoldAtom,
     sups: JetSups,
 ) -> ReconstructionJetSups {
+    // `sups` bounds the FULL-width family (see `family_jet_sups`), so the
+    // decoder it pairs with must be the full-width pre-image `B = Q B̃` when the
+    // atom was #1117 rank-reduced. The reconstruction is identical through that
+    // frame (`Φ̃ B̃ = Φ (Q B̃)`), so the bound is exact-in-structure; pairing the
+    // full sups with the reduced `B̃` instead would price periodic rows at the
+    // wrong harmonic and mismatch the family the sups were taken over.
+    let full_decoder = atom
+        .reduced_column_map
+        .is_some()
+        .then(|| atom.full_width_decoder());
+    let decoder = full_decoder
+        .as_ref()
+        .map_or_else(|| atom.decoder_coefficients.view(), |b| b.view());
     if matches!(atom.basis_kind, crate::manifold::SaeAtomBasisKind::Periodic) {
-        periodic_reconstruction_jet_sups(atom.decoder_coefficients.view())
+        periodic_reconstruction_jet_sups(decoder)
     } else {
-        let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
+        let decoder_norm_sum = decoder_row_norm_sum(decoder);
         ReconstructionJetSups {
             value: decoder_norm_sum * sups.value,
             jacobian: decoder_norm_sum * sups.jacobian,
@@ -831,12 +850,26 @@ pub(crate) const SAE_CYLINDER_LINE_DEGREE: usize = 2;
 /// atlas needs to evaluate the jet sups, which live on the concrete evaluator
 /// types; the atom carries the evaluator as `Arc<dyn SaeBasisEvaluator>`, so we
 /// reconstruct the family bound from the atom's basis kind + width + centers.
+///
+/// The width used is the FULL inner-basis width [`SaeManifoldAtom::full_basis_size`],
+/// never the stored (possibly #1117 rank-reduced) [`SaeManifoldAtom::basis_size`].
+/// After [`SaeManifoldAtom::reduce_basis_to_subspace`] the live columns are
+/// Q-mixtures `Φ̃ = Φ Q` of the fixed-width family, so a family rebuilt at the
+/// REDUCED width bounds the wrong function space — a 5-wide periodic atom reduced
+/// to `r = 3` would be bounded as a single-harmonic family (under-estimating the
+/// `g`-th jet by `2^g`), and a degree-2 patch reduced to `r = 2` would be bounded
+/// as affine (`L = 0` ⇒ every start "certifies": a FALSE Kantorovich
+/// certificate, violating the module invariant that every bound over-estimates).
+/// The sups returned here bound the FULL-width family; [`reconstruction_jet_sups`]
+/// pairs them with the full-width decoder pre-image `B = Q B̃`, against which the
+/// reconstruction is IDENTICAL (`Φ̃ B̃ = Φ (Q B̃)`), so the certificate frame never
+/// sees the reduction and stays sound.
 pub(crate) fn family_jet_sups(
     atom: &SaeManifoldAtom,
     chart: &ChartRegion,
 ) -> Result<JetSups, String> {
     use crate::manifold::SaeAtomBasisKind::*;
-    let m = atom.basis_size();
+    let m = atom.full_basis_size();
     let d = atom.latent_dim;
     let sups = match &atom.basis_kind {
         Periodic => {
@@ -1668,7 +1701,11 @@ impl EncodeAtlas {
                 centers.nrows()
             ));
         }
-        let decoder_norm_sum = decoder_row_norm_sum(atom.decoder_coefficients.view());
+        // Full-width frame (matches `family_jet_sups` / `reconstruction_jet_sups`):
+        // the atlas's stored decoder scaling must pair with the full-width family
+        // sups, so a #1117 rank-reduced atom contributes `Σ‖(Q B̃)_{m,:}‖`, not the
+        // reduced-row sum. Identical for an un-reduced atom.
+        let decoder_norm_sum = decoder_row_norm_sum(atom.full_width_decoder().view());
         let mut charts = Vec::with_capacity(centers.nrows());
         // HONEST REFUSAL for Duchon atoms (F2/F3): the closed-form Hessian-Lipschitz
         // bound available here (`family_jet_sups` Duchon arm) hard-codes cubic-r³
