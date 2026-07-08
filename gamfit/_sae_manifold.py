@@ -284,25 +284,22 @@ def _canonical_n_harmonics(
 
 
 def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
-    """e-BH confirmed set, mirroring `inference::structure_evidence::e_benjamini_hochberg`.
+    """e-BH confirmed-claim set, via the Rust source of truth.
 
-    Sort claims by descending log e-value; confirm the prefix up to the largest
-    rank `k` whose k-th-largest log e-value clears `ln(m) - ln(alpha) - ln(k)`
-    (i.e. `e_(k) >= m / (alpha * k)`). FDR <= alpha over the confirmed set under
-    arbitrary dependence; valid at any stopping time.
+    Thin wrapper over ``inference::structure_evidence::e_benjamini_hochberg``
+    (FFI ``e_bh_dictionary_certificate``): the whole selection procedure — sort by
+    descending log e-value, confirm the prefix up to the largest rank ``k`` whose
+    k-th-largest log e-value clears ``ln(m) − ln(alpha) − ln(k)`` — runs once in
+    the core, never mirrored in Python. Returns the indices of the confirmed
+    claims (FDR ≤ ``alpha`` under arbitrary dependence, valid at any stopping
+    time). Guards the degenerate inputs the FFI does not accept (``m == 0`` or a
+    non-positive ``alpha``) as the empty set, matching the previous contract.
     """
-    import math
-
-    m = len(log_e_values)
-    if m == 0 or not (alpha > 0.0):
+    if len(log_e_values) == 0 or not (alpha > 0.0):
         return []
-    order = sorted(range(m), key=lambda i: log_e_values[i], reverse=True)
-    k_star = 0
-    for rank0, idx in enumerate(order):
-        k = rank0 + 1
-        if log_e_values[idx] >= math.log(m) - math.log(alpha) - math.log(k):
-            k_star = rank0 + 1
-    return order[:k_star]
+    return [int(i) for i in rust_module().e_bh_dictionary_certificate(
+        [float(v) for v in log_e_values], float(alpha)
+    )]
 
 
 def _structure_claim_label(kind: Any) -> str:
@@ -436,33 +433,28 @@ _ALPHA_UNSET: Any = object()
 def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
     """K-aware default IBP concentration ``α`` (#1784).
 
-    Mirror of the Rust source of truth
-    ``gam_sae::manifold::assignment::default_ibp_concentration_for_k_atoms``.
-    The ordered stick-breaking prior mean ``π_k = (α/(α+1))^{k+1}`` decays
-    GEOMETRICALLY in the atom index, so the historical fixed default ``α = 1``
-    (the ``(0.5)^{k+1}`` schedule) collapses to a near-hard mask past atom ~3: a
-    K-atom dictionary can then only place mass on its first handful of atoms,
-    which is why the manifold SAE underfit a linear dictionary of equal K on real
-    activations and why its late atoms carried zero mass — leaving the per-row
-    joint Hessian rank-deficient (the K = 128 ``RemlConvergenceError``). Choosing
-    ``α`` so the LAST atom retains prior mass ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}``
-    makes the prior SPAN the whole dictionary while staying a monotone, honest
-    ordered stick-breaking prior (no atom structurally masked). Solving
-    ``(α/(α+1))^K = e^{-1}`` gives ``α = 1/(exp(1/K) − 1) ≈ K − 1/2``; floored at
-    ``1.0`` so ``K = 1`` keeps the historical ``α = 1``.
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_ibp_concentration_for_k_atoms`` (FFI
+    ``sae_default_ibp_concentration_for_k_atoms``): the formula
+    ``α = max(1, 1/(exp(1/K) − 1))`` is computed once in the core, never mirrored
+    in Python. Choosing ``α`` so the last atom retains prior mass
+    ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered stick-breaking prior SPAN
+    the whole dictionary (no atom structurally masked); floored at ``1.0`` so
+    ``K = 1`` keeps the historical ``α = 1``.
     """
-    k = float(max(int(k_atoms), 1))
-    return max(1.0, 1.0 / (math.expm1(1.0 / k)))
+    return float(rust_module().sae_default_ibp_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
 
 
 def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
-    n = int(n_obs)
-    k = int(k_atoms)
-    if n <= 0 or k <= 1:
-        return None
-    if n >= k * k:
-        return None
-    return max(1, min(k - 1, math.ceil(n / k)))
+    """Default large-K active cap from the data-per-atom ratio.
+
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_top_k_for_large_dictionary`` (FFI
+    ``sae_default_top_k_for_large_dictionary``): ``None`` when the dense softmax
+    path is admitted, else the per-row cap ``clamp(ceil(N/K), 1, K−1)``.
+    """
+    cap = rust_module().sae_default_top_k_for_large_dictionary(int(n_obs), int(k_atoms))
+    return None if cap is None else int(cap)
 
 
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
