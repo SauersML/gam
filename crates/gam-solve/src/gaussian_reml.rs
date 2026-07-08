@@ -432,6 +432,71 @@ pub fn gaussian_reml_point_eval_at_rho(
     })
 }
 
+/// Full stationary-point certificate of the closed-form Gaussian REML
+/// ρ-objective: every root of `∂V/∂ρ` the grid-free enumerator isolated on
+/// `[RHO_LOWER, RHO_UPPER]` (ascending), the globally selected ρ̂, the two
+/// window-endpoint costs, and whether the branch-and-bound bottomed out at its
+/// ρ-resolution floor. Diagnostic surface for auditing λ-selection completeness
+/// against a brute-force scan; the production optimizers ([`optimize_rho`] /
+/// `optimize_rho_no_alloc`) reduce through the SAME core and select the same ρ̂.
+#[derive(Clone, Debug)]
+pub struct GaussianRemlStationarySet {
+    pub roots: Vec<f64>,
+    pub selected_rho: f64,
+    pub endpoint_costs: [f64; 2],
+    pub hit_resolution_floor: bool,
+}
+
+/// Enumerate the closed-form Gaussian REML stationary set at the given design,
+/// exposing the [`GaussianRemlStationarySet`] certificate. Thin wrapper over the
+/// shared enumeration used by the production optimizer — added beside
+/// [`gaussian_reml_point_eval_at_rho`] rather than changing any existing public
+/// signature.
+pub fn gaussian_reml_stationary_set(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlStationarySet, EstimationError> {
+    let y2 = y.insert_axis(Axis(1));
+    let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
+    let endpoint_costs = [
+        prepared.evaluate(RHO_LOWER).cost,
+        prepared.evaluate(RHO_UPPER).cost,
+    ];
+    if prepared.cache.penalty_rank == 0 {
+        return Ok(GaussianRemlStationarySet {
+            roots: Vec::new(),
+            selected_rho: init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER),
+            endpoint_costs,
+            hit_resolution_floor: false,
+        });
+    }
+    let eval = |rho: f64| prepared.evaluate(rho);
+    let enclose = |a: f64, b: f64| {
+        reml_deriv_enclosure(
+            &prepared.cache,
+            prepared.ywy.view(),
+            prepared.projected_rhs_squared.view(),
+            prepared.n_effective,
+            prepared.n_outputs,
+            a,
+            b,
+        )
+    };
+    let mut roots = Vec::new();
+    let (selected_rho, hit_resolution_floor) =
+        enumerate_and_select_rho(&eval, &enclose, init_rho, |r, _e| roots.push(r))?;
+    Ok(GaussianRemlStationarySet {
+        roots,
+        selected_rho,
+        endpoint_costs,
+        hit_resolution_floor,
+    })
+}
+
 pub fn gaussian_reml_multi_closed_form(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -2818,6 +2883,472 @@ pub fn gaussian_reml_cyclic_multi_lambda_rho(
     Ok(rho)
 }
 
+// ============================================================================
+// Grid-free, provably-complete stationary-point enumeration for the closed-form
+// Gaussian-REML ρ-objective `V(ρ)` (ρ = ln λ).
+// ============================================================================
+//
+// The previous optimizer sampled `V′` on a fixed 96-point ρ grid and refined
+// the sign-change cells. A grid can only see stationary points it happens to
+// bracket: two roots inside one 0.625-wide cell (or a root pair narrower than
+// the sample spacing) are invisible, so the selected λ̂ was grid-resolution
+// limited. This replaces the grid with an interval-arithmetic branch-and-bound
+// that is guaranteed to enclose *every* root of `V′` on `[RHO_LOWER, RHO_UPPER]`
+// down to a derived ρ-resolution, then isolates each by the shared safeguarded
+// Newton refinement.
+//
+// ---- Analytic structure of V′ (single-sourced with the evaluator) ----------
+//
+// With λ = e^ρ and t_i = λ·δ_i (δ_i = `cache.penalty_eigenvalues` ≥ 0), the two
+// contributions of `gaussian_reml_logdet_term` / `gaussian_reml_dispersion_term`
+// give, using dt_i/dρ = t_i,
+//
+//   V′(ρ) = ½d·( Σ_i t_i/(1+t_i) − rank )                                 (g1)
+//         + ½ν·Σ_j [ Σ_i c²_ij · t_i/(1+t_i)² ] / dp_j(ρ)                 (g2)
+//
+//   dp_j(ρ) = ywy_j − Σ_i c²_ij/(1+t_i)   (residual deviance, strictly > 0,
+//                                          strictly increasing in ρ).
+//
+//   g1: each kernel t/(1+t) ∈ [0,1) is monotone ↑; the sum minus `rank`
+//       positive eigenvalues is strictly negative and rises to 0⁻ — g1 is
+//       monotone increasing.
+//   g2 ≥ 0: numerator kernel t/(1+t)² is a unimodal bump peaking at ¼ when t=1.
+//
+// V has poles only at λ = −1/δ_i < 0, i.e. outside the real ρ window, so V is
+// real-analytic on [RHO_LOWER, RHO_UPPER] ⇒ V′ has finitely many isolated roots
+// there. That finiteness is what makes exhaustive enumeration well-posed.
+//
+// ---- V″ and its kernel critical points -------------------------------------
+//
+//   V″(ρ) = ½d·Σ_i t_i/(1+t_i)²
+//         + ½ν·Σ_j [ dp″_j/dp_j − (dp′_j/dp_j)² ],
+//   dp′_j = Σ_i c²_ij·t_i/(1+t_i)²,   dp″_j = Σ_i c²_ij·t_i(1−t_i)/(1+t_i)³.
+//
+// The only non-monotone / non-unimodal kernel is k(t) = t(1−t)/(1+t)³ in dp″.
+// Differentiating and clearing (1+t)⁴ (documented derivation):
+//
+//   k′(t) = [ (1−2t)(1+t) − 3(t−t²) ] / (1+t)⁴
+//         = ( 1 − 4t + t² ) / (1+t)⁴.
+//
+// So the interior extrema of k are the roots of the fixed quadratic
+//
+//        t² − 4t + 1 = 0   ⇒   t = 2 ± √3,
+//
+// giving an EXACT range for k over any t-window by testing the two endpoints
+// and whichever of {2−√3, 2+√3} lies strictly inside. Every other kernel is
+// monotone (t/(1+t), 1/(1+t)) or unimodal with a known peak (t/(1+t)²), so each
+// admits an exact endpoint range.
+//
+// ---- Interval enclosure of (V′, V″) over [a,b] -----------------------------
+//
+// t_i ∈ [e^a·δ_i, e^b·δ_i] exactly (t monotone in ρ). Per kernel:
+//   t/(1+t)   ↑   → endpoint range (exact).
+//   1/(1+t)   ↓   → endpoint range (exact) ⇒ dp endpoints are the EXACT dp(a),
+//                    dp(b) (dp monotone), both > 0.
+//   t/(1+t)²  unimodal → endpoint range, max replaced by ¼ iff 1∈[t_lo,t_hi].
+//   k(t)      → endpoints + interior roots 2±√3 (exact, above).
+// g2 ratio enclosure ½ν·[ Σ num_lo/dp_hi , Σ num_hi/dp_lo ] is conservative
+// only in the ratio (it may widen, it can never miss a root). The four final
+// bounds are rounded outward one ULP (`round_down`/`round_up`) so a "0 ∉
+// enclosure" prune is provably one-sided.
+//
+// ---- Branch-and-bound (DFS, fixed stack, no heap in the shared core) --------
+//
+// For [a,b]: (1) enclose V′; if 0 ∉ enclosure, prune. (2) else enclose V″; if
+// 0 ∉ enclosure then V′ is monotone on [a,b] (≤ 1 root) — isolate by the shared
+// refinement iff the EXACT V′(a),V′(b) straddle 0. (3) else split at the
+// midpoint. Children are pushed right-then-left so the leftmost interval is
+// processed first and isolated roots are therefore EMITTED IN ASCENDING ρ with
+// no sort and no heap. Recursion is bounded at MAX_DEPTH =
+// ⌈log₂((RHO_UPPER−RHO_LOWER)/RHO_BRACKET_RESOLUTION)⌉, where the resolution is
+// the same ρ-bracket width the safeguarded Newton stop uses (see
+// `refine_stationary_rho_core`); reaching it sets `hit_resolution_floor` on the
+// certificate — a reported flag, never a loop or timeout.
+
+/// ρ-bracket resolution shared by the enumeration recursion depth and the
+/// safeguarded-Newton stop: a bracket narrower than `RHO_BRACKET_RESOLUTION·
+/// (1+|ρ|)` is treated as converged. ρ = ln λ is O(1)–O(10), so 1e-12 pins λ̂ to
+/// ~12 significant figures — the floor below which cost ordering between two ρ
+/// candidates is pure rounding noise (the non-smoothness that used to wreck the
+/// closed-form REML reverse-mode VJP against finite differences).
+const RHO_BRACKET_RESOLUTION: f64 = 1.0e-12;
+
+/// Safety cap on safeguarded-Newton iterations. Bisection alone halves the
+/// bracket each fallback step, so 80 steps drive a 60-wide window to 60/2⁸⁰ ≈
+/// 5e-23 — astronomically below `RHO_BRACKET_RESOLUTION`; with quadratic Newton
+/// convergence this cap is never binding, it only bounds pathological cases.
+const REFINE_MAX_ITERS: usize = 80;
+
+/// ⌈log₂(range/resolution)⌉ computed at compile time: the smallest depth `d`
+/// with `resolution·2^d ≥ range`, i.e. the number of midpoint bisections needed
+/// to drive the window down to the ρ-bracket resolution. `const fn` so the DFS
+/// stack is a fixed-size array with no heap.
+const fn dfs_max_depth(range: f64, resolution: f64) -> usize {
+    let mut width = range;
+    let mut depth = 0usize;
+    while width > resolution {
+        width *= 0.5;
+        depth += 1;
+    }
+    depth
+}
+
+/// Maximum branch-and-bound recursion depth (= 46 for the ±30 window at 1e-12).
+const MAX_DEPTH: usize = dfs_max_depth(RHO_UPPER - RHO_LOWER, RHO_BRACKET_RESOLUTION);
+
+/// A closed real interval `[lo, hi]` used to enclose `V′`/`V″` over a ρ-cell.
+#[derive(Clone, Copy)]
+struct Interval {
+    lo: f64,
+    hi: f64,
+}
+
+/// Next representable f64 strictly below `x` (toward −∞): outward rounding for
+/// an enclosure lower bound, so the rounded value is provably ≤ the exact one.
+fn round_down(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    let next = if x > 0.0 { bits - 1 } else { bits + 1 };
+    f64::from_bits(next)
+}
+
+/// Next representable f64 strictly above `x` (toward +∞): outward rounding for
+/// an enclosure upper bound, so the rounded value is provably ≥ the exact one.
+fn round_up(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    let next = if x > 0.0 { bits + 1 } else { bits - 1 };
+    f64::from_bits(next)
+}
+
+/// Exact per-eigenvalue ranges of the four `V′`/`V″` kernels over a monotone
+/// `t`-window `[t_lo, t_hi]` (0 ≤ t_lo ≤ t_hi). See the module derivation above:
+/// `u=t/(1+t)` ↑, `v=1/(1+t)` ↓, `w=t/(1+t)²` unimodal (peak ¼ at t=1),
+/// `k=t(1−t)/(1+t)³` with interior extrema at t = 2 ± √3.
+#[derive(Clone, Copy)]
+struct KernelRange {
+    u_lo: f64,
+    u_hi: f64,
+    v_lo: f64,
+    v_hi: f64,
+    w_lo: f64,
+    w_hi: f64,
+    k_lo: f64,
+    k_hi: f64,
+}
+
+fn kernel_ranges(t_lo: f64, t_hi: f64) -> KernelRange {
+    let u = |t: f64| t / (1.0 + t);
+    let v = |t: f64| 1.0 / (1.0 + t);
+    let w = |t: f64| t / ((1.0 + t) * (1.0 + t));
+    let k = |t: f64| t * (1.0 - t) / ((1.0 + t) * (1.0 + t) * (1.0 + t));
+
+    // t/(1+t) increasing; 1/(1+t) decreasing.
+    let u_lo = u(t_lo);
+    let u_hi = u(t_hi);
+    let v_lo = v(t_hi);
+    let v_hi = v(t_lo);
+
+    // t/(1+t)² unimodal, single interior peak ¼ at t=1.
+    let w_a = w(t_lo);
+    let w_b = w(t_hi);
+    let w_lo = w_a.min(w_b);
+    let w_hi = if t_lo <= 1.0 && 1.0 <= t_hi {
+        0.25
+    } else {
+        w_a.max(w_b)
+    };
+
+    // k(t)=t(1−t)/(1+t)³: interior extrema are the roots t = 2 ± √3 of the fixed
+    // quadratic t²−4t+1 (derived in the module comment).
+    let sqrt3 = 3.0_f64.sqrt();
+    let cp_lo = 2.0 - sqrt3;
+    let cp_hi = 2.0 + sqrt3;
+    let mut k_lo = k(t_lo).min(k(t_hi));
+    let mut k_hi = k(t_lo).max(k(t_hi));
+    if t_lo < cp_lo && cp_lo < t_hi {
+        let kc = k(cp_lo);
+        k_lo = k_lo.min(kc);
+        k_hi = k_hi.max(kc);
+    }
+    if t_lo < cp_hi && cp_hi < t_hi {
+        let kc = k(cp_hi);
+        k_lo = k_lo.min(kc);
+        k_hi = k_hi.max(kc);
+    }
+
+    KernelRange {
+        u_lo,
+        u_hi,
+        v_lo,
+        v_hi,
+        w_lo,
+        w_hi,
+        k_lo,
+        k_hi,
+    }
+}
+
+/// Outward-rounded interval enclosure of `(V′([a,b]), V″([a,b]))` for the DFS.
+/// Both intervals are valid OUTER bounds of the exact derivative range over the
+/// ρ-cell; the g2/dispersion ratios are conservative (they may widen the box,
+/// never shrink it below the true range), so a "0 ∉ box" test can only prune a
+/// cell that provably contains no root of `V′`.
+fn reml_deriv_enclosure(
+    cache: &GaussianRemlEigenCache,
+    ywy: ArrayView1<'_, f64>,
+    projected_rhs_squared: ArrayView2<'_, f64>,
+    n_effective: usize,
+    n_outputs: usize,
+    a: f64,
+    b: f64,
+) -> (Interval, Interval) {
+    let nu = n_effective as f64 - cache.nullity as f64;
+    let d = n_outputs as f64;
+    let rank = cache.penalty_rank as f64;
+    let half_d = 0.5 * d;
+    let half_nu = 0.5 * nu;
+    let lambda_lo = a.exp();
+    let lambda_hi = b.exp();
+
+    // g1 = ½d(Σ t/(1+t) − rank) and the logdet part of V″ = ½d·Σ t/(1+t)²,
+    // both summing only over the strictly positive penalty eigenvalues.
+    let mut sum_u_lo = 0.0;
+    let mut sum_u_hi = 0.0;
+    let mut sum_w_lo = 0.0;
+    let mut sum_w_hi = 0.0;
+    for &delta in &cache.penalty_eigenvalues {
+        if delta > 0.0 {
+            let kr = kernel_ranges(lambda_lo * delta, lambda_hi * delta);
+            sum_u_lo += kr.u_lo;
+            sum_u_hi += kr.u_hi;
+            sum_w_lo += kr.w_lo;
+            sum_w_hi += kr.w_hi;
+        }
+    }
+    let g1_lo = half_d * (sum_u_lo - rank);
+    let g1_hi = half_d * (sum_u_hi - rank);
+
+    // Dispersion contributions to V′ (g2) and V″, folded per output so no
+    // per-output heap buffer is needed (the shared core is Vec-free).
+    let mut g2_lo = 0.0;
+    let mut g2_hi = 0.0;
+    let mut vpp_disp_lo = 0.0;
+    let mut vpp_disp_hi = 0.0;
+    for j in 0..n_outputs {
+        let mut num_lo = 0.0; // Σ c² · w   (= dp′, ≥ 0)
+        let mut num_hi = 0.0;
+        let mut sv_lo = 0.0; // Σ c² · v
+        let mut sv_hi = 0.0;
+        let mut dph_lo = 0.0; // Σ c² · k   (= dp″, sign-indefinite)
+        let mut dph_hi = 0.0;
+        for eig in 0..cache.penalty_eigenvalues.len() {
+            let delta = cache.penalty_eigenvalues[eig];
+            let c2 = projected_rhs_squared[[eig, j]];
+            let kr = kernel_ranges(lambda_lo * delta, lambda_hi * delta);
+            num_lo += c2 * kr.w_lo;
+            num_hi += c2 * kr.w_hi;
+            sv_lo += c2 * kr.v_lo;
+            sv_hi += c2 * kr.v_hi;
+            dph_lo += c2 * kr.k_lo;
+            dph_hi += c2 * kr.k_hi;
+        }
+        // dp is monotone increasing, so its endpoint values are EXACT: dp_lo =
+        // dp(a) > 0, dp_hi = dp(b) > 0 (floored at MIN_DEVIANCE to mirror the
+        // evaluator's residual-deviance floor).
+        let dp_lo = (ywy[j] - sv_hi).max(MIN_DEVIANCE);
+        let dp_hi = (ywy[j] - sv_lo).max(MIN_DEVIANCE);
+
+        // g2_j = num_j / dp_j  (num ≥ 0, dp > 0).
+        g2_lo += num_lo / dp_hi;
+        g2_hi += num_hi / dp_lo;
+
+        // dp″/dp with dp″ sign-indefinite: exact four-corner range over the
+        // strictly positive denominator interval.
+        let c1 = dph_lo / dp_lo;
+        let c2c = dph_lo / dp_hi;
+        let c3 = dph_hi / dp_lo;
+        let c4 = dph_hi / dp_hi;
+        let adp_lo = c1.min(c2c).min(c3).min(c4);
+        let adp_hi = c1.max(c2c).max(c3).max(c4);
+
+        // (dp′/dp)² with dp′ ≥ 0, dp > 0.
+        let bl = num_lo / dp_hi;
+        let bh = num_hi / dp_lo;
+        let sq_lo = bl * bl;
+        let sq_hi = bh * bh;
+
+        // term_j = dp″/dp − (dp′/dp)².
+        vpp_disp_lo += adp_lo - sq_hi;
+        vpp_disp_hi += adp_hi - sq_lo;
+    }
+
+    let vp_lo = g1_lo + half_nu * g2_lo;
+    let vp_hi = g1_hi + half_nu * g2_hi;
+    let vpp_lo = half_d * sum_w_lo + half_nu * vpp_disp_lo;
+    let vpp_hi = half_d * sum_w_hi + half_nu * vpp_disp_hi;
+
+    (
+        Interval {
+            lo: round_down(vp_lo),
+            hi: round_up(vp_hi),
+        },
+        Interval {
+            lo: round_down(vpp_lo),
+            hi: round_up(vpp_hi),
+        },
+    )
+}
+
+/// Safeguarded-Newton isolation of a single `V′` root inside a bracket the
+/// caller has established (`V′(lo)` and `V′(hi)` straddle 0). Newton steps that
+/// leave the bracket fall back to bisection, and the bracket is maintained by
+/// the sign of `V′` relative to the low end, so the routine converges for a root
+/// of either orientation (a minimum where V′ crosses ↑, or a maximum ↓). Shared
+/// by both optimizers and the certificate builder so all three reduce
+/// identically. Stops when |V′| ≤ GRAD_TOL·(1+|V|) or the bracket reaches the
+/// ρ-resolution. (Factored from the former `refine_stationary_rho` /
+/// `refine_stationary_rho_no_alloc` copies into one `eval`-closure body.)
+fn refine_stationary_rho_core(
+    eval: impl Fn(f64) -> ObjectiveEval,
+    mut lo: f64,
+    mut hi: f64,
+    mut rho: f64,
+) -> f64 {
+    let g_lo_positive = eval(lo).grad > 0.0;
+    for _ in 0..REFINE_MAX_ITERS {
+        let e = eval(rho);
+        if e.grad.abs() <= GRAD_TOL * (1.0 + e.cost.abs()) {
+            return rho;
+        }
+        // Keep [lo, hi] bracketing the sign change regardless of orientation.
+        if (e.grad > 0.0) == g_lo_positive {
+            lo = rho;
+        } else {
+            hi = rho;
+        }
+        let newton = if e.hess != 0.0 {
+            let candidate = rho - e.grad / e.hess;
+            (candidate > lo && candidate < hi).then_some(candidate)
+        } else {
+            None
+        };
+        if (hi - lo).abs() <= RHO_BRACKET_RESOLUTION * (1.0 + rho.abs()) {
+            break;
+        }
+        rho = newton.unwrap_or(0.5 * (lo + hi));
+    }
+    0.5 * (lo + hi)
+}
+
+/// Branch-and-bound enumeration of the stationary points of `V′` on
+/// `[RHO_LOWER, RHO_UPPER]` followed by a single running-best (strict `<`)
+/// argmin over {roots (ascending), RHO_LOWER, RHO_UPPER, init}. Both optimizers
+/// and the certificate builder call this with the SAME candidate order and the
+/// SAME strict comparison, so they select a bit-identical ρ (closing the old
+/// `min_by(total_cmp)` vs strict-`<` divergence between the two paths). The DFS
+/// uses a fixed-size on-stack array (no heap) and pushes children right-then-left,
+/// so `visit` receives roots in ascending ρ.
+fn enumerate_and_select_rho(
+    eval: impl Fn(f64) -> ObjectiveEval,
+    enclose: impl Fn(f64, f64) -> (Interval, Interval),
+    init_rho: Option<f64>,
+    mut visit: impl FnMut(f64, &ObjectiveEval),
+) -> Result<(f64, bool), EstimationError> {
+    const CAP: usize = MAX_DEPTH + 4;
+    let mut stack = [(0.0f64, 0.0f64); CAP];
+    let mut top = 0usize;
+    stack[top] = (RHO_LOWER, RHO_UPPER);
+    top += 1;
+
+    let mut best_rho = RHO_LOWER;
+    let mut best_cost = f64::INFINITY;
+    let mut hit_resolution_floor = false;
+
+    while top > 0 {
+        top -= 1;
+        let (a, b) = stack[top];
+
+        let (dv, dvv) = enclose(a, b);
+        // Prune: 0 ∉ V′ enclosure ⇒ no root in [a,b].
+        if dv.lo > 0.0 || dv.hi < 0.0 {
+            continue;
+        }
+
+        let monotone = dvv.lo > 0.0 || dvv.hi < 0.0;
+        let at_floor = (b - a) <= RHO_BRACKET_RESOLUTION * (1.0 + a.abs().max(b.abs()));
+
+        if monotone || at_floor {
+            // V′ monotone on [a,b] (≤ 1 root) or the cell is at the resolution
+            // floor: decide by the EXACT endpoint gradients.
+            let ga = eval(a).grad;
+            let gb = eval(b).grad;
+            let crosses = (ga <= 0.0 && gb >= 0.0) || (ga >= 0.0 && gb <= 0.0);
+            if crosses {
+                let root = refine_stationary_rho_core(&eval, a, b, 0.5 * (a + b));
+                let e = eval(root);
+                if e.cost < best_cost {
+                    best_cost = e.cost;
+                    best_rho = root;
+                }
+                visit(root, &e);
+            }
+            if at_floor && !monotone {
+                hit_resolution_floor = true;
+            }
+            continue;
+        }
+
+        // Cannot certify monotonicity: split. Push right then left so the left
+        // half is processed first ⇒ roots emit in ascending ρ.
+        let mid = 0.5 * (a + b);
+        if top + 2 > CAP {
+            hit_resolution_floor = true;
+            continue;
+        }
+        stack[top] = (mid, b);
+        top += 1;
+        stack[top] = (a, mid);
+        top += 1;
+    }
+
+    // Endpoints, then the caller's init seed — fixed order, same strict argmin.
+    for cand in [RHO_LOWER, RHO_UPPER] {
+        let e = eval(cand);
+        if e.cost < best_cost {
+            best_cost = e.cost;
+            best_rho = cand;
+        }
+    }
+    if let Some(rho0) = init_rho {
+        let rho0 = rho0.clamp(RHO_LOWER, RHO_UPPER);
+        let e = eval(rho0);
+        if e.cost < best_cost {
+            best_cost = e.cost;
+            best_rho = rho0;
+        }
+    }
+
+    if best_cost.is_finite() {
+        Ok((best_rho, hit_resolution_floor))
+    } else {
+        Err(EstimationError::InvalidInput(
+            "Gaussian REML optimizer produced no finite candidates".to_string(),
+        ))
+    }
+}
+
+/// Select ρ̂ = ln λ̂ by grid-free stationary-point enumeration (allocating path).
 fn optimize_rho(
     prepared: &GaussianRemlPrepared,
     init_rho: Option<f64>,
@@ -2825,83 +3356,20 @@ fn optimize_rho(
     if prepared.cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
-
-    const GRID_INTERVALS: usize = 96;
-    let mut stationary = Vec::<f64>::new();
-    let mut grid = Vec::<(f64, f64)>::with_capacity(GRID_INTERVALS + 1);
-    let mut prev_rho = RHO_LOWER;
-    let mut prev_eval = prepared.evaluate(prev_rho);
-    grid.push((prev_rho, prev_eval.cost));
-    for i in 1..=GRID_INTERVALS {
-        let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
-        let eval = prepared.evaluate(rho);
-        grid.push((rho, eval.cost));
-        if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
-            push_candidate(
-                &mut stationary,
-                refine_stationary_rho(prepared, prev_rho, rho, 0.5 * (prev_rho + rho)),
-            );
-        }
-        prev_rho = rho;
-        prev_eval = eval;
-    }
-
-    let mut candidates = stationary;
-    push_candidate(&mut candidates, RHO_LOWER);
-    push_candidate(&mut candidates, RHO_UPPER);
-    if let Some(rho0) = init_rho {
-        push_candidate(&mut candidates, rho0);
-    }
-    if let Some(rho) = refine_best_grid_cell(prepared, &grid) {
-        push_candidate(&mut candidates, rho);
-    }
-
-    // Evaluate each candidate exactly once. `min_by` over a comparator that
-    // re-evaluates would do O(n log n) extra `prepared.evaluate` calls during
-    // the sort.
-    candidates
-        .into_iter()
-        .map(|rho| (rho, prepared.evaluate(rho).cost))
-        .min_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(rho, _)| rho)
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "Gaussian REML optimizer produced no candidates".to_string(),
-            )
-        })
-}
-
-fn refine_best_grid_cell(prepared: &GaussianRemlPrepared, grid: &[(f64, f64)]) -> Option<f64> {
-    let best_idx = grid
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, cost))| cost.is_finite())
-        .min_by(|(_, (_, a)), (_, (_, b))| a.total_cmp(b))
-        .map(|(idx, _)| idx)?;
-    if best_idx == 0 || best_idx + 1 == grid.len() {
-        return Some(grid[best_idx].0);
-    }
-    // The best interior grid cell brackets a genuine REML minimum (its cost is
-    // below both neighbours), so the objective gradient changes sign across
-    // `[grid[i-1], grid[i+1]]`. Refine to that stationary point (∂V/∂ρ = 0)
-    // rather than minimising the cost with a golden section: the cost-based
-    // search only locates ρ to ~√ε of the cell (~1e-8), whereas the
-    // grad-sign-change branch already contributes stationary candidates
-    // converged to GRAD_TOL (~1e-12). When both target the same minimum, the
-    // ~1e-16 cost ordering between a 1e-8-accurate and a 1e-12-accurate ρ is
-    // numerical noise, so `min_by(cost)` used to pick between two ρ values
-    // ~1e-8 apart essentially at random — making the selected λ̂ a
-    // non-smooth function of the design X (its ~1e-8 jumps wrecked the
-    // closed-form REML reverse-mode VJP's agreement with finite differences).
-    // Returning the stationary point makes every interior candidate a
-    // GRAD_TOL-accurate root, so the residual selection jitter collapses to
-    // ~1e-12 and λ̂(X) is smooth to the IFT gradient.
-    Some(refine_stationary_rho(
-        prepared,
-        grid[best_idx - 1].0,
-        grid[best_idx + 1].0,
-        grid[best_idx].0,
-    ))
+    let eval = |rho: f64| prepared.evaluate(rho);
+    let enclose = |a: f64, b: f64| {
+        reml_deriv_enclosure(
+            &prepared.cache,
+            prepared.ywy.view(),
+            prepared.projected_rhs_squared.view(),
+            prepared.n_effective,
+            prepared.n_outputs,
+            a,
+            b,
+        )
+    };
+    let (selected, _hit_floor) = enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?;
+    Ok(selected)
 }
 
 fn fill_weighted_rhs_no_alloc(
@@ -2984,6 +3452,11 @@ fn evaluate_reml_parts(
     eval
 }
 
+/// Select ρ̂ by the same grid-free enumeration as [`optimize_rho`], driven from
+/// raw cache/rhs parts with zero heap allocation (the DFS stack is a fixed-size
+/// on-stack array and both closures capture only borrowed views). Reduces
+/// through the shared `enumerate_and_select_rho`, so it returns a bit-identical
+/// ρ to the allocating path on identical inputs.
 fn optimize_rho_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,
@@ -2995,201 +3468,22 @@ fn optimize_rho_no_alloc(
     if cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
-
-    let lower_eval = evaluate_reml_parts(
-        cache,
-        ywy,
-        projected_rhs_squared,
-        n_effective,
-        n_outputs,
-        RHO_LOWER,
-    );
-
-    let mut best_rho = RHO_LOWER;
-    let mut best_cost = lower_eval.cost;
-
-    const GRID_INTERVALS: usize = 96;
-    let mut grid = Vec::<(f64, f64)>::with_capacity(GRID_INTERVALS + 1);
-    let mut prev_rho = RHO_LOWER;
-    let mut prev_eval = lower_eval;
-    grid.push((prev_rho, prev_eval.cost));
-    for i in 1..=GRID_INTERVALS {
-        let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
-        let eval = evaluate_reml_parts(
+    let eval = |rho: f64| {
+        evaluate_reml_parts(cache, ywy, projected_rhs_squared, n_effective, n_outputs, rho)
+    };
+    let enclose = |a: f64, b: f64| {
+        reml_deriv_enclosure(
             cache,
             ywy,
             projected_rhs_squared,
             n_effective,
             n_outputs,
-            rho,
-        );
-        grid.push((rho, eval.cost));
-        if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
-            let stationary_rho = refine_stationary_rho_no_alloc(
-                cache,
-                ywy,
-                projected_rhs_squared,
-                n_effective,
-                n_outputs,
-                prev_rho,
-                rho,
-                0.5 * (prev_rho + rho),
-            );
-            consider_rho_no_alloc(
-                cache,
-                ywy,
-                projected_rhs_squared,
-                n_effective,
-                n_outputs,
-                stationary_rho,
-                &mut best_rho,
-                &mut best_cost,
-            );
-        }
-        prev_rho = rho;
-        prev_eval = eval;
-    }
-    if let Some(best_idx) = grid
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, cost))| cost.is_finite())
-        .min_by(|(_, (_, a)), (_, (_, b))| a.total_cmp(b))
-        .map(|(idx, _)| idx)
-    {
-        let refined = if best_idx == 0 || best_idx + 1 == grid.len() {
-            grid[best_idx].0
-        } else {
-            // Refine the best interior grid cell to the REML stationary point
-            // (∂V/∂ρ = 0) rather than the golden-section cost minimum, mirroring
-            // the allocating `refine_best_grid_cell`. A cost-based search locates
-            // ρ only to ~1e-8, which competed against the GRAD_TOL-accurate
-            // (~1e-12) stationary candidates in the cost `min_by` below and made
-            // the selected λ̂ jump ~1e-8 with the design — a non-smoothness the
-            // closed-form REML VJP could not match under finite differences.
-            // (Keeping both optimizers' refinement identical preserves their
-            // allocating/no-alloc bit-for-bit parity.)
-            refine_stationary_rho_no_alloc(
-                cache,
-                ywy,
-                projected_rhs_squared,
-                n_effective,
-                n_outputs,
-                grid[best_idx - 1].0,
-                grid[best_idx + 1].0,
-                grid[best_idx].0,
-            )
-        };
-        consider_rho_no_alloc(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_effective,
-            n_outputs,
-            refined,
-            &mut best_rho,
-            &mut best_cost,
-        );
-    }
-
-    consider_rho_no_alloc(
-        cache,
-        ywy,
-        projected_rhs_squared,
-        n_effective,
-        n_outputs,
-        RHO_UPPER,
-        &mut best_rho,
-        &mut best_cost,
-    );
-    if let Some(rho0) = init_rho {
-        consider_rho_no_alloc(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_effective,
-            n_outputs,
-            rho0,
-            &mut best_rho,
-            &mut best_cost,
-        );
-    }
-
-    if best_cost.is_finite() {
-        Ok(best_rho)
-    } else {
-        Err(EstimationError::InvalidInput(
-            "Gaussian REML optimizer produced no finite candidates".to_string(),
-        ))
-    }
-}
-
-fn consider_rho_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    ywy: ArrayView1<'_, f64>,
-    projected_rhs_squared: ArrayView2<'_, f64>,
-    n_effective: usize,
-    n_outputs: usize,
-    rho: f64,
-    best_rho: &mut f64,
-    best_cost: &mut f64,
-) {
-    if !rho.is_finite() {
-        return;
-    }
-    let candidate = rho.clamp(RHO_LOWER, RHO_UPPER);
-    let eval = evaluate_reml_parts(
-        cache,
-        ywy,
-        projected_rhs_squared,
-        n_effective,
-        n_outputs,
-        candidate,
-    );
-    if eval.cost < *best_cost {
-        *best_rho = candidate;
-        *best_cost = eval.cost;
-    }
-}
-
-fn refine_stationary_rho_no_alloc(
-    cache: &GaussianRemlEigenCache,
-    ywy: ArrayView1<'_, f64>,
-    projected_rhs_squared: ArrayView2<'_, f64>,
-    n_effective: usize,
-    n_outputs: usize,
-    mut lo: f64,
-    mut hi: f64,
-    mut rho: f64,
-) -> f64 {
-    for _ in 0..80 {
-        let eval = evaluate_reml_parts(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_effective,
-            n_outputs,
-            rho,
-        );
-        if eval.grad.abs() <= GRAD_TOL * (1.0 + eval.cost.abs()) {
-            return rho;
-        }
-        if eval.grad >= 0.0 {
-            hi = rho;
-        } else {
-            lo = rho;
-        }
-        let newton = if eval.hess > 0.0 {
-            let candidate = rho - eval.grad / eval.hess;
-            (candidate > lo && candidate < hi).then_some(candidate)
-        } else {
-            None
-        };
-        if (hi - lo).abs() <= 1e-12 * (1.0 + rho.abs()) {
-            break;
-        }
-        rho = newton.unwrap_or(0.5 * (lo + hi));
-    }
-    0.5 * (lo + hi)
+            a,
+            b,
+        )
+    };
+    let (selected, _hit_floor) = enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?;
+    Ok(selected)
 }
 
 fn fill_coefficients_no_alloc(
@@ -3257,42 +3551,6 @@ fn fill_sigma2_no_alloc(
         }
         sigma2[output] = ((ywy[output] - fitted_quadratic).max(MIN_DEVIANCE)) / nu;
     }
-}
-
-fn push_candidate(candidates: &mut Vec<f64>, rho: f64) {
-    if rho.is_finite() {
-        candidates.push(rho.clamp(RHO_LOWER, RHO_UPPER));
-    }
-}
-
-fn refine_stationary_rho(
-    prepared: &GaussianRemlPrepared,
-    mut lo: f64,
-    mut hi: f64,
-    mut rho: f64,
-) -> f64 {
-    for _ in 0..80 {
-        let eval = prepared.evaluate(rho);
-        if eval.grad.abs() <= GRAD_TOL * (1.0 + eval.cost.abs()) {
-            return rho;
-        }
-        if eval.grad >= 0.0 {
-            hi = rho;
-        } else {
-            lo = rho;
-        }
-        let newton = if eval.hess > 0.0 {
-            let candidate = rho - eval.grad / eval.hess;
-            (candidate > lo && candidate < hi).then_some(candidate)
-        } else {
-            None
-        };
-        if (hi - lo).abs() <= 1e-12 * (1.0 + rho.abs()) {
-            break;
-        }
-        rho = newton.unwrap_or(0.5 * (lo + hi));
-    }
-    0.5 * (lo + hi)
 }
 
 fn invert_lower_triangular(lower: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
@@ -4167,11 +4425,291 @@ mod tests {
             (rho - 4.3251059890).abs() < 1.0e-6,
             "rho optimizer selected {rho}, expected the lower-cost later stationary point"
         );
-        assert!(
-            (no_alloc_rho - rho).abs() < 1.0e-8,
+        // Both paths reduce through `enumerate_and_select_rho` with identical
+        // candidate order and a single strict-`<` running-best over numerically
+        // identical evaluations, so the selected ρ is bit-for-bit equal.
+        assert_eq!(
+            no_alloc_rho, rho,
             "no-alloc optimizer selected {no_alloc_rho}, allocating selected {rho}"
         );
         assert!(prepared.evaluate(rho).cost < prepared.evaluate(-18.9277503549).cost);
+    }
+
+    /// Deterministic linear-congruential generator (Knuth/MMIX constants) so the
+    /// enumeration stress tests are fully reproducible — no time/thread seeding.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+    }
+
+    /// Synthetic eigen-cache with identity bases (the enumerator only reads
+    /// `penalty_eigenvalues`, `penalty_rank`, `nullity` and the additive logdet
+    /// constants), so tests can drive `evaluate_reml_parts` /
+    /// `reml_deriv_enclosure` directly from a spectrum.
+    fn synthetic_cache(eigs: &[f64]) -> GaussianRemlEigenCache {
+        let n = eigs.len();
+        let rank = eigs.iter().filter(|&&delta| delta > 0.0).count();
+        GaussianRemlEigenCache {
+            penalty_eigenvalues: Array1::from(eigs.to_vec()),
+            eigenvectors: Array2::eye(n),
+            coefficient_basis: Array2::eye(n),
+            xtwx_fingerprint: 0,
+            penalty_fingerprint: 0,
+            logdet_xtwx: 0.0,
+            logdet_penalty_positive: 0.0,
+            penalty_rank: rank,
+            nullity: n - rank,
+        }
+    }
+
+    /// Completeness of the grid-free enumeration against a 100k-point brute-force
+    /// sign scan of `V′`: every reference sign-change bracket must be matched by a
+    /// returned root, and every returned root must be a genuine stationary point.
+    #[test]
+    fn enumeration_matches_brute_force_sign_scan() {
+        let mut rng = Lcg::new(0x5eed_1234_abcd_0001);
+        for _case in 0..40 {
+            let n_eig = 2 + (rng.next_u64() % 4) as usize; // 2..=5
+            let eigs: Vec<f64> = (0..n_eig).map(|_| rng.range(-4.0, 6.0).exp()).collect();
+            let cache = synthetic_cache(&eigs);
+            let c2: Vec<f64> = (0..n_eig)
+                .map(|_| {
+                    let v = rng.range(0.0, 2.0);
+                    v * v
+                })
+                .collect();
+            let sum_c2: f64 = c2.iter().sum();
+            let prs = Array2::from_shape_vec((n_eig, 1), c2).unwrap();
+            let ywy = Array1::from(vec![sum_c2 + rng.range(0.1, 3.0)]);
+            let n_eff = 50usize;
+            let n_out = 1usize;
+
+            let eval =
+                |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
+            let enclose = |a: f64, b: f64| {
+                reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
+            };
+            let mut roots = Vec::new();
+            enumerate_and_select_rho(&eval, &enclose, None, |r, _| roots.push(r)).unwrap();
+
+            const SCAN: usize = 100_000;
+            let cell = (RHO_UPPER - RHO_LOWER) / SCAN as f64;
+            let mut brackets = Vec::new();
+            let mut prev_rho = RHO_LOWER;
+            let mut prev_g = eval(prev_rho).grad;
+            for i in 1..=SCAN {
+                let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (SCAN as f64);
+                let g = eval(rho).grad;
+                if (prev_g < 0.0 && g >= 0.0) || (prev_g > 0.0 && g <= 0.0) {
+                    brackets.push((prev_rho, rho));
+                }
+                prev_rho = rho;
+                prev_g = g;
+            }
+
+            for (lo, hi) in &brackets {
+                let matched = roots
+                    .iter()
+                    .any(|&r| r >= lo - 10.0 * cell && r <= hi + 10.0 * cell);
+                assert!(
+                    matched,
+                    "sign-change bracket [{lo},{hi}] unmatched by returned roots {roots:?}"
+                );
+            }
+            for &r in &roots {
+                let g = eval(r).grad;
+                assert!(
+                    g.abs() < 1.0e-9,
+                    "returned root {r} has |V'|={} not < 1e-9",
+                    g.abs()
+                );
+            }
+        }
+    }
+
+    /// Blind-spot regression: the old 96-point grid (0.625-wide cells) could not
+    /// resolve two stationary points inside a single cell. The dispersion cache
+    /// of `scalar_rho_optimizer_chooses_lowest_cost_stationary_point` has two
+    /// stationary points ~23 apart when its two eigenvalues are ~e²⁸ apart;
+    /// shrinking that eigenvalue separation Δ drives the two roots together
+    /// through a saddle-node (their gap → 0 continuously), so some (Δ, c²-scale)
+    /// places them closer than one former grid cell while still scan-resolvable.
+    /// The enumerator must then isolate BOTH — the property the grid lacked.
+    #[test]
+    fn resolves_two_roots_inside_one_former_grid_cell() {
+        const OLD_CELL: f64 = (RHO_UPPER - RHO_LOWER) / 96.0; // 0.625
+        const SCAN: usize = 8_000;
+        let cell = (RHO_UPPER - RHO_LOWER) / SCAN as f64;
+        let ywy = Array1::from(vec![0.5021347226586624]);
+        let n_eff = 100usize;
+        let n_out = 1usize;
+
+        // Fine-scan `V′` for a symmetric two-eigenvalue spectrum δ = e^{±Δ/2},
+        // returning the TIGHTEST scan-resolvable crossing pair (gap ≥ several
+        // scan cells so both crossings are seen). Sweeping Δ toward the
+        // saddle-node shrinks this gap continuously, so the search below can
+        // drive it below one former grid cell.
+        let closest_pair = |delta: f64, c2_scale: f64| -> Option<(f64, f64)> {
+            let eigs = vec![(-0.5 * delta).exp(), (0.5 * delta).exp()];
+            let cache = synthetic_cache(&eigs);
+            let prs = Array2::from_shape_vec(
+                (2, 1),
+                vec![0.361060218768292, 0.01014486085547482 * c2_scale],
+            )
+            .unwrap();
+            let eval =
+                |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
+            let mut cross = Vec::new();
+            let mut prev_rho = RHO_LOWER;
+            let mut prev_g = eval(prev_rho).grad;
+            for i in 1..=SCAN {
+                let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (SCAN as f64);
+                let g = eval(rho).grad;
+                if (prev_g < 0.0 && g >= 0.0) || (prev_g > 0.0 && g <= 0.0) {
+                    cross.push(0.5 * (prev_rho + rho));
+                }
+                prev_rho = rho;
+                prev_g = g;
+            }
+            let mut best: Option<(f64, f64)> = None;
+            for w in cross.windows(2) {
+                let gap = (w[1] - w[0]).abs();
+                if gap >= 6.0 * cell && best.map_or(true, |(b0, b1)| gap < (b1 - b0).abs()) {
+                    best = Some((w[0], w[1]));
+                }
+            }
+            best
+        };
+
+        // Coarse 2-D sweep (Δ, c²-scale) → the config with the globally tightest
+        // resolvable pair; a fine Δ sweep toward the saddle-node then shrinks the
+        // gap below one former grid cell.
+        let scales = [0.25_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
+        let mut winner: Option<(f64, f64, f64, f64)> = None; // (delta, scale, r0, r1)
+        let gap_of = |w: &Option<(f64, f64, f64, f64)>| {
+            w.map_or(f64::INFINITY, |(_, _, r0, r1)| (r1 - r0).abs())
+        };
+        let mut delta = 1.0_f64;
+        while delta <= 30.0 {
+            for &scale in &scales {
+                if let Some((r0, r1)) = closest_pair(delta, scale)
+                    && (r1 - r0).abs() < gap_of(&winner)
+                {
+                    winner = Some((delta, scale, r0, r1));
+                }
+            }
+            delta += 0.2;
+        }
+        if let Some((d0, s0, _, _)) = winner {
+            let mut d = (d0 - 0.3).max(0.2);
+            while d <= d0 + 0.05 {
+                if let Some((r0, r1)) = closest_pair(d, s0)
+                    && (r1 - r0).abs() < gap_of(&winner)
+                {
+                    winner = Some((d, s0, r0, r1));
+                }
+                d += 0.004;
+            }
+        }
+
+        let (delta, scale, r0, r1) =
+            winner.expect("no scan-resolvable double-root config found in the search family");
+        assert!(
+            (r1 - r0).abs() < OLD_CELL,
+            "closest crossing pair {r0:.6},{r1:.6} not below one grid cell {OLD_CELL}"
+        );
+
+        // The enumerator must isolate BOTH roots of the winning spectrum.
+        let eigs = vec![(-0.5 * delta).exp(), (0.5 * delta).exp()];
+        let cache = synthetic_cache(&eigs);
+        let prs = Array2::from_shape_vec(
+            (2, 1),
+            vec![0.361060218768292, 0.01014486085547482 * scale],
+        )
+        .unwrap();
+        let eval =
+            |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
+        let enclose =
+            |a: f64, b: f64| reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b);
+        let mut roots = Vec::new();
+        enumerate_and_select_rho(&eval, &enclose, None, |r, _| roots.push(r)).unwrap();
+        assert!(
+            roots.iter().any(|&r| (r - r0).abs() < 1.0e-2),
+            "root near {r0:.6} (gap {:.4} < grid cell) missing from {roots:?}",
+            (r1 - r0).abs()
+        );
+        assert!(
+            roots.iter().any(|&r| (r - r1).abs() < 1.0e-2),
+            "root near {r1:.6} (gap {:.4} < grid cell) missing from {roots:?}",
+            (r1 - r0).abs()
+        );
+    }
+
+    /// Global-argmin checkability: the selected ρ̂ must have cost no larger than
+    /// the cost at every enumerated root, both window endpoints, and the minimum
+    /// over a dense independent scan.
+    #[test]
+    fn selected_rho_is_the_global_argmin() {
+        let mut rng = Lcg::new(0x9911_7733_5522_0044);
+        for _case in 0..40 {
+            let n_eig = 2 + (rng.next_u64() % 4) as usize;
+            let eigs: Vec<f64> = (0..n_eig).map(|_| rng.range(-5.0, 6.0).exp()).collect();
+            let cache = synthetic_cache(&eigs);
+            let c2: Vec<f64> = (0..n_eig)
+                .map(|_| {
+                    let v = rng.range(0.0, 2.5);
+                    v * v
+                })
+                .collect();
+            let sum_c2: f64 = c2.iter().sum();
+            let prs = Array2::from_shape_vec((n_eig, 1), c2).unwrap();
+            let ywy = Array1::from(vec![sum_c2 + rng.range(0.05, 2.0)]);
+            let n_eff = 80usize;
+            let n_out = 1usize;
+
+            let eval =
+                |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
+            let enclose = |a: f64, b: f64| {
+                reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
+            };
+            let mut roots = Vec::new();
+            let (selected, _floor) =
+                enumerate_and_select_rho(&eval, &enclose, None, |r, _| roots.push(r)).unwrap();
+            let selected_cost = eval(selected).cost;
+            let tol = 1.0e-8 * (1.0 + selected_cost.abs());
+
+            for &r in &roots {
+                assert!(selected_cost <= eval(r).cost + tol);
+            }
+            assert!(selected_cost <= eval(RHO_LOWER).cost + tol);
+            assert!(selected_cost <= eval(RHO_UPPER).cost + tol);
+
+            const SCAN: usize = 5_000;
+            let mut scan_min = f64::INFINITY;
+            for i in 0..=SCAN {
+                let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (SCAN as f64);
+                scan_min = scan_min.min(eval(rho).cost);
+            }
+            assert!(
+                selected_cost <= scan_min + tol,
+                "selected cost {selected_cost} exceeds dense-scan min {scan_min}"
+            );
+        }
     }
 
     #[test]
