@@ -42,7 +42,69 @@ impl SaeManifoldTerm {
             coords.push(self.assignment.coords[atom_idx].as_matrix().to_owned());
         }
         let amplitudes = self.fitted_assignment_amplitudes(rho)?;
-        LearnedAmortizedEncoder::fit(targets, logits.view(), &coords, amplitudes.view())
+        // Seam-invariant periodic path: circular axes are regressed through
+        // their (cos, sin) embedding instead of the raw coordinate, so a chart
+        // seam inside the data cloud no longer pulls predictions to the
+        // antipode. Periods are STRUCTURAL (read from each atom's basis kind).
+        let periods = self.amortized_axis_periods();
+        LearnedAmortizedEncoder::fit_with_axis_periods(
+            targets,
+            logits.view(),
+            &coords,
+            amplitudes.view(),
+            &periods,
+        )
+    }
+
+    /// Per-atom, per-axis period descriptors for the amortized encoder's
+    /// seam-invariant periodic path: `Some(period)` for a circular axis, `None`
+    /// for Euclidean / interval / spherical ones. Structural — derived from the
+    /// atom's basis kind, never inferred from data. When a manifold's flattened
+    /// axis list does not tile the atom's latent dimension exactly (nested
+    /// products with implicit widths), the atom conservatively falls back to
+    /// all-`None`, which reproduces the raw (pre-periodic) behavior for that
+    /// atom rather than mislabeling an axis.
+    fn amortized_axis_periods(&self) -> Vec<crate::amortized_encoder::AxisPeriods> {
+        fn push_axes(m: &LatentManifold, out: &mut Vec<Option<f64>>) {
+            match m {
+                LatentManifold::Circle { period } => out.push(Some(*period)),
+                LatentManifold::Euclidean => out.push(None),
+                LatentManifold::Interval { .. } => out.push(None),
+                LatentManifold::Sphere { dim } => {
+                    for _ in 0..*dim {
+                        out.push(None);
+                    }
+                }
+                LatentManifold::Product(parts) => {
+                    for part in parts {
+                        push_axes(part, out);
+                    }
+                }
+                LatentManifold::ProductWithMetric { manifolds, .. } => {
+                    for part in manifolds {
+                        push_axes(part, out);
+                    }
+                }
+            }
+        }
+        self.atoms
+            .iter()
+            .map(|atom| {
+                let d = atom.latent_dim;
+                let manifold = atom.basis_kind.latent_manifold(d);
+                let mut axes = Vec::with_capacity(d);
+                push_axes(&manifold, &mut axes);
+                if axes.len() == d {
+                    axes
+                } else if let LatentManifold::Circle { period } = manifold {
+                    // A circle manifold on a d-axis atom labels every axis with
+                    // the shared period (the periodic evaluator's convention).
+                    vec![Some(period); d]
+                } else {
+                    vec![None; d]
+                }
+            })
+            .collect()
     }
 
     /// Decode an amortized code into an ambient reconstruction
@@ -123,11 +185,16 @@ impl SaeManifoldTerm {
             (Some(a), Some(b)) => Some(a - b),
             _ => None,
         };
-        let errors = LearnedAmortizedEncoder::error_stats(
+        // Wrap-aware scoring: per-axis errors on circular axes are charged on
+        // the short arc (min(|Δ|, period − |Δ|)), so a seam-straddling exact/
+        // amortized pair no longer registers as a near-full-period miss.
+        let score_periods = self.amortized_axis_periods();
+        let errors = LearnedAmortizedEncoder::error_stats_wrapped(
             &code,
             exact.logits,
             exact.coords,
             exact.amplitudes,
+            &score_periods,
         )?;
         let joint_multistart_fraction = joint_encode_fallback_fraction(
             &self.atoms,
