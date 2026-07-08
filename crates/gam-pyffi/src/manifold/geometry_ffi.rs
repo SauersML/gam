@@ -138,6 +138,48 @@ fn sae_auto_k_recommendation(
     Ok(out.into())
 }
 
+/// Fit-level bits/token description length of a manifold-SAE reconstruction.
+///
+/// The headline currency the results.md postmortem argues for: the whole fit's
+/// code length per token, decomposed into code / selection / dictionary bits,
+/// computed from the fit's own summary quantities (achieved EV, active-atom
+/// count, coordinate dim, dictionary size, decoder scalar count). Every math
+/// term is owned by `description_length::manifold_fit_description_length`; this
+/// only marshals scalars in and the decomposition out.
+#[pyfunction(signature = (ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits = None))]
+fn sae_manifold_description_length(
+    py: Python<'_>,
+    ev: f64,
+    n_tokens: i64,
+    k_active: f64,
+    coord_dim: f64,
+    g_dict: i64,
+    n_params: i64,
+    l_param_bits: Option<f64>,
+) -> PyResult<PyObject> {
+    let dl = gam::terms::sae::description_length::manifold_fit_description_length(
+        ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits,
+    );
+    let out = PyDict::new(py);
+    out.set_item("bits_per_token", dl.bits_per_token)?;
+    out.set_item("total_bits", dl.total_bits)?;
+    out.set_item("code_bits", dl.code_bits)?;
+    out.set_item("selection_bits", dl.selection_bits)?;
+    out.set_item("dict_bits", dl.dict_bits)?;
+    out.set_item("code_bits_per_token", dl.code_bits_per_token)?;
+    out.set_item("selection_bits_per_token", dl.selection_bits_per_token)?;
+    out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
+    out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;
+    out.set_item("l_param_bits", dl.l_param_bits)?;
+    out.set_item("ev", dl.ev)?;
+    out.set_item("n_tokens", dl.n_tokens)?;
+    out.set_item("k_active", dl.k_active)?;
+    out.set_item("coord_dim", dl.coord_dim)?;
+    out.set_item("g_dict", dl.g_dict)?;
+    out.set_item("n_params", dl.n_params)?;
+    Ok(out.into())
+}
+
 #[pyfunction]
 fn poincare_project_into_ball<'py>(
     py: Python<'py>,
@@ -4288,6 +4330,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;

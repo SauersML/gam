@@ -6,10 +6,71 @@ use super::{
     Crossover, DescriptionLength, Featurizer, ScoreRow, bar_birth_threshold_nats,
     bar_supports_birth, circle_chart_columns, circle_coding_gain_bits, circle_shape_const_bits,
     crossover_firings, curved_coding_gain_bits, evidence_per_log_persistence,
-    kappa_coding_gain_detector, matched_dl, matched_dl_delta, reverse_water_filling,
-    scalar_rate_bits, score, se_resolution_bits, selection_bits, uniform_unit_range_sd,
+    kappa_coding_gain_detector, manifold_fit_description_length, matched_dl, matched_dl_delta,
+    reverse_water_filling, scalar_rate_bits, score, se_resolution_bits, selection_bits,
+    uniform_unit_range_sd,
 };
 use crate::atom_codes::SparseAtomCodes;
+
+#[test]
+fn manifold_fit_dl_decomposes_and_sums_to_total() {
+    // ev=0.9 ⇒ per-coordinate rate ½·log₂(1/0.1). k̄=4 firings of d̄=1 coord over
+    // N=1000 tokens, G=32 atoms, 96 decoder scalars at the distortion-matched
+    // precision (l_param defaults to the coordinate rate).
+    let dl = manifold_fit_description_length(0.9, 1000, 4.0, 1.0, 32, 96, None);
+    let rate = scalar_rate_bits(1.0, 0.1);
+    assert!((dl.coordinate_rate_bits - rate).abs() < 1e-12);
+    assert!((dl.l_param_bits - rate).abs() < 1e-12, "default l_param = code rate");
+
+    // Code = k̄·d̄·rate per token; selection = log₂ C(32, 4) per token.
+    assert!((dl.code_bits_per_token - 4.0 * rate).abs() < 1e-12);
+    assert!((dl.selection_bits_per_token - selection_bits(32, 4)).abs() < 1e-12);
+
+    // Corpus totals and per-token accounting reconcile with the parts.
+    assert!((dl.code_bits - 1000.0 * dl.code_bits_per_token).abs() < 1e-9);
+    assert!((dl.selection_bits - 1000.0 * dl.selection_bits_per_token).abs() < 1e-9);
+    assert!((dl.dict_bits - 96.0 * rate).abs() < 1e-12);
+    let total = dl.code_bits + dl.selection_bits + dl.dict_bits;
+    assert!((dl.total_bits - total).abs() < 1e-9, "ledgers must sum to the total");
+    assert!((dl.bits_per_token - dl.total_bits / 1000.0).abs() < 1e-9);
+    assert!(
+        (dl.dict_bits_per_token - dl.dict_bits / 1000.0).abs() < 1e-9,
+        "dictionary bits are amortised across the corpus"
+    );
+}
+
+#[test]
+fn manifold_fit_dl_code_rate_rises_with_explained_variance() {
+    // The honest rate–distortion signature the matched-EV number hides: a higher
+    // EV means a finer distortion floor, so each coordinate costs MORE code bits.
+    let lo = manifold_fit_description_length(0.5, 500, 3.0, 1.0, 64, 64, None);
+    let hi = manifold_fit_description_length(0.95, 500, 3.0, 1.0, 64, 64, None);
+    assert!(
+        hi.coordinate_rate_bits > lo.coordinate_rate_bits,
+        "higher EV must cost more per-coordinate bits: {} !> {}",
+        hi.coordinate_rate_bits,
+        lo.coordinate_rate_bits
+    );
+    assert!(hi.code_bits_per_token > lo.code_bits_per_token);
+}
+
+#[test]
+fn manifold_fit_dl_saturated_ev_stays_finite() {
+    // ev == 1 would drive the rate to +∞; the (1−ev) floor keeps it large but
+    // finite so a report never prints an infinity.
+    let dl = manifold_fit_description_length(1.0, 10, 1.0, 1.0, 8, 8, None);
+    assert!(dl.bits_per_token.is_finite());
+    assert!(dl.coordinate_rate_bits.is_finite() && dl.coordinate_rate_bits > 0.0);
+}
+
+#[test]
+fn manifold_fit_dl_explicit_l_param_overrides_default() {
+    // Passing fp16 precision (16 bits/scalar) must be used verbatim for the
+    // dictionary charge instead of the distortion-matched default.
+    let dl = manifold_fit_description_length(0.8, 100, 2.0, 1.0, 16, 50, Some(16.0));
+    assert!((dl.l_param_bits - 16.0).abs() < 1e-12);
+    assert!((dl.dict_bits - 50.0 * 16.0).abs() < 1e-9);
+}
 
 #[test]
 fn se_resolution_bits_is_the_uniform_quantization_cost() {

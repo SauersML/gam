@@ -840,6 +840,44 @@ impl SaeManifoldTerm {
         self.row_loss_weights.as_deref()
     }
 
+    /// Install a single UNIFORM Horvitz–Thompson inverse-inclusion weight
+    /// `w_i = weight` on every row, riding the same #977 `row_loss_weights` √w
+    /// seam as the design-honesty path but DELIBERATELY bypassing the mean-1
+    /// normalization [`Self::set_row_loss_weights`] applies.
+    ///
+    /// This is the outer-criterion row-subsample installer: a term built as the
+    /// `n_sub`-row restriction of an `N`-row problem takes `weight = N / n_sub`,
+    /// the inverse inclusion probability of uniform-without-replacement sampling.
+    /// Unlike the #991 design-honesty weights (where only the *relative* row
+    /// corrections matter at the fitted sample size, so mean-1 is correct), the
+    /// ABSOLUTE `N / n_sub` scale is load-bearing here: the √w seam scales the
+    /// residual, latent Jacobian, and β basis load by `√weight`, so the weighted
+    /// log-likelihood and joint Hessian are lifted back to the FULL-`N` scale and
+    /// the assembled REML criterion `data_fit + penalty + ½ log|H|` becomes the
+    /// Horvitz–Thompson estimator of the full-`N` criterion. The ρ-fixed penalty
+    /// (already at full-`N` scale) then balances against a full-scale data term,
+    /// keeping ρ selection unbiased. Mean-normalizing a uniform weight would
+    /// collapse it to `1` (the *unweighted* `n_sub`-row subproblem), whose
+    /// penalty/data balance is off by `N / n_sub` and systematically over-smooths.
+    ///
+    /// `weight == 1.0` stores `None` (the exact unweighted path), so a degenerate
+    /// `n_sub == N` subsample is byte-identical to the full-batch fit.
+    pub(crate) fn set_uniform_inclusion_weight(&mut self, weight: f64) -> Result<(), String> {
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::set_uniform_inclusion_weight: weight must be finite and \
+                 strictly positive, got {weight}"
+            ));
+        }
+        let n = self.n_obs();
+        self.row_loss_weights = if weight == 1.0 {
+            None
+        } else {
+            Some(vec![weight; n])
+        };
+        Ok(())
+    }
+
     /// Drop any installed per-row reconstruction weights, returning the term to
     /// the exact unweighted (full-pass) path. Used by the #997 structure-search
     /// wiring to clear the internal estimation/evaluation mask off the adopted

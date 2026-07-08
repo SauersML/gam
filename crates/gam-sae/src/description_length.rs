@@ -640,6 +640,134 @@ pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
     flat.total_dl_bits - chart.total_dl_bits
 }
 
+// ===========================================================================
+// Fit-level bits/token: the headline currency for a WHOLE manifold-SAE fit.
+// The per-featurizer `score` surface prices ONE featurizer at a stated floor;
+// this prices the entire reconstruction at its achieved explained variance, so
+// the user-facing report can LEAD with bits/token instead of the
+// manifold-insensitive matched-EV number (see
+// `experiments/real_manifold_sae/results.md`).
+// ===========================================================================
+
+/// The fit-level description length of a manifold-SAE reconstruction, in bits,
+/// decomposed into the same three ledgers the [`score`] surface uses: CODE
+/// (the coordinates transmitted per firing), SELECTION (naming which atoms
+/// fired), and DICTIONARY (the amortised decoder).
+///
+/// # Currency (reuses [`scalar_rate_bits`] + [`selection_bits`], no new math)
+///
+/// A token is coded by (1) naming which `k_active` of `g_dict` atoms fired —
+/// `selection_bits(g_dict, k_active)` bits — and (2) transmitting each firing's
+/// `coord_dim` latent coordinates. A unit-variance coordinate coded to the
+/// achieved RELATIVE distortion `1 − ev` costs `scalar_rate_bits(1, 1 − ev)`
+/// bits — the numerically-kind reverse-water-filling rate `½·log₂(1 + 1/(1−ev))`
+/// (≈ `½·log₂(1/(1−ev))` once `ev` is high) at the fit's operating EV: a higher
+/// EV means a finer distortion floor and therefore MORE code bits, the honest
+/// rate–distortion trade the matched-EV comparison hides. The decoder is stored
+/// once, `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
+///
+/// `bits_per_token = total_bits / n_tokens` is the headline. It is the code
+/// length per token of the WHOLE representation (codes + amortised dictionary),
+/// so two fits at matched EV but different topologies are finally comparable in
+/// the currency the manifold thesis is stated in.
+#[derive(Clone, Copy, Debug)]
+pub struct ManifoldFitDl {
+    /// Explained variance the reconstruction achieves (the demoted EV line).
+    pub ev: f64,
+    /// Number of coded tokens `N`.
+    pub n_tokens: i64,
+    /// Mean active atoms per token `k̄` (the firing count charged per token).
+    pub k_active: f64,
+    /// Mean coded coordinates per active atom `d̄`.
+    pub coord_dim: f64,
+    /// Dictionary size `G` (atom count) the selection cost names into.
+    pub g_dict: i64,
+    /// Decoder scalar count `n_params = Σ_k M_k·p` charged at `l_param_bits`.
+    pub n_params: i64,
+    /// Per-coordinate code rate `½·log₂(1/(1 − ev))` (bits): the reverse-water-
+    /// filling rate to code one unit-variance coordinate to the achieved floor.
+    pub coordinate_rate_bits: f64,
+    /// Bits per stored dictionary scalar (`l_param_bits`); defaults to the
+    /// distortion-matched precision `coordinate_rate_bits`.
+    pub l_param_bits: f64,
+    /// Selection bits per token, `log₂ C(G, round(k̄))`.
+    pub selection_bits_per_token: f64,
+    /// Code bits per token, `k̄ · d̄ · coordinate_rate_bits`.
+    pub code_bits_per_token: f64,
+    /// Amortised dictionary bits per token, `n_params · l_param_bits / N`.
+    pub dict_bits_per_token: f64,
+    /// Total code bits over the corpus, `N · code_bits_per_token`.
+    pub code_bits: f64,
+    /// Total selection bits over the corpus, `N · selection_bits_per_token`.
+    pub selection_bits: f64,
+    /// Total dictionary bits (not per token), `n_params · l_param_bits`.
+    pub dict_bits: f64,
+    /// Total description length in bits, `code + selection + dict`.
+    pub total_bits: f64,
+    /// The headline currency: `total_bits / n_tokens`.
+    pub bits_per_token: f64,
+}
+
+/// Assemble the fit-level [`ManifoldFitDl`] from a fit's own summary quantities.
+///
+/// `ev` is the achieved explained variance, `n_tokens` the coded-token count,
+/// `k_active` the mean active atoms per token, `coord_dim` the mean coded
+/// coordinates per active atom, `g_dict` the dictionary size, `n_params` the
+/// decoder scalar count, and `l_param_bits` the per-scalar decoder precision
+/// (`None` ⇒ the distortion-matched precision = the per-coordinate code rate).
+/// Every quantity is READ OFF an existing fit; nothing is re-fit. `1 − ev` is
+/// floored at a tiny positive so a numerically-saturated fit reports a large
+/// (finite) code rate rather than `∞`.
+pub fn manifold_fit_description_length(
+    ev: f64,
+    n_tokens: i64,
+    k_active: f64,
+    coord_dim: f64,
+    g_dict: i64,
+    n_params: i64,
+    l_param_bits: Option<f64>,
+) -> ManifoldFitDl {
+    // Relative distortion floor achieved by the reconstruction. Floored away
+    // from zero so a saturated fit reports a large finite rate, not +∞.
+    let rel_distortion = (1.0 - ev).max(1.0e-12);
+    let coordinate_rate_bits = scalar_rate_bits(1.0, rel_distortion);
+    let l_param = l_param_bits.unwrap_or(coordinate_rate_bits).max(0.0);
+
+    let k_round = k_active.max(0.0).round() as i64;
+    let selection_bits_per_token = selection_bits(g_dict, k_round);
+    let code_bits_per_token = k_active.max(0.0) * coord_dim.max(0.0) * coordinate_rate_bits;
+    let dict_bits = n_params.max(0) as f64 * l_param;
+
+    let n = n_tokens.max(0) as f64;
+    let code_bits = n * code_bits_per_token;
+    let selection_bits_total = n * selection_bits_per_token;
+    let total_bits = code_bits + selection_bits_total + dict_bits;
+    let (bits_per_token, dict_bits_per_token) = if n_tokens > 0 {
+        (total_bits / n, dict_bits / n)
+    } else {
+        (f64::INFINITY, f64::INFINITY)
+    };
+
+    ManifoldFitDl {
+        ev,
+        n_tokens,
+        k_active,
+        coord_dim,
+        g_dict,
+        n_params,
+        coordinate_rate_bits,
+        l_param_bits: l_param,
+        selection_bits_per_token,
+        code_bits_per_token,
+        dict_bits_per_token,
+        code_bits,
+        selection_bits: selection_bits_total,
+        dict_bits,
+        total_bits,
+        bits_per_token,
+    }
+}
+
 #[cfg(test)]
 #[path = "description_length_tests.rs"]
 mod description_length_tests;
