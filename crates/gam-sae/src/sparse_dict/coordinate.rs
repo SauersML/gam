@@ -261,6 +261,15 @@ fn phase_se_b2(sigma: f64, norm: f64) -> (f64, bool) {
     }
 }
 
+/// Per-firing circle-phase coordinate standard error `σ/(2π‖z‖)`, clamped at the
+/// uniform-phase ceiling `√(1/12)` — the bare SE (no clamp flag) [`phase_se_b2`]
+/// exposes for the matched-description-length report column. `σ` is the block's
+/// radial-scatter noise scale, `norm = ‖z‖` the firing radius. A zero-norm firing
+/// returns the uniform ceiling (never NaN).
+pub(crate) fn phase_coordinate_se(sigma: f64, norm: f64) -> f64 {
+    phase_se_b2(sigma, norm).0
+}
+
 fn coeffs_from_code(z: &[f64]) -> Vec<(f64, f64)> {
     z.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect()
 }

@@ -127,6 +127,18 @@ pub struct BlockSeedRecord {
     pub basis: Option<Vec<Vec<f32>>>,
     pub mdl_block: MdlFeaturizerRow,
     pub mdl_chart: MdlFeaturizerRow,
+    /// Matched description length (bits) of the FLAT / linear block comparator:
+    /// `block_size` dictionary columns plus the per-firing coordinate coding bits at
+    /// the achieved coordinate-SE resolution (see [`crate::description_length`]).
+    pub matched_dl_flat: crate::description_length::MatchedDl,
+    /// Matched description length (bits) of the CURVED circle chart: `n_basis_chart`
+    /// dictionary columns plus the SAME per-firing coordinate coding bits. The extra
+    /// columns are the price curvature pays; the coding bits are matched.
+    pub matched_dl_chart: crate::description_length::MatchedDl,
+    /// Matched-DL delta `flat − chart` (bits): positive ⇒ the curved chart is the
+    /// shorter code (curvature pays), negative ⇒ the flat block is cheaper here. The
+    /// honest curved-vs-flat headline, read in bits rather than raw EV.
+    pub matched_dl_delta_bits: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +429,17 @@ pub fn block_sparse_dictionary_seed_manifest(
             block_name: Some(block_name),
             chart_name: Some(chart_name),
         };
+        // #P3 matched-DL report column: per-firing coordinate SEs from the block's
+        // firing radii, coded at the uniform-quantization rule, plus the column
+        // charge. Curved (n_basis_chart columns) vs flat (block_size columns) read
+        // in bits. Per-firing SE = σ̂/(2π‖z‖) (the b=2 circle rule; a report column,
+        // so the general-b block uses it as the phase-resolution proxy).
+        let firing_rows = rows_for_block(blocks, g);
+        let firing_coords = take_rows(&coords, &firing_rows);
+        let (matched_dl_flat, matched_dl_chart) =
+            matched_dl_for_block(&firing_coords, config, decoder.ncols(), block_ev);
+        let matched_dl_delta_bits =
+            crate::description_length::matched_dl_delta(&matched_dl_flat, &matched_dl_chart);
         records.push(BlockSeedRecord {
             block: g,
             block_dim: config.block_size,
@@ -431,6 +454,9 @@ pub fn block_sparse_dictionary_seed_manifest(
                 .then(|| block_basis(decoder, config.block_size, g)),
             mdl_block,
             mdl_chart,
+            matched_dl_flat,
+            matched_dl_chart,
+            matched_dl_delta_bits,
         });
     }
     Ok(BlockSeedManifest {
@@ -444,6 +470,63 @@ pub fn block_sparse_dictionary_seed_manifest(
         n_basis_chart: config.n_basis_chart,
         blocks: records,
     })
+}
+
+/// Matched description length (bits) of the flat/linear block vs the curved circle
+/// chart for one block, from its per-firing coordinates.
+///
+/// Per firing, the radial scatter noise `σ̂` (unbiased SD of the firing radii `‖z‖`)
+/// and radius give the coordinate SE `σ̂/(2π‖z‖)`
+/// ([`super::coordinate::phase_coordinate_se`]); each is coded at the uniform-
+/// quantization rule [`crate::description_length::se_resolution_bits`]. Both
+/// featurizers charge the SAME per-firing coding bits (matched distortion) — the
+/// difference is the parameter-column charge: `block_size` columns for the flat
+/// block, `n_basis_chart` for the circle chart, each `p` ambient scalars at the
+/// distortion-matched per-scalar precision (the mean per-firing coding rate).
+fn matched_dl_for_block(
+    firing_coords: &Array2<f32>,
+    config: &BlockSeedManifestConfig,
+    ambient_p: usize,
+    ev: f64,
+) -> (
+    crate::description_length::MatchedDl,
+    crate::description_length::MatchedDl,
+) {
+    use crate::description_length::{matched_dl, se_resolution_bits};
+    // Per-firing radii ‖z‖ and their unbiased radial-scatter noise σ̂.
+    let n_fire = firing_coords.nrows();
+    let mut norms: Vec<f64> = Vec::with_capacity(n_fire);
+    for row in firing_coords.rows() {
+        norms.push(row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt());
+    }
+    let sigma_hat = if n_fire >= 2 {
+        let mean = norms.iter().sum::<f64>() / n_fire as f64;
+        let ss: f64 = norms.iter().map(|&r| (r - mean) * (r - mean)).sum();
+        (ss / (n_fire - 1) as f64).sqrt()
+    } else {
+        0.0
+    };
+    let ses: Vec<f64> = norms
+        .iter()
+        .map(|&nz| super::coordinate::phase_coordinate_se(sigma_hat, nz))
+        .collect();
+    // Distortion-matched per-scalar precision: the mean per-firing coding rate (the
+    // rate a decoder weight is quantised to, matching a coded coordinate — the
+    // `description_length::score` convention). Zero firings ⇒ no coding, zero precision.
+    let l_param_bits = if ses.is_empty() {
+        0.0
+    } else {
+        ses.iter().map(|&se| se_resolution_bits(se)).sum::<f64>() / ses.len() as f64
+    };
+    let flat = matched_dl(config.block_size as i64, ambient_p as i64, l_param_bits, &ses, ev);
+    let chart = matched_dl(
+        config.n_basis_chart as i64,
+        ambient_p as i64,
+        l_param_bits,
+        &ses,
+        ev,
+    );
+    (flat, chart)
 }
 
 fn validate_inputs(
