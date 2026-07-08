@@ -201,7 +201,7 @@ pub struct UnitSpeedReparameterization {
 
 /// Decoder-curve speed `‖Φ'(u) B‖₂` for each evaluated coordinate row, from
 /// the basis jet `(rows, m, 1)` and the decoder `(m, p)`.
-fn curve_speeds(
+pub(crate) fn curve_speeds(
     jet: &ndarray::Array3<f64>,
     decoder: ArrayView2<'_, f64>,
 ) -> Result<Vec<f64>, String> {

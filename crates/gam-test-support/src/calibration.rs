@@ -175,6 +175,233 @@ pub fn audit_sbc_uniformity(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Coverage-sweep mode (issue #1891, audit mode 1).
+//
+// SBC rank uniformity (above) audits *posterior* surfaces. The complementary
+// mode audits *interval* surfaces — Wald/delta intervals, credible bands,
+// predictive intervals, and (via a 0/1 "reject" indicator) test-size curves.
+// The primitive is empirical coverage: over many planted-truth replications,
+// what fraction of the nominal-`c` intervals actually contain the truth?
+//
+// The tolerance is NOT a magic bound. Under correct calibration the hit count
+// is `Binomial(R, c)`, so the acceptance region is the (1 − α) binomial
+// confidence interval for the coverage proportion — the Wilson score interval,
+// the standard interval-for-a-proportion, evaluated at the same fixed 1%
+// false-positive rate the SBC verdict uses. A surface is anti-conservative (the
+// #1870/#1871/#1878 failure signature) only when the nominal level sits ABOVE
+// the whole CI; conservative when it sits below (reported with a named slack,
+// per the issue: anti-conservative gates the build, conservative reports).
+// ---------------------------------------------------------------------------
+
+/// Fixed false-positive rate for the coverage verdict — the same 1% the SBC
+/// uniformity gate uses, so both audit modes share one calibrated error budget
+/// rather than two independently tuned thresholds.
+pub const COVERAGE_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+/// Replications per coverage gate.
+///
+/// Sized so the Wilson half-width at the tightest audited level (`c = 0.95`) is
+/// a few percent — narrow enough to resolve the historical failures (0.157 and
+/// 0.731 observed vs 0.95 nominal in #1870/#1871) with wide margin, while a
+/// merely-1-point miscalibration is not over-resolved into a spurious gate.
+pub const COVERAGE_REPLICATIONS: usize = 2000;
+
+/// The three nominal levels every interval surface is audited at, matching the
+/// issue's 80/90/95 sweep. Test-size surfaces audit the complementary
+/// `α ∈ {0.2, 0.1, 0.05}` by registering the rejection indicator as the "miss".
+pub const COVERAGE_NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
+
+/// Rational-approximation inverse standard-normal CDF (Acklam's algorithm).
+///
+/// Accurate to ~1.15e-9 in absolute error over `p ∈ (0, 1)` — far tighter than
+/// any coverage tolerance here — so a consumer can build an exact-level interval
+/// `μ ± Φ⁻¹((1+c)/2)·σ` without hardcoding per-level z magic numbers. Not a
+/// tuned bound: a fixed published approximation to a fixed function.
+pub fn standard_normal_quantile(p: f64) -> f64 {
+    assert!(p > 0.0 && p < 1.0, "quantile argument must be in (0, 1)");
+    // Coefficients (Acklam 2003).
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_690e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239e0,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838e0,
+        -2.549_732_539_343_734e0,
+        4.374_664_141_464_968e0,
+        2.938_163_982_698_783e0,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996e0,
+        3.754_408_661_907_416e0,
+    ];
+    // Break-points of the central region.
+    const P_LOW: f64 = 0.024_25;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+    if p < P_LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= P_HIGH {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+/// Whether an interval surface's empirical coverage is statistically consistent
+/// with, above, or below its nominal level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageClass {
+    /// Nominal level lies inside the (1 − α) Wilson CI — calibrated.
+    Calibrated,
+    /// Nominal level lies ABOVE the whole CI: the surface under-covers. This is
+    /// the anti-conservative failure that gates the build.
+    AntiConservative,
+    /// Nominal level lies BELOW the whole CI: the surface over-covers. Reported
+    /// with a named slack, not gated.
+    Conservative,
+}
+
+/// Verdict of the empirical-coverage audit for one nominal level.
+#[derive(Clone, Debug)]
+pub struct CoverageVerdict {
+    /// Nominal coverage level `c` the intervals were built at.
+    pub nominal: f64,
+    /// Replications run.
+    pub replications: usize,
+    /// Intervals that contained the truth.
+    pub hits: usize,
+    /// Empirical coverage `hits / replications`.
+    pub empirical: f64,
+    /// Lower endpoint of the (1 − α) Wilson score CI for the true coverage.
+    pub ci_lo: f64,
+    /// Upper endpoint of the (1 − α) Wilson score CI for the true coverage.
+    pub ci_hi: f64,
+    /// Classification of `nominal` against the CI.
+    pub class: CoverageClass,
+    /// `true` unless the surface is anti-conservative. Conservative and
+    /// calibrated both pass (over-coverage is safe); only under-coverage gates.
+    pub passed: bool,
+}
+
+impl CoverageVerdict {
+    /// Signed slack of the nominal level outside the CI: positive when
+    /// conservative (nominal below `ci_lo`), negative when anti-conservative
+    /// (nominal above `ci_hi`), zero when calibrated. Lets a conservative report
+    /// name its margin.
+    pub fn slack(&self) -> f64 {
+        match self.class {
+            CoverageClass::Conservative => self.ci_lo - self.nominal,
+            CoverageClass::AntiConservative => self.ci_hi - self.nominal,
+            CoverageClass::Calibrated => 0.0,
+        }
+    }
+}
+
+/// Classify an observed hit count against its nominal level using the Wilson
+/// score interval at [`COVERAGE_FALSE_POSITIVE_RATE`].
+///
+/// The Wilson interval is the standard confidence interval for a binomial
+/// proportion (better small-sample behaviour than the Wald interval and never
+/// escaping `[0, 1]`), so the tolerance is derived from the binomial law of the
+/// replicate count — not a hand-picked coverage band.
+pub fn audit_coverage(hits: usize, replications: usize, nominal: f64) -> CoverageVerdict {
+    assert!(replications > 0, "coverage audit needs at least one replication");
+    assert!(
+        nominal > 0.0 && nominal < 1.0,
+        "nominal coverage must lie in (0, 1)"
+    );
+    assert!(hits <= replications, "hit count exceeds replication count");
+    let n = replications as f64;
+    let p_hat = hits as f64 / n;
+    // Two-sided z at the fixed FPR: Φ⁻¹(1 − α/2).
+    let z = standard_normal_quantile(1.0 - COVERAGE_FALSE_POSITIVE_RATE / 2.0);
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let center = (p_hat + z2 / (2.0 * n)) / denom;
+    let half = z * (p_hat * (1.0 - p_hat) / n + z2 / (4.0 * n * n)).sqrt() / denom;
+    let ci_lo = (center - half).max(0.0);
+    let ci_hi = (center + half).min(1.0);
+    let class = if nominal > ci_hi {
+        CoverageClass::AntiConservative
+    } else if nominal < ci_lo {
+        CoverageClass::Conservative
+    } else {
+        CoverageClass::Calibrated
+    };
+    CoverageVerdict {
+        nominal,
+        replications,
+        hits,
+        empirical: p_hat,
+        ci_lo,
+        ci_hi,
+        class,
+        passed: class != CoverageClass::AntiConservative,
+    }
+}
+
+/// An interval-emitting surface auditable by [`run_coverage`].
+///
+/// Draws a truth from the prior, then simulates data, fits, and returns the
+/// `(lower, upper)` interval the surface reports at nominal level `c`. As with
+/// [`SbcModel`], simulate+fit+extract live inside the object under test so a
+/// miscalibrated fit is exercised, not bypassed.
+pub trait CoverageModel {
+    /// Draw one true parameter value from the prior `π(θ)`.
+    fn draw_prior(&self, rng: &mut CalibrationRng) -> f64;
+
+    /// Simulate `y ~ p(y | truth)`, fit, and return the surface's `(lower,
+    /// upper)` interval at nominal coverage `level ∈ (0, 1)`.
+    fn simulate_and_interval(
+        &self,
+        truth: f64,
+        level: f64,
+        rng: &mut CalibrationRng,
+    ) -> (f64, f64);
+}
+
+/// Run the coverage loop at one nominal level and return the hit count (the
+/// number of replications whose interval contained the truth). A single
+/// deterministic RNG stream threads every replication so the gate reproduces
+/// from `seed`.
+pub fn run_coverage<M: CoverageModel>(
+    model: &M,
+    seed: u64,
+    replications: usize,
+    level: f64,
+) -> usize {
+    let mut rng = CalibrationRng::new(seed);
+    (0..replications)
+        .filter(|_| {
+            let truth = model.draw_prior(&mut rng);
+            let (lo, hi) = model.simulate_and_interval(truth, level, &mut rng);
+            lo <= truth && truth <= hi
+        })
+        .count()
+}
+
 /// Conjugate normal-normal location model: the first live SBC consumer.
 ///
 /// Prior `θ ~ Normal(prior_mean, prior_sd²)`, likelihood
@@ -182,7 +409,10 @@ pub fn audit_sbc_uniformity(
 /// posterior is available in closed form, so SBC ranks are provably uniform when
 /// [`posterior_sd_scale`](Self::posterior_sd_scale) is `1.0`. Setting the scale
 /// away from `1.0` plants a miscalibration (over-confident below `1.0`,
-/// over-dispersed above) that SBC must detect.
+/// over-dispersed above) that SBC must detect. The same closed form gives an
+/// exact credible interval, so the model is also the first [`CoverageModel`]
+/// consumer: at scale `1.0` its intervals cover at nominal, and a narrowed scale
+/// under-covers (the anti-conservative signature the coverage gate must catch).
 #[derive(Clone, Copy, Debug)]
 pub struct ConjugateGaussianModel {
     /// Prior mean `μ₀`.
@@ -231,6 +461,30 @@ impl SbcModel for ConjugateGaussianModel {
         (0..n_draws)
             .map(|_| posterior_mean + sampling_sd * rng.standard_normal())
             .collect()
+    }
+}
+
+impl CoverageModel for ConjugateGaussianModel {
+    fn draw_prior(&self, rng: &mut CalibrationRng) -> f64 {
+        self.prior_mean + self.prior_sd * rng.standard_normal()
+    }
+
+    fn simulate_and_interval(
+        &self,
+        truth: f64,
+        level: f64,
+        rng: &mut CalibrationRng,
+    ) -> (f64, f64) {
+        let sum_y = (0..self.n_obs)
+            .map(|_| truth + self.obs_sd * rng.standard_normal())
+            .sum::<f64>();
+        let (posterior_mean, posterior_sd) = self.posterior_mean_sd(sum_y);
+        // Exact equal-tailed credible interval at `level`, scaled by the planted
+        // miscalibration factor: at scale 1.0 it is the true posterior interval
+        // (covers at nominal); a narrowed scale under-covers.
+        let half_width =
+            standard_normal_quantile(0.5 + level / 2.0) * posterior_sd * self.posterior_sd_scale;
+        (posterior_mean - half_width, posterior_mean + half_width)
     }
 }
 
@@ -379,6 +633,83 @@ mod tests {
              chi_square={:.3} <= critical_value={:.3}, counts={:?}",
             verdict.chi_square, verdict.critical_value, verdict.counts
         );
+    }
+
+    #[test]
+    fn normal_quantile_matches_known_values_and_is_symmetric() {
+        use super::standard_normal_quantile;
+        // Reference two-sided z at the classic levels (accurate to the
+        // approximation's ~1e-9), and the symmetry Φ⁻¹(1−p) = −Φ⁻¹(p).
+        for (p, z) in [(0.975_f64, 1.959_963_985), (0.95, 1.644_853_627), (0.9, 1.281_551_566)] {
+            assert!(
+                (standard_normal_quantile(p) - z).abs() < 1e-6,
+                "Φ⁻¹({p}) = {} != {z}",
+                standard_normal_quantile(p)
+            );
+            assert!(
+                (standard_normal_quantile(1.0 - p) + z).abs() < 1e-6,
+                "quantile not antisymmetric at p={p}"
+            );
+        }
+        assert!(standard_normal_quantile(0.5).abs() < 1e-9, "median must be 0");
+    }
+
+    #[test]
+    fn wilson_verdict_classifies_nominal_against_the_ci() {
+        use super::{CoverageClass, audit_coverage};
+        // Calibrated: 950/1000 hits at nominal 0.95 — nominal sits inside the CI.
+        let v = audit_coverage(950, 1000, 0.95);
+        assert_eq!(v.class, CoverageClass::Calibrated);
+        assert!(v.passed && v.ci_lo < 0.95 && 0.95 < v.ci_hi);
+        // Anti-conservative: 731/1000 (the #1871 signature) vs nominal 0.95 —
+        // nominal far above the CI, gate must fail.
+        let under = audit_coverage(731, 1000, 0.95);
+        assert_eq!(under.class, CoverageClass::AntiConservative);
+        assert!(!under.passed && 0.95 > under.ci_hi && under.slack() < 0.0);
+        // Conservative: 995/1000 at nominal 0.90 — over-covers, reports positive
+        // slack but does NOT gate.
+        let over = audit_coverage(995, 1000, 0.90);
+        assert_eq!(over.class, CoverageClass::Conservative);
+        assert!(over.passed && over.slack() > 0.0);
+    }
+
+    #[test]
+    fn calibrated_conjugate_gaussian_passes_coverage_sweep() {
+        use super::{
+            COVERAGE_NOMINAL_LEVELS, COVERAGE_REPLICATIONS, audit_coverage, run_coverage,
+        };
+        // Real end-to-end coverage: exact closed-form credible intervals cover at
+        // nominal, so every level in the sweep must pass.
+        let model = conjugate_model(1.0);
+        for &level in &COVERAGE_NOMINAL_LEVELS {
+            let hits = run_coverage(&model, REFERENCE_SEED, COVERAGE_REPLICATIONS, level);
+            let v = audit_coverage(hits, COVERAGE_REPLICATIONS, level);
+            assert!(
+                v.passed,
+                "calibrated Gaussian must pass coverage at {level}: empirical={:.4} \
+                 CI=[{:.4},{:.4}] class={:?}",
+                v.empirical, v.ci_lo, v.ci_hi, v.class
+            );
+        }
+    }
+
+    #[test]
+    fn narrowed_interval_fails_coverage_sweep() {
+        use super::{CoverageClass, COVERAGE_REPLICATIONS, audit_coverage, run_coverage};
+        // Teeth: intervals narrowed to half width (posterior_sd_scale = 0.5)
+        // under-cover, so the gate must classify anti-conservative and fail. A
+        // vacuous coverage check would let this pass.
+        let model = conjugate_model(0.5);
+        let level = 0.95;
+        let hits = run_coverage(&model, PLANTED_SEED, COVERAGE_REPLICATIONS, level);
+        let v = audit_coverage(hits, COVERAGE_REPLICATIONS, level);
+        assert_eq!(
+            v.class,
+            CoverageClass::AntiConservative,
+            "narrowed interval must be flagged anti-conservative: empirical={:.4} CI=[{:.4},{:.4}]",
+            v.empirical, v.ci_lo, v.ci_hi
+        );
+        assert!(!v.passed, "narrowed interval must fail the coverage gate");
     }
 
     #[test]

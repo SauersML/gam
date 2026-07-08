@@ -405,6 +405,13 @@ impl BlockSparseStreamState {
             return Err("BlockSparseStream.partial_fit shard must be finite".to_string());
         }
 
+        // Per-shard wall-clock start (#2227). The block lane processes one shard
+        // per `partial_fit`; the epoch-level telemetry only lands at `end_epoch`,
+        // so a shard that routes or codes slowly (a device stall on a future
+        // GPU-wired route, or a pathological CPU GEMM) is otherwise silent until
+        // the whole epoch finishes. Emitting a bounded, per-shard heartbeat makes
+        // any such stall visible within one shard instead of one epoch.
+        let shard_start = std::time::Instant::now();
         let p = self.p;
         let b = self.b;
         let gamma = self.gamma;
@@ -520,6 +527,21 @@ impl BlockSparseStreamState {
 
         self.rss += shard_rss;
         self.row_count += codes.len();
+        // Per-shard heartbeat (#2227): rows in this shard, cumulative rows, the
+        // shard reconstruction RSS, live-block count, and the shard wall time. A
+        // stalled shard stops advancing this line; under `RUST_LOG=info` a route
+        // that never returns is diagnosable immediately rather than after a whole
+        // silent epoch.
+        log::info!(
+            "[SAE block shard] rows={} total_rows={} rss={:.6e} alive_blocks={}/{} \
+             shard_s={:.2}",
+            codes.len(),
+            self.row_count,
+            shard_rss,
+            self.alive_count,
+            self.g,
+            shard_start.elapsed().as_secs_f64(),
+        );
         Ok(BlockShardStats {
             rows: codes.len(),
             rss: shard_rss,

@@ -168,16 +168,19 @@ class SparseDictionaryFit:
         )
 
     def transform(
-        self, X: Any, active: int | None = None, *, score_mode: str = "required"
+        self, X: Any, active: int | None = None, *, score_mode: str = "auto"
     ) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
         Returns a :class:`SparseDictionaryTransform` with ``indices`` and
         ``codes`` of shape ``M x active`` plus ``score_route_stats``. The stats
         are part of the API: high-``K`` jobs must prove whether the route ran on
-        the device or on the host. ``score_mode`` defaults to ``"required"`` so
-        an admitted route that cannot run on CUDA raises instead of returning an
-        all-CPU success.
+        the device or on the host. ``score_mode`` defaults to ``"auto"`` (the
+        same default as the fit), so a held-out encode whose block is below the
+        device break-even — or that runs on a host with no CUDA — routes on the
+        CPU transparently; the ``score_route_stats`` still report which path ran.
+        Pass ``score_mode="required"`` to fail-closed when you specifically want
+        an admitted route to raise rather than fall back to the host.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
@@ -231,13 +234,16 @@ class SparseDictStreamArtifact:
     score_route_stats: dict[str, Any]
 
     def transform(
-        self, X: Any, active: int | None = None, *, score_mode: str = "required"
+        self, X: Any, active: int | None = None, *, score_mode: str = "auto"
     ) -> SparseDictionaryTransform:
         """Route held-out rows ``X`` (``M x P``) through the fitted decoder.
 
         Returns a :class:`SparseDictionaryTransform`, including route telemetry
         proving CPU/device dispatch for the held-out encode. ``score_mode``
-        defaults to ``"required"`` for fail-closed GPU routing.
+        defaults to ``"auto"`` (the same default as the fit): a block below the
+        device break-even, or a host with no CUDA, routes on the CPU
+        transparently while ``score_route_stats`` still reports the path. Pass
+        ``score_mode="required"`` to fail-closed on an admitted device route.
         """
         x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
