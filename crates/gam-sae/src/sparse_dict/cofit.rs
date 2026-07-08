@@ -221,6 +221,7 @@ pub fn cofit_block_and_curved(
     // ---- Round 0: the one-shot fit-curved-on-linear-residual baseline. ----
     let compose0 = compose_block_coordinate_charts(target, decoder, blocks, work.view(), &chart_cfg)?;
     let mut accepted = accepted_set(&compose0);
+    zero_owned_codes(&mut work, blocks, &accepted);
     let mut composed = compose0.reconstructed.clone();
     let mut curved = curved_correction(decoder, blocks, work.view(), b, &accepted, &composed)?;
     let mut charge = accepted_charge(&compose0);
@@ -279,6 +280,7 @@ pub fn cofit_block_and_curved(
         let curved_committed = objective_b <= objective_a + slack;
         if curved_committed {
             accepted = cand_accepted;
+            zero_owned_codes(&mut work, blocks, &accepted);
             composed = cand_composed;
             curved = curved_correction(decoder, blocks, work.view(), b, &accepted, &composed)?;
             charge = accepted_charge(&candidate);
@@ -412,6 +414,28 @@ fn reconstruct_masked(
 /// chart coordinates of the accepted (chart-owned) blocks. Because
 /// `composed = L_unowned + (chart lifts of the owned blocks)` by the compose
 /// lane's construction, subtracting the unowned linear reconstruction isolates
+
+/// Zero the linear codes of every chart-OWNED active slot. A chart-owned
+/// block's reconstruction lives entirely in the curved correction `C`; its
+/// linear code no longer participates in `L_unowned`, so the exact minimizer
+/// of `J = ‖x − L_unowned − C‖² + λ‖codes‖²` in those slots is `0`. Leaving
+/// stale owned-code mass in place would let `λ‖codes‖²` price codes the
+/// reconstruction does not use, distorting the recorded objective and the
+/// stall test. If ownership later recedes, the block-A exact per-row solve
+/// re-fits the slot from zero.
+fn zero_owned_codes(codes: &mut Array3<f32>, blocks: ArrayView2<'_, u32>, accepted: &HashSet<usize>) {
+    let (n, slots, width) = codes.dim();
+    for i in 0..n {
+        for j in 0..slots.min(blocks.ncols()) {
+            if accepted.contains(&(blocks[[i, j]] as usize)) {
+                for r in 0..width {
+                    codes[[i, j, r]] = 0.0;
+                }
+            }
+        }
+    }
+}
+
 /// the pure curved contribution — a term that does NOT depend on the unowned
 /// blocks' codes, so it stays frozen through the next block-A refit.
 fn curved_correction(

@@ -567,7 +567,13 @@ pub fn screen_all_pairs_phase(
 ) -> Result<Vec<PhaseVerdict>, String> {
     let mut verdicts = Vec::new();
     let mut ledger_e: Vec<f64> = Vec::new();
-    // (verdict index) for each ledger entry — one entry per pair (best channel).
+    // (verdict index) for each ledger entry — one entry per pair × CHANNEL.
+    // The per-pair maximum over channels is NOT an e-value (for three null
+    // channels E[max e] = 8/5 > 1), so feeding `best_e_value` to e-BH would
+    // void the FDR guarantee the module header states. Every calibrated
+    // channel e-value enters the ledger under its own entry, exactly the
+    // pair × channel family the header prices; a pair is proposed when ANY of
+    // its channel entries is rejected.
     let mut ledger_owner: Vec<usize> = Vec::new();
     for a in 0..candidates.len() {
         for b in (a + 1)..candidates.len() {
@@ -583,8 +589,10 @@ pub fn screen_all_pairs_phase(
                 pair_seed,
             )?;
             if v.n_co_active >= 2 {
-                ledger_e.push(v.best_e_value);
-                ledger_owner.push(verdicts.len());
+                for ch in &v.channels {
+                    ledger_e.push(ch.e_value);
+                    ledger_owner.push(verdicts.len());
+                }
             }
             verdicts.push(v);
         }
