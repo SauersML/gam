@@ -64,6 +64,7 @@ pub mod streaming_border;
 pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
+pub mod topology_stack_gaussian;
 // #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
 // `gam-custom-family` crate (above gam-solve) can reach the warm-start
 // artifact/transfer carriers it consumes.

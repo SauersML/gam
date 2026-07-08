@@ -1543,6 +1543,7 @@ class ManifoldSAE(nn.Module):
             "_train_steps", torch.zeros((), dtype=torch.long), persistent=False
         )
 
+
         # The forward path evaluates a Duchon kernel both for an explicit
         # `atom_basis='duchon'` AND for every `product`/`cylinder` patch (whose
         # multi-axis torch basis is the full d-dimensional Duchon kernel — there
@@ -1686,6 +1687,85 @@ class ManifoldSAE(nn.Module):
             "a_init": np.ascontiguousarray(a_init, dtype=np.float64),
         }
 
+    @torch.no_grad()
+    def _solve_chart_coordinates(
+        self,
+        x: torch.Tensor,
+        *,
+        prev_positions: torch.Tensor | None = None,
+        gate_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """E-step coordinate solve through the Rust FFI (no math in Python).
+
+        For every ``(row, atom)`` pair the Rust kernel
+        (``sae_solve_chart_coordinates`` →
+        ``gam_sae::chart_coordinate_solve``) projects the target onto the atom's
+        CURRENT decoded periodic curve, amplitude profiled out, over a grid of
+        ``8·K`` points, and returns the argmax coordinate. The returned
+        coordinates are detached E-step CONSTANTS: the decoder gradient flows
+        through the later ``basis_with_jet`` evaluation at these coordinates, and
+        the encoder position head is kept learning through
+        :meth:`position_alignment_penalty`.
+
+        ``prev_positions`` / ``gate_weights`` are the previous sweep's ``(N, F)``
+        coordinates / gate weights; when supplied the kernel targets the
+        leave-one-out residual ``x − Σ_{g≠f} gate_g · m_g(t_g)`` (second sweep).
+
+        Returns solved coordinates ``(N, F, 1)`` in ``[0, 1)``.
+        """
+        n = int(x.shape[0])
+        F = int(self.cfg.n_atoms)
+        K = int(self.cfg.n_basis_per_atom)
+        # Periodic basis width the circle forward path uses (see ``_basis_rust``):
+        # n_harm = max(1, (K-1)//2), width m = 2·n_harm + 1. The padded tail row
+        # (when K is even) is multiplied by a zero curve column downstream, so it
+        # is excluded from the projection here to keep the width contract.
+        n_harm = max(1, (K - 1) // 2)
+        m = 2 * n_harm + 1
+        dec = to_numpy_f64(self.decoder_blocks)[:, :m, :]
+        x_np = to_numpy_f64(x)
+        prev_np = (
+            None
+            if prev_positions is None
+            else to_numpy_f64(prev_positions.reshape(n, F))
+        )
+        gate_np = (
+            None if gate_weights is None else to_numpy_f64(gate_weights.reshape(n, F))
+        )
+        solved = rust_module().sae_solve_chart_coordinates(
+            np.ascontiguousarray(x_np, dtype=np.float64),
+            np.ascontiguousarray(dec, dtype=np.float64),
+            int(n_harm),
+            prev_np,
+            gate_np,
+        )
+        solved_t = from_numpy_like(solved, x)
+        return solved_t.reshape(n, F, 1)
+
+    def position_alignment_penalty(self) -> torch.Tensor:
+        """Mean squared circular (period-1) distance between the encoder-predicted
+        and E-step-solved coordinates of the last forward.
+
+        Under the E-step coordinate path the reconstruction is built at solved
+        coordinates that are tape constants, so the encoder position head gets no
+        reconstruction gradient. This penalty pulls the encoder toward the
+        coordinates the projection solve found, keeping the position head
+        learning. It is the only coordinate-side tensor math kept in Python — a
+        subtraction, a period-1 wrap, and a mean. Returns a zero scalar when the
+        last forward did not run the E-step (non-circle / non-``softmax_topk``
+        lane, or before any forward).
+        """
+        enc = getattr(self, "_last_encoder_positions", None)
+        solved = getattr(self, "_last_solved_positions", None)
+        if enc is None or solved is None:
+            return torch.zeros(
+                (), dtype=self.cfg.dtype, device=self.decoder_blocks.device
+            )
+        diff = enc - solved
+        # Period-1 circular wrap into (-0.5, 0.5]: d − round(d).
+        wrapped = diff - torch.round(diff)
+        return wrapped.square().mean()
+
     def forward(self, x: torch.Tensor) -> ManifoldSAEOutput:
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE forward expects a torch.Tensor")
@@ -1703,9 +1783,80 @@ class ManifoldSAE(nn.Module):
             return self._forward_from_closed_form(x)
         raw_positions, amp_logits = self._encode(x)
         raw_with_anchor = raw_positions + self.atom_raw_anchor.unsqueeze(0)
-        positions = _project_to_manifold(
+        encoder_positions = _project_to_manifold(
             raw_with_anchor, self.cfg.atom_manifold, self.cfg.intrinsic_rank
         )
+
+        # Issue #1282: break expert collapse with an early *committed* assignment
+        # window (see ``reconstruction_topk_gate``). Track the training step here
+        # so the gate knows whether it is inside the commitment window; only
+        # advance while training. Computed once and shared across E-step sweeps.
+        step = None
+        if self.cfg.sparsity.kind == "softmax_topk" and self.training:
+            step = int(self._train_steps.item())
+            self._train_steps += 1
+
+        # DEFAULT coordinate path for the circle (rank-1) softmax_topk lane: the
+        # Rust E-step coordinate solver. Positions are solved by projecting each
+        # row onto the atom's current decoded curve rather than gradient-learned
+        # through the near-zero basis jet (the measured plateau root cause). The
+        # solved coordinates are tape CONSTANTS; the decoder gradient still flows
+        # through the basis evaluation at them, and the encoder position head
+        # keeps learning through ``position_alignment_penalty``.
+        use_estep = (
+            self.cfg.sparsity.kind == "softmax_topk"
+            and int(self.cfg.intrinsic_rank) == 1
+            and not getattr(self, "_disable_estep", False)
+        )
+        if use_estep:
+            # Sweep 1: plain target x.
+            coords1 = self._solve_chart_coordinates(x)
+            curves1 = _eval_basis_on_manifold(
+                coords1, self.cfg, self._forward_centers
+            )
+            per_atom_recon1 = torch.einsum(
+                "nfk,fkd->nfd", curves1, self.decoder_blocks
+            )
+            # Single gate evaluation (one commitment-state advance): the routing
+            # gate on the sweep-1 reconstruction, reused for the final x_hat.
+            z = self.sparsity.reconstruction_topk_gate(x, per_atom_recon1, step=step)
+            # Sweep 2: leave-one-out residual target using sweep-1 positions and
+            # the (detached) gate weights.
+            positions = self._solve_chart_coordinates(
+                x, prev_positions=coords1, gate_weights=z.detach()
+            )
+            curves = _eval_basis_on_manifold(
+                positions, self.cfg, self._forward_centers
+            )
+            per_atom_recon = torch.einsum(
+                "nfk,fkd->nfd", curves, self.decoder_blocks
+            )
+            gate_pre = amp_logits
+            assignments = z
+            raw_magnitudes = self.sparsity._topk_activation(amp_logits)
+            # Stash for the encoder alignment penalty: tape-connected encoder
+            # positions vs the detached solved coordinates.
+            self._last_encoder_positions = encoder_positions
+            self._last_solved_positions = positions.detach()
+            reml_score = torch.tensor(
+                float("nan"), dtype=x.dtype, device=x.device
+            )
+            lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)
+            x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
+            return ManifoldSAEOutput(
+                z=z,
+                x_hat=x_hat,
+                positions=positions,
+                amplitudes=z.abs(),
+                curves=curves,
+                gate=gate_pre,
+                assignments=assignments,
+                reml_score=reml_score,
+                lambdas=lambdas,
+                raw_magnitudes=raw_magnitudes,
+            )
+
+        positions = encoder_positions
         curves = _eval_basis_on_manifold(
             positions,
             self.cfg,
@@ -1714,14 +1865,6 @@ class ManifoldSAE(nn.Module):
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = amp_logits
-            # Issue #1282: break expert collapse with an early *committed*
-            # assignment window (see ``reconstruction_topk_gate``). Track the
-            # training step here so the gate knows whether it is inside the
-            # commitment window; only advance while training.
-            step = None
-            if self.training:
-                step = int(self._train_steps.item())
-                self._train_steps += 1
             assignments = self.sparsity.reconstruction_topk_gate(
                 x, per_atom_recon, step=step
             )
@@ -1729,6 +1872,8 @@ class ManifoldSAE(nn.Module):
             # Honest pre-mask magnitude: the independent non-negative activation
             # the top-k selection masks, strictly positive even for dropped atoms.
             raw_magnitudes = self.sparsity._topk_activation(amp_logits)
+            self._last_encoder_positions = None
+            self._last_solved_positions = None
         else:
             # IBP-Gumbel / JumpReLU: the code IS the Rust-computed bounded gate,
             # exactly the family the closed-form fit solves — magnitude lives in

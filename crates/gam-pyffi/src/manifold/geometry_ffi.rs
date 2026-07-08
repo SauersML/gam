@@ -520,6 +520,130 @@ fn response_geometry_sphere_normalize_base<'py>(
     Ok(normalized.into_pyarray(py).unbind())
 }
 
+// ── Torch compositional-geometry surface (ILR chart + autograd jets) ─────────
+//
+// These back `gamfit.torch.geometry`. The ILR chart, its inverse, and the ALR
+// Aitchison Gram have no NumPy twin (the `_response_geometry` surface stops at
+// CLR/ALR); the `*_jet` variants return the per-row analytic Jacobian the torch
+// autograd `Function`s contract against so gradients survive the FFI round-trip.
+// All math lives in `gam::geometry::manifolds::aitchison_ilr`.
+
+#[pyfunction]
+fn response_geometry_ilr<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = values.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_ilr", move || {
+        gam::geometry::manifolds::aitchison_ilr::ilr(arr.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_inverse_ilr<'py>(
+    py: Python<'py>,
+    coords: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let arr = coords.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_inverse_ilr", move || {
+        gam::geometry::manifolds::aitchison_ilr::inverse_ilr(arr.view())
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn response_geometry_aitchison_metric<'py>(
+    py: Python<'py>,
+    parts: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let out = detach_py_result(py, "response_geometry_aitchison_metric", move || {
+        gam::geometry::manifolds::aitchison_ilr::aitchison_metric(parts)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// CLR value and its per-row Jacobian `J[n,j,i] = ∂clr(x)_{n,j}/∂x_{n,i}` for the
+/// torch autograd `Function`.
+#[pyfunction]
+fn response_geometry_clr_jet<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>)> {
+    let arr = values.as_array().to_owned();
+    let (value, jac) = detach_py_result(py, "response_geometry_clr_jet", move || {
+        gam::geometry::manifolds::aitchison_ilr::clr_jet(arr.view())
+    })?;
+    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+}
+
+/// Simplex log map value and its per-row Jacobian w.r.t. `values` (base held
+/// constant). `coordinates` is `"ilr"`/`"simplex"`, `"clr"`, or `"alr"`.
+#[pyfunction(signature = (values, base, coordinates, reference = -1))]
+fn response_geometry_simplex_log_map_jet<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+    coordinates: String,
+    reference: isize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>)> {
+    let arr = values.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let (value, jac) = detach_py_result(py, "response_geometry_simplex_log_map_jet", move || {
+        let coord = gam::geometry::manifolds::aitchison_ilr::parse_log_ratio_coord(&coordinates)?;
+        gam::geometry::manifolds::aitchison_ilr::simplex_log_map_jet(
+            arr.view(),
+            base_owned.view(),
+            coord,
+            reference,
+        )
+    })?;
+    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+}
+
+/// Simplex exp map value and its per-row Jacobian w.r.t. `tangent` (base held
+/// constant), inverting [`response_geometry_simplex_log_map_jet`].
+#[pyfunction(signature = (tangent, base, coordinates, reference = -1))]
+fn response_geometry_simplex_exp_map_jet<'py>(
+    py: Python<'py>,
+    tangent: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+    coordinates: String,
+    reference: isize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>)> {
+    let t_owned = tangent.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let (value, jac) = detach_py_result(py, "response_geometry_simplex_exp_map_jet", move || {
+        let coord = gam::geometry::manifolds::aitchison_ilr::parse_log_ratio_coord(&coordinates)?;
+        gam::geometry::manifolds::aitchison_ilr::simplex_exp_map_jet(
+            t_owned.view(),
+            base_owned.view(),
+            coord,
+            reference,
+        )
+    })?;
+    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+}
+
+/// Sphere exp map value and its per-row Jacobian w.r.t. `tangent` (base held
+/// constant) for the torch autograd `Function`.
+#[pyfunction]
+fn response_geometry_sphere_exp_map_jet<'py>(
+    py: Python<'py>,
+    tangent: PyReadonlyArray2<'py, f64>,
+    base: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>)> {
+    let t_owned = tangent.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let (value, jac) = detach_py_result(py, "response_geometry_sphere_exp_map_jet", move || {
+        gam::geometry::manifolds::aitchison_ilr::sphere_exp_map_jet(
+            t_owned.view(),
+            base_owned.view(),
+        )
+    })?;
+    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+}
+
 /// Consolidated response-geometry log map. Owns geometry-kind routing,
 /// coordinate resolution, and base-point selection (intrinsic Fréchet mean when
 /// `base` is `None`) so the Python wrapper marshals arrays only. Returns
@@ -4465,6 +4589,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_ilr, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_inverse_ilr, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_aitchison_metric, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_clr_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map_jet, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_fit_curvature, module)?)?;

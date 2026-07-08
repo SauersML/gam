@@ -9,6 +9,7 @@ pub mod candidate_index;
 pub mod certificate_impls;
 pub mod certificates;
 pub mod chart_canonicalization;
+pub mod chart_coordinate_solve;
 pub mod chart_transfer;
 pub mod coactivation_conditionality;
 pub mod corpus;

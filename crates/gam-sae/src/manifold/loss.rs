@@ -79,11 +79,33 @@ pub struct SaeOuterRhoGradientComponents {
     pub logdet_trace: Array1<f64>,
     /// Derivative contribution of `-occam`.
     pub occam: Array1<f64>,
-    /// `0.5 * tr(H^{-1} (dH/dtheta * dtheta_hat/d rho_j))`.
+    /// `−½·Γᵀθ̂_ρ`, the implicit-state (envelope) response, **after** the inner
+    /// stationarity dead-zone gate — this is the term [`Self::gradient`] consumes.
+    ///
+    /// The tolerance-gated inner solve leaves `θ̂` frozen whenever an outer-ρ step
+    /// perturbs the inner KKT gradient by less than the stationarity tolerance `τ`
+    /// that declared convergence (`τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL ·
+    /// inner_iterate_scale`). On those coordinates the criterion the outer search
+    /// actually experiences has `θ̂` locally constant, so its (Clarke) gradient is
+    /// `explicit + logdet_trace + occam` with NO envelope term. This field is that
+    /// envelope term set to `0` on every coordinate whose predicted response sits
+    /// inside the dead-zone, and equal to the raw response elsewhere. See
+    /// `analytic_outer_rho_gradient_components` for the derivation of the gate.
     pub third_order_correction: Array1<f64>,
+    /// The RAW, ungated envelope response `−½·Γᵀθ̂_ρ` per coordinate, before the
+    /// dead-zone gate zeroes the frozen-`θ̂` coordinates. Diagnostics-only: it lets
+    /// the FD-gate / discriminator instruments still read the analytic IFT value
+    /// (which can be a large, spurious amplification of a below-tolerance signal
+    /// through a weakly-identified inner direction). It is NEVER summed into
+    /// [`Self::gradient`].
+    pub third_order_correction_raw: Array1<f64>,
 }
 
 impl SaeOuterRhoGradientComponents {
+    /// The consumed outer-ρ gradient: `explicit + logdet_trace + occam +
+    /// third_order_correction`, where `third_order_correction` is the **gated**
+    /// envelope term (zero on frozen-`θ̂` coordinates). Consistent with the
+    /// tolerance-gated criterion the outer search actually experiences.
     #[must_use]
     pub fn gradient(&self) -> Array1<f64> {
         &(&(&self.explicit + &self.logdet_trace) + &self.occam) + &self.third_order_correction

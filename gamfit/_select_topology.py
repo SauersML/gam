@@ -15,7 +15,6 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from statistics import NormalDist
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -66,6 +65,16 @@ class _TopologyRustModule(Protocol):
         self,
         names: list[str],
         log_density_rows: list[list[float]],
+    ) -> str: ...
+
+    def stack_topologies_gaussian(
+        self,
+        names: list[str],
+        y: list[float],
+        means: list[list[float]],
+        lowers: list[list[float]],
+        uppers: list[list[float]],
+        interval_level: float,
     ) -> str: ...
 
     def topology_bic_score(
@@ -526,11 +535,13 @@ def stack_topologies(
     predictive moments: mean ``μ_k(x)`` and total predictive standard deviation
     ``σ_k(x)`` recovered from the family-correct observation interval the Rust
     predictor emits (``Var(μ̂) + Var(Y|μ)``). This keeps every family-specific
-    variance in the Rust core; only the generic log-score weight solve and
-    mixture run in Python (the solve itself is the Rust
-    ``stacking_weights_from_log_density`` binding). Rows whose recovered σ is
-    non-positive (e.g. fully clamped against the response support) carry no
-    Gaussian density and are dropped from that candidate's column.
+    variance in the Rust core, and the σ-recovery quantile, Gaussian log-density
+    table, and simplex weight solve all run behind the single Rust
+    ``stack_topologies_gaussian`` binding (``gam::solver::topology_stack_gaussian``);
+    Python only marshals the predictor's mean/interval columns across the FFI.
+    Rows whose recovered σ is non-positive (e.g. fully clamped against the
+    response support) carry no Gaussian density and are dropped from that
+    candidate's column.
     """
     if not fits:
         raise ValueError("stack_topologies requires at least one candidate fit")
@@ -549,24 +560,34 @@ def stack_topologies(
     if not y:
         raise ValueError("stack_topologies holdout fold cannot be empty")
 
-    z = NormalDist().inv_cdf(0.5 + 0.5 * interval_level)
-    # log_density_rows[i][k] = log p_k(y_i | x_i) on the held-out fold.
-    log_density_rows: list[list[float]] = [
-        [float("-inf")] * len(names) for _ in range(len(y))
-    ]
-    for k, name in enumerate(names):
-        means, sds = _holdout_predictive_moments(fits[name], holdout, interval_level, z)
-        if len(means) != len(y) or len(sds) != len(y):
+    # Marshal each retained candidate's held-out predictive mean and observation
+    # interval; the Rust kernel recovers the per-point σ from the interval,
+    # forms the Gaussian held-out log-density table, and solves for the stacking
+    # weights (the quantile, σ-recovery, log-pdf, and simplex solve are all
+    # Rust-side — see `gam::solver::topology_stack_gaussian`).
+    means_by_cand: list[list[float]] = []
+    lowers_by_cand: list[list[float]] = []
+    uppers_by_cand: list[list[float]] = []
+    for name in names:
+        means, lowers, uppers = _holdout_predictive_interval(
+            fits[name], holdout, interval_level
+        )
+        if len(means) != len(y):
             raise ValueError(
                 f"candidate {name!r} predicted {len(means)} rows for a "
                 f"{len(y)}-row holdout fold"
             )
-        for i, (mean, sd) in enumerate(zip(means, sds)):
-            if sd > 0.0 and math.isfinite(mean) and math.isfinite(sd):
-                log_density_rows[i][k] = _gaussian_logpdf(y[i], mean, sd)
+        means_by_cand.append(means)
+        lowers_by_cand.append(lowers)
+        uppers_by_cand.append(uppers)
 
-    raw = _topology_rust().stacking_weights_from_log_density(
-        list(names), log_density_rows
+    raw = _topology_rust().stack_topologies_gaussian(
+        list(names),
+        y,
+        means_by_cand,
+        lowers_by_cand,
+        uppers_by_cand,
+        interval_level,
     )
     parsed = json.loads(raw)
     weights = {name: float(parsed["weights"].get(name, 0.0)) for name in names}
@@ -578,24 +599,16 @@ def stack_topologies(
     )
 
 
-def _gaussian_logpdf(y: float, mean: float, sd: float) -> float:
-    # Generic scalar Gaussian algebra used only to populate the held-out
-    # log-density matrix before the Rust stacking solve consumes it. There is no
-    # family-specific scoring or penalty math here, and crossing the FFI once
-    # per row would make the boundary noisier than the computation.
-    z = (y - mean) / sd
-    return -0.5 * math.log(2.0 * math.pi) - math.log(sd) - 0.5 * z * z
-
-
-def _holdout_predictive_moments(
+def _holdout_predictive_interval(
     model: Any,
     holdout: Any,
     interval_level: float,
-    z: float,
-) -> tuple[list[float], list[float]]:
-    """Per-point response-scale predictive mean and total predictive std on the
-    held-out fold, both sourced from the Rust predictor's family-correct
-    observation interval ``μ ± z·σ`` with ``σ² = Var(μ̂) + Var(Y|μ)``."""
+) -> tuple[list[float], list[float], list[float]]:
+    """Per-point response-scale predictive mean and family-correct observation
+    interval ``[lower, upper]`` (``μ ± z·σ`` with ``σ² = Var(μ̂) + Var(Y|μ)``) on
+    the held-out fold, sourced verbatim from the Rust predictor. The interval is
+    passed straight through to the Rust stacking kernel, which recovers ``σ`` and
+    the Gaussian log-density; no scoring math runs here."""
     prediction = model.predict(
         holdout,
         interval=interval_level,
@@ -605,8 +618,7 @@ def _holdout_predictive_moments(
     means = [float(value) for value in prediction["mean"]]
     lower = [float(value) for value in prediction["observation_lower"]]
     upper = [float(value) for value in prediction["observation_upper"]]
-    sds = [(hi - lo) / (2.0 * z) for lo, hi in zip(lower, upper)]
-    return means, sds
+    return means, lower, upper
 
 
 def _predict_response_mean(model: Any, data: Any, **predict_kwargs: Any) -> list[float]:

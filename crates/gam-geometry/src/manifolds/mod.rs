@@ -9,6 +9,7 @@
 //! re-exported at the crate root, so `gam_geometry::sphere::SphereManifold` and
 //! `gam_geometry::SphereManifold` both continue to resolve.
 
+pub mod aitchison_ilr;
 pub mod circle;
 pub mod constant_curvature;
 pub mod euclidean;

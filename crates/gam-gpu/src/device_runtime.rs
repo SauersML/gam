@@ -1,8 +1,11 @@
 #[cfg(target_os = "linux")]
+use std::cell::Cell;
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +31,20 @@ pub struct GpuRuntime {
 }
 
 static CPU_REASON: OnceLock<String> = OnceLock::new();
+
+/// Process-wide count of calls to [`GpuRuntime::global`].
+///
+/// Incremented on EVERY `global()` call — before the one-time `OnceLock` probe
+/// runs — so it counts the moments at which the device probe (and thus CUDA
+/// primary-context creation on each GPU, `cuDevicePrimaryCtxRetain`) could be
+/// triggered. Size-gated accessors that short-circuit for CPU-sized problems
+/// deliberately do NOT reach `global()`, so a test can pin this counter across
+/// such a call and prove the CPU-sized decision path made ZERO driver contact.
+///
+/// Cross-platform (not `cfg(target_os = "linux")`) so the laziness/ordering
+/// contract is testable on CUDA-less hosts: even where the probe itself is a
+/// no-op, the invariant we verify is that the size check precedes `global()`.
+static GLOBAL_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Install a process-wide panic hook (idempotent) that drops cudarc's
 /// `panic_no_lib_found` message instead of writing it to stderr. All other
@@ -214,6 +231,10 @@ impl GpuRuntime {
 
     #[must_use]
     pub fn global() -> Option<&'static Self> {
+        // Record every entry BEFORE the `OnceLock` probe, so the size-gated
+        // accessors below (which never reach this point for CPU-sized problems)
+        // can be proven not to have triggered a device probe / context creation.
+        GLOBAL_CALLS.fetch_add(1, Ordering::Relaxed);
         static RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
         RUNTIME
             .get_or_init(|| {
@@ -251,6 +272,41 @@ impl GpuRuntime {
     #[must_use]
     pub fn is_available() -> bool {
         Self::global().is_some()
+    }
+
+    /// Number of times [`Self::global`] has been entered process-wide.
+    ///
+    /// Test-facing instrumentation for the laziness contract: a size-gated
+    /// caller that returns before touching `global()` leaves this unchanged, so
+    /// a test can assert a CPU-sized decision path created no CUDA context. This
+    /// is a monotone call counter, NOT a probe-success flag.
+    #[must_use]
+    pub fn global_call_count() -> u64 {
+        GLOBAL_CALLS.load(Ordering::Relaxed)
+    }
+
+    /// Size-gated [`Self::global`]: return the process-wide runtime ONLY when the
+    /// estimated dense arithmetic `work_flops` clears the GPU-dispatch flop floor.
+    ///
+    /// This is the ordering fix for the CUDA startup tax. For a CPU-sized problem
+    /// (`work_flops` below the floor) it returns `None` WITHOUT calling
+    /// [`Self::global`], so the device probe — and the `cuDevicePrimaryCtxRetain`
+    /// primary-context creation it performs on every GPU — never runs. The
+    /// problem-size decision therefore strictly precedes any driver contact, and
+    /// a CPU-sized fit pays ZERO CUDA cost.
+    ///
+    /// The floor is read from [`GpuDispatchPolicy::default`] — the conservative,
+    /// pre-calibration seed available WITHOUT a device — so the gate never needs
+    /// a probed policy to decide it should not probe. A genuinely GPU-sized
+    /// problem clears the floor and falls through to the identical `global()`
+    /// path, so device behaviour is unchanged.
+    #[must_use]
+    pub fn global_if_dense_work_exceeds_floor(work_flops: u128) -> Option<&'static Self> {
+        let floor = GpuDispatchPolicy::default().gemm_min_flops as u128;
+        if work_flops < floor {
+            return None;
+        }
+        Self::global()
     }
 
     /// Fail-closed accessor for the process-wide runtime under a [`GpuMode`]
@@ -325,11 +381,14 @@ fn ensure_cuda_runtime_device(ordinal: usize) {
     // ordinal is idempotent and per-host-thread.
     let set_rc = unsafe { cudarc::runtime::sys::cudaSetDevice(o) };
     log::trace!("[GPU] runtime cudaSetDevice({o}) -> {set_rc:?}");
-    // Materialise the runtime primary context on EVERY call (not once): the driver
-    // probe binds cudarc's own context, and cuBLAS/cuSOLVER `*Create` use whatever
-    // context is current at creation time, so the runtime device must be reselected
-    // and its primary context re-materialised immediately before each handle is made.
-    // A 256-byte allocate-then-free is the canonical, ~microsecond way to force it.
+    // Materialise the runtime primary context for this device: cuBLAS/cuSOLVER
+    // `*Create` use whatever context is current at creation time, so the runtime
+    // device must be selected and its primary context materialised before a
+    // handle is made. A 256-byte allocate-then-free is the canonical,
+    // ~microsecond way to force it. This is invoked exactly once per (thread,
+    // ordinal) by `bind_and_touch_runtime` — the NOT_INITIALIZED condition it
+    // repairs is per-thread-per-device and does NOT re-arm per call once the
+    // primary context is current and the runtime is materialised on the thread.
     let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
     // SAFETY: forces runtime primary-context creation on the current device.
     let malloc_rc = unsafe { cudarc::runtime::sys::cudaMalloc(&mut p as *mut _ as *mut _, 256) };
@@ -342,22 +401,64 @@ fn ensure_cuda_runtime_device(ordinal: usize) {
 }
 
 #[cfg(target_os = "linux")]
+thread_local! {
+    /// The device ordinal whose primary context is bound as THIS thread's
+    /// current context AND whose runtime primary context has already been
+    /// materialised on this thread. `Some(ordinal)` means the last
+    /// [`cuda_context_for`] touch on this thread was `ordinal` and nothing has
+    /// switched it since, so the per-call `bind_to_thread` + runtime
+    /// materialisation can be skipped.
+    ///
+    /// Switching to a different ordinal (or the initial `None`) invalidates the
+    /// memo and forces a full rebind + re-materialisation, so the per-thread-
+    /// per-device NOT_INITIALIZED repair (#1017) is preserved exactly: the
+    /// condition it fixes is arm-once-per-(thread, device), and a memo keyed on
+    /// the thread's currently-bound ordinal only skips work when that same
+    /// ordinal is already current — i.e. when neither the driver context nor the
+    /// runtime device could have drifted.
+    static BOUND_RUNTIME_ORDINAL: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Bind cudarc's primary context for `ordinal` current on this thread and
+/// materialise the runtime primary context on it — memoised once per (thread,
+/// ordinal).
+///
+/// The bind + runtime touch exist to repair the probe-first
+/// CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED bug: on a fresh solve thread the
+/// cached-context path would let the CUDA runtime initialise its OWN device
+/// context, so a later `cublasCreate`/`cusolverDnCreate` on the primary-context
+/// stream fails. Binding the primary context current and forcing runtime
+/// materialisation on the SAME context before returning fixes it. That repair
+/// is durable per (thread, ordinal); it does not re-arm per call. So when this
+/// thread's current context is already `ordinal` we skip the bind and the
+/// 256-byte cudaMalloc/cudaFree entirely, removing the per-call driver tax while
+/// preserving the invariant — a switch to any other ordinal re-runs the full
+/// repair.
+#[cfg(target_os = "linux")]
+fn bind_and_touch_runtime(ordinal: usize, ctx: &Arc<CudaContext>) {
+    if BOUND_RUNTIME_ORDINAL.with(Cell::get) == Some(ordinal) {
+        return;
+    }
+    let bound = catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()));
+    log::trace!(
+        "[GPU] cuda_context_for bind ok={} ordinal={ordinal}",
+        matches!(bound, Ok(Ok(())))
+    );
+    ensure_cuda_runtime_device(ordinal);
+    // Latch the memo only after a SUCCESSFUL bind: a failed bind left the
+    // thread's current context indeterminate, so the next call must retry the
+    // full repair rather than assume `ordinal` is current.
+    if matches!(bound, Ok(Ok(()))) {
+        BOUND_RUNTIME_ORDINAL.with(|c| c.set(Some(ordinal)));
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<CudaContext>>>> = OnceLock::new();
     let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ctx) = contexts.lock().ok()?.get(&ordinal).cloned() {
-        // Bind cudarc's PRIMARY context current on THIS thread BEFORE the runtime
-        // materialisation below, so the runtime initialises the same context that
-        // new_stream()/CudaBlas::new run cublasCreate against. Without this, on a
-        // fresh solve thread the cached path lets the runtime init its own device
-        // context, and the later cublasCreate on the primary-context stream fails
-        // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED (the probe-first GPU-dead bug).
-        let bound = catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()));
-        log::trace!(
-            "[GPU] cuda_context_for cached bind ok={}",
-            matches!(bound, Ok(Ok(())))
-        );
-        ensure_cuda_runtime_device(ordinal);
+        bind_and_touch_runtime(ordinal, &ctx);
         return Some(ctx);
     }
     // cudarc 0.19 panics from `panic_no_lib_found` if its loader fails to
@@ -371,14 +472,10 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
         guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone()
     };
     // CudaContext::new already bound the primary context, but the HashMap may return
-    // an entry created on another thread; rebind so the primary context is current on
-    // THIS thread before the runtime touch (same probe-first NOT_INITIALIZED guard).
-    let bound = catch_unwind(AssertUnwindSafe(|| out.bind_to_thread()));
-    log::trace!(
-        "[GPU] cuda_context_for fresh bind ok={}",
-        matches!(bound, Ok(Ok(())))
-    );
-    ensure_cuda_runtime_device(ordinal);
+    // an entry created on another thread; the memoised bind rebinds so the primary
+    // context is current on THIS thread before the runtime touch (same probe-first
+    // NOT_INITIALIZED guard) on the first touch, and is a no-op thereafter.
+    bind_and_touch_runtime(ordinal, &out);
     Some(out)
 }
 
@@ -453,6 +550,61 @@ mod module_path_lock_tests {
             type_name.contains("device_runtime"),
             "GpuRuntime must live in the `device_runtime` module (got {type_name})"
         );
+    }
+}
+
+#[cfg(test)]
+mod laziness_gate_tests {
+    //! Pins the CUDA startup-tax ordering fix: a CPU-sized problem must reach
+    //! its size decision WITHOUT ever calling `GpuRuntime::global()` (which is
+    //! what triggers the one-time device probe + `cuDevicePrimaryCtxRetain`
+    //! primary-context creation on every GPU). Runs on any host — on a CUDA-less
+    //! box the probe is a no-op, but the invariant under test is purely the
+    //! control-flow ordering (size check strictly before `global()`), which is
+    //! observable through the process-wide `global_call_count` counter.
+    //!
+    //! nextest runs each test in its own process, so the counter starts at a
+    //! clean baseline per test; the assertions use a delta against `before` so
+    //! they are robust regardless of the absolute starting value.
+    use super::*;
+
+    #[test]
+    fn cpu_sized_dense_work_never_calls_global() {
+        let before = GpuRuntime::global_call_count();
+        // Dense work far below the GPU-dispatch flop floor: a CPU-sized fit.
+        assert!(
+            GpuRuntime::global_if_dense_work_exceeds_floor(1_000).is_none(),
+            "CPU-sized work must not select the device"
+        );
+        assert_eq!(
+            GpuRuntime::global_call_count(),
+            before,
+            "the size gate must short-circuit BEFORE global()/probe for CPU-sized \
+             work, so no CUDA context is ever created"
+        );
+    }
+
+    #[test]
+    fn gpu_sized_dense_work_falls_through_to_global() {
+        let before = GpuRuntime::global_call_count();
+        // Above any plausible floor: must consult the runtime exactly once, i.e.
+        // the gate does not change behaviour for genuinely GPU-sized problems.
+        let _ = GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
+        assert_eq!(
+            GpuRuntime::global_call_count(),
+            before + 1,
+            "GPU-sized work must fall through to global() (device path unchanged)"
+        );
+    }
+
+    #[test]
+    fn floor_is_the_default_gemm_flop_threshold() {
+        // The gate's floor is the conservative pre-calibration seed, available
+        // without a device, so the decision to NOT probe never needs a probe.
+        let floor = GpuDispatchPolicy::default().gemm_min_flops as u128;
+        let before = GpuRuntime::global_call_count();
+        assert!(GpuRuntime::global_if_dense_work_exceeds_floor(floor - 1).is_none());
+        assert_eq!(GpuRuntime::global_call_count(), before);
     }
 }
 

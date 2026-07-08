@@ -474,7 +474,18 @@ def _fit_ours_torch(
         idx = rng.integers(0, x_all.shape[0], size=min(batch_size, x_all.shape[0]))
         batch = x_all[idx]
         out = model(batch)
-        loss = torch.mean((out.x_hat - batch) ** 2) + model.sparsity.penalty(out.gate)
+        # Reconstruction + sparsity, plus the encoder position-alignment penalty:
+        # under the Rust E-step coordinate path the reconstruction is built at
+        # solved coordinates that are tape constants, so the encoder position head
+        # gets no reconstruction gradient. The alignment penalty (mean squared
+        # circular distance between encoder-predicted and E-step-solved
+        # coordinates) keeps that head learning. It is a zero scalar for lanes
+        # that do not run the E-step (non-circle / non-softmax_topk).
+        loss = (
+            torch.mean((out.x_hat - batch) ** 2)
+            + model.sparsity.penalty(out.gate)
+            + model.position_alignment_penalty()
+        )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

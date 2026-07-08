@@ -514,6 +514,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "thin_plate_penalty",
             "gaussian_weighted_ridge_array",
             "gaussian_weighted_ridge_batch",
+            "gaussian_weighted_ridge_batch_backward",
             "gaussian_reml_score",
             "gaussian_reml_fit",
             "gaussian_reml_fit_backward",
@@ -3632,6 +3633,63 @@ fn stacking_weights_from_log_density(
     })
 }
 
+/// Topology stacking from the raw per-candidate held-out predictive moments
+/// (#768). Migrated CORE-MATH from `gamfit._select_topology.stack_topologies`:
+/// recovers each candidate's per-point predictive σ by inverting its
+/// `[lower, upper]` observation interval at coverage `interval_level`, forms the
+/// held-out Gaussian log-density table, and solves for the simplex stacking
+/// weights. `means`, `lowers`, and `uppers` are indexed `[candidate][row]`, one
+/// inner list per name. Non-scorable rows (σ ≤ 0 or non-finite mean/σ) carry no
+/// density and are dropped by the solve, exactly as the old Python code did.
+/// Returns the SAME JSON shape as `stacking_weights_from_log_density`:
+/// `{ "weights": {name: w}, "mean_log_score": f, "iterations": k }`.
+#[pyfunction]
+fn stack_topologies_gaussian(
+    py: Python<'_>,
+    names: Vec<String>,
+    y: Vec<f64>,
+    means: Vec<Vec<f64>>,
+    lowers: Vec<Vec<f64>>,
+    uppers: Vec<Vec<f64>>,
+    interval_level: f64,
+) -> PyResult<String> {
+    if names.is_empty() {
+        return Err(py_value_error(
+            "stack_topologies_gaussian: at least one candidate name is required".to_string(),
+        ));
+    }
+    if means.len() != names.len() {
+        return Err(py_value_error(format!(
+            "stack_topologies_gaussian: {} names but {} candidate mean columns",
+            names.len(),
+            means.len()
+        )));
+    }
+    let solved = py
+        .detach(|| {
+            gam::solver::topology_stack_gaussian::stack_topologies_gaussian(
+                &y,
+                &means,
+                &lowers,
+                &uppers,
+                interval_level,
+            )
+        })
+        .map_err(|err| py_value_error(format!("stack_topologies_gaussian: {err}")))?;
+    let weights_by_name: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .zip(solved.weights.iter())
+        .map(|(name, &w)| (name.clone(), serde_json::json!(w)))
+        .collect();
+    let out = serde_json::json!({
+        "weights": weights_by_name,
+        "mean_log_score": solved.mean_log_score,
+        "iterations": solved.iterations,
+    });
+    serde_json::to_string(&out)
+        .map_err(|err| py_value_error(format!("stack_topologies_gaussian: serialise: {err}")))
+}
+
 const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 
 const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
@@ -4208,6 +4266,67 @@ fn gaussian_weighted_ridge_batch<'py>(
     Ok((
         coefficients.into_pyarray(py).unbind(),
         fitted.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Batched closed-form analytic VJP (reverse-mode adjoint) of the Gaussian
+/// row-weighted ridge solve. Single Rust source of truth for the torch
+/// `_GaussianWeightedRidge*Fn` backward: given the upstream cotangents
+/// `grad_coef` (wrt `coef`, `(K,M,D)`) and `grad_fitted` (wrt `fitted`,
+/// `(K,Nmax,D)`), returns the gradients wrt `X (K,Nmax,M)`, `Y (K,Nmax,D)`,
+/// `penalty (M,M)` (summed across problems) and `weights (K,Nmax)`. Padded rows
+/// (index `>= row_counts[k]`) contribute exactly zero, matching the forward's
+/// active-prefix solve. The single-problem torch path routes through here with a
+/// leading batch axis of one. See
+/// `gam::linalg::gaussian_weighted_ridge_backward::gaussian_weighted_ridge_batch_backward`.
+#[pyfunction]
+#[pyo3(signature = (grad_coef, grad_fitted, x, y, penalty, weights, coef, ridge_lambda, row_counts = None))]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_weighted_ridge_batch_backward<'py>(
+    py: Python<'py>,
+    grad_coef: PyReadonlyArray3<'py, f64>,
+    grad_fitted: PyReadonlyArray3<'py, f64>,
+    x: PyReadonlyArray3<'py, f64>,
+    y: PyReadonlyArray3<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray2<'py, f64>,
+    coef: PyReadonlyArray3<'py, f64>,
+    ridge_lambda: f64,
+    row_counts: Option<PyReadonlyArray1<'py, usize>>,
+) -> PyResult<(
+    Py<PyArray3<f64>>,
+    Py<PyArray3<f64>>,
+    Py<PyArray2<f64>>,
+    Py<PyArray2<f64>>,
+)> {
+    let grad_coef_owned = grad_coef.as_array().to_owned();
+    let grad_fitted_owned = grad_fitted.as_array().to_owned();
+    let x_owned = x.as_array().to_owned();
+    let y_owned = y.as_array().to_owned();
+    let penalty_owned = penalty.as_array().to_owned();
+    let weights_owned = weights.as_array().to_owned();
+    let coef_owned = coef.as_array().to_owned();
+    let row_counts_owned = row_counts.map(|counts| counts.as_array().to_owned());
+    let (grad_x, grad_y, grad_penalty, grad_weights) = py
+        .detach(move || {
+            gam::linalg::gaussian_weighted_ridge_backward::gaussian_weighted_ridge_batch_backward(
+                grad_coef_owned.view(),
+                grad_fitted_owned.view(),
+                x_owned.view(),
+                y_owned.view(),
+                penalty_owned.view(),
+                weights_owned.view(),
+                coef_owned.view(),
+                ridge_lambda,
+                row_counts_owned.as_ref().map(|counts| counts.view()),
+            )
+        })
+        .map_err(py_value_error)?;
+    Ok((
+        grad_x.into_pyarray(py).unbind(),
+        grad_y.into_pyarray(py).unbind(),
+        grad_penalty.into_pyarray(py).unbind(),
+        grad_weights.into_pyarray(py).unbind(),
     ))
 }
 

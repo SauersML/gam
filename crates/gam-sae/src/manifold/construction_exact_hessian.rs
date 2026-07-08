@@ -287,6 +287,7 @@ impl SaeManifoldTerm {
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
+        let mut third_order_correction_raw = Array1::<f64>::zeros(n_params);
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
             + self
@@ -383,10 +384,40 @@ impl SaeManifoldTerm {
         // preconditioned Neumann fixed point (`A = B + ΔC`,
         // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
         // biased by `(B⁻¹ − A⁻¹)`.
+        //
+        // #2087 dead-zone gate. The raw envelope term `−½·Γᵀθ̂_ρ` is the response
+        // of the SMOOTH criterion `V(ρ) = penalized_loss(θ̂(ρ),ρ) + ½log|H|` that
+        // presumes the inner optimum tracks ρ exactly. The production inner solve
+        // does NOT: it accepts `θ̂` once the KKT gradient is stationary to the
+        // relative tolerance `τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL · iterate_scale`
+        // (`reml_criterion`'s `grad_tolerance`, construction.rs). Under an outer
+        // step `dρ_j` the warm-started re-solve leaves `θ̂` UNCHANGED as long as
+        // the perturbed inner gradient stays inside that dead-zone. The IFT step
+        // `θ̂_ρ,j = −A⁻¹ rhs_j` images back through the inner Hessian to an inner
+        // gradient of exactly `A·θ̂_ρ,j = −rhs_j` (the `rhs_j` = `∂g/∂ρ_j`
+        // perturbation the re-solve would have to null), so `‖rhs_j‖` is precisely
+        // the inner-gradient signal that the predicted θ̂-response carries. When
+        // `‖rhs_j‖ ≤ τ`, a unit-ρ move perturbs the inner KKT gradient by less
+        // than the stationarity tolerance that declared convergence — the re-solve
+        // returns the incumbent and `θ̂` is FROZEN, so the criterion the outer
+        // search actually experiences has `θ̂` locally constant and its gradient is
+        // `explicit + logdet_trace + occam` with NO envelope term. A large raw
+        // `−½·Γᵀθ̂_ρ` there is the spurious amplification of a below-tolerance
+        // signal through a weakly-identified (near-null) direction of `A`. We
+        // therefore keep the envelope term ONLY on coordinates whose driving
+        // signal escapes the dead-zone (`‖rhs_j‖ > τ`, where the inner re-solve
+        // genuinely tracks `θ̂(ρ)`), and zero it otherwise. The raw value is
+        // preserved on `third_order_correction_raw` for diagnostics; no VALUE
+        // channel changes. Constants come entirely from the inner solver's own
+        // stationarity tolerance — no new knob.
+        let dead_zone_tol = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
         for coord in 0..n_params {
             let rhs = self
                 .outer_rho_gradient_ift_rhs(rho, target, coord, cache)
                 .map_err(OuterGradientError::internal)?;
+            let rhs_norm_sq = rhs.t.iter().map(|&v| v * v).sum::<f64>()
+                + rhs.beta.iter().map(|&v| v * v).sum::<f64>();
+            let rhs_norm = rhs_norm_sq.sqrt();
             let solved = self
                 .solve_exact_stationarity(rho, target, cache, solver, &rhs)
                 .map_err(OuterGradientError::internal)?;
@@ -397,7 +428,15 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            third_order_correction[coord] = -0.5 * dot;
+            let raw = -0.5 * dot;
+            third_order_correction_raw[coord] = raw;
+            // Dead-zone gate: only trust the envelope response where the outer
+            // step would drive the inner gradient past the stationarity tolerance.
+            third_order_correction[coord] = if rhs_norm > dead_zone_tol { raw } else { 0.0 };
+            eprintln!(
+                "[2087-GATE-DIAG] coord {coord}: rhs_norm={rhs_norm:.6e} tau={dead_zone_tol:.6e} raw={raw:.6e} gated={:.6e} kept={}",
+                third_order_correction[coord], rhs_norm > dead_zone_tol
+            );
         }
 
         Ok(SaeOuterRhoGradientComponents {
@@ -405,6 +444,7 @@ impl SaeManifoldTerm {
             logdet_trace,
             occam,
             third_order_correction,
+            third_order_correction_raw,
         })
     }
 }
