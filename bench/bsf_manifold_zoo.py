@@ -426,7 +426,7 @@ def _fit_ours_torch(
     rng = np.random.default_rng(seed)
     t0 = time.perf_counter()
     model.train()
-    for _ in range(steps):
+    for step in range(steps):
         idx = rng.integers(0, x_all.shape[0], size=min(batch_size, x_all.shape[0]))
         batch = x_all[idx]
         out = model(batch)
@@ -434,6 +434,13 @@ def _fit_ours_torch(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if step % 200 == 0 or step == steps - 1:
+            rate = (step + 1) / max(time.perf_counter() - t0, 1e-9)
+            print(
+                f"[ours_torch] step {step + 1}/{steps} loss={float(loss.detach()):.5f} "
+                f"({rate:.2f} steps/s)",
+                flush=True,
+            )
     fit_seconds = time.perf_counter() - t0
     model.eval()
     zs, curves_all, recons, positions = [], [], [], []
