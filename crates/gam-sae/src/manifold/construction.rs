@@ -5462,6 +5462,19 @@ impl SaeManifoldTerm {
         // factor failed and the loop kept extending via `saw_refine_progress`
         // from earlier rounds, accumulating minutes of wasted work (#1094).
         let mut consecutive_stall_factor_fail: usize = 0;
+        // #1094 — the finite deflated evidence cache to rank at a persistent
+        // objective-stall fixed point. At a rank-deficient K>1 optimum the KKT
+        // gradient parks permanently in the weakly-identified decoder/gauge
+        // directions, so neither the gradient nor the affine-invariant
+        // Newton-decrement stationarity certificate below can ever reach
+        // tolerance even though the penalised objective is at its numerical
+        // floor. When the undamped/deflated factorization nonetheless yields a
+        // FINITE Laplace log-det, we stash that cache here; once the objective
+        // stall persists for the full `STALL_MIN_ROUNDS` the floor itself is the
+        // inner-convergence witness (#1051) and ranking this cache is correct —
+        // instead of refusing to the 1e12 infeasible sentinel at a fit that is
+        // de-facto converged (R²≈0.99).
+        let mut stalled_finite_cache: Option<ArrowFactorCache> = None;
         loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -5869,19 +5882,53 @@ impl SaeManifoldTerm {
                     // identified round could abort a still-descending solve and
                     // poison the outer BFGS line search with a false value-probe
                     // refusal.
+                    //
+                    // #1094 — but the undamped/deflated evidence factor DID
+                    // succeed this round with a finite Laplace log-det. Stash it:
+                    // at a rank-deficient K>1 fixed point (euclidean K=2 with
+                    // near-zero initial latent coords) the residual KKT gradient
+                    // lives permanently in the weakly-identified decoder/gauge
+                    // directions the near-singular Schur cannot resolve, so no
+                    // stationarity certificate can ever fire — yet the penalised
+                    // objective is genuinely at its numerical floor. If that stall
+                    // persists for the full `STALL_MIN_ROUNDS` (below), the floor
+                    // is the #1051 inner-convergence witness and this finite
+                    // deflated evidence is the value to rank.
+                    if arrow_log_det_from_cache(&stationary_cache).is_some_and(f64::is_finite) {
+                        stalled_finite_cache = Some(stationary_cache);
+                    }
                 }
-                // Stagnated AND the undamped factor still fails: this is the
-                // numerical fixed point of the inner solve under rank-deficient
-                // or ill-conditioned geometry (e.g. multi-atom euclidean with
-                // near-zero initial latent coords, #1094).  The iterate cannot
-                // be improved further at this ρ.  Treat it as "inner solve did
-                // not converge" — the same signal `is_recoverable_value_probe_refusal`
-                // already handles, causing the outer BFGS to return INFINITY for
-                // this ρ probe and try a different one.  Without this early
-                // return the stagnation handler fell through and the loop kept
-                // burning the extended `progress_refine_iter` budget indefinitely.
+                // Persistent objective-stall fixed point (`STALL_MIN_ROUNDS`
+                // consecutive stalled rounds). Two outcomes:
+                //   * The evidence factor produced a finite log-det that no
+                //     stationarity certificate could accept (#1094): the objective
+                //     has held at its numerical floor across every stalled round,
+                //     which IS the inner-convergence certificate, so rank the
+                //     finite deflated Laplace evidence. The unit-stiffness /
+                //     PD-floor conditioning of the rank-deficient directions is a
+                //     bias consistent across every ρ evaluation and so does not
+                //     move the outer optimum, whereas refusing hands the outer BFGS
+                //     a +∞ at a de-facto-converged point and drives the whole fit
+                //     to the 1e12 infeasible sentinel.
+                //   * The undamped factor FAILED at every stall round (a genuinely
+                //     broken / non-finite rank-deficient geometry, no finite
+                //     evidence to rank): surface the hard refusal — the same signal
+                //     `is_recoverable_value_probe_refusal` handles, so the outer
+                //     BFGS treats this ρ as an INFINITY probe and tries another.
+                // Either way the loop terminates here rather than burning the
+                // extended `progress_refine_iter` budget indefinitely.
                 consecutive_stall_factor_fail += 1;
                 if consecutive_stall_factor_fail >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
+                    if let Some(cache) = stalled_finite_cache.take() {
+                        log::debug!(
+                            "SAE inner objective-stall fixed point accepted after \
+                             {consecutive_stall_factor_fail} consecutive stalled rounds: ranking \
+                             the finite deflated Laplace evidence at the rank-deficient optimum \
+                             (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) instead of the \
+                             infeasible sentinel (#1094)"
+                        );
+                        return Ok(cache);
+                    }
                     return Err(format!(
                         "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                          objective stalled for {consecutive_stall_factor_fail} consecutive refine \
@@ -5892,7 +5939,13 @@ impl SaeManifoldTerm {
                     ));
                 }
             } else {
+                // The stall streak broke (this round is materially descending or
+                // the fraction baseline is not yet meaningful): drop any stashed
+                // cache so the #1094 accept only ever ranks a cache from an
+                // UNBROKEN run of `STALL_MIN_ROUNDS` stalled rounds at a frozen
+                // iterate, never a stale one from an earlier, since-abandoned stall.
                 consecutive_stall_factor_fail = 0;
+                stalled_finite_cache = None;
             }
         }
     }
