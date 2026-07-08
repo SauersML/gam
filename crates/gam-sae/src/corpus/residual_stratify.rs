@@ -284,6 +284,106 @@ fn sturges_stratum_cap(total_rows: u64) -> usize {
     (u64::BITS - total_rows.leading_zeros()) as usize
 }
 
+/// One in-memory residual-energy stratum: the row indices that fall in a
+/// factor-of-two energy band, with the band's population moments. The energy
+/// bands and the Sturges cap are exactly [`design_stratified_subsample`]'s
+/// (`⌊log₂ e_i⌋` bins, `K_max = ⌊log₂ N⌋ + 1`, adjacent low-energy bands merged),
+/// so an in-core caller (the stagewise birth loop) stratifies its residual by the
+/// SAME derived boundaries as the streaming corpus screen — no new cut points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowStratum {
+    /// Inclusive lowest exponent bin in this stratum.
+    pub exp_lo: usize,
+    /// Inclusive highest exponent bin in this stratum.
+    pub exp_hi: usize,
+    /// Row indices assigned to this stratum (ascending).
+    pub rows: Vec<usize>,
+    /// Within-stratum mean residual energy.
+    pub mean_energy: f64,
+    /// Within-stratum residual-energy standard deviation `S_h`.
+    pub std_energy: f64,
+}
+
+/// Stratify a set of per-row residual energies into factor-of-two energy bands,
+/// returning the row-index groups ASCENDING in energy. Reuses the same IEEE-754
+/// binary-exponent bins ([`EnergyExponentHistogram::bin_of`]) and Sturges cap
+/// ([`sturges_stratum_cap`]) as the streaming design; adjacent lowest-energy bands
+/// are merged to the cap so the high-energy tail (where rare discoverable structure
+/// concentrates) keeps its resolution. Empty / non-finite / negative energies fall
+/// in the low-energy floor bin. An empty input yields no strata.
+///
+/// This is the in-core companion to [`design_stratified_subsample`]: where the
+/// streaming screen samples the tail for the corpus producer, this exposes the same
+/// tail-preserving partition to an already-materialized residual so a consumer can
+/// process each stratum's rows locally (the stagewise stratum-local birth screen).
+pub fn stratify_row_energies(energies: &[f64]) -> Vec<RowStratum> {
+    let n = energies.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Group rows by exponent bin (ascending energy).
+    let mut bin_rows: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, &e) in energies.iter().enumerate() {
+        bin_rows.entry(EnergyExponentHistogram::bin_of(e)).or_default().push(i);
+    }
+    // One stratum per occupied bin, with population moments over the (clamped)
+    // energies (negatives / non-finite → 0, matching the histogram floor bin).
+    let clamp = |e: f64| if e.is_finite() && e > 0.0 { e } else { 0.0 };
+    let mut strata: Vec<RowStratum> = bin_rows
+        .into_iter()
+        .map(|(exp, rows)| {
+            let m = rows.len() as f64;
+            let sum: f64 = rows.iter().map(|&i| clamp(energies[i])).sum();
+            let mean = sum / m;
+            let var = (rows.iter().map(|&i| clamp(energies[i]).powi(2)).sum::<f64>() / m
+                - mean * mean)
+                .max(0.0);
+            RowStratum {
+                exp_lo: exp,
+                exp_hi: exp,
+                rows,
+                mean_energy: mean,
+                std_energy: var.sqrt(),
+            }
+        })
+        .collect();
+
+    let k_max = sturges_stratum_cap(n as u64);
+    // Merge adjacent lowest-energy strata until within the cap (tail preserved).
+    while strata.len() > k_max && strata.len() >= 2 {
+        let mut merged = std::mem::take(&mut strata[0]);
+        let hi = std::mem::take(&mut strata[1]);
+        let na = merged.rows.len() as f64;
+        let nb = hi.rows.len() as f64;
+        let nt = na + nb;
+        let mean = (merged.mean_energy * na + hi.mean_energy * nb) / nt;
+        let sumsq_a = (merged.std_energy.powi(2) + merged.mean_energy.powi(2)) * na;
+        let sumsq_b = (hi.std_energy.powi(2) + hi.mean_energy.powi(2)) * nb;
+        let var = ((sumsq_a + sumsq_b) / nt - mean * mean).max(0.0);
+        merged.rows.extend(hi.rows);
+        merged.rows.sort_unstable();
+        merged.exp_hi = hi.exp_hi.max(merged.exp_hi);
+        merged.mean_energy = mean;
+        merged.std_energy = var.sqrt();
+        strata[1] = merged;
+        strata.remove(0);
+    }
+    strata
+}
+
+impl Default for RowStratum {
+    fn default() -> Self {
+        RowStratum {
+            exp_lo: 0,
+            exp_hi: 0,
+            rows: Vec::new(),
+            mean_energy: 0.0,
+            std_energy: 0.0,
+        }
+    }
+}
+
 /// Build the strata from the exponent histogram: one stratum per occupied
 /// exponent band, then merge adjacent **low-energy** bands until at most
 /// `K_max` strata remain (preserving high-energy tail resolution).
