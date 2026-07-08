@@ -229,7 +229,11 @@ fn telemetry_records_subsample_engagement_and_probe_count() {
 
     // One value probe runs on the subsample (n_sub rows) and tallies a criterion call.
     let rho_flat = rho.to_flat();
-    let _ = objective.eval_cost(&rho_flat).unwrap();
+    let subsampled_cost = objective.eval_cost(&rho_flat).unwrap();
+    assert!(
+        subsampled_cost.is_finite(),
+        "subsampled outer criterion must be finite, got {subsampled_cost}"
+    );
     let probes = objective.probe_telemetry().criterion_calls;
     assert!(probes >= 1);
 
