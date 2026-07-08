@@ -2243,6 +2243,24 @@ impl SaeManifoldTerm {
                     self.assignment.logits[[row, atom]] = threshold + temperature;
                 }
             }
+            AssignmentMode::TopK { .. } => {
+                // The support is a deterministic top-k of the ROUTING logits, so
+                // "re-seed to neutral" means routing parity: tie the atom with
+                // each row's current winner so the next support refresh can admit
+                // it wherever it carries signal (the analogue of the Softmax
+                // parity re-seed, without any simplex canonicalization).
+                for row in 0..n {
+                    let row_max = self
+                        .assignment
+                        .logits
+                        .row(row)
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    self.assignment.logits[[row, atom]] =
+                        if row_max.is_finite() { row_max } else { 0.0 };
+                }
+            }
         }
     }
 

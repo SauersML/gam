@@ -7874,6 +7874,9 @@ impl SaeManifoldTerm {
                     None => 0.0,
                 }
             }
+            // Unreachable in practice: every TopK logit is `logit_is_fixed`, so
+            // the mask above already returned 0.0 (no prior, no free logits).
+            AssignmentMode::TopK { .. } => 0.0,
         }
     }
 

@@ -162,6 +162,14 @@ impl SaeManifoldTerm {
                     .map(|&logit| if logit > threshold { 1.0 } else { 0.0 })
                     .collect(),
             ),
+            // TopK: every atom is `logit_is_fixed`, so `fixed_gate_value`
+            // (= the exact {0, 1} support gates) overrides the gate machinery
+            // for ALL atoms — these are never-evaluated placeholders.
+            AssignmentMode::TopK { .. } => (
+                RowGate::PerAtomLogistic { inv_tau: 1.0 },
+                vec![0.0; k_atoms],
+                vec![1.0; k_atoms],
+            ),
         };
 
         Ok(SaeReconstructionRowProgram {
@@ -609,11 +617,16 @@ impl SaeManifoldTerm {
                     &mut beta_l_deriv,
                 );
             }
-            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
-                // PER-ATOM-LOGISTIC modes keep the jet path: value-preserving
-                // (their hand gate prior diverged from the live ordered-geometric
-                // prior, and the batched SIMD speedup that motivated the revert is
-                // softmax-only anyway).
+            AssignmentMode::IBPMap { .. }
+            | AssignmentMode::ThresholdGate { .. }
+            | AssignmentMode::TopK { .. } => {
+                // PER-ATOM modes keep the jet path: value-preserving (their hand
+                // gate prior diverged from the live ordered-geometric prior, and
+                // the batched SIMD speedup that motivated the revert is
+                // softmax-only anyway). TopK is the degenerate member: its gates
+                // are constants {0, 1} with NO logit variables in the row block
+                // (`assignment_coord_dim() == 0`), so the program simply carries
+                // no gate channels.
                 let program = self.reconstruction_row_program_for_logdet(
                     rho,
                     row,

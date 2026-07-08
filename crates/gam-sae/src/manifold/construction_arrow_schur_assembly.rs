@@ -501,6 +501,29 @@ impl SaeManifoldTerm {
                         None => None,
                     }
                 }
+                AssignmentMode::TopK { k } => {
+                    // The support IS the layout: TopK gates are exactly {0, 1},
+                    // so the compact row block is precisely the k support atoms —
+                    // no cutoff heuristics, no near-threshold population, and the
+                    // per-token block is bounded at `k·(1+d)` BY CONSTRUCTION
+                    // (the #2071 block-size contract holds with equality).
+                    let mut assignments_all = Vec::with_capacity(n);
+                    for row in 0..n {
+                        assignments_all
+                            .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+                    }
+                    Some(SaeRowLayout::from_dense_weights(
+                        &assignments_all,
+                        k,
+                        // Gates are exact 1/0: any relative cutoff in (0, 1]
+                        // selects exactly the support; ½ is the midpoint.
+                        0.5,
+                        coord_dims.clone(),
+                        self.assignment.coord_offsets(),
+                        // Column-separable hard support: no reference atom.
+                        None,
+                    ))
+                }
             },
         };
         // #974 likelihood-whitening seam. The single per-row decision: when the

@@ -256,6 +256,22 @@ pub enum AssignmentMode {
     /// spelling; [`Self::jumprelu`] is retained as a deprecated alias, and the FFI
     /// string parser accepts both `"threshold_gate"` and the legacy `"jumprelu"`.
     ThresholdGate { temperature: f64, threshold: f64 },
+    /// Hard top-`k` support gate: the `k` atoms with the LARGEST routing logits
+    /// in a row carry gate 1, every other atom carries gate 0 (ties broken
+    /// toward the lower atom index, so the support is deterministic).
+    ///
+    /// Sparsity is BY CONSTRUCTION, not by penalty: there is no sparsity term
+    /// in the objective, no gate logit in the inner system
+    /// (`assignment_coord_dim() == 0` — at K = 32,000 this deletes 32k
+    /// coordinates from the inner Newton), and no sparsity coordinate in the
+    /// outer ρ search. At fixed support size `|S| = k` this is the
+    /// constrained-MAP member of the same spike-slab generative family the IBP
+    /// gate lives in, with the ℓ2,0 constraint standing in for the
+    /// stick-breaking prior. The gate is per-row independent (couples rows
+    /// through NOTHING), so fits stream chunk-invariantly at any K, and it is
+    /// exchangeable across atom index — the ordered-IBP concentration
+    /// pathology (#1784) cannot arise.
+    TopK { k: usize },
 }
 
 /// Caller intent for assignment-mode admission. `Default` is the production
@@ -338,11 +354,22 @@ impl AssignmentMode {
         Self::threshold_gate(temperature, threshold)
     }
 
+    /// Construct the hard top-`k` support gate ([`Self::TopK`]): sparsity by
+    /// construction, zero gate coordinates in the inner system, per-row
+    /// independent. `k` is clamped to at least 1 by the fit-time validator.
+    #[must_use]
+    pub fn top_k_support(k: usize) -> Self {
+        Self::TopK { k }
+    }
+
     pub fn temperature(&self) -> f64 {
         match *self {
             AssignmentMode::Softmax { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. }
             | AssignmentMode::ThresholdGate { temperature, .. } => temperature,
+            // The hard support gate has no relaxation, hence no temperature; the
+            // unit value keeps generic temperature-logging paths well-defined.
+            AssignmentMode::TopK { .. } => 1.0,
         }
     }
 
@@ -358,6 +385,9 @@ impl AssignmentMode {
             | AssignmentMode::ThresholdGate { temperature, .. } => {
                 *temperature = new_temperature;
             }
+            // No relaxation to anneal: the hard support is temperature-free, so
+            // annealing schedules pass through as a no-op.
+            AssignmentMode::TopK { .. } => {}
         }
         Ok(())
     }
@@ -389,6 +419,13 @@ impl AssignmentMode {
                     return Err(format!(
                         "AssignmentMode::ThresholdGate: threshold must be finite; got {threshold}"
                     ));
+                }
+            }
+            AssignmentMode::TopK { k } => {
+                if k == 0 {
+                    return Err(
+                        "AssignmentMode::TopK: support size k must be at least 1".to_string()
+                    );
                 }
             }
         }
@@ -702,7 +739,12 @@ impl SaeAssignment {
     /// treatment — zero logit-JVP, zero sparsity-prior gradient/curvature, zero
     /// softmax majorizer — so the logit slot never moves.
     pub(crate) fn logit_is_fixed(&self, k: usize) -> bool {
-        self.routing_is_frozen() || self.ungated.get(k).copied().unwrap_or(false)
+        // TopK: NO logit is ever a free Newton parameter — the support is a
+        // deterministic function of the routing logits (assignment_coord_dim
+        // is 0), so every gate rides as a constant, exactly like frozen routing.
+        matches!(self.mode, AssignmentMode::TopK { .. })
+            || self.routing_is_frozen()
+            || self.ungated.get(k).copied().unwrap_or(false)
     }
 
     /// Per-atom mask (length `K`) of [`Self::logit_is_fixed`] — the logit slots
@@ -712,7 +754,7 @@ impl SaeAssignment {
     /// is `true`; with only ungated atoms it equals `ungated`; otherwise all
     /// `false` (the historical free-logit path).
     pub(crate) fn fixed_logit_mask(&self) -> Vec<bool> {
-        if self.routing_is_frozen() {
+        if matches!(self.mode, AssignmentMode::TopK { .. }) || self.routing_is_frozen() {
             vec![true; self.k_atoms()]
         } else {
             self.ungated.clone()
@@ -844,6 +886,10 @@ impl SaeAssignment {
         match self.mode {
             AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
             AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => self.k_atoms(),
+            // Sparsity by construction: the support is a deterministic function
+            // of the routing logits, so there are NO free gate coordinates in
+            // the inner system.
+            AssignmentMode::TopK { .. } => 0,
         }
     }
 
@@ -1016,6 +1062,7 @@ impl SaeAssignment {
                 temperature,
                 threshold,
             } => jumprelu_row(routing, temperature, threshold),
+            AssignmentMode::TopK { k } => topk_row(routing, k),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate. For the
         // column-separable IBP / JumpReLU modes the other atoms' gates are
@@ -1087,6 +1134,7 @@ impl SaeAssignment {
                 temperature,
                 threshold,
             } => jumprelu_row_into(routing, temperature, threshold, out),
+            AssignmentMode::TopK { k } => topk_row_into(routing, k, out),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate, exactly
         // as in the allocating path.
@@ -1204,6 +1252,9 @@ pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Arra
             temperature, alpha, ..
         } => ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature, alpha),
         AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
+        // At all-equal (zero) logits the deterministic tie-break admits the
+        // FIRST k atoms — the neutral support under index-stable ordering.
+        AssignmentMode::TopK { k } => topk_row(Array1::<f64>::zeros(k_atoms).view(), k),
     }
 }
 
@@ -1558,6 +1609,39 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
         }
     }
     out
+}
+
+/// Hard top-`k` support row (the [`AssignmentMode::TopK`] gate): 1.0 for the
+/// `k` largest routing logits in the row, 0.0 elsewhere. Ties break toward the
+/// LOWER atom index so the support is deterministic. `k ≥ len` degenerates to
+/// the all-active row. Logits are validated finite upstream.
+pub fn topk_row(logits: ArrayView1<'_, f64>, k: usize) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(logits.len());
+    topk_row_into(logits, k, out.as_slice_mut().expect("freshly allocated 1-D array is contiguous"));
+    out
+}
+
+/// Fill-into-caller-buffer twin of [`topk_row`] — bit-identical values, no
+/// allocation beyond the O(K) index scratch. Average O(K) via quickselect.
+pub(crate) fn topk_row_into(logits: ArrayView1<'_, f64>, k: usize, out: &mut [f64]) {
+    let n = logits.len();
+    if k >= n {
+        out[..n].fill(1.0);
+        return;
+    }
+    out[..n].fill(0.0);
+    let mut idx: Vec<usize> = (0..n).collect();
+    // Larger logit first; equal logits fall back to index order so the
+    // boundary atom is deterministic across runs and chunkings.
+    idx.select_nth_unstable_by(k, |&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    for &i in &idx[..k] {
+        out[i] = 1.0;
+    }
 }
 
 /// Bounded threshold-gate activations together with the straight-through
@@ -1918,6 +2002,10 @@ pub(crate) fn fill_active_atom_logit_jvp(
                 jac_compact[[compact_index, out_col]] = da * decoded_k[out_col];
             }
         }
+        // Constant {0, 1} gate: zero logit-JVP (no free logit exists; TopK rows
+        // carry no logit slots in the compact layout, so this is unreachable —
+        // kept as the explicit zero for exhaustiveness).
+        AssignmentMode::TopK { .. } => {}
     }
 }
 
@@ -1997,6 +2085,10 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
                 }
             }
         }
+        // Constant {0, 1} gates: zero data-fit logit derivative everywhere (no
+        // logit is a free parameter — the caller's fixed-logit mask already
+        // skips every column; this arm keeps the JVP identically zero).
+        AssignmentMode::TopK { .. } => {}
     }
 }
 
@@ -2097,6 +2189,9 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             }
             sparsity_strength * acc
         }
+        // Sparsity by construction: the fixed-|S| support IS the sparsity — there
+        // is no penalty term, so the prior contributes exactly zero.
+        AssignmentMode::TopK { .. } => 0.0,
     }
 }
 
@@ -2132,6 +2227,8 @@ pub(crate) fn assignment_prior_log_strength_derivative(
                 penalty.value(target.view(), rho_view.view())
             }
         }
+        // No prior term ⇒ no ρ-derivative (sparsity lives in the fixed support).
+        AssignmentMode::TopK { .. } => 0.0,
     }
 }
 
@@ -2211,6 +2308,9 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
             mask_fixed_logit_entries(assignment, &mut d);
             Ok(d)
         }
+        // No prior term ⇒ zero curvature everywhere (mirrors the frozen-routing
+        // early return; the support carries no free logits at all).
+        AssignmentMode::TopK { .. } => Ok(Array1::<f64>::zeros(target.len())),
     }
 }
 
@@ -2331,6 +2431,12 @@ pub(crate) fn assignment_prior_grad_hdiag(
             }
             (g, d)
         }
+        // No sparsity prior and no free logits: zero gradient and curvature by
+        // construction (every column is also masked as fixed below).
+        AssignmentMode::TopK { .. } => (
+            Array1::<f64>::zeros(target.len()),
+            Array1::<f64>::zeros(target.len()),
+        ),
     };
     grad += &sparsity_grad;
     diag += &sparsity_diag;
