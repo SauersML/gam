@@ -231,14 +231,16 @@ pub fn cofit_block_and_curved(
     let mut objective = record_round(
         &mut rounds,
         0,
-        target.view(),
-        &composed,
-        &work,
-        config.code_ridge,
-        charge,
-        n_charts,
-        true,
-        !accepted.is_empty(),
+        RoundTelemetry {
+            target: target.view(),
+            composed: &composed,
+            codes: &work,
+            ridge: config.code_ridge,
+            charge,
+            n_charts,
+            linear_improved: true,
+            curved_committed: !accepted.is_empty(),
+        },
     )?;
 
     // ---- Rounds 1.. : alternate linear refit (A) then curved refit (B). ----
@@ -251,13 +253,15 @@ pub fn cofit_block_and_curved(
         let adjusted = &target_owned - &curved;
         let linear_improved = refit_linear_tier(
             &mut work,
-            adjusted.view(),
-            decoder,
-            blocks,
-            b,
-            &accepted,
-            &active_slots,
-            config.code_ridge,
+            LinearRefitInputs {
+                adjusted: adjusted.view(),
+                decoder,
+                blocks,
+                b,
+                accepted: &accepted,
+                active_slots: &active_slots,
+                ridge: config.code_ridge,
+            },
         );
         let l_unowned = reconstruct_masked(decoder, blocks, work.view(), b, &accepted, false)?;
         let composed_a = &l_unowned + &curved;
@@ -291,14 +295,16 @@ pub fn cofit_block_and_curved(
         record_round(
             &mut rounds,
             round,
-            target.view(),
-            &composed,
-            &work,
-            config.code_ridge,
-            charge,
-            n_charts,
-            linear_improved,
-            curved_committed,
+            RoundTelemetry {
+                target: target.view(),
+                composed: &composed,
+                codes: &work,
+                ridge: config.code_ridge,
+                charge,
+                n_charts,
+                linear_improved,
+                curved_committed,
+            },
         )?;
         assert_monotone(objective, prev_objective, config.monotone_slack, round, "round")?;
 
@@ -415,21 +421,33 @@ fn curved_correction(
     Ok(composed - &l_unowned)
 }
 
+/// Frozen inputs to the block-A linear refit: the chart-adjusted target, the
+/// dictionary/routing views, the chart-owned block set, and the per-row active
+/// slots — everything the refit reads but never writes.
+struct LinearRefitInputs<'a> {
+    adjusted: ArrayView2<'a, f32>,
+    decoder: ArrayView2<'a, f32>,
+    blocks: ArrayView2<'a, u32>,
+    b: usize,
+    accepted: &'a HashSet<usize>,
+    active_slots: &'a [Vec<usize>],
+    ridge: f32,
+}
+
 /// Block A: re-solve the per-row active-set ridge least-squares codes for the
 /// chart-unowned active slots against `adjusted = target − C`, writing the result
 /// back in place. Chart-owned slots (curved-owned blocks) and routing pads are
 /// left untouched. Returns whether any row's solve moved the codes.
-#[allow(clippy::too_many_arguments)]
-fn refit_linear_tier(
-    codes: &mut Array3<f32>,
-    adjusted: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    blocks: ArrayView2<'_, u32>,
-    b: usize,
-    accepted: &HashSet<usize>,
-    active_slots: &[Vec<usize>],
-    ridge: f32,
-) -> bool {
+fn refit_linear_tier(codes: &mut Array3<f32>, inputs: LinearRefitInputs<'_>) -> bool {
+    let LinearRefitInputs {
+        adjusted,
+        decoder,
+        blocks,
+        b,
+        accepted,
+        active_slots,
+        ridge,
+    } = inputs;
     let n = blocks.nrows();
     let mut improved = false;
     for i in 0..n {
@@ -519,20 +537,36 @@ fn joint_objective(
     frobenius_sse(target, recon) + linear_ridge_energy(codes, ridge)
 }
 
-/// Append a round's telemetry and return its joint objective.
-#[allow(clippy::too_many_arguments)]
-fn record_round(
-    rounds: &mut Vec<CofitRound>,
-    round: usize,
-    target: ArrayView2<'_, f32>,
-    composed: &Array2<f32>,
-    codes: &Array3<f32>,
+/// One round's telemetry inputs: the reconstruction state to score plus the
+/// round's chart/step outcomes, bundled so `record_round` reads one coherent
+/// snapshot per round.
+struct RoundTelemetry<'a> {
+    target: ArrayView2<'a, f32>,
+    composed: &'a Array2<f32>,
+    codes: &'a Array3<f32>,
     ridge: f32,
     charge: f64,
     n_charts: usize,
     linear_improved: bool,
     curved_committed: bool,
+}
+
+/// Append a round's telemetry and return its joint objective.
+fn record_round(
+    rounds: &mut Vec<CofitRound>,
+    round: usize,
+    telemetry: RoundTelemetry<'_>,
 ) -> Result<f64, String> {
+    let RoundTelemetry {
+        target,
+        composed,
+        codes,
+        ridge,
+        charge,
+        n_charts,
+        linear_improved,
+        curved_committed,
+    } = telemetry;
     let recon_sse = frobenius_sse(target, composed);
     let linear_ridge = linear_ridge_energy(codes, ridge);
     let objective = recon_sse + linear_ridge;
