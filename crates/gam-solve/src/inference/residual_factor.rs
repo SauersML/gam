@@ -920,7 +920,19 @@ fn factor_coordinates(
     let p = lambda.nrows();
     let rank = lambda.ncols();
     let n = r.nrows();
-    let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
+    // GLS weights 1/D_ii, with zero-variance channels DROPPED (weight 0): a
+    // channel whose residual is identically zero carries no factor information,
+    // and its 1/0 = ∞ weight poisons the whole normal matrix into NaN — the
+    // fully-explained-target abort (Cholesky NonPositivePivot) that killed
+    // stagewise runs on targets the dictionary explains exactly. Dropping the
+    // channel is the pseudo-inverse limit; with every channel degenerate the
+    // ridged normal matrix stays PD and the coordinates are the least-norm 0.
+    let d_inv: Vec<f64> = (0..p)
+        .map(|i| {
+            let d = diagonal[i];
+            if d > 0.0 && d.is_finite() { 1.0 / d } else { 0.0 }
+        })
+        .collect();
     // Normal matrix ΛᵀD^{-1}Λ (+ tiny ridge for invertibility).
     let mut normal = Array2::<f64>::zeros((rank, rank));
     for a in 0..rank {
