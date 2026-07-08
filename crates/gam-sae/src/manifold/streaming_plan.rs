@@ -184,6 +184,32 @@ pub fn sae_streaming_plan_for_shape(
     d_max: usize,
     border_dim: usize,
 ) -> SaeStreamingPlan {
+    // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): build
+    // the plan against the host in-core budget first. If the whole working set
+    // already fits host memory (direct admitted), a present device — whose
+    // pooled budget is at least the host budget in the production multi-GPU
+    // regime — cannot change the admission or any functional plan output
+    // (`chunk_size == n_obs` whenever the direct plan is admitted; the only
+    // budget-dependent fields that still differ are diagnostic byte estimates
+    // and the chunk window, which are consumed only on the streaming path). So
+    // return the host plan without creating any CUDA context. Only when the host
+    // budget FORCES streaming do we probe for the larger pooled device budget
+    // that may restore a single-shot direct plan.
+    let (host_budget, host_available) = sae_host_in_core_budget_bytes();
+    let host_window = SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE;
+    let host_plan = sae_streaming_plan_from_budget(
+        n_obs,
+        total_basis,
+        k_atoms,
+        d_max,
+        border_dim,
+        host_budget,
+        host_window,
+        host_available,
+    );
+    if host_plan.direct_admitted {
+        return host_plan;
+    }
     let (budget, chunk_window, host_available) =
         match crate::gpu::device_runtime::GpuRuntime::global() {
             Some(rt) if rt.device_count() > 0 => {

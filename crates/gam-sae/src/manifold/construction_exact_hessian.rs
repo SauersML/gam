@@ -433,10 +433,6 @@ impl SaeManifoldTerm {
             // Dead-zone gate: only trust the envelope response where the outer
             // step would drive the inner gradient past the stationarity tolerance.
             third_order_correction[coord] = if rhs_norm > dead_zone_tol { raw } else { 0.0 };
-            eprintln!(
-                "[2087-GATE-DIAG] coord {coord}: rhs_norm={rhs_norm:.6e} tau={dead_zone_tol:.6e} raw={raw:.6e} gated={:.6e} kept={}",
-                third_order_correction[coord], rhs_norm > dead_zone_tol
-            );
         }
 
         Ok(SaeOuterRhoGradientComponents {

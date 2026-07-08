@@ -64,6 +64,28 @@ impl Default for GpuDispatchPolicy {
 }
 
 impl GpuDispatchPolicy {
+    /// The smallest `gemm_min_flops` ANY production dispatch policy can carry.
+    ///
+    /// Production policies are exactly two: [`Self::default`] (seed,
+    /// `gemm_min_flops = 1e8`) and the device-calibrated policy, whose
+    /// `crossover_flops` can lower the floor at most to the flop count of the
+    /// smallest calibration measurement — the 64×64×64 GEMM in
+    /// `calibration::GEMM_DIMS`, i.e. `2·64³ = 524_288` (a compile-time assert
+    /// in `calibration.rs` pins the correspondence). Work below this floor is
+    /// therefore inadmissible for GPU dispatch under EVERY reachable policy, so
+    /// a caller may refuse it BEFORE probing the device — this is the pre-probe
+    /// size gate that lets CPU-sized problems skip CUDA context creation
+    /// entirely (the startup-tax ordering fix). Work at or above it must fall
+    /// through to the probed runtime's real (possibly calibrated) policy gate,
+    /// so genuinely GPU-sized problems behave exactly as before.
+    pub const MIN_CALIBRATABLE_GEMM_FLOPS: u128 = 524_288;
+
+    /// The smallest `potrf_min_p` ANY production dispatch policy can carry:
+    /// the smallest POTRF calibration dimension (`calibration::POTRF_DIMS[0]`,
+    /// pinned by a compile-time assert there). A single (batch ≤ 1) POTRF with
+    /// `p` below this is inadmissible under every reachable policy.
+    pub const MIN_CALIBRATABLE_POTRF_P: usize = 64;
+
     /// Minimum problem dimension for the fp32+refinement path.
     ///
     /// Below this threshold the fp64 GEMV needed for the residual check costs

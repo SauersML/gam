@@ -295,15 +295,17 @@ impl GpuRuntime {
     /// problem-size decision therefore strictly precedes any driver contact, and
     /// a CPU-sized fit pays ZERO CUDA cost.
     ///
-    /// The floor is read from [`GpuDispatchPolicy::default`] — the conservative,
-    /// pre-calibration seed available WITHOUT a device — so the gate never needs
-    /// a probed policy to decide it should not probe. A genuinely GPU-sized
-    /// problem clears the floor and falls through to the identical `global()`
-    /// path, so device behaviour is unchanged.
+    /// The floor is [`GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS`] — the
+    /// smallest `gemm_min_flops` ANY reachable policy (default seed or
+    /// device-calibrated) can carry, known WITHOUT a device — so the gate never
+    /// needs a probe to decide it should not probe, and refusing below it can
+    /// never block work that any policy would have dispatched. Work at or above
+    /// the floor falls through to the identical `global()` path (where the real,
+    /// possibly calibrated policy still gates each op), so device behaviour for
+    /// genuinely GPU-sized problems is unchanged.
     #[must_use]
     pub fn global_if_dense_work_exceeds_floor(work_flops: u128) -> Option<&'static Self> {
-        let floor = GpuDispatchPolicy::default().gemm_min_flops as u128;
-        if work_flops < floor {
+        if work_flops < GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
             return None;
         }
         Self::global()
@@ -589,7 +591,9 @@ mod laziness_gate_tests {
         let before = GpuRuntime::global_call_count();
         // Above any plausible floor: must consult the runtime exactly once, i.e.
         // the gate does not change behaviour for genuinely GPU-sized problems.
-        let _ = GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
+        // The returned handle is irrelevant here (None on CPU-only boxes);
+        // the observable is the consultation count below.
+        GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
         assert_eq!(
             GpuRuntime::global_call_count(),
             before + 1,
@@ -598,13 +602,18 @@ mod laziness_gate_tests {
     }
 
     #[test]
-    fn floor_is_the_default_gemm_flop_threshold() {
-        // The gate's floor is the conservative pre-calibration seed, available
-        // without a device, so the decision to NOT probe never needs a probe.
-        let floor = GpuDispatchPolicy::default().gemm_min_flops as u128;
+    fn floor_is_the_min_calibratable_gemm_threshold() {
+        // The gate's floor is the smallest gemm_min_flops any reachable policy
+        // (default seed OR device-calibrated) can carry — known without a
+        // device, so the decision to NOT probe never needs a probe, and the
+        // refusal can never block work some calibrated policy would dispatch.
+        let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS;
         let before = GpuRuntime::global_call_count();
         assert!(GpuRuntime::global_if_dense_work_exceeds_floor(floor - 1).is_none());
         assert_eq!(GpuRuntime::global_call_count(), before);
+        // At the floor the gate must consult the runtime (fall through).
+        GpuRuntime::global_if_dense_work_exceeds_floor(floor);
+        assert_eq!(GpuRuntime::global_call_count(), before + 1);
     }
 }
 

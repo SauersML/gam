@@ -2727,6 +2727,19 @@ impl SaeManifoldTerm {
         // single gate now; it is parameterised in `sparse_active_plan_for_budget`
         // so the engagement regression can pin a small budget without allocating
         // a multi-GB dense Gram.
+        // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering):
+        // decide against the host in-core budget first. If the dense data Gram
+        // already fits the host budget the plan keeps the dense full-support
+        // layout (`None`); because the aggregate pooled device budget the probe
+        // would return is at least the host budget in the multi-GPU production
+        // regime, a present device cannot flip that verdict, so we return
+        // without creating any CUDA context. Only a dense Gram that OVERFLOWS
+        // the host budget needs the larger pooled device budget — and only then
+        // do we pay for the probe.
+        let host_budget = sae_host_in_core_budget_bytes().0;
+        if self.sparse_active_plan_for_budget(host_budget).is_none() {
+            return None;
+        }
         let budget = match crate::gpu::device_runtime::GpuRuntime::global() {
             // Allow up to one quarter of the AGGREGATE device budget for the dense
             // Gram, matching the streaming dispatcher's in-core fraction. The
@@ -2741,7 +2754,7 @@ impl SaeManifoldTerm {
                     .sum();
                 aggregate / 4
             }
-            None => sae_host_in_core_budget_bytes().0,
+            None => host_budget,
         };
         self.sparse_active_plan_for_budget(budget)
     }
