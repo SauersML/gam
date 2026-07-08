@@ -325,28 +325,15 @@ fn activity_of(term: &SaeManifoldTerm) -> Array1<f64> {
     (0..n).map(|r| assignments.row(r).sum()).collect()
 }
 
-/// Fit the running structured residual-covariance `Σ` on the pooled `R = target − fitted`.
-/// Returns `None` when the residual is empty/single-channel (no factor subspace).
-///
-/// The stagewise loop no longer mines the pooled residual directly — it routes through
-/// [`birth_mining_residual`], which applies the [`stratum_local_birth_residual`] floor
-/// screen before calling [`fit_residual_covariance_on`]. This unscreened pooled path is
-/// retained only as the covariance oracle the stratum-local tests compare against.
-#[cfg(test)]
-fn fit_residual_covariance(
-    term: &SaeManifoldTerm,
-    target: ArrayView2<'_, f64>,
-    config: &StagewiseConfig,
-) -> Result<Option<(Array2<f64>, StructuredResidualModel)>, String> {
-    let residual = current_residual(term, target)?;
-    fit_residual_covariance_on(term, residual, config)
-}
-
-/// [`fit_residual_covariance`] on an ALREADY-COMPUTED residual (the pooled `R` or a
-/// stratum-local masked `R`). The stagewise loop computes the pooled residual once,
-/// applies the [`stratum_local_birth_residual`] screen, and mines whichever residual
-/// clears the router floor — but the factor fit and per-row activity are otherwise
-/// identical, so this is the shared body.
+/// Fit the running structured residual-covariance `Σ` on an ALREADY-COMPUTED
+/// residual — the pooled `R = target − fitted` or a stratum-local masked `R`.
+/// Returns `None` when the residual is empty/single-channel (no factor
+/// subspace). The stagewise loop computes the pooled residual once, applies the
+/// [`stratum_local_birth_residual`] screen, and mines whichever residual clears
+/// the router floor — but the factor fit and per-row activity are otherwise
+/// identical, so this is the shared body. (The unscreened pooled path lives on
+/// only as the `fit_residual_covariance` oracle in the `tests` module, which the
+/// stratum-local tests compare against.)
 fn fit_residual_covariance_on(
     term: &SaeManifoldTerm,
     residual: Array2<f64>,
@@ -2264,6 +2251,19 @@ mod tests {
         AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
         SaeBasisEvaluator, SaeManifoldAtom,
     };
+
+    /// Unscreened pooled-residual covariance oracle: `Σ` fit on the full
+    /// `R = target − fitted` with no stratum-local floor screen. Production
+    /// routes through [`birth_mining_residual`]; the stratum-local tests use
+    /// this as the comparison oracle.
+    fn fit_residual_covariance(
+        term: &SaeManifoldTerm,
+        target: ArrayView2<'_, f64>,
+        config: &StagewiseConfig,
+    ) -> Result<Option<(Array2<f64>, StructuredResidualModel)>, String> {
+        let residual = current_residual(term, target)?;
+        fit_residual_covariance_on(term, residual, config)
+    }
     use gam_terms::latent::LatentManifold;
     use ndarray::Array2;
     use std::sync::Arc;

@@ -319,7 +319,12 @@ pub fn cofit_block_and_curved(
     let curved_final = &composed - &linear_reconstruction;
     let explained_variance = explained_variance_from_reconstruction(target, composed.view())?;
     // Guard against an inconsistent report (bounds the accepted block indices).
-    debug_assert!(accepted.iter().all(|&g| g < g_total));
+    // Fails closed in every build: an out-of-range block id is a co-fit bug.
+    if let Some(&bad) = accepted.iter().find(|&&g| g >= g_total) {
+        return Err(format!(
+            "cofit: accepted chart block {bad} out of range (g_total={g_total})"
+        ));
+    }
 
     Ok(CofitReport {
         reconstructed: composed,
@@ -595,10 +600,6 @@ fn assert_monotone(
     stage: &str,
 ) -> Result<(), String> {
     let slack = slack_rel * (prev.abs() + 1.0);
-    debug_assert!(
-        objective <= prev + slack,
-        "cofit monotonicity violated at round {round} stage {stage}: J={objective} > prev={prev}"
-    );
     if objective > prev + slack {
         return Err(format!(
             "cofit: monotone non-increase violated at round {round} stage {stage}: \
