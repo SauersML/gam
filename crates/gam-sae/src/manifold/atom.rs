@@ -1597,6 +1597,44 @@ impl SaeManifoldAtom {
         }
     }
 
+    /// #2133 — the pure second coordinate derivative `∂²g_k/∂t_{ik,axis}²`
+    /// contracted through the decoder, for one row/axis, given the atom's second
+    /// jet `(n, M, d, d)` (from [`SaeManifoldTerm::atom_second_jets`]). This is the
+    /// `f''` leg the Gauss-Newton `htt = J̃J̃ᵀ` omits; the SURE within-basin
+    /// divergence correction contracts it against the metric residual `M·r`.
+    /// Mirrors [`Self::fill_decoded_derivative_row`] exactly (same decoder axpy,
+    /// same `exp(s)` log-amplitude scaling), only the basis weight is the diagonal
+    /// second jet `∂²Φ/∂t_axis²` instead of the first jet `∂Φ/∂t_axis`.
+    pub(crate) fn fill_decoded_second_derivative_row(
+        &self,
+        second_jet: &Array4<f64>,
+        row: usize,
+        latent_axis: usize,
+        out: &mut [f64],
+    ) {
+        let m = self.basis_size();
+        assert_eq!(out.len(), self.output_dim());
+        for slot in out.iter_mut() {
+            *slot = 0.0;
+        }
+        for basis_col in 0..m {
+            let d2phi = second_jet[[row, basis_col, latent_axis, latent_axis]];
+            if d2phi == 0.0 {
+                continue;
+            }
+            let dec = self.decoder_coefficients.row(basis_col);
+            for (o, &d) in out.iter_mut().zip(dec.iter()) {
+                *o += d2phi * d;
+            }
+        }
+        if self.log_amplitude != 0.0 {
+            let amp = self.log_amplitude.exp();
+            for slot in out.iter_mut() {
+                *slot *= amp;
+            }
+        }
+    }
+
     /// #2022 — fold the decoder's Frobenius magnitude into the explicit
     /// log-amplitude: `s_k ← s_k + ln‖B_k‖_F` and `B_k ← B_k / ‖B_k‖_F`, leaving
     /// the atom's contribution `exp(s_k)·Φ·B_k` numerically UNCHANGED. This is

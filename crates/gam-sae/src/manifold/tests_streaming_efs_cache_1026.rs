@@ -66,10 +66,10 @@ fn streaming_cache_is_efs_dropin_for_dense_cache_1026() {
     }
 
     let dense_disp = dense
-        .reconstruction_dispersion(&dense_loss, &dense_cache, &rho)
+        .reconstruction_dispersion(&dense_loss, &dense_cache, &rho, None)
         .unwrap();
     let stream_disp = streaming
-        .reconstruction_dispersion(&stream_loss, &stream_cache, &rho)
+        .reconstruction_dispersion(&stream_loss, &stream_cache, &rho, None)
         .unwrap();
     assert_abs_diff_eq!(dense_disp, stream_disp, epsilon = 1.0e-8);
 }

@@ -274,6 +274,9 @@ mod tests_2111_dense_torus_acceptance;
 mod tests_rank_charge_2101;
 
 #[cfg(test)]
+mod tests_sure_dispersion_2133;
+
+#[cfg(test)]
 mod tests_behavioral_fisher_rung1;
 
 #[cfg(test)]

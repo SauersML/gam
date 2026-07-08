@@ -172,11 +172,20 @@ impl SaeManifoldTerm {
     /// prior-dominated coordinates contribute 0 to both the trace and the
     /// count, hence 0 edf). The residual dof is floored at 1 so `φ̂` stays
     /// finite and positive.
+    /// `residual` is the per-row reconstruction residual `f(θ̂) − y` (n×p) at the
+    /// same state that produced `cache`. When supplied it engages the #2133 SURE
+    /// within-basin second-order deflation correction
+    /// ([`Self::coordinate_sure_deflation_correction`]) — the exact-Newton
+    /// completion of the Gauss-Newton `coord_edf`, which removes the
+    /// incidental-parameters under-dispersion of the per-row coordinate MAP.
+    /// `None` reproduces the historical Gauss-Newton dispersion exactly (used by
+    /// callers with no residual in hand — the correction is then simply absent).
     pub(crate) fn reconstruction_dispersion(
         &self,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
         rho: &SaeManifoldRho,
+        residual: Option<ArrayView2<'_, f64>>,
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -247,6 +256,14 @@ impl SaeManifoldTerm {
                 let edf_kj = (n_active_k - alpha * traces[k][j]).clamp(0.0, n_active_k);
                 coord_edf += edf_kj;
             }
+        }
+        // #2133 — restore the second-order residual-curvature term the
+        // Gauss-Newton `coord_edf` above drops, turning the per-row GN divergence
+        // into the exact within-basin SURE divergence of the coordinate MAP. Pure
+        // additive readout; only engaged when the caller supplies the residual.
+        if let Some(residual) = residual {
+            coord_edf = (coord_edf + self.coordinate_sure_deflation_correction(residual, rho)?)
+                .clamp(0.0, n_scalar);
         }
         let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);
         let phi = rss / resid_dof;
@@ -446,7 +463,9 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
-        let dispersion = self.reconstruction_dispersion(&loss, &cache, rho)?;
+        let residual = self.reconstruction_residual(target, rho)?;
+        let dispersion =
+            self.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;
         self.assemble_shape_uncertainty(&cache, dispersion)
     }
 

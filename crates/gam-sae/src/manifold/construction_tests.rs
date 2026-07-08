@@ -1390,7 +1390,7 @@ mod shape_uncertainty_joint_recompute_tests {
             .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged joint cache");
         let dispersion = term
-            .reconstruction_dispersion(&loss, &cache, &rho)
+            .reconstruction_dispersion(&loss, &cache, &rho, None)
             .expect("dispersion");
         assert!(dispersion > 0.0, "a real residual ⇒ positive dispersion");
         let joint = term

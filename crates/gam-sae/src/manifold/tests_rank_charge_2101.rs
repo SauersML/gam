@@ -89,7 +89,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     let (_v, loss, cache) = term
         .reml_criterion_with_cache(unit_target(&term).view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap_or_else(|_| panic!("reml pass"));
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
     drop((loss, cache));
 
     let d_real = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
@@ -228,7 +228,7 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
     let (v_off, loss, cache) = term
         .reml_criterion_with_cache(x.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
     drop((loss, cache));
     let d_eff = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
     eprintln!("[rank-charge K=3] d_eff per atom = {:?}  disp={disp:.5}",
@@ -475,7 +475,7 @@ fn rank_charge_shared_primitive_parity() {
     let (_v, loss, cache) = term
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
     drop((loss, cache));
 
     // Term-level d_eff (the currency the joint REML charges).

@@ -116,6 +116,158 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
+    /// PD-floor fraction for the #2133 SURE divergence denominator: the exact
+    /// within-basin Newton curvature `htt + c + V''` is clamped to at least this
+    /// fraction of the Gauss-Newton curvature `htt + V''`, so a row whose
+    /// residual curvature `c` exceeds the total positive curvature (a local
+    /// saddle, where the divergence would otherwise blow up or flip sign) is
+    /// bounded instead of poisoning `φ̂`. Matches the acceptance harness floor.
+    pub(crate) const SURE_DIVERGENCE_PD_FLOOR: f64 = 0.1;
+
+    /// #2133 — SURE within-basin second-order deflation correction to `coord_edf`.
+    ///
+    /// The arrow-Schur coordinate curvature `htt = a_k²·(g')ᵀM g'` is
+    /// Gauss-Newton (first jets only), so the ARD-shrunk edf `htt/(htt+V'')` the
+    /// dispersion sums is the GN divergence. The EXACT divergence of the
+    /// penalized basin-selecting MAP `θ̂(y)=argmin ½‖y−f‖²_M + V(θ)` is, by the
+    /// implicit-function theorem on the stationarity `g = f'ᵀM(f−y) + V' = 0`
+    /// (`∂g/∂θ = htt + f''ᵀM(f−y) + V''`, `∂g/∂y = −f'ᵀM`),
+    ///   div = htt / (htt + f''ᵀM·r_code + V''),   r_code = f(θ̂) − y,
+    /// which restores the residual-curvature term `c = a_k·(g'')ᵀM·r_code` the GN
+    /// block drops. On a curved chart `c ≠ 0`, so GN systematically MIS-counts the
+    /// per-row coordinate dof (biasing `φ̂` low — the incidental-parameters
+    /// under-dispersion of #2133). This returns the additive correction summed
+    /// over rows/axes,
+    ///   Δedf = Σ [ htt/(htt+c+V'') − htt/(htt+V'') ]
+    ///        = Σ −htt·c / [(htt+c+V'')·(htt+V'')],
+    /// the exact second-order completion of the already-counted GN baseline
+    /// (`V'' = max(α·cos κt, 0)` is the SAME clamped von-Mises curvature the
+    /// assembly writes into `htt`, so the baseline term cancels the GN edf the
+    /// caller already summed). The full denominator is floored into the PD region
+    /// (`≥ SURE_DIVERGENCE_PD_FLOOR·(htt+V'')`) so a near-saddle row cannot blow
+    /// the divergence up. The measure-zero basin-jump (selection) dof — a
+    /// one-sided term peaking only at intermediate basin ambiguity — is NOT added
+    /// here: it needs per-row multi-basin enumeration and never over-counts, so
+    /// the within-basin term is the dominant, over-shoot-safe piece.
+    ///
+    /// `residual` is the per-row reconstruction residual `f(θ̂) − y` (n×p) at the
+    /// same `rho`/state that produced `cache`. Returns `Ok(0.0)` when no atom
+    /// exposes analytic second jets (the correction is then inert — the historical
+    /// GN dispersion is unchanged).
+    pub(crate) fn coordinate_sure_deflation_correction(
+        &self,
+        residual: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if residual.dim() != (n, p) {
+            return Err(format!(
+                "coordinate_sure_deflation_correction: residual {:?} != ({n}, {p})",
+                residual.dim()
+            ));
+        }
+        // Second jets are the whole point; if the bases cannot supply them the
+        // correction is simply inert (GN dispersion stands).
+        let second_jets = match self.atom_second_jets() {
+            Ok(jets) => jets,
+            Err(_) => return Ok(0.0),
+        };
+        let coord_offsets = self.assignment.coord_offsets();
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|m| m.whitens_likelihood());
+        let mut assignments = vec![0.0_f64; self.k_atoms()];
+        let mut g1 = vec![0.0_f64; p];
+        let mut g2 = vec![0.0_f64; p];
+        let floor = Self::SURE_DIVERGENCE_PD_FLOOR;
+        let mut acc = 0.0_f64;
+        for row in 0..n {
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, assignments.as_mut_slice())?;
+            let r_row = residual.row(row);
+            // Metric-applied residual M·r (p-space); identity when not whitening.
+            let mr: Vec<f64> = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, r_row),
+                _ => r_row.iter().copied().collect(),
+            };
+            let mut correct_atom = |k: usize, block_start: usize| {
+                if rho.log_ard[k].is_empty() {
+                    return;
+                }
+                let coord = &self.assignment.coords[k];
+                let d = coord.latent_dim();
+                if rho.log_ard[k].len() != d {
+                    return;
+                }
+                let a_k = assignments[k];
+                if a_k == 0.0 {
+                    return;
+                }
+                let _ = block_start; // coord block position is not needed here.
+                for axis in 0..d {
+                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                    let t = coord.row(row)[axis];
+                    let v_pp = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis])
+                        .hess
+                        .max(0.0);
+                    // GN coordinate curvature htt = a_k²·(g')ᵀ M g'.
+                    self.atoms[k].fill_decoded_derivative_row(row, axis, g1.as_mut_slice());
+                    let htt = if whitens {
+                        if let Some(metric) = self.row_metric.as_ref() {
+                            let mg = metric.apply_metric_row(
+                                row,
+                                ndarray::ArrayView1::from(g1.as_slice()),
+                            );
+                            a_k * a_k * g1.iter().zip(mg.iter()).map(|(&a, &b)| a * b).sum::<f64>()
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        a_k * a_k * g1.iter().map(|&x| x * x).sum::<f64>()
+                    };
+                    let denom_gn = htt + v_pp;
+                    if !(denom_gn > 0.0) {
+                        continue;
+                    }
+                    // Residual-curvature term c = a_k·(g'')ᵀ M r_code.
+                    self.atoms[k].fill_decoded_second_derivative_row(
+                        &second_jets[k],
+                        row,
+                        axis,
+                        g2.as_mut_slice(),
+                    );
+                    let c = a_k * g2.iter().zip(mr.iter()).map(|(&a, &b)| a * b).sum::<f64>();
+                    let denom_full = (htt + c + v_pp).max(floor * denom_gn);
+                    // Δedf = htt/denom_full − htt/denom_gn (exact 2nd-order completion).
+                    acc += htt / denom_full - htt / denom_gn;
+                }
+            };
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    let active = &layout.active_atoms[row];
+                    let starts = &layout.coord_starts[row];
+                    for (pos, &k) in active.iter().enumerate() {
+                        correct_atom(k, starts[pos]);
+                    }
+                }
+                None => {
+                    for k in 0..self.k_atoms() {
+                        correct_atom(k, coord_offsets[k]);
+                    }
+                }
+            }
+        }
+        Ok(acc)
+    }
+
     /// Atom-count threshold at/above which [`Self::ard_inverse_traces`] switches
     /// from the exact selected-inverse latent diagonal (one dense `K×K` Schur
     /// solve per latent coordinate — the `O(total_t·K²) ≈ O(K³)` massive-`K`

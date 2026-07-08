@@ -1159,7 +1159,10 @@ impl SaeManifoldOuterObjective {
                 return Err(err);
             }
         };
-        let dispersion = self.term.reconstruction_dispersion(&loss, &cache, &rho)?;
+        let residual = self.term.reconstruction_residual(self.target.view(), &rho)?;
+        let dispersion =
+            self.term
+                .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))?;
         self.term.assemble_shape_uncertainty(&cache, dispersion)
     }
 
@@ -2318,9 +2321,13 @@ impl SaeManifoldOuterObjective {
             Err(err) => return Err(err),
         };
         self.current_rho = rho.clone();
+        let residual = self
+            .term
+            .reconstruction_residual(self.target.view(), &rho)
+            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: residual: {e}"))?;
         let dispersion = self
             .term
-            .reconstruction_dispersion(&loss, &cache, &rho)
+            .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: dispersion: {e}"))?;
         self.last_loss = Some(loss);
 

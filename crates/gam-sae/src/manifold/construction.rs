@@ -5082,7 +5082,9 @@ impl SaeManifoldTerm {
             // hardcoded/self-relative floor). If it cannot be computed the vanishing-
             // atom detection silently degrades (R→0 keeps rank_eff≈rank), so surface
             // it loudly rather than hiding a re-admitted co-collapse.
-            let disp = match self.reconstruction_dispersion(&loss, &cache, rho) {
+            let disp = match self.reconstruction_residual(target, rho).and_then(|resid| {
+                self.reconstruction_dispersion(&loss, &cache, rho, Some(resid.view()))
+            }) {
                 Ok(phi) => phi,
                 Err(e) => {
                     log::warn!(
@@ -6256,7 +6258,9 @@ impl SaeManifoldTerm {
             // `rank_dof_from_grams` MP hard count as the dense path off the
             // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
             // of log_det) is untouched — bit-identical dense↔streaming by design.
-            let disp = match self.reconstruction_dispersion(&loss, &converged_cache, rho) {
+            let disp = match self.reconstruction_residual(target, rho).and_then(|resid| {
+                self.reconstruction_dispersion(&loss, &converged_cache, rho, Some(resid.view()))
+            }) {
                 Ok(phi) => phi,
                 Err(e) => {
                     log::warn!(

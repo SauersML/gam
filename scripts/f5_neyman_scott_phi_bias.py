@@ -179,6 +179,62 @@ def _enumerate_basins(sq_row: np.ndarray):
     return np.flatnonzero(is_min)
 
 
+def f_second(theta: np.ndarray, a: float) -> np.ndarray:
+    """d² f / d θ², shape (..., p). The residual-curvature leg the Gauss-Newton
+    coordinate curvature drops (#2133)."""
+    return np.stack(
+        [
+            -4 * np.cos(2 * theta),
+            -4 * np.sin(2 * theta),
+            -a * np.cos(theta),
+            -a * np.sin(theta),
+        ],
+        axis=-1,
+    )
+
+
+def phi_hat_exact_div(y: np.ndarray, a: float, alpha: float) -> dict:
+    """φ̂ via the EXACT within-basin SURE divergence (#2133 landed fix).
+
+    Same PENALIZED single-basin MAP as `phi_hat_per_row_laplace`, but the per-row
+    coordinate dof is the exact divergence of the basin-selecting MAP rather than
+    the Gauss-Newton `H/(H+α)`. By the implicit-function theorem on the penalized
+    stationarity `g(θ,y)=f'ᵀ(f−y)/φ + V'=0`,
+      div_n = H / (H + f''ᵀr_code/φ + V''),   r_code = f(θ̂) − y,  H=‖f'‖²/φ,
+    which restores the residual-curvature term `f''ᵀr_code/φ` the GN block drops.
+    The denominator is floored into the PD region (matching the Rust
+    `SURE_DIVERGENCE_PD_FLOOR`) so a near-saddle row cannot blow the divergence
+    up. This is the estimator wired into `reconstruction_dispersion`; it removes
+    the systematic under-dispersion with NO over-shoot at large `a` (the
+    mixture-mean `phi_hat_basin_marginal` over-shoots there — see the table)."""
+    n = y.shape[0]
+    sq = _row_sqdist(y, a)
+    fg = f_map(_GRID, a)
+    gg = f_prime(_GRID, a)
+    hh = f_second(_GRID, a)
+    grad_sq_grid = np.einsum("gp,gp->g", gg, gg)
+    floor = 0.1  # SURE_DIVERGENCE_PD_FLOOR
+    phi = float(sq.min(axis=1).mean()) / _P + 1e-9
+    coord_edf, rss = 0.0, 0.0
+    for _ in range(200):
+        idx = np.argmin(_penalized_objective(sq, phi, alpha), axis=1)
+        rss = float(sq[np.arange(n), idx].sum())
+        h = grad_sq_grid[idx] / max(phi, 1e-300)          # H = ‖f'‖²/φ
+        v_pp = np.maximum(alpha * np.cos(_GRID[idx]), 0.0)  # V''=α cos θ, clamped
+        r_code = fg[idx] - y                               # f(θ̂) − y
+        c = np.einsum("np,np->n", hh[idx], r_code) / max(phi, 1e-300)
+        denom_gn = h + v_pp
+        denom_full = np.maximum(h + c + v_pp, floor * denom_gn)
+        coord_edf = float((h / denom_full).sum())
+        resid_dof = max(n * _P - coord_edf, 1.0)
+        new = rss / resid_dof
+        if abs(new - phi) < 1e-12 * max(1.0, phi):
+            phi = new
+            break
+        phi = new
+    return {"phi": phi, "coord_edf": coord_edf, "rss": rss}
+
+
 def phi_hat_basin_marginal(y: np.ndarray, a: float, alpha: float) -> dict:
     """φ̂ with the MIXTURE-OF-LAPLACE generalized coord dof (the F5 fix).
 
@@ -316,30 +372,33 @@ def run(ns, a_sweep, phi_true, alpha, reps, seed):
         "merge ⇒ maximally bimodal row posteriors)\n"
     )
     header = (
-        f"{'N':>6} {'a':>6} | {'φ̂_Laplace/φ':>13} {'φ̂_basin/φ':>11} "
-        f"{'φ̂_marg/φ':>10} {'oracle/φ':>9}"
+        f"{'N':>6} {'a':>6} | {'φ̂_Laplace/φ':>13} {'φ̂_exact/φ':>11} "
+        f"{'φ̂_basin/φ':>11} {'φ̂_marg/φ':>10} {'oracle/φ':>9}"
     )
     rows = []
     for n in ns:
         print(header)
         print("  " + "-" * (len(header) + 2))
         for a in a_sweep:
-            lap, bas, mar, ora = [], [], [], []
+            lap, exa, bas, mar, ora = [], [], [], [], []
             for r in range(reps):
                 rng = np.random.default_rng(seed + 1000 * r + n)
                 theta_true, y = simulate(n, a, phi_true, rng)
                 lap.append(phi_hat_per_row_laplace(y, a, alpha)["phi"])
+                exa.append(phi_hat_exact_div(y, a, alpha)["phi"])
                 bas.append(phi_hat_basin_marginal(y, a, alpha)["phi"])
                 mar.append(phi_hat_marginal(y, a, alpha)["phi"])
                 ora.append(oracle_phi(theta_true, y, a))
             lr = np.mean(lap) / phi_true
+            xr = np.mean(exa) / phi_true
             br = np.mean(bas) / phi_true
             mr = np.mean(mar) / phi_true
             orr = np.mean(ora) / phi_true
             print(
-                f"{n:>6} {a:>6.2f} | {lr:>13.3f} {br:>11.3f} {mr:>10.3f} {orr:>9.3f}"
+                f"{n:>6} {a:>6.2f} | {lr:>13.3f} {xr:>11.3f} {br:>11.3f} "
+                f"{mr:>10.3f} {orr:>9.3f}"
             )
-            rows.append((n, a, lr, br, mr, orr))
+            rows.append((n, a, lr, xr, br, mr, orr))
         print()
     _verdict(rows, ns)
     return rows
@@ -348,7 +407,8 @@ def run(ns, a_sweep, phi_true, alpha, reps, seed):
 def _verdict(rows, ns):
     """Summarise the FAITHFUL (penalized-MAP) bias curve and the fix's scope."""
     lap = [r[2] for r in rows]
-    bas = [r[3] for r in rows]
+    exa = [r[3] for r in rows]
+    bas = [r[4] for r in rows]
     worst = min(rows, key=lambda r: r[2])
     by_a = {}
     for r in rows:
@@ -398,6 +458,15 @@ def _verdict(rows, ns):
         "  still calls reconstruction_dispersion for its φ noise floor — so φ̂ must be\n"
         "  fixed regardless of branch."
     )
+    print(
+        f"\n  φ̂_exact = the LANDED fix (#2133): the exact within-basin SURE divergence\n"
+        f"  div = H/(H + f''ᵀr/φ + V''), restoring the residual-curvature term the\n"
+        f"  Gauss-Newton coord_edf drops. Range {min(exa):.2f}–{max(exa):.2f} × φ_true\n"
+        f"  (vs single-basin {min(lap):.2f}–{max(lap):.2f}) — the systematic under-\n"
+        f"  dispersion is removed with NO over-shoot at large a (where φ̂_basin blows\n"
+        f"  up to {max(bas):.2f}×). Residual at intermediate a is the one-sided basin-\n"
+        f"  jump (selection) dof, which never over-counts."
+    )
     print("=" * 70)
 
 
@@ -425,7 +494,7 @@ def main():
 
         with open(args.csv, "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["N", "a", "phi_laplace_over_true", "phi_basin_over_true", "phi_marg_over_true", "oracle_over_true"])
+            w.writerow(["N", "a", "phi_laplace_over_true", "phi_exact_over_true", "phi_basin_over_true", "phi_marg_over_true", "oracle_over_true"])
             w.writerows(rows)
         print(f"wrote {args.csv}")
 

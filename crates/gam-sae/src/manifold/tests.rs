@@ -3048,7 +3048,7 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
-    let dispersion = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+    let dispersion = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
     let smooth_edf: f64 = term
         .decoder_smoothness_effective_dof_per_atom(&cache, &rho.lambda_smooth_vec())
         .unwrap()
