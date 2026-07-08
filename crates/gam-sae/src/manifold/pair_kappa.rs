@@ -53,14 +53,18 @@
 //! atoms are jointly zero and jointly large together (`ρ = 1/q`), independent
 //! atoms factor (`ρ = 1`).
 //!
-//! THE THRESHOLD IS DERIVED, NOT TUNED. Under the independence null, `ρ̂` is a ratio
-//! of sample moments; by the delta method its leading-order variance is
-//! `Var(ρ̂) ≈ (κ_A·κ_B − 1)/N` on the `N` rows (`κ_A = E[r_A⁴]/E[r_A²]²` is each
-//! atom's own single-plane κ — the fourth-moment spread the ISA producer already
-//! measures). The pair is flagged as ONE structure iff
-//! `ρ̂ − 1 > z·√((κ_A·κ_B − 1)/N)` at the conventional `z = 3` — the SAME level the
-//! ISA sub-sample floor is derived at ([`super::isa_seed`] `ISA_SUBSAMPLE_FLOOR`).
-//! No magic ε.
+//! THE THRESHOLD IS DERIVED, NOT TUNED. Under the independence null, `ρ̂` is a
+//! ratio of sample moments; first-order, `ρ̂ − 1 ≈ meanᵢ (Uᵢ−1)(Vᵢ−1)` with
+//! `U = r_A²/E[r_A²]`, `V = r_B²/E[r_B²]` (the ratio's estimated denominators
+//! cancel most of the numerator's fluctuation — the two subtracted terms of the
+//! ratio-estimator influence function). Under independence the factors are
+//! independent, so the delta-method leading-order variance is
+//! `Var(ρ̂) ≈ (κ_A − 1)(κ_B − 1)/N` on the `N` rows (`κ_A = E[r_A⁴]/E[r_A²]²` is
+//! each atom's own single-plane κ — the fourth-moment spread the ISA producer
+//! already measures). The pair is flagged as ONE structure iff
+//! `ρ̂ − 1 > z·√((κ_A − 1)(κ_B − 1)/N)` at the conventional `z = 3` — the SAME
+//! level the ISA sub-sample floor is derived at ([`super::isa_seed`]
+//! `ISA_SUBSAMPLE_FLOOR`). No magic ε.
 
 use crate::coactivation_conditionality::{
     CoactivationConditionality, VaryingCoefficientConfig, estimate_on_rows,
@@ -121,7 +125,7 @@ pub struct PairVerdict {
     /// Each atom's own single-plane κ over all rows (drives the null SE).
     pub kappa_a: f64,
     pub kappa_b: f64,
-    /// Independence-null standard error of `ρ̂`, `√((κ_A·κ_B − 1)/N)`.
+    /// Independence-null standard error of `ρ̂`, `√((κ_A − 1)(κ_B − 1)/N)`.
     pub rho_se: f64,
     /// `z`-score of `ρ̂ − 1` against the independence null.
     pub z: f64,
@@ -240,8 +244,17 @@ pub fn screen_pair_with_contexts(
     let rho = cross / (ma * mb);
     let kappa_a = qa / (ma * ma);
     let kappa_b = qb / (mb * mb);
-    // Independence-null delta-method SE: Var(ρ̂) ≈ (κ_A·κ_B − 1)/N.
-    let var = ((kappa_a * kappa_b) - 1.0).max(0.0) * inv;
+    // Independence-null delta-method SE. First-order, ρ̂ − 1 ≈ meanᵢ (Uᵢ−1)(Vᵢ−1)
+    // with U = r_A²/E[r_A²], V = r_B²/E[r_B²] (the ratio's estimated denominators
+    // cancel most of the numerator's fluctuation — the two subtracted terms of the
+    // ratio-estimator IF). Under X ⊥ Y the factors are independent, so
+    //   Var(ρ̂) ≈ (E U² − 1)(E V² − 1)/N = (κ_A − 1)(κ_B − 1)/N.
+    // (The numerator-only form (κ_A·κ_B − 1)/N ignores the estimated denominators
+    // and overstates the SE by √((κ+1)/(κ−1)) for equal-κ pairs — divergently so
+    // as κ → 1, exactly the clean-ring regime this screen exists for.)
+    // Equivalently: z is, to leading order, √N times the sample correlation of
+    // (r_A², r_B²) — the screen is a calibrated correlation test in disguise.
+    let var = ((kappa_a - 1.0) * (kappa_b - 1.0)).max(0.0) * inv;
     let rho_se = var.sqrt();
     let z = if rho_se > 0.0 {
         (rho - 1.0) / rho_se

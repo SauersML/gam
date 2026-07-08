@@ -14,8 +14,8 @@
 //!     zero-gain point of the coding law), `1/q` = gated spike.
 //!   * first/second circular resultants `R₁, R₂` — coverage of the angle, and
 //!     the diameter degeneracy (`R₂ → 1` ⇒ a line, not a circle).
-//!   * the rate–distortion pre-screen `n_eff·ln(R̂/σ) − Δcharge`, with the
-//!     derived crossover `R̂ > σ·√3/π` below which a circle cannot pay for
+//!   * the rate–distortion pre-screen `n_eff·½·ln(3R̂²/(π²σ²)) − Δcharge`, with
+//!     the derived crossover `R̂ > σ·π/√3` below which a circle cannot pay for
 //!     itself.
 //!
 //! Influence-function SEs make the κ gate a 2σ screen; the engine's existing
@@ -50,10 +50,17 @@ use std::f64::consts::TAU;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-/// The rate–distortion crossover radius factor `√3/π`: below `R̂ = σ·√3/π` a
-/// centered circle cannot pay its charge, so the screen refuses it regardless of
-/// κ. Derived (memo 1), not tuned.
-pub const RD_CROSSOVER_FACTOR: f64 = 0.5513288954217920; // √3 / π
+/// The rate–distortion crossover radius factor `π/√3`: below `R̂ = σ·π/√3` a
+/// centered circle cannot pay its charge, so the screen refuses it regardless
+/// of κ. Derived, not tuned: quantizing the arc `s ∈ [0, 2πR̂)` with cell width
+/// `Δ` gives positional MSE `Δ²/12`; matching the noise floor (`Δ²/12 = σ²`)
+/// makes the per-row angle cost `ln(2πR̂/Δ) = ln(πR̂/(√3σ))` nats against the
+/// flat two-coordinate reference `2·ln(R̂/σ)` (the Theorem-3 convention of
+/// `description_length::circle_coding_gain_bits`), so the per-row gain is
+/// `½·ln(3R̂²/(π²σ²))`, whose zero is exactly `R̂ = σ·π/√3 ≈ 1.814σ`. Sanity:
+/// the crossover must exceed σ — a ring smaller than its own noise annulus is
+/// described at least as compactly by the Gaussian fill.
+pub const RD_CROSSOVER_FACTOR: f64 = 1.8137993642342178; // π / √3
 
 /// The evidence level the κ / resultant gates fire at (a 2σ screen, matching the
 /// pair-κ merge screen's derivation level family).
@@ -75,9 +82,10 @@ pub struct CurlVerdict {
     pub resultant2: f64,
     /// `R̂ = √(E[r²])` — the fitted radius.
     pub radius: f64,
-    /// `ln(R̂/σ)` — the per-row coding gain.
+    /// `½·ln(3R̂²/(π²σ²))` — the per-row coding gain (Theorem-3 circle gain of
+    /// `description_length::circle_coding_gain_bits`, in nats).
     pub gain_nats_per_row: f64,
-    /// `n_eff·ln(R̂/σ) − Δcharge` — the net evidence for the circle.
+    /// `n_eff·½·ln(3R̂²/(π²σ²)) − Δcharge` — the net evidence for the circle.
     pub net_evidence_nats: f64,
     /// True ⇒ recommend submitting the `CircleSeed` to the race.
     pub recommend_curl: bool,
@@ -121,9 +129,11 @@ fn radius_law(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> Result<RadiusLaw
     }
     let kappa = m4 / (m2 * m2);
     // Delta-method SE of κ̂ = m̂₄/m̂₂² from the joint variance of (m̂₂, m̂₄):
-    // grad = (−2 m₄/m₂³, 1/m₂²). Var(m̂₂)=(E[r⁴]−m₂²)/n, Var(m̂₄)=(E[r⁸]−m₄²)/n,
-    // Cov=(E[r⁶]−m₂m₄)/n. We fold E[r⁶] into the two we have via Cauchy proxy is
-    // unnecessary — accumulate it directly.
+    // grad = (−2 m₄/m₂³, 1/m₂²), Var(m̂₂) = (E[r⁴]−m₂²)/n, Var(m̂₄) = (E[r⁸]−m₄²)/n,
+    // Cov(m̂₂, m̂₄) = (E[r⁶]−m₂·m₄)/n. The E[r⁶] cross moment is accumulated
+    // directly (no proxy) — keeping the covariance term is what makes this SE
+    // exact to first order (the pair screen's ratio SE cancels the analogous
+    // denominator fluctuation; see `pair_kappa`).
     let mut m6 = 0.0_f64;
     for i in 0..n {
         let r2 = alpha[i] * alpha[i] + beta[i] * beta[i];
@@ -169,7 +179,7 @@ fn circular_resultants(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> (f64, f
 /// `n_eff = Σ a²` the pattern's effective occupancy (NOT the raw row count),
 /// `delta_charge` the module-4 charge at that occupancy. The recommendation is a
 /// conjunction: κ resolvably below the Gaussian-fill value 2 (2σ), the RD screen
-/// paying (`R̂ > σ·√3/π` and net evidence positive), full angular coverage
+/// paying (`R̂ > σ·π/√3` and net evidence positive), full angular coverage
 /// (`R₁` small), and no diameter degeneracy (`R₂` not saturated).
 pub fn curl_verdict(
     alpha: ArrayView1<f64>,
@@ -184,7 +194,14 @@ pub fn curl_verdict(
     let law = radius_law(alpha, beta)?;
     let (resultant1, resultant2) = circular_resultants(alpha, beta);
     let radius = law.m2.sqrt();
-    let gain_nats_per_row = (radius / sigma).ln();
+    // Per-row circle coding gain ½·ln(3R̂²/(π²σ²)) — the exact Theorem-3 circle
+    // gain of `description_length::circle_coding_gain_bits`, in nats (bits·ln 2).
+    // Equivalently ln(R̂/σ) − ln(π/√3): the shape constant −0.5954… is what makes
+    // the gain vanish exactly at the RD_CROSSOVER_FACTOR radius, not at R̂ = σ.
+    let gain_nats_per_row = {
+        use std::f64::consts::PI;
+        0.5 * (3.0 * radius * radius / (PI * PI * sigma * sigma)).ln()
+    };
     let net_evidence_nats = n_eff * gain_nats_per_row - delta_charge;
     let z_below_gaussian = if law.kappa_se > 0.0 {
         (2.0 - law.kappa) / law.kappa_se

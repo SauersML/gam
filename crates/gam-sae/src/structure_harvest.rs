@@ -2590,7 +2590,7 @@ struct CurlCandidate {
     members: Vec<usize>,
     /// The race-ready periodic circle seed (`BirthSeed::Circle`).
     seed: BirthSeed,
-    /// `n_eff·ln(R̂/σ) − Δcharge` — the ranking score (NOT a decision).
+    /// `n_eff·½·ln(3R̂²/(π²σ²)) − Δcharge` — the ranking score (NOT a decision).
     net_evidence: f64,
 }
 
@@ -2725,7 +2725,8 @@ fn curl_candidates(
 
     // Ambient noise scale for the RD screen: RMS reconstruction residual, floored
     // off zero (a perfectly-shattered circle leaves ~no residual, which is
-    // exactly why it was invisible — the floor keeps ln(R̂/σ) finite and large).
+    // exactly why it was invisible — the floor keeps the per-row coding gain
+    // ½·ln(3R̂²/(π²σ²)) finite and large).
     let mut sse = 0.0_f64;
     let mut cnt = 0usize;
     for r in 0..residuals.nrows() {
@@ -2856,6 +2857,11 @@ fn curl_candidates(
         // Lift the co-firing phases + own-presence gate to the full row set.
         let mut phase_coords = Array2::<f64>::zeros((n, 1));
         let mut gate = vec![f64::NEG_INFINITY; n];
+        // Own-presence gate logit: the per-row coding gain ½·ln(3R̂²/(π²σ²)),
+        // floored at 0.5 nats so a barely-paying circle still opens its gate for
+        // the race to adjudicate. The gain carries the circle shape constant
+        // −ln(π/√3) ≈ −0.595 nats/row, so the floor binds for R̂ ≲ 3.3σ (the
+        // radius where the gain reaches 0.5).
         let own = verdict.gain_nats_per_row.max(0.5);
         for (idx, &r) in co_fire.iter().enumerate() {
             phase_coords[[r, 0]] = seed_circle.theta_turns[idx];
