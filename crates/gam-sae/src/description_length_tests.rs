@@ -107,7 +107,8 @@ fn matched_dl_planted_circle_gives_closed_form_bit_count() {
 
     let ses = vec![se; f];
     let ev = 0.4;
-    let dl = matched_dl(columns, p, l_param, &ses, ev);
+    // A circle chart transmits ONE phase coordinate per firing.
+    let dl = matched_dl(columns, 1, p, l_param, &ses, ev);
 
     let expected_param = 7.0 * 64.0 * 4.0;
     let expected_coding = f as f64 * (-0.5 * (12.0 * se * se).log2());
@@ -130,11 +131,12 @@ fn matched_dl_planted_circle_gives_closed_form_bit_count() {
     assert_eq!(dl.n_firings, f as i64);
     assert!((dl.dl_per_ev - expected_total / ev).abs() < 1e-6);
 
-    // Matched-DL delta vs the flat / line atom (1 column, amplitude bits at the same
-    // SE rule): the curved chart pays 2H extra columns of parameter charge but codes
-    // the SAME per-firing bits, so at large p the flat atom is the shorter code here
-    // (delta < 0 — the honest "curvature doesn't pay at these firings" verdict).
-    let flat = matched_dl(1, p, l_param, &ses, ev);
+    // Matched-DL delta vs the flat / line atom (1 column, 1 amplitude per firing at
+    // the same SE rule): both arms transmit ONE scalar per firing so the coding
+    // bits cancel, and the curved chart pays 2H extra columns of parameter charge —
+    // at large p the flat atom is the shorter code here (delta < 0 — the honest
+    // "curvature doesn't pay at these firings" verdict).
+    let flat = matched_dl(1, 1, p, l_param, &ses, ev);
     let delta = matched_dl_delta(&flat, &dl);
     let expected_delta = flat.total_dl_bits - dl.total_dl_bits;
     assert!((delta - expected_delta).abs() < 1e-9);
@@ -143,6 +145,28 @@ fn matched_dl_planted_circle_gives_closed_form_bit_count() {
         "delta must be the pure param-column difference (coding bits cancel): {delta}"
     );
     assert!(delta < 0.0, "flat cheaper than a 7-column chart at equal firings");
+
+    // The code-economy axis: a b=4 flat BLOCK transmits 4 coefficients per firing
+    // where the chart transmits 1, so the block pays 3·Σ bits(SE) extra coding
+    // bits — enough firings and the chart wins on code economy alone even against
+    // a cheaper dictionary.
+    let block = matched_dl(4, 4, p, l_param, &ses, ev);
+    let per_firing_bits = -0.5 * (12.0 * se * se).log2();
+    assert!(
+        (block.coding_bits - 4.0 * f as f64 * per_firing_bits).abs() < 1e-6,
+        "block codes 4 scalars per firing: {}",
+        block.coding_bits
+    );
+    let economy_delta = matched_dl_delta(&block, &dl);
+    let expected_economy = (4.0 - 7.0) * 64.0 * 4.0 + 3.0 * f as f64 * per_firing_bits;
+    assert!(
+        (economy_delta - expected_economy).abs() < 1e-6,
+        "delta = param-column difference + per-firing economy: {economy_delta} vs {expected_economy}"
+    );
+    assert!(
+        economy_delta > 0.0,
+        "at 250 firings the chart's per-firing economy beats its extra columns"
+    );
 }
 
 #[test]

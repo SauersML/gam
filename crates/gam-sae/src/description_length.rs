@@ -587,7 +587,12 @@ pub struct MatchedDl {
     pub l_param_bits: f64,
     /// Parameter-column charge `C·p·l_param` (bits).
     pub param_bits: f64,
-    /// Summed per-firing coordinate coding bits `Σ_i bits(SE_i)`.
+    /// Coordinates transmitted PER FIRING: `d_atom` for a chart (1 for a circle),
+    /// `block_size` for a flat block that codes every coefficient. This is the
+    /// code-economy axis — at matched per-scalar distortion, a chart spanning the
+    /// same subspace as a b-dim block saves `(b − d)` coded scalars per firing.
+    pub coords_per_firing: i64,
+    /// Summed per-firing coordinate coding bits `coords_per_firing · Σ_i bits(SE_i)`.
     pub coding_bits: f64,
     /// Number of firings coded.
     pub n_firings: i64,
@@ -602,21 +607,32 @@ pub struct MatchedDl {
 /// Assemble the matched description length of a chart / atom from its column count,
 /// ambient dim, per-scalar precision, per-firing coordinate SEs, and achieved EV.
 ///
-/// `coded_columns` is `2H+1` for a circle chart ([`circle_chart_columns`]) or `1`
-/// for a flat / line atom. `per_firing_se` are the delta-method coordinate SEs
-/// (`σ/(2π‖z‖)`), one per firing; each is coded at [`se_resolution_bits`]. The
-/// total is `coded_columns·ambient_p·l_param_bits + Σ_i se_resolution_bits(SE_i)`.
+/// `coded_columns` is `2H+1` for a circle chart ([`circle_chart_columns`]) or the
+/// column count of a flat block. `coords_per_firing` is how many coordinates each
+/// FIRING transmits — `d_atom` for a chart (1 for a circle's phase), `block_size`
+/// for a flat block coding every coefficient: at matched per-scalar distortion the
+/// per-firing bits are `coords_per_firing · se_resolution_bits(SE_i)`, so the
+/// chart's code economy (fewer transmitted scalars per firing) is priced, not
+/// erased. `per_firing_se` are the delta-method coordinate SEs (`σ/(2π‖z‖)`), one
+/// per firing. The total is `coded_columns·ambient_p·l_param_bits +
+/// coords_per_firing·Σ_i se_resolution_bits(SE_i)`.
 pub fn matched_dl(
     coded_columns: i64,
+    coords_per_firing: i64,
     ambient_p: i64,
     l_param_bits: f64,
     per_firing_se: &[f64],
     ev: f64,
 ) -> MatchedDl {
     let coded_columns = coded_columns.max(0);
+    let coords_per_firing = coords_per_firing.max(0);
     let ambient_p = ambient_p.max(0);
     let param_bits = coded_columns as f64 * ambient_p as f64 * l_param_bits.max(0.0);
-    let coding_bits: f64 = per_firing_se.iter().map(|&se| se_resolution_bits(se)).sum();
+    let coding_bits: f64 = coords_per_firing as f64
+        * per_firing_se
+            .iter()
+            .map(|&se| se_resolution_bits(se))
+            .sum::<f64>();
     let total = param_bits + coding_bits;
     let dl_per_ev = if ev > 0.0 { total / ev } else { f64::INFINITY };
     MatchedDl {
@@ -624,6 +640,7 @@ pub fn matched_dl(
         ambient_p,
         l_param_bits,
         param_bits,
+        coords_per_firing,
         coding_bits,
         n_firings: per_firing_se.len() as i64,
         total_dl_bits: total,

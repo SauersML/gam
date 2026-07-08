@@ -477,12 +477,14 @@ pub fn block_sparse_dictionary_seed_manifest(
 ///
 /// Per firing, the radial scatter noise `σ̂` (unbiased SD of the firing radii `‖z‖`)
 /// and radius give the coordinate SE `σ̂/(2π‖z‖)`
-/// ([`super::coordinate::phase_coordinate_se`]); each is coded at the uniform-
-/// quantization rule [`crate::description_length::se_resolution_bits`]. Both
-/// featurizers charge the SAME per-firing coding bits (matched distortion) — the
-/// difference is the parameter-column charge: `block_size` columns for the flat
-/// block, `n_basis_chart` for the circle chart, each `p` ambient scalars at the
-/// distortion-matched per-scalar precision (the mean per-firing coding rate).
+/// ([`super::coordinate::phase_coordinate_se`]); each transmitted scalar is coded
+/// at the uniform-quantization rule
+/// [`crate::description_length::se_resolution_bits`] — the SAME per-scalar rate
+/// on both arms (matched distortion). The arms differ in BOTH ledgers: per firing
+/// the flat block transmits `block_size` coefficients where the circle chart
+/// transmits one phase coordinate (the code-economy axis), and per dictionary the
+/// column charge is `block_size` vs `n_basis_chart` columns of `p` ambient
+/// scalars at the distortion-matched per-scalar precision.
 fn matched_dl_for_block(
     firing_coords: &Array2<f32>,
     config: &BlockSeedManifestConfig,
@@ -518,9 +520,22 @@ fn matched_dl_for_block(
     } else {
         ses.iter().map(|&se| se_resolution_bits(se)).sum::<f64>() / ses.len() as f64
     };
-    let flat = matched_dl(config.block_size as i64, ambient_p as i64, l_param_bits, &ses, ev);
+    // Per-firing multiplicity is where the code economy lives: the flat block
+    // transmits every one of its `block_size` coefficients per firing, the circle
+    // chart transmits ONE phase coordinate — both at the same per-scalar
+    // resolution (matched distortion), so the chart saves `block_size − 1` coded
+    // scalars per firing before the parameter-column charge is even compared.
+    let flat = matched_dl(
+        config.block_size as i64,
+        config.block_size as i64,
+        ambient_p as i64,
+        l_param_bits,
+        &ses,
+        ev,
+    );
     let chart = matched_dl(
         config.n_basis_chart as i64,
+        1,
         ambient_p as i64,
         l_param_bits,
         &ses,
