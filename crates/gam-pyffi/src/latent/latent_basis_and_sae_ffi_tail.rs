@@ -972,9 +972,19 @@ fn sae_manifold_predict_oos<'py>(
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, false),
         "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
+        "topk" => {
+            let k_top = top_k.ok_or_else(|| {
+                py_value_error(
+                    "sae_manifold_predict_oos: assignment_kind 'topk' requires the top_k \
+                     argument (the fixed per-row support size)"
+                        .to_string(),
+                )
+            })?;
+            AssignmentMode::top_k_support(k_top)
+        }
         _ => {
             return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: assignment_kind must be one of 'softmax', 'ibp_map', or 'threshold_gate' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
+                "sae_manifold_predict_oos: assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
             )));
         }
     };
@@ -1848,9 +1858,19 @@ fn sae_steer_delta<'py>(
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, false),
         "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
+        "topk" => {
+            // The steer entry carries no support-size argument yet; the fixed
+            // support must come from the SAVED fit's metadata, not a guess.
+            // Typed refusal until the steer signature grows the parameter.
+            return Err(py_value_error(
+                "sae_steer_delta: assignment_kind 'topk' is not routed through the steer \
+                 entry yet — steering a topk fit needs its saved support size"
+                    .to_string(),
+            ));
+        }
         _ => {
             return Err(py_value_error(format!(
-                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', or 'threshold_gate' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
+                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
             )));
         }
     };

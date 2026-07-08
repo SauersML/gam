@@ -1710,9 +1710,13 @@ fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
         // Primary spelling and the retained legacy alias both collapse to the
         // renamed variant's canonical token.
         "threshold_gate" | "jumprelu" => Ok("threshold_gate".to_string()),
+        // Sparsity by construction: hard top-k support, no sparsity penalty, no
+        // gate coordinates in the inner system. The support size is the fit's
+        // `top_k` argument (required for this mode).
+        "topk" => Ok("topk".to_string()),
         other => Err(format!(
-            "assignment_kind must be one of 'softmax', 'ibp_map', or 'threshold_gate' \
-             (legacy alias 'jumprelu' also accepted); got {other:?}"
+            "assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', \
+             or 'topk' (legacy alias 'jumprelu' also accepted); got {other:?}"
         )),
     }
 }
@@ -2734,10 +2738,20 @@ fn sae_manifold_fit_stagewise<'py>(
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
         "threshold_gate" => AssignmentMode::threshold_gate(tau, 0.0),
+        "topk" => {
+            // The stagewise entry carries no per-row support-size argument yet;
+            // routing 'topk' through it silently would guess k. Typed refusal
+            // until the stagewise signature grows the support parameter.
+            return Err(py_value_error(
+                "sae_manifold_fit_stagewise: assignment_kind 'topk' is not routed through \
+                 the stagewise entry yet — use sae_manifold_fit (joint) with top_k set"
+                    .to_string(),
+            ));
+        }
         other => {
             return Err(py_value_error(format!(
-                "sae_manifold_fit_stagewise: assignment_kind must be softmax/ibp_map/threshold_gate; \
-                 got {other}"
+                "sae_manifold_fit_stagewise: assignment_kind must be \
+                 softmax/ibp_map/threshold_gate/topk; got {other}"
             )));
         }
     };
@@ -3279,10 +3293,22 @@ fn sae_manifold_fit_inner<'py>(
         // (`canonicalize_assignment_kind`), so the legacy "jumprelu" alias arrives
         // here as "threshold_gate".
         "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
+        // Hard top-k support: sparsity by construction (no penalty, no gate
+        // coordinates). The fit's `top_k` argument IS the support size.
+        "topk" => {
+            let k_top = top_k.ok_or_else(|| {
+                py_value_error(
+                    "sae_manifold_fit: assignment_kind 'topk' requires the top_k argument \
+                     (the fixed per-row support size)"
+                        .to_string(),
+                )
+            })?;
+            AssignmentMode::top_k_support(k_top)
+        }
         _ => {
             return Err(py_value_error(format!(
-                "assignment_kind must be one of 'softmax', 'ibp_map', or 'threshold_gate' \
-                 (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
+                "assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or \
+                 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
             )));
         }
     };
