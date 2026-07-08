@@ -13,7 +13,11 @@
         "Tue",
         "Wed"
       ],
-      "calendar_cyclic": true
+      "calendar_cyclic": true,
+      "wrap_steps": 1.5798457137403266,
+      "wrap_perm_p": 0.1894405279736013,
+      "ring_closed": false,
+      "topology": "open_arc"
     }
   },
   "L17": {
@@ -30,7 +34,11 @@
         "Tue",
         "Wed"
       ],
-      "calendar_cyclic": true
+      "calendar_cyclic": true,
+      "wrap_steps": 1.592845933921373,
+      "wrap_perm_p": 0.17994100294985252,
+      "ring_closed": false,
+      "topology": "open_arc"
     },
     "code": {
       "ring_corr": 0.46936963679891525,
@@ -46,7 +54,11 @@
         "Mon"
       ],
       "calendar_cyclic": false,
-      "recon_ev": 0.25680940066528113
+      "recon_ev": 0.25680940066528113,
+      "wrap_steps": 0.871617317199707,
+      "wrap_perm_p": 0.5947202639868007,
+      "ring_closed": true,
+      "topology": "not_cyclic"
     }
   },
   "L23": {
@@ -63,7 +75,11 @@
         "Mon",
         "Tue"
       ],
-      "calendar_cyclic": true
+      "calendar_cyclic": true,
+      "wrap_steps": 1.1915647899772002,
+      "wrap_perm_p": 0.38413079346032697,
+      "ring_closed": true,
+      "topology": "closed_ring"
     }
   }
 }

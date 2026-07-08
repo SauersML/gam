@@ -57,6 +57,39 @@ def plane_and_proj(cent, tokens):
         return False
     return cproj, tproj, var2, [WD[i] for i in order], bool(is_cal(order))
 
+def closure_stats(cproj, n_perm=20000, seed=0):
+    """Wrap-closure test: does the calendar cycle CLOSE, or is it an open arc?
+
+    ring_corr + calendar-order recovery only establish that the 7 days are cyclically
+    *ordered* (adjacent-close, opposite-far) — a monotone 1-D arc satisfies that too.
+    A closed ring additionally requires the Sun->Mon calendar-wrap edge to be a
+    *typical* inter-day step, not the arc's missing chord.
+
+    Statistic (in the top-2 plane the circle is claimed to live in): walk the 7
+    centroids in calendar order and measure each successive ANGULAR step about the
+    plane centroid; the closing wrap step |Sun->Mon| is reported in units of the
+    median interior step:  wrap_steps = |Delta_ang(Sun,Mon)| / median(|Delta_ang| over the 6 interior edges).
+
+    Decision is the 7-fold-symmetry quantum, NOT a data-tuned threshold: one day-slot
+    of the circle subtends one median step, so a closed ring has wrap_steps ~= 1 while
+    skipping a whole empty day-slot costs >= 2. The boundary is the midpoint 1.5 —
+    ring_closed iff the wrap step ROUNDS to a single-day closure (wrap_steps < 1.5).
+    Also returns the label-permutation probability that a random day<->centroid
+    assignment gives a wrap edge at least this long (small => the calendar wrap is an
+    anomalously long outlier edge => open arc), mirroring the ring_corr perm null."""
+    def wrap_steps(C2):
+        c = C2 - C2.mean(0)
+        ang = np.arctan2(c[:,1], c[:,0])
+        # principal-value angular step to the next calendar day (direction-robust)
+        step = np.abs(np.array([np.angle(np.exp(1j*(ang[(i+1)%7]-ang[i]))) for i in range(7)]))
+        m = np.median(step[:6])
+        return float('inf') if m < 1e-12 else float(step[6]/m)   # step[6] = Sun->Mon wrap
+    obs = wrap_steps(cproj)
+    rng = np.random.default_rng(seed); ge = 1
+    for _ in range(n_perm):
+        if wrap_steps(cproj[rng.permutation(7)]) >= obs: ge += 1
+    return obs, ge/(n_perm+1), bool(obs < 1.5)
+
 def centroids(V, labels):
     return np.stack([V[labels==w].mean(0) for w in range(7)])
 
@@ -90,12 +123,18 @@ def main():
         cent = centroids(acts, labels)
         corr,p = ring_stats(cent)
         cproj,tproj,var2,order,iscal = plane_and_proj(cent, acts)
+        wsteps,pclose,closed = closure_stats(cproj)
+        topo = "closed_ring" if (iscal and closed) else "open_arc" if iscal else "not_cyclic"
         print(f" RAW : ring_corr={corr:+.3f} perm_p={p:.4f} top2Dvar={var2:.3f} "
-              f"order={'-'.join(order)} calendar_cyclic={iscal}", flush=True)
+              f"order={'-'.join(order)} calendar_cyclic={iscal} "
+              f"wrap_steps={wsteps:.2f} wrap_p={pclose:.4f} ring_closed={closed} "
+              f"topology={topo}", flush=True)
         dump[f"L{L}_raw_token2d"]=tproj; dump[f"L{L}_raw_centroid2d"]=cproj
         dump[f"L{L}_raw_token_angle"]=np.arctan2(tproj[:,1],tproj[:,0])
         srec={"raw":{"ring_corr":corr,"perm_p":p,"top2D_var":var2,
-                     "angular_order":order,"calendar_cyclic":iscal}}
+                     "angular_order":order,"calendar_cyclic":iscal,
+                     "wrap_steps":wsteps,"wrap_perm_p":pclose,"ring_closed":closed,
+                     "topology":topo}}
         # CODE (if dict exists)
         dpath,t0path = DICTS[L]
         if os.path.exists(dpath) and os.path.exists(t0path):
@@ -109,11 +148,17 @@ def main():
             ccent=centroids(codes,labels)
             ccorr,cp=ring_stats(ccent)
             ccproj,ctproj,cvar2,corder,ciscal=plane_and_proj(ccent,codes)
+            cwsteps,cpclose,cclosed=closure_stats(ccproj)
+            ctopo="closed_ring" if (ciscal and cclosed) else "open_arc" if ciscal else "not_cyclic"
             print(f" CODE: ring_corr={ccorr:+.3f} perm_p={cp:.4f} top2Dvar={cvar2:.3f} "
-                  f"order={'-'.join(corder)} calendar_cyclic={ciscal}  recon_EV={ev:.3f}", flush=True)
+                  f"order={'-'.join(corder)} calendar_cyclic={ciscal} "
+                  f"wrap_steps={cwsteps:.2f} wrap_p={cpclose:.4f} ring_closed={cclosed} "
+                  f"topology={ctopo}  recon_EV={ev:.3f}", flush=True)
             dump[f"L{L}_code_token2d"]=ctproj; dump[f"L{L}_code_centroid2d"]=ccproj
             srec["code"]={"ring_corr":ccorr,"perm_p":cp,"top2D_var":cvar2,
-                          "angular_order":corder,"calendar_cyclic":ciscal,"recon_ev":ev}
+                          "angular_order":corder,"calendar_cyclic":ciscal,
+                          "wrap_steps":cwsteps,"wrap_perm_p":cpclose,"ring_closed":cclosed,
+                          "topology":ctopo,"recon_ev":ev}
         else:
             print(f" CODE: dict not ready ({dpath})", flush=True)
         summary[f"L{L}"]=srec
