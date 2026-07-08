@@ -173,25 +173,60 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
         .run(&mut objective, "SAE euclidean K=2 terminates (#1094)")
         .expect("outer cascade must complete on a K=2 euclidean fit");
     let elapsed = t0.elapsed().as_secs_f64();
-    let fitted_term = objective.into_fitted().term;
-    let fitted = fitted_term.fitted();
-    let r2 = reconstruction_r2(&fitted, &z);
+    let fitted = objective.into_fitted();
+    let mut fitted_term = fitted.term;
+    let fitted_out = fitted_term.fitted();
+    let r2 = reconstruction_r2(&fitted_out, &z);
+    // #1094 residual — evaluate the OUTER criterion DIRECTLY at the converged
+    // optimum, on the fit's own settled ρ, through the same public
+    // `reml_criterion` path the outer cascade uses. The residual bug was the
+    // criterion refusing a feasible euclidean K=2 fit to the infeasible sentinel
+    // (`1e12`): at the rank-deficient optimum the KKT gradient parks in the
+    // weakly-identified decoder/gauge directions, so no stationarity certificate
+    // fires even though the penalised objective is at its numerical floor, and the
+    // driver returned the "did not converge" refusal instead of ranking the finite
+    // deflated Laplace evidence. This recheck pins the criterion PATH itself — not
+    // just the optimizer's reported bookkeeping value — returning a FINITE score
+    // for a fit that reconstructs the two planted lines. A criterion that reports
+    // infeasible for a demonstrably good fit poisons outer model comparison.
+    let (recheck_cost, _loss) = fitted_term
+        .reml_criterion(
+            z.view(),
+            &fitted.rho,
+            None,
+            INNER_MAX_ITER,
+            LEARNING_RATE,
+            RIDGE_EXT_COORD,
+            RIDGE_BETA,
+        )
+        .expect("outer criterion must EVALUATE (not error/refuse) at the converged K=2 optimum");
     println!(
-        "[#1094] euclidean K=2 fit: final_value={:.6e} recon_R2={:.6} elapsed={elapsed:.1}s",
-        result.final_value, r2
+        "[#1094] euclidean K=2 fit: final_value={:.6e} recheck_criterion={:.6e} recon_R2={:.6} elapsed={elapsed:.1}s",
+        result.final_value, recheck_cost, r2
     );
     assert!(
         elapsed < WALL_CLOCK_CEILING_SECS,
         "euclidean K=2 fit took {elapsed:.1}s > {WALL_CLOCK_CEILING_SECS:.0}s ceiling — \
          the multi-atom joint solve hangs (#1094)"
     );
+    // The fit reconstructs the two planted lines — a FEASIBLE fit by its own
+    // reconstruction certificate.
+    assert!(
+        r2 > 0.9,
+        "euclidean K=2 reconstruction R²={r2:.6} < 0.9 — the two lines were not recovered"
+    );
+    // Neither the optimizer's reported value NOR a fresh criterion evaluation at
+    // the converged ρ may land on the infeasible sentinel for this feasible fit:
+    // the criterion must be finite and consistent with the fit's quality (#1094).
     assert!(
         result.final_value.is_finite() && result.final_value < 1.0e11,
         "euclidean K=2 fit terminated at the infeasible sentinel (final_value={:.6e})",
         result.final_value
     );
     assert!(
-        r2 > 0.9,
-        "euclidean K=2 reconstruction R²={r2:.6} < 0.9 — the two lines were not recovered"
+        recheck_cost.is_finite() && recheck_cost < 1.0e11,
+        "euclidean K=2 outer criterion re-evaluated to the infeasible sentinel at the converged \
+         optimum (recheck_criterion={recheck_cost:.6e}) despite R²={r2:.6} — the criterion reports \
+         a demonstrably good fit as infeasible (#1094)"
     );
 }
