@@ -368,6 +368,27 @@ def _fit_ours_rust(
         random_state=seed,
     )
     fit_seconds = time.perf_counter() - t0
+
+    def _r2_of(x: np.ndarray, recon: np.ndarray) -> float:
+        ss_res = float(np.sum((x - recon) ** 2))
+        ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+        return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+    # Three-way state-vs-encoder discriminator:
+    #   native   -- fit.fitted, the terminal state's own train reconstruction;
+    #   re-enc(train) -- converged_latents on the SAME train rows (re-encode);
+    #   re-enc(test)  -- the held-out encode the arena scores.
+    # native >> re-enc(train) localizes the loss to the OOS ENCODE path itself
+    # (row re-encoding, not data novelty); re-enc(train) >> re-enc(test) is a
+    # genuine generalization gap.
+    native_train_r2 = _r2_of(train_x, np.asarray(fit.fitted, dtype=float))
+    train_payload = fit.converged_latents(train_x)
+    reenc_train_r2 = _r2_of(train_x, np.asarray(train_payload["fitted"], dtype=float))
+    print(
+        f"[ours_rust] native train r2 {native_train_r2:.4f} | "
+        f"re-encode(train) r2 {reenc_train_r2:.4f}",
+        flush=True,
+    )
     payload = fit.converged_latents(test_x)
     assignments = np.asarray(payload["assignments"], dtype=float)
     recon = np.asarray(payload["fitted"], dtype=float)
