@@ -11,6 +11,8 @@ mod jet_gamma_oracle_tests;
 #[cfg(test)]
 mod jet_gaulss_link_oracle_tests;
 #[cfg(test)]
+mod jet_cause_specific_oracle_tests;
+#[cfg(test)]
 mod jet_gaussian_oracle_tests;
 #[cfg(test)]
 mod jet_multinomial_oracle_tests;
