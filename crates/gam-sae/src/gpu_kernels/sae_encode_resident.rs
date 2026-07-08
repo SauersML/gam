@@ -697,9 +697,18 @@ fn certify_with_basin_warmup(
         if dnorm <= crate::encode::NEWTON_REFINE_CONVERGED_EPS * (1.0 + tnorm) {
             break;
         }
+        // Mirror production `refine_certified_start`'s in-chart soundness guard:
+        // `chart.lipschitz` is only valid inside the chart ball, so a refine
+        // iterate that leaves it would recompute `h` with an invalid `L` — refuse
+        // and flag, exactly as the warm-up step guard above.
+        let mut next = t.clone();
         for i in 0..dev.d {
-            t[i] += delta[i];
+            next[i] += delta[i];
         }
+        if !in_chart(&next, &chart.center, chart.radius) {
+            return None;
+        }
+        t = next;
         let (nc, nd) = row_certificate(dev, &t, x, amplitude, chart.lipschitz, scratch);
         if !nc.certified() {
             return None;
@@ -1076,7 +1085,12 @@ __device__ int certify_basin(const int* exps, const double* dec,
     double dnorm=0.0, tnorm=0.0;
     for(int i=0;i<DD;++i){ dnorm+=delta[i]*delta[i]; tnorm+=t[i]*t[i]; }
     if(sqrt(dnorm) <= REFINE_EPS*(1.0+sqrt(tnorm))) break;
-    for(int i=0;i<DD;++i) t[i]+=delta[i];
+    // in-chart soundness guard (mirror production refine_certified_start): L is
+    // only valid inside the chart ball; an out-of-ball iterate would recompute h
+    // with an invalid L, so refuse — exactly as the warm-up step guard above.
+    double rnext[DD]; for(int i=0;i<DD;++i) rnext[i]=t[i]+delta[i];
+    if(!in_chart(rnext, center, radius)) return 0;
+    for(int i=0;i<DD;++i) t[i]=rnext[i];
     row_certificate(exps, dec, t, x, amp, L, &h, &beta, &eta, delta);
     if(!(isfinite(h) && h<=KANTOROVICH)) return 0;
   }

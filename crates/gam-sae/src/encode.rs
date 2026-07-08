@@ -1288,6 +1288,8 @@ fn refine_certified_start(
     newton_steps: usize,
     initial_cert: RowCertificate,
     mut delta: Array1<f64>,
+    chart_center: ArrayView1<'_, f64>,
+    chart_radius: f64,
 ) -> Result<Option<CertifiedEncodeProbe>, String> {
     assert!(initial_cert.certified());
     let mut final_cert = initial_cert;
@@ -1300,7 +1302,21 @@ fn refine_certified_start(
         if delta.dot(&delta).sqrt() <= NEWTON_REFINE_CONVERGED_EPS * (1.0 + t.dot(&t).sqrt()) {
             break;
         }
-        t = &t + &delta;
+        let next = &t + &delta;
+        // SOUNDNESS GUARD — same containment rule as `certify_with_basin_warmup`:
+        // `lipschitz` is only a valid Hessian-Lipschitz bound inside this chart's
+        // ball for the chart-local families. A refine iterate that leaves the ball
+        // would have its certificate recomputed below with an `L` that no longer
+        // bounds the true geometry there, so `h ≤ ½` would NOT imply Kantorovich
+        // convergence — and the in-hand certificate at the previous iterate is
+        // itself suspect (its guarantee needs `L` valid on the Newton sequence's
+        // ball, part of which now lies outside the chart). Refuse and flag for the
+        // exact fallback, exactly as the warm-up does. Wrap-aware distance, so
+        // periodic-seam iterates are measured in the true manifold geometry.
+        if latent_coordinate_distance(atom, next.view(), chart_center) > chart_radius {
+            return Ok(None);
+        }
+        t = next;
         let (cert, next_delta) =
             row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz)?;
         if !cert.certified() {
@@ -1517,6 +1533,8 @@ fn certify_with_basin_warmup(
         newton_steps,
         cert,
         delta,
+        chart_center,
+        chart_radius,
     )
 }
 
