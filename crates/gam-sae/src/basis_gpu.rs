@@ -162,15 +162,20 @@ extern "C" __global__ void sae_periodic_basis_with_jet(
 pub use device::sae_periodic_basis_with_jet_device;
 
 /// Non-Linux hosts have no CUDA driver; the torch bridge falls back to the
-/// CPU `basis_with_jet` path on the typed refusal.
+/// CPU `basis_with_jet` path on the typed refusal, which echoes the request so
+/// a misrouted call is diagnosable from the message alone.
 #[cfg(not(target_os = "linux"))]
 pub fn sae_periodic_basis_with_jet_device(
-    _ordinal: usize,
-    _t_dev_ptr: u64,
-    _n: usize,
-    _num_harmonics: usize,
-    _phi_dev_ptr: u64,
-    _jet_dev_ptr: u64,
+    ordinal: usize,
+    t_dev_ptr: u64,
+    n: usize,
+    num_harmonics: usize,
+    phi_dev_ptr: u64,
+    jet_dev_ptr: u64,
 ) -> Result<(), String> {
-    Err("sae_periodic_basis_with_jet_device: CUDA path is Linux-only".to_string())
+    Err(format!(
+        "sae_periodic_basis_with_jet_device: CUDA path is Linux-only (requested \
+         ordinal {ordinal}, n {n}, H {num_harmonics}, t@0x{t_dev_ptr:x}, \
+         phi@0x{phi_dev_ptr:x}, jet@0x{jet_dev_ptr:x})"
+    ))
 }
