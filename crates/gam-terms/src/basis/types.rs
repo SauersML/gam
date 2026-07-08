@@ -454,6 +454,68 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
+/// mgcv-parity STARTING center count for saturation-escalation (#1689).
+///
+/// Rather than provisioning [`default_num_centers`] up-front (≈134 at n=800, d=2)
+/// and paying `O(n·k² + k³)` for the worst case on every fit, a spatial smooth is
+/// first fit at this modest count and grows [`escalated_num_centers`] ONLY when
+/// its own fitted evidence says the basis is saturated ([`basis_is_saturated`]).
+/// The start is mgcv's thin-plate/Duchon default `k = 10·3^(d−1)` (30 in 2-D) —
+/// the SAME quantity `default_duchon_center_count` already uses as its implicit
+/// low-rank cap, not a new constant — clamped so it never exceeds the ceiling on
+/// small `n` (where `default_num_centers` is already below 30).
+pub fn starting_num_centers(n: usize, d: usize) -> usize {
+    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
+    mgcv_default.min(default_num_centers(n, d)).max(1)
+}
+
+/// Center count at escalation `level` (0 = [`starting_num_centers`]) for #1689.
+///
+/// Geometric doubling from the start, capped at the [`default_num_centers`]
+/// ceiling. The ceiling is TODAY's provisioned count, so a fully-saturated fit
+/// escalates back to exactly the current basis size — making the current
+/// accuracy the fixed point for wiggly truths (no quality loss), while smooth
+/// truths stop at a small `level` and never pay for the dense basis. Because each
+/// step at most doubles, the number of escalations before hitting the ceiling is
+/// bounded by `⌈log₂(ceiling / start)⌉` (≈1–2 in the n≈800 regime).
+pub fn escalated_num_centers(n: usize, d: usize, level: u32) -> usize {
+    let ceiling = default_num_centers(n, d);
+    let start = starting_num_centers(n, d);
+    let grown = start.saturating_mul(2usize.saturating_pow(level.min(32)));
+    grown.min(ceiling).max(1)
+}
+
+/// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
+/// the data wants more resolution than the current `num_centers` provides (#1689)?
+///
+/// The penalizable capacity is `num_centers − nullspace_dim`: the unpenalized
+/// polynomial null space is always fully used, so it is excluded from the "is the
+/// PENALIZED part maxed out?" test. The effective degrees of freedom `edf` of the
+/// penalized block rises toward that capacity exactly as REML drives the penalty
+/// λ toward its floor to chase structure the basis cannot resolve. Saturated ⟺
+/// `edf ≥ capacity − ε`, with the margin `ε` DERIVED from the outer REML
+/// convergence tolerance (`ε = capacity · outer_tol`, floored at `outer_tol` so a
+/// tiny-capacity block still has a positive margin) rather than a tuned knob:
+/// escalation only fires when the fit has converged with edf pinned within outer
+/// tolerance of the ceiling. Non-positive capacity (a block whose null space
+/// already exhausts its columns) is never saturated. The absolute scale of `ε`
+/// is what the MSI truth-recovery sweep (sin8/kappa/large_scale + #1074)
+/// validates — the criterion SHAPE (edf-vs-capacity, nullspace excluded, tol-tied
+/// margin) is the load-bearing contract this function pins.
+pub fn basis_is_saturated(
+    edf: f64,
+    num_centers: usize,
+    nullspace_dim: usize,
+    outer_tol: f64,
+) -> bool {
+    let capacity = num_centers.saturating_sub(nullspace_dim) as f64;
+    if !(capacity > 0.0) || !edf.is_finite() {
+        return false;
+    }
+    let margin = (capacity * outer_tol).max(outer_tol);
+    edf >= capacity - margin
+}
+
 /// Resource-aware plan for a spatial smooth (Duchon / Matérn / TPS).
 ///
 /// Returned by [`plan_spatial_basis`]. Captures the resolved center count,
@@ -2157,4 +2219,84 @@ pub fn orthogonality_transform_for_design(
     }
     let (constraint_cross, gram) = design_cross_and_gram(design, constraint_matrix, weights)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
+}
+
+#[cfg(test)]
+mod saturation_escalation_tests {
+    use super::*;
+
+    #[test]
+    fn starting_count_is_mgcv_default_capped_by_ceiling() {
+        // Large n, d=2: mgcv default 10·3^1 = 30, well below the n=800 ceiling.
+        assert_eq!(starting_num_centers(800, 2), 30);
+        // The start never exceeds the default_num_centers ceiling on small n.
+        let small = starting_num_centers(40, 2);
+        assert!(small <= default_num_centers(40, 2));
+        assert!(small >= 1);
+        // d=1: mgcv default 10.
+        assert_eq!(starting_num_centers(100_000, 1), 10);
+    }
+
+    #[test]
+    fn escalation_doubles_then_pins_at_the_default_ceiling() {
+        let n = 800;
+        let d = 2;
+        let ceiling = default_num_centers(n, d);
+        let start = starting_num_centers(n, d);
+        assert_eq!(escalated_num_centers(n, d, 0), start);
+        // Each step at most doubles.
+        assert_eq!(escalated_num_centers(n, d, 1), (2 * start).min(ceiling));
+        // A high level saturates exactly at the ceiling — never past it, so the
+        // fully-escalated basis is byte-for-byte today's provisioned count.
+        assert_eq!(escalated_num_centers(n, d, 20), ceiling);
+        // Monotone non-decreasing in level.
+        let mut prev = 0;
+        for level in 0..8 {
+            let k = escalated_num_centers(n, d, level);
+            assert!(k >= prev);
+            assert!(k <= ceiling);
+            prev = k;
+        }
+    }
+
+    #[test]
+    fn saturation_excludes_the_nullspace_and_tracks_edf() {
+        let tol = 1e-4;
+        // edf pinned at the penalizable capacity (num_centers − nullspace) reads
+        // saturated; the null space (3 unpenalized polynomial columns in 2-D) is
+        // excluded from the capacity.
+        assert!(basis_is_saturated(97.0, 100, 3, tol));
+        // Half-used basis is NOT saturated.
+        assert!(!basis_is_saturated(48.5, 100, 3, tol));
+        // Just below capacity by more than the derived margin: not saturated.
+        assert!(!basis_is_saturated(90.0, 100, 3, tol));
+        // A block whose null space already exhausts its columns has no penalizable
+        // capacity and is never saturated.
+        assert!(!basis_is_saturated(3.0, 3, 3, tol));
+        assert!(!basis_is_saturated(f64::NAN, 100, 3, tol));
+    }
+
+    #[test]
+    fn saturation_is_monotone_in_edf() {
+        let tol = 1e-3;
+        let (k, null) = (60usize, 3usize);
+        let capacity = (k - null) as f64;
+        // Once saturated at some edf, any larger edf stays saturated.
+        let mut first_true: Option<f64> = None;
+        let mut e = capacity - 5.0;
+        while e <= capacity {
+            let sat = basis_is_saturated(e, k, null, tol);
+            if sat && first_true.is_none() {
+                first_true = Some(e);
+            }
+            if let Some(t) = first_true {
+                assert!(
+                    basis_is_saturated(e.max(t), k, null, tol),
+                    "saturation must not flip back to false as edf grows"
+                );
+            }
+            e += 0.25;
+        }
+        assert!(first_true.is_some(), "edf reaching capacity must saturate");
+    }
 }
