@@ -783,9 +783,21 @@ fn crossfit_evidence(
     let s2_lin = (linear_total / n as f64).max(s2_floor);
     let s2_chart = (chart_total / n as f64).max(s2_floor);
     let half_log_ratio = 0.5 * (s2_lin / s2_chart).ln();
+    // Each row residual `eᵢ = linear_loss[i]` is an SSE over the `q =
+    // coords.ncols()` coordinate channels, so the reconstruction is a
+    // q-DIMENSIONAL isotropic Gaussian, not a scalar one: its per-component MLE
+    // variance is `SSE/(n·q)` and the per-row NLL log-det term carries `q/2`, so
+    // the profiled per-row deviance is `q ×` the scalar half-log-ratio form. The
+    // ratio `s2_lin/s2_chart` is q-invariant, and `Σ eᵢ/(2 s2)` telescopes the
+    // same way, so the whole per-row deviance is exactly `q ×` the scalar
+    // expression → `Σ dᵢ = (n·q/2)·ln(SSE_lin/SSE_chart)`. Omitting `q` made
+    // curved evidence `q ×` too small against the q-scaled BIC charge below,
+    // structurally suppressing multi-coordinate charts.
+    let q = coords.ncols().max(1) as f64;
     let deviance: Vec<f64> = (0..n)
         .map(|i| {
-            half_log_ratio + linear_loss[i] / (2.0 * s2_lin) - chart_loss[i] / (2.0 * s2_chart)
+            q * (half_log_ratio + linear_loss[i] / (2.0 * s2_lin)
+                - chart_loss[i] / (2.0 * s2_chart))
         })
         .collect();
     let n_eff = autocorr_ess(&deviance);
@@ -793,9 +805,10 @@ fn crossfit_evidence(
     let se = newey_west_se(&deviance);
     let ci_low = mean_delta - 1.959963984540054 * se;
     let ci_high = mean_delta + 1.959963984540054 * se;
-    // Profiled held-out deviance gain in NATS: (n_eff/2)·ln(SSE_lin/SSE_chart)
-    // = n_eff · mean_delta. Uses the effective (autocorrelation-deflated) sample
-    // count so cross-fit fold correlation cannot inflate the evidence.
+    // Profiled held-out deviance gain in NATS: (n_eff·q/2)·ln(SSE_lin/SSE_chart)
+    // = n_eff · mean_delta (the q factor now lives in each dᵢ). Uses the
+    // effective (autocorrelation-deflated) sample count — scale- AND q-invariant
+    // for the ESS — so cross-fit fold correlation cannot inflate the evidence.
     let d_eff = (2 * coords.ncols()).max(1) as f64;
     let gain = n_eff.max(2.0) * mean_delta;
     let charge = 0.5 * d_eff * n_eff.max(2.0).ln();

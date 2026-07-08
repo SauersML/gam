@@ -90,6 +90,16 @@ impl SaeManifoldTerm {
         };
         let n = self.n_obs();
         let coord_offsets = self.assignment.coord_offsets();
+        // Horvitz–Thompson row weight, IDENTICAL to `ard_coord_sumsq`'s numerator
+        // weighting: the posterior-variance trace `tr H⁻¹` is the OTHER half of
+        // the `α ← n_eff / (Σ wᵢ t̂ᵢ² + Σ wᵢ (H⁻¹)ᵢᵢ)` MacKay/Fellner–Schall
+        // fixed point, so a retained row standing in for `wᵢ` rows must
+        // contribute its posterior variance `wᵢ` times too — else the α-step's
+        // denominator uses a different inclusion measure than its numerator and
+        // `n_eff`. Commit 4862e8355 weighted value/sumsq/gradient/curvature
+        // "together" but missed this trace channel. `None` ⇒ `wᵢ = 1`,
+        // bit-for-bit the historical unweighted sum.
+        let row_w = self.row_loss_weights.as_deref();
         let mut traces: Vec<Array1<f64>> = self
             .assignment
             .coords
@@ -98,6 +108,7 @@ impl SaeManifoldTerm {
             .collect();
         for row in 0..n {
             let row_base = cache.row_offsets[row];
+            let w_row = row_w.map_or(1.0, |w| w[row]);
             match self.last_row_layout {
                 Some(ref layout) => {
                     let active = &layout.active_atoms[row];
@@ -106,7 +117,7 @@ impl SaeManifoldTerm {
                         let d = self.assignment.coords[k].latent_dim();
                         let block_start = starts[pos];
                         for axis in 0..d {
-                            traces[k][axis] += inv_diag[row_base + block_start + axis];
+                            traces[k][axis] += w_row * inv_diag[row_base + block_start + axis];
                         }
                     }
                 }
@@ -115,7 +126,7 @@ impl SaeManifoldTerm {
                         let d = self.assignment.coords[k].latent_dim();
                         let block_start = coord_offsets[k];
                         for axis in 0..d {
-                            traces[k][axis] += inv_diag[row_base + block_start + axis];
+                            traces[k][axis] += w_row * inv_diag[row_base + block_start + axis];
                         }
                     }
                 }
