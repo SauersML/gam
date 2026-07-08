@@ -308,6 +308,49 @@ fn farthest_point_subsample_weighted(
     chosen
 }
 
+/// Landmark weights carrying the FULL support measure after a farthest-point
+/// subsample.
+///
+/// # Math correction (P2): distance-to-measure is a property of the WHOLE measure
+///
+/// The farthest-point subsample keeps only the `landmarks` rows. Taking the
+/// landmark masses as `w[landmark]` alone DISCARDS the mass of every dropped row,
+/// so the distance-to-measure weighting — which normalises by the total mass
+/// (`target_mass = Σ w / m` inside [`dtm_radii`]) — is then evaluated on a
+/// truncated measure and the DTM radii are biased low. The empirical
+/// distance-to-measure is defined on the *entire* sample, not on the retained
+/// landmarks. We therefore push the measure forward onto the cover: each row folds
+/// its mass into its nearest retained landmark (a single-pass nearest-landmark
+/// accumulation), so `Σ folded == Σ w` exactly and the DTM is computed on the full
+/// measure. When nothing is discarded (`target ≥ n`), every row is its own nearest
+/// landmark and this reduces to the identity `folded[k] = w[k]`.
+fn fold_mass_to_landmarks(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    landmarks: &[usize],
+) -> Array1<f64> {
+    let mut folded = Array1::<f64>::zeros(landmarks.len());
+    for r in 0..points.nrows() {
+        let mut nearest = 0usize;
+        let mut nearest_dist = f64::INFINITY;
+        for (li, &l) in landmarks.iter().enumerate() {
+            let d = point_distance(points, r, l);
+            if d < nearest_dist {
+                nearest_dist = d;
+                nearest = li;
+            }
+        }
+        let mass = match weights {
+            Some(w) => w[r],
+            None => 1.0,
+        };
+        if mass.is_finite() && mass > 0.0 {
+            folded[nearest] += mass;
+        }
+    }
+    folded
+}
+
 /// One simplex in the Vietoris–Rips filtration: its sorted vertex set, its
 /// filtration value (max pairwise distance among its vertices), and dimension.
 struct Simplex {
@@ -725,32 +768,44 @@ fn dominant_persistence(bars: &[PersistenceBar]) -> f64 {
     bars.iter().map(|b| b.persistence()).fold(0.0_f64, f64::max)
 }
 
-/// Count the significant H₁ generators as the loops that outlive the sampling
-/// resolution, on a cover dense enough to resolve them.
+/// Count the significant H₁ generators as the number of loops alive on the
+/// **dominant persistence plateau**, on a cover dense enough to resolve them.
 ///
-/// History (#2159). Every rule that reads the *count* off a persistence-*magnitude*
-/// ranking fails on a torus, because a torus's two generators can be very unequal
-/// (an embedded torus's major loop far outlives its minor loop) while a *degenerate
-/// band* of homologous minor cycles from a structured grid looks identical to two
-/// genuinely-distinct equal generators. The Pareto-frontier rule (#2191) dropped
-/// the near-tied second generator; the log-persistence spectral-gap rule collapsed
-/// to `b₁ = 0` on the coarse 48-landmark cover (the two loops were never resolved);
-/// magnitude gaps, plateau readers, and matched-null significance each broke on one
-/// of {unequal generators, degenerate bands, sphere transient loops, density}.
+/// # Math correction (#2159): read the homology RANK, never merge by birth value
 ///
-/// The resolution is two-fold and carries no magic constant. (1) Read H₁ on a cover
-/// at the manifold's covering number ([`PERSISTENCE_H1_MAX_POINTS`], cubic-cost),
-/// not the quartic H₂ cover — the second generator is simply absent from the coarse
-/// cover. (2) A class is a real generator iff its lifetime exceeds the **local
-/// sampling resolution**: within-manifold noise is born and filled within one
-/// point-spacing (a covering-scale bound, the same family as the `ln 2` H₀ floor),
-/// while a genuine cycle survives from the spacing scale up to its hole size. The
-/// floor is the *median nearest-neighbour distance* of the H₁ landmark cover — a
-/// measured quantity, not a threshold. Bars are counted on scale plateaus, with
-/// each active birth-scale family contributing once, so a structured-grid band
-/// born at one edge scale cannot inflate the generator count. This is exact and
-/// density-honest on a full cover; the sphere's transient H₁ dies within the
-/// spacing on a full cover (→ 0), and both torus generators clear it (→ 2).
+/// The first Betti number of the Vietoris–Rips complex at scale `ε` is *exactly*
+/// `β₁(ε) = #{ bars with birth < ε < death }`. The GF(2) boundary reduction emits
+/// one persistence bar per independent 1-cycle, and distinct surviving bars are, by
+/// construction, independent homology classes: the reduction never conflates two
+/// classes into one bar, nor splits one class across two bars. So the honest
+/// generator count at a scale is simply the number of bars alive there.
+///
+/// The previous rule instead grouped the alive bars by *birth-value proximity* (a
+/// `~1e-6` band) and counted one generator per birth-cluster. That is wrong on a
+/// **symmetric grid**: a square Clifford torus (`nu == nv`) is *born-degenerate* —
+/// both of its genuinely-independent generators appear at the *same* filtration
+/// value by symmetry — so birth-proximity merged the two into one and reported
+/// `b₁ = 1` with a spurious `contested` flag (#2159). Birth coincidence cannot tell
+/// "two independent generators born together by symmetry" apart from "one homologous
+/// family": both share filtration values to numerical precision. The reduction had
+/// already answered the question (two independent bars ⇒ rank 2); the downstream
+/// birth-merge discarded that answer. Distinct generators must be separated by the
+/// classes themselves — which the reduction does — not by birth-value nearness.
+///
+/// The resolution carries no magic constant and no dedup. (1) A class is real iff
+/// its lifetime exceeds the **local sampling resolution** — the *median
+/// nearest-neighbour distance* of the landmark cover (a measured covering scale, the
+/// same family as the `ln 2` H₀ floor); within-manifold noise is born and filled
+/// within one point-spacing, whereas a genuine cycle survives from the spacing scale
+/// up to its hole size. (2) Among the survivors, read the rank `β₁` on the **widest
+/// log-scale plateau** of the Betti curve — the topology that persists over the
+/// largest range of scales — exactly as [`shell_plateau_bar_count`] reads the H₂
+/// shell count. A structured grid's spurious per-cell loops are born at the edge
+/// scale and filled at the (nearby) diagonal scale, so they occupy only a *narrow*
+/// plateau and never dominate; the two genuine torus generators span from the
+/// spacing scale to the hole scale and own the widest plateau, so both survive the
+/// symmetry degeneracy and are counted (→ 2). The sphere's transient loops die
+/// within the spacing (→ 0) and a circle keeps its single generator (→ 1).
 fn spacing_floor_bar_count(bars: &[PersistenceBar], distances: &Array2<f64>) -> usize {
     let essential = bars.iter().filter(|b| b.is_essential()).count();
     // Covering-scale floor: the median nearest-neighbour distance of the landmark
@@ -791,10 +846,11 @@ fn spacing_floor_bar_count(bars: &[PersistenceBar], distances: &Array2<f64>) -> 
         return essential;
     }
 
-    // Count the rank on scale plateaus after the spacing floor. Structured grids
-    // can produce many bars born at the same edge scale for one homologous family
-    // with different fill scales; those are one generator family, not several.
-    // Therefore each active birth-scale cluster contributes at most one count.
+    // Read β₁ on the widest log-scale plateau. The count of bars alive at a scale
+    // IS the homology rank there (each bar is an independent GF(2) class), so there
+    // is no birth-proximity merge — that merge collapsed the symmetry-degenerate
+    // torus generators (#2159). Ties in width break to the smaller (coarser) count,
+    // matching `shell_plateau_bar_count`.
     let mut critical = Vec::with_capacity(finite.len() * 2);
     for bar in &finite {
         critical.push(bar.birth);
@@ -802,7 +858,6 @@ fn spacing_floor_bar_count(bars: &[PersistenceBar], distances: &Array2<f64>) -> 
     }
     critical.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     critical.dedup_by(|a, b| *a == *b);
-    let band_tol = 1.0e-6_f64;
     let mut best = 0usize;
     let mut best_width = f64::NEG_INFINITY;
     for window in critical.windows(2) {
@@ -812,30 +867,17 @@ fn spacing_floor_bar_count(bars: &[PersistenceBar], distances: &Array2<f64>) -> 
             continue;
         }
         let probe = if lo > 0.0 { (lo * hi).sqrt() } else { hi / 2.0 };
-        let mut births: Vec<f64> = finite
+        let count = finite
             .iter()
             .filter(|bar| bar.birth < probe && probe < bar.death)
-            .map(|bar| bar.birth)
-            .collect();
-        births.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mut count = 0usize;
-        let mut last_birth: Option<f64> = None;
-        for birth in births {
-            let same_cluster = last_birth.is_some_and(|last| {
-                (birth - last).abs() <= band_tol * last.abs().max(1.0)
-            });
-            if !same_cluster {
-                count += 1;
-                last_birth = Some(birth);
-            }
-        }
+            .count();
         if count == 0 {
             continue;
         }
         let width = if lo > 0.0 { (hi / lo).ln() } else { hi - lo };
-        if count > best || (count == best && width > best_width) {
-            best = count;
+        if width > best_width || (width == best_width && count < best) {
             best_width = width;
+            best = count;
         }
     }
     essential + best
@@ -939,31 +981,24 @@ fn topology_persistence_verdict_impl(
     // resolve a torus's second generator (#2159).
     let h1_landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_H1_MAX_POINTS);
     let h1_sub = points.select(ndarray::Axis(0), &h1_landmarks);
-    let h1_weights = weights.map(|w| {
-        let mut selected = Array1::<f64>::zeros(h1_landmarks.len());
-        for (idx, &row) in h1_landmarks.iter().enumerate() {
-            selected[idx] = w[row];
-        }
-        selected
-    });
+    // P2: fold every discarded row's mass into its nearest retained landmark so the
+    // DTM weighting sees the FULL support measure, not just the landmark rows' mass
+    // (see `fold_mass_to_landmarks`). A no-op when nothing was subsampled.
+    let h1_weights = fold_mass_to_landmarks(points, weights, &h1_landmarks);
     let h1_diagram =
-        dtm_vietoris_rips_persistence(h1_sub.view(), h1_weights.as_ref().map(|w| w.view()), 1);
-    let h1_distances =
-        dtm_weighted_distances(h1_sub.view(), h1_weights.as_ref().map(|w| w.view()));
+        dtm_vietoris_rips_persistence(h1_sub.view(), Some(h1_weights.view()), 1);
+    let h1_distances = dtm_weighted_distances(h1_sub.view(), Some(h1_weights.view()));
 
     // H₂ shells (sphere/torus voids) need the quartic tetrahedron enumeration, so
     // they stay on the compute-bounded PERSISTENCE_MAX_POINTS cover.
     let h2: Vec<PersistenceBar> = if expected_betti.b2.is_some() {
         let landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_MAX_POINTS);
         let sub = points.select(ndarray::Axis(0), &landmarks);
-        let sub_weights = weights.map(|w| {
-            let mut selected = Array1::<f64>::zeros(landmarks.len());
-            for (idx, &row) in landmarks.iter().enumerate() {
-                selected[idx] = w[row];
-            }
-            selected
-        });
-        dtm_vietoris_rips_persistence(sub.view(), sub_weights.as_ref().map(|w| w.view()), 2).h2
+        // P2: fold discarded mass into the nearest landmark. The H₂ cover is the
+        // small PERSISTENCE_MAX_POINTS budget, so it almost always subsamples and
+        // the truncated-measure bias would otherwise be largest here.
+        let sub_weights = fold_mass_to_landmarks(points, weights, &landmarks);
+        dtm_vietoris_rips_persistence(sub.view(), Some(sub_weights.view()), 2).h2
     } else {
         Vec::new()
     };
@@ -1241,8 +1276,132 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistenceBar, components_and_scale, dtm_weighted_distances};
-    use ndarray::Array2;
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    /// A Clifford torus: the product of two unit circles in ℝ⁴, sampled on a
+    /// `nu × nv` grid. When `nu == nv` the grid is symmetric and both H₁
+    /// generators are born at the *same* filtration value — the #2159 degeneracy.
+    fn clifford_torus(nu: usize, nv: usize) -> Array2<f64> {
+        let mut pts = Array2::<f64>::zeros((nu * nv, 4));
+        let mut row = 0usize;
+        for i in 0..nu {
+            let u = std::f64::consts::TAU * (i as f64) / (nu as f64);
+            for j in 0..nv {
+                let v = std::f64::consts::TAU * (j as f64) / (nv as f64);
+                pts[[row, 0]] = u.cos();
+                pts[[row, 1]] = u.sin();
+                pts[[row, 2]] = v.cos();
+                pts[[row, 3]] = v.sin();
+                row += 1;
+            }
+        }
+        pts
+    }
+
+    /// A circle of `n` equally spaced points at radius `r` in ℝ².
+    fn circle(n: usize, r: f64) -> Array2<f64> {
+        let mut pts = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let theta = std::f64::consts::TAU * (i as f64) / (n as f64);
+            pts[[i, 0]] = r * theta.cos();
+            pts[[i, 1]] = r * theta.sin();
+        }
+        pts
+    }
+
+    /// #2159 regression pin. A *symmetric* Clifford grid (`nu == nv`) is
+    /// born-degenerate: both genuinely-independent H₁ generators appear at the
+    /// same filtration value by symmetry. The old birth-proximity dedup merged
+    /// them and reported `b₁ = 1` with a spurious `contested` flag; the
+    /// dominant-plateau homology-rank reading must recover `b₁ = 2` cleanly.
+    #[test]
+    fn symmetric_torus_measures_two_generators_uncontested() {
+        let pts = clifford_torus(8, 8);
+        let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Torus)
+            .expect("torus verdict");
+        assert_eq!(verdict.measured_betti.b0, 1, "a torus is connected");
+        assert_eq!(
+            verdict.measured_betti.b1, 2,
+            "a torus has TWO independent loops; symmetric grids must not merge them (#2159)"
+        );
+        assert_eq!(
+            verdict.measured_betti.b2,
+            Some(1),
+            "a torus bounds exactly one void"
+        );
+        assert!(
+            !verdict.contested,
+            "measured (1,2,1) must agree with the raced Torus prediction: {}",
+            verdict.note
+        );
+    }
+
+    /// An *asymmetric* torus (`nu != nv`): the two generators are born at
+    /// different scales. It must also measure `b₁ = 2` — the plateau reading is
+    /// not special-cased to the degenerate case.
+    #[test]
+    fn asymmetric_torus_still_measures_two_generators() {
+        let pts = clifford_torus(10, 8);
+        let landmarks =
+            farthest_point_subsample_weighted(pts.view(), None, PERSISTENCE_H1_MAX_POINTS);
+        let sub = pts.select(ndarray::Axis(0), &landmarks);
+        let weights = fold_mass_to_landmarks(pts.view(), None, &landmarks);
+        let diagram = dtm_vietoris_rips_persistence(sub.view(), Some(weights.view()), 1);
+        let distances = dtm_weighted_distances(sub.view(), Some(weights.view()));
+        assert_eq!(
+            spacing_floor_bar_count(&diagram.h1, &distances),
+            2,
+            "an asymmetric torus still has two independent loops"
+        );
+    }
+
+    /// A circle keeps its single generator: the dedup removal must not
+    /// over-split a shape with genuine multiplicity one.
+    #[test]
+    fn circle_still_measures_one_generator() {
+        let pts = circle(40, 2.0);
+        let verdict = topology_persistence_verdict(pts.view(), &SaeAtomBasisKind::Periodic)
+            .expect("circle verdict");
+        assert_eq!(
+            verdict.measured_betti.b1, 1,
+            "a circle has exactly one loop; the plateau reading must not over-split"
+        );
+        assert!(
+            !verdict.contested,
+            "measured circle topology must agree with the raced Periodic prediction: {}",
+            verdict.note
+        );
+    }
+
+    /// P2 regression pin. A cloud larger than the H₁ landmark cap forces a real
+    /// farthest-point subsample; the folded landmark weights must still sum to the
+    /// FULL support mass, i.e. no discarded row's mass is dropped from the DTM.
+    #[test]
+    fn folded_landmark_mass_preserves_full_measure() {
+        let n = 400usize;
+        let pts = circle(n, 1.0);
+        let mut weights = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            weights[i] = 0.5 + (i as f64) * 0.01;
+        }
+        let total: f64 = weights.iter().sum();
+        let landmarks = farthest_point_subsample_weighted(
+            pts.view(),
+            Some(weights.view()),
+            PERSISTENCE_H1_MAX_POINTS,
+        );
+        assert!(
+            landmarks.len() < n,
+            "the cap must actually drop rows for this test to exercise the fold"
+        );
+        let folded = fold_mass_to_landmarks(pts.view(), Some(weights.view()), &landmarks);
+        let folded_total: f64 = folded.iter().sum();
+        assert!(
+            (folded_total - total).abs() <= 1e-9 * total,
+            "folded landmark mass {folded_total} must equal the full support mass {total}"
+        );
+    }
 
     fn bars(deaths: &[f64]) -> Vec<PersistenceBar> {
         deaths
