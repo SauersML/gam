@@ -65,6 +65,10 @@ def emit(out: Path, rec: dict) -> None:
     print(f"[e2e32k] {rec.get('record')}: {json.dumps(rec)[:240]}", flush=True)
 
 
+class _LinearReused(Exception):
+    pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, default=Path("/models/k25_tokens"))
@@ -92,10 +96,28 @@ def main() -> None:
                 top_k=args.top_k, pca_ev=round(ev_frac, 4))
 
     # ── ARM 1: matched 32k LINEAR SAE (the baseline to beat) ────────────────
+    # Resumable: a completed linear arm in the output JSONL is reused, not
+    # refit — the baseline costs ~1 GPU-hour and its number is deterministic
+    # at fixed (category, n_rows, p, k, top_k, seed).
     lin_ev = None
     lin_wall = None
+    if args.out.exists():
+        for line in args.out.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if (r.get("record") == "linear32k" and r.get("status") == "ok"
+                    and r.get("k") == args.k and r.get("p") == args.p
+                    and r.get("n_rows") == args.n_rows):
+                lin_ev = float(r["ev"])
+                lin_wall = float(r["wall_s"])
+                print(f"[e2e32k] linear32k reused from {args.out}: ev={lin_ev}", flush=True)
+                break
     t0 = time.perf_counter()
     try:
+        if lin_ev is not None:
+            raise _LinearReused
         lin = gamfit.block_sparse_dictionary_fit(
             train, args.k, block_size=1, block_topk=args.top_k, max_epochs=30,
         )
@@ -104,6 +126,8 @@ def main() -> None:
         emit(args.out, {**base, "record": "linear32k", "status": "ok",
                         "ev": lin_ev, "wall_s": round(lin_wall, 1),
                         "peak_rss_gb": round(peak_rss_gb(), 2)})
+    except _LinearReused:
+        pass
     except Exception as exc:  # noqa: BLE001 - the class IS the datum
         emit(args.out, {**base, "record": "linear32k", "status": type(exc).__name__,
                         "error": str(exc)[:800], "wall_s": round(time.perf_counter() - t0, 1)})
