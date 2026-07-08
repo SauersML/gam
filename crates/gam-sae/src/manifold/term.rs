@@ -283,27 +283,31 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 // death. So there is no amplitude strength or active-atom gate to override.
 static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
-/// #1026/#1522/#1610 — read the process-global separation-barrier-strength
-/// override, or `None` when unset. `None` ⇒ the evidence-derived per-pair μ_jk
-/// (the data-fit inseparability strength from
+/// #1026/#1522/#1610 — read the process-global override for the decoder-repulsion
+/// CONDITIONER strength `μ_C`, or `None` when unset. `None` ⇒ the evidence-derived
+/// per-pair `μ_jk` (data-fit inseparability from
 /// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]) is
-/// used. A quiet-NaN sentinel means "unset → derive from the problem"; `0.0`
-/// stays a legitimate swept value (barrier disabled).
+/// used. NOTE: this no longer scales the primary separation barrier — that is now
+/// the parameter-free Jeffreys prior `−½ log det F` — only the subdominant
+/// repulsion conditioner. A quiet-NaN sentinel means "unset → derive from the
+/// problem"; `0.0` stays a legitimate swept value (conditioner disabled).
 pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
     let v =
         f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
     if v.is_nan() { None } else { Some(v) }
 }
 
-/// Set the process-global SAE separation-barrier strength override (one wheel,
-/// many configs). `sep_strength` is NaN to clear the override back to the
-/// evidence-derived per-pair μ_jk (`γ_jk / (1 - γ_jk)`, the data-fit
-/// inseparability strength — see
+/// Set the process-global override for the SAE decoder-repulsion CONDITIONER
+/// strength `μ_C` (one wheel, many configs). NOTE: the primary separation barrier
+/// is now the parameter-free Jeffreys prior `−½ log det F` and ignores this — the
+/// override scales only the subdominant repulsion conditioner. `sep_strength` is
+/// NaN to clear the override back to the evidence-derived per-pair `μ_jk`
+/// (`γ_jk / (1 - γ_jk)`, the data-fit inseparability strength — see
 /// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]); there
 /// is no compiled-constant default any more.
 /// The amplitude (keep-alive) barrier and its active-atom gate were removed
 /// (surplus features are allowed to die into a ridge-parked state), so this
-/// takes only the separation strength. Called from the gamfit Python FFI.
+/// takes only the conditioner strength. Called from the gamfit Python FFI.
 ///
 /// CONCURRENCY: this is a PROCESS-GLOBAL atomic, so it is NOT safe to use across
 /// concurrent in-process fits — a parallel candidate/rung/layer sweep that sets
@@ -613,14 +617,16 @@ pub struct SaeManifoldTerm {
     /// [`Self::set_hybrid_linear_images`]. Consulted by
     /// [`Self::hybrid_linear_image_map`] so train and OOS share one collapse map.
     pub(crate) oos_linear_images: Option<Vec<crate::hybrid_split::AtomLinearImage>>,
-    /// #1777 PER-FIT separation-barrier strength override `μ_C` — the source of
-    /// truth for the barrier strength when set, replacing the process-global
-    /// [`set_sae_barrier_overrides`] atomic. `Some(μ_C)` forces the absolute
-    /// strength (bypassing the #1610 evidence-derived per-pair reciprocal-margin
-    /// strengths), scoped to THIS term/fit so concurrent in-process fits are
-    /// isolated; `0.0` disables the barrier. `None` ⇒ fall back to the deprecated
-    /// process-global override, then the evidence-derived strength (bit-identical
-    /// to the historical path when neither override is set). Read via
+    /// #1777 PER-FIT decoder-repulsion CONDITIONER strength override `μ_C` — the
+    /// source of truth for the conditioner strength when set, replacing the
+    /// process-global [`set_sae_barrier_overrides`] atomic. NOTE: the primary
+    /// separation barrier is now the parameter-free Jeffreys prior `−½ log det F`
+    /// and ignores this; the override scales only the subdominant repulsion
+    /// conditioner. `Some(μ_C)` forces the absolute strength (bypassing the #1610
+    /// evidence-derived per-pair reciprocal-margin strengths), scoped to THIS
+    /// term/fit so concurrent in-process fits are isolated; `0.0` disables the
+    /// conditioner. `None` ⇒ fall back to the deprecated process-global override,
+    /// then the evidence-derived strength. Read via
     /// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]; set from
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
