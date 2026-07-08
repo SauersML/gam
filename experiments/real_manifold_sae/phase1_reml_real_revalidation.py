@@ -100,7 +100,15 @@ def main() -> None:
     ap.add_argument("--only", default=None, help="comma-separated config names to run")
     args = ap.parse_args()
 
-    # The historical failure family first (all aborted pre-fix), then research shapes.
+    # Three families:
+    #  repro_* — the historical co-collapse family (all aborted pre-fix); kept
+    #            as the regression proof for the barrier fix.
+    #  mid_*   — modest undercomplete warm-ups.
+    #  oc_*    — the REAL manifold-SAE regime: overcomplete dictionaries
+    #            (atoms >> dims), per-row identifiability carried by top_k
+    #            sparsity + curvature. This is genus-2 frontier (pairwise
+    #            barrier known-inadequate pre-Jeffreys), so the K/D survival
+    #            threshold itself is the measurement.
     configs = [
         dict(name="repro_D2_K1", d_pca=2, K=1),
         dict(name="repro_D4_K1", d_pca=4, K=1),
@@ -109,6 +117,10 @@ def main() -> None:
         dict(name="mid_D32_K4", d_pca=32, K=4, top_k=2),
         dict(name="mid_D64_K8", d_pca=64, K=8, top_k=3),
         dict(name="wide_D128_K16", d_pca=128, K=16, top_k=4, n_iter=40),
+        dict(name="oc_D16_K64", d_pca=16, K=64, top_k=4, n_iter=40),
+        dict(name="oc_D32_K128", d_pca=32, K=128, top_k=4, n_iter=40),
+        dict(name="oc_D32_K256", d_pca=32, K=256, top_k=4, n_iter=30),
+        dict(name="oc_D64_K512", d_pca=64, K=512, top_k=8, n_iter=30),
     ]
     if args.only:
         wanted = set(args.only.split(","))
