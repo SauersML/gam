@@ -300,6 +300,34 @@ impl SaeManifoldTerm {
                     blocks[idx] = blocks[idx].with_log_lambda(trial_ll[idx])?;
                 }
                 self.fit_state_restore(&base)?;
+                // EXACT warm-start reparameterization: the stacked target's block
+                // columns are `√λ_ℓ·Y_ℓ`, and quadratic β-penalties are scale-
+                // equivariant (`min_β ‖√λ·y − Φβ‖² + βᵀSβ` maps to
+                // `λ(‖y − Φb‖² + bᵀSb)` under `β = √λ·b`), so the incumbent fit at
+                // `λ_cur` maps to the EXACT incumbent at `λ_trial` by scaling each
+                // behavior block's decoder columns by `√(λ_trial/λ_cur)`. Without
+                // this rescale every trial starts with a spurious scaled-residual
+                // `(√λ_t − √λ_c)²·‖Ŷ‖²` that the TRUNCATED inner solve must burn
+                // its iteration budget removing — which biases the Armijo
+                // comparison against exactly the large closed-form λ jumps the
+                // fixed point needs from a distant start (the from-0.0
+                // 20-sweep-exhaustion failure of `reml_selects_lambda_y…`). The
+                // rescaled state is the same fit in the new parameterization, so
+                // this changes no fixed point — it only stops the line search from
+                // paying an artificial re-fitting tax proportional to the step.
+                let mut col_base = px;
+                for idx in 0..blocks.len() {
+                    let scale = (0.5 * (trial_ll[idx] - cur_log_lambda[idx])).exp();
+                    if scale != 1.0 {
+                        for atom in &mut self.atoms {
+                            let mut cols = atom
+                                .decoder_coefficients
+                                .slice_mut(s![.., col_base..col_base + dims[idx]]);
+                            cols.mapv_inplace(|v| v * scale);
+                        }
+                    }
+                    col_base += dims[idx];
+                }
                 let aug = stack_augmented_target(anchor, blocks)?;
                 let trial_loss = self.run_joint_fit_arrow_schur(
                     aug.view(),
