@@ -343,43 +343,6 @@ def _canonical_n_harmonics(
     return out
 
 
-def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
-    """e-BH confirmed-claim set, via the Rust source of truth.
-
-    Thin wrapper over ``inference::structure_evidence::e_benjamini_hochberg``
-    (FFI ``e_bh_dictionary_certificate``): the whole selection procedure — sort by
-    descending log e-value, confirm the prefix up to the largest rank ``k`` whose
-    k-th-largest log e-value clears ``ln(m) − ln(alpha) − ln(k)`` — runs once in
-    the core, never mirrored in Python. Returns the indices of the confirmed
-    claims (FDR ≤ ``alpha`` under arbitrary dependence, valid at any stopping
-    time). Guards the degenerate inputs the FFI does not accept (``m == 0`` or a
-    non-positive ``alpha``) as the empty set, matching the previous contract.
-    """
-    if len(log_e_values) == 0 or not (alpha > 0.0):
-        return []
-    return [int(i) for i in rust_module().e_bh_dictionary_certificate(
-        [float(v) for v in log_e_values], float(alpha)
-    )]
-
-
-def _structure_claim_label(kind: Any) -> str:
-    """Human-readable label for a serialized `ClaimKind` (serde-tagged enum)."""
-    if isinstance(kind, str):
-        return kind
-    if isinstance(kind, Mapping):
-        for tag, body in kind.items():
-            if tag == "AtomExists":
-                return f"atom {body['atom']} exists"
-            if tag == "BindingEdge":
-                return f"atoms {body['a']}-{body['b']} bound"
-            if tag == "GeometryKind":
-                return f"atom {body['atom']} geometry={body['kind']}"
-            if tag == "Custom":
-                return str(body.get("label", "custom"))
-            return f"{tag}:{body}"
-    return str(kind)
-
-
 def _jsonable_value(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -1276,54 +1239,21 @@ class ManifoldSAE:
             the additional log-evidence a probe must accumulate before the claim
             crosses the confirmation threshold (0 once already confirmed).
         """
-        import json
-        import math
-
         if self.structure_certificate_json is None:
             raise ValueError(
                 "this fitted model carries no structure certificate (payload "
                 "predates #1058); refit to obtain one"
             )
-        cert = json.loads(self.structure_certificate_json)
-        entries = list(cert.get("entries", []))
-        stored_alpha = float(cert.get("alpha", 0.05))
-        level = stored_alpha if alpha is None else float(alpha)
-        if not (0.0 < level < 1.0):
-            raise ValueError(f"alpha must lie in (0, 1); got {level}")
-        log_e = [float(e["log_e"]) for e in entries]
-        confirmed_idx = set(_e_benjamini_hochberg(log_e, level))
-        # Measure the remaining budget against the SAME rank/multiplicity-aware
-        # e-BH threshold the local confirmation helper uses (#984/H): a claim at
-        # descending-log_e rank k (1-based) out of m clears the rule when
-        # log_e >= ln(m) - ln(alpha) - ln(k) == ln(m / (alpha*k)). The previous
-        # ln(1/alpha) threshold dropped the ln(m) - ln(k) term and so understated
-        # the evidence a contested claim still needs.
-        m = len(entries)
-        order = sorted(range(m), key=lambda j: log_e[j], reverse=True)
-        rank_of = {idx: rank0 + 1 for rank0, idx in enumerate(order)}
-        claims: list[dict[str, Any]] = []
-        for i, entry in enumerate(entries):
-            le = float(entry["log_e"])
-            k_rank = rank_of[i]
-            threshold = math.log(m) - math.log(level) - math.log(k_rank)
-            claims.append(
-                {
-                    "claim_index": i,
-                    "claim": _structure_claim_label(entry["kind"]),
-                    "kind": entry["kind"],
-                    "e_value": math.exp(le),
-                    "log_e": le,
-                    "steps": int(entry["steps"]),
-                    "confirmed": i in confirmed_idx,
-                    "evidence_remaining_nats": max(0.0, threshold - le),
-                }
+        # The whole accessor computation — re-run the rank/multiplicity-aware e-BH
+        # at `alpha`, and derive each claim's label, e-value, confirmed flag, and
+        # anytime-valid `evidence_remaining_nats` budget — lives in the Rust owner
+        # (#2091, SPEC thin-wrapper rule 8). We only json.loads its report.
+        return json.loads(
+            rust_module().sae_structure_certificate_report(
+                self.structure_certificate_json,
+                None if alpha is None else float(alpha),
             )
-        return {
-            "alpha": level,
-            "fdr_level": level,
-            "n_confirmed": len(confirmed_idx),
-            "claims": claims,
-        }
+        )
 
     def atom_inference(self) -> list[dict[str, Any]]:
         """Per-atom smooth-functional inference reports (#1097 / #1103).

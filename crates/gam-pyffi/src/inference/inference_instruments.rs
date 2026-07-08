@@ -36,9 +36,9 @@ use gam::inference::lawley::{
 };
 use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
-    AtomBirthGate, CandidateProbe, GateVerdict, ProbePlan, e_benjamini_hochberg,
-    expected_resolution_budget as core_expected_resolution_budget, log_e_from_p_calibrator,
-    plan_probe_for_contested_claim as core_plan_probe_for_contested_claim,
+    AtomBirthGate, CandidateProbe, ClaimKind, GateVerdict, ProbePlan, StructureCertificate,
+    e_benjamini_hochberg, expected_resolution_budget as core_expected_resolution_budget,
+    log_e_from_p_calibrator, plan_probe_for_contested_claim as core_plan_probe_for_contested_claim,
     select_probe_by_expected_evidence as core_select_probe_by_expected_evidence,
     split_likelihood_log_e_value,
 };
@@ -167,6 +167,90 @@ pub(crate) fn e_bh_dictionary_certificate(log_e_values: Vec<f64>, alpha: f64) ->
 #[pyfunction]
 pub(crate) fn log_e_from_p_value(p_value: f64) -> PyResult<f64> {
     log_e_from_p_calibrator(p_value).map_err(py_value_error)
+}
+
+/// Human-readable label for one structural claim (issue #2091 — the claim-label
+/// rendering that used to live in the Python facade's `_structure_claim_label`).
+fn structure_claim_label(kind: &ClaimKind) -> String {
+    match kind {
+        ClaimKind::AtomExists { atom } => format!("atom {atom} exists"),
+        ClaimKind::BindingEdge { a, b } => format!("atoms {a}-{b} bound"),
+        ClaimKind::GeometryKind { atom, kind } => format!("atom {atom} geometry={kind}"),
+        ClaimKind::Custom { label } => label.clone(),
+    }
+}
+
+/// Materialize the anytime-valid structure-discovery certificate report from a
+/// serialized [`StructureCertificate`] (issue #2091 / #1058).
+///
+/// Owns the whole accessor computation the `ManifoldSAE` facade used to do in
+/// numpy/Python (SPEC thin-wrapper rule 8): re-run the rank/multiplicity-aware
+/// e-BH confirmation at `alpha` (defaulting to the level the fit certified at)
+/// over the stored per-claim log e-values, and for each claim emit the label,
+/// e-value, confirmed flag, and the anytime-valid `evidence_remaining_nats`
+/// budget `max(0, ln(m / (alpha·k)) − log_e)` measured against the SAME
+/// descending-log_e rank `k` (out of `m` claims) the e-BH rule uses. Returns the
+/// report as a JSON string (`{"alpha", "fdr_level", "n_confirmed", "claims":
+/// [...]}`) for the facade to `json.loads`; this is a runtime accessor, never
+/// serialized to the model artifact, so only value-equivalence is contracted.
+#[pyfunction(signature = (certificate_json, alpha=None))]
+pub(crate) fn sae_structure_certificate_report(
+    certificate_json: &str,
+    alpha: Option<f64>,
+) -> PyResult<String> {
+    let cert: StructureCertificate = serde_json::from_str(certificate_json)
+        .map_err(|err| py_value_error(format!("invalid structure certificate json: {err}")))?;
+    let level = alpha.unwrap_or(cert.alpha);
+    if !(level > 0.0 && level < 1.0) {
+        return Err(py_value_error(format!(
+            "alpha must lie in (0, 1); got {level}"
+        )));
+    }
+    let entries = &cert.entries;
+    let m = entries.len();
+    let log_e: Vec<f64> = entries.iter().map(|entry| entry.log_e).collect();
+    let confirmed_idx: std::collections::HashSet<usize> =
+        e_benjamini_hochberg(&log_e, level).into_iter().collect();
+    // rank_of[i] = 1-based rank of claim i in descending log_e order (stable on
+    // ties, so equal log_e keep ascending index order — matching the facade's
+    // `sorted(..., reverse=True)`).
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| {
+        log_e[b]
+            .partial_cmp(&log_e[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut rank_of = vec![0usize; m];
+    for (rank0, &idx) in order.iter().enumerate() {
+        rank_of[idx] = rank0 + 1;
+    }
+    let claims: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let le = entry.log_e;
+            let threshold = (m as f64).ln() - level.ln() - (rank_of[i] as f64).ln();
+            serde_json::json!({
+                "claim_index": i,
+                "claim": structure_claim_label(&entry.kind),
+                "kind": serde_json::to_value(&entry.kind)
+                    .unwrap_or(serde_json::Value::Null),
+                "e_value": le.exp(),
+                "log_e": le,
+                "steps": entry.steps,
+                "confirmed": confirmed_idx.contains(&i),
+                "evidence_remaining_nats": (threshold - le).max(0.0),
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "alpha": level,
+        "fdr_level": level,
+        "n_confirmed": confirmed_idx.len(),
+        "claims": claims,
+    });
+    serde_json::to_string(&payload)
+        .map_err(|err| py_value_error(format!("failed to serialize certificate report: {err}")))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1583,6 +1667,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(split_likelihood_log_e, module)?)?;
     module.add_function(wrap_pyfunction!(e_bh_dictionary_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(log_e_from_p_value, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_structure_certificate_report, module)?)?;
     module.add_function(wrap_pyfunction!(select_probe_by_expected_evidence, module)?)?;
     module.add_function(wrap_pyfunction!(expected_resolution_budget, module)?)?;
     module.add_function(wrap_pyfunction!(plan_probe_for_contested_claim, module)?)?;
