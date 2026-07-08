@@ -115,12 +115,22 @@ impl EncodeAtomDevice {
     ) -> Result<Self, String> {
         let d = atom.latent_dim;
         let p = atom.output_dim();
-        let m = atom.basis_size();
+        // FULL inner-basis width + full-width decoder pre-image `B = Q B̃`, never
+        // the stored (possibly #1117 rank-reduced) width/decoder. The device
+        // evaluates the raw monomial family from the exponent table, so a reduced
+        // atom's Q-mixture columns are unrepresentable directly — but the
+        // reconstruction is identical through the full-width frame
+        // (`Φ̃ B̃ = Φ_full (Q B̃)`), which the exponent table CAN express. Extracting
+        // at the reduced width would either error the deployment (reduced width
+        // matches no patch column count) or — worse, when `r` coincides with a
+        // smaller degree's count — silently evaluate the WRONG polynomial family
+        // against the reduced decoder. Identical for un-reduced atoms.
+        let m = atom.full_basis_size();
         let degree = euclidean_patch_degree(d, m);
         let exps = gam_terms::basis::monomial_exponents(d, degree);
         if exps.len() != m {
             return Err(format!(
-                "EncodeAtomDevice::from_atom_atlas: monomial table len {} != basis_size {m} \
+                "EncodeAtomDevice::from_atom_atlas: monomial table len {} != full basis width {m} \
                  (atom is not a EuclideanPatch degree-{degree} monomial family)",
                 exps.len()
             ));
@@ -131,7 +141,7 @@ impl EncodeAtomDevice {
                 exponents[col * d + axis] = alpha[axis] as i32;
             }
         }
-        let dec = &atom.decoder_coefficients;
+        let dec = atom.full_width_decoder();
         if dec.dim() != (m, p) {
             return Err(format!(
                 "EncodeAtomDevice::from_atom_atlas: decoder dim {:?} != ({m}, {p})",
