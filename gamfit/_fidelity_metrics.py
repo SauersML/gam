@@ -1,6 +1,7 @@
 """Model-currency fidelity metric reductions (scorecard axis 1).
 
-The canonical numeric core for the fidelity harness: ``loss_recovered``,
+Thin wrappers over the Rust source of truth ``gam_math::fidelity_metrics``
+(exposed through ``gamfit._rust`` as the ``fidelity_*`` FFI): ``loss_recovered``,
 Euclidean ``r2_score``, categorical ``kl_categorical_rows`` over token rows, and
 the ``distortion_floor_r2``. Held-out EV prices reconstruction error in Euclidean
 distance, but the model reads directions unequally; these price reconstruction in
@@ -9,12 +10,11 @@ produces the losses/logprobs lives at the torch/HF boundary in the harness; thes
 are the pure reductions, shared verbatim by every consumer (CONTROL composed-dict
 run, EVAL scorecard, RUNG1 iid-vs-Fisher-GLS A/B) so the program has ONE currency.
 
-Pure-numpy so it runs on MSI without a fresh wheel. Each function transparently
-dispatches to the Rust source of truth ``gam_math::fidelity_metrics`` (via
-``gamfit._rust``) once that extension exposes the ``fidelity_*`` entry points;
-``tests/metrics/test_fidelity_metrics_parity.py`` pins the numpy path to the Rust
-kernel to double precision and asserts they agree, so the fallback can never
-silently diverge from the source of truth.
+Every function routes unconditionally to the Rust kernels — there is no numpy
+twin. numpy here is marshalling only (shape validation, flattening to the
+row-major flat layout the FFI consumes). If the compiled extension is missing the
+``fidelity_*`` entry points that is an ImportError bug in the build, not a reason
+to reimplement the math.
 
 Definitions (model loss units / nats):
     loss_recovered = (L_ablate − L_recon) / (L_ablate − L_clean)
@@ -30,34 +30,30 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-_EPS = 1e-12
-
 
 def _rust_metrics():
-    """Return the compiled extension iff it exposes the fidelity kernels, else None.
+    """Return the compiled extension, requiring the ``fidelity_*`` FFI kernels.
 
-    A soft probe: if the wheel predates the ``fidelity_*`` FFI exposure (or the
-    extension is a pure-Python shim), we silently use the numpy path. The parity
-    test guarantees the two agree when the kernels ARE present.
+    Hard dependency: the metric math is owned by Rust. A missing extension or a
+    wheel that predates the ``fidelity_*`` exposure is a build bug and surfaces as
+    an ImportError rather than a silent numpy reimplementation.
     """
-    try:
-        from gamfit._binding import rust_module
+    from gamfit._binding import rust_module
 
-        module = rust_module()
-    except Exception:
-        return None
-    return module if hasattr(module, "fidelity_loss_recovered") else None
+    module = rust_module()
+    if not hasattr(module, "fidelity_loss_recovered"):
+        raise ImportError(
+            "gamfit._rust is missing the fidelity_* FFI kernels; rebuild the wheel "
+            "(gam_math::fidelity_metrics must be exposed through gam-pyffi)"
+        )
+    return module
 
 
 def loss_recovered(l_clean: float, l_recon: float, l_ablate: float) -> float:
     """(L_ablate − L_recon) / (L_ablate − L_clean); NaN when the gap is degenerate."""
-    rust = _rust_metrics()
-    if rust is not None:
-        return float(rust.fidelity_loss_recovered(float(l_clean), float(l_recon), float(l_ablate)))
-    denom = l_ablate - l_clean
-    if abs(denom) < _EPS:
-        return float("nan")
-    return (l_ablate - l_recon) / denom
+    return float(
+        _rust_metrics().fidelity_loss_recovered(float(l_clean), float(l_recon), float(l_ablate))
+    )
 
 
 def r2_score(clean: np.ndarray, approx: np.ndarray) -> float:
@@ -68,17 +64,12 @@ def r2_score(clean: np.ndarray, approx: np.ndarray) -> float:
         raise ValueError(f"r2_score shape mismatch: {clean.shape} vs {approx.shape}")
     clean2 = clean.reshape(clean.shape[0], -1) if clean.ndim > 1 else clean.reshape(1, -1)
     approx2 = approx.reshape(clean2.shape)
-    rust = _rust_metrics()
-    if rust is not None:
-        n_rows, n_cols = clean2.shape
-        return float(
-            rust.fidelity_r2_score(
-                clean2.ravel().tolist(), approx2.ravel().tolist(), int(n_rows), int(n_cols)
-            )
+    n_rows, n_cols = clean2.shape
+    return float(
+        _rust_metrics().fidelity_r2_score(
+            clean2.ravel().tolist(), approx2.ravel().tolist(), int(n_rows), int(n_cols)
         )
-    rss = float(np.sum((clean2 - approx2) ** 2))
-    tss = float(np.sum((clean2 - clean2.mean(axis=0, keepdims=True)) ** 2))
-    return 1.0 - rss / tss if tss > 0.0 else 0.0
+    )
 
 
 def kl_categorical_rows(clean_logprobs: np.ndarray, other_logprobs: np.ndarray) -> float:
@@ -89,17 +80,12 @@ def kl_categorical_rows(clean_logprobs: np.ndarray, other_logprobs: np.ndarray) 
         raise ValueError(f"kl shape mismatch: {clean_lp.shape} vs {other_lp.shape}")
     clean2 = clean_lp.reshape(clean_lp.shape[0], -1) if clean_lp.ndim > 1 else clean_lp.reshape(1, -1)
     other2 = other_lp.reshape(clean2.shape)
-    rust = _rust_metrics()
-    if rust is not None:
-        n_rows, n_cols = clean2.shape
-        return float(
-            rust.fidelity_kl_categorical_rows(
-                clean2.ravel().tolist(), other2.ravel().tolist(), int(n_rows), int(n_cols)
-            )
+    n_rows, n_cols = clean2.shape
+    return float(
+        _rust_metrics().fidelity_kl_categorical_rows(
+            clean2.ravel().tolist(), other2.ravel().tolist(), int(n_rows), int(n_cols)
         )
-    p = np.exp(clean2)
-    kl = np.sum(p * (clean2 - other2), axis=-1)
-    return float(np.mean(kl))
+    )
 
 
 def distortion_floor_r2(
@@ -116,19 +102,7 @@ def distortion_floor_r2(
     lr_arr = np.asarray(loss_recovereds, dtype=np.float64)
     if r2_arr.shape != lr_arr.shape:
         raise ValueError("distortion_floor_r2: parallel arrays length mismatch")
-    if r2_arr.size == 0:
-        return None
-    rust = _rust_metrics()
-    if rust is not None:
-        out = rust.fidelity_distortion_floor_r2(
-            r2_arr.tolist(), lr_arr.tolist(), float(tol_frac)
-        )
-        return None if out is None else float(out)
-    # Descending by R² (finest precision first), stable tie-break on original index.
-    order = sorted(range(r2_arr.size), key=lambda i: (-r2_arr[i], i))
-    plateau = float(lr_arr[order[0]])
-    threshold = plateau - tol_frac * abs(plateau)
-    for idx in order:
-        if lr_arr[idx] < threshold:
-            return float(r2_arr[idx])
-    return float(r2_arr[order[-1]])
+    out = _rust_metrics().fidelity_distortion_floor_r2(
+        r2_arr.tolist(), lr_arr.tolist(), float(tol_frac)
+    )
+    return None if out is None else float(out)
