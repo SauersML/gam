@@ -396,3 +396,79 @@ fn ebh_rejects_dominant_e_value() {
     let flat = vec![1.0_f64; 20];
     assert!(ebh_reject(&flat, 0.05).is_empty());
 }
+
+/// The independence certificate (dual of fusion): a TRUE independent product of
+/// circles certifies as separated (no residual coupling), while a phase-coupled
+/// pair breaks the certificate and names itself as the residual coupling.
+#[test]
+fn independence_certificate_passes_on_product_fails_on_coupling() {
+    let mut s = 0x21_11_u64;
+    let n = 2000usize;
+    let p = 8usize;
+    let active = vec![true; n];
+
+    // Independent product of three dense circles on disjoint axis-planes.
+    let mut indep = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for c in 0..3 {
+            let th = std::f64::consts::TAU * lcg(&mut s);
+            indep[[i, 2 * c]] += th.cos();
+            indep[[i, 2 * c + 1]] += th.sin();
+        }
+        for j in 0..p {
+            indep[[i, j]] += NOISE * lcg_normal(&mut s);
+        }
+    }
+    let mean = Array1::<f64>::zeros(p);
+    let cands: Vec<IsaPlaneCandidate> = (0..3)
+        .map(|c| axis_candidate(p, 2 * c, 2 * c + 1, &active))
+        .collect();
+    let cert = certify_pairwise_independence(indep.view(), &mean, &cands, 80, 0xC0, 0.05).unwrap();
+    eprintln!(
+        "[independence] separated={} residual={}",
+        cert.separated,
+        cert.residual_couplings.len()
+    );
+    assert!(
+        cert.separated && cert.residual_couplings.is_empty(),
+        "an independent product must certify separated; residual={:?}",
+        cert.residual_couplings
+    );
+
+    // Couple circles 0 and 1 with a rigid rotation phase law θ_B = θ_A + φ.
+    let mut coupled = Array2::<f64>::zeros((n, p));
+    let phi = 0.8_f64;
+    for i in 0..n {
+        let ta = std::f64::consts::TAU * lcg(&mut s);
+        let tb = ta + phi + 0.06 * lcg_normal(&mut s);
+        coupled[[i, 0]] += ta.cos();
+        coupled[[i, 1]] += ta.sin();
+        coupled[[i, 2]] += tb.cos();
+        coupled[[i, 3]] += tb.sin();
+        let tc = std::f64::consts::TAU * lcg(&mut s);
+        coupled[[i, 4]] += tc.cos();
+        coupled[[i, 5]] += tc.sin();
+        for j in 0..p {
+            coupled[[i, j]] += NOISE * lcg_normal(&mut s);
+        }
+    }
+    let cert2 =
+        certify_pairwise_independence(coupled.view(), &mean, &cands, 80, 0xC1, 0.05).unwrap();
+    eprintln!(
+        "[independence coupled] separated={} residual={:?}",
+        cert2.separated,
+        cert2
+            .residual_couplings
+            .iter()
+            .map(|r| (r.atom_a, r.atom_b, r.channel.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!cert2.separated, "a phase-coupled pair must break the certificate");
+    assert!(
+        cert2
+            .residual_couplings
+            .iter()
+            .any(|r| r.atom_a == 0 && r.atom_b == 1),
+        "the coupled (0,1) pair must be named as a residual coupling"
+    );
+}

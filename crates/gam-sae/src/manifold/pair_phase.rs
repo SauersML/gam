@@ -649,6 +649,82 @@ pub fn screen_all_pairs_phase(
     Ok(verdicts)
 }
 
+/// A residual inter-factor coupling the separation did not remove: the pair, its
+/// strongest phase channel, and that channel's e-value (its e-BH ledger entry).
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualCoupling {
+    pub atom_a: usize,
+    pub atom_b: usize,
+    pub channel: PhaseChannel,
+    pub e_value: f64,
+}
+
+/// The pairwise-independence certificate for a candidate circle factorization —
+/// the DUAL of the phase-fusion screen.
+///
+/// [`screen_all_pairs_phase`] proposes a torus BINDING on POSITIVE coupling
+/// evidence: an e-BH discovery over the (pair × channel) surrogate-null ledger.
+/// The separation problem (#2111) asks the OPPOSITE question of the SAME ledger.
+/// On a dense product-of-circles torus, ring-ness (a second-order, radial signal)
+/// is degenerate: every 2-plane inside the span of two circles is equally
+/// "ring-like", so no second-order score can split the product into its true
+/// circle factors. The identifying signal is INDEPENDENCE: for a product of
+/// independent circles the joint phase law FACTORIZES, so every cross-phase
+/// resultant `T_h` sits in the phase-randomised surrogate null. The candidate
+/// planes are therefore the true factors iff the e-BH ledger makes NO discovery
+/// at level `alpha` — family-wise NON-rejection is the certificate, exactly
+/// dual to the fusion screen reading rejection as a bind proposal.
+#[derive(Clone, Debug)]
+pub struct IndependenceCertificate {
+    /// True ⇒ no (pair × channel) coupling cleared the e-BH surrogate-null ledger:
+    /// the candidate planes are certified pairwise phase-independent at `alpha`.
+    pub separated: bool,
+    /// The couplings that DID clear the ledger (e-BH discoveries). Empty iff
+    /// `separated`. Each names a pair whose phase law did not factorise — the
+    /// caller re-separates it if a rotation within the pair's 4-plane can null the
+    /// coupling (a whitened-basis BLEND, the #2111 45° saddle), or fuses it if the
+    /// coupling is rotation-invariant (a GENUINE torus density the marginals miss).
+    pub residual_couplings: Vec<ResidualCoupling>,
+    /// The full per-pair verdicts (all pairs in `a < b` order), for the
+    /// fuse-vs-reseparate adjudication and diagnostics.
+    pub verdicts: Vec<PhaseVerdict>,
+}
+
+/// Certify that a candidate set of circle 2-planes is the TRUE independent
+/// factorization by running the phase e-BH ledger and reading its NON-rejection.
+///
+/// A thin dual wrapper over [`screen_all_pairs_phase`]: same surrogate null, same
+/// calibrated e-values, same FDR-controlled ledger — only the verdict is inverted.
+/// `separated` is `true` exactly when the fusion screen would propose NO binding,
+/// which for an accepted (already reconstruction-complete) factor set is the
+/// statement that the factors are independent. Any `residual_couplings` entry is
+/// the precise pair the separation must revisit.
+pub fn certify_pairwise_independence(
+    data: ArrayView2<'_, f64>,
+    mean: &Array1<f64>,
+    candidates: &[IsaPlaneCandidate],
+    replicates: usize,
+    seed: u64,
+    alpha: f64,
+) -> Result<IndependenceCertificate, String> {
+    let verdicts = screen_all_pairs_phase(data, mean, candidates, replicates, seed, alpha)?;
+    let residual_couplings: Vec<ResidualCoupling> = verdicts
+        .iter()
+        .filter(|v| v.torus_proposed)
+        .map(|v| ResidualCoupling {
+            atom_a: v.atom_a,
+            atom_b: v.atom_b,
+            channel: v.best_channel,
+            e_value: v.best_e_value,
+        })
+        .collect();
+    Ok(IndependenceCertificate {
+        separated: residual_couplings.is_empty(),
+        residual_couplings,
+        verdicts,
+    })
+}
+
 /// The phase screen's contribution to the structure-search proposal stream: a
 /// [`StructureMove::Fusion`] for every pair the screen binds. Two proposal kinds
 /// share the Fusion move (both assert a `BindingEdge` the terminal joint fit
