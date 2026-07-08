@@ -180,6 +180,7 @@ _ASSIGNMENT_KINDS: dict[str, str] = {
     "softmax": "softmax",
     "threshold_gate": "threshold_gate",
     "jumprelu": "threshold_gate",
+    "topk": "topk",
 }
 
 _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
@@ -187,6 +188,7 @@ _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
     "softmax": "softmax",
     "threshold_gate": "threshold_gate",
     "jumprelu": "threshold_gate",
+    "topk": "topk",
 }
 
 # Public assignment alias table (#159). Both the ``assignment=`` and the
@@ -203,6 +205,8 @@ _PUBLIC_ASSIGNMENT_ALIASES: dict[str, str] = {
     "gated": "threshold_gate",
     "jump_relu": "threshold_gate",
     "jumprelu": "threshold_gate",
+    "topk": "topk",
+    "top_k": "topk",
 }
 
 
