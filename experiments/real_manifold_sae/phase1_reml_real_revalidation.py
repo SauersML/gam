@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import traceback
 from pathlib import Path
@@ -29,27 +30,67 @@ from pathlib import Path
 import numpy as np
 
 
-def load_slice(root: Path, category: str, n_rows: int, seed: int) -> np.ndarray:
+def load_slice(root: Path, category: str, n_rows: int, seed: int, cache_dir: Path | None) -> np.ndarray:
+    """Row-sample the activation memmap, with an atomic shared cache so parallel
+    jobs and restarts pay the 700GB-memmap gather exactly once per slice key."""
+    cache = None
+    if cache_dir is not None:
+        cache = cache_dir / f"slice_{category}_n{n_rows}_s{seed}.npy"
+        if cache.exists():
+            print(f"[phase1] slice cache hit: {cache}", flush=True)
+            return np.load(cache)
     acts = np.load(root / category / "activations.npy", mmap_mode="r")
     n_total = acts.shape[0]
     rng = np.random.default_rng(seed)
     idx = np.sort(rng.choice(n_total, size=min(n_rows, n_total), replace=False))
     z = np.asarray(acts[idx], dtype=np.float32)
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(f".tmp{os.getpid()}")
+        np.save(tmp, z)
+        os.replace(tmp, cache)  # atomic: concurrent writers race harmlessly
     return z
 
 
-def gpu_pca(z: np.ndarray, d: int, device: str) -> np.ndarray:
-    """Center + project to the top-d principal subspace (GPU SVD when available)."""
-    import torch
+def already_done(out: Path) -> set[str]:
+    """Config names already recorded in the output JSONL — the resume set."""
+    done: set[str] = set()
+    if out.exists():
+        for line in out.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("name"):
+                done.add(rec["name"])
+    return done
 
-    with torch.no_grad():
-        t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
-        t -= t.mean(dim=0, keepdim=True)
-        # Economy SVD of (n, D): top-d right singular vectors span the PCA basis.
-        _, s, vh = torch.linalg.svd(t, full_matrices=False)
-        proj = (t @ vh[:d].T).cpu().numpy().astype(np.float64)
-        ev_frac = float((s[:d] ** 2).sum() / (s**2).sum())
-    return proj, ev_frac
+
+class PcaCache:
+    """One SVD for the whole sweep; every config slices its top-d projection.
+
+    The economy SVD of the (n, 7168) slice is the dominant preprocessing cost —
+    recomputing it per config multiplied it by the config count for no reason.
+    """
+
+    def __init__(self, z: np.ndarray, device: str) -> None:
+        import torch
+
+        with torch.no_grad():
+            t = torch.from_numpy(z).to(device=device, dtype=torch.float32)
+            t -= t.mean(dim=0, keepdim=True)
+            _, s, vh = torch.linalg.svd(t, full_matrices=False)
+            self._t = t
+            self._s = s
+            self._vh = vh
+
+    def project(self, d: int):
+        import torch
+
+        with torch.no_grad():
+            proj = (self._t @ self._vh[:d].T).cpu().numpy().astype(np.float64)
+            ev_frac = float((self._s[:d] ** 2).sum() / (self._s**2).sum())
+        return proj, ev_frac
 
 
 def run_config(z: np.ndarray, cfg: dict) -> dict:
@@ -98,9 +139,19 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", type=Path, default=Path("phase1_results.jsonl"))
     ap.add_argument("--only", default=None, help="comma-separated config names to run")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="shared dir for the sampled-slice cache (resume + cross-job reuse)")
     args = ap.parse_args()
 
-    # The historical failure family first (all aborted pre-fix), then research shapes.
+    # Three families:
+    #  repro_* — the historical co-collapse family (all aborted pre-fix); kept
+    #            as the regression proof for the barrier fix.
+    #  mid_*   — modest undercomplete warm-ups.
+    #  oc_*    — the REAL manifold-SAE regime: overcomplete dictionaries
+    #            (atoms >> dims), per-row identifiability carried by top_k
+    #            sparsity + curvature. This is genus-2 frontier (pairwise
+    #            barrier known-inadequate pre-Jeffreys), so the K/D survival
+    #            threshold itself is the measurement.
     configs = [
         dict(name="repro_D2_K1", d_pca=2, K=1),
         dict(name="repro_D4_K1", d_pca=4, K=1),
@@ -109,18 +160,31 @@ def main() -> None:
         dict(name="mid_D32_K4", d_pca=32, K=4, top_k=2),
         dict(name="mid_D64_K8", d_pca=64, K=8, top_k=3),
         dict(name="wide_D128_K16", d_pca=128, K=16, top_k=4, n_iter=40),
+        dict(name="oc_D16_K64", d_pca=16, K=64, top_k=4, n_iter=40),
+        dict(name="oc_D32_K128", d_pca=32, K=128, top_k=4, n_iter=40),
+        dict(name="oc_D32_K256", d_pca=32, K=256, top_k=4, n_iter=30),
+        dict(name="oc_D64_K512", d_pca=64, K=512, top_k=8, n_iter=30),
     ]
     if args.only:
         wanted = set(args.only.split(","))
         configs = [c for c in configs if c["name"] in wanted]
 
+    done = already_done(args.out)
+    configs = [c for c in configs if c["name"] not in done]
+    if done:
+        print(f"[phase1] resume: skipping {sorted(done)}", flush=True)
+    if not configs:
+        print("[phase1] ALL CONFIGS DONE (resume: nothing left)", flush=True)
+        return
+
     print(f"[phase1] loading {args.n_rows} rows from {args.root}/{args.category}", flush=True)
-    z_raw = load_slice(args.root, args.category, args.n_rows, args.seed)
+    z_raw = load_slice(args.root, args.category, args.n_rows, args.seed, args.cache_dir)
     print(f"[phase1] slice {z_raw.shape} dtype={z_raw.dtype}", flush=True)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    pca = PcaCache(z_raw, args.device)
     for cfg in configs:
-        proj, ev_frac = gpu_pca(z_raw, cfg["d_pca"], args.device)
+        proj, ev_frac = pca.project(cfg["d_pca"])
         cfg["pca_ev_fraction"] = round(ev_frac, 4)
         cfg["category"] = args.category
         cfg["n_rows"] = int(proj.shape[0])

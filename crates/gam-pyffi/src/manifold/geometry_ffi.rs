@@ -30,6 +30,24 @@ fn sae_set_ibp_alpha(alpha: f64) {
     gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
 }
 
+/// K-aware default IBP concentration `α` (#1784) from the Rust source of truth
+/// `assignment::default_ibp_concentration_for_k_atoms`. Exposed so the Python
+/// facade calls the core formula (`α = max(1, 1/(exp(1/K) − 1))`) instead of
+/// mirroring it — the thin-wrapper SPEC: no numeric policy lives in Python.
+#[pyfunction]
+fn sae_default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
+    gam::terms::sae::assignment::default_ibp_concentration_for_k_atoms(k_atoms)
+}
+
+/// Default large-K active cap from the data-per-atom ratio, from the Rust source
+/// of truth `assignment::default_top_k_for_large_dictionary`. Returns Python
+/// `None` when the dense softmax path is admitted (`N/K ≥ K`, or `K ≤ 1`), and
+/// otherwise the per-row cap `clamp(ceil(N/K), 1, K−1)`.
+#[pyfunction]
+fn sae_default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Option<usize> {
+    gam::terms::sae::assignment::default_top_k_for_large_dictionary(n_obs, k_atoms)
+}
+
 #[pyfunction]
 fn sae_fit_admission<'py>(
     py: Python<'py>,
@@ -117,6 +135,48 @@ fn sae_auto_k_recommendation(
     out.set_item("linear_k", rec.advantage.k_linear)?;
     out.set_item("efficiency_ratio", rec.advantage.compression_ratio)?;
     out.set_item("confirmed", rec.advantage.manifold_dominates())?;
+    Ok(out.into())
+}
+
+/// Fit-level bits/token description length of a manifold-SAE reconstruction.
+///
+/// The headline currency the results.md postmortem argues for: the whole fit's
+/// code length per token, decomposed into code / selection / dictionary bits,
+/// computed from the fit's own summary quantities (achieved EV, active-atom
+/// count, coordinate dim, dictionary size, decoder scalar count). Every math
+/// term is owned by `description_length::manifold_fit_description_length`; this
+/// only marshals scalars in and the decomposition out.
+#[pyfunction(signature = (ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits = None))]
+fn sae_manifold_description_length(
+    py: Python<'_>,
+    ev: f64,
+    n_tokens: i64,
+    k_active: f64,
+    coord_dim: f64,
+    g_dict: i64,
+    n_params: i64,
+    l_param_bits: Option<f64>,
+) -> PyResult<PyObject> {
+    let dl = gam::terms::sae::description_length::manifold_fit_description_length(
+        ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits,
+    );
+    let out = PyDict::new(py);
+    out.set_item("bits_per_token", dl.bits_per_token)?;
+    out.set_item("total_bits", dl.total_bits)?;
+    out.set_item("code_bits", dl.code_bits)?;
+    out.set_item("selection_bits", dl.selection_bits)?;
+    out.set_item("dict_bits", dl.dict_bits)?;
+    out.set_item("code_bits_per_token", dl.code_bits_per_token)?;
+    out.set_item("selection_bits_per_token", dl.selection_bits_per_token)?;
+    out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
+    out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;
+    out.set_item("l_param_bits", dl.l_param_bits)?;
+    out.set_item("ev", dl.ev)?;
+    out.set_item("n_tokens", dl.n_tokens)?;
+    out.set_item("k_active", dl.k_active)?;
+    out.set_item("coord_dim", dl.coord_dim)?;
+    out.set_item("g_dict", dl.g_dict)?;
+    out.set_item("n_params", dl.n_params)?;
     Ok(out.into())
 }
 
@@ -601,6 +661,23 @@ fn sae_duchon_centers_nd<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let centers_owned = centers_1d.as_array().to_owned();
     let out = py.detach(move || sae_duchon_centers_nd_impl(centers_owned.view(), d));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Sinkhorn per-atom log-bias potentials that balance atom usage across the
+/// batch (torch-lane routing helper for `ManifoldSAE`). Given the row-wise
+/// log-responsibilities `log_scores[n, k]`, returns the additive potential
+/// `b_k`; the Python caller forms the balanced responsibilities as
+/// `log_scores + b`, keeping `log_scores` on the autograd tape while `b` is a
+/// detached constant. See `gam::geometry::sae_routing::sinkhorn_balance_bias`.
+#[pyfunction]
+fn sae_sinkhorn_balance_bias<'py>(
+    py: Python<'py>,
+    log_scores: PyReadonlyArray2<'py, f64>,
+    iters: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let scores_owned = log_scores.as_array().to_owned();
+    let out = py.detach(move || sae_sinkhorn_balance_bias_impl(scores_owned.view(), iters));
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -4240,6 +4317,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
@@ -4260,8 +4338,17 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_ibp_alpha, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sae_default_ibp_concentration_for_k_atoms,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        sae_default_top_k_for_large_dictionary,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
@@ -4480,6 +4567,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(conditional_coactivation_influence, module)?)?;
     module.add_function(wrap_pyfunction!(coupling_robustness_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(effect_weighted_retention, module)?)?;
+    module.add_function(wrap_pyfunction!(chart_interp_score, module)?)?;
+    module.add_function(wrap_pyfunction!(dose_response_calibration, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        coordinate_posterior_from_precision,
+        module
+    )?)?;
     Ok(())
 }
 

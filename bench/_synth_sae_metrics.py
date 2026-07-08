@@ -181,6 +181,78 @@ def n_firing_latents(activations: np.ndarray, threshold: float = 1e-8) -> int:
 
 
 @dataclass(frozen=True)
+class ContributionRecovery:
+    """Per-manifold contribution recovery under optimal atom<->factor matching.
+
+    The BSF ("structure wins at every distortion") toy scores, for each planted
+    manifold/factor ``i``, how well the atom *assigned to it* recovers that
+    factor's CONTRIBUTION signal -- not the raw-activation reconstruction R2. The
+    atom<->factor assignment is the exact Hungarian |cosine| matching of decoder
+    directions to planted directions (the same matching :func:`recovery_scores`
+    uses). For each matched pair ``(atom r, factor c)`` the recovery is::
+
+        m_c = corr(learned_activation[:, r], truth_contribution[:, c]) ** 2
+
+    i.e. the R2 of the single-feature linear predictor -- scale- and sign-free,
+    which is required because SAE codes carry an arbitrary gauge (scale/sign). A
+    factor whose matched atom fires in lock-step with it scores ~1; an unmatched
+    or dead atom scores 0. ``mean`` averages over matched factors; ``per_factor``
+    is aligned to the matched planted-factor indices in ``factor_index``.
+    """
+
+    mean: float
+    per_factor: np.ndarray
+    factor_index: np.ndarray
+    rows: np.ndarray
+    matching: str
+
+
+def contribution_recovery(
+    learned_dirs: np.ndarray,
+    learned_activations: np.ndarray,
+    truth_dirs: np.ndarray,
+    truth_contributions: np.ndarray,
+) -> ContributionRecovery:
+    """Per-factor contribution recovery ``m_i`` under optimal atom<->factor match.
+
+    ``learned_dirs`` (``L x D``) columns must align with ``learned_activations``
+    (``N x L``); ``truth_dirs`` (``T x D``) columns must align with
+    ``truth_contributions`` (``N x T``, e.g. the planted coefficient columns).
+    Matching is exact Hungarian |cosine|; each matched pair's recovery is the
+    squared Pearson correlation of the atom activation to the factor's
+    contribution (0 when either series is constant). Empty input -> ``mean`` 0.0.
+    """
+    learned_dirs = np.asarray(learned_dirs, dtype=float)
+    truth_dirs = np.asarray(truth_dirs, dtype=float)
+    acts = np.asarray(learned_activations, dtype=float)
+    contrib = np.asarray(truth_contributions, dtype=float)
+    rows, cols, method = match_directions(learned_dirs, truth_dirs)
+    if rows.size == 0 or acts.size == 0 or contrib.size == 0:
+        return ContributionRecovery(
+            0.0, np.empty(0), np.empty(0, dtype=int), rows, method
+        )
+    m_vals: list[float] = []
+    for r, c in zip(rows, cols):
+        a = acts[:, int(r)]
+        b = contrib[:, int(c)]
+        sa = float(np.std(a))
+        sb = float(np.std(b))
+        if sa <= 1e-12 or sb <= 1e-12:
+            m_vals.append(0.0)
+            continue
+        corr = float(np.corrcoef(a, b)[0, 1])
+        m_vals.append(corr * corr)
+    per_factor = np.asarray(m_vals, dtype=float)
+    return ContributionRecovery(
+        float(per_factor.mean()) if per_factor.size else 0.0,
+        per_factor,
+        np.asarray(cols, dtype=int),
+        rows,
+        method,
+    )
+
+
+@dataclass(frozen=True)
 class RecoveryScores:
     """Quality-aware one-to-one recovery plus the matched-pair MCC.
 

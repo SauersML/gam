@@ -175,6 +175,7 @@ mod arrow_solver;
 mod atom;
 mod behavior;
 mod behavior_fit;
+mod behavior_isometry;
 mod certificate;
 mod construction;
 mod construction_ard;
@@ -337,6 +338,8 @@ mod lambda_smooth_1556_tests;
 
 #[cfg(test)]
 mod tests_behavior_twoblock_rung2;
+#[cfg(test)]
+mod tests_behavior_isometry_2015;
 
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
@@ -356,10 +359,14 @@ mod tests_chart_angle_fidelity_2081;
 #[cfg(test)]
 mod tests_joint_vs_cascade_2131;
 
+#[cfg(test)]
+mod tests_outer_row_subsample;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use behavior::*;
 pub use behavior_fit::*;
+pub use behavior_isometry::*;
 pub use certificate::*;
 pub use construction_aux_types::*;
 pub use construction_cache_refresh::*;

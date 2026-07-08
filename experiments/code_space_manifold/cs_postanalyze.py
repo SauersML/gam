@@ -5,7 +5,7 @@ manifold adjacency?), RD Pareto verdict, and calendar readout. Prints a markdown
 import json, sys
 import numpy as np
 
-d = sys.argv[1] if len(sys.argv) > 1 else "code_space_out_0"
+d = sys.argv[1] if len(sys.argv) > 1 else "/projects/standard/hsiehph/sauer354/code_space_out_0"
 G = json.load(open(f"{d}/discovered_groups.json"))
 RD = json.load(open(f"{d}/rate_distortion.json"))
 S = G["summary"]

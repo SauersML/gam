@@ -439,25 +439,147 @@ def audit_sae(
         cod,
         acts,
         rw_cod,
-        active,
-        block_size,
-        block_topk,
-        delta,
-        q_levels,
-        max_candidates,
-        blocks,
-        activation_threshold,
-        max_absorption_pairs,
-        theta_in,
-        theta_out,
-        transport_layer_from,
-        transport_layer_to,
+        {
+            "active": active,
+            "block_size": block_size,
+            "block_topk": block_topk,
+            "delta": delta,
+            "quantile_levels": q_levels,
+            "max_candidates": max_candidates,
+            "coordinate_blocks": blocks,
+            "activation_threshold": activation_threshold,
+            "max_absorption_pairs": max_absorption_pairs,
+            "transport_theta_in": theta_in,
+            "transport_theta_out": theta_out,
+            "transport_layer_from": transport_layer_from,
+            "transport_layer_to": transport_layer_to,
+        },
     )
     report = dict(payload)
     report["checkpoint"] = checkpoint_meta
     report["route_source"] = route_meta
     report["api"] = "gamfit.audit_sae"
     return report
+
+
+# --------------------------------------------------------------------------- #
+# SAEBench manifold-native metrics (chart-interp, dose-response, posterior)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ChartInterpReport:
+    """Orientation-quotiented weighted cyclic phase-lock of a recovered chart
+    coordinate against ground-truth cyclic labels (#1942 chart-interp metric).
+
+    ``circular_correlation`` is the ``[0, 1]`` phase-lock after quotienting
+    orientation; ``signed_circular_correlation`` keeps the sign (negative when
+    the recovered coordinate runs backwards relative to the labels);
+    ``effective_weight`` is the accepted posterior/evidence weight mass.
+    """
+
+    circular_correlation: float
+    signed_circular_correlation: float
+    effective_weight: float
+
+
+def chart_interp_score(
+    observations: list[tuple[float, float, float]],
+) -> ChartInterpReport:
+    """Score chart-coordinate interpretability against cyclic labels.
+
+    ``observations`` are ``(recovered_turns, label_turns, weight)`` triples: the
+    recovered chart coordinate and its ground-truth cyclic label, both in turns
+    (wrapped modulo one), and a non-negative posterior/evidence weight. All
+    scoring is the audited Rust ``chart_interp_score`` definition."""
+    payload = rust_module().chart_interp_score(
+        [(float(t), float(y), float(w)) for t, y, w in observations]
+    )
+    return ChartInterpReport(
+        circular_correlation=float(payload["circular_correlation"]),
+        signed_circular_correlation=float(payload["signed_circular_correlation"]),
+        effective_weight=float(payload["effective_weight"]),
+    )
+
+
+@dataclass(frozen=True)
+class DoseResponseCalibrationReport:
+    """Output-Fisher dose-response calibration ledger (#1942 dose-response
+    metric).
+
+    ``slope_through_origin`` is the no-intercept weighted least-squares slope of
+    measured nats on predicted output-Fisher nats and ``r2_through_origin`` its
+    weighted R²; ``mean_measured_nats_per_arc`` / ``cv_measured_nats_per_arc``
+    are the weighted mean and coefficient of variation of measured nats per unit
+    arc-length — the unit-speed constancy kill-test.
+    """
+
+    slope_through_origin: float
+    r2_through_origin: float
+    mean_measured_nats_per_arc: float
+    cv_measured_nats_per_arc: float
+    effective_weight: float
+
+
+def dose_response_calibration(
+    observations: list[tuple[float, float, float, float]],
+) -> DoseResponseCalibrationReport:
+    """Fit the dose-response calibration ledger along a steered arc.
+
+    ``observations`` are ``(arc_length, predicted_nats, measured_nats, weight)``
+    rows: the unit-speed path coordinate, the local output-Fisher prediction in
+    nats, the measured KL/behaviour change in nats, and a non-negative weight.
+    All scoring is the audited Rust ``dose_response_calibration`` definition."""
+    payload = rust_module().dose_response_calibration(
+        [
+            (float(s), float(p), float(m), float(w))
+            for s, p, m, w in observations
+        ]
+    )
+    return DoseResponseCalibrationReport(
+        slope_through_origin=float(payload["slope_through_origin"]),
+        r2_through_origin=float(payload["r2_through_origin"]),
+        mean_measured_nats_per_arc=float(payload["mean_measured_nats_per_arc"]),
+        cv_measured_nats_per_arc=float(payload["cv_measured_nats_per_arc"]),
+        effective_weight=float(payload["effective_weight"]),
+    )
+
+
+@dataclass(frozen=True)
+class CoordinatePosterior:
+    """Per-coordinate Gaussian posterior inverted from a row-Hessian precision
+    block the arrow solve already factors (#1942 posterior enabler).
+
+    ``covariance_diag`` is the diagonal of the inverse-precision covariance,
+    ``covariance_trace`` its trace, and ``precision_weight`` the evidence mass
+    ``1 / trace`` that weights both manifold-native metrics.
+    """
+
+    mean: list[float]
+    covariance_diag: list[float]
+    covariance_trace: float
+    precision_weight: float
+
+
+def coordinate_posterior_from_precision(
+    mean: Any,
+    precision_row_major: Any,
+) -> CoordinatePosterior:
+    """Invert a row-Hessian precision block into a per-coordinate posterior.
+
+    ``mean`` is the posterior mean coordinate and ``precision_row_major`` the
+    row-major ``d x d`` precision (inverse-covariance) block. The inversion and
+    trace are computed by the audited Rust
+    ``coordinate_posterior_from_precision``."""
+    mean_vec = [float(v) for v in np.asarray(mean, dtype=np.float64).ravel()]
+    precision_vec = [
+        float(v) for v in np.asarray(precision_row_major, dtype=np.float64).ravel()
+    ]
+    payload = rust_module().coordinate_posterior_from_precision(mean_vec, precision_vec)
+    return CoordinatePosterior(
+        mean=[float(v) for v in payload["mean"]],
+        covariance_diag=[float(v) for v in payload["covariance_diag"]],
+        covariance_trace=float(payload["covariance_trace"]),
+        precision_weight=float(payload["precision_weight"]),
+    )
 
 
 # --------------------------------------------------------------------------- #

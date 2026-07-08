@@ -1120,46 +1120,13 @@ fn standing_null_calibration(
     Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)))
 }
 
-/// One-shot audit over an externally supplied, frozen SAE dictionary: decoder
-/// rows `K×P`, dense activation/codes matrix `N×K`, source activations `N×P`,
-/// and an architecture-matched random-weight code donor `N'×K` for the required
-/// topology/atlas null battery. No fitting occurs here; the function
-/// reconstructs the frozen rows, derives the sparse/block routing views required
-/// by the existing Rust diagnostics, calibrates the topology/atlas claims
-/// against the donor null and a residual spike-in, and returns a dict of
-/// dual-cert, routability, coordinate-SE, absorption, topology, atlas-nerve, and
-/// optional transport diagnostics.
-#[pyfunction(signature = (
-    decoder,
-    codes,
-    data,
-    random_weight_codes,
-    active = None,
-    block_size = 1,
-    block_topk = None,
-    delta = 0.05,
-    quantile_levels = None,
-    max_candidates = 16,
-    coordinate_blocks = None,
-    activation_threshold = 0.0,
-    max_absorption_pairs = 32,
-    transport_theta_in = None,
-    transport_theta_out = None,
-    transport_layer_from = 0,
-    transport_layer_to = 1,
-    null_replicates = 64,
-    null_seed = 0x5AE0_A0D1_u64,
-    spikein_trials = 32,
-    spikein_snr = 2.0,
-    spikein_false_positive_rate = 0.05
-))]
-#[allow(clippy::too_many_arguments)]
-fn audit_sae<'py>(
-    py: Python<'py>,
-    decoder: PyReadonlyArray2<'py, f32>,
-    codes: PyReadonlyArray2<'py, f32>,
-    data: PyReadonlyArray2<'py, f32>,
-    random_weight_codes: PyReadonlyArray2<'py, f32>,
+/// Typed knob bundle for `audit_sae`, decoded from the single Python-side
+/// `options` dict so the FFI entrypoint keeps a small fixed arity while the
+/// audit keeps its full tuning surface. Field defaults are the audit's
+/// long-standing keyword defaults; [`SaeAuditOptions::from_pydict`] overlays
+/// caller-provided keys on top of them and hard-errors on unknown keys so a
+/// typo can never silently fall back to a default.
+struct SaeAuditOptions {
     active: Option<usize>,
     block_size: usize,
     block_topk: Option<usize>,
@@ -1169,8 +1136,8 @@ fn audit_sae<'py>(
     coordinate_blocks: Option<Vec<usize>>,
     activation_threshold: f32,
     max_absorption_pairs: usize,
-    transport_theta_in: Option<PyReadonlyArray1<'py, f64>>,
-    transport_theta_out: Option<PyReadonlyArray1<'py, f64>>,
+    transport_theta_in: Option<Vec<f64>>,
+    transport_theta_out: Option<Vec<f64>>,
     transport_layer_from: usize,
     transport_layer_to: usize,
     null_replicates: usize,
@@ -1178,7 +1145,261 @@ fn audit_sae<'py>(
     spikein_trials: usize,
     spikein_snr: f64,
     spikein_false_positive_rate: f64,
+}
+
+impl SaeAuditOptions {
+    /// Every key `from_pydict` accepts, in documentation order; kept as a
+    /// single list so the unknown-key error names the full valid vocabulary.
+    const KNOWN_KEYS: [&'static str; 18] = [
+        "active",
+        "block_size",
+        "block_topk",
+        "delta",
+        "quantile_levels",
+        "max_candidates",
+        "coordinate_blocks",
+        "activation_threshold",
+        "max_absorption_pairs",
+        "transport_theta_in",
+        "transport_theta_out",
+        "transport_layer_from",
+        "transport_layer_to",
+        "null_replicates",
+        "null_seed",
+        "spikein_trials",
+        "spikein_snr",
+        "spikein_false_positive_rate",
+    ];
+
+    /// The audit's historical keyword defaults (the pre-dict FFI signature).
+    fn defaults() -> Self {
+        Self {
+            active: None,
+            block_size: 1,
+            block_topk: None,
+            delta: 0.05,
+            quantile_levels: None,
+            max_candidates: 16,
+            coordinate_blocks: None,
+            activation_threshold: 0.0,
+            max_absorption_pairs: 32,
+            transport_theta_in: None,
+            transport_theta_out: None,
+            transport_layer_from: 0,
+            transport_layer_to: 1,
+            null_replicates: 64,
+            null_seed: 0x5AE0_A0D1,
+            spikein_trials: 32,
+            spikein_snr: 2.0,
+            spikein_false_positive_rate: 0.05,
+        }
+    }
+
+    /// Wrap an extraction failure for one options entry with the key name so
+    /// the caller sees which knob was malformed.
+    fn knob_error(key: &str, err: &PyErr) -> PyErr {
+        PyValueError::new_err(format!("audit_sae options[{key:?}]: {err}"))
+    }
+
+    /// `None`-passthrough extraction for the optional integer knobs
+    /// (`active`, `block_topk`).
+    fn optional_usize(value: &Bound<'_, PyAny>, key: &str) -> PyResult<Option<usize>> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        value
+            .extract::<usize>()
+            .map(Some)
+            .map_err(|err| Self::knob_error(key, &err))
+    }
+
+    /// `None`-passthrough extraction for the optional index-list knob
+    /// (`coordinate_blocks`).
+    fn optional_usize_vec(value: &Bound<'_, PyAny>, key: &str) -> PyResult<Option<Vec<usize>>> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        value
+            .extract::<Vec<usize>>()
+            .map(Some)
+            .map_err(|err| Self::knob_error(key, &err))
+    }
+
+    /// `None`-passthrough extraction for the optional float-vector knobs
+    /// (`quantile_levels`, `transport_theta_in`, `transport_theta_out`).
+    /// The transport angles arrive from the Python facade as contiguous 1-D
+    /// float64 numpy arrays, so a `PyReadonlyArray1<f64>` fast path is tried
+    /// first; plain float sequences (lists/tuples) fall through to the
+    /// `Vec<f64>` extraction.
+    fn optional_f64_vec(value: &Bound<'_, PyAny>, key: &str) -> PyResult<Option<Vec<f64>>> {
+        if value.is_none() {
+            return Ok(None);
+        }
+        if let Ok(array) = value.extract::<PyReadonlyArray1<f64>>() {
+            return Ok(Some(array.as_array().to_vec()));
+        }
+        value
+            .extract::<Vec<f64>>()
+            .map(Some)
+            .map_err(|err| Self::knob_error(key, &err))
+    }
+
+    /// Decode the `options` dict: start from [`Self::defaults`], overlay every
+    /// provided key, and reject unknown keys and non-string keys outright.
+    fn from_pydict(options: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut cfg = Self::defaults();
+        let Some(options) = options else {
+            return Ok(cfg);
+        };
+        for (key_any, value) in options.iter() {
+            let key = key_any.extract::<String>().map_err(|_| {
+                PyValueError::new_err("audit_sae options keys must be strings")
+            })?;
+            match key.as_str() {
+                "active" => cfg.active = Self::optional_usize(&value, &key)?,
+                "block_size" => {
+                    cfg.block_size = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "block_topk" => cfg.block_topk = Self::optional_usize(&value, &key)?,
+                "delta" => {
+                    cfg.delta = value
+                        .extract::<f64>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "quantile_levels" => {
+                    cfg.quantile_levels = Self::optional_f64_vec(&value, &key)?;
+                }
+                "max_candidates" => {
+                    cfg.max_candidates = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "coordinate_blocks" => {
+                    cfg.coordinate_blocks = Self::optional_usize_vec(&value, &key)?;
+                }
+                "activation_threshold" => {
+                    cfg.activation_threshold = value
+                        .extract::<f32>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "max_absorption_pairs" => {
+                    cfg.max_absorption_pairs = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "transport_theta_in" => {
+                    cfg.transport_theta_in = Self::optional_f64_vec(&value, &key)?;
+                }
+                "transport_theta_out" => {
+                    cfg.transport_theta_out = Self::optional_f64_vec(&value, &key)?;
+                }
+                "transport_layer_from" => {
+                    cfg.transport_layer_from = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "transport_layer_to" => {
+                    cfg.transport_layer_to = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "null_replicates" => {
+                    cfg.null_replicates = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "null_seed" => {
+                    cfg.null_seed = value
+                        .extract::<u64>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "spikein_trials" => {
+                    cfg.spikein_trials = value
+                        .extract::<usize>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "spikein_snr" => {
+                    cfg.spikein_snr = value
+                        .extract::<f64>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                "spikein_false_positive_rate" => {
+                    cfg.spikein_false_positive_rate = value
+                        .extract::<f64>()
+                        .map_err(|err| Self::knob_error(&key, &err))?;
+                }
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "audit_sae options has unknown key {other:?}; valid keys: {}",
+                        Self::KNOWN_KEYS.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(cfg)
+    }
+}
+
+/// One-shot audit over an externally supplied, frozen SAE dictionary: decoder
+/// rows `K×P`, dense activation/codes matrix `N×K`, source activations `N×P`,
+/// and an architecture-matched random-weight code donor `N'×K` for the required
+/// topology/atlas null battery. No fitting occurs here; the function
+/// reconstructs the frozen rows, derives the sparse/block routing views required
+/// by the existing Rust diagnostics, calibrates the topology/atlas claims
+/// against the donor null and a residual spike-in, and returns a dict of
+/// dual-cert, routability, coordinate-SE, absorption, topology, atlas-nerve, and
+/// optional transport diagnostics.
+///
+/// All tuning knobs travel in the single optional `options` dict; omitted keys
+/// (or `options = None`) take the audit's long-standing defaults, and unknown
+/// keys are a hard error. Accepted keys and their defaults:
+///
+/// * `active = None` — sparse-lane atoms per row (`block_size == 1`).
+/// * `block_size = 1` — dictionary block width; `>= 2` selects the block lane.
+/// * `block_topk = None` — active blocks per row in the block lane.
+/// * `delta = 0.05` — routability confidence level.
+/// * `quantile_levels = None` — routability quantiles (default `[0.5, 0.9, 0.99]`).
+/// * `max_candidates = 16` — dual-certificate candidate budget.
+/// * `coordinate_blocks = None` — block indices for the harmonic coordinate readout.
+/// * `activation_threshold = 0.0` — firing threshold for topology/atlas/absorption.
+/// * `max_absorption_pairs = 32` — absorption-audit pair budget.
+/// * `transport_theta_in = None` / `transport_theta_out = None` — paired circle
+///   coordinates (1-D float64 array or float sequence) for the transport class.
+/// * `transport_layer_from = 0` / `transport_layer_to = 1` — transport layer labels.
+/// * `null_replicates = 64`, `null_seed = 0x5AE0_A0D1` — donor null battery.
+/// * `spikein_trials = 32`, `spikein_snr = 2.0`,
+///   `spikein_false_positive_rate = 0.05` — residual spike-in ROC calibration.
+#[pyfunction(signature = (decoder, codes, data, random_weight_codes, options = None))]
+fn audit_sae<'py>(
+    py: Python<'py>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    codes: PyReadonlyArray2<'py, f32>,
+    data: PyReadonlyArray2<'py, f32>,
+    random_weight_codes: PyReadonlyArray2<'py, f32>,
+    options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
+    let SaeAuditOptions {
+        active,
+        block_size,
+        block_topk,
+        delta,
+        quantile_levels,
+        max_candidates,
+        coordinate_blocks,
+        activation_threshold,
+        max_absorption_pairs,
+        transport_theta_in: theta_in_values,
+        transport_theta_out: theta_out_values,
+        transport_layer_from,
+        transport_layer_to,
+        null_replicates,
+        null_seed,
+        spikein_trials,
+        spikein_snr,
+        spikein_false_positive_rate,
+    } = SaeAuditOptions::from_pydict(options)?;
     let decoder_values = decoder.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
     let data_values = data.as_array().to_owned();
@@ -1271,8 +1492,6 @@ fn audit_sae<'py>(
         spikein_false_positive_rate,
     };
     let quantiles = quantile_levels.unwrap_or_else(|| vec![0.5, 0.9, 0.99]);
-    let theta_in_values = transport_theta_in.map(|values| values.as_array().to_owned().to_vec());
-    let theta_out_values = transport_theta_out.map(|values| values.as_array().to_owned().to_vec());
 
     let audit = detach_py_result(py, "audit_sae", move || {
         let residuals =
@@ -1530,30 +1749,36 @@ mod sae_spectral_ffi_tests {
             let theta_in_py = theta_in.into_pyarray(py);
             let theta_out_py = theta_out.into_pyarray(py);
 
+            let options = PyDict::new(py);
+            options
+                .set_item("quantile_levels", vec![0.5, 0.9])
+                .expect("set quantile_levels");
+            options
+                .set_item("max_candidates", 4)
+                .expect("set max_candidates");
+            options
+                .set_item("max_absorption_pairs", 4)
+                .expect("set max_absorption_pairs");
+            options
+                .set_item("transport_theta_in", &theta_in_py)
+                .expect("set transport_theta_in");
+            options
+                .set_item("transport_theta_out", &theta_out_py)
+                .expect("set transport_theta_out");
+            options
+                .set_item("transport_layer_from", 3)
+                .expect("set transport_layer_from");
+            options
+                .set_item("transport_layer_to", 4)
+                .expect("set transport_layer_to");
+
             let payload = audit_sae(
                 py,
                 decoder_py.readonly(),
                 codes_py.readonly(),
                 data_py.readonly(),
                 donor_py.readonly(),
-                None,
-                1,
-                None,
-                0.05,
-                Some(vec![0.5, 0.9]),
-                4,
-                None,
-                0.0,
-                4,
-                Some(theta_in_py.readonly()),
-                Some(theta_out_py.readonly()),
-                3,
-                4,
-                64,
-                0x5AE0_A0D1,
-                32,
-                2.0,
-                0.05,
+                Some(&options),
             )
             .expect("audit_sae FFI round-trip");
 
@@ -1591,6 +1816,23 @@ mod sae_spectral_ffi_tests {
                     .extract::<usize>()
                     .expect("transport n_samples usize"),
                 8
+            );
+        });
+    }
+
+    #[test]
+    fn audit_sae_options_rejects_unknown_keys() {
+        Python::attach(|py| {
+            let options = PyDict::new(py);
+            options
+                .set_item("block_sise", 2)
+                .expect("set misspelled key");
+            let err = SaeAuditOptions::from_pydict(Some(&options))
+                .expect_err("typo'd options key must error, not fall back to defaults");
+            let message = err.to_string();
+            assert!(
+                message.contains("unknown key \"block_sise\"") && message.contains("block_size"),
+                "unknown-key error must name the typo and the valid vocabulary; got {message}"
             );
         });
     }
@@ -1834,6 +2076,116 @@ fn effect_weighted_retention(
     Ok(out.unbind())
 }
 
+/// Score chart-coordinate interpretability against cyclic ground-truth labels.
+///
+/// `observations` are `(recovered_turns, label_turns, weight)` triples: the
+/// recovered chart coordinate and the ground-truth cyclic label, both in turns
+/// (values are wrapped modulo one), plus a non-negative posterior/evidence
+/// weight per row. Returns `{circular_correlation, signed_circular_correlation,
+/// effective_weight}` from the audited [`saebench_metrics::chart_interp_score`]
+/// definition — the orientation-quotiented weighted cyclic phase-lock the #1942
+/// chart-interp metric reports.
+#[pyfunction(signature = (observations,))]
+fn chart_interp_score(
+    py: Python<'_>,
+    observations: Vec<(f64, f64, f64)>,
+) -> PyResult<Py<PyDict>> {
+    let report = detach_py_result(py, "chart_interp_score", move || {
+        let rows: Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation> = observations
+            .iter()
+            .map(|&(recovered_turns, label_turns, weight)| {
+                gam::terms::sae::saebench_metrics::ChartInterpObservation {
+                    recovered_turns,
+                    label_turns,
+                    weight,
+                }
+            })
+            .collect();
+        gam::terms::sae::saebench_metrics::chart_interp_score(&rows)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("circular_correlation", report.circular_correlation)?;
+    out.set_item(
+        "signed_circular_correlation",
+        report.signed_circular_correlation,
+    )?;
+    out.set_item("effective_weight", report.effective_weight)?;
+    Ok(out.unbind())
+}
+
+/// Fit the output-Fisher dose-response calibration ledger.
+///
+/// `observations` are `(arc_length, predicted_nats, measured_nats, weight)`
+/// rows along a steered arc: the unit-speed path coordinate, the local
+/// output-Fisher prediction in nats, the measured KL/behaviour change in nats,
+/// and a non-negative weight. Returns `{slope_through_origin, r2_through_origin,
+/// mean_measured_nats_per_arc, cv_measured_nats_per_arc, effective_weight}` from
+/// the audited [`saebench_metrics::dose_response_calibration`] — the #1942
+/// dose-response calibration figure (through-origin slope + weighted R², plus
+/// the unit-speed constancy kill-test via the nats-per-arc coefficient of
+/// variation).
+#[pyfunction(signature = (observations,))]
+fn dose_response_calibration(
+    py: Python<'_>,
+    observations: Vec<(f64, f64, f64, f64)>,
+) -> PyResult<Py<PyDict>> {
+    let report = detach_py_result(py, "dose_response_calibration", move || {
+        let rows: Vec<gam::terms::sae::saebench_metrics::DoseResponseObservation> = observations
+            .iter()
+            .map(
+                |&(arc_length, predicted_nats, measured_nats, weight)| {
+                    gam::terms::sae::saebench_metrics::DoseResponseObservation {
+                        arc_length,
+                        predicted_nats,
+                        measured_nats,
+                        weight,
+                    }
+                },
+            )
+            .collect();
+        gam::terms::sae::saebench_metrics::dose_response_calibration(&rows)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("slope_through_origin", report.slope_through_origin)?;
+    out.set_item("r2_through_origin", report.r2_through_origin)?;
+    out.set_item(
+        "mean_measured_nats_per_arc",
+        report.mean_measured_nats_per_arc,
+    )?;
+    out.set_item("cv_measured_nats_per_arc", report.cv_measured_nats_per_arc)?;
+    out.set_item("effective_weight", report.effective_weight)?;
+    Ok(out.unbind())
+}
+
+/// Invert a row-Hessian precision block into a per-coordinate posterior.
+///
+/// `mean` is the posterior mean coordinate the fit/encoder supplies and
+/// `precision_row_major` is the row-major `d x d` precision (inverse-covariance)
+/// block that the arrow solve already factors for that chart coordinate.
+/// Returns `{mean, covariance_diag, covariance_trace, precision_weight}` from
+/// the audited [`saebench_metrics::coordinate_posterior_from_precision`]: the
+/// per-token coordinate posterior uncertainty that weights both #1942
+/// manifold-native metrics and tightens the steering validity radius.
+#[pyfunction(signature = (mean, precision_row_major))]
+fn coordinate_posterior_from_precision(
+    py: Python<'_>,
+    mean: Vec<f64>,
+    precision_row_major: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let posterior = detach_py_result(py, "coordinate_posterior_from_precision", move || {
+        gam::terms::sae::saebench_metrics::coordinate_posterior_from_precision(
+            &mean,
+            &precision_row_major,
+        )
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("mean", posterior.mean)?;
+    out.set_item("covariance_diag", posterior.covariance_diag)?;
+    out.set_item("covariance_trace", posterior.covariance_trace)?;
+    out.set_item("precision_weight", posterior.precision_weight)?;
+    Ok(out.unbind())
+}
+
 #[cfg(test)]
 mod ffi_completeness_tests {
     use super::*;
@@ -1927,6 +2279,98 @@ mod ffi_completeness_tests {
             let r1: bool = a1.get_item("retained").unwrap().unwrap().extract().unwrap();
             assert!(!r1, "atom 1 should not be retained");
             assert!(a1.get_item("variance").unwrap().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn chart_interp_score_quotients_orientation_over_the_ffi_boundary() {
+        Python::attach(|py| {
+            // Recovered coordinate runs backwards relative to the cyclic label;
+            // the orientation-quotiented score still locks phase, and the signed
+            // score records the reversal.
+            let out = chart_interp_score(
+                py,
+                vec![
+                    (0.99, 0.01, 1.0),
+                    (0.24, 0.76, 1.0),
+                    (0.49, 0.51, 1.0),
+                    (0.74, 0.26, 1.0),
+                ],
+            )
+            .expect("chart interp score");
+            let d = out.bind(py);
+            let cc: f64 = d
+                .get_item("circular_correlation")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(cc > 0.99, "circular_correlation = {cc}");
+            let signed: f64 = d
+                .get_item("signed_circular_correlation")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(signed < 0.0, "signed_circular_correlation = {signed}");
+        });
+    }
+
+    #[test]
+    fn dose_response_calibration_reports_slope_and_unit_speed_constancy() {
+        Python::attach(|py| {
+            let out = dose_response_calibration(
+                py,
+                vec![
+                    (1.0, 0.5, 1.0, 1.0),
+                    (2.0, 1.0, 2.0, 1.0),
+                    (3.0, 1.5, 3.0, 1.0),
+                ],
+            )
+            .expect("dose response calibration");
+            let d = out.bind(py);
+            let slope: f64 = d
+                .get_item("slope_through_origin")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((slope - 2.0).abs() < 1e-9, "slope = {slope}");
+            let cv: f64 = d
+                .get_item("cv_measured_nats_per_arc")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(cv < 1e-9, "unit-speed cv = {cv}");
+        });
+    }
+
+    #[test]
+    fn coordinate_posterior_inverts_precision_block_over_the_ffi_boundary() {
+        Python::attach(|py| {
+            let out = coordinate_posterior_from_precision(
+                py,
+                vec![0.25, 0.75],
+                vec![4.0, 1.0, 1.0, 3.0],
+            )
+            .expect("coordinate posterior");
+            let d = out.bind(py);
+            let diag: Vec<f64> = d
+                .get_item("covariance_diag")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((diag[0] - 3.0 / 11.0).abs() < 1e-9, "diag0 = {}", diag[0]);
+            assert!((diag[1] - 4.0 / 11.0).abs() < 1e-9, "diag1 = {}", diag[1]);
+            let pw: f64 = d
+                .get_item("precision_weight")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((pw - 11.0 / 7.0).abs() < 1e-9, "precision_weight = {pw}");
         });
     }
 }

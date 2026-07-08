@@ -18,7 +18,7 @@
 //!     [--budget-s 900] [--seed 1]
 
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
-use gam_sae::basis::PeriodicHarmonicEvaluator;
+use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{
     LatentManifold, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
     StagewiseConfig, StagewiseProgress, fit_stagewise,

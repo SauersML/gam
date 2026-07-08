@@ -257,6 +257,63 @@ def _active_threshold_for_assignment(assignment: str, k_atoms: int) -> float:
     return 1.0e-8
 
 
+def _channel_cov_factors(
+    decoder_covariance: np.ndarray | None, m_basis: int
+) -> list | None:
+    """Compact per-channel covariance factor a shape band consumes for save/load.
+
+    The dense phi-scaled decoder covariance is ``(M_k·p, M_k·p)`` in row-major
+    ``(basis, channel)`` flat layout (flat index ``b·p + c``). The posterior
+    shape band reads ONLY the same-channel blocks ``Cov[(b1,c),(b2,c)]`` — its
+    variance is ``Var_c(t) = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]`` — so those
+    ``p`` blocks of ``M_k × M_k`` are the complete, compact factor the band
+    needs. This extracts them as a ``(p, M_k, M_k)`` array (pure reshaping /
+    diagonal slicing — no numerical decomposition), replacing the dense
+    ``(M_k·p)²`` joint covariance in the on-disk format. ``None`` when the fit
+    carries no covariance (e.g. an LLM-scale ``p`` where even the fresh fit omits
+    the dense lift); the band's stored ``shape_band_sd`` still round-trips.
+    """
+    if decoder_covariance is None:
+        return None
+    cov = np.asarray(decoder_covariance, dtype=float)
+    m = int(m_basis)
+    total = cov.shape[0]
+    if m <= 0 or total % m != 0:
+        # Layout does not match an (M_k, p) decoder; refuse to guess — drop the
+        # factor rather than emit a mislabeled one (band sd still round-trips).
+        return None
+    p = total // m
+    # cov4[b1, c1, b2, c2]; the band consumes the c1 == c2 diagonal.
+    cov4 = cov.reshape(m, p, m, p)
+    diag = np.diagonal(cov4, axis1=1, axis2=3)  # (M_k, M_k, p)
+    blocks = np.ascontiguousarray(np.transpose(diag, (2, 0, 1)))  # (p, M_k, M_k)
+    return blocks.tolist()
+
+
+def _channel_cov_from_factors(factors: Any) -> np.ndarray | None:
+    """Rebuild the full-shape ``(M_k·p, M_k·p)`` decoder covariance from the
+    compact per-channel factor written by :func:`_channel_cov_factors`.
+
+    The result is block-diagonal across channels: the same-channel ``M_k × M_k``
+    blocks are restored exactly and the cross-channel entries (which no band
+    reads) are zero. Reproduces the shape band ``Σ Φ Φ Cov[(·,c),(·,c)]`` to
+    machine precision. ``None`` when no factor was stored.
+    """
+    if factors is None:
+        return None
+    blocks = np.asarray(factors, dtype=float)
+    if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+        raise ValueError(
+            "decoder_covariance_channel_factors must be a (p, M_k, M_k) array; "
+            f"got shape {blocks.shape}"
+        )
+    p, m, _ = blocks.shape
+    cov4 = np.zeros((m, p, m, p), dtype=float)
+    for c in range(p):
+        cov4[:, c, :, c] = blocks[c]
+    return np.ascontiguousarray(cov4.reshape(m * p, m * p))
+
+
 def _canonical_n_harmonics(
     basis_kinds: list[str],
     raw_n_harmonics: list[int],
@@ -284,25 +341,22 @@ def _canonical_n_harmonics(
 
 
 def _e_benjamini_hochberg(log_e_values: list[float], alpha: float) -> list[int]:
-    """e-BH confirmed set, mirroring `inference::structure_evidence::e_benjamini_hochberg`.
+    """e-BH confirmed-claim set, via the Rust source of truth.
 
-    Sort claims by descending log e-value; confirm the prefix up to the largest
-    rank `k` whose k-th-largest log e-value clears `ln(m) - ln(alpha) - ln(k)`
-    (i.e. `e_(k) >= m / (alpha * k)`). FDR <= alpha over the confirmed set under
-    arbitrary dependence; valid at any stopping time.
+    Thin wrapper over ``inference::structure_evidence::e_benjamini_hochberg``
+    (FFI ``e_bh_dictionary_certificate``): the whole selection procedure — sort by
+    descending log e-value, confirm the prefix up to the largest rank ``k`` whose
+    k-th-largest log e-value clears ``ln(m) − ln(alpha) − ln(k)`` — runs once in
+    the core, never mirrored in Python. Returns the indices of the confirmed
+    claims (FDR ≤ ``alpha`` under arbitrary dependence, valid at any stopping
+    time). Guards the degenerate inputs the FFI does not accept (``m == 0`` or a
+    non-positive ``alpha``) as the empty set, matching the previous contract.
     """
-    import math
-
-    m = len(log_e_values)
-    if m == 0 or not (alpha > 0.0):
+    if len(log_e_values) == 0 or not (alpha > 0.0):
         return []
-    order = sorted(range(m), key=lambda i: log_e_values[i], reverse=True)
-    k_star = 0
-    for rank0, idx in enumerate(order):
-        k = rank0 + 1
-        if log_e_values[idx] >= math.log(m) - math.log(alpha) - math.log(k):
-            k_star = rank0 + 1
-    return order[:k_star]
+    return [int(i) for i in rust_module().e_bh_dictionary_certificate(
+        [float(v) for v in log_e_values], float(alpha)
+    )]
 
 
 def _structure_claim_label(kind: Any) -> str:
@@ -436,33 +490,28 @@ _ALPHA_UNSET: Any = object()
 def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
     """K-aware default IBP concentration ``α`` (#1784).
 
-    Mirror of the Rust source of truth
-    ``gam_sae::manifold::assignment::default_ibp_concentration_for_k_atoms``.
-    The ordered stick-breaking prior mean ``π_k = (α/(α+1))^{k+1}`` decays
-    GEOMETRICALLY in the atom index, so the historical fixed default ``α = 1``
-    (the ``(0.5)^{k+1}`` schedule) collapses to a near-hard mask past atom ~3: a
-    K-atom dictionary can then only place mass on its first handful of atoms,
-    which is why the manifold SAE underfit a linear dictionary of equal K on real
-    activations and why its late atoms carried zero mass — leaving the per-row
-    joint Hessian rank-deficient (the K = 128 ``RemlConvergenceError``). Choosing
-    ``α`` so the LAST atom retains prior mass ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}``
-    makes the prior SPAN the whole dictionary while staying a monotone, honest
-    ordered stick-breaking prior (no atom structurally masked). Solving
-    ``(α/(α+1))^K = e^{-1}`` gives ``α = 1/(exp(1/K) − 1) ≈ K − 1/2``; floored at
-    ``1.0`` so ``K = 1`` keeps the historical ``α = 1``.
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_ibp_concentration_for_k_atoms`` (FFI
+    ``sae_default_ibp_concentration_for_k_atoms``): the formula
+    ``α = max(1, 1/(exp(1/K) − 1))`` is computed once in the core, never mirrored
+    in Python. Choosing ``α`` so the last atom retains prior mass
+    ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered stick-breaking prior SPAN
+    the whole dictionary (no atom structurally masked); floored at ``1.0`` so
+    ``K = 1`` keeps the historical ``α = 1``.
     """
-    k = float(max(int(k_atoms), 1))
-    return max(1.0, 1.0 / (math.expm1(1.0 / k)))
+    return float(rust_module().sae_default_ibp_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
 
 
 def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
-    n = int(n_obs)
-    k = int(k_atoms)
-    if n <= 0 or k <= 1:
-        return None
-    if n >= k * k:
-        return None
-    return max(1, min(k - 1, math.ceil(n / k)))
+    """Default large-K active cap from the data-per-atom ratio.
+
+    Thin wrapper over the Rust source of truth
+    ``assignment::default_top_k_for_large_dictionary`` (FFI
+    ``sae_default_top_k_for_large_dictionary``): ``None`` when the dense softmax
+    path is admitted, else the per-row cap ``clamp(ceil(N/K), 1, K−1)``.
+    """
+    cap = rust_module().sae_default_top_k_for_large_dictionary(int(n_obs), int(k_atoms))
+    return None if cap is None else int(cap)
 
 
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
@@ -552,6 +601,11 @@ class SaeManifoldAtomFit:
         coefficients, shape ``(M_k * p, M_k * p)`` in row-major
         ``(basis, channel)`` layout. Entries have squared ``X`` units. Present
         on fresh fits when the Rust payload includes posterior uncertainty.
+        Across :meth:`ManifoldSAE.save` / :meth:`ManifoldSAE.load` only the
+        band-relevant same-channel Schur blocks are persisted (the compact
+        per-atom factor), so a restored covariance is block-diagonal across
+        channels: every quantity the shape band reads is reproduced exactly, and
+        the cross-channel entries the band never touches are zero.
     shape_band_coords
         Optional coordinate grid for the posterior shape band, shape
         ``(G, d_k)``, in the same latent-coordinate units as ``coords``.
@@ -891,8 +945,14 @@ class ManifoldSAE:
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
         n, p = (self.fitted.shape if self.fitted.ndim == 2 else (self.fitted.shape[0], 1))
+        # Lead with bits/token (the headline currency); keep EV as a demoted line.
+        try:
+            dl = self.description_length()
+        except Exception:
+            dl = None
+        bpt = "n/a" if dl is None else f"{float(dl['bits_per_token']):.3f}"
         return (
-            f"ManifoldSAE(K={len(self.atoms)}, d_atom={d_atom}, "
+            f"ManifoldSAE(bits/token={bpt}, K={len(self.atoms)}, d_atom={d_atom}, "
             f"atom_topology={self.atom_topology!r}, assignment={self.assignment!r}, "
             f"alpha={self.alpha!r}, learnable_alpha={self.learnable_alpha}, "
             f"n={n}, p={p}, r2={self.reconstruction_r2:.3f})"
@@ -2030,6 +2090,53 @@ class ManifoldSAE:
     def get_anchors(self) -> list[np.ndarray]:
         return [c.copy() for c in self.coords]
 
+    def description_length(self, *, l_param_bits: float | None = None) -> dict[str, Any] | None:
+        """Fit-level bits/token description length — the honest headline currency.
+
+        The manifold hypothesis is informational: a manifold in the data is a
+        redundancy in the CODES, priced in **bits/token**, not in the
+        matched-EV fraction of ambient residual variance that
+        ``experiments/real_manifold_sae/results.md`` shows is insensitive to the
+        thesis by construction. This returns the whole reconstruction's code
+        length per token decomposed into code / selection / dictionary bits.
+
+        The bits are computed by the Rust
+        ``sae_manifold_description_length`` core from this fit's own summary
+        quantities (achieved EV, mean active atoms per token, coordinate dim,
+        dictionary size ``K``, decoder scalar count); Python only marshals those
+        scalars. ``l_param_bits`` overrides the per-decoder-scalar precision
+        (default: the distortion-matched precision). Returns ``None`` for an
+        empty fit (no atoms or no coded tokens).
+        """
+        k_atoms = len(self.atoms)
+        n_tokens = int(self.fitted.shape[0]) if self.fitted.ndim >= 1 else 0
+        if k_atoms == 0 or n_tokens == 0:
+            return None
+        module = rust_module()
+        # The bits/token math lives entirely in the Rust core. When the loaded
+        # engine predates these exports (older build or a test double), degrade
+        # to ``None`` rather than crashing the report — the fit is unchanged.
+        dl_fn = getattr(module, "sae_manifold_description_length", None)
+        summary_fn = getattr(module, "sae_manifold_assignment_summary", None)
+        if dl_fn is None or summary_fn is None:
+            return None
+        threshold = _active_threshold_for_assignment(self.assignment, k_atoms)
+        avg_active, _mean_mass = summary_fn(self.assignments, threshold)
+        coord_dims = [int(c.shape[1]) for c in self.coords if c.ndim == 2 and c.shape[1] > 0]
+        coord_dim = float(np.mean(coord_dims)) if coord_dims else 1.0
+        n_params = int(sum(int(b.size) for b in self.decoder_blocks))
+        return dict(
+            dl_fn(
+                float(self.reconstruction_r2),
+                int(n_tokens),
+                float(avg_active),
+                float(coord_dim),
+                int(k_atoms),
+                int(n_params),
+                l_param_bits=None if l_param_bits is None else float(l_param_bits),
+            )
+        )
+
     def summary(self) -> dict[str, Any]:
         # Active-atom detection is mode-specific. The Rust counter is INCLUSIVE
         # (active iff assignment >= threshold), so the threshold is the next
@@ -2048,12 +2155,22 @@ class ManifoldSAE:
         score = (
             None if self.penalized_loss_score is None else float(self.penalized_loss_score)
         )
+        # Lead with the honest headline currency: bits/token and the description-
+        # length decomposition (code / selection / dictionary). Explained variance
+        # (``reconstruction_r2``) is kept but DEMOTED below it — matched-EV is
+        # insensitive to the manifold hypothesis by construction
+        # (``experiments/real_manifold_sae/results.md``); bits/token is not.
+        dl = self.description_length()
+        bits_per_token = None if dl is None else float(dl["bits_per_token"])
         return {
+            "bits_per_token": bits_per_token,
+            "description_length": dl,
             "K": len(self.atoms),
             "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
             "atom_topology": self.atom_topology, "assignment": self.assignment,
             "alpha": float(self.alpha), "learnable_alpha": bool(self.learnable_alpha),
             "penalized_loss_score": score, "reml_score": score,
+            # Secondary line: explained variance, demoted beneath bits/token.
             "reconstruction_r2": float(self.reconstruction_r2),
             "dispersion": float(self.dispersion),
             "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
@@ -2152,7 +2269,17 @@ class ManifoldSAE:
                     "coords_u_arc": _optional_list(a.coords_u_arc),
                     "evidence": None if a.evidence is None else float(a.evidence),
                     "active_dim": int(a.active_dim),
-                    "decoder_covariance": _optional_list(a.decoder_covariance),
+                    # Objective-2 (band survives save/load): serialize the COMPACT
+                    # per-atom, per-channel covariance factor the shape band
+                    # actually consumes — the `(p, M_k, M_k)` same-channel Schur
+                    # blocks `Cov[(·,c),(·,c)]` — NOT the dense `(M_k·p)²` joint
+                    # covariance (gigabytes per atom at LLM-scale `p`, and the
+                    # cross-channel entries no band ever reads). `load()`
+                    # reconstructs the full-shape block-diagonal covariance from
+                    # this factor, reproducing the band to machine precision.
+                    "decoder_covariance_channel_factors": _channel_cov_factors(
+                        a.decoder_covariance, a.decoder_coefficients.shape[0]
+                    ),
                     "shape_band_coords": _optional_list(a.shape_band_coords),
                     "shape_band_mean": _optional_list(a.shape_band_mean),
                     "shape_band_sd": _optional_list(a.shape_band_sd),
@@ -2240,7 +2367,14 @@ class ManifoldSAE:
                 coords=np.asarray(a["coords"], dtype=float),
                 evidence=None if a.get("evidence") is None else float(a["evidence"]),
                 active_dim=int(a["active_dim"]),
-                decoder_covariance=_optional_array(a, "decoder_covariance"),
+                # Reconstruct the full-shape `(M_k·p, M_k·p)` decoder covariance
+                # from the compact per-channel factor written by `to_dict`. It is
+                # block-diagonal across channels (the cross-channel entries the
+                # band never reads are not stored), so it reproduces the shape
+                # band `Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]` exactly.
+                decoder_covariance=_channel_cov_from_factors(
+                    a.get("decoder_covariance_channel_factors")
+                ),
                 shape_band_coords=_optional_array(a, "shape_band_coords"),
                 shape_band_mean=_optional_array(a, "shape_band_mean"),
                 shape_band_sd=_optional_array(a, "shape_band_sd"),
@@ -2450,7 +2584,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
-                     structured_residual_passes: int = 0,
+                     structured_residual_passes: int = 2,
                      promote_from_residual: bool = False,
                      score_mode: str = "auto",
                      _run_structure_search: bool = True,
@@ -2575,14 +2709,19 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
         or the global ``sae_set_ibp_alpha`` setter still overrides it.
     structured_residual_passes
-        Number of structured-residual sculpting passes run after the primary
-        joint fit. Defaults to ``0`` (off). Each pass fits the current
-        reconstruction residual and folds the recovered structure back into the
-        atom dictionary. Must be a non-negative int; the native core clamps the
-        effective count to ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``),
-        so larger values behave like ``4``. An explicit, typed opt-in — with the
-        default ``0`` the fit is bit-identical to the pre-existing behavior. The
-        default-on iid→structured refit is deferred to #2080.
+        Number of structured-residual whitening passes run after the primary
+        joint fit. Defaults to ``2`` (#2021 — ON by default; "magic by default":
+        the superposition-aware whitened metric is the best-known behavior, not
+        an opt-in). Each pass fits the current reconstruction residual's
+        structured covariance and installs the Σ-damped per-row metric under the
+        annealed schedule ``γ_p = (p+1)/(N+1)``, so with the default ``N = 2``
+        the final pass installs a majority-structured metric (``γ = 2/3``); ``2``
+        is also the ``PROMOTION_NURSERY_MIN_PASSES`` dwell, so the default budget
+        is coherent with the (opt-in) residual-atom promotion. Pass ``0`` to
+        force the legacy iid fit (bit-identical to the pre-#2021 behavior). Must
+        be a non-negative int; the native core clamps the effective count to
+        ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``), so larger values
+        behave like ``4``.
     promote_from_residual
         When ``True`` (default ``False``), atoms discovered in the structured
         residual passes are promoted into the primary atom tier rather than kept

@@ -243,7 +243,7 @@ fn sae_build_atom_plans(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 0,
+    structured_residual_passes = 2,
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
@@ -295,8 +295,9 @@ fn sae_manifold_fit_minimal<'py>(
     // the high-level Python `sae_manifold_fit` facade routes through.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — opt-in count of extra whitened-residual structured-alternation
-    // passes (default 0 = historical iid-only path, bit-for-bit).
+    // #2021 — count of extra whitened-residual structured-alternation passes.
+    // Default-ON at `2` ("magic by default"); pass `0` for the historical
+    // iid-only path, bit-for-bit.
     structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
@@ -322,20 +323,14 @@ fn sae_manifold_fit_minimal<'py>(
             "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
         ));
     }
-    let admission = gam::terms::sae::front_door::admit_sae_fit(n_obs, z_view.ncols(), k_atoms)
+    // Front-door enforcement through the single shared seam (#985 / E1): the dense
+    // manifold engine is the small-K CERTIFICATION lane only. `admit_dense_certification`
+    // is the ONE refuse-on-sparse implementation both dense entry points route through
+    // (`sae_manifold_fit` and this minimal path), so a K > P shape cannot reach the
+    // dense N×K `SaeAssignment` build from either door — and the refusal wording,
+    // pointing the caller at the sparse-code lane, stays defined once in `front_door`.
+    gam::terms::sae::front_door::admit_dense_certification(n_obs, z_view.ncols(), k_atoms)
         .map_err(py_value_error)?;
-    if admission.uses_sparse_codes() {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_minimal: dense certification lane refused for N={}, P={}, K={} \
-             because N*K={} exceeds N*P={}; call sae_manifold_fit so the public front door \
-             routes to the sparse-code lane",
-            admission.n_obs,
-            admission.output_dim,
-            admission.n_atoms,
-            admission.dense_assignment_cells,
-            admission.response_cells
-        )));
-    }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
             "sae_manifold_fit_minimal: z contains non-finite values".into(),

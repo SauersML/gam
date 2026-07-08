@@ -831,6 +831,61 @@ fn sae_single_planted_circle_embedded_isometry_fit_converges_795() {
     );
 }
 
+/// #2226 — `reml_criterion` must RANK the K=1 planted-circle inner fixed point
+/// (return a finite Laplace value), not hard-refuse it. The inner solve reaches
+/// its numerical fixed point where the objective can no longer decrease, but the
+/// raw KKT gradient plateaus a couple of digits above the absolute iterate-scaled
+/// tolerance on some SIMD targets (NEON/arm64 vs AVX/x86 diverge on the float
+/// summation order). Before the affine-invariant Newton-decrement stationarity
+/// certificate, that plateau exhausted the refine budget and returned
+/// `reml_criterion: inner solve did not converge at fixed ρ` — the exact refusal
+/// reported for `sae_manifold_fit(K=1, atom_topology="circle")` on macOS arm64.
+/// The Newton decrement ½λ² = −½gᵀΔ is affine-invariant, so the shared fixed
+/// point is accepted on both architectures.
+#[test]
+fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
+    use super::tests::{
+        PlantedCircleAssignmentMode, planted_circle_embedded, planted_circle_seed_term,
+    };
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
+    };
+
+    let n = 200usize;
+    let d_embed = 12usize;
+    let sigma = 0.02_f64;
+    let z = planted_circle_embedded(n, d_embed, sigma);
+
+    let (mut term, _seed_dispersion) =
+        planted_circle_seed_term(z.view(), PlantedCircleAssignmentMode::Softmax);
+
+    // Isometry gauge ON — the same fixture as `..._795`, but exercised through
+    // the ρ-ranking `reml_criterion` (the path `sae_manifold_fit`'s outer BFGS
+    // drives) rather than a single joint fit.
+    let mut registry = AnalyticPenaltyRegistry::new();
+    registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+        IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+    )));
+
+    let rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0_f64]]);
+
+    // A generous inner budget: the fixed point is reached well within it. The
+    // criterion must rank that stationary iterate instead of hard-refusing on an
+    // absolute raw-gradient tolerance that is not reachable on every SIMD target.
+    let (value, loss, _cache) = term
+        .reml_criterion_with_cache(z.view(), &rho, Some(&registry), 200, 0.04, 1.0e-6, 1.0e-6)
+        .expect(
+            "#2226: the K=1 planted-circle inner solve reaches a numerical fixed point; \
+             reml_criterion must rank that stationary iterate (affine-invariant Newton \
+             decrement) instead of refusing on an unreachable absolute gradient tolerance",
+        );
+    assert!(
+        value.is_finite() && loss.total().is_finite(),
+        "#2226: the ranked Laplace criterion must be finite (value={value}, loss={})",
+        loss.total()
+    );
+}
+
 /// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
 /// for the outer BFGS Armijo line search. The amortized-encoder consistency
 /// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact

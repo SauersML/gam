@@ -28,8 +28,8 @@ the survivor's is unchanged). This is the "synthetic patched-reconstruction demo
 
 ## The model experiment (needs a GPU + the frozen model)
 
-**Model / GPU.** Qwen3-8B lives under the cluster models dir (point the harness
-at it via a `--model-dir`/`$HF_HOME` of your choosing; HF cache key
+**Model / GPU.** Qwen3-8B is on MSI at
+`/projects/standard/hsiehph/sauer354/models/qwen3-8b` (also HF cache
 `models--Qwen--Qwen3-8B`). A single A100/A40 (or even CPU at this batch size) is
 enough — the experiment is forward passes only, no training, no gradients. This
 is the SAME harvest+hook path `experiments/real_circle/real_qwen_circle.py`

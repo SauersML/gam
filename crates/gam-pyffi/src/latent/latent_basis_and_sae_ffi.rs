@@ -2325,7 +2325,7 @@ fn sae_structured_residual_model(
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 0,
+    structured_residual_passes = 2,
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
@@ -3038,10 +3038,10 @@ fn sae_manifold_fit_inner<'py>(
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
     // #2021 — number of EXTRA whitened-residual refit passes after the iid
-    // pass-0 fit (the structured-residual outer alternation). `0` (the default)
-    // keeps the historical iid-only path bit-for-bit; the value is clamped to
-    // `STRUCTURED_RESIDUAL_PASSES_MAX`. An explicit, typed opt-in — no hidden
-    // env lever.
+    // pass-0 fit (the structured-residual outer alternation). Default-ON at `2`
+    // ("magic by default": the superposition-aware whitened metric is the
+    // best-known behavior); pass `0` for the legacy iid-only path bit-for-bit.
+    // The value is clamped to `STRUCTURED_RESIDUAL_PASSES_MAX`.
     structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,

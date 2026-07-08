@@ -4847,15 +4847,35 @@ mod tests {
             .expect("laml objective for no-penalty model");
 
         let h_dense = state.hessian.to_dense();
+        // Mirror the production LAML Hessian logdet EXACTLY (call production, not
+        // replay): `unified_lamlobjective_and_rhogradient` assembles the logdet
+        // through a `DenseSpectralOperator` whose pseudo-logdet mode is selected by
+        // delayed entry. Left-truncated (delayed-entry) transformation survival
+        // uses the identified positive-subspace HardPseudo logdet (#1915: with the
+        // +H(entry) term the observed information carries genuine negative
+        // curvature, which the smooth full-spectrum regularizer must NOT reward by
+        // mapping to a tiny positive value); right-censored keeps Smooth. This
+        // test's data is left-truncated (age_entry ≫ origin), so the documented
+        // objective's logdet is the HardPseudo one — deriving `expected` from the
+        // same operator+mode keeps this a genuine
+        // obj = ½·deviance + penalty + ½·logdet(H) decomposition check instead of a
+        // stale hand-rolled Smooth-mode formula (which pre-dated #1915 and summed
+        // ln(spectral_regularize(σ)) over the whole spectrum, including the
+        // non-positive delayed-entry modes the objective now excludes).
         let logdet_h: f64 = {
-            use gam_solve::estimate::reml::reml_outer_engine::{spectral_epsilon, spectral_regularize};
-            use gam_linalg::faer_ndarray::FaerEigh;
-            let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
-            let eps = spectral_epsilon(evals.as_slice().unwrap());
-            evals
-                .iter()
-                .map(|&sigma| spectral_regularize(sigma, eps).ln())
-                .sum()
+            use gam_problem::PseudoLogdetMode;
+            use gam_solve::estimate::reml::reml_outer_engine::{
+                DenseSpectralOperator, HessianOperator,
+            };
+            let has_left_truncation = age_entry.iter().any(|&t| t > ENTRY_AT_ORIGIN_THRESHOLD);
+            let mode = if has_left_truncation {
+                PseudoLogdetMode::HardPseudo
+            } else {
+                PseudoLogdetMode::Smooth
+            };
+            DenseSpectralOperator::from_symmetric_with_mode(&h_dense, mode)
+                .expect("survival LAML Hessian operator")
+                .logdet()
         };
         let expected = 0.5 * state.deviance + state.penalty_term + 0.5 * logdet_h;
 

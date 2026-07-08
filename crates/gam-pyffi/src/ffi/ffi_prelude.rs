@@ -103,6 +103,7 @@ pub(crate) use gam_predict::FittedModelPredictExt;
 pub(crate) use gam_predict::input::build_predict_input_for_model;
 
 pub(crate) use gam::geometry::sae_routing::duchon_centers_nd as sae_duchon_centers_nd_impl;
+pub(crate) use gam::geometry::sae_routing::sinkhorn_balance_bias as sae_sinkhorn_balance_bias_impl;
 
 pub(crate) use gam::geometry::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,

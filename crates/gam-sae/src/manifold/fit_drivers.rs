@@ -3279,6 +3279,35 @@ impl SaeManifoldTerm {
     /// the atoms separate. Uses only the production seeding primitive
     /// (`sae_pca_seed_initial_coords`, one atom at a time on the residual) and the
     /// same gated design / `quotient_scale` peel as the joint refit.
+    /// INTERIOR-INIT feasibility predicate for the separation barrier: `true` iff
+    /// the CURRENT decoder dictionary sits at or beyond the barrier's collinear
+    /// boundary — some co-firing atom pair's decoder output-subspace overlap
+    /// `o_jk` ([`Self::decoder_gram_cosine_sq`]) reaches the collinearity gate
+    /// [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`] (`s₀`).
+    ///
+    /// The Jeffreys / self-concordant separation barrier is an INTERIOR-POINT
+    /// penalty: its curvature diverges toward the collinear boundary (`det F → 0`),
+    /// so it may only be entered from a strictly-feasible (mutually-separated)
+    /// seed. A seed placed AT the boundary is trapped — the exact curvature freezes
+    /// angular escape, and the only feasible descent direction left is norm-VANISH
+    /// (the over-complete `K > rank` regression: the cold per-atom decoder LSQ makes
+    /// every atom independently reconstruct the SAME target, so all decoder output
+    /// subspaces coincide and every pair starts at `o_jk ≈ 1`). This predicate is
+    /// the gate the joint fit reads to decide whether it must re-seed onto disjoint
+    /// charts before engaging the barrier. `K < 2` (no pair) is trivially feasible;
+    /// a dictionary already separated below `s₀` returns `false` and is left
+    /// byte-for-byte untouched.
+    pub(crate) fn decoder_seed_at_barrier_pole(&self) -> bool {
+        if self.k_atoms() < 2 {
+            return false;
+        }
+        self.barrier_coactive_pairs()
+            .into_iter()
+            .any(|(j, k, _q)| {
+                self.decoder_gram_cosine_sq(j, k) >= SAE_DECODER_REPULSION_COLLINEARITY_GATE
+            })
+    }
+
     pub(crate) fn seed_cold_start_disjoint_charts(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -4178,7 +4207,27 @@ impl SaeManifoldTerm {
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .fold(0.0_f64, f64::max)
             .sqrt();
-        if !(max_decoder_norm > 0.0) {
+        // INTERIOR-INIT for the separation barrier. The barrier is an interior-point
+        // penalty whose curvature diverges toward the collinear boundary, so it must
+        // be entered from a strictly-feasible (separated) seed. Two starts are
+        // INFEASIBLE and require the disjoint-chart placement:
+        //   (a) a co-VANISHED decoder (`max‖B_k‖ == 0`, the all-zero cold seed): the
+        //       joint Newton would "converge" at the degenerate zero map before
+        //       placing any decoder (#2027); and
+        //   (b) a NON-zero but COLLINEAR seed sitting AT the barrier pole
+        //       (`o_jk ≥ s₀` for a co-firing pair): the over-complete `K > rank`
+        //       cold seed, where each atom's independent decoder LSQ reconstructs the
+        //       SAME target so every pair's output subspaces coincide. Engaging the
+        //       barrier there freezes angular escape and the fit collapses to
+        //       norm-vanish (the `ibp_default_alpha` regression). Re-seeding onto the
+        //       residual-deflated disjoint charts separates the atoms below `s₀`, so
+        //       the barrier starts feasible and only engages if the fit later DRIFTS
+        //       toward collapse (approached from inside, where the exact curvature
+        //       correctly repels).
+        // A seed already separated below `s₀` (every healthy `K ≤ rank` fit, and any
+        // warm-started / already-placed decoder) takes neither arm and is left
+        // byte-for-byte untouched.
+        if !(max_decoder_norm > 0.0) || self.decoder_seed_at_barrier_pole() {
             // Sequential CHART deflation (not just decoder deflation): re-seed each
             // atom's coordinates from the residual left by prior atoms so the atoms
             // align with DISTINCT planted factors and separate, rather than both
