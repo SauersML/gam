@@ -74,6 +74,8 @@ def main() -> None:
     ap.add_argument("--p", type=int, default=512)
     ap.add_argument("--k", type=int, default=32000)
     ap.add_argument("--top-k", type=int, default=8)
+    ap.add_argument("--assignment", default="jumprelu",
+                    help="manifold gate: jumprelu | topk (sparsity by construction)")
     ap.add_argument("--n-iter", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda:0")
@@ -115,7 +117,7 @@ def main() -> None:
             K=args.k,
             d_atom=1,
             atom_topology="circle",
-            assignment="jumprelu",
+            assignment=args.assignment,
             n_iter=args.n_iter,
             random_state=args.seed,
             top_k=args.top_k,
@@ -127,14 +129,14 @@ def main() -> None:
         )
         man_wall = time.perf_counter() - t0
         man_r2 = float(model.reconstruction_r2)
-        emit(args.out, {**base, "record": "manifold32k", "status": "ok",
+        emit(args.out, {**base, "record": "manifold32k:" + args.assignment, "status": "ok",
                         "reconstruction_r2": man_r2, "wall_s": round(man_wall, 1),
                         "peak_rss_gb": round(peak_rss_gb(), 2),
                         "beats_linear": (lin_ev is not None and man_r2 >= lin_ev),
                         "wall_ratio_vs_linear": (round(man_wall / lin_wall, 2)
                                                   if lin_wall else None)})
     except Exception as exc:  # noqa: BLE001
-        emit(args.out, {**base, "record": "manifold32k", "status": type(exc).__name__,
+        emit(args.out, {**base, "record": "manifold32k:" + args.assignment, "status": type(exc).__name__,
                         "error": str(exc)[:800],
                         "traceback_tail": traceback.format_exc()[-1200:],
                         "wall_s": round(time.perf_counter() - t0, 1)})
