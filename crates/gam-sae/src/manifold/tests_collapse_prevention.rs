@@ -680,52 +680,63 @@ fn aligned_two_atom_term_with_c2(c2: f64) -> SaeManifoldTerm {
     SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
 }
 
-/// #1625 — the separation barrier is a COLLAPSE-prevention barrier, gated to the
-/// near-collinear regime: it must be an exact no-op (value AND gradient identically
-/// zero) at moderate collinearity below
-/// [`SAE_SEPARATION_BARRIER_COLLINEARITY_GATE`], and engage (positive value,
-/// nonzero separating gradient) above it. This is the root-cause guard for the
-/// #1625 stall: the ungated `−log(1−c²+ε)` exerted an O(1) force at moderate `c²`
-/// (e.g. the gamma fixture's `c² = 0.36`, a 53° angle nowhere near collapse), which
-/// dominated a well-specified fit's near-zero data residual, dragged the decoders
-/// off the data optimum, and left the inner (t,β) Newton unable to reach KKT
-/// stationarity for the undamped-PD evidence log-det.
+/// The Jeffreys separation barrier `−½ log det F` is a SOFT interior-point
+/// COLLAPSE-prevention barrier with NO hard collinearity gate: its force
+/// `q²o/(1−q²o²)·∂o/∂B` vanishes as `O(o)` for separated atoms and diverges as
+/// `det F → 0`, so the soft interior-point structure IS the gate. This is the
+/// root-cause cure for the #1625 stall WITHOUT a tuned threshold: the ungated
+/// pairwise `−log(1−c²+ε)` exerted an O(1) force at moderate `c²` (its
+/// `∂/∂o = 1/(1−o) → 1` even as `o → 0`) that dragged a healthy fit off the data
+/// optimum, which the old code suppressed with a hard `w(c²)` smoothstep; the
+/// Jeffreys force instead falls off smoothly on its own. Guard: the separating
+/// force must GROW with alignment and become NEGLIGIBLE (relative to the near-
+/// collapse force) as the atoms separate, so a well-separated dictionary is steered
+/// as if the barrier were absent.
 #[test]
-fn separation_barrier_collinearity_gate_off_below_on_above_1625() {
-    // Below the gate (gamma-fixture-like 53° pair): strict no-op.
-    let below = aligned_two_atom_term_with_c2(0.36);
-    let (v_below, g_below) = below.separation_barrier_value_and_grad_for_test(1.0);
-    assert_eq!(
-        v_below, 0.0,
-        "barrier value must be exactly 0 below the collinearity gate (c²=0.36 < {}), got {v_below}",
-        SAE_SEPARATION_BARRIER_COLLINEARITY_GATE
-    );
-    assert!(
-        g_below.iter().all(|&g| g == 0.0),
-        "barrier gradient must be identically 0 below the gate — distinct atoms feel NO force: {g_below:?}"
-    );
+fn separation_barrier_force_vanishes_smoothly_as_atoms_separate() {
+    let grad_norm = |c2: f64| -> (f64, f64) {
+        let term = aligned_two_atom_term_with_c2(c2);
+        let (v, g) = term.separation_barrier_value_and_grad_for_test(1.0);
+        (v, g.iter().map(|x| x * x).sum::<f64>().sqrt())
+    };
+    // Near-orthogonal, moderate, and near-collapse alignments.
+    let (v_lo, f_lo) = grad_norm(0.02);
+    let (v_mid, f_mid) = grad_norm(0.36);
+    let (v_hi, f_hi) = grad_norm(0.8);
 
-    // Above the gate (genuine near-collapse alignment): engaged.
-    let above = aligned_two_atom_term_with_c2(0.8);
-    let (v_above, g_above) = above.separation_barrier_value_and_grad_for_test(1.0);
+    // Interior-point growth: value strictly increases with alignment toward the
+    // collapse boundary (no hard gate flattening the low-overlap regime to 0).
     assert!(
-        v_above > 0.0,
-        "barrier value must be positive above the gate (c²=0.8 > {}), got {v_above}",
-        SAE_SEPARATION_BARRIER_COLLINEARITY_GATE
+        v_lo < v_mid && v_mid < v_hi,
+        "barrier value must grow with alignment: lo(c²=.02)={v_lo:.3e} < mid(.36)={v_mid:.3e} < hi(.8)={v_hi:.3e}"
+    );
+    // The near-collapse pair feels a genuine separating force.
+    assert!(
+        f_hi > 0.0,
+        "the near-collapse pair must feel a separating force, got {f_hi}"
+    );
+    // Force GROWS monotonically toward collapse and VANISHES as atoms separate:
+    // the soft auto-gate that replaces the hard `w(c²)` threshold and prevents the
+    // #1625 stall. At c²=0.02 the force is a small fraction of the near-collapse
+    // force (it scales like O(o)), so it cannot dominate a healthy fit's residual.
+    assert!(
+        f_lo < f_mid && f_mid < f_hi,
+        "separating force must grow with alignment: lo={f_lo:.3e} < mid={f_mid:.3e} < hi={f_hi:.3e}"
     );
     assert!(
-        g_above.iter().any(|&g| g != 0.0),
-        "barrier must produce a separating gradient above the gate"
+        f_lo < 0.2 * f_hi,
+        "the separating force must become negligible as atoms separate (O(o) soft \
+         auto-gate): near-orthogonal force {f_lo:.3e} must be ≪ near-collapse force {f_hi:.3e}"
     );
 }
 
-/// #1625 — the GATED barrier's analytic gradient must match the finite difference
-/// of its OWN value, including the smoothstep's `w'(c²)` product-rule term. A
-/// dropped `w'` (treating the gate as a constant weight instead of a function of
-/// `c²`) would pass the on/off guard above but desync value vs gradient on the
-/// ramp — the exact value/gradient-consistency contract the line search relies on.
-/// Evaluated at `c² = 0.7`, strictly on the smoothstep interior (`0.5 < c² < 1`)
-/// where `w'(c²) > 0`, so the product-rule term is load-bearing.
+/// The Jeffreys barrier's analytic gradient `Σ_e α_e·∂o_e/∂B`,
+/// `α_e = −F⁻¹[jₑ,kₑ]·q_e`, must match the finite difference of its OWN value
+/// `−½ log det F` — the exact value/gradient-consistency contract the line search
+/// relies on (a desync would let the value see a force the Newton step never
+/// modelled). Evaluated at `c² = 0.7`, on the interior-point interior where the
+/// force is materially nonzero, so the `F⁻¹` prefactor and the rank-aware
+/// `∂o/∂B` carrier are both load-bearing.
 #[test]
 fn separation_barrier_gated_gradient_matches_fd_1625() {
     let c2 = 0.7_f64;

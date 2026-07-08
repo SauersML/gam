@@ -68,6 +68,17 @@
 //! parallel layers. `penalty_logdet.rs` needs no change; it is the template
 //! every atom follows, and the #934 certificate is the runtime enforcement that
 //! makes any un-ported residue observable on every fit.
+//!
+//! The `JeffreysAtom` shape named above is REALIZED for the SAE decoder
+//! anti-collapse channel by [`super::manifold::penalties::BarrierComponent`]: the
+//! decoder Jeffreys prior `−½·log det F(B)` (the `√det F` prior), assembled per
+//! co-firing routed-support block with its value, gradient `−tr(F⁻¹ ∂F/∂B)`, and
+//! self-concordant curvature emitted from one factorization — the same
+//! single-source-of-truth contract this module documents. It is NOT a separate
+//! atom variant here (the SAE β-tier is assembled by the arrow–Schur system, not
+//! the `SaeCriterionAtom` enum), so there is no duplicate to maintain; the GAM-wide
+//! `unified.rs::JeffreysAtom` remains the follow-up for the family-information
+//! Jeffreys term on the coefficient tier.
 
 use ndarray::Array1;
 
