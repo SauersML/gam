@@ -4281,7 +4281,6 @@ fn gaussian_weighted_ridge_batch<'py>(
 /// `gam::linalg::gaussian_weighted_ridge_backward::gaussian_weighted_ridge_batch_backward`.
 #[pyfunction]
 #[pyo3(signature = (grad_coef, grad_fitted, x, y, penalty, weights, coef, ridge_lambda, row_counts = None))]
-#[allow(clippy::too_many_arguments)]
 fn gaussian_weighted_ridge_batch_backward<'py>(
     py: Python<'py>,
     grad_coef: PyReadonlyArray3<'py, f64>,

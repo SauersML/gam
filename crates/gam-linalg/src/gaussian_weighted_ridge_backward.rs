@@ -170,7 +170,6 @@ pub fn gaussian_weighted_ridge_backward(
 ///
 /// Returns `(grad_x, grad_y, grad_penalty, grad_weights)` with shapes
 /// `((K, N_max, M), (K, N_max, D), (M, M), (K, N_max))`.
-#[allow(clippy::too_many_arguments)]
 pub fn gaussian_weighted_ridge_batch_backward(
     grad_coef: ArrayView3<'_, f64>,
     grad_fitted: ArrayView3<'_, f64>,
@@ -308,7 +307,6 @@ mod gwr_backward_tests {
     // Independent element-wise reference of the closed form (guards against
     // transposition / axis bugs in the vectorized kernel). Shares only the SPD
     // solve for `b̄`.
-    #[allow(clippy::too_many_arguments)]
     fn reference(
         grad_coef: &Array2<f64>,
         grad_fitted: &Array2<f64>,
