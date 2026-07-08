@@ -24,6 +24,23 @@ pub(crate) const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
 pub(crate) const SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR: usize = 8;
 pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 
+/// Conservative lower bound on the pooled device in-core budget any probed CUDA
+/// runtime can report (`Σ memory_budget_for(ordinal) / 4`), used by the
+/// pre-probe size gates in [`sae_streaming_plan_for_shape`] and
+/// `SaeManifoldTerm::sparse_active_plan`.
+///
+/// Working sets at or below this figure are admitted identically whether the
+/// budget comes from the host or from ANY device pool: the smallest CUDA device
+/// gam can meaningfully probe still has hundreds of MiB of budget (a 64 MiB
+/// pooled budget would require a device with under 256 MiB of usable memory —
+/// below every supported compute-capability generation and every MIG slice), so
+/// a plan whose peak fits under 64 MiB cannot have its admission flipped by the
+/// device-budget cap. Those CPU-sized shapes therefore skip
+/// `GpuRuntime::global()` — and the CUDA primary-context creation on all GPUs
+/// that the first probe performs — entirely. Larger shapes still probe and use
+/// the exact device-aware budget as before.
+pub(crate) const SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
 /// Absolute floor for the *matrix-free streaming* admission test. The chunked
 /// matrix-free plan exists precisely to bound peak memory by the chunk window
 /// rather than the full problem, so it must stay admittable even when the
@@ -185,30 +202,31 @@ pub fn sae_streaming_plan_for_shape(
     border_dim: usize,
 ) -> SaeStreamingPlan {
     // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering): build
-    // the plan against the host in-core budget first. If the whole working set
-    // already fits host memory (direct admitted), a present device — whose
-    // pooled budget is at least the host budget in the production multi-GPU
-    // regime — cannot change the admission or any functional plan output
-    // (`chunk_size == n_obs` whenever the direct plan is admitted; the only
-    // budget-dependent fields that still differ are diagnostic byte estimates
-    // and the chunk window, which are consumed only on the streaming path). So
-    // return the host plan without creating any CUDA context. Only when the host
-    // budget FORCES streaming do we probe for the larger pooled device budget
-    // that may restore a single-shot direct plan.
+    // the plan against `min(host budget, conservative device-pool floor)`. If
+    // the direct plan is admitted even under that pessimistic budget, NO real
+    // budget — host-only or any probed device pool (see
+    // `SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES`) — could refuse it, and a
+    // direct-admitted plan's functional outputs are budget-independent
+    // (`chunk_size == n_obs`, `streaming == false`; the chunk window is
+    // consumed only on the streaming path). So return this plan without
+    // touching `GpuRuntime::global()`, i.e. without creating a CUDA primary
+    // context on every GPU for a fit that stays on the CPU. Shapes that need
+    // more than the pessimistic budget fall through to the exact probed-budget
+    // logic below, bit-for-bit as before.
     let (host_budget, host_available) = sae_host_in_core_budget_bytes();
     let host_window = SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE;
-    let host_plan = sae_streaming_plan_from_budget(
+    let pessimistic_plan = sae_streaming_plan_from_budget(
         n_obs,
         total_basis,
         k_atoms,
         d_max,
         border_dim,
-        host_budget,
+        host_budget.min(SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES),
         host_window,
         host_available,
     );
-    if host_plan.direct_admitted {
-        return host_plan;
+    if pessimistic_plan.direct_admitted {
+        return pessimistic_plan;
     }
     let (budget, chunk_window, host_available) =
         match crate::gpu::device_runtime::GpuRuntime::global() {
