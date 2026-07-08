@@ -454,6 +454,48 @@ impl RowMetric {
         })
     }
 
+    /// Restrict the metric to the rows `rows` (an index subset or permutation),
+    /// preserving provenance, `p`, `rank`, and the solver floor. The
+    /// outer-criterion row subsample uses this to whiten the subsampled fit
+    /// through the SAME per-row metric the full-`N` fit uses, so the ρ search
+    /// ranks the delivered criterion (e.g. a #974 structured-whitening fit is not
+    /// silently searched unwhitened). Each gathered row's factor block is copied
+    /// verbatim, so the induced `M_n = U_n U_nᵀ` is bit-identical to the full
+    /// metric's on every selected row.
+    pub fn gather_rows(&self, rows: &[usize]) -> Result<Self, String> {
+        for (pos, &r) in rows.iter().enumerate() {
+            if r >= self.n_rows {
+                return Err(format!(
+                    "RowMetric::gather_rows: row index {r} at position {pos} is out of bounds \
+                     (n_rows = {})",
+                    self.n_rows
+                ));
+            }
+        }
+        match self.factors.as_ref() {
+            // Euclidean carries an implicit identity factor per row, so the subset
+            // is just a smaller identity stack — no factor storage to gather.
+            None => Self::euclidean(rows.len(), self.p),
+            Some(factors) => {
+                let cols = self.p * self.rank;
+                let mut sub = Array2::<f64>::zeros((rows.len(), cols));
+                for (pos, &r) in rows.iter().enumerate() {
+                    sub.row_mut(pos).assign(&factors.row(r));
+                }
+                // Re-runs the shared PSD normalizer on the subset (a subset of
+                // valid rows stays valid) and preserves the exact provenance and
+                // solver floor.
+                Self::from_factors(
+                    self.provenance,
+                    Arc::new(sub),
+                    self.p,
+                    self.rank,
+                    self.solver_delta,
+                )
+            }
+        }
+    }
+
     /// The provenance tag (consumed by Object 4 to certify the inner product).
     pub fn provenance(&self) -> MetricProvenance {
         self.provenance

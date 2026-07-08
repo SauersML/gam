@@ -633,6 +633,25 @@ impl SaeManifoldOuterObjective {
         // `materialize_chunk` resets to defaults, so the subsample computes the
         // same regularized criterion as the full term.
         sub.set_fit_config(self.term.fit_config());
+        // #2021/#1408/#2022/#5(B) — carry the remaining criterion-DEFINING term
+        // configuration that `materialize_chunk` (a fresh `SaeManifoldTerm::new`)
+        // also resets to defaults, so the subsampled ρ search ranks the SAME
+        // criterion the restored full-`N` fit delivers. Without these the search
+        // silently optimizes a DIFFERENT objective than is delivered: a #974/#2021
+        // structured-whitening fit searched unwhitened, a top-`k`-capped fit
+        // searched at full support, or a rank-charge / quotient-scale fit searched
+        // under the plain ½log|H_tt| gauge. `set_fit_config` above only round-trips
+        // the barrier / IBP-α overrides; these are separate term fields.
+        sub.set_rank_charge_evidence(self.term.rank_charge_evidence());
+        sub.set_soft_rank_charge(self.term.soft_rank_charge());
+        sub.set_softmax_active_cap(self.term.softmax_active_cap);
+        sub.set_quotient_scale(self.term.quotient_scale());
+        // The row metric is per-row, so it is gathered to the subsample's rows (the
+        // same `mask` that selected the logits / coords / target) rather than cloned
+        // whole; `set_row_metric` then re-checks the n_sub / p match.
+        if let Some(metric) = self.term.row_metric() {
+            sub.set_row_metric(metric.gather_rows(mask)?)?;
+        }
         // Uniform HT inverse-inclusion weight w = N / n_sub, un-normalized (the
         // absolute full-N scale is load-bearing — see `set_uniform_inclusion_weight`).
         let weight = n_full as f64 / n_sub as f64;
