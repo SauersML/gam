@@ -57,6 +57,7 @@ struct Args {
     pca: usize,
     harmonics: usize,
     sweeps: usize,
+    out_dir: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,9 +68,14 @@ fn parse_args() -> Result<Args, String> {
     let mut pca = 8usize;
     let mut harmonics = 3usize;
     let mut sweeps = 25usize;
+    let mut out_dir: Option<String> = None;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
+            "--out-dir" => {
+                i += 1;
+                out_dir = Some(raw.get(i).ok_or("--out-dir needs a value")?.clone());
+            }
             "--max-rows" => {
                 i += 1;
                 max_rows = raw.get(i).ok_or("--max-rows needs a value")?.parse().map_err(|e| format!("--max-rows: {e}"))?;
@@ -93,14 +99,14 @@ fn parse_args() -> Result<Args, String> {
     if layers.len() < 2 {
         return Err(format!(
             "usage: {program} <anchor_layer.npy> <block_layer.npy> [more_layers.npy ...] \
-             [--max-rows N] [--pca D] [--harmonics H] [--sweeps S]\n\
+             [--max-rows N] [--pca D] [--harmonics H] [--sweeps S] [--out-dir DIR]\n\
              need an anchor layer plus at least one further layer"
         ));
     }
     if pca < 2 {
         return Err(format!("--pca must be ≥ 2 (need two PCs for the circle seed); got {pca}"));
     }
-    Ok(Args { layers, max_rows, pca, harmonics, sweeps })
+    Ok(Args { layers, max_rows, pca, harmonics, sweeps, out_dir })
 }
 
 /// Explained variance of `fitted` against `target` (same shape); scale-invariant,
@@ -209,7 +215,14 @@ fn main() -> Result<(), String> {
         &augmented.slice(ndarray::s![.., ..p_x]).to_owned(),
         &fitted.slice(ndarray::s![.., ..p_x]).to_owned(),
     );
-    println!("  anchor layer '{}': EV = {anchor_ev:.4}  (λ_x ≡ 1 reference)", layer_name(&args.layers[0]));
+    // The anchor is the REML REFERENCE block: the variance ratios λ_ℓ are
+    // measured relative to it, so it has NO fitted weight of its own — it is the
+    // fixed denominator, not a λ=1 result. Reported as such (never fabricated).
+    println!(
+        "  anchor layer '{}': EV = {anchor_ev:.4}  (REML reference block — no fitted λ; the λ_ℓ below are ratios to this layer's residual variance)",
+        layer_name(&args.layers[0])
+    );
+    let mut block_ev = Vec::with_capacity(blocks.len());
     let mut offset = p_x;
     for (idx, block) in blocks.iter().enumerate() {
         let pl = block.block_dim();
@@ -217,6 +230,7 @@ fn main() -> Result<(), String> {
             &augmented.slice(ndarray::s![.., offset..offset + pl]).to_owned(),
             &fitted.slice(ndarray::s![.., offset..offset + pl]).to_owned(),
         );
+        block_ev.push(ev);
         let outcome = &report.blocks[idx];
         println!(
             "  block layer '{}': EV = {ev:.4}, REML log λ_ℓ = {:.4} (λ_ℓ = {:.4}), identifiable = {}",
@@ -226,6 +240,81 @@ fn main() -> Result<(), String> {
             outcome.identifiable
         );
         offset += pl;
+    }
+
+    // --- Save the RAW circle geometry so the shared-latent circle can be plotted
+    // directly: the token scatter in the circle's own plane, the recovered
+    // per-token angle, the densely-sampled fitted curve γ(t), and the HONEST per
+    // layer λ (anchor = NaN = reference, never a fabricated 1.0).
+    if let Some(dir) = &args.out_dir {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {dir}: {e}"))?;
+
+        // Recovered per-token angle t_i ∈ [0, 1) and the anchor's fitted decoder.
+        let t = term.assignment.coords[0]
+            .as_matrix()
+            .column(0)
+            .mapv(|v| v.rem_euclid(1.0));
+        let m = term.atoms[0].decoder_coefficients.nrows();
+        let b_anchor = term.atoms[0]
+            .decoder_coefficients
+            .slice(ndarray::s![.., ..p_x])
+            .to_owned(); // (M × p_x)
+
+        // The circle's fundamental plane in anchor space is spanned by the
+        // first-harmonic decoder rows: Φ column 1 = sin(2πt), column 2 = cos(2πt).
+        // Orthonormalise those two anchor-space vectors (Gram–Schmidt) → E (p_x×2).
+        let e = fundamental_plane(&b_anchor);
+
+        // Dense curve γ(t) = Φ(t)·B_anchor over a fine grid, projected into E.
+        let grid = 512usize;
+        let tg = Array2::<f64>::from_shape_fn((grid, 1), |(g, _)| g as f64 / grid as f64);
+        let (phi_g, _) = evaluator.evaluate(tg.view())?;
+        assert_eq!(phi_g.ncols(), m);
+        let gamma = phi_g.dot(&b_anchor); // (grid × p_x)
+        let curve_2d = gamma.dot(&e); // (grid × 2)
+
+        // Token scatter: the raw anchor activations projected into the SAME plane.
+        let scatter_2d = anchor.dot(&e); // (n × 2)
+
+        // Honest per-layer λ: anchor = NaN (reference), blocks = fitted λ_ℓ.
+        let n_layers = args.layers.len();
+        let mut layer_lambda = Array1::<f64>::from_elem(n_layers, f64::NAN);
+        let mut layer_ev = Array1::<f64>::zeros(n_layers);
+        let mut is_anchor = Array1::<f64>::zeros(n_layers);
+        is_anchor[0] = 1.0;
+        layer_ev[0] = anchor_ev;
+        for (idx, outcome) in report.blocks.iter().enumerate() {
+            layer_lambda[idx + 1] = outcome.log_lambda.exp();
+            layer_ev[idx + 1] = block_ev[idx];
+        }
+
+        write_npy_2d(&format!("{dir}/circle_scatter.npy"), scatter_2d.view())?;
+        write_npy_2d(&format!("{dir}/circle_curve.npy"), curve_2d.view())?;
+        write_npy_1d(&format!("{dir}/circle_angle.npy"), t.view())?;
+        write_npy_1d(&format!("{dir}/circle_lambda.npy"), layer_lambda.view())?;
+        write_npy_1d(&format!("{dir}/circle_layer_ev.npy"), layer_ev.view())?;
+        write_npy_1d(&format!("{dir}/circle_is_anchor.npy"), is_anchor.view())?;
+        // Layer labels + a note on the anchor honesty, for the plotter.
+        let labels: Vec<String> = args.layers.iter().map(|p| layer_name(p)).collect();
+        std::fs::write(
+            format!("{dir}/circle_labels.txt"),
+            format!(
+                "layers: {}\nanchor: {} (reference block; circle_lambda[0]=NaN, NOT a fitted λ)\n\
+                 circle_scatter.npy: (n×2) anchor tokens in the fundamental circle plane\n\
+                 circle_curve.npy: (512×2) fitted γ(t) in the same plane\n\
+                 circle_angle.npy: (n,) recovered per-token t_i ∈ [0,1)\n\
+                 circle_lambda.npy: (K,) REML λ per layer; index 0 = anchor = NaN (reference)\n\
+                 circle_layer_ev.npy: (K,) per-layer explained variance\n",
+                labels.join(", "),
+                labels[0]
+            ),
+        )
+        .map_err(|e| format!("write labels: {e}"))?;
+        println!(
+            "\nsaved raw circle geometry to {dir}/circle_*.npy (scatter {}×2, curve {grid}×2, angle {}, λ per layer)",
+            scatter_2d.nrows(),
+            t.len()
+        );
     }
 
     // --- Shared-latent baseline: fit the anchor ALONE and report its EV, so the
@@ -279,6 +368,81 @@ fn circle_term(
     let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
     Ok((term, rho))
+}
+
+/// Orthonormal basis `E` (`p_x × 2`) of the circle's fundamental plane in anchor
+/// space: the plane spanned by the first-harmonic decoder rows (`Φ` column 1 =
+/// `sin 2πt`, column 2 = `cos 2πt`), Gram–Schmidt-orthonormalised. Falls back to
+/// the first two coordinate axes if either fundamental direction is degenerate.
+fn fundamental_plane(b_anchor: &Array2<f64>) -> Array2<f64> {
+    let p_x = b_anchor.ncols();
+    let mut e0 = b_anchor.row(1).to_owned(); // sin coefficients
+    let mut e1 = b_anchor.row(2).to_owned(); // cos coefficients
+    let n0 = e0.dot(&e0).sqrt();
+    if n0 > 1e-12 {
+        e0.mapv_inplace(|v| v / n0);
+    } else {
+        e0.fill(0.0);
+        if p_x > 0 {
+            e0[0] = 1.0;
+        }
+    }
+    let proj = e1.dot(&e0);
+    e1 = &e1 - &(&e0 * proj);
+    let n1 = e1.dot(&e1).sqrt();
+    if n1 > 1e-12 {
+        e1.mapv_inplace(|v| v / n1);
+    } else {
+        e1.fill(0.0);
+        if p_x > 1 {
+            e1[1] = 1.0;
+        }
+    }
+    let mut e = Array2::<f64>::zeros((p_x, 2));
+    for r in 0..p_x {
+        e[[r, 0]] = e0[r];
+        e[[r, 1]] = e1[r];
+    }
+    e
+}
+
+/// Write a 2-D `f64` array as a little-endian C-order `.npy` (`<f8`, version 1.0).
+fn write_npy_2d(path: &str, a: ndarray::ArrayView2<'_, f64>) -> Result<(), String> {
+    let (n, m) = a.dim();
+    let mut data = Vec::with_capacity(n * m);
+    for row in a.rows() {
+        for &v in row.iter() {
+            data.push(v);
+        }
+    }
+    write_npy(path, &format!("({n}, {m})"), &data)
+}
+
+/// Write a 1-D `f64` array as a little-endian C-order `.npy` (`<f8`, version 1.0).
+fn write_npy_1d(path: &str, a: ndarray::ArrayView1<'_, f64>) -> Result<(), String> {
+    let data: Vec<f64> = a.iter().copied().collect();
+    write_npy(path, &format!("({},)", a.len()), &data)
+}
+
+/// Core `.npy` v1.0 writer: header dict padded to a 64-byte boundary, then the
+/// raw little-endian `f64` payload.
+fn write_npy(path: &str, shape: &str, data: &[f64]) -> Result<(), String> {
+    let mut header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': {shape}, }}");
+    // Pad so that 10 (magic+version+len) + header.len() is a multiple of 64, and
+    // the header ends with a newline.
+    let unpadded = 10 + header.len() + 1;
+    let pad = (64 - (unpadded % 64)) % 64;
+    header.push_str(&" ".repeat(pad));
+    header.push('\n');
+    let mut buf: Vec<u8> = Vec::with_capacity(10 + header.len() + data.len() * 8);
+    buf.extend_from_slice(b"\x93NUMPY\x01\x00");
+    let hlen = header.len() as u16;
+    buf.extend_from_slice(&hlen.to_le_bytes());
+    buf.extend_from_slice(header.as_bytes());
+    for &v in data {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, &buf).map_err(|e| format!("write {path}: {e}"))
 }
 
 // ---- Minimal row-aligned .npy reader (little-endian <f4 / <f2, C-order, 2-D).

@@ -1,0 +1,7 @@
+layers: L11_train.f32, L17_train.f32, L23_train.f32
+anchor: L11_train.f32 (reference block; circle_lambda[0]=NaN, NOT a fitted λ)
+circle_scatter.npy: (n×2) anchor tokens in the fundamental circle plane
+circle_curve.npy: (512×2) fitted γ(t) in the same plane
+circle_angle.npy: (n,) recovered per-token t_i ∈ [0,1)
+circle_lambda.npy: (K,) REML λ per layer; index 0 = anchor = NaN (reference)
+circle_layer_ev.npy: (K,) per-layer explained variance
