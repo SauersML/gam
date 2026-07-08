@@ -65,6 +65,7 @@ use gam::mixture_link::mixture_inverse_link_jet;
 use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+    build_term_collection_design,
 };
 use gam::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power, unique_count_column,
@@ -4304,16 +4305,30 @@ fn build_termspec_rejects_duchon_double_penalty_option() {
 }
 
 #[test]
-fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum() {
+fn build_termspec_honors_explicit_duchon_power_and_builds_well_posed() {
     // PgsCalibration's defaults expand into
     // `duchon(pc1, pc2, pc3, pc4, centers=N, order=1, power=1, length_scale=1)`.
-    // With the active operator-penalty triple (mass + tension + stiffness),
-    // D2 collocation requires `2(p+s) > d+2`, i.e. `2(2+s) > 6 ⇔ s ≥ 2`,
-    // so explicit `power=1` previously produced the opaque
-    // "Duchon D2 collocation requires …" error from the basis builder
-    // and broke every PgsCalibration fit. The term builder now escalates
-    // the explicit power to the minimum admissible value while honoring
-    // the user-requested nullspace order, and emits an inference note.
+    //
+    // Historical intent (now superseded): when an operator-penalty triple
+    // (mass + tension + stiffness) is active, D2 collocation requires
+    // `2(p+s) > d+2`, and an early design escalated the explicit *power* to the
+    // minimum admissible `s`. That contract is UNSOUND: at `d=4` it lifts `s`
+    // to 2, giving `2s = 4 = d`, which VIOLATES the pure-Duchon conditional-
+    // positive-definiteness gate `2s < d`. Commit f59909437 (#1817, "Auto-raise
+    // Duchon nullspace order to satisfy operator collocation margin") replaced
+    // power-escalation with nullspace-ORDER escalation at basis-build time
+    // (`duchon_order_for_operator_margin`, unit-tested in `duchon_kernel_math`):
+    // lifting `p` is monotone-safe (`2s < d` is untouched, so it can never
+    // invalidate a power the user already satisfied).
+    //
+    // At the term-spec layer the explicit power/order are honored VERBATIM, and
+    // the formula builder sets every operator penalty `Disabled` for a
+    // formula-built duchon (`term_builder`), so there is no D2 collocation
+    // constraint to trip in the first place — `power=1` is already well-posed.
+    // This test therefore asserts the *current* contract: the explicit power is
+    // honored (not silently bumped to 2) and the design builds well-posed rather
+    // than emitting the old opaque "Duchon D2 collocation requires …" reject
+    // that once broke every PgsCalibration fit.
     let formula = "y ~ s(pc1, pc2, pc3, pc4, type=duchon, centers=8, order=1, \
                        power=1, length_scale=1)";
     let parsed = parse_formula(formula)
@@ -4385,31 +4400,40 @@ fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum()
     .unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",
-            "explicit power=1 should auto-escalate, not reject", e
+            "explicit power=1 must be honored, not rejected", e
         )
     });
     assert_eq!(spec.smooth_terms.len(), 1);
     match &spec.smooth_terms[0].basis {
         gam::smooth::SmoothBasisSpec::Duchon { spec: duchon, .. } => {
             assert_eq!(
-                duchon.power, 2.0,
-                "explicit power=1 should escalate to power=2 (the minimum \
-                     admissible for D2 collocation at d=4, p=2): got power={}",
+                duchon.power, 1.0,
+                "explicit power=1 must be honored verbatim (order, not power, is \
+                     escalated for the operator collocation margin — #1817): got power={}",
                 duchon.power
             );
             assert_eq!(
                 duchon.nullspace_order,
                 gam::basis::DuchonNullspaceOrder::Linear,
-                "user-requested nullspace order=Linear must be preserved",
+                "user-requested nullspace order=Linear must be preserved at the spec layer",
             );
         }
         other => panic!("expected Duchon basis, got {other:?}"),
     }
+    // The end-to-end contract that mattered for PgsCalibration: explicit power=1
+    // builds a well-posed design instead of the opaque "Duchon D2 collocation
+    // requires …" reject (basis-time nullspace-order escalation, #1817).
+    let design = build_term_collection_design(ds.values.view(), &spec).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "explicit power=1 duchon must build a well-posed design, not reject", e
+        )
+    });
+    assert_eq!(design.smooth.terms.len(), 1, "one built smooth term");
+    // Power is honored, never silently bumped to 2 (which would violate 2s < d).
     assert!(
-        inference_notes
-            .iter()
-            .any(|note| note.contains("Auto-escalated to power=2")),
-        "expected inference note describing the power escalation; got: {inference_notes:?}"
+        !inference_notes.iter().any(|note| note.contains("power=2")),
+        "no power-escalation note should be emitted — power is honored verbatim: got {inference_notes:?}"
     );
 }
 
