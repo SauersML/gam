@@ -4567,6 +4567,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(conditional_coactivation_influence, module)?)?;
     module.add_function(wrap_pyfunction!(coupling_robustness_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(effect_weighted_retention, module)?)?;
+    module.add_function(wrap_pyfunction!(chart_interp_score, module)?)?;
+    module.add_function(wrap_pyfunction!(dose_response_calibration, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        coordinate_posterior_from_precision,
+        module
+    )?)?;
     Ok(())
 }
 
