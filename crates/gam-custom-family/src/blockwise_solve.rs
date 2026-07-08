@@ -1061,10 +1061,12 @@ pub(crate) fn solve_quadratic_with_simple_lower_bounds(
     beta_start: &Array1<f64>,
     bounds: &SimpleLowerBounds,
     active_rows: Option<&[usize]>,
-    // TRUE (un-reflected) curvature for the KKT release test (gam#979). When the
-    // caller passes a `lhs` that was negative-curvature-reflected to bound the
-    // step, supply the original Hessian here so dual feasibility is judged on
-    // the real curvature. `None` ⇒ use `lhs` (byte-identical to prior behavior).
+    // Reflection flag for the KKT release test (gam#979). When the caller passes
+    // a `lhs` that was negative-curvature-reflected to bound the step, supply the
+    // original (pre-reflection) Hessian here; its presence makes the bound solver
+    // judge dual feasibility on the reflection-invariant first-order multiplier
+    // `g_i` (the far-field reflected step makes the second-order term untrust-
+    // worthy). `None` ⇒ exact `g_i + (H·d)_i` (byte-identical to prior behavior).
     kkt_hessian: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, Vec<usize>), String> {
     let gradient = lhs.dot(beta_start) - rhs;

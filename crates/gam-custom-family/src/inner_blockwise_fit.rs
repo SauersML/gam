@@ -1500,13 +1500,20 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             },
                         );
                     }
-                    // Keep the TRUE (un-reflected) curvature for the KKT release
-                    // test (gam#979). The reflected `lhs` bounds the STEP, but a
-                    // monotone-hazard bound aligned with a negative-curvature mode
-                    // gets its dual multiplier sign-flipped by the reflection —
-                    // released spuriously, then re-added on the next outer cycle
-                    // (the active-set zigzag that ground the survival fit for 30
-                    // cycles). The release must be judged on the real curvature.
+                    // Signal the negative-curvature reflection to the bound solver
+                    // (gam#979). The reflected `lhs` bounds the STEP, but a
+                    // monotone-hazard bound aligned with a reflected mode then rides
+                    // a FAR-FIELD freed step whose length is a reflection artifact;
+                    // the second-order release multiplier `(H·d)_i` evaluated there
+                    // is corrupted and flips the bound loose — released spuriously,
+                    // then re-added on the next outer cycle (the active-set zigzag
+                    // that ground the survival fit for 30 cycles). Passing the
+                    // pre-reflection Hessian here as `kkt_hessian` tells
+                    // `solve_newton_directionwith_lower_bounds` the step was
+                    // reflected, so it judges dual feasibility on the reflection-
+                    // invariant FIRST-ORDER multiplier `g_i` (and uses this matrix
+                    // for the per-cycle diagnostic log). `None` on every unreflected
+                    // caller ⇒ the exact `g_i + (H·d)_i` test, byte-identical.
                     let lhs_true_kkt = lhs.clone();
                     let lhs = lhs_reflected;
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
