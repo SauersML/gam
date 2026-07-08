@@ -5707,7 +5707,7 @@ impl SaeManifoldTerm {
                 let stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-                if let Ok((_dt, _db, stationary_cache)) =
+                if let Ok((stationary_dt, stationary_db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {
                     let stationary_grad_norm_sq: f64 = stationary_sys
@@ -5725,6 +5725,52 @@ impl SaeManifoldTerm {
                     if stationary_grad_norm <= grad_tolerance
                         || stationary_quotient_grad_norm <= grad_tolerance
                     {
+                        return Ok(stationary_cache);
+                    }
+                    // Affine-invariant stationarity certificate (#2226). The raw and
+                    // quotient KKT gradient norms above are measured in the ambient
+                    // Euclidean parameter metric, which lumps the heterogeneous
+                    // logit / coordinate / decoder-coefficient blocks together with
+                    // unit weight. The floor that norm can reach is set by the joint
+                    // Hessian's conditioning and therefore by the float summation
+                    // order, so NEON (arm64) and AVX (x86) plateau at slightly
+                    // different values — a couple of digits apart on this K=1 circle,
+                    // enough that arm64 parks above the absolute iterate-scaled
+                    // tolerance x86 clears and the fixed point is hard-refused
+                    // (issue #2226: `sae_manifold_fit(K=1, atom_topology="circle")`).
+                    //
+                    // The Newton decrement λ² = gᵀH⁻¹g = −gᵀΔ (Δ the exact undamped
+                    // joint Newton step just factored above) is invariant to any
+                    // affine reparametrisation of the iterate, and ½λ² is the
+                    // quadratic model's predicted remaining decrease in the penalised
+                    // objective. `sae_manifold_newton_directional_decrease` returns
+                    // −gᵀΔ = λ² for the descent step Δ. We are already inside the
+                    // objective-stall fixed point (both `relative_decrease` and
+                    // `captured_fraction` fell below their floors above), so no step
+                    // lowers the objective by a meaningful fraction of its scale; the
+                    // model-predicted decrease ½λ² is then likewise below that scale,
+                    // and we accept on that affine-invariant witness. Measuring the
+                    // predicted decrease RELATIVE to the objective scale — the exact
+                    // structure `relative_decrease` (round_improvement / objective_scale)
+                    // uses — keeps this neither looser nor tighter than the stall gate
+                    // that just fired: it can only accept when the model itself
+                    // predicts no further meaningful descent, never a still-descending
+                    // iterate (a large λ² leaves this below and falls through to the
+                    // deterministic refine budget exactly as before).
+                    let newton_decrement_sq = sae_manifold_newton_directional_decrease(
+                        &stationary_sys,
+                        stationary_dt.view(),
+                        stationary_db.view(),
+                    )
+                    .max(0.0);
+                    let predicted_relative_decrease = 0.5 * newton_decrement_sq / objective_scale;
+                    log::debug!(
+                        "SAE inner stall certificate: ‖g‖={stationary_grad_norm:.6e} \
+                         ‖Π⊥gauge g‖={stationary_quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
+                         λ²={newton_decrement_sq:.6e} ½λ²/scale={predicted_relative_decrease:.6e} \
+                         obj_scale={objective_scale:.6e} accept_tol={SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL:.6e}"
+                    );
+                    if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
                         return Ok(stationary_cache);
                     }
                     // A flat objective round is only a convergence shortcut when

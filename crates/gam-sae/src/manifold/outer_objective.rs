@@ -282,13 +282,12 @@ pub(crate) fn plan_outer_criterion_subsample_rows(n_full: usize) -> Option<usize
 /// clock, no env, no user knob. Two identical fits draw the identical subsample,
 /// so a run is reproducible and auditable.
 pub(crate) fn outer_subsample_seed(n_full: usize, p: usize, k: usize, beta_dim: usize) -> u64 {
-    let mut s = 0x05AE_0000_0000_0001u64
+    let fingerprint = 0x05AE_0000_0000_0001u64
         ^ (n_full as u64)
         ^ (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (k as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
         ^ (beta_dim as u64).wrapping_mul(0xC2B2_AE35_59CB_D1EB);
-    gam_linalg::utils::splitmix64(&mut s);
-    s
+    gam_linalg::utils::splitmix64_hash(fingerprint)
 }
 
 /// Deterministic uniform-without-replacement row mask of size `min(n_sub,
@@ -530,15 +529,27 @@ impl SaeManifoldOuterObjective {
     /// degrade gracefully to the full-`N` search rather than aborting.
     fn maybe_engage_outer_row_subsample(&mut self) {
         let n_full = self.target.nrows();
-        let p = self.target.ncols();
-        if n_full == 0 || p == 0 {
-            return;
-        }
         let Some(n_sub) = plan_outer_criterion_subsample_rows(n_full) else {
             return;
         };
-        if n_sub >= n_full {
-            return;
+        self.engage_outer_row_subsample(n_sub);
+    }
+
+    /// Engage the HT subsample at an explicit row budget `n_sub` — the
+    /// threshold-free core of [`Self::maybe_engage_outer_row_subsample`] (and the
+    /// test seam that forces engagement below the production threshold). Returns
+    /// `true` when the subsample was installed; `false` (a no-op) when already
+    /// engaged, when the problem is empty, when `n_sub >= N` (the full-`N` path is
+    /// then exactly the criterion, byte-identical), or when the subsampled term
+    /// cannot be materialized (e.g. an atom with no basis evaluator).
+    pub(crate) fn engage_outer_row_subsample(&mut self, n_sub: usize) -> bool {
+        if self.row_subsample.is_some() {
+            return false;
+        }
+        let n_full = self.target.nrows();
+        let p = self.target.ncols();
+        if n_full == 0 || p == 0 || n_sub == 0 || n_sub >= n_full {
+            return false;
         }
         let seed = outer_subsample_seed(n_full, p, self.term.k_atoms(), self.term.beta_dim());
         let mask = deterministic_uniform_row_mask(n_full, n_sub, seed);
@@ -549,7 +560,7 @@ impl SaeManifoldOuterObjective {
                     "[SAE/outer-subsample] row subsampling unavailable ({err}); running the \
                      ρ search at full N={n_full}"
                 );
-                return;
+                return false;
             }
         };
         let subsample = gam_problem::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
@@ -567,6 +578,7 @@ impl SaeManifoldOuterObjective {
             subsample,
             probe_calls_at_engage: self.probe_telemetry.criterion_calls,
         });
+        true
     }
 
     /// Build the `mask`-row Horvitz–Thompson restriction of the current term +
@@ -577,7 +589,7 @@ impl SaeManifoldOuterObjective {
     /// decoder, penalties, and mode with the full term); carry the per-fit config
     /// authorities `materialize_chunk` does not; install the uniform inclusion
     /// weight `w = N / n_sub`; and gather the matching target rows.
-    fn build_subsampled_term(
+    pub(crate) fn build_subsampled_term(
         &self,
         mask: &[usize],
     ) -> Result<(SaeManifoldTerm, Array2<f64>), String> {
@@ -643,7 +655,7 @@ impl SaeManifoldOuterObjective {
     /// restored full term (and left as `seeded_beta`); the per-row coordinates are
     /// re-solved from the full data by that inner fit. The probes-on-subsample
     /// telemetry delta is recorded here.
-    fn restore_full_rows_for_final_fit(&mut self) {
+    pub(crate) fn restore_full_rows_for_final_fit(&mut self) {
         let Some(state) = self.row_subsample.take() else {
             return;
         };
