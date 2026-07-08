@@ -63,7 +63,7 @@
     }
   ],
   "wall_s": 525.1052820682526,
-  "decoder": "/projects/standard/hsiehph/sauer354/msae_l17/t1_out/decoder_K32000.npy",
-  "tier0": "/projects/standard/hsiehph/sauer354/msae_l17/tier0_recentered.json",
-  "data": "/projects/standard/hsiehph/sauer354/msae_l17/L17_train.f32.npy"
+  "decoder": "t1_out/decoder_K32000.npy",
+  "tier0": "tier0_recentered.json",
+  "data": "L17_train.f32.npy"
 }

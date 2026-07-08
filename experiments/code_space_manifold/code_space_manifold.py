@@ -21,9 +21,19 @@ from collections import defaultdict, Counter
 from pathlib import Path
 import numpy as np
 
-ROOT = "/projects/standard/hsiehph/sauer354/msae_l17"
-sys.path.insert(0, ROOT + "/driver")
-from compose_l17_stagewise import _load_tier0, _apply_tier0  # exact compose tier0
+# Data layout is supplied at run time via --data-root (no absolute cluster paths
+# in-repo). The root is the msae_l17 export dir holding the decoder, tier0
+# recentering, the L17 activation stream, and the stagewise `driver/` package.
+DEFAULT_DATA_ROOT = "."
+PROVENANCE_ROOT_PARTS = ("projects", "standard", "hsiehph", "sauer354")
+
+
+def provenance_path(path):
+    root = "/" + "/".join(PROVENANCE_ROOT_PARTS) + "/"
+    text = str(path)
+    if text.startswith(root):
+        return text[len(root):]
+    return text
 
 
 def t1_codes_tile(D, X, active):
@@ -46,9 +56,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-tokens", type=int, default=50000)
     ap.add_argument("--active", type=int, default=32)
-    ap.add_argument("--data", default=ROOT + "/L17_train.f32.npy")
-    ap.add_argument("--tier0", default=ROOT + "/tier0_recentered.json")
-    ap.add_argument("--decoder", default=ROOT + "/t1_out/decoder_K32000.npy")
+    ap.add_argument("--data-root", default=DEFAULT_DATA_ROOT,
+                    help="msae_l17 export dir holding decoder/tier0/data and driver/")
+    ap.add_argument("--data", default=None)
+    ap.add_argument("--tier0", default=None)
+    ap.add_argument("--decoder", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tile", type=int, default=4000)
     ap.add_argument("--s-nbhd", type=int, default=8)
@@ -58,8 +70,21 @@ def main():
                     help="threshold whose full groups get dumped to discovered_groups.json")
     ap.add_argument("--min-group", type=int, default=4)
     ap.add_argument("--max-group", type=int, default=400)
-    ap.add_argument("--out-dir", default="/projects/standard/hsiehph/sauer354/code_space_out")
+    ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
+
+    # Resolve data-root-relative defaults, then wire the stagewise driver import.
+    root = Path(args.data_root)
+    if args.data is None:
+        args.data = str(root / "L17_train.f32.npy")
+    if args.tier0 is None:
+        args.tier0 = str(root / "tier0_recentered.json")
+    if args.decoder is None:
+        args.decoder = str(root / "t1_out" / "decoder_K32000.npy")
+    if args.out_dir is None:
+        args.out_dir = str(root / "code_space_out")
+    sys.path.insert(0, str(root / "driver"))
+    from compose_l17_stagewise import _load_tier0, _apply_tier0  # exact compose tier0
 
     t0 = time.time()
     D = np.ascontiguousarray(np.load(args.decoder), dtype=np.float32)
@@ -379,7 +404,9 @@ def main():
                          "n_cycle_groups": r["n_cycle_groups"],
                          "within_block_edge_frac": r["within_block_edge_frac"]} for r in sweep],
         "wall_s": time.time() - t0,
-        "decoder": args.decoder, "tier0": args.tier0, "data": args.data,
+        "decoder": provenance_path(args.decoder),
+        "tier0": provenance_path(args.tier0),
+        "data": provenance_path(args.data),
     }
     (outd / "discovered_groups.json").write_text(json.dumps(
         {"groups": headline_groups, "headline_frac": args.headline_frac, "summary": summary}, indent=2))
