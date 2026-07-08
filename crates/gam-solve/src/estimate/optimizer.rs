@@ -2121,12 +2121,11 @@ where
              theta: &Array1<f64>| {
                 let rho = apply_link_theta(state, theta)?;
                 // Route the cost through the SAME link-ext evaluator the gradient
-                // closure uses (value-only). That entry forces full inner
-                // convergence for free SAS/mixture link parameters (#1876 /
-                // #2062), so cost and gradient see the same stationary-mode
-                // β̂ and the outer trust-region ratio stays consistent. Using
-                // plain `compute_cost` here would re-engage the outer-aware
-                // PIRLS cap schedule and desync the two.
+                // closure uses (value-only), so both see the #1876 inner-KKT
+                // envelope correction `Ṽ = V − ½·rᵀH⁻¹r`. Using the plain
+                // `compute_cost` here would report the raw capped-β̂ value `V`
+                // while the gradient closure reports `∇Ṽ`, desyncing the outer
+                // trust-region ratio test on any first-order-capped inner solve.
                 let value_mode =
                     crate::estimate::reml::reml_outer_engine::EvalMode::ValueOnly;
                 let result = state.evaluate_unified_with_link_ext(&rho, value_mode)?;
