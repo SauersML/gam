@@ -136,6 +136,56 @@ impl DispatchOp {
             }
         }
     }
+
+    /// True when SOME reachable dispatch policy could admit this op.
+    ///
+    /// Pre-probe size gate (the CUDA startup-tax ordering fix): evaluated with
+    /// the MOST PERMISSIVE values any production policy can carry — the
+    /// calibration crossover floors ([`GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS`],
+    /// [`GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P`]) for the calibrated
+    /// fields, and the [`GpuDispatchPolicy::default`] values for the
+    /// small-dense-batched-POTRF fields, which `calibration::calibrate_device`
+    /// never adjusts. A `false` here means EVERY reachable policy's
+    /// [`route_through_gpu`] admission would also refuse, so the caller may
+    /// return to the CPU path WITHOUT touching `GpuRuntime::global()` — i.e.
+    /// without triggering the device probe and its per-GPU
+    /// `cuDevicePrimaryCtxRetain` context creation. A `true` decides nothing:
+    /// the probed runtime's real policy still gates the op exactly as before.
+    #[must_use]
+    pub fn admissible_under_any_policy(self) -> bool {
+        let seed = GpuDispatchPolicy::default();
+        let min_gemm = GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS;
+        match self {
+            Self::Gemm { m, n, k } => self.flops() >= min_gemm && m.min(n).min(k) > 0,
+            Self::BatchedGemm { batch, m, n, k } => {
+                self.flops() >= min_gemm && batch > 1 && m.min(n).min(k) > 0
+            }
+            Self::Gemv { m, k } => self.flops() >= min_gemm && m > 0 && k > 0,
+            Self::Potrf { p, batch } => {
+                p > 0
+                    && batch > 0
+                    && (p >= GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P
+                        || (batch > 1 && self.flops() >= min_gemm))
+            }
+            // These two policy fields are never calibrated, so the default seed
+            // values ARE the runtime values and this arm is exact, not a bound.
+            Self::SmallDenseBatchedPotrf { p, batch } => {
+                p > 0
+                    && p <= seed.small_dense_batched_potrf_max_p
+                    && batch >= seed.small_dense_batched_potrf_min_batch
+            }
+            Self::Trsm { m, n } => self.flops() >= min_gemm && m > 0 && n > 0,
+            // XtDiagX/XtDiagY admit on `dense_reduction_flops_min` =
+            // min(xtwx_flops_min, gemm_min_flops); the smallest reachable value
+            // of that min is MIN_CALIBRATABLE_GEMM_FLOPS (the xtwx crossover
+            // cannot calibrate below its smallest measurement, which exceeds it).
+            Self::XtDiagX { n, p } => n > 0 && p > 0 && self.flops() >= min_gemm,
+            Self::XtDiagY { n, px, q } => n > 0 && px > 0 && q > 0 && self.flops() >= min_gemm,
+            Self::JointHessian2x2 { n, pa, pb } => {
+                n > 0 && (pa + pb) > 0 && self.flops() >= min_gemm
+            }
+        }
+    }
 }
 
 /// Returns `Some(runtime)` when both a device is available and the workload
@@ -145,6 +195,14 @@ impl DispatchOp {
 #[inline]
 #[must_use]
 pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
+    // Size gate BEFORE the device probe (startup-tax ordering fix): an op no
+    // reachable policy could admit must not pay `GpuRuntime::global()` — the
+    // first call of which creates a CUDA primary context on every GPU. Ops that
+    // clear this most-permissive bound fall through to the probed runtime's
+    // real policy admission below, bit-for-bit as before.
+    if !op.admissible_under_any_policy() {
+        return None;
+    }
     let runtime = GpuRuntime::global()?;
     let policy = &runtime.policy;
     let admit = match op {
