@@ -609,12 +609,6 @@ TopKActivationPenalty = _rust_descriptor_class("TopKActivationPenalty")
 JumpReLUPenalty = _rust_descriptor_class("JumpReLUPenalty")
 
 
-def _inverse_softplus(x: np.ndarray) -> np.ndarray:
-    # Single source of truth: numerics live in Rust (`numerics_inverse_softplus`).
-    arr = np.ascontiguousarray(x, dtype=float)
-    return _rust_module().numerics_inverse_softplus(arr)
-
-
 SparsityPenalty = _rust_descriptor_class("SparsityPenalty")
 AuxConditionalPriorPenalty = _rust_descriptor_class("AuxConditionalPriorPenalty")
 BlockOrthogonalityPenalty = _rust_descriptor_class("BlockOrthogonalityPenalty")

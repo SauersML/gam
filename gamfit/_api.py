@@ -596,38 +596,23 @@ def _resolve_precision_hyperpriors(
 
 
 def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
+    """Broadcast/validate Fisher-Rao precision blocks to ``(n_rows, dim, dim)``.
+
+    Pure marshaling: the broadcasting and the finiteness / symmetry / PSD
+    validation are the Rust single source of truth
+    (``response_geometry_normalize_fisher_rao`` →
+    ``gam::inference::fisher_rao::normalize_fisher_rao_blocks``), shared with the
+    response-geometry path. Python only coerces the input to a float64 array.
+    """
     import numpy as np
 
-    w = np.asarray(value, dtype=float)
-    if w.ndim == 1:
-        if w.shape[0] != n_rows:
-            raise ValueError(
-                f"fisher_rao_w vector must have length {n_rows}; got {w.shape[0]}"
-            )
-        out = np.zeros((n_rows, dim, dim), dtype=float)
-        idx = np.arange(dim)
-        out[:, idx, idx] = w[:, None]
-    elif w.ndim == 2:
-        if w.shape != (dim, dim):
-            raise ValueError(
-                f"fisher_rao_w matrix must have shape ({dim}, {dim}); got {w.shape}"
-            )
-        out = np.broadcast_to(w, (n_rows, dim, dim)).copy()
-    elif w.ndim == 3:
-        if w.shape != (n_rows, dim, dim):
-            raise ValueError(
-                f"fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got {w.shape}"
-            )
-        out = np.ascontiguousarray(w, dtype=float)
-    else:
-        raise ValueError("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array")
-    if not np.all(np.isfinite(out)):
-        raise ValueError("fisher_rao_w must contain only finite values")
-    if not np.allclose(out, np.swapaxes(out, 1, 2), rtol=1e-10, atol=1e-10):
-        raise ValueError("fisher_rao_w must be symmetric in every row block")
-    if np.any(np.diagonal(out, axis1=1, axis2=2) < 0.0):
-        raise ValueError("fisher_rao_w diagonal entries must be non-negative")
-    return out
+    arr = np.asarray(value, dtype=float)
+    try:
+        return rust_module().response_geometry_normalize_fisher_rao(
+            arr, int(n_rows), int(dim)
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
 
 
 _KWARG_TYPO_PATTERN = re.compile(r"unexpected keyword argument [\"']([^\"']+)[\"']")
