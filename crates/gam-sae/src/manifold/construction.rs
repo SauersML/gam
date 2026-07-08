@@ -4611,7 +4611,16 @@ impl SaeManifoldTerm {
                         // Overflow-free `log I0(η)`; `bessel_i0(η).ln()` would be
                         // `+inf` for `η ≳ 709` (#1113).
                         let log_i0 = bessel_i0_log_and_ratio(eta).0;
-                        acc += energy + n_eff * (-eta + log_i0);
+                        // EXACT von-Mises precision log-partition. The partition over
+                        // one period is `Z(α) = ∫₀ᴾ exp[-V] dt = P·e^{-η}·I0(η)` (sub
+                        // `u=κt`, `dt = P/(2π) du`), so `log Z = log P − η + log I0(η)`.
+                        // The `log P` period-Jacobian was previously dropped: harmless
+                        // for unit-period axes (`P=1 ⇒ ln P = 0`, e.g. Circle{period:1}),
+                        // but it under-counts non-unit periodic axes (sphere longitude,
+                        // `P=2π`) by `n_eff·ln P` in the absolute prior evidence that
+                        // cross-topology/K model comparison consumes. `ln P` is
+                        // ρ-independent, so no inner gradient / FD channel is affected.
+                        acc += energy + n_eff * (p.ln() - eta + log_i0);
                     }
                 }
             }
@@ -8128,7 +8137,20 @@ impl SaeManifoldTerm {
             None => 0.0,
             Some(period) => {
                 let kappa = std::f64::consts::TAU / period;
-                -alpha * kappa * (kappa * t).sin()
+                // HT row weighting: the assembled majorizer whose t-derivative this
+                // feeds into the ½log|H| θ-adjoint is `w_row·max(V'',0)` (full
+                // `w_row`, added directly to `htt` — NOT via the √w jet seam), so on
+                // the positive branch its coordinate derivative is
+                // `w_row·d/dt[α cos κt] = w_row·(−ακ sin κt)`. The data-fit `dH/dθ`
+                // terms sharing this diagonal already carry full `w` (each is a
+                // product of two √w-scaled jets, so √w·√w = w), so the correct single
+                // factor for this prior term is likewise full `w_row`. `None`
+                // weights ⇒ w_row = 1, bit-for-bit the historical derivative.
+                let w_row = self
+                    .row_loss_weights
+                    .as_deref()
+                    .map_or(1.0, |w| w[row]);
+                -w_row * alpha * kappa * (kappa * t).sin()
             }
         }
     }
@@ -8224,6 +8246,7 @@ impl SaeManifoldTerm {
                     }
                     let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
                     let periods = self.assignment.coords[atom].effective_axis_periods();
+                    let row_w = self.row_loss_weights.as_deref();
                     for row in 0..self.n_obs() {
                         let row_t = self.assignment.coords[atom].row(row);
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
@@ -8235,7 +8258,16 @@ impl SaeManifoldTerm {
                         ) else {
                             continue;
                         };
-                        t[cache.row_offsets[row] + pos] += prior.grad;
+                        // HT row weighting: this RHS is `∂g/∂log α` of the inner-MAP
+                        // stationarity gradient `g`, and the assembly writes that
+                        // gradient as `w_row·V'` (full `w_row`, `construction_arrow_schur_assembly.rs`
+                        // gt seam). The IFT operator `H` it feeds carries full `w_row`
+                        // on this coordinate diagonal (`w·(D_data + prior'')`), so the
+                        // RHS must carry the SAME full `w_row` to stay consistent — `V`
+                        // is linear in α so `∂(w·V')/∂log α = w·V'`. `None` ⇒ w_row = 1,
+                        // bit-for-bit the historical RHS.
+                        let w_row = row_w.map_or(1.0, |w| w[row]);
+                        t[cache.row_offsets[row] + pos] += w_row * prior.grad;
                     }
                 }
             }

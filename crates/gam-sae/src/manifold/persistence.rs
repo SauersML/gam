@@ -404,10 +404,14 @@ fn dtm_radii(points: ArrayView2<'_, f64>, weights: Option<ArrayView1<'_, f64>>) 
     radii
 }
 
-fn dtm_weighted_distances(
+/// DTM-weighted pairwise distances together with the per-vertex DTM radii that
+/// define them. The two outputs are the full data of the weighted Vietoris–Rips
+/// filtration: for the standard `p = ∞` DTM convention a vertex is born at its
+/// own DTM radius `w_i = dtm[i]` and an edge at `max(‖x_i − x_j‖, w_i, w_j)`.
+fn dtm_weighted_distances_and_radii(
     points: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
-) -> Array2<f64> {
+) -> (Array2<f64>, Vec<f64>) {
     let m = points.nrows();
     let dtm = dtm_radii(points, weights);
     let mut dist = Array2::<f64>::zeros((m, m));
@@ -418,7 +422,14 @@ fn dtm_weighted_distances(
             dist[[j, i]] = d;
         }
     }
-    dist
+    (dist, dtm)
+}
+
+fn dtm_weighted_distances(
+    points: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Array2<f64> {
+    dtm_weighted_distances_and_radii(points, weights).0
 }
 
 /// Exact DTM-weighted Vietoris–Rips persistent homology up to H₁ (needs
@@ -446,6 +457,8 @@ fn dtm_vietoris_rips_persistence(
         return PersistenceDiagram { h0, h1, h2 };
     }
     if m == 1 {
+        // A single point has DTM radius 0 (`dtm_radii` returns 0 for `m <= 1`), so
+        // its DTM-weighted vertex birth is 0 — historical behavior preserved.
         h0.push(PersistenceBar {
             birth: 0.0,
             death: f64::INFINITY,
@@ -453,16 +466,20 @@ fn dtm_vietoris_rips_persistence(
         return PersistenceDiagram { h0, h1, h2 };
     }
 
-    let dist = dtm_weighted_distances(points, weights);
+    let (dist, dtm) = dtm_weighted_distances_and_radii(points, weights);
 
     // Build simplices up to the coface dimension needed by the requested
     // homology: H₁ needs triangles, H₂ needs tetrahedra.
     let max_simplex_dim = (max_homology_dim + 1).min(3);
     let mut simplices: Vec<Simplex> = Vec::new();
+    // Standard `p = ∞` DTM-weighted Vietoris–Rips convention: a vertex is born at
+    // its own DTM radius `w_i = dtm[i]`, NOT at 0. Edges/higher simplices already
+    // carry `max(d_ij, w_i, w_j)` (see `dtm_weighted_distances_and_radii`), which
+    // is `≥` each face's DTM birth, so face-before-coface ordering is preserved.
     for i in 0..m {
         simplices.push(Simplex {
             verts: vec![i],
-            filt: 0.0,
+            filt: dtm[i],
             dim: 0,
         });
     }

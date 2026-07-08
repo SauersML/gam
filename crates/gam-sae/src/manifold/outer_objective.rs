@@ -3106,7 +3106,9 @@ impl SaeManifoldOuterObjective {
             }
         }
 
-        // ARD axes (indices 1+K..): Mackay fixed point with posterior variance.
+        // ARD axes (indices 1+K..): Mackay fixed point with posterior variance
+        // (Gaussian closed form on Euclidean axes; the exact von-Mises root on
+        // periodic axes, see `von_mises_ard_precision`).
         // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
         // coordinate `1+K+axis`, so the fixed point pools the evidence across the
         // atoms owning the axis — `α_axis_new = φ̂·(count·n) / Σ_k(‖t_kj‖²+tr_kj)` —
@@ -3114,13 +3116,31 @@ impl SaeManifoldOuterObjective {
         // past the flat length `1+K+max_d` (OOB) and splits one shared strength
         // across phantom slots. In `PerAtom` mode each `(k, axis)` is its own
         // coordinate and this reduces to the historical per-atom Mackay update.
+        // Per-(atom, axis) periodicity: a PERIODIC (Circle) axis's empirical-Bayes
+        // precision is the von-Mises root (`von_mises_ard_precision`), NOT the
+        // Gaussian closed form `denom` alone encodes; a non-periodic (Euclidean)
+        // axis keeps the exact Gaussian Mackay/FS update unchanged.
+        let ard_periods: Vec<Vec<Option<f64>>> = self
+            .term
+            .assignment
+            .coords
+            .iter()
+            .map(|c| c.effective_axis_periods())
+            .collect();
         match rho.ard_sharing() {
             ArdSharing::PerAtom => {
                 for (k, axis_logard) in rho.log_ard.iter().enumerate() {
                     for (j, &logard_kj) in axis_logard.iter().enumerate() {
                         let denom = sumsq[k][j] + traces[k][j];
                         if denom > 0.0 {
-                            let alpha_new = dispersion * n_eff / denom;
+                            let alpha_gauss = dispersion * n_eff / denom;
+                            let alpha_new = match ard_periods[k].get(j).copied().flatten() {
+                                Some(period) => von_mises_ard_precision(
+                                    alpha_gauss,
+                                    std::f64::consts::TAU / period,
+                                ),
+                                None => alpha_gauss,
+                            };
                             if alpha_new.is_finite() && alpha_new > 0.0 {
                                 steps[rho.ard_flat_index(k, j)] = alpha_new.ln() - logard_kj;
                             }
@@ -3134,16 +3154,29 @@ impl SaeManifoldOuterObjective {
                     let mut denom = 0.0_f64;
                     let mut count = 0usize;
                     let mut shared_logard = 0.0_f64;
+                    let mut shared_period: Option<f64> = None;
                     for (k, axis_logard) in rho.log_ard.iter().enumerate() {
                         if axis < axis_logard.len() {
                             denom += sumsq[k][axis] + traces[k][axis];
                             // Broadcast table: every owner carries the same value.
                             shared_logard = axis_logard[axis];
+                            // Owners aliasing one shared axis share its geometry, so
+                            // the period is common; take the first owner's.
+                            if shared_period.is_none() {
+                                shared_period = ard_periods[k].get(axis).copied().flatten();
+                            }
                             count += 1;
                         }
                     }
                     if count > 0 && denom > 0.0 {
-                        let alpha_new = dispersion * n_eff * (count as f64) / denom;
+                        let alpha_gauss = dispersion * n_eff * (count as f64) / denom;
+                        let alpha_new = match shared_period {
+                            Some(period) => von_mises_ard_precision(
+                                alpha_gauss,
+                                std::f64::consts::TAU / period,
+                            ),
+                            None => alpha_gauss,
+                        };
                         if alpha_new.is_finite() && alpha_new > 0.0 {
                             steps[rho.ard_flat_index(0, axis)] = alpha_new.ln() - shared_logard;
                         }
@@ -3163,6 +3196,75 @@ impl SaeManifoldOuterObjective {
             inner_hessian_scale: None,
             logdet_enclosure_gap: None,
         })
+    }
+}
+
+/// Correct the Gaussian Mackay/Fellner–Schall ARD precision proposal to the
+/// EXACT von-Mises empirical-Bayes fixed point on a PERIODIC axis.
+///
+/// The closed-form update `α_gauss = φ̂·n_eff/(Σ q + tr H⁻¹)` is the stationary
+/// precision only for a Gaussian coordinate prior, whose normalized
+/// log-partition contributes `−½ n_eff log α` (ρ-derivative `−½ n_eff`). On a
+/// periodic (von-Mises) axis the normalized prior's log-partition is
+/// `log P − η + log I0(η)`, `η = α/κ²`, whose ρ-derivative is
+/// `n_eff·η·(A(η)−1)` with `A(η) = I1(η)/I0(η)` — the Gaussian `−½ n_eff` is only
+/// its `η→∞` limit (`A(η) ≈ 1 − 1/(2η)`). Setting the criterion's ρ-derivative to
+/// zero over the SAME `denom = Σ q + tr H⁻¹` the Gaussian update uses collapses to
+///   `A(η) = 1 − 1/(2·η_gauss)`,  `η_gauss = α_gauss/κ²`,
+/// so the correction → `α_gauss` in the `η→∞` limit (`A(η) ≈ 1 − 1/(2η)`) and only
+/// re-scales the diffuse regime the Gaussian surrogate mis-ranks. It differs from
+/// `α_gauss` at every finite η by design, so the bit-for-bit-unchanged guarantee
+/// holds only for Euclidean (`period = None`) axes, which bypass this function
+/// entirely. When the target ratio leaves `(0,1)` the root is ill-posed
+/// (`η_gauss ≤ ½`: maximally diffuse) and the Gaussian proposal is returned
+/// unchanged (no regression). `A` is strictly increasing on `(0,∞)`, so the root
+/// is found by monotone safeguarded bisection using the crate's stable `I1/I0`
+/// evaluator. The posterior-variance term keeps the plain Fellner–Schall trace
+/// surrogate `T = Σ w·(H⁻¹)ᵢᵢ` (not the exact `cos`-weighted `Σ w·(α cos κt)ᵢ(H⁻¹)ᵢᵢ`);
+/// this refines the analytically-dominant normalizer channel to the von-Mises form
+/// while the outer ρ-gradient (`ard_log_precision_explicit_derivatives`) stays the
+/// exact, value-consistent objective the step is safeguarded against.
+fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
+    if !(alpha_gauss.is_finite() && alpha_gauss > 0.0 && kappa.is_finite() && kappa > 0.0) {
+        return alpha_gauss;
+    }
+    let kappa2 = kappa * kappa;
+    let eta_gauss = alpha_gauss / kappa2;
+    // Exact stationarity over the shared denominator: A(η) = 1 − 1/(2·η_gauss).
+    let a_target = 1.0 - 0.5 / eta_gauss;
+    if !(a_target > 0.0 && a_target < 1.0) {
+        return alpha_gauss;
+    }
+    let a_of = |eta: f64| bessel_i0_log_and_ratio(eta).1;
+    // Bracket the monotone root around η_gauss (A increasing in η).
+    let mut lo = eta_gauss;
+    let mut hi = eta_gauss;
+    let mut guard = 0;
+    while lo > f64::MIN_POSITIVE && a_of(lo) > a_target && guard < 256 {
+        lo *= 0.5;
+        guard += 1;
+    }
+    guard = 0;
+    while hi.is_finite() && a_of(hi) < a_target && guard < 256 {
+        hi *= 2.0;
+        guard += 1;
+    }
+    if !(lo.is_finite() && hi.is_finite() && lo > 0.0 && hi > lo) {
+        return alpha_gauss;
+    }
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if a_of(mid) < a_target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let alpha = kappa2 * 0.5 * (lo + hi);
+    if alpha.is_finite() && alpha > 0.0 {
+        alpha
+    } else {
+        alpha_gauss
     }
 }
 

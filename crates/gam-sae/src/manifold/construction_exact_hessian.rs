@@ -211,6 +211,15 @@ impl SaeManifoldTerm {
             }
 
             // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
+            // HT row weighting: the assembly writes the majorizer this corrects as
+            // `w_row·max(V'',0)` (the weighted ARD seam in
+            // `construction_arrow_schur_assembly.rs`), so the dropped-curvature
+            // delta `A − B = w_row·min(V'',0)` must carry the SAME full `w_row` —
+            // otherwise the exact operator `A = B + ΔC` no longer equals the
+            // weighted von-Mises curvature `w_row·V''` on a subsample (the prior is
+            // added directly with full `w_row`, NOT through the √w jet seam, so the
+            // correct single factor here is `w_row`, not `√w`). `None` ⇒ w_row = 1.
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
             for (a, va) in jets.vars.iter().enumerate() {
                 let SaeLocalRowVar::Coord { atom, axis } = *va else {
                     continue;
@@ -223,7 +232,7 @@ impl SaeManifoldTerm {
                 let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
                 let neg = prior.hess.min(0.0);
                 if neg != 0.0 {
-                    out.t[base + a] += neg * v_t[a];
+                    out.t[base + a] += w_row * neg * v_t[a];
                 }
             }
         }

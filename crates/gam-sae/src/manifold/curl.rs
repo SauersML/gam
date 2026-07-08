@@ -80,7 +80,8 @@ pub struct CurlVerdict {
     pub resultant1: f64,
     /// Second circular resultant `R₂ = |E[e^{2iθ}]|` (`→ 1` diameter/line).
     pub resultant2: f64,
-    /// `R̂ = √(E[r²])` — the fitted radius.
+    /// `R̂ = √(max(E[r²] − 2σ², 0))` — the noise-debiased fitted radius (the raw
+    /// √(E[r²]) is biased up by the 2-D noise energy `2σ²` on the active support).
     pub radius: f64,
     /// `½·ln(3R̂²/(π²σ²))` — the per-row coding gain (Theorem-3 circle gain of
     /// `description_length::circle_coding_gain_bits`, in nats).
@@ -193,7 +194,16 @@ pub fn curl_verdict(
     }
     let law = radius_law(alpha, beta)?;
     let (resultant1, resultant2) = circular_resultants(alpha, beta);
-    let radius = law.m2.sqrt();
+    // Noise-debiased radius. `(α, β)` are the plane coords on the ACTIVE SUPPORT
+    // (the co-firing rows the driver passes), so a noisy ring
+    // `x = R(cosθ, sinθ) + ε`, `ε ~ N(0, σ²I₂)`, has `E[r²] = R² + 2σ²`: each of
+    // the two in-plane coordinates carries the per-coordinate noise variance σ².
+    // `√m₂` therefore estimates `√(R² + 2σ²)`, biased UP by the 2-D noise annulus
+    // — enough to push a sub-crossover ring (e.g. `R = 1.5σ` ⇒ `√m₂ = 2.06σ`)
+    // above the `σ·π/√3 ≈ 1.814σ` acceptance threshold even though its true coding
+    // gain is negative. Subtract the `2σ²` noise energy first (same debiasing as
+    // `isa_seed`'s `a² = (m₂ − 2σ²)/q̂`, here with `q̂ = 1` on the active support).
+    let radius = (law.m2 - 2.0 * sigma * sigma).max(0.0).sqrt();
     // Per-row circle coding gain ½·ln(3R̂²/(π²σ²)) — the exact Theorem-3 circle
     // gain of `description_length::circle_coding_gain_bits`, in nats (bits·ln 2).
     // Equivalently ln(R̂/σ) − ln(π/√3): the shape constant −0.5954… is what makes

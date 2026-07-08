@@ -252,6 +252,21 @@ impl IsometryMetricState {
     }
 }
 
+/// Average trace per latent dimension `(1 / (N d)) Σ_n tr(m_n)` of a flattened
+/// `(n_obs, d*d)` row-major metric field. Shared by the decoder normalizer
+/// `gbar` and the reference normalizer `gref_bar`, so a decoder metric that is
+/// exactly proportional to a reference of arbitrary scale gives a zero residual.
+fn average_trace_per_dim(m: ArrayView2<'_, f64>, n_obs: usize, d: usize) -> f64 {
+    let denom = (n_obs * d) as f64;
+    let mut trace_sum = 0.0;
+    for n in 0..n_obs {
+        for a in 0..d {
+            trace_sum += m[[n, a * d + a]];
+        }
+    }
+    trace_sum / denom
+}
+
 fn isometry_dg_entry(
     jac2: ArrayView2<'_, f64>,
     wj: ArrayView2<'_, f64>,
@@ -918,14 +933,7 @@ impl IsometryPenalty {
     pub fn metric_normalizer(&self, latent_dim: usize) -> Option<f64> {
         let g = self.pullback_metric(latent_dim)?;
         let n_obs = g.nrows();
-        let trace_denominator = (n_obs * latent_dim) as f64;
-        let mut trace_sum = 0.0;
-        for n in 0..n_obs {
-            for a in 0..latent_dim {
-                trace_sum += g[[n, a * latent_dim + a]];
-            }
-        }
-        let normalizer = trace_sum / trace_denominator;
+        let normalizer = average_trace_per_dim(g.view(), n_obs, latent_dim);
         (normalizer.is_finite() && normalizer > f64::MIN_POSITIVE).then_some(normalizer)
     }
 
@@ -951,8 +959,11 @@ impl IsometryPenalty {
 
     /// Shared normalized metric state for the scale-invariant isometry gauge.
     ///
-    /// The residual is `R_n = g_n / gbar - g_ref,n`, with
-    /// `gbar = (1 / (N d)) Σ_n tr(g_n)`. The metric-gradient is the exact
+    /// The residual is `R_n = g_n / gbar - g_ref,n / gref_bar`, with
+    /// `gbar = (1 / (N d)) Σ_n tr(g_n)` and `gref_bar = (1 / (N d)) Σ_n tr(g_ref,n)`
+    /// (`gref_bar == 1` for the `Euclidean` reference). `g_ref / gref_bar` is
+    /// constant w.r.t. the decoder coordinates, so the metric gradient/Hessian
+    /// form below is unchanged. The metric-gradient is the exact
     /// derivative of `0.5 Σ ||R_n||²` with respect to the raw pullback metrics:
     ///
     /// `A_n = R_n / gbar - (Σ_l R_l:g_l) I / (gbar² N d)`.
@@ -967,13 +978,7 @@ impl IsometryPenalty {
     ) -> Option<IsometryMetricState> {
         let dd = d * d;
         let trace_denominator = (n_obs * d) as f64;
-        let mut trace_sum = 0.0;
-        for n in 0..n_obs {
-            for a in 0..d {
-                trace_sum += g[[n, a * d + a]];
-            }
-        }
-        let normalizer = trace_sum / trace_denominator;
+        let normalizer = average_trace_per_dim(g.view(), n_obs, d);
         if !(normalizer.is_finite() && normalizer > f64::MIN_POSITIVE) {
             self.missing_cache_default(
                 "normalized_metric_state",
@@ -984,11 +989,27 @@ impl IsometryPenalty {
             return None;
         }
         let g_ref = self.reference_metric(n_obs, d);
+        // Normalize the reference by its own average trace per dim so the gauge
+        // is scale-invariant on both sides: a decoder metric proportional to the
+        // reference (up to an arbitrary global scale, common for external chart
+        // metrics / GP-LVM warm starts) gives a zero residual. For `Euclidean`,
+        // `ref_normalizer == 1.0` exactly, preserving the prior behavior bit-for-bit.
+        let ref_normalizer = average_trace_per_dim(g_ref.view(), n_obs, d);
+        if !(ref_normalizer.is_finite() && ref_normalizer > f64::MIN_POSITIVE) {
+            self.missing_cache_default(
+                "normalized_metric_state",
+                &format!(
+                    "reference-metric normalizer is non-positive or non-finite: {ref_normalizer}"
+                ),
+            );
+            return None;
+        }
         let mut residual = Array2::<f64>::zeros((n_obs, dd));
         let inv_norm = 1.0 / normalizer;
+        let inv_ref_norm = 1.0 / ref_normalizer;
         for n in 0..n_obs {
             for k in 0..dd {
-                residual[[n, k]] = g[[n, k]] * inv_norm - g_ref[[n, k]];
+                residual[[n, k]] = g[[n, k]] * inv_norm - g_ref[[n, k]] * inv_ref_norm;
             }
         }
         let mut residual_dot_g = 0.0;

@@ -324,11 +324,17 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 
 /// Directly price a WBIC learning-coefficient contribution for ONE scalar
 /// reconstruction direction with per-observation energy `mu` against noise edge
-/// `edge`: `λ̂ = ½·μ/(μ+e)`. Exposed for the sampling cross-check test that
+/// `edge` at effective sample size `n_eff`: `λ̂_k = ½·μ/(μ + e·log n_eff)`
+/// (header derivation, lines ~40-49). The likelihood is tempered by
+/// `β = 1/log n_eff`, the REML prior is NOT — so the edge carries the
+/// `log n_eff` temperature and this is `½ ×` the production `rank_soft`
+/// per-direction term (same `tempered_edge = e·log n_eff`, `n_eff` floored at
+/// `e` so `log n_eff ≥ 1`). Exposed for the sampling cross-check test that
 /// validates the closed form against a genuine tempered-posterior expectation.
-pub fn direction_learning_coefficient(mu: f64, edge: f64) -> f64 {
-    if edge > 0.0 {
-        0.5 * mu / (mu + edge)
+pub fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
+    let tempered_edge = edge * n_eff.max(std::f64::consts::E).ln();
+    if tempered_edge > 0.0 {
+        0.5 * mu / (mu + tempered_edge)
     } else {
         0.5
     }
@@ -336,30 +342,32 @@ pub fn direction_learning_coefficient(mu: f64, edge: f64) -> f64 {
 
 /// A genuine (non-Laplace) WBIC estimate for a SINGLE scalar-amplitude
 /// reconstruction direction, by the thermodynamic tempered-posterior expectation
-/// `E_β[nL] − nL(α̂)`, divided by `log n`, to recover `λ̂`. Used ONLY to validate
-/// [`direction_learning_coefficient`]: model `nL(α) = (g/2R)(α−α̂)²` with a REML
-/// Gaussian prior of precision `τ = g_edge/R` (crossover-at-edge), tempered at
-/// `β = 1/log n`, integrated in closed form over the Gaussian (the integral is
-/// exact — the point is to confirm the algebra that produced the sigmoid, not to
-/// approximate). Because the model is Gaussian this returns the SAME number as
-/// the sigmoid up to the prior-shift term, which this includes so the test sees
-/// the full expectation.
+/// `E_β[nL] − nL(α̂)`, divided by `log n_eff`, to recover `λ̂`. Used ONLY to
+/// validate [`direction_learning_coefficient`]: model `nL(α) = (g/2R)(α−α̂)²`
+/// with the LIKELIHOOD tempered at `β = 1/log n_eff` and a REML Gaussian prior of
+/// precision `τ = g_edge/R` that is NOT tempered (crossover-at-edge, exactly the
+/// header's untempered prior — tempering the prior too would forfeit the WBIC
+/// temperature the estimator's name invokes), integrated in closed form over the
+/// Gaussian (the integral is exact — the point is to confirm the algebra that
+/// produced the sigmoid, not to approximate). Because the model is Gaussian this
+/// returns the SAME number as the sigmoid up to the prior-shift term, which this
+/// includes so the test sees the full expectation. `log n_eff` uses the same
+/// `n_eff` floored at `e` as production `rank_soft`.
 pub fn sampled_direction_learning_coefficient(
     mu: f64,
     edge: f64,
     n_eff: f64,
     r_floor: f64,
-    n: usize,
 ) -> f64 {
-    let ln_n = (n as f64).ln();
-    if !(ln_n > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
+    let ln_neff = n_eff.max(std::f64::consts::E).ln();
+    if !(ln_neff > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
         return 0.0;
     }
-    let beta = 1.0 / ln_n;
+    let beta = 1.0 / ln_neff;
     let g = n_eff * mu; // design energy
     let g_edge = n_eff * edge; // prior precision energy (crossover at edge)
     let h = beta * g / r_floor; // tempered likelihood precision
-    let tau = beta * g_edge / r_floor; // prior precision
+    let tau = g_edge / r_floor; // UNtempered prior precision (β does NOT enter π)
     let prec_post = h + tau;
     if !(prec_post > 0.0) {
         return 0.0;
@@ -376,7 +384,7 @@ pub fn sampled_direction_learning_coefficient(
     let alpha_hat = alpha_hat2.sqrt();
     let shift2 = (m_post - alpha_hat) * (m_post - alpha_hat);
     let e_delta = 0.5 * (g / r_floor) * (var + shift2);
-    e_delta / ln_n
+    e_delta / ln_neff
 }
 
 /// Compute the audit spectrum from an already-projected reconstruction problem:
@@ -544,32 +552,36 @@ mod tests {
         );
     }
 
-    /// The closed-form sigmoid `½·μ/(μ+e)` must equal the tempered-posterior
-    /// expectation for a Gaussian direction (the derivation cross-check). Prior
-    /// shift is negligible far from the edge and the two agree there; near the
-    /// edge the sampled value carries the small prior-shift term, so we check the
-    /// dominant variance term agreement across a μ sweep.
+    /// The closed-form tempered sigmoid `½·μ/(μ + e·log n_eff)` must equal the
+    /// tempered-posterior expectation for a Gaussian direction (the derivation
+    /// cross-check): the likelihood is tempered by `β = 1/log n_eff`, the prior is
+    /// NOT, so the untempered prior precision `τ = g_edge/R` is what makes the
+    /// variance term collapse to the closed form. Prior shift is negligible far
+    /// from the edge and the two agree there; near the edge the sampled value
+    /// carries the small prior-shift term, so we check the dominant variance term
+    /// agreement across a μ sweep.
     #[test]
     fn sigmoid_matches_tempered_posterior_variance_term() {
-        let n = 800usize;
         let n_eff = 800.0_f64;
         let r_floor = 0.0025_f64;
         let edge = r_floor * (1.0 + (12.0_f64 / n_eff).sqrt()).powi(2);
+        let ln_neff = n_eff.max(std::f64::consts::E).ln();
         for &ratio in &[8.0_f64, 4.0, 2.0, 1.0, 0.5, 0.25] {
             let mu = ratio * edge;
-            let closed = direction_learning_coefficient(mu, edge);
-            let sampled = sampled_direction_learning_coefficient(mu, edge, n_eff, r_floor, n);
+            let closed = direction_learning_coefficient(mu, edge, n_eff);
+            let sampled = sampled_direction_learning_coefficient(mu, edge, n_eff, r_floor);
             // The variance term of the sampled expectation equals the closed form
             // exactly; the total sampled value adds only the (non-negative) prior
             // shift, so sampled ≥ variance term and both share the same limits.
             eprintln!("[wbic sigmoid] μ/e={ratio:.2}  closed={closed:.4} sampled≈{sampled:.4}");
-            // Variance-only reconstruction of the sampled expectation:
-            let beta = 1.0 / (n as f64).ln();
+            // Variance-only reconstruction of the sampled expectation: likelihood
+            // tempered at β = 1/log n_eff, prior precision τ = g_edge/R UNtempered.
+            let beta = 1.0 / ln_neff;
             let g = n_eff * mu;
             let g_edge = n_eff * edge;
             let h = beta * g / r_floor;
-            let tau = beta * g_edge / r_floor;
-            let var_term = 0.5 * (g / r_floor) * (1.0 / (h + tau)) / (n as f64).ln();
+            let tau = g_edge / r_floor;
+            let var_term = 0.5 * (g / r_floor) * (1.0 / (h + tau)) / ln_neff;
             assert!(
                 (closed - var_term).abs() < 1e-9,
                 "closed sigmoid must equal the tempered variance term: closed={closed} var={var_term}"
