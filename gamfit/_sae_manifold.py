@@ -1022,38 +1022,20 @@ class ManifoldSAE:
                 )
             order = np.argsort(coords[:, 0], kind="mergesort")
             coords = np.ascontiguousarray(coords[order])
-            decoder = np.asarray(atom["decoder_B"], dtype=float)
-            # #1132 bug 1: a periodic atom is intrinsically at least one harmonic
-            # (basis width 2H+1 with H>=1). A plan field that collapsed to 0 (a
-            # degenerate constant-only width recovered from a born/fissioned atom
-            # at K>=4) must be floored to the harmonic count implied by the
-            # trained decoder width `M = 2H+1`, mirroring `_functional_basis_params`
-            # — never raised. Otherwise the curved (n_harmonics=0) EV-vs-K curve at
-            # K>=4 dies here instead of reconstructing the shape band.
-            n_harmonics = int(plan["n_harmonics"])
-            if n_harmonics <= 0:
-                n_harmonics = (int(decoder.shape[0]) - 1) // 2
-            n_harmonics = max(1, n_harmonics)
-            phi, _jet, _penalty = rust_module().basis_with_jet(
-                "periodic",
-                coords,
-                {"n_harmonics": n_harmonics},
-            )
-            phi = np.asarray(phi, dtype=float)
-            if phi.shape[1] != decoder.shape[0]:
-                # The posterior shape band is an OPTIONAL diagnostic, not part of
-                # reconstruction (which uses `decoder_blocks` via predict_oos). A
-                # periodic atom whose decoder collapsed to a non-`2H+1` width
-                # (e.g. the hybrid-split linear collapse replacing the curved
-                # decoder with a 1-row straight image, or a degenerate
-                # born/fissioned atom) cannot present a periodic shape band — but
-                # that must NOT abort the whole fit. Skip the band gracefully.
+            # The band MEAN is a Rust-owned quantity, exactly like the sd: the
+            # engine's decode applies the atom's amplitude exp(log_amplitude) on
+            # top of Phi(t)·B, and the amplitude never crosses the FFI. The
+            # historical Python recompute (`phi @ decoder`) silently DROPPED
+            # that factor, so the band drew at the wrong radius whenever gauge
+            # canonicalization peeled decoder norm into the amplitude. Read the
+            # payload's amplitude-correct mean, reordered to the sorted
+            # coordinates, and never recompute model math here (SPEC rule 8). An
+            # absent Rust mean means no band: a wrong-radius curve is worse than
+            # an absent diagnostic.
+            mean = _opt_arr(atom, "shape_band_mean")
+            if mean is None:
                 return None, None, None
-            mean = phi @ decoder
-            # Posterior sd is surfaced only when the Rust payload already carries
-            # it. The delta-method covariance push-forward that once recomputed
-            # the band sd in Python (var = phiᵀ Σ phi per channel) was numeric
-            # SE/variance math and has been removed; SE is a Rust-owned quantity.
+            mean = np.asarray(mean, dtype=float)[order]
             sd = _opt_arr(atom, "shape_band_sd")
             if sd is not None:
                 sd = np.asarray(sd, dtype=float)[order]

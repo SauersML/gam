@@ -580,17 +580,21 @@ pub struct SaeManifoldTerm {
     /// no pair co-fires (`K < 2`, or a fully-disjoint routing — the strict no-op);
     /// callers fall back to the live coactivation in that case. Transient: not part
     /// of the persisted term identity (Clone starts `None`, rebuilt next assembly).
-    /// Per-assembly FROZEN separation-barrier pairs `(j, k, q_jk)`: the co-firing
-    /// atom indices and their normalized coactivation weight `q_jk`, the entries of
-    /// the Jeffreys Fisher `F = Q ∘ O` (see
-    /// [`super::penalties::BarrierComponent`]). The coactivation is a function of
-    /// the frozen routing, so freezing it here keeps the barrier value, gradient,
-    /// and curvature reading the SAME `Q` across an inner line search. The decoder
-    /// overlaps `O` are NOT frozen — they are the LIVE shapes the barrier separates
+    /// Per-assembly FROZEN separation-barrier support: the co-firing pairs
+    /// `(j, k, q_jk)` — the entries of the Jeffreys Fisher `F = Q ∘ O` (see
+    /// [`super::penalties::BarrierComponent`]) — TOGETHER with the per-atom
+    /// effective sample sizes `N_eff,k = Σ_{i∈J_k} a_ik²` accumulated over the
+    /// SAME truncated active support as `q`'s denominators. Both are functions of
+    /// the routing masses (hence the logits the inner Newton solve moves), so
+    /// freezing them here keeps the barrier value, gradient, and curvature reading
+    /// the SAME `Q`, the SAME occupancy scale `n_C` (the occupancy-scaled Jeffreys
+    /// weight), and the SAME data-derived softening `ε_C` across an inner line
+    /// search. The decoder overlaps `O` are NOT frozen — they are the LIVE shapes
+    /// the barrier separates
     /// ([`super::penalties::SaeManifoldTerm::decoder_gram_cosine_sq`]), moving with
     /// the trial decoders. The Jeffreys exponent `½` is fixed, so there is no
     /// per-pair strength `μ_jk` to freeze (that under-derived scalar is gone).
-    pub(crate) barrier_coactivation_gate: Option<Vec<(usize, usize, f64)>>,
+    pub(crate) barrier_coactivation_gate: Option<BarrierCoactivationGate>,
     /// #1801 — STREAMING gate-freeze flag. The collapse-prevention gates
     /// ([`Self::decoder_repulsion_gate`], [`Self::barrier_coactivation_gate`]) are
     /// GLOBAL dictionary properties: their per-pair strength `μ_jk` inverts the

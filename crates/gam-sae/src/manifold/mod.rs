@@ -140,7 +140,8 @@ pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
 pub(crate) use gam_solve::arrow_schur::{
     ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, arrow_factor_max_pivot,
-    arrow_factor_min_pivot, solve_arrow_newton_step_with_options,
+    arrow_factor_min_pivot, probe_undamped_evidence_row_factors,
+    solve_arrow_newton_step_with_options,
 };
 
 // #988 memory-matrix-free evidence log-det: the reduced-Schur SLQ entry point
@@ -337,6 +338,9 @@ mod tests_cocollapse_reseed_2089;
 mod tests_outer_reml_probe_budget_2080;
 
 #[cfg(test)]
+mod tests_outer_probe_forcing;
+
+#[cfg(test)]
 mod lambda_smooth_1556_tests;
 
 #[cfg(test)]
@@ -378,6 +382,10 @@ pub use construction_reconstruction::reconstruct_persisted_atom_set;
 // #16/#2023 — the shared rank-charge DOF core, exposed so the hybrid-split DEMOTE
 // gate prices linear/curved candidates in the SAME currency as the joint REML fit.
 pub(crate) use construction::realised_rank_charge_dof;
+// Occupancy-scaled Jeffreys barrier: the per-assembly frozen routing support
+// (coactivation pairs + per-atom N_eff) carried on `SaeManifoldTerm` — reachable
+// crate-wide because the term's frozen-gate field is.
+pub(crate) use penalties::BarrierCoactivationGate;
 
 /// Public single-currency surface for the realised rank-charge DOF: the SAME
 /// `realised_rank_charge_dof` the joint REML PROMOTE gate, the hybrid-split
