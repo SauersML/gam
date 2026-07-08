@@ -1827,6 +1827,68 @@ mod topk_activation_tests {
 }
 
 #[cfg(test)]
+mod topk_support_gate_tests {
+    // Contract tests for the [`AssignmentMode::TopK`] hard-support gate: the
+    // support is EXACTLY the k largest routing logits (deterministic lower-index
+    // tie-break), L0 is exactly k, the fill-into twin is bit-identical, and the
+    // all-equal neutral support is the first k atoms.
+    use super::*;
+
+    #[test]
+    fn topk_row_selects_exact_support_and_l0_is_k() {
+        let logits = Array1::from(vec![0.3_f64, 0.9, 0.9, -1.0, 0.5]);
+        let g = topk_row(logits.view(), 3);
+        assert_eq!(g.to_vec(), vec![0.0, 1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            g.iter().filter(|&&v| v == 1.0).count(),
+            3,
+            "L0 must equal k exactly"
+        );
+        assert!(g.iter().all(|&v| v == 0.0 || v == 1.0), "gates are hard {{0,1}}");
+    }
+
+    #[test]
+    fn topk_boundary_tie_breaks_toward_lower_index() {
+        let logits = Array1::from(vec![1.0_f64, 0.5, 0.5, 0.1]);
+        let g = topk_row(logits.view(), 2);
+        assert_eq!(
+            g.to_vec(),
+            vec![1.0, 1.0, 0.0, 0.0],
+            "the tied boundary atom with the LOWER index wins deterministically"
+        );
+    }
+
+    #[test]
+    fn topk_row_into_is_bit_identical_and_k_ge_n_is_all_active() {
+        let logits = Array1::from(vec![-0.2_f64, 3.0, 0.7, 0.7, -5.0, 2.2]);
+        for k in [1usize, 2, 4, 6, 9] {
+            let alloc = topk_row(logits.view(), k);
+            let mut buf = vec![f64::NAN; logits.len()];
+            topk_row_into(logits.view(), k, &mut buf);
+            assert_eq!(alloc.to_vec(), buf, "into-twin must be bit-identical at k={k}");
+        }
+        let all = topk_row(logits.view(), 99);
+        assert!(all.iter().all(|&v| v == 1.0), "k >= n degenerates to all-active");
+    }
+
+    #[test]
+    fn topk_neutral_support_is_first_k_atoms() {
+        let w = neutral_gate_weights(AssignmentMode::top_k_support(3), 6);
+        assert_eq!(w.to_vec(), vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn topk_mode_carries_no_temperature_or_prior_knobs() {
+        let mode = AssignmentMode::top_k_support(4);
+        mode.validate().expect("k >= 1 validates");
+        assert!(
+            AssignmentMode::top_k_support(0).validate().is_err(),
+            "k = 0 must be rejected"
+        );
+    }
+}
+
+#[cfg(test)]
 mod jumprelu_batch_tests {
     use super::*;
 
