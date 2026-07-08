@@ -3122,7 +3122,15 @@ impl SaeManifoldTerm {
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
-        let mut collapsed = Vec::new();
+        // PASS 1 — output-SUBSPACE overlap CANDIDATES. A pair enters the guard only
+        // when its decoder output frames overlap beyond the random-frame null
+        // `½(μ_null+1)`. This is a cheap prune, NOT the verdict: sharing an output
+        // subspace is FORCED for an over-complete (`K > rank`) manifold dictionary
+        // (several curved atoms cannot avoid the ≤`p`-dim output space) and is not
+        // itself co-collapse. Orthogonal-output atoms have coherence≈0 and never
+        // become candidates (their contributions are also uncorrelated), so nothing
+        // functionally-redundant is pruned here.
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
         for j in 0..k {
             for kk in (j + 1)..k {
                 let rj = frames[j].ncols();
@@ -3138,10 +3146,87 @@ impl SaeManifoldTerm {
                 let a = rj as f64 / p as f64;
                 let b = rk as f64 / p as f64;
                 let mu_null = (a * (1.0 - b)).max(0.0).sqrt() + (b * (1.0 - a)).max(0.0).sqrt();
-                let bar = 0.5 * (mu_null.min(1.0) + 1.0);
-                if coherence > bar {
-                    collapsed.push((j, kk, coherence, bar));
+                let frame_bar = 0.5 * (mu_null.min(1.0) + 1.0);
+                if coherence > frame_bar {
+                    candidates.push((j, kk));
                 }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        // PASS 2 — FUNCTIONAL-REDUNDANCY verdict (#2132/#1893). A frame-coherent pair
+        // is genuine high-EV co-collapse only when the two atoms are the SAME
+        // FUNCTION — their gated per-row contributions `Y_k = diag(a_·k)·Φ_k·B_k`
+        // (n×p) are collinear over the rows — NOT merely when they share an output
+        // subspace. Two curved atoms sharing a decoder frame at DIFFERENT charts
+        // (phases) reconstruct DIFFERENT rows, so `Y_j ≠ Y_k`: benign, healthy,
+        // must not be reseeded (measured on `ibp_default_alpha`: every frame-coherent
+        // pair reconstructs EV≈0.99 with contribution cosine ≤0.27, right at the
+        // independence null, while the frame coherence reads ≈1). Confirm each
+        // candidate on the Frobenius cosine of its contributions against a bar
+        // RE-DERIVED for THIS statistic (the frame-coherence bar `½(μ_null+1)` is the
+        // WRONG null here). Matched null: same frames, INDEPENDENT phases ⇒ the two
+        // contributions are independent random vectors whose shared structure spans
+        // `D = M_k·r_k` dimensions (`M` chart basis functions × `r` frame rank), so
+        // `E_null|cos| = √(2/(πD))`; the bar is its ½-envelope to full alignment,
+        // `contribution_bar = ½(√(2/(πD)) + 1)`, with `D = min(M_j r_j, M_k r_k)` (the
+        // smaller intrinsic dimension bounds the null correlation). No inherited
+        // constant. A true duplicate (`Y_j ∝ Y_k`, cos→1) clears it and still fires;
+        // the benign overcomplete pair (cos≈E_null) does not.
+        // Gated per-row contributions `Y_k` for every atom appearing in a candidate
+        // (computed once each). `None` = no gated design available for that atom.
+        let gates = self.assignment.assignments();
+        let n = gates.nrows();
+        let mut in_candidate = vec![false; k];
+        for &(j, kk) in &candidates {
+            in_candidate[j] = true;
+            in_candidate[kk] = true;
+        }
+        let mut contribution: Vec<Option<Array2<f64>>> = vec![None; k];
+        for atom in 0..k {
+            if !in_candidate[atom] {
+                continue;
+            }
+            let phi = &self.atoms[atom].basis_values;
+            if phi.nrows() != n || n == 0 {
+                continue;
+            }
+            let mut y = phi.dot(&self.atoms[atom].decoder_coefficients);
+            for row in 0..n {
+                let g = gates[[row, atom]];
+                for col in 0..y.ncols() {
+                    y[[row, col]] *= g;
+                }
+            }
+            contribution[atom] = Some(y);
+        }
+        let mut collapsed = Vec::with_capacity(candidates.len());
+        for (j, kk) in candidates {
+            let d_eff = (self.atoms[j].basis_size().max(1) * frames[j].ncols().max(1))
+                .min(self.atoms[kk].basis_size().max(1) * frames[kk].ncols().max(1))
+                as f64;
+            let e_null = (2.0 / (std::f64::consts::PI * d_eff)).sqrt();
+            let contribution_bar = 0.5 * (e_null.min(1.0) + 1.0);
+            let contribution_cos = match (&contribution[j], &contribution[kk]) {
+                (Some(yj), Some(yk)) => {
+                    let mut dot = 0.0_f64;
+                    let mut nj = 0.0_f64;
+                    let mut nk = 0.0_f64;
+                    for (a, b) in yj.iter().zip(yk.iter()) {
+                        dot += a * b;
+                        nj += a * a;
+                        nk += b * b;
+                    }
+                    let denom = (nj * nk).sqrt();
+                    if denom > 0.0 { (dot / denom).abs() } else { 0.0 }
+                }
+                // Contribution unavailable (decoder-only detector call before any
+                // gated design): keep the subspace verdict rather than lose it.
+                _ => 1.0,
+            };
+            if contribution_cos > contribution_bar {
+                collapsed.push((j, kk, contribution_cos, contribution_bar));
             }
         }
         Ok(collapsed)

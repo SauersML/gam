@@ -386,21 +386,30 @@ pub(crate) fn two_circle_separates_at_narrow_and_wide_widths_2027() {
     }
 }
 
-/// #2082 — the STRUCTURAL coherence detector must fire on atoms that decode the
-/// SAME output subspace (the "high EV, no structure" collapse the two-width test
-/// catches) and stay SILENT on atoms whose decoders span ORTHOGONAL subspaces
-/// (a healthy well-separated dictionary), keying on the derived random-subspace
-/// null — so a live fit's guard reseeds a merged pair without touching separated
-/// atoms.
+/// #2082/#2132/#1893 — the STRUCTURAL coherence detector fires on FUNCTIONAL
+/// REDUNDANCY (two atoms that reconstruct the SAME rows — a genuine duplicate),
+/// NOT on mere output-subspace sharing. Three cases pin the contract:
+///
+///  (1) ORTHOGONAL output subspaces → frames don't even overlap → NOT flagged.
+///  (2) SAME output subspace but DIFFERENT charts (identical decoder, distinct
+///      phases) → the atoms decode DIFFERENT rows, so their gated contributions
+///      `Y_k = diag(a)ΦB` are NOT collinear → benign, NOT flagged. This is the
+///      over-complete (`K > rank`) regime the old frame-coherence detector
+///      false-positived on (the `ibp_default_alpha` regression: healthy EV≈0.99,
+///      frame coherence ≈1, contribution cosine ≈ the independence null): several
+///      curved atoms MUST share the ≤`p`-dim output space while encoding distinct
+///      structure.
+///  (3) TRUE DUPLICATE (identical decoder AND identical chart) → `Y_0 ∝ Y_1` →
+///      contribution cosine → 1 → FLAGGED.
 #[test]
 pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_2082() {
     let n = 48usize;
     let p = 8usize;
     let m = 5usize;
-    let (mut term, _target) = two_circle_k2_term(n, p, m);
 
-    // ORTHOGONAL output subspaces: atom 0 decodes only EVEN output channels, atom 1
-    // only ODD → their output frames are orthogonal → coherence 0 → NOT flagged.
+    // (1) ORTHOGONAL output subspaces: atom 0 decodes only EVEN output channels,
+    // atom 1 only ODD → orthogonal frames → not a candidate → NOT flagged.
+    let (mut term, _target) = two_circle_k2_term(n, p, m);
     for atom in 0..2 {
         let mut b = Array2::<f64>::zeros((m, p));
         for col in 0..m {
@@ -418,22 +427,48 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
         "orthogonal-subspace atoms must NOT be flagged as structurally collapsed"
     );
 
-    // DUPLICATE output subspaces: both atoms decode the SAME two output directions
-    // → identical output frames → coherence ~1 → flagged (well above the ½(μ_null+1)
-    // bar; for p=8, rank-2, μ_null ≈ 0.9 so the bar ≈ 0.95, and 1.0 clears it).
+    // (2) SAME output subspace, DIFFERENT charts: identical decoder, but the two
+    // atoms keep their distinct PCA-seeded phases → same output frame (coherence
+    // ≈1) yet DIFFERENT per-row contributions → NOT functional redundancy → the
+    // functional-redundancy detector must stay SILENT (the old frame-only detector
+    // wrongly fired here).
     let mut dup = Array2::<f64>::zeros((m, p));
-    dup[[0, 0]] = 1.0;
-    dup[[1, 1]] = 1.0;
+    dup[[1, 0]] = 1.0;
+    dup[[2, 1]] = 1.0;
     term.atoms[0].decoder_coefficients = dup.clone();
-    term.atoms[1].decoder_coefficients = dup;
+    term.atoms[1].decoder_coefficients = dup.clone();
+    let mut shifted = term.assignment.coords[0].as_matrix().to_owned();
+    for t in shifted.iter_mut() {
+        *t = (*t + 0.25).rem_euclid(1.0);
+    }
+    let shifted_flat: Array1<f64> = shifted.iter().copied().collect();
+    term.assignment.coords[1].set_flat(shifted_flat.view());
+    term.atoms[1].refresh_basis(shifted.view()).unwrap();
+    assert!(
+        term.structural_coherence_collapse_detected()
+            .unwrap()
+            .is_none(),
+        "same output subspace with DIFFERENT charts is benign over-completeness and \
+         must NOT be flagged (the ibp_default_alpha false positive)"
+    );
+
+    // (3) TRUE DUPLICATE: identical decoder AND identical chart (copy atom 0's
+    // coords onto atom 1) → the two atoms reconstruct the SAME rows → contribution
+    // cosine → 1 → FLAGGED as the genuine high-EV co-collapse.
+    let coords0 = term.assignment.coords[0].as_matrix().to_owned();
+    let flat0: Array1<f64> = coords0.iter().copied().collect();
+    term.assignment.coords[1].set_flat(flat0.view());
+    term.atoms[1]
+        .refresh_basis(term.assignment.coords[1].as_matrix().view())
+        .unwrap();
     let hit = term
         .structural_coherence_collapse_detected()
         .unwrap()
-        .expect("duplicate-subspace atoms must be flagged as structurally collapsed");
+        .expect("a true duplicate (identical decoder AND chart) must be flagged");
     assert_eq!((hit.0, hit.1), (0, 1), "the offending pair is (0, 1)");
     assert!(
-        hit.2 > 0.99,
-        "duplicate output frames must report coherence ~1, got {}",
+        hit.2 > 0.9,
+        "true-duplicate contribution cosine must be ~1, got {}",
         hit.2
     );
 }

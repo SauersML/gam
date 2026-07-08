@@ -53,6 +53,22 @@ use std::collections::HashMap;
 /// [`crate::manifold::shape_uncertainty::SHAPE_BAND_MAX_POINTS`].
 pub const PERSISTENCE_MAX_POINTS: usize = 48;
 
+/// Landmark budget for the H₁ (loop) audit, decoupled from [`PERSISTENCE_MAX_POINTS`].
+///
+/// Counting loops needs only the triangles of the filtration (`C(m, 3)`, cubic in
+/// the landmark count), whereas the H₂ shell audit needs tetrahedra (`C(m, 4)`,
+/// quartic) — which is why H₂ is capped at [`PERSISTENCE_MAX_POINTS`]. Resolving
+/// the two independent generators of a torus robustly needs a cover at the
+/// manifold's *covering number*, far above 48: on the coarse 48-landmark
+/// farthest-point cover the two loops are not simultaneously resolved and the
+/// second generator collapses (measured `b₁ = 0` on a clean torus, #2159). Since
+/// the triangle enumeration is only cubic, H₁ can afford this larger cover at a
+/// cost comparable to the quartic H₂ budget. Atoms whose positive support exceeds
+/// this fall back to a farthest-point cover for H₁ as well; density-stable
+/// homology on a subsampled cover is a Vietoris–Rips limitation whose principled
+/// fix is an alpha/witness complex (tracked follow-up), not a larger cover.
+pub const PERSISTENCE_H1_MAX_POINTS: usize = 256;
+
 /// A persistence bar `[birth, death)` in a Vietoris–Rips filtration. An
 /// *essential* class (one that never dies within the filtration — e.g. the
 /// single connected component, or a loop whose disk is never filled) has
@@ -709,86 +725,120 @@ fn dominant_persistence(bars: &[PersistenceBar]) -> f64 {
     bars.iter().map(|b| b.persistence()).fold(0.0_f64, f64::max)
 }
 
-/// Count the significant generators in a persistence diagram by separating the
-/// signal cluster from the diagonal noise floor at the diagram's own largest
-/// spectral gap.
+/// Count the significant H₁ generators as the loops that outlive the sampling
+/// resolution, on a cover dense enough to resolve them.
 ///
-/// The prior Pareto-frontier rule (#2191) counted every birth/death-undominated
-/// bar. That is fragile in BOTH directions on a genuine torus (#2159): the two
-/// independent H₁ generators of a torus have *comparable, near-identical*
-/// persistence, so tiny sampling asymmetries make one bar born-no-earlier /
-/// die-no-later than the other and the frontier DROPS the second generator
-/// (b₁ collapses to 1 — or to 0 when both are dominated by a longer H₀-scale
-/// bar); conversely diagram noise sitting off the main staircase is undominated
-/// and INFLATES the frontier (the measured b₁=29 at one grid). Neither failure
-/// is about topology — both are artefacts of ranking by the birth/death partial
-/// order instead of by persistence magnitude.
+/// History (#2159). Every rule that reads the *count* off a persistence-*magnitude*
+/// ranking fails on a torus, because a torus's two generators can be very unequal
+/// (an embedded torus's major loop far outlives its minor loop) while a *degenerate
+/// band* of homologous minor cycles from a structured grid looks identical to two
+/// genuinely-distinct equal generators. The Pareto-frontier rule (#2191) dropped
+/// the near-tied second generator; the log-persistence spectral-gap rule collapsed
+/// to `b₁ = 0` on the coarse 48-landmark cover (the two loops were never resolved);
+/// magnitude gaps, plateau readers, and matched-null significance each broke on one
+/// of {unequal generators, degenerate bands, sphere transient loops, density}.
 ///
-/// The fix ranks bars by their **scale-free log-persistence** `ρ = ln(death /
-/// birth)` — resolution-invariant, since a generator sampled at spacing `s` is
-/// born at `≈ s` and dies at `≈ D` (the cycle's filling scale) for `ρ ≈ ln(D/s)`
-/// that is stable as the grid density (hence `s` and the landmark count) varies,
-/// whereas the raw lifetime `death − birth` is not. A real generator persists
-/// over a wide multiplicative band (`ρ` well above 0); a noise class is born and
-/// dies at almost the same scale (`ρ ≈ 0`, at the diagonal). The signal/noise
-/// split is then the **largest gap** in the sorted `ρ` spectrum, with the
-/// diagonal (`ρ = 0`) as the anchoring noise reference: the count is the number
-/// of bars above that gap. Counting by magnitude keeps BOTH comparable torus
-/// generators (they sit together above the gap) and admits no diagonal noise
-/// (it stays below). The gap is accepted as a genuine signal/noise boundary only
-/// when it exceeds the most persistent bar still left below it — the noise-band
-/// ceiling — so an all-noise diagram whose bars taper smoothly to the diagonal
-/// (e.g. a sphere's transient H₁) yields zero generators rather than one, and no
-/// threshold is hand-set: it is read off the diagram itself.
-fn dominant_gap_bar_count(bars: &[PersistenceBar]) -> usize {
+/// The resolution is two-fold and carries no magic constant. (1) Read H₁ on a cover
+/// at the manifold's covering number ([`PERSISTENCE_H1_MAX_POINTS`], cubic-cost),
+/// not the quartic H₂ cover — the second generator is simply absent from the coarse
+/// cover. (2) A class is a real generator iff its lifetime exceeds the **local
+/// sampling resolution**: within-manifold noise is born and filled within one
+/// point-spacing (a covering-scale bound, the same family as the `ln 2` H₀ floor),
+/// while a genuine cycle survives from the spacing scale up to its hole size. The
+/// floor is the *median nearest-neighbour distance* of the H₁ landmark cover — a
+/// measured quantity, not a threshold. Bars are counted on scale plateaus, with
+/// each active birth-scale family contributing once, so a structured-grid band
+/// born at one edge scale cannot inflate the generator count. This is exact and
+/// density-honest on a full cover; the sphere's transient H₁ dies within the
+/// spacing on a full cover (→ 0), and both torus generators clear it (→ 2).
+fn spacing_floor_bar_count(bars: &[PersistenceBar], distances: &Array2<f64>) -> usize {
     let essential = bars.iter().filter(|b| b.is_essential()).count();
-    // Scale-free log-persistence ρ = ln(death/birth) of each finite class.
-    // birth = 0 cannot form the ratio (a class born at the zero scale); fall
-    // back to the raw lifetime there, which for such a class equals its death.
-    let mut rho: Vec<f64> = bars
-        .iter()
-        .filter(|b| b.birth.is_finite() && b.death.is_finite() && b.death > b.birth)
-        .map(|b| {
-            if b.birth > 0.0 {
-                (b.death / b.birth).ln()
-            } else {
-                b.death - b.birth
+    // Covering-scale floor: the median nearest-neighbour distance of the landmark
+    // cover. A cycle that persists past this outlives the sampling resolution and
+    // is a genuine generator; within-manifold noise dies within one spacing.
+    let m = distances.nrows();
+    let mut nn: Vec<f64> = Vec::with_capacity(m);
+    for i in 0..m {
+        let mut best = f64::INFINITY;
+        for j in 0..m {
+            if i != j {
+                let d = distances[[i, j]];
+                if d > 0.0 && d < best {
+                    best = d;
+                }
             }
-        })
-        .filter(|r| r.is_finite() && *r > 0.0)
-        .collect();
-    if rho.is_empty() {
-        return essential;
-    }
-    rho.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
-    let m = rho.len();
-    // Largest gap in the sorted spectrum, with the diagonal (ρ = 0) as the
-    // sentinel below the last bar so a diagram with no internal separation is
-    // measured against the noise floor rather than against nothing.
-    let gap_after = |k: usize| -> f64 {
-        let below = if k < m { rho[k] } else { 0.0 };
-        rho[k - 1] - below
-    };
-    let mut k_star = 1usize;
-    let mut best = gap_after(1);
-    for k in 2..=m {
-        let g = gap_after(k);
-        if g > best {
-            best = g;
-            k_star = k;
+        }
+        if best.is_finite() {
+            nn.push(best);
         }
     }
-    // Accept the top-`k_star` bars as generators only when the separating gap
-    // clears the noise-band ceiling (the most persistent bar still below it).
-    // For a genuine loop the drop from generator to noise is order-of-magnitude;
-    // for a taper of diagonal noise the widest gap sits above a comparably tall
-    // bar and is rejected, giving b₁ = 0.
-    let noise_ceiling = if k_star < m { rho[k_star] } else { 0.0 };
-    if best > noise_ceiling {
-        essential + k_star
-    } else {
-        essential
+    if nn.is_empty() {
+        return essential;
     }
+    nn.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let spacing = nn[nn.len() / 2];
+    let finite: Vec<PersistenceBar> = bars
+        .iter()
+        .copied()
+        .filter(|b| {
+            b.birth.is_finite()
+                && b.death.is_finite()
+                && b.death > b.birth
+                && b.persistence() > spacing
+        })
+        .collect();
+    if finite.is_empty() {
+        return essential;
+    }
+
+    // Count the rank on scale plateaus after the spacing floor. Structured grids
+    // can produce many bars born at the same edge scale for one homologous family
+    // with different fill scales; those are one generator family, not several.
+    // Therefore each active birth-scale cluster contributes at most one count.
+    let mut critical = Vec::with_capacity(finite.len() * 2);
+    for bar in &finite {
+        critical.push(bar.birth);
+        critical.push(bar.death);
+    }
+    critical.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    critical.dedup_by(|a, b| *a == *b);
+    let band_tol = 1.0e-6_f64;
+    let mut best = 0usize;
+    let mut best_width = f64::NEG_INFINITY;
+    for window in critical.windows(2) {
+        let lo = window[0];
+        let hi = window[1];
+        if !(hi > lo) {
+            continue;
+        }
+        let probe = if lo > 0.0 { (lo * hi).sqrt() } else { hi / 2.0 };
+        let mut births: Vec<f64> = finite
+            .iter()
+            .filter(|bar| bar.birth < probe && probe < bar.death)
+            .map(|bar| bar.birth)
+            .collect();
+        births.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut count = 0usize;
+        let mut last_birth: Option<f64> = None;
+        for birth in births {
+            let same_cluster = last_birth.is_some_and(|last| {
+                (birth - last).abs() <= band_tol * last.abs().max(1.0)
+            });
+            if !same_cluster {
+                count += 1;
+                last_birth = Some(birth);
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        let width = if lo > 0.0 { (hi / lo).ln() } else { hi - lo };
+        if count > best || (count == best && width > best_width) {
+            best = count;
+            best_width = width;
+        }
+    }
+    essential + best
 }
 
 fn shell_plateau_bar_count(bars: &[PersistenceBar]) -> usize {
@@ -882,37 +932,57 @@ fn topology_persistence_verdict_impl(
     if full < 4 {
         return None;
     }
-    let landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_MAX_POINTS);
-    let sub = points.select(ndarray::Axis(0), &landmarks);
-    let sub_weights = weights.map(|w| {
-        let mut selected = Array1::<f64>::zeros(landmarks.len());
-        for (idx, &row) in landmarks.iter().enumerate() {
+    // H₀/H₁ (components and loops) read a LARGER farthest-point cover than the H₂
+    // shell audit: loop counting is only cubic in the landmark count, so it can
+    // afford the manifold's covering number of samples, whereas the coarse
+    // PERSISTENCE_MAX_POINTS cover (sized for the quartic H₂ tetrahedra) fails to
+    // resolve a torus's second generator (#2159).
+    let h1_landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_H1_MAX_POINTS);
+    let h1_sub = points.select(ndarray::Axis(0), &h1_landmarks);
+    let h1_weights = weights.map(|w| {
+        let mut selected = Array1::<f64>::zeros(h1_landmarks.len());
+        for (idx, &row) in h1_landmarks.iter().enumerate() {
             selected[idx] = w[row];
         }
         selected
     });
-    let max_homology_dim = if expected_betti.b2.is_some() { 2 } else { 1 };
-    let diagram = dtm_vietoris_rips_persistence(
-        sub.view(),
-        sub_weights.as_ref().map(|w| w.view()),
-        max_homology_dim,
-    );
+    let h1_diagram =
+        dtm_vietoris_rips_persistence(h1_sub.view(), h1_weights.as_ref().map(|w| w.view()), 1);
+    let h1_distances =
+        dtm_weighted_distances(h1_sub.view(), h1_weights.as_ref().map(|w| w.view()));
+
+    // H₂ shells (sphere/torus voids) need the quartic tetrahedron enumeration, so
+    // they stay on the compute-bounded PERSISTENCE_MAX_POINTS cover.
+    let h2: Vec<PersistenceBar> = if expected_betti.b2.is_some() {
+        let landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_MAX_POINTS);
+        let sub = points.select(ndarray::Axis(0), &landmarks);
+        let sub_weights = weights.map(|w| {
+            let mut selected = Array1::<f64>::zeros(landmarks.len());
+            for (idx, &row) in landmarks.iter().enumerate() {
+                selected[idx] = w[row];
+            }
+            selected
+        });
+        dtm_vietoris_rips_persistence(sub.view(), sub_weights.as_ref().map(|w| w.view()), 2).h2
+    } else {
+        Vec::new()
+    };
+
     let (support_mass, effective_n, support_ess) = support_summary(weights, full);
 
-    let finite_h0: Vec<PersistenceBar> = diagram
+    let finite_h0: Vec<PersistenceBar> = h1_diagram
         .h0
         .iter()
         .copied()
         .filter(|b| !b.is_essential())
         .collect();
-    let distances = dtm_weighted_distances(sub.view(), sub_weights.as_ref().map(|w| w.view()));
-    let (n_components, _) = components_and_scale(&finite_h0, &distances);
+    let (n_components, _) = components_and_scale(&finite_h0, &h1_distances);
 
     let measured_betti = BettiSignature {
         b0: n_components,
-        b1: dominant_gap_bar_count(&diagram.h1),
+        b1: spacing_floor_bar_count(&h1_diagram.h1, &h1_distances),
         b2: expected_betti.b2.map(|expected_h2| {
-            let counted = shell_plateau_bar_count(&diagram.h2);
+            let counted = shell_plateau_bar_count(&h2);
             if expected_h2 == 0 && counted == 0 {
                 0
             } else {
@@ -920,8 +990,8 @@ fn topology_persistence_verdict_impl(
             }
         }),
     };
-    let dominant_h1_persistence = dominant_persistence(&diagram.h1);
-    let dominant_h2_persistence = dominant_persistence(&diagram.h2);
+    let dominant_h1_persistence = dominant_persistence(&h1_diagram.h1);
+    let dominant_h2_persistence = dominant_persistence(&h2);
     let contested = !measured_betti.matches_expected(expected_betti);
 
     let note = if contested {
@@ -967,7 +1037,7 @@ fn topology_persistence_verdict_impl(
     Some(AtomTopologyPersistence {
         raced_kind: raced_kind.clone(),
         support_size: full,
-        landmark_count: landmarks.len(),
+        landmark_count: h1_landmarks.len(),
         stability_band,
         covering_side,
         support_mass,
@@ -978,9 +1048,9 @@ fn topology_persistence_verdict_impl(
         null_calibration: None,
         dominant_h1_persistence,
         dominant_h2_persistence,
-        h0: diagram.h0,
-        h1: diagram.h1,
-        h2: diagram.h2,
+        h0: h1_diagram.h0,
+        h1: h1_diagram.h1,
+        h2,
         contested,
         note,
     })
