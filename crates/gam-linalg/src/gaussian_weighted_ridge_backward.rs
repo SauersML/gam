@@ -266,7 +266,7 @@ pub fn gaussian_weighted_ridge_batch_backward(
 #[cfg(test)]
 mod gwr_backward_tests {
     use super::*;
-    use crate::utils::{gaussian_weighted_ridge, gaussian_weighted_ridge_batch};
+    use crate::utils::gaussian_weighted_ridge;
     use ndarray::{Array1, Array2, Array3};
 
     // Deterministic small fixture; values chosen so `A = XᵀWX + λS` is SPD.
