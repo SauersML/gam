@@ -681,7 +681,7 @@ pub struct SaeManifoldTerm {
     /// path) for the WBIC SOFT rank-charge ledger. Only has effect when
     /// `rank_charge_evidence` is also on: inside that branch the per-atom coefficient
     /// of the occupancy log-scale `ln N_eff,k` becomes the finite-n WBIC learning
-    /// coefficient `λ_k = ½·rank_soft_k·basis_edf_k` (the tempered β=1/log n count on
+    /// coefficient `λ_k = ½·rank_soft_k·basis_edf_k` (the β=1/log n_eff likelihood-tempered, prior-untempered count on
     /// the occupancy-corrected reconstruction spectrum) instead of the hard limit
     /// `½·d_eff,k`. The two coincide away from the Marchenko–Pastur edge (soft→hard)
     /// and the soft one is strictly smaller near it — the honest Watanabe correction

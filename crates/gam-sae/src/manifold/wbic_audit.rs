@@ -36,28 +36,34 @@
 //!   Take one reconstruction direction `k` with reconstruction-Gram eigenvalue
 //!   `μ_k` (per-observation signal+noise energy, `= sv_k²/n_eff`) against the MP
 //!   noise edge `e = R·(1 + √(p/n_eff))²`. Its scalar amplitude `α_k` has
-//!   tempered-likelihood precision `h_k = β·g_k/R` with design energy
-//!   `g_k = n_eff·μ_k`, and a REML "toward no effect" Gaussian prior whose
-//!   precision is fixed — with NO new constant — to the SAME noise edge the hard
-//!   count uses: `τ_k = β·g_edge/R`, `g_edge = n_eff·e`. The tempered-Gaussian
-//!   learning-coefficient contribution is
+//!   tempered-LIKELIHOOD precision `h_k = β·g_k/R` with design energy
+//!   `g_k = n_eff·μ_k`. The stated WBIC posterior tempers ONLY the likelihood —
+//!   `π(w)` enters at full strength — so the REML "toward no effect" Gaussian
+//!   prior keeps its UNtempered precision, fixed (with NO new constant) to the
+//!   SAME noise edge the hard count uses: `τ_k = g_edge/R`, `g_edge = n_eff·e`.
+//!   The tempered-Gaussian learning-coefficient contribution is
 //!
 //! ```text
-//! λ̂_k = ½ · h_k / (h_k + τ_k) = ½ · g_k/(g_k + g_edge) = ½ · μ_k/(μ_k + e).
+//! λ̂_k = ½ · h_k / (h_k + τ_k) = ½ · β·g_k/(β·g_k + g_edge)
+//!      = ½ · μ_k/(μ_k + e·log n_eff).
 //! ```
 //!
-//!   Every `β`, `R`, `n_eff` and `log n` cancels: the WBIC soft count is a SIGMOID
-//!   in `μ_k/e` that replaces the hard step `1[μ_k > e]`. It recovers the regular
-//!   limit exactly (a direction far above the edge, `μ_k ≫ e`, contributes `½`, so
-//!   a full-rank atom recovers `½·d_eff·log n = BIC`) and discounts singular
-//!   directions smoothly (`μ_k → 0 ⇒ 0`). The two charges cross at `μ_k = e`
-//!   (`λ̂_k = ¼`, exactly half of the full `½`), so both agree far from the edge
-//!   and disagree only in the near-singular transition band.
+//!   `R` and the raw `n_eff` cancel; the `log n_eff` from `β = 1/log n_eff` does
+//!   NOT — it is exactly Watanabe's temperature and dropping it (by tempering the
+//!   prior too, as this module once did) silently forfeits the WBIC theorem the
+//!   estimator's name invokes, over-counting every near-edge direction by up to
+//!   `log n_eff`. The soft count is a SIGMOID in `μ_k/(e·log n_eff)` replacing
+//!   the hard step `1[μ_k > e]`. It recovers the regular limit exactly (a
+//!   direction far above the tempered edge contributes `½`, so a full-rank atom
+//!   recovers `½·d_eff·log n = BIC`) and discounts singular directions smoothly
+//!   (`μ_k → 0 ⇒ 0`). The soft and hard charges now cross at `μ_k = e·log n_eff`
+//!   (`λ̂_k = ¼` there); `n_eff` is floored at `e` so `log n_eff ≥ 1` and the
+//!   tempered edge is never SOFTER than the hard MP edge.
 //!
 //! CHARGES.
 //! ```text
 //! rank_hard = Σ_k 1[μ_k > e]                    (integer MP count — production)
-//! rank_soft = Σ_k μ_k/(μ_k + e)                 (WBIC tempered count)
+//! rank_soft = Σ_k μ_k/(μ_k + e·log n_eff)      (WBIC tempered count)
 //! rank charge  C_rank = ½ · rank_hard · basis_edf · log N_eff
 //! WBIC charge  C_wbic = ½ · rank_soft · basis_edf · log N_eff
 //! ```
@@ -110,13 +116,18 @@ impl ReconSpectrum {
         self.mu.iter().filter(|&&m| m > self.edge).count() as f64
     }
 
-    /// WBIC tempered soft count `Σ_k μ_k/(μ_k + e)` — the sigmoid that replaces the
-    /// hard step (derivation in the module header). Always `≤` the number of
-    /// directions, and each term `∈ [0, 1)`; a direction at the edge counts `½`.
+    /// WBIC tempered soft count `Σ_k μ_k/(μ_k + e·log n_eff)` — the sigmoid that
+    /// replaces the hard step (derivation in the module header: the likelihood is
+    /// tempered by `β = 1/log n_eff`, the prior is NOT, so the edge carries the
+    /// `log n_eff` temperature). Always `≤` the number of directions, each term
+    /// `∈ [0, 1)`; a direction at the TEMPERED edge `μ = e·log n_eff` counts `½`.
+    /// `n_eff` is floored at `e` so the tempered edge is never softer than the
+    /// hard MP edge.
     pub fn rank_soft(&self) -> f64 {
+        let tempered_edge = self.edge * self.n_eff.max(std::f64::consts::E).ln();
         self.mu
             .iter()
-            .map(|&m| if self.edge > 0.0 { m / (m + self.edge) } else { 1.0 })
+            .map(|&m| if tempered_edge > 0.0 { m / (m + tempered_edge) } else { 1.0 })
             .sum()
     }
 

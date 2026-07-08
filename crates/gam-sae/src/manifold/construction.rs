@@ -18,7 +18,7 @@ use gam_math::jet_scalar::JetScalar;
 //     This is the shipped default (`rank_charge_evidence`, hard MP count).
 //   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): a direction
 //     only fractionally resolved contributes a fraction of ½, λ = ½·rank_soft·basis_edf
-//     with rank_soft = Σ_j μ_j/(μ_j+e) the tempered (β=1/log n) count. This is the
+//     with rank_soft = Σ_j μ_j/(μ_j+e·log n_eff) the tempered (β=1/log n_eff) count. This is the
 //     opt-in `soft_rank_charge` ledger below (Theorem K, `wbic_audit`).
 //   • RLCT (SINGULAR truth, a symmetry orbit or a null atom): λ drops below ½·d
 //     to the real log-canonical threshold. The null atom (truth B*=0) has λ=½ from
@@ -1155,7 +1155,7 @@ impl SaeManifoldTerm {
     /// Theorem K WBIC SOFT learning coefficient `λ_k = ½·rank_soft_k·basis_edf_k` per
     /// atom, from the PRE-ACCUMULATED per-atom Grams (the streaming twin of
     /// [`Self::per_atom_soft_learning_coefficient`], as `rank_dof_from_grams` is the
-    /// twin of the dense hard path). `rank_soft_k = Σ_j μ_{kj}/(μ_{kj}+e_k)` is the
+    /// twin of the dense hard path). `rank_soft_k = Σ_j μ_{kj}/(μ_{kj}+e_k·log n_eff,k)` is the
     /// tempered (β=1/log n) count on atom k's occupancy-corrected reconstruction
     /// spectrum `μ = sv(diag(√λ)·Uᵀ·D)²/N_eff` against the SAME Marchenko–Pastur edge
     /// `e = R·(1+√(p/N_eff))²` the hard count thresholds on. It is bit-consistent with
