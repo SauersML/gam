@@ -477,14 +477,16 @@ pub fn admit_assignment_mode_for_size(
             top_k: None,
         },
         AssignmentModeRequest::IbpMap => {
-            if let Some(top_k) = large_k_top {
-                return Err(format!(
-                    "admit_assignment_mode_for_size: IBP-MAP is admitted only for explicit small-N research fits; N={n_obs}, K={k_atoms} requires top_k={top_k}"
-                ));
-            }
+            // #F2 — re-admit IBP-MAP at large K, with the same rows-per-atom
+            // `top_k` used as the ACTIVE-SET COMPUTE CAP (the softmax lane's
+            // large-K cap), instead of refusing the request. The occupancy-driven
+            // empirical-Bayes α M-step (#F1) now un-caps the effective atom count
+            // that the fixed geometric schedule used to pin at ~3, so IBP-MAP is a
+            // usable large-K lane once its per-row work is bounded by `top_k`.
+            // Small fits keep `top_k = None` (dense IBP-MAP), unchanged.
             AssignmentModeAdmission {
                 mode: AssignmentMode::ibp_map(temperature, alpha, learnable_alpha),
-                top_k: None,
+                top_k: large_k_top,
             }
         }
     };
@@ -916,6 +918,67 @@ impl SaeAssignment {
         self.ibp_alpha_override = alpha;
     }
 
+    /// #F1 — the Fellner–Schall-analog empirical-Bayes M-step for the
+    /// `log_lambda_sparse` slot: the additive step `Δθ = ln α_EB* − ln α_current`
+    /// that moves the ordered-IBP concentration to the occupancy-driven marginal
+    /// stationary point (`log_lambda_sparse += Δθ` IS the multiplicative α update,
+    /// since the resolved α is `α_base · exp(log_lambda_sparse)`).
+    ///
+    /// Returns `Some(Δθ)` ONLY when the effective α is a FREE learnable parameter
+    /// (IBP-MAP, `learnable_alpha`, no per-fit or process-global override) —
+    /// exactly when [`Self::effective_alpha_is_learnable`] holds, so the α
+    /// ρ-derivatives are non-zero and the marginal M-step is the coherent update.
+    /// `None` for every other sparsity prior (softmax entropy, gated L1) or a
+    /// pinned α, whose non-quadratic prior has no closed-form fixed point and
+    /// keeps the historical zero step. This is the ONE place the large-K /
+    /// streaming `λ_sparse`-frozen bug is fixed: occupancy `M_k = Σ_i a_{ik}` is
+    /// accumulated per-row from the FITTED gates at `rho` (O(N·K) time, O(K)
+    /// memory — no dense `N×K` materialisation), so it is valid in the streaming
+    /// regime where the value-lane gradient is identically zero.
+    ///
+    /// The returned step is trust-region bounded (`|Δθ| ≤ 2`) so a single outer
+    /// iterate cannot overshoot the α axis; the fixed point is reached over
+    /// successive Fellner–Schall iterates, each accepted through the REML cost
+    /// lane like every other coordinate's step.
+    pub(crate) fn ibp_eb_log_alpha_step(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Option<f64>, String> {
+        if !self.effective_alpha_is_learnable() {
+            return Ok(None);
+        }
+        let resolved = self.resolved_ibp_alpha(rho);
+        let Some(alpha_current) = resolved else {
+            return Ok(None);
+        };
+        if !(alpha_current.is_finite() && alpha_current > 0.0) {
+            return Ok(None);
+        }
+        let k = self.k_atoms();
+        let n = self.n_obs();
+        if k == 0 || n == 0 {
+            return Ok(None);
+        }
+        // Soft occupancy `M_k = Σ_i a_{ik}` from the fitted gates at `rho`,
+        // accumulated row-by-row into a K-buffer (streaming-safe).
+        let mut occupancy = vec![0.0_f64; k];
+        let mut buf = vec![0.0_f64; k];
+        for row in 0..n {
+            self.try_assignments_row_with_alpha_into(row, resolved, &mut buf)?;
+            for (acc, &g) in occupancy.iter_mut().zip(buf.iter()) {
+                *acc += g;
+            }
+        }
+        let alpha_star =
+            ibp_eb_geometric_alpha_fixed_point(&occupancy, n as f64, alpha_current);
+        if !(alpha_star.is_finite() && alpha_star > 0.0) {
+            return Ok(None);
+        }
+        const LOG_ALPHA_STEP_CAP: f64 = 2.0;
+        let step = (alpha_star.ln() - alpha_current.ln()).clamp(-LOG_ALPHA_STEP_CAP, LOG_ALPHA_STEP_CAP);
+        Ok(Some(step))
+    }
+
     pub(crate) fn try_assignments_row_for_rho(
         &self,
         row: usize,
@@ -1211,22 +1274,66 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 /// unshrunk, which is the prior mean of NO stick at all and broke α's role as a
 /// concentration; the consistent product mean restores genuine IBP semantics.)
 pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
-    // Accumulate the geometric schedule `π_k = ratio^(k+1)` in LOG space so the
-    // prior stays a finite *soft* weight even for large `K`. The naive product
-    // `acc *= ratio` underflows to exact `0.0` once `ratio^(k+1) < f64::MIN_POSITIVE`
-    // (e.g. `(0.1/1.1)^320`), which would turn the soft shrinkage prior into a
-    // HARD mask: such atoms would receive zero assignment AND zero logit
-    // gradient (the gradient is multiplied by `π_k`), so they could never
-    // reactivate. Working in log-space and flooring the exponentiated weight at
-    // the smallest positive normal keeps every atom's gradient path alive while
-    // preserving the geometric ordering.
+    // Delegate to the schedule-generic [`ordered_prior_means`] (#F2); the
+    // geometric branch there is byte-for-byte the historical log-space
+    // accumulation, so every existing caller is unchanged.
+    ordered_prior_means(k_atoms, OrderedPriorSchedule::Geometric { alpha })
+}
+
+/// Ordered prior-mean *schedule* for the truncated-IBP assignment prior. Both
+/// forms produce a strictly positive, ordered (decreasing) per-atom mass
+/// `μ_k ∈ (0, 1]` consumed by the IBP-MAP gate `a_k = σ(l_k/τ)·μ_k`.
+///
+/// * [`Self::Geometric`] — the historical stick-breaking mean
+///   `μ_k = (α/(α+1))^{k+1}`, which decays GEOMETRICALLY in the atom index and
+///   at the production `α = 1` structurally caps the effective atom count at
+///   ~3 (the #1777 flatten-override exists precisely to fight this).
+/// * [`Self::PowerLaw`] — a heavier (near-Zipfian) polynomial tail
+///   `μ_k = c/(k + k0)^s`, whose sub-exponential decay keeps late atoms
+///   un-masked at large `K` where the geometric schedule has already collapsed
+///   to numerical zero (#F2). This is the correct tail for near-Zipf feature
+///   frequencies. Both schedules share the SAME occupancy-driven empirical-Bayes
+///   fixed point (the Beta–Bernoulli marginal is schedule-agnostic; only the
+///   `a_k(θ)` map and its derivatives differ — see [`ibp_eb_marginal_score`]).
+#[derive(Debug, Clone, Copy)]
+pub enum OrderedPriorSchedule {
+    /// Stick-breaking mean `μ_k = (α/(α+1))^{k+1}`, `α > 0`.
+    Geometric { alpha: f64 },
+    /// Power-law (Zipf-like) mean `μ_k = c/(k + k0)^s`, `c > 0`, `s > 0`,
+    /// `k0 > 0`.
+    PowerLaw { c: f64, s: f64, k0: f64 },
+}
+
+/// Ordered per-atom prior means `μ_k` for the requested [`OrderedPriorSchedule`].
+///
+/// Both branches accumulate in LOG space and floor the exponentiated weight at
+/// the smallest positive normal so the soft shrinkage prior never becomes a HARD
+/// mask: an atom flushed to exact `0.0` would receive zero assignment AND zero
+/// logit gradient (the gradient is multiplied by `μ_k`) and could never
+/// reactivate. The geometric branch is the historical `π_k = ratio^(k+1)`
+/// computation, unchanged; the power-law branch additionally clamps `μ_k ≤ 1`
+/// (a raw `c/(k0)^s` can exceed 1 for the first atoms).
+pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(k_atoms);
-    let log_ratio = (alpha / (alpha + 1.0)).ln();
-    for k in 0..k_atoms {
-        // π_k = (α/(α+1))^{k+1}: the product of (k+1) i.i.d. Beta(α,1) stick
-        // means, so atom 0 is also shrunk by one stick (E[v_0] = α/(α+1)).
-        let log_pi = ((k + 1) as f64) * log_ratio;
-        out[k] = log_pi.exp().max(f64::MIN_POSITIVE);
+    match schedule {
+        OrderedPriorSchedule::Geometric { alpha } => {
+            let log_ratio = (alpha / (alpha + 1.0)).ln();
+            for k in 0..k_atoms {
+                // π_k = (α/(α+1))^{k+1}: the product of (k+1) i.i.d. Beta(α,1)
+                // stick means, so atom 0 is also shrunk by one stick.
+                let log_pi = ((k + 1) as f64) * log_ratio;
+                out[k] = log_pi.exp().max(f64::MIN_POSITIVE);
+            }
+        }
+        OrderedPriorSchedule::PowerLaw { c, s, k0 } => {
+            // μ_k = c/(k + k0)^s. Clamp into (0, 1]: the smallest positive normal
+            // floor keeps every atom's gradient path alive (as in the geometric
+            // branch), and the unit ceiling keeps `μ_k` a valid prior mean.
+            for k in 0..k_atoms {
+                let log_pi = c.ln() - s * ((k as f64) + k0).ln();
+                out[k] = log_pi.exp().clamp(f64::MIN_POSITIVE, 1.0);
+            }
+        }
     }
     out
 }
@@ -1254,6 +1361,150 @@ pub fn default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
     // π_{K-1} = (α/(α+1))^K = e^{-1}  ⇒  α = 1/(e^{1/K} − 1).
     let alpha = 1.0 / ((1.0 / k).exp() - 1.0);
     alpha.max(1.0)
+}
+
+/// Trigamma `ψ'(x)` (Abramowitz & Stegun recurrence + asymptotic series),
+/// mirroring the `gam-solve` PIRLS implementation so the empirical-Bayes M-step
+/// curvature is computed to the same accuracy the rest of the workspace uses.
+#[inline]
+fn trigamma(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc += 1.0 / (x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    acc + inv + 0.5 * inv2 + inv2 * inv / 6.0 - inv2 * inv2 * inv / 30.0
+        + inv2 * inv2 * inv2 * inv / 42.0
+        - inv2 * inv2 * inv2 * inv2 * inv / 30.0
+}
+
+// ---------------------------------------------------------------------------
+// #F1/#F2 — occupancy-driven empirical-Bayes fixed point for the ordered IBP
+// assignment prior (the Fellner–Schall-analog M-step for `log_lambda_sparse`).
+//
+// COHERENT MODEL. Each atom's ordered prior mass is `π_k ~ Beta(a_k, 1)` with
+// mean `μ_k = a_k/(a_k + 1)`, i.e. `a_k = μ_k/(1 − μ_k)` (the pseudo-count that
+// the shrinkage schedule `μ_k(θ)` — geometric α or power-law (c,s,k0) — pins).
+// The per-atom activation indicators are `z_{ik} ~ Bernoulli(π_k)`, so with
+// occupancy `M_k = Σ_i z_{ik}` out of `N` rows the marginal (integrating out the
+// conjugate `π_k`) is Beta–Bernoulli:
+//   log P(M_k | a_k, N) = logΓ(M_k + a_k) − logΓ(N + a_k + 1) + ln a_k + const.
+// Its `a_k`-score and curvature are elementary digamma/trigamma expressions
+// (`g`, `g'` below). The schedule concentration is then the stationary point of
+// `Σ_k log P(M_k | a_k(θ), N)`, found by a guarded Newton root-find on the score
+// in `θ = ln α` — analytic first AND second derivatives, NO grid, NO finite
+// differences (SPEC). This M-step MOVES `log_lambda_sparse` exactly in the
+// large-K / streaming regime where the value-lane gradient is identically zero,
+// and the occupancy feedback un-caps the effective atom count that a fixed
+// `α = 1` geometric schedule structurally pins at ~3.
+// ---------------------------------------------------------------------------
+
+/// Per-atom Beta–Bernoulli marginal score `g(a) = ψ(M+a) − ψ(N+a+1) + 1/a` and
+/// its derivative `g'(a) = ψ'(M+a) − ψ'(N+a+1) − 1/a²` in the pseudo-count `a`.
+/// This is the schedule-INDEPENDENT core: every schedule reaches the M-step
+/// through the same `(g, g')`, differing only in the `a_k(θ)` map it feeds.
+#[inline]
+fn ibp_eb_atom_score_deriv(m_k: f64, n_obs: f64, a: f64) -> (f64, f64) {
+    let g = statrs::function::gamma::digamma(m_k + a)
+        - statrs::function::gamma::digamma(n_obs + a + 1.0)
+        + 1.0 / a;
+    let gp = trigamma(m_k + a) - trigamma(n_obs + a + 1.0) - 1.0 / (a * a);
+    (g, gp)
+}
+
+/// Schedule-agnostic empirical-Bayes marginal score `Σ_k g(a_k)·(da_k/dθ)`.
+///
+/// The Beta–Bernoulli marginal is identical for the geometric and power-law
+/// schedules; only the `a_k(θ)` map and its `θ`-derivative change (#F2). A
+/// schedule supplies its own `a` (pseudo-counts) and `da_dtheta` arrays and this
+/// core assembles the total score. Exposed so a power-law fit reaches the SAME
+/// fixed point as the geometric one.
+pub fn ibp_eb_marginal_score(occupancy: &[f64], n_obs: f64, a: &[f64], da_dtheta: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for k in 0..occupancy.len() {
+        let (g, _) = ibp_eb_atom_score_deriv(occupancy[k].clamp(0.0, n_obs), n_obs, a[k]);
+        s += g * da_dtheta[k];
+    }
+    s
+}
+
+/// Total empirical-Bayes marginal score `S(θ)` and curvature `H(θ)` for the
+/// ordered GEOMETRIC IBP schedule, parameterised in `θ = ln α` (so the additive
+/// engine step `log_lambda_sparse += Δθ` IS the multiplicative α update).
+///
+/// Uses `ρ = σ(θ) = α/(α+1)` (`dρ/dθ = ρ(1−ρ)`, `d²ρ/dθ² = ρ(1−ρ)(1−2ρ)`),
+/// `μ_k = ρ^{k+1}`, and `a_k = μ_k/(1−μ_k)`, all differentiated analytically.
+/// `occupancy[k] = M_k`, `n_obs = N`. Pure closed form (digamma/trigamma).
+pub fn ibp_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f64, f64) {
+    let rho = alpha / (alpha + 1.0);
+    let one_m_rho = 1.0 - rho;
+    let mut s = 0.0;
+    let mut h = 0.0;
+    for (k, &m_raw) in occupancy.iter().enumerate() {
+        let u = (k + 1) as f64;
+        let m_k = m_raw.clamp(0.0, n_obs);
+        // μ_k = ρ^u and its θ-derivatives (clamp below 1 to keep a_k finite).
+        let mu = rho.powf(u).clamp(f64::MIN_POSITIVE, 1.0 - 1.0e-12);
+        let dmu = u * mu * one_m_rho; // dμ/dθ
+        let d2mu = u * mu * one_m_rho * (u * one_m_rho - rho); // d²μ/dθ²
+        // a_k = μ/(1−μ) and its θ-derivatives.
+        let om = 1.0 - mu;
+        let a = mu / om;
+        let da = dmu / (om * om);
+        let d2a = 2.0 * dmu * dmu / (om * om * om) + d2mu / (om * om);
+        let (g, gp) = ibp_eb_atom_score_deriv(m_k, n_obs, a);
+        s += g * da;
+        h += gp * da * da + g * d2a;
+    }
+    (s, h)
+}
+
+/// Occupancy-driven empirical-Bayes concentration `α*` for the ordered geometric
+/// IBP prior: the stationary point of the Beta–Bernoulli marginal, found by a
+/// GUARDED Newton root-find on `S(θ) = 0` in `θ = ln α` with analytic score and
+/// curvature (no grid, no finite differences — SPEC). Guarding: a Newton step
+/// where the marginal is locally concave (`H < 0`), otherwise a trust-region
+/// gradient step; `θ` is clamped to a wide finite band and the per-iterate step
+/// is bounded, so a monotone (data-wants-the-boundary) marginal converges to the
+/// clamp instead of diverging. Returns a finite `α* > 0`.
+pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_seed: f64) -> f64 {
+    const THETA_LO: f64 = -12.0; // α ≈ 6e-6
+    const THETA_HI: f64 = 16.0; // α ≈ 8.9e6
+    const MAX_ITERS: usize = 100;
+    const STEP_TR: f64 = 1.0; // trust region on |Δθ| per iterate
+    const TOL: f64 = 1.0e-10;
+    if !(n_obs > 0.0) || occupancy.is_empty() {
+        return alpha_seed;
+    }
+    let seed = if alpha_seed.is_finite() && alpha_seed > 0.0 {
+        alpha_seed
+    } else {
+        1.0
+    };
+    let mut theta = seed.ln().clamp(THETA_LO, THETA_HI);
+    for _ in 0..MAX_ITERS {
+        let (s, h) = ibp_eb_alpha_score_hess(occupancy, n_obs, theta.exp());
+        if !s.is_finite() || s.abs() < TOL {
+            break;
+        }
+        let mut step = if h < -1.0e-12 { -s / h } else { s.signum() * STEP_TR };
+        if !step.is_finite() {
+            break;
+        }
+        step = step.clamp(-STEP_TR, STEP_TR);
+        let new_theta = (theta + step).clamp(THETA_LO, THETA_HI);
+        let converged = (new_theta - theta).abs() < TOL;
+        theta = new_theta;
+        if converged {
+            break;
+        }
+    }
+    theta.exp()
 }
 
 /// IBP-MAP row activations: per-atom sigmoid likelihood times the truncated
@@ -2615,5 +2866,193 @@ mod fill_into_buffer_1557_tests {
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::softmax(1.0)));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::ibp_map(0.7, 1.0, false)));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::jumprelu(0.8, 0.1)));
+    }
+}
+
+#[cfg(test)]
+mod ibp_eb_alpha_f1_tests {
+    //! #F1/#F2 — empirical-Bayes concentration M-step + power-law schedule.
+    use super::*;
+
+    // a_k(θ) for the geometric schedule: α = e^θ, ρ = α/(α+1), μ = ρ^{k+1},
+    // a = μ/(1−μ). Independent re-derivation used by the brute-force checks.
+    fn geometric_a(theta: f64, k: usize) -> f64 {
+        let alpha = theta.exp();
+        let rho = alpha / (alpha + 1.0);
+        let mu = rho.powf((k + 1) as f64);
+        mu / (1.0 - mu)
+    }
+
+    // Total Beta–Bernoulli marginal L(θ) (θ-dependent terms only), computed
+    // straight from ln_gamma — the "brute digamma eval" reference the analytic
+    // score/curvature are checked against.
+    fn brute_marginal(occupancy: &[f64], n_obs: f64, theta: f64) -> f64 {
+        let mut l = 0.0;
+        for (k, &m) in occupancy.iter().enumerate() {
+            let a = geometric_a(theta, k);
+            l += statrs::function::gamma::ln_gamma(m + a)
+                - statrs::function::gamma::ln_gamma(n_obs + a + 1.0)
+                + a.ln();
+        }
+        l
+    }
+
+    #[test]
+    fn geometric_delegate_is_bit_identical() {
+        // The refactor must leave the geometric prior byte-for-byte unchanged.
+        for &alpha in &[0.3_f64, 1.0, 4.5, 37.0] {
+            for &k in &[1usize, 3, 8, 64] {
+                let old = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
+                let via = ordered_geometric_shrinkage_prior(k, alpha);
+                for j in 0..k {
+                    assert_eq!(old[j], via[j], "geometric prior drift at alpha={alpha}, k={j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn power_law_schedule_round_trips() {
+        // μ_k = c/(k+k0)^s, positive, decreasing, clamped ≤ 1.
+        let (c, s, k0) = (0.9_f64, 1.2_f64, 1.0_f64);
+        let k = 32usize;
+        let mu = ordered_prior_means(k, OrderedPriorSchedule::PowerLaw { c, s, k0 });
+        for j in 0..k {
+            let expected = (c / ((j as f64) + k0).powf(s)).clamp(f64::MIN_POSITIVE, 1.0);
+            assert!(
+                (mu[j] - expected).abs() <= 1e-12 * expected.max(1.0),
+                "power-law mismatch at k={j}: {} vs {expected}",
+                mu[j]
+            );
+            assert!(mu[j] > 0.0 && mu[j] <= 1.0, "μ_{j}={} out of (0,1]", mu[j]);
+            if j > 0 {
+                assert!(mu[j] <= mu[j - 1], "power-law not decreasing at k={j}");
+            }
+        }
+    }
+
+    #[test]
+    fn eb_alpha_score_matches_brute_digamma() {
+        // Analytic S(θ), H(θ) must match a central finite difference of the
+        // independently-computed Beta–Bernoulli marginal (score = dL/dθ,
+        // curvature = dS/dθ). FD lives ONLY in the test; production is closed form.
+        let n_obs = 500.0_f64;
+        let occupancy = vec![300.0_f64, 120.0, 60.0, 30.0, 12.0, 5.0, 2.0, 1.0];
+        let h = 1e-6_f64;
+        for &alpha in &[0.4_f64, 1.0, 3.0, 12.0] {
+            let theta = alpha.ln();
+            let (s, hess) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha);
+
+            let l_plus = brute_marginal(&occupancy, n_obs, theta + h);
+            let l_minus = brute_marginal(&occupancy, n_obs, theta - h);
+            let s_fd = (l_plus - l_minus) / (2.0 * h);
+            assert!(
+                (s - s_fd).abs() <= 1e-4 * (1.0 + s_fd.abs()),
+                "score mismatch at alpha={alpha}: analytic {s} vs FD {s_fd}"
+            );
+
+            let (s_plus, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, (theta + h).exp());
+            let (s_minus, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, (theta - h).exp());
+            let h_fd = (s_plus - s_minus) / (2.0 * h);
+            assert!(
+                (hess - h_fd).abs() <= 1e-3 * (1.0 + h_fd.abs()),
+                "curvature mismatch at alpha={alpha}: analytic {hess} vs FD {h_fd}"
+            );
+        }
+    }
+
+    #[test]
+    fn eb_marginal_core_is_schedule_agnostic() {
+        // The schedule-agnostic score core, fed the geometric a_k and da_k/dθ,
+        // reproduces the score component of the geometric-specialised routine.
+        let n_obs = 400.0_f64;
+        let occupancy = vec![200.0_f64, 90.0, 40.0, 18.0, 7.0, 3.0];
+        let alpha = 2.5_f64;
+        let theta = alpha.ln();
+        let dh = 1e-6_f64;
+        let (a, da): (Vec<f64>, Vec<f64>) = (0..occupancy.len())
+            .map(|k| {
+                let a0 = geometric_a(theta, k);
+                let da = (geometric_a(theta + dh, k) - geometric_a(theta - dh, k)) / (2.0 * dh);
+                (a0, da)
+            })
+            .unzip();
+        let core = ibp_eb_marginal_score(&occupancy, n_obs, &a, &da);
+        let (s, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha);
+        assert!(
+            (core - s).abs() <= 1e-5 * (1.0 + s.abs()),
+            "schedule-agnostic core {core} != geometric score {s}"
+        );
+    }
+
+    #[test]
+    fn eb_fixed_point_is_stationary_and_moves() {
+        let n_obs = 1000.0_f64;
+        // Flat (near-uniform) occupancy is grossly inconsistent with the steep
+        // α=1 geometric decay, so the EB fixed point must RAISE α far above the
+        // seed — the movement the frozen-λ_sparse bug prevented.
+        let occupancy = vec![500.0_f64; 8];
+        let alpha_star = ibp_eb_geometric_alpha_fixed_point(&occupancy, n_obs, 1.0);
+        assert!(alpha_star > 5.0, "flat occupancy must raise α; got {alpha_star}");
+        // Stationarity: at α* the analytic score is ~0 (interior) or α* railed to
+        // a clamp (monotone) — here it is interior.
+        let (s, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha_star);
+        assert!(s.abs() < 1e-4, "score not stationary at α*={alpha_star}: S={s}");
+
+        // Conversely, occupancy that already matches a small-α steep decay pulls
+        // α back down toward that value.
+        let steep: Vec<f64> = (0..8).map(|k| n_obs * 0.5_f64.powi(k as i32 + 1)).collect();
+        let alpha_low = ibp_eb_geometric_alpha_fixed_point(&steep, n_obs, 20.0);
+        assert!(alpha_low < 5.0, "steep occupancy must lower α; got {alpha_low}");
+    }
+
+    fn learnable_ibp(logits: Array2<f64>, alpha_base: f64) -> SaeAssignment {
+        let (n, k) = logits.dim();
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        SaeAssignment::from_blocks_with_mode(
+            logits,
+            coords,
+            AssignmentMode::ibp_map(1.0, alpha_base, true),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn eb_log_alpha_step_moves_for_learnable_ibp_only() {
+        let n = 300usize;
+        let k = 8usize;
+        // Logits rising in k lift σ(l_k) toward 1, flattening occupancy relative
+        // to the α=1 geometric decay, so the EB step must be a POSITIVE Δ (raise α).
+        let logits = Array2::from_shape_fn((n, k), |(_, kk)| 2.0 * kk as f64);
+        let assign = learnable_ibp(logits.clone(), 1.0);
+        // effective α = alpha_base·exp(log_lambda_sparse) = 1·exp(0) = 1.
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        let step = assign
+            .ibp_eb_log_alpha_step(&rho)
+            .unwrap()
+            .expect("learnable IBP must yield an EB step");
+        assert!(step.is_finite(), "step must be finite, got {step}");
+        assert!(
+            step > 1e-3,
+            "flattened occupancy must MOVE λ_sparse up (raise α); got Δ={step}"
+        );
+
+        // Softmax has no closed-form M-step → None (historical zero step).
+        let sm_coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let softmax =
+            SaeAssignment::from_blocks_with_mode(logits.clone(), sm_coords, AssignmentMode::softmax(1.0))
+                .unwrap();
+        assert!(
+            softmax.ibp_eb_log_alpha_step(&rho).unwrap().is_none(),
+            "softmax sparsity prior has no EB α M-step"
+        );
+
+        // A pinned (overridden) α is not a free parameter → None.
+        let mut pinned = learnable_ibp(logits, 1.0);
+        pinned.set_ibp_alpha_override(Some(3.0));
+        assert!(
+            pinned.ibp_eb_log_alpha_step(&rho).unwrap().is_none(),
+            "override-pinned α must not take the EB M-step"
+        );
     }
 }

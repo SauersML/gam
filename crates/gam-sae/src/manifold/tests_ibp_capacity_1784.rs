@@ -269,11 +269,21 @@ fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ibp() {
         "large-K default cap must be derived from rows per atom"
     );
 
+    // #F2 — an EXPLICIT IBP-MAP request is now RE-ADMITTED at large K, with the
+    // rows-per-atom `top_k` used as the active-set compute cap (never refused).
+    // The default route still never selects IBP-MAP implicitly (asserted above).
     let explicit_ibp =
-        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 1.0, 1.0, false, 0.0);
+        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 1.0, 1.0, false, 0.0)
+            .expect("explicit large-K IBP-MAP admission");
     assert!(
-        explicit_ibp.is_err(),
-        "IBP-MAP must be refused once large-K top-k admission engages"
+        matches!(explicit_ibp.mode, AssignmentMode::IBPMap { .. }),
+        "explicit IBP-MAP request must be admitted at large K, got {:?}",
+        explicit_ibp.mode
+    );
+    assert_eq!(
+        explicit_ibp.top_k,
+        Some(n.div_ceil(k)),
+        "large-K IBP-MAP must carry the rows-per-atom active-set compute cap"
     );
 }
 

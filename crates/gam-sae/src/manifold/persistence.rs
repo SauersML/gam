@@ -709,41 +709,86 @@ fn dominant_persistence(bars: &[PersistenceBar]) -> f64 {
     bars.iter().map(|b| b.persistence()).fold(0.0_f64, f64::max)
 }
 
+/// Count the significant generators in a persistence diagram by separating the
+/// signal cluster from the diagonal noise floor at the diagram's own largest
+/// spectral gap.
+///
+/// The prior Pareto-frontier rule (#2191) counted every birth/death-undominated
+/// bar. That is fragile in BOTH directions on a genuine torus (#2159): the two
+/// independent H₁ generators of a torus have *comparable, near-identical*
+/// persistence, so tiny sampling asymmetries make one bar born-no-earlier /
+/// die-no-later than the other and the frontier DROPS the second generator
+/// (b₁ collapses to 1 — or to 0 when both are dominated by a longer H₀-scale
+/// bar); conversely diagram noise sitting off the main staircase is undominated
+/// and INFLATES the frontier (the measured b₁=29 at one grid). Neither failure
+/// is about topology — both are artefacts of ranking by the birth/death partial
+/// order instead of by persistence magnitude.
+///
+/// The fix ranks bars by their **scale-free log-persistence** `ρ = ln(death /
+/// birth)` — resolution-invariant, since a generator sampled at spacing `s` is
+/// born at `≈ s` and dies at `≈ D` (the cycle's filling scale) for `ρ ≈ ln(D/s)`
+/// that is stable as the grid density (hence `s` and the landmark count) varies,
+/// whereas the raw lifetime `death − birth` is not. A real generator persists
+/// over a wide multiplicative band (`ρ` well above 0); a noise class is born and
+/// dies at almost the same scale (`ρ ≈ 0`, at the diagonal). The signal/noise
+/// split is then the **largest gap** in the sorted `ρ` spectrum, with the
+/// diagonal (`ρ = 0`) as the anchoring noise reference: the count is the number
+/// of bars above that gap. Counting by magnitude keeps BOTH comparable torus
+/// generators (they sit together above the gap) and admits no diagonal noise
+/// (it stays below). The gap is accepted as a genuine signal/noise boundary only
+/// when it exceeds the most persistent bar still left below it — the noise-band
+/// ceiling — so an all-noise diagram whose bars taper smoothly to the diagonal
+/// (e.g. a sphere's transient H₁) yields zero generators rather than one, and no
+/// threshold is hand-set: it is read off the diagram itself.
 fn dominant_gap_bar_count(bars: &[PersistenceBar]) -> usize {
     let essential = bars.iter().filter(|b| b.is_essential()).count();
-    let finite: Vec<PersistenceBar> = bars
+    // Scale-free log-persistence ρ = ln(death/birth) of each finite class.
+    // birth = 0 cannot form the ratio (a class born at the zero scale); fall
+    // back to the raw lifetime there, which for such a class equals its death.
+    let mut rho: Vec<f64> = bars
         .iter()
-        .copied()
         .filter(|b| b.birth.is_finite() && b.death.is_finite() && b.death > b.birth)
+        .map(|b| {
+            if b.birth > 0.0 {
+                (b.death / b.birth).ln()
+            } else {
+                b.death - b.birth
+            }
+        })
+        .filter(|r| r.is_finite() && *r > 0.0)
         .collect();
-    if finite.is_empty() {
+    if rho.is_empty() {
         return essential;
     }
-
-    // Count the Pareto frontier of the birth/death diagram.  A genuine sampled
-    // homology generator is not made less valid merely because the H0 covering
-    // scale is larger than its lifetime; what distinguishes diagram noise is
-    // that it is born no earlier and dies no later than a more persistent class.
-    // This partial-order rule is scale-free and uses only the diagram geometry:
-    // dominated bars cannot represent additional stable topology, while each
-    // undominated bar witnesses an independent class on some filtration band.
-    let mut frontier = 0usize;
-    'candidate: for (idx, bar) in finite.iter().enumerate() {
-        for (other_idx, other) in finite.iter().enumerate() {
-            if idx == other_idx {
-                continue;
-            }
-            let born_no_later = other.birth <= bar.birth;
-            let dies_no_earlier = other.death >= bar.death;
-            let strictly_better = other.birth < bar.birth || other.death > bar.death;
-            if born_no_later && dies_no_earlier && strictly_better {
-                continue 'candidate;
-            }
+    rho.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
+    let m = rho.len();
+    // Largest gap in the sorted spectrum, with the diagonal (ρ = 0) as the
+    // sentinel below the last bar so a diagram with no internal separation is
+    // measured against the noise floor rather than against nothing.
+    let gap_after = |k: usize| -> f64 {
+        let below = if k < m { rho[k] } else { 0.0 };
+        rho[k - 1] - below
+    };
+    let mut k_star = 1usize;
+    let mut best = gap_after(1);
+    for k in 2..=m {
+        let g = gap_after(k);
+        if g > best {
+            best = g;
+            k_star = k;
         }
-        frontier += 1;
     }
-
-    essential + frontier
+    // Accept the top-`k_star` bars as generators only when the separating gap
+    // clears the noise-band ceiling (the most persistent bar still below it).
+    // For a genuine loop the drop from generator to noise is order-of-magnitude;
+    // for a taper of diagonal noise the widest gap sits above a comparably tall
+    // bar and is rejected, giving b₁ = 0.
+    let noise_ceiling = if k_star < m { rho[k_star] } else { 0.0 };
+    if best > noise_ceiling {
+        essential + k_star
+    } else {
+        essential
+    }
 }
 
 fn shell_plateau_bar_count(bars: &[PersistenceBar]) -> usize {

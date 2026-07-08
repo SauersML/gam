@@ -256,63 +256,76 @@ pub fn recover_spikes(
         .eigenvalues()
         .map_err(|e| format!("matrix-pencil eigenproblem failed: {e:?}"))?;
 
-    // Unit-modulus phasors and circle positions t = arg(z)/(2π) mod 1. The
-    // shift-invariance pencil `Φ = V1⁺V2` built from `svd.V()` has eigenvalues
-    // equal to the GENERATING phasors `z_j = e^{2πi t_j}` directly: faer's `V`
-    // columns span the Hankel row space `span{(z_j^k)_k}` itself (the shift
-    // relation `V2 = V1·diag(z_j)` reads off `z_j`, not its conjugate). Only the
-    // magnitude is normalised to the unit circle; NO conjugation is applied.
+    // Unit-modulus phasors from the pencil eigenvalues. The shift-invariance
+    // pencil `Φ = V1⁺V2` built from `svd.V()` recovers the generating phasors
+    // `z_j = e^{2πi t_j}` only up to a GLOBAL complex-conjugation: faer's SVD `V`
+    // is pinned only up to a per-column unit-phase factor, and for some inputs the
+    // whole right basis returns conjugated, so every eigenvalue comes back as
+    // `conj(z_j)` — the reflected circle position `1 − t_j`. This is not a fixed
+    // convention (it is data-dependent), so it cannot be assumed away: e.g.
+    // planted {0.285, 0.801} was returned as its reflection {0.199, 0.715} with
+    // spurious near-zero/negative amplitudes, and the measure readout then
+    // (correctly) rejected the mis-fit and collapsed a genuine two-spike code to
+    // one — silently destroying multiplicity detection.
     //
-    // A spurious `z̄ = conj(z)` here arg-NEGATES every phasor and reports the
-    // reflected circle position `1 − t`, and — because the downstream Vandermonde
-    // amplitude solve then fits the reflected frequencies — inflates the residual
-    // so much that the measure readout rejects the multi-spike result and falls
-    // back to the single-coordinate path. That reflection was the
-    // `exact_recovery_two_spikes_no_noise` failure: planted {0.20, 0.45} came back
-    // as {0.55, 0.80}, a position error of exactly the reflection distance 0.35.
-    let phasors: Vec<c64> = roots
+    // The data disambiguates without any tuning: the samples `y_h` are not
+    // conjugate-symmetric, so the TRUE phasor set fits them with a real,
+    // low-residual amplitude solve while the reflected set inflates the residual.
+    // Solve both the phasor set and its global conjugate, and keep whichever
+    // reconstructs the samples better — a closed-form, threshold-free branch
+    // selection that leaves the already-correct branch untouched (its residual is
+    // strictly smaller, so nothing regresses).
+    let unit_phasors: Vec<c64> = roots
         .iter()
         .map(|z| {
             let norm = z.norm();
             if norm > 0.0 { *z / norm } else { c64::new(1.0, 0.0) }
         })
         .collect();
-    let positions: Vec<f64> = phasors
-        .iter()
-        .map(|z| {
-            let t = z.arg() / std::f64::consts::TAU;
-            if t < 0.0 { t + 1.0 } else { t }
-        })
-        .collect();
 
-    // Amplitudes: least-squares Vandermonde solve of Σ_j a_j z_j^{k+1} = y_k.
-    let vander = Mat::<c64>::from_fn(n, model_order, |k, j| {
-        phasors[j].powu((k + 1) as u32)
-    });
-    let rhs = Mat::<c64>::from_fn(n, 1, |k, _| samples[k]);
-    let amps = vander.qr().solve_lstsq(&rhs);
-
-    let mut spikes: Vec<Spike> = (0..model_order)
-        .map(|j| Spike {
-            t: positions[j],
-            amplitude: amps[(j, 0)].re,
-        })
-        .collect();
-    spikes.sort_by(|a, b| a.t.total_cmp(&b.t));
-
-    // Residual of the recovered physical model (real amplitudes, unit phasors).
-    let mut residual_sq = 0.0;
-    for (k, y) in samples.iter().enumerate() {
-        let mut fit = c64::new(0.0, 0.0);
-        for spike in &spikes {
-            let phasor = c64::new(
-                (std::f64::consts::TAU * spike.t).cos(),
-                (std::f64::consts::TAU * spike.t).sin(),
-            );
-            fit += phasor.powu((k + 1) as u32) * spike.amplitude;
+    let solve_branch = |phasors: &[c64]| -> (Vec<Spike>, f64) {
+        let positions: Vec<f64> = phasors
+            .iter()
+            .map(|z| {
+                let t = z.arg() / std::f64::consts::TAU;
+                if t < 0.0 { t + 1.0 } else { t }
+            })
+            .collect();
+        // Amplitudes: least-squares Vandermonde solve of Σ_j a_j z_j^{k+1} = y_k.
+        let vander = Mat::<c64>::from_fn(n, model_order, |k, j| phasors[j].powu((k + 1) as u32));
+        let rhs = Mat::<c64>::from_fn(n, 1, |k, _| samples[k]);
+        let amps = vander.qr().solve_lstsq(&rhs);
+        let mut spikes: Vec<Spike> = (0..model_order)
+            .map(|j| Spike {
+                t: positions[j],
+                amplitude: amps[(j, 0)].re,
+            })
+            .collect();
+        spikes.sort_by(|a, b| a.t.total_cmp(&b.t));
+        // Residual of the recovered physical model (real amplitudes, unit phasors).
+        let mut residual_sq = 0.0;
+        for (k, y) in samples.iter().enumerate() {
+            let mut fit = c64::new(0.0, 0.0);
+            for spike in &spikes {
+                let phasor = c64::new(
+                    (std::f64::consts::TAU * spike.t).cos(),
+                    (std::f64::consts::TAU * spike.t).sin(),
+                );
+                fit += phasor.powu((k + 1) as u32) * spike.amplitude;
+            }
+            residual_sq += (y - fit).norm_sqr();
         }
-        residual_sq += (y - fit).norm_sqr();
-    }
+        (spikes, residual_sq)
+    };
+
+    let conj_phasors: Vec<c64> = unit_phasors.iter().map(|z| z.conj()).collect();
+    let (spikes_direct, residual_direct) = solve_branch(&unit_phasors);
+    let (spikes_reflected, residual_reflected) = solve_branch(&conj_phasors);
+    let (spikes, residual_sq) = if residual_reflected < residual_direct {
+        (spikes_reflected, residual_reflected)
+    } else {
+        (spikes_direct, residual_direct)
+    };
 
     Ok(SpikeRecovery {
         spikes,

@@ -914,34 +914,33 @@ where
                 //      #1464 collapsing-kernel spatial).
                 //
                 //   2. The Demmler–Reinsch closed-form GLOBAL Gaussian-identity
-                //      REML optimum `ρ*` over the summed penalty `Σ_j S_j`. The
-                //      profiled Gaussian REML criterion is an explicit scalar
-                //      `V(ρ)` whose derivative decays to zero on the high-λ
-                //      shelf, so a descent method (mgcv included) rails to an
-                //      over-smoothed λ̂ there even though a finite-λ basin has a
+                //      REML optimum, PER BLOCK, via cyclic exact 1-D
+                //      minimisation. The profiled Gaussian REML criterion is an
+                //      explicit scalar whose ρ-derivative decays to zero on the
+                //      high-λ shelf, so a descent method (mgcv included) rails to
+                //      an over-smoothed λ̂ there even though a finite-λ basin has a
                 //      strictly lower REML (sin8 k=40: shelf edf≈2 vs basin
-                //      edf≈39). The closed form SELECTS the global minimiser from
-                //      one eigendecomposition rather than descending `V`, so it
-                //      lands the correct basin; setting every block coordinate to
-                //      `ρ*` reproduces `e^{ρ*}·Σ_j S_j` exactly, so its scored
-                //      cost is the closed form's global optimum. Only fires for a
-                //      dense Gaussian-identity design (see
-                //      `analytic_gaussian_closed_form_rho`).
+                //      edf≈39). The closed form SELECTS each block's global
+                //      minimiser from an eigendecomposition of the `(S_k, A_k)`
+                //      pencil (A_k folds the other blocks' λ into the metric)
+                //      rather than descending, so no coordinate shelf-traps and a
+                //      double-penalty smooth's blocks can split (λ_bend high /
+                //      λ_null low). Only fires for a dense Gaussian-identity
+                //      design (see `analytic_gaussian_closed_form_rho`).
                 //
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
                 let initial_sp = reml_state.analytic_initial_sp_rho(&base, (lo, hi));
                 let closed_form = reml_state
                     .analytic_gaussian_closed_form_rho((lo, hi))
-                    .map(|rho_star| {
-                        // Set only the leading penalty coordinates to ρ*; any
-                        // trailing ext/ψ coordinates in `base` are not smoothing
-                        // parameters and pass through unchanged (the same 1:1
-                        // layout `analytic_initial_sp_rho` uses).
+                    .map(|rho_blocks| {
+                        // Map the per-block ρ onto the leading penalty
+                        // coordinates; any trailing ext/ψ coordinates in `base`
+                        // are not smoothing parameters and pass through unchanged
+                        // (the same 1:1 layout `analytic_initial_sp_rho` uses).
                         let mut seed = base.clone();
-                        let n_pen = reml_state.canonical_penalties.len().min(seed.len());
-                        for coord in seed.iter_mut().take(n_pen) {
-                            *coord = rho_star.clamp(lo, hi);
+                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
+                            *coord = r.clamp(lo, hi);
                         }
                         seed
                     });

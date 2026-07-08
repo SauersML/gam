@@ -3977,13 +3977,13 @@ impl<'a> RemlState<'a> {
     /// link states) whose profiled ridge the closed form does not model, no
     /// penalties, or a sparse design (skipped rather than densified so a huge
     /// random-effects design never pays an `n×p` materialization).
-    pub(crate) fn analytic_gaussian_closed_form_rho(&self, bounds: (f64, f64)) -> Option<f64> {
+    pub(crate) fn analytic_gaussian_closed_form_rho(&self, bounds: (f64, f64)) -> Option<Array1<f64>> {
         if !reml_is_gaussian_identity(&self.config.likelihood) {
             return None;
         }
         // The closed form solves an unconstrained ridge `min ‖W^½(y−Xβ)‖² +
-        // λβᵀSβ`; it models none of these side conditions, so defer to the
-        // general seeds when any are present.
+        // Σ_j λ_j βᵀS_jβ`; it models none of these side conditions, so defer to
+        // the general seeds when any are present.
         if self.linear_constraints.is_some()
             || self.coefficient_lower_bounds.is_some()
             || self.runtime_mixture_link_state.is_some()
@@ -3991,7 +3991,8 @@ impl<'a> RemlState<'a> {
         {
             return None;
         }
-        if self.canonical_penalties.is_empty() {
+        let k = self.canonical_penalties.len();
+        if k == 0 {
             return None;
         }
         // Densify only an already-dense design: a sparse (e.g. large
@@ -4008,16 +4009,18 @@ impl<'a> RemlState<'a> {
         if x_dense.ncols() != p {
             return None;
         }
-        // S = Σ_j scatter(local_j) — the single summed penalty at λ = 1.
-        let mut s = Array2::<f64>::zeros((p, p));
-        for pen in self.canonical_penalties.iter() {
-            let r = pen.col_range.clone();
-            for (li, gi) in r.clone().enumerate() {
-                for (lj, gj) in r.clone().enumerate() {
-                    s[[gi, gj]] += pen.local[[li, lj]];
-                }
-            }
-        }
+        // One Demmler–Reinsch penalty block per canonical penalty, so the cyclic
+        // solver optimises each block's λ_j INDEPENDENTLY (a double-penalty
+        // smooth's bend and null-space blocks can split, e.g. λ_bend high /
+        // λ_null low — the single summed-λ optimum cannot express that).
+        let blocks: Vec<crate::gaussian_reml::GaussianRemlLambdaBlock<'_>> = self
+            .canonical_penalties
+            .iter()
+            .map(|pen| crate::gaussian_reml::GaussianRemlLambdaBlock {
+                col_range: pen.col_range.clone(),
+                local: pen.local.view(),
+            })
+            .collect();
         // The closed form fits `y ~ Xβ` with no offset term, so fold any offset
         // into the response.
         let mut y_eff = self.y.to_owned();
@@ -4025,24 +4028,27 @@ impl<'a> RemlState<'a> {
             y_eff -= &self.offset;
         }
         let weights = self.weights.to_owned();
-        let cf = crate::gaussian_reml::gaussian_reml_closed_form(
+        // Start every block at λ = 1 (ρ = 0); each coordinate's first sweep is a
+        // GLOBAL 1-D solve, so the outcome is init-independent.
+        let init_rho = vec![0.0_f64; k];
+        let rho = crate::gaussian_reml::gaussian_reml_cyclic_multi_lambda_rho(
             x_dense.view(),
             y_eff.view(),
-            s.view(),
+            &blocks,
             Some(weights.view()),
-            None,
+            &init_rho,
+            bounds,
         )
         .ok()?;
+        if rho.len() != k || rho.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
         let (lo, hi) = if bounds.0 <= bounds.1 {
             bounds
         } else {
             (bounds.1, bounds.0)
         };
-        if cf.rho.is_finite() {
-            Some(cf.rho.clamp(lo, hi))
-        } else {
-            None
-        }
+        Some(Array1::from_iter(rho.into_iter().map(|v| v.clamp(lo, hi))))
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).

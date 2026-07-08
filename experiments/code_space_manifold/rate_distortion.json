@@ -1,0 +1,317 @@
+{
+  "flat": [
+    {
+      "bits_per_token": 606.9050971091867,
+      "ev": 0.7047351570694043,
+      "b_amp": 4
+    },
+    {
+      "bits_per_token": 670.9050971091867,
+      "ev": 0.7683185062365825,
+      "b_amp": 6
+    },
+    {
+      "bits_per_token": 734.9050971091867,
+      "ev": 0.7731625978027268,
+      "b_amp": 8
+    },
+    {
+      "bits_per_token": 862.9050971091867,
+      "ev": 0.7734866671007196,
+      "b_amp": 12
+    },
+    {
+      "bits_per_token": 990.9050971091867,
+      "ev": 0.7734879767320249,
+      "b_amp": 16
+    }
+  ],
+  "sweep": [
+    {
+      "edge_min_frac": 0.0005,
+      "threshold": 100,
+      "n_edges_kept": 17,
+      "within_block_edge_frac": 0.125,
+      "topology_histogram": {
+        "tree": 1,
+        "path": 1
+      },
+      "size_histogram": {
+        "4": 1,
+        "6": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 2,
+      "log2G": 1.0,
+      "n_grouped_secant_firings": 11421,
+      "n_flat_firings": 6377158,
+      "frac_firings_secant": 0.0035690625,
+      "n_tokens_with_secant": 9302,
+      "manifold_points": [
+        {
+          "bits_per_token": 733.0245398860354,
+          "ev": 0.7708369403183473,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 733.1387498860355,
+          "ev": 0.7709243453203077,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 988.7961198860355,
+          "ev": 0.7712603352045403,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7712597620489932,
+      "manifold_maxfidelity_bits": 1245.2529598860356,
+      "recode_distortion_ev_drop": 0.002228219834898848
+    },
+    {
+      "edge_min_frac": 0.0002,
+      "threshold": 40,
+      "n_edges_kept": 134,
+      "within_block_edge_frac": 0.10810810810810811,
+      "topology_histogram": {
+        "graph_b1_7": 1,
+        "graph_b1_1": 1,
+        "tree": 4,
+        "path": 2
+      },
+      "size_histogram": {
+        "4": 4,
+        "5": 1,
+        "6": 2,
+        "41": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 8,
+      "log2G": 3.0,
+      "n_grouped_secant_firings": 39505,
+      "n_flat_firings": 6320990,
+      "frac_firings_secant": 0.0123453125,
+      "n_tokens_with_secant": 29228,
+      "manifold_points": [
+        {
+          "bits_per_token": 728.795339027531,
+          "ev": 0.7435303012588985,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 729.190389027531,
+          "ev": 0.7422438249749588,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 984.005239027531,
+          "ev": 0.7431771250287403,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7431248037500138,
+      "manifold_maxfidelity_bits": 1241.585439027531,
+      "recode_distortion_ev_drop": 0.030363178133878233
+    },
+    {
+      "edge_min_frac": 0.0001,
+      "threshold": 20,
+      "n_edges_kept": 471,
+      "within_block_edge_frac": 0.08356545961002786,
+      "topology_histogram": {
+        "graph_b1_55": 1,
+        "graph_b1_5": 1,
+        "tree": 13,
+        "graph_b1_2": 1,
+        "graph_b1_3": 1,
+        "graph_b1_1": 6,
+        "path": 6
+      },
+      "size_histogram": {
+        "4": 5,
+        "5": 8,
+        "6": 4,
+        "7": 4,
+        "8": 3,
+        "9": 2,
+        "15": 1,
+        "21": 1,
+        "127": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 29,
+      "log2G": 4.857980995127572,
+      "n_grouped_secant_firings": 96580,
+      "n_flat_firings": 6206840,
+      "frac_firings_secant": 0.03018125,
+      "n_tokens_with_secant": 61795,
+      "manifold_points": [
+        {
+          "bits_per_token": 720.8654616696073,
+          "ev": 0.6888869012552155,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 721.8312616696073,
+          "ev": 0.6885708419355607,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 974.9338616696073,
+          "ev": 0.7083463997124739,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7092729635595849,
+      "manifold_maxfidelity_bits": 1234.7970616696073,
+      "recode_distortion_ev_drop": 0.0642150183243071
+    },
+    {
+      "edge_min_frac": 5e-05,
+      "threshold": 10,
+      "n_edges_kept": 1504,
+      "within_block_edge_frac": 0.01935483870967742,
+      "topology_histogram": {
+        "graph_b1_10": 1,
+        "graph_b1_2": 5,
+        "graph_b1_3": 1,
+        "graph_b1_4": 4,
+        "graph_b1_1": 14,
+        "tree": 14,
+        "path": 7
+      },
+      "size_histogram": {
+        "4": 14,
+        "5": 12,
+        "6": 5,
+        "7": 4,
+        "8": 1,
+        "9": 2,
+        "11": 1,
+        "12": 3,
+        "13": 2,
+        "14": 1,
+        "16": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 46,
+      "log2G": 5.523561956057013,
+      "n_grouped_secant_firings": 50613,
+      "n_flat_firings": 6298774,
+      "frac_firings_secant": 0.0158165625,
+      "n_tokens_with_secant": 37983,
+      "manifold_points": [
+        {
+          "bits_per_token": 727.7160249156003,
+          "ev": 0.7563833324884481,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 728.2221549156003,
+          "ev": 0.757647912536593,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 982.7037649156002,
+          "ev": 0.7580381550843105,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7580434188700509,
+      "manifold_maxfidelity_bits": 1240.7282849156002,
+      "recode_distortion_ev_drop": 0.015444563013841117
+    },
+    {
+      "edge_min_frac": 2e-05,
+      "threshold": 4,
+      "n_edges_kept": 8084,
+      "within_block_edge_frac": 0.004251700680272109,
+      "topology_histogram": {
+        "graph_b1_14": 1,
+        "graph_b1_11": 1,
+        "graph_b1_4": 1,
+        "graph_b1_5": 2,
+        "graph_b1_7": 1,
+        "graph_b1_2": 6,
+        "graph_b1_3": 3,
+        "tree": 100,
+        "graph_b1_1": 20,
+        "path": 93
+      },
+      "size_histogram": {
+        "4": 104,
+        "5": 51,
+        "6": 27,
+        "7": 16,
+        "8": 5,
+        "9": 5,
+        "10": 5,
+        "11": 2,
+        "12": 3,
+        "14": 1,
+        "15": 3,
+        "18": 3,
+        "19": 1,
+        "20": 1,
+        "27": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 228,
+      "log2G": 7.832890014164741,
+      "n_grouped_secant_firings": 72508,
+      "n_flat_firings": 6254984,
+      "frac_firings_secant": 0.02265875,
+      "n_tokens_with_secant": 56108,
+      "manifold_points": [
+        {
+          "bits_per_token": 725.4432821857991,
+          "ev": 0.7575006694202264,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 726.1683621857992,
+          "ev": 0.7586632897610998,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 979.9931221857992,
+          "ev": 0.7590821723974247,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7590806584035172,
+      "manifold_maxfidelity_bits": 1238.8934421857991,
+      "recode_distortion_ev_drop": 0.014407323480374767
+    }
+  ],
+  "flat_active_recon_ev": 0.773487981883892,
+  "N_tokens": 200000,
+  "K": 32000,
+  "active": 32,
+  "log2K": 14.965784284662087
+}

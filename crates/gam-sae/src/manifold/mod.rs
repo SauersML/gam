@@ -194,6 +194,7 @@ mod graph_atom;
 mod inframe_curved;
 mod isa_seed;
 mod kronecker;
+pub mod lift;
 mod loss;
 mod outer_objective;
 mod pair_kappa;
@@ -319,6 +320,9 @@ mod tests_frame_refresh_alpha_grad;
 mod tests_graph_atom;
 
 #[cfg(test)]
+mod tests_graph_spectral_decode;
+
+#[cfg(test)]
 mod tests_cocollapse_disjoint_2027;
 
 #[cfg(test)]
@@ -332,6 +336,9 @@ mod lambda_smooth_1556_tests;
 
 #[cfg(test)]
 mod tests_behavior_twoblock_rung2;
+
+#[cfg(test)]
+mod tests_crosscoder_multiblock;
 
 #[cfg(test)]
 mod tests_ln_sphere_ambient_f4;

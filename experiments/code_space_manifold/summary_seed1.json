@@ -1,0 +1,69 @@
+{
+  "K": 32000,
+  "P": 2048,
+  "active": 32,
+  "N_tokens": 200000,
+  "seed": 1,
+  "flat_active_recon_ev": 0.7093694456242305,
+  "frac_sweep": [
+    0.0005,
+    0.0002,
+    0.0001,
+    5e-05,
+    2e-05
+  ],
+  "headline_frac": 0.0001,
+  "n_calendar_cycle_groups": 0,
+  "calendar": [],
+  "sweep_brief": [
+    {
+      "frac": 0.0005,
+      "n_groups": 3,
+      "frac_firings_secant": 0.0064965625,
+      "manifold_maxfidelity_ev": 0.7035068233958788,
+      "recode_distortion_ev_drop": 0.005862622228351766,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.08333333333333333
+    },
+    {
+      "frac": 0.0002,
+      "n_groups": 12,
+      "frac_firings_secant": 0.0154096875,
+      "manifold_maxfidelity_ev": 0.6840272193286818,
+      "recode_distortion_ev_drop": 0.02534222629554872,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.09302325581395349
+    },
+    {
+      "frac": 0.0001,
+      "n_groups": 24,
+      "frac_firings_secant": 0.0276859375,
+      "manifold_maxfidelity_ev": 0.6388253989437459,
+      "recode_distortion_ev_drop": 0.07054404668048464,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.07624633431085044
+    },
+    {
+      "frac": 5e-05,
+      "n_groups": 41,
+      "frac_firings_secant": 0.0157421875,
+      "manifold_maxfidelity_ev": 0.6882825109097254,
+      "recode_distortion_ev_drop": 0.02108693471450518,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.022950819672131147
+    },
+    {
+      "frac": 2e-05,
+      "n_groups": 244,
+      "frac_firings_secant": 0.022765625,
+      "manifold_maxfidelity_ev": 0.6934849738300575,
+      "recode_distortion_ev_drop": 0.015884471794173072,
+      "n_cycle_groups": 0,
+      "within_block_edge_frac": 0.0024834437086092716
+    }
+  ],
+  "wall_s": 525.1052820682526,
+  "decoder": "/projects/standard/hsiehph/sauer354/msae_l17/t1_out/decoder_K32000.npy",
+  "tier0": "/projects/standard/hsiehph/sauer354/msae_l17/tier0_recentered.json",
+  "data": "/projects/standard/hsiehph/sauer354/msae_l17/L17_train.f32.npy"
+}

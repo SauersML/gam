@@ -112,6 +112,7 @@ from ._sparse_dictionary import (
     sparse_dictionary_fit_begin,
 )
 from ._sae_spectral import (
+    AtlasNerveDiagram,
     AtomRetentionEvidence,
     BlockCoordinateReport,
     ComposedContract,
@@ -125,6 +126,7 @@ from ._sae_spectral import (
     SpectrometerReport,
     SpikeRecovery,
     VarianceChargeEvidence,
+    atlas_nerve_diagram,
     audit_sae,
     block_firing_coordinates,
     compose_contracts,

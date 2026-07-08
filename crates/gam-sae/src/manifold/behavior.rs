@@ -684,6 +684,209 @@ impl BehaviorBlock {
     }
 }
 
+/// A generic output data block of a **multi**-block REML fit: a named
+/// (unscaled) target `Y_ℓ` (`n × p_ℓ`) decoded from the SAME shared latent
+/// coordinate as every other block, plus its own REML-selected relative block
+/// weight `λ_ℓ` (log scale).
+///
+/// # Why this exists — the block-generic core
+///
+/// [`BehaviorBlock`] is the two-block machinery specialized to a behavior
+/// target: the augmented fit `Z̃ = [Z | √λ_y·Y]`, the single shared dispersion
+/// `φ̂`, and the closed-form variance-ratio `λ_y = (R_x/p_x)/(R_y/p_y)` are
+/// derived in `behavior_fit.rs`. **Nothing in that derivation cares that `Y` is
+/// behavior** — it uses only the block's *width* `p_ℓ` and its *residual
+/// variance*. Generalising to `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{K-1}·Y_{K-1}]` and
+/// profiling the `K` dispersions gives, at the joint stationary point,
+///
+/// ```text
+///   λ_ℓ = (R_x / p_x) / (R_ℓ / p_ℓ)   for every block ℓ,
+/// ```
+///
+/// exactly the per-block variance ratio — **decoupled** across blocks even
+/// though the profiled criterion couples them through the shared `φ̂` (the
+/// coupling cancels: summing the `K-1` stationarity equations forces
+/// `φ̂ = R_x/p_x`, and each `λ_ℓ` then reads only its own residual against the
+/// anchor). So one shared latent + per-block decoders + a per-block closed-form
+/// `λ_ℓ` update is the whole generalization; see
+/// [`SaeManifoldTerm::run_multiblock_reml_fit`](crate::manifold::SaeManifoldTerm::run_multiblock_reml_fit).
+///
+/// # Clients
+///
+/// * **Curved crosscoder** — each block is the NEXT layer's activations, so one
+///   shared latent coordinate is decoded into several layers at once and `λ_ℓ`
+///   REML-selects each layer's relevance (see the `curved_crosscoder` example).
+/// * **Development-coder** (follow-up) — each block is a later training
+///   checkpoint's activations along the *checkpoint* axis.
+///
+/// The target is kept **unscaled** (like [`BehaviorBlock::target`]) so `λ_ℓ` can
+/// move under REML without re-forming `Y_ℓ`, and so a fitted decoder can be
+/// returned to honest units via [`Self::split_honest_decoder`] (un-doing `√λ_ℓ`).
+#[derive(Clone, Debug)]
+pub struct OutputBlock {
+    /// A short label for the block (e.g. the layer name), for diagnostics only.
+    pub label: String,
+    /// Unscaled target `Y_ℓ` (`n × p_ℓ`).
+    pub target: Array2<f64>,
+    /// `log(λ_ℓ)`; the relative inferential weight of this block. Moved by the
+    /// closed-form REML variance-ratio update, never a knob.
+    pub log_lambda: f64,
+}
+
+impl OutputBlock {
+    /// Build a block from a label, an (unscaled) target, and an initial
+    /// `log(λ_ℓ)`. The target must be non-empty and `log_lambda` finite.
+    pub fn new(
+        label: impl Into<String>,
+        target: Array2<f64>,
+        log_lambda: f64,
+    ) -> Result<Self, String> {
+        let (n, p) = target.dim();
+        if n == 0 || p == 0 {
+            return Err(format!(
+                "OutputBlock::new: target must be a non-empty (n × p_ℓ) matrix; got ({n}, {p})"
+            ));
+        }
+        if !log_lambda.is_finite() {
+            return Err(format!(
+                "OutputBlock::new: log_lambda must be finite; got {log_lambda}"
+            ));
+        }
+        Ok(Self {
+            label: label.into(),
+            target,
+            log_lambda,
+        })
+    }
+
+    /// Block width `p_ℓ` (the number of output columns this block occupies).
+    pub fn block_dim(&self) -> usize {
+        self.target.ncols()
+    }
+
+    /// The block weight `λ_ℓ = exp(log_lambda)`.
+    pub fn lambda(&self) -> f64 {
+        self.log_lambda.exp()
+    }
+
+    /// `√λ_ℓ`, the per-column scaling applied to the target so a single shared
+    /// dispersion realizes the block's variance ratio.
+    pub fn sqrt_lambda(&self) -> f64 {
+        (0.5 * self.log_lambda).exp()
+    }
+
+    /// A copy re-weighted to a new `log(λ_ℓ)` (the target is untouched, so a REML
+    /// sweep re-weights without re-forming `Y_ℓ`).
+    pub fn with_log_lambda(&self, log_lambda: f64) -> Result<Self, String> {
+        if !log_lambda.is_finite() {
+            return Err(format!(
+                "OutputBlock::with_log_lambda: log_lambda must be finite; got {log_lambda}"
+            ));
+        }
+        let mut next = self.clone();
+        next.log_lambda = log_lambda;
+        Ok(next)
+    }
+
+    /// Un-do the `√λ_ℓ` scaling on a fitted decoder slice `C̃_ℓ` (`M × p_ℓ`)
+    /// carved from the augmented decoder, returning the **honest-units** decoder
+    /// `C_ℓ = C̃_ℓ / √λ_ℓ` that reconstructs this block's target in its own units.
+    pub fn split_honest_decoder(&self, scaled_decoder: ArrayView2<'_, f64>) -> Array2<f64> {
+        let inv = 1.0 / self.sqrt_lambda();
+        scaled_decoder.mapv(|value| inv * value)
+    }
+
+    /// One REML variance-ratio update of `log(λ_ℓ)` from the anchor residual sum
+    /// of squares `R_x = ‖R̃_x‖²` (over the `p_x` anchor columns) and this
+    /// block's **scaled** residual sum of squares `R̃_ℓ = ‖R̃_ℓ‖²` (over its
+    /// `p_ℓ` columns, which carry the `√λ_ℓ` factor). Returns the new
+    /// `log(λ_ℓ) = log((R_x/p_x)/(R_ℓ/p_ℓ))` with `R_ℓ = R̃_ℓ/λ_ℓ`.
+    ///
+    /// This is the per-block instance of [`BehaviorBlock::reml_updated_log_lambda_y`]
+    /// (identical arithmetic in identical order, so a single-block multi-block fit
+    /// reproduces the two-block update bit-for-bit). A block with no residual
+    /// variance (`R_ℓ = 0`: perfectly reconstructed, or a constant target) carries
+    /// no information to set the ratio and is surfaced as an error so the driver
+    /// holds `λ_ℓ` rather than diverging.
+    pub fn reml_updated_log_lambda(
+        &self,
+        rss_x: f64,
+        p_x: usize,
+        rss_block_scaled: f64,
+    ) -> Result<f64, String> {
+        let py = self.block_dim();
+        // Undo the √λ_ℓ scaling to get the unscaled block RSS.
+        let lambda = self.lambda();
+        let rss_y = rss_block_scaled / lambda;
+        if !(rss_y > 0.0) {
+            return Err(format!(
+                "OutputBlock::reml_updated_log_lambda: block '{}' residual sum of squares is \
+                 {rss_y} (no residual variance); λ_ℓ is not identifiable from this fit",
+                self.label
+            ));
+        }
+        let var_x = rss_x / p_x as f64;
+        let var_y = rss_y / py as f64;
+        if !(var_x > 0.0) {
+            return Err(format!(
+                "OutputBlock::reml_updated_log_lambda: anchor residual variance is {var_x}"
+            ));
+        }
+        Ok((var_x / var_y).ln())
+    }
+}
+
+/// Stack an anchor target `Z` (`n × p_x`) with the `√λ_ℓ`-scaled targets of a
+/// list of output blocks to form the augmented multi-block fit target
+/// `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{K-1}·Y_{K-1}]` (`n × p̃`,
+/// `p̃ = p_x + Σ_ℓ p_ℓ`).
+///
+/// For a single block this is byte-identical to
+/// [`BehaviorBlock::augmented_target`] (same per-entry formula, same order), so
+/// the multi-block fit reduces to the two-block fit at `K = 2`. The `√λ_ℓ` per
+/// column is what lets the single shared reconstruction dispersion `φ̂` play the
+/// anchor's noise while block `ℓ` carries noise `φ̂/λ_ℓ`.
+pub fn stack_augmented_target(
+    anchor: ArrayView2<'_, f64>,
+    blocks: &[OutputBlock],
+) -> Result<Array2<f64>, String> {
+    let (n, px) = anchor.dim();
+    if n == 0 || px == 0 {
+        return Err(format!(
+            "stack_augmented_target: anchor must be a non-empty (n × p_x) matrix; got ({n}, {px})"
+        ));
+    }
+    let mut p_tot = px;
+    for block in blocks {
+        if block.target.nrows() != n {
+            return Err(format!(
+                "stack_augmented_target: block '{}' has {} rows but anchor has {n}",
+                block.label,
+                block.target.nrows()
+            ));
+        }
+        p_tot += block.block_dim();
+    }
+    // Precompute √λ_ℓ once per block (deterministic, so bit-identical to the
+    // two-block path which computes it once).
+    let sqrt_lambdas: Vec<f64> = blocks.iter().map(|b| b.sqrt_lambda()).collect();
+    let mut augmented = Array2::<f64>::zeros((n, p_tot));
+    for i in 0..n {
+        for j in 0..px {
+            augmented[[i, j]] = anchor[[i, j]];
+        }
+        let mut offset = px;
+        for (block, &sqrt_lambda) in blocks.iter().zip(sqrt_lambdas.iter()) {
+            let pl = block.block_dim();
+            for j in 0..pl {
+                augmented[[i, offset + j]] = sqrt_lambda * block.target[[i, j]];
+            }
+            offset += pl;
+        }
+    }
+    Ok(augmented)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

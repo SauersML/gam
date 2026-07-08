@@ -2025,8 +2025,23 @@ impl SaeManifoldOuterObjective {
         let n_params = rho.to_flat().len();
         let mut steps = vec![0.0_f64; n_params];
 
-        // λ_sparse (index 0): non-quadratic prior → no FS fixed point. Step 0.
-        steps[0] = 0.0;
+        // λ_sparse (index 0): the ordered-IBP concentration α is the ONE sparsity
+        // prior with a closed-form empirical-Bayes marginal M-step (the
+        // Beta–Bernoulli occupancy fixed point), so it gets a genuine
+        // Fellner–Schall-analog step here — this is what UNFREEZES λ_sparse at
+        // large K / streaming, where the value-lane gradient is identically zero
+        // (#F1). Every other sparsity prior (softmax entropy, gated L1, or a
+        // pinned α) is non-quadratic with no FS fixed point and keeps the
+        // historical zero step (`None` ⇒ 0.0). The step reads the fitted gates'
+        // occupancy at this ρ and is trust-region bounded inside the helper.
+        steps[0] = self
+            .term
+            .assignment
+            .ibp_eb_log_alpha_step(&rho)
+            .map_err(|e| {
+                format!("SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}")
+            })?
+            .unwrap_or(0.0);
 
         // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
         // update (#1556). The EFS fixed point is already per-coordinate, so each

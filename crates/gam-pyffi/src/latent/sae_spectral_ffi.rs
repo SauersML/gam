@@ -678,6 +678,45 @@ fn atlas_nerve_dict<'py>(
     Ok(out)
 }
 
+/// Standalone atlas-nerve diagram from a dense block-sparse code matrix (#985 / E1
+/// FFI completeness). This exposes the same Čech-nerve reduction `audit_sae`
+/// computes internally as its own front-door accessor: build one `AtlasChart` per
+/// requested `b`-wide block from the per-row block-energy weights, wire the charts
+/// with all-valid transfer gates, and reduce the nerve to its Betti signature and
+/// simplex counts. Every number is computed in the `gam::terms::sae::inference::
+/// atlas_nerve` core; this only marshals the code matrix in and the diagram dict
+/// out. Returns `{computed: false, reason}` for shapes the nerve does not apply to
+/// (scalar `block_size == 1`, a width that does not divide `K`, fewer than two
+/// charts, or more blocks than `max_charts` with no explicit `blocks`), matching
+/// `atlas_nerve_dict`'s skipped-report contract.
+#[pyfunction(signature = (codes, block_size, activation_threshold = 1.0e-6, blocks = None, max_charts = 16))]
+fn atlas_nerve_diagram<'py>(
+    py: Python<'py>,
+    codes: PyReadonlyArray2<'py, f32>,
+    block_size: usize,
+    activation_threshold: f32,
+    blocks: Option<Vec<usize>>,
+    max_charts: usize,
+) -> PyResult<Py<PyDict>> {
+    let codes = codes.as_array().to_owned();
+    let report = detach_py_result(py, "atlas_nerve_diagram", move || {
+        atlas_nerve_from_codes(
+            codes.view(),
+            block_size,
+            activation_threshold,
+            blocks.as_deref(),
+            max_charts,
+        )
+    })?;
+    let reason = if block_size == 1 {
+        "scalar block_size == 1 exposes no atlas nerve"
+    } else {
+        "atlas nerve not applicable: block_size must divide K into >= 2 charts \
+         (or supply `blocks`, or raise `max_charts`)"
+    };
+    Ok(atlas_nerve_dict(py, report.as_ref(), reason)?.unbind())
+}
+
 /// Dimension spectrometer: fit a single-atom (`s = 1`) sparse dictionary at each
 /// rung of the doubling ladder `k_min·2^j`, `j = 0..=n_doublings`, and invert the
 /// fitted reconstruction-loss scaling law `L(K) − σ² ∝ K^{-2/d}` into an

@@ -16,10 +16,14 @@ import numpy as np
 import pytest
 
 from gamfit import (
+    atlas_nerve_diagram,
     block_firing_coordinates,
     block_sparse_dictionary_fit,
     compose_contracts,
+    conditional_coactivation_influence,
+    coupling_robustness_certificate,
     dimension_spectrometer,
+    effect_weighted_retention,
     loop_holonomy,
     recover_spikes,
     routability_audit,
@@ -164,3 +168,67 @@ def test_loop_holonomy_smoke():
     reflect = loop_holonomy([(-1, 0.0)], [0.0])
     assert reflect.net_sign == -1
     assert not reflect.is_trivial
+
+
+def test_atlas_nerve_diagram_smoke():
+    # Two b = 2 blocks (K = 4) firing on disjoint rows: a 2-chart nerve.
+    rng = np.random.default_rng(3)
+    n = 64
+    codes = np.zeros((n, 4), dtype=np.float32)
+    codes[: n // 2, 0:2] = rng.standard_normal((n // 2, 2)).astype(np.float32) + 1.0
+    codes[n // 2 :, 2:4] = rng.standard_normal((n // 2, 2)).astype(np.float32) + 1.0
+    report = atlas_nerve_diagram(codes, block_size=2)
+    assert report.computed
+    assert report.chart_blocks == [0, 1]
+    assert set(report.betti) == {"b0", "b1", "b2"}
+    assert report.betti["b0"] >= 1
+    assert report.n_vertices >= 2
+    assert report.n_edges >= 1
+    assert math.isfinite(report.max_filtration)
+    assert isinstance(report.note, str)
+    # A scalar (block_size == 1) shape is not applicable: computed is False.
+    skipped = atlas_nerve_diagram(codes, block_size=1)
+    assert not skipped.computed
+    assert skipped.reason is not None
+
+
+def test_conditional_coactivation_influence_smoke():
+    # gate_j fires on exactly the rows where gate_i fires -> P(j|i) == 1.
+    active_i = [True, True, False, True, False]
+    active_j = [True, True, False, True, False]
+    rows = [0, 1, 2, 3, 4]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    report = conditional_coactivation_influence(active_i, active_j, rows, weights)
+    assert report.conditional_probability == pytest.approx(1.0)
+    assert report.active_mass_i > 0.0
+    assert len(report.psi) == len(rows)
+    assert len(report.normalized_weights) == len(rows)
+    assert all(math.isfinite(v) for v in report.psi)
+
+
+def test_coupling_robustness_certificate_smoke():
+    rng = np.random.default_rng(4)
+    gate_i = rng.standard_normal(48)
+    gate_j = gate_i + 0.1 * rng.standard_normal(48)  # strongly coupled
+    rows = list(range(48))
+    weights = [1.0] * 48
+    cert = coupling_robustness_certificate(gate_i, gate_j, rows, weights, epsilon=0.05)
+    assert -1.0 <= cert.rho <= 1.0
+    assert cert.rho > 0.0
+    assert cert.robustness_radius_epsilon >= 0.0
+    assert cert.epsilon == pytest.approx(0.05)
+    assert math.isfinite(cert.worst_case_coupling)
+    assert len(cert.psi) == len(rows)
+
+
+def test_effect_weighted_retention_smoke():
+    # atom 0: variance charge clears its budget -> retained_by_variance.
+    # atom 1: only Fisher-effect firings -> retained_by_effect (or not), never crashes.
+    variance = [(5.0, 1.0), None]
+    firings = [(0, 0.0), (1, 8.0), (1, 8.0)]
+    atoms = effect_weighted_retention(variance, firings)
+    assert len(atoms) == 2
+    assert atoms[0].atom == 0
+    assert atoms[0].retained_by_variance
+    assert atoms[0].retained
+    assert isinstance(atoms[1].retained, bool)

@@ -551,6 +551,74 @@ def loop_holonomy(
 
 
 # --------------------------------------------------------------------------- #
+# Atlas nerve (Čech-nerve Betti signature over block charts)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class AtlasNerveDiagram:
+    """Čech-nerve reduction of a block-sparse dictionary's per-block charts.
+
+    ``computed`` is False for shapes the nerve does not apply to (scalar
+    ``block_size == 1``, a width that does not divide ``K`` into >= 2 charts, or
+    more blocks than ``max_charts`` without an explicit ``blocks`` list), in which
+    case only ``reason`` is populated. When ``computed`` is True, ``betti`` is the
+    ``{b0, b1, b2}`` signature and the simplex counts / covering side describe the
+    reduced nerve complex.
+    """
+
+    computed: bool
+    reason: str | None = None
+    chart_blocks: list[int] | None = None
+    betti: dict[str, int | None] | None = None
+    n_vertices: int | None = None
+    n_edges: int | None = None
+    n_triangles: int | None = None
+    n_tetrahedra: int | None = None
+    sampled_support_size: int | None = None
+    covering_side: str | None = None
+    max_filtration: float | None = None
+    note: str | None = None
+
+
+def atlas_nerve_diagram(
+    codes: Any,
+    block_size: int,
+    *,
+    activation_threshold: float = 1.0e-6,
+    blocks: Any | None = None,
+    max_charts: int = 16,
+) -> AtlasNerveDiagram:
+    """Build the atlas-nerve Betti signature from a dense ``N x K`` block-sparse
+    code matrix, one chart per ``block_size``-wide block. Returns a report whose
+    ``computed`` flag is False (with a ``reason``) for shapes the nerve does not
+    apply to."""
+    cod = _as_2d_f32(codes, "codes")
+    block_list = None if blocks is None else [int(b) for b in blocks]
+    payload = rust_module().atlas_nerve_diagram(
+        cod, int(block_size), float(activation_threshold), block_list, int(max_charts)
+    )
+    if not bool(payload["computed"]):
+        return AtlasNerveDiagram(computed=False, reason=str(payload["reason"]))
+    betti = payload["betti"]
+    return AtlasNerveDiagram(
+        computed=True,
+        chart_blocks=[int(b) for b in payload["chart_blocks"]],
+        betti={
+            "b0": int(betti["b0"]),
+            "b1": int(betti["b1"]),
+            "b2": None if betti["b2"] is None else int(betti["b2"]),
+        },
+        n_vertices=int(payload["n_vertices"]),
+        n_edges=int(payload["n_edges"]),
+        n_triangles=int(payload["n_triangles"]),
+        n_tetrahedra=int(payload["n_tetrahedra"]),
+        sampled_support_size=int(payload["sampled_support_size"]),
+        covering_side=str(payload["covering_side"]),
+        max_filtration=float(payload["max_filtration"]),
+        note=str(payload["note"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Coactivation conditionality (influence function + robustness certificate)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)

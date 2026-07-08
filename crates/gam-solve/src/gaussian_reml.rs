@@ -2691,6 +2691,133 @@ impl GaussianRemlPrepared {
     }
 }
 
+/// One penalty block for the cyclic multi-λ Demmler–Reinsch solver: a
+/// block-local penalty `local` (S_j restricted to `col_range`) placed at
+/// `col_range` in the global p-dimensional coefficient vector.
+pub struct GaussianRemlLambdaBlock<'a> {
+    pub col_range: std::ops::Range<usize>,
+    pub local: ArrayView2<'a, f64>,
+}
+
+/// ρ-space fixed-point tolerance for the cyclic solver: a coordinate that
+/// moves by less than this is at its conditional optimum. ρ = ln λ is O(1)–O(10),
+/// so `1e-6` pins λ̂ to ~6 significant figures — far tighter than a seed needs.
+const CYCLIC_RHO_TOL: f64 = 1.0e-6;
+/// Safety cap on the number of full coordinate sweeps. Each sweep replaces every
+/// ρ_k with the EXACT conditional global minimiser of the joint REML (others
+/// held fixed), so the joint criterion decreases monotonically and the sweep
+/// count is the real stop; this only bounds pathological non-termination.
+const CYCLIC_MAX_PASSES: usize = 16;
+
+/// Cyclic exact multi-λ Gaussian-identity REML via coordinate-wise
+/// Demmler–Reinsch — the multi-λ generalisation of the single-λ closed form.
+///
+/// The joint profiled REML `V(ρ_1,…,ρ_K)` is minimised by cyclic coordinate
+/// descent where each 1-D subproblem is solved GLOBALLY, not descended. Holding
+/// the other blocks fixed, the penalized Hessian is `H = A_k + λ_k S_k` with the
+/// folded metric `A_k = XᵀWX + Σ_{j≠k} λ_j S_j`; every ρ_k-dependent term of `V`
+/// (log|H|, the profiled dispersion, and −½log|λ_k S_k|₊ + rank_k·ρ_k) is exactly
+/// the single-penalty closed-form scalar in the `(S_k, A_k)` pencil eigenbasis,
+/// with the other blocks' log-determinants constant in ρ_k. So diagonalising the
+/// pencil `(S_k, A_k)` once and selecting the global minimiser of that scalar is
+/// the EXACT conditional minimiser of the joint `V` over ρ_k — no per-coordinate
+/// Newton, hence no per-coordinate high-λ shelf trap. Each sweep is a global move
+/// on every coordinate, so `V` decreases monotonically and the fixed point is a
+/// coordinate-wise global optimum of the joint criterion.
+///
+/// Returns the per-block ρ vector; consumed as a scored seed for the multi-λ
+/// outer search (keep-best-by-cost guarantees it never worsens a fit).
+pub fn gaussian_reml_cyclic_multi_lambda_rho(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty_blocks: &[GaussianRemlLambdaBlock<'_>],
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: &[f64],
+    bounds: (f64, f64),
+) -> Result<Vec<f64>, EstimationError> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let k = penalty_blocks.len();
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let (lo, hi) = if bounds.0 <= bounds.1 {
+        bounds
+    } else {
+        (bounds.1, bounds.0)
+    };
+    let weight = gaussian_reml_weights(n, weights)?;
+    let n_effective = effective_observation_count(weight.view());
+    let y2 = y.insert_axis(Axis(1));
+    if y2.nrows() != n {
+        crate::bail_invalid_estim!("Gaussian REML cyclic: X has {n} rows but y has {}", y2.nrows());
+    }
+    let xtwy = dense_xt_diag_y(x, weight.view(), y2.view());
+    let ywy_val: f64 = (0..n).map(|row| weight[row] * y2[[row, 0]] * y2[[row, 0]]).sum();
+    let ywy = Array1::from_elem(1, ywy_val);
+    let xtwx = dense_xt_diag_x(x, weight.view());
+
+    // Pre-scatter each block penalty to full p×p once (reused every sweep).
+    let mut s_full: Vec<Array2<f64>> = Vec::with_capacity(k);
+    for block in penalty_blocks {
+        let mut s = Array2::<f64>::zeros((p, p));
+        let r = block.col_range.clone();
+        if r.end > p || block.local.nrows() != r.len() || block.local.ncols() != r.len() {
+            crate::bail_invalid_estim!("Gaussian REML cyclic: penalty block shape/range mismatch");
+        }
+        for (li, gi) in r.clone().enumerate() {
+            for (lj, gj) in r.clone().enumerate() {
+                s[[gi, gj]] = block.local[[li, lj]];
+            }
+        }
+        s_full.push(s);
+    }
+
+    // Seed ρ from the caller's per-block hint (clamped); pad/truncate to k.
+    let mut rho: Vec<f64> = (0..k)
+        .map(|j| init_rho.get(j).copied().unwrap_or(0.0).clamp(lo, hi))
+        .collect();
+
+    for _pass in 0..CYCLIC_MAX_PASSES {
+        let mut max_delta = 0.0_f64;
+        for kk in 0..k {
+            // Fold the other blocks' current λ into the metric A_k.
+            let mut a = xtwx.clone();
+            for (j, s_j) in s_full.iter().enumerate() {
+                if j != kk {
+                    a.scaled_add(rho[j].exp(), s_j);
+                }
+            }
+            // Diagonalise the (S_k, A_k) pencil; a non-PD metric (singular
+            // folded system) skips this coordinate for the sweep.
+            let cache = match gaussian_reml_eigen_cache_from_xtwx(a, s_full[kk].view(), None) {
+                Ok(cache) => cache,
+                Err(_) => continue,
+            };
+            if n_effective <= cache.nullity {
+                continue;
+            }
+            let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
+            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+            let prepared = GaussianRemlPrepared {
+                cache,
+                ywy: ywy.clone(),
+                projected_rhs_squared,
+                projected_rhs,
+                n_effective,
+                n_outputs: 1,
+            };
+            let new_rho = optimize_rho(&prepared, Some(rho[kk]))?.clamp(lo, hi);
+            max_delta = max_delta.max((new_rho - rho[kk]).abs());
+            rho[kk] = new_rho;
+        }
+        if max_delta < CYCLIC_RHO_TOL {
+            break;
+        }
+    }
+    Ok(rho)
+}
+
 fn optimize_rho(
     prepared: &GaussianRemlPrepared,
     init_rho: Option<f64>,

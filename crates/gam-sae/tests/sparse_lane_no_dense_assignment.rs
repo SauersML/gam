@@ -12,6 +12,9 @@
 //! research / certification path (which legitimately builds `SaeAssignment` at
 //! K > P for small N) — that path lives in the manifold engine, not here.
 
+use gam_sae::front_door::{admit_dense_certification, admit_sae_fit, SaeFitLane};
+use gam_sae::sparse_dict::{fit_sparse_dictionary, SparseDictConfig};
+use ndarray::Array2;
 use std::path::PathBuf;
 
 /// Drop every `#[cfg(test)]`-guarded item from Rust source, returning only the
@@ -126,4 +129,59 @@ fn sparse_lane_constructs_no_dense_assignment() {
          found {} offender(s): {offenders:?}",
         offenders.len()
     );
+}
+
+/// Runtime lock (complements the static source scan): at a large-`K` shape
+/// (`K ≫ P`) the front door demotes to the sparse-code lane, the dense-engine
+/// guard REFUSES, and a real `fit_sparse_dictionary` returns fixed-width sparse
+/// state `N×s` — never the dense `N×K` assignment the front door exists to avoid.
+#[test]
+fn large_k_sparse_fit_stays_fixed_width_and_never_materializes_dense_n_by_k() {
+    // A wildly overcomplete shape: K = 256 atoms into a P = 8 response. The dense
+    // assignment N·K would be 32× the response scale N·P, so this is squarely the
+    // sparse lane the guard reserves the dense engine against.
+    let n_obs = 96usize;
+    let p_out = 8usize;
+    let k_atoms = 256usize;
+    let active = 4usize;
+
+    // Front-door admission: this shape routes to sparse codes, and the dense-engine
+    // guard refuses it, pointing the caller at the sparse-code lane.
+    let admission = admit_sae_fit(n_obs, p_out, k_atoms).expect("admission");
+    assert_eq!(admission.lane, SaeFitLane::SparseCodes);
+    let refusal = admit_dense_certification(n_obs, p_out, k_atoms)
+        .expect_err("dense engine must refuse the K > P shape");
+    assert!(
+        refusal.contains("sparse-code lane"),
+        "refusal must point at the sparse-code lane; got: {refusal}"
+    );
+
+    // Deterministic planted data: each row is a scaled copy of one of `p_out`
+    // orthonormal axes so the fit has real structure to route (no RNG dependency).
+    let mut x = Array2::<f32>::zeros((n_obs, p_out));
+    for row in 0..n_obs {
+        let axis = row % p_out;
+        x[[row, axis]] = 1.0 + 0.01 * (row / p_out) as f32;
+    }
+
+    let config = SparseDictConfig {
+        active,
+        max_epochs: 5,
+        ..SparseDictConfig::new(k_atoms)
+    };
+    let fit = fit_sparse_dictionary(x.view(), &config).expect("sparse dictionary fit");
+
+    // The whole point: the fitted routing state is fixed-width sparse `N×s`, with
+    // `s = min(active, K) ≪ K`. It is NEVER an `N×K` dense assignment.
+    assert_eq!(fit.active, active.min(k_atoms));
+    assert_eq!(fit.indices.dim(), (n_obs, fit.active));
+    assert_eq!(fit.codes.dim(), (n_obs, fit.active));
+    assert!(
+        fit.indices.ncols() < k_atoms,
+        "sparse routing width {} must be ≪ K = {k_atoms} — an N×K state is the demoted dense lane",
+        fit.indices.ncols()
+    );
+    // The decoder is `K×P` (the dictionary itself), the only K-scaled state — and it
+    // is P-wide, not N-wide, so no `N×K` object exists anywhere in the fit.
+    assert_eq!(fit.decoder.dim(), (k_atoms, p_out));
 }

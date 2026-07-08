@@ -668,3 +668,512 @@ fn graph_union(parent: &mut [usize], a: usize, b: usize) {
         parent[rb] = ra;
     }
 }
+
+// ===========================================================================
+// SPECTRAL DECODE — the open-world atom's basis and out-of-sample coordinate.
+//
+// The learned graph atom certifies and prices topology (Betti read-out, named-
+// shape MDL) but by itself cannot *reconstruct*: it has no basis `Φ` and no
+// per-row coordinate. The spectral decode closes that gap without leaving the
+// currency the atom already uses:
+//
+//   * BASIS — the leading `q` non-trivial eigenvectors of the SAME survived,
+//     ARD-weighted Laplacian `L_W` that assembles the smoothness penalty. In
+//     that eigenbasis the Dirichlet form IS the penalty: `Φᵀ L_W Φ = diag(λ)`
+//     (a diagonalisation, not a parallel computation) — see
+//     [`GraphSpectralBasis::penalty`].
+//   * COORDINATE — a differentiable Nyström (geometric-harmonics) extension of
+//     those eigenvectors to any out-of-sample row `z`, with an analytic jet.
+//   * RACE — a decodable candidate ([`SpectralGraphRaceCandidate`]) presenting
+//     the same {basis eval, penalty, jet, rank charge} interface the typed
+//     atoms hand the birth topology race.
+// ===========================================================================
+
+/// Upper cap on the spectral decode dimension `q`. The eigengap rule
+/// ([`select_spectral_q`]) never keeps more than this many non-trivial modes:
+/// a decode coordinate is meant to be a *small* intrinsic chart (a circle is
+/// `q = 2`, a torus `q = 4`), and the pricing charges every kept mode
+/// ([`spectral_decode_rank_charge`]), so an unbounded `q` would both defeat the
+/// compression story and make the Nyström jet needlessly wide.
+pub const SPECTRAL_DECODE_MAX_Q: usize = 8;
+
+/// Rank charge of a `q`-dimensional spectral decode under the graph atom's own
+/// currency. The atom prices one graph edge at `0.5·d_eff·ln(n_eff)`
+/// ([`graph_edge_rank_charge`]); a spectral decode's `d_eff` is the number of
+/// decode coordinates `q` (each eigenvector is one independent latent axis the
+/// reconstruction spends), so the charge is the identical BIC/Laplace form with
+/// `q` in the `d_eff` slot. Reported by [`GraphSpectralBasis::rank_charge_dof`]
+/// and carried on [`SpectralGraphRaceCandidate`] so the race compares the
+/// spectral alternative against the typed atoms in one commensurable currency.
+pub fn spectral_decode_rank_charge(n_eff: f64, q: usize) -> f64 {
+    0.5 * q as f64 * n_eff.max(2.0).ln()
+}
+
+/// Eigengap rule for the spectral decode dimension `q`.
+///
+/// `mu` is the ascending list of *non-trivial* Laplacian eigenvalues (the
+/// `b0` near-zero constant-per-component modes already stripped). We keep the
+/// number of leading modes that sits just before the largest **multiplicative**
+/// spectral gap: `q = argmax_{1 ≤ k < cap} μ_{k+1} / μ_k`, with
+/// `cap = min(mu.len(), SPECTRAL_DECODE_MAX_Q)`.
+///
+/// The ratio (not the additive gap `μ_{k+1} − μ_k`) is used because it is
+/// scale-free: multiplying every edge precision by a constant rescales `L_W`
+/// and every eigenvalue by that constant, and the ratio is invariant, so the
+/// selected `q` does not drift with the ARD precisions' overall magnitude.
+///
+/// For a clean cycle (a circle) the first non-trivial eigenvalue is *doubly
+/// degenerate* — the `[cos θ, sin θ]` pair — so `μ_2/μ_1 ≈ 1` while
+/// `μ_3/μ_2 ≈ (1−cos 4π/N)/(1−cos 2π/N) ≈ 4`; the largest gap is after the
+/// pair, giving `q = 2` (the minimal embedding dimension of `S¹`). A path /
+/// interval has a single dominant Fiedler mode and a large `μ_2/μ_1`, giving
+/// `q = 1`.
+fn select_spectral_q(mu: &[f64], q_max: usize) -> usize {
+    let cap = q_max.min(mu.len());
+    if cap <= 1 {
+        return cap.max(1);
+    }
+    let tiny = f64::MIN_POSITIVE;
+    let mut best_q = 1usize;
+    let mut best_ratio = f64::NEG_INFINITY;
+    for k in 1..cap {
+        let ratio = mu[k] / mu[k - 1].max(tiny);
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best_q = k;
+        }
+    }
+    best_q
+}
+
+/// The eigengap-selected spectral decode basis of a learned graph atom: the
+/// leading `q` non-trivial eigenvectors of the survived weighted Laplacian
+/// `L_W`, evaluated at the graph vertices, together with the eigenvalues that
+/// ARE the Dirichlet penalty in this basis and the Gaussian-affinity Nyström
+/// data that extends it out of sample.
+#[derive(Debug, Clone)]
+pub struct GraphSpectralBasis {
+    /// `Φ` at the graph vertices, shape `(anchors × q)`. Column `k` is the
+    /// unit-norm eigenvector `v_k` of `L_W` at the `k`-th smallest non-trivial
+    /// eigenvalue.
+    basis_values: Array2<f64>,
+    /// `λ_1 ≤ … ≤ λ_q`, the non-trivial Laplacian eigenvalues. `diag(λ)` is
+    /// literally `Φᵀ L_W Φ` — the Dirichlet form of the basis columns and the
+    /// decode penalty are the SAME object.
+    eigenvalues: Vec<f64>,
+    /// Training-vertex embeddings `x_i`, shape `(anchors × r)`; the Nyström
+    /// anchors the out-of-sample kernel weights against.
+    anchor_embeddings: Array2<f64>,
+    /// Gaussian affinity bandwidth `ε` — the median squared length of the
+    /// surviving graph edges (the same median-neighbour-distance rule the
+    /// Laplacian-eigenmap seed uses, `gam_geometry::latent_seed`).
+    bandwidth: f64,
+    /// Effective sample mass carried from the atom, for the decode rank charge.
+    n_eff: f64,
+}
+
+impl GraphSpectralBasis {
+    /// Selected decode dimension `q`.
+    pub fn selected_q(&self) -> usize {
+        self.eigenvalues.len()
+    }
+
+    /// The kept non-trivial Laplacian eigenvalues `λ_1 ≤ … ≤ λ_q`.
+    pub fn eigenvalues(&self) -> &[f64] {
+        &self.eigenvalues
+    }
+
+    /// The decode basis `Φ` at the graph vertices, shape `(anchors × q)`.
+    pub fn vertex_basis(&self) -> ArrayView2<'_, f64> {
+        self.basis_values.view()
+    }
+
+    /// Nyström Gaussian bandwidth `ε`.
+    pub fn bandwidth(&self) -> f64 {
+        self.bandwidth
+    }
+
+    /// The decode penalty in the spectral basis: `diag(λ)`, shape `(q × q)`.
+    ///
+    /// This is not a second computation of the roughness — it is exactly the
+    /// atom's Dirichlet form `Φᵀ L_W Φ` read in the eigenbasis, where `L_W` is
+    /// the *same* survived weighted Laplacian [`LearnedGraphAtom::surviving_laplacian`]
+    /// whose Kronecker lift `L_W ⊗ I_r` is the atom's smoothness penalty
+    /// [`LearnedGraphAtom::surviving_penalty_op`]. Diagonalising `L_W` on its
+    /// own eigenvectors returns `diag(λ)`, so the penalty a decode consumer
+    /// reads here and the penalty the graph atom prices are one operator.
+    pub fn penalty(&self) -> Array2<f64> {
+        let q = self.selected_q();
+        let mut penalty = Array2::<f64>::zeros((q, q));
+        for k in 0..q {
+            penalty[[k, k]] = self.eigenvalues[k];
+        }
+        penalty
+    }
+
+    /// The decode rank charge `0.5·q·ln(n_eff)` — see
+    /// [`spectral_decode_rank_charge`].
+    pub fn rank_charge_dof(&self) -> f64 {
+        spectral_decode_rank_charge(self.n_eff, self.selected_q())
+    }
+
+    /// Out-of-sample decode coordinate `φ(z) ∈ ℝ^q` for a single query row `z`
+    /// (`r` ambient features) plus its analytic jet `∂φ/∂z` (`q × r`).
+    pub fn nystrom_coordinate(&self, z: &[f64]) -> Result<(Vec<f64>, Array2<f64>), String> {
+        let r = self.anchor_embeddings.ncols();
+        if z.len() != r {
+            return Err(format!(
+                "GraphSpectralBasis::nystrom_coordinate: query has {} features but graph anchors have {r}",
+                z.len()
+            ));
+        }
+        let query = ArrayView2::from_shape((1, r), z)
+            .map_err(|e| format!("GraphSpectralBasis::nystrom_coordinate: bad query shape: {e}"))?;
+        let (phi, jet) = self.nystrom_coordinates(query)?;
+        let q = self.selected_q();
+        let coord = phi.row(0).to_vec();
+        let mut jac = Array2::<f64>::zeros((q, r));
+        for k in 0..q {
+            for c in 0..r {
+                jac[[k, c]] = jet[[0, k, c]];
+            }
+        }
+        Ok((coord, jac))
+    }
+
+    /// Batched Nyström extension of the decode basis to arbitrary out-of-sample
+    /// rows `points` (`n × r`).
+    ///
+    /// The coordinate is the affinity-weighted (Nadaraya–Watson / geometric-
+    /// harmonics) average of the training eigenvectors,
+    ///
+    /// ```text
+    ///   φ_k(z) = N_k(z) / S(z),
+    ///   N_k(z) = Σ_i w_i(z) Φ[i, k],   S(z) = Σ_i w_i(z),
+    ///   w_i(z) = exp(−‖z − x_i‖² / ε),
+    /// ```
+    ///
+    /// with `ε` the graph's edge-length bandwidth [`Self::bandwidth`]. At a
+    /// training vertex the Gaussian mass concentrates on that vertex, so
+    /// `φ_k(x_j) ≈ Φ[j, k]`, and between vertices it interpolates smoothly — the
+    /// standard Nyström / geometric-harmonics extension of a graph eigenmap.
+    ///
+    /// The jet is analytic (no finite differences). With
+    /// `∂w_i/∂z_c = w_i · (−2 (z_c − x_{i,c}) / ε)`,
+    ///
+    /// ```text
+    ///   ∂φ_k/∂z_c = ( (∂N_k/∂z_c)·S − N_k·(∂S/∂z_c) ) / S²,
+    ///   ∂N_k/∂z_c = Σ_i (∂w_i/∂z_c) Φ[i, k],   ∂S/∂z_c = Σ_i ∂w_i/∂z_c.
+    /// ```
+    ///
+    /// Returns `(φ, ∂φ/∂z)` with shapes `(n × q)` and `(n × q × r)`.
+    pub fn nystrom_coordinates(
+        &self,
+        points: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let anchors = self.anchor_embeddings.nrows();
+        let r = self.anchor_embeddings.ncols();
+        let q = self.selected_q();
+        if points.ncols() != r {
+            return Err(format!(
+                "GraphSpectralBasis::nystrom_coordinates: query has {} features but graph anchors have {r}",
+                points.ncols()
+            ));
+        }
+        if points.iter().any(|v| !v.is_finite()) {
+            return Err(
+                "GraphSpectralBasis::nystrom_coordinates: query contains a non-finite value".into(),
+            );
+        }
+        let n = points.nrows();
+        let eps = self.bandwidth;
+        if !(eps > 0.0 && eps.is_finite()) {
+            return Err(format!(
+                "GraphSpectralBasis::nystrom_coordinates: non-positive bandwidth {eps}"
+            ));
+        }
+        let mut phi = Array2::<f64>::zeros((n, q));
+        let mut jet = Array3::<f64>::zeros((n, q, r));
+        let mut w = vec![0.0_f64; anchors];
+        let mut n_k = vec![0.0_f64; q];
+        let mut dw = vec![0.0_f64; anchors];
+        for row in 0..n {
+            // Affinities and the normaliser S(z).
+            let mut s = 0.0_f64;
+            for i in 0..anchors {
+                let mut d2 = 0.0_f64;
+                for c in 0..r {
+                    let d = points[[row, c]] - self.anchor_embeddings[[i, c]];
+                    d2 += d * d;
+                }
+                let wi = (-d2 / eps).exp();
+                w[i] = wi;
+                s += wi;
+            }
+            if !(s > 0.0 && s.is_finite()) {
+                return Err(
+                    "GraphSpectralBasis::nystrom_coordinates: query point has vanishing affinity \
+                     to every anchor (bandwidth underflow)"
+                        .into(),
+                );
+            }
+            // Numerators N_k and the decode coordinate φ_k = N_k / S.
+            for k in 0..q {
+                let mut acc = 0.0_f64;
+                for i in 0..anchors {
+                    acc += w[i] * self.basis_values[[i, k]];
+                }
+                n_k[k] = acc;
+                phi[[row, k]] = acc / s;
+            }
+            // Analytic jet, one ambient channel c at a time.
+            for c in 0..r {
+                let mut ds_c = 0.0_f64;
+                for i in 0..anchors {
+                    let dwi =
+                        w[i] * (-2.0 * (points[[row, c]] - self.anchor_embeddings[[i, c]]) / eps);
+                    dw[i] = dwi;
+                    ds_c += dwi;
+                }
+                for k in 0..q {
+                    let mut dn_kc = 0.0_f64;
+                    for i in 0..anchors {
+                        dn_kc += dw[i] * self.basis_values[[i, k]];
+                    }
+                    jet[[row, k, c]] = (dn_kc * s - n_k[k] * ds_c) / (s * s);
+                }
+            }
+        }
+        Ok((phi, jet))
+    }
+
+    /// The Nyström extension as a first-class [`SaeBasisEvaluator`], so the
+    /// decode presents the exact {basis values, jet} interface the typed atoms'
+    /// evaluators do. Its input coordinates are the ambient row embeddings `z`
+    /// (`r` features), its output the `q`-dimensional decode coordinate.
+    pub fn evaluator(&self) -> Arc<dyn SaeBasisEvaluator> {
+        Arc::new(NystromSpectralEvaluator {
+            basis: self.clone(),
+        })
+    }
+}
+
+/// [`SaeBasisEvaluator`] adapter over a [`GraphSpectralBasis`]: `evaluate`
+/// returns the Nyström decode coordinate `φ(z)` and its analytic first jet
+/// `∂φ/∂z` at each queried ambient row `z`. It declares no analytic second /
+/// third jet (`None`): the spectral decode's roughness is the graph Dirichlet
+/// form `diag(λ)` carried directly on [`GraphSpectralBasis::penalty`], not a
+/// second-jet curvature Gram, so no consumer needs a Nyström Hessian and the
+/// honest capability declaration is absence.
+#[derive(Debug, Clone)]
+pub struct NystromSpectralEvaluator {
+    basis: GraphSpectralBasis,
+}
+
+impl SaeBasisEvaluator for NystromSpectralEvaluator {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        self.basis.nystrom_coordinates(coords)
+    }
+
+    fn second_jet_dyn(&self, _coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        None
+    }
+
+    fn third_jet_dyn(
+        &self,
+        _coords: ArrayView2<'_, f64>,
+    ) -> Option<Result<ndarray::Array5<f64>, String>> {
+        None
+    }
+}
+
+/// A spectral-graph decode candidate shaped for the birth topology race.
+///
+/// This mirrors the private `TopologyRaceFit` shape the typed candidates carry
+/// in [`crate::structure_harvest`] — evaluator, basis kind, latent manifold,
+/// decode design `Φ`, jet `∂Φ`, penalized decoder `B`, roughness penalty — but
+/// for the open-world graph atom, whose penalty is the graph Dirichlet form
+/// `diag(λ)` rather than a basis second-jet Gram.
+///
+/// # Where this plugs into the race
+///
+/// The single call site is
+/// [`crate::structure_harvest::topology_candidates_for_dim`] (crate-internal,
+/// concurrently edited elsewhere, so it is NOT touched here). After that
+/// function builds the typed `TopologyCandidateSpec`s for the born atom's `d_k`,
+/// a spectral candidate is appended when the born atom already carries a
+/// [`LearnedGraphAtom`], by calling
+/// [`LearnedGraphAtom::spectral_race_candidate`] with the birth target and the
+/// per-row ambient embeddings; its `{phi, jet, penalty, rank_charge_dof}` feed
+/// the SAME `TopologyAutoFitEvidence` inputs `fit_topology_candidate` produces —
+/// with `penalty` supplied directly instead of re-derived from a second jet —
+/// and its `evaluator` seeds the born atom's out-of-sample decode. Everything
+/// up to that append (basis, penalty, decoder, jet, charge, evaluator) is
+/// implemented here; only the one `specs.push(...)` line lives across the seam.
+pub struct SpectralGraphRaceCandidate {
+    /// Basis-kind tag; a precomputed decode basis with no closed-form typed
+    /// evaluator family.
+    pub basis_kind: SaeAtomBasisKind,
+    /// The flat `q`-coordinate decode chart the atom carries.
+    pub manifold: LatentManifold,
+    /// Decode dimension `q`.
+    pub latent_dim: usize,
+    /// The ambient row embeddings `z` (`n × r`) the Nyström evaluator reads.
+    pub row_coords: Array2<f64>,
+    /// Decode design `Φ(z)` at the rows (`n × q`).
+    pub phi: Array2<f64>,
+    /// Decode design jet `∂Φ/∂z` (`n × q × r`).
+    pub jet: Array3<f64>,
+    /// Dirichlet-penalized decoder `B` (`q × p`) at the REML-optimal `λ̂` on the
+    /// spectral penalty — fit through the SAME closed-form entry point the typed
+    /// candidates use, so the decode is priced commensurably.
+    pub decoder: Array2<f64>,
+    /// The decode penalty `diag(λ)` (`q × q`) — the graph Dirichlet form.
+    pub penalty: Array2<f64>,
+    /// The Nyström out-of-sample decode map.
+    pub evaluator: Arc<dyn SaeBasisEvaluator>,
+    /// The decode rank charge `0.5·q·ln(n_eff)`.
+    pub rank_charge_dof: f64,
+}
+
+impl LearnedGraphAtom {
+    /// Median squared length of the surviving graph edges — the Nyström Gaussian
+    /// bandwidth `ε`. Mirrors the median-neighbour-distance bandwidth the
+    /// Laplacian-eigenmap seed uses (`gam_geometry::latent_seed`): a scale-free,
+    /// data-driven choice that keeps the out-of-sample affinities matched to the
+    /// graph's own locality.
+    fn surviving_edge_bandwidth(&self) -> Result<f64, String> {
+        let fiber_rank = self.fiber_rank();
+        let mut lengths = Vec::new();
+        for (idx, edge) in self.candidate_edges.iter().enumerate() {
+            if !self.surviving_edges[idx] {
+                continue;
+            }
+            let mut d2 = 0.0_f64;
+            for c in 0..fiber_rank {
+                let d = self.anchor_embeddings[[edge.a, c]] - self.anchor_embeddings[[edge.b, c]];
+                d2 += d * d;
+            }
+            lengths.push(d2);
+        }
+        if lengths.is_empty() {
+            return Err(
+                "LearnedGraphAtom::spectral_decode_basis: no surviving edge to set the Nyström \
+                 bandwidth"
+                    .into(),
+            );
+        }
+        lengths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = lengths[lengths.len() / 2];
+        if !(median > 0.0 && median.is_finite()) {
+            return Err(format!(
+                "LearnedGraphAtom::spectral_decode_basis: degenerate surviving-edge bandwidth {median}"
+            ));
+        }
+        Ok(median)
+    }
+
+    /// Build the eigengap-selected [`GraphSpectralBasis`] from the survived,
+    /// ARD-weighted Laplacian `L_W`.
+    ///
+    /// Diagonalises the SAME `L_W = ` [`Self::surviving_laplacian`] the atom's
+    /// smoothness penalty lifts, strips the `b0` near-zero constant-per-component
+    /// null modes, keeps the leading `q` non-trivial eigenvectors chosen by
+    /// [`select_spectral_q`], and reports their eigenvalues as the decode penalty
+    /// (`diag(λ)`). Errors when the survived graph has no non-trivial mode (every
+    /// vertex isolated, or a single constant component) — such a graph has no
+    /// continuous coordinate to decode.
+    pub fn spectral_decode_basis(&self) -> Result<GraphSpectralBasis, String> {
+        let anchors = self.anchors();
+        let laplacian = self.surviving_laplacian();
+        let (evals, evecs) = laplacian.eigh(Side::Lower).map_err(|e| {
+            format!("LearnedGraphAtom::spectral_decode_basis: Laplacian eigendecomposition failed: {e}")
+        })?;
+        // Ascending eigenvalue order (faer does not guarantee it).
+        let mut order: Vec<usize> = (0..evals.len()).collect();
+        order.sort_by(|&a, &b| {
+            evals[a]
+                .partial_cmp(&evals[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let lambda_max = order.last().map(|&i| evals[i]).unwrap_or(0.0).max(0.0);
+        // Trivial (null) modes: one constant per connected component, at ~0
+        // eigenvalue. Strip them with a relative threshold.
+        let zero_tol = (lambda_max * 1e-8).max(1e-12);
+        let nontrivial: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| evals[i] > zero_tol)
+            .collect();
+        if nontrivial.is_empty() {
+            return Err(
+                "LearnedGraphAtom::spectral_decode_basis: survived graph has no non-trivial \
+                 Laplacian mode to decode (all vertices isolated or a single constant component)"
+                    .into(),
+            );
+        }
+        let sorted_mu: Vec<f64> = nontrivial.iter().map(|&i| evals[i]).collect();
+        let q = select_spectral_q(&sorted_mu, SPECTRAL_DECODE_MAX_Q);
+        let mut basis_values = Array2::<f64>::zeros((anchors, q));
+        for (col, &eig_idx) in nontrivial.iter().take(q).enumerate() {
+            for v in 0..anchors {
+                basis_values[[v, col]] = evecs[[v, eig_idx]];
+            }
+        }
+        let eigenvalues: Vec<f64> = sorted_mu.iter().take(q).copied().collect();
+        let bandwidth = self.surviving_edge_bandwidth()?;
+        Ok(GraphSpectralBasis {
+            basis_values,
+            eigenvalues,
+            anchor_embeddings: self.anchor_embeddings.clone(),
+            bandwidth,
+            n_eff: self.n_eff,
+        })
+    }
+
+    /// Realise the spectral decode as a birth-race candidate: the eigengap decode
+    /// basis, the Nyström design `Φ(z)` + jet at the birth rows, the graph
+    /// Dirichlet penalty `diag(λ)`, and a REML-optimal Dirichlet-penalized
+    /// decoder fit against `target` (`n × p`) through the same closed-form entry
+    /// point the typed candidates use. See [`SpectralGraphRaceCandidate`] for the
+    /// exact call site this plugs into.
+    pub fn spectral_race_candidate(
+        &self,
+        target: ArrayView2<'_, f64>,
+        row_embeddings: ArrayView2<'_, f64>,
+    ) -> Result<SpectralGraphRaceCandidate, String> {
+        let basis = self.spectral_decode_basis()?;
+        let (phi, jet) = basis.nystrom_coordinates(row_embeddings)?;
+        let n = target.nrows();
+        if phi.nrows() != n {
+            return Err(format!(
+                "LearnedGraphAtom::spectral_race_candidate: {n} targets but {} row embeddings",
+                phi.nrows()
+            ));
+        }
+        let penalty = basis.penalty();
+        let reml = gam_solve::gaussian_reml::gaussian_reml_multi_closed_form(
+            phi.view(),
+            target,
+            penalty.view(),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            format!("LearnedGraphAtom::spectral_race_candidate: REML decode fit: {e:?}")
+        })?;
+        let q = basis.selected_q();
+        Ok(SpectralGraphRaceCandidate {
+            basis_kind: SaeAtomBasisKind::Precomputed("spectral_graph".to_string()),
+            manifold: LatentManifold::Euclidean,
+            latent_dim: q,
+            row_coords: row_embeddings.to_owned(),
+            phi,
+            jet,
+            decoder: reml.coefficients,
+            penalty,
+            evaluator: basis.evaluator(),
+            rank_charge_dof: basis.rank_charge_dof(),
+        })
+    }
+}

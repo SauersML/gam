@@ -1,0 +1,320 @@
+{
+  "flat": [
+    {
+      "bits_per_token": 606.9050971091867,
+      "ev": 0.6480058968079072,
+      "b_amp": 4
+    },
+    {
+      "bits_per_token": 670.9050971091867,
+      "ev": 0.7054945961646943,
+      "b_amp": 6
+    },
+    {
+      "bits_per_token": 734.9050971091867,
+      "ev": 0.7091305735944813,
+      "b_amp": 8
+    },
+    {
+      "bits_per_token": 862.9050971091867,
+      "ev": 0.7093685136739756,
+      "b_amp": 12
+    },
+    {
+      "bits_per_token": 990.9050971091867,
+      "ev": 0.7093694419947447,
+      "b_amp": 16
+    }
+  ],
+  "sweep": [
+    {
+      "edge_min_frac": 0.0005,
+      "threshold": 100,
+      "n_edges_kept": 21,
+      "within_block_edge_frac": 0.08333333333333333,
+      "topology_histogram": {
+        "tree": 1,
+        "path": 2
+      },
+      "size_histogram": {
+        "4": 2,
+        "7": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 3,
+      "log2G": 1.584962500721156,
+      "n_grouped_secant_firings": 20789,
+      "n_flat_firings": 6358422,
+      "frac_firings_secant": 0.0064965625,
+      "n_tokens_with_secant": 14524,
+      "manifold_points": [
+        {
+          "bits_per_token": 731.5428291413857,
+          "ev": 0.7030560052530119,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 731.7507191413857,
+          "ev": 0.7032521108163194,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 987.1270491413857,
+          "ev": 0.7035057794718924,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.7035068233958788,
+      "manifold_maxfidelity_bits": 1243.9586091413858,
+      "recode_distortion_ev_drop": 0.005862622228351766
+    },
+    {
+      "edge_min_frac": 0.0002,
+      "threshold": 40,
+      "n_edges_kept": 138,
+      "within_block_edge_frac": 0.09302325581395349,
+      "topology_histogram": {
+        "graph_b1_8": 1,
+        "tree": 6,
+        "graph_b1_1": 1,
+        "path": 4
+      },
+      "size_histogram": {
+        "4": 6,
+        "5": 3,
+        "6": 1,
+        "9": 1,
+        "35": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 12,
+      "log2G": 3.584962500721156,
+      "n_grouped_secant_firings": 49311,
+      "n_flat_firings": 6301378,
+      "frac_firings_secant": 0.0154096875,
+      "n_tokens_with_secant": 30611,
+      "manifold_points": [
+        {
+          "bits_per_token": 727.4229896499423,
+          "ev": 0.6814796398081361,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 727.9160996499423,
+          "ev": 0.6832247487785739,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 982.4367696499423,
+          "ev": 0.6839666608587784,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.6840272193286818,
+      "manifold_maxfidelity_bits": 1240.4092096499423,
+      "recode_distortion_ev_drop": 0.02534222629554872
+    },
+    {
+      "edge_min_frac": 0.0001,
+      "threshold": 20,
+      "n_edges_kept": 459,
+      "within_block_edge_frac": 0.07624633431085044,
+      "topology_histogram": {
+        "graph_b1_53": 1,
+        "graph_b1_6": 1,
+        "graph_b1_2": 3,
+        "tree": 12,
+        "graph_b1_1": 2,
+        "path": 5
+      },
+      "size_histogram": {
+        "4": 9,
+        "5": 4,
+        "6": 3,
+        "7": 1,
+        "8": 1,
+        "10": 1,
+        "13": 1,
+        "15": 1,
+        "16": 1,
+        "20": 1,
+        "135": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 24,
+      "log2G": 4.584962500721156,
+      "n_grouped_secant_firings": 88595,
+      "n_flat_firings": 6222810,
+      "frac_firings_secant": 0.0276859375,
+      "n_tokens_with_secant": 59110,
+      "manifold_points": [
+        {
+          "bits_per_token": 721.9052842859472,
+          "ev": 0.6267060071658721,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 722.7912342859472,
+          "ev": 0.6379169076797904,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 976.1333842859473,
+          "ev": 0.6383000767959348,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.6388253989437459,
+      "manifold_maxfidelity_bits": 1235.6771842859473,
+      "recode_distortion_ev_drop": 0.07054404668048464
+    },
+    {
+      "edge_min_frac": 5e-05,
+      "threshold": 10,
+      "n_edges_kept": 1459,
+      "within_block_edge_frac": 0.022950819672131147,
+      "topology_histogram": {
+        "graph_b1_4": 2,
+        "graph_b1_3": 4,
+        "graph_b1_2": 7,
+        "graph_b1_1": 9,
+        "tree": 16,
+        "path": 3
+      },
+      "size_histogram": {
+        "4": 13,
+        "5": 8,
+        "6": 3,
+        "7": 4,
+        "8": 4,
+        "10": 2,
+        "11": 1,
+        "13": 2,
+        "14": 1,
+        "15": 1,
+        "16": 1,
+        "31": 1
+      },
+      "n_barycentric_groups": 0,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 41,
+      "log2G": 5.357552004618084,
+      "n_grouped_secant_firings": 50375,
+      "n_flat_firings": 6299250,
+      "frac_firings_secant": 0.0157421875,
+      "n_tokens_with_secant": 39672,
+      "manifold_points": [
+        {
+          "bits_per_token": 727.7080166869514,
+          "ev": 0.6852282711555195,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 728.2117666869514,
+          "ev": 0.6879405331487154,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 982.7005166869513,
+          "ev": 0.6882684927007825,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.6882825109097254,
+      "manifold_maxfidelity_bits": 1240.7155166869513,
+      "recode_distortion_ev_drop": 0.02108693471450518
+    },
+    {
+      "edge_min_frac": 2e-05,
+      "threshold": 4,
+      "n_edges_kept": 7961,
+      "within_block_edge_frac": 0.0024834437086092716,
+      "topology_histogram": {
+        "graph_b1_12": 1,
+        "graph_b1_11": 1,
+        "graph_b1_9": 1,
+        "graph_b1_6": 1,
+        "graph_b1_5": 1,
+        "graph_b1_10": 1,
+        "graph_b1_1": 38,
+        "graph_b1_3": 2,
+        "graph_b1_2": 6,
+        "tree": 96,
+        "path": 96
+      },
+      "size_histogram": {
+        "4": 124,
+        "5": 51,
+        "6": 32,
+        "7": 14,
+        "8": 3,
+        "9": 5,
+        "10": 2,
+        "11": 1,
+        "12": 3,
+        "13": 1,
+        "14": 3,
+        "16": 1,
+        "17": 2,
+        "29": 1,
+        "32": 1
+      },
+      "n_barycentric_groups": 1,
+      "n_cycle_groups": 0,
+      "calendar_cycle_candidates": [],
+      "n_groups": 244,
+      "log2G": 7.930737337562887,
+      "n_grouped_secant_firings": 72850,
+      "n_flat_firings": 6254300,
+      "frac_firings_secant": 0.022765625,
+      "n_tokens_with_secant": 57250,
+      "manifold_points": [
+        {
+          "bits_per_token": 725.4342943330176,
+          "ev": 0.6928918042605776,
+          "b_t": 4,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 726.1627943330176,
+          "ev": 0.6932584093016297,
+          "b_t": 6,
+          "b_amp": 8
+        },
+        {
+          "bits_per_token": 979.9772943330177,
+          "ev": 0.6934786408140593,
+          "b_t": 8,
+          "b_amp": 16
+        }
+      ],
+      "manifold_maxfidelity_ev": 0.6934849738300575,
+      "manifold_maxfidelity_bits": 1238.8912943330176,
+      "recode_distortion_ev_drop": 0.015884471794173072
+    }
+  ],
+  "flat_active_recon_ev": 0.7093694456242305,
+  "N_tokens": 200000,
+  "K": 32000,
+  "active": 32,
+  "log2K": 14.965784284662087
+}
