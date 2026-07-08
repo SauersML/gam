@@ -4472,6 +4472,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(routability_audit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dict_dual_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(audit_sae, module)?)?;
+    module.add_function(wrap_pyfunction!(atlas_nerve_diagram, module)?)?;
     module.add_function(wrap_pyfunction!(separation_limit, module)?)?;
     module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
     module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;
