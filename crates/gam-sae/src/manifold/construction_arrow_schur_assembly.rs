@@ -1296,6 +1296,15 @@ impl SaeManifoldTerm {
                         // ARD on each on-atom coordinate.
                         // For compact layout: only active atoms; coord positions use compact starts.
                         // For dense layout: all atoms; coord positions use coord_offsets.
+                        //
+                        // HT row weighting: the data channel is scaled by `√w_row`
+                        // (curvature ⇒ `w_row`; see the residual seam above), so this
+                        // per-row ARD prior — a genuine per-row prior that shares the
+                        // criterion's `ard_value` energy — must carry the SAME full
+                        // `w_row` on BOTH its gradient (inner-MAP stationarity vs the
+                        // weight-aware `ard_value`) and its curvature (the ½log|H_tt|
+                        // block and its ρ-trace). `None` ⇒ `w_row = 1`, bit-for-bit.
+                        let w_row = row_loss_w.map_or(1.0, |w| w[row]);
                         if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
                             let starts = &layout.coord_starts[row];
@@ -1338,9 +1347,9 @@ impl SaeManifoldTerm {
                                         SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
-                                    block.gt[starts[j] + axis] += prior.grad;
+                                    block.gt[starts[j] + axis] += w_row * prior.grad;
                                     block.htt[[starts[j] + axis, starts[j] + axis]] +=
-                                        prior.hess.max(0.0);
+                                        w_row * prior.hess.max(0.0);
                                 }
                             }
                         } else {
@@ -1370,8 +1379,8 @@ impl SaeManifoldTerm {
                                     );
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
-                                    block.gt[off + axis] += prior.grad;
-                                    block.htt[[off + axis, off + axis]] += prior.hess.max(0.0);
+                                    block.gt[off + axis] += w_row * prior.grad;
+                                    block.htt[[off + axis, off + axis]] += w_row * prior.hess.max(0.0);
                                 }
                             }
                         }

@@ -17,16 +17,24 @@ impl SaeManifoldTerm {
     /// consistent with the actual periodic prior energy rather than the
     /// origin-dependent raw `t²`.
     pub(crate) fn ard_coord_sumsq(&self) -> Vec<Array1<f64>> {
+        // Horvitz–Thompson row weighting: the `‖t‖²` sufficient statistic is the
+        // numerator of the same `α ← n_eff / (Σ sq_equiv + tr H⁻¹)` fixed point the
+        // (now weight-aware) `ard_value` energy defines, so it MUST carry the SAME
+        // per-row inclusion weight `wᵢ` — else the subsampled MacKay/Fellner–Schall
+        // step ranks a different precision than the criterion's energy. `None` ⇒
+        // `w_row = 1`, bit-for-bit the historical sum.
+        let row_w = self.row_loss_weights.as_deref();
         let mut out = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             let d = coord.latent_dim();
             let periods = coord.effective_axis_periods();
             let mut sq = Array1::<f64>::zeros(d);
             for row in 0..coord.n_obs() {
+                let w_row = row_w.map_or(1.0, |w| w[row]);
                 let t = coord.row(row);
                 for axis in 0..d {
                     // `sq_equiv` is independent of `alpha`; pass 1.0.
-                    sq[axis] += ArdAxisPrior::eval(1.0, t[axis], periods[axis]).sq_equiv;
+                    sq[axis] += w_row * ArdAxisPrior::eval(1.0, t[axis], periods[axis]).sq_equiv;
                 }
             }
             out.push(sq);
@@ -357,6 +365,13 @@ impl SaeManifoldTerm {
             ));
         }
         let n = self.n_obs() as f64;
+        // HT row weighting: this is the ρ-derivative of `ard_value` (the `explicit`
+        // outer-gradient channel), so it carries the identical per-row inclusion
+        // weight and effective row count `n_eff = Σᵢ wᵢ` as the energy — otherwise
+        // the analytic gradient desyncs from the (now weight-aware) criterion value
+        // on the subsample. `None` ⇒ `w_row = 1`, `n_eff = n`, historical exactly.
+        let row_w = self.row_loss_weights.as_deref();
+        let n_eff = row_w.map_or(n, |w| w.iter().sum::<f64>());
         let mut out = Vec::with_capacity(self.k_atoms());
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             let d = coord.latent_dim();
@@ -377,11 +392,12 @@ impl SaeManifoldTerm {
                 let period = periods[axis];
                 let mut energy_deriv = 0.0_f64;
                 for row in 0..coord.n_obs() {
+                    let w_row = row_w.map_or(1.0, |w| w[row]);
                     let t = coord.row(row)[axis];
-                    energy_deriv += ArdAxisPrior::eval(alpha, t, period).value;
+                    energy_deriv += w_row * ArdAxisPrior::eval(alpha, t, period).value;
                 }
                 let normalizer_deriv = match period {
-                    None => -0.5 * n,
+                    None => -0.5 * n_eff,
                     Some(p) => {
                         let kappa = std::f64::consts::TAU / p;
                         let eta = alpha / (kappa * kappa);
@@ -390,7 +406,7 @@ impl SaeManifoldTerm {
                         // stays finite for large `η` instead of the `inf/inf =
                         // NaN` that `bessel_i1(η)/bessel_i0(η)` produces (#1113).
                         let ratio = bessel_i0_log_and_ratio(eta).1;
-                        n * eta * (-1.0 + ratio)
+                        n_eff * eta * (-1.0 + ratio)
                     }
                 };
                 atom_out[axis] = energy_deriv + normalizer_deriv;
@@ -415,6 +431,13 @@ impl SaeManifoldTerm {
         let inv_diag = solver
             .latent_inverse_diagonal()
             .map_err(|err| ArrowSchurError::SchurFactorFailed { reason: err })?;
+        // HT row weighting: the assembled per-row ARD curvature `∂H/∂logα` is scaled
+        // by the inclusion weight `wᵢ` (see the assembly seam), and `inv_diag` = the
+        // diagonal of `H⁻¹` already reflects that w-scaled `H`. So each row's trace
+        // contribution `½·(H⁻¹)_ss·(wᵢ·hess)` must carry the SAME `wᵢ` here, or the
+        // ½log|H| gradient desyncs from the assembled Hessian on the subsample.
+        // `None` ⇒ `w_row = 1`, bit-for-bit the historical trace.
+        let row_w = self.row_loss_weights.as_deref();
         let n = self.n_obs();
         let total_t = cache.delta_t_len();
         let coord_offsets = self.assignment.coord_offsets();
@@ -444,6 +467,7 @@ impl SaeManifoldTerm {
         let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
         let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..n {
+            let w_row = row_w.map_or(1.0, |w| w[row]);
             let row_base = cache.row_offsets[row];
             let q = cache.row_dims[row];
             let dirs = cache
@@ -499,7 +523,7 @@ impl SaeManifoldTerm {
                             let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            let hess = prior.hess.max(0.0);
+                            let hess = w_row * prior.hess.max(0.0);
                             let s = block_start + axis;
                             traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
                             traces[k][axis] -= 0.5 * slot_correction(s, hess);
@@ -518,7 +542,7 @@ impl SaeManifoldTerm {
                             let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            let hess = prior.hess.max(0.0);
+                            let hess = w_row * prior.hess.max(0.0);
                             let s = block_start + axis;
                             traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
                             traces[k][axis] -= 0.5 * slot_correction(s, hess);

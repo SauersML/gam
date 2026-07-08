@@ -4538,6 +4538,14 @@ impl SaeManifoldTerm {
             ));
         }
         let n = self.n_obs();
+        // Horvitz–Thompson row weighting (#977 seam): under the outer-criterion
+        // subsample each row carries an un-normalized inverse-inclusion weight
+        // `wᵢ = N/n_sub`, so the per-row prior energy is `Σᵢ wᵢ·V(tᵢ)` and the
+        // precision log-partition normalizer counts `n_eff = Σᵢ wᵢ ≈ N` effective
+        // rows — the HT estimate of the full-`N` ARD prior. `None`/mean-1 weights
+        // give `w_row = 1`, `n_eff = n`, bit-for-bit the historical energy.
+        let row_w = self.row_loss_weights.as_deref();
+        let n_eff = row_w.map_or(n as f64, |w| w.iter().sum::<f64>());
         let mut acc = 0.0;
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             let d = coord.latent_dim();
@@ -4563,8 +4571,9 @@ impl SaeManifoldTerm {
                 let period = periods[axis];
                 let mut energy = 0.0;
                 for row in 0..n {
+                    let w_row = row_w.map_or(1.0, |w| w[row]);
                     let v = coord.row(row)[axis];
-                    energy += ArdAxisPrior::eval(alpha, v, period).value;
+                    energy += w_row * ArdAxisPrior::eval(alpha, v, period).value;
                 }
                 // Negative-log prior for precision alpha. The data-dependent
                 // energy is the (Gaussian or von-Mises) coordinate prior; the
@@ -4578,7 +4587,7 @@ impl SaeManifoldTerm {
                 // normaliser is `-η + log I0(η)` and is exact across the cut.
                 match period {
                     None => {
-                        acc += energy - 0.5 * (n as f64) * log_alpha;
+                        acc += energy - 0.5 * n_eff * log_alpha;
                     }
                     Some(p) => {
                         let kappa = std::f64::consts::TAU / p;
@@ -4586,7 +4595,7 @@ impl SaeManifoldTerm {
                         // Overflow-free `log I0(η)`; `bessel_i0(η).ln()` would be
                         // `+inf` for `η ≳ 709` (#1113).
                         let log_i0 = bessel_i0_log_and_ratio(eta).0;
-                        acc += energy + (n as f64) * (-eta + log_i0);
+                        acc += energy + n_eff * (-eta + log_i0);
                     }
                 }
             }

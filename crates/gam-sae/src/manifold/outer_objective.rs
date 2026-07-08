@@ -2392,7 +2392,15 @@ impl SaeManifoldOuterObjective {
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: dispersion: {e}"))?;
         self.last_loss = Some(loss);
 
-        let n_obs = self.term.n_obs() as f64;
+        // HT effective row count for the ARD MacKay/Fellner–Schall α-step: under the
+        // outer row subsample the α fixed point `α ← φ̂·n_eff/(‖t‖²+tr)` must use the
+        // SAME weighted count `n_eff = Σᵢ wᵢ ≈ N` as the (weight-aware) `ard_value`
+        // normalizer and `ard_coord_sumsq` numerator, or the step ranks a different
+        // precision than the criterion it descends. `None` ⇒ `n_eff = n`, historical.
+        let n_eff = self
+            .term
+            .row_loss_weights()
+            .map_or(self.term.n_obs() as f64, |w| w.iter().sum::<f64>());
         let sumsq = self.term.ard_coord_sumsq();
         let traces = self
             .term
@@ -2474,7 +2482,7 @@ impl SaeManifoldOuterObjective {
                     for (j, &logard_kj) in axis_logard.iter().enumerate() {
                         let denom = sumsq[k][j] + traces[k][j];
                         if denom > 0.0 {
-                            let alpha_new = dispersion * n_obs / denom;
+                            let alpha_new = dispersion * n_eff / denom;
                             if alpha_new.is_finite() && alpha_new > 0.0 {
                                 steps[rho.ard_flat_index(k, j)] = alpha_new.ln() - logard_kj;
                             }
@@ -2497,7 +2505,7 @@ impl SaeManifoldOuterObjective {
                         }
                     }
                     if count > 0 && denom > 0.0 {
-                        let alpha_new = dispersion * n_obs * (count as f64) / denom;
+                        let alpha_new = dispersion * n_eff * (count as f64) / denom;
                         if alpha_new.is_finite() && alpha_new > 0.0 {
                             steps[rho.ard_flat_index(0, axis)] = alpha_new.ln() - shared_logard;
                         }
