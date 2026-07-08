@@ -1439,6 +1439,7 @@ fn extract_spatial_operator_runtime_caches(
                             aniso_log_scales.as_deref(),
                             identifiability_transform.as_ref().map(|z| z.view()),
                             2,
+                            None,
                             &mut BasisWorkspace::default(),
                         )?;
                     (

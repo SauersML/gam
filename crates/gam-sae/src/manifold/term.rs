@@ -98,6 +98,22 @@ pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 /// refine budget — terminating the ill-conditioned crawl early is the goal.
 pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
 
+/// Minimum per-refine-round RELATIVE drop in the KKT stationarity metric
+/// `min(‖g‖, ‖Π⊥gauge g‖)` for a round to count as MATERIAL convergence progress
+/// (#2080). Below this, the inner (t, β) solve is on an asymptotic crawl: a fit
+/// dropping the residual by less than 0.1% per round from an off-optimum seed
+/// (`≈1e-2`) cannot reach the `1e-5` stationarity tolerance within any bounded
+/// refine budget, so the round is NOT productive. When such immaterial rounds
+/// recur for `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` in a row while the
+/// residual is still above tolerance, the undamped-logdet re-convergence takes
+/// its typed non-convergence refusal immediately instead of grinding the full
+/// `64×` progress budget to the same refusal (measured 15–31s per wide-`p` probe,
+/// the #2080 cost wall). This changes NO accepted fit: the KKT gate still returns
+/// `Ok` on a converged solve and the #1051 objective-stall gate still accepts a
+/// numerical fixed point before this check — only the crawl-to-inevitable-refusal
+/// path is short-circuited, with a byte-identical refusal outcome.
+pub(crate) const SAE_MANIFOLD_INNER_REFINE_MATERIAL_PROGRESS_REL: f64 = 1.0e-3;
+
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.

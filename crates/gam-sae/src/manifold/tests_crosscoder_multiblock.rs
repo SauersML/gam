@@ -125,6 +125,67 @@ fn reconstruction_controls() -> TwoBlockRemlControls {
     }
 }
 
+/// TEMP DIAGNOSTIC: with the criterion-monotone λ line search, more sweeps must
+/// NOT diverge (previously sweep 2 sent layer2 EV to −73).
+#[test]
+fn diag_crosscoder_sweep_sensitivity() {
+    let n = 96usize;
+    let p_x = 4usize;
+    let p_2 = 4usize;
+    let sigma_x = 0.03_f64;
+    let sigma_2 = 0.09_f64;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
+    let mut z = Array2::<f64>::zeros((n, p_x));
+    let mut y2 = Array2::<f64>::zeros((n, p_2));
+    let mut nx = noise_stream(0x5eed_2001);
+    let mut n2 = noise_stream(0x5eed_2002);
+    for i in 0..n {
+        let theta = std::f64::consts::TAU * (i as f64 / n as f64);
+        z[[i, 0]] = theta.cos() + sigma_x * nx();
+        z[[i, 1]] = theta.sin() + sigma_x * nx();
+        z[[i, 2]] = 0.5 * (2.0 * theta).cos() + sigma_x * nx();
+        z[[i, 3]] = 0.3 * (2.0 * theta).sin() + sigma_x * nx();
+        y2[[i, 0]] = theta.cos() + sigma_2 * n2();
+        y2[[i, 1]] = 0.8 * theta.sin() + sigma_2 * n2();
+        y2[[i, 2]] = 0.5 * (2.0 * theta).sin() + sigma_2 * n2();
+        y2[[i, 3]] = 0.3 * theta.cos() + sigma_2 * n2();
+    }
+    let p_tot = p_x + p_2;
+    for &sweeps in &[1usize, 2, 3, 10, 30] {
+        let (mut term, mut rho) = build_k1(&evaluator, &coords, p_tot);
+        term.set_guards_enabled(false);
+        let mut blocks = vec![OutputBlock::new("layer2", y2.clone(), 0.0).unwrap()];
+        let ctl = TwoBlockRemlControls {
+            max_sweeps: sweeps,
+            inner_max_iter: 60,
+            step_size: 1.0,
+            ridge_ext_coord: 1e-6,
+            ridge_beta: 1e-6,
+            log_lambda_tol: 1e-3,
+        };
+        let report = term
+            .run_multiblock_reml_fit(z.view(), &mut blocks, &mut rho, None, ctl)
+            .unwrap();
+        let augmented = stack_augmented_target(z.view(), &blocks).unwrap();
+        let fitted = term.try_fitted_for_rho(&rho).unwrap();
+        let ev_a = reconstruction_explained_variance(
+            augmented.slice(ndarray::s![.., ..p_x]),
+            fitted.slice(ndarray::s![.., ..p_x]),
+        )
+        .unwrap();
+        let ev_2 = reconstruction_explained_variance(
+            augmented.slice(ndarray::s![.., p_x..]),
+            fitted.slice(ndarray::s![.., p_x..]),
+        )
+        .unwrap();
+        eprintln!(
+            "DIAG sweeps={sweeps}: anchor_EV={ev_a:.4} layer2_EV={ev_2:.4} logλ2={:.4} conv={}",
+            report.blocks[0].log_lambda, report.converged
+        );
+    }
+}
+
 /// Bit-identical comparison of two f64 matrices (NaN-free by construction here).
 fn bit_identical(a: &Array2<f64>, b: &Array2<f64>) -> bool {
     a.dim() == b.dim() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())

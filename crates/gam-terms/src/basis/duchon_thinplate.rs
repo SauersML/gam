@@ -430,14 +430,18 @@ fn build_duchon_basis_uncached(
         // (`frozen_radial_reparam` already folded above on the replay paths). At
         // that point `kernel_transform` is still the raw `Z`.
         //
-        // The reparam is gated to the native-Gram-only configuration (no active
-        // mass/tension/stiffness operator penalties): those operators build
-        // their own collocation Grams in the un-rotated `Z` frame, so rotating
-        // only the native penalty would desync the operator penalty columns.
-        // Default Duchon terms have mass+tension active, so they deliberately
-        // bypass this fused native-only path; `all_disabled()` is the opt-in
-        // configuration that reaches it.
-        let operators_active = spec.operator_penalties.has_active_operator_penalty();
+        // The reparam is adopted for EVERY configuration, including the default
+        // all-on Hilbert scale (mass+tension active). The frozen `V` is threaded
+        // into the operator collocation builder (`duchon_operator_penalty_candidates`
+        // → `build_duchon_collocation_operator_matriceswithworkspace`) so the
+        // mass/tension blocks are assembled directly in the same `K·Z·V` frame as
+        // the design and the native `Primary` penalty — no design↔penalty desync.
+        // Skipping the reparam whenever operators were active (the old gate) left
+        // the default Duchon on the raw cliff-less Mercer spectrum, so REML
+        // over-selected EDF (a single 2-D bump fit to EDF≈30/49), which in turn
+        // made the fit a knife-edge unstable to ulp-level covariate rotation and
+        // unable to collapse toward the null on an irrelevant covariate. Restoring
+        // the cliff for the default is what makes those recoveries hold.
         // When the fresh data-metric reparam is computed, its `raw` (un-rotated)
         // design is built here from a full `n×k` kernel evaluation. That SAME
         // realized design is the base of the final basis — rotating it by the
@@ -447,7 +451,7 @@ fn build_duchon_basis_uncached(
         // configurations (`all_disabled()`, no frozen reparam), closing their
         // wall-time gap to `thinplate(x, z)` without changing default terms.
         let mut prebuilt_raw_basis: Option<Array2<f64>> = None;
-        if frozen_radial_reparam.is_none() && !operators_active {
+        if frozen_radial_reparam.is_none() {
             let kernel_cols = kernel_transform.ncols();
             if kernel_cols > 0 {
                 // Build the un-rotated constrained kernel design once, take its
@@ -588,6 +592,7 @@ fn build_duchon_basis_uncached(
             effective_nullspace_order,
             aniso.is_some(),
             identifiability_transform.as_ref(),
+            frozen_radial_reparam.as_ref(),
             workspace,
         )?);
     }
@@ -692,6 +697,7 @@ pub fn duchon_penalties_at_length_scale(
             effective_nullspace_order,
             aniso.is_some(),
             identifiability_transform,
+            radial_reparam,
             workspace,
         )?);
     }

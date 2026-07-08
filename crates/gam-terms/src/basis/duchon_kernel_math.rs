@@ -21,6 +21,7 @@ pub fn build_duchon_collocation_operator_matrices(
         aniso_log_scales,
         identifiability_transform,
         max_operator_derivative_order,
+        None,
         &mut workspace,
     )
 }
@@ -76,6 +77,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
     max_operator_derivative_order: usize,
+    radial_reparam: Option<ArrayView2<'_, f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     // The operator design rows are the COLLOCATION points (a density-blind,
@@ -151,7 +153,24 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     } else {
         vec![1.0; p_colloc]
     };
-    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    let mut z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    // #1355 cliff reparam consistency: when the design's constrained kernel
+    // columns are rotated into the data-metric generalized eigenbasis
+    // (`K·Z·V`), the operator collocation designs D0/D1/D2 must live in the SAME
+    // `Z·V` frame or their emitted penalties would penalize the wrong
+    // coefficients (a design↔penalty basis desync). Fold the frozen `V` into `Z`
+    // here so every operator block is assembled directly in the fit-time
+    // `K·Z·V` basis — exactly as the native `Primary` penalty already is. Guard
+    // on the column count: `V` was solved against the design's constrained
+    // kernel dimension (`Z.ncols()` at the design's null-space order); if the
+    // operator margin auto-raised the order the dims differ and `V` does not
+    // apply, so the block is left in the raw `Z` frame (the pre-reparam
+    // behavior, no regression for those configs).
+    if let Some(v) = radial_reparam {
+        if v.nrows() == z.ncols() {
+            z = fast_ab(&z, &v);
+        }
+    }
     // D0/D1/D2 rows = collocation points (`p_colloc`), columns = basis centers
     // (`n_basis`). Gradients/Hessians are taken w.r.t. the EVALUATION point
     // (the collocation row), so `delta = collocation - center`. No symmetry: the

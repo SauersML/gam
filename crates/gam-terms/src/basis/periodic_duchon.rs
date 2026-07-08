@@ -1547,6 +1547,7 @@ pub(crate) fn duchon_operator_penalty_candidates(
     nullspace_order: DuchonNullspaceOrder,
     per_axis_relevance: bool,
     identifiability_transform: Option<&Array2<f64>>,
+    radial_reparam: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let want_mass = matches!(operator_penalties.mass, OperatorPenaltySpec::Active { .. });
@@ -1594,6 +1595,7 @@ pub(crate) fn duchon_operator_penalty_candidates(
         None,
         identifiability_transform.map(|t| t.view()),
         max_op,
+        radial_reparam.map(|v| v.view()),
         workspace,
     )?;
     let kernel_nullspace = ops.kernel_nullspace_transform.as_ref();

@@ -136,6 +136,36 @@ fn sure_correction_matches_fd_divergence_2133() {
     // Residual r_code = f(θ̂) − y (the convention the correction contracts).
     let residual = term.reconstruction_residual(x.view(), &rho).unwrap();
 
+    // DEBUG: localize any htt/c/residual scaling mismatch on the first rows.
+    {
+        let sj = term.atom_second_jets().unwrap();
+        let mut g1 = vec![0.0; p];
+        let mut g2 = vec![0.0; p];
+        let mut a_row = vec![0.0; term.atoms.len()];
+        for i in 0..3 {
+            term.assignment
+                .try_assignments_row_for_rho_into(i, &rho, &mut a_row)
+                .unwrap();
+            eprintln!("[dbg row {i}] a_k(method)={:.4}", a_row[0]);
+            term.atoms[0].fill_decoded_derivative_row(i, 0, &mut g1);
+            term.atoms[0].fill_decoded_second_derivative_row(&sj[0], i, 0, &mut g2);
+            let htt_prod: f64 = g1.iter().map(|v| v * v).sum();
+            let rr: Vec<f64> = (0..p).map(|c| residual[[i, c]]).collect();
+            let c_prod: f64 = g2.iter().zip(rr.iter()).map(|(a, b)| a * b).sum();
+            let fitted_norm: f64 = (0..p)
+                .map(|c| (residual[[i, c]] + x[[i, c]]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            eprintln!(
+                "[dbg row {i}] t_hat={:.4} htt_prod={htt_prod:.3} (const≈{:.3}) c_prod={c_prod:.3} \
+                 |resid|={:.3} |fitted|={fitted_norm:.3}",
+                t_hat[i],
+                (TAU * radius).powi(2),
+                rr.iter().map(|v| v * v).sum::<f64>().sqrt()
+            );
+        }
+    }
+
     // FD divergence of the estimator: perturb each y-entry, re-solve the MAP.
     let eps = 1e-4;
     let mut fd_div = 0.0_f64;
@@ -173,6 +203,53 @@ fn sure_correction_matches_fd_divergence_2133() {
             (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
         gn_div += htt / denom_gn;
         exact_div += htt / denom_full;
+    }
+
+    // Replicate the method loop verbatim over ALL rows with the term's own
+    // primitives, to localize any method-vs-hand discrepancy.
+    {
+        let sj = term.atom_second_jets().unwrap();
+        let mut g1 = vec![0.0; p];
+        let mut g2 = vec![0.0; p];
+        let mut a_row = vec![0.0; term.atoms.len()];
+        let mut replica = 0.0_f64;
+        let alpha0 = SaeManifoldRho::stable_exp_strength(-10.0);
+        for i in 0..n {
+            term.assignment
+                .try_assignments_row_for_rho_into(i, &rho, &mut a_row)
+                .unwrap();
+            let a_k = a_row[0];
+            term.atoms[0].fill_decoded_derivative_row(i, 0, &mut g1);
+            term.atoms[0].fill_decoded_second_derivative_row(&sj[0], i, 0, &mut g2);
+            let htt = a_k * a_k * g1.iter().map(|v| v * v).sum::<f64>();
+            let c = a_k
+                * g2.iter()
+                    .zip((0..p).map(|cc| residual[[i, cc]]))
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+            let v_pp = (alpha0 * (TAU * t_hat[i]).cos()).max(0.0);
+            let denom_gn = htt + v_pp;
+            let denom_full =
+                (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
+            let delta = htt / denom_full - htt / denom_gn;
+            replica += delta;
+            if (167..=169).contains(&i) {
+                let f_hand = f_circle(t_hat[i], radius, p);
+                let fitted: Vec<f64> = (0..p).map(|k| residual[[i, k]] + x[[i, k]]).collect();
+                let g2_hand: Vec<f64> = (0..p).map(|k| -(TAU * TAU) * f_hand[k]).collect();
+                eprintln!(
+                    "[dbg row168] t_hat={:.4}\n  f_hand={:.3?}\n  fitted ={:.3?}\n  \
+                     x      ={:.3?}\n  g2(prim)={:.2?}\n  g2(hand)={:.2?}",
+                    t_hat[i],
+                    &f_hand[..2],
+                    &fitted[..2],
+                    (0..2).map(|k| x[[i, k]]).collect::<Vec<_>>(),
+                    &g2[..2],
+                    &g2_hand[..2],
+                );
+            }
+        }
+        eprintln!("[dbg] replica_sum={replica:.3}  alpha0={alpha0:.6}");
     }
 
     let correction = term

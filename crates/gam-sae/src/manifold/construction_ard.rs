@@ -198,7 +198,7 @@ impl SaeManifoldTerm {
                 Some(metric) if whitens => metric.apply_metric_row(row, r_row),
                 _ => r_row.iter().copied().collect(),
             };
-            let mut correct_atom = |k: usize, block_start: usize| {
+            let mut correct_atom = |k: usize| {
                 if rho.log_ard[k].is_empty() {
                     return;
                 }
@@ -211,7 +211,6 @@ impl SaeManifoldTerm {
                 if a_k == 0.0 {
                     return;
                 }
-                let _ = block_start; // coord block position is not needed here.
                 for axis in 0..d {
                     let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                     let t = coord.row(row)[axis];
@@ -252,15 +251,13 @@ impl SaeManifoldTerm {
             };
             match self.last_row_layout {
                 Some(ref layout) => {
-                    let active = &layout.active_atoms[row];
-                    let starts = &layout.coord_starts[row];
-                    for (pos, &k) in active.iter().enumerate() {
-                        correct_atom(k, starts[pos]);
+                    for &k in &layout.active_atoms[row] {
+                        correct_atom(k);
                     }
                 }
                 None => {
                     for k in 0..self.k_atoms() {
-                        correct_atom(k, coord_offsets[k]);
+                        correct_atom(k);
                     }
                 }
             }

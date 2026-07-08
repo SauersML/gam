@@ -887,6 +887,53 @@ pub fn stack_augmented_target(
     Ok(augmented)
 }
 
+/// The multi-block profiled REML criterion (the quantity minimised over the
+/// block weights), evaluated at a fitted state's UNSCALED residual sums of
+/// squares. Up to `log λ`-independent constants it is
+///
+/// ```text
+///   C = (n·p̃/2)·log((R_x + Σ_ℓ λ_ℓ·R_ℓ)/(n·p̃)) − Σ_ℓ (n·p_ℓ/2)·log λ_ℓ ,
+/// ```
+///
+/// (`p̃ = p_x + Σ p_ℓ`, `n = n_obs`), the profiled Gaussian negative-log-marginal
+/// plus the `√λ_ℓ` target-scaling Jacobian ([`OutputBlock::reml_updated_log_lambda`]).
+/// The `−(n p_ℓ/2)·log λ_ℓ` term diverges to `+∞` as `λ_ℓ → 0`, so the criterion
+/// PENALISES a vanishing weight — which is exactly what a plain fixed-point λ
+/// update (that treats the residual as frozen) fails to see, letting the shared
+/// coordinate trade a down-weighted block away in a positive-feedback runaway.
+/// A driver that only accepts a `λ` step when this criterion decreases (Armijo
+/// backtracking) is monotone and cannot diverge; its stationary point is the
+/// same per-block variance ratio the closed form targets.
+///
+/// Returns `+∞` for a non-positive pooled residual (an invalid state a caller's
+/// line search should reject).
+pub fn profiled_reml_criterion(
+    n_obs: usize,
+    p_x: usize,
+    rss_x: f64,
+    block_rss_unscaled: &[f64],
+    block_dims: &[usize],
+    block_log_lambda: &[f64],
+) -> f64 {
+    let n = n_obs as f64;
+    let mut p_tilde = p_x as f64;
+    let mut pooled = rss_x;
+    let mut jac = 0.0_f64;
+    for ((&rss, &dim), &log_lambda) in block_rss_unscaled
+        .iter()
+        .zip(block_dims.iter())
+        .zip(block_log_lambda.iter())
+    {
+        pooled += log_lambda.exp() * rss;
+        p_tilde += dim as f64;
+        jac += (dim as f64) * log_lambda;
+    }
+    if !(pooled > 0.0) {
+        return f64::INFINITY;
+    }
+    0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,7 +26,7 @@ use crate::assignment::{
 use crate::basis::PeriodicHarmonicEvaluator;
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
 use gam_terms::dictionary::{LinearDictionaryConfig, fit_linear_dictionary};
-use ndarray::{Array2, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView2, s};
 use std::sync::Arc;
 
 /// Deterministic "real-like" activation matrix: an anisotropic Gaussian with a
@@ -132,6 +132,74 @@ fn fit_ev(
         "reconstruction_explained_variance undefined (shape mismatch or degenerate total variance)"
             .to_string()
     })
+}
+
+// PROBE: gated per-row contribution Y_j = diag(a_·j)·Φ_j·B_j (n×p).
+fn probe_contribution(term: &SaeManifoldTerm, rho: &SaeManifoldRho, atom: usize) -> Array2<f64> {
+    let n = term.n_obs();
+    let phi = &term.atoms[atom].basis_values;
+    let mut y = phi.dot(&term.atoms[atom].decoder_coefficients);
+    for row in 0..n {
+        let a = term.assignment.try_assignments_row_for_rho(row, rho).unwrap()[atom];
+        for col in 0..y.ncols() {
+            y[[row, col]] *= a;
+        }
+    }
+    y
+}
+
+fn probe_cos(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let d = (na * nb).sqrt();
+    if d > 0.0 { (dot / d).abs() } else { 0.0 }
+}
+
+#[test]
+fn zzz_probe_contribution_cos() {
+    let z = real_like_activations(256, 10, 6, 7);
+    let k = 8usize;
+    let num_basis = 3usize;
+    let alpha = default_ibp_concentration_for_k_atoms(k);
+    // BENIGN: healthy guards-off fit (EV~0.99).
+    let mut term = circle_dictionary_term(z.view(), k, num_basis, alpha);
+    term.set_guards_enabled(false);
+    let mut rho = SaeManifoldRho::new(1.0_f64.ln(), 1.0_f64.ln(), vec![ndarray::array![1.0_f64.ln()]; k]);
+    term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 12, 1.0, 1.0e-6, 1.0e-6).unwrap();
+    let ys: Vec<Array2<f64>> = (0..k).map(|j| probe_contribution(&term, &rho, j)).collect();
+    let mut max_benign = 0.0_f64;
+    for j in 0..k {
+        for l in (j + 1)..k {
+            let c = probe_cos(&ys[j], &ys[l]);
+            if c > max_benign { max_benign = c; }
+            eprintln!("PROBEC benign contribution_cos[{j},{l}] = {c:.4}");
+        }
+    }
+    eprintln!("PROBEC BENIGN max contribution_cos = {max_benign:.4}");
+    // frame coherence (what the guard currently uses) on the same healthy dict.
+    let flagged = term.structural_coherence_collapse_detected().unwrap();
+    eprintln!("PROBEC guard(frame) flags healthy dict? {flagged:?}");
+    // Proposed matched-null bar from atom (M, r).
+    let m = term.atoms[0].basis_size();
+    let r = crate::manifold::certificate::certificate_output_frame(&term, 0).unwrap().ncols().max(1);
+    let d_eff = (m * r) as f64;
+    let e_null = (2.0 / (std::f64::consts::PI * d_eff)).sqrt();
+    let bar = 0.5 * (e_null + 1.0);
+    eprintln!("PROBEC M={m} r={r} D_eff={d_eff} E_null|cos|={e_null:.4} => proposed bar={bar:.4}");
+    // TRUE DUPLICATE: force atom 1 = atom 0 (decoder + coords) → Y_1 == Y_0.
+    let coords0 = term.assignment.coords[0].as_matrix().to_owned();
+    term.assignment.coords[1].set_flat(coords0.iter().copied().collect::<Array1<f64>>().view());
+    term.atoms[1].decoder_coefficients = term.atoms[0].decoder_coefficients.clone();
+    term.atoms[1].refresh_basis(term.assignment.coords[1].as_matrix().view()).unwrap();
+    let y0 = probe_contribution(&term, &rho, 0);
+    let y1 = probe_contribution(&term, &rho, 1);
+    eprintln!("PROBEC DUPLICATE contribution_cos[0,1] = {:.4}", probe_cos(&y0, &y1));
 }
 
 fn linear_ev(z: ArrayView2<'_, f64>, k: usize) -> f64 {
