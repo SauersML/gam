@@ -61,6 +61,16 @@ class ModelResult:
     true_l0_test: float
     learned_l0_train: float
     learned_l0_test: float
+    # Matched-(L0, params, bits) triple so no comparison is silently unmatched
+    # (#external-validity): L0 per row = learned_l0_test, an exact Python
+    # parameter count, and description-length bits. The bits column PICKS UP the
+    # Rust FFI bits/token surface (``ManifoldSAE.description_length``) when the
+    # featurizer exposes it and is honest about its source; flat baselines have no
+    # manifold DL FFI, so their bits are ``None`` with a source note (never faked).
+    l0_per_row: float
+    param_count: int
+    description_length_bits: float | None
+    description_length_source: str
     seconds: float
     status: str
     notes: str

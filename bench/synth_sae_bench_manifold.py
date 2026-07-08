@@ -11,6 +11,33 @@ reconstruction.
 The SAE being benchmarked is the repo's public implementation:
 ``gamfit.sae_manifold_fit``. This file only supplies data generation and
 ground-truth scoring.
+
+Comparable-protocol convention (BSF toy)
+----------------------------------------
+To make our contribution-recovery number the SAME experiment as the BSF
+("structure wins at every distortion") toy table, report per-manifold
+contribution recovery ``m_i`` under an OPTIMAL atom<->factor assignment
+(Hungarian matching of decoder directions to planted directions), NOT the
+raw-activation reconstruction R2. The toy convention is:
+
+* ``M`` manifolds  -- the number of planted ground-truth generative factors
+  (``--features``; the BSF toy uses a small ``M``, e.g. 16).
+* ``L0 = 4``       -- the fixed expected number of factors active per token; the
+  BSF toy holds sparsity at 4. In this generator L0 is set by the firing
+  probabilities (``--p-min`` / ``--p-max`` / ``--zipf-exponent``); the ACHIEVED
+  L0 is reported as ``true_l0_test`` so any mismatch to the 4 target is visible
+  and honest rather than assumed.
+* ``N`` samples    -- matched to the toy (``--n-train`` / ``--n-test``).
+
+Recommended matched invocation (documents the (M, L0, N) settings; achieved L0
+is reported, not assumed)::
+
+    python3 synth_sae_bench_manifold.py --features 16 --n-train 2048 \
+        --n-test 1024 --atoms 16 --p-max 0.25 --zipf-exponent 0.0
+
+Source: the BSF toy convention (M manifolds, L0=4, matched N). The
+contribution-recovery metric itself is defined in
+``bench/_synth_sae_metrics.py::contribution_recovery``.
 """
 
 from __future__ import annotations
@@ -27,7 +54,12 @@ import numpy as np
 
 import gamfit
 from gamfit._binding import rust_module
-from _synth_sae_metrics import feature_uniqueness, n_firing_latents, recovery_scores
+from _synth_sae_metrics import (
+    contribution_recovery,
+    feature_uniqueness,
+    n_firing_latents,
+    recovery_scores,
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +102,8 @@ class BenchmarkMetrics:
     direction_recovery_recall: float
     direction_recovery_f1: float
     direction_recovery_jaccard: float
+    contribution_recovery_mean: float
+    contribution_recovery_matched_factors: int
     n_latent_slots: int
     n_firing_latents: int
     probing_precision: float
@@ -336,7 +370,7 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     )
     synth = SynthSAEBenchData(cfg)
     train_x, train_coeff, _train_fire = synth.sample(args.n_train, seed + 1)
-    test_x, _test_coeff, test_fire = synth.sample(args.n_test, seed + 2)
+    test_x, test_coeff, test_fire = synth.sample(args.n_test, seed + 2)
 
     t0 = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
@@ -376,6 +410,17 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     # nonzero decoder direction that never fires on the eval set is functionally
     # dead -- wasted capacity the geometric (decoder-norm) live check misses.
     n_firing = n_firing_latents(learned_test)
+    # Comparable-protocol contribution recovery (BSF toy): per-planted-factor
+    # signal recovery m_i under the OPTIMAL atom<->factor (Hungarian) assignment,
+    # scored against the true per-token contribution (the planted coefficient
+    # column) on the held-out split -- NOT the raw-activation reconstruction R2.
+    # learned_test columns align with learned_dirs rows (both skip the intercept
+    # row and zero-norm directions in the same order), so the matched atom's
+    # activation is compared to its assigned factor's contribution. See module
+    # header for the (M, L0, N) protocol and bench/_synth_sae_metrics.py.
+    contrib = contribution_recovery(
+        learned_dirs, learned_test, synth.dictionary, test_coeff
+    )
     rows, cols, matching = rec.rows, rec.cols, rec.matching
     if rows.size:
         mcc = rec.mcc
@@ -415,6 +460,8 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         direction_recovery_recall=rec.recall,
         direction_recovery_f1=rec.f1,
         direction_recovery_jaccard=rec.jaccard,
+        contribution_recovery_mean=contrib.mean,
+        contribution_recovery_matched_factors=int(contrib.per_factor.size),
         n_latent_slots=n_slots,
         n_firing_latents=n_firing,
         probing_precision=precision,
@@ -441,6 +488,8 @@ def _summarize(metrics: list[BenchmarkMetrics]) -> dict[str, Any]:
         "direction_recovery_recall",
         "direction_recovery_f1",
         "direction_recovery_jaccard",
+        "contribution_recovery_mean",
+        "contribution_recovery_matched_factors",
         "n_latent_slots",
         "n_firing_latents",
         "probing_precision",
@@ -477,6 +526,7 @@ def _benchmark_notes() -> dict[str, Any]:
                 "GT-F1-style matched-latent firing precision/recall/F1",
                 "feature uniqueness (argmax-collision: #distinct best matches / n_learned)",
                 "direction recovery precision/recall/F1/Jaccard (quality-aware matched cosine mass)",
+                "BSF-toy per-factor contribution recovery m_i under optimal atom<->factor (Hungarian) matching (NOT raw-activation R2)",
             ],
             "saebench_compatible_synthetic": [
                 "sparse-probing analogue on matched ground-truth features",
