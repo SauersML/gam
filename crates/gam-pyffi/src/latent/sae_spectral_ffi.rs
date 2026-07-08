@@ -2076,6 +2076,116 @@ fn effect_weighted_retention(
     Ok(out.unbind())
 }
 
+/// Score chart-coordinate interpretability against cyclic ground-truth labels.
+///
+/// `observations` are `(recovered_turns, label_turns, weight)` triples: the
+/// recovered chart coordinate and the ground-truth cyclic label, both in turns
+/// (values are wrapped modulo one), plus a non-negative posterior/evidence
+/// weight per row. Returns `{circular_correlation, signed_circular_correlation,
+/// effective_weight}` from the audited [`saebench_metrics::chart_interp_score`]
+/// definition — the orientation-quotiented weighted cyclic phase-lock the #1942
+/// chart-interp metric reports.
+#[pyfunction(signature = (observations,))]
+fn chart_interp_score(
+    py: Python<'_>,
+    observations: Vec<(f64, f64, f64)>,
+) -> PyResult<Py<PyDict>> {
+    let report = detach_py_result(py, "chart_interp_score", move || {
+        let rows: Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation> = observations
+            .iter()
+            .map(|&(recovered_turns, label_turns, weight)| {
+                gam::terms::sae::saebench_metrics::ChartInterpObservation {
+                    recovered_turns,
+                    label_turns,
+                    weight,
+                }
+            })
+            .collect();
+        gam::terms::sae::saebench_metrics::chart_interp_score(&rows)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("circular_correlation", report.circular_correlation)?;
+    out.set_item(
+        "signed_circular_correlation",
+        report.signed_circular_correlation,
+    )?;
+    out.set_item("effective_weight", report.effective_weight)?;
+    Ok(out.unbind())
+}
+
+/// Fit the output-Fisher dose-response calibration ledger.
+///
+/// `observations` are `(arc_length, predicted_nats, measured_nats, weight)`
+/// rows along a steered arc: the unit-speed path coordinate, the local
+/// output-Fisher prediction in nats, the measured KL/behaviour change in nats,
+/// and a non-negative weight. Returns `{slope_through_origin, r2_through_origin,
+/// mean_measured_nats_per_arc, cv_measured_nats_per_arc, effective_weight}` from
+/// the audited [`saebench_metrics::dose_response_calibration`] — the #1942
+/// dose-response calibration figure (through-origin slope + weighted R², plus
+/// the unit-speed constancy kill-test via the nats-per-arc coefficient of
+/// variation).
+#[pyfunction(signature = (observations,))]
+fn dose_response_calibration(
+    py: Python<'_>,
+    observations: Vec<(f64, f64, f64, f64)>,
+) -> PyResult<Py<PyDict>> {
+    let report = detach_py_result(py, "dose_response_calibration", move || {
+        let rows: Vec<gam::terms::sae::saebench_metrics::DoseResponseObservation> = observations
+            .iter()
+            .map(
+                |&(arc_length, predicted_nats, measured_nats, weight)| {
+                    gam::terms::sae::saebench_metrics::DoseResponseObservation {
+                        arc_length,
+                        predicted_nats,
+                        measured_nats,
+                        weight,
+                    }
+                },
+            )
+            .collect();
+        gam::terms::sae::saebench_metrics::dose_response_calibration(&rows)
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("slope_through_origin", report.slope_through_origin)?;
+    out.set_item("r2_through_origin", report.r2_through_origin)?;
+    out.set_item(
+        "mean_measured_nats_per_arc",
+        report.mean_measured_nats_per_arc,
+    )?;
+    out.set_item("cv_measured_nats_per_arc", report.cv_measured_nats_per_arc)?;
+    out.set_item("effective_weight", report.effective_weight)?;
+    Ok(out.unbind())
+}
+
+/// Invert a row-Hessian precision block into a per-coordinate posterior.
+///
+/// `mean` is the posterior mean coordinate the fit/encoder supplies and
+/// `precision_row_major` is the row-major `d x d` precision (inverse-covariance)
+/// block that the arrow solve already factors for that chart coordinate.
+/// Returns `{mean, covariance_diag, covariance_trace, precision_weight}` from
+/// the audited [`saebench_metrics::coordinate_posterior_from_precision`]: the
+/// per-token coordinate posterior uncertainty that weights both #1942
+/// manifold-native metrics and tightens the steering validity radius.
+#[pyfunction(signature = (mean, precision_row_major))]
+fn coordinate_posterior_from_precision(
+    py: Python<'_>,
+    mean: Vec<f64>,
+    precision_row_major: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let posterior = detach_py_result(py, "coordinate_posterior_from_precision", move || {
+        gam::terms::sae::saebench_metrics::coordinate_posterior_from_precision(
+            &mean,
+            &precision_row_major,
+        )
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("mean", posterior.mean)?;
+    out.set_item("covariance_diag", posterior.covariance_diag)?;
+    out.set_item("covariance_trace", posterior.covariance_trace)?;
+    out.set_item("precision_weight", posterior.precision_weight)?;
+    Ok(out.unbind())
+}
+
 #[cfg(test)]
 mod ffi_completeness_tests {
     use super::*;
@@ -2169,6 +2279,98 @@ mod ffi_completeness_tests {
             let r1: bool = a1.get_item("retained").unwrap().unwrap().extract().unwrap();
             assert!(!r1, "atom 1 should not be retained");
             assert!(a1.get_item("variance").unwrap().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn chart_interp_score_quotients_orientation_over_the_ffi_boundary() {
+        Python::attach(|py| {
+            // Recovered coordinate runs backwards relative to the cyclic label;
+            // the orientation-quotiented score still locks phase, and the signed
+            // score records the reversal.
+            let out = chart_interp_score(
+                py,
+                vec![
+                    (0.99, 0.01, 1.0),
+                    (0.24, 0.76, 1.0),
+                    (0.49, 0.51, 1.0),
+                    (0.74, 0.26, 1.0),
+                ],
+            )
+            .expect("chart interp score");
+            let d = out.bind(py);
+            let cc: f64 = d
+                .get_item("circular_correlation")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(cc > 0.99, "circular_correlation = {cc}");
+            let signed: f64 = d
+                .get_item("signed_circular_correlation")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(signed < 0.0, "signed_circular_correlation = {signed}");
+        });
+    }
+
+    #[test]
+    fn dose_response_calibration_reports_slope_and_unit_speed_constancy() {
+        Python::attach(|py| {
+            let out = dose_response_calibration(
+                py,
+                vec![
+                    (1.0, 0.5, 1.0, 1.0),
+                    (2.0, 1.0, 2.0, 1.0),
+                    (3.0, 1.5, 3.0, 1.0),
+                ],
+            )
+            .expect("dose response calibration");
+            let d = out.bind(py);
+            let slope: f64 = d
+                .get_item("slope_through_origin")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((slope - 2.0).abs() < 1e-9, "slope = {slope}");
+            let cv: f64 = d
+                .get_item("cv_measured_nats_per_arc")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(cv < 1e-9, "unit-speed cv = {cv}");
+        });
+    }
+
+    #[test]
+    fn coordinate_posterior_inverts_precision_block_over_the_ffi_boundary() {
+        Python::attach(|py| {
+            let out = coordinate_posterior_from_precision(
+                py,
+                vec![0.25, 0.75],
+                vec![4.0, 1.0, 1.0, 3.0],
+            )
+            .expect("coordinate posterior");
+            let d = out.bind(py);
+            let diag: Vec<f64> = d
+                .get_item("covariance_diag")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((diag[0] - 3.0 / 11.0).abs() < 1e-9, "diag0 = {}", diag[0]);
+            assert!((diag[1] - 4.0 / 11.0).abs() < 1e-9, "diag1 = {}", diag[1]);
+            let pw: f64 = d
+                .get_item("precision_weight")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!((pw - 11.0 / 7.0).abs() < 1e-9, "precision_weight = {pw}");
         });
     }
 }
