@@ -134,45 +134,6 @@ fn fit_ev(
     })
 }
 
-#[test]
-fn zzz_diag_ibp_kaware_mechanism() {
-    let z = real_like_activations(256, 10, 6, 7);
-    let k = 8usize;
-    let num_basis = 3usize;
-    let max_iter = 12usize;
-    let alpha = default_ibp_concentration_for_k_atoms(k);
-    let mut term = circle_dictionary_term(z.view(), k, num_basis, alpha);
-    let mut rho = SaeManifoldRho::new(
-        1.0_f64.ln(),
-        1.0_f64.ln(),
-        vec![ndarray::array![1.0_f64.ln()]; k],
-    );
-    let seed_norms: Vec<f64> = term
-        .atoms
-        .iter()
-        .map(|a| a.decoder_coefficients.iter().map(|v| v * v).sum::<f64>().sqrt())
-        .collect();
-    eprintln!("SEED decoder norms: {seed_norms:?}");
-    let res = term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, max_iter, 1.0, 1.0e-6, 1.0e-6);
-    eprintln!("fit result: {:?}", res.as_ref().map(|_| "Ok"));
-    let final_norms: Vec<f64> = term
-        .atoms
-        .iter()
-        .map(|a| a.decoder_coefficients.iter().map(|v| v * v).sum::<f64>().sqrt())
-        .collect();
-    let maxn = final_norms.iter().cloned().fold(0.0_f64, f64::max);
-    eprintln!("FINAL decoder norms: {final_norms:?}  max={maxn:.4e}  rel={:?}", final_norms.iter().map(|n| n / maxn).collect::<Vec<_>>());
-    for e in term.collapse_events() {
-        eprintln!("  event: atom={} iter={} action={:?} max_active_mass={:.4e} floor={:.4e}", e.atom, e.iteration, e.action, e.max_active_mass, e.floor);
-    }
-    if let Ok(()) = res {
-        let fitted = term.try_fitted_for_rho(&rho).unwrap();
-        eprintln!("EV = {:?}", reconstruction_explained_variance(z.view(), fitted.view()));
-    }
-    let lin = linear_ev(z.view(), k);
-    eprintln!("linear EV = {lin:.4}");
-}
-
 fn linear_ev(z: ArrayView2<'_, f64>, k: usize) -> f64 {
     let cfg = LinearDictionaryConfig {
         n_atoms: k,
