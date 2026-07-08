@@ -151,6 +151,128 @@ pub struct PsiGramTensor {
     /// `zᵀWz` — ψ-free, captured at build so the Gaussian sufficient-statistic
     /// triple can be assembled per trial without any row access.
     zt_w_z: f64,
+    /// #1216 — per-column log-amplitude slope `p_j` and intercept `c_j` of the
+    /// AMPLITUDE ENVELOPE `α_j(ψ) = exp(p_j·ψ + c_j)` factored out of column `j`
+    /// of the design BEFORE the Chebyshev transform. The stored `gram`/`rhs`
+    /// series interpolate the AMPLITUDE-NORMALIZED sufficient statistics
+    /// `G̃(ψ) = D(ψ)⁻¹ (XᵀWX)(ψ) D(ψ)⁻¹` and `c̃(ψ) = D(ψ)⁻¹ (XᵀWz)(ψ)`, with
+    /// `D(ψ) = diag(α_j(ψ))`, and every accessor RE-APPLIES `D(ψ)` in closed
+    /// form (`gram_at = D G̃ D`, `rhs_at = D c̃`, with the exact product-rule
+    /// envelope for the ψ-derivatives).
+    ///
+    /// ## Why (the #1216 dynamic-range wall)
+    ///
+    /// For the radial families the length-scale enters the design through the
+    /// kernel argument κr with `ψ = log κ`, so each radial column's AMPLITUDE is
+    /// a pure power `κ^{p_j} = e^{p_j ψ}` (a thin-plate/Duchon kernel `(κr)^{p}`
+    /// or `(κr)^{p} log(κr)` has amplitude `κ^{p} = e^{p ψ}`; the residual
+    /// `log(κr)` growth is only LINEAR in ψ and stays in the normalized factor).
+    /// Over the wide standardized ψ-window default 1-D fits use (#1215, ~9 nats)
+    /// that amplitude spans `e^{9p}` orders of magnitude, so the raw Gram entries
+    /// `G_ab(ψ) = e^{(p_a+p_b)ψ}·(ψ-free)` carry an enormous exponential trend.
+    /// The Chebyshev coefficients of `e^{cψ}` decay only for degree `d ≳ c·halfwidth`,
+    /// so the raw-Gram tail certified geometrically-slowly and the weakly
+    /// penalized β̂ solve amplified the residual — the tensor refused to attach
+    /// (`attached=false`), the n-free skip never fired, and every κ-trial fell to
+    /// the O(n) design realization.
+    ///
+    /// Factoring `α_j(ψ) = e^{p_j ψ + c_j}` out of column `j` cancels the
+    /// exponential EXACTLY for a pure-power radial column: the normalized cross
+    /// block `G̃_ab = G_ab/(α_a α_b) = e^{(p_a+p_b)ψ}·(ψ-free)/e^{(p_a+p_b)ψ}` is
+    /// ψ-FREE, so `G̃` has O(1) dynamic range and certifies at a low degree. A
+    /// SINGLE scalar amplitude does NOT suffice here: the design mixes radial
+    /// columns (power `p`) with a ψ-free polynomial-nullspace block (power 0), and
+    /// only a PER-COLUMN factor (dividing each column by its OWN amplitude) makes
+    /// every block — radial-radial, radial-poly, poly-poly — simultaneously
+    /// ψ-free. `p_j`/`c_j` are recovered EXACTLY (family-agnostically) from the
+    /// node Grams' diagonals: `½·log G_jj(ψ) = p_j·ψ + c_j` is exactly affine for
+    /// a power-law column, so a least-squares fit over the Chebyshev nodes (whose
+    /// weighted column norms `‖X_j(ψ_i)‖²_W = G_jj(ψ_i)` are already formed) reads
+    /// off the slope with zero residual, with no kernel-family dispatch and no
+    /// extra row work. Choosing `c_j` as the fitted intercept sets `α_j(ψ)≈
+    /// ‖X_j(ψ)‖_W`, so `G̃_jj≈1` across the window (Cauchy–Schwarz bounds the
+    /// off-diagonals by 1). The reconstruction `gram_at = D G̃ D` equals the true
+    /// Gram for ANY choice of `D`, so this only ever improves conditioning — and
+    /// the off-node `spot_check` re-derives it against the exact rebuild, so an
+    /// error in the envelope algebra REFUSES the tensor (sound fallback) rather
+    /// than shipping a wrong Gram.
+    col_amp_slope: Array1<f64>,
+    col_amp_intercept: Array1<f64>,
+}
+
+/// Recover the per-column log-amplitude envelope `α_j(ψ) = exp(p_j·ψ + c_j)` from
+/// the node Grams' diagonals (#1216). For a power-law radial column
+/// `X_j(ψ) = e^{p_j ψ}·(ψ-free)`, the weighted column norm satisfies
+/// `½·log G_jj(ψ) = p_j·ψ + c_j` EXACTLY, so an ordinary least-squares fit over
+/// the Chebyshev-node ψ values recovers `(p_j, c_j)` with zero residual; for a
+/// non-power column it returns the best affine log-amplitude, which still removes
+/// the dominant exponential trend and leaves an analytic low-degree remainder.
+/// A column whose diagonal is non-positive or non-finite at ANY node (a genuinely
+/// vanishing column somewhere in the window) gets the identity envelope
+/// `(p_j, c_j) = (0, 0)` ⇒ `α_j ≡ 1` — no normalization, the historical path for
+/// that column — so the recovery never divides by a spurious fitted exponential.
+///
+/// A column is normalized ONLY when its amplitude dynamic range across the window
+/// is large enough to matter: `|p_j|·span ≥ COL_AMP_ENGAGE`. Below that the raw
+/// tensor already certified (the narrow-window regime), so the column keeps the
+/// identity envelope and its accessors stay BIT-FOR-BIT the historical path
+/// (`α_j ≡ 1` ⇒ `gram_at` multiplies by exactly `1.0`). Normalization thus
+/// engages exactly on the wide standardized geometry (#1215/#1216) that needs it.
+const COL_AMP_ENGAGE: f64 = 6.0;
+
+fn recover_column_log_amplitudes(
+    node_grams: &[Array2<f64>],
+    node_psis: &[f64],
+    k: usize,
+) -> (Array1<f64>, Array1<f64>) {
+    let mut slope = Array1::<f64>::zeros(k);
+    let mut intercept = Array1::<f64>::zeros(k);
+    let m = node_psis.len();
+    if m < 2 {
+        return (slope, intercept);
+    }
+    let psi_bar = node_psis.iter().sum::<f64>() / m as f64;
+    let denom = node_psis.iter().map(|&p| (p - psi_bar).powi(2)).sum::<f64>();
+    if !(denom > 0.0) {
+        return (slope, intercept);
+    }
+    let (psi_min, psi_max) = node_psis
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &p| {
+            (lo.min(p), hi.max(p))
+        });
+    let span = psi_max - psi_min;
+    for j in 0..k {
+        // y_i = ½·log G_jj(ψ_i); identity envelope if any diagonal is unusable.
+        let mut ys = Vec::with_capacity(m);
+        let mut usable = true;
+        for g in node_grams.iter() {
+            let d = g[[j, j]];
+            if !(d > 0.0) || !d.is_finite() {
+                usable = false;
+                break;
+            }
+            ys.push(0.5 * d.ln());
+        }
+        if !usable {
+            continue;
+        }
+        let y_bar = ys.iter().sum::<f64>() / m as f64;
+        let mut num = 0.0_f64;
+        for (i, &y) in ys.iter().enumerate() {
+            num += (node_psis[i] - psi_bar) * (y - y_bar);
+        }
+        let p = num / denom;
+        let c = y_bar - p * psi_bar;
+        // Engage normalization only where the amplitude dynamic range is large;
+        // otherwise leave the identity envelope so the column is the historical
+        // path bit-for-bit.
+        if p.is_finite() && c.is_finite() && p.abs() * span >= COL_AMP_ENGAGE {
+            slope[j] = p;
+            intercept[j] = c;
+        }
+    }
+    (slope, intercept)
 }
 
 /// One ladder rung's outcome: a hard evaluation failure aborts the whole
@@ -414,6 +536,7 @@ impl PsiGramTensor {
         // next node. Peak memory is O(m·k² + n·k) (one design at a time) and the
         // only row work is the single O(m·n·k²) node-statistic pass.
         let mut nodes_x = vec![0.0_f64; m];
+        let mut node_psis = vec![0.0_f64; m];
         let mut node_grams: Vec<Array2<f64>> = Vec::with_capacity(m);
         let mut node_rhs: Vec<Array1<f64>> = Vec::with_capacity(m);
 
@@ -442,6 +565,7 @@ impl PsiGramTensor {
             let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
             *x_slot = x;
             let psi = 0.5 * (psi_lo + psi_hi) + 0.5 * (psi_hi - psi_lo) * x;
+            node_psis[i] = psi;
             let design = match eval_design(psi) {
                 Ok(design) => design,
                 Err(why) => {
@@ -484,6 +608,38 @@ impl PsiGramTensor {
             node_rhs.push(node_rh);
         }
         let (_n, k) = dims.expect("node ladder rung m≥1 yields at least one design");
+
+        // #1216 amplitude normalization: recover the per-column log-amplitude
+        // envelope `α_j(ψ) = exp(p_j ψ + c_j)` from the node Grams' diagonals
+        // (`G_jj(ψ_i) = ‖X_j(ψ_i)‖²_W`, already formed), then divide each node's
+        // sufficient statistics by it BEFORE the Chebyshev transform:
+        // `G̃(ψ_i) = D_i⁻¹ G(ψ_i) D_i⁻¹`, `c̃(ψ_i) = D_i⁻¹ c(ψ_i)`, with
+        // `D_i = diag(α_j(ψ_i))`. This cancels the exponential length-scale trend
+        // (κ^{p_j} = e^{p_j ψ}) column-by-column, collapsing the interpoland's
+        // dynamic range to O(1) so the tail certificate/spot-check pass on the
+        // wide standardized geometry that used to refuse. The envelope is
+        // re-applied in closed form by every accessor, so `gram_at` still returns
+        // the TRUE Gram (the transform is conditioning-only, not a change of
+        // answer). Normalizing the k×k node statistics (not the n×k design) keeps
+        // this an O(m·k²) k-space step with no extra row work.
+        let (col_amp_slope, col_amp_intercept) =
+            recover_column_log_amplitudes(&node_grams, &node_psis, k);
+        for (i, &psi) in node_psis.iter().enumerate() {
+            let alpha: Vec<f64> = (0..k)
+                .map(|j| (col_amp_slope[j] * psi + col_amp_intercept[j]).exp())
+                .collect();
+            let g = &mut node_grams[i];
+            for a in 0..k {
+                for b in 0..k {
+                    g[[a, b]] /= alpha[a] * alpha[b];
+                }
+            }
+            let r = &mut node_rhs[i];
+            for a in 0..k {
+                r[a] /= alpha[a];
+            }
+        }
+
         // First-kind discrete orthogonality of the Chebyshev nodes.
         let t_at_nodes: Vec<Vec<f64>> = nodes_x.iter().map(|&x| cheb_t(x, m)).collect();
         let mut gram: Vec<Array2<f64>> = (0..m).map(|_| Array2::<f64>::zeros((k, k))).collect();
@@ -550,6 +706,8 @@ impl PsiGramTensor {
             gram,
             rhs,
             zt_w_z,
+            col_amp_slope,
+            col_amp_intercept,
         })
     }
 
@@ -883,26 +1041,66 @@ impl PsiGramTensor {
         (2.0 * psi - (self.psi_lo + self.psi_hi)) / (self.psi_hi - self.psi_lo)
     }
 
-    /// `XᵀWX(ψ)` assembled n-free in O(Dk²) from the direct Gram series.
-    pub fn gram_at(&self, psi: f64) -> Array2<f64> {
-        let x = self.mapped(psi);
-        let t = cheb_t(x, self.gram.len());
+    /// The per-column amplitude envelope `α_j(ψ) = exp(p_j·ψ + c_j)` (#1216) that
+    /// every accessor re-applies to the stored amplitude-NORMALIZED series to
+    /// recover the true design-moving statistics. `D(ψ) = diag(col_amplitudes)`.
+    fn col_amplitudes(&self, psi: f64) -> Array1<f64> {
+        Array1::from_iter(
+            (0..self.k).map(|j| (self.col_amp_slope[j] * psi + self.col_amp_intercept[j]).exp()),
+        )
+    }
+
+    /// Chebyshev contraction `Σ_d w_d · gram[d]` of the stored (amplitude-
+    /// normalized) Gram series with per-coefficient weights `w_d` — the shared
+    /// n-free O(Dk²) kernel behind the value/gradient/curvature accessors.
+    fn contract_gram(&self, weights: &[f64]) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.k, self.k));
         let mut comp = Array2::<f64>::zeros((self.k, self.k));
-        for (d, td) in t.iter().enumerate() {
-            kahan_scaled_add_array2(&mut out, &mut comp, *td, &self.gram[d]);
+        for (d, &wd) in weights.iter().enumerate() {
+            kahan_scaled_add_array2(&mut out, &mut comp, wd, &self.gram[d]);
         }
         out
     }
 
-    /// `XᵀWz(ψ)` assembled n-free in O(Dk).
+    /// Chebyshev contraction `Σ_d w_d · rhs[d]` of the stored (amplitude-
+    /// normalized) RHS series.
+    fn contract_rhs(&self, weights: &[f64]) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.k);
+        let mut comp = Array1::<f64>::zeros(self.k);
+        for (d, &wd) in weights.iter().enumerate() {
+            kahan_scaled_add_array1(&mut out, &mut comp, wd, &self.rhs[d]);
+        }
+        out
+    }
+
+    /// `XᵀWX(ψ)` assembled n-free in O(Dk²) from the direct Gram series.
+    ///
+    /// `G(ψ) = D(ψ) G̃(ψ) D(ψ)` (#1216): the stored series interpolates the
+    /// amplitude-normalized `G̃`, and the per-column envelope `D(ψ) = diag(α_j)`
+    /// is re-applied here — `G_ab = α_a·α_b·G̃_ab` — reproducing the true Gram.
+    pub fn gram_at(&self, psi: f64) -> Array2<f64> {
+        let x = self.mapped(psi);
+        let t = cheb_t(x, self.gram.len());
+        let g_tilde = self.contract_gram(&t);
+        let alpha = self.col_amplitudes(psi);
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for a in 0..self.k {
+            for b in 0..self.k {
+                out[[a, b]] = alpha[a] * alpha[b] * g_tilde[[a, b]];
+            }
+        }
+        out
+    }
+
+    /// `XᵀWz(ψ)` assembled n-free in O(Dk). `c_a = α_a·c̃_a` (#1216 envelope).
     pub fn rhs_at(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
         let t = cheb_t(x, self.n_coeff);
+        let c_tilde = self.contract_rhs(&t);
+        let alpha = self.col_amplitudes(psi);
         let mut out = Array1::<f64>::zeros(self.k);
-        let mut comp = Array1::<f64>::zeros(self.k);
-        for (d, td) in t.iter().enumerate() {
-            kahan_scaled_add_array1(&mut out, &mut comp, *td, &self.rhs[d]);
+        for a in 0..self.k {
+            out[a] = alpha[a] * c_tilde[a];
         }
         out
     }
@@ -913,24 +1111,39 @@ impl PsiGramTensor {
     pub fn dgram_dpsi(&self, psi: f64) -> Array2<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let t = cheb_t(x, self.gram.len());
         let tp = cheb_t_prime(x, self.gram.len());
+        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
+        let g_tilde = self.contract_gram(&t);
+        let g_tilde_p = self.contract_gram(&tp_scaled);
+        // Product rule on `G = D G̃ D`, `D = diag(exp(p_j ψ + c_j))`,
+        // `D' = diag(p_j)·D`: `[dG/dψ]_ab = α_a α_b [(p_a+p_b) G̃_ab + G̃'_ab]`.
+        let alpha = self.col_amplitudes(psi);
+        let p = &self.col_amp_slope;
         let mut out = Array2::<f64>::zeros((self.k, self.k));
-        let mut comp = Array2::<f64>::zeros((self.k, self.k));
-        for (d, tpd) in tp.iter().enumerate() {
-            kahan_scaled_add_array2(&mut out, &mut comp, *tpd * dx_dpsi, &self.gram[d]);
+        for a in 0..self.k {
+            for b in 0..self.k {
+                out[[a, b]] =
+                    alpha[a] * alpha[b] * ((p[a] + p[b]) * g_tilde[[a, b]] + g_tilde_p[[a, b]]);
+            }
         }
         out
     }
 
-    /// Exact `∂(XᵀWz)/∂ψ`, n-free.
+    /// Exact `∂(XᵀWz)/∂ψ`, n-free. `[dc/dψ]_a = α_a (p_a c̃_a + c̃'_a)` (#1216).
     pub fn drhs_dpsi(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
+        let t = cheb_t(x, self.n_coeff);
         let tp = cheb_t_prime(x, self.n_coeff);
+        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
+        let c_tilde = self.contract_rhs(&t);
+        let c_tilde_p = self.contract_rhs(&tp_scaled);
+        let alpha = self.col_amplitudes(psi);
+        let p = &self.col_amp_slope;
         let mut out = Array1::<f64>::zeros(self.k);
-        let mut comp = Array1::<f64>::zeros(self.k);
-        for (d, tpd) in tp.iter().enumerate() {
-            kahan_scaled_add_array1(&mut out, &mut comp, *tpd * dx_dpsi, &self.rhs[d]);
+        for a in 0..self.k {
+            out[a] = alpha[a] * (p[a] * c_tilde[a] + c_tilde_p[a]);
         }
         out
     }
@@ -947,25 +1160,50 @@ impl PsiGramTensor {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let t = cheb_t(x, self.gram.len());
+        let tp = cheb_t_prime(x, self.gram.len());
         let tpp = cheb_t_double_prime(x, self.gram.len());
+        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
+        let tpp_scaled: Vec<f64> = tpp.iter().map(|v| v * dx_dpsi_sq).collect();
+        let g_tilde = self.contract_gram(&t);
+        let g_tilde_p = self.contract_gram(&tp_scaled);
+        let g_tilde_pp = self.contract_gram(&tpp_scaled);
+        // Second derivative of `G = D G̃ D` (#1216): with `q = p_a + p_b`,
+        // `[d²G/dψ²]_ab = α_a α_b [q² G̃_ab + 2q G̃'_ab + G̃''_ab]`.
+        let alpha = self.col_amplitudes(psi);
+        let p = &self.col_amp_slope;
         let mut out = Array2::<f64>::zeros((self.k, self.k));
-        let mut comp = Array2::<f64>::zeros((self.k, self.k));
-        for (d, tppd) in tpp.iter().enumerate() {
-            kahan_scaled_add_array2(&mut out, &mut comp, *tppd * dx_dpsi_sq, &self.gram[d]);
+        for a in 0..self.k {
+            for b in 0..self.k {
+                let q = p[a] + p[b];
+                out[[a, b]] = alpha[a]
+                    * alpha[b]
+                    * (q * q * g_tilde[[a, b]] + 2.0 * q * g_tilde_p[[a, b]] + g_tilde_pp[[a, b]]);
+            }
         }
         out
     }
 
-    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free. `T_d″·(dx/dψ)²` against the rhs slabs.
+    /// Exact `∂²(XᵀWz)/∂ψ²`, n-free.
+    /// `[d²c/dψ²]_a = α_a (p_a² c̃_a + 2 p_a c̃'_a + c̃''_a)` (#1216 envelope).
     pub fn d2rhs_dpsi2(&self, psi: f64) -> Array1<f64> {
         let x = self.mapped(psi);
         let dx_dpsi = 2.0 / (self.psi_hi - self.psi_lo);
         let dx_dpsi_sq = dx_dpsi * dx_dpsi;
+        let t = cheb_t(x, self.n_coeff);
+        let tp = cheb_t_prime(x, self.n_coeff);
         let tpp = cheb_t_double_prime(x, self.n_coeff);
+        let tp_scaled: Vec<f64> = tp.iter().map(|v| v * dx_dpsi).collect();
+        let tpp_scaled: Vec<f64> = tpp.iter().map(|v| v * dx_dpsi_sq).collect();
+        let c_tilde = self.contract_rhs(&t);
+        let c_tilde_p = self.contract_rhs(&tp_scaled);
+        let c_tilde_pp = self.contract_rhs(&tpp_scaled);
+        let alpha = self.col_amplitudes(psi);
+        let p = &self.col_amp_slope;
         let mut out = Array1::<f64>::zeros(self.k);
-        let mut comp = Array1::<f64>::zeros(self.k);
-        for (d, tppd) in tpp.iter().enumerate() {
-            kahan_scaled_add_array1(&mut out, &mut comp, *tppd * dx_dpsi_sq, &self.rhs[d]);
+        for a in 0..self.k {
+            out[a] =
+                alpha[a] * (p[a] * p[a] * c_tilde[a] + 2.0 * p[a] * c_tilde_p[a] + c_tilde_pp[a]);
         }
         out
     }
@@ -1871,6 +2109,126 @@ mod tests {
             tensor.is_err(),
             "kinked design must fail the tail-decay/spot-check certificates"
         );
+    }
+
+    /// #1216 amplitude normalization: on a WIDE window a mixed design whose radial
+    /// columns carry a pure length-scale amplitude `κ^{p_j} = e^{p_j ψ}` (the
+    /// Duchon/ThinPlate structure) plus a ψ-free polynomial-nullspace column must
+    /// (a) recover the per-column power `p_j` EXACTLY from the node-Gram diagonals,
+    /// (b) collapse the interpoland's dynamic range to O(1) even though the TRUE
+    /// Gram spans many orders of magnitude across the window, and (c) still
+    /// reconstruct the true Gram / rhs / ψ-derivative to certification accuracy via
+    /// the closed-form envelope `D(ψ)`. This is the mechanism that lets the tensor
+    /// attach on the wide standardized geometry that used to refuse (the #1216
+    /// wall): the normalized series is what the tail certificate and off-node spot
+    /// check see, and here it is essentially ψ-free.
+    #[test]
+    fn amplitude_normalization_factors_exact_power_and_bounds_series_1216() {
+        let (n, k) = (180usize, 4usize);
+        // Three radial columns with amplitude e^{p ψ}, p = 2, over distinct
+        // ψ-free profiles, plus one ψ-free polynomial-nullspace column (p = 0).
+        let powers = [2.0_f64, 2.0, 2.0, 0.0];
+        let base = |i: usize, j: usize| -> f64 {
+            let t = (i as f64 + 0.5) / n as f64;
+            match j {
+                0 => 1.0,
+                1 => (2.0 * std::f64::consts::PI * t).sin(),
+                2 => (2.0 * std::f64::consts::PI * t).cos(),
+                _ => t, // ψ-free polynomial column
+            }
+        };
+        let design = move |psi: f64| -> Result<Array2<f64>, String> {
+            let mut x = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                for j in 0..k {
+                    x[[i, j]] = (powers[j] * psi).exp() * base(i, j);
+                }
+            }
+            Ok(x)
+        };
+        let w = Array1::from_iter((0..n).map(|i| 1.0 + 0.4 * ((i % 3) as f64)));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.31).sin() + 0.2));
+        // WIDE window (~9 nats) — the #1215/#1216 standardized-geometry regime.
+        let (psi_lo, psi_hi) = (-4.5_f64, 4.5_f64);
+
+        let tensor = PsiGramTensor::build(|psi| design(psi), w.view(), z.view(), psi_lo, psi_hi)
+            .expect("amplitude-normalized wide-window design must certify (#1216)");
+
+        // (a) The per-column power is recovered EXACTLY (½·log G_jj is affine in ψ
+        // for a power-law column, so the LS slope has zero residual).
+        for j in 0..k {
+            assert!(
+                (tensor.col_amp_slope[j] - powers[j]).abs() <= 1e-9,
+                "recovered amplitude slope p_{j}={} must match the true power {}",
+                tensor.col_amp_slope[j],
+                powers[j]
+            );
+        }
+
+        // (b) The stored (normalized) series has O(1) dynamic range, even though the
+        // TRUE Gram entry spans many orders across the window. Factoring e^{p_j ψ}
+        // out column-by-column makes the normalized statistics essentially ψ-free.
+        let series_scale = tensor.gram.iter().fold(0.0_f64, |acc, slab| {
+            acc.max(slab.iter().fold(0.0_f64, |a, &v| a.max(v.abs())))
+        });
+        assert!(
+            series_scale < 1e2,
+            "normalized Gram series must be O(1); got max entry {series_scale:.3e}"
+        );
+        // The true Gram genuinely explodes at the high-ψ end (evidence the dynamic
+        // range was real and is now carried by the envelope, not the interpoland).
+        let g_hi = tensor.gram_at(psi_hi);
+        assert!(
+            g_hi[[0, 0]] > 1e6,
+            "true Gram must carry the large length-scale amplitude at psi_hi \
+             (got {:.3e})",
+            g_hi[[0, 0]]
+        );
+
+        // (c) The closed-form envelope reconstructs the true Gram / rhs / gradient
+        // to certification accuracy at the window edges and center.
+        let exact_gram_rhs = |psi: f64| -> (Array2<f64>, Array1<f64>) {
+            let d = design(psi).unwrap();
+            let mut wd = d.clone();
+            for (mut row, &wi) in wd.outer_iter_mut().zip(w.iter()) {
+                row.mapv_inplace(|v| v * wi);
+            }
+            (d.t().dot(&wd), wd.t().dot(&z))
+        };
+        for &psi in &[psi_lo + 0.1, 0.0, psi_hi - 0.1] {
+            let (eg, er) = exact_gram_rhs(psi);
+            let fg = tensor.gram_at(psi);
+            let fr = tensor.rhs_at(psi);
+            let gscale = eg.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            for (a, b) in fg.iter().zip(eg.iter()) {
+                assert!(
+                    (a - b).abs() <= PSI_GRAM_SPOT_RTOL * gscale,
+                    "gram reconstruction at psi={psi}: fast={a}, exact={b}"
+                );
+            }
+            let rscale = er.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+            for (a, b) in fr.iter().zip(er.iter()) {
+                assert!(
+                    (a - b).abs() <= PSI_GRAM_SPOT_RTOL * rscale,
+                    "rhs reconstruction at psi={psi}: fast={a}, exact={b}"
+                );
+            }
+        }
+        // Analytic ψ-gradient (product-rule envelope) vs central FD of the exact
+        // Gram at the window center — certifies the derivative envelope algebra.
+        let psi = 0.0_f64;
+        let h = 1e-6;
+        let (gp, _) = exact_gram_rhs(psi + h);
+        let (gm, _) = exact_gram_rhs(psi - h);
+        let dg = tensor.dgram_dpsi(psi);
+        let dscale = dg.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-12);
+        for ((a, p), m_) in dg.iter().zip(gp.iter()).zip(gm.iter()) {
+            let fd = (p - m_) / (2.0 * h);
+            assert!(
+                (a - fd).abs() <= 1e-5 * dscale,
+                "dgram/dpsi envelope mismatch at psi={psi}: analytic={a}, fd={fd}"
+            );
+        }
     }
 
     /// #1264 reduced-basis-equality witness — REFLEXIVITY + GAUGE INVARIANCE.
