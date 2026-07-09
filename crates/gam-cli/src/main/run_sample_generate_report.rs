@@ -4,6 +4,7 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     validate_positive_optional_usize("--chains", args.chains)?;
     validate_positive_optional_usize("--samples", args.samples)?;
     validate_positive_optional_usize("--warmup", args.warmup)?;
+    reject_multinomial_model(&args.model, "sample")?;
     let model = SavedModel::load_from_path(&args.model)?;
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
@@ -144,6 +145,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     if args.n_draws == 0 {
         return Err("--n-draws must be > 0".to_string());
     }
+    reject_multinomial_model(&args.model, "generate")?;
     let model = SavedModel::load_from_path(&args.model)?;
 
     if model.predict_model_class() == PredictModelClass::Survival {
@@ -531,8 +533,7 @@ pub(crate) fn run_report_residual_cascade(
 }
 
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
-    use gam::probability::standard_normal_quantile;
-
+    reject_multinomial_model(&args.model, "report")?;
     let model = SavedModel::load_from_path(&args.model)?;
     // Spline-scan model (#1030/#1034/#1046): no dense fit_result exists — the
     // exact O(n) state-space smoother keeps only the per-knot posterior. Render
@@ -558,6 +559,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     }
     let family = model.likelihood();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    // Total EDF: shown on the summary card and used as the residual degrees
+    // of freedom in the dispersion estimates behind the report residuals.
+    let edf_total = model
+        .unified()
+        .and_then(|u| u.edf_total())
+        .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0));
 
     let beta_se = fit
         .beta_standard_errors_corrected()
@@ -661,42 +668,26 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                         .predict_plugin_response(&pred_input)
                         .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
 
-                    let residuals: Vec<f64> =
-                        y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
-                    let mut residuals_sorted = residuals.clone();
-                    residuals_sorted
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let n = residuals_sorted.len().max(1);
-                    let theoretical_quantiles = (0..n)
-                        .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut bin_pred = [0.0f64; 10];
-                    let mut bin_obs = [0.0f64; 10];
-                    let mut counts = [0usize; 10];
-                    for i in 0..y.len() {
-                        let p = pred.mean[i].clamp(0.0, 1.0);
-                        let b = ((p * 10.0).floor() as usize).min(9);
-                        bin_pred[b] += p;
-                        bin_obs[b] += y[i];
-                        counts[b] += 1;
-                    }
-                    let mut mp = Vec::new();
-                    let mut or = Vec::new();
-                    for b in 0..10 {
-                        if counts[b] > 0 {
-                            mp.push(bin_pred[b] / counts[b] as f64);
-                            or.push((bin_obs[b] / counts[b] as f64).clamp(0.0, 1.0));
-                        }
-                    }
+                    // Bernoulli response: randomized-quantile residuals (the
+                    // raw y − p residual is two-valued and can never track a
+                    // normal Q-Q reference), plus equal-count calibration
+                    // deciles.
+                    let y_vec = y.to_vec();
+                    let p_vec = pred.mean.to_vec();
+                    let residuals = report_residual_diagnostics(
+                        &ResponseFamily::Binomial,
+                        &y_vec,
+                        &p_vec,
+                        None,
+                        edf_total,
+                        &mut notes,
+                    )?;
+                    let calibration = binary_calibration_deciles(&y_vec, &p_vec);
                     diagnostics = Some(report::DiagnosticsInput {
-                        residuals_sorted,
-                        theoretical_quantiles,
-                        y_observed: y.to_vec(),
-                        y_predicted: pred.mean.to_vec(),
-                        calibration: Some(report::CalibrationData {
-                            mean_predicted: mp,
-                            observed_rate: or,
-                        }),
+                        residuals,
+                        y_observed: y_vec,
+                        y_predicted: p_vec,
+                        calibration,
                     });
                 }
             } else if matches!(
@@ -848,53 +839,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     }
                 }
 
-                // Residual QQ data
-                let residuals: Vec<f64> =
-                    y.iter().zip(pred.mean.iter()).map(|(o, p)| o - p).collect();
-                let mut residuals_sorted = residuals.clone();
-                residuals_sorted
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let n = residuals_sorted.len().max(1);
-                let theoretical_quantiles = (0..n)
-                    .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // Calibration for binary responses
-                let calibration = if is_binary_response(y.view()) {
-                    let mut bin_pred = [0.0f64; 10];
-                    let mut bin_obs = [0.0f64; 10];
-                    let mut counts = [0usize; 10];
-                    for i in 0..y.len() {
-                        let p = pred.mean[i].clamp(0.0, 1.0);
-                        let b = ((p * 10.0).floor() as usize).min(9);
-                        bin_pred[b] += p;
-                        bin_obs[b] += y[i];
-                        counts[b] += 1;
-                    }
-                    let mut mp = Vec::new();
-                    let mut or = Vec::new();
-                    for b in 0..10 {
-                        if counts[b] > 0 {
-                            mp.push(bin_pred[b] / counts[b] as f64);
-                            or.push((bin_obs[b] / counts[b] as f64).clamp(0.0, 1.0));
-                        }
-                    }
-                    Some(report::CalibrationData {
-                        mean_predicted: mp,
-                        observed_rate: or,
-                    })
-                } else {
-                    None
-                };
-
-                diagnostics = Some(report::DiagnosticsInput {
-                    residuals_sorted,
-                    theoretical_quantiles,
-                    y_observed: y.to_vec(),
-                    y_predicted: pred.mean.to_vec(),
-                    calibration,
-                });
-
                 // ALO diagnostics: try geometry-based path from unified
                 // result first, fall back to PIRLS-based path.
                 if let Some(link) = model
@@ -938,6 +882,38 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                         Err(e) => notes.push(format!("ALO diagnostics unavailable: {e}")),
                     }
                 }
+
+                // Residual diagnostics: family-appropriate residuals with a
+                // standard-normal null (randomized-quantile / deviance),
+                // leverage-aware where ALO hat values are available, plus
+                // equal-count calibration deciles for binary responses. Raw
+                // y − μ residuals fail a normal Q-Q by construction for
+                // non-Gaussian families (Bernoulli residuals are two-valued;
+                // Poisson residual variance grows with μ).
+                let y_vec = y.to_vec();
+                let mu_vec = pred.mean.to_vec();
+                let leverage: Option<Vec<f64>> = alo_data
+                    .as_ref()
+                    .map(|a| a.rows.iter().map(|r| r.leverage).collect());
+                let residuals = report_residual_diagnostics(
+                    &family.response,
+                    &y_vec,
+                    &mu_vec,
+                    leverage.as_deref(),
+                    edf_total,
+                    &mut notes,
+                )?;
+                let calibration = if is_binary_response(y.view()) {
+                    binary_calibration_deciles(&y_vec, &mu_vec)
+                } else {
+                    None
+                };
+                diagnostics = Some(report::DiagnosticsInput {
+                    residuals,
+                    y_observed: y_vec,
+                    y_predicted: mu_vec,
+                    calibration,
+                });
 
                 // Smooth term partial-effect plots
                 for st in &spec.smooth_terms {
@@ -1006,10 +982,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
             }
         }),
         smoothing_forensics: smoothing_forensics_rows(&fit, &edf_blocks),
-        edf_total: model
-            .unified()
-            .and_then(|u| u.edf_total())
-            .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0)),
+        edf_total,
         r_squared,
         coefficients,
         edf_blocks,
@@ -1039,4 +1012,306 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Deterministic seed for the randomization component of Dunn–Smyth
+/// quantile residuals: reports must be identical run to run.
+const REPORT_RESIDUAL_SEED: u64 = 0x0D5E_ED11;
+
+/// Observation-aligned residuals whose null distribution is standard normal
+/// under a correct model — exactly so for the randomized-quantile families,
+/// asymptotically for Tweedie deviance residuals.
+struct FamilyResiduals {
+    values: Vec<f64>,
+    label: &'static str,
+}
+
+/// Build the report's residual diagnostics for one fitted family, or `None`
+/// (with an explanatory note) when no residual definition with a
+/// standard-normal null is available — the residual plots are omitted rather
+/// than drawn against a false normal reference.
+fn report_residual_diagnostics(
+    response: &ResponseFamily,
+    y: &[f64],
+    mu: &[f64],
+    leverage: Option<&[f64]>,
+    edf_total: f64,
+    notes: &mut Vec<String>,
+) -> Result<Option<report::ResidualDiagnostics>, String> {
+    match report_family_residuals(response, y, mu, leverage, edf_total) {
+        Ok(res) => {
+            let mut sorted = res.values.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = sorted.len().max(1);
+            let theoretical_quantiles = (0..n)
+                .map(|i| standard_normal_quantile((i as f64 + 0.5) / n as f64))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(report::ResidualDiagnostics {
+                values: res.values,
+                sorted,
+                theoretical_quantiles,
+                label: res.label.to_string(),
+            }))
+        }
+        Err(reason) => {
+            notes.push(format!("Residual diagnostics omitted: {reason}"));
+            Ok(None)
+        }
+    }
+}
+
+/// Family-appropriate residuals on the N(0,1) scale (Dunn & Smyth 1996).
+///
+/// Continuous families map the response through its own fitted CDF and then
+/// Φ⁻¹; discrete families draw u ~ U(F(y−1), F(y)) so u is exactly U(0,1)
+/// under a correct model. Gaussian uses the internally-studentized residual
+/// (equivalent to its quantile residual) with the √(1 − h_ii) leverage factor
+/// when hat values are available. Dispersions that the saved model does not
+/// carry (Gamma φ, Tweedie φ) use the Pearson estimate with `n − edf` degrees
+/// of freedom.
+fn report_family_residuals(
+    response: &ResponseFamily,
+    y: &[f64],
+    mu: &[f64],
+    leverage: Option<&[f64]>,
+    edf_total: f64,
+) -> Result<FamilyResiduals, String> {
+    use rand::Rng;
+    use statrs::distribution::{Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
+
+    let n = y.len().min(mu.len());
+    if n == 0 {
+        return Err("no observations".to_string());
+    }
+    // Residual degrees of freedom for the Pearson dispersion estimates.
+    let residual_dof = (n as f64 - edf_total).max(1.0);
+    let mut rng = StdRng::seed_from_u64(REPORT_RESIDUAL_SEED);
+    // Predictive CDF value → normal scale, clamped away from the exact
+    // endpoints so every plotted point stays finite.
+    let to_normal = |u: f64| standard_normal_quantile(u.clamp(1e-12, 1.0 - 1e-12));
+
+    match response {
+        ResponseFamily::Gaussian => {
+            let ssr: f64 = (0..n).map(|i| (y[i] - mu[i]).powi(2)).sum();
+            let sigma = (ssr / residual_dof).sqrt();
+            if !(sigma.is_finite() && sigma > 0.0) {
+                return Err("Gaussian residual scale is zero or non-finite".to_string());
+            }
+            let values = (0..n)
+                .map(|i| {
+                    // Var(y_i − μ̂_i) = σ²(1 − h_ii): without the leverage
+                    // factor even a correct Gaussian fit under-disperses at
+                    // high-leverage rows.
+                    let h = leverage
+                        .and_then(|l| l.get(i).copied())
+                        .filter(|h| h.is_finite())
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0 - 1e-8);
+                    (y[i] - mu[i]) / (sigma * (1.0 - h).sqrt())
+                })
+                .collect();
+            Ok(FamilyResiduals {
+                values,
+                label: "Standardized Residual",
+            })
+        }
+        ResponseFamily::Binomial => {
+            // Bernoulli: u ~ U(F(y−), F(y)) with F(0) = 1 − p, F(1) = 1.
+            let values = (0..n)
+                .map(|i| {
+                    let p = mu[i].clamp(0.0, 1.0);
+                    let v: f64 = rng.random();
+                    let u = if y[i] < 0.5 {
+                        v * (1.0 - p)
+                    } else {
+                        (1.0 - p) + v * p
+                    };
+                    to_normal(u)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Randomized Quantile Residual",
+            })
+        }
+        ResponseFamily::Poisson => {
+            let values = (0..n)
+                .map(|i| {
+                    let k = discrete_count_response(y[i], "Poisson")?;
+                    let dist = Poisson::new(mu[i].max(f64::MIN_POSITIVE))
+                        .map_err(|e| format!("Poisson residual at μ={}: {e}", mu[i]))?;
+                    let lower = if k == 0 { 0.0 } else { dist.cdf(k - 1) };
+                    let u = lower + rng.random::<f64>() * dist.pmf(k);
+                    to_normal(u)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Randomized Quantile Residual",
+            })
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            let theta = *theta;
+            if !(theta.is_finite() && theta > 0.0) {
+                return Err(format!("negative-binomial θ={theta} is not positive"));
+            }
+            let values = (0..n)
+                .map(|i| {
+                    let k = discrete_count_response(y[i], "negative-binomial")?;
+                    // Failures-before-r-th-success parameterization: r = θ and
+                    // p = θ/(θ+μ) give mean μ and variance μ + μ²/θ.
+                    let p = theta / (theta + mu[i].max(f64::MIN_POSITIVE));
+                    let dist = NegativeBinomial::new(theta, p)
+                        .map_err(|e| format!("negative-binomial residual at μ={}: {e}", mu[i]))?;
+                    let lower = if k == 0 { 0.0 } else { dist.cdf(k - 1) };
+                    let u = lower + rng.random::<f64>() * dist.pmf(k);
+                    to_normal(u)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Randomized Quantile Residual",
+            })
+        }
+        ResponseFamily::Gamma => {
+            // Pearson dispersion under V(μ) = μ²: φ̂ = Σ((y−μ)/μ)²/(n − edf).
+            let phi = (0..n)
+                .map(|i| ((y[i] - mu[i]) / mu[i]).powi(2))
+                .sum::<f64>()
+                / residual_dof;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err("Gamma dispersion estimate is not positive".to_string());
+            }
+            let shape = 1.0 / phi;
+            let values = (0..n)
+                .map(|i| {
+                    if !(y[i] > 0.0) {
+                        return Err(format!("Gamma response must be positive, got {}", y[i]));
+                    }
+                    // shape/rate with mean μ: rate = shape/μ.
+                    let dist = Gamma::new(shape, shape / mu[i])
+                        .map_err(|e| format!("Gamma residual at μ={}: {e}", mu[i]))?;
+                    to_normal(dist.cdf(y[i]))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
+            })
+        }
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(format!("Beta precision φ={phi} is not positive"));
+            }
+            let values = (0..n)
+                .map(|i| {
+                    if !(y[i] > 0.0 && y[i] < 1.0) {
+                        return Err(format!("Beta response must lie in (0,1), got {}", y[i]));
+                    }
+                    let m = mu[i].clamp(1e-12, 1.0 - 1e-12);
+                    let dist = Beta::new(m * phi, (1.0 - m) * phi)
+                        .map_err(|e| format!("Beta residual at μ={m}: {e}"))?;
+                    to_normal(dist.cdf(y[i]))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
+            })
+        }
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
+            // No practical closed-form Tweedie CDF, so use deviance residuals
+            // r = sign(y−μ)·√(d(y,μ)/φ̂) — asymptotically N(0,1) under the
+            // fitted model — with the Pearson φ̂ under V(μ) = μ^p.
+            if !(p > 1.0 && p < 2.0) {
+                return Err(format!(
+                    "Tweedie deviance residuals are implemented for power p ∈ (1,2), got {p}"
+                ));
+            }
+            let phi = (0..n)
+                .map(|i| (y[i] - mu[i]).powi(2) / mu[i].powf(p))
+                .sum::<f64>()
+                / residual_dof;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err("Tweedie dispersion estimate is not positive".to_string());
+            }
+            let values = (0..n)
+                .map(|i| {
+                    if y[i] < 0.0 {
+                        return Err(format!(
+                            "Tweedie response must be nonnegative, got {}",
+                            y[i]
+                        ));
+                    }
+                    let dev = tweedie_unit_deviance(y[i], mu[i], p);
+                    Ok((y[i] - mu[i]).signum() * (dev.max(0.0) / phi).sqrt())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Deviance Residual",
+            })
+        }
+        ResponseFamily::RoystonParmar => Err(
+            "no standard-normal residual definition is implemented for the Royston–Parmar family"
+                .to_string(),
+        ),
+    }
+}
+
+/// Validate a discrete count response and convert it to `u64`.
+fn discrete_count_response(y: f64, family: &str) -> Result<u64, String> {
+    let k = y.round();
+    if !(y.is_finite() && k >= 0.0 && (y - k).abs() <= 1e-8) {
+        return Err(format!(
+            "{family} response must be a nonnegative integer count, got {y}"
+        ));
+    }
+    Ok(k as u64)
+}
+
+/// Tweedie unit deviance for 1 < p < 2 (the compound Poisson–Gamma range):
+/// d(y,μ) = 2·[ y^{2−p}/((1−p)(2−p)) − y·μ^{1−p}/(1−p) + μ^{2−p}/(2−p) ],
+/// with the y = 0 limit d = 2·μ^{2−p}/(2−p). Zero at y = μ.
+fn tweedie_unit_deviance(y: f64, mu: f64, p: f64) -> f64 {
+    if y == 0.0 {
+        return 2.0 * mu.powf(2.0 - p) / (2.0 - p);
+    }
+    2.0 * (y.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - y * mu.powf(1.0 - p) / (1.0 - p)
+        + mu.powf(2.0 - p) / (2.0 - p))
+}
+
+/// Equal-count calibration bins for a binary response: observations are
+/// sorted by predicted probability and split into (up to) ten groups of
+/// near-equal size — true deciles. Equal-width probability bins read as
+/// "deciles" but put 90% of a skewed score distribution into one bin, so a
+/// point can summarise 9 observations or 900.
+fn binary_calibration_deciles(y: &[f64], p: &[f64]) -> Option<report::CalibrationData> {
+    let n = y.len().min(p.len());
+    if n == 0 {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let bins = 10usize.min(n);
+    let mut mean_predicted = Vec::with_capacity(bins);
+    let mut observed_rate = Vec::with_capacity(bins);
+    for b in 0..bins {
+        let lo = b * n / bins;
+        let hi = (b + 1) * n / bins;
+        if hi == lo {
+            continue;
+        }
+        let m = (hi - lo) as f64;
+        let sum_p: f64 = order[lo..hi].iter().map(|&i| p[i].clamp(0.0, 1.0)).sum();
+        let sum_y: f64 = order[lo..hi].iter().map(|&i| y[i]).sum();
+        mean_predicted.push(sum_p / m);
+        observed_rate.push((sum_y / m).clamp(0.0, 1.0));
+    }
+    Some(report::CalibrationData {
+        mean_predicted,
+        observed_rate,
+    })
 }
