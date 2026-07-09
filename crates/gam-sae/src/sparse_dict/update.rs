@@ -313,6 +313,108 @@ pub(super) fn run(
     })
 }
 
+/// The unified **linear fast kernel** (design gam#2232, Increment 2, plug points
+/// 1–3): the fixed-support linear-atom (`d = 1`) inner solve of the ONE engine.
+///
+/// This is the exact alternation of [`run`] — `route → s×s active-set code solve
+/// → MOD sparse decoder refresh → unit-norm` — but parameterized by a SINGLE
+/// shared ridge coordinate `shared_rho` that feeds BOTH
+///
+///   * the per-row active-set code/gate solve (plug point 1,
+///     [`super::codes::solve_row_codes`]), and
+///   * the per-atom decoder normal-equation refresh (plug point 2,
+///     [`solve_decoder_with_routability_gate`]),
+///
+/// with routing kept on [`TileScorer::top_s_online`] (plug point 3), never
+/// materializing `N×K`. Collapsing the historical TWO independent ridges
+/// (`code_ridge`, `decoder_ridge`) into ONE shared `shared_rho` is the `d = 1`
+/// specialization of the framed curved refresh's single shared variance
+/// component, and it is the precondition for the shared-REML selection of that
+/// component (plug point 4): a single ρ coordinate the outer evidence loop
+/// selects instead of two magic constants.
+///
+/// At `shared_rho = config.code_ridge = config.decoder_ridge` (the shared default
+/// `1e-6`) this kernel is BIT-IDENTICAL to the historical [`run`] — pinned by the
+/// TEMPORARY parity gate `linear_fast_kernel_matches_legacy_run` (design
+/// Increment 2 shim; removed in Increment 6). It is invoked from the unified
+/// engine's inner-solve seam; [`super::fit_sparse_dictionary`] remains a thin
+/// wrapper over [`run`] for now (its two-ridge FFI surface is preserved until
+/// Increment 5 re-points callers to the REML schedule).
+pub fn run_linear_fast_kernel(
+    x: ArrayView2<'_, f32>,
+    config: &SparseDictConfig,
+    shared_rho: f64,
+) -> Result<SparseDictFit, String> {
+    let mut unified = *config;
+    // ONE shared variance coordinate drives both the code and the decoder ridge:
+    // the `d = 1` specialization carries a single ρ, not two.
+    unified.code_ridge = shared_rho as f32;
+    unified.decoder_ridge = shared_rho as f32;
+    run(x, &unified)
+}
+
+/// Sufficient statistics for the linear block's ONE shared REML variance
+/// component (design gam#2232, Increment 2, plug point 4).
+///
+/// The decoder refresh is `P` independent ridge regressions `(A + ρI) D_{:,c} =
+/// B_{:,c}` (`A = CᵀC` the `K×K` code Gram, `B = CᵀX`) that SHARE the single ridge
+/// `ρ`, with an identity roughness penalty `ρ‖D‖²_F`. Reading `ρ = σ²/τ²` (noise
+/// variance over decoder prior variance) makes the refresh a Gaussian ridge whose
+/// evidence-optimal ρ is a Fellner–Schall / MacKay fixed point over exactly these
+/// aggregates.
+#[derive(Clone, Copy, Debug)]
+pub struct LinearBlockRemlStats {
+    /// Per-column effective degrees of freedom `γ = tr(A (A + ρI)⁻¹)` of the code
+    /// Gram at the current ρ. Identical across the `P` output columns because the
+    /// ridge operator `(A + ρI)⁻¹` is column-independent, so the pooled effective
+    /// dof is `P·γ`.
+    pub gram_edof: f64,
+    /// Output dimension `P` (number of decoder columns sharing ρ).
+    pub p_cols: usize,
+    /// Decoder penalty energy `‖D‖²_F = Σ_{k,c} D_{kc}²` (identity roughness), i.e.
+    /// the roughness quadratic form of the just-refreshed decoder.
+    pub penalty_energy: f64,
+    /// Reconstruction residual sum of squares `Σ_i ‖x_i − Σ_j c_{ij} d_{a_{ij}}‖²`.
+    pub rss: f64,
+    /// Rows `N` (the ridge regressions have `N·P` total observations).
+    pub n_obs: usize,
+}
+
+/// One Fellner–Schall / MacKay evidence fixed-point update of the linear block's
+/// shared ridge ρ (design gam#2232, Increment 2, plug point 4).
+///
+/// For the shared-ρ pooled ridge (see [`LinearBlockRemlStats`]) the REML fixed
+/// point is the standard evidence recursion:
+///
+/// ```text
+///   γ_tot = P · tr(A (A + ρI)⁻¹)                (pooled effective dof)
+///   σ̂²    = RSS / (N·P − γ_tot)                 (REML residual variance)
+///   τ̂²    = ‖D‖²_F / γ_tot                       (decoder prior variance)
+///   ρ_new = σ̂² / τ̂² = γ_tot · σ̂² / ‖D‖²_F
+/// ```
+///
+/// This is the ONE shared REML variance component of the design — no per-atom
+/// λ, no new optimizer, the same Fellner–Schall fixed point the outer engine
+/// runs, specialized to the `d = 1` linear block. It is guarded to stay strictly
+/// positive and finite so the next `(A + ρI)` solve stays SPD; a degenerate
+/// aggregate (all dof consumed, zero penalty energy) leaves ρ unchanged.
+pub fn linear_shared_rho_fs_step(stats: &LinearBlockRemlStats, rho: f64) -> f64 {
+    let gamma_tot = (stats.p_cols as f64) * stats.gram_edof;
+    let total_obs = (stats.n_obs.saturating_mul(stats.p_cols)) as f64;
+    let resid_dof = (total_obs - gamma_tot).max(1.0);
+    let sigma2 = stats.rss / resid_dof;
+    let energy = stats.penalty_energy;
+    if !(energy > 0.0) || !gamma_tot.is_finite() || gamma_tot <= 0.0 {
+        return rho;
+    }
+    let rho_new = gamma_tot * sigma2 / energy;
+    if rho_new.is_finite() && rho_new > 0.0 {
+        rho_new
+    } else {
+        rho
+    }
+}
+
 fn validate(x: ArrayView2<'_, f32>, config: &SparseDictConfig) -> Result<(), String> {
     if x.nrows() == 0 || x.ncols() == 0 {
         return Err("fit_sparse_dictionary requires a non-empty N×P matrix".to_string());
@@ -1941,6 +2043,102 @@ mod exact_solve_tests {
             decoder.iter().all(|v| v.is_finite()),
             "the ridge-diagonal fallback must leave a finite decoder"
         );
+    }
+
+    #[test]
+    fn linear_fast_kernel_matches_legacy_run() {
+        // TEMPORARY bit-parity gate (design gam#2232, Increment 2 shim; removed in
+        // Increment 6). The unified linear fast kernel collapses the two historical
+        // ridges into ONE shared ρ; at the shared default (code_ridge ==
+        // decoder_ridge) it MUST reproduce the legacy `fit_sparse_dictionary`
+        // (= `run`) output bit-for-bit, so the unification introduces no behavioral
+        // change at the default. This pins that contract: same decoder, indices,
+        // and codes to the last bit.
+        use super::run_linear_fast_kernel;
+        let (n, p, k) = (48usize, 5usize, 7usize);
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            for c in 0..p {
+                x[[i, c]] = (((i * 5 + c * 3 + 2) % 11) as f32 - 5.0) / 5.0;
+            }
+        }
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active: 2, // s > 1: exercises the coupled decoder solve on both paths
+            minibatch: 16,
+            max_epochs: 20,
+            score_tile: 8,
+            code_ridge: 1.0e-6,
+            decoder_ridge: 1.0e-6, // shared default: kernel must equal legacy run
+            tolerance: 1.0e-9,
+            score_mode: gam_gpu::GpuMode::Off,
+        };
+        assert_eq!(
+            config.code_ridge, config.decoder_ridge,
+            "parity gate requires the shared-default (equal-ridge) config"
+        );
+
+        let legacy = fit_sparse_dictionary(x.view(), &config).expect("legacy run");
+        let unified = run_linear_fast_kernel(x.view(), &config, config.decoder_ridge as f64)
+            .expect("unified linear fast kernel");
+
+        assert_eq!(
+            legacy.decoder, unified.decoder,
+            "unified kernel decoder must be bit-identical to legacy run"
+        );
+        assert_eq!(
+            legacy.indices, unified.indices,
+            "unified kernel indices must be bit-identical to legacy run"
+        );
+        assert_eq!(
+            legacy.codes, unified.codes,
+            "unified kernel codes must be bit-identical to legacy run"
+        );
+        assert_eq!(
+            legacy.explained_variance, unified.explained_variance,
+            "unified kernel EV must be bit-identical to legacy run"
+        );
+    }
+
+    #[test]
+    fn shared_rho_fs_step_matches_closed_form_evidence_fixed_point() {
+        // Plug point 4 math (design gam#2232, Increment 2): the shared-ρ
+        // Fellner–Schall / MacKay evidence fixed point is pure arithmetic over the
+        // pooled linear-block aggregates. Pin it against a hand-computed value.
+        use super::{LinearBlockRemlStats, linear_shared_rho_fs_step};
+        let stats = LinearBlockRemlStats {
+            gram_edof: 2.5,
+            p_cols: 3,
+            penalty_energy: 4.0,
+            rss: 10.0,
+            n_obs: 8,
+        };
+        // γ_tot = 3·2.5 = 7.5; resid_dof = 24 − 7.5 = 16.5; σ̂² = 10/16.5;
+        // ρ_new = 7.5·σ̂²/4 = 1.1363636363636365.
+        let rho_new = linear_shared_rho_fs_step(&stats, 1.0e-3);
+        assert!(
+            (rho_new - 1.136_363_636_363_636_5).abs() < 1.0e-12,
+            "FS step must match the closed-form evidence fixed point, got {rho_new}"
+        );
+
+        // Degenerate aggregates leave ρ unchanged (SPD-preserving guard):
+        // zero penalty energy, and non-positive effective dof.
+        let zero_energy = LinearBlockRemlStats { penalty_energy: 0.0, ..stats };
+        assert_eq!(linear_shared_rho_fs_step(&zero_energy, 7.0e-4), 7.0e-4);
+        let zero_edof = LinearBlockRemlStats { gram_edof: 0.0, ..stats };
+        assert_eq!(linear_shared_rho_fs_step(&zero_edof, 7.0e-4), 7.0e-4);
+
+        // All dof consumed (γ_tot ≥ N·P) floors the residual dof at 1 rather than
+        // dividing by a non-positive denominator, keeping ρ_new finite/positive.
+        let saturated = LinearBlockRemlStats {
+            gram_edof: 100.0,
+            p_cols: 3,
+            penalty_energy: 4.0,
+            rss: 10.0,
+            n_obs: 8,
+        };
+        let rho_sat = linear_shared_rho_fs_step(&saturated, 1.0e-3);
+        assert!(rho_sat.is_finite() && rho_sat > 0.0, "saturated dof keeps ρ finite/positive");
     }
 
     #[test]

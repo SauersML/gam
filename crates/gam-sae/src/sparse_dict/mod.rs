@@ -80,7 +80,9 @@ pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
-pub use update::DecoderSolveStats;
+pub use update::{
+    DecoderSolveStats, LinearBlockRemlStats, linear_shared_rho_fs_step, run_linear_fast_kernel,
+};
 
 use ndarray::{Array2, ArrayView2};
 
