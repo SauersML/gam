@@ -20,6 +20,7 @@ pub mod dictionary_artifact;
 pub mod dual_certificate;
 pub mod effect_weight;
 pub mod encode;
+pub mod eq4_description_length;
 pub mod frames;
 pub mod gpu_kernels;
 pub mod hybrid_split;

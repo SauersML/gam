@@ -45,6 +45,19 @@ impl GaussianLocationScalePredictor {
         design_noise: &DesignMatrix,
         offset_noise: Option<&Array1<f64>>,
     ) -> Result<Array1<f64>, EstimationError> {
+        let eta_noise = self.eta_noise(design_noise, offset_noise)?;
+        let scaled_floor = self.response_scale * self.sigma_floor;
+        Ok(eta_noise.mapv(|eta| {
+            gam_model_kernels::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
+        }))
+    }
+
+    /// Log-σ linear predictor `η_s = X_noise β_noise + offset_noise`.
+    fn eta_noise(
+        &self,
+        design_noise: &DesignMatrix,
+        offset_noise: Option<&Array1<f64>>,
+    ) -> Result<Array1<f64>, EstimationError> {
         let mut eta_noise = design_noise.dot(&self.beta_noise);
         if let Some(offset_noise) = offset_noise {
             if offset_noise.len() != eta_noise.len() {
@@ -56,9 +69,58 @@ impl GaussianLocationScalePredictor {
             }
             eta_noise += offset_noise;
         }
+        Ok(eta_noise)
+    }
+
+    /// Predictive observation-noise SD `sqrt(E[σ²])`, integrating the log-σ
+    /// posterior instead of plugging in its mode.
+    ///
+    /// The future response is `Y = μ(β) + σ(β_s)·Z` with `Z ~ N(0,1)`
+    /// independent of the posterior, so by the law of total variance
+    /// `Var(Y) = Var(μ̂) + E[σ²]` — the cross term vanishes because `E[Z] = 0`.
+    /// The interval engine adds `Var(μ̂) = mean_se²` itself, so the noise term
+    /// it must receive is `E[σ²]`, not the plug-in `σ(m̂)²` (audit finding 6):
+    /// with `η_s ~ N(0, 1)` the exact `E[σ²] ≈ e² ≈ 7.39` while the plug-in
+    /// reports `1`.
+    ///
+    /// With `σ = f + exp(η_s)` (`f` the scaled floor) and the per-row posterior
+    /// `η_s ~ N(m, v)`, the lognormal moments give exactly
+    ///   `E[σ²] = f² + 2·f·exp(m + v/2) + exp(2m + 2v)`,
+    /// which reduces to the plug-in `σ(m)²` at `v = 0` (also the no-covariance
+    /// degrade). An overflowing moment is reported as `+inf` rather than
+    /// replaced by a finite surrogate.
+    fn integrated_noise_sd(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale prediction requires noise design matrix".to_string(),
+            )
+        })?;
+        let eta_noise = self.eta_noise(design_noise, input.offset_noise.as_ref())?;
         let scaled_floor = self.response_scale * self.sigma_floor;
-        Ok(eta_noise.mapv(|eta| {
-            gam_model_kernels::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
+        let log_sigma_var = match self.covariance.as_ref() {
+            Some(covariance) => {
+                let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+                let p_mu = self.beta_mu.len();
+                let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+                // Coefficient layout is `[mean | scale | wiggle]`, so the log-σ
+                // block sits after the `p_mu` mean columns.
+                let se = padded_design_standard_errors_from_backend(
+                    design_noise,
+                    &backend,
+                    p_mu,
+                    p_w,
+                    "gaussian location-scale log-sigma uncertainty",
+                )?;
+                se.mapv(|s| s * s)
+            }
+            None => Array1::zeros(eta_noise.len()),
+        };
+        Ok(Array1::from_shape_fn(eta_noise.len(), |i| {
+            let m = eta_noise[i];
+            let v = log_sigma_var[i];
+            let e1 = (m + 0.5 * v).exp();
+            let e2 = (2.0 * m + 2.0 * v).exp();
+            (scaled_floor * scaled_floor + 2.0 * scaled_floor * e1 + e2).sqrt()
         }))
     }
 
@@ -216,13 +278,10 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "Gaussian location-scale prediction requires noise design matrix".to_string(),
-            )
-        })?;
-        self.compute_sigma(design_noise, input.offset_noise.as_ref())
-            .map(Some)
+        // The predictive band needs `E[σ²]` under the log-σ posterior, not the
+        // plug-in σ(m̂) — see `integrated_noise_sd`. The fitted σ *surface*
+        // (plug-in) remains available through `predict_noise_scale`.
+        self.integrated_noise_sd(input).map(Some)
     }
 }
 

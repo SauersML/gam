@@ -453,9 +453,12 @@ impl ReducedLogslopeReparam {
 /// [`ReducedLogslopeReparam`]) from the rigid-pilot EFFECTIVE Jacobian geometry,
 /// in the PIRLS row metric `W`. Extracts the dense pilot designs and delegates
 /// the geometry to [`reduced_logslope_transform_effective`]. Returns `Ok(None)`
-/// when there is no logslope/marginal span, no effective-confounded direction to
-/// remove (`r == p_g`), or the whole effective logslope image is in the effective
-/// marginal span (`r == 0`); in those cases the caller keeps the raw design.
+/// when there is no logslope/marginal span or no effective-confounded direction
+/// to remove (`r == p_g`); the caller then keeps the raw design. A fully
+/// confounded block (`r == 0`: the entire effective logslope image is
+/// W-explained by the effective marginal span) is an error: the data identify
+/// only the sum of the marginal and score-slope surfaces, so any fitted
+/// decomposition would be an arbitrary penalty artifact.
 fn build_reduced_logslope_reparam(
     marginal_design: &TermCollectionDesign,
     logslope_design: &TermCollectionDesign,
@@ -531,20 +534,50 @@ fn build_reduced_logslope_reparam(
         logslope_baseline,
         probit_scale,
     )? {
-        Some(transform) => Ok(Some(ReducedLogslopeReparam { transform })),
-        None => Ok(None),
+        ReducedLogslopeOutcome::Reduced(transform) => {
+            Ok(Some(ReducedLogslopeReparam { transform }))
+        }
+        ReducedLogslopeOutcome::FullRank => Ok(None),
+        ReducedLogslopeOutcome::FullyConfounded => Err(
+            "BMS score-slope block is fully confounded with the marginal index: every \
+             effective logslope direction diag(f)·G·v is W-explained by the effective \
+             marginal span at the rigid pilot, so the data identify only the sum of the \
+             marginal and score-slope surfaces and the smoothing penalty would select an \
+             arbitrary decomposition between them. Refusing to fit; remove the score-slope \
+             terms or supply covariates that separate them from the marginal index."
+            .to_string(),
+        ),
     }
+}
+
+/// Distinct outcomes of the effective logslope confound audit. `FullRank`
+/// (nothing to reduce, `r == p_g`) and `FullyConfounded` (`r == 0`) must not
+/// share a signal: keeping the raw design is correct for the former, while for
+/// the latter the data identify only a combination of the marginal and
+/// score-slope surfaces, and silently retaining the raw columns would let the
+/// penalty pick an arbitrary decomposition and report it as an estimate.
+pub(crate) enum ReducedLogslopeOutcome {
+    /// Every effective logslope direction carries its own curvature; keep the
+    /// raw design.
+    FullRank,
+    /// `0 < r < p_g`: the reduced basis `T` (`p_g × r`) spanning the
+    /// identifiable directions.
+    Reduced(Array2<f64>),
+    /// `r == 0`: the entire effective logslope image is W-explained by the
+    /// effective marginal span — the block is unidentified.
+    FullyConfounded,
 }
 
 /// Build the reduced logslope basis `T` (p_g × r) from the EFFECTIVE BMS pilot
 /// geometry, in the PIRLS row metric `W`. `T`'s columns span the raw logslope
 /// coefficient directions whose effective image `diag(f)·G·v` is NOT W-explained
 /// by `span(diag(c)·M)` — i.e. the directions the joint Hessian retains real
-/// curvature along. Returns `Ok(None)` when there is nothing to reduce
-/// (`r == p_g`) or when the entire effective logslope image collapses into the
-/// effective marginal span (`r == 0`); in both cases the caller keeps the raw
-/// design (a zero-width reduction would silently delete the score-effect surface,
-/// which is the estimand — the REML penalty regularises any residual softness).
+/// curvature along. Returns [`ReducedLogslopeOutcome::FullRank`] when there is
+/// nothing to reduce (`r == p_g`, raw design kept) and
+/// [`ReducedLogslopeOutcome::FullyConfounded`] when the entire effective
+/// logslope image collapses into the effective marginal span (`r == 0`), so the
+/// caller can refuse the unidentified block instead of conflating the two
+/// cases.
 ///
 /// At the rigid pilot the effective Jacobians are
 ///     M_eff = diag(c) · M,   c_i = sqrt(1 + (s·g_i)²)
@@ -564,12 +597,12 @@ pub(crate) fn reduced_logslope_transform_effective(
     marginal_baseline: f64,
     logslope_baseline: f64,
     probit_scale: f64,
-) -> Result<Option<Array2<f64>>, String> {
+) -> Result<ReducedLogslopeOutcome, String> {
     let n = marginal.nrows();
     let p_m = marginal.ncols();
     let p_g = logslope.ncols();
     if p_m == 0 || p_g == 0 {
-        return Ok(None);
+        return Ok(ReducedLogslopeOutcome::FullRank);
     }
 
     // Effective pilot Jacobians M_eff = diag(c)·M and G_eff = diag(f)·G.
@@ -593,8 +626,16 @@ pub(crate) fn reduced_logslope_transform_effective(
     // sets the energy scale for the relative kept-direction tolerance.
     let c_gram = fast_xt_diag_x(&g_eff, row_metric);
     let energy_scale = (0..p_g).map(|i| c_gram[[i, i]]).fold(0.0_f64, f64::max);
-    if !energy_scale.is_finite() || energy_scale <= 0.0 {
-        return Ok(None);
+    if !energy_scale.is_finite() {
+        return Err(
+            "reduced logslope reparam: effective logslope Gram produced non-finite energy"
+                .to_string(),
+        );
+    }
+    if energy_scale <= 0.0 {
+        // A zero effective logslope image (f_i·G_i ≡ 0 in W) carries no joint-
+        // Hessian curvature at all — trivially W-explained by any span.
+        return Ok(ReducedLogslopeOutcome::FullyConfounded);
     }
 
     // A = M_effᵀ W M_eff + εI (ridge relative to the marginal effective energy so
@@ -644,11 +685,16 @@ pub(crate) fn reduced_logslope_transform_effective(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let r = kept.len();
-    // r == p_g: no effective-confounded direction to remove. r == 0: the whole
-    // effective logslope image is in the effective marginal span. In both cases
-    // install no transform (see fn-level doc) and keep the raw design.
-    if r == p_g || r == 0 {
-        return Ok(None);
+    // r == p_g: no effective-confounded direction to remove — keep the raw
+    // design. r == 0: the whole effective logslope image is in the effective
+    // marginal span — a distinct outcome the caller must refuse, never a
+    // keep-the-raw-design signal (the raw columns would be an arbitrary
+    // penalty-selected decomposition of an unidentified sum).
+    if r == p_g {
+        return Ok(ReducedLogslopeOutcome::FullRank);
+    }
+    if r == 0 {
+        return Ok(ReducedLogslopeOutcome::FullyConfounded);
     }
     let mut transform = Array2::<f64>::zeros((p_g, r));
     for (out_col, &src) in kept.iter().enumerate() {
@@ -659,7 +705,7 @@ pub(crate) fn reduced_logslope_transform_effective(
             "reduced logslope reparam: reduced transform produced non-finite entries".to_string(),
         );
     }
-    Ok(Some(transform))
+    Ok(ReducedLogslopeOutcome::Reduced(transform))
 }
 
 /// Apply a [`ReducedLogslopeReparam`] to a logslope `TermCollectionDesign`,
@@ -1105,7 +1151,7 @@ mod runaway_tests {
 
         // diag(z)·G[:,0] = [1·1, 0.5·2, (1/3)·3] = [1,1,1] = M_eff (fully aliased);
         // diag(z)·G[:,1] = [1·1, 0.5·2, (1/3)·9] = [1,1,3] (NOT in span([1,1,1])).
-        let reparam = reduced_logslope_transform_effective(
+        let reparam = match reduced_logslope_transform_effective(
             m.view(),
             g.view(),
             &z,
@@ -1117,7 +1163,17 @@ mod runaway_tests {
             1.0,
         )
         .expect("effective reduction must succeed")
-        .expect("effective audit must reduce the score-weighted confound (raw audit would not)");
+        {
+            ReducedLogslopeOutcome::Reduced(t) => t,
+            other => panic!(
+                "effective audit must reduce the score-weighted confound (raw audit would not), got {}",
+                match other {
+                    ReducedLogslopeOutcome::FullRank => "FullRank",
+                    ReducedLogslopeOutcome::FullyConfounded => "FullyConfounded",
+                    ReducedLogslopeOutcome::Reduced(_) => unreachable!(),
+                }
+            ),
+        };
         assert_eq!(
             reparam.ncols(),
             1,
@@ -1147,17 +1203,18 @@ mod runaway_tests {
 
     // The single-column fully-confounded case: G=[1,2,3]ᵀ, z=[1,1/2,1/3] gives
     // G_eff=[1,1,1]=M_eff, so the entire effective logslope image is in the
-    // effective marginal span (r==0). The helper returns None (keep the raw
-    // design) rather than emitting a zero-width transform that would delete the
-    // score-effect surface.
+    // effective marginal span (r==0). The helper must report the distinct
+    // FullyConfounded outcome — NOT the FullRank keep-the-raw-design signal —
+    // because the data identify only the sum of the two surfaces and the
+    // caller must refuse the block.
     #[test]
-    pub(crate) fn effective_reduction_fully_confounded_single_column_returns_none() {
+    pub(crate) fn effective_reduction_fully_confounded_single_column_is_distinct_outcome() {
         let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
         let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
         let w = Array1::<f64>::ones(3);
         let zero = Array1::<f64>::zeros(3);
-        let reparam = reduced_logslope_transform_effective(
+        let outcome = reduced_logslope_transform_effective(
             m.view(),
             g.view(),
             &z,
@@ -1170,8 +1227,8 @@ mod runaway_tests {
         )
         .expect("effective reduction must succeed");
         assert!(
-            reparam.is_none(),
-            "fully effective-confounded logslope must keep raw design (None), not a 0-width block"
+            matches!(outcome, ReducedLogslopeOutcome::FullyConfounded),
+            "fully effective-confounded logslope must surface the distinct FullyConfounded outcome"
         );
     }
 
@@ -1185,7 +1242,7 @@ mod runaway_tests {
         let z = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let w = Array1::<f64>::ones(3);
         let zero = Array1::<f64>::zeros(3);
-        let reparam = reduced_logslope_transform_effective(
+        let outcome = reduced_logslope_transform_effective(
             m.view(),
             g.view(),
             &z,
@@ -1198,8 +1255,8 @@ mod runaway_tests {
         )
         .expect("effective reduction must succeed");
         assert!(
-            reparam.is_none(),
-            "no effective confound ⇒ no reduction (raw design kept unchanged)"
+            matches!(outcome, ReducedLogslopeOutcome::FullRank),
+            "no effective confound ⇒ FullRank (raw design kept unchanged)"
         );
     }
 

@@ -41,8 +41,8 @@ impl DispersionLocationScalePredictor {
     }
 
     /// Log-precision linear predictor `eta_d = X_noise @ beta_noise +
-    /// offset_noise`, mapped to `precision = exp(eta_d)`.
-    fn precision(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
+    /// offset_noise` (before the exp map).
+    fn eta_precision(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "dispersion location-scale prediction requires noise design matrix".to_string(),
@@ -59,9 +59,108 @@ impl DispersionLocationScalePredictor {
             }
             eta_d += offset_noise;
         }
-        // `exp(eta_d)` is the precision; floor it away from zero so the
-        // mean–variance law below never divides by zero on underflow.
-        Ok(eta_d.mapv(|v| v.exp().max(f64::MIN_POSITIVE)))
+        Ok(eta_d)
+    }
+
+    /// `precision = exp(eta_d)`, floored away from zero so the mean–variance
+    /// law never divides by zero on underflow.
+    fn precision(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
+        Ok(self
+            .eta_precision(input)?
+            .mapv(|v| v.exp().max(f64::MIN_POSITIVE)))
+    }
+
+    /// The family's conditional response variance `Var(Y | μ, precision)`.
+    /// `None` for a response that is not a dispersion location-scale family
+    /// (a classification error upstream; callers choose their own degrade).
+    fn conditional_response_variance(
+        response: &ResponseFamily,
+        mu: f64,
+        prec: f64,
+    ) -> Option<f64> {
+        let var = match response {
+            ResponseFamily::NegativeBinomial { .. } => mu + mu * mu / prec,
+            ResponseFamily::Gamma => mu * mu / prec,
+            ResponseFamily::Beta { .. } => mu * (1.0 - mu) / (1.0 + prec),
+            ResponseFamily::Tweedie { p } => mu.powf(*p) / prec,
+            _ => return None,
+        };
+        Some(var.max(0.0))
+    }
+
+    /// `E[Var(Y | μ(η_μ), precision(η_d))]` under the joint per-row posterior
+    /// of the two linear predictors — the observation-noise term of the law of
+    /// total variance `Var(Y) = E[Var(Y|·)] + Var(μ̂)`. The interval engine adds
+    /// `Var(μ̂) = mean_se²` itself, so handing it the plug-in
+    /// `Var(Y | μ̂, preĉ)` understates the predictive spread whenever the mean
+    /// or log-precision predictor is uncertain (audit finding 6) — e.g. the
+    /// Gamma law `μ²/ν` at `η_d ~ N(m, v)` has `E[1/ν] = e^{v/2}/ν̂`, not
+    /// `1/ν̂`, and the mean–precision posterior covariance enters through the
+    /// joint integral.
+    ///
+    /// Integrated with the same projected bivariate quadrature the posterior
+    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)`; with
+    /// no stored covariance the integral degenerates to the plug-in law.
+    fn integrated_response_variance(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let eta_mu = self.eta_mean(input);
+        let eta_d = self.eta_precision(input)?;
+        if eta_mu.len() != eta_d.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "dispersion location-scale mean/precision length mismatch: {} vs {}",
+                eta_mu.len(),
+                eta_d.len()
+            )));
+        }
+        let n = eta_mu.len();
+        let response = &self.likelihood.response;
+        let strategy = self.strategy();
+        let (var_mu, var_d, cov_md) = match self.covariance.as_ref() {
+            Some(covariance) => {
+                let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "dispersion location-scale prediction requires noise design matrix"
+                            .to_string(),
+                    )
+                })?;
+                let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+                project_two_block_linear_predictor_covariance(
+                    &input.design,
+                    design_noise,
+                    &backend,
+                    self.beta_mu.len(),
+                    self.beta_noise.len(),
+                    "dispersion location-scale observation noise",
+                )?
+            }
+            None => (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n)),
+        };
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        let mut variance = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            variance[i] = projected_bivariate_posterior_mean_result(
+                &quadctx,
+                [eta_mu[i], eta_d[i]],
+                [
+                    [var_mu[i].max(0.0), cov_md[i]],
+                    [cov_md[i], var_d[i].max(0.0)],
+                ],
+                |t, d| {
+                    let mu = strategy.inverse_link(t)?;
+                    let prec = d.exp().max(f64::MIN_POSITIVE);
+                    Self::conditional_response_variance(response, mu, prec).ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "dispersion location-scale observation noise: {response:?} is not a \
+                             dispersion location-scale family"
+                        ))
+                    })
+                },
+            )?
+            .max(0.0);
+        }
+        Ok(variance)
     }
 
     /// Observation-scale predictive standard deviation `sqrt(Var(y))` from the
@@ -83,21 +182,13 @@ impl DispersionLocationScalePredictor {
         }
         let response = &self.likelihood.response;
         let variance = Array1::from_shape_fn(mean.len(), |i| {
-            let mu = mean[i];
-            let prec = precision[i];
-            let var = match response {
-                ResponseFamily::NegativeBinomial { .. } => mu + mu * mu / prec,
-                ResponseFamily::Gamma => mu * mu / prec,
-                ResponseFamily::Beta { .. } => mu * (1.0 - mu) / (1.0 + prec),
-                ResponseFamily::Tweedie { p } => mu.powf(*p) / prec,
-                // The dispersion location-scale class only routes the four
-                // overdispersion mean families above; any other response is a
-                // classification error upstream. Report a Gaussian-style scalar
-                // variance (`1/precision`) rather than panic so a corrupt model
-                // degrades gracefully instead of aborting prediction.
-                _ => 1.0 / prec,
-            };
-            var.max(0.0)
+            // The dispersion location-scale class only routes the four
+            // overdispersion mean families; any other response is a
+            // classification error upstream. Report a Gaussian-style scalar
+            // variance (`1/precision`) rather than panic so a corrupt model
+            // degrades gracefully instead of aborting prediction.
+            Self::conditional_response_variance(response, mean[i], precision[i])
+                .unwrap_or(1.0 / precision[i])
         });
         Ok(variance.mapv(f64::sqrt))
     }
@@ -227,7 +318,11 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        self.noise_sd(input).map(Some)
+        // The predictive band needs `E[Var(Y|·)]` under the joint (η_μ, η_d)
+        // posterior, not the plug-in law — see `integrated_response_variance`.
+        // The fitted noise *surface* (plug-in) remains available through
+        // `predict_noise_scale`.
+        Ok(Some(self.integrated_response_variance(input)?.mapv(f64::sqrt)))
     }
 
     /// Skew-aware **equal-tailed** observation band for the dispersion

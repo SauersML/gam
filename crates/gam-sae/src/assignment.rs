@@ -2252,6 +2252,23 @@ fn ibp_prior_penalty(
 }
 
 pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+    assignment_prior_value_weighted(assignment, rho, None)
+}
+
+/// As [`assignment_prior_value`], but with #991 design-honesty per-row weights:
+/// row `i`'s per-row prior contribution is scaled by `w_i` (mean-1). This is the
+/// per-row latent prior's analog of the `√w_i`-weighted data likelihood and the
+/// `w_i`-weighted `ard_value` — each retained row of a design-honest subsample
+/// stands in for `w_i` population rows, so its routing prior carries `w_i` too.
+/// `None` ⇒ the unweighted path, bit-for-bit. Softmax/JumpReLU are row-separable
+/// and fully weighted here; the IBP prior lives in the un-owned `ibp.rs` penalty
+/// and is left unweighted (self-consistent) until that penalty gains a per-row
+/// weight hook — see the module note on `assignment_prior_grad_hdiag`.
+pub(crate) fn assignment_prior_value_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+) -> f64 {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)
             .expect("assignment logits must be finite");
@@ -2272,7 +2289,8 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
+                .with_row_weights(row_weights);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             penalty.value(target.view(), rho_view.view())
         }
@@ -2298,7 +2316,10 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
                     continue;
                 }
                 if jumprelu_in_optimization_band(logit, threshold, temperature) {
-                    acc += gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
+                    // #991 — this row stands in for `w_i` population rows.
+                    let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
+                    acc += w_row
+                        * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
                 }
             }
             sparsity_strength * acc
@@ -2312,6 +2333,17 @@ pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifo
 pub(crate) fn assignment_prior_log_strength_derivative(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
+) -> f64 {
+    assignment_prior_log_strength_derivative_weighted(assignment, rho, None)
+}
+
+/// #991-weighted [`assignment_prior_log_strength_derivative`]. Softmax/JumpReLU
+/// route through the `w_i`-weighted value; IBP stays unweighted (un-owned
+/// `ibp.rs`).
+pub(crate) fn assignment_prior_log_strength_derivative_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
 ) -> f64 {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)
@@ -2327,7 +2359,7 @@ pub(crate) fn assignment_prior_log_strength_derivative(
     }
     match assignment.mode {
         AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. } => {
-            assignment_prior_value(assignment, rho)
+            assignment_prior_value_weighted(assignment, rho, row_weights)
         }
         AssignmentMode::IBPMap {
             temperature, alpha, ..
@@ -2350,6 +2382,16 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
+    assignment_prior_log_strength_hdiag_weighted(assignment, rho, None)
+}
+
+/// #991-weighted [`assignment_prior_log_strength_hdiag`]. Softmax/JumpReLU carry
+/// `w_i` per row; IBP stays unweighted (un-owned `ibp.rs`).
+pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+) -> Result<Array1<f64>, String> {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -2366,7 +2408,8 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
+                .with_row_weights(row_weights);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             let mut d = penalty
                 .hessian_diag(target.view(), rho_view.view())
@@ -2399,7 +2442,9 @@ pub(crate) fn assignment_prior_log_strength_hdiag(
                 }
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
+                // #991 — row `idx / k`'s design weight.
+                let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
+                d[idx] = w_row * sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
             }
             Ok(d)
         }
@@ -2447,6 +2492,17 @@ pub(crate) fn assignment_prior_log_strength_target_mixed(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
+    assignment_prior_log_strength_target_mixed_weighted(assignment, rho, None)
+}
+
+/// #991-weighted [`assignment_prior_log_strength_target_mixed`]. The fixed-α
+/// fall-through reuses the `w_i`-weighted gradient; the learnable-α IBP branch
+/// lives in the un-owned `ibp.rs` penalty and stays unweighted.
+pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+) -> Result<Array1<f64>, String> {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -2472,13 +2528,35 @@ pub(crate) fn assignment_prior_log_strength_target_mixed(
             mask_fixed_logit_entries(assignment, &mut d);
             Ok(d)
         }
-        _ => Ok(assignment_prior_grad_hdiag(assignment, rho)?.0),
+        _ => Ok(assignment_prior_grad_hdiag_weighted(assignment, rho, row_weights)?.0),
     }
 }
 
 pub(crate) fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    assignment_prior_grad_hdiag_weighted(assignment, rho, None)
+}
+
+/// #991-weighted [`assignment_prior_grad_hdiag`] — the per-(row, atom) logit
+/// gradient and Hessian diagonal of the assignment prior, each row scaled by its
+/// design weight `w_i`. Softmax/JumpReLU are fully weighted (row-separable); the
+/// IBP prior is in the un-owned `ibp.rs` penalty and is left unweighted, so a
+/// design-honesty subsample under IBP routing keeps its current (self-consistent)
+/// prior strength — closing that gap needs a per-row weight hook on
+/// `IBPAssignmentPenalty::{value, grad_target, hessian_diag, grad_rho,
+/// hessian_diag_logit_third_channels}`.
+///
+/// The assembly (`construction_arrow_schur_assembly`) consumes THIS gradient
+/// unchanged for `gt`; the softmax curvature written to `htt` is the per-row
+/// Gershgorin/`row_psd_majorizer` block, which its call sites weight by folding
+/// `w_row` into the `scale` they pass — so the softmax gradient and curvature
+/// both carry `w_i` without any double application.
+pub(crate) fn assignment_prior_grad_hdiag_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
@@ -2494,7 +2572,8 @@ pub(crate) fn assignment_prior_grad_hdiag(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
+                .with_row_weights(row_weights);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
@@ -2531,6 +2610,7 @@ pub(crate) fn assignment_prior_grad_hdiag(
             let sparsity_strength = rho.lambda_sparse();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
+            let k = assignment.k_atoms();
             let mut g = Array1::<f64>::zeros(target.len());
             let mut d = Array1::<f64>::zeros(target.len());
             for idx in 0..target.len() {
@@ -2540,8 +2620,11 @@ pub(crate) fn assignment_prior_grad_hdiag(
                 }
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                g[idx] = sparsity_strength * slope * inv_tau;
-                d[idx] = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
+                // #991 — row `idx / k`'s design weight scales this row's prior
+                // gradient AND curvature identically (both linear in strength).
+                let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
+                g[idx] = w_row * sparsity_strength * slope * inv_tau;
+                d[idx] = w_row * sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
             }
             (g, d)
         }

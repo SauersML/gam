@@ -1381,14 +1381,22 @@ fn probit_logp_and_grad_into(
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
-    if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
-        gam_problem::bail_invalid_estim!(
-            "cloglog eta must be finite and within [-700, 700]; got {eta}"
-        );
+    if !eta.is_finite() {
+        gam_problem::bail_invalid_estim!("cloglog eta must be finite; got {eta}");
     }
     let exp_eta = eta.exp();
-    // log_mu = log(1 - exp(-exp_eta)); exp_eta > 0 on the guarded domain, so this is
-    // exactly the canonical cancellation-free log1mexp (single source of truth).
+    // Deep left tail: exp(η) underflows to zero below η ≈ −745, but the exact
+    // limits are log μ = log(1 − exp(−e^η)) → η and d(log μ)/dη → 1, so the
+    // valid finite log-density is preserved instead of degenerating to
+    // log(0) = −∞. (Previously any η outside an arbitrary ±700 window was
+    // declared impossible, truncating the sampled posterior.)
+    if exp_eta == 0.0 {
+        let ll_i = y * eta; // (1 − y)·(−exp_eta) is exactly 0 here
+        let residual_i = y; // grad_log_mu → 1, (1 − y)·exp_eta → 0
+        return Ok((ll_i, residual_i));
+    }
+    // log_mu = log(1 - exp(-exp_eta)); exp_eta > 0 here, so this is exactly
+    // the canonical cancellation-free log1mexp (single source of truth).
     let log_mu = crate::probability::log1mexp_positive(exp_eta);
     let log_one_minus_mu = -exp_eta;
     let grad_log_mu = (eta - exp_eta - log_mu).exp();
@@ -1410,10 +1418,7 @@ fn cloglog_logp_and_grad_into(
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     assert_eq!(residual.len(), n);
-    if eta
-        .iter()
-        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
-    {
+    if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let ll: f64 = residual
@@ -1431,6 +1436,12 @@ fn cloglog_logp_and_grad_into(
         })
         .sum();
 
+    // A finite η can still exhaust binary64 (y = 0 with exp(η) overflowing):
+    // that is a genuine log-density underflow, rejected as −∞ with a zero
+    // gradient — not an a-priori support window.
+    if !ll.is_finite() {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
 }
@@ -1487,10 +1498,12 @@ fn gaussian_logp_and_grad_into(
 fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    if eta
-        .iter()
-        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
-    {
+    // Only non-finite η invalidates the target. Any finite η has a valid
+    // log-density (e.g. y = 0, η = −701 gives ℓ = −exp(−701) ≈ 0); the old
+    // ±700 window declared such points impossible and truncated the
+    // posterior. Genuine binary64 exhaustion (exp(η) overflowing against a
+    // positive count) is caught after the sum below.
+    if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let mut residual = Array1::<f64>::zeros(n);

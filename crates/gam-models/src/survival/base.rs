@@ -1222,16 +1222,30 @@ impl WorkingModelSurvival {
         }
     }
 
-    fn stabilized_structural_derivative(&self, deriv: f64) -> Option<f64> {
+    /// Clamped structural derivative: `max(deriv, floor)` for derivatives
+    /// above the roundoff tolerance, `None` outside structural monotonicity
+    /// or for genuinely negative derivatives.
+    ///
+    /// Returns `(value, slope)` where `slope` is the exact derivative of the
+    /// clamp itself: 1 on the identity branch, 0 on the floored branch.
+    /// Every consumer that differentiates through the structural derivative
+    /// MUST scale its derivative-channel terms by `slope` — the floored
+    /// branch is locally constant in β, so gradients and Hessians of
+    /// `ln(value)` and `1/value` are exactly zero there. Emitting the
+    /// reciprocal-scale terms of the UNclamped expression (≈1e12 gradient,
+    /// ≈1e24 curvature at deriv = 5e-13) against a value branch that is flat
+    /// desynchronizes the objective from its derivatives.
+    fn stabilized_structural_derivative(&self, deriv: f64) -> Option<(f64, f64)> {
         const STRUCTURAL_MONO_ROUNDOFF_TOL: f64 = 1e-7;
+        const STRUCTURAL_DERIV_FLOOR: f64 = 1e-12;
         if !self.structurally_monotonic {
             return None;
         }
-        if deriv >= 1e-12 {
-            return Some(deriv);
+        if deriv >= STRUCTURAL_DERIV_FLOOR {
+            return Some((deriv, 1.0));
         }
         if deriv >= -STRUCTURAL_MONO_ROUNDOFF_TOL {
-            return Some(1e-12);
+            return Some((STRUCTURAL_DERIV_FLOOR, 0.0));
         }
         None
     }
@@ -1861,9 +1875,9 @@ impl WorkingModelSurvival {
             };
             let interval_scaled = h_e_scaled - h_s_scaled;
             let interval = Self::scaled_exp_component(interval_scale, interval_scaled)?;
-            let deriv = self
+            let (deriv, deriv_slope) = self
                 .stabilized_structural_derivative(derivative_raw[i])
-                .unwrap_or(derivative_raw[i]);
+                .unwrap_or((derivative_raw[i], 1.0));
             // Monotonicity of η(t) = log H(t) is a structural property of the
             // whole Royston-Parmar spline. If d_eta/dt is *strictly negative*
             // at any observed exit time, the cumulative hazard H(t) decreases
@@ -1912,7 +1926,10 @@ impl WorkingModelSurvival {
             w_hess_entry[i] = w_entry_i;
 
             if d > 0.0 {
-                let inv_deriv = 1.0 / deriv;
+                // `deriv_slope` is the derivative of the structural clamp: on
+                // the floored branch the NLL's `ln(deriv)` term is locally
+                // constant in β, so its score and curvature channels vanish.
+                let inv_deriv = deriv_slope / deriv;
                 nll += -w * (eta_exit[i] + deriv.ln());
                 w_event[i] = w;
                 w_event_inv_deriv[i] = w * inv_deriv;
@@ -2117,16 +2134,20 @@ impl WorkingModelSurvival {
             }
 
             // Event part: d/dbeta [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u_k]
-            let s_i = self
+            let (s_i, s_slope) = self
                 .stabilized_structural_derivative(deriv_raw[i])
-                .unwrap_or(deriv_raw[i]);
+                .unwrap_or((deriv_raw[i], 1.0));
             if !s_i.is_finite() {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "survival monotonicity violated in unified trace contraction at row {i}: \
                      d_eta/dt={s_i:.3e} <= tolerance={guard:.3e}",
                 )));
             }
-            if self.event_target[i] > 0 {
+            if self.event_target[i] > 0 && s_slope != 0.0 {
+                // On the floored clamp branch (slope 0) the event Hessian
+                // block is identically zero in a neighborhood of β, so its
+                // directional derivative vanishes and the whole event part is
+                // skipped.
                 if s_i < guard_numerical {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated in unified trace contraction at row {i}: \
@@ -2248,9 +2269,9 @@ impl WorkingModelSurvival {
             // censored) falsifies S(t); event rows additionally need
             // `deriv > guard` because `1/deriv` enters their score.
             let deriv_raw = derivative_raw[i];
-            let deriv = self
+            let (deriv, deriv_slope) = self
                 .stabilized_structural_derivative(deriv_raw)
-                .unwrap_or(deriv_raw);
+                .unwrap_or((deriv_raw, 1.0));
             let mono_floor = if d > 0.0 {
                 derivative_guard_numerical
             } else {
@@ -2262,7 +2283,9 @@ impl WorkingModelSurvival {
                 )));
             }
             if d > 0.0 {
-                r_deriv[i] = -w * d / deriv;
+                // The clamp slope zeroes the residual on the floored branch,
+                // matching update_state's flat `ln(deriv)` value there.
+                r_deriv[i] = -w * d * deriv_slope / deriv;
             }
         }
 

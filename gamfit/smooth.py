@@ -572,11 +572,22 @@ class Pca(Smooth):
     Parameters
     ----------
     K : latent rank. Required by formula use; defaults to the provided
-        basis width when ``basis`` is supplied.
+        basis width when ``basis`` is supplied. When both ``K`` and ``basis``
+        are given, every evaluation path projects through the FIRST ``K``
+        basis columns (``basis[:, :K]``) and ``basis_size`` reports ``K``.
     basis : optional array-like of shape ``(D, K)``. A fixed precomputed
         projection matrix, e.g. ``_pca_basis.load_pc_basis(K=64)``.
     lazy_path : optional path to a memmap-able ``.npy`` scores matrix ``(N, K)``.
     centered : if True, subtract the training feature mean before projection.
+        The mean is resolved once — from ``mean`` when supplied, otherwise
+        from the rows of the FIRST evaluation (the fit/transform contract,
+        like auto-resolved B-spline knots) — and cached on ``mean`` so every
+        later prediction applies the same fixed affine map. Deriving the mean
+        from each evaluation batch would make one row's projection depend on
+        unrelated rows in the same call.
+    mean : optional array-like of shape ``(D,)``. Explicit training feature
+        mean for ``centered=True``; auto-resolved and cached on first
+        evaluation when omitted.
     smooth_penalty : ridge multiplier for PCA coefficients.
     """
 
@@ -585,6 +596,7 @@ class Pca(Smooth):
     lazy_path: Path | None = None
     chunk_size: int = 4096
     centered: bool = True
+    mean: Any | None = None
     smooth_penalty: float = 1.0
 
     def __init__(
@@ -594,6 +606,7 @@ class Pca(Smooth):
         lazy_path: Path | None = None,
         chunk_size: int = 4096,
         centered: bool = True,
+        mean: Any | None = None,
         name: str | None = None,
         smooth_penalty: float = 1.0,
         by: Any | None = None,
@@ -609,6 +622,7 @@ class Pca(Smooth):
         self.lazy_path = None if lazy_path is None else Path(lazy_path)
         self.chunk_size = int(chunk_size)
         self.centered = centered
+        self.mean = mean
         self.smooth_penalty = smooth_penalty
 
     @property
@@ -622,9 +636,11 @@ class Pca(Smooth):
     @property
     def basis_size(self) -> int:
         if self.basis is not None:
-            import numpy as np
+            from ._basis_eval import pca_basis_matrix
 
-            return int(np.asarray(self.basis).shape[1])
+            # The projection every evaluator applies is basis[:, :K]; the
+            # advertised size must be the width of that same matrix.
+            return int(pca_basis_matrix(self).shape[1])
         if self.K is None:
             raise ValueError("Pca.basis_size: K or basis must be provided")
         return int(self.K)

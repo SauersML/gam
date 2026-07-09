@@ -8087,34 +8087,18 @@ impl SaeManifoldTerm {
             // #932 FRONT C: row-local Takahashi (O(q·(q+K))) on the plain arrow;
             // per-row full-system `solve` loop (O(n·q)) under gauge / cross-row
             // Woodbury where the row-local blocks are not valid.
-            let (inv_vv, inv_vbeta) = if fast_selected {
-                solver
-                    .selected_inverse_row_blocks(row, &beta_inv)
-                    .map_err(|err| {
-                        format!("learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}")
-                    })?
-            } else {
-                let mut inv_vv = Array2::<f64>::zeros((q, q));
-                let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
-                for col in 0..q {
-                    rhs_t_scratch[base + col] = 1.0;
-                    let solved = solver
-                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                        .map_err(|err| {
-                            format!(
-                                "learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}"
-                            )
-                        })?;
-                    rhs_t_scratch[base + col] = 0.0;
-                    for r in 0..q {
-                        inv_vv[[r, col]] = solved.t[base + r];
-                    }
-                    for b in 0..cache.k {
-                        inv_vbeta[[col, b]] = solved.beta[b];
-                    }
-                }
-                (inv_vv, inv_vbeta)
-            };
+            let (inv_vv, inv_vbeta) = Self::selected_inverse_row_blocks_or_solve(
+                solver,
+                cache,
+                &beta_inv,
+                fast_selected,
+                row,
+                base,
+                q,
+                &mut rhs_t_scratch,
+                rhs_beta_zero.view(),
+                "learnable_ibp_data_logdet_alpha_trace",
+            )?;
 
             // #1026 — UNGATED (background-tier) atoms have a force-fixed unit gate,
             // so their mass `a_k ≡ 1` is α-INDEPENDENT: every data-Jacobian column
@@ -8944,30 +8928,18 @@ impl SaeManifoldTerm {
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
             // full-system `solve` loop under gauge / cross-row Woodbury.
-            let (inv_vv, inv_vbeta) = if fast_selected {
-                solver
-                    .selected_inverse_row_blocks(row, &beta_inv)
-                    .map_err(|err| format!("logdet_theta_adjoint: selected inverse: {err}"))?
-            } else {
-                let mut inv_vv = Array2::<f64>::zeros((q, q));
-                let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
-                for col in 0..q {
-                    rhs_t_scratch[base + col] = 1.0;
-                    let solved = solver
-                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                        .map_err(|err| {
-                            format!("logdet_theta_adjoint: selected inverse solve: {err}")
-                        })?;
-                    rhs_t_scratch[base + col] = 0.0;
-                    for r in 0..q {
-                        inv_vv[[r, col]] = solved.t[base + r];
-                    }
-                    for b in 0..cache.k {
-                        inv_vbeta[[col, b]] = solved.beta[b];
-                    }
-                }
-                (inv_vv, inv_vbeta)
-            };
+            let (inv_vv, inv_vbeta) = Self::selected_inverse_row_blocks_or_solve(
+                solver,
+                cache,
+                &beta_inv,
+                fast_selected,
+                row,
+                base,
+                q,
+                &mut rhs_t_scratch,
+                rhs_beta_zero.view(),
+                "logdet_theta_adjoint",
+            )?;
 
             // Per-row UNIT-stiffness deflated directions: the selected inverse
             // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each

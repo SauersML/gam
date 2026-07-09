@@ -217,6 +217,8 @@ mod family_resolve;
 mod model_build;
 #[path = "main/model_summary.rs"]
 mod model_summary;
+#[path = "main/multinomial_cli.rs"]
+mod multinomial_cli;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
 #[path = "main/run_diagnose.rs"]
@@ -238,6 +240,7 @@ pub(crate) use dataset_io::*;
 pub(crate) use family_resolve::*;
 pub(crate) use model_build::*;
 pub(crate) use model_summary::*;
+pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
 pub(crate) use run_diagnose::*;
 pub(crate) use run_fit::*;

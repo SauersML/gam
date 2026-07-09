@@ -362,31 +362,83 @@ def matern_evaluate_numpy(spec: Any, coords: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def pca_basis_matrix(spec: Any) -> Any:
+    """Validated ``(D, K_eff)`` Pca projection matrix, truncated to ``spec.K``.
+
+    The one definition of "the matrix Pca projects through": explicit ``K``
+    keeps the first ``K`` basis columns, exactly as the torch fit path does,
+    so ``basis_size``, callable evaluation, and fitting all denote the same
+    model.
+    """
+    import numpy as np
+
+    if spec.basis is None:
+        raise ValueError("Pca.evaluate: basis matrix must be provided")
+    basis = np.asarray(spec.basis, dtype=np.float64)
+    if basis.ndim != 2:
+        raise ValueError(
+            f"Pca.basis must be 2D (D, K); got shape {tuple(basis.shape)}"
+        )
+    if spec.K is not None:
+        k = int(spec.K)
+        if not 1 <= k <= basis.shape[1]:
+            raise ValueError(
+                f"Pca: K={k} must lie in 1..{basis.shape[1]} (the basis width)"
+            )
+        basis = basis[:, :k]
+    return basis
+
+
+def pca_training_mean(spec: Any, coords_np: Any) -> Any:
+    """Resolve the ``centered=True`` training mean once; cache it on the spec.
+
+    Mirrors :func:`_ensure_bspline_knots`: the first evaluation is the
+    fit/transform boundary — its rows define the training mean — and every
+    later call reuses the cached value, so the projection is a fixed affine
+    map. Centering each evaluation batch on its own mean would make one
+    row's features depend on unrelated rows in the same call and collapse
+    every single-row prediction of a training row to zero.
+    """
+    import numpy as np
+
+    if spec.mean is None:
+        spec.mean = np.asarray(coords_np, dtype=np.float64).mean(axis=0)
+    mean = np.asarray(spec.mean, dtype=np.float64).reshape(-1)
+    if mean.shape[0] != np.asarray(coords_np).shape[1]:
+        raise ValueError(
+            f"Pca: cached mean has D={mean.shape[0]} but coords has "
+            f"d={np.asarray(coords_np).shape[1]}"
+        )
+    return mean
+
+
 def pca_evaluate(spec: Any, coords: Any) -> Any:
     """Evaluate the Pca smooth as a fixed linear projection.
 
     The PCA basis is a precomputed ``(D, K)`` projection matrix supplied
     by the user (no gamfit-specific math kernel exists for it — the
     ``Φ(x) = (x − μ) · basis`` operation is standard gemm). Returned
-    tensor carries autograd back to ``coords``.
+    tensor carries autograd back to ``coords``; ``μ`` is the persisted
+    training mean, a constant of the map, so rows stay independent.
     """
     torch = _torch()
-    if spec.basis is None:
-        raise ValueError("Pca.evaluate: basis matrix must be provided")
-    basis_t = torch.as_tensor(spec.basis)
-    if not torch.is_floating_point(basis_t):
-        basis_t = basis_t.to(dtype=torch.float64)
+    basis_t = torch.as_tensor(pca_basis_matrix(spec))
     basis_t = basis_t.to(dtype=coords.dtype, device=coords.device)
-    if basis_t.dim() != 2:
-        raise ValueError(
-            f"Pca.basis must be 2D (D, K); got shape {tuple(basis_t.shape)}"
-        )
     if basis_t.shape[0] != coords.shape[1]:
         raise ValueError(
             f"Pca: basis has D={basis_t.shape[0]} but coords has d={coords.shape[1]}"
         )
     if spec.centered:
-        mean = coords.mean(dim=0, keepdim=True)
+        coords_np = (
+            coords.detach().cpu().to(dtype=torch.float64).numpy()
+            if hasattr(coords, "detach")
+            else coords
+        )
+        mean = torch.as_tensor(
+            pca_training_mean(spec, coords_np),
+            dtype=coords.dtype,
+            device=coords.device,
+        ).reshape(1, -1)
         return (coords - mean) @ basis_t
     return coords @ basis_t
 
@@ -519,22 +571,18 @@ def tensor_bspline_evaluate_numpy(spec: Any, coords: Any) -> Any:
 
 
 def pca_evaluate_numpy(spec: Any, coords: Any) -> Any:
-    """NumPy-backend Pca evaluation (standard linear projection)."""
-    import numpy as np
+    """NumPy-backend Pca evaluation (standard linear projection).
 
-    if spec.basis is None:
-        raise ValueError("Pca.evaluate: basis matrix must be provided")
-    basis = np.asarray(spec.basis, dtype=np.float64)
-    if basis.ndim != 2:
-        raise ValueError(
-            f"Pca.basis must be 2D (D, K); got shape {tuple(basis.shape)}"
-        )
+    Uses the same persisted training mean and ``K``-truncated basis as the
+    torch path, so both backends evaluate one fixed affine map.
+    """
+    basis = pca_basis_matrix(spec)
     if basis.shape[0] != coords.shape[1]:
         raise ValueError(
             f"Pca: basis has D={basis.shape[0]} but coords has d={coords.shape[1]}"
         )
     if spec.centered:
-        return (coords - coords.mean(axis=0, keepdims=True)) @ basis
+        return (coords - pca_training_mean(spec, coords).reshape(1, -1)) @ basis
     return coords @ basis
 
 
