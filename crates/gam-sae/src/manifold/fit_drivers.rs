@@ -4437,67 +4437,96 @@ impl SaeManifoldTerm {
         }
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
-        for atom_idx in 0..self.atoms.len() {
-            let m = self.atoms[atom_idx].basis_size();
-            if m == 0 || grams[atom_idx].dim() != (m, m) {
-                continue;
-            }
-            // Symmetrise the bare data Gram `G_k` before the eigendecomposition.
-            let mut data_gram = grams[atom_idx].clone();
-            for i in 0..m {
-                for j in 0..i {
-                    let sym = 0.5 * (data_gram[[i, j]] + data_gram[[j, i]]);
-                    data_gram[[i, j]] = sym;
-                    data_gram[[j, i]] = sym;
+        // Phase 1 (parallel, READ-ONLY): each atom's rank-revealing eigendecomp
+        // depends ONLY on its own data Gram + its own (immutable) atom state, so
+        // the per-atom column-map plan `Q_k` is computed independently and
+        // collected in atom order. The eigendecomp is deterministic and the plan
+        // per atom is a pure function of read-only inputs, so the parallel result
+        // is bit-identical to the serial sweep (ordered collect). #1557 — pin the
+        // faer eigendecomp GEMM to `Par::Seq` inside each atom worker.
+        let plans: Vec<Option<Array2<f64>>> = {
+            let atoms = &self.atoms;
+            let compute_plan = |atom_idx: usize| -> Option<Array2<f64>> {
+                let m = atoms[atom_idx].basis_size();
+                if m == 0 || grams[atom_idx].dim() != (m, m) {
+                    return None;
                 }
-            }
-            let (evals, evecs) = match data_gram.eigh(Side::Lower) {
-                Ok(pair) => pair,
-                Err(_) => continue,
+                // Symmetrise the bare data Gram `G_k` before the eigendecomposition.
+                let mut data_gram = grams[atom_idx].clone();
+                for i in 0..m {
+                    for j in 0..i {
+                        let sym = 0.5 * (data_gram[[i, j]] + data_gram[[j, i]]);
+                        data_gram[[i, j]] = sym;
+                        data_gram[[j, i]] = sym;
+                    }
+                }
+                let (evals, evecs) = match data_gram.eigh(Side::Lower) {
+                    Ok(pair) => pair,
+                    Err(_) => return None,
+                };
+                let max_eig = evals.iter().fold(
+                    0.0_f64,
+                    |acc, &v| {
+                        if v.is_finite() { acc.max(v) } else { acc }
+                    },
+                );
+                if !(max_eig > 0.0) {
+                    // An all-zero data Gram (no assignment mass) is handled by the
+                    // fatal pre-fit audit, not by a basis reduction here.
+                    return None;
+                }
+                let cutoff = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
+                // Eigenvectors whose eigenvalue clears the relative cutoff span the
+                // data-supported subspace `Q_k` (the retained columns).
+                let kept: Vec<usize> = (0..evals.len())
+                    .filter(|&idx| {
+                        let lambda = evals[idx];
+                        lambda.is_finite() && lambda > cutoff
+                    })
+                    .collect();
+                let r = kept.len();
+                // Full rank (`r == m`) → the well-conditioned path; leave it
+                // byte-for-byte unchanged. `r == 0` is a degenerate all-null Gram
+                // that the fatal pre-fit audit already rejects; do not reduce to a
+                // zero-width basis here.
+                if r == m || r == 0 {
+                    return None;
+                }
+                // Build the orthonormal column map `Q_k` (M × r) from the retained
+                // eigenvectors. The reduction needs an analytic second-jet evaluator
+                // to compose the reduced jets; atoms without one (caller-managed,
+                // e.g. an out-of-band design) keep the historical projector-free
+                // full-`B` path and rely on the LM ridge — the periodic/torus/
+                // sphere/Duchon production atoms all carry a second jet.
+                if atoms[atom_idx].basis_second_jet.is_none() {
+                    return None;
+                }
+                let mut q = Array2::<f64>::zeros((m, r));
+                for (col, &eig_idx) in kept.iter().enumerate() {
+                    for row in 0..m {
+                        q[[row, col]] = evecs[[row, eig_idx]];
+                    }
+                }
+                Some(q)
             };
-            let max_eig = evals.iter().fold(
-                0.0_f64,
-                |acc, &v| {
-                    if v.is_finite() { acc.max(v) } else { acc }
-                },
-            );
-            if !(max_eig > 0.0) {
-                // An all-zero data Gram (no assignment mass) is handled by the
-                // fatal pre-fit audit, not by a basis reduction here.
-                continue;
+            let n_atoms = atoms.len();
+            let parallel =
+                n_atoms >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            if parallel {
+                use rayon::prelude::*;
+                (0..n_atoms)
+                    .into_par_iter()
+                    .map(|atom_idx| with_nested_parallel(|| compute_plan(atom_idx)))
+                    .collect()
+            } else {
+                (0..n_atoms).map(compute_plan).collect()
             }
-            let cutoff = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
-            // Eigenvectors whose eigenvalue clears the relative cutoff span the
-            // data-supported subspace `Q_k` (the retained columns).
-            let kept: Vec<usize> = (0..evals.len())
-                .filter(|&idx| {
-                    let lambda = evals[idx];
-                    lambda.is_finite() && lambda > cutoff
-                })
-                .collect();
-            let r = kept.len();
-            // Full rank (`r == m`) → the well-conditioned path; leave it
-            // byte-for-byte unchanged. `r == 0` is a degenerate all-null Gram
-            // that the fatal pre-fit audit already rejects; do not reduce to a
-            // zero-width basis here.
-            if r == m || r == 0 {
-                continue;
-            }
-            // Build the orthonormal column map `Q_k` (M × r) from the retained
-            // eigenvectors. The reduction needs an analytic second-jet evaluator
-            // to compose the reduced jets; atoms without one (caller-managed,
-            // e.g. an out-of-band design) keep the historical projector-free
-            // full-`B` path and rely on the LM ridge — the periodic/torus/
-            // sphere/Duchon production atoms all carry a second jet.
-            if self.atoms[atom_idx].basis_second_jet.is_none() {
-                continue;
-            }
-            let mut q = Array2::<f64>::zeros((m, r));
-            for (col, &eig_idx) in kept.iter().enumerate() {
-                for row in 0..m {
-                    q[[row, col]] = evecs[[row, eig_idx]];
-                }
-            }
+        };
+        // Phase 2 (serial): apply the reparametrization to each atom in atom order.
+        // Each mutation touches ONLY its own atom, but keep it serial so a failure
+        // surfaces the deterministic (lowest-index) error.
+        for (atom_idx, plan) in plans.into_iter().enumerate() {
+            let Some(q) = plan else { continue };
             self.atoms[atom_idx]
                 .reduce_basis_to_subspace(&q)
                 .map_err(|err| {
@@ -4800,19 +4829,83 @@ impl SaeManifoldTerm {
             // in the radial direction, so it is second-order small; the dominant
             // drift is the direct `Δt` null component removed here, and any residual
             // β coupling is re-solved next iterate from the on-circle state.
-            for row_idx in 0..sys.rows.len() {
-                let off = sys.row_offsets[row_idx];
-                let di = sys.row_dims[row_idx];
-                for dir in row_sub_floor_null_directions(sys.rows[row_idx].htt.view()) {
-                    if dir.len() != di {
-                        continue;
+            // Each row projects its own sub-floor null directions out of ONLY its
+            // own `[off..off+di]` coordinate segment (disjoint segments keyed by
+            // `row_offsets`), so the rows are independent. Fan out over the SAE row
+            // count, handing each row-chunk its own contiguous output slice via
+            // `split_at_mut` keyed on `row_offsets` (the same disjoint-segment idiom
+            // `back_substitute_delta_t` uses). Disjoint writes ⇒ no reduction, no
+            // run-to-run drift — bit-identical to the serial sweep.
+            let n_rows = sys.rows.len();
+            let parallel =
+                n_rows >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            if parallel {
+                use rayon::prelude::*;
+                const CHUNK: usize = 64;
+                let row_offsets = &sys.row_offsets;
+                let dt_slice = delta_ext_coord
+                    .as_slice_mut()
+                    .expect("delta_ext_coord contiguous");
+                let n_chunks = n_rows.div_ceil(CHUNK);
+                let mut remaining = dt_slice;
+                let mut segments: Vec<(usize, &mut [f64])> = Vec::with_capacity(n_chunks);
+                let mut prev_end = 0usize;
+                for chunk in 0..n_chunks {
+                    let start = chunk * CHUNK;
+                    let end = (start + CHUNK).min(n_rows);
+                    let seg_len = row_offsets[end] - row_offsets[start];
+                    assert!(
+                        prev_end == row_offsets[start],
+                        "sae gauge-fix: non-contiguous row segment at chunk start {start} \
+                         (prev_end={prev_end}, row_offset={})",
+                        row_offsets[start]
+                    );
+                    let (seg, rest) = remaining.split_at_mut(seg_len);
+                    remaining = rest;
+                    segments.push((start, seg));
+                    prev_end = row_offsets[end];
+                }
+                segments.into_par_iter().for_each(|(start, seg)| {
+                    let end = (start + CHUNK).min(n_rows);
+                    let mut local = 0usize;
+                    for row_idx in start..end {
+                        let di = sys.row_dims[row_idx];
+                        // #1557 — the null-direction eigendecomp (`sym.eigh`) issues a
+                        // faer GEMM; pin it to `Par::Seq` inside this row worker so it
+                        // does not re-fan the outer pool (bit-identical result).
+                        let dirs = with_nested_parallel(|| {
+                            row_sub_floor_null_directions(sys.rows[row_idx].htt.view())
+                        });
+                        for dir in dirs {
+                            if dir.len() != di {
+                                continue;
+                            }
+                            let mut dot = 0.0;
+                            for a in 0..di {
+                                dot += dir[a] * seg[local + a];
+                            }
+                            for a in 0..di {
+                                seg[local + a] -= dot * dir[a];
+                            }
+                        }
+                        local += di;
                     }
-                    let mut dot = 0.0;
-                    for a in 0..di {
-                        dot += dir[a] * delta_ext_coord[off + a];
-                    }
-                    for a in 0..di {
-                        delta_ext_coord[off + a] -= dot * dir[a];
+                });
+            } else {
+                for row_idx in 0..n_rows {
+                    let off = sys.row_offsets[row_idx];
+                    let di = sys.row_dims[row_idx];
+                    for dir in row_sub_floor_null_directions(sys.rows[row_idx].htt.view()) {
+                        if dir.len() != di {
+                            continue;
+                        }
+                        let mut dot = 0.0;
+                        for a in 0..di {
+                            dot += dir[a] * delta_ext_coord[off + a];
+                        }
+                        for a in 0..di {
+                            delta_ext_coord[off + a] -= dot * dir[a];
+                        }
                     }
                 }
             }

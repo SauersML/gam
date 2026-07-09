@@ -50,6 +50,37 @@ pub(super) fn ibp_psd_majorized_hdiag(
 }
 
 impl SaeManifoldTerm {
+    /// Build the per-row dense gate maps `a_{n,·}` at `rho` for all `n` rows.
+    ///
+    /// `try_assignments_row_for_rho` is a pure read-only per-row computation
+    /// (softmax / IBP-MAP / TopK over that row's routing logits — no shared
+    /// mutable state, no faer GEMM), so the rows are independent. Above the
+    /// `SAE_LOSS_PARALLEL_ROW_MIN` floor (and when not already inside a rayon
+    /// worker) they are computed in parallel and collected in row order; the
+    /// order-preserving `collect` reproduces the serial push order bit-for-bit
+    /// (deterministic — each row computed exactly once, no cross-row reduction).
+    pub(crate) fn assignments_all_for_rho_parallel(
+        &self,
+        n: usize,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<Array1<f64>>, String> {
+        let parallel =
+            n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            (0..n)
+                .into_par_iter()
+                .map(|row| self.assignment.try_assignments_row_for_rho(row, rho))
+                .collect::<Result<Vec<_>, String>>()
+        } else {
+            let mut assignments_all = Vec::with_capacity(n);
+            for row in 0..n {
+                assignments_all.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+            }
+            Ok(assignments_all)
+        }
+    }
+
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.
     ///
     /// Full-batch entry point: a single chunk covering all rows, with the
@@ -402,10 +433,33 @@ impl SaeManifoldTerm {
                     // force-included by `from_jumprelu` via the `ungated` mask.
                     let routing = {
                         let mut m = Array2::<f64>::zeros((n, k_atoms));
-                        for row in 0..n {
-                            let r = self.assignment.routing_logits_row(row);
-                            for k in 0..k_atoms {
-                                m[[row, k]] = r[k];
+                        // Each row copies its own read-only routing-logit view into
+                        // its own `m` row — disjoint output rows, no reduction, so
+                        // the row-parallel fill is bit-identical to the serial copy.
+                        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN
+                            && rayon::current_thread_index().is_none();
+                        if parallel {
+                            use rayon::prelude::*;
+                            const CHUNK: usize = 64;
+                            m.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
+                                .into_par_iter()
+                                .enumerate()
+                                .for_each(|(chunk, mut block)| {
+                                    let start = chunk * CHUNK;
+                                    for local in 0..block.nrows() {
+                                        let r =
+                                            self.assignment.routing_logits_row(start + local);
+                                        for k in 0..k_atoms {
+                                            block[[local, k]] = r[k];
+                                        }
+                                    }
+                                });
+                        } else {
+                            for row in 0..n {
+                                let r = self.assignment.routing_logits_row(row);
+                                for k in 0..k_atoms {
+                                    m[[row, k]] = r[k];
+                                }
                             }
                         }
                         m
@@ -451,11 +505,13 @@ impl SaeManifoldTerm {
                 // top-`k` projection is then a no-op at the optimum.
                 AssignmentMode::Softmax { .. } => match self.softmax_active_plan() {
                     Some((k_active_cap, relative_cutoff)) => {
-                        let mut assignments_all = Vec::with_capacity(n);
-                        for row in 0..n {
-                            assignments_all
-                                .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
-                        }
+                        // Per-row gate maps are independent read-only computations
+                        // (`&self`, no shared mutable state, no GEMM), so the
+                        // order-preserving parallel collect is bit-identical to the
+                        // serial push (deterministic — each row computed once, no
+                        // cross-row reduction).
+                        let assignments_all =
+                            self.assignments_all_for_rho_parallel(n, rho)?;
                         Some(SaeRowLayout::from_dense_weights(
                             &assignments_all,
                             k_active_cap,
@@ -475,12 +531,11 @@ impl SaeManifoldTerm {
                             // Build per-row dense assignments once to derive the
                             // active set; the row loop re-derives `assignments`
                             // (cheap gate map at the same rho) and reuses these
-                            // active sets.
-                            let mut assignments_all = Vec::with_capacity(n);
-                            for row in 0..n {
-                                assignments_all
-                                    .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
-                            }
+                            // active sets. Independent read-only per-row builds →
+                            // order-preserving parallel collect is bit-identical to
+                            // the serial push (deterministic).
+                            let assignments_all =
+                                self.assignments_all_for_rho_parallel(n, rho)?;
                             // #1414: pass the RELATIVE cutoff through;
                             // `from_dense_weights` applies it per row against that
                             // row's own peak `max_k |a_{n,k}|`, matching the
@@ -507,11 +562,9 @@ impl SaeManifoldTerm {
                     // no cutoff heuristics, no near-threshold population, and the
                     // per-token block is bounded at `k·(1+d)` BY CONSTRUCTION
                     // (the #2071 block-size contract holds with equality).
-                    let mut assignments_all = Vec::with_capacity(n);
-                    for row in 0..n {
-                        assignments_all
-                            .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
-                    }
+                    // Independent read-only per-row builds → order-preserving
+                    // parallel collect is bit-identical to the serial push.
+                    let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
                     Some(SaeRowLayout::from_dense_weights(
                         &assignments_all,
                         k,
