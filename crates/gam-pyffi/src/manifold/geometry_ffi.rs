@@ -4564,6 +4564,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_atom_topologies, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_core_from_fit_payload, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
     module.add_class::<ManifoldSaeCore>()?;
     module.add_class::<AtomCore>()?;

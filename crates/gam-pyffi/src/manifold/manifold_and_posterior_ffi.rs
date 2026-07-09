@@ -7217,27 +7217,8 @@ fn decoder_channel_cov_factors<'py>(
     decoder_covariance: PyReadonlyArray2<'py, f64>,
     m_basis: i64,
 ) -> Option<Py<PyArray3<f64>>> {
-    let cov = decoder_covariance.as_array();
-    let total = cov.nrows();
-    if m_basis <= 0 {
-        return None;
-    }
-    let m = m_basis as usize;
-    if total == 0 || total % m != 0 {
-        return None;
-    }
-    let p = total / m;
-    // blocks[c, b1, b2] = cov[b1·p + c, b2·p + c] — the same-channel diagonal of
-    // the reshaped `cov4[b1, c1, b2, c2]`.
-    let mut blocks = Array3::<f64>::zeros((p, m, m));
-    for c in 0..p {
-        for b1 in 0..m {
-            for b2 in 0..m {
-                blocks[[c, b1, b2]] = cov[[b1 * p + c, b2 * p + c]];
-            }
-        }
-    }
-    Some(blocks.into_pyarray(py).unbind())
+    crate::manifold::manifold_sae_coercion::channel_cov_factors(decoder_covariance.as_array(), m_basis)
+        .map(|blocks| blocks.into_pyarray(py).unbind())
 }
 
 /// Rebuild the full-shape `(M·p, M·p)` decoder covariance from the compact
@@ -7298,22 +7279,11 @@ fn sae_canonical_n_harmonics(
             decoder_widths.len()
         )));
     }
-    Ok(basis_kinds
-        .iter()
-        .zip(&raw_n_harmonics)
-        .zip(&decoder_widths)
-        .map(|((bk, &h), &width)| {
-            let kind = bk.to_lowercase().replace('-', "_");
-            if matches!(kind.as_str(), "periodic" | "periodic_spline" | "circle") && h <= 0 {
-                // floor((width − 1) / 2), then floor at 1. `width` is a decoder
-                // row count (≥ 1 in practice); the max(1, …) makes the degenerate
-                // width == 0 case land on 1 regardless of division rounding.
-                ((width - 1) / 2).max(1)
-            } else {
-                h
-            }
-        })
-        .collect())
+    Ok(crate::manifold::manifold_sae_coercion::canonical_n_harmonics(
+        &basis_kinds,
+        &raw_n_harmonics,
+        &decoder_widths,
+    ))
 }
 
 /// Rust owner of the SAE atom-topology naming (#2091). Given the resolved
@@ -7375,6 +7345,83 @@ fn sae_periodic_shape_band_reorder<'py>(
 fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PyObject> {
     let value = crate::manifold::manifold_sae_coercion::py_any_to_json_value(obj)?;
     json_value_to_py(py, value)
+}
+
+/// Build a Rust-owned [`ManifoldSaeCore`] directly from the raw
+/// `sae_manifold_fit_minimal` payload — the design-A coercion that lets
+/// `sae_manifold_fit` return the pyclass with no Python dataclass (#2091).
+///
+/// `raw_json` is the raw payload marshalled to JSON (numpy `.tolist()`-flattened
+/// via `_jsonable`, then `json.dumps`); `x` is the training matrix (for
+/// `training_mean = x.mean(0)`); the remaining args are the fit-config scalars
+/// `from_payload` receives (`assignment` already canonical). Reproduces
+/// `from_payload` ∘ `to_dict` bit-for-bit for the MAINLINE case (no Fisher shard,
+/// no `linear_block` relabel — those are follow-up arms before the fit-return
+/// flip). The JSON parse rejects non-finite values exactly as
+/// `ManifoldSaeCore::new` does, so this path is NaN-consistent with the legacy
+/// reader. A perf-optimized direct-read variant (via `py_any_to_json_value`) is a
+/// later increment.
+#[pyfunction(signature = (
+    raw_json, x, topology_fallback, assignment, assignment_label, penalties,
+    alpha, learnable_alpha, tau, sparsity_strength, smoothness, learning_rate,
+    max_iter, random_state, top_k, jumprelu_threshold
+))]
+fn sae_manifold_core_from_fit_payload(
+    py: Python<'_>,
+    raw_json: &str,
+    x: PyReadonlyArray2<'_, f64>,
+    topology_fallback: String,
+    assignment: String,
+    assignment_label: String,
+    penalties: Vec<String>,
+    alpha: f64,
+    learnable_alpha: bool,
+    tau: f64,
+    sparsity_strength: f64,
+    smoothness: f64,
+    learning_rate: f64,
+    max_iter: i64,
+    random_state: i64,
+    top_k: Option<i64>,
+    jumprelu_threshold: f64,
+) -> PyResult<Py<ManifoldSaeCore>> {
+    let raw: serde_json::Value = serde_json::from_str(raw_json).map_err(|e| {
+        py_value_error(format!(
+            "sae_manifold_core_from_fit_payload: raw payload JSON parse: {e}"
+        ))
+    })?;
+    let x_view = x.as_array();
+    let (n, p) = x_view.dim();
+    // training_mean = x.mean(axis=0) (n >= 2 in every real fit).
+    let training_mean: Vec<f64> = (0..p)
+        .map(|j| {
+            if n == 0 {
+                0.0
+            } else {
+                x_view.column(j).sum() / n as f64
+            }
+        })
+        .collect();
+    let cfg = crate::manifold::manifold_sae_coercion::FitConfig {
+        topology_fallback,
+        assignment,
+        assignment_label,
+        penalties,
+        alpha,
+        learnable_alpha,
+        tau,
+        sparsity_strength,
+        smoothness,
+        learning_rate,
+        max_iter,
+        random_state,
+        top_k,
+        jumprelu_threshold,
+    };
+    let payload =
+        crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(&raw, training_mean, &cfg)
+            .map_err(py_value_error)?;
+    Py::new(py, ManifoldSaeCore { inner: payload })
 }
 
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned

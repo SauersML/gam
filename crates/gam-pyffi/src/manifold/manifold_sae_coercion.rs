@@ -13,10 +13,65 @@
 //! doc-comments name the counterpart so a future schema drift is traceable to
 //! one side.
 
-use ndarray::Array2;
+use crate::manifold::manifold_sae_payload::{AtomPayload, ManifoldSaePayload, SCHEMA_TAG};
+use ndarray::{Array2, Array3, ArrayView2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
+
+/// Repair stale/degenerate periodic `n_harmonics` at ingestion (#1132/N), the
+/// shared core of the `sae_canonical_n_harmonics` pyfunction and the
+/// `from_fit_payload` builder. A periodic-family atom's basis width is
+/// `M = 2H + 1` with `H >= 1`; a stored `H <= 0` is floored to `max(1, (M-1)/2)`
+/// from the trained decoder width. Non-periodic atoms (and periodic atoms whose
+/// `H` is already positive) pass through. Callers guarantee equal-length slices.
+pub(crate) fn canonical_n_harmonics(
+    basis_kinds: &[String],
+    raw_n_harmonics: &[i64],
+    decoder_widths: &[i64],
+) -> Vec<i64> {
+    basis_kinds
+        .iter()
+        .zip(raw_n_harmonics)
+        .zip(decoder_widths)
+        .map(|((bk, &h), &width)| {
+            let kind = canon_name(bk);
+            if matches!(kind.as_str(), "periodic" | "periodic_spline" | "circle") && h <= 0 {
+                ((width - 1) / 2).max(1)
+            } else {
+                h
+            }
+        })
+        .collect()
+}
+
+/// Extract the compact per-channel decoder-covariance factor `(p, M, M)` from the
+/// dense `(M*p, M*p)` phi-scaled covariance (#2091), the shared core of the
+/// `decoder_channel_cov_factors` pyfunction and the `from_fit_payload` builder.
+/// `blocks[c, b1, b2] = cov[b1*p + c, b2*p + c]` — the same-channel Schur blocks
+/// the shape band reads. `None` when the layout does not match an `(M, p)`
+/// decoder (`m_basis <= 0`, empty, or `total % m != 0`), matching the prior
+/// contract; the band's stored `shape_band_sd` still recovers.
+pub(crate) fn channel_cov_factors(cov: ArrayView2<'_, f64>, m_basis: i64) -> Option<Array3<f64>> {
+    let total = cov.nrows();
+    if m_basis <= 0 {
+        return None;
+    }
+    let m = m_basis as usize;
+    if total == 0 || total % m != 0 {
+        return None;
+    }
+    let p = total / m;
+    let mut blocks = Array3::<f64>::zeros((p, m, m));
+    for c in 0..p {
+        for b1 in 0..m {
+            for b2 in 0..m {
+                blocks[[c, b1, b2]] = cov[[b1 * p + c, b2 * p + c]];
+            }
+        }
+    }
+    Some(blocks)
+}
 
 /// Convert an arbitrary JSON-shaped Python object into a `serde_json::Value`
 /// (#2091). The inverse of the crate's `json_value_to_py`; the
@@ -213,6 +268,351 @@ pub(crate) fn periodic_shape_band_reorder(
     let mean_sorted = reindex_rows(&mean);
     let sd_sorted = sd.map(|s| reindex_rows(&s));
     Ok((Some(coords_sorted), Some(mean_sorted), sd_sorted))
+}
+
+/// Fit-time config the raw payload does not carry — the scalars/labels
+/// `sae_manifold_fit` passes to `from_payload`. Threaded into
+/// [`build_manifold_sae_payload`] so the assembled payload matches the dataclass
+/// `to_dict` exactly. `assignment` is the already-canonical string
+/// (`_canonical_assignment` stays Python-side interop glue, like the fisher
+/// normalizer).
+pub(crate) struct FitConfig {
+    pub(crate) topology_fallback: String,
+    pub(crate) assignment: String,
+    pub(crate) assignment_label: String,
+    pub(crate) penalties: Vec<String>,
+    pub(crate) alpha: f64,
+    pub(crate) learnable_alpha: bool,
+    pub(crate) tau: f64,
+    pub(crate) sparsity_strength: f64,
+    pub(crate) smoothness: f64,
+    pub(crate) learning_rate: f64,
+    pub(crate) max_iter: i64,
+    pub(crate) random_state: i64,
+    pub(crate) top_k: Option<i64>,
+    pub(crate) jumprelu_threshold: f64,
+}
+
+// --- serde_json::Value accessors (mirror from_payload's `payload[...]` reads) --
+fn vget<'a>(v: &'a Value, key: &str) -> Result<&'a Value, String> {
+    v.get(key)
+        .ok_or_else(|| format!("sae fit payload missing '{key}'"))
+}
+fn vf64(v: &Value, key: &str) -> Result<f64, String> {
+    vget(v, key)?
+        .as_f64()
+        .ok_or_else(|| format!("sae fit payload '{key}' is not a number"))
+}
+fn vi64(v: &Value, key: &str) -> Result<i64, String> {
+    vget(v, key)?
+        .as_i64()
+        .ok_or_else(|| format!("sae fit payload '{key}' is not an integer"))
+}
+fn vbool(v: &Value, key: &str) -> Result<bool, String> {
+    vget(v, key)?
+        .as_bool()
+        .ok_or_else(|| format!("sae fit payload '{key}' is not a bool"))
+}
+fn vstr(v: &Value, key: &str) -> Result<String, String> {
+    vget(v, key)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("sae fit payload '{key}' is not a string"))
+}
+/// A key whose value is absent OR JSON null -> `None`; else `Some(&Value)`.
+fn vopt<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    match v.get(key) {
+        None => None,
+        Some(x) if x.is_null() => None,
+        Some(x) => Some(x),
+    }
+}
+fn v_arr2(v: &Value) -> Result<Vec<Vec<f64>>, String> {
+    serde_json::from_value(v.clone()).map_err(|e| format!("expected a 2-D float array: {e}"))
+}
+fn v_arr1(v: &Value) -> Result<Vec<f64>, String> {
+    serde_json::from_value(v.clone()).map_err(|e| format!("expected a 1-D float array: {e}"))
+}
+fn nested_to_array2(rows: &[Vec<f64>]) -> Result<Array2<f64>, String> {
+    let nrows = rows.len();
+    let ncols = rows.first().map_or(0, Vec::len);
+    let mut flat = Vec::with_capacity(nrows * ncols);
+    for r in rows {
+        if r.len() != ncols {
+            return Err("ragged 2-D array".to_string());
+        }
+        flat.extend_from_slice(r);
+    }
+    Array2::from_shape_vec((nrows, ncols), flat).map_err(|e| e.to_string())
+}
+fn array2_to_nested(a: &Array2<f64>) -> Vec<Vec<f64>> {
+    a.rows().into_iter().map(|r| r.to_vec()).collect()
+}
+fn array3_to_nested(a: &Array3<f64>) -> Vec<Vec<Vec<f64>>> {
+    a.outer_iter()
+        .map(|m| m.rows().into_iter().map(|r| r.to_vec()).collect())
+        .collect()
+}
+
+/// The honest penalized-loss score (#1231, mirror `_penalized_loss_score`):
+/// `penalized_loss_score` else `oos_penalized_loss`; a present-but-null value
+/// stays `None`; neither key present -> error.
+fn penalized_loss_score(raw: &Value) -> Result<Option<f64>, String> {
+    for key in ["penalized_loss_score", "oos_penalized_loss"] {
+        if let Some(v) = raw.get(key) {
+            return Ok(if v.is_null() {
+                None
+            } else {
+                Some(
+                    v.as_f64()
+                        .ok_or_else(|| format!("sae fit payload '{key}' is not a number"))?,
+                )
+            });
+        }
+    }
+    Err("sae fit payload is missing a penalized-loss score".to_string())
+}
+
+/// Reorder (periodic) or pass through (else) an atom's shape band, mirroring
+/// `_shape_band_arrays`: a `periodic` atom's `(G, .)` band is stably reordered by
+/// its coordinate column via [`periodic_shape_band_reorder`]; every other kind
+/// keeps the arrays verbatim.
+fn shape_band_for_kind(
+    kind: &str,
+    coords: Option<Vec<Vec<f64>>>,
+    mean: Option<Vec<Vec<f64>>>,
+    sd: Option<Vec<Vec<f64>>>,
+) -> Result<
+    (
+        Option<Vec<Vec<f64>>>,
+        Option<Vec<Vec<f64>>>,
+        Option<Vec<Vec<f64>>>,
+    ),
+    String,
+> {
+    if kind != "periodic" {
+        return Ok((coords, mean, sd));
+    }
+    let coords = coords.map(|c| nested_to_array2(&c)).transpose()?;
+    let mean = mean.map(|m| nested_to_array2(&m)).transpose()?;
+    let sd = sd.map(|s| nested_to_array2(&s)).transpose()?;
+    let (c, m, s) = periodic_shape_band_reorder(coords, mean, sd)?;
+    Ok((
+        c.map(|a| array2_to_nested(&a)),
+        m.map(|a| array2_to_nested(&a)),
+        s.map(|a| array2_to_nested(&a)),
+    ))
+}
+
+/// Build a [`ManifoldSaePayload`] (the flat `to_dict` schema) directly from the
+/// raw `sae_manifold_fit_minimal` payload (as a `serde_json::Value`) +
+/// `training_mean` + [`FitConfig`], reproducing `from_payload` ∘ `to_dict` with
+/// NO Python dataclass in the middle (#2091 design A).
+///
+/// MAINLINE ONLY: no Fisher shard (`fisher_factors`/`fisher_provenance` = None)
+/// and no `linear_block` relabel — both are POST-`from_payload` steps in
+/// `sae_manifold_fit` and land as follow-up arms before the fit-return flip. The
+/// caller passes the raw payload as JSON (numpy already `.tolist()`-flattened),
+/// which — like `ManifoldSaeCore::new` — rejects non-finite values at parse, so
+/// this path is NaN-consistent with the legacy `from_json` reader.
+pub(crate) fn build_manifold_sae_payload(
+    raw: &Value,
+    training_mean: Vec<f64>,
+    cfg: &FitConfig,
+) -> Result<ManifoldSaePayload, String> {
+    let plans = vget(raw, "atom_plans")?
+        .as_array()
+        .ok_or("atom_plans is not a list")?;
+    let atoms = vget(raw, "atoms")?
+        .as_array()
+        .ok_or("atoms is not a list")?;
+    let k = atoms.len();
+    // #977 variable-K contract (mirror from_payload's ingest asserts).
+    if plans.len() != k {
+        return Err(format!(
+            "variable-K boundary: {k} atoms but {} atom_plans",
+            plans.len()
+        ));
+    }
+    let chosen_k = vi64(raw, "chosen_k")?;
+    if chosen_k != k as i64 {
+        return Err(format!("chosen_k={chosen_k} does not match {k} atoms"));
+    }
+    let assignments = v_arr2(vget(raw, "assignments_z")?)?;
+    let logits = v_arr2(vget(raw, "logits")?)?;
+    for (name, arr) in [("assignments_z", &assignments), ("logits", &logits)] {
+        let cols = arr.first().map_or(0, Vec::len);
+        if cols != k {
+            return Err(format!("'{name}' must be (N, K={k}); got {cols} columns"));
+        }
+    }
+
+    let kinds: Vec<String> = plans
+        .iter()
+        .map(|p| vstr(p, "kind"))
+        .collect::<Result<_, _>>()?;
+    let dims: Vec<i64> = plans
+        .iter()
+        .map(|p| vi64(p, "latent_dim"))
+        .collect::<Result<_, _>>()?;
+    let sizes: Vec<i64> = plans
+        .iter()
+        .map(|p| vi64(p, "basis_size"))
+        .collect::<Result<_, _>>()?;
+    let raw_nharm: Vec<i64> = plans
+        .iter()
+        .map(|p| vi64(p, "n_harmonics"))
+        .collect::<Result<_, _>>()?;
+    let decoder_blocks: Vec<Vec<Vec<f64>>> = atoms
+        .iter()
+        .map(|a| v_arr2(vget(a, "decoder_B")?))
+        .collect::<Result<_, _>>()?;
+    let widths: Vec<i64> = decoder_blocks.iter().map(|b| b.len() as i64).collect();
+    let n_harmonics = canonical_n_harmonics(&kinds, &raw_nharm, &widths);
+    let coords: Vec<Vec<Vec<f64>>> = atoms
+        .iter()
+        .map(|a| v_arr2(vget(a, "on_atom_coords_t")?))
+        .collect::<Result<_, _>>()?;
+    let duchon_centers: Vec<Option<Vec<Vec<f64>>>> = plans
+        .iter()
+        .map(|p| match vopt(p, "duchon_centers") {
+            None => Ok(None),
+            Some(v) => v_arr2(v).map(Some),
+        })
+        .collect::<Result<_, _>>()?;
+    let score = penalized_loss_score(raw)?;
+
+    let mut atom_payloads = Vec::with_capacity(k);
+    for (idx, a) in atoms.iter().enumerate() {
+        let decoder_coefficients = decoder_blocks[idx].clone();
+        // Per-atom gate column = column idx of the top-level assignments_z.
+        let assignments_col: Vec<f64> = assignments
+            .iter()
+            .map(|row| row.get(idx).copied().unwrap_or(0.0))
+            .collect();
+        let coords_u_arc = match vopt(a, "on_atom_coords_u_arc") {
+            None => None,
+            Some(v) => Some(v_arr1(v)?),
+        };
+        let decoder_covariance_channel_factors = match vopt(a, "decoder_covariance") {
+            None => None,
+            Some(v) => {
+                let cov = nested_to_array2(&v_arr2(v)?)?;
+                // M_k = decoder rows = a.decoder_coefficients.shape[0].
+                let m = decoder_coefficients.len() as i64;
+                channel_cov_factors(cov.view(), m).map(|b| array3_to_nested(&b))
+            }
+        };
+        let sb_coords = vopt(a, "shape_band_coords").map(v_arr2).transpose()?;
+        let sb_mean = vopt(a, "shape_band_mean").map(v_arr2).transpose()?;
+        let sb_sd = vopt(a, "shape_band_sd").map(v_arr2).transpose()?;
+        let (sb_coords, sb_mean, sb_sd) =
+            shape_band_for_kind(&kinds[idx], sb_coords, sb_mean, sb_sd)?;
+        atom_payloads.push(AtomPayload {
+            basis: vstr(a, "basis_kind")?,
+            decoder_coefficients,
+            assignments: assignments_col,
+            coords: coords[idx].clone(),
+            coords_u_arc,
+            evidence: score,
+            active_dim: vi64(a, "active_dim")?,
+            decoder_covariance_channel_factors,
+            shape_band_coords: sb_coords,
+            shape_band_mean: sb_mean,
+            shape_band_sd: sb_sd,
+            functional_evidence: vopt(a, "functional_evidence").cloned(),
+        });
+    }
+
+    let mut primitive_names = Vec::with_capacity(cfg.penalties.len() + 1);
+    primitive_names.push("rust_module.sae_manifold_fit_minimal".to_string());
+    primitive_names.extend(cfg.penalties.iter().cloned());
+
+    let atom_topology =
+        topology_for_bases(&kinds).unwrap_or_else(|| cfg.topology_fallback.clone());
+    let atom_topologies = topologies_for_bases(&kinds);
+    let metric_provenance = vopt(raw, "metric_provenance")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Euclidean".to_string());
+    let fisher_mass_residual = vopt(raw, "fisher_mass_residual").map(v_arr1).transpose()?;
+    let selected_log_lambda_sparse = match vopt(raw, "log_lambda_sparse") {
+        None => None,
+        Some(v) => Some(
+            v.as_f64()
+                .ok_or("sae fit payload 'log_lambda_sparse' is not a number")?,
+        ),
+    };
+    let selected_log_lambda_smooth = vopt(raw, "log_lambda_smooth").map(v_arr1).transpose()?;
+    let selected_log_ard = vopt(raw, "log_ard").map(v_arr2).transpose()?;
+    let structure_certificate = vopt(raw, "structure_certificate")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let report = |key: &str| vopt(raw, key).cloned();
+
+    Ok(ManifoldSaePayload {
+        schema: SCHEMA_TAG.to_string(),
+        atom_topology,
+        atom_topologies,
+        assignment: cfg.assignment.clone(),
+        assignment_label: cfg.assignment_label.clone(),
+        alpha: cfg.alpha,
+        learnable_alpha: cfg.learnable_alpha,
+        tau: cfg.tau,
+        sparsity_strength: cfg.sparsity_strength,
+        smoothness: cfg.smoothness,
+        learning_rate: cfg.learning_rate,
+        max_iter: cfg.max_iter,
+        random_state: cfg.random_state,
+        top_k: cfg.top_k,
+        jumprelu_threshold: cfg.jumprelu_threshold,
+        oos_projection_top1: vbool(raw, "oos_projection_top1")?,
+        dispersion: vf64(raw, "dispersion")?,
+        penalized_loss_score: score,
+        // Duplicate write-alias re-derived in `to_json`; the field value here is
+        // irrelevant to the serialized output.
+        reml_score: None,
+        reconstruction_r2: vf64(raw, "reconstruction_r2")?,
+        primitive_names,
+        basis_specs: kinds.clone(),
+        basis_kinds: kinds,
+        atom_dims: dims,
+        basis_sizes: sizes,
+        n_harmonics,
+        training_mean,
+        training_data: None,
+        training_data_retained: false,
+        fitted: v_arr2(vget(raw, "fitted")?)?,
+        assignments,
+        low_level_logits: logits,
+        coords,
+        decoder_blocks,
+        duchon_centers,
+        atoms: atom_payloads,
+        diagnostics: vget(raw, "diagnostics")?.clone(),
+        top_k_projection: report("top_k_projection"),
+        pre_topk: report("pre_topk"),
+        solver_plan: report("solver_plan"),
+        atom_two_lens: report("atom_two_lens"),
+        residual_gauge: report("residual_gauge"),
+        incoherence_report: report("incoherence_report"),
+        curvature_report: report("curvature_report"),
+        coordinate_fidelity: report("coordinate_fidelity"),
+        topology_persistence: report("topology_persistence"),
+        atom_inference: report("atom_inference"),
+        certificates: report("certificates"),
+        structure_certificate,
+        cotrain: report("cotrain"),
+        hybrid_split: report("hybrid_split"),
+        fisher_factors: None,
+        fisher_provenance: None,
+        metric_provenance,
+        fisher_mass_residual,
+        selected_log_lambda_sparse,
+        selected_log_lambda_smooth,
+        selected_log_ard,
+        structured_residual_diagnostics: Vec::new(),
+    })
 }
 
 #[cfg(test)]
