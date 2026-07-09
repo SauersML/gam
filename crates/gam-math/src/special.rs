@@ -80,9 +80,83 @@ pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
     scale * tail
 }
 
+/// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points, computed via
+/// Newton iteration on the Legendre-polynomial roots (Bonnet's three-term
+/// recurrence, cosine initial guess). Returns `(nodes, weights)` with nodes
+/// ascending; for odd `n` the central node is exactly `0.0`.
+///
+/// Canonical home for the routine previously triplicated in
+/// `gam-terms/basis/closed_form_penalty.rs`, `gam-model-kernels/
+/// cubic_cell_kernel.rs`, and `gam-models/survival/base.rs`; this copy keeps
+/// the tightest of their Newton settings (200-iteration cap, `1e-15`
+/// convergence).
+pub fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut tmp: Vec<(f64, f64)> = Vec::with_capacity(n);
+    let half = n.div_ceil(2);
+    for i in 0..half {
+        let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+        let mut pp = 0.0_f64;
+        for _ in 0..200 {
+            let mut p1 = 1.0_f64;
+            let mut p2 = 0.0_f64;
+            for j in 0..n {
+                let p3 = p2;
+                p2 = p1;
+                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
+            }
+            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
+            let z_prev = z;
+            z = z_prev - p1 / pp;
+            if (z - z_prev).abs() < 1e-15 {
+                break;
+            }
+        }
+        let w = 2.0 / ((1.0 - z * z) * pp * pp);
+        // For odd n the central node is at z = 0; record once.
+        if !n.is_multiple_of(2) && i == half - 1 {
+            tmp.push((0.0, w));
+        } else {
+            tmp.push((-z.abs(), w));
+            tmp.push((z.abs(), w));
+        }
+    }
+    tmp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut nodes = Vec::with_capacity(n);
+    let mut weights = Vec::with_capacity(n);
+    for (z, w) in tmp.into_iter().take(n) {
+        nodes.push(z);
+        weights.push(w);
+    }
+    (nodes, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gauss_legendre_integrates_polynomials_exactly() {
+        // An n-point rule is exact for polynomials of degree ≤ 2n−1.
+        for n in [1usize, 2, 3, 5, 8, 40, 64] {
+            let (nodes, weights) = gauss_legendre(n);
+            assert_eq!(nodes.len(), n);
+            assert_eq!(weights.len(), n);
+            assert!(nodes.windows(2).all(|w| w[0] < w[1]), "nodes ascending");
+            if !n.is_multiple_of(2) {
+                assert_eq!(nodes[n / 2], 0.0, "odd-n central node is exact zero");
+            }
+            let total: f64 = weights.iter().sum();
+            assert!((total - 2.0).abs() < 1e-13, "∫1 dx = 2, got {total}");
+            if n >= 2 {
+                let x2: f64 = nodes
+                    .iter()
+                    .zip(&weights)
+                    .map(|(x, w)| w * x * x)
+                    .sum();
+                assert!((x2 - 2.0 / 3.0).abs() < 1e-13, "∫x² dx = 2/3, got {x2}");
+            }
+        }
+    }
 
     #[test]
     fn binom_k_exceeds_n_returns_zero() {

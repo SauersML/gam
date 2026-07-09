@@ -3266,7 +3266,7 @@ fn sae_manifold_fit_inner<'py>(
     // flag. The factor stack is `(n_obs, p_out, rank)` row-major, reshaped to the
     // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
     // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
-    let mut metric_provenance: &'static str = if let Some(u3) = fisher_u {
+    let metric_provenance: &'static str = if let Some(u3) = fisher_u {
         let u_shape = u3.shape();
         if u_shape[0] != n_obs || u_shape[1] != p_out {
             return Err(py_value_error(format!(

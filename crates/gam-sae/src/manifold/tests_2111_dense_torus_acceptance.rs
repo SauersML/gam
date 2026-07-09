@@ -31,7 +31,8 @@
 
 use crate::manifold::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, StagewiseConfig, StagewiseStop, fit_stagewise,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, StagewiseConfig, StagewiseStop,
+    fit_stagewise,
 };
 use gam_linalg::faer_ndarray::FaerSvd;
 use gam_terms::latent::LatentManifold;
@@ -81,9 +82,12 @@ fn dense_torus(
     }
     let true_planes: Vec<Array2<f64>> = (0..k)
         .map(|c| {
-            Array2::from_shape_fn((p, 2), |(row, col)| {
-                if row == 2 * c + col { 1.0 } else { 0.0 }
-            })
+            Array2::from_shape_fn(
+                (p, 2),
+                |(row, col)| {
+                    if row == 2 * c + col { 1.0 } else { 0.0 }
+                },
+            )
         })
         .collect();
     (data, true_planes, turns)
@@ -146,10 +150,7 @@ fn circle_atom(
 }
 
 /// K=1 seed term: circle 0 on its true coordinate, active on every row.
-fn seed_term(
-    coords0: &Array2<f64>,
-    p: usize,
-) -> (SaeManifoldTerm, SaeManifoldRho) {
+fn seed_term(coords0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRho) {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let atom = circle_atom("seed_c0", &evaluator, coords0, 0, 1, p);
     let n = coords0.nrows();
@@ -275,9 +276,7 @@ fn dense_torus_integrated_birth_recovery_2111() {
     eprintln!("[#2111] per-atom decoder plane vs true circles:");
     eprintln!("   atom  best_overlap  second_overlap  best_circle   sv_PR");
     for (k, (best, second, circ, pr)) in rows.iter().enumerate() {
-        eprintln!(
-            "   {k:>4}  {best:>12.4}  {second:>14.4}  {circ:>11}   {pr:>6.3}"
-        );
+        eprintln!("   {k:>4}  {best:>12.4}  {second:>14.4}  {circ:>11}   {pr:>6.3}");
     }
     eprintln!(
         "[#2111] n_distinct={n_distinct} n_real={n_real} n_clean={n_clean}  (bar: 6/6/6, all PR<=3, natural_exit)"
@@ -299,13 +298,25 @@ fn dense_torus_integrated_birth_recovery_2111() {
         "expected K={k} born atoms, got {}",
         result.term.k_atoms()
     );
-    assert!(all_real, "every atom must match a true circle at overlap >= 0.9");
-    assert!(all_clean, "every atom must be CLEAN (best>=0.9 AND second<=0.2)");
-    assert!(all_pr_ok, "every decoder must have SV participation ratio <= 3");
+    assert!(
+        all_real,
+        "every atom must match a true circle at overlap >= 0.9"
+    );
+    assert!(
+        all_clean,
+        "every atom must be CLEAN (best>=0.9 AND second<=0.2)"
+    );
+    assert!(
+        all_pr_ok,
+        "every decoder must have SV participation ratio <= 3"
+    );
     assert!(n_distinct == k, "n_distinct must be {k}; got {n_distinct}");
     assert!(n_real == k, "n_real must be {k}; got {n_real}");
     assert!(n_clean == k, "n_clean must be {k}; got {n_clean}");
-    assert!(natural_exit, "forward phase must exit naturally (not MaxBirths)");
+    assert!(
+        natural_exit,
+        "forward phase must exit naturally (not MaxBirths)"
+    );
 }
 
 /// Fixture sanity (fast, no fit): the planted dense torus really carries `2k`
@@ -317,7 +328,10 @@ fn dense_torus_fixture_has_2k_signal_dirs_2111() {
     let k = 6usize;
     let (data, _planes, _turns) = dense_torus(700, 16, k, &vec![1.0; k], 0.05, 0x2111_F1F7);
     let signal = column_signal_rank(data.view(), 0.05 * 0.05);
-    eprintln!("[#2111 fixture] above-noise signal directions = {signal} (expect {})", 2 * k);
+    eprintln!(
+        "[#2111 fixture] above-noise signal directions = {signal} (expect {})",
+        2 * k
+    );
     assert!(
         signal == 2 * k,
         "dense {k}-torus must show exactly {} signal directions; got {signal}",

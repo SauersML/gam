@@ -27,7 +27,11 @@ mod amortized_encoder_tests {
                 "atom {atom_idx} encode coords must match its latent dim"
             );
         }
-        assert_eq!(results.converged.len(), n, "joint verdict must cover every row");
+        assert_eq!(
+            results.converged.len(),
+            n,
+            "joint verdict must cover every row"
+        );
         assert_eq!(
             results.unconverged_count,
             results.converged.iter().filter(|ok| !**ok).count()
@@ -102,8 +106,7 @@ mod outer_gradient_error_classification_1451_tests {
             "DeflatedArrowSolver: solution length 5 != cache full length 6",
         ];
         for msg in shape_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::InternalInvariant { .. }),
                 "shape mismatch must classify to InternalInvariant (#1451); got {classified}"
@@ -124,8 +127,7 @@ mod outer_gradient_error_classification_1451_tests {
             "outer_gradient_arrow_solver: non-finite entry in projected gauge Hessian",
         ];
         for msg in nonfinite_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::InternalInvariant { .. }),
                 "non-finite intermediate must classify to InternalInvariant (#1451); \
@@ -146,8 +148,7 @@ mod outer_gradient_error_classification_1451_tests {
             "DeflatedArrowSolver: gauge back-solve: singular factor",
         ];
         for msg in conditioning_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::IllConditioned { .. }),
                 "a finite, correctly-shaped near-singular failure must KEEP \
@@ -257,7 +258,8 @@ mod softmax_majorizer_active_entry_1410_tests {
                 for jj in 0..k {
                     let got = super::softmax_dense_entropy_hessian_entry(a, kk, jj, m, scale);
                     assert_eq!(
-                        got, h_dense[[kk, jj]],
+                        got,
+                        h_dense[[kk, jj]],
                         "active dense entropy-Hessian entry ({kk},{jj}) must equal \
                          row_dense_hessian BIT-FOR-BIT (single-source #1410/#1418)"
                     );
@@ -289,7 +291,8 @@ mod softmax_majorizer_active_entry_1410_tests {
                         a, kk, w, m, scale, inv_tau,
                     );
                     assert_eq!(
-                        got, dense[[kk, kk]],
+                        got,
+                        dense[[kk, kk]],
                         "active majorizer logit-derivative ∂D_({kk},{kk})/∂z_{w} must equal \
                          row_psd_majorizer_logit_derivative diagonal BIT-FOR-BIT \
                          (single-source #1410/#1419/#1006)"
@@ -370,11 +373,9 @@ mod exact_stationarity_solve_1418_tests {
     /// `solve_exact_stationarity` returns the EXACT solve of `A x = rhs` (small
     /// `A`-residual), AND the surrogate solve `x_B = B⁻¹ rhs` leaves a LARGE
     /// `A`-residual — so the certificate is non-vacuous (`A ≠ B`) and the IFT
-    /// step genuinely inverts `A`. Before #1418 the implicit step used `x_B`
-    /// (the truncated `B⁻¹`-Neumann iterate), whose `A`-residual is the large
-    /// value asserted below: that code leaves `‖A x_B − rhs‖` far from zero (and
-    /// the Neumann variant diverges outright once `ρ(B⁻¹ΔC) ≥ 1`), so this test
-    /// fails before the fix and passes only when the solve targets the exact `A`.
+    /// step genuinely inverts `A`. The surrogate solve `x_B = B⁻¹ rhs` leaves
+    /// the large `A`-residual asserted below, so this test passes only when the
+    /// implicit solve targets the exact stationarity Jacobian.
     #[test]
     fn solve_exact_stationarity_inverts_a_not_b_1418() {
         let (term, target, rho, cache) = converged_state_with_residual();
@@ -396,7 +397,9 @@ mod exact_stationarity_solve_1418_tests {
         let exact_resid = a_residual_norm(&term, &rho, target.view(), &cache, &x, &rhs);
 
         // Surrogate solve x_B = B⁻¹ rhs (the pre-#1418 implicit step).
-        let x_b = solver.solve(rhs.t.view(), rhs.beta.view()).expect("B inverse");
+        let x_b = solver
+            .solve(rhs.t.view(), rhs.beta.view())
+            .expect("B inverse");
         let surrogate_resid = a_residual_norm(&term, &rho, target.view(), &cache, &x_b, &rhs);
 
         // 1) The exact solve drives the A-residual to ~0.
@@ -589,7 +592,9 @@ mod exact_stationarity_solve_1418_tests {
 
         // Deterministic probe spanning the latent (t) and decoder (β) blocks.
         let v = SaeArrowVector {
-            t: Array1::from_shape_fn(total_t, |i| 0.37 + 0.11 * ((i % 4) as f64) - 0.017 * i as f64),
+            t: Array1::from_shape_fn(total_t, |i| {
+                0.37 + 0.11 * ((i % 4) as f64) - 0.017 * i as f64
+            }),
             beta: Array1::from_shape_fn(kdim, |j| 0.21 - 0.043 * ((j % 3) as f64)),
         };
         let v_flat = flatten_arrow_parts(v.t.view(), v.beta.view());
@@ -656,10 +661,7 @@ mod exact_stationarity_solve_1418_tests {
         // Operator/preconditioner consistency: stripping ΔC must round-trip
         // through the inner solver's exact inverse back to v.
         let (rt, rb) = cache
-            .full_inverse_apply(
-                (&ae.t - &dc_v.t).view(),
-                (&ae.beta - &dc_v.beta).view(),
-            )
+            .full_inverse_apply((&ae.t - &dc_v.t).view(), (&ae.beta - &dc_v.beta).view())
             .expect("round-trip inverse");
         let round_trip = {
             let mut s = 0.0_f64;
@@ -700,7 +702,10 @@ mod smoothness_dof_hutchinson_tests {
         let p = term.output_dim();
         if term.frames_active() {
             let ranks: Vec<usize> = term.atoms.iter().map(|a| a.border_frame_rank()).collect();
-            (term.factored_beta_offsets(), Box::new(move |k: usize| ranks[k]))
+            (
+                term.factored_beta_offsets(),
+                Box::new(move |k: usize| ranks[k]),
+            )
         } else {
             (term.beta_offsets(), Box::new(move |_k: usize| p))
         }
@@ -733,7 +738,13 @@ mod smoothness_dof_hutchinson_tests {
         let seed = 0xC0FFEE_1234;
         let est = term
             .decoder_smoothness_effective_dof_per_atom_hutchinson(
-                cache.k, &offsets, out_dim.as_ref(), &lambda, probes, seed, solve,
+                cache.k,
+                &offsets,
+                out_dim.as_ref(),
+                &lambda,
+                probes,
+                seed,
+                solve,
             )
             .expect("hutchinson per-atom smoothness edof");
 
@@ -767,7 +778,13 @@ mod smoothness_dof_hutchinson_tests {
         };
         let est2 = term
             .decoder_smoothness_effective_dof_per_atom_hutchinson(
-                cache.k, &offsets, out_dim.as_ref(), &lambda, probes, seed, solve2,
+                cache.k,
+                &offsets,
+                out_dim.as_ref(),
+                &lambda,
+                probes,
+                seed,
+                solve2,
             )
             .expect("hutchinson rerun");
         assert_eq!(
@@ -822,8 +839,7 @@ mod step2_quotient_scale_tests {
         // (i) reconstruction data-fit preserved by the peel.
         let loss_peeled = term.loss(target.view(), &rho).expect("peeled loss");
         assert!(
-            (loss_peeled.data_fit - loss0.data_fit).abs()
-                <= 1e-9 * (1.0 + loss0.data_fit.abs()),
+            (loss_peeled.data_fit - loss0.data_fit).abs() <= 1e-9 * (1.0 + loss0.data_fit.abs()),
             "peel must preserve reconstruction data-fit: {} vs {}",
             loss0.data_fit,
             loss_peeled.data_fit
@@ -981,7 +997,10 @@ mod step2_quotient_scale_tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 2, "must check at least two β entries; checked {checked}");
+        assert!(
+            checked >= 2,
+            "must check at least two β entries; checked {checked}"
+        );
     }
 
     /// #2022 transport-peel — the no-refresh peel normalizes the decoder into
@@ -1003,8 +1022,7 @@ mod step2_quotient_scale_tests {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        term.atoms[0]
-            .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
+        term.atoms[0].absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
         // smooth_penalty untouched (the refresh was skipped).
         assert_eq!(
             term.atoms[0].smooth_penalty, penalty_before,
@@ -1041,11 +1059,11 @@ mod step2_quotient_scale_tests {
 mod lever_wiring_2072_tests {
     use crate::manifold::tests::small_two_atom_periodic_term;
     use crate::manifold::{
-        sae_data_row_anchored_euclidean_coords, sae_pca_seed_initial_coords_with_pc_offset,
         AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-        SaeManifoldRho, SaeManifoldTerm,
+        SaeManifoldRho, SaeManifoldTerm, sae_data_row_anchored_euclidean_coords,
+        sae_pca_seed_initial_coords_with_pc_offset,
     };
-    use ndarray::{array, Array2, Array3};
+    use ndarray::{Array2, Array3, array};
 
     fn frob(b: &Array2<f64>) -> f64 {
         b.iter().map(|v| v * v).sum::<f64>().sqrt()
@@ -1322,9 +1340,8 @@ mod lever_wiring_2072_tests {
                 .expect("pca reference seed");
         // Driver anchor for slot 0: (0 + offset·atoms.len()) % n.
         let anchor_rows = [(0usize + offset.wrapping_mul(atoms.len().max(1))) % n];
-        let data_row =
-            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)
-                .expect("data-row reference seed");
+        let data_row = sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)
+            .expect("data-row reference seed");
 
         for row in 0..n {
             assert!(
@@ -1416,8 +1433,7 @@ mod lever_wiring_2072_tests {
         // Neutral default state, then the production penalized amplitude solve.
         term.atoms[0].log_amplitude = 0.0;
         term.atoms[1].log_amplitude = 0.0;
-        term
-            .optimize_log_amplitudes_closed_form(target.view(), &rho)
+        term.optimize_log_amplitudes_closed_form(target.view(), &rho)
             .expect("penalized amplitude solve");
         let b0 = term.atoms[0].log_amplitude.exp();
         let b1 = term.atoms[1].log_amplitude.exp();
@@ -1463,7 +1479,7 @@ mod lever_wiring_2072_tests {
     #[test]
     fn pin_scale_gauge_recovers_k3_multi_active_co_collapse_1939() {
         use crate::assignment::ibp_map_row;
-        use crate::manifold::tests::{periodic_basis, TestPeriodicEvaluator};
+        use crate::manifold::tests::{TestPeriodicEvaluator, periodic_basis};
         use ndarray::Array1;
         use std::sync::Arc;
 

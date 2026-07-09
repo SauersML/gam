@@ -11,48 +11,10 @@ use gam_math::special::binomial_coefficient_f64 as binomial_f64;
 use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
 use std::sync::OnceLock;
 
-/// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points,
-/// computed via Newton iteration on Legendre polynomial roots
-/// (Bonnet's recurrence). Returns `(nodes, weights)` ascending.
-pub(crate) fn compute_gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut tmp: Vec<(f64, f64)> = Vec::with_capacity(n);
-    let half = n.div_ceil(2);
-    for i in 0..half {
-        let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
-        let mut pp = 0.0_f64;
-        for _ in 0..200 {
-            let mut p1 = 1.0_f64;
-            let mut p2 = 0.0_f64;
-            for j in 0..n {
-                let p3 = p2;
-                p2 = p1;
-                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
-            }
-            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
-            let z_prev = z;
-            z = z_prev - p1 / pp;
-            if (z - z_prev).abs() < 1e-15 {
-                break;
-            }
-        }
-        let w = 2.0 / ((1.0 - z * z) * pp * pp);
-        // For odd n the central node is at z = 0; record once.
-        if !n.is_multiple_of(2) && i == half - 1 {
-            tmp.push((0.0, w));
-        } else {
-            tmp.push((-z.abs(), w));
-            tmp.push((z.abs(), w));
-        }
-    }
-    tmp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut nodes = Vec::with_capacity(n);
-    let mut weights = Vec::with_capacity(n);
-    for (z, w) in tmp.into_iter().take(n) {
-        nodes.push(z);
-        weights.push(w);
-    }
-    (nodes, weights)
-}
+/// Gauss-Legendre nodes and weights on `[-1, 1]`; the canonical
+/// implementation lives in `gam-math` (previously triplicated across
+/// gam-terms / gam-model-kernels / gam-models).
+pub(crate) use gam_math::special::gauss_legendre as compute_gauss_legendre;
 
 pub(crate) fn gauss_legendre_64() -> &'static (Vec<f64>, Vec<f64>) {
     static CACHE: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();

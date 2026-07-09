@@ -33,7 +33,7 @@
 
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
-use ndarray::{array, s, Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 /// Deterministic `splitmix64` bit-mixer — a structureless uniform PRNG (no
@@ -139,8 +139,7 @@ pub(crate) fn cocollapse_refusal_is_recoverable_infeasible_rho_2089() {
 
     // The inner fit must terminate cleanly — never panic/abort. It either returns a
     // finite result (the reseed recovered) or the typed co-collapse refusal.
-    let result =
-        term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 0.05, 1.0e-3, 1.0e-3);
+    let result = term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 0.05, 1.0e-3, 1.0e-3);
 
     match result {
         Ok(loss) => {

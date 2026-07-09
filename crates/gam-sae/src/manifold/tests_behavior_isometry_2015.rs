@@ -125,14 +125,24 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
     let fitted = term.try_fitted_for_rho(&rho).unwrap();
     let ev_act = block_ev(&augmented, &fitted, 0, p_x);
     let ev_beh = block_ev(&augmented, &fitted, p_x, p_tot);
-    assert!(ev_act > 0.85, "activation EV too low ({ev_act}) to trust the speeds");
-    assert!(ev_beh > 0.85, "behavior EV too low ({ev_beh}) to trust the speeds");
+    assert!(
+        ev_act > 0.85,
+        "activation EV too low ({ev_act}) to trust the speeds"
+    );
+    assert!(
+        ev_beh > 0.85,
+        "behavior EV too low ({ev_beh}) to trust the speeds"
+    );
 
     let cert = atom_behavior_isometry(&term, 0)
         .expect("isometry certificate must compute")
         .expect("a d=1 two-block atom must yield a certificate");
     assert!(cert.behavior_engaged, "behavior must be engaged (it moves)");
-    assert!(cert.scale.is_finite() && cert.scale > 0.0, "scale {}", cert.scale);
+    assert!(
+        cert.scale.is_finite() && cert.scale > 0.0,
+        "scale {}",
+        cert.scale
+    );
     assert!(
         cert.nats_per_unit_t.is_finite() && cert.nats_per_unit_t > 0.0,
         "nats/unit t {}",
@@ -258,15 +268,25 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
     let fitted = term.try_fitted_for_rho(&rho).unwrap();
     let ev_act = block_ev(&augmented, &fitted, 0, p_x);
     let ev_beh = block_ev(&augmented, &fitted, p_x, p_tot);
-    assert!(ev_act > 0.85, "activation EV too low ({ev_act}) to trust the speeds");
-    assert!(ev_beh > 0.85, "behavior EV too low ({ev_beh}) to trust the speeds");
+    assert!(
+        ev_act > 0.85,
+        "activation EV too low ({ev_act}) to trust the speeds"
+    );
+    assert!(
+        ev_beh > 0.85,
+        "behavior EV too low ({ev_beh}) to trust the speeds"
+    );
 
     // The isometry defect, read off the REML-coupled fit's fitted coordinates.
     let cert = atom_behavior_isometry(&term, 0)
         .expect("isometry certificate must compute")
         .expect("a d=1 two-block atom must yield a certificate");
     assert!(cert.behavior_engaged, "behavior must be engaged (it moves)");
-    assert!(cert.scale.is_finite() && cert.scale > 0.0, "scale {}", cert.scale);
+    assert!(
+        cert.scale.is_finite() && cert.scale > 0.0,
+        "scale {}",
+        cert.scale
+    );
     assert!(
         cert.nats_per_unit_t.is_finite() && cert.nats_per_unit_t > 0.0,
         "nats/unit t {}",
@@ -308,7 +328,10 @@ fn reml_selected_coupling_then_isometry_defect_separates() {
         (conv_broken, ident_broken, log_lambda_broken, "broken"),
     ] {
         assert!(conv, "{label}: λ_y fixed point did not converge");
-        assert!(ident, "{label}: λ_y should be identifiable (behavior varies)");
+        assert!(
+            ident,
+            "{label}: λ_y should be identifiable (behavior varies)"
+        );
         assert!(
             log_lambda.is_finite(),
             "{label}: REML-selected log λ_y must be finite, got {log_lambda}"
@@ -382,7 +405,10 @@ fn behavior_isometry_diagnostic_is_scale_quotient_invariant() {
     let cert0 = atom_behavior_isometry(&term, 0)
         .expect("isometry certificate must compute")
         .expect("a d=1 two-block atom must yield a certificate");
-    assert!(cert0.behavior_engaged, "behavior must move for a real ratio test");
+    assert!(
+        cert0.behavior_engaged,
+        "behavior must move for a real ratio test"
+    );
     assert!(
         cert0.scale.is_finite() && cert0.scale > 0.0 && cert0.nats_per_unit_t > 0.0,
         "baseline readouts must be well-defined: scale {} nats {}",

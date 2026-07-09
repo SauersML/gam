@@ -180,7 +180,10 @@ fn graph_atom_reads_continuous_circle_as_one_loop_from_knn_edges() {
     assert!(selection.compression.bits_saved > 0.0);
     assert!(selection.selected);
     assert!(
-        matches!(atom.occupancy(), OccupancyLaw::Uniform | OccupancyLaw::Continuous),
+        matches!(
+            atom.occupancy(),
+            OccupancyLaw::Uniform | OccupancyLaw::Continuous
+        ),
         "continuous circle occupancy should remain continuous/uniform, got {:?}",
         atom.occupancy()
     );
@@ -372,7 +375,10 @@ fn learned_graph_reads_branching_tree_and_detects_branch_vertex() {
         degrees.iter().any(|&degree| degree > 2),
         "branching tree must expose a degree>2 vertex: {degrees:?}"
     );
-    assert_eq!(atom.certified_compression().kind, GraphCompressionKind::Graph);
+    assert_eq!(
+        atom.certified_compression().kind,
+        GraphCompressionKind::Graph
+    );
     assert_eq!(
         atom.certified_compression().name,
         "structure without a standard name"
@@ -399,7 +405,10 @@ fn two_date_modular_synthetic_binds_super_resolution_to_graph_base() {
     .expect("weekday graph base");
 
     let selection = atom.structure_selection();
-    assert!(selection.selected, "graph base must be selected before binding");
+    assert!(
+        selection.selected,
+        "graph base must be selected before binding"
+    );
     assert_eq!(selection.topology.b0, 1);
     assert_eq!(selection.topology.b1, 1);
     assert_eq!(selection.occupancy, OccupancyLaw::Discrete { anchors });
@@ -429,15 +438,13 @@ fn two_date_modular_synthetic_binds_super_resolution_to_graph_base() {
     );
     assert_eq!(row0.spikes.len(), 2);
     assert!(
-        row0
-            .spikes
+        row0.spikes
             .iter()
             .any(|spike| circ_err(spike.coordinate, first_date) < 1.0e-8),
         "missing first modular date"
     );
     assert!(
-        row0
-            .spikes
+        row0.spikes
             .iter()
             .any(|spike| circ_err(spike.coordinate, second_date) < 1.0e-8),
         "missing second modular date"
@@ -509,7 +516,10 @@ fn coactivation_ring_enrolls_as_graph_atom_with_cycle_betti() {
         "the whole ring must clear the one-edge charge"
     );
     assert_eq!(topo.b0, 1, "a ring is connected: b0 = 1");
-    assert_eq!(topo.b1, 1, "a ring has exactly one independent cycle: b1 = 1");
+    assert_eq!(
+        topo.b1, 1,
+        "a ring has exactly one independent cycle: b1 = 1"
+    );
 
     // The enrolled structure is SELECTED: summed co-fire evidence beats the summed
     // edge charge, and every edge's evidence is n_eff·MI over its one-edge charge.

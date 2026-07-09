@@ -47,9 +47,8 @@ use std::f64::consts::TAU;
 /// same closed form [`crate::super_resolution`] uses; duplicated here so the two
 /// lifted descents stay module-independent.
 fn optimal_hard_threshold_coefficient(beta: f64) -> f64 {
-    (2.0 * (beta + 1.0)
-        + 8.0 * beta / ((beta + 1.0) + (beta * beta + 14.0 * beta + 1.0).sqrt()))
-    .sqrt()
+    (2.0 * (beta + 1.0) + 8.0 * beta / ((beta + 1.0) + (beta * beta + 14.0 * beta + 1.0).sqrt()))
+        .sqrt()
 }
 
 /// Model order from a descending singular spectrum, by the same derived rule as
@@ -72,8 +71,7 @@ fn singular_value_order(
     let threshold = if sigma > 0.0 {
         let beta = rows.min(cols) as f64 / n_big;
         let sigma_entry = std::f64::consts::SQRT_2 * sigma;
-        (optimal_hard_threshold_coefficient(beta) * sigma_entry * n_big.sqrt())
-            .max(numerical_floor)
+        (optimal_hard_threshold_coefficient(beta) * sigma_entry * n_big.sqrt()).max(numerical_floor)
     } else {
         numerical_floor
     };
@@ -421,10 +419,7 @@ pub fn recover_torus_spikes(grid: &Mat<c64>, sigma: f64) -> Result<TorusRecovery
     let cols = (h2 - k + 1) * (h1 - p + 1);
     // Identifiable order: bounded by the enhanced matrix rank and by both shift
     // subselections having at least `m` rows.
-    let max_order = rows
-        .min(cols)
-        .min((p - 1) * k)
-        .min((k - 1) * p);
+    let max_order = rows.min(cols).min((p - 1) * k).min((k - 1) * p);
     if max_order == 0 {
         return Err(format!(
             "recover_torus_spikes: grid {h1}×{h2} too small to resolve any spike"
@@ -668,32 +663,33 @@ where
 
     // Evaluate the model residual `r = z − Σ_j a_j Φ(t_j)` and its norm, caching
     // the per-spike `(Φ_j, J_j)` used to build the Jacobian.
-    let eval = |state: &PolishState| -> Result<(Vec<f64>, f64, Vec<(Array1<f64>, Array2<f64>)>), String> {
-        let mut fit = vec![0.0_f64; big_d];
-        let mut cache = Vec::with_capacity(m);
-        for j in 0..m {
-            let (phi_j, jac_j) = phi(&state.coords[j]);
-            if phi_j.len() != big_d || jac_j.dim() != (big_d, d) {
-                return Err(format!(
-                    "polish_spikes: phi returned Φ len {} / J {:?}, expected {big_d} / ({big_d}, {d})",
-                    phi_j.len(),
-                    jac_j.dim()
-                ));
+    let eval =
+        |state: &PolishState| -> Result<(Vec<f64>, f64, Vec<(Array1<f64>, Array2<f64>)>), String> {
+            let mut fit = vec![0.0_f64; big_d];
+            let mut cache = Vec::with_capacity(m);
+            for j in 0..m {
+                let (phi_j, jac_j) = phi(&state.coords[j]);
+                if phi_j.len() != big_d || jac_j.dim() != (big_d, d) {
+                    return Err(format!(
+                        "polish_spikes: phi returned Φ len {} / J {:?}, expected {big_d} / ({big_d}, {d})",
+                        phi_j.len(),
+                        jac_j.dim()
+                    ));
+                }
+                let a = state.amplitudes[j];
+                for i in 0..big_d {
+                    fit[i] += a * phi_j[i];
+                }
+                cache.push((phi_j, jac_j));
             }
-            let a = state.amplitudes[j];
+            let mut r = vec![0.0_f64; big_d];
+            let mut nsq = 0.0;
             for i in 0..big_d {
-                fit[i] += a * phi_j[i];
+                r[i] = observed[i] - fit[i];
+                nsq += r[i] * r[i];
             }
-            cache.push((phi_j, jac_j));
-        }
-        let mut r = vec![0.0_f64; big_d];
-        let mut nsq = 0.0;
-        for i in 0..big_d {
-            r[i] = observed[i] - fit[i];
-            nsq += r[i] * r[i];
-        }
-        Ok((r, nsq.sqrt(), cache))
-    };
+            Ok((r, nsq.sqrt(), cache))
+        };
 
     let mut state = init;
     let (mut r, mut res_norm, mut cache) = eval(&state)?;
@@ -733,9 +729,14 @@ where
                     0.0
                 }
             });
-            let rhs = Mat::<f64>::from_fn(big_d + n_params, 1, |row, _| {
-                if row < big_d { r[row] } else { 0.0 }
-            });
+            let rhs =
+                Mat::<f64>::from_fn(
+                    big_d + n_params,
+                    1,
+                    |row, _| {
+                        if row < big_d { r[row] } else { 0.0 }
+                    },
+                );
             let delta = aug.qr().solve_lstsq(&rhs);
 
             let mut trial = state.clone();
@@ -814,9 +815,18 @@ mod tests {
         // m = 3 orthogonal directions in d = 4, distinct amplitudes.
         let d = 4;
         let planted = vec![
-            SphereSpike { direction: basis_dir(0, d), amplitude: 2.0 },
-            SphereSpike { direction: basis_dir(1, d), amplitude: 1.3 },
-            SphereSpike { direction: basis_dir(2, d), amplitude: 0.7 },
+            SphereSpike {
+                direction: basis_dir(0, d),
+                amplitude: 2.0,
+            },
+            SphereSpike {
+                direction: basis_dir(1, d),
+                amplitude: 1.3,
+            },
+            SphereSpike {
+                direction: basis_dir(2, d),
+                amplitude: 0.7,
+            },
         ];
         let m = sphere_lift(&planted, d).expect("lift");
         let rec = recover_sphere_spikes(m.view(), 0.0).expect("recover");
@@ -835,8 +845,22 @@ mod tests {
         let d = 3;
         let raw = vec![0.6, -0.8, 0.0];
         let neg = vec![-0.6, 0.8, 0.0];
-        let m_pos = sphere_lift(&[SphereSpike { direction: raw.clone(), amplitude: 1.5 }], d).unwrap();
-        let m_neg = sphere_lift(&[SphereSpike { direction: neg, amplitude: 1.5 }], d).unwrap();
+        let m_pos = sphere_lift(
+            &[SphereSpike {
+                direction: raw.clone(),
+                amplitude: 1.5,
+            }],
+            d,
+        )
+        .unwrap();
+        let m_neg = sphere_lift(
+            &[SphereSpike {
+                direction: neg,
+                amplitude: 1.5,
+            }],
+            d,
+        )
+        .unwrap();
         let rec_pos = recover_sphere_spikes(m_pos.view(), 0.0).unwrap();
         let rec_neg = recover_sphere_spikes(m_neg.view(), 0.0).unwrap();
         assert_eq!(rec_pos.spikes.len(), 1);
@@ -856,7 +880,10 @@ mod tests {
         for m in 1..=3 {
             let amps = [2.5, 1.7, 1.0];
             let planted: Vec<SphereSpike> = (0..m)
-                .map(|i| SphereSpike { direction: basis_dir(i, d), amplitude: amps[i] })
+                .map(|i| SphereSpike {
+                    direction: basis_dir(i, d),
+                    amplitude: amps[i],
+                })
                 .collect();
             let mut lift = sphere_lift(&planted, d).unwrap();
             // Tiny noise well below the amplitude scale.
@@ -887,8 +914,14 @@ mod tests {
         let d = 3;
         let sigma = 0.05;
         let planted = vec![
-            SphereSpike { direction: basis_dir(0, d), amplitude: 3.0 },
-            SphereSpike { direction: basis_dir(1, d), amplitude: 1.5 },
+            SphereSpike {
+                direction: basis_dir(0, d),
+                amplitude: 3.0,
+            },
+            SphereSpike {
+                direction: basis_dir(1, d),
+                amplitude: 1.5,
+            },
         ];
         let mut lift = sphere_lift(&planted, d).unwrap();
         let mut rng = StdRng::seed_from_u64(2024);
@@ -904,8 +937,16 @@ mod tests {
         let rec = recover_sphere_spikes(lift.view(), sigma).unwrap();
         assert_eq!(rec.model_order, 2, "order under moderate noise");
         for (r, p) in rec.spikes.iter().zip(planted.iter()) {
-            assert!(dir_dist(&r.direction, &p.direction) < 0.05, "direction {:.3e}", dir_dist(&r.direction, &p.direction));
-            assert!((r.amplitude - p.amplitude).abs() < 0.5, "amplitude {:.3e}", (r.amplitude - p.amplitude).abs());
+            assert!(
+                dir_dist(&r.direction, &p.direction) < 0.05,
+                "direction {:.3e}",
+                dir_dist(&r.direction, &p.direction)
+            );
+            assert!(
+                (r.amplitude - p.amplitude).abs() < 0.5,
+                "amplitude {:.3e}",
+                (r.amplitude - p.amplitude).abs()
+            );
         }
     }
 
@@ -947,10 +988,22 @@ mod tests {
     fn torus_noiseless_roundtrip_m1_m2() {
         let (h1, h2) = (6, 6);
         for planted in [
-            vec![TorusSpike { theta: 0.23, phi: 0.61, amplitude: 1.4 }],
+            vec![TorusSpike {
+                theta: 0.23,
+                phi: 0.61,
+                amplitude: 1.4,
+            }],
             vec![
-                TorusSpike { theta: 0.15, phi: 0.72, amplitude: 1.0 },
-                TorusSpike { theta: 0.63, phi: 0.28, amplitude: 0.8 },
+                TorusSpike {
+                    theta: 0.15,
+                    phi: 0.72,
+                    amplitude: 1.0,
+                },
+                TorusSpike {
+                    theta: 0.63,
+                    phi: 0.28,
+                    amplitude: 0.8,
+                },
             ],
         ] {
             let grid = torus_lift(&planted, h1, h2).unwrap();
@@ -967,15 +1020,39 @@ mod tests {
     fn torus_multiplicity_detection() {
         let (h1, h2) = (6, 6);
         let candidates = [
-            vec![TorusSpike { theta: 0.30, phi: 0.40, amplitude: 1.2 }],
+            vec![TorusSpike {
+                theta: 0.30,
+                phi: 0.40,
+                amplitude: 1.2,
+            }],
             vec![
-                TorusSpike { theta: 0.12, phi: 0.70, amplitude: 1.1 },
-                TorusSpike { theta: 0.55, phi: 0.20, amplitude: 0.9 },
+                TorusSpike {
+                    theta: 0.12,
+                    phi: 0.70,
+                    amplitude: 1.1,
+                },
+                TorusSpike {
+                    theta: 0.55,
+                    phi: 0.20,
+                    amplitude: 0.9,
+                },
             ],
             vec![
-                TorusSpike { theta: 0.10, phi: 0.15, amplitude: 1.3 },
-                TorusSpike { theta: 0.45, phi: 0.62, amplitude: 1.0 },
-                TorusSpike { theta: 0.80, phi: 0.35, amplitude: 0.8 },
+                TorusSpike {
+                    theta: 0.10,
+                    phi: 0.15,
+                    amplitude: 1.3,
+                },
+                TorusSpike {
+                    theta: 0.45,
+                    phi: 0.62,
+                    amplitude: 1.0,
+                },
+                TorusSpike {
+                    theta: 0.80,
+                    phi: 0.35,
+                    amplitude: 0.8,
+                },
             ],
         ];
         for planted in candidates {
@@ -995,22 +1072,44 @@ mod tests {
         // pencil must instead return the TRUE pairing (θ₁,φ₁), (θ₂,φ₂).
         let (h1, h2) = (7, 7);
         let planted = vec![
-            TorusSpike { theta: 0.20, phi: 0.75, amplitude: 1.0 },
-            TorusSpike { theta: 0.60, phi: 0.25, amplitude: 0.9 },
+            TorusSpike {
+                theta: 0.20,
+                phi: 0.75,
+                amplitude: 1.0,
+            },
+            TorusSpike {
+                theta: 0.60,
+                phi: 0.25,
+                amplitude: 0.9,
+            },
         ];
         let grid = torus_lift(&planted, h1, h2).unwrap();
         let rec = recover_torus_spikes(&grid, 0.0).unwrap();
         assert_eq!(rec.model_order, 2, "order");
         let (pos_err, _) = torus_match_error(&rec.spikes, &planted);
-        assert!(pos_err < 1e-7, "correct-pairing position error {pos_err:.3e}");
+        assert!(
+            pos_err < 1e-7,
+            "correct-pairing position error {pos_err:.3e}"
+        );
         // Assert the GHOST pairing is NOT what came back: the ghost set has a
         // spike near (0.20, 0.25), which no true spike is close to.
         let ghost = [
-            TorusSpike { theta: 0.20, phi: 0.25, amplitude: 1.0 },
-            TorusSpike { theta: 0.60, phi: 0.75, amplitude: 0.9 },
+            TorusSpike {
+                theta: 0.20,
+                phi: 0.25,
+                amplitude: 1.0,
+            },
+            TorusSpike {
+                theta: 0.60,
+                phi: 0.75,
+                amplitude: 0.9,
+            },
         ];
         let (ghost_err, _) = torus_match_error(&rec.spikes, &ghost);
-        assert!(ghost_err > 0.3, "recovery must not be the ghost pairing (err {ghost_err:.3e})");
+        assert!(
+            ghost_err > 0.3,
+            "recovery must not be the ghost pairing (err {ghost_err:.3e})"
+        );
     }
 
     #[test]
@@ -1023,8 +1122,16 @@ mod tests {
         let (h1, h2) = (6, 6);
         let sigma = 0.05;
         let planted = vec![
-            TorusSpike { theta: 0.18, phi: 0.66, amplitude: 1.2 },
-            TorusSpike { theta: 0.62, phi: 0.24, amplitude: 1.0 },
+            TorusSpike {
+                theta: 0.18,
+                phi: 0.66,
+                amplitude: 1.2,
+            },
+            TorusSpike {
+                theta: 0.62,
+                phi: 0.24,
+                amplitude: 1.0,
+            },
         ];
         let mut grid = torus_lift(&planted, h1, h2).unwrap();
         let mut rng = StdRng::seed_from_u64(7);
@@ -1101,8 +1208,8 @@ mod tests {
             let nsq: f64 = z.iter().zip(&fit).map(|(a, b)| (a - b) * (a - b)).sum();
             ((), nsq.sqrt(), ())
         };
-        let res = polish_spikes(&z, circle_phi(h_max), init, &PolishOptions::default())
-            .expect("polish");
+        let res =
+            polish_spikes(&z, circle_phi(h_max), init, &PolishOptions::default()).expect("polish");
         assert!(res.converged, "should converge");
         assert!(res.residual < 1e-6, "residual {:.3e}", res.residual);
         assert!(res.residual < seed_res, "polish must reduce the residual");
@@ -1114,7 +1221,10 @@ mod tests {
         let z = circle_code(&[(0.3, 1.0)], h_max);
         // phi returns the wrong length ⇒ must error, not panic.
         let bad = |_t: &[f64]| (Array1::<f64>::zeros(3), Array2::<f64>::zeros((3, 1)));
-        let init = PolishState { amplitudes: vec![1.0], coords: vec![vec![0.3]] };
+        let init = PolishState {
+            amplitudes: vec![1.0],
+            coords: vec![vec![0.3]],
+        };
         assert!(polish_spikes(&z, bad, init, &PolishOptions::default()).is_err());
     }
 }

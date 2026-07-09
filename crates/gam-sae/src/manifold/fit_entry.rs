@@ -267,41 +267,12 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
     // max_seeds=1 collapses the cascade to the single initial ρ.
     objective.set_cancel_flag(Arc::clone(&cancel_flag));
     let run_result: Result<(), String> = if run_outer_rho_search {
-        // #2134 wall #3 / #1082 — the SAE outer ρ search sat on the DEFAULT
-        // `OuterConfig` (`rel_cost_tolerance = None`), so the relative-cost
-        // convergence stop stayed COUPLED to the tight absolute projected-gradient
-        // `tolerance` (`rel_cost = tolerance ≈ scale·1e-9`). On the flat REML ridge
-        // the manifold criterion sits in once the dictionary EV has plateaued, a
-        // sub-ULP rel-cost change never clears that floor, so the optimizer grinds
-        // to the full `max_iter = 200` — every surplus outer iter re-enters the
-        // O(joint-Newton) inner fit, walks the shared warm-start into a co-collapse
-        // basin, and the EV guard restores it (the endless `[#1026] restoring
-        // inner-fit reconstruction incumbent` churn). Empirically the zoo fit found
-        // its EV≈0.65 optimum in the first ~11 min then burned ~7h49m of the 8h wall
-        // clock on ~190 no-improvement probes and never RETURNED a result. Decouple
-        // the rel-cost stop (the #1082 remedy already used by gam-custom-family):
-        // the ABSOLUTE gradient floor still uses `tolerance` so the genuine REML
-        // optimum is resolved to full accuracy (no weakening), while the rel-cost
-        // stop trips once outer progress falls below `SAE_OUTER_REL_COST_TOL` so a
-        // plateaued fit terminates in a handful of iters instead of at `max_iter`.
-        //
-        // SAE_OUTER_REL_COST_TOL — a 1e-3 relative-cost floor: stop once an accepted
-        // outer step improves the penalized criterion by < 0.1%. Measured on the
-        // 12-factor zoo, a plateaued fit's incumbent still CREEPS ~1.5e-4/iter (EV
-        // 0.6524→0.6525→0.6526…), which sits just ABOVE a 1e-4 floor and never trips
-        // — so the loose-but-principled "no material REML progress" threshold is 1e-3
-        // (0.1%). The ABSOLUTE projected-gradient floor still uses `tolerance`, so a
-        // genuinely descending fit is unaffected; this only halts the co-collapse
-        // plateau creep. The true fix for that plateau's HEIGHT is the per-atom
-        // topology (1-D-circle ceiling), not more outer iters.
-        const SAE_OUTER_REL_COST_TOL: f64 = 1.0e-3;
-        // SAE_OUTER_MAX_ITER — hard backstop so termination NEVER depends solely on
-        // the rel-cost heuristic. The manifold outer ρ is low-dimensional (a sparse
-        // scale + per-atom smoothing), so a well-posed REML search converges in
-        // O(10-20) iters; `4·n_params` bounded to [24, 60] is generous headroom for
-        // a genuine descent yet caps the pathological co-collapse walk far below the
-        // 200 default (each outer iter is one full O(joint-Newton) inner fit).
-        let sae_outer_max_iter = (4 * n_params).clamp(24, 60);
+        // #2241 — do not tune convergence to a workload's observed criterion
+        // creep and do not return merely because an iteration budget expired.
+        // SAE's Fellner–Schall lane carries a typed recurrent-incumbent
+        // certificate: two consecutive inner solves restoring the same banked
+        // model terminate the fixed-point walk directly. Gradient-based plans
+        // retain the shared solver's stationarity and cost-stall tests.
         // SPEC wall-survival resume: if a checkpoint for this exact data
         // fingerprint exists (a prior job died at its wall mid-search), install
         // the banked incumbent as the warm start and open the ρ search at the
@@ -313,17 +284,20 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
         };
         let problem = OuterProblem::new(n_params)
             .with_initial_rho(search_init_rho)
-            .with_rel_cost_tolerance(Some(SAE_OUTER_REL_COST_TOL))
-            .with_max_iter(sae_outer_max_iter)
             .with_seed_config(SeedConfig {
                 max_seeds: 1,
                 seed_budget: 1,
                 ..Default::default()
             });
-        problem
-            .run(&mut objective, "SAE manifold")
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        match problem.run(&mut objective, "SAE manifold") {
+            Ok(result) if result.converged => Ok(()),
+            Ok(result) => Err(format!(
+                "SAE manifold outer search exhausted its solver without a stationarity \
+                 certificate (iterations={}, final_value={:.6e}); refusing to mint a fit",
+                result.iterations, result.final_value,
+            )),
+            Err(err) => Err(err.to_string()),
+        }
     } else {
         objective.fit_at_fixed_rho(init_rho_flat.view())
     };
@@ -337,7 +311,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
     // A converged fit is being minted: the wall-survival checkpoint has served
     // its purpose (it must not warm-start a FUTURE fresh fit — that is
     // `persistent_warm_start`'s job, with its own TTL/eviction discipline).
-    objective.discard_checkpoint();
+    objective.remove_checkpoint();
     let fitted_result = objective.into_fitted();
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
@@ -444,7 +418,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;
-            objective.discard_checkpoint();
+            objective.remove_checkpoint();
             let fitted_result = objective.into_fitted();
             finalization_invalidated_shape_uncertainty =
                 fitted_result.invalidates_pre_final_shape_uncertainty();

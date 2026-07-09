@@ -14,7 +14,7 @@
 //! (best-effort, atomic) at every MATERIAL improvement of the outer best cost
 //! (`SaeManifoldOuterObjective::bank_checkpoint`), resumes via
 //! `try_resume_from_checkpoint` at fit entry, and discards the file when a
-//! converged fit is minted (`discard_checkpoint` — wall survival is not
+//! converged fit is minted (`remove_checkpoint` — wall survival is not
 //! cross-fit caching; `persistent_warm_start` owns that).
 //!
 //! # What is banked
@@ -71,9 +71,8 @@ pub(crate) struct SaeCheckpointFingerprint {
 }
 
 impl SaeCheckpointFingerprint {
-    /// Fingerprint the full-`N` fitting problem: target shape + content hash and
-    /// the dictionary size. Computed at objective construction on the pristine
-    /// full-`N` target (before any outer-criterion row subsample is engaged).
+    /// Fingerprint the full-data fitting problem: target shape + content hash and
+    /// the dictionary size. Computed once when the objective is constructed.
     pub(crate) fn of_target(target: ArrayView2<'_, f64>, k_atoms: usize) -> Self {
         let (n_rows, n_cols) = target.dim();
         let mut hasher = Sha256::new();

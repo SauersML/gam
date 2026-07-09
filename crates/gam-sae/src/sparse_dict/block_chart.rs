@@ -488,10 +488,13 @@ pub fn block_sparse_dictionary_seed_manifest(
 /// sets each coordinate's standard error, but the two arms transmit DIFFERENT kinds
 /// of coordinate and are coded at their OWN resolution (the S5 fix). The circle
 /// chart transmits one PHASE `t = θ/(2π)`, whose arc position ranges over the
-/// circumference `2π‖z‖`, so `SE_phase = σ̂/(2π‖z‖)`
-/// ([`super::coordinate::phase_coordinate_se`]). The flat block transmits
-/// `block_size` AMPLITUDE coefficients, each ranging over the radius `‖z‖`, so
-/// `SE_amp = σ̂/‖z‖ = 2π·SE_phase` — a factor `2π` LARGER, hence `log₂(2π)` bits
+/// circumference `2π·â` at the bias-corrected amplitude `â = √max(‖z‖² − 2σ̂², 0)`,
+/// so `SE_phase = σ̂/(2π·â)` ([`super::coordinate::phase_coordinate_se`], which
+/// evaluates the delta method at the true amplitude rather than the noise-inflated
+/// observed radius and saturates at the uniform-phase ceiling). The flat block
+/// transmits `block_size` AMPLITUDE coefficients, each ranging over the radius
+/// `‖z‖`, so `SE_amp = σ̂/‖z‖`; at the high-SNR regime where `â ≈ ‖z‖` this is
+/// `SE_amp ≈ 2π·SE_phase` — a factor `2π` LARGER, hence `log₂(2π)` bits
 /// CHEAPER per coordinate. Pricing the flat block's amplitudes at the finer phase
 /// rate (as a shared SE did) was an ≈ `block_size·log₂(2π)`-bit-per-firing
 /// pro-chart bias; each scalar is now coded at
@@ -525,9 +528,11 @@ fn matched_dl_for_block(
     };
     // PER-ARM per-scalar resolution. Both arms derive from the SAME σ̂ and radii,
     // but transmit different coordinates: the chart a phase over the circumference
-    // `2π‖z‖` (SE_phase = σ̂/(2π‖z‖)), the flat block amplitudes over the radius
-    // `‖z‖` (SE_amp = σ̂/‖z‖ = 2π·SE_phase). se_resolution_bits floors a zero-norm /
-    // unidentified firing to 0 bits, so a `+∞` amplitude SE needs no clamp.
+    // `2π·â` at the bias-corrected amplitude `â = √max(‖z‖²−2σ̂²,0)`
+    // (SE_phase = σ̂/(2π·â), saturating at the uniform-phase ceiling), the flat
+    // block amplitudes over the radius `‖z‖` (SE_amp = σ̂/‖z‖). se_resolution_bits
+    // floors a zero-norm / unidentified firing to 0 bits, so a `+∞` amplitude SE
+    // needs no clamp.
     let phase_ses: Vec<f64> = norms
         .iter()
         .map(|&nz| super::coordinate::phase_coordinate_se(sigma_hat, nz))
@@ -1320,15 +1325,19 @@ mod tests {
     #[test]
     fn crossfit_bic_selection_is_scale_invariant() {
         // The descriptive BIC margin is scored in the profiled-deviance currency
-        // (nats), so rescaling the coordinates cannot
-        // change the verdict. Ridge = 0 makes the whitening's eigenvalue floor
-        // relative (EPSILON·max_eval), so the whole pipeline is exactly
-        // scale-equivariant and the invariance is pinned to f64 rounding.
+        // (nats), so rescaling the coordinates cannot change the verdict. This
+        // exercises the SHIPPED default whitening_ridge (a dimensionless fraction
+        // of the largest covariance eigenvalue): the eigenvalue floor is
+        // `ridge·max_eval`, which scales with the data like every other term, so
+        // the whole pipeline is exactly scale-equivariant and the invariance is
+        // pinned to f64 rounding — not an artefact of setting ridge to zero.
         let coords = annulus(400);
-        let config = BlockChartComposeConfig {
-            whitening_ridge: 0.0,
-            ..Default::default()
-        };
+        let config = BlockChartComposeConfig::default();
+        assert!(
+            config.whitening_ridge > 0.0,
+            "the default ridge must be exercised (a nonzero absolute ridge would break \
+             scale-equivariance; the relative-fraction ridge does not)"
+        );
         let base = crossfit_evidence(&coords, &config).expect("evidence");
 
         // The ring is a genuine curved structure: the chart must beat the linear

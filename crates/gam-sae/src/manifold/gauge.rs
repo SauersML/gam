@@ -42,7 +42,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side};
 use gam_linalg::faer_ndarray::FaerCholesky;
-use opt::{backtracking_line_search, BacktrackConfig};
+use opt::{BacktrackConfig, backtracking_line_search};
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {
@@ -1443,7 +1443,10 @@ pub fn amplitude_concentration_certificate(
     // Saturation-normalize into [0, 1]. A near-constant amplitude (no spread)
     // carries neither bimodality nor a radial axis: it is a pure fixed-intensity
     // presence coordinate, reported Indeterminate so no radial axis is promoted.
-    let raw: Vec<f64> = amplitudes.iter().map(|&a| (a / amax).clamp(0.0, 1.0)).collect();
+    let raw: Vec<f64> = amplitudes
+        .iter()
+        .map(|&a| (a / amax).clamp(0.0, 1.0))
+        .collect();
     let mean_r: f64 = raw.iter().sum::<f64>() / n as f64;
     let var_r: f64 = raw.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / n as f64;
     // Spread floor: the sample must vary by more than floating-point noise
@@ -1455,10 +1458,7 @@ pub fn amplitude_concentration_certificate(
     // the standard `(r(n−1) + 1/2)/n` compression so `ln r` / `ln(1−r)` stay
     // finite. This is a recognized boundary rule, not a tuning knob.
     let nf = n as f64;
-    let r: Vec<f64> = raw
-        .iter()
-        .map(|&x| (x * (nf - 1.0) + 0.5) / nf)
-        .collect();
+    let r: Vec<f64> = raw.iter().map(|&x| (x * (nf - 1.0) + 0.5) / nf).collect();
 
     let (alpha, beta, loglik) = match fit_beta_mle(&r) {
         Some(v) => v,
@@ -1600,8 +1600,7 @@ fn digamma(mut x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    result + x.ln() - 0.5 * inv
-        - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0))
+    result + x.ln() - 0.5 * inv - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0))
 }
 
 /// Trigamma `ψ₁(x) = d²/dx² ln Γ(x)` for `x > 0`: recurrence up to `x ≥ 6` then
@@ -1615,8 +1614,7 @@ fn trigamma(mut x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    result
-        + inv * (1.0 + inv * (0.5 + inv * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))))
+    result + inv * (1.0 + inv * (0.5 + inv * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))))
 }
 
 /// `ln Γ(x)` for `x > 0` via the Lanczos approximation (g = 7). Hand-derived
@@ -1840,7 +1838,10 @@ mod tests {
         let t = 1.7_f64;
         let gauge_db = b.mapv(|v| t * v);
         let cleaned = project_scale_gauge_from_joint_step(b.view(), gauge_db.view(), -t);
-        let worst_db = cleaned.decoder_step.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let worst_db = cleaned
+            .decoder_step
+            .iter()
+            .fold(0.0_f64, |a, &v| a.max(v.abs()));
         assert!(
             worst_db < 1e-12 && cleaned.log_amplitude_step.abs() < 1e-12,
             "pure gauge step must project to 0: |δB'|max={worst_db}, δs'={}",
@@ -1858,19 +1859,17 @@ mod tests {
             .zip(raw_db.iter())
             .map(|(a, c)| (a - c).abs())
             .fold((cleaned_o.log_amplitude_step - q).abs(), f64::max);
-        assert!(drift < 1e-12, "orthogonal step must pass through, drift {drift}");
+        assert!(
+            drift < 1e-12,
+            "orthogonal step must pass through, drift {drift}"
+        );
 
         // (3) The magnitude-growth direction (vec(B), +1) is OBSERVABLE (doubles
         // exp(s)‖B‖) and must NOT be annihilated — its observable content, the
         // component ⟨Δ',v⟩ removed but everything else kept, survives.
         let grow_db = b.clone();
         let grown = project_scale_gauge_from_joint_step(b.view(), grow_db.view(), 1.0);
-        let residual_norm: f64 = grown
-            .decoder_step
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
+        let residual_norm: f64 = grown.decoder_step.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(
             residual_norm > 1e-6 || grown.log_amplitude_step.abs() > 1e-6,
             "observable magnitude growth must survive the projection"
@@ -1887,7 +1886,10 @@ mod tests {
             .iter()
             .zip(cleaned_o.decoder_step.iter())
             .map(|(a, c)| (a - c).abs())
-            .fold((twice.log_amplitude_step - cleaned_o.log_amplitude_step).abs(), f64::max);
+            .fold(
+                (twice.log_amplitude_step - cleaned_o.log_amplitude_step).abs(),
+                f64::max,
+            );
         assert!(idem < 1e-12, "projection must be idempotent, drift {idem}");
 
         // (5) After projection the cleaned step is orthogonal to v: ⟨δB',B⟩−δs' = 0.

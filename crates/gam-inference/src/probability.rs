@@ -3,27 +3,15 @@ use gam_solve::estimate::EstimationError;
 use gam_solve::mixture_link::inverse_link_jet_for_family_public;
 use ndarray::{Array1, ArrayView1};
 use statrs::function::beta::{beta_reg, inv_beta_reg};
-use statrs::function::erf::erfc;
 
-/// Standard normal PDF φ(x).
-#[inline]
-pub fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
+/// Standard normal PDF φ(x).  Implementation lives in `gam-math`; re-exported
+/// to keep `crate::probability::normal_pdf` resolving for all existing callers.
+pub use gam_math::probability::normal_pdf;
 
-/// Standard normal CDF Φ(x) evaluated via the exact special-function identity
-///
-///   Phi(x) = 0.5 * erfc(-x / sqrt(2)).
-///
-/// This is the exact Gaussian CDF semantics used throughout the codebase. The
-/// numerical `erfc` implementation may use internal approximations, but the
-/// returned function is the standard normal CDF itself rather than a separate
-/// polynomial surrogate surface.
-#[inline]
-pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x / std::f64::consts::SQRT_2)
-}
+/// Standard normal CDF Φ(x) via the exact identity `Φ(x) = 0.5·erfc(−x/√2)`.
+/// Implementation lives in `gam-math`; re-exported to keep
+/// `crate::probability::normal_cdf` resolving for all existing callers.
+pub use gam_math::probability::normal_cdf;
 
 /// Scaled complementary error function `erfcx(x) = exp(x²) · erfc(x)`,
 /// specialized to `x ≥ 0`.  The implementation now lives in the lowest crate

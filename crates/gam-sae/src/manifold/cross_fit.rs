@@ -91,7 +91,9 @@ impl KFoldAssignment {
         // (not hash-mod) guarantees fold sizes differ by at most one regardless
         // of hash collisions, so no fold is ever starved.
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&row| splitmix64(seed ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        order.sort_by_key(|&row| {
+            splitmix64(seed ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        });
         let mut fold_of_row = vec![0usize; n];
         for (rank, &row) in order.iter().enumerate() {
             fold_of_row[row] = rank % k_folds;
@@ -580,7 +582,8 @@ mod tests {
         // y depends on columns 3, 17, 42 plus small noise.
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
-            y[i] = 1.5 * x[[i, 3]] - 2.0 * x[[i, 17]] + 1.0 * x[[i, 42]]
+            y[i] = 1.5 * x[[i, 3]] - 2.0 * x[[i, 17]]
+                + 1.0 * x[[i, 42]]
                 + 0.05 * rng.random_range(-1.0..1.0);
         }
         let report = cross_fit_scalar(

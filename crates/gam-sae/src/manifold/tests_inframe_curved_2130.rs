@@ -9,8 +9,7 @@ use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
 use super::inframe_curved::{
     ChartOccupancyStatus, CurvedRegion, InFrameCurvedConfig, WeightFrameOccupancy,
     activate_residual_frame, dense_ambient_radial_reference, fit_inframe_curved_regions,
-    fit_inframe_curved_weight_frame_catalog, inframe_curved_region_prediction,
-    residual_span_frame,
+    fit_inframe_curved_weight_frame_catalog, inframe_curved_region_prediction, residual_span_frame,
 };
 use super::weight_frame_catalog::{
     WeightFrameCatalogConfig, WeightFrameMatrix, WeightFrameSource,
@@ -26,7 +25,10 @@ impl Lcg {
     }
     fn next_unit(&mut self) -> f64 {
         // Numerical Recipes LCG constants.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = (self.0 >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
         2.0 * bits - 1.0
     }
@@ -225,7 +227,10 @@ fn weight_sourced_atom_fit_is_tagged_with_component_source() {
     .expect("weight-frame fit");
 
     assert_eq!(result.records.len(), 1);
-    assert_eq!(result.records[0].occupancy_status, ChartOccupancyStatus::Occupied);
+    assert_eq!(
+        result.records[0].occupancy_status,
+        ChartOccupancyStatus::Occupied
+    );
     assert_eq!(
         result.records[0].frame_source,
         Some(WeightFrameSource::AttentionHeadOv { layer: 2, head: 14 }),
@@ -552,7 +557,10 @@ fn residual_span_frame_is_the_production_hook_low_rank_and_spans_truth() {
     // rank_max=4 < p=8 so a frame is still returned, but it must be a strict
     // low-rank projection (r <= 4), never the full width.
     if let Some(f) = got {
-        assert!(f.rank() <= 4 && f.rank() < 8, "seam frame must stay strictly low-rank");
+        assert!(
+            f.rank() <= 4 && f.rank() < 8,
+            "seam frame must stay strictly low-rank"
+        );
     }
 }
 
@@ -603,7 +611,10 @@ fn activate_residual_frame_installs_factored_decoder_and_engages_frames() {
     let r = activate_residual_frame(&mut atom, residual.view(), &rows, &config)
         .expect("activation runs")
         .expect("beneficial low-rank frame installed");
-    assert!(r >= r_true && r < p, "installed frame rank {r} low-rank vs p={p}");
+    assert!(
+        r >= r_true && r < p,
+        "installed frame rank {r} low-rank vs p={p}"
+    );
     let frame = atom.decoder_frame.as_ref().expect("frame installed");
     assert_eq!(frame.rank(), r);
 
@@ -697,8 +708,7 @@ fn ledger_shrink_matches_reviewer_frontier_shape() {
         rows: (0..n).collect(),
         basis_size: 8,
     };
-    let result =
-        fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
+    let result = fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
     assert_eq!(result.records[0].frame_rank, r_target);
     if result.selected_regions.is_empty() {
         // Even if the gate is conservative on this synthetic draw, the per-record
@@ -712,7 +722,10 @@ fn ledger_shrink_matches_reviewer_frontier_shape() {
         assert_eq!(ledger.inframe_border_coeffs, 8 * r_target);
         // (8·4096)² · 8 bytes = 8.59 GB ; (8·16)² · 8 bytes = 131072 bytes.
         assert_eq!(ledger.dense_cov_bytes, (8 * p) * (8 * p) * 8);
-        assert_eq!(ledger.inframe_cov_bytes, (8 * r_target) * (8 * r_target) * 8);
+        assert_eq!(
+            ledger.inframe_cov_bytes,
+            (8 * r_target) * (8 * r_target) * 8
+        );
         assert_eq!(ledger.inframe_cov_bytes, 131_072);
         assert!((ledger.border_shrink() - 256.0).abs() < 1.0e-9);
         assert!((ledger.cov_shrink() - 65_536.0).abs() < 1.0e-6);
@@ -771,7 +784,11 @@ fn inframe_curved_p4096_feasible_where_dense_joint_ooms_2134() {
         "frame rank {} recovers intrinsic rank {r_true} and stays far below p={p}",
         rec.frame_rank
     );
-    assert_eq!(result.selected_regions, vec![0], "planted curved region selected");
+    assert_eq!(
+        result.selected_regions,
+        vec![0],
+        "planted curved region selected"
+    );
 
     // (feasibility axis 2 — MEMORY) The dense per-atom covariance the joint lane
     // would allocate is (M·p)² · 8 B ≈ 8.6 GB — the source of the OOM. The in-frame
@@ -793,7 +810,10 @@ fn inframe_curved_p4096_feasible_where_dense_joint_ooms_2134() {
 
     // The hot-path prediction never materialises the N×p ambient image: it stays
     // N_g×r, so peak working memory is p-independent up to the copied residual.
-    assert_eq!(result.curved_prediction.inframe_entries(), n * rec.frame_rank);
+    assert_eq!(
+        result.curved_prediction.inframe_entries(),
+        n * rec.frame_rank
+    );
     assert!(
         result.curved_prediction.inframe_entries()
             < result.curved_prediction.accepted_ambient_entries_if_eager(),
@@ -817,9 +837,12 @@ fn accepted_curved_prediction_hot_path_stays_in_r_frame() {
         rows: (0..n).collect(),
         basis_size: 5,
     };
-    let result =
-        fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
-    assert_eq!(result.selected_regions, vec![0], "planted curved region selected");
+    let result = fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
+    assert_eq!(
+        result.selected_regions,
+        vec![0],
+        "planted curved region selected"
+    );
     let prediction = &result.curved_prediction;
     assert_eq!(prediction.regions().len(), 1);
     assert_eq!(prediction.regions()[0].frame_rank(), r_true);
@@ -834,7 +857,8 @@ fn accepted_curved_prediction_hot_path_stays_in_r_frame() {
         "the forbidden eager atom image would be N_g x p"
     );
     assert!(
-        prediction.inframe_entries() * (p / r_true) <= prediction.accepted_ambient_entries_if_eager(),
+        prediction.inframe_entries() * (p / r_true)
+            <= prediction.accepted_ambient_entries_if_eager(),
         "in-frame storage should scale by r instead of p"
     );
 

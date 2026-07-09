@@ -129,7 +129,10 @@ fn unbudgeted_fit_terminates_bounded_never_hangs() {
         fitted.termination.evals_since_improvement,
         fitted.termination.wall
     );
-    assert!(ev.is_finite() && ev > 0.3, "converged fit must explain the circle");
+    assert!(
+        ev.is_finite() && ev > 0.3,
+        "converged fit must explain the circle"
+    );
     assert!(
         fitted.termination.evals >= 1,
         "the accounting must have ticked"

@@ -13,10 +13,10 @@
 //! block vector is byte-identical to the plain-SAE layout.
 
 use super::{
-    profiled_reml_block_efs_log_lambda_steps, profiled_reml_block_log_lambda_gradient,
-    profiled_reml_criterion, ArdSharing, SaeManifoldRho,
+    ArdSharing, SaeManifoldRho, profiled_reml_block_efs_log_lambda_steps,
+    profiled_reml_block_log_lambda_gradient, profiled_reml_criterion,
 };
-use ndarray::{arr1, Array1};
+use ndarray::{Array1, arr1};
 
 /// Central-difference FD of [`profiled_reml_criterion`] with respect to each
 /// block `log λ_ℓ` must match [`profiled_reml_block_log_lambda_gradient`] to high
@@ -80,12 +80,19 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
     let grad =
         profiled_reml_block_log_lambda_gradient(n_obs, p_x, rss_x, &block_rss, &dims, &log_lambda);
     for (l, g) in grad.iter().enumerate() {
-        assert!(g.abs() < 1e-9, "block {l} gradient {g} not ~0 at fixed point");
+        assert!(
+            g.abs() < 1e-9,
+            "block {l} gradient {g} not ~0 at fixed point"
+        );
     }
 
-    let steps = profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+    let steps =
+        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     for (l, s) in steps.iter().enumerate() {
-        assert!(s.abs() < 1e-12, "block {l} EFS step {s} not ~0 at fixed point");
+        assert!(
+            s.abs() < 1e-12,
+            "block {l} EFS step {s} not ~0 at fixed point"
+        );
     }
 }
 
@@ -101,7 +108,8 @@ fn one_efs_step_reaches_the_variance_ratio_root() {
     let dims = [3usize, 5];
     let log_lambda = [1.3_f64, -2.1]; // far from the root
 
-    let steps = profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+    let steps =
+        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     let var_x = rss_x / p_x as f64;
     for l in 0..block_rss.len() {
         let root = (var_x / (block_rss[l] / dims[l] as f64)).ln();
@@ -124,7 +132,8 @@ fn unidentifiable_block_is_held() {
     let dims = [2usize, 3];
     let log_lambda = [0.0_f64, 0.0];
 
-    let steps = profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+    let steps =
+        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     assert_eq!(steps[0], 0.0, "unidentifiable block must be held");
     assert!(steps[1] != 0.0, "identifiable block must still move");
 }
@@ -153,8 +162,8 @@ fn rho_flat_round_trip_carries_block_coordinates() {
     assert_eq!(recovered.log_lambda_smooth, vec![0.5, 0.5]);
 
     // Shared-ARD mode appends the block tail after the single shared axis.
-    let shared = SaeManifoldRho::new_shared_ard(-0.3, 0.5, log_ard)
-        .with_log_lambda_block(vec![1.1_f64]);
+    let shared =
+        SaeManifoldRho::new_shared_ard(-0.3, 0.5, log_ard).with_log_lambda_block(vec![1.1_f64]);
     assert_eq!(shared.ard_sharing(), ArdSharing::Shared);
     let sflat = shared.to_flat();
     // 1 sparse + 2 smooth + 1 shared axis + 1 block.

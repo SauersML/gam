@@ -2962,42 +2962,12 @@ pub fn assemble_competing_risks_cif_from_endpoints(
     })
 }
 
+/// `(node, weight)` pairs of the `n`-point Gauss-Legendre rule on `[-1, 1]`;
+/// the canonical generator lives in `gam-math` (previously triplicated
+/// across gam-terms / gam-model-kernels / gam-models).
 fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
-    let mut nodesweights = Vec::with_capacity(n);
-    let m = n.div_ceil(2);
-
-    for i in 0..m {
-        let mut z = (std::f64::consts::PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
-        let mut pp = 0.0;
-
-        for _ in 0..100 {
-            let mut p1 = 1.0;
-            let mut p2 = 0.0;
-            for j in 0..n {
-                let p3 = p2;
-                p2 = p1;
-                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
-            }
-            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
-            let z_prev = z;
-            z = z_prev - p1 / pp;
-            if (z - z_prev).abs() < 1e-14 {
-                break;
-            }
-        }
-
-        let x = z;
-        let w = 2.0 / ((1.0 - z * z) * pp * pp);
-        if !n.is_multiple_of(2) && i == m - 1 {
-            nodesweights.push((0.0, w));
-        } else {
-            nodesweights.push((-x, w));
-            nodesweights.push((x, w));
-        }
-    }
-
-    nodesweights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    nodesweights
+    let (nodes, weights) = gam_math::special::gauss_legendre(n);
+    nodes.into_iter().zip(weights).collect()
 }
 
 fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {

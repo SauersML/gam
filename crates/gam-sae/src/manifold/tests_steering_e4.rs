@@ -33,7 +33,11 @@ fn det_noise(a: usize, b: usize) -> f64 {
 /// `θ_i = 2π i / n`. Returns `(z, u, v)` where the NOISE-FREE manifold point at
 /// angle `φ` is `cos φ · u + sin φ · v` with `(u, v)` orthonormal — so the
 /// ground-truth steered point at `θ_i + Δ` is analytic and needs no refit.
-fn planted_circle_with_frame(n: usize, p: usize, sigma: f64) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+fn planted_circle_with_frame(
+    n: usize,
+    p: usize,
+    sigma: f64,
+) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
     let mut u = Array1::<f64>::zeros(p);
     let mut v = Array1::<f64>::zeros(p);
     for j in 0..p {

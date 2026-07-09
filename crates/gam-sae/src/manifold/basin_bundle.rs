@@ -196,9 +196,7 @@ impl<S> BasinBundle<S> {
                 || counter.saturating_sub(m.last_win_eval) < window
         });
         // Recompute the argmin index post-retain (indices may have shifted).
-        let idx = self
-            .argmin_index()
-            .expect("argmin member is never pruned");
+        let idx = self.argmin_index().expect("argmin member is never pruned");
         Ok((idx, self.members[idx].last_value))
     }
 
@@ -228,8 +226,16 @@ mod tests {
     fn envelope_is_continuous_across_the_basin_crossing() {
         // Two basins crossing at ρ=0: hysteretic single-state tracking jumps
         // there; the bundle envelope must be continuous.
-        let b1 = Basin { a: 1.0, c: -1.0, d: 0.0 };
-        let b2 = Basin { a: 1.0, c: 1.0, d: 0.0 };
+        let b1 = Basin {
+            a: 1.0,
+            c: -1.0,
+            d: 0.0,
+        };
+        let b2 = Basin {
+            a: 1.0,
+            c: 1.0,
+            d: 0.0,
+        };
         let mut bundle = BasinBundle::new(4, 100);
         bundle.admit(b1.clone(), f64::INFINITY, |x, y| x == y);
         bundle.admit(b2.clone(), f64::INFINITY, |x, y| x == y);
@@ -256,8 +262,16 @@ mod tests {
 
     #[test]
     fn admitting_a_better_basin_lowers_the_envelope_and_switches_argmin() {
-        let shallow = Basin { a: 1.0, c: 0.0, d: 5.0 };
-        let deep = Basin { a: 1.0, c: 0.0, d: -10.0 };
+        let shallow = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: 5.0,
+        };
+        let deep = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: -10.0,
+        };
         let mut bundle = BasinBundle::new(4, 100);
         bundle.admit(shallow, f64::INFINITY, |x, y| x == y);
         let (_, v1) = bundle
@@ -273,7 +287,11 @@ mod tests {
 
     #[test]
     fn duplicate_admission_replaces_instead_of_growing() {
-        let b = Basin { a: 1.0, c: 0.0, d: 1.0 };
+        let b = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: 1.0,
+        };
         let mut bundle = BasinBundle::new(4, 100);
         bundle.admit(b.clone(), 3.0, |x, y| x == y);
         bundle.admit(b.clone(), 2.0, |x, y| x == y);
@@ -286,8 +304,16 @@ mod tests {
 
     #[test]
     fn dominated_members_are_pruned_after_the_window_but_argmin_survives() {
-        let winner = Basin { a: 1.0, c: 0.0, d: -1.0 };
-        let loser = Basin { a: 1.0, c: 0.0, d: 10.0 };
+        let winner = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: -1.0,
+        };
+        let loser = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: 10.0,
+        };
         let mut bundle = BasinBundle::new(4, 3);
         bundle.admit(winner, f64::INFINITY, |x, y| x == y);
         bundle.admit(loser, f64::INFINITY, |x, y| x == y);
@@ -310,8 +336,16 @@ mod tests {
     fn infeasible_member_is_retained_and_can_win_later() {
         // Member 2 errors (infeasible) at the first ρ but is the winner at the
         // second — dropping it on failure would re-open the hysteresis.
-        let b1 = Basin { a: 1.0, c: 0.0, d: 0.0 };
-        let b2 = Basin { a: 1.0, c: 2.0, d: -5.0 };
+        let b1 = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: 0.0,
+        };
+        let b2 = Basin {
+            a: 1.0,
+            c: 2.0,
+            d: -5.0,
+        };
         let mut bundle = BasinBundle::new(4, 100);
         bundle.admit(b1, f64::INFINITY, |x, y| x == y);
         bundle.admit(b2.clone(), f64::INFINITY, |x, y| x == y);
@@ -335,7 +369,11 @@ mod tests {
 
     #[test]
     fn all_failed_bundle_surfaces_the_error() {
-        let b = Basin { a: 1.0, c: 0.0, d: 0.0 };
+        let b = Basin {
+            a: 1.0,
+            c: 0.0,
+            d: 0.0,
+        };
         let mut bundle = BasinBundle::new(2, 10);
         bundle.admit(b, f64::INFINITY, |x, y| x == y);
         let out = bundle.evaluate(|_s: &Basin| Err::<(Basin, f64), _>("boom"));

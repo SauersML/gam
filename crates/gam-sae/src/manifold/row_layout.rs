@@ -820,6 +820,9 @@ mod softmax_reference_chart_tests {
         assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         // Explicit: atom 0's coordinate offset (full index 2) holds the coord
         // delta (3.0), NOT a reference-logit delta.
-        assert_eq!(out[2], 3.0, "atom 0 coord slot must not be a reference logit");
+        assert_eq!(
+            out[2], 3.0,
+            "atom 0 coord slot must not be a reference logit"
+        );
     }
 }

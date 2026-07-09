@@ -247,7 +247,13 @@ impl SaeManifoldTerm {
         &mut self,
         parallel: bool,
     ) -> Result<(), String> {
-        debug_assert_eq!(self.atoms.len(), self.assignment.coords.len());
+        if self.atoms.len() != self.assignment.coords.len() {
+            return Err(format!(
+                "SaeManifoldTerm::refresh_basis_from_current_coords: {} atoms but {} coordinate blocks",
+                self.atoms.len(),
+                self.assignment.coords.len()
+            ));
+        }
         if parallel {
             use rayon::prelude::*;
             let outcomes: Vec<Result<(), String>> = self
@@ -291,11 +297,24 @@ impl SaeManifoldTerm {
     where
         F: Fn(usize, usize) -> f64 + Sync,
     {
-        debug_assert_eq!(self.atoms.len(), self.assignment.coords.len());
-        debug_assert_eq!(coord_offsets.len(), self.atoms.len());
+        if self.atoms.len() != self.assignment.coords.len() {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: {} atoms but {} coordinate blocks",
+                self.atoms.len(),
+                self.assignment.coords.len()
+            ));
+        }
+        if coord_offsets.len() != self.atoms.len() {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: {} coordinate offsets for {} atoms",
+                coord_offsets.len(),
+                self.atoms.len()
+            ));
+        }
         let update_atom = |atom_idx: usize,
                            atom: &mut SaeManifoldAtom,
-                           coord: &mut LatentCoordValues|
+                           coord: &mut LatentCoordValues,
+                           nested_parallel: bool|
          -> Result<(), String> {
             let d = coord.latent_dim();
             let mut delta_coord = Array1::<f64>::zeros(n * d);
@@ -307,10 +326,12 @@ impl SaeManifoldTerm {
             }
             coord.retract_flat_delta(delta_coord.view());
             if refresh_basis {
-                with_nested_parallel(|| {
-                    let coords = coord.as_matrix();
-                    atom.refresh_basis(coords.view())
-                })?;
+                let coords = coord.as_matrix();
+                if nested_parallel {
+                    with_nested_parallel(|| atom.refresh_basis(coords.view()))?;
+                } else {
+                    atom.refresh_basis(coords.view())?;
+                }
             }
             Ok(())
         };
@@ -322,7 +343,7 @@ impl SaeManifoldTerm {
                 .par_iter_mut()
                 .zip(self.assignment.coords.par_iter_mut())
                 .enumerate()
-                .map(|(atom_idx, (atom, coord))| update_atom(atom_idx, atom, coord))
+                .map(|(atom_idx, (atom, coord))| update_atom(atom_idx, atom, coord, true))
                 .collect();
             for outcome in outcomes {
                 outcome?;
@@ -334,7 +355,51 @@ impl SaeManifoldTerm {
                 .zip(self.assignment.coords.iter_mut())
                 .enumerate()
             {
-                update_atom(atom_idx, atom, coord)?;
+                update_atom(atom_idx, atom, coord, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add one flat full-decoder Newton step directly into the per-atom decoder
+    /// matrices. Atom coefficient blocks are disjoint and the flat indexing is
+    /// identical to [`Self::flatten_beta`], so the indexed parallel path is
+    /// byte-identical while avoiding the old flatten/add/copy-back allocation.
+    fn apply_decoder_step_from_flat(
+        &mut self,
+        delta_beta: ArrayView1<'_, f64>,
+        step_size: f64,
+        parallel: bool,
+    ) -> Result<(), String> {
+        let expected = self.beta_dim();
+        if delta_beta.len() != expected {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: full decoder step length {} != expected {expected}",
+                delta_beta.len()
+            ));
+        }
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let update_atom = |atom_idx: usize, atom: &mut SaeManifoldAtom| {
+            let m = atom.basis_size();
+            let offset = offsets[atom_idx];
+            for basis_col in 0..m {
+                for out_col in 0..p {
+                    let flat_idx = offset + basis_col * p + out_col;
+                    atom.decoder_coefficients[[basis_col, out_col]] +=
+                        step_size * delta_beta[flat_idx];
+                }
+            }
+        };
+        if parallel {
+            use rayon::prelude::*;
+            self.atoms
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(atom_idx, atom)| update_atom(atom_idx, atom));
+        } else {
+            for (atom_idx, atom) in self.atoms.iter_mut().enumerate() {
+                update_atom(atom_idx, atom);
             }
         }
         Ok(())
@@ -4069,9 +4134,10 @@ impl SaeManifoldTerm {
             let row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
             let mut compact_offsets = Vec::with_capacity(n + 1);
             compact_offsets.push(0usize);
+            let mut compact_total = 0usize;
             for &row_dim in &row_dims {
-                let next = compact_offsets.last().copied().unwrap_or(0) + row_dim;
-                compact_offsets.push(next);
+                compact_total += row_dim;
+                compact_offsets.push(compact_total);
             }
             let total_len = compact_offsets[n];
             if delta_ext_coord.len() != total_len {
@@ -4213,26 +4279,20 @@ impl SaeManifoldTerm {
             )?;
         }
 
-        let mut beta = self.flatten_beta();
         if self.last_frames_active {
             // Factored ΔC → lift to a p-wide ΔB and add `step·ΔB`. For atom `k`,
             // basis row `m`, output channel `i`:
             //   ΔB_k[m,i] = Σ_j ΔC[off_C[k] + m·r_k + j] · U_k[i,j].
             // Un-framed atoms (`U_k = I_p`, `r_k = p`) lift by identity, so a
-            // mixed dictionary is handled uniformly. The decoder is then
-            // refreshed below via `set_flat_beta` (the authoritative `B_k` is the
-            // p-wide flatten; the active frames are re-synced from the decoder by
-            // the polar refresh in the joint-fit driver).
+            // mixed dictionary is handled uniformly. The resulting p-wide step
+            // is applied directly to each authoritative decoder block; active
+            // frames are re-synced from those decoders by the polar refresh in
+            // the joint-fit driver.
             let delta_b = FrameProjection::new(self).lift_border_vec(delta_beta);
-            for idx in 0..beta.len() {
-                beta[idx] += step_size * delta_b[idx];
-            }
+            self.apply_decoder_step_from_flat(delta_b.view(), step_size, parallel_atoms)?;
         } else {
-            for idx in 0..beta.len() {
-                beta[idx] += step_size * delta_beta[idx];
-            }
+            self.apply_decoder_step_from_flat(delta_beta, step_size, parallel_atoms)?;
         }
-        self.set_flat_beta(beta.view())?;
         // #2100 — the #2022 STEP2 sphere-retract+peel does NOT belong here.
         // `apply_newton_step_impl` runs on EVERY β-Newton line-search TRIAL, and
         // folding every atom's ‖B_k‖ into its log-amplitude mid-solve forces
@@ -4548,7 +4608,7 @@ impl SaeManifoldTerm {
             // Armijo test. On acceptance the mutable state already holds the
             // accepted trial, so the loss is read after the search returns.
             let mut first_trial = true;
-            let accepted = backtracking_line_search(
+            let accepted = backtracking_line_search::<_, String>(
                 BacktrackConfig {
                     initial_step: step_size,
                     max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
@@ -5321,7 +5381,7 @@ impl SaeManifoldTerm {
             // (`Ok(None)`), halving without consulting the Armijo test.
             let mut first_trial = true;
             let accepted = descent_direction_ok
-                && backtracking_line_search(
+                && backtracking_line_search::<_, String>(
                     BacktrackConfig {
                         initial_step: step_size,
                         max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
@@ -5605,17 +5665,24 @@ impl SaeManifoldTerm {
                     if ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR {
                         let bank = match self.best_fit_incumbent.as_ref() {
                             None => ev.is_finite(),
-                            Some((best_ev, best_uniformity, _)) => prefer_candidate_basin(
+                            Some(incumbent) => prefer_candidate_basin(
                                 ev,
                                 candidate_uniformity,
-                                *best_ev,
-                                *best_uniformity,
+                                incumbent.ev,
+                                incumbent.uniformity,
                                 SAE_FINAL_EV_DEGRADATION_TOL,
                             ),
                         };
                         if bank {
-                            self.best_fit_incumbent =
-                                Some((ev, candidate_uniformity, self.snapshot_mutable_state()));
+                            self.best_fit_incumbent = Some(SaeFitIncumbent {
+                                ev,
+                                uniformity: candidate_uniformity,
+                                state: self.snapshot_mutable_state(),
+                                // A genuinely better model starts a new incumbent
+                                // trajectory; earlier restore events do not certify
+                                // stationarity around this state.
+                                consecutive_inner_restores: 0,
+                            });
                         }
                     }
                 }
@@ -5626,6 +5693,7 @@ impl SaeManifoldTerm {
         // (`reduce_atoms_to_data_supported_rank`), so its decoder lives in the
         // reduced `r_k`-wide coordinate by construction and carries no data-null
         // component to project away. No post-loop projection is needed.
+        let mut restored_inner_incumbent = false;
         if let Some(best_state) = best_reconstruction_state.as_ref()
             && best_reconstruction_obj.is_finite()
         {
@@ -5657,6 +5725,7 @@ impl SaeManifoldTerm {
                      non-monotone boundary-hook damage, not line-search descent"
                 );
                 self.restore_mutable_state(best_state)?;
+                restored_inner_incumbent = true;
                 if self.frames_active() {
                     self.refresh_active_frames_from_data(target, rho)
                         .map_err(|err| {
@@ -5793,6 +5862,13 @@ impl SaeManifoldTerm {
                     self.restore_mutable_state(&pre_polish_state)?;
                 }
             }
+        }
+        if let Some(incumbent) = self.best_fit_incumbent.as_mut() {
+            incumbent.consecutive_inner_restores = if restored_inner_incumbent {
+                incumbent.consecutive_inner_restores.saturating_add(1)
+            } else {
+                0
+            };
         }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
@@ -6494,7 +6570,7 @@ impl SaeManifoldTerm {
             // Every trial rebuilds β from `beta0`, so no snapshot restore is
             // needed between trials; the state is fully determined by the
             // trial β. Evaluation errors propagate (`?`), as before.
-            let accepted_loss = backtracking_line_search(
+            let accepted_loss = backtracking_line_search::<_, String>(
                 BacktrackConfig {
                     initial_step: step_size,
                     max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,

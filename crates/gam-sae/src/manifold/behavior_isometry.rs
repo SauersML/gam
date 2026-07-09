@@ -129,9 +129,10 @@ pub fn atom_behavior_isometry(
         return Ok(None);
     }
     let atom = &term.atoms[atom_idx];
-    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
-        format!("atom_behavior_isometry: atom {atom_idx} has no basis evaluator")
-    })?;
+    let evaluator = atom
+        .basis_evaluator
+        .as_ref()
+        .ok_or_else(|| format!("atom_behavior_isometry: atom {atom_idx} has no basis evaluator"))?;
 
     // Split the fitted augmented decoder [B_k | √λ_y C_k] into the activation
     // decoder B_k and the nats-unit behavior decoder C_k (the √λ_y un-done).
@@ -185,7 +186,13 @@ pub fn atom_behavior_isometry(
         ));
     }
 
-    Ok(Some(assemble(atom_idx, &s_x, &s_y, weights, support.mass())))
+    Ok(Some(assemble(
+        atom_idx,
+        &s_x,
+        &s_y,
+        weights,
+        support.mass(),
+    )))
 }
 
 /// The representation–behavior isometry certificate for every atom of the term
@@ -225,8 +232,16 @@ fn assemble(
         sy_sq += w * s_y[i] * s_y[i];
         sy_max = sy_max.max(s_y[i]);
     }
-    let activation_speed_rms = if mass > 0.0 { (sx_sq / mass).sqrt() } else { f64::NAN };
-    let behavior_speed_rms = if mass > 0.0 { (sy_sq / mass).sqrt() } else { f64::NAN };
+    let activation_speed_rms = if mass > 0.0 {
+        (sx_sq / mass).sqrt()
+    } else {
+        f64::NAN
+    };
+    let behavior_speed_rms = if mass > 0.0 {
+        (sy_sq / mass).sqrt()
+    } else {
+        f64::NAN
+    };
     let nats_per_unit_t = if mass > 0.0 { sy_sq / mass } else { f64::NAN };
 
     // A behaviorally inert atom (C_k ≈ 0) has no behavior geometry to match.

@@ -46,8 +46,8 @@ use gam_terms::inference::structure_evidence::{
 use ndarray::{Array2, ArrayView2, ArrayView4};
 use statrs::distribution::{ContinuousCDF, Normal};
 
-use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
 use super::wbic_audit::{ReconSpectrum, recon_spectrum};
+use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
 
 /// Absolute floor on the studentizing SE of a `λ_k` jump, plus the relative floor
 /// as a fraction of the local `λ` scale. A perfectly stable atom has a jackknife
@@ -272,12 +272,7 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
             });
             birth_evidence.absorb_log(claim, log_e)?;
 
-            transports.push(best_effort_transport(
-                input.decoder_grid,
-                atom,
-                c0,
-                c1,
-            ));
+            transports.push(best_effort_transport(input.decoder_grid, atom, c0, c1));
 
             jumps.push(LambdaJump {
                 step,
@@ -396,7 +391,10 @@ fn lambda_jackknife_se(curve: ArrayView2<'_, f64>, r_floor: f64) -> f64 {
     }
     let m = leave_one.len() as f64;
     let mean = leave_one.iter().sum::<f64>() / m;
-    let ss = leave_one.iter().map(|&l| (l - mean) * (l - mean)).sum::<f64>();
+    let ss = leave_one
+        .iter()
+        .map(|&l| (l - mean) * (l - mean))
+        .sum::<f64>();
     ((m - 1.0) / m * ss).max(0.0).sqrt()
 }
 

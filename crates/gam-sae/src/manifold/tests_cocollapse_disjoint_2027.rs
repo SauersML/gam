@@ -295,7 +295,10 @@ pub(crate) fn two_circle_whitened_k2_recovers_disjoint_signal_2027_quotient_on_2
     let loss = term
         .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 60, 0.05, 1.0e-3, 1.0e-3)
         .unwrap();
-    assert!(loss.total().is_finite(), "loss must stay finite (quotient ON)");
+    assert!(
+        loss.total().is_finite(),
+        "loss must stay finite (quotient ON)"
+    );
 
     let ev = term
         .dictionary_reconstruction_ev(target.view(), &rho)

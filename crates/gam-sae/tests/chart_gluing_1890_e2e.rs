@@ -212,6 +212,7 @@ fn over_tiled_circle_glues_end_to_end() {
 
     let glues = accepted_glues(&result);
     let active_after = active_atom_count(&result.term);
+    let raw_after = result.term.k_atoms();
     eprintln!(
         "[1890-e2e] accepted_glues={glues} active_after={active_after} \
          structure_changed={} k_atoms={}",
@@ -233,6 +234,14 @@ fn over_tiled_circle_glues_end_to_end() {
     assert!(
         active_after < k,
         "active atom count did not drop ({active_after} of {k}); the glue demoted no arc"
+    );
+    assert!(
+        raw_after < k,
+        "raw atom count did not drop ({raw_after} of {k}); a demoted zombie survived compaction"
+    );
+    assert_eq!(
+        active_after, raw_after,
+        "every physically retained atom must carry routing mass after the glue polish"
     );
 
     // (ii) The surviving atom(s) cover MORE than a single original arc — the
@@ -301,5 +310,10 @@ fn distinct_circles_do_not_glue_end_to_end() {
         active_atom_count(&result.term),
         2,
         "both distinct circles must remain active (no spurious fold)"
+    );
+    assert_eq!(
+        result.term.k_atoms(),
+        2,
+        "the negative control must not physically remove either circle"
     );
 }

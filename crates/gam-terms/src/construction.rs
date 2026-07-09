@@ -3,7 +3,7 @@ use crate::basis::analyze_penalty_block;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
-use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd};
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_linalg::utils::KahanSum;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, Axis, s};
@@ -2940,72 +2940,11 @@ pub fn kronecker_reparameterization_engine_with_invariant(
     })
 }
 
-/// Calculate the 2-norm condition number of a matrix.
-///
-/// For symmetric matrices (the dominant case for GAM Hessians/penalties),
-/// this uses an eigenvalue path and computes:
-///   cond_2(A) = max_i |lambda_i| / min_i |lambda_i|
-/// which is exactly equal to the singular-value definition for symmetric A.
-///
-/// For non-symmetric matrices, this falls back to SVD:
-///   cond_2(A) = sigma_max / sigma_min
-///
-/// This preserves semantics while avoiding full SVD in hot paths.
-///
-/// # Arguments
-/// * `matrix` - The matrix to analyze
-///
-/// # Returns
-/// * `Ok(condition_number)` - The condition number (max_sv / min_sv)
-/// * `Ok(f64::INFINITY)` - If the matrix is effectively singular (min_sv < 1e-12)
-/// * `Err` - If SVD computation fails
-pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinalgError> {
-    let (rows, cols) = matrix.dim();
-    if rows == 0 || cols == 0 {
-        return Ok(1.0);
-    }
-
-    // Fast path for (near-)symmetric square matrices.
-    if rows == cols {
-        let mut max_abs = 0.0_f64;
-        let mut max_asym = 0.0_f64;
-        for i in 0..rows {
-            for j in 0..cols {
-                max_abs = max_abs.max(matrix[[i, j]].abs());
-            }
-            for j in 0..i {
-                let diff = (matrix[[i, j]] - matrix[[j, i]]).abs();
-                if diff > max_asym {
-                    max_asym = diff;
-                }
-            }
-        }
-        let sym_tol = max_abs.max(1.0) * 1e-12;
-        if max_asym <= sym_tol {
-            let (evals, _) = matrix.eigh(Side::Lower)?;
-            let mut max_abs_eval = 0.0_f64;
-            let mut min_abs_eval = f64::INFINITY;
-            for &lam in evals.iter() {
-                let s = lam.abs();
-                max_abs_eval = max_abs_eval.max(s);
-                min_abs_eval = min_abs_eval.min(s);
-            }
-            if min_abs_eval < 1e-12 {
-                return Ok(f64::INFINITY);
-            }
-            return Ok(max_abs_eval / min_abs_eval);
-        }
-    }
-
-    // General matrix fallback.
-    let (_, s, _) = matrix.svd(false, false)?;
-    let max_sv = s.iter().fold(0.0_f64, |max, &val| max.max(val));
-    let min_sv = s.iter().fold(f64::INFINITY, |min, &val| min.min(val));
-    if min_sv < 1e-12 {
-        return Ok(f64::INFINITY);
-    }
-    Ok(max_sv / min_sv)
-}
+/// 2-norm condition number of a matrix.  Implementation lives in
+/// `gam-linalg` (the canonical home for numeric matrix utilities);
+/// re-exported to keep `crate::construction::calculate_condition_number`
+/// resolving for all existing callers.
+pub use gam_linalg::utils::calculate_condition_number;
 
 #[cfg(test)]
 mod tests {

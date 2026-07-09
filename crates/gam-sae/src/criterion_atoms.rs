@@ -40,8 +40,8 @@
 //! governed by the EXACT stationarity Jacobian `A = ∇²_θθ L` (with residual
 //! curvature, exact softmax entropy Hessian, exact periodic ARD curvature), NOT
 //! the surrogate `B`. The implicit correction therefore solves against `A`
-//! (`SaeManifoldTerm::solve_exact_stationarity`, a B⁻¹-preconditioned Neumann
-//! fixed point on `A = B + ΔC`), so the correction is not biased by `B⁻¹ − A⁻¹`.
+//! (`SaeManifoldTerm::solve_exact_stationarity`, a left-`B`-preconditioned GMRES
+//! solve on `A = B + ΔC`), so the correction is not biased by `B⁻¹ − A⁻¹`.
 //!
 //! # The atoms
 //!
@@ -505,8 +505,7 @@ mod tests {
     #[test]
     fn residual_em_score_matches_hand_computation() {
         let x = array![[2.0, 1.0]];
-        let recon =
-            ndarray::Array3::from_shape_vec((1, 1, 2), vec![1.0, 0.0]).unwrap();
+        let recon = ndarray::Array3::from_shape_vec((1, 1, 2), vec![1.0, 0.0]).unwrap();
 
         for nonneg in [true, false] {
             let (code, relres) = residual_em_score(x.view(), recon.view(), nonneg);
@@ -518,7 +517,10 @@ mod tests {
             let g_q = array![[0.0]];
             let grad =
                 residual_em_score_vjp(x.view(), recon.view(), nonneg, g_c.view(), g_q.view());
-            assert!((grad[[0, 0, 0]] - (-2.0)).abs() < 1e-12, "dc/dr0 ({nonneg})");
+            assert!(
+                (grad[[0, 0, 0]] - (-2.0)).abs() < 1e-12,
+                "dc/dr0 ({nonneg})"
+            );
             assert!((grad[[0, 0, 1]] - 1.0).abs() < 1e-12, "dc/dr1 ({nonneg})");
 
             // Relative-residual channel only.
@@ -527,7 +529,10 @@ mod tests {
             let grad =
                 residual_em_score_vjp(x.view(), recon.view(), nonneg, g_c.view(), g_q.view());
             assert!((grad[[0, 0, 0]] - 0.0).abs() < 1e-12, "dq/dr0 ({nonneg})");
-            assert!((grad[[0, 0, 1]] - (-0.8)).abs() < 1e-12, "dq/dr1 ({nonneg})");
+            assert!(
+                (grad[[0, 0, 1]] - (-0.8)).abs() < 1e-12,
+                "dq/dr1 ({nonneg})"
+            );
         }
     }
 
@@ -538,22 +543,19 @@ mod tests {
     #[test]
     fn residual_em_score_clamp_kills_gradient_but_signed_survives() {
         let x = array![[2.0, 1.0]];
-        let recon =
-            ndarray::Array3::from_shape_vec((1, 1, 2), vec![-1.0, 0.0]).unwrap();
+        let recon = ndarray::Array3::from_shape_vec((1, 1, 2), vec![-1.0, 0.0]).unwrap();
         let g_c = array![[1.0]];
         let g_q = array![[1.0]];
 
         let (code_nn, _) = residual_em_score(x.view(), recon.view(), true);
         assert!((code_nn[[0, 0]] - 0.0).abs() < 1e-12, "clamped code is 0");
-        let grad_nn =
-            residual_em_score_vjp(x.view(), recon.view(), true, g_c.view(), g_q.view());
+        let grad_nn = residual_em_score_vjp(x.view(), recon.view(), true, g_c.view(), g_q.view());
         assert!(grad_nn[[0, 0, 0]].abs() < 1e-12, "clamped grad r0 = 0");
         assert!(grad_nn[[0, 0, 1]].abs() < 1e-12, "clamped grad r1 = 0");
 
         let (code_sg, _) = residual_em_score(x.view(), recon.view(), false);
         assert!((code_sg[[0, 0]] - (-2.0)).abs() < 1e-12, "signed code = -2");
-        let grad_sg =
-            residual_em_score_vjp(x.view(), recon.view(), false, g_c.view(), g_q.view());
+        let grad_sg = residual_em_score_vjp(x.view(), recon.view(), false, g_c.view(), g_q.view());
         // Signed coefficient is active, so the gradient is non-trivial.
         assert!(
             grad_sg[[0, 0, 0]].abs() + grad_sg[[0, 0, 1]].abs() > 1e-9,

@@ -1,5 +1,5 @@
-use super::{ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot};
 use super::dual::{Dual, DualKinkBranchRecord};
+use super::{ArrowFactorCache, arrow_factor_max_pivot, arrow_factor_min_pivot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MajorizerAnchorMode {
@@ -111,11 +111,7 @@ impl BranchCertificate {
             row_hessian_fingerprint: cache.row_hessian_fingerprint,
             solver_mode: format!("{:?}", cache.solver_mode),
             deflated_rank: cache.gauge_deflated_directions,
-            deflated_per_row: cache
-                .deflated_row_directions
-                .iter()
-                .map(Vec::len)
-                .collect(),
+            deflated_per_row: cache.deflated_row_directions.iter().map(Vec::len).collect(),
             spectral_deflated_rows: cache
                 .deflation_row_spectra
                 .iter()
@@ -241,9 +237,9 @@ impl BranchCertificate {
         }
         let baseline_eigen_route = self.eigen_derivative_route();
         let probe_eigen_route = probe.eigen_derivative_route();
-        let unresolved_invariant_subspace =
-            baseline_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock
-                || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock;
+        let unresolved_invariant_subspace = baseline_eigen_route
+            == EigenDerivativeRoute::InvariantSubspaceBlock
+            || probe_eigen_route == EigenDerivativeRoute::InvariantSubspaceBlock;
         if unresolved_invariant_subspace
             || baseline_eigen_route != probe_eigen_route
             || self.min_eigen_gap != probe.min_eigen_gap
@@ -462,7 +458,11 @@ mod tests {
         let err = baseline
             .assert_same_branch(&probe)
             .expect_err("changed deflation branch must refuse derivative report");
-        assert!(err.changed_fields.iter().any(|field| field == "deflated_rank"));
+        assert!(
+            err.changed_fields
+                .iter()
+                .any(|field| field == "deflated_rank")
+        );
         assert!(
             err.changed_fields
                 .iter()
@@ -490,7 +490,11 @@ mod tests {
             err.refusal,
             BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
         );
-        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+        assert!(
+            err.changed_fields
+                .iter()
+                .any(|field| field == "min_eigen_gap")
+        );
     }
 
     #[test]
@@ -514,7 +518,11 @@ mod tests {
             err.refusal,
             BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
         );
-        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+        assert!(
+            err.changed_fields
+                .iter()
+                .any(|field| field == "min_eigen_gap")
+        );
 
         let just_above = eigen_gap_certificate(&[1.0, 1.0 + 16.0 * f64::EPSILON]);
         assert!(just_above.min_eigen_gap > just_above.threshold);
@@ -551,7 +559,11 @@ mod tests {
             err.refusal,
             BranchCertificateRefusal::UnresolvedInvariantSubspaceBlock
         );
-        assert!(err.changed_fields.iter().any(|field| field == "min_eigen_gap"));
+        assert!(
+            err.changed_fields
+                .iter()
+                .any(|field| field == "min_eigen_gap")
+        );
     }
 
     #[test]
@@ -581,8 +593,7 @@ mod tests {
             .expect("tt channel");
         let beta = exact_logdet_channel(DerivativeTraceChannel::Beta, &beta_matrix, cert.clone())
             .expect("beta channel");
-        let report =
-            guarded_exact_trace_report(cert, vec![tt, beta]).expect("same branch report");
+        let report = guarded_exact_trace_report(cert, vec![tt, beta]).expect("same branch report");
 
         let beta_exact = report
             .channel_derivative(DerivativeTraceChannel::Beta)

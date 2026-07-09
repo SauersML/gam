@@ -141,6 +141,21 @@ include!("construction_exact_hessian.rs");
 // under the per-file line-count gate. They re-enter this module's scope via the
 // parent's glob re-export (`use super::*;` above).
 
+/// The undamped (ridge-0) deflated evidence factorization at an acceptance
+/// iterate, packaged with the factorisation-independent KKT residual norms read
+/// off the SAME assembled system. Produced by
+/// [`SaeManifoldTerm::factor_deflated_evidence_with_grad_norms`] at the
+/// objective-stall fixed point (construction.rs); the discarded Newton step
+/// `(delta_t, delta_beta)` is retained so the caller can form the affine
+/// Newton-decrement stationarity certificate (#2226).
+pub(crate) struct DeflatedEvidenceFactor {
+    pub(crate) delta_t: Array1<f64>,
+    pub(crate) delta_beta: Array1<f64>,
+    pub(crate) cache: ArrowFactorCache,
+    pub(crate) grad_norm: f64,
+    pub(crate) quotient_grad_norm: f64,
+}
+
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
@@ -848,44 +863,6 @@ impl SaeManifoldTerm {
     /// exact unweighted path.
     pub fn row_loss_weights(&self) -> Option<&[f64]> {
         self.row_loss_weights.as_deref()
-    }
-
-    /// Install a single UNIFORM Horvitz–Thompson inverse-inclusion weight
-    /// `w_i = weight` on every row, riding the same #977 `row_loss_weights` √w
-    /// seam as the design-honesty path but DELIBERATELY bypassing the mean-1
-    /// normalization [`Self::set_row_loss_weights`] applies.
-    ///
-    /// This is the outer-criterion row-subsample installer: a term built as the
-    /// `n_sub`-row restriction of an `N`-row problem takes `weight = N / n_sub`,
-    /// the inverse inclusion probability of uniform-without-replacement sampling.
-    /// Unlike the #991 design-honesty weights (where only the *relative* row
-    /// corrections matter at the fitted sample size, so mean-1 is correct), the
-    /// ABSOLUTE `N / n_sub` scale is load-bearing here: the √w seam scales the
-    /// residual, latent Jacobian, and β basis load by `√weight`, so the weighted
-    /// log-likelihood and joint Hessian are lifted back to the FULL-`N` scale and
-    /// the assembled REML criterion `data_fit + penalty + ½ log|H|` becomes the
-    /// Horvitz–Thompson estimator of the full-`N` criterion. The ρ-fixed penalty
-    /// (already at full-`N` scale) then balances against a full-scale data term,
-    /// keeping ρ selection unbiased. Mean-normalizing a uniform weight would
-    /// collapse it to `1` (the *unweighted* `n_sub`-row subproblem), whose
-    /// penalty/data balance is off by `N / n_sub` and systematically over-smooths.
-    ///
-    /// `weight == 1.0` stores `None` (the exact unweighted path), so a degenerate
-    /// `n_sub == N` subsample is byte-identical to the full-batch fit.
-    pub(crate) fn set_uniform_inclusion_weight(&mut self, weight: f64) -> Result<(), String> {
-        if !(weight.is_finite() && weight > 0.0) {
-            return Err(format!(
-                "SaeManifoldTerm::set_uniform_inclusion_weight: weight must be finite and \
-                 strictly positive, got {weight}"
-            ));
-        }
-        let n = self.n_obs();
-        self.row_loss_weights = if weight == 1.0 {
-            None
-        } else {
-            Some(vec![weight; n])
-        };
-        Ok(())
     }
 
     /// Drop any installed per-row reconstruction weights, returning the term to
@@ -3801,9 +3778,7 @@ impl SaeManifoldTerm {
 
         for row in 0..n {
             let u_row = metric.map(|m| {
-                Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| {
-                    m.factor_entry(row, i, k)
-                })
+                Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| m.factor_entry(row, i, k))
             });
             let mut starts = Vec::with_capacity(k_atoms);
             for atom_idx in 0..k_atoms {
@@ -4759,14 +4734,12 @@ impl SaeManifoldTerm {
             ));
         }
         let n = self.n_obs();
-        // Horvitz–Thompson row weighting (#977 seam): under the outer-criterion
-        // subsample each row carries an un-normalized inverse-inclusion weight
-        // `wᵢ = N/n_sub`, so the per-row prior energy is `Σᵢ wᵢ·V(tᵢ)` and the
-        // precision log-partition normalizer counts `n_eff = Σᵢ wᵢ ≈ N` effective
-        // rows — the HT estimate of the full-`N` ARD prior. `None`/mean-1 weights
-        // give `w_row = 1`, `n_eff = n`, bit-for-bit the historical energy.
+        // Design-honesty weights change the relative contribution of rows while
+        // preserving total sample mass: `set_row_loss_weights` normalizes them to
+        // mean one. The ARD energy therefore uses the per-row weights, while its
+        // log-partition normalizer remains the observed row count exactly.
         let row_w = self.row_loss_weights.as_deref();
-        let n_eff = row_w.map_or(n as f64, |w| w.iter().sum::<f64>());
+        let n_eff = n as f64;
         let mut acc = 0.0;
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             let d = coord.latent_dim();
@@ -5671,10 +5644,7 @@ impl SaeManifoldTerm {
             // null is unit-stiffness deflated (`log 1 = 0`, ρ-independent) and the
             // frozen log-det is finite, instead of refusing a rescuable warm-start
             // reuse. A full-rank block has no sub-floor eigenvalue and is untouched.
-            if sys.row_gauge_deflation.is_none() {
-                let n_rows = sys.rows.len();
-                sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
-            }
+            Self::ensure_row_gauge_deflation_for_evidence(&mut sys);
             let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // The frozen-state Newton step (factored.0, factored.1) is discarded
@@ -5760,12 +5730,7 @@ impl SaeManifoldTerm {
             // `with_ill_conditioning_tolerated` Direct factor below documents that
             // its Δ may be inaccurate in exactly those flat directions, so using Δ
             // alone as the convergence gate would falsely reject healthy fits.
-            let grad_norm_sq: f64 = sys
-                .rows
-                .iter()
-                .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
-                .sum::<f64>()
-                + sys.gb.iter().map(|&v| v * v).sum::<f64>();
+            let grad_norm_sq: f64 = Self::system_grad_norm_sq(&sys);
             let grad_norm = grad_norm_sq.sqrt();
             let lambda_smooth = rho_fixed.lambda_smooth_vec();
             let quotient_grad_norm =
@@ -5830,13 +5795,7 @@ impl SaeManifoldTerm {
                 // in the non-stationary branch below, which THIS block never reaches
                 // (every arm returns), and a non-stationary iteration never installs
                 // this deflation — so `sys` stays undamped for the probe.
-                if sys.row_gauge_deflation.is_none() {
-                    let n_rows = sys.rows.len();
-                    sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![
-                        Vec::new();
-                        n_rows
-                    ]));
-                }
+                Self::ensure_row_gauge_deflation_for_evidence(&mut sys);
                 let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                     match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
                         Ok(factored) => factored,
@@ -6122,27 +6081,17 @@ impl SaeManifoldTerm {
                 // remains the #2080 infeasible-ρ probe upstream
                 // (`probe_undamped_evidence_row_factors` on the loop `sys`), which
                 // this does not touch: it is a probe signal, not an acceptance gate.
-                if stationary_sys.row_gauge_deflation.is_none() {
-                    let n_rows = stationary_sys.rows.len();
-                    stationary_sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(
-                        vec![Vec::new(); n_rows],
-                    ));
-                }
-                if let Ok((stationary_dt, stationary_db, stationary_cache)) =
-                    solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
-                {
-                    let stationary_grad_norm_sq: f64 = stationary_sys
-                        .rows
-                        .iter()
-                        .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
-                        .sum::<f64>()
-                        + stationary_sys.gb.iter().map(|&v| v * v).sum::<f64>();
-                    let stationary_grad_norm = stationary_grad_norm_sq.sqrt();
-                    let stationary_quotient_grad_norm = self.quotient_gradient_norm_from_system(
-                        &stationary_sys,
-                        stationary_grad_norm_sq,
-                        &lambda_smooth,
-                    );
+                if let Ok(DeflatedEvidenceFactor {
+                    delta_t: stationary_dt,
+                    delta_beta: stationary_db,
+                    cache: stationary_cache,
+                    grad_norm: stationary_grad_norm,
+                    quotient_grad_norm: stationary_quotient_grad_norm,
+                }) = self.factor_deflated_evidence_with_grad_norms(
+                    &mut stationary_sys,
+                    &lambda_smooth,
+                    options,
+                ) {
                     if stationary_grad_norm <= grad_tolerance
                         || stationary_quotient_grad_norm <= grad_tolerance
                     {
@@ -6270,6 +6219,84 @@ impl SaeManifoldTerm {
                 stalled_finite_cache = None;
             }
         }
+    }
+
+    /// The empty per-row `ArrowRowGaugeDeflation` that opts a system into per-row
+    /// spectral discovery (the #974 low-rank-whiten seam). An intrinsic flat /
+    /// indefinite `H_tt` direction is then deflated to UNIT stiffness
+    /// (`log 1 = 0`, ρ-independent, the quotient pseudo-determinant convention),
+    /// so the ridge-0 factor is PD-by-deflation and the evidence log-det finite;
+    /// a full-rank block has no sub-floor eigenvalue and is untouched.
+    ///
+    /// Shared by the acceptance-site installer
+    /// [`Self::ensure_row_gauge_deflation_for_evidence`] and by the two
+    /// fixed-decoder assembler `.or_else` fallbacks in
+    /// `construction_arrow_schur_assembly`, which keep their `low_rank_whiten`
+    /// gate (this fn only mints the value they conditionally install).
+    pub(crate) fn empty_row_gauge_deflation(n: usize) -> ArrowRowGaugeDeflation {
+        ArrowRowGaugeDeflation::new(vec![Vec::new(); n])
+    }
+
+    /// Force an EVIDENCE/ACCEPTANCE system to opt into per-row spectral discovery
+    /// by installing [`Self::empty_row_gauge_deflation`] when none is present
+    /// (#1095/#2228): the frozen warm-start reuse and the two stationary /
+    /// objective-stall acceptance factorizations. Idempotent — an already-gauged
+    /// system (rotation/phase gauge, #1273/#974 metric-null) is left untouched.
+    ///
+    /// CRITICAL INVARIANT: this MUST only ever run on a system that is about to
+    /// be FACTORED for an accepted evidence log-det, never on the loop `sys` fed
+    /// to `probe_undamped_evidence_row_factors` — the #2080 infeasible-ρ probe is
+    /// contractually the UNDAMPED (non-deflated) per-row verdict (#2080/#2228).
+    pub(crate) fn ensure_row_gauge_deflation_for_evidence(sys: &mut ArrowSchurSystem) {
+        if sys.row_gauge_deflation.is_none() {
+            let n_rows = sys.rows.len();
+            sys.set_row_gauge_deflation(Self::empty_row_gauge_deflation(n_rows));
+        }
+    }
+
+    /// The exact KKT stationarity residual `‖g‖² = Σ_i ‖g_t^(i)‖² + ‖g_β‖²` read
+    /// straight off an assembled system. Unlike the Newton step `Δ = H⁻¹g`, the
+    /// gradient is factorisation-independent — it is NOT amplified by an inverse,
+    /// so a genuinely stationary but ill-conditioned fit (tiny `g`, possibly
+    /// large `Δ` in a flat direction) is correctly recognised as converged.
+    pub(crate) fn system_grad_norm_sq(sys: &ArrowSchurSystem) -> f64 {
+        sys.rows
+            .iter()
+            .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
+            .sum::<f64>()
+            + sys.gb.iter().map(|&v| v * v).sum::<f64>()
+    }
+
+    /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
+    /// undamped (ridge-0) evidence factorization, and read back both KKT residual
+    /// norms (raw and quotient) off the SAME assembled system. This is the
+    /// objective-stall acceptance factorization (#1095/#2228/#1094): the returned
+    /// [`DeflatedEvidenceFactor`] carries the finite deflated Laplace evidence
+    /// cache to rank plus the discarded Newton step retained for the affine
+    /// Newton-decrement certificate (#2226). A solve failure surfaces as `Err`,
+    /// exactly the `if let Ok(..)` guard the caller uses to fall through to the
+    /// persistent-stall counter.
+    fn factor_deflated_evidence_with_grad_norms(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        lambda_smooth: &[f64],
+        options: &ArrowSolveOptions,
+    ) -> Result<DeflatedEvidenceFactor, String> {
+        Self::ensure_row_gauge_deflation_for_evidence(sys);
+        let (delta_t, delta_beta, cache) =
+            solve_arrow_newton_step_with_options(sys, 0.0, 0.0, options)
+                .map_err(|err| err.to_string())?;
+        let grad_norm_sq = Self::system_grad_norm_sq(sys);
+        let grad_norm = grad_norm_sq.sqrt();
+        let quotient_grad_norm =
+            self.quotient_gradient_norm_from_system(sys, grad_norm_sq, lambda_smooth);
+        Ok(DeflatedEvidenceFactor {
+            delta_t,
+            delta_beta,
+            cache,
+            grad_norm,
+            quotient_grad_norm,
+        })
     }
 
     pub(crate) fn refine_iteration_limit(
@@ -8229,9 +8256,7 @@ impl SaeManifoldTerm {
                 t[row_base + pos] += row_weight * contribution;
             }
             for channel in &border {
-                if row_active.is_some_and(|active| {
-                    active.binary_search(&channel.atom).is_err()
-                }) {
+                if row_active.is_some_and(|active| active.binary_search(&channel.atom).is_err()) {
                     continue;
                 }
                 let phi = self.atoms[channel.atom].basis_values[[row, channel.basis_col]];

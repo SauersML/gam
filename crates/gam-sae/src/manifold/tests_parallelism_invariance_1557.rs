@@ -3,8 +3,8 @@
 //! as a sibling `#[cfg(test)] mod` in `mod.rs`.
 
 use super::*;
-use ndarray::Array2;
 use ndarray::array;
+use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 /// Shared fixture for the #1557 parallelism-invariance tests: the issue's
@@ -198,4 +198,130 @@ pub(crate) fn loss_scaled_is_faer_parallelism_invariant_1557() {
         seq.total(),
         par.total()
     );
+}
+
+/// #2242 regression — the remaining Newton-trial hot loops fan disjoint rows
+/// (compact expansion and logits) and disjoint atoms (coordinate retractions and
+/// real basis-evaluator refreshes) across Rayon. Scheduling must not alter the
+/// fitted state because no cross-task floating-point reduction exists. Exercise
+/// the same deterministic periodic-basis fixture once through the serial policy
+/// on a one-thread pool and once through the indexed-parallel policy on four
+/// threads, then require byte identity for every state block the trial mutates.
+#[test]
+pub(crate) fn newton_trial_state_is_rayon_thread_count_invariant_2242() {
+    let (mut serial, _, _) = build_invariance_fixture();
+    let (mut parallel, _, _) = build_invariance_fixture();
+    let n = serial.n_obs();
+    assert!(n >= SAE_LOSS_PARALLEL_ROW_MIN);
+    let k = serial.k_atoms();
+    assert!(k > 1);
+
+    // Exercise the variable-stride compact expansion as well as the common
+    // row/atom update machinery: each row keeps one rotating free atom plus the
+    // softmax reference atom. Both carry their real periodic coordinate block.
+    let active_atoms: Vec<Vec<usize>> = (0..n).map(|row| vec![row % (k - 1), k - 1]).collect();
+    let coord_dims: Vec<usize> = serial
+        .assignment
+        .coords
+        .iter()
+        .map(LatentCoordValues::latent_dim)
+        .collect();
+    let layout = SaeRowLayout::from_active_atoms_with_reference(
+        active_atoms,
+        coord_dims,
+        serial.assignment.coord_offsets(),
+        Some(k - 1),
+    );
+    let delta_ext_coord_len: usize = (0..n).map(|row| layout.row_q_active(row)).sum();
+    serial.last_row_layout = Some(layout.clone());
+    parallel.last_row_layout = Some(layout);
+
+    let delta_ext_coord = Array1::<f64>::from_shape_fn(delta_ext_coord_len, |idx| {
+        0.002 * ((idx as f64 + 0.5) * 0.017).sin()
+    });
+    let delta_beta = Array1::<f64>::from_shape_fn(serial.beta_dim(), |idx| {
+        0.001 * ((idx as f64 + 0.25) * 0.013).cos()
+    });
+    let step_size = 0.7;
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("one-thread Rayon pool")
+        .install(|| {
+            serial
+                .refresh_basis_from_current_coords_with_parallelism(false)
+                .expect("serial basis refresh");
+            serial
+                .apply_newton_step_impl_with_parallelism(
+                    delta_ext_coord.view(),
+                    delta_beta.view(),
+                    step_size,
+                    true,
+                    Some(false),
+                )
+                .expect("serial Newton trial");
+        });
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("four-thread Rayon pool")
+        .install(|| {
+            parallel
+                .refresh_basis_from_current_coords_with_parallelism(true)
+                .expect("parallel basis refresh");
+            parallel
+                .apply_newton_step_impl_with_parallelism(
+                    delta_ext_coord.view(),
+                    delta_beta.view(),
+                    step_size,
+                    true,
+                    Some(true),
+                )
+                .expect("parallel Newton trial");
+        });
+
+    assert_eq!(serial.assignment.logits, parallel.assignment.logits);
+    assert_eq!(serial.atoms.len(), parallel.atoms.len());
+    assert_eq!(
+        serial.assignment.coords.len(),
+        parallel.assignment.coords.len()
+    );
+    for (atom_idx, (serial_coord, parallel_coord)) in serial
+        .assignment
+        .coords
+        .iter()
+        .zip(&parallel.assignment.coords)
+        .enumerate()
+    {
+        assert_eq!(
+            serial_coord.as_flat(),
+            parallel_coord.as_flat(),
+            "atom {atom_idx} coordinates differ across Rayon policies"
+        );
+    }
+    for (atom_idx, (serial_atom, parallel_atom)) in
+        serial.atoms.iter().zip(&parallel.atoms).enumerate()
+    {
+        assert_eq!(
+            serial_atom.decoder_coefficients, parallel_atom.decoder_coefficients,
+            "atom {atom_idx} decoder differs across Rayon policies"
+        );
+        assert_eq!(
+            serial_atom.basis_values, parallel_atom.basis_values,
+            "atom {atom_idx} basis values differ across Rayon policies"
+        );
+        assert_eq!(
+            serial_atom.basis_jacobian, parallel_atom.basis_jacobian,
+            "atom {atom_idx} basis Jacobian differs across Rayon policies"
+        );
+        assert_eq!(
+            serial_atom.basis_second_jet_values, parallel_atom.basis_second_jet_values,
+            "atom {atom_idx} basis Hessian differs across Rayon policies"
+        );
+        assert_eq!(
+            serial_atom.latent_coords, parallel_atom.latent_coords,
+            "atom {atom_idx} cached coordinates differ across Rayon policies"
+        );
+    }
 }

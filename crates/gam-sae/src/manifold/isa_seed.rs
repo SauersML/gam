@@ -378,8 +378,7 @@ impl PlanePolys {
         if !(den > 0.0) {
             return f64::INFINITY;
         }
-        let num =
-            self.n[0] + self.n[1] * c2 + self.n[2] * s2 + self.n[3] * c4 + self.n[4] * s4;
+        let num = self.n[0] + self.n[1] * c2 + self.n[2] * s2 + self.n[3] * c4 + self.n[4] * s4;
         num / (den * den)
     }
 
@@ -390,8 +389,7 @@ impl PlanePolys {
         if !(den > 0.0) {
             return 0.0;
         }
-        let num =
-            self.n[0] + self.n[1] * c2 + self.n[2] * s2 + self.n[3] * c4 + self.n[4] * s4;
+        let num = self.n[0] + self.n[1] * c2 + self.n[2] * s2 + self.n[3] * c4 + self.n[4] * s4;
         let dden = -2.0 * self.d[1] * s2 + 2.0 * self.d[2] * c2;
         let dnum = -2.0 * self.n[1] * s2 + 2.0 * self.n[2] * c2 - 4.0 * self.n[3] * s4
             + 4.0 * self.n[4] * c4;
@@ -637,7 +635,11 @@ fn total_contrast(y: &Array2<f64>, n_planes: usize) -> f64 {
     (0..n_planes)
         .map(|m| {
             let k = plane_rows_kappa(y, m);
-            if k.is_finite() { (k - 2.0) * (k - 2.0) } else { 0.0 }
+            if k.is_finite() {
+                (k - 2.0) * (k - 2.0)
+            } else {
+                0.0
+            }
         })
         .sum()
 }
@@ -647,13 +649,7 @@ fn total_contrast(y: &Array2<f64>, n_planes: usize) -> f64 {
 /// columns of `q` are whitened-space directions); both are updated in place.
 fn jacobi_optimize(y: &mut Array2<f64>, q: &mut Array2<f64>, n_planes: usize, max_sweeps: usize) {
     let r = y.nrows();
-    let partner = |c: usize| -> Option<usize> {
-        if c < 2 * n_planes {
-            Some(c ^ 1)
-        } else {
-            None
-        }
-    };
+    let partner = |c: usize| -> Option<usize> { if c < 2 * n_planes { Some(c ^ 1) } else { None } };
     let mut total = total_contrast(y, n_planes);
     for _ in 0..max_sweeps {
         let mut improved = false;
@@ -714,10 +710,7 @@ fn subsample_columns(n: usize) -> Vec<usize> {
 /// Whitened above-floor coordinates, row-major as `(r, n_sub)` for the Jacobi
 /// moment pass. The rotation itself is estimated on the deterministic
 /// concentration-floor subsample; certification still uses all rows.
-fn whitened_subsample(
-    residual: ArrayView2<'_, f64>,
-    parts: &IsaEigenParts,
-) -> Option<Array2<f64>> {
+fn whitened_subsample(residual: ArrayView2<'_, f64>, parts: &IsaEigenParts) -> Option<Array2<f64>> {
     let n = residual.nrows();
     let r = parts.above.len();
     if r < 2 || n < 2 {
@@ -969,7 +962,11 @@ pub fn isa_extract_certified_planes(
     let mut order: Vec<(f64, usize)> = (0..n_planes)
         .map(|m| {
             let k = plane_rows_kappa(&y, m);
-            let c = if k.is_finite() { (k - 2.0) * (k - 2.0) } else { 0.0 };
+            let c = if k.is_finite() {
+                (k - 2.0) * (k - 2.0)
+            } else {
+                0.0
+            };
             (c, m)
         })
         .collect();
@@ -1147,9 +1144,7 @@ mod tests {
             }
         }
         let true_planes: Vec<Array2<f64>> = (0..k)
-            .map(|c| {
-                Array2::from_shape_fn((p, 2), |(row, col)| frame[[row, 2 * c + col]])
-            })
+            .map(|c| Array2::from_shape_fn((p, 2), |(row, col)| frame[[row, 2 * c + col]]))
             .collect();
         (data, true_planes)
     }
@@ -1181,7 +1176,8 @@ mod tests {
     }
 
     fn residual_power_metrics(data: &Array2<f64>) -> (usize, f64) {
-        let Some(parts) = isa_eigen_parts(data.view()).expect("residual eigensolve must run") else {
+        let Some(parts) = isa_eigen_parts(data.view()).expect("residual eigensolve must run")
+        else {
             return (0, 0.0);
         };
         let excess = parts
@@ -1351,15 +1347,16 @@ mod tests {
         per_truth
     }
 
-    fn candidate_overlaps(
-        planes: &[IsaPlaneCandidate],
-        truth: &[Array2<f64>],
-    ) -> Vec<f64> {
+    fn candidate_overlaps(planes: &[IsaPlaneCandidate], truth: &[Array2<f64>]) -> Vec<f64> {
         let bases: Vec<Array2<f64>> = planes.iter().map(|cand| cand.basis.clone()).collect();
         best_truth_overlaps(&bases, truth)
     }
 
-    fn ambient_plane_from_captured_parts(parts: &IsaEigenParts, q: &Array2<f64>, m: usize) -> Array2<f64> {
+    fn ambient_plane_from_captured_parts(
+        parts: &IsaEigenParts,
+        q: &Array2<f64>,
+        m: usize,
+    ) -> Array2<f64> {
         let p = parts.evecs.nrows();
         let r = parts.above.len();
         let mut amb = Array2::<f64>::zeros((p, 2));
@@ -1370,7 +1367,10 @@ mod tests {
                 amb[[j, 1]] += parts.evecs[[j, k]] * scale * q[[a, 2 * m + 1]];
             }
         }
-        assert!(orthonormalize2(&mut amb), "captured joint plane must have rank 2");
+        assert!(
+            orthonormalize2(&mut amb),
+            "captured joint plane must have rank 2"
+        );
         amb
     }
 
@@ -1399,14 +1399,8 @@ mod tests {
         let k = 6usize;
         let amps = vec![1.00, 0.86, 0.73, 0.61, 0.50, 0.41];
         let qs = vec![0.90, 0.65, 0.42, 0.25, 0.14, 0.08];
-        let (data, truth) = planted_circles_unequal_gates(
-            12_000,
-            32,
-            &qs,
-            &amps,
-            0.03,
-            0x2111_15A_u64,
-        );
+        let (data, truth) =
+            planted_circles_unequal_gates(12_000, 32, &qs, &amps, 0.03, 0x2111_15A_u64);
         let config = IsaSeedConfig {
             n_inits: 10,
             max_sweeps: 80,
@@ -1473,8 +1467,8 @@ mod tests {
                 }
                 let th = std::f64::consts::TAU * lcg_uniform(&mut state);
                 for j in 0..p {
-                    data[[i, j]] += amps[c]
-                        * (th.cos() * frame[[j, 2 * c]] + th.sin() * frame[[j, 2 * c + 1]]);
+                    data[[i, j]] +=
+                        amps[c] * (th.cos() * frame[[j, 2 * c]] + th.sin() * frame[[j, 2 * c + 1]]);
                 }
             }
             for j in 0..p {
@@ -1482,9 +1476,7 @@ mod tests {
             }
         }
         let true_planes: Vec<Array2<f64>> = (0..k)
-            .map(|c| {
-                Array2::from_shape_fn((p, 2), |(row, col)| frame[[row, 2 * c + col]])
-            })
+            .map(|c| Array2::from_shape_fn((p, 2), |(row, col)| frame[[row, 2 * c + col]]))
             .collect();
         (data, true_planes)
     }
@@ -1587,9 +1579,9 @@ mod tests {
             // The hand-derived derivative must match a symmetric secant of the
             // POLYNOMIAL evaluation (test-only differentiation of a closed form).
             let h = 1e-6;
-            let secant =
-                (pair_objective(&pa, &pb, theta + h) - pair_objective(&pa, &pb, theta - h))
-                    / (2.0 * h);
+            let secant = (pair_objective(&pa, &pb, theta + h)
+                - pair_objective(&pa, &pb, theta - h))
+                / (2.0 * h);
             let deriv = pair_objective_deriv(&pa, &pb, theta);
             assert!(
                 (secant - deriv).abs() < 1e-5 * (1.0 + secant.abs()),

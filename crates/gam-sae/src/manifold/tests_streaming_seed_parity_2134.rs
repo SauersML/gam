@@ -142,9 +142,7 @@ fn front_door_admits_overcomplete_topk_to_curved_streaming() {
     let (n, p, k, support_k, d_max) = (64usize, 3usize, 5usize, 2usize, 1usize);
     // K > P through the plain admission would be the sparse-code lane.
     assert_eq!(
-        crate::front_door::admit_sae_fit(n, p, k)
-            .unwrap()
-            .lane,
+        crate::front_door::admit_sae_fit(n, p, k).unwrap().lane,
         crate::front_door::SaeFitLane::SparseCodes
     );
     // Through the TopK front door it is the CURVED lane instead (a tiny resident
@@ -152,7 +150,10 @@ fn front_door_admits_overcomplete_topk_to_curved_streaming() {
     // by the front_door ledger tests).
     let admission = crate::front_door::admit_topk_manifold(n, p, k, d_max, support_k)
         .expect("overcomplete TopK admits to the curved lane");
-    assert_eq!(admission.lane, crate::front_door::SaeFitLane::CurvedStreaming);
+    assert_eq!(
+        admission.lane,
+        crate::front_door::SaeFitLane::CurvedStreaming
+    );
 
     // The admission ledger's chunk width is the one the streaming seed consumes.
     let lane = crate::manifold::admit_topk_curved_lane(n, p, k, d_max, support_k)

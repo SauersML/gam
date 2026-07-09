@@ -118,11 +118,7 @@ pub fn dominant_energy_fraction(residual: ArrayView2<'_, f64>, rows: &[usize]) -
 /// fixed all-ones seed. Deterministic; a small fixed iteration count suffices for
 /// the leading eigenvalue of a matrix with a real spectral gap (the birth candidate
 /// is a dominant direction by construction).
-fn power_iteration_top_eigenvalue(
-    residual: ArrayView2<'_, f64>,
-    rows: &[usize],
-    p: usize,
-) -> f64 {
+fn power_iteration_top_eigenvalue(residual: ArrayView2<'_, f64>, rows: &[usize], p: usize) -> f64 {
     // Deterministic unit seed.
     let mut v = vec![1.0_f64 / (p as f64).sqrt(); p];
     let mut lambda = 0.0_f64;
@@ -539,7 +535,9 @@ mod tests {
         // The lone outlier as its own stratum WOULD clear the fraction floor…
         assert!(dominant_energy_fraction(r.view(), &[n]) >= min_routable);
         // …but its ESS is 1, far below the derived floor, so it must be rejected.
-        assert!(effective_sample_size(r.view(), &[n]) < min_effective_rows_for_birth(p, min_routable));
+        assert!(
+            effective_sample_size(r.view(), &[n]) < min_effective_rows_for_birth(p, min_routable)
+        );
         // The screen proposes nothing: no adequately-sized stratum clears locally.
         assert!(
             stratum_local_birth_residual(r.view(), &floor).is_none(),

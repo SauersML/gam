@@ -36,6 +36,30 @@ def circular_delta(out_t: np.ndarray, in_t: np.ndarray) -> np.ndarray:
     return (out_t - in_t + 0.5) % 1.0 - 0.5
 
 
+def circular_mean_by_bin(
+    delta: np.ndarray, bins: np.ndarray, period: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-bin circular mean of fractional-turn deltas, in ``(-0.5, 0.5]``.
+
+    The deltas are phase shifts measured in fractions of a full turn, so they
+    live on a circle: averaging them linearly collapses the seam (``-0.49`` and
+    ``+0.49`` are both nearly a half turn, yet their arithmetic mean is ``0``).
+    The circular mean sums the unit vectors ``exp(2*pi*i*delta)`` within each bin
+    and reads the resultant angle back with ``atan2``, so the seam is respected
+    and the returned representative is the shortest arc. Returns the per-bin
+    circular mean alongside the per-bin observation counts so the caller can
+    reject empty positional cells.
+    """
+    angle = TAU * delta
+    sin_sum = np.zeros(period, dtype=np.float64)
+    cos_sum = np.zeros(period, dtype=np.float64)
+    count = np.zeros(period, dtype=np.int64)
+    np.add.at(sin_sum, bins, np.sin(angle))
+    np.add.at(cos_sum, bins, np.cos(angle))
+    np.add.at(count, bins, 1)
+    return np.arctan2(sin_sum, cos_sum) / TAU, count
+
+
 def r2_score(y: np.ndarray, fitted: np.ndarray) -> float:
     resid = y - fitted
     sse = float(np.sum(resid * resid))

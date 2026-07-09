@@ -21,8 +21,8 @@
 //!      better than the Gauss-Newton baseline alone.
 
 use crate::manifold::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    ArdAxisPrior, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    ArdAxisPrior, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
@@ -122,9 +122,7 @@ fn hand_correction(
         let a_k = a_row[0];
         let t = term.assignment.coords[0].row(i)[0];
         let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[0][0]);
-        let v_pp = ArdAxisPrior::eval(alpha, t, periods[0])
-            .hess
-            .max(0.0);
+        let v_pp = ArdAxisPrior::eval(alpha, t, periods[0]).hess.max(0.0);
         term.atoms[0].fill_decoded_derivative_row(i, 0, &mut g1);
         term.atoms[0].fill_decoded_second_derivative_row(&sj[0], i, 0, &mut g2);
         let htt = a_k * a_k * g1.iter().map(|v| v * v).sum::<f64>();
@@ -137,8 +135,7 @@ fn hand_correction(
                 .zip((0..p).map(|k| residual[[i, k]]))
                 .map(|(a, b)| a * b)
                 .sum::<f64>();
-        let denom_full =
-            (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
+        let denom_full = (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
         let delta = htt / denom_full - htt / denom_gn;
         total += delta;
         max_abs = max_abs.max(delta.abs());
@@ -249,7 +246,11 @@ fn sure_correction_matches_fd_divergence_2133() {
         let mut best = f64::INFINITY;
         for &t in &grid {
             let f = f_at(t, a);
-            let d = 0.5 * y.iter().zip(f.iter()).map(|(u, v)| (u - v) * (u - v)).sum::<f64>()
+            let d = 0.5
+                * y.iter()
+                    .zip(f.iter())
+                    .map(|(u, v)| (u - v) * (u - v))
+                    .sum::<f64>()
                 + (alpha / (TAU * TAU)) * (1.0 - (TAU * t).cos());
             if d < best {
                 best = d;
@@ -260,8 +261,7 @@ fn sure_correction_matches_fd_divergence_2133() {
         for _ in 0..40 {
             let (f, fp, fpp) = jets_at(t, a);
             let r: Vec<f64> = (0..p).map(|c| f[c] - y[c]).collect();
-            let jp = (0..p).map(|c| fp[c] * r[c]).sum::<f64>()
-                + alpha * (TAU * t).sin() / TAU;
+            let jp = (0..p).map(|c| fp[c] * r[c]).sum::<f64>() + alpha * (TAU * t).sin() / TAU;
             let jpp = (0..p).map(|c| fpp[c] * r[c] + fp[c] * fp[c]).sum::<f64>()
                 + alpha * (TAU * t).cos();
             if jpp.abs() < 1e-12 {
@@ -296,23 +296,22 @@ fn sure_correction_matches_fd_divergence_2133() {
         }
         // Analytic divergence at the fitted coordinate (same primitives as prod).
         let t = term.assignment.coords[0].row(i)[0];
-        let v_pp = ArdAxisPrior::eval(alpha, t, periods[0])
-            .hess
-            .max(0.0);
+        let v_pp = ArdAxisPrior::eval(alpha, t, periods[0]).hess.max(0.0);
         term.atoms[0].fill_decoded_derivative_row(i, 0, &mut g1);
         term.atoms[0].fill_decoded_second_derivative_row(&sj[0], i, 0, &mut g2);
         let htt = a * a * g1.iter().map(|v| v * v).sum::<f64>();
         let denom_gn = htt + v_pp;
-        let c = a * g2.iter().zip((0..p).map(|k| residual[[i, k]])).map(|(u, v)| u * v).sum::<f64>();
-        let denom_full =
-            (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
+        let c = a * g2
+            .iter()
+            .zip((0..p).map(|k| residual[[i, k]]))
+            .map(|(u, v)| u * v)
+            .sum::<f64>();
+        let denom_full = (htt + c + v_pp).max(SaeManifoldTerm::SURE_DIVERGENCE_PD_FLOOR * denom_gn);
         gn_div += htt / denom_gn;
         exact_div += htt / denom_full;
     }
 
-    eprintln!(
-        "[#2133 FD] fd_div={fd_div:.2} gn_div={gn_div:.2} exact_div(GN+corr)={exact_div:.2}"
-    );
+    eprintln!("[#2133 FD] fd_div={fd_div:.2} gn_div={gn_div:.2} exact_div(GN+corr)={exact_div:.2}");
     let exact_err = (exact_div - fd_div).abs();
     let gn_err = (gn_div - fd_div).abs();
     assert!(

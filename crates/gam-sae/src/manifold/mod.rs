@@ -188,6 +188,7 @@ mod behavior;
 mod behavior_fit;
 mod behavior_isometry;
 mod certificate;
+mod checkpoint;
 mod construction;
 mod construction_ard;
 mod construction_arrow_schur_assembly;
@@ -431,9 +432,8 @@ pub use construction_reconstruction::steer_persisted_atom_set;
 // #16/#2023 — the shared rank-charge DOF core, exposed so the hybrid-split DEMOTE
 // gate prices linear/curved candidates in the SAME currency as the joint REML fit.
 pub(crate) use construction::realised_rank_charge_dof;
-// Occupancy-scaled Jeffreys barrier: the per-assembly frozen routing support
-// (coactivation pairs + per-atom N_eff) carried on `SaeManifoldTerm` — reachable
-// crate-wide because the term's frozen-gate field is.
+// Jeffreys barrier routing support: the per-assembly frozen coactivation pairs
+// and per-atom effective sample sizes carried on `SaeManifoldTerm`.
 pub(crate) use penalties::BarrierCoactivationGate;
 
 /// Public single-currency surface for the realised rank-charge DOF: the SAME

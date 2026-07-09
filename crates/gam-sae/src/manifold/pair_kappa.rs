@@ -172,16 +172,7 @@ pub fn screen_pair(
 ) -> PairVerdict {
     let n = data.nrows();
     let contexts = vec![0usize; n];
-    screen_pair_with_contexts(
-        data,
-        mean,
-        atom_a,
-        atom_b,
-        cand_a,
-        cand_b,
-        &contexts,
-        None,
-    )
+    screen_pair_with_contexts(data, mean, atom_a, atom_b, cand_a, cand_b, &contexts, None)
 }
 
 /// Screen one atom pair, additionally conditioning the residual-gate
@@ -328,7 +319,8 @@ fn residual_conditionality(
         .iter()
         .map(|&active| if active { 1.0 } else { 0.0 })
         .collect();
-    let activities = residual_gate_activities(&gate_a, &gate_b, shared_chart, &weights, 0.0).ok()?;
+    let activities =
+        residual_gate_activities(&gate_a, &gate_b, shared_chart, &weights, 0.0).ok()?;
     estimate_on_rows(
         &activities.residual_i,
         &activities.residual_j,
@@ -342,7 +334,8 @@ fn residual_conditionality(
 }
 
 fn pair_continuous_context(ea: &PlaneEnergies, eb: &PlaneEnergies) -> Vec<f64> {
-    ea.r2.iter()
+    ea.r2
+        .iter()
         .zip(eb.r2.iter())
         .map(|(&a, &b)| (a + b).ln_1p())
         .collect()

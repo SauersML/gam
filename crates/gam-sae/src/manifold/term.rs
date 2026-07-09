@@ -485,7 +485,7 @@ pub struct SaeManifoldTerm {
     /// cleared at each outer-optimization entry). Snapshot states are row-count
     /// bound, so a subsampled search term's bank dies with that term and never
     /// crosses the full-row seam.
-    pub(crate) best_fit_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
+    pub(crate) best_fit_incumbent: Option<SaeFitIncumbent>,
     /// Bounded high-EV structural-collapse reseeds spent by the frame-coherence
     /// guard in the current optimization. This is separate from total decoder
     /// co-collapse: these atoms still carry decoder norm and EV, but duplicate an
@@ -827,6 +827,22 @@ pub(crate) struct SaeManifoldMutableState {
     pub(crate) logits: Array2<f64>,
     pub(crate) coords: Vec<LatentCoordValues>,
     pub(crate) last_row_layout: Option<SaeRowLayout>,
+}
+
+/// Fit-global reconstruction incumbent and its outer-stationarity evidence.
+///
+/// `consecutive_inner_restores` counts successful joint-fit calls that ended by
+/// restoring their penalized-objective incumbent.  A newly superior fit-level
+/// incumbent resets the count: only recurrence around the *same* banked model
+/// is evidence that changing rho no longer changes the fitted state.  The EFS
+/// bridge consumes this as a typed termination certificate instead of inferring
+/// flatness from a workload-tuned relative-cost threshold.
+#[derive(Debug)]
+pub(crate) struct SaeFitIncumbent {
+    pub(crate) ev: f64,
+    pub(crate) uniformity: Option<f64>,
+    pub(crate) state: SaeManifoldMutableState,
+    pub(crate) consecutive_inner_restores: usize,
 }
 
 /// Per-atom differential snapshot — see [`SaeManifoldMutableState`].

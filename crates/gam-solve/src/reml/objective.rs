@@ -2690,6 +2690,7 @@ impl<'a> RemlState<'a> {
                 psi_indices,
                 inner_hessian_scale,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             }
         } else {
             let steps = compute_efs_update(
@@ -2713,6 +2714,7 @@ impl<'a> RemlState<'a> {
                 psi_indices: None,
                 inner_hessian_scale,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             }
         };
 

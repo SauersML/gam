@@ -1,5 +1,5 @@
-use gam_solve::arrow_schur::{BetaBlockId, BetaPenaltyOp};
 use gam_runtime::warm_start::Fingerprinter;
+use gam_solve::arrow_schur::{BetaBlockId, BetaPenaltyOp};
 use ndarray::{Array2, ArrayView1};
 use std::ops::Range;
 use std::sync::Arc;
@@ -527,9 +527,7 @@ impl WhitenedFactoredFrameOp {
                 let mut mu = Array2::<f64>::zeros((self.p, r));
                 for a in 0..r {
                     let col: Vec<f64> = (0..self.p).map(|j| u[[j, a]]).collect();
-                    let m_col = self
-                        .metric
-                        .apply_metric_row(row, ndarray::aview1(&col));
+                    let m_col = self.metric.apply_metric_row(row, ndarray::aview1(&col));
                     for j in 0..self.p {
                         mu[[j, a]] = m_col[j];
                     }
@@ -552,9 +550,7 @@ impl WhitenedFactoredFrameOp {
                 for b in 0..r {
                     let mut e = vec![0.0_f64; self.p];
                     e[b] = 1.0;
-                    let m_col = self
-                        .metric
-                        .apply_metric_row(row, ndarray::aview1(&e));
+                    let m_col = self.metric.apply_metric_row(row, ndarray::aview1(&e));
                     for a in 0..r {
                         g[[a, b]] = m_col[a];
                     }
@@ -575,9 +571,7 @@ impl BetaPenaltyOp for WhitenedFactoredFrameOp {
         let mut u_p = vec![0.0_f64; self.p];
         for row in 0..self.n_rows() {
             self.expand_row(row, x, &mut u_p);
-            let mu = self
-                .metric
-                .apply_metric_row(row, ndarray::aview1(&u_p));
+            let mu = self.metric.apply_metric_row(row, ndarray::aview1(&u_p));
             self.project_row(row, &mu, y);
         }
     }
@@ -660,9 +654,7 @@ impl BetaPenaltyOp for WhitenedFactoredFrameOp {
             // One column of the operator = matvec on a unit vector.
             for row in 0..self.n_rows() {
                 self.expand_row(row, &e, &mut u_p);
-                let mu = self
-                    .metric
-                    .apply_metric_row(row, ndarray::aview1(&u_p));
+                let mu = self.metric.apply_metric_row(row, ndarray::aview1(&u_p));
                 self.project_row(row, &mu, &mut y);
             }
             for r in 0..self.dim {
@@ -731,8 +723,8 @@ mod tests {
         p: usize,
         r: usize,
         m: usize,
-        u: &ndarray::Array2<f64>,           // p × r frame
-        factor: &ndarray::Array2<f64>,      // n_rows × (p·rank) metric factor
+        u: &ndarray::Array2<f64>,      // p × r frame
+        factor: &ndarray::Array2<f64>, // n_rows × (p·rank) metric factor
         rank: usize,
         support: &[Vec<(usize, usize, f64)>], // per row (atom, basis, weight)
     ) -> ndarray::Array2<f64> {
@@ -788,11 +780,8 @@ mod tests {
         let m = 2usize;
         let rank = 2usize;
         // Frame U (p×r), arbitrary (not orthonormal — the op must not assume it).
-        let u = ndarray::Array2::from_shape_vec(
-            (p, r),
-            vec![1.0, 0.0, 0.5, 1.0, -0.3, 0.7],
-        )
-        .unwrap();
+        let u =
+            ndarray::Array2::from_shape_vec((p, r), vec![1.0, 0.0, 0.5, 1.0, -0.3, 0.7]).unwrap();
         // Metric factor rows (n_rows × p·rank), anisotropic per row.
         let factor = ndarray::Array2::from_shape_vec(
             (3, p * rank),
@@ -823,8 +812,7 @@ mod tests {
             metric,
         );
 
-        let reference =
-            dense_framed_whitened_reference(p, r, m, &u, &factor, rank, &support);
+        let reference = dense_framed_whitened_reference(p, r, m, &u, &factor, rank, &support);
 
         let dense = op.to_dense();
         for a in 0..dim {
@@ -846,7 +834,11 @@ mod tests {
             for b in 0..dim {
                 expect += reference[[a, b]] * x[b];
             }
-            assert!((y[a] - expect).abs() < 1e-10, "matvec[{a}] {} vs {expect}", y[a]);
+            assert!(
+                (y[a] - expect).abs() < 1e-10,
+                "matvec[{a}] {} vs {expect}",
+                y[a]
+            );
         }
         // diagonal matches reference diagonal.
         let mut d = vec![0.0; dim];
@@ -881,11 +873,8 @@ mod tests {
         let r = 2usize;
         let m = 1usize;
         // Orthonormal frame columns e0, e1.
-        let u = ndarray::Array2::from_shape_vec(
-            (p, r),
-            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-        )
-        .unwrap();
+        let u =
+            ndarray::Array2::from_shape_vec((p, r), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
         // Identity metric per row: factor = I_p (rank p).
         let mut factor = ndarray::Array2::<f64>::zeros((2, p * p));
         for row in 0..2 {
@@ -893,10 +882,8 @@ mod tests {
                 factor[[row, i * p + i]] = 1.0;
             }
         }
-        let support: Vec<Vec<(usize, usize, f64)>> =
-            vec![vec![(0, 0, 1.5)], vec![(0, 0, 0.25)]];
-        let metric =
-            gam_problem::RowMetric::behavioral_fisher(Arc::new(factor), p, p).unwrap();
+        let support: Vec<Vec<(usize, usize, f64)>> = vec![vec![(0, 0, 1.5)], vec![(0, 0, 0.25)]];
+        let metric = gam_problem::RowMetric::behavioral_fisher(Arc::new(factor), p, p).unwrap();
         let dim = m * r;
         let op = WhitenedFactoredFrameOp::new(
             p,
@@ -945,7 +932,11 @@ mod tests {
         let op = WhitenedRowGramPenaltyOp::new(kron, k);
 
         let dense = op.to_dense();
-        assert!((dense[[0, 0]] - 100.0).abs() < 1e-9, "weighted curvature {}", dense[[0, 0]]);
+        assert!(
+            (dense[[0, 0]] - 100.0).abs() < 1e-9,
+            "weighted curvature {}",
+            dense[[0, 0]]
+        );
         assert!(dense[[0, 1]].abs() < 1e-12);
         assert!(dense[[1, 0]].abs() < 1e-12);
         assert!(
@@ -956,11 +947,17 @@ mod tests {
         // matvec in the null direction is zero (isotropic G⊗I would return [0,1]).
         let mut y = vec![0.0; k];
         op.matvec(&[0.0, 1.0], &mut y);
-        assert!(y[0].abs() < 1e-12 && y[1].abs() < 1e-12, "null-direction matvec {y:?}");
+        assert!(
+            y[0].abs() < 1e-12 && y[1].abs() < 1e-12,
+            "null-direction matvec {y:?}"
+        );
         // Jacobi diagonal matches M's diagonal.
         let mut d = vec![0.0; k];
         op.diagonal(&mut d);
-        assert!((d[0] - 100.0).abs() < 1e-9 && d[1].abs() < 1e-12, "diag {d:?}");
+        assert!(
+            (d[0] - 100.0).abs() < 1e-9 && d[1].abs() < 1e-12,
+            "diag {d:?}"
+        );
     }
 
     /// #974 reduction: with an IDENTITY metric (`U = I_p`, `s = p` ⇒ `M_n = I_p`)
@@ -1034,13 +1031,9 @@ mod tests {
         let l = vec![1.0, 0.0, -1.0, 0.5, 2.0, 0.0];
         let jac: Arc<[Vec<f64>]> = Arc::from(vec![l.clone()].into_boxed_slice());
         // M = U Uᵀ, U rows [[1,0],[0,1],[1,1]] (row-major u[i*r+k]).
-        let u = ndarray::Array2::from_shape_vec(
-            (1, p * r),
-            vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-        )
-        .unwrap();
-        let metric =
-            gam_problem::RowMetric::behavioral_fisher(Arc::new(u.clone()), p, r).unwrap();
+        let u = ndarray::Array2::from_shape_vec((1, p * r), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            .unwrap();
+        let metric = gam_problem::RowMetric::behavioral_fisher(Arc::new(u.clone()), p, r).unwrap();
         let kron = SaeKroneckerRows::new(p, a_phi, jac).with_output_metric(Some(metric));
 
         // Reference dense arithmetic.
@@ -1076,7 +1069,12 @@ mod tests {
         let mut out = vec![0.0; q];
         kron.apply_l(0, &u_p, &mut out);
         for c in 0..q {
-            assert!((out[c] - expect[c]).abs() < 1e-9, "c={c}: {} vs {}", out[c], expect[c]);
+            assert!(
+                (out[c] - expect[c]).abs() < 1e-9,
+                "c={c}: {} vs {}",
+                out[c],
+                expect[c]
+            );
         }
 
         // Adjoint: ⟨H_tβ x, y⟩ == ⟨x, H_βt y⟩.

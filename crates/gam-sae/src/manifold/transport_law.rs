@@ -307,9 +307,7 @@ pub(crate) fn honest_layer_decoder(
     layer: CrosscoderLayer,
 ) -> Result<Array2<f64>, String> {
     match layer {
-        CrosscoderLayer::Anchor => {
-            Ok(decoder.slice(s![.., 0..layout.anchor_dim()]).to_owned())
-        }
+        CrosscoderLayer::Anchor => Ok(decoder.slice(s![.., 0..layout.anchor_dim()]).to_owned()),
         CrosscoderLayer::Block(l) => {
             if l >= layout.num_blocks() {
                 return Err(format!(
@@ -318,7 +316,9 @@ pub(crate) fn honest_layer_decoder(
                 ));
             }
             let inv = 1.0 / layout.sqrt_lambda(l);
-            Ok(decoder.slice(s![.., layout.block_range(l)]).mapv(|v| inv * v))
+            Ok(decoder
+                .slice(s![.., layout.block_range(l)])
+                .mapv(|v| inv * v))
         }
     }
 }
@@ -348,10 +348,13 @@ fn fit_transport_law(t: &[f64], tprime: &[f64], n_harmonics: usize) -> ((f64, f6
     let mut best_phi = 0.0_f64;
     let mut best_ss_res = f64::INFINITY;
     for &s in &[1.0_f64, -1.0_f64] {
-        let (su, cu) = t.iter().zip(tprime.iter()).fold((0.0, 0.0), |(a, b), (&ti, &tpi)| {
-            let u = tpi - s * ti;
-            (a + (two_pi * u).sin(), b + (two_pi * u).cos())
-        });
+        let (su, cu) = t
+            .iter()
+            .zip(tprime.iter())
+            .fold((0.0, 0.0), |(a, b), (&ti, &tpi)| {
+                let u = tpi - s * ti;
+                (a + (two_pi * u).sin(), b + (two_pi * u).cos())
+            });
         let r_u = (su * su + cu * cu).sqrt();
         let ss_res = gf - r_u;
         if ss_res < best_ss_res {
@@ -366,7 +369,8 @@ fn fit_transport_law(t: &[f64], tprime: &[f64], n_harmonics: usize) -> ((f64, f6
     // Smooth-map alternative: t' = s·t + f(t), f a Fourier series (constant +
     // n_harmonics harmonics) of t fit to the wrapped drift d_g = wrap(t'_g − s·t_g)
     // by least squares. The constant reproduces the phase model, so this nests it.
-    let smooth_r2 = fit_smooth_alternative(t, tprime, best_s, n_harmonics, ss_tot).unwrap_or(phase_r2);
+    let smooth_r2 =
+        fit_smooth_alternative(t, tprime, best_s, n_harmonics, ss_tot).unwrap_or(phase_r2);
 
     ((best_s, best_phi), phase_r2, smooth_r2.max(phase_r2))
 }
@@ -434,11 +438,7 @@ fn circular_r2(ss_tot: f64, ss_res: f64) -> f64 {
 /// Wrap a turn value to `[−½, ½)` (period 1).
 fn wrap_half(x: f64) -> f64 {
     let r = x.rem_euclid(1.0);
-    if r >= 0.5 {
-        r - 1.0
-    } else {
-        r
-    }
+    if r >= 0.5 { r - 1.0 } else { r }
 }
 
 /// Honest-units decoder drift `δ = ‖B_tgt − B_src‖_F / √(‖B_src‖_F · ‖B_tgt‖_F)`
@@ -487,9 +487,7 @@ pub(crate) fn principal_angles_between_images(
         .iter()
         .map(|&sv| sv.clamp(0.0, 1.0).acos())
         .collect::<Vec<f64>>();
-    angles.extend(
-        std::iter::repeat(std::f64::consts::FRAC_PI_2).take(r_src.abs_diff(r_tgt)),
-    );
+    angles.extend(std::iter::repeat(std::f64::consts::FRAC_PI_2).take(r_src.abs_diff(r_tgt)));
     Ok(angles)
 }
 

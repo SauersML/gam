@@ -811,10 +811,8 @@ pub struct SaeManifoldOuterObjective {
     pub(crate) termination: OuterTerminationLedger,
     /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
     /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
-    /// once at construction on the pristine full-`N` target. Checkpoints are
-    /// written best-effort at every MATERIAL improvement of the outer best
-    /// cost (never while the row-subsample restriction is engaged — the term
-    /// then holds `n_sub`-row state that cannot install at full `N`), and the
+    /// once at construction on the full-data target. Checkpoints are written
+    /// best-effort at every MATERIAL improvement of the outer best cost, and the
     /// file is removed when a converged fit is minted (its purpose is wall
     /// survival, not cross-fit caching — `persistent_warm_start` covers that).
     pub(crate) checkpoint_fingerprint: super::checkpoint::SaeCheckpointFingerprint,
@@ -896,10 +894,8 @@ impl SaeManifoldOuterObjective {
         let baseline_rho = init_rho.clone();
         let term_k_atoms = term.k_atoms();
         // SPEC wall-survival fingerprint on the full-data target.
-        let checkpoint_fingerprint = super::checkpoint::SaeCheckpointFingerprint::of_target(
-            target.view(),
-            term_k_atoms,
-        );
+        let checkpoint_fingerprint =
+            super::checkpoint::SaeCheckpointFingerprint::of_target(target.view(), term_k_atoms);
         let checkpoint_path =
             super::checkpoint::SaeFitCheckpoint::default_store_path(&checkpoint_fingerprint);
         Self {
@@ -979,7 +975,10 @@ impl SaeManifoldOuterObjective {
     /// ledger counters, and returns the banked outer ρ to open the search at.
     /// Any incompatibility or install failure is logged and the fit proceeds
     /// cold — a checkpoint can improve a fit, never break one.
-    pub(crate) fn try_resume_from_checkpoint(&mut self, expected_rho_len: usize) -> Option<Vec<f64>> {
+    pub(crate) fn try_resume_from_checkpoint(
+        &mut self,
+        expected_rho_len: usize,
+    ) -> Option<Vec<f64>> {
         if !self.checkpoint_path.exists() {
             return None;
         }
@@ -1022,7 +1021,7 @@ impl SaeManifoldOuterObjective {
     /// Remove the banked checkpoint after a CONVERGED fit is minted: its
     /// purpose is wall survival of an in-flight optimization, not cross-fit
     /// caching (`persistent_warm_start` covers that). Best-effort.
-    pub(crate) fn discard_checkpoint(&self) {
+    pub(crate) fn remove_checkpoint(&self) {
         if self.checkpoint_path.exists()
             && let Err(e) = std::fs::remove_file(&self.checkpoint_path)
         {
@@ -1168,7 +1167,7 @@ impl SaeManifoldOuterObjective {
         let pristine_seed_term = baseline_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
-        let mut last_loss = last_loss;
+        let last_loss = last_loss;
         // Fit-level keep-best consult (`best_fit_incumbent`): if the terminal
         // outer state reconstructs strictly worse than the best basin any
         // accepted iterate visited during the WHOLE ρ search, restore that basin
@@ -1178,8 +1177,12 @@ impl SaeManifoldOuterObjective {
         // snapshot is row-count bound to this term, so the restore is always
         // shape-consistent.
         let mut fit_incumbent_restored = false;
-        if let Some((incumbent_ev, _incumbent_uniformity, incumbent_state)) =
-            term.best_fit_incumbent.take()
+        if let Some(SaeFitIncumbent {
+            ev: incumbent_ev,
+            uniformity: _incumbent_uniformity,
+            state: incumbent_state,
+            ..
+        }) = term.best_fit_incumbent.take()
         {
             let terminal_ev = term
                 .try_fitted_for_rho(&fitted_rho)
@@ -1222,9 +1225,7 @@ impl SaeManifoldOuterObjective {
         // The terminal `last_loss` described the pre-restore state; re-read the
         // frozen-state loss at the settled ρ so the reported loss matches the
         // restored incumbent.
-        if fit_incumbent_restored
-            && let Ok(recomputed) = term.loss(target.view(), &fitted_rho)
-        {
+        if fit_incumbent_restored && let Ok(recomputed) = term.loss(target.view(), &fitted_rho) {
             loss = recomputed;
         }
         // Basin guard against the multi-atom routing-collapse failure mode
@@ -1576,7 +1577,9 @@ impl SaeManifoldOuterObjective {
                 return Err(err);
             }
         };
-        let residual = self.term.reconstruction_residual(self.target.view(), &rho)?;
+        let residual = self
+            .term
+            .reconstruction_residual(self.target.view(), &rho)?;
         let dispersion =
             self.term
                 .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))?;
@@ -1696,9 +1699,7 @@ impl SaeManifoldOuterObjective {
             .term
             .try_fitted_for_rho(&rho)
             .ok()
-            .and_then(|fit| {
-                reconstruction_explained_variance(self.target.view(), fit.view())
-            });
+            .and_then(|fit| reconstruction_explained_variance(self.target.view(), fit.view()));
 
         let mut eta = 0.0_f64;
         let mut eta_step = CURVATURE_WALK_INITIAL_ETA_STEP;
@@ -2802,11 +2803,9 @@ impl SaeManifoldOuterObjective {
             }
             let grad_norm = grad_norm_sq.sqrt();
             let lambda_smooth = rho_fixed.lambda_smooth_vec();
-            let quotient_grad_norm = self.term.quotient_gradient_norm_from_system(
-                &sys,
-                grad_norm_sq,
-                &lambda_smooth,
-            );
+            let quotient_grad_norm =
+                self.term
+                    .quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
             // The same full stationarity tolerance the historical loop uses
             // (`SAE_MANIFOLD_INNER_GRAD_REL_TOL × iterate scale`), loosened —
             // never tightened — by the forcing term: the gate can only sit
@@ -2845,10 +2844,8 @@ impl SaeManifoldOuterObjective {
                     // A genuine early stop: the forcing gate accepted an
                     // iterate the full-tolerance gate would have kept
                     // refining. Observable per the telemetry contract.
-                    self.probe_telemetry.loosened_probe_calls = self
-                        .probe_telemetry
-                        .loosened_probe_calls
-                        .saturating_add(1);
+                    self.probe_telemetry.loosened_probe_calls =
+                        self.probe_telemetry.loosened_probe_calls.saturating_add(1);
                 }
                 // Price the criterion at the (η-)stationary iterate through the
                 // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
@@ -3252,16 +3249,17 @@ impl SaeManifoldOuterObjective {
                 self.ridge_beta,
             )
         } else {
-            self.term.reml_criterion_streaming_exact_with_cache_and_lane(
-                self.target.view(),
-                &rho,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-                self.surrogate_lane.as_mut(),
-            )
+            self.term
+                .reml_criterion_streaming_exact_with_cache_and_lane(
+                    self.target.view(),
+                    &rho,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                    self.surrogate_lane.as_mut(),
+                )
         };
         let (cost, loss, cache) = match criterion {
             Ok(evaluated) => evaluated,
@@ -3300,6 +3298,7 @@ impl SaeManifoldOuterObjective {
                     psi_indices: None,
                     inner_hessian_scale: None,
                     logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
                 });
             }
             Err(err) => return Err(err),
@@ -3307,16 +3306,10 @@ impl SaeManifoldOuterObjective {
         self.current_rho = rho.clone();
         self.last_loss = Some(loss);
 
-        // HT effective row count for the ARD MacKay/Fellner–Schall α-step: under the
-        // outer row subsample the α fixed point `α ← n_eff/(‖t‖²+tr)` (#F1 — no `φ̂`)
-        // must use the
-        // SAME weighted count `n_eff = Σᵢ wᵢ ≈ N` as the (weight-aware) `ard_value`
-        // normalizer and `ard_coord_sumsq` numerator, or the step ranks a different
-        // precision than the criterion it descends. `None` ⇒ `n_eff = n`, historical.
-        let n_eff = self
-            .term
-            .row_loss_weights()
-            .map_or(self.term.n_obs() as f64, |w| w.iter().sum::<f64>());
+        // The MacKay/Fellner–Schall fixed point uses the observed row count.
+        // Design-honesty weights are mean-one and only redistribute the weighted
+        // coordinate sum of squares in the denominator.
+        let n_eff = self.term.n_obs() as f64;
         let sumsq = self.term.ard_coord_sumsq();
         // #2080: take the surrogate lane's shared (probes, S⁻¹·probes) bundle from
         // this eval's matrix-free evidence branch (if it ran) ONCE — both the ARD
@@ -3510,10 +3503,9 @@ impl SaeManifoldOuterObjective {
                         // count·n_eff/denom`.
                         let alpha_gauss = n_eff * (count as f64) / denom;
                         let alpha_new = match shared_period {
-                            Some(period) => von_mises_ard_precision(
-                                alpha_gauss,
-                                std::f64::consts::TAU / period,
-                            ),
+                            Some(period) => {
+                                von_mises_ard_precision(alpha_gauss, std::f64::consts::TAU / period)
+                            }
                             None => alpha_gauss,
                         };
                         if alpha_new.is_finite() && alpha_new > 0.0 {
@@ -3526,6 +3518,11 @@ impl SaeManifoldOuterObjective {
 
         let beta_hat = self.term.flatten_beta();
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
+        let consecutive_restored_incumbents = self
+            .term
+            .best_fit_incumbent
+            .as_ref()
+            .map(|incumbent| incumbent.consecutive_inner_restores);
         Ok(EfsEval {
             cost,
             steps,
@@ -3534,6 +3531,7 @@ impl SaeManifoldOuterObjective {
             psi_indices: None,
             inner_hessian_scale: None,
             logdet_enclosure_gap: None,
+            consecutive_restored_incumbents,
         })
     }
 }

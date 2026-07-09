@@ -138,12 +138,13 @@ impl AtomDecoderNormalEq {
                 gram[[j, i]] = sym;
             }
         }
-        let (evals, evecs) = gram
-            .eigh(Side::Lower)
-            .map_err(|e| format!("AtomDecoderNormalEq::solve: Gram eigendecomposition failed: {e}"))?;
-        let max_eig = evals
-            .iter()
-            .fold(0.0_f64, |acc, &v| if v.is_finite() { acc.max(v) } else { acc });
+        let (evals, evecs) = gram.eigh(Side::Lower).map_err(|e| {
+            format!("AtomDecoderNormalEq::solve: Gram eigendecomposition failed: {e}")
+        })?;
+        let max_eig = evals.iter().fold(
+            0.0_f64,
+            |acc, &v| if v.is_finite() { acc.max(v) } else { acc },
+        );
         if !(max_eig > 0.0) {
             return Err("AtomDecoderNormalEq::solve: design has zero numerical rank".to_string());
         }
@@ -279,8 +280,8 @@ mod tests {
     #[test]
     fn chunked_normal_eq_matches_dense_svd_seed() {
         let (design, resid) = design_and_residual(200, 5, 4);
-        let dense = solve_design_least_squares(design.view(), resid.view())
-            .expect("dense SVD seed");
+        let dense =
+            solve_design_least_squares(design.view(), resid.view()).expect("dense SVD seed");
 
         for &step in &[3usize, 7, 32, 199, 200, 4096] {
             let chunked = seed_atom_decoder_chunked(design.view(), resid.view(), step)
@@ -312,6 +313,9 @@ mod tests {
             .iter()
             .zip(resid.iter())
             .fold(0.0_f64, |acc, (&a, &b)| acc.max((a - b).abs()));
-        assert!(max_abs <= 1.0e-9, "spanned residual not reconstructed: {max_abs:.3e}");
+        assert!(
+            max_abs <= 1.0e-9,
+            "spanned residual not reconstructed: {max_abs:.3e}"
+        );
     }
 }

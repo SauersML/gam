@@ -305,21 +305,9 @@ impl SaeManifoldTerm {
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let p = self.output_dim();
-        // Scalar-observation count for the residual dof, kept on the SAME scale as
-        // `rss = Σᵢ wᵢ·‖rᵢ‖²` below. Under the outer-criterion Horvitz–Thompson row
-        // subsample an un-normalized inverse-inclusion weight `wᵢ = N / n_sub` lifts
-        // the weighted residual sum back to full-`N` scale (see
-        // `set_uniform_inclusion_weight`); the effective observation count must be
-        // lifted the same way — `Σᵢ wᵢ·p ≈ N·p` — or `φ̂ = rss / resid_dof` inflates
-        // by exactly `N / n_sub` (the RSS numerator is full-`N` while the
-        // denominator is the `n_sub·p` subproblem). Single-sourcing the count from
-        // the installed weights makes the three regimes consistent by construction:
-        // `None` and the mean-1 design-honesty weights both sum to `n`, so
-        // `n_scalar = n·p` there, bit-for-bit the historical count.
-        let n_scalar = match self.row_loss_weights() {
-            Some(w) => w.iter().sum::<f64>() * p as f64,
-            None => (n * p) as f64,
-        };
+        // Design-honesty weights are normalized to mean one, so they redistribute
+        // residual mass without changing the scalar observation count.
+        let n_scalar = (n * p) as f64;
         let rss = 2.0 * loss.data_fit;
         let smooth_edf: f64 = self
             .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec())
@@ -933,13 +921,7 @@ impl SaeManifoldTerm {
                 t: rhs_t.clone(),
                 beta: rhs_beta.clone(),
             };
-            let influence = self.solve_exact_stationarity(
-                rho,
-                target,
-                cache,
-                &b_solver,
-                &rhs,
-            )?;
+            let influence = self.solve_exact_stationarity(rho, target, cache, &b_solver, &rhs)?;
             for a in 0..beta_dim {
                 let ua = influence.beta[a];
                 for b in 0..beta_dim {
@@ -1023,8 +1005,7 @@ impl SaeManifoldTerm {
                 for (gi, &row) in eval_rows.iter().enumerate() {
                     let basis = atom.basis_values.row(row);
                     for c in 0..p {
-                        let var =
-                            frame_projection.output_variance(k, raw_block.view(), basis, c);
+                        let var = frame_projection.output_variance(k, raw_block.view(), basis, c);
                         band_sd_robust[[gi, c]] = var.max(0.0).sqrt();
                     }
                 }
@@ -1067,9 +1048,7 @@ impl SaeManifoldTerm {
     ) -> Result<CompositeLikelihoodCharge, String> {
         let (_joint_beta_cov, joint_clic_dof) =
             self.joint_score_sandwich(cache, rho, target, dispersion)?;
-        Ok(CompositeLikelihoodCharge {
-            joint_clic_dof,
-        })
+        Ok(CompositeLikelihoodCharge { joint_clic_dof })
     }
 }
 
@@ -1088,8 +1067,7 @@ mod persisted_reconstruct_tests {
         let coords = Array2::from_shape_vec((n_rows, 1), vec![0.1, 0.7, 1.9, 2.8]).unwrap();
         let decoder =
             Array2::from_shape_vec((width, p_out), vec![0.5, -0.2, 0.3, 0.9, -0.4, 0.1]).unwrap();
-        let assignments =
-            Array2::from_shape_vec((n_rows, 1), vec![1.0, 0.5, 0.8, 0.2]).unwrap();
+        let assignments = Array2::from_shape_vec((n_rows, 1), vec![1.0, 0.5, 0.8, 0.2]).unwrap();
 
         let out = reconstruct_persisted_atom_set(
             &[SaeAtomBasisKind::Periodic],

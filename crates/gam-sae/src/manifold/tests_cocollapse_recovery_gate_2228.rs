@@ -148,7 +148,9 @@ fn zz_ibp_k1_recovery_gate_pin_rescues_material_smoothing_2228() {
         let rho = SaeManifoldRho::new(0.0, log_lambda, vec![Array1::<f64>::zeros(1)]);
         let (crit, _loss) = term
             .reml_criterion(target.view(), &rho, None, 60, 0.05, 1.0e-3, 1.0e-3)
-            .unwrap_or_else(|e| panic!("REML criterion must evaluate under the pin at log λ={log_lambda}: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("REML criterion must evaluate under the pin at log λ={log_lambda}: {e}")
+            });
         eprintln!("[#2228 recovery] REML criterion @ log λ_smooth={log_lambda:+.1} -> {crit:.6}");
         crits.push(crit);
     }

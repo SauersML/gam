@@ -18,16 +18,6 @@ impl SphereManifold {
         Self { intrinsic_dim }
     }
 
-    fn normalize(&self, x: Array1<f64>) -> GeometryResult<Array1<f64>> {
-        let nrm = norm(x.view());
-        if nrm <= GEOMETRY_EPS || !nrm.is_finite() {
-            return Err(GeometryError::InvalidPoint(
-                "sphere normalization underflow",
-            ));
-        }
-        Ok(x / nrm)
-    }
-
     /// Reject base points that are not on the unit sphere. This guards the maps
     /// that are only meaningful at a genuine manifold point — `log_map`,
     /// `metric_tensor`, `parallel_transport`, `tangent_basis`, `project_tangent`
@@ -123,7 +113,18 @@ impl RiemannianManifold for SphereManifold {
         let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
         let theta = norm(xi.view());
         if theta < 1.0e-10 {
-            return self.normalize(&point + &xi);
+            // Numerically-stable evaluation of the geodesic below as θ→0: both
+            // cos(θ)=1 and sin(θ)/θ=1 hold to full f64 precision (the corrections
+            // are O(θ²)≈1e-20), so the map degenerates to `p + ξ`. This keeps
+            // exp_map a SINGLE geodesic map — bit-identical and C¹ across the
+            // branch boundary, with a matching adjoint in `exp_map_vjp` — rather
+            // than switching to a normalized retraction `normalize(p+ξ)`, a
+            // different map whose derivative disagrees with the geodesic at the
+            // boundary. For a unit base point ξ⟂p, so |p+ξ|=√(1+θ²) rounds to
+            // exactly 1.0 in f64; and the raw (unnormalized) form is what the
+            // honest-ambient contract needs, matching the general branch, which
+            // likewise does not renormalize.
+            return Ok(&point + &xi);
         }
         Ok(point.to_owned() * theta.cos() + xi * (theta.sin() / theta))
     }
@@ -313,26 +314,20 @@ impl RiemannianManifold for SphereManifold {
         let p = point;
         let v = tangent_vec;
 
-        // Small-theta branch of the FORWARD is exactly
-        // `y = normalize(q)`, `q = p + xi`, not the unnormalised first-order
-        // expression. Differentiate that exact branch so the VJP agrees at the
-        // switch, including the radial projection at xi = 0.
+        // Small-theta branch of the FORWARD is the geodesic limit `y = p + xi`
+        // (see `exp_map`), with `xi = v - c p`, `c = p·v`. Its exact Jacobians
+        // are
+        //   dy/dv = I - p p^T,     dy/dp = (1 - c) I - p v^T,
+        // so the transpose-applied pullbacks of cotangent `g` are
+        //   grad_v = (I - p p^T) g = g - p (p·g),
+        //   grad_p = (1 - c) g - v (p·g).
+        // These are exactly the theta -> 0 limit of the general branch below, so
+        // the VJP is continuous at the switch. At p = g = e1, xi = 0 they give
+        // grad_v = (I - p p^T) g = 0 — the correct radial derivative.
         if theta < 1.0e-10 {
-            let q = &p.to_owned() + &xi;
-            let q_norm = norm(q.view());
-            if q_norm <= GEOMETRY_EPS || !q_norm.is_finite() {
-                return Err(GeometryError::InvalidPoint(
-                    "sphere normalization underflow",
-                ));
-            }
-            let y = &q / q_norm;
-            // Normalization adjoint: h = (I - yy^T) g / |q|.
-            let h = (&g.to_owned() - &(&y * dot(y.view(), g))) / q_norm;
-            let p_dot_h = dot(p, h.view());
-            // q_v = I - p p^T.
-            let grad_v = &h - &(p.to_owned() * p_dot_h);
-            // q_p = (1-c)I - p v^T.
-            let grad_p = &(&h * (1.0 - c)) - &(v.to_owned() * p_dot_h);
+            let p_dot_g = dot(p, g);
+            let grad_v = &g.to_owned() - &(p.to_owned() * p_dot_g);
+            let grad_p = &(&g.to_owned() * (1.0 - c)) - &(v.to_owned() * p_dot_g);
             return Ok((grad_p, grad_v));
         }
 

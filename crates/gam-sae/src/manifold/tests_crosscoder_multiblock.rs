@@ -198,7 +198,10 @@ fn diag_crosscoder_sweep_sensitivity() {
 
 /// Bit-identical comparison of two f64 matrices (NaN-free by construction here).
 fn bit_identical(a: &Array2<f64>, b: &Array2<f64>) -> bool {
-    a.dim() == b.dim() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    a.dim() == b.dim()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// The `K = 2` special case: the general multi-block driver reproduces the
@@ -263,7 +266,10 @@ fn multiblock_reduces_to_two_block_bit_identically_at_k2() {
     );
     assert_eq!(report_a.sweeps, report_b.sweeps);
     assert_eq!(report_a.converged, report_b.converged);
-    assert_eq!(report_a.lambda_identifiable, report_b.blocks[0].identifiable);
+    assert_eq!(
+        report_a.lambda_identifiable,
+        report_b.blocks[0].identifiable
+    );
     assert_eq!(
         report_a.log_lambda_trajectory.len(),
         report_b.blocks[0].trajectory.len()
@@ -273,7 +279,11 @@ fn multiblock_reduces_to_two_block_bit_identically_at_k2() {
         .iter()
         .zip(report_b.blocks[0].trajectory.iter())
     {
-        assert_eq!(ta.to_bits(), tb.to_bits(), "trajectory diverged: {ta} vs {tb}");
+        assert_eq!(
+            ta.to_bits(),
+            tb.to_bits(),
+            "trajectory diverged: {ta} vs {tb}"
+        );
     }
 
     // Same fitted decoders, to the bit.
@@ -335,7 +345,13 @@ fn crosscoder_two_layers_shares_one_latent_and_selects_lambda() {
     term.set_guards_enabled(false);
     let mut blocks = vec![OutputBlock::new("layer2", y2.clone(), 0.0).unwrap()];
     let report = term
-        .run_multiblock_reml_fit(z.view(), &mut blocks, &mut rho, None, reconstruction_controls())
+        .run_multiblock_reml_fit(
+            z.view(),
+            &mut blocks,
+            &mut rho,
+            None,
+            reconstruction_controls(),
+        )
         .unwrap();
 
     assert_eq!(report.blocks.len(), 1);
@@ -377,14 +393,19 @@ fn crosscoder_two_layers_shares_one_latent_and_selects_lambda() {
     // is exactly the offset bookkeeping + `√λ_ℓ` division the test used to do).
     let via_accessor = term.layer_decoder(0, 0).unwrap();
     let manual = blocks[0].split_honest_decoder(
-        term.atoms[0].decoder_coefficients.slice(ndarray::s![.., p_x..p_tot]),
+        term.atoms[0]
+            .decoder_coefficients
+            .slice(ndarray::s![.., p_x..p_tot]),
     );
     assert!(
         bit_identical(&via_accessor, &manual),
         "layer_decoder must reproduce the by-hand split_honest_decoder bit-for-bit"
     );
     let honest_norm = via_accessor.iter().map(|v| v * v).sum::<f64>().sqrt();
-    assert!(honest_norm > 0.1, "layer-2 decoder collapsed: {honest_norm}");
+    assert!(
+        honest_norm > 0.1,
+        "layer-2 decoder collapsed: {honest_norm}"
+    );
 }
 
 /// Curved crosscoder, three layers: per-block `λ_ℓ` orders the layers by their
@@ -433,11 +454,22 @@ fn crosscoder_three_layers_orders_lambda_by_layer_noise() {
         OutputBlock::new("layerB", yb.clone(), 0.0).unwrap(),
     ];
     let report = term
-        .run_multiblock_reml_fit(z.view(), &mut blocks, &mut rho, None, reconstruction_controls())
+        .run_multiblock_reml_fit(
+            z.view(),
+            &mut blocks,
+            &mut rho,
+            None,
+            reconstruction_controls(),
+        )
         .unwrap();
 
     assert_eq!(report.blocks.len(), 2);
-    assert!(report.blocks.iter().all(|b| b.identifiable && b.log_lambda.is_finite()));
+    assert!(
+        report
+            .blocks
+            .iter()
+            .all(|b| b.identifiable && b.log_lambda.is_finite())
+    );
 
     // The anchor is reconstructed from the shared latent, and so is the cleaner
     // extra layer A. The noisiest layer B is *down-ranked* by REML (its large
@@ -480,8 +512,7 @@ fn crosscoder_layout_round_trips_offsets_and_unscaling() {
     let dims = vec![3usize, 5, 2];
     let logs = vec![0.1_f64, -0.4, 0.7];
     let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    let layout =
-        CrosscoderLayout::new(p_x, dims.clone(), labels.clone(), logs.clone()).unwrap();
+    let layout = CrosscoderLayout::new(p_x, dims.clone(), labels.clone(), logs.clone()).unwrap();
 
     assert_eq!(layout.anchor_dim(), p_x);
     assert_eq!(layout.num_blocks(), 3);
@@ -497,7 +528,10 @@ fn crosscoder_layout_round_trips_offsets_and_unscaling() {
     // identical whether carved via the layout or the block).
     for (l, (&dim, &ll)) in dims.iter().zip(logs.iter()).enumerate() {
         let block = OutputBlock::new("x", Array2::<f64>::zeros((2, dim)), ll).unwrap();
-        assert_eq!(layout.sqrt_lambda(l).to_bits(), block.sqrt_lambda().to_bits());
+        assert_eq!(
+            layout.sqrt_lambda(l).to_bits(),
+            block.sqrt_lambda().to_bits()
+        );
         assert_eq!(layout.log_lambda(l).to_bits(), ll.to_bits());
     }
 

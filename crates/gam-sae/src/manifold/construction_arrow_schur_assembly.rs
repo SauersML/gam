@@ -64,8 +64,7 @@ impl SaeManifoldTerm {
         n: usize,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
-        let parallel =
-            n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
             use rayon::prelude::*;
             (0..n)
@@ -443,8 +442,7 @@ impl SaeManifoldTerm {
                                 .for_each(|(chunk, mut block)| {
                                     let start = chunk * CHUNK;
                                     for local in 0..block.nrows() {
-                                        let r =
-                                            self.assignment.routing_logits_row(start + local);
+                                        let r = self.assignment.routing_logits_row(start + local);
                                         for k in 0..k_atoms {
                                             block[[local, k]] = r[k];
                                         }
@@ -506,8 +504,7 @@ impl SaeManifoldTerm {
                         // order-preserving parallel collect is bit-identical to the
                         // serial push (deterministic — each row computed once, no
                         // cross-row reduction).
-                        let assignments_all =
-                            self.assignments_all_for_rho_parallel(n, rho)?;
+                        let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
                         Some(SaeRowLayout::from_dense_weights(
                             &assignments_all,
                             k_active_cap,
@@ -530,8 +527,7 @@ impl SaeManifoldTerm {
                             // active sets. Independent read-only per-row builds →
                             // order-preserving parallel collect is bit-identical to
                             // the serial push (deterministic).
-                            let assignments_all =
-                                self.assignments_all_for_rho_parallel(n, rho)?;
+                            let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
                             // #1414: pass the RELATIVE cutoff through;
                             // `from_dense_weights` applies it per row against that
                             // row's own peak `max_k |a_{n,k}|`, matching the
@@ -1736,7 +1732,7 @@ impl SaeManifoldTerm {
                     // #974 — see the main-path site: enable spectral discovery of
                     // the rank-deficient-metric-null `H_tt` directions on the
                     // fixed-decoder path too. No-op when the metric is full-rank.
-                    low_rank_whiten.then(|| ArrowRowGaugeDeflation::new(vec![Vec::new(); n]))
+                    low_rank_whiten.then(|| Self::empty_row_gauge_deflation(n))
                 })
             {
                 sys.set_row_gauge_deflation(deflation);
@@ -2124,8 +2120,7 @@ impl SaeManifoldTerm {
                 );
                 (Arc::new(wop), None)
             } else {
-                let mut frame_blocks: Vec<FactoredFrameGBlock> =
-                    Vec::with_capacity(g_blocks.len());
+                let mut frame_blocks: Vec<FactoredFrameGBlock> = Vec::with_capacity(g_blocks.len());
                 for ((atom_i, atom_j), data) in g_blocks.into_iter() {
                     if data.iter().all(|&v| v == 0.0) {
                         continue;
@@ -2148,7 +2143,10 @@ impl SaeManifoldTerm {
                     basis_sizes.clone(),
                     frame_blocks,
                 )?;
-                (Arc::new(op) as Arc<dyn BetaPenaltyOp>, Some(device_frame_blocks))
+                (
+                    Arc::new(op) as Arc<dyn BetaPenaltyOp>,
+                    Some(device_frame_blocks),
+                )
             };
 
             // Smooth penalty in factored space: `λ S_k ⊗ I_{r_k}` at `off_C[k]`.
@@ -2409,7 +2407,7 @@ impl SaeManifoldTerm {
                 // direction to unit stiffness (`log 1 = 0`, ρ-independent, so the
                 // evidence value and its ρ-adjoint stay consistent) instead of
                 // refusing the block. No-op when the metric is full-rank.
-                low_rank_whiten.then(|| ArrowRowGaugeDeflation::new(vec![Vec::new(); n]))
+                low_rank_whiten.then(|| Self::empty_row_gauge_deflation(n))
             })
         {
             sys.set_row_gauge_deflation(deflation);

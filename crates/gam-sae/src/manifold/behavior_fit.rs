@@ -569,7 +569,10 @@ impl SaeManifoldTerm {
     /// rank reduction, [`Self::reduce_atoms_to_data_supported_rank`], is idempotent
     /// after the sweep-entry fit, so the restored decoder width always matches.)
     fn fit_state_snapshot(&self) -> (SaeManifoldMutableState, Option<GumbelTemperatureSchedule>) {
-        (self.snapshot_mutable_state(), self.temperature_schedule.clone())
+        (
+            self.snapshot_mutable_state(),
+            self.temperature_schedule.clone(),
+        )
     }
 
     /// Restore a [`Self::fit_state_snapshot`]. `restore_mutable_state` rebuilds
@@ -649,8 +652,11 @@ impl SaeManifoldTerm {
         // The behavior block IS an output block: its (unscaled) tangent target,
         // its width p_y, and its weight λ_y drive the same augmented fit and the
         // same variance-ratio update.
-        let mut output_blocks =
-            vec![OutputBlock::new("behavior", block.target.clone(), block.log_lambda_y)?];
+        let mut output_blocks = vec![OutputBlock::new(
+            "behavior",
+            block.target.clone(),
+            block.log_lambda_y,
+        )?];
         let report = self.run_multiblock_reml_fit(
             activation,
             &mut output_blocks,

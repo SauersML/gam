@@ -18,7 +18,9 @@ fn circle_atom(anchors: usize) -> LearnedGraphAtom {
         let phase = TAU * i as f64 / anchors as f64;
         if j == 0 { phase.cos() } else { phase.sin() }
     });
-    let rows: Vec<f64> = (0..anchors * 4).map(|i| i as f64 / (anchors * 4) as f64).collect();
+    let rows: Vec<f64> = (0..anchors * 4)
+        .map(|i| i as f64 / (anchors * 4) as f64)
+        .collect();
     let edges = LearnedGraphAtom::knn_candidate_edges(embeddings.view()).expect("knn edges");
     let n_eff = rows.len() as f64;
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
@@ -134,8 +136,14 @@ fn eigengap_selects_two_for_circle_and_decouples_from_betti() {
     // statement is that a wedge of two circles is not 1-D-embeddable, so the
     // decode keeps at least two modes.
     let (fig, _pos, _coord) = figure_eight(16);
-    assert_eq!(fig.topology_readout().b1, 2, "figure-eight first Betti number");
-    let fig_basis = fig.spectral_decode_basis().expect("figure-eight spectral basis");
+    assert_eq!(
+        fig.topology_readout().b1,
+        2,
+        "figure-eight first Betti number"
+    );
+    let fig_basis = fig
+        .spectral_decode_basis()
+        .expect("figure-eight spectral basis");
     assert!(
         fig_basis.selected_q() >= 2,
         "figure-eight decode dimension {} should be >= 2",
@@ -252,7 +260,9 @@ fn nystrom_jet_matches_central_difference() {
 #[test]
 fn spectral_decode_beats_single_circle_on_figure_eight() {
     let (atom, positions, circle_coord) = figure_eight(16);
-    let basis = atom.spectral_decode_basis().expect("figure-eight spectral basis");
+    let basis = atom
+        .spectral_decode_basis()
+        .expect("figure-eight spectral basis");
     let n = positions.nrows();
 
     // Spectral decode: design = the q eigengap eigenvectors at the vertices,
@@ -274,8 +284,12 @@ fn spectral_decode_beats_single_circle_on_figure_eight() {
     // curvature (second-jet) roughness Gram, fit through the same entry point.
     let circle_eval = PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator");
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| circle_coord[i]);
-    let (phi_circle, _jet) = circle_eval.evaluate(coords.view()).expect("circle basis evaluate");
-    let second = circle_eval.second_jet(coords.view()).expect("circle second jet");
+    let (phi_circle, _jet) = circle_eval
+        .evaluate(coords.view())
+        .expect("circle basis evaluate");
+    let second = circle_eval
+        .second_jet(coords.view())
+        .expect("circle second jet");
     let m_cols = phi_circle.ncols();
     let mut s_circle = Array2::<f64>::zeros((m_cols, m_cols));
     for row in 0..n {

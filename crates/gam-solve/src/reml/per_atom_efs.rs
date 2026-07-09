@@ -765,6 +765,7 @@ mod tests {
                 psi_indices: None,
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             })
         }
         fn reset(&mut self) {}

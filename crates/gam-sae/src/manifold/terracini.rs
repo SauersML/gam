@@ -892,12 +892,7 @@ pub fn terracini_scan_sparse_codes(
         let blocks: Vec<ParseBlock> = pattern
             .iter()
             .map(|&k| {
-                parse_block_from_term(
-                    term,
-                    k,
-                    row,
-                    sparse_code_amplitude(indices, codes, row, k),
-                )
+                parse_block_from_term(term, k, row, sparse_code_amplitude(indices, codes, row, k))
             })
             .collect();
         if cfg.pair_pass {
@@ -956,11 +951,21 @@ mod tests {
                 0.0,
             )
             .unwrap();
-            assert!((cert.margin - (1.0 - c).sqrt()).abs() < 1e-9, "θ={theta} margin {}", cert.margin);
+            assert!(
+                (cert.margin - (1.0 - c).sqrt()).abs() < 1e-9,
+                "θ={theta} margin {}",
+                cert.margin
+            );
             let want_excess = 2.0 * c * c / (1.0 - c * c);
-            assert!((cert.whitened_excess - want_excess).abs() < 1e-9, "θ={theta} excess");
+            assert!(
+                (cert.whitened_excess - want_excess).abs() < 1e-9,
+                "θ={theta} excess"
+            );
             let want_logdet = (1.0 - c * c).ln();
-            assert!((cert.cross_gram_logdet - want_logdet).abs() < 1e-9, "θ={theta} logdet");
+            assert!(
+                (cert.cross_gram_logdet - want_logdet).abs() < 1e-9,
+                "θ={theta} logdet"
+            );
             assert_eq!(cert.pattern, vec![0, 1]);
         }
     }
@@ -971,11 +976,19 @@ mod tests {
         // non-trivial 2-atom parse with tangents.
         let mut ta = Array2::<f64>::zeros((4, 1));
         ta[[1, 0]] = 2.0;
-        let a = ParseBlock { atom: 0, value: Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]), tangent: ta };
+        let a = ParseBlock {
+            atom: 0,
+            value: Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0]),
+            tangent: ta,
+        };
         let mut tb = Array2::<f64>::zeros((4, 1));
         tb[[1, 0]] = 0.5;
         tb[[3, 0]] = 1.0;
-        let b = ParseBlock { atom: 1, value: Array1::from_vec(vec![0.0, 0.0, 1.0, 0.0]), tangent: tb };
+        let b = ParseBlock {
+            atom: 1,
+            value: Array1::from_vec(vec![0.0, 0.0, 1.0, 0.0]),
+            tangent: tb,
+        };
         let cert = parse_certificate(&[a.clone(), b.clone()], 1.0, 0.0).unwrap();
         let ka = a.stacked().unwrap();
         let kb = b.stacked().unwrap();
@@ -990,13 +1003,19 @@ mod tests {
         let evals = jtj.eigh(Side::Lower).unwrap().0;
         let ref_logdet: f64 = evals.iter().map(|&x| x.ln()).sum();
         let split = cert.per_atom_logdet.iter().sum::<f64>() + cert.cross_gram_logdet;
-        assert!((split - ref_logdet).abs() < 1e-9, "split {split} vs {ref_logdet}");
+        assert!(
+            (split - ref_logdet).abs() < 1e-9,
+            "split {split} vs {ref_logdet}"
+        );
     }
 
     #[test]
     fn orthogonal_is_perfectly_conditioned() {
         let cert = parse_certificate(
-            &[unit_block(0, &[1.0, 0.0, 0.0]), unit_block(1, &[0.0, 1.0, 0.0])],
+            &[
+                unit_block(0, &[1.0, 0.0, 0.0]),
+                unit_block(1, &[0.0, 1.0, 0.0]),
+            ],
             2.0,
             0.0,
         )
@@ -1010,7 +1029,10 @@ mod tests {
     fn collision_diverges() {
         let eps: f64 = 1e-6;
         let cert = parse_certificate(
-            &[unit_block(0, &[1.0, 0.0]), unit_block(1, &[(eps).cos(), (eps).sin()])],
+            &[
+                unit_block(0, &[1.0, 0.0]),
+                unit_block(1, &[(eps).cos(), (eps).sin()]),
+            ],
             1.0,
             0.0,
         )
@@ -1066,7 +1088,10 @@ mod tests {
         )
         .unwrap();
         let collided = parse_certificate(
-            &[unit_block(2, &[1.0, 0.0]), unit_block(3, &[(0.008_f64).cos(), (0.008_f64).sin()])],
+            &[
+                unit_block(2, &[1.0, 0.0]),
+                unit_block(3, &[(0.008_f64).cos(), (0.008_f64).sin()]),
+            ],
             1.0,
             0.0,
         )
@@ -1110,5 +1135,4 @@ mod tests {
             assert!(seen.contains(&a), "atom {a} not covered");
         }
     }
-
 }

@@ -164,7 +164,8 @@ fn component_image_frame(
         .matrix
         .svd(true, false)
         .map_err(|e| format!("component_image_frame: SVD failed: {e}"))?;
-    let u = u_opt.ok_or_else(|| "component_image_frame: SVD returned no left factor".to_string())?;
+    let u =
+        u_opt.ok_or_else(|| "component_image_frame: SVD returned no left factor".to_string())?;
     let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
     if !(max_sv > 0.0) {
         return Err("component_image_frame: zero component image is not chartable".to_string());

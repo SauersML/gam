@@ -426,7 +426,11 @@ fn fit_residual_covariance_on(
 /// by construction is then reachable. When the pooled residual already routes (small
 /// `K`, or a globally dominant direction) the screen changes nothing — the pooled
 /// residual is mined, bit-for-bit as before.
-fn birth_mining_residual(term: &SaeManifoldTerm, target: ArrayView2<'_, f64>, config: &StagewiseConfig) -> Result<Array2<f64>, String> {
+fn birth_mining_residual(
+    term: &SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    config: &StagewiseConfig,
+) -> Result<Array2<f64>, String> {
     let pooled = current_residual(term, target)?;
     let (n, p) = pooled.dim();
     if n == 0 || p < 2 {
@@ -819,9 +823,7 @@ fn residual_principal_birth_candidate(
             .flatten();
         if let Some(cand) = joint_span_parts
             .as_ref()
-            .and_then(|span| {
-                isa_extract_certified_plane(residual, span, &IsaSeedConfig::default())
-            })
+            .and_then(|span| isa_extract_certified_plane(residual, span, &IsaSeedConfig::default()))
         {
             // Decoder on the cos/sin harmonic rows at the LS harmonic
             // amplitudes; phase chart + own-presence gate carried through
@@ -1902,7 +1904,14 @@ fn race_birth_seed(
     };
     let (mut cand_term, mut cand_rho) = born_move?;
     cand_term.set_guards_enabled(false);
-    fit_single_atom_response_in_place(&mut cand_term, &mut cand_rho, k, residual, registry, config)?;
+    fit_single_atom_response_in_place(
+        &mut cand_term,
+        &mut cand_rho,
+        k,
+        residual,
+        registry,
+        config,
+    )?;
     let (reml, _) = frozen_joint_evidence(&mut cand_term, target, &cand_rho, registry, config)?;
     let ev = ev_of(&cand_term, target);
     // Support: a circle seed's own-presence gate marks the rows it can fire on
@@ -1934,7 +1943,9 @@ fn race_birth_seed(
     // and so never co-accept two truly output-disjoint circles).
     let out_thresh = 1e-2 * total_energy;
     let out_support: Vec<usize> = (0..p_out).filter(|&j| col_energy[j] > out_thresh).collect();
-    let born_logit_col: Vec<f64> = (0..n).map(|r| cand_term.assignment.logits[[r, k]]).collect();
+    let born_logit_col: Vec<f64> = (0..n)
+        .map(|r| cand_term.assignment.logits[[r, k]])
+        .collect();
     Ok(RacedCandidate {
         born_atom: cand_term.atoms[k].clone(),
         born_coord: cand_term.assignment.coords[k].clone(),
@@ -2147,7 +2158,9 @@ pub fn fit_stagewise_batched(
         // `.ok()`), never aborting the round.
         let raced: Vec<RacedCandidate> = seeds
             .par_iter()
-            .filter_map(|s| race_birth_seed(&term, &rho, s, residual.view(), target, registry, base).ok())
+            .filter_map(|s| {
+                race_birth_seed(&term, &rho, s, residual.view(), target, registry, base).ok()
+            })
             .collect();
 
         // Birth gate: strictly-improved joint evidence AND ΔEV ≥ the minimum-effect
@@ -3477,13 +3490,27 @@ mod tests {
 
         let r0 = current_residual(&seed, target.view()).unwrap();
         // Batched: B raced against the ORIGINAL residual R0.
-        let b_batched =
-            race_birth_seed(&seed, &rho, &seed_b, r0.view(), target.view(), None, &config)
-                .expect("race B against R0");
+        let b_batched = race_birth_seed(
+            &seed,
+            &rho,
+            &seed_b,
+            r0.view(),
+            target.view(),
+            None,
+            &config,
+        )
+        .expect("race B against R0");
         // Serial: accept A first, deflate to R1, then race B against R1.
-        let a =
-            race_birth_seed(&seed, &rho, &seed_a, r0.view(), target.view(), None, &config)
-                .expect("race A against R0");
+        let a = race_birth_seed(
+            &seed,
+            &rho,
+            &seed_a,
+            r0.view(),
+            target.view(),
+            None,
+            &config,
+        )
+        .expect("race A against R0");
         let (term_a, rho_a) = append_fitted_atom(
             &seed,
             &rho,
@@ -3507,9 +3534,16 @@ mod tests {
             rows_b_diff < 1e-9,
             "R0 and R1 must be identical on B's disjoint rows; L1 diff {rows_b_diff}"
         );
-        let b_serial =
-            race_birth_seed(&term_a, &rho_a, &seed_b, r1.view(), target.view(), None, &config)
-                .expect("race B against R1");
+        let b_serial = race_birth_seed(
+            &term_a,
+            &rho_a,
+            &seed_b,
+            r1.view(),
+            target.view(),
+            None,
+            &config,
+        )
+        .expect("race B against R1");
 
         let d_batched = &b_batched.born_atom.decoder_coefficients;
         let d_serial = &b_serial.born_atom.decoder_coefficients;
@@ -3588,8 +3622,17 @@ mod tests {
         };
 
         let (seed_s, rho_s) = build_seed();
-        let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None, None)
-            .expect("serial driver");
+        let serial = fit_stagewise(
+            seed_s,
+            rho_s,
+            target.view(),
+            None,
+            None,
+            &config,
+            None,
+            None,
+        )
+        .expect("serial driver");
         assert!(
             serial.report.births_accepted >= 2,
             "serial driver must grow K on the planted {q}-circle image for the parity \
@@ -3677,9 +3720,16 @@ mod tests {
         });
         let r0 = current_residual(&seed_t, target.view()).unwrap();
         let sa = disjoint_circle_seed(n, p, 0, 1, &(0..n).collect::<Vec<_>>());
-        let template =
-            race_birth_seed(&seed_t, &rho_t, &sa, r0.view(), target.view(), None, &config)
-                .expect("race template");
+        let template = race_birth_seed(
+            &seed_t,
+            &rho_t,
+            &sa,
+            r0.view(),
+            target.view(),
+            None,
+            &config,
+        )
+        .expect("race template");
         let with_support = |rows: Vec<usize>, dims: Vec<usize>| -> RacedCandidate {
             let mut c = template.clone();
             c.support = rows;

@@ -1369,10 +1369,7 @@ fn vec_norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
-#[inline]
-fn softplus(eta: f64) -> f64 {
-    eta.max(0.0) + (-eta.abs()).exp().ln_1p()
-}
+use gam_linalg::utils::stable_softplus as softplus;
 
 /// Canonical-link GLM families supported by the certified z-homotopy
 /// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate

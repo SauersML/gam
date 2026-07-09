@@ -304,17 +304,18 @@ fn atlas_nerve_recovers_circle_and_arc() {
 #[test]
 fn torus_two_h1_generators_resolution_robust_2159() {
     for &(nu, nv) in &[(12usize, 10usize), (14, 12), (16, 14), (10, 8)] {
-        let clifford = topology_persistence_verdict(
-            torus_points(nu, nv).view(),
-            &SaeAtomBasisKind::Torus,
-        )
-        .expect("torus atom has a topology prediction");
+        let clifford =
+            topology_persistence_verdict(torus_points(nu, nv).view(), &SaeAtomBasisKind::Torus)
+                .expect("torus atom has a topology prediction");
         assert_eq!(
             clifford.measured_betti.b1, 2,
             "Clifford torus {nu}×{nv} must measure two H1 generators; note: {}; H1: {:?}",
             clifford.note, clifford.h1
         );
-        assert_eq!(clifford.measured_betti.b0, 1, "torus {nu}×{nv} is connected");
+        assert_eq!(
+            clifford.measured_betti.b0, 1,
+            "torus {nu}×{nv} is connected"
+        );
 
         let embedded = topology_persistence_verdict(
             embedded_torus_points(nu, nv, 2.5, 1.5).view(),

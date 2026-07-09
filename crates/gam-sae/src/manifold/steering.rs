@@ -213,8 +213,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             for c in 0..p {
-                out[[out_row, c]] =
-                    a * (steered_decode[[out_row, c]] - base_decode[[out_row, c]]);
+                out[[out_row, c]] = a * (steered_decode[[out_row, c]] - base_decode[[out_row, c]]);
             }
         }
         Ok(out)

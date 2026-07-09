@@ -242,8 +242,7 @@ fn freeze_contract_bypasses_the_bundle() {
         "the freeze lane must never run the basin envelope"
     );
     assert_eq!(
-        telemetry.basin_max_members,
-        0,
+        telemetry.basin_max_members, 0,
         "the freeze lane must never seed the basin bundle"
     );
 }

@@ -44,7 +44,8 @@ fn augmented_decoder(m: usize, angles: &[f64], block_log_lambda: &[f64]) -> Arra
             let sqrt_lambda = (0.5 * block_log_lambda[layer - 1]).exp();
             block.mapv_inplace(|v| v * sqrt_lambda);
         }
-        d.slice_mut(s![.., layer * P..(layer + 1) * P]).assign(&block);
+        d.slice_mut(s![.., layer * P..(layer + 1) * P])
+            .assign(&block);
     }
     d
 }
@@ -94,7 +95,9 @@ fn build_term(
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
 
-    let labels: Vec<String> = (0..block_dims.len()).map(|l| format!("layer{}", l + 1)).collect();
+    let labels: Vec<String> = (0..block_dims.len())
+        .map(|l| format!("layer{}", l + 1))
+        .collect();
     let layout = CrosscoderLayout::new(P, block_dims, labels, block_log_lambda).unwrap();
     (term, layout)
 }
@@ -126,13 +129,33 @@ fn drift_recovers_planted_layer_rotations() {
 
     // Step 0: anchor(0) → block0(0.3), a 0.3 rad rotation of the second direction.
     let step0 = &report.steps[0];
-    assert_close(step0.max_principal_angle(), 0.3, 1e-9, "step0 max principal angle");
-    assert_close(step0.drift, (1.0 - 0.3_f64.cos()).sqrt(), 1e-9, "step0 drift");
+    assert_close(
+        step0.max_principal_angle(),
+        0.3,
+        1e-9,
+        "step0 max principal angle",
+    );
+    assert_close(
+        step0.drift,
+        (1.0 - 0.3_f64.cos()).sqrt(),
+        1e-9,
+        "step0 drift",
+    );
 
     // Step 1: block0(0.3) → block1(0.7), a 0.4 rad rotation.
     let step1 = &report.steps[1];
-    assert_close(step1.max_principal_angle(), 0.4, 1e-9, "step1 max principal angle");
-    assert_close(step1.drift, (1.0 - 0.4_f64.cos()).sqrt(), 1e-9, "step1 drift");
+    assert_close(
+        step1.max_principal_angle(),
+        0.4,
+        1e-9,
+        "step1 max principal angle",
+    );
+    assert_close(
+        step1.drift,
+        (1.0 - 0.4_f64.cos()).sqrt(),
+        1e-9,
+        "step1 drift",
+    );
 
     let profile = report.atom_drift_profile(0);
     assert_eq!(profile.len(), 2);
@@ -156,14 +179,18 @@ fn honest_drift_is_invariant_to_block_lambda() {
     // as the λ = 1 (log λ = 0) case — λ_ℓ cancels in the honest decoder.
     let angles = vec![0.0, 0.3, 0.7];
     let (term_unit, layout_unit) = build_term(&[angles.clone()], vec![P, P], vec![0.0, 0.0]);
-    let (term_scaled, layout_scaled) =
-        build_term(&[angles], vec![P, P], vec![1.3, -0.8]);
+    let (term_scaled, layout_scaled) = build_term(&[angles], vec![P, P], vec![1.3, -0.8]);
 
     let a = measure_crosscoder_drift(&term_unit, &layout_unit).unwrap();
     let b = measure_crosscoder_drift(&term_scaled, &layout_scaled).unwrap();
 
     for (sa, sb) in a.steps.iter().zip(b.steps.iter()) {
-        assert_close(sb.drift, sa.drift, 1e-12, "λ-scaled drift matches unit-λ drift");
+        assert_close(
+            sb.drift,
+            sa.drift,
+            1e-12,
+            "λ-scaled drift matches unit-λ drift",
+        );
         assert_close(
             sb.max_principal_angle(),
             sa.max_principal_angle(),
@@ -183,9 +210,19 @@ fn ranking_picks_most_and_least_drifting_atoms() {
 
     assert_eq!(report.num_atoms, 2);
     // Atom 1's blocks are identical across layers ⇒ zero drift, zero rotation.
-    assert_close(report.atom_total_drift(1), 0.0, 1e-12, "stable atom total drift");
+    assert_close(
+        report.atom_total_drift(1),
+        0.0,
+        1e-12,
+        "stable atom total drift",
+    );
     for s in report.steps.iter().filter(|s| s.atom == 1) {
-        assert_close(s.max_principal_angle(), 0.0, 1e-9, "stable atom principal angle");
+        assert_close(
+            s.max_principal_angle(),
+            0.0,
+            1e-9,
+            "stable atom principal angle",
+        );
     }
     assert!(report.atom_total_drift(0) > 0.0, "moving atom must drift");
 
@@ -201,7 +238,10 @@ fn rejects_layout_that_does_not_describe_the_term() {
     // A layout whose total width disagrees with the term's augmented width.
     let bad = CrosscoderLayout::new(P, vec![P + 1], vec!["x".into()], vec![0.0]).unwrap();
     let err = measure_crosscoder_drift(&term, &bad).unwrap_err();
-    assert!(err.contains("!= term output_dim"), "unexpected error: {err}");
+    assert!(
+        err.contains("!= term output_dim"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -215,9 +255,13 @@ fn rejects_layers_of_differing_ambient_width() {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
     let p_tot = P + P + (P - 1);
-    let decoder = Array2::<f64>::from_shape_fn((m, p_tot), |(r, c)| {
-        if r == 0 && c == 0 { 1.0 } else { 0.0 }
-    });
+    let decoder =
+        Array2::<f64>::from_shape_fn(
+            (m, p_tot),
+            |(r, c)| {
+                if r == 0 && c == 0 { 1.0 } else { 0.0 }
+            },
+        );
     let atom = SaeManifoldAtom::new(
         "cc",
         SaeAtomBasisKind::Periodic,
@@ -246,5 +290,8 @@ fn rejects_layers_of_differing_ambient_width() {
     )
     .unwrap();
     let err = measure_crosscoder_drift(&term, &ragged).unwrap_err();
-    assert!(err.contains("layer widths differ"), "unexpected error: {err}");
+    assert!(
+        err.contains("layer widths differ"),
+        "unexpected error: {err}"
+    );
 }

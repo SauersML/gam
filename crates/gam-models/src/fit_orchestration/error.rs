@@ -153,6 +153,16 @@ impl From<&str> for WorkflowError {
     }
 }
 
+impl From<crate::survival::lognormal_kernel::LognormalKernelError> for WorkflowError {
+    fn from(err: crate::survival::lognormal_kernel::LognormalKernelError) -> Self {
+        match err {
+            crate::survival::lognormal_kernel::LognormalKernelError::InvalidSpec { reason } => {
+                Self::InvalidConfig { reason }
+            }
+        }
+    }
+}
+
 /// Cross-module cascade: a `FormulaDslError` raised inside `materialize` /
 /// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
 /// up with its parser-layer source attached instead of stringifying into a

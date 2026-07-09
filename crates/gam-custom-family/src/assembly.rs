@@ -591,6 +591,7 @@ pub(crate) fn unified_joint_efs_eval(
             },
             inner_hessian_scale,
             logdet_enclosure_gap: None,
+            consecutive_restored_incumbents: None,
         })
     } else {
         let inner_hessian_scale =
@@ -603,6 +604,7 @@ pub(crate) fn unified_joint_efs_eval(
             psi_indices: None,
             inner_hessian_scale,
             logdet_enclosure_gap: None,
+            consecutive_restored_incumbents: None,
         })
     }
 }

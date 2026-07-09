@@ -103,10 +103,7 @@ struct RadiusLaw {
 fn radius_law(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> Result<RadiusLaw, String> {
     let n = alpha.len();
     if beta.len() != n {
-        return Err(format!(
-            "curl: α len {n} != β len {}",
-            beta.len()
-        ));
+        return Err(format!("curl: α len {n} != β len {}", beta.len()));
     }
     if n < 2 {
         return Err("curl: need at least 2 rows for the radius law".to_string());
@@ -229,8 +226,7 @@ pub fn curl_verdict(
     let not_diameter = resultant2 < 0.5;
 
     let rd_pays = radius > sigma * RD_CROSSOVER_FACTOR && net_evidence_nats > 0.0;
-    let recommend_curl =
-        z_below_gaussian > CURL_Z && rd_pays && coverage_ok && not_diameter;
+    let recommend_curl = z_below_gaussian > CURL_Z && rd_pays && coverage_ok && not_diameter;
 
     Ok(CurlVerdict {
         kappa: law.kappa,
@@ -721,7 +717,11 @@ mod tests {
             beta[i] = 2.0 * lcg_normal(&mut s);
         }
         let v = curl_verdict(alpha.view(), beta.view(), sigma, n as f64, 50.0).unwrap();
-        assert!((v.kappa - 2.0).abs() < 0.15, "Gaussian fill κ≈2, got {}", v.kappa);
+        assert!(
+            (v.kappa - 2.0).abs() < 0.15,
+            "Gaussian fill κ≈2, got {}",
+            v.kappa
+        );
         assert!(!v.recommend_curl, "Gaussian fill must be rejected");
     }
 
@@ -748,9 +748,20 @@ mod tests {
                 pts[[i, j]] = center[j] + a * u[j] + b * v[j];
             }
         }
-        let seed = curl_seed(u.view(), v.view(), alpha.view(), beta.view(), 3, center.view())
-            .unwrap();
-        assert!((seed.radius - radius).abs() < 1e-9, "radius {}", seed.radius);
+        let seed = curl_seed(
+            u.view(),
+            v.view(),
+            alpha.view(),
+            beta.view(),
+            3,
+            center.view(),
+        )
+        .unwrap();
+        assert!(
+            (seed.radius - radius).abs() < 1e-9,
+            "radius {}",
+            seed.radius
+        );
         let mut max_err = 0.0_f64;
         for i in 0..n {
             let rec = seed.reconstruct(seed.theta_turns[i]);
@@ -806,7 +817,11 @@ mod tests {
             angles[i] = TAU * lcg(&mut s);
         }
         let v = flatten_verdict(radii.view(), angles.view()).unwrap();
-        assert!(!v.recommend_flatten, "healthy ring must not flatten (κ={:.3} R2={:.3})", v.kappa, v.resultant2);
+        assert!(
+            !v.recommend_flatten,
+            "healthy ring must not flatten (κ={:.3} R2={:.3})",
+            v.kappa, v.resultant2
+        );
     }
 
     #[test]
@@ -822,14 +837,17 @@ mod tests {
         vp[1] = 1.0;
         let vn = vp.mapv(|x| -x); // −v
         // Disjoint quarter-arc gates: rows 0..100 fire +u, 100..200 +v, etc.
-        let mask = |lo: usize, hi: usize| -> Vec<bool> {
-            (0..n).map(|r| r >= lo && r < hi).collect()
-        };
+        let mask =
+            |lo: usize, hi: usize| -> Vec<bool> { (0..n).map(|r| r >= lo && r < hi).collect() };
         let dirs = [up.view(), un.view(), vp.view(), vn.view()];
         let active = vec![mask(0, 100), mask(200, 300), mask(100, 200), mask(300, 400)];
         let ids = [10usize, 11, 12, 13];
         let signed = coalesce_antipodal(&dirs, &active, &ids, -0.9, 0.1);
-        assert_eq!(signed.len(), 2, "four halves must coalesce into two signed axes");
+        assert_eq!(
+            signed.len(),
+            2,
+            "four halves must coalesce into two signed axes"
+        );
         for sd in &signed {
             assert_eq!(sd.members.len(), 2, "each signed axis merges a ± pair");
             // Union gate covers both halves' rows (200 active).
@@ -893,6 +911,9 @@ mod tests {
         led.tick();
         assert!(led.blocked(&[1, 2, 3]));
         led.tick();
-        assert!(!led.blocked(&[1, 2, 3]), "cooldown must expire after c ticks");
+        assert!(
+            !led.blocked(&[1, 2, 3]),
+            "cooldown must expire after c ticks"
+        );
     }
 }

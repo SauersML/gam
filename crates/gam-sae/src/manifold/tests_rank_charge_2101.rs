@@ -37,7 +37,9 @@ fn lcg_normal(s: &mut u64) -> f64 {
 /// true phase, amp 1, noise 0.05. Returns the fitted term + rho.
 fn fitted_circle_term(n: usize, p: usize) -> (SaeManifoldTerm, SaeManifoldRho) {
     let mut s = 0x2101_B1C_0000_0005u64;
-    let theta: Vec<f64> = (0..n).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect();
+    let theta: Vec<f64> = (0..n)
+        .map(|_| std::f64::consts::TAU * lcg(&mut s))
+        .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         x[[i, 0]] += theta[i].cos();
@@ -47,8 +49,7 @@ fn fitted_circle_term(n: usize, p: usize) -> (SaeManifoldTerm, SaeManifoldRho) {
         }
     }
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
-    let coords =
-        Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r] / std::f64::consts::TAU);
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| theta[r] / std::f64::consts::TAU);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
@@ -89,7 +90,9 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     let (_v, loss, cache) = term
         .reml_criterion_with_cache(unit_target(&term).view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap_or_else(|_| panic!("reml pass"));
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
+    let disp = term
+        .reconstruction_dispersion(&loss, &cache, &rho, None)
+        .unwrap();
     drop((loss, cache));
 
     let d_real = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
@@ -113,11 +116,12 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
 
     // Vanishing: shrink the decoder → singular values ≪ noise floor → d_eff→0.
     let saved = term.atoms[0].decoder_coefficients.clone();
-    term.atoms[0]
-        .decoder_coefficients
-        .assign(&(&saved * 1e-4));
+    term.atoms[0].decoder_coefficients.assign(&(&saved * 1e-4));
     let d_vanish = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
-    eprintln!("[rank-charge] vanishing (decoder×1e-4) d_eff={:.5} → charge≈0 (neutral)", d_vanish[0]);
+    eprintln!(
+        "[rank-charge] vanishing (decoder×1e-4) d_eff={:.5} → charge≈0 (neutral)",
+        d_vanish[0]
+    );
     assert!(
         d_vanish[0] < 0.2,
         "vanishing decoder must give d_eff→0 (neutral); got {:.4}",
@@ -150,7 +154,9 @@ fn rank_charge_flag_off_is_inert() {
     let (v_on, _, _) = term
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    eprintln!("[rank-charge] reml OFF={v_off:.4}  ON={v_on:.4}  (ON lowers the circle's complexity)");
+    eprintln!(
+        "[rank-charge] reml OFF={v_off:.4}  ON={v_on:.4}  (ON lowers the circle's complexity)"
+    );
     assert!(
         (v_on - v_off).abs() > 1e-6 && v_on.is_finite(),
         "rank_charge_evidence=true must change the (finite) criterion; off={v_off:.4} on={v_on:.4}"
@@ -172,7 +178,11 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
     let ncirc = 3usize;
     let mut s = 0x2101_C3C_0000_0009u64;
     let theta: Vec<Vec<f64>> = (0..n)
-        .map(|_| (0..ncirc).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect())
+        .map(|_| {
+            (0..ncirc)
+                .map(|_| std::f64::consts::TAU * lcg(&mut s))
+                .collect()
+        })
         .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
@@ -228,11 +238,18 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
     let (v_off, loss, cache) = term
         .reml_criterion_with_cache(x.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
+    let disp = term
+        .reconstruction_dispersion(&loss, &cache, &rho, None)
+        .unwrap();
     drop((loss, cache));
     let d_eff = term.per_atom_realised_rank_dof(&rho, disp).unwrap();
-    eprintln!("[rank-charge K=3] d_eff per atom = {:?}  disp={disp:.5}",
-        d_eff.iter().map(|v| (v*100.0).round()/100.0).collect::<Vec<_>>());
+    eprintln!(
+        "[rank-charge K=3] d_eff per atom = {:?}  disp={disp:.5}",
+        d_eff
+            .iter()
+            .map(|v| (v * 100.0).round() / 100.0)
+            .collect::<Vec<_>>()
+    );
     for (k, &de) in d_eff.iter().enumerate() {
         assert!(
             de > 2.0 && de < 8.0,
@@ -318,7 +335,11 @@ fn rank_charge_k3_decisions_preserved() {
     let ncirc = 3usize;
     let mut s = 0x2101_DEC_0000_0011u64;
     let theta: Vec<Vec<f64>> = (0..n)
-        .map(|_| (0..ncirc).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect())
+        .map(|_| {
+            (0..ncirc)
+                .map(|_| std::f64::consts::TAU * lcg(&mut s))
+                .collect()
+        })
         .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
@@ -437,8 +458,12 @@ fn rank_charge_dense_streaming_parity() {
 
     // d_eff parity through the shared core (identical grams ⇒ identical count).
     let disp = 0.003_f64; // fixed R so both price against the same floor
-    let d_dense = term.rank_dof_from_grams(&dense_grams, &dense_n_eff, &rho, disp).unwrap();
-    let d_stream = term.rank_dof_from_grams(&ri.grams, &ri.n_eff, &rho, disp).unwrap();
+    let d_dense = term
+        .rank_dof_from_grams(&dense_grams, &dense_n_eff, &rho, disp)
+        .unwrap();
+    let d_stream = term
+        .rank_dof_from_grams(&ri.grams, &ri.n_eff, &rho, disp)
+        .unwrap();
     eprintln!("[#9 parity] d_eff dense={d_dense:?} stream={d_stream:?}");
     for k in 0..d_dense.len() {
         assert!(
@@ -475,7 +500,9 @@ fn rank_charge_shared_primitive_parity() {
     let (_v, loss, cache) = term
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
-    let disp = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
+    let disp = term
+        .reconstruction_dispersion(&loss, &cache, &rho, None)
+        .unwrap();
     drop((loss, cache));
 
     // Term-level d_eff (the currency the joint REML charges).
@@ -502,7 +529,10 @@ fn rank_charge_shared_primitive_parity() {
         Some(&term.atoms[0].smooth_penalty),
     )
     .unwrap();
-    eprintln!("[#16 primitive] d_term={:.12} d_free={:.12}", d_term[0], d_free);
+    eprintln!(
+        "[#16 primitive] d_term={:.12} d_free={:.12}",
+        d_term[0], d_free
+    );
     assert_eq!(
         d_term[0], d_free,
         "shared realised_rank_charge_dof must match the term-level pricing bit-for-bit"
@@ -527,7 +557,10 @@ fn rank_charge_vetoes_zero_realised_rank_atom() {
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     eprintln!("[#5 veto] real circle v={v_real:.4} (finite, accepted)");
-    assert!(v_real.is_finite(), "real rank-2 circle must NOT be vetoed: {v_real}");
+    assert!(
+        v_real.is_finite(),
+        "real rank-2 circle must NOT be vetoed: {v_real}"
+    );
 
     // (b) flag ON, VANISHING decoder (×1e-6 → rank_eff=0, d_eff=0) → VETOED (v=+∞).
     term.atoms[0].decoder_coefficients.assign(&(&saved * 1e-6));
@@ -546,7 +579,10 @@ fn rank_charge_vetoes_zero_realised_rank_atom() {
         .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     eprintln!("[#5 veto] flag-off vanishing v={v_off:.4} (finite, historical)");
-    assert!(v_off.is_finite(), "flag-off must not veto (byte-identical historical): {v_off}");
+    assert!(
+        v_off.is_finite(),
+        "flag-off must not veto (byte-identical historical): {v_off}"
+    );
     term.atoms[0].decoder_coefficients.assign(&saved);
 }
 
@@ -556,7 +592,9 @@ fn unit_target(term: &SaeManifoldTerm) -> Array2<f64> {
     let n = term.n_obs();
     let p = term.output_dim();
     let mut s = 0x2101_B1C_0000_0005u64;
-    let theta: Vec<f64> = (0..n).map(|_| std::f64::consts::TAU * lcg(&mut s)).collect();
+    let theta: Vec<f64> = (0..n)
+        .map(|_| std::f64::consts::TAU * lcg(&mut s))
+        .collect();
     let mut x = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         x[[i, 0]] += theta[i].cos();

@@ -608,15 +608,8 @@ fn classify_occupancy_weighted_impl(
     let bic_uniform = 0.0_f64;
     let sigma_floor = 1.0 / (2.0 * ess);
 
-    let single = wrapped_gaussian_mixture_bic_weighted(
-        &pts,
-        &w,
-        1,
-        sigma_floor,
-        ln_n,
-        circular,
-        mass,
-    );
+    let single =
+        wrapped_gaussian_mixture_bic_weighted(&pts, &w, 1, sigma_floor, ln_n, circular, mass);
 
     let mut best_law = OccupancyLaw::Uniform;
     let mut best_bic = bic_uniform;
@@ -630,15 +623,9 @@ fn classify_occupancy_weighted_impl(
         if k >= pairs.len() {
             break;
         }
-        if let Some(bic) = wrapped_gaussian_mixture_bic_weighted(
-            &pts,
-            &w,
-            k,
-            sigma_floor,
-            ln_n,
-            circular,
-            mass,
-        ) {
+        if let Some(bic) =
+            wrapped_gaussian_mixture_bic_weighted(&pts, &w, k, sigma_floor, ln_n, circular, mass)
+        {
             if bic < best_bic {
                 best_bic = bic;
                 best_law = OccupancyLaw::Discrete { anchors: k };
@@ -682,9 +669,7 @@ fn wrapped_gaussian_mixture_bic(
     // local optimum and loses to a larger `k` that happens to seed onto data.
     // Quantile init always seeds inside occupied regions, so the true `k` finds
     // its anchors.
-    let mut means: Vec<f64> = (0..k)
-        .map(|j| pts[(j * n) / k.max(1)])
-        .collect();
+    let mut means: Vec<f64> = (0..k).map(|j| pts[(j * n) / k.max(1)]).collect();
     let mut assign = vec![0usize; n];
     for _ in 0..100 {
         let mut changed = false;
@@ -2201,8 +2186,13 @@ mod coordinate_fidelity_tests {
         let raw = Array1::linspace(0.0, 1.0 - 1.0 / n as f64, n);
         let u_arc = Array1::from_iter(raw.iter().map(|&t| (0.5 * t * t + 0.5 * t).rem_euclid(1.0)));
         let unit = Array1::<f64>::ones(raw.len());
-        let (rms0, _) =
-            raw_vs_arclength_defect_weighted(raw.view(), u_arc.view(), unit.view(), &circle(), true);
+        let (rms0, _) = raw_vs_arclength_defect_weighted(
+            raw.view(),
+            u_arc.view(),
+            unit.view(),
+            &circle(),
+            true,
+        );
         // Rotate the raw base point and reflect its orientation: both are the
         // circle's residual gauge, so the aligned defect must not change.
         let rotated = Array1::from_iter(raw.iter().map(|&t| (t + 0.31).rem_euclid(1.0)));

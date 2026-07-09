@@ -110,7 +110,9 @@ impl SaeManifoldTerm {
                     &mut jet_window,
                 )?;
             }
-            let jets = jet_window.pop_front().expect("jet window must be non-empty");
+            let jets = jet_window
+                .pop_front()
+                .expect("jet window must be non-empty");
             let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
             // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
@@ -218,14 +220,10 @@ impl SaeManifoldTerm {
             }
 
             // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
-            // HT row weighting: the assembly writes the majorizer this corrects as
-            // `w_row·max(V'',0)` (the weighted ARD seam in
-            // `construction_arrow_schur_assembly.rs`), so the dropped-curvature
-            // delta `A − B = w_row·min(V'',0)` must carry the SAME full `w_row` —
-            // otherwise the exact operator `A = B + ΔC` no longer equals the
-            // weighted von-Mises curvature `w_row·V''` on a subsample (the prior is
-            // added directly with full `w_row`, NOT through the √w jet seam, so the
-            // correct single factor here is `w_row`, not `√w`). `None` ⇒ w_row = 1.
+            // The assembly writes the mean-one design-weighted majorizer
+            // `w_row·max(V'',0)`, so the dropped-curvature correction must carry
+            // that same `w_row`: `A = B + ΔC` then recovers `w_row·V''` exactly.
+            // The prior is weighted directly, not through the √w data-jet seam.
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
             for (a, va) in jets.vars.iter().enumerate() {
                 let SaeLocalRowVar::Coord { atom, axis } = *va else {
@@ -272,7 +270,7 @@ impl SaeManifoldTerm {
     /// GMRES does not require the exact stationarity Jacobian to be SPD; it
     /// refuses non-convergence instead of returning a negative-curvature CG
     /// iterate as though it were an inverse solve.
-    fn solve_exact_stationarity(
+    pub(crate) fn solve_exact_stationarity(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
@@ -483,10 +481,10 @@ impl SaeManifoldTerm {
         // factors is `B` (Gauss-Newton data curvature, softmax Fisher metric,
         // `max(V'',0)` ARD majorizers): the `½log|B|` Laplace term is consistent
         // with `Γ = ½tr(B⁻¹ ∂B/∂θ)`, but the implicit step is governed by `A`.
-        // `solve_exact_stationarity` applies the TRUE `A⁻¹` via a B⁻¹-
-        // preconditioned Neumann fixed point (`A = B + ΔC`,
-        // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
-        // biased by `(B⁻¹ − A⁻¹)`.
+        // `solve_exact_stationarity` applies the TRUE `A⁻¹` with left-`B`
+        // preconditioned GMRES on `A = B + ΔC`, where
+        // `ΔC = apply_exact_hessian_minus_b`, so the correction is no longer
+        // biased by `(B⁻¹ − A⁻¹)` and does not assume `A` is SPD.
         //
         // A numerical stopping tolerance does not change the mathematical
         // objective.  At the exact inner optimum the envelope theorem cancels

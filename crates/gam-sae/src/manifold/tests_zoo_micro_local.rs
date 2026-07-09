@@ -28,12 +28,9 @@ use ndarray::Array2;
 use std::time::Instant;
 
 fn zoo_fixture(name: &str, n: usize, p: usize) -> Array2<f64> {
-    let path = format!(
-        "{}/tests/data/zoo_micro/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("zoo_micro fixture {path} unreadable: {e}"));
+    let path = format!("{}/tests/data/zoo_micro/{name}", env!("CARGO_MANIFEST_DIR"));
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("zoo_micro fixture {path} unreadable: {e}"));
     assert_eq!(bytes.len(), n * p * 8, "fixture {name} size mismatch");
     let vals: Vec<f64> = bytes
         .chunks_exact(8)

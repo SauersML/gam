@@ -136,6 +136,7 @@ pub(crate) fn nonconverged_outer_efs_result(
             psi_indices: None,
             inner_hessian_scale: None,
             logdet_enclosure_gap: None,
+            consecutive_restored_incumbents: None,
         },
         constrained_warm_start_from_inner(rho, inner),
         false,

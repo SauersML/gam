@@ -178,7 +178,9 @@ fn ln_sphere_fit_removes_flat_spurious_curvature_and_radial_residual() {
     // SPHERE: reconstruct the LN-projected direction (the real code path).
     let (u, _norms) = ln_sphere_project(x.view(), None).unwrap();
     let sph_cv = fit_and_measure(&evaluator, &seed, &u);
-    eprintln!("F4 s={s} planted_cv={cv:.3} | FLAT fit_norm_cv={flat_cv:.4} | SPHERE fit_norm_cv={sph_cv:.4}");
+    eprintln!(
+        "F4 s={s} planted_cv={cv:.3} | FLAT fit_norm_cv={flat_cv:.4} | SPHERE fit_norm_cv={sph_cv:.4}"
+    );
 
     // The flat fit absorbs the θ-independent norm variation into its reconstruction
     // (fitted output norms swing with the planted r, forcing radial curvature); the

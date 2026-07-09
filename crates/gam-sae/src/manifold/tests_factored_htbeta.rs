@@ -511,7 +511,11 @@ pub(crate) fn whitened_frames_974_native_solve_matches_full_b_then_project() {
         let k = col % p;
         // A row-dependent near-diagonal factor with off-diagonal coupling.
         let diag = 1.0 + 0.5 * ((row + i) as f64).sin();
-        let off = if i != k { 0.15 * (((row + 1) * (i + k + 1)) as f64).cos() } else { 0.0 };
+        let off = if i != k {
+            0.15 * (((row + 1) * (i + k + 1)) as f64).cos()
+        } else {
+            0.0
+        };
         if i == k { diag } else { off }
     });
     let metric = RowMetric::whitened_structured(Arc::new(u), p, p).unwrap();

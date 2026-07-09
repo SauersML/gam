@@ -29,14 +29,24 @@
 //! ```
 //!
 //! With isotropic noise `cov(z) = σ² I₂`, the delta method gives
-//! `Var(θ̂) = σ² ‖∇θ‖² = σ²/‖z‖²`, hence
+//! `Var(θ̂) = σ² ‖∇θ‖² = σ²/a²`, where the gradient is evaluated at the TRUE point
+//! `z = a·u(t₀)` (so `‖z‖ = a`), not at the noisy observation. The `σ²` here is the
+//! variance of the noise component TANGENTIAL to the circle (the component that
+//! moves the phase); under isotropy it equals the radial variance, so the same `σ̂`
+//! estimated from radial scatter also serves the phase. Hence
 //!
 //! ```text
-//!   SD(t̂) = SD(θ̂)/(2π) = σ / (2π ‖z‖).
+//!   SD(t̂) = SD(θ̂)/(2π) = σ / (2π a).
 //! ```
 //!
-//! **Amplitude.** The estimator is `â = ‖z‖`. Its gradient is the unit radial
-//! `∂‖z‖/∂z = z/‖z‖` (norm 1), so `Var(â) = σ²·1` and `SD(â) ≈ σ`.
+//! The plug-in must use the true amplitude `a`, which is NOT the observed radius
+//! `‖z‖`: since `E[‖z‖²] = a² + 2σ²`, the noise inflates `‖z‖`, and dividing by it
+//! understates the phase SE in the weak-signal regime. We plug in the bias-corrected
+//! amplitude `â = √max(‖z‖² − 2σ², 0)`, which recovers `‖z‖` at high SNR and → 0 as
+//! the signal vanishes (see the weak-signal regime below).
+//!
+//! **Amplitude.** The reported estimator is `â = ‖z‖`. Its gradient is the unit
+//! radial `∂‖z‖/∂z = z/‖z‖` (norm 1), so `Var(â) = σ²·1` and `SD(â) ≈ σ`.
 //!
 //! # Estimating σ (it is not a knob)
 //!
@@ -62,17 +72,29 @@
 //! is a one-sided guarantee: the SE never silently understates phase
 //! uncertainty from amplitude heterogeneity.
 //!
+//! The phase SE is a propagation of the TANGENTIAL noise scale. With per-firing
+//! free phases the tangential residual is absorbed by the phase estimate and is
+//! not separately identifiable from a single circle's marginal, so we identify it
+//! with the radial-scatter `σ̂` under the isotropy assumption above — the one axis
+//! on which the phase SE is conditional. What the earlier `σ̂/(2π‖z‖)` form got
+//! wrong was orthogonal to this: it evaluated the delta method at the noise-inflated
+//! observed radius instead of the true amplitude, an anti-conservative error at low
+//! SNR that the bias-corrected `â` (below) removes.
+//!
 //! # Weak-signal regime (never NaN)
 //!
-//! The linearised phase SE `σ̂/(2π‖z‖)` diverges as `‖z‖ → 0`, but phase
-//! uncertainty is bounded: the least informative posterior is the uniform
-//! distribution on the unit-circumference parameter `t ∈ [0,1)`, whose standard
-//! deviation is `√(Var U(0,1)) = √(1/12)`. We therefore clamp
-//! `t_se = min(σ̂/(2π‖z‖), √(1/12))` and set [`FiringCoordinate::t_se_clamped`]
-//! whenever the raw SE reaches that uniform ceiling — i.e. once
-//! `‖z‖ ≤ σ̂·√12/(2π)`, the *derived* radius at which the linearised SE meets
-//! the uniform SD (no separate magic threshold). A zero-norm firing maps to the
-//! uniform SD, never a NaN.
+//! The linearised phase SE `σ̂/(2π·â)` diverges as the bias-corrected amplitude
+//! `â = √max(‖z‖² − 2σ̂², 0) → 0`, but phase uncertainty is bounded: the least
+//! informative posterior is the uniform distribution on the unit-circumference
+//! parameter `t ∈ [0,1)`, whose standard deviation is `√(Var U(0,1)) = √(1/12)`.
+//! We therefore clamp `t_se = min(σ̂/(2π·â), √(1/12))` and set
+//! [`FiringCoordinate::t_se_clamped`] whenever the raw SE reaches that uniform
+//! ceiling — i.e. once `â ≤ σ̂·√12/(2π)`, equivalently `‖z‖² ≤ σ̂²·(2 + 12/(2π)²)`,
+//! the *derived* radius at which the linearised SE meets the uniform SD (no
+//! separate magic threshold). A radius at or below the noise floor
+//! (`‖z‖² ≤ 2σ̂²`, so `â = 0`) maps to the uniform SD, never a NaN — including the
+//! pure-noise (`a = 0`) firing whose observed radius is Rayleigh-distributed and
+//! strictly positive but whose phase is genuinely uniform.
 //!
 //! # b = 2H: harmonic charts
 //!
@@ -245,12 +267,27 @@ fn radius_and_sigma(firings: &[(usize, Vec<f64>)]) -> (f64, f64) {
 }
 
 /// Assemble the phase SE for a `b = 2` firing, clamping to the uniform ceiling in
-/// the weak-signal regime. `raw_se = σ̂/(2π‖z‖)`; a zero-norm firing yields the
-/// uniform SD (never NaN).
+/// the weak-signal regime.
+///
+/// The delta method gives `Var(θ̂) = σ_t²/a²` — the TANGENTIAL noise variance over
+/// the squared circle radius — and must be evaluated at the TRUE amplitude `a`, not
+/// the noise-inflated observed radius `‖z‖`. Under the isotropic-noise circle model
+/// `σ_t = σ` (the tangential and radial components of an isotropic Gaussian share
+/// one scale, so the radial-scatter `σ̂` also estimates the phase-relevant
+/// tangential noise), while `E[‖z‖²] = a² + 2σ²`, so the bias-corrected amplitude is
+/// `â = √max(‖z‖² − 2σ², 0)`. Plugging the observed `‖z‖` in place of `â` — as a
+/// naive `σ̂/(2π‖z‖)` does — divides by a radius the noise itself inflated, so it
+/// UNDERSTATES the phase SE in the weak-signal regime (at true `a = 0` the observed
+/// radius is Rayleigh-distributed and strictly positive, yielding a small finite SE
+/// for a phase that is in fact uniform). Evaluating at `â` makes the SE degrade
+/// honestly: as the amplitude vanishes `â → 0`, the raw SE `→ ∞` and clamps to the
+/// uniform-phase ceiling `√(1/12)`. A radius below the noise floor (`‖z‖² ≤ 2σ²`)
+/// leaves the phase unidentified → uniform SD (never NaN).
 fn phase_se_b2(sigma: f64, norm: f64) -> (f64, bool) {
     let ceiling = uniform_phase_sd();
-    let raw = if norm > 0.0 {
-        sigma / (TAU * norm)
+    let amp_sq = norm * norm - 2.0 * sigma * sigma;
+    let raw = if amp_sq > 0.0 {
+        sigma / (TAU * amp_sq.sqrt())
     } else {
         f64::INFINITY
     };
@@ -261,10 +298,11 @@ fn phase_se_b2(sigma: f64, norm: f64) -> (f64, bool) {
     }
 }
 
-/// Per-firing circle-phase coordinate standard error `σ/(2π‖z‖)`, clamped at the
-/// uniform-phase ceiling `√(1/12)` — the bare SE (no clamp flag) [`phase_se_b2`]
-/// exposes for the matched-description-length report column. `σ` is the block's
-/// radial-scatter noise scale, `norm = ‖z‖` the firing radius. A zero-norm firing
+/// Per-firing circle-phase coordinate standard error `σ/(2π·â)` at the
+/// bias-corrected amplitude `â = √max(‖z‖² − 2σ², 0)`, clamped at the uniform-phase
+/// ceiling `√(1/12)` — the bare SE (no clamp flag) [`phase_se_b2`] exposes for the
+/// matched-description-length report column. `σ` is the block's radial-scatter noise
+/// scale, `norm = ‖z‖` the firing radius. A firing at or below the noise floor
 /// returns the uniform ceiling (never NaN).
 pub(crate) fn phase_coordinate_se(sigma: f64, norm: f64) -> f64 {
     phase_se_b2(sigma, norm).0

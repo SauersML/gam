@@ -497,7 +497,10 @@ impl LearnedGraphAtom {
     pub fn certified_compression(&self) -> GraphCompressionReport {
         let readout = self.topology_readout();
         let degrees = self.surviving_degrees();
-        let max_edges = readout.vertices.saturating_mul(readout.vertices.saturating_sub(1)) / 2;
+        let max_edges = readout
+            .vertices
+            .saturating_mul(readout.vertices.saturating_sub(1))
+            / 2;
         let generic = crate::description_length::selection_bits(
             max_edges as i64,
             readout.surviving_edges as i64,
@@ -516,7 +519,11 @@ impl LearnedGraphAtom {
             && degrees.iter().filter(|&&d| d == 2).count() == readout.vertices.saturating_sub(2)
             && self.surviving_edge_weights_are_uniform()
         {
-            Some((GraphCompressionKind::Interval, "interval", 2.0 * log_vertices))
+            Some((
+                GraphCompressionKind::Interval,
+                "interval",
+                2.0 * log_vertices,
+            ))
         } else if matches!(
             self.occupancy,
             OccupancyLaw::Discrete { anchors } if anchors == readout.vertices
@@ -1104,7 +1111,9 @@ impl LearnedGraphAtom {
         let anchors = self.anchors();
         let laplacian = self.surviving_laplacian();
         let (evals, evecs) = laplacian.eigh(Side::Lower).map_err(|e| {
-            format!("LearnedGraphAtom::spectral_decode_basis: Laplacian eigendecomposition failed: {e}")
+            format!(
+                "LearnedGraphAtom::spectral_decode_basis: Laplacian eigendecomposition failed: {e}"
+            )
         })?;
         // Ascending eigenvalue order (faer does not guarantee it).
         let mut order: Vec<usize> = (0..evals.len()).collect();

@@ -21,8 +21,9 @@
 //! 3. **Curved REML, purely in-frame.** The curved chart is fit in the `r`-dim
 //!    in-frame coordinates `Z_g = R_g U_g`; the border is `Σ M_k·r`, the posterior
 //!    covariance is `(M·r)²`, and both are projected back to ambient ON DEMAND.
-//!    Each region pays a held-out `½·d_eff·log n_eff` deviance charge and the
-//!    accepted set is chosen by e-BH.
+//!    Each region pays a held-out `½·d_eff·log n_eff` deviance charge and is
+//!    selected descriptively when its BIC margin and lower confidence bound are
+//!    positive.
 //!
 //! The single evidence currency matches the joint REML gate
 //! (`crate::manifold::rank_charge_dof`); the frame's `r(p−r)` Grassmann degrees of
@@ -37,13 +38,13 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use super::weight_frame_catalog::{WeightFrameCatalog, WeightFrameSource};
 use crate::frames::{
     GrassmannCrossMoment, GrassmannFrame, SAE_FRAME_ACTIVATION_MARGIN,
     SAE_FRAME_MIN_AUTO_OUTPUT_DIM, SAE_FRAME_RANK_CUTOFF,
 };
-use super::weight_frame_catalog::{WeightFrameCatalog, WeightFrameSource};
-use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt};
 use faer::Side;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt};
 
 /// Bytes per `f64`, matching the streaming-plan ledger.
 const BYTES_PER_F64: usize = 8;
@@ -231,9 +232,7 @@ impl InFrameCurvedRegionPrediction {
     }
 
     pub fn ambient_entries_if_materialized(&self) -> usize {
-        self.rows
-            .len()
-            .saturating_mul(self.frame.output_dim())
+        self.rows.len().saturating_mul(self.frame.output_dim())
     }
 
     pub fn materialize_ambient(&self) -> Array2<f64> {
@@ -345,8 +344,9 @@ pub fn fit_inframe_curved_regions(
         return Err("fit_inframe_curved_regions: residual must have p >= 1".to_string());
     }
     if config.frame_rank_min == 0 || config.frame_rank_max < config.frame_rank_min {
-        return Err("fit_inframe_curved_regions: require 1 <= frame_rank_min <= frame_rank_max"
-            .to_string());
+        return Err(
+            "fit_inframe_curved_regions: require 1 <= frame_rank_min <= frame_rank_max".to_string(),
+        );
     }
 
     let mut fits: Vec<Option<RegionFit>> = Vec::with_capacity(regions.len());
@@ -442,7 +442,9 @@ pub fn fit_inframe_curved_weight_frame_catalog(
 ) -> Result<InFrameCurvedResult, String> {
     let p = residual.ncols();
     if p == 0 {
-        return Err("fit_inframe_curved_weight_frame_catalog: residual must have p >= 1".to_string());
+        return Err(
+            "fit_inframe_curved_weight_frame_catalog: residual must have p >= 1".to_string(),
+        );
     }
     if catalog.output_dim() != p {
         return Err(format!(
@@ -489,7 +491,9 @@ pub fn fit_inframe_curved_weight_frame_catalog(
     let ln_n = (n_tokens_total.max(2) as f64).ln();
 
     for (i, occupancy) in occupancies.iter().enumerate() {
-        let entry = catalog.entry(occupancy.frame_index).expect("validated catalog index");
+        let entry = catalog
+            .entry(occupancy.frame_index)
+            .expect("validated catalog index");
         let r = entry.frame.rank();
         let m = occupancy.basis_size;
         let inframe_border_coeffs = m.saturating_mul(r);
@@ -786,12 +790,16 @@ fn empty_evidence(n_rows: usize, frame_rank: usize) -> RegionEvidence {
 /// relative spectral cutoff clamped to the configured band. Returns `None` when
 /// no beneficial low-rank frame exists (rank fills the ambient width, so the
 /// region stays on the certified full-`p` path).
-fn learn_frame(r_g: &Array2<f64>, config: &InFrameCurvedConfig) -> Result<Option<GrassmannFrame>, String> {
+fn learn_frame(
+    r_g: &Array2<f64>,
+    config: &InFrameCurvedConfig,
+) -> Result<Option<GrassmannFrame>, String> {
     let (n_g, p) = r_g.dim();
     let (_u, sv, vt_opt) = r_g
         .svd(false, true)
         .map_err(|e| format!("inframe learn_frame: SVD failed: {e}"))?;
-    let vt = vt_opt.ok_or_else(|| "inframe learn_frame: SVD returned no right factor".to_string())?;
+    let vt =
+        vt_opt.ok_or_else(|| "inframe learn_frame: SVD returned no right factor".to_string())?;
     let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
     if !(max_sv > 0.0) {
         return Ok(None);

@@ -1901,9 +1901,10 @@ pub(crate) fn run_fixed_point_outer_solver(
         barrier_config,
         fixed_point_tolerance: config.tolerance,
         consecutive_psi_zero_iters: 0,
+        last_restored_incumbent_streak: None,
     };
-    match objective.eval_step(seed) {
-        Ok(_) => {}
+    let seed_sample = match objective.eval_step(seed) {
+        Ok(sample) => sample,
         Err(err) => {
             let err = match err {
                 ObjectiveEvalError::Recoverable { message }
@@ -1923,6 +1924,11 @@ pub(crate) fn run_fixed_point_outer_solver(
     let max_iter =
         outer_max_iterations(config.max_iter).map_err(FixedPointOuterRunError::Failed)?;
     let mut optimizer = FixedPoint::new(seed.clone(), objective)
+        // Seed validation already paid the complete EFS inner solve. Reuse that
+        // exact sample so iteration zero neither repeats the expensive solve nor
+        // mistakes two evaluations at the identical rho for recurrent incumbent
+        // evidence (#2241).
+        .with_initial_sample(seed.clone(), seed_sample)
         .with_bounds(bounds)
         .with_tolerance(tol)
         .with_max_iterations(max_iter);

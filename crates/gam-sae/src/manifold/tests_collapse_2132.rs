@@ -69,7 +69,8 @@ fn planted_circle_mixture(n: usize, p: usize, c: usize, sigma: f64, phase_key: u
         for col in 0..p {
             // Box–Muller-free: two independent uniforms averaged approximate a
             // zero-mean symmetric perturbation; scale by sigma. Deterministic.
-            let u = splitmix01((row as u64) << 20 ^ (col as u64).wrapping_mul(0x9E3779B1) ^ phase_key);
+            let u =
+                splitmix01((row as u64) << 20 ^ (col as u64).wrapping_mul(0x9E3779B1) ^ phase_key);
             z[[row, col]] += sigma * (u - 0.5) * 2.0;
         }
     }
@@ -125,7 +126,11 @@ fn pca_heldout_ev(train: ArrayView2<'_, f64>, test: ArrayView2<'_, f64>, rank: u
 /// the `sae_manifold_predict_oos` math: cold coords seeded by decoder-grid
 /// projection, softmax routing logits seeded from per-atom projection residuals,
 /// then the fixed-decoder arrow-Schur coordinate solve under the fit's ρ*.
-pub(crate) fn oos_heldout_ev(fitted_term: &SaeManifoldTerm, rho: &SaeManifoldRho, x: ArrayView2<'_, f64>) -> f64 {
+pub(crate) fn oos_heldout_ev(
+    fitted_term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    x: ArrayView2<'_, f64>,
+) -> f64 {
     let n = x.nrows();
     let k = fitted_term.k_atoms();
     let p = x.ncols();
@@ -145,8 +150,7 @@ pub(crate) fn oos_heldout_ev(fitted_term: &SaeManifoldTerm, rho: &SaeManifoldRho
         fitted_term.assignment.mode.clone(),
     )
     .expect("OOS assignment");
-    let mut term =
-        SaeManifoldTerm::new(fitted_term.atoms.clone(), assignment).expect("OOS term");
+    let mut term = SaeManifoldTerm::new(fitted_term.atoms.clone(), assignment).expect("OOS term");
     term.seed_coords_by_decoder_projection(x, 64)
         .expect("decoder-projection seed");
     // Seed softmax routing logits from per-atom projection residuals — the exact
@@ -184,7 +188,10 @@ pub(crate) fn oos_heldout_ev(fitted_term: &SaeManifoldTerm, rho: &SaeManifoldRho
 /// Run the full production outer cascade (`OuterProblem::run`, the FFI entry) for
 /// a K-atom circle dictionary at the single-PCA-seed budget, returning the fitted
 /// term + terminal ρ* and the native (in-sample) train EV.
-fn fit_circle_dictionary(train: ArrayView2<'_, f64>, k: usize) -> (SaeManifoldTerm, SaeManifoldRho, f64) {
+fn fit_circle_dictionary(
+    train: ArrayView2<'_, f64>,
+    k: usize,
+) -> (SaeManifoldTerm, SaeManifoldRho, f64) {
     let (mut objective, seed) =
         objective_and_seed(train, k, Topo::Circle, AssignmentMode::softmax(1.0));
     let n_params = seed.len();
@@ -216,7 +223,10 @@ fn zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca() {
     // test point up to the planted noise. This is the bar the curved dictionary
     // must MATCH on its own curved structure.
     let pca_2c = pca_heldout_ev(train.view(), test.view(), 2 * C);
-    eprintln!("[collapse-2132] rank-{} held-out PCA EV = {pca_2c:.4}", 2 * C);
+    eprintln!(
+        "[collapse-2132] rank-{} held-out PCA EV = {pca_2c:.4}",
+        2 * C
+    );
 
     let (term_c, rho_c, native_c) = fit_circle_dictionary(train.view(), C);
     let ev_c = oos_heldout_ev(&term_c, &rho_c, test.view());

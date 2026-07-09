@@ -4,12 +4,12 @@
 //! current dictionary's encode-chart geometry; see
 //! [`RoutingPredictor::ChartGeometry`].
 
+use super::outer_objective::reconstruction_explained_variance;
 use super::*;
 use crate::amortized_encoder::{
     AmortizationGap, AmortizedCode, ExactRowSolution, LearnedAmortizedEncoder,
 };
 use crate::encode::joint_encode_fallback_fraction;
-use super::outer_objective::reconstruction_explained_variance;
 
 impl SaeManifoldTerm {
     /// #2 (reviewer condition) — fit the DISTILLED / AMORTIZED encoder against
@@ -448,8 +448,11 @@ mod amortized_encoder_glue_tests {
         )
         .expect("assignment");
         let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
-        let rho =
-            SaeManifoldRho::new(0.0, (0.01_f64).ln(), vec![Array1::zeros(1), Array1::zeros(1)]);
+        let rho = SaeManifoldRho::new(
+            0.0,
+            (0.01_f64).ln(),
+            vec![Array1::zeros(1), Array1::zeros(1)],
+        );
         // The exact amplitudes are the term's OWN masses; generate x from them so
         // the term's exact code reconstructs x exactly (self-consistent).
         let amps = term.fitted_assignment_amplitudes(&rho).expect("masses");

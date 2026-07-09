@@ -193,6 +193,17 @@ pub struct EfsEval {
     /// Logdet enclosure gap diagnostic (lower/upper bound spread) captured at
     /// this EFS evaluation when the bounded-logdet path is active.
     pub logdet_enclosure_gap: Option<f64>,
+    /// Number of consecutive successful inner solves that returned to the same
+    /// banked incumbent after a non-monotone boundary mutation.
+    ///
+    /// `None` means the objective has no restored-incumbent certificate.  `Some`
+    /// is reset to zero whenever the objective banks a genuinely better model.
+    /// Two consecutive restorations are the minimal evidence of recurrence: one
+    /// restoration can be a one-off repair, while the second establishes that
+    /// changing the outer coordinate has returned to the same stationary fitted
+    /// state again.  Fixed-point runners may terminate on that certificate even
+    /// when the raw update keeps moving along an objective-flat parameter ridge.
+    pub consecutive_restored_incumbents: Option<usize>,
 }
 
 impl EfsEval {

@@ -381,7 +381,11 @@ fn dtm_radii(points: ArrayView2<'_, f64>, weights: Option<ArrayView1<'_, f64>>) 
         for j in 0..m {
             let weight = local_weights[j];
             if weight.is_finite() && weight > 0.0 {
-                let distance = if i == j { 0.0 } else { point_distance(points, i, j) };
+                let distance = if i == j {
+                    0.0
+                } else {
+                    point_distance(points, i, j)
+                };
                 neighbors.push((distance, weight));
             }
         }
@@ -997,14 +1001,14 @@ fn topology_persistence_verdict_impl(
     // afford the manifold's covering number of samples, whereas the coarse
     // PERSISTENCE_MAX_POINTS cover (sized for the quartic H₂ tetrahedra) fails to
     // resolve a torus's second generator (#2159).
-    let h1_landmarks = farthest_point_subsample_weighted(points, weights, PERSISTENCE_H1_MAX_POINTS);
+    let h1_landmarks =
+        farthest_point_subsample_weighted(points, weights, PERSISTENCE_H1_MAX_POINTS);
     let h1_sub = points.select(ndarray::Axis(0), &h1_landmarks);
     // P2: fold every discarded row's mass into its nearest retained landmark so the
     // DTM weighting sees the FULL support measure, not just the landmark rows' mass
     // (see `fold_mass_to_landmarks`). A no-op when nothing was subsampled.
     let h1_weights = fold_mass_to_landmarks(points, weights, &h1_landmarks);
-    let h1_diagram =
-        dtm_vietoris_rips_persistence(h1_sub.view(), Some(h1_weights.view()), 1);
+    let h1_diagram = dtm_vietoris_rips_persistence(h1_sub.view(), Some(h1_weights.view()), 1);
     let h1_distances = dtm_weighted_distances(h1_sub.view(), Some(h1_weights.view()));
 
     // H₂ shells (sphere/torus voids) need the quartic tetrahedron enumeration, so
@@ -1296,15 +1300,23 @@ pub fn atlas_nerve(points: ArrayView2<'_, f64>) -> AtlasNerveReport {
         roots.insert(r);
     }
     let n_components = roots.len();
-    let edge_index: HashMap<(usize, usize), usize> =
-        edges.iter().copied().enumerate().map(|(i, edge)| (edge, i)).collect();
+    let edge_index: HashMap<(usize, usize), usize> = edges
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, edge)| (edge, i))
+        .collect();
     let mut boundary_columns = Vec::with_capacity(triangles.len());
     for &(a, b, c) in &triangles {
-        boundary_columns.push(vec![edge_index[&(a, b)], edge_index[&(a, c)], edge_index[&(b, c)]]);
+        boundary_columns.push(vec![
+            edge_index[&(a, b)],
+            edge_index[&(a, c)],
+            edge_index[&(b, c)],
+        ]);
     }
     let triangle_boundary_rank = gf2_column_rank(boundary_columns);
-    let b1 = (n_edges as i64 - v as i64 + n_components as i64 - triangle_boundary_rank as i64)
-        .max(0);
+    let b1 =
+        (n_edges as i64 - v as i64 + n_components as i64 - triangle_boundary_rank as i64).max(0);
     // No population covering-number bound is supplied to this empirical API.
     // `n >= n_charts` is true by construction and conveys no resolution
     // guarantee, so never manufacture the above-covering certificate from it.

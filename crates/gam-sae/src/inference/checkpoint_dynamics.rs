@@ -179,171 +179,6 @@ fn interval_bounds(grid: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
     Ok((lo - pad, hi + pad))
 }
 
-/// Debiased `g^{(c1)}(t_mode) − g^{(c0)}(t_mode)` aggregated over the ambient
-/// dimension into the scalar decoder-displacement size, with a delta-method SE.
-///
-/// Each ambient component is an independent identity-basis ridge fit of the
-/// grid values; the [`SmoothFunctional::Contrast`] of the two checkpoints'
-/// fitted coefficient vectors at the mode node is debiased component-wise via
-/// the Riesz one-step. The component contrasts form a vector `Δ ∈ ℝ^ambient`;
-/// the reported scalar `θ = ‖Δ‖₂` is the displacement size and its SE is the
-/// delta-method norm-gradient `‖Δ‖₂` propagation of the per-component SEs,
-/// assuming component independence (separate fits, separate scores).
-struct ContrastAtMode<'a> {
-    grid: ArrayView4<'a, f64>,
-    atom: usize,
-    c0: usize,
-    c1: usize,
-    ambient_dim: usize,
-    n_grid: usize,
-    hessian: ndarray::ArrayView2<'a, f64>,
-    mode_row: ArrayView1<'a, f64>,
-}
-
-fn contrast_at_mode(args: &ContrastAtMode<'_>) -> Result<RieszDebiasReport, String> {
-    let grid = args.grid;
-    let atom = args.atom;
-    let c0 = args.c0;
-    let c1 = args.c1;
-    let ambient_dim = args.ambient_dim;
-    let n_grid = args.n_grid;
-    let hessian = args.hessian;
-    let mode_row = args.mode_row;
-    // Aggregate scalar contrast Δ = θ_c1 − θ_c0 across ambient components, and
-    // the matching aggregate Riesz quantities, so a single RieszDebiasReport
-    // describes the displacement. We assemble the report from one debiasing per
-    // component and combine through the L2 norm.
-    let mut delta = Array1::<f64>::zeros(ambient_dim);
-    let mut delta_one = Array1::<f64>::zeros(ambient_dim);
-    let mut var_components = Array1::<f64>::zeros(ambient_dim);
-    let mut penalty_bias_acc = 0.0_f64;
-    // A representer to carry: reuse the last component's; the scalar norm
-    // estimate's representer is component-wise so we keep the final one as the
-    // canonical witness (its influence vector studentizes the norm contrast).
-    let mut witness: Option<RieszDebiasReport> = None;
-
-    for comp in 0..ambient_dim {
-        // Per-checkpoint identity-basis ridge fit: response y = grid values,
-        // design X = I, penalty S = I. With H = (1+λ)I the fitted coefficient
-        // is β = y / (1 + λ); the per-node score is sᵢ = (μ̂ᵢ − yᵢ)·eᵢ where
-        // μ̂ = Xβ = β, and the penalty gradient is S·β = β.
-        let y0 = grid.slice(ndarray::s![c0, atom, .., comp]).to_owned();
-        let y1 = grid.slice(ndarray::s![c1, atom, .., comp]).to_owned();
-        let report = component_contrast(y0.view(), y1.view(), n_grid, hessian, mode_row)?;
-
-        delta[comp] = report.theta_plugin;
-        delta_one[comp] = report.theta_onestep;
-        var_components[comp] = report.se * report.se;
-        penalty_bias_acc += report.penalty_bias * report.penalty_bias;
-        witness = Some(report);
-    }
-
-    let theta_plugin = delta.dot(&delta).sqrt();
-    let norm_one = delta_one.dot(&delta_one).sqrt();
-    // Delta method for θ = ‖Δ‖₂: ∂θ/∂Δ_k = Δ_k / ‖Δ‖₂, components independent,
-    // so var(θ) = Σ_k (Δ_k/‖Δ‖₂)² var(Δ_k).
-    let se = if norm_one > f64::MIN_POSITIVE {
-        let mut v = 0.0_f64;
-        for comp in 0..ambient_dim {
-            let g = delta_one[comp] / norm_one;
-            v += g * g * var_components[comp];
-        }
-        v.max(0.0).sqrt()
-    } else {
-        // At a null displacement the norm is non-differentiable; fall back to
-        // the RMS of the component SEs (an honest upper-ish bound on the size).
-        (var_components.sum() / ambient_dim as f64).sqrt()
-    };
-
-    let mut report = witness
-        .ok_or_else(|| "checkpoint contrast requires at least one ambient component".to_string())?;
-    report.theta_plugin = theta_plugin;
-    report.theta_onestep = norm_one;
-    report.se = se;
-    report.penalty_bias = penalty_bias_acc.sqrt();
-    Ok(report)
-}
-
-/// One ambient component's debiased contrast `g^{(c1)}(t_mode) −
-/// g^{(c0)}(t_mode)` through the Riesz one-step.
-fn component_contrast(
-    y0: ArrayView1<'_, f64>,
-    y1: ArrayView1<'_, f64>,
-    n_grid: usize,
-    hessian: ndarray::ArrayView2<'_, f64>,
-    mode_row: ArrayView1<'_, f64>,
-) -> Result<RieszDebiasReport, String> {
-    // Stacked paired-contrast trick: the contrast `m_{c1}(t₀) − m_{c0}(t₀)` is
-    // the difference of one linear functional applied to two coefficient
-    // vectors. Riesz operates on a single fit, so we debias on the DIFFERENCE
-    // fit β_Δ = β_{c1} − β_{c0}, whose response is y₁ − y₀ on the same identity
-    // basis — a genuine fit with the same penalized Hessian. The contrast
-    // functional on β_Δ is then the point evaluation at the mode, packaged via
-    // SmoothFunctional::Contrast against a zero row so the gradient is the mode
-    // row exactly (g = mode_row − 0).
-    let beta0 = y0.mapv(|v| v / (1.0 + GRID_FIT_RIDGE));
-    let beta1 = y1.mapv(|v| v / (1.0 + GRID_FIT_RIDGE));
-    let beta_delta = &beta1 - &beta0;
-
-    let zero_row = Array1::<f64>::zeros(n_grid);
-    let functional = SmoothFunctional::Contrast {
-        design_row_a: mode_row,
-        design_row_b: zero_row.view(),
-    };
-    let gradient = functional
-        .gradient()
-        .map_err(|e| format!("contrast functional gradient failed: {e}"))?;
-
-    // Per-node scores of the difference fit: μ̂ = X β_Δ = β_Δ, response y₁−y₀.
-    let response = &y1.to_owned() - &y0;
-    let mut row_scores = Array2::<f64>::zeros((n_grid, n_grid));
-    for i in 0..n_grid {
-        row_scores[[i, i]] = beta_delta[i] - response[i];
-    }
-    // Penalty gradient S·β_Δ = β_Δ (S = I).
-    let penalty_beta = beta_delta.clone();
-
-    let input = RieszInput {
-        beta: beta_delta.view(),
-        functional_gradient: gradient.view(),
-        row_scores: row_scores.view(),
-        penalty_beta: penalty_beta.view(),
-        leverage: None,
-    };
-    debias_with_dense_hessian(&input, hessian).map_err(|e| format!("Riesz debiasing failed: {e}"))
-}
-
-/// Anytime-valid log-e-value for the no-change null `θ = 0` from the debiased,
-/// studentized displacement `z = θ̂ / se` (local Gaussian `θ̂ ~ N(θ, se²)`).
-///
-/// The naive in-sample likelihood ratio `exp(½ z²)` — the alternative density
-/// re-centered on the very estimate `θ̂` it is scored against — is NOT an
-/// e-value: under H0, `z ~ N(0,1)` and `E[exp(½ z²)] = ∫ φ(z) exp(½ z²) dz`
-/// DIVERGES, so it has no `E_{H0}[E] ≤ 1` guarantee. (Universal inference earns
-/// `exp(½ z²)` validity only with a held-out evaluation fold; a single grid of
-/// decoder values affords no such split.)
-///
-/// Instead we map the displacement to its two-sided normal p-value
-/// `p = 2(1 − Φ(|z|))` and route it through the module's frozen p→e calibrator
-/// [`log_e_from_p_calibrator`] (the κ = ½ member `e(p) = ½ p^{−1/2}`, with
-/// `∫₀¹ e(p) dp = 1`, hence `E_{H0}[e(P)] ≤ 1` for any superuniform p). This is
-/// a genuine e-value: no displacement, small e; a real displacement, large e;
-/// and it compounds validly into the change e-process. A degenerate
-/// (non-positive) SE yields a zero log-e-value (no evidence, not certainty).
-fn no_change_log_e_value(theta_hat: f64, se: f64) -> Result<f64, String> {
-    if !(se > 0.0) || !theta_hat.is_finite() {
-        return Ok(0.0);
-    }
-    let z = (theta_hat / se).abs();
-    let normal =
-        Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
-    // Two-sided p-value of the studentized displacement; clamp to (0, 1] so the
-    // calibrator (which rejects p = 0) sees a finite, valid argument even at a
-    // numerically saturated tail.
-    let p: f64 = (2.0 * (1.0 - normal.cdf(z))).clamp(f64::MIN_POSITIVE, 1.0);
-    log_e_from_p_calibrator(p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn no_change_atom_has_near_zero_contrast_and_no_change_evidence() {
+    fn no_change_atom_has_zero_descriptive_displacement() {
         let n_ckpt = 5;
         // The transport fit requires at least MIN_TRANSPORT_OBS (16) paired
         // grid samples, so the shared latent grid must be at least that long.
@@ -396,27 +231,29 @@ mod tests {
         let traj = checkpoint_atom_dynamics(&input).expect("dynamics");
         assert_eq!(traj.len(), 2);
 
-        // Atom 0 is identical across checkpoints: every step contrast must be
-        // (numerically) zero displacement and accumulate no change evidence.
+        // Atom 0 is identical across checkpoints: every descriptive step change
+        // must be exactly zero displacement (the reported displacement is the
+        // raw decoder-grid difference — no fit, no fabricated SE or e-value).
         let constant = &traj[0];
-        assert_eq!(constant.conditional_step_contrasts.len(), n_ckpt - 1);
-        for report in &constant.conditional_step_contrasts {
-            assert!(
-                report.theta_onestep.abs() < 1e-9,
-                "constant atom step displacement should be ~0, got {}",
-                report.theta_onestep
+        assert_eq!(constant.descriptive_step_changes.len(), n_ckpt - 1);
+        for change in &constant.descriptive_step_changes {
+            assert_eq!(
+                change.l2_at_mode, 0.0,
+                "constant atom mode displacement must be exactly zero"
             );
+            assert_eq!(
+                change.grid_rms_l2, 0.0,
+                "constant atom grid displacement must be exactly zero"
+            );
+            assert_eq!(change.grid_max_l2, 0.0);
         }
-        // No-change null is true here → the e-BH certificate confirms nothing.
-        let cert = constant.change_evidence.certify(0.05);
-        assert!(
-            cert.confirmed().count() == 0,
-            "constant atom must not confirm any change claim"
-        );
+        // The transport across identical checkpoint charts is the identity map
+        // on the shared latent grid — a degree-free, fold-free interval homeo.
+        assert_eq!(constant.transports.len(), n_ckpt - 1);
     }
 
     #[test]
-    fn drifting_atom_recovers_displacement_and_accumulates_change_evidence() {
+    fn drifting_atom_recovers_exact_descriptive_displacement() {
         let n_ckpt = 6;
         let n_grid = 17;
         let ambient = 3;
@@ -434,50 +271,37 @@ mod tests {
         let traj = checkpoint_atom_dynamics(&input).expect("dynamics");
         let drifter = &traj[1];
 
-        // Each consecutive step displaces component 0 at the mode by exactly
-        // `shift`; the reported displacement size is `‖Δ‖₂`. On the light
-        // interpolation ridge (λ = GRID_FIT_RIDGE ≈ 1e-3) the plug-in contrast
-        // `shift/(1+λ)` tracks the true displacement to sub-percent, and every
-        // reported quantity is finite. (The component displacement lives in a
-        // single ambient channel, so the L2 size IS that channel's contrast.)
-        for report in &drifter.conditional_step_contrasts {
+        // Each consecutive step displaces component 0 at the mode node by exactly
+        // `shift` and touches no other node/component. The displacement is the
+        // raw decoder-grid difference, so the mode L2 size is exactly `shift`,
+        // and — since only the single mode node moves — the grid RMS over
+        // `n_grid` nodes is `shift / sqrt(n_grid)`.
+        assert_eq!(drifter.descriptive_step_changes.len(), n_ckpt - 1);
+        for change in &drifter.descriptive_step_changes {
             assert!(
-                (report.theta_plugin - shift).abs() < 1e-2 * shift,
-                "drift step plug-in displacement should track {shift}, got {}",
-                report.theta_plugin
+                (change.l2_at_mode - shift).abs() < 1e-12,
+                "drift mode displacement must equal {shift}, got {}",
+                change.l2_at_mode
             );
+            // Displacement lives in component 0 only.
+            assert!((change.displacement_at_mode[0] - shift).abs() < 1e-12);
+            for comp in 1..ambient {
+                assert_eq!(change.displacement_at_mode[comp], 0.0);
+            }
+            let expected_rms = shift / (n_grid as f64).sqrt();
             assert!(
-                report.theta_onestep.is_finite() && report.se.is_finite(),
-                "debiased displacement and SE must be finite"
+                (change.grid_rms_l2 - expected_rms).abs() < 1e-12,
+                "drift grid RMS must equal {expected_rms}, got {}",
+                change.grid_rms_l2
             );
-            // The displacement is unambiguously positive (a real change).
-            assert!(
-                report.theta_plugin > 0.5 * shift,
-                "drift displacement should be well above zero, got {}",
-                report.theta_plugin
-            );
+            assert!((change.grid_max_l2 - shift).abs() < 1e-12);
         }
-
-        // The drift is real → every step's no-change e-value is strictly
-        // positive (studentized displacement away from zero), so the change
-        // certificate carries strictly positive log-evidence on its claims,
-        // unlike the constant atom whose claims carry exactly zero.
-        let cert = drifter.change_evidence.certify(0.05);
-        let total_log_e: f64 = cert.entries.iter().map(|e| e.log_e).sum();
-        assert!(
-            total_log_e > 0.0,
-            "steady real drift must accumulate positive change evidence, entries: {:?}",
-            cert.entries
-                .iter()
-                .map(|e| (e.log_e, e.confirmed))
-                .collect::<Vec<_>>()
-        );
     }
 
-    /// A drifting atom must out-evidence a constant atom: the change e-process
-    /// is a genuine discriminator, not a constant.
+    /// A drifting atom's descriptive displacement must exceed a constant atom's
+    /// (which is exactly zero): the readout is a genuine change discriminator.
     #[test]
-    fn drift_outweighs_constant_in_change_evidence() {
+    fn drift_displacement_exceeds_constant() {
         let n_ckpt = 6;
         let n_grid = 17;
         let ambient = 3;
@@ -492,23 +316,20 @@ mod tests {
             latent_grid: latent.view(),
         };
         let traj = checkpoint_atom_dynamics(&input).expect("dynamics");
-        let const_log_e: f64 = traj[0]
-            .change_evidence
-            .certify(0.05)
-            .entries
+        let const_total: f64 = traj[0]
+            .descriptive_step_changes
             .iter()
-            .map(|e| e.log_e)
+            .map(|c| c.l2_at_mode)
             .sum();
-        let drift_log_e: f64 = traj[1]
-            .change_evidence
-            .certify(0.05)
-            .entries
+        let drift_total: f64 = traj[1]
+            .descriptive_step_changes
             .iter()
-            .map(|e| e.log_e)
+            .map(|c| c.l2_at_mode)
             .sum();
+        assert_eq!(const_total, 0.0, "constant atom displacement must be zero");
         assert!(
-            drift_log_e > const_log_e,
-            "drift change-evidence {drift_log_e} must exceed constant {const_log_e}"
+            drift_total > const_total,
+            "drift displacement {drift_total} must exceed constant {const_total}"
         );
     }
 

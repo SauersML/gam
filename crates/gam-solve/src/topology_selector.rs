@@ -1578,15 +1578,18 @@ pub struct ClosureSelection<FitHandle> {
     pub route_to_mixture_rung: bool,
 }
 
-/// Profile the closure parameter `γ` over [`CLOSURE_GAMMA_GRID`], returning the
+/// Profile the closure parameter `γ`, returning the continuously refined
 /// minimiser, its profile-likelihood CI, and the representative fit.
 ///
 /// `fit_at_gamma` performs the inner fit at a fixed closure value and returns
 /// `(tk_score, fit_handle)`, where `tk_score` is the profiled
 /// negative-log evidence on the same scale [`tk_normalized_score`] produces (so
 /// γ and λ_smooth must both be optimised inside the closure, per the issue's
-/// confounding contract). Lower score is better. The grid is swept in parallel
-/// via [`run_topology_race_parallel`].
+/// confounding contract). Lower score is better. [`CLOSURE_GAMMA_GRID`] is
+/// swept in parallel via [`run_topology_race_parallel`] to build the
+/// reproducible profile curve for the Wilks CI; γ̂ itself is then refined by
+/// golden-section minimization inside the bracketing interval, so the selected
+/// closure is a continuous optimum, not a grid node.
 pub fn profile_closure_within_smooth_class<FitHandle, FitAtGamma>(
     fit_at_gamma: FitAtGamma,
     level: f64,
@@ -1622,14 +1625,66 @@ where
     let grid: Vec<(f64, f64)> = points.iter().map(|p| (p.gamma, p.tk_score)).collect();
     let ci = gam_geometry::profile_ci_from_grid(&grid, level)?;
 
-    // Pull the representative γ̂ fit out of the points (the minimiser).
+    // Pull the curve minimiser out of the points.
     let hat_index = points
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| a.tk_score.partial_cmp(&b.tk_score).expect("finite score"))
         .map(|(i, _)| i)
         .expect("non-empty points");
-    let representative = points.swap_remove(hat_index);
+    let mut representative = points.swap_remove(hat_index);
+
+    // Continuous γ̂ refinement (SPEC: grid search is never allowed). The fixed
+    // grid supplies only the reproducible profile CURVE behind the Wilks CI;
+    // the headline γ̂ is then refined by deterministic golden-section
+    // minimization on the interval bracketing the curve minimum — the same
+    // coarse-curve + golden-section pattern `fit_spline_scan` uses for log λ.
+    // The best profiled evidence among the grid minimiser and the refinement
+    // iterates wins, so refinement can only improve γ̂, and a boundary-pinned
+    // minimiser (γ̂ ∈ {0, 1}) survives unless the interior genuinely beats it.
+    const CLOSURE_GAMMA_TOL: f64 = 1e-3;
+    const INV_PHI: f64 = 0.618_033_988_749_894_9;
+    let mut lo = grid[hat_index.saturating_sub(1)].0;
+    let mut hi = grid[(hat_index + 1).min(grid.len() - 1)].0;
+    if hi - lo > CLOSURE_GAMMA_TOL {
+        let eval_at = |gamma: f64| -> Result<ClosureProfilePoint<FitHandle>, String> {
+            let (tk_score, fit_handle) = fit_at_gamma(gamma)?;
+            if !tk_score.is_finite() {
+                return Err(format!(
+                    "closure profile produced non-finite score at γ={gamma}"
+                ));
+            }
+            Ok(ClosureProfilePoint {
+                gamma,
+                tk_score,
+                fit_handle,
+            })
+        };
+        let mut x1 = hi - INV_PHI * (hi - lo);
+        let mut x2 = lo + INV_PHI * (hi - lo);
+        let mut p1 = eval_at(x1)?;
+        let mut p2 = eval_at(x2)?;
+        while hi - lo > CLOSURE_GAMMA_TOL {
+            if p1.tk_score > p2.tk_score {
+                lo = x1;
+                x1 = x2;
+                p1 = p2;
+                x2 = lo + INV_PHI * (hi - lo);
+                p2 = eval_at(x2)?;
+            } else {
+                hi = x2;
+                x2 = x1;
+                p2 = p1;
+                x1 = hi - INV_PHI * (hi - lo);
+                p1 = eval_at(x1)?;
+            }
+        }
+        for cand in [p1, p2] {
+            if cand.tk_score < representative.tk_score {
+                representative = cand;
+            }
+        }
+    }
 
     Ok(ClosureSelection {
         ci,

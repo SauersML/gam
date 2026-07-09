@@ -488,7 +488,10 @@ pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
     );
     // Value = Σ a_k·phi_k·dec_k with the frozen gates.
     let expected_v = 0.2 * 1.5 + 0.9 * -0.8;
-    assert!((col.v - expected_v).abs() < 1e-12, "frozen reconstruction value");
+    assert!(
+        (col.v - expected_v).abs() < 1e-12,
+        "frozen reconstruction value"
+    );
 }
 
 /// #1026 UNGATED-atom regression: an ungated atom's gate is pinned at 1.0 with a
@@ -530,7 +533,10 @@ pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative()
 
     let col = prog.reconstruction_column::<4>(0);
     // Ungated atom: zero logit derivative, coord derivative at gate 1.0.
-    assert_eq!(col.g[0], 0.0, "ungated atom logit derivative must be exactly 0");
+    assert_eq!(
+        col.g[0], 0.0,
+        "ungated atom logit derivative must be exactly 0"
+    );
     assert!(
         (col.g[2] - 1.0 * (2.0 * 1.5)).abs() < 1e-12,
         "ungated atom coord derivative must use gate 1.0: {}",

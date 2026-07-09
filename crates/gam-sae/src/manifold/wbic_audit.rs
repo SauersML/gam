@@ -127,7 +127,13 @@ impl ReconSpectrum {
         let tempered_edge = self.edge * self.n_eff.max(std::f64::consts::E).ln();
         self.mu
             .iter()
-            .map(|&m| if tempered_edge > 0.0 { m / (m + tempered_edge) } else { 1.0 })
+            .map(|&m| {
+                if tempered_edge > 0.0 {
+                    m / (m + tempered_edge)
+                } else {
+                    1.0
+                }
+            })
             .sum()
     }
 
@@ -353,12 +359,7 @@ pub fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
 /// returns the SAME number as the sigmoid up to the prior-shift term, which this
 /// includes so the test sees the full expectation. `log n_eff` uses the same
 /// `n_eff` floored at `e` as production `rank_soft`.
-pub fn sampled_direction_learning_coefficient(
-    mu: f64,
-    edge: f64,
-    n_eff: f64,
-    r_floor: f64,
-) -> f64 {
+pub fn sampled_direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64, r_floor: f64) -> f64 {
     let ln_neff = n_eff.max(std::f64::consts::E).ln();
     if !(ln_neff > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
         return 0.0;
@@ -533,13 +534,7 @@ mod tests {
         }
         let decoder = reg.cholesky(Side::Lower).unwrap().solve_mat(&cross);
         let d_prod = super::super::construction::realised_rank_charge_dof(
-            &gram,
-            &decoder,
-            n as f64,
-            p as f64,
-            r_floor,
-            0.0,
-            None,
+            &gram, &decoder, n as f64, p as f64, r_floor, 0.0, None,
         )
         .unwrap();
         let d_audit = spec.rank_hard() * spec.basis_edf;
@@ -628,9 +623,8 @@ mod tests {
         // membership basis (rank-3, all far above edge).
         {
             let mut s = 0x2222_u64;
-            let phi = Array2::<f64>::from_shape_fn((n, 3), |(i, c)| {
-                if i % 3 == c { 1.0 } else { 0.0 }
-            });
+            let phi =
+                Array2::<f64>::from_shape_fn((n, 3), |(i, c)| if i % 3 == c { 1.0 } else { 0.0 });
             let centers = [[3.0, 0.0], [0.0, 3.0], [-3.0, -3.0]];
             let mut data = Array2::<f64>::zeros((n, p));
             for i in 0..n {
@@ -691,7 +685,11 @@ mod tests {
             }
             let w = vec![1.0_f64; n];
             let spec = spectrum_from_fit(data.view(), &w, &phi, 0.15 * 0.15, 0.0, None).unwrap();
-            rows.push(AuditRow::from_spectrum("circle near-edge (singular)", &spec, n));
+            rows.push(AuditRow::from_spectrum(
+                "circle near-edge (singular)",
+                &spec,
+                n,
+            ));
         }
 
         // (5) DISK — a filled 2-disk (radius uniform, not a shell): reconstruction
@@ -868,7 +866,10 @@ mod tests {
         // FALSIFY THE OLD SCALE: under ½·d_eff·ln(n_obs) the same append would have
         // inflated the charge (rank_hard>0, n_obs grows N→N+M), so the two scales are
         // genuinely different and this test would fail on the pre-#2a code.
-        assert!(spec_after.rank_hard() > 0.0, "fixture must have a real above-edge atom");
+        assert!(
+            spec_after.rank_hard() > 0.0,
+            "fixture must have a real above-edge atom"
+        );
         let old_before = 0.5 * spec_before.rank_hard() * spec_before.basis_edf * (n as f64).ln();
         let old_after = 0.5 * spec_after.rank_hard() * spec_after.basis_edf * (n_aug as f64).ln();
         assert!(

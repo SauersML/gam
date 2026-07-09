@@ -81,7 +81,11 @@ fn circle() -> CanonicalChartTopology {
 /// Least-squares decoder `B` (m×2) mapping `Φ(t_i) ↦ target_i` via the normal
 /// equations `(ΦᵀΦ) B = Φᵀ target`, solved with a small SPD Gaussian
 /// elimination (design widths are 2 or 4 here).
-fn fit_decoder(evaluator: &CircleHarmonicEvaluator, t: &[f64], target: &Array2<f64>) -> Array2<f64> {
+fn fit_decoder(
+    evaluator: &CircleHarmonicEvaluator,
+    t: &[f64],
+    target: &Array2<f64>,
+) -> Array2<f64> {
     let coords = Array2::from_shape_fn((t.len(), 1), |(i, _)| t[i]);
     let (phi, _) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
@@ -100,10 +104,18 @@ fn fit_decoder(evaluator: &CircleHarmonicEvaluator, t: &[f64], target: &Array2<f
     }
     // Solve [ata | aty] by Gaussian elimination with partial pivoting.
     let mut aug: Vec<Vec<f64>> = (0..m)
-        .map(|i| ata[i].iter().copied().chain(aty[i].iter().copied()).collect())
+        .map(|i| {
+            ata[i]
+                .iter()
+                .copied()
+                .chain(aty[i].iter().copied())
+                .collect()
+        })
         .collect();
     for col in 0..m {
-        let piv = (col..m).max_by(|&a, &b| aug[a][col].abs().total_cmp(&aug[b][col].abs())).unwrap();
+        let piv = (col..m)
+            .max_by(|&a, &b| aug[a][col].abs().total_cmp(&aug[b][col].abs()))
+            .unwrap();
         aug.swap(col, piv);
         let d = aug[col][col];
         for v in aug[col].iter_mut() {
@@ -121,7 +133,12 @@ fn fit_decoder(evaluator: &CircleHarmonicEvaluator, t: &[f64], target: &Array2<f
     Array2::from_shape_fn((m, 2), |(i, c)| aug[i][m + c])
 }
 
-fn reconstruction_ev(evaluator: &CircleHarmonicEvaluator, t: &[f64], b: &Array2<f64>, target: &Array2<f64>) -> f64 {
+fn reconstruction_ev(
+    evaluator: &CircleHarmonicEvaluator,
+    t: &[f64],
+    b: &Array2<f64>,
+    target: &Array2<f64>,
+) -> f64 {
     let coords = Array2::from_shape_fn((t.len(), 1), |(i, _)| t[i]);
     let (phi, _) = evaluator.evaluate(coords.view()).unwrap();
     let pred = phi.dot(b);
@@ -189,8 +206,13 @@ struct TwoCharts {
 fn build_two_charts() -> TwoCharts {
     let n = 300usize;
     let tau = std::f64::consts::TAU;
-    let phi: Vec<f64> = (0..n).map(|i| tau * (i as f64 / n as f64).powf(1.6)).collect();
-    let target = Array2::from_shape_fn((n, 2), |(i, c)| if c == 0 { phi[i].cos() } else { phi[i].sin() });
+    let phi: Vec<f64> = (0..n)
+        .map(|i| tau * (i as f64 / n as f64).powf(1.6))
+        .collect();
+    let target = Array2::from_shape_fn(
+        (n, 2),
+        |(i, c)| if c == 0 { phi[i].cos() } else { phi[i].sin() },
+    );
     let truth: Vec<f64> = phi.iter().map(|&p| (p / tau).rem_euclid(1.0)).collect();
 
     // Honest chart: pure first harmonic, raw coordinate = true angle. The
@@ -205,7 +227,15 @@ fn build_two_charts() -> TwoCharts {
     let warped_t: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
     let warped_b = fit_decoder(&warped_ev, &warped_t, &target);
 
-    TwoCharts { honest_ev, honest_b, honest_t, warped_ev, warped_b, warped_t, truth }
+    TwoCharts {
+        honest_ev,
+        honest_b,
+        honest_t,
+        warped_ev,
+        warped_b,
+        warped_t,
+        truth,
+    }
 }
 
 /// The fix's statistic (mean chart arc-length defect) prefers the honest chart,
@@ -234,8 +264,14 @@ fn arclength_defect_prices_chart_honesty_where_watson_u2_inverts() {
         if col == 0 { p.cos() } else { p.sin() }
     });
     let ev_warped = reconstruction_ev(&c.warped_ev, &c.warped_t, &c.warped_b, &target);
-    assert!(ev_honest > 0.99, "honest chart must reconstruct exactly, EV={ev_honest}");
-    assert!(ev_warped > 0.90, "warped chart must still reconstruct the ring, EV={ev_warped}");
+    assert!(
+        ev_honest > 0.99,
+        "honest chart must reconstruct exactly, EV={ev_honest}"
+    );
+    assert!(
+        ev_warped > 0.90,
+        "warped chart must still reconstruct the ring, EV={ev_warped}"
+    );
 
     // --- The fix's statistic: chart arc-length (unit-speed) defect. ---
     let honest_coords = Array1::from(c.honest_t.clone());

@@ -110,8 +110,9 @@ fn one_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
         let t = std::f64::consts::TAU * (row as f64) / (n as f64);
         let (c, s) = (t.cos(), t.sin());
         for j in 0..p {
-            z[[row, j]] =
-                c * frame[[0, j]] + s * frame[[1, j]] + sigma * deterministic_circle_noise(row, j + 7);
+            z[[row, j]] = c * frame[[0, j]]
+                + s * frame[[1, j]]
+                + sigma * deterministic_circle_noise(row, j + 7);
         }
     }
     for j in 0..p {
@@ -328,7 +329,12 @@ fn l2_norm(v: &Array1<f64>) -> f64 {
 
 fn seeded_k1_circle_objective(
     cfg: CeilingPathologyConfig,
-) -> (Array2<f64>, SaeManifoldRho, Array1<f64>, SaeManifoldOuterObjective) {
+) -> (
+    Array2<f64>,
+    SaeManifoldRho,
+    Array1<f64>,
+    SaeManifoldOuterObjective,
+) {
     let z = one_circle_wide_target(cfg.n, cfg.p, cfg.sigma);
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, cfg.harmonics);
     let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
@@ -358,9 +364,7 @@ fn seeded_k1_circle_objective(
 /// realize. The full outer run then reports the operational symptoms that make
 /// this a solver pathology rather than an information ceiling: collapsed
 /// accepted ρ displacement and a large final gradient.
-fn run_ceiling_vs_pathology_instrument(
-    cfg: CeilingPathologyConfig,
-) -> CeilingPathologyReport {
+fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPathologyReport {
     let probe_seeded = seeded_k1_circle_objective(cfg);
     let seed_probe = probe_seeded.2;
     let mut probe_objective = probe_seeded.3;
@@ -390,9 +394,8 @@ fn run_ceiling_vs_pathology_instrument(
     } else {
         f64::NAN
     };
-    let predicted_decrease_not_materializing =
-        materialization_ratio.is_finite()
-            && materialization_ratio < cfg.materialization_ratio_floor;
+    let predicted_decrease_not_materializing = materialization_ratio.is_finite()
+        && materialization_ratio < cfg.materialization_ratio_floor;
 
     let fit_seeded = seeded_k1_circle_objective(cfg);
     let z = fit_seeded.0;
@@ -417,8 +420,8 @@ fn run_ceiling_vs_pathology_instrument(
             let rho_displacement = l2_norm(&(&result.rho - &seed));
             let step_collapsed =
                 rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius;
-            let huge_final_gradient = final_grad_norm.is_finite()
-                && final_grad_norm >= cfg.huge_final_gradient_floor;
+            let huge_final_gradient =
+                final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor;
             let fitted = objective.into_fitted();
             let ev = global_ev(z.view(), fitted.term.fitted().view());
             let live_lock_present =

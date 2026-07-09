@@ -500,8 +500,7 @@ impl SaeManifoldRho {
                     log_ard.push(block);
                 }
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
-                let log_lambda_block: Vec<f64> =
-                    (0..block_len).map(|b| flat[cursor + b]).collect();
+                let log_lambda_block: Vec<f64> = (0..block_len).map(|b| flat[cursor + b]).collect();
                 SaeManifoldRho {
                     log_lambda_sparse: flat[0],
                     log_lambda_smooth,

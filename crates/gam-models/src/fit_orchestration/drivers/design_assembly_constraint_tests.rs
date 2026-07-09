@@ -3361,6 +3361,7 @@ pub(super) fn run_two_block_exact_joint_optimize(
                 psi_indices: None,
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             })
         },
         |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
@@ -6500,6 +6501,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 psi_indices: None,
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             })
         },
         |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),

@@ -72,12 +72,25 @@
 //!
 //! # Multiplicity — e-BH over the pair × channel ledger
 //!
-//! A screen over `K` atoms tests `O(K²)` pairs on 3 channels each. Each Monte-Carlo
-//! `p` is turned into an e-value with the admissible calibrator `e = ½·p^{−½}`
-//! (`∫₀¹ ½ p^{−½} dp = 1`, decreasing in `p`), and the family is controlled with
-//! e-BH ([`ebh_reject`]): FDR ≤ α with NO independence assumption across the
-//! (heavily dependent) pair statistics — the property a p-value BH could not give
-//! here.
+//! A screen over `K` atoms tests `O(K²)` pairs on 3 channels each. Each channel's
+//! exact Monte-Carlo screen (`B` phase-randomised surrogate draws plus the
+//! observed statistic form `B + 1` exchangeable values under the null) yields the
+//! valid permutation e-value `e = (B+1)·1{no surrogate ≥ observed}`
+//! ([`permutation_e_value`]): `E_0[e] = (B+1)·P(observed is the strict maximum) =
+//! 1` under exchangeability, reaching its maximum `B + 1` exactly when the
+//! observed statistic beats every surrogate. The family is controlled with e-BH
+//! ([`ebh_reject`]): FDR ≤ α with NO independence assumption across the (heavily
+//! dependent) pair statistics — the property a p-value BH could not give here.
+//!
+//! **Budget.** A Monte-Carlo screen with `B` draws resolves an e-value no larger
+//! than `B + 1`, and e-BH rejects a family of `m` = (pairs × 3 channels) entries
+//! only when the largest e clears `m/(α·k)` for some `k` — so at minimum
+//! `B + 1 ≥ m/α`. The replicate budget MUST be sized to the family; it cannot be
+//! a fixed round number. (The former `½·p^{−½}` calibrator was worse still: it
+//! capped `e` at `½√(B+1) ≈ 7` for `B = 200`, below the `1/α = 20` a SINGLE
+//! rejection needs, so the screen could never fire at its declared level. The
+//! reciprocal `(B+1)/(1+#{≥})` is not a fix either — it is not an e-value, its
+//! null mean being the harmonic number `H_{B+1} ≈ ln B`, not `≤ 1`.)
 //!
 //! # The verdict, at zero reconstruction cost
 //!
@@ -179,12 +192,7 @@ fn plane_phases(
 /// The weighted mean resultant length `T` and Kish effective sample size for one
 /// channel, given the per-row angles and non-negative weights. Returns `(T, n_eff)`
 /// with `T = 0`, `n_eff = 0` on empty weight.
-fn resultant(
-    channel: PhaseChannel,
-    theta_a: &[f64],
-    theta_b: &[f64],
-    w: &[f64],
-) -> (f64, f64) {
+fn resultant(channel: PhaseChannel, theta_a: &[f64], theta_b: &[f64], w: &[f64]) -> (f64, f64) {
     let (mut cx, mut sx, mut wsum, mut wsq) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     for i in 0..theta_a.len() {
         let wi = w[i];
@@ -221,7 +229,8 @@ pub struct ChannelVerdict {
     pub z: f64,
     /// Exact upper-tail Monte-Carlo p-value `(1 + #{T_null ≥ T}) / (B + 1)`.
     pub p_value: f64,
-    /// Admissible-calibrator e-value `½·p^{−½}` (feeds the e-BH ledger).
+    /// Valid permutation e-value `(B+1)·1{no surrogate ≥ T}` (feeds the e-BH
+    /// ledger); `E_0[e] = 1`, maximal value `B + 1`. See [`permutation_e_value`].
     pub e_value: f64,
 }
 
@@ -267,22 +276,33 @@ pub const PHASE_NULL_REPLICATES: usize = 200;
 /// the fuse-race energy screens ([`screen_pair_phase`], as exact-null lower-tail
 /// p-values against the phase-randomised surrogate battery, replacing the former
 /// fixed `FUSE_RHO_MAX = 0.85` / `FUSE_TOTAL_ENERGY_CV_MAX = 0.20`) and by the
-/// dose presence F-test ([`certify_phase_circuit`], via `WALD_Z_ALPHA`,
-/// replacing the former fixed `CIRCUIT_DOSE_R2_MIN = 0.5` floor).
+/// dose presence t-test ([`certify_phase_circuit`], the Student-`t` critical value
+/// at this level and `n − 1` residual degrees of freedom, replacing the former
+/// fixed `CIRCUIT_DOSE_R2_MIN = 0.5` floor).
 const PHASE_SCREEN_ALPHA: f64 = 0.05;
-
-/// Two-sided Wald critical value `z = Φ⁻¹(1 − α/2)` at [`PHASE_SCREEN_ALPHA`]
-/// (`= Φ⁻¹(0.975)`). Fixed alongside `α`: if `PHASE_SCREEN_ALPHA` changes this
-/// normal quantile must change with it (gam-math exposes `normal_cdf` but no
-/// inverse, so the quantile of the shared level is pinned here as the derived
-/// constant it is, not recomputed).
+/// Two-sided standard-normal critical value at [`PHASE_SCREEN_ALPHA`].
 const WALD_Z_ALPHA: f64 = 1.959_963_984_540_054;
 
-/// Admissible p-to-e calibrator `e = ½·p^{−½}` (`κ = ½`): `∫₀¹ κ p^{κ−1} dp = 1`
-/// and it is decreasing in `p`, so it is a valid e-value for any valid p-value.
-fn calibrate_e_value(p: f64) -> f64 {
-    let p = p.clamp(f64::MIN_POSITIVE, 1.0);
-    0.5 * p.powf(-0.5)
+/// Valid permutation e-value from an exact Monte-Carlo screen. `exceed` is the
+/// number of surrogate draws that meet or beat the observed statistic and `b` the
+/// number of draws, so the observed statistic plus the `b` surrogates are `b + 1`
+/// exchangeable values under the null. The indicator e-value
+///
+/// ```text
+///   e = (b + 1) · 1{ exceed == 0 } ,
+/// ```
+///
+/// has `E_0[e] = (b+1)·P(observed is the strict maximum) = (b+1)/(b+1) = 1` under
+/// exchangeability — a valid e-value with NO dependence assumption — and attains
+/// its maximum `b + 1` exactly when the observed statistic beats every surrogate.
+/// This is the most powerful e-value at the Monte-Carlo resolution: the largest
+/// value ANY mean-≤1 e-value that is a function of the observed rank can take is
+/// `b + 1`, reached only by placing all the null budget on the top rank. (The
+/// reciprocal `(b+1)/(1+exceed)` is NOT an e-value — its null mean is the harmonic
+/// number `H_{b+1}`, not `≤ 1` — and the former `½·p^{−½}` calibrator, though
+/// valid, capped `e` at `½√(b+1)`, too small to ever clear `m/α`.)
+fn permutation_e_value(exceed: usize, b: usize) -> f64 {
+    if exceed == 0 { (b + 1) as f64 } else { 0.0 }
 }
 
 /// The four ambient dims spanned by the two axis-recoverable planes, if each plane
@@ -314,7 +334,12 @@ fn reduced_null_inputs(
     mean: &Array1<f64>,
     cand_a: &IsaPlaneCandidate,
     cand_b: &IsaPlaneCandidate,
-) -> Option<(Array2<f64>, Array1<f64>, IsaPlaneCandidate, IsaPlaneCandidate)> {
+) -> Option<(
+    Array2<f64>,
+    Array1<f64>,
+    IsaPlaneCandidate,
+    IsaPlaneCandidate,
+)> {
     let sa = plane_support_columns(cand_a)?;
     let sb = plane_support_columns(cand_b)?;
     let mut cols: Vec<usize> = Vec::new();
@@ -374,7 +399,13 @@ pub fn screen_pair_phase(
     let n = pa.theta.len();
     // Weights: mass on rows where BOTH atoms are present (the gate product).
     let w: Vec<f64> = (0..n)
-        .map(|i| if pa.active[i] && pb.active[i] { 1.0 } else { 0.0 })
+        .map(|i| {
+            if pa.active[i] && pb.active[i] {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect();
     let n_co_active = w.iter().filter(|&&x| x > 0.0).count();
 
@@ -387,8 +418,8 @@ pub fn screen_pair_phase(
 
     // Null: phase-randomised surrogate of the ambient columns the planes touch,
     // re-projected through the SAME bases. One surrogate feeds all three channels.
-    let (null_data, null_mean, ncand_a, ncand_b) =
-        reduced_null_inputs(data, mean, cand_a, cand_b).unwrap_or_else(|| {
+    let (null_data, null_mean, ncand_a, ncand_b) = reduced_null_inputs(data, mean, cand_a, cand_b)
+        .unwrap_or_else(|| {
             (
                 data.to_owned(),
                 mean.clone(),
@@ -444,7 +475,7 @@ pub fn screen_pair_phase(
             null_sd: sd,
             z,
             p_value,
-            e_value: calibrate_e_value(p_value),
+            e_value: permutation_e_value(exceed, b),
         });
     }
 
@@ -486,7 +517,10 @@ pub fn screen_pair_phase(
         if !total_energy_cv.is_finite() || b == 0 {
             1.0
         } else {
-            (1 + null_energy_cv.iter().filter(|&&s| s <= total_energy_cv).count()) as f64
+            (1 + null_energy_cv
+                .iter()
+                .filter(|&&s| s <= total_energy_cv)
+                .count()) as f64
                 / (b + 1) as f64
         }
     };
@@ -615,8 +649,8 @@ pub fn screen_all_pairs_phase(
     let mut ledger_e: Vec<f64> = Vec::new();
     // (verdict index) for each ledger entry — one entry per pair × CHANNEL.
     // The per-pair maximum over channels is NOT an e-value (for three null
-    // channels E[max e] = 8/5 > 1), so feeding `best_e_value` to e-BH would
-    // void the FDR guarantee the module header states. Every calibrated
+    // channels E[max e] can be as large as 3 > 1), so feeding `best_e_value` to
+    // e-BH would void the FDR guarantee the module header states. Every valid
     // channel e-value enters the ledger under its own entry, exactly the
     // pair × channel family the header prices; a pair is proposed when ANY of
     // its channel entries is rejected.
@@ -843,7 +877,11 @@ pub fn fuse_race_candidate(
     let (evecs, evals) = symmetric_eig_jacobi(&cov);
     // Top-two eigenpairs.
     let mut order: Vec<usize> = (0..d).collect();
-    order.sort_by(|&i, &j| evals[j].partial_cmp(&evals[i]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&i, &j| {
+        evals[j]
+            .partial_cmp(&evals[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let captured = if total > 0.0 {
         (evals[order[0]].max(0.0) + evals[order[1]].max(0.0)) / total
     } else {
@@ -981,7 +1019,9 @@ pub fn phase_transfer_operator(
     let det = gram[[0, 0]] * gram[[1, 1]] - gram[[0, 1]] * gram[[1, 0]];
     let scale = (gram[[0, 0]].abs() * gram[[1, 1]].abs()).max(1e-300);
     if !det.is_finite() || det.abs() <= f64::EPSILON.sqrt() * scale {
-        return Err("phase_transfer_operator: singular input angle gram (θ_A not exciting)".to_string());
+        return Err(
+            "phase_transfer_operator: singular input angle gram (θ_A not exciting)".to_string(),
+        );
     }
     let inv = {
         let mut m = Array2::<f64>::zeros((2, 2));
@@ -1167,7 +1207,13 @@ pub fn coactive_angles(
     let pb = plane_phases(data, mean, cand_b);
     let n = pa.theta.len();
     let w: Vec<f64> = (0..n)
-        .map(|i| if pa.active[i] && pb.active[i] { 1.0 } else { 0.0 })
+        .map(|i| {
+            if pa.active[i] && pb.active[i] {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect();
     (pa.theta, pb.theta, w)
 }

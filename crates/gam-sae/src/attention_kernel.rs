@@ -180,8 +180,26 @@ pub fn fit_attention_kernel(
     let stationary = fit_stationary_kernel(query_t, key_t, scores, max_harmonic)?;
     let separable = fit_separable_kernel(query_t, key_t, scores, max_harmonic)?;
     let stationary_r2_gap = separable.r2 - stationary.r2;
-    let tolerance = f64::EPSILON.sqrt() * (1.0 + separable.r2.abs());
-    let is_stationary = stationary_r2_gap <= tolerance;
+    // Stationarity is a NESTED-model decision, not a raw training-R² tie at
+    // machine epsilon. The separable `(t_q, t_k)` surface strictly CONTAINS the
+    // stationary circulant kernel (set every off-diagonal query⊗key coefficient
+    // to the circulant value), so under a truly stationary process the larger
+    // model almost surely lowers in-sample SSE — a machine-epsilon R² gap always
+    // fires, declaring even stationary heads non-stationary. Compare the two
+    // nested Gaussian fits by BIC on their SSE with the models' own parameter
+    // counts: `BIC = n·ln(SSE/n) + p·ln n`. The head is stationary unless the
+    // separable surface reduces SSE by more than its extra parameters cost — the
+    // same BIC nested-model comparison the structure search uses elsewhere.
+    let n_obs = (query_t.len() * key_t.len()) as f64;
+    let params_stationary = (1 + 2 * max_harmonic) as f64;
+    let separable_width = 1 + 2 * max_harmonic;
+    let params_separable = (separable_width * separable_width) as f64;
+    let bic = |sse: f64, params: f64| -> f64 {
+        let mean_sq = (sse / n_obs).max(f64::MIN_POSITIVE);
+        n_obs * mean_sq.ln() + params * n_obs.ln()
+    };
+    let is_stationary =
+        bic(stationary.sse, params_stationary) <= bic(separable.sse, params_separable);
     Ok(AttentionKernelFit {
         stationary,
         separable,
@@ -288,18 +306,41 @@ pub fn fit_ov_coordinate_map(
     if key_t.is_empty() {
         return Err("fit_ov_coordinate_map requires at least one observation".to_string());
     }
+    for index in 0..key_t.len() {
+        assert_finite(key_t[index], "key coordinate")?;
+        assert_finite(delta_t[index], "coordinate delta")?;
+    }
+    // The OV coordinate delta is a PHASE (turns, period 1): `delta` and
+    // `delta + 1` are the same shift. A raw Euclidean least-squares of the
+    // wrapped delta collapses seam-straddling pairs to their arithmetic midpoint
+    // — `-0.49` and `+0.49` (nearly the same half-turn) average to `0`, the
+    // antipode of the truth. Regress the SHORTEST-ARC representative instead:
+    // unwrap each delta around the circular mean `μ = atan2(Σsin, Σcos)/2π`, i.e.
+    // `δ̃ = δ − round(δ − μ)`, so the response is seam-invariant. For a delta map
+    // localized within a half-turn (the OV shift case) unwrapping is the identity;
+    // it only bites when the deltas straddle the seam, exactly where the raw fit
+    // was antipode-biased.
+    let (mut cos_sum, mut sin_sum) = (0.0_f64, 0.0_f64);
+    for &delta in delta_t {
+        let angle = TWO_PI * delta;
+        cos_sum += angle.cos();
+        sin_sum += angle.sin();
+    }
+    let circular_mean_turns = sin_sum.atan2(cos_sum) / TWO_PI;
+    let unwrapped_delta: Vec<f64> = delta_t
+        .iter()
+        .map(|&delta| delta - (delta - circular_mean_turns).round())
+        .collect();
     let parameter_count = 1 + 2 * max_harmonic;
     let mut normal = vec![0.0; parameter_count * parameter_count];
     let mut rhs = vec![0.0; parameter_count];
     let mut basis = vec![0.0; parameter_count];
     for index in 0..key_t.len() {
-        assert_finite(key_t[index], "key coordinate")?;
-        assert_finite(delta_t[index], "coordinate delta")?;
         coordinate_basis(key_t[index], max_harmonic, &mut basis);
-        accumulate_normal_equation(&mut normal, &mut rhs, &basis, delta_t[index]);
+        accumulate_normal_equation(&mut normal, &mut rhs, &basis, unwrapped_delta[index]);
     }
     let coefficients = solve_linear_system(normal, rhs, parameter_count)?;
-    let (sse, sst) = coordinate_sums_of_squares(key_t, delta_t, max_harmonic, &coefficients);
+    let (sse, sst) = coordinate_sums_of_squares(key_t, &unwrapped_delta, max_harmonic, &coefficients);
     Ok(CoordinateMapFit {
         intercept: coefficients[0],
         harmonics: harmonic_coefficients_from_regression(&coefficients, max_harmonic),

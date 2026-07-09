@@ -262,7 +262,9 @@ fn planted_nonlinear_transport_flips_the_verdict() {
     );
 
     // The deviation locus is a real chart location where linear transport breaks.
-    let locus = nonlinear.deviation_locus().expect("non-empty transport grid");
+    let locus = nonlinear
+        .deviation_locus()
+        .expect("non-empty transport grid");
     assert!(
         (0.0..1.0).contains(&locus),
         "deviation locus {locus} should be a chart coordinate in [0, 1)"
@@ -309,7 +311,11 @@ fn phase_shift_keeps_layer_images_congruent() {
     let layout = term.crosscoder_layout().unwrap().clone();
     let report = measure_atom_transport(&term, &layout, 0, 256).unwrap();
 
-    assert!(report.drift.is_finite(), "drift must be finite: {}", report.drift);
+    assert!(
+        report.drift.is_finite(),
+        "drift must be finite: {}",
+        report.drift
+    );
     assert_eq!(report.source, CrosscoderLayer::Anchor);
     assert_eq!(report.target, CrosscoderLayer::Block(0));
     // Congruent images (a pure phase shift is a reparameterization of the SAME

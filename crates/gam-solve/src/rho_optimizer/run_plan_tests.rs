@@ -1071,6 +1071,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
                 psi_indices: Some(vec![11]),
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             })
         }),
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
@@ -1083,6 +1084,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         barrier_config: None,
         fixed_point_tolerance: 1e-8,
         consecutive_psi_zero_iters: 0,
+        last_restored_incumbent_streak: None,
     };
 
     let sample = bridge
@@ -1099,6 +1101,75 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
             .enumerate()
             .all(|(idx, &value)| idx == 11 || value == 0.0)
     );
+}
+
+#[test]
+fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
+    let cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: DeclaredHessianForm::Unavailable,
+        n_params: 1,
+        psi_dim: 0,
+        fixed_point_available: true,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let mut obj = ClosureObjective {
+        state: 0_usize,
+        cap: cap.clone(),
+        cost_fn: |_: &mut usize, rho: &Array1<f64>| Ok(10.0 - rho[0]),
+        eval_fn: |_: &mut usize, rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 10.0 - rho[0],
+                gradient: array![-1.0],
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        eval_order_fn: None::<
+            fn(&mut usize, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
+        >,
+        reset_fn: None::<fn(&mut usize)>,
+        efs_fn: Some(|restores: &mut usize, rho: &Array1<f64>| {
+            *restores += 1;
+            Ok(EfsEval {
+                // The criterion is still improving and the fixed-point step is
+                // deliberately far above tolerance: only the model-state
+                // certificate may stop this walk.
+                cost: 10.0 - rho[0],
+                steps: vec![0.25],
+                beta: None,
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+                logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: Some(*restores),
+            })
+        }),
+        screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
+        seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
+        continuation_prewarm: true,
+    };
+    let mut bridge = OuterFixedPointBridge {
+        obj: &mut obj,
+        layout: cap.theta_layout(),
+        barrier_config: None,
+        fixed_point_tolerance: 1.0e-8,
+        consecutive_psi_zero_iters: 0,
+        last_restored_incumbent_streak: None,
+    };
+
+    let first = bridge
+        .eval_step(&array![0.0])
+        .expect("one incumbent repair is not recurrence");
+    assert_eq!(first.status, FixedPointStatus::Continue);
+
+    let second = bridge
+        .eval_step(&array![0.25])
+        .expect("recurrent restored incumbent is a valid stop certificate");
+    assert_eq!(second.status, FixedPointStatus::Stop);
+    assert_eq!(second.value, 9.75, "retain the lower-cost restored point");
 }
 
 #[test]
@@ -3834,6 +3905,7 @@ fn run_efs_skips_global_cost_screening() {
                 psi_indices: None,
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
             })
         }),
     );
@@ -3884,6 +3956,7 @@ fn run_efs_skips_invalid_leading_seed_without_spending_budget() {
                         psi_indices: None,
                         inner_hessian_scale: None,
                         logdet_enclosure_gap: None,
+                        consecutive_restored_incumbents: None,
                     })
                 } else {
                     Err(EstimationError::RemlOptimizationFailed(

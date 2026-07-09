@@ -2235,6 +2235,11 @@ pub(crate) struct OuterFixedPointBridge<'a> {
     /// HybridEFS attempt and the fallback ladder routes to a joint
     /// gradient-based solver where ψ stationarity ∇_ψ V = 0 can be enforced.
     pub(crate) consecutive_psi_zero_iters: usize,
+    /// Restore streak reported by the previous fixed-point evaluation.  Keeping
+    /// this in the bridge requires the certificate to recur across two distinct
+    /// outer evaluations; multiple inner-refinement chunks at one rho cannot
+    /// terminate the outer walk by themselves.
+    pub(crate) last_restored_incumbent_streak: Option<usize>,
 }
 
 impl OuterFixedPointBridge<'_> {
@@ -2467,6 +2472,41 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         )?;
         let max_step_abs = raw_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
         let current_cost = eval.cost;
+        // #2241 — an objective may certify that consecutive inner solves
+        // returned to the same banked incumbent after non-monotone boundary
+        // mutations. One restore is merely a repair; a second consecutive
+        // restore is the first possible recurrence and proves that another outer
+        // update did not change the fitted state. Terminate on that model-state
+        // certificate instead of guessing flatness from a relative-cost scalar
+        // or exhausting an iteration budget. The current rho/cost is retained;
+        // `FixedPointStatus::Stop` prevents the non-stationary proposal from
+        // being applied.
+        let restored_incumbent_recurred = match (
+            self.last_restored_incumbent_streak,
+            eval.consecutive_restored_incumbents,
+        ) {
+            (Some(previous), Some(current)) => current > previous && current > 1,
+            _ => false,
+        };
+        self.last_restored_incumbent_streak = eval.consecutive_restored_incumbents;
+        if restored_incumbent_recurred {
+            let restores = eval.consecutive_restored_incumbents.unwrap_or_default();
+            if psi_indices.is_some() {
+                self.consecutive_psi_zero_iters = 0;
+            }
+            log::info!(
+                "[OUTER] fixed-point convergence by recurrent restored incumbent: \
+                 consecutive_restores={} cost={current_cost:.6e} rho_dim={} psi_dim={}",
+                restores,
+                self.layout.rho_dim(),
+                self.layout.psi_dim,
+            );
+            return Ok(FixedPointSample {
+                value: current_cost,
+                step: raw_step,
+                status: FixedPointStatus::Stop,
+            });
+        }
         if self.fixed_point_step_converged(x, &raw_step, psi_indices.as_deref()) {
             if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;

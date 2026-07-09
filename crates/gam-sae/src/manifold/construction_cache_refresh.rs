@@ -105,14 +105,12 @@ pub fn refresh_isometry_caches_from_atom(
         for a in 0..d {
             for c in 0..d {
                 let slab = hess.slice(ndarray::s![.., .., a, c]).dot(b);
-                jac2_4d
-                    .slice_mut(ndarray::s![.., .., a, c])
-                    .assign(&slab);
+                jac2_4d.slice_mut(ndarray::s![.., .., a, c]).assign(&slab);
             }
         }
-        let jac2 = jac2_4d.into_shape_with_order((n_obs, p * d * d)).map_err(|err| {
-            format!("refresh_isometry_caches_from_atom: H reshape failed: {err}")
-        })?;
+        let jac2 = jac2_4d
+            .into_shape_with_order((n_obs, p * d * d))
+            .map_err(|err| format!("refresh_isometry_caches_from_atom: H reshape failed: {err}"))?;
         Some(Arc::new(jac2))
     } else {
         None
