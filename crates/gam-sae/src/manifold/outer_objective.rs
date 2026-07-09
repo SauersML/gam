@@ -3278,6 +3278,7 @@ impl SaeManifoldOuterObjective {
     }
 
     /// Basin-bundle member count (test observability).
+    #[cfg(test)]
     pub(crate) fn basin_bundle_len(&self) -> usize {
         self.basin_bundle.len()
     }
