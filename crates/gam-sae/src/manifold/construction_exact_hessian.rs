@@ -299,26 +299,27 @@ impl SaeManifoldTerm {
     /// #2080 forward plumbing — the analytic outer-ρ gradient with an OPTIONAL
     /// shared selected-inverse probe bundle `(z_j, S⁻¹ z_j)`.
     ///
-    /// When `inverse_probe_bundle` is `Some`, the two `½log|H|`-trace channels
-    /// that have matrix-free selected-inverse siblings — the per-atom decoder
-    /// smoothness EDF `tr(H⁻¹ M_k)` and the per-(atom,axis) ARD log-precision
-    /// Hessian trace `½tr(H⁻¹ ∂H/∂logα)` — are evaluated off that bundle
-    /// (`decoder_smoothness_effective_dof_per_atom_from_probes` /
-    /// `ard_log_precision_hessian_trace_from_probes`) instead of the dense
-    /// `DeflatedArrowSolver` selected inverse. They convert together as ONE
-    /// all-or-nothing cluster on the single `Some` (invariant #1): never a
-    /// partial mix within a single eval.
+    /// When `inverse_probe_bundle` is `Some`, the THREE selected-inverse channels
+    /// that have matrix-free siblings — the per-atom decoder smoothness EDF
+    /// `tr(H⁻¹ M_k)`, the per-(atom,axis) ARD log-precision Hessian trace
+    /// `½tr(H⁻¹ ∂H/∂logα)`, and the #1006 envelope Γ = tr(H⁻¹ ∂H/∂θ) — are evaluated
+    /// off that bundle (`decoder_smoothness_effective_dof_per_atom_from_probes` /
+    /// `ard_log_precision_hessian_trace_from_probes` / `logdet_theta_adjoint_from_probes`)
+    /// instead of the dense `DeflatedArrowSolver` selected inverse. They convert
+    /// together as ONE all-or-nothing cluster on the single `Some` (invariant #1):
+    /// never a partial mix within a single eval. Each from-probes channel hard-refuses
+    /// deflated rows (the plain-S⁻¹ bundle cannot reconstruct the Daleckii–Krein
+    /// correction), routing those fits to the dense channel.
     ///
     /// The analytic-gradient cluster is DENSE-ONLY today (invariant #3): every
     /// production caller passes `None`, so this `Some` branch is dormant forward
     /// plumbing that the eventual routing flip (once the surrogate lane owns the
     /// analytic gradient, not just the EFS lane) will exercise. Flipping any
-    /// caller to `Some` additionally requires matrix-free siblings for the
-    /// channels that still consume `solver` even on the `Some` branch — the
-    /// assignment/learnable-IBP log-strength traces and the `logdet_theta_adjoint`
-    /// envelope Γ (#2080 task-2, the θ-adjoint `tr(S⁻¹·M)` fold) — so the `solver`
-    /// argument is still required here and the flip stays off until that gap
-    /// closes.
+    /// caller to `Some` still requires matrix-free siblings for the one remaining
+    /// solver-bound channel — the assignment/learnable-IBP log-strength traces
+    /// (`assignment_log_strength_hessian_trace` / `learnable_ibp_data_logdet_alpha_trace`,
+    /// `logdet_trace[0]`) — so the `solver` argument is still required here and the
+    /// flip stays off until that last gap closes.
     pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
         &self,
         target: ArrayView2<'_, f64>,
@@ -449,9 +450,25 @@ impl SaeManifoldTerm {
             }
         }
 
-        let gamma = self
-            .logdet_theta_adjoint(rho, cache, solver)
-            .map_err(OuterGradientError::internal)?;
+        // #2080: the envelope Γ = tr(H⁻¹ ∂H/∂θ) off the SAME shared selected-inverse
+        // bundle (the all-or-nothing cluster's third channel) when present; the dense
+        // selected inverse otherwise. The border-only bundle reconstructs the NO-SELF
+        // base inverse `(H₀')⁻¹`, so `logdet_theta_adjoint_from_probes` HARD-REFUSES
+        // (routes to dense) any cache carrying a T-space rank-R correction the border
+        // cannot span — per-row gauge/rotation deflation OR an IBP cross-row Woodbury —
+        // and otherwise owns the softmax / euclidean / non-cross-row regimes exactly.
+        // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
+        // Hessian trace + θ-adjoint); the assignment/learnable-IBP log-strength traces
+        // (`logdet_trace[0]`) plus the θ-adjoint's IBP-refused fits remain solver-bound
+        // — the last gaps before the routing flip (see the docstring).
+        let gamma = match inverse_probe_bundle {
+            Some((probes, sinv)) => self
+                .logdet_theta_adjoint_from_probes(rho, cache, probes, sinv)
+                .map_err(OuterGradientError::internal)?,
+            None => self
+                .logdet_theta_adjoint(rho, cache, solver)
+                .map_err(OuterGradientError::internal)?,
+        };
         // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
         // `θ̂_ρ = −A⁻¹ g_ρ`, where `A = ∇²_θθ L` is the EXACT stationarity
         // Jacobian of the inner fit — data residual curvature, exact softmax

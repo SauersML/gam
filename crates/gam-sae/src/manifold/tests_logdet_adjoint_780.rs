@@ -2451,3 +2451,156 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_compact_layout_matches_dense_1416() {
          fd(½∂log|H|/∂ρ)={fd_half:.8e}, compact analytic={analytic_compact:.8e}"
     );
 }
+
+/// #2080 shared assertion: the matrix-free θ-adjoint
+/// ([`SaeManifoldTerm::logdet_theta_adjoint_from_probes`]) reconstructed from the
+/// FULL-BASIS probe bundle (`z_j = √k·e_j`, exact dense `S⁻¹` via
+/// `cache.schur_inverse_apply`) must reproduce the dense selected-inverse
+/// θ-adjoint ([`SaeManifoldTerm::logdet_theta_adjoint`]) on an UNDEFLATED cache —
+/// where the plain-`S⁻¹` outer-product estimators are algebraically exact and the
+/// Daleckii–Krein correction is identically zero. This isolates the from-probes
+/// reconstruction (the dense adjoint is already FD-validated against `log|H|`).
+fn assert_theta_adjoint_from_probes_matches_dense(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    cache: &ArrowFactorCache,
+) {
+    let deflated = cache
+        .deflated_row_directions
+        .iter()
+        .any(|d| !d.is_empty());
+    assert!(
+        !deflated,
+        "the from-probes parity gate requires an UNDEFLATED cache (the plain-S⁻¹ \
+         bundle cannot reconstruct the Daleckii–Krein correction); re-pick ρ so no \
+         row deflates"
+    );
+    let solver = DeflatedArrowSolver::plain(cache);
+    let dense = term
+        .logdet_theta_adjoint(rho, cache, &solver)
+        .expect("dense theta-adjoint");
+
+    let k = cache.k;
+    assert!(k > 0, "fixture must have a non-empty border to exercise S⁻¹ folds");
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<ndarray::Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = ndarray::Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<ndarray::Array1<f64>> = probes
+        .iter()
+        .map(|v| cache.schur_inverse_apply(v.view()).expect("schur_inverse_apply"))
+        .collect();
+    let mf = term
+        .logdet_theta_adjoint_from_probes(rho, cache, &probes, &sinv)
+        .expect("matrix-free theta-adjoint");
+
+    assert_eq!(dense.t.len(), mf.t.len());
+    assert_eq!(dense.beta.len(), mf.beta.len());
+    let mut max_abs = 0.0_f64;
+    for (i, (d, m)) in dense.t.iter().zip(mf.t.iter()).enumerate() {
+        assert!(
+            (d - m).abs() <= 1.0e-8 * (1.0 + d.abs()),
+            "theta-adjoint gamma_t[{i}] mismatch: dense={d:.10e}, from_probes={m:.10e}"
+        );
+        max_abs = max_abs.max(d.abs());
+    }
+    for (i, (d, m)) in dense.beta.iter().zip(mf.beta.iter()).enumerate() {
+        assert!(
+            (d - m).abs() <= 1.0e-8 * (1.0 + d.abs()),
+            "theta-adjoint gamma_beta[{i}] mismatch: dense={d:.10e}, from_probes={m:.10e}"
+        );
+        max_abs = max_abs.max(d.abs());
+    }
+    assert!(
+        max_abs > 0.0 && max_abs.is_finite(),
+        "the theta-adjoint must be non-trivial to make the parity check meaningful"
+    );
+}
+
+/// #2080 θ-adjoint from-probes — SOFTMAX fixture. Exercises the softmax entropy
+/// dense off-diagonal channel + the core t–t / t–β / β–β selected-inverse folds.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    rho.log_lambda_sparse = 0.5;
+    let (_v, _l, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged softmax cache");
+    assert_theta_adjoint_from_probes_matches_dense(&term, &rho, &cache);
+}
+
+/// #2080 θ-adjoint from-probes — IBP cross-row Woodbury hard-refuse. The border-only
+/// probe bundle reconstructs only the NO-SELF base inverse `(H₀')⁻¹`; the #1038
+/// cross-row rank-one `W_k` is a T-space rank-R correction the bundle cannot carry, so
+/// an IBP-MAP cache must REFUSE (route to the dense channel) rather than return the
+/// wrong base-inverse θ-adjoint.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_refuses_ibp_cross_row_2080() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    rho.log_lambda_sparse = 0.5;
+    let (_v, _l, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged ibp-map cache");
+    let k = cache.k;
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<ndarray::Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = ndarray::Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<ndarray::Array1<f64>> = probes
+        .iter()
+        .map(|v| cache.schur_inverse_apply(v.view()).expect("schur_inverse_apply"))
+        .collect();
+    let result = term.logdet_theta_adjoint_from_probes(&rho, &cache, &probes, &sinv);
+    assert!(
+        result.is_err(),
+        "the from-probes theta-adjoint must refuse an IBP cross-row cache; got Ok"
+    );
+}
+
+/// #2080 θ-adjoint from-probes — DEFLATION hard-refuse. On the known-deflating
+/// PD-region learnable-IBP fixture (per-row gauge deflation surfaced into the cache),
+/// the from-probes θ-adjoint must REFUSE (route to the dense channel) rather than
+/// silently drop the Daleckii–Krein correction the plain-S⁻¹ bundle cannot rebuild.
+#[test]
+fn sae_logdet_theta_adjoint_from_probes_refuses_deflated_rows_2080() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    rho.log_lambda_sparse = 0.5;
+    let (_v, _l, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged learnable-ibp cache");
+    assert!(
+        cache
+            .deflated_row_directions
+            .iter()
+            .any(|d| !d.is_empty()),
+        "fixture must genuinely deflate to exercise the hard-refuse (re-pick ρ if not)"
+    );
+    let k = cache.k;
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<ndarray::Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = ndarray::Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<ndarray::Array1<f64>> = probes
+        .iter()
+        .map(|v| cache.schur_inverse_apply(v.view()).expect("schur_inverse_apply"))
+        .collect();
+    let result = term.logdet_theta_adjoint_from_probes(&rho, &cache, &probes, &sinv);
+    assert!(
+        result.is_err(),
+        "the from-probes theta-adjoint must refuse a deflated-row cache; got Ok"
+    );
+}
