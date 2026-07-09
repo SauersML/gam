@@ -176,6 +176,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (root - 1.0) / (root + 1.0)
         });
         last_ev = stats.explained_variance;
+        // Coarse per-epoch liveness for the CUDA validation run (a handful of
+        // lines, never per-shard): a stalled device route stops advancing this
+        // line, and under `--gpu required` a route that cannot make progress is a
+        // typed error rather than a silent hang.
+        println!(
+            "[scale_k] epoch {}/{} ev={:.6} revived={} dead={} elapsed={:.1}s",
+            epoch_index + 1,
+            args.epochs,
+            stats.explained_variance,
+            stats.revived,
+            stats.dead,
+            started.elapsed().as_secs_f64(),
+        );
         epoch_reports.push(json!({
             "epoch": epoch_index + 1,
             "reported_epoch": stats.epoch,

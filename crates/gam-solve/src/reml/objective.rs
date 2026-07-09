@@ -947,10 +947,70 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
+    /// The penalized inner KKT residual `r = ∇_β L_pen(β̂)` at the accepted
+    /// P-IRLS iterate, in the STABLE/TRANSFORMED coefficient basis, for engaging
+    /// the inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on the flexible-link
+    /// outer path.
+    ///
+    /// The correction is engaged UNCONDITIONALLY whenever the residual is
+    /// well-defined — it is the exact second-order value/gradient at the
+    /// Newton-refined mode `β* = β̂ − H⁻¹r`, and it vanishes as `r → 0`, so a
+    /// fully-converged inner solve is unchanged while a β̂ accepted at a
+    /// first-order inner cap (the `outer_inner_cap` schedule the flexible-link
+    /// optimizer uses) gets the stationary-mode gradient the raw capped β̂
+    /// silently misreports. There is deliberately NO relative-residual gate: a
+    /// threshold that suppressed the correction above some tolerance would
+    /// silently present a non-stationary iterate as exact-KKT to the outer
+    /// evaluator (gam#2062), which is exactly the failure this fix removes.
+    ///
+    /// Returns `None` (presenting exact-KKT, as before) only when the correction
+    /// is genuinely inapplicable:
+    ///   * Firth bias reduction is active — the penalized Hessian is a
+    ///     reduced-rank Jeffreys-identifiable pseudo-object carrying the Firth
+    ///     score; that correction needs the `HardPseudo` kernel and is out of
+    ///     scope here (tracked separately as gam#1821);
+    ///   * the stored residual is empty or non-finite.
+    fn standard_inner_kkt_residual_transformed(
+        &self,
+        pirls_result: &PirlsResult,
+        firth_active: bool,
+    ) -> Option<Array1<f64>> {
+        if firth_active {
+            return None;
+        }
+        let r = &pirls_result.penalized_gradient_transformed;
+        if r.is_empty() || r.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(r.clone())
+    }
+
+    /// Frame-mapped inner KKT residual for the ORIGINAL-basis assembly builders
+    /// (`build_dense_original_assembly`, `build_sparse_assembly`). The stored
+    /// residual lives in the transformed frame; the penalized score rotates with
+    /// the orthogonal reparameterization exactly as `β` does (`β_o = Qs·β_t`),
+    /// so `r_o = Qs·r_t`. These builders are only reached on the unconstrained
+    /// QS frame, so there is no active-constraint normal component to strip.
+    fn inner_kkt_residual_original_basis(
+        &self,
+        pirls_result: &PirlsResult,
+        firth_active: bool,
+    ) -> Option<crate::model_types::ProjectedKktResidual> {
+        let r_t = self.standard_inner_kkt_residual_transformed(pirls_result, firth_active)?;
+        let r_o = match pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => r_t,
+            pirls::PirlsCoordinateFrame::TransformedQs => pirls_result.reparam_result.qs.dot(&r_t),
+        };
+        Some(crate::model_types::ProjectedKktResidual::from_active_projected(
+            r_o,
+        ))
+    }
+
     /// Pack a `DerivativeContext` plus backend-specific pieces into an
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
     /// here to avoid repeating the 18-field struct literal.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_assembly(
         &self,
         pirls_result: &PirlsResult,
@@ -964,6 +1024,7 @@ impl<'a> RemlState<'a> {
             std::sync::Arc<super::reml_outer_engine::PenaltySubspaceTrace>,
         >,
         free_basis: Option<&Array2<f64>>,
+        inner_kkt_residual: Option<crate::model_types::ProjectedKktResidual>,
     ) -> super::assembly::InnerAssembly<'static> {
         // When a linear-inequality active set reduces the inner solve to the
         // free subspace `β = z β_f`, the penalty coordinates must be restricted
@@ -1050,7 +1111,7 @@ impl<'a> RemlState<'a> {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
-            kkt_residual: None,
+            kkt_residual: inner_kkt_residual,
             active_constraints: None,
         }
     }
@@ -1067,6 +1128,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         force_spectral_logdet: bool,
+        populate_inner_kkt: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{
             DenseCholeskyValueOnlyOperator, DenseSpectralOperator, PseudoLogdetMode,
@@ -1305,6 +1367,21 @@ impl<'a> RemlState<'a> {
 
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
+        // Inner-KKT envelope residual (transformed frame). Only the
+        // unconstrained branch maps a raw transformed residual directly onto the
+        // Hessian operator; under an active-set free basis the stationarity
+        // vector additionally carries a constraint-normal (Lagrange multiplier)
+        // component this standard path does not strip, so present exact-KKT
+        // there (unchanged behaviour) rather than a mis-projected residual.
+        let inner_kkt_residual = if populate_inner_kkt && free_basis_opt.is_none() {
+            self.standard_inner_kkt_residual_transformed(
+                pirls_result,
+                bundle.firth_dense_operator.is_some(),
+            )
+            .map(crate::model_types::ProjectedKktResidual::from_active_projected)
+        } else {
+            None
+        };
         Ok(self.finish_assembly(
             pirls_result,
             ctx,
@@ -1315,6 +1392,7 @@ impl<'a> RemlState<'a> {
             hessian_logdet_correction,
             penalty_subspace_trace,
             free_basis_opt.as_ref(),
+            inner_kkt_residual,
         ))
     }
 
@@ -1326,6 +1404,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
+        populate_inner_kkt: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{
             HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
@@ -1399,6 +1478,18 @@ impl<'a> RemlState<'a> {
         // sides of the LAML ratio on the same p-dim space) rather than
         // reintroducing the range(S_+) projection; Cholesky can't cheaply
         // compute `U_S^T H U_S` without densifying H.
+        // Sparse-exact assembles β and H in the original basis (see `beta =
+        // sparse_exact_beta_original`), so the envelope residual is mapped to
+        // that basis. Sparse-native fits are unconstrained on this path.
+        let inner_kkt_residual = if populate_inner_kkt {
+            self.inner_kkt_residual_original_basis(
+                pirls_result,
+                bundle.firth_dense_operator.is_some()
+                    || bundle.firth_dense_operator_original.is_some(),
+            )
+        } else {
+            None
+        };
         Ok(self.finish_assembly(
             pirls_result,
             ctx,
@@ -1409,6 +1500,7 @@ impl<'a> RemlState<'a> {
             0.0,
             None,
             None,
+            inner_kkt_residual,
         ))
     }
 
@@ -1424,6 +1516,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         force_spectral_logdet: bool,
+        populate_inner_kkt: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{DenseSpectralOperator, PseudoLogdetMode};
 
@@ -1704,6 +1797,19 @@ impl<'a> RemlState<'a> {
         }
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        // Original-basis envelope residual: `β` and `H` here are rotated into
+        // the original basis, and `build_dense_original_assembly` is only ever
+        // reached on the unconstrained QS frame, so the transformed residual
+        // maps up cleanly via the same orthogonal `Qs`.
+        let inner_kkt_residual = if populate_inner_kkt {
+            self.inner_kkt_residual_original_basis(
+                pirls_result,
+                bundle.firth_dense_operator.is_some()
+                    || bundle.firth_dense_operator_original.is_some(),
+            )
+        } else {
+            None
+        };
         Ok(self.finish_assembly(
             pirls_result,
             ctx,
@@ -1714,6 +1820,7 @@ impl<'a> RemlState<'a> {
             hessian_logdet_correction,
             penalty_subspace_trace,
             None,
+            inner_kkt_residual,
         ))
     }
 
@@ -1753,13 +1860,14 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         force_spectral_logdet: bool,
+        populate_inner_kkt: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             // Sparse-exact `log|H|` is Cholesky-derived and its gradient traces
             // are paired against the SAME exact factorization, so there is no
             // floored-vs-exact desync to suppress here (#1376 affects only the
             // dense smooth-floored spectral gradient paths).
-            return self.build_sparse_assembly(rho, bundle, mode);
+            return self.build_sparse_assembly(rho, bundle, mode, populate_inner_kkt);
         }
         // The original-basis dense path keeps β, the Hessian operator, the GLM
         // derivative design, and the penalty coordinates in one (original)
@@ -1775,7 +1883,13 @@ impl<'a> RemlState<'a> {
             .active_constraint_free_basis(bundle.pirls_result.as_ref())
             .is_none();
         if unconstrained_qs_frame {
-            self.build_dense_original_assembly(rho, bundle, mode, force_spectral_logdet)
+            self.build_dense_original_assembly(
+                rho,
+                bundle,
+                mode,
+                force_spectral_logdet,
+                populate_inner_kkt,
+            )
         } else {
             // Reached for the transformed-QS active-set branch (where
             // `free_basis_opt` rotates into a reduced subspace) or a non-QS
@@ -1785,7 +1899,7 @@ impl<'a> RemlState<'a> {
                 "[reml-assembly] build_dense_assembly path \
                  (transformed-QS active-set, or non-QS frame)"
             );
-            self.build_dense_assembly(rho, bundle, mode, force_spectral_logdet)
+            self.build_dense_assembly(rho, bundle, mode, force_spectral_logdet, populate_inner_kkt)
         }
     }
 
@@ -2636,8 +2750,9 @@ impl<'a> RemlState<'a> {
         // maps β and H back to the original basis so every ingredient agrees
         // with the canonical-penalty coordinate frame.
         // No design-moving ψ on this bridge (pure-ρ cost/gradient): the LLT
-        // value-only fast path stays eligible.
-        let assembly = self.build_auto_assembly(rho, bundle, mode, false)?;
+        // value-only fast path stays eligible. Pure-ρ fits present exact-KKT
+        // (no inner-KKT envelope), so this path is byte-unchanged.
+        let assembly = self.build_auto_assembly(rho, bundle, mode, false, false)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
@@ -2648,7 +2763,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
-        let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
+        let assembly = self.build_sparse_assembly(rho, bundle, mode, false)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
@@ -2669,9 +2784,9 @@ impl<'a> RemlState<'a> {
         // differentiates — otherwise the LLT fast path's exact `Σ ln σ` desyncs
         // from the analytic `tr(G_ε Ḣ)` on the ψ block (the headline #1376 gap).
         let mut assembly = if force_sparse {
-            self.build_sparse_assembly(rho, bundle, mode)?
+            self.build_sparse_assembly(rho, bundle, mode, false)?
         } else {
-            self.build_auto_assembly(rho, bundle, mode, true)?
+            self.build_auto_assembly(rho, bundle, mode, true, false)?
         };
         let p_dim = assembly.beta.len();
         assembly.ext_coords = (0..synthetic_ext_count)
@@ -2768,7 +2883,13 @@ impl<'a> RemlState<'a> {
         // `log|H|` even on a value-only probe so the cost matches the floored
         // determinant the gradient path differentiates via `tr(G_ε Ḣ)`.
         let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet)?;
+        // ψ/aniso ext coordinates are equally hypersensitive to a capped inner
+        // β̂, but engaging the envelope correction here touches the whole
+        // Matérn/Duchon/tensor ψ suite; keep this path on the exact-KKT
+        // assumption for now (the SAS/mixture link-ext path below carries the
+        // #1876 fix). Present exact-KKT (populate_inner_kkt = false).
+        let mut assembly =
+            self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet, false)?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
@@ -3381,7 +3502,19 @@ impl<'a> RemlState<'a> {
         // with the gradient path's smooth-floored `log|H|`; force the spectral
         // logdet so the LLT exact-determinant fast path cannot desync the cost.
         let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet)?;
+        // #1876: the SAS/mixture flexible-link optimizer accepts the inner β̂ at
+        // a first-order cap (`outer_inner_cap`); the link-parameter gradient is
+        // hypersensitive to that capped β̂ (`coord.g ~ 1e4`+), so a ~1e-4 β̂ error
+        // silently collapses the ε gradient to near-zero and the optimizer
+        // stalls at the wrong skewness. Engage the inner-KKT envelope correction
+        // `Ṽ = V − ½·rᵀH⁻¹r` (populate_inner_kkt = true) so the outer value AND
+        // gradient are the true stationary-mode quantities rather than the raw
+        // capped-β̂ values. The optimizer's cost closure routes through this same
+        // evaluator (value-only), so cost and gradient stay in sync. The
+        // correction vanishes as `r → 0`, so a converged inner solve is
+        // unchanged.
+        let mut assembly =
+            self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet, true)?;
         let ext_dim = ext_coords.len();
         let p_dim = ext_coords.first().map(|coord| coord.g.len()).unwrap_or(0);
         assembly.ext_coords = ext_coords;
@@ -3454,6 +3587,10 @@ impl<'a> RemlState<'a> {
             bundle,
             super::reml_outer_engine::EvalMode::ValueOnly,
             force_spectral_logdet,
+            // EFS is a universal-form fixed-point λ update, not a
+            // gradient-descent step against the corrected objective; leave the
+            // inner-KKT envelope correction to the gradient/Hessian path.
+            false,
         )?;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)

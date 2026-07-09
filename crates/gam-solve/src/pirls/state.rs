@@ -428,6 +428,19 @@ pub struct PirlsResult {
     /// the scale-invariant residual r_g = ‖g‖ / (1 + this) without rebuilding
     /// the score and penalty norms.
     pub gradient_natural_scale: f64,
+    /// Penalized inner KKT residual `r = ∇_β L_pen(β̂) = Sβ̂ − ∇ℓ(β̂) (+ridge·β̂)`
+    /// at the accepted P-IRLS iterate, in the STABLE/TRANSFORMED coefficient
+    /// basis (the same frame as `beta_transformed` and the transformed penalized
+    /// Hessian). This is the exact vector whose L2 norm `lastgradient_norm`
+    /// records (see `WorkingState::gradient`, assembled as `Xᵀ(η−z)·w + Sβ`,
+    /// which equals `Sβ − ∇ℓ` because `Xᵀ(η−z)·w = −∇ℓ`). Storing the vector —
+    /// not just its norm — lets the outer REML/LAML evaluator engage the
+    /// inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on the flexible-link
+    /// (SAS/mixture) path, where the outer optimizer accepts β̂ at a first-order
+    /// inner cap (`outer_inner_cap`) short of exact stationarity. The correction
+    /// and its θ-gradient vanish as `r → 0`, so a fully-converged fit is
+    /// unchanged. See [`crate::model_types::ProjectedKktResidual`].
+    pub penalized_gradient_transformed: Array1<f64>,
     pub last_deviance_change: f64,
     pub last_step_halving: usize,
     pub hessian_curvature: HessianCurvatureKind,
@@ -560,6 +573,10 @@ impl PirlsResult {
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
             gradient_natural_scale: self.gradient_natural_scale,
+            // Length-p vector; carried across compaction/rehydration so the
+            // inner-KKT envelope correction survives an LRU round-trip without
+            // rebuilding the score from the (dropped) transformed design.
+            penalized_gradient_transformed: self.penalized_gradient_transformed.clone(),
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
@@ -655,6 +672,10 @@ impl PirlsResult {
             max_abs_eta: self.max_abs_eta,
             lastgradient_norm: self.lastgradient_norm,
             gradient_natural_scale: self.gradient_natural_scale,
+            // Length-p vector; carried across compaction/rehydration so the
+            // inner-KKT envelope correction survives an LRU round-trip without
+            // rebuilding the score from the (dropped) transformed design.
+            penalized_gradient_transformed: self.penalized_gradient_transformed.clone(),
             last_deviance_change: self.last_deviance_change,
             last_step_halving: self.last_step_halving,
             hessian_curvature: self.hessian_curvature,
