@@ -217,7 +217,11 @@ impl SaeManifoldTerm {
         // overshoot into a block-abandonment runaway).
         const MAX_BACKTRACK: usize = 12;
 
-        // Initial fit at the starting weights + its criterion.
+        // Initial fit at the starting weights. Besides seeding the warm start and
+        // `loss`, this runs BEFORE the first `fit_state_snapshot`, so any one-shot
+        // atom rank reduction ([`Self::reduce_atoms_to_data_supported_rank`]) has
+        // already settled the decoder/basis widths: every in-loop snapshot and its
+        // in-place `.assign` restore then share one width and cannot shape-mismatch.
         let augmented = stack_augmented_target(anchor, blocks)?;
         let mut loss = self.run_joint_fit_arrow_schur(
             augmented.view(),
@@ -228,19 +232,55 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
-        let (mut rss_x, init_scaled) =
-            self.augmented_block_rss(augmented.view(), rho, px, &dims)?;
-        let mut block_rss_unscaled: Vec<f64> = (0..blocks.len())
-            .map(|i| init_scaled[i] / cur_log_lambda[i].exp())
-            .collect();
-        let mut cur_criterion =
-            profiled_reml_criterion(n_obs, px, rss_x, &block_rss_unscaled, &dims, &cur_log_lambda);
-
+        // No fitted RESIDUAL is carried across sweeps. Each sweep recomputes the
+        // residual from a fresh refit-at-current-λ (the F1 baseline below), so the
+        // closed-form λ* and the Armijo reference both read residuals produced with
+        // the SAME inner budget the trials get; only `cur_log_lambda` and the
+        // warm-start term state persist between sweeps. (`augmented` above seeded
+        // the warm start and `loss`.)
         while sweeps < max_sweeps {
             sweeps += 1;
 
-            // Closed-form λ_ℓ target per identifiable block from the CURRENT
-            // fit's unscaled residuals (λ_ℓ* = (R_x/p_x)/(R_ℓ/p_ℓ)).
+            // Sweep-entry warm-start state. Both the current-λ baseline and every
+            // backtracking trial refit from THIS same snapshot with the SAME inner
+            // budget, so their criteria differ only by the λ they were fit at.
+            let base = self.fit_state_snapshot();
+
+            // F1 — refit-at-current-λ baseline. A backtracking trial runs a full
+            // `run_joint_fit_arrow_schur` with a fresh `inner_max_iter` budget, so
+            // it can lower the profiled criterion purely by spending the truncated
+            // inner solve's LEFTOVER descent at the SAME λ — inner-solve progress
+            // masquerading as λ progress. To make the Armijo test a test of λ, the
+            // value a trial must beat is itself a refit from `base` with the same
+            // budget at the UNCHANGED λ: both sides start from one state and spend
+            // one budget, differing only in λ. This baseline also gives the closed-
+            // form λ* the residuals of the fit AT the current λ, not stale residuals
+            // from the previous sweep's (differently-weighted) fit.
+            self.fit_state_restore(&base)?;
+            let base_aug = stack_augmented_target(anchor, blocks)?;
+            let base_loss = self.run_joint_fit_arrow_schur(
+                base_aug.view(),
+                rho,
+                analytic_penalties,
+                inner_max_iter,
+                step_size,
+                ridge_ext_coord,
+                ridge_beta,
+            )?;
+            let (base_rx, base_scaled) = self.augmented_block_rss(base_aug.view(), rho, px, &dims)?;
+            let base_unscaled: Vec<f64> = (0..blocks.len())
+                .map(|i| base_scaled[i] / cur_log_lambda[i].exp())
+                .collect();
+            let baseline_crit =
+                profiled_reml_criterion(n_obs, px, base_rx, &base_unscaled, &dims, &cur_log_lambda);
+            // The improved current-λ fit to fall back to if no λ step is accepted.
+            let baseline_state = self.fit_state_snapshot();
+            // The term currently holds this baseline fit; record its loss so any
+            // convergence/stall break below reports the state actually installed.
+            loss = base_loss;
+
+            // Closed-form λ_ℓ target per identifiable block from the CURRENT-λ
+            // refit's unscaled residuals (λ_ℓ* = (R_x/p_x)/(R_ℓ/p_ℓ)).
             let mut log_lambda_star = cur_log_lambda.clone();
             let mut any_update = false;
             let mut max_delta = 0.0_f64;
@@ -248,8 +288,8 @@ impl SaeManifoldTerm {
                 if !identifiable[idx] {
                     continue;
                 }
-                let r_ell = block_rss_unscaled[idx];
-                let var_x = rss_x / px as f64;
+                let r_ell = base_unscaled[idx];
+                let var_x = base_rx / px as f64;
                 if !(r_ell > 0.0) || !(var_x > 0.0) {
                     // No block residual variance ⇒ λ_ℓ unidentifiable; hold it.
                     identifiable[idx] = false;
@@ -262,15 +302,10 @@ impl SaeManifoldTerm {
                 any_update = true;
             }
 
-            if !any_update {
-                // Every block held ⇒ no weight can move.
-                converged = true;
-                for idx in 0..blocks.len() {
-                    trajectories[idx].push(cur_log_lambda[idx]);
-                }
-                break;
-            }
-            if max_delta <= log_lambda_tol {
+            if !any_update || max_delta <= log_lambda_tol {
+                // Either every block is held (no weight can move) or the λ fixed
+                // point is within tolerance — converged in the documented sense.
+                // The term holds the current-λ baseline fit, which is the answer.
                 converged = true;
                 for idx in 0..blocks.len() {
                     trajectories[idx].push(cur_log_lambda[idx]);
@@ -279,13 +314,13 @@ impl SaeManifoldTerm {
             }
 
             // Armijo backtracking on the profiled criterion: take the largest
-            // fraction `s` of the closed-form log-λ step whose refit strictly
-            // decreases the criterion. Each trial refits from the SAME snapshot so
-            // the trials are comparable, and the criterion penalises λ→0, so a
-            // step that would abandon a block is rejected — the fix that makes the
+            // fraction `s` of the closed-form log-λ step whose refit strictly beats
+            // the refit-at-current-λ baseline. Each trial refits from the SAME
+            // `base` snapshot with the SAME inner budget as the baseline, so the
+            // comparison isolates the λ move; the criterion penalises λ→0, so a step
+            // that would abandon a block is rejected — the fix that makes the
             // otherwise non-contractive (fit, λ-update) alternation monotone.
-            let base = self.fit_state_snapshot();
-            let armijo_eps = 1e-9 * (1.0 + cur_criterion.abs());
+            let armijo_eps = 1e-9 * (1.0 + baseline_crit.abs());
             let mut s = 1.0_f64;
             let mut accepted = false;
             for _bt in 0..MAX_BACKTRACK {
@@ -344,11 +379,8 @@ impl SaeManifoldTerm {
                     .collect();
                 let trial_crit =
                     profiled_reml_criterion(n_obs, px, trx, &trb_unscaled, &dims, &trial_ll);
-                if trial_crit < cur_criterion - armijo_eps {
+                if trial_crit < baseline_crit - armijo_eps {
                     cur_log_lambda = trial_ll;
-                    cur_criterion = trial_crit;
-                    rss_x = trx;
-                    block_rss_unscaled = trb_unscaled;
                     loss = trial_loss;
                     accepted = true;
                     break;
@@ -357,22 +389,27 @@ impl SaeManifoldTerm {
             }
 
             if !accepted {
-                // No fraction of the step improves the criterion ⇒ we are at a
-                // criterion stationary point; restore the base state and stop.
+                // No fraction of the closed-form λ step beats the current-λ
+                // baseline: moving λ cannot lower the criterion from here. Reinstate
+                // the improved current-λ fit (`baseline_state`, no worse than the
+                // sweep-entry state) at the unchanged weights and stop.
+                //
+                // F4 — honest flag. This branch is reached ONLY after the
+                // `max_delta ≤ log_lambda_tol` gate above FAILED, so the closed-form
+                // λ* still wants a > tol move: the λ fixed-point iteration did NOT
+                // meet its tolerance. A step that then fails the line search is a
+                // STALL (the truncated inner solve cannot resolve the tiny
+                // coordinated improvement the move needs), not tolerance-
+                // convergence. Leaving `converged = false` keeps the flag honest in
+                // BOTH directions — `true` only when λ actually settled (or every
+                // block became inert), `false` for a stall or a `max_sweeps`
+                // exhaustion.
                 for idx in 0..blocks.len() {
                     blocks[idx] = blocks[idx].with_log_lambda(cur_log_lambda[idx])?;
                 }
-                self.fit_state_restore(&base)?;
-                loss = self.run_joint_fit_arrow_schur(
-                    stack_augmented_target(anchor, blocks)?.view(),
-                    rho,
-                    analytic_penalties,
-                    0,
-                    step_size,
-                    ridge_ext_coord,
-                    ridge_beta,
-                )?;
-                converged = true;
+                self.fit_state_restore(&baseline_state)?;
+                loss = base_loss;
+                converged = false;
                 for idx in 0..blocks.len() {
                     trajectories[idx].push(cur_log_lambda[idx]);
                 }
@@ -433,27 +470,35 @@ impl SaeManifoldTerm {
         Ok((rss_x, out))
     }
 
-    /// Snapshot the mutable fit state (decoder β + every atom's latent coords) so
-    /// a λ line-search trial can refit from the same base and be rolled back.
-    fn fit_state_snapshot(&self) -> (Array1<f64>, Vec<Array1<f64>>) {
-        let beta = self.flatten_beta();
-        let coords: Vec<Array1<f64>> = (0..self.atoms.len())
-            .map(|k| {
-                let flat: Vec<f64> = self.assignment.coords[k].as_matrix().iter().copied().collect();
-                Array1::from(flat)
-            })
-            .collect();
-        (beta, coords)
+    /// Snapshot the ENTIRE mutable fit state a λ line-search trial perturbs, so a
+    /// rejected trial rolls back to a bit-identical base.
+    ///
+    /// A trial runs a full [`Self::run_joint_fit_arrow_schur`], which moves far
+    /// more than the decoder β and latent coords: it refreshes each atom's cached
+    /// `basis_values` / `basis_jacobian` and (lagged-diffusivity) `smooth_penalty`,
+    /// rewrites the assignment `logits`, re-derives the active-set `last_row_layout`,
+    /// and advances the Gumbel `temperature_schedule` one anneal step per inner
+    /// iteration. The canonical [`Self::snapshot_mutable_state`] captures the first
+    /// group (the same state the inner damped-Newton line search itself rolls back);
+    /// the schedule is a per-call *stateful* counter, so a rejected trial that
+    /// leaves it advanced would start the next trial at a colder temperature and
+    /// make the backtracking trials incomparable — capture it here too. (An atom
+    /// rank reduction, [`Self::reduce_atoms_to_data_supported_rank`], is idempotent
+    /// after the sweep-entry fit, so the restored decoder width always matches.)
+    fn fit_state_snapshot(&self) -> (SaeManifoldMutableState, Option<GumbelTemperatureSchedule>) {
+        (self.snapshot_mutable_state(), self.temperature_schedule.clone())
     }
 
-    /// Restore a [`Self::fit_state_snapshot`]. The caller must refit (or run a
-    /// zero-iteration basis refresh) afterwards so the cached basis matches the
-    /// restored coords before any residual/fitted read.
-    fn fit_state_restore(&mut self, snap: &(Array1<f64>, Vec<Array1<f64>>)) -> Result<(), String> {
-        self.set_flat_beta(snap.0.view())?;
-        for (k, flat) in snap.1.iter().enumerate() {
-            self.assignment.coords[k].set_flat(flat.view());
-        }
+    /// Restore a [`Self::fit_state_snapshot`]. Because the snapshot carries the
+    /// refreshed `basis_values` / `basis_jacobian` (not just the coords), the
+    /// restored state is immediately consistent for a residual/fitted read — no
+    /// post-restore basis refresh is required.
+    fn fit_state_restore(
+        &mut self,
+        snap: &(SaeManifoldMutableState, Option<GumbelTemperatureSchedule>),
+    ) -> Result<(), String> {
+        self.restore_mutable_state(&snap.0);
+        self.temperature_schedule.clone_from(&snap.1);
         Ok(())
     }
 }
