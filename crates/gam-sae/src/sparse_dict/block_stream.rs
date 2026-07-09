@@ -425,7 +425,7 @@ impl BlockSparseStreamState {
             self.k,
             self.config.minibatch,
             self.config.block_tile,
-        );
+        )?;
         let base_index = self.row_count as u64;
         let mut shard_rss = 0.0f64;
         for (r, code) in codes.iter().enumerate() {

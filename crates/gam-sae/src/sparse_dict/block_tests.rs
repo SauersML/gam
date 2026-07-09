@@ -366,7 +366,8 @@ fn near_orthogonal_row_is_orphaned_by_gate_floor() {
     let mut x = Array2::<f32>::zeros((1, p));
     x[[0, 2]] = 1.0;
 
-    let codes = route_and_code_all(x.view(), decoder.view(), 1.0, n_blocks, b, k, 1, 1);
+    let codes = route_and_code_all(x.view(), decoder.view(), 1.0, n_blocks, b, k, 1, 1)
+        .expect("CPU block route is infallible");
     assert_eq!(codes.len(), 1);
     let code = &codes[0];
     assert!(

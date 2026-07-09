@@ -494,7 +494,7 @@ pub(super) fn route_and_code_all(
     k: usize,
     minibatch: usize,
     block_tile: usize,
-) -> Vec<RowBlockCode> {
+) -> Result<Vec<RowBlockCode>, String> {
     let n = x.nrows();
     let batch = minibatch.max(1);
     let mut out: Vec<RowBlockCode> = Vec::with_capacity(n);
@@ -502,7 +502,7 @@ pub(super) fn route_and_code_all(
     while start < n {
         let end = (start + batch).min(n);
         let mb = x.slice(ndarray::s![start..end, ..]);
-        let routed = route_block_minibatch(mb, decoder, n_blocks, b, k, block_tile);
+        let routed = route_block_minibatch_dispatch(mb, decoder, n_blocks, b, k, block_tile)?;
         let mut coded: Vec<RowBlockCode> = mb
             .axis_iter(Axis(0))
             .into_par_iter()
@@ -519,7 +519,56 @@ pub(super) fn route_and_code_all(
         out.append(&mut coded);
         start = end;
     }
-    out
+    Ok(out)
+}
+
+/// Route one minibatch's blocks, dispatching to the CUDA block-gate router when a
+/// device residency mode asks for it and a CUDA runtime is actually present, and
+/// to the CPU router ([`route_block_minibatch`]) otherwise.
+///
+/// The dispatch honours the process-wide [`gam_gpu::GpuMode`]: `Off` (or any
+/// device-absent host, which is all of CI) always takes the exact CPU router, so
+/// device-absent behaviour is bit-for-bit unchanged; `Auto` uses the device when
+/// admitted and above break-even and transparently falls back to the CPU oracle
+/// otherwise (the fallback is logged once by the block-gate router, never
+/// silent); `Required` propagates a device fault as a typed `Err` up through the
+/// fallible fit rather than degrading silently. The device route carries the
+/// #2227 bounded-progress checkpoints, so a device stall surfaces as a
+/// tile-attributed error instead of a silent hang.
+fn route_block_minibatch_dispatch(
+    mb: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    n_blocks: usize,
+    b: usize,
+    k: usize,
+    block_tile: usize,
+) -> Result<Vec<Vec<(u32, f32)>>, String> {
+    let mode = gam_gpu::gpu_mode();
+    #[cfg(target_os = "linux")]
+    {
+        if mode != gam_gpu::GpuMode::Off && gam_gpu::GpuRuntime::global().is_some() {
+            // Under `Auto`, only hand a minibatch to the device when the score
+            // work clears the launch break-even; below it we take the exact CPU
+            // router (`route_block_minibatch`) so device-present hosts keep
+            // bit-for-bit CPU behaviour instead of switching to the block-gate
+            // CPU oracle's scalar-dot ties. `Required` always routes through the
+            // device entry point, which fails closed on a below-break-even block.
+            let admitted = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
+                mb.nrows(),
+                decoder.nrows(),
+                decoder.ncols(),
+            )
+            .device_admitted;
+            if mode == gam_gpu::GpuMode::Required || admitted {
+                let (selections, _path, _dtoh) =
+                    super::block_scoring_gpu::route_blocks_required(mb, decoder, b, k, mode)
+                        .map_err(|err| err.to_string())?;
+                return Ok(selections);
+            }
+        }
+    }
+    let _ = mode;
+    Ok(route_block_minibatch(mb, decoder, n_blocks, b, k, block_tile))
 }
 
 /// Fixed-width sparse code for one row from its `(block, gate)` shortlist: the
@@ -908,10 +957,10 @@ fn prefix_reconstruction_loss(
     block_topk: usize,
     minibatch: usize,
     block_tile: usize,
-) -> f64 {
+) -> Result<f64, String> {
     let n_blocks = decoder.nrows() / b;
     let k = block_topk.min(n_blocks).max(1);
-    let codes = route_and_code_all(x, decoder, gamma, n_blocks, b, k, minibatch, block_tile);
+    let codes = route_and_code_all(x, decoder, gamma, n_blocks, b, k, minibatch, block_tile)?;
     let mut acc = 0.0f64;
     for (i, code) in codes.iter().enumerate() {
         let xi = x.row(i);
@@ -924,7 +973,7 @@ fn prefix_reconstruction_loss(
             .collect();
         acc += row_loss(xi, decoder, &selected, gamma, b);
     }
-    acc / x.nrows() as f64
+    Ok(acc / x.nrows() as f64)
 }
 
 fn matryoshka_prefix_losses(
@@ -936,7 +985,7 @@ fn matryoshka_prefix_losses(
     block_topk: usize,
     minibatch: usize,
     block_tile: usize,
-) -> Vec<(usize, f64)> {
+) -> Result<Vec<(usize, f64)>, String> {
     let mut out = Vec::new();
     let mut best = f64::INFINITY;
     for k_atoms in log_spaced_prefix_atom_counts(n_blocks, b) {
@@ -949,11 +998,11 @@ fn matryoshka_prefix_losses(
             block_topk,
             minibatch,
             block_tile,
-        );
+        )?;
         best = best.min(loss);
         out.push((k_atoms, best));
     }
-    out
+    Ok(out)
 }
 
 fn matryoshka_block_order(codes: &[RowBlockCode], n_blocks: usize, b: usize) -> Vec<usize> {
@@ -1143,7 +1192,7 @@ pub fn fit_block_sparse_dictionary(
         k,
         config.minibatch,
         config.block_tile,
-    );
+    )?;
 
     let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
@@ -1172,7 +1221,7 @@ pub fn fit_block_sparse_dictionary(
             k,
             config.minibatch,
             config.block_tile,
-        );
+        )?;
 
         let ev = explained_variance(x, &codes, decoder.view(), gamma, b);
         let improve = ev - prev_ev;
@@ -1201,7 +1250,7 @@ pub fn fit_block_sparse_dictionary(
             k,
             config.minibatch,
             config.block_tile,
-        );
+        )?;
     }
     let final_ev = explained_variance(x, &codes, decoder.view(), gamma, b);
     let (block_utilization, block_stable_rank) = block_reports(&codes, g, b, n);
@@ -1215,7 +1264,7 @@ pub fn fit_block_sparse_dictionary(
             k,
             config.minibatch,
             config.block_tile,
-        )
+        )?
     } else {
         Vec::new()
     };
@@ -1328,7 +1377,7 @@ pub fn block_sparse_dictionary_transform(
     // Route + tied-code every row (block-tiled internally, never N×K). A generous
     // minibatch keeps the peak working set bounded without materialising M×G.
     let minibatch = 4096usize;
-    let codes = route_and_code_all(x, decoder, gamma, g, b, k, minibatch, block_tile.max(1));
+    let codes = route_and_code_all(x, decoder, gamma, g, b, k, minibatch, block_tile.max(1))?;
 
     let m = x.nrows();
     let mut blocks = Array2::<u32>::zeros((m, k));

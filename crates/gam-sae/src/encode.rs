@@ -1066,6 +1066,112 @@ pub(crate) fn encode_grad_hess(
     x: ArrayView1<'_, f64>,
     amplitude: f64,
 ) -> Result<Option<(Array1<f64>, Array2<f64>)>, String> {
+    // The bare Euclidean, prior-free objective — the historical field, bit-identical
+    // to the metric-free encode (see [`encode_grad_hess_core`], `EncodeObjective`).
+    encode_grad_hess_core(
+        atom,
+        evaluator,
+        t,
+        x,
+        amplitude,
+        &EncodeObjective::euclidean(),
+    )
+}
+
+/// The TRUE per-row encode objective's non-Euclidean ingredients (F3), so the
+/// Kantorovich certificate certifies the SAME functional the fit optimized `t`
+/// against — not a bare Euclidean stand-in.
+///
+/// The fit's per-row data loss is generalized least squares `½ rᵀ M_n r`
+/// (`r = m(t) − x`) under a per-row output metric `M_n = U_n U_nᵀ`
+/// ([`gam_problem::RowMetric`]), plus a per-axis latent coordinate prior
+/// `Σ_a ArdAxisPrior(α_a, t_a)` (the ARD Gaussian / von-Mises energy the fit
+/// placed on the coordinate). The metric-free encode drops BOTH, so its certified
+/// root solves a different problem whenever a non-identity metric or an active
+/// prior is present. `EncodeObjective` threads them back in:
+///
+/// * `metric_factor` — the per-row factor `U_n ∈ ℝ^{p×rank}`; `None` ⇒ `M = I`.
+///   Whitening reduces to `M r = U(Uᵀr)` and `Jᵀ M J = (UᵀJ)ᵀ(UᵀJ)`.
+/// * `prior_alpha` — per-axis ARD precision `α_a` (the caller folds in any row
+///   weight); `None`/`0` ⇒ no prior on that axis. The period is read from the
+///   atom's basis kind so a periodic axis uses the von-Mises energy.
+/// * `metric_norm_bound` — a GLOBAL upper bound `max_n ‖M_n‖` used to scale the
+///   offline chart Lipschitz (the per-row `M_n` enters `β, η` online; the
+///   certificate needs a valid `L` upper bound, and `L_data` scales by `‖M‖`).
+///
+/// [`EncodeObjective::euclidean`] (all `None`, bound `1`) reproduces the metric-
+/// free field bit-for-bit, so every existing caller is unchanged.
+#[derive(Clone, Copy)]
+pub struct EncodeObjective<'a> {
+    /// Per-row output-metric factor `U ∈ ℝ^{p×rank}` (`M = U Uᵀ`). `None` ⇒ `I`.
+    pub metric_factor: Option<ArrayView2<'a, f64>>,
+    /// Per-axis ARD precision `α_a` (row weight folded in). `None` ⇒ no prior.
+    pub prior_alpha: Option<&'a [f64]>,
+    /// Global bound `max_n ‖M_n‖` scaling the offline chart Lipschitz. `1.0` for
+    /// the Euclidean objective.
+    pub metric_norm_bound: f64,
+}
+
+impl<'a> EncodeObjective<'a> {
+    /// The bare Euclidean, prior-free objective — every code path is bit-identical
+    /// to the metric-free encode under this value.
+    pub fn euclidean() -> Self {
+        Self {
+            metric_factor: None,
+            prior_alpha: None,
+            metric_norm_bound: 1.0,
+        }
+    }
+
+    /// Closed-form Lipschitz contribution of the latent prior's third derivative.
+    /// The Gaussian (non-periodic) prior is quadratic, so `prior''' ≡ 0`; the
+    /// von-Mises (periodic) prior has `hess = α cos(κt)` ⇒ `third = −α κ sin(κt)`,
+    /// bounded by `α·κ` with `κ = 2π/period`. Summed over axes (a conservative
+    /// bound on the diagonal third-order tensor's operator norm — over-estimating
+    /// `L` only shrinks the certified radius, never certifies a divergent start).
+    fn prior_lipschitz(&self, atom: &SaeManifoldAtom) -> f64 {
+        let Some(alpha) = self.prior_alpha else {
+            return 0.0;
+        };
+        let mut l = 0.0;
+        for axis in 0..atom.latent_dim.min(alpha.len()) {
+            if let Some(period) = latent_axis_period(atom, axis) {
+                let kappa = std::f64::consts::TAU / period;
+                l += alpha[axis].abs() * kappa;
+            }
+        }
+        l
+    }
+
+    /// The chart's Kantorovich Lipschitz for the TRUE objective: the stored
+    /// Euclidean data-term bound `data_lipschitz` scaled by the global metric
+    /// operator-norm bound (`½ rᵀM r`'s Hessian-Lipschitz is `‖M‖·L_data`), plus
+    /// the prior's third-derivative bound. Reduces to `data_lipschitz` exactly for
+    /// [`Self::euclidean`] (`1·L + 0`).
+    fn effective_lipschitz(&self, atom: &SaeManifoldAtom, data_lipschitz: f64) -> f64 {
+        self.metric_norm_bound * data_lipschitz + self.prior_lipschitz(atom)
+    }
+}
+
+/// Apply the per-row output metric `M = U Uᵀ` to a residual/tangent vector:
+/// `M v = U (Uᵀ v)`, `U ∈ ℝ^{p×rank}`. `O(p·rank)`, never the dense `p×p`.
+fn apply_row_metric(u: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Array1<f64> {
+    let utv = u.t().dot(&v); // Uᵀ v ∈ ℝ^rank
+    u.dot(&utv) // U (Uᵀ v) ∈ ℝ^p
+}
+
+/// Objective-aware gradient/Hessian of the certified encode field (F3). With
+/// [`EncodeObjective::euclidean`] this is bit-for-bit the historical metric-free
+/// field; with a metric it whitens the residual through `M = U Uᵀ`, and with a
+/// prior it adds the ARD/von-Mises gradient and (diagonal) Hessian.
+pub(crate) fn encode_grad_hess_core(
+    atom: &SaeManifoldAtom,
+    evaluator: &dyn SaeBasisEvaluator,
+    t: ArrayView1<'_, f64>,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+    objective: &EncodeObjective<'_>,
+) -> Result<Option<(Array1<f64>, Array2<f64>)>, String> {
     let d = atom.latent_dim;
     let p = atom.output_dim();
     let m = atom.basis_size();
@@ -1109,29 +1215,46 @@ pub(crate) fn encode_grad_hess(
         Some(result) => result?,
         None => return Ok(None),
     };
-    // Residual · decoder-row `r·B_{basis,:}` is INDEPENDENT of the (a,b) axes, yet
-    // the old code recomputed it `d²` times inside the Hessian double loop. Hoist it
+    // F3 — metric whitening. The certified objective is `½ rᵀ M r`, so the field
+    // reads the M-weighted residual `M r` and M-weighted image tangents `M J_m[a]`.
+    // With no metric (`None`) `wr` aliases `residual` and `jb` aliases `jm.row(b)`,
+    // so the assembly below is the historical Euclidean field bit-for-bit.
+    let mr_owned;
+    let wr: &Array1<f64> = match objective.metric_factor {
+        Some(u) => {
+            mr_owned = apply_row_metric(u, residual.view());
+            &mr_owned
+        }
+        None => &residual,
+    };
+    let mjm: Option<Vec<Array1<f64>>> = objective
+        .metric_factor
+        .map(|u| (0..d).map(|a| apply_row_metric(u, jm.row(a))).collect());
+    // (M-weighted) residual · decoder-row is INDEPENDENT of the (a,b) axes; hoist it
     // to one O(m·p) pass so the per-axis curvature term is a cheap O(m) dot.
     let mut rd = vec![0.0_f64; m];
     for (basis_col, rd_col) in rd.iter_mut().enumerate() {
         let mut dot = 0.0;
         for out in 0..p {
-            dot += residual[out] * decoder[[basis_col, out]];
+            dot += wr[out] * decoder[[basis_col, out]];
         }
         *rd_col = dot;
     }
-    // g_t[axis] = J_m[axis] · r ;  H_tt[a,b] = J_m[a]·J_m[b] + r·∂²m/∂t_a∂t_b.
+    // g_t[a] = J_m[a] · (M r) ;  H_tt[a,b] = J_m[a]·(M J_m[b]) + (M r)·∂²m/∂t_a∂t_b.
     // The full Hessian is symmetric (Gauss-Newton block + symmetric second jet), so
     // compute the upper triangle and mirror — half the curvature work.
     let mut g = Array1::<f64>::zeros(d);
     let mut h = Array2::<f64>::zeros((d, d));
     for a in 0..d {
         let ja = jm.row(a);
-        g[a] = ja.dot(&residual);
+        g[a] = ja.dot(wr);
         for b in a..d {
-            // Gauss-Newton block.
-            let mut hab = ja.dot(&jm.row(b));
-            // Residual · second-jet curvature: r · ∂²m_{ab},
+            // Gauss-Newton block `J_aᵀ M J_b` (Euclidean: `J_aᵀ J_b`).
+            let mut hab = match &mjm {
+                Some(v) => ja.dot(&v[b]),
+                None => ja.dot(&jm.row(b)),
+            };
+            // (M-weighted) residual · second-jet curvature: (M r) · ∂²m_{ab},
             // ∂²m_{ab}[out] = z · Σ_basis (∂²Φ/∂t_a∂t_b) · B[basis, out].
             let mut curv = 0.0;
             for basis_col in 0..m {
@@ -1144,6 +1267,22 @@ pub(crate) fn encode_grad_hess(
             hab += curv;
             h[[a, b]] = hab;
             h[[b, a]] = hab;
+        }
+    }
+    // F3 — latent coordinate prior. The fit placed an ARD (Gaussian) / von-Mises
+    // (periodic) prior on `t`; its energy enters the certified objective, so its
+    // gradient and (per-axis diagonal) Hessian enter the Newton field. Absent for
+    // `EncodeObjective::euclidean` (no allocation, no arithmetic).
+    if let Some(alpha) = objective.prior_alpha {
+        for axis in 0..d.min(alpha.len()) {
+            let alpha_axis = alpha[axis];
+            if alpha_axis == 0.0 {
+                continue;
+            }
+            let pr =
+                crate::manifold::ArdAxisPrior::eval(alpha_axis, t[axis], latent_axis_period(atom, axis));
+            g[axis] += pr.grad;
+            h[[axis, axis]] += pr.hess;
         }
     }
     // NO ridge: the certificate must use the TRUE Hessian (F2). See the doc above.

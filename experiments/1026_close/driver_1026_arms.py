@@ -133,6 +133,23 @@ def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
     return ev
 
 
+def fit_pca_bar(x_tr, x_te, mean_tr, *, ranks):
+    """Affine PCA held-out EV at each rank — the linear-optimum yardstick
+    (rank-k PCA is EV-optimal among ALL linear rank-k reconstructions)."""
+    xc = x_tr - mean_tr[None, :]
+    cov = (xc.T @ xc) / max(xc.shape[0] - 1, 1)
+    w, v = np.linalg.eigh(cov.astype(np.float64))
+    order = np.argsort(w)[::-1]
+    v = v[:, order]
+    out = {}
+    tc = x_te - mean_tr[None, :]
+    for r in ranks:
+        vr = v[:, :r]
+        recon = (tc @ vr) @ vr.T + mean_tr[None, :]
+        out[f"pca_ev_r{r}"] = held_out_ev(x_te, recon, mean_tr)
+    return out
+
+
 def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed):
     import gamfit
 
@@ -243,7 +260,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True,
                     choices=["external_topk", "gam_flat", "curved_topk",
-                             "torch_manifold", "hybrid"])
+                             "torch_manifold", "hybrid", "pca_bar"])
     ap.add_argument("--chunk-dir", required=True)
     ap.add_argument("--max-rows", type=int, default=120_000)
     ap.add_argument("--test-frac", type=float, default=0.2)
@@ -292,6 +309,9 @@ def main() -> int:
                                 steps=args.steps, lr=args.lr, bs=args.batch_size,
                                 seed=args.seed, manifold=args.atom_manifold,
                                 basis=args.atom_basis)
+    elif args.arm == "pca_bar":
+        extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
+        ev = extra[f"pca_ev_r{args.top_k}"] if f"pca_ev_r{args.top_k}" in extra else extra["pca_ev_r32"]
     else:  # hybrid
         ev, ev_flat = fit_hybrid(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                  curved_atoms=args.curved_atoms, curved_k=args.curved_k,
