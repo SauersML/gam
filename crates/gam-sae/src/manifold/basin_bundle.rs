@@ -101,16 +101,32 @@ impl<S> BasinBundle<S> {
             born_eval: self.eval_counter,
         });
         if self.members.len() > self.max_members {
-            // Evict the worst member that is not the current argmin.
+            // Evict the worst member that is neither the current argmin NOR the
+            // newest (the member just admitted may carry a placeholder value —
+            // e.g. +∞ before its first evaluation — and evicting it here would
+            // undo the admission, contradicting the "admission can only lower
+            // the envelope" contract the evaluate() prune already honors).
             let argmin_idx = self.argmin_index();
-            if let Some(worst) = self
+            let newest_born = self.members.iter().map(|m| m.born_eval).max().unwrap_or(0);
+            let candidate = self
                 .members
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| Some(*i) != argmin_idx)
+                .filter(|(i, m)| Some(*i) != argmin_idx && m.born_eval != newest_born)
                 .max_by(|(_, a), (_, b)| a.last_value.total_cmp(&b.last_value))
                 .map(|(i, _)| i)
-            {
+                // Same-eval admissions can all share `newest_born` (e.g. bundle
+                // seeding before the first evaluation); the cap is a hard
+                // memory bound, so fall back to evicting the worst non-argmin.
+                .or_else(|| {
+                    self.members
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| Some(*i) != argmin_idx)
+                        .max_by(|(_, a), (_, b)| a.last_value.total_cmp(&b.last_value))
+                        .map(|(i, _)| i)
+                });
+            if let Some(worst) = candidate {
                 self.members.swap_remove(worst);
             }
         }
