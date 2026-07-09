@@ -313,18 +313,26 @@ impl RiemannianManifold for SphereManifold {
         let p = point;
         let v = tangent_vec;
 
-        // Small-theta limit: y -> normalize(p + xi) and to first order the map
-        // is exp_p(v) ≈ p + xi, so g_xi = (I - p p^T) g and the radial part
-        // collapses. Use a Taylor-stable branch that matches `exp_map`'s
-        // `theta < 1e-10` switch so backward is consistent with forward.
+        // Small-theta branch of the FORWARD is exactly
+        // `y = normalize(q)`, `q = p + xi`, not the unnormalised first-order
+        // expression. Differentiate that exact branch so the VJP agrees at the
+        // switch, including the radial projection at xi = 0.
         if theta < 1.0e-10 {
-            // xi ≈ 0. dy/dv = (I - p p^T); dy/dp = (1 - c) I - p v^T (from
-            // y ≈ p + v - p(p·v), the first-order normalized expansion).
-            let p_dot_g = dot(p, g.view());
-            // grad_v = (I - p p^T) g = g - p (p·g).
-            let grad_v = &g.to_owned() - &(p.to_owned() * p_dot_g);
-            // grad_p = (1 - c) g - v (p·g)  [transpose of (1-c) I - p v^T].
-            let grad_p = &(g.to_owned() * (1.0 - c)) - &(v.to_owned() * p_dot_g);
+            let q = &p.to_owned() + &xi;
+            let q_norm = norm(q.view());
+            if q_norm <= GEOMETRY_EPS || !q_norm.is_finite() {
+                return Err(GeometryError::InvalidPoint(
+                    "sphere normalization underflow",
+                ));
+            }
+            let y = &q / q_norm;
+            // Normalization adjoint: h = (I - yy^T) g / |q|.
+            let h = (&g.to_owned() - &(&y * dot(y.view(), g))) / q_norm;
+            let p_dot_h = dot(p, h.view());
+            // q_v = I - p p^T.
+            let grad_v = &h - &(p.to_owned() * p_dot_h);
+            // q_p = (1-c)I - p v^T.
+            let grad_p = &(&h * (1.0 - c)) - &(v.to_owned() * p_dot_h);
             return Ok((grad_p, grad_v));
         }
 

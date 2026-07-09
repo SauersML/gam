@@ -769,6 +769,10 @@ fn fit_varying_coefficient_gam(
         }
     }
     let penalty_beta = difference_penalty(beta_cols, config.penalty_order)?;
+    // D_m has `beta_cols - m` independent rows, hence rank(D_m^T D_m) is
+    // exactly `beta_cols - m`. Reading non-zero diagonal entries instead counts
+    // every coefficient touched by the difference operator and overstates rank.
+    let penalty_rank = beta_cols - config.penalty_order;
     let mut penalty = vec![vec![0.0_f64; design_cols]; design_cols];
     for r in 0..beta_cols {
         for c in 0..beta_cols {
@@ -777,11 +781,25 @@ fn fit_varying_coefficient_gam(
     }
     let y: Vec<f64> = rows.iter().map(|&row| gate_j[row]).collect();
     let fit_for_log_lambda = |log_lambda: f64| -> Result<PenalizedFit, String> {
-        penalized_gaussian_fit(&design, &y, likelihood_weights, &penalty, log_lambda)
+        penalized_gaussian_fit(
+            &design,
+            &y,
+            likelihood_weights,
+            &penalty,
+            penalty_rank,
+            log_lambda,
+        )
     };
     let selected_log_smoothing = minimize_reml_log_smoothing(fit_for_log_lambda)?;
     let final_fit =
-        penalized_gaussian_fit(&design, &y, likelihood_weights, &penalty, selected_log_smoothing)?;
+        penalized_gaussian_fit(
+            &design,
+            &y,
+            likelihood_weights,
+            &penalty,
+            penalty_rank,
+            selected_log_smoothing,
+        )?;
     let mut coefficients = vec![0.0_f64; beta_cols];
     coefficients.copy_from_slice(&final_fit.coef[1..]);
     let mut beta_at_rows = Vec::with_capacity(n);
@@ -839,6 +857,7 @@ fn penalized_gaussian_fit(
     y: &[f64],
     weights: &[f64],
     penalty: &[Vec<f64>],
+    penalty_rank: usize,
     log_lambda: f64,
 ) -> Result<PenalizedFit, String> {
     let n = design.len();
@@ -883,8 +902,12 @@ fn penalized_gaussian_fit(
         let solved = cholesky_solve(&factor, &rhs);
         effective_degrees += solved[col];
     }
-    let penalty_rank = penalty_rank_from_diagonal(penalty);
-    let df = (n as f64 - effective_degrees).max(MIN_RESIDUAL_DF);
+    // Frequency/HT weights define the likelihood mass represented by this
+    // sample. The residual degrees of freedom must live on that same measure;
+    // using the selected row count mixed a full-corpus weighted SSE with
+    // selected-sample df and changed the criterion under a common weight scale.
+    let likelihood_mass: f64 = weights.iter().sum();
+    let df = (likelihood_mass - effective_degrees).max(MIN_RESIDUAL_DF);
     let logdet = cholesky_logdet(&factor);
     let reml_score = logdet - penalty_rank as f64 * log_lambda + df * (penalized_sse / df).ln();
     Ok(PenalizedFit {
@@ -1002,19 +1025,6 @@ fn difference_coefficients(order: usize) -> Vec<f64> {
     coeff
 }
 
-fn penalty_rank_from_diagonal(penalty: &[Vec<f64>]) -> usize {
-    let diag_max = penalty
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| row[idx].abs())
-        .fold(0.0_f64, f64::max);
-    let floor = f64::EPSILON * penalty.len().max(1) as f64 * diag_max.max(1.0);
-    penalty
-        .iter()
-        .enumerate()
-        .filter(|(idx, row)| row[*idx].abs() > floor)
-        .count()
-}
 
 fn diagnose_context_labels(
     gate_i: &[f64],

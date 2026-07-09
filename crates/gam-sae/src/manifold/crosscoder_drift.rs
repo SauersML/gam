@@ -53,15 +53,15 @@ pub struct LayerStepDrift {
     /// (a dead/empty atom at that layer).
     pub drift: f64,
     /// Principal angles (radians, ascending) between the two layer images (the row
-    /// spaces of the honest decoders). Length `min(rank_src, rank_tgt)`; empty when
-    /// either image is numerically rank-0.
+    /// spaces of the honest decoders). Length `max(rank_src, rank_tgt)`; unmatched
+    /// directions from a rank change are represented by `π/2`. Empty only when
+    /// both images are numerically rank-0.
     pub principal_angles: Vec<f64>,
 }
 
 impl LayerStepDrift {
     /// The largest principal angle (radians) — the worst-case rotation of the
-    /// decoded curve across this step. `0.0` when the angle list is empty (a
-    /// rank-0 image, no measurable rotation).
+    /// decoded curve across this step. `0.0` only when both images are rank zero.
     pub fn max_principal_angle(&self) -> f64 {
         // `principal_angles` is ascending, so the last entry is the maximum.
         self.principal_angles.last().copied().unwrap_or(0.0)

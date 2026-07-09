@@ -377,11 +377,12 @@ fn dtm_radii(points: ArrayView2<'_, f64>, weights: Option<ArrayView1<'_, f64>>) 
     let target_mass = total / m as f64;
     let mut radii = vec![0.0_f64; m];
     for i in 0..m {
-        let mut neighbors: Vec<(f64, f64)> = Vec::with_capacity(m - 1);
+        let mut neighbors: Vec<(f64, f64)> = Vec::with_capacity(m);
         for j in 0..m {
             let weight = local_weights[j];
-            if i != j && weight.is_finite() && weight > 0.0 {
-                neighbors.push((point_distance(points, i, j), weight));
+            if weight.is_finite() && weight > 0.0 {
+                let distance = if i == j { 0.0 } else { point_distance(points, i, j) };
+                neighbors.push((distance, weight));
             }
         }
         neighbors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));

@@ -293,10 +293,11 @@ fn dtm_radii(charts: &[AtlasChart], distances: &[Vec<f64>]) -> Vec<f64> {
     let target_mass = total_mass / n as f64;
     let mut radii = vec![0.0_f64; n];
     for i in 0..n {
-        let mut neighbors = Vec::with_capacity(n - 1);
+        let mut neighbors = Vec::with_capacity(n);
         for j in 0..n {
-            if i != j && charts[j].support_mass > 0.0 {
-                neighbors.push((distances[i][j], charts[j].support_mass));
+            if charts[j].support_mass > 0.0 {
+                let distance = if i == j { 0.0 } else { distances[i][j] };
+                neighbors.push((distance, charts[j].support_mass));
             }
         }
         neighbors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));

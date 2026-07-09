@@ -16,14 +16,10 @@ pub(crate) use faer::Side;
 pub(crate) use gam::alo::compute_alo_diagnostics_from_fit;
 
 pub(crate) use gam::estimate::{
-    AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
-    ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
+    BlockRole, ContinuousSmoothnessOrderStatus, ExternalOptimResult, FitOptions, FittedLinkState,
+    ModelSummary, ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design,
-    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
-
-pub(crate) use gam::faer_ndarray::array2_to_nested_vec;
 
 pub(crate) use gam::families::bms::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentMeasureKind,
@@ -171,13 +167,11 @@ pub(crate) use gam::families::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
     DispersionLocationScaleFitRequest, FitConfig, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
-    LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
-    StandardFitResult, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    SurvivalTransformationFitRequest, SurvivalTransformationTermSpec,
-    TransformationNormalFitRequest, WorkflowError, fit_from_formula_with_notes, fit_model,
-    gate_duchon_operator_penalties_for_family, is_binary_response, prepare_survival_time_stack,
-    residual_cascade_fast_path, resolve_offset_column, resolve_weight_column, response_column_kind,
-    route_marginal_slope_deviation_blocks, spline_scan_fast_path,
+    LinkWiggleConfig, PreparedSurvivalTimeStack, SurvivalLocationScaleFitRequest,
+    SurvivalMarginalSlopeFitRequest, TransformationNormalFitRequest, WorkflowError,
+    fit_from_formula_with_notes, fit_model, is_binary_response, prepare_survival_time_stack,
+    resolve_offset_column, resolve_weight_column, response_column_kind,
+    route_marginal_slope_deviation_blocks,
 };
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};

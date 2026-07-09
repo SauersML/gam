@@ -53,6 +53,10 @@ pub struct FisherEffectEvidence {
     pub atom: usize,
     /// Mean Fisher quadratic local-KL, `0.5 * Δθᵀ I Δθ`, over ablated firings.
     pub mean_fisher_quadratic_kl_nats: f64,
+    /// Total Fisher quadratic local-KL over the `n_firings` observations. BIC is
+    /// an additive evidence price, so this — not the per-firing mean — is the
+    /// quantity compared with [`Self::threshold_nats`].
+    pub total_fisher_quadratic_kl_nats: f64,
     /// Largest per-firing Fisher quadratic local-KL for this atom.
     pub max_fisher_quadratic_kl_nats: f64,
     /// Number of ablated firings accumulated for this atom.
@@ -66,7 +70,7 @@ pub struct FisherEffectEvidence {
 
 impl FisherEffectEvidence {
     pub fn margin(self) -> f64 {
-        self.mean_fisher_quadratic_kl_nats - self.threshold_nats
+        self.total_fisher_quadratic_kl_nats - self.threshold_nats
     }
 
     pub fn retains(self) -> bool {
@@ -195,6 +199,7 @@ impl StreamingFisherEffectAccumulator {
             out.push(Some(FisherEffectEvidence {
                 atom,
                 mean_fisher_quadratic_kl_nats: self.fisher_sums[atom] / n_firings as f64,
+                total_fisher_quadratic_kl_nats: self.fisher_sums[atom],
                 max_fisher_quadratic_kl_nats: self.fisher_maxes[atom],
                 n_firings,
                 threshold_nats: bic_one_degree_threshold_nats(n_firings),
@@ -446,11 +451,24 @@ mod tests {
         let evidence = accumulator.finish();
         let rare = evidence[RARE_ATOM].unwrap();
         assert!((rare.mean_fisher_quadratic_kl_nats - 0.0002).abs() <= 1e-15);
+        assert!((rare.total_fisher_quadratic_kl_nats - 0.0002).abs() <= 1e-15);
         assert_eq!(rare.n_firings, 1);
         assert!(evidence[DENSE_ATOM].is_none());
         let validation = rare.realized_kl_validation.unwrap();
         assert_eq!(validation.n_interventions, 1);
         assert!((validation.mean_empirical_realized_kl_nats - 0.000201).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn bic_price_is_compared_with_total_not_mean_kl() {
+        let mut accumulator = StreamingFisherEffectAccumulator::new(1);
+        for _ in 0..100 {
+            accumulator.accumulate_firing_local_kl(0, 0.1).unwrap();
+        }
+        let evidence = accumulator.finish()[0].unwrap();
+        assert!((evidence.mean_fisher_quadratic_kl_nats - 0.1).abs() < 1e-12);
+        assert!((evidence.total_fisher_quadratic_kl_nats - 10.0).abs() < 1e-12);
+        assert!(evidence.retains(), "total KL 10 must exceed the one-dof BIC price");
     }
 
     #[test]

@@ -30,35 +30,20 @@ use gam_linalg::faer_ndarray::FaerSvd;
 /// penalty per co-firing connected component (the "routed-support blocks"), never
 /// a dense `K × K` Gram.
 ///
-/// OCCUPANCY SCALING (the collapse-RANKING fix). The bare `−½·log det(F + εI)`
-/// is O(1): it saturates at `−½·s·log ε` no matter how much data co-fired, while
-/// the Laplace evidence's collapse REWARD is EXTENSIVE in the data — every
-/// co-fired row's likelihood flattens in the aligning direction, so the log-det
-/// volume the collapse harvests from `−½·log|H|` (with `H ≈ N_eff·F ⊗ Ḡ`) and the
-/// `½·d·log N_eff` dimension refund both grow with `N_eff`. An O(1) prior can
-/// therefore never re-rank a collapse basin at scale (measured on real
-/// activations: collapse basins hundreds of nats BELOW real structure within
-/// `dρ ≈ 0.01`). The honest Jeffreys prior must be taken over the TOTAL Fisher
-/// information of the co-fired data, not the per-observation one: a component `C`
-/// whose atoms co-fire on `N_eff,C` effective rows carries total co-active
-/// information `N_eff,C · F_C`, and the reparametrization-invariant volume
-/// deficit of that block relative to independence is `N_eff,C · log det F_C`
-/// (each effective co-fired observation loses `log det F_C` nats of Fisher
-/// log-volume to the overlap). The barrier is therefore the OCCUPANCY-SCALED
-/// Jeffreys
+/// SAMPLE-SIZE FACTORIZATION.  For a component of dimension `s`, total Fisher
+/// information is `I_N = N_eff F`, hence
+/// `log det I_N = s log N_eff + log det F`.  The first term is independent of
+/// decoder overlap and must not multiply the second.  The Jeffreys barrier is
+/// therefore exactly
 ///
 /// ```text
-///   P = −½ · Σ_C n_C · log det(F_C + ε_C·I),    n_C = N_eff,C = mean_{k∈C} N_eff,k,
-///   N_eff,k = Σ_{i∈J_k} a_ik²   (the SAME summed-squared-gate currency the rank
-///                                charge / `fisher_n` uses, over the SAME truncated
-///                                active support as q's denominators),
+///   P = -1/2 sum_C log det(F_C + eps_C I),
 /// ```
 ///
-/// which prices collapse in exactly the currency the Laplace `½·d·log N_eff`
-/// prices dimensions: at exact collapse of one direction the cost is
-/// `½·N_eff,C·log(1/ε_C)`, extensive in the co-fired data, so destroying
-/// structure that `N` effective rows support always costs more evidence than the
-/// `½·Δd·log N` refund the collapse buys — the ordering flips for every `N`.
+/// with no `N_eff` multiplier.  Occupancy enters only through the precision of
+/// the estimated coactivation matrix and therefore through the resolution shift
+/// `eps_C` below.  Multiplying `log det F` by `N_eff` would turn a fixed-dimensional
+/// Jeffreys volume term into an artificial O(N) force.
 ///
 /// DATA-DERIVED SOFTENING `ε_C` (no magic constant). `F`'s off-diagonals `q·o`
 /// carry the sampling noise of the occupancy cosine `q̂` estimated from the
@@ -90,10 +75,6 @@ struct BarrierComponent {
     atoms: Vec<usize>,
     /// Co-firing edges among `atoms`.
     edges: Vec<BarrierEdge>,
-    /// Occupancy scale `n_C = mean_{k∈C} N_eff,k` multiplying this component's
-    /// `−½·log det(F + ε_C·I)` in value, gradient, and curvature alike (the
-    /// three consumers read THIS field, so they can never desync).
-    n_scale: f64,
     /// Data-derived interior-point softening `ε_C = 2·√(s / min_{k∈C} N_eff,k)`,
     /// the Wigner/MP bulk edge of the coactivation estimation noise (see above).
     eps: f64,
@@ -103,8 +84,8 @@ struct BarrierComponent {
 /// [`SaeManifoldTerm::refresh_barrier_coactivation_gate`]): the co-firing pairs
 /// `(j, k, q_jk)` AND the per-atom effective sample sizes
 /// `N_eff,k = Σ_{i∈J_k} a_ik²`, both read from ONE truncated-support scan of the
-/// routing so the Jeffreys Fisher's weights `Q`, its occupancy scale `n_C`, and
-/// its softening `ε_C` are mutually consistent and all frozen at the same
+/// routing so the Jeffreys Fisher's weights `Q` and its softening `ε_C` are
+/// mutually consistent and both frozen at the same
 /// chokepoint (lagged diffusivity — the gradient treats all three as constants,
 /// so the line-search value must too).
 #[derive(Clone, Debug)]
@@ -907,7 +888,6 @@ impl SaeManifoldTerm {
                 comps.push(BarrierComponent {
                     atoms: Vec::new(),
                     edges: Vec::new(),
-                    n_scale: 0.0,
                     eps: f64::INFINITY,
                 });
                 comps.len() - 1
@@ -927,25 +907,21 @@ impl SaeManifoldTerm {
                 o,
             });
         }
-        // Occupancy scale and data-derived softening per component (see
-        // [`BarrierComponent`]): `n_C = mean_{k∈C} N_eff,k` and
+        // Data-derived softening per component (see [`BarrierComponent`]):
         // `ε_C = 2·√(s / min_{k∈C} N_eff,k)`, from the SAME (frozen-or-live)
         // truncated-support energies as the edge weights `q`, so value, gradient,
         // and curvature all read one measure. An atom index outside the support
         // vector (a stale gate across a structural edit — the assembly resets the
         // gate on structure changes, so this is defensive) reads `N_eff = 0`,
-        // which zeroes `n_C`/blows up `ε_C` and makes the consumers abstain
+        // which blows up `ε_C` and makes the consumers abstain
         // rather than index out of bounds.
         for comp in comps.iter_mut() {
             let s = comp.atoms.len();
-            let mut sum = 0.0_f64;
             let mut min = f64::INFINITY;
             for &a in &comp.atoms {
                 let ne = atom_neff.get(a).copied().unwrap_or(0.0);
-                sum += ne;
                 min = min.min(ne);
             }
-            comp.n_scale = if s > 0 { sum / s as f64 } else { 0.0 };
             comp.eps = if min > 0.0 {
                 2.0 * (s as f64 / min).sqrt()
             } else {
@@ -955,14 +931,9 @@ impl SaeManifoldTerm {
         comps
     }
 
-    /// SEPARATION barrier value — the OCCUPANCY-SCALED SAE decoder Jeffreys prior
-    /// `P_sep = −½ · Σ_components n_C · log det(F_C + ε_C·I)`, `F = Q ∘ O`,
-    /// `n_C = N_eff,C` (see [`BarrierComponent`] for the full derivation of both
-    /// the occupancy scale and the data-derived softening `ε_C`). Diverges as any
-    /// co-firing pair aligns (`det F → 0`) with a cost EXTENSIVE in the co-fired
-    /// effective sample size — `½·N_eff,C·log(1/ε_C)` at exact collapse — so a
-    /// collapsed dictionary always scores worse than the structure it destroys
-    /// (the Laplace dimension refund is only `½·Δd·log N_eff`). Exactly `0` on a
+    /// SEPARATION barrier value — the SAE decoder Jeffreys prior
+    /// `P_sep = −½ · Σ_components log det(F_C + ε_C·I)`, `F = Q ∘ O`.
+    /// Exactly `0` on a
     /// mutually-orthogonal co-active set (`F = I`) and `0` for `K < 2` or a fully
     /// disjoint routing. The Jeffreys exponent `½` is fixed — there is no strength
     /// `μ_C`. `penalty_scale = 0` disables it (the "no prevention" arm).
@@ -987,7 +958,7 @@ impl SaeManifoldTerm {
             }
             // No effective co-fired data ⇒ the barrier honestly abstains (the
             // gradient/curvature seam applies the identical guard).
-            if !(comp.n_scale > 0.0) || !comp.eps.is_finite() {
+            if !comp.eps.is_finite() {
                 continue;
             }
             let eps = comp.eps;
@@ -1003,11 +974,9 @@ impl SaeManifoldTerm {
                 Ok((_, sv, _)) => sv,
                 Err(_) => continue,
             };
-            // −½·n_C·log det(F + ε_C·I), identity-referenced: the ε-SHIFTED,
-            // occupancy-scaled Jeffreys barrier. Shifting (rather than flooring)
-            // keeps the pole bounded (an exactly-collapsed direction contributes
-            // −½·n_C·ln ε_C — extensive in the co-fired data) while the gradient
-            // n_C·(F + ε_C·I)⁻¹ is the EXACT derivative of this value everywhere
+            // −½·log det(F + ε_C·I), identity-referenced. Shifting (rather than flooring)
+            // keeps the pole bounded while `(F + ε_C·I)⁻¹` is the exact derivative
+            // channel of this value everywhere
             // — no sub-floor value/gradient mismatch, no Armijo conservatism at
             // the pole. The per-eigenvalue −ln(1+ε_C) reference keeps a
             // mutually-orthogonal co-active set (F = I) at exactly 0.
@@ -1015,7 +984,7 @@ impl SaeManifoldTerm {
             for &lam in sv.iter() {
                 logdet += (lam + eps).ln() - (1.0 + eps).ln();
             }
-            acc += -0.5 * comp.n_scale * logdet;
+            acc += -0.5 * logdet;
         }
         penalty_scale * acc
     }
@@ -1178,7 +1147,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             // No effective co-fired data ⇒ abstain, exactly like the value seam.
-            if !(comp.n_scale > 0.0) || !comp.eps.is_finite() {
+            if !comp.eps.is_finite() {
                 continue;
             }
             let eps = comp.eps;
@@ -1247,10 +1216,9 @@ impl SaeManifoldTerm {
                 let o_overlap = e.o;
                 let sh_j = o_overlap / (d_j * d_j);
                 let sh_k = o_overlap / (d_k * d_k);
-                // `α_e = penalty_scale·(∂P/∂o_e) = penalty_scale·n_C·(−G[jl,kl]·q_e)`
-                // — the occupancy scale rides the force exactly as it rides the
-                // value (−½·n_C·log det), keeping the FD contract exact.
-                let alpha = penalty_scale * comp.n_scale * (-g[[e.jl, e.kl]] * e.q);
+                // `α_e = penalty_scale·(∂P/∂o_e) =
+                // penalty_scale·(−G[jl,kl]·q_e)`.
+                let alpha = penalty_scale * (-g[[e.jl, e.kl]] * e.q);
                 let off_j = offsets[e.j];
                 let off_k = offsets[e.k];
                 let mut v: Vec<(usize, f64)> = Vec::with_capacity(m_j * p + m_k * p);
@@ -1327,10 +1295,7 @@ impl SaeManifoldTerm {
                 let ea = &comp.edges[a];
                 for b in 0..ne {
                     let eb = &comp.edges[b];
-                    // `n_C` scales the whole overlap-space Hessian of
-                    // `−½·n_C·log det(F+ε_C·I)` — same factor as value and force.
-                    mm[[a, b]] = comp.n_scale
-                        * ea.q
+                    mm[[a, b]] = ea.q
                         * eb.q
                         * (g[[ea.jl, eb.kl]] * g[[ea.kl, eb.jl]]
                             + g[[ea.jl, eb.jl]] * g[[ea.kl, eb.kl]]);

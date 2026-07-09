@@ -207,18 +207,10 @@ pub fn atom_two_lens(
     let mut any_coupling = vec![false; k];
 
     for (atom_idx, atom) in model.atoms.iter().enumerate() {
-        // Amplitude-weighted decoder norm: ‖B_k‖_F. The decoder coefficients
-        // B_k ∈ ℝ^{M_k × p} are the linear map from basis activations to the
-        // reconstruction output, so their Frobenius norm is the per-atom output
-        // amplitude per unit of basis activation — the "how loud is this atom in
-        // the reconstruction" factor of presence. Pure activation-side: no
-        // metric is consulted.
-        let decoder_norm = atom
-            .decoder_coefficients
-            .iter()
-            .map(|&b| b * b)
-            .sum::<f64>()
-            .sqrt();
+        // Physical contribution norm `exp(s_k) * ||B_k||_F`. This is invariant
+        // under the exact scale gauge `B <- cB, s <- s - log(c)`, matching the
+        // physical derivatives used by coupling.
+        let decoder_norm = atom.contribution_frobenius_scale();
 
         let latent_dim = atom.latent_dim;
 
