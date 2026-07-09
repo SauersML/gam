@@ -19,12 +19,12 @@
 //!    threshold — the geometry, not the support pattern, is what forbids gluing.
 
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
-use gam_sae::basis::PeriodicHarmonicEvaluator;
+use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 use gam_sae::structure_harvest::{harvest_move_proposals, HarvestParams};
-use gam_solve::structure_search::StructureMove;
+use gam_solve::structure_search::{MoveProposal, StructureMove};
 use gam_terms::latent::LatentManifold;
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 const ON: f64 = 6.0;
@@ -104,7 +104,7 @@ fn circle_decoder(p: usize, ax_sin: usize, ax_cos: usize) -> Array2<f64> {
     d
 }
 
-fn glue_triggers(proposals: &[gam_solve::structure_search::MoveProposal]) -> Vec<f64> {
+fn glue_triggers(proposals: &[MoveProposal]) -> Vec<f64> {
     proposals
         .iter()
         .filter_map(|prop| match prop.mv {
@@ -114,7 +114,7 @@ fn glue_triggers(proposals: &[gam_solve::structure_search::MoveProposal]) -> Vec
         .collect()
 }
 
-fn fusion_count(proposals: &[gam_solve::structure_search::MoveProposal]) -> usize {
+fn fusion_count(proposals: &[MoveProposal]) -> usize {
     proposals
         .iter()
         .filter(|prop| matches!(prop.mv, StructureMove::Fusion { .. }))
