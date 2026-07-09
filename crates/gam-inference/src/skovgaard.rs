@@ -15,14 +15,43 @@
 //! r* = r + (1/r) · log( u / r )
 //! ```
 //!
-//! is `N(0,1)` to `O(n⁻³ᐟ²)` — third-order accurate. The hard ingredient is the
-//! Skovgaard (1996) sample-space-derivative approximation to `u`. For a scalar
-//! interest parameter this assembles entirely from quantities the engine already
-//! maintains: the **observed** information `ĵ` (the penalized Hessian / true
-//! second derivative at the optimum), the **expected** information `î` (the
-//! Fisher weights every family computes for PIRLS), and the score covariance
-//! (the per-row score outer product). No new theory and no sample-space
-//! quadrature are needed — it is assembly, per the issue's Stage-1 plan.
+//! is `N(0,1)` to `O(n⁻³ᐟ²)` — third-order accurate — *when `u` is the exact
+//! sample-space derivative*. The hard ingredient is Skovgaard's (1996)
+//! approximation to `u`; this module implements the further **leading-Taylor
+//! surrogate** of that approximation (see the accuracy contract below), which
+//! assembles entirely from quantities the engine already maintains: the
+//! curvature `ĵ` supplied by the caller (for a penalized fit this is the
+//! penalized Hessian — MAP curvature, NOT pure likelihood information; see
+//! below), the **expected** information `î` (the Fisher weights every family
+//! computes for PIRLS), and the score covariance (the per-row score outer
+//! product).
+//!
+//! # Accuracy contract (what is actually certified)
+//!
+//! Two substitutions separate the implemented statistic from the textbook
+//! third-order `r*`, and each limits the rate that can honestly be claimed:
+//!
+//! 1. **Leading-Taylor surrogate for `q̃`.** Skovgaard's covariance
+//!    `q̃ = cov_θ̂[U(θ̂), ℓ(θ̂) − ℓ(θ₀)]` is replaced by its leading term
+//!    `(θ̂ − θ₀)·var[U]`. For a **canonical full exponential family** the
+//!    log-likelihood difference is affine in the sufficient statistic, so this
+//!    substitution is *exact* and the Skovgaard rate survives. In general it
+//!    introduces an extra `O(n⁻¹)` relative error, so the implemented `r*` is
+//!    certified second-order (`O(n⁻¹)`) outside canonical families — better
+//!    than the first-order `r`, but the blanket `O(n⁻³ᐟ²)` claim does NOT
+//!    apply to it.
+//! 2. **Penalized curvature is not likelihood information.** When the caller
+//!    passes the penalized Hessian `X'WX + S_λ` as `ĵ` (and its Fisher analog
+//!    as `î`), the smoothing penalty contributes prior curvature, and the
+//!    resulting `r*`/p-values describe the **penalized (MAP) surrogate**, not
+//!    the likelihood. The likelihood-theory calibration statements apply only
+//!    when the penalty's leverage on the interest direction is negligible
+//!    (e.g. an unpenalized functional, or `S_λ → 0`); otherwise treat the
+//!    output as a penalized-curvature diagnostic, not an exact-rate p-value.
+//!
+//! The closed-form fixtures below certify exactly the cases inside this
+//! contract (canonical families, unpenalized scalar models); nothing stronger
+//! is claimed or asserted.
 //!
 //! # The scalar Skovgaard `u`
 //!
@@ -46,11 +75,14 @@
 //!
 //! which is **exact** for a full exponential family and `O(n⁻¹)`-accurate in
 //! general. Expanding `q̃` about the MLE, its leading term is
-//! `q̃ ≈ (θ̂ − θ₀) · var_θ̂[U(θ̂)]`, and `var[U]` is precisely the information
-//! the model supplies. Writing the score `U(θ) = ℓ'(θ) = Σᵢ s_i(θ)`,
+//! `q̃ ≈ (θ̂ − θ₀) · var_θ̂[U(θ̂)]` — the surrogate this module implements
+//! (accuracy contract item 1 above: exact for canonical families, an extra
+//! `O(n⁻¹)` otherwise). `var[U]` is precisely the information the model
+//! supplies. Writing the score `U(θ) = ℓ'(θ) = Σᵢ s_i(θ)`,
 //!
-//! * `ĵ = −ℓ''(θ̂)` — the **observed** information at the MLE (the penalized
-//!   Hessian; the Barndorff-Nielsen normaliser `ĵ^{-1/2}`),
+//! * `ĵ = −ℓ''(θ̂)` — the **observed** information at the MLE (for a penalized
+//!   fit callers pass the penalized Hessian, which triggers accuracy-contract
+//!   item 2 above; the Barndorff-Nielsen normaliser `ĵ^{-1/2}`),
 //! * `î = E[−ℓ''] = var[U]` — the **expected** (Fisher) information (the Fisher
 //!   weights every family computes for PIRLS; the score variance that enters
 //!   `q̃`),
@@ -130,7 +162,10 @@ pub struct ScalarSkovgaardResult {
     pub r_star: f64,
     /// First-order two-sided p-value `2·Φ(−|r|)`.
     pub p_value_first_order: f64,
-    /// Third-order two-sided p-value `2·Φ(−|r*|)` (model/Fisher form).
+    /// Higher-order-corrected two-sided p-value `2·Φ(−|r*|)` (model/Fisher
+    /// form). Third-order accurate only inside the module's accuracy contract
+    /// (canonical family, likelihood curvature); second-order in general and a
+    /// penalized-surrogate diagnostic when `ĵ` carries a smoothing penalty.
     pub p_value_corrected: f64,
     /// The Severini empirical companion `u_emp = (θ̂−θ₀)·Î/√ĵ`, using the
     /// empirical score covariance `Î` in place of the model Fisher information
@@ -277,9 +312,11 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
 ///   point-on-curve `m(x₀)`, the difference of two rows for a contrast, or any
 ///   linear functional gradient.
 /// * `beta` — fitted coefficients `β̂`.
-/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the **observed** information in
-///   coefficient space (the engine's penalized Hessian / true second
-///   derivative).
+/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the curvature used as "observed
+///   information" in coefficient space. NOTE: `S_λ` is prior (penalty)
+///   curvature, not likelihood information; with a non-negligible penalty on
+///   the interest direction the resulting `r*`/p-values describe the penalized
+///   (MAP) surrogate — see the module accuracy contract, item 2.
 /// * `fisher_information` (`Iₑ = X'WX`) — the **expected** (Fisher) information
 ///   in coefficient space (the PIRLS Fisher weights; pass `None` to reuse the
 ///   penalized Hessian when the family is canonical and the distinction

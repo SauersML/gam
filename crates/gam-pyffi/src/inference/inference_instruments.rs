@@ -723,10 +723,16 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
 // #939 deliverable 3 — Skovgaard modified directed root r* for a scalar functional
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Skovgaard's modified directed likelihood root `r*` for a **scalar** interest
-/// parameter `ψ = cᵀβ` (issue #939, deliverable 3), assembled EXACTLY from the
-/// fitted-model matrices — no approximation beyond Skovgaard's own covariance
-/// identity for the sample-space derivative.
+/// Skovgaard-style modified directed likelihood root `r*` for a **scalar**
+/// interest parameter `ψ = cᵀβ` (issue #939, deliverable 3), assembled from the
+/// fitted-model matrices. Two approximations beyond the exact theory apply —
+/// see the `gam::inference::skovgaard` module accuracy contract: (1) the
+/// leading-Taylor surrogate `q̃ ≈ (θ̂−θ₀)·var[U]` (exact for canonical
+/// exponential families, an extra `O(n⁻¹)` otherwise, so second-order rather
+/// than third-order in general), and (2) the penalized Hessian supplies MAP
+/// curvature, not pure likelihood information, so with a non-negligible
+/// penalty on the interest direction the p-values describe the penalized
+/// surrogate.
 ///
 /// This exposes [`gam::inference::skovgaard::scalar_skovgaard_from_matrices`] on
 /// the clean `gamfit` surface (the in-tree implementation was certified against
@@ -735,7 +741,8 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
 /// * `contrast` (`c`) — the functional gradient `∂ψ/∂β` (a prediction row for a
 ///   point-on-curve, a row difference for a contrast, or any linear gradient).
 /// * `beta` (`β̂`) — fitted coefficients; `ψ̂ = cᵀβ̂`.
-/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the **observed** information.
+/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the curvature used as observed
+///   information (MAP curvature when `S_λ ≠ 0`; see the accuracy note above).
 /// * `fisher_information` (`Iₑ = X'WX`, optional) — the **expected** (Fisher)
 ///   information; omit for a canonical link, where `î = ĵ` and the curvature
 ///   factor is `1`.
