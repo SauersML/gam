@@ -441,25 +441,30 @@ impl HessianOperator for FailingSeedMaterializationOperator {
         self.dim
     }
 
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-        Ok(v.clone())
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), ObjectiveEvalError> {
+        out.assign(v);
+        Ok(())
     }
 
-    fn is_cheap_to_materialize(&self) -> bool {
-        true
+    fn materialization(&self) -> HessianMaterialization {
+        HessianMaterialization::RepeatedHvp
     }
 
-    fn materialize_dense(&self) -> Result<Array2<f64>, String> {
-        Err("seed materialization failed".to_string())
+    fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+        Err(ObjectiveEvalError::fatal("seed materialization failed"))
     }
 }
 
 #[test]
-fn materialize_dense_uses_single_batched_mul_mat() {
+fn materialize_dense_uses_single_batched_apply_mat() {
     struct BatchedOnlyHessian {
         matrix: Array2<f64>,
-        matvec_calls: Arc<AtomicUsize>,
-        mul_mat_calls: Arc<AtomicUsize>,
+        apply_calls: Arc<AtomicUsize>,
+        apply_mat_calls: Arc<AtomicUsize>,
         rhs_columns: Arc<AtomicUsize>,
     }
 
@@ -468,26 +473,38 @@ fn materialize_dense_uses_single_batched_mul_mat() {
             self.matrix.nrows()
         }
 
-        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-            self.matvec_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.matrix.dot(v))
+        fn apply_into(
+            &self,
+            v: &Array1<f64>,
+            out: &mut Array1<f64>,
+        ) -> Result<(), ObjectiveEvalError> {
+            self.apply_calls.fetch_add(1, Ordering::Relaxed);
+            out.assign(&self.matrix.dot(v));
+            Ok(())
         }
 
-        fn mul_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-            self.mul_mat_calls.fetch_add(1, Ordering::Relaxed);
+        fn apply_mat(
+            &self,
+            factor: ArrayView2<'_, f64>,
+        ) -> Result<Array2<f64>, ObjectiveEvalError> {
+            self.apply_mat_calls.fetch_add(1, Ordering::Relaxed);
             self.rhs_columns
                 .fetch_add(factor.ncols(), Ordering::Relaxed);
             Ok(self.matrix.dot(&factor))
         }
+
+        fn materialization(&self) -> HessianMaterialization {
+            HessianMaterialization::BatchedHvp
+        }
     }
 
-    let matvec_calls = Arc::new(AtomicUsize::new(0));
-    let mul_mat_calls = Arc::new(AtomicUsize::new(0));
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let apply_mat_calls = Arc::new(AtomicUsize::new(0));
     let rhs_columns = Arc::new(AtomicUsize::new(0));
     let op = BatchedOnlyHessian {
         matrix: array![[2.0, 0.25, -0.5], [0.5, 3.0, 1.0], [-0.25, 2.0, 4.0]],
-        matvec_calls: Arc::clone(&matvec_calls),
-        mul_mat_calls: Arc::clone(&mul_mat_calls),
+        apply_calls: Arc::clone(&apply_calls),
+        apply_mat_calls: Arc::clone(&apply_mat_calls),
         rhs_columns: Arc::clone(&rhs_columns),
     };
 
@@ -497,9 +514,9 @@ fn materialize_dense_uses_single_batched_mul_mat() {
     let expected = array![[2.0, 0.375, -0.375], [0.375, 3.0, 1.5], [-0.375, 1.5, 4.0]];
     assert_eq!(dense, expected);
     assert_eq!(
-        mul_mat_calls.load(Ordering::Relaxed),
+        apply_mat_calls.load(Ordering::Relaxed),
         1,
-        "dense materialization must batch all identity columns into one mul_mat call"
+        "dense materialization must batch all identity columns into one apply_mat call"
     );
     assert_eq!(
         rhs_columns.load(Ordering::Relaxed),
@@ -507,9 +524,9 @@ fn materialize_dense_uses_single_batched_mul_mat() {
         "the single batched materialization call must include every identity RHS"
     );
     assert_eq!(
-        matvec_calls.load(Ordering::Relaxed),
+        apply_calls.load(Ordering::Relaxed),
         0,
-        "operators with batched mul_mat must not be probed column-by-column"
+        "operators with batched apply_mat must not be probed column-by-column"
     );
 }
 

@@ -308,6 +308,11 @@ impl IBPAssignmentPenalty {
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: fixed/inert column ⇒ every log-det adjoint channel slot
+                // stays zero (matches `value`/`grad_target`/`hessian_diag`).
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k];
                 let jac = zk * (1.0 - zk) * inv_tau;
                 let c_ik = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
@@ -355,6 +360,10 @@ impl IBPAssignmentPenalty {
         // diagonal instead of injecting the undifferentiated value `s'_k`.
         let mut cross_row_d_logalpha = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            // #Bug4: fixed/inert column ⇒ zero rank-one Woodbury coefficients.
+            if self.column_is_fixed(k) {
+                continue;
+            }
             // Under majorization the rank-one coefficient is `max(w·s'_k,0)` and its
             // logit/mass derivative is gated by `𝟙[s'_k>0]` (the clamp's subgradient),
             // matching the per-column `gate_col` used for the diagonal channels above.

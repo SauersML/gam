@@ -74,11 +74,10 @@ impl FitConfig {
     /// cross-field invariants live here so direct Rust callers cannot bypass
     /// the same rules enforced by application front ends.
     pub fn resolve(mut self) -> Result<Self, String> {
-        self.family = match self.family {
-            Some(value) if value.eq_ignore_ascii_case("auto") => None,
-            Some(value) => Some(value),
-            None => None,
-        };
+        self.family = self.family.and_then(|value| {
+            let value = value.trim();
+            (!value.eq_ignore_ascii_case("auto")).then(|| value.to_string())
+        });
         self.survival_likelihood = self.survival_likelihood.trim().to_ascii_lowercase();
         self.baseline_target = self.baseline_target.trim().to_ascii_lowercase();
 
@@ -108,7 +107,7 @@ mod tests {
     #[test]
     fn resolve_normalizes_front_end_spellings() {
         let resolved = FitConfig {
-            family: Some("AUTO".to_string()),
+            family: Some(" AUTO ".to_string()),
             survival_likelihood: " Transformation ".to_string(),
             baseline_target: " Linear ".to_string(),
             ..FitConfig::default()
