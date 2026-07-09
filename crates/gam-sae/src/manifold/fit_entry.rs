@@ -239,8 +239,32 @@ pub fn run_sae_manifold_fit_from_parts(
     // max_seeds=1 collapses the cascade to the single initial ρ.
     objective.set_cancel_flag(Arc::clone(&cancel_flag));
     let run_result: Result<(), String> = if run_outer_rho_search {
+        // #2134 wall #3 / #1082 — the SAE outer ρ search sat on the DEFAULT
+        // `OuterConfig` (`rel_cost_tolerance = None`), so the relative-cost
+        // convergence stop stayed COUPLED to the tight absolute projected-gradient
+        // `tolerance` (`rel_cost = tolerance ≈ scale·1e-9`). On the flat REML ridge
+        // the manifold criterion sits in once the dictionary EV has plateaued, a
+        // sub-ULP rel-cost change never clears that floor, so the optimizer grinds
+        // to the full `max_iter = 200` — every surplus outer iter re-enters the
+        // O(joint-Newton) inner fit, walks the shared warm-start into a co-collapse
+        // basin, and the EV guard restores it (the endless `[#1026] restoring
+        // inner-fit reconstruction incumbent` churn). Empirically the zoo fit found
+        // its EV≈0.65 optimum in the first ~11 min then burned ~7h49m of the 8h wall
+        // clock on ~190 no-improvement probes and never RETURNED a result. Decouple
+        // the rel-cost stop (the #1082 remedy already used by gam-custom-family):
+        // the ABSOLUTE gradient floor still uses `tolerance` so the genuine REML
+        // optimum is resolved to full accuracy (no weakening), while the rel-cost
+        // stop trips once outer progress falls below `SAE_OUTER_REL_COST_TOL` so a
+        // plateaued fit terminates in a handful of iters instead of at `max_iter`.
+        //
+        // SAE_OUTER_REL_COST_TOL — a 1e-4 relative-cost floor: stop once an accepted
+        // outer step improves the penalized criterion by < 0.01%. That is the
+        // canonical "no material REML progress" threshold; tight enough that a
+        // genuine slow descent still steps, loose enough that the flat ridge halts.
+        const SAE_OUTER_REL_COST_TOL: f64 = 1.0e-4;
         let problem = OuterProblem::new(n_params)
             .with_initial_rho(init_rho_flat.clone())
+            .with_rel_cost_tolerance(Some(SAE_OUTER_REL_COST_TOL))
             .with_seed_config(SeedConfig {
                 max_seeds: 1,
                 seed_budget: 1,
