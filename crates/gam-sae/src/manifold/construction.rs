@@ -7954,20 +7954,22 @@ impl SaeManifoldTerm {
     /// hoisted `delta_t_len()`-sized buffer, left zeroed on return; `rhs_beta_zero`
     /// is a zero β-RHS of length `cache.k`; `context` prefixes the error text.
     /// Shared by `learnable_ibp_data_logdet_alpha_trace` and `logdet_theta_adjoint`,
-    /// whose per-row selected-inverse preambles were verbatim.
-    #[allow(clippy::too_many_arguments)]
+    /// whose per-row selected-inverse preambles were verbatim. The solve-invariant
+    /// operands ride in [`SelectedInverseRowSolve`] (built once per outer solve);
+    /// only the per-row coordinates and the reusable scratch vary per call.
     fn selected_inverse_row_blocks_or_solve(
-        solver: &DeflatedArrowSolver<'_>,
-        cache: &ArrowFactorCache,
-        beta_inv: &Array2<f64>,
-        fast_selected: bool,
+        ctx: &SelectedInverseRowSolve<'_>,
         row: usize,
         base: usize,
         q: usize,
         rhs_t_scratch: &mut Array1<f64>,
-        rhs_beta_zero: ArrayView1<'_, f64>,
-        context: &str,
     ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let solver = ctx.solver;
+        let cache = ctx.cache;
+        let beta_inv = ctx.beta_inv;
+        let fast_selected = ctx.fast_selected;
+        let rhs_beta_zero = ctx.rhs_beta_zero;
+        let context = ctx.context;
         if fast_selected {
             solver
                 .selected_inverse_row_blocks(row, beta_inv)
@@ -8101,16 +8103,18 @@ impl SaeManifoldTerm {
             // per-row full-system `solve` loop (O(n·q)) under gauge / cross-row
             // Woodbury where the row-local blocks are not valid.
             let (inv_vv, inv_vbeta) = Self::selected_inverse_row_blocks_or_solve(
-                solver,
-                cache,
-                &beta_inv,
-                fast_selected,
+                &SelectedInverseRowSolve {
+                    solver,
+                    cache,
+                    beta_inv: &beta_inv,
+                    fast_selected,
+                    rhs_beta_zero: rhs_beta_zero.view(),
+                    context: "learnable_ibp_data_logdet_alpha_trace",
+                },
                 row,
                 base,
                 q,
                 &mut rhs_t_scratch,
-                rhs_beta_zero.view(),
-                "learnable_ibp_data_logdet_alpha_trace",
             )?;
 
             // #1026 — UNGATED (background-tier) atoms have a force-fixed unit gate,
@@ -8951,16 +8955,18 @@ impl SaeManifoldTerm {
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
             // full-system `solve` loop under gauge / cross-row Woodbury.
             let (inv_vv, inv_vbeta) = Self::selected_inverse_row_blocks_or_solve(
-                solver,
-                cache,
-                &beta_inv,
-                fast_selected,
+                &SelectedInverseRowSolve {
+                    solver,
+                    cache,
+                    beta_inv: &beta_inv,
+                    fast_selected,
+                    rhs_beta_zero: rhs_beta_zero.view(),
+                    context: "logdet_theta_adjoint",
+                },
                 row,
                 base,
                 q,
                 &mut rhs_t_scratch,
-                rhs_beta_zero.view(),
-                "logdet_theta_adjoint",
             )?;
 
             // Per-row UNIT-stiffness deflated directions: the selected inverse
@@ -9621,6 +9627,10 @@ impl SaeManifoldTerm {
                     _ => None,
                 };
 
+            // #991 — same design weighting as the primary θ-adjoint path: the
+            // softmax majorizer written into `htt` carries `w_row`, so its
+            // θ-derivative does too.
+            let w_row_prior = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 let softmax_d_dw: Option<(&[f64], f64, f64, f64, usize)> =
@@ -9656,9 +9666,10 @@ impl SaeManifoldTerm {
                         ) = (softmax_d_dw, jets.vars[a], jets.vars[b])
                         {
                             if atom_a == atom_b {
-                                dh += active_softmax_majorizer_logit_derivative_entry(
-                                    a_soft, atom_a, _atom_w, mm, scale, inv_tau,
-                                );
+                                dh += w_row_prior
+                                    * active_softmax_majorizer_logit_derivative_entry(
+                                        a_soft, atom_a, _atom_w, mm, scale, inv_tau,
+                                    );
                             }
                         }
                         if a == b {
@@ -9851,3 +9862,18 @@ include!("construction_smoothness_dof.rs");
 // `include!` (the sanctioned cohesive-module decomposition — see build.rs
 // file_stem_is_exempt_test_module). Keeps this tracked file under the 10k limit.
 include!("construction_tests.rs");
+
+/// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932
+/// FRONT C): everything fixed across the per-row sweep of one
+/// trace/adjoint pass — the deflated solver, the factor cache, the dense
+/// `(H⁻¹)_ββ`, the Takahashi-vs-solve route flag, the shared zero β-RHS, and
+/// the error-context prefix — bundled so each per-row call carries only the
+/// row coordinates and the reusable scratch buffer.
+pub(crate) struct SelectedInverseRowSolve<'a> {
+    pub(crate) solver: &'a DeflatedArrowSolver<'a>,
+    pub(crate) cache: &'a ArrowFactorCache,
+    pub(crate) beta_inv: &'a Array2<f64>,
+    pub(crate) fast_selected: bool,
+    pub(crate) rhs_beta_zero: ArrayView1<'a, f64>,
+    pub(crate) context: &'a str,
+}

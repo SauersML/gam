@@ -126,22 +126,6 @@ impl SurvivalRowHessian {
         })
     }
 
-    /// Construct a synthetic tensor-backed Hessian for compiler unit tests.
-    /// Production instances must retain their real row data so a later
-    /// `channel_hessian_at` refresh is exact.
-    #[cfg(test)]
-    fn from_full(h: Array3<f64>) -> Self {
-        assert_eq!(h.shape()[1], K_SURVIVAL);
-        assert_eq!(h.shape()[2], K_SURVIVAL);
-        let n = h.shape()[0];
-        Self {
-            h,
-            weights: Array1::ones(n),
-            event: Array1::ones(n),
-            derivative_guard:
-                crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        }
-    }
 }
 
 impl RowHessian for SurvivalRowHessian {
@@ -1550,6 +1534,23 @@ pub struct CompiledSurvivalDesignsVMExact {
 
 #[cfg(test)]
 mod tests {
+
+    /// Construct a synthetic tensor-backed `SurvivalRowHessian` for the unit
+    /// tests below. Production instances must retain their real row data so a
+    /// later `channel_hessian_at` refresh is exact — hence a test-module
+    /// helper, not a production constructor.
+    fn survival_row_hessian_from_full(h: Array3<f64>) -> SurvivalRowHessian {
+        assert_eq!(h.shape()[1], K_SURVIVAL);
+        assert_eq!(h.shape()[2], K_SURVIVAL);
+        let n = h.shape()[0];
+        SurvivalRowHessian {
+            h,
+            weights: Array1::ones(n),
+            event: Array1::ones(n),
+            derivative_guard:
+                crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        }
+    }
     use super::*;
     use gam_problem::Gauge;
 
@@ -1906,7 +1907,7 @@ mod tests {
                 h_full[[i, k, k]] = 1.0;
             }
         }
-        let row_hess = SurvivalRowHessian::from_full(h_full);
+        let row_hess = survival_row_hessian_from_full(h_full);
         let out = compile_survival_parametric_designs(
             time_dq0, time_dq1, time_dqd1, marg_dq, marg_dqd1, log_dg, &row_hess,
         )
@@ -2020,7 +2021,7 @@ mod tests {
                 h_full[[i, k, k]] = 1.0;
             }
         }
-        let row_hess = SurvivalRowHessian::from_full(h_full);
+        let row_hess = survival_row_hessian_from_full(h_full);
 
         let compiled = compile(&inputs.operators, &row_hess, &inputs.ordering)
             .expect("survival 3-block compile must succeed; aliasing is single-direction");
@@ -2369,7 +2370,7 @@ mod tests {
                 h_ident[[i, k, k]] = 1.0;
             }
         }
-        let row_hess_ident = SurvivalRowHessian::from_full(h_ident);
+        let row_hess_ident = survival_row_hessian_from_full(h_ident);
         let compiled_ident = compile_survival_parametric_designs_per_term(
             time_dq0.clone(),
             time_dq1.clone(),
@@ -2392,7 +2393,7 @@ mod tests {
         for i in 0..n {
             h_q0_only[[i, 0, 0]] = 1.0;
         }
-        let row_hess_q0 = SurvivalRowHessian::from_full(h_q0_only);
+        let row_hess_q0 = survival_row_hessian_from_full(h_q0_only);
         let compiled_q0 = compile_survival_parametric_designs_per_term(
             time_dq0,
             time_dq1,
@@ -2530,7 +2531,7 @@ mod tests {
             h[[i, 3, 0]] = h03;
             h[[i, 3, 3]] = h33;
         }
-        SurvivalRowHessian::from_full(h)
+        survival_row_hessian_from_full(h)
     }
 
     #[test]
