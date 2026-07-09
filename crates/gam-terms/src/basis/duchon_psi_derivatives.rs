@@ -1546,7 +1546,13 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
         data_centered.column_mut(c).mapv_inplace(|v| v - mu);
     }
 
-    let poly_block = polynomial_block_from_order(data_centered.view(), nullspace_order);
+    let mut poly_block = polynomial_block_from_order(data_centered.view(), nullspace_order);
+    // Frame-invariant conditioning of the affine slope columns (#1818 rotation):
+    // symmetric-whiten `[x, z, …]` by the frozen-center covariance inverse-sqrt so
+    // the REML λ basin no longer drifts with the covariate rotation. No-op for
+    // d<2 / constants-only, span-preserving, and recomputed identically at predict
+    // (centers are frozen), so design and penalty stay consistent.
+    duchon_whiten_affine_slopes_in_place(&mut poly_block, centers)?;
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.

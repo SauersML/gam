@@ -273,8 +273,12 @@ fn build_duchon_basis_uncached(
             let mu = center_mean[c];
             data_centered.column_mut(c).mapv_inplace(|v| v - mu);
         }
-        let poly_block =
+        let mut poly_block =
             polynomial_block_from_order(data_centered.view(), effective_nullspace_order);
+        // Frame-invariant affine-slope conditioning (#1818 rotation), matching the
+        // dense path: symmetric-whiten the slope columns by the frozen-center
+        // covariance inverse-sqrt. No-op for d<2 / constants-only; span-preserving.
+        duchon_whiten_affine_slopes_in_place(&mut poly_block, centers.view())?;
         let kernel_amp = duchon_kernel_amplification(
             centers.view(),
             length_scale,
@@ -742,6 +746,99 @@ pub(crate) fn polynomial_block_from_order(
         }
         DuchonNullspaceOrder::Degree(degree) => monomial_basis_block(points, degree),
     }
+}
+
+/// Symmetric whitener for the affine SLOPE columns of a Duchon polynomial
+/// null-space DESIGN block, built from the FROZEN center cloud so it replays
+/// bit-identically at predict / κ-trial time (the centers are the frozen basis
+/// geometry, recomputed identically). Returns the `d×d` matrix `U = M^{-1/2}`,
+/// where `M` is the per-axis second-moment (covariance) of the center-cloud-
+/// centered centers, or `None` for `d < 2` (no rotation freedom in 1-D — leave
+/// the single slope column untouched so 1-D fits are byte-unchanged).
+///
+/// ROTATION INVARIANCE (the reason this exists). The isotropic Duchon kernel and
+/// its constraint null space are already *exactly* rotation-equivariant in real
+/// arithmetic; the residual `duchon(x,z)` rotation drift is floating-point REML
+/// λ-selection sensitivity driven by the frame-dependent CONDITIONING of the raw
+/// affine slope columns `[x, z]` (their Gram's condition number is 90°-periodic
+/// in the rotation angle). `M` is the Gram of the centered slope coordinates, so
+/// under a rigid rotation `x → R x` the centers rotate with the data and
+/// `M → R M R^T`. The SYMMETRIC inverse square root commutes with orthogonal
+/// conjugation (functional calculus): `U → R U R^T`. Whitening the slope columns
+/// by `U` therefore gives a slope Gram `U^T M_data U → R(U^T M_data U)R^T` whose
+/// condition number — a similarity invariant — is frame-INDEPENDENT, so the REML
+/// λ basin no longer moves with the frame and the fit becomes rotation-invariant.
+/// A QR/Cholesky factor is NOT equivariant (the triangular convention picks a
+/// frame-dependent basis), which is exactly why the symmetric root is used.
+/// The reparam is span-preserving (`U` invertible), so the constraint null space
+/// `Z` (built from the raw poly-at-centers side condition), the model space, and
+/// the identity-on-indices trend/affine ridge all stay consistent — only the
+/// null-space design basis is re-conditioned. Degenerate eigendirections
+/// (near-zero variance, e.g. a collinear cloud) are left at unit scale so the
+/// whitener stays finite.
+pub(crate) fn duchon_affine_slope_whitener(
+    centers: ArrayView2<'_, f64>,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let d = centers.ncols();
+    let k = centers.nrows();
+    if d < 2 || k == 0 {
+        return Ok(None);
+    }
+    let mean: Vec<f64> = (0..d).map(|c| centers.column(c).sum() / k as f64).collect();
+    let mut m = Array2::<f64>::zeros((d, d));
+    for row in centers.rows() {
+        for a in 0..d {
+            let da = row[a] - mean[a];
+            for b in 0..d {
+                m[[a, b]] += da * (row[b] - mean[b]);
+            }
+        }
+    }
+    m.mapv_inplace(|v| v / k as f64);
+    let sym = symmetrize_penalty(&m);
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_ev = evals.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+    if !max_ev.is_finite() || max_ev <= 0.0 {
+        return Ok(None);
+    }
+    // Numerical-rank floor: eigendirections at or below `d·ε·λ_max` are treated
+    // as degenerate (variance-free) and left at unit scale rather than blown up.
+    let floor = (d as f64) * f64::EPSILON * max_ev;
+    let mut inv_sqrt = Array2::<f64>::zeros((d, d));
+    for j in 0..d {
+        let lam = evals[j];
+        let scale = if lam > floor { 1.0 / lam.sqrt() } else { 1.0 };
+        for a in 0..d {
+            let va = evecs[[a, j]];
+            for b in 0..d {
+                inv_sqrt[[a, b]] += va * scale * evecs[[b, j]];
+            }
+        }
+    }
+    Ok(Some(inv_sqrt))
+}
+
+/// Whiten the affine slope columns (degree-1 monomials, columns `1..=d`) of a
+/// Duchon polynomial DESIGN block in place, using [`duchon_affine_slope_whitener`]
+/// computed from the frozen centers. No-op for `d < 2`, the constants-only
+/// (`Zero`) null space, or when the block has no slope columns — so 1-D and
+/// intercept-only builds are byte-unchanged. Applied to the DESIGN block only;
+/// the penalty candidates are identity-on-column-index and so are agnostic to
+/// this span-preserving reparam.
+pub(crate) fn duchon_whiten_affine_slopes_in_place(
+    poly_block: &mut Array2<f64>,
+    centers: ArrayView2<'_, f64>,
+) -> Result<(), BasisError> {
+    let d = centers.ncols();
+    if d < 2 || poly_block.ncols() < 1 + d {
+        return Ok(());
+    }
+    if let Some(u) = duchon_affine_slope_whitener(centers)? {
+        let slopes = poly_block.slice(s![.., 1..1 + d]).to_owned();
+        let whitened = fast_ab(&slopes, &u);
+        poly_block.slice_mut(s![.., 1..1 + d]).assign(&whitened);
+    }
+    Ok(())
 }
 
 pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
