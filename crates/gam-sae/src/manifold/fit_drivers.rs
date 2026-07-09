@@ -4054,24 +4054,33 @@ impl SaeManifoldTerm {
         if d == 0 {
             return Ok(Array1::<f64>::zeros(0));
         }
-        let mut ridge = base_ridge.max(SAE_MANIFOLD_ROW_RIDGE_FLOOR);
         let mut last_err = String::new();
-        for _ in 0..SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS {
-            let mut a = h.to_owned();
-            for axis in 0..d {
-                a[[axis, axis]] += ridge;
-            }
-            match sae_cholesky_solve_neg_gradient(a.view(), g) {
-                Ok(delta) => return Ok(delta),
-                Err(err) => {
-                    last_err = err;
-                    ridge *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
+        escalate_ridge(
+            RidgeSchedule {
+                initial: base_ridge.max(SAE_MANIFOLD_ROW_RIDGE_FLOOR),
+                growth: SAE_MANIFOLD_ROW_RIDGE_GROWTH,
+                max_escalations: SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS,
+            },
+            |ridge| {
+                let mut a = h.to_owned();
+                for axis in 0..d {
+                    a[[axis, axis]] += ridge;
                 }
-            }
-        }
-        Err(format!(
-            "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
-        ))
+                match sae_cholesky_solve_neg_gradient(a.view(), g) {
+                    Ok(delta) => Some(delta),
+                    Err(err) => {
+                        last_err = err;
+                        None
+                    }
+                }
+            },
+        )
+        .map(|success| success.value)
+        .map_err(|_| {
+            format!(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
+            )
+        })
     }
 
     pub(crate) fn fixed_decoder_step_from_rows(

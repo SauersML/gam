@@ -244,11 +244,12 @@ mod tests {
         let input = RemlOuterGpuInput {
             seed_rho: Array1::<f64>::zeros(0),
             bounds: (Array1::<f64>::zeros(0), Array1::<f64>::zeros(0)),
-            gradient_tolerance: 1.0e-6,
+            gradient_tolerance: GradientTolerance::absolute(1.0e-6),
             max_iterations: 10,
             axis_step_caps: None,
             admission: dummy_admission(0),
             seed_objective: 42.0,
+            seed_gradient: Array1::zeros(0),
         };
         let evaluator = |_: &Array1<f64>| -> Result<RemlOuterDeviceEval, EstimationError> {
             Ok(RemlOuterDeviceEval {
@@ -268,14 +269,17 @@ mod tests {
         // identity; BFGS hits the optimum in a couple of iterations.
         let target = Array1::from(vec![0.5_f64, -0.25, 1.0, -0.75]);
         let target_owned = target.clone();
+        let seed = Array1::from(vec![2.0, 2.0, 2.0, 2.0]);
+        let seed_diff = &seed - &target;
         let input = RemlOuterGpuInput {
-            seed_rho: Array1::from(vec![2.0, 2.0, 2.0, 2.0]),
+            seed_rho: seed,
             bounds: (Array1::from_elem(4, -10.0), Array1::from_elem(4, 10.0)),
-            gradient_tolerance: 1.0e-8,
+            gradient_tolerance: GradientTolerance::absolute(1.0e-8),
             max_iterations: 100,
             axis_step_caps: None,
             admission: dummy_admission(4),
-            seed_objective: 0.0,
+            seed_objective: 0.5 * seed_diff.dot(&seed_diff),
+            seed_gradient: seed_diff,
         };
         let evaluator = move |rho: &Array1<f64>| -> Result<RemlOuterDeviceEval, EstimationError> {
             let diff: Array1<f64> = rho - &target_owned;
@@ -293,25 +297,25 @@ mod tests {
     }
 
     #[test]
-    fn axis_caps_clamp_search_direction() {
-        let mut direction = Array1::from(vec![3.0, -4.0, 0.5]);
-        let caps = Array1::from(vec![1.0, 2.0, 10.0]);
-        cap_axiswise(&mut direction, Some(&caps));
-        assert_eq!(direction[0], 1.0);
-        assert_eq!(direction[1], -2.0);
-        assert_eq!(direction[2], 0.5);
-    }
+    fn stationary_seed_is_not_evaluated_again() {
+        let input = RemlOuterGpuInput {
+            seed_rho: Array1::from(vec![0.25]),
+            bounds: (Array1::from(vec![-1.0]), Array1::from(vec![1.0])),
+            gradient_tolerance: GradientTolerance::absolute(1.0e-8),
+            max_iterations: 10,
+            axis_step_caps: None,
+            admission: dummy_admission(1),
+            seed_objective: 3.0,
+            seed_gradient: Array1::zeros(1),
+        };
+        let evaluator = |_rho: &Array1<f64>| -> Result<RemlOuterDeviceEval, EstimationError> {
+            panic!("the precomputed stationary seed must satisfy the first solver evaluation")
+        };
 
-    #[test]
-    fn projects_onto_bounds() {
-        let mut rho = Array1::from(vec![-5.0, 7.0, 0.5]);
-        let bounds = (
-            Array1::from(vec![-1.0, -1.0, -1.0]),
-            Array1::from(vec![1.0, 1.0, 1.0]),
-        );
-        project_onto_bounds(&mut rho, &bounds);
-        assert_eq!(rho[0], -1.0);
-        assert_eq!(rho[1], 1.0);
-        assert_eq!(rho[2], 0.5);
+        let out = run_reml_outer_on_device(input, evaluator).expect("stationary seed");
+
+        assert!(out.converged);
+        assert_eq!(out.iterations, 0);
+        assert_eq!(out.objective, 3.0);
     }
 }
