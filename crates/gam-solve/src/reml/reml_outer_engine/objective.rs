@@ -1303,12 +1303,23 @@ pub fn reml_laml_evaluate(
         })
         .collect();
     for (idx, value) in ext_grad_entries? {
-        grad[idx] = value;
+        // ACCUMULATE, do not overwrite: the unified `kkt_theta_corrections`
+        // block above already folded the ψ/ext KKT-residual correction
+        // `−coord.gᵀH⁻¹r + ½(H⁻¹r)ᵀB(H⁻¹r)` into `grad[k + ext_idx]`. A plain
+        // `grad[idx] = value` would discard it (the ρ block survives only
+        // because its main entries were assigned BEFORE the fold). Discarding
+        // it is exactly what left the SAS/mixture link-parameter gradient at
+        // the raw capped-β̂ main term `coord.a(β̂)` — collapsing the ε gradient
+        // from the true stationary ≈−9 to ≈−0.02 and stalling recovery (#1876).
+        // `grad[k + ext_idx]` holds 0 when no correction is active (the fold is
+        // skipped), so `+=` is byte-identical to the old assignment there.
+        grad[idx] += value;
     }
 
-    // (The ψ/ext gradient KKT-residual correction is now part of the unified
-    // `kkt_theta_corrections.gradient` folded into `grad` above — see the
-    // full-θ correction block before the ext-gradient assembly.)
+    // (The ψ/ext gradient KKT-residual correction is folded into `grad` by the
+    // unified `kkt_theta_corrections.gradient` block above, and the `+=`
+    // accumulation of the ext main entries here PRESERVES it rather than
+    // overwriting — see the full-θ correction block before this loop.)
 
     // Add prior gradient (ρ-only).
     if let Some((_, ref pg, _)) = prior_cost_gradient {
