@@ -5150,6 +5150,90 @@ fn rational_reduced_schur_directional_matches_fd_of_surrogate() {
     assert!(grad > 0.0, "SPD ∂S must increase the surrogate log det, got {grad}");
 }
 
+/// `rational_reduced_schur_plan_derived` (the build-once companion): the derived
+/// Hutch++ deflation rank must (a) leave the log|S| estimate exact (deflation is
+/// an unbiased variance-reduction split, so the value cannot move outside the
+/// error bar) while (b) tightening the Hutchinson std_err below the bare-probe
+/// pilot when the target bar demands it. `deflation_max_rank == 0` must return
+/// the bare plan (bit-identical to `rational_reduced_schur_log_det`'s plan). The
+/// derived plan's frozen `Q` is what the gradient contracts against, so this pins
+/// the value the criterion swap will consume.
+#[test]
+fn rational_reduced_schur_plan_derived_deflates_to_target() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let seed = 0x2080_DEF1_u64;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+    let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
+
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+        let x = v.to_owned();
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend, None);
+        out
+    };
+
+    // Bare pilot (rank-0): the variance the deflation must beat.
+    let bare = rational_reduced_schur_plan_derived(
+        &sys, &htt_factors, ridge_beta, &backend, None, 32, seed, 1e-9, 40, 1e-11, 20_000, 0, 4,
+        0.0,
+    )
+    .expect("bare plan must build");
+    let bare_eval = bare.evaluate(&matvec, 1e-11, 20_000).expect("bare eval");
+    assert!(
+        (bare_eval.estimate - exact_logdet).abs() / exact_logdet.abs() < 0.05,
+        "bare surrogate estimate {} must match dense {exact_logdet}",
+        bare_eval.estimate
+    );
+
+    // Derived rank: an aggressive target (well under the bare std_err) forces the
+    // peel to grow. The returned plan's frozen Q reduces the Hutchinson bar and
+    // leaves the estimate exact.
+    let target_rel = 0.1 * bare_eval.std_err / (exact_logdet.abs() + 1.0);
+    let derived = rational_reduced_schur_plan_derived(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        32,
+        seed,
+        1e-9,
+        40,
+        1e-11,
+        20_000,
+        32, // deflation_max_rank
+        6,  // subspace_iters
+        target_rel,
+    )
+    .expect("derived plan must build");
+    let derived_eval = derived.evaluate(&matvec, 1e-11, 20_000).expect("derived eval");
+    eprintln!(
+        "derived-rank plan: est={:.6} exact={:.6} bare_std_err={:.3e} derived_std_err={:.3e}",
+        derived_eval.estimate, exact_logdet, bare_eval.std_err, derived_eval.std_err
+    );
+    assert!(
+        (derived_eval.estimate - exact_logdet).abs() / exact_logdet.abs() < 0.05,
+        "deflation must not bias the estimate: derived={} exact={exact_logdet}",
+        derived_eval.estimate
+    );
+    assert!(
+        derived_eval.std_err < bare_eval.std_err,
+        "Hutch++ deflation must reduce the std_err below the bare probe pilot \
+         (bare={:.3e}, derived={:.3e})",
+        bare_eval.std_err,
+        derived_eval.std_err
+    );
+}
+
 /// Dense reference `tr(S⁻¹)` from the lower-Cholesky factor `S = L Lᵀ`:
 /// `tr(S⁻¹) = tr(L⁻ᵀ L⁻¹) = ‖L⁻¹‖_F²`, with each `L⁻¹` column solved by forward
 /// substitution (`L y = e_c`). Self-contained oracle for the matrix-free

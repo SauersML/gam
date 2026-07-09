@@ -1524,6 +1524,86 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     Some((plan, eval))
 }
 
+/// Build the FROZEN #2080 surrogate plan for one outer solve, with the Hutch++
+/// deflation rank DERIVED from a pilot evaluation — the build-once companion to
+/// per-ρ [`RationalLogdetPlan::evaluate`]. Returns just the plan (probes +
+/// quadrature + frozen Hutch++ `Q`); the caller evaluates it at each ρ, so the
+/// expensive rank derivation (several re-solves) is paid ONCE per outer solve,
+/// not per criterion evaluation.
+///
+/// Derived rank (the #2080 lead ruling): a rank-0 pilot fixes the log-det scale,
+/// the target bar is `deflation_target_std_err_rel · (|log|S|_pilot| + 1)` — one
+/// order under the smallest tolerance the criterion feeds (the caller passes
+/// `0.1 · STALL_REL_TOL`; `log|S|` is the criterion's dominant term at wide `k`
+/// so `|log|S||+1` is the right objective scale to `O(1)` and the `0.1` margin
+/// absorbs the loss/Occam remainder). The peel rank grows on a doubling schedule
+/// until the Hutchinson error bar clears the target or the `deflation_max_rank`
+/// cap is hit; `deflation_max_rank == 0` (or a pilot already under target) yields
+/// the bare-Hutchinson plan. Deterministic for fixed inputs (`Q` and probes are
+/// seed-derived). The returned plan's `Q` is FROZEN, so
+/// [`RationalLogdetPlan::directional_derivative`] on its evaluations is the exact
+/// surrogate gradient.
+pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    num_probes: usize,
+    seed: u64,
+    rel_tol: f64,
+    power_iters: usize,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+    deflation_max_rank: usize,
+    deflation_subspace_iters: usize,
+    deflation_target_std_err_rel: f64,
+) -> Option<RationalLogdetPlan> {
+    let k = sys.k;
+    if k == 0 {
+        return None;
+    }
+    let lambda_max =
+        reduced_schur_lambda_max(sys, htt_factors, ridge_beta, backend, resident, power_iters, seed)?;
+    let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
+    let base_plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+        let x = v.to_owned();
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
+        out
+    };
+    // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
+    // deflation is requested or the bare bar already clears the target.
+    let pilot = base_plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
+    if deflation_max_rank == 0 {
+        return Some(base_plan);
+    }
+    let target = deflation_target_std_err_rel.max(0.0) * (pilot.estimate.abs() + 1.0);
+    if pilot.std_err <= target {
+        return Some(base_plan);
+    }
+    // Grow the peel rank (doubling ⇒ log-many re-solves) until the bar clears or
+    // the cap is hit; keep the LAST plan (its frozen Q is the deepest peel tried).
+    let cap = deflation_max_rank.min(k);
+    let mut best_plan = base_plan.clone();
+    let mut rank = 4usize;
+    loop {
+        let r = rank.min(cap);
+        let plan = base_plan
+            .clone()
+            .with_deflation(&matvec, r, deflation_subspace_iters, seed);
+        let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
+        let cleared = eval.std_err <= target;
+        best_plan = plan;
+        if cleared || r >= cap {
+            break;
+        }
+        rank = rank.saturating_mul(2);
+    }
+    Some(best_plan)
+}
+
 /// Contract the surrogate's shifted-solve bundle from
 /// [`rational_reduced_schur_log_det`] against a reduced-Schur derivative operator
 /// `∂S` (supplied through its matvec `dmatvec(v) = (∂S)·v`) to obtain the EXACT
