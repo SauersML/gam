@@ -218,8 +218,7 @@ fn stalled_reml_edf_not_collapsed_to_intercept_1788() {
          (grid-free stationary-point enumeration lands the interior ρ optimum), \
          got converged=false lambda_max={:.3e} (iters={}); the optimizer is back \
          at the rail — treat as a live regression, not a stale re-pin",
-        p.lambda_max,
-        p.outer_iterations,
+        p.lambda_max, p.outer_iterations,
     );
 
     // The reported EDF is self-consistent with those wiggly coefficients:

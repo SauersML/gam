@@ -15,7 +15,11 @@
 //! content to the same assembler, payload drift becomes impossible by
 //! construction.
 
-use gam_solve::estimate::UnifiedFitResult;
+use faer::Side;
+use gam_solve::estimate::{
+    FittedLinkState, UnifiedFitResult, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit,
+};
 use crate::bms::deviation_runtime::AnchorComponentTag;
 use crate::bms::{
     DeviationRuntime, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
@@ -29,17 +33,20 @@ use crate::survival::location_scale::{
     ResidualDistribution, residual_distribution_from_inverse_link,
 };
 use crate::transformation_normal::TransformationNormalFamily;
+use crate::fit_orchestration::{FitConfig, StandardFitResult};
+use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::inference::model::{
     FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
     SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
     SavedSplineScan, TransformationScoreCalibration,
 };
-use gam_terms::smooth::TermCollectionSpec;
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
-use gam_data::DataSchema;
-use ndarray::Array2;
+use gam_data::{DataSchema, EncodedDataset};
+use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
+use ndarray::{Array1, Array2, s};
 
 /// Family tag persisted for Bernoulli marginal-slope saved models.
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
@@ -137,6 +144,259 @@ impl SavedModelSourceMetadata {
         payload.offset_column = self.offset_column;
         payload.noise_offset_column = self.noise_offset_column;
     }
+}
+
+/// Complete semantic input for persisting a standard formula fit.
+///
+/// The workflow result is consumed as one value so callers cannot accidentally
+/// mix a design, resolved term specification, fitted link, or wiggle state from
+/// different fits.  Formula front ends should fit through `fit_from_formula`
+/// and hand its `Standard` result directly to this assembler.
+pub struct StandardPayloadInputs<'a> {
+    pub formula: String,
+    pub dataset: &'a EncodedDataset,
+    pub fit_config: &'a FitConfig,
+    pub result: StandardFitResult,
+}
+
+fn fitted_inverse_link(state: &FittedLinkState) -> Option<InverseLink> {
+    match state {
+        FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(*link)),
+        FittedLinkState::Standard(None) => None,
+        FittedLinkState::LatentCLogLog { state } => Some(InverseLink::LatentCLogLog(*state)),
+        FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(*state)),
+        FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(*state)),
+        FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state.clone())),
+    }
+}
+
+fn standard_null_space_metadata(
+    design: &TermCollectionDesign,
+    fit: &UnifiedFitResult,
+) -> Result<(usize, f64), String> {
+    let hessian = fit
+        .penalized_hessian()
+        .ok_or_else(|| "null-space Hessian logdet requires fitted penalized Hessian".to_string())?;
+    let hessian_dim = hessian.nrows();
+    if hessian.ncols() != hessian_dim {
+        return Err(format!(
+            "null-space Hessian logdet requires a square Hessian, got {}x{}",
+            hessian.nrows(),
+            hessian.ncols()
+        ));
+    }
+    let p = design.design.ncols();
+    if hessian_dim < p {
+        return Err(format!(
+            "null-space Hessian logdet design/Hessian mismatch: design has {p} columns but \
+             Hessian is only {hessian_dim}x{hessian_dim}"
+        ));
+    }
+    if design.penalties.is_empty() {
+        return Ok((0, 0.0));
+    }
+    let hessian = if hessian_dim > p {
+        hessian.slice(s![0..p, 0..p]).to_owned()
+    } else {
+        hessian.clone()
+    };
+    let mut penalty = Array2::<f64>::zeros((p, p));
+    for (idx, block) in design.penalties.iter().enumerate() {
+        let range = block.col_range.clone();
+        if range.start > range.end
+            || range.end > p
+            || block.local.nrows() != range.len()
+            || block.local.ncols() != range.len()
+        {
+            return Err(format!(
+                "null-space Hessian logdet penalty {idx} shape mismatch: range {}..{}, local {}x{}, p={p}",
+                range.start,
+                range.end,
+                block.local.nrows(),
+                block.local.ncols()
+            ));
+        }
+        penalty
+            .slice_mut(s![range.clone(), range])
+            .scaled_add(1.0, &block.local);
+    }
+    let (null_basis, _) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
+        &penalty,
+        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map_err(|err| format!("failed to compute penalty null-space basis: {err}"))?;
+    let q = null_basis.ncols();
+    if q == 0 {
+        return Ok((0, 0.0));
+    }
+    let projected = hessian.dot(&null_basis);
+    let mut restricted = null_basis.t().dot(&projected);
+    restricted = (&restricted + &restricted.t()) * 0.5;
+    let chol = restricted
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("null-space Hessian is not positive definite: {err}"))?;
+    let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
+    if logdet.is_finite() {
+        Ok((q, logdet))
+    } else {
+        Err(format!("null-space Hessian logdet is not finite: {logdet}"))
+    }
+}
+
+fn response_for_standard_payload(
+    formula: &str,
+    dataset: &EncodedDataset,
+) -> Option<Array1<f64>> {
+    let response = gam_terms::inference::formula_dsl::parse_formula(formula)
+        .ok()?
+        .response;
+    let column = *dataset.column_map().get(&response)?;
+    Some(dataset.values.column(column).to_owned())
+}
+
+fn standard_conformal_substrates(
+    formula: &str,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    family: &LikelihoodSpec,
+    fit: &UnifiedFitResult,
+    design: &TermCollectionDesign,
+) -> (
+    Option<crate::inference::full_conformal::GaussianJackknifePlusStats>,
+    Option<crate::inference::full_conformal::ExactFullConformalSubstrate>,
+) {
+    let expectile = fit_config.family.as_deref().is_some_and(|family| {
+        let family = family.trim().to_ascii_lowercase();
+        family == "expectile" || family.starts_with("expectile(")
+    });
+    if expectile
+        || !family.is_gaussian_identity()
+        || fit_config.weight_column.is_some()
+        || fit_config.offset_column.is_some()
+        || fit_config.flexible_link
+    {
+        return (None, None);
+    }
+    let Some(y) = response_for_standard_payload(formula, dataset) else {
+        return (None, None);
+    };
+    let Ok(x) = design.design.try_to_dense_arc("standard conformal design") else {
+        return (None, None);
+    };
+    let Some(normal_matrix) = fit.penalized_hessian() else {
+        return (None, None);
+    };
+    if x.nrows() != y.len()
+        || normal_matrix.nrows() != x.ncols()
+        || normal_matrix.ncols() != x.ncols()
+    {
+        return (None, None);
+    }
+    let weights = Array1::<f64>::ones(y.len());
+    let jackknife = crate::inference::full_conformal::GaussianJackknifePlusStats::from_design_unit_weight_normal_matrix(
+        x.as_ref(),
+        &y,
+        &weights,
+        normal_matrix,
+    )
+    .ok();
+    let full = crate::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
+        x.as_ref(),
+        &y,
+        &weights,
+        normal_matrix,
+    )
+    .ok();
+    (jackknife, full)
+}
+
+/// Assemble the one canonical saved payload for a standard formula fit.
+pub fn assemble_standard_payload(
+    inputs: StandardPayloadInputs<'_>,
+) -> Result<FittedModelPayload, String> {
+    let StandardPayloadInputs {
+        formula,
+        dataset,
+        fit_config,
+        result,
+    } = inputs;
+    let StandardFitResult {
+        mut fit,
+        design,
+        resolvedspec,
+        adaptive_diagnostics,
+        saved_link_state,
+        wiggle_knots,
+        wiggle_degree,
+        wiggle_saved_warp_beta,
+        wiggle_saved_index_shift,
+        ..
+    } = result;
+    fit.fitted_link = saved_link_state;
+    let resolved_termspec = freeze_term_collection_from_design(&resolvedspec, &design)
+        .map_err(|err| format!("failed to freeze standard term specification: {err}"))?;
+    let (null_space_dim, null_space_logdet) = standard_null_space_metadata(&design, &fit)?;
+    fit.artifacts.null_space_dim = Some(null_space_dim);
+    fit.artifacts.null_space_logdet = Some(null_space_logdet);
+    let family = fit
+        .likelihood_family
+        .clone()
+        .unwrap_or_else(LikelihoodSpec::gaussian_identity);
+    let (gaussian_jackknife_plus, full_conformal) = standard_conformal_substrates(
+        &formula,
+        dataset,
+        fit_config,
+        &family,
+        &fit,
+        &design,
+    );
+    let latent_cloglog_state = if family.is_latent_cloglog() {
+        Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
+            "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()
+        })?)
+    } else {
+        saved_latent_cloglog_state_from_fit(&fit)
+    };
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        formula,
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: family.clone(),
+            link: StandardLink::try_from(family.link_function()).ok(),
+            latent_cloglog_state,
+            mixture_state: saved_mixture_state_from_fit(&fit),
+            sas_state: saved_sas_state_from_fit(&fit),
+        },
+        family.name().to_string(),
+    );
+    payload.unified = Some(fit.clone());
+    payload.fit_result = Some(fit.clone());
+    payload.data_schema = Some(dataset.schema.clone());
+    payload.link = fitted_inverse_link(&fit.fitted_link).or_else(|| Some(family.link.clone()));
+    payload.linkwiggle_knots = wiggle_knots.map(|knots| knots.to_vec());
+    payload.linkwiggle_degree = wiggle_degree;
+    payload.beta_link_wiggle = wiggle_saved_warp_beta;
+    payload.link_wiggle_index_shift = wiggle_saved_index_shift;
+    match &fit.fitted_link {
+        FittedLinkState::Mixture { covariance, .. } => {
+            payload.mixture_link_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+        }
+        FittedLinkState::Sas { covariance, .. }
+        | FittedLinkState::BetaLogistic { covariance, .. } => {
+            payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
+        }
+        FittedLinkState::Standard(_) | FittedLinkState::LatentCLogLog { .. } => {}
+    }
+    payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
+    payload.resolved_termspec = Some(resolved_termspec);
+    payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
+    payload.offset_column = fit_config.offset_column.clone();
+    payload.noise_offset_column = fit_config.noise_offset_column.clone();
+    payload.weight_column = fit_config.weight_column.clone();
+    payload.gaussian_jackknife_plus = gaussian_jackknife_plus;
+    payload.full_conformal = full_conformal;
+    Ok(payload)
 }
 
 /// The resolved, source-agnostic semantic content of a Bernoulli

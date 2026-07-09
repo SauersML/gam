@@ -112,8 +112,8 @@ fn gaussian_smooth_observation_interval_covers_nominal_1765() {
             train_mat[[k, i2]] = b;
             train_mat[[k, i3]] = c;
         }
-        let train_design = build_term_collection_design(train_mat.view(), &resolvedspec)
-            .expect("train design");
+        let train_design =
+            build_term_collection_design(train_mat.view(), &resolvedspec).expect("train design");
         let fitted: Array1<f64> = train_design.design.matrixvectormultiply(&fit.beta);
         let rss: f64 = train_y
             .iter()

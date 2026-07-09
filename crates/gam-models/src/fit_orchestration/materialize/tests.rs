@@ -1,10 +1,12 @@
 use super::*;
-use gam_terms::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
-use gam_terms::inference::formula_dsl::{default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec};
-use gam_terms::smooth::SmoothBasisSpec;
-use gam_solve::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+use gam_solve::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
+use gam_terms::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
+use gam_terms::inference::formula_dsl::{
+    default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
+};
+use gam_terms::smooth::SmoothBasisSpec;
 use ndarray::Array2;
 use std::fs;
 use tempfile::tempdir;
@@ -313,13 +315,14 @@ fn survival_marginal_slope_matern_logslope_penalties_keep_surface_width() {
             .unwrap_or_else(|err| {
                 panic!("joint freeze should preserve per-block penalty geometry {case}: {err}")
             });
-        let (rebuilt, _) = crate::fit_orchestration::drivers::build_term_collection_designs_and_freeze_joint(
-            data.values.view(),
-            &frozen_specs,
-        )
-        .unwrap_or_else(|err| {
-            panic!("frozen rebuild should preserve per-block penalty geometry {case}: {err}")
-        });
+        let (rebuilt, _) =
+            crate::fit_orchestration::drivers::build_term_collection_designs_and_freeze_joint(
+                data.values.view(),
+                &frozen_specs,
+            )
+            .unwrap_or_else(|err| {
+                panic!("frozen rebuild should preserve per-block penalty geometry {case}: {err}")
+            });
 
         for (label, design) in [
             ("raw marginal", &designs[0]),
@@ -536,8 +539,16 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
     // raw-age coefficient is +0.025 for cause 1 and −0.020 for cause 2.
     let beta1 = &surv.fit.blocks[0].beta;
     let beta2 = &surv.fit.blocks[1].beta;
-    assert_eq!(beta1.len(), 4, "cause 1 must keep raw width 4 (no reduction)");
-    assert_eq!(beta2.len(), 4, "cause 2 must keep raw width 4 (no reduction)");
+    assert_eq!(
+        beta1.len(),
+        4,
+        "cause 1 must keep raw width 4 (no reduction)"
+    );
+    assert_eq!(
+        beta2.len(),
+        4,
+        "cause 2 must keep raw width 4 (no reduction)"
+    );
     // The dead centered-constant coefficient is pinned to ~0 by the stabilization
     // ridge rather than left at its arbitrary unidentified seed.
     assert!(
@@ -1399,7 +1410,7 @@ fn bernoulli_marginal_slope_prune_rejects_penalized_redundant_scalar_term() {
         &mut notes,
     )
     .err()
-        .expect("explicitly penalized duplicate scalar term must be rejected");
+    .expect("explicitly penalized duplicate scalar term must be rejected");
     let msg = err.to_string();
     assert!(
         msg.contains("explicitly penalized linear term 'constant_spline_col' is redundant"),
@@ -1499,13 +1510,16 @@ fn linkwiggle_noncubic_degree_is_rejected_at_the_routing_boundary_issue_384() {
         let raw = format!("linkwiggle(degree={deg}, internal_knots=3)");
         let spec = parse_linkwiggle_formulaspec(&options, &raw)
             .expect("non-cubic wiggle degree must still parse at the shared layer");
-        assert_eq!(spec.degree, deg, "parser must carry the degree through verbatim");
+        assert_eq!(
+            spec.degree, deg,
+            "parser must carry the degree through verbatim"
+        );
 
         // logslope_formula = linkwiggle(...) is the score-warp route the Python
         // marginal-slope path uses.
         let err = route_marginal_slope_deviation_blocks(None, Some(&spec))
             .err()
-        .expect("non-cubic linkwiggle must be rejected before any fit");
+            .expect("non-cubic linkwiggle must be rejected before any fit");
         assert!(
             err.contains("degree must be 3"),
             "rejection must name the cubic-only contract, got: {err}"
@@ -1518,7 +1532,7 @@ fn linkwiggle_noncubic_degree_is_rejected_at_the_routing_boundary_issue_384() {
         // The main-formula link-deviation route is gated identically.
         let err_main = route_marginal_slope_deviation_blocks(Some(&spec), None)
             .err()
-        .expect("non-cubic link-deviation must be rejected before any fit");
+            .expect("non-cubic link-deviation must be rejected before any fit");
         assert!(err_main.contains("degree must be 3"));
     }
 
@@ -1636,7 +1650,7 @@ fn survival_inverse_link_result_requires_convergence() {
         |_| Some(InverseLink::Standard(StandardLink::Logit)),
     )
     .err()
-        .expect("non-converged inverse-link search should fail");
+    .expect("non-converged inverse-link search should fail");
 
     assert!(err.contains("did not converge"));
     assert!(err.contains("final_objective"));
@@ -1650,7 +1664,7 @@ fn survival_inverse_link_result_requires_recoverable_state() {
         |_| None,
     )
     .err()
-        .expect("unrecoverable inverse-link state should fail");
+    .expect("unrecoverable inverse-link state should fail");
 
     assert!(err.contains("produced an invalid inverse-link state"));
     assert!(err.contains("9.0"));
@@ -2077,8 +2091,13 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
     // same standardize→fit→rescale envelope the engine applies (#884), so the
     // two paths compare the same σ-floor model rather than diverging on the
     // raw-vs-scale-relative floor.
-    let ref_solved =
-        reference_gaussian_wiggle(req_data, spec.clone(), &wiggle_cfg, &options, &kappa_options);
+    let ref_solved = reference_gaussian_wiggle(
+        req_data,
+        spec.clone(),
+        &wiggle_cfg,
+        &options,
+        &kappa_options,
+    );
 
     assert_block_states_match(
         "gaussian/wiggle",
@@ -2086,8 +2105,7 @@ fn gaussian_location_scale_engine_matches_reference_flow() {
         &ref_solved.fit.fit,
     );
     assert_eq!(
-        engine_wiggle.wiggle_degree,
-        ref_solved.wiggle_degree,
+        engine_wiggle.wiggle_degree, ref_solved.wiggle_degree,
         "gaussian wiggle degree must match the reference refit"
     );
     let engine_knots = engine_wiggle
@@ -2461,11 +2479,8 @@ fn nonsurvival_gaussian_dataset() -> Dataset {
             format!("{x:.17e}"),
         ]));
     }
-    gam_data::encode_recordswith_inferred_schema(
-        vec!["time".to_string(), "x".to_string()],
-        records,
-    )
-    .expect("encode non-survival gaussian dataset")
+    gam_data::encode_recordswith_inferred_schema(vec!["time".to_string(), "x".to_string()], records)
+        .expect("encode non-survival gaussian dataset")
 }
 
 #[test]

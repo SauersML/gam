@@ -188,18 +188,19 @@ pub fn tweedie_power_is_estimated(family: Option<&str>) -> bool {
         return false;
     };
     let lowered = name.to_ascii_lowercase().replace('_', "-");
-    let (head, arg): (&str, Option<&str>) =
-        if let Some(open) = lowered.find('(') && lowered.ends_with(')') {
-            let head = lowered[..open].trim_end_matches('-').trim();
-            let inner = lowered[open + 1..lowered.len() - 1].trim();
-            if head.is_empty() || inner.is_empty() {
-                (lowered.as_str(), None)
-            } else {
-                (head, Some(inner))
-            }
-        } else {
+    let (head, arg): (&str, Option<&str>) = if let Some(open) = lowered.find('(')
+        && lowered.ends_with(')')
+    {
+        let head = lowered[..open].trim_end_matches('-').trim();
+        let inner = lowered[open + 1..lowered.len() - 1].trim();
+        if head.is_empty() || inner.is_empty() {
             (lowered.as_str(), None)
-        };
+        } else {
+            (head, Some(inner))
+        }
+    } else {
+        (lowered.as_str(), None)
+    };
     if !matches!(head, "tweedie" | "tw" | "tweedie-log") {
         return false;
     }
@@ -802,7 +803,12 @@ mod tweedie_power_tests {
     #[test]
     fn tweedie_paren_power_rejects_out_of_range() {
         let y = array![0.0, 1.2, 3.4];
-        for bad in ["tweedie(1.0)", "tweedie(2.0)", "tweedie(2.5)", "tweedie(0.5)"] {
+        for bad in [
+            "tweedie(1.0)",
+            "tweedie(2.0)",
+            "tweedie(2.5)",
+            "tweedie(0.5)",
+        ] {
             let err = resolve_family(
                 Some(bad),
                 None,

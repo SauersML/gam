@@ -5,7 +5,7 @@ use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam_models::survival::location_scale::residual_distribution_inverse_link;
 use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam_models::survival::parse_survival_distribution;
-use gam_models::survival::{SurvivalLikelihoodMode, parse_survival_likelihood_mode};
+use gam_models::survival::parse_survival_likelihood_mode;
 use gam_models::transformation_normal::TransformationNormalConfig;
 use gam_problem::types::{
     InverseLink, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink,
@@ -170,7 +170,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         .as_ref()
         .map(gam_solve::topology_selector::TopologyAutoSelector::from_json)
         .transpose()?;
-    fit_config.family = normalize_optional_family(json_config.family);
+    fit_config.family = json_config.family;
     fit_config.offset_column = json_config.offset;
     fit_config.weight_column = json_config.weights;
     if let Some(ridge_lambda) = json_config.ridge_lambda {
@@ -250,25 +250,11 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         json_config.frailty_sd,
         json_config.hazard_loading,
     )?;
-    fit_config = resolve_fit_config(fit_config)?;
+    fit_config = fit_config.resolve()?;
     Ok(ResolvedFitConfig {
         fit_config,
         training_table_kind,
     })
-}
-
-/// Normalize and validate the one canonical fit configuration type.
-///
-/// Front ends are responsible only for translating their syntax into
-/// [`FitConfig`]. All semantic normalization and cross-field validation happens
-/// here, so CLI and JSON callers cannot drift into separate configuration
-/// contracts.
-pub fn resolve_fit_config(mut fit_config: FitConfig) -> Result<FitConfig, String> {
-    fit_config.family = normalize_optional_family(fit_config.family);
-    fit_config.survival_likelihood =
-        parse_survival_likelihood_cli(&fit_config.survival_likelihood)?;
-    validate_resolved_fit_config(&fit_config)?;
-    Ok(fit_config)
 }
 
 pub fn resolve_cli_frailty_spec(
@@ -333,74 +319,6 @@ pub fn parse_baseline_target_cli(raw: &str) -> Result<String, String> {
             "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
         )),
     }
-}
-
-pub fn validate_survival_baseline_args(
-    likelihood_mode: SurvivalLikelihoodMode,
-    baseline_target: &str,
-    baseline_scale: Option<f64>,
-    baseline_shape: Option<f64>,
-    baseline_rate: Option<f64>,
-    baseline_makeham: Option<f64>,
-) -> Result<(), String> {
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-        if baseline_rate.is_some() || baseline_makeham.is_some() {
-            return Err(
-                "--survival-likelihood weibull does not use --baseline-rate or --baseline-makeham"
-                    .to_string(),
-            );
-        }
-        if !matches!(baseline_target, "linear" | "weibull") {
-            return Err(
-                "--survival-likelihood weibull supports only --baseline-target linear|weibull"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    }
-
-    match baseline_target {
-        "linear" => {
-            if baseline_scale.is_some()
-                || baseline_shape.is_some()
-                || baseline_rate.is_some()
-                || baseline_makeham.is_some()
-            {
-                return Err(
-                    "--baseline-target linear does not use baseline parameter flags".to_string(),
-                );
-            }
-        }
-        "weibull" => {
-            if baseline_rate.is_some() || baseline_makeham.is_some() {
-                return Err(
-                    "--baseline-target weibull does not use --baseline-rate or --baseline-makeham"
-                        .to_string(),
-                );
-            }
-        }
-        "gompertz" => {
-            if baseline_scale.is_some() || baseline_makeham.is_some() {
-                return Err(
-                    "--baseline-target gompertz does not use --baseline-scale or --baseline-makeham"
-                        .to_string(),
-                );
-            }
-        }
-        "gompertz-makeham" => {
-            if baseline_scale.is_some() {
-                return Err(
-                    "--baseline-target gompertz-makeham does not use --baseline-scale".to_string(),
-                );
-            }
-        }
-        other => {
-            return Err(format!(
-                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
@@ -598,13 +516,6 @@ pub fn parse_survival_inverse_link(
         }
         let dist = parse_survival_distribution(input.survival_distribution)?;
         Ok(residual_distribution_inverse_link(dist))
-    }
-}
-
-pub fn normalize_optional_family(family: Option<String>) -> Option<String> {
-    match family {
-        Some(value) if value.eq_ignore_ascii_case("auto") => None,
-        other => other,
     }
 }
 
@@ -869,21 +780,6 @@ fn parse_gpu_policy(raw_gpu: &str) -> Result<gam_gpu::GpuPolicy, String> {
     })
 }
 
-fn validate_resolved_fit_config(config: &FitConfig) -> Result<(), String> {
-    if !config.ridge_lambda.is_finite() || config.ridge_lambda < 0.0 {
-        return Err("--ridge-lambda must be finite and >= 0".to_string());
-    }
-    let likelihood_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    validate_survival_baseline_args(
-        likelihood_mode,
-        &config.baseline_target,
-        config.baseline_scale,
-        config.baseline_shape,
-        config.baseline_rate,
-        config.baseline_makeham,
-    )
-}
-
 fn survival_link_usage() -> &'static str {
     "use identity|logit|probit|cloglog|loglog|cauchit|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
 }
@@ -905,7 +801,7 @@ mod tests {
     }
 
     fn resolved_cli(input: FitConfig) -> Result<FitConfig, String> {
-        resolve_fit_config(input)
+        input.resolve()
     }
 
     fn resolved_json(config: Value) -> Result<FitConfig, String> {
@@ -1186,32 +1082,6 @@ mod tests {
         );
     }
 
-    // ── normalize_optional_family ─────────────────────────────────────────
-
-    #[test]
-    fn normalize_optional_family_none_passthrough() {
-        assert_eq!(normalize_optional_family(None), None);
-    }
-
-    #[test]
-    fn normalize_optional_family_auto_becomes_none() {
-        assert_eq!(normalize_optional_family(Some("auto".to_string())), None);
-        assert_eq!(normalize_optional_family(Some("Auto".to_string())), None);
-        assert_eq!(normalize_optional_family(Some("AUTO".to_string())), None);
-    }
-
-    #[test]
-    fn normalize_optional_family_non_auto_passthrough() {
-        assert_eq!(
-            normalize_optional_family(Some("binomial".to_string())),
-            Some("binomial".to_string())
-        );
-        assert_eq!(
-            normalize_optional_family(Some("gaussian".to_string())),
-            Some("gaussian".to_string())
-        );
-    }
-
     // ── parse_survival_likelihood_cli ─────────────────────────────────────
 
     #[test]
@@ -1256,45 +1126,6 @@ mod tests {
         assert!(
             err.contains("cox"),
             "error should name the bad value: {err}"
-        );
-    }
-
-    // ── validate_survival_baseline_args ───────────────────────────────────
-
-    #[test]
-    fn validate_survival_baseline_args_linear_rejects_params() {
-        let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(
-            validate_survival_baseline_args(mode, "linear", Some(1.0), None, None, None).is_err()
-        );
-    }
-
-    #[test]
-    fn validate_survival_baseline_args_linear_accepts_no_params() {
-        let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(validate_survival_baseline_args(mode, "linear", None, None, None, None).is_ok());
-    }
-
-    #[test]
-    fn validate_survival_baseline_args_weibull_likelihood_rejects_gompertz_target() {
-        let mode = parse_survival_likelihood_mode("weibull").unwrap();
-        assert!(validate_survival_baseline_args(mode, "gompertz", None, None, None, None).is_err());
-    }
-
-    #[test]
-    fn validate_survival_baseline_args_gompertz_rejects_scale() {
-        let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(
-            validate_survival_baseline_args(mode, "gompertz", Some(2.0), None, None, None).is_err()
-        );
-    }
-
-    #[test]
-    fn validate_survival_baseline_args_gompertz_makeham_rejects_scale() {
-        let mode = parse_survival_likelihood_mode("transformation").unwrap();
-        assert!(
-            validate_survival_baseline_args(mode, "gompertz-makeham", Some(1.0), None, None, None)
-                .is_err()
         );
     }
 }

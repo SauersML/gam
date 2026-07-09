@@ -822,7 +822,9 @@ pub(super) fn smooth_basis_feature_cols_for_latent(
     basis: &gam_terms::smooth::SmoothBasisSpec,
 ) -> Option<Vec<usize>> {
     match basis {
-        gam_terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(vec![*feature_col]),
+        gam_terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+            Some(vec![*feature_col])
+        }
         gam_terms::smooth::SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | gam_terms::smooth::SmoothBasisSpec::Sphere { feature_cols, .. }
         | gam_terms::smooth::SmoothBasisSpec::ConstantCurvature { feature_cols, .. }

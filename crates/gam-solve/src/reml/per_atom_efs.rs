@@ -314,18 +314,18 @@ pub(crate) fn border_hessian_block(
             rho.len()
         )));
     }
-    // Exact operator path: probes are independent operator matvecs; fan across
+    // Exact operator path: probes are independent operator applications; fan across
     // rayon. No OnceLock get_or_init is triggered inside the probe closure
-    // (matvec is a pure linear action on a captured factorization), so the
+    // (the HVP is a pure linear action on a captured factorization), so the
     // nested-rayon deadlock rule is satisfied.
     let cols: Result<Vec<(usize, Array1<f64>)>, EstimationError> = (0..m)
         .into_par_iter()
         .map(|j| {
             let mut e_j = Array1::<f64>::zeros(rho.len());
             e_j[border[j]] = 1.0;
-            let hv = operator.matvec(&e_j).map_err(|reason| {
+            let hv = operator.apply(&e_j).map_err(|reason| {
                 EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom border θ-HVP operator matvec failed: {reason}"
+                    "per-atom border θ-HVP operator application failed: {reason}"
                 ))
             })?;
             Ok((j, hv))
@@ -691,8 +691,18 @@ mod tests {
         fn dim(&self) -> usize {
             self.a.nrows()
         }
-        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-            Ok(self.a.dot(v))
+        fn apply_into(
+            &self,
+            v: &Array1<f64>,
+            out: &mut Array1<f64>,
+        ) -> Result<(), opt::ObjectiveEvalError> {
+            if v.len() != self.a.ncols() || out.len() != self.a.nrows() {
+                return Err(opt::ObjectiveEvalError::fatal(
+                    "quadratic Hessian operator shape mismatch",
+                ));
+            }
+            out.assign(&self.a.dot(v));
+            Ok(())
         }
     }
 
@@ -876,9 +886,9 @@ mod tests {
                     v.len()
                 )));
             }
-            operator.matvec(v).map_err(|reason| {
+            operator.apply(v).map_err(|reason| {
                 EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom θ-HVP operator matvec failed (dim={}): {reason}",
+                    "per-atom θ-HVP operator application failed (dim={}): {reason}",
                     v.len()
                 ))
             })

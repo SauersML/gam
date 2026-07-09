@@ -78,8 +78,7 @@ pub fn prepare_survival_time_stack(
         let offset_cfg = if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
             && baseline_cfg.target == SurvivalBaselineTarget::Linear
         {
-            let scale =
-                crate::survival::construction::positive_survival_time_seed(age_exit);
+            let scale = crate::survival::construction::positive_survival_time_seed(age_exit);
             conditioning_cfg = crate::survival::construction::SurvivalBaselineConfig {
                 target: SurvivalBaselineTarget::Weibull,
                 scale: Some(scale),

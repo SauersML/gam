@@ -21,9 +21,8 @@ use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, HarmonicRoughnessPenalty,
-    IBPAssignmentPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
-    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
@@ -972,9 +971,8 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    HarmonicRoughnessPenalty::new(weight, n_eff, row_weights, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = HarmonicRoughnessPenalty::new(weight, n_eff, row_weights, learnable)
+                    .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,

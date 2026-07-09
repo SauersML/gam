@@ -38,7 +38,7 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
         cli_hazard_loading(args.hazard_loading),
         "fit",
     )?;
-    crate::config_resolve::resolve_fit_config(FitConfig {
+    FitConfig {
         family: family_arg_canonical_name(args.family).map(str::to_string),
         expectile_tau: args.expectile_tau,
         negative_binomial_theta: args.negative_binomial_theta,
@@ -69,7 +69,8 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
         firth: args.firth,
         frailty,
         ..FitConfig::default()
-    })
+    }
+    .resolve()
 }
 
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
@@ -79,7 +80,7 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         cli_hazard_loading(args.hazard_loading),
         "survival fit",
     )?;
-    crate::config_resolve::resolve_fit_config(FitConfig {
+    FitConfig {
         link: args.link.clone(),
         offset_column: args.offset_column.clone(),
         weight_column: args.weights_column.clone(),
@@ -106,7 +107,8 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         ridge_lambda: args.ridge_lambda,
         frailty,
         ..FitConfig::default()
-    })
+    }
+    .resolve()
 }
 
 pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
@@ -2211,7 +2213,7 @@ pub(crate) fn validate_fit_args_preflight(
             return Err("--noise-offset-column requires --predict-noise".to_string());
         }
     }
-    crate::config_resolve::validate_survival_baseline_args(
+    gam::families::fit_orchestration::validate_survival_baseline_config(
         survival_likelihood,
         &baseline_target_raw,
         fit_config.baseline_scale,

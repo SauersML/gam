@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use std::sync::Arc;
 
-use crate::rho_optimizer::RhoBlockAdditiveOuterHessian;
+use crate::rho_optimizer::RhoBlockAdditiveHessian;
 use gam_problem::OuterStrategyError;
 
 pub use gam_problem::HessianValue;
@@ -53,7 +53,7 @@ pub fn add_rho_block_dense_to_hessian(
                 }
                 .into());
             }
-            *hessian = HessianValue::Operator(Arc::new(RhoBlockAdditiveOuterHessian {
+            *hessian = HessianValue::Operator(Arc::new(RhoBlockAdditiveHessian {
                 base,
                 rho_block: rho_block.clone(),
                 dim,

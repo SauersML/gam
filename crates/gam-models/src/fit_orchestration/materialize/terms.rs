@@ -173,9 +173,16 @@ fn parsed_term_pins_centers(
                 .filter_map(|name| col_map.get(name.trim()).copied())
                 .collect();
             if got == needle {
-                return ["centers", "k", "n_centers", "basis_dim", "basis-dim", "basisdim"]
-                    .iter()
-                    .any(|key| options.contains_key(*key));
+                return [
+                    "centers",
+                    "k",
+                    "n_centers",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                ]
+                .iter()
+                .any(|key| options.contains_key(*key));
             }
         }
     }
@@ -221,9 +228,7 @@ pub fn gate_duchon_operator_penalties_for_family(
     }
 }
 
-fn disable_duchon_operator_penalties_in_basis(
-    basis: &mut gam_terms::smooth::SmoothBasisSpec,
-) {
+fn disable_duchon_operator_penalties_in_basis(basis: &mut gam_terms::smooth::SmoothBasisSpec) {
     use gam_terms::smooth::SmoothBasisSpec;
     match basis {
         SmoothBasisSpec::Duchon { spec, .. } => {

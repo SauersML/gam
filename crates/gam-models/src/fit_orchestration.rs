@@ -118,8 +118,7 @@ use crate::survival::construction::{
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
-    resolved_survival_time_basis_config_from_build,
-    survival_derivative_guard_for_likelihood,
+    resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 
 use crate::survival::location_scale::{
@@ -155,6 +154,7 @@ pub mod drivers;
 mod entry;
 mod error;
 mod fit;
+mod fit_config;
 mod materialize;
 mod request;
 
@@ -173,9 +173,10 @@ mod gaussian_reml_stall_edf_collapse_1788_tests;
 #[cfg(test)]
 mod curv_fixed_kappa_2152_tests;
 
+pub use deviation::*;
 pub use entry::*;
 pub use error::*;
-pub use deviation::*;
 pub(crate) use fit::*;
+pub use fit_config::*;
 pub use materialize::*;
 pub use request::*;

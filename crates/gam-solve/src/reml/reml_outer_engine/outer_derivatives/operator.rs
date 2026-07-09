@@ -727,75 +727,28 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
         self.coords.len()
     }
 
-    fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if alpha.len() != self.coords.len() {
-            return Err(RemlError::DimensionMismatch {
-                reason: format!(
-                    "outer Hessian alpha length mismatch: got {}, expected {}",
-                    alpha.len(),
-                    self.coords.len()
-                ),
-            }
-            .into());
-        }
-        let mut a_alpha = 0.0;
-        for (idx, coord) in self.coords.iter().enumerate() {
-            if alpha[idx] != 0.0 {
-                a_alpha += alpha[idx] * coord.a;
-            }
-        }
-        let correction_m_alpha = self.theta_direction_mode_response(alpha);
-        // #740: one ψψ-block hook contraction per matvec (one family row pass),
-        // shared read-only across the parallel per-row entries below.
-        let psi_contrib = self.psi_contracted_contrib(alpha)?;
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-        let values: Result<Vec<f64>, String> = (0..self.coords.len())
-            .into_par_iter()
-            .map(|idx| {
-                self.outer_hessian_index_entry(
-                    idx,
-                    alpha,
-                    a_alpha,
-                    &correction_m_alpha,
-                    psi_contrib.as_ref(),
-                )
-            })
-            .collect();
-
-        Ok(Array1::from_vec(values?))
-    }
-
     /// Zero-alloc override for the inner-CG hot path.
     ///
-    /// Eliminates the transient `Vec<f64>` + `Array1::from_vec` allocation that
-    /// `matvec` incurs on every CG step.  The parallel computation is identical;
-    /// results are written directly into the caller-supplied `out` buffer via
-    /// `par_iter_mut().enumerate()` rather than collected into a fresh `Vec`.
+    /// Results are written directly into the caller-supplied `out` buffer via
+    /// `par_iter_mut().enumerate()`.
     fn apply_into(
         &self,
         alpha: &ndarray::Array1<f64>,
         out: &mut ndarray::Array1<f64>,
-    ) -> Result<(), String> {
+    ) -> Result<(), opt::ObjectiveEvalError> {
         if alpha.len() != self.coords.len() {
-            return Err(RemlError::DimensionMismatch {
-                reason: format!(
+            return Err(opt::ObjectiveEvalError::fatal(format!(
                     "outer Hessian alpha length mismatch: got {}, expected {}",
                     alpha.len(),
                     self.coords.len()
-                ),
-            }
-            .into());
+                )));
         }
         if out.len() != self.coords.len() {
-            return Err(RemlError::DimensionMismatch {
-                reason: format!(
+            return Err(opt::ObjectiveEvalError::fatal(format!(
                     "outer Hessian apply_into output length mismatch: got {}, expected {}",
                     out.len(),
                     self.coords.len()
-                ),
-            }
-            .into());
+                )));
         }
         let mut a_alpha = 0.0;
         for (idx, coord) in self.coords.iter().enumerate() {
@@ -804,11 +757,17 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
             }
         }
         let correction_m_alpha = self.theta_direction_mode_response(alpha);
-        // #740: one ψψ-block hook contraction per matvec (see `matvec`).
-        let psi_contrib = self.psi_contracted_contrib(alpha)?;
+        // #740: one ψψ-block hook contraction per HVP.
+        let psi_contrib = self
+            .psi_contracted_contrib(alpha)
+            .map_err(opt::ObjectiveEvalError::fatal)?;
         let slice = out
             .as_slice_mut()
-            .ok_or_else(|| "outer Hessian apply_into: non-contiguous output buffer".to_string())?;
+            .ok_or_else(|| {
+                opt::ObjectiveEvalError::fatal(
+                    "outer Hessian apply_into: non-contiguous output buffer",
+                )
+            })?;
         slice
             .par_iter_mut()
             .enumerate()
@@ -822,6 +781,7 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
                 )?;
                 Ok(())
             })
+            .map_err(opt::ObjectiveEvalError::fatal)
     }
 }
 

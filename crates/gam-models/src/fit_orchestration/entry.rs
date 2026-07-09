@@ -371,6 +371,10 @@ pub fn fit_from_formula(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
+    let config = config
+        .clone()
+        .resolve()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
     // Expectile regression (Newey–Powell asymmetric least squares): when the
     // family resolves to "expectile", the τ-expectile of `y | x` is the
     // minimizer of `Σ wᵢ(τ)·(yᵢ − μᵢ)²`, `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`
@@ -382,10 +386,10 @@ pub fn fit_from_formula(
     // penalized expectile smooth with data-driven smoothing for free. This is a
     // genuine estimator route, not a silent swap: it fires only on the explicit
     // `family = "expectile"`. Every other family falls through unchanged.
-    if let Some(result) = fit_expectile_if_requested(formula, data, config)? {
+    if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FitResult::Standard(result));
     }
-    let mat = materialize(formula, data, config)?;
+    let mat = materialize(formula, data, &config)?;
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
     // is the single 1-D Gaussian-identity penalized-smooth shape the
     // state-space scan solves exactly, route through it and return the
@@ -1113,6 +1117,11 @@ pub fn materialize<'a>(
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    let config = config
+        .clone()
+        .resolve()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+    let config = &config;
     gam_gpu::configure_global_policy(config.gpu_policy);
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();

@@ -47,7 +47,7 @@ const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(COLORS.background, 0.028);
 
 const camera = new THREE.PerspectiveCamera(35, mount.clientWidth / mount.clientHeight, 0.1, 100);
-camera.position.set(9.2, 5.1, 17.4);
+camera.position.set(9.6, 5.4, 18.8);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -231,6 +231,8 @@ function createResidualColumns() {
     const curve = lineCurve(new THREE.Vector3(x, yMin, 0), new THREE.Vector3(x, yMax, 0));
     const halo = registerPart(tubeFromCurve(curve, COLORS.graphite, 0.105, 0.045, 60), "residual", { position });
     const core = registerPart(tubeFromCurve(curve, COLORS.graphite, 0.034, 0.52, 60), "residual", { position });
+    halo.userData.role = "halo";
+    core.userData.role = "core";
     residualGroup.add(halo, core);
     residualParts.push(halo, core);
     tagPickable(core, makeInfo(
@@ -248,6 +250,7 @@ function createResidualColumns() {
         "residual",
         { position },
       );
+      arrow.userData.role = "arrow";
       residualGroup.add(arrow);
       residualParts.push(arrow);
     }
@@ -310,7 +313,7 @@ function createModule(layer, position) {
   ));
 
   const kv = new THREE.Mesh(GEOMETRY.kv, standardMaterial(COLORS.violet, {
-    opacity: 0.76,
+    opacity: 0.64,
     emissiveIntensity: 1.05,
     roughness: 0.25,
   }));
@@ -609,7 +612,7 @@ function createLayerLabels() {
 function createOutputHead() {
   const position = TOKENS.length - 1;
   const x = xAt(position);
-  const y = yAt(LAYERS - 1) + 1.72;
+  const y = yAt(LAYERS - 1) + 1.68;
   const output = new THREE.Mesh(GEOMETRY.output, standardMaterial(COLORS.output, {
     opacity: 0.28,
     emissiveIntensity: 0.5,
@@ -635,7 +638,7 @@ function createOutputHead() {
   tagPickable(stem, output.userData.info);
 
   const label = createTextSprite("LM HEAD · LOGITS", "#bdb59f", 24, [2.8, 0.52]);
-  label.position.set(x - 0.1, y + 0.5, 0.1);
+  label.position.set(x - 0.1, y + 0.34, 0.1);
   outputGroup.add(label);
 
   addFlowPulse(stemCurve, COLORS.output, {
@@ -878,14 +881,19 @@ function opacityFor(object, nextMode) {
     const isFocusModule = object.userData.layer === BLOCK_FOCUS.layer && object.userData.position === BLOCK_FOCUS.position;
     const isIncoming = kind === "connection" && object.userData.layer === BLOCK_FOCUS.layer && object.userData.target === BLOCK_FOCUS.position;
     const isFocusResidual = kind === "residual" && object.userData.position === BLOCK_FOCUS.position;
-    if (isFocusModule || isIncoming || isFocusResidual) return Math.max(base, 0.68);
+    if (isFocusResidual) {
+      if (object.userData.role === "halo") return 0.045;
+      if (object.userData.role === "core") return 0.5;
+      return 0.58;
+    }
+    if (isFocusModule || isIncoming) return Math.max(base, 0.58);
     if (kind === "connection") return 0.008;
     return 0.035;
   }
   if (nextMode === "paths") {
     if (kind === "connection") return 0.006;
     if (kind === "module") return 0.025;
-    if (kind === "residual") return 0.075;
+    if (kind === "residual") return object.userData.role === "halo" ? 0.018 : 0.075;
   }
   return base;
 }
@@ -922,8 +930,8 @@ function setMode(nextMode) {
   applyModeOpacity(nextMode);
 
   if (nextMode === "overview") {
-    cameraGoal.set(9.2, 5.1, 17.4);
-    targetGoal.set(0, 0.1, 0);
+    cameraGoal.set(9.6, 5.4, 18.8);
+    targetGoal.set(0, 0.15, 0);
   } else if (nextMode === "block") {
     cameraGoal.set(4.5, yAt(BLOCK_FOCUS.layer) + 1.15, 7.2);
     targetGoal.set(xAt(BLOCK_FOCUS.position), yAt(BLOCK_FOCUS.layer) + 0.25, 0.3);
