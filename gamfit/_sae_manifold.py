@@ -3637,19 +3637,15 @@ def _basis_with_jet_for_atom(
         # atom can degenerate to the DC-only width M = 1 (H = 0) — the SAC driver
         # emits these — so H is ``(M - 1) // 2`` with NO ``max(1, …)`` floor: a
         # spurious floor would rebuild a 3-column Φ against a 1-row decoder and the
-        # ``Φ @ B`` reconstruct would raise a shape mismatch. For H = 0 the basis is
-        # just the constant column, evaluated here directly (the Rust harmonic
-        # evaluator agrees: ``PeriodicHarmonicEvaluator::new(1)`` → Φ ≡ 1).
-        n_harmonics = (int(basis_size) - 1) // 2
-        if n_harmonics <= 0:
-            n_rows = int(t.shape[0])
-            phi = np.ones((n_rows, 1), dtype=np.float64)
-            jet = np.zeros((n_rows, 1, 1), dtype=np.float64)
-            penalty = np.zeros((1, 1), dtype=np.float64)
-        else:
-            phi, jet, penalty = rust_module().basis_with_jet(
-                "periodic", t[:, :1], {"n_harmonics": int(n_harmonics)}
-            )
+        # ``Φ @ B`` reconstruct would raise a shape mismatch. H = 0 is not a Python
+        # special case: the Rust ``basis_with_jet`` periodic kernel honours
+        # ``n_harmonics = 0`` natively (M = 1 constant column, zero jet, DC-only
+        # penalty — the same DC treatment every wider periodic atom gets), so all
+        # widths route through the one Rust kernel and no basis math lives here.
+        n_harmonics = max((int(basis_size) - 1) // 2, 0)
+        phi, jet, penalty = rust_module().basis_with_jet(
+            "periodic", t[:, :1], {"n_harmonics": int(n_harmonics)}
+        )
     elif canon == "sphere":
         phi, jet, penalty = rust_module().basis_with_jet("sphere", t[:, : max(1, latent_dim)], {})
     else:
