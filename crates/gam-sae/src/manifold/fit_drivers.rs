@@ -4,6 +4,55 @@ use super::*;
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 
+/// Floor on the per-axis coordinate spread used to guard the ARD moment-match
+/// (`α' = α · spread_pre / spread_post`, F3). Below this the spread is
+/// numerically degenerate (a near-constant coordinate) and the ratio is
+/// meaningless, so the untransformed precision is stamped instead. Not a tuning
+/// knob — it only fences the division against a vanishing denominator at f64
+/// resolution.
+const ARD_SPREAD_FLOOR: f64 = 1.0e-12;
+
+/// Per-axis spread of a coordinate column used for the ARD moment-match (F3): the
+/// population variance on a flat axis, and the circular variance `1 − R`
+/// (`R = |mean e^{iθ}|`, `θ = 2π t / period`) on a periodic axis — the wrap-aware
+/// second moment, so a seam-straddling circle coordinate is measured by its true
+/// angular concentration rather than a spuriously large linear variance. `NaN`
+/// for an empty column or an out-of-range axis (the caller then leaves the
+/// precision untransformed).
+fn axis_coordinate_spread(coords: ArrayView2<'_, f64>, axis: usize, period: Option<f64>) -> f64 {
+    let n = coords.nrows();
+    if n == 0 || axis >= coords.ncols() {
+        return f64::NAN;
+    }
+    match period {
+        Some(p) if p.is_finite() && p > 0.0 => {
+            let w = std::f64::consts::TAU / p;
+            let mut cs = 0.0;
+            let mut sn = 0.0;
+            for row in 0..n {
+                let ang = coords[[row, axis]] * w;
+                cs += ang.cos();
+                sn += ang.sin();
+            }
+            let r = (cs * cs + sn * sn).sqrt() / n as f64;
+            (1.0 - r).max(0.0)
+        }
+        _ => {
+            let mut mean = 0.0;
+            for row in 0..n {
+                mean += coords[[row, axis]];
+            }
+            mean /= n as f64;
+            let mut var = 0.0;
+            for row in 0..n {
+                let d = coords[[row, axis]] - mean;
+                var += d * d;
+            }
+            var / n as f64
+        }
+    }
+}
+
 /// Per-fit-CONSTANT centered statistics of the reconstruction target, shared by
 /// the #976 decoder-norm co-collapse guard's EV and output-energy signals.
 ///
@@ -347,33 +396,31 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
 
-        // #F3 — stamp each atom's fitted per-axis ARD precisions from the TERMINAL
-        // rho, so the certified encode adds the SAME ARD / von-Mises coordinate
-        // prior the fit optimized `t` against (via
-        // [`crate::encode::EncodeObjective`] `prior_alpha`) rather than certifying a
-        // prior-free objective. Done here, alongside the other terminal-rho
-        // canonicalization state, so the stamped precisions cannot drift from the
-        // rho the fit converged to. Uses the identical `stable_exp_strength` map as
-        // the fit's `ArdAxisPrior` assembly (`α_a = exp(log_ard[k][a])`, stabilized);
-        // an atom with no fitted coordinate prior (`rho.log_ard[k]` empty) is left
-        // `None` (prior-free encode, unchanged). Guarded on the rho/atom-count
-        // invariant so a malformed rho leaves the priors untouched rather than
-        // panicking during finalization.
-        if rho.log_ard.len() == self.k_atoms() {
-            for atom_idx in 0..self.k_atoms() {
-                let log_ard = &rho.log_ard[atom_idx];
-                self.atoms[atom_idx].ard_precisions = if log_ard.is_empty() {
-                    None
-                } else {
-                    Some(
-                        log_ard
-                            .iter()
-                            .map(|&la| SaeManifoldRho::stable_exp_strength(la))
-                            .collect::<Array1<f64>>(),
-                    )
-                };
-            }
-        }
+        // #F3 — capture the PRE-canonicalization coordinate spread per atom/axis.
+        // The ARD precisions are stamped AFTER the reparameterization below (see the
+        // end of this fn), MOMENT-MATCHED into the canonical chart: a coordinate
+        // prior `½ α t²` whose `α` was REML-calibrated to the FIT-chart coordinate
+        // spread must preserve its mass against the realized spread, so
+        // `α' = α · spread_pre / spread_post`. This is exact for any linear rescale
+        // `t' = c·t` (`α/c²` — e.g. the affine `d = 1` arc-length map) and is the
+        // natural second-moment-matched correction for the nonlinear `d = 2` flows;
+        // non-canonicalized atoms have `spread_post == spread_pre`, so the ratio is
+        // 1 and `α` is unchanged. Periodic axes use the circular variance.
+        let ard_pre_spread: Vec<Vec<f64>> = (0..self.k_atoms())
+            .map(|k| {
+                let coords = self.assignment.coords[k].as_matrix();
+                let periods = self.assignment.coords[k].effective_axis_periods();
+                (0..coords.ncols())
+                    .map(|axis| {
+                        axis_coordinate_spread(
+                            coords.view(),
+                            axis,
+                            periods.get(axis).copied().flatten(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
 
         /// Which canonical-representative construction applies to an atom:
         /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
@@ -602,6 +649,52 @@ impl SaeManifoldTerm {
             Err(err) => {
                 log::warn!("[#1026] hybrid split report unavailable: {err}");
                 self.hybrid_split_report = None;
+            }
+        }
+
+        // #F3 — stamp the MOMENT-MATCHED ARD precisions from the TERMINAL rho, now
+        // that the reparameterization above has settled the canonical chart the
+        // encode uses (see the pre-spread capture at the top of this fn).
+        // `α_a = exp(log_ard[k][a])` is the REML precision in the FIT chart;
+        // `α'_a = α_a · spread_pre / spread_post` re-expresses it against the
+        // canonical chart's realized coordinate spread. Uses the identical
+        // `stable_exp_strength` map as the fit's `ArdAxisPrior`; an atom with no
+        // fitted coordinate prior (`rho.log_ard[k]` empty) is left `None`
+        // (prior-free encode, unchanged). A degenerate/non-finite spread on either
+        // side leaves that axis' `α` untransformed. Guarded on the rho/atom-count
+        // invariant so a malformed rho leaves the priors untouched rather than
+        // panicking during finalization.
+        if rho.log_ard.len() == self.k_atoms() {
+            for atom_idx in 0..self.k_atoms() {
+                let log_ard = &rho.log_ard[atom_idx];
+                self.atoms[atom_idx].ard_precisions = if log_ard.is_empty() {
+                    None
+                } else {
+                    let coords = self.assignment.coords[atom_idx].as_matrix();
+                    let periods = self.assignment.coords[atom_idx].effective_axis_periods();
+                    let pre = &ard_pre_spread[atom_idx];
+                    let stamped: Array1<f64> = (0..log_ard.len())
+                        .map(|axis| {
+                            let alpha = SaeManifoldRho::stable_exp_strength(log_ard[axis]);
+                            let sp_pre = pre.get(axis).copied().unwrap_or(f64::NAN);
+                            let sp_post = axis_coordinate_spread(
+                                coords.view(),
+                                axis,
+                                periods.get(axis).copied().flatten(),
+                            );
+                            if sp_pre.is_finite()
+                                && sp_post.is_finite()
+                                && sp_pre > ARD_SPREAD_FLOOR
+                                && sp_post > ARD_SPREAD_FLOOR
+                            {
+                                alpha * sp_pre / sp_post
+                            } else {
+                                alpha
+                            }
+                        })
+                        .collect();
+                    Some(stamped)
+                };
             }
         }
 
