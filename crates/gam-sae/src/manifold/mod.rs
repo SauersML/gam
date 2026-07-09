@@ -381,8 +381,8 @@ mod tests_behavior_isometry_2015;
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
 
-// #[cfg(test)] mod tests_transport_law;  // coordinator-disabled: file not yet
-// written (transport agent mid-work) — re-enable when tests_transport_law.rs lands.
+#[cfg(test)]
+mod tests_transport_law;
 
 #[cfg(test)]
 mod tests_crosscoder_block_fd_2231;

@@ -184,20 +184,24 @@ fn planted_phase_shift_transport_obeys_the_law() {
     );
 }
 
-/// Arm 2: layer 2 is a squashed (different-shape) ellipse image of the same
-/// circle, so the layer-1 → layer-2 projection is a genuinely nonlinear map. The
-/// verdict FLIPS: the smooth alternative clears a margin derived from the
-/// phase-shift arm's own (tiny) gap.
+/// Arm 2: layer 2 traces the SAME circle but under a nonlinear reparameterization
+/// `θ' = θ + a·sin θ` (the brief's planted nonlinear transport). Both layer images
+/// are the unit circle, so projecting the round layer-1 image onto layer 2 recovers
+/// the reparameterization inverse `g⁻¹` — a large sinusoidal drift a constant phase
+/// shift cannot represent. The verdict FLIPS: the smooth alternative clears a
+/// margin derived from the phase-law tolerance (5× the `0.02` phase-arm bound).
 #[test]
 fn planted_nonlinear_transport_flips_the_verdict() {
-    let n = 128usize;
+    let n = 160usize;
     let p_x = 2usize;
     let p_2 = 2usize;
-    let squash = 0.3_f64; // minor-axis scale ⇒ nonlinear angular projection
-    let sigma = 0.004_f64;
-    // H = 2 capacity so the smooth alternative can represent the 2nd-harmonic
-    // drift the squash induces (the planted data itself is pure fundamental).
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    let a = 0.8_f64; // reparam amplitude; a < 1 keeps θ ↦ θ + a·sin θ monotone
+    let sigma = 0.002_f64;
+    // H = 5 capacity so the fitted layer-2 decoder represents the nonlinearly
+    // reparameterized circle (a Jacobi–Anger series whose harmonics J_n(a) decay
+    // past n ≈ 5) cleanly; the smooth alternative then has ample harmonic order to
+    // fit the drift, which the constant phase model cannot.
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(11).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
 
     let mut z = Array2::<f64>::zeros((n, p_x));
@@ -207,13 +211,13 @@ fn planted_nonlinear_transport_flips_the_verdict() {
     let two_pi = std::f64::consts::TAU;
     for i in 0..n {
         let theta = two_pi * (i as f64 / n as f64);
-        // Anchor: a round circle.
+        let reparam = theta + a * theta.sin(); // θ' = θ + a·sin θ
+        // Anchor: a round circle traced uniformly.
         z[[i, 0]] = theta.cos() + sigma * nx();
         z[[i, 1]] = theta.sin() + sigma * nx();
-        // Layer 2: the SAME phase sense but a squashed minor axis — a different
-        // ellipse, NOT a phase rotation.
-        y2[[i, 0]] = theta.cos() + sigma * n2();
-        y2[[i, 1]] = squash * theta.sin() + sigma * n2();
+        // Layer 2: the SAME circle traced under the nonlinear reparameterization.
+        y2[[i, 0]] = reparam.cos() + sigma * n2();
+        y2[[i, 1]] = reparam.sin() + sigma * n2();
     }
 
     let p_tot = p_x + p_2;
@@ -226,10 +230,10 @@ fn planted_nonlinear_transport_flips_the_verdict() {
     let layout = term.crosscoder_layout().unwrap().clone();
     let nonlinear = measure_atom_transport(&term, &layout, 0, 256).unwrap();
 
-    // Reference phase-shift gap for the margin (arm 1's construction, inlined so
-    // this arm is self-contained). The nonlinear gap must clear a multiple of it
-    // AND an absolute floor: the two verdicts are separated by the measurement.
-    let phase_gap_floor = 0.02_f64;
+    // The phase-law tolerance (0.02, the arm-1 bound) is the reference; a nonlinear
+    // transport must beat it by a full order of magnitude — the two verdicts are
+    // separated by the measurement, not a tuned threshold.
+    let phase_tol = 0.02_f64;
     assert!(
         nonlinear.smooth_r2.is_finite() && nonlinear.phase_r2.is_finite(),
         "R² must be finite: phase_r2 = {}, smooth_r2 = {}",
@@ -237,22 +241,24 @@ fn planted_nonlinear_transport_flips_the_verdict() {
         nonlinear.smooth_r2
     );
     assert!(
-        nonlinear.law_gap() > 0.1,
-        "a squashed-ellipse transport is nonlinear: the smooth alternative must beat the \
-         phase law by > 0.1 R²; gap = {} (phase_r2 = {}, smooth_r2 = {})",
+        nonlinear.law_gap() > 5.0 * phase_tol,
+        "a reparameterized transport is nonlinear: the smooth alternative must beat the phase \
+         law by > {} R² (5× the phase-law tolerance); gap = {} (phase_r2 = {}, smooth_r2 = {})",
+        5.0 * phase_tol,
         nonlinear.law_gap(),
         nonlinear.phase_r2,
         nonlinear.smooth_r2
     );
     assert!(
-        nonlinear.law_gap() > 4.0 * phase_gap_floor,
-        "the nonlinear gap {} must clear 4× the phase-arm gap floor {}",
-        nonlinear.law_gap(),
-        phase_gap_floor
-    );
-    assert!(
-        !nonlinear.law_holds(0.02),
+        !nonlinear.law_holds(phase_tol),
         "law verdict should FLIP (not hold) for a nonlinear transport"
+    );
+    // The smooth alternative should itself fit well — the nonlinear map IS a
+    // few-harmonic drift, just not a constant one.
+    assert!(
+        nonlinear.smooth_r2 > 0.9,
+        "the smooth (few-harmonic) alternative should capture the reparam drift: smooth_r2 = {}",
+        nonlinear.smooth_r2
     );
 
     // The deviation locus is a real chart location where linear transport breaks.
