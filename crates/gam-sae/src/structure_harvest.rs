@@ -1902,10 +1902,19 @@ fn compact_glued_atoms(
             ));
         }
     }
+    // Fit every seam while both partners still carry their live supports.  A
+    // fold demotes `b`; fitting after that mutation sees no active B rows and
+    // silently skips the coordinate transplant the true fusion requires.
+    // Precomputing the disjoint matching also keeps one pair's fold from
+    // changing another pair's softmax support before its seam is measured.
+    let seams: Vec<Option<SeamTransition>> = accepted_glues
+        .iter()
+        .map(|&(a, b)| fit_seam_transition(term, a, b))
+        .collect();
     let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for (a, b) in accepted_glues {
+    for ((a, b), seam) in accepted_glues.into_iter().zip(seams) {
         fold_atom_into(term, a, b)?;
-        if let Some(seam) = fit_seam_transition(term, a, b) {
+        if let Some(seam) = seam {
             transplant_glued_coords(term, a, b, &seam);
         }
         to_remove.insert(b);
@@ -5537,6 +5546,61 @@ mod tests {
                 !first_epoch_glue_claims.contains(&proposal.claim),
                 "a reduced dictionary must not reuse old atom-index evidence: {:?}",
                 proposal.claim
+            );
+        }
+    }
+
+    /// The compactor must measure the transition while the retired chart still
+    /// has live support.  Folding first demotes B and makes seam fitting return
+    /// `None`, leaving A's coordinates on B's rows at an arbitrary stale value.
+    #[test]
+    fn physical_excision_transplants_coords_from_the_live_seam() {
+        use gam_solve::structure_search::{MoveRecord, MoveVerdict};
+
+        let (mut term, mut rho) = tiled_circle_term(32, 2, &[1.0; 2]);
+        assert!(term.assignment.frozen_logits.is_none());
+        let seam = fit_seam_transition(&term, 0, 1).expect("live pair has a seam");
+        let da = term.assignment.coords[0].latent_dim();
+        let db = term.assignment.coords[1].latent_dim();
+        let flat_b = term.assignment.coords[1].as_flat().to_owned();
+        let expected: Vec<(usize, f64)> = seam
+            .rows_b
+            .iter()
+            .map(|&row| {
+                let mapped = (seam.sign * flat_b[row * db] + seam.offset).rem_euclid(seam.period);
+                (row, mapped)
+            })
+            .collect();
+        // Poison only A's INACTIVE coordinates on B's rows.  A correct
+        // transplant overwrites every sentinel through the measured seam.
+        let mut flat_a = term.assignment.coords[0].as_flat().to_owned();
+        for &(row, mapped) in &expected {
+            flat_a[row * da] = (mapped + 0.37).rem_euclid(seam.period);
+        }
+        term.assignment.coords[0].set_flat(flat_a.view());
+
+        let ledger = SearchLedger {
+            alpha: 0.05,
+            moves: vec![MoveRecord {
+                mv: StructureMove::Glue { a: 0, b: 1 },
+                trigger: 40.0,
+                structure_hash: 0,
+                claim: ClaimKind::Custom {
+                    label: "test-live-seam".to_string(),
+                },
+                verdict: MoveVerdict::Accepted { log_e: 40.0 },
+            }],
+            collapse_events: Vec::new(),
+        };
+        compact_glued_atoms(&mut term, &mut rho, &ledger).unwrap();
+
+        assert_eq!(term.k_atoms(), 1);
+        let survivor = term.assignment.coords[0].as_flat();
+        for (row, mapped) in expected {
+            assert!(
+                (survivor[row * da] - mapped).abs() < 1.0e-12,
+                "row {row}: survivor coordinate {} != seam-mapped {mapped}",
+                survivor[row * da]
             );
         }
     }
