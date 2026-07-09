@@ -7288,6 +7288,402 @@ fn sae_manifold_payload_roundtrip(payload_json: &str) -> PyResult<String> {
     crate::manifold::manifold_sae_payload::roundtrip_json(payload_json).map_err(py_value_error)
 }
 
+// --- #[pyclass] ManifoldSAE skeleton (issue #2091 cutover) ----------------
+//
+// The Rust-owned model handle. It wraps the serde `ManifoldSaePayload` and
+// exposes the flat attribute surface consumers read (dense arrays, config
+// scalars, diagnostic/certificate report blocks) via `#[getter]`s, plus the
+// `to_dict`/`from_dict` round-trip delegating through the same serde schema the
+// `sae_manifold_payload_roundtrip` seam uses.
+//
+// SCOPE (this increment): the flat surface only. The per-atom object surface
+// (`.atoms` — a list of `SaeManifoldAtomFit`, read as attributes ~200× across
+// consumers), the OOS/steering *methods* (`steer` / `reconstruct` / `encode` /
+// `attach_fisher`), and `fit`-returns-pyclass are deliberately NOT here: they
+// either change a type consumers depend on or drive the heavy Rust cores, so
+// they land as separate build-loop-validated increments while the Python
+// dataclass stays as the adapter (deletion LAST).
+
+/// Build a numpy `(N,)` array from a flat `Vec<f64>`.
+fn manifold_sae_vec1<'py>(py: Python<'py>, v: &[f64]) -> Bound<'py, PyArray1<f64>> {
+    Array1::from(v.to_vec()).into_pyarray(py)
+}
+
+/// Build a numpy `(R, C)` array from nested `Vec`s, rejecting a ragged payload.
+fn manifold_sae_vec2<'py>(
+    py: Python<'py>,
+    v: &[Vec<f64>],
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let rows = v.len();
+    let cols = v.first().map_or(0, Vec::len);
+    let mut flat = Vec::with_capacity(rows * cols);
+    for row in v {
+        if row.len() != cols {
+            return Err(py_value_error(
+                "ManifoldSaeCore: ragged 2-D array in payload".to_string(),
+            ));
+        }
+        flat.extend_from_slice(row);
+    }
+    Array2::from_shape_vec((rows, cols), flat)
+        .map(|a| a.into_pyarray(py))
+        .map_err(|e| py_value_error(e.to_string()))
+}
+
+/// Build a numpy `(D0, D1, D2)` array from triply-nested `Vec`s.
+fn manifold_sae_vec3<'py>(
+    py: Python<'py>,
+    v: &[Vec<Vec<f64>>],
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let d0 = v.len();
+    let d1 = v.first().map_or(0, Vec::len);
+    let d2 = v.first().and_then(|m| m.first()).map_or(0, Vec::len);
+    let mut flat = Vec::with_capacity(d0 * d1 * d2);
+    for mat in v {
+        if mat.len() != d1 {
+            return Err(py_value_error(
+                "ManifoldSaeCore: ragged 3-D array in payload".to_string(),
+            ));
+        }
+        for row in mat {
+            if row.len() != d2 {
+                return Err(py_value_error(
+                    "ManifoldSaeCore: ragged 3-D array in payload".to_string(),
+                ));
+            }
+            flat.extend_from_slice(row);
+        }
+    }
+    Array3::from_shape_vec((d0, d1, d2), flat)
+        .map(|a| a.into_pyarray(py))
+        .map_err(|e| py_value_error(e.to_string()))
+}
+
+/// A Python list of per-atom `(R_k, C)` numpy arrays (e.g. `coords`,
+/// `decoder_blocks`).
+fn manifold_sae_list2<'py>(
+    py: Python<'py>,
+    mats: &[Vec<Vec<f64>>],
+) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for m in mats {
+        list.append(manifold_sae_vec2(py, m)?)?;
+    }
+    Ok(list)
+}
+
+/// A report/certificate block: the stored dict, or Python `None`.
+fn manifold_sae_report(py: Python<'_>, value: &Option<serde_json::Value>) -> PyResult<PyObject> {
+    match value {
+        None => Ok(py.None()),
+        Some(v) => json_value_to_py(py, v.clone()),
+    }
+}
+
+/// Rust-owned fitted `ManifoldSAE` model handle (#2091). Flat surface only in
+/// this increment; see the module comment above.
+#[pyclass(module = "gamfit._rust", name = "ManifoldSaeCore")]
+pub(crate) struct ManifoldSaeCore {
+    inner: crate::manifold::manifold_sae_payload::ManifoldSaePayload,
+}
+
+#[pymethods]
+impl ManifoldSaeCore {
+    /// Construct from a `ManifoldSAE.to_dict()` payload dict. The dict is
+    /// serialized (it is already JSON-able — lists, not numpy) and validated
+    /// through `ManifoldSaePayload::from_json`, enforcing the schema tag and the
+    /// `penalized_loss_score`/`reml_score` fallback.
+    #[new]
+    fn new(py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let json_mod = py.import("json")?;
+        let dumped = json_mod.getattr("dumps")?.call1((payload,))?;
+        let json_str: String = dumped.extract()?;
+        let inner = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(&json_str)
+            .map_err(py_value_error)?;
+        Ok(Self { inner })
+    }
+
+    /// Re-serialize to the `to_dict` schema as a Python dict (through the serde
+    /// round-trip: `reml_score` re-duplicated, `structured_residual_diagnostics`
+    /// dropped).
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let json_str = self.inner.to_json().map_err(py_value_error)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| py_value_error(e.to_string()))?;
+        json_value_to_py(py, value)
+    }
+
+    /// The canonical JSON payload string (what `save()` writes).
+    fn to_json(&self) -> PyResult<String> {
+        self.inner.to_json().map_err(py_value_error)
+    }
+
+    // --- dense numeric getters -------------------------------------------
+    #[getter]
+    fn fitted<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        manifold_sae_vec2(py, &self.inner.fitted)
+    }
+    #[getter]
+    fn assignments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        manifold_sae_vec2(py, &self.inner.assignments)
+    }
+    #[getter]
+    fn low_level_logits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        manifold_sae_vec2(py, &self.inner.low_level_logits)
+    }
+    #[getter]
+    fn training_mean<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        manifold_sae_vec1(py, &self.inner.training_mean)
+    }
+    #[getter]
+    fn coords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        manifold_sae_list2(py, &self.inner.coords)
+    }
+    #[getter]
+    fn decoder_blocks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        manifold_sae_list2(py, &self.inner.decoder_blocks)
+    }
+    #[getter]
+    fn duchon_centers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for center in &self.inner.duchon_centers {
+            match center {
+                None => list.append(py.None())?,
+                Some(m) => list.append(manifold_sae_vec2(py, m)?)?,
+            }
+        }
+        Ok(list)
+    }
+    #[getter]
+    fn fisher_factors<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
+        match &self.inner.fisher_factors {
+            None => Ok(None),
+            Some(v) => Ok(Some(manifold_sae_vec3(py, v)?)),
+        }
+    }
+    #[getter]
+    fn fisher_mass_residual<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner
+            .fisher_mass_residual
+            .as_ref()
+            .map(|v| manifold_sae_vec1(py, v))
+    }
+    #[getter]
+    fn selected_log_lambda_smooth<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner
+            .selected_log_lambda_smooth
+            .as_ref()
+            .map(|v| manifold_sae_vec1(py, v))
+    }
+    #[getter]
+    fn selected_log_ard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        match &self.inner.selected_log_ard {
+            None => Ok(None),
+            Some(v) => {
+                let list = PyList::empty(py);
+                for row in v {
+                    list.append(manifold_sae_vec1(py, row))?;
+                }
+                Ok(Some(list))
+            }
+        }
+    }
+
+    // --- scalar config getters -------------------------------------------
+    #[getter]
+    fn schema(&self) -> String {
+        self.inner.schema.clone()
+    }
+    #[getter]
+    fn atom_topology(&self) -> String {
+        self.inner.atom_topology.clone()
+    }
+    #[getter]
+    fn assignment(&self) -> String {
+        self.inner.assignment.clone()
+    }
+    #[getter]
+    fn assignment_label(&self) -> String {
+        self.inner.assignment_label.clone()
+    }
+    #[getter]
+    fn metric_provenance(&self) -> String {
+        self.inner.metric_provenance.clone()
+    }
+    #[getter]
+    fn fisher_provenance(&self) -> Option<String> {
+        self.inner.fisher_provenance.clone()
+    }
+    #[getter]
+    fn structure_certificate_json(&self) -> Option<String> {
+        self.inner.structure_certificate.clone()
+    }
+    #[getter]
+    fn alpha(&self) -> f64 {
+        self.inner.alpha
+    }
+    #[getter]
+    fn learnable_alpha(&self) -> bool {
+        self.inner.learnable_alpha
+    }
+    #[getter]
+    fn tau(&self) -> f64 {
+        self.inner.tau
+    }
+    #[getter]
+    fn sparsity_strength(&self) -> f64 {
+        self.inner.sparsity_strength
+    }
+    #[getter]
+    fn smoothness(&self) -> f64 {
+        self.inner.smoothness
+    }
+    #[getter]
+    fn learning_rate(&self) -> f64 {
+        self.inner.learning_rate
+    }
+    #[getter]
+    fn max_iter(&self) -> i64 {
+        self.inner.max_iter
+    }
+    #[getter]
+    fn random_state(&self) -> i64 {
+        self.inner.random_state
+    }
+    #[getter]
+    fn top_k(&self) -> Option<i64> {
+        self.inner.top_k
+    }
+    #[getter]
+    fn jumprelu_threshold(&self) -> f64 {
+        self.inner.jumprelu_threshold
+    }
+    #[getter]
+    fn dispersion(&self) -> f64 {
+        self.inner.dispersion
+    }
+    #[getter]
+    fn reconstruction_r2(&self) -> f64 {
+        self.inner.reconstruction_r2
+    }
+    /// The honest penalized-loss score (`None` for closed-form payloads).
+    #[getter]
+    fn penalized_loss_score(&self) -> Option<f64> {
+        self.inner.penalized_loss_score
+    }
+    /// Deprecated read alias for [`Self::penalized_loss_score`] (#1231).
+    #[getter]
+    fn reml_score(&self) -> Option<f64> {
+        self.inner.penalized_loss_score
+    }
+    #[getter]
+    fn selected_log_lambda_sparse(&self) -> Option<f64> {
+        self.inner.selected_log_lambda_sparse
+    }
+    /// The number of atoms the fit settled on (= `len(atoms)`).
+    #[getter]
+    fn chosen_k(&self) -> usize {
+        self.inner.atoms.len()
+    }
+
+    // --- string / int list getters ---------------------------------------
+    #[getter]
+    fn atom_topologies(&self) -> Vec<String> {
+        self.inner.atom_topologies.clone()
+    }
+    #[getter]
+    fn primitive_names(&self) -> Vec<String> {
+        self.inner.primitive_names.clone()
+    }
+    #[getter]
+    fn basis_specs(&self) -> Vec<String> {
+        self.inner.basis_specs.clone()
+    }
+    #[getter]
+    fn basis_kinds(&self) -> Vec<String> {
+        self.inner.basis_kinds.clone()
+    }
+    #[getter]
+    fn atom_dims(&self) -> Vec<i64> {
+        self.inner.atom_dims.clone()
+    }
+    #[getter]
+    fn basis_sizes(&self) -> Vec<i64> {
+        self.inner.basis_sizes.clone()
+    }
+    #[getter]
+    fn n_harmonics(&self) -> Vec<i64> {
+        self.inner.n_harmonics.clone()
+    }
+
+    // --- diagnostic / certificate report-block getters -------------------
+    #[getter]
+    fn diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_value_to_py(py, self.inner.diagnostics.clone())
+    }
+    #[getter]
+    fn top_k_projection(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.top_k_projection)
+    }
+    #[getter]
+    fn pre_topk(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.pre_topk)
+    }
+    #[getter]
+    fn solver_plan(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.solver_plan)
+    }
+    #[getter]
+    fn atom_two_lens(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.atom_two_lens)
+    }
+    #[getter]
+    fn residual_gauge(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.residual_gauge)
+    }
+    #[getter]
+    fn incoherence_report(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.incoherence_report)
+    }
+    #[getter]
+    fn curvature_report(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.curvature_report)
+    }
+    #[getter]
+    fn coordinate_fidelity(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.coordinate_fidelity)
+    }
+    #[getter]
+    fn topology_persistence(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.topology_persistence)
+    }
+    #[getter]
+    fn atom_inference_reports(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.atom_inference)
+    }
+    #[getter]
+    fn certificates(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.certificates)
+    }
+    #[getter]
+    fn cotrain(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.cotrain)
+    }
+    #[getter]
+    fn hybrid_split(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.hybrid_split)
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/src_modules/lib_tests.rs"]
 mod tests;

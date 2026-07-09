@@ -4562,6 +4562,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(decoder_cov_from_channel_factors, module)?)?;
     module.add_function(wrap_pyfunction!(sae_canonical_n_harmonics, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
+    module.add_class::<ManifoldSaeCore>()?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;

@@ -1,0 +1,128 @@
+"""Contract for the Rust-owned `ManifoldSaeCore` #[pyclass] (issue #2091 cutover).
+
+The pyclass owns the fitted-model state in Rust (serde `ManifoldSaePayload`) and
+exposes the flat attribute surface consumers read plus a `to_dict` that round-
+trips through the same serde schema as `sae_manifold_payload_roundtrip`. This
+suite constructs the pyclass from the golden fixture and checks:
+  - to_dict is a value-for-value fixed point (the load-bearing invariant);
+  - the dense-array, scalar, list, and report-block getters return the right
+    shapes/types/values the Python dataclass exposed.
+
+Skipped gracefully until a wheel exposing `ManifoldSaeCore` is built (the class
+is additive; the Python dataclass remains the live facade until a later cutover
+increment). This is the getter analogue of the round-trip contract in
+`tests/test_manifold_sae_golden_roundtrip.py`.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from gamfit._sae_manifold import rust_module
+
+GOLDEN_FULL = (
+    Path(__file__).resolve().parent / "fixtures" / "manifold_sae" / "golden_full.json"
+)
+
+
+def _core_cls():
+    mod = rust_module()
+    cls = getattr(mod, "ManifoldSaeCore", None)
+    if cls is None:
+        pytest.skip("wheel predates the ManifoldSaeCore #[pyclass] (#2091 cutover)")
+    return cls
+
+
+def _golden() -> dict:
+    return json.loads(GOLDEN_FULL.read_text())
+
+
+def test_to_dict_is_a_fixed_point() -> None:
+    core = _core_cls()(_golden())
+    again = core.to_dict()
+    golden = _golden()
+    if again != golden:
+        mismatched = sorted(
+            k for k in set(golden) & set(again) if golden[k] != again[k]
+        )
+        raise AssertionError(f"pyclass to_dict drift on keys: {mismatched}")
+
+
+def test_dense_array_getters() -> None:
+    golden = _golden()
+    core = _core_cls()(golden)
+    fitted = core.fitted
+    assert isinstance(fitted, np.ndarray)
+    assert fitted.shape == np.asarray(golden["fitted"]).shape
+    np.testing.assert_array_equal(fitted, np.asarray(golden["fitted"]))
+    assert core.assignments.shape == np.asarray(golden["assignments"]).shape
+    assert core.low_level_logits.shape == np.asarray(golden["logits"]).shape
+    np.testing.assert_array_equal(
+        core.training_mean, np.asarray(golden["training_mean"])
+    )
+    # coords / decoder_blocks / duchon_centers are per-atom lists of arrays.
+    assert isinstance(core.coords, list) and len(core.coords) == len(golden["coords"])
+    np.testing.assert_array_equal(core.coords[0], np.asarray(golden["coords"][0]))
+    assert len(core.decoder_blocks) == len(golden["decoder_blocks"])
+    duchon = core.duchon_centers
+    assert duchon[0] is None  # non-duchon atoms carry no centers
+    np.testing.assert_array_equal(
+        duchon[2], np.asarray(golden["duchon_centers"][2])
+    )
+
+
+def test_fisher_and_selected_getters() -> None:
+    golden = _golden()
+    core = _core_cls()(golden)
+    np.testing.assert_array_equal(
+        core.fisher_factors, np.asarray(golden["fisher_factors"])
+    )
+    assert core.fisher_factors.shape == np.asarray(golden["fisher_factors"]).shape
+    np.testing.assert_array_equal(
+        core.fisher_mass_residual, np.asarray(golden["fisher_mass_residual"])
+    )
+    np.testing.assert_array_equal(
+        core.selected_log_lambda_smooth,
+        np.asarray(golden["selected_log_lambda_smooth"]),
+    )
+    ard = core.selected_log_ard
+    assert isinstance(ard, list) and len(ard) == len(golden["selected_log_ard"])
+    np.testing.assert_array_equal(ard[1], np.asarray(golden["selected_log_ard"][1]))
+
+
+def test_scalar_and_list_getters() -> None:
+    golden = _golden()
+    core = _core_cls()(golden)
+    assert core.atom_topology == golden["atom_topology"]
+    assert core.assignment == golden["assignment"]
+    assert core.assignment_label == golden["assignment_label"]
+    assert core.metric_provenance == golden["metric_provenance"]
+    assert core.fisher_provenance == golden["fisher_provenance"]
+    assert core.top_k == golden["top_k"]
+    assert core.reconstruction_r2 == golden["reconstruction_r2"]
+    assert core.penalized_loss_score == golden["penalized_loss_score"]
+    assert core.reml_score == golden["penalized_loss_score"]  # deprecated alias
+    assert core.chosen_k == len(golden["atoms"])
+    assert core.selected_log_lambda_sparse == golden["selected_log_lambda_sparse"]
+    assert core.atom_topologies == golden["atom_topologies"]
+    assert core.basis_kinds == golden["basis_kinds"]
+    assert core.atom_dims == golden["atom_dims"]
+    assert core.n_harmonics == golden["n_harmonics"]
+
+
+def test_report_block_getters() -> None:
+    golden = _golden()
+    core = _core_cls()(golden)
+    assert core.diagnostics == golden["diagnostics"]
+    assert core.top_k_projection == golden["top_k_projection"]
+    assert core.solver_plan == golden["solver_plan"]
+    assert core.hybrid_split == golden["hybrid_split"]
+    assert core.certificates == golden["certificates"]
+    assert core.structure_certificate_json == golden["structure_certificate"]
+    # A None report block reads back as Python None.
+    payload = dict(golden)
+    payload["cotrain"] = None
+    assert _core_cls()(payload).cotrain is None
