@@ -8,13 +8,12 @@ use super::{
     collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
     compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
     covariance_from_model, effectivelinkwiggle_formulaspec, family_arg_canonical_name,
-    fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response, parse_survival_time_basis_config,
-    predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit,
-    required_columns_for_formula, resolve_family, summarizewiggle_domain,
-    validate_cli_firth_configuration, validate_fit_args_preflight,
-    write_gaussian_location_scale_prediction_csv, write_prediction_csv,
-    write_survival_binary_prediction_csv, write_survival_prediction_csv,
+    load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+    parse_surv_response, parse_survival_time_basis_config, predict_gam,
+    prepend_id_column_to_prediction_csv, required_columns_for_fit, required_columns_for_formula,
+    resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
+    validate_fit_args_preflight, write_gaussian_location_scale_prediction_csv,
+    write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
     Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
@@ -33,8 +32,7 @@ use gam::basis::{
     SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
 };
 use gam::estimate::{
-    ExternalOptimResult, FitGeometry, FitInference, FittedBlock, FittedLinkState,
-    UnifiedFitResultParts,
+    FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
 };
 use gam::families::bms::LatentMeasureKind;
 use gam::families::cubic_cell_kernel as exact_kernel;
@@ -217,47 +215,6 @@ fn core_saved_fit_result_preserves_nonconverged_status() {
         !fit.outer_converged,
         "compact saved fit must not synthesize convergence for stalled fits"
     );
-}
-
-#[test]
-fn external_fit_result_preserves_outer_convergence_flag() {
-    let ext = ExternalOptimResult {
-        beta: array![0.0],
-        lambdas: Array1::zeros(0),
-        likelihood_family: LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity),
-        ),
-        likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
-        log_likelihood_normalization: LogLikelihoodNormalization::Full,
-        log_likelihood: -1.0,
-        standard_deviation: 1.0,
-        iterations: 17,
-        finalgrad_norm: 3.0,
-        outer_converged: false,
-        pirls_status: gam::pirls::PirlsStatus::Converged,
-        deviance: 2.0,
-        stable_penalty_term: 0.0,
-        max_abs_eta: 0.0,
-        constraint_kkt: None,
-        artifacts: Default::default(),
-        inference: None,
-        reml_score: 4.0,
-        fitted_link: FittedLinkState::Standard(None),
-        used_device: false,
-        outer_cost_evals: 0,
-        inner_pirls_solves: 0,
-    };
-
-    let fit = fit_result_from_external(ext);
-
-    assert_eq!(fit.outer_iterations, 17);
-    assert_eq!(fit.outer_gradient_norm, Some(3.0));
-    assert!(
-        !fit.outer_converged,
-        "external optimizer conversion must preserve the optimizer's convergence flag"
-    );
-    assert_eq!(fit.pirls_status, gam::pirls::PirlsStatus::Converged);
 }
 
 mod saved_survival_marginal_slope_test_support {

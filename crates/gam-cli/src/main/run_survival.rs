@@ -1482,7 +1482,10 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    unreachable!("every supported survival likelihood returns from its canonical family branch")
+    Err(format!(
+        "internal: survival likelihood dispatch for {:?} completed without producing a result",
+        likelihood_mode
+    ))
 }
 
 fn run_canonical_survival_transformation(

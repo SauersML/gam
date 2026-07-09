@@ -1,12 +1,5 @@
 use super::*;
 
-pub(crate) fn set_training_feature_metadata_from_dataset(
-    payload: &mut FittedModelPayload,
-    ds: &Dataset,
-) {
-    payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());
-}
-
 pub(crate) fn cli_frailty_kind(
     frailty_kind: Option<FrailtyKindArg>,
 ) -> Option<crate::config_resolve::CliFrailtyKind> {
@@ -25,20 +18,6 @@ pub(crate) fn cli_hazard_loading(
             crate::config_resolve::CliHazardLoading::LoadedVsUnloaded
         }
     })
-}
-
-pub(crate) fn latent_cloglog_state_from_frailty_spec(
-    frailty: &gam::families::survival::lognormal_kernel::FrailtySpec,
-    context: &str,
-) -> Result<gam::types::LatentCLogLogState, String> {
-    let (sigma, loading) = fixed_latent_hazard_frailty(frailty, context)?;
-    if loading != gam::families::survival::lognormal_kernel::HazardLoading::Full {
-        return Err(format!(
-            "{context} requires --hazard-loading full, got {loading:?}"
-        ));
-    }
-    gam::types::LatentCLogLogState::new(sigma)
-        .map_err(|e| format!("invalid latent-cloglog frailty sigma: {e}"))
 }
 
 pub(crate) fn fit_frailty_spec_from_args(
@@ -364,30 +343,6 @@ impl SavedFitSummary {
         }
         .validated()
     }
-
-    pub(crate) fn from_survivalworking_summary(
-        summary: &gam::pirls::WorkingModelPirlsResult,
-        state: &gam::pirls::WorkingState,
-    ) -> Result<Self, String> {
-        let reml_score = state.penalized_objective();
-        Self {
-            likelihood_family: Some(LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            )),
-            likelihood_scale: LikelihoodScaleMetadata::Unspecified,
-            log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
-            log_likelihood: state.log_likelihood,
-            iterations: summary.iterations,
-            finalgrad_norm: summary.lastgradient_norm,
-            pirls_status: summary.status,
-            deviance: state.deviance,
-            stable_penalty_term: state.penalty_term,
-            max_abs_eta: summary.max_abs_eta,
-            reml_score,
-        }
-        .validated()
-    }
 }
 
 use gam::estimate::{ensure_finite_scalar, validate_all_finite};
@@ -494,19 +449,10 @@ pub(crate) fn print_inference_summary(notes: &[String]) {
     }
 }
 
-pub(crate) fn set_saved_offset_columns(
-    payload: &mut FittedModelPayload,
-    offset_column: Option<String>,
-    noise_offset_column: Option<String>,
-) {
-    payload.offset_column = offset_column;
-    payload.noise_offset_column = noise_offset_column;
-}
-
 /// Persist the fit's case-weight column name on the saved model.
 ///
-/// The saved offset column is already threaded through
-/// [`set_saved_offset_columns`]; the weight column was silently dropped, so
+/// Offset columns are set directly by the fit routes; the weight column was
+/// silently dropped, so
 /// `gam diagnose` (which reloads the prior weights by name to reconstruct the
 /// IRLS working weights for the ALO geometry path) could not recover the case
 /// weights of a `--weights-column` fit and fell back to unit weights. Persist it

@@ -689,14 +689,14 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                          even with ridge {ridge:.3e}: {err}"
                     )));
                 }
-                panic!(
+                return Err(EstimationError::InvalidInput(format!(
                     "{context}: Newton step remained non-finite at iter {iter} after {} ridge \
                      escalations up to {:.3e}; the penalized Hessian is pathologically \
                      rank-deficient (grad_norm={:.3e}, max_diag={max_diag:.3e})",
                     MAX_RIDGE_ESCALATIONS,
                     exhausted.next_ridge,
                     grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
-                );
+                )));
             }
         };
 

@@ -57,56 +57,6 @@ pub(crate) fn resolve_family(
     )
 }
 
-pub(crate) fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Option<InverseLink> {
-    match state {
-        FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(*link)),
-        FittedLinkState::Standard(None) => None,
-        FittedLinkState::LatentCLogLog { state } => Some(InverseLink::LatentCLogLog(*state)),
-        FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(*state)),
-        FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(*state)),
-        FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state.clone())),
-    }
-}
-
-pub(crate) fn resolve_binomial_inverse_link_for_fit(
-    family: LikelihoodSpec,
-    effective_link: LinkFunction,
-    mixture_linkspec: Option<&MixtureLinkSpec>,
-    context: &str,
-) -> Result<InverseLink, String> {
-    if !family.is_binomial() {
-        return Err(format!(
-            "{context} is only available for binomial links, got {}",
-            family.name()
-        ));
-    }
-    match &family.link {
-        InverseLink::Standard(StandardLink::Logit) => {
-            let spec = mixture_linkspec
-                .ok_or_else(|| format!("{context} requires link(type=blended(...))"))?;
-            let state = state_fromspec(spec)
-                .map_err(|e| format!("invalid blended link configuration: {e}"))?;
-            Ok(InverseLink::Mixture(state))
-        }
-        // `resolve_family` already upgrades Sas / BetaLogistic to their
-        // state-bearing variants; we only need to forward them here.
-        InverseLink::Sas(state) => Ok(InverseLink::Sas(*state)),
-        InverseLink::BetaLogistic(state) => Ok(InverseLink::BetaLogistic(*state)),
-        InverseLink::Standard(StandardLink::CLogLog) => Err(format!(
-            "{context} does not construct latent-cloglog links directly; use the latent-cloglog family path with explicit frailty"
-        )),
-        InverseLink::Standard(StandardLink::Probit)
-        | InverseLink::Standard(StandardLink::Identity)
-        | InverseLink::Standard(StandardLink::Log)
-        | InverseLink::Standard(StandardLink::LogLog)
-        | InverseLink::Standard(StandardLink::Cauchit)
-        | InverseLink::LatentCLogLog(_)
-        | InverseLink::Mixture(_) => Ok(InverseLink::Standard(
-            crate::config_resolve::effective_link_to_standard(effective_link, context)?,
-        )),
-    }
-}
-
 pub(crate) fn binomial_mean_linkwiggle_supports_family(
     family: &LikelihoodSpec,
     link_choice: Option<&LinkChoice>,
