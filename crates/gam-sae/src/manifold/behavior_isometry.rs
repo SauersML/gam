@@ -67,18 +67,25 @@ pub struct AtomBehaviorIsometry {
     /// constant behavior) has `false` here and a `NaN` defect/scale — there is no
     /// correspondence to certify, reported honestly rather than as a defect.
     pub behavior_engaged: bool,
+    /// Number of supported rows where the behavioral metric collapses
+    /// (`s_y` is numerically zero). A scaled isometry requires both induced
+    /// metrics to be non-degenerate on the same support, so any positive count
+    /// invalidates the isometry claim instead of silently dropping those rows.
+    pub behavior_metric_collapse_rows: usize,
     /// Support-weighted RMS of the activation induced speed `s_x = ‖dx/dt‖`.
     pub activation_speed_rms: f64,
     /// Support-weighted RMS of the nats-unit behavior induced speed `s_y = ‖dy/dt‖`.
     pub behavior_speed_rms: f64,
     /// The isometry **scale**: support-weighted mean of `r = s_x/s_y` over the
     /// rows where behavior moves. Activation length per unit behavior length.
-    /// `NaN` when `behavior_engaged == false`.
+    /// `NaN` when `behavior_engaged == false` or the behavioral metric collapses
+    /// on any supported row.
     pub scale: f64,
     /// The isometry **defect**: support-weighted coefficient of variation of
     /// `r = s_x/s_y`, `std(r)/mean(r)`. `0` ⟺ an exact scaled isometry; grows as
-    /// the representation–behavior correspondence bends along the atom. `NaN` when
-    /// `behavior_engaged == false`.
+    /// the representation–behavior correspondence bends along the atom.
+    /// `+∞` when the behavioral metric collapses anywhere on support while the
+    /// atom is otherwise engaged; `NaN` only when behavior is globally inert.
     pub defect_cv: f64,
     /// `min r / scale` over the rows — how much slower (relative to its mean) the
     /// activation moves per unit behavior at its most compressed row. `NaN` when
@@ -231,6 +238,7 @@ fn assemble(
             n_rows,
             support_mass,
             behavior_engaged: false,
+            behavior_metric_collapse_rows: n_rows,
             activation_speed_rms,
             behavior_speed_rms,
             scale: f64::NAN,
@@ -241,7 +249,31 @@ fn assemble(
         };
     }
 
-    // Weighted mean and variance of r = s_x/s_y over rows where behavior moves.
+    // A scaled isometry is a pointwise statement on the whole support. Do not
+    // condition the statistic on `s_y > floor`: doing so dropped precisely the
+    // rows where the behavioral metric collapsed and could turn `[1,0]` into a
+    // perfect match for `[1,1]`.
+    let collapse_rows = (0..s_y.len())
+        .filter(|&i| weights[i] > 0.0 && s_y[i] <= floor)
+        .count();
+    if collapse_rows > 0 {
+        return AtomBehaviorIsometry {
+            atom_idx,
+            n_rows,
+            support_mass,
+            behavior_engaged: true,
+            behavior_metric_collapse_rows: collapse_rows,
+            activation_speed_rms,
+            behavior_speed_rms,
+            scale: f64::NAN,
+            defect_cv: f64::INFINITY,
+            min_ratio_over_scale: f64::NAN,
+            max_ratio_over_scale: f64::INFINITY,
+            nats_per_unit_t,
+        };
+    }
+
+    // Weighted mean and variance of r = s_x/s_y on the complete support.
     let mut r_mass = 0.0_f64;
     let mut r_mean = 0.0_f64;
     let mut r_min = f64::INFINITY;
@@ -249,7 +281,7 @@ fn assemble(
     let mut ratios: Vec<(f64, f64)> = Vec::with_capacity(s_x.len());
     for i in 0..s_x.len() {
         let w = weights[i];
-        if !(w > 0.0) || s_y[i] <= floor {
+        if !(w > 0.0) {
             continue;
         }
         let r = s_x[i] / s_y[i];
@@ -266,6 +298,7 @@ fn assemble(
             n_rows,
             support_mass,
             behavior_engaged: false,
+            behavior_metric_collapse_rows: n_rows,
             activation_speed_rms,
             behavior_speed_rms,
             scale: f64::NAN,
@@ -293,6 +326,7 @@ fn assemble(
         n_rows,
         support_mass,
         behavior_engaged: true,
+        behavior_metric_collapse_rows: 0,
         activation_speed_rms,
         behavior_speed_rms,
         scale: r_mean,
@@ -319,11 +353,24 @@ mod tests {
         let weights = Array1::<f64>::ones(n);
         let cert = assemble(0, &s_x, &s_y, weights.view(), n as f64);
         assert!(cert.behavior_engaged);
+        assert_eq!(cert.behavior_metric_collapse_rows, 0);
         assert!((cert.scale - 3.0).abs() < 1e-12, "scale {}", cert.scale);
         assert!(cert.defect_cv < 1e-12, "defect {}", cert.defect_cv);
         // nats/unit t = weighted mean of s_y².
         let want: f64 = s_y.iter().map(|v| v * v).sum::<f64>() / n as f64;
         assert!((cert.nats_per_unit_t - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn local_behavior_metric_collapse_invalidates_isometry() {
+        let s_x = [1.0, 1.0];
+        let s_y = [1.0, 0.0];
+        let weights = Array1::<f64>::ones(2);
+        let cert = assemble(0, &s_x, &s_y, weights.view(), 2.0);
+        assert!(cert.behavior_engaged);
+        assert_eq!(cert.behavior_metric_collapse_rows, 1);
+        assert!(cert.scale.is_nan());
+        assert!(cert.defect_cv.is_infinite());
     }
 
     /// A varying speed ratio (broken isometry) reports a strictly positive defect
