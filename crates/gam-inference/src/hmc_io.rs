@@ -2365,12 +2365,33 @@ mod tests {
             dim: x.ncols(),
         };
 
-        let (value, grad) =
-            firth_jeffreys_logp_and_grad(NutsFamily::BinomialLogit, &data, &eta).expect("firth");
+        let (value, grad) = firth_jeffreys_logp_and_grad(
+            &NutsFamily::BinomialLogit.likelihood_spec(),
+            &data,
+            &eta,
+        )
+        .expect("firth");
 
         assert!(value.is_finite());
         assert_eq!(grad.len(), x.ncols());
         assert!(grad.iter().all(|v| v.is_finite()));
+
+        // The Jeffreys term is link-general: at the same eta the probit
+        // Fisher weight differs from logit (2/pi vs 1/4 at eta = 0), so the
+        // determinants must differ — a hard-coded logit correction would
+        // make these equal (finding 19, #2245).
+        let (value_probit, grad_probit) = firth_jeffreys_logp_and_grad(
+            &NutsFamily::BinomialProbit.likelihood_spec(),
+            &data,
+            &eta,
+        )
+        .expect("probit firth");
+        assert!(value_probit.is_finite());
+        assert!(
+            (value_probit - value).abs() > 1e-6,
+            "probit and logit Jeffreys log-determinants must differ: {value_probit} vs {value}"
+        );
+        assert!(grad_probit.iter().all(|v| v.is_finite()));
     }
 
     #[test]
