@@ -761,9 +761,10 @@ fn dimension_spectrometer<'py>(
 /// the migration ledger (`residual factor ↔ linear atom ↔ curved atom`) that
 /// replaces principal-component reseeding. Thin marshalling wrapper over
 /// `gam::terms::sae::tiered::fit_tiered`; the Python facade stays a marshalling
-/// layer per SPEC. Migration-move kinds are returned as an integer legend:
-/// `0 = promotion`, `1 = demotion`, `2 = death`; a move `round` of `-1` marks the
-/// Tier-1 structural death tally (not a co-fit round).
+/// layer per SPEC. Unified-ledger move kinds are returned as an integer legend:
+/// `0 = birth`, `1 = death`, `2 = refuse`; `move_stage` is `0 = residual`,
+/// `1 = linear`, `2 = curved`; a move `round` of `-1` marks the Tier-1 structural
+/// death tally (not a co-fit round).
 #[pyfunction(signature = (
     data,
     n_blocks,
@@ -787,7 +788,8 @@ fn sae_manifold_fit_tiered<'py>(
     cofit_rel_tol: f64,
     cofit_code_ridge: f32,
 ) -> PyResult<Py<PyDict>> {
-    use gam::terms::sae::tiered::{TieredFitConfig, TieredMoveKind};
+    use gam::terms::sae::migration_ledger::SaeMove;
+    use gam::terms::sae::tiered::TieredFitConfig;
 
     let data64 = data.as_array().mapv(|v| v as f64);
     let mut config = TieredFitConfig::tiered(n_blocks, block_size);
@@ -802,22 +804,32 @@ fn sae_manifold_fit_tiered<'py>(
         gam::terms::sae::tiered::fit_tiered(data64.view(), &config)
     })?;
 
-    // Migration ledger → parallel columns (kind legend documented above).
+    // Unified migration ledger → parallel columns. `move_kind`: 0 = birth,
+    // 1 = death, 2 = refuse. `move_stage`: 0 = residual, 1 = linear, 2 = curved.
+    // `move_seed`: birth seed (0 = residual factor, 1 = linear atom, 2 = curved
+    // chart, 3 = principal-component reseed [forbidden]); -1 for non-births.
     let n_moves = report.ledger.moves.len();
     let mut move_kind = Vec::with_capacity(n_moves);
+    let mut move_stage = Vec::with_capacity(n_moves);
+    let mut move_seed = Vec::with_capacity(n_moves);
     let mut move_round = Vec::with_capacity(n_moves);
     let mut move_count = Vec::with_capacity(n_moves);
     let mut move_dl_bits = Vec::with_capacity(n_moves);
+    let mut move_reml_delta = Vec::with_capacity(n_moves);
+    let mut move_rank_charge = Vec::with_capacity(n_moves);
     let mut move_objective = Vec::with_capacity(n_moves);
     for mv in &report.ledger.moves {
-        move_kind.push(match mv.kind {
-            TieredMoveKind::Promotion => 0u64,
-            TieredMoveKind::Demotion => 1u64,
-            TieredMoveKind::Death => 2u64,
+        move_kind.push(mv.kind.kind_code());
+        move_stage.push(mv.kind.stage().code());
+        move_seed.push(match &mv.kind {
+            SaeMove::Birth { seed, .. } => seed.code() as i64,
+            _ => -1i64,
         });
         move_round.push(mv.round.map(|r| r as i64).unwrap_or(-1));
         move_count.push(mv.count as u64);
-        move_dl_bits.push(mv.dl_bits);
+        move_dl_bits.push(mv.evidence.dl_bits);
+        move_reml_delta.push(mv.evidence.reml_delta);
+        move_rank_charge.push(mv.evidence.rank_charge);
         move_objective.push(mv.objective);
     }
 
@@ -863,14 +875,22 @@ fn sae_manifold_fit_tiered<'py>(
         }
     }
 
-    // Migration ledger.
+    // Unified migration ledger.
     out.set_item("ledger_pc_reseed_events", report.ledger.pc_reseed_events)?;
-    out.set_item("ledger_n_promotions", report.ledger.n_promotions)?;
-    out.set_item("ledger_n_demotions", report.ledger.n_demotions)?;
+    out.set_item("ledger_n_births", report.ledger.n_births)?;
     out.set_item("ledger_n_deaths", report.ledger.n_deaths)?;
+    out.set_item("ledger_n_refusals", report.ledger.n_refusals)?;
     out.set_item(
         "ledger_move_kind",
         ndarray::Array1::from_vec(move_kind).into_pyarray(py),
+    )?;
+    out.set_item(
+        "ledger_move_stage",
+        ndarray::Array1::from_vec(move_stage).into_pyarray(py),
+    )?;
+    out.set_item(
+        "ledger_move_seed",
+        ndarray::Array1::from_vec(move_seed).into_pyarray(py),
     )?;
     out.set_item(
         "ledger_move_round",
@@ -883,6 +903,14 @@ fn sae_manifold_fit_tiered<'py>(
     out.set_item(
         "ledger_move_dl_bits",
         ndarray::Array1::from_vec(move_dl_bits).into_pyarray(py),
+    )?;
+    out.set_item(
+        "ledger_move_reml_delta",
+        ndarray::Array1::from_vec(move_reml_delta).into_pyarray(py),
+    )?;
+    out.set_item(
+        "ledger_move_rank_charge",
+        ndarray::Array1::from_vec(move_rank_charge).into_pyarray(py),
     )?;
     out.set_item(
         "ledger_move_objective",

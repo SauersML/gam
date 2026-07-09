@@ -17,13 +17,15 @@
 //!    for (`residual factor ↔ linear atom ↔ curved atom`, no principal-component
 //!    reseeding) holds by construction.
 //!
-//! The [`MigrationLedger`] records the curved-tier promotions/demotions that the
-//! co-fit adjudicates each round in the matched-description-length currency
-//! (`curved_charge`, the e-BH acceptance charge), plus the Tier-1 block deaths.
+//! The unified [`SaeMigrationLedger`] records the curved-tier promotions
+//! (births) / demotions (refusals) that the co-fit adjudicates each round in the
+//! matched-description-length currency (`curved_charge`, the e-BH acceptance
+//! charge, banked as `dl_bits`), plus the Tier-1 block deaths.
 //! `pc_reseed_events` is always `0` on this path.
 
 use ndarray::ArrayView2;
 
+use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
     BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport, cofit_block_and_curved,
     fit_block_sparse_dictionary,
@@ -68,60 +70,6 @@ impl TieredFitConfig {
     }
 }
 
-/// A move in the three-state migration ledger (`residual factor ↔ linear atom ↔
-/// curved atom`) that replaces principal-component reseeding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TieredMoveKind {
-    /// A linear block / residual factor was promoted to a curved chart because
-    /// the evidence (matched description length) preferred the curve.
-    Promotion,
-    /// A curved chart candidate was rejected this round; the linear block is kept
-    /// (the tier-boundary analogue of the hybrid-split `Θ→0` verdict).
-    Demotion,
-    /// A Tier-1 block ended dead (no rows selected it); it falls back to the
-    /// residual factor pool. Dead-block revival draws from high-residual rows,
-    /// never from principal components.
-    Death,
-}
-
-/// One adjudicated migration move, recorded at the granularity the co-fit
-/// telemetry exposes (per round for promotions/demotions; one structural entry
-/// for the Tier-1 deaths).
-#[derive(Clone, Copy, Debug)]
-pub struct TieredLedgerMove {
-    /// Move kind.
-    pub kind: TieredMoveKind,
-    /// Co-fit round the move was adjudicated in; `None` for the Tier-1 structural
-    /// death tally (which is decided by the linear fit, not a co-fit round).
-    pub round: Option<usize>,
-    /// Number of charts / blocks affected by this move.
-    pub count: usize,
-    /// Matched-description-length charge in the co-fit's currency (the e-BH
-    /// acceptance charge `curved_charge`); `0.0` for demotions and deaths.
-    pub dl_bits: f64,
-    /// Joint objective `J` after the round (`NaN` for the structural death tally).
-    pub objective: f64,
-}
-
-/// The migration ledger: every birth/death that moved an atom between the
-/// residual-factor, linear, and curved states, plus the invariant that this path
-/// performs **zero** principal-component reseeds.
-#[derive(Clone, Debug, Default)]
-pub struct MigrationLedger {
-    /// The adjudicated moves in order.
-    pub moves: Vec<TieredLedgerMove>,
-    /// Number of principal-component reseed events. **Always `0`** on the tiered
-    /// path — the curved tier seeds from the Tier-1 routing / residual. Present so
-    /// callers can assert the "no PC reseed events in the log" acceptance bar.
-    pub pc_reseed_events: usize,
-    /// Total promotions (linear/residual → curved).
-    pub n_promotions: usize,
-    /// Total demotions (rejected curved candidate → kept linear).
-    pub n_demotions: usize,
-    /// Total Tier-1 block deaths (→ residual factor).
-    pub n_deaths: usize,
-}
-
 /// The composed tiered fit.
 #[derive(Clone, Debug)]
 pub struct TieredFitReport {
@@ -131,8 +79,8 @@ pub struct TieredFitReport {
     pub tier1: BlockSparseFit,
     /// Tier-2 curved co-fit on the Tier-1 residual (`None` when Tier-2 disabled).
     pub tier2: Option<CofitReport>,
-    /// Migration ledger of the adjudicated promotions/demotions/deaths.
-    pub ledger: MigrationLedger,
+    /// Unified migration ledger of the adjudicated births / deaths / refusals.
+    pub ledger: SaeMigrationLedger,
     /// Final composed explained variance (`1 − RSS/TSS` vs the Tier-0 mean).
     pub explained_variance: f64,
 }
@@ -143,8 +91,8 @@ pub struct TieredFitReport {
 /// The curved tier is fit on the Tier-1 residual through
 /// [`cofit_block_and_curved`], whose round 0 is exactly "curved-on-linear-
 /// residual" and whose alternation drives the joint objective to stationarity.
-/// No principal-component reseeding occurs; the [`MigrationLedger`] accounts for
-/// the moves and pins `pc_reseed_events = 0`.
+/// No principal-component reseeding occurs; the [`SaeMigrationLedger`] accounts
+/// for the moves and pins `pc_reseed_events = 0`.
 pub fn fit_tiered(
     z: ArrayView2<'_, f64>,
     config: &TieredFitConfig,
@@ -157,7 +105,7 @@ pub fn fit_tiered(
     // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual.
     let tier1 = fit_block_sparse_dictionary(r0_f32.view(), &config.tier1)?;
 
-    let mut ledger = MigrationLedger::default();
+    let mut ledger = SaeMigrationLedger::new();
 
     // Structural deaths: Tier-1 blocks no row selected fall back to the residual
     // factor pool. (Revival, when it happens, draws from worst-residual rows in
@@ -168,14 +116,14 @@ pub fn fit_tiered(
         .filter(|&&u| u == 0.0)
         .count();
     if n_dead > 0 {
-        ledger.n_deaths = n_dead;
-        ledger.moves.push(TieredLedgerMove {
-            kind: TieredMoveKind::Death,
-            round: None,
-            count: n_dead,
-            dl_bits: 0.0,
-            objective: f64::NAN,
-        });
+        ledger.death(
+            MoveStage::Linear,
+            MoveReason::DeadRouting,
+            n_dead,
+            None,
+            MoveEvidence::none(),
+            f64::NAN,
+        );
     }
 
     // Tier 2: curved co-fit on the Tier-1 residual, or the linear-bulk baseline.
@@ -204,45 +152,48 @@ pub fn fit_tiered(
     })
 }
 
-/// Translate the co-fit's per-round acceptance telemetry into migration-ledger
-/// moves. Round 0's accepted charts are promotions off the linear residual; in
-/// later rounds a rise in the accepted-chart count is a promotion and a fall is a
-/// demotion, and a round whose curved candidate was not committed is recorded as
-/// a demotion event (the linear block was kept).
-fn record_cofit_moves(ledger: &mut MigrationLedger, report: &CofitReport) {
+/// Translate the co-fit's per-round acceptance telemetry into unified
+/// migration-ledger moves. Round 0's accepted charts are births off the linear
+/// residual (a linear atom promoted to a curved chart); in later rounds a rise in
+/// the accepted-chart count is a birth and a fall is a refusal (the curved
+/// candidate was demoted back to the linear block), and a round whose curved
+/// candidate was not committed is a refusal (the linear block was kept). Curved
+/// births seed from the Tier-1 linear routing — never a principal component — so
+/// the ledger's `pc_reseed_events` invariant holds by construction.
+fn record_cofit_moves(ledger: &mut SaeMigrationLedger, report: &CofitReport) {
     let mut prev_accepted = 0usize;
     for round in &report.rounds {
         let accepted = round.n_accepted_charts;
         if accepted > prev_accepted {
             let count = accepted - prev_accepted;
-            ledger.n_promotions += count;
-            ledger.moves.push(TieredLedgerMove {
-                kind: TieredMoveKind::Promotion,
-                round: Some(round.round),
+            ledger.birth(
+                MoveStage::Curved,
+                BirthSeed::LinearAtom,
                 count,
-                dl_bits: round.curved_charge,
-                objective: round.objective,
-            });
+                Some(round.round),
+                MoveEvidence::from_dl_bits(round.curved_charge),
+                round.objective,
+            );
         } else if accepted < prev_accepted {
             let count = prev_accepted - accepted;
-            ledger.n_demotions += count;
-            ledger.moves.push(TieredLedgerMove {
-                kind: TieredMoveKind::Demotion,
-                round: Some(round.round),
+            ledger.refuse(
+                MoveStage::Curved,
+                MoveReason::EvidenceInsufficient,
                 count,
-                dl_bits: 0.0,
-                objective: round.objective,
-            });
+                Some(round.round),
+                MoveEvidence::none(),
+                round.objective,
+            );
         } else if round.round > 0 && !round.curved_committed {
             // Candidate proposed but rejected: the linear block is kept.
-            ledger.n_demotions += 1;
-            ledger.moves.push(TieredLedgerMove {
-                kind: TieredMoveKind::Demotion,
-                round: Some(round.round),
-                count: 1,
-                dl_bits: 0.0,
-                objective: round.objective,
-            });
+            ledger.refuse(
+                MoveStage::Curved,
+                MoveReason::EvidenceInsufficient,
+                1,
+                Some(round.round),
+                MoveEvidence::none(),
+                round.objective,
+            );
         }
         prev_accepted = accepted;
     }
@@ -334,9 +285,9 @@ mod fit_tests {
             "the tiered path must never PC-reseed"
         );
         assert!(
-            report.ledger.n_promotions >= 1,
-            "the migration ledger must record >=1 curved promotion; got {} (moves: {:?})",
-            report.ledger.n_promotions,
+            report.ledger.n_births >= 1,
+            "the migration ledger must record >=1 curved birth; got {} (moves: {:?})",
+            report.ledger.n_births,
             report.ledger.moves
         );
         assert!(

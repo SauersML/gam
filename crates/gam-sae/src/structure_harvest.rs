@@ -91,6 +91,7 @@ use crate::manifold::{
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, amplitude_concentration_certificate,
     classify_occupancy_interval,
 };
+use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
@@ -2829,9 +2830,38 @@ pub struct StructureSearchResult {
     /// One ledger per round actually run (a round that applies no move is the
     /// last; its ledger is included so the certificate covers the fixpoint).
     pub rounds: Vec<SearchLedger>,
+    /// The per-round move stream folded into the ONE unified accounting currency
+    /// ([`SaeMigrationLedger`], sae-unification Increment 3): every adjudicated
+    /// birth / death / refusal priced in the shared `dl_bits` description-length
+    /// unit (the e-process `log_e` banked as bits). This is a read-out of the
+    /// e-process verdicts in [`Self::rounds`] — the e-BH gating is untouched and
+    /// still owns acceptance — and carries the `pc_reseed_events == 0` invariant
+    /// (structure births seed from the residual-factor pool, never a PC).
+    pub migration: SaeMigrationLedger,
 }
 
 impl StructureSearchResult {
+    /// Assemble a result from the fitted term/ρ and the per-round e-process
+    /// ledgers, folding those rounds into the unified [`SaeMigrationLedger`]
+    /// currency ([`Self::migration`]) in one place so producers cannot drift.
+    #[must_use]
+    pub fn from_rounds(
+        term: SaeManifoldTerm,
+        rho: SaeManifoldRho,
+        rounds: Vec<SearchLedger>,
+    ) -> Self {
+        let mut migration = SaeMigrationLedger::new();
+        for (round_idx, round_ledger) in rounds.iter().enumerate() {
+            migration.record_search_round(round_idx, round_ledger);
+        }
+        Self {
+            term,
+            rho,
+            rounds,
+            migration,
+        }
+    }
+
     /// `true` iff at least one structure-changing move LANDED across the rounds —
     /// an `Accepted` move (certified birth / fission / fusion that restructured
     /// the dictionary and triggered a warm refit) or a `Demoted` death (an atom
@@ -3145,7 +3175,9 @@ pub fn run_structure_search_rounds(
         }
     }
 
-    Ok(StructureSearchResult { term, rho, rounds })
+    // Fold the per-round e-process verdicts into the ONE unified migration
+    // currency (Increment 3): a read-out, not a second gate.
+    Ok(StructureSearchResult::from_rounds(term, rho, rounds))
 }
 
 /// Build the per-round residual-factor decoder list the birth apply-move indexes
@@ -4223,11 +4255,7 @@ mod tests {
 
         // No rounds ran at all: nothing changed.
         let (term0, rho0) = planted_term(&[vec![true], vec![true]]);
-        let empty = StructureSearchResult {
-            term: term0.clone(),
-            rho: rho0.clone(),
-            rounds: Vec::new(),
-        };
+        let empty = StructureSearchResult::from_rounds(term0.clone(), rho0.clone(), Vec::new());
         assert!(
             !empty.structure_changed(),
             "no rounds ⇒ the term/rho are the pre-search fit ⇒ structure_changed() must be false"
@@ -4235,14 +4263,14 @@ mod tests {
 
         // Every move contested or vetoed: the dictionary is byte-for-byte the
         // pre-search fit, so the exact joint-Hessian bands remain valid.
-        let no_landed = StructureSearchResult {
-            term: term0.clone(),
-            rho: rho0.clone(),
-            rounds: vec![ledger_with(vec![
+        let no_landed = StructureSearchResult::from_rounds(
+            term0.clone(),
+            rho0.clone(),
+            vec![ledger_with(vec![
                 MoveVerdict::Contested { log_e: -1.0 },
                 MoveVerdict::Vetoed { log_e: -2.0 },
             ])],
-        };
+        );
         assert!(
             !no_landed.structure_changed(),
             "all-contested/vetoed rounds leave the model unchanged ⇒ structure_changed() must be false"
@@ -4250,25 +4278,25 @@ mod tests {
 
         // An Accepted move landed (certified restructuring + warm refit): the
         // returned model differs from the pre-search fit ⇒ bands are stale.
-        let accepted = StructureSearchResult {
-            term: term0.clone(),
-            rho: rho0.clone(),
-            rounds: vec![ledger_with(vec![
+        let accepted = StructureSearchResult::from_rounds(
+            term0.clone(),
+            rho0.clone(),
+            vec![ledger_with(vec![
                 MoveVerdict::Contested { log_e: -1.0 },
                 MoveVerdict::Accepted { log_e: 3.0 },
             ])],
-        };
+        );
         assert!(
             accepted.structure_changed(),
             "a landed Accepted move mutates term/rho ⇒ structure_changed() must be true (recompute bands)"
         );
 
         // A Demoted death is also a landed structure change.
-        let demoted = StructureSearchResult {
-            term: term0.clone(),
-            rho: rho0.clone(),
-            rounds: vec![ledger_with(vec![MoveVerdict::Demoted { log_e: -1.0 }])],
-        };
+        let demoted = StructureSearchResult::from_rounds(
+            term0.clone(),
+            rho0.clone(),
+            vec![ledger_with(vec![MoveVerdict::Demoted { log_e: -1.0 }])],
+        );
         assert!(
             demoted.structure_changed(),
             "a landed Demoted death folds an atom to ~0 routing ⇒ structure_changed() must be true"

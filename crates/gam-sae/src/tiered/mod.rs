@@ -57,9 +57,7 @@
 //! block frames on the block-sparse fit directly; see `sparse_dict::block`.
 
 mod fit;
-pub use fit::{
-    MigrationLedger, TieredFitConfig, TieredFitReport, TieredLedgerMove, TieredMoveKind, fit_tiered,
-};
+pub use fit::{TieredFitConfig, TieredFitReport, fit_tiered};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

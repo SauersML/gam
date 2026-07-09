@@ -120,22 +120,33 @@ def dimension_spectrometer(
 # --------------------------------------------------------------------------- #
 # Tiered SAE fit (#2023)
 # --------------------------------------------------------------------------- #
-# Migration-move kind legend for ``TieredFitResult.ledger_move_kind``.
-TIERED_MOVE_PROMOTION = 0
-TIERED_MOVE_DEMOTION = 1
-TIERED_MOVE_DEATH = 2
+# Unified-ledger move kind legend for ``TieredFitResult.ledger_move_kind``.
+SAE_MOVE_BIRTH = 0
+SAE_MOVE_DEATH = 1
+SAE_MOVE_REFUSE = 2
+# Ladder-stage legend for ``TieredFitResult.ledger_move_stage``.
+SAE_STAGE_RESIDUAL = 0
+SAE_STAGE_LINEAR = 1
+SAE_STAGE_CURVED = 2
+# Birth-seed legend for ``TieredFitResult.ledger_move_seed`` (``-1`` non-birth).
+SAE_SEED_RESIDUAL_FACTOR = 0
+SAE_SEED_LINEAR_ATOM = 1
+SAE_SEED_CURVED_CHART = 2
+SAE_SEED_PRINCIPAL_COMPONENT = 3
 
 
 @dataclass(frozen=True)
 class TieredFitResult:
     """End-to-end tiered SAE fit: Tier-0 mean, Tier-1 block-sparse linear bulk,
-    Tier-2 curved co-fit on the Tier-1 residual, and the migration ledger.
+    Tier-2 curved co-fit on the Tier-1 residual, and the unified migration ledger.
 
-    ``ledger_move_kind`` uses the ``TIERED_MOVE_*`` legend
-    (``0`` promotion, ``1`` demotion, ``2`` death); a ``ledger_move_round`` of
-    ``-1`` marks the Tier-1 structural death tally. ``ledger_pc_reseed_events`` is
-    ``0`` by construction on this path (the curved tier seeds from the Tier-1
-    routing / residual, never principal components).
+    ``ledger_move_kind`` uses the ``SAE_MOVE_*`` legend (``0`` birth, ``1`` death,
+    ``2`` refuse), ``ledger_move_stage`` the ``SAE_STAGE_*`` legend (``0``
+    residual, ``1`` linear, ``2`` curved), and ``ledger_move_seed`` the
+    ``SAE_SEED_*`` legend for births (``-1`` for non-births); a
+    ``ledger_move_round`` of ``-1`` marks the Tier-1 structural death tally.
+    ``ledger_pc_reseed_events`` is ``0`` by construction on this path (the curved
+    tier seeds from the Tier-1 routing / residual, never principal components).
     """
 
     explained_variance: float
@@ -152,13 +163,17 @@ class TieredFitResult:
     tier2_n_rounds: int
     tier2_n_accepted_charts: int
     ledger_pc_reseed_events: int
-    ledger_n_promotions: int
-    ledger_n_demotions: int
+    ledger_n_births: int
     ledger_n_deaths: int
+    ledger_n_refusals: int
     ledger_move_kind: np.ndarray
+    ledger_move_stage: np.ndarray
+    ledger_move_seed: np.ndarray
     ledger_move_round: np.ndarray
     ledger_move_count: np.ndarray
     ledger_move_dl_bits: np.ndarray
+    ledger_move_reml_delta: np.ndarray
+    ledger_move_rank_charge: np.ndarray
     ledger_move_objective: np.ndarray
 
 
@@ -204,13 +219,17 @@ def sae_manifold_fit_tiered(
         tier2_n_rounds=int(payload["tier2_n_rounds"]),
         tier2_n_accepted_charts=int(payload["tier2_n_accepted_charts"]),
         ledger_pc_reseed_events=int(payload["ledger_pc_reseed_events"]),
-        ledger_n_promotions=int(payload["ledger_n_promotions"]),
-        ledger_n_demotions=int(payload["ledger_n_demotions"]),
+        ledger_n_births=int(payload["ledger_n_births"]),
         ledger_n_deaths=int(payload["ledger_n_deaths"]),
+        ledger_n_refusals=int(payload["ledger_n_refusals"]),
         ledger_move_kind=np.asarray(payload["ledger_move_kind"]),
+        ledger_move_stage=np.asarray(payload["ledger_move_stage"]),
+        ledger_move_seed=np.asarray(payload["ledger_move_seed"]),
         ledger_move_round=np.asarray(payload["ledger_move_round"]),
         ledger_move_count=np.asarray(payload["ledger_move_count"]),
         ledger_move_dl_bits=np.asarray(payload["ledger_move_dl_bits"]),
+        ledger_move_reml_delta=np.asarray(payload["ledger_move_reml_delta"]),
+        ledger_move_rank_charge=np.asarray(payload["ledger_move_rank_charge"]),
         ledger_move_objective=np.asarray(payload["ledger_move_objective"]),
     )
 
