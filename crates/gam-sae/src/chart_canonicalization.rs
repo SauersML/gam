@@ -547,6 +547,35 @@ pub const TORUS_FLOW_GN_MAX_ITERS: usize = 80;
 /// current iterate a local minimum and stops.
 pub const TORUS_FLOW_GN_MAX_REJECTS: usize = 12;
 
+/// Levenberg damping growth factor applied on a rejected trial step (a Cholesky
+/// factorization failure, or a folded / non-improving candidate) inside the
+/// shared `d = 2` flow trust loop [`lm_damped_accept_sweep`]: `λ ←
+/// LM_LAMBDA_GROWTH · λ` tightens the trust region toward the (safe) gradient
+/// direction. Shared verbatim by the torus and sphere-boost Gauss–Newton cores.
+const LM_LAMBDA_GROWTH: f64 = 10.0;
+
+/// Levenberg damping decay factor applied on an accepted step: `λ ←
+/// max(λ / LM_LAMBDA_DECAY, LM_LAMBDA_FLOOR)` relaxes the trust region back
+/// toward the (fast) Gauss–Newton direction. Used by [`lm_damped_accept_sweep`].
+const LM_LAMBDA_DECAY: f64 = 10.0;
+
+/// Floor on the Levenberg damping so an accepted-step relaxation can never drive
+/// `λ` to zero (which would leave the next damped normal-equation solve singular
+/// on a rank-deficient `JᵀJ`). Used by [`lm_damped_accept_sweep`].
+const LM_LAMBDA_FLOOR: f64 = 1.0e-12;
+
+/// Relative improvement cut declaring the flow converged: once an accepted step
+/// lowers the isometry defect by `≤ LM_IMPROVEMENT_REL_TOL · (1 + defect)` the
+/// iterate is treated as a stationary point of the flow objective. Applied by
+/// [`lm_damped_accept_sweep`].
+const LM_IMPROVEMENT_REL_TOL: f64 = 1.0e-14;
+
+/// Relative step-stall floor for the outer Gauss–Newton loop: after an accepted
+/// step, if the squared step norm is `≤ LM_STEP_STALL_REL_FLOOR · (1 + ‖θ‖²)`
+/// the iterate has stopped moving and the flow terminates. Applied by both
+/// `d = 2` flow cores (torus and sphere-boost).
+const LM_STEP_STALL_REL_FLOOR: f64 = 1.0e-24;
+
 /// Minimum per-axis node count of the decoder-recomposition audit grid. The
 /// actual count also scales with the basis width (`3·√m` per axis) so the
 /// tensor harmonic basis is always Nyquist-oversampled on the audit grid.
@@ -1105,6 +1134,99 @@ struct FlowObjectiveState {
     a_rows: Vec<[f64; 4]>,
 }
 
+/// Outcome of one [`lm_damped_accept_sweep`] trust step, reported back to the
+/// outer Gauss–Newton loop so it can decide whether to continue.
+struct LmTrustStep {
+    /// A strict-descent, fold-free candidate was accepted this sweep.
+    accepted: bool,
+    /// The accepted step improved the defect by less than the relative
+    /// convergence cut ([`LM_IMPROVEMENT_REL_TOL`]) — treat as stationary.
+    converged: bool,
+    /// Squared Euclidean norm of the accepted step (0 if none was accepted);
+    /// the outer loop compares it against the relative step-stall floor.
+    step_norm_sq: f64,
+}
+
+/// The shared Levenberg–Marquardt damped-accept trust step for both `d = 2`
+/// flow cores (the analytic torus Gauss–Newton and the FD sphere-boost
+/// Gauss–Newton). Given the current normal-equation blocks (`JᵀJ`, `Jᵀr`) it
+/// escalates the damping `λ` until it finds a fold-free strict-descent
+/// candidate or exhausts [`TORUS_FLOW_GN_MAX_REJECTS`] rejections:
+///
+/// * on a Cholesky failure or a folded / non-improving candidate it grows the
+///   damping (`λ ← LM_LAMBDA_GROWTH · λ`) and counts a rejection;
+/// * on an accepted candidate it commits `theta`/`state`, relaxes the damping
+///   (`λ ← max(λ / LM_LAMBDA_DECAY, LM_LAMBDA_FLOOR)`), and flags convergence
+///   when the relative improvement drops below [`LM_IMPROVEMENT_REL_TOL`].
+///
+/// The `λ` here is decayed on accept and carried across outer Gauss–Newton
+/// iterations (a stateful trust-region damping), which is why this is NOT the
+/// generic ridge-escalation optimizer primitive. The only flow-specific piece
+/// is `eval_candidate`, which folds the family's diffeomorphism guard and its
+/// defect evaluation into one closure returning `None` for a folded or
+/// out-of-band candidate. The numerics are bit-for-bit identical to the two
+/// former hand-rolled loops it replaces.
+fn lm_damped_accept_sweep(
+    jtj: &Array2<f64>,
+    jtr: &Array2<f64>,
+    q: usize,
+    lambda: &mut f64,
+    theta: &mut Vec<f64>,
+    state: &mut FlowObjectiveState,
+    eval_candidate: impl Fn(&[f64]) -> Option<FlowObjectiveState>,
+) -> LmTrustStep {
+    let mut rejects = 0usize;
+    let mut accepted = false;
+    let mut converged = false;
+    let mut step_norm_sq = 0.0_f64;
+    while rejects < TORUS_FLOW_GN_MAX_REJECTS {
+        let mut damped = jtj.clone();
+        for d in 0..q {
+            damped[[d, d]] += *lambda * (1.0 + jtj[[d, d]]);
+        }
+        let factor = match damped.cholesky(FaerSide::Lower) {
+            Ok(factor) => factor,
+            Err(_) => {
+                *lambda *= LM_LAMBDA_GROWTH;
+                rejects += 1;
+                continue;
+            }
+        };
+        let mut neg_jtr = jtr.clone();
+        neg_jtr.mapv_inplace(|v| -v);
+        let delta = factor.solve_mat(&neg_jtr);
+        let mut candidate = theta.clone();
+        step_norm_sq = 0.0;
+        for k in 0..q {
+            candidate[k] += delta[[k, 0]];
+            step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
+        }
+        match eval_candidate(&candidate) {
+            Some(next) if next.defect < state.defect => {
+                let improvement = state.defect - next.defect;
+                *theta = candidate;
+                *state = next;
+                accepted = true;
+                *lambda = (*lambda / LM_LAMBDA_DECAY).max(LM_LAMBDA_FLOOR);
+                if improvement <= LM_IMPROVEMENT_REL_TOL * (1.0 + state.defect) {
+                    // Converged: the accepted step no longer moves E.
+                    converged = true;
+                }
+                break;
+            }
+            Some(..) | None => {
+                *lambda *= LM_LAMBDA_GROWTH;
+                rejects += 1;
+            }
+        }
+    }
+    LmTrustStep {
+        accepted,
+        converged,
+        step_norm_sq,
+    }
+}
+
 /// Evaluate the isometry-defect objective at `θ` (see
 /// [`torus_isometry_flow_reparameterization`] for the derivation). Returns
 /// `None` when the profiled scale degenerates (`c ≤ 0` or non-finite).
@@ -1244,66 +1366,30 @@ fn minimize_isometry_defect_flow(
 
         // Levenberg-damped step with the diffeomorphism guard in the accept
         // test: only strict-descent, fold-free candidates are ever taken.
-        let mut rejects = 0usize;
-        let mut accepted_step = false;
-        let mut converged = false;
-        let mut step_norm_sq = 0.0_f64;
-        while rejects < TORUS_FLOW_GN_MAX_REJECTS {
-            let mut damped = jtj.clone();
-            for d in 0..q {
-                damped[[d, d]] += lambda * (1.0 + jtj[[d, d]]);
-            }
-            let factor = match damped.cholesky(FaerSide::Lower) {
-                Ok(factor) => factor,
-                Err(_) => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                    continue;
+        let step = lm_damped_accept_sweep(
+            &jtj,
+            &jtr,
+            q,
+            &mut lambda,
+            &mut theta,
+            &mut state,
+            |candidate| {
+                if min_det_on_grid(candidate) <= min_det {
+                    None
+                } else {
+                    evaluate_flow_defect(candidate, row_modes, row_base, ghat, ghat_norm_sq)
                 }
-            };
-            let mut neg_jtr = jtr.clone();
-            neg_jtr.mapv_inplace(|v| -v);
-            let delta = factor.solve_mat(&neg_jtr);
-            let mut candidate = theta.clone();
-            step_norm_sq = 0.0;
-            for k in 0..q {
-                candidate[k] += delta[[k, 0]];
-                step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
-            }
-            let folded = min_det_on_grid(&candidate) <= min_det;
-            let candidate_state = if folded {
-                None
-            } else {
-                evaluate_flow_defect(&candidate, row_modes, row_base, ghat, ghat_norm_sq)
-            };
-            match candidate_state {
-                Some(next) if next.defect < state.defect => {
-                    let improvement = state.defect - next.defect;
-                    theta = candidate;
-                    state = next;
-                    any_accepted = true;
-                    accepted_step = true;
-                    lambda = (lambda / 10.0).max(1.0e-12);
-                    if improvement <= 1.0e-14 * (1.0 + state.defect) {
-                        // Converged: the accepted step no longer moves E.
-                        converged = true;
-                    }
-                    break;
-                }
-                Some(..) | None => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                }
-            }
-        }
-        if !accepted_step {
+            },
+        );
+        any_accepted |= step.accepted;
+        if !step.accepted {
             break;
         }
-        if converged {
+        if step.converged {
             break;
         }
         let theta_norm_sq: f64 = theta.iter().map(|v| v * v).sum();
-        if step_norm_sq <= 1.0e-24 * (1.0 + theta_norm_sq) {
+        if step.step_norm_sq <= LM_STEP_STALL_REL_FLOOR * (1.0 + theta_norm_sq) {
             break;
         }
     }
@@ -2566,63 +2652,32 @@ fn sphere_minimize_boost_defect(
         let jtj = fast_ata(&jmat);
         let jtr = fast_atb(&jmat, &rcol);
 
-        let mut rejects = 0usize;
-        let mut accepted_step = false;
-        let mut converged = false;
-        let mut step_norm_sq = 0.0_f64;
-        while rejects < TORUS_FLOW_GN_MAX_REJECTS {
-            let mut damped = jtj.clone();
-            for d in 0..q {
-                damped[[d, d]] += lambda * (1.0 + jtj[[d, d]]);
-            }
-            let factor = match damped.cholesky(FaerSide::Lower) {
-                Ok(factor) => factor,
-                Err(_) => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                    continue;
+        // Same Levenberg-damped strict-descent + diffeomorphism accept test as
+        // the torus core; the sphere-specific fold guard and defect evaluation
+        // enter only through the `eval_candidate` closure.
+        let step = lm_damped_accept_sweep(
+            &jtj,
+            &jtr,
+            q,
+            &mut lambda,
+            &mut theta,
+            &mut state,
+            |candidate| {
+                if SphereBoostFlowBasis::min_jacobian_det_on_band(candidate, lat_lo, lat_hi)
+                    <= SPHERE_FLOW_DIFFEO_MIN_DET
+                {
+                    None
+                } else {
+                    sphere_eval_boost_defect(candidate, row_coords, ghat, ghat_norm_sq)
                 }
-            };
-            let mut neg_jtr = jtr.clone();
-            neg_jtr.mapv_inplace(|v| -v);
-            let delta = factor.solve_mat(&neg_jtr);
-            let mut candidate = theta.clone();
-            step_norm_sq = 0.0;
-            for k in 0..q {
-                candidate[k] += delta[[k, 0]];
-                step_norm_sq += delta[[k, 0]] * delta[[k, 0]];
-            }
-            let folded = SphereBoostFlowBasis::min_jacobian_det_on_band(&candidate, lat_lo, lat_hi)
-                <= SPHERE_FLOW_DIFFEO_MIN_DET;
-            let candidate_state = if folded {
-                None
-            } else {
-                sphere_eval_boost_defect(&candidate, row_coords, ghat, ghat_norm_sq)
-            };
-            match candidate_state {
-                Some(next) if next.defect < state.defect => {
-                    let improvement = state.defect - next.defect;
-                    theta = candidate;
-                    state = next;
-                    any_accepted = true;
-                    accepted_step = true;
-                    lambda = (lambda / 10.0).max(1.0e-12);
-                    if improvement <= 1.0e-14 * (1.0 + state.defect) {
-                        converged = true;
-                    }
-                    break;
-                }
-                Some(..) | None => {
-                    lambda *= 10.0;
-                    rejects += 1;
-                }
-            }
-        }
-        if !accepted_step || converged {
+            },
+        );
+        any_accepted |= step.accepted;
+        if !step.accepted || step.converged {
             break;
         }
         let theta_norm_sq: f64 = theta.iter().map(|v| v * v).sum();
-        if step_norm_sq <= 1.0e-24 * (1.0 + theta_norm_sq) {
+        if step.step_norm_sq <= LM_STEP_STALL_REL_FLOOR * (1.0 + theta_norm_sq) {
             break;
         }
     }
