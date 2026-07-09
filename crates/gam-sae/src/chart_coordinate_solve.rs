@@ -35,6 +35,7 @@
 //! `y_f = x − Σ_{g≠f} gate_g · m_g(t_g)` built from the previous sweep's
 //! positions and gate weights, so co-active atoms carve complementary charts.
 
+use gam_linalg::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 
 /// Basis family the coordinate solver evaluates on the grid. Periodic
@@ -121,8 +122,7 @@ pub fn solve_chart_coordinates(
     // column), never a caller knob.
     let grid_res = 8 * k;
 
-    // Precompute grid basis rows φ(t_g), the per-atom decoded curves
-    // m_{f,g} = Σ_k φ_g[k]·D_f[k,:], and their squared norms ‖m_{f,g}‖².
+    // Precompute grid basis rows φ(t_g).
     let mut grid_t = Vec::with_capacity(grid_res);
     let mut grid_phi = Array2::<f64>::zeros((grid_res, k));
     {
@@ -134,26 +134,41 @@ pub fn solve_chart_coordinates(
             grid_phi.row_mut(g).assign(&Array1::from(row.clone()));
         }
     }
-    // grid_curve[(f, g, :)] = m_{f,g}; grid_nrm2[(f, g)] = ‖m_{f,g}‖².
-    let mut grid_curve = Array3::<f64>::zeros((f, grid_res, d));
+    // COEFFICIENT-SPACE restructure. The naive sweep scores every
+    // `(row, atom, grid)` triple with an ambient-space dot (`O(N·F·G·D)` —
+    // measured 100 s/step at N=4096, F=512, D=2048 on the torch circle lane).
+    // But `⟨y, m_f(t)⟩ = φ(t)ᵀ (D_f y)`: projecting each target ONCE into every
+    // atom's K-dim coefficient space (one GEMM, `N·D·F·K`) collapses the grid
+    // scan to `K` mults per point, and `‖m_f(t)‖² = φ(t)ᵀ (D_f D_fᵀ) φ(t)` needs
+    // only the K×K per-atom Gram. Identical scores, GEMM-shaped work.
+    //
+    // dec_flat: (F·K, D) — atom-major flattening of the decoder blocks.
+    let dec_flat = decoders
+        .to_shape((f * k, d))
+        .map_err(|e| format!("solve_chart_coordinates: decoder reshape failed: {e}"))?
+        .to_owned();
+    // Per-atom Grams G_f = D_f D_fᵀ (K, K), and grid norms ‖m_{f,g}‖² = φ_gᵀ G_f φ_g.
+    let mut grams = Array3::<f64>::zeros((f, k, k));
     let mut grid_nrm2 = Array2::<f64>::zeros((f, grid_res));
     for fi in 0..f {
         let block = decoders.index_axis(ndarray::Axis(0), fi); // (K, D)
+        let gram = fast_abt(&block, &block);
+        grams.index_axis_mut(ndarray::Axis(0), fi).assign(&gram);
         for g in 0..grid_res {
             let phi = grid_phi.row(g);
-            let mut acc = grid_curve.slice_mut(ndarray::s![fi, g, ..]);
             let mut nrm2 = 0.0_f64;
-            for col in 0..d {
-                let mut v = 0.0_f64;
-                for row in 0..k {
-                    v += phi[row] * block[[row, col]];
+            for a in 0..k {
+                let mut row_acc = 0.0_f64;
+                for b in 0..k {
+                    row_acc += gram[[a, b]] * phi[b];
                 }
-                acc[col] = v;
-                nrm2 += v * v;
+                nrm2 += phi[a] * row_acc;
             }
             grid_nrm2[[fi, g]] = nrm2;
         }
     }
+    // Plain-sweep projections P[row, f·K + k] = ⟨x_row, D_f[k, :]⟩ — one GEMM.
+    let proj_x = fast_abt(&x, &dec_flat); // (N, F·K)
 
     // Leave-one-out residual mode requires BOTH previous positions and gates.
     let loo = match (prev_positions, gate_weights) {
@@ -175,42 +190,65 @@ pub fn solve_chart_coordinates(
         _ => None,
     };
 
-    // Solve one contiguous block of rows into `out`, whose row `i` corresponds
-    // to observation `start + i`.
+    // LOO sweep GEMMs. `W[row, f·K + kk] = gate_f · φ_kk(prev_f)` assembles the
+    // previous reconstruction `full = W · dec_flat` in one GEMM; the residual
+    // projections `⟨x − full, D_f[k, :]⟩` are a second GEMM; the add-back term
+    // `⟨c_f, m_f(t)⟩ = gate_f · φ(prev_f)ᵀ G_f φ(t)` never touches ambient space.
+    let proj_target = if let Some((p, w)) = loo {
+        let mut weights = Array2::<f64>::zeros((n, f * k));
+        {
+            use rayon::prelude::*;
+            weights
+                .axis_chunks_iter_mut(ndarray::Axis(0), ROW_CHUNK)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(chunk, mut block)| {
+                    let start = chunk * ROW_CHUNK;
+                    let mut phi_row = vec![0.0_f64; k];
+                    for local in 0..block.nrows() {
+                        let row = start + local;
+                        for fi in 0..f {
+                            let gate = w[[row, fi]];
+                            basis.eval_into(p[[row, fi]], &mut phi_row);
+                            for (kk, &phi_v) in phi_row.iter().enumerate() {
+                                block[[local, fi * k + kk]] = gate * phi_v;
+                            }
+                        }
+                    }
+                });
+        }
+        let full = fast_ab(&weights, &dec_flat); // (N, D)
+        let residual = &x.to_owned() - &full;
+        fast_abt(&residual, &dec_flat) // (N, F·K)
+    } else {
+        proj_x
+    };
+
+    // Score the grid in coefficient space: `K` mults per (row, atom, grid).
     let solve_rows = |start: usize, end: usize, out: &mut Array2<f64>| {
-        let mut phi_row = vec![0.0_f64; k];
-        // Scratch for the leave-one-out per-atom contributions of one row.
-        let mut contrib = Array2::<f64>::zeros((f, d));
+        let mut phi_prev = vec![0.0_f64; k];
+        let mut gram_phi = vec![0.0_f64; k];
         for row in start..end {
             let out_row = row - start;
-            let xr = x.row(row);
-
-            // In leave-one-out mode, precompute each atom's contribution
-            // c_g = gate_g · m_g(t_g) at its previous coordinate, and the full
-            // reconstruction Σ_g c_g, so target_f = x − full + c_f.
-            let mut full = Array1::<f64>::zeros(d);
-            if let Some((p, w)) = loo {
-                for g in 0..f {
-                    let tg = p[[row, g]];
-                    let gate = w[[row, g]];
-                    basis.eval_into(tg, &mut phi_row);
-                    let block = decoders.index_axis(ndarray::Axis(0), g); // (K, D)
-                    let mut cg = contrib.row_mut(g);
-                    for col in 0..d {
-                        let mut v = 0.0_f64;
-                        for kk in 0..k {
-                            v += phi_row[kk] * block[[kk, col]];
+            for fi in 0..f {
+                // LOO add-back coefficients v = gate_f · G_f φ(prev_f), so
+                // dot(g) = proj_target[row, f·K..] · φ_g + v · φ_g.
+                let mut has_addback = false;
+                if let Some((p, w)) = loo {
+                    let gate = w[[row, fi]];
+                    if gate != 0.0 {
+                        has_addback = true;
+                        basis.eval_into(p[[row, fi]], &mut phi_prev);
+                        let gram = grams.index_axis(ndarray::Axis(0), fi);
+                        for a in 0..k {
+                            let mut acc = 0.0_f64;
+                            for b in 0..k {
+                                acc += gram[[a, b]] * phi_prev[b];
+                            }
+                            gram_phi[a] = gate * acc;
                         }
-                        let scaled = gate * v;
-                        cg[col] = scaled;
-                        full[col] += scaled;
                     }
                 }
-            }
-
-            for fi in 0..f {
-                // Build the projection target for this atom.
-                // Plain sweep: y = x. LOO sweep: y = x − (full − c_f).
                 let mut best_score = f64::NEG_INFINITY;
                 let mut best_t = 0.0_f64;
                 for g in 0..grid_res {
@@ -218,17 +256,14 @@ pub fn solve_chart_coordinates(
                     if nrm2 <= 1e-30 {
                         continue;
                     }
-                    let curve = grid_curve.slice(ndarray::s![fi, g, ..]);
+                    let phi = grid_phi.row(g);
                     let mut dot = 0.0_f64;
-                    if loo.is_some() {
-                        let cf = contrib.row(fi);
-                        for col in 0..d {
-                            let y = xr[col] - full[col] + cf[col];
-                            dot += y * curve[col];
-                        }
-                    } else {
-                        for col in 0..d {
-                            dot += xr[col] * curve[col];
+                    for kk in 0..k {
+                        dot += phi[kk] * proj_target[[row, fi * k + kk]];
+                    }
+                    if has_addback {
+                        for kk in 0..k {
+                            dot += phi[kk] * gram_phi[kk];
                         }
                     }
                     let score = dot * dot / nrm2;
