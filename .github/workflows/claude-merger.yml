@@ -154,13 +154,30 @@ jobs:
 
             After every merge that lands user-facing code, cut a release:
 
-              - **Rust crate (crates.io):** bump the version in the
-                workspace `Cargo.toml` (and any member crates that
-                publish). Pick the right semver step from the merged
-                diff: patch for fixes / internal cleanup, minor for new
-                public surface, major for breaking changes. Commit
-                directly to `main` with a message like
-                `release: gam vX.Y.Z`.
+              - **Rust crate (crates.io):** bump versions INDEPENDENTLY,
+                not in lockstep. Bump ONLY (a) the member crates whose
+                content actually changed since the last release
+                (`git diff <last-release>..HEAD --stat -- crates/` tells
+                you which), (b) their reverse-dependency closure — any
+                crate whose Cargo.toml pins a bumped dep's version must
+                update that pin and bump its own patch version — and
+                (c) the root `gam` crate + workspace `Cargo.toml`, whose
+                version is the release tag anchor and always bumps.
+                Leave every other member crate's version (and its
+                dependents' pins on it) UNTOUCHED. Rationale: a version
+                string participates in cargo's fingerprint (`-C metadata`),
+                so a lockstep bump of all ~30 member crates cold-starts
+                every build cache in the fleet (CI shards, the MSI wheel
+                builds, every dev box) for crates that did not change —
+                tens of wasted compile-hours per release. Independent
+                bumps make version invalidation coincide exactly with the
+                rebuilds the content changes force anyway; crates.io is
+                indifferent (unchanged crates simply skip publish — the
+                "already uploaded" branch in publish.yml already tolerates
+                this). Pick the right semver step from the merged diff:
+                patch for fixes / internal cleanup, minor for new public
+                surface, major for breaking changes. Commit directly to
+                `main` with a message like `release: gam vX.Y.Z`.
               - **Python wrapper (PyPI):** bump `version` in
                 `pyproject.toml` for `gamfit`. Same semver judgment.
                 Commit to `main`: `release: gamfit vX.Y.Z`.
