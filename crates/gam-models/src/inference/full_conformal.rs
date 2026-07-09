@@ -1355,8 +1355,10 @@ const GLM_STALL_ACCEPT_RTOL: f64 = 1e-8;
 /// `B(β_pred, 2‖H₀⁻¹F(β_pred)‖)`, which then provably contains the root.
 const GLM_CONTRACTION_ACCEPT: f64 = 0.5;
 
-/// Armijo sufficient-decrease constant for the cold-fit line search.
-const GLM_ARMIJO_C1: f64 = 1e-4;
+/// Armijo sufficient-decrease constant for the cold-fit line search —
+/// sourced from the shared optimizer constants so the workspace has exactly
+/// one `c₁`.
+const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 /// `η` location of the extrema of the logistic third derivative
 /// `b‴(η) = σ(1−σ)(1−2σ)`: `σ = (3±√3)/6 ⇔ η = ±ln(2+√3)`.

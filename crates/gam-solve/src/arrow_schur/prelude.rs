@@ -66,7 +66,9 @@ pub const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
 /// only on configs that would otherwise have failed.
 pub const DEFAULT_PROXIMAL_MAX_ATTEMPTS: usize = 22;
 
-pub(crate) const DEFAULT_ARMIJO_C1: f64 = 1e-4;
+/// Armijo sufficient-decrease constant — sourced from the shared optimizer
+/// constants so the workspace has exactly one `c₁`.
+pub(crate) const DEFAULT_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 pub(crate) const DEFAULT_GRADIENT_TOLERANCE: f64 = 1e-10;
 

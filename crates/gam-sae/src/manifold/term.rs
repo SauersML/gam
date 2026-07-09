@@ -1,6 +1,8 @@
 use super::*;
 
-pub(crate) const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
+/// Armijo sufficient-decrease constant — sourced from the shared optimizer
+/// constants so the workspace has exactly one `c₁`.
+pub(crate) const SAE_MANIFOLD_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 pub(crate) const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
@@ -536,9 +538,9 @@ pub struct SaeManifoldTerm {
     /// SAME truncated active support as `q`'s denominators. Both are functions of
     /// the routing masses (hence the logits the inner Newton solve moves), so
     /// freezing them here keeps the barrier value, gradient, and curvature reading
-    /// the SAME `Q`, the SAME occupancy scale `n_C` (the occupancy-scaled Jeffreys
-    /// weight), and the SAME data-derived softening `ε_C` across an inner line
-    /// search. The decoder overlaps `O` are NOT frozen — they are the LIVE shapes
+    /// the SAME `Q`, the SAME per-atom effective sample sizes, and therefore the
+    /// SAME data-derived softening `ε_C` across an inner line search. The decoder
+    /// overlaps `O` are NOT frozen — they are the LIVE shapes
     /// the barrier separates
     /// ([`super::penalties::SaeManifoldTerm::decoder_gram_cosine_sq`]), moving with
     /// the trial decoders. The Jeffreys exponent `½` is fixed, so there is no
