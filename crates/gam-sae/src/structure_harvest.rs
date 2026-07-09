@@ -2794,28 +2794,46 @@ pub struct PrimaryTopologyChoice {
 /// `labels` assigns each observation to its seed cluster (the same
 /// output-energy labels the periodic seed refinement uses); the race for atom
 /// `k` weights exactly its cluster's rows. `max_dims[k]` caps the intrinsic
-/// dimension enrolled for atom `k`, so a caller-pinned `d_atom = 1` keeps the
-/// race one-dimensional. Every failure path yields `None` for that atom and
-/// the caller falls back to the historical default — discovery can only ever
-/// ADD fidelity, never remove a working path.
+/// dimension enrolled for atom `k`, so `d_atom = 1` keeps the race
+/// one-dimensional. Auto discovery is an explicit contract: every requested
+/// atom must produce an evidence-backed winner. Invalid inputs, undersupported
+/// clusters, or numerical failures are returned to the caller instead of
+/// silently substituting a different topology.
 pub fn discover_primary_atom_topologies(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
     k_atoms: usize,
     max_dims: &[usize],
-) -> Vec<Option<PrimaryTopologyChoice>> {
+) -> Result<Vec<PrimaryTopologyChoice>, String> {
     let n_obs = target.nrows();
     let p_out = target.ncols();
-    if labels.len() != n_obs || max_dims.len() != k_atoms || p_out < 2 {
-        return vec![None; k_atoms];
+    if labels.len() != n_obs {
+        return Err(format!(
+            "discover_primary_atom_topologies: labels must have N={n_obs} entries; got {}",
+            labels.len()
+        ));
+    }
+    if max_dims.len() != k_atoms {
+        return Err(format!(
+            "discover_primary_atom_topologies: max_dims must have K={k_atoms} entries; got {}",
+            max_dims.len()
+        ));
+    }
+    if p_out < 2 {
+        return Err(format!(
+            "discover_primary_atom_topologies: evidence racing needs at least two output dimensions; got P={p_out}"
+        ));
     }
     (0..k_atoms)
-        .map(|atom_idx| {
+        .map(|atom_idx| -> Result<PrimaryTopologyChoice, String> {
             let rows: Vec<usize> =
                 (0..n_obs).filter(|&row| labels[row] == atom_idx).collect();
             // Too few rows to score a 2-candidate race honestly.
             if rows.len() < 16 {
-                return None;
+                return Err(format!(
+                    "discover_primary_atom_topologies: auto atom {atom_idx} has only {} seed-cluster rows; at least 16 are required for an evidence race (name an explicit topology when discovery is not identifiable)",
+                    rows.len()
+                ));
             }
             // Cluster-local principal frame: up to 4 components of the atom's
             // rows, then every observation projected into that frame (the race
@@ -2836,11 +2854,21 @@ pub fn discover_primary_atom_topologies(
                     local[[out_row, col]] = target[[src_row, col]] - mean[col];
                 }
             }
-            let (_u, _s, vt_opt) = local.svd(false, true).ok()?;
-            let vt = vt_opt?;
+            let (_u, _s, vt_opt) = local.svd(false, true).map_err(|error| {
+                format!(
+                    "discover_primary_atom_topologies: SVD failed for auto atom {atom_idx}: {error}"
+                )
+            })?;
+            let vt = vt_opt.ok_or_else(|| {
+                format!(
+                    "discover_primary_atom_topologies: SVD returned no right-singular frame for auto atom {atom_idx}"
+                )
+            })?;
             let n_pcs = vt.nrows().min(4);
             if n_pcs < 2 {
-                return None;
+                return Err(format!(
+                    "discover_primary_atom_topologies: auto atom {atom_idx} has principal rank {n_pcs}; at least two directions are required"
+                ));
             }
             let mut proj = Array2::<f64>::zeros((n_obs, n_pcs));
             for row in 0..n_obs {
@@ -2875,16 +2903,19 @@ pub fn discover_primary_atom_topologies(
                     coords[[row, 0]] = phase(proj[[row, 0]], proj[[row, 1]]);
                 }
                 let n_harmonics = 3;
-                if let Ok(evaluator) = PeriodicHarmonicEvaluator::new(n_harmonics) {
-                    specs.push(TopologyCandidateSpec {
-                        kind: AutoTopologyKind::Circle,
-                        basis_kind: SaeAtomBasisKind::Periodic,
-                        manifold: LatentManifold::Circle { period: 1.0 },
-                        latent_dim: 1,
-                        evaluator: Arc::new(evaluator),
-                        coords,
-                    });
-                }
+                let evaluator = PeriodicHarmonicEvaluator::new(n_harmonics).map_err(|error| {
+                    format!(
+                        "discover_primary_atom_topologies: circle evaluator failed for auto atom {atom_idx}: {error}"
+                    )
+                })?;
+                specs.push(TopologyCandidateSpec {
+                    kind: AutoTopologyKind::Circle,
+                    basis_kind: SaeAtomBasisKind::Periodic,
+                    manifold: LatentManifold::Circle { period: 1.0 },
+                    latent_dim: 1,
+                    evaluator: Arc::new(evaluator),
+                    coords,
+                });
             }
             if max_dims[atom_idx] >= 2 {
                 // Flat 2-D patch: standardized leading principal projections.
@@ -2894,16 +2925,19 @@ pub fn discover_primary_atom_topologies(
                     coords[[row, 0]] = proj[[row, 0]] / sd0;
                     coords[[row, 1]] = proj[[row, 1]] / sd1;
                 }
-                if let Ok(evaluator) = EuclideanPatchEvaluator::new(2, 2) {
-                    specs.push(TopologyCandidateSpec {
-                        kind: AutoTopologyKind::Euclidean,
-                        basis_kind: SaeAtomBasisKind::EuclideanPatch,
-                        manifold: LatentManifold::Euclidean,
-                        latent_dim: 2,
-                        evaluator: Arc::new(evaluator),
-                        coords,
-                    });
-                }
+                let evaluator = EuclideanPatchEvaluator::new(2, 2).map_err(|error| {
+                    format!(
+                        "discover_primary_atom_topologies: flat evaluator failed for auto atom {atom_idx}: {error}"
+                    )
+                })?;
+                specs.push(TopologyCandidateSpec {
+                    kind: AutoTopologyKind::Euclidean,
+                    basis_kind: SaeAtomBasisKind::EuclideanPatch,
+                    manifold: LatentManifold::Euclidean,
+                    latent_dim: 2,
+                    evaluator: Arc::new(evaluator),
+                    coords,
+                });
                 if n_pcs >= 3 {
                     // Sphere: (lat, lon) of the unit-normalized leading 3-frame.
                     let mut coords = Array2::<f64>::zeros((n_obs, 2));
@@ -2938,35 +2972,47 @@ pub fn discover_primary_atom_topologies(
                         coords[[row, 0]] = phase(proj[[row, 0]], proj[[row, 1]]);
                         coords[[row, 1]] = phase(proj[[row, 2]], proj[[row, 3]]);
                     }
-                    if let Ok(evaluator) = TorusHarmonicEvaluator::new(2, 2) {
-                        specs.push(TopologyCandidateSpec {
-                            kind: AutoTopologyKind::Torus,
-                            basis_kind: SaeAtomBasisKind::Torus,
-                            manifold: LatentManifold::Product(vec![
-                                LatentManifold::Circle { period: 1.0 },
-                                LatentManifold::Circle { period: 1.0 },
-                            ]),
-                            latent_dim: 2,
-                            evaluator: Arc::new(evaluator),
-                            coords,
-                        });
-                    }
+                    let evaluator = TorusHarmonicEvaluator::new(2, 2).map_err(|error| {
+                        format!(
+                            "discover_primary_atom_topologies: torus evaluator failed for auto atom {atom_idx}: {error}"
+                        )
+                    })?;
+                    specs.push(TopologyCandidateSpec {
+                        kind: AutoTopologyKind::Torus,
+                        basis_kind: SaeAtomBasisKind::Torus,
+                        manifold: LatentManifold::Product(vec![
+                            LatentManifold::Circle { period: 1.0 },
+                            LatentManifold::Circle { period: 1.0 },
+                        ]),
+                        latent_dim: 2,
+                        evaluator: Arc::new(evaluator),
+                        coords,
+                    });
                 }
             }
             if specs.is_empty() {
-                return None;
+                return Err(format!(
+                    "discover_primary_atom_topologies: auto atom {atom_idx} produced no realizable candidates"
+                ));
             }
             let mut weights = Array1::<f64>::zeros(n_obs);
             for &row in &rows {
                 weights[row] = 1.0;
             }
-            match race_spec_set(specs, target, weights.view()) {
-                Ok(Some(fit)) => Some(PrimaryTopologyChoice {
-                    basis_kind: fit.basis_kind,
-                    latent_dim: fit.latent_dim,
-                }),
-                _ => None,
-            }
+            let fit = race_spec_set(specs, target, weights.view()).map_err(|error| {
+                format!(
+                    "discover_primary_atom_topologies: evidence race failed for auto atom {atom_idx}: {error}"
+                )
+            })?;
+            let fit = fit.ok_or_else(|| {
+                format!(
+                    "discover_primary_atom_topologies: evidence race returned no winner for auto atom {atom_idx}"
+                )
+            })?;
+            Ok(PrimaryTopologyChoice {
+                basis_kind: fit.basis_kind,
+                latent_dim: fit.latent_dim,
+            })
         })
         .collect()
 }
@@ -2980,47 +3026,56 @@ pub fn discover_primary_atom_topologies(
 /// * a flat 2-D winner builds the expressive thin-plate (`duchon`) chart
 ///   rather than the degree-2 patch the race scored with — same topology,
 ///   strictly richer basis for the seeded atom;
-/// * a circle winner — and every failure path — is the historical periodic
-///   default with the caller's `d_atom` kept as the harmonic budget, so
-///   discovery can only ever ADD fidelity.
+/// * a circle winner keeps the caller's harmonic budget;
+/// * any discovery failure is returned. Auto mode never silently substitutes
+///   the old periodic default; callers that require a fixed topology must name
+///   that topology explicitly.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
     atom_basis: &mut [String],
     atom_dim: &mut [usize],
-) {
+) -> Result<(), String> {
     let k_atoms = atom_basis.len();
-    if atom_dim.len() != k_atoms || !atom_basis.iter().any(|basis| basis == "auto") {
-        return;
+    if atom_dim.len() != k_atoms {
+        return Err(format!(
+            "resolve_auto_primary_atoms: atom_basis and atom_dim must both have K={k_atoms} entries; atom_dim has {}",
+            atom_dim.len()
+        ));
     }
-    let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim);
+    if !atom_basis.iter().any(|basis| basis == "auto") {
+        return Ok(());
+    }
+    let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim)?;
     for atom_idx in 0..k_atoms {
         if atom_basis[atom_idx] != "auto" {
             continue;
         }
-        match choices.get(atom_idx).and_then(|choice| choice.as_ref()) {
-            Some(choice) => match choice.basis_kind {
-                SaeAtomBasisKind::Torus => {
-                    atom_basis[atom_idx] = "torus".to_string();
-                    atom_dim[atom_idx] = choice.latent_dim;
-                }
-                SaeAtomBasisKind::Sphere => {
-                    atom_basis[atom_idx] = "sphere".to_string();
-                    atom_dim[atom_idx] = choice.latent_dim;
-                }
-                SaeAtomBasisKind::EuclideanPatch => {
-                    atom_basis[atom_idx] = "duchon".to_string();
-                    atom_dim[atom_idx] = choice.latent_dim;
-                }
-                _ => {
-                    atom_basis[atom_idx] = "periodic".to_string();
-                }
-            },
-            None => {
+        let choice = &choices[atom_idx];
+        match choice.basis_kind {
+            SaeAtomBasisKind::Torus => {
+                atom_basis[atom_idx] = "torus".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::Sphere => {
+                atom_basis[atom_idx] = "sphere".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::EuclideanPatch => {
+                atom_basis[atom_idx] = "duchon".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
+            }
+            ref unexpected => {
+                return Err(format!(
+                    "resolve_auto_primary_atoms: evidence race selected unsupported primary basis {unexpected:?} for auto atom {atom_idx}"
+                ));
             }
         }
     }
+    Ok(())
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the
@@ -4596,6 +4651,49 @@ mod tests {
     /// softmax of these separates the discrete support cleanly.
     const ON: f64 = 6.0;
     const OFF: f64 = -6.0;
+
+    /// #2238/#2239 — `auto` is an evidence-discovery request, not an alias for
+    /// the old periodic default. An undersupported cluster must fail loudly and
+    /// leave the caller's unresolved state untouched.
+    #[test]
+    fn auto_primary_topology_never_falls_back_on_race_failure_2238_2239() {
+        let target = Array2::<f64>::zeros((15, 2));
+        let labels = vec![0usize; 15];
+        let mut basis = vec!["auto".to_string()];
+        let mut dims = vec![2usize];
+
+        let error = resolve_auto_primary_atoms(target.view(), &labels, &mut basis, &mut dims)
+            .expect_err("an undersupported automatic race must be rejected");
+
+        assert!(error.contains("auto atom 0"), "unexpected error: {error}");
+        assert!(error.contains("at least 16"), "unexpected error: {error}");
+        assert_eq!(basis, vec!["auto"], "failure must not install a fallback");
+        assert_eq!(dims, vec![2], "failure must not rewrite latent dimension");
+    }
+
+    /// #2238 — a genuinely two-dimensional primary factor must not be pinned to
+    /// the old one-dimensional circle. A full 8x8 planar grid is represented
+    /// exactly by the flat 2-D candidate, while phase alone discards radius.
+    #[test]
+    fn auto_primary_topology_selects_two_dimensional_factor_2238() {
+        let side = 8usize;
+        let target = Array2::<f64>::from_shape_fn((side * side, 2), |(row, col)| {
+            let i = row / side;
+            let j = row % side;
+            if col == 0 {
+                i as f64 - 0.5 * (side - 1) as f64
+            } else {
+                j as f64 - 0.5 * (side - 1) as f64
+            }
+        });
+        let labels = vec![0usize; target.nrows()];
+        let choices = discover_primary_atom_topologies(target.view(), &labels, 1, &[2])
+            .expect("the supported planar race must produce a winner");
+
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].latent_dim, 2);
+        assert_eq!(choices[0].basis_kind, SaeAtomBasisKind::EuclideanPatch);
+    }
 
     /// Deterministic low-discrepancy sequence on `[0, 1)` (van der Corput, base
     /// 2) for RNG-free synthetic birth targets.

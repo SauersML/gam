@@ -375,7 +375,7 @@ fn sae_manifold_fit_minimal<'py>(
             &labels,
             &mut atom_basis,
             &mut atom_dim,
-        );
+        )?;
     }
     let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
         .iter()
