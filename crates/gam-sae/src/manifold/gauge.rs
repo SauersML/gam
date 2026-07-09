@@ -1129,6 +1129,99 @@ impl SaeManifoldTerm {
         }
         Ok(())
     }
+
+    /// #2228/#1095/#2132/#1893 Option B — the K=1 SCALE-gauge PIN, the co-collapse
+    /// cure.
+    ///
+    /// # The bug this fixes
+    /// The decoder DATA-fit β-Hessian is gate-weighted (design `D_k = diag(a_·k)·Φ_k·B_k`,
+    /// construction_arrow_schur_assembly.rs), but the decoder SMOOTHNESS / ARD penalty
+    /// is scaled by `λ` ONLY, not the gate — so the EFFECTIVE decoder shrinkage is
+    /// `λ/a_k²`. For a K=1 IBP fit whose gate is hard-capped (`a_1 ≤ 0.5`, π₁=0.5,
+    /// non-learnable α) the decoder is over-shrunk ≥4×, the gated reconstruction
+    /// `a_k·Φ·B` can no longer reach the target, and the fit STALLS at the pristine
+    /// seed (`R² = 0.4375`) — the #2228/#1095/#2132/#1893/OLMo co-collapse.
+    ///
+    /// # The cure (architecturally intended, see
+    /// [`Self::optimize_log_amplitudes_closed_form`]'s doc)
+    /// Move the compensating magnitude OUT of the penalized decoder and INTO the
+    /// UNPENALIZED log-amplitude `s_k`, so the penalty only shapes a unit-Frobenius
+    /// frame `B̂_k`:
+    /// 1. **Peel** each atom's `‖B_k‖_F` into `s_k` ([`SaeManifoldAtom::absorb_decoder_norm_into_log_amplitude`]),
+    ///    so `B̂_k` is unit-Frobenius and magnitude lives only in `s_k`. Unlike the
+    ///    peer-relative [`Self::retract_collapsed_decoders_in_loop`] (which has a
+    ///    `k < 2` early-out — a lone atom has no peer to be "collapsed" against, which
+    ///    is exactly why the K=1 case never self-healed), this fires unconditionally.
+    /// 2. **Re-home** the magnitude via the data-optimal, ARD/SCAD-penalized amplitude
+    ///    solve — the gate-compensating amplitude `exp(s_k) ~ 1/a_k` emerges from the
+    ///    least-squares projection against the frozen unit-`B̂` design.
+    /// 3. **Condition** `exp(s_k)`: an IBP gate driven small by the sparsity prior
+    ///    would otherwise let `exp(s_k)` run away; clamp it against the atom's
+    ///    GATE-INDEPENDENT unit-design magnitude `‖Φ_k B̂_k‖_F` so the pathological
+    ///    `a_k → 0` blow-up is bounded while the legitimate `a_k ≤ 0.5` compensation
+    ///    (`exp(s) ~ 2`) is untouched.
+    ///
+    /// Mirrors [`Self::optimize_log_amplitudes_closed_form`]'s `(target, rho)` params
+    /// so a caller can invoke either at the same fit-loop site with no adaptor.
+    /// Idempotent: peeling an already-unit decoder is a no-op (`ln 1 = 0`).
+    pub fn pin_scale_gauge_k1(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let k = self.k_atoms();
+        if k == 0 {
+            return Ok(());
+        }
+        // (1) Peel ‖B_k‖ → s_k: reset the explicit amplitude, then fold the decoder
+        //     magnitude in so B̂_k is unit-Frobenius. `f64::MIN_POSITIVE` = "skip only
+        //     an exactly-zero decoder" (a truly-collapsed atom carries no direction to
+        //     normalize — that is the reseed arm's job, not the pin's).
+        for atom in self.atoms.iter_mut() {
+            atom.log_amplitude = 0.0;
+            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+        }
+        // Gate-INDEPENDENT unit-design magnitudes ‖Φ_k B̂_k‖_F, captured while s_k is
+        // neutral and B̂_k is unit-Frobenius — the scale the runaway clamp measures
+        // against (a small gate shrinks the GATED design but not this).
+        let target_scale = target.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let ungated_norm: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|a| {
+                a.basis_values
+                    .dot(&a.decoder_coefficients)
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
+        // (2) Re-home the magnitude by the penalized amplitude solve (no k<2 guard).
+        self.optimize_log_amplitudes_closed_form(target, rho)?;
+        // (3) exp(s) conditioning: bound the amplitude by the data scale over the
+        //     atom's gate-independent design magnitude, so a small IBP gate cannot let
+        //     exp(s_k) run away. `RUNAWAY_MULT` leaves ample room for the legitimate
+        //     a_k ≤ 0.5 gate compensation (exp(s) ~ 2 ≪ 16). Floor at the amplitude
+        //     floor `exp(S_MIN) = 1e-12`.
+        const RUNAWAY_MULT: f64 = 16.0;
+        const S_MIN: f64 = -27.631_021_115_928_547; // ln(1e-12)
+        for (j, atom) in self.atoms.iter_mut().enumerate() {
+            let u = ungated_norm[j].max(f64::MIN_POSITIVE);
+            let cap = if target_scale > 0.0 {
+                (RUNAWAY_MULT * target_scale / u).ln()
+            } else {
+                0.0
+            };
+            if atom.log_amplitude > cap {
+                atom.log_amplitude = cap;
+            }
+            if atom.log_amplitude < S_MIN {
+                atom.log_amplitude = S_MIN;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================

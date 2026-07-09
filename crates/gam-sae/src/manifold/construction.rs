@@ -184,8 +184,16 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            // #2022/#2023 — per-fit opt-ins, default false (bit-for-bit historical).
-            quotient_scale: false,
+            // #2228/#1095 — the SCALE-gauge is DEFAULT-ON (magic-by-default): the
+            // decoder-penalty↔gate asymmetry co-collapse (a K=1 IBP gate hard-capped
+            // at a_1≤0.5 over-shrinks the λ/a_1²-penalized decoder until the gated
+            // reconstruction cannot reach the target) is cured by peeling ‖B‖ into the
+            // UNPENALIZED s_k and pinning exp(s_k) to the data optimum. Engaging it by
+            // default (not behind an opt-in) is what makes the fix reach every fit;
+            // the fit-path engagement is breach-gated (K≥2 collapse-retract) / K=1
+            // pinned, so a healthy fit is a strict no-op. `cone_atom_recovery` stays a
+            // per-fit opt-in (it arms the stagewise recovery reseed, a separate lever).
+            quotient_scale: true,
             cone_atom_recovery: false,
             rank_charge_evidence: false,
             soft_rank_charge: false,

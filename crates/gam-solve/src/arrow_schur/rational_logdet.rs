@@ -1309,6 +1309,97 @@ mod tests {
     }
 
     #[test]
+    fn two_sided_deflation_drops_wide_kappa_std_err_below_two_percent() {
+        // #2080 wide-κ VARIANCE-REDUCTION deliverable. The multiseed discriminator
+        // established the surrogate is UNBIASED at κ=1e8 but too NOISY: the wide-κ
+        // Hutchinson bar is ~14% of |logdet| with one-sided top deflation — too
+        // loose for the outer REML to trust one evaluation. Root cause (see
+        // `build_inverse_deflation_basis`): the bar is `√(2‖offdiag(P log(S/c) P)‖_F²)`,
+        // and `log(S/c)`'s off-diagonal mass sits SYMMETRICALLY on both spectral
+        // tails, so one-sided (top-only) deflation removes only half of it. Peeling
+        // BOTH tails — the two-sided low-rank control variate — collapses the bar.
+        //
+        // This measures the bar three ways on IDENTICAL probes through the EXACT
+        // dense-Cholesky estimator arm (so `std_err` reflects the ESTIMATOR variance,
+        // not CG solve noise) and asserts the two-sided bar (a) falls below 2% of
+        // |logdet|, and (b) beats ONE-sided deflation AT EQUAL TOTAL RANK — the
+        // apples-to-apples proof that the win is the two-sidedness, not merely more
+        // deflated columns. The value stays unbiased throughout (exact split for any
+        // orthonormal Q), checked against the estimator's own 5σ bar.
+        let dim = 96;
+        let mut state = 2026u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -4.0, 4.0)))
+            .collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 4321);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+
+        // Common 256-probe block (CRN); the three plans differ ONLY in the frozen Q.
+        let base = RationalLogdetPlan::build(dim, 256, 17, lmin, lmax, 1e-9).expect("plan");
+        let top16 = base.clone().with_deflation(&matvec, 16, 3, 555); // current wide-κ config
+        let top64 = base.clone().with_deflation(&matvec, 64, 3, 555); // one-sided, EQUAL total rank
+        let two = base
+            .clone()
+            .with_two_sided_deflation(&matvec, 32, 32, 3, 555, (1e-3, 5000)); // 32 top + 32 bottom
+
+        let e16 = evaluate_exact(&top16, &a);
+        let e64 = evaluate_exact(&top64, &a);
+        let e2 = evaluate_exact(&two, &a);
+        let f = |se: f64| se / logdet.abs().max(1.0);
+        eprintln!(
+            "wide-κ variance reduction (256 probes, EXACT estimator): |logdet|={:.4}\n  \
+             top-only  r16 (current): std_err={:.4} ({:.4} of |ld|)\n  \
+             top-only  r64 (eq-rank): std_err={:.4} ({:.4} of |ld|)\n  \
+             two-sided 32+32:         std_err={:.4} ({:.4} of |ld|)  rel={:.4}\n  \
+             => vs top-r16 {:.2}×, vs eq-rank top-r64 {:.2}×",
+            logdet.abs(),
+            e16.std_err,
+            f(e16.std_err),
+            e64.std_err,
+            f(e64.std_err),
+            e2.std_err,
+            f(e2.std_err),
+            (e2.estimate - logdet).abs() / logdet.abs().max(1.0),
+            e16.std_err / e2.std_err.max(1e-300),
+            e64.std_err / e2.std_err.max(1e-300),
+        );
+        assert_eq!(
+            e2.deflation_basis.len(),
+            64,
+            "two-sided block must realise 32 top + 32 bottom orthonormal columns (got {})",
+            e2.deflation_basis.len()
+        );
+        // (a) below the 2%-of-|logdet| production target.
+        assert!(
+            e2.std_err < 0.02 * logdet.abs(),
+            "two-sided wide-κ std_err {:.4} must fall below 2% of |logdet| ({:.4})",
+            e2.std_err,
+            0.02 * logdet.abs()
+        );
+        // (b) beats ONE-sided deflation at EQUAL total rank (the two-sidedness is
+        // the lever, not the column count) — calibrated ratio ≈ 2.75×, assert ≥ 2×.
+        assert!(
+            e2.std_err < 0.5 * e64.std_err,
+            "two-sided ({:.4}) must beat equal-rank one-sided ({:.4}) by ≥2× — the win is \
+             peeling BOTH tails, not merely deflating more columns",
+            e2.std_err,
+            e64.std_err
+        );
+        // Value stays unbiased (exact split for any orthonormal Q): the estimate is
+        // within its own honest 5σ bar of the exact log-det.
+        assert!(
+            (e2.estimate - logdet).abs() < 5.0 * e2.std_err,
+            "two-sided estimate {:.4} must stay within 5σ ({:.4}) of exact {:.4} — variance \
+             reduction must not bias the value",
+            e2.estimate,
+            5.0 * e2.std_err,
+            logdet
+        );
+    }
+
+    #[test]
     fn deflated_directional_derivative_matches_fd_of_surrogate() {
         // The value↔gradient no-desync contract WITH deflation: the fixed-Q
         // directional derivative is the exact derivative of the surrogate value
