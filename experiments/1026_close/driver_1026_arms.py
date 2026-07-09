@@ -255,12 +255,46 @@ def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
     return held_out_ev(x_te, combined, mean_tr), ev_flat
 
 
+def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
+                    topology, max_epochs, curved_rows, seed):
+    """ALL-RUST hybrid: gam sparse_dictionary_fit linear tier at reduced actives
+    + gam sae_manifold_fit curved TopK tier on the linear residual. Matched
+    per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k."""
+    import gamfit
+
+    k_lin = top_k - curved_k * (1 + d)
+    if k_lin < 1:
+        raise SystemExit(f"hybrid_rust budget infeasible: top_k={top_k} curved_k={curved_k} d={d}")
+    print(f"[hybrid_rust] k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
+    t0 = time.perf_counter()
+    flat = gamfit.sparse_dictionary_fit(x_tr, K, active=k_lin, max_epochs=max_epochs)
+    tr_tr = flat.transform(x_tr)
+    tr_te = flat.transform(x_te)
+    flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
+    flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
+    ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
+    print(f"[hybrid_rust] flat tier ev={ev_flat:.4f} (k_lin={k_lin}, "
+          f"{time.perf_counter()-t0:.0f}s)", flush=True)
+    r_tr = np.ascontiguousarray(x_tr - flat_recon_tr)
+    r_te = np.ascontiguousarray(x_te - flat_recon_te)
+    rows = min(curved_rows, r_tr.shape[0])
+    sub = np.random.default_rng(seed).choice(r_tr.shape[0], rows, replace=False)
+    t1 = time.perf_counter()
+    curved = gamfit.sae_manifold_fit(
+        r_tr[sub], K=curved_K, d_atom=d, atom_topology=topology,
+        assignment="topk", top_k=curved_k, random_state=seed)
+    print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
+    curved_recon_te = np.asarray(curved.reconstruct(r_te), dtype=np.float32)
+    ev = held_out_ev(x_te, flat_recon_te + curved_recon_te, mean_tr)
+    return ev, ev_flat
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True,
                     choices=["external_topk", "gam_flat", "curved_topk",
-                             "torch_manifold", "hybrid", "pca_bar"])
+                             "torch_manifold", "hybrid", "pca_bar", "hybrid_rust"])
     ap.add_argument("--chunk-dir", required=True)
     ap.add_argument("--max-rows", type=int, default=120_000)
     ap.add_argument("--test-frac", type=float, default=0.2)
@@ -278,6 +312,8 @@ def main() -> int:
     ap.add_argument("--curved-atoms", type=int, default=256)
     ap.add_argument("--curved-k", type=int, default=2)
     ap.add_argument("--curved-steps", type=int, default=6000)
+    ap.add_argument("--curved-rows", type=int, default=20000,
+                    help="hybrid_rust: row subsample for the curved-tier Rust fit")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default="results_1026.jsonl")
     args = ap.parse_args()
@@ -309,6 +345,13 @@ def main() -> int:
                                 steps=args.steps, lr=args.lr, bs=args.batch_size,
                                 seed=args.seed, manifold=args.atom_manifold,
                                 basis=args.atom_basis)
+    elif args.arm == "hybrid_rust":
+        ev, ev_flat = fit_hybrid_rust(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
+                                      curved_K=args.curved_atoms, curved_k=args.curved_k,
+                                      d=args.d_atom, topology=args.atom_topology,
+                                      max_epochs=args.max_epochs,
+                                      curved_rows=args.curved_rows, seed=args.seed)
+        extra["ev_flat_tier"] = ev_flat
     elif args.arm == "pca_bar":
         extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
         ev = extra[f"pca_ev_r{args.top_k}"] if f"pca_ev_r{args.top_k}" in extra else extra["pca_ev_r32"]
