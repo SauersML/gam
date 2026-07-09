@@ -57,7 +57,7 @@ def sae_checkpoint_dynamics(
         ``{"trajectories": [ {"atom_name", "descriptive_step_changes": [...],
         "transports": [...]} ]}``. Each entry in ``descriptive_step_changes`` is
         one consecutive-checkpoint step with ``checkpoint_from``,
-        ``checkpoint_to``, ``latent_coordinate`` (the most-moved grid point),
+        ``checkpoint_to``, ``latent_coordinate`` (the central grid node),
         ``displacement_at_mode`` (the ambient displacement vector there),
         ``l2_at_mode``, ``grid_rms_l2``, and ``grid_max_l2``. These are plain
         measured decoder changes: NO e-values, NO debiased contrasts, and NO
