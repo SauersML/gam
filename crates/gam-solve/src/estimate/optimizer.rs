@@ -3228,6 +3228,7 @@ where
         coefficient_influence,
         weighted_gram,
         bias_correction_beta,
+        bias_correction_jacobian,
     });
 
     let pirls_status = pirls_res.status;

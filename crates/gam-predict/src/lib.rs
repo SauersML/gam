@@ -297,6 +297,16 @@ pub trait UncertaintyCovarianceSource {
     fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
         None
     }
+    /// Optional first-order bias-correction Jacobian `A = I + H⁻¹ S(λ̂)`. When the
+    /// predictor centre is bias-corrected (`resolved_bias_correction_beta` shifts
+    /// it to `β_BC = A·β̂`), the matching CONDITIONAL covariance is `A·V·Aᵀ`, not
+    /// the raw `Vb` the conditional backend reports. The smoothing-corrected
+    /// covariance already folds `A` in, so callers apply this ONLY on the
+    /// conditional path (`covariance_corrected_used == false`). `None` ⇒ no
+    /// adjustment (raw `Array2` sources, or `A` unavailable) — a safe no-op.
+    fn resolved_bias_correction_jacobian(&self) -> Option<ArrayView2<'_, f64>> {
+        None
+    }
     /// Gaussian residual standard deviation used to widen observation
     /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
     /// report `0.0`, which collapses the observation interval to the mean
@@ -337,6 +347,9 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     }
     fn resolved_bias_correction_beta(&self) -> Option<ArrayView1<'_, f64>> {
         UnifiedFitResult::bias_correction_beta(self).map(|b| b.view())
+    }
+    fn resolved_bias_correction_jacobian(&self) -> Option<ArrayView2<'_, f64>> {
+        UnifiedFitResult::bias_correction_jacobian(self).map(|a| a.view())
     }
     fn observation_standard_deviation(&self) -> f64 {
         self.standard_deviation
@@ -573,9 +586,21 @@ fn quadratic_form_indexed(
 fn linear_predictorvariance_from_backend(
     x: &DesignMatrix,
     backend: &PredictionCovarianceBackend<'_>,
+    bias_jacobian: Option<ArrayView2<'_, f64>>,
 ) -> Result<Array1<f64>, EstimationError> {
+    // When the reported centre is bias-corrected (β_BC = A·β̂), the matching
+    // covariance for the CONDITIONAL band is A·V·Aᵀ, not the raw Vb the backend
+    // holds. Rather than re-wrap the (borrowed) covariance, transform the design
+    // rows: with `A = bias_jacobian`, `(x·A)` has row i equal to (Aᵀx_i)ᵀ, so
+    // `(x·A)·V·(x·A)ᵀ` per row is `x_iᵀ A V Aᵀ x_i = Var(x_iᵀ β_BC)` — the exact
+    // A·V·Aᵀ band on the raw conditional backend (#1870). `None` ⇒ raw Vb.
     let local = local_covariances_with_backend(backend, x.nrows(), 1, |rows| {
-        Ok(vec![design_row_chunk(x, rows)?])
+        let chunk = design_row_chunk(x, rows)?;
+        let chunk = match bias_jacobian {
+            Some(a) => chunk.dot(&a),
+            None => chunk,
+        };
+        Ok(vec![chunk])
     })?;
     Ok(local[0][0].mapv(|v| v.max(0.0)))
 }
@@ -1169,7 +1194,7 @@ fn eta_standard_errors_from_backend(
     x: &DesignMatrix,
     backend: &PredictionCovarianceBackend<'_>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let vars = linear_predictorvariance_from_backend(x, backend)?;
+    let vars = linear_predictorvariance_from_backend(x, backend, None)?;
     Ok(vars.mapv(|v| v.max(0.0).sqrt()))
 }
 
@@ -1717,7 +1742,11 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
         let delta = x.matrixvectormultiply(&bc_owned);
         eta += &delta;
     }
-    let etavar = linear_predictorvariance_from_backend(&x, backend)?;
+    // The posterior-mean path reports the UNCORRECTED centre η̂ = Xβ̂ (its
+    // production callers pass `bias_correction_beta = None`; #1602/#398/#1536),
+    // so the raw conditional Vb band is already self-consistent — no A·V·Aᵀ
+    // adjustment is applicable here.
+    let etavar = linear_predictorvariance_from_backend(&x, backend, None)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
     let quadctx = gam::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
@@ -2408,6 +2437,9 @@ where
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
+    // Track whether the centre was actually shifted to β_BC: the covariance must
+    // gain the matching A·V·Aᵀ Jacobian only when it did (#1870).
+    let mut bias_applied = false;
     if options.apply_bias_correction
         && let Some(bc) = source.resolved_bias_correction_beta()
     {
@@ -2415,6 +2447,7 @@ where
             let bc_owned = bc.to_owned();
             let delta = x.matrixvectormultiply(&bc_owned);
             eta += &delta;
+            bias_applied = true;
         } else {
             log::warn!(
                 "predict_gamwith_uncertainty: bias-correction dimension mismatch \
@@ -2448,7 +2481,17 @@ where
     let strategy = strategy_for_spec(&likelihood);
     let mean = apply_family_inverse_link(&eta, &likelihood)?;
 
-    let etavar_raw = linear_predictorvariance_from_backend(&x, &backend)?;
+    // On the conditional path, a bias-corrected centre needs the A·V·Aᵀ band
+    // (the corrected covariance already folds A in, so exclude it via
+    // `!covariance_corrected_used` to avoid double-applying A). #1870.
+    let bias_jacobian = if bias_applied && !covariance_corrected_used {
+        source
+            .resolved_bias_correction_jacobian()
+            .filter(|a| a.nrows() == beta.len() && a.ncols() == beta.len())
+    } else {
+        None
+    };
+    let etavar_raw = linear_predictorvariance_from_backend(&x, &backend, bias_jacobian)?;
     let n_rows = etavar_raw.len();
 
     // ── Coverage corrections ────────────────────────────────────────────
