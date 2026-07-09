@@ -140,15 +140,27 @@ pub struct IsaEigenParts {
     /// direction above it is real structure, not a fluctuation. `σ̂²` is the
     /// median eigenvalue — robust while signal directions are a minority.
     pub mp_edge: f64,
-    /// Noise scale for the κ certificate: the median of the smallest-quartile
-    /// SURVIVING eigenvalues — numerically-zero directions (deflated planes,
-    /// `n ≤ p` rank deficiency) are excluded first, since those are rank
-    /// deficiencies rather than noise observations and would read σ̂² ≈ 0 in
-    /// producer rounds ≥ 2. The quartile sits where white noise provably lives
-    /// regardless of how many directions are signal. (The global median that
-    /// sets the MP edge lands in the SIGNAL bulk on a dense multi-circle
-    /// residual and would inflate the clean anchor past the blend anchor,
-    /// rejecting even a clean circle.)
+    /// Noise scale for the κ certificate: the SAME monotone MP fixed-point
+    /// estimate that sets [`Self::mp_edge`], i.e. `mp_edge / (1 + √(p/n))²`.
+    /// The certificate must read the true white-noise variance, and the fixed
+    /// point is the only estimator here robust to BOTH failure modes at once:
+    ///
+    /// * signal-majority (dense multi-circle round 0): a plain global median
+    ///   lands in the SIGNAL bulk; the fixed point iterates the edge DOWN to
+    ///   the largest prefix self-consistently below its own MP edge — the noise
+    ///   band whatever fraction of directions are signal (see the derivation on
+    ///   [`Self::mp_edge`]).
+    /// * deflation RESIDUE (producer rounds ≥ 1): accepted planes land at ~0.99
+    ///   ambient overlap, so deflating them leaves ~1% of a circle's energy in
+    ///   near-deflated directions — eigenvalues strictly BELOW the noise bulk
+    ///   (`~1e-5..1e-3` on the p=16/32 fixtures) but far above the numerical
+    ///   rank floor. The old bottom-quartile-of-surviving estimator grabbed that
+    ///   residue and read σ̂²_cert an order of magnitude too small, collapsing
+    ///   the χ²₂ active-gate floor so noise rows gated active (`q̂ → 1`), the
+    ///   noise-corrected anchors inverted, and freshly SEPARATED clean circles
+    ///   were REFUSED — the observed sparse-torus stall at 4/6. The fixed point
+    ///   is immune because the noise eigenvalues OUTNUMBER the residue, so the
+    ///   noise-band median stays in the bulk.
     pub sigma2_cert: f64,
 }
 
@@ -265,8 +277,12 @@ pub fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<IsaEigenP
     if above.is_empty() {
         return Ok(None);
     }
-    let q = (surviving.len() / 4).max(1);
-    let sigma2_cert = surviving[(q - 1) / 2];
+    // The certificate noise scale is the MP fixed-point σ̂² (`mp_edge/mp_factor`),
+    // NOT a bottom-quartile of the surviving spectrum: after a deflation the
+    // sub-bulk residue of ~0.99-overlap accepted planes contaminates the bottom
+    // quartile and reads σ̂²_cert far too small, refusing clean circles. The
+    // fixed point rides the noise bulk (which outnumbers the residue) instead.
+    let sigma2_cert = sigma2;
     Ok(Some(IsaEigenParts {
         mean,
         evals,
