@@ -819,6 +819,67 @@ fn sae_sinkhorn_balance_bias<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Residual-EM routing scores for the torch `softmax_topk` lane (issue #1282).
+/// Given the input rows `x (N, D)` and the per-atom decoded curves
+/// `per_atom_recon (N, F, D)`, solves the best scalar code against each atom's
+/// curve and scores the atom by the scale-free relative residual it leaves,
+/// returning `(code (N, F), relative_residual (N, F))`. `nonneg` selects the
+/// `target_k == 1` non-negative code convention vs. the `target_k > 1` signed
+/// one. This is the criterion math the Python gate used to compute inline; the
+/// paired VJP `sae_residual_em_score_vjp` keeps the autograd tape continuous.
+/// See `gam::terms::sae::criterion_atoms::residual_em_score`.
+#[pyfunction]
+fn sae_residual_em_score<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    per_atom_recon: PyReadonlyArray3<'py, f64>,
+    nonneg: bool,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let x_owned = x.as_array().to_owned();
+    let recon_owned = per_atom_recon.as_array().to_owned();
+    let (code, relres) = py.detach(move || {
+        gam::terms::sae::criterion_atoms::residual_em_score(
+            x_owned.view(),
+            recon_owned.view(),
+            nonneg,
+        )
+    });
+    Ok((
+        code.into_pyarray(py).unbind(),
+        relres.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Analytic backward (VJP) for `sae_residual_em_score`, w.r.t. `per_atom_recon`.
+/// Given the upstream cotangents `g_code (N, F)` and `g_relative_residual
+/// (N, F)`, returns `grad_per_atom_recon (N, F, D)`. `x` is a tape constant (the
+/// activation batch never requires grad), so no `∂/∂x` channel is produced. See
+/// `gam::terms::sae::criterion_atoms::residual_em_score_vjp`.
+#[pyfunction]
+fn sae_residual_em_score_vjp<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    per_atom_recon: PyReadonlyArray3<'py, f64>,
+    nonneg: bool,
+    g_code: PyReadonlyArray2<'py, f64>,
+    g_relative_residual: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let x_owned = x.as_array().to_owned();
+    let recon_owned = per_atom_recon.as_array().to_owned();
+    let gc_owned = g_code.as_array().to_owned();
+    let gq_owned = g_relative_residual.as_array().to_owned();
+    let grad = py.detach(move || {
+        gam::terms::sae::criterion_atoms::residual_em_score_vjp(
+            x_owned.view(),
+            recon_owned.view(),
+            nonneg,
+            gc_owned.view(),
+            gq_owned.view(),
+        )
+    });
+    Ok(grad.into_pyarray(py).unbind())
+}
+
 /// Deterministic line-clustering routing anchor for the torch `softmax_topk`
 /// lane (issue #1282). Given the `(N, D)` input rows, returns
 /// `(onehot (N, atoms), valid, confident)`: `valid` is false (with an empty
@@ -4769,6 +4830,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_residual_em_score, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;

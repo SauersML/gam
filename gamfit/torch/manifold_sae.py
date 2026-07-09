@@ -553,6 +553,70 @@ class _PositionAlignmentPenaltyFn(torch.autograd.Function):
         return grad_output * grad_enc, None
 
 
+class _ResidualEmScoreFn(torch.autograd.Function):
+    """Residual-EM routing scores through Rust (issue #1282).
+
+    Forward calls ``sae_residual_em_score`` → the single-sourced criterion kernel
+    ``gam::terms::sae::criterion_atoms::residual_em_score``: for every
+    ``(row, atom)`` it solves the best scalar code against the atom's decoded
+    curve ``per_atom_recon`` and scores the atom by the scale-free relative
+    residual, returning ``(code (N, F), relative_residual (N, F))``. ``nonneg``
+    selects the ``target_k == 1`` non-negative code vs. the ``target_k > 1``
+    signed one.
+
+    Backward calls ``sae_residual_em_score_vjp`` → the paired analytic VJP
+    ``residual_em_score_vjp``: both outputs carry reconstruction gradient into the
+    decoder (``code`` is the routed magnitude, ``relative_residual`` feeds the
+    soft EM responsibilities), so this keeps the autograd tape continuous around
+    the Rust boundary with a Rust-computed gradient (no finite differences). ``x``
+    is the activation batch — a tape constant that never requires grad — so it
+    receives no gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        per_atom_recon: torch.Tensor,
+        nonneg: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n, f = int(per_atom_recon.shape[0]), int(per_atom_recon.shape[1])
+        code_np, relres_np = rust_module().sae_residual_em_score(
+            to_numpy_f64(x),
+            to_numpy_f64(per_atom_recon),
+            bool(nonneg),
+        )
+        ctx.save_for_backward(x, per_atom_recon)
+        ctx.nonneg = bool(nonneg)
+        ctx.nf = (n, f)
+        return (
+            from_numpy_like(code_np, per_atom_recon),
+            from_numpy_like(relres_np, per_atom_recon),
+        )
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
+        g_code, g_relres = grad_outputs
+        x, per_atom_recon = ctx.saved_tensors
+        n, f = ctx.nf
+        if g_code is None:
+            g_code = torch.zeros((n, f), dtype=x.dtype, device=x.device)
+        if g_relres is None:
+            g_relres = torch.zeros((n, f), dtype=x.dtype, device=x.device)
+        grad_recon_np = rust_module().sae_residual_em_score_vjp(
+            to_numpy_f64(x),
+            to_numpy_f64(per_atom_recon),
+            bool(ctx.nonneg),
+            to_numpy_f64(g_code),
+            to_numpy_f64(g_relres),
+        )
+        grad_recon = from_numpy_like(grad_recon_np, per_atom_recon).reshape(
+            per_atom_recon.shape
+        )
+        # (x is a tape constant; nonneg is a non-tensor arg.)
+        return None, grad_recon, None
+
+
 def _decode_params_json(params_json: str) -> dict[str, Any]:
     raw = json.loads(params_json)
     out: dict[str, Any] = {}
@@ -1046,20 +1110,17 @@ class _SparsityLayer(nn.Module):
         stays differentiable and depends only on the reconstruction fit.
         """
         # Best non-negative scalar code per row/atom against that atom's curve,
-        # and the residual it leaves. The code carries the SAE magnitude and is
-        # *not* detached, so reconstruction gradients train the decoder's shape
-        # and scale directly.
-        denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
-        code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
-        code = code.clamp_min(0.0)
-        residual = ((code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2).sum(
-            dim=-1
-        )
-        # Per-row scale-free relative residual: normalize by the row energy so
-        # the annealing temperature is comparable across rows of different
-        # magnitude and tau alone controls assignment hardness.
+        # and the scale-free relative residual it leaves — the residual-EM
+        # criterion math, computed by the Rust kernel
+        # (``sae_residual_em_score`` → ``residual_em_score``) through a
+        # ``torch.autograd.Function`` so the tape stays continuous. The code
+        # carries the SAE magnitude and both outputs are *not* detached, so
+        # reconstruction gradients (Rust-computed analytic VJP) train the
+        # decoder's shape and scale directly. ``row_scale`` (the row energy the
+        # relative residual is already normalized by) is recovered here only for
+        # the code floor further down.
+        code, relative_residual = _ResidualEmScoreFn.apply(x, per_atom_recon, True)
         row_scale = x.square().sum(dim=1, keepdim=True).clamp_min(1e-12)
-        relative_residual = residual / row_scale
         tau = max(float(self.tau.item()), 1e-6)
 
         if self.target_k == 1:
@@ -1221,11 +1282,15 @@ class _SparsityLayer(nn.Module):
             # count is honored exactly as before; selection can only improve the
             # reconstruction fit). The ``target_k == 1`` path above is untouched
             # and keeps the non-negative ``code``.
-            signed_code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
-            signed_residual = (
-                (signed_code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2
-            ).sum(dim=-1)
-            signed_relative_residual = signed_residual / row_scale
+            # Signed least-squares code + relative residual from the same Rust
+            # criterion kernel (``nonneg=False``): the signed coefficient both
+            # scores and gates so the effective active-atom count tracks
+            # ``target_k`` up to a dense gate. The top-k selection is a hard
+            # value-only mask (no gradient through the selection), so the
+            # reconstruction gradient flows only through ``signed_code``.
+            signed_code, signed_relative_residual = _ResidualEmScoreFn.apply(
+                x, per_atom_recon, False
+            )
             responsibilities = self._topk_mask(-signed_relative_residual)
             return signed_code * responsibilities
 
