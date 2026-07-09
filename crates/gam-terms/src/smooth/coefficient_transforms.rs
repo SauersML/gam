@@ -100,11 +100,16 @@ pub(crate) fn convex_divided_difference_transform_matrix(
     // First-difference spans (ξ_{i+1} − ξ_i) and second-difference spans
     // (ξ_{i+2} − ξ_i). Reject degenerate (collapsed) Greville abscissae rather
     // than dividing by zero — a degenerate span means the basis cannot separate
-    // the curvature directions the cone constrains.
+    // the curvature directions the cone constrains. The degeneracy tolerance is
+    // relative to the TOTAL Greville span, not to |ξ_max|: convexity is
+    // translation invariant, and an |ξ|-anchored tolerance rejects a perfectly
+    // ordinary unit-spaced grid the moment it is translated to ~1e13.
+    let total_span = greville[p - 1] - greville[0];
+    let span_tol = 1e-12 * total_span.abs();
     let mut first_span = Array1::<f64>::zeros(p - 1);
     for i in 0..p - 1 {
         let s = greville[i + 1] - greville[i];
-        if !(s > 1e-12 * greville[p - 1].abs().max(1.0)) {
+        if !(s > span_tol) {
             crate::bail_invalid_basis!(
                 "convex/concave box reparameterization requires strictly increasing Greville abscissae; span ξ[{}]−ξ[{i}] = {s:.3e} is non-positive",
                 i + 1

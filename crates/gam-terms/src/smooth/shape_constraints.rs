@@ -61,12 +61,16 @@ pub(super) fn build_shape_constraint_grid_1d(
 
     let mut x_sorted: Vec<f64> = x.iter().copied().collect();
     x_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Tie tolerance on the covariate SPAN, not the absolute coordinates:
+    // monotonicity/convexity are translation invariant, so a unit-spaced grid
+    // must dedup identically whether it sits near 0 or near 1e13.
+    let tie_tol = 1e-12 * (x_sorted[x_sorted.len() - 1] - x_sorted[0]);
     let mut x_unique: Vec<f64> = Vec::with_capacity(x_sorted.len());
     let mut last: Option<f64> = None;
     for v in x_sorted {
         let take = match last {
             None => true,
-            Some(prev) => (v - prev).abs() > 1e-12 * prev.abs().max(v.abs()).max(1.0),
+            Some(prev) => (v - prev).abs() > tie_tol,
         };
         if take {
             x_unique.push(v);
@@ -285,8 +289,11 @@ pub(super) fn build_shape_linear_constraints_1d(
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&i, &j| x[i].partial_cmp(&x[j]).unwrap_or(std::cmp::Ordering::Equal));
 
-    let x_scale = x.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
-    let x_tol = 1e-12 * x_scale;
+    // Tie tolerance on the covariate SPAN (translation invariant): an absolute
+    // |x|-based scale inflates the tolerance for a grid merely translated far
+    // from the origin and collapses genuinely distinct unit-spaced locations.
+    let x_span = x[idx[n - 1]] - x[idx[0]];
+    let x_tol = 1e-12 * x_span;
     let mut collapsedrows: Vec<Array1<f64>> = Vec::new();
     let mut group_sum = Array1::<f64>::zeros(p);
     let mut group_count = 0usize;
@@ -322,7 +329,8 @@ pub(super) fn build_shape_linear_constraints_1d(
     }
 
     let q_raw = m - order;
-    let mut arows: Vec<Array1<f64>> = Vec::with_capacity(q_raw);
+    let mut candidates: Vec<(Array1<f64>, f64)> = Vec::with_capacity(q_raw);
+    let mut max_norm = 0.0_f64;
     for i in 0..q_raw {
         let row = if order == 1 {
             &collapsedrows[i + 1] - &collapsedrows[i]
@@ -334,10 +342,17 @@ pub(super) fn build_shape_linear_constraints_1d(
             row_signed.mapv_inplace(|v| -v);
         }
         let norm = row_signed.dot(&row_signed).sqrt();
-        if norm > 1e-12 {
-            arows.push(row_signed);
-        }
+        max_norm = max_norm.max(norm);
+        candidates.push((row_signed, norm));
     }
+    // Drop numerically-null difference rows RELATIVE to the largest row: an
+    // absolute 1e-12 cutoff silently deletes every constraint of a design that
+    // is merely expressed in small units, which is not a geometric property.
+    let arows: Vec<Array1<f64>> = candidates
+        .into_iter()
+        .filter(|(_, norm)| *norm > 1e-12 * max_norm)
+        .map(|(row, _)| row)
+        .collect();
     if arows.is_empty() {
         return Ok(None);
     }
