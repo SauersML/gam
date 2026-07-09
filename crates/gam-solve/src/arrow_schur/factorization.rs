@@ -677,6 +677,35 @@ pub fn row_sub_floor_null_directions(htt: ArrayView2<'_, f64>) -> Vec<Array1<f64
             dirs.push(evecs.column(eig_idx).to_owned());
         }
     }
+    // Knife-edge fallback — mirror `factor_spectral_deflated_evidence_row`'s
+    // `deflated_count == 0` branch so the STEP freezes EXACTLY the direction the
+    // EVIDENCE log-det deflates in the barely-non-PD case, by construction. When
+    // the hysteresis band kept every eigenvalue (nothing strictly sub-floor) YET
+    // the raw block's ridge-0 Cholesky still REFUSES, the block is non-PD at the
+    // band's ε margin: the evidence routine (reached from `factor_one_row_result`
+    // only on that same refused ridge-0 Cholesky) deflates the single
+    // smallest-eigenvalue direction to unit stiffness, so the step must freeze
+    // that same direction. The trigger is deliberately the Cholesky REFUSAL, read
+    // on the raw block's lower triangle exactly as `factor_row_block_cholesky`
+    // does — NOT a high-κ-but-PD block whose Cholesky SUCCEEDS. The evidence
+    // path's separate Ok-arm κ-deflation (it also force-deflates a PD-but-ill-
+    // conditioned block for log-det finiteness) is intentionally NOT mirrored: a
+    // non-null ill-conditioned block is genuinely full-rank and its weak but
+    // data-supported direction must stay with the LM ridge damping, not be frozen
+    // (the step's non-null-ill-conditioning guardrail). So the two lists are
+    // identical wherever the block is non-PD, and differ only where the block is
+    // PD — where the step must not freeze anyway.
+    if dirs.is_empty() && cholesky_lower(&htt.to_owned()).is_err() {
+        let mut min_idx = 0usize;
+        let mut min_lambda = f64::INFINITY;
+        for eig_idx in 0..evals.len() {
+            if evals[eig_idx] < min_lambda {
+                min_lambda = evals[eig_idx];
+                min_idx = eig_idx;
+            }
+        }
+        dirs.push(evecs.column(min_idx).to_owned());
+    }
     dirs
 }
 
