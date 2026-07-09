@@ -2625,6 +2625,16 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         need_hessian: bool,
+        // Per-row coefficient scratch, owned by the caller and reused across rows
+        // (`compute_row_analytic_flex_from_parts_into` sizes these to `r` on its
+        // `BernoulliMarginalSlopeFlexRowScratch`). Threading them in keeps the
+        // empirical-grid Hessian path allocation-free per row; `zero_family` is the
+        // immutable all-zero filler for the absent higher-order coefficient
+        // families and is never written here.
+        coeff_u: &mut [[f64; 4]],
+        coeff_au: &mut [[f64; 4]],
+        coeff_bu: &mut [[f64; 4]],
+        zero_family: &[[f64; 4]],
         f_u: &mut Array1<f64>,
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
@@ -2635,10 +2645,6 @@ impl BernoulliMarginalSlopeFamily {
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
-        let zero_family = vec![[0.0f64; 4]; r];
-        let mut coeff_u = vec![[0.0f64; 4]; r];
-        let mut coeff_au = vec![[0.0f64; 4]; r];
-        let mut coeff_bu = vec![[0.0f64; 4]; r];
         let mut f_aa = 0.0f64;
         use super::exact_kernel as exact;
 
@@ -2762,16 +2768,16 @@ impl BernoulliMarginalSlopeFamily {
                     1,
                     h_range,
                     w_range,
-                    coeff_u.as_slice(),
-                    coeff_au.as_slice(),
-                    coeff_bu.as_slice(),
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
-                    &zero_family,
+                    &*coeff_u,
+                    &*coeff_au,
+                    &*coeff_bu,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
+                    zero_family,
                 );
                 for u in 1..r {
                     for v in u..r {
@@ -2870,6 +2876,10 @@ impl BernoulliMarginalSlopeFamily {
                 beta_h,
                 beta_w,
                 need_hessian,
+                coeff_u.as_mut_slice(),
+                coeff_au.as_mut_slice(),
+                coeff_bu.as_mut_slice(),
+                zero_family,
                 f_u,
                 f_au,
                 f_uv,
