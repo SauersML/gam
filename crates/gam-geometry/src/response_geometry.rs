@@ -21,7 +21,11 @@
 //! [`RiemannianManifold::metric_tensor`], so adding a curved response geometry
 //! is a single resolver arm.
 
+use gam_optimize::{
+    BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search, constants,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use std::convert::Infallible;
 
 use crate::manifold::{
     GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
@@ -745,9 +749,6 @@ pub fn response_frechet_mean(
 
     const STALL_REL: f64 = 5.0e-3;
     const STALL_PATIENCE: usize = 10;
-    const ARMIJO_C1: f64 = 1.0e-4;
-    const MAX_BACKTRACK_HALVINGS: usize = 60;
-    const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
     // Cap on how many admissible interior starts we descend from before giving
     // up on finding a strictly better basin. Only reached on a positively
     // curved manifold whose data spread makes the mean weakly identified; a
@@ -821,40 +822,36 @@ pub fn response_frechet_mean(
                 }
             }
 
-            // Armijo-backtracked unit Karcher step exp_p(t·ξ).
+            // Armijo-backtracked unit Karcher step exp_p(t·ξ). A step that
+            // leaves the manifold's domain (e.g. a Poincaré overshoot past the
+            // ball boundary) or lands where the dispersion is undefined is an
+            // INVALID trial (`Ok(None)`): shrink and retry without consulting
+            // the Armijo test — unlike `spd_frechet_mean`, this generic driver
+            // never aborts the descent on a trial-evaluation error.
             let pred = grad_norm * grad_norm;
-            let f_tol = ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + f_cur.abs());
-            let mut t = 1.0_f64;
-            let mut accepted = false;
-            for _ in 0..MAX_BACKTRACK_HALVINGS {
-                let step = &xi * t;
-                let cand = match manifold.exp_point(p.view(), step.view()) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        // The step left the manifold's domain (e.g. a Poincaré
-                        // overshoot past the ball boundary); shrink and retry.
-                        t *= 0.5;
-                        continue;
-                    }
-                };
-                let f_cand = match dispersion(cand.view()) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        t *= 0.5;
-                        continue;
-                    }
-                };
-                if f_cand <= f_cur - 2.0 * ARMIJO_C1 * t * pred + f_tol {
-                    p = cand;
-                    f_cur = f_cand;
-                    accepted = true;
-                    break;
-                }
-                t *= 0.5;
-            }
-            if !accepted {
+            let f_tol = armijo_roundoff_cushion(f_cur);
+            let accepted = match backtracking_line_search::<_, Infallible>(
+                BacktrackConfig::default(),
+                |t| {
+                    let step = &xi * t;
+                    let Ok(cand) = manifold.exp_point(p.view(), step.view()) else {
+                        return Ok(None);
+                    };
+                    let Ok(f_cand) = dispersion(cand.view()) else {
+                        return Ok(None);
+                    };
+                    Ok(Some((f_cand, cand)))
+                },
+                |t, f_cand| f_cand <= f_cur - 2.0 * constants::ARMIJO_C1 * t * pred + f_tol,
+            ) {
+                Ok(result) => result,
+                Err(never) => match never {},
+            };
+            let Some(accepted_step) = accepted else {
                 break;
-            }
+            };
+            p = accepted_step.payload;
+            f_cur = accepted_step.value;
         }
         (best_p, best_grad, best_disp)
     };

@@ -13,12 +13,12 @@
 
 use ndarray::Array1;
 use opt::{
-    Bfgs, BfgsError, Bounds, FirstOrderSample, FusedObjective, GradientTolerance,
-    InitialMetric, MaxIterations, ObjectiveEvalError, Profile,
+    Bfgs, BfgsError, Bounds, FirstOrderSample, FusedObjective, GradientTolerance, InitialMetric,
+    MaxIterations, ObjectiveEvalError, Profile,
 };
 
-use gam_gpu::policy::RemlOuterAdmission;
 use crate::estimate::EstimationError;
+use gam_gpu::policy::RemlOuterAdmission;
 
 /// Input bundle handed to [`run_reml_outer_on_device`] by the host
 /// outer-strategy dispatch site. Everything needed to seed the device-resident
