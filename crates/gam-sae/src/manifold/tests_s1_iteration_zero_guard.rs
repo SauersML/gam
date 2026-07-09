@@ -83,9 +83,22 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
     let ev = term
         .dictionary_reconstruction_ev(target.view(), &rho)
         .expect("EV evaluates");
+    let fitted = term
+        .try_fitted_for_rho(&rho)
+        .expect("fitted reconstruction evaluates");
     let out_ratio = term
-        .dictionary_reconstruction_output_energy_ratio_maybe(target.view(), &rho, None)
+        .dictionary_reconstruction_output_energy_ratio_from_fitted(&fitted, target.view(), None)
         .expect("output-energy ratio evaluates");
+    // Reconstruction-cache parity: deriving EV from the SHARED `fitted` matrix
+    // (the guard's dedup path) must be bit-for-bit the independent recompute via
+    // `dictionary_reconstruction_ev` (fresh `try_fitted_for_rho` + subtract).
+    let ev_shared = term
+        .dictionary_reconstruction_ev_from_fitted(&fitted, target.view(), None)
+        .expect("EV from shared fitted evaluates");
+    assert_eq!(
+        ev_shared, ev,
+        "shared-fitted EV must equal the independent try_fitted recompute"
+    );
     let q = crate::manifold::outer_objective::reachable_dictionary_rank(
         &term.atoms,
         term.n_obs(),

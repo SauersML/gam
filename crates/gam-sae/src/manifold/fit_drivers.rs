@@ -61,7 +61,7 @@ fn axis_coordinate_spread(coords: ArrayView2<'_, f64>, axis: usize, period: Opti
 /// total centered sum-of-squares are invariants of the whole joint fit. The
 /// guard formerly re-derived them from the full `n × p` target on EVERY accepted
 /// outer iteration ([`SaeManifoldTerm::dictionary_reconstruction_ev`] +
-/// [`SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio_maybe`] each ran an
+/// [`SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio_from_fitted`] each ran an
 /// `O(n·p)` column-major reduction), which the single-threaded inner-loop profile
 /// showed dominating the fit. Computing them ONCE per joint fit and handing them
 /// to each iteration's guard call removes that per-iteration cost.
@@ -2960,70 +2960,25 @@ impl SaeManifoldTerm {
 
     /// S1 (guard surgery) — fraction of the centered target variance carried by the
     /// dictionary's OWN reconstruction OUTPUT: `Σ (fitted − mean)² / Σ (target −
-    /// mean)²`. A dictionary whose decoders have co-vanished reconstructs ≈ the
-    /// column mean, so this ratio falls to the null fitting-noise level; a fit that
-    /// merely reconstructs poorly but whose decoders carry real signal keeps output
-    /// energy of ordinary magnitude. Paired with [`Self::dictionary_reconstruction_ev`],
+    /// mean)²`, computed against an ALREADY-COMPUTED `fitted` reconstruction (the
+    /// decoder-norm guard's shared `try_fitted_for_rho`, so the EV and output-energy
+    /// tests share one `(N, p)` reconstruction instead of recomputing it twice).
+    ///
+    /// A dictionary whose decoders have co-vanished reconstructs ≈ the column mean,
+    /// so this ratio falls to the null fitting-noise level; a fit that merely
+    /// reconstructs poorly but whose decoders carry real signal keeps output energy
+    /// of ordinary magnitude. Paired with [`Self::dictionary_reconstruction_ev`],
     /// this is the "decoder output co-vanished" half of the absolute-degeneracy
     /// co-collapse verdict in [`Self::enforce_decoder_norm_guard`]: a genuine
     /// co-collapse has BOTH ~zero EV AND ~zero output energy, distinguishing it from
     /// a present-decoder fit that simply reconstructs poorly (the optimizer's job).
     /// Returns `0.0` for a constant (zero-variance) target, where the notion is
-    /// vacuous. Column means use the same running update as `dictionary_reconstruction_ev`.
+    /// vacuous.
     ///
-    /// Pass `precomputed = None` for the standalone reduction (the historical
-    /// inline form the S1 guard tests exercise) or `Some(stats)` inside the fit
-    /// loop to reuse the once-per-fit target statistics.
-    ///
-    /// `precomputed = Some(stats)` reuses the
-    /// once-per-fit per-column means and centered total-sum-of-squares (`None`
-    /// reproduces the historical inline reduction bit-for-bit). Only the OUTPUT
-    /// energy `Σ (fitted − mean)²` — which depends on the CURRENT dictionary — is
-    /// recomputed per call; the column means and target variance are fit
-    /// invariants. The output-energy accumulation keeps the historical
+    /// `precomputed = Some(stats)` reuses the once-per-fit per-column means and
+    /// centered total-sum-of-squares (`None` reproduces the historical inline
+    /// reduction bit-for-bit). The output-energy accumulation keeps the historical
     /// single-accumulator column-major order.
-    pub(crate) fn dictionary_reconstruction_output_energy_ratio_maybe(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        precomputed: Option<&TargetCenteredColStats>,
-    ) -> Result<f64, String> {
-        let fitted = self.try_fitted_for_rho(rho)?;
-        if fitted.dim() != target.dim() {
-            return Err(format!(
-                "SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio: fitted {:?} \
-                 != target {:?}",
-                fitted.dim(),
-                target.dim()
-            ));
-        }
-        let n = target.nrows();
-        let owned;
-        let stats = match precomputed {
-            Some(stats) => stats,
-            None => {
-                owned = TargetCenteredColStats::compute(target);
-                &owned
-            }
-        };
-        let mut ss_out = 0.0_f64;
-        for col in 0..target.ncols() {
-            let mean = stats.col_means[col];
-            for row in 0..n {
-                let out = fitted[[row, col]] - mean;
-                ss_out += out * out;
-            }
-        }
-        if !(stats.ss_tot > 0.0) {
-            return Ok(0.0);
-        }
-        Ok(ss_out / stats.ss_tot)
-    }
-
-    /// [`Self::dictionary_reconstruction_output_energy_ratio_maybe`] against an
-    /// ALREADY-COMPUTED fitted reconstruction (the decoder-norm guard's shared
-    /// `try_fitted_for_rho`). The accumulation order is identical to the `_maybe`
-    /// path, so the returned ratio is bit-for-bit the same.
     pub(crate) fn dictionary_reconstruction_output_energy_ratio_from_fitted(
         &self,
         fitted: &Array2<f64>,

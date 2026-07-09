@@ -2459,3 +2459,108 @@ impl SaeBasisThirdJet for AnchorIndicatorEvaluator {
         Ok(Array5::<f64>::zeros((n, self.anchors, 1, 1, 1)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array2, Array3};
+
+    /// The in-place `evaluate_into` must reproduce `evaluate` EXACTLY, even when
+    /// the target workspace arrives pre-loaded with garbage — the hot Newton loop
+    /// reuses one buffer across trials, so any entry the in-place path forgets to
+    /// (re)write would carry a stale value forward. Prefilling with a sentinel and
+    /// asserting bit-equality against a fresh `evaluate` pins that.
+    fn assert_into_matches_evaluate(eval: &dyn SaeBasisEvaluator, coords: &Array2<f64>) {
+        let (phi_ref, jet_ref) = eval.evaluate(coords.view()).expect("evaluate");
+        let mut phi = Array2::<f64>::from_elem(phi_ref.dim(), 999.0);
+        let mut jet = Array3::<f64>::from_elem(jet_ref.dim(), 999.0);
+        eval.evaluate_into(&mut phi, &mut jet, coords.view())
+            .expect("evaluate_into");
+        assert_eq!(phi, phi_ref, "evaluate_into Φ must equal evaluate Φ exactly");
+        assert_eq!(
+            jet, jet_ref,
+            "evaluate_into jet must equal evaluate jet exactly"
+        );
+    }
+
+    /// Reusing ONE workspace across two different coordinate sets (the line-search
+    /// cadence) must leave no contamination: the second fill must match a fresh
+    /// `evaluate` on the second coordinates.
+    fn assert_workspace_reuse(
+        eval: &dyn SaeBasisEvaluator,
+        coords_a: &Array2<f64>,
+        coords_b: &Array2<f64>,
+    ) {
+        let (phi_a, jet_a) = eval.evaluate(coords_a.view()).expect("evaluate a");
+        let mut phi = Array2::<f64>::zeros(phi_a.dim());
+        let mut jet = Array3::<f64>::zeros(jet_a.dim());
+        eval.evaluate_into(&mut phi, &mut jet, coords_a.view())
+            .expect("into a");
+        assert_eq!(phi, phi_a);
+        assert_eq!(jet, jet_a);
+        let (phi_b_ref, jet_b_ref) = eval.evaluate(coords_b.view()).expect("evaluate b");
+        eval.evaluate_into(&mut phi, &mut jet, coords_b.view())
+            .expect("into b (reused workspace)");
+        assert_eq!(phi, phi_b_ref, "reused workspace Φ must not carry stale data");
+        assert_eq!(
+            jet, jet_b_ref,
+            "reused workspace jet must not carry stale data"
+        );
+    }
+
+    #[test]
+    fn periodic_harmonic_evaluate_into_matches() {
+        let eval = PeriodicHarmonicEvaluator::new(5).unwrap();
+        let coords_a = Array2::from_shape_vec((4, 1), vec![0.10, 0.35, 0.60, 0.85]).unwrap();
+        let coords_b = Array2::from_shape_vec((4, 1), vec![0.20, 0.45, 0.70, 0.05]).unwrap();
+        assert_into_matches_evaluate(&eval, &coords_a);
+        assert_workspace_reuse(&eval, &coords_a, &coords_b);
+    }
+
+    #[test]
+    fn euclidean_patch_evaluate_into_matches() {
+        let eval = EuclideanPatchEvaluator::new(2, 2).unwrap();
+        let coords_a =
+            Array2::from_shape_vec((4, 2), vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8]).unwrap();
+        let coords_b =
+            Array2::from_shape_vec((4, 2), vec![-0.3, 0.9, 0.2, -0.1, 0.5, 0.5, -0.7, 0.3]).unwrap();
+        assert_into_matches_evaluate(&eval, &coords_a);
+        assert_workspace_reuse(&eval, &coords_a, &coords_b);
+    }
+
+    #[test]
+    fn torus_harmonic_evaluate_into_matches() {
+        let eval = TorusHarmonicEvaluator::new(2, 2).unwrap();
+        let coords_a =
+            Array2::from_shape_vec((4, 2), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap();
+        let coords_b =
+            Array2::from_shape_vec((4, 2), vec![0.9, 0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65])
+                .unwrap();
+        assert_into_matches_evaluate(&eval, &coords_a);
+        assert_workspace_reuse(&eval, &coords_a, &coords_b);
+    }
+
+    #[test]
+    fn default_evaluate_into_matches_for_unspecialized_evaluator() {
+        // SphereChartEvaluator does not override `evaluate_into`, so this pins the
+        // allocate-and-copy DEFAULT trait method against `evaluate`.
+        let eval = SphereChartEvaluator;
+        let coords_a =
+            Array2::from_shape_vec((3, 2), vec![0.2, 0.5, -0.4, 1.1, 0.9, -0.7]).unwrap();
+        let coords_b =
+            Array2::from_shape_vec((3, 2), vec![-0.1, 0.3, 0.6, -0.9, -0.5, 0.8]).unwrap();
+        assert_into_matches_evaluate(&eval, &coords_a);
+        assert_workspace_reuse(&eval, &coords_a, &coords_b);
+    }
+
+    #[test]
+    fn evaluate_into_rejects_mismatched_buffer() {
+        let eval = PeriodicHarmonicEvaluator::new(5).unwrap();
+        let coords = Array2::from_shape_vec((4, 1), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+        // Wrong Φ width (4 columns instead of 5) must be rejected, not silently
+        // written past — the shape guard `refresh_basis` relied on.
+        let mut phi = Array2::<f64>::zeros((4, 4));
+        let mut jet = Array3::<f64>::zeros((4, 5, 1));
+        assert!(eval.evaluate_into(&mut phi, &mut jet, coords.view()).is_err());
+    }
+}
