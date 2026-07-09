@@ -5581,6 +5581,125 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
     );
 }
 
+/// #1017 resident-context parity: [`ReducedSchurOperator`] on the CPU lane
+/// (`gpu_matvec == None`) must be BIT-IDENTICAL to the inline `schur_matvec`
+/// closure it replaces across the rational-logdet / SLQ ladder. The whole point
+/// of the widened-lifetime operator is that staging it once and reusing it across
+/// every shifted solve cannot move a single ULP versus the per-solve-closure form.
+#[test]
+fn reduced_schur_operator_cpu_lane_is_bit_identical_to_schur_matvec() {
+    let (n, d, k) = (32usize, 3usize, 64usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    // The CPU operator: no device matvec attached, so every apply routes through
+    // `schur_matvec` with the shared (here `None`) residency.
+    let op = ReducedSchurOperator::new(&sys, &htt_factors, ridge_beta, &backend, None);
+
+    // Several deterministic Rademacher probes — the operator's `apply` /
+    // `apply_owned` must reproduce a direct `schur_matvec` call byte-for-byte.
+    let mut state = 0x1017_0FEE_C0DE_u64;
+    for _ in 0..5 {
+        let v = Array1::<f64>::from_shape_fn(k, |_| {
+            if gam_linalg::utils::splitmix64(&mut state) & 1 == 1 {
+                1.0
+            } else {
+                -1.0
+            }
+        });
+        let mut expected = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &v, &mut expected, &backend, None);
+
+        let got_view = op.apply(v.view());
+        assert_eq!(
+            got_view, expected,
+            "ReducedSchurOperator::apply must be bit-identical to schur_matvec"
+        );
+        let got_owned = op.apply_owned(&v);
+        assert_eq!(
+            got_owned, expected,
+            "ReducedSchurOperator::apply_owned must be bit-identical to schur_matvec"
+        );
+    }
+}
+
+/// #1017 resident-context lifecycle: a device operator attached via
+/// [`ReducedSchurOperator::with_gpu_matvec`] is staged ONCE and every shifted
+/// solve of a ladder reuses it — the "upload once per criterion evaluation"
+/// contract, verified with a mock [`GpuSchurMatvec`] that counts its applies. The
+/// operator must (a) route ALL applies to the single attached device matvec
+/// (never fall back to the CPU `schur_matvec`), and (b) never rebuild it per
+/// apply — the call count equals the number of ladder applies exactly.
+#[test]
+fn reduced_schur_operator_device_matvec_is_uploaded_once_and_reused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (n, d, k) = (8usize, 2usize, 16usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    // Mock device operator: an identity apply `out = x` that counts every call.
+    // Building the Arc ONCE models the "upload once"; the counter proves reuse.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_c = Arc::clone(&calls);
+    let gpu: GpuSchurMatvec = Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
+        calls_c.fetch_add(1, Ordering::Relaxed);
+        out.assign(x);
+    });
+
+    // Attach the resident device operator to a single operator instance.
+    let op = ReducedSchurOperator::new(&sys, &htt_factors, ridge_beta, &backend, None)
+        .with_gpu_matvec(Some(&gpu));
+
+    // A ladder of applies (mimicking the shift ladder's repeated matvecs). Each
+    // must be served by the attached device operator, not the CPU path: the
+    // identity output proves the device lane was taken (a real `schur_matvec` on
+    // this SPD system would NOT return the input unchanged).
+    const APPLIES: usize = 11;
+    for i in 0..APPLIES {
+        let v = Array1::<f64>::from_elem(k, (i as f64) + 1.0);
+        let got = op.apply(v.view());
+        assert_eq!(
+            got, v,
+            "the attached device matvec (identity) must serve every apply"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        APPLIES,
+        "the resident device operator must be reused across every ladder apply \
+         (uploaded once, not rebuilt per solve)"
+    );
+
+    // With NO device operator the SAME operator config falls back to the CPU
+    // `schur_matvec` — the byte-identical default lane.
+    let cpu_op = ReducedSchurOperator::new(&sys, &htt_factors, ridge_beta, &backend, None);
+    let probe = Array1::<f64>::from_elem(k, 1.0);
+    let mut expected = Array1::<f64>::zeros(k);
+    schur_matvec(&sys, &htt_factors, ridge_beta, &probe, &mut expected, &backend, None);
+    assert_eq!(
+        cpu_op.apply(probe.view()),
+        expected,
+        "gpu_matvec=None must route to schur_matvec (byte-identical CPU fallback)"
+    );
+    // And the device apply-count is untouched by the CPU-lane operator.
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        APPLIES,
+        "the CPU-lane operator must not touch the device matvec"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Co-visibility cluster preconditioner (Kushal & Agarwal visibility-based
 // preconditioning). At real over-complete SAE widths the co-firing graph is a
