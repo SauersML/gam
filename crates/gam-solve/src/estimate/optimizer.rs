@@ -899,7 +899,7 @@ where
                 // search; `(lo, hi)` already widens `hi` to `RHO_BOUND` so a
                 // genuinely large `λ_j` is not clipped to the seed band. The seed is
                 // order-independent, so no canonical permutation is needed.
-                // Two principled, data-derived candidates are scored against the
+                // Three principled, data-derived candidates are scored against the
                 // anchor, each adopted only when it STRICTLY lowers the true
                 // REML/LAML cost — exactly the criterion the old grid used, but
                 // scoring a handful of hand-derived candidates instead of a
@@ -944,6 +944,26 @@ where
                         }
                         seed
                     });
+                //   3. The GLOBAL single-λ (diagonal) closed-form optimum on the
+                //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
+                //      ρ. The per-block cyclic solver (candidate 2) descends one
+                //      coordinate at a time and can PARK at a coordinate-wise
+                //      stationary interior point that is not the joint optimum —
+                //      on the double-penalty null-recovery fixture the joint REML
+                //      rails both blocks onto the collapse shelf, but cyclic
+                //      descent stalls at an inferior split (#1815/#1867). The
+                //      diagonal restriction is solved by grid-free stationary
+                //      enumeration (no coordinate stall), so it supplies that
+                //      shelf corner as a scored candidate.
+                let summed_diagonal = reml_state
+                    .analytic_gaussian_summed_diagonal_rho((lo, hi))
+                    .map(|rho_blocks| {
+                        let mut seed = base.clone();
+                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
+                            *coord = r.clamp(lo, hi);
+                        }
+                        seed
+                    });
                 let base_cost = reml_state
                     .compute_cost(&base)
                     .ok()
@@ -951,7 +971,7 @@ where
                 // Keep the strictly-cheapest of {anchor, initial.sp, closed-form}.
                 let mut refined = base.clone();
                 let mut best_cost = base_cost;
-                for candidate in [initial_sp, closed_form].into_iter().flatten() {
+                for candidate in [initial_sp, closed_form, summed_diagonal].into_iter().flatten() {
                     let candidate_cost = reml_state
                         .compute_cost(&candidate)
                         .ok()
