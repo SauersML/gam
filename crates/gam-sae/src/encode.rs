@@ -1304,6 +1304,11 @@ pub(crate) fn beta_eta_newton(
     // `eigh(Side::Lower)` (which uses the lower triangle) exactly.
     let d = h.nrows();
     if d == 1 {
+        // A 1-D chart has no identifiable subspace ALONGSIDE a null to deflate:
+        // its single direction is either the (positive-curvature) certifiable
+        // coordinate or it is not, so the ridge-0 gate is exactly right here and
+        // the #1095/#2228 rank-1 radial-null deflation (which needs `d ≥ 2`, a
+        // kept direction beside the null) does not apply.
         let h00 = h[[0, 0]];
         if !(h00.is_finite() && h00 > 0.0) {
             return Ok(None);
@@ -1320,46 +1325,133 @@ pub(crate) fn beta_eta_newton(
         let c = h[[1, 1]];
         let tr = a + c;
         let det = a * c - b * b;
-        // λ_min = ½(tr − √((a−c)² + 4b²)); ≥ 0 ⇒ H PSD, > 0 ⇒ PD.
+        // λ_min = ½(tr − √((a−c)² + 4b²)), λ_max = ½(tr + √…); ≥ 0 ⇒ PSD.
         let disc = ((a - c) * (a - c) + 4.0 * b * b).max(0.0).sqrt();
         let lambda_min = 0.5 * (tr - disc);
-        if !(lambda_min.is_finite() && lambda_min > 0.0) {
+        let lambda_max = 0.5 * (tr + disc);
+        let max_abs = lambda_min.abs().max(lambda_max.abs());
+        if !(lambda_min.is_finite() && lambda_max.is_finite() && max_abs > 0.0) {
             return Ok(None);
         }
-        // δ = −H⁻¹g with H⁻¹ = [[c, −b], [−b, a]] / det (det = λ_min·λ_max > 0).
-        let inv_det = 1.0 / det;
-        let g0 = g[0];
-        let g1 = g[1];
-        let d0 = -(c * g0 - b * g1) * inv_det;
-        let d1 = -(a * g1 - b * g0) * inv_det;
-        if !(d0.is_finite() && d1.is_finite()) {
-            return Ok(None);
+        let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
+        // Healthy PD block — smallest eigenvalue clears the spectral null band —
+        // keeps the closed-form fast path bit-for-bit (no eigenvector solve on the
+        // encode hot loop). A genuinely negative or near-null block falls through
+        // to the deflation path, which needs the eigenvectors.
+        if lambda_min > floor {
+            // δ = −H⁻¹g with H⁻¹ = [[c, −b], [−b, a]] / det (det = λ_min·λ_max > 0).
+            let inv_det = 1.0 / det;
+            let g0 = g[0];
+            let g1 = g[1];
+            let d0 = -(c * g0 - b * g1) * inv_det;
+            let d1 = -(a * g1 - b * g0) * inv_det;
+            if !(d0.is_finite() && d1.is_finite()) {
+                return Ok(None);
+            }
+            let mut delta = Array1::<f64>::zeros(2);
+            delta[0] = d0;
+            delta[1] = d1;
+            let eta = (d0 * d0 + d1 * d1).sqrt();
+            return Ok(Some((1.0 / lambda_min, eta, delta)));
         }
-        let mut delta = Array1::<f64>::zeros(2);
-        delta[0] = d0;
-        delta[1] = d1;
-        let eta = (d0 * d0 + d1 * d1).sqrt();
-        return Ok(Some((1.0 / lambda_min, eta, delta)));
+        return beta_eta_newton_spectral_deflated(h, g);
     }
-    let (vals, vecs) = h
+    // General `d ≥ 3` block: spectral path with the same #1095/#2228 unit-stiffness
+    // deflation of a rank-deficient chart's radial null.
+    beta_eta_newton_spectral_deflated(h, g)
+}
+
+/// [`beta_eta_newton`] on the eigen-spectrum with the #1095/#2228 unit-stiffness
+/// deflation of a rank-deficient chart's radial null.
+///
+/// On an over-parametrized chart (e.g. `d_atom = 2` on intrinsic-1-D circle data)
+/// every per-row encode Hessian carries a rank-1 radial NULL: `λ_min ≈ 0`, so the
+/// ridge-0 gate `λ_min > 0` rejects a perfectly good fit and the amortized encoder
+/// silently falls back to the exact multi-start solve for that whole chart. This
+/// is the encode twin of the evidence-side
+/// [`gam_solve::arrow_schur`] `factor_spectral_deflated_evidence_row`, and it uses
+/// the IDENTICAL relative spectral floor: a direction whose eigenvalue sits in the
+/// numerical null band `|λ| ≤ floor·max|λ|` is stiffened to UNIT curvature
+/// (`λ̃ = 1`, the ρ-independent `log 1 = 0` quotient pseudo-determinant
+/// convention). The Kantorovich quantities are then measured on the deflated
+/// operator `H̃`, which is exactly the operator the returned Newton step
+/// `δ = −H̃⁻¹g` iterates — so the certificate guarantees convergence of the SAME
+/// (null-frozen) iteration the caller runs, on the identifiable (angular)
+/// complement. On a genuine null the gradient has no null-direction component
+/// (`vᵀg ≈ 0`), so `δ` picks up no motion along the deflated direction and the
+/// reconstruction is unchanged to floor precision.
+///
+/// UNLIKE the evidence factor, a GENUINELY negative-curvature direction
+/// (`λ < −floor·max|λ|`) is REFUSED (returns `None`), not deflated: the evidence
+/// deflation runs at a valid stationary point where an indefinite `H_tt` is a
+/// legitimate quotient direction, but this is a basin-CONVERGENCE certificate, and
+/// negative curvature means the start is at or past a saddle/max of the encode
+/// objective where Newton does not converge to the minimum. Deflating it to `+1`
+/// would manufacture a false certificate. This preserves the pre-existing
+/// negative-curvature refusal exactly while curing only the rank-null case.
+fn beta_eta_newton_spectral_deflated(
+    h: ArrayView2<'_, f64>,
+    g: ArrayView1<'_, f64>,
+) -> Result<Option<(f64, f64, Array1<f64>)>, String> {
+    let d = h.nrows();
+    // Symmetrise defensively before the eigendecomposition (the assembled Hessian
+    // is symmetric only up to reduction order), mirroring the evidence routine.
+    let mut sym = Array2::<f64>::zeros((d, d));
+    for i in 0..d {
+        for j in 0..d {
+            let v = 0.5 * (h[[i, j]] + h[[j, i]]);
+            if !v.is_finite() {
+                return Ok(None);
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (vals, vecs) = sym
         .eigh(Side::Lower)
         .map_err(|e| format!("beta_eta_newton: eigh failed: {e:?}"))?;
-    let lambda_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_abs = vals.iter().fold(
+        0.0_f64,
+        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
+    );
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return Ok(None);
+    }
+    let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
+    // Conditioned spectrum: keep genuine positive curvature, deflate the numerical
+    // null band to unit stiffness, refuse on genuine negative curvature.
+    let mut cond = Array1::<f64>::zeros(d);
+    for (idx, &lambda) in vals.iter().enumerate() {
+        if !lambda.is_finite() {
+            return Ok(None);
+        }
+        cond[idx] = if lambda > floor {
+            lambda
+        } else if lambda >= -floor {
+            // Rank-null / numerically-flat radial direction → unit stiffness.
+            1.0
+        } else {
+            // Genuine negative curvature: past a basin boundary — flag.
+            return Ok(None);
+        };
+    }
+    let lambda_min = cond.iter().cloned().fold(f64::INFINITY, f64::min);
     if !(lambda_min.is_finite() && lambda_min > 0.0) {
         return Ok(None);
     }
     let beta = 1.0 / lambda_min;
-    // Newton step δ = −H⁻¹ g via the eigendecomposition: δ = −Σ_i (vᵢᵀg/λᵢ) vᵢ.
+    // Newton step δ = −H̃⁻¹ g via the eigendecomposition: δ = −Σ_i (vᵢᵀg/λ̃ᵢ) vᵢ,
+    // with the deflated eigenvalue λ̃_i in place of a raw sub-floor λ_i. A genuine
+    // null carries vᵢᵀg ≈ 0, so the deflated direction contributes ≈ 0 step.
     let mut delta = Array1::<f64>::zeros(d);
-    for (col, &lam) in vals.iter().enumerate() {
-        if lam <= 0.0 {
-            return Ok(None);
-        }
+    for (col, &lam) in cond.iter().enumerate() {
         let vi = vecs.column(col);
         let coeff = vi.dot(&g) / lam;
         for row in 0..d {
             delta[row] -= coeff * vi[row];
         }
+    }
+    if delta.iter().any(|v| !v.is_finite()) {
+        return Ok(None);
     }
     let eta = delta.dot(&delta).sqrt();
     Ok(Some((beta, eta, delta)))
@@ -4567,6 +4659,107 @@ mod encode_fix_tests {
         assert!(!warmup_should_reject(true, 0.1, 0.9));
         // A genuinely-contracting uncertified step is accepted (no regression).
         assert!(!warmup_should_reject(false, 0.4, 0.9));
+    }
+
+    // ---------------------------------------------------------------------
+    // #1095 / #2228 — the encode Kantorovich certificate must not refuse a
+    // rank-deficient (radial-null) over-parametrized chart's per-row Hessian.
+    // `beta_eta_newton` reads the undamped, non-deflated per-row `H_tt`; on a
+    // d≥2 chart carrying intrinsically lower-dimensional data every row plants a
+    // rank-1 null, so the old `λ_min > 0` gate returned `None` (uncertified) and
+    // silently disabled the amortized encoder for that whole chart. The fix
+    // deflates the numerical null band to unit stiffness (`log 1 = 0`) and
+    // certifies on the identifiable subspace, while STILL refusing genuine
+    // negative curvature (a saddle/max the Kantorovich certificate must reject).
+    // ---------------------------------------------------------------------
+
+    /// A rank-1 null 2×2 (one genuine positive curvature, one radial null) now
+    /// CERTIFIES: β finite, and the Newton step picks up NO motion along the
+    /// deflated null direction because the null carries zero gradient — exactly
+    /// the over-parametrized-circle geometry of #1095/#2228.
+    #[test]
+    fn beta_eta_newton_deflates_rank1_null_2x2() {
+        // H = diag(4, 0): axis-0 is the identifiable (angular) direction, axis-1
+        // is the radial null. g lives entirely in the identifiable direction.
+        let h = ndarray::array![[4.0_f64, 0.0], [0.0, 0.0]];
+        let g = Array1::from(vec![4.0_f64, 0.0]);
+        let out = beta_eta_newton(h.view(), g.view())
+            .expect("beta_eta_newton runs")
+            .expect("a rank-1 null block must CERTIFY after unit-stiffness deflation (#1095/#2228)");
+        let (beta, eta, delta) = out;
+        // λ_min of the deflated spectrum is the unit-stiffness null → β = 1.
+        assert!(beta.is_finite() && (beta - 1.0).abs() < 1e-9, "β={beta}");
+        // Identifiable Newton step −g₀/4 = −1 on axis 0; ZERO on the deflated null.
+        assert!((delta[0] + 1.0).abs() < 1e-9, "delta0={}", delta[0]);
+        assert!(delta[1].abs() < 1e-9, "null-direction step must be ~0, got {}", delta[1]);
+        assert!((eta - 1.0).abs() < 1e-9, "eta={eta}");
+    }
+
+    /// A tiny (sub-floor) gradient component ALONG the null direction produces a
+    /// BOUNDED step (`−g_null / 1`), never the `−g_null / 0` blow-up the old
+    /// ridge-0 factor would imply — the certificate stays finite and usable.
+    #[test]
+    fn beta_eta_newton_null_direction_step_is_bounded() {
+        let h = ndarray::array![[4.0_f64, 0.0], [0.0, 0.0]];
+        let g = Array1::from(vec![4.0_f64, 1.0e-3]);
+        let (_beta, eta, delta) = beta_eta_newton(h.view(), g.view())
+            .expect("runs")
+            .expect("certifies");
+        // Null-direction step is exactly −g_null / λ̃_null = −1e-3, not divergent.
+        assert!((delta[1] + 1.0e-3).abs() < 1e-12, "delta1={}", delta[1]);
+        assert!(eta.is_finite() && eta < 2.0, "eta={eta}");
+    }
+
+    /// A genuinely INDEFINITE 2×2 (one negative eigenvalue) is STILL refused —
+    /// deflation must not manufacture a certificate at a saddle/max of the encode
+    /// objective (the pre-existing negative-curvature guard is preserved).
+    #[test]
+    fn beta_eta_newton_refuses_genuine_negative_curvature_2x2() {
+        let h = ndarray::array![[4.0_f64, 0.0], [0.0, -2.0]];
+        let g = Array1::from(vec![1.0_f64, 1.0]);
+        let out = beta_eta_newton(h.view(), g.view()).expect("runs");
+        assert!(
+            out.is_none(),
+            "a negative-curvature (indefinite) start must NOT certify — it is at/past a \
+             basin boundary; deflating it to +1 would be a false certificate"
+        );
+    }
+
+    /// A rank-deficient 3×3 PSD block (null in one direction) certifies on the
+    /// general `d ≥ 3` eigen path, mirroring the 2×2 case.
+    #[test]
+    fn beta_eta_newton_deflates_rank_deficient_3x3() {
+        let h = ndarray::array![
+            [4.0_f64, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0]
+        ];
+        let g = Array1::from(vec![4.0_f64, 1.0, 0.0]);
+        let (beta, _eta, delta) = beta_eta_newton(h.view(), g.view())
+            .expect("runs")
+            .expect("rank-deficient 3×3 PSD must certify after deflation");
+        assert!(beta.is_finite() && beta > 0.0, "β={beta}");
+        assert!((delta[0] + 1.0).abs() < 1e-9 && (delta[1] + 1.0).abs() < 1e-9);
+        assert!(delta[2].abs() < 1e-9, "null-direction step must be ~0, got {}", delta[2]);
+    }
+
+    /// A healthy positive-definite 2×2 is UNCHANGED by the fix: it keeps the
+    /// closed-form fast path, β = 1/λ_min, and the Newton step solves H·δ = −g.
+    #[test]
+    fn beta_eta_newton_healthy_pd_unchanged() {
+        let h = ndarray::array![[4.0_f64, 1.0], [1.0, 3.0]];
+        let g = Array1::from(vec![2.0_f64, -1.0]);
+        let (beta, eta, delta) = beta_eta_newton(h.view(), g.view())
+            .expect("runs")
+            .expect("a PD block certifies");
+        // λ_min = ½(7 − √5); β = 1/λ_min.
+        let lambda_min = 0.5 * (7.0 - 5.0_f64.sqrt());
+        assert!((beta - 1.0 / lambda_min).abs() < 1e-9, "β={beta}");
+        // Newton normal equations: H·δ = −g.
+        let hd0 = h[[0, 0]] * delta[0] + h[[0, 1]] * delta[1];
+        let hd1 = h[[1, 0]] * delta[0] + h[[1, 1]] * delta[1];
+        assert!((hd0 + g[0]).abs() < 1e-9 && (hd1 + g[1]).abs() < 1e-9);
+        assert!((eta - delta.dot(&delta).sqrt()).abs() < 1e-12);
     }
 }
 
