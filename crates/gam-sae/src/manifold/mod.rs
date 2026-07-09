@@ -118,8 +118,12 @@ pub(crate) use gam_solve::arrow_schur::{
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
     IbpHessianDiagThirdChannels, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
-    PenaltyTier, PsiSlice, WeightField, resolve_learnable_weight,
+    PenaltyTier, PsiSlice, WeightField,
 };
+// The FFI seed path resolves learnable α through the exact terminal-ρ schedule
+// (`gam::terms::sae::manifold::resolve_learnable_weight`), so this re-export
+// must be PUBLIC — pub(crate) here broke every CI test-build shard (E0603).
+pub use gam_terms::analytic_penalties::resolve_learnable_weight;
 
 pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 pub use gam_terms::latent::LatentManifold;
