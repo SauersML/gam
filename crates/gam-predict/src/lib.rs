@@ -2789,17 +2789,23 @@ where
                     );
                     meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
                 }
-                if !meanvar.is_finite() {
-                    // #1515: the same pathological coefficient posterior that
-                    // overflows the response-mean integral (an all-zero Poisson
-                    // flat likelihood leaves se_eta in the thousands) also
-                    // overflows the exact response-variance integral. Fall back
-                    // to the delta-method SE |dμ/dη| · se_eta around the plug-in
-                    // mean — finite — so an interval predict on a fitted-but-
-                    // degenerate model returns finite bounds instead of a
-                    // `+inf`/`None` that crashes the Python table shaper.
-                    let dmu_deta = strategy.inverse_link_jet(eta[i])?.d1;
-                    return Ok((dmu_deta.abs() * se_i).max(0.0));
+                if !meanvar.is_finite() && meanvar != f64::INFINITY {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "response-variance integral produced a non-numeric value at row {i} \
+                         (meanvar = {meanvar}, eta = {:.6e}, se_eta = {:.6e})",
+                        eta[i], se_i
+                    )));
+                }
+                if meanvar == f64::INFINITY {
+                    // The exact response-variance integral overflowed (a
+                    // degenerate fit can leave se_eta in the thousands). The
+                    // mathematical variance is then larger than anything
+                    // representable, so the honest SE is +inf — an
+                    // infinite-width interval that support clamping reduces to
+                    // the family's full response range. Substituting the
+                    // (finite, often tiny) delta-method SE here fabricated
+                    // precision the posterior does not have.
+                    return Ok(f64::INFINITY);
                 }
                 Ok(meanvar.max(0.0).sqrt())
             })
