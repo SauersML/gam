@@ -1882,6 +1882,41 @@ fn reduced_schur_cg_solve<B: BatchedBlockSolver + Sync>(
     Some(y)
 }
 
+/// Matrix-free single-rhs reduced-Schur solve `S⁻¹ rhs` (`t = 0`) via CG on
+/// [`schur_matvec`], warm-started from `warm` (or cold). The base primitive for
+/// the selected-inverse gradient channels whose `S⁻¹` argument is NOT the fixed
+/// probe family but a per-call probe-derived vector (e.g. `(H⁻¹)_tt`'s
+/// `H_βt(H_tt)⁻¹z` term in the ARD latent-block diagonal, and the per-row
+/// `(H⁻¹)_tβ` blocks the θ-adjoint / assignment-strength traces contract) — those
+/// cannot reuse the `(probes, S⁻¹·probes)` bundle, so they solve `S⁻¹` on demand
+/// through this. `None` on a CG breakdown (SPD `S` forbids it, so it signals a
+/// non-finite operator or caller bug).
+pub fn reduced_schur_inverse_apply<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    rhs: &Array1<f64>,
+    warm: Option<&Array1<f64>>,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<Array1<f64>> {
+    let zero = Array1::<f64>::zeros(sys.k);
+    let y0 = warm.unwrap_or(&zero);
+    reduced_schur_cg_solve(
+        sys,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        rhs,
+        y0,
+        cg_rel_tol,
+        cg_max_iters,
+    )
+}
+
 /// The `S⁻¹ v_j` bundle for a fixed probe set: solves `S y_j = v_j` (`t = 0`) on
 /// the matrix-free reduced Schur for each probe `v_j`, warm-started per-probe
 /// from `warm` when supplied (e.g. the surrogate's smallest-shift solves, which

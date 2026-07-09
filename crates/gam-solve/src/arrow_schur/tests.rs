@@ -5414,6 +5414,89 @@ fn hutchinson_reduced_schur_inverse_trace_matches_dense() {
     assert_eq!(tr_sinv_i, tr2, "tr(S⁻¹) estimator must be bit-reproducible");
 }
 
+/// Dense SPD solve `S⁻¹ rhs` from the lower-Cholesky factor `S = L Lᵀ`: forward
+/// substitution `L y = rhs` then back substitution `Lᵀ x = y`. Oracle for the
+/// matrix-free single-rhs [`reduced_schur_inverse_apply`].
+fn dense_spd_solve_from_lower(l: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+    let k = l.nrows();
+    let mut y = vec![0.0_f64; k];
+    for i in 0..k {
+        let mut s = rhs[i];
+        for j in 0..i {
+            s -= l[[i, j]] * y[j];
+        }
+        y[i] = s / l[[i, i]];
+    }
+    let mut x = vec![0.0_f64; k];
+    for i in (0..k).rev() {
+        let mut s = y[i];
+        for j in i + 1..k {
+            s -= l[[j, i]] * x[j];
+        }
+        x[i] = s / l[[i, i]];
+    }
+    Array1::from_vec(x)
+}
+
+/// The matrix-free single-rhs reduced-Schur solve
+/// [`reduced_schur_inverse_apply`] (the base primitive for the selected-inverse
+/// gradient channels whose `S⁻¹` argument is per-call, not the fixed probe
+/// bundle) must reproduce the dense `S⁻¹ rhs` to solve accuracy and be
+/// bit-reproducible for a fixed rhs.
+#[test]
+fn reduced_schur_inverse_apply_matches_dense_solve() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+
+    // Fixed Rademacher rhs (deterministic, no eigensolver needed).
+    let mut state = 0x2080_A951_C0DE_u64;
+    let rhs = Array1::<f64>::from_shape_fn(k, |_| {
+        if gam_linalg::utils::splitmix64(&mut state) & 1 == 1 {
+            1.0
+        } else {
+            -1.0
+        }
+    });
+    let dense_x = dense_spd_solve_from_lower(&l, &rhs);
+
+    let mf_x = reduced_schur_inverse_apply(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        &rhs,
+        None,
+        1e-12,
+        50_000,
+    )
+    .expect("matrix-free S⁻¹ rhs must solve");
+    let err = (&mf_x - &dense_x).mapv(|x| x * x).sum().sqrt();
+    let scale = dense_x.mapv(|x| x * x).sum().sqrt().max(1e-12);
+    let rel = err / scale;
+    eprintln!("matrix-free S⁻¹ rhs: rel err {rel:.3e}");
+    assert!(
+        rel < 1e-6,
+        "matrix-free S⁻¹ rhs must match the dense L Lᵀ solve to CG accuracy (rel {rel:.3e})"
+    );
+
+    // Bit-reproducible for a fixed rhs (the REML gradient lane requires it).
+    let mf_x2 = reduced_schur_inverse_apply(
+        &sys, &htt_factors, ridge_beta, &backend, None, &rhs, None, 1e-12, 50_000,
+    )
+    .expect("matrix-free S⁻¹ rhs must re-solve");
+    assert_eq!(mf_x, mf_x2, "single-rhs S⁻¹ solve must be bit-reproducible");
+}
+
 // ---------------------------------------------------------------------------
 // Co-visibility cluster preconditioner (Kushal & Agarwal visibility-based
 // preconditioning). At real over-complete SAE widths the co-firing graph is a
