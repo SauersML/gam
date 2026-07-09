@@ -760,14 +760,38 @@ extern "C" __device__ double pg_series(int n, double x) {
     }
 }
 
+extern "C" __device__ double pg_log_std_normal_cdf(double x) {
+    // ln Φ(x): direct log of erfc in the bulk; leading Mills-ratio
+    // asymptotic once erfc underflows (x <~ -38). Mirrors the host
+    // `log_std_normal_cdf` in polya_gamma_core.rs exactly.
+    double erfc_val = erfc(-x * 0.7071067811865475);
+    if (erfc_val > 0.0) {
+        return log(erfc_val) - 0.6931471805599453;
+    }
+    return -0.5 * x * x - log(-x) - 0.9189385332046727;
+}
+
 extern "C" __device__ double pg_exp_tail_mass(double tilt) {
     double base = 0.125 * PG_PI_SQ + 0.5 * tilt * tilt;
     double upper = PG_SQRT_PI_OVER_2 * (PG_FRAC_2_PI * tilt - 1.0);
     double lower = -(PG_SQRT_PI_OVER_2 * (PG_FRAC_2_PI * tilt + 1.0));
-    double base_factor = base * exp(base * PG_FRAC_2_PI);
-    double p_upper = base_factor * exp(-tilt) * std_normal_cdf(upper);
-    double p_lower = base_factor * exp( tilt) * std_normal_cdf(lower);
-    double exp_terms = (4.0 / PG_PI) * (p_upper + p_lower);
+    double log_growth = base * PG_FRAC_2_PI;
+    double exp_terms;
+    if (log_growth + tilt <= 600.0) {
+        // Bulk regime: direct folding, bit-identical to the host fast path.
+        double base_factor = base * exp(log_growth);
+        double p_upper = base_factor * exp(-tilt) * std_normal_cdf(upper);
+        double p_lower = base_factor * exp( tilt) * std_normal_cdf(lower);
+        exp_terms = (4.0 / PG_PI) * (p_upper + p_lower);
+    } else {
+        // Extreme tilt: the folded product forms inf * 0 = NaN; assemble
+        // each term in log space (same expression, regrouped), mirroring
+        // the host TAIL_MASS_DIRECT_MAX_LOG branch.
+        double log_base = log(base);
+        double lp_upper = log_base + log_growth - tilt + pg_log_std_normal_cdf(upper);
+        double lp_lower = log_base + log_growth + tilt + pg_log_std_normal_cdf(lower);
+        exp_terms = (4.0 / PG_PI) * (exp(lp_upper) + exp(lp_lower));
+    }
     return 1.0 / (1.0 + exp_terms);
 }
 

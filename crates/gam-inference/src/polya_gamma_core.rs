@@ -88,23 +88,57 @@ pub fn std_normal_cdf(x: f64) -> f64 {
     0.5 * libm::erfc(-x * inv_sqrt2)
 }
 
+/// Largest `base·(2/π) + tilt` for which the folded direct evaluation of the
+/// tail-mass terms stays inside binary64: beyond it `base · exp(base·2/π) ·
+/// exp(tilt)` overflows to `+∞` while `Φ(lower)` underflows to `0`, producing
+/// `∞ · 0 = NaN` from a function whose contract is a probability. The
+/// crossover sits near half-tilt ≈ 42 (`|c| ≈ 84`), safely below the ≈ 46
+/// overflow point, so the direct path — and its bit-exact agreement with the
+/// CUDA kernel — is preserved everywhere the parity gate exercises.
+const TAIL_MASS_DIRECT_MAX_LOG: f64 = 600.0;
+
+/// Stable `ln Φ(x)`. In the bulk, `erfc` is exact to a ULP and the direct
+/// logarithm is fine; once `erfc` underflows (x ≲ −38) switch to the leading
+/// Mills-ratio asymptotic `ln Φ(x) ≈ −x²/2 − ln(−x) − ½·ln(2π)`.
+#[inline]
+fn log_std_normal_cdf(x: f64) -> f64 {
+    let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
+    let erfc_val = libm::erfc(-x * inv_sqrt2);
+    if erfc_val > 0.0 {
+        erfc_val.ln() - std::f64::consts::LN_2
+    } else {
+        const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_7;
+        -0.5 * x * x - (-x).ln() - HALF_LOG_2PI
+    }
+}
+
 /// Exponential-tail acceptance mass for the proposal mixture (PSW 2013 §2;
 /// Devroye 1986). Returns the probability of proposing from the exponential
 /// right-tail arm rather than the truncated inverse-Gaussian arm.
 ///
-/// `tilt` is the half-tilt `|c|/2`. The original formulation built
-/// `log_p = ln(base) + base·(2/π) ± tilt + ln(Φ(·))` and exponentiated; folding
-/// the factors directly as `base · exp(base·2/π) · exp(∓tilt) · Φ(·)` saves two
-/// transcendentals per draw setup.
+/// `tilt` is the half-tilt `|c|/2`. In the bulk the factors are folded
+/// directly as `base · exp(base·2/π) · exp(∓tilt) · Φ(·)`, saving two
+/// transcendentals per draw setup. For extreme tilt that folding overflows
+/// (`∞ · 0 = NaN` around `|c| ≈ 95`), so each term is assembled in log space
+/// as `ln(base) + base·(2/π) ∓ tilt + ln Φ(·)` and exponentiated once —
+/// the two regimes evaluate the same expression, only regrouped.
 #[inline]
 pub fn exponential_tail_mass(tilt: f64) -> f64 {
     let base = 0.125 * PI_SQ + 0.5 * tilt * tilt;
     let upper = SQRT_PI_OVER_2 * (FRAC_2_PI * tilt - 1.0);
     let lower = -(SQRT_PI_OVER_2 * (FRAC_2_PI * tilt + 1.0));
-    let base_factor = base * (base * FRAC_2_PI).exp();
-    let p_upper = base_factor * (-tilt).exp() * std_normal_cdf(upper);
-    let p_lower = base_factor * tilt.exp() * std_normal_cdf(lower);
-    let exp_terms = (4.0 / PI) * (p_upper + p_lower);
+    let log_growth = base * FRAC_2_PI;
+    let exp_terms = if log_growth + tilt <= TAIL_MASS_DIRECT_MAX_LOG {
+        let base_factor = base * log_growth.exp();
+        let p_upper = base_factor * (-tilt).exp() * std_normal_cdf(upper);
+        let p_lower = base_factor * tilt.exp() * std_normal_cdf(lower);
+        (4.0 / PI) * (p_upper + p_lower)
+    } else {
+        let log_base = base.ln();
+        let log_p_upper = log_base + log_growth - tilt + log_std_normal_cdf(upper);
+        let log_p_lower = log_base + log_growth + tilt + log_std_normal_cdf(lower);
+        (4.0 / PI) * (log_p_upper.exp() + log_p_lower.exp())
+    };
     1.0 / (1.0 + exp_terms)
 }
 
@@ -293,6 +327,50 @@ mod tests {
                 "exponential_tail_mass should decrease with tilt, but {:.6} ≥ {:.6}",
                 w[1],
                 w[0]
+            );
+        }
+    }
+
+    #[test]
+    fn exponential_tail_mass_extreme_tilt_is_a_probability_not_nan() {
+        // Around |c| ≈ 95 (half-tilt ≈ 47.5) the direct folding forms
+        // `∞ · 0 = NaN`; the log-space regrouping must keep the result a
+        // genuine probability, monotone decreasing, all the way out.
+        let mut prev = exponential_tail_mass(40.0);
+        for &tilt in &[45.0_f64, 47.5, 60.0, 100.0, 500.0] {
+            let p = exponential_tail_mass(tilt);
+            assert!(
+                p.is_finite() && (0.0..=1.0).contains(&p),
+                "exponential_tail_mass({tilt}) = {p} is not a probability"
+            );
+            assert!(
+                p <= prev,
+                "tail mass must keep decreasing with tilt: p({tilt}) = {p} > {prev}"
+            );
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn tail_mass_log_and_direct_regimes_agree_at_the_crossover() {
+        // Just below the direct-evaluation ceiling both groupings are exact;
+        // evaluating the log-space assembly by hand at a direct-regime tilt
+        // must reproduce the production value to rounding.
+        for &tilt in &[5.0_f64, 20.0, 35.0] {
+            let base = 0.125 * PI_SQ + 0.5 * tilt * tilt;
+            let upper = SQRT_PI_OVER_2 * (FRAC_2_PI * tilt - 1.0);
+            let lower = -(SQRT_PI_OVER_2 * (FRAC_2_PI * tilt + 1.0));
+            let log_growth = base * FRAC_2_PI;
+            let hand_log = {
+                let lp_u = base.ln() + log_growth - tilt + (std_normal_cdf(upper)).ln();
+                let lp_l = base.ln() + log_growth + tilt + (std_normal_cdf(lower)).ln();
+                1.0 / (1.0 + (4.0 / PI) * (lp_u.exp() + lp_l.exp()))
+            };
+            let prod = exponential_tail_mass(tilt);
+            let rel = (prod - hand_log).abs() / prod.max(1e-300);
+            assert!(
+                rel < 1e-10,
+                "regimes disagree at tilt {tilt}: direct {prod:.17e} vs log {hand_log:.17e}"
             );
         }
     }
