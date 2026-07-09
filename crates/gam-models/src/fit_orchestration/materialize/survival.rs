@@ -749,7 +749,7 @@ pub(crate) fn materialize_survival<'a>(
     }
     let marginal_slope_frailty = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         Some(fixed_gaussian_shift_frailty_from_spec(
-            config.frailty.as_ref().unwrap_or(&FrailtySpec::None),
+            &config.frailty,
             "survival marginal-slope",
         )?)
     } else {
@@ -757,7 +757,7 @@ pub(crate) fn materialize_survival<'a>(
     };
     match survival_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
-            if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) =>
+            if config.frailty.is_active() =>
         {
             return Err(WorkflowError::InvalidConfig {
                 reason: "frailty is not supported for transformation/weibull survival models"
@@ -766,7 +766,7 @@ pub(crate) fn materialize_survival<'a>(
             .into());
         }
         SurvivalLikelihoodMode::LocationScale
-            if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) =>
+            if config.frailty.is_active() =>
         {
             return Err(WorkflowError::InvalidConfig {
                 reason: "config.frailty is not implemented for survival-likelihood=location-scale"
@@ -789,7 +789,7 @@ pub(crate) fn materialize_survival<'a>(
         survival_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
     ) {
-        let frailty = config.frailty.as_ref().unwrap_or(&FrailtySpec::None);
+        let frailty = &config.frailty;
         Some(latent_hazard_loading(
             frailty,
             "workflow latent survival/binary",
@@ -1056,7 +1056,7 @@ pub(crate) fn materialize_survival<'a>(
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
                 },
-                frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+                frailty: config.frailty.clone(),
                 options: BlockwiseFitOptions::default(),
             })
         };
@@ -1114,7 +1114,7 @@ pub(crate) fn materialize_survival<'a>(
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
                 },
-                frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+                frailty: config.frailty.clone(),
                 options: BlockwiseFitOptions::default(),
             })
         };

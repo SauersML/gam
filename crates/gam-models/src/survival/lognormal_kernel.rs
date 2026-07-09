@@ -67,10 +67,11 @@ pub enum HazardLoading {
 ///    K_{k,m}(μ, σ) kernel terms.
 ///
 /// These are mathematically distinct families.  Do not mix them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frailty_kind", rename_all = "kebab-case")]
 pub enum FrailtySpec {
     /// No frailty modifier.
+    #[default]
     None,
     /// Gaussian shift on the final scalar index: U ~ N(0, σ²) added to η.
     /// Exact for probit: E[Φ(η + U)] = Φ(η / √(1+σ²)).
@@ -92,12 +93,8 @@ pub enum FrailtySpec {
 impl FrailtySpec {
     /// Whether this spec requests an actual frailty modifier.
     ///
-    /// [`FrailtySpec::None`] is the canonical "no frailty" value. The CLI/config
-    /// layer normalizes a missing `--frailty-kind` to `Some(FrailtySpec::None)`
-    /// (see `resolve_cli_frailty_spec`), so `Option::is_some` on
-    /// `config.frailty` is NOT a valid test for "the user requested frailty" — it
-    /// fires on the null `Some(FrailtySpec::None)`. Family/mode guards that only
-    /// support the no-frailty case must reject on this predicate instead, or they
+    /// [`FrailtySpec::None`] is the sole "no frailty" value. Family/mode guards
+    /// that only support the no-frailty case must reject on this predicate, or they
     /// misclassify every ordinary CLI fit as a frailty request.
     #[inline]
     pub fn is_active(&self) -> bool {

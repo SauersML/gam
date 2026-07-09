@@ -164,10 +164,10 @@ fn gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines() {
         survival_likelihood: "latent".to_string(),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
-        frailty: Some(FrailtySpec::HazardMultiplier {
+        frailty: FrailtySpec::HazardMultiplier {
             sigma_fixed: None,
             loading: HazardLoading::Full,
-        }),
+        },
         ..FitConfig::default()
     };
     let result = fit_from_formula("SurvInterval(L, R, event) ~ 1", &data, &cfg)

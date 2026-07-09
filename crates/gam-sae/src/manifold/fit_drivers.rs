@@ -6292,29 +6292,38 @@ impl SaeManifoldTerm {
             } else {
                 delta_beta.clone()
             };
-            let mut trial_step = step_size;
-            let mut accepted_loss: Option<SaeManifoldLoss> = None;
-            for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
-                let mut trial_beta = beta0.clone();
-                for j in 0..self.beta_dim() {
-                    trial_beta[j] += trial_step * delta_b[j];
-                }
-                self.set_flat_beta(trial_beta.view())?;
-                let (trial_loss, trial_total) = self.streaming_loss_and_penalized_objective_total(
-                    &chunk_ranges,
-                    rho,
-                    analytic_penalties,
-                    n_total,
-                    &mut chunk_init,
-                )?;
-                let armijo_bound =
-                    pre_step_total - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
-                if trial_total.is_finite() && trial_total <= armijo_bound {
-                    accepted_loss = Some(trial_loss);
-                    break;
-                }
-                trial_step *= 0.5;
-            }
+            // Every trial rebuilds β from `beta0`, so no snapshot restore is
+            // needed between trials; the state is fully determined by the
+            // trial β. Evaluation errors propagate (`?`), as before.
+            let accepted_loss = backtracking_line_search(
+                BacktrackConfig {
+                    initial_step: step_size,
+                    max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
+                    ..BacktrackConfig::default()
+                },
+                |trial_step| {
+                    let mut trial_beta = beta0.clone();
+                    for j in 0..self.beta_dim() {
+                        trial_beta[j] += trial_step * delta_b[j];
+                    }
+                    self.set_flat_beta(trial_beta.view())?;
+                    let (trial_loss, trial_total) = self
+                        .streaming_loss_and_penalized_objective_total(
+                            &chunk_ranges,
+                            rho,
+                            analytic_penalties,
+                            n_total,
+                            &mut chunk_init,
+                        )?;
+                    Ok(Some((trial_total, trial_loss)))
+                },
+                |trial_step, trial_total| {
+                    let armijo_bound = pre_step_total
+                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
+                    trial_total.is_finite() && trial_total <= armijo_bound
+                },
+            )?
+            .map(|step| step.payload);
             match accepted_loss {
                 Some(loss) => {
                     last_loss = loss;

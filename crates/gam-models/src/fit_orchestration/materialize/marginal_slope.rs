@@ -213,7 +213,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         logslopespec,
         marginal_offset,
         logslope_offset,
-        frailty: config.frailty.clone().unwrap_or(FrailtySpec::None),
+        frailty: config.frailty.clone(),
         score_warp: routing.score_warp,
         link_dev: routing.link_dev,
         latent_z_policy: Default::default(),

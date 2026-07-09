@@ -64,27 +64,27 @@
 use crate::custom_family::{
     BlockwiseFitOptions, ParameterBlockState, PenaltyMatrix, fit_custom_family_with_rho_prior,
 };
-use crate::multinomial_reml::MultinomialFamily;
-use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
-use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
-use gam_terms::inference::formula_dsl::parse_formula;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
-use std::convert::Infallible;
-use crate::model_types::EstimationError;
+use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
+use crate::model_types::EstimationError;
+use crate::multinomial_reml::MultinomialFamily;
+use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
+use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
+use gam_data::ColumnKindTag;
+use gam_data::EncodedDataset;
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use gam_problem::ResponseColumnKind;
+use gam_runtime::resource::ProblemHints;
+use gam_terms::inference::formula_dsl::parse_formula;
 use gam_terms::smooth::{
     PenaltyBlockInfo, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
 };
-use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use gam_terms::term_builder::resolve_role_col;
-use gam_problem::ResponseColumnKind;
-use gam_data::ColumnKindTag;
-use gam_data::EncodedDataset;
-use gam_runtime::resource::ProblemHints;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::Arc;
 
 /// Solver-only numerical stabilization floor for the formula-driven
@@ -862,7 +862,11 @@ fn fit_penalized_multinomial_firth_fallback(
     let weight = |row: usize| -> f64 { row_weights.as_ref().map_or(1.0, |w| w[row]) };
 
     let max_iter = max_iter.max(1);
-    let tol_eff = if tol.is_finite() && tol > 0.0 { tol } else { 1e-8 };
+    let tol_eff = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        1e-8
+    };
 
     // Probabilities (N, K), active classes 0..M then the pinned reference at M.
     let probs_at = |beta: &Array2<f64>| -> Array2<f64> {
@@ -917,7 +921,9 @@ fn fit_penalized_multinomial_firth_fallback(
     // in a bounded number of steps; (d) the attempt count is capped so a
     // genuinely singular information (e.g. an exactly rank-deficient Fisher block)
     // surfaces as an explicit error rather than an unbounded loop.
-    let invert_spd = |mat: &Array2<f64>, context: &str| -> Result<(Array2<f64>, f64), EstimationError> {
+    let invert_spd = |mat: &Array2<f64>,
+                      context: &str|
+     -> Result<(Array2<f64>, f64), EstimationError> {
         let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
         let base = if max_diag.is_finite() && max_diag > 0.0 {
             max_diag * 1e-10
@@ -999,83 +1005,84 @@ fn fit_penalized_multinomial_firth_fallback(
     };
 
     // Firth-adjusted penalized score U* (length d, block-ordered).
-    let firth_score = |probs: &Array2<f64>, beta: &Array2<f64>, iinv: &Array2<f64>| -> Array1<f64> {
-        let mut u = Array1::<f64>::zeros(d);
-        let mut xn = vec![0.0_f64; p];
-        let mut pa = vec![0.0_f64; m];
-        let mut q = vec![0.0_f64; m * m];
-        for row in 0..n_obs {
-            let w = weight(row);
-            if w == 0.0 {
-                continue;
-            }
-            for i in 0..p {
-                xn[i] = design[[row, i]];
-            }
-            for a in 0..m {
-                pa[a] = probs[[row, a]];
-            }
-            // Data score: U[(a,i)] += w x_{ni} (y_{na} − p_{na}).
-            for a in 0..m {
-                let resid = y_one_hot[[row, a]] - pa[a];
-                let ao = a * p;
+    let firth_score =
+        |probs: &Array2<f64>, beta: &Array2<f64>, iinv: &Array2<f64>| -> Array1<f64> {
+            let mut u = Array1::<f64>::zeros(d);
+            let mut xn = vec![0.0_f64; p];
+            let mut pa = vec![0.0_f64; m];
+            let mut q = vec![0.0_f64; m * m];
+            for row in 0..n_obs {
+                let w = weight(row);
+                if w == 0.0 {
+                    continue;
+                }
                 for i in 0..p {
-                    u[ao + i] += w * xn[i] * resid;
+                    xn[i] = design[[row, i]];
                 }
-            }
-            // Per-row information hat Q_{ab} = x_nᵀ [I⁻¹]_{(a,b)} x_n.
-            for a in 0..m {
-                let ao = a * p;
-                for b in 0..m {
-                    let bo = b * p;
-                    let mut s = 0.0_f64;
-                    for i in 0..p {
-                        let xi = xn[i];
-                        if xi == 0.0 {
-                            continue;
-                        }
-                        let mut inner = 0.0_f64;
-                        for j in 0..p {
-                            inner += iinv[[ao + i, bo + j]] * xn[j];
-                        }
-                        s += xi * inner;
-                    }
-                    q[a * m + b] = s;
-                }
-            }
-            // Firth adjustment: U[(c,s)] += ½ w x_{ns} h^c_n.
-            for c in 0..m {
-                let pc = pa[c];
-                let mut h = 0.0_f64;
                 for a in 0..m {
-                    for b in 0..m {
-                        let dab = if a == b { 1.0 } else { 0.0 };
-                        let dac = if a == c { 1.0 } else { 0.0 };
-                        let dbc = if b == c { 1.0 } else { 0.0 };
-                        let g = dab * pa[a] * (dac - pc)
-                            - pa[a] * pa[b] * (dac + dbc - 2.0 * pc);
-                        h += g * q[a * m + b];
+                    pa[a] = probs[[row, a]];
+                }
+                // Data score: U[(a,i)] += w x_{ni} (y_{na} − p_{na}).
+                for a in 0..m {
+                    let resid = y_one_hot[[row, a]] - pa[a];
+                    let ao = a * p;
+                    for i in 0..p {
+                        u[ao + i] += w * xn[i] * resid;
                     }
                 }
-                let co = c * p;
-                for s in 0..p {
-                    u[co + s] += 0.5 * w * h * xn[s];
+                // Per-row information hat Q_{ab} = x_nᵀ [I⁻¹]_{(a,b)} x_n.
+                for a in 0..m {
+                    let ao = a * p;
+                    for b in 0..m {
+                        let bo = b * p;
+                        let mut s = 0.0_f64;
+                        for i in 0..p {
+                            let xi = xn[i];
+                            if xi == 0.0 {
+                                continue;
+                            }
+                            let mut inner = 0.0_f64;
+                            for j in 0..p {
+                                inner += iinv[[ao + i, bo + j]] * xn[j];
+                            }
+                            s += xi * inner;
+                        }
+                        q[a * m + b] = s;
+                    }
+                }
+                // Firth adjustment: U[(c,s)] += ½ w x_{ns} h^c_n.
+                for c in 0..m {
+                    let pc = pa[c];
+                    let mut h = 0.0_f64;
+                    for a in 0..m {
+                        for b in 0..m {
+                            let dab = if a == b { 1.0 } else { 0.0 };
+                            let dac = if a == c { 1.0 } else { 0.0 };
+                            let dbc = if b == c { 1.0 } else { 0.0 };
+                            let g =
+                                dab * pa[a] * (dac - pc) - pa[a] * pa[b] * (dac + dbc - 2.0 * pc);
+                            h += g * q[a * m + b];
+                        }
+                    }
+                    let co = c * p;
+                    for s in 0..p {
+                        u[co + s] += 0.5 * w * h * xn[s];
+                    }
                 }
             }
-        }
-        // Smoothing penalty gradient: U[(a,i)] −= λ_a (S β_a)_i.
-        for a in 0..m {
-            let la = lambdas[a];
-            if la != 0.0 {
-                let sbeta = penalty.dot(&beta.column(a));
-                let ao = a * p;
-                for i in 0..p {
-                    u[ao + i] -= la * sbeta[i];
+            // Smoothing penalty gradient: U[(a,i)] −= λ_a (S β_a)_i.
+            for a in 0..m {
+                let la = lambdas[a];
+                if la != 0.0 {
+                    let sbeta = penalty.dot(&beta.column(a));
+                    let ao = a * p;
+                    for i in 0..p {
+                        u[ao + i] -= la * sbeta[i];
+                    }
                 }
             }
-        }
-        u
-    };
+            u
+        };
 
     // Penalized Hessian H = I + blockdiag_a(λ_a S) (positive definite).
     let penalized_hessian = |info: &Array2<f64>| -> Array2<f64> {
@@ -1100,7 +1107,9 @@ fn fit_penalized_multinomial_firth_fallback(
     // one decade tighter (`max_diag · 1e-12`) because the penalized Hessian
     // solved here is better conditioned than the Fisher information inverted
     // there, so a smaller perturbation suffices before escalating.
-    let solve_spd = |mat: &Array2<f64>, rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+    let solve_spd = |mat: &Array2<f64>,
+                     rhs: &Array1<f64>|
+     -> Result<Array1<f64>, EstimationError> {
         let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
         let base = if max_diag.is_finite() && max_diag > 0.0 {
             max_diag * 1e-12
@@ -2493,8 +2502,7 @@ pub fn fit_penalized_multinomial_formula(
                 let rank_t = (p_per_class as f64 - ns_t as f64).max(0.0);
                 edf_per_penalty.push((rank_t - tr_at).clamp(0.0, p_per_class as f64));
             }
-            edf_per_class
-                .push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
+            edf_per_class.push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
         }
         Some((f, edf_per_class, edf_per_penalty, n_components, lam))
     });
@@ -3035,10 +3043,7 @@ mod fisher_override_tests {
                     q += v[i] * cov[[i, j]] * v[j];
                 }
             }
-            assert!(
-                q >= -1e-9,
-                "covariance must be PSD: vᵀΣv = {q:.3e} < 0"
-            );
+            assert!(q >= -1e-9, "covariance must be PSD: vᵀΣv = {q:.3e} < 0");
         }
 
         // (2) & (3) Delta-method SEs and simplex probabilities on the training
@@ -3053,10 +3058,16 @@ mod fisher_override_tests {
             let mut rowsum = 0.0_f64;
             for c in 0..k {
                 let pc = probs[[row, c]];
-                assert!(pc.is_finite() && (0.0..=1.0).contains(&pc), "prob[{row},{c}]={pc}");
+                assert!(
+                    pc.is_finite() && (0.0..=1.0).contains(&pc),
+                    "prob[{row},{c}]={pc}"
+                );
                 rowsum += pc;
                 let se = prob_se[[row, c]];
-                assert!(se.is_finite(), "prob_se[{row},{c}] must be finite (got {se})");
+                assert!(
+                    se.is_finite(),
+                    "prob_se[{row},{c}] must be finite (got {se})"
+                );
                 assert!(
                     (0.0..=1.0).contains(&se),
                     "prob_se[{row},{c}] must be in [0,1] (got {se})"
@@ -3735,7 +3746,12 @@ mod reference_class_invariance_tests {
 
     /// Build an `EncodedDataset` with columns `x` (numeric) and `y`
     /// (categorical, from the given string labels) by round-tripping a CSV.
-    fn dataset_xy(dir: &std::path::Path, tag: &str, x: &[f64], y: &[String]) -> gam_data::EncodedDataset {
+    fn dataset_xy(
+        dir: &std::path::Path,
+        tag: &str,
+        x: &[f64],
+        y: &[String],
+    ) -> gam_data::EncodedDataset {
         let path = dir.join(format!("data_{tag}.csv"));
         let mut csv = String::from("x,y\n");
         for (xi, yi) in x.iter().zip(y.iter()) {

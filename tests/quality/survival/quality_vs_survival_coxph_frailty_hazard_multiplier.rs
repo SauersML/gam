@@ -221,10 +221,10 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
         survival_likelihood: "latent".to_string(),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
-        frailty: Some(FrailtySpec::HazardMultiplier {
+        frailty: FrailtySpec::HazardMultiplier {
             sigma_fixed: None,
             loading: HazardLoading::Full,
-        }),
+        },
         ..FitConfig::default()
     };
     let result =
@@ -494,10 +494,10 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data() {
         survival_likelihood: "latent".to_string(),
         baseline_target: "weibull".to_string(),
         time_basis: "ispline".to_string(),
-        frailty: Some(FrailtySpec::HazardMultiplier {
+        frailty: FrailtySpec::HazardMultiplier {
             sigma_fixed: None,
             loading: HazardLoading::Full,
-        }),
+        },
         ..FitConfig::default()
     };
     let result = fit_from_formula("Surv(time, status) ~ karno", &train_ds, &cfg)

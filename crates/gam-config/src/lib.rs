@@ -338,12 +338,12 @@ pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, Str
     if let Some(raw_gpu) = input.gpu {
         fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
     }
-    fit_config.frailty = Some(resolve_cli_frailty_spec(
+    fit_config.frailty = resolve_cli_frailty_spec(
         input.frailty_kind,
         input.frailty_sd,
         input.hazard_loading,
         "fit",
-    )?);
+    )?;
     validate_resolved_fit_config(&fit_config)?;
     Ok(fit_config)
 }
@@ -697,7 +697,7 @@ fn parse_json_frailty_spec(
     frailty_kind: Option<String>,
     frailty_sd: Option<f64>,
     hazard_loading: Option<String>,
-) -> Result<Option<FrailtySpec>, String> {
+) -> Result<FrailtySpec, String> {
     if let Some(kind) = frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();
         let sigma = frailty_sd;
@@ -749,11 +749,11 @@ fn parse_json_frailty_spec(
                 ));
             }
         };
-        Ok(Some(frailty))
+        Ok(frailty)
     } else if frailty_sd.is_some() || hazard_loading.is_some() {
         Err("frailty_kind is required when frailty_sd or hazard_loading is provided".to_string())
     } else {
-        Ok(None)
+        Ok(FrailtySpec::None)
     }
 }
 
@@ -1029,10 +1029,7 @@ mod tests {
         })
     }
 
-    fn canonical_fit_config(mut config: FitConfig) -> String {
-        if config.frailty.is_none() {
-            config.frailty = Some(FrailtySpec::None);
-        }
+    fn canonical_fit_config(config: FitConfig) -> String {
         format!("{config:#?}")
     }
 

@@ -497,7 +497,7 @@ fn fit_expectile_laws(
 ) -> Result<StandardFitResult, WorkflowError> {
     use gam_linalg::matrix::LinearOperator;
 
-    if config.frailty.as_ref().is_some_and(FrailtySpec::is_active) {
+    if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
             reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
                 .to_string(),
@@ -510,12 +510,8 @@ fn fit_expectile_laws(
         family: Some("gaussian".to_string()),
         link: Some("identity".to_string()),
         expectile_tau: None,
-        // The inner Gaussian-identity design carries no frailty. Normalize the
-        // CLI/config-layer null value (`Some(FrailtySpec::None)`) to `None` so
-        // the expectile driver does not leak survival-only plumbing into the
-        // standard-family materializer, while the active-frailty guard above
-        // still rejects unsupported frailty requests explicitly.
-        frailty: None,
+        // The inner Gaussian-identity design carries no frailty.
+        frailty: FrailtySpec::None,
         ..config.clone()
     };
 

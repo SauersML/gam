@@ -367,7 +367,9 @@ pub struct FitConfig {
     /// Optional additive offset column for the noise/log-scale predictor.
     pub noise_offset_column: Option<String>,
     /// Optional family-level frailty modifier.
-    pub frailty: Option<FrailtySpec>,
+    /// Family-level frailty. `None` is represented only by
+    /// [`FrailtySpec::None`]; an outer `Option` would create two null states.
+    pub frailty: FrailtySpec,
 
     // Survival-specific
     /// Baseline target: "linear", "weibull", "gompertz", "gompertz-makeham".
@@ -532,7 +534,7 @@ impl Default for FitConfig {
             flexible_link: false,
             offset_column: None,
             noise_offset_column: None,
-            frailty: None,
+            frailty: FrailtySpec::None,
             baseline_target: "linear".into(),
             baseline_scale: None,
             baseline_shape: None,

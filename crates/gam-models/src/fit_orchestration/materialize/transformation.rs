@@ -26,7 +26,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
         }
         .into());
     }
-    if config.frailty.as_ref().is_some_and(|f| f.is_active()) {
+    if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
             reason: "frailty is not supported for transformation-normal models".to_string(),
         }
