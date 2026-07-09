@@ -315,10 +315,18 @@ impl OuterTerminationLedger {
         }
         if self.evals.saturating_sub(self.last_improvement_eval) >= Self::stationarity_window() {
             self.frozen = Some(SaeOuterTerminationVerdict::IncumbentStationary);
+            // DEFECT ALARM, not a success path: with a continuous envelope
+            // criterion, a descendable objective, and paid refinement budgets,
+            // the bridge's OWN stationarity/stall logic must stop the fit
+            // first. Reaching this freeze means the solver wandered a full
+            // window without the bridge concluding — ship the incumbent
+            // honestly, but treat the verdict as a bug report against the
+            // driver/bridge composition (file it with the eval ledger).
             log::warn!(
-                "[#2235] outer incumbent stationary: no material improvement for {} \
-                 evaluations (window {}); freezing the criterion at the banked incumbent \
-                 (cost {best:.6e})",
+                "[#2235] SOLVER DEFECT SIGNAL — outer incumbent stationary: no material \
+                 improvement for {} evaluations (window {}) and the bridge did not stop on \
+                 its own. Freezing the criterion at the banked incumbent (cost {best:.6e}); \
+                 a healthy fit ends EngineStopped — investigate why this one did not",
                 self.evals - self.last_improvement_eval,
                 Self::stationarity_window()
             );
