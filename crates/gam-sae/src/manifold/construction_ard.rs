@@ -897,4 +897,182 @@ impl SaeManifoldTerm {
         }
         Ok(traces)
     }
+
+    /// Per-atom, per-axis `½ tr(H⁻¹ ∂H/∂logα_{kj})` — the ARD ½log|H| ρ-gradient
+    /// channel [`Self::ard_log_precision_hessian_trace`] computes — from the #2080
+    /// SHARED selected-inverse bundle instead of the dense `DeflatedArrowSolver`
+    /// (`latent_inverse_diagonal` + per-column `solve`). The massive-lane /
+    /// eventual-dense-cache-retirement replacement for the last dense `S⁻¹` in the
+    /// analytic outer ρ-gradient's ARD block.
+    ///
+    /// Each ARD component differentiates ONE coordinate-slot diagonal entry, so the
+    /// trace is `Σ_{row, slot s(k,j)} ½·(H⁻¹)_tt[s,s]·(w_row·hess)`. The diagonal is
+    /// the SAME per-row arrow selected-inverse the ARD posterior-variance trace uses
+    /// (`(A_i⁻¹)[s,s]` row-local + border `(1/m)Σ_j w_ij[s]·s_ij[s]` off the bundle,
+    /// see [`Self::ard_inverse_traces_from_probes`] for the derivation), matching
+    /// `solver.latent_inverse_diagonal()` on the PLAIN (undeflated) selected inverse
+    /// to solve precision.
+    ///
+    /// # Deflation is out of scope for this lane
+    ///
+    /// The dense path's Daleckii–Krein correction `−½ tr(inv_vv·(D − DΦ[D]))`
+    /// reconstructs the per-row gauge/rotation deflation the DEFLATED `solve`
+    /// removes; it needs the DEFLATED per-row inverse block. The surrogate bundle
+    /// carries the PLAIN reduced-Schur `S⁻¹`, so `A_i⁻¹ + G_i S⁻¹ G_iᵀ` is the
+    /// UNdeflated block — correct only where no row carries deflation directions
+    /// (`deflated_row_directions` empty), which is precisely the matrix-free
+    /// surrogate regime (per-row gauge deflation is a dense-solver feature). A row
+    /// that DOES carry deflation is hard-refused here (the caller must keep the
+    /// dense channel for it) rather than silently double-adding the correction on an
+    /// undeflated block. On the plain regime the correction term is identically
+    /// zero, so the two paths agree exactly — the FD gate's acceptance.
+    pub(crate) fn ard_log_precision_hessian_trace_from_probes(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+    ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        let m = probes.len();
+        if m == 0 || sinv_probes.len() != m {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "ard_log_precision_hessian_trace_from_probes: need matching non-empty \
+                     probe/solve bundles, got {m} probes and {} solves",
+                    sinv_probes.len()
+                ),
+            });
+        }
+        let k_border = cache.k;
+        for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+            for (j, v) in set.iter().enumerate() {
+                if v.len() != k_border {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "ard_log_precision_hessian_trace_from_probes: {label} {j} has length \
+                             {} != border dim {k_border}",
+                            v.len()
+                        ),
+                    });
+                }
+            }
+        }
+        let row_w = self.row_loss_weights.as_deref();
+        let n = self.n_obs();
+        let coord_offsets = self.assignment.coord_offsets();
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        let mut traces: Vec<Array1<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                if rho.log_ard[k].is_empty() {
+                    Array1::<f64>::zeros(0)
+                } else {
+                    Array1::<f64>::zeros(c.latent_dim())
+                }
+            })
+            .collect();
+        let inv_m = 1.0 / (m as f64);
+        for row in 0..n {
+            let w_row = row_w.map_or(1.0, |w| w[row]);
+            let q = cache.row_dims[row];
+            // Per-row gauge/rotation deflation is unsupported on the plain-`S⁻¹`
+            // surrogate bundle (see the docstring); the dense channel owns those rows.
+            if cache
+                .deflated_row_directions
+                .get(row)
+                .is_some_and(|d| !d.is_empty())
+            {
+                return Err(ArrowSchurError::SchurFactorFailed {
+                    reason: format!(
+                        "ard_log_precision_hessian_trace_from_probes: row {row} carries \
+                         deflation directions; the plain-S⁻¹ bundle cannot reconstruct the \
+                         Daleckii–Krein correction — route this fit through the dense channel"
+                    ),
+                });
+            }
+            let factor = cache.undamped_factor(row);
+            // Row-local (A_i⁻¹)[s,s].
+            let mut a_inv_diag = Array1::<f64>::zeros(q);
+            let mut e_s = Array1::<f64>::zeros(q);
+            for s in 0..q {
+                e_s.fill(0.0);
+                e_s[s] = 1.0;
+                let col = cholesky_solve_vector(factor, e_s.view());
+                a_inv_diag[s] = col[s];
+            }
+            // Border vectors w_ij = A_i⁻¹ H_tβ^i z_j, s_ij = A_i⁻¹ H_tβ^i (S⁻¹ z_j).
+            let mut w_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            let mut s_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            let mut b_tmp = Array1::<f64>::zeros(q);
+            for j in 0..m {
+                b_tmp.fill(0.0);
+                if !cache.apply_htbeta_row(row, probes[j].view(), &mut b_tmp) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "ard_log_precision_hessian_trace_from_probes: H_tβ^({row}) probe apply \
+                             failed"
+                        ),
+                    });
+                }
+                w_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+                b_tmp.fill(0.0);
+                if !cache.apply_htbeta_row(row, sinv_probes[j].view(), &mut b_tmp) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "ard_log_precision_hessian_trace_from_probes: H_tβ^({row}) solve apply \
+                             failed"
+                        ),
+                    });
+                }
+                s_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+            }
+            // Full per-row selected-inverse diagonal (undeflated).
+            let mut inv_diag_local = Array1::<f64>::zeros(q);
+            for s in 0..q {
+                let mut border = 0.0_f64;
+                for j in 0..m {
+                    border += w_probes[j][s] * s_probes[j][s];
+                }
+                inv_diag_local[s] = a_inv_diag[s] + inv_m * border;
+            }
+            let accumulate = |k: usize, block_start: usize, traces: &mut Vec<Array1<f64>>| {
+                if rho.log_ard[k].is_empty() {
+                    return;
+                }
+                let coord = &self.assignment.coords[k];
+                let d = coord.latent_dim();
+                for axis in 0..d {
+                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                    let t = coord.row(row)[axis];
+                    let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
+                    let hess = w_row * prior.hess.max(0.0);
+                    let s = block_start + axis;
+                    traces[k][axis] += 0.5 * inv_diag_local[s] * hess;
+                }
+            };
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    let active = &layout.active_atoms[row];
+                    let starts = &layout.coord_starts[row];
+                    for (pos, &k) in active.iter().enumerate() {
+                        accumulate(k, starts[pos], &mut traces);
+                    }
+                }
+                None => {
+                    for k in 0..self.k_atoms() {
+                        accumulate(k, coord_offsets[k], &mut traces);
+                    }
+                }
+            }
+        }
+        Ok(traces)
+    }
 }
