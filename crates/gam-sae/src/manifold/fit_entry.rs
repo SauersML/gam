@@ -257,14 +257,27 @@ pub fn run_sae_manifold_fit_from_parts(
         // stop trips once outer progress falls below `SAE_OUTER_REL_COST_TOL` so a
         // plateaued fit terminates in a handful of iters instead of at `max_iter`.
         //
-        // SAE_OUTER_REL_COST_TOL — a 1e-4 relative-cost floor: stop once an accepted
-        // outer step improves the penalized criterion by < 0.01%. That is the
-        // canonical "no material REML progress" threshold; tight enough that a
-        // genuine slow descent still steps, loose enough that the flat ridge halts.
-        const SAE_OUTER_REL_COST_TOL: f64 = 1.0e-4;
+        // SAE_OUTER_REL_COST_TOL — a 1e-3 relative-cost floor: stop once an accepted
+        // outer step improves the penalized criterion by < 0.1%. Measured on the
+        // 12-factor zoo, a plateaued fit's incumbent still CREEPS ~1.5e-4/iter (EV
+        // 0.6524→0.6525→0.6526…), which sits just ABOVE a 1e-4 floor and never trips
+        // — so the loose-but-principled "no material REML progress" threshold is 1e-3
+        // (0.1%). The ABSOLUTE projected-gradient floor still uses `tolerance`, so a
+        // genuinely descending fit is unaffected; this only halts the co-collapse
+        // plateau creep. The true fix for that plateau's HEIGHT is the per-atom
+        // topology (1-D-circle ceiling), not more outer iters.
+        const SAE_OUTER_REL_COST_TOL: f64 = 1.0e-3;
+        // SAE_OUTER_MAX_ITER — hard backstop so termination NEVER depends solely on
+        // the rel-cost heuristic. The manifold outer ρ is low-dimensional (a sparse
+        // scale + per-atom smoothing), so a well-posed REML search converges in
+        // O(10-20) iters; `4·n_params` bounded to [24, 60] is generous headroom for
+        // a genuine descent yet caps the pathological co-collapse walk far below the
+        // 200 default (each outer iter is one full O(joint-Newton) inner fit).
+        let sae_outer_max_iter = (4 * n_params).clamp(24, 60);
         let problem = OuterProblem::new(n_params)
             .with_initial_rho(init_rho_flat.clone())
             .with_rel_cost_tolerance(Some(SAE_OUTER_REL_COST_TOL))
+            .with_max_iter(sae_outer_max_iter)
             .with_seed_config(SeedConfig {
                 max_seeds: 1,
                 seed_budget: 1,
