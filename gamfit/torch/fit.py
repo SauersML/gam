@@ -336,28 +336,37 @@ def _build_design_penalty(
         return design.to(torch.float64), penalty.to(torch.float64)
 
     if entry == "pca" and isinstance(smooth, Pca):
+        from .._basis_eval import pca_basis_matrix, pca_training_mean
+
         pca = smooth
         if pca.lazy_path is not None:
             raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
+        design_points = points.to(torch.float64)
+        if pca.centered:
+            # Fitting is the fit/transform boundary: resolve the training mean
+            # here and persist it on the spec so predict-time evaluations
+            # subtract the SAME mean (a fixed affine map), not their own
+            # batch mean.
+            mean_np = pca_training_mean(pca, design_points.detach().cpu().numpy())
+            design_points = design_points - torch.as_tensor(
+                mean_np, dtype=torch.float64, device=points.device
+            ).reshape(1, -1)
         if pca.basis is None:
             if pca.K is None:
                 raise ValueError("Pca requires K when basis is None")
-            x_for_pca = points - points.mean(dim=0, keepdim=True) if pca.centered else points
-            _u, _s, vh = torch.linalg.svd(x_for_pca.to(torch.float64), full_matrices=False)
+            _u, _s, vh = torch.linalg.svd(design_points, full_matrices=False)
             basis = vh[: int(pca.K)].T.contiguous()
+            # Persist the fitted projection so later descriptor evaluations
+            # reuse the map this fit selected.
+            pca.basis = basis.detach().cpu().numpy()
         else:
-            basis = _to_tensor(pca.basis, points).to(torch.float64)
-            if basis.dim() != 2:
-                raise ValueError(f"Pca.basis must be 2D, got shape {tuple(basis.shape)}")
-            if pca.K is not None:
-                basis = basis[:, : int(pca.K)]
+            basis = torch.as_tensor(
+                pca_basis_matrix(pca), dtype=torch.float64, device=points.device
+            )
         if basis.shape[0] != points.shape[1]:
             raise ValueError(
                 f"Pca: points d={points.shape[1]} but basis has {basis.shape[0]} rows"
             )
-        design_points = points.to(torch.float64)
-        if pca.centered:
-            design_points = design_points - design_points.mean(dim=0, keepdim=True)
         design = design_points @ basis
         penalty = torch.eye(
             basis.shape[1], dtype=torch.float64, device=points.device
