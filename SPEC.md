@@ -6,6 +6,7 @@
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
 - Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch. Exception: analysis of results or examples in the proper, non-production directories.
+- It's required that the CLI, Python library, and Rust library are unified, have a single source of truth, and have behavior parity. Therefore, pyffi should not contain logic whenever possible, and should be thin.
 - The program must never run out of memory on reasonably-resourced computers.
 - REML (or LAML) always used for fitting, never GCV.
 - Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
