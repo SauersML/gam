@@ -3611,18 +3611,25 @@ impl SaeManifoldTerm {
             crate::encode::AtlasConfig::default(),
         )?;
 
-        // F3 — certify against the TRUE encode objective when a non-Euclidean
-        // per-row output metric is installed. The fit optimized each coordinate
-        // `t` against generalized least squares `½ rᵀ M_n r` (`M_n = U_n U_nᵀ`, the
-        // installed `RowMetric`), so a bare Euclidean encode certifies the root of
-        // a DIFFERENT problem. Route every (row, atom) through the metric-aware
-        // certified encode (`certified_encode_row_with_objective`), whitening the
-        // residual and the SSE guard by the row's factor `U_n` and scaling the
-        // offline chart Lipschitz by the global bound `max_n tr(M_n) ≥ max_n ‖M_n‖`
-        // (for PSD `M_n`, `‖M_n‖ = λ_max ≤ tr(M_n)`, so the certificate stays
-        // conservatively valid). The Euclidean amortized fast path is bypassed here
-        // because its Euclidean certificate does not certify the metric objective;
-        // metric-active fits are the structured regime where correctness dominates.
+        // F3 — certify against the TRUE encode objective when the installed
+        // per-row metric WHITENS THE LIKELIHOOD. The fit's reconstruction loss is
+        // then generalized least squares `½ rᵀ M_n r` (`M_n = U_n U_nᵀ`), so a bare
+        // Euclidean encode certifies the root of a DIFFERENT problem. Gate on
+        // `whitens_likelihood()`, NOT merely non-Euclidean: the gauge-only
+        // `OutputFisher`/`OutputFisherDownstream` provenances leave the data loss
+        // isotropic (whitening by them would be the #980 failure mode — silently
+        // replacing the reconstruction loss with a Fisher pullback). Only
+        // `WhitenedStructured` (estimated noise model) and `BehavioralFisher`
+        // (GLS-in-nats, elected) actually price `½ rᵀ M_n r`.
+        //
+        // Route every (row, atom) through the metric-aware certified encode
+        // (`certified_encode_row_with_objective`), whitening the residual and the
+        // SSE guard by the row's factor `U_n` and scaling the offline chart
+        // Lipschitz by the global bound `max_n tr(M_n) ≥ max_n ‖M_n‖` (for PSD
+        // `M_n`, `‖M_n‖ = λ_max ≤ tr(M_n)`, so the certificate stays conservatively
+        // valid). The Euclidean amortized fast path is bypassed here because its
+        // Euclidean certificate does not certify the metric objective; likelihood-
+        // whitening fits are the structured regime where correctness dominates.
         // NOTE: the latent ARD/von-Mises prior the fit also placed on `t` lives in
         // `rho.log_ard`, which this rho-free encode does not receive; wiring it
         // needs the fitted precisions carried on the atom (a finalization-site
@@ -3631,7 +3638,7 @@ impl SaeManifoldTerm {
         if let Some(metric) = self
             .row_metric
             .as_ref()
-            .filter(|m| !matches!(m.provenance(), gam_problem::MetricProvenance::Euclidean))
+            .filter(|m| m.whitens_likelihood())
         {
             if metric.p_out() != p || metric.n_rows() != n {
                 return Err(format!(
