@@ -485,7 +485,48 @@ pub(crate) fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
 pub(crate) fn spectral_pd_floored_schur(
     schur: &Array2<f64>,
     relative_floor: f64,
-) -> Option<Array2<f64>> {
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    spectral_conditioned_schur_with_factor(schur, relative_floor, false)
+}
+
+/// Unit-stiffness quotient conditioning for the *reduced* evidence Schur block.
+///
+/// `spectral_pd_floored_schur` is the right object for Newton steps: it is a
+/// Levenberg-Marquardt floor that damps collapsed decoder directions just enough
+/// to compute a stable `Δβ`.  The Laplace evidence path is different.  Once the
+/// reduced Schur is being used only for a log determinant, a non-positive (or
+/// numerically null) reduced direction is a quotient/null direction, just like
+/// the per-row `H_tt` spectral-deflation case.  It must contribute the
+/// ρ-independent constant `log 1 = 0`, not `log(floor·max λ)`: the latter is a
+/// ρ-dependent Occam reward for collapsed/redundant decoders and can make the
+/// outer REML sweep prefer a worse planted-manifold optimum.
+pub(crate) fn spectral_unit_deflated_schur(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    spectral_conditioned_schur_with_factor(schur, relative_floor, true)
+}
+
+/// Shared body for [`spectral_pd_floored_schur`] / [`spectral_unit_deflated_schur`]:
+/// symmetrise, eigendecompose, condition the spectrum per policy, and return BOTH
+/// the conditioned matrix `Σ λ̃_i v_i v_iᵀ` (consumed by Steihaug / matvec /
+/// mixed-precision refinement) and its lower Cholesky factor.
+///
+/// The factor is built DIRECTLY from the conditioned spectral form — QR of
+/// `W = diag(√λ̃)·Vᵀ` gives `A = WᵀW = RᵀR`, so `L = Rᵀ` — never by
+/// re-factorising the reconstructed matrix. Reconstruct-then-refactor fails
+/// under extreme eigenvalue spread: with `λ_max ~ 1e57` the `Σ λ̃ v vᵀ`
+/// reconstruction carries `O(ε·λ_max)` round-off, which swamps unit-deflated
+/// (`λ̃ = 1`) and floored (`λ̃ = floor·λ_max`) directions and re-poisons the
+/// second Cholesky — the #2230 "spectral PD-floor reconstruction still non-PD"
+/// refusal at a ρ whose conditioned evidence is perfectly well-defined. The QR
+/// route factors the exact conditioned spectrum, so it succeeds whenever the
+/// policy produced strictly positive `λ̃` (always, by construction).
+fn spectral_conditioned_schur_with_factor(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+    unit_deflate_null_directions: bool,
+) -> Option<(Array2<f64>, Array2<f64>)> {
     let n = schur.nrows();
     if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
         return None;
@@ -511,80 +552,33 @@ pub(crate) fn spectral_pd_floored_schur(
         return None;
     }
     let floor = relative_floor * max_abs;
-    // Reconstruct `Σ_i max(λ_i, floor) v_i v_iᵀ`: clamp every eigenvalue UP to a
-    // strictly positive `floor`. Healthy positive directions (`λ ≫ floor`) are
-    // untouched; non-positive / tiny collapsed directions are lifted to exactly
-    // `floor`. The result is symmetric PD by construction.
+    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    // Newton-step policy (LM): clamp every eigenvalue UP to a strictly positive
+    // `floor` — healthy positive directions (`λ ≫ floor`) keep their EXACT
+    // eigenvalue, collapsed/indefinite directions get the minimal stiffness for
+    // a stable `Δβ`. Evidence policy (`unit_deflate_null_directions`): a
+    // non-positive / numerically-null direction is a quotient direction and
+    // contributes the ρ-independent `log 1 = 0`, so it is set to UNIT stiffness
+    // instead (see the doc comments on the public wrappers).
     let mut conditioned = Array2::<f64>::zeros((n, n));
+    let mut weighted_vt = Array2::<f64>::zeros((n, n));
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
-        let lambda_floored = if lambda.is_finite() {
+        let lambda_conditioned = if unit_deflate_null_directions {
+            if !lambda.is_finite() || lambda <= 0.0 || lambda < deflate_floor {
+                1.0
+            } else {
+                lambda.max(floor)
+            }
+        } else if lambda.is_finite() {
             lambda.max(floor)
         } else {
             floor
         };
+        let sqrt_lambda = lambda_conditioned.sqrt();
         for i in 0..n {
             let vi = evecs[[i, eig_idx]];
-            if vi == 0.0 {
-                continue;
-            }
-            for j in 0..n {
-                conditioned[[i, j]] += lambda_floored * vi * evecs[[j, eig_idx]];
-            }
-        }
-    }
-    Some(conditioned)
-}
-
-/// Unit-stiffness quotient conditioning for the *reduced* evidence Schur block.
-///
-/// `spectral_pd_floored_schur` is the right object for Newton steps: it is a
-/// Levenberg-Marquardt floor that damps collapsed decoder directions just enough
-/// to compute a stable `Δβ`.  The Laplace evidence path is different.  Once the
-/// reduced Schur is being used only for a log determinant, a non-positive (or
-/// numerically null) reduced direction is a quotient/null direction, just like
-/// the per-row `H_tt` spectral-deflation case.  It must contribute the
-/// ρ-independent constant `log 1 = 0`, not `log(floor·max λ)`: the latter is a
-/// ρ-dependent Occam reward for collapsed/redundant decoders and can make the
-/// outer REML sweep prefer a worse planted-manifold optimum.
-pub(crate) fn spectral_unit_deflated_schur(
-    schur: &Array2<f64>,
-    relative_floor: f64,
-) -> Option<Array2<f64>> {
-    let n = schur.nrows();
-    if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
-        return None;
-    }
-    let mut sym = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..n {
-            let v = 0.5 * (schur[[i, j]] + schur[[j, i]]);
-            if !v.is_finite() {
-                return None;
-            }
-            sym[[i, j]] = v;
-        }
-    }
-    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
-    let max_abs = evals.iter().fold(
-        0.0_f64,
-        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
-    );
-    if !(max_abs.is_finite() && max_abs > 0.0) {
-        return None;
-    }
-    let floor = relative_floor * max_abs;
-    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
-    let mut conditioned = Array2::<f64>::zeros((n, n));
-    for eig_idx in 0..evals.len() {
-        let lambda = evals[eig_idx];
-        let lambda_conditioned = if !lambda.is_finite() || lambda <= 0.0 || lambda < deflate_floor {
-            1.0
-        } else {
-            lambda.max(floor)
-        };
-        for i in 0..n {
-            let vi = evecs[[i, eig_idx]];
+            weighted_vt[[eig_idx, i]] = sqrt_lambda * vi;
             if vi == 0.0 {
                 continue;
             }
@@ -593,7 +587,39 @@ pub(crate) fn spectral_unit_deflated_schur(
             }
         }
     }
-    Some(conditioned)
+    let factor = spectral_qr_cholesky_factor(&weighted_vt)
+        .or_else(|| cholesky_lower(&conditioned).ok())?;
+    Some((conditioned, factor))
+}
+
+/// Lower Cholesky factor of `A = WᵀW` computed from `W` itself: QR gives
+/// `W = QR ⇒ A = RᵀR`, so the factor is `L = Rᵀ` (rows sign-fixed to a positive
+/// diagonal). `W` here is `diag(√λ̃)·Vᵀ` with every `λ̃ > 0`, so `W` has full
+/// rank and the factor exists exactly; returns `None` only if the QR itself
+/// declines or produces a non-finite / zero pivot, in which case the caller
+/// falls back to factoring the reconstructed matrix (the historical path).
+fn spectral_qr_cholesky_factor(weighted_vt: &Array2<f64>) -> Option<Array2<f64>> {
+    let n = weighted_vt.nrows();
+    let (_q, r) = weighted_vt.qr().ok()?;
+    if r.nrows() != n || r.ncols() != n {
+        return None;
+    }
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        let d = r[[i, i]];
+        if !d.is_finite() || d == 0.0 {
+            return None;
+        }
+        let s = if d < 0.0 { -1.0 } else { 1.0 };
+        for j in i..n {
+            let v = s * r[[i, j]];
+            if !v.is_finite() {
+                return None;
+            }
+            l[[j, i]] = v;
+        }
+    }
+    Some(l)
 }
 
 pub(crate) fn factor_dense_reduced_schur(
@@ -622,17 +648,7 @@ pub(crate) fn factor_dense_reduced_schur(
                 } else {
                     spectral_pd_floored_schur(schur, relative_floor)
                 } {
-                    Some(floored) => (
-                        cholesky_lower(&floored).map_err(|floored_err| {
-                            ArrowSchurError::SchurFactorFailed {
-                                reason: format!(
-                                    "reduced Schur non-PD ({e}); spectral PD-floor \
-                                     reconstruction still non-PD: {floored_err}"
-                                ),
-                            }
-                        })?,
-                        Some(floored),
-                    ),
+                    Some((floored, floored_factor)) => (floored_factor, Some(floored)),
                     None => {
                         return Err(ArrowSchurError::SchurFactorFailed {
                             reason: format!(
@@ -715,8 +731,7 @@ pub(crate) fn solve_dense_reduced_system(
             // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
             // Without the floor (BA / non-SAE callers) the strict refusal stands.
             if let Some(relative_floor) = options.schur_pd_floor
-                && let Some(floored) = spectral_pd_floored_schur(schur, relative_floor)
-                && let Ok(floored_factor) = cholesky_lower(&floored)
+                && let Some((floored, floored_factor)) = spectral_pd_floored_schur(schur, relative_floor)
             {
                 let direct =
                     mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
