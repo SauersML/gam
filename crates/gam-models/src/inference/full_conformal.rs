@@ -202,6 +202,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
 
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /
@@ -1888,30 +1889,45 @@ impl<'a> GlmHomotopyFullConformal<'a> {
             }
             // gᵀH⁻¹g ≥ 0: the Newton direction is a descent direction.
             let decrease = g.dot(&step);
-            let mut t = 1.0_f64;
-            let mut accepted = false;
-            for _ in 0..GLM_NEWTON_MAX_BACKTRACKS {
-                let mut cand = beta.clone();
-                cand.scaled_add(-t, &step);
-                let cand_nll = self.penalized_nll(&cand, z);
-                if cand_nll.is_finite() && cand_nll <= nll - GLM_ARMIJO_C1 * t * decrease {
-                    beta = cand;
-                    nll = cand_nll;
-                    accepted = true;
+            let search = backtracking_line_search::<_, std::convert::Infallible>(
+                BacktrackConfig {
+                    initial_step: 1.0,
+                    contraction: 0.5,
+                    max_steps: GLM_NEWTON_MAX_BACKTRACKS,
+                },
+                |t| {
+                    let mut cand = beta.clone();
+                    cand.scaled_add(-t, &step);
+                    let cand_nll = self.penalized_nll(&cand, z);
+                    Ok(if cand_nll.is_finite() {
+                        Some((cand_nll, cand))
+                    } else {
+                        None
+                    })
+                },
+                |t, cand_nll| cand_nll <= nll - GLM_ARMIJO_C1 * t * decrease,
+            );
+            let accepted = match search {
+                Ok(step) => step,
+                Err(never) => match never {},
+            };
+            match accepted {
+                Some(step) => {
+                    beta = step.payload;
+                    nll = step.value;
+                }
+                None => {
+                    // The Armijo line search could not realize the predicted
+                    // descent `½·gᵀH⁻¹g`. Near the optimum that decrease
+                    // underflows the round-off of `penalized_nll` (`~ε·nll`),
+                    // so a failed line search is the FLOOR of this Newton loop,
+                    // not a true failure — the iterate is
+                    // for-all-practical-purposes stationary. Stop iterating and
+                    // let the certified error bound below decide acceptance
+                    // (rather than rejecting on an un-improvable gradient
+                    // floor).
                     break;
                 }
-                t *= 0.5;
-            }
-            if !accepted {
-                // The Armijo line search could not realize the predicted
-                // descent `½·gᵀH⁻¹g`. Near the optimum that decrease underflows
-                // the round-off of `penalized_nll` (`~ε·nll`), so a failed
-                // line search is the FLOOR of this Newton loop, not a true
-                // failure — the iterate is for-all-practical-purposes
-                // stationary. Stop iterating and let the certified error bound
-                // below decide acceptance (rather than rejecting on an
-                // un-improvable gradient floor).
-                break;
             }
         }
         // Acceptance is decided by the COMPUTED coefficient-error bound, not by
@@ -3317,19 +3333,27 @@ mod tests {
             if vec_norm(&step) <= 1e-13 * (1.0 + vec_norm(&beta)) {
                 break;
             }
-            let mut t = 1.0_f64;
-            loop {
-                let mut cand = beta.clone();
-                cand.scaled_add(-t, &step);
-                let cand_nll = pen_nll(&cand);
-                if cand_nll.is_finite() && cand_nll <= cur {
-                    beta = cand;
-                    cur = cand_nll;
-                    break;
-                }
-                t *= 0.5;
-                assert!(t > 1e-18, "oracle line search failed at z={z}");
-            }
+            let search = backtracking_line_search::<_, std::convert::Infallible>(
+                BacktrackConfig::default(),
+                |t| {
+                    let mut cand = beta.clone();
+                    cand.scaled_add(-t, &step);
+                    let cand_nll = pen_nll(&cand);
+                    Ok(if cand_nll.is_finite() {
+                        Some((cand_nll, cand))
+                    } else {
+                        None
+                    })
+                },
+                |_t, cand_nll| cand_nll <= cur,
+            );
+            let accepted = match search {
+                Ok(step) => step,
+                Err(never) => match never {},
+            };
+            let step = accepted.unwrap_or_else(|| panic!("oracle line search failed at z={z}"));
+            beta = step.payload;
+            cur = step.value;
         }
         beta
     }

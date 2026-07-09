@@ -42,6 +42,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side};
 use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_optimize::{backtracking_line_search, BacktrackConfig};
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {
@@ -1082,19 +1083,31 @@ impl SaeManifoldTerm {
                 let curv = (2.0 * a * b * b + (ddp * b * b + dp * b).max(0.0) + alpha).max(1e-300);
                 let dir = -grad / curv;
                 let g0 = gval(s);
-                let mut t = 1.0_f64;
-                let mut moved = false;
-                for _ in 0..40 {
-                    let sn = (s + t * dir).clamp(S_MIN, S_MAX);
-                    if gval(sn) <= g0 {
-                        s = sn;
-                        moved = true;
-                        break;
+                // Monotone-decrease backtracking on g over the Newton direction,
+                // clamped to the s-box: start t = 1, halve on reject (≤ 40 tries).
+                let accepted = match backtracking_line_search::<_, std::convert::Infallible>(
+                    BacktrackConfig {
+                        initial_step: 1.0,
+                        contraction: 0.5,
+                        max_steps: 40,
+                    },
+                    |t| {
+                        let sn = (s + t * dir).clamp(S_MIN, S_MAX);
+                        Ok(Some((gval(sn), sn)))
+                    },
+                    |_t, f| f <= g0,
+                ) {
+                    Ok(v) => v,
+                    Err(never) => match never {},
+                };
+                match accepted {
+                    Some(step) => {
+                        s = step.payload;
+                        if (step.step * dir).abs() < 1e-12 {
+                            break;
+                        }
                     }
-                    t *= 0.5;
-                }
-                if !moved || (t * dir).abs() < 1e-12 {
-                    break;
+                    None => break,
                 }
             }
             s.clamp(S_MIN, S_MAX).exp()
@@ -1529,22 +1542,36 @@ fn fit_beta_mle(r: &[f64]) -> Option<(f64, f64, f64)> {
         let d_b = (h_aa * g_b - h_ab * g_a) / det;
         // Step-halving to keep `(α, β)` strictly positive and non-decreasing in
         // loglik — a standard safeguard, no wall-clock budget.
-        let mut step = 1.0_f64;
         let base = beta_loglik_avg(alpha, beta, s_ln, s_ln1m);
-        let mut moved = false;
-        for _ in 0..40 {
-            let na = alpha + step * d_a;
-            let nb = beta + step * d_b;
-            if na > 0.0 && nb > 0.0 && beta_loglik_avg(na, nb, s_ln, s_ln1m) >= base {
+        let accepted = match backtracking_line_search::<_, std::convert::Infallible>(
+            BacktrackConfig {
+                initial_step: 1.0,
+                contraction: 0.5,
+                max_steps: 40,
+            },
+            |step| {
+                let na = alpha + step * d_a;
+                let nb = beta + step * d_b;
+                // Feasibility (strict positivity) gates the trial before the
+                // ascent test — mirrors the short-circuit `&&` of the original.
+                if na > 0.0 && nb > 0.0 {
+                    Ok(Some((beta_loglik_avg(na, nb, s_ln, s_ln1m), (na, nb))))
+                } else {
+                    Ok(None)
+                }
+            },
+            |_step, f| f >= base,
+        ) {
+            Ok(v) => v,
+            Err(never) => match never {},
+        };
+        match accepted {
+            Some(step) => {
+                let (na, nb) = step.payload;
                 alpha = na;
                 beta = nb;
-                moved = true;
-                break;
             }
-            step *= 0.5;
-        }
-        if !moved {
-            break;
+            None => break,
         }
     }
     let loglik = nf * beta_loglik_avg(alpha, beta, s_ln, s_ln1m);
