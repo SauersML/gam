@@ -529,8 +529,16 @@ fn compound_cyclic_plus_anchored_plus_sphere_fits_jointly() {
 /// MSPE below the Bernoulli variance floor.  We instead compare against the
 /// TRUE probability surface (denoising) — for which the bias-variance
 /// tradeoff gives MSPE on order p / N.  Tolerance is 0.02 (much less than
-/// the 0.25 Bernoulli variance floor; tight given N=600 and a smooth signal
-/// with no aliasing).
+/// the 0.25 Bernoulli variance floor; tight given N=600 and a smooth signal).
+///
+/// The truth carries a SECOND harmonic in theta (`-0.25·sin(2θ)`), so the
+/// periodic theta marginal must resolve frequency 2.  A cyclic cubic spline
+/// with k=4 places 4 evenly-spaced knots at {0, π/2, π, 3π/2}, which sit
+/// exactly on the zeros of sin(2θ): the second harmonic lands in the basis'
+/// Nyquist blind spot and is dropped by the fit, so k=4 would silently ignore
+/// a third of the signal while still passing under a loose tolerance.  k=6
+/// gives the marginal enough degrees of freedom (const, cos θ, sin θ, cos 2θ,
+/// sin 2θ) to represent the second harmonic, so recovery is genuinely tested.
 #[test]
 fn family_binomial_cylinder_recovers_probability_surface() {
     init_parallelism();
@@ -561,7 +569,7 @@ fn family_binomial_cylinder_recovers_probability_surface() {
     let test = predict_matrix(3, &[&theta, &h, &vec![0.0; n]]);
     let p_true_arr: Array1<f64> = Array1::from(p_true);
     let eta_pred = fit_and_predict_eta(
-        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None], k=4)",
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None], k=6)",
         &data,
         &binomial_cfg(),
         &test,
