@@ -61,9 +61,10 @@ pub(crate) fn reconstruction_explained_variance(
 /// reaches purely from finite-sample fitting noise — carrying no magnitude fit to
 /// any corpus and shrinking toward 0 as `n` grows, exactly as the null fitting
 /// noise does. `dictionary_rank` is the dictionary's GEOMETRICALLY REACHABLE rank
-/// (`reachable_dictionary_rank` = `Σ_k rank(Φ_k)`, read from the chart designs
-/// alone so a co-collapsed decoder still reports full reach), capped at
-/// `min(n, p) ≤ n`, so the floor stays in `[0, 1]`.
+/// (`reachable_dictionary_rank` = `rank([Φ_1 … Φ_K])`, read from the chart designs
+/// alone so a co-collapsed decoder still reports full reach), capped at the
+/// observation count `n` (NOT at the output dim `p` — see #F8 on
+/// `reachable_dictionary_rank`), so `q ≤ n` keeps the floor in `[0, 1]`.
 ///
 /// This REPLACES the former `0.5 × rank-q PCA/Eckart-Young EV ceiling` bar, which
 /// compared a `k_active`-SPARSE fit against a DENSE rank-`q` linear ceiling and so
@@ -97,9 +98,9 @@ pub(crate) fn absolute_degeneracy_ev_floor(
 /// all `basis_size_k` of its coefficient directions in the output — its decoded
 /// image `Φ_k B_k` lies inside `colspan(Φ_k)`, whose dimension is the realized
 /// chart rank `rank(Φ_k) ≤ basis_size_k`. Summing the per-atom REALIZED chart
-/// ranks (each capped at the output dim `p`) gives the linear dimension the
-/// dictionary's union of chart images can actually reach on this sample, which
-/// is the principled rank for the linear PCA ceiling that the bar uses.
+/// ranks gives the linear dimension the dictionary's union of chart images can
+/// actually reach on this sample, which is the principled rank for the linear
+/// PCA ceiling that the bar uses.
 ///
 /// The charts are read from the CHART design alone (not the decoder magnitude),
 /// so a co-collapsed atom (`‖B_k‖ → 0`) still reports its full geometric reach
@@ -113,9 +114,20 @@ pub(crate) fn absolute_degeneracy_ev_floor(
 /// true reachable rank 1, the sum claims 2), biasing the null floor `q/n` upward
 /// and manufacturing false collapse verdicts. The number of FREE reconstruction
 /// directions a signal-free dictionary fits is exactly this concatenated rank.
-/// Capped at the data rank `min(n, p)`. If any atom's design is non-finite or the
-/// concatenated SVD fails, the whole function degrades to the historical summed
-/// per-atom ranks rather than corrupting `q`.
+///
+/// #F8: `q` is capped at the OBSERVATION count `n`, NOT at the output dim `p`.
+/// The signal-free reconstruction is `X̂ = Φ·B` with `Φ = [Φ_1 … Φ_K]` (`n × Σ_k
+/// M_k`) fixed and the decoder `B` (`Σ_k M_k × p`) free, so each of the `p` target
+/// columns is least-squares projected onto `colspan(Φ) ⊆ Rⁿ` — a subspace of
+/// dimension `q = rank(Φ) ≤ min(n, Σ_k M_k)`. The expected captured fraction is
+/// `tr(P)/n = q/n` for EVERY column, so the null `R²` is `q/n` INDEPENDENT of `p`
+/// (the `p` output columns cancel between the Frobenius numerator and
+/// denominator). An OVERCOMPLETE dictionary (`Σ_k M_k > p`) can therefore reach
+/// `q > p` free directions; the old `min(n, p)` cap under-counted `q`, LOWERED the
+/// floor, and made the collapse detector LENIENT exactly for overcomplete
+/// dictionaries. `q ≤ n` still keeps the floor in `[0, 1]`. If any atom's design
+/// is non-finite or the concatenated SVD fails, the whole function degrades to the
+/// historical summed per-atom ranks rather than corrupting `q`.
 pub(crate) fn reachable_dictionary_rank(atoms: &[SaeManifoldAtom], n: usize, p: usize) -> usize {
     if atoms.is_empty() || n == 0 || p == 0 {
         return 0;
@@ -131,7 +143,6 @@ pub(crate) fn reachable_dictionary_rank(atoms: &[SaeManifoldAtom], n: usize, p: 
             })
             .sum::<usize>()
             .min(n)
-            .min(p)
     };
     let total_cols: usize = atoms.iter().map(|atom| atom.basis_values.ncols()).sum();
     if total_cols == 0 {
@@ -159,7 +170,7 @@ pub(crate) fn reachable_dictionary_rank(atoms: &[SaeManifoldAtom], n: usize, p: 
         return 0;
     }
     let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_sv;
-    sv.iter().filter(|&&v| v > tol).count().min(n).min(p)
+    sv.iter().filter(|&&v| v > tol).count().min(n)
 }
 
 /// #1207 — observable telemetry for the amortized warm-start (Design A). The
@@ -937,9 +948,18 @@ impl SaeManifoldOuterObjective {
     /// restored full term (and left as `seeded_beta`); the per-row coordinates are
     /// re-solved from the full data by that inner fit. The probes-on-subsample
     /// telemetry delta is recorded here.
-    pub(crate) fn restore_full_rows_for_final_fit(&mut self) {
+    ///
+    /// Returns `true` iff a subsampled state was actually swapped back — i.e. the
+    /// restored `term` carries the searched decoder on top of the pristine full-`N`
+    /// coordinates and is NOT yet at its full-`N` inner optimum. Callers that then
+    /// COMPARE this state against a freshly inner-solved candidate (the `into_fitted`
+    /// seed arbitration, #F7) must re-solve it at full `N` first, or the un-solved
+    /// searched state loses by construction. Callers that re-solve `term` anyway as
+    /// a side effect (e.g. `reml_criterion_*` in the certificate / shape-band paths)
+    /// can ignore the flag.
+    pub(crate) fn restore_full_rows_for_final_fit(&mut self) -> bool {
         let Some(state) = self.row_subsample.take() else {
-            return;
+            return false;
         };
         let searched_beta = self.term.flatten_beta();
         self.term = state.full_term;
@@ -970,6 +990,7 @@ impl SaeManifoldOuterObjective {
             state.subsample.len(),
             state.subsample.seed,
         );
+        true
     }
 
     /// Whether the outer ρ search is currently running on a row subsample.
@@ -1096,7 +1117,7 @@ impl SaeManifoldOuterObjective {
         // The final accepted fit and every reported quantity run at full `N` at
         // the selected ρ — the ρ search may have run on a row subsample, but it is
         // swapped back (warm-started from the search-fitted decoder) here.
-        self.restore_full_rows_for_final_fit();
+        let restored_from_subsample = self.restore_full_rows_for_final_fit();
         let Self {
             mut term,
             mut baseline_term,
@@ -1114,6 +1135,61 @@ impl SaeManifoldOuterObjective {
         let pristine_seed_term = baseline_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
+        let mut last_loss = last_loss;
+        // #F7 — when the ρ search ran on a row subsample, `restore_full_rows_for_final_fit`
+        // swapped the pristine full-`N` term back in and warm-started `term`'s decoder
+        // from the subsampled search, but left the per-row coordinates at the pristine
+        // full-`N` seed — NOT re-solved against that decoder. The seed candidate in the
+        // arbitration below is FULLY inner-solved at full `N` (`fit_streaming_in_memory`
+        // / `run_joint_fit_arrow_schur`), so comparing the two as-is pits an inner-solved
+        // seed against an UN-solved searched state: the searched decoder loses by
+        // construction and the whole subsampled search contributes only ρ. Re-solve the
+        // searched state at full `N` (warm-started from its own decoder, which is already
+        // installed in `term`) so both regimes — streaming and dense — arbitrate
+        // like-for-like inner-solved candidates. Skipped when the search ran at full `N`
+        // (no restore): `term` is then already at its inner optimum at `fitted_rho`, so a
+        // re-solve would be a redundant full-`N` fit.
+        if restored_from_subsample {
+            let mut rho_full = fitted_rho.clone();
+            let resolve = match term.streaming_plan().admitted_or_error(
+                term.n_obs(),
+                term.output_dim(),
+                term.k_atoms(),
+            ) {
+                Ok(plan)
+                    if plan.streaming
+                        && plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
+                        && plan.estimated_dense_schur_bytes <= plan.in_core_budget_bytes =>
+                {
+                    term.fit_streaming_in_memory(
+                        target.view(),
+                        &mut rho_full,
+                        registry.as_ref(),
+                        inner_max_iter,
+                        learning_rate,
+                        ridge_ext_coord,
+                        ridge_beta,
+                    )
+                }
+                Ok(_) => term.run_joint_fit_arrow_schur(
+                    target.view(),
+                    &mut rho_full,
+                    registry.as_ref(),
+                    inner_max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                ),
+                Err(err) => Err(err),
+            };
+            match resolve {
+                Ok(resolved_loss) => last_loss = Some(resolved_loss),
+                Err(err) => log::warn!(
+                    "[#F7] full-N re-solve of the subsample-searched state failed ({err}); \
+                     arbitrating the un-solved searched decoder against the inner-solved seed"
+                ),
+            }
+        }
         // Fit-level keep-best consult (`best_fit_incumbent`): if the terminal
         // outer state reconstructs strictly worse than the best basin any
         // accepted iterate visited during the WHOLE ρ search, restore that basin
@@ -2922,14 +2998,16 @@ impl SaeManifoldOuterObjective {
     ///
     /// All ρ coords are log-quantities, so the engine's additive step
     /// `rho_new = rho + step` IS the multiplicative FS update. Per coord:
-    /// - ARD axis (k,j): `α_new = φ̂ n / (‖t_kj‖² + tr_kj(H⁻¹))`,
+    /// - ARD axis (k,j): `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))` (unit-dispersion
+    ///   MacKay fixed point, #F1 — no `φ̂`),
     ///   `step = ln α_new − log_ard[k][j]`. The `tr_kj(H⁻¹)` posterior
     ///   variance (from the selected-inverse latent diagonal) is exactly the
     ///   term the deleted `α=n/‖t‖²` rule dropped, so α cannot collapse on a
     ///   degenerate axis: as `‖t‖²→0`, `tr_kj(H⁻¹)→1/α` bounds the
     ///   denominator and the fixed point has a finite root.
-    /// - λ_smooth[k] (per-atom, #1556): `λ_k_new = φ̂[p·rank S_k − tr_k(S_β⁻¹ M_k)]
-    ///   / B_kᵀ(S_k⊗I_p)B_k` (Wood-Fasiolo EFS, already per-coordinate),
+    /// - λ_smooth[k] (per-atom, #1556): `λ_k_new = [p·rank S_k − tr_k(S_β⁻¹ M_k)]
+    ///   / B_kᵀ(S_k⊗I_p)B_k` (Wood-Fasiolo EFS, already per-coordinate, #F1 — no
+    ///   `φ̂`),
     ///   `step = ln λ_k_new − log_lambda_smooth[k]`, written into each atom's own
     ///   step slot `1+k`.
     /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
@@ -3020,18 +3098,11 @@ impl SaeManifoldOuterObjective {
             Err(err) => return Err(err),
         };
         self.current_rho = rho.clone();
-        let residual = self
-            .term
-            .reconstruction_residual(self.target.view(), &rho)
-            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: residual: {e}"))?;
-        let dispersion = self
-            .term
-            .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))
-            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: dispersion: {e}"))?;
         self.last_loss = Some(loss);
 
         // HT effective row count for the ARD MacKay/Fellner–Schall α-step: under the
-        // outer row subsample the α fixed point `α ← φ̂·n_eff/(‖t‖²+tr)` must use the
+        // outer row subsample the α fixed point `α ← n_eff/(‖t‖²+tr)` (#F1 — no `φ̂`)
+        // must use the
         // SAME weighted count `n_eff = Σᵢ wᵢ ≈ N` as the (weight-aware) `ard_value`
         // normalizer and `ard_coord_sumsq` numerator, or the step ranks a different
         // precision than the criterion it descends. `None` ⇒ `n_eff = n`, historical.
@@ -3070,7 +3141,7 @@ impl SaeManifoldOuterObjective {
 
         // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
         // update (#1556). The EFS fixed point is already per-coordinate, so each
-        // atom `k` gets `λ_k_new = φ̂·(rank_k − edof_k)/energy_k` written into its
+        // atom `k` gets `λ_k_new = (rank_k − edof_k)/energy_k` written into its
         // own step slot. `rank_k = r_k·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
         // `energy_k = <B_k, S_k B_k>` are the per-atom splits of the historical
         // global totals. The penalized-dimension `rank_k` uses the atom's
@@ -3099,7 +3170,22 @@ impl SaeManifoldOuterObjective {
             // non-positive numerator (transient far from the optimum) by holding
             // that atom's λ fixed (step 0) — the cost path still moves it then.
             if quad_k > 0.0 && rank_k - eff_dof_k > 0.0 && lambda_k > 0.0 {
-                let lambda_new = dispersion * (rank_k - eff_dof_k) / quad_k;
+                // #F1 — NO dispersion factor. The outer objective the value/gradient
+                // lanes minimize is the UNIT-dispersion penalized Laplace criterion
+                // `v = ½‖r‖² + ½Σ_k λ_k·B_kᵀS_kB_k + ½log|H| − ½Σ_k rank_k·log λ_k`
+                // (`reml_criterion_*`: `loss.data_fit` is the raw half-SSE, with no
+                // `1/φ̂` on the data term and no `(np/2)·ln φ̂` scale term). Its
+                // stationarity in `ρ_k = log λ_k` — using `edof_k = tr(H⁻¹·λ_k S_k)`
+                // so `tr(H⁻¹S_k) = edof_k/λ_k` — is
+                //   ½B_kᵀS_kB_k + ½·edof_k/λ_k − ½·rank_k/λ_k = 0
+                //   ⇒ λ_k = (rank_k − edof_k)/B_kᵀS_kB_k,
+                // with NO `φ̂`. The former `φ̂·(…)` fixed point was the textbook
+                // ESTIMATED-scale GAM update; against this unit-scale criterion it
+                // walked to `φ̂·λ*`, so the EFS lane and the value lane optimized two
+                // different objectives inside one solve. Matches the φ̂-free value
+                // gradient (`reml_occam_log_lambda_smooth_derivative` +
+                // `decoder_smoothness_value_per_atom`).
+                let lambda_new = (rank_k - eff_dof_k) / quad_k;
                 if lambda_new.is_finite() && lambda_new > 0.0 {
                     steps[1 + atom_idx] = lambda_new.ln() - rho.log_lambda_smooth[atom_idx];
                 }
@@ -3133,7 +3219,16 @@ impl SaeManifoldOuterObjective {
                     for (j, &logard_kj) in axis_logard.iter().enumerate() {
                         let denom = sumsq[k][j] + traces[k][j];
                         if denom > 0.0 {
-                            let alpha_gauss = dispersion * n_eff / denom;
+                            // #F1 — NO dispersion factor (same unit-dispersion
+                            // criterion as λ_smooth). The Gaussian coordinate prior
+                            // contributes `+½α‖t‖² − ½·n_eff·log α` to the unit-scale
+                            // `v`, and `½log|H|` contributes `½α·tr(H⁻¹)`; stationarity
+                            // in `log α` gives `α(‖t‖² + tr) = n_eff`, i.e. `α_new =
+                            // n_eff/denom` with NO `φ̂` — matching the φ̂-free value
+                            // gradient `ard_log_precision_explicit_derivatives`
+                            // (`normalizer_deriv = −½·n_eff`). The former `φ̂·n_eff/…`
+                            // walked the ARD precision to `φ̂·α*`.
+                            let alpha_gauss = n_eff / denom;
                             let alpha_new = match ard_periods[k].get(j).copied().flatten() {
                                 Some(period) => von_mises_ard_precision(
                                     alpha_gauss,
@@ -3169,7 +3264,11 @@ impl SaeManifoldOuterObjective {
                         }
                     }
                     if count > 0 && denom > 0.0 {
-                        let alpha_gauss = dispersion * n_eff * (count as f64) / denom;
+                        // #F1 — NO dispersion factor (see the PerAtom branch). The
+                        // shared axis pools `count` owners' evidence, so `n_eff` is
+                        // lifted by `count`; the φ̂-free form is `α_new =
+                        // count·n_eff/denom`.
+                        let alpha_gauss = n_eff * (count as f64) / denom;
                         let alpha_new = match shared_period {
                             Some(period) => von_mises_ard_precision(
                                 alpha_gauss,
@@ -3202,8 +3301,8 @@ impl SaeManifoldOuterObjective {
 /// Correct the Gaussian Mackay/Fellner–Schall ARD precision proposal to the
 /// EXACT von-Mises empirical-Bayes fixed point on a PERIODIC axis.
 ///
-/// The closed-form update `α_gauss = φ̂·n_eff/(Σ q + tr H⁻¹)` is the stationary
-/// precision only for a Gaussian coordinate prior, whose normalized
+/// The closed-form update `α_gauss = n_eff/(Σ q + tr H⁻¹)` (#F1 — no `φ̂`) is the
+/// stationary precision only for a Gaussian coordinate prior, whose normalized
 /// log-partition contributes `−½ n_eff log α` (ρ-derivative `−½ n_eff`). On a
 /// periodic (von-Mises) axis the normalized prior's log-partition is
 /// `log P − η + log I0(η)`, `η = α/κ²`, whose ρ-derivative is
