@@ -4051,6 +4051,86 @@ impl<'a> RemlState<'a> {
         Some(Array1::from_iter(rho.into_iter().map(|v| v.clamp(lo, hi))))
     }
 
+    /// The GLOBAL single-λ (diagonal) Gaussian-identity REML optimum, mapped to a
+    /// UNIFORM per-block ρ seed. Setting every block's λ equal makes the effective
+    /// penalty `λ·Σ_j S_j`, so the profiled Gaussian REML criterion collapses to
+    /// the one-dimensional closed form on the summed penalty, whose global
+    /// minimiser is selected by grid-free stationary enumeration
+    /// (`gaussian_reml_closed_form`) rather than descent. Unlike the per-block
+    /// cyclic solver (`analytic_gaussian_closed_form_rho`), coordinate descent
+    /// cannot stall here at a coordinate-wise-stationary interior point: on a
+    /// double-penalty null-recovery fixture (#1815/#1867) the joint REML optimum
+    /// rails BOTH blocks onto the collapse shelf (edf → null dimension), but
+    /// cyclic descent parks at a strictly-inferior split (e.g. ρ ≈ [7.5, 1.1]).
+    /// The diagonal is the best single-λ RESTRICTION of the multi-λ problem, so a
+    /// feasible, principled candidate; the outer optimizer refines it and the
+    /// candidate is adopted only when it strictly lowers the true REML cost, so a
+    /// genuinely split-λ optimum (bend high / null low) and healthy fits are
+    /// unaffected — this only supplies the shelf corner the cyclic seed misses.
+    pub(crate) fn analytic_gaussian_summed_diagonal_rho(
+        &self,
+        bounds: (f64, f64),
+    ) -> Option<Array1<f64>> {
+        if !reml_is_gaussian_identity(&self.config.likelihood) {
+            return None;
+        }
+        if self.linear_constraints.is_some()
+            || self.coefficient_lower_bounds.is_some()
+            || self.runtime_mixture_link_state.is_some()
+            || self.runtime_sas_link_state.is_some()
+        {
+            return None;
+        }
+        let k = self.canonical_penalties.len();
+        if k == 0 {
+            return None;
+        }
+        if !matches!(self.x, DesignMatrix::Dense(_)) {
+            return None;
+        }
+        let x_dense = self
+            .x
+            .try_to_dense_by_chunks("gaussian_summed_diagonal_seed")
+            .ok()?;
+        let p = self.p;
+        if x_dense.ncols() != p {
+            return None;
+        }
+        // Sum the canonical penalties into a single p×p `S = Σ_j S_j` — the
+        // effective penalty when every λ_j is equal.
+        let mut s = Array2::<f64>::zeros((p, p));
+        for pen in self.canonical_penalties.iter() {
+            let r = pen.col_range.clone();
+            for (li, gi) in r.clone().enumerate() {
+                for (lj, gj) in r.clone().enumerate() {
+                    s[[gi, gj]] += pen.local[[li, lj]];
+                }
+            }
+        }
+        let mut y_eff = self.y.to_owned();
+        if self.offset.len() == y_eff.len() {
+            y_eff -= &self.offset;
+        }
+        let weights = self.weights.to_owned();
+        let result = crate::gaussian_reml::gaussian_reml_closed_form(
+            x_dense.view(),
+            y_eff.view(),
+            s.view(),
+            Some(weights.view()),
+            None,
+        )
+        .ok()?;
+        if !result.rho.is_finite() {
+            return None;
+        }
+        let (lo, hi) = if bounds.0 <= bounds.1 {
+            bounds
+        } else {
+            (bounds.1, bounds.0)
+        };
+        Some(Array1::from_elem(k, result.rho.clamp(lo, hi)))
+    }
+
     /// Returns the effective Hessian and the ridge value used (if any).
     /// Uses the same Hessian matrix in both cost and gradient calculations.
     ///
