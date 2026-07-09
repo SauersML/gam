@@ -1630,12 +1630,16 @@ class ManifoldSAE:
         false certificate). When omitted they default to the trained assignment
         magnitudes and the training-row norms, respectively.
         """
+        # Default bounds (per-atom max|assignment| and max row L2 of x) are
+        # reduced inside the Rust builder: hand it the raw arrays and a `None`
+        # sentinel rather than pre-reducing in NumPy. Explicit bounds pass
+        # through verbatim and the arrays are omitted.
+        assignments_arr = None
         if amplitude_bounds is None:
-            amp = np.abs(np.asarray(self.assignments, dtype=float))
-            amplitude_bounds = [
-                float(amp[:, k].max()) if amp.shape[0] else 1.0
-                for k in range(len(self._atom_dims))
-            ]
+            assignments_arr = np.ascontiguousarray(
+                np.asarray(self.assignments, dtype=float)
+            )
+        encode_rows_arr = None
         if target_norm_bound is None:
             if isinstance(self.training_data, _SaeTrainingDataHandle):
                 raise ValueError(
@@ -1643,9 +1647,8 @@ class ManifoldSAE:
                     "training data, but ManifoldSAE no longer stores the input matrix; "
                     "pass target_norm_bound explicitly."
                 )
-            td = np.asarray(self.training_data, dtype=float)
-            target_norm_bound = (
-                float(np.max(np.sqrt(np.sum(td * td, axis=1)))) if td.size else 1.0
+            encode_rows_arr = np.ascontiguousarray(
+                np.asarray(self.training_data, dtype=float)
             )
         return rust_module().build_sae_encode_atlas(
             list(self._basis_kinds),
@@ -1653,8 +1656,10 @@ class ManifoldSAE:
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
             [int(s) for s in self._basis_sizes],
-            [float(a) for a in amplitude_bounds],
-            float(target_norm_bound),
+            None if amplitude_bounds is None else [float(a) for a in amplitude_bounds],
+            None if target_norm_bound is None else float(target_norm_bound),
+            assignments=assignments_arr,
+            encode_rows=encode_rows_arr,
             grid_resolution=int(grid_resolution),
             ridge=float(ridge),
             newton_steps=int(newton_steps),

@@ -1515,6 +1515,22 @@ pub(crate) fn hash_analytic_penalty_kind(
                 hasher.write_usize(d);
             }
         }
+        AnalyticPenaltyKind::HarmonicRoughness(p) => {
+            hasher.write_str("harmonic-roughness");
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            // Per-period diagonal weights are the penalty's identity: the
+            // resolved operator tiles them across the `n_eff` rows, so two
+            // penalties with equal (weight, n_eff, rho_index) but different
+            // row_weights are distinct and must not share a warm-start key.
+            hasher.write_usize(p.row_weights.len());
+            for &w in &p.row_weights {
+                hasher.write_f64(w);
+            }
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
     }
 }
 

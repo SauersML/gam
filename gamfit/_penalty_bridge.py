@@ -320,7 +320,14 @@ class GumbelTemperatureSchedule:
         self.tau_start = float(tau_start)
         self.tau_min = float(tau_min)
         self.decay = name  # type: ignore[assignment]
-        self.rate = 0.9 if (rate is None and name == "geometric") else rate
+        # A geometric schedule may be specified either by an explicit `rate` or
+        # by the (tau_start, tau_min, steps) endpoints spec (Rust derives the
+        # rate). Only fall back to the 0.9 default when neither is given.
+        self.rate = (
+            0.9
+            if (rate is None and steps is None and name == "geometric")
+            else rate
+        )
         self.steps = steps
         self.iter_count = int(iter_count)
 

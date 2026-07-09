@@ -1,5 +1,6 @@
 pub mod amortized_encoder;
 pub mod assignment;
+pub mod assignment_state;
 pub mod front_door;
 pub mod attention_kernel;
 pub mod atom_codes;
