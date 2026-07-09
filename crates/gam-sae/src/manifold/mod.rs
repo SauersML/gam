@@ -378,6 +378,9 @@ mod tests_behavior_isometry_2015;
 mod tests_crosscoder_multiblock;
 
 #[cfg(test)]
+mod tests_crosscoder_block_fd_2231;
+
+#[cfg(test)]
 mod tests_ln_sphere_ambient_f4;
 
 #[cfg(test)]

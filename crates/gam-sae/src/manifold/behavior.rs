@@ -1084,6 +1084,98 @@ pub fn profiled_reml_criterion(
     0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
 }
 
+/// The analytic outer-REML gradient of [`profiled_reml_criterion`] with respect
+/// to each block weight `log λ_ℓ` (#2231 §2a), evaluated at a fitted state's
+/// UNSCALED per-block residual sums of squares. At the inner optimum the residual
+/// is stationary in `(t, β)` (the envelope theorem: `∂R/∂β · ∂β/∂λ` vanishes), so
+/// only the EXPLICIT `λ_ℓ`-dependence of the profiled criterion survives:
+///
+/// ```text
+///   ∂C/∂(log λ_ℓ) = (n·p̃/2) · λ_ℓ·R_ℓ / (R_x + Σ_m λ_m·R_m)  −  n·p_ℓ/2 ,
+/// ```
+///
+/// (`p̃ = p_x + Σ p_ℓ`), the exact derivative of the profiled Gaussian
+/// negative-log-marginal (`d pooled/d log λ_ℓ = λ_ℓ R_ℓ`) plus the `√λ_ℓ`
+/// target-scaling Jacobian (`d(−½ n Σ p_m log λ_m)/d log λ_ℓ = −½ n p_ℓ`). This is
+/// the desync-safe (#2087) partner of the value in [`profiled_reml_criterion`] —
+/// they are a consistent `(value, gradient)` pair, FD-verified in
+/// `tests_crosscoder_block_fd_2231.rs`.
+///
+/// The per-coordinate stationary point `λ_ℓ·R_ℓ = (p_ℓ/p̃)·pooled` is met exactly
+/// by the joint variance-ratio fixed point `λ_ℓ = (R_x/p_x)/(R_ℓ/p_ℓ)` (substitute
+/// and use `pooled = R_x·p̃/p_x` there), so the analytic gradient and the
+/// closed-form EFS step ([`profiled_reml_block_efs_log_lambda_steps`]) agree at the
+/// optimum — the coherence the planted two-layer test pins.
+///
+/// Returns all-zero for a non-positive pooled residual (the criterion is then
+/// `+∞`; a caller's line search rejects the value and must not consume a NaN
+/// direction).
+pub fn profiled_reml_block_log_lambda_gradient(
+    n_obs: usize,
+    p_x: usize,
+    rss_x: f64,
+    block_rss_unscaled: &[f64],
+    block_dims: &[usize],
+    block_log_lambda: &[f64],
+) -> Vec<f64> {
+    let n = n_obs as f64;
+    let mut p_tilde = p_x as f64;
+    let mut pooled = rss_x;
+    for ((&rss, &dim), &log_lambda) in block_rss_unscaled
+        .iter()
+        .zip(block_dims.iter())
+        .zip(block_log_lambda.iter())
+    {
+        pooled += log_lambda.exp() * rss;
+        p_tilde += dim as f64;
+    }
+    if !(pooled > 0.0) {
+        return vec![0.0; block_rss_unscaled.len()];
+    }
+    block_rss_unscaled
+        .iter()
+        .zip(block_dims.iter())
+        .zip(block_log_lambda.iter())
+        .map(|((&rss, &dim), &log_lambda)| {
+            let lambda_r = log_lambda.exp() * rss;
+            0.5 * n * p_tilde * lambda_r / pooled - 0.5 * n * dim as f64
+        })
+        .collect()
+}
+
+/// The Fellner–Schall / MacKay closed-form fixed-point STEP on each block weight
+/// `log λ_ℓ` (#2231 §2a): the ADDITIVE log-λ move to the variance-ratio root
+/// `log λ_ℓ* = ln((R_x/p_x)/(R_ℓ/p_ℓ))`, i.e. `step_ℓ = log λ_ℓ* − log λ_ℓ`. This
+/// is [`OutputBlock::reml_updated_log_lambda`] re-expressed as an outer-coordinate
+/// step (multiplicative in λ, additive in log λ — the EFS convention the outer
+/// engine's `efs_step` uses for every ρ coordinate), so a block coordinate reduces
+/// M1's alternation to one more Fellner–Schall coordinate. A block with no
+/// residual variance (`R_ℓ ≤ 0`, or a non-positive anchor variance) is
+/// unidentifiable and HELD (step 0), matching the M1 driver's `identifiable`
+/// gate.
+pub fn profiled_reml_block_efs_log_lambda_steps(
+    p_x: usize,
+    rss_x: f64,
+    block_rss_unscaled: &[f64],
+    block_dims: &[usize],
+    block_log_lambda: &[f64],
+) -> Vec<f64> {
+    let var_x = rss_x / p_x as f64;
+    block_rss_unscaled
+        .iter()
+        .zip(block_dims.iter())
+        .zip(block_log_lambda.iter())
+        .map(|((&rss, &dim), &log_lambda)| {
+            if var_x > 0.0 && rss > 0.0 {
+                let var_y = rss / dim as f64;
+                (var_x / var_y).ln() - log_lambda
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
