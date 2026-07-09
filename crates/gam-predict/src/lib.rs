@@ -32,11 +32,12 @@ use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 use gam_linalg::utils::predict_gam_dimension_mismatch_message;
-use gam_math::probability::{
+use gam_inference::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, normal_cdf, poisson_moment_matched_interval,
-    standard_normal_quantile, tweedie_moment_matched_interval,
+    negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
+    tweedie_moment_matched_interval,
 };
+use gam_math::probability::{normal_cdf, standard_normal_quantile};
 use gam_models::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
@@ -1751,22 +1752,13 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
-            let pm = strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])?;
-            if pm.is_finite() {
-                return Ok(pm);
-            }
-            // #1515: a pathological coefficient posterior — e.g. an all-zero
-            // Poisson fit, whose flat likelihood leaves the penalized Hessian
-            // near-singular with `se_eta` in the thousands — makes the
-            // response-scale posterior integral E[g⁻¹(η)] = exp(η + se_eta²/2)
-            // overflow to +inf. That serializes to a JSON null across the
-            // gam-pyffi boundary and crashes the Python shaper with a `None`
-            // mean, even though the point linear predictor is finite. Degrade
-            // gracefully to the plug-in mean g⁻¹(η̂): it is finite (exp(η̂) for
-            // the log link) and consistent with the reported `linear_predictor`,
-            // so a model the API reports as fitted always yields a finite
-            // response mean.
-            strategy.inverse_link(eta[i])
+            // The posterior-integrated mean E[g⁻¹(η)] can genuinely overflow
+            // f64 (an all-zero Poisson fit leaves se_eta in the thousands, so
+            // exp(η + se_eta²/2) → +inf). +inf IS the correctly rounded value
+            // of that integral; substituting the finite plug-in g⁻¹(η̂) here —
+            // the pre-audit #1515 behavior — silently reported an unbounded
+            // posterior mean as an innocuous finite number. Report it honestly.
+            strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])
         })
         .collect();
 
@@ -2019,15 +2011,41 @@ fn gaussian_observation_variance_per_row(
     }
 }
 
+/// Expected conditional response variance `E[Var(Y | μ)]` per row, integrating
+/// the family's variance function over the posterior of the response mean μ
+/// (posterior mean `m` = `mean[i]`, posterior variance `v` = `mean_variance[i]`).
+///
+/// The total predictive (observation) variance is, by the law of total
+/// variance, `E[Var(Y|μ)] + Var(μ)`; every consumer adds `Var(μ) = SE(μ̂)²`
+/// on top of this function's output. Plugging the posterior mean into
+/// `Var(Y|·)` — the pre-audit behavior — is exact only for Gaussian and
+/// Poisson, whose variance functions are constant/linear in μ. With
+/// `E[μ] = m`, `E[μ²] = m² + v`:
+///
+/// - Poisson:    `E[μ] = m`
+/// - NegBin:     `E[μ + μ²/θ] = m + (m² + v)/θ`
+/// - Gamma:      `E[φμ²] = φ(m² + v)`
+/// - Beta:       `E[μ(1−μ)]/(1+φ) = (m(1−m) − v)/(1+φ)`
+///   (so total = `(m(1−m) + φv)/(1+φ)`, not `m(1−m)/(1+φ) + v`)
+/// - Bernoulli:  `E[μ(1−μ)] = m(1−m) − v` (total is exactly `m(1−m)`)
+/// - Tweedie:    `φE[μ^p]`, evaluated exactly under the log-link log-normal
+///   posterior: `E[μ^p] = m^p (1 + v/m²)^{p(p−1)/2}` (reduces to `m^p` at
+///   `v = 0`; for p > 1 the factor is ≥ 1, so the plug-in under-counts).
+///
+/// `mean_variance = None` (or a length mismatch) means "no posterior
+/// uncertainty on μ", collapsing every formula to its plug-in value.
 pub(crate) fn family_response_variance<S>(
     response: &ResponseFamily,
     mean: &Array1<f64>,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
+    mean_variance: Option<&Array1<f64>>,
 ) -> Option<Array1<f64>>
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
+    let mv = mean_variance.filter(|m| m.len() == mean.len());
+    let v = |i: usize| mv.map_or(0.0, |m| m[i].max(0.0));
     match response {
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
@@ -2044,24 +2062,43 @@ where
             } else {
                 source.observation_theta()
             }?;
-            Some(mean.mapv(|mu| mu + mu.powi(2) / theta))
+            Some(Array1::from_iter(mean.iter().enumerate().map(
+                |(i, &mu)| mu + (mu.powi(2) + v(i)) / theta,
+            )))
         }
         ResponseFamily::Tweedie { p } => {
             let phi = source.observation_phi()?;
-            Some(mean.mapv(|mu| phi * mu.powf(*p)))
+            let power = *p;
+            Some(Array1::from_iter(mean.iter().enumerate().map(
+                |(i, &mu)| {
+                    let vi = v(i);
+                    let plug = phi * mu.powf(power);
+                    if vi > 0.0 && mu > 0.0 {
+                        plug * (1.0 + vi / (mu * mu)).powf(0.5 * power * (power - 1.0))
+                    } else {
+                        plug
+                    }
+                },
+            )))
         }
         ResponseFamily::Gamma => {
             let phi = source.observation_phi()?;
-            Some(mean.mapv(|mu| phi * mu.powi(2)))
+            Some(Array1::from_iter(mean.iter().enumerate().map(
+                |(i, &mu)| phi * (mu.powi(2) + v(i)),
+            )))
         }
         ResponseFamily::Beta { .. } => {
             let phi = source.observation_phi()?;
-            Some(mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi)))
+            Some(Array1::from_iter(mean.iter().enumerate().map(
+                |(i, &mu)| ((mu * (1.0 - mu) - v(i)).max(0.0)) / (1.0 + phi),
+            )))
         }
-        ResponseFamily::Binomial => Some(mean.mapv(|mu| {
-            let p = mu.clamp(0.0, 1.0);
-            p * (1.0 - p)
-        })),
+        ResponseFamily::Binomial => Some(Array1::from_iter(mean.iter().enumerate().map(
+            |(i, &mu)| {
+                let p = mu.clamp(0.0, 1.0);
+                (p * (1.0 - p) - v(i)).max(0.0)
+            },
+        ))),
         ResponseFamily::RoystonParmar => None,
     }
 }
@@ -2086,27 +2123,10 @@ where
         observation_support.clamp_in_place(&mut upper);
         (Some(lower), Some(upper))
     };
-    let response_observation_bounds = |response_var: Array1<f64>| {
-        let obs_se = Array1::from_iter(
-            mean_standard_error
-                .iter()
-                .zip(response_var.iter())
-                .map(|(&mean_se, &obsvar)| (mean_se.powi(2) + obsvar).max(0.0).sqrt()),
-        );
-        let lower = Array1::from_iter(
-            mean.iter()
-                .zip(obs_se.iter())
-                .zip(z_lower_per_row.iter())
-                .map(|((&m, &s), &zl)| m - zl * s),
-        );
-        let upper = Array1::from_iter(
-            mean.iter()
-                .zip(obs_se.iter())
-                .zip(z_upper_per_row.iter())
-                .map(|((&m, &s), &zu)| m + zu * s),
-        );
-        clamp_to_support(lower, upper)
-    };
+    // Posterior variance of the response mean, Var(μ) = SE(μ̂)². Threaded into
+    // `family_response_variance` so each family's conditional variance is the
+    // law-of-total-variance term E[Var(Y|μ)], not the plug-in Var(Y|E[μ]).
+    let mean_variance = mean_standard_error.mapv(|s| s * s);
 
     // Skew-aware equal-tailed observation band for a non-Gaussian response. A
     // symmetric `μ ± z·σ` band gets the *width* right but the *shape* wrong: on
@@ -2195,7 +2215,14 @@ where
             // the conjugate Negative-Binomial (Gamma–Poisson) posterior
             // predictive — NOT a continuous moment-matched surrogate, which has
             // no zero atom and would over-cover the lower tail at low rates.
-            let response_var = mean.mapv(|mu| mu.max(0.0));
+            let response_var = family_response_variance(
+                response,
+                mean,
+                source,
+                None,
+                Some(&mean_variance),
+            )
+            .expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 poisson_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
@@ -2221,7 +2248,16 @@ where
             // effective dispersion), NOT a continuous moment-matched surrogate —
             // a Gamma has no zero atom and would grossly over-cover the lower
             // tail at low means.
-            let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
+            // E[Var(Y|μ)] = m + (m² + Var(μ))/θ (law of total variance; the
+            // plug-in m + m²/θ omitted Var(μ)/θ).
+            let response_var = family_response_variance(
+                response,
+                mean,
+                source,
+                None,
+                Some(&mean_variance),
+            )
+            .expect("theta availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
             })
@@ -2238,7 +2274,15 @@ where
             // zero atom and would over-cover the lower tail like the NB
             // surrogate, #1193). Estimation uncertainty is folded into an
             // effective dispersion that matches the inflated total variance.
-            let response_var = mean.mapv(|mu| phi * mu.powf(*p));
+            // E[Var(Y|μ)] = φE[μ^p] (log-normal-exact), not φ(E[μ])^p.
+            let response_var = family_response_variance(
+                response,
+                mean,
+                source,
+                None,
+                Some(&mean_variance),
+            )
+            .expect("phi availability was checked above");
             let power = *p;
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi)
@@ -2252,7 +2296,15 @@ where
             let Some(phi) = source.observation_phi() else {
                 return (None, None);
             };
-            let response_var = mean.mapv(|mu| phi * mu.powi(2));
+            // E[Var(Y|μ)] = φ(m² + Var(μ)) (the plug-in φm² omitted φ·Var(μ)).
+            let response_var = family_response_variance(
+                response,
+                mean,
+                source,
+                None,
+                Some(&mean_variance),
+            )
+            .expect("phi availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
@@ -2272,19 +2324,42 @@ where
             // mean is near, so a symmetric band mis-covers BOTH tails (#1194).
             // Build the edges from equal-tailed quantiles of a moment-matched
             // Beta predictive, mirroring the Gamma arm.
-            let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
+            // E[Var(Y|μ)] = (m(1−m) − Var(μ))/(1+φ), so the total predictive
+            // variance is (m(1−m) + φ·Var(μ))/(1+φ) — the plug-in added all of
+            // Var(μ) instead of its φ/(1+φ) share.
+            let response_var = family_response_variance(
+                response,
+                mean,
+                source,
+                None,
+                Some(&mean_variance),
+            )
+            .expect("phi availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
         ResponseFamily::Binomial => {
-            // Prediction returns probability/proportion means; trial counts are not in this API.
-            // Beta-logistic and mixture links use the closest conditional Bernoulli variance.
-            let response_var = mean.mapv(|mu| {
-                let p = mu.clamp(0.0, 1.0);
-                p * (1.0 - p)
-            });
-            response_observation_bounds(response_var)
+            // A new Bernoulli observation is DISCRETE on {0, 1}: a continuous
+            // Gaussian band on the probability scale can contain neither
+            // support point (p = 0.5, no parameter uncertainty: the 50% band
+            // [0.163, 0.837] excludes both 0 and 1 — actual coverage zero).
+            // Report equal-tailed quantiles of the marginal predictive
+            // P(Y = 1) = E[μ] instead: F⁻¹(q) = 0 for q < 1 − m, else 1, at
+            // the same per-row tail masses Φ(−z_lower) / Φ(z_upper) every
+            // other family's band targets. Coverage of [F⁻¹(p_lo), F⁻¹(p_hi)]
+            // is ≥ p_hi − p_lo by construction of the quantile function.
+            let n = mean.len();
+            let mut lower = Array1::<f64>::zeros(n);
+            let mut upper = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let m = mean[i].clamp(0.0, 1.0);
+                let p_lo = normal_cdf(-z_lower_per_row[i]);
+                let p_hi = normal_cdf(z_upper_per_row[i]);
+                lower[i] = if p_lo < 1.0 - m { 0.0 } else { 1.0 };
+                upper[i] = if p_hi < 1.0 - m { 0.0 } else { 1.0 };
+            }
+            (Some(lower), Some(upper))
         }
         ResponseFamily::RoystonParmar => (None, None),
     }
@@ -2368,7 +2443,28 @@ pub(crate) fn family_observation_band_per_row(
     let mut upper = Array1::<f64>::zeros(n);
     for i in 0..n {
         let mu = mean[i];
-        let total_var = (mean_standard_error[i].powi(2) + response_var[i]).max(0.0);
+        let v = mean_standard_error[i].powi(2);
+        // Law of total variance: `response_var` arrives as the per-row plug-in
+        // Var(Y | E[μ], φ(x)); lift it to E[Var(Y|μ)] before adding Var(μ) = v.
+        // With E[μ²] = μ² + v and the per-row dispersion in natural units
+        // (NB θ, Gamma ν = 1/φ, Beta φ, Tweedie φ):
+        //   NB      m + (m²+v)/θ         = plug + v/θ
+        //   Gamma   (m²+v)/ν             = plug + v/ν
+        //   Beta    (m(1−m)−v)/(1+φ)     = plug − v/(1+φ)
+        //   Tweedie φE[μ^p]              = plug·(1+v/m²)^{p(p−1)/2} (log-normal μ)
+        let expected_var = match response {
+            ResponseFamily::NegativeBinomial { .. } | ResponseFamily::Gamma
+                if dispersion[i] > 0.0 =>
+            {
+                response_var[i] + v / dispersion[i]
+            }
+            ResponseFamily::Beta { .. } => (response_var[i] - v / (1.0 + dispersion[i])).max(0.0),
+            ResponseFamily::Tweedie { p } if mu > 0.0 && v > 0.0 => {
+                response_var[i] * (1.0 + v / (mu * mu)).powf(0.5 * p * (p - 1.0))
+            }
+            _ => response_var[i],
+        };
+        let total_var = (v + expected_var).max(0.0);
         let p_lower = normal_cdf(-z_lower_per_row[i]);
         let p_upper = normal_cdf(z_upper_per_row[i]);
         match predictive(mu, dispersion[i], total_var, p_lower, p_upper) {
@@ -2930,7 +3026,8 @@ fn predictive_standard_error<S>(
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
-    match family_response_variance(&family.response, mean, source, None) {
+    let mean_variance = mean_standard_error.mapv(|s| s * s);
+    match family_response_variance(&family.response, mean, source, None, Some(&mean_variance)) {
         Some(response_var) => Array1::from_iter(
             mean_standard_error
                 .iter()
