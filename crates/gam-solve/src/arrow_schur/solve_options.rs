@@ -291,6 +291,20 @@ pub struct ArrowSolveOptions {
     /// caller of [`super::reduced_solve::solve_dense_reduced_system`]); the
     /// InexactPCG path is unaffected.
     pub schur_pd_floor: Option<f64>,
+    /// #1017 device-resident framed SAE frame for the LM ridge ladder.
+    ///
+    /// When set (by [`super::newton_step::solve_with_lm_escalation_inner`] on a
+    /// device-admitted matrix-free SAE system), the Direct SAE-PCG seam
+    /// ([`super::newton_step::try_device_arrow_direct_sae_pcg`]) recomputes only
+    /// the ridge-dependent per-row `ainv` per ladder trial and reuses the
+    /// resident ridge-independent operand buffers, instead of re-marshalling and
+    /// re-uploading every operand through `flatten_device_sae_frame_data` on each
+    /// trial. The solve is bit-identical; only the redundant per-trial upload is
+    /// removed. `None` (default) keeps the per-trial re-flatten path. A trait
+    /// object (like [`GpuSchurMatvec`]) so the CUDA-only device buffers it owns
+    /// never leak a `mod cuda`-gated type into these cfg-independent options.
+    pub sae_resident_frame:
+        Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -305,6 +319,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
             .field("solve_precision", &self.solve_precision)
             .field("schur_pd_floor", &self.schur_pd_floor)
+            .field("sae_resident_frame", &self.sae_resident_frame.is_some())
             .finish()
     }
 }
@@ -381,6 +396,7 @@ impl ArrowSolveOptions {
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             schur_pd_floor: None,
+            sae_resident_frame: None,
         }
     }
 
@@ -397,6 +413,7 @@ impl ArrowSolveOptions {
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             schur_pd_floor: None,
+            sae_resident_frame: None,
         }
     }
 
@@ -412,6 +429,7 @@ impl ArrowSolveOptions {
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             schur_pd_floor: None,
+            sae_resident_frame: None,
         }
     }
 
@@ -427,6 +445,7 @@ impl ArrowSolveOptions {
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             schur_pd_floor: None,
+            sae_resident_frame: None,
         }
     }
 

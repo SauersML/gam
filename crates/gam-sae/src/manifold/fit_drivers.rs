@@ -5126,6 +5126,25 @@ impl SaeManifoldTerm {
                 && self.retract_collapsed_decoders_in_loop() > 0
             {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
+            } else if self.quotient_scale && self.k_atoms() == 1 {
+                // #2228/#1095 K=1 scale-gauge. A single atom has no dictionary peer
+                // for the collapse-relative retraction above (`retract_collapsed_
+                // decoders_in_loop` is a K<2 no-op), so that path never fires — yet
+                // the K=1 IBP gate is HARD-CAPPED at `a_1 = σ(l_1/τ)·π_1 ≤ π_1`
+                // (`π_1 = (α/(α+1))^1 = 0.5` at the production α=1), so the decoder
+                // must carry the `1/a_1 ≥ 2×` compensating magnitude the smoothness
+                // penalty (scaled by λ, NOT the gate) fights: the penalized decoder
+                // argmin is over-shrunk by `1/a_1²`, the gated reconstruction can't
+                // reach the target, and the fit co-collapses (the #2228 inner-solve
+                // stall / the `R²≈1−(1−0.25)²=0.4375` pristine-seed fallback). Re-home
+                // the scale into the UNPENALIZED log-amplitude `s_1` at this accepted
+                // boundary — `pin_scale_gauge_k1` peels `‖B‖` into `s_1` (unit-`B̂`,
+                // scale-free smoothness) and pins `exp(s_1)` to the data optimum, so
+                // the reconstruction reaches the target regardless of the gate cap.
+                // Unconditional (not collapse-gated): a healthy low-signal K=1 atom is
+                // pinned to its true small amplitude by the same solve's monotone
+                // safeguard, so this only ever helps.
+                self.pin_scale_gauge_k1(target, rho)?;
             }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step

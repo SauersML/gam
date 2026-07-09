@@ -665,15 +665,43 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     // compute the required Steihaug boundary step.
     let max_iterations = options.pcg.max_iterations.max(sys.k.saturating_add(1));
     let relative_tolerance = options.pcg.relative_tolerance.min(1e-12);
-    match crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
-        sys,
-        device_data.as_ref(),
-        ridge_t,
-        ridge_beta,
-        rhs_beta,
-        max_iterations,
-        relative_tolerance,
-    ) {
+    // #1017: when the LM ridge ladder installed a device-resident SAE frame,
+    // recompute only the ridge-dependent per-row `ainv` and reuse the resident
+    // ridge-independent operand buffers instead of re-marshalling+re-uploading
+    // every operand through `flatten_device_sae_frame_data` on this trial. The
+    // solve is bit-identical; a resident `Unavailable` decline (shape drift /
+    // transient) retries via the established per-trial flatten so we neither drop
+    // to full CPU dense nor mask a genuine numerical signal — a
+    // `RidgeBumpRequired`/`SchurFactorFailed` still flows into the classifier
+    // below and drives the escalation exactly as the flatten path would.
+    let per_trial_flatten = || {
+        crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
+            sys,
+            device_data.as_ref(),
+            ridge_t,
+            ridge_beta,
+            rhs_beta,
+            max_iterations,
+            relative_tolerance,
+        )
+    };
+    let solve_result = match options.sae_resident_frame.as_ref() {
+        Some(resident) => match resident.resolve(
+            sys,
+            ridge_t,
+            ridge_beta,
+            rhs_beta,
+            max_iterations,
+            relative_tolerance,
+        ) {
+            Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {
+                per_trial_flatten()
+            }
+            other => other,
+        },
+        None => per_trial_flatten(),
+    };
+    match solve_result {
         Ok((delta_beta, mut diag)) => {
             if !step_inside_trust_region(delta_beta.view(), options.trust_region.radius, None) {
                 trace_decline!(
@@ -879,6 +907,41 @@ fn build_resident_base_frame_if_admitted(
     crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle::new(sys).ok()
 }
 
+/// #1017: build a device-resident framed SAE frame for the LM ridge ladder, or
+/// `None` to keep the per-trial re-flatten path.
+///
+/// The matrix-free SAE-PCG system is exactly the shape
+/// [`build_resident_base_frame_if_admitted`] declines (it rejects
+/// `htbeta_matvec.is_some()`), so it re-marshalled and re-uploaded every device
+/// operand through `flatten_device_sae_frame_data` on each ladder trial even
+/// though only `ainv = (H_tt + ridge_t·I)⁻¹` depends on the ridge. This admits
+/// the same shape [`try_device_arrow_direct_sae_pcg`] serves (Direct mode, framed
+/// `device_sae_pcg` present, no cross-row penalties / streaming) and hands the
+/// runtime/offload gate + the one-time upload to
+/// [`crate::gpu_kernels::arrow_schur::build_sae_resident_frame`]. Whenever this
+/// returns `Some`, the per-trial device solve it replaces would ALSO have run on
+/// the device — the resident frame changes only how the (identical) solve is fed.
+fn build_resident_sae_frame_if_admitted(
+    sys: &ArrowSchurSystem,
+    options: &ArrowSolveOptions,
+) -> Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>> {
+    if options.mode != ArrowSolverMode::Direct {
+        return None;
+    }
+    let data = sys.device_sae_pcg.as_ref()?;
+    if data.frame.is_none() {
+        return None;
+    }
+    if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
+        return None;
+    }
+    let cg_iters = options
+        .pcg
+        .max_iterations
+        .min(options.trust_region.max_iterations);
+    crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters)
+}
+
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
 /// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
@@ -918,6 +981,26 @@ pub fn solve_with_lm_escalation_inner(
     // per-trial re-upload path unchanged (Off, non-Direct, matrix-free, or below
     // the device threshold).
     let mut resident_frame = build_resident_base_frame_if_admitted(sys, options);
+    // #1017: the matrix-free SAE-PCG system is exactly the shape the dense base
+    // frame above declines, so it re-flattened every device operand each trial.
+    // Give it a device-resident frame that reuses the ridge-independent buffers
+    // and recomputes only `ainv` per trial (consumed by the Direct SAE-PCG seam
+    // through `options.sae_resident_frame`). Only built when the dense base frame
+    // is absent (mutually exclusive shapes); a `None` keeps the per-trial
+    // re-flatten path bit-identical. Carried via a `Cow` so options are cloned
+    // only when a resident frame is actually installed.
+    let core_options = match resident_frame
+        .is_none()
+        .then(|| build_resident_sae_frame_if_admitted(sys, options))
+        .flatten()
+    {
+        Some(frame) => {
+            let mut owned = options.clone();
+            owned.sae_resident_frame = Some(frame);
+            std::borrow::Cow::Owned(owned)
+        }
+        None => std::borrow::Cow::Borrowed(options),
+    };
     for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
         let damped_ridge_t = ridge_t + proximal_ridge;
         let damped_ridge_beta = ridge_beta + proximal_ridge;
@@ -967,9 +1050,11 @@ pub fn solve_with_lm_escalation_inner(
                 // Unavailable / GpuRequiresDenseSystem / NaN-ridge: retire the
                 // resident frame and fall back to the per-trial re-upload path.
                 resident_frame = None;
-                solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options)
+                solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, &core_options)
             }
-            None => solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options),
+            None => {
+                solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, &core_options)
+            }
         };
         match step_result {
             Ok((delta_t, delta_beta, mut pcg_diagnostics)) => {

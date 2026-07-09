@@ -1557,6 +1557,14 @@ pub fn apply_structure_move(
             // poles / Möbius, which need a new multi-chart atom representation)
             // is Increment 2 and lives with the atom/construction types this lane
             // does not own; see `fit_seam_transition`'s recorded sign.
+            // Index-stable during the search: fold `b`'s mass into `a` and
+            // transplant `b`'s chart, then DEMOTE `b` (the column stays so later
+            // proposals in the same round keep their harvested indices). The
+            // actual excision of `b` — the true-fusion tail that makes the
+            // effective atom count fall — is deferred to the round boundary
+            // ([`compact_glued_atoms`]), where all accepted glues are compacted at
+            // once before the polish refit, so no zombie survives for that refit's
+            // active-mass guard to resurrect (#1890 root cause).
             let mut child = term.clone();
             fold_atom_into(&mut child, *a, *b)?;
             if let Some(seam) = fit_seam_transition(term, *a, *b) {
@@ -1709,6 +1717,114 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
     }
     demote_atom(term, b)?;
     Ok(())
+}
+
+/// Physically REMOVE the atoms in `remove` from `term`/`rho` — the TRUE-FUSION
+/// tail that a demotion alone cannot deliver. A [`fold_atom_into`] combines the
+/// folded atom's routing mass into its survivor and drops its logit column to
+/// [`DEMOTE_LOGIT`], but a demoted-not-removed atom keeps a full decoder at ~0
+/// mass, and the joint refit's #976/#1003 active-mass guard
+/// ([`SaeManifoldTerm::enforce_active_mass_guard`]) runs at fit ENTRY after
+/// `collapse_events` is cleared: it reads that atom's max gate as below the trust
+/// floor and RESEEDS its logits to per-row winner parity, resurrecting the atom
+/// the glue just retired (the effective atom count never falls, #1890). So for a
+/// certified glue we excise the folded atoms outright — decoder atom,
+/// routing-logit column, latent coordinate block, per-atom `ungated`/frozen slot,
+/// and per-atom ρ (smoothness + ARD) blocks — so BOTH the raw and the active
+/// dictionary size fall, no zero-mass atom survives for the guard to revive, and
+/// each survivor is forced to carry the absorbed arc through the refit.
+///
+/// Every atom is dropped in ONE pass (a shared keep-mask), so removing several
+/// atoms needs no descending-index bookkeeping. Each survivor must already hold
+/// its folded partner's mass (call this AFTER the folds); any per-atom diagnostic
+/// caches are reset so the post-glue refit rebuilds them against the reduced
+/// dictionary rather than indexing a stale length-`K`.
+fn remove_atoms(
+    term: &mut SaeManifoldTerm,
+    rho: &mut SaeManifoldRho,
+    remove: &std::collections::BTreeSet<usize>,
+) -> Result<(), String> {
+    let k = term.k_atoms();
+    if let Some(&bad) = remove.iter().find(|&&j| j >= k) {
+        return Err(format!("remove_atoms: atom {bad} out of range (K={k})"));
+    }
+    if remove.len() >= k {
+        return Err("remove_atoms: cannot remove every atom".to_string());
+    }
+    if remove.is_empty() {
+        return Ok(());
+    }
+    let keep: Vec<usize> = (0..k).filter(|j| !remove.contains(j)).collect();
+    // Rebuild the atom list, coord blocks, ungated flags, and ρ blocks keeping
+    // only the surviving indices (descending removal on the Vecs would also work,
+    // but the keep-mask keeps atoms/coords/logits/ρ provably in lock-step).
+    term.atoms = keep.iter().map(|&j| term.atoms[j].clone()).collect();
+    term.assignment.logits = term.assignment.logits.select(Axis(1), &keep);
+    term.assignment.coords = keep.iter().map(|&j| term.assignment.coords[j].clone()).collect();
+    term.assignment.ungated = keep.iter().map(|&j| term.assignment.ungated[j]).collect();
+    term.assignment.frozen_logits = term
+        .assignment
+        .frozen_logits
+        .as_ref()
+        .map(|frozen| frozen.select(Axis(1), &keep));
+    // Per-atom ρ blocks (the block-relevance `log_lambda_block` is per-output-block,
+    // not per-atom, so it is untouched).
+    rho.log_lambda_smooth = keep.iter().map(|&j| rho.log_lambda_smooth[j]).collect();
+    rho.log_ard = keep.iter().map(|&j| rho.log_ard[j].clone()).collect();
+    // Drop per-atom diagnostic/incumbent caches indexed by the OLD `K`: they are
+    // rebuilt on demand (the post-glue refit re-derives them), and carrying a
+    // stale length-`K` vector past a smaller dictionary would mis-index.
+    term.collapse_events.clear();
+    term.atom_inner_fits = None;
+    term.oos_linear_images = None;
+    term.best_cocollapse_incumbent = None;
+    term.best_fit_incumbent = None;
+    // The row/border assembly layout is a `K`-dependent cache; drop it so the next
+    // assembly (the polish refit's basis refresh) rebuilds it for the reduced K.
+    term.last_row_layout = None;
+    Ok(())
+}
+
+/// Round-boundary TRUE-FUSION compaction (#1890). Every glue the round's e-gate
+/// ACCEPTED folded its partner atom in place and DEMOTED it (index-stable for the
+/// search's within-round proposal chain, which references harvested indices); here
+/// — once, after the search's chaining is done and before the polish refit — we
+/// excise those atoms for real so the effective (and raw) dictionary size falls.
+///
+/// The search-time scoring refit resurrects the demoted partner (the very
+/// active-mass guard this lane fights), so before excising we RE-ASSERT each
+/// survivor's hold on its partner's mass and chart (fold + seam transplant) on the
+/// adopted state, then drop every folded partner in one pass. No zero-mass zombie
+/// then reaches the polish refit's guard, and each survivor is forced to cover its
+/// absorbed arc. The `touched` guard in [`gam_solve::structure_search::search`]
+/// guarantees the accepted glues share no atom, so the survivors (the `a`s) and
+/// the removed partners (the `b`s) are disjoint. No accepted glue ⇒ a no-op.
+fn compact_glued_atoms(
+    term: &mut SaeManifoldTerm,
+    rho: &mut SaeManifoldRho,
+    round_ledger: &SearchLedger,
+) -> Result<usize, String> {
+    use gam_solve::structure_search::MoveVerdict;
+    let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for rec in &round_ledger.moves {
+        if let (StructureMove::Glue { a, b }, MoveVerdict::Accepted { .. }) = (&rec.mv, &rec.verdict)
+        {
+            let (a, b) = (*a, *b);
+            let k = term.k_atoms();
+            if a >= k || b >= k || a == b {
+                return Err(format!(
+                    "compact_glued_atoms: accepted glue ({a},{b}) out of range (K={k})"
+                ));
+            }
+            fold_atom_into(term, a, b)?;
+            if let Some(seam) = fit_seam_transition(term, a, b) {
+                transplant_glued_coords(term, a, b, &seam);
+            }
+            to_remove.insert(b);
+        }
+    }
+    remove_atoms(term, rho, &to_remove)?;
+    Ok(to_remove.len())
 }
 
 /// Append a child cloned from atom `parent`: identical basis, decoder, and
@@ -3336,6 +3452,20 @@ pub fn run_structure_search_rounds(
         round_predictions.push(birth_predictions);
 
         if applied {
+            // #1890 — TRUE-FUSION compaction. Every glue the round ACCEPTED folded
+            // its partner in place and demoted it (index-stable for the search's
+            // within-round chain); excise those partners NOW, before the polish
+            // refit, so the fusion actually reduces the dictionary and no zero-mass
+            // zombie reaches the refit's active-mass guard (which would otherwise
+            // reseed it back to routing parity and undo the glue). Done once per
+            // round on the adopted state, after the search's index-sensitive
+            // chaining is complete; the next round re-harvests fresh indices.
+            let (mut next_term, mut next_rho) = (next_term, next_rho);
+            compact_glued_atoms(
+                &mut next_term,
+                &mut next_rho,
+                rounds.last().expect("round ledger pushed above"),
+            )?;
             // The adopted winner reached its restructured form through the cheap
             // capped-iteration SCORING refit; re-refit it at the full inner
             // budget (same estimation-row weighting) before it becomes the next

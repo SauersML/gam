@@ -14,12 +14,15 @@
 //! the co-tiled arcs, and the reconstruction is preserved. A negative arm on
 //! two genuinely distinct (orthogonal-plane) circles must NOT glue.
 //!
-//! NOTE on the observable: a glue (like a fusion) applies via `fold_atom_into`,
-//! which DEMOTES the folded atom's routing to ~0 (logit → `DEMOTE_LOGIT`) and
-//! folds its mass into the survivor — it does NOT shrink `term.k_atoms()` (the
-//! column stays, carrying zero mass). So "K drops" is asserted on the ACTIVE
-//! atom count (atoms carrying routing mass above the support floor), not on the
-//! raw `k_atoms()`.
+//! NOTE on the observable: a glue folds the merged atom's mass into the survivor
+//! and then EXCISES it (true fusion, `remove_atom`), so both the raw `k_atoms()`
+//! and the ACTIVE atom count fall by one. A mere demotion would not survive: the
+//! next joint refit's active-mass guard reseeds any ~0-mass atom back to per-row
+//! winner parity, resurrecting the atom the glue retired (the #1890 root cause).
+//! We assert the drop on the ACTIVE count (atoms carrying routing mass above the
+//! support floor) — with removal this equals the raw `k_atoms()`, but the active
+//! count is the invariant the observable is about and stays correct even if a
+//! future glue variant demotes-without-removing a genuinely covered atom.
 
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};

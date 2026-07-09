@@ -175,22 +175,7 @@ impl RationalLogdetPlan {
         // one hashed master state has no window structure and no cross-seed
         // stream aliasing; determinism per seed (the CRN contract) is kept.
         let mut master = splitmix64_hash(seed);
-        let mut probes = Vec::with_capacity(num_probes);
-        for _ in 0..num_probes {
-            let mut v = Array1::<f64>::zeros(dim);
-            let mut bits: u64 = 0;
-            let mut remaining: u32 = 0;
-            for value in v.iter_mut() {
-                if remaining == 0 {
-                    bits = splitmix64(&mut master);
-                    remaining = 64;
-                }
-                *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
-                bits >>= 1;
-                remaining -= 1;
-            }
-            probes.push(v);
-        }
+        let probes = rademacher_block(&mut master, num_probes, dim);
         // Bracket-centred exp-sinh DE nodes for the shifted representation
         //
         //   log x = log c + ∫₀^∞ ( 1/(c+t) − 1/(x+t) ) dt,   c = √(λ_min·λ_max),
@@ -279,6 +264,59 @@ impl RationalLogdetPlan {
         seed: u64,
     ) -> Self {
         let basis = build_deflation_basis(matvec, self.dim, rank, subspace_iters, seed);
+        self.deflation = (!basis.is_empty()).then_some(DeflationSpec { basis });
+        self
+    }
+
+    /// Attach TWO-SIDED spectral deflation: freeze an orthonormal basis `Q`
+    /// spanning BOTH the `top_rank` largest-λ directions (block power on `S`) and
+    /// the `bottom_rank` smallest-λ directions (inverse iteration on `S⁻¹`, matrix-
+    /// free via CG), merged and re-orthonormalised into one basis.
+    ///
+    /// This is the wide-κ variance-reduction lever. The surrogate's Hutchinson bar
+    /// is `√(2·‖offdiag(P·log(S/c)·P)‖_F²)` — purely off-diagonal, so a
+    /// diagonal/scalar control variate buys NOTHING (Rademacher already resolves
+    /// the diagonal exactly). The off-diagonal mass of `log(S/c)` is loaded
+    /// SYMMETRICALLY onto the two spectral tails (`|log(λ/c)|` peaks at both
+    /// `λ_max` and `λ_min`), so the one-sided [`Self::with_deflation`] removes only
+    /// half of it and stalls near `½·lnκ`-scale error bars at wide κ. Peeling both
+    /// tails is a rank-`(top+bottom)` low-rank control variate whose deterministic
+    /// `tr(Qᵀ log(S/c) Q)` block (term1) is computed exactly and whose complement
+    /// carries only the interior — small — off-diagonal mass. At EQUAL total rank
+    /// this cuts the wide-κ bar by ≈`√2`·(tail/interior ratio) over one-sided
+    /// deflation; the decomposition stays EXACT for any orthonormal `Q`, so the
+    /// value is never biased (only the bar shrinks). `top_rank = bottom_rank = 0`
+    /// reduces to the bare-Hutchinson plan.
+    ///
+    /// The `cg` budget `(rel_tol, max_iters)` bounds the inverse-iteration solves;
+    /// it may be loose (an approximate bottom `Q` only relaxes the variance
+    /// reduction, never biases the estimate). Build this once at the plan's ρ, from
+    /// the same operator the evaluations use.
+    pub fn with_two_sided_deflation(
+        mut self,
+        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+        top_rank: usize,
+        bottom_rank: usize,
+        subspace_iters: usize,
+        seed: u64,
+        cg: (f64, usize),
+    ) -> Self {
+        let (cg_rel_tol, cg_max_iters) = cg;
+        let mut cols = build_deflation_basis(matvec, self.dim, top_rank, subspace_iters, seed);
+        cols.extend(build_inverse_deflation_basis(
+            matvec,
+            self.dim,
+            bottom_rank,
+            subspace_iters,
+            seed,
+            cg_rel_tol,
+            cg_max_iters,
+        ));
+        // Merge the two orthonormal families into ONE orthonormal basis (the top
+        // and bottom blocks are near-orthogonal but not exactly; the second MGS
+        // pass in `orthonormalize` cleans the cross terms and drops any collapsed
+        // column, so `Q` stays exactly orthonormal — the property term1 needs).
+        let basis = orthonormalize(&cols);
         self.deflation = (!basis.is_empty()).then_some(DeflationSpec { basis });
         self
     }
@@ -540,6 +578,33 @@ fn orthonormalize(cols: &[Array1<f64>]) -> Vec<Array1<f64>> {
     out
 }
 
+/// Draw `ncols` length-`dim` Rademacher (±1) vectors by consuming ONE sequential
+/// splitmix stream from `master` (LSB-first, 64 signs per word), the bit buffer
+/// reset per column. Single home for the probe/start-block generation shared by
+/// [`RationalLogdetPlan::build`], [`build_deflation_basis`], and
+/// [`build_inverse_deflation_basis`]; consuming from one advancing `master`
+/// (rather than a per-column `(seed + col)·γ` restart) is what removes the
+/// cross-column / cross-seed stream aliasing documented in `build`.
+fn rademacher_block(master: &mut u64, ncols: usize, dim: usize) -> Vec<Array1<f64>> {
+    (0..ncols)
+        .map(|_| {
+            let mut v = Array1::<f64>::zeros(dim);
+            let mut bits: u64 = 0;
+            let mut remaining: u32 = 0;
+            for value in v.iter_mut() {
+                if remaining == 0 {
+                    bits = splitmix64(master);
+                    remaining = 64;
+                }
+                *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
+                bits >>= 1;
+                remaining -= 1;
+            }
+            v
+        })
+        .collect()
+}
+
 /// Build the Hutch++ top-subspace basis `Q` (`≤ rank` orthonormal columns) by
 /// block-power (subspace) iteration on the operator: a `seed`-deterministic
 /// Rademacher start block, orthonormalised, then `iters` rounds of
@@ -567,29 +632,69 @@ fn build_deflation_basis(
     // block weakens the subspace iteration's coverage of the top eigenspace
     // for no reason. Determinism per seed is kept.
     let mut master = splitmix64_hash(seed.wrapping_add(0xD1B5_4A32_D192_ED03));
-    let mut cols: Vec<Array1<f64>> = (0..r)
-        .map(|_| {
-            let mut v = Array1::<f64>::zeros(dim);
-            let mut bits: u64 = 0;
-            let mut remaining: u32 = 0;
-            for value in v.iter_mut() {
-                if remaining == 0 {
-                    bits = splitmix64(&mut master);
-                    remaining = 64;
-                }
-                *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
-                bits >>= 1;
-                remaining -= 1;
-            }
-            v
-        })
-        .collect();
-    cols = orthonormalize(&cols);
+    let mut cols = orthonormalize(&rademacher_block(&mut master, r, dim));
     for _ in 0..iters.max(1) {
         if cols.is_empty() {
             break;
         }
         let applied: Vec<Array1<f64>> = cols.iter().map(|c| matvec(c.view())).collect();
+        cols = orthonormalize(&applied);
+    }
+    cols
+}
+
+/// Build the BOTTOM (smallest-λ) subspace basis by INVERSE subspace iteration:
+/// the same block-power as [`build_deflation_basis`] but with the operator
+/// replaced by `S⁻¹` (applied matrix-free by plain CG through `matvec`), so the
+/// rounds `Q ← orthonormalise(S⁻¹·Q)` amplify the SMALLEST eigenvalues instead of
+/// the largest. This is the second arm of the two-sided control variate
+/// ([`RationalLogdetPlan::with_two_sided_deflation`]): the Hutchinson variance of
+/// the surrogate rides on the off-diagonal Frobenius mass of `log(S/c)`, which a
+/// wide spectrum loads SYMMETRICALLY onto both tails (`log(λ_max/c) = +½lnκ` and
+/// `log(λ_min/c) = −½lnκ`), so peeling only the top leaves the entire bottom-tail
+/// contribution in the bar. A polynomial filter `(μI − S)` cannot reach the
+/// bottom on a dense log-uniform spectrum (the relative gap `(μ−λ_1)/(μ−λ_2) ≈ 1`
+/// gives no separation); genuine bottom amplification needs `S⁻¹`, whence the CG
+/// inverse iteration here.
+///
+/// The solves need NOT be accurate — an approximate bottom `Q` only relaxes the
+/// variance reduction, it can NEVER bias the estimate (the log-det split is exact
+/// for ANY orthonormal `Q`; see [`DeflationSpec`]). A loose `cg_rel_tol` and a
+/// bounded `cg_max_iters` therefore suffice, and a CG breakdown falls back to the
+/// (still valid) un-amplified start column. The whole build is a ONE-TIME frozen
+/// cost per outer solve, never per evaluation.
+fn build_inverse_deflation_basis(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    dim: usize,
+    rank: usize,
+    iters: usize,
+    seed: u64,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Vec<Array1<f64>> {
+    let r = rank.min(dim);
+    if r == 0 {
+        return Vec::new();
+    }
+    // Distinct master stream from the top-basis start (a different additive
+    // offset into splitmix) so the top and bottom start blocks are not aliased.
+    let mut master = splitmix64_hash(seed.wrapping_add(0x2545_F491_4F6C_DD1D));
+    let mut cols = orthonormalize(&rademacher_block(&mut master, r, dim));
+    let zero = Array1::<f64>::zeros(dim);
+    for _ in 0..iters.max(1) {
+        if cols.is_empty() {
+            break;
+        }
+        // Inverse iteration step: apply S⁻¹ column-wise via plain CG (shift 0 on
+        // the SPD operator). Approximate is fine; a breakdown keeps the column.
+        let applied: Vec<Array1<f64>> = cols
+            .iter()
+            .map(|c| {
+                shifted_cg(matvec, 0.0, c, &zero, cg_rel_tol, cg_max_iters)
+                    .map(|(y, _)| y)
+                    .unwrap_or_else(|| c.clone())
+            })
+            .collect();
         cols = orthonormalize(&applied);
     }
     cols
