@@ -39,15 +39,44 @@ const NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
 const SEED: u64 = 0x1891_C0_7A_9E_5D;
 const DESIGN_SEED: u64 = 0x1891_DE_517_C0;
 
-/// The two covariance modes under audit: the conditional `H⁻¹` band (#1870) and
-/// the smoothing-corrected band (#1871, the default preferred mode which adds
-/// the ρ̂ correction when available).
-const COVARIANCE_MODES: [(InferenceCovarianceMode, &str); 2] = [
-    (InferenceCovarianceMode::Conditional, "conditional (H⁻¹, #1870)"),
-    (
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-        "smoothing-corrected (H⁻¹ + J·Var(ρ̂)·Jᵀ, #1871)",
-    ),
+/// The band configurations under audit: covariance mode × bias correction.
+///
+/// The bias-correction axis is load-bearing for #1870. When
+/// `apply_bias_correction` is on (the DEFAULT, user-facing band), the reported
+/// centre shifts to β_BC = β̂ + H⁻¹S(β̂ − μ); the matching covariance is
+/// A·V·Aᵀ with A = I + H⁻¹S. The fit applies A to the SMOOTHING-CORRECTED
+/// covariance (optimizer.rs:3193) but stores the CONDITIONAL covariance as raw
+/// Vb — so a bias-corrected CONDITIONAL band is centred at β_BC yet reports the
+/// uncertainty of the shrunken mode β̂, the over-narrow band #1870 documents.
+/// This gate exercises all four cells so a red one names exactly the
+/// (mode, bias) configuration that under-covers.
+struct BandConfig {
+    covariance_mode: InferenceCovarianceMode,
+    apply_bias_correction: bool,
+    label: &'static str,
+}
+
+const CONFIGS: [BandConfig; 4] = [
+    BandConfig {
+        covariance_mode: InferenceCovarianceMode::Conditional,
+        apply_bias_correction: false,
+        label: "conditional core (bias off)",
+    },
+    BandConfig {
+        covariance_mode: InferenceCovarianceMode::Conditional,
+        apply_bias_correction: true,
+        label: "conditional bias-corrected (#1870 oracle)",
+    },
+    BandConfig {
+        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        apply_bias_correction: false,
+        label: "smoothing-corrected core (#1871)",
+    },
+    BandConfig {
+        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        apply_bias_correction: true,
+        label: "smoothing-corrected bias-corrected (default user band)",
+    },
 ];
 
 /// A smooth additive truth f(x1, x2) = center + g1(x1) + g2(x2), each component
@@ -104,12 +133,12 @@ fn simulate_dataset(
     .expect("encode gaussian replication dataset")
 }
 
-/// The credible band at every training row under the requested covariance mode.
-fn confidence_band(
-    fit: &FitResult,
-    level: f64,
-    covariance_mode: InferenceCovarianceMode,
-) -> (Array1<f64>, Array1<f64>) {
+/// The credible band at every training row under the requested configuration.
+///
+/// Only the covariance mode and the bias-correction flag are varied; the
+/// Edgeworth / boundary / OOD modifiers are held OFF (and no-op here anyway
+/// without their inputs) so the gate isolates the covariance-mode × bias axis.
+fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<f64>, Array1<f64>) {
     let FitResult::Standard(standard) = fit else {
         panic!(
             "gaussian `y ~ s(x1) + s(x2)` must fit through the dense standard path, \
@@ -125,14 +154,12 @@ fn confidence_band(
         .likelihood_family
         .clone()
         .expect("fit records its likelihood family");
-    // Central Vp/Vc band under the requested mode, corrections OFF so the gate
-    // measures the band's own calibration.
     let options = PredictUncertaintyOptions {
         confidence_level: level,
-        covariance_mode,
+        covariance_mode: config.covariance_mode,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
-        apply_bias_correction: false,
+        apply_bias_correction: config.apply_bias_correction,
         edgeworth_one_sided: false,
         boundary_correction: false,
         ..PredictUncertaintyOptions::default()
@@ -158,30 +185,31 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
     );
 
     let mut rng = CalibrationRng::new(SEED);
-    // hits[mode][level].
-    let mut hits = [[0usize; NOMINAL_LEVELS.len()]; COVARIANCE_MODES.len()];
+    // hits[config][level].
+    let mut hits = [[0usize; NOMINAL_LEVELS.len()]; CONFIGS.len()];
     let mut positive_width_seen = false;
 
     for _ in 0..N_REPLICATIONS {
         let truth = AdditiveTruth::draw(&mut rng);
         let data = simulate_dataset(&x1, &x2, &truth, &mut rng);
-        let config = FitConfig {
+        let fit_config = FitConfig {
             family: Some("gaussian".to_string()),
             ..FitConfig::default()
         };
-        let fit =
-            fit_from_formula("y ~ s(x1) + s(x2)", &data, &config).expect("gaussian additive fit");
+        let fit = fit_from_formula("y ~ s(x1) + s(x2)", &data, &fit_config)
+            .expect("gaussian additive fit");
 
         let pick = (rng.uniform_open01() * interior.len() as f64) as usize % interior.len();
         let j = interior[pick];
         let f_true = truth.eval(x1[j], x2[j]);
 
-        for (mode_idx, &(mode, _label)) in COVARIANCE_MODES.iter().enumerate() {
+        for (config_idx, config) in CONFIGS.iter().enumerate() {
             for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
-                let (lower, upper) = confidence_band(&fit, level, mode);
+                let (lower, upper) = confidence_band(&fit, level, config);
                 assert!(
                     lower[j].is_finite() && upper[j].is_finite() && upper[j] >= lower[j],
-                    "degenerate band at eval point {j} (mode {mode:?}, level {level}): [{}, {}]",
+                    "degenerate band at eval point {j} ({}, level {level}): [{}, {}]",
+                    config.label,
                     lower[j],
                     upper[j]
                 );
@@ -189,7 +217,7 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
                     positive_width_seen = true;
                 }
                 if lower[j] <= f_true && f_true <= upper[j] {
-                    hits[mode_idx][level_idx] += 1;
+                    hits[config_idx][level_idx] += 1;
                 }
             }
         }
@@ -202,13 +230,14 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
     );
 
     let mut failures = Vec::new();
-    for (mode_idx, &(_mode, label)) in COVARIANCE_MODES.iter().enumerate() {
+    for (config_idx, config) in CONFIGS.iter().enumerate() {
         for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
-            let verdict = audit_coverage(hits[mode_idx][level_idx], N_REPLICATIONS, level);
+            let verdict = audit_coverage(hits[config_idx][level_idx], N_REPLICATIONS, level);
             if verdict.class == CoverageClass::AntiConservative {
                 failures.push(format!(
-                    "mode {label} @ level {level}: empirical={:.4} (hits {}/{}), \
+                    "{} @ level {level}: empirical={:.4} (hits {}/{}), \
                      Wilson CI=[{:.4},{:.4}], nominal ABOVE the CI by {:.4} — anti-conservative",
+                    config.label,
                     verdict.empirical,
                     verdict.hits,
                     verdict.replications,
@@ -221,7 +250,7 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
     }
     assert!(
         failures.is_empty(),
-        "gaussian mean band under-covers the truth (per covariance mode):\n{}",
+        "gaussian mean band under-covers the truth (per covariance-mode × bias config):\n{}",
         failures.join("\n")
     );
 }
