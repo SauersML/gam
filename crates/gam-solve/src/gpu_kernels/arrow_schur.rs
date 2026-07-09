@@ -404,10 +404,16 @@ pub fn solve_arrow_newton_step_fused_force(
 /// [`solve_arrow_newton_step`] which re-uploads and re-factors the full system
 /// every call. On a non-CUDA host construction returns
 /// `ArrowSchurGpuFailure::Unavailable`.
-pub enum ResidentArrowFrameHandle {
-    #[cfg(target_os = "linux")]
-    Cuda(cuda::ResidentArrowFrame),
+#[cfg(target_os = "linux")]
+pub struct ResidentArrowFrameHandle {
+    inner: cuda::ResidentArrowFrame,
 }
+
+/// The resident CUDA frame has no value on hosts that cannot construct it.
+/// Keeping this type uninhabited preserves the fail-loud platform contract
+/// without exposing a fake non-CUDA implementation.
+#[cfg(not(target_os = "linux"))]
+pub enum ResidentArrowFrameHandle {}
 
 impl ResidentArrowFrameHandle {
     /// Upload the constant Hessian blocks and perform the one-time factor work.
@@ -435,9 +441,9 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self::Cuda(cuda::ResidentArrowFrame::new(
-                sys, ridge_t, ridge_beta,
-            )?))
+            Ok(Self {
+                inner: cuda::ResidentArrowFrame::new(sys, ridge_t, ridge_beta)?,
+            })
         }
     }
 
@@ -458,9 +464,7 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            match self {
-                Self::Cuda(inner) => inner.solve_gradient(g_t, g_beta),
-            }
+            self.inner.solve_gradient(g_t, g_beta)
         }
     }
 
@@ -473,9 +477,7 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            match self {
-                Self::Cuda(inner) => inner.log_det_hessian(),
-            }
+            self.inner.log_det_hessian()
         }
     }
 }
@@ -494,10 +496,15 @@ impl ResidentArrowFrameHandle {
 /// factor/solve — in place of the full `O(n·d·k)` host→device re-upload that
 /// [`solve_arrow_newton_step`] performs every trial. The per-trial numerics are
 /// bit-identical to that re-upload path (same POTRF/TRSM/Schur/back-sub order).
-pub enum ResidentBaseArrowFrameHandle {
-    #[cfg(target_os = "linux")]
-    Cuda(cuda::ResidentBaseArrowFrame),
+#[cfg(target_os = "linux")]
+pub struct ResidentBaseArrowFrameHandle {
+    inner: cuda::ResidentBaseArrowFrame,
 }
+
+/// The base-resident CUDA frame is unavailable, rather than emulated, on a
+/// non-CUDA host.
+#[cfg(not(target_os = "linux"))]
+pub enum ResidentBaseArrowFrameHandle {}
 
 impl ResidentBaseArrowFrameHandle {
     /// Upload the ridge-independent base blocks once. No factorization runs here;
@@ -518,7 +525,9 @@ impl ResidentBaseArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self::Cuda(cuda::ResidentBaseArrowFrame::new(sys)?))
+            Ok(Self {
+                inner: cuda::ResidentBaseArrowFrame::new(sys)?,
+            })
         }
     }
 
@@ -544,9 +553,7 @@ impl ResidentBaseArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            match self {
-                Self::Cuda(inner) => inner.refactor_and_solve(ridge_t, ridge_beta),
-            }
+            self.inner.refactor_and_solve(ridge_t, ridge_beta)
         }
     }
 }
