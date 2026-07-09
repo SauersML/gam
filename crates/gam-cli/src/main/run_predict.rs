@@ -186,13 +186,16 @@ pub(crate) fn run_predict_unified(
             pm.mean,
             // Response-scale `std_error` (#1536): the posterior-mean path
             // populates `mean_standard_error` once a confidence level is
-            // requested (it is here); fall back to the link-scale SE only for
-            // the unreachable point-only case.
-            Some(
-                pm.mean_standard_error
-                    .clone()
-                    .unwrap_or(pm.eta_standard_error),
-            ),
+            // requested (it is here). A missing column means the backend could
+            // not propagate coefficient uncertainty to the response scale
+            // (e.g. transformation models); the link-scale SE is not a
+            // substitute — dimensionally it is a different quantity — so
+            // refuse rather than emit a wrong column.
+            Some(pm.mean_standard_error.clone().ok_or_else(|| {
+                "posterior-mean prediction returned no response-scale standard error; \
+                 this model cannot report --uncertainty SE columns"
+                    .to_string()
+            })?),
             pm.mean_lower,
             pm.mean_upper,
         )
