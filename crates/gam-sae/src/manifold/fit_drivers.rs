@@ -286,7 +286,7 @@ impl SaeManifoldTerm {
     /// failure remains deterministic. The explicit policy argument lets the
     /// parallelism-invariance regression exercise both paths without changing
     /// the process-global Rayon pool.
-    fn refresh_basis_from_current_coords_with_parallelism(
+    pub(crate) fn refresh_basis_from_current_coords_with_parallelism(
         &mut self,
         parallel: bool,
     ) -> Result<(), String> {
@@ -4126,7 +4126,7 @@ impl SaeManifoldTerm {
     /// parallelism-invariance regression. `forced_parallelism == None` selects
     /// the production policy; tests force the serial and indexed-parallel paths
     /// inside local Rayon pools without mutating global process state.
-    fn apply_newton_step_impl_with_parallelism(
+    pub(crate) fn apply_newton_step_impl_with_parallelism(
         &mut self,
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
