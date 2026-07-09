@@ -1,0 +1,80 @@
+{
+  "meta": {
+    "comparator": "mgcv gam s(x, bs='ds', m=c(2,0)) method='REML'",
+    "note": "sp is mgcv's smoothing parameter; sum_edf and sp are the calibration targets. null.k20.sum_edf collapsing to ~1-2 with large sp is the mgcv baseline gam must match.",
+    "mgcv_version": "1.8.41"
+  },
+  "sin8": {
+    "exact": false,
+    "k40": {
+      "k":          40,
+      "n_train":         240,
+      "sum_edf": 2.000424744,
+      "sp": [
+        6210.544078
+      ],
+      "fitted_amplitude": 0.1934032841,
+      "max_dev_from_mean": 0.09672821577,
+      "reml_score": 252.3916558,
+      "max_err_vs_truth": 1.100142112,
+      "truth_rmse": 0.7040088838
+    },
+    "k50": {
+      "k":          50,
+      "n_train":         240,
+      "sum_edf": 46.89600402,
+      "sp": [
+        6.852228158e-07
+      ],
+      "fitted_amplitude": 2.136082262,
+      "max_dev_from_mean": 1.069558727,
+      "reml_score": -98.32374499,
+      "max_err_vs_truth": 0.1906368268,
+      "truth_rmse": 0.04937409776
+    },
+    "k20": {
+      "k":          20,
+      "n_train":         240,
+      "sum_edf": 2.000409246,
+      "sp": [
+        6443.016899
+      ],
+      "fitted_amplitude": 0.1934029384,
+      "max_dev_from_mean": 0.09672707805,
+      "reml_score": 252.3916535,
+      "max_err_vs_truth": 1.100141505,
+      "truth_rmse": 0.704008895
+    }
+  },
+  "deselection": {
+    "exact": false,
+    "k20": {
+      "k":          20,
+      "n_train":         200,
+      "sum_edf": 15.89315789,
+      "sp": [
+        0.0001779665652
+      ],
+      "fitted_amplitude": 2.014870332,
+      "max_dev_from_mean": 1.010647991,
+      "reml_score":  -293.43808,
+      "max_err_vs_truth": 0.02481825469,
+      "truth_rmse": 0.01053656823
+    }
+  },
+  "null": {
+    "exact": false,
+    "sigma":           1,
+    "k20": {
+      "k":          20,
+      "n_train":         300,
+      "sum_edf": 2.348702022,
+      "sp": [
+         9.27611423
+      ],
+      "fitted_amplitude": 0.06454273037,
+      "max_dev_from_mean": 0.04125667299,
+      "reml_score": 428.7849846
+    }
+  }
+} 
