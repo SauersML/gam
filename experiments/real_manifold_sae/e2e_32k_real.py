@@ -6,8 +6,12 @@ must not be slow (slow = bug), and every user-facing feature must work on the
 resulting fit (each feature failure is recorded as a named bug).
 
 Arms (identical PCA-reduced data):
-  linear32k   — block_sparse_dictionary_fit, 32,000 blocks of size 1 (a plain
-                TopK linear SAE: pure directions, the baseline to beat).
+  linear32k   — sae_manifold_fit sparse-code lane (K>P, non-topk assignment):
+                a plain TopK linear SAE (pure directions, the baseline to beat).
+                This is the unified single public entry — the K>P sparse-code
+                branch runs the linear REML schedule internally (issue #2232 Inc
+                5), so the old block_size=1 block_sparse_dictionary_fit call is
+                expressed through sae_manifold_fit.
   manifold32k — sae_manifold_fit, K=32,000 circle atoms (d_atom=1, jumprelu
                 assignment: per-row independent, streams at massive K), the
                 known-good convergence regime from bench/massive_k_manifold_validate.
@@ -118,8 +122,8 @@ def main() -> None:
     try:
         if lin_ev is not None:
             raise _LinearReused
-        lin = gamfit.block_sparse_dictionary_fit(
-            train, args.k, block_size=1, block_topk=args.top_k, max_epochs=30,
+        lin = gamfit.sae_manifold_fit(
+            train, K=args.k, assignment="softmax", top_k=args.top_k, n_iter=30,
         )
         lin_wall = time.perf_counter() - t0
         lin_ev = float(lin.explained_variance)
