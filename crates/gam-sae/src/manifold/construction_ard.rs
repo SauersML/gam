@@ -380,14 +380,32 @@ impl SaeManifoldTerm {
             let logits = self.assignment.logits.row(row);
             // Selectable candidates are the GATED atoms (ungated = always-on
             // background tier `a_k≡1`, not part of the selection simplex).
+            // Ranks needed on the selection boundary: the `(k+1)`-th for a TopK
+            // support swap, else just the top-2. Selecting only these (below) keeps
+            // the per-row cost O(K), not the O(K log K) of a full logit sort — a cost
+            // the massive-K streaming rank-charge dispersion cannot pay.
+            let need = match self.assignment.mode {
+                AssignmentMode::TopK { k } => k.saturating_add(1),
+                _ => 2,
+            };
             ranked.clear();
             ranked.extend(
                 (0..k_atoms).filter(|&k| !self.assignment.ungated.get(k).copied().unwrap_or(false)),
             );
-            if ranked.len() < 2 {
+            if ranked.len() < need {
                 continue;
             }
-            // Descending by logit; the routing order the selection boundary lives on.
+            // O(K) partial selection: bring the top-`need` gated atoms (DESCENDING
+            // logit — the routing order the boundary lives on) to the front, then
+            // order just those.
+            if ranked.len() > need {
+                ranked.select_nth_unstable_by(need - 1, |a, b| {
+                    logits[*b]
+                        .partial_cmp(&logits[*a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                ranked.truncate(need);
+            }
             ranked.sort_by(|&a, &b| {
                 logits[b]
                     .partial_cmp(&logits[a])
@@ -400,7 +418,7 @@ impl SaeManifoldTerm {
                 // (`k`-th) vs the STRONGEST unselected (`(k+1)`-th) — the cheapest
                 // one-atom support swap. Both carry unit gate weight.
                 AssignmentMode::TopK { k } => {
-                    if k == 0 || ranked.len() <= k {
+                    if k == 0 {
                         continue;
                     }
                     // Unit gate weight is swapped from the k-th to the (k+1)-th atom.
