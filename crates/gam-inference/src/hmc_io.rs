@@ -7440,6 +7440,8 @@ pub fn run_joint_beta_rho_sampling(
         inputs.rho_mode,
         inputs.likelihood.clone(),
         inputs.gamma_shape,
+        inputs.dispersion,
+        inputs.offset,
         inputs.rho_prior.clone(),
         inputs.firth_bias_reduction,
     )?;
