@@ -7316,6 +7316,22 @@ fn sae_canonical_n_harmonics(
         .collect())
 }
 
+/// Rust owner of the SAE atom-topology naming (#2091). Given the resolved
+/// per-atom basis kinds (`basis_specs` order), return the honest scalar topology
+/// label together with the per-atom labels: the scalar is the common label when
+/// every atom agrees, `"mixed"` when they disagree, and `None` for an empty
+/// dictionary so the caller supplies its own seed fallback
+/// (`_topology_for_bases(kinds) if kinds else str(topology)`). Mirrors
+/// `_sae_manifold.py::_topology_for_bases` / `_topologies_for_bases` (and the
+/// `_basis_to_topology` alias map) exactly, so `from_payload` derives
+/// `atom_topology` / `atom_topologies` from one Rust source.
+#[pyfunction(signature = (bases))]
+fn sae_atom_topologies(bases: Vec<String>) -> (Option<String>, Vec<String>) {
+    let scalar = crate::manifold::manifold_sae_coercion::topology_for_bases(&bases);
+    let per_atom = crate::manifold::manifold_sae_coercion::topologies_for_bases(&bases);
+    (scalar, per_atom)
+}
+
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
 /// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:

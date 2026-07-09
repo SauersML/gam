@@ -11,4 +11,5 @@
 //! `#[pymodule] _rust` registration.
 
 pub(crate) mod manifold_pyclasses;
+pub(crate) mod manifold_sae_coercion;
 pub(crate) mod manifold_sae_payload;
