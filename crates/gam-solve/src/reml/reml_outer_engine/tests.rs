@@ -2,7 +2,7 @@ use super::*;
 use crate::estimate::smooth_floor_dp;
 use crate::estimate::smoothing_correction::DP_FLOOR;
 use approx::assert_relative_eq;
-use gam_problem::{BlockLocalDrift, ContractedPsiSecondOrder};
+use gam_problem::{BlockLocalDrift, ContractedPsiSecondOrder, HessianOperator};
 use ndarray::array;
 
 #[test]
