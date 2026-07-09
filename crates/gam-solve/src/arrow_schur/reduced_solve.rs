@@ -1404,7 +1404,7 @@ pub fn matrix_free_arrow_evidence_log_det(
 /// non-positive Rayleigh quotient (an SPD operator forbids the latter, so it
 /// signals a caller bug or a non-finite operator, both of which must surface
 /// rather than be silently bracketed).
-pub(crate) fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
+pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -1444,20 +1444,17 @@ pub(crate) fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
         schur_matvec(sys, htt_factors, ridge_beta, x, &mut out, backend, resident);
         out
     };
-    let mut lambda = 0.0_f64;
     for _ in 0..iters.max(1) {
         let sv = apply(&v);
-        // v is unit, so the Rayleigh quotient is `vᵀ S v` directly.
-        lambda = v.dot(&sv);
         let norm = sv.dot(&sv).sqrt();
         if !(norm.is_finite() && norm > 0.0) {
             break;
         }
         v = sv / norm;
     }
-    // Final Rayleigh on the converged iterate (v stays unit).
+    // Rayleigh quotient on the converged iterate (v stays unit).
     let sv = apply(&v);
-    lambda = v.dot(&sv);
+    let lambda = v.dot(&sv);
     (lambda.is_finite() && lambda > 0.0).then_some(lambda)
 }
 
@@ -1486,7 +1483,7 @@ pub(crate) fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
 ///
 /// `None` when `k == 0`, the bracket estimate is degenerate, the plan cannot be
 /// built, or a shifted CG solve breaks down on a non-finite operator.
-pub(crate) fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
+pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
@@ -1539,7 +1536,7 @@ pub(crate) fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
 /// per-ρ-coordinate Schur-derivative operator the SAE trace channels assemble
 /// row-locally (`(∂S)·y = (∂H_ββ)y − Σ_i[ (∂H_βt^(i))(H_tt⁻¹H_tβ y) −
 /// H_βt H_tt⁻¹(∂H_tt^(i))H_tt⁻¹H_tβ y + H_βt H_tt⁻¹(∂H_tβ^(i))y ]`).
-pub(crate) fn rational_reduced_schur_directional(
+pub fn rational_reduced_schur_directional(
     plan: &RationalLogdetPlan,
     eval: &RationalLogdetEval,
     dmatvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
