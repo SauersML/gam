@@ -1,9 +1,6 @@
 use super::*;
 
-fn normalize_optional_column(
-    value: Option<String>,
-    field: &str,
-) -> Result<Option<String>, String> {
+fn normalize_optional_column(value: Option<String>, field: &str) -> Result<Option<String>, String> {
     value
         .map(|value| {
             let value = value.trim();

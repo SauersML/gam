@@ -1099,7 +1099,9 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
                 let tk = t[[n, k]];
                 let sq = tk * tk;
                 let r2 = self.dist2(n, k, rho);
-                let lambda = alpha + beta * r2;
+                // Same floored λ as `lambda_at`/`value`, so this gradient is the
+                // exact derivative of the evaluated energy (no value↔grad drift).
+                let lambda = MIN_CONDITIONAL_PRECISION + alpha + beta * r2;
                 let precision_score = 0.5 * weight * sq - 0.5 / lambda;
                 grad_weight_direct += 0.5 * weight * lambda * sq;
                 grad_alpha_direct += precision_score;

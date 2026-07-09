@@ -371,6 +371,24 @@ pub fn fit_from_formula(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
+    fit_from_formula_with_notes(formula, data, config).map(|outcome| outcome.result)
+}
+
+/// A fitted formula result together with advisories emitted by its one
+/// authoritative materialization pass.
+pub struct FormulaFitResult {
+    pub result: FitResult,
+    pub inference_notes: Vec<String>,
+}
+
+/// Resolve, materialize, and fit a formula without making front ends repeat any
+/// model construction. Unlike `fit_from_formula`, this service also returns the
+/// materializer's user-facing advisories for CLI/Python presentation.
+pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
     let config = config
         .clone()
         .resolve()
@@ -387,9 +405,13 @@ pub fn fit_from_formula(
     // genuine estimator route, not a silent swap: it fires only on the explicit
     // `family = "expectile"`. Every other family falls through unchanged.
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
-        return Ok(FitResult::Standard(result));
+        return Ok(FormulaFitResult {
+            result: FitResult::Standard(result),
+            inference_notes: Vec::new(),
+        });
     }
     let mat = materialize(formula, data, &config)?;
+    let inference_notes = mat.inference_notes;
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
     // is the single 1-D Gaussian-identity penalized-smooth shape the
     // state-space scan solves exactly, route through it and return the
@@ -401,7 +423,10 @@ pub fn fit_from_formula(
     // from this same `SplineScanFit`.
     if let FitRequest::Standard(request) = &mat.request {
         if gaussian_response_is_constant(request) {
-            return constant_gaussian_standard_fit(request).map(FitResult::Standard);
+            return constant_gaussian_standard_fit(request).map(|result| FormulaFitResult {
+                result: FitResult::Standard(result),
+                inference_notes,
+            });
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = gam_solve::spline_scan::fit_spline_scan(
@@ -411,7 +436,10 @@ pub fn fit_from_formula(
                 inputs.order,
             )
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
-            return Ok(FitResult::SplineScan(scan));
+            return Ok(FormulaFitResult {
+                result: FitResult::SplineScan(scan),
+                inference_notes,
+            });
         }
         // O(n log n) multiresolution residual-cascade fast path (#1032): a
         // scattered low-d Gaussian-identity Duchon/Matérn smooth past the
@@ -432,7 +460,10 @@ pub fn fit_from_formula(
                 &inputs.metric,
                 inputs.sobolev_s,
             ) {
-                return Ok(FitResult::ResidualCascade(fit));
+                return Ok(FormulaFitResult {
+                    result: FitResult::ResidualCascade(fit),
+                    inference_notes,
+                });
             }
             // The quasi-uniformity guard (caveat 2) or any degenerate-design
             // signal surfaces as a build/solve error; fall through to the dense
@@ -441,7 +472,10 @@ pub fn fit_from_formula(
     }
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
     // directly instead of stringifying then re-wrapping.
-    fit_model(mat.request)
+    fit_model(mat.request).map(|result| FormulaFitResult {
+        result,
+        inference_notes,
+    })
 }
 
 /// THE single dispatch seam for the expectile (Newey–Powell LAWS) family.
