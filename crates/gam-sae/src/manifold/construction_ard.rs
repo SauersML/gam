@@ -497,6 +497,12 @@ impl SaeManifoldTerm {
         if k_atoms < 2 {
             return Ok(0.0);
         }
+        if self.assignment.ungated.len() != k_atoms {
+            return Err(format!(
+                "basin_selection_deflation_correction: ungated mask has length {}, expected {k_atoms}",
+                self.assignment.ungated.len()
+            ));
+        }
         let whitens = self
             .row_metric
             .as_ref()
@@ -529,9 +535,16 @@ impl SaeManifoldTerm {
                 _ => 2,
             };
             ranked.clear();
-            ranked.extend(
-                (0..k_atoms).filter(|&k| !self.assignment.ungated.get(k).copied().unwrap_or(false)),
-            );
+            for atom in 0..k_atoms {
+                if !logits[atom].is_finite() {
+                    return Err(format!(
+                        "basin_selection_deflation_correction: non-finite logit on row {row}, atom {atom}"
+                    ));
+                }
+                if !self.assignment.ungated[atom] {
+                    ranked.push(atom);
+                }
+            }
             if ranked.len() < need {
                 continue;
             }
@@ -539,18 +552,10 @@ impl SaeManifoldTerm {
             // logit — the routing order the boundary lives on) to the front, then
             // order just those.
             if ranked.len() > need {
-                ranked.select_nth_unstable_by(need - 1, |a, b| {
-                    logits[*b]
-                        .partial_cmp(&logits[*a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                ranked.select_nth_unstable_by(need - 1, |a, b| logits[*b].total_cmp(&logits[*a]));
                 ranked.truncate(need);
             }
-            ranked.sort_by(|&a, &b| {
-                logits[b]
-                    .partial_cmp(&logits[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            ranked.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
             // The boundary pair `(w, r)` = (the atom whose weight is at stake, the
             // runner-up it would flip to) and the winner mass `a_w` moved across it.
             let (w, r, a_w) = match self.assignment.mode {
