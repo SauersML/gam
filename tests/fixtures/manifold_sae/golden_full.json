@@ -1,0 +1,903 @@
+{
+  "alpha": 0.75,
+  "assignment": "topk",
+  "assignment_label": "TopK",
+  "assignments": [
+    [
+      0.02,
+      0.11,
+      0.19999999999999998
+    ],
+    [
+      0.29000000000000004,
+      0.38,
+      0.47
+    ],
+    [
+      0.56,
+      0.65,
+      0.74
+    ],
+    [
+      0.83,
+      0.9199999999999999,
+      1.01
+    ],
+    [
+      1.1,
+      1.19,
+      1.28
+    ]
+  ],
+  "atom_dims": [
+    1,
+    2,
+    2
+  ],
+  "atom_inference": [
+    {
+      "atom_index": 0,
+      "atom_name": "circle_0",
+      "functionals": {
+        "slope": 0.2
+      },
+      "smooth_significance": {
+        "log_e_nonconstant": 3.4
+      }
+    },
+    {
+      "atom_index": 1,
+      "atom_name": "line_1",
+      "functionals": null,
+      "smooth_significance": {
+        "log_e_nonconstant": null
+      }
+    }
+  ],
+  "atom_topologies": [
+    "periodic",
+    "euclidean",
+    "duchon"
+  ],
+  "atom_topology": "mixed",
+  "atom_two_lens": {
+    "coupling": [
+      0.05,
+      0.15,
+      0.25
+    ],
+    "presence": [
+      0.1,
+      0.2,
+      0.3
+    ]
+  },
+  "atoms": [
+    {
+      "active_dim": 1,
+      "assignments": [
+        0.05,
+        0.16,
+        0.27,
+        0.38,
+        0.49
+      ],
+      "basis": "periodic",
+      "coords": [
+        [
+          0.1
+        ],
+        [
+          0.4
+        ],
+        [
+          0.7
+        ],
+        [
+          0.9999999999999999
+        ],
+        [
+          1.3
+        ]
+      ],
+      "coords_u_arc": [
+        0.0,
+        0.19,
+        0.38,
+        0.5700000000000001,
+        0.76
+      ],
+      "decoder_coefficients": [
+        [
+          1.0,
+          2.0,
+          3.0,
+          4.0
+        ],
+        [
+          5.0,
+          6.0,
+          7.0,
+          8.0
+        ],
+        [
+          9.0,
+          10.0,
+          11.0,
+          12.0
+        ],
+        [
+          13.0,
+          14.0,
+          15.0,
+          16.0
+        ],
+        [
+          17.0,
+          18.0,
+          19.0,
+          20.0
+        ]
+      ],
+      "decoder_covariance_channel_factors": null,
+      "evidence": -12.5,
+      "functional_evidence": {
+        "average_derivative": -0.4,
+        "average_value": 1.25,
+        "peak_contrast": 2.1
+      },
+      "shape_band_coords": [
+        [
+          0.0
+        ],
+        [
+          0.2
+        ],
+        [
+          0.4
+        ],
+        [
+          0.6000000000000001
+        ],
+        [
+          0.8
+        ],
+        [
+          1.0
+        ]
+      ],
+      "shape_band_mean": [
+        [
+          0.3,
+          0.35,
+          0.4,
+          0.45
+        ],
+        [
+          0.5,
+          0.55,
+          0.6000000000000001,
+          0.65
+        ],
+        [
+          0.7,
+          0.75,
+          0.8,
+          0.8500000000000001
+        ],
+        [
+          0.9000000000000001,
+          0.95,
+          1.0,
+          1.05
+        ],
+        [
+          1.1,
+          1.1500000000000001,
+          1.2,
+          1.25
+        ],
+        [
+          1.3,
+          1.35,
+          1.4000000000000001,
+          1.4500000000000002
+        ]
+      ],
+      "shape_band_sd": [
+        [
+          0.01,
+          0.012,
+          0.014,
+          0.016
+        ],
+        [
+          0.018000000000000002,
+          0.02,
+          0.022,
+          0.024
+        ],
+        [
+          0.026000000000000002,
+          0.028000000000000004,
+          0.03,
+          0.032
+        ],
+        [
+          0.034,
+          0.036000000000000004,
+          0.038,
+          0.04
+        ],
+        [
+          0.042,
+          0.044000000000000004,
+          0.046000000000000006,
+          0.048
+        ],
+        [
+          0.05,
+          0.052000000000000005,
+          0.054,
+          0.056
+        ]
+      ]
+    },
+    {
+      "active_dim": 2,
+      "assignments": [
+        0.1,
+        0.21000000000000002,
+        0.32,
+        0.43000000000000005,
+        0.54
+      ],
+      "basis": "euclidean",
+      "coords": [
+        [
+          0.2,
+          0.5
+        ],
+        [
+          0.8,
+          1.0999999999999999
+        ],
+        [
+          1.4,
+          1.7
+        ],
+        [
+          1.9999999999999998,
+          2.3000000000000003
+        ],
+        [
+          2.6,
+          2.9
+        ]
+      ],
+      "coords_u_arc": null,
+      "decoder_coefficients": [
+        [
+          2.0,
+          3.0,
+          4.0,
+          5.0
+        ],
+        [
+          6.0,
+          7.0,
+          8.0,
+          9.0
+        ],
+        [
+          10.0,
+          11.0,
+          12.0,
+          13.0
+        ]
+      ],
+      "decoder_covariance_channel_factors": null,
+      "evidence": -13.5,
+      "functional_evidence": null,
+      "shape_band_coords": null,
+      "shape_band_mean": null,
+      "shape_band_sd": null
+    },
+    {
+      "active_dim": 2,
+      "assignments": [
+        0.15000000000000002,
+        0.26,
+        0.37,
+        0.48000000000000004,
+        0.5900000000000001
+      ],
+      "basis": "duchon",
+      "coords": [
+        [
+          0.30000000000000004,
+          0.6000000000000001
+        ],
+        [
+          0.9,
+          1.2
+        ],
+        [
+          1.5,
+          1.8
+        ],
+        [
+          2.0999999999999996,
+          2.4000000000000004
+        ],
+        [
+          2.7,
+          3.0
+        ]
+      ],
+      "coords_u_arc": null,
+      "decoder_coefficients": [
+        [
+          3.0,
+          4.0,
+          5.0,
+          6.0
+        ],
+        [
+          7.0,
+          8.0,
+          9.0,
+          10.0
+        ],
+        [
+          11.0,
+          12.0,
+          13.0,
+          14.0
+        ],
+        [
+          15.0,
+          16.0,
+          17.0,
+          18.0
+        ]
+      ],
+      "decoder_covariance_channel_factors": null,
+      "evidence": -14.5,
+      "functional_evidence": null,
+      "shape_band_coords": null,
+      "shape_band_mean": null,
+      "shape_band_sd": null
+    }
+  ],
+  "basis_kinds": [
+    "periodic",
+    "euclidean",
+    "duchon"
+  ],
+  "basis_sizes": [
+    5,
+    3,
+    4
+  ],
+  "basis_specs": [
+    "periodic:H2",
+    "euclidean:3",
+    "duchon:4"
+  ],
+  "certificates": {
+    "claims": {
+      "c0": {
+        "certified": true,
+        "claim": "nonconstant",
+        "evidence": {},
+        "verdict": "certified"
+      }
+    },
+    "overall": "certified",
+    "overall_certified": true
+  },
+  "coordinate_fidelity": {
+    "atoms": [
+      {
+        "atom": 0,
+        "verdict": "arclength_honest"
+      }
+    ]
+  },
+  "coords": [
+    [
+      [
+        0.1
+      ],
+      [
+        0.4
+      ],
+      [
+        0.7
+      ],
+      [
+        0.9999999999999999
+      ],
+      [
+        1.3
+      ]
+    ],
+    [
+      [
+        0.2,
+        0.5
+      ],
+      [
+        0.8,
+        1.0999999999999999
+      ],
+      [
+        1.4,
+        1.7
+      ],
+      [
+        1.9999999999999998,
+        2.3000000000000003
+      ],
+      [
+        2.6,
+        2.9
+      ]
+    ],
+    [
+      [
+        0.30000000000000004,
+        0.6000000000000001
+      ],
+      [
+        0.9,
+        1.2
+      ],
+      [
+        1.5,
+        1.8
+      ],
+      [
+        2.0999999999999996,
+        2.4000000000000004
+      ],
+      [
+        2.7,
+        3.0
+      ]
+    ]
+  ],
+  "cotrain": {
+    "n_encodes": 10,
+    "n_uncertified": 1,
+    "recon_consistency": 0.02,
+    "uncertified_fraction": 0.1
+  },
+  "curvature_report": {
+    "atoms": [
+      {
+        "atom": 0,
+        "kappa_hat": 0.9
+      }
+    ]
+  },
+  "decoder_blocks": [
+    [
+      [
+        1.0,
+        2.0,
+        3.0,
+        4.0
+      ],
+      [
+        5.0,
+        6.0,
+        7.0,
+        8.0
+      ],
+      [
+        9.0,
+        10.0,
+        11.0,
+        12.0
+      ],
+      [
+        13.0,
+        14.0,
+        15.0,
+        16.0
+      ],
+      [
+        17.0,
+        18.0,
+        19.0,
+        20.0
+      ]
+    ],
+    [
+      [
+        2.0,
+        3.0,
+        4.0,
+        5.0
+      ],
+      [
+        6.0,
+        7.0,
+        8.0,
+        9.0
+      ],
+      [
+        10.0,
+        11.0,
+        12.0,
+        13.0
+      ]
+    ],
+    [
+      [
+        3.0,
+        4.0,
+        5.0,
+        6.0
+      ],
+      [
+        7.0,
+        8.0,
+        9.0,
+        10.0
+      ],
+      [
+        11.0,
+        12.0,
+        13.0,
+        14.0
+      ],
+      [
+        15.0,
+        16.0,
+        17.0,
+        18.0
+      ]
+    ]
+  ],
+  "diagnostics": {
+    "atom_trust": [
+      0.6,
+      0.7,
+      0.55
+    ],
+    "atoms": [
+      {
+        "activation_frequency": 0.3,
+        "active_token_count": 10,
+        "coverage": 0.8,
+        "sigma_max_tangent": 1.5,
+        "sigma_min_tangent": 0.2,
+        "tangent_condition_score": 0.9,
+        "trust_score": 0.5,
+        "untyped": false
+      },
+      {
+        "activation_frequency": 0.35,
+        "active_token_count": 11,
+        "coverage": 0.8,
+        "sigma_max_tangent": 1.51,
+        "sigma_min_tangent": 0.21000000000000002,
+        "tangent_condition_score": 0.89,
+        "trust_score": 0.6,
+        "untyped": true
+      },
+      {
+        "activation_frequency": 0.4,
+        "active_token_count": 12,
+        "coverage": 0.8,
+        "sigma_max_tangent": 1.52,
+        "sigma_min_tangent": 0.22,
+        "tangent_condition_score": 0.88,
+        "trust_score": 0.7,
+        "untyped": false
+      }
+    ]
+  },
+  "dispersion": 1.07,
+  "duchon_centers": [
+    null,
+    null,
+    [
+      [
+        0.0,
+        0.5
+      ],
+      [
+        1.0,
+        1.5
+      ],
+      [
+        2.0,
+        2.5
+      ],
+      [
+        3.0,
+        3.5
+      ]
+    ]
+  ],
+  "fisher_factors": [
+    [
+      [
+        0.01,
+        0.013000000000000001
+      ],
+      [
+        0.016,
+        0.019000000000000003
+      ],
+      [
+        0.022,
+        0.025
+      ],
+      [
+        0.028000000000000004,
+        0.031
+      ]
+    ],
+    [
+      [
+        0.034,
+        0.037
+      ],
+      [
+        0.04,
+        0.043000000000000003
+      ],
+      [
+        0.046000000000000006,
+        0.049
+      ],
+      [
+        0.052000000000000005,
+        0.055
+      ]
+    ],
+    [
+      [
+        0.058,
+        0.061000000000000006
+      ],
+      [
+        0.064,
+        0.067
+      ],
+      [
+        0.06999999999999999,
+        0.073
+      ],
+      [
+        0.076,
+        0.079
+      ]
+    ],
+    [
+      [
+        0.082,
+        0.08499999999999999
+      ],
+      [
+        0.088,
+        0.091
+      ],
+      [
+        0.094,
+        0.097
+      ],
+      [
+        0.09999999999999999,
+        0.103
+      ]
+    ],
+    [
+      [
+        0.106,
+        0.109
+      ],
+      [
+        0.112,
+        0.11499999999999999
+      ],
+      [
+        0.118,
+        0.121
+      ],
+      [
+        0.124,
+        0.127
+      ]
+    ]
+  ],
+  "fisher_mass_residual": [
+    0.001,
+    0.0015,
+    0.002,
+    0.0025,
+    0.003
+  ],
+  "fisher_provenance": "output_fisher_downstream",
+  "fitted": [
+    [
+      0.5,
+      0.5700000000000001,
+      0.64,
+      0.71
+    ],
+    [
+      0.78,
+      0.8500000000000001,
+      0.92,
+      0.99
+    ],
+    [
+      1.06,
+      1.1300000000000001,
+      1.2000000000000002,
+      1.27
+    ],
+    [
+      1.34,
+      1.4100000000000001,
+      1.48,
+      1.55
+    ],
+    [
+      1.62,
+      1.6900000000000002,
+      1.7600000000000002,
+      1.83
+    ]
+  ],
+  "hybrid_split": {
+    "atoms": [
+      {
+        "atom": "circle_0",
+        "chart_efficiency_eta": 1.125,
+        "curved_ev": 0.9,
+        "curved_evidence_margin": 0.3,
+        "curved_vs_envelope_ratio": 1.125,
+        "fitted_turning": 1.2,
+        "kept_curved": true,
+        "negative_log_evidence": 4.0,
+        "num_parameters": 5,
+        "parameterization": "periodic",
+        "topm_linear_ev": 0.8,
+        "train_loao_delta_ev": 0.05
+      }
+    ],
+    "curved_atom_count": 1,
+    "is_pure_curved": false,
+    "is_pure_linear": false,
+    "linear_atom_count": 2,
+    "total_negative_log_evidence": 12.0,
+    "total_parameters": 12
+  },
+  "incoherence_report": {
+    "activity_floor": [
+      0.1,
+      0.1,
+      0.1
+    ],
+    "mu_hat": 0.31
+  },
+  "jumprelu_threshold": 0.15,
+  "learnable_alpha": true,
+  "learning_rate": 0.03,
+  "logits": [
+    [
+      -1.0,
+      -0.87,
+      -0.74
+    ],
+    [
+      -0.61,
+      -0.48,
+      -0.35
+    ],
+    [
+      -0.21999999999999997,
+      -0.08999999999999997,
+      0.040000000000000036
+    ],
+    [
+      0.16999999999999993,
+      0.30000000000000004,
+      0.43000000000000016
+    ],
+    [
+      0.56,
+      0.69,
+      0.8200000000000001
+    ]
+  ],
+  "max_iter": 42,
+  "metric_provenance": "OutputFisher",
+  "n_harmonics": [
+    2,
+    0,
+    0
+  ],
+  "oos_projection_top1": true,
+  "penalized_loss_score": -37.5,
+  "pre_topk": {
+    "active_fraction": 0.66,
+    "note": "pre-projection gate"
+  },
+  "primitive_names": [
+    "circle_0",
+    "line_1",
+    "duchon_2"
+  ],
+  "random_state": 7,
+  "reconstruction_r2": 0.8123,
+  "reml_score": -37.5,
+  "residual_gauge": {
+    "generators": [],
+    "group_signature": "SO(2)"
+  },
+  "schema": "gamfit.ManifoldSAE/v1",
+  "selected_log_ard": [
+    [
+      0.1
+    ],
+    [
+      0.2,
+      -0.3
+    ],
+    [
+      0.4,
+      0.5
+    ]
+  ],
+  "selected_log_lambda_smooth": [
+    -1.2,
+    0.3,
+    1.1
+  ],
+  "selected_log_lambda_sparse": -0.6,
+  "smoothness": 0.9,
+  "solver_plan": {
+    "max_outer": 3,
+    "stages": [
+      "seed",
+      "refine"
+    ]
+  },
+  "sparsity_strength": 1.3,
+  "structure_certificate": "{\"alpha\": 0.1, \"entries\": [{\"kind\": \"NonConstant\", \"log_e\": 3.4, \"steps\": 2, \"confirmed\": true}]}",
+  "tau": 0.4,
+  "top_k": 2,
+  "top_k_projection": {
+    "k": 2,
+    "kind": "reconstruction",
+    "residual_ev": 0.12
+  },
+  "topology_persistence": {
+    "atoms": [
+      {
+        "atom": 0,
+        "betti": [
+          1,
+          1
+        ],
+        "contested": false
+      }
+    ]
+  },
+  "training_data": null,
+  "training_data_retained": false,
+  "training_mean": [
+    0.4,
+    0.65,
+    0.9,
+    1.15
+  ]
+}

@@ -7275,6 +7275,19 @@ fn sae_canonical_n_harmonics(
         .collect())
 }
 
+/// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
+/// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
+/// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:
+/// it enforces the `"gamfit.ManifoldSAE/v1"` schema tag, the
+/// `penalized_loss_score`/`reml_score` write-alias, and the write-dropped
+/// `structured_residual_diagnostics` asymmetry. The Python facade will delegate
+/// its save/load round-trip here at cutover; an unsupported schema or malformed
+/// payload raises `ValueError` with the same message the Python guard produced.
+#[pyfunction(signature = (payload_json))]
+fn sae_manifold_payload_roundtrip(payload_json: &str) -> PyResult<String> {
+    crate::manifold::manifold_sae_payload::roundtrip_json(payload_json).map_err(py_value_error)
+}
+
 #[cfg(test)]
 #[path = "../../tests/src_modules/lib_tests.rs"]
 mod tests;
