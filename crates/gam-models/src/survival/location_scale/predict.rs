@@ -435,7 +435,10 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::Probit) => probit_survival_value(eta),
         InverseLink::Standard(StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
         InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
-        InverseLink::Standard(StandardLink::LogLog) => 1.0 - (-(-eta).exp()).exp(),
+        // S = 1 − exp(−exp(−η)) evaluated as −expm1: the naive form loses all
+        // precision once exp(−exp(−η)) rounds to 1 (η ≳ 36), returning an
+        // exact 0 for valid far-tail rows whose true survival is ~exp(−η).
+        InverseLink::Standard(StandardLink::LogLog) => -(-(-eta).exp()).exp_m1(),
         InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
         InverseLink::Standard(StandardLink::Log) => {
