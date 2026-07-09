@@ -828,6 +828,64 @@ mod tests {
     }
 
     #[test]
+    fn full_rank_deflation_is_exact_at_wide_kappa_deterministic_bias_localizer() {
+        // #2080 DEFINITIVE deterministic-bias localizer at WIDE κ. The sibling
+        // `full_rank_deflation_is_exact_no_hutchinson` pins the split at κ≈20
+        // (narrow); this pins it on the SAME κ≈1e8 log-uniform spectrum the wide-κ
+        // multiseed discriminator uses. Deflating the ENTIRE space (rank = dim)
+        // makes P = 0: term2 (Hutchinson) vanishes with NO variance, so the estimate
+        // is the PURE deterministic quadrature of `tr log(S/c)` over a full
+        // orthonormal basis — and `tr(Qᵀ M Q) = tr(M)` for ANY orthonormal full-rank
+        // `Q`, so this is independent of which basis the block power realises.
+        //
+        // This is the discriminator the multiseed test could not be: if the wide-κ
+        // "+2.87 (5.57σ)" were a genuine quadrature or split DEFECT it would surface
+        // HERE, at rel ≈ 5%, with ZERO probe noise to hide behind. It does not — the
+        // exp-sinh DE quadrature resolves the [λ_min, λ_max] = 1e8 bracket to ~1e-10
+        // per eigenvalue and the term1/term2 decomposition is exact by construction.
+        // A nonzero value here (rel ≥ 1e-6) is the ONLY thing that would justify
+        // "quadrature/split derivation work"; its passing localises the multiseed
+        // residual entirely to Hutchinson VARIANCE on the deflated complement (fixed
+        // by more probes / deeper rank / a control variate, NOT a re-derivation).
+        // Uses the EXACT dense-Cholesky arm so there is not even CG error to blame.
+        let dim = 96;
+        let mut state = 2026u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -4.0, 4.0)))
+            .collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 4321);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plan = RationalLogdetPlan::build(dim, 8, 5, lmin, lmax, 1e-9)
+            .expect("plan")
+            .with_deflation(&matvec, dim, 2, 555);
+        let eval = evaluate_exact(&plan, &a);
+        assert_eq!(
+            eval.deflation_basis.len(),
+            dim,
+            "the rank=dim block power must realise a full orthonormal basis even at \
+             κ≈1e8 (got {}); if it collapses, term2 is nonzero and this stops being a \
+             zero-variance deterministic check",
+            eval.deflation_basis.len()
+        );
+        assert!(
+            eval.std_err < 1e-8,
+            "full deflation must leave ~no Hutchinson variance (P ≈ 0) at wide κ, got \
+             std_err={:.3e}",
+            eval.std_err
+        );
+        let rel = (eval.estimate - logdet).abs() / logdet.abs().max(1.0);
+        assert!(
+            rel < 1e-6,
+            "wide-κ full-rank deflation must be exact to quadrature — a nonzero value \
+             is the ONLY signature of a genuine deterministic quadrature/split bias: \
+             rel {rel:.3e} (est {} vs exact {logdet})",
+            eval.estimate
+        );
+    }
+
+    #[test]
     fn deflation_cuts_error_bar_and_stays_accurate_at_wide_kappa() {
         // κ = 1e8 log-uniform: raw Hutchinson carries a large bar; peeling the
         // top-16 directions collapses it while the estimate stays accurate (the
@@ -1067,14 +1125,44 @@ mod tests {
         let k_seeds = 96usize;
         let mut ests = Vec::with_capacity(k_seeds);
         let mut internal_bars = Vec::with_capacity(k_seeds);
+        // Guard the PRECONDITION this discriminator rests on: the K·m probe vectors
+        // must be JOINTLY INDEPENDENT across the unit-spaced seeds. The former
+        // per-probe RNG init `(seed + p)·γ` aliased them — a splitmix stream from
+        // `x₀` and one from `x₀ + γ` are the same stream shifted, so
+        // `(seed=9000+s, probe=p)` and `(9000+s−1, p+1)` were BIT-IDENTICAL and the
+        // 96 seeds drew only ~128 distinct vectors of 96·32=3072. Averaging
+        // correlated draws does not reduce variance as 1/√K, so `se_mean` collapsed
+        // and a shared Hutchinson fluctuation was reported as a "5.57σ deterministic
+        // bias". Fingerprint every probe's sign pattern (dim ≤ 128) and require near
+        // all distinct, so an RNG regression that re-aliases the seeds fails HERE
+        // rather than resurfacing as a phantom quadrature/split bias.
+        let mut probe_fingerprints: std::collections::HashSet<u128> = std::collections::HashSet::new();
         for s in 0..k_seeds {
             let plan = RationalLogdetPlan::build(dim, 32, 9000 + s as u64, lmin, lmax, 1e-9)
                 .expect("plan")
                 .with_deflation(&matvec, 16, 3, 555);
+            for probe in &plan.probes {
+                let mut fp = 0u128;
+                for (i, &x) in probe.iter().enumerate() {
+                    if x > 0.0 {
+                        fp |= 1u128 << i;
+                    }
+                }
+                probe_fingerprints.insert(fp);
+            }
             let e = evaluate_exact(&plan, &a);
             ests.push(e.estimate);
             internal_bars.push(e.std_err);
         }
+        let total_pairs = k_seeds * 32;
+        let distinct = probe_fingerprints.len();
+        assert!(
+            distinct as f64 > 0.95 * total_pairs as f64,
+            "probe vectors must be jointly independent across seeds for this \
+             variance-vs-bias split to be valid: only {distinct} distinct of \
+             {total_pairs} (seed, probe) pairs — the RNG has re-aliased unit-spaced \
+             seeds (expected ~{total_pairs}), so any reported σ is meaningless"
+        );
         let n = ests.len() as f64;
         let mean = ests.iter().sum::<f64>() / n;
         let var = ests.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / (n - 1.0);

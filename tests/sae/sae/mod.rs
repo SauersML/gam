@@ -13,6 +13,7 @@ mod sae_grassmann_frame_fit_battery;
 mod sae_incoherence_phase_diagram;
 mod sae_k1_periodic_p2048_profile;
 mod sae_manifold_circle_d2_ridge0_fits;
+mod sae_manifold_d1_ibp_gate_cocollapse;
 mod sae_manifold_euclidean_k2_terminates;
 mod sae_manifold_euclidean_line_fit;
 mod sae_manifold_gauge_deflated_evidence;

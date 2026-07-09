@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::manifold::{
     AssignmentMode, BehaviorBlock, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    atom_behavior_isometry, reconstruction_explained_variance,
+    TwoBlockRemlControls, atom_behavior_isometry, reconstruction_explained_variance,
 };
 
 /// Numerically stable softmax — the planted behavior law.
@@ -166,5 +166,167 @@ fn isometry_defect_separates_isometric_from_broken() {
     assert!(
         defect_broken > 2.0 * defect_iso,
         "defect must separate the two cases: isometric {defect_iso} vs broken {defect_broken}"
+    );
+}
+
+/// The full #2015 pipeline, read off the CORRECT seam: the coupling weight `λ_y`
+/// is selected by REML (`run_two_block_reml_fit` → `run_multiblock_reml_fit` →
+/// the shared-latent arrow-Schur assembly, NOT the sparse-dict `cofit` linear
+/// seam), and the isometry defect is then measured on the FITTED coordinates of
+/// that REML-coupled fit.
+///
+/// Returns `(defect_cv, converged, identifiable, log_lambda_y)` so the caller can
+/// assert both that REML actually selected the weight (the fit converged to a
+/// finite, identifiable data-determined `λ_y`) and that the defect separates the
+/// isometric from the broken planting on the resulting fit.
+fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
+    let n = 96usize;
+    let p_x = 4usize;
+    let vocab = 4usize; // p_y = 3
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(6).unwrap());
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
+
+    // A clean unit circle is EXACTLY harmonic, so the order-6 basis fits it to
+    // round-off and R_x → 0 pushes λ_y toward a near-degenerate fixed point that
+    // is a poor conditioning test for the REML iteration. A small deterministic
+    // activation perturbation (a fixed fraction of a low harmonic the basis
+    // cannot fully absorb into the planted channels) keeps R_x safely positive,
+    // so the variance-ratio fixed point is well-conditioned and converges — while
+    // leaving the fitted DECODER (which the induced speeds are read off) on the
+    // clean circle, so the isometry geometry is unchanged.
+    let mut z = Array2::<f64>::zeros((n, p_x));
+    let mut probs = Array2::<f64>::zeros((n, vocab));
+    for i in 0..n {
+        let t = i as f64 / n as f64;
+        let theta = std::f64::consts::TAU * t;
+        // Deterministic zero-mean high-harmonic wiggle (order 9 > basis order 6),
+        // ~5% amplitude: the basis cannot represent it, so it is genuine residual.
+        let wiggle = 0.05 * (9.0 * theta).sin();
+        // Activation: a clean unit circle (IDENTICAL across the two cases) plus the
+        // unrepresentable wiggle on one channel to keep R_x conditioned.
+        z[[i, 0]] = theta.cos();
+        z[[i, 1]] = theta.sin();
+        z[[i, 2]] = 0.4 * (2.0 * theta).cos() + wiggle;
+        // Behavior winds through its own circle at angular position ψ(t): evenly
+        // (scaled isometry) or unevenly (bent correspondence).
+        let psi = if uneven {
+            theta + 0.8 * theta.sin()
+        } else {
+            theta
+        };
+        let law = softmax(&[0.7 * psi.cos(), 0.7 * psi.sin(), 0.2, 0.0]);
+        for j in 0..vocab {
+            probs[[i, j]] = law[j];
+        }
+    }
+
+    // Seed the coupling AWAY from where REML lands so a moved, identifiable
+    // weight is evidence the data selected it rather than a held knob.
+    let start_log_lambda = 0.0_f64;
+    let block = BehaviorBlock::fit(probs.view(), p_x, start_log_lambda).unwrap();
+    let p_tot = p_x + block.behavior_dim();
+
+    let (atom, cb) = augmented_circle_atom(&evaluator, &coords, p_tot);
+    let (mut term, mut rho) = build_k1(atom, cb);
+    term.set_behavior_block(block).unwrap();
+    term.set_guards_enabled(false);
+
+    // The correct seam: two-block joint fit with λ_y REML-selected, on the raw
+    // activation Z (the augmented target is stacked internally at each sweep's
+    // current λ_y).
+    let report = term
+        .run_two_block_reml_fit(
+            z.view(),
+            &mut rho,
+            None,
+            TwoBlockRemlControls {
+                max_sweeps: 20,
+                inner_max_iter: 64,
+                step_size: 1.0,
+                ridge_ext_coord: 1e-6,
+                ridge_beta: 1e-6,
+                log_lambda_tol: 1e-3,
+            },
+        )
+        .expect("two-block REML fit must complete");
+
+    // Precondition: both blocks are actually reconstructed at the SELECTED λ_y,
+    // so the induced speeds reflect the planted geometry, not fit noise. Rebuild
+    // the augmented target at the fitted weight the term now carries.
+    let fitted_block = term.behavior_block().unwrap().clone();
+    let augmented = fitted_block.augmented_target(z.view()).unwrap();
+    let fitted = term.try_fitted_for_rho(&rho).unwrap();
+    let ev_act = block_ev(&augmented, &fitted, 0, p_x);
+    let ev_beh = block_ev(&augmented, &fitted, p_x, p_tot);
+    assert!(ev_act > 0.85, "activation EV too low ({ev_act}) to trust the speeds");
+    assert!(ev_beh > 0.85, "behavior EV too low ({ev_beh}) to trust the speeds");
+
+    // The isometry defect, read off the REML-coupled fit's fitted coordinates.
+    let cert = atom_behavior_isometry(&term, 0)
+        .expect("isometry certificate must compute")
+        .expect("a d=1 two-block atom must yield a certificate");
+    assert!(cert.behavior_engaged, "behavior must be engaged (it moves)");
+    assert!(cert.scale.is_finite() && cert.scale > 0.0, "scale {}", cert.scale);
+    assert!(
+        cert.nats_per_unit_t.is_finite() && cert.nats_per_unit_t > 0.0,
+        "nats/unit t {}",
+        cert.nats_per_unit_t
+    );
+    // The λ_y that came back is what the term actually holds — the coupling the
+    // defect above was measured under.
+    let installed = fitted_block.log_lambda_y;
+    assert!(
+        (installed - report.log_lambda_y).abs() < 1e-12,
+        "installed λ_y {installed} disagrees with report {}",
+        report.log_lambda_y
+    );
+    (
+        cert.defect_cv,
+        report.converged,
+        report.lambda_identifiable,
+        report.log_lambda_y,
+    )
+}
+
+/// End-to-end #2015 acceptance: with the coupling weight selected by REML on the
+/// correct shared-latent seam, the isometry defect measured on the resulting
+/// FITTED coordinates still (a) reports the coupling was data-selected and
+/// identifiable, and (b) separates a scaled-isometric atom from one whose
+/// behavior winds unevenly — proving the two payoffs compose, not just coexist.
+#[test]
+fn reml_selected_coupling_then_isometry_defect_separates() {
+    let (defect_iso, conv_iso, ident_iso, log_lambda_iso) = reml_fitted_defect(false);
+    let (defect_broken, conv_broken, ident_broken, log_lambda_broken) = reml_fitted_defect(true);
+
+    // REML actually selected the coupling in both fits: the variance-ratio fixed
+    // point converged to a finite, IDENTIFIABLE weight — i.e. both blocks carried
+    // residual variance and the data determined λ_y (the destination is the REML
+    // stationary point, not the arbitrary 0.0 start; see the start-invariance
+    // arm of `reml_selects_lambda_y_at_planted_variance_ratio`).
+    for (conv, ident, log_lambda, label) in [
+        (conv_iso, ident_iso, log_lambda_iso, "isometric"),
+        (conv_broken, ident_broken, log_lambda_broken, "broken"),
+    ] {
+        assert!(conv, "{label}: λ_y fixed point did not converge");
+        assert!(ident, "{label}: λ_y should be identifiable (behavior varies)");
+        assert!(
+            log_lambda.is_finite(),
+            "{label}: REML-selected log λ_y must be finite, got {log_lambda}"
+        );
+    }
+
+    // The defect, measured on the REML-coupled fit, still separates the cases.
+    assert!(
+        defect_iso < 0.15,
+        "scaled-isometric atom should report a low defect on the REML fit, got {defect_iso}"
+    );
+    assert!(
+        defect_broken > 0.30,
+        "broken-isometry atom should report a high defect on the REML fit, got {defect_broken}"
+    );
+    assert!(
+        defect_broken > 2.0 * defect_iso,
+        "defect must separate on the REML-coupled fit: isometric {defect_iso} vs broken \
+         {defect_broken}"
     );
 }
