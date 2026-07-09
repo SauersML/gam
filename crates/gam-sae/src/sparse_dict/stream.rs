@@ -556,7 +556,7 @@ fn validate_config(config: &SparseDictConfig) -> Result<(), String> {
 #[cfg(test)]
 mod stream_tests {
     use super::{SparseDictConfig, SparseDictStreamState, TileScorer, route_and_code_all};
-    use crate::sparse_dict::fit_sparse_dictionary;
+    use crate::sparse_dict::run_linear_fast_kernel;
     use ndarray::{Array2, ArrayView2};
 
     /// Deterministic synthetic corpus: `n` rows, each a scaled planted atom plus a
@@ -675,7 +675,17 @@ mod stream_tests {
             score_mode: gam_gpu::GpuMode::Off,
         };
 
-        let one_shot = fit_sparse_dictionary(x.view(), &config).expect("one-shot fit");
+        // Compare streaming against the LEGACY fixed-ridge batch fit: the
+        // streaming refresh (`SparseDictStreamState`) implements the same additive
+        // per-shard normal-eq accumulation as the batch `run`, NOT the outer
+        // shared-ρ REML schedule that the public `fit_sparse_dictionary` default
+        // now runs (design gam#2232 Increment 2; streaming re-points in a later
+        // increment). `run_linear_fast_kernel` at the shared default ridge is
+        // bit-identical to `run` (parity-gated by
+        // `linear_fast_kernel_matches_legacy_run`), so this is exactly the batch
+        // baseline the streaming path must reproduce.
+        let one_shot = run_linear_fast_kernel(x.view(), &config, config.decoder_ridge as f64)
+            .expect("one-shot fit");
 
         // Four contiguous shards whose concatenation (row order) is exactly `x`.
         let chunk = n / 4;

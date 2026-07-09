@@ -415,6 +415,308 @@ pub fn linear_shared_rho_fs_step(stats: &LinearBlockRemlStats, rho: f64) -> f64 
     }
 }
 
+/// Variance ceiling for the matrix-free effective-dof estimator, expressed as a
+/// fraction of the trace it estimates (design gam#2232, Increment 2, plug 4).
+///
+/// The edof is estimated by a Hutchinson (Rademacher) stochastic-trace probe of
+/// the symmetric PSD operator whose trace is the complementary dof
+/// `c = tr(ρ(A+ρI)⁻¹)` (its spectrum `ρ/(λ+ρ)` lies in `(0, 1]`). For such a
+/// matrix `M ⪰ 0` with spectrum in `[0, 1]` the single-probe Rademacher variance
+/// is `2(‖M‖²_F − Σ Mᵢᵢ²) ≤ 2‖M‖²_F = 2 Σμ² ≤ 2 Σμ = 2 tr(M)` (using `μ² ≤ μ`
+/// on `[0, 1]`); averaging `m` independent probes gives
+/// `Var(ĉ) ≤ 2 tr(M) / m`. Requiring that variance to be at most a fraction `v`
+/// of the trace it estimates — `Var(ĉ) ≤ v · tr(M)` — fixes the probe count
+/// `m = ⌈2/v⌉` with NO dependence on the (unknown) spectrum: it is the universal
+/// PSD-trace bound. This is the single documented quality knob; the probe count
+/// is derived from it, not tuned.
+const EDOF_TRACE_VARIANCE_PER_UNIT_TRACE: f64 = 0.05;
+
+/// Relative normal-equation residual at which each Hutchinson trace solve stops.
+///
+/// The solve `(A + ρI) w = z` supplies the per-probe `zᵀ(A+ρI)⁻¹z`; a residual
+/// this small is orders of magnitude below the stochastic Hutchinson error
+/// (variance `≈ v·tr` per [`EDOF_TRACE_VARIANCE_PER_UNIT_TRACE`]), so the
+/// per-solve bias never dominates — the same tolerance convention the crate's
+/// REML trace probes use elsewhere (`gam_linalg::pcg`, ≈1e-6 per-probe residual).
+const EDOF_TRACE_CG_RELATIVE_RESIDUAL: f64 = 1.0e-6;
+
+/// Matrix-free effective degrees of freedom `γ = tr(A(A+ρI)⁻¹)` of the shared-ρ
+/// code Gram `A = CᵀC`, via Hutchinson stochastic-trace probes solved with the
+/// existing sparse normal-equation conjugate-gradient matvec (design gam#2232,
+/// Increment 2, plug 4). Never materialises the dense `K×K` Gram: the operator
+/// touches only the streamed `diag`/`off` entries, so this scales to `K ≈ 32k`.
+///
+/// The trace is taken on the COMPLEMENTARY operator
+/// `γ = K − tr(ρ(A+ρI)⁻¹)` because `ρ(A+ρI)⁻¹` has spectrum in `(0, 1]` and, at
+/// the small linear-block ridge, most of the `K` dof are retained, so the
+/// complementary trace is the low-variance quantity to sample (see
+/// [`EDOF_TRACE_VARIANCE_PER_UNIT_TRACE`]). Each probe is one CG solve of
+/// `(A + ρI) w = z` for a deterministic Rademacher `z`; the estimate is
+/// `K − ρ·mean_probe(zᵀw)`, clamped to `[0, K]`.
+fn hutchinson_gram_edof(
+    diag: &[f64],
+    off: &HashMap<(u32, u32), f64>,
+    rho: f64,
+    k: usize,
+) -> f64 {
+    if k == 0 {
+        return 0.0;
+    }
+
+    // Symmetric coupling adjacency (sorted per atom for deterministic matvec),
+    // exactly the structure `solve_decoder` builds for the refresh solve.
+    let mut neigh: Vec<Vec<(u32, f64)>> = vec![Vec::new(); k];
+    for (&(a, b), &val) in off.iter() {
+        neigh[a as usize].push((b, val));
+        neigh[b as usize].push((a, val));
+    }
+    for list in neigh.iter_mut() {
+        list.sort_by_key(|&(nb, _)| nb);
+    }
+
+    // Matrix-free `(A + ρI)·v` over the whole dictionary: `O(K + nnz)`, no dense
+    // block. `A + ρI ⪰ ρI ≻ 0`, so every probe solve is SPD.
+    let matvec = |v: &[f64]| -> Vec<f64> {
+        let mut y = vec![0.0f64; k];
+        for a in 0..k {
+            let mut acc = (diag[a] + rho) * v[a];
+            for &(nb, val) in &neigh[a] {
+                acc += val * v[nb as usize];
+            }
+            y[a] = acc;
+        }
+        y
+    };
+
+    // A-priori Gershgorin condition bound κ̂ ≥ κ(A+ρI): the smallest eigenvalue
+    // is at least the ridge floor ρ (M ⪰ ρI), Gershgorin caps the largest. This
+    // sets the SAME derived CG iteration cap `⌈½√κ·ln(2√κ/ε)⌉` the refresh solve
+    // uses, so a probe solve cannot spin unbounded on a near-singular giant block.
+    let mut lambda_max_bound = 0.0f64;
+    for a in 0..k {
+        let mut off_abs = 0.0f64;
+        for &(_, val) in &neigh[a] {
+            off_abs += val.abs();
+        }
+        lambda_max_bound = lambda_max_bound.max(diag[a] + rho + off_abs);
+    }
+    let lambda_min = rho.max(DEAD_DENOM);
+    let kappa_bound = (lambda_max_bound / lambda_min).max(1.0);
+    let root = kappa_bound.sqrt();
+    let charge_floor = EDOF_TRACE_CG_RELATIVE_RESIDUAL;
+    let chebyshev = 0.5 * root * (2.0 * root / charge_floor).ln();
+    let finite = k.saturating_mul(2).saturating_add(16);
+    let cap = (chebyshev.max(0.0).ceil() as usize)
+        .saturating_add(16)
+        .min(finite)
+        .max(1);
+
+    // Probe count derived from the documented variance target: m = ⌈2/v⌉.
+    let m_probes = (2.0 / EDOF_TRACE_VARIANCE_PER_UNIT_TRACE).ceil() as usize;
+    let m_probes = m_probes.max(1);
+
+    // Deterministic per-probe Rademacher signs from the crate's canonical
+    // `splitmix64` mixer (NO `rand` crate): the seed is a content hash of the
+    // Gram diagonal, ρ, and K, so the estimate is reproducible across runs and
+    // moves with the problem. Mixing `probe · atom` gives independent ±1 draws.
+    let mut base_seed = gam_linalg::utils::splitmix64_hash((k as u64) ^ rho.to_bits());
+    base_seed = gam_linalg::utils::splitmix64_hash(base_seed ^ (off.len() as u64).wrapping_add(1));
+    for &d in diag.iter() {
+        base_seed = gam_linalg::utils::splitmix64_hash(base_seed ^ d.to_bits());
+    }
+
+    let mut complementary_trace_acc = 0.0f64;
+    for probe in 0..m_probes {
+        let probe_salt = gam_linalg::utils::splitmix64_hash(base_seed ^ (probe as u64).wrapping_add(1));
+        let mut z = vec![0.0f64; k];
+        for (a, zi) in z.iter_mut().enumerate() {
+            let h = gam_linalg::utils::splitmix64_hash(probe_salt ^ (a as u64).wrapping_add(1));
+            // High bit of a well-mixed hash → an unbiased ±1 Rademacher draw.
+            *zi = if h >> 63 == 0 { 1.0 } else { -1.0 };
+        }
+        let result = cg_solve(&matvec, &z, charge_floor, cap);
+        // zᵀ(A+ρI)⁻¹z; ρ·zᵀ(A+ρI)⁻¹z is one sample of tr(ρ(A+ρI)⁻¹).
+        let zt_minv_z: f64 = z.iter().zip(result.x.iter()).map(|(zi, wi)| zi * wi).sum();
+        complementary_trace_acc += rho * zt_minv_z;
+    }
+    let complementary_trace = complementary_trace_acc / m_probes as f64;
+    (k as f64 - complementary_trace).clamp(0.0, k as f64)
+}
+
+/// Assemble ONLY the shared-ρ code Gram `A = CᵀC` (diagonal + strictly-upper
+/// couplings) from a fit's stored fixed-width routing — WITHOUT the `K×P`
+/// right-hand side `B = CᵀX`. The edof trace `tr(A(A+ρI)⁻¹)` needs `A` alone, so
+/// skipping `B` avoids a `K×P` allocation at `K ≈ 32k`. This is exactly the `A`
+/// part of [`DecoderNormalEq::accumulate`] (same padding contract: a padded slot
+/// carries a zero code and is skipped, and a repeated support index folds into
+/// the diagonal), so it matches the `A` the decoder refresh actually solved.
+fn code_gram_from_routing(
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    k: usize,
+) -> (Vec<f64>, HashMap<(u32, u32), f64>) {
+    let mut diag = vec![0.0f64; k];
+    let mut off: HashMap<(u32, u32), f64> = HashMap::new();
+    let s = indices.ncols();
+    for i in 0..indices.nrows() {
+        for a in 0..s {
+            let ca = codes[[i, a]] as f64;
+            if ca == 0.0 {
+                continue;
+            }
+            let ka = indices[[i, a]];
+            diag[ka as usize] += ca * ca;
+            for b in (a + 1)..s {
+                let cb = codes[[i, b]] as f64;
+                if cb == 0.0 {
+                    continue;
+                }
+                let kb = indices[[i, b]];
+                if ka == kb {
+                    diag[ka as usize] += 2.0 * ca * cb;
+                    continue;
+                }
+                let key = if ka < kb { (ka, kb) } else { (kb, ka) };
+                *off.entry(key).or_insert(0.0) += ca * cb;
+            }
+        }
+    }
+    (diag, off)
+}
+
+/// Reconstruction residual sum of squares `Σ_i ‖x_i − Σ_j c_{ij} d_{a_{ij}}‖²` of
+/// a fit's stored routing against its decoder — the `RSS` aggregate the shared-ρ
+/// REML fixed point consumes.
+fn reconstruction_rss(x: ArrayView2<'_, f32>, fit: &SparseDictFit) -> f64 {
+    let p = x.ncols();
+    let s = fit.indices.ncols();
+    let mut rss = 0.0f64;
+    let mut recon = vec![0.0f64; p];
+    for i in 0..x.nrows() {
+        for r in recon.iter_mut() {
+            *r = 0.0;
+        }
+        for a in 0..s {
+            let cj = fit.codes[[i, a]] as f64;
+            if cj == 0.0 {
+                continue;
+            }
+            let drow = fit.decoder.row(fit.indices[[i, a]] as usize);
+            for (c, r) in recon.iter_mut().enumerate() {
+                *r += cj * drow[c] as f64;
+            }
+        }
+        let xi = x.row(i);
+        for c in 0..p {
+            let d = xi[c] as f64 - recon[c];
+            rss += d * d;
+        }
+    }
+    rss
+}
+
+/// Pooled aggregates for the linear block's ONE shared REML variance component
+/// at ridge `rho` (design gam#2232, Increment 2, plug 4).
+///
+/// Reconstructs the shared-ρ code Gram `A = CᵀC` from the fit's
+/// stored routing and computes the matrix-free effective dof
+/// `γ = tr(A(A+ρI)⁻¹)` ([`hutchinson_gram_edof`]) together with the reconstruction
+/// `RSS` and the decoder penalty energy `‖D‖²_F` — exactly the aggregates
+/// [`linear_shared_rho_fs_step`] consumes. Matrix-free throughout (no dense
+/// `K×K`, no `K×P` right-hand side), so it holds at `K ≈ 32k`.
+pub fn linear_block_reml_stats(
+    x: ArrayView2<'_, f32>,
+    fit: &SparseDictFit,
+    rho: f64,
+) -> LinearBlockRemlStats {
+    let k = fit.decoder.nrows();
+    let (diag, off) = code_gram_from_routing(fit.indices.view(), fit.codes.view(), k);
+    let gram_edof = hutchinson_gram_edof(&diag, &off, rho, k);
+    let penalty_energy: f64 = fit.decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
+    let rss = reconstruction_rss(x, fit);
+    LinearBlockRemlStats {
+        gram_edof,
+        p_cols: x.ncols(),
+        penalty_energy,
+        rss,
+        n_obs: x.nrows(),
+    }
+}
+
+/// Iteration cap for the shared-ρ REML schedule (design gam#2232, Increment 2,
+/// plug 4). The Fellner–Schall / MacKay evidence recursion for a single variance
+/// component contracts geometrically near its fixed point, and each iteration is
+/// a FULL linear-kernel fit, so a small cap bounds the schedule at a few times a
+/// single fit while comfortably covering the handful of steps to the stochastic
+/// edof floor. A run that has not settled by the cap returns its last fit rather
+/// than spinning.
+const MAX_REML_SCHEDULE_ITERS: usize = 8;
+
+/// Relative-ρ stopping band for the shared-ρ REML schedule, DERIVED from the
+/// edof probe variance target: the Hutchinson estimator resolves a PSD trace to a
+/// coefficient of variation of at best `√v` (variance-per-unit-trace `v`, at unit
+/// trace; see [`EDOF_TRACE_VARIANCE_PER_UNIT_TRACE`]), so a relative-ρ change
+/// below `√v` is already within the stochastic resolution of the edof that drives
+/// the update — iterating tighter would chase Monte-Carlo noise. Not a tuned knob:
+/// it is `√v` of the one documented quality target.
+fn reml_schedule_rho_rel_tol() -> f64 {
+    EDOF_TRACE_VARIANCE_PER_UNIT_TRACE.sqrt()
+}
+
+/// The shared-ρ REML schedule (design gam#2232, Increment 2, plug 4): the outer
+/// evidence loop that SELECTS the ONE shared linear-block ridge instead of taking
+/// two magic constants. It alternates a full [`run_linear_fast_kernel`] at the
+/// current ρ with one [`linear_shared_rho_fs_step`] Fellner–Schall update built
+/// from the matrix-free aggregates [`linear_block_reml_stats`], to the fixed
+/// point.
+///
+/// The initial ρ is the shared default ridge (`config.decoder_ridge`, equal to
+/// `config.code_ridge` on the shared-default entry) — the historical magic
+/// constant becomes only the WARM START of the evidence loop. Iteration stops
+/// when the relative ρ change falls below the solver-derived stochastic floor
+/// ([`reml_schedule_rho_rel_tol`]) — at which point the current fit already
+/// reflects a ρ within that band, so no redundant refit is issued — or at the
+/// documented cap [`MAX_REML_SCHEDULE_ITERS`].
+pub fn run_linear_reml_schedule(
+    x: ArrayView2<'_, f32>,
+    config: &SparseDictConfig,
+) -> Result<SparseDictFit, String> {
+    // Warm start at the shared-default ridge; from here ρ is REML-selected.
+    let mut rho = config.decoder_ridge as f64;
+    let mut fit = run_linear_fast_kernel(x, config, rho)?;
+    let tol = reml_schedule_rho_rel_tol();
+
+    for iter in 0..MAX_REML_SCHEDULE_ITERS {
+        let stats = linear_block_reml_stats(x, &fit, rho);
+        let rho_new = linear_shared_rho_fs_step(&stats, rho);
+        let rel_change = (rho_new - rho).abs() / rho.abs().max(f64::MIN_POSITIVE);
+        // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
+        // harnesses), at outer-loop cadence only — never per row or minibatch.
+        log::warn!(
+            "[SAE reml-schedule iter {}/{}] rho={:.6e} rho_new={:.6e} rel_change={:.3e} \
+             edof={:.2} rss={:.6e} penalty_energy={:.6e} tol={:.3e}",
+            iter + 1,
+            MAX_REML_SCHEDULE_ITERS,
+            rho,
+            rho_new,
+            rel_change,
+            stats.gram_edof,
+            stats.rss,
+            stats.penalty_energy,
+            tol,
+        );
+        if rel_change <= tol {
+            // The current `fit` was produced at `rho`, which is within `tol` of
+            // `rho_new`: it already reflects the fixed point. Stop without a
+            // redundant refit.
+            break;
+        }
+        rho = rho_new;
+        fit = run_linear_fast_kernel(x, config, rho)?;
+    }
+    Ok(fit)
+}
+
 fn validate(x: ArrayView2<'_, f32>, config: &SparseDictConfig) -> Result<(), String> {
     if x.nrows() == 0 || x.ncols() == 0 {
         return Err("fit_sparse_dictionary requires a non-empty N×P matrix".to_string());
@@ -2078,7 +2380,13 @@ mod exact_solve_tests {
             "parity gate requires the shared-default (equal-ridge) config"
         );
 
-        let legacy = fit_sparse_dictionary(x.view(), &config).expect("legacy run");
+        // Reference is the legacy fixed-ridge alternation `run` directly — NOT the
+        // public `fit_sparse_dictionary`, whose shared-default entry now layers the
+        // outer shared-ρ REML schedule on top (design gam#2232 Increment 2 plug 4).
+        // The parity contract this pins is `run_linear_fast_kernel == run` at the
+        // shared default ridge (the inner-solve seam), independent of that outer
+        // selection loop.
+        let legacy = super::run(x.view(), &config).expect("legacy run");
         let unified = run_linear_fast_kernel(x.view(), &config, config.decoder_ridge as f64)
             .expect("unified linear fast kernel");
 
@@ -2139,6 +2447,342 @@ mod exact_solve_tests {
         };
         let rho_sat = linear_shared_rho_fs_step(&saturated, 1.0e-3);
         assert!(rho_sat.is_finite() && rho_sat > 0.0, "saturated dof keeps ρ finite/positive");
+    }
+
+    /// Deterministic splitmix-backed uniform draw in `[0, 1)` (NO `rand` crate),
+    /// the crate's canonical test PRNG pattern.
+    fn next_unit(state: &mut u64) -> f64 {
+        let h = gam_linalg::utils::splitmix64(state);
+        (h >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Assemble the DENSE `K×K` Gram `A` from the sparse `(diag, off)` the
+    /// matrix-free estimator consumes — test-only oracle for the exact edof.
+    fn densify_gram(diag: &[f64], off: &HashMap<(u32, u32), f64>, k: usize) -> Array2<f64> {
+        let mut a = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            a[[i, i]] = diag[i];
+        }
+        for (&(r, c), &v) in off.iter() {
+            a[[r as usize, c as usize]] = v;
+            a[[c as usize, r as usize]] = v;
+        }
+        a
+    }
+
+    /// Exact `γ = tr(A(A+ρI)⁻¹) = tr((A+ρI)⁻¹ A)` via a dense Cholesky solve of
+    /// `(A+ρI) Y = A`, then `tr(Y)`.
+    fn exact_gram_edof(a: &Array2<f64>, rho: f64) -> f64 {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let k = a.nrows();
+        let mut m = a.clone();
+        for i in 0..k {
+            m[[i, i]] += rho;
+        }
+        let y = m
+            .cholesky(Side::Lower)
+            .expect("A+ρI is SPD")
+            .solve_mat(a);
+        (0..k).map(|i| y[[i, i]]).sum()
+    }
+
+    #[test]
+    fn hutchinson_gram_edof_matches_exact_dense_trace() {
+        // Plug point 4 (design gam#2232, Increment 2): the matrix-free Hutchinson
+        // edof `tr(A(A+ρI)⁻¹)` must agree with the exact dense trace within the
+        // stochastic tolerance DERIVED from the estimator's own variance target.
+        // Small `K=32` so the dense oracle is cheap; the estimator itself never
+        // forms the dense Gram.
+        use super::{
+            EDOF_TRACE_VARIANCE_PER_UNIT_TRACE, code_gram_from_routing, hutchinson_gram_edof,
+        };
+        let (k, s, n) = (32usize, 3usize, 400usize);
+
+        // Deterministic 3-sparse routing over the 32 atoms with non-trivial
+        // co-firing (so `A` has a genuine off-diagonal coupling graph, not a
+        // diagonal degenerate case).
+        let mut indices = Array2::<u32>::zeros((n, s));
+        let mut codes = Array2::<f32>::zeros((n, s));
+        let mut rng = 0x51E2_D3C4_A5B6_9788u64;
+        for i in 0..n {
+            for j in 0..s {
+                // Distinct-per-slot atoms spread across the dictionary.
+                let atom = ((i * (j + 1) * 7 + j * 5 + 1) % k) as u32;
+                indices[[i, j]] = atom;
+                codes[[i, j]] = (next_unit(&mut rng) as f32 - 0.5) * 2.0;
+            }
+        }
+
+        let (diag, off) = code_gram_from_routing(indices.view(), codes.view(), k);
+        let a_dense = densify_gram(&diag, &off, k);
+
+        for &rho in &[1.0e-3_f64, 1.0e-1, 1.0] {
+            let exact = exact_gram_edof(&a_dense, rho);
+            let approx = hutchinson_gram_edof(&diag, &off, rho, k);
+
+            // Derived tolerance: with `m = ⌈2/v⌉` probes and complementary trace
+            // `c = K − γ`, the Rademacher estimator's standard error is at most
+            // `√(2c/m)` (universal PSD-trace bound); allow 6 σ (a very safe tail).
+            let probes = (2.0 / EDOF_TRACE_VARIANCE_PER_UNIT_TRACE).ceil();
+            let c = (k as f64 - exact).max(0.0);
+            let sd_bound = (2.0 * c / probes).sqrt();
+            let tol = 6.0 * sd_bound + 1.0e-6;
+            assert!(
+                (approx - exact).abs() <= tol,
+                "Hutchinson edof {approx} vs exact {exact} at rho={rho} exceeds derived \
+                 6σ tolerance {tol} (c={c}, probes={probes})"
+            );
+            // The estimate is a valid effective-dof: in `[0, K]`.
+            assert!(
+                approx >= 0.0 && approx <= k as f64 + 1.0e-9,
+                "edof {approx} must lie in [0, K]"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_rho_fixed_point_converges_and_tracks_planted_noise() {
+        // Plug point 4 (design gam#2232, Increment 2): the shared-ρ FS fixed point
+        // must (1) CONVERGE on a planted problem and (2) TRACK the planted noise —
+        // a noisier reconstruction target selects a LARGER shared ridge
+        // (ρ* = γ·σ̂²/‖D‖²_F grows with the residual variance). We iterate exactly
+        // the schedule's loop body (fit → stats → FS step) so the test exercises
+        // production math, and read the fixed point off at two noise levels.
+        use super::{
+            linear_block_reml_stats, linear_shared_rho_fs_step, reml_schedule_rho_rel_tol,
+            run_linear_fast_kernel,
+        };
+
+        // Planted 2-sparse mixture over K orthonormal-ish atoms + additive noise.
+        fn planted_noisy(n: usize, p: usize, k: usize, noise: f32, seed: u64) -> Array2<f32> {
+            let mut atoms = Array2::<f32>::zeros((k, p));
+            for atom in 0..k {
+                // Deterministic near-orthonormal-ish rows (unit-normed).
+                let mut norm = 0.0f64;
+                for c in 0..p {
+                    let v = (((atom * 13 + c * 7 + 3) % 17) as f32 - 8.0) / 8.0;
+                    atoms[[atom, c]] = v;
+                    norm += (v as f64) * (v as f64);
+                }
+                let inv = 1.0 / norm.sqrt().max(1.0e-12) as f32;
+                for c in 0..p {
+                    atoms[[atom, c]] *= inv;
+                }
+            }
+            let mut rng = seed;
+            let mut x = Array2::<f32>::zeros((n, p));
+            for i in 0..n {
+                let a0 = (i % k) as usize;
+                let a1 = ((i / k + 1) % k) as usize;
+                let c0 = 0.6 + 0.4 * next_unit(&mut rng) as f32;
+                let c1 = 0.2 + 0.3 * next_unit(&mut rng) as f32;
+                for c in 0..p {
+                    let clean = c0 * atoms[[a0, c]] + c1 * atoms[[a1, c]];
+                    let eps = noise * (next_unit(&mut rng) as f32 - 0.5) * 2.0;
+                    x[[i, c]] = clean + eps;
+                }
+            }
+            x
+        }
+
+        let (n, p, k) = (300usize, 12usize, 24usize);
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active: 2,
+            minibatch: 64,
+            max_epochs: 40,
+            score_tile: 12,
+            code_ridge: 1.0e-6,
+            decoder_ridge: 1.0e-6,
+            tolerance: 1.0e-9,
+            score_mode: gam_gpu::GpuMode::Off,
+        };
+
+        // Iterate the schedule's loop body to the fixed point and return (ρ*, last
+        // relative change) so we can assert convergence.
+        let fixed_point = |x: ArrayView2<'_, f32>| -> (f64, f64) {
+            let mut rho = config.decoder_ridge as f64;
+            let mut last_rel = f64::INFINITY;
+            for _ in 0..16 {
+                let fit = run_linear_fast_kernel(x, &config, rho).expect("kernel fit");
+                let stats = linear_block_reml_stats(x, &fit, rho);
+                let rho_new = linear_shared_rho_fs_step(&stats, rho);
+                last_rel = (rho_new - rho).abs() / rho.abs().max(f64::MIN_POSITIVE);
+                rho = rho_new;
+            }
+            (rho, last_rel)
+        };
+
+        let x_low = planted_noisy(n, p, k, 0.03, 0x1111_2222_3333_4444);
+        let x_high = planted_noisy(n, p, k, 0.40, 0x1111_2222_3333_4444);
+        let (rho_low, rel_low) = fixed_point(x_low.view());
+        let (rho_high, rel_high) = fixed_point(x_high.view());
+
+        // (1) Both fixed points are finite, strictly positive, and SETTLED: the
+        // last relative move is small (the FS evidence recursion contracted).
+        assert!(
+            rho_low.is_finite() && rho_low > 0.0 && rho_high.is_finite() && rho_high > 0.0,
+            "shared ρ* must be finite and positive (low={rho_low}, high={rho_high})"
+        );
+        // Settled = the last relative move is within the schedule's derived
+        // stopping band (the stochastic edof floor √v); iterating tighter would
+        // chase Monte-Carlo noise, so this IS convergence for this estimator.
+        let band = reml_schedule_rho_rel_tol();
+        assert!(
+            rel_low <= band && rel_high <= band,
+            "FS fixed point must settle within the derived stopping band {band}: \
+             last relative moves low={rel_low} high={rel_high}"
+        );
+
+        // (2) NOISE TRACKING: the noisier target selects the larger shared ridge.
+        assert!(
+            rho_high > rho_low,
+            "shared ρ* must grow with planted noise: high-noise ρ*={rho_high} \
+             must exceed low-noise ρ*={rho_low}"
+        );
+    }
+
+    #[test]
+    fn reml_schedule_held_out_ev_matches_or_beats_magic_ridge() {
+        // Plug point 4 (design gam#2232, Increment 2): the shared-ρ REML schedule
+        // (the new default entry) must NOT regress held-out reconstruction EV
+        // versus the legacy fixed magic ridge — the risk pin for #1026 through the
+        // new entry. Objective metric: OUT-OF-SAMPLE explained variance (frozen
+        // decoder, fresh test-row codes), so the REML selection is judged on real
+        // predictive quality, not on reproducing the magic-ridge decoder.
+        use super::{run_linear_fast_kernel, run_linear_reml_schedule};
+        use crate::sparse_dict::codes::solve_row_codes;
+
+        // Held-out EV of a frozen decoder on a fresh block (production path).
+        fn held_out_ev(
+            decoder: ArrayView2<'_, f32>,
+            x_test: ArrayView2<'_, f32>,
+            s: usize,
+            tile: usize,
+            code_ridge: f32,
+        ) -> f64 {
+            let n = x_test.nrows();
+            let p = x_test.ncols();
+            let scorer = TileScorer::new(s, tile);
+            let mut means = vec![0.0f64; p];
+            for i in 0..n {
+                for c in 0..p {
+                    means[c] += x_test[[i, c]] as f64;
+                }
+            }
+            for m in means.iter_mut() {
+                *m /= n as f64;
+            }
+            let mut rss = 0.0f64;
+            let mut tss = 0.0f64;
+            for i in 0..n {
+                let row = x_test.row(i);
+                let active = scorer.route_row(row, decoder);
+                let code = solve_row_codes(row, decoder, &active, s, code_ridge);
+                let mut recon = vec![0.0f64; p];
+                for j in 0..code.indices.len() {
+                    let cj = code.codes[j] as f64;
+                    if cj == 0.0 {
+                        continue;
+                    }
+                    let drow = decoder.row(code.indices[j] as usize);
+                    for c in 0..p {
+                        recon[c] += cj * drow[c] as f64;
+                    }
+                }
+                for c in 0..p {
+                    let r = x_test[[i, c]] as f64 - recon[c];
+                    rss += r * r;
+                    let t = x_test[[i, c]] as f64 - means[c];
+                    tss += t * t;
+                }
+            }
+            if tss <= 1.0e-24 {
+                if rss <= 1.0e-24 { 1.0 } else { 0.0 }
+            } else {
+                1.0 - rss / tss
+            }
+        }
+
+        // Planted 2-sparse mixture with modest noise (so REML has a real ridge to
+        // select), deterministic 80/20 stride split.
+        let (k, p, n) = (24usize, 12usize, 500usize);
+        let mut atoms = Array2::<f32>::zeros((k, p));
+        for atom in 0..k {
+            let mut norm = 0.0f64;
+            for c in 0..p {
+                let v = (((atom * 11 + c * 5 + 2) % 13) as f32 - 6.0) / 6.0;
+                atoms[[atom, c]] = v;
+                norm += (v as f64) * (v as f64);
+            }
+            let inv = 1.0 / norm.sqrt().max(1.0e-12) as f32;
+            for c in 0..p {
+                atoms[[atom, c]] *= inv;
+            }
+        }
+        let mut rng = 0x0BAD_C0FF_EE12_3456u64;
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            let a0 = i % k;
+            let a1 = (i / k + 1) % k;
+            let c0 = 0.6 + 0.4 * next_unit(&mut rng) as f32;
+            let c1 = 0.2 + 0.3 * next_unit(&mut rng) as f32;
+            for c in 0..p {
+                let clean = c0 * atoms[[a0, c]] + c1 * atoms[[a1, c]];
+                let eps = 0.15 * (next_unit(&mut rng) as f32 - 0.5) * 2.0;
+                x[[i, c]] = clean + eps;
+            }
+        }
+        let mut train_rows = Vec::new();
+        let mut test_rows = Vec::new();
+        for i in 0..n {
+            if i % 5 == 0 {
+                test_rows.push(i);
+            } else {
+                train_rows.push(i);
+            }
+        }
+        let mut x_train = Array2::<f32>::zeros((train_rows.len(), p));
+        for (r, &i) in train_rows.iter().enumerate() {
+            x_train.row_mut(r).assign(&x.row(i));
+        }
+        let mut x_test = Array2::<f32>::zeros((test_rows.len(), p));
+        for (r, &i) in test_rows.iter().enumerate() {
+            x_test.row_mut(r).assign(&x.row(i));
+        }
+
+        let s = 2usize;
+        let tile = 12usize;
+        let config = SparseDictConfig {
+            n_atoms: k,
+            active: s,
+            minibatch: 128,
+            max_epochs: 60,
+            score_tile: tile,
+            code_ridge: 1.0e-6,
+            decoder_ridge: 1.0e-6,
+            tolerance: 1.0e-9,
+            score_mode: gam_gpu::GpuMode::Off,
+        };
+
+        // Magic-ridge baseline: legacy fixed-ridge fit at the default 1e-6.
+        let magic = run_linear_fast_kernel(x_train.view(), &config, config.decoder_ridge as f64)
+            .expect("magic-ridge fit");
+        // REML-selected shared ρ: the new default schedule.
+        let reml = run_linear_reml_schedule(x_train.view(), &config).expect("reml schedule fit");
+
+        let magic_ev = held_out_ev(magic.decoder.view(), x_test.view(), s, tile, config.code_ridge);
+        let reml_ev = held_out_ev(reml.decoder.view(), x_test.view(), s, tile, config.code_ridge);
+
+        // REML must MATCH-OR-BEAT the magic ridge on held-out EV (small epsilon
+        // absorbs f32 routing noise); it selects the ridge by evidence rather than
+        // pinning a constant, so it cannot do materially worse out of sample.
+        assert!(
+            reml_ev + 1.0e-3 >= magic_ev,
+            "REML-selected shared ρ held-out EV {reml_ev} must match-or-beat the \
+             magic-ridge baseline {magic_ev}"
+        );
     }
 
     #[test]

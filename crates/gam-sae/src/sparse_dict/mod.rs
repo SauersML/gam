@@ -81,7 +81,8 @@ pub use scoring_gpu::{
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 pub use update::{
-    DecoderSolveStats, LinearBlockRemlStats, linear_shared_rho_fs_step, run_linear_fast_kernel,
+    DecoderSolveStats, LinearBlockRemlStats, linear_block_reml_stats, linear_shared_rho_fs_step,
+    run_linear_fast_kernel, run_linear_reml_schedule,
 };
 
 use ndarray::{Array2, ArrayView2};
@@ -312,9 +313,26 @@ pub fn sparse_dictionary_transform_with_mode(
 /// This is the public entry of the collapsed linear lane. It never forms a
 /// dense `N×K` object: scoring is tiled, routing is fixed-width sparse, and the
 /// decoder is refreshed from accumulated sparse normal equations.
+///
+/// At the **shared default** (`code_ridge == decoder_ridge == 1e-6`, the
+/// documented defaults) the two historical magic ridges collapse into ONE shared
+/// ρ that the linear block's REML evidence loop SELECTS
+/// ([`update::run_linear_reml_schedule`], design gam#2232 Increment 2 plug 4):
+/// the default ridge becomes only the warm start, killing the no-REML lane. Any
+/// **explicit** ridge choice (the two differ, or either departs from the default)
+/// keeps the legacy fixed-ridge alternation ([`update::run`]) verbatim, so the
+/// two-ridge FFI surface is preserved unchanged until Increment 5 re-points
+/// callers.
 pub fn fit_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
 ) -> Result<SparseDictFit, String> {
-    update::run(x, config)
+    let default_ridge = SparseDictConfig::default();
+    let shared_default = config.code_ridge == default_ridge.code_ridge
+        && config.decoder_ridge == default_ridge.decoder_ridge;
+    if shared_default {
+        update::run_linear_reml_schedule(x, config)
+    } else {
+        update::run(x, config)
+    }
 }
