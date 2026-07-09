@@ -1592,6 +1592,13 @@ impl PySaeAmortizedEncoder {
 /// larger bound only SHRINKS the certified radius — it can never issue a false
 /// certificate. Precomputed bases (no analytic second jet) are rejected: they
 /// have no closed-form `L` and must route to the exact encode.
+///
+/// When `amplitude_bounds` is `None` the per-atom default `|z_k|` bound is the
+/// max `|assignment|` over the `(N, K)` training `assignments` (or `1.0` for an
+/// empty design); when `target_norm_bound` is `None` the default `‖x‖` bound is
+/// the max row `L2` norm of the `(N, F)` `encode_rows` (or `1.0` when empty).
+/// These default reductions live here so the wrapper hands the arrays over
+/// verbatim instead of pre-reducing them in NumPy.
 #[pyfunction(signature = (
     basis_kinds,
     atom_dims,
@@ -1600,6 +1607,8 @@ impl PySaeAmortizedEncoder {
     basis_sizes,
     amplitude_bounds,
     target_norm_bound,
+    assignments = None,
+    encode_rows = None,
     grid_resolution = 32,
     ridge = 1.0e-10,
     newton_steps = 8,
@@ -1610,8 +1619,10 @@ fn build_sae_encode_atlas<'py>(
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
     duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
     basis_sizes: Vec<usize>,
-    amplitude_bounds: Vec<f64>,
-    target_norm_bound: f64,
+    amplitude_bounds: Option<Vec<f64>>,
+    target_norm_bound: Option<f64>,
+    assignments: Option<PyReadonlyArray2<'py, f64>>,
+    encode_rows: Option<PyReadonlyArray2<'py, f64>>,
     grid_resolution: usize,
     ridge: f64,
     newton_steps: usize,
@@ -1622,6 +1633,58 @@ fn build_sae_encode_atlas<'py>(
             "build_sae_encode_atlas: dictionary must have at least one atom".into(),
         ));
     }
+    // Default amplitude bounds: per-atom max |assignment| over the training
+    // codes (or 1.0 for an empty design), matching the former NumPy reduction.
+    let amplitude_bounds: Vec<f64> = match amplitude_bounds {
+        Some(bounds) => bounds,
+        None => {
+            let assignments = assignments.ok_or_else(|| {
+                py_value_error(
+                    "build_sae_encode_atlas: amplitude_bounds=None requires the training \
+                     assignments array"
+                        .into(),
+                )
+            })?;
+            let a = assignments.as_array();
+            if a.ncols() < k_atoms {
+                return Err(py_value_error(format!(
+                    "build_sae_encode_atlas: assignments has {} columns but K={k_atoms}",
+                    a.ncols()
+                )));
+            }
+            (0..k_atoms)
+                .map(|k| {
+                    if a.nrows() == 0 {
+                        1.0
+                    } else {
+                        a.column(k).iter().map(|v| v.abs()).fold(f64::NEG_INFINITY, f64::max)
+                    }
+                })
+                .collect()
+        }
+    };
+    // Default target-norm bound: max row L2 norm of the encode data (or 1.0 for
+    // an empty matrix), matching the former NumPy reduction.
+    let target_norm_bound: f64 = match target_norm_bound {
+        Some(bound) => bound,
+        None => {
+            let rows = encode_rows.ok_or_else(|| {
+                py_value_error(
+                    "build_sae_encode_atlas: target_norm_bound=None requires the encode-data rows"
+                        .into(),
+                )
+            })?;
+            let x = rows.as_array();
+            if x.len() == 0 {
+                1.0
+            } else {
+                x.rows()
+                    .into_iter()
+                    .map(|row| row.iter().map(|v| v * v).sum::<f64>().sqrt())
+                    .fold(f64::NEG_INFINITY, f64::max)
+            }
+        }
+    };
     if atom_dims.len() != k_atoms
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
