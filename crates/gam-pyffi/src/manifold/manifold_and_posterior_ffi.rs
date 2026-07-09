@@ -7496,6 +7496,71 @@ fn manifold_sae_owned3(v: &[Vec<Vec<f64>>]) -> PyResult<Array3<f64>> {
     Array3::from_shape_vec((d0, d1, d2), flat).map_err(|e| py_value_error(e.to_string()))
 }
 
+/// Parse a JSON array of numbers into an owned `Array1` (for the hybrid-split
+/// linear-image `b0`/`b1`/`v` vectors read from the stored payload).
+fn manifold_sae_json_vec1(value: Option<&serde_json::Value>) -> PyResult<Array1<f64>> {
+    let arr = value.and_then(|v| v.as_array()).ok_or_else(|| {
+        py_value_error("hybrid_split linear_image b0/b1/v must be a JSON array".to_string())
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for x in arr {
+        out.push(x.as_f64().ok_or_else(|| {
+            py_value_error("hybrid_split linear_image array has a non-numeric entry".to_string())
+        })?);
+    }
+    Ok(Array1::from(out))
+}
+
+/// Rust port of `ManifoldSAE._hybrid_linear_images_for_oos` (#1228/#2091): read
+/// the trained dictionary's hybrid-collapsed straight sub-models out of the
+/// stored `hybrid_split` block as `(atom_idx, t_bar, b0, b1, v)` tuples for the
+/// OOS reconstruction. Mirrors the Python exactly — an entry without a
+/// `linear_image` is skipped, `v` is `None` for an ordinary straight image and
+/// `Some` for a collapse-rescued slot, and an empty result maps to `None` (all
+/// -curved OOS reconstruction).
+fn manifold_sae_hybrid_linear_images(
+    hybrid_split: &Option<serde_json::Value>,
+) -> PyResult<Option<Vec<(usize, f64, Array1<f64>, Array1<f64>, Option<Array1<f64>>)>>> {
+    let Some(hs) = hybrid_split else {
+        return Ok(None);
+    };
+    let Some(atoms) = hs.get("atoms").and_then(|a| a.as_array()) else {
+        return Ok(None);
+    };
+    let mut images = Vec::new();
+    for entry in atoms {
+        let linear_image = entry.get("linear_image");
+        let Some(li) = linear_image else {
+            continue;
+        };
+        // Mirror the Python `if not li: continue` — skip a null / empty
+        // `linear_image` (an all-curved slot carries no straight image).
+        let is_empty_container = li.as_object().map(|o| o.is_empty()).unwrap_or(false)
+            || li.as_array().map(|a| a.is_empty()).unwrap_or(false);
+        if li.is_null() || is_empty_container {
+            continue;
+        }
+        let atom_idx = li
+            .get("atom_idx")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| py_value_error("hybrid_split linear_image missing atom_idx".to_string()))?
+            as usize;
+        let t_bar = li
+            .get("t_bar")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| py_value_error("hybrid_split linear_image missing t_bar".to_string()))?;
+        let b0 = manifold_sae_json_vec1(li.get("b0"))?;
+        let b1 = manifold_sae_json_vec1(li.get("b1"))?;
+        let v = match li.get("v") {
+            None => None,
+            Some(x) if x.is_null() => None,
+            Some(x) => Some(manifold_sae_json_vec1(Some(x))?),
+        };
+        images.push((atom_idx, t_bar, b0, b1, v));
+    }
+    Ok(if images.is_empty() { None } else { Some(images) })
+}
+
 /// A single fitted atom's object surface (#2091). Mirrors the attributes
 /// `SaeManifoldAtomFit` exposed (`atom.basis`, `atom.decoder_coefficients`,
 /// `atom.decoder_covariance` reconstructed dense, the shape band, …) so
@@ -7592,6 +7657,87 @@ impl AtomCore {
 #[pyclass(module = "gamfit._rust", name = "ManifoldSaeCore")]
 pub(crate) struct ManifoldSaeCore {
     inner: crate::manifold::manifold_sae_payload::ManifoldSaePayload,
+}
+
+impl ManifoldSaeCore {
+    /// Build the OOS argument bundle from this handle's state and run the
+    /// frozen-decoder Newton solve, returning the full payload dict
+    /// (`assignments_z`, `on_atom_coords_t`, `logits`, `fitted`). The Rust-owned
+    /// counterpart of `ManifoldSAE._oos_payload`: it threads the trained geometry,
+    /// terminal ρ* (`selected_log_*`), learnable-α flag, and hybrid-collapsed
+    /// straight sub-models exactly as the Python does, so the returned arrays are
+    /// bitwise-identical to the dataclass OOS path. No warm start is supplied
+    /// (`initial_logits`/`initial_coords` are `None`), matching a bare
+    /// `reconstruct`/`encode` call, and the two ridge floors take the same
+    /// `1e-6` defaults the `sae_manifold_predict_oos` pyfunction applies when the
+    /// Python omits them.
+    fn oos_payload_dict<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let inner = &self.inner;
+        let decoder_owned: Vec<Array2<f64>> = inner
+            .decoder_blocks
+            .iter()
+            .map(|b| manifold_sae_owned2(b))
+            .collect::<PyResult<_>>()?;
+        let duchon_owned: Vec<Option<Array2<f64>>> = inner
+            .duchon_centers
+            .iter()
+            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
+            .collect::<PyResult<_>>()?;
+        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
+        let basis_sizes: Vec<usize> =
+            inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
+        // Exact mirror of the Python OOS n_harmonics gate (case-sensitive
+        // `periodic`/`torus` only), matching the steer path above.
+        let n_harm: Vec<Option<usize>> = inner
+            .basis_kinds
+            .iter()
+            .zip(&inner.n_harmonics)
+            .map(|(kind, &h)| {
+                if kind == "periodic" || kind == "torus" {
+                    Some(h.max(0) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
+        let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            decoder_owned.iter().map(|a| a.view()).collect();
+        predict_oos_from_arrays(
+            py,
+            x_new.as_array(),
+            inner.basis_kinds.clone(),
+            atom_dim,
+            &decoder_views,
+            &duchon_owned,
+            n_harm,
+            basis_sizes,
+            inner.alpha,
+            inner.tau,
+            inner.assignment.clone(),
+            inner.sparsity_strength,
+            inner.smoothness,
+            inner.max_iter.max(0) as usize,
+            inner.learning_rate,
+            // Ridge floors: the Python `_oos_payload` omits both, so the
+            // `sae_manifold_predict_oos` pyfunction supplies its `1e-6` defaults.
+            1.0e-6,
+            1.0e-6,
+            None,
+            None,
+            inner.jumprelu_threshold,
+            inner.top_k.map(|t| t.max(0) as usize),
+            hybrid,
+            inner.selected_log_lambda_sparse,
+            inner.selected_log_lambda_smooth.clone(),
+            inner.selected_log_ard.clone(),
+            inner.learnable_alpha,
+        )
+    }
 }
 
 #[pymethods]
@@ -7759,6 +7905,44 @@ impl ManifoldSaeCore {
             inner.fisher_provenance.as_deref(),
         )?;
         steer_plan_to_pydict(py, plan)
+    }
+
+    /// Held-out dense reconstruction `(N, p)` of `x_new` — the Rust-owned
+    /// counterpart of `ManifoldSAE.reconstruct` for out-of-sample rows. Runs the
+    /// frozen-decoder OOS Newton solve through the SAME `predict_oos_from_arrays`
+    /// core the `sae_manifold_predict_oos` pyfunction uses, reading the trained
+    /// geometry, terminal ρ*, and hybrid-collapsed straight sub-models from this
+    /// handle's own state (no per-call re-marshalling), and returns the payload's
+    /// `fitted` array. Unlike the dataclass path there is no training-data
+    /// shortcut: every call runs the OOS solve.
+    fn reconstruct<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<PyObject> {
+        let payload = self.oos_payload_dict(py, x_new)?;
+        let bound = payload.bind(py);
+        let fitted = bound
+            .get_item("fitted")?
+            .ok_or_else(|| py_value_error("OOS payload missing 'fitted'".to_string()))?;
+        Ok(fitted.unbind())
+    }
+
+    /// Held-out soft assignment codes `(N, K)` for `x_new` — the Rust-owned
+    /// counterpart of `ManifoldSAE.encode`. Runs the same frozen-decoder OOS
+    /// solve as [`reconstruct`](Self::reconstruct) and returns the payload's
+    /// `assignments_z` array.
+    fn encode<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<PyObject> {
+        let payload = self.oos_payload_dict(py, x_new)?;
+        let bound = payload.bind(py);
+        let codes = bound
+            .get_item("assignments_z")?
+            .ok_or_else(|| py_value_error("OOS payload missing 'assignments_z'".to_string()))?;
+        Ok(codes.unbind())
     }
 
     // --- dense numeric getters -------------------------------------------

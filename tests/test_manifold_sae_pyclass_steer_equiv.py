@@ -101,6 +101,29 @@ def test_reconstruct_training_bitwise_equivalence() -> None:
     )
 
 
+def test_reconstruct_encode_oos_bitwise_equivalence_circle() -> None:
+    """Held-out `reconstruct`/`encode` are bitwise identical between the
+    dataclass and the pyclass. Both run the frozen-decoder OOS Newton solve
+    through the same `sae_manifold_predict_oos` core; the pyclass builds the
+    argument bundle (trained geometry, terminal rho*, hybrid-collapsed straight
+    sub-models parsed from `hybrid_split`) from Rust-owned state, the dataclass
+    from its attributes. Any divergence is an arg-threading bug in that rebuild,
+    which is exactly what exact equality catches. Held-out X (a distinct seed)
+    forces the OOS branch on both — no training-data shortcut."""
+    core_cls = _core_cls()
+    if not hasattr(core_cls, "reconstruct") or not hasattr(core_cls, "encode"):
+        pytest.skip("wheel predates ManifoldSaeCore.reconstruct/encode (#2091)")
+    x = _planted_circle(44, 6, seed=7)
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        n_iter=8, random_state=0,
+    )
+    core = core_cls(fit.to_dict())
+    x_oos = _planted_circle(20, 6, seed=101)
+    np.testing.assert_array_equal(fit.reconstruct(x_oos), core.reconstruct(x_oos))
+    np.testing.assert_array_equal(fit.encode(x_oos), core.encode(x_oos))
+
+
 def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
     """Euclidean (degree-2 patch) atom: exercises the duchon_centers threading
     that the circle atom (no centers) does not."""
