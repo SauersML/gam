@@ -1143,7 +1143,7 @@ fn sae_manifold_predict_oos<'py>(
         // keeps the supplied α. Seeding at the initial α while the gates read
         // the learnable α would seed against a different prior schedule.
         let seed_alpha = if learnable_alpha {
-            gam::terms::sae::manifold::resolve_learnable_weight(
+            gam::terms::analytic_penalties::resolve_learnable_weight(
                 alpha,
                 log_lambda_sparse.unwrap_or_else(|| sparsity_strength.ln()),
             )
