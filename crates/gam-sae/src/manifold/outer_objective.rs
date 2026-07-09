@@ -3197,8 +3197,8 @@ impl SaeManifoldOuterObjective {
         // periodic axes, see `von_mises_ard_precision`).
         // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
         // coordinate `1+K+axis`, so the fixed point pools the evidence across the
-        // atoms owning the axis — `α_axis_new = φ̂·(count·n) / Σ_k(‖t_kj‖²+tr_kj)` —
-        // and writes a single step. Walking a raw per-atom cursor there indexes
+        // atoms owning the axis — `α_axis_new = (count·n) / Σ_k(‖t_kj‖²+tr_kj)`
+        // (#F1 — no `φ̂`) — and writes a single step. Walking a raw per-atom cursor there indexes
         // past the flat length `1+K+max_d` (OOB) and splits one shared strength
         // across phantom slots. In `PerAtom` mode each `(k, axis)` is its own
         // coordinate and this reduces to the historical per-atom Mackay update.
@@ -3399,11 +3399,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // intractable at large K. EFS updates all coords SIMULTANEOUSLY from a
             // single trace pass, so it scales. The #1023 boundary-collapse (EFS
             // railing λ_smooth and collapsing the decoder to the mean) is guarded
-            // two ways now: efs_step's update is dispersion-SCALED (λ_new = φ̂·(rank
-            // −edof)/energy, the dimensionless effective stiffness, not an absolute
-            // output-unit weight), and the data-floor collapse penalty
-            // (add_fit_data_collapse_penalty) on the value lane rejects a
-            // mean-collapsed dictionary. So the fixed-point lane is enabled.
+            // two ways now: efs_step's update targets the FINITE REML stationary
+            // point λ_new = (rank−edof)/energy (#F1 — the unit-dispersion fixed
+            // point the value criterion's ∂/∂ρ = 0 defines; `rank−edof ≤ rank`
+            // bounded and `energy > 0`, so λ cannot rail to a mean-collapse), and
+            // the data-floor collapse penalty (add_fit_data_collapse_penalty) on the
+            // value lane rejects a mean-collapsed dictionary. So the fixed-point
+            // lane is enabled.
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
