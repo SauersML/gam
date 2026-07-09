@@ -35,6 +35,10 @@ on:
         description: "cargo test name filter(s), whitespace-separated. Empty = skip Rust."
         default: ""
         required: false
+      rust_package:
+        description: "Optional Cargo package for focused Rust tests. Empty = workspace minus gam-pyffi."
+        default: ""
+        required: false
       py_filter:
         description: "pytest -k expression. Empty = skip Python."
         default: ""
@@ -90,6 +94,7 @@ jobs:
         shell: bash
         env:
           RUST_FILTER: ${{ github.event.inputs.rust_filter }}
+          RUST_PACKAGE: ${{ github.event.inputs.rust_package }}
         run: |
           set -euo pipefail
           # `--exclude gam-pyffi`: gam-pyffi's default-on `extension-module`
@@ -107,8 +112,13 @@ jobs:
           # or shell syntax.
           read -r -a filters <<< "$RUST_FILTER"
           for filter in "${filters[@]}"; do
-            echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
-            cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture
+            if [[ -n "$RUST_PACKAGE" ]]; then
+              echo "cargo test -p ${RUST_PACKAGE} -- ${filter}"
+              cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture
+            else
+              echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
+              cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture
+            fi
           done
 
       # ---- Python/torch shared prerequisites (either filter needs the extension) ----
