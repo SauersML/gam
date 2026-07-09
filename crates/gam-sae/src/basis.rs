@@ -4,6 +4,49 @@ use std::sync::Arc;
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 
+    /// Evaluate `Φ` and its first-location jet DIRECTLY into caller-owned
+    /// buffers, avoiding the fresh `(N, M)` Φ + `(N, M, d)` jet allocation
+    /// [`Self::evaluate`] performs on every call.
+    ///
+    /// The inner Newton loop re-evaluates each atom's basis on every
+    /// line-search trial ([`crate::manifold::atom::SaeManifoldAtom::refresh_basis`]);
+    /// there the term already owns correctly-shaped Φ / jet arrays, so reusing
+    /// them removes the per-trial allocation churn (multiple trials per Newton
+    /// iteration under LM / backtracking). `phi` must be shaped
+    /// `(coords.nrows(), M)` and `jet` `(coords.nrows(), M, coords.ncols())`
+    /// for this evaluator's basis width `M`; implementations return a
+    /// descriptive `Err` on any mismatch — the same shape guard `refresh_basis`
+    /// previously applied to the freshly-allocated arrays.
+    ///
+    /// The default forwards to [`Self::evaluate`] and copies, so evaluators
+    /// that have not specialized it stay correct at the cost of one extra copy;
+    /// the hot evaluators override it to fill in place.
+    fn evaluate_into(
+        &self,
+        phi: &mut Array2<f64>,
+        jet: &mut Array3<f64>,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        let (new_phi, new_jet) = self.evaluate(coords)?;
+        if new_phi.dim() != phi.dim() {
+            return Err(format!(
+                "SaeBasisEvaluator::evaluate_into: evaluator returned Φ {:?}, target buffer {:?}",
+                new_phi.dim(),
+                phi.dim()
+            ));
+        }
+        if new_jet.dim() != jet.dim() {
+            return Err(format!(
+                "SaeBasisEvaluator::evaluate_into: evaluator returned jet {:?}, target buffer {:?}",
+                new_jet.dim(),
+                jet.dim()
+            ));
+        }
+        phi.assign(&new_phi);
+        jet.assign(&new_jet);
+        Ok(())
+    }
+
     /// Return the same evaluator after the coordinate change
     /// `old_t = shift + scale * new_t`, when the basis family can transport the
     /// decoder coefficients exactly enough for the accepted-iterate gauge fix.
@@ -302,6 +345,23 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        // Single source of truth: allocate the correctly-shaped buffers and let
+        // the in-place path fill them, so `evaluate` and `evaluate_into` can
+        // never numerically diverge.
+        let n = coords.nrows();
+        let m = self.num_basis;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 1));
+        self.evaluate_into(&mut phi, &mut jet, coords)?;
+        Ok((phi, jet))
+    }
+
+    fn evaluate_into(
+        &self,
+        phi: &mut Array2<f64>,
+        jet: &mut Array3<f64>,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
         let n = coords.nrows();
         let d = coords.ncols();
         if d != 1 {
@@ -310,10 +370,25 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
             ));
         }
         let m = self.num_basis;
+        if phi.dim() != (n, m) {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator::evaluate_into: Φ buffer {:?} != ({n}, {m})",
+                phi.dim()
+            ));
+        }
+        if jet.dim() != (n, m, 1) {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator::evaluate_into: jet buffer {:?} != ({n}, {m}, 1)",
+                jet.dim()
+            ));
+        }
         let num_harmonics = (m - 1) / 2;
         let two_pi = 2.0 * std::f64::consts::PI;
-        let mut phi = Array2::<f64>::zeros((n, m));
-        let mut jet = Array3::<f64>::zeros((n, m, 1));
+        // The constant column carries a zero jet and is never written in the
+        // harmonic loop below, so clear both buffers to erase any stale
+        // (reused-workspace) contents before filling.
+        phi.fill(0.0);
+        jet.fill(0.0);
         for row in 0..n {
             let t = coords[[row, 0]];
             phi[[row, 0]] = 1.0;
@@ -329,7 +404,7 @@ impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
                 jet[[row, c_idx, 0]] = -two_pi * (h as f64) * s;
             }
         }
-        Ok((phi, jet))
+        Ok(())
     }
 }
 
@@ -908,6 +983,23 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        // Single source of truth: allocate correctly-shaped buffers and fill
+        // them through the in-place path (see `evaluate_into`).
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let d = self.latent_dim;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, d));
+        self.evaluate_into(&mut phi, &mut jet, coords)?;
+        Ok((phi, jet))
+    }
+
+    fn evaluate_into(
+        &self,
+        phi: &mut Array2<f64>,
+        jet: &mut Array3<f64>,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
         let d = self.latent_dim;
         if coords.ncols() != d {
             return Err(format!(
@@ -918,10 +1010,23 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
         let n = coords.nrows();
         let axis_m = self.axis_basis_size();
         let m = self.basis_size();
+        if phi.dim() != (n, m) {
+            return Err(format!(
+                "TorusHarmonicEvaluator::evaluate_into: Φ buffer {:?} != ({n}, {m})",
+                phi.dim()
+            ));
+        }
+        if jet.dim() != (n, m, d) {
+            return Err(format!(
+                "TorusHarmonicEvaluator::evaluate_into: jet buffer {:?} != ({n}, {m}, {d})",
+                jet.dim()
+            ));
+        }
         let h_max = self.num_harmonics;
         let two_pi = 2.0 * std::f64::consts::PI;
-        let mut phi = Array2::<f64>::zeros((n, m));
-        let mut jet = Array3::<f64>::zeros((n, m, d));
+        // Every `(row, flat)` Φ entry and every `(row, flat, axis)` jet entry is
+        // written unconditionally in the product loops below, so no pre-clear is
+        // needed — stale workspace contents cannot survive.
         // Per-axis evaluation buffer: phi_axis[axis][col] and dphi_axis[axis][col].
         let mut phi_axis = vec![vec![0.0_f64; axis_m]; d];
         let mut dphi_axis = vec![vec![0.0_f64; axis_m]; d];
@@ -975,7 +1080,7 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
                 }
             }
         }
-        Ok((phi, jet))
+        Ok(())
     }
 }
 
@@ -1419,14 +1524,6 @@ impl EuclideanPatchEvaluator {
     pub fn basis_size(&self) -> usize {
         gam_terms::basis::monomial_exponents(self.latent_dim, self.max_degree).len()
     }
-
-    fn order(&self) -> gam_terms::basis::DuchonNullspaceOrder {
-        match self.max_degree {
-            0 => gam_terms::basis::DuchonNullspaceOrder::Zero,
-            1 => gam_terms::basis::DuchonNullspaceOrder::Linear,
-            k => gam_terms::basis::DuchonNullspaceOrder::Degree(k),
-        }
-    }
 }
 
 impl SaeBasisEvaluator for EuclideanPatchEvaluator {
@@ -1483,7 +1580,25 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
-        if coords.ncols() != self.latent_dim {
+        // Single source of truth: allocate correctly-shaped buffers and fill
+        // them through the in-place path (see `evaluate_into`).
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let d = self.latent_dim;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, d));
+        self.evaluate_into(&mut phi, &mut jet, coords)?;
+        Ok((phi, jet))
+    }
+
+    fn evaluate_into(
+        &self,
+        phi: &mut Array2<f64>,
+        jet: &mut Array3<f64>,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        let d = self.latent_dim;
+        if coords.ncols() != d {
             return Err(format!(
                 "EuclideanPatchEvaluator: expected latent_dim {}, got {}",
                 self.latent_dim,
@@ -1493,7 +1608,23 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
         let exponents = gam_terms::basis::monomial_exponents(self.latent_dim, self.max_degree);
         let n = coords.nrows();
         let m = exponents.len();
-        let mut phi = Array2::<f64>::zeros((n, m));
+        if phi.dim() != (n, m) {
+            return Err(format!(
+                "EuclideanPatchEvaluator::evaluate_into: Φ buffer {:?} != ({n}, {m})",
+                phi.dim()
+            ));
+        }
+        if jet.dim() != (n, m, d) {
+            return Err(format!(
+                "EuclideanPatchEvaluator::evaluate_into: jet buffer {:?} != ({n}, {m}, {d})",
+                jet.dim()
+            ));
+        }
+        // The jet is nonzero only where a monomial's axis exponent is positive,
+        // so most entries are left untouched by the loops below; clear both
+        // buffers to erase any stale (reused-workspace) contents first.
+        phi.fill(0.0);
+        jet.fill(0.0);
         for (col, alpha) in exponents.iter().enumerate() {
             for row in 0..n {
                 let mut value = 1.0_f64;
@@ -1504,16 +1635,27 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
                 }
                 phi[[row, col]] = value;
             }
+            // Monomial first derivative, written to match
+            // `gam_terms::basis::duchon_polynomial_first_derivative_nd` operation
+            // for operation (same factor ordering) so the value is bit-identical.
+            for axis in 0..d {
+                let a_axis = alpha[axis];
+                if a_axis == 0 {
+                    continue;
+                }
+                for row in 0..n {
+                    let mut value = a_axis as f64;
+                    for a in 0..d {
+                        let exp_a = if a == axis { a_axis - 1 } else { alpha[a] };
+                        if exp_a != 0 {
+                            value *= coords[[row, a]].powi(exp_a as i32);
+                        }
+                    }
+                    jet[[row, col, axis]] = value;
+                }
+            }
         }
-        let jet = gam_terms::basis::duchon_polynomial_first_derivative_nd(coords, self.order());
-        if jet.shape() != [n, m, self.latent_dim] {
-            return Err(format!(
-                "EuclideanPatchEvaluator: monomial jet shape {:?} disagrees with ({n}, {m}, {})",
-                jet.shape(),
-                self.latent_dim
-            ));
-        }
-        Ok((phi, jet))
+        Ok(())
     }
 }
 

@@ -546,8 +546,10 @@ pub(crate) fn quotient_scale_on_does_not_detonate_healthy_k2_two_circle_2100() {
     let p = 16usize;
     let m = 5usize;
 
-    // OFF baseline (default lever) — the healthy EV the ON path must match.
+    // OFF baseline — the healthy EV the ON path must match. #2228: `quotient_scale`
+    // now defaults ON, so disable it explicitly to keep this a genuine OFF contrast.
     let (mut off, target) = two_circle_k2_term(n, p, m);
+    off.set_quotient_scale(false);
     let mut rho_off = SaeManifoldRho::new(
         0.0,
         -6.0,
@@ -632,7 +634,10 @@ pub(crate) fn quotient_scale_on_does_not_crash_k1_2100() {
 
     let target = two_circle_whitened_target(n, p, 0.05);
 
+    // #2228: `quotient_scale` now defaults ON (and at K=1 engages the scale-gauge
+    // pin), so disable it explicitly to keep a genuine OFF baseline for the contrast.
     let mut off = two_circle_kn_term(n, p, m, 1);
+    off.set_quotient_scale(false);
     let mut rho_off = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
     off.run_joint_fit_arrow_schur(target.view(), &mut rho_off, None, 60, 0.05, 1.0e-3, 1.0e-3)
         .unwrap();
