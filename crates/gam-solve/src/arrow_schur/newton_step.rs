@@ -828,6 +828,57 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     }
 }
 
+/// #1017: build a base-block-resident Arrow-Schur frame for the LM ridge ladder,
+/// or `None` when the current path should keep its per-trial re-upload behaviour.
+///
+/// The admission predicate is EXACTLY [`try_device_arrow_direct`]'s (Direct mode,
+/// dense — no cross-row penalties / streaming / matrix-free `H_ββ`·`H_tβ` /
+/// `penalty_op`, `k ≥ DEVICE_LOOP_MIN_P`, over the dense-reduction flop floor,
+/// runtime policy admits) so that whenever this returns `Some`, the per-trial path
+/// it replaces would ALSO have executed on the device — the residency frame only
+/// changes HOW the (identical) device step is fed (base blocks resident vs
+/// re-uploaded), never the numbers. It additionally declines under
+/// [`gam_gpu::GpuMode::Off`], leaving the Off path bit-identical to before.
+fn build_resident_base_frame_if_admitted(
+    sys: &ArrowSchurSystem,
+    options: &ArrowSolveOptions,
+) -> Option<crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle> {
+    if options.mode != ArrowSolverMode::Direct {
+        return None;
+    }
+    if !sys.cross_row_penalties.is_empty()
+        || options.streaming_chunk_size.is_some()
+        || sys.hbb_matvec.is_some()
+        || sys.htbeta_matvec.is_some()
+        || sys.penalty_op.is_some()
+    {
+        return None;
+    }
+    if matches!(gam_gpu::gpu_mode(), gam_gpu::GpuMode::Off) {
+        return None;
+    }
+    // Same size gate as `try_device_arrow_direct`, BEFORE `GpuRuntime::global()`,
+    // so a below-threshold shape never creates a CUDA primary context.
+    let n_rows = sys.rows.len();
+    let dense_work = 2u128 * (n_rows as u128) * (sys.k as u128) * (sys.k as u128);
+    if n_rows == 0
+        || sys.k < gam_gpu::GpuDispatchPolicy::DEVICE_LOOP_MIN_P
+        || dense_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+    {
+        return None;
+    }
+    let runtime = gam_gpu::device_runtime::GpuRuntime::global()?;
+    if !runtime
+        .policy()
+        .dense_hessian_work_target_is_gpu(sys.rows.len(), sys.k)
+    {
+        return None;
+    }
+    // The frame's own upload re-checks admission and rejects matrix-free systems;
+    // a decline here (transient device-unavailable) simply keeps the per-trial path.
+    crate::gpu_kernels::arrow_schur::ResidentBaseArrowFrameHandle::new(sys).ok()
+}
+
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
 /// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
@@ -861,6 +912,12 @@ pub fn solve_with_lm_escalation_inner(
     let mut proximal_ridge = 0.0_f64;
     let mut escalations: usize = 0;
     let mut last_err: Option<ArrowSchurError> = None;
+    // #1017: when the shape is device-admitted, hold the ridge-independent base
+    // blocks (D, B, H_ββ, gradient) resident and re-factor per trial rather than
+    // re-uploading the whole system each escalation. `None` keeps the exact
+    // per-trial re-upload path unchanged (Off, non-Direct, matrix-free, or below
+    // the device threshold).
+    let mut resident_frame = build_resident_base_frame_if_admitted(sys, options);
     for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
         let damped_ridge_t = ridge_t + proximal_ridge;
         let damped_ridge_beta = ridge_beta + proximal_ridge;
@@ -872,7 +929,49 @@ pub fn solve_with_lm_escalation_inner(
         // CPU-only assembly entry and bypasses that seam, so the SAE inner loop
         // (the one consumer of this escalation helper) never saw the GPU. The
         // returned `(Δt, Δβ, diagnostics)` contract is identical.
-        match solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options) {
+        // Prefer the resident base frame when live: it re-factors the resident
+        // base blocks at this trial's ridge (device-to-device copy + on-device
+        // diagonal ridge add), avoiding the full O(n·d·k) re-upload that
+        // `solve_arrow_newton_step_core` pays every trial. A non-PD per-row block
+        // or Schur pivot is surfaced as the SAME recoverable CPU error variant
+        // `try_device_arrow_direct` uses, so escalation is byte-for-byte unchanged;
+        // any other device decline retires the frame and takes the established
+        // per-trial path for this and every later trial.
+        let step_result = match resident_frame
+            .as_ref()
+            .map(|frame| frame.refactor_and_solve(damped_ridge_t, damped_ridge_beta))
+        {
+            Some(Ok(solution)) => Ok((
+                solution.delta_t,
+                solution.delta_beta,
+                PcgDiagnostics {
+                    used_device_arrow: true,
+                    ..PcgDiagnostics::default()
+                },
+            )),
+            Some(Err(
+                crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+                    row,
+                    bump,
+                },
+            )) => Err(ArrowSchurError::PerRowFactorFailed {
+                row,
+                reason: format!(
+                    "resident base-frame per-row block non-PD; suggested ridge bump {bump:e}"
+                ),
+            }),
+            Some(Err(
+                crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed { reason },
+            )) => Err(ArrowSchurError::SchurFactorFailed { reason }),
+            Some(Err(_)) => {
+                // Unavailable / GpuRequiresDenseSystem / NaN-ridge: retire the
+                // resident frame and fall back to the per-trial re-upload path.
+                resident_frame = None;
+                solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options)
+            }
+            None => solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options),
+        };
+        match step_result {
             Ok((delta_t, delta_beta, mut pcg_diagnostics)) => {
                 pcg_diagnostics.ridge_escalations = escalations;
                 return Ok((delta_t, delta_beta, pcg_diagnostics));
