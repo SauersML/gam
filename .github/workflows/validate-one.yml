@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       rust_filter:
-        description: "cargo test name filter (substring). Empty = skip Rust."
+        description: "cargo test name filter(s), whitespace-separated. Empty = skip Rust."
         default: ""
         required: false
       py_filter:
@@ -88,6 +88,8 @@ jobs:
       - name: Run Rust tests (filtered)
         if: ${{ github.event.inputs.rust_filter != '' }}
         shell: bash
+        env:
+          RUST_FILTER: ${{ github.event.inputs.rust_filter }}
         run: |
           set -euo pipefail
           # `--exclude gam-pyffi`: gam-pyffi's default-on `extension-module`
@@ -98,8 +100,16 @@ jobs:
           # separately under `--no-default-features`; mirror the exclusion so the
           # filtered Rust path links for every non-pyffi crate (the Python path
           # below already exercises the built extension for pyffi coverage).
-          echo "cargo test --workspace --exclude gam-pyffi ${{ github.event.inputs.rust_filter }}"
-          cargo test --workspace --exclude gam-pyffi ${{ github.event.inputs.rust_filter }} -- --nocapture
+          # Cargo accepts exactly one TESTNAME positional argument.  Treat a
+          # whitespace-separated input as a list of independent substring
+          # filters instead of forwarding it as several invalid positionals.
+          # Array expansion stays quoted, so a filter can never become an option
+          # or shell syntax.
+          read -r -a filters <<< "$RUST_FILTER"
+          for filter in "${filters[@]}"; do
+            echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
+            cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture
+          done
 
       # ---- Python/torch shared prerequisites (either filter needs the extension) ----
       - name: Set up Python 3.11
