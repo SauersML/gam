@@ -508,8 +508,10 @@ pub struct FittedModelPayload {
     ///
     /// Populated *only* for a standard Gaussian-identity model fit with unit
     /// prior weights, where the closed-form Sherman–Morrison leave-one-out
-    /// substrate gives a distribution-free finite-sample (≥ level) prediction
-    /// interval with no held-out fold. When `Some`, `predict(interval=level)`
+    /// substrate gives a distribution-free prediction interval with no held-out
+    /// fold, targeting ≈level coverage at α = 1 − level with the finite-sample
+    /// floor ≥ 2·level − 1 (Barber et al. 2021, ≥ 1 − 2α; see the pyffi
+    /// route for the calibration decision, #1546). When `Some`, `predict(interval=level)`
     /// auto-routes through it (the MAGIC default); when `None` — any other
     /// family/link, reweighted rows, or an older payload — predict falls back
     /// to the model-based posterior band and labels the provenance honestly.
