@@ -932,7 +932,12 @@ impl SaeManifoldTerm {
     /// reformulated block is the deflated inverse the correction expects) — a
     /// separate design step, taken only if we ever route the deflated regime
     /// matrix-free. Until then, deflated rows stay on the dense channel.
-    pub(crate) fn ard_log_precision_hessian_trace_from_probes(
+    // Forward plumbing for the #2080 analytic-gradient cluster threading: the
+    // channel body lands ahead of its (one-shot) routing pass, so it is `pub`
+    // as the cluster's stable entry — pub(crate) with no caller yet would trip
+    // dead-code deny-warnings and block every build (same treatment as the
+    // reduced-Schur surrogate trio in gam-solve).
+    pub fn ard_log_precision_hessian_trace_from_probes(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
