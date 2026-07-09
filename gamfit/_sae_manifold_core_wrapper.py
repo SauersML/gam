@@ -98,13 +98,15 @@ applying — #2011 may shift them by a few lines around `_trust_scores`).
 ──────────────────────────────────────────────────────────────────────────────
 EQUIVALENCE RISKS to confirm under the pytest oracle (green = closed)
 ──────────────────────────────────────────────────────────────────────────────
- R1. n_harmonics canonicalization on LOAD: Python `from_dict` canonicalizes stale
-     periodic n_harmonics via `_canonical_n_harmonics` (old line 2423). The core
-     `ManifoldSaeCore(dict)` (`ManifoldSaePayload::from_json`) is a faithful serde
-     parse — verify it applies the SAME canonicalization; if not, either add it to
-     the Rust coercion OR canonicalize the dict in WRAPPER.from_dict before
-     constructing the core (a thin, pre-core Python step is acceptable). Oracle:
-     test_manifold_sae_golden_roundtrip.py + any periodic round-trip test.
+ R1. [CLOSED] n_harmonics canonicalization on LOAD: Python `from_dict`
+     canonicalized stale periodic n_harmonics via `_canonical_n_harmonics` (old
+     line 2423). The core `ManifoldSaeCore(dict)` (`ManifoldSaePayload::from_json`)
+     was a faithful serde parse that skipped it. FIXED in
+     `manifold_sae_payload.rs::normalize_after_load` (calls the coercion module's
+     `canonical_n_harmonics` on the decoder widths) — now both the fit-path builder
+     and the from_json/load path canonicalize, matching legacy Python. Idempotent
+     and a no-op on the golden fixture (`n_harmonics=[2,0,0]`, periodic H=2/width 5).
+     Oracle: test_manifold_sae_golden_roundtrip.py + any periodic round-trip test.
  R2. `low_level` surface: consumers only read `.chosen_k`; the adapter also
      exposes atoms/fitted/assignments/coords/reml_score off the core. It does NOT
      carry `evidence_by_candidate` / `comparison` (not in the payload). If any
@@ -383,10 +385,11 @@ class ManifoldSAE:
         """Reconstruct from a `to_dict` payload. The core's `#[new]` validates the
         `gamfit.ManifoldSAE/v1` schema tag and parses through
         `ManifoldSaePayload::from_json` (the same NaN→reject, `reml_score`
-        fallback, and channel-cov reconstruction the legacy reader had). See R1:
-        confirm n_harmonics canonicalization parity under the golden-roundtrip
-        oracle; if the core does not canonicalize, canonicalize the dict here
-        (thin, pre-core) before constructing."""
+        fallback, and channel-cov reconstruction the legacy reader had).
+        n_harmonics canonicalization on load is now owned by the core's
+        `ManifoldSaePayload::normalize_after_load` (R1 CLOSED — matches the legacy
+        Python `_canonical_n_harmonics` + the fit-path builder), so no pre-core
+        Python canonicalization is needed here."""
         core = rust_module().ManifoldSaeCore(dict(payload))
         # training_data: the payload always writes null (new fits do not retain X);
         # mirror the legacy from_dict, which built a handle from the fitted shape.

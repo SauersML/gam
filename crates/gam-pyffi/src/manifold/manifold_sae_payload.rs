@@ -210,6 +210,27 @@ impl ManifoldSaePayload {
         if self.penalized_loss_score.is_none() {
             self.penalized_loss_score = self.reml_score;
         }
+        // Repair stale/degenerate periodic `n_harmonics` on load, matching the
+        // legacy Python `ManifoldSAE.from_dict` (which canonicalized `H<=0` from
+        // the trained decoder width via `_canonical_n_harmonics`) and the fit-path
+        // builder (`build_manifold_sae_payload`). Without this the from_dict/load
+        // path (`ManifoldSaeCore(dict)`) would drive OOS reconstruct/steer off a
+        // different periodic basis than the fit/save path for an older saved model
+        // carrying a stale `H`. Idempotent (canonical∘canonical == canonical), so a
+        // payload already carrying positive `H` — e.g. the golden fixture
+        // `n_harmonics=[2,0,0]` — is unchanged. Guarded on equal lengths so a
+        // malformed payload never silently truncates `n_harmonics`.
+        if self.basis_kinds.len() == self.n_harmonics.len()
+            && self.decoder_blocks.len() == self.n_harmonics.len()
+        {
+            let decoder_widths: Vec<i64> =
+                self.decoder_blocks.iter().map(|b| b.len() as i64).collect();
+            self.n_harmonics = crate::manifold::manifold_sae_coercion::canonical_n_harmonics(
+                &self.basis_kinds,
+                &self.n_harmonics,
+                &decoder_widths,
+            );
+        }
     }
 
     /// Serialize to the `to_dict` schema, writing `reml_score` as the duplicate
