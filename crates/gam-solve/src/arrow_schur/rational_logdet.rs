@@ -812,6 +812,62 @@ mod tests {
     }
 
     #[test]
+    fn deflation_wide_kappa_bias_cg_convergence_discriminator() {
+        // #2080 loop discriminator (battery_5e59e646b). With BOTH the quadrature
+        // window fix and the `/c` node-placement fix landed,
+        // `deflation_cuts_error_bar_and_stays_accurate_at_wide_kappa` still fails
+        // ~10% low (est ≈51.54 vs exact ≈57.39) — NEARLY byte-identical to the
+        // pre-fix 51.529 — while `full_rank_deflation_is_exact_no_hutchinson` now
+        // PASSES. So pure quadrature is exonerated and the residual bias appears
+        // ONLY with deflation at wide κ. Prime suspect: CG under-resolution of the
+        // SMALL-shift solves on the κ=1e8 operator — those directions carry most of
+        // the log-det magnitude, and a `cg_rel_tol` scaled to ‖b‖ can stop before
+        // resolving the small-eigenvalue mass, dropping it deterministically (which
+        // is why the FD gates, sharing the same value path, still pass — a
+        // self-consistent bias).
+        //
+        // Discriminator: rerun the EXACT failing fixture with `cg_rel_tol`
+        // tightened 1e-12→1e-15 and `cg_max_iters` ×10. If the deflated estimate
+        // becomes accurate the bias is SOLVE-CONVERGENCE (production fix = an honest
+        // per-shift iteration/tolerance budget from the shift-dependent conditioning
+        // `κ_ℓ = (λmax + t)/(λmin + t)`); if it stays ~10% low (Δest ≈ 0) the bias is
+        // STRUCTURAL in the deflated split and needs a fresh derivation. The loop
+        // battery verdicts this test's pass/fail.
+        let dim = 96;
+        let mut state = 2026u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -4.0, 4.0)))
+            .collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 4321);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plain = RationalLogdetPlan::build(dim, 32, 17, lmin, lmax, 1e-9).expect("plan");
+        let defl = plain.clone().with_deflation(&matvec, 16, 3, 555);
+        // Loose CG (the failing fixture's budget) vs tightened CG (the discriminator).
+        let e_loose = defl.evaluate(&matvec, 1e-12, 50_000).expect("loose");
+        let e_tight = defl.evaluate(&matvec, 1e-15, 500_000).expect("tight");
+        let rel_loose = (e_loose.estimate - logdet).abs() / logdet.abs().max(1.0);
+        let rel_tight = (e_tight.estimate - logdet).abs() / logdet.abs().max(1.0);
+        eprintln!(
+            "wide-κ CG discriminator: exact={logdet:.6} loose(1e-12,50k)={:.6} rel={rel_loose:.3e} \
+             tight(1e-15,500k)={:.6} rel={rel_tight:.3e} Δest={:.3e}",
+            e_loose.estimate,
+            e_tight.estimate,
+            (e_tight.estimate - e_loose.estimate).abs()
+        );
+        // GREEN ⇒ tightening CG removed the bias ⇒ solve-convergence root.
+        // RED with Δest≈0 ⇒ bias is structural in the deflated split.
+        assert!(
+            rel_tight < 0.05,
+            "tightened-CG deflated estimate rel err {rel_tight:.3e} (est {} vs exact {logdet}); \
+             loose rel {rel_loose:.3e} — if ≈ loose (Δest≈0) the wide-κ bias is STRUCTURAL in \
+             the deflated split, not CG convergence",
+            e_tight.estimate
+        );
+    }
+
+    #[test]
     fn deflated_directional_derivative_matches_fd_of_surrogate() {
         // The value↔gradient no-desync contract WITH deflation: the fixed-Q
         // directional derivative is the exact derivative of the surrogate value
