@@ -183,8 +183,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         fit_config.survival_likelihood = mode;
     }
     if let Some(target) = json_config.baseline_target {
-        fit_config.baseline_target =
-            resolve_nonempty_string(target, "baseline_target must be a non-empty string")?;
+        fit_config.baseline_target = target;
     }
     if let Some(value) = json_config.baseline_scale {
         fit_config.baseline_scale = Some(value);
@@ -198,26 +197,14 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
     if let Some(value) = json_config.baseline_makeham {
         fit_config.baseline_makeham = Some(value);
     }
-    if let Some(z) = json_config.z_column {
-        fit_config.z_column = Some(resolve_nonempty_string(
-            z,
-            "z_column must be a non-empty string",
-        )?);
-    }
+    fit_config.z_column = json_config.z_column;
     if let Some(formula) = json_config.logslope_formula {
         fit_config.logslope_formula = Some(formula);
     }
     if let Some(stage1) = json_config.ctn_stage1 {
         fit_config.ctn_stage1 = Some(stage1.into_recipe()?);
     }
-    if let Some(link) = json_config.link {
-        let trimmed = link.trim();
-        fit_config.link = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
+    fit_config.link = json_config.link;
     if let Some(flag) = json_config.flexible_link {
         fit_config.flexible_link = flag;
     }
@@ -517,14 +504,6 @@ pub fn parse_survival_inverse_link(
         let dist = parse_survival_distribution(input.survival_distribution)?;
         Ok(residual_distribution_inverse_link(dist))
     }
-}
-
-fn resolve_nonempty_string(raw: String, message: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(message.to_string());
-    }
-    Ok(trimmed.to_string())
 }
 
 fn parse_json_frailty_spec(

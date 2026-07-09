@@ -1074,12 +1074,21 @@ impl gam_problem::HessianOperator for SentinelHessianOperator {
         self.matrix.nrows()
     }
 
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-        Ok(self.matrix.dot(v))
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), opt::ObjectiveEvalError> {
+        out.assign(&self.matrix.dot(v));
+        Ok(())
     }
 
-    fn is_cheap_to_materialize(&self) -> bool {
-        true
+    fn materialization(&self) -> opt::HessianMaterialization {
+        opt::HessianMaterialization::Explicit
+    }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, opt::ObjectiveEvalError> {
+        Ok(self.matrix.clone())
     }
 }
 
@@ -1190,7 +1199,11 @@ pub(crate) fn dense_and_materialized_outer_hessian(
         None,
     )
     .unwrap();
-    let materialized = gam_problem::HessianOperator::materialize_dense(&operator).unwrap();
+    let materialized = gam_problem::HessianOperator::apply_mat(
+        &operator,
+        Array2::eye(operator.dim()).view(),
+    )
+    .unwrap();
     (dense, operator, materialized)
 }
 
@@ -2125,7 +2138,7 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
     }
 
     let alpha = array![0.37, -0.58];
-    let hvp = gam_problem::HessianOperator::matvec(&operator, &alpha).expect("operator HVP");
+    let hvp = gam_problem::HessianOperator::apply(&operator, &alpha).expect("operator HVP");
     let dense_hvp = dense.dot(&alpha);
     for i in 0..hvp.len() {
         let tolerance = 1e-10_f64.max(1e-10 * dense_hvp[i].abs());
@@ -2310,13 +2323,17 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     // if that happens.
     assert!(
         matches!(
-            gam_problem::HessianOperator::materialization_capability(&operator),
+            gam_problem::HessianOperator::materialization(&operator),
             gam_problem::HessianMaterialization::Unavailable
         ),
         "#740 operator must advertise Unavailable materialization to stay matrix-free"
     );
 
-    let materialized = gam_problem::HessianOperator::materialize_dense(&operator).unwrap();
+    let materialized = gam_problem::HessianOperator::apply_mat(
+        &operator,
+        Array2::eye(operator.dim()).view(),
+    )
+    .unwrap();
 
     // CONTROL: the SAME operator built WITHOUT the hook (ψψ block filled from
     // the per-pair ext_coord_pair_fn tables) must already match the dense
@@ -2339,7 +2356,11 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     )
     .unwrap();
     let control_mat =
-        gam_problem::HessianOperator::materialize_dense(&control_operator).unwrap();
+        gam_problem::HessianOperator::apply_mat(
+            &control_operator,
+            Array2::eye(control_operator.dim()).view(),
+        )
+        .unwrap();
 
     for row in 0..dense.nrows() {
         for col in 0..dense.ncols() {
@@ -2443,7 +2464,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
     // matvec path, distinct from the materialize column-probes above, so it
     // also exercises the hook's per-matvec injection directly.)
     let mixed = array![0.6_f64, -1.1_f64]; // [ρ, ψ], both live
-    let hvp = gam_problem::HessianOperator::matvec(&operator, &mixed)
+    let hvp = gam_problem::HessianOperator::apply(&operator, &mixed)
         .expect("mixed-direction operator HVP");
     let dense_hvp = dense.dot(&mixed);
     for i in 0..hvp.len() {
@@ -2765,7 +2786,7 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
     ];
     for alpha in alphas.iter() {
         let hvp =
-            gam_problem::HessianOperator::matvec(&operator, alpha).expect("operator HVP");
+            gam_problem::HessianOperator::apply(&operator, alpha).expect("operator HVP");
         let dense_hvp = dense.dot(alpha);
         for i in 0..hvp.len() {
             assert_relative_eq!(hvp[i], dense_hvp[i], epsilon = 1e-12, max_relative = 1e-12);
@@ -3492,22 +3513,28 @@ impl gam_problem::HessianOperator for FixedHessianOperator {
         self.matrix.nrows()
     }
 
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), opt::ObjectiveEvalError> {
         if v.len() != self.dim() {
-            return Err(RemlError::DimensionMismatch {
-                reason: format!(
+            return Err(opt::ObjectiveEvalError::fatal(format!(
                     "fixed test outer Hessian dimension mismatch: got {}, expected {}",
                     v.len(),
                     self.dim()
-                ),
-            }
-            .into());
+                )));
         }
-        Ok(self.matrix.dot(v))
+        out.assign(&self.matrix.dot(v));
+        Ok(())
     }
 
-    fn is_cheap_to_materialize(&self) -> bool {
-        true
+    fn materialization(&self) -> opt::HessianMaterialization {
+        opt::HessianMaterialization::Explicit
+    }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, opt::ObjectiveEvalError> {
+        Ok(self.matrix.clone())
     }
 }
 
@@ -3595,7 +3622,7 @@ pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assemb
         panic!("expected family-supplied operator Hessian");
     };
     assert_eq!(op.dim(), 1);
-    let hv = op.matvec(&array![4.0]).unwrap();
+    let hv = op.apply(&array![4.0]).unwrap();
     assert_relative_eq!(hv[0], 10.0, epsilon = 1e-12);
     let dense = op.materialize_dense().unwrap();
     assert_relative_eq!(dense[[0, 0]], supplied[[0, 0]], epsilon = 1e-12);

@@ -1,5 +1,21 @@
 use super::*;
 
+fn normalize_optional_column(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(format!("{field} must be a non-empty column name"))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
+}
+
 /// Validate the survival baseline fields shared by every front end.
 pub fn validate_survival_baseline_config(
     likelihood_mode: SurvivalLikelihoodMode,
@@ -80,6 +96,15 @@ impl FitConfig {
         });
         self.survival_likelihood = self.survival_likelihood.trim().to_ascii_lowercase();
         self.baseline_target = self.baseline_target.trim().to_ascii_lowercase();
+        self.link = self.link.and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        });
+        self.offset_column = normalize_optional_column(self.offset_column, "offset_column")?;
+        self.noise_offset_column =
+            normalize_optional_column(self.noise_offset_column, "noise_offset_column")?;
+        self.weight_column = normalize_optional_column(self.weight_column, "weight_column")?;
+        self.z_column = normalize_optional_column(self.z_column, "z_column")?;
 
         if !self.ridge_lambda.is_finite() || self.ridge_lambda < 0.0 {
             return Err("ridge_lambda must be finite and >= 0".to_string());
@@ -132,6 +157,14 @@ mod tests {
         assert!(
             FitConfig {
                 outer_max_iter: Some(0),
+                ..FitConfig::default()
+            }
+            .resolve()
+            .is_err()
+        );
+        assert!(
+            FitConfig {
+                weight_column: Some("   ".to_string()),
                 ..FitConfig::default()
             }
             .resolve()
