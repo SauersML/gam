@@ -125,15 +125,27 @@ pub struct SbcUniformityVerdict {
 /// Bin SBC ranks into `bins` equal-width cells and test uniformity by Pearson
 /// chi-square against a fixed critical value.
 ///
+/// Under the SBC null the rank is uniform on the `L + 1` reachable ranks
+/// `{0, …, L}` (`L = posterior_draws_per_rep`), so the null probability of a
+/// bin is the fraction of reachable ranks that map into it — NOT `1 / bins`
+/// unless `bins` divides `L + 1` exactly. Expected counts are therefore
+/// computed per bin from the number of reachable ranks it receives; with
+/// `L = 2` and two bins the null is `(2/3, 1/3)`, and using `(1/2, 1/2)`
+/// would misfire in both directions.
+///
 /// The critical value is the Laurent–Massart (2000) upper tail bound for a
 /// chi-square with `bins - 1` degrees of freedom:
 /// `k + 2·√(k·x) + 2·x` with `x = ln(100)`, which bounds
 /// `P(χ²_k ≥ value) ≤ e^{-x} = 0.01`. This is a principled fixed 1%
-/// false-positive rate for a standing gate, not a tuned threshold.
+/// false-positive rate for a standing gate, not a tuned threshold. Unequal
+/// bin probabilities do not change the null distribution: Pearson's statistic
+/// is asymptotically `χ²_{bins-1}` for any fixed positive cell probabilities.
 ///
 /// # Panics
-/// Panics if `bins < 2`, or if any rank exceeds `posterior_draws_per_rep`
-/// (which would mean the caller mixed histograms of different resolutions).
+/// Panics if `bins < 2`, if `bins` exceeds the `L + 1` reachable ranks (some
+/// bin would have null probability zero), or if any rank exceeds
+/// `posterior_draws_per_rep` (which would mean the caller mixed histograms of
+/// different resolutions).
 pub fn audit_sbc_uniformity(
     ranks: &[usize],
     posterior_draws_per_rep: usize,
@@ -142,6 +154,10 @@ pub fn audit_sbc_uniformity(
     assert!(bins > 1, "uniformity test needs at least two bins");
     assert!(!ranks.is_empty(), "SBC produced no ranks");
     let reachable_ranks = posterior_draws_per_rep + 1;
+    assert!(
+        bins <= reachable_ranks,
+        "{bins} bins over {reachable_ranks} reachable ranks leaves an unreachable bin"
+    );
     let mut counts = vec![0usize; bins];
     for &rank in ranks {
         assert!(
@@ -154,10 +170,16 @@ pub fn audit_sbc_uniformity(
         counts[bin] += 1;
     }
 
-    let expected = ranks.len() as f64 / bins as f64;
+    // Reachable ranks landing in bin `b`: rank r maps to floor(r·bins/(L+1)),
+    // so bin b holds r ∈ [⌈b(L+1)/bins⌉, ⌈(b+1)(L+1)/bins⌉). The expected
+    // count is the total scaled by that bin's share of the reachable ranks.
+    let bin_lower = |b: usize| (b * reachable_ranks).div_ceil(bins);
     let chi_square = counts
         .iter()
-        .map(|&count| {
+        .enumerate()
+        .map(|(b, &count)| {
+            let ranks_in_bin = (bin_lower(b + 1) - bin_lower(b)) as f64;
+            let expected = ranks.len() as f64 * ranks_in_bin / reachable_ranks as f64;
             let residual = count as f64 - expected;
             residual * residual / expected
         })
@@ -819,6 +841,48 @@ mod tests {
             "over-dispersed posterior must fail SBC uniformity but passed: \
              chi_square={:.3} <= critical_value={:.3}, counts={:?}",
             verdict.chi_square, verdict.critical_value, verdict.counts
+        );
+    }
+
+    #[test]
+    fn nondivisible_rank_bins_use_reachable_rank_null_probabilities() {
+        // L = 2 posterior draws per rep gives 3 reachable ranks {0, 1, 2};
+        // two bins split them 2:1 (ranks {0,1} vs {2}), so the null is
+        // (2/3, 1/3). A perfectly uniform rank histogram lands 2:1 across the
+        // bins and MUST pass — under the old equal-expected-count null it
+        // scored chi-square ≈ 22 against a critical value ≈ 14.5 and failed.
+        let mut ranks = Vec::new();
+        for _ in 0..67 {
+            ranks.push(0);
+            ranks.push(2);
+        }
+        for _ in 0..66 {
+            ranks.push(1);
+        }
+        let uniform = audit_sbc_uniformity(&ranks, 2, 2);
+        assert_eq!(uniform.counts, vec![133, 67]);
+        assert!(
+            uniform.passed,
+            "uniform ranks over a non-divisible bin layout must pass: \
+             chi_square={:.3} > critical_value={:.3}",
+            uniform.chi_square, uniform.critical_value
+        );
+
+        // Conversely, equal bin COUNTS (100/100) are far from rank-uniform
+        // under the (2/3, 1/3) null and must fail — the exact histogram the
+        // old equal-expected null would have scored as a perfect pass.
+        let mut skewed = Vec::new();
+        for _ in 0..100 {
+            skewed.push(0);
+            skewed.push(2);
+        }
+        let verdict = audit_sbc_uniformity(&skewed, 2, 2);
+        assert_eq!(verdict.counts, vec![100, 100]);
+        assert!(
+            !verdict.passed,
+            "equal bin counts are non-uniform under the (2/3, 1/3) null: \
+             chi_square={:.3} <= critical_value={:.3}",
+            verdict.chi_square, verdict.critical_value
         );
     }
 
