@@ -211,6 +211,151 @@ pub fn log_amplitude_hoyer_energy(s: ArrayView1<'_, f64>, lambda: f64) -> LogAmp
     LogAmplitudeHoyerEnergy { value, grad, hess }
 }
 
+/// Evidence (log-normal / ARD) prior energy on the per-atom log-amplitudes
+/// `s_k = log_amplitude` — the RADIAL intensity coordinate of the cone-atom
+/// decomposition `a_ik · exp(s_k) · Φ_k · B̃_k` (#1939), separate from the
+/// existence gate `a_ik` and the identity frame `B̃_k`.
+#[derive(Debug, Clone)]
+pub struct LogAmplitudeArdEnergy {
+    /// Prior energy `E(s) = ½ α Σ_k s_k²`.
+    pub value: f64,
+    /// Gradient `∂E/∂s_k = α s_k`, length `K`.
+    pub grad: Array1<f64>,
+    /// Diagonal of the (separable, so purely diagonal) Hessian `∂²E/∂s_k² = α`,
+    /// length `K`. PSD (`α > 0`) — convex, needs no majorization.
+    pub hess_diag: Array1<f64>,
+}
+
+/// Evaluate the amplitude EVIDENCE prior `E(s) = ½ α Σ_k s_k²` (a log-normal
+/// `s_k ~ N(0, 1/α)` on the log-amplitude, i.e. an ARD Gaussian on
+/// `log_amplitude`) with precision `alpha`.
+///
+/// # Why ARD, not Hoyer, is the EVIDENCE prior (decoupling doctrine, #1939)
+/// The cone-atom split makes existence (`a_ik`), intensity (`exp(s_k)`), and
+/// identity (`B̃_k`) three separable axes. The intensity axis itself carries two
+/// distinct quantities: the overall MAGNITUDE of each atom's amplitude (radial
+/// dosimetry) and the DISTRIBUTION of intensity across atoms (selectivity). The
+/// scale-invariant [`log_amplitude_hoyer_energy`] prices ONLY the distribution —
+/// it is invariant to a common shift of `s`, so it "never [prices] the overall
+/// magnitude (which the per-atom evidence owns)". The EVIDENCE prior is exactly
+/// that magnitude owner: a log-normal on `s` whose evidence-optimized precision
+/// `α` sets the a-priori intensity scale (fit by the same Fellner–Schall /
+/// MacKay evidence step as the coordinate-ARD `α` and `λ_smooth`). It is
+/// therefore the correct object for the issue's "log-normal / ARD prior on log
+/// s", while Hoyer and SCAD are the complementary SELECTIVITY penalties (Hoyer
+/// scale-free relative prominence, SCAD shrink-to-exact-zero). Being at its MODE
+/// at `s = 0` (`log_amplitude = 0`, unit amplitude) it contributes zero value AND
+/// zero gradient at the zero-amplitude default, so a fit that never engages the
+/// amplitude coordinate is bit-for-bit unchanged. A non-finite / non-positive
+/// `alpha` yields a vacuous zero prior.
+pub fn log_amplitude_ard_energy(s: ArrayView1<'_, f64>, alpha: f64) -> LogAmplitudeArdEnergy {
+    let k = s.len();
+    let mut grad = Array1::<f64>::zeros(k);
+    let mut hess_diag = Array1::<f64>::zeros(k);
+    if !(alpha.is_finite() && alpha > 0.0) {
+        return LogAmplitudeArdEnergy {
+            value: 0.0,
+            grad,
+            hess_diag,
+        };
+    }
+    let mut value = 0.0_f64;
+    for i in 0..k {
+        let si = s[i];
+        value += 0.5 * alpha * si * si;
+        grad[i] = alpha * si;
+        hess_diag[i] = alpha;
+    }
+    LogAmplitudeArdEnergy {
+        value,
+        grad,
+        hess_diag,
+    }
+}
+
+/// SCAD (Fan–Li smoothly-clipped absolute deviation) SELECTIVITY penalty on the
+/// cone-atom AMPLITUDES `β_k = exp(s_k)`, `s_k = log_amplitude` (#1939).
+#[derive(Debug, Clone)]
+pub struct LogAmplitudeScadEnergy {
+    /// Penalty energy `E(s) = Σ_k p_λ(exp(s_k))`.
+    pub value: f64,
+    /// Gradient `∂E/∂s_k`, length `K` (the `s`-coordinate, chain-ruled).
+    pub grad: Array1<f64>,
+    /// Diagonal of the (separable) Hessian `∂²E/∂s_k²`, length `K`. SCAD is
+    /// NONCONVEX, so entries can be negative in the taper region — a Newton
+    /// assembly must PSD-majorize this exactly as the periodic-ARD / Hoyer
+    /// curvatures are majorized.
+    pub hess_diag: Array1<f64>,
+}
+
+/// Evaluate the SCAD-on-amplitude selectivity penalty. This is the issue's "move
+/// `coord_sparsity` SCAD onto intensity, not the gate" leg: nonconvex
+/// shrink-to-EXACT-zero belongs on the amplitude (the closed-form amplitude solve
+/// is a `β ≥ 0` NNLS, so a small `β_k` can be driven to exactly 0 — a turned-off
+/// atom), while the bounded gate must stay a soft existence indicator.
+///
+/// The penalty is the standard three-region SCAD in the amplitude `β` (concavity
+/// `gamma > 2`, canonical `3.7`):
+/// ```text
+///   p_λ(β)   =  λβ                              0 ≤ β ≤ λ
+///              (2γλβ − β² − λ²)/(2(γ−1))        λ < β ≤ γλ
+///              λ²(γ+1)/2                        β > γλ
+///   p_λ'(β)  =  λ,  (γλ−β)/(γ−1),  0            (Fan–Li three regions)
+///   p_λ''(β) =  0,  −1/(γ−1),      0
+/// ```
+/// returned in the `s`-coordinate through the exp chain rule `dβ/ds = β`:
+/// ```text
+///   ∂E/∂s_k   = p_λ'(β_k)·β_k
+///   ∂²E/∂s_k² = p_λ''(β_k)·β_k² + p_λ'(β_k)·β_k
+/// ```
+/// DEFAULT-INACTIVE: `lambda ≤ 0` (or `gamma ≤ 2`, or non-finite) gives an
+/// identically zero penalty — value, gradient, AND curvature — so the
+/// zero-amplitude default is bit-for-bit unchanged and the knob is strictly
+/// opt-in.
+pub fn log_amplitude_scad_energy(
+    s: ArrayView1<'_, f64>,
+    lambda: f64,
+    gamma: f64,
+) -> LogAmplitudeScadEnergy {
+    let k = s.len();
+    let mut grad = Array1::<f64>::zeros(k);
+    let mut hess_diag = Array1::<f64>::zeros(k);
+    if !(lambda.is_finite() && lambda > 0.0 && gamma.is_finite() && gamma > 2.0) {
+        return LogAmplitudeScadEnergy {
+            value: 0.0,
+            grad,
+            hess_diag,
+        };
+    }
+    let mut value = 0.0_f64;
+    for i in 0..k {
+        let beta = s[i].exp();
+        if !beta.is_finite() {
+            continue;
+        }
+        let (p, dp, ddp) = if beta <= lambda {
+            (lambda * beta, lambda, 0.0)
+        } else if beta <= gamma * lambda {
+            let num = 2.0 * gamma * lambda * beta - beta * beta - lambda * lambda;
+            (
+                num / (2.0 * (gamma - 1.0)),
+                (gamma * lambda - beta) / (gamma - 1.0),
+                -1.0 / (gamma - 1.0),
+            )
+        } else {
+            (lambda * lambda * (gamma + 1.0) / 2.0, 0.0, 0.0)
+        };
+        value += p;
+        grad[i] = dp * beta;
+        hess_diag[i] = ddp * beta * beta + dp * beta;
+    }
+    LogAmplitudeScadEnergy {
+        value,
+        grad,
+        hess_diag,
+    }
+}
+
 /// Sample one atom's decoded curve `γ(t) = exp(s)·Φ(t)·B` at the given latent
 /// coordinates, returning the point set `(n × p)`. Pure forward evaluation (no
 /// data, no refit) — the honest image the gluing test compares. `coords` is the
@@ -1312,6 +1457,92 @@ mod tests {
             (ed - (4.0_f64).sqrt()).abs() < 1e-9,
             "dense ratio must be √K"
         );
+    }
+
+    #[test]
+    fn ard_energy_gradient_hessian_and_default_mode() {
+        let s = array![0.3_f64, -0.7, 1.1, 0.05];
+        let alpha = 1.9_f64;
+        let base = log_amplitude_ard_energy(s.view(), alpha);
+        let expect_v = 0.5 * alpha * s.iter().map(|v| v * v).sum::<f64>();
+        assert!((base.value - expect_v).abs() <= 1e-12 * (1.0 + expect_v.abs()));
+        let h = 1e-6_f64;
+        for i in 0..s.len() {
+            let mut sp = s.clone();
+            sp[i] += h;
+            let mut sm = s.clone();
+            sm[i] -= h;
+            let fd = (log_amplitude_ard_energy(sp.view(), alpha).value
+                - log_amplitude_ard_energy(sm.view(), alpha).value)
+                / (2.0 * h);
+            assert!(
+                (base.grad[i] - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+                "ARD grad[{i}] {} != FD {fd}",
+                base.grad[i]
+            );
+            assert!((base.hess_diag[i] - alpha).abs() <= 1e-12, "ARD hess[{i}]");
+        }
+        // At the zero-amplitude default (s = 0, the prior mode) value AND gradient
+        // vanish → a non-cone fit is bit-for-bit unchanged.
+        let zero = Array1::<f64>::zeros(4);
+        let at_mode = log_amplitude_ard_energy(zero.view(), alpha);
+        assert_eq!(at_mode.value, 0.0);
+        assert!(at_mode.grad.iter().all(|&g| g == 0.0));
+        // Vacuous for a non-positive precision.
+        let off = log_amplitude_ard_energy(s.view(), 0.0);
+        assert_eq!(off.value, 0.0);
+        assert!(off.grad.iter().all(|&g| g == 0.0));
+    }
+
+    #[test]
+    fn scad_energy_gradient_hessian_three_regions_and_default_off() {
+        // β = exp(s) placed strictly inside each SCAD region (λ=0.5, γλ=1.85):
+        // 0.3 < λ (shrink), 0.8 & 1.0 ∈ (λ,γλ] (taper), 3.0 > γλ (flat).
+        let s = array![
+            (0.3_f64).ln(),
+            (0.8_f64).ln(),
+            (1.0_f64).ln(),
+            (3.0_f64).ln()
+        ];
+        let (lambda, gamma) = (0.5_f64, 3.7_f64);
+        let base = log_amplitude_scad_energy(s.view(), lambda, gamma);
+        let h = 1e-6_f64;
+        for i in 0..s.len() {
+            let mut sp = s.clone();
+            sp[i] += h;
+            let mut sm = s.clone();
+            sm[i] -= h;
+            let fd_g = (log_amplitude_scad_energy(sp.view(), lambda, gamma).value
+                - log_amplitude_scad_energy(sm.view(), lambda, gamma).value)
+                / (2.0 * h);
+            assert!(
+                (base.grad[i] - fd_g).abs() <= 1e-5 * (1.0 + fd_g.abs()),
+                "SCAD grad[{i}] {} != FD {fd_g}",
+                base.grad[i]
+            );
+            let gp = log_amplitude_scad_energy(sp.view(), lambda, gamma).grad[i];
+            let gm = log_amplitude_scad_energy(sm.view(), lambda, gamma).grad[i];
+            let fd_h = (gp - gm) / (2.0 * h);
+            assert!(
+                (base.hess_diag[i] - fd_h).abs() <= 1e-4 * (1.0 + fd_h.abs()),
+                "SCAD hess[{i}] {} != FD {fd_h}",
+                base.hess_diag[i]
+            );
+        }
+        // Nonconvexity: the upper taper (β=1.0 > γλ/2) has NEGATIVE curvature.
+        assert!(
+            base.hess_diag[2] < 0.0,
+            "taper curvature must be negative (SCAD is nonconvex)"
+        );
+        // Flat region (β=3.0 > γλ) contributes zero gradient — the large-signal
+        // taper-to-zero that distinguishes SCAD from L¹.
+        assert_eq!(base.grad[3], 0.0);
+        // DEFAULT-OFF: λ ≤ 0 ⇒ identically zero (value, grad, curvature) ⇒
+        // bit-for-bit unchanged.
+        let off = log_amplitude_scad_energy(s.view(), 0.0, gamma);
+        assert_eq!(off.value, 0.0);
+        assert!(off.grad.iter().all(|&g| g == 0.0));
+        assert!(off.hess_diag.iter().all(|&hd| hd == 0.0));
     }
 
     #[test]
