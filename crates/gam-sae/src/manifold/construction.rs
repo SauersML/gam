@@ -6204,11 +6204,25 @@ impl SaeManifoldTerm {
         // shown a real finite round-to-round drop; true stalls end at the base
         // work budget (#968/#1029). Value-order probes pass the base budget as
         // their progress budget, so this branch cannot make probes expensive.
+        //
+        // #2230 COST-PROPORTIONAL EXTENSION: `saw_refine_progress` is the
+        // LATEST-round verdict, not a sticky historical OR. The historical
+        // `|=` accumulation meant ONE gradient drop anywhere granted the
+        // 16×/64× extended budget for the rest of the evaluation — an
+        // oscillating or stalled tail then ground the full extended budget on
+        // every criterion eval (the #1094 "kept extending via
+        // saw_refine_progress from earlier rounds" pathology, and the
+        // dominant per-eval cost of the measured multi-hour outer churn).
+        // Under the per-round contract each extension round must PAY for
+        // itself with a monotone KKT-residual decrease; the first
+        // non-decreasing round drops the limit back to the base budget and
+        // the evaluation concludes (stall acceptance or typed refusal),
+        // bounding every eval at base + the genuinely-descending tail.
         if total_inner_iter < base_refine_iter {
             return base_refine_iter;
         }
         let making_progress =
-            saw_refine_progress || Self::refine_round_made_progress(previous_grad_norm, grad_norm);
+            saw_refine_progress && Self::refine_round_made_progress(previous_grad_norm, grad_norm);
         if making_progress && grad_norm.is_finite() {
             progress_refine_iter
         } else {
