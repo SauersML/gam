@@ -224,9 +224,6 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         fit_config.firth = flag;
     }
     if let Some(value) = json_config.outer_max_iter {
-        if value == 0 {
-            return Err("outer_max_iter must be >= 1".to_string());
-        }
         fit_config.outer_max_iter = Some(value);
     }
     if let Some(raw_gpu) = json_config.gpu {
@@ -514,11 +511,6 @@ fn parse_json_frailty_spec(
     if let Some(kind) = frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();
         let sigma = frailty_sd;
-        if let Some(value) = sigma
-            && (!value.is_finite() || value < 0.0)
-        {
-            return Err(format!("frailty_sd must be finite and >= 0, got {value}"));
-        }
         let hazard_loading = hazard_loading
             .as_ref()
             .map(|raw| raw.trim().to_ascii_lowercase());

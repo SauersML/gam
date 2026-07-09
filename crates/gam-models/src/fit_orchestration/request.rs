@@ -366,7 +366,6 @@ pub struct FitConfig {
     pub offset_column: Option<String>,
     /// Optional additive offset column for the noise/log-scale predictor.
     pub noise_offset_column: Option<String>,
-    /// Optional family-level frailty modifier.
     /// Family-level frailty. `None` is represented only by
     /// [`FrailtySpec::None`]; an outer `Option` would create two null states.
     pub frailty: FrailtySpec,
@@ -432,6 +431,10 @@ pub struct FitConfig {
 
     // Fitting options
     pub scale_dimensions: bool,
+    /// Spatial length-scale/anisotropy optimization policy shared by every
+    /// formula family. Front ends must set model-wide spatial knobs here rather
+    /// than mutating a request after materialization.
+    pub spatial_optimization: SpatialLengthScaleOptimizationOptions,
     /// Enable exact spatial adaptive regularization for standard formula fits.
     /// `None` uses the quality-first automatic policy. The current automatic
     /// policy leaves LAREG off unless explicitly requested because the
@@ -557,6 +560,7 @@ impl Default for FitConfig {
             expectile_tau: None,
             ctn_stage1: None,
             scale_dimensions: false,
+            spatial_optimization: SpatialLengthScaleOptimizationOptions::default(),
             adaptive_regularization: None,
             ridge_lambda: 1e-6,
             transformation_normal: false,

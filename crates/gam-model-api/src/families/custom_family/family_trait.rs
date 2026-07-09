@@ -910,8 +910,8 @@ pub trait CustomFamily {
     /// evaluator wires the operator into [`HessianValue::Operator`] via
     /// the [`HessianDerivativeProvider::family_outer_hessian_operator`] hook
     /// the family installs on its provider; consumers see a generic
-    /// `Arc<dyn HessianOperator>` (matvec / dim / mul_mat /
-    /// is_cheap_to_materialize).
+    /// `Arc<dyn HessianOperator>` (`apply_into`, `apply_mat`, `dim`, and the
+    /// explicit materialization work model).
     ///
     /// Default returns `None`, leaving the family on the existing pairwise
     /// assembly path.  This is the architectural contract for CTN, survival

@@ -22,17 +22,17 @@ impl gam_problem::HessianOperator for OwnedDenseHessianOperator {
     ) -> Result<(), opt::ObjectiveEvalError> {
         if v.len() != self.matrix.ncols() {
             return Err(opt::ObjectiveEvalError::fatal(format!(
-                    "batched dense outer Hessian apply_into input length mismatch: got {}, expected {}",
-                    v.len(),
-                    self.matrix.ncols()
-                )));
+                "batched dense outer Hessian apply_into input length mismatch: got {}, expected {}",
+                v.len(),
+                self.matrix.ncols()
+            )));
         }
         if out.len() != self.matrix.nrows() {
             return Err(opt::ObjectiveEvalError::fatal(format!(
-                    "batched dense outer Hessian apply_into output length mismatch: got {}, expected {}",
-                    out.len(),
-                    self.matrix.nrows()
-                )));
+                "batched dense outer Hessian apply_into output length mismatch: got {}, expected {}",
+                out.len(),
+                self.matrix.nrows()
+            )));
         }
         for (row, cell) in self.matrix.rows().into_iter().zip(out.iter_mut()) {
             *cell = row.dot(v);
@@ -112,12 +112,9 @@ impl gam_problem::HessianOperator for LabeledHessianOperator {
                 self.outer_dim
             )));
         }
-        let mut guard = self
-            .scratch
-            .lock()
-            .map_err(|_| {
-                opt::ObjectiveEvalError::fatal("labeled outer Hessian scratch lock poisoned")
-            })?;
+        let mut guard = self.scratch.lock().map_err(|_| {
+            opt::ObjectiveEvalError::fatal("labeled outer Hessian scratch lock poisoned")
+        })?;
         let (physical_in, physical_out) = &mut *guard;
         for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
             physical_in[physical_idx] = outer_idx.map(|idx| v[idx]).unwrap_or(0.0);

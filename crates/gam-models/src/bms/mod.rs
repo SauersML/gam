@@ -8,7 +8,7 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
     joint_hyper_options_for_outer_tolerance,
 };
-use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
+use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
 use crate::cubic_cell_kernel as exact_kernel;
 use crate::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,

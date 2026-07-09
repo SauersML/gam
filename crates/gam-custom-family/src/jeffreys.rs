@@ -550,7 +550,7 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
 /// the mode β̂(ρ): `H_Φ = H_Φ(β̂(ρ))` because it is built from `H_id = Z_Jᵀ H Z_J`
 /// and `D_a = Z_Jᵀ ∂_a H Z_J`, both functions of β̂. So the exact outer gradient
 /// of `½ log|H+S_λ+H_Φ|` carries a `½ tr[(·)⁻¹ D_β H_Φ[v_k]]` drift term ALONGSIDE
-/// the likelihood drift `D_β H[v_k]`. Folding `H_Φ` into the `HessianOperator`
+/// the likelihood drift `D_β H[v_k]`. Folding `H_Φ` into the `HessianFactorization`
 /// (the `(·)⁻¹` kernel and `logdet()`) is necessary but NOT sufficient: the
 /// trace contraction must ALSO include `D_β H_Φ[v_k]`, supplied by the companion
 /// drift wrapper. Without it the analytic gradient describes a DIFFERENT objective

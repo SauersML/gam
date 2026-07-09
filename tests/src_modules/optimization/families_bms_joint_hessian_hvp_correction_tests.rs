@@ -1531,7 +1531,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
     use gam_custom_family::build_psi_hyper_coords;
     use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
+    use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
 
     let n = 32usize;
     let y: Array1<f64> =

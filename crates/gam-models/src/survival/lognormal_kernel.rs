@@ -101,6 +101,23 @@ impl FrailtySpec {
         !matches!(self, Self::None)
     }
 
+    /// Validate the frailty scale domain independently of a model family.
+    pub fn validate(&self) -> Result<(), LognormalKernelError> {
+        let (kind, sigma) = match self {
+            Self::None => return Ok(()),
+            Self::GaussianShift { sigma_fixed } => ("GaussianShift", sigma_fixed),
+            Self::HazardMultiplier { sigma_fixed, .. } => ("HazardMultiplier", sigma_fixed),
+        };
+        if let Some(sigma) = sigma
+            && (!sigma.is_finite() || *sigma < 0.0)
+        {
+            return Err(LognormalKernelError::InvalidSpec {
+                reason: format!("{kind} frailty requires a finite fixed sigma >= 0, got {sigma}"),
+            });
+        }
+        Ok(())
+    }
+
     /// Resolve the exact frailty subset supported by Gaussian-shift
     /// marginal-slope models.
     ///
@@ -112,6 +129,7 @@ impl FrailtySpec {
         &self,
         context: &str,
     ) -> Result<Self, LognormalKernelError> {
+        self.validate()?;
         match self {
             Self::None => Ok(Self::None),
             Self::GaussianShift {
@@ -1254,6 +1272,20 @@ mod tests {
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(0.75),
                 loading: HazardLoading::Full,
+            }
+            .resolve_fixed_gaussian_shift("marginal-slope")
+            .is_err()
+        );
+        assert!(
+            FrailtySpec::GaussianShift {
+                sigma_fixed: Some(-0.1),
+            }
+            .resolve_fixed_gaussian_shift("marginal-slope")
+            .is_err()
+        );
+        assert!(
+            FrailtySpec::GaussianShift {
+                sigma_fixed: Some(f64::NAN),
             }
             .resolve_fixed_gaussian_shift("marginal-slope")
             .is_err()

@@ -61,7 +61,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
             covariate_spec,
             config: TransformationNormalConfig::default(),
             options: BlockwiseFitOptions::default(),
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: config.spatial_optimization.clone(),
             warm_start: None,
         }),
         inference_notes,

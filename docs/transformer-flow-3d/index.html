@@ -8,6 +8,7 @@
       content="An interactive 3D map of residual, key, and value information flow through a causal transformer."
     />
     <title>Inside the Transformer — Information Flow in 3D</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2308090d'/%3E%3Cpath d='M18 42V24m14 24V16m14 26V22' stroke='%23a78bfa' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./styles.css" />
     <script type="importmap">
       {
@@ -185,9 +186,9 @@
             </article>
           </div>
           <div class="attention-formula" aria-label="Scaled dot product attention formula">
-            <span>ATTENTION</span>
-            <strong>softmax(QK<sup>T</sup> / √d<sub>k</sub>)V</strong>
-            <small>match → weight → retrieve</small>
+            <span>MULTI-HEAD ATTENTION</span>
+            <strong>Concat<sub>h</sub>[softmax((Q<sub>h</sub>K<sub>h</sub><sup>T</sup> + M<sub>causal</sub>) / √d<sub>h</sub>)V<sub>h</sub>]W<sub>O</sub></strong>
+            <small>mask → match → weight → retrieve → project</small>
           </div>
         </section>
 
@@ -208,7 +209,7 @@
         <li><b>Select</b> a node or stream for a precise explanation.</li>
         <li><b>Change views</b> to isolate a block or trace combinatorial paths.</li>
       </ol>
-      <p>The view shows a decoder-only, pre-norm transformer. Multi-head internals are grouped into one attention module for clarity.</p>
+      <p>This view shows a common sequential, pre-norm, decoder-only block. “LN” denotes the normalizer; many current models use RMSNorm. Multi-head internals are grouped for clarity. Positional transforms such as RoPE, grouped-query attention, gated MLP variants, biases, and dropout are not drawn because they do not change the two dependency axes shown here.</p>
     </dialog>
 
     <script type="module" src="./app.js"></script>

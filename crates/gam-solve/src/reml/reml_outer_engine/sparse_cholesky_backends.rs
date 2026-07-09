@@ -1,7 +1,7 @@
 use super::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Sparse Cholesky HessianOperator implementation
+//  Sparse Cholesky HessianFactorization implementation
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Sparse Cholesky Hessian operator.
@@ -402,7 +402,7 @@ impl SparseCholeskyOperator {
     }
 }
 
-impl HessianOperator for SparseCholeskyOperator {
+impl HessianFactorization for SparseCholeskyOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
     }
@@ -575,10 +575,10 @@ impl HessianOperator for SparseCholeskyOperator {
 // sensitivity, and basis sensitivity.
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Cholesky-backed value-only HessianOperator (logdet + solve, no traces)
+//  Cholesky-backed value-only HessianFactorization (logdet + solve, no traces)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Dense Cholesky-backed [`HessianOperator`] for `EvalMode::ValueOnly` paths.
+/// Dense Cholesky-backed [`HessianFactorization`] for `EvalMode::ValueOnly` paths.
 ///
 /// When the penalized Hessian is known to be SPD (no Firth bias reduction, no
 /// hard linear constraints, no `HardPseudo` mode), the REML/LAML cost needs
@@ -636,7 +636,7 @@ impl DenseCholeskyValueOnlyOperator {
     }
 }
 
-impl HessianOperator for DenseCholeskyValueOnlyOperator {
+impl HessianFactorization for DenseCholeskyValueOnlyOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
     }
@@ -667,13 +667,13 @@ impl HessianOperator for DenseCholeskyValueOnlyOperator {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Block-coupled HessianOperator for joint multi-block models
+//  Block-coupled HessianFactorization for joint multi-block models
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Block-coupled Hessian operator for joint multi-block models (GAMLSS, survival).
 ///
 /// Wraps a [`DenseSpectralOperator`] over the full assembled joint Hessian while
-/// retaining block-structure metadata. All [`HessianOperator`] trait methods
+/// retaining block-structure metadata. All [`HessianFactorization`] trait methods
 /// delegate to the inner spectral decomposition, ensuring a single
 /// eigendecomposition governs logdet, trace, and solve.
 ///
@@ -706,7 +706,7 @@ impl BlockCoupledOperator {
     }
 }
 
-impl HessianOperator for BlockCoupledOperator {
+impl HessianFactorization for BlockCoupledOperator {
     fn logdet(&self) -> f64 {
         self.inner.logdet()
     }
@@ -801,7 +801,7 @@ impl HessianOperator for BlockCoupledOperator {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Matrix-free SPD HessianOperator implementation
+//  Matrix-free SPD HessianFactorization implementation
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Operator-backed SPD Hessian with exact spectral REML algebra.
@@ -1142,7 +1142,7 @@ where
     Some((x, iters, residual_norm))
 }
 
-impl HessianOperator for MatrixFreeSpdOperator {
+impl HessianFactorization for MatrixFreeSpdOperator {
     fn logdet(&self) -> f64 {
         *self
             .cached_logdet

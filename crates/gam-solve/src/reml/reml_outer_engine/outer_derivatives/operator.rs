@@ -322,7 +322,7 @@ pub(crate) struct OuterHessianCoord {
 }
 
 pub(crate) struct UnifiedHessianOperator {
-    pub(crate) hop: Arc<dyn HessianOperator>,
+    pub(crate) hop: Arc<dyn HessianFactorization>,
     pub(crate) coords: Vec<OuterHessianCoord>,
     pub(crate) pair_a: Array2<f64>,
     pub(crate) pair_ld_s: Array2<f64>,

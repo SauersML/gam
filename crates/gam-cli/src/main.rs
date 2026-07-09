@@ -71,15 +71,14 @@ pub(crate) use gam_data::{ColumnKindTag, DataSchema};
 
 pub(crate) use gam::inference::model_payload_builders::{
     BernoulliMarginalSlopeInputs, LatentWindowInputs, LocationScaleInputs, LocationScaleResponse,
-    LocationScaleWiggle, SavedModelSourceMetadata, SurvivalLocationScaleInputs,
-    SurvivalMarginalSlopeInputs, SurvivalTimewiggle, SurvivalTimewiggleBeta,
-    SurvivalTransformationInputs, TransformationNormalInputs, StandardPayloadInputs,
-    assemble_standard_payload,
+    LocationScaleWiggle, SavedModelSourceMetadata, StandardPayloadInputs,
+    SurvivalLocationScaleInputs, SurvivalMarginalSlopeInputs, SurvivalTimewiggle,
+    SurvivalTimewiggleBeta, SurvivalTransformationInputs, TransformationNormalInputs,
     assemble_bernoulli_marginal_slope_payload, assemble_latent_window_payload,
     assemble_location_scale_payload, assemble_residual_cascade_payload,
-    assemble_spline_scan_payload, assemble_survival_location_scale_payload,
-    assemble_survival_marginal_slope_payload, assemble_survival_transformation_payload,
-    assemble_transformation_normal_payload,
+    assemble_spline_scan_payload, assemble_standard_payload,
+    assemble_survival_location_scale_payload, assemble_survival_marginal_slope_payload,
+    assemble_survival_transformation_payload, assemble_transformation_normal_payload,
 };
 
 pub(crate) use gam_predict::input::{
@@ -175,10 +174,10 @@ pub(crate) use gam::families::fit_orchestration::{
     LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
     StandardFitResult, SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, SurvivalTransformationTermSpec,
-    TransformationNormalFitRequest, WorkflowError, fit_model,
-    gate_duchon_operator_penalties_for_family, prepare_survival_time_stack,
-    is_binary_response, residual_cascade_fast_path, resolve_offset_column, resolve_weight_column,
-    response_column_kind, route_marginal_slope_deviation_blocks, spline_scan_fast_path,
+    TransformationNormalFitRequest, WorkflowError, fit_from_formula_with_notes, fit_model,
+    gate_duchon_operator_penalties_for_family, is_binary_response, prepare_survival_time_stack,
+    residual_cascade_fast_path, resolve_offset_column, resolve_weight_column, response_column_kind,
+    route_marginal_slope_deviation_blocks, spline_scan_fast_path,
 };
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};

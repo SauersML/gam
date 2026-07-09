@@ -38,8 +38,7 @@ pub(crate) fn build_model_summary(
     } else {
         None
     };
-    let whitening_gram_full: Option<&Array2<f64>> =
-        fit.weighted_gram().or(design_gram.as_ref());
+    let whitening_gram_full: Option<&Array2<f64>> = fit.weighted_gram().or(design_gram.as_ref());
     let scale_is_estimated = matches!(
         family.response,
         ResponseFamily::Gaussian | ResponseFamily::Gamma

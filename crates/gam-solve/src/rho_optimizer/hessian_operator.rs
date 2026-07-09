@@ -19,24 +19,20 @@ impl HessianOperator for RhoBlockAdditiveHessian {
     /// base overrides) then adds the rho-block correction using a row-dot loop
     /// rather than materialising an intermediate `rho_v.to_owned()` +
     /// `rho_block.dot(&rho_v)` pair.
-    fn apply_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<(), ObjectiveEvalError> {
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
         if v.len() != self.dim {
             return Err(ObjectiveEvalError::fatal(format!(
-                    "outer Hessian operator input length mismatch: got {}, expected {}",
-                    v.len(),
-                    self.dim
-                )));
+                "outer Hessian operator input length mismatch: got {}, expected {}",
+                v.len(),
+                self.dim
+            )));
         }
         if out.len() != self.dim {
             return Err(ObjectiveEvalError::fatal(format!(
-                    "outer Hessian apply_into output length mismatch: got {}, expected {}",
-                    out.len(),
-                    self.dim
-                )));
+                "outer Hessian apply_into output length mismatch: got {}, expected {}",
+                out.len(),
+                self.dim
+            )));
         }
         self.base.apply_into(v, out)?;
         let k = self.rho_block.nrows();
@@ -54,20 +50,17 @@ impl HessianOperator for RhoBlockAdditiveHessian {
     /// block. This propagates the batched-amortization benefit to wrappers
     /// — `materialize_dense` (which goes through `apply_mat(eye)`) and any
     /// future K-column inner-CG batching path.
-    fn apply_mat(
-        &self,
-        factor: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, ObjectiveEvalError> {
+    fn apply_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, ObjectiveEvalError> {
         let mut out = self.base.apply_mat(factor)?;
         let k = self.rho_block.nrows();
         if k > 0 {
             if k > out.nrows() {
                 return Err(ObjectiveEvalError::fatal(format!(
-                        "rho-block Hessian update shape mismatch: rho_block is {}x{}, mul_mat output has {} rows",
-                        self.rho_block.nrows(),
-                        self.rho_block.ncols(),
-                        out.nrows()
-                    )));
+                    "rho-block Hessian update shape mismatch: rho_block is {}x{}, apply_mat output has {} rows",
+                    self.rho_block.nrows(),
+                    self.rho_block.ncols(),
+                    out.nrows()
+                )));
             }
             // Update the leading-k rows of `out` by the rho_block contribution
             // to the first k rows of v: out[..k, :] += rho_block · factor[..k, :].

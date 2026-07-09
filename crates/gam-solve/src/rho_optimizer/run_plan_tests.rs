@@ -441,11 +441,7 @@ impl HessianOperator for FailingSeedMaterializationOperator {
         self.dim
     }
 
-    fn apply_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<(), ObjectiveEvalError> {
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
         out.assign(v);
         Ok(())
     }

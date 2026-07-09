@@ -264,7 +264,7 @@ pub fn compute_corrected_covariance(
     v_ks: &[Array1<f64>],
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
 ) -> Result<Array2<f64>, CorrectedCovarianceError> {
     compute_corrected_covariance_with_constraints(v_ks, ext_v, outer_hessian, hop, None, f64::NAN)
         .map(|cov| {
@@ -288,7 +288,7 @@ pub fn compute_corrected_covariance_with_constraints(
     v_ks: &[Array1<f64>],
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     theta_at_optimum: Option<&[f64]>,
     gradient_norm: f64,
 ) -> Result<CorrectedCovariance, CorrectedCovarianceError> {
@@ -372,7 +372,7 @@ pub fn compute_corrected_covariance_with_constraints(
 /// - `v_ks`: mode responses for rho coordinates
 /// - `ext_v`: mode responses for extended (psi) coordinates
 /// - `outer_hessian`: the q x q outer Hessian
-/// - `hop`: the HessianOperator providing H^{-1}
+/// - `hop`: the HessianFactorization providing H^{-1}
 ///
 /// # Returns
 /// A p-vector of corrected marginal variances.
@@ -380,7 +380,7 @@ pub fn compute_corrected_covariance_diagonal(
     v_ks: &[Array1<f64>],
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
 ) -> Result<Array1<f64>, CorrectedCovarianceError> {
     compute_corrected_covariance_diagonal_with_constraints(
         v_ks,
@@ -422,7 +422,7 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
     v_ks: &[Array1<f64>],
     ext_v: &[Array1<f64>],
     outer_hessian: &Array2<f64>,
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     theta_at_optimum: Option<&[f64]>,
     gradient_norm: f64,
 ) -> Result<CorrectedCovarianceDiagonal, CorrectedCovarianceError> {

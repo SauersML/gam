@@ -401,7 +401,7 @@ pub(crate) fn efs_profiling(solution: &InnerSolution<'_>) -> (f64, f64) {
 }
 
 pub(crate) fn trace_hinv_cached_drift_cross(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     left_dense: Option<&Array2<f64>>,
     left_op: Option<&dyn HyperOperator>,
     right_dense: Option<&Array2<f64>>,
@@ -655,7 +655,7 @@ pub(crate) fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
     gam_linalg::faer_ndarray::fast_abt(&vs, &op.eigenvectors)
 }
 
-/// Tangent-projected `HessianOperator` adapter. Wraps an `m × m`
+/// Tangent-projected `HessianFactorization` adapter. Wraps an `m × m`
 /// `H_T = ZᵀHZ` operator and exposes the `p × p` interface needed by the
 /// existing evaluator pipeline. All p-space inputs are projected via `Z`
 /// before being passed to the tangent operator; outputs are lifted back
@@ -669,7 +669,7 @@ pub(crate) struct TangentProjectedHessianOperator {
     pub(crate) h_t_op: DenseSpectralOperator,
 }
 
-impl HessianOperator for TangentProjectedHessianOperator {
+impl HessianFactorization for TangentProjectedHessianOperator {
     fn active_rank(&self) -> usize {
         self.h_t_op.active_rank()
     }
@@ -705,7 +705,7 @@ impl HessianOperator for TangentProjectedHessianOperator {
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         // Matrix-free tangent projection of an operator-backed Hessian drift.
         //
-        // The `HessianOperator` trait default densifies `op` (`op.to_dense()`,
+        // The `HessianFactorization` trait default densifies `op` (`op.to_dense()`,
         // p forward HVPs + a p×p transient) and then evaluates
         // `trace_logdet_gradient`, which internally forms `Zᵀ Bdense Z`. For a
         // spectral tangent operator `logdet_traces_match_hinv_kernel()` is
@@ -814,7 +814,7 @@ pub(crate) fn tangent_penalty_logdet(
 /// Borrowing adapter that lets a tangent-projected `InnerSolution` reuse
 /// the original `HessianDerivativeProvider` without taking ownership.
 /// The provider returns p-space drift matrices (`D_β H[v]`) which the
-/// tangent-wrapped `HessianOperator` correctly projects via `ZᵀMZ` in
+/// tangent-wrapped `HessianFactorization` correctly projects via `ZᵀMZ` in
 /// its `trace_logdet_gradient` / `trace_hinv_product` methods. So no
 /// per-method projection is needed here — pure delegation suffices.
 pub(crate) struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);

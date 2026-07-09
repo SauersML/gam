@@ -56,7 +56,7 @@ pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 /// the outer gradient.
 ///
 /// # Arguments
-/// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
+/// - `solution`: Converged inner state (β̂, H, penalties, HessianFactorization).
 /// - `rho`: Current log-smoothing parameters.
 /// - `gradient`: Full outer gradient `∂V_total/∂θ`, length
 ///   `n_rho + n_ext`. The caller must run
@@ -329,7 +329,7 @@ pub struct HybridEfsResult {
 ///    first-order fallback marker.
 ///
 /// # Arguments
-/// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
+/// - `solution`: Converged inner state (β̂, H, penalties, HessianFactorization).
 /// - `rho`: Current log-smoothing parameters.
 /// - `gradient`: Full REML/LAML gradient ∂V/∂θ (length = n_rho + n_ext).
 ///   Must be provided; the hybrid needs the gradient for ψ coordinates.

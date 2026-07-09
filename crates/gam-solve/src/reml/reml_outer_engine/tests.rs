@@ -58,7 +58,7 @@ pub(crate) fn xt_logdet_kernel_diagonal_iterator_matches_scalar_reference() {
         pub(crate) kernel: Array2<f64>,
     }
 
-    impl HessianOperator for FixedKernelHessian {
+    impl HessianFactorization for FixedKernelHessian {
         fn logdet(&self) -> f64 {
             0.0
         }
@@ -98,7 +98,7 @@ pub(crate) fn xt_logdet_kernel_diagonal_iterator_matches_scalar_reference() {
     let op = FixedKernelHessian { kernel };
     let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x.clone()));
 
-    let got = HessianOperator::xt_logdet_kernel_x_diagonal(&op, &design);
+    let got = HessianFactorization::xt_logdet_kernel_x_diagonal(&op, &design);
     let solved = op.solve_multi(&x.t().to_owned());
     for i in 0..x.nrows() {
         let mut reference = 0.0;
@@ -6633,8 +6633,8 @@ pub(crate) fn dense_cholesky_value_only_matches_spectral() {
 
     // solve must agree.
     let rhs = array![1.0, 2.0, 3.0, 4.0];
-    let sol_spec = HessianOperator::solve(&spectral, &rhs);
-    let sol_chol = HessianOperator::solve(&cholesky, &rhs);
+    let sol_spec = HessianFactorization::solve(&spectral, &rhs);
+    let sol_chol = HessianFactorization::solve(&cholesky, &rhs);
     for i in 0..4 {
         assert_relative_eq!(sol_chol[i], sol_spec[i], epsilon = 1e-10);
     }

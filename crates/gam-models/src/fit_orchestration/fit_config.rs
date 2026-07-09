@@ -109,6 +109,8 @@ impl FitConfig {
         if self.outer_max_iter == Some(0) {
             return Err("outer_max_iter must be >= 1".to_string());
         }
+        self.frailty.validate().map_err(|error| error.to_string())?;
+        self.spatial_optimization.validate()?;
         let likelihood_mode = parse_survival_likelihood_mode(&self.survival_likelihood)?;
         validate_survival_baseline_config(
             likelihood_mode,

@@ -28,7 +28,10 @@ pub(crate) fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Syn
     Ok((
         result.objective,
         result.gradient,
-        result.outer_hessian.materialize_dense()?,
+        result
+            .outer_hessian
+            .materialize_dense()
+            .map_err(|error| error.to_string())?,
         result.warm_start,
     ))
 }

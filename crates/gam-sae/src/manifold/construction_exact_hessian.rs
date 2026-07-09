@@ -119,7 +119,14 @@ impl SaeManifoldTerm {
             // so this is exactly the residual contracted against the raw `∂²f`
             // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
             fitted.fill(0.0);
+            let active_atoms = self
+                .last_row_layout
+                .as_ref()
+                .map(|layout| layout.active_atoms[row].as_slice());
             for k in 0..k_atoms {
+                if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
+                    continue;
+                }
                 self.atoms[k].fill_decoded_row(row, &mut decoded);
                 let a_k = assignments[k];
                 for out_col in 0..p {

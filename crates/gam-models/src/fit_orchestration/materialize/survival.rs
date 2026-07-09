@@ -891,7 +891,7 @@ pub(crate) fn materialize_survival<'a>(
                 data: data.values.view(),
                 spec,
                 wiggle: effective_linkwiggle_cfg.clone(),
-                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+                kappa_options: config.spatial_optimization.clone(),
                 optimize_inverse_link,
                 cache_session: None,
             })
@@ -937,7 +937,7 @@ pub(crate) fn materialize_survival<'a>(
                     // default for survival marginal-slope — no flag to thread.
                     ..Default::default()
                 },
-                kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+                kappa_options: config.spatial_optimization.clone(),
             })
         };
 

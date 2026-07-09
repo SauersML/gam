@@ -58,27 +58,6 @@ pub(crate) fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
 }
 
-/// Inner-PIRLS options shared by both survival-baseline fit sites (the
-/// per-candidate trial fit and the final baseline fit). Centralised so the two
-/// call sites cannot drift in their convergence policy: a generous 400-iter /
-/// 40-halving budget with a 1e-6 coefficient-change tolerance and a 1e-12
-/// step-size floor, matching the survival baseline's BFGS envelope solver.
-pub(crate) fn survival_baseline_pirls_options() -> gam::pirls::WorkingModelPirlsOptions {
-    gam::pirls::WorkingModelPirlsOptions {
-        max_iterations: 400,
-        convergence_tolerance: 1e-6,
-        adaptive_kkt_tolerance: None,
-        max_step_halving: 40,
-        min_step_size: 1e-12,
-        firth_bias_reduction: false,
-        coefficient_lower_bounds: None,
-        linear_constraints: None,
-        initial_lm_lambda: None,
-        geodesic_acceleration: false,
-        arrow_schur: None,
-    }
-}
-
 pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let response_expr = surv_response_expr(args.entry.as_deref(), &args.exit, &args.event);
     let formula = format!("{response_expr} ~ {}", args.formula);
@@ -200,6 +179,20 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     } else {
         requested_likelihood_mode
     };
+    if matches!(
+        likelihood_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
+        return run_canonical_survival_transformation(
+            &args,
+            &ds,
+            &parsed,
+            &formula,
+            &effectivespec,
+            likelihood_mode,
+            &effective_config,
+        );
+    }
     // linkwiggle(...) is a nonparametric anchored correction to the inverse
     // link g^{-1}: eta -> mu. It is defined only for modes that expose such a
     // map. LocationScale uses a standard inverse link for the residual
@@ -1489,540 +1482,117 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    if effective_config.noise_offset_column.is_some() {
+    unreachable!("every supported survival likelihood returns from its canonical family branch")
+}
+
+fn run_canonical_survival_transformation(
+    args: &SurvivalArgs,
+    dataset: &Dataset,
+    parsed: &ParsedFormula,
+    formula: &str,
+    survivalspec: &str,
+    requested_mode: SurvivalLikelihoodMode,
+    fit_config: &FitConfig,
+) -> Result<(), String> {
+    let phase_start = std::time::Instant::now();
+    log::info!(
+        "[PHASE] canonical survival fit start n={} mode={}",
+        dataset.values.nrows(),
+        survival_likelihood_modename(requested_mode),
+    );
+    let outcome = fit_from_formula_with_notes(formula, dataset, fit_config)
+        .map_err(|error| format!("survival formula fit failed: {error}"))?;
+    let FitResult::SurvivalTransformation(result) = outcome.result else {
         return Err(
-            "--noise-offset-column is supported only for survival location-scale or marginal-slope"
+            "canonical transformation-survival service returned the wrong result variant"
                 .to_string(),
         );
-    }
-    let covariate_offset =
-        resolve_offset_column(&ds, &col_map, effective_config.offset_column.as_deref())?;
-    let dense_cov_design = cov_design.design.to_dense();
-    if cause_count > 1 {
-        let weibull_seed = if likelihood_mode == SurvivalLikelihoodMode::Weibull
-            && !learn_timewiggle
-        {
-            let scale = effective_config
-                .baseline_scale
-                .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
-            let shape = effective_config.baseline_shape.unwrap_or(1.0);
-            if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
-                return Err(
-                    "weibull survival fit requires finite positive baseline_scale and baseline_shape"
-                        .to_string(),
-                );
-            }
-            Some((scale, shape))
-        } else {
-            None
-        };
-        let fit = match fit_model(FitRequest::SurvivalTransformation(
-            SurvivalTransformationFitRequest {
-                data: ds.values.view(),
-                spec: SurvivalTransformationTermSpec {
-                    age_entry: age_entry.clone(),
-                    age_exit: age_exit.clone(),
-                    event_target: event_target.clone(),
-                    weights: weights.clone(),
-                    covariate_spec: termspec.clone(),
-                    covariate_offset: covariate_offset.clone(),
-                    baseline_cfg: baseline_cfg.clone(),
-                    likelihood_mode,
-                    time_anchor,
-                    time_build: time_build.clone(),
-                    timewiggle: effective_timewiggle.clone(),
-                    weibull_seed,
-                    ridge_lambda: effective_config.ridge_lambda,
-                    // Gamma precision hyperpriors on penalty blocks are only reachable via the
-                    // Python FFI fit config. The CLI exposes no flag,
-                    // config file, or formula-DSL syntax for them, and the magic-by-default
-                    // policy forbids inventing one here, so an empty prior list is correct.
-                    penalty_block_gamma_priors: Vec::new(),
-                },
-                cache_session: None,
-            },
-        )) {
-            Ok(FitResult::SurvivalTransformation(result)) => result,
-            Ok(_) => {
-                return Err(
-                    "internal cause-specific survival workflow returned the wrong result variant"
-                        .to_string(),
-                );
-            }
-            Err(e) => return Err(format!("cause-specific survival fit failed: {e}")),
-        };
-        cli_out!();
-        cli_out!(
-            "cause-specific survival fit | causes={} | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
-            cause_count,
-            fit.fit.pirls_status.label(),
-            fit.fit.outer_iterations,
-            fit.fit.log_likelihood,
-            fit.fit.reml_score
-        );
-        if let Some(out) = args.out {
-            // Source-specific work: extract the cause-specific baseline-timewiggle
-            // coefficients from the first fitted block (this CLI path persists a
-            // single shared timewiggle block; cause_count > 1 guarantees the
-            // block exists). The shared core then assembles the canonical
-            // payload exactly as the FFI does.
-            let timewiggle = fit
-                .baseline_timewiggle
-                .as_ref()
-                .zip(fit.fit.blocks.first())
-                .map(|(timewiggle, block)| {
-                    let start = fit.time_base_ncols;
-                    let end = start + timewiggle.ncols;
-                    SurvivalTimewiggle {
-                        degree: timewiggle.degree,
-                        knots: timewiggle.knots.to_vec(),
-                        penalty_orders: effective_timewiggle
-                            .as_ref()
-                            .map(|cfg| cfg.penalty_orders.clone()),
-                        double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
-                        beta: SurvivalTimewiggleBeta::Single(
-                            block.beta.slice(s![start..end]).to_vec(),
-                        ),
-                    }
-                });
-            let payload = assemble_survival_transformation_payload(
-                SurvivalTransformationInputs {
-                    formula,
-                    data_schema: ds.schema.clone(),
-                    fit_result: fit.fit.clone(),
-                    survival_entry: args.entry,
-                    survival_exit: args.exit,
-                    survival_event: args.event,
-                    survivalspec: effectivespec,
-                    cause_count: Some(cause_count),
-                    baseline_cfg: fit.baseline_cfg.clone(),
-                    time_basis: fit.time_basis.clone(),
-                    ridge_lambda: effective_config.ridge_lambda,
-                    survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
-                        .to_string(),
-                    resolved_termspec: fit.resolvedspec.clone(),
-                    survival_beta_time: Some(fit.fit.beta.to_vec()),
-                    timewiggle,
-                },
-                SavedModelSourceMetadata {
-                    training_headers: ds.headers.clone(),
-                    training_feature_ranges: Some(ds.feature_ranges()),
-                    offset_column: effective_config.offset_column.clone(),
-                    noise_offset_column: None,
-                },
-            );
-            write_payload_json(&out, payload)?;
-        }
-        return Ok(());
-    }
-    let build_working_model = |candidate: &SurvivalBaselineConfig| {
-        let prepared = prepare_survival_time_stack(
-            &age_entry,
-            &age_exit,
-            candidate,
-            likelihood_mode,
-            None,
-            time_anchor,
-            exact_derivative_guard,
-            &time_build,
-            effective_timewiggle.as_ref(),
-            None,
-        )?;
-        let mut eta_offset_entry = prepared.eta_offset_entry.clone();
-        let mut eta_offset_exit = prepared.eta_offset_exit.clone();
-        eta_offset_entry += &covariate_offset;
-        eta_offset_exit += &covariate_offset;
-        let p_time_total = prepared.time_design_exit.ncols();
-        let p = p_time_total + p_cov;
-        let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
-        for (idx, s) in prepared.time_penalties.iter().enumerate() {
-            if s.nrows() == p_time_total && s.ncols() == p_time_total {
-                penalty_blocks.push(PenaltyBlock {
-                    matrix: s.clone(),
-                    lambda: time_build.smooth_lambda.unwrap_or(1e-2),
-                    range: 0..p_time_total,
-                    nullspace_dim: prepared.time_nullspace_dims.get(idx).copied().unwrap_or(0),
-                });
-            }
-        }
-        let ridge_range_start = if time_build.basisname == "linear" && !learn_timewiggle {
-            1
-        } else {
-            0
-        };
-        if effective_config.ridge_lambda > 0.0 && p > ridge_range_start {
-            let dim = p - ridge_range_start;
-            let mut ridge = Array2::<f64>::zeros((dim, dim));
-            for d in 0..dim {
-                ridge[[d, d]] = 1.0;
-            }
-            penalty_blocks.push(PenaltyBlock {
-                matrix: ridge,
-                lambda: effective_config.ridge_lambda,
-                range: ridge_range_start..p,
-                nullspace_dim: 0,
-            });
-        }
-        let penalties = PenaltyBlocks::new(penalty_blocks.clone());
-        let monotonicity = SurvivalMonotonicityPenalty { tolerance: 0.0 };
-        let dense_time_entry = prepared.time_design_entry.to_dense();
-        let dense_time_exit = prepared.time_design_exit.to_dense();
-        let dense_time_derivative = prepared.time_design_derivative_exit.to_dense();
-        let mut model =
-            gam::families::survival::royston_parmar::working_model_from_time_covariateshared(
-                penalties,
-                monotonicity,
-                survivalspec,
-                gam::families::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
-                    age_entry: age_entry.view(),
-                    age_exit: age_exit.view(),
-                    event_target: event_target.view(),
-                    event_competing: event_competing.view(),
-                    weights: weights.view(),
-                    time_entry: dense_time_entry.view(),
-                    time_exit: dense_time_exit.view(),
-                    time_derivative: dense_time_derivative.view(),
-                    covariates: dense_cov_design.view(),
-                    monotonicity_constraint_rows: None,
-                    monotonicity_constraint_offsets: None,
-                    eta_offset_entry: Some(eta_offset_entry.view()),
-                    eta_offset_exit: Some(eta_offset_exit.view()),
-                    derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
-                },
-            )
-            .map_err(|e| format!("failed to construct survival model: {e}"))?;
-        if likelihood_mode != SurvivalLikelihoodMode::Weibull {
-            model
-                .set_structural_monotonicity(true, p_time_total)
-                .map_err(|e| format!("failed to enable structural monotonicity: {e}"))?;
-        }
-        let mut beta0 = Array1::<f64>::zeros(p);
-        if let Some(seed) = weibull_builtin_beta_seed.as_ref() {
-            if p_time_total < seed.len() {
-                return Err(format!(
-                    "weibull built-in time basis has {} columns but needs at least {} to seed scale/shape",
-                    p_time_total,
-                    seed.len()
-                ));
-            }
-            beta0.slice_mut(s![..seed.len()]).assign(seed);
-        }
-        let structural_lower_bounds =
-            if likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
-                let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
-                for j in 0..p_time_total {
-                    lb[j] = 0.0;
-                    beta0[j] = 1e-4;
-                }
-                Some(lb)
-            } else {
-                None
-            };
-        Ok((
-            prepared,
-            penalty_blocks,
-            p_time_total,
-            beta0,
-            structural_lower_bounds,
-            model,
-        ))
     };
-    if baseline_cfg.target != SurvivalBaselineTarget::Linear {
-        // Analytic-gradient BFGS over the baseline shape params (weibull
-        // scale/shape; gompertz rate/shape; gompertz-makeham rate/shape/makeham).
-        //
-        // The optimized cost is the *profile penalized NLL*
-        //   V(θ) = 0.5·deviance(β̂(θ); o(θ)) + 0.5·β̂ᵀSβ̂   (= survival_working_reml_score).
-        // The baseline θ enters this working model only through the three additive
-        // time-block offsets (entry η, exit η, exit ∂η/∂t). At the (constrained)
-        // PIRLS optimum β̂ the envelope theorem gives
-        //   dV/dθ_k = ∂V/∂θ_k|_{β=β̂}
-        //           = Σ_i r^X_i ∂o_X_i/∂θ_k + r^E_i ∂o_E_i/∂θ_k + r^D_i ∂o_D_i/∂θ_k,
-        // the residual×offset-partial contraction of
-        // WorkingModelSurvival::offset_channel_residuals(β̂) against the η-channel
-        // offset partials (baseline_chain_rule_gradient → baseline_offset_theta_partials).
-        // The β_j ≥ 0 active-set constraints carry no θ-dependence, so the
-        // constrained envelope identity is exact. See baseline_chain_rule_gradient
-        // for the full derivation. BFGS on this exact gradient converges in ≲10
-        // outer evaluations on the 2–3 dim θ-surface.
-        baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
-            &baseline_cfg,
-            "survival baseline",
-            |candidate| {
-                let (_, _, _, beta0, structural_lower_bounds, mut model) =
-                    build_working_model(candidate)?;
-                let pirls_opts = survival_baseline_pirls_options();
-                let beta = if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-                    let summary = gam::pirls::runworking_model_pirls(
-                        &mut model,
-                        gam::types::Coefficients::new(beta0.clone()),
-                        &pirls_opts,
-                        |_| {},
-                    )
-                    .map_err(|e| format!("survival PIRLS failed: {e}"))?;
-                    summary.beta.as_ref().to_owned()
-                } else {
-                    let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
-                        coefficient_lower_bounds: structural_lower_bounds,
-                        ..pirls_opts
-                    };
-                    let summary = gam::pirls::runworking_model_pirls(
-                        &mut model,
-                        gam::types::Coefficients::new(beta0.clone()),
-                        &constrained_opts,
-                        |_| {},
-                    )
-                    .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
-                    summary.beta.as_ref().to_owned()
-                };
-                let state = model.update_state(&beta).map_err(|e| {
-                    format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
-                })?;
-                let cost = state.penalized_objective();
-                let residuals = model.offset_channel_residuals(&beta).map_err(|e| {
-                    format!("failed to form survival baseline offset residuals: {e}")
-                })?;
-                let gradient = baseline_chain_rule_gradient(
-                    age_entry.view(),
-                    age_exit.view(),
-                    // RP transformation path has no interval channel; `residuals.right`
-                    // is all-zero so `age_exit` is an unconsulted placeholder.
-                    age_exit.view(),
-                    candidate,
-                    &residuals,
-                )?
-                .ok_or_else(|| {
-                    "survival baseline unexpectedly has no theta gradient".to_string()
-                })?;
-                Ok((cost, gradient))
-            },
-        )?;
-    }
-    let (prepared, penalty_blocks, p_time_total, beta0, structural_lower_bounds, model) =
-        build_working_model(&baseline_cfg)?;
-    let beta0_norm = beta0.dot(&beta0).sqrt();
-    let pirls_opts = survival_baseline_pirls_options();
-    let pirls_start = std::time::Instant::now();
-    let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
-        let elapsed = pirls_start.elapsed().as_secs_f64();
-        log::debug!(
-            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} | halving {} | {:.1}s",
-            info.iteration,
-            info.deviance,
-            info.gradient_norm,
-            info.step_size,
-            info.step_halving,
-            elapsed,
-        );
-    };
-    let (summary, beta, state, constraint_mode, surv_model) =
-        if likelihood_mode == SurvivalLikelihoodMode::Weibull {
-            let mut plain_model = model;
-            let summary = gam::pirls::runworking_model_pirls(
-                &mut plain_model,
-                gam::types::Coefficients::new(beta0.clone()),
-                &pirls_opts,
-                pirls_callback,
-            )
-            .map_err(|e| format!("survival PIRLS failed: {e}"))?;
-            let beta = summary.beta.as_ref().to_owned();
-            let state = plain_model.update_state(&beta).map_err(|e| {
-                format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
-            })?;
-            (
-                summary,
-                beta,
-                state,
-                "baseline-timewiggle".to_string(),
-                plain_model,
-            )
-        } else {
-            let mut constrained_model = model;
-            let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
-                coefficient_lower_bounds: structural_lower_bounds,
-                ..pirls_opts
-            };
-            let summary = gam::pirls::runworking_model_pirls(
-                &mut constrained_model,
-                gam::types::Coefficients::new(beta0.clone()),
-                &constrained_opts,
-                pirls_callback,
-            )
-            .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
-            let beta = summary.beta.as_ref().to_owned();
-            let state = constrained_model.update_state(&beta).map_err(|e| {
-                format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
-            })?;
-            (
-                summary,
-                beta,
-                state,
-                "constrained-structural-time".to_string(),
-                constrained_model,
-            )
-        };
-    log::debug!(
-        "[PIRLS] finished: {:?} after {} iterations, deviance={:.6e}, {:.1}s total",
-        summary.status,
-        summary.iterations,
-        state.deviance,
-        pirls_start.elapsed().as_secs_f64(),
+    log::info!(
+        "[PHASE] canonical survival fit end elapsed={:.3}s",
+        phase_start.elapsed().as_secs_f64()
     );
-    // Evaluate LAML objective via unified evaluator for diagnostic logging.
-    // Move surv_model into block so it is dropped at block end.
-    {
-        let surv_model = surv_model;
-        let rho = ndarray::Array1::from_iter(
-            penalty_blocks
-                .iter()
-                .filter(|b| b.lambda > 0.0)
-                .map(|b| b.lambda.ln()),
-        );
-        if !rho.is_empty() {
-            match surv_model.unified_lamlobjective_and_rhogradient(&beta, &state, &rho) {
-                Ok((laml_obj, laml_grad)) => {
-                    log::debug!(
-                        "[LAML] unified objective={:.6e}, |grad|={:.3e}",
-                        laml_obj,
-                        laml_grad.dot(&laml_grad).sqrt(),
-                    );
-                }
-                Err(e) => {
-                    log::debug!("[LAML] unified evaluation skipped: {e}");
-                }
-            }
-        }
-    }
-    match summary.status {
-        gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum => {}
-        other => {
-            let event_count = event_target.iter().filter(|&&ev| ev > 0).count();
-            let event_rate = if n > 0 {
-                event_count as f64 / n as f64
-            } else {
-                0.0
-            };
-            let min_entry = age_entry.iter().copied().fold(f64::INFINITY, f64::min);
-            let max_exit = age_exit.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let beta_norm = beta.dot(&beta).sqrt();
-            return Err(format!(
-                "survival constrained PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}, last_deviance_change={:.3e}, last_step_size={:.3e}, last_step_halving={}, max_abs_eta={:.3e}, beta0_norm={:.3e}, beta_norm={:.3e}; run[likelihood={}, spec={}, baseline_target={}, time_basis={}, constraint_mode={}, n={}, events={}, event_rate={:.4}, time_range=[{:.3e}, {:.3e}], p_time={}, p_cov={}, formula=\"{}\"]",
-                summary.lastgradient_norm,
-                summary.iterations,
-                state.deviance,
-                summary.last_deviance_change,
-                summary.last_step_size,
-                summary.last_step_halving,
-                summary.max_abs_eta,
-                beta0_norm,
-                beta_norm,
-                survival_likelihood_modename(likelihood_mode),
-                effectivespec,
-                if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
-                    survival_baseline_targetname(SurvivalBaselineTarget::Weibull)
-                } else {
-                    survival_baseline_targetname(baseline_cfg.target)
-                },
-                time_build.basisname,
-                constraint_mode,
-                n,
-                event_count,
-                event_rate,
-                min_entry,
-                max_exit,
-                p_time_total,
-                p_cov,
-                formula
-            ));
-        }
-    }
+    print_inference_summary(&outcome.inference_notes);
 
-    let fitted_baseline_cfg = if likelihood_mode == SurvivalLikelihoodMode::Weibull
-        && !learn_timewiggle
-    {
-        let time_beta = beta.slice(s![..p_time_total]).to_owned();
-        fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor).ok_or_else(|| {
-            "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                .to_string()
-        })?
-    } else {
-        baseline_cfg.clone()
-    };
+    let event_col = dataset
+        .column_map()
+        .get(&args.event)
+        .copied()
+        .ok_or_else(|| format!("event column '{}' is missing", args.event))?;
+    let cause_count = dataset
+        .values
+        .column(event_col)
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(row, value)| survival_event_code_from_value(value, row))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0) as usize;
 
-    cli_out!();
     cli_out!(
-        "survival config | likelihood={} | time_basis={} | baseline_target={}",
-        survival_likelihood_modename(likelihood_mode),
-        time_build.basisname,
-        survival_baseline_targetname(fitted_baseline_cfg.target)
+        "survival fit | likelihood={} | causes={} | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+        survival_likelihood_modename(result.likelihood_mode),
+        cause_count.max(1),
+        result.fit.pirls_status.label(),
+        result.fit.outer_iterations,
+        result.fit.log_likelihood,
+        result.fit.reml_score,
     );
 
-    if let Some(out) = args.out {
-        let hessian = state.hessian.to_dense();
-        let cov = match invert_symmetric_matrix(&hessian) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                cli_err!(
-                    "warning: failed to invert survival Hessian for covariance ({}); saving model without covariance",
-                    e
-                );
-                None
-            }
-        };
-        let fit_result = core_saved_fit_result(
-            beta.clone(),
-            Array1::from_iter(penalty_blocks.iter().map(|b| b.lambda)),
-            1.0,
-            cov.clone(),
-            cov.clone(),
-            SavedFitSummary::from_survivalworking_summary(&summary, &state)?,
-        );
-        // Source-specific work: snapshot the time basis and, when present,
-        // extract the single-block baseline-timewiggle coefficients. The shared
-        // core (the same path the FFI uses) assembles the canonical payload —
-        // and routes the time-basis write through `apply_survival_time_basis`,
-        // which is what makes the historic `survival_time_anchor` omission
-        // impossible.
-        let timewiggle = prepared.timewiggle_build.as_ref().map(|w| {
-            let start = time_build.x_exit_time.ncols();
-            let end = start + w.ncols;
-            SurvivalTimewiggle {
-                degree: w.degree,
-                knots: w.knots.to_vec(),
-                penalty_orders: effective_timewiggle
-                    .as_ref()
-                    .map(|cfg| cfg.penalty_orders.clone()),
-                double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
-                beta: SurvivalTimewiggleBeta::Single(beta.slice(s![start..end]).to_vec()),
-            }
-        });
-        let payload = assemble_survival_transformation_payload(
+    if let Some(out) = args.out.as_ref() {
+        let timewiggle = result
+            .baseline_timewiggle
+            .as_ref()
+            .zip(result.fit.blocks.first())
+            .map(|(timewiggle, block)| {
+                let start = result.time_base_ncols;
+                let end = start + timewiggle.ncols;
+                SurvivalTimewiggle {
+                    degree: timewiggle.degree,
+                    knots: timewiggle.knots.to_vec(),
+                    penalty_orders: parsed
+                        .timewiggle
+                        .as_ref()
+                        .map(|config| config.penalty_orders.clone()),
+                    double_penalty: parsed
+                        .timewiggle
+                        .as_ref()
+                        .map(|config| config.double_penalty),
+                    beta: SurvivalTimewiggleBeta::Single(block.beta.slice(s![start..end]).to_vec()),
+                }
+            });
+        let mut payload = assemble_survival_transformation_payload(
             SurvivalTransformationInputs {
-                formula,
-                data_schema: ds.schema.clone(),
-                fit_result,
-                survival_entry: args.entry,
-                survival_exit: args.exit,
-                survival_event: args.event,
-                survivalspec: effectivespec,
-                cause_count: None,
-                baseline_cfg: fitted_baseline_cfg.clone(),
-                time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
-                ridge_lambda: effective_config.ridge_lambda,
-                survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
+                formula: formula.to_string(),
+                data_schema: dataset.schema.clone(),
+                fit_result: result.fit.clone(),
+                survival_entry: args.entry.clone(),
+                survival_exit: args.exit.clone(),
+                survival_event: args.event.clone(),
+                survivalspec: survivalspec.to_string(),
+                cause_count: (cause_count > 1).then_some(cause_count),
+                baseline_cfg: result.baseline_cfg,
+                time_basis: result.time_basis,
+                ridge_lambda: fit_config.ridge_lambda,
+                survival_likelihood_label: survival_likelihood_modename(result.likelihood_mode)
                     .to_string(),
-                resolved_termspec: frozen_termspec,
-                survival_beta_time: None,
+                resolved_termspec: result.resolvedspec,
+                survival_beta_time: (cause_count > 1).then(|| result.fit.beta.to_vec()),
                 timewiggle,
             },
             SavedModelSourceMetadata {
-                training_headers: ds.headers.clone(),
-                training_feature_ranges: Some(ds.feature_ranges()),
-                offset_column: effective_config.offset_column.clone(),
-                noise_offset_column: effective_config.noise_offset_column.clone(),
+                training_headers: dataset.headers.clone(),
+                training_feature_ranges: Some(dataset.feature_ranges()),
+                offset_column: fit_config.offset_column.clone(),
+                noise_offset_column: fit_config.noise_offset_column.clone(),
             },
         );
-        write_payload_json(&out, payload)?;
+        payload.group_metadata = fit_config.group_metadata.clone();
+        payload.inference_notes = outcome.inference_notes;
+        set_saved_weight_column(&mut payload, fit_config.weight_column.clone());
+        write_payload_json(out, payload)?;
     }
     Ok(())
 }

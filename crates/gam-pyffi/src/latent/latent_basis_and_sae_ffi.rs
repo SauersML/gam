@@ -2091,39 +2091,9 @@ fn row_metric_from_fisher_provenance(
     .map_err(py_value_error)
 }
 
-/// The Python-facing label for a [`MetricProvenance`], shared across every FFI
-/// site that surfaces `metric_provenance` (#980). Centralized so a new
-/// provenance variant is labelled in exactly one place.
-fn metric_provenance_label(
-    provenance: gam::inference::row_metric::MetricProvenance,
-) -> &'static str {
-    use gam::inference::row_metric::MetricProvenance;
-    match provenance {
-        MetricProvenance::Euclidean => "Euclidean",
-        MetricProvenance::OutputFisher { .. } => "OutputFisher",
-        MetricProvenance::OutputFisherDownstream { .. } => "OutputFisherDownstream",
-        MetricProvenance::BehavioralFisher { .. } => "BehavioralFisher",
-        MetricProvenance::WhitenedStructured { .. } => "WhitenedStructured",
-    }
-}
-
-#[derive(Clone, Debug)]
-struct StructuredResidualPassDiagnostic {
-    pass: usize,
-    gamma: f64,
-    factor_rank: usize,
-    log_evidence: f64,
-    factor_energy: f64,
-    diagonal_mean: f64,
-    dispersion_before: f64,
-    dispersion_after: f64,
-    log_lambda_smooth_before: Vec<f64>,
-    log_lambda_smooth_after: Vec<f64>,
-}
-
 fn structured_residual_pass_diagnostics_dict<'py>(
     py: Python<'py>,
-    diagnostics: &[StructuredResidualPassDiagnostic],
+    diagnostics: &[gam::terms::sae::manifold::StructuredResidualPassDiagnostic],
 ) -> PyResult<Bound<'py, PyList>> {
     let out = PyList::empty(py);
     for d in diagnostics {
@@ -2146,69 +2116,22 @@ fn structured_residual_pass_diagnostics_dict<'py>(
     Ok(out)
 }
 
-/// #2021 — ceiling on the number of EXTRA whitened-residual refit passes the
-/// structured-residual outer alternation will run after the iid pass-0 fit. The
-/// caller-supplied `structured_residual_passes` kwarg is clamped to this so a
-/// pathological value cannot spin the alternation unboundedly.
-const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
-
-/// #2021 — fit the structured residual-covariance model on `term`'s
-/// post-dictionary residuals and return it (the driver then materializes the
-/// damped per-row metric via [`StructuredResidualModel::row_metric_damped`],
-/// holding the returned model as the next pass's damping anchor). `Ok(None)`
-/// ONLY when there is no factor subspace to mine (fewer than two output
-/// channels) — the caller then stops the alternation and keeps the current (iid
-/// or prior-pass) metric. A genuine evidence-fit failure is returned as `Err`,
-/// not silently degraded to `Ok(None)`.
-///
-/// Residuals `R = target − term.fitted()`; the activity coordinate the scale law
-/// `c(z)` is smooth in is the per-row total assignment mass — the same
-/// activation-strength summary the structure-search birth harvest mines the
-/// factor subspace in (`gam-sae/src/structure_harvest.rs`).
-fn sae_structured_residual_model(
-    term: &gam::terms::sae::manifold::SaeManifoldTerm,
-    target: ndarray::ArrayView2<'_, f64>,
-) -> PyResult<Option<gam::inference::residual_factor::StructuredResidualModel>> {
-    use gam::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
-    let fitted = term.fitted();
-    let (n, p) = fitted.dim();
-    // Need >= 2 output channels for an off-diagonal factor subspace.
-    if n == 0 || p <= 1 {
-        return Ok(None);
+/// #2071 residual-factor promotion alignment gate. For two independent unit
+/// directions in an r-dimensional subspace, cos²θ follows
+/// Beta(1/2, (r−1)/2); use its 95th percentile as the per-pass false-merge
+/// threshold. Rank one has no informative angle, so the threshold is exactly
+/// one. The fit engine receives this function because the quantile routine lives
+/// above `gam-sae` in the crate graph.
+fn sae_promotion_align_min(factor_rank: usize) -> f64 {
+    if factor_rank <= 1 {
+        return 1.0;
     }
-    if target.dim() != (n, p) {
-        return Err(py_value_error(format!(
-            "sae_structured_residual_model: target must be ({n}, {p}); got {:?}",
-            target.dim()
-        )));
-    }
-    // R = target − fitted (post-dictionary residual). Bind `fitted` first so the
-    // owned temporary outlives the in-place subtraction.
-    let mut residuals = target.to_owned();
-    residuals -= &fitted;
-    // Activity = per-row total assignment mass (mirrors structure_harvest.rs and
-    // the fit tail's own assignment read).
-    let assignments = term.assignment.assignments();
-    let activity: ndarray::Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    // Let the evidence ladder pick the rank up to p-1 (`fit` re-caps to p-1 and
-    // scores r = 0..=cap, keeping the penalized-evidence maximizer).
-    let max_factor_rank = p.saturating_sub(1);
-    match StructuredResidualModel::fit(ResidualFactorInput {
-        residuals: residuals.view(),
-        activity: activity.view(),
-        max_factor_rank,
-    }) {
-        Ok(m) => Ok(Some(m)),
-        // Propagate a genuine fit failure instead of swallowing it (#2070/#2021).
-        // The only benign "nothing to mine" case — fewer than two output channels
-        // — is already handled by the early `Ok(None)` above, and the evidence
-        // ladder always scores at least rank 0, so every error reaching here is a
-        // real breakdown (non-finite residuals/activity, a dimension mismatch, or
-        // an inner-alternation numerical failure). Accepting-on-any-error would
-        // silently degrade to prior-pass geometry and hide the failure; surface it.
-        Err(e) => Err(py_value_error(format!(
-            "sae_structured_residual_model: structured residual-covariance fit failed: {e}"
-        ))),
+    let rank = factor_rank as f64;
+    let cos2 = gam::inference::probability::beta_quantile(0.95, 0.5, (rank - 1.0) / 2.0);
+    if cos2.is_finite() {
+        cos2.sqrt().clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
@@ -3382,7 +3305,7 @@ fn sae_manifold_fit_inner<'py>(
         }
         let metric =
             row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
-        let label = metric_provenance_label(metric.provenance());
+        let label = gam::terms::sae::manifold::metric_provenance_label(metric.provenance());
         base_term.set_row_metric(metric).map_err(py_value_error)?;
         label
     } else {
@@ -3457,8 +3380,6 @@ fn sae_manifold_fit_inner<'py>(
     }
     .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
     .map_err(py_value_error)?;
-    let init_rho_flat = init_rho.to_flat();
-    let n_params = init_rho_flat.len();
     // Whether an isometry gauge penalty is installed on this fit. Read here,
     // before the registry is moved into the objective, and threaded into the
     // residual-gauge certificate below: an inactive isometry pin escalates the
@@ -3478,488 +3399,62 @@ fn sae_manifold_fit_inner<'py>(
     base_term
         .validate_heterogeneous_atom_compatibility(Some(&registry), native_ard_enabled)
         .map_err(py_value_error)?;
-    // Route every problem size through the full-batch objective on the owned
-    // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
-    // basis, `(N × M_total × d)` jacobian, and `(N × K)` logit buffers in full,
-    // so the outer-cascade entry point owns the full target verbatim.
-    // `sae_streaming_plan` is exposed separately as a standalone diagnostic
-    // pyfunction.
-    let mut objective = gam::terms::sae::manifold::SaeManifoldOuterObjective::new(
+    // The python boundary owns seed construction and validation; every fit,
+    // structured-residual pass, evidence-guarded structure move, certificate,
+    // diagnostic, and top-k projection after this point belongs to gam-sae's
+    // single typed orchestration entry (#2236).
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let request = gam::terms::sae::manifold::SaeFitRequest {
         base_term,
-        z_view.to_owned(),
-        Some(registry),
-        init_rho,
+        target: z_view.to_owned(),
+        registry,
+        initial_rho: init_rho,
         max_iter,
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-    );
-    // #1026 — "normal SAE" entry: a single seed (the PCA decoder-projection
-    // seed already installed on the term) with NO ρ-multistart. The GAM default
-    // generates ~12 ρ-candidates and screens them (each a partial inner fit) plus
-    // a continuation pre-warm — empirically that entry machinery alone times out
-    // even a well-posed K=8 fit (the 13-seed cascade burned the whole budget
-    // before the outer loop made progress). A dictionary fit does not need
-    // multistart insurance: the PCA projection lands each row in the decisive
-    // basin and EFS refines the per-atom penalties from there. seed_budget=1 +
-    // max_seeds=1 collapses the cascade to the single initial ρ.
-    // #2138 — run the multi-minute joint solve on the worker with the GIL
-    // released + signal polling, so a slow/hung fit is interruptible. `objective`
-    // is fully owned (no lifetime), so it moves in and is handed back out. The
-    // shared cancel flag lets an interrupt cooperatively stop the abandoned worker
-    // (the objective bails out of its next outer eval).
-    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
-    let (mut objective, run_result) =
-        run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
-            let run_result = if run_outer_rho_search {
-                let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
-                    .with_initial_rho(init_rho_flat.clone())
-                    .with_seed_config(gam::solver::seeding::SeedConfig {
-                        max_seeds: 1,
-                        seed_budget: 1,
-                        ..Default::default()
-                    });
-                problem.run(&mut objective, "SAE manifold").map(|_| ())
-            } else {
-                objective
-                    .fit_at_fixed_rho(init_rho_flat.view())
-                    .map_err(gam::model_types::EstimationError::RemlOptimizationFailed)
-            };
-            (objective, run_result)
-        })?;
-    run_result.map_err(estimation_error_to_pyerr)?;
-    // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
-    // ambient bands, read off the converged joint-Hessian Schur factor at the
-    // settled ρ. Computed before `into_fitted` consumes the objective; reflects
-    // the fitted (smooth) decoder shape, independent of any top-k assignment
-    // gate applied below.
-    let mut shape_uncertainty = objective
-        .decoder_shape_uncertainty()
-        .map_err(py_value_error)?;
-    let fitted_result = objective.into_fitted();
-    let mut finalization_invalidated_shape_uncertainty =
-        fitted_result.invalidates_pre_final_shape_uncertainty();
-    // #2235 — the outer termination verdict + ledger, surfaced on the payload.
-    let outer_termination = fitted_result.termination;
-    let mut term = fitted_result.term;
-    let mut rho = fitted_result.rho;
-    let mut loss = fitted_result.loss;
-
-    // #2021 (EXPERIMENT) — structured-residual OUTER ALTERNATION.
-    // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
-    // `structured_residual_passes > 0` AND no explicit metric was installed at
-    // pass 0 (a WP-D `OutputFisher` gauge lives in the SAME single metric slot
-    // and must not be clobbered), run N extra passes: fit the whitened
-    // residual-covariance model on the current fitted residuals, materialize the
-    // Σ-DAMPED per-row metric, install it — `loss_scaled` and
-    // `assemble_arrow_schur` auto-route on `metric.whitens_likelihood()` (the
-    // #974 seam, so no construction.rs change is needed) — and refit
-    // warm-started from the settled ρ. The returned provenance / shape bands /
-    // loss are refreshed from the final pass. A `None` model (no factor
-    // subspace, or a degenerate residual fit) stops the alternation early,
-    // degrading to the pass-0 iid fit.
-    //
-    // Covariance-domain damping (residual-fix's `row_metric_damped`):
-    // Σ_t = (1−γ)·Σ_prev + γ·Σ̂_t, with Σ_prev = the previous pass's fitted model
-    // (or I on the first structured pass). A small, increasing γ schedule
-    // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
-    // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
-    // builds a genuine WhitenedStructured blend).
-    let structured_passes = structured_residual_passes.min(STRUCTURED_RESIDUAL_PASSES_MAX);
-    let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
-    if structured_passes > 0 && metric_provenance == "Euclidean" {
-        let mut prev_model: Option<gam::inference::residual_factor::StructuredResidualModel> = None;
-        // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
-        // directions that PERSIST across passes (producer
-        // `StructuredResidualModel::promotion_candidates`: energy above the
-        // idiosyncratic-noise floor AND |cos|-alignment with the previous pass's
-        // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
-        // pass refits with the discovered structure. A lineage that skips a pass
-        // loses its dwell; at most one birth per pass, and only when a later pass
-        // remains to refit the born atom, so K grows ≤ structured_passes and no
-        // born atom is left unrefit inside the alternation.
-        // #2071 — the three promotion gates, each derived or priced (not a silent
-        // literal). A lineage is promoted to a born atom only when its residual-
-        // factor direction is (i) energetic enough, (ii) persists in ORIENTATION
-        // across passes, and (iii) has dwelt long enough to be more than a
-        // one-pass fluke.
-        //
-        // PROMOTION_ENERGY_FLOOR_MULT — DERIVED (identity). The energy gate is
-        // "above the idiosyncratic-noise floor"; the floor is already the
-        // data-estimated detection threshold, so the canonical multiplier is 1.0.
-        // Any value ≠ 1 arbitrarily rescales a derived floor (>1 rejects real
-        // structure sitting just above the noise; <1 promotes noise-floor
-        // directions). Kept as a named identity so the "no inflation" choice is
-        // explicit rather than buried.
-        const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
-        // PROMOTION_NURSERY_MIN_PASSES — DERIVED (minimal persistence). A single
-        // pass carries no persistence evidence; two is the smallest dwell at which
-        // a direction has been re-observed across a refit, i.e. the minimal count
-        // that distinguishes a repeated structural signal from a one-pass artifact.
-        // Larger only delays true structure by whole passes (K grows ≤
-        // structured_passes, so a 3-pass budget with min-dwell 3 could never
-        // promote); 2 is the floor of the concept.
-        const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
-        // PROMOTION_ALIGN_MIN — DERIVED (#2071), no longer the fixed `0.9`. The
-        // |cos| a lineage's Λ direction must hold with the previous pass's to
-        // count as the SAME structure is the (1 − α) quantile of the random-
-        // alignment null keyed to the residual signal-subspace dimension `r`
-        // (`model.factor_rank()`): for two independent unit directions in an
-        // r-dim subspace, `cos²θ ~ Beta(½, (r−1)/2)`, so the α-level threshold is
-        //   align_min(r) = sqrt( Beta⁻¹_{1−α}(½, (r−1)/2) ),
-        // i.e. the |cos| that phase-independent directions exceed only with
-        // probability α (a false-merge rate), computed per pass from the current
-        // factor rank via [`promotion_align_min`]. This self-scales: at small r
-        // (a genuinely few-dim residual) random directions align strongly, so the
-        // bar is near 1; as r grows the bar drops toward the `sqrt(2/(π·r))` null
-        // mean. `α` is the shared screening level [`PROMOTION_ALIGN_ALPHA`].
-        //
-        // The same conventional `0.05` false-birth level the structure battery
-        // uses; here it is the per-pass false-MERGE rate of two independent
-        // residual-factor directions.
-        const PROMOTION_ALIGN_ALPHA: f64 = 0.05;
-        // align_min(r) = sqrt(Beta⁻¹_{1−α}(½, (r−1)/2)); r = residual factor rank.
-        // r ≤ 1 is degenerate (a 1-D subspace has a single direction up to sign,
-        // so any two align at |cos| = 1): fall back to r = 2, the smallest rank
-        // at which alignment carries information. Non-finite/NaN quantiles (only
-        // possible from a degenerate shape) clamp the gate open-safe at 1.0 so a
-        // bad estimate never promotes on a spurious near-collinear match.
-        fn promotion_align_min(factor_rank: usize) -> f64 {
-            let r = factor_rank.max(2) as f64;
-            let cos2 = gam::inference::probability::beta_quantile(
-                1.0 - PROMOTION_ALIGN_ALPHA,
-                0.5,
-                (r - 1.0) / 2.0,
-            );
-            if cos2.is_finite() {
-                cos2.sqrt().clamp(0.0, 1.0)
-            } else {
-                1.0
-            }
-        }
-        // `promote_from_residual` is the typed pyfunction kwarg (default false);
-        // opt-in, default-off ⇒ whitening runs without growth unless set.
-        let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
-        for pass in 0..structured_passes {
-            let Some(model) = sae_structured_residual_model(&term, z_view.view())? else {
-                break;
-            };
-            let gamma = (pass as f64 + 1.0) / (structured_passes as f64 + 1.0);
-            let metric = model
-                .row_metric_damped(n_obs, gamma, prev_model.as_ref())
-                .map_err(py_value_error)?;
-            let installed_label = metric_provenance_label(metric.provenance());
-            let factor_energy = model.factor().iter().map(|v| v * v).sum::<f64>();
-            let diagonal_mean = model.diagonal().iter().copied().sum::<f64>() / p_out as f64;
-            let dispersion_before = shape_uncertainty.dispersion;
-            let log_lambda_smooth_before = rho.log_lambda_smooth.clone();
-            term.set_row_metric(metric).map_err(py_value_error)?;
-            // Rebuild the analytic-penalty registry (cheap; `latent_payload` is
-            // still owned) and warm-start ρ from the settled fit.
-            let registry = build_analytic_penalty_registry_from_json(
-                Some(&latent_payload),
-                analytic_penalties.as_ref(),
-            )
-            .map_err(py_value_error)?;
-            let warm_flat = rho.to_flat();
-            let mut objective = gam::terms::sae::manifold::SaeManifoldOuterObjective::new(
-                term,
-                z_view.to_owned(),
-                Some(registry),
-                rho,
-                max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            );
-            // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
-            // problem from the CURRENT warm vector, not the pass-0 `n_params`
-            // (identical to `n_params` when no birth has occurred).
-            let problem = gam::solver::rho_optimizer::OuterProblem::new(warm_flat.len())
-                .with_initial_rho(warm_flat)
-                .with_seed_config(gam::solver::seeding::SeedConfig {
-                    max_seeds: 1,
-                    seed_budget: 1,
-                    ..Default::default()
-                });
-            // #2138 — same GIL-released, interruptible + cancellable worker per pass.
-            let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            objective.set_cancel_flag(std::sync::Arc::clone(&cancel_flag));
-            let (mut objective, run_result) =
-                run_sae_fit_interruptible(py, "gam-sae-fit-structured", &cancel_flag, move || {
-                    let run_result = problem
-                        .run(&mut objective, "SAE manifold (structured)")
-                        .map(|_| ());
-                    (objective, run_result)
-                })?;
-            run_result.map_err(estimation_error_to_pyerr)?;
-            // Refresh shape bands + fitted state from the FINAL pass objective
-            // (decoder_shape_uncertainty must be read before `into_fitted`).
-            shape_uncertainty = objective
-                .decoder_shape_uncertainty()
-                .map_err(py_value_error)?;
-            let fitted_result = objective.into_fitted();
-            finalization_invalidated_shape_uncertainty =
-                fitted_result.invalidates_pre_final_shape_uncertainty();
-            term = fitted_result.term;
-            rho = fitted_result.rho;
-            loss = fitted_result.loss;
-            structured_residual_diagnostics.push(StructuredResidualPassDiagnostic {
-                pass: pass + 1,
-                gamma,
-                factor_rank: model.factor_rank(),
-                log_evidence: model.log_evidence(),
-                factor_energy,
-                diagonal_mean,
-                dispersion_before,
-                dispersion_after: shape_uncertainty.dispersion,
-                log_lambda_smooth_before,
-                log_lambda_smooth_after: rho.log_lambda_smooth.clone(),
-            });
-            // Report the geometry actually used by the returned fit.
-            metric_provenance = installed_label;
-            // #2021 promotion: fold this pass's persisted factor directions into
-            // the nursery, then promote (birth) at most one matured lineage so the
-            // NEXT pass refits with it. Runs only when the opt-in lever is set
-            // (default off) AND from pass 1 on (needs a `prev`). Gating via a
-            // `None` prev keeps the block un-indented and inert when off.
-            let prev_for_promotion = if promote_from_residual {
-                prev_model.as_ref()
-            } else {
-                None
-            };
-            if let Some(prev) = prev_for_promotion {
-                // Per-pass derived alignment threshold from the current residual
-                // factor rank (#2071); used identically by the producer-side
-                // candidate gate and the nursery lineage-dedup below.
-                let align_min = promotion_align_min(model.factor_rank());
-                let cands = model
-                    .promotion_candidates(Some(prev), align_min, PROMOTION_ENERGY_FLOOR_MULT)
-                    .map_err(py_value_error)?;
-                let mut seen = vec![false; nursery.len()];
-                for cand in &cands {
-                    let hit = nursery
-                        .iter()
-                        .position(|(d, _)| cand.direction.dot(d).abs() >= align_min);
-                    match hit {
-                        Some(i) => {
-                            nursery[i].0 = cand.direction.clone();
-                            nursery[i].1 += 1;
-                            seen[i] = true;
-                        }
-                        None => {
-                            nursery.push((cand.direction.clone(), 1));
-                            seen.push(true);
-                        }
-                    }
-                }
-                // A lineage that did not recur this pass loses its dwell.
-                let mut keep = seen.into_iter();
-                nursery.retain(|_| keep.next().unwrap_or(false));
-                // Promote at most one matured lineage, and only if a later pass
-                // remains to refit the born atom. Collect the direction BEFORE
-                // mutating `term` to avoid overlapping borrows.
-                let matured = if pass + 1 < structured_passes {
-                    nursery
-                        .iter()
-                        .find(|(_, count)| *count >= PROMOTION_NURSERY_MIN_PASSES)
-                        .map(|(dir, _)| dir.clone())
-                } else {
-                    None
-                };
-                if let Some(dir) = matured {
-                    // Born-atom decoder: the unit direction on atom-0's constant
-                    // (row-0) basis row, shape (m, p) per `born_atom`'s contract.
-                    let m = term.atoms[0].basis_size();
-                    let mut decoder = Array2::<f64>::zeros((m, p_out));
-                    for out in 0..p_out {
-                        decoder[[0, out]] = dir[out];
-                    }
-                    let (grown_term, grown_rho) =
-                        gam::terms::sae::structure_harvest::apply_structure_move(
-                            &term,
-                            &rho,
-                            &gam::solver::structure_search::StructureMove::Birth { candidate: 0 },
-                            std::slice::from_ref(&decoder),
-                        )
-                        .map_err(py_value_error)?;
-                    term = grown_term;
-                    rho = grown_rho;
-                    // Drop the promoted lineage so it is not re-promoted; the next
-                    // pass rebuilds the objective from the grown `term`/`rho` and
-                    // `warm_flat.len()` picks up the enlarged ρ automatically.
-                    nursery.retain(|(d, _)| d.dot(&dir).abs() < align_min);
-                }
-            }
-            // Carry this pass's model forward as the next pass's damping anchor.
-            prev_model = Some(model);
-        }
-    }
-    {
-        let assignments = term.assignment.assignments();
-        let fitted = term.fitted();
-        term.record_fit_data_collapse_if_needed(
-            z_view.view(),
-            fitted.view(),
-            assignments.view(),
-            max_iter,
-        )
-        .map_err(py_value_error)?;
-    }
-
-    // #977 / #997 — evidence-guarded structure search around the production fit:
-    // the genuine dictionary learner. Harvest deaths (diverged ARD ∪ terminal
-    // collapse), fusions (co-activation), fission audits (absorption asymmetry),
-    // and BIRTHS (whitened residual-factor subspace), then run the e-gated move
-    // engine over a held-out estimation/evaluation row split. Every move — and in
-    // particular every birth/fission that GROWS K — must pass the #984 held-out
-    // e-value gate ([`run_atom_birth_gate`], invoked inside [`search`] for births,
-    // fissions, and fusions) before it lands; deaths demote-never-reject. So K is
-    // DISCOVERED from the data (grown by certified births, shrunk by demoted
-    // deaths / fused atoms) rather than pinned at the user's input K, and the
-    // returned `atoms`/`logits`/`assignments`/`atom_plans` reflect the discovered
-    // K (the variable-K payload boundary below threads the post-search shape
-    // through `from_payload`). The SearchLedger (+ the joint fit's collapse
-    // events) is serialized onto the payload as the honesty surface — never a
-    // silent restructure. Conservative by construction: only evidence-earning
-    // atoms are born; the gates rarely certify, so the common all-contested case
-    // returns the fit unchanged.
-    //
-    // Move budgets are magic-by-default — derived from the fitted dictionary, not
-    // surfaced as user flags. The per-round breadth scales with the current atom
-    // count so a small dictionary proposes few candidates and a large one a few
-    // more, while `max_moves` (below) caps how many of those land per round and
-    // `max_rounds` bounds the harvest→gate→refit loop. A genuine residual factor
-    // earns its atom across rounds; a spurious one fails the held-out gate and is
-    // recorded contested.
-    let mut structure_ledger = gam::inference::structure_evidence::StructureLedger::new();
-    // #1230 — whether structure search actually changed the model (a landed
-    // birth/fission/fusion or a demoted death). When it did, the pre-search
-    // joint-Hessian shape bands assembled above are stale and must be recomputed
-    // from the final post-search per-atom inner fits (below).
-    let mut structure_changed = false;
-    let structure_search_json = 'structure: {
-        if !run_structure_search {
-            break 'structure None;
-        }
-        // #1026 — structure search is a post-fit DISCOVERY pass: each round refits
-        // the full dictionary over ALL N rows, so its cost is ~(moves·rounds)
-        // full-dictionary refits. At large user-fixed K it is intractable (dozens
-        // of refits) and is refinement, not discovery, of a dictionary the caller
-        // already sized. Scale rounds down with K and SKIP entirely past a ceiling,
-        // so a fixed-K performance run returns the fitted dictionary without paying
-        // the search. Small K (the discovery regime) keeps the full 3-round harvest.
-        let structure_max_rounds = {
-            let k_now = term.k_atoms().max(1);
-            if k_now <= 2 {
-                3
-            } else if k_now <= 8 {
-                2
-            } else if k_now <= 64 {
-                1
-            } else {
-                0
-            }
-        };
-        if structure_max_rounds == 0 {
-            break 'structure None;
-        }
-        // Per-round harvest breadth derived from the fitted K (magic-by-default):
-        // propose at most a handful of each move kind, scaled gently with the
-        // dictionary size, with a small fixed floor so even a K=1 fit can grow
-        // (the #1117 rank-revealing basis makes K>1 fits converge, so births no
-        // longer hit the old K>1 wall). The e-gate, not these caps, decides what
-        // lands; the caps only keep the proposal stream finite.
-        let k_now = term.k_atoms().max(1);
-        let births_per_round = (k_now + 1).min(4);
-        let fissions_per_round = k_now.min(4);
-        let harvest_params = gam::terms::sae::structure_harvest::HarvestParams {
-            max_fusions: 4,
-            max_fissions: fissions_per_round,
-            max_births: births_per_round,
-        };
-        // The per-candidate scoring refit is capped well below the outer fit's
-        // `max_iter`: a structural move yields a WARM child (the parent's
-        // converged dictionary with one atom restructured), so only the touched
-        // atom must re-equilibrate before the held-out evidence gate can rank the
-        // candidate. The dominant cost of the search is ≈ (moves · rounds)
-        // full-dictionary refits over all N rows; capping the SCORING budget cuts
-        // it several-fold. Each round's accepted winner is re-refit at the full
-        // `max_iter` before adoption, so the returned dictionary still converges
-        // to the full-iter inner optimum — only the gate's ranking reads the
-        // capped score (#1026, verified move-equivalent on a tractable proxy).
-        const STRUCTURE_SCORING_INNER_MAX_ITER: usize = 8;
-        let refit_params = gam::terms::sae::structure_harvest::ProductionRefitParams {
-            inner_max_iter: max_iter,
-            scoring_inner_max_iter: STRUCTURE_SCORING_INNER_MAX_ITER.min(max_iter),
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        };
-        // Moves that may LAND this round (accepted births/fissions/fusions +
-        // demoted deaths); remaining proposals are recorded `Deferred` and
-        // replayed next round. Sized to the current dictionary plus headroom for
-        // the new birth/fission proposals so a single round can both prune a dead
-        // atom and grow a genuinely-supported one. Magic-by-default — a function
-        // of the fitted K, never a user flag.
-        let max_moves = k_now + births_per_round + fissions_per_round;
-        let budget = gam::solver::structure_search::MoveBudget {
-            max_moves,
-            alpha: 0.05,
-        };
-        let config = gam::terms::sae::structure_harvest::RoundDriverConfig {
-            n_shards: 4,
-            budget,
-            max_rounds: structure_max_rounds,
-            harvest_params,
-            // Curl/flatten structure moves stay off in the production FFI path
-            // until the killer-demo gate graduates them (INTEGRATION_PLAN §8).
-            curl: None,
-        };
-        match gam::terms::sae::structure_harvest::run_production_structure_search(
-            term,
-            rho,
-            z_view.view(),
-            config,
-            refit_params,
-            &mut structure_ledger,
-        ) {
-            Ok(result) => {
-                structure_changed = result.structure_changed();
-                term = result.term;
-                rho = result.rho;
-                gam::terms::sae::structure_harvest::rounds_to_json(&result.rounds).ok()
-            }
-            Err(e) => {
-                // Structure search is a post-fit audit pass; a failure must not
-                // silently corrupt the fit — surface it loudly.
-                return Err(py_value_error(format!(
-                    "structure search around SAE fit failed: {e}"
-                )));
-            }
-        }
+        assignment_kind: assignment_kind.clone(),
+        alpha,
+        top_k,
+        isometry_pin_active,
+        metric_provenance,
+        structured_residual_passes,
+        promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
+        align_min_from_rank: sae_promotion_align_min,
+        cancel: Some(std::sync::Arc::clone(&cancel_flag)),
     };
+    let report = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
+        gam::terms::sae::manifold::run_sae_manifold_fit(request)
+    })?
+    .map_err(py_value_error)?;
+    let gam::terms::sae::manifold::SaeFitReport {
+        term,
+        rho,
+        loss,
+        post_topk_loss,
+        assignments,
+        fitted,
+        active_mask,
+        reconstruction_r2,
+        outer_termination,
+        shape_uncertainty,
+        metric_provenance,
+        structured_residual_diagnostics,
+        trust_diagnostics,
+        fit_diagnostics,
+        structure_search_json,
+        structure_certificate_json,
+        top_k_will_project,
+        pre_topk_assignments,
+        pre_topk_fitted,
+        reported_log_alpha,
+    } = report;
 
-    // Clear any per-row estimation mask the structure-search refit left on the
-    // adopted term so the returned `fitted` / dispersion / diagnostics are
-    // computed over ALL rows (the mask is an internal split device, not a
-    // property of the returned fit).
-    term.clear_row_loss_weights();
-
-    // #977 — VARIABLE-K boundary. The structure search above may have GROWN K
-    // (certified births / fissions) or shrunk it (demoted deaths fold to ~0
-    // routing — they keep their index but carry no mass). The returned payload
-    // must reflect the DISCOVERED dictionary, not the user's input K, so every
-    // downstream per-atom field is re-derived FROM THE FITTED TERM here. The
-    // input `k_atoms` / `atom_basis` / `atom_dim` described the seed dictionary;
-    // they are stale the moment a birth lands. `term.k_atoms()` is the source of
-    // truth from this point on, and the per-atom basis-kind / active-dim vectors
-    // are read off each fitted atom (born atoms inherit a template basis at
-    // birth; their topology is then adjudicated by the post-fit curved-vs-linear
-    // hybrid-split pass — see `set_atom_inner_fits` below — and reported on the
-    // payload's `hybrid_split` key, so the dictionary is genuinely heterogeneous
-    // rather than all-circle).
+    // #977 variable-K boundary: structure search may grow or shrink the seed
+    // dictionary, so every per-atom payload vector is re-derived from the
+    // returned term rather than the caller's now-stale seed metadata.
     let k_atoms = term.k_atoms();
     let atom_basis: Vec<String> = term
         .atoms
@@ -3967,265 +3462,6 @@ fn sae_manifold_fit_inner<'py>(
         .map(|atom| sae_atom_basis_kind_name(&atom.basis_kind))
         .collect();
     let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim).collect();
-
-    term.set_certificate_dispersion(shape_uncertainty.dispersion)
-        .map_err(py_value_error)?;
-
-    // #1097 / #1103: harvest each atom's fixed inner-decoder-smooth snapshot
-    // (design, derivative design, penalized inner Hessian, per-row Gaussian
-    // scores, roughness Gram, peak/mode design rows) at the settled state, so
-    // the diagnostics report can produce per-atom Riesz-debiased functionals and
-    // the split-LRT smooth-structure e-value. Needs the reconstruction target `Z` (dropped
-    // from the objective at fit end) and the fitted dispersion, both available
-    // here. A degenerate atom (no active rows / non-SPD inner Hessian) yields a
-    // `None` slot inside; a structural shape inconsistency surfaces loudly.
-    term.set_atom_inner_fits(z_view.view(), &rho, shape_uncertainty.dispersion)
-        .map_err(py_value_error)?;
-
-    // #977 — COMPLETE the per-atom shape band for any structure-search-BORN atom
-    // (index ≥ the seed K the Schur factor was assembled at). `shape_uncertainty`
-    // above was read off the PRE-search joint-Hessian Schur factor, so a born atom
-    // has no Schur block and would be reported with NO uncertainty band — a silent
-    // gap. This fills that atom's band from its OWN fitted penalized inner Hessian
-    // `H_k = Φ_kᵀ W_k Φ_k + S̃_k` (harvested by `set_atom_inner_fits` for every
-    // atom): the principled per-atom Laplace band `Var_c(t) = φ · Φ_k(t)ᵀ H_k⁻¹
-    // Φ_k(t)`. Seed atoms keep their exact joint-Hessian band (untouched); only
-    // missing bands are filled, and a degenerate born atom (no active rows /
-    // non-SPD inner Hessian) keeps an honest NaN band rather than a fabricated one.
-    // After this, NO post-search atom is reported without an uncertainty band.
-    // #1230 — if structure search changed the model (a landed birth/fission/
-    // fusion or a demoted death), the warm refit re-converged the WHOLE
-    // dictionary at a new ρ, so the SEED atoms' pre-search joint-Hessian bands
-    // (assembled before `into_fitted`/search) are stale. Invalidate every band so
-    // the completion pass below recomputes ALL of them — seed and born — from
-    // each atom's OWN final penalized inner Hessian harvested at the settled
-    // post-search state by `set_atom_inner_fits` above. When the structure did
-    // NOT change, term/rho are byte-for-byte the pre-search fit and the exact
-    // joint-Hessian seed bands are kept (higher quality than the per-atom Laplace
-    // approximation).
-    if structure_changed || finalization_invalidated_shape_uncertainty {
-        // The pre-search `shape_uncertainty` was read off the JOINT-Hessian Schur
-        // factor of the SEED dictionary at the pre-search ρ. A structure move (K
-        // grew / the whole dictionary re-converged at a new ρ) or a finalization
-        // fallback (settled-basin swap / chart canonicalization) makes those bands
-        // stale. Rebuild the JOINT inverse-Hessian bands from the FINAL term + ρ so
-        // the returned band is the documented joint decoder covariance — carrying
-        // the cross-atom covariance and decoder-coordinate Schur couplings, with a
-        // genuine per-output-channel SD — for EVERY atom, seed and born. This
-        // replaces the former per-atom-inner-Hessian recompute, which dropped those
-        // couplings and reported one identical SD across all channels.
-        let joint_registry = build_analytic_penalty_registry_from_json(
-            Some(&latent_payload),
-            analytic_penalties.as_ref(),
-        )
-        .map_err(py_value_error)?;
-        // Snapshot the fitted term: the optional joint recompute mutates `term`
-        // while re-solving, so a recoverable refusal must not leave the actual
-        // fitted model perturbed. Restore it before degrading to per-atom bands.
-        let saved_term_for_shape_recompute = term.clone();
-        match term.recompute_joint_shape_uncertainty(
-            z_view.view(),
-            &rho,
-            Some(&joint_registry),
-            max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        ) {
-            Ok(joint) => {
-                shape_uncertainty = joint;
-                // The certificate dispersion was seeded from the (now stale)
-                // pre-search φ̂; refresh it to the joint recompute's final value.
-                term.set_certificate_dispersion(shape_uncertainty.dispersion)
-                    .map_err(py_value_error)?;
-            }
-            Err(e) => {
-                term = saved_term_for_shape_recompute;
-                // The joint factor could not be reformed at the final state (a
-                // non-PD post-search Hessian / an unadmitted dense Schur). Fall
-                // back to the per-atom Laplace completion: invalidate the stale
-                // joint bands so `complete_born_atom_shape_bands` refills each from
-                // its OWN penalized inner Hessian. That band is a per-atom MARGINAL
-                // (documented as such) — honest, never fabricated — not the joint
-                // covariance; the log line records the degradation.
-                log::warn!(
-                    "[shape-uncertainty] joint band recompute after structure/finalization \
-                     change failed ({e}); falling back to per-atom Laplace bands"
-                );
-                shape_uncertainty.invalidate_bands_for_recompute();
-            }
-        }
-    }
-    // Backstop: fill any atom the joint factor left unidentified (all-NaN) — a
-    // structure-search-born atom the pre-search Schur never covered, or a
-    // degenerate joint block — from its own inner Hessian. A no-op after a
-    // successful joint recompute (every covered atom already has a finite band).
-    term.complete_born_atom_shape_bands(&mut shape_uncertainty)
-        .map_err(py_value_error)?;
-
-    // Additive post-fit diagnostics (#980): the two-score per-atom lens
-    // (presence / behavioral coupling / discrepancy) and the residual-gauge
-    // certificate. Both read the fitted term + its single per-row metric; under a
-    // Euclidean / no-harvest provenance the lens coupling is `None` and the gauge
-    // is certified under Euclidean provenance — never an error, never flag-gated.
-    // Per-atom ARD variances (∝ exp(−log_precision); equality-preserving for the
-    // certificate's equal-ARD-rotation detection) are threaded in when native ARD
-    // was enabled, else `None` per atom.
-    let ard_variances: Vec<Option<Array1<f64>>> = rho
-        .log_ard
-        .iter()
-        .map(|log_prec| {
-            if log_prec.is_empty() {
-                None
-            } else {
-                Some(log_prec.mapv(|lp| (-lp).exp()))
-            }
-        })
-        .collect();
-    let mut assignments = term.assignment.assignments();
-    let mut fitted = term.fitted();
-    // #1232 — when a hard top-k gate is applied, the smooth optimization model
-    // (full assignments, fitted, penalized loss) differs from the projected
-    // inference model returned on the payload. Capture the optimization-era state
-    // before projection so the payload can expose both layers honestly.
-    let top_k_will_project = top_k.is_some_and(|k_top| k_top < k_atoms);
-    let pre_topk_assignments = if top_k_will_project {
-        Some(assignments.clone())
-    } else {
-        None
-    };
-    let pre_topk_fitted = if top_k_will_project {
-        Some(fitted.clone())
-    } else {
-        None
-    };
-    // Apply hard top-k projection per row, then recompute `fitted` from the
-    // projected assignments so the returned `assignments` and `fitted` stay
-    // mutually consistent (i.e. `fitted == sum_k a_k * decoder_k @ basis_k`).
-    // Smooth softmax (or IBP/JumpReLU) drives optimisation; the hard top-k
-    // gate is applied at inference time. For softmax mode the kept entries
-    // are renormalised so the resulting per-row distribution sums to 1; for
-    // the other modes the kept entries retain their unnormalised values
-    // (those modes' assignments are not probability distributions).
-    //
-    // #1232 — the penalized-loss score the payload reports at top level must
-    // describe the SAME (projected) model as the top-level
-    // `assignments`/`fitted`/`diagnostics`. The smooth-optimization `loss` from
-    // `into_fitted` is the score of the UNPROJECTED model; after a hard top-k
-    // gate, only its data-fit term changes (the assignment-sparsity / smoothness
-    // / ARD penalties are decoder/ρ properties the gate does not touch). So we
-    // recompute the data-fit on the projected reconstruction and swap it into a
-    // `post_topk_loss`; the unprojected `loss` is surfaced under `pre_topk`.
-    let mut post_topk_loss: Option<gam::terms::sae::manifold::SaeManifoldLoss> = None;
-    if let Some(k_top) = top_k {
-        if k_top < k_atoms {
-            let n_obs_local = z_view.nrows();
-            let renormalise = assignment_kind == "softmax";
-            for row in 0..n_obs_local {
-                // Collect (value, atom_idx) pairs; pick the indices of the
-                // largest k_top values. Ties broken by lower atom index.
-                //
-                // #1409: select the top-k_top via an O(K) PARTIAL selection
-                // (`select_nth_unstable_by`) instead of a full O(K log K) sort —
-                // only the kept prefix matters, and the per-token projection runs
-                // once per row at large K. The comparator (value desc, then atom
-                // index asc) is the SAME total order the sort used, so the
-                // partition's first `k_top` elements are exactly the sorted
-                // top-k_top set (identical `keep` mask, including tie-breaking).
-                let mut paired: Vec<(f64, usize)> = (0..k_atoms)
-                    .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
-                    .collect();
-                let cmp = |a: &(f64, usize), b: &(f64, usize)| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.1.cmp(&b.1))
-                };
-                if k_top < k_atoms {
-                    paired.select_nth_unstable_by(k_top - 1, cmp);
-                }
-                let mut keep = vec![false; k_atoms];
-                for &(_, atom_idx) in paired.iter().take(k_top) {
-                    keep[atom_idx] = true;
-                }
-                if renormalise {
-                    let mut kept_sum = 0.0_f64;
-                    for atom_idx in 0..k_atoms {
-                        if keep[atom_idx] {
-                            kept_sum += assignments[[row, atom_idx]];
-                        }
-                    }
-                    if kept_sum > 0.0 {
-                        for atom_idx in 0..k_atoms {
-                            assignments[[row, atom_idx]] = if keep[atom_idx] {
-                                assignments[[row, atom_idx]] / kept_sum
-                            } else {
-                                0.0
-                            };
-                        }
-                    } else {
-                        // Pathological case: all kept entries are zero. Fall
-                        // back to uniform mass over the kept indices so the
-                        // contract `assignments.sum(axis=1) == 1` still holds.
-                        let inv = 1.0 / (k_top as f64);
-                        for atom_idx in 0..k_atoms {
-                            assignments[[row, atom_idx]] = if keep[atom_idx] { inv } else { 0.0 };
-                        }
-                    }
-                } else {
-                    for atom_idx in 0..k_atoms {
-                        if !keep[atom_idx] {
-                            assignments[[row, atom_idx]] = 0.0;
-                        }
-                    }
-                }
-            }
-            // Recompute `fitted` from the projected assignments through the
-            // SHARED collapse-aware assembler so the hard top-k projection
-            // composes with the #1026 hybrid collapse (#1233): a verdict-linear
-            // d = 1 slot still decodes its straight sub-model image, exactly as
-            // the non-projected `term.fitted()` (above) does. Re-deriving the
-            // curved image here by hand with `fill_decoded_row` previously
-            // bypassed the collapse, so `top_k == k_atoms` reconstruction
-            // diverged from the unprojected reconstruction whenever any atom was
-            // hybrid-collapsed linear.
-            fitted = term
-                .reconstruct_from_assignments(assignments.view(), true)
-                .map_err(py_value_error)?;
-            // #1232 — projected-model penalized loss: the reconstruction data-fit
-            // recomputed on the projected `fitted` (same per-row metric / honesty
-            // weights as the smooth `loss`), with the decoder/ρ penalties carried
-            // over unchanged (the top-k gate touches assignments, not the decoder
-            // smoothness / ARD / assignment-prior strength). This is the score
-            // that describes the returned (projected) model.
-            let projected_data_fit = term
-                .data_fit_for_reconstruction(z_view.view(), fitted.view())
-                .map_err(py_value_error)?;
-            post_topk_loss = Some(gam::terms::sae::manifold::SaeManifoldLoss {
-                data_fit: projected_data_fit,
-                ..loss
-            });
-        }
-    }
-    term.record_fit_data_collapse_if_needed(
-        z_view.view(),
-        fitted.view(),
-        assignments.view(),
-        max_iter,
-    )
-    .map_err(py_value_error)?;
-    let trust_diagnostics = term
-        .trust_diagnostics_report(assignments.view())
-        .map_err(py_value_error)?;
-    // Assignment-support diagnostics (atom lens) must read the SAME assignments
-    // the payload exposes — after any hard top-k projection (#1232).
-    let fit_diagnostics = term
-        .fit_diagnostics_report(
-            Some(&ard_variances),
-            isometry_pin_active,
-            Some(shape_uncertainty.dispersion),
-            Some(assignments.view()),
-        )
-        .map_err(py_value_error)?;
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
@@ -4396,10 +3632,6 @@ fn sae_manifold_fit_inner<'py>(
             out.set_item("pre_topk", pre_topk)?;
         }
     }
-    let reported_log_alpha = match term.assignment.mode {
-        gam::terms::sae::manifold::AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
-        _ => alpha.ln(),
-    };
     out.set_item("log_alpha", reported_log_alpha)?;
     // Clone, do NOT move the field out: `rho` is still owned and is borrowed
     // again below for the co-trained amortized-encoder report
@@ -4695,10 +3927,7 @@ fn sae_manifold_fit_inner<'py>(
     // discovered atoms / bindings / geometries the held-out data confirmed vs
     // left contested — without re-running any fitting. Valid at this (or any)
     // data-dependent stopping time because each claim is an e-process.
-    let structure_certificate = structure_ledger.certify(0.05);
-    let certificate_json =
-        serde_json::to_string(&structure_certificate).map_err(serde_json_error_to_pyerr)?;
-    out.set_item("structure_certificate", certificate_json)?;
+    out.set_item("structure_certificate", structure_certificate_json)?;
     Ok(out.unbind())
 }
 

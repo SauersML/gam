@@ -155,7 +155,6 @@ impl std::fmt::Debug for OuterEval {
     }
 }
 
-
 /// Result bundle returned by the EFS (extended Fellner–Schall) evaluation
 /// path. Pure data: families compute the additive step and the optional
 /// curvature/gradient diagnostics; the solver consumes them.

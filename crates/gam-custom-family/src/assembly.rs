@@ -20,7 +20,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     specs: &[ParameterBlockSpec],
     per_block: &[Array1<f64>],
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn HessianOperator>,
+    hessian_op: Arc<dyn HessianFactorization>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -178,12 +178,12 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
 }
 
 pub(crate) struct FirstOrderTraceSkipOperator {
-    pub(crate) inner: Arc<dyn HessianOperator>,
+    pub(crate) inner: Arc<dyn HessianFactorization>,
     pub(crate) remaining_first_order_traces: AtomicUsize,
 }
 
 impl FirstOrderTraceSkipOperator {
-    pub(crate) fn new(inner: Arc<dyn HessianOperator>, skip_count: usize) -> Self {
+    pub(crate) fn new(inner: Arc<dyn HessianFactorization>, skip_count: usize) -> Self {
         Self {
             inner,
             remaining_first_order_traces: AtomicUsize::new(skip_count),
@@ -211,7 +211,7 @@ impl FirstOrderTraceSkipOperator {
     }
 }
 
-impl HessianOperator for FirstOrderTraceSkipOperator {
+impl HessianFactorization for FirstOrderTraceSkipOperator {
     fn logdet(&self) -> f64 {
         self.inner.logdet()
     }
@@ -402,7 +402,7 @@ pub(crate) fn unified_joint_cost_gradient(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn HessianOperator>,
+    hessian_op: Arc<dyn HessianFactorization>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -422,7 +422,7 @@ pub(crate) fn unified_joint_cost_gradient(
     // objective (gam#979). `None` when the term is unavailable/gated to zero.
     firth_value: Option<f64>,
 ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String> {
-    let hessian_op: Arc<dyn HessianOperator> = match first_order_trace_skip.as_ref() {
+    let hessian_op: Arc<dyn HessianFactorization> = match first_order_trace_skip.as_ref() {
         Some(trace_values) if !trace_values.is_empty() => Arc::new(
             FirstOrderTraceSkipOperator::new(hessian_op, trace_values.len()),
         ),
@@ -494,7 +494,7 @@ pub(crate) fn unified_joint_efs_eval(
     per_block: &[Array1<f64>],
     rho: &Array1<f64>,
     beta_flat: &Array1<f64>,
-    hessian_op: Arc<dyn HessianOperator>,
+    hessian_op: Arc<dyn HessianFactorization>,
     ranges: &[(usize, usize)],
     total: usize,
     ridge: f64,
@@ -573,7 +573,7 @@ pub(crate) fn unified_joint_efs_eval(
 
     if has_psi {
         let inner_hessian_scale =
-            hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
+            hessian_factorization_geometric_scale(inner_solution.hessian_op.as_ref());
         let hybrid = compute_hybrid_efs_update(&inner_solution, rho_slice, gradient_slice);
         Ok(gam_problem::EfsEval {
             cost: result.cost,
@@ -594,7 +594,7 @@ pub(crate) fn unified_joint_efs_eval(
         })
     } else {
         let inner_hessian_scale =
-            hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
+            hessian_factorization_geometric_scale(inner_solution.hessian_op.as_ref());
         Ok(gam_problem::EfsEval {
             cost: result.cost,
             steps: compute_efs_update(&inner_solution, rho_slice, gradient_slice),
@@ -621,7 +621,7 @@ pub(crate) fn unified_joint_efs_eval(
 /// The operator is a deterministic function of `(β̂, ρ)` for a fixed
 /// family/data plus the scalar assembly knobs (ridges, curvature scale, logdet
 /// flags, pseudo-logdet mode, Jeffreys curvature). We therefore cache the
-/// assembled `Arc<dyn HessianOperator>` keyed by a content fingerprint of ALL of
+/// assembled `Arc<dyn HessianFactorization>` keyed by a content fingerprint of ALL of
 /// those inputs and reuse it on a bit-identical hit. Because the reuse condition
 /// is exact byte-equality of the build inputs, the reused operator — and so the
 /// LAML cost and its analytic gradient — is bit-identical to a fresh build.
@@ -629,20 +629,20 @@ pub(crate) fn unified_joint_efs_eval(
 /// entries, which bounds memory to the last two distinct ρ assemblies.
 struct AssembledOperatorCache {
     /// `(fingerprint, operator)` for at most the last two distinct assemblies.
-    entries: Vec<(u64, Arc<dyn HessianOperator>)>,
+    entries: Vec<(u64, Arc<dyn HessianFactorization>)>,
 }
 
 impl AssembledOperatorCache {
     const CAPACITY: usize = 2;
 
-    fn get(&self, fingerprint: u64) -> Option<Arc<dyn HessianOperator>> {
+    fn get(&self, fingerprint: u64) -> Option<Arc<dyn HessianFactorization>> {
         self.entries
             .iter()
             .find(|(key, _)| *key == fingerprint)
             .map(|(_, op)| Arc::clone(op))
     }
 
-    fn insert(&mut self, fingerprint: u64, op: Arc<dyn HessianOperator>) {
+    fn insert(&mut self, fingerprint: u64, op: Arc<dyn HessianFactorization>) {
         if self.entries.iter().any(|(key, _)| *key == fingerprint) {
             return;
         }
@@ -1029,13 +1029,13 @@ pub(crate) fn joint_outer_evaluate(
         .ok()
         .and_then(|cache| cache.get(operator_fingerprint));
 
-    let hessian_op: Arc<dyn HessianOperator> = if let Some(cached) = cached_operator {
+    let hessian_op: Arc<dyn HessianFactorization> = if let Some(cached) = cached_operator {
         log::debug!(
             "[OUTER hessian-route] reusing cached same-ρ assembled operator (fingerprint hit)"
         );
         cached
     } else {
-        let built: Arc<dyn HessianOperator> = if use_joint_matrix_free_path(
+        let built: Arc<dyn HessianFactorization> = if use_joint_matrix_free_path(
             total,
             joint_observation_count(&inner.block_states),
         ) {
@@ -1368,7 +1368,7 @@ pub(crate) fn joint_outer_evaluate(
     // second-order, and Hessian work, but short-circuit only the
     // soon-discarded first-order trace calls. The projected-subspace
     // trace path is left untouched because the Hessian shares that
-    // kernel and it is not routed through HessianOperator trace methods.
+    // kernel and it is not routed through HessianFactorization trace methods.
     // Bind the gating flag before `penalty_subspace_trace` is consumed by
     // the call below so the trace-skip choice does not depend on a moved
     // value (was: `if penalty_subspace_trace.is_none()` evaluated AFTER
@@ -1403,7 +1403,7 @@ pub(crate) fn joint_outer_evaluate(
         // second-order, and Hessian work, but short-circuit only the
         // soon-discarded first-order trace calls. The projected-subspace
         // trace path is left untouched because the Hessian shares that
-        // kernel and it is not routed through HessianOperator trace methods.
+        // kernel and it is not routed through HessianFactorization trace methods.
         if has_penalty_subspace_trace {
             None
         } else {
@@ -1595,7 +1595,7 @@ pub(crate) fn joint_outer_evaluate_efs(
             Some(matrix)
         });
 
-    let hessian_op: Arc<dyn HessianOperator> = if use_joint_matrix_free_path(
+    let hessian_op: Arc<dyn HessianFactorization> = if use_joint_matrix_free_path(
         total,
         joint_observation_count(&inner.block_states),
     ) {
