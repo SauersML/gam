@@ -296,32 +296,16 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | (ResponseFamily::NegativeBinomial { .. }, _)
             | (ResponseFamily::Gamma, _) => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
-                // (log-normal MGF). When the likelihood is near-flat (e.g.
-                // all-zero Poisson counts) the posterior SE is astronomically
-                // wide and `0.5·se²` overflows the exponent, producing +inf —
-                // which the FFI serializes as JSON null (issue #1515). In that
-                // regime the posterior-integrated mean is numerically
-                // meaningless; fall back to the plug-in `exp(eta)` (the exact
-                // public inverse-link at the floored point estimate) so
-                // predict() stays finite and non-negative.
-                let exponent = eta + 0.5 * se_eta * se_eta;
-                if exponent.is_finite() {
-                    let mgf = exponent.exp();
-                    if mgf.is_finite() {
-                        return Ok(mgf);
-                    }
-                }
-                // Overflow: fall back to the exact plug-in exp(η). If even that
-                // is not f64-representable the true mean genuinely exceeds the
-                // f64 range, so saturate to the largest finite f64 (a monotone,
-                // non-arbitrary boundary — no magic exponent cutoff) rather than
-                // returning +inf and serializing to null.
-                let plugin = eta.exp();
-                if plugin.is_finite() {
-                    Ok(plugin)
-                } else {
-                    Ok(f64::MAX)
-                }
+                // (log-normal MGF). When the exponent exceeds the f64 range the
+                // posterior mean genuinely overflows; `exp` then returns +inf,
+                // which IS the correctly rounded value of the integral. Earlier
+                // revisions substituted the plug-in `exp(η)` (or f64::MAX) here
+                // to keep the FFI finite, silently turning an unbounded
+                // posterior mean into an innocuous value (η = 0, se = 40 →
+                // exponent 800 reported as 1). Honesty over convenience:
+                // return the exact, possibly infinite, mean and let callers
+                // decide how to present it.
+                Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
@@ -348,10 +332,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
-                // Other standard binomial links fall back to the logit path
-                // (the legacy default for non-{logit,probit,cloglog} binomial
-                // standard links).
-                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
+                // Remaining standard binomial links (LogLog, Cauchit, ...):
+                // integrate the family's ACTUAL inverse link through the shared
+                // probability-kernel quadrature. The historical fallback
+                // integrated the logistic kernel here, so LogLog/Cauchit
+                // response moments were computed for the wrong link (at
+                // se_eta = 0, η = 1: exact Cauchit mean 0.75, exact LogLog mean
+                // exp(-exp(-1)) ≈ 0.6922, logistic 0.7311).
+                Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
+                    inverse_link_jet_for_family_public(&self.spec, x)
+                        .map(|jet| jet.mu)
+                        .unwrap_or(f64::NAN)
+                }))
             }
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
                 let state = self.require_latent_cloglog_state()?;
@@ -408,10 +400,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | (ResponseFamily::NegativeBinomial { .. }, _)
             | (ResponseFamily::Gamma, _) => {
                 // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
-                // Var[exp(η)] = exp(2μ + σ²)(exp(σ²) - 1)
+                // Var[exp(η)] = exp(2μ + σ²)·expm1(σ²). `expm1` keeps the
+                // variance factor exact for tiny σ² (σ² = 1e-20: exp(σ²) - 1
+                // rounds to 0, expm1 returns 1e-20), so small but nonzero
+                // posterior uncertainty is never reported as exactly zero.
                 let s2 = se_eta * se_eta;
                 let m1 = (eta + 0.5 * s2).exp();
-                let m2 = (2.0 * eta + s2).exp() * (s2.exp() - 1.0);
+                let m2 = (2.0 * eta + s2).exp() * s2.exp_m1();
                 Ok((m1, m2.max(0.0)))
             }
             (ResponseFamily::Beta { .. }, _) => {
