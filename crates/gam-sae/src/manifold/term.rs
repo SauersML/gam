@@ -721,6 +721,16 @@ pub struct SaeManifoldTerm {
     /// because the augmented output shares `t` and `a` by construction. Carried
     /// across clones so a cloned candidate keeps its behavioral identity.
     pub(crate) behavior: Option<crate::manifold::BehaviorBlock>,
+    /// Crosscoder — stacked-column layout of a multi-block fit: the anchor width
+    /// `p_x`, the per-layer output-block widths/labels, and the fitted per-block
+    /// relevance `log λ_ℓ`. `Some` after a [`SaeManifoldTerm::run_multiblock_reml_fit`]
+    /// (or an explicit [`SaeManifoldTerm::set_crosscoder_layout`]); it is the single
+    /// owner of the offset bookkeeping so [`SaeManifoldTerm::layer_decoder`] returns
+    /// an honest per-layer decoder `B_k^(ℓ)` without any caller re-slicing by hand.
+    /// Pure descriptor state (which columns are which layer, and each layer's
+    /// weight) — the joint fit never reads it, so `None` is the ordinary path,
+    /// bit-for-bit unchanged. Carried across clones like the behavior block.
+    pub(crate) crosscoder_layout: Option<crate::manifold::CrosscoderLayout>,
     /// #2023 C4 — the manifold-tier analogue of [`crate::tiered::Tier0Mean`]: the
     /// single shared mean μ (length `p`) that carries the global DC for THIS term.
     /// `None` (the default) ⇒ the historical, bit-for-bit path (no Tier-0; every
@@ -815,6 +825,10 @@ impl Clone for SaeManifoldTerm {
             // assignment mode / barrier override), carried across clones so a
             // cloned candidate fits the same augmented two-block problem.
             behavior: self.behavior.clone(),
+            // Crosscoder stacked-column layout is persisted descriptor state (like
+            // the behavior block), carried across clones so a cloned candidate
+            // reports the same per-layer decoders.
+            crosscoder_layout: self.crosscoder_layout.clone(),
             // #2023 C4 — persisted Tier-0 shared mean, carried across clones like
             // the assignment mode so a cloned candidate de-means identically.
             tier0_mean: self.tier0_mean.clone(),

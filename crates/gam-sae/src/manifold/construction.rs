@@ -222,6 +222,10 @@ impl SaeManifoldTerm {
             // Rung-2 behavioral block: default None (ordinary single-block term,
             // bit-for-bit unchanged). Attached via `set_behavior_block`.
             behavior: None,
+            // Crosscoder stacked-column layout: default None (no multi-block
+            // layout installed; `layer_decoder` errors until a multi-block fit or
+            // `set_crosscoder_layout` records one). Bit-for-bit historical path.
+            crosscoder_layout: None,
             // #2023 C4 — Tier-0 shared mean: default None (no de-meaning; the
             // historical path is bit-for-bit). Installed via `set_tier0_mean` /
             // `fit_tier0_mean`.
@@ -9145,6 +9149,394 @@ impl SaeManifoldTerm {
                 }
             }
         }
+
+        Ok(SaeArrowVector {
+            t: gamma_t,
+            beta: gamma_beta,
+        })
+    }
+
+    /// #2080 matrix-free θ-adjoint: the SAME `Γ = tr(H⁻¹ ∂H/∂θ)` the dense
+    /// [`Self::logdet_theta_adjoint`] assembles, reconstructed from the shared
+    /// selected-inverse probe bundle `(z_j, S⁻¹ z_j)` instead of the dense
+    /// `DeflatedArrowSolver` selected inverse — the last new-math channel of the
+    /// wide-p surrogate. It never materializes the `K×K` reduced-Schur `S⁻¹`
+    /// (the one massive-K-infeasible object the dense β–β loop reads); everything
+    /// folds onto the bundle:
+    ///
+    /// With `A_i = undamped_factor(i)`, `G_i = A_i⁻¹ H_tβ^(i)`, and the Rademacher
+    /// probe identity `E[z zᵀ] = I` (EXACT at the full-basis probe set `√k·e_j`),
+    /// the arrow inverse blocks the dense adjoint contracts are unbiased outer
+    /// products of the row probe images `w_l = G_i z_l`, `s_l = G_i (S⁻¹ z_l)`:
+    /// ```text
+    ///   (H⁻¹)_tt[i]  = A_i⁻¹ + G_i S⁻¹ G_iᵀ ,  (G_i S⁻¹ G_iᵀ)[a,b] ≈ (1/m)Σ_l w_l[a] s_l[b]
+    ///   (H⁻¹)_tβ[i]  = −G_i S⁻¹           ,  (G_i S⁻¹)[a,c]      ≈ (1/m)Σ_l w_l[a] (S⁻¹z_l)[c]
+    /// ```
+    /// so the t–t (`q×q`) and t–β (`q×K`) blocks are materialized per row (feasible:
+    /// `q` small, `q×K` matches the dense t–β cost) and the dense contraction code is
+    /// reused verbatim. Only the β–β term `Σ_ij S⁻¹[i,j]·∂H_βiβj` (dense: the `O(K²)`
+    /// `beta_inv` double loop) is refolded as `tr(S⁻¹·M)`:
+    /// `Σ_ij S⁻¹[i,j](⟨bd_i,b_j⟩+⟨b_i,bd_j⟩) = (1/m)Σ_l (⟨Rd_l,P_l⟩+⟨R_l,Q_l⟩)` with
+    /// `P_l=Σ_j z_l[c_j] b_j`, `R_l=Σ_i (S⁻¹z_l)[c_i] b_i`, `Q_l=Σ_j z_l[c_j] bd_j`,
+    /// `Rd_l=Σ_i (S⁻¹z_l)[c_i] bd_i` (`b`=`beta` jet, `bd`=`beta_deriv` jet).
+    ///
+    /// # Scope: softmax / euclidean / non-cross-row (hard refuse otherwise)
+    ///
+    /// The bundle spans ONLY the reduced-Schur border (`cache.k`), so the outer
+    /// products reconstruct exactly the NO-SELF base inverse `(H₀')⁻¹ = A_i⁻¹ +
+    /// G_i S⁻¹ G_iᵀ`. That equals the full `H⁻¹` only when the cache carries no
+    /// T-space rank-R correction; two regimes are therefore hard-refused (routed to
+    /// the dense channel, same discipline as invariant #2):
+    ///
+    /// * **Per-row deflation** (`deflated_row_directions`): the Daleckii–Krein
+    ///   correction `−tr(inv_vv·(D − DΦ[D]))` needs the DEFLATED block the plain-S⁻¹
+    ///   bundle does not carry.
+    /// * **IBP cross-row Woodbury** (`ibp_channels` / `cache.cross_row_woodbury`):
+    ///   `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto `H₀'` as a rank-R
+    ///   correction (`full_inverse_apply`), NOT in the border the bundle spans —
+    ///   folding it matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
+    ///   reduced-Schur/bundle design step tracked separately.
+    ///
+    /// On the accepted (softmax / euclidean / non-cross-row) regimes base = full
+    /// inverse, both refuse conditions are absent, and the from-probes and dense
+    /// θ-adjoints agree exactly at full-basis probes — the FD gate's acceptance.
+    pub(crate) fn logdet_theta_adjoint_from_probes(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+    ) -> Result<SaeArrowVector, String> {
+        if cache.arrow_log_det().is_none() {
+            return Err(
+                "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \
+                 log-det for the selected-inverse operator"
+                    .to_string(),
+            );
+        }
+        let k_border = cache.k;
+        let m = probes.len();
+        if k_border > 0 {
+            if m == 0 || sinv_probes.len() != m {
+                return Err(format!(
+                    "logdet_theta_adjoint_from_probes: need matching non-empty probe/solve \
+                     bundles, got {m} probes and {} solves",
+                    sinv_probes.len()
+                ));
+            }
+            for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+                for (j, v) in set.iter().enumerate() {
+                    if v.len() != k_border {
+                        return Err(format!(
+                            "logdet_theta_adjoint_from_probes: {label} {j} has length {} != \
+                             border dim {k_border}",
+                            v.len()
+                        ));
+                    }
+                }
+            }
+        }
+        let inv_m = if m > 0 { 1.0 / m as f64 } else { 0.0 };
+        let n = self.n_obs();
+        let total_t = cache.delta_t_len();
+        let mut gamma_t = Array1::<f64>::zeros(total_t);
+        let mut gamma_beta = Array1::<f64>::zeros(k_border);
+
+        // Deflation hard-refuse (see the docstring): the plain-S⁻¹ bundle cannot
+        // reconstruct the Daleckii–Krein correction, so any deflated row routes the
+        // whole fit to the dense channel.
+        for row in 0..n {
+            if cache
+                .deflated_row_directions
+                .get(row)
+                .is_some_and(|d| !d.is_empty())
+            {
+                return Err(format!(
+                    "logdet_theta_adjoint_from_probes: row {row} carries deflation directions; \
+                     the plain-S⁻¹ bundle cannot reconstruct the Daleckii–Krein correction — \
+                     route this fit through the dense channel"
+                ));
+            }
+        }
+
+        // Cross-row IBP Woodbury hard-refuse. The bundle spans only the reduced-Schur
+        // BORDER (the decoder-β channels, `cache.k`); the #1038 cross-row rank-one
+        // curvature `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto the NO-SELF
+        // base `H₀'` as a rank-R correction (`full_inverse_apply` / the
+        // `subtract_inverse_diagonal` step). The border-only outer products reconstruct
+        // exactly `A_i⁻¹ + G_i S⁻¹ G_iᵀ = (H₀')⁻¹` per row — NOT the Woodbury-corrected
+        // full inverse the dense adjoint contracts — so an IBP cross-row cache is routed
+        // to the dense channel (same hard-refuse discipline as deflation; folding this
+        // channel matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
+        // reduced-Schur/bundle design step). The from-probes lane therefore owns the
+        // softmax / euclidean / non-cross-row regimes where base = full inverse.
+        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, true)?;
+        if ibp_channels.is_some() || cache.cross_row_woodbury.is_some() {
+            return Err(
+                "logdet_theta_adjoint_from_probes: cache carries an IBP cross-row Woodbury \
+                 (T-space rank-R) curvature the border-only probe bundle cannot reconstruct — \
+                 route this fit through the dense channel"
+                    .to_string(),
+            );
+        }
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let whiten_row_jets = self.whiten_logdet_row_jets();
+        let k_atoms = self.k_atoms();
+        // Softmax entropy dense off-diagonal channel `scale = λ·sparsity/τ²` — the
+        // SAME weight the dense adjoint (and the assembly) differentiate. The compact
+        // per-active-atom majorizer derivative reads only this scale (not the full
+        // penalty object), so we carry just the scalar.
+        let softmax_dense_adjoint: Option<f64> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                Some(rho.lambda_sparse() * sparsity * inv_tau * inv_tau)
+            }
+            _ => None,
+        };
+
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    rho,
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let mut jets = jet_window
+                .pop_front()
+                .expect("jet window must be non-empty");
+            if whiten_row_jets {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
+            }
+
+            // A_i⁻¹ (q×q) via the row-local undamped Cholesky.
+            let factor = cache.undamped_factor(row);
+            let mut a_inv = Array2::<f64>::zeros((q, q));
+            let mut e_j = Array1::<f64>::zeros(q);
+            for j in 0..q {
+                e_j.fill(0.0);
+                e_j[j] = 1.0;
+                let col = cholesky_solve_vector(factor, e_j.view());
+                for r in 0..q {
+                    a_inv[[r, j]] = col[r];
+                }
+            }
+
+            // Row probe images w_l = G_i z_l, s_l = G_i (S⁻¹ z_l) — the bundle carriers
+            // for the selected-inverse blocks (identical to the ARD from-probes path).
+            let mut w_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            let mut s_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            if k_border > 0 {
+                let mut b_tmp = Array1::<f64>::zeros(q);
+                for l in 0..m {
+                    b_tmp.fill(0.0);
+                    if !cache.apply_htbeta_row(row, probes[l].view(), &mut b_tmp) {
+                        return Err(format!(
+                            "logdet_theta_adjoint_from_probes: H_tβ^({row}) probe apply failed"
+                        ));
+                    }
+                    w_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+                    b_tmp.fill(0.0);
+                    if !cache.apply_htbeta_row(row, sinv_probes[l].view(), &mut b_tmp) {
+                        return Err(format!(
+                            "logdet_theta_adjoint_from_probes: H_tβ^({row}) solve apply failed"
+                        ));
+                    }
+                    s_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+                }
+            }
+
+            // (H⁻¹)_tt block: A_i⁻¹ + (1/m)Σ_l sym(w_l ⊗ s_l) (symmetrized outer product;
+            // exact & symmetric at full-basis probes).
+            // `w_probes`/`s_probes` are populated only when a border exists
+            // (`k_border > 0`); their length is `m` there and `0` otherwise, so the
+            // border-term loops below vanish cleanly on the borderless arrow.
+            let mut inv_vv = a_inv.clone();
+            for l in 0..w_probes.len() {
+                for a in 0..q {
+                    for b in 0..q {
+                        inv_vv[[a, b]] +=
+                            0.5 * inv_m * (w_probes[l][a] * s_probes[l][b] + s_probes[l][a] * w_probes[l][b]);
+                    }
+                }
+            }
+            // (H⁻¹)_tβ block (q×K): −(1/m)Σ_l w_l ⊗ (S⁻¹ z_l).
+            let mut inv_vbeta = Array2::<f64>::zeros((q, k_border));
+            for l in 0..w_probes.len() {
+                for a in 0..q {
+                    inv_vbeta
+                        .row_mut(a)
+                        .scaled_add(-inv_m * w_probes[l][a], &sinv_probes[l]);
+                }
+            }
+
+            // Precompute the β–β fold carriers P_l, R_l (w-independent) per probe.
+            let bjet_len = if k_border > 0 {
+                jets.beta.first().map_or(0, Vec::len)
+            } else {
+                0
+            };
+            let mut p_probe: Vec<Vec<f64>> = Vec::with_capacity(m);
+            let mut r_probe: Vec<Vec<f64>> = Vec::with_capacity(m);
+            if k_border > 0 && bjet_len > 0 {
+                for l in 0..m {
+                    let mut p_l = vec![0.0_f64; bjet_len];
+                    let mut r_l = vec![0.0_f64; bjet_len];
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        let zc = probes[l][channel.index];
+                        let sc = sinv_probes[l][channel.index];
+                        let bj = &jets.beta[beta_pos];
+                        for c in 0..bjet_len {
+                            p_l[c] += zc * bj[c];
+                            r_l[c] += sc * bj[c];
+                        }
+                    }
+                    p_probe.push(p_l);
+                    r_probe.push(r_l);
+                }
+            }
+
+            let softmax_adjoint_row: Option<(&[f64], f64, f64, f64)> =
+                match (softmax_dense_adjoint, self.assignment.mode) {
+                    (Some(scale), AssignmentMode::Softmax { temperature, .. }) => {
+                        let a = assignments
+                            .as_slice()
+                            .expect("softmax assignments row must be contiguous");
+                        let m_mean = softmax_majorizer_log_mean(a);
+                        Some((a, m_mean, scale, 1.0 / temperature))
+                    }
+                    _ => None,
+                };
+
+            for w in 0..q {
+                let mut gamma = 0.0_f64;
+                let softmax_d_dw: Option<(&[f64], f64, f64, f64, usize)> =
+                    match (softmax_adjoint_row, jets.vars[w]) {
+                        (Some((a, mm, scale, inv_tau)), SaeLocalRowVar::Logit { atom: atom_w }) => {
+                            Some((a, mm, scale, inv_tau, atom_w))
+                        }
+                        _ => None,
+                    };
+                // t–t block: reuse the dense contraction (undeflated: no DΦ correction).
+                for a in 0..q {
+                    for b in 0..q {
+                        let mut dh = match (softmax_d_dw, jets.vars[a], jets.vars[b]) {
+                            (
+                                Some((a_soft, _m, _scale, inv_tau, atom_w)),
+                                SaeLocalRowVar::Coord { atom: atom_a, .. },
+                                SaeLocalRowVar::Coord { atom: atom_b, .. },
+                            ) => {
+                                let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                                h_ab
+                                    * Self::softmax_data_weight_product_logit_factor(
+                                        a_soft, atom_a, atom_b, atom_w, inv_tau,
+                                    )
+                            }
+                            _ => {
+                                sae_dot(&jets.second[a][w], &jets.first[b])
+                                    + sae_dot(&jets.first[a], &jets.second[b][w])
+                            }
+                        };
+                        if let (
+                            Some((a_soft, mm, scale, inv_tau, _atom_w)),
+                            SaeLocalRowVar::Logit { atom: atom_a },
+                            SaeLocalRowVar::Logit { atom: atom_b },
+                        ) = (softmax_d_dw, jets.vars[a], jets.vars[b])
+                        {
+                            if atom_a == atom_b {
+                                dh += active_softmax_majorizer_logit_derivative_entry(
+                                    a_soft, atom_a, _atom_w, mm, scale, inv_tau,
+                                );
+                            }
+                        }
+                        if a == b {
+                            dh += match jets.vars[a] {
+                                SaeLocalRowVar::Logit { atom } => self
+                                    .assignment_prior_hdiag_derivative_entry(
+                                        rho,
+                                        row,
+                                        atom,
+                                        jets.vars[w],
+                                        ibp_channels.as_ref(),
+                                    ),
+                                SaeLocalRowVar::Coord { atom, axis } if a == w => {
+                                    self.ard_majorized_hessian_derivative(rho, row, atom, axis)
+                                }
+                                _ => 0.0,
+                            };
+                        }
+                        gamma += inv_vv[[b, a]] * dh;
+                    }
+                }
+                // t–β block: reuse the dense contraction with the reconstructed inv_vβ.
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        let dh = sae_dot(&jets.second[a][w], &jets.beta[beta_pos])
+                            + sae_dot(&jets.first[a], &jets.beta_deriv[w][beta_pos]);
+                        gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
+                    }
+                }
+                // β–β block: refolded as tr(S⁻¹·M) onto the probe bundle.
+                if k_border > 0 && bjet_len > 0 {
+                    for l in 0..m {
+                        let mut q_l = vec![0.0_f64; bjet_len];
+                        let mut rd_l = vec![0.0_f64; bjet_len];
+                        for (beta_pos, channel) in border.iter().enumerate() {
+                            let zc = probes[l][channel.index];
+                            let sc = sinv_probes[l][channel.index];
+                            let bd = &jets.beta_deriv[w][beta_pos];
+                            for c in 0..bjet_len {
+                                q_l[c] += zc * bd[c];
+                                rd_l[c] += sc * bd[c];
+                            }
+                        }
+                        gamma += inv_m
+                            * (sae_dot(&rd_l, &p_probe[l]) + sae_dot(&r_probe[l], &q_l));
+                    }
+                }
+                gamma_t[base + w] = gamma;
+            }
+
+            for (w_beta_pos, w_channel) in border.iter().enumerate() {
+                let mut gamma = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
+                            + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
+                        gamma += inv_vv[[b, a]] * dh;
+                    }
+                }
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.beta[beta_pos]);
+                        gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
+                    }
+                }
+                gamma_beta[w_channel.index] += gamma;
+            }
+        }
+
+        // No IBP empirical-M / cross-row Woodbury pass here: those channels are
+        // hard-refused above (the border-only bundle cannot carry the T-space
+        // rank-R Woodbury), so on every accepted cache `ibp_channels` is `None` and
+        // the softmax/euclidean core folds above are the complete θ-adjoint.
 
         Ok(SaeArrowVector {
             t: gamma_t,

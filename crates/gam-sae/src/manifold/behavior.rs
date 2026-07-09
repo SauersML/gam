@@ -836,6 +836,159 @@ impl OutputBlock {
     }
 }
 
+/// Stacked-column offset bookkeeping for a crosscoder target
+/// `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{L-1}·Y_{L-1}]` and the block-columned decoders
+/// carved out of it.
+///
+/// # Why this exists — one owner of the offset arithmetic
+///
+/// Every consumer of the augmented layout — stacking the target
+/// ([`stack_augmented_target`]), reading a block's residual sum of squares
+/// ([`SaeManifoldTerm::run_multiblock_reml_fit`]'s `augmented_block_rss`), and
+/// carving the honest per-layer decoder
+/// (`B_k^(ℓ) = C̃_k[:, off_ℓ..off_ℓ+p_ℓ] / √λ_ℓ`,
+/// [`SaeManifoldTerm::layer_decoder`]) — recomputed `off_ℓ = p_x + Σ_{m<ℓ} p_m`
+/// by hand. This type owns that arithmetic once ([`Self::block_range`],
+/// [`Self::total_dim`]) and carries the fitted per-block weight `λ_ℓ` alongside
+/// the widths and labels, so a caller reads a layer's decoder in honest units
+/// without re-deriving either the offsets or the `√λ_ℓ` unscaling.
+///
+/// The anchor block `Z` (`p_x` columns) is implicit at `[0, p_x)`; the `L-1`
+/// output blocks follow it in order. `block_dims`, `labels`, and
+/// `block_log_lambda` are parallel (one entry per output block); the type's
+/// constructors are the only way to build one, so the three stay in lock-step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrosscoderLayout {
+    /// Anchor width `p_x` (the leading `[0, p_x)` column block).
+    p_x: usize,
+    /// Per-output-block width `p_ℓ`, in stacked-column order.
+    block_dims: Vec<usize>,
+    /// Per-output-block label (diagnostics only), parallel to `block_dims`.
+    labels: Vec<String>,
+    /// Per-output-block fitted `log(λ_ℓ)`, parallel to `block_dims`. The honest
+    /// per-layer decoder divides by `√λ_ℓ = exp(½·log λ_ℓ)`.
+    block_log_lambda: Vec<f64>,
+}
+
+impl CrosscoderLayout {
+    /// Build a layout from the anchor width and parallel per-block
+    /// `(dim, label, log λ)` vectors. The three block vectors must have equal
+    /// length; `p_x` and every block dim must be non-zero; every `log λ_ℓ`
+    /// finite. Zero output blocks is valid (an anchor-only / plain layout,
+    /// `total_dim() == p_x`).
+    pub fn new(
+        p_x: usize,
+        block_dims: Vec<usize>,
+        labels: Vec<String>,
+        block_log_lambda: Vec<f64>,
+    ) -> Result<Self, String> {
+        if p_x == 0 {
+            return Err("CrosscoderLayout::new: anchor width p_x must be non-zero".to_string());
+        }
+        if block_dims.len() != labels.len() || block_dims.len() != block_log_lambda.len() {
+            return Err(format!(
+                "CrosscoderLayout::new: block_dims ({}), labels ({}), and block_log_lambda ({}) \
+                 must have equal length",
+                block_dims.len(),
+                labels.len(),
+                block_log_lambda.len()
+            ));
+        }
+        for (l, &dim) in block_dims.iter().enumerate() {
+            if dim == 0 {
+                return Err(format!(
+                    "CrosscoderLayout::new: block {l} ('{}') has width 0",
+                    labels[l]
+                ));
+            }
+        }
+        for (l, &ll) in block_log_lambda.iter().enumerate() {
+            if !ll.is_finite() {
+                return Err(format!(
+                    "CrosscoderLayout::new: block {l} ('{}') log λ is {ll} (not finite)",
+                    labels[l]
+                ));
+            }
+        }
+        Ok(Self {
+            p_x,
+            block_dims,
+            labels,
+            block_log_lambda,
+        })
+    }
+
+    /// Build a layout from the anchor width and the fitted [`OutputBlock`]s (their
+    /// widths, labels, and converged `log λ_ℓ`). Infallible: an `OutputBlock` is
+    /// already validated to carry a non-zero width and a finite `log λ_ℓ`.
+    pub fn from_blocks(p_x: usize, blocks: &[OutputBlock]) -> Self {
+        Self {
+            p_x,
+            block_dims: blocks.iter().map(|b| b.block_dim()).collect(),
+            labels: blocks.iter().map(|b| b.label.clone()).collect(),
+            block_log_lambda: blocks.iter().map(|b| b.log_lambda).collect(),
+        }
+    }
+
+    /// Anchor width `p_x` (the leading `[0, p_x)` column block).
+    pub fn anchor_dim(&self) -> usize {
+        self.p_x
+    }
+
+    /// Number of output blocks `L-1` (excludes the anchor).
+    pub fn num_blocks(&self) -> usize {
+        self.block_dims.len()
+    }
+
+    /// Per-output-block widths `p_ℓ`, in stacked-column order.
+    pub fn block_dims(&self) -> &[usize] {
+        &self.block_dims
+    }
+
+    /// Per-output-block labels, parallel to [`Self::block_dims`].
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Per-output-block fitted `log(λ_ℓ)`, parallel to [`Self::block_dims`].
+    pub fn block_log_lambda(&self) -> &[f64] {
+        &self.block_log_lambda
+    }
+
+    /// Total augmented width `p̃ = p_x + Σ_ℓ p_ℓ`.
+    pub fn total_dim(&self) -> usize {
+        self.p_x + self.block_dims.iter().sum::<usize>()
+    }
+
+    /// The half-open column range `[off_ℓ, off_ℓ + p_ℓ)` of output block `ℓ` in
+    /// the stacked target / decoder, `off_ℓ = p_x + Σ_{m<ℓ} p_m`.
+    ///
+    /// # Panics
+    /// If `l >= num_blocks()`. Callers that take an untrusted index bounds-check
+    /// against [`Self::num_blocks`] first (e.g. [`SaeManifoldTerm::layer_decoder`]).
+    pub fn block_range(&self, l: usize) -> std::ops::Range<usize> {
+        assert!(
+            l < self.block_dims.len(),
+            "CrosscoderLayout::block_range: block {l} out of range (L-1 = {})",
+            self.block_dims.len()
+        );
+        let start = self.p_x + self.block_dims[..l].iter().sum::<usize>();
+        start..start + self.block_dims[l]
+    }
+
+    /// `log(λ_ℓ)` for output block `ℓ`.
+    pub fn log_lambda(&self, l: usize) -> f64 {
+        self.block_log_lambda[l]
+    }
+
+    /// `√λ_ℓ = exp(½·log λ_ℓ)`, the per-column target scaling. Computed exactly as
+    /// [`OutputBlock::sqrt_lambda`], so a layout built from the fitted blocks
+    /// unscales a decoder bit-for-bit like the by-hand [`OutputBlock::split_honest_decoder`].
+    pub fn sqrt_lambda(&self, l: usize) -> f64 {
+        (0.5 * self.block_log_lambda[l]).exp()
+    }
+}
+
 /// Stack an anchor target `Z` (`n × p_x`) with the `√λ_ℓ`-scaled targets of a
 /// list of output blocks to form the augmented multi-block fit target
 /// `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{K-1}·Y_{K-1}]` (`n × p̃`,
@@ -856,7 +1009,6 @@ pub fn stack_augmented_target(
             "stack_augmented_target: anchor must be a non-empty (n × p_x) matrix; got ({n}, {px})"
         ));
     }
-    let mut p_tot = px;
     for block in blocks {
         if block.target.nrows() != n {
             return Err(format!(
@@ -865,23 +1017,21 @@ pub fn stack_augmented_target(
                 block.target.nrows()
             ));
         }
-        p_tot += block.block_dim();
     }
-    // Precompute √λ_ℓ once per block (deterministic, so bit-identical to the
-    // two-block path which computes it once).
-    let sqrt_lambdas: Vec<f64> = blocks.iter().map(|b| b.sqrt_lambda()).collect();
-    let mut augmented = Array2::<f64>::zeros((n, p_tot));
+    // The column offsets and total width are owned by the layout (no by-hand
+    // `off_ℓ` accumulation here). `√λ_ℓ` per block matches the two-block path
+    // ([`OutputBlock::sqrt_lambda`]) bit-for-bit.
+    let layout = CrosscoderLayout::from_blocks(px, blocks);
+    let mut augmented = Array2::<f64>::zeros((n, layout.total_dim()));
     for i in 0..n {
         for j in 0..px {
             augmented[[i, j]] = anchor[[i, j]];
         }
-        let mut offset = px;
-        for (block, &sqrt_lambda) in blocks.iter().zip(sqrt_lambdas.iter()) {
-            let pl = block.block_dim();
-            for j in 0..pl {
-                augmented[[i, offset + j]] = sqrt_lambda * block.target[[i, j]];
+        for (l, block) in blocks.iter().enumerate() {
+            let sqrt_lambda = layout.sqrt_lambda(l);
+            for (jj, col) in layout.block_range(l).enumerate() {
+                augmented[[i, col]] = sqrt_lambda * block.target[[i, jj]];
             }
-            offset += pl;
         }
     }
     Ok(augmented)
