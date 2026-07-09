@@ -487,10 +487,9 @@ pub(crate) fn principal_angles_between_images(
         .iter()
         .map(|&sv| sv.clamp(0.0, 1.0).acos())
         .collect::<Vec<f64>>();
-    angles.extend(std::iter::repeat_n(
-        std::f64::consts::FRAC_PI_2,
-        r_src.abs_diff(r_tgt),
-    ));
+    angles.extend(
+        std::iter::repeat(std::f64::consts::FRAC_PI_2).take(r_src.abs_diff(r_tgt)),
+    );
     Ok(angles)
 }
 

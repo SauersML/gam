@@ -147,7 +147,9 @@ pub(crate) fn compute_fourth_derivative_trace_matrix(
             let scale = d * h;
             row.mapv_inplace(|value| value * scale);
         });
-    Ok(Some(gam_linalg::faer_ndarray::fast_atb(&x_modes, &weighted)))
+    Ok(Some(gam_linalg::faer_ndarray::fast_atb(
+        &x_modes, &weighted,
+    )))
 }
 
 /// Compute the IFT second-derivative correction contribution to h2_trace.

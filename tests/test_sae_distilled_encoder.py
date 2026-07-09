@@ -79,6 +79,7 @@ class _FakeModel:
     alpha = 1.0
     jumprelu_threshold = 0.0
     _atom_dims = [1]
+    _basis_kinds = ["euclidean"]
 
     def __init__(self) -> None:
         self.calls = 0

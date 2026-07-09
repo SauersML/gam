@@ -2,14 +2,10 @@
 mod amortized_encoder_tests {
     use crate::manifold::tests::small_two_atom_periodic_term;
 
-    /// #1026 ladder item 2/3 — the amortized encoder is reachable end-to-end
-    /// from a fitted term and is certificate-honest: it encodes the dictionary's
-    /// own fit-time target, returns one result per atom with the right shape, and
-    /// every row is either certified or counted in
-    /// `encode_uncertified_count` (never silently miscounted), with the exact
-    /// fallback strictly reducing the uncertified count it inherits.
+    /// The fitted encoder is reachable end-to-end and returns one coordinate
+    /// block per atom plus one honest joint-convergence verdict per row.
     #[test]
-    fn amortized_encode_fitted_is_reachable_and_certificate_honest() {
+    fn amortized_encode_fitted_is_reachable_and_jointly_solved() {
         let (term, target, rho) = small_two_atom_periodic_term();
         let n = term.n_obs();
         let k = term.k_atoms();
@@ -17,36 +13,25 @@ mod amortized_encoder_tests {
         let results = term
             .amortized_encode_fitted(target.view(), &rho)
             .expect("amortized encode of the fit-time target runs end-to-end");
-        assert_eq!(
-            results.len(),
-            k,
-            "one encode result per atom in dictionary order"
-        );
+        assert_eq!(results.coords.len(), k, "one coordinate block per atom");
 
-        for (atom_idx, result) in results.iter().enumerate() {
+        for (atom_idx, result) in results.coords.iter().enumerate() {
             assert_eq!(
-                result.coords.nrows(),
+                result.nrows(),
                 n,
                 "atom {atom_idx} encode must produce one coordinate per row"
             );
             assert_eq!(
-                result.coords.ncols(),
+                result.ncols(),
                 term.atoms[atom_idx].latent_dim,
                 "atom {atom_idx} encode coords must match its latent dim"
             );
-            // The uncertified count is the honest tally of rows the certificate
-            // could not gate — it must equal the false entries of the mask.
-            let uncertified = result.certified.iter().filter(|c| !**c).count();
-            assert_eq!(
-                result.encode_uncertified_count, uncertified,
-                "atom {atom_idx} uncertified count must match the certificate mask"
-            );
-            assert_eq!(
-                result.certified.len(),
-                n,
-                "atom {atom_idx} certificate mask must cover every row"
-            );
         }
+        assert_eq!(results.converged.len(), n, "joint verdict must cover every row");
+        assert_eq!(
+            results.unconverged_count,
+            results.converged.iter().filter(|ok| !**ok).count()
+        );
     }
 
     /// The fitted amplitudes the encoder derives are the realised intensity

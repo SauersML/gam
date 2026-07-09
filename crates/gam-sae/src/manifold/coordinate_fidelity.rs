@@ -124,22 +124,59 @@ pub fn angle_fidelity_verdict(reading: Option<&ChartArcLengthReading>) -> AngleF
     }
 }
 
-/// Watson's `U²` uniformity statistic and its asymptotic null p-value for a set
-/// of coordinates already mapped onto the unit interval `[0, 1)` (a circle by
-/// wrapping modulo its period, an interval by range-normalization). Larger `U²`
-/// ⟺ farther from the uniform invariant measure.
+/// Geometry-appropriate uniformity statistic for a one-dimensional chart.
+/// Circles use rotation-invariant Watson `U²`; intervals use the ordinary
+/// (non-wrapping) Kolmogorov--Smirnov distance on `[0, 1]`.
 #[derive(Debug, Clone, Copy)]
 pub struct WatsonUniformity {
-    /// Watson's `U²` statistic. Rotation- and reflection-invariant. Null mean
-    /// `1/12 ≈ 0.0833`; the classical asymptotic upper-tail critical values are
-    /// `0.187` (5%) and `0.267` (1%).
+    /// Watson `U²` for a circle, or two-sided KS distance for an interval.
     pub statistic: f64,
-    /// Closed-form asymptotic upper-tail p-value `P(U² ≥ statistic)` under the
-    /// uniform null. Small ⟺ coordinates flagged non-uniform. `1.0` for
-    /// `n < 2` (statistic undefined).
+    /// Closed-form Watson upper-tail p-value for circles. `NaN` for intervals:
+    /// the interval endpoints are estimated from this same sample, so a
+    /// known-boundary KS p-value would not be calibrated. The interval statistic
+    /// remains a descriptive occupancy diagnostic until endpoint uncertainty is
+    /// carried by the chart schema.
     pub p_value: f64,
     /// Number of coordinates the statistic was computed from.
     pub n: usize,
+}
+
+/// Non-circular KS distance of range-normalized interval coordinates. The value
+/// `1.0` is retained as the right endpoint; it is never folded to zero.
+fn interval_uniformity(
+    u: &[f64],
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Option<WatsonUniformity> {
+    let mut pairs: Vec<(f64, f64)> = u
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(i, x)| {
+            let w = weights.map_or(1.0, |wv| wv[i]);
+            (x.is_finite() && w.is_finite() && w > 0.0).then_some((x.clamp(0.0, 1.0), w))
+        })
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mass: f64 = pairs.iter().map(|(_, w)| *w).sum();
+    if !(mass > 0.0) {
+        return None;
+    }
+    let mut cumulative = 0.0_f64;
+    let mut d = 0.0_f64;
+    for (x, w) in pairs.iter().copied() {
+        let before = cumulative / mass;
+        cumulative += w;
+        let after = cumulative / mass;
+        d = d.max((x - before).abs()).max((after - x).abs());
+    }
+    Some(WatsonUniformity {
+        statistic: d,
+        p_value: f64::NAN,
+        n: pairs.len(),
+    })
 }
 
 /// Closed-form asymptotic upper-tail p-value of Watson's `U²` under the uniform
@@ -277,9 +314,12 @@ fn coordinate_uniformity_impl(
             coords.iter().map(|&t| (t - lo) / span).collect()
         }
     };
-    match weights {
-        Some(w) => watson_u2_uniform_weighted(&u, w),
-        None => Some(watson_u2_uniform(&u)),
+    match topology {
+        CanonicalChartTopology::Circle { .. } => match weights {
+            Some(w) => watson_u2_uniform_weighted(&u, w),
+            None => Some(watson_u2_uniform(&u)),
+        },
+        CanonicalChartTopology::Interval => interval_uniformity(&u, weights),
     }
 }
 
@@ -918,8 +958,8 @@ pub struct AtomCoordinateFidelity {
     /// Watson's `U²` of the fitted coordinates against the uniform invariant
     /// measure (larger ⟺ less uniform). Rotation/reflection invariant.
     pub uniformity_statistic: f64,
-    /// Closed-form asymptotic p-value of `uniformity_statistic`. Small ⟺ the
-    /// coordinates are flagged non-uniform relative to the invariant measure.
+    /// Closed-form asymptotic p-value of the circle Watson statistic. `NaN` for
+    /// interval charts whose endpoints were fitted from these same coordinates.
     pub uniformity_p_value: f64,
     /// Arc-length (unit-speed) defect of the chart parameterization
     /// ([`crate::chart_canonicalization::chart_unit_speed_defect`]): speed
@@ -1615,6 +1655,14 @@ mod coordinate_fidelity_tests {
         assert!((weighted.statistic - unweighted.statistic).abs() < 1e-12);
         assert!((weighted.p_value - unweighted.p_value).abs() < 1e-12);
         assert_eq!(weighted.n, unweighted.n);
+    }
+
+    #[test]
+    fn interval_uniformity_keeps_the_right_endpoint_distinct() {
+        let coords = Array1::from_vec(vec![0.0, 0.5, 1.0]);
+        let result = coordinate_uniformity(coords.view(), &interval()).unwrap();
+        assert!((result.statistic - 1.0 / 3.0).abs() < 1e-12);
+        assert!(result.p_value.is_nan());
     }
 
     #[test]

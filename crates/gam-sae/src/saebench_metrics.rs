@@ -52,10 +52,10 @@ pub struct DoseResponseCalibrationReport {
     pub slope_through_origin: f64,
     /// Weighted R² of that no-intercept calibration fit.
     pub r2_through_origin: f64,
-    /// Weighted mean of `measured_nats / arc_length` for non-zero arcs.
-    pub mean_measured_nats_per_arc: f64,
-    /// Weighted coefficient of variation of `measured_nats / arc_length`.
-    pub cv_measured_nats_per_arc: f64,
+    /// Weighted mean of `measured_nats / arc_length²` for non-zero arcs.
+    pub mean_measured_nats_per_arc_squared: f64,
+    /// Weighted coefficient of variation of `measured_nats / arc_length²`.
+    pub cv_measured_nats_per_arc_squared: f64,
     /// Sum of accepted observation weights.
     pub effective_weight: f64,
 }
@@ -134,7 +134,7 @@ pub fn dose_response_calibration(
         xy += obs.weight * obs.predicted_nats * obs.measured_nats;
         y2 += obs.weight * obs.measured_nats * obs.measured_nats;
         if obs.arc_length > 0.0 {
-            let rate = obs.measured_nats / obs.arc_length;
+            let rate = obs.measured_nats / (obs.arc_length * obs.arc_length);
             rate_w += obs.weight;
             rate_sum += obs.weight * rate;
         }
@@ -153,7 +153,7 @@ pub fn dose_response_calibration(
     let mean_rate = rate_sum / rate_w;
     let rate_var = observations.iter().fold(0.0, |acc, obs| {
         if obs.arc_length > 0.0 {
-            let residual = obs.measured_nats / obs.arc_length - mean_rate;
+            let residual = obs.measured_nats / (obs.arc_length * obs.arc_length) - mean_rate;
             acc + obs.weight * residual * residual
         } else {
             acc
@@ -167,8 +167,8 @@ pub fn dose_response_calibration(
     Ok(DoseResponseCalibrationReport {
         slope_through_origin: slope,
         r2_through_origin: (1.0 - sse / y2).clamp(0.0, 1.0),
-        mean_measured_nats_per_arc: mean_rate,
-        cv_measured_nats_per_arc: cv,
+        mean_measured_nats_per_arc_squared: mean_rate,
+        cv_measured_nats_per_arc_squared: cv,
         effective_weight: weight_sum,
     })
 }
@@ -192,6 +192,27 @@ pub fn coordinate_posterior_from_precision(
     for (i, &m) in mean.iter().enumerate() {
         if !m.is_finite() {
             return Err(format!("coordinate_posterior: mean[{i}] is not finite"));
+        }
+    }
+    let max_abs = precision_row_major
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max);
+    if !max_abs.is_finite() {
+        return Err("coordinate_posterior: precision block contains a non-finite entry".into());
+    }
+    let symmetry_tol = f64::EPSILON * d.max(1) as f64 * max_abs.max(1.0);
+    for row in 0..d {
+        for col in 0..row {
+            let lower = precision_row_major[row * d + col];
+            let upper = precision_row_major[col * d + row];
+            if (lower - upper).abs() > symmetry_tol {
+                return Err(format!(
+                    "coordinate_posterior: precision block is not symmetric at ({row}, {col}): \
+                     {lower} versus {upper} (tolerance {symmetry_tol:e})"
+                ));
+            }
         }
     }
     let chol = cholesky_lower(precision_row_major, d)?;

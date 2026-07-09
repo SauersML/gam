@@ -1594,22 +1594,24 @@ impl PySaeAmortizedEncoder {
     /// solver's converged coordinates). The evidence chooses the encoder's
     /// capacity (linear vs a diagonal-quadratic head).
     #[new]
-    #[pyo3(signature = (train_x, train_logits, train_coords, train_amplitudes))]
+    #[pyo3(signature = (train_x, train_logits, train_coords, train_amplitudes, coord_periods))]
     fn new<'py>(
         train_x: PyReadonlyArray2<'py, f64>,
         train_logits: PyReadonlyArray2<'py, f64>,
         train_coords: Vec<PyReadonlyArray2<'py, f64>>,
         train_amplitudes: PyReadonlyArray2<'py, f64>,
+        coord_periods: Vec<Vec<Option<f64>>>,
     ) -> PyResult<Self> {
         let coords: Vec<Array2<f64>> = train_coords
             .iter()
             .map(|c| c.as_array().to_owned())
             .collect();
-        let encoder = gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder::fit(
+        let encoder = gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder::fit_with_axis_periods(
             train_x.as_array(),
             train_logits.as_array(),
             &coords,
             train_amplitudes.as_array(),
+            &coord_periods,
         )
         .map_err(py_value_error)?;
         Ok(Self { encoder })

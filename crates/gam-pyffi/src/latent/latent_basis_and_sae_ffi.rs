@@ -2375,12 +2375,13 @@ fn stagewise_atoms_py<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
-            // #2135 — emit the FULL-width decoder `B = Q B̃` so a reloaded
-            // checkpoint carries the canonical `M × p` block on the standard inner
-            // basis; the #1117 reduced frame is a fit-internal device and must not
-            // escape. Unchanged for un-reduced atoms.
+            // #2135/#2237 — persistence consumes BOTH fit-internal gauges: expand
+            // the reduced frame (`Q B̃`) and materialize the scale quotient
+            // (`exp(s_k) Q B̃`). A reloaded checkpoint therefore receives the
+            // physical `M × p` decoder and can set `log_amplitude = 0` without
+            // changing the fitted atom.
             "decoder_B",
-            atom.full_width_decoder().into_pyarray(py),
+            atom.physical_full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
         atom_dict.set_item("latent_dim", atom.latent_dim)?;
@@ -3471,14 +3472,13 @@ fn sae_manifold_fit_inner<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
-            // #2135 — emit the FULL-width decoder `B = Q B̃` (`M × p`). When this
-            // atom was #1117 rank-reduced, `decoder_coefficients` is the reduced
-            // `B̃` (`r × p`) in a fit-internal eigenvector frame; the OOS / steer /
-            // reconstruct consumers rebuild the standard `M`-column inner basis, so
-            // they must receive the re-expanded decoder that decodes that design.
-            // `full_width_decoder` is the stored block unchanged for un-reduced atoms.
+            // #2135/#2237 — emit the PHYSICAL full-width decoder
+            // `exp(s_k) Q B̃` (`M × p`). The rank-reduced frame `Q` and the
+            // quotient-scale coordinate `s_k` are both fit-internal; OOS, steering,
+            // reconstruction, and reload consumers rebuild the standard `M`-column
+            // basis with zero log-amplitude, so this boundary must materialize both.
             "decoder_B",
-            atom.full_width_decoder().into_pyarray(py),
+            atom.physical_full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
         atom_dict.set_item("basis_centers", py.None())?;
@@ -3709,16 +3709,15 @@ fn sae_manifold_fit_inner<'py>(
     //   * `recon_consistency` — mean per-element squared gap between the amortized
     //     reconstruction and the exact encode-by-inner-solve reconstruction (0 ⇒
     //     the IFT predictor is an exact first-order model of the encode map);
-    //   * `uncertified_fraction` — share of (row, atom) amortized encodes whose
-    //     Kantorovich certificate failed and fell back to the exact Newton (the
-    //     encoder's certifiable coverage of the fitted dictionary).
+    //   * `unconverged_fraction` — share of shared-residual row solves that did
+    //     not meet the first-order stationarity tolerance.
     // Best-effort: a degenerate atlas (no usable charts) yields no report rather
     // than aborting the fit payload (the co-training fold itself is advisory).
     if let Ok(consistency) = term.amortized_encoder_consistency(z_view.view(), &rho) {
         let cotrain = PyDict::new(py);
         cotrain.set_item("recon_consistency", consistency.recon_consistency)?;
-        cotrain.set_item("uncertified_fraction", consistency.uncertified_fraction)?;
-        cotrain.set_item("n_uncertified", consistency.n_uncertified)?;
+        cotrain.set_item("unconverged_fraction", consistency.unconverged_fraction)?;
+        cotrain.set_item("n_unconverged", consistency.n_unconverged)?;
         cotrain.set_item("n_encodes", consistency.n_encodes)?;
         out.set_item("cotrain", cotrain)?;
     }

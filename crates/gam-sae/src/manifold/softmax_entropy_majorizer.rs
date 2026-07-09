@@ -6,6 +6,15 @@
 // they keep the SAME module scope (`use super::*`), visibility, and the debug
 // oracles that pin them to the dense library routines.
 
+#[inline]
+fn softmax_entropy_log_plus_one(probability: f64) -> f64 {
+    if probability > 0.0 {
+        probability.ln() + 1.0
+    } else {
+        0.0
+    }
+}
+
 /// #1410 — single active-atom entry of the per-row softmax-entropy Gershgorin
 /// Loewner majorizer `D_kk = Σ_j |H_kj|` (#1419), computed WITHOUT materialising
 /// a full-`K` diagonal `d`.
@@ -23,7 +32,7 @@
 /// nothing.
 ///
 /// It reproduces `psd_majorizer_abs_row_sums` EXACTLY (same `(a, l, m)`
-/// algebra, same `ENTROPY_LOG_PROBABILITY_FLOOR`, same scaled formula), so the
+/// algebra and the same exact-zero continuation for underflowed probabilities), so the
 /// assembly, the criterion's `log|H|`, and the #1006 θ-adjoint still
 /// differentiate ONE operator. The shared `m = Σ_j a_j l_j` is the only `O(K)`
 /// pass; pass it in precomputed (`softmax_majorizer_log_mean`) so a row that
@@ -32,12 +41,8 @@
 /// dense `psd_majorizer_abs_row_sums` so the two cannot drift.
 #[inline]
 pub(crate) fn softmax_majorizer_log_mean(a: &[f64]) -> f64 {
-    let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
     a.iter()
-        .map(|&a_i| {
-            let l_i = a_i.max(floor).ln() + 1.0;
-            a_i * l_i
-        })
+        .map(|&a_i| a_i * softmax_entropy_log_plus_one(a_i))
         .sum()
 }
 
@@ -50,9 +55,8 @@ pub(crate) fn softmax_majorizer_log_mean(a: &[f64]) -> f64 {
 /// [`softmax_majorizer_log_mean`]; `O(1)` per entry, zero allocation.
 #[inline]
 fn softmax_dense_entropy_hessian_entry(a: &[f64], kk: usize, jj: usize, m: f64, scale: f64) -> f64 {
-    let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
-    let l_kk = a[kk].max(floor).ln() + 1.0;
-    let l_jj = a[jj].max(floor).ln() + 1.0;
+    let l_kk = softmax_entropy_log_plus_one(a[kk]);
+    let l_jj = softmax_entropy_log_plus_one(a[jj]);
     let indicator = if kk == jj { 1.0 } else { 0.0 };
     scale * a[kk] * (indicator * (m - l_kk - 1.0) + a[jj] * (l_kk + l_jj + 1.0 - 2.0 * m))
 }
@@ -63,8 +67,7 @@ fn softmax_dense_entropy_hessian_entry(a: &[f64], kk: usize, jj: usize, m: f64, 
 /// the `λ/τ²` penalty scale. `O(K)` time, zero allocation.
 #[inline]
 pub(crate) fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m: f64, scale: f64) -> f64 {
-    let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
-    let l_kk = a[kk].max(floor).ln() + 1.0;
+    let l_kk = softmax_entropy_log_plus_one(a[kk]);
     // Diagonal entry H_kk.
     let h_kk = scale * a[kk] * ((m - l_kk - 1.0) + a[kk] * (2.0 * l_kk + 1.0 - 2.0 * m));
     let mut acc = h_kk.abs();
@@ -73,7 +76,7 @@ pub(crate) fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m:
         if jj == kk {
             continue;
         }
-        let l_jj = a_jj.max(floor).ln() + 1.0;
+        let l_jj = softmax_entropy_log_plus_one(a_jj);
         let h_kj = scale * a[kk] * a_jj * (l_kk + l_jj + 1.0 - 2.0 * m);
         acc += h_kj.abs();
     }
@@ -105,13 +108,12 @@ fn active_softmax_majorizer_logit_derivative_entry(
     scale: f64,
     inv_tau: f64,
 ) -> f64 {
-    let floor = gam_terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
     let a_w = a[w];
     // ∂a_r/∂z_w = a_r(δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r ;
     // dm = Σ_r (da_r·l_r + a_r·dl_r). One O(K) pass.
     let da = |r: usize| a[r] * (if r == w { 1.0 } else { 0.0 } - a_w) * inv_tau;
-    let l = |r: usize| a[r].max(floor).ln() + 1.0;
-    let dl = |r: usize| da(r) / a[r].max(floor);
+    let l = |r: usize| softmax_entropy_log_plus_one(a[r]);
+    let dl = |r: usize| if a[r] > 0.0 { da(r) / a[r] } else { 0.0 };
     let dm: f64 = (0..a.len()).map(|r| da(r) * l(r) + a[r] * dl(r)).sum();
     let l_kk = l(kk);
     let da_kk = da(kk);

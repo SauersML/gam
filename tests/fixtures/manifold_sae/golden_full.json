@@ -470,9 +470,9 @@
   ],
   "cotrain": {
     "n_encodes": 10,
-    "n_uncertified": 1,
+    "n_unconverged": 1,
     "recon_consistency": 0.02,
-    "uncertified_fraction": 0.1
+    "unconverged_fraction": 0.1
   },
   "curvature_report": {
     "atoms": [

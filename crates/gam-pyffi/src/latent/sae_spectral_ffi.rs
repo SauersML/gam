@@ -2118,7 +2118,8 @@ fn chart_interp_score(
 /// rows along a steered arc: the unit-speed path coordinate, the local
 /// output-Fisher prediction in nats, the measured KL/behaviour change in nats,
 /// and a non-negative weight. Returns `{slope_through_origin, r2_through_origin,
-/// mean_measured_nats_per_arc, cv_measured_nats_per_arc, effective_weight}` from
+/// mean_measured_nats_per_arc_squared, cv_measured_nats_per_arc_squared,
+/// effective_weight}` from
 /// the audited [`saebench_metrics::dose_response_calibration`] — the #1942
 /// dose-response calibration figure (through-origin slope + weighted R², plus
 /// the unit-speed constancy kill-test via the nats-per-arc coefficient of
@@ -2148,10 +2149,13 @@ fn dose_response_calibration(
     out.set_item("slope_through_origin", report.slope_through_origin)?;
     out.set_item("r2_through_origin", report.r2_through_origin)?;
     out.set_item(
-        "mean_measured_nats_per_arc",
-        report.mean_measured_nats_per_arc,
+        "mean_measured_nats_per_arc_squared",
+        report.mean_measured_nats_per_arc_squared,
     )?;
-    out.set_item("cv_measured_nats_per_arc", report.cv_measured_nats_per_arc)?;
+    out.set_item(
+        "cv_measured_nats_per_arc_squared",
+        report.cv_measured_nats_per_arc_squared,
+    )?;
     out.set_item("effective_weight", report.effective_weight)?;
     Ok(out.unbind())
 }
@@ -2322,8 +2326,8 @@ mod ffi_completeness_tests {
                 py,
                 vec![
                     (1.0, 0.5, 1.0, 1.0),
-                    (2.0, 1.0, 2.0, 1.0),
-                    (3.0, 1.5, 3.0, 1.0),
+                    (2.0, 2.0, 4.0, 1.0),
+                    (3.0, 4.5, 9.0, 1.0),
                 ],
             )
             .expect("dose response calibration");
@@ -2336,7 +2340,7 @@ mod ffi_completeness_tests {
                 .unwrap();
             assert!((slope - 2.0).abs() < 1e-9, "slope = {slope}");
             let cv: f64 = d
-                .get_item("cv_measured_nats_per_arc")
+                .get_item("cv_measured_nats_per_arc_squared")
                 .unwrap()
                 .unwrap()
                 .extract()

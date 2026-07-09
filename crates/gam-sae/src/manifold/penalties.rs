@@ -66,8 +66,8 @@ use gam_linalg::faer_ndarray::FaerSvd;
 /// data-unit spectrum has no unit to contribute here). `min` (not mean) bounds
 /// the worst-case entry noise, so `ε_C` is an honest resolution floor for every
 /// edge in the component. With no effective co-fired data (`N_eff → 0`) the
-/// floor exceeds the whole spectrum and `n_C → 0`: the barrier honestly abstains
-/// — collapse of atoms no data supports carries no evidence cost.
+/// floor exceeds the whole spectrum and the identity-referenced log determinant
+/// tends to zero: the barrier honestly abstains.
 ///
 /// Local edge indices `jl, kl` index into the owning component's `atoms`.
 struct BarrierComponent {
@@ -330,8 +330,8 @@ impl SaeManifoldTerm {
         }
         // The Jeffreys barrier freezes the ROUTING-derived quantities only: the
         // coactivation weights `q_jk` AND the per-atom effective sample sizes
-        // `N_eff,k` (which set the occupancy scale `n_C` and the softening `ε_C`
-        // of every component — see [`BarrierComponent`]). The whole strength is
+        // `N_eff,k` (which set the softening `ε_C` of every component — see
+        // [`BarrierComponent`]). The whole strength is
         // the fixed Jeffreys exponent `½` (no evidence-derived `μ_jk` to freeze).
         // The decoder overlaps `o_jk` are deliberately NOT frozen — they are the
         // shapes the barrier is actively separating, so they stay LIVE and
@@ -342,8 +342,8 @@ impl SaeManifoldTerm {
     /// #1625 — the SEPARATION barrier's routing support: the coactivation pairs
     /// `(j, k, q_jk)` and the per-atom effective sample sizes `N_eff,k`,
     /// preferring the per-assembly FROZEN gate ([`Self::barrier_coactivation_gate`])
-    /// when present so the value and gradient seams read the SAME `q_jk`, the SAME
-    /// occupancy scale `n_C`, and the SAME softening `ε_C` across a Newton step
+    /// when present so the value and gradient seams read the SAME `q_jk` and the
+    /// SAME softening `ε_C` across a Newton step
     /// (see [`Self::refresh_barrier_coactivation_gate`]). Falls back to the LIVE
     /// [`Self::barrier_coactive_support`] for standalone calls made outside an
     /// inner-solve assembly (e.g. the #1522 prevention-vs-bandaid test and the
@@ -502,7 +502,7 @@ impl SaeManifoldTerm {
     /// the SAME summed-squared-gate currency the rank charge's
     /// `per_atom_effective_sample_size` (`fisher_n = Σ w²`) uses, restricted to
     /// the same relative-mass active support as the numerator so numerator,
-    /// denominator, occupancy scale `n_C`, and softening `ε_C` are one measure
+    /// denominator and softening `ε_C` are one measure
     /// (for hard-gated routings — JumpReLU/IBP/TopK — the truncated and full sums
     /// coincide exactly; for softmax the sub-floor tail is dropped from ALL of
     /// them consistently). Returned together so the frozen gate can pin both at
@@ -1074,48 +1074,46 @@ impl SaeManifoldTerm {
     /// `atom_curv` / `sep_rank1` carriers (matrix-free / framed path), in the
     /// full-`B` β layout. Returns `true` iff anything was written.
     ///
-    /// The barrier is the OCCUPANCY-SCALED SAE decoder Jeffreys prior
-    /// `P = −½ Σ_comp n_C · log det(F + ε_C·I)`, `F = Q ∘ O` (see
-    /// [`BarrierComponent`] for the derivation of the occupancy scale `n_C` and
-    /// the data-derived softening `ε_C`). Per component (`G ≜ (F + ε_C·I)⁻¹`):
+    /// The barrier is the SAE decoder Jeffreys prior
+    /// `P = −½ Σ_comp log det(F + ε_C·I)`, `F = Q ∘ O` (see
+    /// [`BarrierComponent`] for the data-derived softening `ε_C`). Per component
+    /// (`G ≜ (F + ε_C·I)⁻¹`):
     ///
-    /// GRADIENT. `∂P/∂o_e = −n_C·G[jₑ,kₑ]·q_e` (edge `e = (j,k)`, since
-    /// `F[j,k] = q_e·o_e` and `n_C`, `ε_C` are frozen routing constants), and
+    /// GRADIENT. `∂P/∂o_e = −G[jₑ,kₑ]·q_e` (edge `e = (j,k)`, since
+    /// `F[j,k] = q_e·o_e` and `ε_C` is a frozen routing constant), and
     /// `∂o_e/∂B` is the historical rank-aware carrier
     /// `v_e`: with `M = B_jB_kᵀ`, `S_· = B_·B_·ᵀ`, `D_· = ‖S_·‖_F`,
     /// `o_e = ‖M‖²_F/(D_jD_k)`,
     ///   `∂o_e/∂B_j = 2[ (M B_k)/(D_jD_k) − (o_e/D_j²) S_j B_j ]`,
     ///   `∂o_e/∂B_k = 2[ (Mᵀ B_j)/(D_jD_k) − (o_e/D_k²) S_k B_k ]`,
-    /// so `∂P/∂B = Σ_e α_e·v_e`, `α_e = penalty_scale·n_C·(−G[jₑ,kₑ]·q_e)`. For
+    /// so `∂P/∂B = Σ_e α_e·v_e`, `α_e = penalty_scale·(−G[jₑ,kₑ]·q_e)`. For
     /// the `K = 2` component `F = [[1,r],[r,1]]`, `r = q·o`, this is
-    /// `α = n_C·q²o/((1+ε)²−q²o²)·penalty_scale ≥ 0` — the same repulsive
-    /// `∂o/∂B` force as the historical pairwise barrier, but with the Jeffreys
-    /// `½` fixing the per-observation strength, the occupancy `n_C` making the
-    /// restoring force extensive in the co-fired data, and NO smoothstep gate:
+    /// `α = q²o/((1+ε)²−q²o²)·penalty_scale ≥ 0` — the same repulsive
+    /// `∂o/∂B` force as the historical pairwise barrier, with the Jeffreys
+    /// `½` fixing its strength and no smoothstep gate:
     /// the force vanishes as `O(o)` for separated atoms (so it cannot drag a
     /// healthy fit off the data optimum, the #1625 concern) and diverges as
     /// `det F → 0`, an automatic soft gate.
     ///
     /// CURVATURE. `F` is LINEAR in the overlaps `o_e`, so the overlap-space Hessian
     /// is exactly Gauss–Newton and PSD:
-    ///   `M[a,b] = ∂²P/∂o_a∂o_b = n_C·q_a q_b (G[jₐ,m_b]G[kₐ,l_b] + G[jₐ,l_b]G[kₐ,m_b])`
+    ///   `M[a,b] = ∂²P/∂o_a∂o_b = q_a q_b (G[jₐ,m_b]G[kₐ,l_b] + G[jₐ,l_b]G[kₐ,m_b])`
     /// (`a = (jₐ,kₐ)`, `b = (l_b,m_b)`), and the β-Hessian's PSD part is
     /// `Σ_{a,b} M[a,b] v_a v_bᵀ`. Eigendecomposing `M = Σ_r λ_r e_r e_rᵀ` gives the
     /// exact rank-1 carriers `(λ_r, w_r)`, `w_r = Σ_a e_r[a] v_a`, each PSD. For a
     /// single-edge component this reduces to one rank-1 `∂²P/∂o²·v vᵀ`,
     /// bit-compatible with the historical self-concordant rank-1. The remaining
     /// indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part is handled by the per-atom
-    /// Levenberg ridge `2|α_e|·o_e/D_·` (`α_e` already carries `n_C`, so the
-    /// ridge scales with the same occupancy as the force it dominates), which
+    /// Levenberg ridge `2|α_e|·o_e/D_·`, which
     /// dominates its NEGATIVE part: the
     /// negative curvature of the cosine² overlap only appears past `o > ½` and
     /// scales like `2(2o−1)⁺·|α_e|/D_· ≤ 2o·|α_e|/D_·` (at small `o` the overlap
     /// sits at its minimum, so the dropped term is PSD and needs no domination —
     /// the metric merely under-counts positive curvature there, which the line
     /// search absorbs). The total metric GN + ridge is PSD by construction.
-    /// Value (`−½·n_C·Σ ln(λ+ε_C)`), gradient (`n_C·G`), and curvature (`n_C·GN`
-    /// + `|α|`-ridge) all read `n_C` and `ε_C` from the SAME
-    /// [`BarrierComponent`], so the three seams cannot desync.
+    /// Value (`−½·Σ ln(λ+ε_C)`), gradient (`G`), and curvature (GN plus the
+    /// `|α|` ridge) all read `ε_C` from the same [`BarrierComponent`], so the
+    /// three seams cannot desync.
     pub(crate) fn add_sae_separation_barrier(
         &self,
         sys: &mut ArrowSchurSystem,

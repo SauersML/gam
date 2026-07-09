@@ -13,6 +13,24 @@ const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 /// resolution.
 const ARD_SPREAD_FLOOR: f64 = 1.0e-12;
 
+/// Put one softmax-logit row in the reference-logit chart used by the joint
+/// solver. Kept row-local so Newton's disjoint row update can canonicalize in
+/// the same worker instead of making another serial `N × K` pass.
+#[inline]
+fn canonicalize_softmax_logit_row(logits: &mut [f64]) {
+    match logits.len() {
+        0 => {}
+        1 => logits[0] = 0.0,
+        k => {
+            let reference = logits[k - 1];
+            for logit in &mut logits[..k - 1] {
+                *logit -= reference;
+            }
+            logits[k - 1] = 0.0;
+        }
+    }
+}
+
 /// Per-axis spread of a coordinate column used for the ARD moment-match (F3): the
 /// population variance on a flat axis, and the circular variance `1 − R`
 /// (`R = |mean e^{iθ}|`, `θ = 2π t / period`) on a periodic axis — the wrap-aware
@@ -211,9 +229,46 @@ impl SaeManifoldTerm {
     }
 
     pub(crate) fn refresh_basis_from_current_coords(&mut self) -> Result<(), String> {
-        for atom_idx in 0..self.k_atoms() {
-            let coords = self.assignment.coords[atom_idx].as_matrix();
-            self.atoms[atom_idx].refresh_basis(coords.view())?;
+        let parallel = self.n_obs() >= SAE_LOSS_PARALLEL_ROW_MIN
+            && self.k_atoms() > 1
+            && rayon::current_thread_index().is_none();
+        self.refresh_basis_from_current_coords_with_parallelism(parallel)
+    }
+
+    /// Refresh every atom's basis cache from its matching coordinate block.
+    ///
+    /// Atoms are independent: atom `k` reads only coordinate block `k` and
+    /// writes only basis cache `k`. Rayon indexed collection preserves atom
+    /// order, and errors are inspected serially afterward so the lowest-indexed
+    /// failure remains deterministic. The explicit policy argument lets the
+    /// parallelism-invariance regression exercise both paths without changing
+    /// the process-global Rayon pool.
+    fn refresh_basis_from_current_coords_with_parallelism(
+        &mut self,
+        parallel: bool,
+    ) -> Result<(), String> {
+        debug_assert_eq!(self.atoms.len(), self.assignment.coords.len());
+        if parallel {
+            use rayon::prelude::*;
+            let outcomes: Vec<Result<(), String>> = self
+                .atoms
+                .par_iter_mut()
+                .zip(self.assignment.coords.par_iter())
+                .map(|(atom, coord)| {
+                    with_nested_parallel(|| {
+                        let coords = coord.as_matrix();
+                        atom.refresh_basis(coords.view())
+                    })
+                })
+                .collect();
+            for outcome in outcomes {
+                outcome?;
+            }
+        } else {
+            for (atom, coord) in self.atoms.iter_mut().zip(&self.assignment.coords) {
+                let coords = coord.as_matrix();
+                atom.refresh_basis(coords.view())?;
+            }
         }
         Ok(())
     }
@@ -3877,6 +3932,27 @@ impl SaeManifoldTerm {
         step_size: f64,
         refresh_basis: bool,
     ) -> Result<(), String> {
+        self.apply_newton_step_impl_with_parallelism(
+            delta_ext_coord,
+            delta_beta,
+            step_size,
+            refresh_basis,
+            None,
+        )
+    }
+
+    /// Implementation shared by the production auto-policy and the
+    /// parallelism-invariance regression. `forced_parallelism == None` selects
+    /// the production policy; tests force the serial and indexed-parallel paths
+    /// inside local Rayon pools without mutating global process state.
+    fn apply_newton_step_impl_with_parallelism(
+        &mut self,
+        delta_ext_coord: ArrayView1<'_, f64>,
+        delta_beta: ArrayView1<'_, f64>,
+        step_size: f64,
+        refresh_basis: bool,
+        forced_parallelism: Option<bool>,
+    ) -> Result<(), String> {
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::apply_newton_step: step_size must be finite and positive; got {step_size}"
@@ -3886,6 +3962,13 @@ impl SaeManifoldTerm {
         let q = self.assignment.row_block_dim();
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
+        let at_top_level = rayon::current_thread_index().is_none();
+        let parallel_rows = forced_parallelism
+            .unwrap_or(n >= SAE_LOSS_PARALLEL_ROW_MIN && at_top_level);
+        let parallel_atoms = forced_parallelism.unwrap_or(
+            n >= SAE_LOSS_PARALLEL_ROW_MIN && k_atoms > 1 && at_top_level,
+        );
+        let softmax = matches!(self.assignment.mode, AssignmentMode::Softmax { .. });
         // #972 / #977 T1: when the most recent assembly built the factored
         // β-tier, `delta_beta` is a factored ΔC (length `factored_border_dim`)
         // that must be LIFTED through each active frame (`ΔB_k = ΔC_k U_kᵀ`)

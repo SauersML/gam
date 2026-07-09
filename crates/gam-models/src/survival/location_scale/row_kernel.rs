@@ -2880,15 +2880,24 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
-    /// Survival log value and ratio derivatives.  The CLogLog survival ratio is
-    /// `r = exp(eta)`, and its derivatives are also `exp(eta)`; these are not
-    /// derivative-rescaled because they are already ratio derivatives with
-    /// respect to the unshifted predictor.  Unlike the rescaled PDF path, this
-    /// evaluator therefore does not depend on the derivative log-scale.  The
-    /// function value (`-exp(eta)` = `log S`) is returned unshifted.
+    /// Survival log value and ratio derivatives, with the same log-scale shift
+    /// on the derivative magnitudes as [`Self::exact_log_pdf_derivatives_rescaled`].
+    /// For CLogLog the ratio derivatives are all `exp(eta)`, which enter the
+    /// joint Hessian side-by-side with the pdf stack's `exp(eta − L)` terms:
+    /// scaling one stack but not the other breaks the documented
+    /// `H_scaled = exp(−L)·H_exact` contract on every censored or
+    /// left-truncated row (their curvature would carry an extra `exp(L)`),
+    /// corrupting the `logdet(H_exact) = logdet(H_scaled) + p·L` correction —
+    /// and lets an unscaled `exp(eta)` overflow drop censored rows the pdf
+    /// path would have kept.  The function value (`-exp(eta)` = `log S`) is
+    /// returned unshifted, exactly like the pdf value channel.
+    /// `deriv_log_scale` is only ever nonzero for CLogLog
+    /// (see `hessian_deriv_log_rescale`), so the other links ignore it,
+    /// mirroring the pdf evaluator.
     pub(crate) fn exact_survival_neglog_derivatives_fourth_rescaled(
         inverse_link: &InverseLink,
         eta: f64,
+        deriv_log_scale: f64,
     ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(StandardLink::Probit) => {
@@ -2911,8 +2920,9 @@ impl SurvivalLocationScaleFamily {
                 ))
             }
             InverseLink::Standard(StandardLink::CLogLog) => {
-                let t = eta.exp();
-                Ok((-t, t, t, t, t))
+                let t_val = eta.exp(); // for function value (may be Inf)
+                let t_deriv = (eta - deriv_log_scale).exp(); // for derivatives
+                Ok((-t_val, t_deriv, t_deriv, t_deriv, t_deriv))
             }
             InverseLink::Standard(StandardLink::Identity) => {
                 let s = 1.0 - eta;
@@ -2962,7 +2972,9 @@ impl SurvivalLocationScaleFamily {
         let t_val = u1.exp();
         let t_deriv = (u1 - deriv_log_scale).exp();
         let deriv_scale = (-deriv_log_scale).exp();
-        let surv = (-t_val, t_val, t_val, t_val, t_val);
+        // Survival ratio derivatives share the same rescale as the pdf stack so
+        // event and censored rows stay on one uniform exp(-L) Hessian scaling.
+        let surv = (-t_val, t_deriv, t_deriv, t_deriv, t_deriv);
         let logpdf = (
             u1 - t_val,
             deriv_scale - t_deriv,
@@ -3054,11 +3066,12 @@ impl SurvivalLocationScaleFamily {
         let u0 = state.h0 + state.q0;
         let u1 = state.h1 + state.q1;
 
-        let (log_s0, r0, dr0, ddr0, dddr0) =
-            Self::exact_survival_neglog_derivatives_fourth_rescaled(&self.inverse_link, u0)
-                .map_err(|e| {
-                    format!("inverse-link survival evaluation failed at row {row} entry: {e}")
-                })?;
+        let (log_s0, r0, dr0, ddr0, dddr0) = Self::exact_survival_neglog_derivatives_fourth_rescaled(
+            &self.inverse_link,
+            u0,
+            deriv_log_scale,
+        )
+        .map_err(|e| format!("inverse-link survival evaluation failed at row {row} entry: {e}"))?;
 
         // Fast path: for CLogLog the survival and log-pdf evaluators both need
         // `exp(u1)`, and the PDF derivatives also need
@@ -3071,13 +3084,14 @@ impl SurvivalLocationScaleFamily {
             ) {
                 Self::clglog_exit_pair(u1, deriv_log_scale)
             } else {
-                let surv =
-                    Self::exact_survival_neglog_derivatives_fourth_rescaled(&self.inverse_link, u1)
-                        .map_err(|e| {
-                            format!(
-                                "inverse-link survival evaluation failed at row {row} exit: {e}"
-                            )
-                        })?;
+                let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
+                    &self.inverse_link,
+                    u1,
+                    deriv_log_scale,
+                )
+                .map_err(|e| {
+                    format!("inverse-link survival evaluation failed at row {row} exit: {e}")
+                })?;
 
                 let pdf = Self::exact_log_pdf_derivatives_rescaled(
                     &self.inverse_link,

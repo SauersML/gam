@@ -3674,18 +3674,16 @@ impl SaeManifoldTerm {
     /// dictionary. Builds the offline certified [`EncodeAtlas`] over this term's
     /// frozen atoms and encodes a target corpus `targets` (`n × p`) through the
     /// per-chart distilled Jacobian predictor, with the Kantorovich certificate
-    /// gating each row and an exact-solve fallback for the rows the amortized
-    /// predictor cannot certify. Returns one [`EncodeResult`] per atom (the
-    /// per-atom encoded coordinates + per-row certificate mask), in dictionary
-    /// order.
+    /// supplying chart-aware starts. Those starts are then refined together by
+    /// the frozen dictionary's shared-residual objective. The returned
+    /// [`JointEncodeResult`] carries one coordinate block per atom plus a
+    /// numerical joint-stationarity mask; it does not mislabel a composition of
+    /// per-atom certificates as a certificate for the multi-atom problem.
     ///
-    /// This is the thread's "encoder + certificate-gated exact fallback"
-    /// deployment made reachable from a fit: the distilled map approximates
-    /// inference at one mat-vec/row, and any row whose amortized prediction fails
-    /// `h ≤ ½` falls back to the certified IFT-warm-start Newton encode
-    /// ([`EncodeAtlas::certified_encode_row`]); rows that still cannot be
-    /// certified ride the [`EncodeResult::encode_uncertified_count`] flag for the
-    /// upstream exact multi-start solve (honesty, never a silent wrong encode).
+    /// The distilled map and per-atom atlas are initializer machinery only. A
+    /// row whose cheap start is not certifiable tries the atlas's colder start;
+    /// either way, the final coordinates come from the joint residual solve and
+    /// its explicit first-order convergence verdict.
     ///
     /// Magic by default: the atlas's worst-case bounds are auto-derived from the
     /// fit — `amplitude_bound[k]` is the largest fitted assignment mass `a[i,k]`
@@ -3699,7 +3697,7 @@ impl SaeManifoldTerm {
         &self,
         targets: ArrayView2<'_, f64>,
         amplitudes: ArrayView2<'_, f64>,
-    ) -> Result<Vec<crate::encode::EncodeResult>, String> {
+    ) -> Result<crate::encode::JointEncodeResult, String> {
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
         let n = targets.nrows();
@@ -3779,128 +3777,86 @@ impl SaeManifoldTerm {
         // Euclidean-metric, prior-free fits (empty `log_ard`) skip this branch and
         // take the cascade below bit-for-bit unchanged.
         let metric = self.row_metric.as_ref().filter(|m| m.whitens_likelihood());
-        let prior_active = self
+        let (metric_rank, metric_norm_bound) = match metric {
+            Some(m) => {
+                if m.p_out() != p || m.n_rows() != n {
+                    return Err(format!(
+                        "SaeManifoldTerm::amortized_encode_target: row_metric is ({} rows, \
+                         p={}) but target is (n={n}, p={p})",
+                        m.n_rows(),
+                        m.p_out()
+                    ));
+                }
+                let bound = m.row_traces().iter().copied().fold(0.0_f64, f64::max);
+                (m.metric_rank(), bound)
+            }
+            None => (0usize, 1.0_f64),
+        };
+        let mut coords: Vec<Array2<f64>> = self
             .atoms
             .iter()
-            .any(|a| a.ard_precisions.as_ref().is_some_and(|pa| !pa.is_empty()));
-        if metric.is_some() || prior_active {
-            let (metric_rank, metric_norm_bound) = match metric {
-                Some(m) => {
-                    if m.p_out() != p || m.n_rows() != n {
-                        return Err(format!(
-                            "SaeManifoldTerm::amortized_encode_target: row_metric is ({} rows, \
-                             p={}) but target is (n={n}, p={p})",
-                            m.n_rows(),
-                            m.p_out()
-                        ));
-                    }
-                    // max_n tr(M_n) — conservative upper bound on max_n ‖M_n‖ (the
-                    // offline Lipschitz scale); `row_traces()` is the criterion-facing
-                    // (un-floored) trace stack the metric already carries.
-                    let bound = m.row_traces().iter().copied().fold(0.0_f64, f64::max);
-                    (m.metric_rank(), bound)
-                }
-                // Prior-only (Euclidean metric): identity whitening, unit Lipschitz
-                // scale — only the ARD prior departs from the Euclidean field.
-                None => (0usize, 1.0_f64),
-            };
-            let mut coords: Vec<Array2<f64>> = self
-                .atoms
-                .iter()
-                .map(|a| Array2::<f64>::zeros((n, a.latent_dim)))
-                .collect();
-            let mut certified: Vec<Vec<bool>> = vec![vec![false; n]; k_atoms];
-            for row in 0..n {
-                // The row's metric factor `U_n ∈ ℝ^{p×rank}` (`factor_entry` reads the
-                // un-floored criterion-face factors), materialized once and shared
-                // across atoms (the metric is atom-independent — output-space). `None`
-                // when no likelihood-whitening metric is active (identity whitening).
-                let u_row = metric.map(|m| {
-                    Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| {
-                        m.factor_entry(row, i, k)
-                    })
-                });
-                for atom_idx in 0..k_atoms {
-                    // The atom's fitted per-axis ARD precisions (empty ⇒ prior-free).
-                    let prior_alpha = self.atoms[atom_idx]
-                        .ard_precisions
-                        .as_ref()
-                        .filter(|pa| !pa.is_empty())
-                        .and_then(|pa| pa.as_slice());
-                    let objective = crate::encode::EncodeObjective {
-                        metric_factor: u_row.as_ref().map(|u| u.view()),
-                        prior_alpha,
-                        metric_norm_bound,
-                    };
-                    let amp = amplitudes[[row, atom_idx]];
-                    // Same amortized-then-certified cascade as the Euclidean path,
-                    // both tiers certifying under the objective: the one-mat-vec
-                    // distilled predictor first, the certified IFT-warm-start Newton
-                    // encode only for rows it cannot certify.
-                    let (mut t, mut cert) = atlas.amortized_encode_row_with_objective(
-                        &self.atoms[atom_idx],
+            .map(|a| Array2::<f64>::zeros((n, a.latent_dim)))
+            .collect();
+        let mut converged = vec![false; n];
+
+        for row in 0..n {
+            let u_row = metric.map(|m| {
+                Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| {
+                    m.factor_entry(row, i, k)
+                })
+            });
+            let mut starts = Vec::with_capacity(k_atoms);
+            for atom_idx in 0..k_atoms {
+                let atom = &self.atoms[atom_idx];
+                let prior_alpha = atom
+                    .ard_precisions
+                    .as_ref()
+                    .filter(|pa| !pa.is_empty())
+                    .and_then(|pa| pa.as_slice());
+                let objective = crate::encode::EncodeObjective {
+                    metric_factor: u_row.as_ref().map(|u| u.view()),
+                    prior_alpha,
+                    metric_norm_bound,
+                };
+                let amplitude = amplitudes[[row, atom_idx]];
+                let (mut start, start_cert) = atlas.amortized_encode_row_with_objective(
+                    atom,
+                    atom_idx,
+                    targets.row(row),
+                    amplitude,
+                    &objective,
+                )?;
+                if !start_cert.certified() {
+                    let (cold, cold_cert) = atlas.certified_encode_row_with_objective(
+                        atom,
                         atom_idx,
                         targets.row(row),
-                        amp,
+                        amplitude,
                         &objective,
                     )?;
-                    if !cert.certified() {
-                        let (t_c, cert_c) = atlas.certified_encode_row_with_objective(
-                            &self.atoms[atom_idx],
-                            atom_idx,
-                            targets.row(row),
-                            amp,
-                            &objective,
-                        )?;
-                        if cert_c.certified() {
-                            t = t_c;
-                            cert = cert_c;
-                        }
-                    }
-                    if cert.certified() {
-                        coords[atom_idx].row_mut(row).assign(&t);
-                        certified[atom_idx][row] = true;
+                    // A valid per-atom certificate improves the initializer. If it
+                    // is unavailable, retain the finite amortized chart start; the
+                    // joint solver below, not this initializer, decides validity.
+                    if cold_cert.certified() {
+                        start = cold;
                     }
                 }
+                starts.push(start);
             }
-            let mut results = Vec::with_capacity(k_atoms);
-            for atom_idx in 0..k_atoms {
-                results.push(crate::encode::EncodeResult::from_rows(
-                    std::mem::take(&mut coords[atom_idx]),
-                    std::mem::take(&mut certified[atom_idx]),
-                ));
-            }
-            return Ok(results);
-        }
 
-        // Euclidean path (bit-for-bit unchanged): per-atom amortized encode with a
-        // certificate-gated exact-solve fallback — a row whose distilled prediction
-        // fails `h ≤ ½` is retried through the certified IFT-warm-start Newton path;
-        // a row that still cannot be certified stays flagged for the upstream
-        // multi-start solve. (The atlas is rho-free; the per-row amplitudes already
-        // carry the rho-resolved assignment masses the caller produced upstream.)
-        let mut results = Vec::with_capacity(k_atoms);
-        for atom_idx in 0..k_atoms {
-            let atom = &self.atoms[atom_idx];
-            let amp_col = amplitudes.column(atom_idx).to_owned();
-            let amortized =
-                atlas.amortized_encode_batch(atom, atom_idx, targets, amp_col.view())?;
-            let mut coords = amortized.coords;
-            let mut certified = amortized.certified;
-            for row in 0..n {
-                if certified[row] {
-                    continue;
-                }
-                let (t, cert) =
-                    atlas.certified_encode_row(atom, atom_idx, targets.row(row), amp_col[row])?;
-                if cert.certified() {
-                    coords.row_mut(row).assign(&t);
-                    certified[row] = true;
-                }
+            let (joint, row_converged) = crate::encode::joint_encode_refine_row(
+                &self.atoms,
+                &starts,
+                targets.row(row),
+                amplitudes.row(row),
+                u_row.as_ref().map(|u| u.view()),
+            )?;
+            for atom_idx in 0..k_atoms {
+                coords[atom_idx].row_mut(row).assign(&joint[atom_idx]);
             }
-            results.push(crate::encode::EncodeResult::from_rows(coords, certified));
+            converged[row] = row_converged;
         }
-        Ok(results)
+        Ok(crate::encode::JointEncodeResult::new(coords, converged))
     }
 
     /// #1026 — the fitted per-row assignment masses `a[i,k]` (the activation
@@ -3936,7 +3892,7 @@ impl SaeManifoldTerm {
         &self,
         targets: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
-    ) -> Result<Vec<crate::encode::EncodeResult>, String> {
+    ) -> Result<crate::encode::JointEncodeResult, String> {
         let amplitudes = self.fitted_assignment_amplitudes(rho)?;
         self.amortized_encode_target(targets, amplitudes.view())
     }
@@ -3957,16 +3913,12 @@ impl SaeManifoldTerm {
     ///   curvature, poorly-charted regions) scores high. Minimising this jointly
     ///   with REML steers the fit toward dictionaries that admit a fast,
     ///   faithful amortized encode — the architectural co-adaptation #1154 adds.
-    /// * `uncertified_fraction`: the share of (row, atom) encodes whose
-    ///   Kantorovich certificate failed (`h > ½`), i.e. that fell back to the
-    ///   certified IFT-warm-start Newton. This is the encoder's *certifiable coverage*
-    ///   of the dictionary; co-training rewards dictionaries the cheap encode
-    ///   certifies, not just ones it happens to land.
+    /// * `unconverged_fraction`: the share of rowwise joint shared-residual
+    ///   solves that did not meet the first-order stationarity tolerance.
     ///
-    /// The certificate keeps every accepted amortized coord honest (uncertified
-    /// rows already ride the exact fallback inside `amortized_encode_target`), so
-    /// this metric never silently trusts a wrong encode — it MEASURES how much of
-    /// the dictionary the cheap encoder can faithfully and certifiably invert.
+    /// Shared-residual refinement keeps the reported reconstruction tied to the
+    /// fitted multi-atom objective; the convergence fraction records rows that
+    /// did not reach its first-order tolerance.
     pub fn amortized_encoder_consistency(
         &self,
         targets: ArrayView2<'_, f64>,
@@ -3991,23 +3943,14 @@ impl SaeManifoldTerm {
         // Build the amortized reconstruction Σ_k z_k · Φ_k(t̂_k) B_k by decoding
         // each atom's amortized coords through that atom's own basis evaluator.
         let mut amortized_recon = Array2::<f64>::zeros((n, p));
-        let mut uncertified = 0usize;
         for atom_idx in 0..k_atoms {
             let atom = &self.atoms[atom_idx];
-            let result = &encodes[atom_idx];
-            // An atom with no basis evaluator cannot decode an amortized
-            // reconstruction; every one of its rows is necessarily uncertified
-            // (the encode flagged them all), so it contributes nothing to the
-            // amortized recon and its full row-count to the uncertified tally.
-            // Count it and skip the decode rather than erroring — the consistency
-            // fold stays a bounded penalty, never a hard abort of the criterion.
-            let Some(evaluator) = atom.basis_evaluator.as_ref() else {
-                uncertified += n;
-                continue;
-            };
-            uncertified += result.encode_uncertified_count;
+            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+                format!("amortized_encoder_consistency: atom {atom_idx} has no basis evaluator")
+            })?;
+            let coord_block = &encodes.coords[atom_idx];
             // Decode the amortized coords: Φ_k(t̂) is (n × M_k); B_k is (M_k × p).
-            let (phi, _jac) = evaluator.evaluate(result.coords.view())?;
+            let (phi, _jac) = evaluator.evaluate(coord_block.view())?;
             // Decode `Φ_k(t̂) · B_k` (n×M · M×p) through the faer GEMM; small
             // shapes fall back to `ndarray::dot` inside `fast_ab` (reduction
             // order may differ, acceptable per the crate convention).
@@ -4032,21 +3975,21 @@ impl SaeManifoldTerm {
         }
         let denom = (n.max(1) * p.max(1)) as f64;
         let recon_consistency = sse / denom;
-        let total_encodes = (n * k_atoms).max(1) as f64;
-        let uncertified_fraction = uncertified as f64 / total_encodes;
+        let total_encodes = n.max(1) as f64;
+        let unconverged_fraction = encodes.unconverged_count as f64 / total_encodes;
 
         Ok(AmortizedEncoderConsistency {
             recon_consistency,
-            uncertified_fraction,
-            n_uncertified: uncertified,
-            n_encodes: n * k_atoms,
+            unconverged_fraction,
+            n_unconverged: encodes.unconverged_count,
+            n_encodes: n,
         })
     }
 
     /// #1154 — the co-trained REML criterion: the exact REML criterion at `rho`
     /// PLUS the amortized-encoder consistency penalty, so the outer optimizer
-    /// co-adapts the dictionary + smoothing parameters λ TOWARD a dictionary the
-    /// fast amortized encoder can faithfully and certifiably invert.
+    /// co-adapts the dictionary + smoothing parameters λ toward a dictionary the
+    /// fast initializer and joint refinement can faithfully invert.
     ///
     /// This is Design A of #1154. The inner solve still converges the `(t, β)`
     /// system to stationarity at the engine's current ρ (so the implicit-function
@@ -4056,7 +3999,7 @@ impl SaeManifoldTerm {
     ///
     /// ```text
     ///   J_cotrain(ρ) = REML(ρ)  +  w · ‖x̂_amortized − x̂_exact‖²/(n·p)
-    ///                            +  w_cert · uncertified_fraction
+    ///                            +  w_conv · unconverged_fraction
     /// ```
     ///
     /// folds the post-fit amortized-encode quality into the ranked objective. The
@@ -4119,26 +4062,23 @@ impl SaeManifoldTerm {
         let reml_scale = reml_cost.abs().max(1.0);
         reml_cost
             + COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
-            + COTRAIN_CERT_WEIGHT * reml_scale * consistency.uncertified_fraction
+            + COTRAIN_CONVERGENCE_WEIGHT * reml_scale * consistency.unconverged_fraction
     }
 
     /// #1154 item 2 — warm-start the inner latent coordinates from the amortized
-    /// encoder (Design A). Builds the per-chart IFT-Jacobian atlas from the
-    /// CURRENT dictionary, runs the one-mat-vec amortized encode of `target`
-    /// against each atom at the rho-resolved assignment masses, and overwrites
-    /// each atom's stored latent coords with the predicted `t̂` ON THE ROWS THE
-    /// KANTOROVICH CERTIFICATE ACCEPTS. Uncertified rows are left at their
-    /// current coords (the previous-iterate start), so the
-    /// warm-start can only HELP — a row the cheap predictor cannot certify never
-    /// corrupts the seed. The subsequent inner Newton refines from this seed to
+    /// encoder (Design A). Builds per-chart starts from the current dictionary,
+    /// refines all atoms against the shared row residual, and overwrites stored
+    /// latent coordinates only on rows whose joint solve reaches first-order
+    /// stationarity. Unconverged rows are left at their current coordinates, so the
+    /// warm-start can only help. The subsequent inner Newton refines from this seed to
     /// the SAME stationary point (the warm-start changes only the basin entry,
     /// not the root), so the REML λ-gradient stays exactly the implicit-function
     /// path and the criterion is unchanged at convergence — the amortized encoder
     /// only accelerates/co-adapts the inner solve, it never replaces the
     /// stationary point.
     ///
-    /// Returns the number of ROWS actually warm-started — rows that carried a
-    /// certified prediction AND cleared the per-row acceptance guard — for
+    /// Returns the number of rows actually warm-started — rows whose joint solve
+    /// converged and cleared the per-row acceptance guard — for
     /// instrumentation / tests. A first-build dictionary with no usable charts, or
     /// an already-converged one whose seeds are all rejected, simply warm-starts
     /// nothing and returns 0 (the inner state is left byte-for-byte unchanged).
@@ -4157,11 +4097,11 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         // Per-row reconstruction squared error BEFORE any seed is applied. The
         // amortized encoder is an approximate inverse: on a not-yet-converged
-        // dictionary its certified rows accelerate the inner solve, but against an
+        // dictionary its converged rows accelerate the inner solve, but against an
         // ALREADY-converged (per-row optimal) dictionary a seed can only move a
         // coord off its optimum. Adopting such a seed would corrupt a good inner
         // state — precisely the regression the warm-start contract forbids ("changes
-        // basin entry, not root"). So each certified seed is applied under a per-row
+        // basin entry, not root"). So each converged seed is applied under a per-row
         // acceptance guard: a row keeps the encoder coord only if it does not worsen
         // that row's reconstruction. This makes the warm-start a monotone operation
         // on the reconstruction objective (post-warm per-row SSE ≤ pre-warm), so
@@ -4181,14 +4121,14 @@ impl SaeManifoldTerm {
         let orig_coords: Vec<Array2<f64>> = (0..k_atoms)
             .map(|atom_idx| self.assignment.coords[atom_idx].as_matrix())
             .collect();
-        // Tentatively apply every certified seed, then accept/reject per row.
+        // Tentatively apply every converged joint solution, then accept/reject per row.
         let mut candidate_rows: Vec<bool> = vec![false; n];
         for atom_idx in 0..k_atoms {
             let d = self.atoms[atom_idx].latent_dim;
             if d == 0 {
                 continue;
             }
-            let result = &encodes[atom_idx];
+            let coord_block = &encodes.coords[atom_idx];
             let mut coords = orig_coords[atom_idx].clone();
             if coords.dim() != (n, d) {
                 return Err(format!(
@@ -4197,11 +4137,11 @@ impl SaeManifoldTerm {
                 ));
             }
             for row in 0..n {
-                if !result.certified[row] {
+                if !encodes.converged[row] {
                     continue;
                 }
                 for axis in 0..d {
-                    coords[[row, axis]] = result.coords[[row, axis]];
+                    coords[[row, axis]] = coord_block[[row, axis]];
                 }
                 candidate_rows[row] = true;
             }
@@ -8211,7 +8151,14 @@ impl SaeManifoldTerm {
                 .try_assignments_row_for_rho_into(row, rho, &mut assignments)?;
             fitted.fill(0.0);
             f_rho.fill(0.0);
+            let row_active = self
+                .last_row_layout
+                .as_ref()
+                .map(|layout| layout.active_atoms[row].as_slice());
             for k in 0..k_atoms {
+                if row_active.is_some_and(|active| active.binary_search(&k).is_err()) {
+                    continue;
+                }
                 self.atoms[k].fill_decoded_row(row, &mut decoded_rows[k]);
                 // Ungated (#1026 background-tier) atoms have a force-fixed unit
                 // gate (`has_ungated` override), so their mass `a_k ≡ 1` is
@@ -8282,6 +8229,11 @@ impl SaeManifoldTerm {
                 t[row_base + pos] += row_weight * contribution;
             }
             for channel in &border {
+                if row_active.is_some_and(|active| {
+                    active.binary_search(&channel.atom).is_err()
+                }) {
+                    continue;
+                }
                 let phi = self.atoms[channel.atom].basis_values[[row, channel.basis_col]];
                 let sigma = assignments[channel.atom] / prior[channel.atom];
                 let da_rho = sigma * dprior[channel.atom];

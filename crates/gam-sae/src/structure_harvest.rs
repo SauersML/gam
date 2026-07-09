@@ -94,6 +94,7 @@ use crate::manifold::{
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
+use gam_linalg::faer_ndarray::FaerSvd;
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
@@ -2682,6 +2683,206 @@ fn race_spec_set(
         .winner()
         .ok_or_else(|| "race_birth_topology: empty ranking".to_string())?;
     Ok(Some(winner.fit_handle.clone()))
+}
+
+/// A primary-atom topology choice discovered by the fit-entry evidence race
+/// (#2238/#2239): the basis kind the seed dictionary should build for the atom
+/// and the latent dimension that kind carries.
+pub struct PrimaryTopologyChoice {
+    pub basis_kind: SaeAtomBasisKind,
+    pub latent_dim: usize,
+}
+
+/// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
+///
+/// [`race_birth_topology`] adjudicates topology by evidence, but it only ever
+/// runs on residual births — the K primary atoms created at fit entry kept the
+/// pinned default (a 1-D circle), hard-capping every intrinsically 2-D factor
+/// at R² ≈ 0.5. This lifts the SAME evidence race to fit entry: each atom
+/// races a circle, a torus, a sphere and a flat 2-D patch — every candidate
+/// seeded with its own NATURAL chart of the atom's cluster (phase angles for
+/// the periodic forms, (lat, lon) for the sphere, standardized principal
+/// projections for the patch) so no candidate is handicapped by a chart built
+/// for a rival — and the proper REML marginal likelihood picks the winner.
+///
+/// `labels` assigns each observation to its seed cluster (the same
+/// output-energy labels the periodic seed refinement uses); the race for atom
+/// `k` weights exactly its cluster's rows. `max_dims[k]` caps the intrinsic
+/// dimension enrolled for atom `k`, so a caller-pinned `d_atom = 1` keeps the
+/// race one-dimensional. Every failure path yields `None` for that atom and
+/// the caller falls back to the historical default — discovery can only ever
+/// ADD fidelity, never remove a working path.
+pub fn discover_primary_atom_topologies(
+    target: ArrayView2<'_, f64>,
+    labels: &[usize],
+    k_atoms: usize,
+    max_dims: &[usize],
+) -> Vec<Option<PrimaryTopologyChoice>> {
+    let n_obs = target.nrows();
+    let p_out = target.ncols();
+    if labels.len() != n_obs || max_dims.len() != k_atoms || p_out < 2 {
+        return vec![None; k_atoms];
+    }
+    (0..k_atoms)
+        .map(|atom_idx| {
+            let rows: Vec<usize> =
+                (0..n_obs).filter(|&row| labels[row] == atom_idx).collect();
+            // Too few rows to score a 2-candidate race honestly.
+            if rows.len() < 16 {
+                return None;
+            }
+            // Cluster-local principal frame: up to 4 components of the atom's
+            // rows, then every observation projected into that frame (the race
+            // weights select the cluster; out-of-cluster rows carry weight 0).
+            let mut mean = vec![0.0_f64; p_out];
+            for &row in &rows {
+                for col in 0..p_out {
+                    mean[col] += target[[row, col]];
+                }
+            }
+            let inv_count = 1.0 / rows.len() as f64;
+            for value in &mut mean {
+                *value *= inv_count;
+            }
+            let mut local = Array2::<f64>::zeros((rows.len(), p_out));
+            for (out_row, &src_row) in rows.iter().enumerate() {
+                for col in 0..p_out {
+                    local[[out_row, col]] = target[[src_row, col]] - mean[col];
+                }
+            }
+            let (_u, _s, vt_opt) = local.svd(false, true).ok()?;
+            let vt = vt_opt?;
+            let n_pcs = vt.nrows().min(4);
+            if n_pcs < 2 {
+                return None;
+            }
+            let mut proj = Array2::<f64>::zeros((n_obs, n_pcs));
+            for row in 0..n_obs {
+                for pc in 0..n_pcs {
+                    let mut acc = 0.0_f64;
+                    for col in 0..p_out {
+                        acc += (target[[row, col]] - mean[col]) * vt[[pc, col]];
+                    }
+                    proj[[row, pc]] = acc;
+                }
+            }
+            // In-cluster standard deviation per component (the projections are
+            // already centered at the cluster mean), so the flat patch sees
+            // O(1) coordinates.
+            let cluster_sd = |pc: usize| -> f64 {
+                let mut acc = 0.0_f64;
+                for &row in &rows {
+                    acc += proj[[row, pc]] * proj[[row, pc]];
+                }
+                (acc * inv_count).sqrt().max(1e-12)
+            };
+            let phase = |a: f64, b: f64| -> f64 {
+                let frac = b.atan2(a) / std::f64::consts::TAU;
+                frac - frac.floor()
+            };
+            let mut specs: Vec<TopologyCandidateSpec> = Vec::with_capacity(4);
+            // Circle: phase of the leading principal pair (unit-period
+            // convention, matching the periodic seed refinement).
+            {
+                let mut coords = Array2::<f64>::zeros((n_obs, 1));
+                for row in 0..n_obs {
+                    coords[[row, 0]] = phase(proj[[row, 0]], proj[[row, 1]]);
+                }
+                let n_harmonics = 3;
+                if let Ok(evaluator) = PeriodicHarmonicEvaluator::new(n_harmonics) {
+                    specs.push(TopologyCandidateSpec {
+                        kind: AutoTopologyKind::Circle,
+                        basis_kind: SaeAtomBasisKind::Periodic,
+                        manifold: LatentManifold::Circle { period: 1.0 },
+                        latent_dim: 1,
+                        evaluator: Arc::new(evaluator),
+                        coords,
+                    });
+                }
+            }
+            if max_dims[atom_idx] >= 2 {
+                // Flat 2-D patch: standardized leading principal projections.
+                let (sd0, sd1) = (cluster_sd(0), cluster_sd(1));
+                let mut coords = Array2::<f64>::zeros((n_obs, 2));
+                for row in 0..n_obs {
+                    coords[[row, 0]] = proj[[row, 0]] / sd0;
+                    coords[[row, 1]] = proj[[row, 1]] / sd1;
+                }
+                if let Ok(evaluator) = EuclideanPatchEvaluator::new(2, 2) {
+                    specs.push(TopologyCandidateSpec {
+                        kind: AutoTopologyKind::Euclidean,
+                        basis_kind: SaeAtomBasisKind::EuclideanPatch,
+                        manifold: LatentManifold::Euclidean,
+                        latent_dim: 2,
+                        evaluator: Arc::new(evaluator),
+                        coords,
+                    });
+                }
+                if n_pcs >= 3 {
+                    // Sphere: (lat, lon) of the unit-normalized leading 3-frame.
+                    let mut coords = Array2::<f64>::zeros((n_obs, 2));
+                    for row in 0..n_obs {
+                        let (x, y, z) = (proj[[row, 0]], proj[[row, 1]], proj[[row, 2]]);
+                        let norm = (x * x + y * y + z * z).sqrt().max(1e-12);
+                        coords[[row, 0]] = (z / norm).clamp(-1.0, 1.0).asin();
+                        coords[[row, 1]] = y.atan2(x);
+                    }
+                    specs.push(TopologyCandidateSpec {
+                        kind: AutoTopologyKind::Sphere,
+                        basis_kind: SaeAtomBasisKind::Sphere,
+                        manifold: LatentManifold::Product(vec![
+                            LatentManifold::Interval {
+                                lo: -std::f64::consts::FRAC_PI_2,
+                                hi: std::f64::consts::FRAC_PI_2,
+                            },
+                            LatentManifold::Circle {
+                                period: std::f64::consts::TAU,
+                            },
+                        ]),
+                        latent_dim: 2,
+                        evaluator: Arc::new(SphereChartEvaluator),
+                        coords,
+                    });
+                }
+                if n_pcs >= 4 {
+                    // Torus: independent phases of the two leading principal
+                    // pairs (fraction-of-period convention on both axes).
+                    let mut coords = Array2::<f64>::zeros((n_obs, 2));
+                    for row in 0..n_obs {
+                        coords[[row, 0]] = phase(proj[[row, 0]], proj[[row, 1]]);
+                        coords[[row, 1]] = phase(proj[[row, 2]], proj[[row, 3]]);
+                    }
+                    if let Ok(evaluator) = TorusHarmonicEvaluator::new(2, 2) {
+                        specs.push(TopologyCandidateSpec {
+                            kind: AutoTopologyKind::Torus,
+                            basis_kind: SaeAtomBasisKind::Torus,
+                            manifold: LatentManifold::Product(vec![
+                                LatentManifold::Circle { period: 1.0 },
+                                LatentManifold::Circle { period: 1.0 },
+                            ]),
+                            latent_dim: 2,
+                            evaluator: Arc::new(evaluator),
+                            coords,
+                        });
+                    }
+                }
+            }
+            if specs.is_empty() {
+                return None;
+            }
+            let mut weights = Array1::<f64>::zeros(n_obs);
+            for &row in &rows {
+                weights[row] = 1.0;
+            }
+            match race_spec_set(specs, target, weights.view()) {
+                Ok(Some(fit)) => Some(PrimaryTopologyChoice {
+                    basis_kind: fit.basis_kind,
+                    latent_dim: fit.latent_dim,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the

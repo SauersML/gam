@@ -1,5 +1,14 @@
 use super::*;
 
+/// Exact floating-point continuation of `log(p) + 1` on the support of a
+/// representable softmax row. An underflowed probability is exactly zero in the
+/// value path, so its entropy contribution and all local derivatives are zero;
+/// using the same branch everywhere keeps value/gradient/Hessian consistent.
+#[inline]
+fn entropy_log_plus_one(p: f64) -> f64 {
+    if p > 0.0 { p.ln() + 1.0 } else { 0.0 }
+}
+
 // ---------------------------------------------------------------------------
 // Sparsity penalty
 // ---------------------------------------------------------------------------
@@ -136,7 +145,7 @@ impl SoftmaxAssignmentSparsityPenalty {
         let a = self.softmax_row(row);
         let k = self.k_atoms;
         let l: Vec<f64> = (0..k)
-            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .map(|i| entropy_log_plus_one(a[i]))
             .collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         let mut d = vec![0.0_f64; k];
@@ -177,7 +186,7 @@ impl SoftmaxAssignmentSparsityPenalty {
         let k = self.k_atoms;
         let a = self.softmax_row(row_logits);
         let l: Vec<f64> = (0..k)
-            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .map(|i| entropy_log_plus_one(a[i]))
             .collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         let mut h = Array2::<f64>::zeros((k, k));
@@ -210,7 +219,7 @@ impl SoftmaxAssignmentSparsityPenalty {
         let inv_tau = 1.0 / self.temperature;
         let a = self.softmax_row(row_logits);
         let l: Vec<f64> = (0..k)
-            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .map(|i| entropy_log_plus_one(a[i]))
             .collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         // ∂a_r/∂z_w = a_r (δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r.
@@ -218,7 +227,7 @@ impl SoftmaxAssignmentSparsityPenalty {
             .map(|r| a[r] * (if r == w { 1.0 } else { 0.0 } - a[w]) * inv_tau)
             .collect();
         let dl: Vec<f64> = (0..k)
-            .map(|r| da[r] / a[r].max(ENTROPY_LOG_PROBABILITY_FLOOR))
+            .map(|r| if a[r] > 0.0 { da[r] / a[r] } else { 0.0 })
             .collect();
         let dm: f64 = (0..k).map(|r| da[r] * l[r] + a[r] * dl[r]).sum();
         let mut dh = Array2::<f64>::zeros((k, k));
@@ -401,8 +410,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             let mut d_h_da = vec![0.0; self.k_atoms];
             let mut mean = 0.0;
             for k in 0..self.k_atoms {
-                let ak = a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR);
-                d_h_da[k] = -lambda * (ak.ln() + 1.0);
+                d_h_da[k] = -lambda * entropy_log_plus_one(a[k]);
                 mean += a[k] * d_h_da[k];
             }
             for k in 0..self.k_atoms {
@@ -446,10 +454,10 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
             let mut mean_log_plus_one = 0.0;
             for k in 0..self.k_atoms {
-                mean_log_plus_one += a[k] * (a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0);
+                mean_log_plus_one += a[k] * entropy_log_plus_one(a[k]);
             }
             for k in 0..self.k_atoms {
-                let log_plus_one = a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0;
+                let log_plus_one = entropy_log_plus_one(a[k]);
                 let term = (1.0 - 2.0 * a[k]) * (mean_log_plus_one - log_plus_one) + a[k] - 1.0;
                 out[start + k] = scale * a[k] * term;
             }
@@ -486,17 +494,17 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             let mut mean_log_plus_one = 0.0;
             let mut mean_v = 0.0;
             for k in 0..self.k_atoms {
-                mean_log_plus_one += a[k] * (a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0);
+                mean_log_plus_one += a[k] * entropy_log_plus_one(a[k]);
                 mean_v += a[k] * v[start + k];
             }
             let mut mean_centered_v_log_plus_one = 0.0;
             for k in 0..self.k_atoms {
                 let centered_v = v[start + k] - mean_v;
                 mean_centered_v_log_plus_one +=
-                    a[k] * centered_v * (a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0);
+                    a[k] * centered_v * entropy_log_plus_one(a[k]);
             }
             for k in 0..self.k_atoms {
-                let log_plus_one = a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0;
+                let log_plus_one = entropy_log_plus_one(a[k]);
                 let centered_v = v[start + k] - mean_v;
                 out[start + k] = scale
                     * a[k]

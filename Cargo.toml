@@ -61,6 +61,9 @@ members = [
 ]
 resolver = "3"
 
+[workspace.dependencies]
+opt = { version = "=0.5.12", git = "https://github.com/SauersML/opt.git", rev = "6c4bf464a790e1e315e012f5accf1781822c5e94" }
+
 [lints.rust]
 warnings = "deny"
 

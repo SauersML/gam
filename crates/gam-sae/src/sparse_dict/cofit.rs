@@ -225,7 +225,8 @@ pub fn cofit_block_and_curved(
     let mut composed = compose0.reconstructed.clone();
     let mut curved = curved_correction(decoder, blocks, work.view(), b, &accepted, &composed)?;
     let mut charge = accepted_charge(&compose0);
-    let mut n_charts = compose0.accepted_blocks.len() + compose0.accepted_pairs.len();
+    let mut n_charts =
+        compose0.selected_chart_blocks.len() + compose0.selected_chart_pairs.len();
     let mut compose_result = compose0;
 
     let mut rounds: Vec<CofitRound> = Vec::with_capacity(config.max_rounds + 1);
@@ -284,7 +285,8 @@ pub fn cofit_block_and_curved(
             composed = cand_composed;
             curved = curved_correction(decoder, blocks, work.view(), b, &accepted, &composed)?;
             charge = accepted_charge(&candidate);
-            n_charts = candidate.accepted_blocks.len() + candidate.accepted_pairs.len();
+            n_charts =
+                candidate.selected_chart_blocks.len() + candidate.selected_chart_pairs.len();
             compose_result = candidate;
             objective = objective_b;
         } else {
@@ -339,30 +341,29 @@ pub fn cofit_block_and_curved(
     })
 }
 
-/// The global set of chart-owned (accepted) block indices from a compose result:
-/// accepted single blocks plus both members of every accepted pair.
+/// The global set of BIC-selected chart-owned block indices from a compose result.
 fn accepted_set(result: &BlockChartComposeResult) -> HashSet<usize> {
     let mut s = HashSet::new();
-    for &g in &result.accepted_blocks {
+    for &g in &result.selected_chart_blocks {
         s.insert(g);
     }
-    for &(g0, g1) in &result.accepted_pairs {
+    for &(g0, g1) in &result.selected_chart_pairs {
         s.insert(g0);
         s.insert(g1);
     }
     s
 }
 
-/// Total e-BH acceptance charge of the accepted charts (their information cost).
+/// Total complexity charge of the BIC-selected charts.
 fn accepted_charge(result: &BlockChartComposeResult) -> f64 {
     let mut charge = 0.0;
     for rec in &result.block_records {
-        if rec.evidence.accepted {
+        if rec.evidence.selected_by_bic {
             charge += rec.evidence.charge;
         }
     }
     for rec in &result.pair_records {
-        if rec.evidence.accepted {
+        if rec.evidence.selected_by_bic {
             charge += rec.evidence.charge;
         }
     }
@@ -720,7 +721,6 @@ mod cofit_tests {
             min_firings: 8,
             crossfit_folds: 4,
             pair_screen: false,
-            alpha: 0.20,
             ..BlockChartComposeConfig::default()
         }
     }

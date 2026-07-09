@@ -209,7 +209,6 @@ fn weight_sourced_atom_fit_is_tagged_with_component_source() {
         frame_rank_min: r,
         frame_rank_max: r,
         min_rows: 16,
-        alpha: 1.0,
         ..Default::default()
     };
     let result = fit_inframe_curved_weight_frame_catalog(
@@ -270,7 +269,6 @@ fn zero_occupancy_weight_frame_is_reported_chartable_unoccupied() {
         frame_rank_min: r,
         frame_rank_max: r,
         min_rows: 16,
-        alpha: 1.0,
         ..Default::default()
     };
     let result = fit_inframe_curved_weight_frame_catalog(
@@ -305,7 +303,7 @@ fn zero_occupancy_weight_frame_is_reported_chartable_unoccupied() {
         Some(WeightFrameSource::MlpDownProjection { layer: 6 })
     );
     assert_eq!(unoccupied.evidence.n_rows, 0);
-    assert!(!unoccupied.evidence.accepted);
+    assert!(!unoccupied.evidence.selected_by_bic);
 }
 
 #[test]
@@ -352,7 +350,7 @@ fn planted_low_rank_curved_recovered_inframe_p2048() {
         "curved chart should improve held-out deviance, got {}",
         rec.evidence.deviance_gain
     );
-    assert_eq!(result.accepted_regions, vec![0], "planted region accepted");
+    assert_eq!(result.selected_regions, vec![0], "planted region selected");
 
     // MEASURED memory ledger: border and covariance orders below the dense path.
     let ledger = &result.ledger;
@@ -671,7 +669,7 @@ fn linear_structure_is_not_promoted_to_curved() {
     let result = fit_inframe_curved_regions(residual.view(), &[region], n, &config)
         .expect("fit runs on linear structure");
     assert!(
-        result.accepted_regions.is_empty(),
+        result.selected_regions.is_empty(),
         "purely linear (rank-1) structure must NOT be promoted to a curved atom; \
          deviance_gain={} margin={}",
         result.records[0].evidence.deviance_gain,
@@ -702,7 +700,7 @@ fn ledger_shrink_matches_reviewer_frontier_shape() {
     let result =
         fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
     assert_eq!(result.records[0].frame_rank, r_target);
-    if result.accepted_regions.is_empty() {
+    if result.selected_regions.is_empty() {
         // Even if the gate is conservative on this synthetic draw, the per-record
         // border/cov arithmetic is what we are asserting; recompute from record.
         let rec = &result.records[0];
@@ -773,7 +771,7 @@ fn inframe_curved_p4096_feasible_where_dense_joint_ooms_2134() {
         "frame rank {} recovers intrinsic rank {r_true} and stays far below p={p}",
         rec.frame_rank
     );
-    assert_eq!(result.accepted_regions, vec![0], "planted curved region accepted");
+    assert_eq!(result.selected_regions, vec![0], "planted curved region selected");
 
     // (feasibility axis 2 — MEMORY) The dense per-atom covariance the joint lane
     // would allocate is (M·p)² · 8 B ≈ 8.6 GB — the source of the OOM. The in-frame
@@ -821,7 +819,7 @@ fn accepted_curved_prediction_hot_path_stays_in_r_frame() {
     };
     let result =
         fit_inframe_curved_regions(residual.view(), &[region], n, &config).expect("fit");
-    assert_eq!(result.accepted_regions, vec![0], "planted curved region accepted");
+    assert_eq!(result.selected_regions, vec![0], "planted curved region selected");
     let prediction = &result.curved_prediction;
     assert_eq!(prediction.regions().len(), 1);
     assert_eq!(prediction.regions()[0].frame_rank(), r_true);

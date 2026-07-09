@@ -51,6 +51,9 @@ fn default_metric_provenance() -> String {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub(crate) struct AtomPayload {
     pub(crate) basis: String,
+    /// Gauge-free physical decoder `exp(s_k) B_k`. The fit-internal scale
+    /// quotient is materialized before this payload is built, so persisted
+    /// models reload with zero hidden log-amplitude and unchanged predictions.
     pub(crate) decoder_coefficients: Vec<Vec<f64>>,
     pub(crate) assignments: Vec<f64>,
     pub(crate) coords: Vec<Vec<f64>>,

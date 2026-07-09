@@ -1,62 +1,14 @@
-//! Cross-checkpoint training-dynamics inference for SAE atoms (issue #1102).
+//! Cross-checkpoint descriptive dynamics for SAE decoder curves.
 //!
-//! OLMo ships intermediate-training checkpoints. Each checkpoint `c` fits a
-//! dictionary whose atom `a` is a decoder curve `g^{(c)}_a: t ↦ ℝ^ambient`
-//! sampled on a shared latent grid `t`. The question this module answers, per
-//! atom, is *did the atom change across training, and where*, with
-//! debiased point estimates, standard errors, and anytime-valid evidence.
-//!
-//! It is pure assembly of three landed instruments — none is reimplemented:
-//!
-//! * [`crate::inference::riesz`] — the per-step contrast
-//!   `θ = g^{(c+1)}(t₀) − g^{(c)}(t₀)` is the linear
-//!   [`SmoothFunctional::Contrast`] of a stacked two-checkpoint coefficient
-//!   vector; [`debias_with_dense_hessian`] returns the penalty-debiased
-//!   estimate and a plug-in SE via the Riesz representer.
-//! * [`crate::inference::layer_transport`] — the checkpoint axis is reused as
-//!   the "layer" axis: [`fit_transport_map`] aligns the atom's latent chart
-//!   across consecutive checkpoints (topology compatibility, isometry defect,
-//!   winding degree), packaged as a [`LayerTransportReport`].
-//! * [`gam_terms::inference::structure_evidence`] — each consecutive-step contrast
-//!   feeds one anytime-valid e-value (the studentized displacement mapped to a
-//!   two-sided p-value and run through the frozen κ = ½ p→e calibrator) into a
-//!   per-step [`StructureLedger`] claim under the null "the atom did not change
-//!   at this checkpoint step". A genuine e-value (`E_{H0}[E] ≤ 1`), unlike the
-//!   divergent in-sample `exp(½ z²)` likelihood ratio; optional-stopping-safe.
-//!
-//! # Honest accounting of the Riesz inputs
-//!
-//! A *bare* decoder grid carries the fitted curve VALUES but no
-//! observation-level scores and no penalized Hessian — those cannot be
-//! fabricated from grid samples. So the smooth this module debiases is the
-//! one the grid actually defines: a ridge-penalized least-squares fit of the
-//! grid VALUES on the latent-grid identity (interpolation) basis, where each
-//! grid node is one observation with response equal to the decoder value at
-//! that node. This is a genuine fit with a genuine penalized Hessian
-//! `XᵀX + λS = I + λS` and genuine per-node scores `s_i = (β_i − y_i)·eᵢ`,
-//! so every quantity handed to [`debias_with_dense_hessian`] is real, not a
-//! placeholder. The contrast functional is then evaluated against the
-//! identity design row at the latent-grid mode index. The ambient dimension is
-//! handled component-wise and the per-component contrasts are aggregated into a
-//! single scalar `θ` by the L2 norm of the component contrast vector (the size
-//! of the decoder displacement at `t₀`); its SE is propagated by the
-//! delta method through that norm.
+//! The input is a deterministic grid of already-fitted decoder values. Such a
+//! grid contains no observation-level scores, sampling covariance, or null
+//! distribution, so this module reports geometric displacements and chart
+//! transports only. It deliberately emits no standard errors, p-values, or
+//! e-values. Calibrated change evidence requires fit-time influence data (or an
+//! external replicated checkpoint experiment) in a future input schema.
 
 use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
-use crate::inference::riesz::{
-    RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
-};
-use gam_terms::inference::structure_evidence::{
-    ClaimKind, StructureLedger, log_e_from_p_calibrator,
-};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView4};
-use statrs::distribution::{ContinuousCDF, Normal};
-
-/// Ridge penalty on the interpolation fit of the grid values. Small relative
-/// to the unit data Hessian so the fit tracks the grid closely; non-zero so
-/// the penalty-debiasing term in the Riesz one-step is exercised on real
-/// (not degenerate) curvature, and so the Hessian `I + λS` is strictly SPD.
-const GRID_FIT_RIDGE: f64 = 1e-3;
+use ndarray::{Array1, ArrayView1, ArrayView4};
 
 /// Inputs for one cross-checkpoint atom-dynamics run.
 ///
@@ -70,45 +22,35 @@ pub struct CheckpointDynamicsInput<'a> {
     pub latent_grid: ArrayView1<'a, f64>,
 }
 
-/// The training-dynamics trajectory of one atom across the checkpoint axis.
-///
-/// The PRIMARY, coverage-valid deliverable is [`Self::change_evidence`]: the
-/// anytime-valid e-process answering "did atom k change during training?".
-/// [`Self::conditional_step_contrasts`] is a secondary, descriptive readout (see
-/// its docs for the conditional caveat).
+/// One deterministic decoder-grid change between consecutive checkpoints.
+pub struct CheckpointStepChange {
+    pub checkpoint_from: String,
+    pub checkpoint_to: String,
+    pub latent_coordinate: f64,
+    /// Ambient decoder displacement at the central latent-grid node.
+    pub displacement_at_mode: Array1<f64>,
+    pub l2_at_mode: f64,
+    /// Root mean squared ambient displacement over the complete shared grid.
+    pub grid_rms_l2: f64,
+    /// Largest ambient displacement over the complete shared grid.
+    pub grid_max_l2: f64,
+}
+
+/// The descriptive training trajectory of one atom across checkpoints.
 pub struct AtomTrajectory {
     pub atom_name: String,
-    /// Debiased `g^{(c+1)}(t_mode) − g^{(c)}(t_mode)` for each consecutive
-    /// checkpoint step, with its plug-in SE.
-    ///
-    /// CONDITIONAL ON THE FITTED COORDINATES (not a coverage-valid CI). The
-    /// debiased SE here conditions away the generated-regressor uncertainty in
-    /// the estimated latent coordinates `t̂` and activations `â` — the exact
-    /// correction the marginal-slope family exists to make (issue #1115). It is
-    /// reported only as a conditional contrast point estimate with a plug-in SE,
-    /// NOT as an interval with frequentist coverage for the population
-    /// displacement. The headline change verdict is carried by the e-process
-    /// [`Self::change_evidence`], which IS anytime-valid; this field is a
-    /// descriptive companion. Read the SE accordingly.
-    pub conditional_step_contrasts: Vec<RieszDebiasReport>,
+    pub descriptive_step_changes: Vec<CheckpointStepChange>,
     /// Consecutive-checkpoint chart correspondences (checkpoint axis reused as
     /// the transport "layer" axis).
     pub transports: Vec<LayerTransportReport>,
-    /// PRIMARY deliverable: anytime-valid evidence that the atom changed at each
-    /// consecutive checkpoint step, one calibrated e-value per step into a
-    /// per-step claim. Valid at any data-dependent stopping time.
-    pub change_evidence: StructureLedger,
 }
 
-/// Run cross-checkpoint debiased dynamics inference for every atom.
+/// Run cross-checkpoint descriptive dynamics for every atom.
 ///
 /// For each atom, walks consecutive checkpoints and, at each step `c → c+1`:
 /// 1. fits the transport map between the two checkpoints' latent charts
 ///    ([`fit_layer_transport`], checkpoint axis as the layer axis);
-/// 2. evaluates the Riesz-debiased decoder-displacement contrast at the
-///    latent-grid mode ([`SmoothFunctional::Contrast`] + penalty debiasing);
-/// 3. absorbs the studentized contrast as a calibrated anytime-valid e-value
-///    into the step's change claim under the no-change null.
+/// 2. reads direct decoder displacement summaries on the shared grid.
 pub fn checkpoint_atom_dynamics(
     input: &CheckpointDynamicsInput<'_>,
 ) -> Result<Vec<AtomTrajectory>, String> {
@@ -153,55 +95,30 @@ pub fn checkpoint_atom_dynamics(
     // Use the central node so it sits inside any chart and away from edge
     // interpolation artifacts.
     let mode_index = n_grid / 2;
-
-    // Identity interpolation design `X = I_{n_grid}` and its ridge penalty
-    // `S = I`. The penalized Hessian `H = XᵀX + λS = (1 + λ) I` is shared by
-    // every component fit, so it is built once.
-    let penalty_scale = 1.0 + GRID_FIT_RIDGE;
-    let mut hessian = Array2::<f64>::zeros((n_grid, n_grid));
-    for i in 0..n_grid {
-        hessian[[i, i]] = penalty_scale;
-    }
-    // Contrast design rows pick out the mode node: `m(t_mode) = β_{mode}`, so
-    // the value-design row is the mode basis vector. The contrast `a − b`
-    // (later checkpoint minus earlier) shares the same row; the per-checkpoint
-    // distinction is carried by the two fitted coefficient vectors, exactly as
-    // a paired contrast of the same functional across two fits.
-    let mut mode_row = Array1::<f64>::zeros(n_grid);
-    mode_row[mode_index] = 1.0;
+    let (lo, hi) = interval_bounds(input.latent_grid)?;
+    let topology = ChartTopology::Interval { lo, hi };
+    let latent_coords = input.latent_grid.to_owned();
 
     let mut trajectories = Vec::with_capacity(n_atoms);
     for atom in 0..n_atoms {
         let atom_name = input.atom_names[atom].clone();
-        let mut step_contrasts = Vec::with_capacity(n_checkpoints - 1);
+        let mut descriptive_step_changes = Vec::with_capacity(n_checkpoints - 1);
         let mut transports = Vec::with_capacity(n_checkpoints - 1);
-        let mut change_evidence = StructureLedger::new();
 
         for step in 0..n_checkpoints - 1 {
             let c0 = step;
             let c1 = step + 1;
 
             // --- transport map across the checkpoint axis --------------------
-            // Reuse the latent grid itself as both charts' coordinates on an
-            // interval `[min, max]`; the transport fit aligns the two
-            // checkpoints' decoder curves through their shared latent index.
-            // The "from"/"to" coordinates are the decoder values projected to
-            // the first ambient component, the available scalar chart sample.
-            let coords_from = input
-                .decoder_grid
-                .slice(ndarray::s![c0, atom, .., 0])
-                .to_owned();
-            let coords_to = input
-                .decoder_grid
-                .slice(ndarray::s![c1, atom, .., 0])
-                .to_owned();
-            let (lo, hi) = interval_bounds(coords_from.view(), coords_to.view());
-            let topology = ChartTopology::Interval { lo, hi };
+            // The chart coordinate is the supplied latent grid itself. Decoder
+            // output components are ambient values and may be non-injective
+            // (for a circle, a component can be cos(t)); they are never used as
+            // latent coordinates.
             let transport = fit_layer_transport(
                 c0,
                 c1,
-                coords_from.view(),
-                coords_to.view(),
+                latent_coords.view(),
+                latent_coords.view(),
                 topology,
                 topology,
             )
@@ -213,74 +130,53 @@ pub fn checkpoint_atom_dynamics(
             })?;
             transports.push(transport);
 
-            // --- Riesz-debiased decoder-displacement contrast at the mode ----
-            let report = contrast_at_mode(&ContrastAtMode {
-                grid: input.decoder_grid,
-                atom,
-                c0,
-                c1,
-                ambient_dim,
-                n_grid,
-                hessian: hessian.view(),
-                mode_row: mode_row.view(),
-            })
-            .map_err(|e| {
-                format!(
-                    "checkpoint contrast for atom '{atom_name}' step {} → {} failed: {e}",
-                    input.checkpoint_ids[c0], input.checkpoint_ids[c1]
-                )
-            })?;
-
-            // --- anytime-valid evidence the atom changed at this step --------
-            // The debiased displacement `θ̂` with SE `se` studentizes to
-            // `z = θ̂ / se` (local Gaussian `θ̂ ~ N(θ, se²)`). Its two-sided
-            // p-value run through the frozen κ = ½ p→e calibrator is a genuine
-            // e-value for the per-step no-change null θ = 0 — `E_{H0}[E] ≤ 1`,
-            // which the naive in-sample `exp(½ z²)` ratio is NOT (it diverges
-            // under H0). One e-value per step into a per-step claim; the
-            // calibrator's contract (one e-value per independent batch) is met
-            // because each step is a distinct checkpoint transition.
-            let claim = change_evidence.register(ClaimKind::Custom {
-                label: format!(
-                    "atom '{atom_name}' changed from checkpoint {} to {}",
-                    input.checkpoint_ids[c0], input.checkpoint_ids[c1]
-                ),
+            let mut displacement_at_mode = Array1::<f64>::zeros(ambient_dim);
+            let mut grid_sum_sq = 0.0_f64;
+            let mut grid_max_l2 = 0.0_f64;
+            for grid_idx in 0..n_grid {
+                let mut row_sq = 0.0_f64;
+                for component in 0..ambient_dim {
+                    let delta = input.decoder_grid[[c1, atom, grid_idx, component]]
+                        - input.decoder_grid[[c0, atom, grid_idx, component]];
+                    row_sq += delta * delta;
+                    if grid_idx == mode_index {
+                        displacement_at_mode[component] = delta;
+                    }
+                }
+                grid_sum_sq += row_sq;
+                grid_max_l2 = grid_max_l2.max(row_sq.sqrt());
+            }
+            let l2_at_mode = displacement_at_mode.dot(&displacement_at_mode).sqrt();
+            descriptive_step_changes.push(CheckpointStepChange {
+                checkpoint_from: input.checkpoint_ids[c0].clone(),
+                checkpoint_to: input.checkpoint_ids[c1].clone(),
+                latent_coordinate: input.latent_grid[mode_index],
+                displacement_at_mode,
+                l2_at_mode,
+                grid_rms_l2: (grid_sum_sq / n_grid as f64).sqrt(),
+                grid_max_l2,
             });
-            let log_e = no_change_log_e_value(report.theta_onestep, report.se)?;
-            change_evidence.absorb_log(claim, log_e)?;
-
-            step_contrasts.push(report);
         }
 
         trajectories.push(AtomTrajectory {
             atom_name,
-            conditional_step_contrasts: step_contrasts,
+            descriptive_step_changes,
             transports,
-            change_evidence,
         });
     }
 
     Ok(trajectories)
 }
 
-/// Interval bounds spanning both checkpoints' scalar chart samples, padded so
-/// the transport basis domain strictly contains the data.
-fn interval_bounds(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> (f64, f64) {
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &v in a.iter().chain(b.iter()) {
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
-    if !(lo.is_finite() && hi.is_finite()) {
-        return (0.0, 1.0);
-    }
+/// Strict interval bounds for the supplied latent chart.
+fn interval_bounds(grid: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
+    let lo = grid.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = grid.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if hi <= lo {
-        // Degenerate (constant) chart: open a unit window around the value.
-        return (lo - 0.5, lo + 0.5);
+        return Err("checkpoint dynamics latent_grid must have positive range".to_string());
     }
     let pad = (hi - lo) * 1e-6;
-    (lo - pad, hi + pad)
+    Ok((lo - pad, hi + pad))
 }
 
 /// Debiased `g^{(c1)}(t_mode) − g^{(c0)}(t_mode)` aggregated over the ambient

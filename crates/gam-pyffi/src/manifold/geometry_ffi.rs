@@ -6153,7 +6153,6 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     min_firings = 64,
     max_blocks = 256,
     crossfit_folds = 2,
-    alpha = 0.10,
     min_effect = 0.0,
     whitening_ridge = 1.0e-8,
     pair_screen = true,
@@ -6176,7 +6175,6 @@ fn block_coordinate_chart_compose_ffi<'py>(
     min_firings: usize,
     max_blocks: usize,
     crossfit_folds: usize,
-    alpha: f64,
     min_effect: f64,
     whitening_ridge: f64,
     pair_screen: bool,
@@ -6198,7 +6196,6 @@ fn block_coordinate_chart_compose_ffi<'py>(
         min_firings,
         max_blocks,
         crossfit_folds,
-        alpha,
         min_effect,
         whitening_ridge,
         pair_screen,
@@ -6220,8 +6217,8 @@ fn block_coordinate_chart_compose_ffi<'py>(
     let out = PyDict::new(py);
     out.set_item("reconstructed", result.reconstructed.into_pyarray(py))?;
     out.set_item("selected_blocks", result.selected_blocks)?;
-    out.set_item("accepted_blocks", result.accepted_blocks)?;
-    out.set_item("accepted_pairs", result.accepted_pairs)?;
+    out.set_item("selected_chart_blocks", result.selected_chart_blocks)?;
+    out.set_item("selected_chart_pairs", result.selected_chart_pairs)?;
     out.set_item("blocks", chart_records_to_py(py, &result.block_records)?)?;
     out.set_item("pairs", chart_records_to_py(py, &result.pair_records)?)?;
     Ok(out.unbind())
@@ -6246,9 +6243,7 @@ fn chart_records_to_py(py: Python<'_>, records: &[BlockChartRecord]) -> PyResult
         row.set_item("ci_high", e.ci_high)?;
         row.set_item("charge", e.charge)?;
         row.set_item("margin", e.margin)?;
-        row.set_item("log_e_value", e.log_e_value)?;
-        row.set_item("accepted_pre_ebh", e.accepted_pre_ebh)?;
-        row.set_item("accepted", e.accepted)?;
+        row.set_item("selected_by_bic", e.selected_by_bic)?;
         rows.append(row)?;
     }
     Ok(rows.unbind())

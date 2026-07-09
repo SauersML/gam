@@ -87,7 +87,7 @@ use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_he
 use crate::manifold::SaeManifoldTerm;
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
+    FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
@@ -220,9 +220,9 @@ impl ConditionalPriorIvae {
         // priors `p(t|u)` whose sufficient-statistic parameters
         // `(η_1(u), η_2(u)) = (μ(u)/σ(u)², −1/(2σ(u)²))` span a
         // 2k-dimensional set. For the diagonal Gaussian family this is
-        // equivalent (an invertible reparameterisation) to requiring that
-        // the stacked signature `S = [μ(u) ‖ log σ(u)]` of shape
-        // (n_rows, 2k) have rank 2k, with at least 2k+1 distinct rows.
+        // requires the BASELINE DIFFERENCES of the NATURAL parameters to span
+        // `R^{2k}`. Raw `[μ, log σ]` is not an invertible LINEAR change of these
+        // parameters and can have a different rank.
         //
         // This is the CLASSICAL precondition the certificate's per-generator
         // gauge-groupoid slice (see [`GeneratorFamily`]) generalises: Khemakhem's
@@ -246,32 +246,26 @@ impl ConditionalPriorIvae {
                  auxiliary states for latent_dim k = {latent_dim}, got n_rows = {n_rows}"
             ));
         }
-        let signature = {
+        let natural = {
             let mut s = Array2::<f64>::zeros((n_rows, 2 * latent_dim));
             for r in 0..n_rows {
                 for c in 0..latent_dim {
-                    s[[r, c]] = mean[[r, c]];
-                    s[[r, latent_dim + c]] = scale[[r, c]].ln();
+                    let variance = scale[[r, c]] * scale[[r, c]];
+                    s[[r, c]] = mean[[r, c]] / variance;
+                    s[[r, latent_dim + c]] = -0.5 / variance;
                 }
             }
             s
         };
-        let first = signature.row(0).to_owned();
-        let all_identical = signature
-            .outer_iter()
-            .all(|row| row.iter().zip(first.iter()).all(|(a, b)| a == b));
-        if all_identical {
-            return Err(format!(
-                "ConditionalPriorIvae: Khemakhem (arXiv:2107.10098) Theorem 1 \
-                 precondition violated: all {n_rows} rows of the stacked auxiliary \
-                 signature [μ ‖ log σ] are identical, so the conditional prior is the \
-                 trivial unconditional N(μ, σ²) — provably non-identifiable (no \
-                 auxiliary information)"
-            ));
+        let mut differences = Array2::<f64>::zeros((n_rows - 1, 2 * latent_dim));
+        for r in 1..n_rows {
+            for c in 0..2 * latent_dim {
+                differences[[r - 1, c]] = natural[[r, c]] - natural[[0, c]];
+            }
         }
-        let (_u, sv, _vt) = signature
+        let (_u, sv, _vt) = differences
             .svd(false, false)
-            .map_err(|e| format!("ConditionalPriorIvae: SVD of auxiliary signature failed: {e}"))?;
+            .map_err(|e| format!("ConditionalPriorIvae: SVD of natural-parameter differences failed: {e}"))?;
         let max_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
         let tol = max_sv * (n_rows.max(2 * latent_dim) as f64) * f64::EPSILON;
         let numerical_rank = sv.iter().filter(|&&s| s > tol).count();
@@ -279,7 +273,8 @@ impl ConditionalPriorIvae {
         if numerical_rank < required {
             return Err(format!(
                 "ConditionalPriorIvae: Khemakhem (arXiv:2107.10098) Theorem 1 \
-                 precondition violated: stacked auxiliary signature [μ ‖ log σ] has \
+                 precondition violated: baseline differences of Gaussian natural \
+                 parameters [μ/σ² ‖ −1/(2σ²)] have \
                  numerical rank {numerical_rank} < 2·latent_dim = {required} \
                  (tolerance {tol:.3e}); the family `p(t|u)` does not span a \
                  2k-dimensional set of natural parameters"
@@ -855,10 +850,30 @@ pub fn partial_supervision_solve(
             if t_sup_aligned.ncols() == 0 || t_free.ncols() == 0 {
                 t_free.to_owned()
             } else {
-                let qr_pair = t_sup_aligned
-                    .qr()
-                    .map_err(|e| format!("partial_supervision_solve: QR on T_sup failed: {e}"))?;
-                let q = qr_pair.0;
+                let (u_opt, singular, _vt) = t_sup_aligned
+                    .svd(true, false)
+                    .map_err(|e| format!("partial_supervision_solve: SVD on T_sup failed: {e}"))?;
+                let u = u_opt.ok_or_else(|| {
+                    "partial_supervision_solve: SVD did not return supervised left vectors"
+                        .to_string()
+                })?;
+                let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
+                let tol = sigma_max
+                    * t_sup_aligned.nrows().max(t_sup_aligned.ncols()) as f64
+                    * f64::EPSILON;
+                let rank = singular.iter().filter(|&&value| value > tol).count();
+                if rank == 0 {
+                    return Ok(PartialSupervisionResult {
+                        t_supervised: t_sup_aligned,
+                        t_free: t_free.to_owned(),
+                        alignment_score,
+                        selected_weight,
+                        map_r,
+                        map_a,
+                        map_b,
+                    });
+                }
+                let q = u.slice(s![.., 0..rank]);
                 let qt_free = q.t().dot(&t_free);
                 let proj = q.dot(&qt_free);
                 let mut out = t_free.to_owned();

@@ -398,33 +398,33 @@ def _coerce_cotrain_report(raw: Any) -> dict[str, Any] | None:
     report = dict(raw)
     required = (
         "recon_consistency",
-        "uncertified_fraction",
-        "n_uncertified",
+        "unconverged_fraction",
+        "n_unconverged",
         "n_encodes",
     )
     missing = [key for key in required if key not in report]
     if missing:
         raise ValueError(f"SAE cotrain report missing keys: {missing}")
     recon = float(report["recon_consistency"])
-    uncert = float(report["uncertified_fraction"])
-    n_uncert = int(report["n_uncertified"])
+    unconverged = float(report["unconverged_fraction"])
+    n_unconverged = int(report["n_unconverged"])
     n_encodes = int(report["n_encodes"])
     if not np.isfinite(recon) or recon < 0.0:
         raise ValueError(f"SAE cotrain recon_consistency must be finite >= 0, got {recon}")
-    if not np.isfinite(uncert) or uncert < 0.0 or uncert > 1.0:
+    if not np.isfinite(unconverged) or unconverged < 0.0 or unconverged > 1.0:
         raise ValueError(
-            "SAE cotrain uncertified_fraction must be finite in [0, 1], "
-            f"got {uncert}"
+            "SAE cotrain unconverged_fraction must be finite in [0, 1], "
+            f"got {unconverged}"
         )
-    if n_uncert < 0 or n_encodes < 0 or n_uncert > n_encodes:
+    if n_unconverged < 0 or n_encodes < 0 or n_unconverged > n_encodes:
         raise ValueError(
-            "SAE cotrain counts must satisfy 0 <= n_uncertified <= n_encodes; "
-            f"got {n_uncert} / {n_encodes}"
+            "SAE cotrain counts must satisfy 0 <= n_unconverged <= n_encodes; "
+            f"got {n_unconverged} / {n_encodes}"
         )
     return {
         "recon_consistency": recon,
-        "uncertified_fraction": uncert,
-        "n_uncertified": n_uncert,
+        "unconverged_fraction": unconverged,
+        "n_unconverged": n_unconverged,
         "n_encodes": n_encodes,
     }
 
@@ -538,10 +538,13 @@ class SaeManifoldAtomFit:
         Basis kind used by this atom, for example ``"periodic"``,
         ``"euclidean"``, ``"duchon"``, ``"sphere"``, or ``"torus"``.
     decoder_coefficients
-        Decoder basis coefficients ``B_k`` with shape ``(M_k, p)`` where
+        Gauge-free physical decoder coefficients ``exp(s_k) B_k`` with shape
+        ``(M_k, p)`` where
         ``M_k`` is the atom basis size and ``p`` is the ambient/output
-        dimension. Values are in the same units as ``X`` because the basis
-        functions are dimensionless.
+        dimension. The Rust fit's quotient-scale coordinate is materialized at
+        the boundary, so save/load, reconstruction, prediction, and steering all
+        consume this same block with no hidden scale state. Values are in the
+        same units as ``X`` because the basis functions are dimensionless.
     assignments
         Per-observation assignment/gate values for this atom, shape ``(N,)``.
         For ``assignment="softmax"`` these are mixture masses; for
@@ -1471,12 +1474,18 @@ class ManifoldSAE:
                 "ManifoldSAE no longer retains it. Use distill_encoder(X, ...) "
                 "with explicit training activations."
             )
+        from .distill import _coordinate_periods
+
         rust = rust_module()
+        coord_periods = _coordinate_periods(
+            self, [int(dim) for dim in self._atom_dims]
+        )
         return rust.SaeAmortizedEncoder(
             np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64)),
             np.ascontiguousarray(np.asarray(self.low_level_logits, dtype=np.float64)),
             [np.ascontiguousarray(np.asarray(c, dtype=np.float64)) for c in self.coords],
             np.ascontiguousarray(np.asarray(self.assignments, dtype=np.float64)),
+            [list(periods) for periods in coord_periods],
         )
 
     def encode_amortized(self, X: Any) -> dict[str, Any]:

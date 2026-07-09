@@ -219,8 +219,8 @@ def build_model() -> ManifoldSAE:
         ),
         cotrain={
             "recon_consistency": 0.02,
-            "uncertified_fraction": 0.1,
-            "n_uncertified": 1,
+            "unconverged_fraction": 0.1,
+            "n_unconverged": 1,
             "n_encodes": 10,
         },
         hybrid_split={

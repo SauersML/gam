@@ -430,8 +430,7 @@ impl SparseAtomCodes {
         rho.clamp(-1.0, 1.0)
     }
 
-    /// Empirical per-token support-entropy estimate `H(S)` of the binary support
-    /// process, in BITS, together with the references it must be read against.
+    /// Universal per-token code lengths for the binary support process, in bits.
     ///
     /// The MDL *selection* price names, per token, WHICH atoms fired. The uniform
     /// (combinatorial) price `log₂ C(G, k)` assumes every `k`-subset is equally
@@ -446,26 +445,13 @@ impl SparseAtomCodes {
     /// fit to the data — no magic constants, only empirical marginals and
     /// pairwise co-occurrence counts:
     ///
-    /// * [`SupportEntropy::independent_bits`] — the first-order
-    ///   (product-of-marginals) model `Σ_g h(π_g)`, with `π_g = P(x_g = 1)` the
-    ///   atom's empirical firing rate and `h` the binary entropy. It charges each
-    ///   atom its own on/off entropy and nothing for co-firing — the price if
-    ///   atoms fired independently.
-    /// * [`SupportEntropy::tree_bits`] — the second-order Chow–Liu model: the
-    ///   maximum-likelihood tree-structured distribution `q` whose node and edge
-    ///   marginals match the data. Its per-token code length is
-    ///   `Σ_g h(π_g) − Σ_{(u,v)∈T} I(x_u; x_v)`, where `T` is the maximum-weight
-    ///   spanning tree under pairwise mutual information `I(u,v)` (Chow & Liu,
-    ///   1968). Because `q`'s sufficient statistics match the data exactly,
-    ///   `−E_data[log₂ q] = H(q)` equals that expression, so it is a genuine
-    ///   ACHIEVABLE per-token code length; every `I(u,v) ≥ 0` gives
-    ///   `tree_bits ≤ independent_bits`, and being an achievable code it also
-    ///   bounds the truth from above, `tree_bits ≥ H(S)`. This is the DEFAULT
-    ///   selection currency: predictable adjacent-atom co-firing is charged at its
-    ///   true (low) rate.
-    /// * [`SupportEntropy::combinatorial_bits`] — `log₂ C(G, k̄)` at the mean
-    ///   support size `k̄`, the uniform-support worst case, reported alongside so
-    ///   the combinatorial bound the currency replaces is always visible.
+    /// Both learned models use Krichevsky–Trofimov sequential probabilities, so
+    /// no fitted Bernoulli parameter is transmitted for free. The Chow–Liu code
+    /// additionally transmits its data-selected labeled tree using Cayley's
+    /// `G^(G−2)` possibilities before conditionally KT-coding every child. The
+    /// combinatorial reference transmits each row's cardinality and then its
+    /// subset, so variable support sizes are charged exactly rather than at a
+    /// rounded mean.
     pub fn support_entropy(&self) -> SupportEntropy {
         let n = self.n_obs();
         let g = self.k_atoms();
@@ -497,7 +483,9 @@ impl SparseAtomCodes {
         }
 
         let nn = n as f64;
-        let independent_bits: f64 = marg.iter().map(|&c| binary_entropy_bits(c / nn)).sum();
+        let independent_total: f64 = (0..g)
+            .map(|atom| kt_bernoulli_bits(self.codes.iter().map(|code| code.active_mask.get(atom))))
+            .sum();
 
         // Maximum-weight (mutual-information) spanning tree by Prim over the dense
         // pairwise-MI graph. `best_mi[v]` is the largest MI connecting an
@@ -509,11 +497,13 @@ impl SparseAtomCodes {
         };
         let mut in_tree = vec![false; g];
         let mut best_mi = vec![f64::NEG_INFINITY; g];
+        let mut best_parent = vec![0usize; g];
+        let mut parent = vec![0usize; g];
         in_tree[0] = true;
         for v in 1..g {
             best_mi[v] = mi(0, v);
+            best_parent[v] = 0;
         }
-        let mut tree_mi_sum = 0.0_f64;
         for _ in 1..g {
             // Pick the out-of-tree node joined to the tree by the strongest edge.
             let mut pick = usize::MAX;
@@ -528,31 +518,47 @@ impl SparseAtomCodes {
                 break;
             }
             in_tree[pick] = true;
-            tree_mi_sum += pick_w.max(0.0);
+            parent[pick] = best_parent[pick];
             for v in 0..g {
                 if !in_tree[v] {
                     let w = mi(pick, v);
                     if w > best_mi[v] {
                         best_mi[v] = w;
+                        best_parent[v] = pick;
                     }
                 }
             }
         }
 
-        // `tree_bits = Σ h(π_g) − Σ_tree I`, clamped into `[0, independent_bits]`
-        // against floating-point drift (MI can carry a hair of negative noise, and
-        // rounding must never report a negative or super-independent code length).
-        let tree_bits = (independent_bits - tree_mi_sum).clamp(0.0, independent_bits);
+        let tree_structure_bits = if g <= 2 {
+            0.0
+        } else {
+            (g as f64 - 2.0) * (g as f64).log2()
+        };
+        let mut tree_total = tree_structure_bits
+            + kt_bernoulli_bits(self.codes.iter().map(|code| code.active_mask.get(0)));
+        for child in 1..g {
+            tree_total += kt_conditional_bernoulli_bits(self.codes.iter().map(|code| {
+                (
+                    code.active_mask.get(parent[child]),
+                    code.active_mask.get(child),
+                )
+            }));
+        }
 
         let mean_support = total_active / nn;
-        // Combinatorial worst case at the mean support size (rounded to the
-        // nearest whole active-atom count the `log₂ C(G, k)` bound is defined on).
-        let k_bar = mean_support.round().max(0.0) as i64;
-        let combinatorial_bits = log2_binom(g as i64, k_bar);
+        let cardinality_bits = (g as f64 + 1.0).log2();
+        let combinatorial_bits = cardinality_bits
+            + self
+                .codes
+                .iter()
+                .map(|code| log2_binom(g as i64, code.active_mask.count_ones() as i64))
+                .sum::<f64>()
+                / nn;
 
         SupportEntropy {
-            tree_bits,
-            independent_bits,
+            tree_bits: tree_total / nn,
+            independent_bits: independent_total / nn,
             combinatorial_bits,
             mean_support,
         }
@@ -565,27 +571,49 @@ impl SparseAtomCodes {
 /// per token except [`Self::mean_support`]. See the method for the derivation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SupportEntropy {
-    /// Chow–Liu tree-model per-token support entropy in bits — the DEFAULT MDL
-    /// selection currency. `Σ_g h(π_g) − Σ_{tree} I(u,v)`. Satisfies
-    /// `H(S) ≤ tree_bits ≤ independent_bits`.
+    /// Complete Chow–Liu universal code per token, including tree transmission
+    /// and conditional KT parameter learning.
     pub tree_bits: f64,
-    /// First-order (independent-atom) per-token support entropy `Σ_g h(π_g)` in
-    /// bits — the tree model with no edges; an upper bound on [`Self::tree_bits`].
+    /// Independent-Bernoulli KT universal code per token.
     pub independent_bits: f64,
-    /// `log₂ C(G, k̄)` at the mean support size — the uniform-support worst-case
-    /// per-token selection price, reported alongside the currency it replaces.
+    /// `log₂(G+1) + mean_i log₂ C(G, |S_i|)`: a valid variable-cardinality
+    /// fixed code, unlike `log₂ C(G, round(mean |S|))`.
     pub combinatorial_bits: f64,
     /// Mean support size `k̄` (mean number of active atoms per token).
     pub mean_support: f64,
 }
 
-/// Binary entropy `h(p) = −p log₂ p − (1−p) log₂(1−p)` in bits. Zero at the
-/// boundaries (`p ≤ 0` or `p ≥ 1`) where a term is `0 · log 0 ≡ 0`.
-fn binary_entropy_bits(p: f64) -> f64 {
-    if p <= 0.0 || p >= 1.0 {
-        return 0.0;
+/// Sequential Krichevsky–Trofimov code for a binary sequence. The Jeffreys
+/// half-counts make the code universal and give every one-sample outcome one
+/// bit instead of the zero-bit plug-in pathology.
+fn kt_bernoulli_bits(values: impl IntoIterator<Item = bool>) -> f64 {
+    let mut counts = [0.5_f64, 0.5_f64];
+    let mut bits = 0.0;
+    for value in values {
+        let index = usize::from(value);
+        let probability = counts[index] / (counts[0] + counts[1]);
+        bits -= probability.log2();
+        counts[index] += 1.0;
     }
-    -p * p.log2() - (1.0 - p) * (1.0 - p).log2()
+    bits
+}
+
+/// Conditional KT code with a separate Bernoulli predictor in each binary
+/// parent context.
+fn kt_conditional_bernoulli_bits(
+    values: impl IntoIterator<Item = (bool, bool)>,
+) -> f64 {
+    let mut counts = [[0.5_f64, 0.5_f64], [0.5_f64, 0.5_f64]];
+    let mut bits = 0.0;
+    for (context, value) in values {
+        let context_index = usize::from(context);
+        let value_index = usize::from(value);
+        let probability = counts[context_index][value_index]
+            / (counts[context_index][0] + counts[context_index][1]);
+        bits -= probability.log2();
+        counts[context_index][value_index] += 1.0;
+    }
+    bits
 }
 
 /// Pairwise mutual information `I(x_u; x_v)` in bits of two binary indicators,

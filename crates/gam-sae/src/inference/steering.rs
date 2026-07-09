@@ -7,10 +7,12 @@
 //! [`RowMetric`], a *steering move* is "drive atom `k`'s latent coordinate from
 //! `t_from` to `t_to`". The atom's decoder curve `g_k(t) = Φ_k(t) B_k` maps that
 //! latent move to an **activation-space delta** — the actual vector you add to
-//! the residual stream / reconstruction to realize the move *on the manifold*:
+//! the residual stream / reconstruction to realize the move *on the manifold*.
+//! Here `g_k(t) = exp(s_k) Phi_k^eta(t) B_k` is the fitted physical decoder,
+//! including the atom scale and curvature-homotopy state:
 //!
 //! ```text
-//! δ = a · ( g_k(t_to) − g_k(t_from) )          (the on-manifold move)
+//! delta = a · ( g_k(t_to) - g_k(t_from) )      (the on-manifold move)
 //! ```
 //!
 //! where `a` is the atom's amplitude (how loudly the atom is expressed). This is
@@ -67,9 +69,8 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::encode::EncodeAtlas;
-use crate::manifold::{SaeManifoldTerm, SupportMeasure};
+use crate::manifold::{SaeManifoldAtom, SaeManifoldTerm, SupportMeasure};
 use gam_problem::{MetricProvenance, RowMetric};
-use gam_terms::inference::structure_evidence::log_e_from_p_calibrator;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
 /// the dosimetry path integral. The decoder curve is smooth, so a modest
@@ -221,9 +222,10 @@ pub struct InterchangeResult {
     pub off_manifold_norm: f64,
     /// Reported steering validity radius.
     pub validity_radius: Option<f64>,
-    /// Calibrated log e-value for counterfactual consistency: larger means the
-    /// post-edit target coordinate landed closer to the donor coordinate.
-    pub counterfactual_consistency_log_e: f64,
+    /// Geodesic chart-coordinate landing error. Wrapped axes use their shortest
+    /// signed displacement. This is a descriptive reconstruction diagnostic,
+    /// not a p/e-value: no counterfactual null distribution is available here.
+    pub landing_error: f64,
     /// Underlying coordinate-write plan.
     pub set_result: CoordinateSetResult,
 }
@@ -232,9 +234,9 @@ pub struct InterchangeResult {
 ///
 /// The source coordinate is certified with `source_amplitude`; the target write
 /// is performed with `target_amplitude`, so swapping a position coordinate cannot
-/// silently smuggle donor intensity into the target. The returned consistency
-/// e-value is computed by re-encoding the edited target and calibrating the
-/// coordinate landing error into the existing structure-evidence e-currency.
+/// silently smuggle donor intensity into the target. The returned landing error
+/// is descriptive; statistical evidence requires an externally specified null
+/// experiment and is deliberately not fabricated from the error magnitude.
 pub fn interchange(
     model: &SaeManifoldTerm,
     metric: &RowMetric,
@@ -264,23 +266,12 @@ pub fn interchange(
     )?;
     let (target_t_after, _after_cert) =
         atlas.certified_encode_row(atom, atom_k, set.edited.view(), target_amplitude)?;
-    let landing_error = l2_distance(donor_t.view(), target_t_after.view())?;
-    let scale = set
-        .steer
-        .validity_radius
-        .unwrap_or_else(|| {
-            l2_distance(set.t_from_certified.view(), donor_t.view())
-                .unwrap_or(1.0)
-                .max(1e-12)
-        })
-        .max(1e-12);
-    // Convert closeness into a superuniform-shaped p-value and then into the
-    // repository's standard e-value currency. Exact hits approach machine-small
-    // p-values; errors at/above the validity radius produce e-values near or
-    // below one, so shuffled-chart negative controls do not accumulate evidence.
-    let z = (scale / landing_error.max(1e-12)).min(1.0e6);
-    let p_value = (-0.5 * z * z).exp().clamp(f64::MIN_POSITIVE, 1.0);
-    let log_e = log_e_from_p_calibrator(p_value)?;
+    let periods = model.assignment.coords[atom_k].effective_axis_periods();
+    let landing_error = coordinate_l2_distance(
+        donor_t.as_slice().unwrap_or(&[]),
+        target_t_after.as_slice().unwrap_or(&[]),
+        &periods,
+    )?;
     Ok(InterchangeResult {
         edited_target: set.edited.clone(),
         donor_t,
@@ -289,25 +280,66 @@ pub fn interchange(
         predicted_nats: set.steer.predicted_nats,
         off_manifold_norm: set.steer.off_manifold_norm,
         validity_radius: set.steer.validity_radius,
-        counterfactual_consistency_log_e: log_e,
+        landing_error,
         set_result: set,
     })
 }
 
-fn l2_distance(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> Result<f64, String> {
-    if a.len() != b.len() {
+fn shortest_coordinate_delta(
+    from: &[f64],
+    to: &[f64],
+    periods: &[Option<f64>],
+) -> Result<Vec<f64>, String> {
+    if from.len() != to.len() || from.len() != periods.len() {
         return Err(format!(
-            "coordinate distance length mismatch: {} vs {}",
-            a.len(),
-            b.len()
+            "coordinate displacement length mismatch: from={}, to={}, periods={}",
+            from.len(),
+            to.len(),
+            periods.len()
         ));
     }
-    let mut ss = 0.0;
-    for i in 0..a.len() {
-        let r = a[i] - b[i];
-        ss += r * r;
+    let mut delta = Vec::with_capacity(from.len());
+    for axis in 0..from.len() {
+        let mut d = to[axis] - from[axis];
+        if let Some(period) = periods[axis] {
+            if !(period.is_finite() && period > 0.0) {
+                return Err(format!(
+                    "coordinate axis {axis} has invalid period {period}"
+                ));
+            }
+            d -= period * (d / period).round();
+        }
+        delta.push(d);
     }
-    Ok(ss.sqrt())
+    Ok(delta)
+}
+
+fn coordinate_l2_distance(
+    a: &[f64],
+    b: &[f64],
+    periods: &[Option<f64>],
+) -> Result<f64, String> {
+    Ok(shortest_coordinate_delta(a, b, periods)?
+        .iter()
+        .map(|d| d * d)
+        .sum::<f64>()
+        .sqrt())
+}
+
+fn path_coordinate(
+    from: &[f64],
+    delta: &[f64],
+    periods: &[Option<f64>],
+    fraction: f64,
+) -> Vec<f64> {
+    from.iter()
+        .zip(delta.iter())
+        .zip(periods.iter())
+        .map(|((&start, &step), &period)| {
+            let value = start + fraction * step;
+            period.map_or(value, |p| value.rem_euclid(p))
+        })
+        .collect()
 }
 
 /// Build a [`SteerPlan`] for driving atom `atom_k` from `t_from` to `t_to`.
@@ -373,13 +405,15 @@ fn steer_delta_impl(
             t_to.len()
         ));
     }
-    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+    atom.basis_evaluator.as_ref().ok_or_else(|| {
         format!(
             "steer_delta: atom {atom_k} ('{}') has no installed basis evaluator; \
              arbitrary-t decoder evaluation requires one",
             atom.name
         )
     })?;
+    let periods = model.assignment.coords[atom_k].effective_axis_periods();
+    let coordinate_delta = shortest_coordinate_delta(t_from, t_to, &periods)?;
 
     // --- amplitude & the row the dose is measured through -------------------
     // The amplitude and measured row come from the shared atom support measure.
@@ -405,8 +439,8 @@ fn steer_delta_impl(
     });
 
     // --- the on-manifold activation-space delta -----------------------------
-    let g_from = decode_at(evaluator.as_ref(), &atom.decoder_coefficients, t_from, p)?;
-    let g_to = decode_at(evaluator.as_ref(), &atom.decoder_coefficients, t_to, p)?;
+    let g_from = decode_at(atom, t_from)?;
+    let g_to = decode_at(atom, t_to)?;
     let mut delta = Array1::<f64>::zeros(p);
     for i in 0..p {
         delta[i] = amplitude * (g_to[i] - g_from[i]);
@@ -428,10 +462,12 @@ fn steer_delta_impl(
     // `≈ 0` for an on-manifold move and grows only with genuine arc curvature.
     let mut t_mid = vec![0.0_f64; d];
     for a in 0..d {
-        t_mid[a] = 0.5 * (t_from[a] + t_to[a]);
+        t_mid[a] = t_from[a] + 0.5 * coordinate_delta[a];
+        if let Some(period) = periods[a] {
+            t_mid[a] = t_mid[a].rem_euclid(period);
+        }
     }
-    let tangents =
-        decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, &t_mid, p, d)?;
+    let tangents = decode_tangents_at(atom, &t_mid)?;
     let off_manifold_norm = off_manifold_residual_norm(&tangents, delta.view());
 
     // --- dosimetry: path-integrated Fisher dose -----------------------------
@@ -439,16 +475,17 @@ fn steer_delta_impl(
         (None, None)
     } else {
         let ctx = SteerContext {
-            evaluator: evaluator.as_ref(),
-            decoder: &atom.decoder_coefficients,
+            atom,
             metric,
             row: best_row,
             p,
             d,
             amplitude,
+            coordinate_delta: &coordinate_delta,
+            periods: &periods,
         };
-        let dose = path_integrated_dose(&ctx, t_from, t_to)?;
-        let radius = validity_radius(&ctx, t_from, t_to)?;
+        let dose = path_integrated_dose(&ctx, t_from)?;
+        let radius = validity_radius(&ctx, t_from)?;
         (Some(dose), Some(radius))
     };
 
@@ -508,13 +545,13 @@ pub fn predicted_response(
             delta.len()
         ));
     }
-    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+    atom.basis_evaluator.as_ref().ok_or_else(|| {
         format!(
             "predicted_response: atom {atom_k} ('{}') has no installed basis evaluator",
             atom.name
         )
     })?;
-    let tangents = decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, t_at, p, d)?;
+    let tangents = decode_tangents_at(atom, t_at)?;
     Ok(project_onto_tangent_span(&tangents, delta))
 }
 
@@ -533,49 +570,30 @@ fn metric_carries_behavior(p: MetricProvenance) -> bool {
 
 /// Evaluate the decoder output `g_k(t) = Φ_k(t) B_k ∈ ℝ^p` at an arbitrary
 /// latent coordinate `t` (length `d`) via the atom's installed evaluator.
-fn decode_at(
-    evaluator: &dyn crate::manifold::SaeBasisEvaluator,
-    decoder: &Array2<f64>,
-    t: &[f64],
-    p: usize,
-) -> Result<Array1<f64>, String> {
+fn decode_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array1<f64>, String> {
     let d = t.len();
     let coords = Array2::from_shape_vec((1, d), t.to_vec())
         .map_err(|e| format!("steer_delta::decode_at: coord shape: {e}"))?;
-    let (phi, _jet) = evaluator.evaluate(coords.view())?;
-    let m = decoder.nrows();
-    if phi.ncols() != m {
-        return Err(format!(
-            "steer_delta::decode_at: evaluator returned {} basis cols but decoder has {m} rows",
-            phi.ncols()
-        ));
-    }
-    let mut g = Array1::<f64>::zeros(p);
-    for basis_col in 0..m {
-        let phi_v = phi[[0, basis_col]];
-        if phi_v == 0.0 {
-            continue;
-        }
-        for out_col in 0..p {
-            g[out_col] += phi_v * decoder[[basis_col, out_col]];
-        }
-    }
-    Ok(g)
+    Ok(atom.decode_at_coords(coords.view())?.row(0).to_owned())
 }
 
 /// Evaluate the decoder tangents `∂g_k/∂t_a = Φ_k'(t) B_k ∈ ℝ^p`, one per latent
 /// axis `a ∈ 0..d`, at an arbitrary latent coordinate `t`. Returned as a
 /// `(p × d)` matrix whose column `a` is the tangent along axis `a`.
-fn decode_tangents_at(
-    evaluator: &dyn crate::manifold::SaeBasisEvaluator,
-    decoder: &Array2<f64>,
-    t: &[f64],
-    p: usize,
-    d: usize,
-) -> Result<Array2<f64>, String> {
+fn decode_tangents_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array2<f64>, String> {
+    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+        "steer_delta::decode_tangents_at: atom has no installed basis evaluator".to_string()
+    })?;
+    let p = atom.output_dim();
+    let d = atom.latent_dim;
     let coords = Array2::from_shape_vec((1, d), t.to_vec())
         .map_err(|e| format!("steer_delta::decode_tangents_at: coord shape: {e}"))?;
-    let (_phi, jet) = evaluator.evaluate(coords.view())?;
+    let jet = if atom.homotopy_eta == 1.0 {
+        evaluator.evaluate(coords.view())?.1
+    } else {
+        evaluator.evaluate_phi_eta(coords.view(), atom.homotopy_eta)?.jet
+    };
+    let decoder = &atom.decoder_coefficients;
     let m = decoder.nrows();
     if jet.dim() != (1, m, d) {
         return Err(format!(
@@ -594,6 +612,9 @@ fn decode_tangents_at(
                 tang[[out_col, axis]] += dphi * decoder[[basis_col, out_col]];
             }
         }
+    }
+    if atom.log_amplitude != 0.0 {
+        tang.mapv_inplace(|value| value * atom.log_amplitude.exp());
     }
     Ok(tang)
 }
@@ -701,8 +722,7 @@ fn solve_spd_small(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
 /// The fixed geometry of one steering query, bundled so the dose integrator and
 /// its helpers take a single context rather than a long argument list.
 struct SteerContext<'a> {
-    evaluator: &'a dyn crate::manifold::SaeBasisEvaluator,
-    decoder: &'a Array2<f64>,
+    atom: &'a SaeManifoldAtom,
     metric: &'a RowMetric,
     /// The row whose per-row metric the dose is measured through.
     row: usize,
@@ -712,11 +732,13 @@ struct SteerContext<'a> {
     d: usize,
     /// Amplitude `a` the move is scaled by.
     amplitude: f64,
+    coordinate_delta: &'a [f64],
+    periods: &'a [Option<f64>],
 }
 
 /// Path-integrated Fisher dose
 /// `½ a² ∫ g_k'(t)ᵀ M g_k'(t) dt` along the straight latent segment
-/// `t(τ) = t_from + τ (t_to − t_from)`, `τ ∈ [0, 1]`, by the midpoint rule over
+/// the shortest wrapped latent segment from `t_from` to `t_to`, by the midpoint rule over
 /// [`STEER_PATH_STEPS`] sub-steps.
 ///
 /// The local quadratic `g'(t)ᵀ M g'(t)` is the [`RowMetric::pullback`] of the
@@ -725,28 +747,21 @@ struct SteerContext<'a> {
 fn path_integrated_dose(
     ctx: &SteerContext<'_>,
     t_from: &[f64],
-    t_to: &[f64],
 ) -> Result<f64, String> {
     let d = ctx.d;
     let p = ctx.p;
     let steps = STEER_PATH_STEPS;
     let dtau = 1.0 / steps as f64;
     // Latent velocity Δt (constant along the straight segment).
-    let mut dt = vec![0.0_f64; d];
-    for a in 0..d {
-        dt[a] = t_to[a] - t_from[a];
-    }
+    let dt = ctx.coordinate_delta;
     let mut acc = 0.0_f64;
     let amp2 = ctx.amplitude * ctx.amplitude;
     for s in 0..steps {
         // Midpoint of sub-step s in τ, mapped to a latent coordinate.
         let tau_mid = (s as f64 + 0.5) * dtau;
-        let mut t_mid = vec![0.0_f64; d];
-        for a in 0..d {
-            t_mid[a] = t_from[a] + tau_mid * dt[a];
-        }
+        let t_mid = path_coordinate(t_from, dt, ctx.periods, tau_mid);
         // Decoder tangents at the midpoint: ∂g/∂t_a, columns of a (p × d) matrix.
-        let tang = decode_tangents_at(ctx.evaluator, ctx.decoder, &t_mid, p, d)?;
+        let tang = decode_tangents_at(ctx.atom, &t_mid)?;
         // The pulled-back metric at this point is g_{ab} = (∂g/∂t)ᵀ M (∂g/∂t),
         // the d × d local inner product of latent motion *in output-Fisher
         // units*. We form it through the criterion-facing `RowMetric::pullback`
@@ -788,26 +803,18 @@ fn path_integrated_dose(
 /// pure surface curvature: on a flat decoder the two agree for every `τ` and the
 /// radius is the whole move. If the metric kills the tangent (no linear effect to
 /// validate), the move is trusted to its full length.
-fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64], t_to: &[f64]) -> Result<f64, String> {
+fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String> {
     let d = ctx.d;
     let p = ctx.p;
-    let full_len: f64 = t_from
-        .iter()
-        .zip(t_to.iter())
-        .map(|(&a, &b)| (b - a) * (b - a))
-        .sum::<f64>()
-        .sqrt();
+    let full_len: f64 = ctx.coordinate_delta.iter().map(|d| d * d).sum::<f64>().sqrt();
     if full_len == 0.0 {
         return Ok(0.0);
     }
-    let mut dt = vec![0.0_f64; d];
-    for a in 0..d {
-        dt[a] = t_to[a] - t_from[a];
-    }
+    let dt = ctx.coordinate_delta;
     let amp = ctx.amplitude;
 
     // Initial-tangent linear output move per unit τ: v0 = (∂g/∂t|_{t_from}) Δt.
-    let tang0 = decode_tangents_at(ctx.evaluator, ctx.decoder, t_from, p, d)?;
+    let tang0 = decode_tangents_at(ctx.atom, t_from)?;
     let mut v0 = Array1::<f64>::zeros(p);
     for i in 0..p {
         let mut acc = 0.0_f64;
@@ -823,15 +830,12 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64], t_to: &[f64]) -> Resu
         return Ok(full_len);
     }
 
-    let g_from = decode_at(ctx.evaluator, ctx.decoder, t_from, p)?;
+    let g_from = decode_at(ctx.atom, t_from)?;
     let steps = STEER_PATH_STEPS;
     for s in 0..steps {
         let tau = (s as f64 + 1.0) / steps as f64;
-        let mut t_mid = vec![0.0_f64; d];
-        for a in 0..d {
-            t_mid[a] = t_from[a] + tau * dt[a];
-        }
-        let g_tau = decode_at(ctx.evaluator, ctx.decoder, &t_mid, p)?;
+        let t_mid = path_coordinate(t_from, dt, ctx.periods, tau);
+        let g_tau = decode_at(ctx.atom, &t_mid)?;
         let mut chord = Array1::<f64>::zeros(p);
         for i in 0..p {
             chord[i] = amp * (g_tau[i] - g_from[i]);
@@ -845,4 +849,20 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64], t_to: &[f64]) -> Resu
         }
     }
     Ok(full_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_steering_uses_shortest_path_across_seam() {
+        let periods = [Some(1.0)];
+        let delta = shortest_coordinate_delta(&[0.99], &[0.01], &periods).unwrap();
+        assert!((delta[0] - 0.02).abs() < 1e-12);
+        let midpoint = path_coordinate(&[0.99], &delta, &periods, 0.5);
+        assert!(midpoint[0].abs() < 1e-12 || (midpoint[0] - 1.0).abs() < 1e-12);
+        let distance = coordinate_l2_distance(&[0.99], &[0.01], &periods).unwrap();
+        assert!((distance - 0.02).abs() < 1e-12);
+    }
 }

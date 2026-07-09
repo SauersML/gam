@@ -69,7 +69,7 @@ def test_cotrained_torch_fit_surfaces_report_and_matches_sequential_circle() -> 
     assert module.cotrain == cotrained.cotrain
     assert cotrained.cotrain["n_encodes"] > 0
     assert cotrained.cotrain["recon_consistency"] <= 1.0e-2
-    assert cotrained.cotrain["uncertified_fraction"] < 1.0
+    assert cotrained.cotrain["unconverged_fraction"] < 1.0
 
     cotrain_train_mse = _mse(cotrained.fitted, train)
     sequential_train_mse = _mse(sequential.fitted, train)

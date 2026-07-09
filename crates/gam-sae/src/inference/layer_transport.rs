@@ -31,10 +31,10 @@
 //!    reshaped).
 //! 3. **Composition law** — `h_{l→l+2}` vs `h_{l+1→l+2} ∘ h_{l→l+1}`. The
 //!    defect `d(t) = h_ac(t) ⊖ h_bc(h_ab(t))` (circular difference on circle
-//!    charts) is evaluated on a grid, studentized by the composed
-//!    delta-method bands, and tested with the existing
-//!    [`wood_smooth_test`](gam_terms::inference::smooth_test::wood_smooth_test)
-//!    machinery applied to a REML smooth of the defect.
+//!    charts) is evaluated on a grid and studentized with a joint shared-row
+//!    influence sandwich. A Bonferroni max test controls the grid family under
+//!    arbitrary pointwise dependence; deterministic fits with no score
+//!    variation emit no p-value.
 //!
 //! # Gauge discipline
 //!
@@ -46,12 +46,9 @@
 //!   coordinates, so any isometry of the source chart acts identically on
 //!   `h_ac` and on `h_bc ∘ h_ab`; the source gauge cancels in the defect and
 //!   needs no explicit alignment.
-//! * The target gauge does not cancel: before testing, the composed route is
-//!   aligned to the direct route using ONLY the certified finite/1-parameter
-//!   isometries of the target chart — for a circle, the rotation (fixed at
-//!   the circular mean of the defect) and the reflection (the orientation
-//!   with the smaller squared defect); for an interval, the reflection about
-//!   its midpoint. No general reparameterization is ever fitted away.
+//! * Both routes land in the same target chart, so the target gauge also acts
+//!   identically and cancels. No post-hoc rotation or reflection is selected;
+//!   such an alignment would erase genuine composition violations.
 //!
 //! All smooths reuse the engine's existing periodic cardinal-B-spline basis
 //! ([`build_periodic_bspline_basis_1d`]) with the cyclic difference penalty on
@@ -66,7 +63,6 @@ use gam_terms::basis::{
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
-use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use ndarray::{Array1, Array2, ArrayView1, Axis};
 use statrs::distribution::{ContinuousCDF, Normal};
 use std::f64::consts::{PI, TAU};
@@ -93,27 +89,6 @@ const DEGREE_CANDIDATES: [i32; 5] = [-2, -1, 0, 1, 2];
 const FOLD_CHECK_GRID: usize = 512;
 /// Default evaluation grid for the composition-law defect.
 pub const DEFAULT_COMPOSITION_GRID: usize = 256;
-/// Absolute floor on the composition-defect studentization variance, expressed
-/// as a fraction of the target chart's coordinate span (`std = span · this`).
-///
-/// The delta-method band variance the defect is studentized against is a pure
-/// SAMPLING variance and collapses toward zero as the adjacent REML transports
-/// approach noiselessness (`σ̂² → 0`). But composing two penalized-spline chart
-/// maps is not closed in a single finite basis, so even a perfectly composable
-/// chain carries an irreducible composition defect at the spline-representation
-/// scale (empirically `~1e-5` of the coordinate span) — a bias the sampling
-/// variance does not model. Without an absolute floor, studentizing that
-/// machine-level defect against a collapsed sampling variance inflates it into a
-/// spurious "law violated" verdict and even inverts the test: a smaller, more
-/// composable defect on cleaner data is judged MORE significant (#2143).
-///
-/// Set an order of magnitude above the representation defect so a machine-level
-/// defect reads as non-significant, and far below any realistic composition-law
-/// violation or genuine sampling scale, so the floor never binds when a real
-/// defect or real noise is present — restoring type-I control at no cost to
-/// power. It is scale-aware (tied to the coordinate span), matching the
-/// scale-aware tolerance convention used elsewhere in this module.
-const COMPOSITION_DEFECT_REL_VAR_FLOOR: f64 = 1e-4;
 /// REML λ-profile: log-spaced grid points then golden-section refinement.
 const REML_LAMBDA_GRID_POINTS: usize = 41;
 const REML_GOLDEN_ITERATIONS: usize = 40;
@@ -414,31 +389,26 @@ impl DomainBasis {
     }
 }
 
-/// One penalized 1-D smooth chosen by exact Gaussian REML (or known-scale
-/// REML for the weighted defect fit), with everything downstream inference
-/// needs: scale-included covariance, the influence block for trace-corrected
-/// reference d.f., EDF, and the selected λ.
+/// One penalized 1-D smooth chosen by exact Gaussian REML.
 struct Penalized1dFit {
     beta: Array1<f64>,
-    /// Scale-included posterior covariance `σ̂²(XᵀWX + λS)⁻¹` (φ̂ = 1 in the
-    /// known-scale branch).
+    /// Scale-included posterior covariance `σ̂²(XᵀWX + λS)⁻¹`.
     covariance: Array2<f64>,
-    /// Coefficient-space influence `F = (XᵀWX + λS)⁻¹ XᵀWX` for Wood's
-    /// trace-corrected reference d.f.
-    influence: Array2<f64>,
     lambda: f64,
     edf: f64,
     sigma2: f64,
     residual_rms: f64,
+    /// Observation-level coefficient influence columns
+    /// `A^{-1} x_i w_i residual_i`. Keeping the row identity lets composition
+    /// contrasts form the joint sandwich across maps fitted on the same rows.
+    coefficient_score_influence: Array2<f64>,
 }
 
 /// Exact 1-D Gaussian REML on a fixed design/penalty pair.
 ///
-/// Estimated scale (`known_scale = false`): profile σ² out of Wood's REML,
+/// Profile σ² out of Wood's REML,
 /// `V(λ) = (n − M₀)·log PRSS(λ) + log|XᵀWX + λS| − rank(S)·log λ`, with
-/// `M₀ = dim ker S` and `PRSS = yᵀWy − β̂ᵀXᵀWy`. Known scale (φ = 1, used for
-/// the variance-weighted defect smooth): `V(λ) = PRSS + log|XᵀWX + λS| −
-/// rank(S)·log λ`. λ is selected on a deterministic log grid spanning
+/// `M₀ = dim ker S` and `PRSS = yᵀWy − β̂ᵀXᵀWy`. λ is selected on a deterministic log grid spanning
 /// ±[`REML_LAMBDA_SPAN_DECADES`] decades around the design's trace scale and
 /// refined by golden section — no RNG, no caller knobs.
 fn fit_penalized_1d(
@@ -447,7 +417,6 @@ fn fit_penalized_1d(
     response: ArrayView1<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     penalty_rank: usize,
-    known_scale: bool,
 ) -> Result<Penalized1dFit, String> {
     let n = design.nrows();
     let m = design.ncols();
@@ -535,7 +504,7 @@ fn fit_penalized_1d(
             logdet += d.ln();
         }
         let prss = prss.max(f64::MIN_POSITIVE);
-        let fit_term = if known_scale { prss } else { dof * prss.ln() };
+        let fit_term = dof * prss.ln();
         fit_term + logdet - rank_f * lambda.ln()
     };
 
@@ -604,13 +573,21 @@ fn fit_penalized_1d(
         let e = response[r] - fitted[r];
         rss += w * e * e;
     }
-    let sigma2 = if known_scale {
-        1.0
-    } else {
-        (rss / ((n as f64) - edf).max(1.0)).max(f64::MIN_POSITIVE)
-    };
+    let sigma2 = (rss / ((n as f64) - edf).max(1.0)).max(f64::MIN_POSITIVE);
     let covariance = a_inv.mapv(|v| v * sigma2);
     let residual_rms = (rss / sum_w.max(f64::MIN_POSITIVE)).sqrt();
+    let mut coefficient_score_influence = Array2::<f64>::zeros((m, n));
+    for row in 0..n {
+        let w = weights.map_or(1.0, |wv| wv[row]);
+        let residual = response[row] - fitted[row];
+        for j in 0..m {
+            let mut sensitivity = 0.0_f64;
+            for k in 0..m {
+                sensitivity += a_inv[[j, k]] * design[[row, k]];
+            }
+            coefficient_score_influence[[j, row]] = sensitivity * w * residual;
+        }
+    }
 
     if beta.iter().any(|v| !v.is_finite()) {
         return Err("penalized 1-D fit produced non-finite coefficients".to_string());
@@ -618,11 +595,11 @@ fn fit_penalized_1d(
     Ok(Penalized1dFit {
         beta,
         covariance,
-        influence,
         lambda,
         edf,
         sigma2,
         residual_rms,
+        coefficient_score_influence,
     })
 }
 
@@ -671,6 +648,7 @@ pub struct FittedTransport {
     /// RMS of the response residuals at the fitted map.
     pub residual_rms: f64,
     basis: DomainBasis,
+    coefficient_score_influence: Array2<f64>,
 }
 
 impl FittedTransport {
@@ -714,6 +692,12 @@ impl FittedTransport {
         let rows = self.basis.derivative_rows(t)?;
         let slope = self.linear_slope();
         Ok(rows.dot(&self.beta).mapv(|v| v + slope))
+    }
+
+    /// Point-evaluation influence by original observation row. The returned
+    /// matrix has shape `(t.len(), n_obs)` and retains cross-map row identity.
+    fn eval_score_influence(&self, t: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        Ok(self.basis.value_rows(t)?.dot(&self.coefficient_score_influence))
     }
 
     /// Pre-wrap map value `slope·t + offset + g(t)` at a single point — the
@@ -1006,10 +990,11 @@ pub struct LayerTransportReport {
     pub composition_defect: Option<f64>,
     /// Max studentized composition defect against the composed bands.
     pub composition_max_studentized: Option<f64>,
-    /// `wood_smooth_test` p-value of the defect smooth (H₀: defect ≡ 0 up to
-    /// the target-chart gauge).
+    /// Bonferroni familywise p-value from the joint shared-row sandwich.
+    /// `None` when the fitted maps carry no empirical score variation.
     pub composition_p_value: Option<f64>,
-    /// Whether the gauge alignment chose the reflected target orientation.
+    /// Always `false`: both routes already land in the same target chart, so no
+    /// post-hoc target alignment is fitted.
     pub composition_gauge_reflected: Option<bool>,
 }
 
@@ -1018,7 +1003,7 @@ impl LayerTransportReport {
     pub fn with_composition(mut self, composition: &CompositionDefectReport) -> Self {
         self.composition_defect = Some(composition.rms_defect);
         self.composition_max_studentized = Some(composition.max_studentized_defect);
-        self.composition_p_value = Some(composition.p_value);
+        self.composition_p_value = composition.p_value.is_finite().then_some(composition.p_value);
         self.composition_gauge_reflected = Some(composition.gauge_reflected);
         self
     }
@@ -1114,7 +1099,6 @@ pub fn fit_transport_map(
         response.view(),
         None,
         basis.penalty_rank(),
-        false,
     )?;
 
     // --- isometry defect under the empirical density -------------------------
@@ -1181,6 +1165,7 @@ pub fn fit_transport_map(
         min_directional_derivative,
         residual_rms: fit.residual_rms,
         basis,
+        coefficient_score_influence: fit.coefficient_score_influence,
     })
 }
 
@@ -1203,9 +1188,9 @@ pub fn fit_layer_transport(
 #[derive(Debug, Clone)]
 pub struct CompositionDefectReport {
     pub n_grid: usize,
-    /// Rotation gauge applied to the composed route (circle targets).
+    /// Always zero: no post-hoc target rotation is fitted.
     pub gauge_rotation: f64,
-    /// Whether the reflected target orientation minimized the defect.
+    /// Always false: no post-hoc target reflection is fitted.
     pub gauge_reflected: bool,
     pub mean_abs_defect: f64,
     pub rms_defect: f64,
@@ -1215,12 +1200,8 @@ pub struct CompositionDefectReport {
     /// Bonferroni p-value bound for the max studentized defect over all tested
     /// grid points.
     pub max_studentized_p_value: f64,
-    /// EDF of the variance-weighted REML defect smooth.
-    pub defect_edf: f64,
-    /// Wood rank-truncated Wald statistic of the defect smooth.
-    pub statistic: f64,
-    pub ref_df: f64,
-    /// `wood_smooth_test` p-value for H₀: the gauge-aligned defect is zero.
+    /// Alias of the familywise max-test p-value for report consumers. `NaN`
+    /// explicitly means that deterministic fits supplied no sampling variation.
     pub p_value: f64,
 }
 
@@ -1377,17 +1358,10 @@ fn domain_grid(topology: ChartTopology, n: usize) -> Array1<f64> {
 /// Test the composition law `h_ac ≟ h_bc ∘ h_ab` on `n_grid` points.
 ///
 /// The defect `d(t) = h_ac(t) ⊖ (h_bc ∘ h_ab)(t)` (circular difference on
-/// circle targets) is first quotiented by the certified isometry gauge of the
-/// TARGET chart only — the source gauge cancels because both routes consume
-/// identical source coordinates (double-coset estimand; see module docs):
-/// rotation fixed at the circular mean of the defect, reflection chosen as
-/// the orientation with smaller squared defect. The aligned defect is then
-/// (a) studentized pointwise against the composed delta-method bands
-/// `var(h_ac) + var(h_bc) + h_bc′² var(h_ab)` (the three maps are fitted from
-/// disjoint response pairs; cross-correlations through shared rows are
-/// neglected), with the max studentized defect as the headline statistic, and
-/// (b) smoothed by a variance-weighted known-scale REML fit whose coefficients
-/// feed [`wood_smooth_test`] for the calibrated p-value.
+/// circle targets) is computed directly in the common target chart: no gauge is
+/// selected after seeing the defect. Pointwise uncertainty is assembled from
+/// the combined observation-level influence of all three maps, retaining their
+/// shared-row covariance, and the grid is tested by a Bonferroni max statistic.
 pub fn composition_defect(
     h_ab: &FittedTransport,
     h_bc: &FittedTransport,
@@ -1407,52 +1381,51 @@ pub fn composition_defect(
             "composition defect grid must have at least {MIN_TRANSPORT_OBS} points, got {n_grid}"
         ));
     }
+    if h_ab.n_obs != h_bc.n_obs || h_ab.n_obs != h_ac.n_obs {
+        return Err(format!(
+            "composition defect requires maps fitted on the same rows; got n_ab={}, n_bc={}, n_ac={}",
+            h_ab.n_obs, h_bc.n_obs, h_ac.n_obs
+        ));
+    }
 
     let grid = domain_grid(h_ab.topology_from, n_grid);
-    let (direct, var_direct) = h_ac.eval_with_variance(grid.view())?;
-    let (mid, var_mid) = h_ab.eval_with_variance(grid.view())?;
-    let (composed, var_bc) = h_bc.eval_with_variance(mid.view())?;
+    let direct = h_ac.eval(grid.view())?;
+    let mid = h_ab.eval(grid.view())?;
+    let composed = h_bc.eval(mid.view())?;
     let mid_slope = h_bc.derivative(mid.view())?;
+
+    // Joint row-influence sandwich. For original fit row r and evaluation point
+    // t, the first-order influence of the composition defect is
+    //   IF_ac(t,r) - IF_bc(h_ab(t),r) - h_bc'(h_ab(t)) IF_ab(t,r).
+    // Squaring the combined influence before summing retains every shared-fit
+    // covariance term; adding three marginal variances drops those cross terms.
+    let influence_direct = h_ac.eval_score_influence(grid.view())?;
+    let influence_ab = h_ab.eval_score_influence(grid.view())?;
+    let influence_bc = h_bc.eval_score_influence(mid.view())?;
     let mut variance = Array1::<f64>::zeros(n_grid);
     for i in 0..n_grid {
-        variance[i] = var_direct[i] + var_bc[i] + mid_slope[i] * mid_slope[i] * var_mid[i];
+        let mut value = 0.0_f64;
+        for row in 0..h_ab.n_obs {
+            let influence = influence_direct[[i, row]]
+                - influence_bc[[i, row]]
+                - mid_slope[i] * influence_ab[[i, row]];
+            value += influence * influence;
+        }
+        variance[i] = value;
     }
 
-    // --- target-chart gauge alignment (rotation + reflection only) ----------
+    // Both routes consume the same source chart and land in the same target
+    // chart. Every source/target gauge transformation therefore acts on both
+    // routes identically and cancels. Fitting a fresh rotation/reflection here
+    // would fit away the very composition violation being tested.
     let circle_target = matches!(h_ac.topology_to, ChartTopology::Circle);
-    let mut gauge_reflected = false;
-    let mut gauge_rotation = 0.0_f64;
-    let mut defect = Array1::<f64>::zeros(n_grid);
-    let mut best_sse = f64::INFINITY;
-    for reflected in [false, true] {
-        let composed_oriented: Array1<f64> = match (h_ac.topology_to, reflected) {
-            (_, false) => composed.clone(),
-            (ChartTopology::Circle, true) => composed.mapv(|v| wrap_tau(-v)),
-            (ChartTopology::Interval { lo, hi }, true) => composed.mapv(|v| lo + hi - v),
-        };
-        let (rotation, candidate): (f64, Array1<f64>) = if circle_target {
-            let raw: Vec<f64> = (0..n_grid)
-                .map(|i| wrap_pi(direct[i] - composed_oriented[i]))
-                .collect();
-            let rot = circular_mean(&raw);
-            (
-                rot,
-                Array1::from_iter(raw.iter().map(|&d| wrap_pi(d - rot))),
-            )
+    let defect = Array1::from_iter((0..n_grid).map(|i| {
+        if circle_target {
+            wrap_pi(direct[i] - composed[i])
         } else {
-            (
-                0.0,
-                Array1::from_iter((0..n_grid).map(|i| direct[i] - composed_oriented[i])),
-            )
-        };
-        let sse = candidate.iter().map(|&d| d * d).sum::<f64>();
-        if sse < best_sse {
-            best_sse = sse;
-            gauge_reflected = reflected;
-            gauge_rotation = rotation;
-            defect = candidate;
+            direct[i] - composed[i]
         }
-    }
+    }));
 
     // --- pointwise studentization against the composed bands ----------------
     // Floor the band variance with BOTH a relative component (numerical guard
@@ -1465,13 +1438,8 @@ pub fn composition_defect(
     // target chart's coordinate span, so a machine-level composition defect on a
     // clean chain reads as non-significant while a genuine violation (far larger
     // defect, or real sampling variance well above the floor) is unaffected.
-    let coord_scale = match h_ac.topology_to {
-        ChartTopology::Circle => TAU,
-        ChartTopology::Interval { lo, hi } => (hi - lo).abs(),
-    };
-    let repr_var_floor = (coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR).powi(2);
     let max_var = variance.iter().copied().fold(0.0_f64, f64::max);
-    let var_floor = (max_var * 1e-10).max(repr_var_floor).max(f64::MIN_POSITIVE);
+    let var_floor = (max_var * 1e-12).max(f64::MIN_POSITIVE);
     let mut max_abs = 0.0_f64;
     let mut sum_abs = 0.0_f64;
     let mut sum_sq = 0.0_f64;
@@ -1482,59 +1450,37 @@ pub fn composition_defect(
         max_abs = max_abs.max(a);
         sum_abs += a;
         sum_sq += d * d;
-        let z = a / variance[i].max(var_floor).sqrt();
-        max_z = max_z.max(z);
+        if max_var > 0.0 {
+            let z = a / variance[i].max(var_floor).sqrt();
+            max_z = max_z.max(z);
+        }
     }
     let mean_abs_defect = sum_abs / n_grid as f64;
     let rms_defect = (sum_sq / n_grid as f64).sqrt();
 
-    // --- variance-weighted REML defect smooth + Wood Wald test ---------------
-    let basis = DomainBasis::build(h_ab.topology_from, grid.view())?;
-    let design = basis.value_rows(grid.view())?;
-    let penalty = basis.penalty()?;
-    let weights = variance.mapv(|v| 1.0 / v.max(var_floor));
-    let fit = fit_penalized_1d(
-        &design,
-        &penalty,
-        defect.view(),
-        Some(weights.view()),
-        basis.penalty_rank(),
-        true,
-    )?;
-    let m = basis.num_basis();
-    let test = wood_smooth_test(SmoothTestInput {
-        beta: fit.beta.view(),
-        covariance: &fit.covariance,
-        influence_matrix: Some(&fit.influence),
-        whitening_gram: None,
-        coeff_range: 0..m,
-        edf: fit.edf,
-        nullspace_dim: 0,
-        residual_df: (n_grid as f64 - fit.edf).max(1.0),
-        scale: SmoothTestScale::Known,
-    })
-    .ok_or_else(|| "composition defect smooth test degenerated".to_string())?;
-
     // Bonferroni bound for the max studentized defect over the actual grid:
-    // valid for arbitrary dependence among the tested pointwise contrasts.
-    let normal =
-        Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
-    let pointwise: f64 = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
-    let max_studentized_p_value = (n_grid as f64 * pointwise).min(1.0);
+    // valid for arbitrary dependence among pointwise contrasts. With zero
+    // empirical score variation there is no sampling law, so no p-value is
+    // emitted from deterministic fitted-grid values.
+    let max_studentized_p_value = if max_var > 0.0 {
+        let normal = Normal::new(0.0, 1.0)
+            .map_err(|e| format!("standard normal construction failed: {e}"))?;
+        let pointwise: f64 = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
+        (n_grid as f64 * pointwise).min(1.0)
+    } else {
+        f64::NAN
+    };
 
     Ok(CompositionDefectReport {
         n_grid,
-        gauge_rotation,
-        gauge_reflected,
+        gauge_rotation: 0.0,
+        gauge_reflected: false,
         mean_abs_defect,
         rms_defect,
         max_abs_defect: max_abs,
-        max_studentized_defect: max_z,
+        max_studentized_defect: if max_var > 0.0 { max_z } else { f64::NAN },
         max_studentized_p_value,
-        defect_edf: fit.edf,
-        statistic: test.statistic,
-        ref_df: test.ref_df,
-        p_value: test.p_value,
+        p_value: max_studentized_p_value,
     })
 }
 
@@ -1820,6 +1766,7 @@ mod invert_tests {
             topology_preserved: true,
             min_directional_derivative: 1.0,
             residual_rms: 0.0,
+            coefficient_score_influence: Array2::<f64>::zeros((m, from.len())),
             basis,
         }
     }
@@ -2012,29 +1959,4 @@ mod invert_tests {
         assert!((crit[0] - 1.3 / 4.2).abs() < 1e-12);
     }
 
-    /// The #2143 composition-defect variance floor must be calibrated: its
-    /// standard deviation must sit ABOVE the irreducible spline-representation
-    /// defect (empirically ~1e-5 of the coordinate span) so a machine-level
-    /// defect on a near-noiseless chain reads as non-significant, yet FAR BELOW
-    /// a genuine composition-law violation (~1e-2 of the span and up) so it never
-    /// masks a real defect. This is the analytic guard on the constant behind
-    /// the runtime behaviour tested end-to-end in the Python bug-hunt.
-    #[test]
-    fn composition_defect_var_floor_is_calibrated() {
-        for coord_scale in [std::f64::consts::TAU, 1.0_f64, (5.0_f64 - (-3.0_f64)).abs()] {
-            let floor_std = coord_scale * COMPOSITION_DEFECT_REL_VAR_FLOOR;
-            let repr_defect = coord_scale * 1e-5; // spline-representation scale
-            let violation_defect = coord_scale * 1e-2; // a real law violation
-            assert!(
-                floor_std > 3.0 * repr_defect,
-                "floor std {floor_std:.3e} does not clear the representation \
-                 defect {repr_defect:.3e} (span {coord_scale})"
-            );
-            assert!(
-                floor_std < 0.1 * violation_defect,
-                "floor std {floor_std:.3e} is too close to a real violation \
-                 {violation_defect:.3e} (span {coord_scale}) — would cost power"
-            );
-        }
-    }
 }

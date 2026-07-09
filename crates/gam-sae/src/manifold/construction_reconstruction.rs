@@ -825,29 +825,147 @@ impl SaeManifoldTerm {
         SaeShapeUncertainty { dispersion, atoms }
     }
 
+    /// Joint empirical-score sandwich in the cache's complete decoder-border
+    /// coordinates, plus `tr(J A^-1)` for the complete fitted state.
+    ///
+    /// Each observation contributes one score vector over its row-local routing
+    /// and coordinate variables and the shared decoder border.  Solving the
+    /// exact stationarity Jacobian against that complete score before extracting
+    /// the beta influence is what retains cross-atom and nuisance effects:
+    /// `(A^-1 J A^-1)_beta,beta = sum_i u_i,beta u_i,beta'`,
+    /// `u_i = A^-1 s_i`.  The score is built from the same compact support,
+    /// physical `exp(s)` Jacobian, row weights, and row metric as the fitted
+    /// objective.  Its single vector per row also retains every cross-output
+    /// residual product in the outer product.
+    fn joint_score_sandwich(
+        &self,
+        cache: &ArrowFactorCache,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        dispersion: f64,
+    ) -> Result<(Array2<f64>, f64), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "joint_score_sandwich: target {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        if !(dispersion.is_finite() && dispersion > 0.0) {
+            return Err(format!(
+                "joint_score_sandwich: dispersion must be finite and positive, got {dispersion}"
+            ));
+        }
+        let total_t = cache.delta_t_len();
+        let beta_dim = cache.k;
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let b_solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec())?;
+        let fitted_full = self.try_fitted_with_rho(Some(rho), false)?;
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let row_weights = self.row_loss_weights.as_deref();
+        let mut beta_cov = Array2::<f64>::zeros((beta_dim, beta_dim));
+        let mut joint_clic_dof = 0.0_f64;
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        let mut decoded = vec![0.0_f64; p];
+        let mut residual = Array1::<f64>::zeros(p);
+        let mut rhs_t = Array1::<f64>::zeros(total_t);
+        let mut rhs_beta = Array1::<f64>::zeros(beta_dim);
+
+        for row in 0..n {
+            self.assignment.try_assignments_row_for_rho_into(
+                row,
+                rho,
+                assignments.as_slice_mut().expect("contiguous assignments"),
+            )?;
+            for out_col in 0..p {
+                residual[out_col] = target[[row, out_col]] - fitted_full[[row, out_col]];
+            }
+            // `try_fitted_with_rho` is the full dictionary reconstruction.  The
+            // compact objective treats dropped atoms as identically zero, so add
+            // those contributions back to the residual to recover
+            // target - sum_{k in A_i} a_ik g_ik.
+            if let Some(layout) = self.last_row_layout.as_ref() {
+                let active = &layout.active_atoms[row];
+                for atom_idx in 0..self.k_atoms() {
+                    if active.binary_search(&atom_idx).is_ok() {
+                        continue;
+                    }
+                    self.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
+                    let a_k = assignments[atom_idx];
+                    for out_col in 0..p {
+                        residual[out_col] += a_k * decoded[out_col];
+                    }
+                }
+            }
+            let metric_residual = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, residual.view()),
+                _ => residual.to_vec(),
+            };
+            let sqrt_weight = row_weights.map_or(1.0, |weights| weights[row].sqrt());
+            let error_metric: Vec<f64> = metric_residual
+                .into_iter()
+                .map(|value| sqrt_weight * value)
+                .collect();
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let jets = self.row_jets_for_logdet(
+                rho,
+                row,
+                vars,
+                assignments.view(),
+                &second_jets,
+                &border,
+            )?;
+            rhs_t.fill(0.0);
+            rhs_beta.fill(0.0);
+            let base = cache.row_offsets[row];
+            for local in 0..jets.vars.len() {
+                rhs_t[base + local] = sae_dot(&jets.first[local], &error_metric);
+            }
+            for (beta_pos, channel) in border.iter().enumerate() {
+                rhs_beta[channel.index] += sae_dot(&jets.beta[beta_pos], &error_metric);
+            }
+            let rhs = SaeArrowVector {
+                t: rhs_t.clone(),
+                beta: rhs_beta.clone(),
+            };
+            let influence = self.solve_exact_stationarity(
+                rho,
+                target,
+                cache,
+                &b_solver,
+                &rhs,
+            )?;
+            for a in 0..beta_dim {
+                let ua = influence.beta[a];
+                for b in 0..beta_dim {
+                    beta_cov[[a, b]] += ua * influence.beta[b];
+                }
+            }
+            joint_clic_dof +=
+                (rhs_t.dot(&influence.t) + rhs_beta.dot(&influence.beta)) / dispersion;
+        }
+        if beta_cov.iter().any(|value| !value.is_finite())
+            || !(joint_clic_dof.is_finite() && joint_clic_dof >= 0.0)
+        {
+            return Err("joint_score_sandwich: non-finite or negative joint result".to_string());
+        }
+        Ok((beta_cov, joint_clic_dof))
+    }
+
     /// Sandwich (Godambe / robust) companion to
     /// [`Self::assemble_shape_uncertainty`]: computes the model-based bands
     /// exactly as before AND fills each atom's `band_sd_robust` with the
-    /// misspecification-robust band, so BOTH are reported side by side
-    /// (the [`RobustCovarianceMode`] contract).
+    /// misspecification-robust band, so both are reported side by side.
     ///
-    /// The model-based band uses `Cov(β) = φ̂ H⁻¹` (the inverse expected-Fisher
-    /// covariance, valid only under a correctly specified reconstruction
-    /// likelihood). The robust band replaces the within-channel covariance block
-    /// `A_c⁻¹` with the Godambe sandwich `A_c⁻¹ J_cc A_c⁻¹`, where the "meat"
-    /// `J_cc = (1/φ̂²) Σ_i r_{ic}² g_{ik} g_{ik}ᵀ` is the empirical outer product
-    /// of the per-observation Gaussian scores and `g_{ik} = a_{ik} Φ_k(t_i)` is
-    /// atom `k`'s gate-scaled effective design row (see [`super::sandwich`] for
-    /// the full derivation). The two dispersion factors cancel, so the robust
-    /// band is scale-free and lets the data's own per-observation residual
-    /// energy — heteroskedastic tokens, LayerNorm structure, cross-channel
-    /// template correlation — set the width. When the residuals actually satisfy
-    /// the working likelihood the sandwich collapses back onto the model-based
-    /// band, so any divergence is an honest, local misspecification diagnostic.
-    ///
-    /// `band_sd_robust` stays `None` for any atom whose dense within-channel
-    /// bread was not materialized (the huge-`p` factored path where
-    /// `decoder_covariance` is `None`) — an honest gap, never a fabricated band.
+    /// The robust block is extracted only after forming the complete joint
+    /// sandwich.  Thus a reported atom band retains cross-atom, routing,
+    /// coordinate, frame, and cross-output effects; factored decoders are pushed
+    /// forward directly without materializing an ambient covariance.
     pub fn assemble_shape_uncertainty_robust(
         &self,
         cache: &ArrowFactorCache,
@@ -869,113 +987,77 @@ impl SaeManifoldTerm {
                  got {dispersion}"
             ));
         }
-        // Model-based bands + per-atom φ-scaled decoder covariance (the bread).
+        // Model-based bands remain reported alongside the robust result.
         let mut unc = self.assemble_shape_uncertainty(cache, dispersion)?;
-        // Reconstruction residuals r_{ic} = z_{ic} − ẑ_{ic} (score sign z − ẑ).
-        let fitted = self.try_fitted_with_rho(Some(rho), false)?;
-        let mut residuals = Array2::<f64>::zeros((n, p));
-        for row in 0..n {
-            for c in 0..p {
-                residuals[[row, c]] = target[[row, c]] - fitted[[row, c]];
-            }
-        }
-        // Per-row gate mass a_{ik} for every atom, so g_{ik} = a_{ik} Φ_k(t_i).
-        let mut gate = Array2::<f64>::zeros((n, self.k_atoms()));
-        for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
-            for k in 0..self.k_atoms() {
-                gate[[row, k]] = a[k];
-            }
-        }
+        let (joint_beta_cov, _joint_clic_dof) =
+            self.joint_score_sandwich(cache, rho, target, dispersion)?;
+        let frames_active = self.frames_active();
+        let frame_projection = FrameProjection::new(self);
+        let block_ranges = if frames_active {
+            (0..self.k_atoms())
+                .map(|k| frame_projection.atom_border_range(k))
+                .collect::<Vec<_>>()
+        } else {
+            self.beta_block_offsets().to_vec()
+        };
         for (k, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
-            // Robust band only where the dense within-channel bread exists.
-            let cov = match unc.atoms[k].decoder_covariance.as_ref() {
-                Some(cov) => cov.clone(),
-                None => continue,
-            };
-            if cov.dim() != (m * p, m * p) {
-                // Frame-lifted or full-B block must be (M·p)²; anything else is a
-                // layout we cannot slice per channel — leave the honest None.
-                continue;
-            }
-            // Effective (gate-scaled) design g_{ik} = a_{ik} Φ_k(t_i), (n × M).
-            let mut design = Array2::<f64>::zeros((n, m));
-            for row in 0..n {
-                let a_k = gate[[row, k]];
-                if a_k == 0.0 {
-                    continue;
-                }
-                let basis = atom.basis_values.row(row);
-                for b in 0..m {
-                    design[[row, b]] = a_k * basis[b];
+            let range = block_ranges[k].clone();
+            let block_dim = range.end - range.start;
+            let mut raw_block = Array2::<f64>::zeros((block_dim, block_dim));
+            for i in 0..block_dim {
+                for j in 0..block_dim {
+                    raw_block[[i, j]] = joint_beta_cov[[range.start + i, range.start + j]];
                 }
             }
-            // Within-channel score meat J_cc, one (M × M) per output channel.
-            let meat = super::sandwich::gaussian_within_channel_meat(
-                design.view(),
-                residuals.view(),
-                dispersion,
-            )?;
-            // Evaluation rows: reuse the exact strided grid the model-based band
-            // used, so band_sd and band_sd_robust are aligned point-for-point.
+            // Convert covariance of the scale-gauge representative to physical
+            // decoder units before pushing it through Phi.
+            raw_block.mapv_inplace(|value| value * atom.log_amplitude.exp().powi(2));
             let n_rows = atom.n_obs();
             let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
             let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
             let g = eval_rows.len();
             let mut band_sd_robust = Array2::<f64>::zeros((g, p));
-            // Per-channel within-channel bread block A_c⁻¹ = cov[(b1,c),(b2,c)].
-            let mut ok = true;
-            for c in 0..p {
-                let mut bread_c = Array2::<f64>::zeros((m, m));
-                for b1 in 0..m {
-                    for b2 in 0..m {
-                        bread_c[[b1, b2]] = cov[[b1 * p + c, b2 * p + c]];
+            let framed = frames_active && atom.decoder_frame.is_some();
+            if framed {
+                for (gi, &row) in eval_rows.iter().enumerate() {
+                    let basis = atom.basis_values.row(row);
+                    for c in 0..p {
+                        let var =
+                            frame_projection.output_variance(k, raw_block.view(), basis, c);
+                        band_sd_robust[[gi, c]] = var.max(0.0).sqrt();
                     }
+                }
+            } else {
+                if raw_block.dim() != (m * p, m * p) {
+                    return Err(format!(
+                        "assemble_shape_uncertainty_robust: atom {k} joint block {:?} != ({},{})",
+                        raw_block.dim(),
+                        m * p,
+                        m * p
+                    ));
                 }
                 for (gi, &row) in eval_rows.iter().enumerate() {
-                    let phi_t = atom.basis_values.row(row);
-                    match super::sandwich::robust_channel_band_variance(
-                        bread_c.view(),
-                        meat[c].view(),
-                        phi_t,
-                    ) {
-                        Ok(var) => band_sd_robust[[gi, c]] = var.sqrt(),
-                        Err(_) => {
-                            ok = false;
-                            break;
-                        }
+                    for c in 0..p {
+                        let var = frame_projection.full_output_variance(
+                            k,
+                            raw_block.view(),
+                            atom.basis_values.row(row),
+                            c,
+                        );
+                        band_sd_robust[[gi, c]] = var.max(0.0).sqrt();
                     }
                 }
-                if !ok {
-                    break;
-                }
             }
-            if ok {
-                unc.atoms[k].band_sd_robust = Some(band_sd_robust);
-            }
+            unc.atoms[k].band_sd_robust = Some(band_sd_robust);
         }
         Ok(unc)
     }
 
-    /// Composite-likelihood model-selection charge for the decoder block,
-    /// reported under BOTH the model-based and the CLIC (sandwich) accounting.
-    ///
-    /// The model-based effective dof `tr(F A⁻¹)` (the smoother/hat trace assumed
-    /// by a well-specified-likelihood charge) is compared against the
-    /// composite-likelihood `tr(J A⁻¹)`, which replaces the expected information
-    /// `F` by the empirical score meat `J = Σ_i s_i s_iᵀ` (see [`super::sandwich`]).
-    /// Both are summed over atoms and output channels from the same fitted
-    /// residuals, so they sit on identical footing and coincide exactly when the
-    /// reconstruction residuals satisfy the working Gaussian likelihood. A
-    /// selection routine that prices a structure move should use `clic_dof` when
-    /// it cannot assume iid Gaussian residuals, and can read
-    /// [`CompositeLikelihoodCharge::misspecification_ratio`] to see the gap.
-    ///
-    /// Only atoms whose dense within-channel bread is materialized contribute
-    /// (the huge-`p` factored path is skipped, mirroring the robust band); the
-    /// returned charge is therefore over the decoder blocks that carry an
-    /// exportable covariance.
+    /// Composite-likelihood model-selection charge
+    /// `tr(J A^-1)` for the complete joint fitted state.  Scores, sensitivity,
+    /// compact support, metric, weights, amplitudes, and nuisance couplings are
+    /// identical to [`Self::joint_score_sandwich`].
     pub fn composite_likelihood_charge(
         &self,
         cache: &ArrowFactorCache,
@@ -983,77 +1065,10 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         dispersion: f64,
     ) -> Result<CompositeLikelihoodCharge, String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        if target.dim() != (n, p) {
-            return Err(format!(
-                "composite_likelihood_charge: target {:?} != ({n}, {p})",
-                target.dim()
-            ));
-        }
-        if !(dispersion.is_finite() && dispersion > 0.0) {
-            return Err(format!(
-                "composite_likelihood_charge: dispersion must be finite and positive, \
-                 got {dispersion}"
-            ));
-        }
-        // Model-based bread (φ-scaled per-atom decoder covariance).
-        let unc = self.assemble_shape_uncertainty(cache, dispersion)?;
-        let fitted = self.try_fitted_with_rho(Some(rho), false)?;
-        let mut residuals = Array2::<f64>::zeros((n, p));
-        for row in 0..n {
-            for c in 0..p {
-                residuals[[row, c]] = target[[row, c]] - fitted[[row, c]];
-            }
-        }
-        let mut gate = Array2::<f64>::zeros((n, self.k_atoms()));
-        for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
-            for k in 0..self.k_atoms() {
-                gate[[row, k]] = a[k];
-            }
-        }
-        let mut model_based_dof = 0.0_f64;
-        let mut clic_dof = 0.0_f64;
-        for (k, atom) in self.atoms.iter().enumerate() {
-            let m = atom.basis_size();
-            let cov = match unc.atoms[k].decoder_covariance.as_ref() {
-                Some(cov) if cov.dim() == (m * p, m * p) => cov,
-                _ => continue,
-            };
-            let mut design = Array2::<f64>::zeros((n, m));
-            for row in 0..n {
-                let a_k = gate[[row, k]];
-                if a_k == 0.0 {
-                    continue;
-                }
-                let basis = atom.basis_values.row(row);
-                for b in 0..m {
-                    design[[row, b]] = a_k * basis[b];
-                }
-            }
-            let meat = super::sandwich::gaussian_within_channel_meat(
-                design.view(),
-                residuals.view(),
-                dispersion,
-            )?;
-            let expected =
-                super::sandwich::gaussian_within_channel_expected_meat(design.view(), dispersion)?;
-            for c in 0..p {
-                let mut bread_c = Array2::<f64>::zeros((m, m));
-                for b1 in 0..m {
-                    for b2 in 0..m {
-                        bread_c[[b1, b2]] = cov[[b1 * p + c, b2 * p + c]];
-                    }
-                }
-                model_based_dof +=
-                    super::sandwich::clic_effective_dof(bread_c.view(), expected.view())?;
-                clic_dof += super::sandwich::clic_effective_dof(bread_c.view(), meat[c].view())?;
-            }
-        }
+        let (_joint_beta_cov, joint_clic_dof) =
+            self.joint_score_sandwich(cache, rho, target, dispersion)?;
         Ok(CompositeLikelihoodCharge {
-            model_based_dof,
-            clic_dof,
+            joint_clic_dof,
         })
     }
 }

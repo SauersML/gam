@@ -31,6 +31,7 @@ fn survival_ls_log_survival_stack(
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             inverse_link,
             eta,
+            0.0,
         )?;
     Ok([log_s, -r, -dr, -ddr, -dddr])
 }
@@ -3954,7 +3955,7 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
         // log S(eta): value = slot 0; analytic derivatives are -r, -dr, -ddr, -dddr.
         let log_s_value = |eta: f64| {
             SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                link, eta,
+                link, eta, 0.0,
             )
             .expect("log-survival stack")
             .0
@@ -3968,7 +3969,7 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
         for &eta in &etas {
             let (_, r, dr, ddr, dddr) =
                 SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                    link, eta,
+                    link, eta, 0.0,
                 )
                 .expect("log-survival stack");
             let log_s_analytic = [-r, -dr, -ddr, -dddr];
@@ -4063,29 +4064,36 @@ fn exact_log_pdf_derivatives_rescaled_scale_cloglog_uniformly() {
 }
 
 #[test]
-fn exact_survival_neglog_derivatives_rescaled_do_not_scale_cloglog_ratio() {
+fn exact_survival_neglog_derivatives_rescaled_scale_cloglog_uniformly() {
+    // The survival ratio stack must carry the SAME exp(-L) derivative rescale
+    // as the log-pdf stack: the two enter the joint Hessian side by side, and
+    // the logdet correction `logdet(H_exact) = logdet(H_scaled) + p*L` is only
+    // valid if EVERY row's curvature (event, censored, and left-truncated
+    // alike) is scaled uniformly. The log S value channel stays unshifted.
     let eta = 2.25_f64;
     let log_scale = 1.5_f64;
-    let expected = eta.exp();
+    let raw = eta.exp();
+    let scaled = (eta - log_scale).exp();
 
     let (log_s, r, dr, ddr, dddr) =
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             &InverseLink::Standard(StandardLink::CLogLog),
             eta,
+            log_scale,
         )
         .expect("rescaled cloglog survival derivatives");
 
-    assert!((log_s + expected).abs() <= 1e-15 * expected);
+    assert!((log_s + raw).abs() <= 1e-15 * raw);
     for (label, actual) in [("r", r), ("dr", dr), ("ddr", ddr), ("dddr", dddr)] {
         assert!(
-            (actual - expected).abs() <= 1e-15 * expected,
-            "CLogLog survival ratio derivative {label} must ignore deriv_log_scale: actual={actual} expected={expected}"
+            (actual - scaled).abs() <= 1e-15 * scaled,
+            "CLogLog survival ratio derivative {label} must scale by exp(-L): actual={actual} expected={scaled}"
         );
     }
 
     let ((pair_log_s, pair_r, pair_dr, pair_ddr, pair_dddr), _) =
         SurvivalLocationScaleFamily::clglog_exit_pair(eta, log_scale);
-    assert!((pair_log_s + expected).abs() <= 1e-15 * expected);
+    assert!((pair_log_s + raw).abs() <= 1e-15 * raw);
     for (label, actual) in [
         ("pair r", pair_r),
         ("pair dr", pair_dr),
@@ -4093,8 +4101,8 @@ fn exact_survival_neglog_derivatives_rescaled_do_not_scale_cloglog_ratio() {
         ("pair dddr", pair_dddr),
     ] {
         assert!(
-            (actual - expected).abs() <= 1e-15 * expected,
-            "fused CLogLog survival ratio derivative {label} must ignore deriv_log_scale: actual={actual} expected={expected}"
+            (actual - scaled).abs() <= 1e-15 * scaled,
+            "fused CLogLog survival ratio derivative {label} must scale by exp(-L): actual={actual} expected={scaled}"
         );
     }
 }
@@ -4108,6 +4116,7 @@ fn exact_survival_neglog_derivatives_match_identity_closed_form() {
         SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
             &InverseLink::Standard(StandardLink::Identity),
             eta,
+            0.0,
         )
         .expect("exact identity survival derivatives");
     assert!((log_s - s.ln()).abs() <= 1e-15);

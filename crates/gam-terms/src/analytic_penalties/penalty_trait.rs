@@ -2,12 +2,6 @@ use super::*;
 
 pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
 
-/// Floor applied to an assignment probability before taking its logarithm in the
-/// entropic / softmax-assignment penalties, keeping `ln(a)` finite (and the
-/// `a·ln(a)` contribution → 0) as `a → 0` without changing the value anywhere a
-/// is not numerically zero.
-pub const ENTROPY_LOG_PROBABILITY_FLOOR: f64 = 1e-300;
-
 /// Half-width of the open-interval clamp `[ε, 1−ε]` applied to IBP-assignment
 /// probabilities before `ln`/`1/p` so the Bernoulli cross-entropy and its score
 /// stay finite at the simplex boundary.

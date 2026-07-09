@@ -358,18 +358,17 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
         consistency.recon_consistency
     );
     assert!(
-        (0.0..=1.0).contains(&consistency.uncertified_fraction),
-        "uncertified fraction must be a probability, got {}",
-        consistency.uncertified_fraction
+        (0.0..=1.0).contains(&consistency.unconverged_fraction),
+        "unconverged fraction must be a probability, got {}",
+        consistency.unconverged_fraction
     );
 
-    // (3) The encoder must certify real coverage of the fitted dictionary —
-    // not a vacuous all-uncertified fraction.
+    // (3) The joint encoder must converge on real rows of the fitted dictionary.
     assert!(
-        consistency.uncertified_fraction < 1.0,
-        "the amortized encoder must certify at least some rows of a \
-         well-conditioned periodic dictionary; uncertified_fraction={}",
-        consistency.uncertified_fraction
+        consistency.unconverged_fraction < 1.0,
+        "the joint encoder must converge on at least some rows of a \
+         well-conditioned periodic dictionary; unconverged_fraction={}",
+        consistency.unconverged_fraction
     );
 
     // (2) Faithfulness: on the rows the certificate accepts, the cheap
@@ -389,7 +388,7 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
         .expect("amortized encode runs");
     let atom0 = &term.atoms[0];
     let evaluator = atom0.basis_evaluator.as_ref().unwrap();
-    let (phi_hat, _j) = evaluator.evaluate(encodes[0].coords.view()).unwrap();
+    let (phi_hat, _j) = evaluator.evaluate(encodes.coords[0].view()).unwrap();
     let decoded_hat = phi_hat.dot(&atom0.decoder_coefficients); // (n × p)
 
     // The exact per-row encode the sequential path would use as its teacher:
@@ -410,7 +409,7 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
     let mut certified_rows = 0usize;
     let mut max_certified_gap = 0.0_f64;
     for row in 0..n {
-        if !encodes[0].certified[row] {
+        if !encodes.converged[row] {
             continue;
         }
         let z = amplitudes[[row, 0]];

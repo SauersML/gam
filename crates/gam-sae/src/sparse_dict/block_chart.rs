@@ -15,8 +15,8 @@ pub struct BlockChartComposeConfig {
     pub min_firings: usize,
     pub max_blocks: usize,
     pub crossfit_folds: usize,
-    pub alpha: f64,
     pub min_effect: f64,
+    /// Dimensionless ridge fraction of the largest covariance eigenvalue.
     pub whitening_ridge: f64,
     pub pair_screen: bool,
     pub pair_top_blocks: usize,
@@ -38,7 +38,6 @@ impl Default for BlockChartComposeConfig {
             min_firings: 64,
             max_blocks: 256,
             crossfit_folds: 2,
-            alpha: 0.10,
             min_effect: 0.0,
             whitening_ridge: 1.0e-8,
             pair_screen: true,
@@ -73,11 +72,10 @@ pub struct ChartEvidence {
     pub charge: f64,
     /// `deviance_gain − charge` in NATS — scale-invariant.
     pub margin: f64,
-    /// `margin.max(0)` in NATS: an `exp(margin)` BIC-style e-value's log, needing
-    /// no per-unit rescale (the S4 fix; formerly `margin / mean_SSE`).
-    pub log_e_value: f64,
-    pub accepted_pre_ebh: bool,
-    pub accepted: bool,
+    /// Descriptive model-selection verdict: positive held-out BIC margin above
+    /// `min_effect`, with a positive lower confidence bound on mean deviance.
+    /// This is not a p-value, e-value, or FDR-controlled discovery.
+    pub selected_by_bic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -94,8 +92,8 @@ pub struct BlockChartComposeResult {
     pub block_records: Vec<BlockChartRecord>,
     pub pair_records: Vec<BlockChartRecord>,
     pub selected_blocks: Vec<usize>,
-    pub accepted_blocks: Vec<usize>,
-    pub accepted_pairs: Vec<(usize, usize)>,
+    pub selected_chart_blocks: Vec<usize>,
+    pub selected_chart_pairs: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -234,12 +232,11 @@ pub fn compose_block_coordinate_charts(
         }
     }
 
-    apply_ebh(&mut singles, &mut pairs, config.alpha, config.min_effect);
     let mut reconstructed = base;
     let mut replaced = vec![vec![false; decoder.nrows() / config.block_size]; x.nrows()];
 
     for pair in &pairs {
-        if !pair.evidence.accepted {
+        if !pair.evidence.selected_by_bic {
             continue;
         }
         let b = config.block_size;
@@ -272,7 +269,7 @@ pub fn compose_block_coordinate_charts(
     }
 
     for single in &singles {
-        if !single.evidence.accepted {
+        if !single.evidence.selected_by_bic {
             continue;
         }
         let g = single.blocks[0];
@@ -323,14 +320,14 @@ pub fn compose_block_coordinate_charts(
             evidence: c.evidence.clone(),
         })
         .collect::<Vec<_>>();
-    let accepted_blocks = singles
+    let selected_chart_blocks = singles
         .iter()
-        .filter(|c| c.evidence.accepted)
+        .filter(|c| c.evidence.selected_by_bic)
         .map(|c| c.blocks[0])
         .collect::<Vec<_>>();
-    let accepted_pairs = pairs
+    let selected_chart_pairs = pairs
         .iter()
-        .filter(|c| c.evidence.accepted)
+        .filter(|c| c.evidence.selected_by_bic)
         .map(|c| (c.blocks[0], c.blocks[1]))
         .collect::<Vec<_>>();
     Ok(BlockChartComposeResult {
@@ -338,8 +335,8 @@ pub fn compose_block_coordinate_charts(
         block_records,
         pair_records,
         selected_blocks: selected,
-        accepted_blocks,
-        accepted_pairs,
+        selected_chart_blocks,
+        selected_chart_pairs,
     })
 }
 
@@ -609,9 +606,6 @@ fn validate_inputs(
             codes.shape()
         ));
     }
-    if !(config.alpha > 0.0 && config.alpha <= 1.0) {
-        return Err("block chart compose: alpha must be in (0, 1]".to_string());
-    }
     if config.block_tile == 0 {
         return Err("block chart compose: block_tile must be >= 1".to_string());
     }
@@ -813,9 +807,6 @@ fn crossfit_evidence(
     let gain = n_eff.max(2.0) * mean_delta;
     let charge = 0.5 * d_eff * n_eff.max(2.0).ln();
     let margin = gain - charge;
-    // Both terms are nats; the log-e-value is the margin directly (an exp(margin)
-    // BIC-style e-value) — no per-unit rescale, and so scale-invariant.
-    let log_e_value = margin.max(0.0);
     Ok(ChartEvidence {
         n_rows: n,
         n_effective: n_eff,
@@ -828,63 +819,8 @@ fn crossfit_evidence(
         ci_high,
         charge,
         margin,
-        log_e_value,
-        accepted_pre_ebh: margin >= config.min_effect && ci_low > 0.0,
-        accepted: false,
+        selected_by_bic: margin >= config.min_effect && ci_low > 0.0,
     })
-}
-
-fn apply_ebh(
-    singles: &mut [CandidateFit],
-    pairs: &mut [CandidateFit],
-    alpha: f64,
-    min_effect: f64,
-) {
-    let mut logs = Vec::new();
-    let mut refs = Vec::<(bool, usize)>::new();
-    for (i, c) in singles.iter().enumerate() {
-        if c.evidence.accepted_pre_ebh && c.evidence.margin >= min_effect {
-            logs.push(c.evidence.log_e_value);
-            refs.push((false, i));
-        }
-    }
-    for (i, c) in pairs.iter().enumerate() {
-        if c.evidence.accepted_pre_ebh && c.evidence.margin >= min_effect {
-            logs.push(c.evidence.log_e_value);
-            refs.push((true, i));
-        }
-    }
-    let keep = ebh(&logs, alpha);
-    for (ok, (is_pair, idx)) in keep.into_iter().zip(refs.into_iter()) {
-        if is_pair {
-            pairs[idx].evidence.accepted = ok;
-        } else {
-            singles[idx].evidence.accepted = ok;
-        }
-    }
-}
-
-fn ebh(logs: &[f64], alpha: f64) -> Vec<bool> {
-    let m = logs.len();
-    let mut order = (0..m).collect::<Vec<_>>();
-    order.sort_by(|&a, &b| {
-        logs[b]
-            .partial_cmp(&logs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut k_star = 0usize;
-    for (rank0, &idx) in order.iter().enumerate() {
-        let rank = rank0 + 1;
-        let threshold = (m as f64 / (alpha * rank as f64)).ln();
-        if logs[idx] >= threshold {
-            k_star = rank;
-        }
-    }
-    let mut keep = vec![false; m];
-    for &idx in order.iter().take(k_star) {
-        keep[idx] = true;
-    }
-    keep
 }
 
 fn fit_radial_chart_all(coords: &Array2<f32>, ridge: f64) -> Result<Array2<f64>, String> {
@@ -919,8 +855,12 @@ fn fit_whitening(coords: &Array2<f32>, ridge: f64) -> Result<Whitening, String> 
         *v /= denom;
     }
     let (vals, eigvec) = jacobi_eigh(cov, d)?;
-    let max_eval = vals.iter().copied().fold(0.0, f64::max).max(1.0);
-    let floor = ridge.max(f64::EPSILON * max_eval);
+    let max_eval = vals.iter().copied().fold(0.0, f64::max);
+    if !(ridge.is_finite() && ridge >= 0.0) {
+        return Err(format!("whitening ridge fraction must be finite and non-negative; got {ridge}"));
+    }
+    let spectral_scale = max_eval.max(f64::MIN_POSITIVE);
+    let floor = (ridge * spectral_scale).max(f64::EPSILON * spectral_scale);
     let scale = vals
         .into_iter()
         .map(|v| (v.max(0.0) + floor).sqrt())
@@ -1378,9 +1318,9 @@ mod tests {
     }
 
     #[test]
-    fn crossfit_evidence_verdict_and_e_value_are_scale_invariant() {
-        // The S4 currency fix: the acceptance margin and e-value are scored in the
-        // profiled-deviance currency (nats), so rescaling the coordinates cannot
+    fn crossfit_bic_selection_is_scale_invariant() {
+        // The descriptive BIC margin is scored in the profiled-deviance currency
+        // (nats), so rescaling the coordinates cannot
         // change the verdict. Ridge = 0 makes the whitening's eigenvalue floor
         // relative (EPSILON·max_eval), so the whole pipeline is exactly
         // scale-equivariant and the invariance is pinned to f64 rounding.
@@ -1394,23 +1334,17 @@ mod tests {
         // The ring is a genuine curved structure: the chart must beat the linear
         // comparator (a meaningful ACCEPT, not a trivial tie).
         assert!(base.deviance_gain > 0.0, "chart must beat linear on a ring");
-        assert!(base.accepted_pre_ebh, "the ring must be accepted pre-eBH");
+        assert!(base.selected_by_bic, "the ring must be selected by held-out BIC");
 
         // Rescale every coordinate by 10 (SSE ×100). Deviance-scale scoring must
-        // leave the verdict AND the e-value unchanged.
+        // leave the verdict and margin unchanged.
         let mut scaled = coords.clone();
         scaled.mapv_inplace(|v| v * 10.0);
         let big = crossfit_evidence(&scaled, &config).expect("evidence scaled");
 
         assert_eq!(
-            base.accepted_pre_ebh, big.accepted_pre_ebh,
+            base.selected_by_bic, big.selected_by_bic,
             "accept/reject verdict must be scale-invariant"
-        );
-        assert!(
-            (base.log_e_value - big.log_e_value).abs() < 1e-6,
-            "e-value must be scale-invariant: {} vs {}",
-            base.log_e_value,
-            big.log_e_value
         );
         assert!(
             (base.margin - big.margin).abs() < 1e-6,

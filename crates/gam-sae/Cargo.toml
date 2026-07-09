@@ -14,7 +14,7 @@ gam-gpu = { path = "../gam-gpu", version = "=0.3.148" }
 gam-identifiability = { path = "../gam-identifiability", version = "=0.3.148" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.148" }
 gam-math = { path = "../gam-math", version = "=0.3.148" }
-opt = "=0.5.12"
+opt.workspace = true
 gam-problem = { path = "../gam-problem", version = "=0.3.148" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.148" }
 gam-solve = { path = "../gam-solve", version = "=0.3.148" }

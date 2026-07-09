@@ -186,7 +186,7 @@ fn composition_stack(seed: u64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
 }
 
 #[test]
-fn composition_law_passes_on_consistent_triples_and_rotated_gauge() {
+fn composition_law_passes_on_consistent_triples_and_does_not_fit_target_shift_away() {
     let (t, coords_b, coords_c) = composition_stack(0x1013_0005);
     let circle = ChartTopology::Circle;
     let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle).expect("h_ab");
@@ -206,28 +206,26 @@ fn composition_law_passes_on_consistent_triples_and_rotated_gauge() {
         report.p_value
     );
 
-    // Rotation gauge invariance: the direct chart re-gauged by a constant
-    // rotation is the SAME double coset, so the verdict must not change.
+    // Only the direct route is shifted while the composed route still lands in
+    // the original C chart. This is a genuine composition violation; fitting a
+    // fresh target rotation here would erase it.
     let rotated_c = coords_c.mapv(|v| (v + 1.3).rem_euclid(TAU));
     let h_ac_rot =
         fit_transport_map(t.view(), rotated_c.view(), circle, circle).expect("rotated h_ac");
     let rotated = composition_defect(&h_ab, &h_bc, &h_ac_rot, DEFAULT_COMPOSITION_GRID)
         .expect("rotated composition test");
     assert!(
-        rotated.rms_defect < 0.08,
-        "rotation gauge must be quotiented; rms defect = {}",
+        rotated.rms_defect > 1.0,
+        "one-route target shift must remain visible; rms defect = {}",
         rotated.rms_defect
     );
     assert!(
-        rotated.p_value > 0.01,
-        "rotation gauge must be quotiented; p = {}",
+        rotated.p_value < 0.01,
+        "one-route target shift must reject composition; p = {}",
         rotated.p_value
     );
-    assert!(
-        (rotated.gauge_rotation - 1.3).abs() < 0.15 || rotated.gauge_reflected,
-        "the alignment should have absorbed the planted 1.3 rad rotation, got {}",
-        rotated.gauge_rotation
-    );
+    assert_eq!(rotated.gauge_rotation, 0.0);
+    assert!(!rotated.gauge_reflected);
 }
 
 #[test]

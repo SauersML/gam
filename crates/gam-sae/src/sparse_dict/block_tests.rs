@@ -740,7 +740,6 @@ fn block_coordinate_chart_pair_screen_accepts_split_circle() {
         min_firings: 8,
         max_blocks: 2,
         crossfit_folds: 4,
-        alpha: 1.0,
         min_effect: 0.0,
         whitening_ridge: 1.0e-8,
         pair_screen: true,
@@ -758,7 +757,7 @@ fn block_coordinate_chart_pair_screen_accepts_split_circle() {
         &config,
     )
     .expect("compose charts");
-    assert_eq!(result.accepted_pairs, vec![(0, 1)]);
+    assert_eq!(result.selected_chart_pairs, vec![(0, 1)]);
     assert_eq!(result.pair_records.len(), 1);
     assert!(result.pair_records[0].screen_score > 0.9);
     assert!(result.pair_records[0].evidence.deviance_gain > 0.0);

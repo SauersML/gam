@@ -266,11 +266,12 @@ impl SaeManifoldTerm {
     }
 
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
-    /// via `B`-preconditioned CG ([`solve_b_preconditioned_cg`]) with the
+    /// via left-`B`-preconditioned GMRES ([`solve_b_preconditioned_gmres`]) with the
     /// matrix-free `A v = B v + ΔC v` apply ([`Self::apply_exact_hessian`]). The
     /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` must invert the EXACT `A`, not the surrogate `B`;
-    /// CG converges for any `ρ(B⁻¹ΔC)`, where the earlier Neumann series diverged
-    /// once the dropped curvature `ΔC = ⟨r, ∂²f⟩` grew (large unmodellable residual).
+    /// GMRES does not require the exact stationarity Jacobian to be SPD; it
+    /// refuses non-convergence instead of returning a negative-curvature CG
+    /// iterate as though it were an inverse solve.
     fn solve_exact_stationarity(
         &self,
         rho: &SaeManifoldRho,
@@ -279,7 +280,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
-        solve_b_preconditioned_cg(solver, rhs, |v| {
+        solve_b_preconditioned_gmres(solver, rhs, |v| {
             self.apply_exact_hessian(rho, target, cache, v)
         })
     }
@@ -341,7 +342,6 @@ impl SaeManifoldTerm {
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
-        let mut third_order_correction_raw = Array1::<f64>::zeros(n_params);
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
             + self
@@ -488,39 +488,12 @@ impl SaeManifoldTerm {
         // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
         // biased by `(B⁻¹ − A⁻¹)`.
         //
-        // #2087 desync resolution — the envelope term `−½·Γᵀθ̂_ρ` is NOT part of
-        // the gradient the outer search consumes at a converged inner solve. It is
-        // the response of the SMOOTH criterion `V(ρ) = penalized_loss(θ̂(ρ),ρ) +
-        // ½log|H|` that presumes the inner optimum tracks ρ EXACTLY. The production
-        // criterion does not: `reml_criterion` warm-starts the inner solve from `θ̂`
-        // and accepts it the instant the KKT gradient is stationary to
-        // `τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL · inner_iterate_scale`
-        // (`reml_criterion`'s `grad_tolerance`, construction.rs). Under an outer
-        // step `dρ` the perturbed inner gradient is `g(θ̂,ρ) + dρ·(∂g/∂ρ)`; the
-        // converged state already satisfies `‖g(θ̂,ρ)‖ ≤ τ`, so in the `dρ → 0`
-        // limit that DEFINES the consumed gradient it stays inside the τ-ball, the
-        // warm-started re-solve returns the incumbent, and `θ̂` is FROZEN. The
-        // criterion's local gradient is therefore `explicit + logdet_trace + occam`,
-        // with NO envelope term. The `θ̂`-motion the envelope prices is realized
-        // ONLY when the inner solve has not reached stationarity (`‖g‖ > τ`, still
-        // actively tracking ρ) — a regime no converged consumer of this routine is
-        // in, so the envelope is dropped on every coordinate.
-        //
-        // The earlier gate kept the envelope wherever `‖∂g/∂ρ‖ > τ`. That compared
-        // a UNIT-ρ-step signal against `τ`, but the criterion freezes `θ̂` whenever
-        // an ACTUAL step `h` leaves `h·‖∂g/∂ρ‖ ≤ τ`, i.e. for `‖∂g/∂ρ‖` up to
-        // `τ/h`. At the FD gate's `h = 2e-4` that is `5000·τ`, so coordinates with
-        // `τ < ‖∂g/∂ρ‖ < τ/h` survived the gate yet were frozen in the criterion —
-        // the analytic gradient then injected a large `−½·Γᵀθ̂_ρ` the criterion FD
-        // never experienced: the #2087 objective↔gradient desync (and the line-
-        // search thrash / #2080 wide-p wall-clock burn it drives). Consuming the
-        // frozen-`θ̂` gradient ends the desync: the outer optimizer descends its own
-        // criterion. No new knob.
-        //
-        // The raw envelope is still assembled onto `third_order_correction_raw` for
-        // the #2087 discriminator (it characterises the spurious amplification of a
-        // below-tolerance signal through a weakly-identified near-null direction of
-        // `A`). It is NEVER summed into the consumed gradient.
+        // A numerical stopping tolerance does not change the mathematical
+        // objective.  At the exact inner optimum the envelope theorem cancels
+        // the penalized-loss response, but the Laplace term still contributes
+        // `-1/2 Gamma' theta_hat_rho`.  Dropping this term differentiates a
+        // fictitious criterion in which the fitted state is held fixed.  The
+        // exact stationarity solve above supplies the required implicit response.
         for coord in 0..n_params {
             let rhs = self
                 .outer_rho_gradient_ift_rhs(rho, target, coord, cache)
@@ -535,10 +508,7 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            third_order_correction_raw[coord] = -0.5 * dot;
-            // θ̂ is frozen at a converged inner solve (see above): the envelope is
-            // not part of the criterion's local gradient, so it is not consumed.
-            third_order_correction[coord] = 0.0;
+            third_order_correction[coord] = -0.5 * dot;
         }
 
         Ok(SaeOuterRhoGradientComponents {
@@ -546,7 +516,6 @@ impl SaeManifoldTerm {
             logdet_trace,
             occam,
             third_order_correction,
-            third_order_correction_raw,
         })
     }
 }

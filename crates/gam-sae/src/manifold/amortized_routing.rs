@@ -195,6 +195,7 @@ impl SaeManifoldTerm {
             exact.coords,
             exact.amplitudes,
             &score_periods,
+            amplitude_floor,
         )?;
         let joint_multistart_fraction = joint_encode_fallback_fraction(
             &self.atoms,
@@ -283,15 +284,15 @@ impl SaeManifoldTerm {
                     continue;
                 }
             };
-            let result = &encoded[atom_idx];
+            let coord_block = &encoded.coords[atom_idx];
             let m = atom.basis_size();
             for row in 0..n {
-                if !result.certified[row] {
+                if !encoded.converged[row] {
                     valid[row] = false;
                     continue;
                 }
                 // Reconstruct the amplitude-1 image γ_k(t̂) = Bᵀ φ(t̂).
-                let t_hat: Vec<f64> = result.coords.row(row).iter().copied().collect();
+                let t_hat: Vec<f64> = coord_block.row(row).iter().copied().collect();
                 let coord_2d = Array2::from_shape_vec((1, atom.latent_dim), t_hat)
                     .map_err(|e| format!("chart_geometry_routing_logits: coord reshape: {e}"))?;
                 let (phi, _jet) = evaluator.evaluate(coord_2d.view())?;
@@ -526,13 +527,13 @@ mod amortized_encoder_glue_tests {
         let ev_amortized = gap.ev_amortized.expect("amortized EV defined");
         eprintln!(
             "[ENCODE-GAP] EV_exact={:.4} EV_amortized={:.4} EV_gap={:.4} \
-             coord_rmse={:.4} gate_agreement={:.4} amp_rmse={:.4} \
+             coord_rmse={:.4} support_agreement={:.4} amp_rmse={:.4} \
              joint_multistart_frac={:.4} used_quadratic_head={} log_evidence={:.1}",
             ev_exact,
             ev_amortized,
             gap.ev_gap.unwrap_or(f64::NAN),
             gap.errors.coord_rmse,
-            gap.errors.gate_agreement,
+            gap.errors.support_agreement,
             gap.errors.amplitude_rmse,
             gap.joint_multistart_fraction,
             gap.used_quadratic_head,
@@ -561,6 +562,6 @@ mod amortized_encoder_glue_tests {
         );
         // The error-stats half of the artifact is well-formed.
         assert!(gap.errors.coord_rmse.is_finite() && gap.errors.coord_rmse >= 0.0);
-        assert!((0.0..=1.0).contains(&gap.errors.gate_agreement));
+        assert!((0.0..=1.0).contains(&gap.errors.support_agreement));
     }
 }

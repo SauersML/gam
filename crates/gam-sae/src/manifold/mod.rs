@@ -130,8 +130,7 @@ pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 pub(crate) use crate::criterion_atoms::SaeCriterion;
 
 pub(crate) use crate::certificates::{
-    DirectionalCriterionCertificate, DirectionalSamples, certificate_from_samples,
-    deterministic_probe_direction, probe_step,
+    CoordinateSamples, GradientCriterionCertificate, certificate_from_samples, probe_step_for,
 };
 
 pub(crate) use gam_linalg::faer_ndarray::{
@@ -416,9 +415,6 @@ mod tests_chart_angle_fidelity_2081;
 
 #[cfg(test)]
 mod tests_joint_vs_cascade_2131;
-
-#[cfg(test)]
-mod tests_outer_row_subsample;
 
 pub use arrow_solver::*;
 pub use atom::*;

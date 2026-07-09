@@ -2732,8 +2732,8 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
 ///     gradient is ever paired with the cost, so it legitimately carries the
 ///     fold (`fold_cotrain = true`): its cost is `f + c`.
 ///
-/// This fixture's atoms carry NO basis evaluator, so every amortized encode is
-/// uncertified (`uncertified_fraction = 1.0`) and the consistency fold `c` is
+/// This fixture's atoms carry no basis evaluator, so every joint row solve is
+/// unavailable (`unconverged_fraction = 1.0`) and the consistency fold `c` is
 /// strictly positive. The regression therefore pins:
 ///   (1) line-search lane cost == gradient lane cost  (the desync invariant),
 ///   (2) ranking lane cost  >  line-search lane cost   (the fold IS present on
@@ -2775,7 +2775,7 @@ pub(crate) fn line_search_value_probe_sees_pure_reml_not_cotrain_fold() {
     assert_abs_diff_eq!(ls_cost, grad_cost, epsilon = 1.0e-10);
 
     // The fold is genuinely present in this fixture (no basis evaluator ⇒
-    // uncertified_fraction = 1.0), so the ranking lane is strictly costlier.
+    // unconverged_fraction = 1.0), so the ranking lane is strictly costlier.
     assert!(
         rank_cost > grad_cost + 1.0e-6,
         "ranking lane must carry a strictly positive co-training fold: \

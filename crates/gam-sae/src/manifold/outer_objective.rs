@@ -397,95 +397,6 @@ impl AmortizedWarmStartTelemetry {
 /// is a cost-only objective and the engine routes it to a derivative-free /
 /// central-difference outer strategy per the planner.
 
-/// Target row budget for the outer-criterion Horvitz–Thompson subsample. The HT
-/// relative standard error of the reconstruction sums the criterion is built
-/// from scales like `1 / √n_sub`, so `16_384` rows hold the sampled criterion to
-/// ≈1% relative resolution for moderate per-row heterogeneity — comfortably
-/// inside the outer ρ search's own convergence tolerance — while the inner joint
-/// fit (the `O(N · K · M · p)` wall-time driver of every probe) shrinks by the
-/// full `N / n_sub` factor. Fixed (not a user knob): the row budget that makes a
-/// criterion probe cheap is a property of the estimator's variance, not the
-/// caller.
-pub(crate) const OUTER_CRITERION_SUBSAMPLE_ROWS: usize = 16_384;
-
-/// Auto-engage the subsample only when it cuts the per-probe row work by at least
-/// this factor. Below `OUTER_CRITERION_SUBSAMPLE_ROWS · MIN_CUT` rows the fixed
-/// mask-build + `Φ(t)` re-evaluation overhead is not dominated by the inner-fit
-/// savings, so small/medium fits stay on the full-`N` path, byte-identical to the
-/// pre-subsampling behavior. This also guarantees `n_sub < N` whenever engaged,
-/// so the `n_sub ≥ N` case is exactly the (never-engaged) full-`N` criterion.
-pub(crate) const OUTER_CRITERION_SUBSAMPLE_MIN_CUT: usize = 2;
-
-/// The retained row budget for an `n_full`-row outer criterion, or `None` when
-/// the problem is too small to benefit (the ρ search then runs at full `N`).
-pub(crate) fn plan_outer_criterion_subsample_rows(n_full: usize) -> Option<usize> {
-    let budget = OUTER_CRITERION_SUBSAMPLE_ROWS;
-    if n_full >= budget.saturating_mul(OUTER_CRITERION_SUBSAMPLE_MIN_CUT) {
-        Some(budget)
-    } else {
-        None
-    }
-}
-
-/// Deterministic seed for the outer-criterion row sampler, derived only from the
-/// problem fingerprint (`N`, output dim `p`, atom count `K`, decoder dim) — no
-/// clock, no env, no user knob. Two identical fits draw the identical subsample,
-/// so a run is reproducible and auditable.
-pub(crate) fn outer_subsample_seed(n_full: usize, p: usize, k: usize, beta_dim: usize) -> u64 {
-    let fingerprint = 0x05AE_0000_0000_0001u64
-        ^ (n_full as u64)
-        ^ (p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (k as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
-        ^ (beta_dim as u64).wrapping_mul(0xC2B2_AE35_59CB_D1EB);
-    gam_linalg::utils::splitmix64_hash(fingerprint)
-}
-
-/// Deterministic uniform-without-replacement row mask of size `min(n_sub,
-/// n_full)`: order the row indices by a splitmix64 hash keyed on `seed`, keep the
-/// first `n_sub`, and return them sorted ascending. Hash-ORDER selection (as in
-/// [`crate::manifold::cross_fit`]) makes the subsample size exact regardless of
-/// hash collisions, and each row's inclusion probability is uniform `n_sub /
-/// n_full`, matching the `w_i = N / n_sub` inverse-inclusion weight the criterion
-/// installs.
-pub(crate) fn deterministic_uniform_row_mask(
-    n_full: usize,
-    n_sub: usize,
-    seed: u64,
-) -> Vec<usize> {
-    if n_sub >= n_full {
-        return (0..n_full).collect();
-    }
-    let mut order: Vec<usize> = (0..n_full).collect();
-    order.sort_by_key(|&row| {
-        gam_linalg::utils::splitmix64_hash(seed ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-    });
-    let mut mask: Vec<usize> = order[..n_sub].to_vec();
-    mask.sort_unstable();
-    mask
-}
-
-/// Full-`N` state stashed while the outer ρ search runs on a Horvitz–Thompson row
-/// subsample (see [`SaeManifoldOuterObjective::maybe_engage_outer_row_subsample`]).
-///
-/// While engaged, `SaeManifoldOuterObjective::{term, baseline_term, target}` hold
-/// the `n_sub`-row restriction with the `w_i = N / n_sub` weights installed, so
-/// every eval/eval_cost/EFS criterion probe is the HT estimate of the full-`N`
-/// REML criterion. The pristine full-`N` term/baseline/target live here and are
-/// swapped back — warm-started from the subsample-fitted decoder — before any
-/// reported quantity (shape bands, certificate) or the final accepted fit, which
-/// always run at full `N` at the selected ρ.
-struct OuterRowSubsample {
-    full_term: SaeManifoldTerm,
-    full_baseline_term: SaeManifoldTerm,
-    full_target: Array2<f64>,
-    /// The engaged HT subsample (mask + inclusion weight + seed) — telemetry /
-    /// audit record of exactly which rows the ρ search consumed.
-    subsample: gam_problem::outer_subsample::OuterScoreSubsample,
-    /// `probe_telemetry.criterion_calls` at the moment of engagement, so the
-    /// probes-on-subsample count is the delta measured at restore.
-    probe_calls_at_engage: usize,
-}
-
 /// #2080 — probe telemetry for the outer REML ρ-search. Counts how the outer
 /// objective spends its criterion evaluations so the wide-`p` acceptance test can
 /// assert a BOUNDED probe budget (not a wall-clock limit — SPEC bans time
@@ -527,17 +438,6 @@ pub struct OuterProbeTelemetry {
     /// (the stateful-objective corruption of #629/#630/#2080). A nonzero count is a
     /// regression — a probe lane that mutates the committed state.
     pub mutating_value_probes: usize,
-    /// Outer-criterion row subsampling engagement (the #977-ride HT subsample).
-    /// `subsample_rows` is the retained subsample size `n_sub` (`0` ⇒ never
-    /// engaged: the ρ search ran at full `N`, byte-identical to the
-    /// pre-subsampling path); `subsample_full_rows` is the full `N`;
-    /// `subsample_probe_calls` counts how many outer criterion evaluations ran on
-    /// the subsample before the final fit was restored to full `N`. Auditable via
-    /// [`SaeManifoldOuterObjective::probe_telemetry`] so a run's row budget and
-    /// probe spend are observable.
-    pub subsample_rows: usize,
-    pub subsample_full_rows: usize,
-    pub subsample_probe_calls: usize,
     /// Eisenstat–Walker inexact-probe engagement: line-search value probes
     /// (`eval_with_order(Value)`) whose inner `(t, β)` solve was ACCEPTED at the
     /// loosened forcing gate `max(η_j·‖g_inner,entry‖, τ_full)` while the inner
@@ -870,13 +770,6 @@ pub struct SaeManifoldOuterObjective {
     /// `RemlOptimizationFailed` so an abandoned worker thread unwinds and stops
     /// rather than running a hung fit to completion. `None` ⇒ historical path.
     pub(crate) cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Outer-criterion row subsampling state (#977-ride). `Some` while the ρ
-    /// search runs on a Horvitz–Thompson subsample — `term`/`baseline_term`/
-    /// `target` above are then the `n_sub`-row restriction and this holds the
-    /// pristine full-`N` state to restore before the final fit. `None` ⇒ the
-    /// search runs at full `N` (small/medium problems, or when a subsampled term
-    /// could not be materialized), byte-identical to the pre-subsampling path.
-    row_subsample: Option<OuterRowSubsample>,
     /// #2080 (a) — the last successful value probe's converged inner state (see
     /// [`ProbeConvergedHandoff`]). Single-shot: taken by the next
     /// criterion-driving call and cleared by every state-swapping seam
@@ -1002,15 +895,14 @@ impl SaeManifoldOuterObjective {
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         let term_k_atoms = term.k_atoms();
-        // SPEC wall-survival fingerprint, computed on the pristine full-`N`
-        // target BEFORE the row subsample can restrict it below.
+        // SPEC wall-survival fingerprint on the full-data target.
         let checkpoint_fingerprint = super::checkpoint::SaeCheckpointFingerprint::of_target(
             target.view(),
             term_k_atoms,
         );
         let checkpoint_path =
             super::checkpoint::SaeFitCheckpoint::default_store_path(&checkpoint_fingerprint);
-        let mut objective = Self {
+        Self {
             term,
             baseline_term,
             target,
@@ -1027,7 +919,6 @@ impl SaeManifoldOuterObjective {
             routing_frozen: false,
             probe_telemetry: OuterProbeTelemetry::default(),
             cancel_flag: None,
-            row_subsample: None,
             probe_converged_handoff: None,
             forcing: ProbeForcingState::new(),
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
@@ -1041,24 +932,13 @@ impl SaeManifoldOuterObjective {
             termination: OuterTerminationLedger::new(),
             checkpoint_fingerprint,
             checkpoint_path,
-        };
-        // Magic by default: above the row-count threshold, run the outer ρ search
-        // on a deterministic Horvitz–Thompson row subsample; the final fit and all
-        // reported quantities are restored to full `N` (see
-        // `maybe_engage_outer_row_subsample`). Below threshold this is a no-op.
-        objective.maybe_engage_outer_row_subsample();
-        objective
+        }
     }
 
     /// SPEC wall-survival: bank a resumable checkpoint at a MATERIAL improvement
     /// of the outer best cost. Best-effort — a checkpoint write must never abort
-    /// a fit (the error is logged, not raised) — and skipped while the
-    /// row-subsample restriction is engaged (the term then holds `n_sub`-row
-    /// state whose coords/logits cannot install at full `N`).
+    /// a fit (the error is logged, not raised).
     pub(crate) fn bank_checkpoint(&self, rho_flat: &Array1<f64>) {
-        if self.row_subsample.is_some() {
-            return;
-        }
         let (evals, last_improvement_eval, best_cost) = self.termination.checkpoint_counters();
         let rho_owned = rho_flat.to_vec();
         // serde_json refuses non-finite floats, and the ledger's best cost is
@@ -1114,27 +994,12 @@ impl SaeManifoldOuterObjective {
             log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
             return None;
         }
-        // Install into the PRISTINE full-`N` term when the subsample is engaged
-        // (the working term is the n_sub restriction and cannot take full-`N`
-        // state); the restored-for-final-fit path re-reads from there. With no
-        // subsample, install into the working term directly.
-        let install_result = if let Some(sub) = self.row_subsample.as_mut() {
-            let r = ckpt.install_into(&mut sub.full_term);
-            if r.is_ok()
-                && let Err(e) = ckpt.install_into(&mut sub.full_baseline_term)
-            {
-                log::warn!("SAE fit checkpoint resume (full baseline): {e}");
-            }
-            r
-        } else {
-            let r = ckpt.install_into(&mut self.term);
-            if r.is_ok()
-                && let Err(e) = ckpt.install_into(&mut self.baseline_term)
-            {
-                log::warn!("SAE fit checkpoint resume (baseline): {e}");
-            }
-            r
-        };
+        let install_result = ckpt.install_into(&mut self.term);
+        if install_result.is_ok()
+            && let Err(e) = ckpt.install_into(&mut self.baseline_term)
+        {
+            log::warn!("SAE fit checkpoint resume (baseline): {e}");
+        }
         if let Err(e) = install_result {
             log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
             return None;
@@ -1166,232 +1031,6 @@ impl SaeManifoldOuterObjective {
                 self.checkpoint_path.display()
             );
         }
-    }
-
-    /// Auto-engage outer-criterion row subsampling for the ρ search when the row
-    /// count clears [`plan_outer_criterion_subsample_rows`].
-    ///
-    /// Builds the `n_sub`-row Horvitz–Thompson restriction of the current term +
-    /// target (deterministic seed from the problem fingerprint), installs the
-    /// uniform inverse-inclusion weight `w_i = N / n_sub` via the #977
-    /// `row_loss_weights` seam, and swaps it into `term`/`baseline_term`/`target`
-    /// so every outer eval/eval_cost/EFS criterion probe runs on the subsample —
-    /// the HT estimate of the full-`N` REML criterion. The pristine full-`N` state
-    /// is stashed in `self.row_subsample` and restored, warm-started from the
-    /// subsample-fitted decoder, before any reported quantity or the final fit
-    /// (`restore_full_rows_for_final_fit`).
-    ///
-    /// The subsample MASK is fixed for the whole search (not re-drawn per probe),
-    /// so the sampled criterion is a single deterministic surrogate with an exact
-    /// analytic ρ-gradient — the outer KKT stopping test stays well-posed (the
-    /// "never converge on a noisy subsampled gradient" caveat applies to per-probe
-    /// resampling, which this deliberately avoids). Building the subsampled term
-    /// can fail for atoms with no basis evaluator (`materialize_chunk`); such fits
-    /// degrade gracefully to the full-`N` search rather than aborting.
-    fn maybe_engage_outer_row_subsample(&mut self) {
-        let n_full = self.target.nrows();
-        let Some(n_sub) = plan_outer_criterion_subsample_rows(n_full) else {
-            return;
-        };
-        self.engage_outer_row_subsample(n_sub);
-    }
-
-    /// Engage the HT subsample at an explicit row budget `n_sub` — the
-    /// threshold-free core of [`Self::maybe_engage_outer_row_subsample`] (and the
-    /// test seam that forces engagement below the production threshold). Returns
-    /// `true` when the subsample was installed; `false` (a no-op) when already
-    /// engaged, when the problem is empty, when `n_sub >= N` (the full-`N` path is
-    /// then exactly the criterion, byte-identical), or when the subsampled term
-    /// cannot be materialized (e.g. an atom with no basis evaluator).
-    pub(crate) fn engage_outer_row_subsample(&mut self, n_sub: usize) -> bool {
-        if self.row_subsample.is_some() {
-            return false;
-        }
-        let n_full = self.target.nrows();
-        let p = self.target.ncols();
-        if n_full == 0 || p == 0 || n_sub == 0 || n_sub >= n_full {
-            return false;
-        }
-        let seed = outer_subsample_seed(n_full, p, self.term.k_atoms(), self.term.beta_dim());
-        let mask = deterministic_uniform_row_mask(n_full, n_sub, seed);
-        let (sub_term, sub_target) = match self.build_subsampled_term(&mask) {
-            Ok(pair) => pair,
-            Err(err) => {
-                log::info!(
-                    "[SAE/outer-subsample] row subsampling unavailable ({err}); running the \
-                     ρ search at full N={n_full}"
-                );
-                return false;
-            }
-        };
-        let subsample = gam_problem::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
-            mask, n_full, seed,
-        );
-        let full_term = std::mem::replace(&mut self.term, sub_term.clone());
-        let full_baseline_term = std::mem::replace(&mut self.baseline_term, sub_term);
-        let full_target = std::mem::replace(&mut self.target, sub_target);
-        // #2080 (a) — the accepted basin just changed row support; any pending
-        // probe handoff (full-N state) is invalid against the subsampled term.
-        self.probe_converged_handoff = None;
-        // #2230/#2087 — the saved basin states are on the FULL-N row support; the
-        // ρ search now runs on the subsample, so they are invalid. Same rule as
-        // the handoff above: any accepted-basin / row-support seam clears both.
-        self.basin_bundle.clear();
-        self.probe_telemetry.subsample_rows = n_sub;
-        self.probe_telemetry.subsample_full_rows = n_full;
-        self.row_subsample = Some(OuterRowSubsample {
-            full_term,
-            full_baseline_term,
-            full_target,
-            subsample,
-            probe_calls_at_engage: self.probe_telemetry.criterion_calls,
-        });
-        true
-    }
-
-    /// Build the `mask`-row Horvitz–Thompson restriction of the current term +
-    /// target: gather the masked rows of the routing logits, per-atom latent
-    /// coordinates, and (if present) frozen routing; re-materialize the row-
-    /// restricted term via [`SaeManifoldTerm::materialize_chunk`] (which re-
-    /// evaluates each atom's `Φ(t)` at the gathered coordinates and shares the
-    /// decoder, penalties, and mode with the full term); carry the per-fit config
-    /// authorities `materialize_chunk` does not; install the uniform inclusion
-    /// weight `w = N / n_sub`; and gather the matching target rows.
-    pub(crate) fn build_subsampled_term(
-        &self,
-        mask: &[usize],
-    ) -> Result<(SaeManifoldTerm, Array2<f64>), String> {
-        let n_sub = mask.len();
-        if n_sub == 0 {
-            return Err("outer-subsample: empty row mask".to_string());
-        }
-        let n_full = self.target.nrows();
-        let p = self.target.ncols();
-        let k = self.term.k_atoms();
-        let src = &self.term.assignment;
-        // Routing logits (n_sub × K).
-        let mut logits = Array2::<f64>::zeros((n_sub, k));
-        for (r, &i) in mask.iter().enumerate() {
-            logits.row_mut(r).assign(&src.logits.row(i));
-        }
-        // Per-atom latent coordinates (n_sub × d_k).
-        let coords: Vec<Array2<f64>> = src
-            .coords
-            .iter()
-            .map(|coord| {
-                let m = coord.as_matrix();
-                let d = m.ncols();
-                let mut g = Array2::<f64>::zeros((n_sub, d));
-                for (r, &i) in mask.iter().enumerate() {
-                    g.row_mut(r).assign(&m.row(i));
-                }
-                g
-            })
-            .collect();
-        // Frozen (amortized) routing, if any, so the subsample reads the same gates.
-        let frozen = src.frozen_logits.as_ref().map(|f| {
-            let mut g = Array2::<f64>::zeros((n_sub, k));
-            for (r, &i) in mask.iter().enumerate() {
-                g.row_mut(r).assign(&f.row(i));
-            }
-            g
-        });
-        let mut sub = self.term.materialize_chunk(logits, coords, frozen)?;
-        // Carry the per-fit config (separation-barrier / IBP-α authorities) that
-        // `materialize_chunk` resets to defaults, so the subsample computes the
-        // same regularized criterion as the full term.
-        sub.set_fit_config(self.term.fit_config());
-        // #2021/#1408/#2022/#5(B) — carry the remaining criterion-DEFINING term
-        // configuration that `materialize_chunk` (a fresh `SaeManifoldTerm::new`)
-        // also resets to defaults, so the subsampled ρ search ranks the SAME
-        // criterion the restored full-`N` fit delivers. Without these the search
-        // silently optimizes a DIFFERENT objective than is delivered: a #974/#2021
-        // structured-whitening fit searched unwhitened, a top-`k`-capped fit
-        // searched at full support, or a rank-charge / quotient-scale fit searched
-        // under the plain ½log|H_tt| gauge. `set_fit_config` above only round-trips
-        // the barrier / IBP-α overrides; these are separate term fields.
-        sub.set_rank_charge_evidence(self.term.rank_charge_evidence());
-        sub.set_soft_rank_charge(self.term.soft_rank_charge());
-        sub.set_softmax_active_cap(self.term.softmax_active_cap);
-        sub.set_quotient_scale(self.term.quotient_scale());
-        // The row metric is per-row, so it is gathered to the subsample's rows (the
-        // same `mask` that selected the logits / coords / target) rather than cloned
-        // whole; `set_row_metric` then re-checks the n_sub / p match.
-        if let Some(metric) = self.term.row_metric() {
-            sub.set_row_metric(metric.gather_rows(mask)?)?;
-        }
-        // Uniform HT inverse-inclusion weight w = N / n_sub, un-normalized (the
-        // absolute full-N scale is load-bearing — see `set_uniform_inclusion_weight`).
-        let weight = n_full as f64 / n_sub as f64;
-        sub.set_uniform_inclusion_weight(weight)?;
-        // Matching target rows (n_sub × p).
-        let mut sub_target = Array2::<f64>::zeros((n_sub, p));
-        for (r, &i) in mask.iter().enumerate() {
-            sub_target.row_mut(r).assign(&self.target.row(i));
-        }
-        Ok((sub, sub_target))
-    }
-
-    /// Swap the pristine full-`N` term/baseline/target back in before the final
-    /// fit and every reported quantity, so — per the subsampling contract — only
-    /// the ρ *search* ever saw a subsample. Idempotent: a no-op once restored (or
-    /// when the search ran at full `N`).
-    ///
-    /// The decoder settled by the subsampled search is a strong warm start for the
-    /// single full-`N` inner solve at the selected ρ, so it is copied onto the
-    /// restored full term (and left as `seeded_beta`); the per-row coordinates are
-    /// re-solved from the full data by that inner fit. The probes-on-subsample
-    /// telemetry delta is recorded here.
-    ///
-    /// Returns `true` iff a subsampled state was actually swapped back — i.e. the
-    /// restored `term` carries the searched decoder on top of the pristine full-`N`
-    /// coordinates and is NOT yet at its full-`N` inner optimum. Callers that then
-    /// COMPARE this state against a freshly inner-solved candidate (the `into_fitted`
-    /// seed arbitration, #F7) must re-solve it at full `N` first, or the un-solved
-    /// searched state loses by construction. Callers that re-solve `term` anyway as
-    /// a side effect (e.g. `reml_criterion_*` in the certificate / shape-band paths)
-    /// can ignore the flag.
-    pub(crate) fn restore_full_rows_for_final_fit(&mut self) -> bool {
-        let Some(state) = self.row_subsample.take() else {
-            return false;
-        };
-        let searched_beta = self.term.flatten_beta();
-        self.term = state.full_term;
-        self.baseline_term = state.full_baseline_term;
-        self.target = state.full_target;
-        // #2080 (a) — a probe handoff captured on the subsampled rows must never
-        // warm-start a full-`N` evaluation.
-        self.probe_converged_handoff = None;
-        // #2230/#2087 — subsampled saved basins are invalid at full N.
-        self.basin_bundle.clear();
-        // The subsample→full-`N` swap changes the criterion's scale, so the
-        // subsampled gradient decay is not the full-`N` optimality measure:
-        // drop the Eisenstat–Walker ratio. (The ρ search is over by now anyway
-        // — everything after this point is terminal and full-tolerance.)
-        self.forcing.clear_history();
-        if searched_beta.len() == self.term.beta_dim()
-            && self.term.set_flat_beta(searched_beta.view()).is_ok()
-        {
-            self.seeded_beta = Some(searched_beta);
-        }
-        self.probe_telemetry.subsample_probe_calls = self
-            .probe_telemetry
-            .criterion_calls
-            .saturating_sub(state.probe_calls_at_engage);
-        log::info!(
-            "[SAE/outer-subsample] restored full N={} for the final fit after {} subsampled \
-             ρ-search probes on {} rows (mask seed {:#x})",
-            self.term.n_obs(),
-            self.probe_telemetry.subsample_probe_calls,
-            state.subsample.len(),
-            state.subsample.seed,
-        );
-        true
-    }
-
-    /// Whether the outer ρ search is currently running on a row subsample.
-    pub fn outer_row_subsample_engaged(&self) -> bool {
-        self.row_subsample.is_some()
     }
 
     /// #2138 — install a cooperative cancellation flag shared with the pyffi fit
@@ -1509,13 +1148,9 @@ impl SaeManifoldOuterObjective {
 
     /// Consume the objective, returning the inner-fitted term, the last rho the
     /// engine evaluated, and the inner loss breakdown at that rho.
-    pub fn into_fitted(mut self) -> SaeIntoFittedResult {
+    pub fn into_fitted(self) -> SaeIntoFittedResult {
         // #2235 — capture the termination ledger before `self` is consumed.
         let termination_report = self.termination.report();
-        // The final accepted fit and every reported quantity run at full `N` at
-        // the selected ρ — the ρ search may have run on a row subsample, but it is
-        // swapped back (warm-started from the search-fitted decoder) here.
-        let restored_from_subsample = self.restore_full_rows_for_final_fit();
         let Self {
             mut term,
             mut baseline_term,
@@ -1534,68 +1169,14 @@ impl SaeManifoldOuterObjective {
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
         let mut last_loss = last_loss;
-        // #F7 — when the ρ search ran on a row subsample, `restore_full_rows_for_final_fit`
-        // swapped the pristine full-`N` term back in and warm-started `term`'s decoder
-        // from the subsampled search, but left the per-row coordinates at the pristine
-        // full-`N` seed — NOT re-solved against that decoder. The seed candidate in the
-        // arbitration below is FULLY inner-solved at full `N` (`fit_streaming_in_memory`
-        // / `run_joint_fit_arrow_schur`), so comparing the two as-is pits an inner-solved
-        // seed against an UN-solved searched state: the searched decoder loses by
-        // construction and the whole subsampled search contributes only ρ. Re-solve the
-        // searched state at full `N` (warm-started from its own decoder, which is already
-        // installed in `term`) so both regimes — streaming and dense — arbitrate
-        // like-for-like inner-solved candidates. Skipped when the search ran at full `N`
-        // (no restore): `term` is then already at its inner optimum at `fitted_rho`, so a
-        // re-solve would be a redundant full-`N` fit.
-        if restored_from_subsample {
-            let mut rho_full = fitted_rho.clone();
-            let resolve = match term.streaming_plan().admitted_or_error(
-                term.n_obs(),
-                term.output_dim(),
-                term.k_atoms(),
-            ) {
-                Ok(plan)
-                    if plan.streaming
-                        && plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
-                        && plan.estimated_dense_schur_bytes <= plan.in_core_budget_bytes =>
-                {
-                    term.fit_streaming_in_memory(
-                        target.view(),
-                        &mut rho_full,
-                        registry.as_ref(),
-                        inner_max_iter,
-                        learning_rate,
-                        ridge_ext_coord,
-                        ridge_beta,
-                    )
-                }
-                Ok(_) => term.run_joint_fit_arrow_schur(
-                    target.view(),
-                    &mut rho_full,
-                    registry.as_ref(),
-                    inner_max_iter,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                ),
-                Err(err) => Err(err),
-            };
-            match resolve {
-                Ok(resolved_loss) => last_loss = Some(resolved_loss),
-                Err(err) => log::warn!(
-                    "[#F7] full-N re-solve of the subsample-searched state failed ({err}); \
-                     arbitrating the un-solved searched decoder against the inner-solved seed"
-                ),
-            }
-        }
         // Fit-level keep-best consult (`best_fit_incumbent`): if the terminal
         // outer state reconstructs strictly worse than the best basin any
         // accepted iterate visited during the WHOLE ρ search, restore that basin
         // BEFORE the seed-vs-settled arbitration below, so every downstream
         // guard (seed refit, pristine-seed comparison, canonicalization) sees
         // the search's real best rather than its last collapse. The banked
-        // snapshot is row-count bound to THIS term (a subsampled search term's
-        // bank died with it), so the restore is always shape-consistent.
+        // snapshot is row-count bound to this term, so the restore is always
+        // shape-consistent.
         let mut fit_incumbent_restored = false;
         if let Some((incumbent_ev, _incumbent_uniformity, incumbent_state)) =
             term.best_fit_incumbent.take()
@@ -1821,39 +1402,32 @@ impl SaeManifoldOuterObjective {
     /// First-order optimality certificate for this fit (#934).
     ///
     /// At the converged outer optimum `ρ̂` this runs the self-audit the desync
-    /// bug genus (#752/#748/#808/#901) was always diagnosed by hand: it draws
-    /// one deterministic direction `v` from the problem fingerprint, central-
-    /// differences the criterion **value path** at `ρ̂ ± h v` (with a Richardson
-    /// `2h` step for the FD's own error bar), and compares against the analytic
-    /// directional derivative `∇V(ρ̂)·v` from the production gradient path. The
-    /// returned [`DirectionalCriterionCertificate`] records whether the objective and its
+    /// bug genus (#752/#748/#808/#901) was always diagnosed by hand: it central-
+    /// differences the criterion **value path on every outer-ρ axis** (with a
+    /// Richardson `2h` step for each FD error bar), and compares the resulting
+    /// complete numerical gradient against the production analytic gradient. The
+    /// returned [`GradientCriterionCertificate`] records whether the objective and its
     /// analytic gradient agree *here*, on this data shape, where #901-class
     /// desyncs actually manifest.
     ///
     /// The numerical secant is the *audit instrument*, not an estimator: it
     /// only checks the production analytic gradient against the production value
-    /// path at one point after convergence, so it is fully compatible with the
+    /// path after convergence, so it is fully compatible with the
     /// exact-REML-only policy (see `sae_optimality_certificate`). Cost is four
-    /// criterion value-path evaluations at the single final point.
+    /// `4 * dim(ρ)` criterion value-path evaluations at the final point.
     ///
     /// The value probes are taken on a **clone of the pristine baseline term**
     /// so the production fitted state is untouched and the value caches start
     /// cold — they must not alias the gradient path's converged warm state,
     /// since that aliasing is exactly what the certificate audits. Call before
     /// [`Self::into_fitted`].
-    pub fn optimality_certificate(&mut self) -> Result<DirectionalCriterionCertificate, String> {
-        // The certificate audits the full-`N` criterion at the settled ρ, so
-        // restore full rows first (idempotent) — the subsampled surrogate is not
-        // the objective the reported fit optimizes.
-        self.restore_full_rows_for_final_fit();
+    pub fn optimality_certificate(&mut self) -> Result<GradientCriterionCertificate, String> {
         // #2080 (a) — this diagnostic commits its own inner solves to the
         // accepted basin; drop any pending probe handoff.
         self.probe_converged_handoff = None;
         // #2230/#2087 — the ρ search is over; drop the saved basins too.
         self.basin_bundle.clear();
         let rho_hat_flat = self.current_rho.to_flat();
-        let dir = deterministic_probe_direction(rho_hat_flat.view());
-        let h = probe_step(rho_hat_flat.view());
 
         // Analytic directional derivative at ρ̂, from the production gradient
         // path (same code the outer optimizer consumed). Re-forming the cache
@@ -1881,18 +1455,16 @@ impl SaeManifoldOuterObjective {
             &solver,
         )?;
         let grad = components.gradient();
-        let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        let analytic_directional: f64 = grad.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
 
-        // Value-path probe on a cold clone of the pristine baseline term: the
+        // Value-path probes on cold clones of the pristine baseline term: the
         // value path must be exercised WITHOUT the gradient path's warm caches,
         // since aliasing the two is exactly the failure the certificate audits.
-        let mut probe_term = self.baseline_term.clone();
-        let value_at = |term: &mut SaeManifoldTerm, mult: f64| -> Result<f64, String> {
-            let flat: Array1<f64> =
-                Array1::from_shape_fn(rho_hat_flat.len(), |i| rho_hat_flat[i] + mult * h * dir[i]);
+        let value_at = |axis: usize, delta: f64| -> Result<f64, String> {
+            let mut probe_term = self.baseline_term.clone();
+            let mut flat = rho_hat_flat.clone();
+            flat[axis] += delta;
             let rho = self.baseline_rho.from_flat(flat.view());
-            let (cost, _loss) = term.reml_criterion(
+            let (cost, _loss) = probe_term.reml_criterion(
                 self.target.view(),
                 &rho,
                 self.registry.as_ref(),
@@ -1903,25 +1475,27 @@ impl SaeManifoldOuterObjective {
             )?;
             Ok(cost)
         };
-        let plus_h = value_at(&mut probe_term, 1.0)?;
-        let minus_h = value_at(&mut probe_term, -1.0)?;
-        let plus_2h = value_at(&mut probe_term, 2.0)?;
-        let minus_2h = value_at(&mut probe_term, -2.0)?;
-
-        let well_posed = plus_h.is_finite()
-            && minus_h.is_finite()
-            && plus_2h.is_finite()
-            && minus_2h.is_finite();
-        let samples = DirectionalSamples {
-            plus_h,
-            minus_h,
-            plus_2h,
-            minus_2h,
-            step: h,
-            grad_norm,
-            analytic_directional,
-            well_posed,
-        };
+        let mut samples = Vec::with_capacity(rho_hat_flat.len());
+        for axis in 0..rho_hat_flat.len() {
+            let step = probe_step_for(rho_hat_flat[axis]);
+            let plus_h = value_at(axis, step)?;
+            let minus_h = value_at(axis, -step)?;
+            let plus_2h = value_at(axis, 2.0 * step)?;
+            let minus_2h = value_at(axis, -2.0 * step)?;
+            let well_posed = plus_h.is_finite()
+                && minus_h.is_finite()
+                && plus_2h.is_finite()
+                && minus_2h.is_finite();
+            samples.push(CoordinateSamples {
+                plus_h,
+                minus_h,
+                plus_2h,
+                minus_2h,
+                step,
+                analytic: grad[axis],
+                well_posed,
+            });
+        }
         Ok(certificate_from_samples(&samples))
     }
 
@@ -1944,9 +1518,6 @@ impl SaeManifoldOuterObjective {
     }
 
     pub fn decoder_shape_uncertainty(&mut self) -> Result<SaeShapeUncertainty, String> {
-        // Shape bands are a reported quantity: restore full `N` (idempotent) so
-        // the posterior covariance is read from the full-data joint-Hessian factor.
-        self.restore_full_rows_for_final_fit();
         // #2080 (a) — this diagnostic runs its own inner solves against the
         // accepted basin; drop any pending probe handoff.
         self.probe_converged_handoff = None;
@@ -3324,11 +2895,6 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
-        // A single fixed-ρ fit has no ρ search to accelerate, and its committed
-        // basin is the returned fit — it must be the full-`N` solve. Restore full
-        // rows first (idempotent) so this path is byte-identical whether or not
-        // the constructor engaged a subsample.
-        self.restore_full_rows_for_final_fit();
         self.evaluate_with_refine_policy(rho_flat, true, false)
             .map(|_| ())
     }

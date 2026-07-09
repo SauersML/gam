@@ -24,13 +24,14 @@
 
 use super::*;
 
-mod dense;
+#[path = "outer_derivatives/dense.rs"]
+mod dense_assembly;
 mod kkt;
 mod operator;
 mod routing;
 mod traces;
 
-pub(crate) use dense::*;
+pub(crate) use dense_assembly::*;
 pub(crate) use kkt::*;
 pub(crate) use operator::*;
 // Re-flatten `routing` at each item's own declared visibility: the outer-Hessian

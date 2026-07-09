@@ -517,10 +517,10 @@ pub struct SaeManifoldAtom {
     /// hence the topology evidence — is gauge-invariant under reparameterization
     /// of the latent coordinate `t` (issue #673). It is recomputed from the
     /// current basis Jacobian and decoder coefficients by
-    /// [`Self::refresh_intrinsic_smooth_penalty`] (lagged-diffusivity: the
-    /// metric weight is frozen within each inner Newton/evidence assembly and
-    /// refreshed between them, so at convergence the penalty is the true
-    /// arc-length roughness). The metric weight is centered (geometric mean 1),
+    /// [`Self::refresh_intrinsic_smooth_penalty`] at an explicit initialization
+    /// or structural-reparameterization boundary.  It remains frozen throughout
+    /// each fitted objective, so its quadratic value, gradient, Hessian, and
+    /// Occam term describe one function. The metric weight is centered (geometric mean 1),
     /// so for constant-speed atoms (the periodic sin/cos basis on `S¹`) every
     /// weight is exactly `1` and `S̃_k = S_k` — periodic atoms are untouched
     /// and no overall magnitude leaks into the penalty.
@@ -971,7 +971,8 @@ impl SaeManifoldAtom {
     pub fn physical_full_width_decoder(&self) -> Array2<f64> {
         let mut decoder = self.full_width_decoder();
         if self.log_amplitude != 0.0 {
-            decoder.mapv_inplace(|v| self.log_amplitude.exp() * v);
+            let amplitude = self.log_amplitude.exp();
+            decoder.mapv_inplace(|v| amplitude * v);
         }
         decoder
     }
@@ -1169,7 +1170,12 @@ impl SaeManifoldAtom {
     /// automatically in [`Self::refresh_basis`]; this is the caller-managed
     /// counterpart.
     pub fn install_bending_second_jet(&mut self, values: Array4<f64>) -> Result<(), String> {
-        let expected = (self.n_obs(), self.basis_size(), self.latent_dim, self.latent_dim);
+        let expected = (
+            self.n_obs(),
+            self.basis_size(),
+            self.latent_dim,
+            self.latent_dim,
+        );
         if values.dim() != expected {
             return Err(format!(
                 "SaeManifoldAtom::install_bending_second_jet: values {:?}, expected {expected:?}",
@@ -1794,10 +1800,12 @@ impl SaeManifoldAtom {
     ///
     /// A degenerate (empty/zero) raw Gram leaves `S̃ = S` untouched.
     ///
-    /// The intrinsic geometry `(g, Γ)` / latent coordinates are FROZEN at the
-    /// current iterate (lagged-diffusivity / IRLS surrogate): within one inner
-    /// solve the penalty stays a fixed quadratic Gram, and refreshing between
-    /// assemblies makes the *converged* penalty the true intrinsic roughness. A
+    /// This method snapshots the intrinsic geometry `(g, Γ)` / latent
+    /// coordinates into a fixed quadratic Gram.  The fit does not call it at
+    /// Newton or REML assembly boundaries: doing so would make `S(B,t)` part of
+    /// the objective while omitting its derivatives.  Callers may invoke it only
+    /// before starting a new objective or after an explicit structural
+    /// reparameterization. A
     /// geodesic (zero-bending) image — the periodic sin/cos basis on `S¹`, a
     /// straight decoder — carries no intrinsic roughness, so no overall magnitude
     /// (which `λ` already owns) leaks into the penalty.
@@ -1911,10 +1919,10 @@ impl SaeManifoldAtom {
     ///   `Γ^c_{ab} = g^{cd} ⟨∂_d γ, ∂²_{ab} γ⟩`.
     /// The embedding hands us `(g, Γ)` directly — no differentiating the metric
     /// — and NO `∂³Φ` enters, so this is exactly a curvature (order-2) object.
-    /// `(g, Γ)` are FROZEN at the current iterate (the same lagged-diffusivity
-    /// contract as the `d = 1` scalar-speed path): the penalty is a fixed
-    /// quadratic Gram within one inner solve, refreshed between assemblies so
-    /// the CONVERGED penalty is the true intrinsic bending energy.
+    /// `(g, Γ)` are snapshotted at an explicit objective boundary.  The resulting
+    /// Gram stays fixed for the complete inner/outer solve; it is not refreshed
+    /// between assemblies, because that would require differentiating the metric
+    /// and connection as part of the objective.
     ///
     /// # Coefficient-space realisation (exact, PSD by construction)
     ///
@@ -2062,11 +2070,7 @@ impl SaeManifoldAtom {
             // Gram estimates the full-set Gram (its trace = Σ_i ω_i‖II_i‖²).
             let omega = weight_scale
                 * if volume {
-                    if full_rank {
-                        (0.5 * logdet).exp()
-                    } else {
-                        0.0
-                    }
+                    if full_rank { (0.5 * logdet).exp() } else { 0.0 }
                 } else {
                     1.0
                 };
@@ -2248,11 +2252,7 @@ mod tests {
         let (phi_train, jac_train) = eval.evaluate(train_t.view()).unwrap();
         let p = 2usize;
         // Arbitrary full-width decoder `B` (M = 3 rows, p = 2 cols).
-        let decoder = Array2::from_shape_vec(
-            (3, p),
-            vec![0.5, -0.2, 1.3, 0.7, -0.9, 0.4],
-        )
-        .unwrap();
+        let decoder = Array2::from_shape_vec((3, p), vec![0.5, -0.2, 1.3, 0.7, -0.9, 0.4]).unwrap();
         let mut penalty = Array2::<f64>::zeros((3, 3));
         penalty[[1, 1]] = 1.0;
         penalty[[2, 2]] = 1.0;
@@ -2278,11 +2278,15 @@ mod tests {
         let n1 = (v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2]).sqrt();
         let u1 = [v1[0] / n1, v1[1] / n1, v1[2] / n1];
         let dot = v2[0] * u1[0] + v2[1] * u1[1] + v2[2] * u1[2];
-        let w2 = [v2[0] - dot * u1[0], v2[1] - dot * u1[1], v2[2] - dot * u1[2]];
+        let w2 = [
+            v2[0] - dot * u1[0],
+            v2[1] - dot * u1[1],
+            v2[2] - dot * u1[2],
+        ];
         let n2 = (w2[0] * w2[0] + w2[1] * w2[1] + w2[2] * w2[2]).sqrt();
         let u2 = [w2[0] / n2, w2[1] / n2, w2[2] / n2];
-        let q = Array2::from_shape_vec((3, 2), vec![u1[0], u2[0], u1[1], u2[1], u1[2], u2[2]])
-            .unwrap();
+        let q =
+            Array2::from_shape_vec((3, 2), vec![u1[0], u2[0], u1[1], u2[1], u1[2], u2[2]]).unwrap();
 
         atom.reduce_basis_to_subspace(&q).unwrap();
 
@@ -2370,22 +2374,52 @@ mod tests {
             let mut var_red = 0.0_f64;
             for r1 in 0..2 {
                 for r2 in 0..2 {
-                    var_red += phi_tilde_row[r1]
-                        * phi_tilde_row[r2]
-                        * cov_red[[r1 * p + c, r2 * p + c]];
+                    var_red +=
+                        phi_tilde_row[r1] * phi_tilde_row[r2] * cov_red[[r1 * p + c, r2 * p + c]];
                 }
             }
             let mut var_full = 0.0_f64;
             for m1 in 0..3 {
                 for m2 in 0..3 {
-                    var_full += phi_inner_row[m1]
-                        * phi_inner_row[m2]
-                        * lifted[[m1 * p + c, m2 * p + c]];
+                    var_full +=
+                        phi_inner_row[m1] * phi_inner_row[m2] * lifted[[m1 * p + c, m2 * p + c]];
                 }
             }
             assert!(
                 (var_red - var_full).abs() <= 1e-12,
                 "channel {c} band variance must be invariant under the lift: {var_red} vs {var_full}"
+            );
+        }
+    }
+
+    /// #2237 — persistence must export the physical decoder, not the unit-norm
+    /// representative left after the default-on scale quotient peels magnitude
+    /// into `log_amplitude`.
+    #[test]
+    fn physical_decoder_export_preserves_scale_quotient_2237() {
+        let mut atom = monomial_atom(SaeAtomBasisKind::EuclideanPatch, &[0.1, 0.4, 0.8]);
+        let physical_before = atom.full_width_decoder();
+
+        atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+
+        let representative = atom.full_width_decoder();
+        let representative_norm = representative.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            (representative_norm - 1.0).abs() <= 1.0e-14,
+            "scale-quotient representative must have unit Frobenius norm; got {representative_norm}"
+        );
+        assert_ne!(
+            atom.log_amplitude, 0.0,
+            "fixture must move non-trivial magnitude into log_amplitude"
+        );
+
+        let physical_after = atom.physical_full_width_decoder();
+        assert_eq!(physical_after.dim(), physical_before.dim());
+        for ((row, col), expected) in physical_before.indexed_iter() {
+            assert!(
+                (physical_after[[row, col]] - *expected).abs() <= 1.0e-14,
+                "physical decoder changed across quotient peel at [{row},{col}]: {} vs {expected}",
+                physical_after[[row, col]]
             );
         }
     }
@@ -2443,7 +2477,8 @@ mod tests {
         for i in 0..3 {
             for j in 0..3 {
                 assert!(
-                    (expected[[i, j]] - 0.5 * flat[[i, j]]).abs() <= 1e-9 * (1.0 + flat[[i, j]].abs()),
+                    (expected[[i, j]] - 0.5 * flat[[i, j]]).abs()
+                        <= 1e-9 * (1.0 + flat[[i, j]].abs()),
                     "d=1 hyperbolic Dirichlet Gram[{i},{j}]={} must equal ½·flat {}",
                     expected[[i, j]],
                     0.5 * flat[[i, j]]
@@ -2522,7 +2557,10 @@ mod tests {
             let atom = bending_atom(dg.clone(), d2.clone(), measure);
             let got = bending_energy_of(&atom);
             let want = ambient_bending_energy(&dg, &d2, volume);
-            assert!(want > 0.5, "reference d=1 bending should be sizeable: {want}");
+            assert!(
+                want > 0.5,
+                "reference d=1 bending should be sizeable: {want}"
+            );
             assert!(
                 (got - want).abs() <= 1e-9 * want.max(1.0),
                 "volume={volume}: d=1 coefficient bending {got} != ambient reference {want}"
@@ -2556,7 +2594,10 @@ mod tests {
         let identity = bending_atom(dg_x, d2_x, SaeBendingMeasure::Data);
         let e_warped = bending_energy_of(&warped);
         let e_identity = bending_energy_of(&identity);
-        assert!(e_identity > 0.5, "identity-chart d=1 energy sanity: {e_identity}");
+        assert!(
+            e_identity > 0.5,
+            "identity-chart d=1 energy sanity: {e_identity}"
+        );
         assert!(
             (e_warped - e_identity).abs() <= 1e-9 * e_identity,
             "d=1 bending must be reparam-invariant at matched points: warped {e_warped} vs identity {e_identity}"
@@ -2632,13 +2673,20 @@ mod tests {
         let full = bending_atom(dgamma.clone(), d2gamma.clone(), SaeBendingMeasure::Data);
         let e_full = bending_energy_of(&full);
         assert!(e_full > 0.0 && e_full.is_finite());
-        assert!(full.bending_quadrature_rows.is_none(), "small-n harness stays full");
+        assert!(
+            full.bending_quadrature_rows.is_none(),
+            "small-n harness stays full"
+        );
 
         // Manually drive the subsample path: pick Q rows, keep only their jet
         // slices, tag the quadrature. try_intrinsic then reweights by n/Q.
         let q = 400usize;
         let rows = full.select_bending_quadrature_rows(q);
-        assert!(rows.len() <= q && rows.len() >= q / 2, "got {} rows", rows.len());
+        assert!(
+            rows.len() <= q && rows.len() >= q / 2,
+            "got {} rows",
+            rows.len()
+        );
         let mut compact = Array4::<f64>::zeros((rows.len(), p, d, d));
         for (jet_idx, &r) in rows.iter().enumerate() {
             compact
@@ -2651,8 +2699,16 @@ mod tests {
         // Memory footprint is O(Q·M·d²), NOT O(n·M·d²): the retained jet holds
         // only the subsampled rows (Q ≪ n), the OOM-avoiding invariant at scale.
         let jet_len = sub.basis_second_jet_values.as_ref().unwrap().len();
-        assert_eq!(jet_len, rows.len() * p * d * d, "compact jet must be Q·p·d²");
-        assert!(rows.len() * 3 < n, "subsample Q={} must be ≪ n={n}", rows.len());
+        assert_eq!(
+            jet_len,
+            rows.len() * p * d * d,
+            "compact jet must be Q·p·d²"
+        );
+        assert!(
+            rows.len() * 3 < n,
+            "subsample Q={} must be ≪ n={n}",
+            rows.len()
+        );
         sub.refresh_intrinsic_smooth_penalty();
         let e_sub = bending_energy_of(&sub);
         assert!(e_sub > 0.0 && e_sub.is_finite());
@@ -2677,11 +2733,7 @@ mod tests {
     // `Σ_abcd g^{ac} g^{bd} ⟨II_ab, II_cd⟩`. This shares NO code with the
     // coefficient-space whitening in `try_intrinsic_bending_gram` (which never
     // forms an ambient `II` vector), so agreement is a genuine cross-check.
-    fn ambient_bending_energy(
-        dgamma: &Array3<f64>,
-        d2gamma: &Array4<f64>,
-        volume: bool,
-    ) -> f64 {
+    fn ambient_bending_energy(dgamma: &Array3<f64>, d2gamma: &Array4<f64>, volume: bool) -> f64 {
         let (n, p, d) = dgamma.dim();
         let mut total = 0.0_f64;
         for row in 0..n {
@@ -2720,11 +2772,7 @@ mod tests {
                 }
             }
             let omega = if volume {
-                if full {
-                    (0.5 * logdet).exp()
-                } else {
-                    0.0
-                }
+                if full { (0.5 * logdet).exp() } else { 0.0 }
             } else {
                 1.0
             };
@@ -2918,7 +2966,10 @@ mod tests {
 
         let e_warped = bending_energy_of(&warped);
         let e_identity = bending_energy_of(&identity);
-        assert!(e_identity > 1.0, "identity-chart energy sanity: {e_identity}");
+        assert!(
+            e_identity > 1.0,
+            "identity-chart energy sanity: {e_identity}"
+        );
         assert!(
             (e_warped - e_identity).abs() <= 1e-9 * e_identity,
             "bending energy must be chart-invariant: warped {e_warped} vs identity {e_identity}"
@@ -3021,6 +3072,9 @@ mod tests {
         let min_eig = ev.iter().cloned().fold(f64::INFINITY, f64::min);
         assert!(min_eig > -1e-10, "S̃ must be PSD; min eigenvalue {min_eig}");
         let max_eig = ev.iter().cloned().fold(0.0_f64, f64::max);
-        assert!(max_eig > 1.0, "curved atom must carry real bending: {max_eig}");
+        assert!(
+            max_eig > 1.0,
+            "curved atom must carry real bending: {max_eig}"
+        );
     }
 }

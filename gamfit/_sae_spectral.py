@@ -507,15 +507,15 @@ class DoseResponseCalibrationReport:
 
     ``slope_through_origin`` is the no-intercept weighted least-squares slope of
     measured nats on predicted output-Fisher nats and ``r2_through_origin`` its
-    weighted R²; ``mean_measured_nats_per_arc`` / ``cv_measured_nats_per_arc``
-    are the weighted mean and coefficient of variation of measured nats per unit
-    arc-length — the unit-speed constancy kill-test.
+    weighted R²; ``mean_measured_nats_per_arc_squared`` /
+    ``cv_measured_nats_per_arc_squared`` are the weighted mean and coefficient
+    of variation of measured nats per squared arc length, the local Fisher law.
     """
 
     slope_through_origin: float
     r2_through_origin: float
-    mean_measured_nats_per_arc: float
-    cv_measured_nats_per_arc: float
+    mean_measured_nats_per_arc_squared: float
+    cv_measured_nats_per_arc_squared: float
     effective_weight: float
 
 
@@ -537,8 +537,12 @@ def dose_response_calibration(
     return DoseResponseCalibrationReport(
         slope_through_origin=float(payload["slope_through_origin"]),
         r2_through_origin=float(payload["r2_through_origin"]),
-        mean_measured_nats_per_arc=float(payload["mean_measured_nats_per_arc"]),
-        cv_measured_nats_per_arc=float(payload["cv_measured_nats_per_arc"]),
+        mean_measured_nats_per_arc_squared=float(
+            payload["mean_measured_nats_per_arc_squared"]
+        ),
+        cv_measured_nats_per_arc_squared=float(
+            payload["cv_measured_nats_per_arc_squared"]
+        ),
         effective_weight=float(payload["effective_weight"]),
     )
 

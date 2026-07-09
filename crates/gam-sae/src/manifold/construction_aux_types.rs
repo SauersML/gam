@@ -143,26 +143,25 @@ pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 /// is a bounded, scale-free share of the objective and needs no caller knob.
 pub(crate) const COTRAIN_RECON_WEIGHT: f64 = 0.1;
 
-/// #1154 — base co-training weight for the encoder's certifiable-coverage
-/// penalty (the fraction of (row, atom) encodes the Kantorovich certificate
-/// rejected). Scaled like [`COTRAIN_RECON_WEIGHT`].
-pub(crate) const COTRAIN_CERT_WEIGHT: f64 = 0.05;
+/// #1154 — base co-training weight for joint-solver non-convergence. Scaled like
+/// [`COTRAIN_RECON_WEIGHT`].
+pub(crate) const COTRAIN_CONVERGENCE_WEIGHT: f64 = 0.05;
 
 /// #1154 — amortized-encoder consistency of a fitted dictionary against its own
 /// fit-time target. The co-training signal of the joint amortized-encoder +
-/// REML loop: how faithfully (and how certifiably) the cheap one-mat-vec
-/// encoder inverts the dictionary the inner solve converged to.
+/// REML loop: how faithfully the cheap initializer plus joint refinement invert
+/// the dictionary the inner solve converged to.
 #[derive(Debug, Clone, Copy)]
 pub struct AmortizedEncoderConsistency {
     /// Mean per-element squared gap between the amortized reconstruction and the
     /// exact fitted reconstruction (`‖x̂_amortized − x̂_exact‖² / (n·p)`). Zero ⇒
     /// the IFT predictor reproduces the encode map exactly to first order.
     pub recon_consistency: f64,
-    /// Fraction of (row, atom) amortized encodes whose Kantorovich certificate
-    /// failed (`h > ½`) and fell back to the certified Newton encode.
-    pub uncertified_fraction: f64,
-    /// Count of uncertified (row, atom) encodes (numerator of the fraction).
-    pub n_uncertified: usize,
-    /// Total (row, atom) encodes scored (`n · K`).
+    /// Fraction of rowwise shared-residual solves that did not meet the exact
+    /// first-order stationarity tolerance.
+    pub unconverged_fraction: f64,
+    /// Count of unconverged joint row solves (numerator of the fraction).
+    pub n_unconverged: usize,
+    /// Total joint row solves scored (`n`).
     pub n_encodes: usize,
 }

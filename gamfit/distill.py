@@ -50,24 +50,121 @@ def _pad_coords(coords: Sequence[np.ndarray], atom_dims: Sequence[int]) -> np.nd
     return out
 
 
-def _flatten_targets(coords_nkd: np.ndarray, logits: np.ndarray) -> np.ndarray:
-    n_rows = coords_nkd.shape[0]
-    return np.concatenate(
-        [coords_nkd.reshape(n_rows, -1), np.asarray(logits, dtype=np.float64)],
-        axis=1,
+def _coordinate_periods(
+    model: Any,
+    atom_dims: Sequence[int],
+) -> tuple[tuple[float | None, ...], ...]:
+    """Return each fitted atom's structural chart periods."""
+    kinds = tuple(
+        str(kind).strip().lower().replace("-", "_") for kind in model._basis_kinds
     )
+    if len(kinds) != len(atom_dims):
+        raise ValueError(f"expected {len(atom_dims)} basis kinds, got {len(kinds)}")
+    result: list[tuple[float | None, ...]] = []
+    for atom, (kind, dim_value) in enumerate(zip(kinds, atom_dims)):
+        dim = int(dim_value)
+        if kind in {"periodic", "periodic_spline", "circle", "torus"}:
+            periods: tuple[float | None, ...] = (1.0,) * dim
+        elif kind == "cylinder":
+            if dim != 2:
+                raise ValueError(
+                    f"cylinder atom {atom} must have latent dimension 2; got {dim}"
+                )
+            periods = (1.0, None)
+        elif kind == "sphere":
+            if dim != 2:
+                raise ValueError(
+                    f"sphere atom {atom} must have latitude/longitude dimension 2; got {dim}"
+                )
+            periods = (None, float(2.0 * np.pi))
+        else:
+            periods = (None,) * dim
+        result.append(periods)
+    return tuple(result)
+
+
+def _flatten_targets(
+    coords: Sequence[np.ndarray],
+    logits: np.ndarray,
+    coord_periods: Sequence[Sequence[float | None]],
+) -> np.ndarray:
+    """Embed circular coordinates as seam-invariant ``(cos, sin)`` targets."""
+    n_rows = int(np.asarray(logits).shape[0])
+    columns: list[np.ndarray] = []
+    for atom, (block, periods) in enumerate(zip(coords, coord_periods)):
+        arr = np.asarray(block, dtype=np.float64)
+        if arr.shape != (n_rows, len(periods)):
+            raise ValueError(
+                f"coords[{atom}] must have shape {(n_rows, len(periods))}; got {arr.shape}"
+            )
+        for axis, period in enumerate(periods):
+            values = arr[:, axis : axis + 1]
+            if period is None:
+                columns.append(values)
+            else:
+                angle = values * (2.0 * np.pi / float(period))
+                columns.extend((np.cos(angle), np.sin(angle)))
+    columns.append(np.asarray(logits, dtype=np.float64))
+    return np.concatenate(columns, axis=1)
 
 
 def _split_targets(
     values: np.ndarray,
     *,
-    k_atoms: int,
-    max_dim: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    coord_width = int(k_atoms) * int(max_dim)
-    coords = values[:, :coord_width].reshape(values.shape[0], int(k_atoms), int(max_dim))
-    logits = values[:, coord_width : coord_width + int(k_atoms)]
+    atom_dims: Sequence[int],
+    coord_periods: Sequence[Sequence[float | None]],
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Invert embedded coordinate targets into canonical chart values."""
+    n_rows = int(values.shape[0])
+    offset = 0
+    coords: list[np.ndarray] = []
+    for atom, (dim_value, periods) in enumerate(zip(atom_dims, coord_periods)):
+        dim = int(dim_value)
+        if len(periods) != dim:
+            raise ValueError(f"period width mismatch for atom {atom}: {len(periods)} != {dim}")
+        block = np.zeros((n_rows, dim), dtype=np.float64)
+        for axis, period in enumerate(periods):
+            if period is None:
+                block[:, axis] = values[:, offset]
+                offset += 1
+            else:
+                angle = np.arctan2(values[:, offset + 1], values[:, offset])
+                block[:, axis] = np.mod(
+                    angle * (float(period) / (2.0 * np.pi)), float(period)
+                )
+                offset += 2
+        coords.append(block)
+    k_atoms = len(atom_dims)
+    logits = values[:, offset : offset + k_atoms]
+    if logits.shape[1] != k_atoms or offset + k_atoms != values.shape[1]:
+        raise ValueError("distilled target layout does not match atom dimensions and periods")
     return coords, logits
+
+
+def _coordinate_linf(
+    predicted: Sequence[np.ndarray],
+    exact: Sequence[np.ndarray],
+    coord_periods: Sequence[Sequence[float | None]],
+) -> np.ndarray:
+    """Per-row maximum coordinate error, using short arcs on periodic axes."""
+    if len(predicted) != len(exact) or len(predicted) != len(coord_periods):
+        raise ValueError("coordinate block count mismatch")
+    n_rows = int(np.asarray(predicted[0]).shape[0])
+    out = np.zeros(n_rows, dtype=np.float64)
+    for atom, (pred_block, exact_block, periods) in enumerate(
+        zip(predicted, exact, coord_periods)
+    ):
+        pred = np.asarray(pred_block, dtype=np.float64)
+        truth = np.asarray(exact_block, dtype=np.float64)
+        if pred.shape != truth.shape or pred.shape != (n_rows, len(periods)):
+            raise ValueError(f"coordinate shape mismatch for atom {atom}")
+        for axis, period in enumerate(periods):
+            err = np.abs(pred[:, axis] - truth[:, axis])
+            if period is not None:
+                err = np.mod(err, float(period))
+                err = np.minimum(err, float(period) - err)
+            out = np.maximum(out, err)
+    return out
 
 
 def _scale(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -156,6 +253,7 @@ class DistilledEncoder:
     y_mean: np.ndarray
     y_scale: np.ndarray
     atom_dims: tuple[int, ...]
+    coord_periods: tuple[tuple[float | None, ...], ...]
     assignment: str
     tau: float
     alpha: float
@@ -191,11 +289,12 @@ class DistilledEncoder:
             tensor = torch.as_tensor(x_std, dtype=dtype, device=device)
             pred_std = self.module(tensor).detach().cpu().numpy()
         pred = pred_std * self.y_scale.reshape(1, -1) + self.y_mean.reshape(1, -1)
-        coords_nkd, logits = _split_targets(
+        coord_blocks, logits = _split_targets(
             pred,
-            k_atoms=self.k_atoms,
-            max_dim=self.max_dim,
+            atom_dims=self.atom_dims,
+            coord_periods=self.coord_periods,
         )
+        coords_nkd = _pad_coords(coord_blocks, self.atom_dims)
         coords_knm = np.transpose(coords_nkd, (1, 0, 2))
         return np.ascontiguousarray(coords_knm), np.ascontiguousarray(logits)
 
@@ -257,13 +356,14 @@ def distill_encoder(
         )
     exact = model.converged_latents(x)
     atom_dims = tuple(int(dim) for dim in model._atom_dims)
-    coords_nkd = _pad_coords(exact["coords"], atom_dims)
+    coord_periods = _coordinate_periods(model, atom_dims)
+    exact_coords = [np.asarray(block, dtype=np.float64) for block in exact["coords"]]
     logits = np.asarray(exact["logits"], dtype=np.float64)
     if logits.shape != (x.shape[0], len(atom_dims)):
         raise ValueError(
             f"teacher logits must have shape {(x.shape[0], len(atom_dims))}; got {logits.shape}"
         )
-    y = _flatten_targets(coords_nkd, logits)
+    y = _flatten_targets(exact_coords, logits, coord_periods)
     x_mean, x_scale = _scale(x)
     y_mean, y_scale = _scale(y)
     x_std = (x - x_mean.reshape(1, -1)) / x_scale.reshape(1, -1)
@@ -320,8 +420,8 @@ def distill_encoder(
     pred = pred_std * y_scale.reshape(1, -1) + y_mean.reshape(1, -1)
     pred_coords, pred_logits = _split_targets(
         pred,
-        k_atoms=len(atom_dims),
-        max_dim=max(atom_dims),
+        atom_dims=atom_dims,
+        coord_periods=coord_periods,
     )
     pred_assign = _activation_from_logits(
         pred_logits,
@@ -331,7 +431,7 @@ def distill_encoder(
         jumprelu_threshold=float(model.jumprelu_threshold),
     )
     exact_assign = np.asarray(exact["assignments"], dtype=np.float64)
-    coord_err = np.max(np.abs(pred_coords - coords_nkd), axis=(1, 2))
+    coord_err = _coordinate_linf(pred_coords, exact_coords, coord_periods)
     assign_err = np.max(np.abs(pred_assign - exact_assign), axis=1)
     calibration_idx = val_idx if val_idx.size else train_idx
     coord_tol = float(np.max(coord_err[calibration_idx]) * float(tolerance_multiplier))
@@ -353,6 +453,7 @@ def distill_encoder(
         y_mean=y_mean,
         y_scale=y_scale,
         atom_dims=atom_dims,
+        coord_periods=coord_periods,
         assignment=str(model.assignment),
         tau=float(model.tau),
         alpha=float(model.alpha),
@@ -391,13 +492,16 @@ def encode_with_fallback(
     # the gate measuring the encoder against the same fixed solve everywhere.
     exact_payload = model._oos_payload(x)
     exact_assign = np.asarray(exact_payload["assignments_z"], dtype=np.float64)
-    exact_coords = _pad_coords(
-        [np.asarray(atom["on_atom_coords_t"], dtype=np.float64) for atom in exact_payload["atoms"]],
-        encoder.atom_dims,
-    )
-    pred_coords_nkd = np.transpose(t_init, (1, 0, 2))
+    exact_coords = [
+        np.asarray(atom["on_atom_coords_t"], dtype=np.float64)
+        for atom in exact_payload["atoms"]
+    ]
+    pred_coords = [
+        np.asarray(t_init[atom, :, :dim], dtype=np.float64)
+        for atom, dim in enumerate(encoder.atom_dims)
+    ]
     assign_err = np.max(np.abs(fast_assign - exact_assign), axis=1)
-    coord_err = np.max(np.abs(pred_coords_nkd - exact_coords), axis=(1, 2))
+    coord_err = _coordinate_linf(pred_coords, exact_coords, encoder.coord_periods)
     accepted = (assign_err <= encoder.assignment_tolerance) & (
         coord_err <= encoder.coord_tolerance
     )

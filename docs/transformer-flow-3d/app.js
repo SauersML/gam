@@ -294,11 +294,11 @@ function createModule(layer, position) {
   preAttentionNorm.rotation.x = Math.PI / 2;
   preAttentionNorm.position.set(0, -0.88, 0.03);
   addModulePart(group, preAttentionNorm, layer, position, makeInfo(
-    "Pre-attention normalization",
+    "Pre-attention RMSNorm",
     location,
-    "z = LN(x)",
+    "z = RMSNorm(x)",
     "Attention projections read a <em>normalized state.</em>",
-    "In the pre-norm architecture shown here, normalization is inside the residual branch. Q, K, and V are projected from z = LN(x), while the unnormalized x continues along the residual bypass.",
+    "Modern decoders normalize inside the residual branch with RMSNorm: divide by the root-mean-square, rescale with learned gains — no mean subtraction, no bias. Q, K, and V are projected from z while the raw x continues along the bypass.",
     "#aab5c7",
   ));
 
@@ -308,7 +308,7 @@ function createModule(layer, position) {
     location,
     "NORMALIZED RESIDUAL READ",
     "This branch projects state into <em>keys and values.</em>",
-    "A pre-norm decoder reads LN(x) to form Q, K, and V. The key and value for this position are then available to causal attention queries at the same layer and this or later positions.",
+    "The normalized state is multiplied by W_K and W_V, and RoPE rotates the key by angles set by this position's index. The resulting pair is what queries at this and later positions read at this layer.",
     "#a78bfa",
   ));
 
@@ -323,7 +323,7 @@ function createModule(layer, position) {
     location,
     "K AND V VECTORS",
     "This position becomes an <em>addressable memory.</em>",
-    "K encodes how a later query can match this position; V encodes the content returned after that match. Each head uses smaller head-width vectors, while all heads together are typically comparable to the model width.",
+    "K encodes how a later query can match this position; V encodes what is delivered after the match. With grouped-query attention there are only a few K/V heads, each shared by a group of query heads — and during generation this pair is computed once and kept in the KV cache.",
     "#a78bfa",
   ));
 
@@ -352,9 +352,9 @@ function createModule(layer, position) {
   addModulePart(group, queryStem, layer, position, makeInfo(
     "Query projection",
     location,
-    "Q = LN(x)WQ",
+    "q = RoPE(RMSNorm(x)Wq)",
     "The current position forms a <em>query vector.</em>",
-    "Within each head, Q represents what the current position is looking for. Its dot products with allowed keys produce attention scores before masking and softmax.",
+    "Within each head, q represents what this position is looking for. RoPE rotates q and each k by position-dependent angles, so the score q·k depends on the relative offset between tokens — no position vector is ever added to the residual stream.",
     "#35d6ff",
   ));
 
@@ -370,7 +370,7 @@ function createModule(layer, position) {
     location,
     "QK MATCH · V RETRIEVAL",
     "A query turns context into a <em>weighted value read.</em>",
-    `The query at “${TOKENS[position]}” scores keys from positions 0…${position}. Softmax produces one weight distribution per head; weighted values are concatenated and output-projected into a residual-stream update.`,
+    `The query at “${TOKENS[position]}” scores keys from positions 0…${position}. Softmax gives every query head its own weight distribution; in grouped-query attention several query heads read the same shared K/V head. The weighted values are concatenated and output-projected into a residual update.`,
     "#35d6ff",
   ));
 
@@ -399,7 +399,7 @@ function createModule(layer, position) {
   addModulePart(group, addOne, layer, position, makeInfo(
     "First residual addition",
     location,
-    "x + ATTENTION(LN(x))",
+    "x + Attn(RMSNorm(x))",
     "Attention is <em>added, not substituted.</em>",
     "The incoming residual stream bypasses attention. Its state and the attention output are summed here to form the post-attention state u.",
     "#d7d5dc",
@@ -421,9 +421,9 @@ function createModule(layer, position) {
   addModulePart(group, preMlpNorm, layer, position, makeInfo(
     "Pre-MLP normalization",
     location,
-    "LN(u) READ",
+    "RMSNorm(u) READ",
     "The MLP reads a <em>normalized post-attention state.</em>",
-    "After the first residual addition forms u, a second normalization produces the MLP input. The unnormalized u remains on the residual bypass and is added back after the MLP.",
+    "After the first residual addition forms u, a second RMSNorm produces the MLP input. The unnormalized u remains on the residual bypass and is added back after the MLP.",
     "#aab5c7",
   ));
 
@@ -431,7 +431,7 @@ function createModule(layer, position) {
   addModulePart(group, mlpInput, layer, position, makeInfo(
     "Normalized MLP input",
     location,
-    "LN(u) READ",
+    "RMSNorm(u) READ",
     "The MLP reads the <em>post-attention state.</em>",
     "In this pre-norm block, the state after the first residual addition is normalized and fed into the MLP. The residual stream itself continues along the bypass.",
     "#d7d5dc",
@@ -445,11 +445,11 @@ function createModule(layer, position) {
   mlp.position.set(0, 0.88, 0.3);
   mlp.renderOrder = 3;
   addModulePart(group, mlp, layer, position, makeInfo(
-    "Position-wise MLP block",
+    "Gated MLP (SwiGLU)",
     location,
-    "NONLINEAR LOCAL TRANSFORM",
+    "PER-POSITION SwiGLU",
     "The MLP transforms the <em>current position locally.</em>",
-    "The MLP mixes features within this one position; it does not communicate across token positions. Its output is another model-width update added through a second residual connection.",
+    "The MLP mixes features within this one position only — no cross-token communication. Modern models use a gated form: an up- and a gate-projection, SiLU on the gate, an elementwise product, then a down-projection. In mixture-of-experts models a router activates a few expert MLPs per token here instead.",
     "#f34bb5",
   ));
 
@@ -478,7 +478,7 @@ function createModule(layer, position) {
   addModulePart(group, addTwo, layer, position, makeInfo(
     "Second residual addition",
     location,
-    "u + MLP(LN(u))",
+    "u + MLP(RMSNorm(u))",
     "The completed block state continues <em>upward.</em>",
     "The MLP update is added to the post-attention state u. The resulting state x at the next layer retains both bypass paths and both learned updates.",
     "#d7d5dc",
@@ -628,11 +628,11 @@ function createOutputHead() {
   moduleParts.push(output);
   outputGroup.add(output);
   tagPickable(output, makeInfo(
-    "Final norm and language-model head",
+    "Final RMSNorm and language-model head",
     `Final state at position t · “${TOKENS[position]}”`,
     "RESIDUAL STATE → VOCABULARY LOGITS",
     "The last input position produces the <em>next-token distribution.</em>",
-    "A final normalization and unembedding map the final residual state to one logit per vocabulary token. During training the same head can be applied at every input position; generation reads the last position shown here.",
+    "A final RMSNorm and the unembedding matrix map the last residual state to one logit per vocabulary token; softmax and a sampling rule pick the next token. During training the head is applied at every position in parallel; generation reads only the last position shown here.",
     "#f2e7c9",
   ));
 
