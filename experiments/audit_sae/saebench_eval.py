@@ -59,14 +59,18 @@ _REQUIRED_GAMFIT_API = (
 
 
 def _preflight_gamfit() -> None:
+    import sys
+
+    pyver = ".".join(str(v) for v in sys.version_info[:3])
     missing = [name for name in _REQUIRED_GAMFIT_API if not hasattr(gamfit, name)]
     if missing:
         raise SystemExit(
-            f"[saebench_eval] installed gamfit {getattr(gamfit, '__version__', '?')} at "
-            f"{os.path.dirname(gamfit.__file__)} is missing required metric entry point(s): "
-            f"{', '.join(missing)}. Upgrade the venv wheel to a build that exposes the #1942 "
-            f"SAEBench scorers (>= the commit that landed gamfit.chart_interp_score / "
-            f"dose_response_calibration / audit_sae) before submitting this job."
+            f"[saebench_eval] python {pyver} ({sys.executable}); installed gamfit "
+            f"{getattr(gamfit, '__version__', '?')} at {os.path.dirname(gamfit.__file__)} is "
+            f"missing required metric entry point(s): {', '.join(missing)}. Upgrade the venv "
+            f"wheel to a build that exposes the #1942 SAEBench scorers (>= the commit that "
+            f"landed gamfit.chart_interp_score / dose_response_calibration / audit_sae), and "
+            f"note gamfit needs python >= 3.10 (no wheel for the MSI-node default 3.6)."
         )
 
 

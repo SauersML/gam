@@ -64,7 +64,8 @@ fi
 # binding the driver calls (node1/node2 have no GitHub — the wheel is deployed
 # out of band and can lag).
 PREFLIGHT="$PY -c \"import os,sys,gamfit; m=[n for n in ('chart_interp_score','dose_response_calibration','audit_sae') if not hasattr(gamfit,n)]; sys.exit('gamfit '+getattr(gamfit,'__version__','?')+' at '+os.path.dirname(gamfit.__file__)+' missing '+repr(m)+'; redeploy the wheel with the #1942 SAEBench scorers') if m else print('preflight OK')\""
-CMD="mkdir -p $OUT_DIR && unset RUSTFLAGS && $PREFLIGHT && $PY -u $DRIVER $ARGS"
+echo "=== python: $($PY -V 2>&1)  ($PY) ==="
+CMD="mkdir -p $OUT_DIR && unset RUSTFLAGS && $PY -V && $PREFLIGHT && $PY -u $DRIVER $ARGS"
 echo "=== heimdall submit ($NODE, ${GPUS}gpu ${VRAM}GB): $CMD ==="
 heimdall submit "$CMD" \
   --type custom --gpus "$GPUS" --vram "$VRAM" --node "$NODE" \

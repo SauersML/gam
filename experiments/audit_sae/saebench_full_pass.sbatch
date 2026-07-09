@@ -69,18 +69,27 @@ SAEBENCH_HOOK_LAYER=${SAEBENCH_HOOK_LAYER:-12}
 SAEBENCH_DEVICE=${SAEBENCH_DEVICE:-cuda}
 SAEBENCH_DTYPE=${SAEBENCH_DTYPE:-bfloat16}
 
-# Job-pinned fresh venv — never trust a shared venv's wheel version.
-VENV=${VENV:-$R/venv_saebench_${SLURM_JOB_ID:-manual}}
-python3 -m venv "$VENV"
+# Use the EXISTING working venv — do NOT build a fresh venv from the node's
+# system python: that is Python 3.6 on the MSI compute nodes, for which no gamfit
+# (or modern torch) wheel exists ("No matching distribution for gamfit"). saevenv
+# is the proven frontier venv (modern python + torch + matplotlib) the #1026 jobs
+# use; we only pin the gamfit wheel on top of it.
+VENV=${VENV:-$R/saevenv}
+test -f "$VENV/bin/activate" || { echo "FATAL: no venv at $VENV (set VENV=)"; exit 2; }
 source "$VENV/bin/activate"
-python -m pip install --upgrade pip >/dev/null
-python -m pip install --no-cache-dir "gamfit==$GAMFIT_VERSION" numpy scikit-learn safetensors
-# torch + sae_bench are only needed for the public suite; install them but let
-# the driver skip that arm gracefully if the datasets/model are absent.
-python -m pip install --no-cache-dir torch sae_bench transformers accelerate || \
-  echo "WARN: sae_bench/torch install failed — public suite will report skipped"
+echo "=== python $(python -V 2>&1)  ($(command -v python))  node=$(hostname)  $(date) ==="
+# Guard against a stale/3.6 interpreter slipping through (belt-and-suspenders with
+# the gamfit-availability preflight below).
+python -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)' || {
+  echo "FATAL: $VENV python $(python -V 2>&1) is too old for the gamfit wheel (need >= 3.10)"; exit 2; }
+python -m pip install --no-cache-dir --upgrade "gamfit==$GAMFIT_VERSION" >/dev/null
+python -m pip install --no-cache-dir numpy scikit-learn safetensors >/dev/null
+# sae_bench is only needed for the public suite; saevenv already carries torch, so
+# do NOT reinstall/upgrade torch here (would risk clobbering the working GPU build).
+python -m pip install --no-cache-dir sae_bench transformers accelerate || \
+  echo "WARN: sae_bench install failed — public suite will report skipped"
 
-echo "=== gamfit $(python -c 'import gamfit;print(getattr(gamfit,"__version__","?"))')  node=$(hostname)  $(date) ==="
+echo "=== gamfit $(python -c 'import gamfit;print(getattr(gamfit,"__version__","?"))')  ==="
 
 # Deploy-skew preflight: fail the job at submission-time BEFORE any model load if
 # the installed wheel lacks a #1942 metric binding the driver calls.
@@ -114,6 +123,5 @@ rc=$?
 echo "=== rc=$rc DONE $(date) ==="
 echo "=== report: $OUT_DIR/saebench_1942_report.json ==="
 [ -f "$OUT_DIR/saebench_1942_report.json" ] && cat "$OUT_DIR/saebench_1942_report.json"
-# Leave the venv on failure for debugging.
-[ "$rc" -eq 0 ] && rm -rf "$VENV"
+# NB: $VENV is the SHARED saevenv — never rm it.
 exit $rc
