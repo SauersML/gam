@@ -689,6 +689,16 @@ pub struct SaeManifoldAtom {
     /// reduced frame at the emission boundary so it never leaks. `None` ⇒ the
     /// atom was never reduced and the stored decoder is already full-width.
     pub reduced_column_map: Option<Array2<f64>>,
+    /// #F3 — the fitted per-axis ARD precision `α_a = exp(log_ard[k][a])` of the
+    /// latent coordinate prior, length `latent_dim`. Stamped from the TERMINAL
+    /// `rho.log_ard[k]` when the term finalizes each atom (alongside the other
+    /// terminal-rho state), so the certified encode can add the SAME ARD /
+    /// von-Mises coordinate prior the fit optimized `t` against
+    /// ([`crate::encode::EncodeObjective`] `prior_alpha`) rather than certifying a
+    /// prior-free objective. `None` ⇒ no coordinate prior was fitted for this atom
+    /// (`rho.log_ard[k]` empty), in which case the encode objective is prior-free
+    /// exactly as before.
+    pub ard_precisions: Option<Array1<f64>>,
 }
 
 /// Quadrature-subsample cap for the `d ≥ 2` bending Gram: above this many active
@@ -763,6 +773,9 @@ impl SaeManifoldAtom {
             // Set only by `reduce_basis_to_subspace`; a freshly-built atom is
             // full-width (its decoder is already the un-reduced `M × p` block).
             reduced_column_map: None,
+            // Stamped from the terminal `rho.log_ard` at fit finalization; a
+            // freshly-built atom carries no fitted coordinate prior yet.
+            ard_precisions: None,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the

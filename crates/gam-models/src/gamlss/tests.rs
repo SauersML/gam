@@ -5528,77 +5528,26 @@ pub(crate) fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
         psi_terms.hessian_psi[[0, 0]],
         h_mu_mu_psi
     );
-    // The (μ, log-σ) cross block of the analytic coefficient Hessian uses
-    // Fisher information `E[H_{μ,ls}] = 2κ·E[m] = 0` (`hmu_ls[i] = 0` in
-    // `gaussian_joint_psi_firstweights`; #684), so its ψ-derivative is
-    // identically 0. The AD reference is the observed `∂³N/∂β_μ∂β_ls∂ψ`,
-    // which carries the observed contribution `Σ_i X_μ_i · (2 m_i κ_i)·
-    // X_ls,i(ψ)`. Subtracting that observed ψ-drift puts the AD reference
-    // back on the same Fisher footing as the analytic block. Per-row,
-    // `∂(2mκ)/∂η_ls = -2 m·P` with `P = 2κ² − κ'` (from `dm/dη_ls = -2κm`
-    // and `dκ/dη_ls = κ'`), and `dX_ls/dψ = x_ls_psi`, so the chain rule
-    // gives `∂(observed cross)/∂ψ = Σ_i X_μ_i·[-2 m P·z_ls_psi·X_ls,i
-    // + 2 m κ·x_ls_psi,i]` with `z_ls_psi = X_ls_psi·β_ls`.
-    let rows_gap =
-        gaussian_jointrow_scalars(&y, &(&x_mu0 * beta_mu0), &(&x_ls0 * beta_ls0), &weights)
-            .expect("gaussian row scalars for psi corrections");
-    let mu_ls_psi_correction: f64 = (0..y.len())
-        .map(|i| {
-            let m = rows_gap.m[i];
-            let k = rows_gap.kappa[i];
-            let kp = rows_gap.kappa_prime[i];
-            let p = 2.0 * k * k - kp;
-            let xm = x_mu0[i];
-            let xl = x_ls0[i];
-            let xp = x_ls_psi[i];
-            let z_ls_psi = xp * beta_ls0;
-            // Fisher − observed = 0 − ∂(2mκ·X_ls)/∂ψ at ψ=0
-            xm * (2.0 * m * p * z_ls_psi * xl - 2.0 * m * k * xp)
-        })
-        .sum();
+    // OBSERVED curvature contract (#1561 cutover from block-Fisher #566/#684):
+    // the analytic psi Hessian is now the OBSERVED joint penalized Hessian at
+    // every block, so the (μ, log-σ) cross block ψ-derivative equals the AD
+    // reference `∂³N/∂β_μ∂β_ls∂ψ` directly — no Fisher correction. (Previously
+    // the cross block was Fisher 0, requiring a `−∂(2mκ·X_ls)/∂ψ` correction;
+    // the observed production now carries that term itself.)
     assert!(
-        (psi_terms.hessian_psi[[0, 1]] - (h_mu_ls_psi + mu_ls_psi_correction)).abs() <= 1e-9,
-        "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} reference={} (ad={} + Fisher correction={})",
+        (psi_terms.hessian_psi[[0, 1]] - h_mu_ls_psi).abs() <= 1e-9,
+        "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} observed-AD={}",
         psi_terms.hessian_psi[[0, 1]],
-        h_mu_ls_psi + mu_ls_psi_correction,
-        h_mu_ls_psi,
-        mu_ls_psi_correction
+        h_mu_ls_psi
     );
-    // The (ls,ls) coefficient-Hessian block uses the Fisher curvature
-    // `2κ²a` (#566), so its ψ-derivative `hessian_psi[[1,1]]` is the Fisher
-    // ψ-drift, while the AD reference `∂³N/∂β_ls²∂ψ` is the observed drift.
-    // They differ by the ψ-derivative of the Fisher−observed coefficient
-    // gap `H^gap_lsls(ψ) = Σ_i Δ_i(η_ls(ψ))·X_ls,i(ψ)²` with
-    // `Δ = (a−n)·P`, `P = 2κ² − κ'`, `P' = 4κκ' − κ''`,
-    // `∂Δ/∂η_ls = 2κn·P + (a−n)P'`. With `dη_ls/dψ = X_ls_psi·β_ls` and
-    // `dX_ls/dψ = x_ls_psi` (the ψ-drift of the log-σ design), product rule
-    // gives the per-row correction below. The η-drift is the code's own
-    // `z_ls_psi = X_ls_psi·β_ls` (the η_ls induced by the design ψ-drift)
-    // and the design drift is `dX_ls/dψ = x_ls_psi`. η_μ is ψ-independent.
-    let ls_ls_psi_correction: f64 = (0..y.len())
-        .map(|i| {
-            let a = rows_gap.obs_weight[i];
-            let n = rows_gap.n[i];
-            let k = rows_gap.kappa[i];
-            let kp = rows_gap.kappa_prime[i];
-            let kdp = rows_gap.kappa_dprime[i];
-            let p = 2.0 * k * k - kp;
-            let p1 = 4.0 * k * kp - kdp;
-            let delta = (a - n) * p;
-            let ddelta_deta = 2.0 * k * n * p + (a - n) * p1;
-            let x0 = x_ls0[i];
-            let xp = x_ls_psi[i];
-            let z_ls_psi = xp * beta_ls0; // dη_ls/dψ = X_ls_psi·β_ls
-            ddelta_deta * z_ls_psi * x0 * x0 + delta * 2.0 * x0 * xp
-        })
-        .sum();
+    // OBSERVED (ls,ls) block: `hessian_psi[[1,1]]` is now the ψ-derivative of the
+    // observed curvature `κ'(a−n)+2κ²n`, equal to the AD `∂³N/∂β_ls²∂ψ` with no
+    // Fisher gap correction.
     assert!(
-        (psi_terms.hessian_psi[[1, 1]] - (h_ls_ls_psi + ls_ls_psi_correction)).abs() <= 1e-9,
-        "Gaussian log-sigma psi hessian(ls,ls) mismatch: analytic={} reference={} (ad={} + Fisher correction={})",
+        (psi_terms.hessian_psi[[1, 1]] - h_ls_ls_psi).abs() <= 1e-9,
+        "Gaussian log-sigma psi hessian(ls,ls) mismatch: analytic={} observed-AD={}",
         psi_terms.hessian_psi[[1, 1]],
-        h_ls_ls_psi + ls_ls_psi_correction,
-        h_ls_ls_psi,
-        ls_ls_psi_correction
+        h_ls_ls_psi
     );
 }
 
@@ -5910,64 +5859,21 @@ pub(crate) fn gaussian_joint_static_hessian_matches_autodiff() {
         }
     }
 
-    // Both the (log-σ, log-σ) and (μ, log-σ) blocks ship the Fisher/expected
-    // information by deliberate design (#566 / #684): the score stays the
-    // exact observed gradient so the joint Newton lands on the true MLE, but
-    // the curvature feeding the REML log-determinant / EDF is the
-    // expectation, exactly as gamlss/mgcv `gaulss` Fisher-scores the scale
-    // channel and as `gaussian_joint_psi_firstweights` already pins
-    // (`hmu_ls = 0`, `h_ls_ls = 2κ²a`). The AD reference computes the
-    // observed Hessian, so on each Fisher-replaced block the analytic value
-    // differs from AD by the per-row amount `fisher − observed`. We add
-    // those exact, separately derived corrections to the AD observed
-    // Hessian so the comparison both
-    //   (a) validates the AD machinery against the analytic mean blocks,
-    //   (b) pins each analytic Fisher block to its closed form via a
-    //       non-circular `observed + (Fisher − observed)` reference.
-    let mut reference = ad.clone();
-    let fisher_minus_observed_ls_ls: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
-        let a = rows.obs_weight[i];
-        let n = rows.n[i];
-        let k = rows.kappa[i];
-        let kp = rows.kappa_prime[i];
-        let fisher = 2.0 * k * k * a;
-        let observed = 2.0 * k * k * n + kp * (a - n);
-        fisher - observed
-    });
-    let ls_correction = x_ls
-        .t()
-        .dot(&Array2::from_diag(&fisher_minus_observed_ls_ls).dot(&x_ls));
-    for a in 0..p_ls {
-        for b in 0..p_ls {
-            reference[[pmu + a, pmu + b]] += ls_correction[[a, b]];
-        }
-    }
-    // (μ, log-σ) cross block: observed ∂²ℓ/∂η_μ∂η_ls = 2 m κ (zero in
-    // expectation since E[m] = 0 under correct model), Fisher = 0.
-    // Correction = fisher − observed = −2 m κ.
-    let fisher_minus_observed_mu_ls: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
-        let m = rows.m[i];
-        let k = rows.kappa[i];
-        -2.0 * m * k
-    });
-    let mu_ls_correction = xmu
-        .t()
-        .dot(&Array2::from_diag(&fisher_minus_observed_mu_ls).dot(&x_ls));
-    for a in 0..pmu {
-        for b in 0..p_ls {
-            reference[[a, pmu + b]] += mu_ls_correction[[a, b]];
-            reference[[pmu + b, a]] += mu_ls_correction[[a, b]];
-        }
-    }
-
+    // OBSERVED curvature contract (#1561 cutover from block-Fisher #566/#684):
+    // the analytic joint Hessian is now the OBSERVED penalized Hessian at every
+    // block (`gaussian_joint_psi_firstweights` ships `hmu_ls = 2κm`,
+    // `h_ls_ls = κ'(a−n)+2κ²n`), exactly what the AD ground truth differentiates.
+    // The score stays the exact observed gradient (joint Newton still lands on
+    // the true MLE), and the observed curvature is the LAML determinant/EDF
+    // object per Wood–Pya–Säfken 2016. So the analytic Hessian equals the AD
+    // Hessian on every block directly — no `Fisher − observed` correction.
     for i in 0..total {
         for j in 0..total {
-            let diff = (analytic[[i, j]] - reference[[i, j]]).abs();
+            let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
             assert!(
                 diff <= 1e-10,
-                "Gaussian static joint H[{i},{j}] mismatch (κ < 1 case): analytic={} reference={} (ad={}) diff={}",
+                "Gaussian static joint H[{i},{j}] mismatch (κ < 1 case): analytic={} observed-AD={} diff={}",
                 analytic[[i, j]],
-                reference[[i, j]],
                 ad[[i, j]],
                 diff
             );
@@ -6045,43 +5951,19 @@ pub(crate) fn gaussian_joint_first_directional_hessian_matches_autodiff() {
         }
     }
 
-    // (ls,ls) is the Fisher curvature `2κ²a` (#566), not the observed
-    // `2κ²n + κ'(a−n)` that AD differentiates. The per-row Fisher−observed
-    // gap is `Δ = (a−n)·P` with `P = 2κ² − κ'` (η_ls only). Its directional
-    // derivative along (ξ_μ=ximu, ξ_ls=xi_ls), using ∂G/∂η_μ = 2m,
-    // ∂G/∂η_ls = 2κn (G=a−n) and P' = 4κκ' − κ'', is
-    //   dΔ = 2m·P·ξ_μ + (2κn·P + (a−n)·P')·ξ_ls.
-    // We add this to the AD observed dH so the (ls,ls) reference matches the
-    // Fisher closed form while the mean/cross blocks stay pinned to AD.
-    let mut reference = ad.clone();
-    let d_fisher_minus_observed: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
-        let a = rows.obs_weight[i];
-        let n = rows.n[i];
-        let m = rows.m[i];
-        let k = rows.kappa[i];
-        let kp = rows.kappa_prime[i];
-        let kdp = rows.kappa_dprime[i];
-        let p = 2.0 * k * k - kp;
-        let p1 = 4.0 * k * kp - kdp;
-        2.0 * m * p * ximu[i] + (2.0 * k * n * p + (a - n) * p1) * xi_ls[i]
-    });
-    let ls_correction = x_ls
-        .t()
-        .dot(&Array2::from_diag(&d_fisher_minus_observed).dot(&x_ls));
-    for a in 0..p_ls {
-        for b in 0..p_ls {
-            reference[[pmu + a, pmu + b]] += ls_correction[[a, b]];
-        }
-    }
-
+    // OBSERVED curvature contract (#1561): `gaussian_joint_first_directionalweights`
+    // returns the directional derivative of the OBSERVED joint Hessian at every
+    // block — the (ls,ls) drift differentiates `κ'(a−n)+2κ²n` and the cross
+    // drift `2κm`, exactly what the AD `∂³N` differentiates. So the analytic
+    // first-directional dH equals the AD dH on every block directly, with no
+    // `Fisher − observed` gap correction.
     for i in 0..total {
         for j in 0..total {
-            let diff = (analytic[[i, j]] - reference[[i, j]]).abs();
+            let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
             assert!(
                 diff <= 1e-10,
-                "Gaussian dH (first-directional) [{i},{j}] mismatch: analytic={} reference={} (ad={}) diff={}",
+                "Gaussian dH (first-directional) [{i},{j}] mismatch: analytic={} observed-AD={} diff={}",
                 analytic[[i, j]],
-                reference[[i, j]],
                 ad[[i, j]],
                 diff
             );
@@ -6348,60 +6230,20 @@ pub(crate) fn gaussian_joint_second_directional_hessian_matches_autodiff() {
     // AD third partial, so we relax from 1e-10 to a value compatible with
     // the central-difference truncation (O(h²) ≈ 1e-8) and the rounding
     // floor of the AD third partial (≈ 1e-10 / h ≈ 1e-6).
-    // (ls,ls) is the Fisher curvature `2κ²a` (#566); AD differentiates the
-    // observed `2κ²n + κ'(a−n)`. The second-directional correction is the
-    // η-Hessian of the Fisher−observed gap `Δ = (a−n)·P`, `P = 2κ² − κ'`
-    // (η_ls only), contracted with the two η-directions. Writing G = a−n
-    // (G' = ∂_η_ls G = 2κn, G'' = 2n(κ'−2κ²), ∂_η_μ G = 2m, ∂²_η_μ G = −2w,
-    // ∂²_{η_μ,η_ls} G = −4κm), P' = 4κκ' − κ'',
-    // P'' = 6κ'² + κ''(6κ − 1) (using κ''' = κ''(1−2κ) − 2κ'²):
-    //   Δ_{μμ}  = −2w·P
-    //   Δ_{μls} = 2m(P' − 2κP)
-    //   Δ_{lsls}= G''·P + 2G'·P' + G·P''
-    // Both η-directions are linear in β (no curvature term), so the
-    // second directional derivative is the bilinear contraction below. We
-    // add it to the AD observed d²H (ls,ls) block to form the Fisher
-    // reference while the mean/cross blocks stay pinned to AD.
-    let mut reference = ad.clone();
-    let d2_fisher_minus_observed: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
-        let a = rows.obs_weight[i];
-        let n = rows.n[i];
-        let m = rows.m[i];
-        let w = rows.w[i];
-        let k = rows.kappa[i];
-        let kp = rows.kappa_prime[i];
-        let kdp = rows.kappa_dprime[i];
-        let g = a - n;
-        let p = 2.0 * k * k - kp;
-        let p1 = 4.0 * k * kp - kdp;
-        let p2 = 6.0 * kp * kp + kdp * (6.0 * k - 1.0);
-        let g1 = 2.0 * k * n;
-        let g2 = 2.0 * n * (kp - 2.0 * k * k);
-        let d_mumu = -2.0 * w * p;
-        let d_muls = 2.0 * m * (p1 - 2.0 * k * p);
-        let d_lsls = g2 * p + 2.0 * g1 * p1 + g * p2;
-        d_mumu * ximu_u[i] * ximuv[i]
-            + d_muls * (ximu_u[i] * xi_lsv[i] + xi_ls_u[i] * ximuv[i])
-            + d_lsls * xi_ls_u[i] * xi_lsv[i]
-    });
-    let ls_correction = x_ls
-        .t()
-        .dot(&Array2::from_diag(&d2_fisher_minus_observed).dot(&x_ls));
-    for a in 0..p_ls {
-        for b in 0..p_ls {
-            reference[[pmu + a, pmu + b]] += ls_correction[[a, b]];
-        }
-    }
-
+    // OBSERVED curvature contract (#1561): `gaussian_jointsecond_directionalweights`
+    // returns the second directional derivative of the OBSERVED joint Hessian at
+    // every block (the (ls,ls) second drift differentiates `κ'(a−n)+2κ²n`, the
+    // cross `2κm`), exactly what the AD `∂⁴N` ground truth differentiates. So the
+    // analytic d²H equals the AD d²H on every block directly, with no
+    // `Fisher − observed` gap correction.
     let tol = 5e-6;
     for i in 0..total {
         for j in 0..total {
-            let diff = (analytic[[i, j]] - reference[[i, j]]).abs();
+            let diff = (analytic[[i, j]] - ad[[i, j]]).abs();
             assert!(
                 diff <= tol,
-                "Gaussian d2H (second-directional) [{i},{j}] mismatch: analytic={} reference={} (ad={}) diff={}",
+                "Gaussian d2H (second-directional) [{i},{j}] mismatch: analytic={} observed-AD={} diff={}",
                 analytic[[i, j]],
-                reference[[i, j]],
                 ad[[i, j]],
                 diff
             );

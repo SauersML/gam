@@ -346,6 +346,35 @@ impl SaeManifoldTerm {
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<(), String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
+
+        // #F3 — stamp each atom's fitted per-axis ARD precisions from the TERMINAL
+        // rho, so the certified encode adds the SAME ARD / von-Mises coordinate
+        // prior the fit optimized `t` against (via
+        // [`crate::encode::EncodeObjective`] `prior_alpha`) rather than certifying a
+        // prior-free objective. Done here, alongside the other terminal-rho
+        // canonicalization state, so the stamped precisions cannot drift from the
+        // rho the fit converged to. Uses the identical `stable_exp_strength` map as
+        // the fit's `ArdAxisPrior` assembly (`α_a = exp(log_ard[k][a])`, stabilized);
+        // an atom with no fitted coordinate prior (`rho.log_ard[k]` empty) is left
+        // `None` (prior-free encode, unchanged). Guarded on the rho/atom-count
+        // invariant so a malformed rho leaves the priors untouched rather than
+        // panicking during finalization.
+        if rho.log_ard.len() == self.k_atoms() {
+            for atom_idx in 0..self.k_atoms() {
+                let log_ard = &rho.log_ard[atom_idx];
+                self.atoms[atom_idx].ard_precisions = if log_ard.is_empty() {
+                    None
+                } else {
+                    Some(
+                        log_ard
+                            .iter()
+                            .map(|&la| SaeManifoldRho::stable_exp_strength(la))
+                            .collect::<Array1<f64>>(),
+                    )
+                };
+            }
+        }
+
         /// Which canonical-representative construction applies to an atom:
         /// arc length for `d = 1` (#1019 stage 1), the minimum-isometry-defect
         /// flow for `d = 2` torus atoms (#1019 stage 2), and the same flow

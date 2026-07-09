@@ -3611,52 +3611,62 @@ impl SaeManifoldTerm {
             crate::encode::AtlasConfig::default(),
         )?;
 
-        // F3 — certify against the TRUE encode objective when the installed
-        // per-row metric WHITENS THE LIKELIHOOD. The fit's reconstruction loss is
-        // then generalized least squares `½ rᵀ M_n r` (`M_n = U_n U_nᵀ`), so a bare
-        // Euclidean encode certifies the root of a DIFFERENT problem. Gate on
-        // `whitens_likelihood()`, NOT merely non-Euclidean: the gauge-only
-        // `OutputFisher`/`OutputFisherDownstream` provenances leave the data loss
-        // isotropic (whitening by them would be the #980 failure mode — silently
-        // replacing the reconstruction loss with a Fisher pullback). Only
-        // `WhitenedStructured` (estimated noise model) and `BehavioralFisher`
-        // (GLS-in-nats, elected) actually price `½ rᵀ M_n r`.
+        // F3 — certify against the TRUE encode objective whenever it departs from
+        // the bare Euclidean, prior-free field the fast path assumes: either the
+        // installed per-row metric WHITENS THE LIKELIHOOD (GLS reconstruction loss
+        // `½ rᵀ M_n r`, `M_n = U_n U_nᵀ`), or a latent ARD / von-Mises coordinate
+        // prior was fitted on `t` (`atom.ard_precisions`). In either case a bare
+        // Euclidean encode certifies the root of a DIFFERENT problem, so route every
+        // (row, atom) through the metric-and-prior-aware certified encode
+        // (`certified_encode_row_with_objective`).
         //
-        // Route every (row, atom) through the metric-aware certified encode
-        // (`certified_encode_row_with_objective`), whitening the residual and the
-        // SSE guard by the row's factor `U_n` and scaling the offline chart
-        // Lipschitz by the global bound `max_n tr(M_n) ≥ max_n ‖M_n‖` (for PSD
-        // `M_n`, `‖M_n‖ = λ_max ≤ tr(M_n)`, so the certificate stays conservatively
-        // valid). The Euclidean amortized fast path is bypassed here because its
-        // Euclidean certificate does not certify the metric objective; likelihood-
-        // whitening fits are the structured regime where correctness dominates.
-        // NOTE: the latent ARD/von-Mises prior the fit also placed on `t` lives in
-        // `rho.log_ard`, which this rho-free encode does not receive; wiring it
-        // needs the fitted precisions carried on the atom (a finalization-site
-        // write), so `prior_alpha` stays `None` here. The metric — the GLS
-        // whitening the audit flagged — is threaded.
-        if let Some(metric) = self
+        // Metric gate is `whitens_likelihood()`, NOT merely non-Euclidean: the
+        // gauge-only `OutputFisher`/`OutputFisherDownstream` provenances leave the
+        // data loss isotropic (whitening by them would be the #980 failure mode —
+        // silently replacing the reconstruction loss with a Fisher pullback). Only
+        // `WhitenedStructured` (estimated noise model) and `BehavioralFisher`
+        // (GLS-in-nats, elected) actually price `½ rᵀ M_n r`. When active the
+        // residual and SSE guard are whitened by the row factor `U_n`, and the
+        // offline chart Lipschitz is scaled by the global bound
+        // `max_n tr(M_n) ≥ max_n ‖M_n‖` (for PSD `M_n`, `‖M_n‖ = λ_max ≤ tr(M_n)`).
+        //
+        // The ARD precisions `α_a = exp(log_ard[k][a])` were stamped onto each atom
+        // from the terminal rho at finalization (`canonicalize_charts_post_fit`), so
+        // the encode adds the SAME coordinate prior gradient / Hessian / Lipschitz
+        // the fit used. The Euclidean amortized fast path is bypassed on this branch
+        // (its Euclidean certificate certifies neither the metric nor the prior
+        // objective); structured/prior fits are the regime where correctness
+        // dominates. Euclidean-metric, prior-free fits skip this branch entirely and
+        // take the amortized+certified cascade below bit-for-bit unchanged.
+        let metric = self
             .row_metric
             .as_ref()
-            .filter(|m| m.whitens_likelihood())
-        {
-            if metric.p_out() != p || metric.n_rows() != n {
-                return Err(format!(
-                    "SaeManifoldTerm::amortized_encode_target: row_metric is ({} rows, p={}) but \
-                     target is (n={n}, p={p})",
-                    metric.n_rows(),
-                    metric.p_out()
-                ));
-            }
-            let rank = metric.metric_rank();
-            // max_n tr(M_n) — a conservative upper bound on max_n ‖M_n‖ (the offline
-            // Lipschitz scale). `row_traces()` is the criterion-facing (un-floored)
-            // trace stack the metric already carries.
-            let metric_norm_bound = metric
-                .row_traces()
-                .iter()
-                .copied()
-                .fold(0.0_f64, f64::max);
+            .filter(|m| m.whitens_likelihood());
+        let prior_active = self
+            .atoms
+            .iter()
+            .any(|a| a.ard_precisions.as_ref().map_or(false, |pa| !pa.is_empty()));
+        if metric.is_some() || prior_active {
+            let (metric_rank, metric_norm_bound) = match metric {
+                Some(m) => {
+                    if m.p_out() != p || m.n_rows() != n {
+                        return Err(format!(
+                            "SaeManifoldTerm::amortized_encode_target: row_metric is ({} rows, \
+                             p={}) but target is (n={n}, p={p})",
+                            m.n_rows(),
+                            m.p_out()
+                        ));
+                    }
+                    // max_n tr(M_n) — conservative upper bound on max_n ‖M_n‖ (the
+                    // offline Lipschitz scale); `row_traces()` is the criterion-facing
+                    // (un-floored) trace stack the metric already carries.
+                    let bound = m.row_traces().iter().copied().fold(0.0_f64, f64::max);
+                    (m.metric_rank(), bound)
+                }
+                // Prior-only (Euclidean metric): identity whitening, unit Lipschitz
+                // scale — only the ARD prior departs from the Euclidean field.
+                None => (0usize, 1.0_f64),
+            };
             let mut coords: Vec<Array2<f64>> = self
                 .atoms
                 .iter()
@@ -3666,15 +3676,23 @@ impl SaeManifoldTerm {
             for row in 0..n {
                 // The row's metric factor `U_n ∈ ℝ^{p×rank}` (`factor_entry` reads the
                 // un-floored criterion-face factors), materialized once and shared
-                // across atoms (the metric is atom-independent — output-space).
-                let u_row =
-                    Array2::<f64>::from_shape_fn((p, rank), |(i, k)| metric.factor_entry(row, i, k));
-                let objective = crate::encode::EncodeObjective {
-                    metric_factor: Some(u_row.view()),
-                    prior_alpha: None,
-                    metric_norm_bound,
-                };
+                // across atoms (the metric is atom-independent — output-space). `None`
+                // when no likelihood-whitening metric is active (identity whitening).
+                let u_row = metric.map(|m| {
+                    Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| m.factor_entry(row, i, k))
+                });
                 for atom_idx in 0..k_atoms {
+                    // The atom's fitted per-axis ARD precisions (empty ⇒ prior-free).
+                    let prior_alpha = self.atoms[atom_idx]
+                        .ard_precisions
+                        .as_ref()
+                        .filter(|pa| !pa.is_empty())
+                        .and_then(|pa| pa.as_slice());
+                    let objective = crate::encode::EncodeObjective {
+                        metric_factor: u_row.as_ref().map(|u| u.view()),
+                        prior_alpha,
+                        metric_norm_bound,
+                    };
                     let (t, cert) = atlas.certified_encode_row_with_objective(
                         &self.atoms[atom_idx],
                         atom_idx,
