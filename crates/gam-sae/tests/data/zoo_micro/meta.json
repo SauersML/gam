@@ -1,0 +1,30 @@
+{
+ "generator": "bench/bsf_manifold_zoo.py ZooData(12,48,3,seed=0,curved_fraction=0.5)",
+ "kinds": [
+  "torus",
+  "segment",
+  "disk",
+  "segment",
+  "segment",
+  "swiss",
+  "segment",
+  "segment",
+  "circle",
+  "mobius",
+  "sphere",
+  "segment"
+ ],
+ "train": {
+  "n": 3000,
+  "p": 48,
+  "sample_seed": 1
+ },
+ "test": {
+  "n": 1500,
+  "p": 48,
+  "sample_seed": 2
+ },
+ "l0": 3,
+ "layout": "row-major little-endian f64",
+ "purpose": "local zoo-micro loop: fit wall-clock + train EV + held-out re-encode EV without the MSI wheel round-trip"
+}

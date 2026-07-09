@@ -382,7 +382,13 @@ def _fit_ours_rust(
     # (row re-encoding, not data novelty); re-enc(train) >> re-enc(test) is a
     # genuine generalization gap.
     native_train_r2 = _r2_of(train_x, np.asarray(fit.fitted, dtype=float))
-    train_payload = fit.converged_latents(train_x)
+    # COLD arm must run the GENUINE frozen-decoder OOS solve on the training
+    # rows. `converged_latents(train_x)` short-circuits on a bit-exact training
+    # matrix (`_is_training_data`) and returns the STORED training latents —
+    # which would make this arm vacuously equal to `native` and mislocalize the
+    # OOS collapse. Call the underlying OOS payload directly so the cold
+    # seed/routing path actually executes.
+    train_payload = fit._oos_payload(train_x, t_init=None, a_init=None)
     reenc_train_r2 = _r2_of(train_x, np.asarray(train_payload["fitted"], dtype=float))
     # Warm re-encode: seed the SAME frozen-decoder OOS solve with the training
     # fit's own converged coords/logits. Recovering the native number here
