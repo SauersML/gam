@@ -494,7 +494,11 @@ impl SaeManifoldTerm {
                 // which is the r×r quadratic form `u_cᵀ Y u_c` with
                 //   Y = Σ_{b1,b2} φ[b1] φ[b2] Cov(C)[(b1,·),(b2,·)].
                 let mut cov_c = cov_block;
-                cov_c.mapv_inplace(|v| v * dispersion);
+                // The Schur block is covariance of the optimizer's gauge
+                // representative B/C.  The reported shape is the physical
+                // exp(s_k) B, so its covariance carries exp(2 s_k).
+                let physical_cov_scale = dispersion * atom.log_amplitude.exp().powi(2);
+                cov_c.mapv_inplace(|v| v * physical_cov_scale);
                 for (gi, &row) in eval_rows.iter().enumerate() {
                     let basis = atom.basis_values.row(row);
                     for c in 0..p {
@@ -512,7 +516,8 @@ impl SaeManifoldTerm {
                 } else {
                     cov_block
                 };
-                cov.mapv_inplace(|v| v * dispersion);
+                let physical_cov_scale = dispersion * atom.log_amplitude.exp().powi(2);
+                cov.mapv_inplace(|v| v * physical_cov_scale);
                 for (gi, &row) in eval_rows.iter().enumerate() {
                     // Var_c = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]; the flat
                     // decoder index is basis·p + channel (row-major (M_k, p)).
@@ -771,7 +776,7 @@ impl SaeManifoldTerm {
                 let quad = phi_t.dot(&solved).max(0.0);
                 // Var_c(t) = φ · Φ(t)ᵀ H_k⁻¹ Φ(t) — identical across channels (the
                 // inner Hessian is shared; the decoder differs only in the mean).
-                let sd = (dispersion * quad).sqrt();
+                let sd = atom.log_amplitude.exp() * (dispersion * quad).sqrt();
                 for c in 0..p {
                     band_sd[[gi, c]] = sd;
                 }

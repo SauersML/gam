@@ -572,7 +572,12 @@ function createBlockSequence() {
   addFlowPulse(curve([[0, -0.78, 0.04], [0.17, -0.34, 0.25], [0.05, 0.02, 0.72]]), COLORS.cyan, {
     scale: 0.78,
     modes: ["block"],
-    sequence: { start: 0.31, duration: 0.18 },
+    sequence: { start: 0.05, duration: 0.15 },
+  });
+  addFlowPulse(curve([[0, -0.51, 0.62], [0.28, -0.34, 0.84], [0.08, 0.02, 0.73]]), COLORS.violetBright, {
+    scale: 0.72,
+    modes: ["block"],
+    sequence: { start: 0.2, duration: 0.27 },
   });
   addFlowPulse(curve([[0, 0.28, 0.36], [0, 0.42, 0.25], [0, 0.5, 0.04]]), COLORS.cyan, {
     scale: 0.72,
@@ -790,7 +795,7 @@ const modeCopy = {
   block: {
     index: "02 / 03",
     caption: "One layer, one position",
-    hint: "Watch K/V projection → retrieval → attention → MLP",
+    hint: "Watch Q/K/V projection → causal retrieval → attention → MLP",
     id: "BLOCK / L2·T−1",
     icon: "node",
     iconColor: "#35d6ff",
