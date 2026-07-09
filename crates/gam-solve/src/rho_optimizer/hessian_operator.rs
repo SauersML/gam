@@ -3,17 +3,17 @@ use super::*;
 // The outer Hessian operator contract lives in `gam-problem`. Re-exported here
 // while solver-private wrappers stay in `solver`.
 pub use gam_problem::{
-    DeclaredHessianForm, Derivative, OuterHessianMaterialization, OuterHessianOperator,
+    DeclaredHessianForm, Derivative, HessianMaterialization, HessianOperator,
     OuterStrategyError,
 };
 
 pub(crate) struct RhoBlockAdditiveOuterHessian {
-    pub(crate) base: Arc<dyn OuterHessianOperator>,
+    pub(crate) base: Arc<dyn HessianOperator>,
     pub(crate) rho_block: Array2<f64>,
     pub(crate) dim: usize,
 }
 
-impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
+impl HessianOperator for RhoBlockAdditiveOuterHessian {
     fn dim(&self) -> usize {
         self.dim
     }
@@ -111,7 +111,7 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
         self.base.is_cheap_to_materialize()
     }
 
-    fn materialization_capability(&self) -> OuterHessianMaterialization {
+    fn materialization_capability(&self) -> HessianMaterialization {
         self.base.materialization_capability()
     }
 }

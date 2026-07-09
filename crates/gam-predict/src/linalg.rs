@@ -1,11 +1,8 @@
 use gam_linalg::matrix::{DesignMatrix, FactorizedSystem, SymmetricMatrix};
+use gam_runtime::resource::prediction_chunk_rows;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::ops::Range;
-
-const PREDICTION_TARGET_WORK_BYTES: usize = 8 * 1024 * 1024;
-const PREDICTION_MIN_CHUNK_ROWS: usize = 16;
-const PREDICTION_MAX_CHUNK_ROWS: usize = 4096;
 
 pub enum PredictionCovarianceBackend<'a> {
     Dense(ArrayView2<'a, f64>),
@@ -120,30 +117,6 @@ pub(crate) fn design_row_chunk(
         ));
     }
     design.try_row_chunk(rows).map_err(|e| e.to_string())
-}
-
-pub(crate) fn prediction_chunk_rows(
-    parameter_dim: usize,
-    local_dim: usize,
-    n_rows: usize,
-) -> usize {
-    if n_rows == 0 {
-        return 1;
-    }
-    let bytes_per_row = parameter_dim
-        .max(1)
-        .saturating_mul(local_dim.max(1))
-        .saturating_mul(std::mem::size_of::<f64>())
-        .saturating_mul(4);
-    let target_rows = if bytes_per_row == 0 {
-        n_rows
-    } else {
-        PREDICTION_TARGET_WORK_BYTES / bytes_per_row
-    };
-    target_rows
-        .max(PREDICTION_MIN_CHUNK_ROWS)
-        .min(PREDICTION_MAX_CHUNK_ROWS)
-        .min(n_rows.max(1))
 }
 
 struct LocalCovarianceChunk {

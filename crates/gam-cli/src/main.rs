@@ -23,12 +23,16 @@ pub(crate) use gam::estimate::{
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 
+pub(crate) use gam::faer_ndarray::array2_to_nested_vec;
+
 pub(crate) use gam::families::bms::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentMeasureKind,
     LatentZPolicy,
 };
 
-pub(crate) use gam::families::survival::latent::latent_hazard_loading;
+pub(crate) use gam::families::survival::latent::{
+    fixed_latent_hazard_frailty, latent_hazard_loading,
+};
 
 pub(crate) use gam::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -123,9 +127,10 @@ pub(crate) use gam::families::survival::{
     baseline_chain_rule_gradient, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
-    marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
-    normalize_survival_time_pair, optimize_survival_baseline_config_with_gradient,
+    fitted_weibull_baseline_from_linear_time_beta, initial_survival_baseline_config_for_fit,
+    location_scale_uses_probit_survival_baseline, marginal_slope_baseline_chain_rule_gradient,
+    marginal_slope_baseline_chain_rule_hessian, normalize_survival_time_pair,
+    optimize_survival_baseline_config_with_gradient,
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,

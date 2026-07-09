@@ -55,7 +55,8 @@
 
           <div class="equation-card" aria-label="Transformer block equations">
             <span class="eyebrow">ONE PRE-NORM BLOCK</span>
-            <div><i>u</i><sub>ℓ,t</sub> = <i>x</i><sub>ℓ,t</sub> + Attn<sub>ℓ</sub>(LN(<i>x</i><sub>ℓ,t</sub>), K/V<sub>≤t</sub>)</div>
+            <div><i>z</i><sub>ℓ,≤t</sub> = LN(<i>x</i><sub>ℓ,≤t</sub>), &nbsp;Q/K/V = <i>zW</i><sub>Q/K/V</sub></div>
+            <div><i>u</i><sub>ℓ,t</sub> = <i>x</i><sub>ℓ,t</sub> + Attn<sub>ℓ</sub>(Q<sub>t</sub>, K<sub>≤t</sub>, V<sub>≤t</sub>)</div>
             <div><i>x</i><sub>ℓ+1,t</sub> = <i>u</i><sub>ℓ,t</sub> + MLP<sub>ℓ</sub>(LN(<i>u</i><sub>ℓ,t</sub>))</div>
           </div>
         </section>
@@ -97,6 +98,11 @@
               </div>
             </div>
 
+            <div class="selection-pill" id="selectionPill" aria-live="polite">
+              <i aria-hidden="true"></i>
+              <span><small>SELECTED</small><strong>Choose a component</strong></span>
+            </div>
+
             <div class="view-controls">
               <button class="round-button" id="playButton" type="button" aria-label="Pause animation" aria-pressed="true">
                 <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12M16 6v12"></path></svg>
@@ -125,12 +131,17 @@
 
             <div id="inspectorContent">
               <div class="signal-icon dual" aria-hidden="true"><span></span><span></span></div>
+              <div class="object-identity">
+                <span>WHAT THIS IS</span>
+                <strong>Causal transformer lattice</strong>
+                <small>4 token positions · 4 representative layers</small>
+              </div>
               <h2>The architecture is a <em>causal lattice.</em></h2>
-              <p>
-                Every point can inherit state from the layer below and retrieve
-                layer-matched values from positions to its left. Together these axes create
-                many distinct computational histories.
-              </p>
+              <div><p>
+                  Every point can inherit state from the layer below and retrieve
+                  layer-matched values from positions to its left. Together these axes create
+                  many distinct computational histories.
+                </p></div>
             </div>
 
             <div class="legend">

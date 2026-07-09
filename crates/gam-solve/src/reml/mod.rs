@@ -179,14 +179,14 @@ pub(crate) struct TauTauHessianPolicy {
 impl TauTauHessianPolicy {
     /// True when the τ-τ exact-Hessian path cannot be assembled at all and the
     /// eval must fall back to value-and-gradient mode (forcing
-    /// `HessianResult::Unavailable`).
+    /// `HessianValue::Unavailable`).
     ///
     /// This is the *only* remaining capability gate: the previous
     /// implementation also forced gradient-only when the design used implicit
     /// multi-dim Duchon storage or when the dense τ-cache plan would exceed
     /// the budget.  Both of those are now *cost* gates, not capability gates
     /// — the unified evaluator's `prefer_outer_hessian_operator(n, p, k)`
-    /// selects the matrix-free `HessianResult::Operator` representation in
+    /// selects the matrix-free `HessianValue::Operator` representation in
     /// exactly the regimes where the dense cache would be unaffordable, and
     /// the planner routes operator returns through `run_operator_trust_region`
     /// (or basis-probes them when `dim ≤ OUTER_HVP_MATERIALIZE_MAX_DIM`).
@@ -343,7 +343,7 @@ mod tests {
         GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
     };
     use faer::Side;
-    use gam_problem::{HessianResult, OuterEval};
+    use gam_problem::{HessianValue, OuterEval};
     use ndarray::{Array1, Array2, array, s};
     use std::sync::Arc;
 
@@ -470,7 +470,7 @@ mod tests {
         // Multi-dim Duchon implicit storage used to force gradient-only,
         // because the τ-cache materialization plan was infeasible.  The
         // unified evaluator now elects the matrix-free
-        // `HessianResult::Operator` representation in this regime via
+        // `HessianValue::Operator` representation in this regime via
         // `prefer_outer_hessian_operator`, so the planner can route to the
         // operator trust-region (or basis-probe to dense for small K) — the
         // capability is preserved and gradient-only must NOT engage.
@@ -995,7 +995,7 @@ mod tests {
         let eval = OuterEval {
             cost: 3.5,
             gradient: array![1.0, -2.0],
-            hessian: HessianResult::Unavailable,
+            hessian: HessianValue::Unavailable,
             inner_beta_hint: None,
         };
 
@@ -1006,7 +1006,7 @@ mod tests {
             .expect("first-order outer eval should be cached");
         assert_eq!(cached.cost, eval.cost);
         assert_eq!(cached.gradient, eval.gradient);
-        assert!(matches!(cached.hessian, HessianResult::Unavailable));
+        assert!(matches!(cached.hessian, HessianValue::Unavailable));
 
         cache.invalidate_eval_bundle();
         assert!(
@@ -1033,7 +1033,7 @@ mod tests {
         let make_eval = |seed: f64| OuterEval {
             cost: (seed * std::f64::consts::PI).sin() / 3.0 - seed,
             gradient: array![seed, -seed * 2.0, seed.recip()],
-            hessian: HessianResult::Unavailable,
+            hessian: HessianValue::Unavailable,
             inner_beta_hint: Some(array![seed + 0.5, seed - 0.5]),
         };
         let bits_eq = |a: &OuterEval, b: &OuterEval| -> bool {
@@ -1615,8 +1615,8 @@ mod tests {
             )
             .expect("analytic Hessian eval");
         let h = match eval.hessian {
-            HessianResult::Analytic(hessian) => hessian,
-            HessianResult::Operator(_) | HessianResult::Unavailable => {
+            HessianValue::Dense(hessian) => hessian,
+            HessianValue::Operator(_) | HessianValue::Unavailable => {
                 panic!("expected dense analytic Hessian")
             }
         };

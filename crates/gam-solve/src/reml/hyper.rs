@@ -1084,7 +1084,7 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
         order: crate::rho_optimizer::OuterEvalOrder,
-    ) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), EstimationError> {
+    ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
         let t_outer_start = std::time::Instant::now();
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
@@ -1156,7 +1156,7 @@ impl<'a> RemlState<'a> {
                 if requested_hessian && !downgrade_exact_tau_tau {
                     result.hessian
                 } else {
-                    gam_problem::HessianResult::Unavailable
+                    gam_problem::HessianValue::Unavailable
                 },
             ))
         } else {

@@ -23,6 +23,7 @@ macro_rules! impl_reason_error_boilerplate {
 }
 
 mod error;
+pub mod dense;
 pub mod faer_ndarray;
 pub mod gaussian_weighted_ridge_backward;
 pub mod gpu_hook;

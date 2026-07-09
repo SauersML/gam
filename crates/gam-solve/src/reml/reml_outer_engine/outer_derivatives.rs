@@ -14,7 +14,7 @@
 //! - [`dense`]: the dense `K × K` assembled outer Hessian
 //!   ([`compute_outer_hessian`]).
 //! - [`operator`]: the matrix-free assembled outer-Hessian operator
-//!   ([`UnifiedOuterHessianOperator`] and `build_outer_hessian_operator`).
+//!   ([`UnifiedHessianOperator`] and `build_outer_hessian_operator`).
 //!
 //! Every submodule reaches its cross-concern dependencies (and the parent
 //! `reml_outer_engine` namespace) through `use super::*;`; each item keeps the exact

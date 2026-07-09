@@ -3,7 +3,7 @@ use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use gam_optimize::{RidgeSchedule, escalate_ridge};
+use opt::{RidgeSchedule, escalate_ridge};
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1, ArrayViewMut2, Axis,
     s,

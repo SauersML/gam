@@ -68,7 +68,7 @@ pub struct ExactNewtonJointGradientEvaluation {
 pub struct BatchedOuterHessianTerms {
     /// Exact profiled outer Hessian over θ = (ρ, ψ), assembled or exposed in
     /// operator form by the family in one amortized evaluation.
-    pub outer_hessian: gam_problem::HessianResult,
+    pub outer_hessian: gam_problem::HessianValue,
 }
 
 pub struct BatchedOuterGradientTerms {
@@ -843,7 +843,7 @@ pub trait CustomFamily {
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
-                outer_hessian: gam_problem::HessianResult::Operator(operator),
+                outer_hessian: gam_problem::HessianValue::Operator(operator),
             }))
     }
 
@@ -907,10 +907,10 @@ pub trait CustomFamily {
     /// matrix-free Hv operator — using its own directional θθ kernels and
     /// trace algebra rather than the generic per-pair enumeration — it
     /// overrides this method and returns `Some(op)`.  The unified REML/LAML
-    /// evaluator wires the operator into [`HessianResult::Operator`] via
+    /// evaluator wires the operator into [`HessianValue::Operator`] via
     /// the [`HessianDerivativeProvider::family_outer_hessian_operator`] hook
     /// the family installs on its provider; consumers see a generic
-    /// `Arc<dyn OuterHessianOperator>` (matvec / dim / mul_mat /
+    /// `Arc<dyn HessianOperator>` (matvec / dim / mul_mat /
     /// is_cheap_to_materialize).
     ///
     /// Default returns `None`, leaving the family on the existing pairwise
@@ -921,7 +921,7 @@ pub trait CustomFamily {
     fn outer_hyper_hessian_operator(
         &self,
         specs: &[ParameterBlockSpec],
-    ) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn gam_problem::HessianOperator>> {
         assert_valid_blockspecs(specs, "outer hyper-Hessian operator");
         None
     }

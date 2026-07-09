@@ -32,12 +32,16 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
 }
 
 pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
-    crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
+    let frailty = crate::config_resolve::resolve_cli_frailty_spec(
+        cli_frailty_kind(args.frailty_kind),
+        args.frailty_sd,
+        cli_hazard_loading(args.hazard_loading),
+        "fit",
+    )?;
+    crate::config_resolve::resolve_fit_config(FitConfig {
         family: family_arg_canonical_name(args.family).map(str::to_string),
         expectile_tau: args.expectile_tau,
         negative_binomial_theta: args.negative_binomial_theta,
-        link: None,
-        flexible_link: false,
         offset_column: args.offset_column.clone(),
         weight_column: args.weights_column.clone(),
         noise_offset_column: args.noise_offset_column.clone(),
@@ -51,7 +55,6 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
         time_num_internal_knots: args.time_num_internal_knots,
         time_smooth_lambda: args.time_smooth_lambda,
         survival_likelihood: args.survival_likelihood.clone(),
-        survival_distribution: "gaussian".to_string(),
         threshold_time_k: args.threshold_time_k,
         threshold_time_degree: args.threshold_time_degree,
         sigma_time_k: args.sigma_time_k,
@@ -64,21 +67,20 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
         ridge_lambda: args.ridge_lambda,
         transformation_normal: args.transformation_normal,
         firth: args.firth,
-        outer_max_iter: None,
-        gpu: None,
-        frailty_kind: cli_frailty_kind(args.frailty_kind),
-        frailty_sd: args.frailty_sd,
-        hazard_loading: cli_hazard_loading(args.hazard_loading),
+        frailty,
+        ..FitConfig::default()
     })
 }
 
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
-    crate::config_resolve::resolve_cli_fit_config(crate::config_resolve::CliFitConfigInput {
-        family: None,
-        expectile_tau: None,
-        negative_binomial_theta: None,
+    let frailty = crate::config_resolve::resolve_cli_frailty_spec(
+        cli_frailty_kind(args.frailty_kind),
+        args.frailty_sd,
+        cli_hazard_loading(args.hazard_loading),
+        "survival fit",
+    )?;
+    crate::config_resolve::resolve_fit_config(FitConfig {
         link: args.link.clone(),
-        flexible_link: false,
         offset_column: args.offset_column.clone(),
         weight_column: args.weights_column.clone(),
         noise_offset_column: args.noise_offset_column.clone(),
@@ -101,15 +103,9 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         logslope_formula: args.logslope_formula.clone(),
         z_column: args.z_column.clone(),
         scale_dimensions: args.scale_dimensions,
-        adaptive_regularization: None,
         ridge_lambda: args.ridge_lambda,
-        transformation_normal: false,
-        firth: false,
-        outer_max_iter: None,
-        gpu: None,
-        frailty_kind: cli_frailty_kind(args.frailty_kind),
-        frailty_sd: args.frailty_sd,
-        hazard_loading: cli_hazard_loading(args.hazard_loading),
+        frailty,
+        ..FitConfig::default()
     })
 }
 
@@ -737,7 +733,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             // Request fields that are derived from the resolved `FitConfig` are
             // sourced from `fit_config` here exactly as `materialize_standard`
             // sources them (#1196), instead of being hardcoded to empty. The CLI
-            // arg→config resolver (`resolve_cli_fit_config`) currently leaves
+            // typed arg→config construction currently leaves
             // `coefficient_groups` / `penalty_block_gamma_priors` at their empty
             // defaults because no CLI flag sets them, so this is value-identical
             // today; routing them through `fit_config` makes the CLI request a
@@ -999,11 +995,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         match &saved_fit.fitted_link {
             FittedLinkState::Mixture { covariance, .. } => {
                 payload.mixture_link_param_covariance =
-                    covariance.as_ref().map(array2_to_nestedvec);
+                    covariance.as_ref().map(array2_to_nested_vec);
             }
             FittedLinkState::Sas { covariance, .. }
             | FittedLinkState::BetaLogistic { covariance, .. } => {
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
             }
             FittedLinkState::LatentCLogLog { .. } => {}
             FittedLinkState::Standard(_) => {}
@@ -1259,10 +1255,8 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let logslope_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
-    let frailty = fixed_gaussian_shift_frailty_from_spec(
-        &fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?,
-        "bernoulli marginal-slope",
-    )?;
+    let frailty = fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?
+        .resolve_fixed_gaussian_shift("bernoulli marginal-slope")?;
     let routed_deviations = route_marginal_slope_deviation_blocks(
         parsed.linkwiggle.as_ref(),
         parsed_logslope.linkwiggle.as_ref(),

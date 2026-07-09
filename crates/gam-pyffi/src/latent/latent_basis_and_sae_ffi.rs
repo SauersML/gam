@@ -1871,9 +1871,7 @@ fn gumbel_temperature_schedule_from_pydict(
                 None => None,
             };
             let rate = match steps {
-                Some(steps) => {
-                    ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps)
-                }
+                Some(steps) => ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps),
                 None => match schedule.get_item("rate").map_err(|err| err.to_string())? {
                     Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
                     None => 0.9,
@@ -2308,9 +2306,8 @@ fn sae_manifold_fit<'py>(
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // #1777 PER-FIT config overrides (separation-barrier strength / IBP-α). `Some`
-    // pins this term's value for THIS fit; `None` defers to the process-global
-    // atomic setter (or the compiled default). See `SaeManifoldTerm::set_fit_config`.
+    // Per-fit config (separation-barrier strength / IBP-α). `Some` pins this
+    // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
     // #2021 — count of extra whitened-residual structured-alternation passes
@@ -2973,11 +2970,9 @@ fn sae_manifold_fit_inner<'py>(
     // scales every per-row reconstruction loss before the inner joint fit and
     // outer ρ selection. Uniform / absent ⇒ the bit-identical unweighted path.
     row_loss_weights: Option<ArrayView1<'_, f64>>,
-    // #1777 PER-FIT config overrides. `Some(x)` pins this term's separation-barrier
-    // strength / IBP-α to `x` for THIS fit only (via `SaeManifoldTerm::set_fit_config`),
-    // taking precedence over the process-global atomic setters; `None` leaves the
-    // global setter (or the compiled default) in control. These are isolated per
-    // term so concurrent fits with different overrides never race a global atomic.
+    // Per-fit config. `Some(x)` pins this term's separation-barrier strength /
+    // IBP-α to `x` via `SaeManifoldTerm::set_fit_config`; `None` selects the
+    // canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
     // #2021 — number of EXTRA whitened-residual refit passes after the iid
@@ -3289,13 +3284,9 @@ fn sae_manifold_fit_inner<'py>(
             atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
         }
     }
-    // #1777 — install the PER-FIT config overrides as this term's source of truth
-    // BEFORE the joint fit / ρ selection consumes it. `set_fit_config` distributes
-    // the separation-barrier strength onto the term and the IBP-α onto the
-    // assignment; each `Some` field wins over the process-global atomic setter,
-    // while a `None` field leaves the global setter (or compiled default) in
-    // control (the global setters stay working for back-compat). Passing the
-    // default (both `None`) is a no-op that preserves the global-only behaviour.
+    // Install the per-fit config before the joint fit / ρ selection consumes it.
+    // `set_fit_config` distributes the separation-barrier strength onto the term
+    // and the IBP-α onto the assignment; `None` selects each canonical default.
     base_term.set_fit_config(gam::terms::sae::manifold::SaeFitConfig {
         separation_barrier_strength_override,
         ibp_alpha_override,
@@ -5310,9 +5301,8 @@ fn sae_manifold_fit_ibp<'py>(
         None,
         // No per-row design-honesty weights on this convenience IBP entry point.
         None,
-        // No per-fit separation-barrier / IBP-α overrides on this convenience IBP
-        // entry point (#1777): defer to the process-global setter (or the compiled
-        // default), matching how every other override above is left `None` here.
+        // No explicit separation-barrier / IBP-α values on this convenience IBP
+        // entry point: use their canonical data-derived and assignment defaults.
         None,
         None,
         // No structured-residual alternation on this convenience IBP entry point
@@ -6423,8 +6413,7 @@ fn sae_decoder_lsq_init(
                 ));
             }
             for row in 0..n_obs {
-                let weights =
-                    gam::terms::sae::manifold::topk_row(initial_logits.row(row), k_top);
+                let weights = gam::terms::sae::manifold::topk_row(initial_logits.row(row), k_top);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }

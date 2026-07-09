@@ -1,5 +1,5 @@
 use super::*;
-use gam_optimize::{RidgeSchedule, escalate_ridge};
+use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
     match link {
@@ -98,28 +98,6 @@ fn resolved_wiggle_inverse_link(
     };
     require_inverse_link_supports_joint_wiggle(&resolved, "standard link wiggle")?;
     Ok(resolved)
-}
-
-pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
-    frailty: &FrailtySpec,
-    context: &str,
-) -> Result<FrailtySpec, String> {
-    match frailty {
-        FrailtySpec::None => Ok(FrailtySpec::None),
-        FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sigma),
-        } => Ok(FrailtySpec::GaussianShift {
-            sigma_fixed: Some(*sigma),
-        }),
-        FrailtySpec::GaussianShift { sigma_fixed: None } => Err(WorkflowError::MissingDependency {
-            reason: format!("{context} currently requires a fixed GaussianShift sigma"),
-        }
-        .into()),
-        FrailtySpec::HazardMultiplier { .. } => Err(WorkflowError::MissingDependency {
-            reason: format!("{context} requires FrailtySpec::GaussianShift or no frailty"),
-        }
-        .into()),
-    }
 }
 
 /// #1788: neutralize a self-contradictory penalized-EDF report on a stalled
@@ -1334,50 +1312,6 @@ pub(crate) fn fit_binomial_location_scale_model(
     fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
 }
 
-fn survival_working_reml_score(state: &gam_solve::pirls::WorkingState) -> f64 {
-    0.5 * (state.deviance + state.penalty_term)
-}
-
-/// Recover the fitted Weibull baseline config from the anchor-CENTERED linear
-/// `[1, log t]` time-basis coefficients.
-///
-/// The fit centers the time basis at the survival time anchor
-/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
-/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
-/// stale seed). The identified baseline the model carries is
-/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
-/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
-/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
-/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
-/// saved scale, misleading every consumer that rebuilds `H0(t) = (t/scale)^shape`
-/// from the saved scale (e.g. competing-risks CIF). Recover `scale` from the
-/// identified anchor instead (issue #899).
-fn fitted_weibull_baseline_from_linear_time_beta(
-    beta: &Array1<f64>,
-    anchor: f64,
-) -> Option<crate::survival::construction::SurvivalBaselineConfig> {
-    if beta.len() < 2 {
-        return None;
-    }
-    let shape = beta[1];
-    if !shape.is_finite() || shape <= 0.0 {
-        return None;
-    }
-    if !anchor.is_finite() || anchor <= 0.0 {
-        return None;
-    }
-    let scale = anchor;
-    Some(
-        crate::survival::construction::SurvivalBaselineConfig {
-            target: SurvivalBaselineTarget::Weibull,
-            scale: Some(scale),
-            shape: Some(shape),
-            rate: None,
-            makeham: None,
-        },
-    )
-}
-
 /// Penalized effective degrees of freedom for a survival transformation fit.
 ///
 /// Uses exactly the mgcv definition `edf_total = p − Σ_k λ_k·tr(H⁻¹ S_k)`, where
@@ -1528,7 +1462,7 @@ fn optimize_survival_transformation_smoothing(
     left_truncated: bool,
 ) -> Result<Option<Vec<f64>>, String> {
     use gam_solve::rho_optimizer::OuterProblem;
-    use gam_problem::{Derivative, HessianResult, OuterEval};
+    use gam_problem::{Derivative, HessianValue, OuterEval};
     if num_smoothing == 0 {
         return Ok(None);
     }
@@ -1717,7 +1651,7 @@ fn optimize_survival_transformation_smoothing(
             Ok(OuterEval {
                 cost,
                 gradient,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -1770,7 +1704,7 @@ fn survival_unified_fit_result(
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
     let log_lambdas = lambdas.mapv(|v| v.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln());
-    let reml_score = survival_working_reml_score(state);
+    let reml_score = state.penalized_objective();
     // #1426-class honesty: report `outer_converged` from the REAL inner PIRLS
     // verdict, not a hardcoded `true`. The caller (#1123) deliberately accepts a
     // FINITE-but-non-converged inner solve at the selected λ rather than aborting
@@ -2670,7 +2604,7 @@ pub(crate) fn fit_survival_transformation_model(
                 let state = model.update_state(&beta).map_err(|err| {
                     format!("failed to evaluate survival baseline candidate: {err}")
                 })?;
-                let cost = survival_working_reml_score(&state);
+                let cost = state.penalized_objective();
                 let residuals = model.offset_channel_residuals(&beta).map_err(|err| {
                     format!("failed to form survival baseline offset residuals: {err}")
                 })?;
@@ -2977,7 +2911,7 @@ pub(crate) fn fit_survival_location_scale_model(
             R: Fn(&Array1<f64>) -> Option<InverseLink>,
         {
             use gam_solve::rho_optimizer::OuterProblem;
-            use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
+            use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let dim = init.len();
             // Box bounds keep line-search probes inside a physically admissible
             // region (|ε|, |log δ| ≤ 6 gives the SAS link a finite range on both
@@ -3051,7 +2985,7 @@ pub(crate) fn fit_survival_location_scale_model(
                 Ok(OuterEval {
                     cost,
                     gradient,
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             };

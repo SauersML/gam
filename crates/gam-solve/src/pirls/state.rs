@@ -108,6 +108,12 @@ pub struct WorkingState {
 }
 
 impl WorkingState {
+    /// Value minimized by PIRLS for this fully evaluated state.
+    #[inline]
+    pub fn penalized_objective(&self) -> f64 {
+        0.5 * (self.deviance + self.penalty_term)
+    }
+
     #[inline]
     pub fn jeffreys_logdet(&self) -> Option<f64> {
         self.firth.jeffreys_logdet()

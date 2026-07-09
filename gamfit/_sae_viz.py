@@ -40,7 +40,6 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     """
     atom = _atom_at(fit, k)
     decoder = _as_2d(atom.decoder_coefficients, "decoder_coefficients")
-    coords = _as_2d(atom.coords, "coords")
     basis = _basis_for(fit, atom, k)
     topology = _topology_for(fit, basis, k)
 

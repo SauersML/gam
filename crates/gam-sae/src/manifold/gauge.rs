@@ -42,7 +42,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side};
 use gam_linalg::faer_ndarray::FaerCholesky;
-use gam_optimize::{backtracking_line_search, BacktrackConfig};
+use opt::{backtracking_line_search, BacktrackConfig};
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {

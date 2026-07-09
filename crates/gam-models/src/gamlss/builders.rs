@@ -3106,7 +3106,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Array1<f64>,
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
             crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
@@ -3278,8 +3278,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             && (!matches!(order, OuterEvalOrder::ValueGradientHessian)
                 || matches!(
                     cached_hess,
-                    gam_problem::HessianResult::Analytic(_)
-                        | gam_problem::HessianResult::Operator(_)
+                    gam_problem::HessianValue::Dense(_)
+                        | gam_problem::HessianValue::Operator(_)
                 ))
         {
             state.warm_cache = Some(cached_warm.clone());

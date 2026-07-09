@@ -289,10 +289,8 @@ fn sae_manifold_fit_minimal<'py>(
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // #1777 PER-FIT config overrides (separation-barrier strength / IBP-α). `Some`
-    // pins this term's value for THIS fit (per-fit, isolated from the process-global
-    // atomic setters, which remain as the `None` fallback). This is the entry point
-    // the high-level Python `sae_manifold_fit` facade routes through.
+    // Per-fit config (separation-barrier strength / IBP-α). `Some` pins this
+    // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
     // #2021 — count of extra whitened-residual structured-alternation passes.
@@ -679,15 +677,7 @@ fn predict_oos_from_arrays<'py>(
     // own leave-this-atom-out residual projected onto `v` (`try_fitted_target_aware`),
     // so it reconstructs identically train vs held-out. `None`/empty ⇒ all-curved
     // OOS reconstruction (the prior behaviour).
-    hybrid_linear_images: Option<
-        Vec<(
-            usize,
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Option<Array1<f64>>,
-        )>,
-    >,
+    hybrid_linear_images: Option<Vec<(usize, f64, Array1<f64>, Array1<f64>, Option<Array1<f64>>)>>,
     // #2132 — the TRAINING fit's terminal REML-selected penalized-objective
     // hyperparameters. The frozen-decoder OOS Newton solve descends the same
     // penalized objective the training state converged under, so re-encoding
@@ -1751,7 +1741,10 @@ fn build_sae_encode_atlas<'py>(
                     if a.nrows() == 0 {
                         1.0
                     } else {
-                        a.column(k).iter().map(|v| v.abs()).fold(f64::NEG_INFINITY, f64::max)
+                        a.column(k)
+                            .iter()
+                            .map(|v| v.abs())
+                            .fold(f64::NEG_INFINITY, f64::max)
                     }
                 })
                 .collect()

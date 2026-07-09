@@ -1,4 +1,4 @@
-use gam_optimize::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
+use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
@@ -409,11 +409,11 @@ pub fn spd_frechet_mean(
     let mut stall = 0_usize;
     // Armijo sufficient-decrease parameter c₁ (`1e-4`), the backtracking-halving
     // cap (`t = 1` unit Karcher step down to `t = 2⁻⁶⁰ ≈ 1e-18`), and the
-    // round-off cushion `8·ε·(1+|f|)` all live in `gam_optimize` now — this loop
+    // round-off cushion `8·ε·(1+|f|)` all live in `opt` now — this loop
     // routes through the shared `backtracking_line_search` primitive
     // (`BacktrackConfig::default()` supplies `t₀ = 1`, factor `0.5`, 60 steps)
     // and the shared `armijo_roundoff_cushion` helper.
-    const ARMIJO_C1: f64 = gam_optimize::constants::ARMIJO_C1;
+    const ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
     for _ in 0..max_iter {
         // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V).

@@ -18,7 +18,6 @@ gam-gpu = { path = "../gam-gpu", version = "=0.3.148" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.148" }
 gam-math = { path = "../gam-math", version = "=0.3.148" }
 gam-model-api = { path = "../gam-model-api", version = "=0.3.148" }
-gam-optimize = { path = "../gam-optimize", version = "=0.3.148" }
 gam-problem = { path = "../gam-problem", version = "=0.3.148" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.148" }
 gam-spec = { path = "../gam-spec", version = "=0.3.148" }

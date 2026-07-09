@@ -377,10 +377,6 @@ pub(crate) fn build_model_summary(
     }
 }
 
-pub(crate) fn array2_to_nestedvec(a: &Array2<f64>) -> Vec<Vec<f64>> {
-    a.axis_iter(Axis(0)).map(|row| row.to_vec()).collect()
-}
-
 pub(crate) fn covariance_from_model(
     model: &SavedModel,
     mode: CovarianceModeArg,

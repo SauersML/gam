@@ -11,8 +11,6 @@ and host/device marshalling.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 
 from . import kernels as _kernels

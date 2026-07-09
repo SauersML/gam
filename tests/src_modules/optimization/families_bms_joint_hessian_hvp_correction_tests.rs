@@ -2235,7 +2235,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // #1165: assert the operator's single-vector HVP directly before dense
     // materialization can symmetrize/probe around a row-specific ψ correction.
     let hess0_operator = match &hess0 {
-        gam_problem::HessianResult::Operator(op) => Arc::clone(op),
+        gam_problem::HessianValue::Operator(op) => Arc::clone(op),
         other => panic!("ψ-active BMS outer Hessian must be an operator, got {other:?}"),
     };
     let hess0_dense = hess0

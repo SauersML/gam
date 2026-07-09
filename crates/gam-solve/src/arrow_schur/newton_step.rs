@@ -287,7 +287,7 @@ pub(crate) fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usi
 }
 
 /// Schur-eliminate the per-row latent block and solve with explicit options,
-/// returning `(Δt, Δβ, PcgDiagnostics)`.
+/// returning `(Δt, Δβ, ArrowPcgDiagnostics)`.
 ///
 /// The diagnostics are zero-valued (default) when the selected mode is
 /// `Direct` or `SqrtBA` — use them to monitor `InexactPCG` iteration counts
@@ -298,7 +298,7 @@ pub fn solve_arrow_newton_step_core(
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
     if let Some(chunk_size) = options.streaming_chunk_size {
         // #1014: the streaming/residency path is the memory-bound assembly wall,
         // so its reduced dense Schur solve runs certified mixed precision by
@@ -310,7 +310,7 @@ pub fn solve_arrow_newton_step_core(
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         return streaming
             .solve(ridge_t, ridge_beta, &streaming_options)
-            .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, PcgDiagnostics::default()));
+            .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, ArrowPcgDiagnostics::default()));
     }
     // #1017 phase-3 production seam: when a device is present and the dense
     // Schur work clears the work-based dispatch threshold (LLM/SAE shapes —
@@ -448,7 +448,7 @@ pub(crate) fn try_device_arrow_direct(
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Option<Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError>> {
+) -> Option<Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError>> {
     // Only the dense Direct mode maps onto the device dense-Schur sequence.
     // SqrtBA / InexactPCG have distinct numerics (square-root factors,
     // truncated-CG trust region) and must stay on their CPU implementations so
@@ -504,9 +504,9 @@ pub(crate) fn try_device_arrow_direct(
     }
     match crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
         Ok(solution) => {
-            let diagnostics = PcgDiagnostics {
+            let diagnostics = ArrowPcgDiagnostics {
                 used_device_arrow: true,
-                ..PcgDiagnostics::default()
+                ..ArrowPcgDiagnostics::default()
             };
             Some(Ok((solution.delta_t, solution.delta_beta, diagnostics)))
         }
@@ -984,15 +984,15 @@ fn build_resident_sae_frame_if_admitted(
 /// it is an option-validation / line-search failure that a ridge shift cannot
 /// repair.
 ///
-/// Returns `(Δt, Δβ, PcgDiagnostics)` from `solve_arrow_newton_step_core`,
+/// Returns `(Δt, Δβ, ArrowPcgDiagnostics)` from `solve_arrow_newton_step_core`,
 /// computed with the smallest escalated ridge that produced a successful factor.
-/// `PcgDiagnostics::ridge_escalations` records how many ridge bumps were needed.
+/// `ArrowPcgDiagnostics::ridge_escalations` records how many ridge bumps were needed.
 pub fn solve_with_lm_escalation_inner(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
     options: &ArrowSolveOptions,
-) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
     let mut proximal_ridge = 0.0_f64;
     let mut escalations: usize = 0;
     let mut last_err: Option<ArrowSchurError> = None;
@@ -1048,9 +1048,9 @@ pub fn solve_with_lm_escalation_inner(
             Some(Ok(solution)) => Ok((
                 solution.delta_t,
                 solution.delta_beta,
-                PcgDiagnostics {
+                ArrowPcgDiagnostics {
                     used_device_arrow: true,
-                    ..PcgDiagnostics::default()
+                    ..ArrowPcgDiagnostics::default()
                 },
             )),
             Some(Err(
@@ -1474,7 +1474,7 @@ pub(crate) struct ArrowNewtonStepArtifacts {
     /// exact dense-factor path (small `k`, streaming, cross-row CG), which keeps
     /// the bit-identical Cholesky log-determinant.
     pub(crate) schur_log_det_override: Option<f64>,
-    pub(crate) pcg_diagnostics: PcgDiagnostics,
+    pub(crate) pcg_diagnostics: ArrowPcgDiagnostics,
     pub(crate) gauge_deflated_directions: usize,
     /// Per-row unit-norm deflated directions surfaced for the outer-gradient
     /// deflation correction (see [`ArrowBlockFactorization::deflated_row_directions`]).
@@ -2148,7 +2148,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             htt_factors: ArrowFactorSlab::from_blocks(Vec::new()),
             schur_factor,
             schur_log_det_override: None,
-            pcg_diagnostics: PcgDiagnostics::default(),
+            pcg_diagnostics: ArrowPcgDiagnostics::default(),
             gauge_deflated_directions: 0,
             deflated_row_directions: Vec::new(),
             deflation_row_spectra: Vec::new(),
@@ -2212,7 +2212,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         schur_factor,
                         refinement_steps,
                     } => {
-                        let mut pcg_diagnostics = PcgDiagnostics::default();
+                        let mut pcg_diagnostics = ArrowPcgDiagnostics::default();
                         pcg_diagnostics.mixed_precision_status =
                             MixedPrecisionStatus::Certified { refinement_steps };
                         return Ok(ArrowNewtonStepArtifacts {
@@ -2254,7 +2254,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         schur_factor,
                         refinement_steps,
                     } => {
-                        let mut pcg_diagnostics = PcgDiagnostics::default();
+                        let mut pcg_diagnostics = ArrowPcgDiagnostics::default();
                         pcg_diagnostics.mixed_precision_status =
                             MixedPrecisionStatus::Certified { refinement_steps };
                         return Ok(ArrowNewtonStepArtifacts {
@@ -2841,7 +2841,7 @@ pub(crate) fn solve_arrow_newton_step_cross_row(
     }
 
     let final_residual = (dot2(&r_t, &r_beta, &r_t, &r_beta)).sqrt();
-    let diag = PcgDiagnostics {
+    let diag = ArrowPcgDiagnostics {
         iterations: iters,
         matvec_calls: iters,
         precond_apply_calls: iters + 1,

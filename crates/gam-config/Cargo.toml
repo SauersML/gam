@@ -3,7 +3,7 @@ name = "gam-config"
 version = "0.3.148"
 edition = "2024"
 rust-version = "1.93"
-description = "Shared JSON to FitConfig resolver for the gam CLI and Python FFI"
+description = "Canonical multi-front-end parsing and normalization for gam FitConfig"
 license = "AGPL-3.0-or-later"
 
 [lints.rust]

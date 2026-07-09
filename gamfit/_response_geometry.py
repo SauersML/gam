@@ -8,7 +8,7 @@ model.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ._binding import rust_module
 from ._exceptions import map_exception

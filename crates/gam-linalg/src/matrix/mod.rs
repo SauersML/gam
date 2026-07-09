@@ -5161,6 +5161,105 @@ impl DesignMatrix {
         Ok(())
     }
 
+    /// Apply the design to a borrowed vector into caller-owned storage.
+    ///
+    /// Unlike [`Self::matrixvectormultiply`], this accepts an `ArrayView1` and
+    /// does not require either operand to be copied for materialized dense or
+    /// sparse designs.
+    pub fn apply_view_into(
+        &self,
+        vector: ArrayView1<'_, f64>,
+        mut output: ArrayViewMut1<'_, f64>,
+    ) {
+        assert_eq!(self.ncols(), vector.len());
+        assert_eq!(self.nrows(), output.len());
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                crate::dense::matvec_into(matrix.as_ref(), vector, output);
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(operator)) => {
+                output.assign(&operator.apply(&vector.to_owned()));
+            }
+            Self::Sparse(matrix) => {
+                output.fill(0.0);
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let x = vector[col];
+                    if x == 0.0 {
+                        continue;
+                    }
+                    for idx in col_ptr[col]..col_ptr[col + 1] {
+                        output[row_idx[idx]] += values[idx] * x;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply the design to a borrowed vector and return the owned result.
+    pub fn apply_view(&self, vector: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut output = Array1::<f64>::zeros(self.nrows());
+        self.apply_view_into(vector, output.view_mut());
+        output
+    }
+
+    /// Apply the transposed design to a borrowed vector into caller storage.
+    pub fn transpose_apply_view_into(
+        &self,
+        vector: ArrayView1<'_, f64>,
+        mut output: ArrayViewMut1<'_, f64>,
+    ) {
+        assert_eq!(self.nrows(), vector.len());
+        assert_eq!(self.ncols(), output.len());
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                crate::dense::transpose_matvec_into(matrix.as_ref(), vector, output);
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(operator)) => {
+                output.assign(&operator.apply_transpose(&vector.to_owned()));
+            }
+            Self::Sparse(matrix) => {
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for col in 0..matrix.ncols() {
+                    let mut value = 0.0;
+                    for idx in col_ptr[col]..col_ptr[col + 1] {
+                        value += values[idx] * vector[row_idx[idx]];
+                    }
+                    output[col] = value;
+                }
+            }
+        }
+    }
+
+    /// Extract one column into caller-owned storage without densification.
+    pub fn column_into(&self, col: usize, mut output: ArrayViewMut1<'_, f64>) {
+        assert!(col < self.ncols());
+        assert_eq!(self.nrows(), output.len());
+        match self {
+            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+                output.assign(&matrix.column(col));
+            }
+            Self::Dense(DenseDesignMatrix::Lazy(operator)) => {
+                let mut basis = Array1::<f64>::zeros(operator.ncols());
+                basis[col] = 1.0;
+                output.assign(&operator.apply(&basis));
+            }
+            Self::Sparse(matrix) => {
+                output.fill(0.0);
+                let (symbolic, values) = matrix.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for idx in col_ptr[col]..col_ptr[col + 1] {
+                    output[row_idx[idx]] = values[idx];
+                }
+            }
+        }
+    }
+
     /// Element access: returns the value at row `i`, column `j`.
     ///
     /// For materialized dense matrices this is O(1). For sparse matrices,
@@ -5209,30 +5308,9 @@ impl DesignMatrix {
     /// - `Sparse` (CSC): O(nnz_j) using the column pointer structure.
     /// - lazy `Dense`: O(matvec) via unit-vector application.
     pub fn extract_column(&self, j: usize) -> Array1<f64> {
-        match self {
-            Self::Dense(m) => {
-                if let Some(dense) = m.as_dense_ref() {
-                    dense.column(j).to_owned()
-                } else {
-                    let mut e_j = Array1::zeros(m.ncols());
-                    e_j[j] = 1.0;
-                    m.apply(&e_j)
-                }
-            }
-            Self::Sparse(sp) => {
-                let n = sp.nrows();
-                let mut col = Array1::zeros(n);
-                let (symbolic, values) = sp.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                let start = col_ptr[j];
-                let end = col_ptr[j + 1];
-                for idx in start..end {
-                    col[row_idx[idx]] = values[idx];
-                }
-                col
-            }
-        }
+        let mut column = Array1::zeros(self.nrows());
+        self.column_into(j, column.view_mut());
+        column
     }
 
     /// Batched column extraction: returns an `nrows × cols.len()` dense block

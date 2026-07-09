@@ -9,7 +9,7 @@ use gam_solve::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use gam_problem::{Coefficients, LinearPredictor};
-use gam_optimize::{
+use opt::{
     BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
@@ -2597,7 +2597,7 @@ impl WorkingModelSurvival {
             const POLISH_MAX_ITERS: usize = 400;
             const POLISH_TOL: f64 = 1e-13;
             // Armijo sufficient-decrease constant and backtracking factor —
-            // the shared gam-optimize tuning constants; only the halving
+            // the shared opt tuning constants; only the halving
             // budget (80, deeper than the shared 60) is site-specific.
             const ARMIJO_C: f64 = constants::ARMIJO_C1;
             const BACKTRACK: f64 = constants::BACKTRACK_CONTRACTION;

@@ -74,7 +74,7 @@ use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector
 use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
 use gam_data::ColumnKindTag;
 use gam_data::EncodedDataset;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use opt::{BacktrackConfig, backtracking_line_search};
 use gam_problem::ResponseColumnKind;
 use gam_runtime::resource::ProblemHints;
 use gam_terms::inference::formula_dsl::parse_formula;
@@ -1172,7 +1172,7 @@ fn fit_penalized_multinomial_firth_fallback(
             }
         }
 
-        // Backtracking line search on ℓ* (ascent) via the shared `gam_optimize`
+        // Backtracking line search on ℓ* (ascent) via the shared `opt`
         // primitive: t₀ = 1, halving up to 60 trials. A candidate whose expected
         // information `I` is not SPD (boundary) is an INVALID trial (`Ok(None)`),
         // so the search contracts without consulting the acceptance test, keeping

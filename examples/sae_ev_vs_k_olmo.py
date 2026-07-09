@@ -133,7 +133,16 @@ def _jsonable(value):
     return value
 
 
-def _sae_fit_worker(z_tr, z_te, k, topology, seed, n_iter):
+def _sae_fit_worker(
+    z_tr,
+    z_te,
+    k,
+    topology,
+    seed,
+    n_iter,
+    separation_barrier_strength,
+    ibp_alpha,
+):
     """TOP-LEVEL (picklable) worker: fit + reconstruct in a child process.
 
     Lives at module scope so the "spawn" ProcessPoolExecutor can pickle it by
@@ -152,6 +161,8 @@ def _sae_fit_worker(z_tr, z_te, k, topology, seed, n_iter):
         assignment="ibp_map",
         n_iter=n_iter,
         random_state=seed,
+        separation_barrier_strength=separation_barrier_strength,
+        ibp_alpha=ibp_alpha,
     )
     fit_seconds = time.perf_counter() - fit_started
 
@@ -191,6 +202,8 @@ def _fit_ev(
     topology: str,
     seed: int,
     n_iter: int,
+    separation_barrier_strength: float | None,
+    ibp_alpha: float | None,
 ) -> tuple[float, float, float, dict | None, list[str]]:
     """Fit one dictionary through the production engine; return HELD-OUT EV.
 
@@ -205,7 +218,15 @@ def _fit_ev(
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
     try:
         result = executor.submit(
-            _sae_fit_worker, z_tr, z_te, k, topology, seed, n_iter
+            _sae_fit_worker,
+            z_tr,
+            z_te,
+            k,
+            topology,
+            seed,
+            n_iter,
+            separation_barrier_strength,
+            ibp_alpha,
         ).result()
     finally:
         executor.shutdown(wait=False)
@@ -351,25 +372,23 @@ def main() -> None:
         help="held-out EV of the official Qwen W32K linear-SAE reference from figH",
     )
     ap.add_argument("--out", help="optional JSON file for the measured table")
-    # #1026/#1522 anti-collapse separation-barrier override (one wheel sweeps
-    # many configs; NaN strength = compiled default). The amplitude (keep-alive)
-    # barrier and its active-atom gate were removed, so μ_sep is the only knob.
-    ap.add_argument("--sep-mu", type=float, default=float("nan"))
-    ap.add_argument("--ibp-alpha", type=float, default=float("nan"),
-                    help="#1026 override IBP-MAP alpha (flattens prior; NaN=compiled default)")
+    ap.add_argument(
+        "--sep-mu",
+        type=float,
+        default=None,
+        help="per-fit decoder-repulsion strength (default: evidence-derived)",
+    )
+    ap.add_argument(
+        "--ibp-alpha",
+        type=float,
+        default=None,
+        help="per-fit IBP-MAP alpha (default: K-aware canonical value)",
+    )
     args = ap.parse_args()
 
-    import math
-    # The pyo3 setters live in the compiled `gamfit._rust` module (the #[pymodule]
-    # named "_rust"); gamfit/__init__.py only re-exports a curated top-level list,
-    # which does not include these sweep knobs — so import them from _rust directly.
-    if not math.isnan(args.sep_mu):
-        from gamfit._rust import sae_set_barrier_overrides
-        sae_set_barrier_overrides(args.sep_mu)
+    if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
-    if not math.isnan(args.ibp_alpha):
-        from gamfit._rust import sae_set_ibp_alpha
-        sae_set_ibp_alpha(args.ibp_alpha)
+    if args.ibp_alpha is not None:
         print(f"[ibp] alpha={args.ibp_alpha}", flush=True)
 
     x = _load_activations(args)
@@ -413,6 +432,8 @@ def main() -> None:
             "circle",
             args.seed,
             args.n_iter,
+            args.sep_mu,
+            args.ibp_alpha,
         )
         # The pure-linear comparison arm rides a separate basis lane whose OOS /
         # basis_with_jet plumbing can error independently of the curved arm (e.g.
@@ -427,6 +448,8 @@ def main() -> None:
                 "linear",
                 args.seed,
                 args.n_iter,
+                args.sep_mu,
+                args.ibp_alpha,
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)

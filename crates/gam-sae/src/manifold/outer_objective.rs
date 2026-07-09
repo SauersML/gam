@@ -241,11 +241,12 @@ impl OuterTerminationLedger {
         basin_bundle_dominance_window()
     }
 
-    /// Record one finite criterion value; returns the improvement verdict.
-    pub(crate) fn record(&mut self, cost: f64) {
+    /// Record one finite criterion value; returns `true` on a MATERIAL
+    /// improvement of the best cost (the caller's checkpoint-bank signal).
+    pub(crate) fn record(&mut self, cost: f64) -> bool {
         self.evals += 1;
         if !cost.is_finite() {
-            return;
+            return false;
         }
         let improved = match self.best_cost {
             None => true,
@@ -260,6 +261,27 @@ impl OuterTerminationLedger {
             });
             self.last_improvement_eval = self.evals;
         }
+        improved
+    }
+
+    /// Resume accounting from a checkpoint: the eval/improvement tallies and
+    /// best cost continue across the wall so the #2235 forcing function stays
+    /// armed (the wall clock restarts — SPEC bans wall-clock budgets, and the
+    /// forcing function measures stalled evaluations, not elapsed time).
+    pub(crate) fn seed_from_checkpoint(
+        &mut self,
+        evals: u64,
+        last_improvement_eval: u64,
+        best_cost: Option<f64>,
+    ) {
+        self.evals = evals;
+        self.last_improvement_eval = last_improvement_eval.min(evals);
+        self.best_cost = best_cost.filter(|c| c.is_finite());
+    }
+
+    /// Snapshot the ledger counters for a checkpoint write.
+    pub(crate) fn checkpoint_counters(&self) -> (u64, u64, Option<f64>) {
+        (self.evals, self.last_improvement_eval, self.best_cost)
     }
 
     /// Consult the ledger's FORCING FUNCTION: `Some(message)` when the
@@ -894,6 +916,16 @@ pub struct SaeManifoldOuterObjective {
     /// stationary / budget-exhausted). Freezes the criterion once a verdict
     /// fires so the bridge converges onto the banked incumbent.
     pub(crate) termination: OuterTerminationLedger,
+    /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
+    /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
+    /// once at construction on the pristine full-`N` target. Checkpoints are
+    /// written best-effort at every MATERIAL improvement of the outer best
+    /// cost (never while the row-subsample restriction is engaged — the term
+    /// then holds `n_sub`-row state that cannot install at full `N`), and the
+    /// file is removed when a converged fit is minted (its purpose is wall
+    /// survival, not cross-fit caching — `persistent_warm_start` covers that).
+    pub(crate) checkpoint_fingerprint: super::checkpoint::SaeCheckpointFingerprint,
+    pub(crate) checkpoint_path: std::path::PathBuf,
 }
 
 /// #2230/#2087 basin-bundle sizing, derived from problem structure (no tuning).
@@ -970,6 +1002,14 @@ impl SaeManifoldOuterObjective {
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         let term_k_atoms = term.k_atoms();
+        // SPEC wall-survival fingerprint, computed on the pristine full-`N`
+        // target BEFORE the row subsample can restrict it below.
+        let checkpoint_fingerprint = super::checkpoint::SaeCheckpointFingerprint::of_target(
+            target.view(),
+            term_k_atoms,
+        );
+        let checkpoint_path =
+            super::checkpoint::SaeFitCheckpoint::default_store_path(&checkpoint_fingerprint);
         let mut objective = Self {
             term,
             baseline_term,
@@ -999,6 +1039,8 @@ impl SaeManifoldOuterObjective {
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
             termination: OuterTerminationLedger::new(),
+            checkpoint_fingerprint,
+            checkpoint_path,
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all
@@ -1006,6 +1048,124 @@ impl SaeManifoldOuterObjective {
         // `maybe_engage_outer_row_subsample`). Below threshold this is a no-op.
         objective.maybe_engage_outer_row_subsample();
         objective
+    }
+
+    /// SPEC wall-survival: bank a resumable checkpoint at a MATERIAL improvement
+    /// of the outer best cost. Best-effort — a checkpoint write must never abort
+    /// a fit (the error is logged, not raised) — and skipped while the
+    /// row-subsample restriction is engaged (the term then holds `n_sub`-row
+    /// state whose coords/logits cannot install at full `N`).
+    pub(crate) fn bank_checkpoint(&self, rho_flat: &Array1<f64>) {
+        if self.row_subsample.is_some() {
+            return;
+        }
+        let (evals, last_improvement_eval, best_cost) = self.termination.checkpoint_counters();
+        let rho_owned = rho_flat.to_vec();
+        // serde_json refuses non-finite floats, and the ledger's best cost is
+        // finite by construction (`record` skips non-finite values); sanitize
+        // the EV the same way so a degenerate probe can never wedge the write.
+        let incumbent_ev = self
+            .term
+            .dictionary_reconstruction_ev(self.target.view(), &self.current_rho)
+            .ok()
+            .filter(|ev| ev.is_finite())
+            .unwrap_or(-1.0);
+        let ckpt = super::checkpoint::SaeFitCheckpoint::capture(
+            &self.term,
+            &self.checkpoint_fingerprint,
+            &rho_owned,
+            super::checkpoint::SaeCheckpointLedger {
+                evals,
+                last_improvement_eval,
+                best_cost,
+            },
+            incumbent_ev,
+        );
+        if let Some(dir) = self.checkpoint_path.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            log::warn!("SAE fit checkpoint: create dir {}: {e}", dir.display());
+            return;
+        }
+        if let Err(e) = ckpt.save_atomic(&self.checkpoint_path) {
+            log::warn!("SAE fit checkpoint: {e}");
+        }
+    }
+
+    /// SPEC wall-survival: attempt to resume from a banked checkpoint for this
+    /// exact data fingerprint. On a verified hit, installs the banked incumbent
+    /// into the term (and the baseline term, so a multi-start `reset` re-opens
+    /// from the banked state rather than the cold seed), seeds the termination
+    /// ledger counters, and returns the banked outer ρ to open the search at.
+    /// Any incompatibility or install failure is logged and the fit proceeds
+    /// cold — a checkpoint can improve a fit, never break one.
+    pub(crate) fn try_resume_from_checkpoint(&mut self, expected_rho_len: usize) -> Option<Vec<f64>> {
+        if !self.checkpoint_path.exists() {
+            return None;
+        }
+        let ckpt = match super::checkpoint::SaeFitCheckpoint::load(&self.checkpoint_path) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
+                return None;
+            }
+        };
+        if let Err(e) = ckpt.verify_compatible(&self.checkpoint_fingerprint, expected_rho_len) {
+            log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
+            return None;
+        }
+        // Install into the PRISTINE full-`N` term when the subsample is engaged
+        // (the working term is the n_sub restriction and cannot take full-`N`
+        // state); the restored-for-final-fit path re-reads from there. With no
+        // subsample, install into the working term directly.
+        let install_result = if let Some(sub) = self.row_subsample.as_mut() {
+            let r = ckpt.install_into(&mut sub.full_term);
+            if r.is_ok()
+                && let Err(e) = ckpt.install_into(&mut sub.full_baseline_term)
+            {
+                log::warn!("SAE fit checkpoint resume (full baseline): {e}");
+            }
+            r
+        } else {
+            let r = ckpt.install_into(&mut self.term);
+            if r.is_ok()
+                && let Err(e) = ckpt.install_into(&mut self.baseline_term)
+            {
+                log::warn!("SAE fit checkpoint resume (baseline): {e}");
+            }
+            r
+        };
+        if let Err(e) = install_result {
+            log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
+            return None;
+        }
+        self.termination.seed_from_checkpoint(
+            ckpt.ledger.evals,
+            ckpt.ledger.last_improvement_eval,
+            ckpt.ledger.best_cost,
+        );
+        log::warn!(
+            "SAE fit checkpoint resume: installed banked incumbent from {} \
+             (evals {}, best cost {:?}); the resumed search must still converge on its own",
+            self.checkpoint_path.display(),
+            ckpt.ledger.evals,
+            ckpt.ledger.best_cost,
+        );
+        Some(ckpt.rho_flat)
+    }
+
+    /// Remove the banked checkpoint after a CONVERGED fit is minted: its
+    /// purpose is wall survival of an in-flight optimization, not cross-fit
+    /// caching (`persistent_warm_start` covers that). Best-effort.
+    pub(crate) fn discard_checkpoint(&self) {
+        if self.checkpoint_path.exists()
+            && let Err(e) = std::fs::remove_file(&self.checkpoint_path)
+        {
+            log::warn!(
+                "SAE fit checkpoint: remove {}: {e}",
+                self.checkpoint_path.display()
+            );
+        }
     }
 
     /// Auto-engage outer-criterion row subsampling for the ρ search when the row
@@ -1666,7 +1826,7 @@ impl SaeManifoldOuterObjective {
     /// differences the criterion **value path** at `ρ̂ ± h v` (with a Richardson
     /// `2h` step for the FD's own error bar), and compares against the analytic
     /// directional derivative `∇V(ρ̂)·v` from the production gradient path. The
-    /// returned [`CriterionCertificate`] records whether the objective and its
+    /// returned [`DirectionalCriterionCertificate`] records whether the objective and its
     /// analytic gradient agree *here*, on this data shape, where #901-class
     /// desyncs actually manifest.
     ///
@@ -1681,7 +1841,7 @@ impl SaeManifoldOuterObjective {
     /// cold — they must not alias the gradient path's converged warm state,
     /// since that aliasing is exactly what the certificate audits. Call before
     /// [`Self::into_fitted`].
-    pub fn optimality_certificate(&mut self) -> Result<CriterionCertificate, String> {
+    pub fn optimality_certificate(&mut self) -> Result<DirectionalCriterionCertificate, String> {
         // The certificate audits the full-`N` criterion at the settled ρ, so
         // restore full rows first (idempotent) — the subsampled surrogate is not
         // the objective the reported fit optimizes.
@@ -3959,7 +4119,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
             },
         ) {
             Ok((cost, _beta)) => {
-                self.termination.record(cost);
+                if self.termination.record(cost) {
+                    self.bank_checkpoint(rho);
+                }
                 Ok(cost)
             }
             // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
@@ -4016,17 +4178,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     return Ok(OuterEval {
                         cost: Self::recoverable_refusal_wall_cost(),
                         gradient: Array1::zeros(rho.len()),
-                        hessian: HessianResult::Unavailable,
+                        hessian: HessianValue::Unavailable,
                         inner_beta_hint: None,
                     });
                 }
                 Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
             };
-            self.termination.record(cost);
+            if self.termination.record(cost) {
+                self.bank_checkpoint(rho);
+            }
             return Ok(OuterEval {
                 cost,
                 gradient: Array1::zeros(rho.len()),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             });
         }
@@ -4121,7 +4285,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 return Ok(OuterEval {
                     cost: Self::recoverable_refusal_wall_cost(),
                     gradient: Array1::zeros(rho.len()),
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 });
             }
@@ -4251,11 +4415,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.forcing.observe_accepted_gradient(rho, gradient_norm);
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
-        self.termination.record(cost);
+        if self.termination.record(cost) {
+            self.bank_checkpoint(rho);
+        }
         Ok(OuterEval {
             cost,
             gradient,
-            hessian: HessianResult::Unavailable,
+            hessian: HessianValue::Unavailable,
             inner_beta_hint: Some(beta_hat),
         })
     }
@@ -4331,17 +4497,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
                             return Ok(OuterEval {
                                 cost: Self::recoverable_refusal_wall_cost(),
                                 gradient: Array1::zeros(rho.len()),
-                                hessian: HessianResult::Unavailable,
+                                hessian: HessianValue::Unavailable,
                                 inner_beta_hint: None,
                             });
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };
-                self.termination.record(cost);
+                if self.termination.record(cost) {
+                    self.bank_checkpoint(rho);
+                }
                 Ok(OuterEval {
                     cost,
                     gradient: Array1::zeros(rho.len()),
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -4362,7 +4530,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let eval = self
             .efs_step(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        self.termination.record(eval.cost);
+        if self.termination.record(eval.cost) {
+            self.bank_checkpoint(rho);
+        }
         Ok(eval)
     }
 

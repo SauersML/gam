@@ -280,3 +280,63 @@ def test_gam_module_train_then_freeze_then_eval():
     assert not model.training
     assert model(t).shape == (40, 1)
     assert [name for name, _ in model.named_parameters()] == []
+
+
+@pytest.mark.parametrize("block_count", [1, 3])
+def test_gam_frozen_eval_rejects_points_block_count_mismatch(block_count):
+    model = gt.GAM([
+        gt.Duchon(centers=_centers(6), m=2),
+        gt.Duchon(centers=_centers(7), m=2),
+    ])
+    model._frozen_coefs = [torch.zeros(6, 1), torch.zeros(7, 1)]
+    model.eval()
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{block_count} points tensors for 2 smooths",
+    ):
+        model([torch.zeros(4)] * block_count)
+
+
+@pytest.mark.parametrize("block_count", [1, 3])
+def test_gam_frozen_eval_rejects_coefficient_block_count_mismatch(block_count):
+    model = gt.GAM([
+        gt.Duchon(centers=_centers(6), m=2),
+        gt.Duchon(centers=_centers(7), m=2),
+    ])
+    model._frozen_coefs = [torch.zeros(6, 1)] * block_count
+    model.eval()
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{block_count} frozen coefficient blocks for 2 smooths",
+    ):
+        model(torch.zeros(4))
+
+
+@pytest.mark.parametrize("block_count", [1, 3])
+def test_gam_freeze_rejects_fit_coefficient_block_count_mismatch(
+    monkeypatch, block_count,
+):
+    import importlib
+
+    gam_module = importlib.import_module("gamfit.torch.module")
+    model = gt.GAM([
+        gt.Duchon(centers=_centers(6), m=2),
+        gt.Duchon(centers=_centers(7), m=2),
+    ])
+
+    class BadFitResult:
+        coefficients = [torch.zeros(6, 1)] * block_count
+
+    monkeypatch.setattr(gam_module, "fit", lambda *_args, **_kwargs: BadFitResult())
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{block_count} coefficient blocks for 2 smooths",
+    ):
+        model.freeze(torch.zeros(4), torch.zeros(4))
+
+    assert model._frozen_coefs is None
+    assert model.last_fit is None
+    assert model.training

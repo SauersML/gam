@@ -587,8 +587,8 @@ fn spectral_conditioned_schur_with_factor(
             }
         }
     }
-    let factor = spectral_qr_cholesky_factor(&weighted_vt)
-        .or_else(|| cholesky_lower(&conditioned).ok())?;
+    let factor =
+        spectral_qr_cholesky_factor(&weighted_vt).or_else(|| cholesky_lower(&conditioned).ok())?;
     Some((conditioned, factor))
 }
 
@@ -670,14 +670,17 @@ pub(crate) fn solve_dense_reduced_system(
     rhs_beta: &Array1<f64>,
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
-    let (factor, floored_schur) =
-        factor_dense_reduced_schur(schur, options.schur_pd_floor, options.tolerate_ill_conditioning)?;
+) -> Result<(Array1<f64>, Option<Array2<f64>>, ArrowPcgDiagnostics), ArrowSchurError> {
+    let (factor, floored_schur) = factor_dense_reduced_schur(
+        schur,
+        options.schur_pd_floor,
+        options.tolerate_ill_conditioning,
+    )?;
     if let Some(floored) = floored_schur {
         let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
             .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
         if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
-            return Ok((direct, Some(factor), PcgDiagnostics::default()));
+            return Ok((direct, Some(factor), ArrowPcgDiagnostics::default()));
         }
         let identity = IdentityPreconditioner;
         let (delta, diag) = steihaug_dense_system(
@@ -731,7 +734,8 @@ pub(crate) fn solve_dense_reduced_system(
             // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
             // Without the floor (BA / non-SAE callers) the strict refusal stands.
             if let Some(relative_floor) = options.schur_pd_floor
-                && let Some((floored, floored_factor)) = spectral_pd_floored_schur(schur, relative_floor)
+                && let Some((floored, floored_factor)) =
+                    spectral_pd_floored_schur(schur, relative_floor)
             {
                 let direct =
                     mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
@@ -741,7 +745,7 @@ pub(crate) fn solve_dense_reduced_system(
                     options.trust_region.radius,
                     metric_weights,
                 ) {
-                    return Ok((direct, Some(floored_factor), PcgDiagnostics::default()));
+                    return Ok((direct, Some(floored_factor), ArrowPcgDiagnostics::default()));
                 }
                 let identity = IdentityPreconditioner;
                 let (delta, diag) = steihaug_dense_system(
@@ -775,7 +779,7 @@ pub(crate) fn solve_dense_reduced_system(
     let direct = mixed_precision_reduced_beta(schur, &factor, rhs_beta, options)
         .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
-        return Ok((direct, Some(factor), PcgDiagnostics::default()));
+        return Ok((direct, Some(factor), ArrowPcgDiagnostics::default()));
     }
 
     // Ceres-style trust-region correction: once the dense BA solve proposes a
@@ -1434,13 +1438,7 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // the byte-identical CPU `schur_matvec` lane is taken.
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
         .with_gpu_matvec(gpu_matvec);
-    slq_logdet(
-        k,
-        |v| op.apply(v),
-        num_probes,
-        lanczos_steps,
-        seed,
-    )
+    slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed)
 }
 
 /// One-call matrix-free arrow evidence log-determinant for an assembled system.
@@ -1487,7 +1485,8 @@ pub fn matrix_free_arrow_evidence_log_det(
         options,
         num_probes.saturating_mul(lanczos_steps),
     );
-    let gpu_matvec: Option<&GpuSchurMatvec> = options.gpu_matvec.as_ref().or(device_matvec.as_ref());
+    let gpu_matvec: Option<&GpuSchurMatvec> =
+        options.gpu_matvec.as_ref().or(device_matvec.as_ref());
     let resident = if gpu_matvec.is_none() {
         SaeResidentReducedSchur::build(sys, &htt_factors, &backend)
     } else {
@@ -1685,7 +1684,8 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
         .unwrap_or_else(|| slq_num_probes.saturating_mul(slq_lanczos_steps));
     let device_matvec =
         maybe_build_evidence_gpu_matvec(sys, ridge_t, ridge_beta, options, cfg_apply_budget);
-    let gpu_matvec: Option<&GpuSchurMatvec> = options.gpu_matvec.as_ref().or(device_matvec.as_ref());
+    let gpu_matvec: Option<&GpuSchurMatvec> =
+        options.gpu_matvec.as_ref().or(device_matvec.as_ref());
     let resident = if gpu_matvec.is_none() {
         SaeResidentReducedSchur::build(sys, &htt_factors, &backend)
     } else {
@@ -1926,7 +1926,14 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
         return None;
     }
     let lambda_max = reduced_schur_lambda_max(
-        sys, htt_factors, ridge_beta, backend, resident, gpu_matvec, power_iters, seed,
+        sys,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        gpu_matvec,
+        power_iters,
+        seed,
     )?;
     // λ_min from the deflation floor: after unit-deflation the operative spectrum
     // is bounded below by `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (or 1.0), so this
@@ -1998,10 +2005,18 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         return None;
     }
     let lambda_max = reduced_schur_lambda_max(
-        sys, htt_factors, ridge_beta, backend, resident, gpu_matvec, power_iters, seed,
+        sys,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        gpu_matvec,
+        power_iters,
+        seed,
     )?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
-    let base_plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let base_plan =
+        RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
     // One resident operator across the pilot, every deflation re-solve, and the
     // subspace-iteration `with_two_sided_deflation` applies — the whole rank-derivation
     // ladder (the two-sided deflation: block-power on S + inverse subspace
@@ -3058,8 +3073,12 @@ pub enum SchurPreconditionerKind {
     /// into bounded strongly-co-firing clusters so the dense per-cluster factor
     /// conditions the cross-atom coupling scalar Jacobi cannot see.
     CoVisibilityClusterJacobi,
-    AdditiveSchwarz { overlap: usize },
-    DiagAssembledSchwarz { overlap: usize },
+    AdditiveSchwarz {
+        overlap: usize,
+    },
+    DiagAssembledSchwarz {
+        overlap: usize,
+    },
     BlockIncompleteCholesky,
 }
 
@@ -3144,7 +3163,9 @@ pub(crate) const CLUSTER_SCHUR_FACTOR_BYTES_BUDGET: u128 = 2 * 1024 * 1024;
 /// `b×b` f64 Cholesky factor fits [`CLUSTER_SCHUR_FACTOR_BYTES_BUDGET`]. See that
 /// constant for the memory justification. Never below 1.
 pub(crate) fn covisibility_cluster_max_cols() -> usize {
-    let b = ((CLUSTER_SCHUR_FACTOR_BYTES_BUDGET / 8) as f64).sqrt().floor() as usize;
+    let b = ((CLUSTER_SCHUR_FACTOR_BYTES_BUDGET / 8) as f64)
+        .sqrt()
+        .floor() as usize;
     b.max(1)
 }
 
@@ -4230,7 +4251,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
     curvature_floor: Option<f64>,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
     // #1017 CPU residency: stage the per-row reduced-Schur factors `(L_i, Y_i)`
     // (NOT the dense `p×p` block — `di ≪ p`, so the factored form is `O(n·di·p)`
     // memory and `2·support_i·p + 2·di·p` flops/row including the sparse
@@ -4260,7 +4281,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     // small attempt cap and a relative ridge ceiling; on exhaustion the original
     // recoverable failure still reaches the outer LM loop.
     let mut effective_ridge = ridge_beta;
-    let mut x0_diag0: Option<(Array1<f64>, PcgDiagnostics)> = None;
+    let mut x0_diag0: Option<(Array1<f64>, ArrowPcgDiagnostics)> = None;
     let mut last_curvature_err: Option<ArrowSchurError> = None;
     let rhs_scale = metric_norm(rhs.view(), metric_weights).max(1.0);
     let ridge_ceiling = ridge_beta.max(SCHUR_CURVATURE_FLOOR_REL_CEILING * rhs_scale);
@@ -4534,7 +4555,7 @@ pub(crate) fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver + Syn
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
     resident: Option<&SaeResidentReducedSchur>,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError>
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError>
 where
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
 {
@@ -4582,7 +4603,7 @@ pub(crate) fn steihaug_dense_system(
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
     steihaug_cg(
         rhs,
         |p, out| dense_matvec(schur, p, out),
@@ -4602,7 +4623,7 @@ pub(crate) fn steihaug_cg<MatVec, ApplyPrec>(
     relative_tolerance: f64,
     trust_radius: f64,
     metric_weights: Option<&MetricWeights>,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError>
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError>
 where
     MatVec: FnMut(&Array1<f64>, &mut Array1<f64>),
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
@@ -4622,15 +4643,15 @@ where
     };
     let rhs_norm = metric_norm(rhs.view(), metric_weights);
     if rhs_norm == 0.0 {
-        return Ok((Array1::<f64>::zeros(n), PcgDiagnostics::default()));
+        return Ok((Array1::<f64>::zeros(n), ArrowPcgDiagnostics::default()));
     }
     let tol = (relative_tolerance.max(0.0) * rhs_norm).max(PCG_ABSOLUTE_TOLERANCE_FLOOR);
     let mut x = Array1::<f64>::zeros(n);
     let mut r = rhs.clone();
     let mut z = apply_preconditioner(&r);
-    let mut diag = PcgDiagnostics {
+    let mut diag = ArrowPcgDiagnostics {
         precond_apply_calls: 1,
-        ..PcgDiagnostics::default()
+        ..ArrowPcgDiagnostics::default()
     };
     let mut p = z.clone();
     let mut rz = metric_dot(&r, &z, metric_weights);

@@ -3281,7 +3281,7 @@ impl<'a> RemlState<'a> {
 
         let hessian = match decision.map(|decision| decision.strategy) {
             Some(HessianEvalStrategyKind::SpectralExact) => result.hessian,
-            None => HessianResult::Unavailable,
+            None => HessianValue::Unavailable,
         };
 
         // SINGLE SOURCE OF TRUTH for the outer objective VALUE: this

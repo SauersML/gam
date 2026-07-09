@@ -416,6 +416,65 @@ h2 em {
   font: 400 9px/1.4 var(--mono);
 }
 
+.selection-pill {
+  position: absolute;
+  bottom: 96px;
+  left: 24px;
+  z-index: 5;
+  display: flex;
+  gap: 11px;
+  align-items: center;
+  max-width: min(360px, calc(100% - 48px));
+  padding: 10px 14px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 4px;
+  background: rgba(12,13,18,.88);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px);
+  transition: opacity 180ms ease, transform 180ms ease;
+  backdrop-filter: blur(14px);
+}
+
+.selection-pill.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.selection-pill > i {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--violet);
+}
+
+.selection-pill span {
+  min-width: 0;
+}
+
+.selection-pill small,
+.selection-pill strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selection-pill small {
+  margin-bottom: 4px;
+  color: #777680;
+  font: 400 7px/1 var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.selection-pill strong {
+  color: #d9d7df;
+  font-size: 10px;
+  font-weight: 500;
+}
+
 .view-controls {
   position: absolute;
   top: 24px;
@@ -510,7 +569,7 @@ h2 em {
 }
 
 #inspectorContent {
-  padding: clamp(42px, 6vh, 78px) 4px 20px;
+  padding: clamp(34px, 4.5vh, 58px) 4px 20px;
 }
 
 .signal-icon {
@@ -560,6 +619,39 @@ h2 em {
   border: 1px solid currentColor;
   border-radius: 50%;
   content: "";
+}
+
+.object-identity {
+  display: grid;
+  gap: 6px;
+  margin: -12px 0 30px;
+  padding: 13px 14px;
+  border: 1px solid rgba(255,255,255,.09);
+  border-left-color: rgba(167,139,250,.65);
+  background: rgba(255,255,255,.025);
+}
+
+.object-identity span,
+.object-identity small {
+  color: #686770;
+  font: 400 7px/1.35 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.object-identity strong {
+  color: #e5e2e9;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.object-identity small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: .02em;
+  text-transform: none;
 }
 
 #inspectorContent h2 {
@@ -630,11 +722,12 @@ h2 em {
 .legend .cube {
   width: 8px;
   height: 8px;
+  border: 1px solid currentColor;
   border-radius: 2px;
 }
 
-.legend .attention { background: var(--cyan); }
-.legend .mlp { background: var(--magenta); }
+.legend .attention { background: rgba(53,214,255,.28); color: var(--cyan); }
+.legend .mlp { background: rgba(243,75,181,.28); color: var(--magenta); }
 
 .inspector-footer {
   display: flex;
@@ -851,9 +944,11 @@ body.stage-only .experience {
   .equation-card { max-width: 620px; }
   .experience { grid-template-columns: 1fr; grid-template-rows: auto 680px auto; }
   .inspector { min-height: 430px; border-top: 1px solid var(--line); border-left: 0; }
-  #inspectorContent { display: grid; grid-template-columns: 100px 1fr 1.4fr; gap: 20px; align-items: start; padding: 44px 0 24px; }
+  #inspectorContent { display: grid; grid-template-columns: 80px minmax(210px, .85fr) 1.25fr; gap: 18px 24px; align-items: start; padding: 38px 0 24px; }
   #inspectorContent .signal-icon { grid-row: 1 / 3; }
-  #inspectorContent h2 { margin: 0; }
+  #inspectorContent .object-identity { grid-column: 2; margin: 0; }
+  #inspectorContent h2 { grid-column: 2; margin: 0; }
+  #inspectorContent > div:last-child { grid-column: 3; grid-row: 1 / 3; }
   .legend { margin-top: 0; }
   .explanation { grid-template-columns: 150px 1fr; }
   .concept-grid { grid-column: 1 / -1; }
@@ -877,7 +972,9 @@ body.stage-only .experience {
   .inspector { padding: 28px 22px 20px; }
   #inspectorContent { display: block; padding-top: 36px; }
   #inspectorContent .signal-icon { margin-bottom: 26px; }
+  #inspectorContent .object-identity { margin-bottom: 26px; }
   #inspectorContent h2 { margin-bottom: 20px; }
+  .selection-pill { right: 14px; bottom: 82px; left: 14px; max-width: none; }
   .explanation { grid-template-columns: 1fr; }
   .section-number { position: absolute; top: 75px; right: 20px; opacity: .6; }
   .concept-grid { grid-template-columns: 1fr; }

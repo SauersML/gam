@@ -6898,5 +6898,5 @@ pub(crate) struct BorrowedJointDerivProvider<'a> {
     /// to the per-pair `compute_d2h` dispatch and preserves the historical
     /// dispatch cost.
     pub(crate) compute_d2h_many: Option<&'a DriftSecondDerivManyFn<'a>>,
-    pub(crate) family_outer_hessian_operator: Option<Arc<dyn gam_problem::OuterHessianOperator>>,
+    pub(crate) family_outer_hessian_operator: Option<Arc<dyn gam_problem::HessianOperator>>,
 }

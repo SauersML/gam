@@ -1,4 +1,4 @@
-use gam_optimize::{BacktrackConfig, backtracking_line_search, constants};
+use opt::{BacktrackConfig, backtracking_line_search, constants};
 use ndarray::{Array1, ArrayView1};
 
 use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};

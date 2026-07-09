@@ -1078,7 +1078,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         context: &str,
         order: crate::rho_optimizer::OuterEvalOrder,
         design_revision: Option<u64>,
-    ) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), EstimationError> {
+    ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
         let order = if matches!(
             order,
             crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian

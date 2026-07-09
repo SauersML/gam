@@ -745,10 +745,11 @@ pub(crate) fn materialize_survival<'a>(
         }
     }
     let marginal_slope_frailty = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        Some(fixed_gaussian_shift_frailty_from_spec(
-            &config.frailty,
-            "survival marginal-slope",
-        )?)
+        Some(
+            config
+                .frailty
+                .resolve_fixed_gaussian_shift("survival marginal-slope")?,
+        )
     } else {
         None
     };

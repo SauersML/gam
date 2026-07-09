@@ -741,7 +741,7 @@ fn add_latent_id_objective_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     ),
 ) -> Result<(), EstimationError> {
     let contribution =
@@ -756,7 +756,7 @@ fn add_latent_id_objective_to_eval(
     }
     eval.1 += &contribution.gradient;
     if eval.2.is_analytic() {
-        eval.2 = gam_problem::HessianResult::Unavailable;
+        eval.2 = gam_problem::HessianValue::Unavailable;
     }
     Ok(())
 }
@@ -826,7 +826,7 @@ fn add_analytic_penalty_hessian_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     ),
 ) -> Result<(), EstimationError> {
     let flat_len = latent.len();
@@ -841,9 +841,9 @@ fn add_analytic_penalty_hessian_to_eval(
             rho_end
         );
     }
-    let gam_problem::HessianResult::Analytic(hessian) = &mut eval.2 else {
+    let gam_problem::HessianValue::Dense(hessian) = &mut eval.2 else {
         if eval.2.is_analytic() {
-            eval.2 = gam_problem::HessianResult::Unavailable;
+            eval.2 = gam_problem::HessianValue::Unavailable;
         }
         return Ok(());
     };
@@ -905,7 +905,7 @@ fn add_analytic_penalty_objective_to_eval(
     eval: &mut (
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     ),
 ) -> Result<(), EstimationError> {
     let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
@@ -1203,7 +1203,7 @@ macro_rules! impl_exact_joint_theta_memo {
         ) -> Option<(
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
         )> {
             if self
                 .current_theta
@@ -1221,7 +1221,7 @@ macro_rules! impl_exact_joint_theta_memo {
             eval: (
                 f64,
                 Array1<f64>,
-                gam_problem::HessianResult,
+                gam_problem::HessianValue,
             ),
         ) {
             self.last_cost = Some(eval.0);
@@ -1244,7 +1244,7 @@ struct SingleBlockExactJointDesignCache<'d> {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     )>,
     // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
     // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
@@ -1416,7 +1416,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     ) -> Option<(
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     )> {
         if self
             .last_eval_theta
@@ -1438,7 +1438,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         eval: (
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
         ),
     ) {
         self.last_eval_theta = Some(theta.clone());
@@ -1515,7 +1515,7 @@ struct SingleBlockLatentCoordDesignCache {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     )>,
     term_index: gam_problem::types::SmoothTermIdx,
     feature_cols: Vec<usize>,
@@ -1948,7 +1948,7 @@ impl SingleBlockLatentCoordDesignCache {
     ) -> Option<(
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     )> {
         if self
             .current_theta
@@ -1968,7 +1968,7 @@ impl SingleBlockLatentCoordDesignCache {
         eval: (
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
         ),
     ) {
         self.last_cost = Some(eval.0);
@@ -3722,7 +3722,7 @@ impl<'d> SpatialJointContext<'d> {
         (
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
         ),
         EstimationError,
     > {
@@ -4232,7 +4232,7 @@ fn run_exact_joint_spatial_optimization(
     // problem size. The unified REML evaluator now exposes exact matrix-free
     // outer Hessian operators for the costly third/fourth-derivative
     // contractions used by spatial ψ coordinates; its internal
-    // `(n, p, K)` work model chooses `HessianResult::Operator` at large-scale
+    // `(n, p, K)` work model chooses `HessianValue::Operator` at large-scale
     // scale and the dense analytic matrix only below that crossover. Keeping
     // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
     // optimization for `n > 50_000` and `coord_dim > 30` instead of forcing the
@@ -4567,7 +4567,7 @@ fn run_exact_joint_spatial_optimization(
                 (
                     f64,
                     Array1<f64>,
-                    gam_problem::HessianResult,
+                    gam_problem::HessianValue,
                 ),
                 String,
             > {
@@ -6767,7 +6767,7 @@ struct ExactJointDesignCache<'d> {
     last_eval: Option<(
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     )>,
     rho_dim: usize,
     all_dims: Vec<usize>,
@@ -7253,7 +7253,7 @@ where
         (
             f64,
             Array1<f64>,
-            gam_problem::HessianResult,
+            gam_problem::HessianValue,
         ),
         String,
     >,
@@ -8052,7 +8052,7 @@ fn try_exact_joint_latent_coord_optimization(
             (
                 f64,
                 Array1<f64>,
-                gam_problem::HessianResult,
+                gam_problem::HessianValue,
             ),
             EstimationError,
         > {

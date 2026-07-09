@@ -8,7 +8,7 @@ use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
 use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
 use gam_linalg::utils::StableSolver;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use opt::{BacktrackConfig, backtracking_line_search};
 use gam_problem::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 use std::convert::Infallible;

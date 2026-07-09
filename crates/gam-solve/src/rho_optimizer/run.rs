@@ -902,7 +902,7 @@ pub struct OuterResult {
     /// (gradient-free solvers, cache-hit short-circuits, per-atom EFS) or
     /// when an audit probe failed to evaluate. Populated once by
     /// [`run_outer`] after the solver ladder returns, outside all hot loops.
-    pub criterion_certificate: Option<CriterionCertificate>,
+    pub criterion_certificate: Option<OuterCriterionCertificate>,
     /// Post-fit PSIS diagnostic for whether sampled smoothing-parameter weights
     /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
@@ -1076,7 +1076,7 @@ pub(crate) fn audit_first_order_optimality(
     config: &OuterConfig,
     context: &str,
     result: &OuterResult,
-) -> Option<CriterionCertificate> {
+) -> Option<OuterCriterionCertificate> {
     let gradient = result.final_gradient.as_ref()?;
     if gradient.is_empty()
         || gradient.len() != result.rho.len()
@@ -1176,7 +1176,7 @@ pub(crate) fn audit_first_order_optimality(
     let grad_norm = gradient.dot(gradient).sqrt();
     let agreement_z = (analytic_directional - fd_directional).abs() / fd_error; // fd-ok: FD-audit certificate, not in math path
 
-    let certificate = CriterionCertificate {
+    let certificate = OuterCriterionCertificate {
         grad_norm,
         analytic_directional,
         fd_directional, // fd-ok: FD-audit certificate, not in math path
@@ -1805,13 +1805,11 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         lower,
         upper,
     );
-    let topology =
-        crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
+    let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
-    let result = crate::estimate::reml::per_atom_efs::run_per_atom_efs(
-        obj, &seed, &pa_cfg, &topology,
-    )?;
+    let result =
+        crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
     Ok(Some(result.into_outer_result(the_plan)))
 }
 

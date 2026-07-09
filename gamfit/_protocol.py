@@ -68,7 +68,6 @@ class BasisDescriptor(ABC):
         t_t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t, dtype=torch.float64)
         if not t_t.requires_grad:
             t_t = t_t.detach().clone().requires_grad_(True)
-        phi = self.evaluate(t_t)
         return torch.autograd.functional.jacobian(lambda x: self.evaluate(x), t_t)
 
     def hessian(self, t: Any) -> Any:

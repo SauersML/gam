@@ -202,7 +202,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use opt::{BacktrackConfig, backtracking_line_search};
 
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /

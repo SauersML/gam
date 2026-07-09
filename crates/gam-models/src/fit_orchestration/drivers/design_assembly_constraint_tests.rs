@@ -3341,11 +3341,11 @@ pub(super) fn run_two_block_exact_joint_optimize(
                     eval_mode,
                     gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
-                    gam_problem::HessianResult::Analytic(Array2::zeros((
+                    gam_problem::HessianValue::Dense(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    gam_problem::HessianResult::Unavailable
+                    gam_problem::HessianValue::Unavailable
                 },
             ))
         },
@@ -4340,7 +4340,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                     theta: &Array1<f64>,
                     with_hessian: bool|
      -> (f64, Array1<f64>, Option<Array2<f64>>) {
-        use gam_problem::HessianResult;
+        use gam_problem::HessianValue;
         cache.ensure_theta(theta).unwrap_or_else(|e| panic!("{} failed: {:?}", "ensure_theta", e));
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
@@ -4369,7 +4369,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate_with_order", e));
         let hess_mat = if with_hessian {
             match hess {
-                HessianResult::Analytic(h) => Some(h),
+                HessianValue::Dense(h) => Some(h),
                 _ => None,
             }
         } else {
@@ -6480,11 +6480,11 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                     eval_mode,
                     gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
                 ) {
-                    gam_problem::HessianResult::Analytic(Array2::zeros((
+                    gam_problem::HessianValue::Dense(Array2::zeros((
                         theta_dim, theta_dim,
                     )))
                 } else {
-                    gam_problem::HessianResult::Unavailable
+                    gam_problem::HessianValue::Unavailable
                 },
             ))
         },
@@ -6771,7 +6771,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         2.25,
         Array1::<f64>::ones(theta0.len()),
-        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        gam_problem::HessianValue::Dense(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval(eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
@@ -6887,7 +6887,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let eval = (
         0.5,
         Array1::<f64>::ones(theta0.len()),
-        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
+        gam_problem::HessianValue::Dense(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval_at(&theta0, eval.clone());
     let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
@@ -6997,7 +6997,7 @@ fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance
     let eval = (
         1.25_f64,
         Array1::<f64>::from_elem(theta.len(), 0.5),
-        gam_problem::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
+        gam_problem::HessianValue::Dense(Array2::<f64>::eye(theta.len())),
     );
     cache.store_eval(eval.clone());
 

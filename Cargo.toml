@@ -38,7 +38,6 @@ members = [
     "crates/gam-data",
     "crates/gam-spec",
     "crates/gam-linalg",
-    "crates/gam-optimize",
     "crates/gam-geometry",
     "crates/gam-model-api",
     "crates/gam-gpu",
@@ -67,19 +66,13 @@ warnings = "deny"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
-comfy-table = "7.2.2"
 rayon = "1.12.0"
 rand = "0.10.1"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.18"
-opt = "=0.5.12"
 log = "0.4.29"
-libloading = "0.8.9"
 csv = "1.4.0"
 faer = "0.24.0"
-memmap2 = "0.9.10"
-dyn-stack = "0.13.2"
 # `float_roundtrip` makes the JSON parser bit-exact for f64: serialization
 # (ryu) is already shortest-round-trippable, but the DEFAULT parser can be off
 # by 1 ULP on some values, so a saved model could predict infinitesimally
@@ -101,7 +94,6 @@ gam-spec = { path = "crates/gam-spec", version = "=0.3.148" }
 gam-runtime = { path = "crates/gam-runtime", version = "=0.3.148" }
 gam-linalg = { path = "crates/gam-linalg", version = "=0.3.148" }
 gam-geometry = { path = "crates/gam-geometry", version = "=0.3.148" }
-gam-model-api = { path = "crates/gam-model-api", version = "=0.3.148" }
 gam-gpu = { path = "crates/gam-gpu", version = "=0.3.148" }
 gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.148" }
 gam-terms = { path = "crates/gam-terms", version = "=0.3.148" }
@@ -119,14 +111,7 @@ gam-sae = { path = "crates/gam-sae", version = "=0.3.148" }
 # `#[macro_export]` macros) so the integration tests under `tests/` keep their
 # `gam::test_support::*` / `gam::gam_binary!` paths unchanged.
 gam-test-support = { path = "crates/gam-test-support", version = "=0.3.148" }
-pest = "2.8.6"
-pest_derive = "2.8.6"
-arrow = { version = "54", default-features = false, features = ["ffi"] }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 wide = "0.7"
-smallvec = "1"
-sha2 = "0.10.8"
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-13000"] }

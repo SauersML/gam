@@ -98,7 +98,6 @@ pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 /// refine budget — terminating the ill-conditioned crawl early is the goal.
 pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
 
-
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
@@ -232,8 +231,8 @@ pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 pub(crate) const SAE_DECODER_REPULSION_BARRIER_RATIO: f64 = 1.0e-4;
 
 // The derived decoder-repulsion strength is a dimensionless fraction
-// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (possibly
-// runtime-overridden) separation-barrier strength μ_C; it is computed on the
+// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (or explicitly
+// per-fit) separation-barrier strength μ_C; it is computed on the
 // term itself (it needs the dictionary's overcompleteness, not a global
 // constant) — see [`super::penalties::SaeManifoldTerm::decoder_repulsion_strength`].
 
@@ -272,56 +271,6 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 // anti-collapse core: they are interior-point log-barriers that DIVERGE at the
 // collapse boundary, so the inner Newton can never reach it.
 
-// #1026/#1522 — RUNTIME separation-barrier-strength override. Read through the
-// accessor below so a SINGLE compiled wheel can sweep μ_sep from Python
-// (`set_sae_barrier_overrides`) without recompiling. A quiet-NaN sentinel means
-// "unset → derive μ_C from the problem" (the data-derived overcompleteness
-// ratio), so 0.0 remains a legitimate swept value (barrier disabled). The amplitude
-// (keep-alive) barrier was removed: an over-complete dictionary's surplus
-// features SHOULD die, and a dead atom's decoder block is parked into a
-// well-conditioned state by the inner per-row Tikhonov ridge — forcing the
-// norm away from zero only over-inflated healthy atoms and fought that natural
-// death. So there is no amplitude strength or active-atom gate to override.
-static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
-/// #1026/#1522/#1610 — read the process-global override for the decoder-repulsion
-/// CONDITIONER strength `μ_C`, or `None` when unset. `None` ⇒ the evidence-derived
-/// per-pair `μ_jk` (data-fit inseparability from
-/// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]) is
-/// used. NOTE: this no longer scales the primary separation barrier — that is now
-/// the parameter-free Jeffreys prior `−½ log det F` — only the subdominant
-/// repulsion conditioner. A quiet-NaN sentinel means "unset → derive from the
-/// problem"; `0.0` stays a legitimate swept value (conditioner disabled).
-pub(crate) fn sae_separation_barrier_override() -> Option<f64> {
-    let v =
-        f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
-    if v.is_nan() { None } else { Some(v) }
-}
-
-/// Set the process-global override for the SAE decoder-repulsion CONDITIONER
-/// strength `μ_C` (one wheel, many configs). NOTE: the primary separation barrier
-/// is now the parameter-free Jeffreys prior `−½ log det F` and ignores this — the
-/// override scales only the subdominant repulsion conditioner. `sep_strength` is
-/// NaN to clear the override back to the evidence-derived per-pair `μ_jk`
-/// (`γ_jk / (1 - γ_jk)`, the data-fit inseparability strength — see
-/// [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]); there
-/// is no compiled-constant default any more.
-/// The amplitude (keep-alive) barrier and its active-atom gate were removed
-/// (surplus features are allowed to die into a ridge-parked state), so this
-/// takes only the conditioner strength. Called from the gamfit Python FFI.
-///
-/// CONCURRENCY: this is a PROCESS-GLOBAL atomic, so it is NOT safe to use across
-/// concurrent in-process fits — a parallel candidate/rung/layer sweep that sets
-/// different strengths in different threads will leak the override between fits
-/// (last writer wins for all readers). It is intended for a single-fit-at-a-time
-/// CLI/notebook sweep where the process runs one configuration at a time. The
-/// proper fix is to migrate this to a per-fit configuration field threaded
-/// through the solver rather than a global; that refactor is out of scope here.
-pub fn set_sae_barrier_overrides(sep_strength: f64) {
-    SAE_SEP_STRENGTH_OVERRIDE_BITS
-        .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
 // The SEPARATION barrier has NO strength scalar `μ_C` at all: it is the SAE decoder
 // Jeffreys prior `−½ log det F` (see [`super::penalties::BarrierComponent`]), whose
 // exponent `½` is fixed by the prior (`π(B) ∝ √det F`) and is the exact
@@ -330,8 +279,8 @@ pub fn set_sae_barrier_overrides(sep_strength: f64) {
 // historical `μ_jk = γ_jk/(1−γ_jk)` (data-fit inseparability, see
 // [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]) survives
 // ONLY as the per-dictionary strength of the subdominant decoder-repulsion CONDITIONER
-// (`decoder_repulsion_strength = ratio · μ_C`), not of the barrier. The runtime
-// override (`set_sae_barrier_overrides`) therefore now scales only that conditioner.
+// (`decoder_repulsion_strength = ratio · μ_C`), not of the barrier. An explicit
+// per-fit strength can scale that conditioner through [`SaeFitConfig`].
 
 /// SEPARATION barrier softening `ε`: the floor on the eigenvalues of the Jeffreys
 /// Fisher `F = Q ∘ O` (see [`super::penalties::BarrierComponent`]) in
@@ -638,16 +587,14 @@ pub struct SaeManifoldTerm {
     /// [`Self::set_hybrid_linear_images`]. Consulted by
     /// [`Self::hybrid_linear_image_map`] so train and OOS share one collapse map.
     pub(crate) oos_linear_images: Option<Vec<crate::hybrid_split::AtomLinearImage>>,
-    /// #1777 PER-FIT decoder-repulsion CONDITIONER strength override `μ_C` — the
-    /// source of truth for the conditioner strength when set, replacing the
-    /// process-global [`set_sae_barrier_overrides`] atomic. NOTE: the primary
+    /// #1777 PER-FIT decoder-repulsion CONDITIONER strength override `μ_C`. The
+    /// primary
     /// separation barrier is now the parameter-free Jeffreys prior `−½ log det F`
     /// and ignores this; the override scales only the subdominant repulsion
     /// conditioner. `Some(μ_C)` forces the absolute strength (bypassing the #1610
     /// evidence-derived per-pair reciprocal-margin strengths), scoped to THIS
     /// term/fit so concurrent in-process fits are isolated; `0.0` disables the
-    /// conditioner. `None` ⇒ fall back to the deprecated process-global override,
-    /// then the evidence-derived strength. Read via
+    /// conditioner. `None` uses the evidence-derived strength. Read via
     /// [`super::penalties::SaeManifoldTerm::separation_barrier_strength`]; set from
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
@@ -748,25 +695,18 @@ pub struct SaeManifoldTerm {
     pub(crate) tier0_mean: Option<Array1<f64>>,
 }
 
-/// #1777 — PER-FIT configuration overrides the FFI sets on a term to isolate a
-/// fit from the deprecated process-global atomics
-/// ([`set_sae_barrier_overrides`] / [`crate::assignment::set_ibp_alpha_override`]).
-///
-/// This is the additive, back-compatible config surface the Python/FFI layer
-/// consumes: build it, then apply it with [`SaeManifoldTerm::set_fit_config`]. Any
-/// `None` field leaves the corresponding axis on its historical fallback
-/// (process-global override, then the compiled/data-derived default), so an
-/// all-`None` config is a strict no-op. Both fields are the SOURCE OF TRUTH for
-/// their axis when `Some`, so two terms carrying different configs produce
-/// correspondingly-different barrier/α WITHOUT touching any global — concurrent
-/// fits are isolatable.
+/// Per-fit SAE configuration consumed by the Python/FFI layer. Build it, then
+/// apply it with [`SaeManifoldTerm::set_fit_config`]. A `None` field selects the
+/// corresponding canonical data-derived or assignment-mode default. Both fields
+/// are the source of truth for their axis when `Some`, so concurrent fits remain
+/// fully isolated.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SaeFitConfig {
-    /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses both the global
-    /// override and the #1610 evidence-derived per-pair strengths (`0.0` = barrier off).
+    /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses the #1610
+    /// evidence-derived per-pair strengths (`0.0` = conditioner off).
     pub separation_barrier_strength_override: Option<f64>,
-    /// Per-fit truncated-IBP concentration `α`. `Some` bypasses both the global
-    /// override and the mode's own `α` / learnable schedule.
+    /// Per-fit truncated-IBP concentration `α`. `Some` bypasses the mode's own
+    /// `α` / learnable schedule.
     pub ibp_alpha_override: Option<f64>,
 }
 
@@ -952,7 +892,10 @@ mod soft_rank_charge_flag_tests {
             !term.soft_rank_charge(),
             "soft_rank_charge must default OFF (bit-identical historical hard path)"
         );
-        assert!(!term.clone().soft_rank_charge(), "a false flag must clone as false");
+        assert!(
+            !term.clone().soft_rank_charge(),
+            "a false flag must clone as false"
+        );
 
         term.set_soft_rank_charge(true);
         assert!(term.soft_rank_charge());

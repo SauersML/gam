@@ -34,7 +34,7 @@ pub struct RemlLamlResult {
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
-    pub hessian: gam_problem::HessianResult,
+    pub hessian: gam_problem::HessianValue,
     /// Rho-coordinate mode responses, one `K · g_j` vector per column, when
     /// they were already built for derivative corrections. Consumed by the
     /// runtime IFT mode-response cache for joint-IFT warm starts.
@@ -785,7 +785,7 @@ pub(crate) fn tangent_penalty_logdet(
     }
     let mut first = Array1::<f64>::zeros(k);
     for k_idx in 0..k {
-        first[k_idx] = lambdas[k_idx] * trace_matrix_product(&s_t_plus, &zsz[k_idx]);
+        first[k_idx] = lambdas[k_idx] * dense::trace_product(&s_t_plus, &zsz[k_idx]);
     }
     let mut second = Array2::<f64>::zeros((k, k));
     // δ_{kl} ∂_k value contribution (from ∂_ρ_l λ_k = λ_k δ_{kl}).
@@ -796,7 +796,7 @@ pub(crate) fn tangent_penalty_logdet(
     let s_plus_zsz: Vec<Array2<f64>> = zsz.iter().map(|m_k| s_t_plus.dot(m_k)).collect();
     for k_idx in 0..k {
         for l_idx in 0..=k_idx {
-            let cross = trace_matrix_product(&s_plus_zsz[k_idx], &s_plus_zsz[l_idx]);
+            let cross = dense::trace_product(&s_plus_zsz[k_idx], &s_plus_zsz[l_idx]);
             let entry = -lambdas[k_idx] * lambdas[l_idx] * cross;
             second[[k_idx, l_idx]] += entry;
             if l_idx != k_idx {
@@ -873,7 +873,7 @@ impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
         self.0.outer_hessian_derivative_kernel()
     }
-    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::HessianOperator>> {
         self.0.family_outer_hessian_operator()
     }
     fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {

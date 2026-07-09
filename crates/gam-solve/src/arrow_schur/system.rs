@@ -457,8 +457,6 @@ impl ArrowSchurSystem {
         }
     }
 
-
-
     /// Allocate a heterogeneous-row arrow system with no dense shared `H_ββ`
     /// block and with row `H_tβ` slabs allocated at `htbeta_cols` columns.
     pub fn new_with_per_row_dims_empty_hbb_and_htbeta_cols(
@@ -1161,12 +1159,12 @@ impl ArrowSchurSystem {
     /// Call [`ArrowSchurSystem::solve_with_options`] to force Square-Root BA
     /// or a specific inexact solve policy.
     ///
-    /// Returns `(delta_t, delta_beta, PcgDiagnostics)` with `delta_t` flat
+    /// Returns `(delta_t, delta_beta, ArrowPcgDiagnostics)` with `delta_t` flat
     /// row-major of length `N · d` and `delta_beta` of length `K`. The sign
     /// convention matches `solve_newton_direction_dense`: the returned
     /// increments satisfy the bordered system with RHS `[-g_t; -g_β]`, i.e.
     /// they are the *negated* solutions of the standard Newton-direction
-    /// formulation. `PcgDiagnostics` is zero-valued for the Direct path and
+    /// formulation. `ArrowPcgDiagnostics` is zero-valued for the Direct path and
     /// carries live counters (PCG iters, ridge escalations, residual) for
     /// InexactPCG.
     ///
@@ -1179,7 +1177,7 @@ impl ArrowSchurSystem {
         &self,
         ridge_t: f64,
         ridge_beta: f64,
-    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
         let options = ArrowSolveOptions::automatic(self.k);
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
     }
@@ -1202,18 +1200,18 @@ impl ArrowSchurSystem {
         &self,
         ridge_t: f64,
         ridge_beta: f64,
-    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
         let options = ArrowSolveOptions::automatic(self.k);
         solve_with_lm_escalation_inner(self, ridge_t, ridge_beta, &options)
     }
 
-    /// Solve with an explicit BA Schur mode, returning `(Δt, Δβ, PcgDiagnostics)`.
+    /// Solve with an explicit BA Schur mode, returning `(Δt, Δβ, ArrowPcgDiagnostics)`.
     ///
     /// [`ArrowSolverMode::Direct`] is the classic dense reduced-camera-system
     /// Cholesky path; [`ArrowSolverMode::SqrtBA`] forms the same dense system
     /// through Square-Root BA factors; [`ArrowSolverMode::InexactPCG`] runs
     /// inexact-step LM on the reduced system with Jacobi-preconditioned
-    /// Steihaug-CG. `PcgDiagnostics` is zero-valued for Direct/SqrtBA and
+    /// Steihaug-CG. `ArrowPcgDiagnostics` is zero-valued for Direct/SqrtBA and
     /// carries live counters for InexactPCG (iterations, matvec calls,
     /// preconditioner escalations, final relative residual, stopping reason).
     pub fn solve_with_options(
@@ -1221,7 +1219,7 @@ impl ArrowSchurSystem {
         ridge_t: f64,
         ridge_beta: f64,
         options: &ArrowSolveOptions,
-    ) -> Result<(Array1<f64>, Array1<f64>, PcgDiagnostics), ArrowSchurError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, options)
     }
 }
@@ -2549,7 +2547,7 @@ pub struct ArrowFactorCache {
     ///
     /// Zero-valued (default) when the selected mode did not use PCG
     /// (i.e. `Direct` or `SqrtBA`).
-    pub pcg_diagnostics: PcgDiagnostics,
+    pub pcg_diagnostics: ArrowPcgDiagnostics,
     /// Number of row-local gauge directions stiffened in an undamped evidence
     /// factorization.
     ///
@@ -3209,10 +3207,10 @@ impl ArrowFactorCache {
     /// include the injected host-procedural reduced-Schur matvec, whose
     /// arithmetic runs on the CPU even when a CUDA context was opened to build
     /// per-row factors (#1209) — that path sets
-    /// `PcgDiagnostics::injected_host_procedural_matvec` instead. Read-only
+    /// `ArrowPcgDiagnostics::injected_host_procedural_matvec` instead. Read-only
     /// routing provenance: lets a fit result record device-vs-CPU as ground
     /// truth instead of inferring it from the runtime probe. Mirrors
-    /// `PcgDiagnostics::used_device_arrow`.
+    /// `ArrowPcgDiagnostics::used_device_arrow`.
     #[must_use]
     pub fn used_device(&self) -> bool {
         self.pcg_diagnostics.used_device_arrow

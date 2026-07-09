@@ -2,7 +2,7 @@ use super::family::clamp_bernoulli_link_probability;
 use super::*;
 use gam_linalg::matrix::{LinearOperator, SignedWeightsView};
 use gam_math::jet_tower::Tower4;
-use gam_optimize::{
+use opt::{
     BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge,
 };
 

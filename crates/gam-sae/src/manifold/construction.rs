@@ -241,18 +241,14 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// #1777 — apply the PER-FIT configuration overrides (the FFI-facing
-    /// [`SaeFitConfig`]) as the source of truth for this term's fit, isolating it
-    /// from the deprecated process-global barrier/α atomics.
+    /// Apply the FFI-facing [`SaeFitConfig`] as the source of truth for this fit.
     ///
     /// Distributes the config to its two authorities: the barrier strength override
     /// onto the term (read by `separation_barrier_strength`), and the IBP-α
     /// override onto the assignment (read by
-    /// [`SaeAssignment::resolved_ibp_alpha`]). Any `None` field leaves that axis on
-    /// its historical fallback (process-global override, then the
-    /// data-derived/mode default), so an all-`None` config is a strict no-op. Call
-    /// this after building the term (before the fit) so concurrent fits carrying
-    /// distinct configs stay isolated without any global writes.
+    /// [`SaeAssignment::resolved_ibp_alpha`]). A `None` field selects the canonical
+    /// data-derived or assignment-mode default. Call this after building the term
+    /// and before fitting; distinct terms remain isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
         self.assignment
@@ -1105,9 +1101,9 @@ impl SaeManifoldTerm {
         if z.nrows() == 0 {
             return Err("SaeManifoldTerm::fit_tier0_mean: empty target".to_string());
         }
-        let mean = z
-            .mean_axis(ndarray::Axis(0))
-            .ok_or_else(|| "SaeManifoldTerm::fit_tier0_mean: mean_axis returned None".to_string())?;
+        let mean = z.mean_axis(ndarray::Axis(0)).ok_or_else(|| {
+            "SaeManifoldTerm::fit_tier0_mean: mean_axis returned None".to_string()
+        })?;
         let demeaned = &z - &mean.view().insert_axis(ndarray::Axis(0));
         self.set_tier0_mean(mean)?;
         Ok(demeaned)
@@ -1525,18 +1521,14 @@ impl SaeManifoldTerm {
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let support = SupportMeasure::from_assignment_matrix(assignments, atom_idx)?;
             let active_token_count = support.positive_rows().len();
-            let coverage = if n > 0 {
-                support.ess() / n as f64
-            } else {
-                0.0
-            };
+            let coverage = if n > 0 { support.ess() / n as f64 } else { 0.0 };
             let activation_frequency = if n > 0 {
                 support.mass() / n as f64
             } else {
                 0.0
             };
-            let (sigma_min_tangent, sigma_max_tangent) = self
-                .atom_tangent_spectrum_from_assignments(atom_idx, &support, &metric)?;
+            let (sigma_min_tangent, sigma_max_tangent) =
+                self.atom_tangent_spectrum_from_assignments(atom_idx, &support, &metric)?;
             let tangent_condition_score = if sigma_max_tangent > 0.0 {
                 (sigma_min_tangent / sigma_max_tangent).clamp(0.0, 1.0)
             } else {
@@ -2614,8 +2606,7 @@ impl SaeManifoldTerm {
                         with_nested_parallel(|| {
                             for atom_idx in 0..k_atoms {
                                 let mut arow = drow.row_mut(atom_idx);
-                                let arow =
-                                    arow.as_slice_mut().expect("contiguous decoded row");
+                                let arow = arow.as_slice_mut().expect("contiguous decoded row");
                                 atoms[atom_idx].fill_decoded_row(row, arow);
                             }
                         });
@@ -3787,10 +3778,7 @@ impl SaeManifoldTerm {
         // keep the one-mat-vec encode without a broad slow-path regression.
         // Euclidean-metric, prior-free fits (empty `log_ard`) skip this branch and
         // take the cascade below bit-for-bit unchanged.
-        let metric = self
-            .row_metric
-            .as_ref()
-            .filter(|m| m.whitens_likelihood());
+        let metric = self.row_metric.as_ref().filter(|m| m.whitens_likelihood());
         let prior_active = self
             .atoms
             .iter()
@@ -3828,7 +3816,9 @@ impl SaeManifoldTerm {
                 // across atoms (the metric is atom-independent — output-space). `None`
                 // when no likelihood-whitening metric is active (identity whitening).
                 let u_row = metric.map(|m| {
-                    Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| m.factor_entry(row, i, k))
+                    Array2::<f64>::from_shape_fn((p, metric_rank), |(i, k)| {
+                        m.factor_entry(row, i, k)
+                    })
                 });
                 for atom_idx in 0..k_atoms {
                     // The atom's fitted per-axis ARD precisions (empty ⇒ prior-free).
@@ -5902,7 +5892,10 @@ impl SaeManifoldTerm {
                 // this deflation — so `sys` stays undamped for the probe.
                 if sys.row_gauge_deflation.is_none() {
                     let n_rows = sys.rows.len();
-                    sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
+                    sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![
+                        Vec::new();
+                        n_rows
+                    ]));
                 }
                 let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                     match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
@@ -6191,8 +6184,9 @@ impl SaeManifoldTerm {
                 // this does not touch: it is a probe signal, not an acceptance gate.
                 if stationary_sys.row_gauge_deflation.is_none() {
                     let n_rows = stationary_sys.rows.len();
-                    stationary_sys
-                        .set_row_gauge_deflation(ArrowRowGaugeDeflation::new(vec![Vec::new(); n_rows]));
+                    stationary_sys.set_row_gauge_deflation(ArrowRowGaugeDeflation::new(
+                        vec![Vec::new(); n_rows],
+                    ));
                 }
                 if let Ok((stationary_dt, stationary_db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
@@ -6698,8 +6692,7 @@ impl SaeManifoldTerm {
             // drift linearly while the model it scores is frozen. (The outer
             // walk is bounded at |ρ| ≤ 30, so the band is unreachable in
             // production; this keeps the two conventions identical anyway.)
-            let log_lambda =
-                SaeManifoldRho::clamped_log_strength(rho.log_lambda_smooth[atom_idx]);
+            let log_lambda = SaeManifoldRho::clamped_log_strength(rho.log_lambda_smooth[atom_idx]);
             acc += 0.5 * (penalized_channel_dim as f64) * log_lambda;
         }
         // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer.
@@ -7034,8 +7027,11 @@ impl SaeManifoldTerm {
                 .iter()
                 .map(|coord| coord.as_matrix().slice(s![0..n_total, ..]).to_owned())
                 .collect();
-            let mut full_chunk =
-                self.materialize_chunk(full_logits, full_coords, self.chunk_frozen_logits(0, n_total))?;
+            let mut full_chunk = self.materialize_chunk(
+                full_logits,
+                full_coords,
+                self.chunk_frozen_logits(0, n_total),
+            )?;
             if let Some(w) = self.row_loss_weights.as_deref() {
                 full_chunk.row_loss_weights = Some(w[0..n_total].to_vec());
             }
@@ -7211,14 +7207,19 @@ impl SaeManifoldTerm {
         // it the streaming criterion would silently drop the entire cross-row
         // coupling and disagree with the dense path by exactly `log|C|`.
         if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
-            let correction =
-                streaming_cross_row_woodbury_log_det(&schur_acc, &m0, &w, &d, options.schur_pd_floor)
-                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
-                .ok_or_else(|| {
-                    "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
+            let correction = streaming_cross_row_woodbury_log_det(
+                &schur_acc,
+                &m0,
+                &w,
+                &d,
+                options.schur_pd_floor,
+            )
+            .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
+            .ok_or_else(|| {
+                "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
                      this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
-                        .to_string()
-                })?;
+                    .to_string()
+            })?;
             total += correction;
         }
         if let Some(ri) = rank_inputs.as_deref_mut() {
@@ -7559,7 +7560,11 @@ impl SaeManifoldTerm {
                 for atom in 0..k_atoms {
                     let slot = row * k_atoms + atom;
                     hdiag[slot] = super::construction_arrow_schur_assembly::ibp_psd_majorized_hdiag(
-                        ch, row, k_atoms, atom, hdiag[slot],
+                        ch,
+                        row,
+                        k_atoms,
+                        atom,
+                        hdiag[slot],
                     );
                 }
             }
@@ -8546,10 +8551,7 @@ impl SaeManifoldTerm {
                 // product of two √w-scaled jets, so √w·√w = w), so the correct single
                 // factor for this prior term is likewise full `w_row`. `None`
                 // weights ⇒ w_row = 1, bit-for-bit the historical derivative.
-                let w_row = self
-                    .row_loss_weights
-                    .as_deref()
-                    .map_or(1.0, |w| w[row]);
+                let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
                 -w_row * alpha * kappa * (kappa * t).sin()
             }
         }
@@ -9040,10 +9042,9 @@ impl SaeManifoldTerm {
                                 SaeLocalRowVar::Coord { atom: atom_b, .. },
                             ) => {
                                 let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
-                                h_ab
-                                    * Self::softmax_data_weight_product_logit_factor(
-                                        a_soft, atom_a, atom_b, atom_w, inv_tau,
-                                    )
+                                h_ab * Self::softmax_data_weight_product_logit_factor(
+                                    a_soft, atom_a, atom_b, atom_w, inv_tau,
+                                )
                             }
                             _ => {
                                 sae_dot(&jets.second[a][w], &jets.first[b])
@@ -9533,8 +9534,9 @@ impl SaeManifoldTerm {
             for l in 0..w_probes.len() {
                 for a in 0..q {
                     for b in 0..q {
-                        inv_vv[[a, b]] +=
-                            0.5 * inv_m * (w_probes[l][a] * s_probes[l][b] + s_probes[l][a] * w_probes[l][b]);
+                        inv_vv[[a, b]] += 0.5
+                            * inv_m
+                            * (w_probes[l][a] * s_probes[l][b] + s_probes[l][a] * w_probes[l][b]);
                     }
                 }
             }
@@ -9605,10 +9607,9 @@ impl SaeManifoldTerm {
                                 SaeLocalRowVar::Coord { atom: atom_b, .. },
                             ) => {
                                 let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
-                                h_ab
-                                    * Self::softmax_data_weight_product_logit_factor(
-                                        a_soft, atom_a, atom_b, atom_w, inv_tau,
-                                    )
+                                h_ab * Self::softmax_data_weight_product_logit_factor(
+                                    a_soft, atom_a, atom_b, atom_w, inv_tau,
+                                )
                             }
                             _ => {
                                 sae_dot(&jets.second[a][w], &jets.first[b])
@@ -9668,8 +9669,7 @@ impl SaeManifoldTerm {
                                 rd_l[c] += sc * bd[c];
                             }
                         }
-                        gamma += inv_m
-                            * (sae_dot(&rd_l, &p_probe[l]) + sae_dot(&r_probe[l], &q_l));
+                        gamma += inv_m * (sae_dot(&rd_l, &p_probe[l]) + sae_dot(&r_probe[l], &q_l));
                     }
                 }
                 gamma_t[base + w] = gamma;

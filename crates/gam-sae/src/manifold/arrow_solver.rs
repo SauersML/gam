@@ -311,7 +311,8 @@ mod selected_inverse_row_blocks_oracle_tests {
     //! α-trace consumers rely on when they take the fast path.
     use super::*;
     use gam_solve::arrow_schur::{
-        ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
+        ArrowFactorSlab, ArrowHtbetaCache, ArrowPcgDiagnostics, ArrowSolverMode,
+        ArrowUndampedFactors,
     };
     use ndarray::array;
     use std::sync::Arc;
@@ -349,7 +350,7 @@ mod selected_inverse_row_blocks_oracle_tests {
             k: 2,
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
-            pcg_diagnostics: PcgDiagnostics::default(),
+            pcg_diagnostics: ArrowPcgDiagnostics::default(),
             gauge_deflated_directions: 0,
             deflated_row_directions: Arc::from(Vec::new()),
             deflation_row_spectra: Arc::from(Vec::new()),

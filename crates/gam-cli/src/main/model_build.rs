@@ -31,36 +31,12 @@ pub(crate) fn latent_cloglog_state_from_frailty_spec(
     frailty: &gam::families::survival::lognormal_kernel::FrailtySpec,
     context: &str,
 ) -> Result<gam::types::LatentCLogLogState, String> {
-    let sigma = match frailty {
-        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(sigma),
-            loading: gam::families::survival::lognormal_kernel::HazardLoading::Full,
-        } => *sigma,
-        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(_),
-            loading,
-        } => {
-            return Err(format!(
-                "{context} requires --hazard-loading full, got {loading:?}"
-            ));
-        }
-        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
-            ..
-        } => {
-            return Err(format!("{context} currently requires a fixed --frailty-sd"));
-        }
-        gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift { .. } => {
-            return Err(format!(
-                "{context} requires --frailty-kind hazard-multiplier"
-            ));
-        }
-        gam::families::survival::lognormal_kernel::FrailtySpec::None => {
-            return Err(format!(
-                "{context} requires an explicit frailty specification"
-            ));
-        }
-    };
+    let (sigma, loading) = fixed_latent_hazard_frailty(frailty, context)?;
+    if loading != gam::families::survival::lognormal_kernel::HazardLoading::Full {
+        return Err(format!(
+            "{context} requires --hazard-loading full, got {loading:?}"
+        ));
+    }
     gam::types::LatentCLogLogState::new(sigma)
         .map_err(|e| format!("invalid latent-cloglog frailty sigma: {e}"))
 }
@@ -89,32 +65,6 @@ pub(crate) fn fit_frailty_spec_from_survival_args(
     )
 }
 
-pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
-    frailty: &gam::families::survival::lognormal_kernel::FrailtySpec,
-    context: &str,
-) -> Result<gam::families::survival::lognormal_kernel::FrailtySpec, String> {
-    match frailty {
-        gam::families::survival::lognormal_kernel::FrailtySpec::None => {
-            Ok(gam::families::survival::lognormal_kernel::FrailtySpec::None)
-        }
-        gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sigma),
-        } => Ok(
-            gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                sigma_fixed: Some(*sigma),
-            },
-        ),
-        gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-            sigma_fixed: None,
-        } => Err(format!(
-            "{context} currently requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-        )),
-        gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier { .. } => Err(
-            format!("{context} requires --frailty-kind gaussian-shift or no frailty"),
-        ),
-    }
-}
-
 pub(crate) fn fixed_hazard_multiplier_from_saved_family(
     family: &FittedFamily,
 ) -> Result<
@@ -124,22 +74,11 @@ pub(crate) fn fixed_hazard_multiplier_from_saved_family(
     ),
     String,
 > {
-    match family.frailty() {
-        Some(gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: Some(sigma),
-            loading,
-        }) => Ok((*sigma, *loading)),
-        Some(gam::families::survival::lognormal_kernel::FrailtySpec::HazardMultiplier {
-            sigma_fixed: None,
-            ..
-        }) => Err("saved latent survival/binary model must store a concrete HazardMultiplier sigma in family_state.frailty".to_string()),
-        Some(gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift { .. })
-        | Some(gam::families::survival::lognormal_kernel::FrailtySpec::None)
-        | None => Err(
-            "saved latent survival/binary model requires a fixed HazardMultiplier frailty specification"
-                .to_string(),
-        ),
-    }
+    let frailty = family.frailty().ok_or_else(|| {
+        "saved latent survival/binary model requires a fixed HazardMultiplier frailty specification"
+            .to_string()
+    })?;
+    fixed_latent_hazard_frailty(frailty, "saved latent survival/binary model")
 }
 
 pub(crate) fn build_bernoulli_marginal_slope_saved_model(
@@ -430,7 +369,7 @@ impl SavedFitSummary {
         summary: &gam::pirls::WorkingModelPirlsResult,
         state: &gam::pirls::WorkingState,
     ) -> Result<Self, String> {
-        let reml_score = 0.5 * (state.deviance + state.penalty_term);
+        let reml_score = state.penalized_objective();
         Self {
             likelihood_family: Some(LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,

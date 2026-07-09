@@ -27,7 +27,7 @@ pub struct ReportInput {
     pub outer_gradient_norm: Option<f64>,
     /// First-order optimality certificate (#934), when the fit recorded one.
     /// Plain data so report.rs stays free of gam library types; main.rs maps
-    /// the fit's `CriterionCertificate` into this row.
+    /// the fit's `OuterCriterionCertificate` into this row.
     pub criterion_certificate: Option<CriterionCertificateRow>,
     /// Optional smoothing-forensics rows (#1892). These are diagnostic-only
     /// snapshots aligned to fitted terms/blocks and expose the quantities that

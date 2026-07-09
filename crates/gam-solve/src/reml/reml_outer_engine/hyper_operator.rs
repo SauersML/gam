@@ -507,7 +507,7 @@ impl HyperOperator for CompositeHyperOperator {
 
         out.fill(0.0);
         if let Some(dense) = self.dense.as_ref() {
-            dense_matvec_into(dense, v, out.view_mut());
+            dense::matvec_into(dense, v, out.view_mut());
         }
         for op in &self.operators {
             op.scaled_add_mul_vec(v, 1.0, out.view_mut());
@@ -548,7 +548,7 @@ impl HyperOperator for CompositeHyperOperator {
         }
 
         if let Some(dense) = self.dense.as_ref() {
-            dense_matvec_scaled_add_into(dense, v, scale, out.view_mut());
+            dense::matvec_scaled_add_into(dense, v, scale, out.view_mut());
         }
         for op in &self.operators {
             op.scaled_add_mul_vec(v, scale, out.view_mut());
@@ -656,7 +656,7 @@ impl HyperOperator for CompositeHyperOperator {
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let mut total = 0.0;
         if let Some(dense) = self.dense.as_ref() {
-            total += dense_bilinear(dense, v.view(), u.view());
+            total += dense::bilinear(dense, v.view(), u.view());
         }
         for op in &self.operators {
             total += op.bilinear(v, u);
@@ -667,7 +667,7 @@ impl HyperOperator for CompositeHyperOperator {
     fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
         let mut total = 0.0;
         if let Some(dense) = self.dense.as_ref() {
-            total += dense_bilinear(dense, v, u);
+            total += dense::bilinear(dense, v, u);
         }
         for op in &self.operators {
             total += op.bilinear_view(v, u);
@@ -797,7 +797,7 @@ impl HyperOperator for ImplicitHyperOperator {
             let mut x_v_view = ndarray::ArrayViewMut1::from(s.x_v.as_mut_slice());
             let n_work_view = ndarray::ArrayViewMut1::from(s.n_work.as_mut_slice());
             let p_work_view = ndarray::ArrayViewMut1::from(s.p_work.as_mut_slice());
-            design_matrix_apply_view_into(&self.x_design, v, x_v_view.view_mut());
+            self.x_design.apply_view_into(v, x_v_view.view_mut());
             self.matvec_with_shared_xz_into(x_v_view.view(), v, out, n_work_view, p_work_view);
         });
     }
@@ -818,7 +818,7 @@ impl HyperOperator for ImplicitHyperOperator {
             let mut out_col = out.column_mut(local_col);
             out_col.assign(&self.s_psi.column(global_col));
 
-            design_matrix_column_into(&self.x_design, global_col, x_col.view_mut());
+            self.x_design.column_into(global_col, x_col.view_mut());
             Zip::from(weighted.view_mut())
                 .and(self.w_diag.view())
                 .and(x_col.view())
@@ -844,11 +844,8 @@ impl HyperOperator for ImplicitHyperOperator {
                 .and(self.w_diag.view())
                 .and(dx_col.view())
                 .par_for_each(|dst, &w, &dx| *dst = w * dx);
-            design_matrix_transpose_apply_view_into(
-                &self.x_design,
-                weighted.view(),
-                term.view_mut(),
-            );
+            self.x_design
+                .transpose_apply_view_into(weighted.view(), term.view_mut());
             out_col += &term;
 
             // Non-Gaussian third-derivative correction column j: shared kernel.
@@ -869,8 +866,8 @@ impl HyperOperator for ImplicitHyperOperator {
         assert_eq!(v.len(), self.p);
         assert_eq!(u.len(), self.p);
 
-        let x_v = design_matrix_apply_view(&self.x_design, v);
-        let x_u = design_matrix_apply_view(&self.x_design, u);
+        let x_v = self.x_design.apply_view(v);
+        let x_u = self.x_design.apply_view(u);
         let dx_v = self
             .implicit_deriv
             .forward_mul(self.axis, &v)
@@ -889,7 +886,7 @@ impl HyperOperator for ImplicitHyperOperator {
 
         design += self.c_correction_bilinear(&x_v, &x_u);
 
-        let penalty = dense_bilinear(&self.s_psi, v, u);
+        let penalty = dense::bilinear(&self.s_psi, v, u);
 
         design + penalty
     }
@@ -1196,7 +1193,8 @@ impl ImplicitHyperOperator {
         for i in 0..c.len() {
             n_work[i] = c[i] * x_col[i];
         }
-        design_matrix_transpose_apply_view_into(&self.x_design, n_work.view(), p_work.view_mut());
+        self.x_design
+            .transpose_apply_view_into(n_work.view(), p_work.view_mut());
         out_col += &p_work;
     }
 
@@ -1271,7 +1269,7 @@ impl ImplicitHyperOperator {
         }
 
         // Penalty part: u^T S_psi z
-        let penalty = dense_bilinear(&self.s_psi, z.view(), u.view());
+        let penalty = dense::bilinear(&self.s_psi, z.view(), u.view());
 
         design + penalty
     }
@@ -1315,10 +1313,11 @@ impl ImplicitHyperOperator {
         for i in 0..w.len() {
             n_work[i] = w[i] * dx_z[i];
         }
-        design_matrix_transpose_apply_view_into(&self.x_design, n_work.view(), p_work.view_mut());
+        self.x_design
+            .transpose_apply_view_into(n_work.view(), p_work.view_mut());
         out += &p_work;
 
-        dense_matvec_into(&self.s_psi, z, p_work.view_mut());
+        dense::matvec_into(&self.s_psi, z, p_work.view_mut());
         out += &p_work;
 
         // Non-Gaussian fixed-β third-derivative correction.
@@ -1327,11 +1326,8 @@ impl ImplicitHyperOperator {
             for i in 0..w.len() {
                 n_work[i] = c[i] * x_vec[i];
             }
-            design_matrix_transpose_apply_view_into(
-                &self.x_design,
-                n_work.view(),
-                p_work.view_mut(),
-            );
+            self.x_design
+                .transpose_apply_view_into(n_work.view(), p_work.view_mut());
             out += &p_work;
         }
     }

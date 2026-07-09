@@ -499,10 +499,10 @@ impl HessianOperator for SparseCholeskyOperator {
         // are only used for block-local operators via trace_hinv_operator_cross.
         let solved_a = self.solve_multi(a);
         if std::ptr::eq(a, b) {
-            return trace_matrix_product(&solved_a, &solved_a);
+            return dense::trace_product(&solved_a, &solved_a);
         }
         let solved_b = self.solve_multi(b);
-        trace_matrix_product(&solved_a, &solved_b)
+        dense::trace_product(&solved_a, &solved_b)
     }
 
     fn trace_hinv_matrix_operator_cross(
@@ -532,7 +532,7 @@ impl HessianOperator for SparseCholeskyOperator {
             // Same block: tr(Z_block * A_local * Z_block * B_local)
             let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
             if std::ptr::addr_eq(left, right) {
-                return trace_matrix_product(&za, &za);
+                return dense::trace_product(&za, &za);
             }
             let zb = Self::takahashi_left_multiply_block(taka, b_local, b_start);
             // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij

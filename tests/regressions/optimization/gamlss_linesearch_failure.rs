@@ -1,6 +1,6 @@
 use ndarray::Array1;
 
-use gam::solver::rho_optimizer::{Derivative, EfsEval, HessianResult, OuterEval, OuterProblem};
+use gam::solver::rho_optimizer::{Derivative, EfsEval, HessianValue, OuterEval, OuterProblem};
 
 /// Verify that `run_outer` propagates the error when the objective only
 /// produces finite values at the origin and errors everywhere else — the
@@ -39,14 +39,14 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                     Ok(OuterEval {
                         cost: 833.403058988699,
                         gradient: ndarray::array![1.1751972450892738, 0.0, 0.0],
-                        hessian: HessianResult::Unavailable,
+                        hessian: HessianValue::Unavailable,
                         inner_beta_hint: None,
                     })
                 } else {
                     Ok(OuterEval {
                         cost: f64::INFINITY,
                         gradient: Array1::zeros(3),
-                        hessian: HessianResult::Unavailable,
+                        hessian: HessianValue::Unavailable,
                         inner_beta_hint: None,
                     })
                 }

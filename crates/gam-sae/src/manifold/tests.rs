@@ -1,10 +1,13 @@
 use gam_linalg::faer_ndarray::fast_ata;
 
+pub(crate) use super::tests_recovery_split_780::{
+    diagonal_latent_cache, fixed_state_logdet, gamma_fd_tiny_fixture, warmstart_test_objective,
+    warmstart_test_objective_with_evaluator,
+};
 use super::*;
 use approx::assert_abs_diff_eq;
 use gam_terms::analytic_penalties::ARDPenalty;
 use ndarray::{Array5, array};
-pub(crate) use super::tests_recovery_split_780::{gamma_fd_tiny_fixture, fixed_state_logdet, diagonal_latent_cache, warmstart_test_objective, warmstart_test_objective_with_evaluator};
 
 pub(crate) fn assert_matrix_same_bits(left: &Array2<f64>, right: &Array2<f64>) {
     assert_eq!(left.dim(), right.dim());
@@ -1899,21 +1902,14 @@ pub(crate) fn collapse_rescue_oos_v_projection_matches_train_and_beats_fallback(
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the
 /// IBP-α and separation-barrier overrides: two terms carrying DIFFERENT configs
-/// produce correspondingly-different α / barrier strength, with NO process-global
-/// atomic touched (isolation), and the two terms do not leak into each other.
+/// produce correspondingly-different α / barrier strength, and the two terms do
+/// not leak into each other.
 #[test]
 pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
-    // Sanity: neither term sets a global override, so the global fallbacks stay
-    // unset and cannot be the source of the distinct effects observed below.
-    assert!(
-        crate::assignment::ibp_alpha_override().is_none(),
-        "test must not depend on a preset global IBP-α override"
-    );
-
     let (mut term_a, _t_a, rho_a) = small_two_atom_ibp_term();
     let (mut term_b, _t_b, rho_b) = small_two_atom_ibp_term();
 
-    // Distinct per-fit configs, applied via config ONLY (no global setters).
+    // Distinct per-fit configs, applied to each term independently.
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
         ibp_alpha_override: Some(0.2),
@@ -1931,7 +1927,7 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
     );
 
     // IBP-α: the per-fit override is the resolved α (bypassing the mode schedule),
-    // and the two terms resolve DIFFERENT α without touching any global.
+    // and the two terms resolve different α values.
     assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(0.2));
     assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
 
@@ -1947,16 +1943,12 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
     );
 
     // Barrier strength (K=2, so the barrier is live): the per-fit override is the
-    // source of truth, distinct per term, with the global still unset.
+    // source of truth, distinct per term.
     assert_eq!(term_a.separation_barrier_strength(), 0.1);
     assert_eq!(term_b.separation_barrier_strength(), 3.0);
-    assert!(
-        super::term::sae_separation_barrier_override().is_none(),
-        "the per-fit override must NOT write the process-global barrier atomic"
-    );
 
     // Isolation: clearing term_a's config leaves term_b untouched, and term_a
-    // falls back to the mode's own α (the historical path).
+    // uses the mode's canonical α.
     term_a.set_fit_config(SaeFitConfig::default());
     assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(1.0)); // the mode's compiled α
     assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
@@ -1966,24 +1958,10 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
 /// genuinely CONCURRENT in-process fits: two threads that each build a term,
 /// set a DIFFERENT `μ_sep` via [`SaeFitConfig`], and hammer
 /// [`SaeManifoldTerm::separation_barrier_strength`] must each keep reading their
-/// OWN strength for the whole run, and the process-global barrier atomic must
-/// stay unset throughout (the field, not the global, is the source of truth).
-///
-/// This is the concurrency safety the process-global `set_sae_barrier_overrides`
-/// atomic could NOT provide (last-writer-wins across threads leaks the override
-/// between fits): a parallel candidate/rung/layer sweep is now safe because the
-/// strength lives on the term, so there is no shared cell to race on. The
-/// pre-#1777 global-atomic path would fail this test — thread B's `store` would
-/// be observed by thread A's `separation_barrier_strength` read.
+/// own strength for the whole run. A parallel candidate/rung/layer sweep is safe
+/// because the strength lives on the term and there is no shared mutable state.
 #[test]
 pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
-    // Neither thread touches a global setter, so the global fallback must stay
-    // unset for the whole run — assert the precondition up front.
-    assert!(
-        super::term::sae_separation_barrier_override().is_none(),
-        "test must not depend on a preset global barrier override"
-    );
-
     // Two distinct per-fit strengths, one per worker. Chosen far apart so a leak
     // between threads (either direction) is unambiguous.
     let strengths = [0.125_f64, 7.5_f64];
@@ -2003,17 +1981,12 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     // Hammer the barrier-strength read while the sibling thread
                     // hammers its own with a different μ. The per-fit field is
                     // the source of truth, so every read is this thread's μ and
-                    // the global stays unset — under the old global atomic the
-                    // sibling's `store` would be visible here.
+                    // no sibling state can be visible here.
                     for _ in 0..iters {
                         assert_eq!(
                             term.separation_barrier_strength(),
                             mu,
                             "concurrent fit read a leaked barrier strength (expected {mu})"
-                        );
-                        assert!(
-                            super::term::sae_separation_barrier_override().is_none(),
-                            "a per-fit override must never write the process-global atomic"
                         );
                     }
                     mu
@@ -2024,13 +1997,6 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
             assert_eq!(handle.join().unwrap(), mu);
         }
     });
-
-    // Post-condition: the global barrier atomic is still unset — no thread leaked
-    // its per-fit strength into the process-global cell.
-    assert!(
-        super::term::sae_separation_barrier_override().is_none(),
-        "the process-global barrier atomic must remain unset after concurrent per-fit fits"
-    );
 }
 
 /// #1777 GOAL 3 — the assignment mode is the accurately-named `ThresholdGate`
@@ -3053,7 +3019,9 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
-    let dispersion = term.reconstruction_dispersion(&loss, &cache, &rho, None).unwrap();
+    let dispersion = term
+        .reconstruction_dispersion(&loss, &cache, &rho, None)
+        .unwrap();
     let smooth_edf: f64 = term
         .decoder_smoothness_effective_dof_per_atom(&cache, &rho.lambda_smooth_vec())
         .unwrap()
@@ -4556,13 +4524,7 @@ pub(crate) fn separation_barrier_deferred_curvature_matches_dense_hbb_1610() {
     let mut atom_curv = vec![0.0_f64; term.k_atoms()];
     let mut sep_rank1 = Vec::new();
     assert!(
-        term.add_sae_separation_barrier(
-            &mut deferred,
-            1.0,
-            false,
-            &mut atom_curv,
-            &mut sep_rank1
-        ),
+        term.add_sae_separation_barrier(&mut deferred, 1.0, false, &mut atom_curv, &mut sep_rank1),
         "fixture must activate the co-collapse separation barrier on the deferred path"
     );
 
@@ -4638,8 +4600,14 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
         // its single largest atom. Cap 2 ⇒ {0, 1}.
         Array1::from_vec(vec![0.001, 0.002, 0.0005]),
     ];
-    let layout =
-        SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full, None);
+    let layout = SaeRowLayout::from_dense_weights(
+        &assignments,
+        2,
+        0.05,
+        coord_dims,
+        coord_offsets_full,
+        None,
+    );
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
     assert_eq!(layout.active_atoms[1], vec![0, 1]);
     // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
@@ -5341,8 +5309,7 @@ pub(crate) fn native_ard_energy_composes_additively_on_mixed_dictionary() {
     )
     .unwrap();
     let joint = SaeManifoldTerm::new(vec![a0, a1, a2], joint_assign).unwrap();
-    let joint_rho =
-        SaeManifoldRho::new(0.0, 0.0, vec![ard0.clone(), ard1.clone(), ard2.clone()]);
+    let joint_rho = SaeManifoldRho::new(0.0, 0.0, vec![ard0.clone(), ard1.clone(), ard2.clone()]);
     let joint_energy = joint.ard_value(&joint_rho).unwrap();
 
     // Per-atom single-block terms, each with the SAME coords / manifold / ARD.

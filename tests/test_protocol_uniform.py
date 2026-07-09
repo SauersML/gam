@@ -18,6 +18,7 @@ dim-mismatch check.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -139,6 +140,24 @@ def test_smooth_compose_circle_fourier_evaluate_matches_basis() -> None:
     phi_b = sm.basis.evaluate(theta)
     assert torch.allclose(phi_sm, phi_b, atol=1e-14)
     assert sm(theta).shape == phi_sm.shape
+
+
+def test_basis_jacobian_evaluates_descriptor_once() -> None:
+    class CountingBasis(gamfit.BasisDescriptor):
+        def __init__(self) -> None:
+            self.evaluate_calls = 0
+
+        def evaluate(self, t: Any) -> Any:
+            self.evaluate_calls += 1
+            return t**2
+
+    basis = CountingBasis()
+    t = torch.tensor([1.0, 2.0], dtype=torch.float64)
+
+    jacobian = basis.jacobian(t)
+
+    assert basis.evaluate_calls == 1
+    assert torch.allclose(jacobian, torch.diag(2.0 * t))
 
 
 def test_smooth_dim_mismatch_raises_eagerly() -> None:

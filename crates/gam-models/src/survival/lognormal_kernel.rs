@@ -101,6 +101,37 @@ impl FrailtySpec {
         !matches!(self, Self::None)
     }
 
+    /// Resolve the exact frailty subset supported by Gaussian-shift
+    /// marginal-slope models.
+    ///
+    /// These models admit either no frailty or a Gaussian shift with a fixed
+    /// standard deviation. A learnable Gaussian-shift scale and the
+    /// structurally different hazard-multiplier frailty require other fitting
+    /// machinery and are rejected here at the type that owns those states.
+    pub fn resolve_fixed_gaussian_shift(
+        &self,
+        context: &str,
+    ) -> Result<Self, LognormalKernelError> {
+        match self {
+            Self::None => Ok(Self::None),
+            Self::GaussianShift {
+                sigma_fixed: Some(sigma),
+            } => Ok(Self::GaussianShift {
+                sigma_fixed: Some(*sigma),
+            }),
+            Self::GaussianShift { sigma_fixed: None } => Err(LognormalKernelError::InvalidSpec {
+                reason: format!(
+                    "{context} requires a fixed GaussianShift sigma; learnable GaussianShift sigma is not supported"
+                ),
+            }),
+            Self::HazardMultiplier { .. } => Err(LognormalKernelError::InvalidSpec {
+                reason: format!(
+                    "{context} requires GaussianShift frailty or no frailty; HazardMultiplier is a distinct hazard-scale model"
+                ),
+            }),
+        }
+    }
+
     /// Validate that this frailty spec is compatible with score_warp/linkwiggle
     /// cubic marginal-slope families.
     ///
@@ -1196,6 +1227,38 @@ impl LatentSurvivalRowJet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_gaussian_shift_resolution_accepts_only_exact_fixed_states() {
+        assert_eq!(
+            FrailtySpec::None
+                .resolve_fixed_gaussian_shift("marginal-slope")
+                .unwrap(),
+            FrailtySpec::None
+        );
+        let fixed = FrailtySpec::GaussianShift {
+            sigma_fixed: Some(0.75),
+        };
+        assert_eq!(
+            fixed
+                .resolve_fixed_gaussian_shift("marginal-slope")
+                .unwrap(),
+            fixed
+        );
+        assert!(
+            FrailtySpec::GaussianShift { sigma_fixed: None }
+                .resolve_fixed_gaussian_shift("marginal-slope")
+                .is_err()
+        );
+        assert!(
+            FrailtySpec::HazardMultiplier {
+                sigma_fixed: Some(0.75),
+                loading: HazardLoading::Full,
+            }
+            .resolve_fixed_gaussian_shift("marginal-slope")
+            .is_err()
+        );
+    }
 
     fn latent_binomial_row_log_lik(
         ctx: &QuadratureContext,

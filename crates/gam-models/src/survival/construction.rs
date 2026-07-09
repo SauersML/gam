@@ -119,6 +119,33 @@ pub struct SurvivalBaselineConfig {
     pub makeham: Option<f64>,
 }
 
+/// Recover the fitted Weibull baseline from anchor-centered linear
+/// `[1, log(t)]` time-basis coefficients.
+///
+/// Centering at `anchor` makes the constant coefficient unidentified. The
+/// fitted model is therefore `shape * (log(t) - log(anchor))`: the identified
+/// shape is `beta[1]` and the identified scale is the anchor itself. Consumers
+/// must not reconstruct the scale from the stale constant coefficient.
+pub fn fitted_weibull_baseline_from_linear_time_beta(
+    beta: &Array1<f64>,
+    anchor: f64,
+) -> Option<SurvivalBaselineConfig> {
+    if beta.len() < 2 {
+        return None;
+    }
+    let shape = beta[1];
+    if !shape.is_finite() || shape <= 0.0 || !anchor.is_finite() || anchor <= 0.0 {
+        return None;
+    }
+    Some(SurvivalBaselineConfig {
+        target: SurvivalBaselineTarget::Weibull,
+        scale: Some(anchor),
+        shape: Some(shape),
+        rate: None,
+        makeham: None,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub enum SurvivalTimeBasisConfig {
     None,
@@ -792,7 +819,7 @@ where
 /// the same user closure back both the `cost_fn` and `eval_fn`, the θ→config
 /// conversion, and deriving the scalar `cost_fn` from the eval result — is
 /// identical, so it lives here once. The contract-specific axis is only which
-/// `HessianResult` the objective embeds, which the wrapper has already encoded
+/// `HessianValue` the objective embeds, which the wrapper has already encoded
 /// in the returned `OuterEval`, so this helper is contract-agnostic beyond the
 /// `contract` it forwards to [`run_baseline_theta_optimizer`].
 fn run_baseline_theta_optimizer_with_eval<F>(
@@ -821,7 +848,7 @@ where
                 theta.len()
             )));
         }
-        if let gam_problem::HessianResult::Analytic(ref h) = eval.hessian {
+        if let gam_problem::HessianValue::Dense(ref h) = eval.hessian {
             if h.nrows() != theta.len() || h.ncols() != theta.len() {
                 return Err(crate::model_types::EstimationError::InvalidInput(format!(
                     "{engine_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
@@ -861,7 +888,7 @@ pub fn optimize_survival_baseline_config_with_gradient_only<F>(
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
 {
-    use gam_problem::{HessianResult, OuterEval};
+    use gam_problem::{HessianValue, OuterEval};
     run_baseline_theta_optimizer_with_eval(
         initial,
         context,
@@ -871,7 +898,7 @@ where
             Ok(OuterEval {
                 cost,
                 gradient,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -890,7 +917,7 @@ pub fn optimize_survival_baseline_config_with_gradient<F>(
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
-    use gam_problem::{HessianResult, OuterEval};
+    use gam_problem::{HessianValue, OuterEval};
     run_baseline_theta_optimizer_with_eval(
         initial,
         context,
@@ -900,7 +927,7 @@ where
             Ok(OuterEval {
                 cost,
                 gradient,
-                hessian: HessianResult::Analytic(hessian),
+                hessian: HessianValue::Dense(hessian),
                 inner_beta_hint: None,
             })
         },
@@ -3634,10 +3661,10 @@ mod tests {
         baseline_chain_rule_gradient, baseline_offset_theta_partials,
         build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
-        evaluate_survival_marginal_slope_baseline, gompertz_cumulative_shape_derivative,
-        gompertz_cumulative_shape_second_derivative, gompertz_hazard_components,
-        marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
-        marginal_slope_baseline_offset_theta_partials,
+        evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta,
+        gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative,
+        gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient,
+        marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
         optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only,
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
@@ -3647,6 +3674,21 @@ mod tests {
     use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
     use crate::probability::normal_cdf;
     use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn fitted_weibull_baseline_uses_identified_anchor_and_slope() {
+        let fitted = fitted_weibull_baseline_from_linear_time_beta(&array![123.0, 1.75], 4.5)
+            .expect("valid Weibull baseline");
+        assert_eq!(fitted.target, SurvivalBaselineTarget::Weibull);
+        assert_eq!(fitted.scale, Some(4.5));
+        assert_eq!(fitted.shape, Some(1.75));
+        assert_eq!(fitted.rate, None);
+        assert_eq!(fitted.makeham, None);
+
+        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![1.0], 4.5).is_none());
+        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![0.0, 0.0], 4.5).is_none());
+        assert!(fitted_weibull_baseline_from_linear_time_beta(&array![0.0, 1.0], 0.0).is_none());
+    }
 
     #[test]
     fn survival_timewiggle_keeps_requested_order_one_penalty() {

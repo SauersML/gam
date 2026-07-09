@@ -854,18 +854,18 @@ pub(crate) fn run_outer_with_plan(
 
                 let cheap_materializable_operator = matches!(
                     seed_eval.hessian,
-                    HessianResult::Operator(ref op)
-                        if op.materialization_capability().is_available()
+                    HessianValue::Operator(ref op)
+                        if op.materialization().is_available()
                             && op.dim() <= OUTER_HVP_MATERIALIZE_MAX_DIM
                 );
                 if cheap_materializable_operator {
                     // The operator's own work model says probing every column
                     // is cheap; convert the seed Hessian to dense in-place.
                     // Subsequent bridge evaluations apply the same predicate.
-                    if let HessianResult::Operator(op) = &seed_eval.hessian {
+                    if let HessianValue::Operator(op) = &seed_eval.hessian {
                         match op.materialize_dense() {
                             Ok(dense) => {
-                                seed_eval.hessian = HessianResult::Analytic(dense);
+                                seed_eval.hessian = HessianValue::Dense(dense);
                             }
                             Err(message) => {
                                 let err = EstimationError::RemlOptimizationFailed(format!(
@@ -880,7 +880,7 @@ pub(crate) fn run_outer_with_plan(
                         }
                     }
                 }
-                if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
+                if matches!(seed_eval.hessian, HessianValue::Operator(_)) {
                     log::debug!(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
@@ -904,7 +904,7 @@ pub(crate) fn run_outer_with_plan(
                     let initial_op_sample = OperatorSample {
                         value: seed_eval.cost,
                         gradient: seed_eval.gradient.clone(),
-                        hessian: hessian_result_to_value(seed_eval.hessian.clone()),
+                        hessian: seed_eval.hessian.clone(),
                     };
 
                     let bridge_obj = OuterOperatorBridge {

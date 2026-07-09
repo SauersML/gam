@@ -1,5 +1,5 @@
 use super::*;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use opt::{BacktrackConfig, backtracking_line_search};
 
 pub(crate) struct OuterFirstOrderBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
@@ -1369,7 +1369,7 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
     pub(crate) layout: OuterThetaLayout,
     pub(crate) hessian_source: HessianSource,
-    /// When the evaluator returns `HessianResult::Operator(op)` and the
+    /// When the evaluator returns `HessianValue::Operator(op)` and the
     /// operator advertises an exact dense route, the bridge may materialize the
     /// operator into a dense K×K matrix so the dense ARC path can run an exact
     /// factorization instead of operator-CG.
@@ -1854,27 +1854,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     }
 }
 
-// =====================================================================
-// opt 0.4 matrix-free TR adapter (Phase 6)
-// =====================================================================
-//
-// `OuterToOptHessianOperator` wraps gam's `OuterHessianOperator` so it
-// can be passed to `opt::MatrixFreeTrustRegion` via
-// `opt::HessianValue::Operator`. The two traits have nearly identical
-// surfaces — the adapter is just shape/error translation:
-//
-//   gam::OuterHessianOperator              opt::HessianOperator
-//     dim()                       <-->       dim()
-//     matvec(v) -> Array1         <-->       apply_into(v, &mut out)
-//     mul_mat(X) -> Array2        <-->       apply_mat(X)
-//     materialization_capability  <-->       materialization
-//     materialize_dense           <-->       materialize_dense
-//
-// gam errors are `String`; opt errors are `ObjectiveEvalError`. We
-// promote everything to `ObjectiveEvalError::Fatal` because operator
-// failures inside a solver step are not generally recoverable —
-// shrinking the trust radius would not fix a dimension mismatch.
-//
 // `OuterOperatorBridge` is the bridge that implements
 // `opt::OperatorObjective` for `gam`'s outer objective — parallel to
 // `OuterSecondOrderBridge` but produces `OperatorSample` whose
@@ -1902,65 +1881,6 @@ impl OptimizerObserver for OuterAcceptObserver {
             info.actual_decrease,
         );
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-pub(crate) struct OuterToOptHessianOperator(Arc<dyn OuterHessianOperator>);
-
-impl HessianOperator for OuterToOptHessianOperator {
-    fn dim(&self) -> usize {
-        self.0.dim()
-    }
-
-    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
-        // Forward to gam's `OuterHessianOperator::apply_into` (default
-        // impl wraps `matvec`; backends with a native into-buffer
-        // kernel override for true zero-alloc CG iterations).
-        self.0
-            .apply_into(v, out)
-            .map_err(|message| ObjectiveEvalError::Fatal {
-                message: format!("outer Hessian operator apply_into failed: {message}"),
-            })
-    }
-
-    fn apply_mat(&self, x: ArrayView2<'_, f64>) -> Result<Array2<f64>, ObjectiveEvalError> {
-        self.0
-            .mul_mat(x)
-            .map_err(|message| ObjectiveEvalError::Fatal {
-                message: format!("outer Hessian operator mul_mat failed: {message}"),
-            })
-    }
-
-    fn materialization(&self) -> HessianMaterialization {
-        match self.0.materialization_capability() {
-            OuterHessianMaterialization::Unavailable => HessianMaterialization::Unavailable,
-            OuterHessianMaterialization::RepeatedHvp => HessianMaterialization::RepeatedHvp,
-            OuterHessianMaterialization::BatchedHvp => HessianMaterialization::BatchedHvp,
-            OuterHessianMaterialization::Explicit => HessianMaterialization::Explicit,
-        }
-    }
-
-    fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
-        self.0
-            .materialize_dense()
-            .map_err(|message| ObjectiveEvalError::Fatal {
-                message: format!("outer Hessian operator materialization failed: {message}"),
-            })
-    }
-}
-
-/// Translate a gam `HessianResult` into an `opt::HessianValue` for
-/// consumption by `MatrixFreeTrustRegion`. `Analytic` becomes
-/// `Dense`; `Operator` is wrapped in the adapter; `Unavailable` is
-/// preserved (the solver's `HessianFallbackPolicy` decides what
-/// happens then).
-pub(crate) fn hessian_result_to_value(hessian: HessianResult) -> HessianValue {
-    match hessian {
-        HessianResult::Analytic(h) => HessianValue::Dense(h),
-        HessianResult::Operator(op) => {
-            HessianValue::Operator(Arc::new(OuterToOptHessianOperator(op)))
-        }
-        HessianResult::Unavailable => HessianValue::Unavailable,
     }
 }
 
@@ -2100,7 +2020,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         Ok(OperatorSample {
             value: eval.cost,
             gradient: eval.gradient,
-            hessian: hessian_result_to_value(eval.hessian),
+            hessian: eval.hessian,
         })
     }
 }
@@ -2252,36 +2172,34 @@ pub(crate) fn project_to_bounds(
 /// reuses this bridge.)
 pub(crate) fn build_bridge_hessian_for_source(
     source: HessianSource,
-    hessian: HessianResult,
+    hessian: HessianValue,
     materialize_operator_max_dim: usize,
 ) -> Result<Option<Array2<f64>>, ObjectiveEvalError> {
     match source {
         HessianSource::Analytic => match hessian {
-            HessianResult::Analytic(h) => Ok(Some(h)),
-            HessianResult::Operator(op)
-                if op.materialization_capability().is_available()
+            HessianValue::Dense(h) => Ok(Some(h)),
+            HessianValue::Operator(op)
+                if op.materialization().is_available()
                     && op.dim() <= materialize_operator_max_dim =>
             {
                 op.materialize_dense()
                     .map(Some)
-                    .map_err(|message| ObjectiveEvalError::Fatal {
-                        message: format!(
-                            "outer Hessian operator materialization failed: {message}"
-                        ),
+                    .map_err(|error| ObjectiveEvalError::Fatal {
+                        message: format!("outer Hessian operator materialization failed: {error}"),
                     })
             }
-            HessianResult::Operator(op) => Err(ObjectiveEvalError::Fatal {
+            HessianValue::Operator(op) => Err(ObjectiveEvalError::Fatal {
                 message: format!(
                     "outer plan declared HessianSource::Analytic but the runtime returned a \
                      non-materializable Hessian operator (dim={}, materialization={:?}); \
                      finite-difference Hessian estimation is not permitted on the analytic route",
                     op.dim(),
-                    op.materialization_capability(),
+                    op.materialization(),
                 ),
             }),
-            HessianResult::Unavailable => Err(ObjectiveEvalError::Fatal {
+            HessianValue::Unavailable => Err(ObjectiveEvalError::Fatal {
                 message: "outer plan declared HessianSource::Analytic but the runtime returned \
-                          HessianResult::Unavailable; finite-difference Hessian estimation is \
+                          HessianValue::Unavailable; finite-difference Hessian estimation is \
                           not permitted on the analytic route"
                     .to_string(),
             }),

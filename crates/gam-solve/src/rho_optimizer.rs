@@ -55,7 +55,7 @@ mod run_plan;
 mod seed_screening;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
-pub use crate::model_types::CriterionCertificate;
+pub use crate::model_types::OuterCriterionCertificate;
 pub(crate) use bridges::*;
 pub use capability::*;
 // #1521 carve: the spatial-optimization driver runs the FD-audit oracle as
@@ -65,7 +65,7 @@ pub use capability::*;
 // re-export surface (a whole-module `pub(crate) use fd_audit::*` glob brought in
 // nothing else and was dead). The oracle is audit-only, never on the math path.
 pub use fd_audit::{OuterGradientFdAudit, OuterGradientFdComponent, outer_gradient_fd_audit}; // fd-ok: audit-only oracle, not in the math path
-pub use gam_problem::{HessianResult, OuterEval};
+pub use gam_problem::{HessianValue, OuterEval};
 pub(crate) use hessian_operator::*;
 pub use objective::*;
 pub(crate) use run::*;

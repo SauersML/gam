@@ -63,13 +63,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+
+from gamfit._description_length import FittedFeaturizer, description_length
 
 # --------------------------------------------------------------------------- #
 # The manifold zoo (their Appendix table, verbatim parametrizations)          #
@@ -236,29 +237,6 @@ class ZooData:
 # --------------------------------------------------------------------------- #
 # Featurizer adapters: everything scoring needs from one fitted featurizer    #
 # --------------------------------------------------------------------------- #
-
-
-@dataclass
-class FittedFeaturizer:
-    """Uniform scoring surface.
-
-    ``gate`` is (N, G) nonnegative firing strength per atom/latent on the test
-    split. ``atom_contribution(g)`` returns that atom's SOLO reconstruction of
-    every test row (N, d). ``code_dims[g]`` is the number of coordinates atom
-    ``g`` transmits when active (intrinsic dim + amplitude for a curved atom, 1
-    for a flat latent). ``dictionary_params`` is the one-time dictionary cost.
-    """
-
-    name: str
-    gate: np.ndarray
-    atom_contribution: Callable[[int], np.ndarray]
-    code_dims: np.ndarray
-    dictionary_params: int
-    recon: np.ndarray
-    fit_seconds: float
-    native_bits_per_token: float | None = None
-    atom_intrinsic_coords: Callable[[int], np.ndarray] | None = None
-    extras: dict[str, Any] | None = None
 
 
 def _fit_oracle(data: ZooData, test_x: np.ndarray, active: np.ndarray) -> FittedFeaturizer:
@@ -654,55 +632,6 @@ def score_recovery(
 # --------------------------------------------------------------------------- #
 # Description length (their Eq. 4, uniform estimator) + dimensionality        #
 # --------------------------------------------------------------------------- #
-
-
-def _water_fill_bits(spectrum: np.ndarray, delta: float) -> float:
-    lam = np.maximum(np.asarray(spectrum, dtype=float), 0.0)
-    return float(np.sum(0.5 * np.log2(1.0 + lam / max(delta, 1e-300))))
-
-
-def description_length(
-    fitted: FittedFeaturizer, test_x: np.ndarray, *, r2_targets: tuple[float, ...] = (0.99, 0.95, 0.90, 0.80),
-) -> dict[str, Any]:
-    n, _d = test_x.shape
-    gate_active = fitted.gate > 1e-10
-    p_g = gate_active.mean(axis=0)
-    l0 = float(gate_active.sum(axis=1).mean())
-    n_atoms = fitted.gate.shape[1]
-    support_bits = float(
-        math.lgamma(n_atoms + 1)
-        - math.lgamma(max(round(l0), 1) + 1)
-        - math.lgamma(max(n_atoms - round(l0), 1) + 1)
-    ) / math.log(2.0)
-    resid = test_x - fitted.recon
-    resid_cov_eigs = np.linalg.eigvalsh(np.cov(resid.T))
-    var_ref = float(np.var(test_x - test_x.mean(axis=0, keepdims=True)) * test_x.shape[1])
-    # Per-atom active-code spectra: contribution PCA restricted to firing rows.
-    code_spectra: list[np.ndarray] = []
-    for g in range(n_atoms):
-        rows = np.flatnonzero(gate_active[:, g])
-        if rows.size < max(int(fitted.code_dims[g]) + 1, 4):
-            code_spectra.append(np.zeros(int(fitted.code_dims[g])))
-            continue
-        take = rows if rows.size <= 4096 else rows[:: max(rows.size // 4096, 1)]
-        m_g = fitted.atom_contribution(g)[take]
-        sing = np.linalg.svd(m_g - m_g.mean(axis=0, keepdims=True), compute_uv=False)
-        top = sing[: int(fitted.code_dims[g])] ** 2 / max(take.size - 1, 1)
-        code_spectra.append(top)
-    out: dict[str, Any] = {"support_bits": support_bits, "achieved_block_l0": l0}
-    for target in r2_targets:
-        delta = (1.0 - target) * var_ref / test_x.shape[1]
-        code_bits = float(
-            sum(p * _water_fill_bits(spec, delta) for p, spec in zip(p_g, code_spectra))
-        )
-        resid_bits = _water_fill_bits(resid_cov_eigs, delta)
-        dict_bits = 0.5 * fitted.dictionary_params / n * math.log2(max(n, 2))
-        out[f"bits_at_r2_{target:g}"] = support_bits + code_bits + resid_bits + dict_bits
-        out[f"code_bits_at_r2_{target:g}"] = code_bits
-        out[f"resid_bits_at_r2_{target:g}"] = resid_bits
-    if fitted.native_bits_per_token is not None:
-        out["native_bits_per_token"] = fitted.native_bits_per_token
-    return out
 
 
 def stable_ranks(fitted: FittedFeaturizer) -> dict[str, Any]:

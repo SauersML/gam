@@ -2022,7 +2022,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
 
     use gam_solve::rho_optimizer::OuterProblem;
-    use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
@@ -2030,7 +2030,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             Array1<f64>,
             f64,
             Array1<f64>,
-            HessianResult,
+            HessianValue,
             CustomFamilyWarmStart,
         )>,
     }
@@ -2149,7 +2149,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 {
                     cached_hess.clone()
                 } else {
-                    HessianResult::Unavailable
+                    HessianValue::Unavailable
                 },
                 inner_beta_hint: None,
             });
@@ -2219,7 +2219,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ));
             result.outer_hessian
         } else {
-            HessianResult::Unavailable
+            HessianValue::Unavailable
         };
         st.warm_cache = Some(result.warm_start);
         Ok(OuterEval {
@@ -6681,7 +6681,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     (
         f64,
         Array1<f64>,
-        gam_problem::HessianResult,
+        gam_problem::HessianValue,
     ),
     EstimationError,
 > {
@@ -6733,7 +6733,7 @@ fn exact_joint_spatial_outer_hessian_available(
     // variants supply scalar-GLM derivative ingredients consumed by
     // `compute_outer_hessian` / `build_outer_hessian_operator`, and the
     // (n, p, K) crossover in `prefer_outer_hessian_operator` chooses the
-    // matrix-free `HessianResult::Operator` representation at large scale
+    // matrix-free `HessianValue::Operator` representation at large scale
     // for dense-lazy designs.  The previous `Identity || sparse_design`
     // gate predates that operator routing and forced binomial+logit+Matern
     // (and any other non-Gaussian dense-lazy spatial design) onto the

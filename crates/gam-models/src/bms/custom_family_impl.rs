@@ -892,7 +892,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // is solved through the inner Hv workspace. The generic exact
         // joint-hyper assembler in `custom_family::outer_objective` consumes
         // these directional kernels to produce an
-        // `OuterHessianOperator`, so advertising this capability lifts the
+        // `HessianOperator`, so advertising this capability lifts the
         // outer-derivative order to `Second` and routes the planner to ARC /
         // exact outer Newton instead of BFGS — converging the outer ρ-loop in
         // ≤ a couple of iterations rather than several BFGS line searches, each

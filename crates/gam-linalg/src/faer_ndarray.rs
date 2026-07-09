@@ -333,6 +333,12 @@ pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     unsafe { MatMut::from_raw_parts_mut(array.as_mut_ptr(), rows, cols, s0, s1) }
 }
 
+/// Convert an ndarray matrix into row-major nested vectors for serialized
+/// payloads without exposing storage-layout assumptions to callers.
+pub fn array2_to_nested_vec(array: &Array2<f64>) -> Vec<Vec<f64>> {
+    array.rows().into_iter().map(|row| row.to_vec()).collect()
+}
+
 #[inline]
 pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
     let len = array.len();

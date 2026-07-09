@@ -109,8 +109,7 @@ pub(crate) use gam_solve::arrow_schur::{
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
-    SparseRankOnePenaltyOp,
-    StreamingArrowSchur, row_sub_floor_null_directions,
+    SparseRankOnePenaltyOp, StreamingArrowSchur, row_sub_floor_null_directions,
     solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
     solve_with_lm_escalation_inner, streaming_cross_row_woodbury_log_det,
 };
@@ -125,13 +124,13 @@ pub(crate) use gam_terms::analytic_penalties::{
 // must be PUBLIC — pub(crate) here broke every CI test-build shard (E0603).
 pub use gam_terms::analytic_penalties::resolve_learnable_weight;
 
-pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 pub use gam_terms::latent::LatentManifold;
+pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
 pub(crate) use crate::criterion_atoms::SaeCriterion;
 
 pub(crate) use crate::certificates::{
-    CriterionCertificate, DirectionalSamples, certificate_from_samples,
+    DirectionalCriterionCertificate, DirectionalSamples, certificate_from_samples,
     deterministic_probe_direction, probe_step,
 };
 
@@ -166,7 +165,7 @@ pub(crate) use gam_solve::estimate::EstimationError;
 
 pub(crate) use gam_solve::evidence::arrow_log_det_from_cache;
 
-pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval};
+pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{
     OuterCapability, OuterEvalOrder, OuterObjective, SeedOutcome,
 };
@@ -184,8 +183,8 @@ pub use crate::frames::*;
 
 mod amortized_routing;
 mod arrow_solver;
-mod basin_bundle;
 mod atom;
+mod basin_bundle;
 mod behavior;
 mod behavior_fit;
 mod behavior_isometry;
@@ -232,9 +231,9 @@ mod streaming_seed;
 mod term;
 mod terracini;
 mod transport_law;
-mod weight_frame_catalog;
 mod wbic_audit;
 mod wbic_dynamics;
+mod weight_frame_catalog;
 
 #[cfg(test)]
 mod tests;
@@ -387,9 +386,9 @@ mod tests_outer_probe_forcing;
 mod lambda_smooth_1556_tests;
 
 #[cfg(test)]
-mod tests_behavior_twoblock_rung2;
-#[cfg(test)]
 mod tests_behavior_isometry_2015;
+#[cfg(test)]
+mod tests_behavior_twoblock_rung2;
 
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
@@ -422,8 +421,8 @@ mod tests_joint_vs_cascade_2131;
 mod tests_outer_row_subsample;
 
 pub use arrow_solver::*;
-pub use basin_bundle::*;
 pub use atom::*;
+pub use basin_bundle::*;
 pub use behavior::*;
 pub use behavior_fit::*;
 pub use behavior_isometry::*;
@@ -462,9 +461,10 @@ pub fn rank_charge_dof(
     construction::realised_rank_charge_dof(gram, decoder, n_eff, p_out, dispersion, 0.0, None)
 }
 
-pub use coordinate_fidelity::*;
 pub use crate::inference::atlas_nerve::AtlasCoveringSide;
+pub use coordinate_fidelity::*;
 pub use cross_fit::*;
+pub use crosscoder_drift::*;
 pub use curl::*;
 pub use derivative_oracle::*;
 pub use fit_entry::*;
@@ -490,8 +490,7 @@ pub use stratum_births::*;
 pub use streaming_plan::*;
 pub use term::*;
 pub use terracini::*;
-pub use crosscoder_drift::*;
 pub use transport_law::*;
-pub use weight_frame_catalog::*;
 pub use wbic_audit::*;
 pub use wbic_dynamics::*;
+pub use weight_frame_catalog::*;

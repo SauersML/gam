@@ -421,7 +421,7 @@ pub(crate) fn unified_joint_cost_gradient(
     // (`cost −= Φ`) so the outer criterion matches the Φ-augmented inner
     // objective (gam#979). `None` when the term is unavailable/gated to zero.
     firth_value: Option<f64>,
-) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), String> {
+) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String> {
     let hessian_op: Arc<dyn HessianOperator> = match first_order_trace_skip.as_ref() {
         Some(trace_values) if !trace_values.is_empty() => Arc::new(
             FirstOrderTraceSkipOperator::new(hessian_op, trace_values.len()),
@@ -836,7 +836,7 @@ pub(crate) fn joint_outer_evaluate(
     >,
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
-    batched_outer_hessian_operator: Option<Arc<dyn gam_problem::OuterHessianOperator>>,
+    batched_outer_hessian_operator: Option<Arc<dyn gam_problem::HessianOperator>>,
     // Universal under-identification robustness (always armed when the family can
     // expose an exact joint Hessian). The
     // outer REML logdet AND its trace derivatives must run on the same
@@ -902,7 +902,7 @@ pub(crate) fn joint_outer_evaluate(
     // logdet regularizes its large negative eigenvalue to a near-zero pivot, so the
     // IFT solve `v_k = −M⁻¹ Ṡ_k β̂` amplifies by `~1/ε²` and the outer gradient
     // explodes, after which the envelope tripwire suppresses the Hessian entirely
-    // (`HessianResult::Unavailable`). When the completed curvature is NOT PSD we
+    // (`HessianValue::Unavailable`). When the completed curvature is NOT PSD we
     // keep the bounded PSD `H_Φ` — which is exactly the curvature the criterion's
     // value (`½log|H+S_λ+H_Φ|`) and trace kernel already use, so the operator and
     // the criterion agree. The decision is all-or-nothing per evaluation:
@@ -1444,7 +1444,7 @@ pub(crate) fn joint_outer_evaluate(
         .into());
     }
     match &outer_hessian {
-        gam_problem::HessianResult::Analytic(hessian) => {
+        gam_problem::HessianValue::Dense(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
                 return Err(CustomFamilyError::NumericalFailure {
                     reason: "joint outer evaluation produced a non-finite Hessian".to_string(),
@@ -1464,7 +1464,7 @@ pub(crate) fn joint_outer_evaluate(
                 .into());
             }
         }
-        gam_problem::HessianResult::Operator(op) => {
+        gam_problem::HessianValue::Operator(op) => {
             if op.dim() != expected_theta_dim {
                 return Err(format!(
                     "joint outer evaluation returned operator Hessian dim {}, expected {}",
@@ -1473,7 +1473,7 @@ pub(crate) fn joint_outer_evaluate(
                 ));
             }
         }
-        gam_problem::HessianResult::Unavailable => {}
+        gam_problem::HessianValue::Unavailable => {}
     }
 
     let warm = ConstrainedWarmStart {

@@ -37,7 +37,7 @@ pub(crate) use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
     SasLinkState, StandardLink,
 };
-pub(crate) use gam_problem::{HessianResult, OuterEval};
+pub(crate) use gam_problem::{HessianValue, OuterEval};
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
 // #1521 trait-inversion: the `BlockExcessTarget` evaluator trait (implemented by
 // `Gam784BlockTarget`, consumed by the up-tier #784 sampler) lives in the neutral

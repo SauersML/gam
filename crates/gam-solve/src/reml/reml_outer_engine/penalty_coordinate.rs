@@ -125,7 +125,7 @@ impl PenaltySubspaceTrace {
         // left = H_proj⁻¹ · R_A ;  right = H_proj⁻¹ · R_B ;  tr(left · right).
         let left = self.h_proj_inverse.dot(ra);
         let right = self.h_proj_inverse.dot(rb);
-        trace_matrix_product(&left, &right)
+        dense::trace_product(&left, &right)
     }
 
     /// Reduce a `HyperOperator` `A` to its `r × r` projection
@@ -562,7 +562,7 @@ impl<'s> ThetaModeResponseKernel<'s> {
     /// stream, exactly like the outer-optimum criterion audit. The
     /// unconstrained arm carries no separate certify: its coherence with
     /// the criterion VALUE is audited end-to-end by the #934
-    /// `CriterionCertificate` at every returned optimum.
+    /// `OuterCriterionCertificate` at every returned optimum.
     pub(crate) fn certify_tangency(&self, ck: &ConstrainedSubspaceKernel<'_>, v: &Array1<f64>) {
         let residual = ck.a_act.dot(v);
         for (row, r) in residual.iter().enumerate() {

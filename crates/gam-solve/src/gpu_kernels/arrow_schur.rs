@@ -14,12 +14,13 @@
 //! is Layer D's NVRTC fused-kernel concern and lives in this module's
 //! follow-up implementation rather than in policy plumbing.
 //!
-//! On non-Linux builds the entire module degrades to a CPU-fallback shim.
+//! CUDA-only probes are exported only on Linux. Platform-neutral dispatch
+//! entries remain available so their callers can report a typed device decline.
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use crate::arrow_schur::{ArrowPcgDiagnostics, ArrowSchurSystem, DeviceSaePcgData};
 use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
-use crate::arrow_schur::{ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics};
 
 /// Outcome of a single Arrow-Schur Newton solve.
 pub struct ArrowSchurGpuSolution {
@@ -369,12 +370,13 @@ fn pack_block(
     }
 }
 
-/// Test-only entry that forces the Layer D + E fused NVRTC path regardless
-/// of the admission heuristic. Used by the V100 Layer C↔D parity test to
-/// drive the fused kernel at small shapes the heuristic would otherwise
-/// route through the cuSOLVER/cuBLAS Layer A+B+C path.
+/// Entry that forces the Layer D + E fused NVRTC path regardless of the
+/// admission heuristic. Used by the V100 Layer C↔D parity harness to drive
+/// the fused kernel at small shapes the heuristic would otherwise route through
+/// the cuSOLVER/cuBLAS Layer A+B+C path. The symbol only exists on the target
+/// that provides the NVRTC implementation.
 #[doc(hidden)]
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))] // `sys` is consumed only by the linux branch
+#[cfg(target_os = "linux")]
 pub fn solve_arrow_newton_step_fused_force(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -385,23 +387,12 @@ pub fn solve_arrow_newton_step_fused_force(
             reason: "ridge is NaN".to_string(),
         });
     }
-    #[cfg(not(target_os = "linux"))]
+    if crate::gpu_kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k)
+        .is_none()
     {
-        // No NVRTC toolchain off linux: the fused path is unconditionally
-        // unavailable. `sys` is consumed only by the linux branch below; the
-        // fn-level cfg_attr allows it to read as unused here without a banned
-        // `let _` binding or a no-op `drop` of the reference.
-        Err(ArrowSchurGpuFailure::Unavailable)
+        return Err(ArrowSchurGpuFailure::Unavailable);
     }
-    #[cfg(target_os = "linux")]
-    {
-        if crate::gpu_kernels::arrow_schur_nvrtc::plan_fused_launch(sys.rows.len(), sys.d, sys.k)
-            .is_none()
-        {
-            return Err(ArrowSchurGpuFailure::Unavailable);
-        }
-        cuda::solve_fused(sys, ridge_t, ridge_beta)
-    }
+    cuda::solve_fused(sys, ridge_t, ridge_beta)
 }
 
 /// #1017 Phase 3: a device-resident Arrow-Schur frame whose constant Hessian
@@ -413,11 +404,9 @@ pub fn solve_arrow_newton_step_fused_force(
 /// [`solve_arrow_newton_step`] which re-uploads and re-factors the full system
 /// every call. On a non-CUDA host construction returns
 /// `ArrowSchurGpuFailure::Unavailable`.
-pub struct ResidentArrowFrameHandle {
+pub enum ResidentArrowFrameHandle {
     #[cfg(target_os = "linux")]
-    inner: cuda::ResidentArrowFrame,
-    #[cfg(not(target_os = "linux"))]
-    _never: std::convert::Infallible,
+    Cuda(cuda::ResidentArrowFrame),
 }
 
 impl ResidentArrowFrameHandle {
@@ -446,9 +435,9 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self {
-                inner: cuda::ResidentArrowFrame::new(sys, ridge_t, ridge_beta)?,
-            })
+            Ok(Self::Cuda(cuda::ResidentArrowFrame::new(
+                sys, ridge_t, ridge_beta,
+            )?))
         }
     }
 
@@ -469,7 +458,9 @@ impl ResidentArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            self.inner.solve_gradient(g_t, g_beta)
+            match self {
+                Self::Cuda(inner) => inner.solve_gradient(g_t, g_beta),
+            }
         }
     }
 
@@ -478,16 +469,13 @@ impl ResidentArrowFrameHandle {
     pub fn log_det_hessian(&self) -> f64 {
         #[cfg(not(target_os = "linux"))]
         {
-            // SAFETY: off-CUDA, `ResidentArrowFrameHandle::new` always returns
-            // `Err(Unavailable)`, so no handle of this type is ever constructed and
-            // this method is statically unreachable on non-Linux targets. A NaN
-            // sentinel would silently corrupt any consumer of the log-determinant,
-            // so fail loudly on the impossible path instead.
-            panic!("ResidentArrowFrameHandle cannot be constructed off CUDA")
+            match *self {}
         }
         #[cfg(target_os = "linux")]
         {
-            self.inner.log_det_hessian()
+            match self {
+                Self::Cuda(inner) => inner.log_det_hessian(),
+            }
         }
     }
 }
@@ -506,11 +494,9 @@ impl ResidentArrowFrameHandle {
 /// factor/solve — in place of the full `O(n·d·k)` host→device re-upload that
 /// [`solve_arrow_newton_step`] performs every trial. The per-trial numerics are
 /// bit-identical to that re-upload path (same POTRF/TRSM/Schur/back-sub order).
-pub struct ResidentBaseArrowFrameHandle {
+pub enum ResidentBaseArrowFrameHandle {
     #[cfg(target_os = "linux")]
-    inner: cuda::ResidentBaseArrowFrame,
-    #[cfg(not(target_os = "linux"))]
-    _never: std::convert::Infallible,
+    Cuda(cuda::ResidentBaseArrowFrame),
 }
 
 impl ResidentBaseArrowFrameHandle {
@@ -532,9 +518,7 @@ impl ResidentBaseArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            Ok(Self {
-                inner: cuda::ResidentBaseArrowFrame::new(sys)?,
-            })
+            Ok(Self::Cuda(cuda::ResidentBaseArrowFrame::new(sys)?))
         }
     }
 
@@ -560,7 +544,9 @@ impl ResidentBaseArrowFrameHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            self.inner.refactor_and_solve(ridge_t, ridge_beta)
+            match self {
+                Self::Cuda(inner) => inner.refactor_and_solve(ridge_t, ridge_beta),
+            }
         }
     }
 }
@@ -859,7 +845,7 @@ pub fn solve_reduced_beta_pcg_with_diagnostics(
     rhs_beta: &Array1<f64>,
     max_iterations: usize,
     relative_tolerance: f64,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
     let k = rhs_beta.len();
     if s_acc.dim() != (k, k) {
         return Err(ArrowSchurGpuFailure::SchurFactorFailed {
@@ -902,7 +888,7 @@ pub fn solve_sae_matrix_free_pcg(
     rhs_beta: &Array1<f64>,
     max_iterations: usize,
     relative_tolerance: f64,
-) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
     if sys.k != data.beta_dim || rhs_beta.len() != data.beta_dim || data.p == 0 {
         return Err(ArrowSchurGpuFailure::Unavailable);
     }
@@ -986,7 +972,7 @@ pub trait SaeResidentFrame {
         rhs_beta: &Array1<f64>,
         max_iterations: usize,
         relative_tolerance: f64,
-    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure>;
+    ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure>;
 }
 
 /// Build the device-resident SAE frame for the LM ridge ladder, or `None` when
@@ -994,27 +980,28 @@ pub trait SaeResidentFrame {
 /// predicate rejects the shape). `cg_iters` is the CG budget the offload gate
 /// scores (same value the per-trial framed solve uses). A `None` here keeps the
 /// established per-trial re-flatten path completely unchanged.
-#[cfg(target_os = "linux")]
 pub fn build_sae_resident_frame(
     sys: &ArrowSchurSystem,
     cg_iters: usize,
 ) -> Option<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>> {
-    cuda::ResidentSaeFrameHandle::build(sys, cg_iters)
-        .map(|h| std::sync::Arc::new(h) as std::sync::Arc<dyn SaeResidentFrame + Send + Sync>)
-}
-
-/// Non-CUDA host: no device frame. Reads the inputs (a real, cheap use) so the
-/// shared signature's params are not flagged unused on this target without an
-/// `#[allow]`/`let _` dodge (both banned by the build.rs scanner).
-#[cfg(not(target_os = "linux"))]
-pub fn build_sae_resident_frame(
-    sys: &ArrowSchurSystem,
-    cg_iters: usize,
-) -> Option<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>> {
+    // Target-independent admission: a zero-K system has no reduced-Schur block
+    // to keep resident, and a zero CG budget can never consume the frame — both
+    // decline on every host, keeping the per-trial flatten the single fallback
+    // (on CUDA hosts this also spares a doomed device build attempt).
     if sys.k == 0 || cg_iters == 0 {
         return None;
     }
-    None
+    #[cfg(target_os = "linux")]
+    {
+        cuda::ResidentSaeFrameHandle::build(sys, cg_iters)
+            .map(|h| std::sync::Arc::new(h) as std::sync::Arc<dyn SaeResidentFrame + Send + Sync>)
+    }
+    // Non-CUDA host: the admission checks above are this signature's real use
+    // of both params; there is no device to build a frame on.
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// The ridge-INDEPENDENT host operands of the framed SAE reduced-Schur system,
@@ -1248,9 +1235,9 @@ pub fn compute_ainv_host(
 /// [`sae_framed_schur_matvec_cpu`] to prove the GPU kernel computes the SAME
 /// operator — a check that is independent of solver conditioning (unlike a
 /// solved-`δβ` comparison, which can diverge purely because dense Cholesky and
-/// iterative PCG resolve an ill-conditioned `S` to different accuracies). On a
-/// non-CUDA host this returns `Unavailable` so the caller skips cleanly.
+/// iterative PCG resolve an ill-conditioned `S` to different accuracies).
 #[doc(hidden)]
+#[cfg(target_os = "linux")]
 pub fn framed_schur_matvec_once_on_device(
     sys: &ArrowSchurSystem,
     data: &DeviceSaePcgData,
@@ -1264,21 +1251,7 @@ pub fn framed_schur_matvec_once_on_device(
     if data.frame.is_none() {
         return Err(ArrowSchurGpuFailure::Unavailable);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // CUDA is linux-only; the framed device solve is unavailable here. Read
-        // the ridge params (a real, cheap use) so the values the shared signature
-        // carries are not flagged unused on this target — without an `#[allow]`
-        // or `let _` dodge, both of which the build.rs scanner bans.
-        if ridge_t.is_finite() && ridge_beta.is_finite() {
-            return Err(ArrowSchurGpuFailure::Unavailable);
-        }
-        Err(ArrowSchurGpuFailure::Unavailable)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        cuda::framed_schur_matvec_once_on_device(sys, data, ridge_t, ridge_beta, x)
-    }
+    cuda::framed_schur_matvec_once_on_device(sys, data, ridge_t, ridge_beta, x)
 }
 
 /// Reference dense back-end used by tests and as the fallback when the
@@ -1484,10 +1457,8 @@ pub fn sae_framed_schur_matvec_cpu(
 #[cfg(target_os = "linux")]
 mod cuda {
     use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
-    use gam_gpu::driver::to_i32;
-    use gam_gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
     use crate::arrow_schur::{
-        ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, PcgDiagnostics, PcgStopReason,
+        ArrowPcgDiagnostics, ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, PcgStopReason,
     };
     use cudarc::cublas::sys::{
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
@@ -1498,6 +1469,8 @@ mod cuda {
         CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
         PushKernelArg,
     };
+    use gam_gpu::driver::to_i32;
+    use gam_gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
     use ndarray::Array1;
     use std::sync::{Arc, OnceLock};
 
@@ -3144,8 +3117,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             for col in 0..q {
                 let mut e = Array1::<f64>::zeros(q);
                 e[col] = 1.0;
-                let solved =
-                    gam_linalg::triangular::cholesky_solve_vector(factor.view(), e.view());
+                let solved = gam_linalg::triangular::cholesky_solve_vector(factor.view(), e.view());
                 for r in 0..q {
                     ainv_host[row_idx * max_q * max_q + r * max_q + col] = solved[r];
                 }
@@ -3986,7 +3958,16 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .clone_htod(&rhs_init)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
 
-            accumulate_schur(&self.blas, d, k, n, &y_dev, &u_dev, &mut schur_dev, &mut rhs_dev)?;
+            accumulate_schur(
+                &self.blas,
+                d,
+                k,
+                n,
+                &y_dev,
+                &u_dev,
+                &mut schur_dev,
+                &mut rhs_dev,
+            )?;
 
             // ----- Factor S_β, solve δβ = L_S^{-T} L_S^{-1} rhs.
             let info = potrf_single(&self.solver, &self.stream, k, &mut schur_dev)?;
@@ -3995,8 +3976,24 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                     reason: format!("Schur Cholesky failed at pivot {info}"),
                 });
             }
-            trsm_single(&self.blas, &self.stream, k, &schur_dev, &mut rhs_dev, false, false)?;
-            trsm_single(&self.blas, &self.stream, k, &schur_dev, &mut rhs_dev, false, true)?;
+            trsm_single(
+                &self.blas,
+                &self.stream,
+                k,
+                &schur_dev,
+                &mut rhs_dev,
+                false,
+                false,
+            )?;
+            trsm_single(
+                &self.blas,
+                &self.stream,
+                k,
+                &schur_dev,
+                &mut rhs_dev,
+                false,
+                true,
+            )?;
             let delta_beta_host = self
                 .stream
                 .clone_dtoh(&rhs_dev)
@@ -4840,7 +4837,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         rhs_beta: &Array1<f64>,
         max_iterations: usize,
         relative_tolerance: f64,
-    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+    ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
         if k == 0 || data.beta_dim != k || sys.k != k {
             return Err(ArrowSchurGpuFailure::Unavailable);
@@ -4909,7 +4906,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         ridge_beta: f64,
         rhs_beta: &Array1<f64>,
         dctx: &FramedPcgCtx<'_>,
-    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+    ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
         let stream = dctx.stream;
         let blas = dctx.blas;
         let vector_module = dctx.module;
@@ -4918,7 +4915,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let k = rhs_beta.len();
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         if rhs_norm == 0.0 {
-            return Ok((Array1::<f64>::zeros(k), PcgDiagnostics::default()));
+            return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
         let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
         let rhs_dev = stream
@@ -4976,13 +4973,20 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 reason: format!("framed SAE GPU PCG: non-positive initial rᵀM⁻¹r={rz:e}"),
             });
         }
-        let mut diag = PcgDiagnostics {
+        let mut diag = ArrowPcgDiagnostics {
             precond_apply_calls: 1,
             stopping_reason: PcgStopReason::MaxIter,
-            ..PcgDiagnostics::default()
+            ..ArrowPcgDiagnostics::default()
         };
         for _ in 0..max_iterations.max(1) {
-            launch_sae_frame_matvec(stream, vector_module, buffers, &p_dev, &mut ap_dev, ridge_beta)?;
+            launch_sae_frame_matvec(
+                stream,
+                vector_module,
+                buffers,
+                &p_dev,
+                &mut ap_dev,
+                ridge_beta,
+            )?;
             diag.matvec_calls += 1;
             diag.iterations += 1;
             let pap = device_dot(blas, stream, k, &p_dev, &ap_dev)?;
@@ -5055,11 +5059,14 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 return None;
             }
             let runtime = gam_gpu::device_runtime::GpuRuntime::global().filter(|rt| {
-                rt.policy()
-                    .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
+                rt.policy().reduced_schur_matvec_should_offload(
+                    sys.rows.len(),
+                    sys.k,
+                    sys.d,
+                    cg_iters,
+                )
             })?;
-            let ctx =
-                gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)?;
+            let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)?;
             let stream = ctx.new_stream().ok()?;
             let host = super::flatten_frame_host_operands(sys, data, frame).ok()?;
             // #1017/#2230 residency measurement: the ridge-independent operand
@@ -5098,7 +5105,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             rhs_beta: &Array1<f64>,
             max_iterations: usize,
             relative_tolerance: f64,
-        ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+        ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
             // The ladder holds `sys` fixed across trials; if any shape drifted
             // from build time the resident buffers no longer match — decline so
             // the caller retries via the per-trial flatten.
@@ -5125,8 +5132,8 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .stream
                 .clone_htod(&ainv)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            let blas =
-                CudaBlas::new(self.stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let blas = CudaBlas::new(self.stream.clone())
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
             let vector_module = pcg_vector_module(&self.ctx)?;
             let dctx = FramedPcgCtx {
                 stream: &self.stream,
@@ -5153,7 +5160,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         rhs_beta: &Array1<f64>,
         max_iterations: usize,
         relative_tolerance: f64,
-    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+    ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
         if k == 0 || data.beta_dim != k || sys.k != k {
             return Err(ArrowSchurGpuFailure::Unavailable);
@@ -5205,7 +5212,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
 
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         if rhs_norm == 0.0 {
-            return Ok((Array1::<f64>::zeros(k), PcgDiagnostics::default()));
+            return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
         let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
         let rhs_dev = stream
@@ -5263,10 +5270,10 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 reason: format!("SAE matrix-free GPU PCG: non-positive initial rᵀM⁻¹r={rz:e}"),
             });
         }
-        let mut diag = PcgDiagnostics {
+        let mut diag = ArrowPcgDiagnostics {
             precond_apply_calls: 1,
             stopping_reason: PcgStopReason::MaxIter,
-            ..PcgDiagnostics::default()
+            ..ArrowPcgDiagnostics::default()
         };
 
         for _ in 0..max_iterations.max(1) {
@@ -5323,7 +5330,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         rhs_beta: &Array1<f64>,
         max_iterations: usize,
         relative_tolerance: f64,
-    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+    ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
         // #1017 dispatch re-key: this is an ITERATIVE device-resident PCG, not a
         // single GEMV. `S` (k×k) is uploaded once and reused for `max_iterations`
@@ -5383,7 +5390,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         // uses an unbounded trust region (pure CG to tolerance).
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         if rhs_norm == 0.0 {
-            return Ok((Array1::<f64>::zeros(k), PcgDiagnostics::default()));
+            return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
         let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
 
@@ -5414,10 +5421,10 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .alloc_zeros::<f64>(k)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let mut rz = device_dot(&blas, &stream, k, &r_dev, &z_dev)?;
-        let mut diag = PcgDiagnostics {
+        let mut diag = ArrowPcgDiagnostics {
             precond_apply_calls: 1,
             stopping_reason: PcgStopReason::MaxIter,
-            ..PcgDiagnostics::default()
+            ..ArrowPcgDiagnostics::default()
         };
         if rz <= 0.0 || !rz.is_finite() {
             return Err(ArrowSchurGpuFailure::SchurFactorFailed {
@@ -5776,29 +5783,59 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .expect("host operands a");
             let host_b = super::super::flatten_frame_host_operands(&sys, &data, frame)
                 .expect("host operands b");
-            assert_eq!(host_a.s_data, host_b.s_data, "smooth λS must be ridge-independent");
-            assert_eq!(host_a.g_data, host_b.g_data, "frame G must be ridge-independent");
-            assert_eq!(host_a.w_data, host_b.w_data, "frame W must be ridge-independent");
+            assert_eq!(
+                host_a.s_data, host_b.s_data,
+                "smooth λS must be ridge-independent"
+            );
+            assert_eq!(
+                host_a.g_data, host_b.g_data,
+                "frame G must be ridge-independent"
+            );
+            assert_eq!(
+                host_a.w_data, host_b.w_data,
+                "frame W must be ridge-independent"
+            );
             assert_eq!(host_a.htb, host_b.htb, "row H_tβ must be ridge-independent");
             assert_eq!(host_a.q_of, host_b.q_of);
 
             let report = data.operand_byte_report();
             assert!(report.framed, "fixture must exercise the framed lane");
-            assert!(report.total_bytes > 0, "framed operands must have nonzero bytes");
+            assert!(
+                report.total_bytes > 0,
+                "framed operands must have nonzero bytes"
+            );
 
             // The ONLY ridge-dependent buffer: ainv. Deterministic at a fixed
             // ridge (safe to reuse across the ladder), changing with ridge_t
             // (must be recomputed each trial).
-            let ainv_lo =
-                super::super::compute_ainv_host(&sys, &host_a.q_of, host_a.max_q, host_a.n_rows, 1e-3)
-                    .expect("ainv lo");
-            let ainv_lo2 =
-                super::super::compute_ainv_host(&sys, &host_a.q_of, host_a.max_q, host_a.n_rows, 1e-3)
-                    .expect("ainv lo repeat");
-            let ainv_hi =
-                super::super::compute_ainv_host(&sys, &host_a.q_of, host_a.max_q, host_a.n_rows, 1e3)
-                    .expect("ainv hi");
-            assert_eq!(ainv_lo, ainv_lo2, "ainv must be deterministic at a fixed ridge");
+            let ainv_lo = super::super::compute_ainv_host(
+                &sys,
+                &host_a.q_of,
+                host_a.max_q,
+                host_a.n_rows,
+                1e-3,
+            )
+            .expect("ainv lo");
+            let ainv_lo2 = super::super::compute_ainv_host(
+                &sys,
+                &host_a.q_of,
+                host_a.max_q,
+                host_a.n_rows,
+                1e-3,
+            )
+            .expect("ainv lo repeat");
+            let ainv_hi = super::super::compute_ainv_host(
+                &sys,
+                &host_a.q_of,
+                host_a.max_q,
+                host_a.n_rows,
+                1e3,
+            )
+            .expect("ainv hi");
+            assert_eq!(
+                ainv_lo, ainv_lo2,
+                "ainv must be deterministic at a fixed ridge"
+            );
             let max_diff = ainv_lo
                 .iter()
                 .zip(&ainv_hi)
@@ -5839,9 +5876,8 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
             let runtime = gam_gpu::device_runtime::GpuRuntime::global()
                 .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-            let ctx =
-                gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-                    .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
             let stream = ctx
                 .new_stream()
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
@@ -7194,8 +7230,9 @@ mod tests {
                 for dd in 0..qi {
                     block[[dd, dd]] += ridge_t;
                 }
-                let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
-                    .expect("row htt PD");
+                let factor =
+                    cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
+                        .expect("row htt PD");
                 // ainv = (H_tt+ρI)⁻¹ column by column.
                 let mut ainv = Array2::<f64>::zeros((qi, qi));
                 for col in 0..qi {
@@ -7275,10 +7312,7 @@ mod tests {
     /// Host mirror of the device `sae_frame_penalty_diag_host` for the framed
     /// Jacobi preconditioner (penalty diagonal only; the reduced-Schur diagonal
     /// subtraction is applied by the caller). Test-only.
-    fn sae_frame_penalty_diag_host_for_test(
-        data: &DeviceSaePcgData,
-        ridge_beta: f64,
-    ) -> Vec<f64> {
+    fn sae_frame_penalty_diag_host_for_test(data: &DeviceSaePcgData, ridge_beta: f64) -> Vec<f64> {
         let frame = data.frame.as_ref().expect("frame");
         let mut diag = vec![ridge_beta; data.beta_dim];
         for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
@@ -7320,6 +7354,7 @@ mod tests {
     /// operator itself must still match here). Fails loud if CUDA is present but
     /// the device matvec declines; skips cleanly only when no device exists.
     #[test]
+    #[cfg(target_os = "linux")]
     fn framed_sae_device_matvec_matches_cpu_oracle_when_cuda_admits() {
         use crate::arrow_schur::{
             DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
@@ -7510,8 +7545,15 @@ mod tests {
             };
             any_ran = true;
             let mut cpu = vec![0.0_f64; border_dim];
-            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, x.as_slice().unwrap(), &mut cpu)
-                .expect("cpu oracle matvec");
+            sae_framed_schur_matvec_cpu(
+                &sys,
+                &data,
+                ridge_t,
+                ridge_beta,
+                x.as_slice().unwrap(),
+                &mut cpu,
+            )
+            .expect("cpu oracle matvec");
             let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
             for a in 0..border_dim {
                 let rel = (device[a] - cpu[a]).abs() / scale;

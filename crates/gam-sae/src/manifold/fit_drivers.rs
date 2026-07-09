@@ -1,5 +1,5 @@
 use super::*;
-use gam_optimize::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
+use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
 /// Hessian unfactorable.

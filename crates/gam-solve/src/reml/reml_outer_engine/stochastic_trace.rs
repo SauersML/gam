@@ -351,7 +351,7 @@ impl StochasticTraceEstimator {
                 let mut a_w = Array1::<f64>::zeros(hop.dim());
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
                     for k in 0..matrices.len() {
-                        dense_matvec_into(matrices[k], w.view(), a_w.view_mut());
+                        dense::matvec_into(matrices[k], w.view(), a_w.view_mut());
                         probe_values[k] = z.dot(&a_w);
                     }
                 })
@@ -363,7 +363,7 @@ impl StochasticTraceEstimator {
                 let mut a_w = Array1::<f64>::zeros(hop.dim());
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
                     for k in 0..dense_matrices.len() {
-                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                        dense::matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
                         probe_values[k] = z.dot(&a_w);
                     }
 
@@ -399,11 +399,11 @@ impl StochasticTraceEstimator {
                 let mut y_vec = Array1::<f64>::zeros(x_design.nrows());
                 let mut a_w = Array1::<f64>::zeros(hop.dim());
                 self.estimate_from_probe_batch(hop, n_coords, |z, w, probe_values| {
-                    design_matrix_apply_view_into(x_design.as_ref(), z.view(), x_vec.view_mut());
-                    design_matrix_apply_view_into(x_design.as_ref(), w.view(), y_vec.view_mut());
+                    x_design.apply_view_into(z.view(), x_vec.view_mut());
+                    x_design.apply_view_into(w.view(), y_vec.view_mut());
 
                     for k in 0..dense_matrices.len() {
-                        dense_matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
+                        dense::matvec_into(dense_matrices[k], w.view(), a_w.view_mut());
                         probe_values[k] = z.dot(&a_w);
                     }
 
@@ -585,7 +585,7 @@ impl StochasticTraceEstimator {
             );
 
             if let Some(ref x) = x_design {
-                design_matrix_apply_view_into(x.as_ref(), z.view(), x_vec.view_mut());
+                x.apply_view_into(z.view(), x_vec.view_mut());
             }
 
             // Step 2: Form q_e = A_e z for all axes e. Each operator column is
@@ -601,7 +601,7 @@ impl StochasticTraceEstimator {
                     .enumerate()
                     .for_each(|(e, q_col)| {
                         if e < n_dense {
-                            dense_matvec_into(dense_matrices[e], z.view(), q_col);
+                            dense::matvec_into(dense_matrices[e], z.view(), q_col);
                         } else {
                             let op = implicit_ops[e - n_dense];
                             let mut n_work = Array1::<f64>::zeros(n_obs);
@@ -626,12 +626,12 @@ impl StochasticTraceEstimator {
 
             // Precompute X u and X r_e for implicit operators.
             if let Some(ref x) = x_design {
-                design_matrix_apply_view_into(x.as_ref(), u.view(), y_vec.view_mut());
+                x.apply_view_into(u.view(), y_vec.view_mut());
             }
 
             // For dense operators, precompute A_d u once.
             for d in 0..n_dense {
-                dense_matvec_into(dense_matrices[d], u.view(), dense_a_u[d].view_mut());
+                dense::matvec_into(dense_matrices[d], u.view(), dense_a_u[d].view_mut());
             }
 
             // Precompute X r_e for all axes e (for implicit operators). These
@@ -639,7 +639,7 @@ impl StochasticTraceEstimator {
             if let Some(ref x) = x_design {
                 use rayon::prelude::*;
                 x_r.par_iter_mut().enumerate().for_each(|(e, x_r_e)| {
-                    design_matrix_apply_view_into(x.as_ref(), r.column(e), x_r_e.view_mut());
+                    x.apply_view_into(r.column(e), x_r_e.view_mut());
                 });
             }
 
@@ -668,7 +668,7 @@ impl StochasticTraceEstimator {
                             w_y[i] = w[i] * y_vec[i];
                         }
                         let mut u_s = Array1::<f64>::zeros(p);
-                        dense_transpose_matvec_into(&op.s_psi, u.view(), u_s.view_mut());
+                        dense::transpose_matvec_into(&op.s_psi, u.view(), u_s.view_mut());
                         ImplicitSecondOrderScratch { w_dx_u, w_y, u_s }
                     })
                     .collect()
@@ -774,8 +774,8 @@ impl StochasticTraceEstimator {
             );
 
             for e in 0..n_dense {
-                dense_matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
-                dense_matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
+                dense::matvec_into(dense_matrices[e], z.view(), q_columns.column_mut(e));
+                dense::matvec_into(dense_matrices[e], u.view(), a_u_columns.column_mut(e));
             }
             for (oi, op) in operators.iter().enumerate() {
                 let e = n_dense + oi;
@@ -826,9 +826,9 @@ impl StochasticTraceEstimator {
                 probe_id,
                 Some(&self.trace_state),
             );
-            dense_matvec_into(matrix, z.view(), q.view_mut());
+            dense::matvec_into(matrix, z.view(), q.view_mut());
             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
-            probe_values[[0, 0]] = dense_bilinear(matrix, u.view(), r.view());
+            probe_values[[0, 0]] = dense::bilinear(matrix, u.view(), r.view());
         })[[0, 0]]
     }
 
@@ -860,7 +860,7 @@ impl StochasticTraceEstimator {
                 probe_id,
                 Some(&self.trace_state),
             );
-            design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
+            op.x_design.apply_view_into(z.view(), x_z.view_mut());
             op.matvec_with_shared_xz_into(
                 x_z.view(),
                 z.view(),
@@ -870,8 +870,8 @@ impl StochasticTraceEstimator {
             );
             let r = hop.stochastic_trace_solve(&q, self.config.solve_rel_tol);
 
-            design_matrix_apply_view_into(&op.x_design, u.view(), x_u.view_mut());
-            design_matrix_apply_view_into(&op.x_design, r.view(), x_r.view_mut());
+            op.x_design.apply_view_into(u.view(), x_u.view_mut());
+            op.x_design.apply_view_into(r.view(), x_r.view_mut());
             let dx_u = op
                 .implicit_deriv
                 .forward_mul(op.axis, &u.view())
@@ -896,7 +896,7 @@ impl StochasticTraceEstimator {
                     value += x_u[i] * c[i] * x_r[i];
                 }
             }
-            value += dense_bilinear(&op.s_psi, r.view(), u.view());
+            value += dense::bilinear(&op.s_psi, r.view(), u.view());
 
             probe_values[[0, 0]] = value;
         })[[0, 0]]

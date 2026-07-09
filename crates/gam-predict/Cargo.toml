@@ -14,6 +14,7 @@ gam-math = { path = "../gam-math" }
 gam-model-kernels = { path = "../gam-model-kernels" }
 gam-models = { path = "../gam-models" }
 gam-problem = { path = "../gam-problem" }
+gam-runtime = { path = "../gam-runtime" }
 gam-solve = { path = "../gam-solve" }
 gam-spec = { path = "../gam-spec" }
 gam-terms = { path = "../gam-terms" }

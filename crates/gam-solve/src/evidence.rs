@@ -44,13 +44,13 @@
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
+use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::lanczos::{
     SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
 };
 use gam_linalg::triangular::cholesky_solve_vector;
-use crate::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
-use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
 const EVIDENCE_LOGDET_SLQ_PROBES: usize = 16;
@@ -2292,10 +2292,8 @@ pub fn ift_dbeta_drho(
     if dg_red_drho.nrows() != cache.k || schur.nrows() != cache.k {
         return None;
     }
-    crate::sensitivity::FitSensitivity::from_lower_triangular(schur)
-        .mode_response(dg_red_drho)
+    crate::sensitivity::FitSensitivity::from_lower_triangular(schur).mode_response(dg_red_drho)
 }
-
 
 // ---------------------------------------------------------------------------
 // ∂V/∂ρ — analytic optimized-evidence gradient via IFT mode response
@@ -2708,7 +2706,6 @@ fn topology_selection_score(candidate: &TopologyCandidate, scale: TopologyScoreS
 // ---------------------------------------------------------------------------
 // Cache verification helpers
 // ---------------------------------------------------------------------------
-
 
 /// Verifies the `ArrowSchurSystem` dimensions match the cache. Used as
 /// a debug-time precondition; never silently masks shape errors
@@ -3353,7 +3350,7 @@ mod tests {
             k: 1,
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
-            pcg_diagnostics: crate::arrow_schur::PcgDiagnostics::default(),
+            pcg_diagnostics: crate::arrow_schur::ArrowPcgDiagnostics::default(),
             gauge_deflated_directions: 0,
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),
@@ -3410,7 +3407,7 @@ mod tests {
             k: 0,
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
-            pcg_diagnostics: crate::arrow_schur::PcgDiagnostics::default(),
+            pcg_diagnostics: crate::arrow_schur::ArrowPcgDiagnostics::default(),
             gauge_deflated_directions: 0,
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),

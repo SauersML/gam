@@ -4,13 +4,14 @@
 #![allow(unused_imports)]
 use super::tests::*;
 use super::*;
-use gam_linalg::faer_ndarray::fast_ata;
-use gam_solve::evidence::arrow_log_det_from_cache;
 use approx::assert_abs_diff_eq;
-use gam_solve::arrow_schur::{ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics};
+use gam_linalg::faer_ndarray::fast_ata;
+use gam_solve::arrow_schur::{
+    ArrowFactorSlab, ArrowHtbetaCache, ArrowPcgDiagnostics, ArrowSolverMode, ArrowUndampedFactors,
+};
+use gam_solve::evidence::arrow_log_det_from_cache;
 use gam_terms::analytic_penalties::ARDPenalty;
 use ndarray::{Array5, array};
-
 
 /// Torus T^2 fit on synthetic data with a known two-frequency signal.
 /// Drives a single torus atom through the [`SaeManifoldTerm`] Newton loop
@@ -1123,7 +1124,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         k: 1,
         manifold_mode_fingerprint: 0,
         row_hessian_fingerprint: 0,
-        pcg_diagnostics: PcgDiagnostics::default(),
+        pcg_diagnostics: ArrowPcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),
@@ -1153,7 +1154,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         k: 0,
         manifold_mode_fingerprint: 0,
         row_hessian_fingerprint: 0,
-        pcg_diagnostics: PcgDiagnostics::default(),
+        pcg_diagnostics: ArrowPcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),
@@ -1323,7 +1324,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         k: 4,
         manifold_mode_fingerprint: 0,
         row_hessian_fingerprint: 0,
-        pcg_diagnostics: PcgDiagnostics::default(),
+        pcg_diagnostics: ArrowPcgDiagnostics::default(),
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),

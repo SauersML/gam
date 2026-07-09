@@ -684,7 +684,6 @@ def _one_fit(
         optim.zero_grad(set_to_none=True)
         t = encoder(x_t)
         t_sup = t[:, :n_supervised]
-        t_free = t[:, n_supervised : n_supervised + n_free]
         x_hat = decoder(t)
         recon = ((x_hat - x_t) ** 2).sum()
 

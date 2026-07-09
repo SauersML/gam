@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import get_type_hints
+
 import numpy as np
 
 from gamfit._response_geometry import (
@@ -8,6 +10,7 @@ from gamfit._response_geometry import (
     closure,
     clr,
     geometry_log_map,
+    fit_response_geometry,
     inverse_alr,
     simplex_exp_map,
     simplex_frechet_mean,
@@ -15,6 +18,12 @@ from gamfit._response_geometry import (
     sphere_frechet_mean,
     sphere_log_map,
 )
+
+
+def test_fit_response_geometry_runtime_type_hints_resolve() -> None:
+    hints = get_type_hints(fit_response_geometry)
+
+    assert {"latents", "smooths", "constraints"} <= hints.keys()
 
 
 def test_simplex_frechet_mean_is_geometric_not_extrinsic() -> None:

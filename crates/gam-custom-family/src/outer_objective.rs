@@ -8,7 +8,7 @@
 
 use super::*;
 
-impl gam_problem::OuterHessianOperator for OwnedDenseOuterHessianOperator {
+impl gam_problem::HessianOperator for OwnedDenseHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
@@ -61,8 +61,8 @@ impl gam_problem::OuterHessianOperator for OwnedDenseOuterHessianOperator {
     }
 }
 
-pub(crate) struct LabeledOuterHessianOperator {
-    pub(crate) base: Arc<dyn gam_problem::OuterHessianOperator>,
+pub(crate) struct LabeledHessianOperator {
+    pub(crate) base: Arc<dyn gam_problem::HessianOperator>,
     pub(crate) physical_to_outer: Vec<Option<usize>>,
     pub(crate) outer_dim: usize,
     /// Scratch buffers reused across `apply_into` calls to avoid
@@ -71,9 +71,9 @@ pub(crate) struct LabeledOuterHessianOperator {
     pub(crate) scratch: std::sync::Mutex<(ndarray::Array1<f64>, ndarray::Array1<f64>)>,
 }
 
-impl LabeledOuterHessianOperator {
+impl LabeledHessianOperator {
     pub(crate) fn new(
-        base: Arc<dyn gam_problem::OuterHessianOperator>,
+        base: Arc<dyn gam_problem::HessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
         // gam#1587: the base operator spans the per-block physical coords followed
@@ -98,7 +98,7 @@ impl LabeledOuterHessianOperator {
     }
 }
 
-impl gam_problem::OuterHessianOperator for LabeledOuterHessianOperator {
+impl gam_problem::HessianOperator for LabeledHessianOperator {
     fn dim(&self) -> usize {
         self.outer_dim
     }
@@ -217,7 +217,7 @@ impl gam_problem::OuterHessianOperator for LabeledOuterHessianOperator {
         self.base.is_cheap_to_materialize()
     }
 
-    fn materialization_capability(&self) -> gam_problem::OuterHessianMaterialization {
+    fn materialization_capability(&self) -> gam_problem::HessianMaterialization {
         self.base.materialization_capability()
     }
 }
@@ -230,7 +230,7 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     rho: &Array1<f64>,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     eval_mode: EvalMode,
-) -> Result<Option<Arc<dyn gam_problem::OuterHessianOperator>>, String> {
+) -> Result<Option<Arc<dyn gam_problem::HessianOperator>>, String> {
     if eval_mode != EvalMode::ValueGradientHessian {
         return Ok(None);
     }
@@ -240,11 +240,11 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
         return Ok(None);
     };
     match terms.outer_hessian {
-        gam_problem::HessianResult::Operator(operator) => Ok(Some(operator)),
-        gam_problem::HessianResult::Analytic(matrix) => {
-            Ok(Some(Arc::new(OwnedDenseOuterHessianOperator { matrix })))
+        gam_problem::HessianValue::Operator(operator) => Ok(Some(operator)),
+        gam_problem::HessianValue::Dense(matrix) => {
+            Ok(Some(Arc::new(OwnedDenseHessianOperator { matrix })))
         }
-        gam_problem::HessianResult::Unavailable => Ok(None),
+        gam_problem::HessianValue::Unavailable => Ok(None),
     }
 }
 

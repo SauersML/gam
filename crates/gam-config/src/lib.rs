@@ -131,50 +131,6 @@ pub struct ResolvedFitConfig {
     pub training_table_kind: Option<String>,
 }
 
-pub struct CliFitConfigInput {
-    pub family: Option<String>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile`. The CLI family
-    /// flag is a fixed value-enum that cannot carry the inline `expectile(τ)`
-    /// asymmetry the string form accepts, so the CLI pins `τ` through this
-    /// separate `--expectile-tau` field; it rides into `FitConfig::expectile_tau`
-    /// and is read by the shared expectile dispatch seam (#1777).
-    pub expectile_tau: Option<f64>,
-    pub negative_binomial_theta: Option<f64>,
-    pub link: Option<String>,
-    pub flexible_link: bool,
-    pub offset_column: Option<String>,
-    pub weight_column: Option<String>,
-    pub noise_offset_column: Option<String>,
-    pub baseline_target: String,
-    pub baseline_scale: Option<f64>,
-    pub baseline_shape: Option<f64>,
-    pub baseline_rate: Option<f64>,
-    pub baseline_makeham: Option<f64>,
-    pub time_basis: String,
-    pub time_degree: usize,
-    pub time_num_internal_knots: usize,
-    pub time_smooth_lambda: f64,
-    pub survival_likelihood: String,
-    pub survival_distribution: String,
-    pub threshold_time_k: Option<usize>,
-    pub threshold_time_degree: usize,
-    pub sigma_time_k: Option<usize>,
-    pub sigma_time_degree: usize,
-    pub noise_formula: Option<String>,
-    pub logslope_formula: Option<String>,
-    pub z_column: Option<String>,
-    pub scale_dimensions: bool,
-    pub adaptive_regularization: Option<bool>,
-    pub ridge_lambda: f64,
-    pub transformation_normal: bool,
-    pub firth: bool,
-    pub outer_max_iter: Option<usize>,
-    pub gpu: Option<String>,
-    pub frailty_kind: Option<CliFrailtyKind>,
-    pub frailty_sd: Option<f64>,
-    pub hazard_loading: Option<CliHazardLoading>,
-}
-
 pub struct SurvivalInverseLinkInput<'a> {
     pub link: Option<&'a str>,
     pub mixture_rho: Option<&'a str>,
@@ -224,7 +180,7 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         fit_config.transformation_normal = flag;
     }
     if let Some(mode) = json_config.survival_likelihood {
-        fit_config.survival_likelihood = parse_survival_likelihood_cli(&mode)?;
+        fit_config.survival_likelihood = mode;
     }
     if let Some(target) = json_config.baseline_target {
         fit_config.baseline_target =
@@ -294,56 +250,23 @@ fn resolve_json_fit_config(json_config: JsonFitConfig) -> Result<ResolvedFitConf
         json_config.frailty_sd,
         json_config.hazard_loading,
     )?;
-    validate_resolved_fit_config(&fit_config)?;
+    fit_config = resolve_fit_config(fit_config)?;
     Ok(ResolvedFitConfig {
         fit_config,
         training_table_kind,
     })
 }
 
-pub fn resolve_cli_fit_config(input: CliFitConfigInput) -> Result<FitConfig, String> {
-    let mut fit_config = FitConfig::default();
-    fit_config.family = input.family;
-    fit_config.expectile_tau = input.expectile_tau;
-    fit_config.negative_binomial_theta = input.negative_binomial_theta;
-    fit_config.link = input.link;
-    fit_config.flexible_link = input.flexible_link;
-    fit_config.offset_column = input.offset_column;
-    fit_config.weight_column = input.weight_column;
-    fit_config.noise_offset_column = input.noise_offset_column;
-    fit_config.baseline_target = input.baseline_target;
-    fit_config.baseline_scale = input.baseline_scale;
-    fit_config.baseline_shape = input.baseline_shape;
-    fit_config.baseline_rate = input.baseline_rate;
-    fit_config.baseline_makeham = input.baseline_makeham;
-    fit_config.time_basis = input.time_basis;
-    fit_config.time_degree = input.time_degree;
-    fit_config.time_num_internal_knots = input.time_num_internal_knots;
-    fit_config.time_smooth_lambda = input.time_smooth_lambda;
-    fit_config.survival_likelihood = parse_survival_likelihood_cli(&input.survival_likelihood)?;
-    fit_config.survival_distribution = input.survival_distribution;
-    fit_config.threshold_time_k = input.threshold_time_k;
-    fit_config.threshold_time_degree = input.threshold_time_degree;
-    fit_config.sigma_time_k = input.sigma_time_k;
-    fit_config.sigma_time_degree = input.sigma_time_degree;
-    fit_config.noise_formula = input.noise_formula;
-    fit_config.logslope_formula = input.logslope_formula;
-    fit_config.z_column = input.z_column;
-    fit_config.scale_dimensions = input.scale_dimensions;
-    fit_config.adaptive_regularization = input.adaptive_regularization;
-    fit_config.ridge_lambda = input.ridge_lambda;
-    fit_config.transformation_normal = input.transformation_normal;
-    fit_config.firth = input.firth;
-    fit_config.outer_max_iter = input.outer_max_iter;
-    if let Some(raw_gpu) = input.gpu {
-        fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
-    }
-    fit_config.frailty = resolve_cli_frailty_spec(
-        input.frailty_kind,
-        input.frailty_sd,
-        input.hazard_loading,
-        "fit",
-    )?;
+/// Normalize and validate the one canonical fit configuration type.
+///
+/// Front ends are responsible only for translating their syntax into
+/// [`FitConfig`]. All semantic normalization and cross-field validation happens
+/// here, so CLI and JSON callers cannot drift into separate configuration
+/// contracts.
+pub fn resolve_fit_config(mut fit_config: FitConfig) -> Result<FitConfig, String> {
+    fit_config.family = normalize_optional_family(fit_config.family);
+    fit_config.survival_likelihood =
+        parse_survival_likelihood_cli(&fit_config.survival_likelihood)?;
     validate_resolved_fit_config(&fit_config)?;
     Ok(fit_config)
 }
@@ -973,53 +896,16 @@ mod tests {
 
     struct ParityCase {
         name: &'static str,
-        cli: CliFitConfigInput,
+        cli: FitConfig,
         json: Value,
     }
 
-    fn base_cli() -> CliFitConfigInput {
-        CliFitConfigInput {
-            family: None,
-            expectile_tau: None,
-            negative_binomial_theta: None,
-            link: None,
-            flexible_link: false,
-            offset_column: None,
-            weight_column: None,
-            noise_offset_column: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "ispline".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            survival_likelihood: "transformation".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            noise_formula: None,
-            logslope_formula: None,
-            z_column: None,
-            scale_dimensions: false,
-            adaptive_regularization: None,
-            ridge_lambda: 1e-6,
-            transformation_normal: false,
-            firth: false,
-            outer_max_iter: None,
-            gpu: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-        }
+    fn base_cli() -> FitConfig {
+        FitConfig::default()
     }
 
-    fn resolved_cli(input: CliFitConfigInput) -> Result<FitConfig, String> {
-        resolve_cli_fit_config(input)
+    fn resolved_cli(input: FitConfig) -> Result<FitConfig, String> {
+        resolve_fit_config(input)
     }
 
     fn resolved_json(config: Value) -> Result<FitConfig, String> {
@@ -1153,7 +1039,7 @@ mod tests {
                 name: "gpu policy toggle",
                 cli: {
                     let mut input = base_cli();
-                    input.gpu = Some("off".to_string());
+                    input.gpu_policy = gam_gpu::GpuPolicy::Off;
                     input
                 },
                 json: json!({
@@ -1164,9 +1050,10 @@ mod tests {
                 name: "hazard multiplier frailty fields",
                 cli: {
                     let mut input = base_cli();
-                    input.frailty_kind = Some(CliFrailtyKind::HazardMultiplier);
-                    input.frailty_sd = Some(0.35);
-                    input.hazard_loading = Some(CliHazardLoading::LoadedVsUnloaded);
+                    input.frailty = FrailtySpec::HazardMultiplier {
+                        sigma_fixed: Some(0.35),
+                        loading: HazardLoading::LoadedVsUnloaded,
+                    };
                     input
                 },
                 json: json!({
@@ -1179,8 +1066,9 @@ mod tests {
                 name: "gaussian shift frailty fields",
                 cli: {
                     let mut input = base_cli();
-                    input.frailty_kind = Some(CliFrailtyKind::GaussianShift);
-                    input.frailty_sd = Some(0.2);
+                    input.frailty = FrailtySpec::GaussianShift {
+                        sigma_fixed: Some(0.2),
+                    };
                     input
                 },
                 json: json!({
@@ -1216,17 +1104,6 @@ mod tests {
                 },
                 json: json!({
                     "ridge_lambda": -1.0
-                }),
-            },
-            ParityCase {
-                name: "unknown gpu policy",
-                cli: {
-                    let mut input = base_cli();
-                    input.gpu = Some("cuda".to_string());
-                    input
-                },
-                json: json!({
-                    "gpu": "cuda"
                 }),
             },
             ParityCase {

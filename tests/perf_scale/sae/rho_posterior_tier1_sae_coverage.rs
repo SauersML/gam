@@ -11,7 +11,7 @@ use faer::Side as FaerSide;
 use gam::estimate::EstimationError;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::rho_optimizer::{
-    DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
+    DeclaredHessianForm, Derivative, HessianValue, OuterCapability, OuterEval, OuterObjective,
     OuterProblem, SeedOutcome,
 };
 use gam::terms::latent::LatentManifold;
@@ -220,7 +220,7 @@ impl OuterObjective for SmoothOnlyObjective<'_> {
         Ok(OuterEval {
             cost: eval.cost,
             gradient: Array1::from_vec(vec![eval.gradient[SMOOTH_RHO_INDEX]]),
-            hessian: HessianResult::Unavailable,
+            hessian: HessianValue::Unavailable,
             inner_beta_hint: eval.inner_beta_hint,
         })
     }

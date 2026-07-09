@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,13 +10,12 @@ from typing import Any, Mapping
 import numpy as np
 
 from ._binding import rust_module
-from ._linear_dictionary import linear_dictionary_fit
 from ._penalty_bridge import (
     GumbelTemperatureSchedule,
     validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
 )
 from ._sparse_dictionary import sparse_dictionary_fit
-from ._sae_trust import atom_trust_scores, coerce_sae_trust_diagnostics
+from ._sae_trust import atom_trust_scores
 
 
 class _SaeLazyFitArtifact:
@@ -1976,18 +1974,15 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Deprecated alias for ``coord_sparsity`` (#1777). Supplying both with
         different values raises ``ValueError``.
     separation_barrier_strength
-        Optional PER-FIT override (#1777) for this term's separation-barrier
-        strength. ``None`` (default) defers to the process-global
-        :func:`sae_set_barrier_overrides` setter (or the compiled default); a
-        finite value pins the strength for THIS fit only, isolated from other
-        concurrent fits. Threaded into the Rust ``SaeFitConfig`` and takes
-        precedence over the global setter.
+        Optional per-fit value for this term's decoder-repulsion conditioner.
+        ``None`` (default) uses the canonical evidence-derived strength; a finite
+        value pins the strength for this fit. Threaded into the Rust
+        ``SaeFitConfig``.
     ibp_alpha
-        Optional PER-FIT override (#1777) for this term's IBP-α (flattens the
-        ordered geometric assignment prior). ``None`` (default) defers to the
-        process-global :func:`sae_set_ibp_alpha` setter (or the compiled
-        default); a value pins α for THIS fit only. Threaded into the Rust
-        ``SaeFitConfig`` and takes precedence over the global setter.
+        Optional per-fit IBP-α value, which controls the ordered geometric
+        assignment prior. ``None`` uses the assignment mode's canonical fixed or
+        learnable value; an explicit value pins α for this fit. Threaded into
+        the Rust ``SaeFitConfig``.
     scad_mcp_gamma
         Optional SCAD/MCP concavity parameter. Defaults are SCAD ``3.7`` and
         MCP ``2.5``. SCAD requires ``gamma > 2``; MCP requires ``gamma > 1``.
@@ -2006,7 +2001,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         so the ordered stick-breaking prior spans the whole dictionary instead of
         masking every atom past the first few (which underfit an equal-K linear
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
-        or the global ``sae_set_ibp_alpha`` setter still overrides it.
+        overrides it.
     structured_residual_passes
         Number of structured-residual whitening passes run after the primary
         joint fit. Defaults to ``2`` (#2021 — ON by default; "magic by default":
@@ -2173,15 +2168,14 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         float(separation_barrier_strength)
     ):
         raise ValueError(
-            "separation_barrier_strength must be finite (or None to defer to the "
-            f"global setter); got {separation_barrier_strength}"
+            "separation_barrier_strength must be finite or None; "
+            f"got {separation_barrier_strength}"
         )
     if ibp_alpha is not None and not (
         np.isfinite(float(ibp_alpha)) and float(ibp_alpha) > 0.0
     ):
         raise ValueError(
-            "ibp_alpha must be finite and > 0 (or None to defer to the global "
-            f"setter); got {ibp_alpha}"
+            f"ibp_alpha must be finite and > 0 or None; got {ibp_alpha}"
         )
     # Structured-residual sculpting is an explicit, typed opt-in. The count must
     # be a non-negative int (it is clamped natively to
@@ -2373,9 +2367,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # so the prior SPANS the whole dictionary instead of collapsing to a near-hard
     # mask past the first ~3 atoms (the fixed `alpha=1.0` failure that made the
     # manifold underfit an equal-K linear dictionary and left late atoms massless,
-    # rank-deficient at K=128). A per-fit `ibp_alpha` / the process-global
-    # `sae_set_ibp_alpha` override still wins in Rust (`resolved_ibp_alpha`), so
-    # this only moves the *base* default. `alpha="auto"` (learnable) and every
+    # rank-deficient at K=128). A per-fit `ibp_alpha` still wins in Rust
+    # (`resolved_ibp_alpha`), so this only moves the *base* default.
+    # `alpha="auto"` (learnable) and every
     # non-`ibp_map` gate keep the historical `1.0` seed.
     alpha_is_auto = alpha == "auto"
     if alpha is _ALPHA_UNSET:
@@ -2560,9 +2554,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
         fisher_provenance=None if fisher_shard is None else fisher_shard[2],
         row_loss_weights=row_loss_weights_arr,
-        # #1777 PER-FIT config overrides. `None` defers to the process-global
-        # `sae_set_barrier_overrides` / `sae_set_ibp_alpha` setters (or the
-        # compiled default); a value pins the strength/α for THIS fit only.
+        # Per-fit config. `None` selects the canonical data-derived or assignment
+        # default; a value pins the strength/α for this fit.
         separation_barrier_strength_override=(
             None if separation_barrier_strength is None else float(separation_barrier_strength)
         ),
@@ -2777,7 +2770,6 @@ class StagewiseSAE:
             ((size - 1) // 2 if kind in ("periodic", "periodic_spline") else 0)
             for kind, size in zip(basis_kinds, basis_sizes)
         ]
-        centers: list[np.ndarray | None] = [None] * len(self.atoms)
         coords = [np.ascontiguousarray(np.asarray(a.coords, dtype=np.float64)) for a in self.atoms]
         assignments = np.ascontiguousarray(
             np.column_stack(

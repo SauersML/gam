@@ -1238,7 +1238,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // callbacks factorize the canonical-TRANSFORMED (possibly constraint-
 // projected) penalties — a different matrix, not a duplicate.
 //
-// LANDED (#934 sibling): `CriterionCertificate` FD-audits the value path
+// LANDED (#934 sibling): `OuterCriterionCertificate` FD-audits the value path
 // against the analytic gradient at every returned optimum, so each further
 // port inherits an end-to-end desync alarm even before its per-atom
 // `certify` body exists.
@@ -1273,7 +1273,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // certify body: `certify_tangency` audits every constrained emission
 // against the defining invariant `A_act·v = 0` on the `[CERTIFICATE]`
 // stream (#934 pattern; the unconstrained arm is covered end-to-end by
-// `CriterionCertificate`'s FD audit at every optimum). Bit-identity pin:
+// `OuterCriterionCertificate`'s FD audit at every optimum). Bit-identity pin:
 // `theta_mode_response_kernel_matches_preport_assembly_bitwise` reproduces
 // the pre-port per-site assemblies inline and asserts bitwise-equal
 // emissions in both regimes plus the masked-ρ and subspace-without-

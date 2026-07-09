@@ -2118,7 +2118,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 // when its cycle budget is exhausted without convergence; the
                 // matching outer-side contract is `nonconverged_outer_eval_result`
                 // (custom_family.rs:5993), which surfaces zero gradient and
-                // HessianResult::Unavailable so the optimizer backs off. A
+                // HessianValue::Unavailable so the optimizer backs off. A
                 // partial pilot β can still be far from the cold-start optimum
                 // (the warning literally exists to signal that), so seeding
                 // the real outer optimizer with it can drag the first true

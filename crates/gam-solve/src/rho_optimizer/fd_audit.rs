@@ -214,7 +214,7 @@ where
     EvalF: FnMut(
         &Array1<f64>,
         crate::estimate::reml::reml_outer_engine::EvalMode,
-    ) -> Result<(f64, Array1<f64>, HessianResult), String>,
+    ) -> Result<(f64, Array1<f64>, HessianValue), String>,
 {
     use crate::estimate::reml::reml_outer_engine::EvalMode;
     let (value, analytic_grad, hess) = eval(theta0, EvalMode::ValueGradientHessian)?;

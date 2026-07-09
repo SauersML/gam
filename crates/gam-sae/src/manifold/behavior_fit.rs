@@ -48,7 +48,7 @@
 //!   than manufacturing spurious weight.
 
 use super::*;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use opt::{BacktrackConfig, backtracking_line_search};
 
 /// Outcome of a two-block REML fit: the converged weight, the trajectory, and
 /// the final inner loss.
@@ -330,7 +330,7 @@ impl SaeManifoldTerm {
             // otherwise non-contractive (fit, λ-update) alternation monotone.
             let armijo_eps = 1e-9 * (1.0 + baseline_crit.abs());
             // Backtracking line search on the closed-form λ step, migrated onto
-            // the shared `gam_optimize` primitive. `trial(s)` evaluates the step
+            // the shared `opt` primitive. `trial(s)` evaluates the step
             // of scale `s` (always well defined here, so never `Ok(None)`) and
             // threads the trial iterate `(trial_ll, trial_loss)` through the
             // payload; `accept` inlines the exact Armijo sufficient-decrease test

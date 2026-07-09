@@ -2,7 +2,7 @@
 //! under #1521). The enum is pure data; its operators use only gam-problem's own
 //! dense linalg helpers, so hosting it here lets the criterion/solver layers share
 //! one definition without an upward edge into the engine.
-use crate::linalg_helpers::{dense_matvec_into, dense_transpose_matvec_scaled_add_into};
+use gam_linalg::dense;
 use crate::reml_contract_panic;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
@@ -291,8 +291,8 @@ impl PenaltyCoordinate {
             | Self::BlockRootCentered { .. } => match self {
                 Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
                     let mut root_beta = Array1::<f64>::zeros(root.nrows());
-                    dense_matvec_into(root, beta, root_beta.view_mut());
-                    dense_transpose_matvec_scaled_add_into(
+                    dense::matvec_into(root, beta, root_beta.view_mut());
+                    dense::transpose_matvec_scaled_add_into(
                         root,
                         root_beta.view(),
                         scale,
@@ -314,9 +314,9 @@ impl PenaltyCoordinate {
                 } => {
                     let beta_block = beta.slice(ndarray::s![*start..*end]);
                     let mut root_beta = Array1::<f64>::zeros(root.nrows());
-                    dense_matvec_into(root, beta_block, root_beta.view_mut());
+                    dense::matvec_into(root, beta_block, root_beta.view_mut());
                     let out_block = out.slice_mut(ndarray::s![*start..*end]);
-                    dense_transpose_matvec_scaled_add_into(
+                    dense::transpose_matvec_scaled_add_into(
                         root,
                         root_beta.view(),
                         scale,

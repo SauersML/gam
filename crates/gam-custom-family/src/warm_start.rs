@@ -172,7 +172,7 @@ pub struct BlockwiseFitResultParts {
     /// First-order optimality certificate from the outer smoothing solve
     /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
     /// audit could not evaluate.
-    pub criterion_certificate: Option<gam_solve::rho_optimizer::CriterionCertificate>,
+    pub criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
@@ -832,7 +832,7 @@ impl CustomOuterState {
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
-    pub outer_hessian: gam_problem::HessianResult,
+    pub outer_hessian: gam_problem::HessianValue,
     pub warm_start: CustomFamilyWarmStart,
     /// `false` when the inner blockwise/Newton solve hit its divergence
     /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
@@ -855,7 +855,7 @@ pub struct CustomFamilyJointHyperEfsResult {
 pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) objective: f64,
     pub(crate) gradient: Array1<f64>,
-    pub(crate) outer_hessian: gam_problem::HessianResult,
+    pub(crate) outer_hessian: gam_problem::HessianValue,
     pub(crate) warm_start: ConstrainedWarmStart,
     pub(crate) inner_converged: bool,
 }
@@ -874,6 +874,6 @@ pub(crate) fn outer_eval_result_to_joint_hyper_result(
     }
 }
 
-pub(crate) struct OwnedDenseOuterHessianOperator {
+pub(crate) struct OwnedDenseHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }

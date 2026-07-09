@@ -2009,7 +2009,7 @@ where
                 reml_seed_config_mix.seed_budget = 1;
             }
             use crate::rho_optimizer::OuterProblem;
-            use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
+            use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
             let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
             let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
@@ -2221,7 +2221,7 @@ where
                 Ok(OuterEval {
                     cost,
                     gradient: grad,
-                    hessian: HessianResult::Analytic(hessian),
+                    hessian: HessianValue::Dense(hessian),
                     inner_beta_hint: state.current_original_basis_beta(),
                 })
             },

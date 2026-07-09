@@ -9,6 +9,14 @@
 //! reached only when the outer bridge concludes on its own — an interrupted
 //! worker unwinds through the cancel flag and never reaches it).
 //!
+//! Wiring: the outer objective computes the [`SaeCheckpointFingerprint`] once at
+//! construction on the pristine full-`N` target, banks a checkpoint
+//! (best-effort, atomic) at every MATERIAL improvement of the outer best cost
+//! (`SaeManifoldOuterObjective::bank_checkpoint`), resumes via
+//! `try_resume_from_checkpoint` at fit entry, and discards the file when a
+//! converged fit is minted (`discard_checkpoint` — wall survival is not
+//! cross-fit caching; `persistent_warm_start` owns that).
+//!
 //! # What is banked
 //!
 //! The checkpoint holds the *fittable* incumbent state — per-atom decoder
@@ -39,10 +47,11 @@
 //! the trailing version only when the serialized layout changes in a way that
 //! makes a prior file unsafe to consume.
 
+use super::term::SaeManifoldTerm;
 use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// On-disk schema tag. Hand-bumped only on a layout-breaking change (see module
 /// docs); [`SaeFitCheckpoint::verify_compatible`] rejects any other value.
@@ -128,7 +137,9 @@ pub(crate) struct SaeFitCheckpoint {
     /// [`crate::manifold::rho::SaeManifoldRho::to_flat`]).
     pub(crate) rho_flat: Vec<f64>,
     pub(crate) ledger: SaeCheckpointLedger,
-    /// The banked incumbent's reconstruction EV (the keep-best ordering key).
+    /// The banked incumbent's reconstruction EV (telemetry alongside the
+    /// objective-keyed ordering; sanitized finite by the writer — serde_json
+    /// refuses non-finite floats).
     pub(crate) incumbent_ev: f64,
     pub(crate) atoms: Vec<SaeCheckpointAtom>,
     /// `(N, K)` shared assignment logits, nested row-major.
@@ -136,6 +147,109 @@ pub(crate) struct SaeFitCheckpoint {
 }
 
 impl SaeFitCheckpoint {
+    /// Content-addressed default store path, following the
+    /// `persistent_warm_start` convention (`temp_dir()/gam/...`): magic by
+    /// default, no user-supplied path. On cluster jobs whose `TMPDIR` points at
+    /// persistent project storage (the MSI sbatch contract) this survives the
+    /// wall; a re-submitted job on the SAME data finds it by content hash.
+    pub(crate) fn default_store_path(fingerprint: &SaeCheckpointFingerprint) -> PathBuf {
+        std::env::temp_dir()
+            .join("gam")
+            .join("sae_fit_checkpoint")
+            .join("v1")
+            .join(format!("{}.json", &fingerprint.content_hash))
+    }
+
+    /// Capture the current fittable incumbent from the term: per-atom decoder /
+    /// coords / log-amplitude / η plus the shared logits — the same recoverable
+    /// state `SaeManifoldMutableState` snapshots (basis matrices are rebuilt on
+    /// resume from `(coords, evaluator, η)`).
+    pub(crate) fn capture(
+        term: &SaeManifoldTerm,
+        fingerprint: &SaeCheckpointFingerprint,
+        rho_flat: &[f64],
+        ledger: SaeCheckpointLedger,
+        incumbent_ev: f64,
+    ) -> Self {
+        let atoms = term
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(atom_idx, atom)| SaeCheckpointAtom {
+                decoder_coefficients: rows_of(&atom.decoder_coefficients),
+                coords: rows_of(&term.assignment.coords[atom_idx].as_matrix()),
+                log_amplitude: atom.log_amplitude,
+                homotopy_eta: atom.homotopy_eta,
+            })
+            .collect();
+        Self {
+            schema: SAE_FIT_CHECKPOINT_SCHEMA.to_string(),
+            created_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            fingerprint: fingerprint.clone(),
+            rho_flat: rho_flat.to_vec(),
+            ledger,
+            incumbent_ev,
+            atoms,
+            logits: rows_of(&term.assignment.logits),
+        }
+    }
+
+    /// Install the banked incumbent into a freshly constructed term: assign the
+    /// per-atom decoder / coords / log-amplitude / η and the shared logits in
+    /// place, then rebuild the basis caches from the restored coordinates
+    /// (deterministic, exactly as `restore_mutable_state` does). Typed `Err` on
+    /// any shape mismatch — a checkpoint that fails to install must never
+    /// silently degrade into a partial resume. Call only after
+    /// [`Self::verify_compatible`] has accepted the fingerprint.
+    pub(crate) fn install_into(&self, term: &mut SaeManifoldTerm) -> Result<(), String> {
+        if self.atoms.len() != term.atoms.len() {
+            return Err(format!(
+                "checkpoint install: atom count {} != term {}",
+                self.atoms.len(),
+                term.atoms.len()
+            ));
+        }
+        for (atom_idx, banked) in self.atoms.iter().enumerate() {
+            let decoder = array2_from_rows(&banked.decoder_coefficients)?;
+            let atom = &mut term.atoms[atom_idx];
+            if decoder.dim() != atom.decoder_coefficients.dim() {
+                return Err(format!(
+                    "checkpoint install: atom {atom_idx} decoder {:?} != term {:?}",
+                    decoder.dim(),
+                    atom.decoder_coefficients.dim()
+                ));
+            }
+            atom.decoder_coefficients.assign(&decoder);
+            atom.log_amplitude = banked.log_amplitude;
+            atom.homotopy_eta = banked.homotopy_eta;
+            let coords = array2_from_rows(&banked.coords)?;
+            let slot = &mut term.assignment.coords[atom_idx];
+            if coords.dim() != (slot.n_obs(), slot.latent_dim()) {
+                return Err(format!(
+                    "checkpoint install: atom {atom_idx} coords {:?} != term ({}, {})",
+                    coords.dim(),
+                    slot.n_obs(),
+                    slot.latent_dim()
+                ));
+            }
+            let flat: Vec<f64> = coords.iter().copied().collect();
+            slot.set_flat(ndarray::ArrayView1::from(&flat));
+        }
+        let logits = array2_from_rows(&self.logits)?;
+        if logits.dim() != term.assignment.logits.dim() {
+            return Err(format!(
+                "checkpoint install: logits {:?} != term {:?}",
+                logits.dim(),
+                term.assignment.logits.dim()
+            ));
+        }
+        term.assignment.logits.assign(&logits);
+        term.refresh_basis_from_current_coords()
+    }
+
     /// Atomically persist to `path`: encode to JSON, write a sibling temp file,
     /// `fsync` it, then `rename` over the destination. A reader therefore only
     /// ever observes a complete file — a crash mid-write leaves the previous
@@ -168,7 +282,10 @@ impl SaeFitCheckpoint {
         }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("SaeFitCheckpoint::save_atomic: rename into {}: {e}", path.display())
+            format!(
+                "SaeFitCheckpoint::save_atomic: rename into {}: {e}",
+                path.display()
+            )
         })
     }
 
@@ -274,7 +391,12 @@ mod checkpoint_tests {
                 },
                 SaeCheckpointAtom {
                     decoder_coefficients: vec![vec![-1.0, -2.0, -3.0]],
-                    coords: vec![vec![0.9, 0.8], vec![0.7, 0.6], vec![0.5, 0.4], vec![0.3, 0.2]],
+                    coords: vec![
+                        vec![0.9, 0.8],
+                        vec![0.7, 0.6],
+                        vec![0.5, 0.4],
+                        vec![0.3, 0.2],
+                    ],
                     log_amplitude: -0.3,
                     homotopy_eta: 0.5,
                 },
@@ -315,7 +437,10 @@ mod checkpoint_tests {
         let err = ckpt
             .verify_compatible(&mismatched, ckpt.rho_flat.len())
             .expect_err("content-hash mismatch must refuse");
-        assert!(err.contains("fingerprint mismatch"), "unexpected error: {err}");
+        assert!(
+            err.contains("fingerprint mismatch"),
+            "unexpected error: {err}"
+        );
 
         // A ρ-length mismatch (e.g. K changed) also refuses instead of panicking
         // a later `from_flat`.
@@ -348,9 +473,14 @@ mod checkpoint_tests {
             .join("nested")
             .join("ckpt.json");
         let ckpt = sample_checkpoint();
-        let err = ckpt.save_atomic(&missing).expect_err("save into missing dir must fail");
+        let err = ckpt
+            .save_atomic(&missing)
+            .expect_err("save into missing dir must fail");
         assert!(err.contains("write temp"), "unexpected error: {err}");
-        assert!(!missing.exists(), "destination must not exist after a failed save");
+        assert!(
+            !missing.exists(),
+            "destination must not exist after a failed save"
+        );
         let mut tmp = missing.as_os_str().to_owned();
         tmp.push(format!(".tmp.{}", std::process::id()));
         assert!(
@@ -372,7 +502,10 @@ mod checkpoint_tests {
             !std::path::PathBuf::from(tmp).exists(),
             "temp sibling must be renamed away after a successful save"
         );
-        assert!(path.exists(), "destination must exist after a successful save");
+        assert!(
+            path.exists(),
+            "destination must exist after a successful save"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -383,7 +516,10 @@ mod checkpoint_tests {
         let back = array2_from_rows(&rows).expect("rectangular");
         assert_eq!(back, m);
         let ragged = vec![vec![1.0, 2.0], vec![3.0]];
-        assert!(array2_from_rows(&ragged).is_err(), "ragged input must error");
+        assert!(
+            array2_from_rows(&ragged).is_err(),
+            "ragged input must error"
+        );
     }
 
     /// The fingerprint is content-sensitive: two same-shape targets with

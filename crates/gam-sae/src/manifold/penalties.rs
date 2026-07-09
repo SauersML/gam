@@ -678,10 +678,7 @@ impl SaeManifoldTerm {
         // #4 — per-row reconstruction weights `w_i` (the same #991 design-honesty
         // weights the assembly applies as `√w_i`), or the exact unweighted path
         // when none are installed. A mismatched length falls back to unweighted.
-        let row_w = self
-            .row_loss_weights
-            .as_deref()
-            .filter(|w| w.len() == n);
+        let row_w = self.row_loss_weights.as_deref().filter(|w| w.len() == n);
         // Coactivation-weighted design Grams and cross-Gram (small: M_· × M_·).
         let mut gj = Array2::<f64>::zeros((mj, mj));
         let mut gk = Array2::<f64>::zeros((mk, mk));
@@ -800,20 +797,16 @@ impl SaeManifoldTerm {
     /// reuses [`SAE_SEPARATION_BARRIER_EPS`], so a perfectly data-degenerate pair
     /// (`γ_jk = 1`) gets the largest finite strength `1/ε_barrier`.
     ///
-    /// The runtime override (per-fit [`Self::separation_barrier_strength_override`],
-    /// or the deprecated process-global [`sae_separation_barrier_override`]) still
-    /// takes precedence — when set it is the absolute conditioner strength for
-    /// EVERY pair, and `0.0` stays a legitimate "conditioner off" value.
+    /// The per-fit [`Self::separation_barrier_strength_override`] takes precedence:
+    /// when set it is the absolute conditioner strength for every pair, and `0.0`
+    /// stays a legitimate "conditioner off" value.
     pub(crate) fn barrier_pair_strength_with_gates(
         &self,
         gates: ArrayView2<'_, f64>,
         j: usize,
         k: usize,
     ) -> f64 {
-        if let Some(over) = self
-            .separation_barrier_strength_override
-            .or_else(sae_separation_barrier_override)
-        {
+        if let Some(over) = self.separation_barrier_strength_override {
             return over;
         }
         let gamma = self.design_inseparability_with_gates(gates, j, k);
@@ -829,10 +822,7 @@ impl SaeManifoldTerm {
     /// override takes precedence (absolute strength); a term with no co-active pair
     /// has no collapse geometry, so the strength is `0`.
     pub(crate) fn separation_barrier_strength(&self) -> f64 {
-        if let Some(over) = self
-            .separation_barrier_strength_override
-            .or_else(sae_separation_barrier_override)
-        {
+        if let Some(over) = self.separation_barrier_strength_override {
             return over;
         }
         if self.k_atoms() < 2 {
@@ -846,8 +836,8 @@ impl SaeManifoldTerm {
     }
 
     /// #1610 derived decoder-repulsion strength: a dimensionless fraction
-    /// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (or
-    /// runtime-overridden) separation-barrier strength `μ_C`. Single source for
+    /// [`SAE_DECODER_REPULSION_BARRIER_RATIO`] of the data-derived (or per-fit)
+    /// separation-barrier strength `μ_C`. Single source for
     /// the energy-normalized per-pair repulsion weight, so the subdominant
     /// conditioner stays a fixed fraction of the primary barrier under any sweep
     /// of `μ_C`, rather than a frozen independent magic number.
@@ -1645,8 +1635,8 @@ impl SaeManifoldTerm {
     /// FD battery can certify `∂P_sep/∂B` in isolation, and so the #1522
     /// prevention-vs-bandaid pinning test can read the barrier ON (`scale = 1`)
     /// against barrier OFF (`scale = 0`, the local "no prevention" arm —
-    /// `penalty_scale = 0` writes nothing — without touching the process-global
-    /// strength override). Returns `(value, grad)`.
+    /// `penalty_scale = 0` writes nothing — without changing the term's per-fit
+    /// configuration). Returns `(value, grad)`.
     pub fn separation_barrier_value_and_grad_for_test(
         &self,
         penalty_scale: f64,
@@ -2613,7 +2603,9 @@ pub fn sae_row_block_penalty_kinds() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests_findings_234 {
     use super::*;
-    use crate::manifold::tests::{periodic_basis, small_two_atom_periodic_term, TestPeriodicEvaluator};
+    use crate::manifold::tests::{
+        TestPeriodicEvaluator, periodic_basis, small_two_atom_periodic_term,
+    };
     use ndarray::array;
 
     /// Build a co-firing (softmax) two-atom term with EXPLICIT decoder blocks of
@@ -2745,7 +2737,10 @@ mod tests_findings_234 {
             "orthogonal output subspaces must have zero overlap"
         );
         let (vo, go) = ortho.separation_barrier_value_and_grad_for_test(1.0);
-        assert_eq!(vo, 0.0, "orthogonal subspaces must carry zero barrier value");
+        assert_eq!(
+            vo, 0.0,
+            "orthogonal subspaces must carry zero barrier value"
+        );
         assert!(
             go.iter().all(|&g| g == 0.0),
             "orthogonal subspaces must produce no separating force"
@@ -2814,23 +2809,28 @@ mod tests_findings_234 {
         let (phi0, jet0) = periodic_basis(&coords0);
         let (phi1, jet1) = periodic_basis(&coords1);
         let atom0 = SaeManifoldAtom::new(
-            "a0", SaeAtomBasisKind::Periodic, 1, phi0, jet0,
-            array![[0.25], [-0.35], [0.15]], Array2::<f64>::eye(3),
+            "a0",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.25], [-0.35], [0.15]],
+            Array2::<f64>::eye(3),
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
         let atom1 = SaeManifoldAtom::new(
-            "a1", SaeAtomBasisKind::Periodic, 1, phi1, jet1,
-            array![[-0.10], [0.20], [0.30]], Array2::<f64>::eye(3),
+            "a1",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi1,
+            jet1,
+            array![[-0.10], [0.20], [0.30]],
+            Array2::<f64>::eye(3),
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-        let logits = array![
-            [5.6, 0.0],
-            [5.0, 0.04],
-            [5.0, 0.05],
-            [5.0, 0.03]
-        ];
+        let logits = array![[5.6, 0.0], [5.0, 0.04], [5.0, 0.05], [5.0, 0.03]];
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits,
             vec![coords0, coords1],

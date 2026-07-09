@@ -1,7 +1,7 @@
 //! The unified certificate contract (task #16).
 //!
 //! Across the program a dozen independent analyses each emit a "certificate":
-//! the outer-optimum first-order self-audit ([`CriterionCertificate`]), the
+//! the outer-optimum first-order self-audit ([`OuterCriterionCertificate`]), the
 //! sensitivity-coreset error budget ([`CoresetCertificate`]), the log-det
 //! enclosure ([`LogdetEnclosure`]), the Kantorovich encode atlas
 //! ([`EncodeResult`]), the exact-orbit residual-gauge report, the dictionary

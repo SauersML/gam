@@ -25,8 +25,7 @@ use crate::interval_policy::{
     predict_with_uncertainty_generic,
 };
 use crate::linalg::{
-    PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
-    rowwise_local_covariances_parallel,
+    PredictionCovarianceBackend, design_row_chunk, rowwise_local_covariances_parallel,
 };
 pub use crate::standard::StandardPredictor;
 use crate::survival::SurvivalPredictor;
@@ -48,6 +47,7 @@ use gam_models::inference::model::{
     location_scale_noise_beta,
 };
 use gam_problem::{BlockRole, EstimationError};
+use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,

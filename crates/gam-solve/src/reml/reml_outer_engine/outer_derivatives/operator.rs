@@ -1,6 +1,6 @@
 //! Matrix-free assembled outer-Hessian operator.
 //!
-//! The [`UnifiedOuterHessianOperator`] precomputes per-coordinate mode
+//! The [`UnifiedHessianOperator`] precomputes per-coordinate mode
 //! responses, drift tables, and pair-wise logdet-Hessian cross traces once,
 //! then applies the `K × K` outer Hessian as an `O(K)`-build HVP without
 //! materialising the dense `K × K` matrix — winning when dense `p × p` drift
@@ -41,7 +41,7 @@ impl StoredFirstDrift {
             return;
         }
         if let Some(matrix) = self.dense.as_ref() {
-            dense_matvec_scaled_add_into(matrix, v, scale, out.view_mut());
+            dense::matvec_scaled_add_into(matrix, v, scale, out.view_mut());
         }
         if !self.operators.is_empty() {
             for op in &self.operators {
@@ -54,7 +54,7 @@ impl StoredFirstDrift {
         assert_eq!(v.len(), test.len());
         let mut total = 0.0;
         if let Some(matrix) = self.dense.as_ref() {
-            total += dense_bilinear(matrix, v, test);
+            total += dense::bilinear(matrix, v, test);
         }
         for op in &self.operators {
             total += op.bilinear_view(v, test);
@@ -88,7 +88,7 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         out.fill(0.0);
         if let Some(matrix) = self.drift.dense.as_ref() {
-            dense_matvec_into(matrix, v, out.view_mut());
+            dense::matvec_into(matrix, v, out.view_mut());
         }
         for op in &self.drift.operators {
             op.scaled_add_mul_vec(v, 1.0, out.view_mut());
@@ -101,7 +101,7 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
         }
         let mut out = out;
         if let Some(matrix) = self.drift.dense.as_ref() {
-            dense_matvec_scaled_add_into(matrix, v, scale, out.view_mut());
+            dense::matvec_scaled_add_into(matrix, v, scale, out.view_mut());
         }
         for op in &self.drift.operators {
             op.scaled_add_mul_vec(v, scale, out.view_mut());
@@ -321,7 +321,7 @@ pub(crate) struct OuterHessianCoord {
     pub(crate) b_depends_on_beta: bool,
 }
 
-pub(crate) struct UnifiedOuterHessianOperator {
+pub(crate) struct UnifiedHessianOperator {
     pub(crate) hop: Arc<dyn HessianOperator>,
     pub(crate) coords: Vec<OuterHessianCoord>,
     pub(crate) pair_a: Array2<f64>,
@@ -365,7 +365,7 @@ pub(crate) struct UnifiedOuterHessianOperator {
     pub(crate) contracted_psi: Option<ContractedPsiSecondOrderFn>,
 }
 
-impl UnifiedOuterHessianOperator {
+impl UnifiedHessianOperator {
     /// Exact implicit-function-theorem mode response of the inner coefficient
     /// solution along a θ-direction `α = (α_ρ, α_ψ)` (#740 primitive).
     ///
@@ -722,7 +722,7 @@ impl UnifiedOuterHessianOperator {
     }
 }
 
-impl gam_problem::OuterHessianOperator for UnifiedOuterHessianOperator {
+impl gam_problem::HessianOperator for UnifiedHessianOperator {
     fn dim(&self) -> usize {
         self.coords.len()
     }
@@ -832,7 +832,7 @@ pub(crate) fn build_outer_hessian_operator(
     kernel: OuterHessianDerivativeKernel,
     precomputed_coord_vs: Option<&[Array1<f64>]>,
     precomputed_coord_corrections: Option<&[Option<DriftDerivResult>]>,
-) -> Result<UnifiedOuterHessianOperator, String> {
+) -> Result<UnifiedHessianOperator, String> {
     let hop = Arc::clone(&solution.hessian_op);
     let k = lambdas.len();
     let ext_dim = solution.ext_coords.len();
@@ -1586,7 +1586,7 @@ pub(crate) fn build_outer_hessian_operator(
         None
     };
 
-    Ok(UnifiedOuterHessianOperator {
+    Ok(UnifiedHessianOperator {
         hop,
         coords,
         pair_a,

@@ -145,13 +145,13 @@ pub(crate) fn pullback_labeled_outer_eval(
     }
     if eval_mode == EvalMode::ValueGradientHessian {
         result.outer_hessian = match result.outer_hessian {
-            gam_problem::HessianResult::Analytic(hessian) => {
-                gam_problem::HessianResult::Analytic(aggregate_labeled_hessian(&hessian, layout)?)
+            gam_problem::HessianValue::Dense(hessian) => {
+                gam_problem::HessianValue::Dense(aggregate_labeled_hessian(&hessian, layout)?)
             }
-            gam_problem::HessianResult::Operator(operator) => gam_problem::HessianResult::Operator(
-                Arc::new(LabeledOuterHessianOperator::new(operator, layout)),
+            gam_problem::HessianValue::Operator(operator) => gam_problem::HessianValue::Operator(
+                Arc::new(LabeledHessianOperator::new(operator, layout)),
             ),
-            gam_problem::HessianResult::Unavailable => gam_problem::HessianResult::Unavailable,
+            gam_problem::HessianValue::Unavailable => gam_problem::HessianValue::Unavailable,
         };
     }
     result.warm_start.rho = rho.clone();

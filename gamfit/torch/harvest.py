@@ -312,7 +312,7 @@ def _capture_activations(
     handle = hook_module.register_forward_hook(_grab)
     try:
         with torch.no_grad():
-            logits = model(inputs)
+            model(inputs)
         act = captured["act"]
     finally:
         handle.remove()

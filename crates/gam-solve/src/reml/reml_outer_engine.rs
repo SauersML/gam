@@ -49,7 +49,7 @@
 //!   block-coupled, matrix-free SPD) plus the penalty-root helpers.
 //! - [`stochastic_trace`]: the Girard–Hutchinson / Hutch++ trace estimators and
 //!   their deterministic RNG.
-//! - [`dense_linalg`], [`pseudo_logdet`], [`dense_projection`]: leaf,
+//! - [`pseudo_logdet`], [`dense_projection`]: leaf,
 //!   state-free linear-algebra kernels.
 //!
 //! # Spectral Consistency Guarantee
@@ -157,15 +157,10 @@ pub use gam_problem::{
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).
 // ─────────────────────────────────────────────────────────────────────────
-pub(crate) mod dense_linalg;
 mod dense_projection;
 mod pseudo_logdet;
 
-pub(crate) use dense_linalg::{
-    dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into, dense_transpose_matvec_into,
-    design_matrix_apply_view, design_matrix_apply_view_into, design_matrix_column_into,
-    design_matrix_transpose_apply_view_into, trace_matrix_product,
-};
+use gam_linalg::dense;
 pub(crate) use dense_projection::{dense_projected_matrix, dense_trace_projected_factor};
 pub use pseudo_logdet::exact_pseudo_logdet;
 // Re-exported at `pub` (#1521) so the lifted gam-models bms deviation-runtime

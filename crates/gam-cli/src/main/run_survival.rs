@@ -1,9 +1,5 @@
 use super::*;
 
-pub(crate) fn survival_working_reml_score(state: &gam::pirls::WorkingState) -> f64 {
-    0.5 * (state.deviance + state.penalty_term)
-}
-
 pub(crate) fn survival_time_initial_log_lambdas(
     time_build: &SurvivalTimeBuildOutput,
     penalties: &[Array2<f64>],
@@ -56,38 +52,6 @@ pub(crate) fn build_survival_time_initial_beta(
                 .unwrap_or_else(|_| Array1::zeros(p))
         },
     )
-}
-
-/// Recover the fitted Weibull `(scale, shape)` baseline from the anchor-CENTERED
-/// linear `[1, log t]` time-basis coefficients.
-///
-/// The fit centers the time basis at the survival time anchor
-/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
-/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
-/// stale seed). The identified baseline the model actually carries is
-/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
-/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
-/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
-/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
-/// scale, so any consumer that rebuilds `H0(t) = (t/scale)^shape` from the saved
-/// scale (e.g. competing-risks CIF) is misled. Recover `scale` from the
-/// identified anchor instead (issue #899).
-pub(crate) fn fitted_weibull_baseline_from_linear_time_beta(
-    beta: &Array1<f64>,
-    anchor: f64,
-) -> Option<(f64, f64)> {
-    if beta.len() < 2 {
-        return None;
-    }
-    let shape = beta[1];
-    if !shape.is_finite() || shape <= 0.0 {
-        return None;
-    }
-    if !anchor.is_finite() || anchor <= 0.0 {
-        return None;
-    }
-    let scale = anchor;
-    Some((scale, shape))
 }
 
 pub(crate) fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
@@ -959,10 +923,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             );
         }
 
-        let frailty = fixed_gaussian_shift_frailty_from_spec(
-            &fit_frailty_spec_from_survival_args(&args, "survival marginal-slope")?,
-            "survival marginal-slope",
-        )?;
+        let frailty = fit_frailty_spec_from_survival_args(&args, "survival marginal-slope")?
+            .resolve_fixed_gaussian_shift("survival marginal-slope")?;
         let kappa_options = {
             let mut opts = SpatialLengthScaleOptimizationOptions::default();
             opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
@@ -1816,7 +1778,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 let state = model.update_state(&beta).map_err(|e| {
                     format!("failed to evaluate survival optimum in coefficient coordinates: {e}")
                 })?;
-                let cost = survival_working_reml_score(&state);
+                let cost = state.penalized_objective();
                 let residuals = model.offset_channel_residuals(&beta).map_err(|e| {
                     format!("failed to form survival baseline offset residuals: {e}")
                 })?;
@@ -1979,18 +1941,10 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         && !learn_timewiggle
     {
         let time_beta = beta.slice(s![..p_time_total]).to_owned();
-        let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor)
-            .ok_or_else(|| {
-                "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                    .to_string()
-            })?;
-        SurvivalBaselineConfig {
-            target: SurvivalBaselineTarget::Weibull,
-            scale: Some(scale),
-            shape: Some(shape),
-            rate: None,
-            makeham: None,
-        }
+        fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor).ok_or_else(|| {
+            "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                .to_string()
+        })?
     } else {
         baseline_cfg.clone()
     };

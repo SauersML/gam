@@ -71,7 +71,7 @@ use crate::vector_response::VectorLikelihood;
 use crate::model_types::EstimationError;
 use gam_solve::pirls::dense_block_xtwx;
 use faer::Side;
-use gam_optimize::{
+use opt::{
     BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};

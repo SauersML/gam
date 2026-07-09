@@ -8,11 +8,11 @@ pub(crate) struct BatchedOuterHessianTestFamily {
     pub(crate) matrix: Array2<f64>,
 }
 
-pub(crate) struct TestOuterHessianOperator {
+pub(crate) struct TestHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
 
-impl gam_problem::OuterHessianOperator for TestOuterHessianOperator {
+impl gam_problem::HessianOperator for TestHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
@@ -41,8 +41,8 @@ impl CustomFamily for BatchedOuterHessianTestFamily {
     fn outer_hyper_hessian_operator(
         &self,
         _: &[ParameterBlockSpec],
-    ) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
-        Some(Arc::new(TestOuterHessianOperator {
+    ) -> Option<Arc<dyn gam_problem::HessianOperator>> {
+        Some(Arc::new(TestHessianOperator {
             matrix: self.matrix.clone(),
         }))
     }
@@ -111,7 +111,7 @@ pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
         .expect("batched Hessian hook succeeds")
         .expect("test family exposes batched HVP terms");
     let operator = match terms.outer_hessian {
-        gam_problem::HessianResult::Operator(operator) => operator,
+        gam_problem::HessianValue::Operator(operator) => operator,
         _ => panic!("batched hook should expose an operator"),
     };
     let dense = operator
@@ -2383,7 +2383,7 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hes
 
     assert_eq!(result.gradient.len(), 1);
     match result.outer_hessian {
-        gam_problem::HessianResult::Analytic(hessian) => {
+        gam_problem::HessianValue::Dense(hessian) => {
             assert_eq!(hessian.dim(), (1, 1));
             assert!(hessian[[0, 0]].is_finite());
         }
@@ -2665,14 +2665,14 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     .expect("single-block fallback with zero d2H should evaluate");
 
     let h_with = match with_d2.outer_hessian {
-        gam_problem::HessianResult::Analytic(hessian) => hessian,
-        gam_problem::HessianResult::Operator(_) | gam_problem::HessianResult::Unavailable => {
+        gam_problem::HessianValue::Dense(hessian) => hessian,
+        gam_problem::HessianValue::Operator(_) | gam_problem::HessianValue::Unavailable => {
             panic!("expected dense analytic Hessian")
         }
     };
     let h_without = match without_d2_contribution.outer_hessian {
-        gam_problem::HessianResult::Analytic(hessian) => hessian,
-        gam_problem::HessianResult::Operator(_) | gam_problem::HessianResult::Unavailable => {
+        gam_problem::HessianValue::Dense(hessian) => hessian,
+        gam_problem::HessianValue::Operator(_) | gam_problem::HessianValue::Unavailable => {
             panic!("expected dense analytic Hessian")
         }
     };

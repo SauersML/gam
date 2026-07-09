@@ -1606,7 +1606,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: gam_problem::HessianResult::Unavailable,
+                        outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });
@@ -2040,7 +2040,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: gam_problem::HessianResult::Unavailable,
+                        outer_hessian: gam_problem::HessianValue::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });

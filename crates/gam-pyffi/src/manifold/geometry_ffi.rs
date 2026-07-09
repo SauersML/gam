@@ -12,24 +12,6 @@ fn poincare_distance<'py>(
     })
 }
 
-/// #1026/#1522 — set the process-global SAE separation-barrier strength so a
-/// SINGLE compiled wheel can sweep μ_sep without recompiling gam. `sep_strength`
-/// is NaN to restore the compiled default. The amplitude (keep-alive) barrier
-/// and its active-atom gate were removed (surplus features die into a
-/// ridge-parked state), so only the separation strength is tunable.
-#[pyfunction(signature = (sep_strength = f64::NAN))]
-fn sae_set_barrier_overrides(sep_strength: f64) {
-    gam::terms::sae::manifold::set_sae_barrier_overrides(sep_strength);
-}
-
-/// #1026 — set the process-global IBP-α override (flattens the ordered geometric
-/// assignment prior π_k=(α/(α+1))^{k+1} so all K atoms can contribute). A
-/// non-finite or non-positive value clears the override back to the compiled α.
-#[pyfunction(signature = (alpha = f64::NAN))]
-fn sae_set_ibp_alpha(alpha: f64) {
-    gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
-}
-
 /// K-aware default IBP concentration `α` (#1784) from the Rust source of truth
 /// `assignment::default_ibp_concentration_for_k_atoms`. Exposed so the Python
 /// facade calls the core formula (`α = max(1, 1/(exp(1/K) − 1))`) instead of
@@ -172,7 +154,13 @@ fn sae_manifold_description_length(
     l_param_bits: Option<f64>,
 ) -> PyResult<PyObject> {
     let dl = gam::terms::sae::description_length::manifold_fit_description_length(
-        ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits,
+        ev,
+        n_tokens,
+        k_active,
+        coord_dim,
+        g_dict,
+        n_params,
+        l_param_bits,
     );
     let out = PyDict::new(py);
     out.set_item("bits_per_token", dl.bits_per_token)?;
@@ -574,7 +562,10 @@ fn response_geometry_clr_jet<'py>(
     let (value, jac) = detach_py_result(py, "response_geometry_clr_jet", move || {
         gam::geometry::manifolds::aitchison_ilr::clr_jet(arr.view())
     })?;
-    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        jac.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Simplex log map value and its per-row Jacobian w.r.t. `values` (base held
@@ -598,7 +589,10 @@ fn response_geometry_simplex_log_map_jet<'py>(
             reference,
         )
     })?;
-    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        jac.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Simplex exp map value and its per-row Jacobian w.r.t. `tangent` (base held
@@ -622,7 +616,10 @@ fn response_geometry_simplex_exp_map_jet<'py>(
             reference,
         )
     })?;
-    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        jac.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Sphere exp map value and its per-row Jacobian w.r.t. `tangent` (base held
@@ -641,7 +638,10 @@ fn response_geometry_sphere_exp_map_jet<'py>(
             base_owned.view(),
         )
     })?;
-    Ok((value.into_pyarray(py).unbind(), jac.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        jac.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Consolidated response-geometry log map. Owns geometry-kind routing,
@@ -836,9 +836,8 @@ fn sae_assign_ema_update<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let prev_owned = prev.as_array().to_owned();
     let signal_owned = signal.as_array().to_owned();
-    let out = py.detach(move || {
-        sae_assign_ema_update_impl(prev_owned.view(), signal_owned.view(), beta)
-    });
+    let out =
+        py.detach(move || sae_assign_ema_update_impl(prev_owned.view(), signal_owned.view(), beta));
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -918,10 +917,15 @@ fn sae_direction_cluster_anchor<'py>(
     iters: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, bool, bool)> {
     let x_owned = x.as_array().to_owned();
-    let result = py.detach(move || sae_direction_cluster_anchor_impl(x_owned.view(), n_atoms, iters));
+    let result =
+        py.detach(move || sae_direction_cluster_anchor_impl(x_owned.view(), n_atoms, iters));
     match result {
         Some((onehot, confident)) => Ok((onehot.into_pyarray(py).unbind(), true, confident)),
-        None => Ok((Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(), false, false)),
+        None => Ok((
+            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
+            false,
+            false,
+        )),
     }
 }
 
@@ -939,7 +943,8 @@ fn sae_quadratic_subspace_anchor<'py>(
     subspace_dim: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, bool, usize, usize, f64)> {
     let x_owned = x.as_array().to_owned();
-    let result = py.detach(move || sae_quadratic_subspace_anchor_impl(x_owned.view(), subspace_dim));
+    let result =
+        py.detach(move || sae_quadratic_subspace_anchor_impl(x_owned.view(), subspace_dim));
     match result {
         Some((onehot, i, j, threshold)) => {
             Ok((onehot.into_pyarray(py).unbind(), true, i, j, threshold))
@@ -1003,7 +1008,10 @@ fn sae_matching_pursuit_commit<'py>(
     });
     match result {
         Some(onehot) => Ok((onehot.into_pyarray(py).unbind(), true)),
-        None => Ok((Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(), false)),
+        None => Ok((
+            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
+            false,
+        )),
     }
 }
 
@@ -1042,9 +1050,8 @@ fn sae_solve_chart_coordinates<'py>(
     let gate_owned = gate_weights.map(|w| w.as_array().to_owned());
     let out = py
         .detach(move || {
-            let basis = gam::terms::sae::chart_coordinate_solve::ChartBasisKind::Periodic {
-                n_harmonics,
-            };
+            let basis =
+                gam::terms::sae::chart_coordinate_solve::ChartBasisKind::Periodic { n_harmonics };
             gam::terms::sae::chart_coordinate_solve::solve_chart_coordinates(
                 x_owned.view(),
                 dec_owned.view(),
@@ -1152,11 +1159,7 @@ fn sae_duchon_device_basis_width(
 ) -> PyResult<usize> {
     let centers_owned = centers.as_array().to_owned();
     py.detach(move || {
-        gam::terms::sae::basis_gpu::sae_duchon_device_basis_width(
-            ordinal,
-            centers_owned.view(),
-            m,
-        )
+        gam::terms::sae::basis_gpu::sae_duchon_device_basis_width(ordinal, centers_owned.view(), m)
     })
     .map_err(PyValueError::new_err)
 }
@@ -4695,7 +4698,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_core_from_fit_payload, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sae_manifold_core_from_fit_payload,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
     module.add_class::<ManifoldSaeCore>()?;
     module.add_class::<AtomCore>()?;
@@ -4786,7 +4792,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
-    module.add_function(wrap_pyfunction!(harmonic_roughness_evidence_weight, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        harmonic_roughness_evidence_weight,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
     module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;
@@ -4837,11 +4846,23 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_ilr, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_inverse_ilr, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_aitchison_metric, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_aitchison_metric,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(response_geometry_clr_jet, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_simplex_log_map_jet, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map_jet, module)?)?;
-    module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_simplex_log_map_jet,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_simplex_exp_map_jet,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        response_geometry_sphere_exp_map_jet,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(response_geometry_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_fit_curvature, module)?)?;
@@ -4882,8 +4903,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_rho_so3, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_set_ibp_alpha, module)?)?;
     module.add_function(wrap_pyfunction!(
         sae_default_ibp_concentration_for_k_atoms,
         module
@@ -5111,7 +5130,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
     module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;
     module.add_function(wrap_pyfunction!(loop_holonomy, module)?)?;
-    module.add_function(wrap_pyfunction!(conditional_coactivation_influence, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        conditional_coactivation_influence,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(coupling_robustness_certificate, module)?)?;
     module.add_function(wrap_pyfunction!(effect_weighted_retention, module)?)?;
     module.add_function(wrap_pyfunction!(chart_interp_score, module)?)?;
@@ -5648,7 +5670,10 @@ fn sparse_dictionary_fit<'py>(
         "score_route_stats",
         score_route_stats_dict(py, fit.score_route_stats)?,
     )?;
-    out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual_cert)?)?;
+    out.set_item(
+        "dual_certificate",
+        dual_certificate_report_dict(py, &dual_cert)?,
+    )?;
     Ok(out.unbind())
 }
 
@@ -5909,7 +5934,10 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("converged", fit.converged)?;
     out.set_item("block_topk", fit.block_topk)?;
     out.set_item("block_size", fit.block_size)?;
-    out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual_cert)?)?;
+    out.set_item(
+        "dual_certificate",
+        dual_certificate_report_dict(py, &dual_cert)?,
+    )?;
     Ok(out.unbind())
 }
 

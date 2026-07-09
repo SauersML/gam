@@ -190,6 +190,36 @@ pub const fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
     if rows == 0 { 1 } else { rows }
 }
 
+/// Select the row count for prediction-time covariance work.
+///
+/// A prediction row can keep roughly four `parameter_dim × local_dim`
+/// `f64` workspaces live while gradients and covariance solves are assembled.
+/// This central policy prevents predictors from drifting to different memory
+/// budgets and chunk bounds for the same operation.
+pub fn prediction_chunk_rows(
+    parameter_dim: usize,
+    local_dim: usize,
+    total_rows: usize,
+) -> usize {
+    const MIN_ROWS: usize = 16;
+    const MAX_ROWS: usize = 4096;
+
+    if total_rows == 0 {
+        return 1;
+    }
+    let live_f64_values_per_row = parameter_dim
+        .max(1)
+        .saturating_mul(local_dim.max(1))
+        .saturating_mul(4);
+    rows_for_target_bytes(
+        ResourcePolicy::default_library().row_chunk_target_bytes,
+        live_f64_values_per_row,
+    )
+    .max(MIN_ROWS)
+    .min(MAX_ROWS)
+    .min(total_rows)
+}
+
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -617,6 +647,18 @@ mod resource_policy_tests {
         let cols = 1024_usize;
         let expected = target / (cols * std::mem::size_of::<f64>());
         assert_eq!(rows_for_target_bytes(target, cols), expected);
+    }
+
+    #[test]
+    fn prediction_chunks_share_the_runtime_byte_budget() {
+        assert_eq!(prediction_chunk_rows(1024, 1, 100_000), 256);
+        assert_eq!(prediction_chunk_rows(32, 2, 100_000), 4096);
+    }
+
+    #[test]
+    fn prediction_chunks_respect_dataset_bounds() {
+        assert_eq!(prediction_chunk_rows(1, 1, 7), 7);
+        assert_eq!(prediction_chunk_rows(1, 1, 0), 1);
     }
 
     // ── ResourcePolicy::for_problem ──────────────────────────────────────────

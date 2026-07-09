@@ -20,8 +20,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
-FitMode = Literal["joint", "independent", "auto"]
-
 import torch
 
 from ..smooth import (
@@ -52,6 +50,7 @@ from ._reml import (
     gaussian_reml_fit_with_constraints,
 )
 
+FitMode = Literal["joint", "independent", "auto"]
 ShapeConstrainedSmooth = BSpline | Duchon
 
 
@@ -861,7 +860,6 @@ def fit(
         response = response.unsqueeze(1)
     if response.dim() != 2:
         raise ValueError(f"response must be 1D or 2D, got shape {tuple(response.shape)}")
-    N = response.shape[0]
     response_f64 = response.to(torch.float64)
 
     weights_f64 = (

@@ -55,10 +55,10 @@ class GAM(nn.Module):
 
     def __init__(self, smooths: Sequence[Smooth]) -> None:
         super().__init__()
-        if len(smooths) == 0:
+        self.smooths: list[Smooth] = list(smooths)
+        if not self.smooths:
             raise ValueError("GAM needs at least one Smooth")
         # Keep the specs themselves on self for dispatch.
-        self.smooths: list[Smooth] = list(smooths)
         # Frozen coefficients (set by .freeze()).
         self._frozen_coefs: list[torch.Tensor] | None = None
         self.last_fit: FitResult | None = None
@@ -106,10 +106,20 @@ class GAM(nn.Module):
         the cached coefficients feedforward — no gamfit call at inference.
         """
         result = fit(points, response, self.smooths)
-        if isinstance(result.coefficients, list):
-            self._frozen_coefs = [c.detach() for c in result.coefficients]
-        else:
-            self._frozen_coefs = [result.coefficients.detach()]
+        coefficient_blocks = (
+            result.coefficients
+            if isinstance(result.coefficients, list)
+            else [result.coefficients]
+        )
+        if len(coefficient_blocks) != len(self.smooths):
+            raise RuntimeError(
+                "fit returned "
+                f"{len(coefficient_blocks)} coefficient blocks for "
+                f"{len(self.smooths)} smooths"
+            )
+        self._frozen_coefs = [
+            coefficient.detach() for coefficient in coefficient_blocks
+        ]
         self.last_fit = result
         self.eval()
 
@@ -129,8 +139,23 @@ class GAM(nn.Module):
             list(points) if isinstance(points, (list, tuple))
             else [points] * len(self.smooths)
         )
+        if len(points_list) != len(self.smooths):
+            raise ValueError(
+                f"got {len(points_list)} points tensors for "
+                f"{len(self.smooths)} smooths"
+            )
+        if len(self._frozen_coefs) != len(self.smooths):
+            raise RuntimeError(
+                f"GAM has {len(self._frozen_coefs)} frozen coefficient blocks for "
+                f"{len(self.smooths)} smooths"
+            )
         fitted_parts: list[torch.Tensor] = []
-        for s, pts, coef in zip(self.smooths, points_list, self._frozen_coefs):
+        for s, pts, coef in zip(
+            self.smooths,
+            points_list,
+            self._frozen_coefs,
+            strict=True,
+        ):
             design, _ = _build_design_penalty(s, pts)
             if s.by is not None:
                 by_t = (

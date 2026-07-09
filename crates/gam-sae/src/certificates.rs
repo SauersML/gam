@@ -19,7 +19,7 @@
 //! 2. Central-difference the criterion **value path** at `ρ̂ ± h v` with a
 //!    Richardson second step `2h` to estimate the FD's own error bar.
 //! 3. Compare against the analytic directional derivative `∇V(ρ̂)·v`.
-//! 4. Record a [`CriterionCertificate`] on the fit payload.
+//! 4. Record a [`DirectionalCriterionCertificate`] on the fit payload.
 //!
 //! # Why finite differences are legal here
 //!
@@ -55,7 +55,7 @@ use ndarray::ArrayView1;
 /// moment of introduction. Consumers decide the policy verdict from
 /// [`Self::agreement_rel`] against their own tolerance.
 #[derive(Debug, Clone, Copy)]
-pub struct CriterionCertificate {
+pub struct DirectionalCriterionCertificate {
     /// `‖∇V(ρ̂)‖₂`, the analytic gradient norm reported as converged.
     pub grad_norm: f64,
     /// Central-difference directional derivative of the **value path**:
@@ -82,7 +82,7 @@ pub struct CriterionCertificate {
     pub well_posed: bool,
 }
 
-impl CriterionCertificate {
+impl DirectionalCriterionCertificate {
     /// Signed FD−analytic disagreement, normalized to the larger of the two
     /// directional magnitudes (so a flat direction with both near zero does
     /// not manufacture a spurious relative blow-up) and floored by the FD
@@ -211,7 +211,7 @@ pub struct DirectionalSamples {
     pub well_posed: bool,
 }
 
-/// Assemble the [`CriterionCertificate`] from directional value samples.
+/// Assemble the [`DirectionalCriterionCertificate`] from directional value samples.
 ///
 /// The central difference at step `h` is `D(h) = (V₊ − V₋) / 2h`; at step
 /// `2h` it is `D(2h) = (V₊₊ − V₋₋) / 4h`. For a smooth criterion both
@@ -220,12 +220,12 @@ pub struct DirectionalSamples {
 /// error bar of `D(h)` is `|D(h) − D(2h)| / 3` (the standard central-difference
 /// Richardson remainder). The reported `fd_directional` is `D(h)`.
 #[must_use]
-pub fn certificate_from_samples(s: &DirectionalSamples) -> CriterionCertificate {
+pub fn certificate_from_samples(s: &DirectionalSamples) -> DirectionalCriterionCertificate {
     // FD-OK: Richardson FD oracle constructed to audit the analytic directional derivative
     let d_h = (s.plus_h - s.minus_h) / (2.0 * s.step);
     let d_2h = (s.plus_2h - s.minus_2h) / (4.0 * s.step);
     let fd_error_bar = (d_h - d_2h).abs() / 3.0; // fd-ok: FD-audit certificate, not in math path
-    CriterionCertificate {
+    DirectionalCriterionCertificate {
         grad_norm: s.grad_norm,
         fd_directional: d_h, // fd-ok: FD-audit certificate, not in math path
         analytic_directional: s.analytic_directional,

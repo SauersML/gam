@@ -156,13 +156,13 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// `Some(op)` here.  The unified evaluator then short-circuits the
     /// kernel-based assembly path at
     /// [`reml_laml_evaluate`] and routes the result
-    /// straight into [`HessianResult::Operator`].
+    /// straight into [`HessianValue::Operator`].
     ///
     /// Default returns `None`, in which case the evaluator falls through to
     /// the existing `outer_hessian_derivative_kernel` / `compute_outer_hessian`
     /// path.  This is the contract surface for CTN, survival, GAMLSS and
     /// other families that ship a directional outer-HVP operator.
-    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::HessianOperator>> {
         None
     }
 }

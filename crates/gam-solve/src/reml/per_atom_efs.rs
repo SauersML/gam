@@ -40,7 +40,7 @@
 //! 3. **Matrix-free θ-HVP** (#740). For a direction `v` over the border axes,
 //!    `H_outer · v` is computed *without* assembling the O(K²) coordinate-pair
 //!    Hessian. The family's exact outer-Hessian operator
-//!    (`HessianResult::Operator`) `matvec` realizes the IFT-corrected action
+//!    (`HessianValue::Operator`) `matvec` realizes the IFT-corrected action
 //!    `β̇ = −H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace — exactly the #740
 //!    product — through one inner solve per matvec. When no exact operator is
 //!    available the shared-border correction is deferred to the decoupled
@@ -65,8 +65,8 @@ use gam_linalg::matrix::FactorizedSystem;
 use crate::estimate::EstimationError;
 use crate::rho_optimizer::{OuterCapability, OuterObjective, OuterPlan, OuterResult};
 use faer::Side;
-use gam_optimize::{BacktrackConfig, backtracking_line_search};
-use gam_problem::{HessianResult, OuterHessianOperator};
+use opt::{BacktrackConfig, backtracking_line_search};
+use gam_problem::{HessianValue, HessianOperator};
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
@@ -300,7 +300,7 @@ pub(crate) fn sanitize_step(raw: f64) -> f64 {
 /// fallback) — when none is available the caller defers the border correction.
 pub(crate) fn border_hessian_block(
     topology: &SharedBorderTopology,
-    operator: &Arc<dyn OuterHessianOperator>,
+    operator: &Arc<dyn HessianOperator>,
     rho: &Array1<f64>,
 ) -> Result<Array2<f64>, EstimationError> {
     let m = topology.border_count();
@@ -426,7 +426,7 @@ fn solve_shared_border_block(
 /// vanishes for a well-conditioned block.
 pub(crate) fn shared_border_correction(
     topology: &SharedBorderTopology,
-    operator: &Arc<dyn OuterHessianOperator>,
+    operator: &Arc<dyn HessianOperator>,
     rho: &Array1<f64>,
     gradient: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
@@ -573,7 +573,7 @@ pub fn run_per_atom_efs(
             let gradient = outer_eval.gradient.clone();
             if gradient.len() == rho_dim {
                 let border_step_result = match &outer_eval.hessian {
-                    HessianResult::Analytic(hessian)
+                    HessianValue::Dense(hessian)
                         if hessian.nrows() == rho_dim && hessian.ncols() == rho_dim =>
                     {
                         let m = topology.border_count();
@@ -586,7 +586,7 @@ pub fn run_per_atom_efs(
                         }
                         solve_shared_border_block(topology, block, &gradient)
                     }
-                    HessianResult::Operator(op) => {
+                    HessianValue::Operator(op) => {
                         let operator = Arc::clone(op);
                         shared_border_correction(topology, &operator, &rho, &gradient)
                     }
@@ -687,7 +687,7 @@ mod tests {
         pub(crate) a: Array2<f64>,
     }
 
-    impl OuterHessianOperator for QuadraticOperator {
+    impl HessianOperator for QuadraticOperator {
         fn dim(&self) -> usize {
             self.a.nrows()
         }
@@ -740,7 +740,7 @@ mod tests {
             Ok(OuterEval {
                 cost: self.cost(rho),
                 gradient: self.grad(rho),
-                hessian: HessianResult::Operator(Arc::new(QuadraticOperator { a: self.a.clone() })),
+                hessian: HessianValue::Operator(Arc::new(QuadraticOperator { a: self.a.clone() })),
                 inner_beta_hint: None,
             })
         }
@@ -866,7 +866,7 @@ mod tests {
         // matvec, reproducing H·v of the analytic quadratic bit-for-bit (#1440:
         // there is no finite-difference branch to approximate it).
         fn theta_hvp_matrix_free(
-            operator: &Arc<dyn OuterHessianOperator>,
+            operator: &Arc<dyn HessianOperator>,
             v: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
             if operator.dim() != v.len() {
@@ -887,7 +887,7 @@ mod tests {
         let a = array![[2.0, 0.3, 0.0], [0.3, 1.5, -0.2], [0.0, -0.2, 4.0]];
         let v = array![0.3, -1.1, 0.9];
         let exact = a.dot(&v);
-        let op: Arc<dyn OuterHessianOperator> = Arc::new(QuadraticOperator { a: a.clone() });
+        let op: Arc<dyn HessianOperator> = Arc::new(QuadraticOperator { a: a.clone() });
         let hv_op = theta_hvp_matrix_free(&op, &v).expect("op hvp");
         for i in 0..3 {
             assert_eq!(hv_op[i].to_bits(), exact[i].to_bits());

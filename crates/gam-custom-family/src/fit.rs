@@ -109,7 +109,7 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) penalized_objective: f64,
     pub(crate) outer_iterations: usize,
     pub(crate) outer_gradient_norm: Option<f64>,
-    pub(crate) criterion_certificate: Option<gam_solve::rho_optimizer::CriterionCertificate>,
+    pub(crate) criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
     pub(crate) outer_converged: bool,
     /// Selected per-component log-smoothing parameters of the full-width JOINT
     /// penalty at ρ* (gam#1587/#561), surfaced on `FitArtifacts` so a
@@ -1140,7 +1140,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     Ok(OuterEval {
                         cost: eval.objective,
                         gradient: Array1::zeros(rho.len()),
-                        hessian: gam_problem::HessianResult::Unavailable,
+                        hessian: gam_problem::HessianValue::Unavailable,
                         inner_beta_hint,
                     })
                 }
@@ -1188,13 +1188,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 if eval.objective.is_finite()
                     && eval.gradient.iter().all(|v| v.is_finite())
                     && match &eval.outer_hessian {
-                        gam_problem::HessianResult::Analytic(hessian) => {
+                        gam_problem::HessianValue::Dense(hessian) => {
                             hessian.iter().all(|v| v.is_finite())
                         }
-                        gam_problem::HessianResult::Operator(op) => {
+                        gam_problem::HessianValue::Operator(op) => {
                             !request_hessian || op.dim() == rho.len()
                         }
-                        gam_problem::HessianResult::Unavailable => !request_hessian,
+                        gam_problem::HessianValue::Unavailable => !request_hessian,
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
@@ -1466,7 +1466,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             let mut eval_at =
                 |rho: &Array1<f64>,
                  mode: EvalMode|
-                 -> Result<(f64, Array1<f64>, gam_problem::HessianResult), String> {
+                 -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String> {
                     let e = outerobjectivegradienthessian_labeled(
                         family,
                         specs,

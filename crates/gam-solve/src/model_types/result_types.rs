@@ -2,9 +2,9 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
+use crate::model_types::{Dispersion, EstimationError};
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::utils::stack_offsets;
-use crate::model_types::{Dispersion, EstimationError};
 use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
     LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
@@ -110,9 +110,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: Vec::new(),
                 edf_total: 28.0,
                 smoothing_correction: None,
-                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
-                    36,
-                )),
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -197,9 +195,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: vec![3.0],
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
-                    p,
-                )),
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -270,9 +266,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
-                    p,
-                )),
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -465,9 +459,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total: p as f64,
                 smoothing_correction: None,
-                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
-                    p,
-                )),
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -603,7 +595,7 @@ pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 /// curvature positive definite HERE (`hessian_pd`); did any smoothing
 /// coordinate rail to a box bound (`lambdas_railed`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CriterionCertificate {
+pub struct OuterCriterionCertificate {
     /// ‖∇F(θ̂)‖₂ from the analytic gradient path at the returned point.
     pub grad_norm: f64,
     /// Analytic directional derivative ∇F(θ̂)·v along the audit direction.
@@ -632,7 +624,7 @@ pub struct CriterionCertificate {
     pub lambdas_railed: Vec<usize>,
 }
 
-impl CriterionCertificate {
+impl OuterCriterionCertificate {
     /// Whether the analytic directional derivative agrees with the finite
     /// difference of the actual criterion value at the optimum.
     pub fn first_order_consistent(&self) -> bool {
@@ -814,7 +806,7 @@ pub struct FitArtifacts {
     /// optimum, Hessian-PD probe, λ-rail flags. `None` when the outer ran
     /// gradient-free or an audit probe could not evaluate.
     #[serde(default)]
-    pub criterion_certificate: Option<CriterionCertificate>,
+    pub criterion_certificate: Option<OuterCriterionCertificate>,
     /// Tier-0 marginal-smoothing (`ρ`-uncertainty) PSIS certificate (#938):
     /// the Pareto-`k̂` diagnostic that says whether the plug-in + first-order
     /// `V_ρ` correction is adequate or `ρ`-uncertainty needs a heavier
@@ -1275,8 +1267,8 @@ fn validate_likelihood_scale_estimation(
     }
 }
 
-pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub(crate) use gam_problem::validate_all_finite_estimation;
+pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 
 impl FitGeometry {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {

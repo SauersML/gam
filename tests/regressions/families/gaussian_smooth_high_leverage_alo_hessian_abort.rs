@@ -4,12 +4,12 @@
 //!
 //! Root cause: the ALO-stabilized REML criterion (feee4f7b5) augments the REML
 //! gradient on detected high-leverage instability (max hat-diagonal >= 0.80) and
-//! used to deliberately invalidate the analytic Hessian (`HessianResult::
+//! used to deliberately invalidate the analytic Hessian (`HessianValue::
 //! Unavailable`). But the outer optimizer for the dense Gaussian-identity route
 //! is planned as `HessianSource::Analytic` (exact-Hessian ARC) and is configured
 //! to treat a non-analytic Hessian as fatal, so the fit died with
 //! "outer plan declared HessianSource::Analytic but the runtime returned
-//! HessianResult::Unavailable". The cost and gradient are both augmented and
+//! HessianValue::Unavailable". The cost and gradient are both augmented and
 //! therefore consistent; the base REML analytic Hessian is a valid second-order
 //! model for the augmented objective under ARC's adaptive cubic regularization
 //! (the ratio test drives convergence on the exact augmented gradient), so the

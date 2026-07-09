@@ -21,7 +21,7 @@
 //! [`RiemannianManifold::metric_tensor`], so adding a curved response geometry
 //! is a single resolver arm.
 
-use gam_optimize::{
+use opt::{
     BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search, constants,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};

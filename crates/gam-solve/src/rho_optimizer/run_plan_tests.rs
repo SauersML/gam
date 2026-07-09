@@ -34,7 +34,7 @@ fn certificate_attests_consistent_quadratic() {
             Ok(OuterEval {
                 cost: 0.5 * d.dot(&d),
                 gradient: d,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -93,7 +93,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
                 Ok(OuterEval {
                     cost: 0.5 * d.dot(&d),
                     gradient: d,
-                    hessian: HessianResult::Analytic(array![[1.0]]),
+                    hessian: HessianValue::Dense(array![[1.0]]),
                     inner_beta_hint: None,
                 })
             }
@@ -117,7 +117,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
                 Ok(OuterEval {
                     cost: 0.5 * d.dot(&d),
                     gradient: d,
-                    hessian: HessianResult::Analytic(array![[1.0]]),
+                    hessian: HessianValue::Dense(array![[1.0]]),
                     inner_beta_hint: None,
                 })
             }
@@ -174,7 +174,7 @@ fn certificate_flags_value_gradient_desync() {
             Ok(OuterEval {
                 cost: 0.5 * d.dot(&d),
                 gradient: d,
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -260,7 +260,7 @@ fn audit_at_railed_optimum(
     theta_hat: Array1<f64>,
     analytic_gradient: Array1<f64>,
     value_slope_railed: f64,
-) -> Option<CriterionCertificate> {
+) -> Option<OuterCriterionCertificate> {
     let slope = value_slope_railed;
     let mut obj = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
@@ -276,7 +276,7 @@ fn audit_at_railed_optimum(
                 Ok(OuterEval {
                     cost: 0.5 * rho[0] * rho[0] + slope * rho[1],
                     gradient: array![rho[0], slope],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             },
@@ -436,7 +436,7 @@ struct FailingSeedMaterializationOperator {
     dim: usize,
 }
 
-impl OuterHessianOperator for FailingSeedMaterializationOperator {
+impl HessianOperator for FailingSeedMaterializationOperator {
     fn dim(&self) -> usize {
         self.dim
     }
@@ -463,7 +463,7 @@ fn materialize_dense_uses_single_batched_mul_mat() {
         rhs_columns: Arc<AtomicUsize>,
     }
 
-    impl OuterHessianOperator for BatchedOnlyHessian {
+    impl HessianOperator for BatchedOnlyHessian {
         fn dim(&self) -> usize {
             self.matrix.nrows()
         }
@@ -902,11 +902,11 @@ fn barrier_curvature_locally_concentrated_covers_both_failure_modes() {
 #[test]
 fn hessian_result_reports_analytic_variant() {
     let h = Array2::<f64>::eye(3);
-    let result = HessianResult::Analytic(h.clone());
+    let result = HessianValue::Dense(h.clone());
     assert!(result.is_analytic());
     match result {
-        HessianResult::Analytic(extracted) => assert_eq!(extracted, h),
-        HessianResult::Operator(_) | HessianResult::Unavailable => {
+        HessianValue::Dense(extracted) => assert_eq!(extracted, h),
+        HessianValue::Operator(_) | HessianValue::Unavailable => {
             panic!("expected dense analytic Hessian")
         }
     }
@@ -948,7 +948,7 @@ fn closure_objective_delegates() {
             Ok(OuterEval {
                 cost: 1.0,
                 gradient: Array1::zeros(1),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -986,7 +986,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
             Ok(OuterEval {
                 cost: 0.0,
                 gradient: Array1::zeros(1),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -1039,7 +1039,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
             Ok(OuterEval {
                 cost: theta[11].abs(),
                 gradient: Array1::zeros(theta.len()),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -1111,7 +1111,7 @@ fn run_bfgs_mode_aware_eval_skips_hessian_work() {
                 Ok(OuterEval {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -1169,7 +1169,7 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
                 Ok(OuterEval {
                     cost,
                     gradient: array![4.0],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -1230,11 +1230,9 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
                     hessian: match order {
-                        OuterEvalOrder::Value => HessianResult::Unavailable,
-                        OuterEvalOrder::ValueAndGradient => HessianResult::Unavailable,
-                        OuterEvalOrder::ValueGradientHessian => {
-                            HessianResult::Analytic(array![[2.0]])
-                        }
+                        OuterEvalOrder::Value => HessianValue::Unavailable,
+                        OuterEvalOrder::ValueAndGradient => HessianValue::Unavailable,
+                        OuterEvalOrder::ValueGradientHessian => HessianValue::Dense(array![[2.0]]),
                     },
                     inner_beta_hint: None,
                 })
@@ -1277,7 +1275,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
 
 /// Phase 1.1 — On `HessianSource::Analytic` the bridge MUST surface a
 /// fatal error rather than producing `SecondOrderSample { hessian: None }`
-/// when the runtime returns `HessianResult::Unavailable`. A `None` here
+/// when the runtime returns `HessianValue::Unavailable`. A `None` here
 /// would let `opt::SecondOrderCache::finite_difference_hessian` silently
 /// estimate the Hessian by finite-differencing the gradient — at large-scale
 /// scale, hours of work per silently-mis-routed step. The seed loop
@@ -1299,7 +1297,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
             Ok(OuterEval {
                 cost: theta[0] * theta[0],
                 gradient: array![2.0 * theta[0]],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -1383,8 +1381,8 @@ fn arc_bridge_cost_stall_certifies_at_bound_separation() {
                 // = 1 forever, but the bound-projected residual at rho=-10 is 0.
                 gradient: array![1.0],
                 hessian: match order {
-                    OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
-                    _ => HessianResult::Unavailable,
+                    OuterEvalOrder::ValueGradientHessian => HessianValue::Dense(array![[1.0]]),
+                    _ => HessianValue::Unavailable,
                 },
                 inner_beta_hint: None,
             })
@@ -1485,8 +1483,8 @@ fn arc_bridge_cost_stall_halts_on_kkt_stationary_bound_descent() {
                 // forever, bound-projected residual = 0 (KKT-stationary).
                 gradient: array![1.0],
                 hessian: match order {
-                    OuterEvalOrder::ValueGradientHessian => HessianResult::Analytic(array![[1.0]]),
-                    _ => HessianResult::Unavailable,
+                    OuterEvalOrder::ValueGradientHessian => HessianValue::Dense(array![[1.0]]),
+                    _ => HessianValue::Unavailable,
                 },
                 inner_beta_hint: None,
             })
@@ -1578,10 +1576,8 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
                     cost: 1.0,
                     gradient: array![1.0e-9],
                     hessian: match order {
-                        OuterEvalOrder::ValueGradientHessian => {
-                            HessianResult::Analytic(array![[1.0]])
-                        }
-                        _ => HessianResult::Unavailable,
+                        OuterEvalOrder::ValueGradientHessian => HessianValue::Dense(array![[1.0]]),
+                        _ => HessianValue::Unavailable,
                     },
                     inner_beta_hint: None,
                 })
@@ -2559,7 +2555,7 @@ fn disabled_fallback_hybrid_efs_problem_uses_bfgs_without_calling_efs() {
             Ok(OuterEval {
                 cost: 0.5 * theta.dot(theta),
                 gradient: theta.clone(),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -2673,7 +2669,7 @@ fn run_malformed_gradient_seed_surfaces_as_error() {
             Ok(OuterEval {
                 cost: 0.0,
                 gradient: Array1::zeros(1),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -2704,7 +2700,7 @@ fn run_bfgs_ignores_malformed_hessian_payload() {
                 cost: theta[0] * theta[0],
                 gradient: array![2.0 * theta[0]],
                 // First-order paths must ignore Hessian payload quality.
-                hessian: HessianResult::Analytic(array![[f64::NAN, 0.0], [0.0, 1.0]]),
+                hessian: HessianValue::Dense(array![[f64::NAN, 0.0], [0.0, 1.0]]),
                 inner_beta_hint: None,
             })
         },
@@ -2726,7 +2722,7 @@ fn finite_outer_eval_reports_gradient_length_mismatch() {
         OuterEval {
             cost: 0.0,
             gradient: Array1::zeros(1),
-            hessian: HessianResult::Unavailable,
+            hessian: HessianValue::Unavailable,
             inner_beta_hint: None,
         },
     )
@@ -2777,7 +2773,7 @@ fn run_with_initial_seed_still_considers_generated_candidates() {
                 Ok(OuterEval {
                     cost: 0.0,
                     gradient: Array1::zeros(1),
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             } else {
@@ -2810,7 +2806,7 @@ fn run_indefinite_analytic_seed_stays_on_arc() {
             Ok(OuterEval {
                 cost: 0.0,
                 gradient: array![0.0],
-                hessian: HessianResult::Analytic(array![[-1.0]]),
+                hessian: HessianValue::Dense(array![[-1.0]]),
                 inner_beta_hint: None,
             })
         },
@@ -2849,7 +2845,7 @@ fn run_seed_materialization_failure_surfaces_arc_error_verbatim() {
             Ok(OuterEval {
                 cost: 0.0,
                 gradient: array![0.0],
-                hessian: HessianResult::Operator(Arc::new(FailingSeedMaterializationOperator {
+                hessian: HessianValue::Operator(Arc::new(FailingSeedMaterializationOperator {
                     dim: 1,
                 })),
                 inner_beta_hint: None,
@@ -2917,7 +2913,7 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
             Ok(OuterEval {
                 cost: x.powi(4),
                 gradient: array![4.0 * x.powi(3)],
-                hessian: HessianResult::Analytic(array![[12.0 * x.powi(2)]]),
+                hessian: HessianValue::Dense(array![[12.0 * x.powi(2)]]),
                 inner_beta_hint: None,
             })
         },
@@ -3115,7 +3111,8 @@ fn parsimony_second_seed_waived_only_for_sharp_well_penalized_optimum() {
     let rho_dim = 2usize;
     // `at_band(frac, score)` is the residual gradient sitting `frac`× the
     // score-relative sharpness band: frac<1 is inside (sharp), frac>1 outside.
-    let at_band = |frac: f64, score: f64| PARSIMONY_SHARP_GRAD_REL_BAND * (1.0 + score.abs()) * frac;
+    let at_band =
+        |frac: f64, score: f64| PARSIMONY_SHARP_GRAD_REL_BAND * (1.0 + score.abs()) * frac;
 
     // The redundant case: converged, every smoothing ρ ≥ 0, residual gradient
     // two orders inside the tie band. Slot 1 would only re-derive this — waive.
@@ -3214,7 +3211,7 @@ fn gaussian_multistart_compares_converged_seed_costs() {
                 Ok(OuterEval {
                     cost: if theta[0] < -1.0 { 0.0 } else { 10.0 },
                     gradient: array![0.0],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -3280,7 +3277,7 @@ fn parsimony_multistart_breaks_after_sharp_well_penalized_first_seed() {
                     Ok(OuterEval {
                         cost: 0.5 * d * d,
                         gradient: array![d],
-                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        hessian: HessianValue::Dense(array![[1.0]]),
                         inner_beta_hint: None,
                     })
                 }
@@ -3393,7 +3390,7 @@ fn run_starts_solver_with_direct_startup_eval() {
                 Ok(OuterEval {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
-                    hessian: HessianResult::Analytic(array![[2.0]]),
+                    hessian: HessianValue::Dense(array![[2.0]]),
                     inner_beta_hint: None,
                 })
             }
@@ -3454,7 +3451,7 @@ fn run_screening_reorders_expensive_generated_seeds_before_full_startup_eval() {
                     Ok(OuterEval {
                         cost: 0.0,
                         gradient: array![0.0],
-                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        hessian: HessianValue::Dense(array![[1.0]]),
                         inner_beta_hint: None,
                     })
                 } else {
@@ -3531,7 +3528,7 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
                     Ok(OuterEval {
                         cost: 0.0,
                         gradient: array![0.0],
-                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        hessian: HessianValue::Dense(array![[1.0]]),
                         inner_beta_hint: None,
                     })
                 } else {
@@ -3603,7 +3600,7 @@ fn run_screening_reorders_bfgs_seeds_before_full_startup_eval() {
                     Ok(OuterEval {
                         cost: 0.0,
                         gradient: array![0.0],
-                        hessian: HessianResult::Unavailable,
+                        hessian: HessianValue::Unavailable,
                         inner_beta_hint: None,
                     })
                 } else {
@@ -3661,7 +3658,7 @@ fn screening_cap_survives_per_seed_reset_before_proxy_eval() {
             Ok(OuterEval {
                 cost: theta[0].abs(),
                 gradient: array![0.0],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -3669,7 +3666,7 @@ fn screening_cap_survives_per_seed_reset_before_proxy_eval() {
             Ok(OuterEval {
                 cost: theta[0].abs(),
                 gradient: array![0.0],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -3764,7 +3761,7 @@ fn rank_seeds_cascade_escalates_when_initial_cap_collapses_all() {
                     Ok(OuterEval {
                         cost: 0.0,
                         gradient: array![0.0],
-                        hessian: HessianResult::Analytic(array![[1.0]]),
+                        hessian: HessianValue::Dense(array![[1.0]]),
                         inner_beta_hint: None,
                     })
                 } else {
@@ -3908,7 +3905,7 @@ fn run_efs_runtime_fallback_marker_degrades_to_bfgs_immediately() {
             Ok(OuterEval {
                 cost: 0.5 * theta.dot(theta),
                 gradient: theta.clone(),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -3950,7 +3947,7 @@ fn run_rejects_invalid_theta_layout() {
             Ok(OuterEval {
                 cost: 0.0,
                 gradient: Array1::zeros(1),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -3977,11 +3974,7 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         1
     );
     assert_eq!(
-        effective_seed_budget(
-            4,
-            Solver::HybridEfs,
-            gam_problem::SeedRiskProfile::Survival,
-        ),
+        effective_seed_budget(4, Solver::HybridEfs, gam_problem::SeedRiskProfile::Survival,),
         1
     );
     // #1575/#1074/#1426: Arc + GeneralizedLinear is floored to a single seed too
@@ -4004,11 +3997,7 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         1
     );
     assert_eq!(
-        effective_seed_budget(
-            3,
-            Solver::Arc,
-            gam_problem::SeedRiskProfile::Survival,
-        ),
+        effective_seed_budget(3, Solver::Arc, gam_problem::SeedRiskProfile::Survival,),
         1
     );
     // #1689/#1757: Arc + Gaussian is floored to a single seed (the analytic
@@ -4019,11 +4008,7 @@ fn effective_seed_budget_caps_expensive_solver_retries() {
         1
     );
     assert_eq!(
-        effective_seed_budget(
-            3,
-            Solver::Bfgs,
-            gam_problem::SeedRiskProfile::Survival,
-        ),
+        effective_seed_budget(3, Solver::Bfgs, gam_problem::SeedRiskProfile::Survival,),
         3
     );
 }
@@ -4051,7 +4036,7 @@ fn run_arc_projects_seed_before_seed_validation_eval() {
                 Ok(OuterEval {
                     cost: (theta[0] - 0.25).powi(2),
                     gradient: array![2.0 * (theta[0] - 0.25)],
-                    hessian: HessianResult::Analytic(array![[2.0]]),
+                    hessian: HessianValue::Dense(array![[2.0]]),
                     inner_beta_hint: None,
                 })
             }
@@ -4092,7 +4077,7 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
                 Ok(OuterEval {
                     cost: (theta[0] - 0.25).powi(2),
                     gradient: array![2.0 * (theta[0] - 0.25)],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -4256,7 +4241,7 @@ fn note_persists_inner_beta_hint_from_eval() {
             Ok(OuterEval {
                 cost: theta[0] * theta[0],
                 gradient: array![2.0 * theta[0]],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: Some(array![1.5, 2.5, 3.5]),
             })
         },
@@ -4290,7 +4275,7 @@ fn note_rejects_nonfinite_inner_beta() {
             Ok(OuterEval {
                 cost: theta[0] * theta[0],
                 gradient: array![2.0 * theta[0]],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: Some(array![f64::NAN, 0.5]),
             })
         },
@@ -4396,7 +4381,7 @@ fn run_calls_seed_inner_state_with_cached_beta() {
             Ok(OuterEval {
                 cost: theta.dot(theta),
                 gradient: 2.0 * theta,
-                hessian: HessianResult::Analytic(2.0 * Array2::<f64>::eye(theta.len())),
+                hessian: HessianValue::Dense(2.0 * Array2::<f64>::eye(theta.len())),
                 inner_beta_hint: None,
             })
         }
@@ -4476,7 +4461,7 @@ fn run_skips_seed_inner_state_when_payload_has_no_beta() {
             Ok(OuterEval {
                 cost: theta.dot(theta),
                 gradient: 2.0 * theta,
-                hessian: HessianResult::Analytic(2.0 * Array2::<f64>::eye(theta.len())),
+                hessian: HessianValue::Dense(2.0 * Array2::<f64>::eye(theta.len())),
                 inner_beta_hint: None,
             })
         }
@@ -4694,7 +4679,7 @@ fn cached_rho_is_prepended_as_first_seed() {
                 Ok(OuterEval {
                     cost: (theta[0] - 2.5).powi(2),
                     gradient: array![2.0 * (theta[0] - 2.5)],
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
                 })
             }
@@ -4772,7 +4757,7 @@ fn all_saturated_cached_rho_is_honored_as_seed() {
             Ok(OuterEval {
                 cost: theta.dot(theta),
                 gradient: theta.clone(),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -4820,7 +4805,7 @@ fn exact_final_cache_hit_skips_outer_validation() {
             Ok(OuterEval {
                 cost: (theta[0] - 2.5).powi(2),
                 gradient: array![2.0 * (theta[0] - 2.5)],
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         },
@@ -4871,8 +4856,7 @@ fn prewarm_budget_cold_start_keeps_shape_budget() {
     let budget = continuation_prewarm_step_budget(&config, &cap, 1, 1);
     assert_eq!(
         budget,
-        SINGLE_EXPENSIVE_PREWARM_BUDGET
-            .min(crate::estimate::reml::continuation::PATH_BUDGET),
+        SINGLE_EXPENSIVE_PREWARM_BUDGET.min(crate::estimate::reml::continuation::PATH_BUDGET),
         "cold-start expensive single-seed shape must keep its shape-derived budget"
     );
     assert!(

@@ -17,7 +17,7 @@ use gam_sae::manifold::{
     LatentManifold, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho,
     SaeManifoldTerm,
 };
-use gam_solve::rho_optimizer::{CriterionCertificate, OuterProblem};
+use gam_solve::rho_optimizer::{OuterCriterionCertificate, OuterProblem};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -76,7 +76,9 @@ impl Args {
                 "--raw-ok" => raw_ok = true,
                 "--positions" => {
                     let Some(value) = raw.next() else {
-                        return Err("--positions requires a path to a token-position .npy".to_string());
+                        return Err(
+                            "--positions requires a path to a token-position .npy".to_string()
+                        );
                     };
                     positions = Some(PathBuf::from(value));
                 }
@@ -103,16 +105,8 @@ impl Args {
         }
         Ok(Self {
             path,
-            max_rows: parse_positional_usize(
-                positional.first(),
-                DEFAULT_MAX_ROWS,
-                "max_rows",
-            )?,
-            harmonics: parse_positional_usize(
-                positional.get(1),
-                DEFAULT_HARMONICS,
-                "harmonics",
-            )?,
+            max_rows: parse_positional_usize(positional.first(), DEFAULT_MAX_ROWS, "max_rows")?,
+            harmonics: parse_positional_usize(positional.get(1), DEFAULT_HARMONICS, "harmonics")?,
             outer_iters: parse_positional_usize(
                 positional.get(2),
                 DEFAULT_OUTER_ITERS,
@@ -286,7 +280,10 @@ fn run(args: &Args) -> Result<(), String> {
         serde_json::to_string(&ceiling_contract_json(&post_report))
             .map_err(|err| format!("serialize ceiling_contract_json: {err}"))?
     );
-    println!("numbers_json={}", args.out_dir.join("numbers.json").display());
+    println!(
+        "numbers_json={}",
+        args.out_dir.join("numbers.json").display()
+    );
     println!("wall_seconds={:.3}", started.elapsed().as_secs_f64());
     Ok(())
 }
@@ -341,7 +338,7 @@ struct CeilingRegionReport {
     infeasible_total: usize,
     wall_cost_value_probes: usize,
     mutating_value_probes: usize,
-    certificate: Option<CriterionCertificate>,
+    certificate: Option<OuterCriterionCertificate>,
 }
 
 fn fit_ceiling_region(
@@ -494,7 +491,7 @@ fn ceiling_contract_json(report: &CeilingRegionReport) -> Value {
     })
 }
 
-fn print_gradient_certificate(label: &str, certificate: Option<&CriterionCertificate>) {
+fn print_gradient_certificate(label: &str, certificate: Option<&OuterCriterionCertificate>) {
     match certificate {
         Some(cert) => {
             let clean = gradient_certificate_clean(Some(cert));
@@ -545,7 +542,7 @@ fn print_gradient_certificate(label: &str, certificate: Option<&CriterionCertifi
     }
 }
 
-fn gradient_certificate_clean(certificate: Option<&CriterionCertificate>) -> bool {
+fn gradient_certificate_clean(certificate: Option<&OuterCriterionCertificate>) -> bool {
     certificate.is_some_and(|cert| {
         cert.first_order_consistent()
             && cert.hessian_pd != Some(false)
@@ -589,7 +586,8 @@ fn periodic_k1_term(
     let p = z.ncols();
     let dim = 1usize;
     let num_basis = 1 + 2 * harmonics;
-    let evaluator: Arc<dyn SaeBasisSecondJet> = Arc::new(PeriodicHarmonicEvaluator::new(num_basis)?);
+    let evaluator: Arc<dyn SaeBasisSecondJet> =
+        Arc::new(PeriodicHarmonicEvaluator::new(num_basis)?);
     let basis_kinds = vec![SaeAtomBasisKind::Periodic];
     let atom_dims = vec![dim];
     let seed_coords = gam_sae::manifold::sae_pca_seed_initial_coords(z, &basis_kinds, &atom_dims)?;
@@ -642,7 +640,10 @@ fn ridge_decoder(
     Ok(chol.solve_mat(&xtz))
 }
 
-fn reconstruction_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> Result<f64, String> {
+fn reconstruction_ev(
+    target: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
     if target.dim() != fitted.dim() {
         return Err(format!(
             "reconstruction_ev: target {:?} != fitted {:?}",
@@ -944,12 +945,18 @@ fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, Str
         (header_len, 10 + header_len)
     };
     if data_off > head.len() {
-        return Err(format!("{}: positions header exceeds initial read buffer", path.display()));
+        return Err(format!(
+            "{}: positions header exceeds initial read buffer",
+            path.display()
+        ));
     }
     let header = std::str::from_utf8(&head[data_off - header_len..data_off])
         .map_err(|err| format!("{}: header is not utf8: {err}", path.display()))?;
     if !(header.contains("'fortran_order': False") || header.contains("\"fortran_order\": false")) {
-        return Err(format!("{}: expected C-order positions; header: {header}", path.display()));
+        return Err(format!(
+            "{}: expected C-order positions; header: {header}",
+            path.display()
+        ));
     }
     // Element decoder from the numpy descr (little-endian / byte-order-agnostic
     // integer or float scalar). Positions are token indices, so integer dtypes
@@ -970,7 +977,9 @@ fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, Str
     let descr = &rest[..end];
     let kind_size = |tag: &str| descr.contains(tag);
     let (elem, decode): (usize, fn(&[u8]) -> i64) = if kind_size("i8") {
-        (8, |b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        (8, |b| {
+            i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        })
     } else if kind_size("i4") {
         (4, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
     } else if kind_size("i2") {
@@ -978,7 +987,9 @@ fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, Str
     } else if kind_size("i1") {
         (1, |b| b[0] as i8 as i64)
     } else if kind_size("u8") {
-        (8, |b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i64)
+        (8, |b| {
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i64
+        })
     } else if kind_size("u4") {
         (4, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
     } else if kind_size("u2") {
@@ -990,7 +1001,9 @@ fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, Str
             f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]).round() as i64
         })
     } else if kind_size("f4") {
-        (4, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).round() as i64)
+        (4, |b| {
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]]).round() as i64
+        })
     } else {
         return Err(format!(
             "{}: unsupported positions dtype; expected an integer or float scalar; header: {header}",
@@ -1002,17 +1015,30 @@ fn read_npy_positions_subsample(path: &Path, cap: usize) -> Result<Vec<i64>, Str
     let shape_open = header
         .find("'shape':")
         .and_then(|start| header[start..].find('(').map(|o| start + o + 1))
-        .ok_or_else(|| format!("{}: missing positions shape; header: {header}", path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "{}: missing positions shape; header: {header}",
+                path.display()
+            )
+        })?;
     let shape_close = header[shape_open..]
         .find(')')
         .map(|c| shape_open + c)
-        .ok_or_else(|| format!("{}: missing positions shape close; header: {header}", path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "{}: missing positions shape close; header: {header}",
+                path.display()
+            )
+        })?;
     let dims: Vec<usize> = header[shape_open..shape_close]
         .split(',')
         .filter_map(|token| token.trim().parse::<usize>().ok())
         .collect();
     if dims.is_empty() {
-        return Err(format!("{}: empty positions shape; header: {header}", path.display()));
+        return Err(format!(
+            "{}: empty positions shape; header: {header}",
+            path.display()
+        ));
     }
     let n_full = dims[0];
     let trailing: usize = dims[1..].iter().product();

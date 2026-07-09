@@ -7,10 +7,10 @@
 //! outer alternation (including its Λ nursery→promotion births), the #977/#997
 //! evidence-guarded structure search, every post-fit diagnostic
 //! (shape-uncertainty bands, trust/fit reports, coordinate fidelity, …), and
-//! the #1231/#1232 hard top-k projection split. The binding is now a pure
-//! marshaller: it builds the configured [`SaeManifoldTerm`] + seed ρ from the
-//! incoming arrays, calls [`run_sae_manifold_fit_from_parts`] on its worker
-//! thread, and turns the returned [`SaeFitOutcome`] into the payload dict.
+//! the #1231/#1232 hard top-k projection split. A binding only needs to assemble
+//! the incoming arrays into a configured [`SaeManifoldTerm`] and typed
+//! [`SaeFitRequest`], execute [`run_sae_manifold_fit`] on its worker thread, and
+//! marshal the returned [`SaeFitReport`].
 //!
 //! Two seams keep this library entry free of python AND of the two crates that
 //! sit ABOVE `gam-sae` in the dependency graph:
@@ -135,7 +135,7 @@ fn sae_structured_residual_model(
 /// Everything the payload-dict build needs from a completed SAE-manifold fit. The
 /// binding reads these fields directly (no python object lives here), re-deriving
 /// per-atom vectors (`atom_basis`, `atom_dim`, `k_atoms`) from `term` on its side.
-pub struct SaeFitOutcome {
+pub struct SaeFitReport {
     pub term: SaeManifoldTerm,
     pub rho: SaeManifoldRho,
     /// The smooth-optimization penalized loss (the UNPROJECTED model's score).
@@ -167,6 +167,34 @@ pub struct SaeFitOutcome {
     pub reported_log_alpha: f64,
 }
 
+/// Fully typed request for the single SAE-manifold fit entry.
+///
+/// Seed construction is deliberately outside this type: callers build and
+/// validate the [`SaeManifoldTerm`] once, then hand ownership of the complete
+/// per-fit state to the engine.  The request owns every orchestration choice so
+/// bindings do not need a parallel fit driver or process-global configuration.
+pub struct SaeFitRequest {
+    pub base_term: SaeManifoldTerm,
+    pub target: Array2<f64>,
+    pub registry: AnalyticPenaltyRegistry,
+    pub initial_rho: SaeManifoldRho,
+    pub max_iter: usize,
+    pub learning_rate: f64,
+    pub ridge_ext_coord: f64,
+    pub ridge_beta: f64,
+    pub assignment_kind: String,
+    pub alpha: f64,
+    pub top_k: Option<usize>,
+    pub isometry_pin_active: bool,
+    pub metric_provenance: &'static str,
+    pub structured_residual_passes: usize,
+    pub promote_from_residual: bool,
+    pub run_structure_search: bool,
+    pub run_outer_rho_search: bool,
+    pub align_min_from_rank: fn(usize) -> f64,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
 /// Run the SAE-manifold fit end-to-end from a fully-constructed, fully-configured
 /// seed `base_term` and its seed ρ. This is the python-free single source the
 /// binding, the CLI, and Rust library users all call. `base_term` must already
@@ -184,28 +212,28 @@ pub struct SaeFitOutcome {
 ///   default-off `promote_from_residual` path.
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
-#[allow(clippy::too_many_arguments)]
-pub fn run_sae_manifold_fit_from_parts(
-    base_term: SaeManifoldTerm,
-    z: Array2<f64>,
-    registry: AnalyticPenaltyRegistry,
-    init_rho: SaeManifoldRho,
-    max_iter: usize,
-    learning_rate: f64,
-    ridge_ext_coord: f64,
-    ridge_beta: f64,
-    assignment_kind: &str,
-    alpha: f64,
-    top_k: Option<usize>,
-    isometry_pin_active: bool,
-    metric_provenance_initial: &'static str,
-    structured_residual_passes: usize,
-    promote_from_residual: bool,
-    run_structure_search: bool,
-    run_outer_rho_search: bool,
-    align_min_from_rank: fn(usize) -> f64,
-    cancel: Option<Arc<AtomicBool>>,
-) -> Result<SaeFitOutcome, String> {
+pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, String> {
+    let SaeFitRequest {
+        base_term,
+        target: z,
+        registry,
+        initial_rho: init_rho,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        assignment_kind,
+        alpha,
+        top_k,
+        isometry_pin_active,
+        metric_provenance: metric_provenance_initial,
+        structured_residual_passes,
+        promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
+        align_min_from_rank,
+        cancel,
+    } = request;
     let (n_obs, p_out) = z.dim();
     let mut metric_provenance: &'static str = metric_provenance_initial;
 
@@ -274,8 +302,17 @@ pub fn run_sae_manifold_fit_from_parts(
         // a genuine descent yet caps the pathological co-collapse walk far below the
         // 200 default (each outer iter is one full O(joint-Newton) inner fit).
         let sae_outer_max_iter = (4 * n_params).clamp(24, 60);
+        // SPEC wall-survival resume: if a checkpoint for this exact data
+        // fingerprint exists (a prior job died at its wall mid-search), install
+        // the banked incumbent as the warm start and open the ρ search at the
+        // banked coordinate. The resumed run must still CONVERGE on its own —
+        // a checkpoint never mints a fit, it only saves the work.
+        let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
+            Some(banked) => ndarray::Array1::from(banked),
+            None => init_rho_flat.clone(),
+        };
         let problem = OuterProblem::new(n_params)
-            .with_initial_rho(init_rho_flat.clone())
+            .with_initial_rho(search_init_rho)
             .with_rel_cost_tolerance(Some(SAE_OUTER_REL_COST_TOL))
             .with_max_iter(sae_outer_max_iter)
             .with_seed_config(SeedConfig {
@@ -297,6 +334,10 @@ pub fn run_sae_manifold_fit_from_parts(
     // the fitted (smooth) decoder shape, independent of any top-k assignment
     // gate applied below.
     let mut shape_uncertainty = objective.decoder_shape_uncertainty()?;
+    // A converged fit is being minted: the wall-survival checkpoint has served
+    // its purpose (it must not warm-start a FUTURE fresh fit — that is
+    // `persistent_warm_start`'s job, with its own TTL/eviction discipline).
+    objective.discard_checkpoint();
     let fitted_result = objective.into_fitted();
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
@@ -403,6 +444,7 @@ pub fn run_sae_manifold_fit_from_parts(
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;
+            objective.discard_checkpoint();
             let fitted_result = objective.into_fitted();
             finalization_invalidated_shape_uncertainty =
                 fitted_result.invalidates_pre_final_shape_uncertainty();
@@ -438,8 +480,11 @@ pub fn run_sae_manifold_fit_from_parts(
                 // factor rank (#2071); used identically by the producer-side
                 // candidate gate and the nursery lineage-dedup below.
                 let align_min = align_min_from_rank(model.factor_rank());
-                let cands =
-                    model.promotion_candidates(Some(prev), align_min, PROMOTION_ENERGY_FLOOR_MULT)?;
+                let cands = model.promotion_candidates(
+                    Some(prev),
+                    align_min,
+                    PROMOTION_ENERGY_FLOOR_MULT,
+                )?;
                 let mut seen = vec![false; nursery.len()];
                 for cand in &cands {
                     let hit = nursery
@@ -774,20 +819,14 @@ pub fn run_sae_manifold_fit_from_parts(
             // recomputed on the projected `fitted`, with the decoder/ρ penalties
             // carried over unchanged (the top-k gate touches assignments, not the
             // decoder smoothness / ARD / assignment-prior strength).
-            let projected_data_fit =
-                term.data_fit_for_reconstruction(z.view(), fitted.view())?;
+            let projected_data_fit = term.data_fit_for_reconstruction(z.view(), fitted.view())?;
             post_topk_loss = Some(SaeManifoldLoss {
                 data_fit: projected_data_fit,
                 ..loss
             });
         }
     }
-    term.record_fit_data_collapse_if_needed(
-        z.view(),
-        fitted.view(),
-        assignments.view(),
-        max_iter,
-    )?;
+    term.record_fit_data_collapse_if_needed(z.view(), fitted.view(), assignments.view(), max_iter)?;
     let trust_diagnostics = term.trust_diagnostics_report(assignments.view())?;
     // Assignment-support diagnostics (atom lens) must read the SAME assignments
     // the payload exposes — after any hard top-k projection (#1232).
@@ -836,7 +875,7 @@ pub fn run_sae_manifold_fit_from_parts(
     let structure_certificate_json =
         serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
 
-    Ok(SaeFitOutcome {
+    Ok(SaeFitReport {
         term,
         rho,
         loss,

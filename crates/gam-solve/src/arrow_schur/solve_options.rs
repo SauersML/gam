@@ -85,7 +85,7 @@ pub enum PcgStopReason {
 /// ignore the value. The struct is Copy so passing it through return tuples
 /// is zero-overhead.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PcgDiagnostics {
+pub struct ArrowPcgDiagnostics {
     /// Number of CG iterations executed.
     pub iterations: usize,
     /// Total calls to the Schur matvec A·p.

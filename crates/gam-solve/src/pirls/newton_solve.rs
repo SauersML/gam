@@ -4,7 +4,7 @@
 //! active-set KKT machinery, and the soft-acceptance progress test.
 
 use super::*;
-use gam_optimize::{RidgeSchedule, escalate_ridge};
+use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 

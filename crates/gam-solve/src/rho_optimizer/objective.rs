@@ -66,7 +66,7 @@ pub enum SeedOutcome {
 /// # Contract
 ///
 /// - `capability()` must be stable (same result across calls).
-/// - `eval()` may return `HessianResult::Unavailable` at individual trial
+/// - `eval()` may return `HessianValue::Unavailable` at individual trial
 ///   points even when `capability().hessian == Analytic`; `opt` degrades that
 ///   step to first-order behavior instead of requiring the objective to fake a
 ///   stale or non-finite Hessian.
@@ -872,7 +872,7 @@ pub(crate) fn finite_outer_eval_or_error(
 ) -> Result<OuterEval, ObjectiveEvalError> {
     validate_outer_first_order(context, layout, &eval)?;
     match &eval.hessian {
-        HessianResult::Analytic(hessian) => {
+        HessianValue::Dense(hessian) => {
             layout.validate_hessian_shape(hessian, context)?;
             if !hessian.iter().all(|v| v.is_finite()) {
                 return Err(ObjectiveEvalError::recoverable(format!(
@@ -880,7 +880,7 @@ pub(crate) fn finite_outer_eval_or_error(
                 )));
             }
         }
-        HessianResult::Operator(op) => {
+        HessianValue::Operator(op) => {
             if op.dim() != layout.n_params {
                 return Err(ObjectiveEvalError::recoverable(format!(
                     "{context}: outer Hessian operator dimension mismatch: got {}, expected {} (rho_dim={}, psi_dim={})",
@@ -891,7 +891,7 @@ pub(crate) fn finite_outer_eval_or_error(
                 )));
             }
         }
-        HessianResult::Unavailable => {}
+        HessianValue::Unavailable => {}
     }
     Ok(eval)
 }
@@ -915,14 +915,14 @@ pub(crate) fn validate_second_order_seed_hessian(
     }
     if matches!(
         &eval.hessian,
-        HessianResult::Operator(op) if !op.materialization_capability().is_available()
+        HessianValue::Operator(op) if !op.materialization().is_available()
     ) {
         return Ok(());
     }
 
-    let Some(hessian) = eval.hessian.materialize_dense().map_err(|message| {
+    let Some(hessian) = eval.hessian.materialize_dense().map_err(|error| {
         ObjectiveEvalError::recoverable(format!(
-            "{context}: analytic outer Hessian materialization failed during second-order seed validation: {message}"
+            "{context}: analytic outer Hessian materialization failed during second-order seed validation: {error}"
         ))
     })?
     else {
@@ -1059,7 +1059,7 @@ impl<'a> CanonicalizedObjective<'a> {
             eval.gradient = permute_to_canonical(&eval.gradient, &self.perm);
         }
         eval.hessian = match eval.hessian {
-            HessianResult::Analytic(h)
+            HessianValue::Dense(h)
                 if h.nrows() == self.perm.len() && h.ncols() == self.perm.len() =>
             {
                 let mut hc = Array2::<f64>::zeros((self.perm.len(), self.perm.len()));
@@ -1068,7 +1068,7 @@ impl<'a> CanonicalizedObjective<'a> {
                         hc[[a, b]] = h[[ia, ib]];
                     }
                 }
-                HessianResult::Analytic(hc)
+                HessianValue::Dense(hc)
             }
             other => other,
         };

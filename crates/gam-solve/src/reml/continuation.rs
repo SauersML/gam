@@ -804,7 +804,7 @@ mod tests {
     // mock records the ρ at each call so step counting can be asserted.
 
     use crate::rho_optimizer::OuterCapability;
-    use gam_problem::{DeclaredHessianForm, Derivative, HessianResult};
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianValue};
 
     /// A response scripted for the next `eval_with_order` call.
     #[derive(Clone)]
@@ -874,7 +874,7 @@ mod tests {
             Ok(OuterEval {
                 cost,
                 gradient: Array1::zeros(self.n_params),
-                hessian: HessianResult::Unavailable,
+                hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
             })
         }
@@ -1255,7 +1255,7 @@ mod tests {
                 Ok(OuterEval {
                     cost: rho.dot(rho),
                     gradient: Array1::zeros(1),
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: Some(Array1::from_vec(vec![0.1, 0.2, 0.3, 0.4])),
                 })
             },
@@ -1324,7 +1324,7 @@ mod tests {
                 Ok(OuterEval {
                     cost: rho.dot(rho),
                     gradient: Array1::zeros(1),
-                    hessian: HessianResult::Unavailable,
+                    hessian: HessianValue::Unavailable,
                     inner_beta_hint: Some(Array1::from_vec(vec![1.0, 2.0])),
                 })
             },

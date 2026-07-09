@@ -22,6 +22,7 @@ use gam_problem::types::{
     SasLinkState, StandardLink,
 };
 use gam_runtime::span::span_index_for_breakpoints;
+use gam_linalg::faer_ndarray::array2_to_nested_vec;
 // The data-schema value types live in the `gam-data` foundation crate; they
 // were previously authored here and are still named `gam::inference::model::{
 // ColumnKindTag, DataSchema, SchemaColumn}` by a broad set of integration tests
@@ -2703,7 +2704,7 @@ impl FittedModel {
                 FittedLinkState::Sas { state, covariance },
             ) if likelihood.is_binomial_sas() => {
                 *sas_state = Some(*state);
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
             }
             (
                 FittedFamily::Standard {
@@ -2714,7 +2715,7 @@ impl FittedModel {
                 FittedLinkState::BetaLogistic { state, covariance },
             ) if likelihood.is_binomial_beta_logistic() => {
                 *sas_state = Some(*state);
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
+                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
             }
             (
                 FittedFamily::Standard {
@@ -2726,7 +2727,7 @@ impl FittedModel {
             ) if likelihood.is_binomial_mixture() => {
                 *mixture_state = Some(state.clone());
                 payload.mixture_link_param_covariance =
-                    covariance.as_ref().map(array2_to_nestedvec);
+                    covariance.as_ref().map(array2_to_nested_vec);
             }
             _ => {}
         }
@@ -4684,10 +4685,6 @@ impl FittedModel {
         }
         Ok(())
     }
-}
-
-fn array2_to_nestedvec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
-    a.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
 use gam_solve::estimate::{ensure_finite_scalar, validate_all_finite};

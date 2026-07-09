@@ -431,7 +431,7 @@ pub fn reml_laml_evaluate(
             ift_residual_energy,
             inner_polish_step,
             gradient: None,
-            hessian: gam_problem::HessianResult::Unavailable,
+            hessian: gam_problem::HessianValue::Unavailable,
             rho_mode_response_cols: None,
             ext_mode_response_cols: None,
         });
@@ -1434,7 +1434,7 @@ pub fn reml_laml_evaluate(
                 .into());
             }
             let assembly_start = std::time::Instant::now();
-            let mut hessian = gam_problem::HessianResult::Operator(family_op);
+            let mut hessian = gam_problem::HessianValue::Operator(family_op);
             // Full-θ correction: the matrix spans (ρ ‖ ψ) = the operator's whole
             // dimension, so this folds the cross-ρψ and ψψ blocks too, not just ρρ.
             if let Some(kkt_hessian) = kkt_theta_corrections
@@ -1532,7 +1532,7 @@ pub fn reml_laml_evaluate(
                 Some(&coord_corrections),
             ) {
                 Ok(op) => {
-                    let mut hessian = gam_problem::HessianResult::Operator(Arc::new(op));
+                    let mut hessian = gam_problem::HessianValue::Operator(Arc::new(op));
                     // Full-θ correction (ρρ + cross-ρψ + ψψ); the matrix is the
                     // operator's whole dimension.
                     if let Some(kkt_hessian) = kkt_theta_corrections
@@ -1554,7 +1554,7 @@ pub fn reml_laml_evaluate(
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    gam_problem::HessianResult::Unavailable
+                    gam_problem::HessianValue::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1606,11 +1606,11 @@ pub fn reml_laml_evaluate(
                         let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
                         sl += ph;
                     }
-                    gam_problem::HessianResult::Analytic(h)
+                    gam_problem::HessianValue::Dense(h)
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    gam_problem::HessianResult::Unavailable
+                    gam_problem::HessianValue::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1622,7 +1622,7 @@ pub fn reml_laml_evaluate(
         );
         result
     } else {
-        gam_problem::HessianResult::Unavailable
+        gam_problem::HessianValue::Unavailable
     };
 
     // Envelope-gradient sanity tripwire — last line of defense.

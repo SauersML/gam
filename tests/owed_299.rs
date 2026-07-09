@@ -10,7 +10,7 @@
 //! These gates drive the public study seam
 //! `arrow_precond_ladder_iteration_study`, which runs the SAME preconditioned
 //! CG (identical rhs, tolerances, trust radius) once per ladder tier and reports
-//! each tier's iteration count via `PcgDiagnostics`. The iteration counts are
+//! each tier's iteration count via `ArrowPcgDiagnostics`. The iteration counts are
 //! MEASUREMENTS, not tuned constants; the assertions only encode the structural
 //! facts the ladder must satisfy:
 //!

@@ -10,6 +10,7 @@ use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use gam_linalg::matrix::DesignMatrix;
 use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use gam_problem::types::{InverseLink, LikelihoodSpec};
 use ndarray::{Array1, Array2, ArrayView1};
@@ -54,29 +55,6 @@ pub struct BernoulliMarginalSlopePredictor {
     pub gaussian_frailty_sd: Option<f64>,
     pub latent_z_calibration: Option<LatentZRankIntCalibration>,
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
-}
-
-fn prediction_chunk_rows(parameter_dim: usize, local_dim: usize, n_rows: usize) -> usize {
-    const PREDICTION_TARGET_WORK_BYTES: usize = 2 * 1024 * 1024;
-    const PREDICTION_MIN_CHUNK_ROWS: usize = 16;
-    const PREDICTION_MAX_CHUNK_ROWS: usize = 4096;
-    if n_rows == 0 {
-        return 1;
-    }
-    let bytes_per_row = parameter_dim
-        .max(1)
-        .saturating_mul(local_dim.max(1))
-        .saturating_mul(std::mem::size_of::<f64>())
-        .saturating_mul(4);
-    let target_rows = if bytes_per_row == 0 {
-        n_rows
-    } else {
-        PREDICTION_TARGET_WORK_BYTES / bytes_per_row
-    };
-    target_rows
-        .max(PREDICTION_MIN_CHUNK_ROWS)
-        .min(PREDICTION_MAX_CHUNK_ROWS)
-        .min(n_rows.max(1))
 }
 
 /// Per-runtime predict-time anchor correction matrices.

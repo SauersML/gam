@@ -2,7 +2,7 @@
 //! the gam-solve-tier certificate zoo (task #16; descended #1521).
 //!
 //! Two concerns live here, both gam-solve-tier: (a) the `impl Certificate for …`
-//! blocks for the gam-solve-owned certificate types ([`CriterionCertificate`],
+//! blocks for the gam-solve-owned certificate types ([`OuterCriterionCertificate`],
 //! [`CoresetCertificate`](crate::row_sampling_measure::CoresetCertificate),
 //! [`LogdetEnclosure`], [`CollapseEvent`](crate::structure_search::CollapseEvent)),
 //! and (b) the two pure margin-resolution helpers, whose only inputs are
@@ -18,7 +18,7 @@
 //! `CertificateInputs` — carry their own impls in `gam_sae::certificate_impls`.)
 
 use crate::logdet_bounds::{LogdetEnclosure, MarginVerdict};
-use crate::model_types::CriterionCertificate;
+use crate::model_types::OuterCriterionCertificate;
 use crate::row_sampling_measure::{CoresetCertificate, CoresetMarginVerdict};
 use crate::structure_search::{CollapseAction, CollapseEvent};
 use gam_problem::topology_certificates::{Certificate, Claim, Evidence, Verdict};
@@ -35,7 +35,7 @@ fn put_finite(evidence: &mut Evidence, key: &'static str, value: f64) {
 
 // ── 1. Outer-optimum first-order self-audit (#931/#934) ──────────────────────
 
-impl Certificate for CriterionCertificate {
+impl Certificate for OuterCriterionCertificate {
     fn claim(&self) -> Claim {
         Claim::new(
             "outer-optimality",
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn criterion_clean_certifies_desync_is_insufficient() {
-        let clean = CriterionCertificate {
+        let clean = OuterCriterionCertificate {
             grad_norm: 1e-8,
             analytic_directional: 1.0,
             fd_directional: 1.0,
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(clean.verdict(), Verdict::Certified);
         assert!(clean.verdict().is_certified());
 
-        let desync = CriterionCertificate {
+        let desync = OuterCriterionCertificate {
             analytic_directional: 1.0,
             fd_directional: 5.0,
             fd_error: 1e-6,
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn ledger_rolls_up_to_weakest_member() {
         let mut ledger = CertificateLedger::new();
-        let clean = CriterionCertificate {
+        let clean = OuterCriterionCertificate {
             grad_norm: 1e-8,
             analytic_directional: 1.0,
             fd_directional: 1.0,

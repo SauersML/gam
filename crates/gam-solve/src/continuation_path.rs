@@ -1399,7 +1399,7 @@ mod tests {
             Ok(gam_problem::OuterEval {
                 cost: self.eval_cost(rho)?,
                 gradient: Array1::zeros(rho.len()),
-                hessian: gam_problem::HessianResult::Unavailable,
+                hessian: gam_problem::HessianValue::Unavailable,
                 inner_beta_hint: Some(Array1::from_vec(vec![1.0, self.seed_count as f64])),
             })
         }
@@ -1413,7 +1413,7 @@ mod tests {
             let mut eval = self.eval(rho)?;
             if matches!(order, OuterEvalOrder::Value) {
                 eval.gradient = Array1::zeros(0);
-                eval.hessian = gam_problem::HessianResult::Unavailable;
+                eval.hessian = gam_problem::HessianValue::Unavailable;
             }
             Ok(eval)
         }

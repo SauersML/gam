@@ -435,11 +435,8 @@ impl AssignmentMode {
     /// Resolve the effective truncated-IBP concentration `α` for this mode.
     ///
     /// `per_fit_override` is the #1777 PER-FIT override (from
-    /// [`SaeAssignment::ibp_alpha_override`]) and is the SOURCE OF TRUTH when set.
-    /// It falls back to the deprecated process-global [`ibp_alpha_override`] atomic
-    /// only when the per-fit field is unset, then to the mode's own `α` /
-    /// learnable schedule — so nothing breaks, but concurrent fits are isolatable
-    /// via the per-fit field.
+    /// [`SaeAssignment::ibp_alpha_override`]) and is the source of truth when set.
+    /// Otherwise the mode's canonical fixed `α` or learnable schedule is used.
     pub(crate) fn resolved_ibp_alpha(
         &self,
         rho: &SaeManifoldRho,
@@ -450,21 +447,19 @@ impl AssignmentMode {
                 alpha,
                 learnable_alpha,
                 ..
-            } => Some(
-                if let Some(over) = per_fit_override.or_else(ibp_alpha_override) {
-                    // #1777 — the per-fit override (else the deprecated process-global
-                    // one) flattens the ordered geometric prior π_k = (α/(α+1))^{k+1}
-                    // so all K atoms can contribute to the reconstruction (the
-                    // production α=1 gives a (0.5)^{k+1} schedule that structurally
-                    // caps atoms 4..K → effective-K≈3). Forces the fixed value,
-                    // bypassing the learnable schedule.
-                    over
-                } else if learnable_alpha {
-                    resolve_learnable_weight(alpha, rho.log_lambda_sparse)
-                } else {
-                    alpha
-                },
-            ),
+            } => Some(if let Some(over) = per_fit_override {
+                // #1777 — the per-fit override flattens the ordered geometric
+                // prior π_k = (α/(α+1))^{k+1}
+                // so all K atoms can contribute to the reconstruction (the
+                // production α=1 gives a (0.5)^{k+1} schedule that structurally
+                // caps atoms 4..K → effective-K≈3). Forces the fixed value,
+                // bypassing the learnable schedule.
+                over
+            } else if learnable_alpha {
+                resolve_learnable_weight(alpha, rho.log_lambda_sparse)
+            } else {
+                alpha
+            }),
             _ => None,
         }
     }
@@ -505,10 +500,12 @@ pub fn admit_assignment_mode_for_size(
     }
     let large_k_top = default_top_k_for_large_dictionary(n_obs, k_atoms);
     let admission = match request {
-        AssignmentModeRequest::Default | AssignmentModeRequest::Softmax => AssignmentModeAdmission {
-            mode: AssignmentMode::softmax(temperature),
-            top_k: large_k_top,
-        },
+        AssignmentModeRequest::Default | AssignmentModeRequest::Softmax => {
+            AssignmentModeAdmission {
+                mode: AssignmentMode::softmax(temperature),
+                top_k: large_k_top,
+            }
+        }
         AssignmentModeRequest::ThresholdGate => AssignmentModeAdmission {
             mode: AssignmentMode::threshold_gate(temperature, threshold),
             top_k: None,
@@ -529,43 +526,6 @@ pub fn admit_assignment_mode_for_size(
     };
     admission.mode.validate()?;
     Ok(admission)
-}
-
-// #1026 — process-global IBP-α override (NaN sentinel = "unset → use the
-// AssignmentMode's compiled α"). Lets ONE wheel sweep the prior-flattening axis
-// from Python (`sae_set_ibp_alpha`) without recompiling the gam crate.
-//
-// CONCURRENCY WARNING: this is a PROCESS-GLOBAL atomic, not per-fit config. It is
-// read by `ibp_alpha_override` from every IBP assignment evaluation in the
-// process, so setting it affects ALL in-flight fits, not just the caller's. It is
-// therefore UNSAFE to use across concurrent / parallel in-process fits — one
-// fit's sweep value leaks into another's gates. It is safe only for serial,
-// whole-process sweeps (the single-wheel FFI sweep driver it exists for). This
-// should be migrated to per-fit configuration (threaded through `SaeManifoldRho`
-// / the AssignmentMode) before any concurrent multi-fit use; that refactor is
-// cross-cutting (FFI + term plumbing) and deliberately out of scope here.
-static IBP_ALPHA_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
-
-pub(crate) fn ibp_alpha_override() -> Option<f64> {
-    let v = f64::from_bits(IBP_ALPHA_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
-    if v.is_finite() && v > 0.0 {
-        Some(v)
-    } else {
-        None
-    }
-}
-
-/// Set (or, with a non-finite/non-positive value, clear) the process-global
-/// IBP-α override. Called from the gamfit Python FFI sweep driver.
-///
-/// PROCESS-GLOBAL / NOT CONCURRENCY-SAFE: this mutates one process-wide atomic
-/// read by every IBP assignment in the process. Calling it while any other fit is
-/// running leaks the override into that fit's gates. Use only for serial,
-/// whole-process sweeps; do not use across concurrent in-process fits. See the
-/// `IBP_ALPHA_OVERRIDE_BITS` note on migrating this to per-fit config.
-pub fn set_ibp_alpha_override(alpha: f64) {
-    IBP_ALPHA_OVERRIDE_BITS.store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Per-row latent assignment state — the DENSE-CERTIFICATION / debug-and-research
@@ -621,15 +581,11 @@ pub struct SaeAssignment {
     /// gates every outer eval — the n-independent-outer-loop lever (#1033). `None`
     /// is the historical free-logit path (bit-identical).
     pub frozen_logits: Option<Array2<f64>>,
-    /// #1777 PER-FIT IBP-α override — the source of truth for the truncated-IBP
-    /// concentration `α` when set, replacing the process-global
-    /// [`set_ibp_alpha_override`] atomic. `Some(α)` forces the fixed value
-    /// (bypassing the learnable schedule), scoped to THIS assignment/fit so
-    /// concurrent in-process fits are isolated. `None` ⇒ fall back to the
-    /// deprecated process-global override, then to the `AssignmentMode`'s own `α` /
-    /// learnable schedule (bit-identical to the historical path when neither
-    /// override is set). Read via [`Self::resolved_ibp_alpha`]; set from the FFI
-    /// through the term's `set_fit_config`.
+    /// #1777 PER-FIT IBP-α override. `Some(α)` forces a fixed value and bypasses
+    /// the learnable schedule for this assignment/fit. `None` uses the
+    /// [`AssignmentMode`]'s canonical fixed `α` or learnable schedule. Read via
+    /// [`Self::resolved_ibp_alpha`]; set from the FFI through the term's
+    /// `set_fit_config`.
     pub ibp_alpha_override: Option<f64>,
 }
 
@@ -930,29 +886,27 @@ impl SaeAssignment {
     }
 
     /// #1777 — the effective truncated-IBP `α` for this assignment at `rho`,
-    /// honoring the PER-FIT [`Self::ibp_alpha_override`] first (source of truth),
-    /// then the deprecated process-global override, then the mode's own schedule.
-    /// The single seam every gate/jet/prior site reads so the per-fit override is
-    /// applied consistently. `None` for non-IBP modes.
+    /// honoring the PER-FIT [`Self::ibp_alpha_override`] before the mode's
+    /// canonical value or learnable schedule. The single seam every
+    /// gate/jet/prior site reads so the per-fit override is applied consistently.
+    /// `None` for non-IBP modes.
     pub(crate) fn resolved_ibp_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
         self.mode.resolved_ibp_alpha(rho, self.ibp_alpha_override)
     }
 
     /// Whether the truncated-IBP concentration α is a FREE outer parameter that
     /// varies with ρ (`rho.log_lambda_sparse`). α is learnable ONLY when the mode
-    /// requests it AND no override (per-fit #1777 or the deprecated process-global
-    /// one) pins it: an override forces the fixed value and bypasses the learnable
+    /// requests it AND no per-fit override pins it: an override forces the fixed
+    /// value and bypasses the learnable
     /// schedule (see [`AssignmentMode::resolved_ibp_alpha`]), so α's ρ-derivatives
     /// are then identically zero and every prior / log-det / IFT term must treat α
     /// as a constant to stay consistent with the forward gate. `false` for non-IBP
     /// modes. (#Bug6)
     pub(crate) fn effective_alpha_is_learnable(&self) -> bool {
         match self.mode {
-            AssignmentMode::IBPMap { learnable_alpha, .. } => {
-                learnable_alpha
-                    && self.ibp_alpha_override.is_none()
-                    && ibp_alpha_override().is_none()
-            }
+            AssignmentMode::IBPMap {
+                learnable_alpha, ..
+            } => learnable_alpha && self.ibp_alpha_override.is_none(),
             _ => false,
         }
     }
@@ -971,7 +925,7 @@ impl SaeAssignment {
     /// since the resolved α is `α_base · exp(log_lambda_sparse)`).
     ///
     /// Returns `Some(Δθ)` ONLY when the effective α is a FREE learnable parameter
-    /// (IBP-MAP, `learnable_alpha`, no per-fit or process-global override) —
+    /// (IBP-MAP, `learnable_alpha`, no per-fit override) —
     /// exactly when [`Self::effective_alpha_is_learnable`] holds, so the α
     /// ρ-derivatives are non-zero and the marginal M-step is the coherent update.
     /// `None` for every other sparsity prior (softmax entropy, gated L1) or a
@@ -1015,13 +969,13 @@ impl SaeAssignment {
                 *acc += g;
             }
         }
-        let alpha_star =
-            ibp_eb_geometric_alpha_fixed_point(&occupancy, n as f64, alpha_current);
+        let alpha_star = ibp_eb_geometric_alpha_fixed_point(&occupancy, n as f64, alpha_current);
         if !(alpha_star.is_finite() && alpha_star > 0.0) {
             return Ok(None);
         }
         const LOG_ALPHA_STEP_CAP: f64 = 2.0;
-        let step = (alpha_star.ln() - alpha_current.ln()).clamp(-LOG_ALPHA_STEP_CAP, LOG_ALPHA_STEP_CAP);
+        let step =
+            (alpha_star.ln() - alpha_current.ln()).clamp(-LOG_ALPHA_STEP_CAP, LOG_ALPHA_STEP_CAP);
         Ok(Some(step))
     }
 
@@ -1543,7 +1497,11 @@ pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_s
         if !s.is_finite() || s.abs() < TOL {
             break;
         }
-        let mut step = if h < -1.0e-12 { -s / h } else { s.signum() * STEP_TR };
+        let mut step = if h < -1.0e-12 {
+            -s / h
+        } else {
+            s.signum() * STEP_TR
+        };
         if !step.is_finite() {
             break;
         }
@@ -1666,7 +1624,12 @@ pub fn activation_matrix_from_logits(
 /// the all-active row. Logits are validated finite upstream.
 pub fn topk_row(logits: ArrayView1<'_, f64>, k: usize) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
-    topk_row_into(logits, k, out.as_slice_mut().expect("freshly allocated 1-D array is contiguous"));
+    topk_row_into(
+        logits,
+        k,
+        out.as_slice_mut()
+            .expect("freshly allocated 1-D array is contiguous"),
+    );
     out
 }
 
@@ -1894,7 +1857,10 @@ mod topk_activation_tests {
         let (value, grad) = topk_activation_row_value_grad(logits.view(), temperature);
         for (&v, &g) in value.iter().zip(grad.iter()) {
             assert!(v >= 0.0, "activation must be non-negative, got {v}");
-            assert!((0.0..=1.0).contains(&g), "grad must be a logistic in [0,1], got {g}");
+            assert!(
+                (0.0..=1.0).contains(&g),
+                "grad must be a logistic in [0,1], got {g}"
+            );
         }
         // Spot-check the closed form at l = 0: τ·softplus(0) = τ·ln 2, σ(0) = 0.5.
         assert!((value[2] - temperature * 2.0_f64.ln()).abs() < 1e-15);
@@ -1920,7 +1886,10 @@ mod topk_support_gate_tests {
             3,
             "L0 must equal k exactly"
         );
-        assert!(g.iter().all(|&v| v == 0.0 || v == 1.0), "gates are hard {{0,1}}");
+        assert!(
+            g.iter().all(|&v| v == 0.0 || v == 1.0),
+            "gates are hard {{0,1}}"
+        );
     }
 
     #[test]
@@ -1941,10 +1910,17 @@ mod topk_support_gate_tests {
             let alloc = topk_row(logits.view(), k);
             let mut buf = vec![f64::NAN; logits.len()];
             topk_row_into(logits.view(), k, &mut buf);
-            assert_eq!(alloc.to_vec(), buf, "into-twin must be bit-identical at k={k}");
+            assert_eq!(
+                alloc.to_vec(),
+                buf,
+                "into-twin must be bit-identical at k={k}"
+            );
         }
         let all = topk_row(logits.view(), 99);
-        assert!(all.iter().all(|&v| v == 1.0), "k >= n degenerates to all-active");
+        assert!(
+            all.iter().all(|&v| v == 1.0),
+            "k >= n degenerates to all-active"
+        );
     }
 
     #[test]
@@ -3149,7 +3125,10 @@ mod ibp_eb_alpha_f1_tests {
                 let old = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
                 let via = ordered_geometric_shrinkage_prior(k, alpha);
                 for j in 0..k {
-                    assert_eq!(old[j], via[j], "geometric prior drift at alpha={alpha}, k={j}");
+                    assert_eq!(
+                        old[j], via[j],
+                        "geometric prior drift at alpha={alpha}, k={j}"
+                    );
                 }
             }
         }
@@ -3237,17 +3216,26 @@ mod ibp_eb_alpha_f1_tests {
         // seed — the movement the frozen-λ_sparse bug prevented.
         let occupancy = vec![500.0_f64; 8];
         let alpha_star = ibp_eb_geometric_alpha_fixed_point(&occupancy, n_obs, 1.0);
-        assert!(alpha_star > 5.0, "flat occupancy must raise α; got {alpha_star}");
+        assert!(
+            alpha_star > 5.0,
+            "flat occupancy must raise α; got {alpha_star}"
+        );
         // Stationarity: at α* the analytic score is ~0 (interior) or α* railed to
         // a clamp (monotone) — here it is interior.
         let (s, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha_star);
-        assert!(s.abs() < 1e-4, "score not stationary at α*={alpha_star}: S={s}");
+        assert!(
+            s.abs() < 1e-4,
+            "score not stationary at α*={alpha_star}: S={s}"
+        );
 
         // Conversely, occupancy that already matches a small-α steep decay pulls
         // α back down toward that value.
         let steep: Vec<f64> = (0..8).map(|k| n_obs * 0.5_f64.powi(k as i32 + 1)).collect();
         let alpha_low = ibp_eb_geometric_alpha_fixed_point(&steep, n_obs, 20.0);
-        assert!(alpha_low < 5.0, "steep occupancy must lower α; got {alpha_low}");
+        assert!(
+            alpha_low < 5.0,
+            "steep occupancy must lower α; got {alpha_low}"
+        );
     }
 
     fn learnable_ibp(logits: Array2<f64>, alpha_base: f64) -> SaeAssignment {
@@ -3283,9 +3271,12 @@ mod ibp_eb_alpha_f1_tests {
 
         // Softmax has no closed-form M-step → None (historical zero step).
         let sm_coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
-        let softmax =
-            SaeAssignment::from_blocks_with_mode(logits.clone(), sm_coords, AssignmentMode::softmax(1.0))
-                .unwrap();
+        let softmax = SaeAssignment::from_blocks_with_mode(
+            logits.clone(),
+            sm_coords,
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
         assert!(
             softmax.ibp_eb_log_alpha_step(&rho).unwrap().is_none(),
             "softmax sparsity prior has no EB α M-step"
