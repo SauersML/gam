@@ -79,7 +79,28 @@ pub fn build_thin_plate_basiswithworkspace(
     let augmented_fits_in_data = center_strategy_num_centers(&augmented_strategy)
         .map(|augmented_count| augmented_count <= data.nrows())
         .unwrap_or(true);
-    let center_strategy = if augmented_fits_in_data {
+    // When the caller EXPLICITLY asks for fewer centers than the canonical-TPS
+    // polynomial floor `M(d)` but at least enough for the Duchon generalization
+    // (`duchon_thin_plate_fallback_params` admissible at that count), honor the
+    // exact request and let the count-short infeasibility gate below promote to
+    // Duchon at that resolution. Augmenting to `M(d)` in this case is exactly
+    // wrong: it inflates past the request AND lands on `k ≥ M(d)` centers that
+    // are generically full-rank, so `thin_plate_canonical_infeasible_at_centers`
+    // reports feasible and the promotion never fires — the requested-low-k fit
+    // silently becomes a canonical TPS at `M(d)` centers instead of the intended
+    // Duchon spline (gam#1813 freeze-promotion arm: e.g. d=5, k=10 < M(5)=21
+    // must promote to a 10-center Duchon, not inflate to 21-center canonical TPS).
+    let requested_below_canonical_but_duchon_feasible = center_strategy_num_centers(
+        &spec.center_strategy,
+    )
+    .map(|requested| {
+        requested < poly_cols
+            && duchon_thin_plate_fallback_params(data.ncols(), requested).is_some()
+    })
+    .unwrap_or(false);
+    let center_strategy = if requested_below_canonical_but_duchon_feasible {
+        spec.center_strategy.clone()
+    } else if augmented_fits_in_data {
         augmented_strategy
     } else {
         spec.center_strategy.clone()
