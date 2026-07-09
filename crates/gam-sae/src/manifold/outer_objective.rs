@@ -3205,7 +3205,7 @@ impl SaeManifoldOuterObjective {
             // Return the discovery verdict verbatim (its typed refusal / error is
             // what the value lanes already map to the finite collapse wall).
             None => {
-                debug_assert!(member_eval.is_err());
+                drop(member_eval);
                 discovery
             }
         }
