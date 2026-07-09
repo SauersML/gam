@@ -664,7 +664,9 @@ class SurvivalPrediction:
         Returns
         -------
         float
-            Harrell's C-index in ``[0, 1]``.
+            Harrell's C-index in ``[0, 1]``, or ``nan`` when the sample has no
+            comparable pairs (e.g. every row censored) and the C-index is
+            undefined.
 
         Examples
         --------
@@ -684,13 +686,14 @@ class SurvivalPrediction:
             score_arr = self.risk_score_at(horizon_value)
         else:
             score_arr = np.asarray(risk_score, dtype=float).reshape(-1)
-        return float(
-            rust_module().survival_concordance(
-                times_arr.tolist(),
-                score_arr.tolist(),
-                events_arr.tolist(),
-            )
+        c_index = rust_module().survival_concordance(
+            times_arr.tolist(),
+            score_arr.tolist(),
+            events_arr.tolist(),
         )
+        # The core returns None when no comparable pairs exist (undefined
+        # C-index); report that as NaN rather than a misleading 0.5.
+        return float("nan") if c_index is None else float(c_index)
 
 
 def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:

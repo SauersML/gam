@@ -5139,7 +5139,7 @@ fn survival_concordance(
     event_times: Vec<f64>,
     risk_score: Vec<f64>,
     events: Vec<f64>,
-) -> PyResult<f64> {
+) -> PyResult<Option<f64>> {
     if event_times.len() != risk_score.len() || event_times.len() != events.len() {
         return Err(PyValueError::new_err(format!(
             "survival_concordance length mismatch: times={} risk={} events={}",
@@ -5148,32 +5148,19 @@ fn survival_concordance(
             events.len()
         )));
     }
-    let mut admissible = 0.0;
-    let mut concordant = 0.0;
-    for i in 0..event_times.len() {
-        for j in (i + 1)..event_times.len() {
-            let ordering = if event_times[i] < event_times[j] && events[i] > 0.5 {
-                Some(risk_score[i].total_cmp(&risk_score[j]))
-            } else if event_times[j] < event_times[i] && events[j] > 0.5 {
-                Some(risk_score[j].total_cmp(&risk_score[i]))
-            } else {
-                None
-            };
-            if let Some(ordering) = ordering {
-                admissible += 1.0;
-                concordant += match ordering {
-                    Ordering::Greater => 1.0,
-                    Ordering::Equal => 0.5,
-                    Ordering::Less => 0.0,
-                };
-            }
-        }
-    }
-    Ok(if admissible == 0.0 {
-        0.5
-    } else {
-        concordant / admissible
-    })
+    // Delegate to the single source of truth for Harrell's C-index in
+    // gam-models (`survival::predict::harrell_concordance`). The core counts
+    // tied event times as a comparable half-credit pair and returns None when
+    // there are no comparable pairs at all (e.g. every row censored); the old
+    // hand-rolled pair loop here dropped tied-time pairs entirely and returned
+    // a silent 0.5 sentinel. Where the two disagreed the core wins — a None
+    // degenerate result is surfaced as Python None, matching how the
+    // neighboring metric pyfunctions report an undefined score.
+    Ok(gam::families::survival::predict::harrell_concordance(
+        &event_times,
+        &events,
+        &risk_score,
+    ))
 }
 
 #[pyfunction]
