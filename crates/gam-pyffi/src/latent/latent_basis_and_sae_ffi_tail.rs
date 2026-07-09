@@ -1729,54 +1729,43 @@ fn build_sae_encode_atlas<'py>(
 /// `steer_delta` sees the fitted assignments. `fisher_factors` is the `(n, p, r)`
 /// harvest shard `U`; its presence installs `RowMetric::OutputFisher` (and makes
 /// `predicted_nats` / `validity_radius` available), exactly as in the fit.
-#[pyfunction(signature = (
-    atom_k,
-    t_from,
-    t_to,
-    n_obs,
-    p_out,
-    atom_basis,
-    atom_dim,
-    decoder_blocks,
-    duchon_centers,
-    n_harmonics_list,
-    basis_size_list,
-    coords,
-    logits,
-    assignment_kind,
-    tau,
-    alpha = 1.0,
-    jumprelu_threshold = 0.0,
-    fisher_factors = None,
-    fisher_provenance = None,
-))]
-fn sae_steer_delta<'py>(
-    py: Python<'py>,
+/// Owned-array core of the steering primitive (#2091): the full per-atom basis
+/// rebuild + trained-latent seeding + optional output-Fisher metric install +
+/// `steer_delta` call, on borrowed ndarray views instead of `PyReadonlyArray`.
+///
+/// Both callers route through this single rebuild path so their `SteerPlan`s are
+/// identical by construction: the `sae_steer_delta` `#[pyfunction]` (arrays
+/// marshalled from Python) and `ManifoldSaeCore::steer` (arrays read from the
+/// Rust-owned model state, so an attached Fisher shard is NOT re-marshalled
+/// across the FFI boundary per call — acceptance bullet 2). The
+/// predicted-nats-vs-analytic steering tests guard this rebuild's correctness;
+/// the pyclass equivalence test guards that the two callers thread identical
+/// inputs into it. `fisher_provenance`: same-position `"output_fisher"` (default)
+/// or forward-looking `"output_fisher_downstream"` — selects the re-installed
+/// output-Fisher `RowMetric` the dose is measured through.
+fn steer_delta_from_arrays(
     atom_k: usize,
-    t_from: PyReadonlyArray1<'py, f64>,
-    t_to: PyReadonlyArray1<'py, f64>,
+    t_from: ndarray::ArrayView1<'_, f64>,
+    t_to: ndarray::ArrayView1<'_, f64>,
     n_obs: usize,
     p_out: usize,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
-    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
-    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
-    n_harmonics_list: Vec<Option<usize>>,
-    basis_size_list: Vec<usize>,
-    coords: Vec<PyReadonlyArray2<'py, f64>>,
-    logits: PyReadonlyArray2<'py, f64>,
-    assignment_kind: String,
+    atom_basis: &[String],
+    atom_dim: &[usize],
+    decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
+    duchon_centers: &[Option<Array2<f64>>],
+    n_harmonics_list: &[Option<usize>],
+    basis_size_list: &[usize],
+    coords: &[ndarray::ArrayView2<'_, f64>],
+    logits: ndarray::ArrayView2<'_, f64>,
+    assignment_kind: &str,
     tau: f64,
     alpha: f64,
     jumprelu_threshold: f64,
-    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
-    // Harvest provenance tag (#980): same-position `"output_fisher"` (default) or
-    // forward-looking `"output_fisher_downstream"`. Selects the re-installed
-    // output-Fisher `RowMetric` the dose is measured through.
-    fisher_provenance: Option<String>,
-) -> PyResult<Py<PyDict>> {
+    fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
+    fisher_provenance: Option<&str>,
+) -> PyResult<gam::inference::steering::SteerPlan> {
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
-    let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
+    let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = atom_basis.len();
     if n_obs == 0 || p_out == 0 {
         return Err(py_value_error(format!(
@@ -1862,8 +1851,7 @@ fn sae_steer_delta<'py>(
                             "sae_steer_delta: atom {atom_idx} (Duchon-like) needs duchon_centers"
                         ))
                     })?
-                    .as_array()
-                    .to_owned();
+                    .clone();
                 let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
                 let (phi, _jet, _penalty) = match kind {
                     // #1221 — linear (degree-1) and euclidean-quadratic (degree-2)
@@ -1877,7 +1865,7 @@ fn sae_steer_delta<'py>(
                         // re-emit a wrong width. Keeps the steer rebuild's basis
                         // width matched to the decoder, same as predict_oos.
                         let euclidean_dim = centers.ncols();
-                        let trained_m = decoder_blocks[atom_idx].as_array().nrows();
+                        let trained_m = decoder_blocks[atom_idx].nrows();
                         let degree = sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
                             .map_err(py_value_error)?;
                         sae_build_euclidean_atom_with_degree(
@@ -1909,7 +1897,7 @@ fn sae_steer_delta<'py>(
     let d_max = effective_atom_dim.iter().copied().max().unwrap_or(1).max(1);
     let mut start_coords = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
     for atom_idx in 0..k_atoms {
-        let block = coords[atom_idx].as_array();
+        let block = coords[atom_idx];
         let d = effective_atom_dim[atom_idx];
         if block.nrows() != n_obs || block.ncols() != d {
             return Err(py_value_error(format!(
@@ -1933,7 +1921,7 @@ fn sae_steer_delta<'py>(
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
     for atom_idx in 0..k_atoms {
-        let block = decoder_blocks[atom_idx].as_array();
+        let block = decoder_blocks[atom_idx];
         if block.ncols() != p_out {
             return Err(py_value_error(format!(
                 "sae_steer_delta: decoder_blocks[{atom_idx}] has p={} but p_out={p_out}",
@@ -1959,7 +1947,7 @@ fn sae_steer_delta<'py>(
             .assign(&block.slice(s![0..m_k, 0..p_out]));
     }
 
-    let logits_view = logits.as_array();
+    let logits_view = logits;
     if logits_view.dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
             "sae_steer_delta: logits must be ({n_obs}, {k_atoms}); got {:?}",
@@ -2038,7 +2026,7 @@ fn sae_steer_delta<'py>(
     // same `(n, p, r)` → `(n, p*r)` flatten the fit uses. Presence activates the
     // OutputFisher provenance so `predicted_nats` / `validity_radius` are
     // available; absence keeps the Euclidean geometry-only path (dose = None).
-    if let Some(u3) = fisher_factors.as_ref().map(|f| f.as_array()) {
+    if let Some(u3) = fisher_factors {
         let u_shape = u3.shape();
         if u_shape[0] != n_obs || u_shape[1] != p_out {
             return Err(py_value_error(format!(
@@ -2082,13 +2070,20 @@ fn sae_steer_delta<'py>(
         gam::inference::row_metric::RowMetric::euclidean(n_obs, p_out).map_err(py_value_error)?;
     let metric = term.row_metric().unwrap_or(&euclidean);
 
-    let t_from_vec = t_from.as_array().to_vec();
-    let t_to_vec = t_to.as_array().to_vec();
+    let t_from_vec = t_from.to_vec();
+    let t_to_vec = t_to.to_vec();
     let plan = gam::inference::steering::steer_delta(&term, metric, atom_k, &t_from_vec, &t_to_vec)
         .map_err(py_value_error)?;
+    Ok(plan)
+}
 
+/// Render a [`gam::inference::steering::SteerPlan`] as the Python dict both steer
+/// callers return (the `sae_steer_delta` pyfunction and `ManifoldSaeCore::steer`).
+fn steer_plan_to_pydict(
+    py: Python<'_>,
+    plan: gam::inference::steering::SteerPlan,
+) -> PyResult<Py<PyDict>> {
     let provenance_str = metric_provenance_label(plan.metric_provenance);
-
     let out = PyDict::new(py);
     out.set_item("atom", plan.atom)?;
     out.set_item("atom_name", plan.atom_name)?;
@@ -2102,6 +2097,88 @@ fn sae_steer_delta<'py>(
     out.set_item("off_manifold_norm", plan.off_manifold_norm)?;
     out.set_item("metric_provenance", provenance_str)?;
     Ok(out.unbind())
+}
+
+/// FFI surface for the steering primitive: rebuilds the fitted term from the
+/// trained decoder blocks + basis metadata, seeds it with the trained latents /
+/// logits (no re-solve), optionally installs the WP-D output-Fisher metric from
+/// `fisher_factors`, and drives atom `atom_k` from `t_from` to `t_to`, returning
+/// the [`gam::inference::steering::SteerPlan`] as a dict. Thin marshalling over
+/// the shared [`steer_delta_from_arrays`] rebuild (#2091).
+#[pyfunction(signature = (
+    atom_k,
+    t_from,
+    t_to,
+    n_obs,
+    p_out,
+    atom_basis,
+    atom_dim,
+    decoder_blocks,
+    duchon_centers,
+    n_harmonics_list,
+    basis_size_list,
+    coords,
+    logits,
+    assignment_kind,
+    tau,
+    alpha = 1.0,
+    jumprelu_threshold = 0.0,
+    fisher_factors = None,
+    fisher_provenance = None,
+))]
+fn sae_steer_delta<'py>(
+    py: Python<'py>,
+    atom_k: usize,
+    t_from: PyReadonlyArray1<'py, f64>,
+    t_to: PyReadonlyArray1<'py, f64>,
+    n_obs: usize,
+    p_out: usize,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
+    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
+    n_harmonics_list: Vec<Option<usize>>,
+    basis_size_list: Vec<usize>,
+    coords: Vec<PyReadonlyArray2<'py, f64>>,
+    logits: PyReadonlyArray2<'py, f64>,
+    assignment_kind: String,
+    tau: f64,
+    alpha: f64,
+    jumprelu_threshold: f64,
+    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_provenance: Option<String>,
+) -> PyResult<Py<PyDict>> {
+    let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+        decoder_blocks.iter().map(|b| b.as_array()).collect();
+    let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
+        coords.iter().map(|c| c.as_array()).collect();
+    let duchon_owned: Vec<Option<Array2<f64>>> = duchon_centers
+        .iter()
+        .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
+        .collect();
+    let fisher_view = fisher_factors.as_ref().map(|f| f.as_array());
+    let plan = steer_delta_from_arrays(
+        atom_k,
+        t_from.as_array(),
+        t_to.as_array(),
+        n_obs,
+        p_out,
+        &atom_basis,
+        &atom_dim,
+        &decoder_views,
+        &duchon_owned,
+        &n_harmonics_list,
+        &basis_size_list,
+        &coord_views,
+        logits.as_array(),
+        &assignment_kind,
+        tau,
+        alpha,
+        jumprelu_threshold,
+        fisher_view,
+        fisher_provenance.as_deref(),
+    )?;
+    steer_plan_to_pydict(py, plan)
 }
 
 /// Global coefficient of determination

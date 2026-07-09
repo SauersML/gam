@@ -7414,6 +7414,47 @@ fn manifold_sae_dense_cov<'py>(
     Ok(cov.into_pyarray(py))
 }
 
+/// Build an owned `(R, C)` ndarray from nested `Vec`s (for feeding Rust-owned
+/// model state into the shared steering/OOS rebuild without a numpy round-trip).
+fn manifold_sae_owned2(v: &[Vec<f64>]) -> PyResult<Array2<f64>> {
+    let rows = v.len();
+    let cols = v.first().map_or(0, Vec::len);
+    let mut flat = Vec::with_capacity(rows * cols);
+    for row in v {
+        if row.len() != cols {
+            return Err(py_value_error(
+                "ManifoldSaeCore: ragged 2-D state array".to_string(),
+            ));
+        }
+        flat.extend_from_slice(row);
+    }
+    Array2::from_shape_vec((rows, cols), flat).map_err(|e| py_value_error(e.to_string()))
+}
+
+/// Build an owned `(D0, D1, D2)` ndarray from triply-nested `Vec`s.
+fn manifold_sae_owned3(v: &[Vec<Vec<f64>>]) -> PyResult<Array3<f64>> {
+    let d0 = v.len();
+    let d1 = v.first().map_or(0, Vec::len);
+    let d2 = v.first().and_then(|m| m.first()).map_or(0, Vec::len);
+    let mut flat = Vec::with_capacity(d0 * d1 * d2);
+    for mat in v {
+        if mat.len() != d1 {
+            return Err(py_value_error(
+                "ManifoldSaeCore: ragged 3-D state array".to_string(),
+            ));
+        }
+        for row in mat {
+            if row.len() != d2 {
+                return Err(py_value_error(
+                    "ManifoldSaeCore: ragged 3-D state array".to_string(),
+                ));
+            }
+            flat.extend_from_slice(row);
+        }
+    }
+    Array3::from_shape_vec((d0, d1, d2), flat).map_err(|e| py_value_error(e.to_string()))
+}
+
 /// A single fitted atom's object surface (#2091). Mirrors the attributes
 /// `SaeManifoldAtomFit` exposed (`atom.basis`, `atom.decoder_coefficients`,
 /// `atom.decoder_covariance` reconstructed dense, the shape band, …) so
@@ -7541,6 +7582,94 @@ impl ManifoldSaeCore {
     /// The canonical JSON payload string (what `save()` writes).
     fn to_json(&self) -> PyResult<String> {
         self.inner.to_json().map_err(py_value_error)
+    }
+
+    /// Steering plan with output dosimetry for one atom — the Rust-owned
+    /// counterpart of `ManifoldSAE.steer` (#980/#2091). Reads the model geometry
+    /// (decoder blocks, coords, logits, and the attached output-Fisher shard)
+    /// from this handle's own state and routes through the SAME
+    /// `steer_delta_from_arrays` rebuild the `sae_steer_delta` pyfunction uses, so
+    /// the Fisher shard is NOT re-marshalled across the FFI boundary per call
+    /// (acceptance bullet 2) and the returned plan is bitwise-identical to the
+    /// dataclass path. Mirrors the Python steer's exact `n_harmonics` gate
+    /// (`periodic`/`torus` only) so the rebuilt basis matches the trained design.
+    #[pyo3(signature = (atom_k, t_from, t_to))]
+    fn steer<'py>(
+        &self,
+        py: Python<'py>,
+        atom_k: usize,
+        t_from: PyReadonlyArray1<'py, f64>,
+        t_to: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let inner = &self.inner;
+        let n_obs = inner.fitted.len();
+        let p_out = inner.fitted.first().map_or(0, Vec::len);
+        let decoder_owned: Vec<Array2<f64>> = inner
+            .decoder_blocks
+            .iter()
+            .map(|b| manifold_sae_owned2(b))
+            .collect::<PyResult<_>>()?;
+        let coord_owned: Vec<Array2<f64>> = inner
+            .coords
+            .iter()
+            .map(|c| manifold_sae_owned2(c))
+            .collect::<PyResult<_>>()?;
+        let duchon_owned: Vec<Option<Array2<f64>>> = inner
+            .duchon_centers
+            .iter()
+            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
+            .collect::<PyResult<_>>()?;
+        let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
+        let fisher_owned: Option<Array3<f64>> = inner
+            .fisher_factors
+            .as_ref()
+            .map(|f| manifold_sae_owned3(f))
+            .transpose()?;
+        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
+        let basis_sizes: Vec<usize> =
+            inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
+        // Exact mirror of the Python steer's per-kind n_harmonics gate:
+        // `int(h) if bk in {"periodic", "torus"} else None` (case-sensitive) — a
+        // looser (e.g. lowercased) predicate would diverge the rebuilt basis.
+        let n_harm: Vec<Option<usize>> = inner
+            .basis_kinds
+            .iter()
+            .zip(&inner.n_harmonics)
+            .map(|(kind, &h)| {
+                if kind == "periodic" || kind == "torus" {
+                    Some(h.max(0) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            decoder_owned.iter().map(|a| a.view()).collect();
+        let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            coord_owned.iter().map(|a| a.view()).collect();
+        let fisher_view = fisher_owned.as_ref().map(|a| a.view());
+        let plan = steer_delta_from_arrays(
+            atom_k,
+            t_from.as_array(),
+            t_to.as_array(),
+            n_obs,
+            p_out,
+            &inner.basis_kinds,
+            &atom_dim,
+            &decoder_views,
+            &duchon_owned,
+            &n_harm,
+            &basis_sizes,
+            &coord_views,
+            logits_owned.view(),
+            inner.assignment.as_str(),
+            inner.tau,
+            inner.alpha,
+            inner.jumprelu_threshold,
+            fisher_view,
+            inner.fisher_provenance.as_deref(),
+        )?;
+        steer_plan_to_pydict(py, plan)
     }
 
     // --- dense numeric getters -------------------------------------------
