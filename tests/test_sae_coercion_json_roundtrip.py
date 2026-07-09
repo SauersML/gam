@@ -70,3 +70,17 @@ def test_json_roundtrip_preserves_int_vs_float():
 def test_json_roundtrip_numpy_int_scalar_is_int():
     got = _roundtrip(np.int64(5))
     assert got == 5 and isinstance(got, int)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_json_roundtrip_nonfinite_maps_to_none(bad):
+    # Explicit NaN/Inf policy (#2091): serde_json::Value cannot hold non-finite,
+    # and the json.dumps->from_json path rejects the bare NaN/Infinity literals,
+    # so the helper Nulls a non-finite value rather than erroring or laundering
+    # it inconsistently. Pinned here so the policy is asserted, not assumed.
+    assert _roundtrip(bad) is None
+
+
+def test_json_roundtrip_nonfinite_inside_dict_maps_to_none():
+    got = _roundtrip({"finite": 1.5, "bad": float("nan")})
+    assert got == {"finite": 1.5, "bad": None}

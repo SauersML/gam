@@ -28,17 +28,31 @@ use serde_json::Value;
 /// arrays, and JSON scalars pass through. `bool` is checked before `int`
 /// (Python `bool` subclasses `int`), and `int` before `float` so an integral
 /// value serializes as a JSON integer, matching `json.dumps`.
+///
+/// NaN / +-Inf policy (explicit, #2091): a non-finite `f64` maps to
+/// `Value::Null`. `serde_json::Value` provably cannot represent non-finite
+/// numbers (`Number::from_f64` returns `None`), and the existing
+/// `ManifoldSaeCore::new` path (Python `json.dumps` -> `ManifoldSaePayload::from_json`)
+/// rejects the bare `NaN` / `Infinity` literals `json.dumps` emits (serde_json's
+/// parser errors), so a non-finite report value has never round-tripped through
+/// the Rust schema at all. Nulling it (rather than erroring) keeps a fit whose
+/// diagnostics carry a meaningless non-finite value loadable instead of failing
+/// the whole build; the `json_value_cannot_hold_nonfinite_*` test pins both the
+/// schema limitation and the parser rejection so the policy is asserted, not
+/// assumed.
 pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
-    if let Ok(b) = obj.downcast::<PyBool>() {
+    if let Ok(b) = obj.cast::<PyBool>() {
         return Ok(Value::Bool(b.is_true()));
     }
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(Value::Number(i.into()));
     }
     if let Ok(f) = obj.extract::<f64>() {
+        // Non-finite (NaN / +-Inf) -> Null: `from_f64` returns `None`, matching
+        // the schema's inability to hold non-finite (see the fn doc-comment).
         return Ok(serde_json::Number::from_f64(f)
             .map(Value::Number)
             .unwrap_or(Value::Null));
@@ -46,7 +60,7 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
     }
-    if let Ok(dict) = obj.downcast::<PyDict>() {
+    if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
             // Mirror `_jsonable`'s `str(k)` key coercion.
@@ -64,14 +78,14 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         let listed = obj.call_method0("tolist")?;
         return py_any_to_json_value(&listed);
     }
-    if let Ok(seq) = obj.downcast::<PyList>() {
+    if let Ok(seq) = obj.cast::<PyList>() {
         let mut arr = Vec::with_capacity(seq.len());
         for item in seq.iter() {
             arr.push(py_any_to_json_value(&item)?);
         }
         return Ok(Value::Array(arr));
     }
-    if let Ok(seq) = obj.downcast::<PyTuple>() {
+    if let Ok(seq) = obj.cast::<PyTuple>() {
         let mut arr = Vec::with_capacity(seq.len());
         for item in seq.iter() {
             arr.push(py_any_to_json_value(&item)?);
@@ -271,5 +285,20 @@ mod manifold_sae_coercion_tests {
         assert!(
             periodic_shape_band_reorder(Some(coords), Some(array![1.0, 2.0]), None).is_err()
         );
+    }
+
+    #[test]
+    fn json_value_cannot_hold_nonfinite_and_parser_rejects_nan() {
+        // Pins the existing-path behavior py_any_to_json_value's NaN/Inf policy
+        // matches: serde_json::Value cannot represent non-finite numbers, and the
+        // json.dumps -> ManifoldSaePayload::from_json path rejects the bare
+        // `NaN` / `Infinity` literals json.dumps emits, so a non-finite report
+        // value never round-trips through the Rust schema -> the helper Nulls it.
+        assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+        assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+        assert!(serde_json::Number::from_f64(f64::NEG_INFINITY).is_none());
+        assert!(serde_json::from_str::<Value>("NaN").is_err());
+        assert!(serde_json::from_str::<Value>("Infinity").is_err());
+        assert!(serde_json::from_str::<Value>("-Infinity").is_err());
     }
 }
