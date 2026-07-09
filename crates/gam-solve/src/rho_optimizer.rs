@@ -66,7 +66,7 @@ pub use capability::*;
 // nothing else and was dead). The oracle is audit-only, never on the math path.
 pub use fd_audit::{OuterGradientFdAudit, OuterGradientFdComponent, outer_gradient_fd_audit}; // fd-ok: audit-only oracle, not in the math path
 pub use gam_problem::{HessianResult, OuterEval};
-pub use hessian_operator::*;
+pub(crate) use hessian_operator::*;
 pub use objective::*;
 pub(crate) use run::*;
 // Re-export the outer-problem driver at `pub` (not just `pub(crate)`) so the
