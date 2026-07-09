@@ -207,11 +207,17 @@ pub fn alo_elpd(
     let pointwise = loglik_loo.to_owned();
     let elpd: f64 = pointwise.iter().sum();
     let mean = elpd / n as f64;
-    let var = pointwise
-        .iter()
-        .map(|&p| (p - mean) * (p - mean))
-        .sum::<f64>()
-        / n as f64;
+    // SE of the sum of n pointwise contributions: √(n·s²) with the unbiased
+    // sample variance (denominator n−1). Undefined for a single observation.
+    let var = if n > 1 {
+        pointwise
+            .iter()
+            .map(|&p| (p - mean) * (p - mean))
+            .sum::<f64>()
+            / (n - 1) as f64
+    } else {
+        f64::NAN
+    };
     let se = (n as f64 * var).sqrt();
     Some(AloElpd {
         elpd,
@@ -255,7 +261,13 @@ pub fn compare(a: &ModelComparison, b: &ModelComparison) -> ComparisonReport {
             let diff: Array1<f64> = &la.pointwise - &lb.pointwise;
             let delta_elpd: f64 = diff.iter().sum();
             let mean = delta_elpd / n as f64;
-            let var = diff.iter().map(|&d| (d - mean) * (d - mean)).sum::<f64>() / n as f64;
+            // Unbiased sample variance (n−1) of the paired differences; the SE
+            // of the summed difference is √(n·s²).
+            let var = if n > 1 {
+                diff.iter().map(|&d| (d - mean) * (d - mean)).sum::<f64>() / (n - 1) as f64
+            } else {
+                f64::NAN
+            };
             ComparisonReport {
                 delta_elpd,
                 delta_elpd_se: (n as f64 * var).sqrt(),
@@ -596,6 +608,46 @@ mod tests {
         assert!((rep.delta_elpd - 4.0).abs() < 1e-12);
         assert!((rep.delta_aic_corrected + 4.0).abs() < 1e-12);
         assert!(rep.delta_elpd_se.abs() < 1e-12);
+    }
+
+    #[test]
+    fn alo_elpd_se_uses_unbiased_sample_variance() {
+        // Pointwise contributions (0, 2): mean 1, sample variance s² = 2
+        // (denominator n−1 = 1), so SE(Σ) = √(n·s²) = √4 = 2. The population
+        // variance (denominator n) would give √2 instead.
+        let ll: Array1<f64> = array![0.0, 2.0];
+        let loo = alo_elpd(ll.view(), ll.view()).expect("alo elpd");
+        assert!((loo.se - 2.0).abs() < 1e-12, "se = {}", loo.se);
+    }
+
+    #[test]
+    fn compare_se_uses_unbiased_sample_variance_of_paired_differences() {
+        let mk = |pw: Array1<f64>| ModelComparison {
+            log_lik: 0.0,
+            edf: CorrectedEdf {
+                conditional: 0.0,
+                corrected: 0.0,
+            },
+            aic_conditional: 0.0,
+            aic_corrected: 0.0,
+            loo: Some(AloElpd {
+                elpd: pw.iter().sum(),
+                se: 0.0,
+                pointwise: pw,
+                k_hat_max: 0.1,
+                n_k_bad: 0,
+            }),
+        };
+        // Paired differences (0, 2): s² = 2, SE(Σ diff) = √(2·2) = 2.
+        let a = mk(array![0.0, 2.0]);
+        let b = mk(array![0.0, 0.0]);
+        let rep = compare(&a, &b);
+        assert!(rep.rows_aligned);
+        assert!(
+            (rep.delta_elpd_se - 2.0).abs() < 1e-12,
+            "se = {}",
+            rep.delta_elpd_se
+        );
     }
 
     #[test]
