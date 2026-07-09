@@ -752,23 +752,16 @@ impl SaeManifoldTerm {
         // independent), so toggling atom `k` on (`s=0`) and the rest off
         // (`exp(s)→0`) reads off `C_k`.
         let saved: Vec<f64> = self.atoms.iter().map(|a| a.log_amplitude).collect();
-        // Monotone safeguard: the amplitude LSQ is optimal for the frozen unit-B
-        // designs, but the retraction↔amplitude↔Newton alternation is not
-        // guaranteed contractive, so the update can make the reconstruction WORSE.
-        // Bank the pre-solve data-fit and revert if the update degrades it
-        // (keep-best, exactly like the #1026 incumbent restore), so the cone-atom
-        // can never regress a fit that was recovering. CRITICAL (team-lead
-        // #1939): the banked objective is the fit's OWN weighted reconstruction
-        // data-fit `data_fit_for_reconstruction` (per-row RowMetric whitening +
-        // #991 design-honesty row weights), NOT a raw unweighted EV — a raw EV is
-        // a parallel re-derivation that diverges from what the fit minimises under
-        // a whitening / row-weighted metric and mis-fires the guard (the −151 /
-        // whitened_k2 regression class). The retraction is magnitude-neutral, so
-        // this reconstruction is the pre-retraction one. Lower data-fit is better.
-        let df_before = self
-            .try_fitted_for_rho(rho)
-            .and_then(|recon| self.data_fit_for_reconstruction(target, recon.view()))
-            .unwrap_or(f64::INFINITY);
+        // Monotone safeguard: the penalized amplitude solve is optimal for the
+        // frozen unit-B designs, but the retraction↔amplitude↔Newton alternation is
+        // not guaranteed contractive, so the update can make the PENALIZED objective
+        // worse. Bank the pre-solve state and revert if the update degrades it
+        // (keep-best, exactly like the #1026 incumbent restore) so the cone-atom can
+        // never regress a fit that was recovering. The banked objective is the fit's
+        // OWN weighted reconstruction data-fit PLUS the #1939 amplitude priors (ARD
+        // evidence + SCAD), assembled in whitened units below from the same Gram the
+        // solve minimises — never a raw unweighted EV (the −151 / whitened_k2
+        // divergence class). The retraction is magnitude-neutral.
         const OFF: f64 = -700.0; // exp(-700) underflows to 0: contribution off.
         let mut designs: Vec<Array2<f64>> = Vec::with_capacity(k);
         let mut probe_err: Option<String> = None;
@@ -811,6 +804,14 @@ impl SaeManifoldTerm {
         let n = target.nrows();
         let mut gram = Array2::<f64>::zeros((k, k));
         let mut rhs = Array1::<f64>::zeros(k);
+        // Whitened target energy `tt = ‖W·target‖²_w` and whitened residual
+        // dof-count `n_w` accumulated alongside the Gram: together with `(G, r)`
+        // they give the whitened RSS at any `β` in closed form,
+        // `RSS(β) = tt − 2 r·β + βᵀGβ`, which the #1939 SCAD threshold reads to
+        // set its noise scale `σ̂² = RSS(β̂_ls)/(n_w − k)` (see the penalized solve
+        // below). Pure book-keeping; the historical Gram/rhs are untouched.
+        let mut tt = 0.0_f64;
+        let mut n_w = 0usize;
         // Per-row whitened design/target rows reused across the K(K+1)/2 + K dot
         // products (K small); rank-length under a factored metric, p under None.
         let mut wdesign: Vec<Vec<f64>> = vec![Vec::new(); k];
@@ -829,6 +830,8 @@ impl SaeManifoldTerm {
                 }
             };
             let wtarget = whiten_row(target.row(row));
+            tt += wtarget.iter().map(|&x| x * x).sum::<f64>();
+            n_w += wtarget.len();
             for kk in 0..k {
                 wdesign[kk] = whiten_row(designs[kk].row(row));
             }
@@ -863,34 +866,263 @@ impl SaeManifoldTerm {
         for j in 0..k {
             gram[[j, j]] += 1e-12 * scale;
         }
-        let raw = gram
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("optimize_log_amplitudes_closed_form: cholesky failed: {e}"))?
-            .solvevec(&rhs);
-        // Project to the non-negative orthant (guardrail: born atom takes only its
-        // residual-appropriate share; a negative optimum means the atom is off).
-        // For an already-non-negative optimum this is exact; where it clamps, the
-        // remaining atoms' share is re-absorbed on the next accepted-iterate solve.
+        // ---- #1939: penalized amplitude solve (default-on ARD evidence + SCAD) --
+        //
+        // The amplitude fit is not a bare least-squares. Two effects on the amplitude
+        // vector `β = exp(s)` are ALWAYS active — no flag, no env var — and both
+        // self-tune from the fit's own evidence/noise (magic-by-default):
+        //
+        //   * SCAD (Fan–Li) SELECTIVITY penalty `p_λ(β_k)` on each amplitude, with
+        //     canonical concavity `γ = 3.7` and a data-driven threshold
+        //     `λ = √(2 ln k)·σ̂·√((G⁻¹)_kk)_median` — the universal (BIC) scale from the
+        //     fit's own noise `σ̂` and the per-atom amplitude standard error. It is
+        //     evaluated in β-space, where its kink at `β = 0` gives genuine
+        //     shrink-to-EXACT-zero: a spurious small-amplitude atom is turned OFF
+        //     (its selection test `z_k ≤ λ` fires), while a well-supported large
+        //     amplitude sits in SCAD's flat tail (`β > γλ`) and is left UNBIASED.
+        //   * an EVIDENCE (ARD) prior on the log-amplitude of the SURVIVING atoms,
+        //     `log β_k ~ N(0, 1/α)`, whose precision `α` is chosen by the MacKay /
+        //     Fellner–Schall evidence fixed point `α ← γ_eff / Σ_k s_k²`,
+        //     `γ_eff = |A| − α·Σ Var(s_k)` (the number of well-determined active
+        //     amplitudes). It regularizes the INTENSITY SCALE of the present atoms —
+        //     evidence-selected, not a fixed hyperparameter — and is applied ONLY on
+        //     the active set (`β_k > 0`), so its log-space pull (which diverges as
+        //     `β → 0`) can never fight SCAD's zeroing of an absent atom.
+        //
+        // The solve runs in NOISE-WHITENED units `G̃ = G/σ̂²`, `r̃ = r/σ̂²` (σ̂² is the LS
+        // residual variance, estimated once from the warm start) so `α` is a genuine
+        // precision and `λ` is calibrated against a unit-variance data-fit — the
+        // textbook empirical-Bayes plug-in. As `σ̂² → 0` (noiseless fit) `λ → 0` and
+        // `α`'s pull vanishes against the diverging data curvature, so the solve
+        // reproduces the LS amplitude exactly. The engine is a non-negative
+        // SCAD-penalized coordinate descent (exact zeros through the per-coordinate
+        // threshold), with a 1-D Newton refining each ACTIVE amplitude under SCAD +
+        // ARD, and a monotone keep-best guard on the penalized objective.
         const AMP_FLOOR: f64 = 1.0e-12;
-        for atom_idx in 0..k {
-            let b = raw[atom_idx];
-            self.atoms[atom_idx].log_amplitude = if b.is_finite() && b > AMP_FLOOR {
-                b.ln()
+        const S_MIN: f64 = -27.631_021_115_928_547; // ln(AMP_FLOOR)
+        const S_MAX: f64 = 30.0; // exp(30) ≫ any physical amplitude
+        const SCAD_GAMMA: f64 = 3.7; // Fan–Li canonical concavity.
+        const ALPHA_MIN: f64 = 1.0e-8;
+        const ALPHA_MAX: f64 = 1.0e8;
+
+        // Warm start: the unpenalized whitened LS amplitude (the historical closed
+        // form) is where the SCAD noise scale is measured and the descent begins.
+        let chol = gram
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("optimize_log_amplitudes_closed_form: cholesky failed: {e}"))?;
+        let beta_ls = chol.solvevec(&rhs);
+        // σ̂² from the LS residual: `RSS = tt − 2 r·β̂ + β̂ᵀGβ̂`, and `Gβ̂ = r` ⇒
+        // `β̂ᵀGβ̂ = r·β̂`, so `RSS = tt − r·β̂`. Per whitened residual dof.
+        let rss_ls = (tt - rhs.dot(&beta_ls)).max(0.0);
+        let resid_dof = (n_w as f64 - k as f64).max(1.0);
+        let sigma2 = (rss_ls / resid_dof).max(1.0e-300);
+        let sigma = sigma2.sqrt();
+        // Noise-whitened data-fit system used by the descent and the evidence step.
+        let gt = &gram / sigma2;
+        let rt = &rhs / sigma2;
+
+        // Per-coordinate SCAD penalty coefficient. SCAD's `p_λ(β)` prices the
+        // coordinate GRADIENT `z_k = a_k·β̂_k` (its zeroing test is `z_k ≤ λ_k`), so to
+        // encode the universal rule "turn atom k OFF when its LS amplitude β̂_k is
+        // below `κ = √(2 ln k)` standard errors", the coefficient carries the local
+        // curvature `a_k = G̃_kk` and standard error `SE(β̂_k) = σ̂·√((G⁻¹)_kk)`:
+        //   λ_k = κ · a_k · SE(β̂_k) = κ · G̃_kk · σ̂ · √((G⁻¹)_kk).
+        // Then `β̂_k = z_k/a_k ≤ κ·SE ⟺ z_k ≤ λ_k` for ANY (non-standardized) Gram —
+        // a spurious atom whose amplitude is within noise is zeroed, a large one is
+        // far into SCAD's unbiased flat tail. `k = 1` has no multiple-comparison
+        // inflation ⇒ κ = √2.
+        let g_inv = chol.solve_mat(&Array2::<f64>::eye(k));
+        let kappa = (2.0 * (k as f64).max(2.0).ln()).sqrt();
+        let lam: Vec<f64> = (0..k)
+            .map(|j| kappa * gt[[j, j]] * sigma * g_inv[[j, j]].max(0.0).sqrt())
+            .collect();
+
+        // SCAD helpers in β at a per-coordinate coefficient `l` (the three Fan–Li
+        // regions), matching `log_amplitude_scad_energy`'s per-atom math; `p_l'(0⁺) =
+        // l` is the right-derivative that sets the selection threshold.
+        let scad_p = |b: f64, l: f64| -> f64 {
+            if !(b > 0.0) {
+                0.0
+            } else if b <= l {
+                l * b
+            } else if b <= SCAD_GAMMA * l {
+                (2.0 * SCAD_GAMMA * l * b - b * b - l * l) / (2.0 * (SCAD_GAMMA - 1.0))
             } else {
-                AMP_FLOOR.ln()
+                l * l * (SCAD_GAMMA + 1.0) / 2.0
+            }
+        };
+        let scad_dp = |b: f64, l: f64| -> f64 {
+            if b <= l {
+                l
+            } else if b <= SCAD_GAMMA * l {
+                (SCAD_GAMMA * l - b) / (SCAD_GAMMA - 1.0)
+            } else {
+                0.0
+            }
+        };
+        let scad_ddp = |b: f64, l: f64| -> f64 {
+            if b > l && b <= SCAD_GAMMA * l {
+                -1.0 / (SCAD_GAMMA - 1.0)
+            } else {
+                0.0
+            }
+        };
+
+        // Penalized objective (whitened data-fit + SCAD + ARD-on-active), the
+        // quantity the descent and the keep-best guard minimise.
+        let penalized_obj = |beta: &Array1<f64>, alpha: f64| -> f64 {
+            let mut e = 0.5 * beta.dot(&gt.dot(beta)) - rt.dot(beta);
+            for j in 0..k {
+                let b = beta[j];
+                e += scad_p(b, lam[j]);
+                if b > AMP_FLOOR {
+                    let s = b.ln();
+                    e += 0.5 * alpha * s * s;
+                }
+            }
+            e
+        };
+
+        // 1-D Newton for ONE active coordinate: minimise over `s = ln β` of
+        //   g(s) = ½ a e^{2s} − z e^s + p_l(e^s) + ½ α s²,
+        // with a GN-majorized positive curvature and a backtracking guard on g. Only
+        // called when the coordinate is active (`z > l`), so `β > 0` throughout and
+        // the ARD log term is well-defined.
+        let solve_active = |a: f64, z: f64, l: f64, alpha: f64, warm: f64| -> f64 {
+            let mut s = if warm > AMP_FLOOR {
+                warm.ln()
+            } else {
+                (z / a).max(AMP_FLOOR).ln()
+            }
+            .clamp(S_MIN, S_MAX);
+            let gval = |s: f64| -> f64 {
+                let b = s.clamp(S_MIN, S_MAX).exp();
+                0.5 * a * b * b - z * b + scad_p(b, l) + 0.5 * alpha * s * s
+            };
+            for _ in 0..40 {
+                let b = s.exp();
+                let dp = scad_dp(b, l);
+                let ddp = scad_ddp(b, l);
+                let grad = a * b * b - z * b + dp * b + alpha * s;
+                // GN majorizer: keep the guaranteed-positive data curvature 2aβ² and
+                // the ARD α; add the SCAD s-curvature only where positive.
+                let curv = (2.0 * a * b * b + (ddp * b * b + dp * b).max(0.0) + alpha).max(1e-300);
+                let dir = -grad / curv;
+                let g0 = gval(s);
+                let mut t = 1.0_f64;
+                let mut moved = false;
+                for _ in 0..40 {
+                    let sn = (s + t * dir).clamp(S_MIN, S_MAX);
+                    if gval(sn) <= g0 {
+                        s = sn;
+                        moved = true;
+                        break;
+                    }
+                    t *= 0.5;
+                }
+                if !moved || (t * dir).abs() < 1e-12 {
+                    break;
+                }
+            }
+            s.clamp(S_MIN, S_MAX).exp()
+        };
+
+        // Warm-start β from the whitened LS amplitude, projected non-negative.
+        let mut beta = Array1::<f64>::zeros(k);
+        for j in 0..k {
+            let b = beta_ls[j];
+            beta[j] = if b.is_finite() && b > 0.0 { b } else { 0.0 };
+        }
+        let mut alpha = 1.0_f64; // broad unit-variance prior; refined by evidence.
+        const MAX_OUTER: usize = 12;
+        const MAX_SWEEP: usize = 100;
+        const CD_TOL: f64 = 1.0e-10;
+        for _outer in 0..MAX_OUTER {
+            // SCAD-penalized non-negative coordinate descent (exact zeros).
+            for _sweep in 0..MAX_SWEEP {
+                let mut max_change = 0.0_f64;
+                for kk in 0..k {
+                    let a_k = gt[[kk, kk]];
+                    let old = beta[kk];
+                    if !(a_k > 0.0) {
+                        beta[kk] = 0.0;
+                        max_change = max_change.max(old.abs());
+                        continue;
+                    }
+                    // Partial residual correlation z = r̃_k − Σ_{j≠k} G̃_kj β_j.
+                    let mut z = rt[kk];
+                    for j in 0..k {
+                        if j != kk {
+                            z -= gt[[kk, j]] * beta[j];
+                        }
+                    }
+                    // Selection: β_k = 0 iff the SCAD right-derivative at 0 dominates
+                    // the data pull (z ≤ λ_k). ARD (log) is applied only when active,
+                    // so it never blocks the zeroing.
+                    let new = if z <= lam[kk] {
+                        0.0
+                    } else {
+                        solve_active(a_k, z, lam[kk], alpha, old)
+                    };
+                    beta[kk] = new;
+                    max_change = max_change.max((new - old).abs());
+                }
+                if max_change < CD_TOL {
+                    break;
+                }
+            }
+            // Evidence (MacKay) update of α from the ACTIVE log-amplitudes.
+            let mut active = 0usize;
+            let mut sum_s2 = 0.0_f64;
+            let mut sum_var = 0.0_f64;
+            for kk in 0..k {
+                let b = beta[kk];
+                if b > AMP_FLOOR {
+                    active += 1;
+                    let s = b.ln();
+                    sum_s2 += s * s;
+                    // Diagonal-Laplace posterior variance Var(s_k) ≈ 1/g''_k, the
+                    // local penalized curvature in s-space.
+                    let curv = 2.0 * gt[[kk, kk]] * b * b + alpha;
+                    if curv > 0.0 {
+                        sum_var += 1.0 / curv;
+                    }
+                }
+            }
+            if active == 0 {
+                break;
+            }
+            let gamma_eff = (active as f64 - alpha * sum_var).clamp(1.0e-6, active as f64);
+            let new_alpha = (gamma_eff / sum_s2.max(1.0e-12)).clamp(ALPHA_MIN, ALPHA_MAX);
+            let done = (new_alpha - alpha).abs() <= 1.0e-9 * alpha.max(1.0);
+            alpha = new_alpha;
+            if done {
+                break;
+            }
+        }
+        // Commit `s = ln β` (SCAD zeros → the amplitude floor).
+        for j in 0..k {
+            let b = beta[j];
+            self.atoms[j].log_amplitude = if b > AMP_FLOOR {
+                b.ln().clamp(S_MIN, S_MAX)
+            } else {
+                S_MIN
             };
         }
-        let df_after = self
-            .try_fitted_for_rho(rho)
-            .and_then(|recon| self.data_fit_for_reconstruction(target, recon.view()))
-            .unwrap_or(f64::INFINITY);
-        // Keep-best on the fit's own weighted data-fit (lower = better). Tolerance
-        // is relative to the incumbent so a benign round-off wobble is accepted but
-        // a genuine degradation reverts. `df_before` finite is guaranteed unless the
-        // entry reconstruction itself failed, in which case any finite `df_after`
-        // is an improvement over the +inf sentinel and is kept.
-        let tol = 1.0e-9 * df_before.abs().max(1.0);
-        if !(df_after <= df_before + tol) {
+        // Keep-best on the PENALIZED objective (NOT the bare data-fit: the accepted
+        // shrinkage raises the pure data-fit on purpose, so a data-fit-only guard
+        // would spuriously revert it). Compared at the converged (α, λ) in the same
+        // whitened units both sides share; the ½‖target‖² constant cancels.
+        let saved_beta = Array1::from(
+            saved
+                .iter()
+                .map(|&s| if s.is_finite() { s.exp() } else { 0.0 })
+                .collect::<Vec<_>>(),
+        );
+        let j_before = penalized_obj(&saved_beta, alpha);
+        let j_after = penalized_obj(&beta, alpha);
+        let tol = 1.0e-9 * j_before.abs().max(1.0);
+        if !(j_after <= j_before + tol) {
             for (j, atom) in self.atoms.iter_mut().enumerate() {
                 atom.log_amplitude = saved[j];
             }

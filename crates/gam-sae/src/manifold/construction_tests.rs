@@ -1356,6 +1356,101 @@ mod lever_wiring_2072_tests {
             "the PCA and data-row producers must differ at this offset; gap {ref_gap:e}"
         );
     }
+
+    /// #1939 — the DEFAULT-ON ARD/evidence prior on `log s_k` + SCAD-on-amplitude
+    /// penalty inside `optimize_log_amplitudes_closed_form`. A spurious atom whose
+    /// TRUE amplitude is zero (its only support is orthogonal-complement noise) is
+    /// shrunk to the amplitude FLOOR by SCAD's selection, while a genuine
+    /// large-amplitude atom is recovered essentially UNBIASED (it sits in SCAD's
+    /// flat tail; the evidence prior's log-shrinkage is negligible against the
+    /// strong data curvature). No flag toggles this — both effects are on by default
+    /// and self-tune from the fit's own evidence/noise.
+    #[test]
+    fn cone_amplitude_ard_scad_shrinks_spurious_atom_1939() {
+        let (mut term, _t, rho) = small_two_atom_periodic_term();
+        assert_eq!(term.k_atoms(), 2);
+        // Per-atom UNIT-amplitude designs C_k, read off the term's own
+        // reconstruction exactly as the solver's probe does (atom k on at s = 0, the
+        // rest off). This fixture installs no RowMetric / row-weight ⇒ the amplitude
+        // Gram is plain Euclidean over the flattened R^5 outputs (p = 1).
+        const OFF: f64 = -700.0;
+        let unit_design = |term: &mut SaeManifoldTerm, k: usize| -> Array2<f64> {
+            for (j, a) in term.atoms.iter_mut().enumerate() {
+                a.log_amplitude = if j == k { 0.0 } else { OFF };
+            }
+            term.try_fitted_for_rho(&rho).expect("unit design")
+        };
+        let c0 = unit_design(&mut term, 0);
+        let c1 = unit_design(&mut term, 1);
+        let v0: Vec<f64> = c0.iter().copied().collect();
+        let v1: Vec<f64> = c1.iter().copied().collect();
+        let n = v0.len();
+        let dot = |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+
+        // ε in the ORTHOGONAL COMPLEMENT of span(C0, C1) (Gram–Schmidt): it perturbs
+        // neither atom's least-squares amplitude (β0_ls = 8, β1_ls = 0 EXACTLY) yet
+        // supplies a nonzero residual variance σ̂² > 0 for the evidence/SCAD scales to
+        // read — so atom 1 is a genuinely SPURIOUS (zero-amplitude) atom that only
+        // noise could support.
+        let mut eps = vec![0.30, -0.22, 0.18, -0.26, 0.11];
+        assert_eq!(eps.len(), n);
+        for basis in [&v0, &v1] {
+            let bb = dot(basis, basis);
+            if bb > 0.0 {
+                let proj = dot(&eps, basis) / bb;
+                for i in 0..n {
+                    eps[i] -= proj * basis[i];
+                }
+            }
+        }
+        for basis in [&v0, &v1] {
+            assert!(
+                dot(&eps, basis).abs() < 1e-9,
+                "ε must be orthogonal to the atom designs"
+            );
+        }
+        assert!(
+            dot(&eps, &eps).sqrt() > 1e-2,
+            "ε must carry real residual energy so σ̂² > 0"
+        );
+
+        // Ground truth: atom 0 STRONG (β0 = 8), atom 1 ABSENT (β1 = 0). target =
+        // 8·C0 + ε.
+        const BETA0: f64 = 8.0;
+        let mut target = Array2::<f64>::zeros(c0.dim());
+        for (i, t) in target.iter_mut().enumerate() {
+            *t = BETA0 * v0[i] + eps[i];
+        }
+
+        // Neutral default state, then the production penalized amplitude solve.
+        term.atoms[0].log_amplitude = 0.0;
+        term.atoms[1].log_amplitude = 0.0;
+        term
+            .optimize_log_amplitudes_closed_form(target.view(), &rho)
+            .expect("penalized amplitude solve");
+        let b0 = term.atoms[0].log_amplitude.exp();
+        let b1 = term.atoms[1].log_amplitude.exp();
+
+        // (1) The true large amplitude is recovered essentially unbiased (SCAD leaves
+        //     β ≫ γλ untouched; the evidence prior barely moves it): within 15%.
+        assert!(
+            (b0 - BETA0).abs() <= 0.15 * BETA0,
+            "true large-amplitude atom must be preserved (β0 = {b0}, want ≈ {BETA0})"
+        );
+        // (2) The spurious atom (zero true amplitude, noise-only support below the
+        //     universal SCAD threshold) is driven to the amplitude floor — turned
+        //     OFF — not merely nudged.
+        assert!(
+            b1 < 1e-6,
+            "spurious zero-amplitude atom must be shrunk to the floor (β1 = {b1})"
+        );
+        // (3) The two verdicts are decisively separated.
+        assert!(
+            b0 / b1 > 1e6,
+            "true vs spurious amplitude must separate (ratio {})",
+            b0 / b1
+        );
+    }
 }
 
 #[cfg(test)]
