@@ -2834,7 +2834,32 @@ impl SaeManifoldTerm {
             return None;
         }
         let budget_plan = self.sparse_active_plan();
-        match (self.softmax_active_cap, budget_plan) {
+        // #2134 — the deployment `top_k` (`softmax_active_cap`) is a HARD fit-time
+        // truncation of the softmax RECONSTRUCTION, faithful in only two regimes:
+        //   * the FIXED-DECODER encode / OOS assembly, where the decoder is frozen
+        //     so the dictionary cannot co-collapse — this is the load-bearing
+        //     large-K compact-encode contract
+        //     (`large_k_softmax_compact_encode_is_o1_per_token_and_recovers_support`);
+        //   * the winner-take-all `cap == 1` (#2132): the top-1 truncation's
+        //     optimum coincides with a valid full-softmax state (`a_winner → 1`),
+        //     and installing it keeps the cold routing-refine seed and the
+        //     subsequent Arrow-Schur solve on the SAME support (the saddle escape).
+        //
+        // In the JOINT co-training fit with `cap >= 2`, nothing forces the softmax
+        // to concentrate onto exactly `top_k` atoms per row, so the truncated,
+        // NON-renormalized reconstruction `Σ_{k∈top_k} a_k B_k g_k` (formed
+        // identically by the compact assembly and the line-search objective) is a
+        // SUPPORT-DEPENDENT surrogate: the per-row top-k support flips across outer
+        // Newton iterations, the objective jumps at every re-selection, monotone
+        // descent breaks, and the dictionary co-collapses — the reported top_k>1
+        // divergence. Route joint `cap >= 2` through the memory-budget lever ALONE
+        // (faithful at large K where the softmax IS concentrated so the dropped
+        // mass is `O(a²)`; a no-op dense fit at small/moderate K) and apply `top_k`
+        // only as the post-fit projection. The winner-take-all cap and the
+        // fixed-decoder encode cap are unchanged.
+        let honor_user_cap = self.fixed_decoder_assembly || self.softmax_active_cap == Some(1);
+        let user_cap = self.softmax_active_cap.filter(|_| honor_user_cap);
+        match (user_cap, budget_plan) {
             (Some(cap), Some((budget_cap, cutoff))) => Some((cap.min(budget_cap), cutoff)),
             // Explicit cap only: retain exactly the top-`cap` atoms (no extra
             // magnitude cutoff beyond the cap).
@@ -3882,7 +3907,10 @@ impl SaeManifoldTerm {
             uncertified += result.encode_uncertified_count;
             // Decode the amortized coords: Φ_k(t̂) is (n × M_k); B_k is (M_k × p).
             let (phi, _jac) = evaluator.evaluate(result.coords.view())?;
-            let decoded = phi.dot(&atom.decoder_coefficients); // (n × p)
+            // Decode `Φ_k(t̂) · B_k` (n×M · M×p) through the faer GEMM; small
+            // shapes fall back to `ndarray::dot` inside `fast_ab` (reduction
+            // order may differ, acceptable per the crate convention).
+            let decoded = fast_ab(&phi, &atom.decoder_coefficients); // (n × p)
             for row in 0..n {
                 let z = amplitudes[[row, atom_idx]];
                 if z == 0.0 {

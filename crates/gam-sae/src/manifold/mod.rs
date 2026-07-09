@@ -365,6 +365,9 @@ mod tests_cocollapse_disjoint_2027;
 mod tests_cocollapse_reseed_2089;
 
 #[cfg(test)]
+mod tests_topk_divergence_2134;
+
+#[cfg(test)]
 mod tests_outer_reml_probe_budget_2080;
 
 #[cfg(test)]
