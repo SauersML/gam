@@ -287,6 +287,39 @@ fn zz_measure_duchon_null_recovery_lambda_gap() {
     let cf_pred = xt.dot(&cf_beta).to_vec();
     let cf_dev = max_dev_from_mean(&cf_pred);
 
+    // #1815/#1867 SEED-PROBE (no-op forensics): reproduce the two analytic
+    // Gaussian closed-form seed CANDIDATES the outer prepass scores, to pin why
+    // the diagonal-seed fix (b26e1cfe9) was byte-identical. If both analytic
+    // seeds RAIL (ρ→bound, edf→null) while PROD parks at ~[7.5, 1.1], the seeds
+    // are not reaching the production outer optimizer for this fit route
+    // (wrong-entry: fit_from_formula builds its own OuterProblem, not the
+    // optimize_external_design prepass where the seeds live) — NOT a scoring or
+    // guard failure. `cyclic_rho` = the per-block Demmler–Reinsch seed
+    // (analytic_gaussian_closed_form_rho core); `cf.rho` broadcast = the
+    // single-λ summed diagonal seed (the b26e1cfe9 fix core).
+    let seed_blocks: Vec<gam_solve::gaussian_reml::GaussianRemlLambdaBlock> = train_design
+        .penalties
+        .iter()
+        .map(|bp| gam_solve::gaussian_reml::GaussianRemlLambdaBlock {
+            col_range: bp.col_range.clone(),
+            local: bp.local.view(),
+        })
+        .collect();
+    let cyclic_rho = gam_solve::gaussian_reml::gaussian_reml_cyclic_multi_lambda_rho(
+        x_dense.view(),
+        y_tr.view(),
+        &seed_blocks,
+        None,
+        &vec![0.0_f64; seed_blocks.len()],
+        (-30.0, 30.0),
+    )
+    .map(|r| r.to_vec());
+    eprintln!(
+        "  SEED-PROBE : per-block cyclic rho={cyclic_rho:?}  diagonal(summed-λ) rho={:.4} broadcast to {} blocks\n               (if both rail but PROD parks -> analytic seeds never reach this fit route; b26e1cfe9 wired the wrong optimizer entry)",
+        cf.rho,
+        seed_blocks.len(),
+    );
+
     // mgcv reference on the same fixture (predict on the grid; no truth signal).
     let (mgcv_edf, mgcv_sp, mgcv_pred) = mgcv_diag(&data, &x_test, 20);
 
