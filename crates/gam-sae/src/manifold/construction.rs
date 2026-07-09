@@ -3633,11 +3633,12 @@ impl SaeManifoldTerm {
         // The ARD precisions `α_a = exp(log_ard[k][a])` were stamped onto each atom
         // from the terminal rho at finalization (`canonicalize_charts_post_fit`), so
         // the encode adds the SAME coordinate prior gradient / Hessian / Lipschitz
-        // the fit used. The Euclidean amortized fast path is bypassed on this branch
-        // (its Euclidean certificate certifies neither the metric nor the prior
-        // objective); structured/prior fits are the regime where correctness
-        // dominates. Euclidean-metric, prior-free fits skip this branch entirely and
-        // take the amortized+certified cascade below bit-for-bit unchanged.
+        // the fit used. The distilled fast path is PRESERVED — the same
+        // amortized-then-certified cascade as the Euclidean branch, but both tiers
+        // certify under the objective (`*_with_objective`), so structured/prior fits
+        // keep the one-mat-vec encode without a broad slow-path regression.
+        // Euclidean-metric, prior-free fits (empty `log_ard`) skip this branch and
+        // take the cascade below bit-for-bit unchanged.
         let metric = self
             .row_metric
             .as_ref()
@@ -3645,7 +3646,7 @@ impl SaeManifoldTerm {
         let prior_active = self
             .atoms
             .iter()
-            .any(|a| a.ard_precisions.as_ref().map_or(false, |pa| !pa.is_empty()));
+            .any(|a| a.ard_precisions.as_ref().is_some_and(|pa| !pa.is_empty()));
         if metric.is_some() || prior_active {
             let (metric_rank, metric_norm_bound) = match metric {
                 Some(m) => {
@@ -3693,13 +3694,31 @@ impl SaeManifoldTerm {
                         prior_alpha,
                         metric_norm_bound,
                     };
-                    let (t, cert) = atlas.certified_encode_row_with_objective(
+                    let amp = amplitudes[[row, atom_idx]];
+                    // Same amortized-then-certified cascade as the Euclidean path,
+                    // both tiers certifying under the objective: the one-mat-vec
+                    // distilled predictor first, the certified IFT-warm-start Newton
+                    // encode only for rows it cannot certify.
+                    let (mut t, mut cert) = atlas.amortized_encode_row_with_objective(
                         &self.atoms[atom_idx],
                         atom_idx,
                         targets.row(row),
-                        amplitudes[[row, atom_idx]],
+                        amp,
                         &objective,
                     )?;
+                    if !cert.certified() {
+                        let (t_c, cert_c) = atlas.certified_encode_row_with_objective(
+                            &self.atoms[atom_idx],
+                            atom_idx,
+                            targets.row(row),
+                            amp,
+                            &objective,
+                        )?;
+                        if cert_c.certified() {
+                            t = t_c;
+                            cert = cert_c;
+                        }
+                    }
                     if cert.certified() {
                         coords[atom_idx].row_mut(row).assign(&t);
                         certified[atom_idx][row] = true;

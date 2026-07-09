@@ -2273,6 +2273,32 @@ impl EncodeAtlas {
         x: ArrayView1<'_, f64>,
         amplitude: f64,
     ) -> Result<(Array1<f64>, RowCertificate), String> {
+        // Euclidean, prior-free objective — bit-identical to the metric-free path.
+        self.amortized_encode_row_with_objective(
+            atom,
+            atom_index,
+            x,
+            amplitude,
+            &EncodeObjective::euclidean(),
+        )
+    }
+
+    /// [`Self::amortized_encode_row`] against the TRUE encode objective (F3): the
+    /// distilled predictor's warm start is Euclidean (its `A₁` is the Euclidean
+    /// Gauss–Newton block), but BOTH Kantorovich probes certify under the supplied
+    /// metric + prior objective, with the chart Lipschitz taken as the objective's
+    /// effective bound. So the fast path is preserved (one mat-vec warm start) while
+    /// the certificate — and therefore the trust/fallback decision — is honest about
+    /// the metric-and-prior objective the fit optimized. `EncodeObjective::euclidean`
+    /// reproduces the metric-free distilled path exactly.
+    pub fn amortized_encode_row_with_objective(
+        &self,
+        atom: &SaeManifoldAtom,
+        atom_index: usize,
+        x: ArrayView1<'_, f64>,
+        amplitude: f64,
+        objective: &EncodeObjective<'_>,
+    ) -> Result<(Array1<f64>, RowCertificate), String> {
         let atom_atlas = self
             .atoms
             .get(atom_index)
@@ -2310,6 +2336,12 @@ impl EncodeAtlas {
         let Some(t_hat) = amortized_warm_start(chart, x, amplitude) else {
             return Ok(uncertified());
         };
+        // Effective Kantorovich Lipschitz for the TRUE objective (F3): the stored
+        // Euclidean data-term bound scaled by the metric operator-norm bound plus
+        // the prior's third-derivative bound. Reduces to `chart.lipschitz` exactly
+        // for `EncodeObjective::euclidean`, so the metric-free distilled path is
+        // unchanged.
+        let lipschitz = objective.effective_lipschitz(atom, chart.lipschitz);
         // Evaluate the SAME Kantorovich certificate at the predicted start. The
         // amortized prediction is trusted only if this certificate holds AND an
         // independent cold chart-center probe certifies and agrees below the
@@ -2322,16 +2354,16 @@ impl EncodeAtlas {
             t_hat,
             x,
             amplitude,
-            chart.lipschitz,
+            lipschitz,
             self.config.newton_steps,
             chart.region.center.view(),
             chart.region.radius,
-            &EncodeObjective::euclidean(),
+            objective,
         )?
         else {
             return Ok((
                 Array1::<f64>::zeros(d),
-                uncertified_certificate(chart.lipschitz),
+                uncertified_certificate(lipschitz),
             ));
         };
 
@@ -2342,16 +2374,16 @@ impl EncodeAtlas {
             cold_start,
             x,
             amplitude,
-            chart.lipschitz,
+            lipschitz,
             self.config.newton_steps,
             chart.region.center.view(),
             chart.region.radius,
-            &EncodeObjective::euclidean(),
+            objective,
         )?
         else {
             return Ok((
                 amortized_probe.coord,
-                uncertified_certificate(chart.lipschitz),
+                uncertified_certificate(lipschitz),
             ));
         };
 
@@ -2361,7 +2393,7 @@ impl EncodeAtlas {
         if !(gap.is_finite() && gap <= tolerance) {
             return Ok((
                 amortized_probe.coord,
-                uncertified_certificate(chart.lipschitz),
+                uncertified_certificate(lipschitz),
             ));
         }
         // F5: return the certificate at the refined landing coordinate
