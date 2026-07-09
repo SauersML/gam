@@ -1184,11 +1184,7 @@ fn fit_penalized_multinomial_firth_fallback(
             Ok(result) => result,
             Err(never) => match never {},
         };
-        let accepted = accepted_step.is_some();
-        if let Some(step) = accepted_step {
-            beta = step.payload;
-        }
-        if !accepted {
+        let Some(accepted_step) = accepted_step else {
             // Backtracking exhausted 60 halvings without an admissible ascent
             // step. This is convergence ONLY if the iterate is already first-order
             // stationary; a line-search stall at a non-stationary point is a
@@ -1207,8 +1203,10 @@ fn fit_penalized_multinomial_firth_fallback(
             // singular Fisher information), i.e. a genuine stall → not converged.
             converged = 0.5 * decrement.abs() < tol_eff;
             break;
-        }
+        };
 
+        let step = accepted_step.step;
+        beta = accepted_step.payload;
         let max_step = step * delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         let scale = 1.0 + beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if max_step < tol_eff * scale {

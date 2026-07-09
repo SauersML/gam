@@ -5103,36 +5103,49 @@ impl SaeManifoldTerm {
                 // non-descent delta straight to proximal correction.
             }
 
-            let mut trial_step_size = step_size;
-            let mut accepted = false;
-            for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
-                if !descent_direction_ok {
-                    // No Armijo bound is meaningful along a non-descent
-                    // direction; route straight to the proximal correction.
-                    break;
-                }
-                if halving > 0 {
-                    // Reset to the pre-step state before re-applying at the
-                    // halved step. The first trial starts from the pre-step
-                    // state already, so the restore is only needed after a
-                    // rejected trial mutated `self`.
-                    self.restore_mutable_state(&snapshot)?;
-                }
-                let trial_result = self
-                    .apply_newton_step(delta_ext_coord.view(), delta_beta.view(), trial_step_size)
-                    .and_then(|()| {
-                        self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                    });
-                if let Ok(post_step_total) = trial_result {
-                    let armijo_bound = pre_step_total
-                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                    if post_step_total.is_finite() && post_step_total <= armijo_bound {
-                        accepted = true;
-                        break;
-                    }
-                }
-                trial_step_size *= 0.5;
-            }
+            // No Armijo bound is meaningful along a non-descent direction, so
+            // the whole line search is gated on `descent_direction_ok` and a
+            // non-descent delta routes straight to the proximal correction.
+            // Each trial re-applies the Newton step from the pre-step
+            // `snapshot` (reset-before-reapply after the first trial); a trial
+            // whose step application or objective evaluation errors is INVALID
+            // (`Ok(None)`), halving without consulting the Armijo test.
+            let mut first_trial = true;
+            let accepted = descent_direction_ok
+                && backtracking_line_search(
+                    BacktrackConfig {
+                        initial_step: step_size,
+                        max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
+                        ..BacktrackConfig::default()
+                    },
+                    |trial_step_size| {
+                        if !std::mem::take(&mut first_trial) {
+                            self.restore_mutable_state(&snapshot)?;
+                        }
+                        Ok(self
+                            .apply_newton_step(
+                                delta_ext_coord.view(),
+                                delta_beta.view(),
+                                trial_step_size,
+                            )
+                            .and_then(|()| {
+                                self.penalized_objective_total(
+                                    target,
+                                    rho,
+                                    analytic_penalties,
+                                    1.0,
+                                )
+                            })
+                            .ok()
+                            .map(|post_step_total| (post_step_total, ())))
+                    },
+                    |trial_step_size, post_step_total| {
+                        let armijo_bound = pre_step_total
+                            - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
+                        post_step_total.is_finite() && post_step_total <= armijo_bound
+                    },
+                )?
+                .is_some();
             if !accepted {
                 self.restore_mutable_state(&snapshot)?;
                 let correction = ArrowProximalCorrectionOptions {
