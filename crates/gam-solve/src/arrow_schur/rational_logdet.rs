@@ -1004,6 +1004,96 @@ mod tests {
     }
 
     #[test]
+    fn deflation_wide_kappa_variance_vs_bias_multiseed() {
+        // #2080 DEFINITIVE variance-vs-bias split for the wide-κ "10% low" verdict.
+        //
+        // The sibling `..._cg_convergence_discriminator` proves the residual is NOT
+        // CG error (loose/tight/EXACT-Cholesky arms are byte-identical) and reports
+        // gap ≈ 5.85 = 0.6σ against a std_err of 9.25 (≈16% of |logdet|=57.4). A
+        // SINGLE-seed draw at 0.6σ cannot distinguish a structural split/quadrature
+        // BIAS from an unlucky Hutchinson VARIANCE draw — the two have completely
+        // different production fixes (fresh derivation vs. more probes / deeper
+        // deflation / a control variate). This test settles it by AVERAGING the
+        // estimate over K independent probe seeds while holding the deterministic
+        // pieces fixed:
+        //   • frozen Q (seed 555, rank 16) — term1 = tr(Qᵀ log(S/c) Q) is IDENTICAL
+        //     across seeds, so it drops out of the seed-to-seed spread;
+        //   • EXACT Cholesky solves — zero CG error, as the sibling established;
+        //   • only the 32 Rademacher probes (and thus term2's Hutchinson draw) vary.
+        // Hutchinson is UNBIASED over Rademacher probes, so
+        //   E_seed[estimate] = k·log c + term1 + E_seed[term2]
+        //                    → k·log c + tr_quad(Qᵀ·Q) + tr_quad(P·P)
+        //                    = the QUADRATURE approximation of tr log S.
+        // Hence bias_of_mean isolates the DETERMINISTIC (split+quadrature) error
+        // with the Hutchinson variance averaged away as 1/√K. Verdict:
+        //   |mean − logdet| ≲ 3·se_mean  ⇒  VARIANCE-dominated: the split+quadrature
+        //     are unbiased at κ=1e8; the fix is variance reduction (more probes,
+        //     deeper deflation rank, or a control variate), NOT a re-derivation.
+        //   |mean − logdet| ≫ se_mean    ⇒  a genuine deterministic bias remains
+        //     (quadrature under-resolution or a split defect) → derivation work.
+        let dim = 96;
+        let mut state = 2026u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -4.0, 4.0)))
+            .collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 4321);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+
+        // Fixed frozen Q (identical to the sibling's), varied ONLY by probe seed.
+        let k_seeds = 96usize;
+        let mut ests = Vec::with_capacity(k_seeds);
+        let mut internal_bars = Vec::with_capacity(k_seeds);
+        for s in 0..k_seeds {
+            let plan = RationalLogdetPlan::build(dim, 32, 9000 + s as u64, lmin, lmax, 1e-9)
+                .expect("plan")
+                .with_deflation(&matvec, 16, 3, 555);
+            let e = evaluate_exact(&plan, &a);
+            ests.push(e.estimate);
+            internal_bars.push(e.std_err);
+        }
+        let n = ests.len() as f64;
+        let mean = ests.iter().sum::<f64>() / n;
+        let var = ests.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let sd = var.sqrt();
+        let se_mean = sd / n.sqrt();
+        let mean_internal_bar = internal_bars.iter().sum::<f64>() / n;
+        let bias = mean - logdet;
+        let bias_frac = bias.abs() / logdet.abs().max(1.0);
+        let bias_sigma = bias.abs() / se_mean.max(1e-300);
+        eprintln!(
+            "wide-κ variance-vs-bias ({k_seeds} seeds, fixed Q, EXACT solves): exact={logdet:.6}\n  \
+             mean={mean:.6}  bias={bias:+.6} ({bias_frac:.3e} rel, {bias_sigma:.2}σ of the mean)\n  \
+             seed-to-seed sd={sd:.4}  se_mean={se_mean:.4}  ⟨internal std_err⟩={mean_internal_bar:.4}\n  \
+             VERDICT: {}",
+            if bias_sigma < 3.0 {
+                "VARIANCE-dominated — split+quadrature UNBIASED at κ=1e8; fix = variance reduction (probes/rank/control-variate), NOT re-derivation"
+            } else {
+                "genuine DETERMINISTIC bias survives probe-averaging — quadrature/split derivation work needed"
+            }
+        );
+        // Cross-check: the internal per-eval Hutchinson bar must PREDICT the
+        // observed seed-to-seed spread (both estimate the same term2 variance);
+        // a gross mismatch would mean the reported std_err is itself miscalibrated.
+        assert!(
+            (mean_internal_bar / sd).ln().abs() < 1.0,
+            "internal std_err ({mean_internal_bar:.3}) must track the empirical seed spread ({sd:.3}) \
+             within a factor e; a mismatch means the surrogate's error bar is miscalibrated"
+        );
+        // The definitive verdict for #2080's deflation lane: with the split and
+        // quadrature deterministic and solves exact, the probe-averaged estimate is
+        // an UNBIASED estimator of tr log S. If this holds, the single-seed "10%"
+        // is variance and the sibling discriminator's STRUCTURAL framing is too
+        // strong — the production lever is variance reduction, not a new derivation.
+        assert!(
+            bias_sigma < 3.0 || bias_frac < 0.02,
+            "probe-averaged estimate is biased by {bias:+.4} ({bias_frac:.3e} rel, {bias_sigma:.2}σ): \
+             deterministic split/quadrature bias survives — genuine derivation work, not variance"
+        );
+    }
+
+    #[test]
     fn deflated_directional_derivative_matches_fd_of_surrogate() {
         // The value↔gradient no-desync contract WITH deflation: the fixed-Q
         // directional derivative is the exact derivative of the surrogate value
