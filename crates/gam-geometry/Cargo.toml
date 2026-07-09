@@ -15,5 +15,6 @@ faer = "0.24.0"
 libm = "0.2.16"
 gam-linalg = { path = "../gam-linalg", version = "=0.3.148" }
 gam-math = { path = "../gam-math", version = "=0.3.148" }
+gam-optimize = { path = "../gam-optimize", version = "=0.3.148" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 wide = "0.7"

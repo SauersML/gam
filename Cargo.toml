@@ -38,6 +38,7 @@ members = [
     "crates/gam-data",
     "crates/gam-spec",
     "crates/gam-linalg",
+    "crates/gam-optimize",
     "crates/gam-geometry",
     "crates/gam-model-api",
     "crates/gam-gpu",
