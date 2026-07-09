@@ -926,6 +926,12 @@ impl SaeManifoldTerm {
     /// dense channel for it) rather than silently double-adding the correction on an
     /// undeflated block. On the plain regime the correction term is identically
     /// zero, so the two paths agree exactly — the FD gate's acceptance.
+    ///
+    /// BOUNDARY (#2080): for the surrogate to OWN a deflated-row dense fit, the
+    /// lane would have to emit a DEFLATED reduced-Schur `S⁻¹` bundle (so the
+    /// reformulated block is the deflated inverse the correction expects) — a
+    /// separate design step, taken only if we ever route the deflated regime
+    /// matrix-free. Until then, deflated rows stay on the dense channel.
     pub(crate) fn ard_log_precision_hessian_trace_from_probes(
         &self,
         rho: &SaeManifoldRho,
