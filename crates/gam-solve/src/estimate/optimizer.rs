@@ -1436,7 +1436,6 @@ where
             // below. Unsupported, uncorrelated terms are left alone so the
             // whole-term shrink-out can still select them out at the rail.
             {
-                const NULLSPACE_DEGENERACY_RHO_CEILING: f64 = 21.0;
                 const CONCURVITY_COLUMN_CORR: f64 = 0.2;
                 if n_design_rows >= 2 * p
                     && let gam_problem::RhoPrior::Independent(per_coord) =
@@ -1726,39 +1725,43 @@ where
                             groups.push(group);
                         }
                     }
-                    // Moderate over-smoothing band: high enough to remove a genuinely
-                    // unsupported smooth, but strictly below the λ-explosion rail
-                    // (`RHO_BOUND` = 30) where total EDF saturates numerically. The
-                    // empirical separation between a real #1266 shrink-out and a
-                    // #1476 concurvity ridge is wide and clean inside [15, 21].
-                    const SHRINK_BAND: [f64; 3] = [15.0, 18.0, 21.0];
+                    // Continuous over-smoothing search, capped strictly below the
+                    // λ-explosion rail (`RHO_BOUND` = 30, where total EDF saturates
+                    // numerically) at the same moderate ceiling the #1860/#1476
+                    // rail guard uses. Raising every coordinate of the group to a
+                    // COMMON target level parameterizes the whole-term shrink-out
+                    // by one displacement `t`: level = start + t with `start` the
+                    // group's current maximum ρ, so every probe strictly raises at
+                    // least one coordinate and the grid-free bracketing search
+                    // covers the entire moderate band.
                     let mut best_rho = strategy_result.rho.clone();
                     let mut best_pure = base_pure;
                     let mut best_edf = edf_conv;
                     let mut improved = false;
-                    for group in &groups {
-                        // Warm pure-REML screen over the band; remember the
-                        // most-improving level for this group.
-                        let mut group_best: Option<(Array1<f64>, f64)> = None;
-                        for &lvl in &SHRINK_BAND {
-                            let mut probe = best_rho.clone();
-                            let mut raised = false;
-                            for &i in group {
-                                if lvl > probe[i] + 1e-9 {
-                                    probe[i] = lvl;
-                                    raised = true;
-                                }
-                            }
-                            if !raised {
-                                continue;
-                            }
-                            if let Some(c) = pure_reml(&probe)
-                                && c < best_pure - 1e-6 * (1.0 + best_pure.abs())
-                                && group_best.as_ref().is_none_or(|(_, gp)| c < *gp)
-                            {
-                                group_best = Some((probe, c));
+                    let raise_group_to = |base: &Array1<f64>, coords: &[usize], lvl: f64| {
+                        let mut probe = base.clone();
+                        for &i in coords {
+                            if lvl > probe[i] {
+                                probe[i] = lvl;
                             }
                         }
+                        probe
+                    };
+                    for group in &groups {
+                        // Warm pure-REML screen along the group direction; the
+                        // continuous search returns the most-improving level.
+                        let start = group
+                            .iter()
+                            .map(|&i| best_rho[i])
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let t_max = NULLSPACE_DEGENERACY_RHO_CEILING - start;
+                        let base = best_rho.clone();
+                        let mut eval =
+                            |t: f64| pure_reml(&raise_group_to(&base, group, start + t));
+                        let group_best: Option<(Array1<f64>, f64)> =
+                            continuous_directional_descent(&mut eval, t_max, best_pure).map(
+                                |(t_best, c)| (raise_group_to(&base, group, start + t_best), c),
+                            );
                         // COLD-confirm the group's best candidate on BOTH axes (the
                         // warm probes ran off each other's inner warm starts — the
                         // #1074 lesson): pure REML strictly down AND total EDF not up.
@@ -1817,26 +1820,23 @@ where
                         if primary_coords.is_empty() {
                             continue;
                         }
-                        let mut group_best: Option<(Array1<f64>, f64)> = None;
-                        for &lvl in &SHRINK_BAND {
-                            let mut probe = best_rho.clone();
-                            let mut raised = false;
-                            for &i in &primary_coords {
-                                if lvl > probe[i] + 1e-9 {
-                                    probe[i] = lvl;
-                                    raised = true;
-                                }
-                            }
-                            if !raised {
-                                continue;
-                            }
-                            if let Some(c) = pure_reml(&probe)
-                                && c < best_pure - 1e-6 * (1.0 + best_pure.abs())
-                                && group_best.as_ref().is_none_or(|(_, gp)| c < *gp)
-                            {
-                                group_best = Some((probe, c));
-                            }
-                        }
+                        // Same continuous search as the whole-term escape above,
+                        // restricted to the primary wiggliness coordinates and
+                        // capped at the same moderate ceiling.
+                        let start = primary_coords
+                            .iter()
+                            .map(|&i| best_rho[i])
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let t_max = NULLSPACE_DEGENERACY_RHO_CEILING - start;
+                        let base = best_rho.clone();
+                        let mut eval =
+                            |t: f64| pure_reml(&raise_group_to(&base, &primary_coords, start + t));
+                        let group_best: Option<(Array1<f64>, f64)> =
+                            continuous_directional_descent(&mut eval, t_max, best_pure).map(
+                                |(t_best, c)| {
+                                    (raise_group_to(&base, &primary_coords, start + t_best), c)
+                                },
+                            );
                         let Some((cand, _)) = group_best else {
                             continue;
                         };
