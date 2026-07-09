@@ -4881,7 +4881,7 @@ mod tests {
         let logdet_h: f64 = {
             use gam_problem::PseudoLogdetMode;
             use gam_solve::estimate::reml::reml_outer_engine::{
-                DenseSpectralOperator, HessianOperator,
+                DenseSpectralOperator, HessianFactorization,
             };
             let has_left_truncation = age_entry.iter().any(|&t| t > ENTRY_AT_ORIGIN_THRESHOLD);
             let mode = if has_left_truncation {

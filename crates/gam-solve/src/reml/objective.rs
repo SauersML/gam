@@ -1014,7 +1014,7 @@ impl<'a> RemlState<'a> {
         &self,
         pirls_result: &PirlsResult,
         ctx: DerivativeContext,
-        hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator>,
+        hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization>,
         beta: Array1<f64>,
         penalty_logdet: super::reml_outer_engine::PenaltyLogdetDerivs,
         nullspace_dim: f64,
@@ -1207,7 +1207,7 @@ impl<'a> RemlState<'a> {
         // and there is no design-moving axis to desync. The caller passes
         // `force_spectral_logdet = true` exactly when the outer vector carries a
         // design-moving ψ coordinate.
-        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator> = if mode
+        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = if mode
             == super::reml_outer_engine::EvalMode::ValueOnly
             && matches!(hessian_mode, PseudoLogdetMode::Smooth)
             && free_basis_opt.is_none()
@@ -1406,7 +1406,7 @@ impl<'a> RemlState<'a> {
         populate_inner_kkt: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{
-            HessianOperator, PenaltyLogdetDerivs, SparseCholeskyOperator,
+            HessianFactorization, PenaltyLogdetDerivs, SparseCholeskyOperator,
         };
         let sparse = bundle.sparse_exact.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput("missing sparse exact evaluation payload".to_string())
@@ -1415,7 +1415,7 @@ impl<'a> RemlState<'a> {
 
         let beta = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta.len();
-        let hessian_op: std::sync::Arc<dyn HessianOperator> = {
+        let hessian_op: std::sync::Arc<dyn HessianFactorization> = {
             let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
@@ -1631,7 +1631,7 @@ impl<'a> RemlState<'a> {
         // `build_dense_original_assembly` is only called when there is no
         // active constraint free-basis, so the no-hard-constraints condition
         // is always satisfied here.
-        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator> = {
+        let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::DenseCholeskyValueOnlyOperator;
             if mode == super::reml_outer_engine::EvalMode::ValueOnly
                 && matches!(hessian_mode, PseudoLogdetMode::Smooth)
@@ -2599,7 +2599,7 @@ impl<'a> RemlState<'a> {
         let mut inner_solution = assembly.build();
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
-        let inner_hessian_scale = super::reml_outer_engine::hessian_operator_geometric_scale(
+        let inner_hessian_scale = super::reml_outer_engine::hessian_factorization_geometric_scale(
             inner_solution.hessian_op.as_ref(),
         );
 

@@ -20,7 +20,7 @@ use gam::estimate::{
 };
 use gam::smooth::BlockwisePenalty;
 use gam::solver::estimate::reml::reml_outer_engine::{
-    DenseSpectralOperator, DispersionHandling, HessianOperator, InnerSolutionBuilder,
+    DenseSpectralOperator, DispersionHandling, HessianFactorization, InnerSolutionBuilder,
     PenaltyCoordinate, PenaltyLogdetDerivs, compute_efs_update, compute_hybrid_efs_update,
 };
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -496,7 +496,7 @@ fn build_gaussian_inner_solution(
     let op = DenseSpectralOperator::from_symmetric(&h).expect("SPD Hessian factorizes");
 
     let xty = ndarray::array![5.0, 3.0, 2.0];
-    let beta = HessianOperator::solve(&op, &xty);
+    let beta = HessianFactorization::solve(&op, &xty);
 
     let penalty_quad =
         lambdas[0] * beta.dot(&s1.dot(&beta)) + lambdas[1] * beta.dot(&s2.dot(&beta));
@@ -521,7 +521,7 @@ fn build_gaussian_inner_solution(
         penalty_quad,
         beta,
         50,
-        Arc::new(op) as Arc<dyn HessianOperator>,
+        Arc::new(op) as Arc<dyn HessianFactorization>,
         vec![
             PenaltyCoordinate::from_dense_root(r1),
             PenaltyCoordinate::from_dense_root(r2),

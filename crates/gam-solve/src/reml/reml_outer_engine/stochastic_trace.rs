@@ -189,7 +189,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_from_probe_batch<F>(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         n_coords: usize,
         mut evaluate_probe: F,
     ) -> Vec<f64>
@@ -251,7 +251,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_matrix_from_probe_batch<F>(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         n_coords: usize,
         mut evaluate_probe: F,
     ) -> Array2<f64>
@@ -338,7 +338,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_hinv_traces(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         targets: StochasticTraceTargets<'_>,
     ) -> Vec<f64> {
         let n_coords = targets.len();
@@ -419,7 +419,7 @@ impl StochasticTraceEstimator {
 
     /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
     /// core as the multi-coordinate path.
-    pub fn estimate_single_trace(&self, hop: &dyn HessianOperator, matrix: &Array2<f64>) -> f64 {
+    pub fn estimate_single_trace(&self, hop: &dyn HessianFactorization, matrix: &Array2<f64>) -> f64 {
         let matrices = [matrix];
         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
     }
@@ -438,7 +438,7 @@ impl StochasticTraceEstimator {
     /// A vector of estimated traces, one per input matrix.
     pub fn estimate_traces(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         matrices: &[&Array2<f64>],
     ) -> Vec<f64> {
         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(matrices))
@@ -460,7 +460,7 @@ impl StochasticTraceEstimator {
     /// A vector of estimated traces: first for dense matrices, then for operators.
     pub fn estimate_traces_with_operators(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         dense_matrices: &[&Array2<f64>],
         operators: &[&dyn HyperOperator],
     ) -> Vec<f64> {
@@ -491,7 +491,7 @@ impl StochasticTraceEstimator {
     /// Estimated traces: first for dense matrices, then for implicit operators.
     pub fn estimate_traces_structural(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         dense_matrices: &[&Array2<f64>],
         implicit_ops: &[&ImplicitHyperOperator],
     ) -> Vec<f64> {
@@ -530,7 +530,7 @@ impl StochasticTraceEstimator {
     /// Estimated D×D matrix of `tr(H⁻¹ A_d H⁻¹ A_e)` values, symmetrized.
     pub fn estimate_second_order_traces(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         dense_matrices: &[&Array2<f64>],
         implicit_ops: &[&ImplicitHyperOperator],
     ) -> Array2<f64> {
@@ -737,7 +737,7 @@ impl StochasticTraceEstimator {
     /// for a mix of dense matrices and generic hyperoperators.
     pub fn estimate_second_order_traces_with_operators(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         dense_matrices: &[&Array2<f64>],
         operators: &[&dyn HyperOperator],
     ) -> Array2<f64> {
@@ -803,7 +803,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_second_order_single_dense(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         matrix: &Array2<f64>,
     ) -> f64 {
         let p = hop.dim();
@@ -834,7 +834,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_second_order_single_implicit(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         op: &ImplicitHyperOperator,
     ) -> f64 {
         let p = hop.dim();
@@ -904,7 +904,7 @@ impl StochasticTraceEstimator {
 
     pub(crate) fn estimate_second_order_single_operator(
         &self,
-        hop: &dyn HessianOperator,
+        hop: &dyn HessianFactorization,
         op: &dyn HyperOperator,
     ) -> f64 {
         let p = hop.dim();
@@ -983,7 +983,7 @@ impl StochasticTraceEstimator {
 }
 
 pub(crate) fn stochastic_trace_hinv_products_with_floor(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     targets: StochasticTraceTargets<'_>,
     trace_state: Option<Arc<Mutex<StochasticTraceState>>>,
 ) -> Vec<f64> {
@@ -1011,7 +1011,7 @@ pub(crate) fn stochastic_trace_hinv_products_with_floor(
 }
 
 pub(crate) fn stochastic_trace_hinv_crosses<'a>(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     dense_matrices: &'a [Array2<f64>],
     coord_has_operator: &[bool],
     generic_ops: &[&'a dyn HyperOperator],
@@ -1031,7 +1031,7 @@ pub(crate) fn stochastic_trace_hinv_crosses<'a>(
 }
 
 pub(crate) fn stochastic_trace_hinv_crosses_with_floor<'a>(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     dense_matrices: &[&'a Array2<f64>],
     coord_has_operator: &[bool],
     generic_ops: &[&'a dyn HyperOperator],
@@ -1356,7 +1356,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator<H, O>(
     config: &StochasticTraceConfig,
 ) -> f64
 where
-    H: HessianOperator + ?Sized,
+    H: HessianFactorization + ?Sized,
     O: HyperOperator + ?Sized,
 {
     let p = hop.dim();
@@ -1382,7 +1382,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H, O>(
     config: &StochasticTraceConfig,
 ) -> f64
 where
-    H: HessianOperator + ?Sized,
+    H: HessianFactorization + ?Sized,
     O: HyperOperator + ?Sized,
 {
     let p = hop.dim();
@@ -1415,7 +1415,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross<H, L, R>(
     config: &StochasticTraceConfig,
 ) -> f64
 where
-    H: HessianOperator + ?Sized,
+    H: HessianFactorization + ?Sized,
     L: HyperOperator + ?Sized,
     R: HyperOperator + ?Sized,
 {

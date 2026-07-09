@@ -1277,7 +1277,12 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         pilot_subsample_threshold: 0,
         out: Some(model_path.clone()),
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "CLI Poisson Duchon fit should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "CLI Poisson Duchon fit should succeed", e
+        )
+    });
 
     let saved = SavedModel::load_from_path(&model_path)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));

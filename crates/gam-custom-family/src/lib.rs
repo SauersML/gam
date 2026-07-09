@@ -45,10 +45,10 @@ pub(crate) use gam_solve::active_set::{
 pub(crate) use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     BlockCoupledOperator, CompositeHyperOperator, DenseSpectralOperator, DispersionHandling,
-    ExactJeffreysTerm, HessianDerivativeProvider, HessianOperator, MatrixFreeSpdOperator,
+    ExactJeffreysTerm, HessianDerivativeProvider, HessianFactorization, MatrixFreeSpdOperator,
     OuterHessianDerivativeKernel, PenaltySubspaceTrace, StochasticTraceState,
     compute_block_penalty_logdet_derivs, compute_efs_update, compute_hybrid_efs_update,
-    exact_pseudo_logdet, hessian_operator_geometric_scale, positive_eigenvalue_threshold,
+    exact_pseudo_logdet, hessian_factorization_geometric_scale, positive_eigenvalue_threshold,
     spectral_epsilon, spectral_regularize,
 };
 // `ActiveLinearConstraintBlock`, `FitGeometry`, and `ProjectedKktResidual` are

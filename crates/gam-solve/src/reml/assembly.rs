@@ -9,7 +9,7 @@
 
 use super::reml_outer_engine::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordPair, InnerSolution,
+    HessianDerivativeProvider, HessianFactorization, HyperCoord, HyperCoordPair, InnerSolution,
     InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
     RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
@@ -321,7 +321,7 @@ pub struct InnerAssembly<'dp> {
     pub penalty_quadratic: f64,
     pub beta: Array1<f64>,
     pub n_observations: usize,
-    pub hessian_op: std::sync::Arc<dyn HessianOperator>,
+    pub hessian_op: std::sync::Arc<dyn HessianFactorization>,
     pub penalty_coords: Vec<PenaltyCoordinate>,
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,

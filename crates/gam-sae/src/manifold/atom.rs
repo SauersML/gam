@@ -959,6 +959,23 @@ impl SaeManifoldAtom {
         }
     }
 
+    /// Full-width decoder in physical output units.
+    ///
+    /// `decoder_coefficients` is the scale-gauge representative used by the
+    /// optimizer.  Once the quotient is active its Frobenius magnitude lives in
+    /// `log_amplitude`, so exporting the representative by itself loses fitted
+    /// scale.  Persistence and inference boundaries must use this accessor:
+    /// it first reverses any internal basis reduction and then materializes
+    /// `exp(log_amplitude) * B`.  The returned block is gauge free and can be
+    /// loaded with `log_amplitude = 0` without changing the represented atom.
+    pub fn physical_full_width_decoder(&self) -> Array2<f64> {
+        let mut decoder = self.full_width_decoder();
+        if self.log_amplitude != 0.0 {
+            decoder.mapv_inplace(|v| self.log_amplitude.exp() * v);
+        }
+        decoder
+    }
+
     /// Full inner-basis width `M` — the row count of
     /// [`Self::full_width_decoder`]. Equals [`Self::basis_size`] unless the atom
     /// was #1117 rank-reduced, in which case it is the un-reduced inner width
@@ -1683,10 +1700,10 @@ impl SaeManifoldAtom {
         }
         self.log_amplitude += norm.ln();
         self.decoder_coefficients.mapv_inplace(|v| v / norm);
-        // Keep the pullback-metric-reweighted roughness Gram consistent with the
-        // normalized decoder. It is magnitude-blind by design (#673), so this is
-        // a no-op in exact arithmetic — refreshed for defensive consistency.
-        self.refresh_intrinsic_smooth_penalty();
+        // `smooth_penalty` is a frozen quadratic operator.  Recomputing it from
+        // the new decoder here would make the reported value state-dependent
+        // while the optimizer differentiates it as fixed.  A pure scale-gauge
+        // retraction therefore leaves the operator untouched.
     }
 
     /// #2022 — like [`Self::absorb_decoder_norm_into_log_amplitude`] but SKIPS the

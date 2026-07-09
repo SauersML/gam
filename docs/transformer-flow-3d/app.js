@@ -883,7 +883,7 @@ function opacityFor(object, nextMode) {
     const isFocusResidual = kind === "residual" && object.userData.position === BLOCK_FOCUS.position;
     if (isFocusResidual) {
       if (object.userData.role === "halo") return 0.045;
-      if (object.userData.role === "core") return 0.5;
+      if (object.userData.role === "core") return 0.36;
       return 0.58;
     }
     if (isFocusModule || isIncoming) return Math.max(base, 0.58);

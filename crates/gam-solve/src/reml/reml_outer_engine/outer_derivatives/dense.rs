@@ -1,7 +1,7 @@
 //! Dense `K × K` assembled outer Hessian ∂²V/∂ρₖ∂ρₗ.
 //!
 //! Materialises the full coordinate Hessian using the precomputed
-//! [`HessianOperator`] for all linear algebra. Selected when the model's
+//! [`HessianFactorization`] for all linear algebra. Selected when the model's
 //! `(n, p, K)` shape keeps dense `p × p` drift storage and pairwise row
 //! assembly cheaper than the matrix-free operator path (see `routing`).
 
@@ -10,12 +10,12 @@ use crate::estimate::smooth_floor_dp;
 
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
 ///
-/// Uses the precomputed HessianOperator for all linear algebra.
+/// Uses the precomputed HessianFactorization for all linear algebra.
 pub(crate) fn compute_outer_hessian(
     solution: &InnerSolution<'_>,
     rho: &[f64],
     lambdas: &[f64],
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     effective_deriv: &dyn HessianDerivativeProvider,
     workspace: Option<&RemlDerivativeWorkspace<'_>>,
 ) -> Result<Array2<f64>, String> {

@@ -64,6 +64,13 @@ impl SaeManifoldTerm {
             }
         }
 
+        let active_atoms = self
+            .last_row_layout
+            .as_ref()
+            .map(|layout| layout.active_atoms[row].as_slice());
+        let atom_is_active = |atom_idx: usize| {
+            active_atoms.is_none_or(|active| active.binary_search(&atom_idx).is_ok())
+        };
         let atoms: Vec<AtomRowBasisJet> = self
             .atoms
             .iter()
@@ -97,7 +104,14 @@ impl SaeManifoldTerm {
                     decoder: (0..m)
                         .map(|basis_col| {
                             (0..p)
-                                .map(|out_col| atom.decoder_coefficients[[basis_col, out_col]])
+                                .map(|out_col| {
+                                    if atom_is_active(atom_idx) {
+                                        atom.log_amplitude.exp()
+                                            * atom.decoder_coefficients[[basis_col, out_col]]
+                                    } else {
+                                        0.0
+                                    }
+                                })
                                 .collect()
                         })
                         .collect(),
@@ -119,7 +133,14 @@ impl SaeManifoldTerm {
         // covers both cases (the same mask the arrow-Schur assembly uses).
         let fixed_gate_value: Vec<Option<f64>> = (0..k_atoms)
             .map(|k| {
-                if self.assignment.logit_is_fixed(k) {
+                if !atom_is_active(k) {
+                    // A compact reconstruction is the fixed-support map
+                    // sum_{k in A_i} a_ik g_k.  Dropped atoms are identically
+                    // zero functions (including all beta derivatives), even
+                    // though their full-softmax probabilities still enter the
+                    // normalization and therefore the active gates' logit jets.
+                    Some(0.0)
+                } else if self.assignment.logit_is_fixed(k) {
                     Some(assignments[k])
                 } else {
                     None
@@ -333,6 +354,12 @@ impl SaeManifoldTerm {
                 out[out_col] += d2phi * atom.decoder_coefficients[[basis_col, out_col]];
             }
         }
+        if atom.log_amplitude != 0.0 {
+            let amplitude = atom.log_amplitude.exp();
+            for value in out.iter_mut() {
+                *value *= amplitude;
+            }
+        }
     }
 
     /// HAND reconstruction + β-border channels for the SOFTMAX gate — the
@@ -375,6 +402,13 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         let q = vars.len();
         let k_atoms = self.k_atoms();
+        let active_atoms = self
+            .last_row_layout
+            .as_ref()
+            .map(|layout| layout.active_atoms[row].as_slice());
+        let atom_is_active = |atom_idx: usize| {
+            active_atoms.is_none_or(|active| active.binary_search(&atom_idx).is_ok())
+        };
 
         // Softmax gate derivatives (closed form; NO exps — the K softmax values
         // `assignments` are precomputed upstream).
@@ -426,6 +460,9 @@ impl SaeManifoldTerm {
             .collect();
         let mut scratch = vec![0.0_f64; p];
         for k in 0..k_atoms {
+            if !atom_is_active(k) {
+                continue;
+            }
             self.atoms[k].fill_decoded_row(row, &mut decoded[k]);
             for axis in 0..self.atoms[k].latent_dim {
                 self.atoms[k].fill_decoded_derivative_row(row, axis, &mut d1[k][axis]);
@@ -451,6 +488,9 @@ impl SaeManifoldTerm {
             match *var {
                 SaeLocalRowVar::Logit { .. } => {
                     for k in 0..k_atoms {
+                        if !atom_is_active(k) {
+                            continue;
+                        }
                         let coeff = dz[idx][k] * sqrt_row_w;
                         if coeff == 0.0 {
                             continue;
@@ -477,6 +517,9 @@ impl SaeManifoldTerm {
                 match (vars[a], vars[b]) {
                     (SaeLocalRowVar::Logit { .. }, SaeLocalRowVar::Logit { .. }) => {
                         for k in 0..k_atoms {
+                            if !atom_is_active(k) {
+                                continue;
+                            }
                             let coeff = d2z[a][b][k] * sqrt_row_w;
                             if coeff == 0.0 {
                                 continue;
@@ -525,6 +568,9 @@ impl SaeManifoldTerm {
         // map is linear in β).
         for (beta_pos, channel) in border.iter().enumerate() {
             let atom = channel.atom;
+            if !atom_is_active(atom) {
+                continue;
+            }
             let phi = self.atoms[atom].basis_values[[row, channel.basis_col]];
             let base = assignments[atom] * phi * sqrt_row_w;
             for out_col in 0..p {

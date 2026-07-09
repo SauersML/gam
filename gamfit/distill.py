@@ -95,9 +95,13 @@ def _activation_from_logits(
         exp = np.exp(shifted)
         return exp / np.sum(exp, axis=1, keepdims=True)
     if name == "ibp_map":
+        if not np.isfinite(alpha) or alpha <= 0.0:
+            raise ValueError(f"alpha must be finite and positive; got {alpha}")
         k_atoms = z.shape[1]
         ratio = float(alpha) / (float(alpha) + 1.0)
-        prior = np.exp(np.arange(k_atoms, dtype=np.float64) * np.log(ratio))
+        prior = np.exp(
+            np.arange(1, k_atoms + 1, dtype=np.float64) * np.log(ratio)
+        )
         prior = np.maximum(prior, np.finfo(np.float64).tiny)
         sig = 1.0 / (1.0 + np.exp(-np.clip(z / tau, -709.0, 709.0)))
         return sig * prior.reshape(1, -1)

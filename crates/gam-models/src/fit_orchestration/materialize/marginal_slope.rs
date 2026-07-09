@@ -230,7 +230,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
                 // default for bernoulli marginal-slope — no flag to thread.
                 ..Default::default()
             },
-            kappa_options: SpatialLengthScaleOptimizationOptions::default(),
+            kappa_options: config.spatial_optimization.clone(),
             policy,
         }),
         inference_notes,

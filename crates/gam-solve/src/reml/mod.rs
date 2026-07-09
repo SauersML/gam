@@ -878,7 +878,7 @@ mod tests {
             gradient,
             hessian
                 .materialize_dense()
-                .map_err(EstimationError::RemlOptimizationFailed)?
+                .map_err(|error| EstimationError::RemlOptimizationFailed(error.to_string()))?
                 .ok_or_else(|| {
                     EstimationError::RemlOptimizationFailed(
                         "joint hyper Hessian requested but unavailable".to_string(),

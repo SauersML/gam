@@ -490,7 +490,7 @@ pub(crate) const THETA_MODE_RESPONSE_TANGENCY_GATE: f64 = 1e-6;
 /// contraction of this kernel, so atoms borrowing the shared drift can no
 /// longer see a different chain rule than their neighbors.
 pub(crate) struct ThetaModeResponseKernel<'s> {
-    pub(crate) hop: &'s dyn HessianOperator,
+    pub(crate) hop: &'s dyn HessianFactorization,
     /// `Some` exactly when the selection rule chose the lifted constrained
     /// kernel. Built once per evaluation point (one Schur-complement
     /// factorization), shared by every gradient/Hessian consumer — the
@@ -503,7 +503,7 @@ impl<'s> ThetaModeResponseKernel<'s> {
     pub(crate) fn select(
         subspace: Option<&'s PenaltySubspaceTrace>,
         active_constraints: Option<&'s ActiveLinearConstraintBlock>,
-        hop: &'s dyn HessianOperator,
+        hop: &'s dyn HessianFactorization,
     ) -> Self {
         let constrained = match (subspace, active_constraints) {
             (Some(kernel), Some(block)) => {

@@ -74,7 +74,7 @@ pub(crate) struct KktThetaCorrections {
 /// coordinate freezes (its θ does not move), so its row/column correction is
 /// zero.
 pub(crate) fn compute_kkt_residual_theta_corrections<F>(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     subspace: Option<&PenaltySubspaceTrace>,
     score_derivs: &[Array1<f64>],
     drift_apply: F,
@@ -233,7 +233,7 @@ where
 }
 
 pub(crate) fn solve_kkt_residual_kernel(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     subspace: Option<&PenaltySubspaceTrace>,
     rhs: &Array1<f64>,
 ) -> Array1<f64> {

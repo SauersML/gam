@@ -1,7 +1,7 @@
 use super::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Dense spectral HessianOperator implementation
+//  Dense spectral HessianFactorization implementation
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Dense spectral Hessian operator using eigendecomposition.
@@ -70,7 +70,7 @@ impl DenseSpectralOperator {
         if n != h.ncols() {
             return Err(RemlError::DimensionMismatch {
                 reason: format!(
-                    "HessianOperator: expected square matrix, got {}×{}",
+                    "HessianFactorization: expected square matrix, got {}×{}",
                     n,
                     h.ncols()
                 ),
@@ -391,7 +391,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
     });
 }
 
-impl HessianOperator for DenseSpectralOperator {
+impl HessianFactorization for DenseSpectralOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
     }

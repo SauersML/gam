@@ -63,6 +63,10 @@ pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, Stri
         logslope_formula: args.logslope_formula.clone(),
         z_column: args.z_column.clone(),
         scale_dimensions: args.scale_dimensions,
+        spatial_optimization: SpatialLengthScaleOptimizationOptions {
+            pilot_subsample_threshold: args.pilot_subsample_threshold,
+            ..SpatialLengthScaleOptimizationOptions::default()
+        },
         adaptive_regularization: Some(args.adaptive_regularization),
         ridge_lambda: args.ridge_lambda,
         transformation_normal: args.transformation_normal,
@@ -104,6 +108,10 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
         logslope_formula: args.logslope_formula.clone(),
         z_column: args.z_column.clone(),
         scale_dimensions: args.scale_dimensions,
+        spatial_optimization: SpatialLengthScaleOptimizationOptions {
+            pilot_subsample_threshold: args.pilot_subsample_threshold,
+            ..SpatialLengthScaleOptimizationOptions::default()
+        },
         ridge_lambda: args.ridge_lambda,
         frailty,
         ..FitConfig::default()
@@ -276,7 +284,14 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // FFI and the in-process `fit_from_formula` use, so the CLI reaches the same
     // estimator instead of failing with `unknown family 'expectile'`.
     if matches!(args.family, FamilyArg::Expectile) {
-        return run_fit_expectile(&args, &ds, &formula_text, &fit_config);
+        return run_canonical_standard_fit(&args, &ds, &parsed, &formula_text, &fit_config);
+    }
+
+    // Every single-parameter formula fit is owned end-to-end by gam-models.
+    // The remainder of this function is only the still-specialized
+    // location-scale presentation/persistence adapter.
+    if fit_config.noise_formula.is_none() {
+        return run_canonical_standard_fit(&args, &ds, &parsed, &formula_text, &fit_config);
     }
 
     let link_choice = parse_link_choice(effective_link_arg.as_deref(), false)?;
@@ -447,337 +462,118 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if let Some(noise_formula_raw) = &fit_config.noise_formula {
-        return run_fitwith_predict_noise(
-            &args,
-            &ds,
-            &col_map,
-            &parsed,
-            &y,
-            family,
-            link_choice.as_ref(),
-            mixture_linkspec.as_ref(),
-            effective_linkwiggle.as_ref(),
-            &mut inference_notes,
-            noise_formula_raw,
-            &formula_text,
-        );
-    }
-    if fit_config.noise_offset_column.is_some() {
-        return Err(
-            "--noise-offset-column requires --predict-noise or survival location-scale".to_string(),
-        );
-    }
-
-    // Shape-derived resource policy: at large-scale n we auto-select strict
-    // (analytic-operator-required) so any silent dense fallback in the
-    // term-construction layer fails fast.
-    let bare_fit_policy =
-        gam::ResourcePolicy::for_problem(ds.values.nrows(), 0, gam::ProblemHints::default());
-    let mut spec = build_termspec(
-        &parsed.terms,
+    let noise_formula_raw = fit_config
+        .noise_formula
+        .as_deref()
+        .expect("the standard path returned before location-scale dispatch");
+    run_fitwith_predict_noise(
+        &args,
         &ds,
         &col_map,
+        &parsed,
+        &y,
+        family,
+        link_choice.as_ref(),
+        mixture_linkspec.as_ref(),
+        effective_linkwiggle.as_ref(),
         &mut inference_notes,
-        &bare_fit_policy,
-    )?;
-    if fit_config.scale_dimensions {
-        enable_scale_dimensions(&mut spec);
-    }
-    // #2116: apply the SAME Duchon operator-penalty gating the Python/materialize
-    // standard path applies (`materialize_standard` → `terms.rs`
-    // `gate_duchon_operator_penalties_for_family`). Both front-ends are one shared
-    // engine (#1191/#1196), so a Duchon smooth under a non-Gaussian-identity
-    // family MUST arrive at the solver with the same penalty structure regardless
-    // of entry point. Previously only the formula/Python path dropped the
-    // collocation-Gram mass/tension operator blocks for the fixed-φ GLM arm; the
-    // CLI's hand-built request left them in, so the two front-ends fit a
-    // different penalty on identical Duchon data — a single-engine-contract
-    // violation. Runs after `enable_scale_dimensions` so the gate sees the fully
-    // resolved basis, exactly as the materialize path does.
-    gate_duchon_operator_penalties_for_family(&mut spec, &family);
-    let kappa_options = {
-        let mut opts = SpatialLengthScaleOptimizationOptions::default();
-        opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
-        opts
-    };
-    let route_flexible_through_standard = link_choice.as_ref().is_some_and(|choice| {
-        matches!(choice.mode, LinkMode::Flexible) && choice.mixture_components.is_none()
-    });
-    let spatial_usagewarnings = collect_smooth_structure_warnings(&spec, &ds.headers, "model");
-    emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
-    print_inference_summary(&inference_notes);
-    let has_bounded_terms = termspec_has_bounded_terms(&spec);
-    validate_cli_firth_configuration(CliFirthValidation {
-        enabled: fit_config.firth,
-        family: family.clone(),
-        predict_noise: fit_config.noise_formula.is_some(),
-        is_survival: false,
-        link_choice: link_choice.as_ref(),
-    })?;
-    // `--firth` with `bounded()` is *redundant*, not unsupported. Firth
-    // bias-reduction is exactly penalized maximum likelihood with Jeffreys'
-    // prior `½ log|I(β)|`, and that prior is reparameterization-INVARIANT: its
-    // MAP is equivariant under any smooth change of coordinates. Bounded terms
-    // fit through the custom-family blockwise solver
-    // (`fit_bounded_term_collection_with_design` -> `fit_custom_family`), whose
-    // inner/outer joint Newton ALWAYS carries the full-span Jeffreys curvature
-    // `H_Φ` and score `∇Φ` (its `joint_jeffreys_term_required()` is the trait
-    // default `true`; `BoundedLinearFamily` does not opt out). That term is the
-    // Jeffreys prior on the bounded LATENT coordinates `θ`, whose log-det
-    // already threads the interval reparameterization's log-Jacobian
-    // (`½ log|I_θ| = ½ log|I_β| + log|det J|`), so the latent MAP maps back
-    // through the interval transform to the exact user-scale Firth estimate.
-    // The explicit `--firth` branch below instead fits through
-    // `optimize_external_design` on the raw unconstrained design and would
-    // silently DROP the bounds — wrong for a bounded model. We therefore keep
-    // bounded models on the standard branch (which is already Firth-equivalent)
-    // and record the redundancy, rather than refusing the combination.
-    let firth_redundant_for_bounded = fit_config.firth && has_bounded_terms;
-    if firth_redundant_for_bounded {
-        inference_notes.push(
-            "--firth is redundant for bounded() coefficients: the bounded custom-family solver \
-             already installs the reparameterization-invariant Jeffreys/Firth bias-reduction in \
-             the bounded latent coordinates, which is the exact Firth estimate on the user scale."
-                .to_string(),
-        );
-        print_inference_summary(std::slice::from_ref(
-            inference_notes.last().expect("note just pushed is present"),
-        ));
-    }
-    let fit_max_iter = 200usize;
-    let fit_tol = 1e-6f64;
-    let weights = resolve_weight_column(&ds, &col_map, fit_config.weight_column.as_deref())?;
-    let offset = resolve_offset_column(&ds, &col_map, fit_config.offset_column.as_deref())?;
-    let frailty = fit_frailty_spec_from_args(&args, "fit")?;
-    if let Some(choice) = link_choice.as_ref()
-        && matches!(choice.mode, LinkMode::Flexible)
-    {
-        if choice.mixture_components.is_some() {
-            return Err(
-                    "flexible(blended(...)/mixture(...)) is currently supported only with --predict-noise binomial location-scale fitting or --survival-likelihood=location-scale"
-                        .to_string(),
-                );
-        }
-        if has_bounded_terms {
-            return Err(
-                "flexible(...) links are not yet supported with bounded() coefficients".to_string(),
-            );
-        }
-        if !family.is_binomial() {
-            return Err("flexible(...) links currently require a binomial family/link".to_string());
-        }
-    }
-    let adaptive_opts = if fit_config.adaptive_regularization.unwrap_or(false) {
-        Some(AdaptiveRegularizationOptions {
-            enabled: true,
-            ..AdaptiveRegularizationOptions::default()
-        })
-    } else {
-        None
-    };
-    let latent_cloglog_state = if family.is_latent_cloglog() {
-        Some(latent_cloglog_state_from_frailty_spec(
-            &frailty,
-            "latent-cloglog-binomial",
-        )?)
-    } else {
-        if !matches!(
-            frailty,
-            gam::families::survival::lognormal_kernel::FrailtySpec::None
-        ) {
-            return Err(
-                "frailty is only supported here for --family latent-cloglog-binomial; use the frailty-aware marginal-slope or survival paths instead"
-                    .to_string(),
-            );
-        }
-        None
-    };
-    // Standard-fit `FitOptions` are built through the single shared policy
-    // source (#1196). The CLI passes only the request-specific link/Firth/
-    // adaptive inputs; the outer-REML optimization policy
-    // (`compute_inference`, `skip_rho_posterior_inference`, `tol`, the
-    // `max_iter` default, the penalty shrinkage floor) is filled in by
-    // `canonical_standard_fit_options`, identical to the formula/Python path,
-    // so the same model can no longer fit differently across entry points.
-    // (Previously this hand-built block used `tol: 1e-6` /
-    // `skip_rho_posterior_inference: false`, diverging from the formula path's
-    // `1e-10`/`true` — the structural defect behind #1191/#1196.)
-    // `fit_max_iter`/`fit_tol` remain the inputs to the separate forced-Firth
-    // external-design branch below.
-    let base_fit_options = gam::families::fit_orchestration::canonical_standard_fit_options(
-        &fit_config,
-        gam::families::fit_orchestration::StandardFitOptionsInputs {
-            latent_cloglog: latent_cloglog_state,
-            mixture_link: mixture_linkspec.clone(),
-            optimize_mixture: true,
-            sas_link: sas_linkspec,
-            optimize_sas: sas_linkspec.is_some()
-                && matches!(
-                    effective_link,
-                    LinkFunction::Sas | LinkFunction::BetaLogistic
-                ),
-            firth_bias_reduction: false,
-            adaptive_regularization: adaptive_opts,
-            ..Default::default()
-        },
-    );
-    let standard_wiggle = if learn_linkwiggle
-        && fit_config.noise_formula.is_none()
-        && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
-    {
-        let wiggle_cfg = effective_linkwiggle
-            .as_ref()
-            .expect("learn_linkwiggle guarantees wiggle config");
-        let link_kind = resolve_binomial_inverse_link_for_fit(
-            family.clone(),
-            effective_link,
-            mixture_linkspec.as_ref(),
-            "binomial mean-only link wiggle",
-        )?;
-        Some(StandardBinomialWiggleConfig {
-            link_kind,
-            wiggle: LinkWiggleConfig {
-                degree: wiggle_cfg.degree,
-                num_internal_knots: wiggle_cfg.num_internal_knots,
-                penalty_orders: wiggle_cfg.penalty_orders.clone(),
-                double_penalty: wiggle_cfg.double_penalty,
-            },
-            // CLI path: keep `blockwise_options_from_fit_args()` as the
-            // option source (it currently returns defaults but is the hook
-            // for future fit-arg overrides). Bound together with the pilot
-            // config inside `StandardBinomialWiggleConfig` so the two can
-            // never disagree (#320).
-            refit_options: blockwise_options_from_fit_args()?,
-        })
-    } else {
-        None
-    };
+        noise_formula_raw,
+        &formula_text,
+    )
+}
 
-    let (
-        fit,
-        design,
-        resolvedspec,
-        adaptive_regularization_diagnostics,
-        standard_saved_link_state,
-        standard_wiggle_meta,
-    ): (
-        UnifiedFitResult,
-        gam::smooth::TermCollectionDesign,
-        TermCollectionSpec,
-        Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
-        FittedLinkState,
-        // (knots, degree, frozen-index shift #2141)
-        Option<(Vec<f64>, usize, Option<Vec<f64>>)>,
-    ) = if fit_config.firth && !firth_redundant_for_bounded {
-        let design = build_term_collection_design(ds.values.view(), &spec)
-            .map_err(|e| format!("failed to build term collection design: {e}"))?;
-        let ext = optimize_external_design(
-            y.view(),
-            weights.view(),
-            design.design.clone(),
-            offset.view(),
-            design.penalties.clone(),
-            &ExternalOptimOptions {
-                family: family.clone(),
-                latent_cloglog: None,
-                mixture_link: None,
-                optimize_mixture: true,
-                sas_link: None,
-                optimize_sas: false,
-                // Always compute inference so `predict --uncertainty` works
-                // for Gaussian fits too (see comment near the other compute_inference site).
-                compute_inference: true,
-                skip_rho_posterior_inference: false,
-                max_iter: fit_max_iter,
-                tol: fit_tol,
-                nullspace_dims: design.nullspace_dims.clone(),
-                linear_constraints: design.linear_constraints.clone(),
-                firth_bias_reduction: Some(true),
-                penalty_shrinkage_floor: Some(1e-6),
-                rho_prior: Default::default(),
-                kronecker_penalty_system: None,
-                kronecker_factored: None,
-                persist_warm_start_disk: false,
-            },
-        )
-        .map_err(|e| format!("fit_gam (forced Firth) failed: {e}"))?;
-        (
-            fit_result_from_external(ext),
-            design,
-            spec.clone(),
-            None,
-            FittedLinkState::Standard(None),
-            None,
+fn standard_fast_path_feature_columns(parsed: &ParsedFormula) -> Vec<String> {
+    parsed
+        .terms
+        .iter()
+        .find_map(|term| match term {
+            ParsedTerm::Smooth { vars, .. } => Some(vars.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn canonical_standard_fit_error(error: WorkflowError) -> String {
+    let detail = error.to_string();
+    if detail.contains("Parameter constraint violation") && detail.contains("no candidate seeds") {
+        format!(
+            "standard term fit failed: every candidate fit violates the requested coefficient \
+             constraint. Remove the constraint, change its direction/bounds, or check the data. \
+             Underlying error: {error}"
         )
     } else {
-        let phase_start = std::time::Instant::now();
-        log::info!(
-            "[PHASE] standard-GAM fit start n={} family={:?}",
-            ds.values.nrows(),
-            family
-        );
-        let standard_request = StandardFitRequest {
-            data: ds.values.to_owned(),
-            y: y.clone(),
-            weights: weights.clone(),
-            offset: offset.clone(),
-            spec: spec.clone(),
-            family: family.clone(),
-            // #2026: `--family tweedie` names the bare Tweedie family with no way
-            // to spell an explicit power on the CLI, so it mirrors mgcv `tw()`
-            // and estimates `p` by profile likelihood before the reported fit.
-            estimate_tweedie_p: matches!(family.response, ResponseFamily::Tweedie { .. })
-                && matches!(args.family, FamilyArg::Tweedie),
-            options: base_fit_options,
-            kappa_options: kappa_options.clone(),
-            wiggle: standard_wiggle,
-            // Request fields that are derived from the resolved `FitConfig` are
-            // sourced from `fit_config` here exactly as `materialize_standard`
-            // sources them (#1196), instead of being hardcoded to empty. The CLI
-            // typed arg→config construction currently leaves
-            // `coefficient_groups` / `penalty_block_gamma_priors` at their empty
-            // defaults because no CLI flag sets them, so this is value-identical
-            // today; routing them through `fit_config` makes the CLI request a
-            // function of the same resolved config the Python/PyO3 path consumes,
-            // so a future config knob can never be silently dropped on the CLI
-            // side while the FFI honors it — the divergence class behind #1191.
-            coefficient_groups: fit_config.coefficient_groups.clone(),
-            penalty_block_gamma_priors: fit_config.penalty_block_gamma_priors.clone(),
-            // `latent_coord` is resolved (its `term_index` bound to a smooth in
-            // the spec) only inside `materialize_standard` from a formula latent
-            // term; the CLI standard-fit path parses no latent coordinate, so
-            // `None` is the materialized value, not a dropped config field.
-            latent_coord: None,
-            _marker: std::marker::PhantomData,
-        };
-        // Exact O(n) spline-scan fast path (#1030/#1034): a single 1-D
-        // Gaussian cubic smooth routes through the state-space scan — the
-        // same penalized posterior at O(n) per λ-trial instead of the dense
-        // design/Gram route — and persists the smoother state directly.
-        if let Some(inputs) = spline_scan_fast_path(&standard_request) {
-            let scan = gam::solver::spline_scan::fit_spline_scan(
-                &inputs.x,
-                &inputs.y,
-                &inputs.w,
-                inputs.order,
-            )
-            .map_err(|e| format!("spline-scan fit failed: {e}"))?;
-            log::info!(
-                "[PHASE] spline-scan fit end elapsed={:.3}s",
-                phase_start.elapsed().as_secs_f64()
-            );
-            let feature_col = match &spec.smooth_terms[0].basis {
-                gam::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => *feature_col,
-                other => {
-                    return Err(format!(
-                        "internal error: spline-scan detection accepted a non-1D basis {other:?}"
-                    ));
-                }
+        format!("standard formula fit failed: {error}")
+    }
+}
+
+fn run_canonical_standard_fit(
+    args: &FitArgs,
+    dataset: &Dataset,
+    parsed: &ParsedFormula,
+    formula: &str,
+    fit_config: &FitConfig,
+) -> Result<(), String> {
+    let phase_start = std::time::Instant::now();
+    log::info!(
+        "[PHASE] canonical formula fit start n={}",
+        dataset.values.nrows()
+    );
+    let outcome = fit_from_formula_with_notes(formula, dataset, fit_config)
+        .map_err(canonical_standard_fit_error)?;
+    log::info!(
+        "[PHASE] canonical formula fit end elapsed={:.3}s",
+        phase_start.elapsed().as_secs_f64()
+    );
+    print_inference_summary(&outcome.inference_notes);
+
+    match outcome.result {
+        FitResult::Standard(mut result) => {
+            let family = result
+                .fit
+                .likelihood_family
+                .clone()
+                .unwrap_or_else(LikelihoodSpec::gaussian_identity);
+            let model_label = if matches!(args.family, FamilyArg::Expectile) {
+                "expectile"
+            } else {
+                "standard"
             };
-            let feature_column = ds.headers.get(feature_col).cloned().ok_or_else(|| {
-                format!("internal error: spline-scan feature column {feature_col} has no header")
-            })?;
+            let spatial_warnings =
+                collect_smooth_structure_warnings(&result.resolvedspec, &dataset.headers, "model");
+            print_spatial_aniso_scales(&result.resolvedspec);
+            cli_out!(
+                "{} fit | family={} | status={} | iterations={} | terms={} | edf={:.3} | loglik={:.6e} | objective={:.6e}",
+                model_label,
+                family.name(),
+                result.fit.pirls_status.label(),
+                result.fit.outer_iterations,
+                result.resolvedspec.smooth_terms.len() + result.resolvedspec.linear_terms.len(),
+                result.fit.edf_total().unwrap_or(f64::NAN),
+                result.fit.log_likelihood,
+                result.fit.reml_score,
+            );
+            if let Some(out) = args.out.as_ref() {
+                compact_fit_result_for_batch(&mut result.fit);
+                let mut payload = assemble_standard_payload(StandardPayloadInputs {
+                    formula: formula.to_string(),
+                    dataset,
+                    fit_config,
+                    result,
+                })?;
+                payload.group_metadata = fit_config.group_metadata.clone();
+                payload.inference_notes = outcome.inference_notes;
+                write_payload_json(out, payload)?;
+            }
+            emit_smooth_structure_warnings("fit-end", &spatial_warnings);
+            Ok(())
+        }
+        FitResult::SplineScan(scan) => {
+            let feature_column = standard_fast_path_feature_columns(parsed)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "canonical spline-scan result has no smooth feature in its formula".to_string()
+                })?;
             cli_out!(
                 "spline-scan fit | knots={} | edf={:.3} | sigma2={:.6e} | log_lambda={:.4} | reml={:.6e}",
                 scan.knots.len(),
@@ -786,382 +582,61 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 scan.log_lambda,
                 scan.restricted_loglik,
             );
-            if let Some(out) = args.out {
-                let payload = assemble_spline_scan_payload(
-                    formula_text,
+            if let Some(out) = args.out.as_ref() {
+                let mut payload = assemble_spline_scan_payload(
+                    formula.to_string(),
                     feature_column,
                     &scan,
-                    ds.schema.clone(),
-                    ds.headers.clone(),
-                    ds.feature_ranges(),
+                    dataset.schema.clone(),
+                    dataset.headers.clone(),
+                    dataset.feature_ranges(),
                 );
-                write_payload_json(&out, payload)?;
+                payload.group_metadata = fit_config.group_metadata.clone();
+                payload.inference_notes = outcome.inference_notes;
+                write_payload_json(out, payload)?;
             }
-            emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-            return Ok(());
+            Ok(())
         }
-        // O(n log n) multiresolution residual-cascade fast path (#1032): a
-        // single scattered 2–3D Gaussian Duchon/Matérn smooth past the
-        // dense-kernel cliff routes through the Wendland multilevel-frame fit.
-        // Unlike the 1-D scan this is a DIFFERENT posterior, so the seam only
-        // fires on the exact structural signature; rejected metric or ineligible
-        // shape fall through to the dense `fit_model` path.
-        if let Some(inputs) = residual_cascade_fast_path(&standard_request) {
-            let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-            if let Ok(cascade_fit) = gam::solver::residual_cascade::fit_residual_cascade(
-                &coord_refs,
-                &inputs.y,
-                &inputs.w,
-                &inputs.metric,
-                inputs.sobolev_s,
-            ) {
-                log::info!(
-                    "[PHASE] residual-cascade fit end elapsed={:.3}s",
-                    phase_start.elapsed().as_secs_f64()
-                );
-                // Resolve the d feature column names from the single smooth term.
-                let feature_columns: Vec<String> = {
-                    let feature_cols = match &spec.smooth_terms[0].basis {
-                        gam::smooth::SmoothBasisSpec::Duchon { feature_cols, .. } => {
-                            feature_cols.clone()
-                        }
-                        gam::smooth::SmoothBasisSpec::Matern { feature_cols, .. } => {
-                            feature_cols.clone()
-                        }
-                        other => {
-                            return Err(format!(
-                                "internal error: cascade detection accepted non-radial basis \
-                                 {other:?}"
-                            ));
-                        }
-                    };
-                    feature_cols
-                        .iter()
-                        .map(|&c| {
-                            ds.headers.get(c).cloned().ok_or_else(|| {
-                                format!("internal error: cascade feature column {c} has no header")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let cert = &cascade_fit.certificate;
-                cli_out!(
-                    "residual-cascade fit | levels={} | centers={} | sigma2={:.6e} | \
-                     log_lambda={:.4} | reml={:.6e} | rel_resid={:.2e}",
-                    cascade_fit.num_levels(),
-                    cascade_fit.num_centers(),
-                    cascade_fit.sigma2,
-                    cascade_fit.log_lambda,
-                    cascade_fit.restricted_loglik,
-                    cert.solve_rel_residual,
-                );
-                if let Some(out) = args.out {
-                    let payload = assemble_residual_cascade_payload(
-                        formula_text,
-                        feature_columns,
-                        &cascade_fit,
-                        ds.schema.clone(),
-                        ds.headers.clone(),
-                        ds.feature_ranges(),
-                    )?;
-                    write_payload_json(&out, payload)?;
-                }
-                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-                return Ok(());
-            }
-            // Quasi-uniformity guard (caveat 2) or degenerate design: fall
-            // through to the dense kernel path.
-        }
-        let fitted = match fit_model(FitRequest::Standard(standard_request)) {
-            Ok(FitResult::Standard(result)) => {
-                log::info!(
-                    "[PHASE] standard-GAM fit end elapsed={:.3}s",
-                    phase_start.elapsed().as_secs_f64()
-                );
-                result
-            }
-            Ok(_) => {
-                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+        FitResult::ResidualCascade(cascade) => {
+            let feature_columns = standard_fast_path_feature_columns(parsed);
+            if feature_columns.is_empty() {
                 return Err(
-                    "internal standard workflow returned the wrong result variant".to_string(),
+                    "canonical residual-cascade result has no smooth features in its formula"
+                        .to_string(),
                 );
             }
-            Err(e) => {
-                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-                // Recognize the common "user's sign / box constraint fights
-                // the data" failure mode and surface a focused hint above
-                // the technical REML / KKT breakdown. Without this the user
-                // sees only:
-                //   "no candidate seeds passed outer startup validation
-                //    (standard REML); ... reasons: [seed 0 (validation):
-                //    Parameter constraint violation: KKT residuals exceed
-                //    tolerance: primal=0.81 ..."
-                // which is incomprehensible jargon for the case where they
-                // wrote `nonpositive(x)` on data where the sign of the
-                // covariate-response correlation is actually positive.
-                let estr = e.to_string();
-                if estr.contains("Parameter constraint violation")
-                    && estr.contains("no candidate seeds")
-                {
-                    return Err(format!(
-                        "standard term fit failed: every candidate fit violates the \
-                         parameter constraint you set (nonpositive() / nonnegative() / \
-                         constrain() / bounded()). The constraint and the data appear to \
-                         disagree about the sign or magnitude of the effect. \
-                         Either remove the constraint, flip its direction, or check the \
-                         data. Underlying error: {e}"
-                    ));
-                }
-                return Err(format!("standard term fit failed: {e}"));
-            }
-        };
-        (
-            fitted.fit,
-            fitted.design,
-            fitted.resolvedspec,
-            fitted.adaptive_diagnostics,
-            fitted.saved_link_state,
-            match (fitted.wiggle_knots, fitted.wiggle_degree) {
-                (Some(knots), Some(degree)) => {
-                    Some((knots.to_vec(), degree, fitted.wiggle_saved_index_shift))
-                }
-                _ => None,
-            },
-        )
-    };
-    print_spatial_aniso_scales(&resolvedspec);
-
-    let frozenspec =
-        freeze_term_collection_from_design(&resolvedspec, &design).map_err(|e| e.to_string())?;
-    let mut saved_fit = fit.clone();
-    saved_fit.fitted_link = standard_saved_link_state.clone();
-    let saved_termspec = frozenspec.clone();
-    if let Some((wiggle_knots, wiggle_degree, _)) = standard_wiggle_meta.as_ref() {
-        let beta_eta = fit
-            .block_by_role(BlockRole::Mean)
-            .ok_or_else(|| "standard wiggle fit is missing eta block".to_string())?
-            .beta
-            .clone();
-        let q0_final = design.design.dot(&beta_eta);
-        let domain = summarizewiggle_domain(
-            q0_final.view(),
-            ArrayView1::from(wiggle_knots),
-            *wiggle_degree,
-        )?;
-        if domain.outside_count > 0 {
-            cli_err!(
-                "warning: {} of {} link-wiggle eta values ({:.1}%) fell outside the knot domain [{:.3}, {:.3}] after fitting",
-                domain.outside_count,
-                q0_final.len(),
-                100.0 * domain.outside_fraction,
-                domain.domain_min,
-                domain.domain_max
+            cli_out!(
+                "residual-cascade fit | levels={} | centers={} | sigma2={:.6e} | \
+                 log_lambda={:.4} | reml={:.6e} | rel_resid={:.2e}",
+                cascade.num_levels(),
+                cascade.num_centers(),
+                cascade.sigma2,
+                cascade.log_lambda,
+                cascade.restricted_loglik,
+                cascade.certificate.solve_rel_residual,
             );
+            if let Some(out) = args.out.as_ref() {
+                let mut payload = assemble_residual_cascade_payload(
+                    formula.to_string(),
+                    feature_columns,
+                    &cascade,
+                    dataset.schema.clone(),
+                    dataset.headers.clone(),
+                    dataset.feature_ranges(),
+                )?;
+                payload.group_metadata = fit_config.group_metadata.clone();
+                payload.inference_notes = outcome.inference_notes;
+                write_payload_json(out, payload)?;
+            }
+            Ok(())
         }
+        _ => Err(
+            "canonical standard fit returned a non-standard model; specialized formula families \
+             must be dispatched before the standard service"
+                .to_string(),
+        ),
     }
-    compact_fit_result_for_batch(&mut saved_fit);
-
-    if let Some(out) = args.out {
-        let latent_cloglog_state = if family.is_latent_cloglog() {
-            Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
-                "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
-            ))
-        } else {
-            saved_latent_cloglog_state_from_fit(&saved_fit)
-        };
-        let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
-            formula_text,
-            ModelKind::Standard,
-            FittedFamily::Standard {
-                likelihood: family.clone(),
-                link: StandardLink::try_from(effective_link).ok(),
-                latent_cloglog_state,
-                mixture_state: saved_mixture_state_from_fit(&saved_fit),
-                sas_state: saved_sas_state_from_fit(&saved_fit),
-            },
-            family.name().to_string(),
-        );
-        payload.unified = Some(saved_fit.clone());
-        payload.fit_result = Some(saved_fit.clone());
-        payload.data_schema = Some(ds.schema.clone());
-        payload.link = inverse_link_from_fitted_link_state(&saved_fit.fitted_link);
-        if let Some((wiggle_knots, wiggle_degree, index_shift)) = standard_wiggle_meta {
-            payload.linkwiggle_knots = Some(wiggle_knots);
-            payload.linkwiggle_degree = Some(wiggle_degree);
-            // #2141: persist the frozen-index shift so CLI-saved standard
-            // link-warp models reconstruct the fitted `q` at predict time,
-            // matching the FFI save path (`build_standard_payload`).
-            payload.link_wiggle_index_shift = index_shift;
-        }
-        match &saved_fit.fitted_link {
-            FittedLinkState::Mixture { covariance, .. } => {
-                payload.mixture_link_param_covariance =
-                    covariance.as_ref().map(array2_to_nested_vec);
-            }
-            FittedLinkState::Sas { covariance, .. }
-            | FittedLinkState::BetaLogistic { covariance, .. } => {
-                payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
-            }
-            FittedLinkState::LatentCLogLog { .. } => {}
-            FittedLinkState::Standard(_) => {}
-        }
-        set_training_feature_metadata_from_dataset(&mut payload, &ds);
-        payload.resolved_termspec = Some(saved_termspec);
-        payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
-        // Populate the exact Gaussian jackknife+ substrate (#1098) when the fit
-        // is a standard Gaussian-identity model with unit prior weights and the
-        // converged penalized Hessian M = X'X + S(λ) is available from the
-        // FitGeometry.  The exchangeability proof requires unit weights — a
-        // non-unit weight makes the test row non-exchangeable with training rows.
-        // When all conditions hold the substrate is factored once here; predict
-        // calls GaussianJackknifePlusStats::interval per test point in O(p)
-        // from the precomputed LOO quantities.
-        if family.is_gaussian_identity() {
-            if let Some(geo) = fit.geometry.as_ref() {
-                let m = &geo.penalized_hessian.0;
-                let x_dense = design.design.to_dense();
-                match gam::inference::full_conformal::GaussianJackknifePlusStats::from_design_unit_weight_normal_matrix(
-                    &x_dense,
-                    &y,
-                    &weights,
-                    m,
-                ) {
-                    Ok(stats) => {
-                        payload.gaussian_jackknife_plus = Some(stats);
-                    }
-                    Err(_) => {
-                        // Non-unit weights or other precondition failure: silently skip.
-                        // predict falls back to the posterior band as documented.
-                    }
-                }
-                // Exact full-conformal substrate (#1098): same eligibility, persists
-                // X + y + frozen Sλ so the EXACT distribution-free set replays per
-                // test point. Sλ = M − XᵀX is recovered inside the substrate ctor.
-                match gam::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-                    &x_dense,
-                    &y,
-                    &weights,
-                    m,
-                ) {
-                    Ok(sub) => {
-                        payload.full_conformal = Some(sub);
-                    }
-                    Err(_) => {
-                        // Precondition failure: skip; predict errors clearly or
-                        // falls back to jackknife+/posterior band.
-                    }
-                }
-            }
-        }
-        set_saved_offset_columns(
-            &mut payload,
-            fit_config.offset_column.clone(),
-            fit_config.noise_offset_column.clone(),
-        );
-        set_saved_weight_column(&mut payload, fit_config.weight_column.clone());
-        write_payload_json(&out, payload)?;
-    }
-
-    emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-    Ok(())
 }
-
-/// Expectile (Newey–Powell LAWS) standard-GAM fit for the CLI.
-///
-/// Mirrors the dedicated transformation-normal / marginal-slope CLI sub-fits:
-/// it routes through the single shared dispatch seam
-/// [`fit_expectile_if_requested`], which runs the iteratively-reweighted
-/// Gaussian-identity GAM and returns an ordinary [`StandardFitResult`] whose
-/// coefficients ARE the τ-expectile. The fit is reported and persisted as the
-/// Gaussian-identity standard model it is — predict, bands, and persistence work
-/// unchanged. The exact Gaussian jackknife+/full-conformal substrates the
-/// symmetric path attaches are deliberately omitted: their finite-sample
-/// coverage proof needs exchangeable unit-weight rows, which the asymmetric LAWS
-/// weighting breaks, so attaching them would advertise a guarantee the expectile
-/// fit does not hold.
-pub(crate) fn run_fit_expectile(
-    args: &FitArgs,
-    ds: &Dataset,
-    formula_text: &str,
-    fit_config: &FitConfig,
-) -> Result<(), String> {
-    let phase_start = std::time::Instant::now();
-    let tau = args.expectile_tau.unwrap_or(0.5);
-    log::info!(
-        "[PHASE] expectile-LAWS fit start n={} tau={tau}",
-        ds.values.nrows()
-    );
-    let result =
-        gam::families::fit_orchestration::fit_expectile_if_requested(formula_text, ds, fit_config)
-            .map_err(|e| format!("expectile fit failed: {e}"))?
-            .ok_or_else(|| {
-                "internal error: run_fit_expectile entered for a non-expectile family".to_string()
-            })?;
-    log::info!(
-        "[PHASE] expectile-LAWS fit end elapsed={:.3}s",
-        phase_start.elapsed().as_secs_f64()
-    );
-
-    let StandardFitResult {
-        fit,
-        design,
-        resolvedspec,
-        adaptive_diagnostics,
-        saved_link_state,
-        ..
-    } = result;
-    // The inner family is Gaussian-identity; the LAWS coefficients are reported
-    // and persisted as that standard model.
-    let family = fit
-        .likelihood_family
-        .clone()
-        .unwrap_or_else(LikelihoodSpec::gaussian_identity);
-
-    cli_out!(
-        "expectile fit | tau={:.4} | terms={} | edf={:.3} | scale={:.6e}",
-        tau,
-        resolvedspec.smooth_terms.len() + resolvedspec.linear_terms.len(),
-        fit.edf_total().unwrap_or(f64::NAN),
-        fit.dispersion_phi(),
-    );
-
-    if let Some(out) = args.out.as_ref() {
-        let frozenspec = freeze_term_collection_from_design(&resolvedspec, &design)
-            .map_err(|e| e.to_string())?;
-        let mut saved_fit = fit.clone();
-        saved_fit.fitted_link = saved_link_state.clone();
-        compact_fit_result_for_batch(&mut saved_fit);
-        let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
-            formula_text.to_string(),
-            ModelKind::Standard,
-            FittedFamily::Standard {
-                likelihood: family.clone(),
-                link: StandardLink::try_from(family.link_function()).ok(),
-                latent_cloglog_state: None,
-                mixture_state: saved_mixture_state_from_fit(&saved_fit),
-                sas_state: saved_sas_state_from_fit(&saved_fit),
-            },
-            family.name().to_string(),
-        );
-        payload.unified = Some(saved_fit.clone());
-        payload.fit_result = Some(saved_fit.clone());
-        payload.data_schema = Some(ds.schema.clone());
-        payload.link = inverse_link_from_fitted_link_state(&saved_fit.fitted_link);
-        set_training_feature_metadata_from_dataset(&mut payload, ds);
-        payload.resolved_termspec = Some(frozenspec);
-        payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
-        set_saved_offset_columns(
-            &mut payload,
-            fit_config.offset_column.clone(),
-            fit_config.noise_offset_column.clone(),
-        );
-        write_payload_json(out, payload)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn run_fit_bernoulli_marginal_slope(
     args: &FitArgs,
     ds: &Dataset,

@@ -278,7 +278,7 @@ pub(crate) fn materialize_standard<'a>(
             ..Default::default()
         },
     );
-    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let kappa_options = config.spatial_optimization.clone();
 
     let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {
         if !family.is_binomial() {

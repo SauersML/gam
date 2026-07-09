@@ -47,7 +47,7 @@ pub struct InnerSolution<'dp> {
     /// for non-canonical links. Using expected Fisher H_Fisher = X'W_Fisher X + S
     /// would make this a PQL surrogate rather than the exact Laplace approximation.
     /// See response.md Section 3 for the mathematical justification.
-    pub hessian_op: Arc<dyn HessianOperator>,
+    pub hessian_op: Arc<dyn HessianFactorization>,
 
     // === Coefficients and penalty structure ===
     /// β̂ — coefficients at the converged mode (in the operator's native basis).
@@ -255,7 +255,7 @@ pub struct InnerSolutionBuilder<'dp> {
     // Required fields
     pub(crate) log_likelihood: f64,
     pub(crate) penalty_quadratic: f64,
-    pub(crate) hessian_op: Arc<dyn HessianOperator>,
+    pub(crate) hessian_op: Arc<dyn HessianFactorization>,
     pub(crate) beta: Array1<f64>,
     pub(crate) penalty_coords: Vec<PenaltyCoordinate>,
     pub(crate) penalty_logdet: PenaltyLogdetDerivs,
@@ -289,7 +289,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         penalty_quadratic: f64,
         beta: Array1<f64>,
         n_observations: usize,
-        hessian_op: Arc<dyn HessianOperator>,
+        hessian_op: Arc<dyn HessianFactorization>,
         penalty_coords: Vec<PenaltyCoordinate>,
         penalty_logdet: PenaltyLogdetDerivs,
         dispersion: DispersionHandling,

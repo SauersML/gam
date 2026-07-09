@@ -519,7 +519,7 @@ impl<'a> RemlState<'a> {
         result
             .hessian
             .materialize_dense()
-            .map_err(EstimationError::RemlOptimizationFailed)?
+            .map_err(|error| EstimationError::RemlOptimizationFailed(error.to_string()))?
             .ok_or_else(|| {
                 EstimationError::RemlOptimizationFailed(
                     "Unified Hessian returned no analytic representation for VGH mode".into(),

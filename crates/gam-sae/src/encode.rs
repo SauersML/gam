@@ -1304,11 +1304,8 @@ pub(crate) fn beta_eta_newton(
     // `eigh(Side::Lower)` (which uses the lower triangle) exactly.
     let d = h.nrows();
     if d == 1 {
-        // A 1-D chart has no identifiable subspace ALONGSIDE a null to deflate:
-        // its single direction is either the (positive-curvature) certifiable
-        // coordinate or it is not, so the ridge-0 gate is exactly right here and
-        // the #1095/#2228 rank-1 radial-null deflation (which needs `d ≥ 2`, a
-        // kept direction beside the null) does not apply.
+        // A coordinate direction is certifiable only when the actual derivative
+        // F'(t) has strictly positive, resolved curvature.
         let h00 = h[[0, 0]];
         if !(h00.is_finite() && h00 > 0.0) {
             return Ok(None);
@@ -1334,10 +1331,9 @@ pub(crate) fn beta_eta_newton(
             return Ok(None);
         }
         let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
-        // Healthy PD block — smallest eigenvalue clears the spectral null band —
-        // keeps the closed-form fast path bit-for-bit (no eigenvector solve on the
-        // encode hot loop). A genuinely negative or near-null block falls through
-        // to the deflation path, which needs the eigenvectors.
+        // Healthy PD block — smallest eigenvalue clears the numerical null band —
+        // keeps the closed-form fast path. A negative or unresolved eigenvalue is
+        // not invertible as F'(t), so ordinary Kantorovich cannot certify it.
         if lambda_min > floor {
             // δ = −H⁻¹g with H⁻¹ = [[c, −b], [−b, a]] / det (det = λ_min·λ_max > 0).
             let inv_det = 1.0 / det;
@@ -1354,42 +1350,17 @@ pub(crate) fn beta_eta_newton(
             let eta = (d0 * d0 + d1 * d1).sqrt();
             return Ok(Some((1.0 / lambda_min, eta, delta)));
         }
-        return beta_eta_newton_spectral_deflated(h, g);
+        return Ok(None);
     }
-    // General `d ≥ 3` block: spectral path with the same #1095/#2228 unit-stiffness
-    // deflation of a rank-deficient chart's radial null.
-    beta_eta_newton_spectral_deflated(h, g)
+    beta_eta_newton_positive_definite(h, g)
 }
 
-/// [`beta_eta_newton`] on the eigen-spectrum with the #1095/#2228 unit-stiffness
-/// deflation of a rank-deficient chart's radial null.
-///
-/// On an over-parametrized chart (e.g. `d_atom = 2` on intrinsic-1-D circle data)
-/// every per-row encode Hessian carries a rank-1 radial NULL: `λ_min ≈ 0`, so the
-/// ridge-0 gate `λ_min > 0` rejects a perfectly good fit and the amortized encoder
-/// silently falls back to the exact multi-start solve for that whole chart. This
-/// is the encode twin of the evidence-side
-/// [`gam_solve::arrow_schur`] `factor_spectral_deflated_evidence_row`, and it uses
-/// the IDENTICAL relative spectral floor: a direction whose eigenvalue sits in the
-/// numerical null band `|λ| ≤ floor·max|λ|` is stiffened to UNIT curvature
-/// (`λ̃ = 1`, the ρ-independent `log 1 = 0` quotient pseudo-determinant
-/// convention). The Kantorovich quantities are then measured on the deflated
-/// operator `H̃`, which is exactly the operator the returned Newton step
-/// `δ = −H̃⁻¹g` iterates — so the certificate guarantees convergence of the SAME
-/// (null-frozen) iteration the caller runs, on the identifiable (angular)
-/// complement. On a genuine null the gradient has no null-direction component
-/// (`vᵀg ≈ 0`), so `δ` picks up no motion along the deflated direction and the
-/// reconstruction is unchanged to floor precision.
-///
-/// UNLIKE the evidence factor, a GENUINELY negative-curvature direction
-/// (`λ < −floor·max|λ|`) is REFUSED (returns `None`), not deflated: the evidence
-/// deflation runs at a valid stationary point where an indefinite `H_tt` is a
-/// legitimate quotient direction, but this is a basin-CONVERGENCE certificate, and
-/// negative curvature means the start is at or past a saddle/max of the encode
-/// objective where Newton does not converge to the minimum. Deflating it to `+1`
-/// would manufacture a false certificate. This preserves the pre-existing
-/// negative-curvature refusal exactly while curing only the rank-null case.
-fn beta_eta_newton_spectral_deflated(
+/// Spectral path for `d ≥ 3`. Ordinary Newton--Kantorovich requires the inverse
+/// of the actual derivative `F'(t) = H`; quotienting or replacing a null
+/// eigenvalue changes that derivative and therefore cannot certify the returned
+/// iteration. We consequently accept only a numerically resolved positive-
+/// definite Hessian and report every singular/indefinite start as uncertified.
+fn beta_eta_newton_positive_definite(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
 ) -> Result<Option<(f64, f64, Array1<f64>)>, String> {
@@ -1417,33 +1388,17 @@ fn beta_eta_newton_spectral_deflated(
         return Ok(None);
     }
     let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
-    // Conditioned spectrum: keep genuine positive curvature, deflate the numerical
-    // null band to unit stiffness, refuse on genuine negative curvature.
-    let mut cond = Array1::<f64>::zeros(d);
-    for (idx, &lambda) in vals.iter().enumerate() {
-        if !lambda.is_finite() {
-            return Ok(None);
-        }
-        cond[idx] = if lambda > floor {
-            lambda
-        } else if lambda >= -floor {
-            // Rank-null / numerically-flat radial direction → unit stiffness.
-            1.0
-        } else {
-            // Genuine negative curvature: past a basin boundary — flag.
-            return Ok(None);
-        };
+    if vals.iter().any(|&lambda| !lambda.is_finite() || lambda <= floor) {
+        return Ok(None);
     }
-    let lambda_min = cond.iter().cloned().fold(f64::INFINITY, f64::min);
+    let lambda_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
     if !(lambda_min.is_finite() && lambda_min > 0.0) {
         return Ok(None);
     }
     let beta = 1.0 / lambda_min;
-    // Newton step δ = −H̃⁻¹ g via the eigendecomposition: δ = −Σ_i (vᵢᵀg/λ̃ᵢ) vᵢ,
-    // with the deflated eigenvalue λ̃_i in place of a raw sub-floor λ_i. A genuine
-    // null carries vᵢᵀg ≈ 0, so the deflated direction contributes ≈ 0 step.
+    // Newton step δ = −H⁻¹g via the eigendecomposition of the actual Hessian.
     let mut delta = Array1::<f64>::zeros(d);
-    for (col, &lam) in cond.iter().enumerate() {
+    for (col, &lam) in vals.iter().enumerate() {
         let vi = vecs.column(col);
         let coeff = vi.dot(&g) / lam;
         for row in 0..d {
@@ -4661,53 +4616,24 @@ mod encode_fix_tests {
         assert!(!warmup_should_reject(false, 0.4, 0.9));
     }
 
-    // ---------------------------------------------------------------------
-    // #1095 / #2228 — the encode Kantorovich certificate must not refuse a
-    // rank-deficient (radial-null) over-parametrized chart's per-row Hessian.
-    // `beta_eta_newton` reads the undamped, non-deflated per-row `H_tt`; on a
-    // d≥2 chart carrying intrinsically lower-dimensional data every row plants a
-    // rank-1 null, so the old `λ_min > 0` gate returned `None` (uncertified) and
-    // silently disabled the amortized encoder for that whole chart. The fix
-    // deflates the numerical null band to unit stiffness (`log 1 = 0`) and
-    // certifies on the identifiable subspace, while STILL refusing genuine
-    // negative curvature (a saddle/max the Kantorovich certificate must reject).
-    // ---------------------------------------------------------------------
-
-    /// A rank-1 null 2×2 (one genuine positive curvature, one radial null) now
-    /// CERTIFIES: β finite, and the Newton step picks up NO motion along the
-    /// deflated null direction because the null carries zero gradient — exactly
-    /// the over-parametrized-circle geometry of #1095/#2228.
+    // A singular Hessian is not invertible as the derivative F'(t). Replacing
+    // its null eigenvalue by an arbitrary stiffness describes a different map,
+    // so it must never produce an ordinary Kantorovich certificate.
     #[test]
-    fn beta_eta_newton_deflates_rank1_null_2x2() {
-        // H = diag(4, 0): axis-0 is the identifiable (angular) direction, axis-1
-        // is the radial null. g lives entirely in the identifiable direction.
+    fn beta_eta_newton_refuses_rank1_null_2x2() {
         let h = ndarray::array![[4.0_f64, 0.0], [0.0, 0.0]];
         let g = Array1::from(vec![4.0_f64, 0.0]);
-        let out = beta_eta_newton(h.view(), g.view())
-            .expect("beta_eta_newton runs")
-            .expect("a rank-1 null block must CERTIFY after unit-stiffness deflation (#1095/#2228)");
-        let (beta, eta, delta) = out;
-        // λ_min of the deflated spectrum is the unit-stiffness null → β = 1.
-        assert!(beta.is_finite() && (beta - 1.0).abs() < 1e-9, "β={beta}");
-        // Identifiable Newton step −g₀/4 = −1 on axis 0; ZERO on the deflated null.
-        assert!((delta[0] + 1.0).abs() < 1e-9, "delta0={}", delta[0]);
-        assert!(delta[1].abs() < 1e-9, "null-direction step must be ~0, got {}", delta[1]);
-        assert!((eta - 1.0).abs() < 1e-9, "eta={eta}");
+        assert!(beta_eta_newton(h.view(), g.view()).expect("runs").is_none());
     }
 
-    /// A tiny (sub-floor) gradient component ALONG the null direction produces a
-    /// BOUNDED step (`−g_null / 1`), never the `−g_null / 0` blow-up the old
-    /// ridge-0 factor would imply — the certificate stays finite and usable.
+    /// Refusal is independent of whether the observed gradient happens to have a
+    /// small projection onto the null direction: that observation cannot turn a
+    /// singular derivative into the derivative required by the theorem.
     #[test]
-    fn beta_eta_newton_null_direction_step_is_bounded() {
+    fn beta_eta_newton_refuses_null_with_projected_gradient() {
         let h = ndarray::array![[4.0_f64, 0.0], [0.0, 0.0]];
         let g = Array1::from(vec![4.0_f64, 1.0e-3]);
-        let (_beta, eta, delta) = beta_eta_newton(h.view(), g.view())
-            .expect("runs")
-            .expect("certifies");
-        // Null-direction step is exactly −g_null / λ̃_null = −1e-3, not divergent.
-        assert!((delta[1] + 1.0e-3).abs() < 1e-12, "delta1={}", delta[1]);
-        assert!(eta.is_finite() && eta < 2.0, "eta={eta}");
+        assert!(beta_eta_newton(h.view(), g.view()).expect("runs").is_none());
     }
 
     /// A genuinely INDEFINITE 2×2 (one negative eigenvalue) is STILL refused —
@@ -4725,22 +4651,17 @@ mod encode_fix_tests {
         );
     }
 
-    /// A rank-deficient 3×3 PSD block (null in one direction) certifies on the
-    /// general `d ≥ 3` eigen path, mirroring the 2×2 case.
+    /// The general eigen path applies the same refusal to a rank-deficient PSD
+    /// block instead of silently changing its spectrum.
     #[test]
-    fn beta_eta_newton_deflates_rank_deficient_3x3() {
+    fn beta_eta_newton_refuses_rank_deficient_3x3() {
         let h = ndarray::array![
             [4.0_f64, 0.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0]
         ];
         let g = Array1::from(vec![4.0_f64, 1.0, 0.0]);
-        let (beta, _eta, delta) = beta_eta_newton(h.view(), g.view())
-            .expect("runs")
-            .expect("rank-deficient 3×3 PSD must certify after deflation");
-        assert!(beta.is_finite() && beta > 0.0, "β={beta}");
-        assert!((delta[0] + 1.0).abs() < 1e-9 && (delta[1] + 1.0).abs() < 1e-9);
-        assert!(delta[2].abs() < 1e-9, "null-direction step must be ~0, got {}", delta[2]);
+        assert!(beta_eta_newton(h.view(), g.view()).expect("runs").is_none());
     }
 
     /// A healthy positive-definite 2×2 is UNCHANGED by the fix: it keeps the

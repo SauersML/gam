@@ -12,7 +12,7 @@ use super::*;
 //   tr(G_ε C[u])    = uᵀ Xᵀ (c ⊙ h^G) = uᵀ v
 pub(crate) fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     leverage: &Array1<f64>,
 ) -> Result<Array1<f64>, String> {
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
@@ -168,7 +168,7 @@ pub(crate) fn compute_fourth_derivative_trace_matrix(
 /// Otherwise falls back to the O(p²) direct path:
 ///   u = H⁻¹(rhs),  correction = hessian_second_derivative_correction(v_i, v_j, u)
 pub(crate) fn compute_ift_correction_trace(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     rhs: &Array1<f64>,
     v_i: &Array1<f64>,
     v_j: &Array1<f64>,
@@ -238,7 +238,7 @@ pub(crate) fn compute_ift_correction_trace(
 /// For ρ coordinates, B_k = A_k (penalty derivative) is β-independent, so
 /// `b_depends_on_beta = false` and this returns 0.
 pub(crate) fn compute_drift_deriv_traces(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     b_i_depends: bool,
     b_j_depends: bool,
     ext_i: Option<usize>,
@@ -285,7 +285,7 @@ pub(crate) fn compute_drift_deriv_traces(
 /// dense matrix trace.  Returns 0 when neither is provided (e.g., ρ-ρ
 /// off-diagonal where the fixed-β second drift is zero).
 pub(crate) fn compute_base_h2_trace(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     b_mat: &Array2<f64>,
     b_operator: Option<&dyn HyperOperator>,
     subspace: Option<&PenaltySubspaceTrace>,
@@ -308,7 +308,7 @@ pub(crate) fn compute_base_h2_trace(
 }
 
 pub(crate) fn compute_base_h2_traces(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     pairs: &[&HyperCoordPair],
     subspace: Option<&PenaltySubspaceTrace>,
     trace_state: Option<Arc<Mutex<StochasticTraceState>>>,
@@ -412,7 +412,7 @@ pub(crate) fn compute_base_h2_traces(
 }
 
 pub(crate) fn trace_logdet_hessian_cross_dense_drift(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     dense: &Array2<f64>,
     drift: &DriftDerivResult,
 ) -> f64 {
@@ -480,7 +480,7 @@ pub(crate) fn trace_logdet_hessian_crosses_dense_spectral_drifts(
 
 #[inline]
 pub(crate) fn can_use_stochastic_logdet_hinv_kernel(
-    hop: &dyn HessianOperator,
+    hop: &dyn HessianFactorization,
     total_p: usize,
     incl_logdet_h: bool,
 ) -> bool {

@@ -200,17 +200,13 @@ impl SaeManifoldTerm {
                 ));
             }
         }
-        // Reparameterize each atom's roughness Gram into arc length at the
-        // current decoder/coordinates (issue #673). This is the single
-        // chokepoint for both the inner Newton assembly and the undamped
-        // evidence factorization, so freezing the pullback-metric weight here
-        // (lagged-diffusivity) keeps the smoothness value, gradient, Kronecker
-        // Hessian, and REML log-det mutually consistent within each assembly
-        // and makes the converged penalty — hence the topology evidence —
-        // gauge-invariant. Constant-speed (periodic) atoms are unaffected.
-        for atom in &mut self.atoms {
-            atom.refresh_intrinsic_smooth_penalty();
-        }
+        // `smooth_penalty` is fixed for the lifetime of this objective.  In
+        // particular it is not rebuilt from the current decoder/coordinates at
+        // an assembly boundary: doing so would optimize
+        // 1/2 lambda B' S(B,t) B while assembling only lambda S B and lambda S,
+        // silently dropping every derivative of S.  Basis reparameterizations
+        // transport the fixed operator explicitly; ordinary Newton/REML steps
+        // all differentiate the same quadratic form.
         // #1026 — freeze the decoder-repulsion collinearity gate at the SAME
         // assembly chokepoint as the smoothness Gram, so the repulsion's
         // gradient/curvature (assembled below) and its value (read by the
