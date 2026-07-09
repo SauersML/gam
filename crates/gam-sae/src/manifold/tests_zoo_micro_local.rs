@@ -68,45 +68,26 @@ fn global_ev(target: &Array2<f64>, fitted: &Array2<f64>) -> f64 {
 /// rows, cold logits, coords seeded by the production decoder-grid projection,
 /// then the fixed-decoder Newton refinement — the `sae_manifold_predict_oos`
 /// math without the FFI marshalling. Returns the reconstruction EV.
+///
+/// Delegates to the PRODUCTION-FAITHFUL helper in `tests_collapse_2132`
+/// (decoder-projection coords + residual-seeded softmax logits + ρ*-threaded
+/// fixed-decoder solve). The original inline version here seeded the logits
+/// UNIFORMLY, which softmax-blends all K atoms into a near-mean reconstruction
+/// and mis-attributes routing collapse to the encode path — the flaw the
+/// #2132 status-diff caught.
 fn cold_oos_ev(
     fitted_term: &super::SaeManifoldTerm,
     rho: &super::SaeManifoldRho,
     x: &Array2<f64>,
     label: &str,
 ) -> f64 {
-    let n = x.nrows();
-    let k = fitted_term.k_atoms();
-    // Fresh assignment at the fitted mode: cold logits (uniform), zero coords.
-    let coords_blocks: Vec<Array2<f64>> = (0..k)
-        .map(|atom| {
-            let d = fitted_term.assignment.coords[atom].as_matrix().ncols();
-            Array2::<f64>::zeros((n, d))
-        })
-        .collect();
-    let manifolds: Vec<_> = (0..k)
-        .map(|atom| fitted_term.assignment.coords[atom].manifold().clone())
-        .collect();
-    let assignment = crate::assignment::SaeAssignment::from_blocks_with_mode_and_manifolds(
-        Array2::<f64>::zeros((n, k)),
-        coords_blocks,
-        manifolds,
-        fitted_term.assignment.mode.clone(),
-    )
-    .expect("cold OOS assignment");
-    // Atoms: clone the FITTED decoders; the basis is refreshed at the seeded
-    // coords by seed_coords_by_decoder_projection below.
-    let mut term =
-        super::SaeManifoldTerm::new(fitted_term.atoms.clone(), assignment).expect("cold OOS term");
-    term.seed_coords_by_decoder_projection(x.view(), 64)
-        .expect("decoder-projection seed");
-    let mut rho_oos = rho.clone();
     let t0 = Instant::now();
-    term.run_fixed_decoder_arrow_schur(x.view(), &mut rho_oos, None, 24, 1.0, 1.0e-6)
-        .expect("fixed-decoder OOS solve");
+    let ev = super::tests_collapse_2132::oos_heldout_ev(fitted_term, rho, x.view());
     let secs = t0.elapsed().as_secs_f64();
-    let fitted = term.try_fitted().expect("cold OOS fitted");
-    let ev = global_ev(x, &fitted);
-    eprintln!("[zoo-micro-local] cold OOS {label}: ev={ev:.4} solve={secs:.2}s n={n}");
+    eprintln!(
+        "[zoo-micro-local] cold OOS {label}: ev={ev:.4} solve={secs:.2}s n={}",
+        x.nrows()
+    );
     ev
 }
 

@@ -125,7 +125,7 @@ fn pca_heldout_ev(train: ArrayView2<'_, f64>, test: ArrayView2<'_, f64>, rank: u
 /// the `sae_manifold_predict_oos` math: cold coords seeded by decoder-grid
 /// projection, softmax routing logits seeded from per-atom projection residuals,
 /// then the fixed-decoder arrow-Schur coordinate solve under the fit's ρ*.
-fn oos_heldout_ev(fitted_term: &SaeManifoldTerm, rho: &SaeManifoldRho, x: ArrayView2<'_, f64>) -> f64 {
+pub(crate) fn oos_heldout_ev(fitted_term: &SaeManifoldTerm, rho: &SaeManifoldRho, x: ArrayView2<'_, f64>) -> f64 {
     let n = x.nrows();
     let k = fitted_term.k_atoms();
     let p = x.ncols();
