@@ -4,6 +4,7 @@
 
 use super::*;
 use gam_problem::{ensure_finite_scalar_estimation, validate_all_finite_estimation};
+use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
@@ -296,25 +297,23 @@ pub(crate) fn custom_family_blockwise_edf(
     // succeeds rather than dropping inference for the whole fit.
     let factor = {
         let scale = h_sym.max_abs_diag();
-        let min_step = scale * 1e-10;
-        let mut ridge = 0.0_f64;
-        let mut attempts = 0_usize;
-        loop {
+        let try_ridge = |ridge: f64| -> Option<_> {
             let candidate = if ridge > 0.0 {
                 h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
             } else {
                 h_sym.clone()
             };
-            if let Ok(f) = candidate.factorize() {
-                break f;
-            }
-            attempts += 1;
-            if attempts >= 8 {
-                return Err(
-                    "custom-family edf: penalized Hessian could not be factorized".to_string(),
-                );
-            }
-            ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+            candidate.factorize().ok()
+        };
+        // Bare (unridged) attempt first, then 7 geometric escalations from
+        // `scale·1e-10` — the pre-migration budget of 8 total attempts.
+        match try_ridge(0.0) {
+            Some(f) => f,
+            None => escalate_ridge(RidgeSchedule::geometric(scale * 1e-10, 7), try_ridge)
+                .map(|success| success.value)
+                .map_err(|_| {
+                    "custom-family edf: penalized Hessian could not be factorized".to_string()
+                })?,
         }
     };
 

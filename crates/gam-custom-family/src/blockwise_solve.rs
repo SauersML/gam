@@ -5,6 +5,7 @@
 //! labeled-rho aggregation/pullback helpers that drive the outer eval.
 
 use super::*;
+use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn aggregate_labeled_hessian(
     hessian: &Array2<f64>,
@@ -1942,22 +1943,31 @@ pub(crate) fn try_cholesky_with_escalating_ridge<R>(
     mut on_success: impl FnMut(&gam_linalg::faer_ndarray::FaerCholeskyFactor, usize, f64) -> Option<R>,
 ) -> Option<(R, f64, usize)> {
     let p = matrix.nrows();
-    let mut boost = initial_boost;
-    for attempt in 0..max_attempts {
-        let mut candidate = matrix.clone();
-        if boost != 0.0 {
-            for i in 0..p {
-                candidate[[i, i]] += boost;
+    // The shared primitive reports 1-based escalation counts; this helper's
+    // contract hands `on_success` the 0-based attempt index, so the counter
+    // lives here.
+    let mut attempt = 0_usize;
+    escalate_ridge(
+        RidgeSchedule {
+            initial: initial_boost,
+            growth,
+            max_escalations: max_attempts,
+        },
+        |boost| {
+            let this_attempt = attempt;
+            attempt += 1;
+            let mut candidate = matrix.clone();
+            if boost != 0.0 {
+                for i in 0..p {
+                    candidate[[i, i]] += boost;
+                }
             }
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower)
-            && let Some(r) = on_success(&chol, attempt, boost)
-        {
-            return Some((r, boost, attempt));
-        }
-        boost *= growth;
-    }
-    None
+            let chol = candidate.cholesky(Side::Lower).ok()?;
+            on_success(&chol, this_attempt, boost).map(|r| (r, boost, this_attempt))
+        },
+    )
+    .ok()
+    .map(|success| success.value)
 }
 
 /// Fallback for penalty pseudo-logdet when eigendecomposition fails.
@@ -2174,23 +2184,31 @@ pub(crate) fn strict_spd_lm_engine<R>(
     let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
     let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(CUSTOM_FAMILY_RIDGE_FLOOR);
 
-    let mut delta = delta0;
-    for escalation in 1..=STRICT_SPD_LM_MAX_ESCALATIONS {
-        let mut ridged = sym.clone();
-        for i in 0..p {
-            ridged[[i, i]] += delta;
-        }
-        if let Ok(chol) = ridged.cholesky(Side::Lower) {
+    let exhausted = match escalate_ridge(
+        RidgeSchedule {
+            initial: delta0,
+            growth: STRICT_SPD_LM_RIDGE_GROWTH,
+            max_escalations: STRICT_SPD_LM_MAX_ESCALATIONS,
+        },
+        |delta| {
+            let mut ridged = sym.clone();
+            for i in 0..p {
+                ridged[[i, i]] += delta;
+            }
+            ridged.cholesky(Side::Lower).ok()
+        },
+    ) {
+        Ok(success) => {
             return Ok((
-                process_chol(&chol),
+                process_chol(&success.value),
                 StrictSpdLmStats {
-                    delta_used: delta,
-                    escalations: escalation,
+                    delta_used: success.ridge,
+                    escalations: success.escalations,
                 },
             ));
         }
-        delta *= STRICT_SPD_LM_RIDGE_GROWTH;
-    }
+        Err(exhausted) => exhausted,
+    };
 
     // δ-ridge schedule exhausted; fall back to rank-aware eigen-floor handling.
     // Floors every eigenvalue at `eps_floor = 1e-12 · max|λ|` so well-conditioned
@@ -2198,6 +2216,7 @@ pub(crate) fn strict_spd_lm_engine<R>(
     // controlled curvature, preventing the spatial-adaptive pilot from collapsing
     // to a cold full-data run.
     let max_esc = STRICT_SPD_LM_MAX_ESCALATIONS;
+    let delta = exhausted.next_ridge;
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
         format!(
             "{op_label} failed even with LM δ-ridge continuation \
