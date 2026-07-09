@@ -4988,7 +4988,7 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
 
     // Matrix-free SLQ estimate — never forms S.
     let slq =
-        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
+        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, None, 48, 60, seed);
     let rel = (slq.estimate - exact_logdet).abs() / exact_logdet.abs();
     eprintln!(
         "matrix-free reduced-Schur log|S|: slq={:.6} exact={:.6} rel={:.3e} std_err={:.3e}",
@@ -5003,7 +5003,7 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
 
     // Deterministic for a fixed seed (the REML evidence outer loop requires it).
     let slq_again =
-        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, 48, 60, seed);
+        slq_reduced_schur_log_det(&sys, &htt_factors, ridge_beta, &backend, None, None, 48, 60, seed);
     assert_eq!(
         slq.estimate, slq_again.estimate,
         "matrix-free reduced-Schur SLQ log-det must be bit-reproducible for a fixed seed"
@@ -5186,7 +5186,7 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
     // tight eigenvalue tolerance, which would be flaky when the top two
     // eigenvalues are close (slow power-iteration convergence).
     let lambda_max =
-        reduced_schur_lambda_max(&sys, &htt_factors, ridge_beta, &backend, None, 80, seed)
+        reduced_schur_lambda_max(&sys, &htt_factors, ridge_beta, &backend, None, None, 80, seed)
             .expect("power iteration must produce a finite positive λ_max");
     assert!(
         lambda_max <= true_lambda_max * (1.0 + 1e-9),
@@ -5205,6 +5205,7 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         &htt_factors,
         ridge_beta,
         &backend,
+        None,
         None,
         64,   // num_probes
         seed,
@@ -5228,7 +5229,7 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
 
     // Bit-reproducible for a fixed seed.
     let (_plan2, eval2) = rational_reduced_schur_log_det(
-        &sys, &htt_factors, ridge_beta, &backend, None, 64, seed, 1e-9, 40, 1e-11, 20_000,
+        &sys, &htt_factors, ridge_beta, &backend, None, None, 64, seed, 1e-9, 40, 1e-11, 20_000,
     )
     .expect("rational surrogate must re-evaluate");
     assert_eq!(
@@ -5270,7 +5271,7 @@ fn rational_reduced_schur_directional_matches_fd_of_surrogate() {
 
     // Build the surrogate value + solve bundle once from S.
     let (plan, eval) = rational_reduced_schur_log_det(
-        &sys, &htt_factors, ridge_beta, &backend, None, 16, seed, 1e-10, 60, 1e-13, 40_000,
+        &sys, &htt_factors, ridge_beta, &backend, None, None, 16, seed, 1e-10, 60, 1e-13, 40_000,
     )
     .expect("rational surrogate must evaluate");
     let grad = rational_reduced_schur_directional(&plan, &eval, &d_matvec)

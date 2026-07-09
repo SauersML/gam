@@ -766,13 +766,34 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 //           - Σ_i H_βt_i (H_tt_i + ρ_t I)⁻¹ H_tβ_i v
                 //
                 // without materialising `S`.
-                let resident = SaeResidentReducedSchur::build(sys, htt_factors, backend);
+                // #1017 Phase-3: run the SLQ log|S| probes on the SAME resident
+                // device `S·v` this Direct path already solves the step through,
+                // built once for the evaluation. This closes the "device-apply
+                // plumbing / remaining future work" noted above: with the operator
+                // engaged, every Lanczos apply runs on device (no `O(k²)` dense
+                // assembly, no per-apply host round-trip); when it declines the
+                // shape/device the byte-identical CPU resident row-factor lane is
+                // staged instead.
+                let device_matvec = crate::arrow_schur::maybe_build_evidence_gpu_matvec(
+                    sys,
+                    ridge_t,
+                    ridge_beta,
+                    options,
+                    (SCHUR_SLQ_LOGDET_PROBES * SCHUR_SLQ_LOGDET_LANCZOS_STEPS).max(1),
+                );
+                let gpu_matvec = options.gpu_matvec.as_ref().or(device_matvec.as_ref());
+                let resident = if gpu_matvec.is_none() {
+                    SaeResidentReducedSchur::build(sys, htt_factors, backend)
+                } else {
+                    None
+                };
                 let slq = crate::arrow_schur::slq_reduced_schur_log_det(
                     sys,
                     htt_factors,
                     ridge_beta,
                     backend,
                     resident.as_ref(),
+                    gpu_matvec,
                     SCHUR_SLQ_LOGDET_PROBES,
                     SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
                     SCHUR_SLQ_LOGDET_SEED,

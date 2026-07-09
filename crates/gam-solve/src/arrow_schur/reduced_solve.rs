@@ -1523,7 +1523,7 @@ pub fn matrix_free_arrow_evidence_log_det(
 /// apply and the evidence ladder runs that apply across every probe / Lanczos /
 /// shifted-CG step, so a large budget is the honest amortisation the offload
 /// break-even is measured against.
-fn maybe_build_evidence_gpu_matvec(
+pub(crate) fn maybe_build_evidence_gpu_matvec(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,

@@ -1457,6 +1457,200 @@ mod lever_wiring_2072_tests {
             b0 / b1
         );
     }
+
+    /// #1939 / #2134 — K=3 MULTI-ACTIVE co-collapse RECOVERY through the amplitude
+    /// scale-gauge [`SaeManifoldTerm::pin_scale_gauge`]. THREE concepts are planted
+    /// on atoms 0, 1, 2, each on its OWN ambient output column (disjoint,
+    /// unit-Frobenius decoders → orthogonal gated designs `C_k`), and an IBP-MAP
+    /// gate caps each atom's activation by its COLUMN INDEX:
+    /// `a_k = σ(l_k/τ)·π_k`, `π_k = (α/(α+1))^{k+1} = {0.5, 0.25, 0.125}` at α=1.
+    /// With the logits saturated (`σ ≈ 1`) the gate is a pure ordered-prior cap, so
+    /// the UNPENALIZED-amplitude reconstruction (`s_k = 0`) delivers only `π_k` of
+    /// each planted concept and CO-COLLAPSES per active atom (`top_k>1` divergence).
+    ///
+    /// The pin peels each unit-Frobenius decoder into the unpenalized `s_k` and
+    /// re-homes the magnitude by the JOINT amplitude solve. Because the ordered
+    /// prior over-shrinks atom `k` by `1/π_k` PER COLUMN INDEX (not a single shared
+    /// scale), the recovery must be per-atom: `exp(s_k) ≈ 1/π_k` (2, 4, 8), each
+    /// atom's gated reconstruction must reach its planted concept, and the aggregate
+    /// EV must lift from the co-collapsed regime to ≈ 1. This is the generalized
+    /// (any-K) pin, the case the old `k_atoms()==1` gate could not serve.
+    #[test]
+    fn pin_scale_gauge_recovers_k3_multi_active_co_collapse_1939() {
+        use crate::assignment::ibp_map_row;
+        use crate::manifold::tests::{periodic_basis, TestPeriodicEvaluator};
+        use ndarray::Array1;
+        use std::sync::Arc;
+
+        // Three periodic atoms at distinct coords; each decoder writes ONLY its own
+        // ambient column `k` (block-diagonal in p = 3) and is unit-Frobenius, so the
+        // three gated designs `C_k` are exactly ORTHOGONAL — the joint K×K amplitude
+        // solve decouples and `exp(s_k)` reads off `1/a_k` with no cross-talk. The
+        // sin/cos loadings are nonzero so every output column VARIES across rows (a
+        // target with real, non-constant variance to explain).
+        let coords = [
+            array![[0.05], [0.20], [0.55], [0.80], [0.35]],
+            array![[0.15], [0.30], [0.65], [0.90], [0.45]],
+            array![[0.10], [0.42], [0.70], [0.25], [0.88]],
+        ];
+        let raw_cols = [
+            [0.20_f64, 0.70, -0.50],
+            [-0.30, 0.55, 0.40],
+            [0.45, -0.35, 0.60],
+        ];
+        let n = 5usize;
+        let p = 3usize;
+        let mut atoms = Vec::new();
+        let mut coords_vec = Vec::new();
+        for k in 0..3 {
+            let (phi, jet) = periodic_basis(&coords[k]);
+            let mut dec = Array2::<f64>::zeros((3, p));
+            for r in 0..3 {
+                dec[[r, k]] = raw_cols[k][r];
+            }
+            let fro = frob(&dec);
+            dec.mapv_inplace(|v| v / fro); // unit-Frobenius decoder B̂_k
+            let atom = SaeManifoldAtom::new(
+                format!("periodic{k}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                dec,
+                Array2::<f64>::eye(3),
+            )
+            .unwrap()
+            .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+            atoms.push(atom);
+            coords_vec.push(coords[k].clone());
+        }
+
+        // Saturated logits ⇒ σ(l/τ) ≈ 1 ⇒ a_k ≈ π_k: the gate is a PURE ordered
+        // prior cap by column index, the exact IBP-MAP over-shrink the pin targets.
+        let mut logits = Array2::<f64>::zeros((n, 3));
+        logits.fill(20.0);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords_vec,
+            vec![LatentManifold::Circle { period: 1.0 }; 3],
+            AssignmentMode::ibp_map(1.0, 1.0, false),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        assert_eq!(term.k_atoms(), 3);
+        let rho = SaeManifoldRho::new(0.0, -6.0, vec![array![0.0], array![0.0], array![0.0]]);
+
+        // Gate values a_k = σ(20)·π_k (σ(20) = 0.999999998 ⇒ a_k = π_k to 1e-9).
+        let gate = ibp_map_row(Array1::from(vec![20.0_f64; 3]).view(), 1.0, 1.0);
+
+        // Per-atom UNIT-amplitude gated designs C_k = a_k·Φ_k·B̂_k, read off the
+        // term's OWN reconstruction (atom k on at s = 0, the rest off) exactly as
+        // the solver's probe does. C_k is nonzero only in ambient column k.
+        const OFF: f64 = -700.0;
+        let unit_design = |term: &mut SaeManifoldTerm, kk: usize| -> Array2<f64> {
+            for (j, a) in term.atoms.iter_mut().enumerate() {
+                a.log_amplitude = if j == kk { 0.0 } else { OFF };
+            }
+            term.try_fitted_for_rho(&rho).expect("unit design probe")
+        };
+        let c: Vec<Array2<f64>> = (0..3).map(|k| unit_design(&mut term, k)).collect();
+
+        // Planted target: each concept at UNIT amplitude, gate removed:
+        // z = Σ_k Φ_k·B̂_k = Σ_k C_k / a_k. The gate can only reach a_k = π_k of it.
+        let mut z = Array2::<f64>::zeros((n, p));
+        for k in 0..3 {
+            z.scaled_add(1.0 / gate[k], &c[k]);
+        }
+        // A tiny residual in the ORTHOGONAL COMPLEMENT of span(C_0,C_1,C_2) so the
+        // penalized solve has a well-posed σ̂² > 0 (a noiseless-exact target would
+        // floor σ̂² and destabilize λ); Gram–Schmidt against each flattened C_k
+        // keeps it orthogonal, so it perturbs no atom's LS amplitude (exp(s_k) = 1/a_k
+        // is preserved) yet supplies real residual energy.
+        let mut eps = Array2::<f64>::zeros((n, p));
+        for (i, v) in eps.iter_mut().enumerate() {
+            *v = (0.7 * i as f64 + 0.3).sin();
+        }
+        for ck in &c {
+            let cf: Vec<f64> = ck.iter().copied().collect();
+            let cc: f64 = cf.iter().map(|x| x * x).sum();
+            if cc > 0.0 {
+                let ef: Vec<f64> = eps.iter().copied().collect();
+                let proj = ef.iter().zip(&cf).map(|(e, x)| e * x).sum::<f64>() / cc;
+                for (e, x) in eps.iter_mut().zip(cf.iter()) {
+                    *e -= proj * x;
+                }
+            }
+        }
+        let znorm = z.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let enorm = eps.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+        eps.mapv_inplace(|v| v * 0.03 * znorm / enorm); // ≈ 3% orthogonal residual
+        z = &z + &eps;
+
+        // Co-collapsed regime: unpenalized amplitude (s_k = 0) ⇒ the gate delivers
+        // only a_k = π_k of each concept ⇒ the reconstruction cannot reach z.
+        for atom in term.atoms.iter_mut() {
+            atom.log_amplitude = 0.0;
+        }
+        let ev_before = term
+            .dictionary_reconstruction_ev(z.view(), &rho)
+            .expect("EV defined");
+        assert!(
+            ev_before < 0.5,
+            "the s_k = 0 gate-capped reconstruction must CO-COLLAPSE (EV = {ev_before:.4}); \
+             each atom delivers only π_k of its concept"
+        );
+
+        // The cure: peel each unit decoder into s_k, re-home by the joint solve.
+        term.pin_scale_gauge(z.view(), &rho)
+            .expect("multi-active scale-gauge pin");
+
+        // (1) exp(s_k) ≈ 1/π_k emerges PER ATOM (2, 4, 8) — per-column-index
+        //     compensation, not one shared scale.
+        let mut amp = [0.0_f64; 3];
+        for k in 0..3 {
+            amp[k] = term.atoms[k].log_amplitude.exp();
+            let pi_k = 0.5_f64.powi(k as i32 + 1);
+            let want = 1.0 / gate[k]; // = 1/a_k ≈ 1/π_k
+            assert!(
+                (amp[k] - want).abs() <= 0.08 * want,
+                "atom {k}: exp(s_k) = {:.5} must recover 1/a_k = {want:.5} (≈ 1/π_k = {:.3})",
+                amp[k],
+                1.0 / pi_k
+            );
+        }
+        // (2) The per-atom amplitudes are DISTINCT and ordered by column index — the
+        //     hallmark of per-π_k compensation (a single shared scale cannot do this).
+        assert!(
+            amp[0] < amp[1] && amp[1] < amp[2],
+            "per-column-index compensation must be ordered: {amp:?}"
+        );
+
+        // (3) Per-atom gated reconstruction now REACHES the planted concept: the
+        //     recovered fitted output matches z within the seeded residual.
+        let fitted = term.try_fitted_for_rho(&rho).expect("recovered fitted");
+        for k in 0..3 {
+            let col_sig: f64 = (0..n).map(|r| z[[r, k]] * z[[r, k]]).sum::<f64>().sqrt();
+            let col_res: f64 = (0..n)
+                .map(|r| (fitted[[r, k]] - z[[r, k]]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                col_res <= 0.15 * col_sig.max(1e-12),
+                "atom {k} gated reconstruction must reach its concept column \
+                 (residual {col_res:.4} vs signal {col_sig:.4})"
+            );
+        }
+
+        // (4) Aggregate reconstruction EV lifts out of the co-collapse to ≈ 1.
+        let ev_after = term
+            .dictionary_reconstruction_ev(z.view(), &rho)
+            .expect("EV defined");
+        assert!(
+            ev_after > 0.9,
+            "the scale-gauge pin must recover the multi-active reconstruction \
+             (EV {ev_before:.4} → {ev_after:.4})"
+        );
+    }
 }
 
 #[cfg(test)]
