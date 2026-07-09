@@ -110,6 +110,79 @@ pub fn unit_frobenius_tangent_projection(
     out
 }
 
+/// A joint decoder-frame + log-amplitude Newton step with the SCALE gauge
+/// nullvector removed in place.
+#[derive(Debug, Clone)]
+pub struct GaugeCleanedJointStep {
+    /// Decoder-block step `δB_k` with the scale-gauge component removed.
+    pub decoder_step: Array2<f64>,
+    /// Log-amplitude step `δs_k` with the scale-gauge component removed.
+    pub log_amplitude_step: f64,
+}
+
+/// Project a JOINT `(δB_k, δs_k)` Newton step onto the orthogonal complement of
+/// the atom's exact SCALE-gauge nullvector `v = (vec(B_k), −1)`, returning the
+/// gauge-cleaned step (#2022 — quotient the scale nullvector out of the INNER
+/// solve).
+///
+/// # Why the JOINT projection, not the decoder-only radial one
+///
+/// The decoded contribution is `exp(s_k)·Φ·B_k`, invariant under the one-
+/// parameter gauge `B_k ↦ (1+ε)B_k`, `s_k ↦ s_k − ε` — infinitesimally the
+/// direction `v = (vec(B_k), −1)`:
+///
+/// ```text
+///   d/dε [ exp(s−ε) (1+ε) B ] |_{ε=0} = exp(s)(B − B) = 0.
+/// ```
+///
+/// So `v` is an EXACT Hessian nullvector of the penalized objective: the inner
+/// Newton solve is free to slide along it, which is the representable scale
+/// gauge the PD-floor and evidence-deflation budget exist to floor. Removing the
+/// component of the step along `v` makes that slide unrepresentable *in the step
+/// itself*, so the nullvector never enters the trajectory.
+///
+/// The [`unit_frobenius_tangent_projection`] above removes the radial part of a
+/// decoder-ONLY step (`δs` frozen). That kills genuine magnitude growth too:
+/// with `s` fixed, the only way to grow `‖exp(s)B‖` is to grow `‖B‖`, which the
+/// radial projection annihilates — the fight that made the unconditional
+/// `‖B‖≡1` retraction detonate a healthy fit (#2100). The JOINT projection does
+/// NOT: it removes only the unobservable direction `v`, and the observable
+/// magnitude-growth direction `(vec(B), +1)` (which *doubles* `exp(s)‖B‖`, i.e.
+/// is orthogonal to `v` in the sum/difference decomposition) passes through —
+/// re-expressed in the canonical representative that splits the growth across
+/// the frame and amplitude channels. So a healthy fit still grows its atoms;
+/// only the redundant scale↔amplitude trade-off is quotiented away.
+///
+/// The projection is exact and idempotent (a metric projector): re-applying it
+/// is a no-op, and a pure gauge step `t·v` maps to zero. `B_k` need not be
+/// unit-Frobenius — the coefficient uses `⟨v,v⟩ = ‖B_k‖² + 1`, so it is correct
+/// for a mid-solve frame that still carries scale.
+pub fn project_scale_gauge_from_joint_step(
+    decoder: ArrayView2<'_, f64>,
+    decoder_step: ArrayView2<'_, f64>,
+    log_amplitude_step: f64,
+) -> GaugeCleanedJointStep {
+    // ⟨Δ, v⟩ = ⟨δB, B⟩_F + δs·(−1);  ⟨v, v⟩ = ‖B‖_F² + 1.
+    let bb: f64 = decoder.iter().map(|v| v * v).sum();
+    let vv = bb + 1.0;
+    let db_b: f64 = decoder_step
+        .iter()
+        .zip(decoder.iter())
+        .map(|(d, b)| d * b)
+        .sum();
+    let dot = db_b - log_amplitude_step;
+    let coeff = dot / vv;
+    // Δ' = Δ − coeff·v  ⇒  δB' = δB − coeff·B,  δs' = δs − coeff·(−1) = δs + coeff.
+    let mut decoder_out = decoder_step.to_owned();
+    for (o, b) in decoder_out.iter_mut().zip(decoder.iter()) {
+        *o -= coeff * b;
+    }
+    GaugeCleanedJointStep {
+        decoder_step: decoder_out,
+        log_amplitude_step: log_amplitude_step + coeff,
+    }
+}
+
 /// #1939 cone atom — the Hoyer sparsity prior on the atoms' explicit
 /// amplitudes `a_k = exp(s_k)`, evaluated as an energy in the log-amplitudes
 /// `s = (s_1, …, s_K)`.
@@ -1725,6 +1798,85 @@ mod tests {
             drift < 1e-12,
             "tangent gradient must pass through, drift {drift}"
         );
+    }
+
+    #[test]
+    fn joint_scale_gauge_projection_annihilates_nullvector_preserves_complement_idempotent() {
+        use super::project_scale_gauge_from_joint_step;
+        // A frame that still carries scale (‖B‖_F ≠ 1) — the mid-inner-solve
+        // regime the projection must handle.
+        let b = array![[0.6_f64, -0.3], [0.9, 0.2]];
+        let bb: f64 = b.iter().map(|v| v * v).sum();
+
+        // (1) A pure gauge step t·v = (t·B, −t) must map to exactly zero, in both
+        // the decoder and amplitude channels.
+        let t = 1.7_f64;
+        let gauge_db = b.mapv(|v| t * v);
+        let cleaned = project_scale_gauge_from_joint_step(b.view(), gauge_db.view(), -t);
+        let worst_db = cleaned.decoder_step.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(
+            worst_db < 1e-12 && cleaned.log_amplitude_step.abs() < 1e-12,
+            "pure gauge step must project to 0: |δB'|max={worst_db}, δs'={}",
+            cleaned.log_amplitude_step
+        );
+
+        // (2) A step ORTHOGONAL to v must pass through unchanged. Build one with
+        // ⟨δB,B⟩_F − δs = 0: take a decoder step with ⟨δB,B⟩_F = q and δs = q.
+        let raw_db = array![[0.1_f64, 0.4], [-0.2, 0.05]];
+        let q: f64 = raw_db.iter().zip(b.iter()).map(|(d, x)| d * x).sum();
+        let cleaned_o = project_scale_gauge_from_joint_step(b.view(), raw_db.view(), q);
+        let drift = cleaned_o
+            .decoder_step
+            .iter()
+            .zip(raw_db.iter())
+            .map(|(a, c)| (a - c).abs())
+            .fold((cleaned_o.log_amplitude_step - q).abs(), f64::max);
+        assert!(drift < 1e-12, "orthogonal step must pass through, drift {drift}");
+
+        // (3) The magnitude-growth direction (vec(B), +1) is OBSERVABLE (doubles
+        // exp(s)‖B‖) and must NOT be annihilated — its observable content, the
+        // component ⟨Δ',v⟩ removed but everything else kept, survives.
+        let grow_db = b.clone();
+        let grown = project_scale_gauge_from_joint_step(b.view(), grow_db.view(), 1.0);
+        let residual_norm: f64 = grown
+            .decoder_step
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            residual_norm > 1e-6 || grown.log_amplitude_step.abs() > 1e-6,
+            "observable magnitude growth must survive the projection"
+        );
+
+        // (4) Idempotence: re-projecting a cleaned step changes nothing.
+        let twice = project_scale_gauge_from_joint_step(
+            b.view(),
+            cleaned_o.decoder_step.view(),
+            cleaned_o.log_amplitude_step,
+        );
+        let idem = twice
+            .decoder_step
+            .iter()
+            .zip(cleaned_o.decoder_step.iter())
+            .map(|(a, c)| (a - c).abs())
+            .fold((twice.log_amplitude_step - cleaned_o.log_amplitude_step).abs(), f64::max);
+        assert!(idem < 1e-12, "projection must be idempotent, drift {idem}");
+
+        // (5) After projection the cleaned step is orthogonal to v: ⟨δB',B⟩−δs' = 0.
+        let dot_after: f64 = grown
+            .decoder_step
+            .iter()
+            .zip(b.iter())
+            .map(|(d, x)| d * x)
+            .sum::<f64>()
+            - grown.log_amplitude_step;
+        assert!(
+            dot_after.abs() < 1e-12,
+            "cleaned step must be orthogonal to the gauge nullvector, ⟨Δ',v⟩={dot_after}"
+        );
+        // Guard the fixture is non-degenerate.
+        assert!(bb > 0.0);
     }
 
     #[test]
