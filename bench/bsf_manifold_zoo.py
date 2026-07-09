@@ -173,14 +173,49 @@ class FactorInstance:
 
 
 class ZooData:
-    """Additive mixture of manifolds: their toy DGP, exactly."""
+    """Additive mixture of manifolds.
+
+    ``dgp="toy"`` is their toy DGP exactly: every factor unit-importance,
+    uniform-without-replacement active sets of fixed size ``l0``, unit
+    amplitudes, no noise floor.
+
+    ``dgp="llm"`` reshapes the SAME manifold mixture into the statistics real
+    LLM residual-stream features show:
+
+    * **Zipfian firing** — feature ``i`` fires independently with probability
+      ``∝ (i+1)^-zipf`` (mean row support ``l0``), so rows have variable L0
+      with a few frequent features and a long tail.
+    * **Context-correlated co-occurrence** — each row draws one of a few
+      latent contexts; a context doubles the firing rate of its feature
+      subset (topics make features co-fire; marginal rates preserved).
+    * **Power-law importance** — feature ``i`` contributes at scale
+      ``∝ (i+1)^-importance`` (a few dominant directions, a long tail).
+    * **Heavy-tailed amplitudes** — every firing scales its contribution by a
+      mean-one lognormal, so features have continuous strength, not 0/1.
+    * **Unstructured noise floor** — dense isotropic Gaussian residual the
+      dictionary should NOT explain (the unexplained-variance floor every
+      real SAE faces).
+
+    The curved minority (circles / helices — the day-of-week and numeric
+    features found in real models) is controlled by ``curved_fraction`` as
+    before; realistic runs want it low (~0.25) with the rest segments.
+    """
 
     def __init__(self, m_factors: int, d_ambient: int, l0: int, seed: int, *,
-                 curved_fraction: float = 0.5) -> None:
+                 curved_fraction: float = 0.5, dgp: str = "toy",
+                 zipf: float = 1.0, importance: float = 0.5,
+                 amp_sigma: float = 0.6, noise: float = 0.25,
+                 n_contexts: int = 4) -> None:
         self.m_factors = int(m_factors)
         self.d_ambient = int(d_ambient)
         self.l0 = int(l0)
         self.seed = int(seed)
+        if dgp not in ("toy", "llm"):
+            raise ValueError(f"dgp must be 'toy' or 'llm'; got {dgp!r}")
+        self.dgp = dgp
+        self.noise = float(noise)
+        self.amp_sigma = float(amp_sigma)
+        self.n_contexts = int(n_contexts)
         rng = np.random.default_rng(seed)
         self.factors: list[FactorInstance] = []
         n_curved = int(round(curved_fraction * m_factors))
@@ -201,6 +236,23 @@ class ZooData:
                                sigma=max(sigma, 1e-12))
             )
         self.kinds = kinds
+        if dgp == "llm":
+            ranks = np.arange(1, self.m_factors + 1, dtype=float)
+            probs = ranks ** -float(zipf)
+            self.base_probs = np.minimum(probs * (self.l0 / probs.sum()), 0.95)
+            weights = ranks ** -float(importance)
+            self.importance = weights / weights.mean()
+            # Each context DOUBLES the rate of a random third of the features
+            # and scales the rest so every feature's marginal rate (averaged
+            # over contexts) is exactly its Zipf base rate.
+            boost, frac = 2.0, 1.0 / 3.0
+            off_gain = (1.0 - frac * boost) / (1.0 - frac)
+            self.context_gain = np.full((self.n_contexts, self.m_factors), off_gain)
+            for ctx in range(self.n_contexts):
+                subset = rng.choice(self.m_factors,
+                                    size=max(1, int(round(frac * self.m_factors))),
+                                    replace=False)
+                self.context_gain[ctx, subset] = boost
 
     def sample(
         self, n: int, seed: int, *, keep_contributions: bool
@@ -215,10 +267,21 @@ class ZooData:
         rng = np.random.default_rng(seed)
         x = np.zeros((n, self.d_ambient))
         active = np.zeros((n, self.m_factors), dtype=bool)
-        # Uniform-without-replacement active sets, vectorized via argsort.
-        order = np.argsort(rng.random((n, self.m_factors)), axis=1)[:, : self.l0]
-        rows = np.repeat(np.arange(n), self.l0)
-        active[rows, order.ravel()] = True
+        if self.dgp == "llm":
+            # Zipfian per-feature Bernoulli firing, correlated through a
+            # per-row latent context; empty rows fire their most likely
+            # feature so every row carries signal.
+            ctx = rng.integers(0, self.n_contexts, size=n)
+            probs = np.clip(self.base_probs[None, :] * self.context_gain[ctx], 0.0, 0.95)
+            active = rng.random((n, self.m_factors)) < probs
+            empty = ~active.any(axis=1)
+            if empty.any():
+                active[np.flatnonzero(empty), np.argmax(probs[empty], axis=1)] = True
+        else:
+            # Uniform-without-replacement active sets, vectorized via argsort.
+            order = np.argsort(rng.random((n, self.m_factors)), axis=1)[:, : self.l0]
+            rows = np.repeat(np.arange(n), self.l0)
+            active[rows, order.ravel()] = True
         contribs: list[dict[str, np.ndarray]] | None = [] if keep_contributions else None
         for i, factor in enumerate(self.factors):
             idx = np.flatnonzero(active[:, i])
@@ -228,9 +291,22 @@ class ZooData:
                                      "theta": np.zeros((0, 1))})
                 continue
             m_i, theta = factor.draw(rng, idx.size)
+            if self.dgp == "llm":
+                # Mean-one lognormal amplitude per firing, scaled by the
+                # feature's power-law importance; the ground-truth
+                # contribution INCLUDES both (that is what recovery targets).
+                amps = self.importance[i] * rng.lognormal(
+                    mean=-0.5 * self.amp_sigma ** 2, sigma=self.amp_sigma,
+                    size=idx.size,
+                )
+                m_i = amps[:, None] * m_i
             x[idx] += m_i
             if contribs is not None:
                 contribs.append({"rows": idx, "m": m_i, "theta": theta})
+        if self.dgp == "llm" and self.noise > 0.0:
+            # Dense unstructured residual — deliberately NOT part of any
+            # factor's ground truth; it is the unexplained-variance floor.
+            x += self.noise * rng.standard_normal(x.shape)
         return np.ascontiguousarray(x), active, contribs
 
 
@@ -731,6 +807,14 @@ def main() -> int:
     parser.add_argument("--ambient", type=int, default=128)
     parser.add_argument("--l0", type=int, default=4)
     parser.add_argument("--curved-fraction", type=float, default=0.5)
+    parser.add_argument("--dgp", choices=("toy", "llm"), default="toy",
+                        help="'llm' = Zipf firing, context co-occurrence, power-law "
+                             "importance, lognormal amplitudes, noise floor.")
+    parser.add_argument("--llm-zipf", type=float, default=1.0)
+    parser.add_argument("--llm-importance", type=float, default=0.5)
+    parser.add_argument("--llm-amp-sigma", type=float, default=0.6)
+    parser.add_argument("--llm-noise", type=float, default=0.25)
+    parser.add_argument("--llm-contexts", type=int, default=4)
     parser.add_argument("--n-train", type=int, default=300_000)
     parser.add_argument("--n-test", type=int, default=100_000)
     parser.add_argument("--atoms", type=int, default=None,
@@ -757,7 +841,10 @@ def main() -> int:
     args = parser.parse_args()
 
     data = ZooData(args.factors, args.ambient, args.l0, args.seed,
-                   curved_fraction=args.curved_fraction)
+                   curved_fraction=args.curved_fraction, dgp=args.dgp,
+                   zipf=args.llm_zipf, importance=args.llm_importance,
+                   amp_sigma=args.llm_amp_sigma, noise=args.llm_noise,
+                   n_contexts=args.llm_contexts)
     train_x, _train_active, _ = data.sample(args.n_train, args.seed + 1,
                                             keep_contributions=False)
     test_x, test_active, contribs = data.sample(args.n_test, args.seed + 2,
