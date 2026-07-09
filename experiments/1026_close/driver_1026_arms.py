@@ -204,6 +204,8 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
     torch.set_float32_matmul_precision("high")  # TF32 on B200; applied to BOTH torch arms
     torch.manual_seed(seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if d == 1 and manifold == "product":
+        manifold = "circle"  # product requires rank >= 2; rank-1 atoms are circles
     cfg = ManifoldSAEConfig(
         input_dim=x_tr.shape[1], n_atoms=atoms, intrinsic_rank=d,
         atom_manifold=manifold, atom_basis=basis,
