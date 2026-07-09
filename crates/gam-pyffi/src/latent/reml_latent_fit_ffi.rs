@@ -4716,13 +4716,22 @@ fn benchmark_pr_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<
     let mut prev_precision = 1.0;
     let mut prev_recall = 0.0;
     let mut area = 0.0;
-    for (_score, is_pos) in pairs {
-        if is_pos {
-            tp += 1;
-        } else {
-            fp += 1;
+    let mut i = 0usize;
+    while i < pairs.len() {
+        // A decision threshold cannot fall between equal scores, so an entire
+        // tied-score group enters the confusion matrix as one unit; advancing
+        // the curve row-by-row inside a tie would make the area depend on the
+        // input order of the tied rows.
+        let group_score = pairs[i].0;
+        while i < pairs.len() && pairs[i].0.total_cmp(&group_score).is_eq() {
+            if pairs[i].1 {
+                tp += 1;
+            } else {
+                fp += 1;
+            }
+            i += 1;
         }
-        let precision = tp as f64 / (tp + fp).max(1) as f64;
+        let precision = tp as f64 / (tp + fp) as f64;
         let recall = tp as f64 / n_pos as f64;
         area += 0.5 * (precision + prev_precision) * (recall - prev_recall);
         prev_precision = precision;
@@ -4834,13 +4843,14 @@ fn make_folds_indices(
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Group row indices either into a single bucket (unstratified) or into
-    // one bucket per exact label value (stratified). Using the bit pattern
-    // as the key produces a well-defined grouping even when labels are
-    // floats; NaN is rejected above.
+    // one bucket per numeric label value (stratified). The key is the bit
+    // pattern with both IEEE zeros canonicalized to +0.0 — `-0.0 == +0.0`,
+    // so they are one class level, not two; NaN is rejected above.
     let mut buckets: Vec<Vec<usize>> = if stratified {
+        let label_key = |v: f64| if v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() };
         let mut by_label: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, v) in y.iter().enumerate() {
-            by_label.entry(v.to_bits()).or_default().push(i);
+            by_label.entry(label_key(*v)).or_default().push(i);
         }
         by_label.into_values().collect()
     } else {
@@ -4981,13 +4991,17 @@ fn gaussian_log_loss_value(
             )));
         }
         let s_raw = if scalar_sigma { sigma[0] } else { sigma[i] };
-        if !s_raw.is_finite() {
+        if !s_raw.is_finite() || s_raw <= 0.0 {
+            // A standard deviation is strictly positive by definition; folding
+            // a negative or zero scale into a usable one (abs, eps floor) would
+            // score a density that was never predicted.
             return Err(py_value_error(format!(
-                "gaussian_log_loss_from_predictions: sigma[{}] is not finite ({s_raw})",
+                "gaussian_log_loss_from_predictions: sigma[{}] must be strictly positive \
+                 and finite; got {s_raw}",
                 if scalar_sigma { 0 } else { i }
             )));
         }
-        let s = s_raw.abs().max(eps);
+        let s = s_raw.max(eps);
         let r = y - mu;
         total += 0.5 * (two_pi * s * s).ln() + 0.5 * (r / s) * (r / s);
     }
@@ -5076,14 +5090,29 @@ fn zscore_train_test_arrays<'py>(
     let mut stds = vec![1.0_f64; p];
     for j in 0..p {
         let col = tr.column(j);
-        let mean = col.iter().sum::<f64>() / n_train_f;
-        means[j] = mean;
+        // Welford one-pass moments: the running mean never leaves the data's
+        // range, so finite inputs near f64::MAX cannot overflow the way a
+        // naive `Σx / n` does (Σx saturates to +inf and the centred output
+        // turns NaN).
+        let mut mean = 0.0_f64;
+        let mut m2 = 0.0_f64;
+        for (k, v) in col.iter().enumerate() {
+            let delta = v - mean;
+            mean += delta / (k + 1) as f64;
+            m2 += delta * (v - mean);
+        }
         // Population standard deviation matches sklearn StandardScaler and
         // pandas (ddof=0). A constant column collapses to std=0 below; we
         // pass the centred zero through unchanged by leaving the divisor
         // at 1.0 in that branch (column has no variation to scale away).
-        let var = col.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n_train_f;
-        let std = var.sqrt();
+        let std = (m2 / n_train_f).sqrt();
+        if !mean.is_finite() || !std.is_finite() {
+            return Err(py_value_error(format!(
+                "zscore_train_test_arrays: column {j} moments are not representable in f64 \
+                 (mean={mean}, std={std}); rescale the inputs before standardizing"
+            )));
+        }
+        means[j] = mean;
         stds[j] = if std > 0.0 { std } else { 1.0 };
     }
 

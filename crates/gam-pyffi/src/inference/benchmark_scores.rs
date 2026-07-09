@@ -200,22 +200,26 @@ pub(crate) fn benchmark_gaussian_logloss(
             sigma.len()
         )));
     }
-    let eps = 1.0e-12;
     let two_pi = 2.0 * std::f64::consts::PI;
-    let loss_sum = observed
-        .iter()
-        .zip(predicted_mean.iter())
-        .enumerate()
-        .map(|(idx, (&y, &mu))| {
-            let raw_sigma = if sigma.len() == 1 {
-                sigma[0]
-            } else {
-                sigma[idx]
-            };
-            let sigma_use = raw_sigma.max(eps);
-            let var = sigma_use * sigma_use;
-            0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var)
-        })
-        .sum::<f64>();
+    let mut loss_sum = 0.0_f64;
+    for (idx, (&y, &mu)) in observed.iter().zip(predicted_mean.iter()).enumerate() {
+        let raw_sigma = if sigma.len() == 1 {
+            sigma[0]
+        } else {
+            sigma[idx]
+        };
+        if !raw_sigma.is_finite() || raw_sigma <= 0.0 {
+            // A standard deviation is strictly positive by definition; flooring
+            // a nonpositive scale to eps would reward an invalid prediction
+            // with a spuriously sharp density instead of rejecting it.
+            return Err(PyValueError::new_err(format!(
+                "gaussian logloss: sigma[{}] must be strictly positive and finite; \
+                 got {raw_sigma}",
+                if sigma.len() == 1 { 0 } else { idx }
+            )));
+        }
+        let var = raw_sigma * raw_sigma;
+        loss_sum += 0.5 * (two_pi * var).ln() + ((y - mu) * (y - mu)) / (2.0 * var);
+    }
     Ok(loss_sum / observed.len() as f64)
 }
