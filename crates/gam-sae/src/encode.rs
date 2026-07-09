@@ -62,6 +62,8 @@
 //!    silently.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use opt::constants::{ARMIJO_C1, BACKTRACK_CONTRACTION};
+use opt::{AcceptedStep, BacktrackConfig, backtracking_line_search};
 
 use crate::candidate_index::{AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget};
 use crate::manifold::{
@@ -1191,6 +1193,34 @@ const JOINT_ENCODE_MAX_ITER: usize = 64;
 const JOINT_ENCODE_GRAD_TOL: f64 = 1.0e-10;
 const JOINT_ENCODE_STEP_TOL: f64 = 1.0e-12;
 
+/// Floor on the Levenberg--Marquardt damping `λ` for the joint row solve. The
+/// damping is carried and decayed *across* outer Gauss--Newton iterations
+/// (warm-started at this value on entry, then raised on rejection and lowered on
+/// acceptance), so it is a stateful trust-region parameter rather than an
+/// `escalate_ridge` schedule — it is deliberately kept hand-rolled. This is the
+/// initial `λ` seed at the smallest scale that still perturbs the Hessian.
+const JOINT_ENCODE_DAMPING_FLOOR: f64 = 1.0e-10;
+
+/// Multiplicative growth applied to the LM damping `λ` whenever a damped step is
+/// rejected (unfactorable, non-descent, or Armijo-exhausted). Numerically equal
+/// to [`opt::constants::RIDGE_GROWTH`], but this loop is stateful across outer
+/// iterations and is intentionally not routed through `escalate_ridge`.
+const JOINT_ENCODE_DAMPING_GROWTH: f64 = 10.0;
+
+/// Multiplicative decay applied to the LM damping `λ` after an accepted step, so
+/// the next outer iteration starts from a looser trust region. Kept above the
+/// `f64::EPSILON · diag_scale` floor at the use site.
+const JOINT_ENCODE_DAMPING_DECAY: f64 = 3.0;
+
+/// Maximum number of damping-escalation attempts within a single outer
+/// Gauss--Newton iteration before the row is declared non-improvable.
+const JOINT_ENCODE_DAMPING_MAX_ATTEMPTS: usize = 12;
+
+/// Maximum number of Armijo backtracking halvings for the inner line search on
+/// each damped step. Passed as `max_steps` to the shared
+/// [`opt::backtracking_line_search`] primitive.
+const JOINT_ENCODE_ARMIJO_MAX_STEPS: usize = 24;
+
 fn joint_data_value_grad_hess(
     jac: ArrayView2<'_, f64>,
     residual: ArrayView1<'_, f64>,
@@ -1412,7 +1442,7 @@ pub(crate) fn joint_encode_refine_row(
         return Ok((coords, true));
     }
     let target_scale = 1.0 + x.dot(&x).sqrt();
-    let mut damping = 1.0e-10_f64;
+    let mut damping = JOINT_ENCODE_DAMPING_FLOOR;
 
     for _ in 0..JOINT_ENCODE_MAX_ITER {
         let (value, grad, hess) = joint_encode_value_grad_hess(
@@ -1433,37 +1463,62 @@ pub(crate) fn joint_encode_refine_row(
         damping = damping.max(f64::EPSILON * diag_scale);
 
         let mut accepted = None;
-        for _ in 0..12 {
+        for _ in 0..JOINT_ENCODE_DAMPING_MAX_ATTEMPTS {
             let Some(step) = joint_encode_damped_step(hess.view(), grad.view(), damping)? else {
-                damping *= 10.0;
+                damping *= JOINT_ENCODE_DAMPING_GROWTH;
                 continue;
             };
             let directional = grad.dot(&step);
             if !(directional.is_finite() && directional < 0.0) {
-                damping *= 10.0;
+                damping *= JOINT_ENCODE_DAMPING_GROWTH;
                 continue;
             }
-            let mut line_scale = 1.0_f64;
-            for _ in 0..24 {
-                let candidate = joint_encode_add_step(atoms, &coords, step.view(), line_scale);
-                let (candidate_value, _, _) = joint_encode_value_grad_hess(
-                    atoms,
-                    &candidate,
-                    x,
-                    amplitudes,
-                    metric_factor.clone(),
-                )?;
-                if candidate_value <= value + 1.0e-4 * line_scale * directional {
-                    accepted = Some((candidate, line_scale * step.dot(&step).sqrt()));
-                    break;
-                }
-                line_scale *= 0.5;
+            // Armijo backtracking on the shared reconstruction objective, migrated
+            // onto the shared `opt` primitive with bit-for-bit-identical semantics:
+            // initial step 1.0, `BACKTRACK_CONTRACTION` (×0.5) contraction,
+            // `JOINT_ENCODE_ARMIJO_MAX_STEPS` (24) trials, and the exact
+            // sufficient-decrease test `F(t + s·d) ≤ F(t) + c₁·s·∇F·d`
+            // (c₁ = `ARMIJO_C1` = 1e-4, no roundoff cushion — the pre-migration
+            // loop had none). `trial(s)` evaluates the candidate coords (always
+            // well defined, so never `Ok(None)`) and threads them through the
+            // payload so the accepted trial is returned without recomputation.
+            let base_value = value;
+            let step_unit_norm = step.dot(&step).sqrt();
+            let line_search = backtracking_line_search::<Vec<Array1<f64>>, String>(
+                BacktrackConfig {
+                    initial_step: 1.0,
+                    contraction: BACKTRACK_CONTRACTION,
+                    max_steps: JOINT_ENCODE_ARMIJO_MAX_STEPS,
+                },
+                |line_scale| {
+                    let candidate = joint_encode_add_step(atoms, &coords, step.view(), line_scale);
+                    let (candidate_value, _, _) = joint_encode_value_grad_hess(
+                        atoms,
+                        &candidate,
+                        x,
+                        amplitudes,
+                        metric_factor.clone(),
+                    )?;
+                    Ok(Some((candidate_value, candidate)))
+                },
+                |line_scale, candidate_value| {
+                    candidate_value <= base_value + ARMIJO_C1 * line_scale * directional
+                },
+            )?;
+            if let Some(AcceptedStep {
+                step: line_scale,
+                payload: candidate,
+                ..
+            }) = line_search
+            {
+                accepted = Some((candidate, line_scale * step_unit_norm));
             }
             if accepted.is_some() {
-                damping = (damping / 3.0).max(f64::EPSILON * diag_scale);
+                damping =
+                    (damping / JOINT_ENCODE_DAMPING_DECAY).max(f64::EPSILON * diag_scale);
                 break;
             }
-            damping *= 10.0;
+            damping *= JOINT_ENCODE_DAMPING_GROWTH;
         }
         let Some((next, step_norm)) = accepted else {
             return Ok((coords, false));
