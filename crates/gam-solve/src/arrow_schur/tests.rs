@@ -3935,6 +3935,69 @@ pub(crate) fn device_a_phi_shared_is_refcount_bump_not_clone_1033() {
     );
 }
 
+/// #1017/#2230 residency measurement: `operand_byte_report` must categorise the
+/// per-solve host→device operand bytes correctly on BOTH matrix-free sub-lanes,
+/// so the a100 job's log numbers are trustworthy. Legacy (`frame = None`) carries
+/// the sparse `a_phi`/`local_jac` and zero `row_htbeta`; framed carries a dense
+/// per-row `row_htbeta` (the 34MiB-vs-31GiB discriminator the #2230 report flags).
+#[test]
+pub(crate) fn sae_pcg_operand_byte_report_categorises_both_lanes_1017() {
+    let p = 5usize;
+    // Legacy sparse lane: 2 rows, supports of 3 and 2 atoms; local_jac 4+6 f64.
+    let a_phi: std::sync::Arc<[Vec<(usize, f64)>]> = std::sync::Arc::from(
+        vec![vec![(0usize, 1.0), (2, 0.5), (7, -0.3)], vec![(1usize, 1.0), (4, 0.2)]]
+            .into_boxed_slice(),
+    );
+    let jac: std::sync::Arc<[Vec<f64>]> =
+        std::sync::Arc::from(vec![vec![1.0; 4], vec![2.0; 6]].into_boxed_slice());
+    let legacy = DeviceSaePcgData {
+        p,
+        beta_dim: 12,
+        a_phi: std::sync::Arc::clone(&a_phi),
+        local_jac: std::sync::Arc::clone(&jac),
+        smooth_blocks: Vec::new(),
+        sparse_g_blocks: Vec::new(),
+        frame: None,
+    };
+    let r = legacy.operand_byte_report();
+    assert!(!r.framed, "frame = None must report the legacy sparse lane");
+    assert_eq!(r.a_phi_pairs, 5, "3 + 2 support pairs");
+    assert_eq!(r.a_phi_bytes, 5 * std::mem::size_of::<(usize, f64)>());
+    assert_eq!(r.local_jac_elems, 10);
+    assert_eq!(r.local_jac_bytes, 10 * 8);
+    assert_eq!(r.row_htbeta_bytes, 0, "legacy lane has no dense per-row cross");
+    assert_eq!(r.frame_blocks_bytes, 0);
+    assert_eq!(r.total_bytes, r.a_phi_bytes + r.local_jac_bytes);
+
+    // Framed dense lane: 3 rows, two carrying a length-4 dense cross, one empty.
+    let frame = DeviceSaeFrameData {
+        ranks: vec![2, 2],
+        basis_sizes: vec![3, 3],
+        border_offsets: vec![0, 6],
+        frame_blocks: Vec::new(),
+        smooth_ranks: Vec::new(),
+        row_htbeta: vec![vec![0.0; 4], vec![0.0; 4], Vec::new()],
+    };
+    let framed = DeviceSaePcgData {
+        p,
+        beta_dim: 12,
+        a_phi: std::sync::Arc::clone(&a_phi),
+        local_jac: std::sync::Arc::clone(&jac),
+        smooth_blocks: Vec::new(),
+        sparse_g_blocks: Vec::new(),
+        frame: Some(frame),
+    };
+    let rf = framed.operand_byte_report();
+    assert!(rf.framed, "frame = Some must report the framed dense lane");
+    assert_eq!(rf.row_htbeta_rows, 2, "two rows carry a non-empty cross slab");
+    assert_eq!(rf.row_htbeta_bytes, 8 * 8, "4 + 4 f64 across the two rows");
+    assert_eq!(
+        rf.total_bytes,
+        rf.a_phi_bytes + rf.local_jac_bytes + rf.row_htbeta_bytes,
+        "total must fold the framed dense cross into the per-solve upload"
+    );
+}
+
 /// #1033 frames-engaged assembly guard: `set_device_sae_pcg_data` must NOT panic
 /// when the frames-engaged builder (`build_framed_device_sae_data`) hands it a
 /// `DeviceSaePcgData` whose full-`B` per-row `a_phi`/`local_jac` slabs are left

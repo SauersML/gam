@@ -4694,6 +4694,14 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let vector_module = pcg_vector_module(&ctx)?;
+        // #1017/#2230 residency measurement: one line per matrix-free PCG solve
+        // (hence per LM ridge-ladder trial) — operand bytes by category + the
+        // ridge pair, so the a100 job (RUST_LOG=info) confirms the sub-lane and
+        // sizes the per-trial re-upload a base-resident frame would remove.
+        log::info!(
+            "#1017/#2230 {} ridge_t={ridge_t:e} ridge_beta={ridge_beta:e}",
+            data.operand_byte_report()
+        );
         let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
 
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -4865,6 +4873,13 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let vector_module = pcg_vector_module(&ctx)?;
+        // #1017/#2230 residency measurement (legacy sparse ⊗I_p lane): see the
+        // framed twin — one line per solve/ladder-trial for the a100 job to size
+        // the per-trial operand re-upload.
+        log::info!(
+            "#1017/#2230 {} ridge_t={ridge_t:e} ridge_beta={ridge_beta:e}",
+            data.operand_byte_report()
+        );
         let mut buffers = flatten_device_sae_data(sys, data, ridge_t, &stream)?;
 
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
