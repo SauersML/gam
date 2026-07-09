@@ -1116,12 +1116,15 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         disable_fixed_point: false,
     };
     let mut obj = ClosureObjective {
-        state: 0_usize,
+        // Start at one so the first outer evaluation reports two inner restore
+        // events. They happened inside one rho evaluation and must not, by
+        // themselves, count as an outer recurrence.
+        state: 1_usize,
         cap: cap.clone(),
-        cost_fn: |_: &mut usize, rho: &Array1<f64>| Ok(10.0 - rho[0]),
+        cost_fn: |_: &mut usize, rho: &Array1<f64>| Ok(10.0 - 1.0e-4 * rho[0]),
         eval_fn: |_: &mut usize, rho: &Array1<f64>| {
             Ok(OuterEval {
-                cost: 10.0 - rho[0],
+                cost: 10.0 - 1.0e-4 * rho[0],
                 gradient: array![-1.0],
                 hessian: HessianValue::Unavailable,
                 inner_beta_hint: None,
@@ -1137,7 +1140,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
                 // The criterion is still improving and the fixed-point step is
                 // deliberately far above tolerance: only the model-state
                 // certificate may stop this walk.
-                cost: 10.0 - rho[0],
+                cost: 10.0 - 1.0e-4 * rho[0],
                 steps: vec![0.25],
                 beta: None,
                 psi_gradient: None,
@@ -1162,14 +1165,18 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
 
     let first = bridge
         .eval_step(&array![0.0])
-        .expect("one incumbent repair is not recurrence");
+        .expect("same-rho inner refinements are not an outer recurrence");
     assert_eq!(first.status, FixedPointStatus::Continue);
 
     let second = bridge
         .eval_step(&array![0.25])
         .expect("recurrent restored incumbent is a valid stop certificate");
     assert_eq!(second.status, FixedPointStatus::Stop);
-    assert_eq!(second.value, 9.75, "retain the lower-cost restored point");
+    assert_eq!(
+        second.value,
+        10.0 - 1.0e-4 * 0.25,
+        "retain the lower-cost restored point"
+    );
 }
 
 #[test]
@@ -3880,6 +3887,7 @@ fn run_efs_skips_global_cost_screening() {
     seed_config.max_seeds = 6;
     seed_config.seed_budget = 1;
     let screening_calls = Arc::new(AtomicUsize::new(0));
+    let efs_calls = Arc::new(AtomicUsize::new(0));
     let problem = OuterProblem::new(15)
         .with_gradient(Derivative::Unavailable)
         .with_hessian(DeclaredHessianForm::Unavailable)
@@ -3896,18 +3904,22 @@ fn run_efs_skips_global_cost_screening() {
         },
         |_: &mut (), theta: &Array1<f64>| Ok(OuterEval::infeasible(theta.len())),
         None::<fn(&mut ())>,
-        Some(|_: &mut (), theta: &Array1<f64>| {
-            Ok(EfsEval {
-                cost: 0.0,
-                steps: vec![0.0; theta.len()],
-                beta: None,
-                psi_gradient: None,
-                psi_indices: None,
-                inner_hessian_scale: None,
-                logdet_enclosure_gap: None,
-                consecutive_restored_incumbents: None,
+        {
+            let efs_calls = Arc::clone(&efs_calls);
+            Some(move |_: &mut (), theta: &Array1<f64>| {
+                efs_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(EfsEval {
+                    cost: 0.0,
+                    steps: vec![0.0; theta.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                })
             })
-        }),
+        },
     );
     problem
         .run(
@@ -3919,6 +3931,11 @@ fn run_efs_skips_global_cost_screening() {
         screening_calls.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "EFS startup should not call eval_cost just to screen seeds"
+    );
+    assert_eq!(
+        efs_calls.load(Ordering::Relaxed),
+        1,
+        "the validated seed sample must be reused instead of paying the EFS inner solve twice"
     );
 }
 

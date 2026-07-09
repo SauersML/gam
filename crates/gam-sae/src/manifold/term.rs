@@ -832,11 +832,12 @@ pub(crate) struct SaeManifoldMutableState {
 /// Fit-global reconstruction incumbent and its outer-stationarity evidence.
 ///
 /// `consecutive_inner_restores` counts successful joint-fit calls that ended by
-/// restoring their penalized-objective incumbent.  A newly superior fit-level
-/// incumbent resets the count: only recurrence around the *same* banked model
-/// is evidence that changing rho no longer changes the fitted state.  The EFS
-/// bridge consumes this as a typed termination certificate instead of inferring
-/// flatness from a workload-tuned relative-cost threshold.
+/// restoring exactly the fit-level incumbent model (checked on the snapshot's
+/// decoder, gates, coordinates, evaluator handles, and homotopy dial).  A newly
+/// superior fit-level incumbent resets the count: only exact recurrent restores
+/// are evidence that changing rho no longer changes the accepted fitted
+/// manifold.  The EFS bridge consumes this as a typed termination certificate
+/// instead of inferring flatness from a workload-tuned relative-cost threshold.
 #[derive(Debug)]
 pub(crate) struct SaeFitIncumbent {
     pub(crate) ev: f64,

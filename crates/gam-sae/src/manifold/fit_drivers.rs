@@ -196,6 +196,49 @@ impl SaeManifoldTerm {
         }
     }
 
+    /// Whether the term is exactly at a saved fitted-model state.
+    ///
+    /// The snapshot omits basis caches because they are deterministic functions
+    /// of the coordinate blocks, evaluator handles, and homotopy dial. Comparing
+    /// those driving fields plus the decoder/logits is therefore an exact model-
+    /// state identity test without copying the large `(N × M)` basis arrays.
+    fn matches_mutable_state(&self, snapshot: &SaeManifoldMutableState) -> bool {
+        let atoms_match = self.atoms.len() == snapshot.atoms.len()
+            && self
+                .atoms
+                .iter()
+                .zip(snapshot.atoms.iter())
+                .all(|(atom, saved)| {
+                    let evaluator_matches = match (&atom.basis_evaluator, &saved.basis_evaluator) {
+                        (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let second_jet_matches =
+                        match (&atom.basis_second_jet, &saved.basis_second_jet) {
+                            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                    atom.decoder_coefficients == saved.decoder_coefficients
+                        && atom.smooth_penalty == saved.smooth_penalty
+                        && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
+                        && evaluator_matches
+                        && second_jet_matches
+                });
+        let coords_match = self.assignment.coords.len() == snapshot.coords.len()
+            && self
+                .assignment
+                .coords
+                .iter()
+                .zip(snapshot.coords.iter())
+                .all(|(current, expected)| {
+                    current.latent_id() == expected.latent_id()
+                        && current.as_flat() == expected.as_flat()
+                });
+        atoms_match && self.assignment.logits == snapshot.logits && coords_match
+    }
+
     /// Restore the mutable state captured by [`Self::snapshot_mutable_state`].
     ///
     /// Reassigns the cheap driving state in place (reusing the already-allocated
@@ -5693,7 +5736,7 @@ impl SaeManifoldTerm {
         // (`reduce_atoms_to_data_supported_rank`), so its decoder lives in the
         // reduced `r_k`-wide coordinate by construction and carries no data-null
         // component to project away. No post-loop projection is needed.
-        let mut restored_inner_incumbent = false;
+        let mut inner_incumbent_restored = false;
         if let Some(best_state) = best_reconstruction_state.as_ref()
             && best_reconstruction_obj.is_finite()
         {
@@ -5725,7 +5768,7 @@ impl SaeManifoldTerm {
                      non-monotone boundary-hook damage, not line-search descent"
                 );
                 self.restore_mutable_state(best_state)?;
-                restored_inner_incumbent = true;
+                inner_incumbent_restored = true;
                 if self.frames_active() {
                     self.refresh_active_frames_from_data(target, rho)
                         .map_err(|err| {
@@ -5863,8 +5906,16 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // Frame refresh and final polish run after the inner-incumbent restore,
+        // so certify identity at the function boundary, not immediately after
+        // the restore. Any later state change correctly breaks the streak.
+        let exact_fit_incumbent_restored = inner_incumbent_restored
+            && self
+                .best_fit_incumbent
+                .as_ref()
+                .is_some_and(|incumbent| self.matches_mutable_state(&incumbent.state));
         if let Some(incumbent) = self.best_fit_incumbent.as_mut() {
-            incumbent.consecutive_inner_restores = if restored_inner_incumbent {
+            incumbent.consecutive_inner_restores = if exact_fit_incumbent_restored {
                 incumbent.consecutive_inner_restores.saturating_add(1)
             } else {
                 0
