@@ -13,7 +13,7 @@
 //! doc-comments name the counterpart so a future schema drift is traceable to
 //! one side.
 
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
@@ -151,23 +151,26 @@ pub(crate) fn topology_for_bases(bases: &[String]) -> Option<String> {
 /// Stable ascending reorder of a periodic atom's shape band by its single
 /// coordinate column, mirroring `_periodic_shape_band` in `from_payload`:
 ///
-///   * `coords` must be `(N, 1)` (one coordinate column) — an error otherwise,
-///     matching the Python `ValueError`.
+///   * `coords` is `(G, 1)` (one coordinate column, `d_k = 1` for a periodic
+///     atom) — an error otherwise, matching the Python `ValueError`.
+///   * `mean` / `sd` are `(G, p)` (the ambient band value / per-channel sd on
+///     the `G`-point coordinate grid — NOT 1-D; see `SaeManifoldAtomFit`).
 ///   * `order = argsort(coords[:, 0], kind="mergesort")` — a STABLE ascending
-///     sort; `coords`, `mean`, and (optional) `sd` are all reindexed by it.
+///     sort; `coords` and the ROWS of `mean` / `sd` are all reindexed by it.
 ///   * When `coords` is absent OR `mean` is absent the band is dropped entirely
 ///     (`(None, None, None)`) — a periodic band without its amplitude-correct
 ///     Rust mean draws at the wrong radius, so an absent mean means no band.
 ///
-/// `sd` follows `mean` (reindexed when present, `None` when absent). The sort
-/// key uses `f64::total_cmp` for a total, deterministic order (NaN sorts last,
-/// matching numpy's mergesort NaN-at-end); shape-band coordinates are finite in
-/// practice so this only fixes the degenerate tie/NaN ordering deterministically.
+/// `sd` follows `mean` (reindexed when present, `None` when absent), and both
+/// must share `coords`'s row count `G`. The sort key uses `f64::total_cmp` for a
+/// total, deterministic order (NaN sorts last, matching numpy's mergesort
+/// NaN-at-end); shape-band coordinates are finite in practice so this only fixes
+/// the degenerate tie/NaN ordering deterministically.
 pub(crate) fn periodic_shape_band_reorder(
     coords: Option<Array2<f64>>,
-    mean: Option<Array1<f64>>,
-    sd: Option<Array1<f64>>,
-) -> Result<(Option<Array2<f64>>, Option<Array1<f64>>, Option<Array1<f64>>), String> {
+    mean: Option<Array2<f64>>,
+    sd: Option<Array2<f64>>,
+) -> Result<(Option<Array2<f64>>, Option<Array2<f64>>, Option<Array2<f64>>), String> {
     let Some(coords) = coords else {
         return Ok((None, None, None));
     };
@@ -183,13 +186,32 @@ pub(crate) fn periodic_shape_band_reorder(
         return Ok((None, None, None));
     };
     let n = coords.nrows();
+    if mean.nrows() != n {
+        return Err(format!(
+            "periodic shape_band_mean rows ({}) must match shape_band_coords rows ({n})",
+            mean.nrows()
+        ));
+    }
+    if let Some(sd) = sd.as_ref() {
+        if sd.nrows() != n {
+            return Err(format!(
+                "periodic shape_band_sd rows ({}) must match shape_band_coords rows ({n})",
+                sd.nrows()
+            ));
+        }
+    }
     let mut order: Vec<usize> = (0..n).collect();
     // Stable sort (Rust's sort_by is stable) on the single coordinate column,
     // matching numpy argsort(kind="mergesort").
     order.sort_by(|&a, &b| coords[[a, 0]].total_cmp(&coords[[b, 0]]));
     let coords_sorted = Array2::from_shape_fn((n, 1), |(i, _)| coords[[order[i], 0]]);
-    let mean_sorted = Array1::from_shape_fn(mean.len().min(n), |i| mean[order[i]]);
-    let sd_sorted = sd.map(|sd| Array1::from_shape_fn(sd.len().min(n), |i| sd[order[i]]));
+    // Reindex the ROWS of the (G, p) band arrays by the coordinate order.
+    let reindex_rows = |m: &Array2<f64>| {
+        let p = m.ncols();
+        Array2::from_shape_fn((n, p), |(i, j)| m[[order[i], j]])
+    };
+    let mean_sorted = reindex_rows(&mean);
+    let sd_sorted = sd.map(|s| reindex_rows(&s));
     Ok((Some(coords_sorted), Some(mean_sorted), sd_sorted))
 }
 
@@ -257,16 +279,23 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
-    fn periodic_shape_band_reorder_stable_ascending() {
+    fn periodic_shape_band_reorder_stable_ascending_rows() {
+        // coords (G,1); mean/sd (G,p) — the ROWS reindex by the coord order.
         let coords = array![[0.9], [0.1], [0.5], [0.1]];
-        let mean = array![9.0, 1.0, 5.0, 2.0];
-        let sd = array![0.9, 0.1, 0.5, 0.2];
+        let mean = array![[9.0, 90.0], [1.0, 10.0], [5.0, 50.0], [2.0, 20.0]];
+        let sd = array![[0.9, 0.09], [0.1, 0.01], [0.5, 0.05], [0.2, 0.02]];
         let (c, m, s) =
             periodic_shape_band_reorder(Some(coords), Some(mean), Some(sd)).expect("reorder");
         // Ascending by coord; the two 0.1 rows keep input order (stable): idx 1 then 3.
         assert_eq!(c.unwrap(), array![[0.1], [0.1], [0.5], [0.9]]);
-        assert_eq!(m.unwrap(), array![1.0, 2.0, 5.0, 9.0]);
-        assert_eq!(s.unwrap(), array![0.1, 0.2, 0.5, 0.9]);
+        assert_eq!(
+            m.unwrap(),
+            array![[1.0, 10.0], [2.0, 20.0], [5.0, 50.0], [9.0, 90.0]]
+        );
+        assert_eq!(
+            s.unwrap(),
+            array![[0.1, 0.01], [0.2, 0.02], [0.5, 0.05], [0.9, 0.09]]
+        );
     }
 
     #[test]
@@ -275,15 +304,27 @@ mod manifold_sae_coercion_tests {
         let (c, m, s) = periodic_shape_band_reorder(Some(coords), None, None).expect("ok");
         assert!(c.is_none() && m.is_none() && s.is_none());
         let (c2, m2, s2) =
-            periodic_shape_band_reorder(None, Some(array![1.0]), None).expect("ok");
+            periodic_shape_band_reorder(None, Some(array![[1.0, 2.0]]), None).expect("ok");
         assert!(c2.is_none() && m2.is_none() && s2.is_none());
     }
 
     #[test]
     fn periodic_shape_band_reorder_rejects_multicolumn_coords() {
         let coords = array![[0.1, 0.2], [0.3, 0.4]];
+        assert!(periodic_shape_band_reorder(
+            Some(coords),
+            Some(array![[1.0], [2.0]]),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn periodic_shape_band_reorder_rejects_row_mismatch() {
+        let coords = array![[0.1], [0.2], [0.3]];
+        // mean has 2 rows but coords has 3 -> error (Python would index-error).
         assert!(
-            periodic_shape_band_reorder(Some(coords), Some(array![1.0, 2.0]), None).is_err()
+            periodic_shape_band_reorder(Some(coords), Some(array![[1.0], [2.0]]), None).is_err()
         );
     }
 

@@ -46,16 +46,17 @@ def _assert_triples_equal(got, expected):
 
 
 def test_shape_band_reorder_matches_python_with_ties():
+    # coords (G,1); mean/sd (G,p) — rows reindex by the coord order.
     coords = np.array([[0.9], [0.1], [0.5], [0.1]], dtype=float)
-    mean = np.array([9.0, 1.0, 5.0, 2.0], dtype=float)
-    sd = np.array([0.9, 0.1, 0.5, 0.2], dtype=float)
+    mean = np.array([[9.0, 90.0], [1.0, 10.0], [5.0, 50.0], [2.0, 20.0]], dtype=float)
+    sd = np.array([[0.9, 0.09], [0.1, 0.01], [0.5, 0.05], [0.2, 0.02]], dtype=float)
     _assert_triples_equal(_rust_reorder(coords, mean, sd), _py_reorder(coords, mean, sd))
 
 
 def test_shape_band_reorder_matches_python_no_sd():
     rng = np.random.default_rng(4)
     coords = rng.standard_normal((25, 1))
-    mean = rng.standard_normal(25)
+    mean = rng.standard_normal((25, 3))  # (G, p)
     _assert_triples_equal(_rust_reorder(coords, mean, None), _py_reorder(coords, mean, None))
 
 
@@ -65,10 +66,10 @@ def test_shape_band_reorder_drops_band_without_mean():
 
 
 def test_shape_band_reorder_absent_coords_all_none():
-    _assert_triples_equal(_rust_reorder(None, np.array([1.0]), None), (None, None, None))
+    _assert_triples_equal(_rust_reorder(None, np.array([[1.0, 2.0]]), None), (None, None, None))
 
 
 def test_shape_band_reorder_rejects_multicolumn_coords():
     coords = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=float)
     with pytest.raises(ValueError):
-        _rust_reorder(coords, np.array([1.0, 2.0]), None)
+        _rust_reorder(coords, np.array([[1.0], [2.0]]), None)

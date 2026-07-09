@@ -7333,21 +7333,22 @@ fn sae_atom_topologies(bases: Vec<String>) -> (Option<String>, Vec<String>) {
 }
 
 /// Rust owner of the periodic shape-band reorder (#2091). Stably sorts a periodic
-/// atom's `(N, 1)` shape-band coordinates ascending and reindexes the amplitude-
-/// correct mean and (optional) sd to match, mirroring `_periodic_shape_band` in
-/// `from_payload`: `coords`/`mean` absent -> the whole band is dropped
-/// (`(None, None, None)`), multi-column `coords` -> a `ValueError`. A later
-/// increment's `from_fit_payload` builder consumes the same Rust helper directly.
+/// atom's `(G, 1)` shape-band coordinates ascending and reindexes the ROWS of the
+/// amplitude-correct `(G, p)` mean and (optional) `(G, p)` sd to match, mirroring
+/// `_periodic_shape_band` in `from_payload`: `coords`/`mean` absent -> the whole
+/// band is dropped (`(None, None, None)`), multi-column `coords` or a row-count
+/// mismatch -> a `ValueError`. A later increment's `from_fit_payload` builder
+/// consumes the same Rust helper directly.
 #[pyfunction(signature = (coords, mean, sd))]
 fn sae_periodic_shape_band_reorder<'py>(
     py: Python<'py>,
     coords: Option<PyReadonlyArray2<'py, f64>>,
-    mean: Option<PyReadonlyArray1<'py, f64>>,
-    sd: Option<PyReadonlyArray1<'py, f64>>,
+    mean: Option<PyReadonlyArray2<'py, f64>>,
+    sd: Option<PyReadonlyArray2<'py, f64>>,
 ) -> PyResult<(
     Option<Bound<'py, PyArray2<f64>>>,
-    Option<Bound<'py, PyArray1<f64>>>,
-    Option<Bound<'py, PyArray1<f64>>>,
+    Option<Bound<'py, PyArray2<f64>>>,
+    Option<Bound<'py, PyArray2<f64>>>,
 )> {
     let coords_owned = coords.map(|a| a.as_array().to_owned());
     let mean_owned = mean.map(|a| a.as_array().to_owned());
