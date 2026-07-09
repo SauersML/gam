@@ -186,11 +186,23 @@ impl RationalLogdetPlan {
         // d(λ) ≈ (π/2)/cosh(u_λ), u_λ = asinh((2/π)·ln(λ/c)), which SHRINKS
         // with the bracket width — the reason a fixed h fails at wide κ. Size
         // the step from the trapezoid-DE bound err ~ exp(−2π·d_min/h):
-        // h = 2π·d_min/ln(1/tol); truncation window padded two decades past
-        // the bracket (the tail beyond contributes O(t_lo/λ_min) ≪ tol).
+        // h = 2π·d_min/ln(1/tol).
+        //
+        // TRUNCATION WINDOW must be sized by rel_tol, NOT a fixed decade pad. The
+        // dropped tails of the t-integral are, for the EXTREME eigenvalues,
+        //   low : ∫₀^{t_lo}(1/(c+t) − 1/(λ_min+t))dt ≈ (1/c − 1/λ_min)·t_lo
+        //         ≈ −t_lo/λ_min,          bounded by rel_tol ⟺ t_lo = λ_min·rel_tol
+        //   high: ∫_{t_hi}^∞(1/(c+t) − 1/(λ_max+t))dt ≈ (λ_max − c)/t_hi
+        //         ≈ λ_max/t_hi,           bounded by rel_tol ⟺ t_hi = λ_max/rel_tol.
+        // The former fixed two-decade pad (t_lo = (λ_min/c)·1e-2, t_hi =
+        // (λ_max/c)·1e2) left these tails at O(1e-2/c) and O(1e-2) — orders ABOVE
+        // rel_tol — so the estimate lost the extreme (esp. TOP) eigenvalues' tail
+        // mass and was biased LOW, worst at wide κ. The DE transform compresses
+        // the wider t-window into a modest u-range (double-exponential), so the
+        // node count grows only logarithmically.
         let c = (lambda_min * lambda_max).sqrt();
-        let t_lo = (lambda_min / c) * 1e-2;
-        let t_hi = (lambda_max / c) * 1e2;
+        let t_lo = lambda_min * rel_tol;
+        let t_hi = lambda_max / rel_tol;
         let u_of = |ratio: f64| ((2.0 / std::f64::consts::PI) * ratio.ln()).asinh();
         let u_lo = u_of(t_lo);
         let u_hi = u_of(t_hi);
@@ -444,12 +456,31 @@ fn orthonormalize(cols: &[Array1<f64>]) -> Vec<Array1<f64>> {
     let mut out: Vec<Array1<f64>> = Vec::with_capacity(cols.len());
     for col in cols {
         let mut v = col.clone();
+        // TWO MGS passes ("twice is enough", Kahan/Parlett): block-power drives
+        // the columns of S·Q toward the dominant eigenvector, so the input block
+        // is ill-conditioned and a SINGLE pass leaves orthogonality error O(κ·ε).
+        // Q enters the DETERMINISTIC term1 = tr(Qᵀ log(S/c) Q), where any
+        // QᵀQ ≠ I directly biases the estimate (a slack basis would only widen
+        // the Hutchinson bar, but a non-orthonormal one shifts the value). The
+        // second pass restores orthogonality to O(ε). The collapse test uses the
+        // FIRST-pass residual norm (relative to the pre-orthogonalisation norm) so
+        // a genuinely dependent column is still dropped, not merely re-cleaned.
+        let v0_norm = v.dot(&v).sqrt();
+        for basis in &out {
+            let proj = v.dot(basis);
+            v.scaled_add(-proj, basis);
+        }
+        let norm_after_first = v.dot(&v).sqrt();
         for basis in &out {
             let proj = v.dot(basis);
             v.scaled_add(-proj, basis);
         }
         let norm = v.dot(&v).sqrt();
-        if norm.is_finite() && norm > 1e-12 {
+        let collapsed = !(norm_after_first.is_finite())
+            || norm_after_first <= 1e-12 * v0_norm.max(1e-300)
+            || !(norm.is_finite())
+            || norm <= 1e-12;
+        if !collapsed {
             v.mapv_inplace(|x| x / norm);
             out.push(v);
         }
