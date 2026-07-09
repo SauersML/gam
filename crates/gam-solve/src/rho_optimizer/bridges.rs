@@ -947,10 +947,11 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                             // above tolerance — not a flat valley. Keep going.
                             log::warn!(
                                 "[OUTER] cost-stall STUCK (infeasible BFGS probes, NOT a flat \
-                                 valley): residual |g|={:.3e} far above ceiling {:.3e}; refusing \
+                                 valley): residual |g|={:.3e} far above the certified-stationary \
+                                 band (escape threshold {:.3e}); refusing \
                                  to halt-and-ship and continuing (escape {}/{}, value={:.6e}).",
                                 residual_grad_norm,
-                                FLAT_VALLEY_STALL_GRAD_CEILING,
+                                escape_threshold,
                                 guard.stuck_escapes,
                                 STUCK_STALL_MAX_ESCAPES,
                                 guard.best_value,
@@ -1704,10 +1705,11 @@ impl OuterSecondOrderBridge<'_> {
                 // tolerance — not a flat valley. Keep ARC descending.
                 log::warn!(
                     "[OUTER] ARC cost-stall STUCK (infeasible run, NOT a flat valley): best \
-                     feasible residual |g|={:.3e} far above ceiling {:.3e}; refusing to \
+                     feasible residual |g|={:.3e} far above the certified-stationary band \
+                     (escape threshold {:.3e}); refusing to \
                      halt-and-ship and continuing (escape {}/{}, value={:.6e}).",
                     residual_grad_norm,
-                    FLAT_VALLEY_STALL_GRAD_CEILING,
+                    escape_threshold,
                     guard.stuck_escapes,
                     STUCK_STALL_MAX_ESCAPES,
                     guard.best_value,
