@@ -6461,6 +6461,29 @@ fn sae_decoder_lsq_init(
                 }
             }
         }
+        // #1026 — hard top-`k` support gate. The forward map at `initial_logits`
+        // is exactly `topk_row`: gate 1.0 on the `k_top` largest logits (ties
+        // toward the lower atom index), 0 elsewhere. Reusing the production
+        // helper keeps the LSQ seed bit-consistent with the fit's gate.
+        "topk" => {
+            let k_top = top_k.ok_or_else(|| {
+                "sae_decoder_lsq_init: assignment_kind 'topk' requires the top_k \
+                 argument (the fixed per-row support size)"
+                    .to_string()
+            })?;
+            if k_top == 0 || k_top > k_atoms {
+                return Err(format!(
+                    "sae_decoder_lsq_init: top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
+                ));
+            }
+            for row in 0..n_obs {
+                let weights =
+                    gam::terms::sae::manifold::topk_row(initial_logits.row(row), k_top);
+                for k in 0..k_atoms {
+                    a_init[[row, k]] = weights[k];
+                }
+            }
+        }
         other => {
             return Err(format!(
                 "sae_decoder_lsq_init: unsupported assignment_kind {other:?}"

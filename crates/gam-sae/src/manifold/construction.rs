@@ -3611,12 +3611,92 @@ impl SaeManifoldTerm {
             crate::encode::AtlasConfig::default(),
         )?;
 
-        // Per-atom amortized encode with a certificate-gated exact-solve fallback:
-        // a row whose distilled prediction fails `h ≤ ½` is retried through the
-        // certified IFT-warm-start Newton path; a row that still cannot be
-        // certified stays flagged for the upstream multi-start solve.
-        // (The atlas is rho-free; the per-row amplitudes already carry the
-        // rho-resolved assignment masses the caller produced upstream.)
+        // F3 — certify against the TRUE encode objective when a non-Euclidean
+        // per-row output metric is installed. The fit optimized each coordinate
+        // `t` against generalized least squares `½ rᵀ M_n r` (`M_n = U_n U_nᵀ`, the
+        // installed `RowMetric`), so a bare Euclidean encode certifies the root of
+        // a DIFFERENT problem. Route every (row, atom) through the metric-aware
+        // certified encode (`certified_encode_row_with_objective`), whitening the
+        // residual and the SSE guard by the row's factor `U_n` and scaling the
+        // offline chart Lipschitz by the global bound `max_n tr(M_n) ≥ max_n ‖M_n‖`
+        // (for PSD `M_n`, `‖M_n‖ = λ_max ≤ tr(M_n)`, so the certificate stays
+        // conservatively valid). The Euclidean amortized fast path is bypassed here
+        // because its Euclidean certificate does not certify the metric objective;
+        // metric-active fits are the structured regime where correctness dominates.
+        // NOTE: the latent ARD/von-Mises prior the fit also placed on `t` lives in
+        // `rho.log_ard`, which this rho-free encode does not receive; wiring it
+        // needs the fitted precisions carried on the atom (a finalization-site
+        // write), so `prior_alpha` stays `None` here. The metric — the GLS
+        // whitening the audit flagged — is threaded.
+        if let Some(metric) = self
+            .row_metric
+            .as_ref()
+            .filter(|m| !matches!(m.provenance(), gam_problem::MetricProvenance::Euclidean))
+        {
+            if metric.p_out() != p || metric.n_rows() != n {
+                return Err(format!(
+                    "SaeManifoldTerm::amortized_encode_target: row_metric is ({} rows, p={}) but \
+                     target is (n={n}, p={p})",
+                    metric.n_rows(),
+                    metric.p_out()
+                ));
+            }
+            let rank = metric.metric_rank();
+            // max_n tr(M_n) — a conservative upper bound on max_n ‖M_n‖ (the offline
+            // Lipschitz scale). `row_traces()` is the criterion-facing (un-floored)
+            // trace stack the metric already carries.
+            let metric_norm_bound = metric
+                .row_traces()
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max);
+            let mut coords: Vec<Array2<f64>> = self
+                .atoms
+                .iter()
+                .map(|a| Array2::<f64>::zeros((n, a.latent_dim)))
+                .collect();
+            let mut certified: Vec<Vec<bool>> = vec![vec![false; n]; k_atoms];
+            for row in 0..n {
+                // The row's metric factor `U_n ∈ ℝ^{p×rank}` (`factor_entry` reads the
+                // un-floored criterion-face factors), materialized once and shared
+                // across atoms (the metric is atom-independent — output-space).
+                let u_row =
+                    Array2::<f64>::from_shape_fn((p, rank), |(i, k)| metric.factor_entry(row, i, k));
+                let objective = crate::encode::EncodeObjective {
+                    metric_factor: Some(u_row.view()),
+                    prior_alpha: None,
+                    metric_norm_bound,
+                };
+                for atom_idx in 0..k_atoms {
+                    let (t, cert) = atlas.certified_encode_row_with_objective(
+                        &self.atoms[atom_idx],
+                        atom_idx,
+                        targets.row(row),
+                        amplitudes[[row, atom_idx]],
+                        &objective,
+                    )?;
+                    if cert.certified() {
+                        coords[atom_idx].row_mut(row).assign(&t);
+                        certified[atom_idx][row] = true;
+                    }
+                }
+            }
+            let mut results = Vec::with_capacity(k_atoms);
+            for atom_idx in 0..k_atoms {
+                results.push(crate::encode::EncodeResult::from_rows(
+                    std::mem::take(&mut coords[atom_idx]),
+                    std::mem::take(&mut certified[atom_idx]),
+                ));
+            }
+            return Ok(results);
+        }
+
+        // Euclidean path (bit-for-bit unchanged): per-atom amortized encode with a
+        // certificate-gated exact-solve fallback — a row whose distilled prediction
+        // fails `h ≤ ½` is retried through the certified IFT-warm-start Newton path;
+        // a row that still cannot be certified stays flagged for the upstream
+        // multi-start solve. (The atlas is rho-free; the per-row amplitudes already
+        // carry the rho-resolved assignment masses the caller produced upstream.)
         let mut results = Vec::with_capacity(k_atoms);
         for atom_idx in 0..k_atoms {
             let atom = &self.atoms[atom_idx];
