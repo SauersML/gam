@@ -4331,29 +4331,43 @@ impl SaeManifoldTerm {
                 break;
             }
 
-            let mut trial_step_size = step_size;
-            let mut accepted_loss: Option<SaeManifoldLoss> = None;
-            for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
-                if halving > 0 {
-                    self.restore_mutable_state(&snapshot)?;
-                }
-                let trial_result = self
-                    .apply_newton_step(delta_ext_coord.view(), beta_zero.view(), trial_step_size)
-                    .and_then(|()| {
-                        self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                    });
-                if let Ok(post_step_total) = trial_result {
+            // Each trial re-applies the Newton step from the pre-step
+            // `snapshot` (reset-before-reapply on every trial after the
+            // first). A trial whose step application or objective evaluation
+            // errors is INVALID (`Ok(None)`): halve without consulting the
+            // Armijo test. On acceptance the mutable state already holds the
+            // accepted trial, so the loss is read after the search returns.
+            let mut first_trial = true;
+            let accepted = backtracking_line_search(
+                BacktrackConfig {
+                    initial_step: step_size,
+                    max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
+                    ..BacktrackConfig::default()
+                },
+                |trial_step_size| {
+                    if !std::mem::take(&mut first_trial) {
+                        self.restore_mutable_state(&snapshot)?;
+                    }
+                    Ok(self
+                        .apply_newton_step(
+                            delta_ext_coord.view(),
+                            beta_zero.view(),
+                            trial_step_size,
+                        )
+                        .and_then(|()| {
+                            self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                        })
+                        .ok()
+                        .map(|post_step_total| (post_step_total, ())))
+                },
+                |trial_step_size, post_step_total| {
                     let armijo_bound = pre_step_total
                         - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                    if post_step_total.is_finite() && post_step_total <= armijo_bound {
-                        accepted_loss = Some(self.loss(target, rho)?);
-                        break;
-                    }
-                }
-                trial_step_size *= 0.5;
-            }
-            match accepted_loss {
-                Some(loss) => last_loss = loss,
+                    post_step_total.is_finite() && post_step_total <= armijo_bound
+                },
+            )?;
+            match accepted {
+                Some(_) => last_loss = self.loss(target, rho)?,
                 None => {
                     self.restore_mutable_state(&snapshot)?;
                     last_loss = pre_step_loss;

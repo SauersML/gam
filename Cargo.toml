@@ -73,7 +73,7 @@ rand = "0.10.1"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-opt = "0.5.2"
+opt = "=0.5.12"
 log = "0.4.29"
 libloading = "0.8.9"
 csv = "1.4.0"
