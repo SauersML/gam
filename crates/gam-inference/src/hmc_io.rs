@@ -2865,6 +2865,8 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Log),
             },
             gamma_shape: None,
+            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            offset: None,
             mode: mode.view(),
             hessian: hessian.view(),
             penalty_roots: vec![CanonicalPenalty::from_dense_root(
@@ -2916,6 +2918,8 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
+            gam_solve::model_types::Dispersion::Known(1.0),
+            None,
             RhoPrior::Flat,
             false,
         )
@@ -2961,6 +2965,8 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
+            gam_solve::model_types::Dispersion::Known(1.0),
+            None,
             prior.clone(),
             false,
         )
@@ -2977,6 +2983,8 @@ mod tests {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
             },
+            None,
+            gam_solve::model_types::Dispersion::Known(1.0),
             None,
             prior,
             false,
@@ -2996,6 +3004,48 @@ mod tests {
                 grad_b[i]
             );
         }
+    }
+
+    #[test]
+    fn joint_hmc_target_retains_fit_dispersion_and_offset() {
+        // A Gaussian fit with sigma^2 = 4 and a fixed offset of 1.5: the joint
+        // target at beta = 0 must be -0.5 * (1/phi) * (y - offset)^2. The old
+        // target hard-coded phi = 1 and eta = X beta, i.e. -0.5 * y^2 — four
+        // times the likelihood curvature at a shifted center (finding 18,
+        // #2245). No penalties / flat prior isolate the likelihood term.
+        let x = array![[1.0]];
+        let y = array![2.0];
+        let w = array![1.0];
+        let mode = array![0.0];
+        let hessian = array![[1.0]];
+        let offset = array![1.5];
+        let target = JointBetaRhoPosterior::new(
+            x.view(),
+            y.view(),
+            w.view(),
+            mode.view(),
+            hessian.view(),
+            Vec::new(),
+            Array1::<f64>::zeros(0).view(),
+            LikelihoodSpec {
+                response: ResponseFamily::Gaussian,
+                link: InverseLink::Standard(StandardLink::Identity),
+            },
+            None,
+            gam_solve::model_types::Dispersion::Estimated(4.0),
+            Some(offset.view()),
+            RhoPrior::Flat,
+            false,
+        )
+        .expect("joint target");
+
+        let params = array![0.0];
+        let (logp, _) = target.compute_joint_logp_and_grad(&params);
+        let expected = -0.5 * (1.0 / 4.0) * (2.0_f64 - 1.5).powi(2);
+        assert!(
+            (logp - expected).abs() < 1e-12,
+            "joint target must keep phi and offset: logp = {logp}, expected {expected}"
+        );
     }
 
     #[test]
@@ -3131,6 +3181,8 @@ mod tests {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
             },
+            None,
+            gam_solve::model_types::Dispersion::Known(1.0),
             None,
             RhoPrior::Flat,
             false,
