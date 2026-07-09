@@ -135,6 +135,142 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
+    /// Per-atom, per-axis posterior-variance trace `tr_kj(H⁻¹)` — the SAME
+    /// quantity [`Self::ard_inverse_traces`] returns — from the #2080 SHARED
+    /// selected-inverse bundle instead of the dense Schur factor
+    /// (`full_inverse_apply` / `latent_block_inverse_diagonal`). The massive-`K`
+    /// surrogate-lane replacement that removes the last dense `S⁻¹` from the ARD
+    /// Fellner–Schall denominator.
+    ///
+    /// # Reformulation (arrow selected-inverse, no dense `S⁻¹`)
+    ///
+    /// For an arrow `H = [[A (⊕_i A_i), B], [Bᵀ, C]]` with reduced Schur
+    /// complement `S`, the per-row latent block is exactly
+    /// `(H⁻¹)_{t_i t_i} = A_i⁻¹ + G_i S⁻¹ G_iᵀ`, `A_i = H_tt^(i)` (the per-row
+    /// `undamped_factor`), `B_i = H_tβ^(i)` (via `apply_htbeta_row`),
+    /// `G_i = A_i⁻¹ B_i`. So the per-slot diagonal the ARD denominator sums splits
+    /// into a ROW-LOCAL exact term `(A_i⁻¹)[s,s]` and a border term
+    /// `(G_i S⁻¹ G_iᵀ)[s,s] = g_sᵀ S⁻¹ g_s`, `g_s = G_iᵀ e_s`. Summed over rows
+    /// for a FIXED `(atom k, axis a)` — the group the ARD α-fixed-point actually
+    /// needs — the border piece is a trace `Σ_i g_{s_i}ᵀ S⁻¹ g_{s_i} =
+    /// tr(S⁻¹ M_{ka})`, `M_{ka} = Σ_i g_{s_i} g_{s_i}ᵀ`, estimated off the shared
+    /// bundle `(z_j, S⁻¹ z_j)` by
+    ///   `tr(S⁻¹ M_{ka}) = (1/m) Σ_j Σ_i (g_{s_i}ᵀ S⁻¹ z_j)(g_{s_i}ᵀ z_j)
+    ///                   = (1/m) Σ_j Σ_i s_ij[s_i]·w_ij[s_i]`,
+    /// with `w_ij = G_i z_j = A_i⁻¹ B_i z_j` and `s_ij = G_i S⁻¹ z_j =
+    /// A_i⁻¹ B_i (S⁻¹ z_j)` — both per-row `t`-space vectors from
+    /// `apply_htbeta_row` + a per-row Cholesky solve. The final `H_βt` never
+    /// appears: it is absorbed by contracting against `S⁻¹ z_j`. Everything is
+    /// sourced from the cache (`undamped_factor` + `apply_htbeta_row`) plus the
+    /// bundle — no `ArrowSchurSystem`, no dense `S⁻¹`.
+    ///
+    /// `probes` and `sinv_probes` are the surrogate lane's frozen `(z_j, S⁻¹ z_j)`
+    /// pairs (each length `cache.k`, the reduced-Schur border dim); with
+    /// full-basis probes `√k·e_j` the Hutchinson average is exact, which the FD
+    /// gate exploits to assert equality with [`Self::ard_inverse_traces`]. HT
+    /// row-weighting matches `ard_inverse_traces` bit-for-bit (both diagonal parts
+    /// carry `w_row`; `None` ⇒ `w_row = 1`).
+    pub(crate) fn ard_inverse_traces_from_probes(
+        &self,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+    ) -> Result<Vec<Array1<f64>>, String> {
+        let m = probes.len();
+        if m == 0 || sinv_probes.len() != m {
+            return Err(format!(
+                "ard_inverse_traces_from_probes: need matching non-empty probe/solve \
+                 bundles, got {m} probes and {} solves",
+                sinv_probes.len()
+            ));
+        }
+        let k_border = cache.k;
+        for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+            for (j, v) in set.iter().enumerate() {
+                if v.len() != k_border {
+                    return Err(format!(
+                        "ard_inverse_traces_from_probes: {label} {j} has length {} != border \
+                         dim {k_border}",
+                        v.len()
+                    ));
+                }
+            }
+        }
+        let n = self.n_obs();
+        let coord_offsets = self.assignment.coord_offsets();
+        let row_w = self.row_loss_weights.as_deref();
+        let inv_m = 1.0 / (m as f64);
+        let mut traces: Vec<Array1<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|c| Array1::<f64>::zeros(c.latent_dim()))
+            .collect();
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let w_row = row_w.map_or(1.0, |w| w[row]);
+            let factor = cache.undamped_factor(row);
+            // A_i⁻¹ diagonal (row-local, exact): solve A_i e_s = e_s per local slot.
+            let mut a_inv_diag = Array1::<f64>::zeros(q);
+            let mut e_s = Array1::<f64>::zeros(q);
+            for s in 0..q {
+                e_s.fill(0.0);
+                e_s[s] = 1.0;
+                let col = cholesky_solve_vector(factor, e_s.view());
+                a_inv_diag[s] = col[s];
+            }
+            // Per-probe border vectors w_ij = A_i⁻¹ B_i z_j and s_ij = A_i⁻¹ B_i
+            // (S⁻¹ z_j), both row-local `t`-space (length q).
+            let mut w_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            let mut s_probes: Vec<Array1<f64>> = Vec::with_capacity(m);
+            let mut b_tmp = Array1::<f64>::zeros(q);
+            for j in 0..m {
+                b_tmp.fill(0.0);
+                if !cache.apply_htbeta_row(row, probes[j].view(), &mut b_tmp) {
+                    return Err(format!(
+                        "ard_inverse_traces_from_probes: H_tβ^({row}) probe apply failed"
+                    ));
+                }
+                w_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+                b_tmp.fill(0.0);
+                if !cache.apply_htbeta_row(row, sinv_probes[j].view(), &mut b_tmp) {
+                    return Err(format!(
+                        "ard_inverse_traces_from_probes: H_tβ^({row}) solve apply failed"
+                    ));
+                }
+                s_probes.push(cholesky_solve_vector(factor, b_tmp.view()));
+            }
+            // Per-slot diagonal = (A_i⁻¹)[s,s] + (1/m) Σ_j w_ij[s]·s_ij[s]; sum into
+            // the owning (atom, axis) trace exactly as `ard_inverse_traces` does.
+            let accumulate = |k: usize, block_start: usize, traces: &mut Vec<Array1<f64>>| {
+                let d = self.assignment.coords[k].latent_dim();
+                for axis in 0..d {
+                    let s = block_start + axis;
+                    let mut border = 0.0_f64;
+                    for j in 0..m {
+                        border += w_probes[j][s] * s_probes[j][s];
+                    }
+                    traces[k][axis] += w_row * (a_inv_diag[s] + inv_m * border);
+                }
+            };
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    let active = &layout.active_atoms[row];
+                    let starts = &layout.coord_starts[row];
+                    for (pos, &k) in active.iter().enumerate() {
+                        accumulate(k, starts[pos], &mut traces);
+                    }
+                }
+                None => {
+                    for k in 0..self.k_atoms() {
+                        accumulate(k, coord_offsets[k], &mut traces);
+                    }
+                }
+            }
+        }
+        Ok(traces)
+    }
+
     /// PD-floor fraction for the #2133 SURE divergence denominator: the exact
     /// within-basin Newton curvature `htt + c + V''` is clamped to at least this
     /// fraction of the Gauss-Newton curvature `htt + V''`, so a row whose

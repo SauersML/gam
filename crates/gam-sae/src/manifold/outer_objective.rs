@@ -3161,10 +3161,28 @@ impl SaeManifoldOuterObjective {
             .row_loss_weights()
             .map_or(self.term.n_obs() as f64, |w| w.iter().sum::<f64>());
         let sumsq = self.term.ard_coord_sumsq();
-        let traces = self
-            .term
-            .ard_inverse_traces(&cache)
-            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?;
+        // #2080: take the surrogate lane's shared (probes, S⁻¹·probes) bundle from
+        // this eval's matrix-free evidence branch (if it ran) ONCE — both the ARD
+        // posterior-variance trace here and the smoothness EDF below consume it, so
+        // taking it twice would starve the second consumer. When present, the ARD
+        // denominator's `tr(H⁻¹)_tt` is the matrix-free selected-inverse trace off
+        // that bundle (no dense Schur `S⁻¹`); otherwise (dense-admitted, or no lane)
+        // the dense `full_inverse_apply` / selected-inverse diagonal path stands.
+        let inverse_probe_bundle = self
+            .surrogate_lane
+            .as_mut()
+            .and_then(|l| l.take_inverse_probes());
+        let traces = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
+            self.term
+                .ard_inverse_traces_from_probes(&cache, probes, sinv)
+                .map_err(|e| {
+                    format!("SaeManifoldOuterObjective::efs_step: ARD traces (matrix-free): {e}")
+                })?
+        } else {
+            self.term
+                .ard_inverse_traces(&cache)
+                .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?
+        };
 
         // Build the flat step vector in `to_flat` layout (#1556):
         // [0]=log_lambda_sparse, [1..1+K]=per-atom log_lambda_smooth, then ARD.
@@ -3205,15 +3223,10 @@ impl SaeManifoldOuterObjective {
         let k_smooth = rho.log_lambda_smooth.len();
         let lambda_smooth_vec = rho.lambda_smooth_vec();
         let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
-        // #2080: the surrogate lane's shared (probes, S⁻¹·probes) bundle from this
-        // eval's matrix-free evidence branch, if it ran. When present, the
-        // smoothness EDF is the matrix-free tr(S⁻¹·M_k) off that bundle (no dense
-        // `beta_inv`); otherwise (dense-admitted, or no lane) fall back to the
-        // dense selected-inverse trace.
-        let inverse_probe_bundle = self
-            .surrogate_lane
-            .as_mut()
-            .and_then(|l| l.take_inverse_probes());
+        // #2080: reuse the SAME shared (probes, S⁻¹·probes) bundle taken once above
+        // for the ARD trace. When present, the smoothness EDF is the matrix-free
+        // tr(S⁻¹·M_k) off that bundle (no dense `beta_inv`); otherwise (dense-
+        // admitted, or no lane) fall back to the dense selected-inverse trace.
         let eff_dof_per_atom = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
             self.term
                 .decoder_smoothness_effective_dof_per_atom_from_probes(
