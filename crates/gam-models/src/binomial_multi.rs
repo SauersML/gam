@@ -102,7 +102,11 @@ pub struct BinomialMultiFitOutputs {
     /// block-diagonal penalized Hessian, so there is one iteration count for
     /// the whole solve.
     pub iterations: usize,
-    /// `true` if the relative-step test was satisfied before `max_iter`.
+    /// Always `true` for values returned by [`fit_penalized_binomial_multi`]:
+    /// non-convergence is surfaced as the typed
+    /// [`EstimationError::FixedLambdaNewtonDidNotConverge`] rather than an
+    /// `Ok` with a flag (SPEC: a fit only ever comes from a converged
+    /// optimization).
     pub converged: bool,
     /// Penalized negative log-likelihood at the returned `β̂`:
     /// `−log L(β̂) + ½ Σ_a λ_a · β̂_aᵀ S β̂_a`.
@@ -324,6 +328,18 @@ pub fn fit_penalized_binomial_multi(
         &likelihood,
         "fit_penalized_binomial_multi",
     )?;
+
+    if !fit.converged {
+        // SPEC: a fit object must only ever come from a converged optimization.
+        // Exhausting `max_iter` is a typed error carrying its evidence, never
+        // an Ok(outputs) with `converged: false`.
+        return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
+            context: "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton)"
+                .to_string(),
+            iterations: fit.iterations,
+            penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
+        });
+    }
 
     // η → μ = σ(η) is the binomial inverse link applied column-wise.
     let fitted = fit.eta.mapv(sigmoid_stable);

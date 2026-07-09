@@ -50,6 +50,22 @@ pub enum EstimationError {
     },
 
     #[error(
+        "{context} did not converge within {iterations} iterations (final penalized \
+         objective {penalized_neg_log_likelihood:.6e}). A fit is only minted from a \
+         converged optimization; raise the iteration budget or inspect the data for \
+         ill-conditioning."
+    )]
+    FixedLambdaNewtonDidNotConverge {
+        /// Which fixed-λ Newton entry stalled (e.g. the multinomial softmax or
+        /// independent-binomial vector-GLM solve, or the Firth refit lane).
+        context: String,
+        /// Newton iterations executed before the budget was exhausted.
+        iterations: usize,
+        /// Penalized negative log-likelihood at the abandoned iterate.
+        penalized_neg_log_likelihood: f64,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during model fitting at iteration {iteration}. \
         The model cannot converge because a predictor perfectly separates the binary outcomes. \
         (Diagnostic: max|eta| = {max_abs_eta:.2e})."
@@ -208,6 +224,7 @@ impl EstimationError {
                 | EstimationError::PerfectSeparationDetected { .. }
                 | EstimationError::MultinomialSeparationDetected { .. }
                 | EstimationError::PirlsDidNotConverge { .. }
+                | EstimationError::FixedLambdaNewtonDidNotConverge { .. }
         )
     }
 }

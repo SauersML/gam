@@ -493,9 +493,13 @@ pub struct MultinomialFitOutputs {
     /// Number of Newton iterations executed (including the final step that
     /// satisfied the tolerance).
     pub iterations: usize,
-    /// `true` if the relative-step test was satisfied; `false` if the
-    /// solver exhausted `max_iter`. (A non-converged solve is still
-    /// returned; the caller decides whether to escalate.)
+    /// Always `true` for values returned by [`fit_penalized_multinomial`]:
+    /// non-convergence (outside the separation lane, which escalates to the
+    /// Firth refit) is surfaced as the typed
+    /// [`EstimationError::FixedLambdaNewtonDidNotConverge`] rather than an
+    /// `Ok` with a flag (SPEC: a fit only ever comes from a converged
+    /// optimization). The field remains so internal mid-trajectory
+    /// constructors can carry solver state.
     pub converged: bool,
     /// Penalized negative log-likelihood at the returned `β̂`:
     /// `−log L(β̂) + ½ Σ_a λ_a · β̂_a^T S β̂_a`.
@@ -747,7 +751,18 @@ pub fn fit_penalized_multinomial(
             )
         }));
         match firth {
-            Ok(Ok(out)) => return Ok(out),
+            // SPEC: a fit object must only ever come from a converged
+            // optimization — a Firth refit that itself exhausted its budget is
+            // a typed error carrying its evidence, never an Ok with a flag.
+            Ok(Ok(out)) if out.converged => return Ok(out),
+            Ok(Ok(out)) => {
+                return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
+                    context: "fit_penalized_multinomial (Firth/Jeffreys separation refit)"
+                        .to_string(),
+                    iterations: out.iterations,
+                    penalized_neg_log_likelihood: out.penalized_neg_log_likelihood,
+                });
+            }
             // Firth refit errored, or an internal consistency guard panicked:
             // fall back to the explicit hard separation diagnostic.
             Ok(Err(_)) | Err(_) => {
@@ -759,6 +774,18 @@ pub fn fit_penalized_multinomial(
                 });
             }
         }
+    }
+
+    if !fit.converged {
+        // SPEC: a fit object must only ever come from a converged optimization.
+        // A stall WITHOUT the separation fingerprint (|η| below the threshold —
+        // e.g. ill-conditioned data exhausting `max_iter`) is a typed error
+        // carrying its evidence, never an Ok(outputs) with `converged: false`.
+        return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
+            context: "fit_penalized_multinomial (fixed-λ softmax damped Newton)".to_string(),
+            iterations: fit.iterations,
+            penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
+        });
     }
 
     let fitted_probabilities = likelihood.probabilities(fit.eta.view());

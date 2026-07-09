@@ -857,14 +857,10 @@ fn fit_penalized_multinomial_pyfunc<'py>(
     .map_err(|err| py_value_error(err.to_string()))?;
 
     let out = PyDict::new(py);
-    out.set_item(
-        "status",
-        if outputs.converged {
-            "ok"
-        } else {
-            "not_converged"
-        },
-    )?;
+    // Non-convergence is a typed error from the core entry point (SPEC: a fit
+    // only ever comes from a converged optimization), so reaching here means
+    // the solve converged.
+    out.set_item("status", "ok")?;
     out.set_item("iterations", outputs.iterations)?;
     out.set_item(
         "coefficients_active",
@@ -4168,25 +4164,6 @@ fn sae_hybrid_split_dict<'py>(
     Ok(d)
 }
 
-/// Serialize one Riesz-debiased smooth-functional report (#1097): the plug-in
-/// estimate, the one-step penalty-debiased estimate, its influence-based SE, the
-/// removed penalty bias, and a 95% Wald interval on the debiased estimate.
-fn sae_riesz_report_dict<'py>(
-    py: Python<'py>,
-    report: &gam::inference::riesz::RieszDebiasReport,
-) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    d.set_item("theta_plugin", report.theta_plugin)?;
-    d.set_item("theta_onestep", report.theta_onestep)?;
-    d.set_item("se", report.se)?;
-    d.set_item("penalty_bias", report.penalty_bias)?;
-    // 95% Wald interval on the debiased estimate (z = 1.959963985 for 0.975).
-    let z = 1.959_963_984_540_054_f64;
-    d.set_item("ci_lo", report.theta_onestep - z * report.se)?;
-    d.set_item("ci_hi", report.theta_onestep + z * report.se)?;
-    Ok(d)
-}
-
 /// Serialize one SAE atom decoder-functional POINT summary (#1097, narrowed
 /// under #1115): the plug-in value, the one-step penalty-debiased value, and the
 /// removed penalty bias. Deliberately carries NO standard error and NO
@@ -5069,43 +5046,33 @@ fn certify_chart_transfer(
     Ok(out.unbind())
 }
 
-/// Cross-checkpoint Riesz-debiased atom-trajectory dynamics (issue #1102).
+/// Cross-checkpoint descriptive atom-trajectory dynamics (issue #1102).
 ///
 /// `decoder_grid` is `[n_checkpoints, n_atoms, n_grid, ambient_dim]`: every
 /// atom's decoder curve sampled on the shared `latent_grid` at every checkpoint.
 /// `checkpoint_ids` / `atom_names` label the checkpoint and atom axes (lengths
 /// must match the corresponding grid axes). For each atom this walks consecutive
-/// checkpoints and, per step `c → c+1`:
-///   1. fits the inter-checkpoint transport map (checkpoint axis reused as the
-///      transport "layer" axis);
-///   2. evaluates the Riesz penalty-debiased decoder-displacement contrast
-///      `‖g^{(c+1)}(t_mode) − g^{(c)}(t_mode)‖` with a delta-method SE;
-///   3. accumulates an anytime-valid e-process under the no-change null.
+/// checkpoints and, per step `c → c+1`, fits the inter-checkpoint transport map
+/// (checkpoint axis reused as the transport "layer" axis) and records the
+/// DESCRIPTIVE decoder change of that step: the displacement vector at the
+/// most-moved latent coordinate, its L2 norm, and the grid RMS / max L2 change.
 ///
-/// Returns `{"trajectories": [ {atom_name,
-/// conditional_step_contrasts:[...riesz...], transports:[...transport...],
-/// change_evidence:{...certificate...}} ]}`. The PRIMARY, coverage-valid
-/// deliverable is `change_evidence` (the anytime-valid change e-process);
-/// `conditional_step_contrasts` is a descriptive readout CONDITIONAL ON THE
-/// FITTED COORDINATES (its SE conditions away the generated-regressor
-/// uncertainty in t̂/â — issue #1115), not a coverage-valid CI. See
-/// `gam::inference::checkpoint_dynamics` for the estimator and the honest
-/// accounting of which Riesz inputs a bare decoder grid supports.
-#[pyfunction(signature = (decoder_grid, checkpoint_ids, atom_names, latent_grid, alpha = 0.05))]
+/// Returns `{"trajectories": [ {atom_name, descriptive_step_changes:[...],
+/// transports:[...transport...]} ]}`. `descriptive_step_changes` are plain
+/// measured decoder changes — NO e-values, NO penalty-debiased Riesz contrasts,
+/// and NO coverage claim: the anytime-valid change e-process and the Riesz
+/// contrast estimator were removed because a bare decoder grid does not supply
+/// the inputs a coverage-valid change certificate requires. See
+/// `gam::inference::checkpoint_dynamics`.
+#[pyfunction(signature = (decoder_grid, checkpoint_ids, atom_names, latent_grid))]
 fn sae_checkpoint_dynamics(
     py: Python<'_>,
     decoder_grid: PyReadonlyArray4<'_, f64>,
     checkpoint_ids: Vec<String>,
     atom_names: Vec<String>,
     latent_grid: PyReadonlyArray1<'_, f64>,
-    alpha: f64,
 ) -> PyResult<Py<PyDict>> {
     use gam::inference::checkpoint_dynamics::{CheckpointDynamicsInput, checkpoint_atom_dynamics};
-    if !(alpha > 0.0 && alpha < 1.0) {
-        return Err(PyValueError::new_err(format!(
-            "sae_checkpoint_dynamics: alpha must be in (0, 1), got {alpha}"
-        )));
-    }
     let grid = decoder_grid.as_array();
     let lat = latent_grid.as_array();
     let input = CheckpointDynamicsInput {
@@ -5121,37 +5088,30 @@ fn sae_checkpoint_dynamics(
     for traj in &trajectories {
         let t = PyDict::new(py);
         t.set_item("atom_name", &traj.atom_name)?;
+        // Descriptive per-step decoder changes: measured displacement only, with
+        // no e-values, debiased contrasts, or coverage claim (the change
+        // estimator a bare decoder grid cannot support was removed).
         let steps = PyList::empty(py);
-        for report in &traj.conditional_step_contrasts {
-            steps.append(sae_riesz_report_dict(py, report)?)?;
+        for change in &traj.descriptive_step_changes {
+            let c = PyDict::new(py);
+            c.set_item("checkpoint_from", &change.checkpoint_from)?;
+            c.set_item("checkpoint_to", &change.checkpoint_to)?;
+            c.set_item("latent_coordinate", change.latent_coordinate)?;
+            c.set_item(
+                "displacement_at_mode",
+                change.displacement_at_mode.clone().into_pyarray(py),
+            )?;
+            c.set_item("l2_at_mode", change.l2_at_mode)?;
+            c.set_item("grid_rms_l2", change.grid_rms_l2)?;
+            c.set_item("grid_max_l2", change.grid_max_l2)?;
+            steps.append(c)?;
         }
-        t.set_item("conditional_step_contrasts", steps)?;
+        t.set_item("descriptive_step_changes", steps)?;
         let transports = PyList::empty(py);
         for report in &traj.transports {
             transports.append(layer_transport_report_to_pydict(py, report)?)?;
         }
         t.set_item("transports", transports)?;
-        // Anytime-valid change evidence: the e-BH certificate of the atom's
-        // change e-process at level `alpha`, one entry per consecutive-step
-        // claim with its accumulated log-evidence and confirmation verdict.
-        let certificate = traj.change_evidence.certify(alpha);
-        let ev = PyDict::new(py);
-        ev.set_item("alpha", certificate.alpha)?;
-        let entries = PyList::empty(py);
-        for entry in &certificate.entries {
-            let e = PyDict::new(py);
-            let label = match &entry.kind {
-                gam::inference::structure_evidence::ClaimKind::Custom { label } => label.clone(),
-                other => format!("{other:?}"),
-            };
-            e.set_item("claim", label)?;
-            e.set_item("log_e", entry.log_e)?;
-            e.set_item("steps", entry.steps)?;
-            e.set_item("confirmed", entry.confirmed)?;
-            entries.append(e)?;
-        }
-        ev.set_item("entries", entries)?;
-        t.set_item("change_evidence", ev)?;
         traj_list.append(t)?;
     }
     out.set_item("trajectories", traj_list)?;
