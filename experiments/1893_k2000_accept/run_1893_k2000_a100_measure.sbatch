@@ -1,23 +1,27 @@
 #!/bin/bash
 # A100 variant of the #1893 K=2000 acceptance harness, doubling as the #1017/#2230
 # increment-1 residency MEASUREMENT. Same real creditscope Qwen3.5-35B L30 fit as
-# run_1893_k2000_accept.sbatch, but on the GPU partition with RUST_LOG scoped so
-# the per-solve operand-upload lines (DeviceSaePcgData::operand_byte_report, landed
-# 9b98a5413) print, and a final SUMMARY block sums them:
+# run_1893_k2000_accept.sbatch, but on the GPU partition, and it opts the wheel's
+# logger into Info (via the exposed set_log_level pyfunction) so the per-solve
+# operand-upload lines (DeviceSaePcgData::operand_byte_report, landed 9b98a5413)
+# print, and a final SUMMARY block sums them:
 #   count(lines) = matrix-free PCG solves = LM-ladder trials across the fit
 #   Σ total MiB  = the host→device operand transfer a base-resident frame removes
 # It also confirms the sub-lane (framed-dense vs legacy-sparse — expected
 # legacy-sparse at this wide-p shape; framed dense would be ~31 GiB, impossible).
 #
-# TWO HARD REQUIREMENTS — the job is USELESS as a measurement without both:
+# TWO REQUIREMENTS:
 #   1. GAMFIT_VERSION must pin a wheel built from >= 9b98a5413 (contains
 #      operand_byte_report + the log::info! emission at both flatten sites).
-#   2. *** The gamfit wheel MUST install a `log` backend in its #[pymodule] ***
-#      (pyo3-log or env_logger::try_init) — WITHOUT one, Rust `log::info!` is a
-#      no-op and NO measurement lines are emitted regardless of RUST_LOG. There is
-#      currently NO logger backend in gam-pyffi; adding ~3 lines to the #[pymodule]
-#      is out of the gpu-1017 fence and OWED BY THE PYFFI OWNER. Until it lands the
-#      SUMMARY prints "0 operand lines" (see the diagnostic at the end).
+#   2. The wheel's log level is raised to Info BEFORE the fit. gam-pyffi DOES
+#      install a `log` backend (gam::solver::progress_log::init_logging in the
+#      #[pymodule], all sites -> stderr), but the level defaults to Warn (a
+#      deliberate #1689 fit-overhead choice) and RUST_LOG is intentionally IGNORED
+#      (explicit-API-not-env-var design). This script raises it in-process via the
+#      exposed `gamfit._rust.set_log_level("info")` pyfunction (a tiny wrapper runs
+#      the unmodified driver right after the call), so NO RUST_LOG and no pyffi
+#      change is needed. A "0 operand lines" SUMMARY then means the device
+#      matrix-free PCG lane did NOT offload at K (not a logging problem).
 #
 # Submit (coordinator): GAMFIT_VERSION=0.1.NNN /Users/user/msi-node/msi sub \
 #   experiments/1893_k2000_accept/run_1893_k2000_a100_measure.sbatch
@@ -57,10 +61,10 @@ nvidia-smi -L || { echo "FATAL: no GPU visible to the job"; exit 98; }
 
 export OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 MKL_NUM_THREADS=16 NUMEXPR_NUM_THREADS=16
 export LD_LIBRARY_PATH="/common/software/install/manual/openblas/0.3.27_gcc11.3.0/lib:${LD_LIBRARY_PATH:-}"
-# Scope RUST_LOG to the residency measurement module so ONLY the operand lines
-# print (not the other ~517 log sites). Requires the wheel's logger backend (see
-# HARD REQUIREMENT 2).
-export RUST_LOG="${RUST_LOG:-gam_solve::gpu_kernels::arrow_schur=info}"
+# RUST_LOG is intentionally IGNORED by the wheel (requirement 2); the level is
+# raised in-process via set_log_level below, and we grep the emitted lines rather
+# than rely on an env-var filter. The #1017/#2230 lines are prefix-tagged so the
+# grep is exact even amid the other Info-level fit-progress chatter.
 
 VENV=${VENV:-$R/venv_1893_a100_${SLURM_JOB_ID:-manual}}
 python3 -m venv "$VENV"
@@ -70,8 +74,23 @@ python -m pip install --no-cache-dir "gamfit==$GAMFIT_VERSION" numpy scikit-lear
 python -c "import gamfit; print('gamfit', getattr(gamfit,'__version__','?'))"
 
 RUNLOG="$R/sae_1893_a100_measure_${SLURM_JOB_ID:-manual}.runlog"
-echo "=== #1893 a100 measure K=$K  $(date)  node=$(hostname)  gamfit==$GAMFIT_VERSION  RUST_LOG=$RUST_LOG ==="
-python -u "$DRIVER" \
+echo "=== #1893 a100 measure K=$K  $(date)  node=$(hostname)  gamfit==$GAMFIT_VERSION ==="
+
+# Raise the wheel log level to Info in-process (RUST_LOG is ignored), then run the
+# UNMODIFIED #1893 driver in the same interpreter so the level persists through the
+# fit. The wrapper drops its own name from argv so the driver's argparse is intact.
+WRAP="$R/measure_setloglevel_${SLURM_JOB_ID:-manual}.py"
+cat > "$WRAP" <<'PYEOF'
+import sys, runpy, gamfit
+_set = getattr(getattr(gamfit, "_rust", gamfit), "set_log_level", None) \
+    or getattr(gamfit, "set_log_level", None)
+if _set is None:
+    sys.exit("FATAL: gamfit set_log_level not found — wheel predates the export (need >= 9b98a5413)")
+_set("info")
+sys.argv = sys.argv[1:]            # argv[0] becomes the driver path
+runpy.run_path(sys.argv[0], run_name="__main__")
+PYEOF
+python -u "$WRAP" "$DRIVER" \
   --data-mode chunkdir --chunk-dir "$CHUNK_DIR" --max-rows "$MAX_ROWS" \
   --K "$K" --top-k "$TOP_K" --d-atom 1 --atom-topology circle \
   --external-live --max-fit-seconds "$MAX_FIT_SECONDS" \
@@ -83,11 +102,11 @@ echo "================= #1017/#2230 RESIDENCY MEASUREMENT SUMMARY ==============
 LINES="$(grep -F '#1017/#2230' "$RUNLOG" || true)"
 COUNT="$(printf '%s\n' "$LINES" | grep -c 'operand upload' || true)"
 if [ "${COUNT:-0}" -eq 0 ]; then
-  echo "0 operand lines captured. EITHER the matrix-free device PCG lane did not"
-  echo "engage at K=$K (border k below the offload floor — rerun with a larger K or"
-  echo "a wider-p shape, or use the synthetic #2230 driver), OR the gamfit wheel has"
-  echo "NO log backend (HARD REQUIREMENT 2 — pyffi #[pymodule] must init pyo3-log/"
-  echo "env_logger). Confirm which before concluding."
+  echo "0 operand lines captured. With set_log_level('info') applied, this means the"
+  echo "matrix-free device PCG lane did NOT engage at K=$K (border k below the offload"
+  echo "floor) — rerun with a larger K / wider-p shape, or use the host-pure"
+  echo "residency_operand_measure harness which assembles the wide border directly."
+  echo "(If it also fails to raise the level, confirm the wheel is >= 9b98a5413.)"
 else
   # Sum the per-solve total=X.YMiB across all captured solves/ladder-trials.
   printf '%s\n' "$LINES" | awk '
