@@ -174,7 +174,12 @@ fn sas_epsilon_objective_profile_measure() {
         score_at_true - score_at_zero
     );
 
-    // 4. The ACTUAL free recovery fit (optimize_sas = true).
+    // 4. The ACTUAL free recovery fit (optimize_sas = true), with the opening
+    //    outer evaluations captured so we can read the ANALYTIC θ-gradient the
+    //    optimizer actually received at the ε=0 init (the number that splits
+    //    "gradient collapsed at the capped β̂" from "step logic drops a correct
+    //    gradient"). θ layout is (ρ[0..k] ‖ ε ‖ log_δ), so the LAST two gradient
+    //    components are (ε, log_δ).
     let mut opts = base_fit_options();
     opts.sas_link = Some(SasLinkSpec {
         initial_epsilon: 0.0,
@@ -182,6 +187,7 @@ fn sas_epsilon_objective_profile_measure() {
     });
     opts.optimize_sas = true;
     let family = sas_likelihood(opts.sas_link.expect("SAS fit spec"));
+    gam::estimate::enable_outer_eval_capture();
     let fit = fit_gam(
         x.view(),
         y.view(),
@@ -192,6 +198,7 @@ fn sas_epsilon_objective_profile_measure() {
         &opts,
     )
     .expect("free SAS fit");
+    let evals = gam::estimate::take_outer_eval_capture();
     let (eps_hat, delta_hat) = match &fit.fitted_link {
         FittedLinkState::Sas { state, .. } => (state.epsilon, state.delta),
         other => panic!("expected SAS fitted state, got {other:?}"),
@@ -205,11 +212,51 @@ fn sas_epsilon_objective_profile_measure() {
         "  reml_score={:+.6e}  outer_iters={}  outer_converged={}  outer_grad_norm={:?}",
         fit.reml_score, fit.outer_iterations, fit.outer_converged, fit.outer_gradient_norm
     );
+
+    // ANALYTIC gradient the optimizer received at the opening evals. The ε
+    // component (2nd-from-last) at eval 1 is at (near) the ε=0 init — compare it
+    // to the FD dReml/dε(0)=−7-scale truth above. If |analytic ε-grad| ≪ |FD|
+    // ⇒ the analytic gradient is COLLAPSED at the capped β̂ (envelope not
+    // restoring it — refined-β̃ / gradient fix); if analytic ≈ FD but ε̂ stalls
+    // ⇒ ARC/Armijo step logic drops a correct gradient.
+    eprintln!("--- ANALYTIC opening outer evals (θ = ρ.. ‖ ε ‖ log_δ) ---");
+    for (i, rec) in evals.iter().enumerate() {
+        let n = rec.gradient.len();
+        let eps_theta = if n >= 2 { rec.theta[n - 2] } else { f64::NAN };
+        let eps_grad = if n >= 2 { rec.gradient[n - 2] } else { f64::NAN };
+        let ldelta_grad = if n >= 1 { rec.gradient[n - 1] } else { f64::NAN };
+        eprintln!(
+            "  eval {:>2}: cost={:+.6e}  ε_raw(θ)={eps_theta:+.5e}  analytic dCost/dε={eps_grad:+.6e}  dCost/dlog_δ={ldelta_grad:+.6e}  ‖g‖={:+.3e}",
+            i + 1,
+            rec.cost,
+            rec.gradient.mapv(|v| v * v).sum().sqrt(),
+        );
+    }
+    let first_eps_grad = evals
+        .first()
+        .and_then(|r| {
+            let n = r.gradient.len();
+            (n >= 2).then(|| r.gradient[n - 2])
+        })
+        .unwrap_or(f64::NAN);
+
+    // 5. FD dReml/dε at the LANDING point ε̂, for a truth reference where the
+    //    optimizer declared victory.
+    let (score_hp, _) = fixed_link_reml(&x, &y, &w, &offset, &s_list, eps_hat + h, log_delta_true);
+    let (score_hm, _) = fixed_link_reml(&x, &y, &w, &offset, &s_list, eps_hat - h, log_delta_true);
+    let fd_grad_landing = (score_hp - score_hm) / (2.0 * h);
     eprintln!(
-        "  VERDICT INPUTS: profile argmin eps*={best_eps:+.3}; FD dReml/dε(0)={fd_grad0:+.3e}; free eps_hat={eps_hat:+.3e}"
+        "--- FD dReml/dε at landing ε̂={eps_hat:+.4} (log_δ_true): {fd_grad_landing:+.6e} ---"
+    );
+
+    eprintln!(
+        "  VERDICT INPUTS: profile argmin eps*={best_eps:+.3}; FD dReml/dε(0)={fd_grad0:+.3e}; \
+         analytic dCost/dε @eval1={first_eps_grad:+.3e}; free eps_hat={eps_hat:+.3e}; \
+         FD@landing={fd_grad_landing:+.3e}"
     );
     eprintln!(
-        "    (a=objective/coord.a bug  if eps*≈0 or |FD(0)|≈0; b=optimizer bug if eps*≈0.38 & FD(0)≪0 but eps_hat≈0)"
+        "    (b-gradient: |analytic@eval1| ≪ |FD(0)| ⇒ analytic ε-grad COLLAPSED at capped β̂; \
+         b-step: analytic@eval1 ≈ FD(0) but eps_hat≈0 ⇒ step logic drops it)"
     );
     eprintln!("===== END MEASURE =====");
 

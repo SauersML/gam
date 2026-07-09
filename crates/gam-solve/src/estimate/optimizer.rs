@@ -2213,6 +2213,11 @@ where
                     aux_dim,
                     cost_sec,
                 );
+                // Diagnostic capture of the opening outer evals (no-op unless a
+                // measurement test enabled it): records the ANALYTIC θ-gradient
+                // the optimizer received, so the ε/log_δ component at the init
+                // can be read directly (#1876).
+                crate::estimate::outer_eval_capture::record_outer_eval(theta, cost, &grad);
                 Ok(OuterEval {
                     cost,
                     gradient: grad,

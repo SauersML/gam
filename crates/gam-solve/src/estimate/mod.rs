@@ -68,6 +68,7 @@ mod external_options;
 mod fit;
 mod joint_hyper;
 mod optimizer;
+pub mod outer_eval_capture;
 mod penalty;
 mod prefit;
 pub(crate) mod smoothing_correction;
@@ -98,6 +99,9 @@ pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas
 pub use joint_hyper::ExternalJointHyperEvaluator;
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
+pub use outer_eval_capture::{
+    OuterEvalRecord, enable_outer_eval_capture, take_outer_eval_capture,
+};
 pub(crate) use penalty::{
     ParametricColumnConditioning, REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP,
     REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
