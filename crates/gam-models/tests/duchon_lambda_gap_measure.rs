@@ -42,6 +42,28 @@ fn make_sin_dataset(freq: f64, sigma: f64, n: usize, seed: u64) -> EncodedDatase
     encode_recordswith_inferred_schema(headers, rows).expect("encode sin dataset")
 }
 
+/// Null-recovery fixture (mirrors `duchon_hilbert_scale::null_recovery`): a
+/// DETERMINISTIC uniform x-grid and `y ~ N(0, sigma)` INDEPENDENT of x, so the
+/// only correct fit is the null (flat). Same seed/params as the failing test.
+fn make_null_dataset(n: usize, sigma: f64, seed: u64) -> EncodedDataset {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let noise = Normal::new(0.0, sigma).expect("normal");
+    let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+    let y: Vec<f64> = (0..n).map(|_| noise.sample(&mut rng)).collect();
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode null dataset")
+}
+
+fn max_dev_from_mean(v: &[f64]) -> f64 {
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    v.iter().map(|x| (x - mean).abs()).fold(0.0_f64, f64::max)
+}
+
 fn max_abs_err(yhat: &[f64], y: &[f64]) -> f64 {
     yhat.iter()
         .zip(y.iter())
@@ -184,4 +206,105 @@ fn zz_measure_duchon_sin8_lambda_gap() {
             amp_pp(&mgcv_pred)
         );
     }
+}
+
+/// MEASUREMENT (not a gate): why does the default `duchon(x, k=20)` NOT collapse
+/// to the null when `y` is independent of `x`? mgcv `bs="ds"` deselects
+/// (sum_edf≈2.35, fitted swing≈0.041); production gam sits at max_dev≈0.28. This
+/// dumps the per-penalty λ̂, the summed-penalty closed-form REML optimum, and the
+/// penalty null-space structure so the mechanism can be split:
+///   * PROD edf ≈ CF edf (both under-collapsed) ⇒ gam's REML SCORE prefers the
+///     under-smoothed λ (score-assembly / a missing −½·rankᵢ·logλᵢ reward, or a
+///     penalty whose numerical null space wrongly swallows a wiggly kernel mode
+///     so no λ can shrink it — compare `nulldim` to the affine {1,x}=2 expected).
+///   * CF edf ≪ PROD edf at a better CF score ⇒ the production OUTER optimizer is
+///     stuck in a shallow basin (optimizer, not score).
+/// Reading `prod_log_lambda` per block (Primary first, then the
+/// DoublePenaltyNullspace trend ridge) shows WHICH λ fails to go large.
+#[test]
+fn zz_measure_duchon_null_recovery_lambda_gap() {
+    let n = 300usize;
+    let sigma = 1.0;
+    let data = make_null_dataset(n, sigma, 98_765);
+    let x_col = data.column_map()["x"];
+    let y_col = data.column_map()["y"];
+    let ncols = data.headers.len();
+    // Grid matching the failing test (x_test = i/200, i=0..200).
+    let m = 201usize;
+    let x_test: Vec<f64> = (0..m).map(|i| i as f64 / (m as f64 - 1.0)).collect();
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let FitResult::Standard(fit) =
+        fit_from_formula("y ~ duchon(x, k=20)", &data, &cfg).expect("null fit")
+    else {
+        panic!("standard")
+    };
+    let prod_loglam = fit.fit.log_lambdas.to_vec();
+    let prod_lam = fit.fit.lambdas.to_vec();
+    let prod_edf = fit.fit.edf_total();
+    let prod_score = fit.fit.reml_score;
+
+    let mut mt = Array2::<f64>::zeros((m, ncols));
+    for (i, &t) in x_test.iter().enumerate() {
+        mt[[i, x_col]] = t;
+    }
+    let test_design =
+        build_term_collection_design(mt.view(), &fit.resolvedspec).expect("null test design");
+    let prod_pred = test_design.design.apply(&fit.fit.beta).to_vec();
+    let prod_dev = max_dev_from_mean(&prod_pred);
+
+    // Train design + summed penalty + per-block null-space structure.
+    let n_tr = data.values.nrows();
+    let mut mtr = Array2::<f64>::zeros((n_tr, ncols));
+    for i in 0..n_tr {
+        mtr[[i, x_col]] = data.values[[i, x_col]];
+    }
+    let train_design =
+        build_term_collection_design(mtr.view(), &fit.resolvedspec).expect("null train design");
+    let x_dense = train_design.design.to_dense();
+    let p = x_dense.ncols();
+    let mut s = Array2::<f64>::zeros((p, p));
+    let mut per_block: Vec<(usize, usize)> = Vec::new(); // (cols, nullity-of-block)
+    for bp in &train_design.penalties {
+        let r = bp.col_range.clone();
+        per_block.push((r.len(), 0));
+        for (li, gi) in r.clone().enumerate() {
+            for (lj, gj) in r.clone().enumerate() {
+                s[[gi, gj]] += bp.local[[li, lj]];
+            }
+        }
+    }
+    let nulldim: usize = train_design.nullspace_dims.iter().sum();
+    let y_tr = data.values.column(y_col).to_owned();
+
+    let cf = gaussian_reml_closed_form(x_dense.view(), y_tr.view(), s.view(), None, None)
+        .expect("closed form");
+    let xt = test_design.design.to_dense();
+    let cf_beta = Array1::from(cf.coefficients.to_vec());
+    let cf_pred = xt.dot(&cf_beta).to_vec();
+    let cf_dev = max_dev_from_mean(&cf_pred);
+
+    // mgcv reference on the same fixture (predict on the grid; no truth signal).
+    let (mgcv_edf, mgcv_sp, mgcv_pred) = mgcv_diag(&data, &x_test, 20);
+
+    eprintln!(
+        "\n===== [null-recovery] p={p} nulldim={nulldim} (affine {{1,x}} expects 2) n_penalties={} block_cols={:?} penalty_nullspace_dims={:?} sigma={sigma} =====",
+        train_design.penalties.len(),
+        per_block.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        train_design.nullspace_dims,
+    );
+    eprintln!(
+        "  PROD gam  : log_lambda={prod_loglam:?}\n              lambda={prod_lam:?}\n              edf={prod_edf:?} reml_score={prod_score:.4} max_dev_from_mean={prod_dev:.4} (fails at >=0.25)",
+    );
+    eprintln!(
+        "  CF   gam  : rho={:.4} lambda={:.4e} edf={:.3} reml_score={:.4} max_dev={cf_dev:.4}",
+        cf.rho, cf.lambda, cf.edf, cf.reml_score,
+    );
+    eprintln!(
+        "  MGCV ds k=20: sp={mgcv_sp:.4e} edf={mgcv_edf:.3} max_dev={:.4} (target: collapses, edf~2.35 dev~0.041)",
+        max_dev_from_mean(&mgcv_pred),
+    );
 }
