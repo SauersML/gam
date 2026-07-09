@@ -77,7 +77,7 @@ def make_split(X: np.ndarray, test_frac: float, seed: int):
 
 # --------------------------------------------------------------------------- #
 def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
-                      return_model=False):
+                      return_model=False, cosine_lr=False):
     """Gao-et-al. TopK SAE with the standard training refinements (tied init,
     unit-norm decoder columns, pre-bias). The traditional-SAE bar."""
     import torch
@@ -94,6 +94,8 @@ def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
     with torch.no_grad():
         W_dec /= W_dec.norm(dim=1, keepdim=True).clamp_min(1e-8)
     opt = torch.optim.Adam([W_enc, W_dec, b_dec], lr=lr)
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+             if cosine_lr else None)
 
     def encode(x):
         pre = (x - b_dec) @ W_enc.t()
@@ -114,6 +116,8 @@ def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if sched is not None:
+            sched.step()
         with torch.no_grad():
             W_dec /= W_dec.norm(dim=1, keepdim=True).clamp_min(1e-8)
         now = time.perf_counter()
@@ -328,6 +332,8 @@ def main() -> int:
     ap.add_argument("--curved-steps", type=int, default=6000)
     ap.add_argument("--curved-rows", type=int, default=20000,
                     help="hybrid_rust: row subsample for the curved-tier Rust fit")
+    ap.add_argument("--cosine-lr", action="store_true",
+                    help="cosine LR decay for the external bar (stronger baseline)")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default="results_1026.jsonl")
     args = ap.parse_args()
@@ -344,7 +350,7 @@ def main() -> int:
     if args.arm == "external_topk":
         ev = fit_external_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                steps=args.steps, lr=args.lr, bs=args.batch_size,
-                               seed=args.seed)
+                               seed=args.seed, cosine_lr=args.cosine_lr)
     elif args.arm == "gam_flat":
         ev, ev_train = fit_gam_flat(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                     max_epochs=args.max_epochs, seed=args.seed)
