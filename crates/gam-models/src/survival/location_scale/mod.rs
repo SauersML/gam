@@ -60,7 +60,7 @@ use crate::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator, infer_non_intercept_start_design,
 };
 
-use crate::sigma_link::{EXP_NEG_STABLE_MAX_ARG, exp_sigma_inverse_from_eta_scalar};
+use crate::sigma_link::exp_sigma_inverse_from_eta_scalar;
 
 use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 

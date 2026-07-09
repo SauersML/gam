@@ -71,15 +71,20 @@ impl From<String> for SurvivalLocationScaleError {
 //
 // The protection strategy is layered:
 //
-//   Layer 1 – `exp_neg_stable`: cap the exp argument at +500 (one-sided)
-//     so inv_sigma ≤ exp(500) ≈ 1.4e217, preventing overflow at the
-//     source.  Underflow (exp(-x) → 0 for large positive x) is allowed
-//     because it is the mathematically correct limit.  Products like
-//     inv_sigma * eta_t stay finite for any eta_t below ~1e91.
+//   Layer 1 – `exp_neg_stable`: exact exp(-eta_ls) for every value that is
+//     representable in binary64, saturating near f64::MAX only past the
+//     representability boundary (`EXP_SATURATION_MAX_ARG` ≈ ln(f64::MAX))
+//     instead of overflowing to +inf.  Underflow (exp(-x) → 0 for large
+//     positive x) is allowed because it is the mathematically correct
+//     limit.  The saturation never rewrites a finite model: it engages
+//     only where the true value has no f64 representation.
 //
-//   Layer 2 – `survival_q0_from_eta`: uses log-space arithmetic to detect
-//     when |eta_t * inv_sigma| would exceed the clamp ceiling and saturates
-//     to ±MAX instead of overflowing.
+//   Layer 2 – `survival_q0_from_eta`: uses exact log-space arithmetic to
+//     detect when |eta_t * inv_sigma| genuinely exceeds f64::MAX and
+//     saturates to ±MAX instead of overflowing; when exp(-eta_ls) alone is
+//     unrepresentable but the product is finite it evaluates the product in
+//     the log domain, so the value channel matches the mathematical
+//     function on the whole representable range.
 //
 //   Layer 3 – factorized time-derivative algebra and compensated subtraction:
 //     the base dq/dt chain is evaluated as exp(-eta_ls) * (eta_t*eta_ls' - eta_t')

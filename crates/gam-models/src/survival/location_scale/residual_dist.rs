@@ -1,20 +1,10 @@
 use super::*;
 
-/// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
-/// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
-/// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
-#[inline]
-pub(crate) fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
-    if eta_t == 0.0 {
-        return 0.0;
-    }
-    let log_abs = eta_t.abs().ln() + (-eta_ls).min(EXP_NEG_STABLE_MAX_ARG);
-    if log_abs > EXP_NEG_STABLE_MAX_ARG {
-        if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
-    } else {
-        -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls)
-    }
-}
+// Layer 2 defense (canonical implementation lives beside the σ-link in
+// `gam_model_kernels::sigma_link` so the fit engine and the prediction
+// crates share one guarded product): q0 = -eta_t · exp(-eta_ls) with exact
+// log-space overflow detection, saturating only past f64 representability.
+pub(crate) use crate::sigma_link::survival_q0_from_eta;
 
 #[inline]
 pub(crate) fn probit_survival_value(eta: f64) -> f64 {

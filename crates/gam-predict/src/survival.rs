@@ -9,30 +9,22 @@ use super::*;
 /// The "design" in `PredictInput` is the threshold design matrix, and
 /// "design_noise" is the log-sigma design matrix. The time dimension
 /// (x_time_exit) is handled externally and is not part of this predictor.
-const SURVIVAL_EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
-
+///
+/// Both the inverse σ-link and the guarded q0 product are the canonical
+/// `gam_model_kernels::sigma_link` kernels shared with the fit engine: exact
+/// wherever the mathematical value is representable in `f64`, saturating only
+/// at the representability boundary itself.
 #[inline]
 fn survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma: f64) -> f64 {
-    (-eta_log_sigma).min(SURVIVAL_EXP_NEG_STABLE_MAX_ARG).exp()
+    gam_model_kernels::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_log_sigma)
 }
 
 #[inline]
 fn survival_q0_and_inverse_sigma(eta_threshold: f64, eta_log_sigma: f64) -> (f64, f64) {
-    let inv_sigma = survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma);
-    if eta_threshold == 0.0 {
-        return (0.0, inv_sigma);
-    }
-    let log_abs = eta_threshold.abs().ln() + (-eta_log_sigma).min(SURVIVAL_EXP_NEG_STABLE_MAX_ARG);
-    let q0 = if log_abs > SURVIVAL_EXP_NEG_STABLE_MAX_ARG {
-        if eta_threshold > 0.0 {
-            -f64::MAX
-        } else {
-            f64::MAX
-        }
-    } else {
-        -eta_threshold * inv_sigma
-    };
-    (q0, inv_sigma)
+    (
+        gam_model_kernels::sigma_link::survival_q0_from_eta(eta_threshold, eta_log_sigma),
+        survival_inverse_sigma_from_eta_log_sigma(eta_log_sigma),
+    )
 }
 
 #[inline]
@@ -154,31 +146,23 @@ impl SurvivalPredictor {
         Ok((eta_threshold, eta_log_sigma, design_noise))
     }
 
-    /// Survival point + η/mean standard errors from an explicit covariance
-    /// `backend` (so the caller can select conditional vs. smoothing-corrected
-    /// covariance). The `covariance_corrected_used` flag is left `false`; the
-    /// caller overrides it according to the backend it selected.
-    fn state_from_backend(
+    /// Delta-method response-scale SE of the survival probability from an
+    /// explicit covariance `backend`, via the threshold/log-σ chain rule.
+    /// Shared by the full-uncertainty state and the posterior-mean pass so both
+    /// report a genuine probability-scale SE (never the threshold-scale η SE,
+    /// which lives in different units).
+    fn survival_mean_se_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
-    ) -> Result<LinearState, EstimationError> {
-        let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
-        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+        eta_threshold: &Array1<f64>,
+        eta_log_sigma: &Array1<f64>,
+        design_noise: &DesignMatrix,
+    ) -> Result<Array1<f64>, EstimationError> {
         let n = eta_threshold.len();
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_log_sigma.len();
-
-        let eta_se = padded_design_standard_errors_from_backend(
-            &input.design,
-            backend,
-            0,
-            p_s,
-            "survival threshold uncertainty",
-        )?;
-
-        // Delta-method SE for survival probability.
-        let mean_se_vec = linear_predictor_se_from_backend(backend, n, |rows| {
+        linear_predictor_se_from_backend(backend, n, |rows| {
             let x_t = design_row_chunk(&input.design, rows.clone())?;
             let x_s = design_row_chunk(design_noise, rows.clone())?;
             let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]);
@@ -201,7 +185,38 @@ impl SurvivalPredictor {
                 }
             }
             Ok(vec![grad])
-        })?;
+        })
+    }
+
+    /// Survival point + η/mean standard errors from an explicit covariance
+    /// `backend` (so the caller can select conditional vs. smoothing-corrected
+    /// covariance). The `covariance_corrected_used` flag is left `false`; the
+    /// caller overrides it according to the backend it selected.
+    fn state_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<LinearState, EstimationError> {
+        let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
+        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+        let p_s = self.beta_log_sigma.len();
+
+        let eta_se = padded_design_standard_errors_from_backend(
+            &input.design,
+            backend,
+            0,
+            p_s,
+            "survival threshold uncertainty",
+        )?;
+
+        // Delta-method SE for survival probability.
+        let mean_se_vec = self.survival_mean_se_from_backend(
+            input,
+            backend,
+            &eta_threshold,
+            &eta_log_sigma,
+            design_noise,
+        )?;
         Ok(LinearState {
             eta: eta_threshold,
             mean: survival_prob,
@@ -260,9 +275,10 @@ impl PredictionTransform for SurvivalPredictor {
             }
             PredictPass::PosteriorMean => {
                 let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
-                // The eta_se here covers only the threshold block. Response-scale
-                // survival intervals also need sigma uncertainty, which is
-                // propagated by the caller when it requests full interval output.
+                // The eta_se covers only the threshold block; the response-scale
+                // `mean_se` below carries the full threshold + log-σ delta-method
+                // propagation, so the collapsed-delta credible band is in genuine
+                // survival-probability units.
                 //
                 // Validation target for this survival posterior-mean path:
                 // compare against 50K Monte Carlo draws from N(beta_hat, V) for a
@@ -319,11 +335,18 @@ impl PredictionTransform for SurvivalPredictor {
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 );
+                let mean_se = self.survival_mean_se_from_backend(
+                    input,
+                    &backend,
+                    &eta_threshold,
+                    &eta_log_sigma,
+                    design_noise,
+                )?;
                 Ok(LinearState {
                     eta: eta_threshold,
                     mean,
                     eta_se: Some(eta_se),
-                    mean_se: None,
+                    mean_se: Some(mean_se),
                     covariance_corrected_used: false,
                 })
             }
@@ -428,18 +451,27 @@ mod tests {
     }
 
     #[test]
-    fn inverse_sigma_large_positive_clamps_near_zero() {
-        // exp(-eta) clamped at exp(-500) ≈ 0
+    fn inverse_sigma_large_positive_underflows_to_zero() {
+        // exp(-1000) underflows naturally — the mathematically correct limit.
         let result = survival_inverse_sigma_from_eta_log_sigma(1000.0);
-        assert!(result < 1e-200);
+        assert_eq!(result, 0.0);
     }
 
     #[test]
-    fn inverse_sigma_large_negative_uses_cap() {
-        // exp(-eta) clamped to exp(500) for eta = -1000
+    fn inverse_sigma_is_exact_on_the_representable_range() {
+        // exp(600) ≈ 3.77e260 is representable and must be returned exactly,
+        // not rewritten by an artificial cap.
+        let result = survival_inverse_sigma_from_eta_log_sigma(-600.0);
+        assert_eq!(result, 600.0_f64.exp());
+    }
+
+    #[test]
+    fn inverse_sigma_saturates_finite_at_representability_boundary() {
+        // exp(1000) overflows binary64; the link saturates near f64::MAX
+        // instead of returning +inf.
         let result = survival_inverse_sigma_from_eta_log_sigma(-1000.0);
-        let capped = 500.0_f64.exp();
-        assert!((result - capped).abs() < 1e-6 * capped);
+        assert!(result.is_finite());
+        assert!(result > 1e308);
     }
 
     #[test]
@@ -465,16 +497,33 @@ mod tests {
     }
 
     #[test]
-    fn q0_large_positive_threshold_clamps_to_neg_max() {
-        // Very large positive threshold: log_abs > 500 → q0 = -f64::MAX
+    fn q0_huge_finite_product_is_exact() {
+        // |q0| = 1e300 is representable, so no saturation may engage.
         let (q0, _) = survival_q0_and_inverse_sigma(1e300, 0.0);
-        assert_eq!(q0, -f64::MAX);
+        assert_eq!(q0, -1e300);
+        let (q0_neg, _) = survival_q0_and_inverse_sigma(-1e300, 0.0);
+        assert_eq!(q0_neg, 1e300);
     }
 
     #[test]
-    fn q0_large_negative_threshold_clamps_to_pos_max() {
-        let (q0, _) = survival_q0_and_inverse_sigma(-1e300, 0.0);
-        assert_eq!(q0, f64::MAX);
+    fn q0_saturates_only_past_f64_representability() {
+        // ln(1e300) - (-100) ≈ 790.8 > ln(f64::MAX): the true product
+        // overflows binary64 and saturates to ∓MAX.
+        let (q0, _) = survival_q0_and_inverse_sigma(1e300, -100.0);
+        assert_eq!(q0, -f64::MAX);
+        let (q0_neg, _) = survival_q0_and_inverse_sigma(-1e300, -100.0);
+        assert_eq!(q0_neg, f64::MAX);
+    }
+
+    #[test]
+    fn q0_log_domain_rescues_saturated_inverse_sigma() {
+        // exp(720) alone is unrepresentable, but 1e-9 · exp(720) ≈ e^699.3 is
+        // finite; the product must be evaluated in the log domain.
+        let (q0, inv_sigma) = survival_q0_and_inverse_sigma(1e-9, -720.0);
+        assert!(!inv_sigma.is_infinite());
+        assert!(q0.is_finite());
+        let expected = -(1e-9_f64.ln() + 720.0).exp();
+        assert!((q0 - expected).abs() <= 1e-10 * expected.abs());
     }
 
     #[test]

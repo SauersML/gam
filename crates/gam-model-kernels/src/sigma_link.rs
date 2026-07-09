@@ -44,34 +44,80 @@ pub fn exp_sigma_from_eta_scalar(eta: f64) -> f64 {
     safe_exp(eta)
 }
 
-/// Maximum exponent argument for the one-sided overflow guard on the
-/// inverse sigma link. exp(500) ≈ 1.4e217 leaves ~91 orders of magnitude
-/// of headroom before reaching f64::MAX ≈ 1.8e308, sufficient for any
-/// reasonable downstream multiplicative chain.
-pub const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+/// Largest exponent argument whose `exp` is still finite in binary64.
+///
+/// `ln(f64::MAX) ≈ 709.782712893384`; this constant sits ~1e-11 below it so
+/// `exp(EXP_SATURATION_MAX_ARG)` is guaranteed to round to a finite value
+/// (≈ `f64::MAX · (1 − 1.3e-11)`). The inverse σ-link saturates only here —
+/// at the representability boundary of the number format itself — so the
+/// implemented link equals the mathematical `exp(-η)` for every argument
+/// whose value is representable in `f64`, and the saturated value differs
+/// from the true value's rounding by less than one part in 1e11.
+///
+/// (A former cap at +500 silently rewrote *finite* models: `exp(600)` ≈
+/// 3.8e260 is perfectly representable but was returned as `exp(500)` ≈
+/// 1.4e217, desynchronizing the likelihood value from the uncapped
+/// gradient/Hessian algebra over the entire exponent band (500, 709.78].)
+pub const EXP_SATURATION_MAX_ARG: f64 = 709.78271289338;
 
-/// Overflow-safe `exp(-x)`: guards against overflow when `x` is very
-/// negative (so `exp(-x)` would overflow to +inf) by capping the exponent
-/// at +500, but allows natural IEEE 754 underflow to 0.0 when `x` is
-/// very positive.
+/// Overflow-safe `exp(-x)`: exact wherever `exp(-x)` is representable.
+///
+/// Saturates at `exp(EXP_SATURATION_MAX_ARG) ≈ f64::MAX` instead of
+/// overflowing to `+inf` (which would poison downstream products with NaN
+/// via `inf · 0`), and allows natural IEEE 754 underflow to `0.0` when `x`
+/// is very positive because that is the mathematically correct limit.
 ///
 /// The one-sided guard is critical: for `x = 701` the correct value is
-/// `exp(-701) ≈ 5e-305` (essentially zero), NOT `exp(-500) ≈ 7e-218`.
-/// A two-sided clamp would return the latter, which is ~1e87× too large
-/// and destroys far-tail exact derivatives.
+/// `exp(-701) ≈ 5e-305` (essentially zero); a two-sided clamp would destroy
+/// far-tail exact derivatives.
 #[inline]
 pub fn exp_neg_stable(x: f64) -> f64 {
-    (-x).min(EXP_NEG_STABLE_MAX_ARG).exp()
+    (-x).min(EXP_SATURATION_MAX_ARG).exp()
 }
 
-/// Inverse exp-link `1/σ = exp(-η)` with the one-sided overflow guard
-/// from [`exp_neg_stable`]. Required by every solver path that forms
-/// products like `t · exp(-η_ls)` — without the guard, very negative
-/// η_ls produces `+inf`, which propagates as `NaN` through subsequent
-/// multiplications and breaks the monotonicity floor / penalty chain.
+/// Inverse exp-link `1/σ = exp(-η)` with the one-sided representability
+/// guard from [`exp_neg_stable`]: exact for every η whose `exp(-η)` fits in
+/// `f64`, saturating near `f64::MAX` only past that boundary. Required by
+/// every solver path that forms products like `t · exp(-η_ls)` — without the
+/// guard, very negative η_ls produces `+inf`, which propagates as `NaN`
+/// through subsequent multiplications and breaks the monotonicity floor /
+/// penalty chain.
 #[inline]
 pub fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
     exp_neg_stable(eta)
+}
+
+/// Standardized survival threshold q0 = -eta_t · exp(-eta_ls) with log-space
+/// overflow detection.
+///
+/// log|q0| = ln|eta_t| + (-eta_ls) is formed exactly (no argument cap), so
+/// the result equals the mathematical product for every representable
+/// magnitude; saturation to ±MAX happens only when |q0| genuinely exceeds
+/// `f64::MAX` — the representability boundary of the number format, not an
+/// arbitrary ceiling. When `exp(-eta_ls)` alone is unrepresentable but the
+/// product is finite (|eta_t| tiny), the magnitude is evaluated in the log
+/// domain instead of through the saturated factor.
+#[inline]
+pub fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
+    if eta_t == 0.0 {
+        return 0.0;
+    }
+    let log_abs = eta_t.abs().ln() - eta_ls;
+    if log_abs > EXP_SATURATION_MAX_ARG {
+        return if eta_t > 0.0 { -f64::MAX } else { f64::MAX };
+    }
+    if -eta_ls > EXP_SATURATION_MAX_ARG {
+        let mag = log_abs.exp();
+        return if eta_t > 0.0 { -mag } else { mag };
+    }
+    let q = -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls);
+    if q.is_finite() {
+        q
+    } else {
+        // Roundoff at the very edge of the representable band can push the
+        // direct product to ±inf even though log_abs cleared the check.
+        if eta_t > 0.0 { -f64::MAX } else { f64::MAX }
+    }
 }
 
 #[inline]

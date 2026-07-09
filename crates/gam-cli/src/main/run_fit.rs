@@ -1829,7 +1829,7 @@ pub(crate) fn compute_probit_q0_from_eta(
     }
     let mut q0 = Array1::<f64>::zeros(eta_t.len());
     for i in 0..q0.len() {
-        q0[i] = -eta_t[i] * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
+        q0[i] = gam::families::sigma_link::survival_q0_from_eta(eta_t[i], eta_ls[i]);
     }
     Ok(q0)
 }
