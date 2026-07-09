@@ -1769,6 +1769,21 @@ impl SaeManifoldTerm {
         }
         let ev = 1.0 - ssr / sst;
         let out_energy_ratio = sfit / sst;
+        // F9 perf — the exact reachable-rank SVD below (`reachable_dictionary_rank`,
+        // an `O(n·(Σ_k M_k)²)` concatenated decomposition — the ~hundreds-of-MB,
+        // dominant cost of this per-probe check) only feeds `ev_floor = q / n`, and
+        // `q = reachable_dictionary_rank` is CAPPED at `min(n, p)` (see
+        // `reachable_dictionary_rank`). The collapse verdict requires `ev ≤ ev_floor
+        // ≤ min(n, p) / n`, so any fit whose EV clears that data-rank ceiling CANNOT
+        // be a collapse regardless of the exact rank. Skip the SVD and return the
+        // no-collapse verdict directly: healthy probes (the overwhelming majority)
+        // exit here having paid only the `O(n·p)` sums already computed above, and
+        // the returned verdict is byte-identical to the full path (the `ev ≤ ev_floor`
+        // branch at the same bar is the only place `q` can change the outcome).
+        let max_possible_ev_floor = n.min(p) as f64 / n as f64;
+        if ev.is_finite() && ev > max_possible_ev_floor {
+            return Ok(false);
+        }
         // S1 (guard surgery) — the collapse verdict that feeds the outer BFGS WALL
         // must fire ONLY on ABSOLUTE degeneracy, never on a fit that is merely
         // below a competitiveness ceiling. The former `0.5 × dense rank-K PCA
@@ -3140,6 +3155,26 @@ impl SaeManifoldTerm {
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
+        // OVERCOMPLETE GATE (ibp_default_alpha false-positive root cause). A shared
+        // output subspace is evidence of a REDUNDANT atom only when the dictionary is
+        // NOT overcomplete relative to the output space it actually occupies. Let
+        // `R = dim(⋃_k col Q_k)` be the effective output rank — the dimension spanned
+        // by the atoms' orthonormal decoder output frames. When `K > R`, pigeonhole
+        // FORCES output-frame sharing: `K` curved atoms cannot each claim a private
+        // output direction inside an `R < K`-dim space, so every co-firing pair MUST
+        // overlap while encoding DISTINCT charts/phases — benign over-completeness, not
+        // duplication (measured on `ibp_default_alpha`: 8 curved atoms in a ~6-dim
+        // output, every frame-coherent pair reconstructs EV≈0.99 with contribution
+        // cosine at the independence null; firing the reseed here burns the iteration
+        // budget — guards-on 12-iter EV 0.697 vs guards-off 0.990). Restrict the whole
+        // detector to `K ≤ R`, where a shared output frame is genuine evidence of a
+        // redundant atom and the PASS-2 contribution-cosine verdict then separates a
+        // true duplicate from a merely-correlated pair. `R` is READ from the frames at
+        // hand (numeric rank of the stacked orthonormal frames), never a config knob.
+        let effective_output_rank = union_output_frame_rank(&frames, p);
+        if k > effective_output_rank {
+            return Ok(Vec::new());
+        }
         // PASS 1 — output-SUBSPACE overlap CANDIDATES. A pair enters the guard only
         // when its decoder output frames overlap beyond the random-frame null
         // `½(μ_null+1)`. This is a cheap prune, NOT the verdict: sharing an output
@@ -5918,4 +5953,48 @@ impl SaeManifoldTerm {
             total,
         ))
     }
+}
+
+/// Effective output rank `R = dim(⋃_k col(Q_k))` — the dimension actually spanned by
+/// the atoms' orthonormal decoder output frames `Q_k` (`certificate_output_frame`),
+/// as the numeric rank of the HORIZONTALLY-STACKED frames at the shared frame-rank
+/// cutoff [`crate::frames::SAE_FRAME_RANK_CUTOFF`]. Caps the structural-coherence
+/// overcomplete gate: a dictionary with `K > R` atoms cannot give each atom a private
+/// output direction, so output-frame sharing there is FORCED (benign over-completeness)
+/// rather than evidence of a redundant atom. `p` is the output dimension (every frame
+/// is `p × r_k`); an SVD failure degrades to `p` (the maximal meaningful rank) so a
+/// numerical hiccup never spuriously DISABLES the guard.
+fn union_output_frame_rank(frames: &[Array2<f64>], p: usize) -> usize {
+    let total_cols: usize = frames.iter().map(|q| q.ncols()).sum();
+    if p == 0 || total_cols == 0 {
+        return 0;
+    }
+    let mut stacked = Array2::<f64>::zeros((p, total_cols));
+    let mut col = 0usize;
+    for q in frames {
+        let m = q.ncols();
+        if m == 0 {
+            continue;
+        }
+        // Frames are `p × r_k`; guard a stray row-count mismatch rather than panic.
+        if q.nrows() != p {
+            return p;
+        }
+        for qc in 0..m {
+            for row in 0..p {
+                stacked[[row, col + qc]] = q[[row, qc]];
+            }
+        }
+        col += m;
+    }
+    let sv = match stacked.svd(false, false) {
+        Ok((_, sv, _)) => sv,
+        Err(_) => return p,
+    };
+    let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
+    if !(max_sv > 0.0) {
+        return 0;
+    }
+    let tol = crate::frames::SAE_FRAME_RANK_CUTOFF * max_sv;
+    sv.iter().filter(|&&v| v > tol).count().min(p)
 }
