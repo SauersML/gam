@@ -14,6 +14,75 @@
 //! one side.
 
 use ndarray::{Array1, Array2};
+use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
+use serde_json::Value;
+
+/// Convert an arbitrary JSON-shaped Python object into a `serde_json::Value`
+/// (#2091). The inverse of the crate's `json_value_to_py`; the
+/// `from_fit_payload` builder needs it to carry the raw fit payload's opaque
+/// report blocks (`diagnostics`, `atom_inference`, `hybrid_split`, …) through as
+/// `Value` without a Python `json.dumps` hop. Mirrors the Python `_jsonable`
+/// coercion `to_dict` applies to those blocks: numpy arrays/scalars are
+/// `.tolist()`-flattened, `dict` keys are stringified, `list`/`tuple` become
+/// arrays, and JSON scalars pass through. `bool` is checked before `int`
+/// (Python `bool` subclasses `int`), and `int` before `float` so an integral
+/// value serializes as a JSON integer, matching `json.dumps`.
+pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = obj.downcast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(Value::Number(i.into()));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(Value::String(s));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = serde_json::Map::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            // Mirror `_jsonable`'s `str(k)` key coercion.
+            let key: String = match k.extract::<String>() {
+                Ok(key) => key,
+                Err(_) => k.str()?.extract::<String>()?,
+            };
+            map.insert(key, py_any_to_json_value(&v)?);
+        }
+        return Ok(Value::Object(map));
+    }
+    // A numpy array (or any object exposing `.tolist()`) flattens to native
+    // Python lists first, then recurses — the same path `_jsonable` takes.
+    if obj.hasattr("tolist")? {
+        let listed = obj.call_method0("tolist")?;
+        return py_any_to_json_value(&listed);
+    }
+    if let Ok(seq) = obj.downcast::<PyList>() {
+        let mut arr = Vec::with_capacity(seq.len());
+        for item in seq.iter() {
+            arr.push(py_any_to_json_value(&item)?);
+        }
+        return Ok(Value::Array(arr));
+    }
+    if let Ok(seq) = obj.downcast::<PyTuple>() {
+        let mut arr = Vec::with_capacity(seq.len());
+        for item in seq.iter() {
+            arr.push(py_any_to_json_value(&item)?);
+        }
+        return Ok(Value::Array(arr));
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "py_any_to_json_value: cannot convert Python object of type {} to JSON",
+        obj.get_type().name()?,
+    )))
+}
 
 /// Case-insensitive, `-`/`_`-interchangeable name normalizer. Mirrors
 /// `_sae_manifold.py::_canon_name`: `str(name).strip().lower().replace("-", "_")`.

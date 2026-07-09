@@ -7365,6 +7365,17 @@ fn sae_periodic_shape_band_reorder<'py>(
     ))
 }
 
+/// Round-trip a JSON-shaped Python object through the `py_any_to_json_value` ->
+/// `json_value_to_py` pair (#2091). Exists to pin the builder's report-block
+/// coercion (numpy `.tolist()` flattening, `dict` key stringification, int-vs-
+/// float scalars) from Python; the `from_fit_payload` builder reuses
+/// `py_any_to_json_value` directly for the raw payload's opaque report blocks.
+#[pyfunction(signature = (obj))]
+fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    let value = crate::manifold::manifold_sae_coercion::py_any_to_json_value(obj)?;
+    json_value_to_py(py, value)
+}
+
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
 /// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:
