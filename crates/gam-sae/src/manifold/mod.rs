@@ -269,6 +269,9 @@ mod tests_startup_validation_1782;
 mod tests_zoo_micro_local;
 
 #[cfg(test)]
+mod tests_termination_2235;
+
+#[cfg(test)]
 mod tests_steering_e4;
 
 #[cfg(test)]
