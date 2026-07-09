@@ -1427,8 +1427,12 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // pre-staged residency (no per-apply operator re-capture). The probes fan
     // across rayon workers (in `slq_logdet`), and `schur_matvec`'s own row
     // parallelism is guarded off inside a worker, so there is no nested
-    // oversubscription.
-    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    // oversubscription. The device seam is explicitly CPU here (`None`) until
+    // the #1017 upload-once GpuSchurMatvec wiring lands — this call is the
+    // production expression of that choice (and keeps the seam live under the
+    // lib target's dead-code lint without an allow).
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
+        .with_gpu_matvec(None);
     slq_logdet(
         k,
         |v| op.apply(v),
