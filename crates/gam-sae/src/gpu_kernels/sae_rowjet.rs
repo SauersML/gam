@@ -43,6 +43,7 @@
 //! unified jet — so the result is identical and the path is never GPU-only.
 
 use crate::row_jet_program::SaeReconstructionRowProgram;
+use gam_solve::gpu_kernels::sae_resident::{DeviceResidentArrowShape, DeviceResidentArrowSlabs};
 
 /// One row's order-≤2 reconstruction jet channels, flattened row-major:
 /// `first[a*p + c] = ∂ẑ_c/∂p_a` and `second[(a*K + b)*p + c] = ∂²ẑ_c/∂p_a∂p_b`,
@@ -479,6 +480,101 @@ pub fn gauss_newton_row_hessian_slabs(channels: &SaeRowJetChannels) -> Vec<f64> 
     slabs
 }
 
+/// Assemble the [`DeviceResidentArrowSlabs`] the #1017 resident inner-iteration
+/// workspace uploads, feeding the per-row Gauss-Newton data curvature straight
+/// from the proven SAE row-jet primitive instead of hand-built host slabs (the
+/// #1017 Phase-3 bridge the row-jet doc at [`gauss_newton_row_hessian_slabs`]
+/// points to).
+///
+/// `row_hessian_slabs` is the exact GN contraction of the row-jet channels
+/// ([`gauss_newton_row_hessian_slabs`]) — `n·d·d`, one `d×d` slab per row, with
+/// the row-jet tower arity `K` playing the resident row-block dimension `d`. The
+/// remaining slabs are the SHARED-BORDER (decoder) quantities the arrow assembler
+/// owns — they are not row-jet products — and are passed through verbatim:
+/// `row_cross_slabs` (`n·d·p`, the per-row latent↔border cross curvature),
+/// `row_gradient_slabs` (`n·d`), `border_hessian` (`p·p`), and `border_gradient`
+/// (`p`). Every component is length-checked against `shape` (the same contract
+/// [`DeviceResidentArrowWorkspace::new`] enforces), so a mis-sized or
+/// mismatched-arity feed fails loudly at the bridge instead of deep in the device
+/// upload.
+///
+/// # Per-row loss weight
+///
+/// [`gauss_newton_row_hessian_slabs`] contracts the channels as supplied, i.e. at
+/// `sqrt_row_w = 1`. The production arrow system's `H_tt` carries the per-row loss
+/// weight `w_i`, and weighting is linear in the Gram (`(√w·J)ᵀ(√w·J) = w·JᵀJ`), so
+/// the caller must feed **weight-scaled channels** (`first`/`second` pre-multiplied
+/// by `√w_i`) — the contract the row-jet doc already states — for the resident
+/// `H_tt` to match the CPU factor. The cross/gradient/border are passed through
+/// unchanged and must already carry their weights.
+///
+/// [`DeviceResidentArrowWorkspace::new`]: gam_solve::gpu_kernels::sae_resident::DeviceResidentArrowWorkspace::new
+pub fn resident_slabs_from_rowjet(
+    shape: DeviceResidentArrowShape,
+    channels: &SaeRowJetChannels,
+    row_cross_slabs: Vec<f64>,
+    row_gradient_slabs: Vec<f64>,
+    border_hessian: Vec<f64>,
+    border_gradient: Vec<f64>,
+) -> Result<DeviceResidentArrowSlabs, String> {
+    if channels.k != shape.d {
+        return Err(format!(
+            "resident_slabs_from_rowjet: row-jet K={} must equal resident d={}",
+            channels.k, shape.d
+        ));
+    }
+    if channels.n_rows != shape.n {
+        return Err(format!(
+            "resident_slabs_from_rowjet: row-jet n_rows={} must equal resident n={}",
+            channels.n_rows, shape.n
+        ));
+    }
+    if channels.p != shape.p {
+        return Err(format!(
+            "resident_slabs_from_rowjet: row-jet p={} must equal resident p={}",
+            channels.p, shape.p
+        ));
+    }
+    let slabs = DeviceResidentArrowSlabs {
+        row_hessian_slabs: gauss_newton_row_hessian_slabs(channels),
+        row_cross_slabs,
+        row_gradient_slabs,
+        border_hessian,
+        border_gradient,
+    };
+    let checks = [
+        (
+            "row_hessian_slabs",
+            slabs.row_hessian_slabs.len(),
+            shape.row_hessian_len(),
+        ),
+        (
+            "row_cross_slabs",
+            slabs.row_cross_slabs.len(),
+            shape.row_cross_len(),
+        ),
+        (
+            "row_gradient_slabs",
+            slabs.row_gradient_slabs.len(),
+            shape.row_gradient_len(),
+        ),
+        (
+            "border_hessian",
+            slabs.border_hessian.len(),
+            shape.border_hessian_len(),
+        ),
+        ("border_gradient", slabs.border_gradient.len(), shape.p),
+    ];
+    for (label, got, want) in checks {
+        if got != want {
+            return Err(format!(
+                "resident_slabs_from_rowjet: {label} length {got} != expected {want}"
+            ));
+        }
+    }
+    Ok(slabs)
+}
+
 #[cfg(target_os = "linux")]
 mod device {
     use super::{SaeRowJetChannels, SaeSoftmaxRowInputs, softmax_kernel_source};
@@ -731,6 +827,60 @@ mod tests {
             }
             assert!(quad >= -1e-12, "GN slab not PSD: vᵀHv={quad}");
         }
+    }
+
+    #[test]
+    fn resident_bridge_packs_rowjet_hessian_and_validates_lengths() {
+        use gam_solve::gpu_kernels::sae_resident::DeviceResidentArrowShape;
+        // The bridge feeds row_hessian straight from the row-jet GN contraction
+        // and passes the border quantities through, length-checked against shape.
+        let (n, k, p) = (4usize, 5usize, 7usize);
+        let ch = sae_row_jets_cpu_softmax(&fixture(n, k, p), k, p, 1.0 / 0.9);
+        let shape = DeviceResidentArrowShape {
+            n,
+            p,
+            basis_cols: k,
+            d: k,
+        };
+        let cross = vec![0.25_f64; shape.row_cross_len()];
+        let grad = vec![0.5_f64; shape.row_gradient_len()];
+        let border_h = vec![1.0_f64; shape.border_hessian_len()];
+        let border_g = vec![0.1_f64; shape.p];
+        let slabs = resident_slabs_from_rowjet(
+            shape,
+            &ch,
+            cross.clone(),
+            grad.clone(),
+            border_h.clone(),
+            border_g.clone(),
+        )
+        .expect("well-sized feed packs");
+        // row_hessian is exactly the GN contraction; the rest passes through.
+        assert_eq!(slabs.row_hessian_slabs, gauss_newton_row_hessian_slabs(&ch));
+        assert_eq!(slabs.row_cross_slabs, cross);
+        assert_eq!(slabs.row_gradient_slabs, grad);
+        assert_eq!(slabs.border_hessian, border_h);
+        assert_eq!(slabs.border_gradient, border_g);
+        // A mismatched border length is rejected at the bridge, not on upload.
+        let bad = resident_slabs_from_rowjet(shape, &ch, cross, grad, border_h, vec![0.1; shape.p + 1]);
+        assert!(bad.is_err(), "short border_gradient must fail loudly");
+        // Arity mismatch (row-jet K != resident d) is rejected too.
+        let wrong_shape = DeviceResidentArrowShape {
+            d: k + 1,
+            ..shape
+        };
+        assert!(
+            resident_slabs_from_rowjet(
+                wrong_shape,
+                &ch,
+                vec![0.0; wrong_shape.row_cross_len()],
+                vec![0.0; wrong_shape.row_gradient_len()],
+                vec![0.0; wrong_shape.border_hessian_len()],
+                vec![0.0; wrong_shape.p],
+            )
+            .is_err(),
+            "K != d must fail"
+        );
     }
 
     #[cfg(target_os = "linux")]
