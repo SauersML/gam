@@ -141,8 +141,22 @@ impl BinomialLocationScalePredictor {
             for i in 0..rows_in_chunk {
                 let dphi = dmu_chunk[i];
                 let scale = dq_dq0[i];
-                let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                // The predicted value is built from the CLAMPED standardized
+                // argument (see `compute_q0_and_sigma`), so the differentiated
+                // function is `q0 = clamp(-eta_t/sigma, ±C)`. Where the clamp is
+                // active the value is locally constant in both linear predictors
+                // and the chain factor `dq0/deta` is exactly zero; reporting the
+                // unclamped `-1/sigma` / `eta_t/sigma` factors there would make
+                // the delta-method SE describe a different function than the
+                // reported probability.
+                let raw_q0 = -eta_t_chunk[i] / sigma_chunk[i];
+                let dclamp = if raw_q0.abs() < SURVIVAL_STANDARDIZED_ARG_CLAMP {
+                    1.0
+                } else {
+                    0.0
+                };
+                let dprob_deta_t = dphi * scale * dclamp * (-1.0 / sigma_chunk[i]);
+                let dprob_deta_s = dphi * scale * dclamp * (eta_t_chunk[i] / sigma_chunk[i]);
                 for j in 0..p_t {
                     grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
                 }
