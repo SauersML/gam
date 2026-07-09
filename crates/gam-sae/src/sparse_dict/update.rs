@@ -278,31 +278,44 @@ pub(super) fn seed_decoder(x: ArrayView2<'_, f32>, k: usize) -> Array2<f32> {
     }
     decoder.row_mut(0).assign(&x.row(first));
 
+    // Row-parallel distance refresh + reduction. Each row's `min_dist2[i]`
+    // update reads only row `i` and the single previous atom, so the parallel
+    // pass is elementwise-independent and bit-identical to the serial sweep;
+    // the argmax reduction breaks ties toward the LOWER row index (the serial
+    // scan's `>` comparison), keeping the seed deterministic. This pass was the
+    // measured single-thread wall at dictionary scale (`O(K·N·P)` serial ≈ 2 h
+    // at K=32k, N=96k, P=2048 — creditscope #1026); the work is unchanged, only
+    // spread across rows.
     let mut min_dist2 = vec![f32::INFINITY; n];
     for atom in 1..k {
         let prev = decoder.row(atom - 1);
-        for i in 0..n {
-            let mut d2 = 0.0f32;
-            let xi = x.row(i);
-            for c in 0..p {
-                let d = xi[c] - prev[c];
-                d2 += d * d;
-            }
-            if d2 < min_dist2[i] {
-                min_dist2[i] = d2;
-            }
-        }
         let chosen = if atom < n {
-            let mut bi = 0usize;
-            let mut bv = f32::NEG_INFINITY;
-            for i in 0..n {
-                if min_dist2[i] > bv {
-                    bv = min_dist2[i];
-                    bi = i;
-                }
-            }
+            let (bi, _bv) = min_dist2
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, md)| {
+                    let xi = x.row(i);
+                    let mut d2 = 0.0f32;
+                    for c in 0..p {
+                        let d = xi[c] - prev[c];
+                        d2 += d * d;
+                    }
+                    if d2 < *md {
+                        *md = d2;
+                    }
+                    (i, *md)
+                })
+                .reduce(
+                    || (usize::MAX, f32::NEG_INFINITY),
+                    |a, b| {
+                        // Strictly-greater wins; on ties keep the lower index —
+                        // exactly the serial scan's first-max semantics.
+                        if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) { b } else { a }
+                    },
+                );
             bi
         } else {
+            // K > N wrap: no distance refresh needed, the atom repeats a row.
             atom % n
         };
         decoder.row_mut(atom).assign(&x.row(chosen));
