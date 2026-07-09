@@ -35,12 +35,39 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 import gamfit
+
+
+# --------------------------------------------------------------------------- #
+# Deploy-skew preflight
+# --------------------------------------------------------------------------- #
+# node1/node2 are targeted-job-only; a job must never burn a slot to
+# AttributeError minutes into a model load because the installed gamfit wheel
+# predates a metric binding this driver calls. Assert the required pyffi metric
+# entry points exist at entry with an actionable upgrade message.
+_REQUIRED_GAMFIT_API = (
+    "chart_interp_score",
+    "dose_response_calibration",
+    "audit_sae",
+)
+
+
+def _preflight_gamfit() -> None:
+    missing = [name for name in _REQUIRED_GAMFIT_API if not hasattr(gamfit, name)]
+    if missing:
+        raise SystemExit(
+            f"[saebench_eval] installed gamfit {getattr(gamfit, '__version__', '?')} at "
+            f"{os.path.dirname(gamfit.__file__)} is missing required metric entry point(s): "
+            f"{', '.join(missing)}. Upgrade the venv wheel to a build that exposes the #1942 "
+            f"SAEBench scorers (>= the commit that landed gamfit.chart_interp_score / "
+            f"dose_response_calibration / audit_sae) before submitting this job."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -676,6 +703,9 @@ def main() -> None:
     ap.add_argument("--saebench-force-rerun", action="store_true", help="ignore SAEBench's cached artifacts")
     ap.add_argument("--out", type=Path, required=True, help="output report json")
     args = ap.parse_args()
+
+    # Fail-fast deploy-skew guard before any ledger read / SAE build / model load.
+    _preflight_gamfit()
 
     report: dict[str, Any] = {"api": "experiments/audit_sae/saebench_eval.py"}
 

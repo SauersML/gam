@@ -82,6 +82,18 @@ python -m pip install --no-cache-dir torch sae_bench transformers accelerate || 
 
 echo "=== gamfit $(python -c 'import gamfit;print(getattr(gamfit,"__version__","?"))')  node=$(hostname)  $(date) ==="
 
+# Deploy-skew preflight: fail the job at submission-time BEFORE any model load if
+# the installed wheel lacks a #1942 metric binding the driver calls.
+python - <<'PYEOF' || { echo "FATAL: gamfit deploy-skew — aborting before the GPU run"; exit 3; }
+import os, sys, gamfit
+required = ("chart_interp_score", "dose_response_calibration", "audit_sae")
+missing = [n for n in required if not hasattr(gamfit, n)]
+if missing:
+    sys.exit(f"gamfit {getattr(gamfit,'__version__','?')} at {os.path.dirname(gamfit.__file__)} "
+             f"missing {missing}; pin a newer GAMFIT_VERSION with the #1942 SAEBench scorers")
+print("preflight OK: gamfit exposes", required)
+PYEOF
+
 # Assemble the driver invocation from whatever inputs actually exist.
 ARGS=(--out "$OUT_DIR/saebench_1942_report.json")
 [ -f "$DOSE_LEDGER" ]  && ARGS+=(--dose-ledger "$DOSE_LEDGER")

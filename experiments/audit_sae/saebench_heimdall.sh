@@ -59,7 +59,12 @@ if [ -n "$SAEBENCH_SAE" ] && [ -n "$SAEBENCH_MODEL" ] && [ -f "$SAEBENCH_SAE" ];
   ARGS="$ARGS --saebench-dtype $SAEBENCH_DTYPE --saebench-output-dir $OUT_DIR/saebench_out"
 fi
 
-CMD="mkdir -p $OUT_DIR && unset RUSTFLAGS && $PY -u $DRIVER $ARGS"
+# Deploy-skew preflight embedded in the submitted command: fail inside the
+# heimdall slot BEFORE any model load if the venv's gamfit lacks a #1942 metric
+# binding the driver calls (node1/node2 have no GitHub — the wheel is deployed
+# out of band and can lag).
+PREFLIGHT="$PY -c \"import os,sys,gamfit; m=[n for n in ('chart_interp_score','dose_response_calibration','audit_sae') if not hasattr(gamfit,n)]; sys.exit('gamfit '+getattr(gamfit,'__version__','?')+' at '+os.path.dirname(gamfit.__file__)+' missing '+repr(m)+'; redeploy the wheel with the #1942 SAEBench scorers') if m else print('preflight OK')\""
+CMD="mkdir -p $OUT_DIR && unset RUSTFLAGS && $PREFLIGHT && $PY -u $DRIVER $ARGS"
 echo "=== heimdall submit ($NODE, ${GPUS}gpu ${VRAM}GB): $CMD ==="
 heimdall submit "$CMD" \
   --type custom --gpus "$GPUS" --vram "$VRAM" --node "$NODE" \
