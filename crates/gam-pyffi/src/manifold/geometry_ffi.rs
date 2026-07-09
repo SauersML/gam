@@ -819,6 +819,110 @@ fn sae_sinkhorn_balance_bias<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Deterministic line-clustering routing anchor for the torch `softmax_topk`
+/// lane (issue #1282). Given the `(N, D)` input rows, returns
+/// `(onehot (N, atoms), valid, confident)`: `valid` is false (with an empty
+/// `onehot`) for the torch `(None, False)` cases (too few rows, `< 2` atoms, or
+/// an eigensolver failure); otherwise `onehot` is the per-row cluster one-hot
+/// and `confident` reports the balance/margin gate. See
+/// `gam::geometry::sae_routing::direction_cluster_anchor`.
+#[pyfunction]
+fn sae_direction_cluster_anchor<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    n_atoms: usize,
+    iters: usize,
+) -> PyResult<(Py<PyArray2<f64>>, bool, bool)> {
+    let x_owned = x.as_array().to_owned();
+    let result = py.detach(move || sae_direction_cluster_anchor_impl(x_owned.view(), n_atoms, iters));
+    match result {
+        Some((onehot, confident)) => Ok((onehot.into_pyarray(py).unbind(), true, confident)),
+        None => Ok((Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(), false, false)),
+    }
+}
+
+/// Balanced quadratic union-of-subspaces routing anchor for the torch
+/// `softmax_topk` lane (issue #1282). Returns
+/// `(onehot (N, 2), confident, i, j, threshold)`: when `confident` is true the
+/// `onehot` is the accepted two-cluster split and `(i, j, threshold)` is the
+/// transferable decision rule; otherwise `confident` is false with an empty
+/// `onehot` and zeroed rule. See
+/// `gam::geometry::sae_routing::quadratic_subspace_anchor`.
+#[pyfunction]
+fn sae_quadratic_subspace_anchor<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    subspace_dim: usize,
+) -> PyResult<(Py<PyArray2<f64>>, bool, usize, usize, f64)> {
+    let x_owned = x.as_array().to_owned();
+    let result = py.detach(move || sae_quadratic_subspace_anchor_impl(x_owned.view(), subspace_dim));
+    match result {
+        Some((onehot, i, j, threshold)) => {
+            Ok((onehot.into_pyarray(py).unbind(), true, i, j, threshold))
+        }
+        None => Ok((
+            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
+            false,
+            0,
+            0,
+            0.0,
+        )),
+    }
+}
+
+/// Apply a cached quadratic-subspace decision rule to route an arbitrary batch
+/// (torch `softmax_topk` out-of-sample routing, issue #1282). Returns the
+/// `(N, 2)` one-hot from the `(i, j, threshold)` split of `x_i·x_j` on the
+/// L2-normalized rows. See `gam::geometry::sae_routing::apply_anchor_rule`.
+#[pyfunction]
+fn sae_apply_anchor_rule<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    i: usize,
+    j: usize,
+    threshold: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let x_owned = x.as_array().to_owned();
+    let out = py.detach(move || sae_apply_anchor_rule_impl(x_owned.view(), i, j, threshold));
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Residual-PC matching-pursuit commitment one-hot for the early training window
+/// of the torch `softmax_topk` lane (issue #1282). Given `x (N, D)`, the per-atom
+/// reconstructions `per_atom_recon (N, F, D)`, and the current non-negative codes
+/// `code (N, F)`, returns `(onehot (N, F), valid)`. `valid` is false (empty
+/// `onehot`) for the non-committing configuration (`step ≥ commit_steps`) or an
+/// eigensolver failure — the torch `None` cases. See
+/// `gam::geometry::sae_routing::matching_pursuit_commit`.
+#[pyfunction]
+fn sae_matching_pursuit_commit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    per_atom_recon: PyReadonlyArray3<'py, f64>,
+    code: PyReadonlyArray2<'py, f64>,
+    step: usize,
+    commit_steps: usize,
+    n_atoms: usize,
+) -> PyResult<(Py<PyArray2<f64>>, bool)> {
+    let x_owned = x.as_array().to_owned();
+    let recon_owned = per_atom_recon.as_array().to_owned();
+    let code_owned = code.as_array().to_owned();
+    let result = py.detach(move || {
+        sae_matching_pursuit_commit_impl(
+            x_owned.view(),
+            recon_owned.view(),
+            code_owned.view(),
+            step,
+            commit_steps,
+            n_atoms,
+        )
+    });
+    match result {
+        Some(onehot) => Ok((onehot.into_pyarray(py).unbind(), true)),
+        None => Ok((Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(), false)),
+    }
+}
+
 /// Batched rank-1 chart-coordinate E-step solver for the torch `ManifoldSAE`
 /// `softmax_topk` lane (#2011-style Python→Rust trainer-math migration). For
 /// every `(row, atom)` pair it solves the on-manifold coordinate by projecting
@@ -4608,6 +4712,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_solve_chart_coordinates, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;

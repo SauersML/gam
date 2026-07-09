@@ -102,7 +102,11 @@ pub(crate) use gam_predict::posterior_bands::{self, PosteriorPredictBandsPayload
 pub(crate) use gam_predict::FittedModelPredictExt;
 pub(crate) use gam_predict::input::build_predict_input_for_model;
 
+pub(crate) use gam::geometry::sae_routing::apply_anchor_rule as sae_apply_anchor_rule_impl;
+pub(crate) use gam::geometry::sae_routing::direction_cluster_anchor as sae_direction_cluster_anchor_impl;
 pub(crate) use gam::geometry::sae_routing::duchon_centers_nd as sae_duchon_centers_nd_impl;
+pub(crate) use gam::geometry::sae_routing::matching_pursuit_commit as sae_matching_pursuit_commit_impl;
+pub(crate) use gam::geometry::sae_routing::quadratic_subspace_anchor as sae_quadratic_subspace_anchor_impl;
 pub(crate) use gam::geometry::sae_routing::sinkhorn_balance_bias as sae_sinkhorn_balance_bias_impl;
 
 pub(crate) use gam::geometry::sinkhorn_barycenter::{
