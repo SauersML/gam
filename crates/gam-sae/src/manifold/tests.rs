@@ -3371,7 +3371,7 @@ fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
         AssignmentMode::softmax(1.0),
     )
     .unwrap();
-    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     let target = Array2::from_shape_fn((n, p), |(row, col)| {
         let x = (row as f64 + 0.5) / n as f64;
         if col == 0 {
