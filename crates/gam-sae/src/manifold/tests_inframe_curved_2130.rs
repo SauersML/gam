@@ -722,6 +722,88 @@ fn ledger_shrink_matches_reviewer_frontier_shape() {
 }
 
 #[test]
+fn inframe_curved_p4096_feasible_where_dense_joint_ooms_2134() {
+    // #2134 wall #1: the COLD-JOINT `sae_manifold_fit` lane does not scale in p —
+    // it times out at p=256 and OOMs (48 GB) at p=1024 because the dense arrow-Schur
+    // border/covariance carries the full ambient width `p` (border `Σ M_k·p`, per-atom
+    // covariance `(M·p)²`). The shipped in-frame cascade sidesteps that wall: the
+    // curved chart is fit purely in an `r`-dim learned frame, so `p` only reappears
+    // in the final ambient lift. This gate fits the SAME frontier shape the dense
+    // lane could not reach — p=4096 at the issue's N=1500 — and asserts it is both
+    // WALL-CLOCK tractable and MEMORY-bounded, the two feasibility axes the dense
+    // lane failed. It is the explicit p=4096 feasibility gate the report requires.
+    let n = 1500; // the issue's N; the dense lane already timed out at p=256/this N.
+    let p = 4096; // the dense lane OOMed at p=1024; the in-frame lane clears 4× that.
+    let r_true = 8;
+    let m = 8usize; // atom basis size ⇒ dense per-atom covariance is (8·4096)² = 8.6 GB.
+    let (residual, _q) = planted_curved_residual(n, p, r_true, 0.02, 0.0, 21_34);
+
+    let config = InFrameCurvedConfig {
+        frame_rank_min: 2,
+        frame_rank_max: 16,
+        crossfit_folds: 4,
+        min_rows: 32,
+        ..Default::default()
+    };
+    let region = CurvedRegion {
+        rows: (0..n).collect(),
+        basis_size: m,
+    };
+
+    let start = std::time::Instant::now();
+    let result = fit_inframe_curved_regions(residual.view(), &[region], n, &config)
+        .expect("in-frame curved fit is feasible at p=4096 where the dense joint OOMs");
+    let elapsed = start.elapsed();
+
+    // (feasibility axis 1 — WALL CLOCK) The dense lane timed out at >1200 s for
+    // p=256 and never returned at p=1024. The in-frame lane fits p=4096 in seconds;
+    // a generous 120 s ceiling keeps the gate robust on a contended CI node while
+    // still being ~10× under the dense lane's p=256 timeout at 16× the width.
+    assert!(
+        elapsed.as_secs_f64() < 120.0,
+        "in-frame fit at p={p}, N={n} took {elapsed:?}; the whole point is it is tractable \
+         where the dense joint times out / OOMs"
+    );
+
+    // The frame is learned at ~the intrinsic rank, far below the ambient width, so
+    // the curved arithmetic never touches p except in the lift.
+    let rec = &result.records[0];
+    assert!(
+        rec.frame_rank >= r_true && rec.frame_rank <= 16 && rec.frame_rank < p,
+        "frame rank {} recovers intrinsic rank {r_true} and stays far below p={p}",
+        rec.frame_rank
+    );
+    assert_eq!(result.accepted_regions, vec![0], "planted curved region accepted");
+
+    // (feasibility axis 2 — MEMORY) The dense per-atom covariance the joint lane
+    // would allocate is (M·p)² · 8 B ≈ 8.6 GB — the source of the OOM. The in-frame
+    // covariance is (M·r)² · 8 B, well under a MB. Assert the ledger reproduces both
+    // so the report's cost model is anchored on measured arithmetic, not a claim.
+    let ledger = &result.ledger;
+    assert_eq!(ledger.dense_border_coeffs, m * p);
+    assert_eq!(ledger.inframe_border_coeffs, m * rec.frame_rank);
+    assert!(
+        ledger.dense_cov_bytes >= 8_000_000_000,
+        "dense (M·p)² covariance is the ~8.6 GB the joint lane OOMs on, got {} bytes",
+        ledger.dense_cov_bytes
+    );
+    assert!(
+        ledger.inframe_cov_bytes <= 1_000_000,
+        "in-frame (M·r)² covariance must stay well under a MB, got {} bytes",
+        ledger.inframe_cov_bytes
+    );
+
+    // The hot-path prediction never materialises the N×p ambient image: it stays
+    // N_g×r, so peak working memory is p-independent up to the copied residual.
+    assert_eq!(result.curved_prediction.inframe_entries(), n * rec.frame_rank);
+    assert!(
+        result.curved_prediction.inframe_entries()
+            < result.curved_prediction.accepted_ambient_entries_if_eager(),
+        "curved prediction must stay in-frame (N_g×r), never the eager N_g×p ambient image"
+    );
+}
+
+#[test]
 fn accepted_curved_prediction_hot_path_stays_in_r_frame() {
     let n = 180;
     let p = 128;

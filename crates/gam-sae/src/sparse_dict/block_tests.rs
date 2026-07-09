@@ -381,6 +381,49 @@ fn near_orthogonal_row_is_orphaned_by_gate_floor() {
 }
 
 #[test]
+fn small_k_block_fit_runs_on_cpu_baseline_2134() {
+    // #2134 wall #3: the block lane must provide a SMALL-`K` CPU baseline. The
+    // device launch break-even is `n_rows·K ≥ 2^20`; a small block dictionary
+    // (K = 4·2 = 8, minibatch 64 ⇒ 64·8 = 512 elems) is three orders of magnitude
+    // below it, so the device could never beat the CPU here. The lane must fit it
+    // on the CPU under ANY residency mode — never refuse — so the block lane can be
+    // compared against the curved lane at small `K`. On this (device-absent) host
+    // the CPU router runs unconditionally; the dispatch fix additionally routes a
+    // below-break-even block to the exact CPU oracle on a device-PRESENT host under
+    // `Required`, where it previously hard-refused. Either way, a small-`K` fit
+    // must succeed and reconstruct the planted subspaces.
+    let (p, b, n_blocks) = (8usize, 2usize, 4usize);
+    // Break-even is n_rows·K ≥ 2^20; here minibatch·K = 64·8 = 512, far below it.
+    let planted = planted_frames(p, n_blocks, b);
+    let x = planted_data(&planted, n_blocks, b, p, 200);
+
+    let config = BlockSparseConfig {
+        n_blocks,
+        block_size: b,
+        block_topk: 1,
+        max_epochs: 80,
+        minibatch: 64,
+        block_tile: 8,
+        frame_ridge: 1.0e-9,
+        aux_k: 3,
+        matryoshka_prefix: false,
+        tolerance: 1.0e-10,
+    };
+    let fit = fit_block_sparse_dictionary(x.view(), &config)
+        .expect("small-K block fit must run on the CPU baseline, not refuse");
+    assert!(
+        fit.explained_variance > 0.95,
+        "small-K CPU block baseline must reconstruct the planted blocks: EV = {}",
+        fit.explained_variance
+    );
+    // The reconstruction is the data-size N×P, computable and non-degenerate.
+    let recon = fit.reconstruct();
+    assert_eq!(recon.dim(), (x.nrows(), p));
+    let energy: f32 = recon.iter().map(|v| v * v).sum();
+    assert!(energy > 0.0, "small-K CPU baseline reconstruction must be non-trivial");
+}
+
+#[test]
 fn planted_block_subspaces_recovered() {
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);

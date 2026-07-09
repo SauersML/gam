@@ -4834,6 +4834,216 @@ mod tests {
         );
     }
 
+    /// #1890 verification fixture: plant ONE circle tiled into `k` arc atoms with
+    /// DISJOINT supports. Row `r` (of `n`) sits at circle phase `2π·r/n`; arc atom
+    /// `j` owns the contiguous row block `[j·n/k, (j+1)·n/k)` (routed ON there,
+    /// OFF elsewhere). Every atom shares the SAME periodic basis and a unit-circle
+    /// decoder (harmonic cols 1,2 → ambient dims 0,1) scaled by `decoder_scale[j]`,
+    /// so a shared scale makes all arcs decode onto ONE closed curve — the
+    /// over-tiling signature the co-activation fusion lane is structurally blind to
+    /// (disjoint supports ⇒ anti-correlated codes). A per-atom scale plants a
+    /// CONCENTRIC circle of a different radius (a genuinely distinct manifold —
+    /// the negative control).
+    fn tiled_circle_term(
+        n: usize,
+        k: usize,
+        decoder_scale: &[f64],
+    ) -> (SaeManifoldTerm, SaeManifoldRho) {
+        assert_eq!(decoder_scale.len(), k, "one decoder scale per arc atom");
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        let mut atoms = Vec::with_capacity(k);
+        let mut coord_blocks = Vec::with_capacity(k);
+        for (j, &scale) in decoder_scale.iter().enumerate() {
+            // Unit-circle decoder: first cos/sin harmonic → ambient {0,1}, radius
+            // `scale`. Shared scale ⇒ ONE circle (glue); distinct scale ⇒ a
+            // concentric distinct circle (no glue).
+            let mut decoder = Array2::<f64>::zeros((m, p));
+            decoder[[1, 0]] = scale;
+            decoder[[2, 1]] = scale;
+            let atom = SaeManifoldAtom::new(
+                format!("arc_{j}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi.clone(),
+                jet.clone(),
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator.clone());
+            atoms.push(atom);
+            coord_blocks.push(coords.clone());
+        }
+        let mut logits = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let owner = (row * k) / n; // contiguous arc ownership
+            for j in 0..k {
+                logits[[row, j]] = if j == owner { ON } else { OFF };
+            }
+        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coord_blocks,
+            vec![LatentManifold::Circle { period: 1.0 }; k],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
+        (term, rho)
+    }
+
+    /// #1890 negative control (type-I): two CONCENTRIC circles of different radii —
+    /// a shared plane (so the frames align and the geometric pre-screen DOES
+    /// nominate the pair), disjoint adjacent arc supports, but a NON-isometric
+    /// transition onto a genuinely distinct manifold. Because the pair is screened,
+    /// this exercises the seam EQUIVALENCE e-value itself, not the pre-screen: it
+    /// must REJECT (negative log-e), so the engine's positive-evidence e-gate never
+    /// accepts the glue. Clusters that DON'T glue must not be forced together.
+    #[test]
+    fn distinct_concentric_circles_do_not_glue() {
+        let n = 40usize;
+        let (term, rho) = tiled_circle_term(n, 2, &[1.0, 2.0]); // radius 1 vs radius 2
+        let residuals = Array2::<f64>::zeros((n, 4));
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+
+        // No co-activation fusion (disjoint supports), same as the tiling case.
+        assert!(
+            !report
+                .proposals
+                .iter()
+                .any(|p| matches!(p.mv, StructureMove::Fusion { .. })),
+            "disjoint supports must yield no co-activation fusion"
+        );
+
+        // The shared plane aligns the frames, so the pair IS screened — this is a
+        // genuine test of the equivalence e-value, which must reject the distinct
+        // manifold.
+        assert!(
+            report.glue_candidates_screened >= 1,
+            "the shared-plane pair must be geometrically screened"
+        );
+        let e_distinct = glue_pair_evalue(&term, residuals.view(), 0, 1)
+            .expect("the aligned pair yields a seam e-value");
+        assert!(
+            e_distinct.log_e_value < 0.0,
+            "distinct concentric circles must NOT glue (negative log-e), got {}",
+            e_distinct.log_e_value
+        );
+
+        // Any emitted glue proposal therefore carries negative evidence — rejected
+        // by the engine's e-gate (which certifies only positive log-e).
+        for p in &report.proposals {
+            if matches!(p.mv, StructureMove::Glue { .. }) {
+                assert!(
+                    p.trigger < 0.0,
+                    "the distinct-circle glue must carry negative evidence, got {}",
+                    p.trigger
+                );
+            }
+        }
+    }
+
+    /// #1890 over-birth reassembly — the PHYSICAL-excision resurrection fix, on the
+    /// private primitives the `chart_gluing_1890.rs` integration test cannot reach.
+    /// A circle over-tiled into 4 disjoint arcs proposes a spanning set of glues
+    /// (each arc pair lies on ONE circle, so the primitive `glue_pair_evalue`
+    /// certifies with large positive log-e) with ZERO co-activation fusions. A
+    /// round that accepts a matching of those glues then EXCISES the folded
+    /// partners for real ([`compact_glued_atoms`]): folding + demoting alone leaves
+    /// a zero-mass atom the #976/#1003 active-mass guard revives on the next refit,
+    /// so the effective count never falls; removal drops both the raw and active
+    /// size, and the wider-arc survivors STILL glue — the round sequence converges
+    /// toward the single reassembled chart K=1.
+    #[test]
+    fn over_tiling_physical_excision_reduces_k_toward_one() {
+        use gam_solve::structure_search::{MoveRecord, MoveVerdict};
+
+        let n = 32usize;
+        let (mut term, mut rho) = tiled_circle_term(n, 4, &[1.0; 4]);
+        assert_eq!(term.k_atoms(), 4);
+
+        // The primitive certifies every arc pair as ONE circle (large positive
+        // log-e), and the co-activation lane stays silent on the disjoint supports.
+        let residuals0 = Array2::<f64>::zeros((n, 4));
+        let e_arc = glue_pair_evalue(&term, residuals0.view(), 0, 2)
+            .expect("a d=1 aligned disjoint pair yields a seam e-value");
+        assert!(
+            e_arc.log_e_value > 5.0,
+            "e_glue must certify two arcs of one circle, got {}",
+            e_arc.log_e_value
+        );
+        let params0 = HarvestParams {
+            max_fusions: 16,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let report0 = harvest_move_proposals(&term, &rho, residuals0.view(), &params0).unwrap();
+        assert!(
+            !report0
+                .proposals
+                .iter()
+                .any(|p| matches!(p.mv, StructureMove::Fusion { .. })),
+            "disjoint tiling must yield no co-activation fusion"
+        );
+        assert!(
+            report0.glues_proposed >= 3,
+            "a spanning set (≥ k−1 = 3 edges) must reassemble the 4 arcs, got {}",
+            report0.glues_proposed
+        );
+        let accepted_glue = |a: usize, b: usize| MoveRecord {
+            mv: StructureMove::Glue { a, b },
+            trigger: 40.0,
+            structure_hash: 0,
+            claim: ClaimKind::Custom {
+                label: format!("seam_glue:{a}:{b}"),
+            },
+            verdict: MoveVerdict::Accepted { log_e: 40.0 },
+        };
+        // A matching (shares no atom) of disjoint glues — the within-round `touched`
+        // guard admits exactly this shape in one round.
+        let ledger = SearchLedger {
+            alpha: 0.05,
+            moves: vec![accepted_glue(0, 1), accepted_glue(2, 3)],
+            collapse_events: Vec::new(),
+        };
+        let removed = compact_glued_atoms(&mut term, &mut rho, &ledger).unwrap();
+        assert_eq!(removed, 2, "both folded partners must be physically excised");
+        assert_eq!(
+            term.k_atoms(),
+            2,
+            "physical excision must reduce K from 4 to 2 (no active-mass resurrection)"
+        );
+        assert_eq!(
+            rho.log_ard.len(),
+            2,
+            "ρ ARD blocks must fall in lock-step with the atoms"
+        );
+
+        // The two survivors each now cover a half-circle and STILL glue — the round
+        // sequence converges toward the single reassembled chart (K=1).
+        let residuals = Array2::<f64>::zeros((n, 4));
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 0,
+            max_births: 0,
+        };
+        let report2 = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+        assert!(
+            report2.glues_proposed >= 1,
+            "the two reassembled half-circle survivors must still glue toward K=1"
+        );
+    }
+
     /// Oracle (#997 death trigger): a diverged ARD precision yields a DEATH
     /// proposal; a terminal collapse event yields a death even with finite ARD.
     #[test]

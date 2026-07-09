@@ -1752,96 +1752,11 @@ const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 /// in the outer search.
 const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;
 
-fn seed_oos_softmax_logits_from_projection_residuals(
-    term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
-    target: ArrayView2<'_, f64>,
-    tau: f64,
-) {
-    let (n_obs, p_out) = target.dim();
-    let k_atoms = term.k_atoms();
-    let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-    let mut decoded = vec![0.0_f64; p_out];
-    for row in 0..n_obs {
-        for atom_idx in 0..k_atoms {
-            term.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
-            let mut err = 0.0_f64;
-            for out_col in 0..p_out {
-                let diff = target[[row, out_col]] - decoded[out_col];
-                err += diff * diff;
-            }
-            seeded_logits[[row, atom_idx]] = -err / tau;
-        }
-        let reference = seeded_logits[[row, k_atoms - 1]];
-        for atom_idx in 0..k_atoms {
-            seeded_logits[[row, atom_idx]] -= reference;
-        }
-    }
-    term.assignment.logits.assign(&seeded_logits);
-}
-
-fn seed_oos_ibp_logits_from_projected_decoder_lsq(
-    term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
-    target: ArrayView2<'_, f64>,
-    tau: f64,
-    alpha: f64,
-) {
-    let (n_obs, p_out) = target.dim();
-    let k_atoms = term.k_atoms();
-    // Consistent truncated IBP stick-breaking prior mean π_k = (α/(α+1))^(k+1)
-    // (#614): the first atom is also shrunk by one Beta(α,1) stick mean, matching
-    // the closed-form `ordered_geometric_shrinkage_prior` the fitter applies.
-    let ratio = alpha / (alpha + 1.0);
-    let mut prior = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        prior.push(ratio.powi(atom_idx as i32 + 1).max(f64::MIN_POSITIVE));
-    }
-    let mut decoded = vec![vec![0.0_f64; p_out]; k_atoms];
-    let mut norm_sq = vec![0.0_f64; k_atoms];
-    let mut gates = vec![0.0_f64; k_atoms];
-    let mut fitted = vec![0.0_f64; p_out];
-    let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-    const OOS_IBP_BOX_LSQ_SWEEPS: usize = 12;
-    const OOS_IBP_GATE_EPS: f64 = 1.0e-6;
-    for row in 0..n_obs {
-        for atom_idx in 0..k_atoms {
-            term.atoms[atom_idx].fill_decoded_row(row, &mut decoded[atom_idx]);
-            norm_sq[atom_idx] = decoded[atom_idx]
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .max(1.0e-12);
-            gates[atom_idx] = 0.0;
-        }
-        fitted.fill(0.0);
-        for _ in 0..OOS_IBP_BOX_LSQ_SWEEPS {
-            for atom_idx in 0..k_atoms {
-                let old_gate = gates[atom_idx];
-                let g_row = &decoded[atom_idx];
-                let mut numerator = 0.0_f64;
-                for out_col in 0..p_out {
-                    let residual_without_atom =
-                        target[[row, out_col]] - fitted[out_col] + old_gate * g_row[out_col];
-                    numerator += g_row[out_col] * residual_without_atom;
-                }
-                let upper = prior[atom_idx] * (1.0 - OOS_IBP_GATE_EPS);
-                let new_gate = (numerator / norm_sq[atom_idx]).clamp(0.0, upper);
-                if new_gate != old_gate {
-                    let delta = new_gate - old_gate;
-                    for out_col in 0..p_out {
-                        fitted[out_col] += delta * g_row[out_col];
-                    }
-                    gates[atom_idx] = new_gate;
-                }
-            }
-        }
-        for atom_idx in 0..k_atoms {
-            let q =
-                (gates[atom_idx] / prior[atom_idx]).clamp(OOS_IBP_GATE_EPS, 1.0 - OOS_IBP_GATE_EPS);
-            seeded_logits[[row, atom_idx]] = tau * (q / (1.0 - q)).ln();
-        }
-    }
-    term.assignment.logits.assign(&seeded_logits);
-}
+// The OOS assignment-logit seeders moved to the library
+// (`gam_sae::manifold::oos_logit_seed`, methods on `SaeManifoldTerm`) so the CLI
+// and Rust callers seed identically to python — issue #2236. The binding calls
+// `term.seed_oos_softmax_logits_from_projection_residuals(..)` /
+// `term.seed_oos_ibp_logits_from_projected_decoder_lsq(..)` directly.
 
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
 /// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)

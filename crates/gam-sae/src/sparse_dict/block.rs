@@ -522,6 +522,27 @@ pub(super) fn route_and_code_all(
     Ok(out)
 }
 
+/// One-shot bounded-coverage note: a device-present host declined a below-break-even
+/// block minibatch and ran the exact CPU oracle instead. Routed through `log::warn!`
+/// (the repo's sanctioned diagnostics path) and fired once per process so the
+/// per-minibatch route does not spam thousands of identical lines. This is the "log
+/// what is dropped, no silent cap" record for the small-`K` CPU baseline path.
+#[cfg(target_os = "linux")]
+fn note_below_breakeven_cpu_route(n_rows: usize, krows: usize) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        log::warn!(
+            "[gam-sae sparse_dict block-gate router] below-break-even CPU route: block \
+             {n_rows}x{krows} = {} elems is under the device launch break-even \
+             (DEVICE_BLOCK_GATE_MIN_ELEMS={}); running the exact CPU oracle (device could \
+             not beat it) — this is the small-K CPU baseline, not a silent GPU-0% fallback",
+            n_rows.saturating_mul(krows),
+            gam_gpu::DEFAULT_DICTIONARY_SCORE_MIN_ELEMS,
+        );
+    });
+}
+
 /// Route one minibatch's blocks, dispatching to the CUDA block-gate router when a
 /// device residency mode asks for it and a CUDA runtime is actually present, and
 /// to the CPU router ([`route_block_minibatch`]) otherwise.
@@ -531,10 +552,17 @@ pub(super) fn route_and_code_all(
 /// device-absent behaviour is bit-for-bit unchanged; `Auto` uses the device when
 /// admitted and above break-even and transparently falls back to the CPU oracle
 /// otherwise (the fallback is logged once by the block-gate router, never
-/// silent); `Required` propagates a device fault as a typed `Err` up through the
-/// fallible fit rather than degrading silently. The device route carries the
-/// #2227 bounded-progress checkpoints, so a device stall surfaces as a
-/// tile-attributed error instead of a silent hang.
+/// silent); `Required` propagates an ADMITTED (above-break-even) device fault as a
+/// typed `Err` up through the fallible fit rather than degrading silently. The
+/// device route carries the #2227 bounded-progress checkpoints, so a device stall
+/// surfaces as a tile-attributed error instead of a silent hang.
+///
+/// BELOW-BREAK-EVEN (small-`K`) blocks take the exact CPU oracle under EVERY mode,
+/// including `Required` (#2134): below the `n_rows × K` launch break-even the device
+/// provably cannot beat the CPU, so refusing there would guard nothing (there is no
+/// silent GPU-0% regime to catch) while making a small-`K` CPU baseline impossible
+/// under a `Required` process. The bounded CPU coverage is logged once, never a
+/// silent cap.
 fn route_block_minibatch_dispatch(
     mb: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -547,24 +575,29 @@ fn route_block_minibatch_dispatch(
     {
         let mode = gam_gpu::gpu_mode();
         if mode != gam_gpu::GpuMode::Off && gam_gpu::GpuRuntime::global().is_some() {
-            // Under `Auto`, only hand a minibatch to the device when the score
-            // work clears the launch break-even; below it we take the exact CPU
-            // router (`route_block_minibatch`) so device-present hosts keep
-            // bit-for-bit CPU behaviour instead of switching to the block-gate
-            // CPU oracle's scalar-dot ties. `Required` always routes through the
-            // device entry point, which fails closed on a below-break-even block.
+            // Only hand a minibatch to the device when the `n_rows × K` score work
+            // clears the launch break-even. Below it the device provably cannot beat
+            // the CPU (that IS the definition of the break-even), so a `Required`
+            // refusal there guards NOTHING — there is no #1551 "GPU 0%" regime to
+            // catch when the device could not have helped in the first place. We
+            // take the exact CPU router (`route_block_minibatch`) and log the bounded
+            // coverage once, so a small-`K` block fit yields a CPU baseline under any
+            // residency mode. The fail-loud `Required` contract is preserved exactly
+            // where it matters: for an ADMITTED (above-break-even) block a device
+            // fault still propagates as a typed `Err` through `route_blocks_required`.
             let admitted = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
                 mb.nrows(),
                 decoder.nrows(),
                 decoder.ncols(),
             )
             .device_admitted;
-            if mode == gam_gpu::GpuMode::Required || admitted {
+            if admitted {
                 let (selections, _path, _dtoh) =
                     super::block_scoring_gpu::route_blocks_required(mb, decoder, b, k, mode)
                         .map_err(|err| err.to_string())?;
                 return Ok(selections);
             }
+            note_below_breakeven_cpu_route(mb.nrows(), decoder.nrows());
         }
     }
     Ok(route_block_minibatch(mb, decoder, n_blocks, b, k, block_tile))

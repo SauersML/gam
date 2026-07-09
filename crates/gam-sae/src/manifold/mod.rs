@@ -211,6 +211,7 @@ mod isa_seed;
 mod kronecker;
 pub mod lift;
 mod loss;
+mod oos_logit_seed;
 mod outer_objective;
 mod pair_kappa;
 mod pca_seed;
