@@ -110,9 +110,9 @@ pub(crate) use gam_solve::arrow_schur::{
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
     SparseRankOnePenaltyOp,
-    StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
-    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
-    streaming_cross_row_woodbury_log_det,
+    StreamingArrowSchur, row_sub_floor_null_directions,
+    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
+    solve_with_lm_escalation_inner, streaming_cross_row_woodbury_log_det,
 };
 
 pub(crate) use gam_terms::analytic_penalties::{

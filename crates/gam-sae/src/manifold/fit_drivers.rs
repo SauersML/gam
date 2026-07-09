@@ -4692,6 +4692,56 @@ impl SaeManifoldTerm {
             let (mut delta_ext_coord, mut delta_beta, _diag) =
                 solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &solve_options)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            // #1095/#2228 (second root) — per-row STEP gauge fixing. On a chart
+            // over-parametrized for its intrinsic data dimension (d=2 chart on an
+            // intrinsically 1-D circle) every per-row `H_tt` carries a rank-1
+            // radial null whose direction ROTATES per row (the null is the radial
+            // unit vector `(cosθ_i, sinθ_i)`, distinct for every row — NOT a chart
+            // axis, so no global/per-atom axis reduction can capture it). The
+            // undamped acceptance factorizations in `reml_criterion` already deflate
+            // that null to UNIT stiffness (`log 1 = 0`, ρ-independent) so the
+            // evidence log-det is finite — but the coordinate SOLVE here does not:
+            // `solve_with_lm_escalation_inner` LM-ridge-damps the near-null block,
+            // leaving a small-but-nonzero step along the radial null (the data is
+            // radially FLAT, not absent, so `g_null ≠ 0` at finite noise). Those
+            // sub-floor steps ACCUMULATE across the cumulative outer ρ-walk, walking
+            // `t` off the unit circle → the decoder loses angular resolution
+            // (reconstruction collapses) and the inner optimum — hence the REML
+            // criterion — becomes warm-start dependent rather than a function of ρ.
+            //
+            // True gauge fixing is a projection: subtract each row's sub-floor null
+            // direction from that row's coordinate step so there is ZERO motion along
+            // a deflated direction, period, while the identifiable (angular)
+            // complement keeps the exact LM/Newton step. `row_sub_floor_null_directions`
+            // uses the IDENTICAL spectral floor + hysteresis the evidence deflation
+            // uses, so the step freezes exactly what the log-det deflated. It returns
+            // EMPTY for a genuinely full-rank row (a well-conditioned block, or a
+            // merely-ill-conditioned NON-null K>1 block whose weak but data-supported
+            // direction must stay with the LM damping, not be frozen) and for
+            // radius-curved circle data (the radial eigenvalue lifts above the floor)
+            // — so healthy fits are bit-for-bit unchanged and the fix is auto-undone
+            // wherever the chart is not over-parametrized. Projecting the coordinate
+            // block alone is sufficient: the null's cross-coupling to β flows through
+            // `H_tβ = ∂²/∂t∂β`, built from the SAME decoded derivative that vanishes
+            // in the radial direction, so it is second-order small; the dominant
+            // drift is the direct `Δt` null component removed here, and any residual
+            // β coupling is re-solved next iterate from the on-circle state.
+            for row_idx in 0..sys.rows.len() {
+                let off = sys.row_offsets[row_idx];
+                let di = sys.row_dims[row_idx];
+                for dir in row_sub_floor_null_directions(sys.rows[row_idx].htt.view()) {
+                    if dir.len() != di {
+                        continue;
+                    }
+                    let mut dot = 0.0;
+                    for a in 0..di {
+                        dot += dir[a] * delta_ext_coord[off + a];
+                    }
+                    for a in 0..di {
+                        delta_ext_coord[off + a] -= dot * dir[a];
+                    }
+                }
+            }
             // Relative-scale floor on the directional decrease. When the
             // gradient is nearly orthogonal to the Newton step (ill-conditioned
             // near-convergence), `directional_decrease` collapses to O(machine
