@@ -7354,17 +7354,24 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
 /// `raw_json` is the raw payload marshalled to JSON (numpy `.tolist()`-flattened
 /// via `_jsonable`, then `json.dumps`); `x` is the training matrix (for
 /// `training_mean = x.mean(0)`); the remaining args are the fit-config scalars
-/// `from_payload` receives (`assignment` already canonical). Reproduces
-/// `from_payload` ∘ `to_dict` bit-for-bit for the MAINLINE case (no Fisher shard,
-/// no `linear_block` relabel — those are follow-up arms before the fit-return
-/// flip). The JSON parse rejects non-finite values exactly as
-/// `ManifoldSaeCore::new` does, so this path is NaN-consistent with the legacy
-/// reader. A perf-optimized direct-read variant (via `py_any_to_json_value`) is a
-/// later increment.
+/// `from_payload` receives (`assignment` already canonical). `fisher_factors`
+/// `(n, p, r)` + `fisher_provenance` are the retained output-Fisher shard
+/// `sae_manifold_fit` installs AFTER `from_payload` (`None` for a Euclidean fit).
+/// Reproduces `from_payload` ∘ `to_dict` bit-for-bit; the `linear_block` relabel
+/// (a post-`from_payload` step) is the one remaining follow-up arm before the
+/// fit-return flip.
+///
+/// The JSON parse rejects non-finite values exactly as `ManifoldSaeCore::new`
+/// does, so this path is NaN-consistent with the legacy reader. The raw-payload
+/// JSON marshal is a per-fit round-trip measured in milliseconds against fits
+/// that run seconds-to-hours; a direct-read variant (via `py_any_to_json_value`)
+/// is a DEFERRED-UNTIL-MEASURED follow-up — justified only if a real fit profile
+/// ever shows the marshal as a cost, which no current shape does.
 #[pyfunction(signature = (
     raw_json, x, topology_fallback, assignment, assignment_label, penalties,
     alpha, learnable_alpha, tau, sparsity_strength, smoothness, learning_rate,
-    max_iter, random_state, top_k, jumprelu_threshold
+    max_iter, random_state, top_k, jumprelu_threshold,
+    fisher_factors=None, fisher_provenance=None
 ))]
 fn sae_manifold_core_from_fit_payload(
     py: Python<'_>,
@@ -7384,6 +7391,8 @@ fn sae_manifold_core_from_fit_payload(
     random_state: i64,
     top_k: Option<i64>,
     jumprelu_threshold: f64,
+    fisher_factors: Option<PyReadonlyArray3<'_, f64>>,
+    fisher_provenance: Option<String>,
 ) -> PyResult<Py<ManifoldSaeCore>> {
     let raw: serde_json::Value = serde_json::from_str(raw_json).map_err(|e| {
         py_value_error(format!(
@@ -7402,6 +7411,13 @@ fn sae_manifold_core_from_fit_payload(
             }
         })
         .collect();
+    // (n, p, r) shard -> nested Vec (the ManifoldSaePayload / to_dict layout).
+    let fisher_factors_nested: Option<Vec<Vec<Vec<f64>>>> = fisher_factors.map(|arr| {
+        arr.as_array()
+            .outer_iter()
+            .map(|m| m.rows().into_iter().map(|r| r.to_vec()).collect())
+            .collect()
+    });
     let cfg = crate::manifold::manifold_sae_coercion::FitConfig {
         topology_fallback,
         assignment,
@@ -7417,6 +7433,8 @@ fn sae_manifold_core_from_fit_payload(
         random_state,
         top_k,
         jumprelu_threshold,
+        fisher_factors: fisher_factors_nested,
+        fisher_provenance,
     };
     let payload =
         crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(&raw, training_mean, &cfg)

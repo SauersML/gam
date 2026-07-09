@@ -120,6 +120,51 @@ def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
     assert new == old
 
 
+def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
+    """Fisher-shard arm: a fit with a raw (n,p,r) output-Fisher shard installs
+    metric_provenance='OutputFisher' + retains fisher_factors/fisher_provenance
+    POST-from_payload. The builder threads the same shard and must reproduce
+    to_dict (fisher_factors serialized, provenance present, dose state intact)."""
+    builder = _builder()
+    rm = rust_module()
+    captured: dict = {}
+    orig = rm.sae_manifold_fit_minimal
+
+    def capture(*args, **kwargs):
+        payload = orig(*args, **kwargs)
+        captured["raw"] = dict(payload)
+        return payload
+
+    monkeypatch.setattr(rm, "sae_manifold_fit_minimal", capture)
+
+    n, p, r = 48, 6, 2
+    x = _data_for("circle", n=n, p=p, seed=1)
+    u = np.random.default_rng(2).standard_normal((n, p, r)).astype(np.float64)
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        n_iter=8, random_state=0, fisher_factors=u,
+    )
+    assert fit.metric_provenance == "OutputFisher"
+    assert "raw" in captured
+
+    raw_json = json.dumps(_jsonable(captured["raw"]))
+    core = builder(
+        raw_json, x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
+        list(fit.primitive_names[1:]),
+        float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
+        float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
+        int(fit.max_iter), int(fit.random_state), fit.top_k, float(fit.jumprelu_threshold),
+        np.ascontiguousarray(fit.fisher_factors), fit.fisher_provenance,
+    )
+    old = fit.to_dict()
+    new = core.to_dict()
+    assert _no_nonfinite(old)
+    assert new == old
+    # The shard must actually be present (this is the OutputFisher path).
+    assert new["fisher_factors"] is not None
+    assert new["metric_provenance"] == "OutputFisher"
+
+
 def test_builder_rejects_nonfinite_consistent_with_from_json():
     """The JSON-marshalled builder parses with serde, which rejects the bare
     `NaN` literal exactly as `ManifoldSaeCore.__new__` (`from_json`) does — so the

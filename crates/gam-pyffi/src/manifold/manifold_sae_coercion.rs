@@ -291,6 +291,15 @@ pub(crate) struct FitConfig {
     pub(crate) random_state: i64,
     pub(crate) top_k: Option<i64>,
     pub(crate) jumprelu_threshold: f64,
+    /// The retained WP-D output-Fisher shard `U` `(n, p, r)`, set by
+    /// `sae_manifold_fit` AFTER `from_payload` when a shard was passed
+    /// (`model.fisher_factors = ascontiguousarray(shard[0])`); `None` for a
+    /// Euclidean fit. When present, `metric_provenance` still comes from the raw
+    /// payload (the Rust fit stamped `"OutputFisher"`).
+    pub(crate) fisher_factors: Option<Vec<Vec<Vec<f64>>>>,
+    /// The shard's provenance tag (`shard[2]`); serialized only when
+    /// `fisher_factors` is present, mirroring `to_dict`.
+    pub(crate) fisher_provenance: Option<String>,
 }
 
 // --- serde_json::Value accessors (mirror from_payload's `payload[...]` reads) --
@@ -604,8 +613,13 @@ pub(crate) fn build_manifold_sae_payload(
         structure_certificate,
         cotrain: report("cotrain"),
         hybrid_split: report("hybrid_split"),
-        fisher_factors: None,
-        fisher_provenance: None,
+        fisher_factors: cfg.fisher_factors.clone(),
+        // to_dict: `None if fisher_factors is None else str(fisher_provenance)`.
+        fisher_provenance: if cfg.fisher_factors.is_some() {
+            cfg.fisher_provenance.clone()
+        } else {
+            None
+        },
         metric_provenance,
         fisher_mass_residual,
         selected_log_lambda_sparse,
