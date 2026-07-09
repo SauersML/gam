@@ -1537,21 +1537,24 @@ fn atom_isometry_generators(atom: &FittedAtom) -> Vec<(Array1<f64>, String)> {
     let mut out: Vec<(Array1<f64>, String)> = Vec::new();
     match &atom.topology {
         AtomTopology::Circle => {
-            // so(2): A = [[0,-1],[1,0]] on the 1 circle, but a Circle atom has a
-            // single latent axis whose isometry is a *shift* of the periodic
-            // coordinate. The first-order motion of the (cos,sin) frame columns
-            // under a shift is the orthogonal frame column. With latent_dim == 1
-            // the decoder frame's single column moves along its own
-            // 90°-rotated image, which (lacking a second column) is realised as
-            // the tangent that advances the periodic phase: the unit direction
-            // along the frame column itself (the generator of the U(1) shift).
-            if d >= 1 {
-                let mut g = Array1::<f64>::zeros(p * d);
-                for i in 0..p {
-                    g[i * d] = atom.frame[[i, 0]];
-                }
-                out.push((g, format!("{}: S¹ U(1) phase shift", atom.name)));
-            }
+            // The S¹ U(1) shift θ ↦ θ+ε is a *translation* of the periodic
+            // coordinate, not a rotation of latent axes (so(1) = 0). Its
+            // first-order action on the decoder FRAME parameter is the derivative
+            // of the frame tangent along the orbit, i.e. the acceleration
+            // ∂²g/∂θ² = J·(∂g/∂θ) — the 90°-rotated frame column IN THE CIRCLE'S
+            // EMBEDDING 2-PLANE (the complex structure J). The mean frame stores
+            // only the single tangent column ∂g/∂θ and no radial companion, so
+            // that 2-plane — and hence J·frame — is not recoverable here. The
+            // former emission used the tangent column `frame` ITSELF, which is the
+            // amplitude/scaling direction (scaling the decoder always costs
+            // reconstruction) and so read as a false "pin", biasing the circle
+            // toward "identified". Rather than fabricate a J the mean frame cannot
+            // supply, we emit nothing: the U(1) shift is faithfully certified by
+            // the exact #998 orbit path (`exact_orbit_fields`, which realises it
+            // as the chart-free coordinate motion δt = 1 and profiles out the
+            // decoder compensation) and, for canonicalized d = 1 charts, recorded
+            // as `PinnedByCanonicalization`. The frame path must not carry a
+            // third, wrong-direction proxy for the same freedom.
         }
         AtomTopology::Sphere | AtomTopology::EuclideanPatch { .. } | AtomTopology::Torus { .. } => {
             // so(d) rotation generators: one per unordered axis pair (a < b).
@@ -1579,18 +1582,17 @@ fn atom_isometry_generators(atom: &FittedAtom) -> Vec<(Array1<f64>, String)> {
                     ));
                 }
             }
-            // Torus additionally carries `d` independent circle shifts: the unit
-            // tangent advancing each axis's periodic phase (translation of that
-            // circle coordinate), realised as motion along each frame column.
-            if let AtomTopology::Torus { .. } = atom.topology {
-                for a in 0..d {
-                    let mut g = Array1::<f64>::zeros(p * d);
-                    for i in 0..p {
-                        g[i * d + a] = atom.frame[[i, a]];
-                    }
-                    out.push((g, format!("{}: Tᵈ circle shift axis {a}", atom.name)));
-                }
-            }
+            // Torus additionally carries `d` independent circle shifts (one U(1)
+            // translation per axis). As in the [`AtomTopology::Circle`] arm above,
+            // each shift's action on the frame parameter is the J-rotated (radial)
+            // acceleration ∂²g/∂θ_a² in axis a's embedding 2-plane, which the mean
+            // frame — storing only the tangent column ∂g/∂θ_a — cannot realise.
+            // The former emission used the tangent column itself (the amplitude
+            // direction, a false pin), so we drop it: the per-axis circle shifts
+            // are certified exactly by the #998 orbit path (δt = e_a per axis) and,
+            // for canonicalized torus charts, by `PinnedByCanonicalization`. The
+            // so(d) latent-frame rotation generators above (realised faithfully as
+            // frame·Aᵀ, a genuine rotation of latent axes) are unaffected.
         }
     }
     out
