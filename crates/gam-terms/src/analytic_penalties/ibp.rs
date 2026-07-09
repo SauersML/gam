@@ -452,6 +452,11 @@ impl IBPAssignmentPenalty {
         // where PSD_k = ∂pi_score_k/∂M_k (D_k, a_k both ρ-quantities, constant in M).
         let mut d_g_dm = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
+            // #Bug4: fixed/inert column ⇒ zero mixed derivative (its column is
+            // excluded from `grad_rho`, so the ℓ-derivative of G_k is zero too).
+            if self.column_is_fixed(k) {
+                continue;
+            }
             let a = a_col[k];
             let da = da_col[k];
             let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
