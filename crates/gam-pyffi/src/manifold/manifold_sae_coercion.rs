@@ -45,6 +45,19 @@ pub(crate) fn canonical_n_harmonics(
         .collect()
 }
 
+/// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector.
+/// Owned in Rust so neither the fit builder nor the gamfit SAC lift
+/// (`StagewiseSAE.to_manifold_sae`) computes a reduction in production Python
+/// (SPEC thin-wrapper rule). `n == 0` yields zeros (matching the builder's prior
+/// inline guard). Shared by [`build_manifold_sae_payload`] and the
+/// `sae_manifold_training_mean` pyfunction.
+pub(crate) fn column_mean(x: ArrayView2<'_, f64>) -> Vec<f64> {
+    let (n, p) = x.dim();
+    (0..p)
+        .map(|j| if n == 0 { 0.0 } else { x.column(j).sum() / n as f64 })
+        .collect()
+}
+
 /// Extract the compact per-channel decoder-covariance factor `(p, M, M)` from the
 /// dense `(M*p, M*p)` phi-scaled covariance (#2091), the shared core of the
 /// `decoder_channel_cov_factors` pyfunction and the `from_fit_payload` builder.

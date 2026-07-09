@@ -7302,6 +7302,20 @@ fn sae_atom_topologies(bases: Vec<String>) -> (Option<String>, Vec<String>) {
     (scalar, per_atom)
 }
 
+/// Rust-owned training-mean `x.mean(axis=0)` -> `(P,)` (#2091). The gamfit SAC
+/// lift (`StagewiseSAE.to_manifold_sae`) marshals this rather than computing the
+/// centering vector in production Python (SPEC thin-wrapper rule); it is the same
+/// reduction (`column_mean`) the fit builder applies, so a lifted dictionary's
+/// `training_mean` matches the fit path.
+#[pyfunction(signature = (x))]
+fn sae_manifold_training_mean<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+) -> Bound<'py, PyArray1<f64>> {
+    let mean = crate::manifold::manifold_sae_coercion::column_mean(x.as_array());
+    manifold_sae_vec1(py, &mean)
+}
+
 /// Rust owner of the periodic shape-band reorder (#2091). Stably sorts a periodic
 /// atom's `(G, 1)` shape-band coordinates ascending and reindexes the ROWS of the
 /// amplitude-correct `(G, p)` mean and (optional) `(G, p)` sd to match, mirroring
@@ -7401,17 +7415,9 @@ fn sae_manifold_core_from_fit_payload(
         ))
     })?;
     let x_view = x.as_array();
-    let (n, p) = x_view.dim();
-    // training_mean = x.mean(axis=0) (n >= 2 in every real fit).
-    let training_mean: Vec<f64> = (0..p)
-        .map(|j| {
-            if n == 0 {
-                0.0
-            } else {
-                x_view.column(j).sum() / n as f64
-            }
-        })
-        .collect();
+    // training_mean = x.mean(axis=0) (n >= 2 in every real fit); shared reduction
+    // core so the SAC lift's `sae_manifold_training_mean` uses the identical math.
+    let training_mean: Vec<f64> = crate::manifold::manifold_sae_coercion::column_mean(x_view);
     // (n, p, r) shard -> nested Vec (the ManifoldSaePayload / to_dict layout).
     let fisher_factors_nested: Option<Vec<Vec<Vec<f64>>>> = fisher_factors.map(|arr| {
         arr.as_array()
@@ -7945,6 +7951,116 @@ impl ManifoldSaeCore {
         )
         .map_err(py_value_error)?;
         Ok(out.into_pyarray(py))
+    }
+
+    /// Dense reconstruction `(N, P)` from EXTERNALLY-supplied assignment codes
+    /// `(N, K)`, decoded against this handle's stored per-atom coordinates and
+    /// frozen decoder blocks — the accessor SAEBench's SCR / unlearning arm reads
+    /// (zero a latent's code column, then decode to measure the ablated output).
+    /// Identical persisted-atom-set assembler as
+    /// [`reconstruct_training`](Self::reconstruct_training); only the assignment
+    /// matrix is the caller's `codes` instead of the stored assignments. Like
+    /// `reconstruct_training` it decodes each atom at its trained coordinate and
+    /// does NOT re-apply the joint fit's hybrid collapse. The core validates
+    /// `codes` has `K` columns (== atom count) and `p_out`-consistent widths.
+    fn reconstruct_from_assignments<'py>(
+        &self,
+        py: Python<'py>,
+        codes: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let inner = &self.inner;
+        let basis_kinds: Vec<SaeAtomBasisKind> = inner
+            .basis_kinds
+            .iter()
+            .map(|name| sae_atom_basis_kind_from_str(name))
+            .collect();
+        let atom_dims: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
+        let decoder_owned: Vec<Array2<f64>> = inner
+            .decoder_blocks
+            .iter()
+            .map(|b| manifold_sae_owned2(b))
+            .collect::<PyResult<_>>()?;
+        let coord_owned: Vec<Array2<f64>> = inner
+            .coords
+            .iter()
+            .map(|c| manifold_sae_owned2(c))
+            .collect::<PyResult<_>>()?;
+        let p_out = if inner.decoder_blocks.is_empty() {
+            inner.fitted.first().map_or(0, Vec::len)
+        } else {
+            inner.decoder_blocks[0].first().map_or(0, Vec::len)
+        };
+        let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            decoder_owned.iter().map(|a| a.view()).collect();
+        let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            coord_owned.iter().map(|a| a.view()).collect();
+        let out = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
+            &basis_kinds,
+            &atom_dims,
+            &decoder_views,
+            &coord_views,
+            codes.as_array(),
+            p_out,
+        )
+        .map_err(py_value_error)?;
+        Ok(out.into_pyarray(py))
+    }
+
+    /// Frozen anchor dictionary `(K, P)` — one representative ambient direction
+    /// per atom, the linear-`(K, P)`-dictionary analog SAEBench's curved
+    /// `audit_sae` arm consumes when collapsing the curved per-atom decoders.
+    ///
+    /// MODELING CHOICE (documented, principled, basis-agnostic): row `k` is the
+    /// MEAN decoded ambient direction of atom `k` over its OWN fitted coordinates,
+    /// `mean_i Φ_k(coords_k[i])·B_k` — the "center" of the curved atom's shape.
+    /// This is deliberately the atom's INTRINSIC mean shape (each row decoded at
+    /// unit assignment weight, NOT its activation-weighted contribution), so an
+    /// atom's dictionary direction does not shrink just because it was rarely
+    /// active. For a d=1 Fourier atom it coincides with the DC / constant-harmonic
+    /// decoder row; for a linear atom it is the mean of its linear image. Chosen
+    /// over "decode at the single mean coordinate" because a coordinate-space mean
+    /// is ill-defined for a periodic atom (angles need a circular mean), whereas
+    /// the ambient-image mean is always well-defined. The per-atom decode reuses
+    /// the same persisted-atom-set assembler as `reconstruct_training`; the row
+    /// reduction is done in Rust. An atom with zero fitted rows yields a zero row.
+    fn frozen_dictionary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let inner = &self.inner;
+        let k_atoms = inner.decoder_blocks.len();
+        let p_out = if inner.decoder_blocks.is_empty() {
+            inner.fitted.first().map_or(0, Vec::len)
+        } else {
+            inner.decoder_blocks[0].first().map_or(0, Vec::len)
+        };
+        let mut dictionary = Array2::<f64>::zeros((k_atoms, p_out));
+        for k in 0..k_atoms {
+            let kind = sae_atom_basis_kind_from_str(&inner.basis_kinds[k]);
+            let atom_dim = inner.atom_dims[k].max(0) as usize;
+            let decoder = manifold_sae_owned2(&inner.decoder_blocks[k])?;
+            let coords = manifold_sae_owned2(&inner.coords[k])?;
+            let n_rows = coords.nrows();
+            if n_rows == 0 {
+                continue;
+            }
+            // Decode atom k ALONE at its stored coordinates (unit weight) through
+            // the shared assembler, then average the ambient rows (Rust-side).
+            let assignments = Array2::<f64>::ones((n_rows, 1));
+            let decoder_view = decoder.view();
+            let coords_view = coords.view();
+            let decoded = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
+                std::slice::from_ref(&kind),
+                std::slice::from_ref(&atom_dim),
+                std::slice::from_ref(&decoder_view),
+                std::slice::from_ref(&coords_view),
+                assignments.view(),
+                p_out,
+            )
+            .map_err(py_value_error)?;
+            let mean = decoded.mean_axis(ndarray::Axis(0)).ok_or_else(|| {
+                py_value_error("frozen_dictionary: atom decoded to zero rows".to_string())
+            })?;
+            dictionary.row_mut(k).assign(&mean);
+        }
+        Ok(dictionary.into_pyarray(py))
     }
 
     /// Steering plan with output dosimetry for one atom — the Rust-owned

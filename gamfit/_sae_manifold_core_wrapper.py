@@ -530,7 +530,12 @@ def stagewise_to_manifold_sae_dict(
         "penalized_loss_score": None,
         "reml_score": None,
         "reconstruction_r2": float(reconstruction_r2),
-        "training_mean": np.asarray(training, dtype=float).mean(axis=0).tolist(),
+        # SPEC: the centering-mean REDUCTION is computed in Rust (the shared
+        # `column_mean` core, identical to the fit builder), never in production
+        # Python. This call is pure marshaling of the result.
+        "training_mean": rust_module()
+        .sae_manifold_training_mean(np.ascontiguousarray(np.asarray(training, dtype=float)))
+        .tolist(),
         "training_data": None,
         "training_data_retained": False,
         "fitted": np.asarray(fitted, dtype=float).tolist(),
