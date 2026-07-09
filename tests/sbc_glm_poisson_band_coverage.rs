@@ -139,8 +139,10 @@ fn poisson_glm_mean_band_covers_truth_at_nominal() {
     for _ in 0..N_REPLICATIONS {
         let truth = SmoothLogMean::draw(&mut rng);
         let data = simulate_dataset(&x, &truth, &mut rng);
-        let mut config = FitConfig::default();
-        config.family = Some("poisson".to_string());
+        let config = FitConfig {
+            family: Some("poisson".to_string()),
+            ..FitConfig::default()
+        };
         let fit = fit_from_formula("y ~ s(x)", &data, &config).expect("poisson smooth fit");
 
         let j = interior_lo + (rng.uniform_open01() * span as f64) as usize % span;

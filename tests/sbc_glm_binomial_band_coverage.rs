@@ -174,8 +174,10 @@ fn binomial_glm_response_band_covers_truth_at_nominal() {
     for _ in 0..N_REPLICATIONS {
         let truth = SmoothTruth::draw(&mut rng);
         let data = simulate_dataset(&x, &truth, &mut rng);
-        let mut config = FitConfig::default();
-        config.family = Some("binomial".to_string());
+        let config = FitConfig {
+            family: Some("binomial".to_string()),
+            ..FitConfig::default()
+        };
         let fit = fit_from_formula("y ~ s(x)", &data, &config).expect("binomial smooth fit");
 
         // One independent interior evaluation point per replication.

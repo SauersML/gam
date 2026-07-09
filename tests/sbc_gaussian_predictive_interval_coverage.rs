@@ -151,8 +151,10 @@ fn gaussian_predictive_interval_covers_new_observation_at_nominal() {
     for _ in 0..N_REPLICATIONS {
         let truth = AdditiveTruth::draw(&mut rng);
         let data = simulate_dataset(&x1, &x2, &truth, &mut rng);
-        let mut config = FitConfig::default();
-        config.family = Some("gaussian".to_string());
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
         let fit =
             fit_from_formula("y ~ s(x1) + s(x2)", &data, &config).expect("gaussian additive fit");
 
