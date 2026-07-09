@@ -21,7 +21,7 @@
 //!
 //! This module separates those concerns into honest submodules:
 //! - [`error`]: the [`RemlError`] type and its `String` boundary conversion.
-//! - [`hessian_operator_trait`]: the [`HessianOperator`] trait — backend-specific
+//! - [`hessian_factorization`]: the [`HessianFactorization`] trait — backend-specific
 //!   linear algebra (logdet, trace, solve) plus its default trace-estimation
 //!   machinery and the shared [`StochasticTraceState`].
 //! - [`derivative_providers`]: the [`HessianDerivativeProvider`] trait and every
@@ -176,7 +176,8 @@ mod dense_spectral;
 mod derivative_providers;
 mod efs;
 mod error;
-mod hessian_operator_trait;
+#[path = "reml_outer_engine/hessian_operator_trait.rs"]
+mod hessian_factorization;
 mod hyper_operator;
 mod inner_solution;
 mod objective;
@@ -198,7 +199,7 @@ pub use dense_spectral::*;
 pub use derivative_providers::*;
 pub use efs::*;
 pub use error::*;
-pub use hessian_operator_trait::*;
+pub use hessian_factorization::*;
 pub use hyper_operator::*;
 pub use inner_solution::*;
 pub(crate) use objective::*;

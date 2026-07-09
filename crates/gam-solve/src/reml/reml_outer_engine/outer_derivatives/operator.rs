@@ -738,17 +738,17 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
     ) -> Result<(), opt::ObjectiveEvalError> {
         if alpha.len() != self.coords.len() {
             return Err(opt::ObjectiveEvalError::fatal(format!(
-                    "outer Hessian alpha length mismatch: got {}, expected {}",
-                    alpha.len(),
-                    self.coords.len()
-                )));
+                "outer Hessian alpha length mismatch: got {}, expected {}",
+                alpha.len(),
+                self.coords.len()
+            )));
         }
         if out.len() != self.coords.len() {
             return Err(opt::ObjectiveEvalError::fatal(format!(
-                    "outer Hessian apply_into output length mismatch: got {}, expected {}",
-                    out.len(),
-                    self.coords.len()
-                )));
+                "outer Hessian apply_into output length mismatch: got {}, expected {}",
+                out.len(),
+                self.coords.len()
+            )));
         }
         let mut a_alpha = 0.0;
         for (idx, coord) in self.coords.iter().enumerate() {
@@ -761,13 +761,9 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
         let psi_contrib = self
             .psi_contracted_contrib(alpha)
             .map_err(opt::ObjectiveEvalError::fatal)?;
-        let slice = out
-            .as_slice_mut()
-            .ok_or_else(|| {
-                opt::ObjectiveEvalError::fatal(
-                    "outer Hessian apply_into: non-contiguous output buffer",
-                )
-            })?;
+        let slice = out.as_slice_mut().ok_or_else(|| {
+            opt::ObjectiveEvalError::fatal("outer Hessian apply_into: non-contiguous output buffer")
+        })?;
         slice
             .par_iter_mut()
             .enumerate()

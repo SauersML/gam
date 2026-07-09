@@ -265,14 +265,20 @@ pub fn parse_certificate(
         .eigh(Side::Lower)
         .map_err(|e| format!("terracini: eigh of J_SᵀJ_S failed: {e}"))?
         .0;
+    // Attribution risk is the exact least-squares risk of the physical joint
+    // Jacobian. The per-atom whitening ridge above is a numerical device for the
+    // cross-angle diagnostic; adding it here would turn a non-identifiable parse
+    // into a finite-risk one. Resolve numerical rank relative to the observed
+    // spectrum and report infinite risk whenever J_S is singular.
+    let max_j_eig = w_j.iter().copied().fold(0.0_f64, f64::max);
+    let rank_tol = f64::EPSILON * (p.max(m) as f64) * max_j_eig;
     let mut trace_inv_j = 0.0_f64;
     for &lam in w_j.iter() {
-        let lam_c = lam + ridge;
-        trace_inv_j += if lam_c > 1.0e-300 {
-            1.0 / lam_c
-        } else {
-            f64::INFINITY
-        };
+        if !(lam.is_finite() && lam > rank_tol) {
+            trace_inv_j = f64::INFINITY;
+            break;
+        }
+        trace_inv_j += 1.0 / lam;
     }
     let attribution_risk = noise_var * trace_inv_j;
 
@@ -1012,6 +1018,26 @@ mod tests {
         assert!(cert.margin < 1e-3, "margin {}", cert.margin);
         assert!(cert.amplification > 1e2);
         assert!(cert.whitened_excess > 1e5);
+    }
+
+    #[test]
+    fn singular_joint_jacobian_has_infinite_attribution_risk_even_with_whitening_ridge() {
+        let mut tangent = Array2::<f64>::zeros((2, 1));
+        tangent[[0, 0]] = 1.0;
+        let cert = parse_certificate(
+            &[ParseBlock {
+                atom: 0,
+                value: Array1::from_vec(vec![1.0, 0.0]),
+                tangent,
+            }],
+            1.0,
+            1.0e-6,
+        )
+        .expect("the whitening diagnostic may regularize its own Gram");
+        assert!(
+            cert.attribution_risk.is_infinite(),
+            "an exact risk cannot hide a singular physical Jacobian behind a ridge"
+        );
     }
 
     #[test]
