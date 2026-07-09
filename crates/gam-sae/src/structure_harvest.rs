@@ -78,9 +78,10 @@
 
 use std::sync::Arc;
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 use crate::atom_codes::SparseAtomCodes;
+use crate::frames::GrassmannFrame;
 use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
@@ -286,6 +287,17 @@ fn post_move_structure_hash(term: &SaeManifoldTerm, mv: &StructureMove) -> u64 {
             fp.write_usize((*a).min(*b));
             fp.write_usize((*a).max(*b));
         }
+        StructureMove::Glue { a, b } => {
+            // A glue reaches the same POST-move dictionary shape as a fusion of
+            // the same pair (one atom folds into the other), so it shares the
+            // fusion tag: a fusion and a glue proposed on the same pair in one
+            // round are the same resulting structure and dedup against each
+            // other — the engine keeps only the canonically-first (fusion sorts
+            // ahead of glue), never applying both to the same pair.
+            fp.write_str("fusion");
+            fp.write_usize((*a).min(*b));
+            fp.write_usize((*a).max(*b));
+        }
     }
     // Post-move atom-shape skeleton: the current per-atom (basis-kind tag,
     // latent dim) plus the count delta the move applies. Births/fissions add an
@@ -366,6 +378,16 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
         StructureMove::Fusion { a, b } => ClaimKind::BindingEdge { a: *a, b: *b },
         StructureMove::Fission { atom } => ClaimKind::Custom {
             label: format!("fission:{atom}"),
+        },
+        // #1890: the seam-glue claim is its own ledger entry, distinct from the
+        // fusion `BindingEdge` on the same pair (glue asserts "these two charts
+        // tile ONE manifold within an isometry tolerance", a strictly stronger
+        // claim than "these two atoms co-fire and bind"). Carried as a labeled
+        // `Custom` — an ordered `(min,max)` key so `Glue{a,b}` and `Glue{b,a}`
+        // dedup — rather than a new `ClaimKind` variant, to avoid a cross-crate
+        // enum change whose exhaustive-match fallout the design does not need.
+        StructureMove::Glue { a, b } => ClaimKind::Custom {
+            label: format!("seam_glue:{}:{}", (*a).min(*b), (*a).max(*b)),
         },
     };
     MoveProposal {
@@ -498,6 +520,26 @@ pub fn harvest_move_proposals(
     for &(a, b, z) in fusion_pairs.iter().take(params.max_fusions) {
         proposals.push(proposal(term, StructureMove::Fusion { a, b }, z));
     }
+
+    // --- Glue: chart-gluing over-tiling detector (#1890) -------------------
+    // A SECOND, independent proposal lane, blind to the co-activation currency
+    // the fusion lane above runs on. Atoms over-tiling ONE manifold have
+    // DISJOINT supports (each owns its own arc), hence anti-correlated codes, so
+    // no such pair EVER clears the co-activation floor — the fusion lane is
+    // structurally blind to them. This lane screens pairs GEOMETRICALLY instead:
+    // a d=1 periodic pair whose decoder AMBIENT spans align (small principal
+    // angles via the Grassmann frame) and whose supports are disjoint is a
+    // candidate. Acceptance is NOT decided here — the seam equivalence e-value
+    // (`glue_pair_evalue`) is carried on the proposal's trigger and the engine's
+    // Glue arm banks it against the churn null. The pre-screen only RANKS, so
+    // the budget spends its e-value evaluations on the most-aligned pairs; it
+    // carries no acceptance threshold of its own (magic-free).
+    let (glues_proposed, glue_candidates_screened) = harvest_glue_proposals(
+        term,
+        residuals,
+        params.max_fusions,
+        &mut proposals,
+    );
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
@@ -660,6 +702,8 @@ pub fn harvest_move_proposals(
         fission_carve_blocked_count,
         births_proposed,
         birth_skipped_reason,
+        glues_proposed,
+        glue_candidates_screened,
     })
 }
 
@@ -749,6 +793,500 @@ pub struct HarvestReport {
     /// If the birth channel could not run (empty residuals, evidence-ladder
     /// failure), why — so the absence of births is explained, not silent.
     pub birth_skipped_reason: Option<String>,
+    /// #1890: number of chart-gluing proposals emitted (pairs whose seam
+    /// equivalence e-value was finite and carried to the engine's Glue gate).
+    pub glues_proposed: usize,
+    /// #1890: number of disjoint-support d=1 periodic pairs the glue lane
+    /// GEOMETRICALLY screened (passed the ambient-frame / disjoint-support
+    /// pre-screen) before ranking under budget — the loud denominator for the
+    /// glues actually proposed.
+    pub glue_candidates_screened: usize,
+}
+
+// ===========================================================================
+// #1890 — chart-gluing lane: the geometric over-tiling detector.
+//
+// Atoms over-tiling ONE manifold are CHARTS, and the merge test for charts is
+// GLUING, not co-activation fusion. The co-activation lane (above) fires on
+// DEPENDENT codes; over-tiling atoms have DISJOINT supports (each owns its own
+// arc) and hence anti-correlated codes, so the fusion lane is structurally
+// blind to them. This lane screens pairs GEOMETRICALLY — a d=1 periodic pair
+// whose decoder AMBIENT spans align (small principal angles) and whose supports
+// are no more co-active than chance — and its acceptance is an EQUIVALENCE
+// e-value on the decoded seam (the two charts coincide within an isometry
+// tolerance) against the churn-null scatter, NOT a fit-improvement gate (a
+// clean glue leaves EV tied, so a likelihood-ratio gate could never accept it).
+// ===========================================================================
+
+/// Number of full-period samples of each decoded curve for the nearest-point
+/// seam residual. Fixed structural resolution (magic-by-default): dense enough
+/// that the nearest-grid-point distance is dominated by genuine chart mismatch
+/// rather than grid quantization for the harmonic bases this lane runs on.
+const GLUE_CURVE_GRID: usize = 256;
+
+/// Fallback intrinsic period of a d=1 periodic atom's latent coordinate when the
+/// atom's `Circle { period }` manifold does not report one. The periodic
+/// harmonic evaluator sweeps a full circle over `t ∈ [0, 1)` (`angle = 2π·h·t`),
+/// so the coordinate period is `1.0` unless the manifold overrides it — which is
+/// the value read per-atom by [`atom_axis_period`].
+const GLUE_DEFAULT_PERIOD: f64 = 1.0;
+
+/// Finite clamp on the seam log-e-value so a perfect (zero-residual) synthetic
+/// glue banks a large-but-finite certificate rather than `+∞` — the engine
+/// rejects non-finite triggers, and a banked e-value only needs to clear the
+/// ledger threshold `ln(1/α) ≈ 3`, not diverge. Kept well under `ln(f64::MAX)`
+/// so the ledger never overflows when it exponentiates the banked log-e.
+const GLUE_LOG_E_CLAMP: f64 = 50.0;
+
+/// A fitted seam transition between two d=1 charts A, B of one manifold under
+/// the unit-speed gauge: `t_A = sign · t_B + offset` (mod the `2π` period), with
+/// the seam equivalence e-value that certifies the two decoded charts coincide
+/// within an isometry tolerance against the churn null.
+///
+/// `sign = +1` is a plain over-tile (two arcs of one ORIENTED circle → a single
+/// periodic atom covers the union: the fuse outcome, Increment 1). `sign = -1`
+/// is ORIENTATION-REVERSING — the sphere-pole / Möbius signature no single
+/// orientable chart can represent, which must instead be REGISTERED as a
+/// partition-of-unity atlas atom (Increment 2, in the atom/construction types
+/// this lane does not own). The sign is the detector either way.
+#[derive(Clone, Copy, Debug)]
+pub struct ChartTransition {
+    /// `+1` orientation-preserving (fuse), `-1` orientation-reversing (register).
+    pub sign: i8,
+    /// Latent offset `c` in `t_A = sign·t_B + c`, wrapped into `[0, 2π)`.
+    pub offset: f64,
+    /// Seam equivalence e-value (log scale) against the churn-null scatter. Large
+    /// positive ⇒ the two charts coincide within the reconstruction band beyond
+    /// what independent curves would; carried on the proposal trigger and banked
+    /// by the engine's Glue gate.
+    pub log_e_value: f64,
+}
+
+/// The geometric half of a chart glue (no e-value): the fitted sign + offset and
+/// the decoded seam clouds/curves, shared by the acceptance e-value
+/// ([`glue_pair_evalue`]) and the warm-start coordinate transplant
+/// ([`transplant_glued_coords`]).
+struct SeamTransition {
+    sign: f64,
+    offset: f64,
+    /// Intrinsic period of atom A's latent coordinate (the transplant wraps into
+    /// `[0, period_a)`).
+    period: f64,
+    rows_a: Vec<usize>,
+    points_a: Array2<f64>,
+    rows_b: Vec<usize>,
+    points_b: Array2<f64>,
+    curve_a: Array2<f64>,
+    curve_b: Array2<f64>,
+}
+
+/// Intrinsic period of a d=1 atom's latent coordinate, read from its
+/// `Circle { period }` manifold (falling back to [`GLUE_DEFAULT_PERIOD`] when the
+/// manifold reports no axis period).
+fn atom_axis_period(term: &SaeManifoldTerm, atom: usize) -> f64 {
+    let coords = &term.assignment.coords;
+    if atom < coords.len() {
+        if let Some(Some(p)) = coords[atom].effective_axis_periods().first().copied() {
+            if p.is_finite() && p > 0.0 {
+                return p;
+            }
+        }
+    }
+    GLUE_DEFAULT_PERIOD
+}
+
+/// Active rows of `atom` — the discrete support the disjoint-support signature
+/// is read from, thresholded at the same relative floor as
+/// [`sparse_codes_from_term`].
+fn atom_active_rows(term: &SaeManifoldTerm, atom: usize) -> Vec<usize> {
+    let assignments = term.assignment.assignments();
+    let k = assignments.ncols();
+    let floor = if k == 0 {
+        0.0
+    } else {
+        ACTIVE_SUPPORT_REL_FLOOR / k as f64
+    };
+    (0..assignments.nrows())
+        .filter(|&r| assignments[[r, atom]] > floor)
+        .collect()
+}
+
+/// Decode an atom's ambient points `x_i = Φ_k(t_i) · B_k` at the given rows,
+/// reading the atom's already-evaluated basis values (no re-evaluate). Returns
+/// `(rows.len() × p)`.
+fn decoded_points_at(atom: &SaeManifoldAtom, rows: &[usize]) -> Array2<f64> {
+    let phi_sub = atom.basis_values.select(Axis(0), rows);
+    phi_sub.dot(&atom.decoder_coefficients)
+}
+
+/// Sample the atom's full decoded curve over one period `[0, 2π)`:
+/// `γ_k(grid) = Φ_k(grid) · B_k` (`GLUE_CURVE_GRID × p`). Needs the basis
+/// evaluator (a caller-managed atom without one cannot be glued — returns
+/// `None`).
+fn full_period_curve(atom: &SaeManifoldAtom, period: f64) -> Option<Array2<f64>> {
+    let eval = atom.basis_evaluator.as_ref()?;
+    let mut coords = Array2::<f64>::zeros((GLUE_CURVE_GRID, 1));
+    for i in 0..GLUE_CURVE_GRID {
+        coords[[i, 0]] = period * i as f64 / GLUE_CURVE_GRID as f64;
+    }
+    let (phi, _jet) = eval.evaluate(coords.view()).ok()?;
+    if phi.ncols() != atom.decoder_coefficients.nrows() {
+        return None;
+    }
+    Some(phi.dot(&atom.decoder_coefficients))
+}
+
+/// Squared distance from `point` to its nearest sample on `curve`, and that
+/// sample's grid index (the nearest-point projection = the transition map).
+fn nearest_curve_sq(point: ArrayView1<'_, f64>, curve: &Array2<f64>) -> (usize, f64) {
+    let mut best = f64::INFINITY;
+    let mut best_i = 0usize;
+    for i in 0..curve.nrows() {
+        let mut s = 0.0;
+        for c in 0..curve.ncols() {
+            let d = point[c] - curve[[i, c]];
+            s += d * d;
+        }
+        if s < best {
+            best = s;
+            best_i = i;
+        }
+    }
+    (best_i, best)
+}
+
+/// Fit the unit-speed transition `t_A = sign·t_B + c` from B's latent coords and
+/// the arc-length coords they project to on A's curve. Both signs are tried; the
+/// one whose offset residual is smaller (larger circular resultant length) wins
+/// — `sign = -1` is the orientation-reversing (Möbius / pole) detector.
+fn fit_sign_offset(t_b: &[f64], t_a_star: &[f64], period: f64) -> (f64, f64) {
+    let n = t_b.len().max(1) as f64;
+    let scale = std::f64::consts::TAU / period;
+    let mut best_sign = 1.0_f64;
+    let mut best_offset = 0.0_f64;
+    let mut best_r = -1.0_f64;
+    for &sign in &[1.0_f64, -1.0_f64] {
+        let (mut cs, mut sn) = (0.0_f64, 0.0_f64);
+        for i in 0..t_b.len() {
+            // Map the coordinate offset to an angle on the circle of the given
+            // period so the circular mean respects wrap-around.
+            let ang = (t_a_star[i] - sign * t_b[i]) * scale;
+            cs += ang.cos();
+            sn += ang.sin();
+        }
+        let r = (cs * cs + sn * sn).sqrt() / n;
+        if r > best_r {
+            best_r = r;
+            best_sign = sign;
+            best_offset = (sn.atan2(cs) / scale).rem_euclid(period);
+        }
+    }
+    (best_sign, best_offset)
+}
+
+/// Fit the geometric seam transition (sign + offset) between two d=1 charts and
+/// carry the decoded clouds/curves the e-value and transplant reuse. `None`
+/// unless both atoms are d=1 with a shared ambient dim, non-empty active
+/// supports, and available basis evaluators.
+fn fit_seam_transition(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<SeamTransition> {
+    let k = term.k_atoms();
+    if a >= k || b >= k || a == b {
+        return None;
+    }
+    let atom_a = &term.atoms[a];
+    let atom_b = &term.atoms[b];
+    if atom_a.latent_dim != 1 || atom_b.latent_dim != 1 {
+        return None;
+    }
+    let p = atom_a.decoder_coefficients.ncols();
+    if p == 0 || p != atom_b.decoder_coefficients.ncols() {
+        return None;
+    }
+    let rows_a = atom_active_rows(term, a);
+    let rows_b = atom_active_rows(term, b);
+    if rows_a.is_empty() || rows_b.is_empty() {
+        return None;
+    }
+    let coords = &term.assignment.coords;
+    if b >= coords.len() || coords[b].latent_dim() < 1 {
+        return None;
+    }
+    let period_a = atom_axis_period(term, a);
+    let period_b = atom_axis_period(term, b);
+    let curve_a = full_period_curve(atom_a, period_a)?;
+    let curve_b = full_period_curve(atom_b, period_b)?;
+    let points_a = decoded_points_at(atom_a, &rows_a);
+    let points_b = decoded_points_at(atom_b, &rows_b);
+    // Project B's decoded points onto A's full curve (the transition map) and
+    // fit the sign + offset from the arc-length correspondence.
+    let mut t_b = Vec::with_capacity(rows_b.len());
+    let mut t_a_star = Vec::with_capacity(rows_b.len());
+    let grid_to_t = |gi: usize| -> f64 { period_a * gi as f64 / GLUE_CURVE_GRID as f64 };
+    for (i, &r) in rows_b.iter().enumerate() {
+        let (gi, _sq) = nearest_curve_sq(points_b.row(i), &curve_a);
+        t_a_star.push(grid_to_t(gi));
+        t_b.push(coords[b].row(r)[0]);
+    }
+    let (sign, offset) = fit_sign_offset(&t_b, &t_a_star, period_a);
+    Some(SeamTransition {
+        sign,
+        offset,
+        period: period_a,
+        rows_a,
+        points_a,
+        rows_b,
+        points_b,
+        curve_a,
+        curve_b,
+    })
+}
+
+/// The seam equivalence e-value (#1890): does chart A's arc lie on chart B's
+/// curve AND vice versa, within the reconstruction band, beyond the pooled
+/// independent-scatter (churn-null) scale?
+///
+/// For every seam point the per-point statistic is the Gaussian likelihood ratio
+/// `N(x; nearest point on the OTHER chart's curve, σ_band²) / N(x; pooled
+/// centroid, σ_pool²)`, both directions, summed to a log-e-value:
+///
+/// * `σ_band²` — per-coordinate reconstruction noise floor, the mean squared
+///   dictionary residual over the pair's rows (the isometry TOLERANCE: how close
+///   "the same manifold" must decode).
+/// * `σ_pool²` — per-coordinate scatter of the pooled decoded points about their
+///   centroid (the churn-null currency: how far apart INDEPENDENT curves' points
+///   sit). A pair whose pooled scatter is no larger than the reconstruction
+///   floor cannot be discriminated and yields no e-value.
+///
+/// Two arcs of ONE circle decode ONTO each other's curve (`e_glue ≈ 0 ≪ σ_pool`)
+/// so the ratio is large positive; two DISTINCT circles decode FAR from each
+/// other's curve (`e_glue ~ σ_pool ≫ σ_band`) so the `−e_glue/(2σ_band²)` term
+/// drives the ratio large negative — the tied-EV-cannot-win property the issue
+/// requires. This is a plug-in e-value (band/pool estimated from the same rows,
+/// the same discipline as every harvest trigger); the churn null is the
+/// calibration currency, not a held-out split.
+fn glue_pair_evalue(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+    a: usize,
+    b: usize,
+) -> Option<ChartTransition> {
+    let seam = fit_seam_transition(term, a, b)?;
+    let p = seam.points_a.ncols();
+    if p == 0 || residuals.ncols() != p {
+        return None;
+    }
+    // Pooled independent-scatter scale (the churn-null currency): union points
+    // about their pooled centroid.
+    let n_union = seam.points_a.nrows() + seam.points_b.nrows();
+    if n_union == 0 {
+        return None;
+    }
+    let mut mu = vec![0.0_f64; p];
+    for i in 0..seam.points_a.nrows() {
+        for c in 0..p {
+            mu[c] += seam.points_a[[i, c]];
+        }
+    }
+    for i in 0..seam.points_b.nrows() {
+        for c in 0..p {
+            mu[c] += seam.points_b[[i, c]];
+        }
+    }
+    for c in 0..p {
+        mu[c] /= n_union as f64;
+    }
+    let point_null_sq = |pt: ArrayView1<'_, f64>| -> f64 {
+        (0..p).map(|c| (pt[c] - mu[c]).powi(2)).sum::<f64>()
+    };
+    let mut pool_acc = 0.0_f64;
+    for i in 0..seam.points_a.nrows() {
+        pool_acc += point_null_sq(seam.points_a.row(i));
+    }
+    for i in 0..seam.points_b.nrows() {
+        pool_acc += point_null_sq(seam.points_b.row(i));
+    }
+    let pool_sq = pool_acc / (n_union as f64 * p as f64);
+    if !(pool_sq.is_finite() && pool_sq > 0.0) {
+        return None;
+    }
+    // Per-coordinate reconstruction noise floor over the pair's rows, floored
+    // WELL below the pooled scatter so a near-perfect glue banks a large finite
+    // certificate rather than dividing by zero.
+    let mut band_acc = 0.0_f64;
+    let mut band_rows = 0usize;
+    for &r in seam.rows_a.iter().chain(seam.rows_b.iter()) {
+        for c in 0..p {
+            band_acc += residuals[[r, c]].powi(2);
+        }
+        band_rows += 1;
+    }
+    if band_rows == 0 {
+        return None;
+    }
+    let band_sq = (band_acc / (band_rows as f64 * p as f64)).max(pool_sq * 1.0e-12);
+    // A pooled scatter no larger than the reconstruction floor cannot separate
+    // "same manifold" from "independent blob" — no e-value.
+    if !(pool_sq > band_sq) {
+        return None;
+    }
+    let norm_term = (p as f64 / 2.0) * (pool_sq / band_sq).ln();
+    let mut log_e = 0.0_f64;
+    // B's arc projected onto A's curve.
+    for i in 0..seam.points_b.nrows() {
+        let (_gi, e_glue) = nearest_curve_sq(seam.points_b.row(i), &seam.curve_a);
+        let e_null = point_null_sq(seam.points_b.row(i));
+        log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
+    }
+    // A's arc projected onto B's curve.
+    for i in 0..seam.points_a.nrows() {
+        let (_gi, e_glue) = nearest_curve_sq(seam.points_a.row(i), &seam.curve_b);
+        let e_null = point_null_sq(seam.points_a.row(i));
+        log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
+    }
+    if !log_e.is_finite() {
+        log_e = if log_e < 0.0 {
+            -GLUE_LOG_E_CLAMP
+        } else {
+            GLUE_LOG_E_CLAMP
+        };
+    }
+    let log_e = log_e.clamp(-GLUE_LOG_E_CLAMP, GLUE_LOG_E_CLAMP);
+    Some(ChartTransition {
+        sign: seam.sign as i8,
+        offset: seam.offset,
+        log_e_value: log_e,
+    })
+}
+
+/// Emit the chart-gluing proposal lane (#1890) into `proposals`, ranked under
+/// `budget`. Returns `(glues_proposed, candidates_screened)`.
+///
+/// Pre-screen (GEOMETRIC, code-blind): a pair `(a, b)` is a candidate iff both
+/// atoms are d=1 periodic with a live decoder ambient frame, their supports are
+/// no more co-active than independence would give (`inter ≤ na·nb/N` — the
+/// complement of the fusion lane's positive-dependence trigger, so the two lanes
+/// partition the pair space with NO tuned overlap threshold), and their ambient
+/// spans are comparable (principal-angle alignment, the ranking key). The
+/// pre-screen only RANKS; the seam equivalence e-value owns acceptance, so no
+/// magic alignment cutoff is imposed here.
+fn harvest_glue_proposals(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+    budget: usize,
+    proposals: &mut Vec<MoveProposal>,
+) -> (usize, usize) {
+    let k = term.k_atoms();
+    if k < 2 || budget == 0 {
+        return (0, 0);
+    }
+    let assignments = term.assignment.assignments();
+    let n_rows = assignments.nrows();
+    if n_rows == 0 {
+        return (0, 0);
+    }
+    let floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
+    let supports: Vec<Vec<bool>> = (0..k)
+        .map(|atom| (0..n_rows).map(|r| assignments[[r, atom]] > floor).collect())
+        .collect();
+    let support_sizes: Vec<usize> = supports
+        .iter()
+        .map(|s| s.iter().filter(|&&x| x).count())
+        .collect();
+    // Ambient decoder frames — only for d=1 periodic atoms (the over-tiling
+    // signature); every other atom is a `None` and never a glue endpoint.
+    let frames: Vec<Option<GrassmannFrame>> = (0..k)
+        .map(|atom| {
+            let at = &term.atoms[atom];
+            if at.latent_dim == 1 && matches!(at.basis_kind, SaeAtomBasisKind::Periodic) {
+                GrassmannFrame::from_decoder_row_space(at.decoder_coefficients.view())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut screened = 0usize;
+    let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
+    for a in 0..k {
+        let fa = match &frames[a] {
+            Some(f) => f,
+            None => continue,
+        };
+        if support_sizes[a] == 0 {
+            continue;
+        }
+        for b in (a + 1)..k {
+            let fb = match &frames[b] {
+                Some(f) => f,
+                None => continue,
+            };
+            if support_sizes[b] == 0 {
+                continue;
+            }
+            // Disjoint-support gate: keep only pairs that co-fire no MORE than
+            // independence predicts (the anti-correlated / disjoint signature the
+            // fusion lane cannot see). Positively co-active pairs are fusion's.
+            let inter = (0..n_rows)
+                .filter(|&r| supports[a][r] && supports[b][r])
+                .count();
+            let expected = support_sizes[a] as f64 * support_sizes[b] as f64 / n_rows as f64;
+            if inter as f64 > expected {
+                continue;
+            }
+            // Ambient-span alignment (ranking key): cos of the largest principal
+            // angle between the two decoder frames — 1 for a shared plane.
+            let alignment = match fa.max_principal_angle(fb.frame()) {
+                Ok(theta) => theta.cos(),
+                Err(_) => continue,
+            };
+            if !alignment.is_finite() {
+                continue;
+            }
+            screened += 1;
+            candidates.push((a, b, alignment));
+        }
+    }
+    candidates.sort_by(|x, y| {
+        y.2.total_cmp(&x.2)
+            .then(x.0.cmp(&y.0))
+            .then(x.1.cmp(&y.1))
+    });
+
+    let mut proposed = 0usize;
+    for &(a, b, _score) in candidates.iter().take(budget) {
+        if let Some(tr) = glue_pair_evalue(term, residuals, a, b) {
+            proposals.push(proposal(term, StructureMove::Glue { a, b }, tr.log_e_value));
+            proposed += 1;
+        }
+    }
+    (proposed, screened)
+}
+
+/// Warm the glued atom `a`'s chart to cover the union of both arcs by
+/// transplanting `b`'s per-row latent coordinate through the fitted seam
+/// transition `t_a = sign·t_b + offset` (mod `2π`), so the joint refit starts
+/// from a full-manifold chart rather than re-discovering `b`'s arc cold.
+fn transplant_glued_coords(term: &mut SaeManifoldTerm, a: usize, b: usize, seam: &SeamTransition) {
+    let coords = &mut term.assignment.coords;
+    if a >= coords.len() || b >= coords.len() {
+        return;
+    }
+    let da = coords[a].latent_dim();
+    let db = coords[b].latent_dim();
+    if da < 1 || db < 1 || coords[a].n_obs() != coords[b].n_obs() {
+        return;
+    }
+    // Read B's flat coords, then write A's transplanted rows through the fitted
+    // transition. The read is cloned first, so the mutable borrow of A's coords
+    // never aliases B's.
+    let flat_b = coords[b].as_flat().to_owned();
+    let mut flat_a = coords[a].as_flat().to_owned();
+    for &r in &seam.rows_b {
+        let t_b = flat_b[r * db];
+        let t_a = (seam.sign * t_b + seam.offset).rem_euclid(seam.period);
+        flat_a[r * da] = t_a;
+    }
+    coords[a].set_flat(flat_a.view());
 }
 
 /// Apply one [`StructureMove`] to a fitted term + ρ, returning the warm child
@@ -784,6 +1322,25 @@ pub fn apply_structure_move(
         StructureMove::Fusion { a, b } => {
             let mut child = term.clone();
             fold_atom_into(&mut child, *a, *b)?;
+            Ok((child, rho.clone()))
+        }
+        StructureMove::Glue { a, b } => {
+            // #1890 fuse outcome (Increment 1): a d=1 chart glue that a SINGLE
+            // periodic atom can cover reassembles the tiling by folding `b`'s
+            // routing into `a` (the disjoint-support union: `a` now routes over
+            // BOTH arcs) exactly like a fusion, THEN transplanting `b`'s per-row
+            // latent coordinate into `a`'s chart through the fitted seam
+            // transition `t_a = s·t_b + c` so `a`'s warm chart already covers the
+            // whole manifold before the joint refit reconciles the merged atom.
+            // The atlas-register outcome (orientation-reversing s = −1, sphere
+            // poles / Möbius, which need a new multi-chart atom representation)
+            // is Increment 2 and lives with the atom/construction types this lane
+            // does not own; see `fit_seam_transition`'s recorded sign.
+            let mut child = term.clone();
+            fold_atom_into(&mut child, *a, *b)?;
+            if let Some(seam) = fit_seam_transition(term, *a, *b) {
+                transplant_glued_coords(&mut child, *a, *b, &seam);
+            }
             Ok((child, rho.clone()))
         }
         StructureMove::Fission { atom } => {

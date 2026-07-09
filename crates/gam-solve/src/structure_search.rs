@@ -94,6 +94,19 @@ pub enum StructureMove {
     /// Merge two atoms into one joint structure (dependent codes + joint
     /// interaction evidence — #975's binding, in reverse).
     Fusion { a: usize, b: usize },
+    /// Glue two CHARTS of one manifold into one atom (#1890). Distinct from
+    /// [`StructureMove::Fusion`]: the co-activation fusion lane fires on
+    /// DEPENDENT (co-firing) codes, but atoms over-tiling a single manifold have
+    /// DISJOINT supports (each owns its own arc/patch) and therefore
+    /// anti-correlated codes — invisible to fusion. The glue lane proposes such a
+    /// pair on a GEOMETRIC pre-screen (decoder-frame principal angles × latent-
+    /// support adjacency) and its acceptance is an EQUIVALENCE e-value on the
+    /// seam (the two decoded charts coincide within an isometry tolerance,
+    /// against the churn null) — a pre-computed e-value carried on the proposal's
+    /// `trigger`, not the held-out fit-improvement gate the other moves use (a
+    /// clean glue leaves EV tied, so a likelihood-ratio gate could never accept
+    /// it). Applied by folding the pair through the fitted seam transition.
+    Glue { a: usize, b: usize },
 }
 
 impl StructureMove {
@@ -102,17 +115,19 @@ impl StructureMove {
         match self {
             StructureMove::Birth { .. } => Vec::new(),
             StructureMove::Death { atom } | StructureMove::Fission { atom } => vec![*atom],
-            StructureMove::Fusion { a, b } => vec![*a, *b],
+            StructureMove::Fusion { a, b } | StructureMove::Glue { a, b } => vec![*a, *b],
         }
     }
 
-    /// Canonical kind rank: deaths, fissions, fusions, births.
+    /// Canonical kind rank: deaths, fissions, fusions, glues, births. Glue sorts
+    /// after fusion (both merge a pair) and before birth (#1890).
     fn kind_rank(&self) -> u8 {
         match self {
             StructureMove::Death { .. } => 0,
             StructureMove::Fission { .. } => 1,
             StructureMove::Fusion { .. } => 2,
-            StructureMove::Birth { .. } => 3,
+            StructureMove::Glue { .. } => 3,
+            StructureMove::Birth { .. } => 4,
         }
     }
 
@@ -356,6 +371,29 @@ pub fn search<S, Sh>(
                         MoveVerdict::Demoted { log_e }
                     }
                 }
+                StructureMove::Glue { a, b } => {
+                    // Equivalence acceptance (#1890): the seam e-value was
+                    // computed at harvest against the churn null (the two charts
+                    // coincide within an isometry tolerance) and carried on
+                    // `trigger`. Bank it and glue when the accumulated evidence
+                    // certifies at α — never the held-out fit-improvement gate
+                    // the merge/split/birth moves use, which a clean glue's tied
+                    // EV could never clear. Composes with the e-BH ledger like
+                    // every other claim.
+                    let idx = ledger.register(prop.claim.clone());
+                    ledger.absorb_log(idx, prop.trigger)?;
+                    let evidence = &ledger.claims()[idx].evidence;
+                    let log_e = evidence.log_evidence();
+                    if evidence.rejects_at(budget.alpha) {
+                        state = apply_move(&state, &prop.mv)?;
+                        touched.push(*a);
+                        touched.push(*b);
+                        moves_applied += 1;
+                        MoveVerdict::Accepted { log_e }
+                    } else {
+                        MoveVerdict::Contested { log_e }
+                    }
+                }
                 mv @ (StructureMove::Birth { .. }
                 | StructureMove::Fission { .. }
                 | StructureMove::Fusion { .. }) => {
@@ -444,6 +482,7 @@ mod tests {
                 }
             }
             StructureMove::Fusion { .. } => next.push("fake"),
+            StructureMove::Glue { .. } => next.push("glued"),
             StructureMove::Fission { .. } => next.push("split"),
         }
         Ok(next)

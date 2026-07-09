@@ -762,6 +762,56 @@ impl GrassmannFrame {
             .clamp(0.0, 1.0);
         Ok(max_sin.atan2(min_cos))
     }
+
+    /// Build the column-orthonormal ambient frame `V` (`p × r`) spanning the
+    /// subspace of `ℝ^p` an atom's decoded curve lives in, from its decoder
+    /// coefficients `B_k` (`M_k × p`).
+    ///
+    /// The decoded point for latent coordinate `t` is `x(t) = Φ_k(t) · B_k`, so
+    /// as `t` sweeps the atom's manifold `x(t)` ranges over the ROW SPACE of
+    /// `B_k` — the span of `B_k`'s right singular vectors. That ambient span is
+    /// exactly the object the chart-gluing pre-screen (#1890) compares between
+    /// two atoms: two arcs of ONE circle span the same 2-plane (principal angles
+    /// ≈ 0 via [`Self::max_principal_angle`]), while two genuinely distinct
+    /// circles generically span different planes. The effective rank `r` is the
+    /// number of singular values at or above [`SAE_FRAME_RANK_CUTOFF`] · σ_max,
+    /// so a rank-deficient decoder contributes only its live directions.
+    ///
+    /// Returns `None` for an empty decoder or one whose largest singular value is
+    /// not finite-positive (a dead atom carries no ambient span to compare).
+    pub fn from_decoder_row_space(decoder: ArrayView2<'_, f64>) -> Option<Self> {
+        let (m, p) = decoder.dim();
+        if m == 0 || p == 0 {
+            return None;
+        }
+        // Right singular vectors of `B_k` are the rows of `Vᵀ`; each is a unit
+        // vector in `ℝ^p`. Request the right factor only (the left factor is the
+        // basis-space image we do not need here).
+        let (_u, sv, vt_opt) = decoder.to_owned().svd(false, true).ok()?;
+        let vt = vt_opt?;
+        let sigma_max = sv.iter().copied().fold(0.0_f64, f64::max);
+        if !(sigma_max.is_finite() && sigma_max > 0.0) {
+            return None;
+        }
+        let cutoff = SAE_FRAME_RANK_CUTOFF * sigma_max;
+        // `Vᵀ` is `k × p` with `k = min(m, p)`; keep the leading rows whose
+        // singular value clears the cutoff (they are already ordered descending).
+        let r = sv.iter().take(vt.nrows()).filter(|&&s| s >= cutoff).count();
+        if r == 0 {
+            return None;
+        }
+        // Frame column `j` is right singular vector `j` (row `j` of `Vᵀ`); the
+        // rows of `Vᵀ` are orthonormal, so the assembled `p × r` matrix is
+        // column-orthonormal as `from_oriented` requires.
+        let mut frame = Array2::<f64>::zeros((p, r));
+        for j in 0..r {
+            for row in 0..p {
+                frame[[row, j]] = vt[[j, row]];
+            }
+        }
+        let gauge = Array1::from_iter(sv.iter().take(r).copied());
+        Some(Self::from_oriented(frame, gauge))
+    }
 }
 
 /// Streaming `p × r` cross-moment accumulator for the closed-form polar frame
