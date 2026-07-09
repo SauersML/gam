@@ -56,11 +56,51 @@ class FittedFeaturizer:
             raise ValueError("dictionary_params must be nonnegative")
 
 
-def _water_fill_bits(spectrum: np.ndarray, delta: float) -> float:
-    if not math.isfinite(delta) or delta <= 0.0:
-        raise ValueError(f"distortion must be finite and positive, got {delta}")
-    lam = np.maximum(np.asarray(spectrum, dtype=float), 0.0)
-    return float(np.sum(0.5 * np.log2(1.0 + lam / delta)))
+def _water_fill_component_bits(
+    components: list[tuple[float, np.ndarray]], total_distortion: float
+) -> list[float]:
+    """Allocate total distortion across weighted Gaussian spectra."""
+
+    if not math.isfinite(total_distortion) or total_distortion <= 0.0:
+        raise ValueError(
+            f"total distortion must be finite and positive, got {total_distortion}"
+        )
+    spectra: list[tuple[float, np.ndarray]] = []
+    total_variance = 0.0
+    max_variance = 0.0
+    for weight, spectrum in components:
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"component weight must be finite and nonnegative, got {weight}")
+        variances = np.maximum(np.asarray(spectrum, dtype=float), 0.0)
+        if not np.all(np.isfinite(variances)):
+            raise ValueError("component spectrum must contain only finite values")
+        spectra.append((weight, variances))
+        total_variance += weight * float(np.sum(variances))
+        if variances.size:
+            max_variance = max(max_variance, float(np.max(variances)))
+    if total_distortion >= total_variance or max_variance == 0.0:
+        return [0.0] * len(spectra)
+
+    low, high = 0.0, max_variance
+    for _ in range(200):
+        water_level = 0.5 * (low + high)
+        allocated = sum(
+            weight * float(np.sum(np.minimum(variances, water_level)))
+            for weight, variances in spectra
+        )
+        if allocated > total_distortion:
+            high = water_level
+        else:
+            low = water_level
+    water_level = 0.5 * (low + high)
+    rates: list[float] = []
+    for weight, variances in spectra:
+        active = variances > water_level
+        rates.append(
+            weight
+            * float(np.sum(0.5 * np.log2(variances[active] / water_level)))
+        )
+    return rates
 
 
 def _covariance_eigenvalues(values: np.ndarray) -> np.ndarray:
@@ -147,14 +187,17 @@ def description_length(
         "achieved_block_l0": l0,
     }
     for target in r2_targets:
-        distortion = (1.0 - target) * reference_variance / d
-        code_bits = float(
-            sum(
-                probability * _water_fill_bits(spectrum, distortion)
+        total_distortion = (1.0 - target) * reference_variance
+        component_bits = _water_fill_component_bits(
+            [
+                (float(probability), spectrum)
                 for probability, spectrum in zip(p_g, code_spectra, strict=True)
-            )
+            ]
+            + [(1.0, residual_covariance_eigenvalues)],
+            total_distortion,
         )
-        residual_bits = _water_fill_bits(residual_covariance_eigenvalues, distortion)
+        code_bits = float(sum(component_bits[:-1]))
+        residual_bits = component_bits[-1]
         dictionary_bits = 0.5 * fitted.dictionary_params / n * math.log2(max(n, 2))
         suffix = f"{target:g}"
         out[f"bits_at_r2_{suffix}"] = (

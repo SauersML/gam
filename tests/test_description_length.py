@@ -5,7 +5,11 @@ import math
 import numpy as np
 import pytest
 
-from gamfit._description_length import FittedFeaturizer, description_length
+from gamfit._description_length import (
+    FittedFeaturizer,
+    _water_fill_component_bits,
+    description_length,
+)
 
 
 def _featurizer(*, rows: int = 8, dimensions: int = 2) -> FittedFeaturizer:
@@ -56,3 +60,11 @@ def test_fitted_featurizer_requires_one_code_dimension_per_atom() -> None:
             recon=np.ones((4, 1)),
             fit_seconds=0.0,
         )
+
+
+def test_water_filling_uses_gaussian_rate_distortion_and_total_budget() -> None:
+    [rate] = _water_fill_component_bits([(1.0, np.array([1.0]))], 1.0)
+    assert rate == 0.0
+
+    [rate] = _water_fill_component_bits([(1.0, np.array([1.0, 1.0]))], 0.5)
+    assert rate == pytest.approx(2.0)

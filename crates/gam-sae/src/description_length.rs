@@ -31,13 +31,16 @@ use std::f64::consts::LN_2;
 use crate::atom_codes::SparseAtomCodes;
 
 /// Bits to code one Gaussian scalar of variance `signal_var` to per-sample MSE
-/// `delta2`: the numerically-kind rate `½log₂(1 + σ²/δ²)` (≥ 0, finite at low SNR;
-/// agrees with the high-rate `½log₂(σ²/δ²)` to O(1) bit once `σ² ≫ δ²`).
+/// `delta2`: the Gaussian rate-distortion law
+/// `½ max(log₂(signal_var / delta2), 0)`.
 pub fn scalar_rate_bits(signal_var: f64, delta2: f64) -> f64 {
+    if signal_var <= 0.0 {
+        return 0.0;
+    }
     if delta2 <= 0.0 {
         return f64::INFINITY;
     }
-    0.5 * (1.0 + signal_var.max(0.0) / delta2).log2()
+    (0.5 * (signal_var / delta2).log2()).max(0.0)
 }
 
 /// `log₂ C(G, k)`: bits to name which `k` of `G` dictionary atoms fired. Computed
@@ -64,11 +67,23 @@ pub fn reverse_water_filling(eigs: &[f64], delta2: f64) -> (f64, Vec<f64>) {
     if eigs.is_empty() {
         return (0.0, Vec::new());
     }
-    let max_e = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let (mut lo, mut hi) = (0.0f64, max_e.max(delta2));
+    let variances: Vec<f64> = eigs.iter().map(|&value| value.max(0.0)).collect();
+    if delta2 <= 0.0 {
+        let per: Vec<f64> = variances
+            .iter()
+            .map(|&variance| if variance > 0.0 { f64::INFINITY } else { 0.0 })
+            .collect();
+        return (per.iter().sum(), per);
+    }
+    let total_variance: f64 = variances.iter().sum();
+    if delta2 >= total_variance {
+        return (0.0, vec![0.0; variances.len()]);
+    }
+    let max_e = variances.iter().cloned().fold(0.0_f64, f64::max);
+    let (mut lo, mut hi) = (0.0f64, max_e);
     for _ in 0..200 {
         let theta = 0.5 * (lo + hi);
-        let dist: f64 = eigs.iter().map(|&e| e.min(theta)).sum();
+        let dist: f64 = variances.iter().map(|&e| e.min(theta)).sum();
         if dist > delta2 {
             hi = theta;
         } else {
@@ -76,9 +91,9 @@ pub fn reverse_water_filling(eigs: &[f64], delta2: f64) -> (f64, Vec<f64>) {
         }
     }
     let theta = 0.5 * (lo + hi);
-    let per: Vec<f64> = eigs
+    let per: Vec<f64> = variances
         .iter()
-        .map(|&e| (0.5 * (e / theta).log2()).max(0.0))
+        .map(|&e| scalar_rate_bits(e, theta))
         .collect();
     (per.iter().sum(), per)
 }
@@ -150,8 +165,8 @@ pub struct BirthMdlPrescreen {
 #[must_use]
 pub fn predicted_birth_dl_bits(p: &BirthMdlPrescreen) -> f64 {
     let span = p.span;
-    let code_bits = (span - p.intrinsic_dim as f64 - 1.0)
-        * scalar_rate_bits(p.signal_var, p.noise_floor);
+    let code_bits =
+        (span - p.intrinsic_dim as f64 - 1.0) * scalar_rate_bits(p.signal_var, p.noise_floor);
     let support_bits = if p.g_dict > 0 && p.l0 > 0.0 {
         (span - 1.0) * (p.g_dict as f64 / p.l0).log2()
     } else {
@@ -265,11 +280,7 @@ pub struct ScoreRow {
 /// rate as a code coefficient) = the mean per-coefficient code rate; pass a value
 /// (e.g. 16 for fp16) to override.
 pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> ScoreRow {
-    let code_coeff: f64 = feat
-        .coded_var
-        .iter()
-        .map(|&v| scalar_rate_bits(v, delta2))
-        .sum();
+    let (code_coeff, _) = reverse_water_filling(&feat.coded_var, delta2);
     let sel_comb = feat.selection_bits_combinatorial();
     let sel = feat.selection_bits_charged();
     let code_per_firing = code_coeff + sel;
@@ -351,16 +362,8 @@ pub fn crossover_firings(
     delta2: f64,
     l_param_bits: Option<f64>,
 ) -> Crossover {
-    let code_b: f64 = block
-        .coded_var
-        .iter()
-        .map(|&v| scalar_rate_bits(v, delta2))
-        .sum();
-    let code_c: f64 = chart
-        .coded_var
-        .iter()
-        .map(|&v| scalar_rate_bits(v, delta2))
-        .sum();
+    let (code_b, _) = reverse_water_filling(&block.coded_var, delta2);
+    let (code_c, _) = reverse_water_filling(&chart.coded_var, delta2);
     // Selection currency: charge BOTH sides the empirical support entropy `H(S)`
     // when supplied (the default), else the combinatorial worst case. The
     // combinatorial delta is computed unconditionally and reported alongside, so
@@ -551,7 +554,13 @@ pub fn bar_birth_threshold_nats(delta_d_eff: f64, n_eff: f64, codim: f64) -> f64
 /// The LOG-length is load-bearing (Theorem D): persistence is additive with the
 /// likelihood only under `log(d/b)`, which is why a bar twice as long in log buys
 /// twice the evidence — `death − birth` would NOT be the right currency.
-pub fn bar_supports_birth(birth: f64, death: f64, delta_d_eff: f64, n_eff: f64, codim: f64) -> bool {
+pub fn bar_supports_birth(
+    birth: f64,
+    death: f64,
+    delta_d_eff: f64,
+    n_eff: f64,
+    codim: f64,
+) -> bool {
     if !(birth > 0.0) || !(death > birth) {
         return false;
     }
@@ -761,8 +770,8 @@ pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
 /// `selection_bits(g_dict, k_active)` bits — and (2) transmitting each firing's
 /// `coord_dim` latent coordinates. A unit-variance coordinate coded to the
 /// achieved RELATIVE distortion `1 − ev` costs `scalar_rate_bits(1, 1 − ev)`
-/// bits — the numerically-kind reverse-water-filling rate `½·log₂(1 + 1/(1−ev))`
-/// (≈ `½·log₂(1/(1−ev))` once `ev` is high) at the fit's operating EV: a higher
+/// bits — the Gaussian rate-distortion law `½·log₂(1/(1−ev))` at the fit's
+/// operating EV: a higher
 /// EV means a finer distortion floor and therefore MORE code bits, the honest
 /// rate–distortion trade the matched-EV comparison hides. The decoder is stored
 /// once, `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
@@ -785,9 +794,7 @@ pub struct ManifoldFitDl {
     pub g_dict: i64,
     /// Decoder scalar count `n_params = Σ_k M_k·p` charged at `l_param_bits`.
     pub n_params: i64,
-    /// Per-coordinate code rate `½·log₂(1 + 1/(1 − ev))` (bits): the numerically-
-    /// kind rate to code one unit-variance coordinate to the achieved floor
-    /// (`≈ ½·log₂(1/(1 − ev))` once `ev` is high).
+    /// Per-coordinate code rate `½·log₂(1/(1 − ev))` (bits), floored at zero.
     pub coordinate_rate_bits: f64,
     /// Bits per stored dictionary scalar (`l_param_bits`); defaults to the
     /// distortion-matched precision `coordinate_rate_bits`.
