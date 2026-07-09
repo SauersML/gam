@@ -543,9 +543,9 @@ fn route_block_minibatch_dispatch(
     k: usize,
     block_tile: usize,
 ) -> Result<Vec<Vec<(u32, f32)>>, String> {
-    let mode = gam_gpu::gpu_mode();
     #[cfg(target_os = "linux")]
     {
+        let mode = gam_gpu::gpu_mode();
         if mode != gam_gpu::GpuMode::Off && gam_gpu::GpuRuntime::global().is_some() {
             // Under `Auto`, only hand a minibatch to the device when the score
             // work clears the launch break-even; below it we take the exact CPU
@@ -567,7 +567,6 @@ fn route_block_minibatch_dispatch(
             }
         }
     }
-    let _ = mode;
     Ok(route_block_minibatch(mb, decoder, n_blocks, b, k, block_tile))
 }
 
