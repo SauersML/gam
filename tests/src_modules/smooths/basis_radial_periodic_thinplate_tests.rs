@@ -5502,14 +5502,37 @@ fn test_duchon_polyharmonic_log_branch_sign_depends_on_dimension() {
 }
 
 #[test]
-fn test_pure_duchon_rejects_undefined_gradient_collocation() {
+fn test_pure_duchon_auto_raises_order_for_undefined_gradient_collocation() {
+    // CURRENT CONTRACT (#1817): a low-order/low-power config whose gradient
+    // collocation would be undefined at the origin is AUTO-REPAIRED — the
+    // null-space order p is raised (leaving the spectral power s and the CPD
+    // condition untouched) until the pointwise/collocation margin
+    // `2(p+s) > d + max_op` holds, rather than hard-erroring. This supersedes
+    // the pre-#1817 strict-reject policy this test used to pin.
+    //
+    // d=3, requested Zero (p=1), s=1, D2 operators (max_op=2): unraised
+    // `2(p+s)=2(1+1)=4 <= d+1=4`, so the D1 gradient collocation was undefined.
+    // The margin auto-raise lifts Zero -> Linear (p=2), giving `2(p+s)=6`, which
+    // clears both the D1 (`>d+1=4`) and D2 (`>d+2=5`) collocation floors.
+    assert_eq!(
+        duchon_order_for_operator_margin(3, 1.0, DuchonNullspaceOrder::Zero, 2),
+        DuchonNullspaceOrder::Linear,
+        "d=3, Zero(p=1), s=1, max_op=2 must auto-raise to Linear so 2(p+s)=6 > d+2"
+    );
+    // The eight unit-cube corners span the raised affine null space
+    // `{1, x, y, z}` (rank 4) and leave 8-4=4 constrained radial degrees of
+    // freedom, so the collocation operators build on a non-degenerate basis.
     let centers = array![
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0]
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0]
     ];
-    let err = match build_duchon_collocation_operator_matrices(
+    let ops = build_duchon_collocation_operator_matrices(
         centers.view(),
         None,
         None,
@@ -5518,24 +5541,40 @@ fn test_pure_duchon_rejects_undefined_gradient_collocation() {
         None,
         None,
         2,
-    ) {
-        Ok(_) => panic!("d=3, p=1, s=1 has no well-defined collision gradient"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("D1 collocation"),
-        "unexpected error: {err}"
-    );
+    )
+    .expect("gradient/Laplacian collocation must build after the #1817 order auto-raise");
+    for m in [&ops.d0, &ops.d1, &ops.d2] {
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "auto-raised collocation operator matrices must be finite"
+        );
+    }
 }
 
 #[test]
-fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
-    // Four 2D centers leave one constrained radial degree of freedom
-    // after the linear nullspace (1, x, y), so this isolates the D2
-    // collocation regularity check instead of auto-degrading to the
-    // constants-only nullspace.
-    let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-    let err = match build_duchon_collocation_operator_matrices(
+fn test_pure_duchon_auto_raises_order_for_divergent_laplacian_collocation() {
+    // CURRENT CONTRACT (#1817): the 2-D thin-plate config whose collision
+    // Laplacian used to diverge (D2 collocation of `r^2 log r`) is auto-repaired
+    // by raising the null-space order rather than rejected.
+    //
+    // d=2, requested Linear (p=2), s=0, D2 operators (max_op=2): unraised
+    // `2(p+s)=2(2+0)=4 <= d+2=4`, so the D2 Laplacian collocation was divergent.
+    // The margin auto-raise lifts Linear -> Degree(2) (p=3), giving `2(p+s)=6`,
+    // which clears the strict D2 floor `>d+2=4`.
+    assert_eq!(
+        duchon_order_for_operator_margin(2, 0.0, DuchonNullspaceOrder::Linear, 2),
+        DuchonNullspaceOrder::Degree(2),
+        "d=2, Linear(p=2), s=0, max_op=2 must auto-raise to Degree(2) so 2(p+s)=6 > d+2"
+    );
+    // The raised quadratic null space `{1, x, y, x^2, xy, y^2}` has 6 columns, so
+    // the centers must span it: a 3x3 grid (9 points) has full rank-6 polynomial
+    // block, so the collocation operators build at the auto-raised order.
+    let mut centers = Array2::<f64>::zeros((9, 2));
+    for (idx, (i, j)) in (0..3).flat_map(|i| (0..3).map(move |j| (i, j))).enumerate() {
+        centers[[idx, 0]] = i as f64;
+        centers[[idx, 1]] = j as f64;
+    }
+    let ops = build_duchon_collocation_operator_matrices(
         centers.view(),
         None,
         None,
@@ -5544,14 +5583,14 @@ fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
         None,
         None,
         2,
-    ) {
-        Ok(_) => panic!("2D thin-plate Duchon collocation has no finite collision Laplacian"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("D2 collocation"),
-        "unexpected error: {err}"
-    );
+    )
+    .expect("Laplacian collocation must build after the #1817 order auto-raise");
+    for m in [&ops.d0, &ops.d1, &ops.d2] {
+        assert!(
+            m.iter().all(|v| v.is_finite()),
+            "auto-raised collocation operator matrices must be finite"
+        );
+    }
 }
 
 #[test]
