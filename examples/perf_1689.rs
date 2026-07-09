@@ -159,9 +159,16 @@ fn profile_case(
     // Isolated basis-construction cost at full n (post-fit, so the resolved
     // basis width/knots match the fitted model exactly).
     let t_bb = Instant::now();
-    let _train_design = build_term_collection_design(train.view(), &fit.resolvedspec)
+    let train_design = build_term_collection_design(train.view(), &fit.resolvedspec)
         .expect("rebuild training design");
     let basis_build_s = t_bb.elapsed().as_secs_f64();
+    // The timing above is only meaningful if the rebuilt design is the SAME
+    // design the fit solved: pin its width to the fitted coefficient length.
+    assert_eq!(
+        train_design.design.ncols(),
+        fit.fit.beta.len(),
+        "rebuilt training design width diverged from the fitted beta length"
+    );
 
     let t1 = Instant::now();
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
