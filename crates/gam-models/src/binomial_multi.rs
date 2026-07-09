@@ -151,18 +151,27 @@ impl BinomialMultiLikelihood {
 
 impl VectorLikelihood for BinomialMultiLikelihood {
     /// `Σ_n Σ_a w_n [ y_{n,a} log μ_{n,a} + (1 − y_{n,a}) log(1 − μ_{n,a}) ]`,
-    /// clamping `μ` to `[1e-12, 1 − 1e-12]` so the closed-form expression stays
-    /// finite when β drives a row deeply into saturation during a tentative
-    /// Newton step (the surrounding line search rejects such steps).
+    /// evaluated in log-space via `log μ = −softplus(−η)`,
+    /// `log(1 − μ) = −softplus(η)` — exact and finite for every η, with no
+    /// probability clamp. The former `μ.clamp(1e-12, 1−1e-12)` made this value
+    /// FLAT beyond |η| ≈ 27.6 while [`Self::grad_eta`]/[`Self::hess_diag`]
+    /// kept reporting the unclamped derivatives, so the line search scored a
+    /// surface the Newton direction was not the derivative of: on a
+    /// misclassified saturated row the gradient pushed full-strength while
+    /// the objective registered no improvement. The softplus form keeps the
+    /// true slope (≈ |η| per unit) at any saturation, so value, gradient, and
+    /// curvature are exact surfaces of ONE function.
     fn log_lik(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> f64 {
         let (n, k) = eta.dim();
         let mut acc = 0.0_f64;
         for row in 0..n {
             let w = self.row_weight(row);
             for a in 0..k {
-                let mu = sigmoid_stable(eta[[row, a]]).clamp(1.0e-12, 1.0 - 1.0e-12);
+                let e = eta[[row, a]];
                 let yv = y[[row, a]];
-                acc += w * (yv * mu.ln() + (1.0 - yv) * (1.0 - mu).ln());
+                acc -= w
+                    * (yv * gam_linalg::utils::stable_softplus(-e)
+                        + (1.0 - yv) * gam_linalg::utils::stable_softplus(e));
             }
         }
         acc
