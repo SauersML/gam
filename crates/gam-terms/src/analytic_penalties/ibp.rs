@@ -384,6 +384,10 @@ impl IBPAssignmentPenalty {
             // exactly (one operator, one derivative).
             let (_d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
             for k in 0..self.k_max {
+                // #Bug4: fixed/inert column ⇒ zero α-derivative channel.
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 // Gated by the same `𝟙[s'_k>0]` clamp subgradient: where the
                 // rank-one is clamped off, its α-derivative is 0.
                 cross_row_d_logalpha[k] = if majorize && score_derivative[k] <= 0.0 {
@@ -523,6 +527,11 @@ impl IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
+            // #Bug4: fixed/inert column ⇒ zero ρ-derivative scalars (this masks
+            // both `hessian_diag_log_alpha_derivative` and `cross_row_d_logalpha`).
+            if self.column_is_fixed(k) {
+                continue;
+            }
             let a = a_col[k];
             let da = da_col[k];
             let denom = (n_f + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
