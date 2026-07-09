@@ -103,11 +103,15 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                         .map(|(&eta_i, &se)| strategy.posterior_mean(&quadctx, eta_i, se))
                         .collect::<Result<Vec<_>, _>>()?,
                 );
+                // Response-scale delta-method SE: SE(μ) = |dμ/dη|·SE(η). The
+                // η-scale SE alone lives on the link scale and must never be
+                // reported as a probability-scale SE.
+                let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&eta)?;
                 Ok(LinearState {
                     eta,
                     mean,
                     eta_se: Some(eta_se),
-                    mean_se: None,
+                    mean_se: Some(mean_se),
                     covariance_corrected_used: false,
                 })
             }

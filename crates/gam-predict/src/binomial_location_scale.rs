@@ -426,8 +426,8 @@ impl BinomialLocationScalePredictor {
         Ok(LinearState {
             eta,
             mean,
-            eta_se: Some(eta_se),
-            mean_se: None,
+            eta_se: Some(eta_se.clone()),
+            mean_se: Some(eta_se),
             covariance_corrected_used: false,
         })
     }

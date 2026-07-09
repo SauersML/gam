@@ -213,11 +213,16 @@ impl StandardPredictor {
                 }
             })
             .collect::<Result<Array1<f64>, _>>()?;
+        // Response-scale delta-method SE at the plug-in η: SE(μ) = |dμ/dη|·SE(η).
+        // The η-scale SE alone is on the link scale and must not stand in for a
+        // response-scale SE across the nonlinear inverse link.
+        let (_, dmu_deta) = inverse_link_mean_and_d1(&strategy, plugin.eta.view())?;
+        let mean_se = delta_method_mean_se_from_d1(&dmu_deta, &eta_se);
         Ok(LinearState {
             eta: plugin.eta,
             mean,
             eta_se: Some(eta_se),
-            mean_se: None,
+            mean_se: Some(mean_se),
             // Posterior-mean integration always uses the conditional posterior.
             covariance_corrected_used: false,
         })

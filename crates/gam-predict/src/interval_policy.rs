@@ -723,11 +723,32 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
         InferenceCovarianceMode::Conditional,
     )?;
     let policy = transform.response_jacobian_rows(PredictPass::PosteriorMean);
+    let has_covariance = state.eta_se.is_some();
     let cond_eta_se = state
         .eta_se
         .clone()
         .unwrap_or_else(|| Array1::zeros(state.eta.len()));
-    let cond_mean_se = state.mean_se.clone().unwrap_or_else(|| cond_eta_se.clone());
+    // The response-scale SE must come from the transform itself: copying the
+    // η-scale SE across a nonlinear inverse link omits the link Jacobian and is
+    // dimensionally wrong (a logistic fit at η = 10 with SE(η) = 1 has response
+    // SE ≈ 4.5e-5, not 1). Only the identity link may reuse SE(η) — there the
+    // response IS the linear predictor. Every other transform must supply a
+    // genuine delta-method `mean_se`; a missing one is a producer bug, not a
+    // fallback opportunity. The no-covariance degrade (η SE also absent) keeps
+    // its zero-SE point-only behaviour.
+    let cond_mean_se = match (state.mean_se.clone(), &policy) {
+        (Some(se), _) => se,
+        (None, ResponseInterval::IdentityEta) => cond_eta_se.clone(),
+        (None, _) if !has_covariance => cond_eta_se.clone(),
+        (None, _) => {
+            return Err(EstimationError::InvalidInput(
+                "posterior-mean prediction: transform supplied an η-scale SE but no \
+                 response-scale SE; a non-identity response interval requires the \
+                 delta-method mean SE"
+                    .to_string(),
+            ));
+        }
+    };
     let mut result = PredictPosteriorMeanResult {
         eta: state.eta,
         eta_standard_error: cond_eta_se.clone(),
