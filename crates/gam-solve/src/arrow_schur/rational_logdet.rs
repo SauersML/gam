@@ -52,7 +52,7 @@
 //! `S` is never formed.
 
 use super::prelude::*;
-use gam_linalg::utils::splitmix64;
+use gam_linalg::utils::{splitmix64, splitmix64_hash};
 
 /// Top-subspace (Hutch++) deflation configuration for the surrogate. When a plan
 /// carries one, [`RationalLogdetPlan::evaluate`] peels an `r`-dimensional
@@ -158,15 +158,31 @@ impl RationalLogdetPlan {
         {
             return None;
         }
+        // ONE sequential master stream for ALL probes. The former per-probe
+        // initial state `(seed + p)·γ` (γ = the splitmix64 increment) made
+        // probe `p` of seed `s` BIT-IDENTICAL to probe `p+1` of seed `s−1`
+        // (a splitmix stream from x₀ emits the words at x₀+γ, x₀+2γ, …, so
+        // any two starts differing by a multiple of γ are the same stream
+        // shifted), and within one plan made probe `p+1`'s word stream probe
+        // `p`'s shifted by one word — a sliding window sharing sign words
+        // between consecutive probes. Each probe was still individually
+        // uniform Rademacher (Hutchinson stays unbiased), but the probes were
+        // NOT jointly independent: the std_err bookkeeping and any
+        // seed-averaged inference (the wide-κ multiseed discriminator, whose
+        // 96 seeds at unit spacing drew ~128 distinct probe vectors instead
+        // of 3072 and reported a common Hutchinson fluctuation as a "5.57σ
+        // deterministic bias") were invalidated. Sequential consumption from
+        // one hashed master state has no window structure and no cross-seed
+        // stream aliasing; determinism per seed (the CRN contract) is kept.
+        let mut master = splitmix64_hash(seed);
         let mut probes = Vec::with_capacity(num_probes);
-        for p in 0..num_probes {
+        for _ in 0..num_probes {
             let mut v = Array1::<f64>::zeros(dim);
-            let mut state = seed.wrapping_add(p as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut bits: u64 = 0;
             let mut remaining: u32 = 0;
             for value in v.iter_mut() {
                 if remaining == 0 {
-                    bits = splitmix64(&mut state);
+                    bits = splitmix64(&mut master);
                     remaining = 64;
                 }
                 *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
@@ -542,17 +558,23 @@ fn build_deflation_basis(
     if r == 0 {
         return Vec::new();
     }
+    // One sequential master stream for the whole start block — same
+    // decorrelation as the probe generation in `RationalLogdetPlan::build`:
+    // the former per-column start `seed + col·γ + const` (γ = the splitmix64
+    // increment) made column c+1's word stream column c's shifted by one
+    // word (sliding-window sharing). Harmless to the EXACTNESS of the
+    // deflated split (any orthonormal Q is valid), but a correlated start
+    // block weakens the subspace iteration's coverage of the top eigenspace
+    // for no reason. Determinism per seed is kept.
+    let mut master = splitmix64_hash(seed.wrapping_add(0xD1B5_4A32_D192_ED03));
     let mut cols: Vec<Array1<f64>> = (0..r)
-        .map(|col| {
+        .map(|_| {
             let mut v = Array1::<f64>::zeros(dim);
-            let mut state = seed
-                .wrapping_add((col as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                .wrapping_add(0xD1B5_4A32_D192_ED03);
             let mut bits: u64 = 0;
             let mut remaining: u32 = 0;
             for value in v.iter_mut() {
                 if remaining == 0 {
-                    bits = splitmix64(&mut state);
+                    bits = splitmix64(&mut master);
                     remaining = 64;
                 }
                 *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
