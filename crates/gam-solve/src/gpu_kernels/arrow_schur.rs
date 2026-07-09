@@ -492,6 +492,79 @@ impl ResidentArrowFrameHandle {
     }
 }
 
+/// #1017: a BASE-block-resident Arrow-Schur frame for the LM ridge ladder.
+///
+/// Unlike [`ResidentArrowFrameHandle`] — which BAKES one ridge into its factors
+/// and then serves cheap re-solves for a NEW GRADIENT at that SAME ridge — this
+/// frame holds the ridge-INDEPENDENT base blocks (`D = H_tt`, `B = H_tβ`, border
+/// `H_ββ`, gradient) resident and RE-FACTORS on-device at each requested
+/// `(ridge_t, ridge_beta)`. That is the regime `solve_with_lm_escalation_inner`
+/// actually runs: its trials re-solve the SAME system (same gradient) at
+/// ESCALATING ridges, so the factor changes every trial but the base blocks do
+/// not. The base blocks upload ONCE; each trial pays only a device-to-device
+/// copy of the base blocks into scratch, an on-device diagonal ridge add, and the
+/// factor/solve — in place of the full `O(n·d·k)` host→device re-upload that
+/// [`solve_arrow_newton_step`] performs every trial. The per-trial numerics are
+/// bit-identical to that re-upload path (same POTRF/TRSM/Schur/back-sub order).
+pub struct ResidentBaseArrowFrameHandle {
+    #[cfg(target_os = "linux")]
+    inner: cuda::ResidentBaseArrowFrame,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl ResidentBaseArrowFrameHandle {
+    /// Upload the ridge-independent base blocks once. No factorization runs here;
+    /// each [`Self::refactor_and_solve`] performs the ridge-dependent factor+solve.
+    /// The dense device path requires materialised blocks, so a matrix-free
+    /// `H_ββ` / `H_tβ` operator is rejected (same admission as
+    /// [`solve_arrow_newton_step`]).
+    pub fn new(sys: &ArrowSchurSystem) -> Result<Self, ArrowSchurGpuFailure> {
+        if sys.hbb_matvec.is_some() || sys.htbeta_matvec.is_some() {
+            return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+                had_hbb_matvec: sys.hbb_matvec.is_some(),
+                had_htbeta_matvec: sys.htbeta_matvec.is_some(),
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                inner: cuda::ResidentBaseArrowFrame::new(sys)?,
+            })
+        }
+    }
+
+    /// Factor the resident base blocks at `(ridge_t, ridge_beta)` and solve
+    /// `(H + ridge)·δ = −gradient`. Only the two ridge scalars and the tiny
+    /// re-diagonalised `D` cross to the device; only `δ` crosses back. A non-PD
+    /// per-row block surfaces as [`ArrowSchurGpuFailure::RidgeBumpRequired`] so
+    /// the LM escalation bumps and retries at the larger ridge exactly as the
+    /// re-upload path does.
+    pub fn refactor_and_solve(
+        &self,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            if ridge_t.is_nan() || ridge_beta.is_nan() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "ridge is NaN".to_string(),
+                });
+            }
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.refactor_and_solve(ridge_t, ridge_beta)
+        }
+    }
+}
+
 /// Build a GPU-backed Schur matvec closure for CPU-driven PCG at K ≥ 5000.
 ///
 /// Runs the fused NVRTC forward kernel once on the dense per-row `H_tβ` slabs
@@ -3439,6 +3512,255 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         }
     }
 
+    /// #1017 base-resident frame for the LM ridge ladder: holds the ridge-
+    /// INDEPENDENT base blocks resident and re-factors at each requested ridge.
+    /// This is the residency counterpart to [`ResidentArrowFrame`], which bakes
+    /// the ridge into its factors (wrong invariant for the ladder, whose trials
+    /// vary the ridge while the gradient stays fixed).
+    pub(super) struct ResidentBaseArrowFrame {
+        n: usize,
+        d: usize,
+        k: usize,
+        stream: Arc<CudaStream>,
+        solver: DnHandle,
+        blas: CudaBlas,
+        /// `D = H_tt` at ridge 0, host-side (`n` stacked column-major `d×d`
+        /// tiles). Per trial a copy gets `ridge_t` added to every tile diagonal
+        /// and is uploaded (the `O(n·d·d)` re-diagonalised `D` is tiny relative to
+        /// the resident `B`); the same copy feeds the `RidgeBumpRequired`
+        /// Gershgorin bound on a non-PD pivot.
+        d_base_host: Vec<f64>,
+        /// `B = H_tβ` resident (`n` stacked column-major `d×k` tiles). Ridge-free;
+        /// this is the bulk of the per-trial transfer the residency eliminates.
+        base_b_dev: CudaSlice<f64>,
+        /// Border `H_ββ` resident (column-major `k×k`). Ridge-free; `ridge_beta`
+        /// is added to a per-trial device copy's diagonal.
+        base_hbb_dev: CudaSlice<f64>,
+        /// Row gradient `g_t` resident (`n·d`). Ridge-free.
+        g_t_dev: CudaSlice<f64>,
+        /// Border gradient `g_β` host-side (`k`); the tiny `−g_β` RHS is rebuilt
+        /// per trial.
+        gb_host: Vec<f64>,
+        /// Resident all-ones vector (length `k`) whose strided daxpy adds
+        /// `ridge_beta` to the `k×k` Schur base diagonal on-device.
+        ones_k_dev: CudaSlice<f64>,
+    }
+
+    impl ResidentBaseArrowFrame {
+        /// Upload the ridge-independent base blocks once. No POTRF runs here.
+        pub(super) fn new(sys: &ArrowSchurSystem) -> Result<Self, ArrowSchurGpuFailure> {
+            let n = sys.rows.len();
+            let d = sys.d;
+            let k = sys.k;
+            let runtime = route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n })
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let stream = gam_gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
+                .and_then(|ctx| ctx.new_stream().ok())
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let solver =
+                DnHandle::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let blas =
+                CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            // Base blocks at ridge 0 (ridge-independent); g_t stacked (n·d).
+            let (d_base_host, b_host, g_host) = pack_host(sys, 0.0);
+            let base_b_dev = stream
+                .clone_htod(&b_host)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let g_t_dev = stream
+                .clone_htod(&g_host)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            // Border H_ββ, column-major, NO ridge (ridge_beta added per trial).
+            let hbb_base: Vec<f64> = {
+                let mut tmp = Vec::with_capacity(k * k);
+                for col in 0..k {
+                    for row in 0..k {
+                        tmp.push(sys.hbb[[row, col]]);
+                    }
+                }
+                tmp
+            };
+            let base_hbb_dev = stream
+                .clone_htod(&hbb_base)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            let gb_host: Vec<f64> = sys.gb.iter().copied().collect();
+            let ones_k_dev = stream
+                .clone_htod(&vec![1.0_f64; k])
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            Ok(Self {
+                n,
+                d,
+                k,
+                stream,
+                solver,
+                blas,
+                d_base_host,
+                base_b_dev,
+                base_hbb_dev,
+                g_t_dev,
+                gb_host,
+                ones_k_dev,
+            })
+        }
+
+        /// Factor the resident base blocks at `(ridge_t, ridge_beta)` and solve.
+        /// Mirrors the full [`solve`] sequence, but sources `D`/`B`/`H_ββ`/`g`
+        /// from the resident buffers (device-to-device copy into scratch) instead
+        /// of re-uploading them, so it is bit-identical to [`solve`] at the same
+        /// ridge while moving only the ridge scalars + re-diagonalised `D`.
+        pub(super) fn refactor_and_solve(
+            &self,
+            ridge_t: f64,
+            ridge_beta: f64,
+        ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+            if ridge_t.is_nan() || ridge_beta.is_nan() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: "ridge is NaN".to_string(),
+                });
+            }
+            let (n, d, k) = (self.n, self.d, self.k);
+
+            // ----- D + ridge_t·I: add on a host copy (tiny) and upload as work L.
+            // Tile i is column-major d×d, so its diagonal entries are at
+            // i·d·d + j·(d+1) — matching pack_block's `value += ridge_t` on r==col.
+            let mut d_ridged = self.d_base_host.clone();
+            for i in 0..n {
+                for j in 0..d {
+                    d_ridged[i * d * d + j * (d + 1)] += ridge_t;
+                }
+            }
+            let mut l_dev = self
+                .stream
+                .clone_htod(&d_ridged)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            // POTRF(D) → L_i. A non-PD pivot is the LM escalation's signal.
+            let info_host = potrf_batched(&self.solver, &self.stream, d, n, &mut l_dev)?;
+            if let Some(idx) = info_host.iter().position(|info| *info != 0) {
+                let base = idx * d * d;
+                return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                    row: idx,
+                    // The tile already carries ridge_t on its diagonal, so the
+                    // Gershgorin bound is taken at ridge 0 (see
+                    // `ridge_bump_to_make_pd_colmajor`).
+                    bump: super::ridge_bump_to_make_pd_colmajor(&d_ridged[base..base + d * d], d),
+                });
+            }
+
+            // ----- Y_i = L_i^{-1} B_i on a device copy of the resident base B.
+            let mut y_dev = self
+                .stream
+                .alloc_zeros::<f64>(n * d * k)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            self.stream
+                .memcpy_dtod(&self.base_b_dev, &mut y_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            trsm_batched_lower_inplace(&self.blas, &self.stream, d, n, k, &l_dev, &mut y_dev)?;
+
+            // ----- u_i = L_i^{-1} g_i on a device copy of the resident base g_t.
+            let mut u_dev = self
+                .stream
+                .alloc_zeros::<f64>(n * d)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            self.stream
+                .memcpy_dtod(&self.g_t_dev, &mut u_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            trsm_batched_lower_inplace(&self.blas, &self.stream, d, n, 1, &l_dev, &mut u_dev)?;
+
+            // ----- Schur S = (H_ββ + ridge_β I) − Σ Y_iᵀ Y_i.
+            let mut schur_dev = self
+                .stream
+                .alloc_zeros::<f64>(k * k)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            self.stream
+                .memcpy_dtod(&self.base_hbb_dev, &mut schur_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            // schur diag += ridge_β (column-major k×k → stride k+1 over the ones).
+            device_axpy_strided(
+                &self.blas,
+                &self.stream,
+                k,
+                ridge_beta,
+                &self.ones_k_dev,
+                1,
+                &mut schur_dev,
+                k + 1,
+            )?;
+            let rhs_init: Vec<f64> = self.gb_host.iter().map(|v| -v).collect();
+            let mut rhs_dev = self
+                .stream
+                .clone_htod(&rhs_init)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            accumulate_schur(&self.blas, d, k, n, &y_dev, &u_dev, &mut schur_dev, &mut rhs_dev)?;
+
+            // ----- Factor S_β, solve δβ = L_S^{-T} L_S^{-1} rhs.
+            let info = potrf_single(&self.solver, &self.stream, k, &mut schur_dev)?;
+            if info != 0 {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("Schur Cholesky failed at pivot {info}"),
+                });
+            }
+            trsm_single(&self.blas, &self.stream, k, &schur_dev, &mut rhs_dev, false, false)?;
+            trsm_single(&self.blas, &self.stream, k, &schur_dev, &mut rhs_dev, false, true)?;
+            let delta_beta_host = self
+                .stream
+                .clone_dtoh(&rhs_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let delta_beta = Array1::from_vec(delta_beta_host);
+
+            // ----- Back-sub δt_i = −L_i^{-T}(u_i + Y_i δβ).
+            accumulate_back_sub_rhs(&self.blas, d, k, n, &y_dev, &rhs_dev, &mut u_dev)?;
+            trsm_batched_lower_inplace_transposed(
+                &self.blas,
+                &self.stream,
+                d,
+                n,
+                1,
+                &l_dev,
+                &mut u_dev,
+            )?;
+            let x_host = self
+                .stream
+                .clone_dtoh(&u_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut delta_t = Array1::<f64>::zeros(n * d);
+            for (i, v) in x_host.iter().enumerate() {
+                delta_t[i] = -*v;
+            }
+
+            // ----- log|H| = 2 Σ log L_{i,jj} + 2 Σ log L_{S,aa}.
+            let l_local_host = self
+                .stream
+                .clone_dtoh(&l_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let l_schur_host = self
+                .stream
+                .clone_dtoh(&schur_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut log_det = 0.0_f64;
+            for i in 0..n {
+                let base = i * d * d;
+                for j in 0..d {
+                    log_det += l_local_host[base + j * d + j].ln();
+                }
+            }
+            for j in 0..k {
+                log_det += l_schur_host[j * k + j].ln();
+            }
+            log_det *= 2.0;
+
+            Ok(ArrowSchurGpuSolution {
+                delta_t,
+                delta_beta,
+                log_det_hessian: log_det,
+            })
+        }
+    }
+
     pub(super) fn solve_fused(
         sys: &ArrowSchurSystem,
         ridge_t: f64,
@@ -4878,6 +5200,45 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 1,
                 y_ptr as *mut f64,
                 1,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(ArrowSchurGpuFailure::Unavailable)
+        }
+    }
+
+    /// As [`device_axpy`] but with explicit strides, so a unit-stride source
+    /// (e.g. an all-ones vector) can target a matrix diagonal with `incy = dim+1`.
+    /// Used by [`ResidentBaseArrowFrame`] to add `ridge_beta` to the resident
+    /// `k×k` Schur base on-device without re-uploading the border block.
+    fn device_axpy_strided(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        n: usize,
+        alpha: f64,
+        x: &CudaSlice<f64>,
+        incx: usize,
+        y: &mut CudaSlice<f64>,
+        incy: usize,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let n_i = to_i32(n).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let incx_i = to_i32(incx).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let incy_i = to_i32(incy).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let (x_ptr, _x_rec) = x.device_ptr(stream);
+        let (y_ptr, _y_rec) = y.device_ptr_mut(stream);
+        // SAFETY: x spans ≥ 1+(n−1)·incx entries and y spans ≥ 1+(n−1)·incy
+        // entries, both live on this stream; cuBLAS only reads alpha by pointer.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDaxpy_v2(
+                *blas.handle(),
+                n_i,
+                &alpha,
+                x_ptr as *const f64,
+                incx_i,
+                y_ptr as *mut f64,
+                incy_i,
             )
         };
         if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
