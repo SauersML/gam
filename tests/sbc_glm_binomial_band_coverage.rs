@@ -153,8 +153,9 @@ fn response_band(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>) {
         boundary_correction: false,
         ..PredictUncertaintyOptions::default()
     };
-    let result = predict_gamwith_uncertainty(design, beta, offset.view(), family, &standard.fit, &options)
-        .expect("binomial uncertainty prediction");
+    let result =
+        predict_gamwith_uncertainty(design, beta, offset.view(), family, &standard.fit, &options)
+            .expect("binomial uncertainty prediction");
     (result.mean_lower, result.mean_upper)
 }
 
