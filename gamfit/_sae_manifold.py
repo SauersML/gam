@@ -733,9 +733,10 @@ class ManifoldSAE:
     pre_topk: dict[str, Any] | None = None
     jumprelu_threshold: float = 0.0
     solver_plan: dict[str, Any] | None = None
-    # #2235 -- how the outer rho search ENDED: {"verdict": "engine_stopped" |
-    # "incumbent_stationary" | "budget_exhausted", "evals", "evals_since_improvement",
-    # "wall_seconds"}. None on payloads predating the termination ledger.
+    # #2235 -- outer-search accounting for the converged fit: {"evals",
+    # "evals_since_improvement", "wall_seconds"}. Non-convergence RAISES (the
+    # forcing-function contract) -- a fit object always came from a converged
+    # optimization. None on payloads predating the ledger.
     termination: dict[str, Any] | None = None
     # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
     # covariance (Cov(beta_k) = phi * S_beta^{-1}[block]).

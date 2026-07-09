@@ -4443,11 +4443,11 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reconstruction_r2", reconstruction_r2)?;
-    // #2235 — how the outer ρ search ended: a verdict, never a hang. The
-    // driver-facing contract for budget honesty and stationarity accounting.
+    // #2235 — outer-search accounting for the CONVERGED fit (the only kind
+    // that exists: non-convergence raises a typed error before a fit is
+    // minted — the forcing-function contract, see SPEC).
     {
         let termination = PyDict::new(py);
-        termination.set_item("verdict", outer_termination.verdict.as_str())?;
         termination.set_item("evals", outer_termination.evals)?;
         termination.set_item(
             "evals_since_improvement",

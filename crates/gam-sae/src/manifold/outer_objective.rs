@@ -196,42 +196,20 @@ pub struct AmortizedWarmStartTelemetry {
     pub total_rows_warm_started: usize,
 }
 
-/// #2235 — how the outer ρ search ENDED. Every fit terminates with exactly one
-/// verdict; "hang" is not in the type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaeOuterTerminationVerdict {
-    /// The outer bridge stopped through its own convergence/stopping logic
-    /// while the criterion was still live (never frozen): stationarity, EFS
-    /// fixed point, or its iteration cap.
-    EngineStopped,
-    /// The termination ledger froze the criterion after the incumbent went
-    /// unimproved for the full stationarity window — every subsequent probe
-    /// returned the banked incumbent value, so the bridge converged onto it.
-    IncumbentStationary,
-    /// The caller-supplied wall budget expired; the criterion froze and the
-    /// bridge converged onto the banked incumbent (deadline honesty).
-    BudgetExhausted,
-}
-
-impl SaeOuterTerminationVerdict {
-    /// Canonical wire name — the SINGLE source of truth every surface
-    /// (pyffi payload, CLI output, logs) must use. Never re-map in a binding.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::EngineStopped => "engine_stopped",
-            Self::IncumbentStationary => "incumbent_stationary",
-            Self::BudgetExhausted => "budget_exhausted",
-        }
-    }
-}
-
 /// #2235 — outer termination ledger: one per fit, ticked by every criterion
-/// evaluation lane. When a verdict fires the ledger FREEZES the criterion:
-/// every later evaluation returns the best (incumbent) cost with a zero
-/// gradient, so the generic outer bridge — BFGS line search, ARC, or the EFS
-/// fixed point — sees a flat, feasible surface and halts through its own
-/// convergence logic onto the state the incumbent banking already holds. No
-/// engine surgery, no new stopping API: the objective simply stops moving.
+/// evaluation lane. PURE ACCOUNTING plus one FORCING FUNCTION:
+///
+/// * A fit object exists ONLY when the outer bridge concludes through its own
+///   convergence/stopping logic. There is no freeze, no deadline-return, no
+///   "best-effort fit" lane — an incomplete optimization must never mint a
+///   consumable fit (that would remove all pressure to fix the solver; the
+///   user's moral-hazard rule).
+/// * If the incumbent goes materially unimproved for a full stationarity
+///   window while the bridge KEEPS probing, that is a SOLVER DEFECT — the
+///   ledger raises a typed, non-recoverable error carrying the evidence
+///   (eval counts, window, best cost). The fit dies loudly; the defect gets
+///   fixed at the root. Wall-clock survival is the checkpoint/resume lane's
+///   job (persistent_warm_start), never a criterion freeze.
 #[derive(Debug, Clone)]
 pub(crate) struct OuterTerminationLedger {
     /// Total criterion evaluations across all lanes.
@@ -242,21 +220,15 @@ pub(crate) struct OuterTerminationLedger {
     best_cost: Option<f64>,
     /// Fit wall-clock start.
     wall_start: std::time::Instant,
-    /// Optional wall budget (deadline honesty). `None` ⇒ unbounded.
-    wall_budget: Option<std::time::Duration>,
-    /// Latched verdict once frozen; `None` while the criterion is live.
-    frozen: Option<SaeOuterTerminationVerdict>,
 }
 
 impl OuterTerminationLedger {
-    pub(crate) fn new(wall_budget: Option<std::time::Duration>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             evals: 0,
             last_improvement_eval: 0,
             best_cost: None,
             wall_start: std::time::Instant::now(),
-            wall_budget,
-            frozen: None,
         }
     }
 
@@ -290,64 +262,39 @@ impl OuterTerminationLedger {
         }
     }
 
-    /// Consult the ledger: `Some(frozen_cost)` once a verdict has fired (and
-    /// latch the verdict), `None` while the criterion is live. Freezing
-    /// requires a banked best cost — with nothing banked yet there is no
-    /// incumbent to converge onto, so the fit keeps running (the very first
-    /// evaluations can never freeze).
-    pub(crate) fn frozen_cost(&mut self) -> Option<f64> {
-        if let Some(_verdict) = self.frozen {
-            return self.best_cost;
-        }
+    /// Consult the ledger's FORCING FUNCTION: `Some(message)` when the
+    /// incumbent has gone materially unimproved for a full stationarity
+    /// window while the bridge kept probing — a solver defect the caller must
+    /// raise as a typed, NON-RECOVERABLE error (the fit must die loudly, not
+    /// mint a frozen "fit"). `None` while the walk is healthy. Requires a
+    /// banked best cost: the very first evaluations can never trip it.
+    pub(crate) fn stationarity_defect(&self) -> Option<String> {
         let best = self.best_cost?;
-        if let Some(budget) = self.wall_budget
-            && self.wall_start.elapsed() > budget
-        {
-            self.frozen = Some(SaeOuterTerminationVerdict::BudgetExhausted);
-            log::warn!(
-                "[#2235] outer wall budget exhausted after {} evals ({:.0?}); freezing the \
-                 criterion at the banked incumbent (cost {best:.6e}) — the bridge converges \
-                 onto it (deadline honesty)",
+        let stalled = self.evals.saturating_sub(self.last_improvement_eval);
+        if stalled >= Self::stationarity_window() {
+            return Some(format!(
+                "SOLVER DEFECT (#2235): the outer search made no material improvement for \
+                 {stalled} consecutive criterion evaluations (window {}, total evals {}, \
+                 best cost {best:.6e}, wall {:.1?}) and the bridge did not conclude on its \
+                 own. A healthy fit terminates through the bridge's convergence logic; this \
+                 one wandered. Refusing to mint a fit from a non-converging optimization — \
+                 fix the driver/bridge composition defect this error is evidence of",
+                Self::stationarity_window(),
                 self.evals,
                 self.wall_start.elapsed()
-            );
-            return Some(best);
-        }
-        if self.evals.saturating_sub(self.last_improvement_eval) >= Self::stationarity_window() {
-            self.frozen = Some(SaeOuterTerminationVerdict::IncumbentStationary);
-            // DEFECT ALARM, not a success path: with a continuous envelope
-            // criterion, a descendable objective, and paid refinement budgets,
-            // the bridge's OWN stationarity/stall logic must stop the fit
-            // first. Reaching this freeze means the solver wandered a full
-            // window without the bridge concluding — ship the incumbent
-            // honestly, but treat the verdict as a bug report against the
-            // driver/bridge composition (file it with the eval ledger).
-            log::warn!(
-                "[#2235] SOLVER DEFECT SIGNAL — outer incumbent stationary: no material \
-                 improvement for {} evaluations (window {}) and the bridge did not stop on \
-                 its own. Freezing the criterion at the banked incumbent (cost {best:.6e}); \
-                 a healthy fit ends EngineStopped — investigate why this one did not",
-                self.evals - self.last_improvement_eval,
-                Self::stationarity_window()
-            );
-            return Some(best);
+            ));
         }
         None
     }
 
     /// New multi-start seed: the stationarity window restarts (a fresh walk
-    /// deserves fresh evidence), the wall clock and eval totals do not (the
-    /// budget is fit-global).
+    /// deserves fresh evidence); the eval totals and wall clock are fit-global.
     pub(crate) fn reset_stationarity(&mut self) {
         self.last_improvement_eval = self.evals;
-        if self.frozen == Some(SaeOuterTerminationVerdict::IncumbentStationary) {
-            self.frozen = None;
-        }
     }
 
     pub(crate) fn report(&self) -> SaeOuterTermination {
         SaeOuterTermination {
-            verdict: self.frozen.unwrap_or(SaeOuterTerminationVerdict::EngineStopped),
             evals: self.evals,
             evals_since_improvement: self.evals.saturating_sub(self.last_improvement_eval),
             wall: self.wall_start.elapsed(),
@@ -355,10 +302,10 @@ impl OuterTerminationLedger {
     }
 }
 
-/// #2235 — the termination report carried out of the fit.
+/// #2235 — outer-search accounting carried out of a CONVERGED fit (the only
+/// kind that exists: a defect raises before a fit is minted).
 #[derive(Debug, Clone, Copy)]
 pub struct SaeOuterTermination {
-    pub verdict: SaeOuterTerminationVerdict,
     pub evals: u64,
     pub evals_since_improvement: u64,
     pub wall: std::time::Duration,
@@ -1048,10 +995,10 @@ impl SaeManifoldOuterObjective {
                 basin_bundle_max_members(term_k_atoms),
                 basin_bundle_dominance_window(),
             ),
-            // #2235 — no wall budget by default (unbounded); the FFI/driver can
-            // install one via `set_outer_wall_budget`. The incumbent-stationarity
-            // freeze is always armed.
-            termination: OuterTerminationLedger::new(None),
+            // #2235 — outer-search accounting + the non-convergence forcing
+            // function (stationarity defect raises a typed error; a fit object
+            // only ever exists from a converged optimization).
+            termination: OuterTerminationLedger::new(),
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all
@@ -1297,13 +1244,6 @@ impl SaeManifoldOuterObjective {
 
     /// `Err` if a host cancellation was requested (see [`Self::set_cancel_flag`]);
     /// a cheap relaxed load, no-op when no flag is installed.
-    /// #2235 — install a wall budget for deadline-honest termination: past it,
-    /// the criterion freezes at the banked incumbent and the outer bridge
-    /// converges onto it instead of grinding (or dying at) an external wall.
-    pub fn set_outer_wall_budget(&mut self, budget: std::time::Duration) {
-        self.termination = OuterTerminationLedger::new(Some(budget));
-    }
-
     fn check_cancelled(&self) -> Result<(), EstimationError> {
         if let Some(flag) = &self.cancel_flag {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1518,8 +1458,17 @@ impl SaeManifoldOuterObjective {
                      EV={terminal_ev:?} vs best-visited EV={incumbent_ev:.4} across the outer \
                      ρ search"
                 );
-                term.restore_mutable_state(&incumbent_state);
-                fit_incumbent_restored = true;
+                // `into_fitted` has no error channel; a differential restore only
+                // fails if the basis re-evaluation fails on the restored coords
+                // (not reachable for a state that produced a valid incumbent).
+                // Report success honestly rather than swallowing a rebuild error.
+                match term.restore_mutable_state(&incumbent_state) {
+                    Ok(()) => fit_incumbent_restored = true,
+                    Err(err) => log::warn!(
+                        "[#1026] fit-level incumbent restore failed to rebuild basis ({err}); \
+                         keeping terminal state"
+                    ),
+                }
             }
         }
         let mut loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
@@ -1693,9 +1642,7 @@ impl SaeManifoldOuterObjective {
         }
         let termination = termination_report;
         log::warn!(
-            "[#2235] outer termination: {:?} after {} evals ({} since last improvement, \
-             wall {:.1?})",
-            termination.verdict,
+            "[#2235] outer search concluded: {} evals ({} since last improvement, wall {:.1?})",
             termination.evals,
             termination.evals_since_improvement,
             termination.wall
@@ -2222,7 +2169,7 @@ impl SaeManifoldOuterObjective {
                 });
             match accepted_polish {
                 Ok(loss) => self.last_loss = Some(loss),
-                Err(_) => self.term.restore_mutable_state(&snapshot),
+                Err(_) => self.term.restore_mutable_state(&snapshot)?,
             }
         }
         // Arrival quality floor (#1117). "Arrived" is only a usable certificate
@@ -2402,7 +2349,11 @@ impl SaeManifoldOuterObjective {
             && cur_ev < arrival_floor
             && anchor_state_ev > cur_ev
         {
-            self.term.restore_mutable_state(&anchor_floor_state);
+            // The differential snapshot captured `homotopy_eta` at the η = 0
+            // anchor, so the restore already re-derives the base-topology basis at
+            // η = 0; the explicit `set_homotopy_eta(0.0)` below is now a redundant
+            // (harmless) reassertion kept for clarity.
+            self.term.restore_mutable_state(&anchor_floor_state)?;
             self.term.set_homotopy_eta(0.0).ok();
             self.last_loss = self.term.loss(self.target.view(), &rho).ok();
             // The certified anchor IS the delivered fit: mark arrival and clear any
@@ -3995,10 +3946,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // instead of the single hysteretic warm-start trajectory. Same value-probe
         // drive (`refine_progress_extension = false`) as the historical lane; the
         // envelope bypasses to it verbatim in the streaming / freeze regimes.
-        // #2235 — frozen criterion: once the termination ledger verdicts, every
-        // probe returns the banked incumbent value so the bridge halts onto it.
-        if let Some(frozen) = self.termination.frozen_cost() {
-            return Ok(frozen);
+        // #2235 forcing function — a stationarity defect kills the fit loudly;
+        // no frozen "fit" is ever minted from a non-converging walk.
+        if let Some(defect) = self.termination.stationarity_defect() {
+            return Err(EstimationError::RemlOptimizationFailed(defect));
         }
         match self.evaluate_envelope_value_probe(
             rho.view(),
@@ -4030,15 +3981,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
-        // #2235 — frozen criterion (see OuterTerminationLedger): flat value +
-        // zero gradient converges the bridge onto the banked incumbent.
-        if let Some(frozen) = self.termination.frozen_cost() {
-            return Ok(OuterEval {
-                cost: frozen,
-                gradient: Array1::zeros(rho.len()),
-                hessian: HessianResult::Unavailable,
-                inner_beta_hint: None,
-            });
+        // #2235 forcing function — see OuterTerminationLedger.
+        if let Some(defect) = self.termination.stationarity_defect() {
+            return Err(EstimationError::RemlOptimizationFailed(defect));
         }
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
@@ -4326,18 +4271,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // keep grinding. Idempotent for the gradient orders (they also delegate to
         // `eval`, which checks again); no-op when no cancel flag is installed.
         self.check_cancelled()?;
-        // #2235 — frozen criterion: the line-search probe lane must freeze too,
-        // or the bridge keeps probing a live surface the other lanes no longer
-        // report. Gradient orders delegate to `eval`, which freezes itself.
+        // #2235 forcing function — the probe lane raises too (gradient orders
+        // delegate to `eval`, which raises itself).
         if matches!(order, OuterEvalOrder::Value)
-            && let Some(frozen) = self.termination.frozen_cost()
+            && let Some(defect) = self.termination.stationarity_defect()
         {
-            return Ok(OuterEval {
-                cost: frozen,
-                gradient: Array1::zeros(rho.len()),
-                hessian: HessianResult::Unavailable,
-                inner_beta_hint: None,
-            });
+            return Err(EstimationError::RemlOptimizationFailed(defect));
         }
         match order {
             OuterEvalOrder::Value => {
@@ -4416,19 +4355,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2138 — the Fellner–Schall route is a primary outer descent path with its
         // own inner solve (bypassing `eval`/`eval_cost`), so cover it too.
         self.check_cancelled()?;
-        // #2235 — frozen criterion on the EFS lane: flat cost + zero steps IS
-        // the Fellner–Schall fixed point, so the EFS loop halts onto the
-        // banked incumbent.
-        if let Some(frozen) = self.termination.frozen_cost() {
-            return Ok(EfsEval {
-                cost: frozen,
-                steps: vec![0.0; rho.len()],
-                beta: None,
-                psi_gradient: None,
-                psi_indices: None,
-                inner_hessian_scale: None,
-                logdet_enclosure_gap: None,
-            });
+        // #2235 forcing function — the EFS lane raises too.
+        if let Some(defect) = self.termination.stationarity_defect() {
+            return Err(EstimationError::RemlOptimizationFailed(defect));
         }
         let eval = self
             .efs_step(rho.view())
