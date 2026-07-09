@@ -12,9 +12,10 @@ set -uo pipefail
 # Derive the repo root from this script's own location so build.sh is
 # portable (the shared local tree AND a cluster clone), not pinned to one path.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Optional machine-local build env (kept OUT of the repo): lets a cluster point
-# the linker at a system lib (e.g. MSI OpenBLAS) without baking a host-specific
-# path into the repo. No-op where absent (e.g. macOS/Homebrew finds BLAS itself).
+# Optional machine-local build env (kept OUT of the repo) for host-specific knobs
+# (CARGO_BUILD_JOBS, sccache, PATH). gam links NO external BLAS/LAPACK — faer
+# (pure-Rust) is the sole CPU linalg backend — so this must NOT inject an OpenBLAS
+# `-L` (that only ever sabotaged the link). No-op where the file is absent.
 [ -f "$HOME/.config/gam-build-env" ] && . "$HOME/.config/gam-build-env"
 S="$REPO/.buildd"; mkdir -p "$S"
 # Per-invocation log: concurrent build.sh calls must NOT share one file, or each
