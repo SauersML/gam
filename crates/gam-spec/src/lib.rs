@@ -314,29 +314,6 @@ impl LatentCLogLogState {
     }
 }
 
-/// Whether the inverse link exposes the Fisher-weight jet that the Firth
-/// penalty's higher-order correction consumes. Inlined here (issue #1521) so
-/// `LikelihoodSpec::supports_firth` has no upward dependency on
-/// `solver::mixture_link` — the match is over link variants all defined in this
-/// module, so the predicate is self-contained. The canonical jet evaluation
-/// still lives in `solver::mixture_link`; this is purely the classifier.
-#[inline]
-fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
-    matches!(
-        link,
-        InverseLink::Standard(
-            StandardLink::Logit
-                | StandardLink::Probit
-                | StandardLink::CLogLog
-                | StandardLink::LogLog
-                | StandardLink::Cauchit,
-        ) | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
-    )
-}
-
 /// Parameterized inverse-link selector used where mu/derivatives are evaluated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InverseLink {
@@ -381,6 +358,29 @@ impl InverseLink {
             Self::LatentCLogLog(state) => Some(state),
             _ => None,
         }
+    }
+
+    /// Whether this inverse link exposes the Fisher-weight jet consumed by
+    /// higher-order Firth/Jeffreys corrections.
+    ///
+    /// The numerical jet evaluation lives in `gam-solve`; the capability is a
+    /// property of the link vocabulary and therefore belongs here with the
+    /// variants it classifies.
+    #[inline]
+    pub const fn has_fisher_weight_jet(&self) -> bool {
+        matches!(
+            self,
+            Self::Standard(
+                StandardLink::Logit
+                    | StandardLink::Probit
+                    | StandardLink::CLogLog
+                    | StandardLink::LogLog
+                    | StandardLink::Cauchit,
+            ) | Self::LatentCLogLog(_)
+                | Self::Sas(_)
+                | Self::BetaLogistic(_)
+                | Self::Mixture(_)
+        )
     }
 }
 
@@ -1301,7 +1301,7 @@ impl FamilySpecKind {
     ///
     /// The authoritative, link-resolved gate is
     /// [`LikelihoodSpec::supports_firth`], which routes through
-    /// `inverse_link_has_fisher_weight_jet`. Keep this in agreement with that
+    /// [`InverseLink::has_fisher_weight_jet`]. Keep this in agreement with that
     /// predicate: a future binomial link without a Fisher-weight jet would make
     /// this approximation diverge and must be handled at both sites.
     #[inline]
@@ -1699,7 +1699,7 @@ impl LikelihoodSpec {
     #[inline]
     pub fn supports_firth(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
-            && inverse_link_has_fisher_weight_jet(&self.link)
+            && self.link.has_fisher_weight_jet()
     }
 
     /// Family-level fixed-dispersion contract. Returns the dispersion parameter

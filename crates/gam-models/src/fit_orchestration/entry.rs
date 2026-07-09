@@ -288,8 +288,8 @@ fn constant_gaussian_standard_fit(
     }
     let lambdas = Array1::<f64>::ones(design.penalties.len());
     let log_lambdas = Array1::<f64>::zeros(design.penalties.len());
-    let fit =
-        gam_solve::estimate::UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
+    let fit = gam_solve::estimate::UnifiedFitResult::try_from_parts(
+        gam_solve::estimate::UnifiedFitResultParts {
             blocks: vec![gam_solve::estimate::FittedBlock {
                 beta: beta.clone(),
                 role: gam_problem::BlockRole::Mean,
@@ -325,10 +325,11 @@ fn constant_gaussian_standard_fit(
                 ..Default::default()
             },
             inner_cycles: 0,
-        })
-        .map_err(|err| WorkflowError::IntegrationFailed {
-            reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
-        })?;
+        },
+    )
+    .map_err(|err| WorkflowError::IntegrationFailed {
+        reason: format!("constant Gaussian shortcut produced invalid fit: {err}"),
+    })?;
     let resolvedspec =
         freeze_term_collection_from_design(&request.spec, &design).map_err(|err| {
             WorkflowError::InvalidConfig {
@@ -862,13 +863,15 @@ pub fn constant_curvature_profiled_reml_scores(
                 .to_string(),
         });
     };
-    let term_idx = *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
-        .first()
-        .ok_or_else(|| WorkflowError::IntegrationFailed {
-            reason: "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
+    let term_idx =
+        *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
+            .first()
+            .ok_or_else(|| WorkflowError::IntegrationFailed {
+                reason:
+                    "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
                      curv() term"
-                .to_string(),
-        })?;
+                        .to_string(),
+            })?;
     let mut out = Vec::with_capacity(kappas.len());
     for &kappa in kappas {
         let score = crate::fit_orchestration::drivers::fixed_kappa_profiled_reml_score(
@@ -1235,7 +1238,10 @@ mod sz_factor_smooth_recovery_tests {
     impl Lcg {
         fn next_u64(&mut self) -> u64 {
             // Numerical Recipes LCG constants.
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0
         }
         /// Uniform in [0, 1).
@@ -1303,7 +1309,10 @@ mod sz_factor_smooth_recovery_tests {
     }
 
     fn gaussian_config() -> FitConfig {
-        FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() }
+        FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        }
     }
 
     /// In-sample residual sd of a fitted standard GAM: `sd(y − Xβ̂)`.
@@ -1332,7 +1341,11 @@ mod sz_factor_smooth_recovery_tests {
             start = end;
         }
         let y = data.values.column(0);
-        let resid: Vec<f64> = y.iter().zip(fitted.iter()).map(|(&yi, &fi)| yi - fi).collect();
+        let resid: Vec<f64> = y
+            .iter()
+            .zip(fitted.iter())
+            .map(|(&yi, &fi)| yi - fi)
+            .collect();
         let mean = resid.iter().sum::<f64>() / resid.len() as f64;
         let var = resid.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / resid.len() as f64;
         var.sqrt()
@@ -1343,8 +1356,10 @@ mod sz_factor_smooth_recovery_tests {
             .unwrap_or_else(|e| panic!("fit `{formula}` failed: {e:?}"))
         {
             FitResult::Standard(r) => r,
-            other => panic!("expected Standard fit for `{formula}`, got a different variant: {}",
-                std::any::type_name_of_val(&other)),
+            other => panic!(
+                "expected Standard fit for `{formula}`, got a different variant: {}",
+                std::any::type_name_of_val(&other)
+            ),
         }
     }
 

@@ -1679,7 +1679,7 @@ pub(crate) fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Op
     if !matches!(spec.response, ResponseFamily::Binomial) {
         return None;
     }
-    if inverse_link_has_fisher_weight_jet(&spec.link) {
+    if spec.link.has_fisher_weight_jet() {
         Some(spec.link.clone())
     } else {
         None

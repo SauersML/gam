@@ -28,7 +28,6 @@ pub(crate) use gam_linalg::faer_ndarray::array2_to_matmut;
 pub(crate) use gam_linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
-pub(crate) use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 pub(crate) use crate::pirls::PirlsWorkspace;
 use crate::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::persistent_warm_start::{

@@ -22,8 +22,7 @@ pub(crate) use gam_linalg::utils::{StableSolver, boundary_hit_step_fraction};
 pub(crate) use gam_linalg::matrix::{DesignMatrix, LinearOperator};
 
 pub(crate) use crate::mixture_link::{
-    InverseLinkJet as MixtureInverseLinkJet, inverse_link_has_fisher_weight_jet,
-    logit_inverse_link_jet5,
+    InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5,
 };
 
 pub(crate) use crate::active_set;

@@ -310,30 +310,6 @@ pub(crate) fn fisher_weight_jet5_for_inverse_link(
 }
 
 #[inline]
-pub(crate) fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
-    // Every standard binomial probability link exposes a full 5-jet Fisher weight
-    // via `fisher_weight_jet5` — LogLog and Cauchit included (their d1..d5 close in
-    // the same stable `poly·exp(-·)` / rational forms as CLogLog/Probit). The gate
-    // must therefore admit them: excluding LogLog/Cauchit here (while the jet, the
-    // gam-spec classifier, `reml_jeffreys_supported_link`, and `is_legal_cell` all
-    // support them) would refuse Firth/Jeffreys on a fully-implemented link.
-    matches!(
-        link,
-        InverseLink::Standard(
-            StandardLink::Logit
-                | StandardLink::Probit
-                | StandardLink::CLogLog
-                | StandardLink::LogLog
-                | StandardLink::Cauchit,
-        )
-            | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
-    )
-}
-
-#[inline]
 fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
     let jet = component_inverse_link_jet(component, eta);
     let d4 = component_inverse_link_pdfthird_derivative(component, eta);
@@ -3177,7 +3153,7 @@ mod tests {
         .expect("mixture state");
         let link = InverseLink::Mixture(state);
         assert!(
-            inverse_link_has_fisher_weight_jet(&link),
+            link.has_fisher_weight_jet(),
             "anchored mixtures with loglog/cauchit components must remain eligible for Firth"
         );
         assert!(

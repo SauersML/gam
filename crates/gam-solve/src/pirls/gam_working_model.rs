@@ -954,7 +954,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
         let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
-            if !inverse_link_has_fisher_weight_jet(&self.link_kind) {
+            if !self.link_kind.has_fisher_weight_jet() {
                 crate::bail_invalid_estim!(
                     "Firth/Jeffreys PIRLS requested for unsupported inverse link {:?}",
                     self.link_kind
