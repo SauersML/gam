@@ -19,13 +19,10 @@ extension is rebuilt.
 import numpy as np
 import pytest
 
-from types import SimpleNamespace
-
 from gamfit._sae_manifold import (
     _basis_to_topology,
     _bases,
     _canonical_topology,
-    _preserve_linear_block_labels,
     _topologies_for_bases,
     flat_block_assignment,
 )
@@ -79,27 +76,9 @@ def test_linear_block_decode_equals_t_times_orthonormal_frame():
     assert np.allclose(np.linalg.norm(gamma, axis=1), np.linalg.norm(t, axis=1), atol=1e-10)
 
 
-def test_fit_preserves_linear_block_label_for_roundtrip():
-    # A fit reports the generic fitted "linear" for a flat block (linear_block ->
-    # Linear kind). The facade restores "linear_block" for caller-declared block
-    # atoms the fit left as plain linear, so save/load round-trips linear_block.
-    model = SimpleNamespace(
-        atom_topologies=["linear", "circle", "linear"],
-        _basis_kinds=["linear", "periodic", "linear"],
-        atom_topology="mixed",
-    )
-    out = _preserve_linear_block_labels(model, ["linear_block", "circle", "linear"])
-    # positions 0 (declared block, fit=linear) relabelled; 2 declared plain linear
-    # stays linear; the circle the fit discovered is untouched.
-    assert out.atom_topologies == ["linear_block", "circle", "linear"]
-    assert out._basis_kinds == ["linear_block", "periodic", "linear"]
-
-    # No-op when the caller requested no block atoms.
-    m2 = SimpleNamespace(atom_topologies=["circle"], _basis_kinds=["periodic"], atom_topology="circle")
-    assert _preserve_linear_block_labels(m2, ["circle"]).atom_topologies == ["circle"]
-
-    # A position the fit RETYPED away from linear (structure search) is NOT clobbered.
-    m3 = SimpleNamespace(
-        atom_topologies=["sphere"], _basis_kinds=["sphere"], atom_topology="sphere"
-    )
-    assert _preserve_linear_block_labels(m3, ["linear_block"]).atom_topologies == ["sphere"]
+# The declared-linear_block relabel-after-fit behavior (formerly the Python
+# facade helper `_preserve_linear_block_labels`, removed in the #2091 cutover)
+# now lives in the Rust builder as `declared_bases=` and is unit-tested at its
+# new home: crates/gam-pyffi/src/manifold/manifold_sae_coercion.rs
+# (`preserve_linear_block_labels` tests cover relabel, plain-linear no-op, and
+# structure-search retype non-clobber).

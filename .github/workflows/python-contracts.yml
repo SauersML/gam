@@ -144,14 +144,14 @@ jobs:
         #
         # Run from runner.temp so the INSTALLED wheel's gamfit._rust wins over
         # the source-tree ./gamfit (same reason as the contract steps above).
-        # `continue-on-error` until the inventory is triaged to green; the
-        # JUnit artifact is the durable record either way.
+        # SPEC 16 (no XFAIL): the job reports red when the suite is red, and
+        # collection errors abort loudly instead of being skipped past. The
+        # JUnit artifact (uploaded with `if: always()`) stays the durable
+        # per-file record; nothing gates pushes to main on this status.
         working-directory: ${{ runner.temp }}
-        continue-on-error: true
         run: |
           python -m pytest "$GITHUB_WORKSPACE/tests/" \
             -m "not slow" \
-            --continue-on-collection-errors \
             -p no:cacheprovider \
             -n auto --timeout=300 \
             -o addopts="--import-mode=importlib" \

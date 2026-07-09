@@ -754,8 +754,8 @@ jobs:
       - name: Install Python test extras
         run: |
           python -m pip install \
-            'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
-            'matplotlib>=3.8' 'scikit-learn>=1.4'
+            'pytest>=8' 'pytest-xdist>=3' 'numpy>=1.26' 'pandas>=2.0' \
+            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.4'
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -810,18 +810,6 @@ jobs:
         run: |
           python -m pytest tests/test_ci_no_orphan_python_tests_1512.py -v --tb=short
 
-      - name: Run full Python test suite (all test_*.py in tests/)
-        # continue-on-error RETAINED ON PURPOSE (see #1512): ~20 files document
-        # still-open engine bugs and stand red here as the signal of those bugs;
-        # SPEC.md forbids XFAIL, so they are not masked. Flip to a hard gate once
-        # those open bugs are fixed and `-m "not slow"` is green.
-        continue-on-error: true
-        run: |
-          python -m pytest tests/ \
-            -m "not slow" \
-            --continue-on-collection-errors \
-            -v --tb=short -q
-
       - name: Build gam release binary
         run: cargo build --release -p gam-cli
 
@@ -829,3 +817,19 @@ jobs:
         run: |
           python tests/integration_marginal_slope.py
           python tests/integration_pit_pipeline.py
+
+      - name: Run full Python test suite (all Python tests in tests/)
+        # SPEC 16 (no XFAIL): red is red. Files documenting still-open engine
+        # bugs stand red here and the JOB reports red with them — a green job
+        # over failing tests is the workflow-level XFAIL pattern SPEC 16
+        # forbids. Collection errors abort loudly for the same reason: a file
+        # that cannot even import is the loudest failure, not one to skip
+        # past. Nothing gates pushes to main; this status is pure signal.
+        # Runs LAST (after the release-CLI build) so the CLI-driven
+        # `*_test.py` repros actually execute instead of capability-skipping
+        # on the missing binary, and so its failure hides no other step.
+        run: |
+          python -m pytest tests/ \
+            -m "not slow" \
+            -n auto \
+            --tb=short -q
