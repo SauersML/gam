@@ -82,6 +82,7 @@ def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
     unit-norm decoder columns, pre-bias). The traditional-SAE bar."""
     import torch
 
+    torch.set_float32_matmul_precision("high")  # TF32 on B200; applied to BOTH torch arms
     torch.manual_seed(seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     p = x_tr.shape[1]
@@ -165,6 +166,7 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
     import torch
     from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig
 
+    torch.set_float32_matmul_precision("high")  # TF32 on B200; applied to BOTH torch arms
     torch.manual_seed(seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = ManifoldSAEConfig(
