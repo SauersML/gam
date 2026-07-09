@@ -157,13 +157,16 @@ impl SaeManifoldTerm {
         let atoms = self
             .atoms
             .iter()
-            .map(|atom| {
-                (
-                    atom.basis_values.clone(),
-                    atom.basis_jacobian.clone(),
-                    atom.decoder_coefficients.clone(),
-                    atom.smooth_penalty.clone(),
-                )
+            .map(|atom| SaeManifoldAtomSnapshot {
+                decoder_coefficients: atom.decoder_coefficients.clone(),
+                smooth_penalty: atom.smooth_penalty.clone(),
+                // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
+                // are rebuilt from these + coords on restore, avoiding the
+                // dominant `O(N·M·(1+d))` snapshot copy (see
+                // `SaeManifoldMutableState`).
+                basis_evaluator: atom.basis_evaluator.clone(),
+                basis_second_jet: atom.basis_second_jet.clone(),
+                homotopy_eta: atom.homotopy_eta,
             })
             .collect();
         SaeManifoldMutableState {
@@ -175,20 +178,35 @@ impl SaeManifoldTerm {
     }
 
     /// Restore the mutable state captured by [`Self::snapshot_mutable_state`].
-    /// Assigns into the existing arrays in place so the restore reuses the
-    /// already-allocated buffers rather than reallocating per trial.
-    pub(crate) fn restore_mutable_state(&mut self, snapshot: &SaeManifoldMutableState) {
-        for (atom, (basis_values, basis_jacobian, decoder, smooth_penalty)) in
-            self.atoms.iter_mut().zip(snapshot.atoms.iter())
-        {
-            atom.basis_values.assign(basis_values);
-            atom.basis_jacobian.assign(basis_jacobian);
-            atom.decoder_coefficients.assign(decoder);
-            atom.smooth_penalty.assign(smooth_penalty);
+    ///
+    /// Reassigns the cheap driving state in place (reusing the already-allocated
+    /// buffers), restores each atom's basis-determining handles
+    /// (`basis_evaluator`, `basis_second_jet`, `homotopy_eta`), then rebuilds
+    /// `basis_values`/`basis_jacobian` from the restored coordinates via
+    /// `refresh_basis_from_current_coords` — which fills the atoms' existing
+    /// basis buffers in place through `SaeBasisEvaluator::evaluate_into`. Because
+    /// the basis is a deterministic function of `(coords, evaluator, η)`, the
+    /// rebuilt basis is bit-identical to the snapshotted values. Fallible only
+    /// because the basis re-evaluation is: on valid restored state it cannot
+    /// fail, but the error is propagated rather than swallowed.
+    pub(crate) fn restore_mutable_state(
+        &mut self,
+        snapshot: &SaeManifoldMutableState,
+    ) -> Result<(), String> {
+        for (atom, snap) in self.atoms.iter_mut().zip(snapshot.atoms.iter()) {
+            atom.decoder_coefficients.assign(&snap.decoder_coefficients);
+            atom.smooth_penalty.assign(&snap.smooth_penalty);
+            atom.basis_evaluator.clone_from(&snap.basis_evaluator);
+            atom.basis_second_jet.clone_from(&snap.basis_second_jet);
+            atom.homotopy_eta = snap.homotopy_eta;
         }
         self.assignment.logits.assign(&snapshot.logits);
         self.assignment.coords.clone_from(&snapshot.coords);
         self.last_row_layout.clone_from(&snapshot.last_row_layout);
+        // Rebuild the per-atom basis caches from the restored coordinates. This
+        // reuses the in-place `evaluate_into` workspaces (no fresh (N,M)+(N,M,d)
+        // allocation) and reproduces the snapshotted basis exactly.
+        self.refresh_basis_from_current_coords()
     }
 
     pub(crate) fn refresh_basis_from_current_coords(&mut self) -> Result<(), String> {
@@ -533,7 +551,7 @@ impl SaeManifoldTerm {
                 match outcome {
                     Ok(changed) => any_changed |= changed,
                     Err(err) => {
-                        self.restore_mutable_state(&snapshot);
+                        self.restore_mutable_state(&snapshot)?;
                         for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
                             atom.chart_canonicalized = *flag;
                         }
@@ -558,7 +576,7 @@ impl SaeManifoldTerm {
                     Err(_) => false,
                 };
                 if !keep {
-                    self.restore_mutable_state(&snapshot);
+                    self.restore_mutable_state(&snapshot)?;
                     for (atom, flag) in self.atoms.iter_mut().zip(prior_flags.iter()) {
                         atom.chart_canonicalized = *flag;
                     }
@@ -2682,7 +2700,7 @@ impl SaeManifoldTerm {
                         current_uniformity,
                         SAE_FINAL_EV_DEGRADATION_TOL,
                     ) {
-                        self.restore_mutable_state(&best_state);
+                        self.restore_mutable_state(&best_state)?;
                         log::warn!(
                             "SaeManifoldTerm: dictionary co-collapse multi-start budget spent; \
                              restoring best basin (EV={best_ev:.4}) over last reseed (EV={ev:.4})"
@@ -2809,7 +2827,7 @@ impl SaeManifoldTerm {
                 // the budget-exhaustion arm and any later reseed.
                 let incumbent = self.best_cocollapse_incumbent.take();
                 if let Some((_, _, ref state)) = incumbent {
-                    self.restore_mutable_state(state);
+                    self.restore_mutable_state(state)?;
                 }
                 self.best_cocollapse_incumbent = incumbent;
             }
@@ -4299,7 +4317,7 @@ impl SaeManifoldTerm {
                 && directional_decrease > 0.0
                 && directional_decrease > directional_decrease_floor)
             {
-                self.restore_mutable_state(&snapshot);
+                self.restore_mutable_state(&snapshot)?;
                 last_loss = pre_step_loss;
                 break;
             }
@@ -4308,7 +4326,7 @@ impl SaeManifoldTerm {
             let mut accepted_loss: Option<SaeManifoldLoss> = None;
             for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
                 if halving > 0 {
-                    self.restore_mutable_state(&snapshot);
+                    self.restore_mutable_state(&snapshot)?;
                 }
                 let trial_result = self
                     .apply_newton_step(delta_ext_coord.view(), beta_zero.view(), trial_step_size)
@@ -4328,7 +4346,7 @@ impl SaeManifoldTerm {
             match accepted_loss {
                 Some(loss) => last_loss = loss,
                 None => {
-                    self.restore_mutable_state(&snapshot);
+                    self.restore_mutable_state(&snapshot)?;
                     last_loss = pre_step_loss;
                     break;
                 }
@@ -4898,7 +4916,7 @@ impl SaeManifoldTerm {
             if !pre_step_total.is_finite() {
                 // Pre-step state is unperturbed here; restore is a no-op but
                 // keeps the invariant explicit.
-                self.restore_mutable_state(&snapshot);
+                self.restore_mutable_state(&snapshot)?;
                 break;
             }
             // #2100/#1117 objective-stagnation gate (see the locals above). The
@@ -4969,7 +4987,7 @@ impl SaeManifoldTerm {
                     // halved step. The first trial starts from the pre-step
                     // state already, so the restore is only needed after a
                     // rejected trial mutated `self`.
-                    self.restore_mutable_state(&snapshot);
+                    self.restore_mutable_state(&snapshot)?;
                 }
                 let trial_result = self
                     .apply_newton_step(delta_ext_coord.view(), delta_beta.view(), trial_step_size)
@@ -4987,7 +5005,7 @@ impl SaeManifoldTerm {
                 trial_step_size *= 0.5;
             }
             if !accepted {
-                self.restore_mutable_state(&snapshot);
+                self.restore_mutable_state(&snapshot)?;
                 let correction = ArrowProximalCorrectionOptions {
                     initial_ridge: ridge_ext_coord
                         .max(ridge_beta)
@@ -5007,7 +5025,9 @@ impl SaeManifoldTerm {
                     &solve_options,
                     &correction,
                     |trial_delta_t, trial_delta_beta| {
-                        self.restore_mutable_state(&snapshot);
+                        if self.restore_mutable_state(&snapshot).is_err() {
+                            return f64::INFINITY;
+                        }
                         self.apply_newton_step(trial_delta_t, trial_delta_beta, 1.0)
                             .and_then(|()| {
                                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
@@ -5024,7 +5044,7 @@ impl SaeManifoldTerm {
                              ‖g‖={:.3e}): {err}",
                             grad_norm_sq.sqrt()
                         );
-                        self.restore_mutable_state(&snapshot);
+                        self.restore_mutable_state(&snapshot)?;
                         break;
                     }
                 };
@@ -5038,7 +5058,7 @@ impl SaeManifoldTerm {
                         accepted_step.trial_objective_value,
                         grad_norm_sq.sqrt()
                     );
-                    self.restore_mutable_state(&snapshot);
+                    self.restore_mutable_state(&snapshot)?;
                     break;
                 }
             }
@@ -5054,7 +5074,7 @@ impl SaeManifoldTerm {
             let canonical_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
-                self.restore_mutable_state(&accepted_snapshot);
+                self.restore_mutable_state(&accepted_snapshot)?;
             }
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
@@ -5268,7 +5288,7 @@ impl SaeManifoldTerm {
                         "[#1026] restoring inner-fit reconstruction incumbent after EV degraded \
                          from {best_reconstruction_ev:.4} to {final_ev:.4}"
                     );
-                    self.restore_mutable_state(best_state);
+                    self.restore_mutable_state(best_state)?;
                     if self.frames_active() {
                         self.refresh_active_frames_from_data(target, rho)
                             .map_err(|err| {
@@ -5379,7 +5399,7 @@ impl SaeManifoldTerm {
                             best_objective = value;
                         }
                         _ => {
-                            self.restore_mutable_state(&snapshot);
+                            self.restore_mutable_state(&snapshot)?;
                             break;
                         }
                     }
@@ -5403,7 +5423,7 @@ impl SaeManifoldTerm {
                         "[#1026] restoring pre-polish reconstruction incumbent after final \
                          polish degraded EV from {pre_polish_ev:.4} to {final_ev:.4}"
                     );
-                    self.restore_mutable_state(&pre_polish_state);
+                    self.restore_mutable_state(&pre_polish_state)?;
                 }
             }
         }

@@ -1477,7 +1477,12 @@ pub(crate) fn snapshot_restore_round_trips_mutated_state() {
 
     // Restore and confirm every snapshotted field matches the pre-step
     // values bit-for-bit.
-    term.restore_mutable_state(&snapshot);
+    term.restore_mutable_state(&snapshot)
+        .expect("differential restore rebuilds the basis");
+    // The differential snapshot drops `basis_values`/`basis_jacobian` and rebuilds
+    // them from the restored coordinates via `refresh_basis_from_current_coords`.
+    // `TestPeriodicEvaluator::evaluate` is exactly `periodic_basis`, so the rebuild
+    // reproduces the pre-step basis bit-for-bit (basis is deterministic in coords).
     assert_eq!(term.atoms[0].basis_values, pre_basis);
     assert_eq!(term.atoms[0].basis_jacobian, pre_jet);
     assert_eq!(term.atoms[0].decoder_coefficients, pre_decoder);

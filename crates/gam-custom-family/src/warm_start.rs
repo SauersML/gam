@@ -650,6 +650,7 @@ pub fn blockwise_fit_from_parts(
             coefficient_influence: None,
             weighted_gram: None,
             bias_correction_beta: None,
+            bias_correction_jacobian: None,
         }),
         _ => None,
     };

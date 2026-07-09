@@ -2660,6 +2660,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 coefficient_influence: None,
                 weighted_gram: None,
                 bias_correction_beta: None,
+                bias_correction_jacobian: None,
             };
             let geometry = Some(gam_solve::estimate::FitGeometry {
                 penalized_hessian: penalized_hessian.into(),
@@ -6012,6 +6013,7 @@ fn fit_bounded_term_collection_with_design(
                 coefficient_influence: None,
                 weighted_gram: None,
                 bias_correction_beta: None,
+                bias_correction_jacobian: None,
             };
             let covariance_conditional = beta_covariance;
             let pirls_status_val = if fit.outer_converged {

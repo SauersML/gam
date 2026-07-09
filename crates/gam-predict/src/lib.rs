@@ -4028,6 +4028,7 @@ mod tests {
             coefficient_influence: None,
             weighted_gram: None,
             bias_correction_beta,
+            bias_correction_jacobian: None,
         };
         UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
             blocks: vec![FittedBlock {

@@ -1685,7 +1685,8 @@ pub(crate) fn line_search_snapshot_restores_intrinsic_smooth_penalty() {
         "test setup must perturb the live intrinsic smoothness Gram"
     );
 
-    term.restore_mutable_state(&snapshot);
+    term.restore_mutable_state(&snapshot)
+        .expect("differential restore rebuilds the basis");
     let restored = (&term.atoms[0].smooth_penalty - &original)
         .mapv(f64::abs)
         .sum();

@@ -558,15 +558,15 @@ impl SaeManifoldTerm {
         (self.snapshot_mutable_state(), self.temperature_schedule.clone())
     }
 
-    /// Restore a [`Self::fit_state_snapshot`]. Because the snapshot carries the
-    /// refreshed `basis_values` / `basis_jacobian` (not just the coords), the
-    /// restored state is immediately consistent for a residual/fitted read — no
-    /// post-restore basis refresh is required.
+    /// Restore a [`Self::fit_state_snapshot`]. `restore_mutable_state` rebuilds
+    /// each atom's `basis_values` / `basis_jacobian` from the restored coordinates
+    /// (the differential snapshot stores only the cheap driving state), so the
+    /// restored state is immediately consistent for a residual/fitted read.
     fn fit_state_restore(
         &mut self,
         snap: &(SaeManifoldMutableState, Option<GumbelTemperatureSchedule>),
     ) -> Result<(), String> {
-        self.restore_mutable_state(&snap.0);
+        self.restore_mutable_state(&snap.0)?;
         self.temperature_schedule.clone_from(&snap.1);
         Ok(())
     }

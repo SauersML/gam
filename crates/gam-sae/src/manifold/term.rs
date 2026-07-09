@@ -837,32 +837,64 @@ impl Clone for SaeManifoldTerm {
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
-/// `loss` line-search trial perturbs: per-atom decoder coefficients, the
-/// `refresh_basis`-rebuilt basis evaluations (`basis_values`, `basis_jacobian`),
-/// and the live intrinsic smoothness Gram read by the objective, plus the
-/// assignment logits and latent coordinates.
+/// `loss` line-search trial perturbs, stored DIFFERENTIALLY: the CHEAP driving
+/// state — decoder coefficients, the live intrinsic smoothness Gram, and the
+/// per-atom basis-determining handles (`basis_evaluator`, `basis_second_jet`,
+/// `homotopy_eta`) — plus the assignment logits, latent coordinates, and row
+/// layout.
 ///
-/// Static fields (atom names, basis kinds, basis-evaluator `Arc`s, assignment
-/// mode, temperature schedule) are *not* snapshotted: they are invariant across
-/// an inner Newton line search, so the previous `self.clone()` per halving
-/// re-copied them needlessly. Cloning only the line-search state keeps the
-/// `O(N·M·d)` `basis_jacobian` copy off the per-halving hot path (one snapshot
-/// before the search, one restore per rejected trial) instead of firing it on
-/// every Armijo backtrack.
+/// The expensive `basis_values` (`N×M`) and `basis_jacobian` (`N×M×d`) arrays are
+/// NOT stored: they are pure deterministic functions of `(coords, basis_evaluator,
+/// homotopy_eta)` via [`SaeManifoldAtom::refresh_basis`]. At the production curved
+/// tier (K=512, N=96k, M=7, d=1) copying them was ~5.5 GB of `memcpy` per snapshot
+/// — taken once per Newton line search, per incumbent-banking improvement, per
+/// basin-bundle member, per polish round — the dominant memory-bandwidth wall.
+/// [`SaeManifoldTerm::restore_mutable_state`] reassigns the cheap state, restores
+/// the basis-determining handles, and rebuilds `basis_values`/`basis_jacobian`
+/// in place via `refresh_basis_from_current_coords` (reusing the atoms' existing
+/// buffers through `SaeBasisEvaluator::evaluate_into`). Restores happen only on
+/// REJECTED trials / incumbent rollbacks, which are rare relative to snapshots, so
+/// trading a snapshot-time `O(K·N·M·(1+d))` copy for a restore-time single basis
+/// evaluation is a large net win — and the previous restore ALSO deep-copied the
+/// basis via `.assign()`, so restore gets cheaper too.
+///
+/// The basis-determining handles are captured because `basis_values` is a function
+/// of the evaluator and `η`, not of the coordinates alone: `canonicalize_atom_
+/// affine_gauge` swaps `basis_evaluator`/`basis_second_jet`, and the curvature-
+/// homotopy walk moves `homotopy_eta`. Restoring all three makes the rebuilt basis
+/// bit-identical to the snapshotted state in every case (the affine-gauge reject
+/// and the η=0 base-topology anchor restore both re-derive the exact pre-change
+/// basis), where the previous direct `basis_values` restore left a mixed evaluator/
+/// η state. The `Arc`/`f64` handles are pointer-cheap to clone.
+///
+/// Static fields (atom names, basis kinds, assignment mode, temperature schedule)
+/// are still not snapshotted: they are invariant across a Newton line search.
 ///
 /// The canonical `smooth_penalty_raw` / `smooth_penalty_order` are static, but
 /// the live intrinsic roughness Gram `smooth_penalty` is mutable state: it is
 /// refreshed by assembly from the current decoder and basis Jacobian, and the
-/// line-search objective reads it directly. Restoring it with the decoder and
-/// basis caches keeps every rejected trial's baseline and nonlinear objective
-/// on the same lagged-diffusivity quadratic.
+/// line-search objective reads it directly. Restoring it with the decoder keeps
+/// every rejected trial's baseline and nonlinear objective on the same
+/// lagged-diffusivity quadratic.
 #[derive(Debug)]
 pub(crate) struct SaeManifoldMutableState {
-    /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients, smooth_penalty)`.
-    pub(crate) atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>, Array2<f64>)>,
+    /// Per-atom differential state
+    /// `(decoder_coefficients, smooth_penalty, basis_evaluator, basis_second_jet,
+    /// homotopy_eta)`. `basis_values`/`basis_jacobian` are rebuilt on restore.
+    pub(crate) atoms: Vec<SaeManifoldAtomSnapshot>,
     pub(crate) logits: Array2<f64>,
     pub(crate) coords: Vec<LatentCoordValues>,
     pub(crate) last_row_layout: Option<SaeRowLayout>,
+}
+
+/// Per-atom differential snapshot — see [`SaeManifoldMutableState`].
+#[derive(Debug)]
+pub(crate) struct SaeManifoldAtomSnapshot {
+    pub(crate) decoder_coefficients: Array2<f64>,
+    pub(crate) smooth_penalty: Array2<f64>,
+    pub(crate) basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
+    pub(crate) basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
+    pub(crate) homotopy_eta: f64,
 }
 
 #[cfg(test)]
