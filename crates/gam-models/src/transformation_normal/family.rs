@@ -195,7 +195,13 @@ pub(crate) fn build_transformation_row_derived(
                 format!("TransformationNormalFamily row_quantities: row {i} invalid endpoint normalizer: {e}")
             })?;
             let log_z = q.log_z;
-            let row_ll = w_i * (-0.5 * h_i * h_i + hp.ln() - log_z);
+            // Full truncated-normal density log φ(h) + log h' − log Z, including
+            // the −½ln(2π) normalizer so the reported absolute log-likelihood
+            // (and AIC) is comparable to reference tools (mlt/tram). The constant
+            // is coefficient-independent: scores, Hessians, and PIT residuals
+            // are unchanged.
+            let row_ll = w_i
+                * (-0.5 * h_i * h_i - 0.5 * (2.0 * std::f64::consts::PI).ln() + hp.ln() - log_z);
             // Fast path: a single short-circuited finiteness check. Only
             // when something is non-finite do we walk the named-field
             // table to produce a precise diagnostic.
