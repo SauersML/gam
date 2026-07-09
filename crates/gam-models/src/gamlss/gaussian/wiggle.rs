@@ -411,8 +411,7 @@ pub(crate) fn gls_wiggle_second_directional_coeffs(
     let ml_term_k_s = &rows.kappa * &(&(&dm_v * s1_u) + &(&dm_u * s1_v));
     let ml_term_k_m = &rows.kappa * &rows.m * s1_uv;
     let coeff_ml_uv = 2.0
-        * &(&(&(&(&(&ml_term_kpp + &ml_term_kp_d) + &ml_term_kp_m) + &ml_term_k_d)
-            + &ml_term_k_s)
+        * &(&(&(&(&(&ml_term_kpp + &ml_term_kp_d) + &ml_term_kp_m) + &ml_term_k_d) + &ml_term_k_s)
             + &ml_term_k_m);
     // D²(κ'(a−n)+2κ²n)[u,v] via dn: κ'''(a−n)ζ_uζ_v + 4(κ'²+κκ'')nζ_uζ_v
     // + (4κκ'−κ'')(ζ_v·dn_u + ζ_u·dn_v) + (2κ²−κ')·dn_uv.
@@ -1573,12 +1572,14 @@ impl GaussianLocationScaleWiggleFamily {
         // + (2κ²−κ')dn_ab + (κ''(a−n)+4κκ'n)e_ab.
         let coeff_ll_ab = &(&(&(&(&ktp * &amn * &(e_a * e_b))
             + &(4.0
-                * &(&(&rows.kappa_prime * &rows.kappa_prime) + &(&rows.kappa * &rows.kappa_dprime))
+                * &(&(&rows.kappa_prime * &rows.kappa_prime)
+                    + &(&rows.kappa * &rows.kappa_dprime))
                 * &rows.n
                 * &(e_a * e_b)))
             + &(&four_kkp_minus_kdp * &(&(e_a * &dn_b) + &(e_b * &dn_a))))
             + &(&a_coef * &dn_ab))
-            + &(&(&(&rows.kappa_dprime * &amn) + &(4.0 * &rows.kappa * &rows.kappa_prime * &rows.n))
+            + &(&(&(&rows.kappa_dprime * &amn)
+                + &(4.0 * &rows.kappa * &rows.kappa_prime * &rows.n))
                 * e_ab);
         let a = &rows.w * &geom.dq_dq0;
         let a_a = &dw_a * &geom.dq_dq0 + &rows.w * &s1_a;
@@ -1932,12 +1933,14 @@ impl GaussianLocationScaleWiggleFamily {
         // + (4κκ'−κ'')(e_a dn_u + ζ dn_a) + (2κ²−κ')dn_a_u + (κ''(a−n)+4κκ'n)zls_a_u.
         let coeff_ll_a_u = &(&(&(&(&ktp * &amn * &(e_a * &zeta))
             + &(4.0
-                * &(&(&rows.kappa_prime * &rows.kappa_prime) + &(&rows.kappa * &rows.kappa_dprime))
+                * &(&(&rows.kappa_prime * &rows.kappa_prime)
+                    + &(&rows.kappa * &rows.kappa_dprime))
                 * &rows.n
                 * &(e_a * &zeta)))
             + &(&four_kkp_minus_kdp * &(&(e_a * &dn_u) + &(&zeta * &dn_a))))
             + &(&a_coef * &dn_a_u))
-            + &(&(&(&rows.kappa_dprime * &amn) + &(4.0 * &rows.kappa * &rows.kappa_prime * &rows.n))
+            + &(&(&(&rows.kappa_dprime * &amn)
+                + &(4.0 * &rows.kappa * &rows.kappa_prime * &rows.n))
                 * &zls_a_u);
 
         let a = &rows.w * &geom.dq_dq0;

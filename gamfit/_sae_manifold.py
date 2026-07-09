@@ -2351,7 +2351,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"got {decoder_incoherence_weight}"
         )
     topology_supplied = atom_topology is not _TOPOLOGY_UNSET
-    atom_topology_str = str(atom_topology) if topology_supplied else "circle"
+    # Magic default (#2238/#2239): when the caller names no topology, every
+    # atom is seeded "auto" and the Rust fit entry races circle / torus /
+    # sphere / flat-2-D per atom by REML evidence over its seed cluster —
+    # the historical pinned circle hard-capped intrinsically 2-D factors at
+    # R² ≈ 0.5. An explicit atom_topology still pins exactly as before.
+    atom_topology_str = str(atom_topology) if topology_supplied else "auto"
     bases = _bases(k_atoms, atom_basis, atom_topology_str)
     resolved_topology = _topology_for_bases(bases)
     # O: compare CANONICAL forms on both sides. Comparing the resolved (already
@@ -3604,6 +3609,9 @@ _TOPOLOGY_TO_BASIS = {
     "duchon": "duchon",
     "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
     "cylinder": "cylinder",
+    # Per-atom evidence-raced topology discovery at fit entry (#2238): the
+    # Rust driver rewrites each "auto" atom to the concrete race winner.
+    "auto": "auto",
 }
 # Canonical / aliased basis kind -> canonical topology label.
 _BASIS_TO_TOPOLOGY = {
@@ -3617,6 +3625,7 @@ _BASIS_TO_TOPOLOGY = {
     "euclidean_quadratic_patch": "euclidean",
     "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
     "cylinder": "cylinder",
+    "auto": "auto",
 }
 
 

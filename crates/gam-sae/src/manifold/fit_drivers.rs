@@ -273,6 +273,73 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Retract every atom's coordinate block by its disjoint slice of a
+    /// row-major Newton step, then optionally refresh that atom's basis cache.
+    /// The indexed parallel path changes scheduling only: no atom reads or
+    /// writes another atom's coordinates, evaluator, or cache, and no
+    /// floating-point reduction crosses atom boundaries.
+    fn apply_coordinate_step_from_rows<F>(
+        &mut self,
+        n: usize,
+        q: usize,
+        coord_offsets: &[usize],
+        step_size: f64,
+        delta_at: F,
+        refresh_basis: bool,
+        parallel: bool,
+    ) -> Result<(), String>
+    where
+        F: Fn(usize, usize) -> f64 + Sync,
+    {
+        debug_assert_eq!(self.atoms.len(), self.assignment.coords.len());
+        debug_assert_eq!(coord_offsets.len(), self.atoms.len());
+        let update_atom = |atom_idx: usize,
+                           atom: &mut SaeManifoldAtom,
+                           coord: &mut LatentCoordValues|
+         -> Result<(), String> {
+            let d = coord.latent_dim();
+            let mut delta_coord = Array1::<f64>::zeros(n * d);
+            for row in 0..n {
+                let row_base = row * q + coord_offsets[atom_idx];
+                for axis in 0..d {
+                    delta_coord[row * d + axis] = step_size * delta_at(row, row_base + axis);
+                }
+            }
+            coord.retract_flat_delta(delta_coord.view());
+            if refresh_basis {
+                with_nested_parallel(|| {
+                    let coords = coord.as_matrix();
+                    atom.refresh_basis(coords.view())
+                })?;
+            }
+            Ok(())
+        };
+
+        if parallel {
+            use rayon::prelude::*;
+            let outcomes: Vec<Result<(), String>> = self
+                .atoms
+                .par_iter_mut()
+                .zip(self.assignment.coords.par_iter_mut())
+                .enumerate()
+                .map(|(atom_idx, (atom, coord))| update_atom(atom_idx, atom, coord))
+                .collect();
+            for outcome in outcomes {
+                outcome?;
+            }
+        } else {
+            for (atom_idx, (atom, coord)) in self
+                .atoms
+                .iter_mut()
+                .zip(self.assignment.coords.iter_mut())
+                .enumerate()
+            {
+                update_atom(atom_idx, atom, coord)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn canonicalize_affine_gauge_after_accept(
         &mut self,
         rho: Option<&SaeManifoldRho>,
@@ -3393,7 +3460,9 @@ impl SaeManifoldTerm {
             .map(|(j, kk, coherence, _bar)| (j, kk, coherence)))
     }
 
-    fn structural_coherence_collapsed_pairs(&self) -> Result<Vec<(usize, usize, f64, f64)>, String> {
+    fn structural_coherence_collapsed_pairs(
+        &self,
+    ) -> Result<Vec<(usize, usize, f64, f64)>, String> {
         let k = self.k_atoms();
         let p = self.output_dim();
         if k < 2 || p == 0 {
@@ -3524,7 +3593,11 @@ impl SaeManifoldTerm {
                         nk += b * b;
                     }
                     let denom = (nj * nk).sqrt();
-                    if denom > 0.0 { (dot / denom).abs() } else { 0.0 }
+                    if denom > 0.0 {
+                        (dot / denom).abs()
+                    } else {
+                        0.0
+                    }
                 }
                 // Contribution unavailable (decoder-only detector call before any
                 // gated design): keep the subspace verdict rather than lose it.
@@ -3963,11 +4036,10 @@ impl SaeManifoldTerm {
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
         let at_top_level = rayon::current_thread_index().is_none();
-        let parallel_rows = forced_parallelism
-            .unwrap_or(n >= SAE_LOSS_PARALLEL_ROW_MIN && at_top_level);
-        let parallel_atoms = forced_parallelism.unwrap_or(
-            n >= SAE_LOSS_PARALLEL_ROW_MIN && k_atoms > 1 && at_top_level,
-        );
+        let parallel_rows =
+            forced_parallelism.unwrap_or(n >= SAE_LOSS_PARALLEL_ROW_MIN && at_top_level);
+        let parallel_atoms = forced_parallelism
+            .unwrap_or(n >= SAE_LOSS_PARALLEL_ROW_MIN && k_atoms > 1 && at_top_level);
         let softmax = matches!(self.assignment.mode, AssignmentMode::Softmax { .. });
         // #972 / #977 T1: when the most recent assembly built the factored
         // β-tier, `delta_beta` is a factored ΔC (length `factored_border_dim`)
@@ -3994,7 +4066,14 @@ impl SaeManifoldTerm {
         // [compact_offset_i .. compact_offset_i + q_active_i].
         // We expand each row back to full-q before applying.
         if let Some(ref layout) = self.last_row_layout.clone() {
-            let total_len: usize = (0..n).map(|row| layout.row_q_active(row)).sum();
+            let row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
+            let mut compact_offsets = Vec::with_capacity(n + 1);
+            compact_offsets.push(0usize);
+            for &row_dim in &row_dims {
+                let next = compact_offsets.last().copied().unwrap_or(0) + row_dim;
+                compact_offsets.push(next);
+            }
+            let total_len = compact_offsets[n];
             if delta_ext_coord.len() != total_len {
                 return Err(format!(
                     "SaeManifoldTerm::apply_newton_step: compact delta_ext_coord length {} != expected {}",
@@ -4002,50 +4081,80 @@ impl SaeManifoldTerm {
                     total_len
                 ));
             }
-            // Expand compact layout to full-q flat buffer.
+            // Expand compact rows independently into disjoint full-q slices.
             let mut full_delta = vec![0.0_f64; n * q];
-            let mut compact_off = 0usize;
-            for row in 0..n {
-                let q_active = layout.row_q_active(row);
-                // Collect compact row (handles both contiguous and strided views).
-                let compact_row: Vec<f64> = delta_ext_coord
-                    .slice(ndarray::s![compact_off..compact_off + q_active])
-                    .iter()
-                    .copied()
-                    .collect();
-                layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
-                compact_off += q_active;
+            if parallel_rows && q > 0 {
+                use rayon::prelude::*;
+                full_delta
+                    .par_chunks_mut(q)
+                    .enumerate()
+                    .for_each(|(row, full_row)| {
+                        let compact_row: Vec<f64> = delta_ext_coord
+                            .slice(ndarray::s![compact_offsets[row]..compact_offsets[row + 1]])
+                            .iter()
+                            .copied()
+                            .collect();
+                        layout.expand_row(row, &compact_row, full_row);
+                    });
+            } else {
+                for row in 0..n {
+                    let compact_row: Vec<f64> = delta_ext_coord
+                        .slice(ndarray::s![compact_offsets[row]..compact_offsets[row + 1]])
+                        .iter()
+                        .copied()
+                        .collect();
+                    layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
+                }
             }
             // Apply logits from expanded buffer, clamped to the #976 gate-scale
-            // step cap (see SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS for the Armijo
-            // consistency argument).
+            // step cap, then canonicalize each softmax row in the same worker.
             let logit_step_cap =
                 SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
-            for row in 0..n {
-                let row_base = row * q;
-                for atom_idx in 0..assignment_dim {
-                    self.assignment.logits[[row, atom_idx]] += (step_size
-                        * full_delta[row_base + atom_idx])
-                        .clamp(-logit_step_cap, logit_step_cap);
-                }
-            }
-            // Apply coords from expanded buffer.
-            let coord_offsets = self.assignment.coord_offsets();
-            for atom_idx in 0..k_atoms {
-                let d = self.assignment.coords[atom_idx].latent_dim();
-                let mut delta_coord = Array1::<f64>::zeros(n * d);
+            if parallel_rows {
+                use rayon::prelude::*;
+                self.assignment
+                    .logits
+                    .axis_iter_mut(ndarray::Axis(0))
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(row, mut logits)| {
+                        let row_base = row * q;
+                        for atom_idx in 0..assignment_dim {
+                            logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
+                                .clamp(-logit_step_cap, logit_step_cap);
+                        }
+                        if softmax {
+                            canonicalize_softmax_logit_row(
+                                logits.as_slice_mut().expect("contiguous logit row"),
+                            );
+                        }
+                    });
+            } else {
                 for row in 0..n {
-                    let row_base = row * q + coord_offsets[atom_idx];
-                    for axis in 0..d {
-                        delta_coord[row * d + axis] = step_size * full_delta[row_base + axis];
+                    let row_base = row * q;
+                    let mut logits = self.assignment.logits.row_mut(row);
+                    for atom_idx in 0..assignment_dim {
+                        logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
+                            .clamp(-logit_step_cap, logit_step_cap);
+                    }
+                    if softmax {
+                        canonicalize_softmax_logit_row(
+                            logits.as_slice_mut().expect("contiguous logit row"),
+                        );
                     }
                 }
-                self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
-                if refresh_basis {
-                    let coords = self.assignment.coords[atom_idx].as_matrix();
-                    self.atoms[atom_idx].refresh_basis(coords.view())?;
-                }
             }
+            // Coordinate blocks and basis caches are independent across atoms.
+            let coord_offsets = self.assignment.coord_offsets();
+            self.apply_coordinate_step_from_rows(
+                n,
+                q,
+                &coord_offsets,
+                step_size,
+                |_, flat_idx| full_delta[flat_idx],
+                refresh_basis,
+                parallel_atoms,
+            )?;
         } else {
             // Dense layout: uniform q per row.
             if delta_ext_coord.len() != n * q {
@@ -4059,32 +4168,49 @@ impl SaeManifoldTerm {
             // #976 gate-scale step cap, as in the compact branch above.
             let logit_step_cap =
                 SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
-            for row in 0..n {
-                let row_base = row * q;
-                for atom_idx in 0..assignment_dim {
-                    self.assignment.logits[[row, atom_idx]] += (step_size
-                        * delta_ext_coord[row_base + atom_idx])
-                        .clamp(-logit_step_cap, logit_step_cap);
-                }
-            }
-            for atom_idx in 0..k_atoms {
-                let d = self.assignment.coords[atom_idx].latent_dim();
-                let mut delta_coord = Array1::<f64>::zeros(n * d);
+            if parallel_rows {
+                use rayon::prelude::*;
+                self.assignment
+                    .logits
+                    .axis_iter_mut(ndarray::Axis(0))
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(row, mut logits)| {
+                        let row_base = row * q;
+                        for atom_idx in 0..assignment_dim {
+                            logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
+                                .clamp(-logit_step_cap, logit_step_cap);
+                        }
+                        if softmax {
+                            canonicalize_softmax_logit_row(
+                                logits.as_slice_mut().expect("contiguous logit row"),
+                            );
+                        }
+                    });
+            } else {
                 for row in 0..n {
-                    let row_base = row * q + coord_offsets[atom_idx];
-                    for axis in 0..d {
-                        delta_coord[row * d + axis] = step_size * delta_ext_coord[row_base + axis];
+                    let row_base = row * q;
+                    let mut logits = self.assignment.logits.row_mut(row);
+                    for atom_idx in 0..assignment_dim {
+                        logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
+                            .clamp(-logit_step_cap, logit_step_cap);
+                    }
+                    if softmax {
+                        canonicalize_softmax_logit_row(
+                            logits.as_slice_mut().expect("contiguous logit row"),
+                        );
                     }
                 }
-                self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
-                if refresh_basis {
-                    let coords = self.assignment.coords[atom_idx].as_matrix();
-                    self.atoms[atom_idx].refresh_basis(coords.view())?;
-                }
             }
-        }
-        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
-            canonicalize_softmax_logits(&mut self.assignment.logits);
+            self.apply_coordinate_step_from_rows(
+                n,
+                q,
+                &coord_offsets,
+                step_size,
+                |_, flat_idx| delta_ext_coord[flat_idx],
+                refresh_basis,
+                parallel_atoms,
+            )?;
         }
 
         let mut beta = self.flatten_beta();
@@ -4551,84 +4677,83 @@ impl SaeManifoldTerm {
         // per atom is a pure function of read-only inputs, so the parallel result
         // is bit-identical to the serial sweep (ordered collect). #1557 — pin the
         // faer eigendecomp GEMM to `Par::Seq` inside each atom worker.
-        let plans: Vec<Option<Array2<f64>>> = {
-            let atoms = &self.atoms;
-            let compute_plan = |atom_idx: usize| -> Option<Array2<f64>> {
-                let m = atoms[atom_idx].basis_size();
-                if m == 0 || grams[atom_idx].dim() != (m, m) {
-                    return None;
+        let plans: Vec<Option<Array2<f64>>> =
+            {
+                let atoms = &self.atoms;
+                let compute_plan =
+                    |atom_idx: usize| -> Option<Array2<f64>> {
+                        let m = atoms[atom_idx].basis_size();
+                        if m == 0 || grams[atom_idx].dim() != (m, m) {
+                            return None;
+                        }
+                        // Symmetrise the bare data Gram `G_k` before the eigendecomposition.
+                        let mut data_gram = grams[atom_idx].clone();
+                        for i in 0..m {
+                            for j in 0..i {
+                                let sym = 0.5 * (data_gram[[i, j]] + data_gram[[j, i]]);
+                                data_gram[[i, j]] = sym;
+                                data_gram[[j, i]] = sym;
+                            }
+                        }
+                        let (evals, evecs) = match data_gram.eigh(Side::Lower) {
+                            Ok(pair) => pair,
+                            Err(_) => return None,
+                        };
+                        let max_eig = evals.iter().fold(0.0_f64, |acc, &v| {
+                            if v.is_finite() { acc.max(v) } else { acc }
+                        });
+                        if !(max_eig > 0.0) {
+                            // An all-zero data Gram (no assignment mass) is handled by the
+                            // fatal pre-fit audit, not by a basis reduction here.
+                            return None;
+                        }
+                        let cutoff = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
+                        // Eigenvectors whose eigenvalue clears the relative cutoff span the
+                        // data-supported subspace `Q_k` (the retained columns).
+                        let kept: Vec<usize> = (0..evals.len())
+                            .filter(|&idx| {
+                                let lambda = evals[idx];
+                                lambda.is_finite() && lambda > cutoff
+                            })
+                            .collect();
+                        let r = kept.len();
+                        // Full rank (`r == m`) → the well-conditioned path; leave it
+                        // byte-for-byte unchanged. `r == 0` is a degenerate all-null Gram
+                        // that the fatal pre-fit audit already rejects; do not reduce to a
+                        // zero-width basis here.
+                        if r == m || r == 0 {
+                            return None;
+                        }
+                        // Build the orthonormal column map `Q_k` (M × r) from the retained
+                        // eigenvectors. The reduction needs an analytic second-jet evaluator
+                        // to compose the reduced jets; atoms without one (caller-managed,
+                        // e.g. an out-of-band design) keep the historical projector-free
+                        // full-`B` path and rely on the LM ridge — the periodic/torus/
+                        // sphere/Duchon production atoms all carry a second jet.
+                        if atoms[atom_idx].basis_second_jet.is_none() {
+                            return None;
+                        }
+                        let mut q = Array2::<f64>::zeros((m, r));
+                        for (col, &eig_idx) in kept.iter().enumerate() {
+                            for row in 0..m {
+                                q[[row, col]] = evecs[[row, eig_idx]];
+                            }
+                        }
+                        Some(q)
+                    };
+                let n_atoms = atoms.len();
+                let parallel =
+                    n_atoms >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                if parallel {
+                    use rayon::prelude::*;
+                    (0..n_atoms)
+                        .into_par_iter()
+                        .map(|atom_idx| with_nested_parallel(|| compute_plan(atom_idx)))
+                        .collect()
+                } else {
+                    (0..n_atoms).map(compute_plan).collect()
                 }
-                // Symmetrise the bare data Gram `G_k` before the eigendecomposition.
-                let mut data_gram = grams[atom_idx].clone();
-                for i in 0..m {
-                    for j in 0..i {
-                        let sym = 0.5 * (data_gram[[i, j]] + data_gram[[j, i]]);
-                        data_gram[[i, j]] = sym;
-                        data_gram[[j, i]] = sym;
-                    }
-                }
-                let (evals, evecs) = match data_gram.eigh(Side::Lower) {
-                    Ok(pair) => pair,
-                    Err(_) => return None,
-                };
-                let max_eig = evals.iter().fold(
-                    0.0_f64,
-                    |acc, &v| {
-                        if v.is_finite() { acc.max(v) } else { acc }
-                    },
-                );
-                if !(max_eig > 0.0) {
-                    // An all-zero data Gram (no assignment mass) is handled by the
-                    // fatal pre-fit audit, not by a basis reduction here.
-                    return None;
-                }
-                let cutoff = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
-                // Eigenvectors whose eigenvalue clears the relative cutoff span the
-                // data-supported subspace `Q_k` (the retained columns).
-                let kept: Vec<usize> = (0..evals.len())
-                    .filter(|&idx| {
-                        let lambda = evals[idx];
-                        lambda.is_finite() && lambda > cutoff
-                    })
-                    .collect();
-                let r = kept.len();
-                // Full rank (`r == m`) → the well-conditioned path; leave it
-                // byte-for-byte unchanged. `r == 0` is a degenerate all-null Gram
-                // that the fatal pre-fit audit already rejects; do not reduce to a
-                // zero-width basis here.
-                if r == m || r == 0 {
-                    return None;
-                }
-                // Build the orthonormal column map `Q_k` (M × r) from the retained
-                // eigenvectors. The reduction needs an analytic second-jet evaluator
-                // to compose the reduced jets; atoms without one (caller-managed,
-                // e.g. an out-of-band design) keep the historical projector-free
-                // full-`B` path and rely on the LM ridge — the periodic/torus/
-                // sphere/Duchon production atoms all carry a second jet.
-                if atoms[atom_idx].basis_second_jet.is_none() {
-                    return None;
-                }
-                let mut q = Array2::<f64>::zeros((m, r));
-                for (col, &eig_idx) in kept.iter().enumerate() {
-                    for row in 0..m {
-                        q[[row, col]] = evecs[[row, eig_idx]];
-                    }
-                }
-                Some(q)
             };
-            let n_atoms = atoms.len();
-            let parallel =
-                n_atoms >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
-            if parallel {
-                use rayon::prelude::*;
-                (0..n_atoms)
-                    .into_par_iter()
-                    .map(|atom_idx| with_nested_parallel(|| compute_plan(atom_idx)))
-                    .collect()
-            } else {
-                (0..n_atoms).map(compute_plan).collect()
-            }
-        };
         // Phase 2 (serial): apply the reparametrization to each atom in atom order.
         // Each mutation touches ONLY its own atom, but keep it serial so a failure
         // surfaces the deterministic (lowest-index) error.
@@ -5142,15 +5267,15 @@ impl SaeManifoldTerm {
             // fit the grad gate above breaks first. Counting CONSECUTIVE stalls
             // tolerates a lone flat step; `MIN_ROUNDS` in a row is the fixed point.
             if previous_full_iterate_objective.is_finite() {
-                let round_improvement =
-                    (previous_full_iterate_objective - pre_step_total).max(0.0);
-                let objective_scale =
-                    previous_full_iterate_objective.abs().max(pre_step_total.abs()) + 1.0;
+                let round_improvement = (previous_full_iterate_objective - pre_step_total).max(0.0);
+                let objective_scale = previous_full_iterate_objective
+                    .abs()
+                    .max(pre_step_total.abs())
+                    + 1.0;
                 let relative_decrease = round_improvement / objective_scale;
                 if relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
                     consecutive_objective_stalls += 1;
-                    if consecutive_objective_stalls
-                        >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
+                    if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
                     {
                         // Converged on the quotient — the objective is at its
                         // numerical fixed point. The pre-step state is unperturbed
@@ -5213,12 +5338,7 @@ impl SaeManifoldTerm {
                                 trial_step_size,
                             )
                             .and_then(|()| {
-                                self.penalized_objective_total(
-                                    target,
-                                    rho,
-                                    analytic_penalties,
-                                    1.0,
-                                )
+                                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
                             })
                             .ok()
                             .map(|post_step_total| (post_step_total, ())))
@@ -5315,12 +5435,7 @@ impl SaeManifoldTerm {
             // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
             // that has fallen far behind its peers and reseed it onto the
             // residual; a strict no-op for K=1.
-            self.enforce_decoder_norm_guard(
-                target,
-                outer_iteration,
-                rho,
-                Some(&target_col_stats),
-            )?;
+            self.enforce_decoder_norm_guard(target, outer_iteration, rho, Some(&target_col_stats))?;
             self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). When the co-collapse
@@ -6402,8 +6517,8 @@ impl SaeManifoldTerm {
                     Ok(Some((trial_total, trial_loss)))
                 },
                 |trial_step, trial_total| {
-                    let armijo_bound = pre_step_total
-                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
+                    let armijo_bound =
+                        pre_step_total - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
                     trial_total.is_finite() && trial_total <= armijo_bound
                 },
             )?

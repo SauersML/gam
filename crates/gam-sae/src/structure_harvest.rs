@@ -442,7 +442,19 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
         // dedup — rather than a new `ClaimKind` variant, to avoid a cross-crate
         // enum change whose exhaustive-match fallout the design does not need.
         StructureMove::Glue { a, b } => ClaimKind::Custom {
-            label: format!("seam_glue:{}:{}", (*a).min(*b), (*a).max(*b)),
+            // Atom indices are only stable within one dictionary epoch.  A
+            // certified glue physically compacts the atom columns at the round
+            // boundary, so the next round's `(0, 1)` can denote a DIFFERENT
+            // pair than this round's `(0, 1)`.  Scope the running e-process by
+            // the parent dictionary's structural hash: contested seams in an
+            // unchanged dictionary still resume their evidence, while a
+            // compaction can never lend already-certified evidence to a newly
+            // re-indexed pair.
+            label: format!(
+                "seam_glue:{structure_hash:016x}:{}:{}",
+                (*a).min(*b),
+                (*a).max(*b)
+            ),
         },
     };
     MoveProposal {
@@ -1755,34 +1767,86 @@ fn remove_atoms(
     if remove.is_empty() {
         return Ok(());
     }
+    // Validate every atom-indexed container BEFORE mutating any of them.  The
+    // normal constructors maintain these invariants, but this function is the
+    // variable-K boundary and must return a useful error rather than partially
+    // compacting a malformed warm state and then panicking on an indexed gather.
+    let n = term.assignment.logits.nrows();
+    if term.assignment.logits.ncols() != k
+        || term.assignment.coords.len() != k
+        || term.assignment.ungated.len() != k
+    {
+        return Err(format!(
+            "remove_atoms: atom-indexed assignment shape mismatch: atoms={k}, \
+             logits={:?}, coords={}, ungated={}",
+            term.assignment.logits.dim(),
+            term.assignment.coords.len(),
+            term.assignment.ungated.len()
+        ));
+    }
+    if let Some(frozen) = term.assignment.frozen_logits.as_ref() {
+        if frozen.dim() != (n, k) {
+            return Err(format!(
+                "remove_atoms: frozen logits shape {:?} must equal ({n}, {k})",
+                frozen.dim()
+            ));
+        }
+    }
+    if rho.log_lambda_smooth.len() != k || rho.log_ard.len() != k {
+        return Err(format!(
+            "remove_atoms: rho per-atom lengths (smooth {}, ard {}) must equal K={k}",
+            rho.log_lambda_smooth.len(),
+            rho.log_ard.len()
+        ));
+    }
     let keep: Vec<usize> = (0..k).filter(|j| !remove.contains(j)).collect();
     // Rebuild the atom list, coord blocks, ungated flags, and ρ blocks keeping
     // only the surviving indices (descending removal on the Vecs would also work,
     // but the keep-mask keeps atoms/coords/logits/ρ provably in lock-step).
     term.atoms = keep.iter().map(|&j| term.atoms[j].clone()).collect();
     term.assignment.logits = term.assignment.logits.select(Axis(1), &keep);
-    term.assignment.coords = keep.iter().map(|&j| term.assignment.coords[j].clone()).collect();
+    term.assignment.coords = keep
+        .iter()
+        .map(|&j| term.assignment.coords[j].clone())
+        .collect();
     term.assignment.ungated = keep.iter().map(|&j| term.assignment.ungated[j]).collect();
-    term.assignment.frozen_logits = term
-        .assignment
-        .frozen_logits
-        .as_ref()
-        .map(|frozen| frozen.select(Axis(1), &keep));
+    // A frozen router was trained against the old dictionary.  Merely slicing
+    // its columns would not encode the fold's log-sum-exp mass transfer and
+    // would keep routing permanently frozen to an invalid model.  The reduced
+    // dictionary must refit its routing from the physically folded logits.
+    term.assignment.frozen_logits = None;
     // Per-atom ρ blocks (the block-relevance `log_lambda_block` is per-output-block,
     // not per-atom, so it is untouched).
     rho.log_lambda_smooth = keep.iter().map(|&j| rho.log_lambda_smooth[j]).collect();
     rho.log_ard = keep.iter().map(|&j| rho.log_ard[j].clone()).collect();
-    // Drop per-atom diagnostic/incumbent caches indexed by the OLD `K`: they are
-    // rebuilt on demand (the post-glue refit re-derives them), and carrying a
-    // stale length-`K` vector past a smaller dictionary would mis-index.
+    // Drop every K-dependent cache and optimization ledger.  Compaction changes
+    // both the column order and the quotient dimension, so retaining any of the
+    // old assembly layout, frozen pair gates, evidence-deflation anchor, or
+    // per-atom diagnostic reports would make the polish refit interpret old-K
+    // state as if it described the reduced dictionary.
     term.collapse_events.clear();
+    term.last_row_layout = None;
+    term.last_frames_active = false;
+    term.fixed_decoder_assembly = false;
+    term.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
+    term.decoder_repulsion_gate = None;
+    term.barrier_coactivation_gate = None;
+    term.streaming_gates_frozen = false;
+    term.curvature_walk_report = None;
+    term.expected_evidence_gauge_deflated_directions = None;
+    term.evidence_gauge_deflation_reanchors = 0;
+    term.evidence_gauge_deflation_last_delta_sign = 0;
+    term.dictionary_cocollapse_reseeds = 0;
+    term.structural_cocollapse_reseeds = 0;
     term.atom_inner_fits = None;
     term.oos_linear_images = None;
+    term.hybrid_split_report = None;
     term.best_cocollapse_incumbent = None;
     term.best_fit_incumbent = None;
-    // The row/border assembly layout is a `K`-dependent cache; drop it so the next
-    // assembly (the polish refit's basis refresh) rebuilds it for the reduced K.
-    term.last_row_layout = None;
+    // A cap equal to or wider than the reduced K is no longer an active-set cap.
+    // Re-normalize it through the canonical setter after K has changed.
+    let softmax_active_cap = term.softmax_active_cap;
+    term.set_softmax_active_cap(softmax_active_cap);
     Ok(())
 }
 
@@ -1806,23 +1870,45 @@ fn compact_glued_atoms(
     round_ledger: &SearchLedger,
 ) -> Result<usize, String> {
     use gam_solve::structure_search::MoveVerdict;
-    let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for rec in &round_ledger.moves {
-        if let (StructureMove::Glue { a, b }, MoveVerdict::Accepted { .. }) = (&rec.mv, &rec.verdict)
-        {
-            let (a, b) = (*a, *b);
-            let k = term.k_atoms();
-            if a >= k || b >= k || a == b {
-                return Err(format!(
-                    "compact_glued_atoms: accepted glue ({a},{b}) out of range (K={k})"
-                ));
+    let accepted_glues: Vec<(usize, usize)> = round_ledger
+        .moves
+        .iter()
+        .filter_map(|rec| {
+            if let (StructureMove::Glue { a, b }, MoveVerdict::Accepted { .. }) =
+                (&rec.mv, &rec.verdict)
+            {
+                Some((*a, *b))
+            } else {
+                None
             }
-            fold_atom_into(term, a, b)?;
-            if let Some(seam) = fit_seam_transition(term, a, b) {
-                transplant_glued_coords(term, a, b, &seam);
-            }
-            to_remove.insert(b);
+        })
+        .collect();
+    // Validate the whole accepted matching before the first fold.  The search
+    // engine enforces this through its `touched` set; checking again here keeps
+    // the variable-K boundary transactional even for resumed/deserialized or
+    // directly-constructed ledgers.
+    let k = term.k_atoms();
+    let mut touched = std::collections::BTreeSet::new();
+    for &(a, b) in &accepted_glues {
+        if a >= k || b >= k || a == b {
+            return Err(format!(
+                "compact_glued_atoms: accepted glue ({a},{b}) out of range or self-gluing (K={k})"
+            ));
         }
+        if !touched.insert(a) || !touched.insert(b) {
+            return Err(format!(
+                "compact_glued_atoms: accepted glues are not an atom-disjoint matching; \
+                 atom reused by ({a},{b})"
+            ));
+        }
+    }
+    let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (a, b) in accepted_glues {
+        fold_atom_into(term, a, b)?;
+        if let Some(seam) = fit_seam_transition(term, a, b) {
+            transplant_glued_coords(term, a, b, &seam);
+        }
+        to_remove.insert(b);
     }
     remove_atoms(term, rho, &to_remove)?;
     Ok(to_remove.len())
@@ -5201,6 +5287,29 @@ mod tests {
             "a spanning set (≥ k−1 = 3 edges) must reassemble the 4 arcs, got {}",
             report0.glues_proposed
         );
+        let first_epoch_glue_claims: Vec<ClaimKind> = report0
+            .proposals
+            .iter()
+            .filter(|proposal| matches!(proposal.mv, StructureMove::Glue { .. }))
+            .map(|proposal| proposal.claim.clone())
+            .collect();
+        assert!(!first_epoch_glue_claims.is_empty());
+
+        // Seed old-K state that MUST NOT survive a physical dictionary resize.
+        // These are all legitimate transient states immediately after a fit;
+        // the compactor owns invalidating them before the reduced-K polish.
+        term.assignment.frozen_logits = Some(term.assignment.logits.clone());
+        term.last_frames_active = true;
+        term.fixed_decoder_assembly = true;
+        term.border_hbb_workspace = Array2::<f64>::ones((3, 3));
+        term.decoder_repulsion_gate = Some(vec![(0, 1, 1.0)]);
+        term.streaming_gates_frozen = true;
+        term.expected_evidence_gauge_deflated_directions = Some(7);
+        term.evidence_gauge_deflation_reanchors = 2;
+        term.evidence_gauge_deflation_last_delta_sign = -1;
+        term.dictionary_cocollapse_reseeds = 3;
+        term.structural_cocollapse_reseeds = 4;
+        term.softmax_active_cap = Some(3);
         let accepted_glue = |a: usize, b: usize| MoveRecord {
             mv: StructureMove::Glue { a, b },
             trigger: 40.0,
@@ -5218,7 +5327,10 @@ mod tests {
             collapse_events: Vec::new(),
         };
         let removed = compact_glued_atoms(&mut term, &mut rho, &ledger).unwrap();
-        assert_eq!(removed, 2, "both folded partners must be physically excised");
+        assert_eq!(
+            removed, 2,
+            "both folded partners must be physically excised"
+        );
         assert_eq!(
             term.k_atoms(),
             2,
@@ -5228,6 +5340,29 @@ mod tests {
             rho.log_ard.len(),
             2,
             "ρ ARD blocks must fall in lock-step with the atoms"
+        );
+        assert_eq!(
+            rho.log_lambda_smooth.len(),
+            2,
+            "ρ smoothness blocks must fall in lock-step with the atoms"
+        );
+        assert!(
+            term.assignment.frozen_logits.is_none(),
+            "an old-K frozen router cannot survive compaction"
+        );
+        assert!(!term.last_frames_active);
+        assert!(!term.fixed_decoder_assembly);
+        assert_eq!(term.border_hbb_workspace.dim(), (0, 0));
+        assert!(term.decoder_repulsion_gate.is_none());
+        assert!(!term.streaming_gates_frozen);
+        assert_eq!(term.expected_evidence_gauge_deflated_directions, None);
+        assert_eq!(term.evidence_gauge_deflation_reanchors, 0);
+        assert_eq!(term.evidence_gauge_deflation_last_delta_sign, 0);
+        assert_eq!(term.dictionary_cocollapse_reseeds, 0);
+        assert_eq!(term.structural_cocollapse_reseeds, 0);
+        assert_eq!(
+            term.softmax_active_cap, None,
+            "a width-3 cap is inert after compaction to K=2"
         );
 
         // The two survivors each now cover a half-circle and STILL glue — the round
@@ -5243,6 +5378,37 @@ mod tests {
             report2.glues_proposed >= 1,
             "the two reassembled half-circle survivors must still glue toward K=1"
         );
+        for proposal in report2
+            .proposals
+            .iter()
+            .filter(|proposal| matches!(proposal.mv, StructureMove::Glue { .. }))
+        {
+            assert!(
+                !first_epoch_glue_claims.contains(&proposal.claim),
+                "a reduced dictionary must not reuse old atom-index evidence: {:?}",
+                proposal.claim
+            );
+        }
+    }
+
+    /// Variable-K compaction is transactional: malformed paired ρ state returns
+    /// an error before changing the term, instead of panicking halfway through a
+    /// gather and leaving atom/assignment arrays at different widths.
+    #[test]
+    fn physical_excision_refuses_misaligned_rho_without_mutation() {
+        let (mut term, mut rho) = tiled_circle_term(16, 3, &[1.0; 3]);
+        let atoms_before = term.k_atoms();
+        let logits_before = term.assignment.logits.clone();
+        rho.log_ard.pop();
+        let remove = std::collections::BTreeSet::from([1usize]);
+
+        let err = remove_atoms(&mut term, &mut rho, &remove).unwrap_err();
+        assert!(
+            err.contains("rho per-atom lengths"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(term.k_atoms(), atoms_before);
+        assert_eq!(term.assignment.logits, logits_before);
     }
 
     /// Oracle (#997 death trigger): a diverged ARD precision yields a DEATH
