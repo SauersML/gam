@@ -1345,6 +1345,59 @@ pub fn prefer_candidate_basin(
     }
 }
 
+/// #2230 — ONE-referee state preference for the inner-fit keep-best incumbent,
+/// keyed on the PENALIZED OBJECTIVE (the exact scalar the inner Armijo lane
+/// descends and the outer REML evidence consumes), with the #2081
+/// EV-then-uniformity ordering ([`prefer_candidate_basin`]) demoted to a
+/// tie-break at (near-)equal objective.
+///
+/// Rationale: the inner walk at a probed ρ is objective-monotone (Armijo), so a
+/// trajectory that ends at lower reconstruction EV has a LOWER penalized
+/// objective — at that ρ the objective genuinely prefers the walked-to state.
+/// An EV-keyed incumbent restore then installs a HIGHER-objective state, and
+/// because the restored state is ρ-independent the outer criterion gets priced
+/// at ≈ the same state for every probe: the outer objective flattens, the ρ
+/// search loses its gradient, and the fit grinds `max_iter` restoring the same
+/// incumbent after every evaluation (the #2230/#2134 churn signature). Keying
+/// the incumbent on the objective makes the restore fire ONLY when the
+/// non-monotone boundary hooks (collapse reseeds, gauge retraction/pin, frame
+/// refresh) genuinely damaged the walk — never to veto legitimate descent.
+///
+/// The objective tolerance is `tol` scale-relative (`tol·(1+max|obj|)`, the
+/// same reading [`crate::manifold::SAE_FINAL_EV_DEGRADATION_TOL`] already has
+/// on objective-scaled quantities); within that band the objectives are
+/// numerically tied and the EV/uniformity certificate picks the basin.
+pub fn prefer_candidate_state(
+    candidate_objective: f64,
+    candidate_ev: f64,
+    candidate_uniformity: Option<f64>,
+    incumbent_objective: f64,
+    incumbent_ev: f64,
+    incumbent_uniformity: Option<f64>,
+    tol: f64,
+) -> bool {
+    if !candidate_objective.is_finite() {
+        return false;
+    }
+    if !incumbent_objective.is_finite() {
+        return true;
+    }
+    let scale = tol * (1.0 + candidate_objective.abs().max(incumbent_objective.abs()));
+    if candidate_objective < incumbent_objective - scale {
+        return true; // strictly lower penalized objective — the walk's own referee
+    }
+    if candidate_objective > incumbent_objective + scale {
+        return false; // strictly higher objective can never displace the incumbent
+    }
+    prefer_candidate_basin(
+        candidate_ev,
+        candidate_uniformity,
+        incumbent_ev,
+        incumbent_uniformity,
+        tol,
+    )
+}
+
 impl SaeManifoldTerm {
     /// #2081 — aggregate chart-honesty score over the fit's `d = 1` atoms: the
     /// MEAN arc-length (unit-speed) DEFECT
@@ -1781,6 +1834,78 @@ mod coordinate_fidelity_tests {
             Some(0.0),
             0.5,
             Some(0.5),
+            tol
+        ));
+    }
+
+    /// #2230 ONE-referee ordering: the penalized objective is primary — a
+    /// lower-objective candidate wins even at catastrophically worse EV (the
+    /// walk's own preference at this ρ must never be vetoed), a higher-objective
+    /// candidate loses even at much better EV (the exact churn mode: the
+    /// high-EV incumbent must NOT displace a legitimately walked-to state), and
+    /// only a numerical objective tie falls through to EV-then-uniformity.
+    #[test]
+    fn prefer_candidate_state_prices_objective_then_ev() {
+        let tol = SAE_FINAL_EV_DEGRADATION_TOL;
+        // Strictly lower objective wins despite much worse EV.
+        assert!(prefer_candidate_state(
+            100.0,
+            0.13,
+            Some(0.5),
+            200.0,
+            0.65,
+            Some(0.01),
+            tol
+        ));
+        // Strictly higher objective loses despite much better EV — the #2230
+        // churn signature (EV 0.65 incumbent vetoing an EV 0.13 walked state).
+        assert!(!prefer_candidate_state(
+            200.0,
+            0.65,
+            Some(0.01),
+            100.0,
+            0.13,
+            Some(0.5),
+            tol
+        ));
+        // Numerically tied objective (within tol·(1+scale)): EV decides.
+        assert!(prefer_candidate_state(
+            100.0,
+            0.65,
+            Some(0.5),
+            100.0 + 0.5 * tol,
+            0.13,
+            Some(0.01),
+            tol
+        ));
+        // Tied objective AND near-equal EV: uniformity decides.
+        assert!(prefer_candidate_state(
+            100.0,
+            0.65,
+            Some(0.02),
+            100.0,
+            0.6502,
+            Some(0.20),
+            tol
+        ));
+        // Non-finite candidate objective never preferred.
+        assert!(!prefer_candidate_state(
+            f64::NAN,
+            0.9,
+            Some(0.0),
+            100.0,
+            0.1,
+            Some(0.5),
+            tol
+        ));
+        // Non-finite incumbent objective: any finite candidate adopted.
+        assert!(prefer_candidate_state(
+            100.0,
+            0.1,
+            None,
+            f64::INFINITY,
+            0.9,
+            None,
             tol
         ));
     }

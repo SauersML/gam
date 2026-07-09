@@ -4696,22 +4696,34 @@ impl SaeManifoldTerm {
             // fitting the dominant factor (high EV, no structure recovery).
             self.seed_cold_start_disjoint_charts(target, rho)?;
         }
-        // #1026 — keep the best real reconstruction basin found inside this
-        // bounded inner solve. The co-collapse guard can reseed onto a high-EV
-        // PC-periodic dictionary and then a later Newton step can drift back into
-        // the same low-EV basin before `into_fitted` gets a chance to compare
-        // against the pristine seed. Track an incumbent over states that have
-        // passed the identifiability audit and restore it if the final iterate
-        // degraded. This is not a PCA shortcut: the incumbent is the normal SAE
-        // dictionary state (coords, logits, decoder blocks) produced by the
-        // existing seed/reseed plus LSQ machinery.
+        // #1026/#2230 — keep the best state found inside this bounded inner
+        // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
+        // the same scalar the Armijo lane descends and the outer REML evidence
+        // consumes. The incumbent exists to undo damage from the NON-monotone
+        // boundary hooks (collapse reseeds, gauge retraction/pin, frame
+        // refresh) — the Armijo walk itself is objective-monotone, so under
+        // this key the end-of-loop restore never vetoes legitimate descent.
+        // The former EV key did: a walk that traded EV for penalty (the
+        // objective's own preference at this ρ) was "restored" back to the
+        // high-EV incumbent after EVERY probe, so the outer criterion was
+        // priced at ≈ the same ρ-independent state each evaluation and the ρ
+        // search flattened into the #2230/#2134 restore-churn grind. EV and
+        // coordinate uniformity remain as the tie-break at near-equal
+        // objective (#2081), and as telemetry. This is not a PCA shortcut:
+        // the incumbent is the normal SAE dictionary state (coords, logits,
+        // decoder blocks) produced by the existing seed/reseed + LSQ machinery.
         let mut best_reconstruction_ev = self
             .dictionary_reconstruction_ev(target, rho)
             .unwrap_or(f64::NEG_INFINITY);
+        let mut best_reconstruction_obj = self
+            .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+            .unwrap_or(f64::INFINITY);
         let initial_reconstruction_is_structurally_healthy = best_reconstruction_ev.is_finite()
+            && best_reconstruction_obj.is_finite()
             && self.structural_coherence_collapse_detected()?.is_none();
         // #2081 — the incumbent carries its coordinate-uniformity score alongside
-        // EV so the keep-best can break (near-)equal-EV ties on coordinate fidelity.
+        // EV so the keep-best can break (near-)equal-objective ties on coordinate
+        // fidelity.
         let mut best_reconstruction_uniformity = if initial_reconstruction_is_structurally_healthy {
             self.coordinate_uniformity_aggregate()
         } else {
@@ -4721,6 +4733,7 @@ impl SaeManifoldTerm {
             Some(self.snapshot_mutable_state())
         } else {
             best_reconstruction_ev = f64::NEG_INFINITY;
+            best_reconstruction_obj = f64::INFINITY;
             None
         };
         // #2100/#1117 — objective-stagnation convergence for the JOINT outer loop,
@@ -5325,18 +5338,25 @@ impl SaeManifoldTerm {
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
-                // #2081 — keep the best basin on EV FIRST and, at (near-)equal EV,
-                // on the coordinate-uniformity certificate ([`prefer_candidate_basin`]).
+                // #2230 — keep the best state on the PENALIZED OBJECTIVE first
+                // (the walk's own referee) and, at (near-)equal objective, on the
+                // #2081 EV-then-uniformity certificate ([`prefer_candidate_state`]).
                 if self.structural_coherence_collapse_detected()?.is_none() {
                     let candidate_uniformity = self.coordinate_uniformity_aggregate();
-                    if prefer_candidate_basin(
+                    let candidate_obj = self
+                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                        .unwrap_or(f64::INFINITY);
+                    if prefer_candidate_state(
+                        candidate_obj,
                         ev,
                         candidate_uniformity,
+                        best_reconstruction_obj,
                         best_reconstruction_ev,
                         best_reconstruction_uniformity,
                         SAE_FINAL_EV_DEGRADATION_TOL,
                     ) {
                         best_reconstruction_ev = ev;
+                        best_reconstruction_obj = candidate_obj;
                         best_reconstruction_uniformity = candidate_uniformity;
                         best_reconstruction_state = Some(self.snapshot_mutable_state());
                     }
@@ -5371,36 +5391,42 @@ impl SaeManifoldTerm {
         // (`reduce_atoms_to_data_supported_rank`), so its decoder lives in the
         // reduced `r_k`-wide coordinate by construction and carries no data-null
         // component to project away. No post-loop projection is needed.
-        if let Some(best_state) = best_reconstruction_state.as_ref() {
-            if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
-                if best_reconstruction_ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
-                    && final_ev.is_finite()
-                    && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < best_reconstruction_ev
-                {
-                    // #2230 two-referee instrumentation: log the CRITERION's
-                    // opinion of the walked-to state alongside the EV guard's
-                    // veto, so a churn log decides empirically whether the
-                    // outer criterion genuinely prefers the basins this guard
-                    // keeps restoring (criterion↔guard conflict) or the walk
-                    // is pure line-search hysteresis. Penalized total only —
-                    // no factorization, same objective the Armijo lane uses.
-                    let walked_obj = self
-                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                        .unwrap_or(f64::NAN);
-                    log::warn!(
-                        "[#1026] restoring inner-fit reconstruction incumbent after EV degraded \
-                         from {best_reconstruction_ev:.4} to {final_ev:.4} \
-                         (walked-to penalized objective {walked_obj:.6e} — compare against the \
-                         restored state's next accepted objective to adjudicate #2230's \
-                         two-referee conflict)"
-                    );
-                    self.restore_mutable_state(best_state)?;
-                    if self.frames_active() {
-                        self.refresh_active_frames_from_data(target, rho)
-                            .map_err(|err| {
-                                format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                            })?;
-                    }
+        if let Some(best_state) = best_reconstruction_state.as_ref()
+            && best_reconstruction_obj.is_finite()
+        {
+            // #2230 ONE-referee restore: the incumbent is restored ONLY when the
+            // final iterate's PENALIZED OBJECTIVE — the exact scalar the Armijo
+            // lane descended and the outer evidence will consume — is materially
+            // WORSE than the banked best. The Armijo walk is objective-monotone,
+            // so this fires solely when a non-monotone boundary hook (collapse
+            // reseed, gauge retraction/pin, frame refresh) damaged the state; a
+            // walk that legitimately traded reconstruction EV for penalty is the
+            // objective's own preference at this ρ and is KEPT, so the outer ρ
+            // search sees a criterion that actually varies with ρ (the former
+            // EV-keyed veto restored the same ρ-independent incumbent after
+            // every probe and flattened the outer objective into the
+            // #2230/#2134 restore-churn grind).
+            let final_obj = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
+            let obj_scale = SAE_FINAL_EV_DEGRADATION_TOL
+                * (1.0 + final_obj.abs().max(best_reconstruction_obj.abs()));
+            if !(final_obj <= best_reconstruction_obj + obj_scale) {
+                let final_ev = self
+                    .dictionary_reconstruction_ev(target, rho)
+                    .unwrap_or(f64::NAN);
+                log::warn!(
+                    "[#1026] restoring inner-fit incumbent: final penalized objective \
+                     {final_obj:.6e} degraded past banked {best_reconstruction_obj:.6e} \
+                     (EV {final_ev:.4} vs banked {best_reconstruction_ev:.4}) — \
+                     non-monotone boundary-hook damage, not line-search descent"
+                );
+                self.restore_mutable_state(best_state)?;
+                if self.frames_active() {
+                    self.refresh_active_frames_from_data(target, rho)
+                        .map_err(|err| {
+                            format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                        })?;
                 }
             }
         }
