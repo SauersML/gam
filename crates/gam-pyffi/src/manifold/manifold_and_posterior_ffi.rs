@@ -7332,6 +7332,39 @@ fn sae_atom_topologies(bases: Vec<String>) -> (Option<String>, Vec<String>) {
     (scalar, per_atom)
 }
 
+/// Rust owner of the periodic shape-band reorder (#2091). Stably sorts a periodic
+/// atom's `(N, 1)` shape-band coordinates ascending and reindexes the amplitude-
+/// correct mean and (optional) sd to match, mirroring `_periodic_shape_band` in
+/// `from_payload`: `coords`/`mean` absent -> the whole band is dropped
+/// (`(None, None, None)`), multi-column `coords` -> a `ValueError`. A later
+/// increment's `from_fit_payload` builder consumes the same Rust helper directly.
+#[pyfunction(signature = (coords, mean, sd))]
+fn sae_periodic_shape_band_reorder<'py>(
+    py: Python<'py>,
+    coords: Option<PyReadonlyArray2<'py, f64>>,
+    mean: Option<PyReadonlyArray1<'py, f64>>,
+    sd: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<(
+    Option<Bound<'py, PyArray2<f64>>>,
+    Option<Bound<'py, PyArray1<f64>>>,
+    Option<Bound<'py, PyArray1<f64>>>,
+)> {
+    let coords_owned = coords.map(|a| a.as_array().to_owned());
+    let mean_owned = mean.map(|a| a.as_array().to_owned());
+    let sd_owned = sd.map(|a| a.as_array().to_owned());
+    let (c, m, s) = crate::manifold::manifold_sae_coercion::periodic_shape_band_reorder(
+        coords_owned,
+        mean_owned,
+        sd_owned,
+    )
+    .map_err(py_value_error)?;
+    Ok((
+        c.map(|a| a.into_pyarray(py)),
+        m.map(|a| a.into_pyarray(py)),
+        s.map(|a| a.into_pyarray(py)),
+    ))
+}
+
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
 /// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:
