@@ -59,7 +59,7 @@
 //!    caller to the existing exact multi-start solve. No approximation enters
 //!    silently.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 use crate::candidate_index::{AtomFrameSketch, SaeCandidateIndex, auto_candidate_budget};
 use crate::manifold::{
@@ -2450,7 +2450,16 @@ impl EncodeAtlas {
             (0..n)
                 .map(|row| {
                     let z = amplitudes[row];
-                    if !z.is_finite() {
+                    // F4 — ACTIVITY GATE BEFORE ROUTING: an inactive (z = 0) or
+                    // non-finite-amplitude row is skipped by the predictor loop
+                    // below (`amp.abs() > 0.0`), so its chart never matters. Routing
+                    // it anyway is the dense `O(n·K·C·p)` waste this path incurs at
+                    // massive K, where each atom is active on only a sparse handful of
+                    // the N rows yet the routing scan still touches every (row, chart)
+                    // pair. Gate the amplitude here so the `C·p` distance scan runs
+                    // only for the atom's genuinely-active rows; the chart-0 sentinel
+                    // is moot for the gated rows (they are dropped downstream).
+                    if !(z.is_finite() && z.abs() > 0.0) {
                         return 0usize;
                     }
                     let x_row = x.row(row);
@@ -3772,39 +3781,60 @@ pub fn joint_encode_fallback_fraction(
     if n == 0 || k_atoms == 0 {
         return Ok(0.0);
     }
-    // Per-atom row tangents (None ⇒ evaluator-less atom, no coupling).
-    let mut tangents: Vec<Option<Vec<Array2<f64>>>> = Vec::with_capacity(k_atoms);
-    for (atom_idx, atom) in atoms.iter().enumerate() {
-        if coords[atom_idx].nrows() != n {
+    // F5 — FILTER BEFORE MATERIALIZE: the dense form built the full `n × K`
+    // tangent tensor (`atom_row_tangents` over every atom, all N rows) BEFORE the
+    // per-row activity filter, which OOMs at `K = 32k` even though each row couples
+    // only through its co-active atoms. Cross-coupling exists only among a row's
+    // co-active, differentiable atoms (`z > floor`), so materialize just that row's
+    // active tangents, lazily, per row. `atom_row_tangents` is row-wise, so the
+    // single-row slice is bit-identical to the batched evaluate the dense path
+    // indexed — the fallback fraction is unchanged; only the peak allocation drops
+    // from `O(n·K·d·p)` to the max active-set size per row.
+    for (atom_idx, coord) in coords.iter().enumerate() {
+        if coord.nrows() != n {
             return Err(format!(
                 "joint_encode_fallback_fraction: coord block {atom_idx} has {} rows, expected {n}",
-                coords[atom_idx].nrows()
+                coord.nrows()
             ));
         }
-        tangents.push(atom_row_tangents(atom, coords[atom_idx].view())?);
     }
     let mut fallback_rows = 0usize;
     for row in 0..n {
-        // Gather this row's co-active, differentiable atoms.
+        // Gather this row's co-active, differentiable atoms (evaluator-less atoms
+        // carry no coupling — same `is_some()` predicate the dense path applied via
+        // `tangents[k].is_some()`).
         let active: Vec<usize> = (0..k_atoms)
-            .filter(|&k| amplitudes[[row, k]] > amplitude_floor && tangents[k].is_some())
+            .filter(|&k| amplitudes[[row, k]] > amplitude_floor && atoms[k].basis_evaluator.is_some())
             .collect();
         if active.len() < 2 {
             continue; // no cross blocks: the per-atom certificate composes trivially
         }
-        let mut row_needs_multistart = false;
+        // Materialize ONLY this row's active tangents (one `d × p` block per active
+        // atom), never the dense tensor. An atom that unexpectedly yields no tangent
+        // (evaluator present but non-differentiable) simply drops out of the coupling,
+        // exactly as a `None` block did in the dense path.
+        let mut tans: Vec<Array2<f64>> = Vec::with_capacity(active.len());
+        let mut zs: Vec<f64> = Vec::with_capacity(active.len());
         for &k in &active {
-            let tan_k = &tangents[k].as_ref().unwrap()[row];
-            let zk = amplitudes[[row, k]];
+            let coord_row = coords[k].row(row).insert_axis(Axis(0)); // (1, d)
+            if let Some(mut block) = atom_row_tangents(&atoms[k], coord_row)? {
+                tans.push(block.pop().expect("single-row tangents carry one block"));
+                zs.push(amplitudes[[row, k]]);
+            }
+        }
+        if tans.len() < 2 {
+            continue;
+        }
+        let mut row_needs_multistart = false;
+        for (ki, tan_k) in tans.iter().enumerate() {
+            let zk = zs[ki];
             let lam_min = min_curvature_eigenvalue(tan_k, zk)?;
             let mut coupling = 0.0;
-            for &j in &active {
-                if j == k {
+            for (ji, tan_j) in tans.iter().enumerate() {
+                if ji == ki {
                     continue;
                 }
-                let tan_j = &tangents[j].as_ref().unwrap()[row];
-                let zj = amplitudes[[row, j]];
-                coupling += cross_block_frobenius(tan_k, tan_j, zk, zj);
+                coupling += cross_block_frobenius(tan_k, tan_j, zk, zs[ji]);
             }
             if lam_min <= coupling {
                 row_needs_multistart = true;
