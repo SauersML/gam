@@ -1043,27 +1043,41 @@ fn fit_seam_transition(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<Sea
 
 /// The seam equivalence e-value (#1890): does chart A's arc lie on chart B's
 /// curve AND vice versa, within the reconstruction band, beyond the pooled
-/// independent-scatter (churn-null) scale?
+/// independent-scatter (churn-scatter reference null) scale?
 ///
-/// For every seam point the per-point statistic is the Gaussian likelihood ratio
-/// `N(x; nearest point on the OTHER chart's curve, σ_band²) / N(x; pooled
-/// centroid, σ_pool²)`, both directions, summed to a log-e-value:
+/// Per point the statistic is the Gaussian likelihood ratio `N(x; nearest point
+/// on the OTHER chart's curve, σ_band²) / N(x; pooled centroid, σ_pool²)`, both
+/// directions, summed to a log-e-value:
 ///
-/// * `σ_band²` — per-coordinate reconstruction noise floor, the mean squared
-///   dictionary residual over the pair's rows (the isometry TOLERANCE: how close
-///   "the same manifold" must decode).
+/// * `σ_band²` — per-coordinate reconstruction noise floor (the isometry
+///   TOLERANCE), the mean squared dictionary residual over the pair's rows,
+///   floored by the GRID QUANTIZATION variance below (a nearest-point residual
+///   cannot be resolved below half a curve-sample spacing, so a perfect glue's
+///   quantization residual must not be charged as tolerance violation — without
+///   this floor a near-exact glue is a FALSE REJECT).
 /// * `σ_pool²` — per-coordinate scatter of the pooled decoded points about their
-///   centroid (the churn-null currency: how far apart INDEPENDENT curves' points
-///   sit). A pair whose pooled scatter is no larger than the reconstruction
-///   floor cannot be discriminated and yields no e-value.
+///   centroid (the reference-null currency: how far apart INDEPENDENT curves'
+///   points sit). A pair whose pooled scatter is no larger than the band cannot
+///   be discriminated and yields no e-value.
 ///
-/// Two arcs of ONE circle decode ONTO each other's curve (`e_glue ≈ 0 ≪ σ_pool`)
-/// so the ratio is large positive; two DISTINCT circles decode FAR from each
-/// other's curve (`e_glue ~ σ_pool ≫ σ_band`) so the `−e_glue/(2σ_band²)` term
-/// drives the ratio large negative — the tied-EV-cannot-win property the issue
-/// requires. This is a plug-in e-value (band/pool estimated from the same rows,
-/// the same discipline as every harvest trigger); the churn null is the
-/// calibration currency, not a held-out split.
+/// # Honesty: this is a genuine e-value, by SAMPLE SPLITTING
+///
+/// `σ_band²`, `σ_pool²` and the centroid `μ` are estimated on the EVEN-indexed
+/// boundary points and the per-point ratios are evaluated ONLY on the
+/// ODD-indexed points. The reference-null density and the numerator variance are
+/// therefore independent of the points they are scored on, so under the null
+/// (odd points drawn from the isotropic churn-scatter reference `N(μ, σ_pool²I)`)
+/// `E_null[∏ q/p] = ∏ E_null[q/p] = 1` — a bona-fide e-value, not the plug-in LR
+/// a same-data estimate would give (whose optimism has no `E[e]≤1` guarantee).
+/// The e-value is stated against the isotropic-Gaussian reference null at the
+/// pooled scale; that is the "independent decode scatter" the churn currency
+/// stands in for.
+///
+/// Two arcs of ONE circle decode ONTO each other's curve (`e_glue ≈ σ_band ≪
+/// σ_pool`) so the ratio is large positive; two DISTINCT circles decode FAR from
+/// each other's curve (`e_glue ~ σ_pool ≫ σ_band`) so the `−e_glue/(2σ_band²)`
+/// term drives the ratio large negative — the tied-EV-cannot-win property the
+/// issue requires.
 fn glue_pair_evalue(
     term: &SaeManifoldTerm,
     residuals: ArrayView2<'_, f64>,
@@ -1075,70 +1089,97 @@ fn glue_pair_evalue(
     if p == 0 || residuals.ncols() != p {
         return None;
     }
-    // Pooled independent-scatter scale (the churn-null currency): union points
-    // about their pooled centroid.
-    let n_union = seam.points_a.nrows() + seam.points_b.nrows();
-    if n_union == 0 {
+    let na = seam.points_a.nrows();
+    let nb = seam.points_b.nrows();
+    // Sample split needs at least one estimation and one evaluation point on
+    // each side (even/odd parity), so ≥ 2 active points per atom.
+    if na < 2 || nb < 2 {
         return None;
     }
+    let a_est: Vec<usize> = (0..na).filter(|i| i % 2 == 0).collect();
+    let a_eval: Vec<usize> = (0..na).filter(|i| i % 2 == 1).collect();
+    let b_est: Vec<usize> = (0..nb).filter(|i| i % 2 == 0).collect();
+    let b_eval: Vec<usize> = (0..nb).filter(|i| i % 2 == 1).collect();
+    let n_est = a_est.len() + b_est.len();
+    let n_eval = a_eval.len() + b_eval.len();
+    if n_est == 0 || n_eval == 0 {
+        return None;
+    }
+
+    // --- Reference-null centroid + scatter, ESTIMATED on the even points ------
     let mut mu = vec![0.0_f64; p];
-    for i in 0..seam.points_a.nrows() {
+    for &i in &a_est {
         for c in 0..p {
             mu[c] += seam.points_a[[i, c]];
         }
     }
-    for i in 0..seam.points_b.nrows() {
+    for &i in &b_est {
         for c in 0..p {
             mu[c] += seam.points_b[[i, c]];
         }
     }
     for c in 0..p {
-        mu[c] /= n_union as f64;
+        mu[c] /= n_est as f64;
     }
     let point_null_sq = |pt: ArrayView1<'_, f64>| -> f64 {
         (0..p).map(|c| (pt[c] - mu[c]).powi(2)).sum::<f64>()
     };
     let mut pool_acc = 0.0_f64;
-    for i in 0..seam.points_a.nrows() {
+    for &i in &a_est {
         pool_acc += point_null_sq(seam.points_a.row(i));
     }
-    for i in 0..seam.points_b.nrows() {
+    for &i in &b_est {
         pool_acc += point_null_sq(seam.points_b.row(i));
     }
-    let pool_sq = pool_acc / (n_union as f64 * p as f64);
+    let pool_sq = pool_acc / (n_est as f64 * p as f64);
     if !(pool_sq.is_finite() && pool_sq > 0.0) {
         return None;
     }
-    // Per-coordinate reconstruction noise floor over the pair's rows, floored
-    // WELL below the pooled scatter so a near-perfect glue banks a large finite
-    // certificate rather than dividing by zero.
+
+    // --- Reconstruction band (tolerance), ESTIMATED on the even rows ----------
     let mut band_acc = 0.0_f64;
     let mut band_rows = 0usize;
-    for &r in seam.rows_a.iter().chain(seam.rows_b.iter()) {
+    for &i in &a_est {
+        let r = seam.rows_a[i];
         for c in 0..p {
             band_acc += residuals[[r, c]].powi(2);
         }
         band_rows += 1;
     }
-    if band_rows == 0 {
-        return None;
+    for &i in &b_est {
+        let r = seam.rows_b[i];
+        for c in 0..p {
+            band_acc += residuals[[r, c]].powi(2);
+        }
+        band_rows += 1;
     }
-    let band_sq = (band_acc / (band_rows as f64 * p as f64)).max(pool_sq * 1.0e-12);
-    // A pooled scatter no larger than the reconstruction floor cannot separate
-    // "same manifold" from "independent blob" — no e-value.
+    let band_raw = if band_rows == 0 {
+        0.0
+    } else {
+        band_acc / (band_rows as f64 * p as f64)
+    };
+    // Grid-quantization floor: a nearest-point residual to a curve sampled at
+    // `GLUE_CURVE_GRID` points cannot be resolved below ~half the mean sample
+    // spacing, so the per-coordinate band cannot honestly claim to be tighter.
+    // Derived from the curves' own arc lengths, never hardcoded.
+    let quant_full = curve_quantization_sq(&seam.curve_a).max(curve_quantization_sq(&seam.curve_b));
+    let quant_band = quant_full / p as f64;
+    let band_sq = band_raw.max(quant_band).max(pool_sq * 1.0e-12);
+    // A pooled scatter no larger than the band cannot separate "same manifold"
+    // from "independent blob" — no e-value.
     if !(pool_sq > band_sq) {
         return None;
     }
+
+    // --- Per-point likelihood ratio, EVALUATED on the odd points --------------
     let norm_term = (p as f64 / 2.0) * (pool_sq / band_sq).ln();
     let mut log_e = 0.0_f64;
-    // B's arc projected onto A's curve.
-    for i in 0..seam.points_b.nrows() {
+    for &i in &b_eval {
         let (_gi, e_glue) = nearest_curve_sq(seam.points_b.row(i), &seam.curve_a);
         let e_null = point_null_sq(seam.points_b.row(i));
         log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
     }
-    // A's arc projected onto B's curve.
-    for i in 0..seam.points_a.nrows() {
+    for &i in &a_eval {
         let (_gi, e_glue) = nearest_curve_sq(seam.points_a.row(i), &seam.curve_b);
         let e_null = point_null_sq(seam.points_a.row(i));
         log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
@@ -1156,6 +1197,32 @@ fn glue_pair_evalue(
         offset: seam.offset,
         log_e_value: log_e,
     })
+}
+
+/// Grid-quantization squared-distance floor for a periodic decoded curve: the
+/// worst-case nearest-sample residual for a query point lying on the curve is
+/// about half the mean sample spacing (chord length), because the curve is only
+/// known at [`GLUE_CURVE_GRID`] samples. Returned as a FULL-vector squared
+/// distance (summed over ambient coordinates), derived from the curve's own arc
+/// length — the geometry sets the floor, not a constant.
+fn curve_quantization_sq(curve: &Array2<f64>) -> f64 {
+    let g = curve.nrows();
+    let p = curve.ncols();
+    if g < 2 || p == 0 {
+        return 0.0;
+    }
+    let mut arc_len = 0.0_f64;
+    for i in 0..g {
+        let j = (i + 1) % g; // closed loop: the curve is one period
+        let mut seg = 0.0_f64;
+        for c in 0..p {
+            let d = curve[[j, c]] - curve[[i, c]];
+            seg += d * d;
+        }
+        arc_len += seg.sqrt();
+    }
+    let mean_spacing = arc_len / g as f64;
+    (0.5 * mean_spacing).powi(2)
 }
 
 /// Emit the chart-gluing proposal lane (#1890) into `proposals`, ranked under
