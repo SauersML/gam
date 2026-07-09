@@ -739,7 +739,7 @@ mod cpu_sized_plan_laziness_tests {
         let before = GpuRuntime::global_call_count();
         // The plan itself is irrelevant here; the test asserts the side effect
         // that computing it consulted the device budget.
-        drop(sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768));
+        sae_streaming_plan_for_shape(2_000_000, 4_096, 512, 8, 32_768);
         assert!(
             GpuRuntime::global_call_count() > before,
             "an oversized plan must consult GpuRuntime::global() for the \
