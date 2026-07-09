@@ -472,13 +472,14 @@ impl GaussianLocationScaleFamily {
         let directional = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
         let dhmumu = directional.0;
         let dh_ls_ls = directional.2;
-        // Fisher cross block E[H_{μ,ls}] ≡ 0 (μ ⊥ σ; see
-        // exact_newton_joint_hessian_from_designs / #684), so its directional
-        // derivative is identically 0 — keep the Hessian's curvature object the
-        // block-diagonal Gaussian Fisher information at every order. The
-        // observed-cross directional weight (`directional.1`) is therefore not
-        // assembled.
-        let dhmu_ls = Array1::<f64>::zeros(dhmumu.len());
+        // Observed cross block H_{μ,ls} = 2κm is nonzero away from the truth
+        // (the value Hessian carries it; see
+        // exact_newton_joint_hessian_from_designs / #1561), so its directional
+        // derivative d(2κm)[ξ] = −2κw·ξ_μ + (2κ'−4κ²)m·ξ_s is nonzero too. Use
+        // the computed observed-cross channel (`directional.1`) so the Hessian's
+        // derivative and its value are the SAME functional at every order (no
+        // objective↔gradient desync feeding the outer criterion).
+        let dhmu_ls = directional.1;
 
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &dhmumu, &dhmu_ls, &dh_ls_ls,
@@ -524,10 +525,12 @@ impl GaussianLocationScaleFamily {
             gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
         let d2hmumu = second.0;
         let d2h_ls_ls = second.2;
-        // Fisher cross block E[H_{μ,ls}] ≡ 0 (μ ⊥ σ; #684), so its second
-        // directional derivative is identically 0; `second.1` (observed) is not
-        // assembled, keeping the curvature object block-diagonal Fisher.
-        let d2hmu_ls = Array1::<f64>::zeros(d2hmumu.len());
+        // Observed cross block H_{μ,ls} = 2κm (see
+        // exact_newton_joint_hessian_from_designs / #1561); its second
+        // directional derivative d²(2κm)[u,v] (`second.1`) is nonzero and must
+        // be assembled so the value and its second derivative are the SAME
+        // functional at every order.
+        let d2hmu_ls = second.1;
 
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &d2hmumu, &d2hmu_ls, &d2h_ls_ls,
