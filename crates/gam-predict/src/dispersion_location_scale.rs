@@ -350,33 +350,33 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         if mean.len() != precision.len() {
             return Ok(None);
         }
-        // Per-row response variance `Var(Y | μ, φ)` and the per-row dispersion in
-        // the family's natural units (NB θ, Tweedie φ; Gamma/Beta ignore it). The
-        // moment-matched predictive then carries each row's exact conditional law,
-        // widened only by that row's estimation SE.
+        // Per-row observation-noise variance `E[Var(Y | μ, φ)]` integrated over
+        // the joint (η_μ, η_d) posterior (see `integrated_response_variance` —
+        // the plug-in law understates the band wherever the scale predictor is
+        // uncertain, audit finding 6), and the per-row dispersion in the
+        // family's natural units (NB θ, Tweedie φ; Gamma/Beta ignore it). The
+        // moment-matched predictive then carries each row's conditional law,
+        // widened by that row's estimation SE. The plug-in dispersion still
+        // selects the predictive *shape*; the integrated variance sets its
+        // width.
         let n = mean.len();
-        let mut response_var = Array1::<f64>::zeros(n);
         let mut dispersion = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let mu = mean[i];
             let prec = precision[i];
-            let (var, disp) = match response {
-                ResponseFamily::NegativeBinomial { .. } => (mu + mu * mu / prec, prec),
-                ResponseFamily::Gamma => (mu * mu / prec, prec),
-                ResponseFamily::Beta { .. } => (mu * (1.0 - mu) / (1.0 + prec), prec),
-                // Tweedie precision is `1/φ`, so `φ = 1/prec` enters both the
-                // variance law and the compound-distribution quantile.
-                ResponseFamily::Tweedie { p } => {
-                    let phi = 1.0 / prec.max(f64::MIN_POSITIVE);
-                    (phi * mu.powf(*p), phi)
-                }
+            let disp = match response {
+                ResponseFamily::NegativeBinomial { .. }
+                | ResponseFamily::Gamma
+                | ResponseFamily::Beta { .. } => prec,
+                // Tweedie precision is `1/φ`, so `φ = 1/prec` enters the
+                // compound-distribution quantile.
+                ResponseFamily::Tweedie { .. } => 1.0 / prec.max(f64::MIN_POSITIVE),
                 // Any other response is not a dispersion location-scale family;
                 // leave the band to the symmetric driver.
                 _ => return Ok(None),
             };
-            response_var[i] = var.max(0.0);
             dispersion[i] = disp;
         }
+        let response_var = self.integrated_response_variance(input)?;
         let (lower, upper) = family_observation_band_per_row(
             response,
             mean,
