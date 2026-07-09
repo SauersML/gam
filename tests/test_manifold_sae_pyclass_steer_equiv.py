@@ -124,6 +124,76 @@ def test_reconstruct_encode_oos_bitwise_equivalence_circle() -> None:
     np.testing.assert_array_equal(fit.encode(x_oos), core.encode(x_oos))
 
 
+def test_reconstruct_encode_oos_hybrid_split_parse_exercised() -> None:
+    """Exercise the Rust `_hybrid_linear_images_for_oos` port at the boundary.
+
+    A natural hybrid collapse is gate/data-dependent and not reliably forced
+    from a small Python fit, so — following the established #1204/#1026 pattern —
+    a schema-valid `hybrid_split` (exactly the shape the FFI emits) is injected
+    onto a real euclidean d=1 fit and carried through `to_dict()`. Both the
+    dataclass (`ManifoldSAE._hybrid_linear_images_for_oos`) and the pyclass
+    (`manifold_sae_hybrid_linear_images`) parse that same block into the OOS
+    linear-image map and feed identical images to the identical OOS solve, so
+    the reconstruction/encoding are bitwise equal IFF the two parsers agree.
+    Three parser branches are covered: `v` absent (ordinary straight image),
+    `v` present (collapse-rescue), and a `linear_image`-less entry (skipped).
+    A plain-vs-injected sanity assertion guarantees the images are actually
+    consumed, so this cannot pass vacuously with a silently-dropped parse."""
+    core_cls = _core_cls()
+    if not hasattr(core_cls, "reconstruct") or not hasattr(core_cls, "encode"):
+        pytest.skip("wheel predates ManifoldSaeCore.reconstruct/encode (#2091)")
+    n, p = 40, 5
+    rng = np.random.default_rng(11)
+    # Two 1-D linear latents -> two euclidean d=1 atoms, both collapse-eligible.
+    t = rng.standard_normal((n, 2))
+    mixing = rng.standard_normal((2, p))
+    x = (t @ mixing + 0.02 * rng.standard_normal((n, p))).astype(np.float64)
+    x -= x.mean(axis=0, keepdims=True)
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=2, d_atom=1, atom_topology="euclidean", assignment="softmax",
+        n_iter=8, random_state=0,
+    )
+
+    core_plain = core_cls(fit.to_dict())  # hybrid_split is None here
+
+    # A hybrid_split shaped exactly as the FFI emits it (plain JSON scalars/lists
+    # so it survives to_dict -> json.dumps). b0/b1/v are length p, as production.
+    b0 = [0.10 * (i + 1) for i in range(p)]
+    b1 = [0.05 * (p - i) for i in range(p)]
+    v_unit = [1.0] + [0.0] * (p - 1)
+    fit.hybrid_split = {
+        "curved_atom_count": 0,
+        "linear_atom_count": 2,
+        "atoms": [
+            {  # v absent -> ordinary straight image
+                "atom": "atom_0", "kept_curved": False,
+                "linear_image": {"atom_idx": 0, "t_bar": 0.3, "b0": b0, "b1": b1},
+            },
+            {  # v present -> collapse-rescue (target-aware) branch
+                "atom": "atom_1", "kept_curved": False,
+                "linear_image": {"atom_idx": 1, "t_bar": -0.2, "b0": b0, "b1": b1, "v": v_unit},
+            },
+            {"atom": "atom_2_dummy", "kept_curved": True},  # no linear_image -> skipped
+        ],
+    }
+    assert fit._hybrid_linear_images_for_oos() is not None  # Python parse populated
+    core_hyb = core_cls(fit.to_dict())
+
+    x_oos = (rng.standard_normal((16, p))).astype(np.float64)
+    x_oos -= x_oos.mean(axis=0, keepdims=True)
+
+    recon_dc = fit.reconstruct(x_oos)
+    recon_core = core_hyb.reconstruct(x_oos)
+    np.testing.assert_array_equal(recon_dc, recon_core)
+    np.testing.assert_array_equal(fit.encode(x_oos), core_hyb.encode(x_oos))
+    # Not vacuous: the injected images must actually move the reconstruction, so
+    # the parse is observable in the output (a dropped parse would match plain).
+    assert not np.array_equal(core_plain.reconstruct(x_oos), recon_core), (
+        "injected hybrid linear images did not change the OOS reconstruction — "
+        "the parse is not being exercised"
+    )
+
+
 def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
     """Euclidean (degree-2 patch) atom: exercises the duchon_centers threading
     that the circle atom (no centers) does not."""
