@@ -1436,6 +1436,14 @@ pub(crate) fn duchon_native_penalty_candidates(
         z,
     )?;
     let n_pre = n_kernel + poly_cols;
+    // Range-floor the ill-conditioned curvature spectrum so its numerical null
+    // space is exactly the polynomial null space (#1815): without this, the
+    // Duchon Gram's low-curvature tail sits below `analyze_penalty_block`'s
+    // `nrows·1e-10·λmax` cutoff and those retained kernel modes are classed
+    // UNPENALIZED, so no `λ` collapses them and the smooth cannot reach the null
+    // on an irrelevant covariate. `n_pre` is the embedded penalty dimension the
+    // assembled block is later scored against.
+    let omega = duchon_range_floor_curvature(&omega, n_pre)?;
     let mut primary_pre = Array2::<f64>::zeros((n_pre, n_pre));
     primary_pre
         .slice_mut(s![..n_kernel, ..n_kernel])

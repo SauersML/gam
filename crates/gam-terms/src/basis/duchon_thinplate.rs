@@ -841,6 +841,76 @@ pub(crate) fn duchon_whiten_affine_slopes_in_place(
     Ok(())
 }
 
+/// Range-floor the reparam'd Duchon Primary curvature block so its numerical
+/// null space is exactly the polynomial null space, not inflated by the
+/// ill-conditioned kernel Gram's low-curvature tail.
+///
+/// The default duchon adopts the data-metric radial reparam `V`, so the Primary
+/// penalty kernel block is `Vᵀ Ω_c V` — diagonal in the `μ` (generalized
+/// curvature) eigenvalues. The Duchon polyharmonic Gram is extremely
+/// ill-conditioned (cond ≫ 1e10 at k=20), so most `μ` fall far below the
+/// numerical-rank cutoff `spectral_tolerance = nrows·1e-10·λmax` that
+/// [`analyze_penalty_block`] uses to partition range vs null. Those genuine
+/// low-curvature directions are then mis-classified as UNPENALIZED null:
+/// retained in the design (they clear the SEPARATE `k·ε` design-support floor)
+/// but shrinkable by NO `λ`, so the smooth cannot collapse toward the null on an
+/// irrelevant covariate (measured `nulldim = 19` vs the affine `{1,x} = 2`
+/// expected on the gam#1815 null-recovery fixture) and REML over-selects EDF.
+///
+/// Lift the smallest eigenvalues to a relative floor one decade above that
+/// cutoff (`nrows·1e-9·λmax`, with `nrows` the EMBEDDED penalty dimension
+/// kernel+poly, so the floor clears the tolerance the assembled block is scored
+/// against) so every retained mode is a genuine — if weak — penalized `Range`
+/// direction; REML's `λ→∞` tail then collapses them. The floor is far below the
+/// statistical scale and lifts only the lowest-curvature (near-linear) modes, so
+/// signal recovery (e.g. the sin8 centers=50 escape) is unchanged — the
+/// high-curvature signal modes sit orders of magnitude above the floor.
+pub(crate) fn duchon_range_floor_curvature(
+    omega: &Array2<f64>,
+    embedded_penalty_dim: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let n = omega.nrows();
+    if n == 0 {
+        return Ok(omega.clone());
+    }
+    let sym = symmetrize_penalty(omega);
+    let (mut evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let lam_max = evals.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+    if !lam_max.is_finite() || lam_max <= 0.0 {
+        return Ok(sym);
+    }
+    // Two decades above `analyze_penalty_block`'s `nrows·1e-10·λmax` cutoff, so
+    // the margin survives the later identifiability congruence `Tᵀ(·)T` and the
+    // Frobenius renormalization before the block's rank is scored. Still far
+    // below the statistical scale (`≤ nrows·1e-8·λmax`).
+    let floor = (embedded_penalty_dim.max(n) as f64) * 1e-8 * lam_max;
+    let mut floored = false;
+    for v in evals.iter_mut() {
+        if v.is_finite() && *v < floor {
+            *v = floor;
+            floored = true;
+        }
+    }
+    if !floored {
+        return Ok(sym);
+    }
+    // Reconstruct `U diag(evals) Uᵀ` with the floored spectrum.
+    let mut out = Array2::<f64>::zeros((n, n));
+    for j in 0..n {
+        let lam = evals[j];
+        for a in 0..n {
+            let ua = evecs[[a, j]];
+            if ua == 0.0 {
+                continue;
+            }
+            for b in 0..n {
+                out[[a, b]] += ua * lam * evecs[[b, j]];
+            }
+        }
+    }
+    Ok(symmetrize_penalty(&out))
+}
+
 pub fn monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
     fn recurse(
         axis: usize,
