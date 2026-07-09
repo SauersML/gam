@@ -83,6 +83,24 @@ def test_steer_bitwise_equivalence_circle_with_fisher() -> None:
     _assert_plans_bitwise_equal(plan_dc, plan_core)
 
 
+def test_reconstruct_training_bitwise_equivalence() -> None:
+    """The in-sample reconstruction rebuilt from stored codes is bitwise
+    identical between the dataclass and the pyclass (both call the same
+    reconstruct_persisted_atom_set core over the same stored state)."""
+    core_cls = _core_cls()
+    if not hasattr(core_cls, "reconstruct_training"):
+        pytest.skip("wheel predates ManifoldSaeCore.reconstruct_training (#2091)")
+    x = _planted_circle(40, 6, seed=5)
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        n_iter=8, random_state=0,
+    )
+    core = core_cls(fit.to_dict())
+    np.testing.assert_array_equal(
+        fit.reconstruct_training(), core.reconstruct_training()
+    )
+
+
 def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
     """Euclidean (degree-2 patch) atom: exercises the duchon_centers threading
     that the circle atom (no centers) does not."""

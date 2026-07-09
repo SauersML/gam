@@ -7625,6 +7625,54 @@ impl ManifoldSaeCore {
         self.inner.to_json().map_err(py_value_error)
     }
 
+    /// In-sample dense reconstruction `(N, p)` rebuilt from the stored per-atom
+    /// coordinates, assignment codes, and decoder blocks — the Rust-owned
+    /// counterpart of `ManifoldSAE.reconstruct_training`. Reads the codes from
+    /// this handle's own state and calls the SAME pure-Rust core
+    /// (`reconstruct_persisted_atom_set`) the `sae_manifold_reconstruct_ffi`
+    /// pyfunction uses, so the output is bitwise-identical to the dataclass path.
+    fn reconstruct_training<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let inner = &self.inner;
+        let basis_kinds: Vec<SaeAtomBasisKind> = inner
+            .basis_kinds
+            .iter()
+            .map(|name| sae_atom_basis_kind_from_str(name))
+            .collect();
+        let atom_dims: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
+        let decoder_owned: Vec<Array2<f64>> = inner
+            .decoder_blocks
+            .iter()
+            .map(|b| manifold_sae_owned2(b))
+            .collect::<PyResult<_>>()?;
+        let coord_owned: Vec<Array2<f64>> = inner
+            .coords
+            .iter()
+            .map(|c| manifold_sae_owned2(c))
+            .collect::<PyResult<_>>()?;
+        let assignments = manifold_sae_owned2(&inner.assignments)?;
+        // Mirror the Python p_out: fitted columns when there are no atoms, else
+        // the trained decoder block's output width.
+        let p_out = if inner.decoder_blocks.is_empty() {
+            inner.fitted.first().map_or(0, Vec::len)
+        } else {
+            inner.decoder_blocks[0].first().map_or(0, Vec::len)
+        };
+        let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            decoder_owned.iter().map(|a| a.view()).collect();
+        let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            coord_owned.iter().map(|a| a.view()).collect();
+        let out = gam::terms::sae::manifold::reconstruct_persisted_atom_set(
+            &basis_kinds,
+            &atom_dims,
+            &decoder_views,
+            &coord_views,
+            assignments.view(),
+            p_out,
+        )
+        .map_err(py_value_error)?;
+        Ok(out.into_pyarray(py))
+    }
+
     /// Steering plan with output dosimetry for one atom — the Rust-owned
     /// counterpart of `ManifoldSAE.steer` (#980/#2091). Reads the model geometry
     /// (decoder blocks, coords, logits, and the attached output-Fisher shard)
