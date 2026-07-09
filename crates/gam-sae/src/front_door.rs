@@ -99,14 +99,17 @@ pub fn admit_sae_fit(
 ///
 ///   * `K ≤ P` — the historical dense-certification admission, byte-identical;
 ///   * `K > P`, resident seed (`N·K·(1+d_max)·8` bytes) within the in-core
-///     budget — admitted; today's engine runs the fit in core;
+///     budget — admitted; the engine runs the fit with the dense seed in core;
 ///   * `K > P`, resident seed over budget but the honest streaming shape
 ///     (`O(N·k_active)` active sets + `O(K·M·r)` framed decoder + chunked
-///     routing window) within the streaming budget — a typed Err naming the
-///     chunked-seed integration seam
-///     ([`crate::manifold::admit_topk_curved_lane`]) the driver must wire;
-///     admitting it before that wiring would OOM on the dense seed;
-///   * over both budgets — a typed Err. For a caller who asked for TOPK
+///     routing window) within the streaming budget — ALSO admitted to the
+///     CURVED lane: the chunked-seed driver is wired
+///     ([`crate::manifold::admit_topk_curved_lane`] +
+///     `SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming` +
+///     `SaeManifoldTerm::fit_topk_curved_streaming`), so the seed is built by
+///     accumulating each atom's decoder normal equations in
+///     `seed_chunk_rows()` row chunks — never a resident dense `(N, K)` seed;
+///   * over BOTH budgets — a typed Err. For a caller who asked for TOPK
 ///     MANIFOLD atoms, silently substituting the linear sparse-code lane is
 ///     the exact failure mode this front door exists to prevent (witnessed
 ///     2026-07-08: K>P fits returned `SparseDictionaryFit` through the
@@ -156,31 +159,19 @@ pub(crate) fn admit_topk_manifold_with_budget(
         support_k,
         budget_bytes,
     );
-    if ledger.resident_seed_admitted {
+    // Both the resident sub-lane (dense seed fits in core) AND the streaming
+    // sub-lane (dense seed over budget, streamed curved shape fits) are runnable:
+    // the chunked-seed driver is wired
+    // ([`crate::manifold::SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming`]
+    // + [`crate::manifold::SaeManifoldTerm::fit_topk_curved_streaming`]), so the
+    // streaming region no longer builds any dense `(N, K)` seed — it accumulates
+    // the per-atom decoder normal equations in `seed_chunk_rows()` row chunks.
+    // Only a shape past BOTH budgets refuses.
+    if ledger.resident_seed_admitted || ledger.streaming_admitted {
         return Ok(SaeFitAdmission {
             lane: SaeFitLane::CurvedStreaming,
             ..admission
         });
-    }
-    if ledger.streaming_admitted {
-        return Err(format!(
-            "topk curved lane: the dense routing seed ({} bytes at N={n_obs}, K={n_atoms}, \
-             d_max={d_max}) exceeds the host in-core budget ({budget_bytes} bytes), but the \
-             streamed curved shape fits (peak {} <= streaming budget {} bytes; active sets \
-             O(N*k_active)={}, framed decoder O(K*M*r)={}). This region needs the chunked-seed \
-             driver wiring: fit_drivers must call \
-             gam_sae::manifold::admit_topk_curved_lane(n_obs, output_dim, n_atoms, d_max, \
-             support_k) before building any dense (N, K) seed and stream the routing seed in \
-             seed_chunk_rows() row chunks. Until that lands, reduce n_obs (row-subsample; the \
-             HT outer subsampling keeps the criterion honest) so the resident seed fits — a \
-             TOPK MANIFOLD request is never silently substituted with the linear sparse-code \
-             lane",
-            ledger.resident_seed_bytes,
-            ledger.streaming_peak_bytes,
-            ledger.streaming_budget_bytes,
-            ledger.active_state_bytes,
-            ledger.framed_decoder_bytes,
-        ));
     }
     Err(format!(
         "topk manifold engine refused: the dense seed ({} bytes) exceeds the host in-core \
@@ -255,11 +246,14 @@ mod tests {
         assert!(ledger.resident_seed_admitted);
         assert_eq!(ledger.resident_seed_bytes, bytes);
 
-        // One byte under the resident seed: this shape is exactly the chunked-
-        // seed integration region — refused with the actionable seam-naming
-        // error, never silently demoted to the linear sparse-code lane.
+        // One byte under the resident seed: at this tiny (~2.1 GB) budget the
+        // streamed curved peak (~9.5 GB, dominated by the framed border
+        // workspace at K=32000) does NOT fit either, so the shape is over BOTH
+        // budgets and refuses — never silently demoted to the linear sparse-code
+        // lane. (The streaming region that IS runnable is exercised at a larger
+        // budget in `topk_manifold_streaming_region_admits_to_curved_lane`.)
         let err = admit_topk_manifold_with_budget(4096, 512, 32_000, 1, 8, bytes - 1)
-            .expect_err("over-resident-budget topk must refuse until the seam is wired");
+            .expect_err("over-both-budgets topk must refuse");
         assert!(
             err.contains("never silently substituted"),
             "refusal must state the no-substitution contract; got: {err}"
@@ -286,14 +280,17 @@ mod tests {
         assert!(admit_topk_manifold_with_budget(64, 8, 16, 1, 17, bytes).is_err());
     }
 
-    /// The chunked-seed region (dense seed over budget, streamed shape within)
-    /// names the ONE integration seam the driver must wire, and the fully
-    /// over-budget region refuses with the ledger's figures. Both refuse — a
-    /// TopK request is never substituted.
+    /// The chunked-seed region (dense seed over budget, streamed curved shape
+    /// within the streaming budget) is now RUNNABLE — the driver is wired
+    /// (`SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming` +
+    /// `fit_topk_curved_streaming`), so the front door admits it to the CURVED
+    /// lane instead of refusing. Only a shape past BOTH budgets refuses, still
+    /// without substituting the linear sparse-code lane.
     #[test]
-    fn topk_manifold_seam_region_names_the_integration_call() {
-        // N=1e6, K=32000, d=1: resident seed = 512 GB, streamed peak ≈ 9.6 GiB
-        // (dominated by the framed border workspace).
+    fn topk_manifold_streaming_region_admits_to_curved_lane() {
+        // N=1e6, K=32000, d=1: resident seed = 512 GB (over the 16 GiB in-core
+        // budget), streamed peak ≈ 9.6 GiB (dominated by the framed border
+        // workspace) — the region the chunked-seed driver exists to run.
         let ledger = crate::manifold::sae_topk_curved_budget_from_budget(
             1_000_000,
             512,
@@ -304,16 +301,21 @@ mod tests {
         );
         assert!(!ledger.resident_seed_admitted);
         assert!(ledger.streaming_admitted);
-        let err =
+        let admission =
             admit_topk_manifold_with_budget(1_000_000, 512, 32_000, 1, 8, 16 * 1024 * 1024 * 1024)
-                .expect_err("seam region refuses until the chunked-seed driver lands");
-        assert!(
-            err.contains("admit_topk_curved_lane"),
-            "the refusal must name the integration seam; got: {err}"
+                .expect("streaming region is runnable and must admit to the curved lane");
+        assert_eq!(
+            admission.lane,
+            SaeFitLane::CurvedStreaming,
+            "the over-resident/under-streaming region admits to CurvedStreaming"
         );
-        assert!(err.contains("never silently substituted"));
+        assert_eq!(
+            (admission.n_obs, admission.output_dim, admission.n_atoms),
+            (1_000_000, 512, 32_000)
+        );
 
-        // Over both budgets: the plain refusal, still no substitution.
+        // Over BOTH budgets (budget 0 → streaming floored at 64 MiB, still far
+        // below the K=32000 framed workspace): the plain refusal, no substitution.
         let err = admit_topk_manifold_with_budget(1_000_000, 512, 32_000, 1, 8, 0)
             .expect_err("over-both-budgets topk must refuse");
         assert!(err.contains("never silently substituted"));

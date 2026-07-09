@@ -215,6 +215,7 @@ mod shape_uncertainty;
 mod stagewise;
 mod stratum_births;
 mod streaming_plan;
+mod streaming_seed;
 mod term;
 mod terracini;
 mod weight_frame_catalog;
@@ -253,6 +254,9 @@ mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
 mod tests_streaming_materialize_chunk_1801;
+
+#[cfg(test)]
+mod tests_streaming_seed_parity_2134;
 
 #[cfg(test)]
 mod tests_recovery_split_780;
