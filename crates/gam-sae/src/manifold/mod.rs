@@ -394,6 +394,9 @@ mod tests_behavior_twoblock_rung2;
 mod tests_crosscoder_multiblock;
 
 #[cfg(test)]
+mod tests_crosscoder_rho_2231;
+
+#[cfg(test)]
 mod tests_transport_law;
 
 #[cfg(test)]
