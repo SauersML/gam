@@ -3357,6 +3357,47 @@ fn analytic_penalty_value_grad<'py>(
     ))
 }
 
+/// Evidence-optimal roughness precision `λ⋆` for a periodic decoder block under
+/// the graduated Gaussian prior whose Gram diagonal is `row_weights` (`h⁴` on
+/// harmonic rows, `0` on DC / fundamental), tiled over the leading axis with
+/// period `row_weights.len()`.
+///
+/// Returns the empirical-Bayes / REML variance-component optimum
+/// `λ⋆ = N_pen / Σᵢ Sᵢᵢ bᵢ²` (see
+/// `gam::terms::analytic_penalties::harmonic_roughness_evidence_weight`): the
+/// marginal-likelihood-optimal precision of the penalized decoder coefficients
+/// given the current blocks and the periodic penalty Gram. The torch lane calls
+/// this every few steps to refresh the harmonic-roughness penalty weight from
+/// evidence instead of a hand-tuned constant; the weight is a detached
+/// hyperparameter, so it is never differentiated through.
+#[pyfunction(signature = (target, n_eff, row_weights))]
+fn harmonic_roughness_evidence_weight<'py>(
+    target: PyReadonlyArray1<'py, f64>,
+    n_eff: usize,
+    row_weights: PyReadonlyArray1<'py, f64>,
+) -> PyResult<f64> {
+    let target_view = target.as_array();
+    let row_weights_view = row_weights.as_array();
+    if !target_view.iter().all(|value| value.is_finite()) {
+        return Err(py_value_error(
+            "harmonic_roughness_evidence_weight: target must be finite".to_string(),
+        ));
+    }
+    if !row_weights_view.iter().all(|value| value.is_finite() && *value >= 0.0) {
+        return Err(py_value_error(
+            "harmonic_roughness_evidence_weight: row_weights must be finite and non-negative"
+                .to_string(),
+        ));
+    }
+    Ok(
+        gam::terms::analytic_penalties::harmonic_roughness_evidence_weight(
+            target_view.view(),
+            n_eff,
+            row_weights_view.view(),
+        ),
+    )
+}
+
 /// Hessian-vector product `H · v` of the analytic-penalty registry frozen at
 /// `(target, rho)`, accumulated across all penalties whose target tier lives
 /// on `target` (`PenaltyTier::Psi`). This is the same kernel that `PIRLS`

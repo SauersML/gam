@@ -59,6 +59,7 @@ from .._sae_manifold import (
 from ._coerce import from_numpy_like, to_numpy_f64
 from .penalties import (
     BlockOrthogonalityPenalty,
+    HarmonicRoughnessPenalty,
     IBPAssignmentPenalty,
     JumpReLUPenalty,
     MonotonicityPenalty,
@@ -162,9 +163,10 @@ class SparsityConfig:
         if self.tau_schedule == "linear":
             kwargs["steps"] = int(self.tau_steps)
         elif self.tau_schedule == "geometric":
-            ratio = float(self.tau_min / self.tau_start)
-            steps = max(1, int(self.tau_steps))
-            kwargs["rate"] = ratio ** (1.0 / steps)
+            # Hand the (tau_start, tau_min, steps) spec over verbatim; the Rust
+            # schedule derives the geometric decay rate = (tau_min/tau_start) **
+            # (1/steps) so the arithmetic lives in exactly one place.
+            kwargs["steps"] = int(self.tau_steps)
         return GumbelTemperatureSchedule(**kwargs)
 
 
@@ -1394,12 +1396,44 @@ class ManifoldSAE(nn.Module):
         self.sparsity = _SparsityLayer(cfg)
         self.log_lambda = nn.Parameter(torch.zeros(F, dtype=dt))
 
-        # #1282 decoder-harmonic smoothness weight. The training loss scales
-        # `regularization()` by a small coefficient (~1e-5); this internal weight
-        # lifts the harmonic (h>=2) smoothness term to an effective magnitude
-        # that actually suppresses decoder snaking while leaving the fundamental
-        # ellipse free. See `decoder_harmonic_penalty`.
-        self._harmonic_penalty_weight = 5.0e3
+        # #1282 decoder-harmonic smoothness penalty: Rust ``harmonic_roughness``
+        # descriptor over each circle atom's periodic basis-coefficient axis.
+        # ``row_weights`` is the periodic penalty Gram's diagonal for one atom
+        # (``h⁴`` on the sin/cos rows of harmonics ``h >= 2``, ``0`` on DC and
+        # the fundamental), tiled across all ``F`` atoms of the stacked
+        # ``(F·K, D)`` decoder. The penalty STRENGTH is no longer a hand-tuned
+        # constant: it is the evidence-optimal roughness precision the Rust REML
+        # machinery returns from the current decoder blocks, refreshed every
+        # ``_harmonic_penalty_refresh`` calls (see `decoder_harmonic_penalty`).
+        # Only well-defined for the odd-K ``[DC, {sinθ,cosθ}, {sin2θ,cos2θ}, …]``
+        # circle layout with harmonics beyond the fundamental.
+        if (
+            cfg.atom_manifold == "circle"
+            and K == 1 + 2 * ((K - 1) // 2)
+            and K >= 4
+        ):
+            row_weights = [0.0] * K
+            for h in range(2, (K - 1) // 2 + 1):
+                sin_row = 1 + 2 * (h - 1)
+                row_weights[sin_row] = float(h) ** 4
+                row_weights[sin_row + 1] = float(h) ** 4
+            self._harmonic_row_weights: list[float] | None = row_weights
+            self._harmonic_penalty: HarmonicRoughnessPenalty | None = (
+                HarmonicRoughnessPenalty(
+                    row_weights=row_weights,
+                    n_eff=F * K,
+                    weight=1.0,
+                )
+            )
+            # Refresh the evidence-sourced weight every N regularization() calls;
+            # -1 forces a refresh on the first call.
+            self._harmonic_penalty_refresh = 25
+            self._harmonic_penalty_step = -1
+        else:
+            self._harmonic_row_weights = None
+            self._harmonic_penalty = None
+            self._harmonic_penalty_refresh = 0
+            self._harmonic_penalty_step = 0
 
         # Decoder orthogonality penalty: Rust ``block_orthogonality`` descriptor.
         # The penalty operates on a flat target of shape ``(n_eff, latent_dim)``
@@ -2212,27 +2246,52 @@ class ManifoldSAE(nn.Module):
         the disjoint case) untouched while removing only the snaking capacity the
         true circles never use.
 
+        The value / gradient of the ``h⁴``-graduated smoothness form are computed
+        by the Rust ``harmonic_roughness`` analytic-penalty descriptor. Its
+        strength is the evidence-optimal roughness precision the Rust REML
+        machinery returns from the current decoder blocks (empirical-Bayes /
+        variance-component optimum ``λ⋆ = N_pen / Σ Sᵢᵢ bᵢ²`` under the periodic
+        penalty Gram), refreshed every ``_harmonic_penalty_refresh`` calls — the
+        former hand-tuned ``5e3`` constant is gone. ``λ⋆`` is a detached
+        hyperparameter (never differentiated through), so the training loss sees
+        an evidence-sourced, decoder-scale-relative weight that self-calibrates
+        as the harmonics shrink.
+
         Only well-defined for the ``circle`` manifold with the standard odd-K
         ``[DC, {sinθ,cosθ}, {sin2θ,cos2θ}, …]`` layout (row index == basis
         column == harmonic), where ``decoder_blocks`` rows ``>= 3`` are the
         harmonics ``h >= 2``; returns zero otherwise.
         """
-        K = int(self.cfg.n_basis_per_atom)
-        if self.cfg.atom_manifold != "circle" or K != 1 + 2 * ((K - 1) // 2):
+        if self._harmonic_penalty is None:
             return self.decoder_blocks.new_zeros(())
-        if K < 4:  # no harmonics beyond the fundamental to penalize
-            return self.decoder_blocks.new_zeros(())
-        total = self.decoder_blocks.new_zeros(())
-        # rows: 0=DC, 1,2=h1 (fundamental, free), then (sin,cos) pairs for h>=2.
-        for h in range(2, (K - 1) // 2 + 1):
-            sin_row = 1 + 2 * (h - 1)
-            cos_row = sin_row + 1
-            w = float(h) ** 4  # graduated smoothness weight (Rust convention)
-            total = total + w * (
-                self.decoder_blocks[:, sin_row, :].square().sum()
-                + self.decoder_blocks[:, cos_row, :].square().sum()
+        # decoder_blocks: (F, K, D) → row-major (F·K, D) so each atom's K basis
+        # rows are contiguous and the periodic-Gram row_weights tile with period K.
+        F, K, D = self.decoder_blocks.shape
+        flat = self.decoder_blocks.reshape(F * K, D)
+        # Refresh the evidence-optimal precision from the current (detached)
+        # decoder blocks via the Rust REML machinery every N calls.
+        self._harmonic_penalty_step += 1
+        if (
+            self._harmonic_penalty_step % max(1, self._harmonic_penalty_refresh) == 0
+            or self._harmonic_penalty_step == 0
+        ):
+            lam = float(
+                rust_module().harmonic_roughness_evidence_weight(
+                    np.ascontiguousarray(
+                        flat.detach().to(torch.float64).cpu().numpy().reshape(-1)
+                    ),
+                    int(F * K),
+                    np.ascontiguousarray(
+                        np.asarray(self._harmonic_row_weights, dtype=np.float64)
+                    ),
+                )
             )
-        return self._harmonic_penalty_weight * total
+            # A degenerate all-zero harmonic block yields λ⋆ = 0 (nothing to
+            # penalize yet); keep the penalty inert rather than pinning a weight.
+            self._harmonic_penalty.weight = lam if np.isfinite(lam) and lam > 0.0 else 0.0
+        if self._harmonic_penalty.weight == 0.0:
+            return self.decoder_blocks.new_zeros(())
+        return self._harmonic_penalty(flat)
 
     def regularization(self, logits: torch.Tensor | None = None) -> torch.Tensor:
         """Sum of Rust-backed regularizers used by the loss."""

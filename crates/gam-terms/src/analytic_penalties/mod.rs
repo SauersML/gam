@@ -139,6 +139,7 @@ mod penalty_trait;
 mod ard;
 mod block_sparsity;
 pub mod equivariant_penalty;
+mod harmonic_roughness;
 mod ibp;
 mod isometry;
 mod manifest;
@@ -155,6 +156,7 @@ mod total_variation;
 
 pub use ard::*;
 pub use block_sparsity::*;
+pub use harmonic_roughness::*;
 pub use ibp::*;
 pub use isometry::*;
 pub use nested_prefix::*;

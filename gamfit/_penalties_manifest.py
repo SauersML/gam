@@ -49,6 +49,12 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": False,
     },
     {
+        "kind": "harmonic_roughness",
+        "rust": "HarmonicRoughness:HarmonicRoughnessPenalty",
+        "python": "HarmonicRoughnessPenalty",
+        "row_block_diagonal": True,
+    },
+    {
         "kind": "nuclear_norm",
         "rust": "NuclearNorm:NuclearNormPenalty",
         "python": "NuclearNormPenalty",

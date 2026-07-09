@@ -409,6 +409,76 @@ class MonotonicityPenalty(_RustPenaltyModule):
         )
 
 
+class HarmonicRoughnessPenalty(_RustPenaltyModule):
+    """Graduated periodic-basis roughness prior over a decoder block (#1282).
+
+    Routes through the Rust ``harmonic_roughness`` analytic-penalty descriptor,
+    which evaluates ``weight · Σ_r row_weights[r mod period] · Σ_j target[r,j]²``
+    on a row-major ``(n_eff, d)`` block. ``row_weights`` is one atom's per-basis
+    weight vector (``h⁴`` on harmonic rows ``h ≥ 2``, ``0`` on DC / fundamental)
+    and is tiled across the ``F`` atoms of a stacked ``(F·K, D)`` decoder.
+
+    ``weight`` is the evidence-optimal roughness precision refreshed from the
+    Rust REML machinery during training (see
+    :func:`ManifoldSAE.decoder_harmonic_penalty`); it is a plain float held off
+    the autograd tape, so mutating it between forwards is safe.
+    """
+
+    def __init__(
+        self,
+        row_weights: Sequence[float],
+        n_eff: int,
+        weight: float = 1.0,
+        *,
+        target: str = "t",
+        learnable: bool = False,
+    ) -> None:
+        super().__init__()
+        rows = [float(w) for w in row_weights]
+        if not rows:
+            raise ValueError("HarmonicRoughnessPenalty.row_weights must be non-empty")
+        if not all(np.isfinite(w) and w >= 0.0 for w in rows):
+            raise ValueError(
+                "HarmonicRoughnessPenalty.row_weights must be finite and non-negative"
+            )
+        if n_eff <= 0:
+            raise ValueError("HarmonicRoughnessPenalty.n_eff must be > 0")
+        if n_eff % len(rows) != 0:
+            raise ValueError(
+                "HarmonicRoughnessPenalty.n_eff must be a multiple of len(row_weights)"
+            )
+        self.row_weights = rows
+        self.n_eff = int(n_eff)
+        self.weight = float(weight)
+        self.target = str(target)
+        self.learnable = bool(learnable)
+        if self.learnable:
+            self.log_weight = nn.Parameter(torch.zeros(1))
+
+    def _prepare(
+        self, primary: torch.Tensor, basis: torch.Tensor | None = None
+    ) -> _PenaltyCall:
+        del basis
+        coeffs = _check_matrix(primary, "decoder_block")
+        descriptor = {
+            "kind": "harmonic_roughness",
+            "target": self.target,
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "row_weights": list(self.row_weights),
+            "learnable": self.learnable,
+        }
+        rho = _rho_tensor(
+            getattr(self, "log_weight", None), coeffs, 1 if self.learnable else 0
+        )
+        return _PenaltyCall(
+            target=coeffs,
+            rho=rho,
+            latents_json=_latent_json(coeffs.shape[0], coeffs.shape[1], name=self.target),
+            penalties_json=_penalty_json(descriptor),
+        )
+
+
 class MechanismSparsityPenalty(_RustPenaltyModule):
     """Per-latent group-lasso sparsity over decoder feature groups."""
 
@@ -888,6 +958,7 @@ __all__ = [
     "ARDPenalty",
     "BlockOrthogonalityPenalty",
     "GumbelTemperatureSchedule",
+    "HarmonicRoughnessPenalty",
     "IBPAssignmentPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",

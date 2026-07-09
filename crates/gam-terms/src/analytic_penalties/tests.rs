@@ -2282,3 +2282,87 @@ fn nested_prefix_rejects_non_monotone_prefixes() {
     .expect_err("non-strictly-increasing prefixes must error");
     assert!(err.contains("strictly increasing"), "got: {err}");
 }
+
+/// The harmonic-roughness penalty is the graduated diagonal periodic-Gram form:
+/// `weight · Σ_r S[r mod K] · Σ_j target[r,j]²`, only on the harmonic rows.
+/// Value, gradient, and Hessian diagonal must be mutually consistent (grad is
+/// the exact derivative of value; the diagonal is the exact second derivative,
+/// which is constant for a quadratic).
+#[test]
+fn harmonic_roughness_value_grad_hessian_are_consistent() {
+    // K = 5 periodic basis rows: [DC, sin1, cos1, sin2, cos2]. Only h=2 (rows
+    // 3, 4) is penalized with weight h⁴ = 16; DC and the fundamental are free.
+    let row_weights = array![0.0, 0.0, 0.0, 16.0, 16.0];
+    let n_eff = 10; // F = 2 atoms × K = 5 rows.
+    let d = 3;
+    let weight = 2.5;
+    let penalty =
+        HarmonicRoughnessPenalty::new(weight, n_eff, row_weights.clone(), false).unwrap();
+    // Row-major (n_eff, d) target with distinct values per entry.
+    let target: Array1<f64> = (0..n_eff * d).map(|i| 0.1 * (i as f64) - 0.7).collect();
+    let rho = Array1::<f64>::zeros(0);
+
+    // Value: only the two penalized rows of each atom contribute.
+    let mut expected = 0.0;
+    for r in 0..n_eff {
+        let w = row_weights[r % row_weights.len()];
+        for j in 0..d {
+            expected += w * target[r * d + j] * target[r * d + j];
+        }
+    }
+    expected *= weight;
+    assert_abs_diff_eq!(penalty.value(target.view(), rho.view()), expected, epsilon = 1e-12);
+
+    // Gradient matches a central finite difference of the value.
+    let grad = penalty.grad_target(target.view(), rho.view());
+    let h = 1e-6;
+    for i in 0..target.len() {
+        let mut tp = target.clone();
+        let mut tm = target.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (penalty.value(tp.view(), rho.view()) - penalty.value(tm.view(), rho.view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(grad[i], fd, epsilon = 1e-5);
+    }
+
+    // Hessian diagonal is the constant 2·weight·S[r mod K] on every column.
+    let diag = penalty.hessian_diag(target.view(), rho.view()).unwrap();
+    for r in 0..n_eff {
+        let w = row_weights[r % row_weights.len()];
+        for j in 0..d {
+            assert_abs_diff_eq!(diag[r * d + j], 2.0 * weight * w, epsilon = 1e-12);
+        }
+    }
+}
+
+/// The evidence-optimal precision is the marginal-likelihood stationary point
+/// `λ⋆ = N_pen / Σ_i S_ii b_i²` over the penalized coefficients only.
+#[test]
+fn harmonic_roughness_evidence_weight_matches_closed_form() {
+    let row_weights = array![0.0, 0.0, 0.0, 16.0, 16.0];
+    let n_eff = 10;
+    let d = 3;
+    let target: Array1<f64> = (0..n_eff * d).map(|i| 0.05 * (i as f64) + 0.3).collect();
+
+    let mut energy = 0.0;
+    let mut n_pen = 0.0;
+    for r in 0..n_eff {
+        let w = row_weights[r % row_weights.len()];
+        if w > 0.0 {
+            for j in 0..d {
+                energy += w * target[r * d + j] * target[r * d + j];
+                n_pen += 1.0;
+            }
+        }
+    }
+    let expected = n_pen / energy;
+    let got = harmonic_roughness_evidence_weight(target.view(), n_eff, row_weights.view());
+    assert_abs_diff_eq!(got, expected, epsilon = 1e-10);
+
+    // An all-zero harmonic block has nothing to penalize → finite (floored) λ,
+    // never a division by zero.
+    let zeros = Array1::<f64>::zeros(n_eff * d);
+    let floored = harmonic_roughness_evidence_weight(zeros.view(), n_eff, row_weights.view());
+    assert!(floored.is_finite() && floored > 0.0, "got {floored}");
+}

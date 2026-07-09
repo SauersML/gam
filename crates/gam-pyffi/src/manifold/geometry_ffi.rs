@@ -4651,6 +4651,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
+    module.add_function(wrap_pyfunction!(harmonic_roughness_evidence_weight, module)?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
     module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;

@@ -20,7 +20,8 @@ use std::sync::Arc;
 use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, IBPAssignmentPenalty,
+    BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, HarmonicRoughnessPenalty,
+    IBPAssignmentPenalty,
     IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
     NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
@@ -949,6 +950,36 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     None => penalty,
                 };
                 registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(penalty)));
+            }
+            "harmonic_roughness" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "row_weights",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let row_weights = descriptor_array1_flat(descriptor, "row_weights", &context)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let penalty =
+                    HarmonicRoughnessPenalty::new(weight, n_eff, row_weights, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::HarmonicRoughness(Arc::new(penalty)));
             }
             "monotonicity" => {
                 descriptor_no_unknown_keys(

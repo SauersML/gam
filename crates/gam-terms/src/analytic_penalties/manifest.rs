@@ -50,6 +50,12 @@ impl PenaltyManifest for DecoderIncoherencePenalty {
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
 
+impl PenaltyManifest for HarmonicRoughnessPenalty {
+    const KIND_TAG: &'static str = "harmonic_roughness";
+    const PYTHON_WRAPPER: &'static str = "HarmonicRoughnessPenalty";
+    const ROW_BLOCK_DIAGONAL: bool = true;
+}
+
 impl PenaltyManifest for IBPAssignmentPenalty {
     const KIND_TAG: &'static str = "ibp_assignment";
     const PYTHON_WRAPPER: &'static str = "IBPAssignmentPenalty";
@@ -164,6 +170,7 @@ macro_rules! analytic_penalty_registry {
             register!(TopKActivation, TopKActivationPenalty);
             register!(JumpReLU, JumpReLUPenalty);
             register!(TotalVariation, TotalVariationPenalty);
+            register!(HarmonicRoughness, HarmonicRoughnessPenalty);
             register!(NuclearNorm, NuclearNormPenalty);
             register!(BlockSparsity, BlockSparsityPenalty);
             register!(MechanismSparsity, MechanismSparsityPenalty);

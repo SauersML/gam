@@ -338,6 +338,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::TotalVariation(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::HarmonicRoughness(p) => p
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
+                .expect("HarmonicRoughness diag"),
             AnalyticPenaltyKind::BlockOrthogonality(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -432,6 +435,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)
+            | AnalyticPenaltyKind::HarmonicRoughness(_)
             | AnalyticPenaltyKind::NestedPrefix(_) => {
                 let d = self.diag();
                 let mut s = 0.0;
