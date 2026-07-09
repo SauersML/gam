@@ -54,6 +54,38 @@
 use super::prelude::*;
 use gam_linalg::utils::splitmix64;
 
+/// Top-subspace (Hutch++) deflation configuration for the surrogate. When a plan
+/// carries one, [`RationalLogdetPlan::evaluate`] peels an `r`-dimensional
+/// orthonormal subspace `Q` of the heavy (top) directions from the operator and
+/// splits the log-determinant by the EXACT identity (no invariance assumed)
+///
+/// `tr log(S/c) = tr(Qᵀ log(S/c) Q) + tr(P log(S/c) P)`,  `P = I − QQᵀ`,
+///
+/// evaluating the first block deterministically over the `r` basis columns and
+/// the second by Hutchinson over the PROJECTED probes `u_j = P v_j` (each with
+/// its own reference norm `‖u_j‖²`, so the `k − r` bookkeeping is automatic).
+/// The Hutchinson variance then rides only on the off-diagonal mass of
+/// `P log(S/c) P` — small once `Q` captures the heavy directions — collapsing the
+/// error bar that raw probes carry on a wide spectrum. The decomposition is
+/// EXACT for ANY orthonormal `Q`; the subspace iteration only steers `Q` toward
+/// the top space to reduce variance, it can never bias the estimate.
+///
+/// The basis is FROZEN here (built once by [`RationalLogdetPlan::with_deflation`]
+/// from the operator at the plan's ρ), NOT rebuilt per evaluation. This is what
+/// keeps value and gradient the SAME functional: with the estimated `term2`, the
+/// sum `term1 + term2` is `Q`-dependent, so a `Q` that moved with ρ would put an
+/// un-modelled `∂Q/∂ρ` term in the true gradient. A frozen `Q` makes the
+/// fixed-`Q` directional derivative EXACT for the surrogate, at the cost of `Q`
+/// going slightly stale as the line search moves ρ (which only relaxes the
+/// variance reduction — never biases the value, since the decomposition is exact
+/// for any fixed orthonormal `Q`).
+#[derive(Clone)]
+pub struct DeflationSpec {
+    /// Frozen orthonormal top-subspace basis `Q` (columns `q_i`), built once from
+    /// the operator. Reused verbatim across every ρ evaluation (CRN).
+    pub basis: Vec<Array1<f64>>,
+}
+
 /// Fixed probes + fixed quadrature for one outer solve. Build once (per ρ
 /// search), reuse for every criterion/gradient evaluation so the surrogate is
 /// one deterministic function of ρ.
@@ -71,6 +103,10 @@ pub struct RationalLogdetPlan {
     pub log_center: f64,
     /// The bracket centre `c = √(λ_min·λ_max)` itself.
     pub center: f64,
+    /// Optional top-subspace (Hutch++) deflation. `None` (the default from
+    /// [`Self::build`]) reproduces the bare-Hutchinson path bit-for-bit; set via
+    /// [`Self::with_deflation`].
+    pub deflation: Option<DeflationSpec>,
 }
 
 /// One evaluation of the surrogate: the value and the per-(probe, node) solve
@@ -83,8 +119,19 @@ pub struct RationalLogdetEval {
     /// `√m`. Zero for a single probe. The QUADRATURE part of the error is not
     /// in this bar (it is deterministic and bounded by the plan's `rel_tol`).
     pub std_err: f64,
-    /// `y_{jℓ} = (S + t_ℓ I)⁻¹ v_j`, outer index `ℓ` (node), inner `j` (probe).
+    /// `y_{jℓ} = (S + t_ℓ I)⁻¹ u_j`, outer index `ℓ` (node), inner `j` (probe).
+    /// `u_j = P v_j` are the deflation-PROJECTED probes when the plan carries a
+    /// [`DeflationSpec`] (`u_j = v_j` — the raw probes — otherwise).
     pub shifted_solves: Vec<Vec<Array1<f64>>>,
+    /// `y_{q_iℓ} = (S + t_ℓ I)⁻¹ q_i` for each deflation-basis column `q_i`,
+    /// outer index `ℓ` (node), inner `i` (basis column). Empty without deflation.
+    /// Carried so the directional derivative contracts the deterministic
+    /// `tr(Qᵀ log(S/c) Q)` block against `∂S` from the SAME shifted solves.
+    pub deflation_solves: Vec<Vec<Array1<f64>>>,
+    /// The orthonormal deflation basis `Q` (columns `q_i`) actually realised for
+    /// this evaluation; empty without deflation, and possibly shorter than the
+    /// requested rank if the block collapsed.
+    pub deflation_basis: Vec<Array1<f64>>,
     /// Total CG iterations spent (diagnostic).
     pub cg_iterations: usize,
 }
@@ -178,7 +225,29 @@ impl RationalLogdetPlan {
             nodes,
             log_center: c.ln(),
             center: c,
+            deflation: None,
         })
+    }
+
+    /// Attach top-subspace (Hutch++) deflation, FREEZING an orthonormal basis `Q`
+    /// of up to `rank` columns built now from `matvec` by `subspace_iters`
+    /// block-power steps (`Q ← orthonormalise(S·Q)`) from a `seed`-deterministic
+    /// Rademacher start. The frozen `Q` is reused for every subsequent
+    /// [`Self::evaluate`], so the surrogate stays one deterministic function of ρ
+    /// with the fixed-`Q` directional derivative as its EXACT gradient (see
+    /// [`DeflationSpec`]). Build this at the plan's ρ, from the same operator the
+    /// evaluations use. `rank = 0` (or a fully-collapsed block) yields the
+    /// bare-Hutchinson plan unchanged.
+    pub fn with_deflation(
+        mut self,
+        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+        rank: usize,
+        subspace_iters: usize,
+        seed: u64,
+    ) -> Self {
+        let basis = build_deflation_basis(matvec, self.dim, rank, subspace_iters, seed);
+        self.deflation = (!basis.is_empty()).then_some(DeflationSpec { basis });
+        self
     }
 
     /// Evaluate the surrogate `L̃ ≈ log det S` through `matvec(v) = S·v`.
@@ -195,10 +264,7 @@ impl RationalLogdetPlan {
     ) -> Option<RationalLogdetEval> {
         let m = self.probes.len();
         let k = self.dim as f64;
-        let mut shifted: Vec<Vec<Array1<f64>>> =
-            vec![Vec::with_capacity(m); self.nodes.len()];
-        let mut total_iters = 0usize;
-        // Ladder: descending t. Warm starts carry per-probe across shifts.
+        // Ladder: descending t (warm starts carry per vector across shifts).
         let mut order: Vec<usize> = (0..self.nodes.len()).collect();
         order.sort_by(|&a, &b| {
             self.nodes[b]
@@ -206,32 +272,71 @@ impl RationalLogdetPlan {
                 .partial_cmp(&self.nodes[a].0)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut warm: Vec<Array1<f64>> = vec![Array1::zeros(self.dim); m];
-        for &ell in &order {
-            let (t, _) = self.nodes[ell];
-            let mut per_probe = Vec::with_capacity(m);
-            for (j, v) in self.probes.iter().enumerate() {
-                let (y, iters) = shifted_cg(matvec, t, v, &warm[j], cg_rel_tol, cg_max_iters)?;
-                total_iters += iters;
-                warm[j] = y.clone();
-                per_probe.push(y);
-            }
-            shifted[ell] = per_probe;
-        }
-        // Per-probe estimates: e_j = k·ln c + Σ_ℓ w_ℓ·(k/(c+t_ℓ) − v_jᵀ y_{jℓ});
-        // the surrogate is their mean, the Hutchinson error bar their spread.
-        let mut per_probe = vec![k * self.log_center; m];
+
+        // FROZEN top-subspace deflation basis Q (empty without a DeflationSpec).
+        // Built once at plan creation from the operator at the plan's ρ; reused
+        // verbatim here so the surrogate is one fixed-Q function of ρ.
+        let basis: &[Array1<f64>] = self
+            .deflation
+            .as_ref()
+            .map(|d| d.basis.as_slice())
+            .unwrap_or(&[]);
+
+        // Deflation-projected probes u_j = P v_j = v_j − Q(Qᵀ v_j). With no
+        // basis this is v_j unchanged, so the bare-Hutchinson path is recovered
+        // bit-for-bit (‖u_j‖² = k, one solve family, no term1).
+        let probes_proj: Vec<Array1<f64>> = self
+            .probes
+            .iter()
+            .map(|v| {
+                let mut u = v.clone();
+                for q in basis {
+                    let c = u.dot(q);
+                    u.scaled_add(-c, q);
+                }
+                u
+            })
+            .collect();
+
+        // Shifted solves for the projected probes and (if any) the basis columns.
+        let (shifted, iters_probe) =
+            solve_shift_ladder(matvec, &self.nodes, &order, &probes_proj, cg_rel_tol, cg_max_iters)?;
+        let (deflation_solves, iters_basis) = if basis.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            solve_shift_ladder(matvec, &self.nodes, &order, basis, cg_rel_tol, cg_max_iters)?
+        };
+        let total_iters = iters_probe + iters_basis;
+
+        // term1 = tr(Qᵀ log(S/c) Q) = Σ_i Σ_ℓ w_ℓ (‖q_i‖²/(c+t_ℓ) − q_iᵀ y_{q_iℓ}),
+        // ‖q_i‖² = 1. Deterministic (no probe variance).
+        let mut term1 = 0.0_f64;
         for (ell, &(t, w)) in self.nodes.iter().enumerate() {
-            let reference = k / (self.center + t);
-            for (j, v) in self.probes.iter().enumerate() {
-                per_probe[j] += w * (reference - v.dot(&shifted[ell][j]));
+            let reference = 1.0 / (self.center + t);
+            for (i, q) in basis.iter().enumerate() {
+                term1 += w * (reference - q.dot(&deflation_solves[ell][i]));
             }
         }
-        let estimate = per_probe.iter().sum::<f64>() / m as f64;
+
+        // term2 per-probe: e_j = Σ_ℓ w_ℓ (‖u_j‖²/(c+t_ℓ) − u_jᵀ y_{u_jℓ}). The
+        // PER-VECTOR reference norm ‖u_j‖² makes the (k−r) count automatic and
+        // exact. The surrogate value is k·ln c + term1 + mean_j e_j; the
+        // Hutchinson error bar is the spread of the e_j (term1 is deterministic,
+        // so it carries no variance).
+        let u_norm_sq: Vec<f64> = probes_proj.iter().map(|u| u.dot(u)).collect();
+        let mut per_probe = vec![0.0_f64; m];
+        for (ell, &(t, w)) in self.nodes.iter().enumerate() {
+            let inv = 1.0 / (self.center + t);
+            for j in 0..m {
+                per_probe[j] += w * (u_norm_sq[j] * inv - probes_proj[j].dot(&shifted[ell][j]));
+            }
+        }
+        let term2 = per_probe.iter().sum::<f64>() / m as f64;
+        let estimate = k * self.log_center + term1 + term2;
         let std_err = if m > 1 {
             let var = per_probe
                 .iter()
-                .map(|e| (e - estimate) * (e - estimate))
+                .map(|e| (e - term2) * (e - term2))
                 .sum::<f64>()
                 / (m as f64 - 1.0);
             (var / m as f64).sqrt()
@@ -245,6 +350,8 @@ impl RationalLogdetPlan {
             estimate,
             std_err,
             shifted_solves: shifted,
+            deflation_solves,
+            deflation_basis: basis.to_vec(),
             cg_iterations: total_iters,
         })
     }
@@ -260,14 +367,25 @@ impl RationalLogdetPlan {
         dmatvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
     ) -> Option<f64> {
         let m = self.probes.len() as f64;
-        let mut acc = 0.0;
+        // Projected-probe block (Hutchinson, averaged over m) and the
+        // deterministic deflation block (Σ over the r basis columns, NOT
+        // averaged) — the exact derivative of `term2` and `term1` respectively.
+        // The `k·ln c` term is ρ-independent and contributes nothing.
+        let mut acc_probe = 0.0;
+        let mut acc_defl = 0.0;
         for (ell, &(_, w)) in self.nodes.iter().enumerate() {
             for y in &eval.shifted_solves[ell] {
                 let dy = dmatvec(y.view());
-                acc += w * y.dot(&dy);
+                acc_probe += w * y.dot(&dy);
+            }
+            if let Some(defl) = eval.deflation_solves.get(ell) {
+                for y in defl {
+                    let dy = dmatvec(y.view());
+                    acc_defl += w * y.dot(&dy);
+                }
             }
         }
-        acc /= m;
+        let acc = acc_defl + acc_probe / m;
         acc.is_finite().then_some(acc)
     }
 }
@@ -317,6 +435,108 @@ fn shifted_cg(
         iters += 1;
     }
     Some((y, iters))
+}
+
+/// Modified Gram-Schmidt orthonormalisation of a column block, DROPPING any
+/// column whose residual norm collapses (linear dependence / rank deficiency).
+/// The realised rank is `out.len()`, which may be below the input count.
+fn orthonormalize(cols: &[Array1<f64>]) -> Vec<Array1<f64>> {
+    let mut out: Vec<Array1<f64>> = Vec::with_capacity(cols.len());
+    for col in cols {
+        let mut v = col.clone();
+        for basis in &out {
+            let proj = v.dot(basis);
+            v.scaled_add(-proj, basis);
+        }
+        let norm = v.dot(&v).sqrt();
+        if norm.is_finite() && norm > 1e-12 {
+            v.mapv_inplace(|x| x / norm);
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Build the Hutch++ top-subspace basis `Q` (`≤ rank` orthonormal columns) by
+/// block-power (subspace) iteration on the operator: a `seed`-deterministic
+/// Rademacher start block, orthonormalised, then `iters` rounds of
+/// `Q ← orthonormalise(S·Q)`. The result steers toward the top eigenspace so the
+/// deflated Hutchinson variance is small; the log-det decomposition is EXACT for
+/// any orthonormal `Q`, so a slack `Q` cannot bias the estimate (only widen the
+/// error bar). Deterministic for a fixed `(matvec, dim, rank, iters, seed)`.
+fn build_deflation_basis(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    dim: usize,
+    rank: usize,
+    iters: usize,
+    seed: u64,
+) -> Vec<Array1<f64>> {
+    let r = rank.min(dim);
+    if r == 0 {
+        return Vec::new();
+    }
+    let mut cols: Vec<Array1<f64>> = (0..r)
+        .map(|col| {
+            let mut v = Array1::<f64>::zeros(dim);
+            let mut state = seed
+                .wrapping_add((col as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .wrapping_add(0xD1B5_4A32_D192_ED03);
+            let mut bits: u64 = 0;
+            let mut remaining: u32 = 0;
+            for value in v.iter_mut() {
+                if remaining == 0 {
+                    bits = splitmix64(&mut state);
+                    remaining = 64;
+                }
+                *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
+                bits >>= 1;
+                remaining -= 1;
+            }
+            v
+        })
+        .collect();
+    cols = orthonormalize(&cols);
+    for _ in 0..iters.max(1) {
+        if cols.is_empty() {
+            break;
+        }
+        let applied: Vec<Array1<f64>> = cols.iter().map(|c| matvec(c.view())).collect();
+        cols = orthonormalize(&applied);
+    }
+    cols
+}
+
+/// Solve `(S + t_ℓ I) y = v` for every input vector across the whole shift
+/// ladder, walking `order` (descending `t`) with per-vector warm starts (the
+/// solution is smooth in `t`, so the previous shift seeds the next). Returns
+/// `solves[ℓ][j]` and the total CG iteration count, or `None` on a shifted-CG
+/// breakdown. Shared by the projected-probe and deflation-basis solve families
+/// so both warm-start identically.
+fn solve_shift_ladder(
+    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    nodes: &[(f64, f64)],
+    order: &[usize],
+    vectors: &[Array1<f64>],
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<(Vec<Vec<Array1<f64>>>, usize)> {
+    let m = vectors.len();
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+    let mut solves: Vec<Vec<Array1<f64>>> = vec![Vec::with_capacity(m); nodes.len()];
+    let mut warm: Vec<Array1<f64>> = vec![Array1::zeros(dim); m];
+    let mut total = 0usize;
+    for &ell in order {
+        let (t, _) = nodes[ell];
+        let mut per = Vec::with_capacity(m);
+        for (j, v) in vectors.iter().enumerate() {
+            let (y, iters) = shifted_cg(matvec, t, v, &warm[j], cg_rel_tol, cg_max_iters)?;
+            total += iters;
+            warm[j] = y.clone();
+            per.push(y);
+        }
+        solves[ell] = per;
+    }
+    Some((solves, total))
 }
 
 #[cfg(test)]
@@ -480,5 +700,125 @@ mod tests {
             .expect("eval2")
             .estimate;
         assert_eq!(e1, e2, "fixed plan must be bit-deterministic");
+    }
+
+    #[test]
+    fn full_rank_deflation_is_exact_no_hutchinson() {
+        // Deflating the ENTIRE space (rank = dim) makes P = 0: every probe
+        // projects to zero, term2 vanishes with no variance, and the estimate is
+        // the deterministic quadrature tr log(S/c) over a full orthonormal basis
+        // = exact log det. Pins the term1 / decomposition bookkeeping as
+        // UNBIASED (a wrong reference count or projector would shift it).
+        let dim = 28;
+        let lambdas: Vec<f64> = (1..=dim).map(|i| 0.3 + 0.7 * i as f64).collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 31);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plan = RationalLogdetPlan::build(dim, 4, 5, lmin, lmax, 1e-11)
+            .expect("plan")
+            .with_deflation(&matvec, dim, 2, 123);
+        let eval = plan.evaluate(&matvec, 1e-14, 20_000).expect("eval");
+        assert_eq!(
+            eval.deflation_basis.len(),
+            dim,
+            "full-rank block must realise dim orthonormal columns"
+        );
+        assert!(
+            eval.std_err < 1e-8,
+            "full deflation leaves ~no Hutchinson variance (P ≈ 0), got std_err={:.3e}",
+            eval.std_err
+        );
+        let rel = (eval.estimate - logdet).abs() / logdet.abs().max(1.0);
+        assert!(
+            rel < 1e-6,
+            "full-rank deflation must be exact to quadrature: rel {rel:.3e} \
+             (est {} vs {logdet})",
+            eval.estimate
+        );
+    }
+
+    #[test]
+    fn deflation_cuts_error_bar_and_stays_accurate_at_wide_kappa() {
+        // κ = 1e8 log-uniform: raw Hutchinson carries a large bar; peeling the
+        // top-16 directions collapses it while the estimate stays accurate (the
+        // decomposition is exact for any Q, term2 unbiased for the projected
+        // probes).
+        let dim = 96;
+        let mut state = 2026u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -4.0, 4.0)))
+            .collect();
+        let (a, logdet) = spd_with_spectrum(dim, &lambdas, 4321);
+        let lmin = lambdas.iter().cloned().fold(f64::INFINITY, f64::min);
+        let lmax = lambdas.iter().cloned().fold(0.0f64, f64::max);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plain = RationalLogdetPlan::build(dim, 32, 17, lmin, lmax, 1e-9).expect("plan");
+        let defl = plain.clone().with_deflation(&matvec, 16, 3, 555);
+        let e_plain = plain.evaluate(&matvec, 1e-12, 50_000).expect("plain");
+        let e_defl = defl.evaluate(&matvec, 1e-12, 50_000).expect("defl");
+        let rel = (e_defl.estimate - logdet).abs() / logdet.abs().max(1.0);
+        eprintln!(
+            "wide-κ: plain std_err={:.3e} defl std_err={:.3e} defl rel={:.3e}",
+            e_plain.std_err, e_defl.std_err, rel
+        );
+        assert!(
+            rel < 0.05,
+            "deflated estimate rel err {rel:.3e} (est {} vs exact {logdet})",
+            e_defl.estimate
+        );
+        assert!(
+            e_defl.std_err < e_plain.std_err,
+            "deflation must shrink the Hutchinson error bar (plain {:.3e} vs defl {:.3e})",
+            e_plain.std_err,
+            e_defl.std_err
+        );
+    }
+
+    #[test]
+    fn deflated_directional_derivative_matches_fd_of_surrogate() {
+        // The value↔gradient no-desync contract WITH deflation: the fixed-Q
+        // directional derivative is the exact derivative of the surrogate value
+        // because Q is FROZEN. Building the plan's Q once from `a` and reusing it
+        // for the a ± h·da evaluations holds Q fixed, so the central FD matches
+        // the analytic gradient tightly.
+        let dim = 40;
+        let mut state = 9u64;
+        let lambdas: Vec<f64> = (0..dim)
+            .map(|_| 10f64.powf(next_uniform(&mut state, -2.0, 2.0)))
+            .collect();
+        let (a, _) = spd_with_spectrum(dim, &lambdas, 77);
+        let d_lambdas: Vec<f64> = (0..dim).map(|_| next_uniform(&mut state, 0.1, 1.0)).collect();
+        let (da, _) = spd_with_spectrum(dim, &d_lambdas, 78);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plan = RationalLogdetPlan::build(dim, 8, 5, 1e-2, 1e2, 1e-9)
+            .expect("plan")
+            .with_deflation(&matvec, 6, 3, 4242);
+        assert!(
+            plan.deflation.as_ref().is_some_and(|d| !d.basis.is_empty()),
+            "deflation basis must have been frozen"
+        );
+        let eval = plan.evaluate(&matvec, 1e-13, 20_000).expect("eval");
+        let grad = plan
+            .directional_derivative(&eval, &|v: ArrayView1<f64>| da.dot(&v))
+            .expect("grad");
+        let h = 1e-5;
+        let a_plus = &a + &(&da * h);
+        let a_minus = &a - &(&da * h);
+        let f_plus = plan
+            .evaluate(&|v: ArrayView1<f64>| a_plus.dot(&v), 1e-13, 20_000)
+            .expect("eval+")
+            .estimate;
+        let f_minus = plan
+            .evaluate(&|v: ArrayView1<f64>| a_minus.dot(&v), 1e-13, 20_000)
+            .expect("eval-")
+            .estimate;
+        let fd = (f_plus - f_minus) / (2.0 * h);
+        let rel = (grad - fd).abs() / fd.abs().max(1e-12);
+        assert!(
+            rel < 1e-5,
+            "deflated surrogate gradient {grad:.9e} vs its own FD {fd:.9e} (rel {rel:.3e})"
+        );
+        assert!(grad > 0.0, "SPD direction must increase log det, got {grad}");
     }
 }
