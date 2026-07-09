@@ -344,11 +344,19 @@ impl SurvivalLocationScaleFamily {
             // derivative is exactly the Newton decrement computed above.
             let directional = newton_decrement;
             const MIN_ALPHA: f64 = 1e-12;
-            // The pre-migration loop halved from the feasibility-capped α until
-            // it fell below MIN_ALPHA; the equivalent trial count is
-            // ⌊log₂(α₀/MIN_ALPHA)⌋ + 1 (zero when α₀ already sits below the
-            // floor, in which case no trial runs and the search is exhausted).
-            let max_steps = ((alpha / MIN_ALPHA).log2().floor() as i64 + 1).max(0) as usize;
+            // The pre-migration loop halved from the feasibility-capped α
+            // while `alpha >= MIN_ALPHA`; count those trials by the same
+            // halving recurrence (exact, unlike a log — zero trials when α₀
+            // already sits below the floor, leaving the search exhausted).
+            let max_steps = {
+                let mut n = 0_usize;
+                let mut a = alpha;
+                while a >= MIN_ALPHA {
+                    n += 1;
+                    a *= 0.5;
+                }
+                n
+            };
             // A trial whose block-state rebuild or likelihood evaluation errors
             // is INVALID (`Ok(None)`): halve without consulting the Armijo test.
             let accepted = match backtracking_line_search::<_, Infallible>(

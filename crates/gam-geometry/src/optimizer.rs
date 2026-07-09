@@ -1,3 +1,4 @@
+use gam_optimize::{BacktrackConfig, backtracking_line_search, constants};
 use ndarray::{Array1, ArrayView1};
 
 use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
@@ -486,7 +487,7 @@ impl RiemannianLBFGS {
         // Initial Riemannian gradient norm: the shift-invariant scale of the
         // relative stationarity test (see `relative_stationarity`).
         let grad0_norm = g_norm(manifold, x.view(), grad.view())?;
-        let armijo_c: f64 = 1.0e-4;
+        let armijo_c: f64 = constants::ARMIJO_C1;
         let alpha_min: f64 = 1.0e-16;
         let alpha_max: f64 = 1.0e16;
         let initial_step = if self.step_size.is_finite() && self.step_size > 0.0 {
@@ -553,22 +554,41 @@ impl RiemannianLBFGS {
             }
             // If no expansion succeeded, contract from the initial trial.
             if best_alpha == 0.0 {
-                alpha = initial_step;
-                while alpha > alpha_min {
-                    let step = &direction * alpha;
-                    let trial_x = manifold.retract(x.view(), step.view())?;
-                    let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
-                    let armijo_rhs = f_curr + armijo_c * alpha * slope;
-                    if f_trial.is_finite() && f_trial <= armijo_rhs {
-                        best_alpha = alpha;
-                        best_f = f_trial;
-                        best_x = trial_x;
-                        // Riemannian (metric-raised) gradient at the trial point.
-                        best_grad =
-                            manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
-                        break;
+                // The pre-migration loop halved while `alpha > alpha_min`;
+                // `initial_step` is caller-supplied, so the trial count is
+                // derived by the same halving recurrence (exact, unlike a log).
+                let max_steps = {
+                    let mut n = 0_usize;
+                    let mut a = initial_step;
+                    while a > alpha_min {
+                        n += 1;
+                        a *= 0.5;
                     }
-                    alpha *= 0.5;
+                    n
+                };
+                if let Some(accepted) = backtracking_line_search(
+                    BacktrackConfig {
+                        initial_step,
+                        max_steps,
+                        ..BacktrackConfig::default()
+                    },
+                    |alpha| {
+                        let step = &direction * alpha;
+                        let trial_x = manifold.retract(x.view(), step.view())?;
+                        let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
+                        Ok(Some((f_trial, (trial_x, g_trial_e))))
+                    },
+                    |alpha, f_trial| {
+                        f_trial.is_finite() && f_trial <= f_curr + armijo_c * alpha * slope
+                    },
+                )? {
+                    best_alpha = accepted.step;
+                    best_f = accepted.value;
+                    let (trial_x, g_trial_e) = accepted.payload;
+                    // Riemannian (metric-raised) gradient at the trial point.
+                    best_grad =
+                        manifold.riemannian_gradient(trial_x.view(), g_trial_e.view())?;
+                    best_x = trial_x;
                 }
             }
             if best_alpha == 0.0 {
