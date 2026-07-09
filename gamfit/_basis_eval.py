@@ -99,7 +99,13 @@ def bspline_basis_size(spec: Any) -> int:
 
     arr = np.asarray(knots)
     if spec.periodic:
-        return int(arr.size - spec.degree - 1 - spec.degree)
+        # The Rust periodic evaluator (`bspline_basis(..., periodic=True)`)
+        # builds the cyclic basis on the knot-interval lattice: one basis
+        # function per interval of the closed domain, i.e. len(knots) - 1
+        # columns regardless of degree. This is the single periodic-basis
+        # cardinality; the cyclic difference penalty is built at the same
+        # width in the torch fit path.
+        return int(arr.size - 1)
     return int(arr.size - spec.degree - 1)
 
 

@@ -129,6 +129,33 @@ def _torch_smooth_dispatch_key(class_name: str) -> str:
     return str(dispatch_key(class_name))
 
 
+def _bspline_penalty_np(knots_np: Any, degree: int, order: int, periodic: bool) -> Any:
+    """Difference penalty matching the design ``bspline_basis`` builds.
+
+    The open basis spans ``len(knots) - degree - 1`` columns and takes the
+    open-spline difference penalty. The periodic basis is cyclic on the
+    knot-interval lattice — ``len(knots) - 1`` columns for any degree — so
+    its penalty must be the cyclic difference penalty at that SAME width;
+    the open penalty has the wrong dimension (and the wrong wrap-around
+    coupling) for a cyclic coefficient vector.
+    """
+    if periodic:
+        import numpy as np
+
+        from .._binding import rust_module
+
+        num_basis = int(np.asarray(knots_np).size - 1)
+        return np.asarray(
+            rust_module().cyclic_difference_penalty(num_basis, int(order)), dtype=float
+        )
+    from .._api import smoothness_penalty as _smoothness_penalty
+
+    penalty_np, _null_basis = _smoothness_penalty(
+        knots_np, degree=int(degree), order=int(order),
+    )
+    return penalty_np
+
+
 def _marginal_bspline_design_penalty(
     marginal: BSpline, x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -136,15 +163,14 @@ def _marginal_bspline_design_penalty(
 
     Mirrors the scalar :class:`BSpline` branch exactly: the design carries the
     autograd VJP back to ``x`` through :func:`bspline_basis`, and the penalty
-    shares the SAME resolved knot vector and effective degree as the design so
-    the difference penalty regularizes the basis the design actually spans
-    (auto-knot derivation may downgrade the degree for small n — #340).
+    shares the SAME resolved knot vector, effective degree, and (cyclic vs
+    open) topology as the design so the difference penalty regularizes the
+    basis the design actually spans (auto-knot derivation may downgrade the
+    degree for small n — #340).
 
     ``x`` is the 1D marginal coordinate ``(N,)``. Returns ``(B_x, S_x)`` where
     ``B_x`` is ``(N, k)`` (differentiable) and ``S_x`` is ``(k, k)``.
     """
-    from .._api import smoothness_penalty as _smoothness_penalty
-
     marg_knots = marginal.knots
     if marg_knots is None or isinstance(marg_knots, int):
         from .._api import _resolve_knots
@@ -163,8 +189,8 @@ def _marginal_bspline_design_penalty(
     design = bspline_basis(
         x, knots, degree=eff_degree, periodic=bool(marginal.periodic),
     )
-    penalty_np, _null_basis = _smoothness_penalty(
-        knots_np, degree=eff_degree, order=int(marginal.penalty_order),
+    penalty_np = _bspline_penalty_np(
+        knots_np, eff_degree, int(marginal.penalty_order), bool(marginal.periodic),
     )
     penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=x.device)
     return design.to(torch.float64), penalty
@@ -255,7 +281,6 @@ def _build_design_penalty(
         bspline_degree = smooth.degree
         bspline_periodic = smooth.periodic
         bspline_penalty_order = smooth.penalty_order
-        from .._api import smoothness_penalty as _smoothness_penalty
         if bspline_knots is None or isinstance(bspline_knots, int):
             # Resolve auto-knots once (the `None` default and the integer
             # interior-knot-count form both auto-derive) so the design and the
@@ -278,8 +303,8 @@ def _build_design_penalty(
         design = bspline_basis(
             points.squeeze(1), knots, degree=eff_degree, periodic=bspline_periodic,
         )
-        penalty_np, _null_basis = _smoothness_penalty(
-            knots_np, degree=eff_degree, order=bspline_penalty_order,
+        penalty_np = _bspline_penalty_np(
+            knots_np, eff_degree, bspline_penalty_order, bool(bspline_periodic),
         )
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
