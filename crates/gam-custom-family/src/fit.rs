@@ -333,20 +333,25 @@ pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
 /// penalty `S` on `range(S)`, computed structurally (unit weights).
 ///
 /// These are the eigenvalues of the pencil `(UᵀG U, D)` where `S = U D Uᵀ` and
-/// the index runs over `range(S)` (the positive eigenvalues `d_j` of `S`).
-/// Equivalently they are the eigenvalues of the symmetric matrix
+/// the index runs over `range(S)` (the positive eigenvalues `d_j` of `S`),
+/// QUOTIENTED by `ker(S)`: with `A = UᵀGU` partitioned into null (`0`) and
+/// range (`r`) blocks they are the eigenvalues of the symmetric matrix
 ///
 /// ```text
-/// B = D^{-1/2} (Uᵀ G U) D^{-1/2}   restricted to range(S),
+/// B = D_r^{-1/2} (A_rr − A_r0 A₀₀⁺ A₀r) D_r^{-1/2},
 /// ```
 ///
-/// with `D = diag(d_j)` over the range and `U` the corresponding penalty
-/// eigenvectors. With these `γ_j` the structural effective df is the EXACT
-/// trace identity
+/// with `D_r = diag(d_j)` over the range and `U` the penalty eigenvectors.
+/// The Schur complement is essential whenever `G` couples the penalized range
+/// to `ker(S)`: null directions are fitted unpenalized at every λ and absorb
+/// the shared curvature, so `A_rr` alone overstates the λ-resistant df. With
+/// these `γ_j` the structural effective df obeys the EXACT trace identity
 ///
 /// ```text
-/// Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }   for all λ > 0.
+/// rank(A₀₀) + Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }   for all λ > 0,
 /// ```
+///
+/// whose λ-dependent part is the returned spectrum.
 ///
 /// This is NOT a per-direction Rayleigh quotient `(u_jᵀ G u_j)/d_j`: that would
 /// keep only the diagonal of `B` and is correct only when `G` and `S` commute

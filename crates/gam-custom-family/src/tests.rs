@@ -9075,6 +9075,67 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
     );
 }
 
+/// Structural edf with a penalty NULLSPACE coupled to the range through the
+/// design Gram: the γ_j must come from the Schur complement
+/// `A_rr − A_r0 A₀₀⁺ A₀r` on the penalty quotient, not from `A_rr` alone.
+///
+/// `S = diag(0, 1, 1)` and `G = [[1, 1, 0], [1, 1+ε, 0], [0, 0, 1]]`: the
+/// unpenalized null coordinate absorbs the shared curvature between
+/// coordinates 0 and 1 at every λ, so the quotient eigenvalues are (ε, 1) —
+/// keeping `A_rr` alone would claim (1+ε, 1) and overstate the λ-resistant
+/// df. Verified against the exact trace identity
+/// `tr{G (G+λS)⁻¹} = rank(A₀₀) + Σ_j γ_j/(γ_j+λ)` with `rank(A₀₀) = 1`.
+#[test]
+pub(crate) fn structural_edf_quotients_nullspace_range_coupling() {
+    let eps = 0.01_f64;
+    // XᵀX = [[1,1,0],[1,1+ε,0],[0,0,1]] via the Cholesky factor
+    // L = [[1,0,0],[1,√ε,0],[0,0,1]], X = Lᵀ.
+    let x = array![
+        [1.0, 1.0, 0.0],
+        [0.0, eps.sqrt(), 0.0],
+        [0.0, 0.0, 1.0]
+    ];
+    let design = DesignMatrix::from(x);
+    let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let penalty = PenaltyMatrix::Dense(s.clone());
+
+    let mut gammas = design_penalty_range_gammas(&design, &penalty)
+        .expect("rank-2 penalty range must yield generalized eigenvalues");
+    gammas.sort_by(|a, b| a.partial_cmp(b).expect("finite γ"));
+    assert_eq!(gammas.len(), 2, "range(S) has rank 2");
+    assert!(
+        (gammas[0] - eps).abs() < 1e-9,
+        "coupled range direction must carry quotient curvature ε={eps}, got {}",
+        gammas[0]
+    );
+    assert!(
+        (gammas[1] - 1.0).abs() < 1e-9,
+        "uncoupled range direction keeps curvature 1, got {}",
+        gammas[1]
+    );
+
+    // Exact trace identity: tr(G (G+λS)⁻¹) = 1 + Σ_j γ_j/(γ_j+λ), the leading
+    // 1 being the null-block rank (fitted unpenalized at every λ). Reference
+    // computed with a dense solve independent of the helper.
+    let g = array![[1.0, 1.0, 0.0], [1.0, 1.0 + eps, 0.0], [0.0, 0.0, 1.0]];
+    for &lambda in &[0.25_f64, 1.0, 7.5] {
+        let m = &g + &(&s * lambda);
+        let m_inv = {
+            use gam_linalg::faer_ndarray::FaerCholesky;
+            let chol = m.cholesky(faer::Side::Lower).expect("G+λS is SPD here");
+            let mut ident = Array2::<f64>::eye(3);
+            chol.solve_mat_in_place(&mut ident);
+            ident
+        };
+        let trace: f64 = g.dot(&m_inv).diag().iter().sum();
+        let edf = 1.0 + unit_weight_term_edf(&gammas, lambda.ln());
+        assert!(
+            (edf - trace).abs() < 1e-9,
+            "quotient edf {edf} must equal tr(G(G+λS)⁻¹) {trace} at λ={lambda}",
+        );
+    }
+}
+
 /// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
 /// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
 /// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
