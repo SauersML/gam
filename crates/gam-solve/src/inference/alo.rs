@@ -1227,8 +1227,10 @@ pub fn compute_case_deletion_from_pirls(
         return Ok(None);
     }
 
-    // Dispersion φ matches the ALO entry point: estimated RSS/(n−edf) for the
-    // Gaussian identity link, fixed at 1 for the single-parameter families.
+    // Dispersion φ matches the ALO entry point: estimated RSS/(n_pos−edf) for
+    // the Gaussian identity link, fixed at 1 for the single-parameter families.
+    // Zero-weight rows contribute nothing to the RSS, so they must not inflate
+    // the residual degrees of freedom either (#584 weighting consistency).
     let phi = match link {
         LinkFunction::Identity => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -1239,7 +1241,8 @@ pub fn compute_case_deletion_from_pirls(
                     base.finalweights[i] * r * r
                 })
                 .sum();
-            let dof = (n as f64) - base.edf;
+            let n_pos = (0..n).filter(|&i| base.finalweights[i] > 0.0).count();
+            let dof = (n_pos as f64) - base.edf;
             rss / dof.max(1.0)
         }
         _ => 1.0,
