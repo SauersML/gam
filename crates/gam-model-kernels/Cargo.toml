@@ -18,6 +18,7 @@ gam-runtime = { path = "../gam-runtime", version = "=0.3.149" }
 gam-solve = { path = "../gam-solve", version = "=0.3.149" }
 libm = "0.2.16"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+opt.workspace = true
 smallvec = "1"
 statrs = "0.18.0"
 wide = "0.7"
