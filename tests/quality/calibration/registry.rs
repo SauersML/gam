@@ -204,9 +204,10 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             name: "skovgaard_lr_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
-            guards: &[1872],
-            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
-                         (PENDING dedicated skovgaard r* size curve)",
+            guards: &[1872, 939],
+            audited_by: "sbc_skovgaard_rstar_size_curve \
+                         (skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null) \
+                         + bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
         // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873).
         CalibrationTarget {
