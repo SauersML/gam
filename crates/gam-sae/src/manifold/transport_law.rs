@@ -301,7 +301,7 @@ pub fn measure_atom_transport_between(
 /// augmented decoder: the anchor slice `[0, p_x)` verbatim, or block `ℓ`'s slice
 /// divided by `√λ_ℓ` (exactly [`SaeManifoldTerm::layer_decoder`]'s arithmetic,
 /// but keyed off the passed `layout` so this needs no installed layout).
-fn honest_layer_decoder(
+pub(crate) fn honest_layer_decoder(
     decoder: &Array2<f64>,
     layout: &CrosscoderLayout,
     layer: CrosscoderLayer,
@@ -443,7 +443,7 @@ fn wrap_half(x: f64) -> f64 {
 
 /// Honest-units decoder drift `δ = ‖B_tgt − B_src‖_F / √(‖B_src‖_F · ‖B_tgt‖_F)`
 /// (gam#2231 §3). `NaN` if either decoder is numerically zero.
-fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
+pub(crate) fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
     let fro = |a: &Array2<f64>| a.iter().map(|&v| v * v).sum::<f64>().sqrt();
     let ns = fro(b_src);
     let nt = fro(b_tgt);
@@ -465,7 +465,7 @@ fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
 /// the right-singular vectors of the `M × p` decoder above a numerical-rank
 /// threshold; the singular values of `Q_srcᵀ Q_tgt` are the cosines of the
 /// angles.
-fn principal_angles_between_images(
+pub(crate) fn principal_angles_between_images(
     b_src: &Array2<f64>,
     b_tgt: &Array2<f64>,
 ) -> Result<Vec<f64>, String> {

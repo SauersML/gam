@@ -199,6 +199,7 @@ mod construction_padded_blocks;
 mod construction_reconstruction;
 mod coordinate_fidelity;
 mod cross_fit;
+mod crosscoder_drift;
 mod curl;
 mod derivative_oracle;
 mod dual;
@@ -394,6 +395,9 @@ mod tests_transport_law;
 mod tests_crosscoder_block_fd_2231;
 
 #[cfg(test)]
+mod tests_crosscoder_drift;
+
+#[cfg(test)]
 mod tests_ln_sphere_ambient_f4;
 
 #[cfg(test)]
@@ -478,6 +482,7 @@ pub use stratum_births::*;
 pub use streaming_plan::*;
 pub use term::*;
 pub use terracini::*;
+pub use crosscoder_drift::*;
 pub use transport_law::*;
 pub use weight_frame_catalog::*;
 pub use wbic_audit::*;
