@@ -1544,6 +1544,132 @@ pub fn rational_reduced_schur_directional(
     plan.directional_derivative(eval, dmatvec)
 }
 
+/// Plain CG solve `S y = b` on the SPD reduced Schur through the matrix-free
+/// [`schur_matvec`] apply (the `t = 0`, unshifted companion to the surrogate's
+/// shifted solves), warm-started from `y0`. Yields `y = S⁻¹ b` — the operator
+/// every `tr(S⁻¹·M)` gradient / adjoint channel contracts against at massive K.
+/// `None` on a non-finite breakdown (SPD `S` ⇒ that signals a caller bug or a
+/// non-finite operator, both of which must surface rather than be swallowed).
+fn reduced_schur_cg_solve<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    b: &Array1<f64>,
+    y0: &Array1<f64>,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<Array1<f64>> {
+    let k = sys.k;
+    let apply = |v: &Array1<f64>| -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(sys, htt_factors, ridge_beta, v, &mut out, backend, resident);
+        out
+    };
+    let mut y = y0.clone();
+    let mut r = b - &apply(&y);
+    let b_norm = b.dot(b).sqrt().max(f64::MIN_POSITIVE);
+    let mut p = r.clone();
+    let mut rs = r.dot(&r);
+    if !rs.is_finite() {
+        return None;
+    }
+    let tol = cg_rel_tol * b_norm;
+    let mut iters = 0usize;
+    while rs.sqrt() > tol && iters < cg_max_iters {
+        let ap = apply(&p);
+        let denom = p.dot(&ap);
+        if !(denom.is_finite() && denom > 0.0) {
+            return None;
+        }
+        let alpha = rs / denom;
+        y.scaled_add(alpha, &p);
+        r.scaled_add(-alpha, &ap);
+        let rs_new = r.dot(&r);
+        if !rs_new.is_finite() {
+            return None;
+        }
+        p = &r + &(&p * (rs_new / rs));
+        rs = rs_new;
+        iters += 1;
+    }
+    Some(y)
+}
+
+/// The `S⁻¹ v_j` bundle for a fixed probe set: solves `S y_j = v_j` (`t = 0`) on
+/// the matrix-free reduced Schur for each probe `v_j`, warm-started per-probe
+/// from `warm` when supplied (e.g. the surrogate's smallest-shift solves, which
+/// already sit close to `S⁻¹ v_j`). Computed ONCE per outer solve and reused
+/// across every `tr(S⁻¹·M)` channel, so the whole massive-K ρ-gradient +
+/// θ-adjoint rides on one probe family — one functional, desync closed.
+///
+/// `probes` are the surrogate plan's Rademacher probes (`RationalLogdetPlan::
+/// probes`); pass the SAME set the value used so the trace estimates are
+/// consistent with it. `None` on any CG breakdown.
+pub fn reduced_schur_inverse_probe_solves<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    probes: &[Array1<f64>],
+    warm: Option<&[Array1<f64>]>,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<Vec<Array1<f64>>> {
+    let k = sys.k;
+    let zero = Array1::<f64>::zeros(k);
+    let mut out = Vec::with_capacity(probes.len());
+    for (j, v) in probes.iter().enumerate() {
+        let y0 = warm.and_then(|w| w.get(j)).unwrap_or(&zero);
+        let y = reduced_schur_cg_solve(
+            sys,
+            htt_factors,
+            ridge_beta,
+            backend,
+            resident,
+            v,
+            y0,
+            cg_rel_tol,
+            cg_max_iters,
+        )?;
+        out.push(y);
+    }
+    Some(out)
+}
+
+/// Hutchinson estimate `tr(S⁻¹ M) ≈ (1/m) Σ_j (S⁻¹ v_j)ᵀ (M v_j)` for the reduced
+/// Schur `S` and a SYMMETRIC channel operator `M` supplied by its matvec
+/// `m_matvec(v) = M·v`. `sinv_probes[j] = S⁻¹ v_j` is the bundle from
+/// [`reduced_schur_inverse_probe_solves`] and `probes` the matching probe set.
+///
+/// The general umbrella (#2080): every dense-`S⁻¹` consumer in the SAE outer
+/// gradient — the per-row selected-inverse deflation corrections
+/// (`M = Σ_i G_iᵀ C_i G_i`), the direct β–β contractions (`M = ∂H_ββ` channel),
+/// and the θ-adjoint — is ultimately a `tr(S⁻¹·M)` with `M·v` computable
+/// row-locally without forming `M`. Estimating them all from the SAME
+/// `(probes, S⁻¹ v_j)` pair keeps the value, ρ-gradient, and θ-adjoint one
+/// functional. Unbiased for the ±1 Rademacher probes (`E[vᵀ S⁻¹ M v] =
+/// tr(S⁻¹ M)`). `None` on a length mismatch or a non-finite accumulation.
+pub fn hutchinson_reduced_schur_inverse_trace(
+    probes: &[Array1<f64>],
+    sinv_probes: &[Array1<f64>],
+    m_matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+) -> Option<f64> {
+    let m = probes.len();
+    if m == 0 || sinv_probes.len() != m {
+        return None;
+    }
+    let mut acc = 0.0_f64;
+    for (v, y) in probes.iter().zip(sinv_probes) {
+        let mv = m_matvec(v.view());
+        acc += y.dot(&mv);
+    }
+    acc /= m as f64;
+    acc.is_finite().then_some(acc)
+}
+
 /// Accumulate one row's reduced-Schur point-elimination contribution
 /// `H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i) x` (length `K`) into `acc`.
 ///

@@ -5150,6 +5150,98 @@ fn rational_reduced_schur_directional_matches_fd_of_surrogate() {
     assert!(grad > 0.0, "SPD ∂S must increase the surrogate log det, got {grad}");
 }
 
+/// Dense reference `tr(S⁻¹)` from the lower-Cholesky factor `S = L Lᵀ`:
+/// `tr(S⁻¹) = tr(L⁻ᵀ L⁻¹) = ‖L⁻¹‖_F²`, with each `L⁻¹` column solved by forward
+/// substitution (`L y = e_c`). Self-contained oracle for the matrix-free
+/// `tr(S⁻¹·M)` estimator, no eigensolver needed.
+fn dense_trace_inverse(l: &Array2<f64>) -> f64 {
+    let k = l.nrows();
+    let mut acc = 0.0;
+    for c in 0..k {
+        let mut y = vec![0.0_f64; k];
+        for i in 0..k {
+            let mut s = if i == c { 1.0 } else { 0.0 };
+            for j in 0..i {
+                s -= l[[i, j]] * y[j];
+            }
+            y[i] = s / l[[i, i]];
+        }
+        acc += y.iter().map(|v| v * v).sum::<f64>();
+    }
+    acc
+}
+
+/// The matrix-free `tr(S⁻¹·M)` Hutchinson estimator (#2080 general umbrella):
+/// the `S⁻¹ v_j` bundle (`reduced_schur_inverse_probe_solves`, `t = 0` CG on
+/// `schur_matvec`) contracted against a channel matvec. `M = S` is the exact
+/// plumbing check (`tr(S⁻¹ S) = k` with ZERO variance, since `(S⁻¹v)ᵀ(Sv) =
+/// ‖v‖² = k`), and `M = I` exercises the genuine Hutchinson estimate of
+/// `tr(S⁻¹)` against the dense oracle. Also pins determinism.
+#[test]
+fn hutchinson_reduced_schur_inverse_trace_matches_dense() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let seed = 0x2080_51_7A_u64;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+    let exact_tr_inv = dense_trace_inverse(&l);
+
+    // Fixed probe set (reuse the surrogate plan's Rademacher probes).
+    let plan = RationalLogdetPlan::build(k, 64, seed, 1e-3, 1e3, 1e-9).expect("plan");
+    let sinv = reduced_schur_inverse_probe_solves(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        &plan.probes,
+        None,
+        1e-12,
+        50_000,
+    )
+    .expect("S⁻¹ v_j bundle must solve");
+
+    // M = S ⇒ tr(S⁻¹S) = k, variance-free (a plumbing + solve-accuracy gate).
+    let tr_sinv_s = hutchinson_reduced_schur_inverse_trace(&plan.probes, &sinv, &|v| {
+        let x = v.to_owned();
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend, None);
+        out
+    })
+    .expect("tr(S⁻¹S) estimate");
+    let rel_s = (tr_sinv_s - k as f64).abs() / k as f64;
+    assert!(
+        rel_s < 1e-5,
+        "tr(S⁻¹S) must equal k to solve accuracy: got {tr_sinv_s} vs k={k} (rel {rel_s:.3e})"
+    );
+
+    // M = I ⇒ tr(S⁻¹) against the dense forward-substitution oracle.
+    let tr_sinv_i = hutchinson_reduced_schur_inverse_trace(&plan.probes, &sinv, &|v| v.to_owned())
+        .expect("tr(S⁻¹) estimate");
+    let rel_i = (tr_sinv_i - exact_tr_inv).abs() / exact_tr_inv.abs().max(1e-12);
+    eprintln!("tr(S⁻¹): est={tr_sinv_i:.6} exact={exact_tr_inv:.6} rel={rel_i:.3e}");
+    assert!(
+        rel_i < 0.15,
+        "matrix-free tr(S⁻¹) rel err {rel_i:.3e} exceeds 15% (est {tr_sinv_i} vs exact {exact_tr_inv})"
+    );
+
+    // Determinism: the fixed probe set + deterministic CG reproduce bit-for-bit.
+    let sinv2 = reduced_schur_inverse_probe_solves(
+        &sys, &htt_factors, ridge_beta, &backend, None, &plan.probes, None, 1e-12, 50_000,
+    )
+    .expect("S⁻¹ v_j bundle must re-solve");
+    let tr2 = hutchinson_reduced_schur_inverse_trace(&plan.probes, &sinv2, &|v| v.to_owned())
+        .expect("tr(S⁻¹) re-estimate");
+    assert_eq!(tr_sinv_i, tr2, "tr(S⁻¹) estimator must be bit-reproducible");
+}
+
 // ---------------------------------------------------------------------------
 // Co-visibility cluster preconditioner (Kushal & Agarwal visibility-based
 // preconditioning). At real over-complete SAE widths the co-firing graph is a
