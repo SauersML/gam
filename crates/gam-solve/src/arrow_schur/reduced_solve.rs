@@ -1947,6 +1947,16 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     Some((plan, eval))
 }
 
+/// Loose CG budget for BUILDING the bottom-tail (inverse-iteration) deflation
+/// basis columns. The two-sided split `tr log(S/c) = term1(Q) + term2(P)` is
+/// EXACT for any orthonormal `Q`, so basis-build solve error can only relax the
+/// variance reduction — it can never bias the value or its gradient. Three
+/// digits steers the subspace iteration onto the small-λ tail (all that is
+/// needed for the Frobenius off-diagonal mass to move into term1) while an
+/// evaluation-grade tolerance on the UNSHIFTED full-κ operator would cost
+/// √κ-scale CG iterations per column for no accuracy in return.
+const DEFLATION_BASIS_CG_REL_TOL: f64 = 1.0e-3;
+
 /// Build the FROZEN #2080 surrogate plan for one outer solve, with the Hutch++
 /// deflation rank DERIVED from a pilot evaluation — the build-once companion to
 /// per-ρ [`RationalLogdetPlan::evaluate`]. Returns just the plan (probes +
@@ -1993,7 +2003,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
     let base_plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
     // One resident operator across the pilot, every deflation re-solve, and the
-    // subspace-iteration `with_deflation` applies — the whole rank-derivation
+    // subspace-iteration `with_two_sided_deflation` applies — the whole rank-derivation
     // ladder (the two-sided deflation: block-power on S + inverse subspace
     // iteration on S⁻¹) reuses the same staged residency / device `S·v`.
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
@@ -2015,9 +2025,26 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let mut rank = 4usize;
     loop {
         let r = rank.min(cap);
-        let plan = base_plan
-            .clone()
-            .with_deflation(&matvec, r, deflation_subspace_iters, seed);
+        // Split the peel budget across BOTH spectral tails at equal total rank:
+        // the Hutchinson bar rides on ‖offdiag(P log(S/c) P)‖_F, whose mass sits
+        // symmetrically on the λ_max AND λ_min tails (|log(λ/c)| peaks equally at
+        // both ends of the bracket since c is its geometric midpoint), so top-only
+        // deflation stalls at ~½ the removable variance
+        // (`two_sided_deflation_drops_wide_kappa_std_err_below_two_percent`).
+        // The bottom-tail basis comes from inverse iteration — CG on the UNSHIFTED
+        // operator at full κ — so it gets its own LOOSE budget, not the
+        // evaluation-grade `cg_rel_tol`: an approximate bottom `Q` only relaxes
+        // the variance reduction, never biases the value (the split is exact for
+        // any orthonormal `Q`), while an evaluation-grade solve there would burn
+        // √κ-scale iterations per basis column for no accuracy in return.
+        let plan = base_plan.clone().with_two_sided_deflation(
+            &matvec,
+            r.div_ceil(2),
+            r / 2,
+            deflation_subspace_iters,
+            seed,
+            (DEFLATION_BASIS_CG_REL_TOL, cg_max_iters),
+        );
         let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
         if eval.std_err <= target || r >= cap {
             return Some(plan);

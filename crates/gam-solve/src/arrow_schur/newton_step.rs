@@ -1520,25 +1520,57 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
             deflation_row_spectra: Vec::new(),
         });
     };
-    let mut blocks = Vec::with_capacity(sys.rows.len());
+    let n = sys.rows.len();
+    let mut blocks = Vec::with_capacity(n);
     let mut count = 0usize;
-    let mut deflated_row_directions: Vec<Vec<Array1<f64>>> = Vec::with_capacity(sys.rows.len());
-    let mut deflation_row_spectra: Vec<Option<RowDeflationSpectrum>> =
-        Vec::with_capacity(sys.rows.len());
-    for (row_idx, row) in sys.rows.iter().enumerate() {
-        let result = factor_one_row_result(
-            row,
-            ridge_t,
-            sys.row_dims[row_idx],
-            row_idx,
-            options.tolerate_ill_conditioning,
-            deflation.row(row_idx),
-            // The presence of an installed `row_gauge_deflation` marks this as the
-            // SAE manifold evidence path, which opts into spectral discovery of a
-            // flat per-row H_tt direction (intrinsic-dimension deficiency, #1273)
-            // even when THIS row's supplied gauge list is empty/non-spanning.
-            true,
-        )?;
+    let mut deflated_row_directions: Vec<Vec<Array1<f64>>> = Vec::with_capacity(n);
+    let mut deflation_row_spectra: Vec<Option<RowDeflationSpectrum>> = Vec::with_capacity(n);
+    // The presence of an installed `row_gauge_deflation` marks this as the SAE
+    // manifold evidence path, which opts into spectral discovery of a flat per-row
+    // H_tt direction (intrinsic-dimension deficiency, #1273) even when THIS row's
+    // supplied gauge list is empty/non-spanning — the `true` flag below.
+    //
+    // Per-row Cholesky + spectral-deflation eigendecomps are INDEPENDENT (each
+    // reads only its own read-only `sys.rows[i]` block + that row's deflation
+    // gauges), so factor rows in parallel then collect in row order. The ordered
+    // `collect` + in-order fold reproduce the serial push order bit-for-bit
+    // (deterministic assembly — no cross-row reduction). #1557 — pin the nested
+    // faer eigendecomp GEMMs to `Par::Seq` inside each row worker.
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let results = if parallel {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .map(|row_idx| {
+                gam_problem::with_nested_parallel(|| {
+                    factor_one_row_result(
+                        &sys.rows[row_idx],
+                        ridge_t,
+                        sys.row_dims[row_idx],
+                        row_idx,
+                        options.tolerate_ill_conditioning,
+                        deflation.row(row_idx),
+                        true,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, ArrowSchurError>>()?
+    } else {
+        let mut results = Vec::with_capacity(n);
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            results.push(factor_one_row_result(
+                row,
+                ridge_t,
+                sys.row_dims[row_idx],
+                row_idx,
+                options.tolerate_ill_conditioning,
+                deflation.row(row_idx),
+                true,
+            )?);
+        }
+        results
+    };
+    for result in results {
         count += result.gauge_deflated_directions;
         deflated_row_directions.push(result.deflated_directions);
         deflation_row_spectra.push(result.deflation_spectrum);

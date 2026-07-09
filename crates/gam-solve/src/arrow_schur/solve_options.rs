@@ -601,16 +601,43 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         {
             return Ok(batched);
         }
-        let mut out = Vec::with_capacity(rows.len());
-        for (row_idx, row) in rows.iter().enumerate() {
-            out.push(factor_one_row(
-                row,
-                ridge_t,
-                d,
-                row_idx,
-                tolerate_ill_conditioning,
-            )?);
-        }
+        // Per-row Cholesky factorizations are INDEPENDENT (each reads only its own
+        // read-only `rows[i]` block), so factor rows in parallel then collect in
+        // row order — the ordered `collect` reproduces the serial push order
+        // bit-for-bit (no cross-row reduction; each block factored once). #1557 —
+        // pin any nested faer GEMM inside each row worker to `Par::Seq`.
+        let n = rows.len();
+        let parallel =
+            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let out = if parallel {
+            use rayon::prelude::*;
+            (0..n)
+                .into_par_iter()
+                .map(|row_idx| {
+                    gam_problem::with_nested_parallel(|| {
+                        factor_one_row(
+                            &rows[row_idx],
+                            ridge_t,
+                            d,
+                            row_idx,
+                            tolerate_ill_conditioning,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, ArrowSchurError>>()?
+        } else {
+            let mut out = Vec::with_capacity(n);
+            for (row_idx, row) in rows.iter().enumerate() {
+                out.push(factor_one_row(
+                    row,
+                    ridge_t,
+                    d,
+                    row_idx,
+                    tolerate_ill_conditioning,
+                )?);
+            }
+            out
+        };
         Ok(ArrowFactorSlab::from_blocks(out))
     }
 
