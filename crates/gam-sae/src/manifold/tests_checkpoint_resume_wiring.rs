@@ -1,5 +1,5 @@
 //! SPEC wall-survival E2E: the checkpoint wiring on the outer objective
-//! (`bank_checkpoint` → `try_resume_from_checkpoint` → `discard_checkpoint`)
+//! (`bank_checkpoint` → `try_resume_from_checkpoint` → `remove_checkpoint`)
 //! banks a resumable incumbent at a criterion improvement, installs it into a
 //! FRESH objective on the identical data (the re-submitted-job scenario), and
 //! removes the file once a converged fit is minted. Complements the pure
@@ -73,7 +73,7 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
     let salt = std::process::id() as u64 ^ 0xE2E0;
     let (mut first, flat) = tiny_objective(salt);
     // Ensure no stale file from a crashed previous run of THIS test.
-    first.discard_checkpoint();
+    first.remove_checkpoint();
     let cost = first
         .eval_cost(&flat)
         .expect("tiny circle criterion must evaluate");
@@ -107,7 +107,7 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
     );
 
     // Minting a converged fit discards the file; a third job starts cold.
-    second.discard_checkpoint();
+    second.remove_checkpoint();
     assert!(
         !second.checkpoint_path.exists(),
         "discard must remove the checkpoint file"
@@ -125,7 +125,7 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
 fn checkpoint_never_resumes_across_different_data() {
     let salt = std::process::id() as u64 ^ 0xD1FF;
     let (mut a, flat) = tiny_objective(salt);
-    a.discard_checkpoint();
+    a.remove_checkpoint();
     a.eval_cost(&flat).expect("criterion must evaluate");
     a.bank_checkpoint(&flat);
     assert!(a.checkpoint_path.exists());
@@ -138,5 +138,5 @@ fn checkpoint_never_resumes_across_different_data() {
         "a different data fingerprint must not find (let alone resume) another \
          problem's checkpoint"
     );
-    a.discard_checkpoint();
+    a.remove_checkpoint();
 }
