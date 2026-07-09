@@ -203,7 +203,12 @@ impl RationalLogdetPlan {
         let c = (lambda_min * lambda_max).sqrt();
         let t_lo = lambda_min * rel_tol;
         let t_hi = lambda_max / rel_tol;
-        let u_of = |ratio: f64| ((2.0 / std::f64::consts::PI) * ratio.ln()).asinh();
+        // Invert t(u) = c·exp(π/2·sinh u): u(t) = asinh((2/π)·ln(t/c)). The /c is
+        // load-bearing — t_lo/t_hi below are ABSOLUTE truncation points, so a node
+        // at u_of(t) must land at t, not c·t (which shifts the resolved window by a
+        // full factor of c and under-resolves the extreme-eigenvalue tails). Mirrors
+        // the /c the pole_height ratio uses just below.
+        let u_of = |t: f64| ((2.0 / std::f64::consts::PI) * (t / c).ln()).asinh();
         let u_lo = u_of(t_lo);
         let u_hi = u_of(t_hi);
         // Worst-case pole height over the padded bracket (evaluate at both
