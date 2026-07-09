@@ -128,7 +128,6 @@ from ._sae_spectral import (
     RoutabilityFloor,
     SpectrometerReport,
     SpikeRecovery,
-    TieredFitResult,
     VarianceChargeEvidence,
     atlas_nerve_diagram,
     audit_sae,
@@ -145,7 +144,6 @@ from ._sae_spectral import (
     recover_spikes,
     routability_audit,
     routability_floor,
-    sae_manifold_fit_tiered,
     separation_limit,
     sparse_dict_dual_certificate,
 )

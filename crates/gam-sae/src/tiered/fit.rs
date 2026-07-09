@@ -1,24 +1,37 @@
-//! End-to-end tiered fit driver (#2023).
+//! Tiered fit as a **seed policy + alternation cadence** of the unified engine
+//! (#2023; unification #2232 Increment 4).
 //!
-//! Assembles the primitives the tiered architecture is built from into one
-//! runnable path, replacing the "components exist but nothing composes them"
-//! state:
+//! "Tiered" is not a separate model or a separate public API — it is a *schedule*
+//! that the one SAE engine runs: the residual tier is a **round-0 warm start**,
+//! and the alternation to joint stationarity is the fit. Increment 4 deleted the
+//! public tiered surface (the `sae_manifold_fit_tiered` FFI entry and its
+//! `gamfit._sae_spectral` Python wrapper); the tiered flow is now reached only
+//! through the unified engine + the seed/cadence composition (`examples/
+//! compose_tiers.py`: linear warm start via `sparse_dictionary_fit` → curved
+//! alternation via `sae_manifold_fit`).
 //!
-//! 1. **Tier 0** — peel the shared column mean ([`Tier0Mean`]); the bulk is fit
-//!    on the de-meaned residual `R0 = z − μ`.
-//! 2. **Tier 1** — the block-sparse collapsed-linear dictionary
-//!    ([`fit_block_sparse_dictionary`]) at width `K = G·b`, the scalable linear
-//!    bulk.
-//! 3. **Tier 2** — curved atoms fit on the Tier-1 residual via
-//!    [`cofit_block_and_curved`]: its round 0 fits curved charts on the linear
-//!    residual and rounds ≥1 alternate the two blocks to joint stationarity. The
-//!    curved tier seeds from the Tier-1 block routing / residual, so **this path
-//!    never PC-reseeds** — the migration-ledger property this architecture asks
-//!    for (`residual factor ↔ linear atom ↔ curved atom`, no principal-component
-//!    reseeding) holds by construction.
+//! This module keeps the in-crate orchestrator [`fit_tiered`] that expresses that
+//! schedule directly in Rust, used by the risk-pin tests + the `tiered_gpu_scale`
+//! example. It is **internal, not public API**, and is slated to fold into
+//! `sae_manifold_fit`'s inner arrow-Schur driver in Increment 5 (the fold needs
+//! the `sparse_dict` inner-solve seam owned elsewhere + the central build loop);
+//! it survives here only as the delegating expression of the two schedule phases:
+//!
+//! **(a) Seed policy** — Tier-0 peels the shared column mean ([`Tier0Mean`]; the
+//!    bulk is fit on `R0 = z − μ`), then Tier-1 warm-starts the linear bulk: the
+//!    block-sparse collapsed-linear dictionary ([`fit_block_sparse_dictionary`])
+//!    at width `K = G·b`, the linear-atom special case of the one dictionary.
+//!    Births only ever draw from this residual-factor pool — never a principal
+//!    component — so `pc_reseed_events == 0` holds by construction.
+//!
+//! **(b) Alternation cadence** — Tier-2 curved atoms are fit on the Tier-1
+//!    residual via [`cofit_block_and_curved`]: round 0 is the curved-on-linear-
+//!    residual warm start and rounds ≥1 alternate the two blocks to joint
+//!    stationarity. This is the same inner/outer descent the unified engine runs,
+//!    warm-started from the seed above.
 //!
 //! The unified [`SaeMigrationLedger`] records the curved-tier promotions
-//! (births) / demotions (refusals) that the co-fit adjudicates each round in the
+//! (births) / demotions (refusals) that the cadence adjudicates each round in the
 //! matched-description-length currency (`curved_charge`, the e-BH acceptance
 //! charge, banked as `dl_bits`), plus the Tier-1 block deaths.
 //! `pc_reseed_events` is always `0` on this path.
@@ -32,7 +45,9 @@ use crate::sparse_dict::{
 };
 use crate::tiered::Tier0Mean;
 
-/// Configuration for [`fit_tiered`].
+/// Configuration for [`fit_tiered`]. Internal (in-crate) only — the public
+/// tiered surface was removed in unification Increment 4; this is the seed/cadence
+/// schedule config, slated to fold into `sae_manifold_fit`'s driver in Inc 5.
 #[derive(Clone, Debug)]
 pub struct TieredFitConfig {
     /// Tier-1 block-sparse dictionary configuration (`G` blocks of size `b`, the
@@ -85,8 +100,14 @@ pub struct TieredFitReport {
     pub explained_variance: f64,
 }
 
-/// Fit the tiered decomposition on activations `z` (`N×P`, f64): Tier-0 mean →
-/// Tier-1 block-sparse bulk → Tier-2 curved co-fit on the Tier-1 residual.
+/// Run the seed policy + alternation cadence on activations `z` (`N×P`, f64):
+/// Tier-0 mean + Tier-1 block-sparse linear warm start (the seed) → Tier-2 curved
+/// co-fit on the Tier-1 residual (the cadence).
+///
+/// **Internal (in-crate) only.** The public tiered FFI/Python surface was deleted
+/// in unification Increment 4; this orchestrator is the in-Rust expression of the
+/// schedule for the risk-pin tests + `tiered_gpu_scale` example, to be folded into
+/// `sae_manifold_fit`'s inner arrow-Schur driver in Increment 5.
 ///
 /// The curved tier is fit on the Tier-1 residual through
 /// [`cofit_block_and_curved`], whose round 0 is exactly "curved-on-linear-
