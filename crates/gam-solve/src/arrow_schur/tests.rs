@@ -5558,6 +5558,27 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
     )
     .expect("matrix-free S⁻¹ rhs must re-solve");
     assert_eq!(mf_x, mf_x2, "single-rhs S⁻¹ solve must be bit-reproducible");
+
+    // Warm-start slot: seeding with the exact solution converges to it (the CRN
+    // reuse the surrogate lane does across the ρ walk cannot move the answer, only
+    // cut iterations).
+    let mf_warm = reduced_schur_inverse_apply(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        &rhs,
+        Some(&dense_x),
+        1e-12,
+        50_000,
+    )
+    .expect("warm-started S⁻¹ rhs must solve");
+    let warm_rel = (&mf_warm - &dense_x).mapv(|x| x * x).sum().sqrt() / scale;
+    assert!(
+        warm_rel < 1e-6,
+        "warm-starting from the exact solution must return it (rel {warm_rel:.3e})"
+    );
 }
 
 // ---------------------------------------------------------------------------

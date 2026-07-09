@@ -1426,6 +1426,13 @@ pub struct SurrogateLaneState {
     /// selected-inverse trace `tr(S⁻¹·M) ≈ (1/m)Σ_j (S⁻¹v_j)ᵀ(M v_j)` off the
     /// SAME probes as the value, so value and ρ-gradient never desync.
     inverse_probes: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
+    /// The previous ρ's `S⁻¹ v_j` solves, kept as the CG warm-start for the next
+    /// bundle solve. `S⁻¹` is smooth in ρ, so a neighbouring-ρ solution is a near
+    /// seed (common-random-numbers reuse — the discipline that makes the
+    /// surrogate's shifted ladder cheap); the converged solve is unchanged to
+    /// `cg_rel_tol`, only its iteration count drops. Cleared when the plan rebuilds
+    /// (basin border change ⇒ the old-dim seeds are meaningless).
+    warm_inverse_probes: Option<Vec<Array1<f64>>>,
 }
 
 impl SurrogateLaneState {
@@ -1436,6 +1443,7 @@ impl SurrogateLaneState {
             cfg,
             request_inverse_probes: false,
             inverse_probes: None,
+            warm_inverse_probes: None,
         }
     }
 
@@ -1541,6 +1549,8 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                     ),
                 })?;
                 state.plan = Some(plan);
+                // The old-dim S⁻¹·probes are meaningless against the new border.
+                state.warm_inverse_probes = None;
             }
             let plan = state
                 .plan
@@ -1573,7 +1583,7 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                         &backend,
                         resident.as_ref(),
                         &plan.probes,
-                        None,
+                        state.warm_inverse_probes.as_deref(),
                         state.cfg.cg_rel_tol,
                         state.cfg.cg_max_iters,
                     )
@@ -1587,6 +1597,11 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 (eval.estimate, bundle)
             };
             if want_bundle {
+                // Keep the fresh solves as the next ρ's warm-start seed (CRN),
+                // then hand the bundle to the gradient lane.
+                if let Some((_, sinv)) = &bundle {
+                    state.warm_inverse_probes = Some(sinv.clone());
+                }
                 state.inverse_probes = bundle;
                 state.request_inverse_probes = false;
             }
