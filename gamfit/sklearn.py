@@ -458,11 +458,13 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
 
         Overrides scikit-learn's default accuracy score with AUC, the natural
         threshold-free discrimination metric for the probabilistic output of
-        a GAM classifier, computed through the Rust ``classification_metrics``
-        routine. ``sample_weight`` is honoured by restricting the AUC to the
-        rows with strictly positive weight (an AUC is rank-based and has no
-        per-pair weighting), keeping the call signature compatible with the
-        scikit-learn scorer protocol.
+        a GAM classifier. ``sample_weight`` is honoured as a genuine weighted
+        Mann-Whitney statistic computed in the Rust core: each positive /
+        negative pair ``(i, j)`` contributes with pair weight ``w_i * w_j``
+        (ties counted half), exactly as :func:`sklearn.metrics.roc_auc_score`
+        weights pairs. Weight magnitudes therefore matter — a row with weight
+        100 dominates a row with weight 1 — rather than merely selecting
+        which rows participate.
 
         Parameters
         ----------
@@ -471,8 +473,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         y : array-like
             True labels, drawn from :attr:`classes_`.
         sample_weight : array-like or None, optional
-            Per-row weights; rows with weight ``<= 0`` are dropped before
-            scoring. ``None`` (default) scores every row.
+            Per-row non-negative weights. ``None`` (default) weights every
+            row equally.
 
         Returns
         -------
@@ -487,11 +489,21 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         check_is_fitted(self, "model_")
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
-        if sample_weight is not None:
-            keep = np.asarray(sample_weight, dtype=float).reshape(-1) > 0.0
-            observed = observed[keep]
-            positive = positive[keep]
-        return float(rust_module().auc_from_predictions(observed.tolist(), positive.tolist()))
+        if sample_weight is None:
+            return float(
+                rust_module().auc_from_predictions(observed.tolist(), positive.tolist())
+            )
+        weights = np.asarray(sample_weight, dtype=float).reshape(-1)
+        if weights.shape[0] != observed.shape[0]:
+            raise ValueError(
+                "GAMClassifier.score: sample_weight has length "
+                f"{weights.shape[0]} but y has {observed.shape[0]} rows"
+            )
+        return float(
+            rust_module().weighted_auc_from_predictions(
+                observed.tolist(), positive.tolist(), weights.tolist()
+            )
+        )
 
     def _encode_labels(self, y: Any) -> np.ndarray:
         """Encode ``y`` to ``{0, 1}`` against :attr:`classes_`.
