@@ -803,6 +803,15 @@ mod device {
 
     const TOP_S_FOLD_THREADS: u32 = 32;
 
+    /// Number of bounded-progress checkpoints across one tiled route's atom-tile
+    /// walk (#2227). This is a telemetry/backlog cadence, not a numerical tuning
+    /// knob: the tile loop synchronises `min(tile_count, this)` times so the
+    /// in-flight async launch backlog is bounded to `ceil(tile_count/this)` tiles
+    /// and any device fault or stall is attributed to the tile window that
+    /// produced it, instead of surfacing (if at all) as one unattributed block in
+    /// the terminal synchronize with no telemetry for the whole high-`K` route.
+    const ROUTE_PROGRESS_CHECKPOINTS: usize = 16;
+
     pub(super) struct RouteDeviceOutput {
         pub(super) selections: Vec<Vec<(u32, f32)>>,
         pub(super) device_dtoh_bytes: usize,
@@ -935,6 +944,21 @@ mod device {
         let fold_shared =
             fold_shared_bytes(active, TOP_S_FOLD_THREADS, b.max_shared_mem_per_block)?;
 
+        // Bounded-progress checkpoints (#2227). The walk enqueues every score+fold
+        // launch on one stream; without intermediate synchronisation a device fault
+        // or stall in any tile surfaces only at the terminal synchronize, as a
+        // single unattributed block with no telemetry for the whole high-`K` route.
+        // Synchronise on a cadence derived from the tile count so the async backlog
+        // is bounded and each fault is attributed to its tile window; the heartbeat
+        // is `log::debug!` so an ordinary (info-level) per-minibatch run is not
+        // flooded, while `RUST_LOG=debug` exposes intra-route progress.
+        let tile_count = k.div_ceil(tile_cols);
+        let checkpoint_stride = tile_count
+            .div_ceil(ROUTE_PROGRESS_CHECKPOINTS.max(1))
+            .max(1);
+        let route_started = std::time::Instant::now();
+        let mut tiles_done = 0usize;
+        let mut checkpoint_lo = 0usize;
         let mut start = 0usize;
         while start < k {
             let end = (start + tile_cols).min(k);
@@ -996,6 +1020,20 @@ mod device {
             // updates exactly `n_rows * active` shortlist slots.
             unsafe { fold.launch(fold_cfg) }.gpu_ctx("sparse_dict top-s fold launch")?;
             start = end;
+            tiles_done += 1;
+            if tiles_done % checkpoint_stride == 0 || start >= k {
+                stream.synchronize().gpu_ctx_with(|err| {
+                    format!(
+                        "sparse_dict tiled route progress checkpoint (tiles {checkpoint_lo}..{tiles_done} of {tile_count}, atoms 0..{start} of {k}): {err}"
+                    )
+                })?;
+                log::debug!(
+                    "[SAE score route] tiles {tiles_done}/{tile_count} atoms {start}/{k} \
+                     elapsed {:.2}s",
+                    route_started.elapsed().as_secs_f64(),
+                );
+                checkpoint_lo = tiles_done;
+            }
         }
 
         let mut top_atoms = vec![0u32; n_rows * active];

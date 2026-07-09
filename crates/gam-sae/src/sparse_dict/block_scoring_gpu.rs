@@ -182,6 +182,32 @@ const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE
 /// # Errors
 /// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but the
 /// device path cannot run for this minibatch.
+/// One-shot engagement report for the block-gate router, mirroring the atom
+/// lane's [`super::scoring_gpu`] `note_route_engagement` (#1551 "GPU 0%" class:
+/// an `Auto` run that silently declines the device and falls back to the CPU
+/// otherwise leaves no trace of WHY). Warns once per category per process — the
+/// route is per-minibatch, so an unconditional line would spam thousands of
+/// identical entries.
+#[cfg(target_os = "linux")]
+fn note_block_route_engagement(engaged: bool, detail: &str) {
+    use std::sync::Once;
+    static ENGAGED_ONCE: Once = Once::new();
+    static DECLINED_ONCE: Once = Once::new();
+    let once = if engaged {
+        &ENGAGED_ONCE
+    } else {
+        &DECLINED_ONCE
+    };
+    once.call_once(|| {
+        let verdict = if engaged {
+            "device ENGAGED"
+        } else {
+            "device DECLINED - falling back to CPU"
+        };
+        log::warn!("[gam-sae sparse_dict block-gate router] {verdict}: {detail}");
+    });
+}
+
 #[cfg(target_os = "linux")]
 pub fn route_blocks_required(
     rows: ArrayView2<'_, f32>,
@@ -226,6 +252,14 @@ pub fn route_blocks_required(
                 m.saturating_mul(krows)
             ));
         }
+        note_block_route_engagement(
+            false,
+            &format!(
+                "block {m}x{krows} = {} elems below the device launch break-even \
+                 (DEVICE_BLOCK_GATE_MIN_ELEMS={DEVICE_BLOCK_GATE_MIN_ELEMS})",
+                m.saturating_mul(krows)
+            ),
+        );
         return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
     }
     if m == 0 || g == 0 {
@@ -237,12 +271,19 @@ pub fn route_blocks_required(
     let tile_blocks = (plan.tile_items / b.max(1)).clamp(1, g);
 
     match device::route_blocks_device(rows, decoder, b, g, active, tile_blocks) {
-        Ok(out) => Ok((
-            out.selections,
-            BlockRoutePath::Device,
-            out.device_dtoh_bytes,
-        )),
+        Ok(out) => {
+            note_block_route_engagement(
+                true,
+                &format!("block {m}x{krows}, tile_blocks={tile_blocks}, active={active}"),
+            );
+            Ok((
+                out.selections,
+                BlockRoutePath::Device,
+                out.device_dtoh_bytes,
+            ))
+        }
         Err(err) => {
+            note_block_route_engagement(false, &format!("device route fault: {err}"));
             if mode == GpuMode::Required {
                 return Err(err);
             }
@@ -317,6 +358,15 @@ mod device {
 
     const TOP_S_FOLD_THREADS: u32 = 32;
     const GATE_KERNEL_THREADS: u32 = 256;
+
+    /// Number of bounded-progress checkpoints across one route's block-tile walk
+    /// (#2227). A telemetry/backlog cadence, not a numerical tuning knob: the tile
+    /// loop synchronises `min(tile_count, this)` times so the in-flight async
+    /// launch backlog is bounded to `ceil(tile_count/this)` tiles and any device
+    /// fault or stall is attributed to the tile window that produced it, rather
+    /// than surfacing (if at all) as one unattributed block in the terminal
+    /// synchronize with no telemetry for the whole high-`K` route.
+    const ROUTE_PROGRESS_CHECKPOINTS: usize = 16;
 
     pub(super) struct BlockRouteDeviceOutput {
         pub(super) selections: Vec<Vec<(u32, f32)>>,
@@ -466,6 +516,21 @@ mod device {
         let tile_m = super::super::scoring_gpu::SCORE_BLOCK_TILE_M;
         let tile_n = super::super::scoring_gpu::SCORE_BLOCK_TILE_N;
 
+        // Bounded-progress checkpoints (#2227). The block-tile walk enqueues every
+        // score+gate+fold launch on one stream; without intermediate
+        // synchronisation a device fault or stall in any tile surfaces only at the
+        // terminal synchronize, as a single unattributed block with no telemetry
+        // for the whole high-`G` route. Synchronise on a cadence derived from the
+        // tile count so the async backlog is bounded and each fault is attributed
+        // to its tile window; the heartbeat is `log::debug!` so an ordinary
+        // (info-level) per-minibatch run is not flooded.
+        let tile_count = n_blocks.div_ceil(tile_blocks.max(1));
+        let checkpoint_stride = tile_count
+            .div_ceil(ROUTE_PROGRESS_CHECKPOINTS.max(1))
+            .max(1);
+        let route_started = std::time::Instant::now();
+        let mut tiles_done = 0usize;
+        let mut checkpoint_lo = 0usize;
         let mut g0 = 0usize;
         while g0 < n_blocks {
             let g1 = (g0 + tile_blocks).min(n_blocks);
@@ -554,6 +619,20 @@ mod device {
             unsafe { fold.launch(fold_cfg) }.gpu_ctx("sparse_dict block-gate fold launch")?;
 
             g0 = g1;
+            tiles_done += 1;
+            if tiles_done % checkpoint_stride == 0 || g0 >= n_blocks {
+                stream.synchronize().gpu_ctx_with(|err| {
+                    format!(
+                        "sparse_dict block-gate route progress checkpoint (tiles {checkpoint_lo}..{tiles_done} of {tile_count}, blocks 0..{g0} of {n_blocks}): {err}"
+                    )
+                })?;
+                log::debug!(
+                    "[SAE block route] tiles {tiles_done}/{tile_count} blocks {g0}/{n_blocks} \
+                     elapsed {:.2}s",
+                    route_started.elapsed().as_secs_f64(),
+                );
+                checkpoint_lo = tiles_done;
+            }
         }
 
         let mut top_blocks = vec![0u32; m * active];
