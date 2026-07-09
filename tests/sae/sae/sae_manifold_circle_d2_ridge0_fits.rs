@@ -213,3 +213,56 @@ fn sae_manifold_circle_d2_ridge0_fits() {
          deflated identifiable subspace"
     );
 }
+
+/// zz_ loop discriminator (#1095/#2228): is the failing R²≈0.4347 the gate-scaled
+/// PRISTINE SEED reconstruction rather than any fitted state? For K=1 with α=1 the
+/// ordered-IBP prior mass is π₀=(α/(α+1))¹=0.5, and the seed logits are 0, so the
+/// gate is a₁=σ(0)·π₀=0.5·0.5=0.25. `decoder_lsq_init` fits the decoder UNGATED
+/// (z≈Φ·B), so the gated reconstruction is 0.25·Φ·B≈0.25·z on the signal columns →
+/// R²≈1−(1−0.25)²=0.4375, which matches the measured 0.434688. If `into_fitted`
+/// returns the pristine seed (because the settled curved fit reconstructs even
+/// worse — the IBP-gate/decoder co-collapse), the reported R² is this FIXED seed
+/// value, byte-identical across builds and INDEPENDENT of any inner-solve
+/// coordinate fix. This prints the cold-seed R², the returned R², and which
+/// into_fitted fallback fired so the loop can confirm the binding mechanism is the
+/// gate/decoder co-collapse, not the radial-coordinate drift. Pure measurement —
+/// no assertion (never gates CI).
+#[test]
+fn zz_1095_2228_measure_seed_vs_settled_r2() {
+    let z = planted_circle();
+    // Cold seed, NO outer fit: gate a₁=σ(0)·π₀=0.25 applied to the ungated LSQ decoder.
+    let seed_term = build_cold_circle_d2_term(&z);
+    let seed_r2 = reconstruction_r2(&seed_term.fitted(), &z);
+
+    let term = build_cold_circle_d2_term(&z);
+    let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(D); 1]);
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        init_rho,
+        INNER_MAX_ITER,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
+    );
+    let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
+    let result = problem
+        .run(&mut objective, "SAE d=2 circle ridge-0 measure (#1095/#2228)")
+        .expect("outer cascade completes");
+    let fitted = objective.into_fitted();
+    let used_pristine = fitted.used_pristine_seed_fallback;
+    let used_seed_basin = fitted.used_seed_basin_fallback;
+    let charts_canonicalized = fitted.charts_canonicalized;
+    let mut fitted_term = fitted.term;
+    let returned_r2 = reconstruction_r2(&fitted_term.fitted(), &z);
+    println!(
+        "[#1095/#2228 measure] cold_seed_R2={seed_r2:.6} returned_R2={returned_r2:.6} \
+         final_value={:.6e} used_pristine_seed_fallback={used_pristine} \
+         used_seed_basin_fallback={used_seed_basin} charts_canonicalized={charts_canonicalized} \
+         (a1=σ(0)·π0=0.25 → predicted gated-seed R2≈0.4375)",
+        result.final_value
+    );
+}
