@@ -20,10 +20,12 @@ assembly layer, no math of its own):
 Guards enforced here:
 
 * **G2** — the eval-forever split is a pure per-group function of
-  ``(group id, seed)``: SplitMix64 parity, bit-identical to the Rust
-  ``InterventionShard::eval_forever_split`` (reference values pinned in both
-  test suites). Eval groups never enter the fit; held-out error is reported
-  from them.
+  ``(group id, seed)``, computed by the Rust
+  ``intervention_shard::eval_forever_mask`` (the single source of the
+  SplitMix64 split, reference values pinned in its test suite). This module
+  delegates to that binding, so the split is bit-identical to the Rust
+  ``InterventionShard::eval_forever_split`` by construction. Eval groups never
+  enter the fit; held-out error is reported from them.
 * **G3** — the measurement floor is the caller-chosen quantile of the
   Δt = 0 control measurements (never a constant). Atoms whose train records
   all fall at or below the floor are excluded from the fit and reported as
@@ -38,27 +40,25 @@ import numpy as np
 
 __all__ = ["ChartCalibration", "fit_chart_calibration"]
 
-_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _MASK64 = (1 << 64) - 1
 
 
-def _splitmix64(x: int) -> int:
-    """SplitMix64 — must stay bit-identical to the Rust
-    ``intervention_shard::splitmix64`` (the G2 cross-language contract; the
-    reference values below are pinned in both test suites)."""
-    z = (x + _SPLITMIX_GAMMA) & _MASK64
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
-    return (z ^ (z >> 31)) & _MASK64
-
-
 def _eval_forever_mask(group: np.ndarray, seed: int) -> np.ndarray:
-    """True where the record's group is eval-forever (G2)."""
-    seed_mix = _splitmix64(int(seed) & _MASK64)
-    eval_groups = {
-        int(g) for g in np.unique(group) if _splitmix64((int(g) & _MASK64) ^ seed_mix) & 1
-    }
-    return np.asarray([int(g) in eval_groups for g in group], dtype=bool)
+    """True where the record's group is eval-forever (G2).
+
+    Delegates to the Rust ``intervention_shard::eval_forever_mask`` (exposed as
+    ``intervention_eval_forever_mask``) — the single source of the SplitMix64
+    split. This module never re-derives the hash, so the assignment stays
+    bit-identical to the Rust side by construction rather than by a duplicated
+    Python implementation (SPEC rules 8-9).
+    """
+    from ._binding import rust_module
+
+    mask = rust_module().intervention_eval_forever_mask(
+        [int(g) for g in np.asarray(group, dtype=np.int64).reshape(-1)],
+        int(seed) & _MASK64,
+    )
+    return np.asarray(mask, dtype=bool)
 
 
 @dataclass(frozen=True)

@@ -4932,6 +4932,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(chart_transfer_operator, module)?)?;
     module.add_function(wrap_pyfunction!(certify_chart_transfer, module)?)?;
     module.add_function(wrap_pyfunction!(sae_checkpoint_dynamics, module)?)?;
+    module.add_function(wrap_pyfunction!(intervention_eval_forever_mask, module)?)?;
     inference_instruments::register(module)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;

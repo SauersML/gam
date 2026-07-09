@@ -71,6 +71,29 @@ fn splitmix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The G2 per-group predicate: group `g` is eval-forever under a split whose
+/// seed hashes to `seed_mix` iff `splitmix64(g ^ seed_mix)` is odd. The single
+/// place the split's membership is decided — shared by
+/// [`InterventionShard::eval_forever_split`] and [`eval_forever_mask`].
+#[inline]
+fn group_is_eval_forever(g: i64, seed_mix: u64) -> bool {
+    splitmix64((g as u64) ^ seed_mix) & 1 == 1
+}
+
+/// Per-record eval-forever mask: `mask[i]` is true iff record `i`'s `group[i]`
+/// is an eval-forever group under `seed` (guard G2). A pure per-group function
+/// of `(group id, seed)` — record order, shard composition, and refit history
+/// cannot move a record across the fence. This is the single source of truth
+/// the Python `intervention_calibration._eval_forever_mask` binding wraps, so
+/// the SplitMix64 split stays bit-identical across the language boundary.
+pub fn eval_forever_mask(group: &[i64], seed: u64) -> Vec<bool> {
+    let seed_mix = splitmix64(seed);
+    group
+        .iter()
+        .map(|&g| group_is_eval_forever(g, seed_mix))
+        .collect()
+}
+
 impl InterventionShard {
     /// Validate the shard invariants. Errors carry the first offending record.
     ///
@@ -172,7 +195,7 @@ impl InterventionShard {
         groups.dedup();
         let seed_mix = splitmix64(seed);
         for g in groups {
-            if splitmix64((g as u64) ^ seed_mix) & 1 == 1 {
+            if group_is_eval_forever(g, seed_mix) {
                 eval.push(g);
             } else {
                 train.push(g);

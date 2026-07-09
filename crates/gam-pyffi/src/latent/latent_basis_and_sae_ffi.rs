@@ -5118,6 +5118,17 @@ fn sae_checkpoint_dynamics(
     Ok(out.unbind())
 }
 
+/// Guard G2's eval-forever split, per record: `mask[i]` is true iff `group[i]`
+/// is an eval-forever group under `seed`. A thin wrapper over the single source
+/// of truth `gam_sae::inference::intervention_shard::eval_forever_mask`, so the
+/// SplitMix64 split stays bit-identical across the language boundary and the
+/// Python assembly layer never re-derives the hash (SPEC rules 8-9). Group ids
+/// are reinterpreted to `u64` two's-complement exactly as the Rust split does.
+#[pyfunction(signature = (group, seed))]
+fn intervention_eval_forever_mask(group: Vec<i64>, seed: u64) -> Vec<bool> {
+    gam::sae::inference::intervention_shard::eval_forever_mask(&group, seed)
+}
+
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
 /// atoms, column 0 is `atan2(Z·v2, Z·v1) / (2π)` (per-atom v2 picked from PCs)
 /// and remaining columns are min-max normalized projections onto subsequent
