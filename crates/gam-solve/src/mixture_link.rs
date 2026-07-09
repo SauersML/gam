@@ -2417,6 +2417,130 @@ mod tests {
         assert!((out.djet_dlog_delta.d3 - fd_ld.d3).abs() < 5e-4);
     }
 
+    /// #1876 closability isolation gate. The SAS-link binomial FAMILY score at
+    /// fixed η is `∂ℓ/∂ε = a1 · ∂μ/∂ε`, with the binomial score
+    /// `a1 = w(y/μ − (1−y)/(1−μ))` and `∂μ/∂ε = djet_depsilon.mu`. This proves
+    /// that single source is correct — in SIGN and MAGNITUDE — against an
+    /// independent finite difference of the row log-likelihood over a whole
+    /// (η, ε, log_δ) grid and both responses (`sas_param_partials_matchfd` only
+    /// checks the pointwise link partials at one point; this composes them into
+    /// the objective-level family score).
+    ///
+    /// Part 2 reproduces the issue's own symptom deterministically: plant
+    /// ε*=0.38, δ*=1 and use expected fractional responses yᵢ=μ*(ηᵢ). By the
+    /// score identity the summed data-fit ∂ℓ/∂ε then vanishes exactly at ε* and
+    /// the negative-log-likelihood profile is minimized there — the summed
+    /// ∂(NLL)/∂ε is strongly negative below ε* (pushes ε UP toward the truth),
+    /// zero at ε*, strongly positive above, and STRICTLY increasing through it.
+    /// That strict monotonicity is exactly what distinguishes +κ/skew from −κ,
+    /// the sign-blindness #1876 reported. With the family derivative certified
+    /// here, any wrong-sign ε recovery is provably the OUTER REML envelope path
+    /// (the capped-β̂ / KKT-residual clobber fixed in 574129459), not this
+    /// derivative.
+    #[test]
+    fn sas_family_score_depsilon_matches_fd_and_reproduces_profile_1876() {
+        let h = 1e-6;
+        let mu_at = |eta: f64, eps: f64, ld: f64| sas_inverse_link_jet(eta, eps, ld).mu;
+        let dmu_deps = |eta: f64, eps: f64, ld: f64| {
+            sas_inverse_link_jetwith_param_partials(eta, eps, ld)
+                .djet_depsilon
+                .mu
+        };
+        // Binomial row log-likelihood and score dℓ/dμ (== link_binomial_aux.a1).
+        let row_ll = |y: f64, w: f64, mu: f64| w * (y * mu.ln() + (1.0 - y) * (1.0 - mu).ln());
+        let a1 = |y: f64, w: f64, mu: f64| w * (y / mu - (1.0 - y) / (1.0 - mu));
+
+        // ── Part 1: pointwise family-score correctness across a grid. ──
+        let etas = [-1.0, -0.6, -0.2, 0.15, 0.5, 0.9];
+        let epsilons = [-0.5, -0.2, 0.0, 0.3, 0.6];
+        let log_deltas = [-0.3, 0.0, 0.4];
+        for &eta in &etas {
+            for &eps in &epsilons {
+                for &ld in &log_deltas {
+                    let mu0 = mu_at(eta, eps, ld);
+                    // Stay in the numerically comfortable interior; the far tail
+                    // is covered by `sas_jet_extreme_inputs_stay_finite`.
+                    if !(0.02..=0.98).contains(&mu0) {
+                        continue;
+                    }
+                    let dmu = dmu_deps(eta, eps, ld);
+                    for &y in &[0.0_f64, 1.0] {
+                        let analytic = a1(y, 1.0, mu0) * dmu; // dℓ/dε
+                        let fd = (row_ll(y, 1.0, mu_at(eta, eps + h, ld))
+                            - row_ll(y, 1.0, mu_at(eta, eps - h, ld)))
+                            / (2.0 * h);
+                        let scale = analytic.abs().max(fd.abs()).max(1.0);
+                        assert_eq!(
+                            analytic.signum(),
+                            fd.signum(),
+                            "∂ℓ/∂ε sign mismatch η={eta} ε={eps} log_δ={ld} y={y}: \
+                             analytic={analytic:e} fd={fd:e}"
+                        );
+                        assert!(
+                            (analytic - fd).abs() < 1e-5 * scale,
+                            "∂ℓ/∂ε magnitude mismatch η={eta} ε={eps} log_δ={ld} y={y}: \
+                             analytic={analytic:e} fd={fd:e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── Part 2: summed-profile symptom reproduction (deterministic). ──
+        let eps_true = 0.38;
+        let ld_true = 0.0;
+        let etas_ds: Vec<f64> = (0..21).map(|i| -1.0 + 0.1 * i as f64).collect();
+        let y: Vec<f64> = etas_ds
+            .iter()
+            .map(|&e| mu_at(e, eps_true, ld_true))
+            .collect();
+
+        // Summed ∂(NLL)/∂ε = −Σ a1·∂μ/∂ε, analytic and by FD of the summed NLL.
+        let grad_nll = |eps: f64| -> (f64, f64) {
+            let mut analytic = 0.0;
+            let mut nll_p = 0.0;
+            let mut nll_m = 0.0;
+            for (i, &eta) in etas_ds.iter().enumerate() {
+                let mu0 = mu_at(eta, eps, ld_true);
+                analytic += -a1(y[i], 1.0, mu0) * dmu_deps(eta, eps, ld_true);
+                nll_p += -row_ll(y[i], 1.0, mu_at(eta, eps + h, ld_true));
+                nll_m += -row_ll(y[i], 1.0, mu_at(eta, eps - h, ld_true));
+            }
+            (analytic, (nll_p - nll_m) / (2.0 * h))
+        };
+
+        // (a) analytic == FD at every probe ε.
+        for &eps in &[0.0, eps_true, 0.6] {
+            let (analytic, fd) = grad_nll(eps);
+            let scale = analytic.abs().max(fd.abs()).max(1.0);
+            assert!(
+                (analytic - fd).abs() < 1e-4 * scale,
+                "summed ∂NLL/∂ε analytic≠fd at ε={eps}: {analytic:e} vs {fd:e}"
+            );
+        }
+        // (b) minimum exactly at the planted ε*: strictly increasing through it.
+        let (g_below, _) = grad_nll(0.0);
+        let (g_at, _) = grad_nll(eps_true);
+        let (g_above, _) = grad_nll(0.6);
+        assert!(
+            g_below < -1.0,
+            "expected strongly negative ∂NLL/∂ε below ε* (pushes ε up toward truth), got {g_below:e}"
+        );
+        assert!(
+            g_at.abs() < 1e-6,
+            "expected ≈0 ∂NLL/∂ε at the planted ε* (score identity), got {g_at:e}"
+        );
+        assert!(
+            g_above > 1.0,
+            "expected strongly positive ∂NLL/∂ε above ε*, got {g_above:e}"
+        );
+        assert!(
+            g_below < g_at && g_at < g_above,
+            "∂NLL/∂ε must strictly increase through ε* (distinguishes ±ε): \
+             {g_below:e} < {g_at:e} < {g_above:e}"
+        );
+    }
+
     #[test]
     fn sas_jet_extreme_inputs_stay_finite() {
         let cases = [
