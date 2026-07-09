@@ -3003,7 +3003,27 @@ impl<'a> RemlState<'a> {
         let mut dw_explicit_by_j = [Array1::<f64>::zeros(nobs), Array1::<f64>::zeros(nobs)];
 
         for i in 0..nobs {
-            let eta_i = pirls_result.final_eta[i].clamp(-30.0, 30.0);
+            // #1876: evaluate the jet on the SAME η surface the inner Hessian
+            // used (`eta_for_observed_hessian_jet`, ±20 for SAS/beta-logistic),
+            // not an ad-hoc ±30 clamp — otherwise ∂W_obs/∂θ differentiates a
+            // different operator than the H whose log-det the ½tr(H⁻¹∂H/∂θ)
+            // term inverts.
+            let eta_raw = pirls_result.final_eta[i];
+            let eta_i =
+                crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
+            // #1876: PIRLS pins H to the floored weight `max(W_obs, floor(W_F))`
+            // and computes it at the clamped η. On floored or clamped rows the
+            // Hessian surface is CONSTANT in θ, so the explicit drift
+            // ∂W_obs/∂θ must be masked to zero there — exactly the
+            // reconciliation `outer_hessian_curvature_arrays` applies to the ρ
+            // coordinates' (c, d) arrays. Skipping it here fed the ε/log-δ
+            // gradient an unfloored ∂H/∂θ that disagrees with H at every
+            // saturated row, and tr(G_ε(H)·B) amplifies that by O(1/σ_min(H)):
+            // the #1876 wrong-ε-recovery driver.
+            let w_obs = pirls_result.finalweights[i];
+            let floor = crate::pirls::solver_hessian_weight_floor(pirls_result.solveweights[i]);
+            let drift_masked = !(w_obs.is_finite() && w_obs > floor)
+                || crate::pirls::eta_clamp_active(&self.config.link_kind, eta_raw);
             let jets = if is_beta_logistic {
                 beta_logistic_inverse_link_jetwith_param_partials(
                     eta_i,
@@ -3071,7 +3091,12 @@ impl<'a> RemlState<'a> {
                 // OBSERVED weight derivative for the outer REML (see response.md Section 3):
                 //   dW_obs/dtheta = dW_Fisher/dtheta + (dmu/dtheta)*B - (y-mu)*dB/dtheta
                 // This is the exact Laplace derivative, not the PQL surrogate.
-                dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
+                // #1876: zero on floored/clamped rows where H is pinned constant.
+                dw_explicit_by_j[j][i] = if drift_masked {
+                    0.0
+                } else {
+                    dw_fisher + wi * (dmu * b_val - resid * db_val)
+                };
             }
         }
 
@@ -3189,9 +3214,20 @@ impl<'a> RemlState<'a> {
         ];
 
         for i in 0..nobs {
+            // #1876: same η-surface + floored/clamped-row reconciliation as the
+            // SAS builder above — the mixture-ρ drift must differentiate the
+            // exact H the log-det trace inverts (see
+            // `outer_hessian_curvature_arrays`).
+            let eta_raw = pirls_result.final_eta[i];
+            let eta_i =
+                crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
+            let w_obs = pirls_result.finalweights[i];
+            let floor = crate::pirls::solver_hessian_weight_floor(pirls_result.solveweights[i]);
+            let drift_masked = !(w_obs.is_finite() && w_obs > floor)
+                || crate::pirls::eta_clamp_active(&self.config.link_kind, eta_raw);
             let jet = mixture_inverse_link_jetwith_rho_partials_into(
                 mix_state,
-                pirls_result.final_eta[i],
+                eta_i,
                 &mut mix_partials,
             );
             let mu = jet.mu;
@@ -3242,7 +3278,12 @@ impl<'a> RemlState<'a> {
                 // OBSERVED weight derivative for the outer REML (see response.md Section 3):
                 //   dW_obs/dtheta = dW_Fisher/dtheta + (dmu/dtheta)*B - (y-mu)*dB/dtheta
                 // This is the exact Laplace derivative, not the PQL surrogate.
-                dw_explicit_by_j[j][i] = dw_fisher + wi * (dmu * b_val - resid * db_val);
+                // #1876: zero on floored/clamped rows where H is pinned constant.
+                dw_explicit_by_j[j][i] = if drift_masked {
+                    0.0
+                } else {
+                    dw_fisher + wi * (dmu * b_val - resid * db_val)
+                };
             }
         }
 
