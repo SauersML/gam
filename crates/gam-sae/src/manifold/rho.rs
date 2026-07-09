@@ -59,6 +59,23 @@ pub struct SaeManifoldRho {
     /// not change `log_ard`'s shape or the inner-solve math; only `to_flat` /
     /// `from_flat` consult it.
     pub ard_sharing: ArdSharing,
+    /// #2231 §2a — per-output-block relevance weights `log(λ_ℓ)` for a manifold
+    /// CROSSCODER, length `L-1` in stacked-block order (parallel to a term's
+    /// [`crate::manifold::CrosscoderLayout::block_dims`]). EMPTY for a plain SAE
+    /// (the historical case): the block sub-vector is APPENDED to the flat
+    /// outer-coordinate layout AFTER the ARD block, so with an empty vector every
+    /// existing consumer's cursor arithmetic (`to_flat` / `from_flat` /
+    /// [`Self::ard_flat_index`]) is untouched and the plain-SAE flat vector is
+    /// byte-identical.
+    ///
+    /// The block weight scales the augmented crosscoder target's block columns by
+    /// `√λ_ℓ` (never the design), so it enters the criterion only through the
+    /// per-block residual sum of squares and the `√λ_ℓ` target-scaling Jacobian —
+    /// its closed-form REML variance ratio is
+    /// [`crate::manifold::behavior::OutputBlock::reml_updated_log_lambda`] and its
+    /// analytic outer gradient is
+    /// [`crate::manifold::behavior::profiled_reml_block_log_lambda_gradient`].
+    pub log_lambda_block: Vec<f64>,
 }
 
 impl SaeManifoldRho {
@@ -75,6 +92,7 @@ impl SaeManifoldRho {
             log_lambda_smooth: vec![log_lambda_smooth; k],
             log_ard,
             ard_sharing: ArdSharing::PerAtom,
+            log_lambda_block: Vec::new(),
         }
     }
 
@@ -92,6 +110,7 @@ impl SaeManifoldRho {
             log_lambda_smooth,
             log_ard,
             ard_sharing: ArdSharing::PerAtom,
+            log_lambda_block: Vec::new(),
         }
     }
 
@@ -111,7 +130,26 @@ impl SaeManifoldRho {
             log_lambda_smooth: vec![log_lambda_smooth; k],
             log_ard,
             ard_sharing: ArdSharing::Shared,
+            log_lambda_block: Vec::new(),
         }
+    }
+
+    /// Return a copy of this ρ carrying the crosscoder per-block relevance weights
+    /// `log(λ_ℓ)` (#2231 §2a). The block sub-vector is APPENDED to the flat
+    /// layout after ARD; an empty `log_lambda_block` restores the plain-SAE
+    /// byte-identical layout. The block order must match a term's
+    /// [`crate::manifold::CrosscoderLayout::block_dims`].
+    #[must_use]
+    pub fn with_log_lambda_block(mut self, log_lambda_block: Vec<f64>) -> Self {
+        self.log_lambda_block = log_lambda_block;
+        self
+    }
+
+    /// Number of crosscoder output blocks `L-1` carried as outer coordinates
+    /// (0 for a plain SAE).
+    #[must_use]
+    pub fn num_blocks(&self) -> usize {
+        self.log_lambda_block.len()
     }
 
     /// Largest per-atom ARD axis count `max_k d_k` (0 when ARD is disabled on
@@ -344,9 +382,12 @@ impl SaeManifoldRho {
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
     /// `OuterObjective` engine optimises over.
     ///
-    /// Layout: `[log_lambda_sparse, <K smooth>, <ARD>]`, where `<K smooth>` is
-    /// the per-atom `log_lambda_smooth[k]` in atom order (`k in 0..K`), so the
-    /// smoothness block carries `K` outer coordinates, not 1 (#1556).
+    /// Layout: `[log_lambda_sparse, <K smooth>, <ARD>, <L-1 block>]`, where
+    /// `<K smooth>` is the per-atom `log_lambda_smooth[k]` in atom order
+    /// (`k in 0..K`), so the smoothness block carries `K` outer coordinates, not 1
+    /// (#1556). The trailing `<L-1 block>` is the crosscoder per-block
+    /// `log_lambda_block[ℓ]` (#2231 §2a), APPENDED after ARD and EMPTY for a plain
+    /// SAE (so the plain-SAE flat vector is byte-identical).
     ///
     /// * [`ArdSharing::PerAtom`] — the `<ARD>` block concatenates each atom
     ///   `k`'s per-axis `log_ard[k][j]` in atom order, axis `j` in `0..d_k`.
@@ -367,7 +408,8 @@ impl SaeManifoldRho {
             ArdSharing::PerAtom => {
                 let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
-                let mut out = Array1::<f64>::zeros(1 + k + ard_len);
+                let block_len = self.log_lambda_block.len();
+                let mut out = Array1::<f64>::zeros(1 + k + ard_len + block_len);
                 out[0] = self.log_lambda_sparse;
                 for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
                     out[1 + atom] = v;
@@ -379,12 +421,19 @@ impl SaeManifoldRho {
                         cursor += 1;
                     }
                 }
+                // #2231 §2a — the crosscoder block weights are APPENDED after ARD
+                // (empty ⇒ byte-identical plain-SAE layout).
+                for &v in &self.log_lambda_block {
+                    out[cursor] = v;
+                    cursor += 1;
+                }
                 out
             }
             ArdSharing::Shared => {
                 let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
-                let mut out = Array1::<f64>::zeros(1 + k + max_d);
+                let block_len = self.log_lambda_block.len();
+                let mut out = Array1::<f64>::zeros(1 + k + max_d + block_len);
                 out[0] = self.log_lambda_sparse;
                 for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
                     out[1 + atom] = v;
@@ -403,6 +452,11 @@ impl SaeManifoldRho {
                         }
                     }
                     out[1 + k + j] = if count > 0 { acc / count as f64 } else { 0.0 };
+                }
+                // #2231 §2a — crosscoder block weights appended after the shared
+                // ARD block (empty ⇒ byte-identical).
+                for (b, &v) in self.log_lambda_block.iter().enumerate() {
+                    out[1 + k + max_d + b] = v;
                 }
                 out
             }
@@ -425,12 +479,13 @@ impl SaeManifoldRho {
             ArdSharing::PerAtom => {
                 let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
+                let block_len = self.log_lambda_block.len();
                 assert_eq!(
                     flat.len(),
-                    1 + k + ard_len,
-                    "SaeManifoldRho::from_flat: flat length {} != 1 + K + Σ d_k = {}",
+                    1 + k + ard_len + block_len,
+                    "SaeManifoldRho::from_flat: flat length {} != 1 + K + Σ d_k + (L-1) = {}",
                     flat.len(),
-                    1 + k + ard_len
+                    1 + k + ard_len + block_len
                 );
                 let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
                 let mut log_ard = Vec::with_capacity(self.log_ard.len());
@@ -444,22 +499,27 @@ impl SaeManifoldRho {
                     cursor += d;
                     log_ard.push(block);
                 }
+                // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
+                let log_lambda_block: Vec<f64> =
+                    (0..block_len).map(|b| flat[cursor + b]).collect();
                 SaeManifoldRho {
                     log_lambda_sparse: flat[0],
                     log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::PerAtom,
+                    log_lambda_block,
                 }
             }
             ArdSharing::Shared => {
                 let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
+                let block_len = self.log_lambda_block.len();
                 assert_eq!(
                     flat.len(),
-                    1 + k + max_d,
-                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != 1 + K + max_d = {}",
+                    1 + k + max_d + block_len,
+                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != 1 + K + max_d + (L-1) = {}",
                     flat.len(),
-                    1 + k + max_d
+                    1 + k + max_d + block_len
                 );
                 let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
                 // Broadcast the shared per-axis strengths into each atom's block,
@@ -475,11 +535,15 @@ impl SaeManifoldRho {
                     }
                     log_ard.push(block);
                 }
+                // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
+                let log_lambda_block: Vec<f64> =
+                    (0..block_len).map(|b| flat[1 + k + max_d + b]).collect();
                 SaeManifoldRho {
                     log_lambda_sparse: flat[0],
                     log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::Shared,
+                    log_lambda_block,
                 }
             }
         }
