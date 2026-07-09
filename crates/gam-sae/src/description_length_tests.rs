@@ -3,12 +3,12 @@
 //! exactly, and the criterion-bits reconciliation invariant must hold.
 
 use super::{
-    Crossover, DescriptionLength, Featurizer, ScoreRow, bar_birth_threshold_nats,
+    BirthMdlPrescreen, Crossover, DescriptionLength, Featurizer, ScoreRow, bar_birth_threshold_nats,
     bar_supports_birth, circle_chart_columns, circle_coding_gain_bits, circle_shape_const_bits,
     crossover_firings, curved_coding_gain_bits, evidence_per_log_persistence,
     kappa_coding_gain_detector, manifold_fit_description_length, matched_dl, matched_dl_delta,
-    reverse_water_filling, scalar_rate_bits, score, se_resolution_bits, selection_bits,
-    uniform_unit_range_sd,
+    predicted_birth_dl_bits, reverse_water_filling, scalar_rate_bits, score, se_resolution_bits,
+    selection_bits, uniform_unit_range_sd,
 };
 use crate::atom_codes::SparseAtomCodes;
 
@@ -582,4 +582,69 @@ fn tiling_support_entropy_undercuts_combinatorial_and_shrinks_gap() {
         xo_h.f_star,
         xo_comb.f_star
     );
+}
+
+/// #2233 closed-form birth pre-screen: hand-computed crossover on a planted
+/// spectrum. A circle (span 2, no code savings, support-only win) pays; a torus
+/// (span 4, rich basis) at a tiny activation rate does NOT.
+#[test]
+fn birth_prescreen_matches_hand_computed_crossover() {
+    // Shared config: N=1000 tokens, P=8 channels, G=1024 atoms, L0=32 active.
+    // log₂(N) = ln(1000)/ln(2) and log₂(G/L0) = log₂(32) = 5 exactly.
+    let log2_n = 1000.0_f64.log2();
+    let log2_g_over_l0 = (1024.0_f64 / 32.0).log2();
+    assert!((log2_g_over_l0 - 5.0).abs() < 1e-12);
+
+    // --- Circle: span ŝ=2, d=1, m=3. Code term (ŝ−d−1)=0 ⇒ support-only win. ---
+    // λ̂=3, δ=1 (scalar rate ½log₂(4)=1, unused here since the code coefficient is 0).
+    let circle = BirthMdlPrescreen {
+        rho: 0.1,
+        span: 2.0,
+        intrinsic_dim: 1,
+        basis_size: 3,
+        signal_var: 3.0,
+        noise_floor: 1.0,
+        n_tokens: 1000.0,
+        p_out: 8,
+        g_dict: 1024,
+        l0: 32.0,
+    };
+    // saving = ρN·[0 + (s−1)·log₂(G/L0)] = 0.1·1000·(1·5) = 500.
+    // surcharge = (m−s)·P·½·log₂(N) = (3−2)·8·0.5·log₂(1000).
+    let expected_circle = 0.1 * 1000.0 * 5.0 - (3.0 - 2.0) * 8.0 * 0.5 * log2_n;
+    let got_circle = predicted_birth_dl_bits(&circle);
+    assert!(
+        (got_circle - expected_circle).abs() < 1e-9,
+        "circle pre-screen bits {got_circle} != hand value {expected_circle}"
+    );
+    assert!(got_circle > 0.0, "a firing circle must pay: {got_circle}");
+
+    // --- Torus at tiny ρ: span ŝ=4, d=2, m=25. Rich basis, negligible firing. ---
+    let torus = BirthMdlPrescreen {
+        rho: 0.001,
+        span: 4.0,
+        intrinsic_dim: 2,
+        basis_size: 25,
+        signal_var: 3.0,
+        noise_floor: 1.0,
+        n_tokens: 1000.0,
+        p_out: 8,
+        g_dict: 1024,
+        l0: 32.0,
+    };
+    // code coeff (s−d−1)=1, scalar rate = ½log₂(1+3/1)=1 ⇒ code=1; support=(4−1)·5=15.
+    // saving = 0.001·1000·(1+15) = 16; surcharge = (25−4)·8·0.5·log₂(1000).
+    let expected_torus = 0.001 * 1000.0 * (1.0 + 15.0) - (25.0 - 4.0) * 8.0 * 0.5 * log2_n;
+    let got_torus = predicted_birth_dl_bits(&torus);
+    assert!(
+        (got_torus - expected_torus).abs() < 1e-9,
+        "torus pre-screen bits {got_torus} != hand value {expected_torus}"
+    );
+    assert!(
+        got_torus < 0.0,
+        "a tiny-ρ rich torus must not pay (deferred): {got_torus}"
+    );
+
+    // Scalar-rate sanity: the code coefficient the torus used is exactly 1 bit.
+    assert!((scalar_rate_bits(3.0, 1.0) - 1.0).abs() < 1e-12);
 }

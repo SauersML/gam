@@ -81,6 +81,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 use crate::atom_codes::SparseAtomCodes;
+use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
@@ -247,6 +248,58 @@ fn per_atom_max_mass(term: &SaeManifoldTerm) -> Array1<f64> {
         out[atom] = max;
     }
     out
+}
+
+/// Participation ratio `(Σλ)²/Σλ²` of a non-negative spectrum — the effective
+/// number of significant directions (the #2233 span estimate `ŝ` when the spectrum
+/// is the residual factor-energy set). `1.0` for a single direction (or an
+/// all-but-one-zero spectrum); `0.0` for an empty / all-zero spectrum.
+fn participation_ratio(spectrum: &[f64]) -> f64 {
+    let sum: f64 = spectrum.iter().map(|&e| e.max(0.0)).sum();
+    let sum_sq: f64 = spectrum.iter().map(|&e| e.max(0.0) * e.max(0.0)).sum();
+    if sum_sq > 0.0 {
+        (sum * sum) / sum_sq
+    } else {
+        0.0
+    }
+}
+
+/// The curved topology `(d, m)` the #2233 pre-screen matches to an estimated
+/// ambient span `ŝ`, so the dictionary surcharge is priced against the realizable
+/// curved atom a span-`ŝ` residual would be raced into. The basis budgets mirror
+/// [`topology_candidates_for_dim`] (the downstream birth topology race), not a new
+/// menu: circle `2·1+1 = 3`, sphere chart `7`, torus `(2·2+1)² = 25`. The curved
+/// families top out at `d = 2`, so a span `≥ 4` residual is priced against the
+/// richest curved atom (the torus); the e-gate, never this map, owns acceptance.
+fn curved_topology_for_span(span: f64) -> (usize, usize) {
+    match span.round().max(1.0) as usize {
+        0 | 1 | 2 => (1, 3),  // circle (PeriodicHarmonicEvaluator, 2·d+1 harmonics)
+        3 => (2, 7),          // sphere chart (SphereChartEvaluator)
+        _ => (2, 25),         // torus (TorusHarmonicEvaluator, (2H+1)² at H=2)
+    }
+}
+
+/// Mean active atoms per token `L0` — the support-budget denominator for the
+/// #2233 pre-screen's `log₂(G/L0)` term. An atom counts as active on a row by the
+/// SAME `ACTIVE_SUPPORT_REL_FLOOR / K` discrete-support threshold
+/// [`sparse_codes_from_term`] uses (no new constant), floored at `1.0` so the
+/// support term is well-defined even on a degenerate all-inactive round.
+fn mean_active_atoms(assignments: ArrayView2<'_, f64>) -> f64 {
+    let n = assignments.nrows();
+    let k = assignments.ncols();
+    if n == 0 || k == 0 {
+        return 1.0;
+    }
+    let floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
+    let mut total_active = 0usize;
+    for row in 0..n {
+        for atom in 0..k {
+            if assignments[[row, atom]] > floor {
+                total_active += 1;
+            }
+        }
+    }
+    (total_active as f64 / n as f64).max(1.0)
 }
 
 /// The largest per-atom ARD log-precision (over the atom's axes), or `-inf` for
@@ -659,6 +712,9 @@ pub fn harvest_move_proposals(
     let assignments = term.assignment.assignments();
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
     let mut births_proposed = 0usize;
+    let mut birth_predictions: Vec<(usize, f64)> = Vec::new();
+    let mut births_deferred = 0usize;
+    let mut deferred_predicted_bits = 0.0_f64;
     let mut birth_skipped_reason: Option<String> = None;
     if params.max_births > 0 && n > 0 && residuals.ncols() > 0 {
         let p = residuals.ncols();
@@ -670,20 +726,100 @@ pub fn harvest_move_proposals(
         }) {
             Ok(model) => {
                 let factor = model.factor();
+                let diagonal = model.diagonal();
                 let r = model.factor_rank();
-                // Rank each factor direction by its explained residual mass
-                // (column norm of Λ scaled by the mean activity); births are
-                // proposed in descending mass order, capped at `max_births`.
-                let mut dirs: Vec<(usize, f64)> = (0..r)
-                    .map(|j| {
-                        let mass = factor.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
-                        (j, mass)
-                    })
+                // #2233 closed-form MDL birth pre-screen. Every quantity below is
+                // read from the structured residual-factor fit already computed —
+                // no candidate refit runs here. Shared per-round crossover inputs:
+                //  * ŝ = participation ratio of the factor-energy spectrum,
+                //  * (d, m) = the curved topology matched to ŝ (basis surcharge),
+                //  * G = current dictionary size, L0 = mean active atoms/token,
+                //  * N = tokens, P = channels.
+                let energies: Vec<f64> = (0..r)
+                    .map(|j| factor.column(j).iter().map(|v| v * v).sum::<f64>())
                     .collect();
-                dirs.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
-                for &(candidate, mass) in dirs.iter().take(params.max_births) {
-                    proposals.push(proposal(term, StructureMove::Birth { candidate }, mass));
+                let span = participation_ratio(&energies);
+                let (intrinsic_dim, basis_size) = curved_topology_for_span(span);
+                let g_dict = term.k_atoms();
+                let l0 = mean_active_atoms(assignments.view());
+                let n_tokens = n as f64;
+                // Score every factor direction; a positive predicted ΔMDL rides as a
+                // proposal (ordered by the prediction), a non-positive one is
+                // DEFERRED (not proposed this round — a soft defer, never a kill).
+                let mut scored: Vec<(usize, f64)> = Vec::with_capacity(r);
+                for j in 0..r {
+                    let col = factor.column(j);
+                    let energy = energies[j];
+                    if !(energy > 0.0) {
+                        // A zero-energy direction carries no residual structure to
+                        // birth from — defer it (no finite prediction to bank).
+                        births_deferred += 1;
+                        continue;
+                    }
+                    let norm = energy.sqrt();
+                    // Per-direction idiosyncratic-noise floor δ_j = u_jᵀ D u_j (the
+                    // residual diagonal projected onto the unit birth direction) —
+                    // derived from the fitted noise model, not a hand-set floor.
+                    let mut noise_floor = 0.0_f64;
+                    for out in 0..p {
+                        let u = col[out] / norm;
+                        noise_floor += u * u * diagonal[out];
+                    }
+                    // ρ̂_j: fraction of tokens whose residual projects onto the unit
+                    // direction above that direction's noise floor.
+                    let mut active = 0usize;
+                    for row in 0..n {
+                        let res_row = residuals.row(row);
+                        let mut proj = 0.0_f64;
+                        for out in 0..p {
+                            proj += res_row[out] * col[out];
+                        }
+                        proj /= norm;
+                        if proj * proj > noise_floor {
+                            active += 1;
+                        }
+                    }
+                    let rho = active as f64 / n_tokens;
+                    let predicted = predicted_birth_dl_bits(&BirthMdlPrescreen {
+                        rho,
+                        span,
+                        intrinsic_dim,
+                        basis_size,
+                        signal_var: energy,
+                        noise_floor,
+                        n_tokens,
+                        p_out: p,
+                        g_dict,
+                        l0,
+                    });
+                    if predicted.is_finite() && predicted > 0.0 {
+                        scored.push((j, predicted));
+                    } else {
+                        births_deferred += 1;
+                        if predicted.is_finite() {
+                            deferred_predicted_bits += predicted;
+                        }
+                    }
+                }
+                // Order the survivors by predicted ΔMDL (descending), tie-break by
+                // index, and cap at `max_births`; the overflow is deferred too.
+                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                for &(candidate, predicted) in scored.iter().take(params.max_births) {
+                    proposals.push(proposal(term, StructureMove::Birth { candidate }, predicted));
+                    birth_predictions.push((candidate, predicted));
                     births_proposed += 1;
+                }
+                for &(_, predicted) in scored.iter().skip(params.max_births) {
+                    births_deferred += 1;
+                    deferred_predicted_bits += predicted;
+                }
+                if births_deferred > 0 {
+                    log::debug!(
+                        "[structure-harvest] #2233 MDL pre-screen deferred {births_deferred} \
+                         birth(s) (total predicted ΔMDL {deferred_predicted_bits:.1} bits; span \
+                         ŝ={span:.2}, d={intrinsic_dim}, m={basis_size}); proposed {births_proposed} \
+                         ordered by predicted ΔMDL",
+                    );
                 }
             }
             Err(e) => {
@@ -702,6 +838,9 @@ pub fn harvest_move_proposals(
         fission_carve_unavailable_count,
         fission_carve_blocked_count,
         births_proposed,
+        birth_predictions,
+        births_deferred,
+        deferred_predicted_bits,
         birth_skipped_reason,
         glues_proposed,
         glue_candidates_screened,
@@ -791,6 +930,20 @@ pub struct HarvestReport {
     pub fission_carve_blocked_count: usize,
     /// Number of residual-factor birth candidates proposed.
     pub births_proposed: usize,
+    /// #2233 closed-form MDL pre-screen: `(candidate index, predicted ΔMDL bits)`
+    /// for every residual-factor birth that was PROPOSED (predicted saving > 0).
+    /// The candidate index is the factor direction the birth seeds from — the same
+    /// index the [`StructureMove::Birth`] carries — so the round driver threads
+    /// each prediction into the unified [`SaeMigrationLedger`] record the post-refit
+    /// verdict fills in (the predicted-vs-realized calibration curve).
+    pub birth_predictions: Vec<(usize, f64)>,
+    /// #2233: number of residual-factor births DEFERRED this round — non-positive
+    /// predicted ΔMDL, so not proposed (a soft defer: they may return next round
+    /// once the residual changes; never a hard kill).
+    pub births_deferred: usize,
+    /// #2233: total predicted ΔMDL (bits) summed over the deferred births — the
+    /// round-cadence honesty figure logged alongside the deferred count.
+    pub deferred_predicted_bits: f64,
     /// If the birth channel could not run (empty residuals, evidence-ladder
     /// failure), why — so the absence of births is explained, not silent.
     pub birth_skipped_reason: Option<String>,
@@ -2850,9 +3003,27 @@ impl StructureSearchResult {
         rho: SaeManifoldRho,
         rounds: Vec<SearchLedger>,
     ) -> Self {
+        Self::from_rounds_with_predictions(term, rho, rounds, &[])
+    }
+
+    /// Assemble a result AND thread the #2233 closed-form birth pre-screen
+    /// predictions into the unified ledger. `birth_predictions[i]` maps a birth
+    /// candidate index to its predicted ΔMDL (bits) for round `i` (parallel to
+    /// `rounds`; a missing / short entry is treated as "no predictions"), so each
+    /// proposed residual-factor birth's `predicted_dl_bits` sits on the same
+    /// migration record its post-refit verdict fills in.
+    #[must_use]
+    pub fn from_rounds_with_predictions(
+        term: SaeManifoldTerm,
+        rho: SaeManifoldRho,
+        rounds: Vec<SearchLedger>,
+        birth_predictions: &[std::collections::HashMap<usize, f64>],
+    ) -> Self {
         let mut migration = SaeMigrationLedger::new();
+        let empty = std::collections::HashMap::new();
         for (round_idx, round_ledger) in rounds.iter().enumerate() {
-            migration.record_search_round(round_idx, round_ledger);
+            let preds = birth_predictions.get(round_idx).unwrap_or(&empty);
+            migration.record_search_round(round_idx, round_ledger, preds);
         }
         Self {
             term,
@@ -3002,6 +3173,10 @@ pub fn run_structure_search_rounds(
     } = config;
     let split = estimation_eval_split(target, n_shards);
     let mut rounds: Vec<SearchLedger> = Vec::new();
+    // #2233: per-round birth-pre-screen predictions (candidate index → predicted
+    // ΔMDL bits), pushed in lock-step with `rounds` so the unified ledger can pair
+    // each proposed birth's prediction with its post-refit verdict.
+    let mut round_predictions: Vec<std::collections::HashMap<usize, f64>> = Vec::new();
     // Hysteresis ledger for the curl/flatten pair — persists across rounds so a
     // just-curled atom-set (or just-flattened one) is silenced for a few rounds
     // and the two moves cannot chase each other (INTEGRATION_PLAN risk #5).
@@ -3012,6 +3187,10 @@ pub fn run_structure_search_rounds(
         let fitted = term.try_fitted()?;
         let residuals = &target.to_owned() - &fitted;
         let mut report = harvest_move_proposals(&term, &rho, residuals.view(), &harvest_params)?;
+        // Capture the pre-screen predictions before `report.proposals` is consumed
+        // by the search; curl births (appended below) carry no prediction.
+        let birth_predictions: std::collections::HashMap<usize, f64> =
+            report.birth_predictions.iter().copied().collect();
 
         // #993 item 3: BANK the within-atom carve binding evidence in the
         // ledger. The carve ran on each `d = 2` product-atom fission candidate
@@ -3086,6 +3265,7 @@ pub fn run_structure_search_rounds(
                 moves: Vec::new(),
                 collapse_events: term.collapse_events().to_vec(),
             });
+            round_predictions.push(birth_predictions);
             break;
         }
 
@@ -3153,6 +3333,7 @@ pub fn run_structure_search_rounds(
             cooldown.tick();
         }
         rounds.push(round_ledger);
+        round_predictions.push(birth_predictions);
 
         if applied {
             // The adopted winner reached its restructured form through the cheap
@@ -3177,7 +3358,12 @@ pub fn run_structure_search_rounds(
 
     // Fold the per-round e-process verdicts into the ONE unified migration
     // currency (Increment 3): a read-out, not a second gate.
-    Ok(StructureSearchResult::from_rounds(term, rho, rounds))
+    Ok(StructureSearchResult::from_rounds_with_predictions(
+        term,
+        rho,
+        rounds,
+        &round_predictions,
+    ))
 }
 
 /// Build the per-round residual-factor decoder list the birth apply-move indexes

@@ -83,6 +83,90 @@ pub fn reverse_water_filling(eigs: &[f64], delta2: f64) -> (f64, Vec<f64>) {
     (per.iter().sum(), per)
 }
 
+/// The spectra-only inputs to the #2233 closed-form curved-birth MDL pre-screen.
+///
+/// Every field is estimated at PROPOSAL time from quantities the structured
+/// residual-factor fit already produced — no candidate refit is run. See
+/// [`predicted_birth_dl_bits`] for the crossover formula they feed.
+#[derive(Clone, Copy, Debug)]
+pub struct BirthMdlPrescreen {
+    /// Activation rate `ρ̂ ∈ [0, 1]`: the fraction of tokens whose residual
+    /// projects onto the birth decoder direction above that direction's
+    /// idiosyncratic-noise floor.
+    pub rho: f64,
+    /// Ambient span `ŝ`: the participation ratio `(Σλ)²/Σλ²` of the residual
+    /// factor-energy spectrum — the effective number of significant residual
+    /// directions the manifold image occupies (circle ≈ 2, sphere ≈ 3, torus ≈ 4).
+    pub span: f64,
+    /// Intrinsic dimension `d` of the candidate topology matched to `span`.
+    pub intrinsic_dim: usize,
+    /// Basis size `m` of the candidate topology matched to `span` (the curved
+    /// atom's dictionary width per output channel).
+    pub basis_size: usize,
+    /// Factor signal variance `λ̂` along the birth direction (its explained
+    /// residual energy `‖Λ_:,j‖²`).
+    pub signal_var: f64,
+    /// Per-direction idiosyncratic-noise floor `δ` (`u_jᵀ D u_j`, the residual
+    /// diagonal projected onto the unit birth direction).
+    pub noise_floor: f64,
+    /// Token count `N` (residual rows).
+    pub n_tokens: f64,
+    /// Output dimension `P` (residual channels) — the per-parameter multiplier of
+    /// the dictionary surcharge.
+    pub p_out: usize,
+    /// Dictionary size `G` (current atom count) for the `log₂(G/L0)` support term.
+    pub g_dict: usize,
+    /// Mean active atoms per token `L0` (the support-budget denominator).
+    pub l0: f64,
+}
+
+/// The #2233 closed-form curved-birth MDL pre-screen: the predicted NET
+/// description-length saving (bits) of a curved birth over the flat `s`-latent
+/// alternative, from spectra alone.
+///
+/// From the Eq-4 crossover theorem (positive ⇒ the birth strictly lowers Eq-4
+/// bits and should reach the e-process gate):
+///
+/// ```text
+///   ΔMDL = ρ̂·N·[ (ŝ−d−1)·½log₂(1+λ̂/δ) + (ŝ−1)·log₂(G/L0) ]
+///          − (m−ŝ)·P·½log₂(N)
+/// ```
+///
+/// * the **code** term `(ŝ−d−1)·½log₂(1+λ̂/δ)` credits the scalars the curved
+///   atom transmits fewer of than the flat span (zero for circle/sphere, positive
+///   for torus/helix — signed, so a topology that needs MORE code dims than the
+///   span is honestly charged);
+/// * the **support** term `(ŝ−1)·log₂(G/L0)` credits the extra active slots the
+///   flat span spends that the single curved atom does not — the term that scales
+///   with dictionary overcompleteness;
+/// * the **dictionary surcharge** `(m−ŝ)·P·½log₂(N)` is the BIC rank charge the
+///   richer curved decoder pays.
+///
+/// The second-order residual (Eckart–Young) term `Δresid ≥ 0` is OMITTED: the
+/// pre-screen therefore under-credits the birth, so it can only DEFER a proposal
+/// (which returns next round when the residual changes), never accept one — the
+/// e-process gate stays the sole arbiter. Returns a finite value (all logs are
+/// floored on degenerate inputs).
+#[must_use]
+pub fn predicted_birth_dl_bits(p: &BirthMdlPrescreen) -> f64 {
+    let span = p.span;
+    let code_bits = (span - p.intrinsic_dim as f64 - 1.0)
+        * scalar_rate_bits(p.signal_var, p.noise_floor);
+    let support_bits = if p.g_dict > 0 && p.l0 > 0.0 {
+        (span - 1.0) * (p.g_dict as f64 / p.l0).log2()
+    } else {
+        0.0
+    };
+    let n = p.n_tokens.max(0.0);
+    let saving = p.rho.clamp(0.0, 1.0) * n * (code_bits + support_bits);
+    // `½log₂(N)` needs N ≥ 2 to be non-negative; a degenerate token count charges
+    // no surcharge. `(m−ŝ)` is clamped ≥ 0 so a basis narrower than the span never
+    // credits a spurious dictionary saving.
+    let log2_n = if n >= 2.0 { n.log2() } else { 0.0 };
+    let surcharge = (p.basis_size as f64 - span).max(0.0) * p.p_out as f64 * 0.5 * log2_n;
+    saving - surcharge
+}
+
 /// One rung of the description-length ladder — a featurizer's reporting inputs.
 ///
 /// `coded_var` are the per-coordinate signal variances of the `m` coefficients
