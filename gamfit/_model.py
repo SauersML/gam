@@ -85,23 +85,31 @@ class Model:
             into this single flag (use ``interval=0.95`` for the SE-only
             case).
 
-            Pass ``interval="conformal"`` to use exact distribution-free
-            jackknife+ prediction intervals (Barber et al. 2021) — no
-            held-out calibration fold is required. The coverage level is
-            controlled by ``conformal_level`` (default ``0.9``). This path
-            requires a Gaussian-identity model fitted without prior weights,
-            offsets, or a link wiggle; use :meth:`predict_conformal` for
-            split-conformal intervals on other families.
+            Pass ``interval="conformal"`` to use distribution-free jackknife+
+            prediction intervals (Barber et al. 2021) — no held-out
+            calibration fold is required. The interval *targets*
+            ``conformal_level`` (default ``0.9``) marginal coverage; the
+            finite-sample guarantee the theorem certifies at this setting is
+            the weaker ``2 * conformal_level - 1`` (coverage >= 1 - 2*alpha at
+            alpha = 1 - level). This path requires a Gaussian-identity model
+            fitted without prior weights, offsets, or a link wiggle; use
+            :meth:`predict_conformal` for split-conformal intervals on other
+            families.
 
-            Pass ``interval="full_conformal"`` for the EXACT full-conformal
-            set (#942 Layer 1): every observation is used for both fitting and
-            calibration, the exact prediction set is computed from one Cholesky
-            per test point with zero refits, and the output additionally gains a
-            ``frozen_rho_certified`` column reporting the Layer-3 frozen-ρ
-            self-diagnostic (whether freezing the global smoothing parameter is
-            certified equal to the honest ρ-re-selecting set). Same eligibility
-            as ``"conformal"``; ``mean_lower`` / ``mean_upper`` report the outer
-            envelope of the (possibly multi-interval) exact set.
+            Pass ``interval="full_conformal"`` for the full-conformal set at
+            the fitted (frozen) smoothing parameters (#942 Layer 1): every
+            observation is used for both fitting and calibration, and the set
+            is exact *given* the frozen penalty, computed from one Cholesky per
+            test point with zero refits. Because the smoothing parameters were
+            selected from all training responses, the distribution-free
+            finite-sample ``conformal_level`` coverage theorem applies only
+            where the per-row ``frozen_rho_certified`` output column is 1.0
+            (the Layer-3 certificate that freezing the global smoothing
+            parameter matches the honest ρ-re-selecting set, under a
+            grid-checked Lipschitz assumption); rows with 0.0 carry no
+            finite-sample guarantee. Same eligibility as ``"conformal"``;
+            ``mean_lower`` / ``mean_upper`` report the outer envelope of the
+            (possibly multi-interval) set.
         conformal_level : float, default 0.9
             Target marginal coverage in ``(0, 1)`` when ``interval="conformal"``
             or ``interval="full_conformal"``
@@ -190,9 +198,11 @@ class Model:
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
         # #1054: interval='conformal' routes to the exact Gaussian jackknife+
-        # path (no held-out fold needed, finite-sample ≥conformal_level
-        # marginal coverage). The returned JSON has the same column schema as
-        # the model-based predict path so shape_predict_response is unchanged.
+        # path (no held-out fold needed; targets conformal_level coverage with
+        # the finite-sample floor 2*level-1 — see the Rust route for the
+        # calibration decision, #1546). The returned JSON has the same column
+        # schema as the model-based predict path so shape_predict_response is
+        # unchanged.
         if interval == "conformal":
             try:
                 raw = rust_module().predict_table_jackknife_plus(
@@ -212,11 +222,12 @@ class Model:
                 row_ids=row_ids,
                 restore=restore_output_table,
             )
-        # #1098: interval='full_conformal' routes to the EXACT Gaussian
-        # full-conformal set (no held-out fold; finite-sample ≥conformal_level
-        # marginal coverage; #942 Layer 1). One Cholesky per test point, zero
-        # refits. The returned JSON carries the same column schema plus a
-        # `frozen_rho_certified` column (the Layer-3 self-diagnostic).
+        # #1098: interval='full_conformal' routes to the Gaussian
+        # full-conformal set at frozen smoothing parameters (no held-out fold;
+        # exact given Sλ; the finite-sample ≥conformal_level theorem holds per
+        # row only where frozen_rho_certified=1 — see the docstring; #942
+        # Layer 1). One Cholesky per test point, zero refits. The returned
+        # JSON carries the same column schema plus that certificate column.
         if interval == "full_conformal":
             try:
                 raw = rust_module().predict_table_full_conformal(
