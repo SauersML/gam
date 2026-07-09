@@ -1278,6 +1278,114 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     }
 }
 
+/// #1017: the reduced-Schur operator `v ↦ S·v` staged ONCE per criterion
+/// evaluation and reused across EVERY shifted / warm-started solve of the
+/// rational-logdet (and SLQ) ladder — the widened-lifetime residency the #1017
+/// device design calls for.
+///
+/// The rational-logdet criterion (`matrix_free_arrow_evidence_log_det_surrogate`)
+/// walks SEVERAL shift ladders inside ONE evaluation: the `λ_max` power iteration
+/// ([`reduced_schur_lambda_max`]), the pilot / deflation-derived plan build
+/// ([`rational_reduced_schur_plan_derived`]), the value [`RationalLogdetPlan::
+/// evaluate`], and the `(probes, S⁻¹·probes)` gradient bundle
+/// ([`reduced_schur_inverse_probe_solves`]). Each formerly re-captured its own
+/// inline `schur_matvec` closure over `(sys, htt_factors, ρ_β, backend,
+/// resident)`. On CPU those captures are free; on the device lane they are the
+/// per-solve FLATTEN — every ladder would re-marshal and re-upload the
+/// ridge-independent operands (the factored `H_tt` slab, the framed `G ⊗ W`, the
+/// dense per-row cross blocks) that are INVARIANT across the whole evaluation.
+///
+/// This object is the single operator every ladder borrows: the invariant state
+/// (`sys`, the factored `H_tt` slab, the `ρ_β` border, the pre-staged CPU
+/// [`SaeResidentReducedSchur`] frame, and — when engaged — a device-resident
+/// [`GpuSchurMatvec`] whose per-row factors upload ONCE) lives for the whole
+/// evaluation, so a shifted solve reuses the resident operator instead of
+/// re-staging it. Every `apply` accumulates the SAME reduced operator
+/// `S = (H_ββ + ρ_β I) − Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹H_tβ^(i)` regardless of
+/// lane. With `gpu_matvec == None` (every current construction) the result is
+/// byte-for-byte the pre-context inline `schur_matvec` closure; the `gpu_matvec`
+/// seam is where a device operator, built once per evaluation, is threaded through
+/// the ladder (the reported #1017 next increment).
+pub(crate) struct ReducedSchurOperator<'a, B: BatchedBlockSolver + Sync> {
+    sys: &'a ArrowSchurSystem,
+    htt_factors: &'a ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &'a B,
+    resident: Option<&'a SaeResidentReducedSchur>,
+    gpu_matvec: Option<&'a GpuSchurMatvec>,
+}
+
+impl<'a, B: BatchedBlockSolver + Sync> ReducedSchurOperator<'a, B> {
+    /// The CPU/host operator — the byte-identical default. Every shifted solve in
+    /// the evaluation reuses the same pre-staged `resident` frame (or the generic
+    /// per-row `apply → solve → transpose` when `resident` is `None`).
+    pub(crate) fn new(
+        sys: &'a ArrowSchurSystem,
+        htt_factors: &'a ArrowFactorSlab,
+        ridge_beta: f64,
+        backend: &'a B,
+        resident: Option<&'a SaeResidentReducedSchur>,
+    ) -> Self {
+        Self {
+            sys,
+            htt_factors,
+            ridge_beta,
+            backend,
+            resident,
+            gpu_matvec: None,
+        }
+    }
+
+    /// Attach a device-resident [`GpuSchurMatvec`] (built ONCE per evaluation) so
+    /// the whole ladder applies `S·v` on device without a per-solve re-upload.
+    /// #1017 next increment: the caller that owns the device operand upload builds
+    /// the operator once and calls this; until then every construction is CPU
+    /// (`gpu_matvec == None`), so the lane stays byte-identical.
+    pub(crate) fn with_gpu_matvec(mut self, gpu_matvec: Option<&'a GpuSchurMatvec>) -> Self {
+        self.gpu_matvec = gpu_matvec;
+        self
+    }
+
+    /// `out = S·x`. Both lanes CLEAR and fully assign `out`, so a fresh zeroed
+    /// buffer per apply is correct (and the shift-ladder CG contract is upheld).
+    #[inline]
+    pub(crate) fn apply_into(&self, x: &Array1<f64>, out: &mut Array1<f64>) {
+        if let Some(gpu) = self.gpu_matvec {
+            gpu(x, out);
+        } else {
+            schur_matvec(
+                self.sys,
+                self.htt_factors,
+                self.ridge_beta,
+                x,
+                out,
+                self.backend,
+                self.resident,
+            );
+        }
+    }
+
+    /// `S·v` into a fresh length-`k` vector — the shift-ladder matvec-closure form
+    /// (`|v: ArrayView1| op.apply(v)`). Byte-for-byte the inline
+    /// `let x = v.to_owned(); schur_matvec(…, &x, &mut zeros(k), …)` it replaces.
+    #[inline]
+    pub(crate) fn apply(&self, v: ArrayView1<f64>) -> Array1<f64> {
+        let x = v.to_owned();
+        let mut out = Array1::<f64>::zeros(self.sys.k);
+        self.apply_into(&x, &mut out);
+        out
+    }
+
+    /// `S·x` into a fresh vector from an already-owned `&Array1` (no redundant copy
+    /// of a vector the caller already owns) — the power-iteration / CG-solve form.
+    #[inline]
+    pub(crate) fn apply_owned(&self, x: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.sys.k);
+        self.apply_into(x, &mut out);
+        out
+    }
+}
+
 /// Matrix-free reduced-Schur log-determinant `log|S|` via Stochastic Lanczos
 /// Quadrature on the exact `schur_matvec` apply `v ↦ S·v`, where
 /// `S = (H_ββ + ρ_β I) − Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹H_tβ^(i)` is the SPD
@@ -1315,26 +1423,15 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     seed: u64,
 ) -> SlqLogDet {
     let k = sys.k;
+    // Stage the reduced-Schur operator ONCE; every probe/Lanczos apply reuses the
+    // pre-staged residency (no per-apply operator re-capture). The probes fan
+    // across rayon workers (in `slq_logdet`), and `schur_matvec`'s own row
+    // parallelism is guarded off inside a worker, so there is no nested
+    // oversubscription.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
     slq_logdet(
         k,
-        |v| {
-            // `schur_matvec` clears and fully assigns `out`, so a fresh zeroed
-            // buffer per apply is correct; the probes fan across rayon workers
-            // (in `slq_logdet`), and `schur_matvec`'s own row parallelism is
-            // guarded off inside a worker, so there is no nested oversubscription.
-            let x = v.to_owned();
-            let mut out = Array1::<f64>::zeros(k);
-            schur_matvec(
-                sys,
-                htt_factors,
-                ridge_beta,
-                &x,
-                &mut out,
-                backend,
-                resident,
-            );
-            out
-        },
+        |v| op.apply(v),
         num_probes,
         lanczos_steps,
         seed,
@@ -1563,12 +1660,20 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
             // ends. The bundle uses the plan's RAW probes v_j (not the deflation-
             // projected ones) since tr(S⁻¹·M) contracts the full S⁻¹ v_j.
             let (estimate, bundle) = {
-                let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
-                    let x = v.to_owned();
-                    let mut out = Array1::<f64>::zeros(dim);
-                    schur_matvec(sys, &htt_factors, ridge_beta, &x, &mut out, &backend, resident.as_ref());
-                    out
-                };
+                // #1017: ONE reduced-Schur operator for the whole value ladder —
+                // the frozen plan walks its shift ladder through this single
+                // resident apply instead of re-capturing a `schur_matvec` closure
+                // per shifted solve. `gpu_matvec` is `None` here (byte-identical
+                // CPU); the seam is where a device operator, uploaded once for this
+                // evaluation, would be threaded (`.with_gpu_matvec(...)`).
+                let op = ReducedSchurOperator::new(
+                    sys,
+                    &htt_factors,
+                    ridge_beta,
+                    &backend,
+                    resident.as_ref(),
+                );
+                let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
                 let eval = plan
                     .evaluate(&matvec, state.cfg.cg_rel_tol, state.cfg.cg_max_iters)
                     .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
@@ -1663,11 +1768,9 @@ pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
         return None;
     }
     v.mapv_inplace(|x| x * inv_norm0);
-    let apply = |x: &Array1<f64>| -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(k);
-        schur_matvec(sys, htt_factors, ridge_beta, x, &mut out, backend, resident);
-        out
-    };
+    // One resident operator reused across every power-iteration apply.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    let apply = |x: &Array1<f64>| -> Array1<f64> { op.apply_owned(x) };
     for _ in 0..iters.max(1) {
         let sv = apply(&v);
         let norm = sv.dot(&sv).sqrt();
@@ -1734,16 +1837,12 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // the estimate.
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
     let plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
-    let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
-        // `schur_matvec` clears and fully assigns `out`, so a fresh zeroed buffer
-        // per apply is correct; the probes fan across rayon workers (in
-        // `evaluate`), and `schur_matvec`'s own row parallelism is guarded off
-        // inside a worker, so there is no nested oversubscription.
-        let x = v.to_owned();
-        let mut out = Array1::<f64>::zeros(k);
-        schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
-        out
-    };
+    // One resident operator; the plan's shift ladder reuses it across every
+    // shifted solve. The probes fan across rayon workers (in `evaluate`), and
+    // `schur_matvec`'s own row parallelism is guarded off inside a worker, so
+    // there is no nested oversubscription.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
     let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
     Some((plan, eval))
 }
@@ -1791,12 +1890,11 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         reduced_schur_lambda_max(sys, htt_factors, ridge_beta, backend, resident, power_iters, seed)?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
     let base_plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
-    let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
-        let x = v.to_owned();
-        let mut out = Array1::<f64>::zeros(k);
-        schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
-        out
-    };
+    // One resident operator across the pilot, every deflation re-solve, and the
+    // subspace-iteration `with_deflation` applies — the whole rank-derivation
+    // ladder reuses the same staged residency.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
     // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
     // deflation is requested or the bare bar already clears the target.
     let pilot = base_plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
@@ -1861,12 +1959,9 @@ fn reduced_schur_cg_solve<B: BatchedBlockSolver + Sync>(
     cg_rel_tol: f64,
     cg_max_iters: usize,
 ) -> Option<Array1<f64>> {
-    let k = sys.k;
-    let apply = |v: &Array1<f64>| -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(k);
-        schur_matvec(sys, htt_factors, ridge_beta, v, &mut out, backend, resident);
-        out
-    };
+    // One resident operator reused across every CG apply of this solve.
+    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
+    let apply = |v: &Array1<f64>| -> Array1<f64> { op.apply_owned(v) };
     let mut y = y0.clone();
     let mut r = b - &apply(&y);
     let b_norm = b.dot(b).sqrt().max(f64::MIN_POSITIVE);

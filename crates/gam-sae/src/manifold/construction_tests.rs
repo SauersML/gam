@@ -1128,9 +1128,13 @@ mod lever_wiring_2072_tests {
         // OFF (default): the gate `(false || false) && …` short-circuits — the
         // retraction helper is NEVER invoked, so atom 0 stays co-vanished.
         let (mut off, off_target, off_rho) = make_collapsed();
+        // #2228: the SCALE-gauge (`quotient_scale`) now DEFAULTS ON, so this baseline
+        // explicitly disables BOTH levers to isolate the `cone_atom_recovery` driver
+        // under test (else the default-on quotient would drive the same retraction).
+        off.set_quotient_scale(false);
         assert!(
             !off.cone_atom_recovery() && !off.quotient_scale(),
-            "both scale-gauge levers must default OFF"
+            "baseline must have both scale-gauge levers OFF"
         );
         if (off.cone_atom_recovery() || off.quotient_scale())
             && off.retract_collapsed_decoders_in_loop() > 0
@@ -1177,8 +1181,10 @@ mod lever_wiring_2072_tests {
     /// `a·exp(s)·Φ·B_unit == a·Φ·B_abs` is preserved to machine precision.
     #[test]
     fn quotient_scale_driver_peels_decoder_norm_and_preserves_reconstruction() {
-        // OFF (default).
+        // OFF baseline — #2228: `quotient_scale` now defaults ON, so disable it
+        // explicitly to exercise the lever-off refit path this test contrasts against.
         let (mut off, target, rho) = small_two_atom_periodic_term();
+        off.set_quotient_scale(false);
         off.refit_decoder_least_squares_at_current_state(target.view(), Some(&rho))
             .expect("LSQ refit (lever off)");
         let fitted_off = off

@@ -2344,7 +2344,10 @@ fn sae_structured_residual_model(
     promote_from_residual = false,
     run_structure_search = true,
     run_outer_rho_search = true,
-    quotient_scale = false,
+    // #2228/#1095 — the SCALE-gauge is DEFAULT-ON to cure the decoder-penalty↔gate
+    // co-collapse (see SaeManifoldTerm construction). Python callers can pass
+    // `quotient_scale=False` for a historical A/B, but the default engages the fix.
+    quotient_scale = true,
     data_row_reseed = false,
     // #1893: production Python fits use the realised-rank REML/Laplace
     // complexity ledger by default; callers can set false for historical A/B.
@@ -3353,17 +3356,19 @@ fn sae_manifold_fit_inner<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
-    // #2022/#2023/#1893 — install typed per-fit switches before the fit consumes
-    // the term. The quotient/data-row recovery levers remain opt-in; the Python
-    // surface defaults the rank-charge evidence ledger on because the historical
+    // #2022/#2023/#1893/#2228 — install typed per-fit switches before the fit
+    // consumes the term. The SCALE-gauge (`quotient_scale`) now defaults ON (the
+    // #2228 co-collapse cure); `data_row_reseed` stays opt-in; the Python surface
+    // defaults the rank-charge evidence ledger on because the historical
     // coordinate-block Laplace charge mis-prices vanishing/co-collapsed atoms.
     base_term.set_quotient_scale(quotient_scale);
     base_term.set_data_row_reseed(data_row_reseed);
     base_term.set_rank_charge_evidence(rank_charge_evidence);
     // #2022 SEED peel — moved here from the (env-free) padded-blocks builder.
-    // Quotient on ⇒ gauge-fix each seed decoder onto the unit Frobenius sphere
-    // with its magnitude in the explicit log-amplitude (reconstruction preserved:
-    // exp(s)·B_unit == B_seed). Default off ⇒ s stays 0, seed bit-for-bit.
+    // Quotient on (now the default) ⇒ gauge-fix each seed decoder onto the unit
+    // Frobenius sphere with its magnitude in the explicit log-amplitude
+    // (reconstruction preserved: exp(s)·B_unit == B_seed). Explicit off ⇒ s stays 0,
+    // seed bit-for-bit.
     if quotient_scale {
         for atom in base_term.atoms.iter_mut() {
             atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);

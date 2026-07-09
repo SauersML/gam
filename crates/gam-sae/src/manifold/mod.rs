@@ -227,6 +227,7 @@ mod streaming_plan;
 mod streaming_seed;
 mod term;
 mod terracini;
+mod transport_law;
 mod weight_frame_catalog;
 mod wbic_audit;
 mod wbic_dynamics;
@@ -242,6 +243,9 @@ mod tests_chart_evaluator_jets;
 
 #[cfg(test)]
 mod tests_collapse_prevention;
+
+#[cfg(test)]
+mod tests_collapse_2132;
 
 #[cfg(test)]
 mod tests_factored_htbeta;
@@ -377,6 +381,9 @@ mod tests_behavior_isometry_2015;
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
 
+// #[cfg(test)] mod tests_transport_law;  // coordinator-disabled: file not yet
+// written (transport agent mid-work) — re-enable when tests_transport_law.rs lands.
+
 #[cfg(test)]
 mod tests_crosscoder_block_fd_2231;
 
@@ -465,6 +472,7 @@ pub use stratum_births::*;
 pub use streaming_plan::*;
 pub use term::*;
 pub use terracini::*;
+pub use transport_law::*;
 pub use weight_frame_catalog::*;
 pub use wbic_audit::*;
 pub use wbic_dynamics::*;
