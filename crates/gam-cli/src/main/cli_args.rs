@@ -398,6 +398,13 @@ pub(crate) enum FamilyArg {
     RoystonParmar,
     TransformationNormal,
     Expectile,
+    /// Penalized multinomial-logit GAM: a categorical response with K classes
+    /// modelled by a shared-covariate softmax over K-1 active-class linear
+    /// predictors (the last class is the reference). Routes through the same
+    /// `fit_penalized_multinomial_formula` REML/LAML driver as
+    /// `gamfit.fit(..., family='multinomial')`. `gam predict` emits per-class
+    /// softmax probabilities.
+    Multinomial,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]

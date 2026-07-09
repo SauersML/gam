@@ -2267,8 +2267,13 @@ def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
     assert np.all(np.asarray(pd_out["standard_error"], dtype=float) >= 0.0)
 
 
-def test_model_variance_share_sums_to_at_most_one_plus_slack() -> None:
-    """variance_share returns dict of [0,1]-valued shares summing ~≤ 1."""
+def test_model_variance_share_is_a_decomposition_summing_to_one() -> None:
+    """variance_share allocates cov(f_t, eta)/var(eta): shares sum to exactly 1.
+
+    With independent covariates each share also lands in [0, 1]; the sum-to-one
+    identity is the decomposition contract (cross-covariances are split
+    symmetrically, so Σ_t cov(f_t, η) = var(η) by bilinearity).
+    """
     rng = np.random.default_rng(2026052203)
     n = 150
     x1 = rng.uniform(0.0, 1.0, n)
@@ -2282,8 +2287,12 @@ def test_model_variance_share_sums_to_at_most_one_plus_slack() -> None:
     for name, val in shares.items():
         assert isinstance(name, str)
         v = float(val)
-        assert 0.0 <= v <= 1.0, f"variance share {name}={v} outside [0,1]"
-    assert sum(float(v) for v in shares.values()) <= 1.1
+        assert np.isfinite(v), f"variance share {name}={v} not finite"
+        # Independent covariates: negligible anticorrelation, so each
+        # covariance-allocated share is an honest fraction.
+        assert -0.05 <= v <= 1.05, f"variance share {name}={v} outside [0,1] band"
+    total = sum(float(v) for v in shares.values())
+    assert abs(total - 1.0) < 1e-8, f"shares must sum to 1 exactly; got {total}"
 
 
 # ---------------------------------------------------------------------------

@@ -462,6 +462,12 @@ pub(crate) fn run_predict_residual_cascade(
 
 pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     validate_level(args.level)?;
+    // A multinomial model persists as its own softmax-envelope file, not a
+    // scalar `SavedModel`; dispatch on the file discriminator before the
+    // standard load so `SavedModel::load_from_path` is never handed one.
+    if is_multinomial_model_file(&args.model) {
+        return run_predict_multinomial(&args);
+    }
     let phase_start = std::time::Instant::now();
     let model = SavedModel::load_from_path(&args.model)?;
     log::info!(

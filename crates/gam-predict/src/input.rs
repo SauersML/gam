@@ -489,6 +489,30 @@ fn invert_transformation_normal_grid(
     grid_y[lo] + t * (grid_y[hi] - grid_y[lo])
 }
 
+/// Number of latent-z nodes on which the CTM predict input tabulates the
+/// response-scale predictive quantile ladder `h⁻¹(z_j | x_i)`.
+pub(crate) const TRANSFORMATION_NORMAL_BAND_Z_NODES: usize = 65;
+
+/// Half-width of the latent-z ladder. `Φ(4) ≈ 0.999968`, so every two-sided
+/// observation level up to ≈ 0.99993 interpolates strictly inside the ladder;
+/// beyond it the band clamps to the outermost tabulated quantile.
+pub(crate) const TRANSFORMATION_NORMAL_BAND_Z_MAX: f64 = 4.0;
+
+/// The fixed, evenly spaced latent-z ladder shared by the CTM input builder
+/// (which tabulates `h⁻¹` on it) and the transformation-normal predictor
+/// (which interpolates it to build response-scale observation bands). The CTM
+/// predictive is `Y | x = h⁻¹(Z | x)` with `Z ~ N(0,1)`, so the response-scale
+/// `p`-quantile is exactly `h⁻¹(Φ⁻¹(p) | x)` — quantiles map through the
+/// monotone inverse transform; they are NOT `E[Y|x] ± z·σ` in latent-normal
+/// units.
+pub(crate) fn transformation_normal_band_z_nodes() -> Array1<f64> {
+    Array1::from_shape_fn(TRANSFORMATION_NORMAL_BAND_Z_NODES, |j| {
+        -TRANSFORMATION_NORMAL_BAND_Z_MAX
+            + 2.0 * TRANSFORMATION_NORMAL_BAND_Z_MAX * (j as f64)
+                / ((TRANSFORMATION_NORMAL_BAND_Z_NODES - 1) as f64)
+    })
+}
+
 /// The response-scale conditional mean `E[Y|x] = E_{Z~N(0,1)}[h⁻¹(Z|x)]` for
 /// each row of a CTM transform grid, by averaging the grid inverse over a
 /// standard-normal midpoint quadrature in probability space (see the predict
@@ -775,6 +799,17 @@ fn build_predict_input_for_model_inner(
             // weights.
             let (grid_y, h_grid) = transformation_normal_quantile_grid(model, &design, n, offset)?;
             let conditional_mean = transformation_normal_conditional_mean(&grid_y, &h_grid)?;
+            // Response-scale predictive quantile ladder: `Y|x = h⁻¹(Z|x)` with
+            // `Z ~ N(0,1)`, so the p-quantile of `Y|x` is `h⁻¹(Φ⁻¹(p)|x)`.
+            // Tabulating `h⁻¹` on the fixed z ladder lets the predictor build
+            // genuine response-scale observation bands by interpolating this
+            // matrix — instead of adding standard-normal quantiles to `E[Y|x]`
+            // in latent-normal units, which is wrong by exactly the (unknown to
+            // the predictor) scale of `h⁻¹`.
+            let z_nodes = transformation_normal_band_z_nodes();
+            let quantile_ladder = Array2::from_shape_fn((n, z_nodes.len()), |(i, j)| {
+                invert_transformation_normal_grid(&grid_y, &h_grid, i, z_nodes[j])
+            });
             // The predictor passes the offset through unchanged as `eta` and
             // `mean`, so storing E[Y|x] here yields a y-independent response-scale
             // prediction for both columns on a covariate-only frame.
@@ -784,7 +819,7 @@ fn build_predict_input_for_model_inner(
                 design_noise: None,
                 offset_noise: None,
                 auxiliary_scalar: None,
-                auxiliary_matrix: None,
+                auxiliary_matrix: Some(quantile_ladder),
             })
         }
     }

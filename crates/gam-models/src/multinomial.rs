@@ -1740,6 +1740,58 @@ impl MultinomialSavedModel {
     }
 }
 
+/// On-disk `model_class` discriminator for a persisted multinomial model. Kept
+/// as a single constant so every producer / consumer of the envelope agrees on
+/// the tag without a scattered string literal.
+pub const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
+
+/// Round-trip persistence envelope for a fitted multinomial model. The
+/// `model_class` discriminator lets a loader tell a multinomial payload apart
+/// from the scalar `FittedModel` JSON before deserialising the whole struct.
+///
+/// This is the single definition of the multinomial on-disk format, shared by
+/// the Python FFI (`fit_multinomial_formula` / `predict_multinomial_formula`)
+/// and the `gam` CLI (`gam fit --family multinomial` / `gam predict`), so a
+/// model persisted by one surface loads in the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultinomialModelEnvelope {
+    pub model_class: String,
+    pub saved: MultinomialSavedModel,
+}
+
+impl MultinomialModelEnvelope {
+    /// Wrap a fitted model with the canonical `model_class` tag.
+    pub fn new(saved: MultinomialSavedModel) -> Self {
+        Self {
+            model_class: MULTINOMIAL_MODEL_CLASS.to_string(),
+            saved,
+        }
+    }
+
+    /// Serialize to the canonical JSON byte payload.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, EstimationError> {
+        serde_json::to_vec(self).map_err(|err| {
+            EstimationError::InvalidInput(format!("failed to serialize multinomial model: {err}"))
+        })
+    }
+
+    /// Parse an envelope from JSON bytes, validating the `model_class`
+    /// discriminator so a non-multinomial payload is rejected with a clear
+    /// error rather than silently mis-predicted.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, EstimationError> {
+        let envelope: Self = serde_json::from_slice(bytes).map_err(|err| {
+            EstimationError::InvalidInput(format!("failed to deserialize multinomial model: {err}"))
+        })?;
+        if envelope.model_class != MULTINOMIAL_MODEL_CLASS {
+            return Err(EstimationError::InvalidInput(format!(
+                "multinomial model: model_class = {:?}, expected {MULTINOMIAL_MODEL_CLASS:?}",
+                envelope.model_class
+            )));
+        }
+        Ok(envelope)
+    }
+}
+
 /// One row of the multinomial smooth-significance table (#1101): the Wood
 /// rank-truncated Wald test for one `(active class, smooth term)` pair.
 #[derive(Debug, Clone)]

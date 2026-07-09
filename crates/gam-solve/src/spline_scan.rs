@@ -518,9 +518,11 @@ pub struct SplineScanFit {
     pub knots: Vec<f64>,
     /// Smoothed posterior mean of `f` at each knot.
     pub mean: Vec<f64>,
-    /// Smoothed posterior mean of `f′` at each knot (`0` for order `m = 1`,
-    /// which carries no derivative state).
-    pub deriv: Vec<f64>,
+    /// Smoothed posterior mean of `f′` at each knot, present only for order
+    /// `m ≥ 2`. At `m = 1` the latent process is Brownian motion, which has NO
+    /// pointwise derivative state (it is a.s. nondifferentiable), so this is
+    /// `None` rather than a fabricated zero.
+    pub deriv: Option<Vec<f64>>,
     /// Posterior variance of `f` at each knot (scaled by `sigma2`).
     pub var: Vec<f64>,
     /// Selected (or supplied) log smoothing parameter `log λ`.
@@ -531,11 +533,15 @@ pub struct SplineScanFit {
     /// λ- and data-independent additive constant. Differences across λ are
     /// exact REML criterion differences.
     pub restricted_loglik: f64,
-    /// Raw observation count `n` (pre-pooling; ties collapse to fewer knots).
-    /// The profiled σ² used the restricted residual d.o.f. `n − order`, so this
-    /// is exactly the count needed to recover the Gaussian deviance
-    /// (`σ²·(n − order)`) and the residual d.o.f. for introspection (#1046).
+    /// Raw observation count `n` (pre-pooling; ties collapse to fewer knots),
+    /// retained for the residual d.o.f. `n − order` (#1046).
     pub n_obs: usize,
+    /// Weighted DATA residual sum of squares `Σ wᵢ (yᵢ − f̂(xᵢ))²` at the
+    /// smoothed posterior mean. Stored explicitly because the profiled
+    /// innovations quadratic `σ̂²·(n − order)` is the REML objective's
+    /// quadratic — data residual energy PLUS process/roughness energy at the
+    /// posterior mode — and is therefore NOT the Gaussian deviance.
+    pub data_sse: f64,
     /// Smoothed full states `(f, f′)` per knot.
     smoothed_state: Vec<Vec2>,
     /// Smoothed full state covariances per knot (unit-σ² scale).

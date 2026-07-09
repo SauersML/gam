@@ -286,6 +286,147 @@ fn sae_manifold_description_length<'py>(
     Ok(out.into())
 }
 
+/// Format a float the way Python's `f"{x:g}"` does (default precision 6), so the
+/// per-target dict keys (`bits_at_r2_0.9`, …) are byte-identical to the NumPy
+/// scorer's. Fixed notation for `|x| ∈ [1e-4, 1e6)`, exponential otherwise, with
+/// trailing zeros (and a bare trailing point) stripped.
+fn format_g(x: f64) -> String {
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let strip = |s: String| -> String {
+        if s.contains('.') {
+            let trimmed = s.trim_end_matches('0');
+            trimmed.trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    };
+    let exp = x.abs().log10().floor() as i32;
+    if !(-4..6).contains(&exp) {
+        // Exponential form with 6 significant digits (5 after the point).
+        let s = format!("{x:.5e}");
+        // Rust emits `e-5`/`e0`; Python `%g` emits `e-05`/`e+00`. Normalize.
+        if let Some((mantissa, exp_part)) = s.split_once('e') {
+            let mantissa = strip(mantissa.to_string());
+            let (sign, digits) = match exp_part.strip_prefix('-') {
+                Some(rest) => ('-', rest),
+                None => ('+', exp_part.trim_start_matches('+')),
+            };
+            format!("{mantissa}e{sign}{:0>2}", digits)
+        } else {
+            strip(s)
+        }
+    } else {
+        let precision = (5 - exp).max(0) as usize;
+        strip(format!("{x:.precision$}"))
+    }
+}
+
+/// Eq. 4 fixed-distortion description length of one fitted featurizer.
+///
+/// The single Rust home for the `gamfit._description_length` scorer: it prices a
+/// featurizer's reconstruction of `test_x` at each R² target into support / code
+/// / residual / dictionary bits. Every numeric term (the combinatorial `lgamma`
+/// support cost, the residual covariance eigendecomposition, each atom's SVD
+/// coordinate spectrum, and the joint firing-weighted reverse-water-filling)
+/// lives in `eq4_description_length`; this only marshals the arrays and drives
+/// the Python `atom_contribution` callback that materialises each atom's firing
+/// rows. Returns the same dict shape the NumPy scorer returned (`support_bits`,
+/// `achieved_block_l0`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
+/// `resid_bits_at_r2_{g}` per target, and `native_bits_per_token` when given).
+#[pyfunction]
+#[pyo3(signature = (
+    test_x, recon, gate, code_dims, dictionary_params, atom_contribution,
+    r2_targets = None, native_bits_per_token = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn sae_eq4_description_length<'py>(
+    py: Python<'py>,
+    test_x: PyReadonlyArray2<'py, f64>,
+    recon: PyReadonlyArray2<'py, f64>,
+    gate: PyReadonlyArray2<'py, f64>,
+    code_dims: PyReadonlyArray1<'py, i64>,
+    dictionary_params: i64,
+    atom_contribution: Bound<'py, PyAny>,
+    r2_targets: Option<Vec<f64>>,
+    native_bits_per_token: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let test_x = test_x.as_array();
+    let recon = recon.as_array();
+    let gate = gate.as_array();
+    let code_dims = code_dims.as_array();
+    let code_dims: Vec<i64> = code_dims.iter().copied().collect();
+    let targets = r2_targets.unwrap_or_else(|| vec![0.99, 0.95, 0.90, 0.80]);
+
+    // Captures the real Python exception raised inside the callback so it
+    // propagates with its original type instead of being flattened to a
+    // ValueError; the closure returns the message the core threads back.
+    let callback_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
+    let fetch = |atom: usize, take: &[usize]| -> Result<Array2<f64>, String> {
+        let take_arr = take
+            .iter()
+            .map(|&i| i as i64)
+            .collect::<Vec<i64>>()
+            .into_pyarray(py);
+        let result = atom_contribution.call1((atom, take_arr)).map_err(|e| {
+            let message = e.to_string();
+            *callback_err.borrow_mut() = Some(e);
+            message
+        })?;
+        let array = result.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
+            let message = format!("atom {atom} contribution must be a float64 matrix: {e}");
+            *callback_err.borrow_mut() = Some(e);
+            message
+        })?;
+        Ok(array.as_array().to_owned())
+    };
+
+    let dl = gam::terms::sae::eq4_description_length::eq4_fixed_distortion_description_length(
+        test_x,
+        recon,
+        gate,
+        &code_dims,
+        dictionary_params,
+        &targets,
+        native_bits_per_token,
+        fetch,
+    )
+    .map_err(|message| callback_err.borrow_mut().take().unwrap_or_else(|| py_value_error(message)))?;
+
+    let out = PyDict::new(py);
+    out.set_item("support_bits", dl.support_bits)?;
+    out.set_item("achieved_block_l0", dl.achieved_block_l0)?;
+    for row in &dl.per_target {
+        let suffix = format_g(row.target);
+        out.set_item(format!("bits_at_r2_{suffix}"), row.bits)?;
+        out.set_item(format!("code_bits_at_r2_{suffix}"), row.code_bits)?;
+        out.set_item(format!("resid_bits_at_r2_{suffix}"), row.resid_bits)?;
+    }
+    if let Some(native) = dl.native_bits_per_token {
+        out.set_item("native_bits_per_token", native)?;
+    }
+    Ok(out.into())
+}
+
+/// Joint firing-weighted reverse-water-filling of Gaussian spectra to a fixed
+/// total distortion — the standalone core the Eq. 4 code/residual split uses.
+///
+/// `components` is a sequence of `(weight, spectrum)` pairs; returns one rate
+/// (bits) per component. The whole allocation is owned by
+/// `eq4_description_length::water_fill_component_bits`.
+#[pyfunction]
+fn sae_eq4_water_fill_component_bits(
+    components: Vec<(f64, Vec<f64>)>,
+    total_distortion: f64,
+) -> PyResult<Vec<f64>> {
+    gam::terms::sae::eq4_description_length::water_fill_component_bits(
+        &components,
+        total_distortion,
+    )
+    .map_err(py_value_error)
+}
+
 #[pyfunction]
 fn poincare_project_into_ball<'py>(
     py: Python<'py>,
@@ -5018,6 +5159,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_eq4_water_fill_component_bits, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
@@ -8956,12 +9099,23 @@ fn design_matrix_array_impl(
 
 /// Population variance (divide by `n`, matching numpy `np.var`'s default).
 fn population_variance(values: &[f64]) -> f64 {
-    let n = values.len();
+    population_covariance(values, values)
+}
+
+/// Population covariance (divide by `n`, matching `population_variance`).
+fn population_covariance(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
     if n == 0 {
         return 0.0;
     }
-    let mean = values.iter().sum::<f64>() / n as f64;
-    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64
+    let mean_a = a.iter().sum::<f64>() / n as f64;
+    let mean_b = b.iter().sum::<f64>() / n as f64;
+    a.iter()
+        .zip(b.iter())
+        .map(|(&va, &vb)| (va - mean_a) * (vb - mean_b))
+        .sum::<f64>()
+        / n as f64
 }
 
 /// Per-term partial dependence on a grid table.
@@ -9021,9 +9175,19 @@ fn model_partial_dependence_impl(
     Ok((predicted, se))
 }
 
-/// Per-term variance share: `var(X_t β_t) / var(X β)` for each non-intercept
-/// term block (or a single `term` when supplied). Evaluated on the caller's
-/// grid table; `β` and the term column ranges come from the Rust core.
+/// Per-term variance share: `cov(X_t β_t, X β) / var(X β)` for each
+/// non-intercept term block (or a single `term` when supplied). Evaluated on
+/// the caller's grid table; `β` and the term column ranges come from the Rust
+/// core.
+///
+/// This is a genuine variance decomposition: `var(η) = Σ_t cov(f_t, η)`, so
+/// the shares sum to exactly 1 (the intercept contributes a constant with
+/// zero covariance). Each term's cross-covariance with every other term is
+/// split symmetrically — half to each side — which is the Shapley allocation
+/// for a sum of terms. The naive `var(f_t) / var(η)` it replaces dropped all
+/// cross terms: for `f_1 = x`, `f_2 = -0.9x` it reported shares 100 and 81
+/// against a total of 0.01·var(x). A share can exceed 1 or be negative only
+/// when terms genuinely anticorrelate, which is honest rather than a bug.
 fn model_variance_share_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
@@ -9068,7 +9232,7 @@ fn model_variance_share_impl(
             contrib[i] = s;
         }
         let share = if total_var > 0.0 {
-            population_variance(&contrib) / total_var
+            population_covariance(&contrib, &eta) / total_var
         } else {
             0.0
         };

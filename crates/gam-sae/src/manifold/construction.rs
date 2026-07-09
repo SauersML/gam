@@ -4356,7 +4356,11 @@ impl SaeManifoldTerm {
             }
             total
         };
-        let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
+        let assignment_sparsity = crate::assignment::assignment_prior_value_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        );
         let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
@@ -7413,9 +7417,14 @@ impl SaeManifoldTerm {
             let inv_diag = solver
                 .latent_inverse_diagonal_kept()
                 .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
+            let row_loss_w = self.row_loss_weights.as_deref();
             let mut trace = 0.0_f64;
             for row in 0..self.n_obs() {
                 let row_base = cache.row_offsets[row];
+                // #991 — the softmax prior curvature written to `htt` carries the
+                // row's design weight `w_row` (via the `scale·w_row` the majorizer
+                // sites fold in), so its ρ-trace must carry the SAME `w_row`.
+                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
                 // ∂(scale·D)/∂ρ = scale·D (linear in λ_sparse = eᵖ) — the SAME
                 // operator the assembly and θ-adjoint differentiate.
                 match self.last_row_layout {
@@ -7439,7 +7448,7 @@ impl SaeManifoldTerm {
                         for (j, &atom) in layout.logit_atoms[row].iter().enumerate() {
                             let d_atom =
                                 active_softmax_gershgorin_majorizer_entry(a, atom, m, scale);
-                            trace += inv_diag[row_base + j] * d_atom;
+                            trace += inv_diag[row_base + j] * w_row * d_atom;
                         }
                     }
                     None => {
@@ -7453,14 +7462,18 @@ impl SaeManifoldTerm {
                         let q = cache.row_dims[row];
                         let logit_dim = assignment_dim.min(q);
                         for atom in 0..logit_dim {
-                            trace += inv_diag[row_base + atom] * d[atom];
+                            trace += inv_diag[row_base + atom] * w_row * d[atom];
                         }
                     }
                 }
             }
             return Ok(0.5 * trace);
         }
-        let mut hdiag = assignment_prior_log_strength_hdiag(&self.assignment, rho)?;
+        let mut hdiag = crate::assignment::assignment_prior_log_strength_hdiag_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        )?;
         if hdiag.is_empty() {
             return Ok(0.0);
         }
@@ -8610,7 +8623,11 @@ impl SaeManifoldTerm {
         let mut beta = Array1::<f64>::zeros(cache.k);
         if j == 0 {
             let assignment_grad =
-                assignment_prior_log_strength_target_mixed(&self.assignment, rho)?;
+                crate::assignment::assignment_prior_log_strength_target_mixed_weighted(
+                    &self.assignment,
+                    rho,
+                    self.row_loss_weights.as_deref(),
+                )?;
             let k_atoms = self.k_atoms();
             let assignment_dim = self.assignment.assignment_coord_dim();
             for row in 0..self.n_obs() {

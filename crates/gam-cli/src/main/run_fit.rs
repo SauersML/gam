@@ -188,6 +188,14 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         };
         return run_survival(surv_args);
     }
+    // Multinomial is a softmax multi-output family (categorical response, K-1
+    // active-class linear predictors): it owns its own dataset load (with the
+    // response forced to a factor) and persistence envelope, so dispatch it
+    // before the scalar-response standard path. The stale note below about "the
+    // CLI has no multinomial family" no longer holds for this early return.
+    if matches!(args.family, FamilyArg::Multinomial) {
+        return run_fit_multinomial(&args, &parsed, &formula_text, &fit_config);
+    }
     let requested_columns = required_columns_for_fit(&args, &parsed)?;
     // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
     // encoding even when their labels are numeric. An untyped CSV cannot carry
@@ -1729,6 +1737,7 @@ pub(crate) fn family_arg_name(arg: FamilyArg) -> &'static str {
         FamilyArg::RoystonParmar => "royston-parmar",
         FamilyArg::TransformationNormal => "transformation-normal",
         FamilyArg::Expectile => "expectile",
+        FamilyArg::Multinomial => "multinomial",
     }
 }
 

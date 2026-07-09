@@ -250,8 +250,19 @@ impl SaeManifoldTerm {
             .iter()
             .map(|&l| l * penalty_scale)
             .collect();
+        // #991 — the softmax/JumpReLU assignment prior's per-(row, atom) gradient
+        // (and, for JumpReLU/IBP, its curvature diagonal) is design-weighted by
+        // `w_i` here so `gt`/`htt` estimate the same target as the `√w`-weighted
+        // data likelihood. The softmax curvature written to `htt` below is the
+        // per-row Gershgorin/`row_psd_majorizer` block, weighted by folding
+        // `w_row` into its `scale` at each site (no double application on the
+        // gradient, which is already weighted here).
         let (assignment_grad, assignment_hdiag) =
-            assignment_prior_grad_hdiag(&self.assignment, rho)?;
+            crate::assignment::assignment_prior_grad_hdiag_weighted(
+                &self.assignment,
+                rho,
+                self.row_loss_weights.as_deref(),
+            )?;
 
         // #1038 softmax entropy: the exact per-row Hessian in logits is dense
         // (`H_kj = (λ/τ²) a_k[δ_kj(m−L_k−1)+a_j(L_k+L_j+1−2m)]`), not just the
@@ -1252,12 +1263,18 @@ impl SaeManifoldTerm {
                             let majorizer_log_mean: Option<f64> = softmax_dense
                                 .as_ref()
                                 .map(|_| softmax_majorizer_log_mean(assignments_slice));
+                            // #991 — the softmax majorizer curvature is a per-row
+                            // BLOCK (not sourced from the design-weighted
+                            // `assignment_hdiag` array), so fold this row's design
+                            // weight into its `scale` here; `gt` uses the already
+                            // `w`-weighted `assignment_grad`, so it is not touched.
+                            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
                             for (j, &k) in active.iter().enumerate() {
                                 block.gt[j] += assignment_grad[assignment_base + k];
                                 match (softmax_dense.as_ref(), majorizer_log_mean) {
                                     (Some((_penalty, scale)), Some(m)) => {
-                                        block.htt[[j, j]] +=
-                                            active_softmax_gershgorin_majorizer_entry(
+                                        block.htt[[j, j]] += w_row
+                                            * active_softmax_gershgorin_majorizer_entry(
                                                 assignments_slice,
                                                 k,
                                                 m,
@@ -1316,7 +1333,13 @@ impl SaeManifoldTerm {
                                 let row_logits: Vec<f64> = (0..k_atoms)
                                     .map(|k| self.assignment.logits[[row, k]])
                                     .collect();
-                                let h_dense = penalty.row_psd_majorizer(&row_logits, *scale);
+                                // #991 — fold this row's design weight into the
+                                // majorizer strength (the block is not sourced from
+                                // the weighted `assignment_hdiag`); the θ-adjoint at
+                                // `row_psd_majorizer_logit_derivative` carries the
+                                // same `w_row` so value and adjoint stay on one branch.
+                                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+                                let h_dense = penalty.row_psd_majorizer(&row_logits, *scale * w_row);
                                 for ki in 0..assignment_dim {
                                     for kj in 0..assignment_dim {
                                         block.htt[[ki, kj]] += h_dense[[ki, kj]];

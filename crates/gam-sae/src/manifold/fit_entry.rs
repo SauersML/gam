@@ -411,10 +411,25 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
                 });
             // #2138 — same shared cancel flag; each pass's objective polls it.
             objective.set_cancel_flag(Arc::clone(&cancel_flag));
-            problem
-                .run(&mut objective, "SAE manifold (structured)")
-                .map(|_| ())
-                .map_err(|e| e.to_string())?;
+            // SPEC 20 — same discipline as the primary path above: a fit is
+            // minted only from a CONVERGED outer run. Non-convergence is a
+            // typed error and the wall-survival checkpoint is left in place
+            // for resume (`remove_checkpoint` below is only reached on the
+            // converged path).
+            match problem.run(&mut objective, "SAE manifold (structured)") {
+                Ok(result) if result.converged => {}
+                Ok(result) => {
+                    return Err(format!(
+                        "SAE manifold structured-residual pass {} exhausted its solver \
+                         without a stationarity certificate (iterations={}, \
+                         final_value={:.6e}); refusing to mint a fit",
+                        pass + 1,
+                        result.iterations,
+                        result.final_value,
+                    ));
+                }
+                Err(err) => return Err(err.to_string()),
+            }
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;

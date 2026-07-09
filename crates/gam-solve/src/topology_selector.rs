@@ -73,6 +73,11 @@ pub enum AutoTopologyKind {
     Sphere,
     Torus,
     Cylinder,
+    /// Möbius band (#2240): the unique non-orientable smooth `d = 2`
+    /// candidate. Genuinely non-homotopic to the torus / cylinder / sphere /
+    /// patch, so it races as its own discrete candidate — no curvature fusion
+    /// applies to it.
+    Mobius,
     /// Constant-curvature space form `M_κ` with the sectional curvature κ
     /// ESTIMATED (#944 stage 4). This single candidate replaces the family of
     /// fixed simply-connected constant-curvature geometries — `Euclidean`
@@ -112,6 +117,7 @@ impl AutoTopologyKind {
             AutoTopologyKind::Sphere => "sphere",
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
+            AutoTopologyKind::Mobius => "mobius",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
             AutoTopologyKind::Union { structure } => structure.as_str(),

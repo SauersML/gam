@@ -9,6 +9,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // diagnostics land, this path can route based on explicit flags.
     // (`args.alo` is intentionally ignored until other diagnostics land.)
 
+    reject_multinomial_model(&args.model, "diagnose")?;
     let model = SavedModel::load_from_path(&args.model)?;
     let parsed = parse_formula(&model.formula)?;
     // Survival / location-scale / marginal-slope models don't have a single

@@ -1018,11 +1018,17 @@ class Model:
         data: Any,
         term: str | None = None,
     ) -> dict[str, float] | float:
-        """Term-wise variance decomposition ``var(X_t β_t) / var(X β)``.
+        """Term-wise variance decomposition ``cov(X_t β_t, X β) / var(X β)``.
 
         Computed by the Rust core (``model_variance_share``) on the rows of
-        ``data``; the intercept is excluded. Returns ``{term: fraction}`` for
-        every non-intercept term, or the scalar fraction when ``term`` is given.
+        ``data``; the intercept is excluded. Cross-covariances between terms
+        are split symmetrically (the Shapley allocation for a sum of terms),
+        so the shares of all non-intercept terms sum to exactly 1 — unlike a
+        naive ``var(f_t)/var(η)`` ratio, which drops every covariance term
+        and need not sum to anything meaningful. A share can be negative (or
+        exceed 1) when a term genuinely anticorrelates with the rest of the
+        predictor. Returns ``{term: share}`` for every non-intercept term, or
+        the scalar share when ``term`` is given.
         """
         headers, data_rows, _ = normalize_table(data)
         rows = [[str(v) for v in row] for row in data_rows]

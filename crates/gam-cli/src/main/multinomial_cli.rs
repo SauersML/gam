@@ -1,15 +1,10 @@
 use super::*;
 
 use gam::families::multinomial::{
-    MultinomialSavedModel, fit_penalized_multinomial_formula, predict_multinomial_formula,
+    MULTINOMIAL_MODEL_CLASS, MultinomialModelEnvelope, MultinomialSavedModel,
+    fit_penalized_multinomial_formula, predict_multinomial_formula,
     predict_multinomial_formula_with_se,
 };
-
-/// `model_class` discriminator written into every persisted multinomial model
-/// file. Shared verbatim with the Python FFI envelope (see
-/// `latent_basis_and_sae_ffi.rs`) so a model fit by the CLI loads in the Python
-/// surface and vice versa.
-pub(crate) const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
 
 /// Initial uniform smoothing parameter and inner-Newton controls for the
 /// multinomial REML/LAML fit. These mirror the
@@ -19,16 +14,6 @@ pub(crate) const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
 const MULTINOMIAL_INIT_LAMBDA: f64 = 1.0;
 const MULTINOMIAL_MAX_ITER: usize = 50;
 const MULTINOMIAL_TOL: f64 = 1.0e-7;
-
-/// On-disk envelope for a persisted multinomial model. Byte-identical in shape
-/// to the Python FFI's `MultinomialModelEnvelope`: the `model_class`
-/// discriminator lets every model-loading command tell a multinomial payload
-/// apart from a scalar `SavedModel` without a speculative deserialize.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct MultinomialModelEnvelope {
-    pub(crate) model_class: String,
-    pub(crate) saved: MultinomialSavedModel,
-}
 
 /// Peek a model file's JSON discriminator to detect a persisted multinomial
 /// envelope before committing to a full `SavedModel` deserialize. Returns
@@ -61,20 +46,17 @@ pub(crate) fn reject_multinomial_model(path: &Path, command: &str) -> Result<(),
 }
 
 fn load_multinomial_model(path: &Path) -> Result<MultinomialSavedModel, String> {
-    let text = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read multinomial model '{}': {e}", path.display()))?;
-    let envelope: MultinomialModelEnvelope = serde_json::from_str(&text)
+    let envelope = MultinomialModelEnvelope::from_json_bytes(&bytes)
         .map_err(|e| format!("failed to parse multinomial model '{}': {e}", path.display()))?;
     Ok(envelope.saved)
 }
 
 fn write_multinomial_model(path: &Path, saved: MultinomialSavedModel) -> Result<(), String> {
-    let envelope = MultinomialModelEnvelope {
-        model_class: MULTINOMIAL_MODEL_CLASS.to_string(),
-        saved,
-    };
-    let bytes = serde_json::to_vec(&envelope)
-        .map_err(|e| format!("failed to serialize multinomial model: {e}"))?;
+    let bytes = MultinomialModelEnvelope::new(saved)
+        .to_json_bytes()
+        .map_err(|e| e.to_string())?;
     std::fs::write(path, bytes)
         .map_err(|e| format!("failed to write multinomial model '{}': {e}", path.display()))?;
     cli_out!("saved model: {}", path.display());

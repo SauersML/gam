@@ -307,7 +307,8 @@ where
         / std::f64::consts::LN_2;
 
     // Residual covariance spectrum and the reference variance the targets scale.
-    let residual = &test_x.to_owned() - &recon;
+    let mut residual = test_x.to_owned();
+    residual -= &recon;
     let residual_covariance_eigenvalues = covariance_eigenvalues(residual.view())?;
     let centered_x = column_centered(test_x);
     // reference_variance = mean(centered²)·d = Σ centered² / N.

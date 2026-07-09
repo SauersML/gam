@@ -16,6 +16,10 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
         FamilyArg::RoystonParmar => Some("royston-parmar"),
         FamilyArg::TransformationNormal => Some("transformation-normal"),
         FamilyArg::Expectile => Some("expectile"),
+        // Dispatched by `run_fit` before the canonical family resolver (the
+        // multinomial artifact is a softmax multi-output model, not a scalar
+        // GLM), so this canonical name is used only for display/config echoing.
+        FamilyArg::Multinomial => Some("multinomial"),
     }
 }
 

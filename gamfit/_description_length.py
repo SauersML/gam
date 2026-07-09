@@ -8,11 +8,12 @@ an installed wheel.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
+
+from ._binding import rust_module
 
 
 @dataclass
@@ -59,54 +60,15 @@ class FittedFeaturizer:
 def _water_fill_component_bits(
     components: list[tuple[float, np.ndarray]], total_distortion: float
 ) -> list[float]:
-    """Allocate total distortion across weighted Gaussian spectra."""
+    """Allocate total distortion across weighted Gaussian spectra (Rust core)."""
 
-    if not math.isfinite(total_distortion) or total_distortion <= 0.0:
-        raise ValueError(
-            f"total distortion must be finite and positive, got {total_distortion}"
-        )
-    spectra: list[tuple[float, np.ndarray]] = []
-    total_variance = 0.0
-    max_variance = 0.0
-    for weight, spectrum in components:
-        if not math.isfinite(weight) or weight < 0.0:
-            raise ValueError(f"component weight must be finite and nonnegative, got {weight}")
-        variances = np.maximum(np.asarray(spectrum, dtype=float), 0.0)
-        if not np.all(np.isfinite(variances)):
-            raise ValueError("component spectrum must contain only finite values")
-        spectra.append((weight, variances))
-        total_variance += weight * float(np.sum(variances))
-        if variances.size:
-            max_variance = max(max_variance, float(np.max(variances)))
-    if total_distortion >= total_variance or max_variance == 0.0:
-        return [0.0] * len(spectra)
-
-    low, high = 0.0, max_variance
-    for _ in range(200):
-        water_level = 0.5 * (low + high)
-        allocated = sum(
-            weight * float(np.sum(np.minimum(variances, water_level)))
-            for weight, variances in spectra
-        )
-        if allocated > total_distortion:
-            high = water_level
-        else:
-            low = water_level
-    water_level = 0.5 * (low + high)
-    rates: list[float] = []
-    for weight, variances in spectra:
-        active = variances > water_level
-        rates.append(
-            weight
-            * float(np.sum(0.5 * np.log2(variances[active] / water_level)))
-        )
-    return rates
-
-
-def _covariance_eigenvalues(values: np.ndarray) -> np.ndarray:
-    centered = values - values.mean(axis=0, keepdims=True)
-    covariance = centered.T @ centered / max(values.shape[0] - 1, 1)
-    return np.linalg.eigvalsh(covariance)
+    coerced = [
+        (float(weight), np.asarray(spectrum, dtype=np.float64).ravel().tolist())
+        for weight, spectrum in components
+    ]
+    return list(
+        rust_module().sae_eq4_water_fill_component_bits(coerced, float(total_distortion))
+    )
 
 
 def description_length(
@@ -115,99 +77,42 @@ def description_length(
     *,
     r2_targets: tuple[float, ...] = (0.99, 0.95, 0.90, 0.80),
 ) -> dict[str, Any]:
-    """Score support, code, residual, and dictionary bits at fixed R-squared."""
+    """Score support, code, residual, and dictionary bits at fixed R-squared.
 
-    test_x = np.asarray(test_x, dtype=float)
-    if test_x.ndim != 2:
-        raise ValueError(f"test_x must be a matrix, got shape {test_x.shape}")
-    if test_x.shape != fitted.recon.shape:
-        raise ValueError(
-            f"test_x and recon must have the same shape, got {test_x.shape} "
-            f"and {fitted.recon.shape}"
-        )
-    if test_x.shape[0] == 0 or test_x.shape[1] == 0:
-        raise ValueError("test_x must contain at least one row and one column")
-    if not np.all(np.isfinite(test_x)) or not np.all(np.isfinite(fitted.recon)):
-        raise ValueError("test_x and recon must contain only finite values")
-    if not np.all(np.isfinite(fitted.gate)):
-        raise ValueError("gate must contain only finite values")
-    if not r2_targets:
-        raise ValueError("r2_targets must not be empty")
-    if any(
-        not math.isfinite(target) or not 0.0 <= target < 1.0
-        for target in r2_targets
-    ):
-        raise ValueError("every R-squared target must be finite and in [0, 1)")
+    Every numeric term (the combinatorial ``lgamma`` support cost, the residual
+    covariance eigendecomposition, each atom's SVD coordinate spectrum, and the
+    joint firing-weighted reverse-water-filling) lives in the Rust
+    ``sae_eq4_description_length`` core; this only coerces the arrays to the
+    core's dtypes and adapts ``atom_contribution`` into the row-fetch callback
+    the core drives (one atom at a time, so a lazy contribution still only
+    materialises the sampled firing rows).
+    """
 
-    n, d = test_x.shape
-    gate_active = fitted.gate > 1e-10
-    p_g = gate_active.mean(axis=0)
-    l0 = float(gate_active.sum(axis=1).mean())
-    n_atoms = fitted.gate.shape[1]
-    support_cardinality = min(max(round(l0), 0), n_atoms)
-    support_bits = (
-        math.lgamma(n_atoms + 1)
-        - math.lgamma(support_cardinality + 1)
-        - math.lgamma(n_atoms - support_cardinality + 1)
-    ) / math.log(2.0)
+    test_x = np.ascontiguousarray(np.asarray(test_x, dtype=np.float64))
+    recon = np.ascontiguousarray(np.asarray(fitted.recon, dtype=np.float64))
+    gate = np.ascontiguousarray(np.asarray(fitted.gate, dtype=np.float64))
+    code_dims = np.ascontiguousarray(np.asarray(fitted.code_dims, dtype=np.int64))
 
-    residual = test_x - fitted.recon
-    residual_covariance_eigenvalues = _covariance_eigenvalues(residual)
-    centered_x = test_x - test_x.mean(axis=0, keepdims=True)
-    reference_variance = float(np.mean(centered_x * centered_x) * d)
-    if reference_variance <= 0.0:
-        raise ValueError("test_x must have positive variance")
-
-    code_spectra: list[np.ndarray] = []
-    for atom in range(n_atoms):
-        code_dim = int(fitted.code_dims[atom])
-        rows = np.flatnonzero(gate_active[:, atom])
-        if rows.size < max(code_dim + 1, 4):
-            code_spectra.append(np.zeros(code_dim))
-            continue
-        take = rows if rows.size <= 4096 else rows[:: max(rows.size // 4096, 1)]
-        contribution = np.asarray(fitted.atom_contribution(atom)[take], dtype=float)
-        if contribution.shape != (take.size, d):
-            raise ValueError(
-                f"atom {atom} contribution has shape {contribution.shape}; "
-                f"expected {(take.size, d)}"
-            )
-        if not np.all(np.isfinite(contribution)):
-            raise ValueError(f"atom {atom} contribution contains non-finite values")
-        singular_values = np.linalg.svd(
-            contribution - contribution.mean(axis=0, keepdims=True),
-            compute_uv=False,
-        )
-        code_spectra.append(
-            singular_values[:code_dim] ** 2 / max(take.size - 1, 1)
+    def _fetch(atom: int, take: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(
+            np.asarray(fitted.atom_contribution(atom)[take], dtype=np.float64)
         )
 
-    out: dict[str, Any] = {
-        "support_bits": float(support_bits),
-        "achieved_block_l0": l0,
-    }
-    for target in r2_targets:
-        total_distortion = (1.0 - target) * reference_variance
-        component_bits = _water_fill_component_bits(
-            [
-                (float(probability), spectrum)
-                for probability, spectrum in zip(p_g, code_spectra, strict=True)
-            ]
-            + [(1.0, residual_covariance_eigenvalues)],
-            total_distortion,
-        )
-        code_bits = float(sum(component_bits[:-1]))
-        residual_bits = component_bits[-1]
-        dictionary_bits = 0.5 * fitted.dictionary_params / n * math.log2(max(n, 2))
-        suffix = f"{target:g}"
-        out[f"bits_at_r2_{suffix}"] = (
-            support_bits + code_bits + residual_bits + dictionary_bits
-        )
-        out[f"code_bits_at_r2_{suffix}"] = code_bits
-        out[f"resid_bits_at_r2_{suffix}"] = residual_bits
-    if fitted.native_bits_per_token is not None:
-        out["native_bits_per_token"] = fitted.native_bits_per_token
-    return out
+    native = (
+        None
+        if fitted.native_bits_per_token is None
+        else float(fitted.native_bits_per_token)
+    )
+    return rust_module().sae_eq4_description_length(
+        test_x,
+        recon,
+        gate,
+        code_dims,
+        int(fitted.dictionary_params),
+        _fetch,
+        r2_targets=[float(target) for target in r2_targets],
+        native_bits_per_token=native,
+    )
 
 
 __all__ = ["FittedFeaturizer", "description_length"]

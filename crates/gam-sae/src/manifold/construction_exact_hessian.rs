@@ -341,10 +341,13 @@ impl SaeManifoldTerm {
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
-        explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
-            + self
-                .learnable_ibp_forward_alpha_data_derivative(rho, target)
-                .map_err(OuterGradientError::internal)?;
+        explicit[0] = crate::assignment::assignment_prior_log_strength_derivative_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        ) + self
+            .learnable_ibp_forward_alpha_data_derivative(rho, target)
+            .map_err(OuterGradientError::internal)?;
         // #1417: the FULL `½ tr(H⁻¹ ∂H/∂logα)` for the assignment coordinate.
         // For LEARNABLE IBP alpha the forward assignments `a_ik = σ(ℓ/τ)·π_k(α)`
         // carry an explicit α-dependence (`∂logπ_k/∂logα = k/(α+1)`), so BOTH the

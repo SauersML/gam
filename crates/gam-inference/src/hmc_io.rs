@@ -771,7 +771,8 @@ impl NutsPosterior {
 
         let mut firth_logdet = 0.0;
         if self.firth_enabled {
-            match firth_jeffreys_logp_and_grad(self.nuts_family, &self.data, &eta) {
+            match firth_jeffreys_logp_and_grad(&self.nuts_family.likelihood_spec(), &self.data, &eta)
+            {
                 Ok((value, grad_beta_firth)) => {
                     firth_logdet = value;
                     grad_ll_beta += &grad_beta_firth;
@@ -949,8 +950,14 @@ fn validate_binary_responses(
 /// HMC uses the same `FirthDenseOperator` as the REML exact-gradient path.
 /// The operator owns the reduced identifiable Fisher factorization, the
 /// Jeffreys log-determinant, and the analytic β-gradient.
+///
+/// Takes the full `LikelihoodSpec` — not a `NutsFamily` — because the
+/// Jeffreys determinant is built from the *inverse link's* Fisher-weight
+/// jet: at η = 0 the logit weight is 1/4 while probit's is 2/π, so
+/// collapsing every binomial link to logit produces the wrong determinant
+/// and gradient for probit / cloglog / adaptive (SAS, mixture) links.
 fn firth_jeffreys_logp_and_grad(
-    family: NutsFamily,
+    likelihood: &LikelihoodSpec,
     data: &SharedData,
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), HmcError> {
@@ -966,19 +973,17 @@ fn firth_jeffreys_logp_and_grad(
     if data.dim == 0 || data.n_samples == 0 {
         return Ok((0.0, Array1::zeros(data.dim)));
     }
-    validate_firth_support(family, true)?;
+    validate_firth_likelihood_support(likelihood, true)?;
     if data.weights.iter().all(|w| *w == 0.0) {
         return Ok((0.0, Array1::zeros(data.dim)));
     }
 
     let jeffreys_link =
-        likelihood_spec_jeffreys_link(&family.likelihood_spec()).ok_or_else(|| {
-            HmcError::FirthUnsupported {
-                reason: format!(
-                    "Firth Jeffreys term has no Fisher-weight jet for {}",
-                    family.likelihood_spec().pretty_name()
-                ),
-            }
+        likelihood_spec_jeffreys_link(likelihood).ok_or_else(|| HmcError::FirthUnsupported {
+            reason: format!(
+                "Firth Jeffreys term has no Fisher-weight jet for {}",
+                likelihood.pretty_name()
+            ),
         })?;
     let op = if data.weights.iter().all(|&w| w == 1.0) {
         FirthDenseOperator::build_for_link(&jeffreys_link, data.x.as_ref(), eta)
@@ -7091,7 +7096,12 @@ impl JointBetaRhoPosterior {
 
         let mut firth_logdet = 0.0;
         if self.firth_enabled {
-            match firth_jeffreys_logp_and_grad(NutsFamily::BinomialLogit, &self.data, &eta) {
+            // The Jeffreys determinant must use the *sampled* inverse link's
+            // Fisher-weight jet — the same `step_likelihood` (with the current
+            // adaptive link parameters) the log-likelihood above was evaluated
+            // under. Hard-coding logit gave probit/cloglog/SAS/mixture targets
+            // the wrong determinant and gradient (finding 19, #2245).
+            match firth_jeffreys_logp_and_grad(&step_likelihood, &self.data, &eta) {
                 Ok((value, grad_beta_firth)) => {
                     firth_logdet = value;
                     grad_ll_beta += &grad_beta_firth;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::input::{TRANSFORMATION_NORMAL_BAND_Z_MAX, TRANSFORMATION_NORMAL_BAND_Z_NODES};
 
 /// Predictor for transformation-normal (CTM) models.
 ///
@@ -8,48 +9,62 @@ use super::*;
 /// alone, so prediction is covariate-only and does not require the outcome
 /// column. This predictor passes the precomputed value through unchanged as both
 /// the linear predictor and the mean: eta = mean = E[Y|x].
+///
+/// ## Uncertainty contract
+///
+/// * **Epistemic (coefficient) uncertainty is reported as unavailable, never
+///   as zero.** Propagating `Cov(β)` into `E[Y|x]` requires the Jacobian of
+///   the inverse transform `∂h⁻¹/∂β`, which needs the I-spline basis partials
+///   that are not part of the persisted quantile grid. A zero SE claims exact
+///   knowledge of `E[Y|x]` the posterior does not have, so the point paths
+///   return `None` SEs and `predict_full_uncertainty` errors instead of
+///   emitting zero-width intervals.
+/// * **Observation (predictive) intervals are exact response-scale quantiles.**
+///   The CTM predictive is `Y|x = h⁻¹(Z|x)` with `Z ~ N(0,1)`, so the
+///   `p`-quantile of `Y|x` is `h⁻¹(Φ⁻¹(p)|x)`. The input builder tabulates
+///   `h⁻¹` on a fixed latent-z ladder (`PredictInput::auxiliary_matrix`);
+///   the band interpolates that ladder. Adding standard-normal quantiles to
+///   `E[Y|x]` directly would be off by exactly the (row-dependent) scale of
+///   `h⁻¹` — for `h(y) = 10·y` the true 95% band is `±0.196`, not `±1.96`.
 pub struct TransformationNormalPredictor {
     pub covariance: Option<Array2<f64>>,
+}
+
+/// Interpolate one row of the tabulated response-quantile ladder
+/// `Q[j] = h⁻¹(z_j | x)` at an arbitrary latent value `z`. The ladder nodes are
+/// the fixed even grid from `transformation_normal_band_z_nodes`; values beyond
+/// the ladder clamp to the outermost tabulated quantile (the same endpoint
+/// clamping the grid inversion itself applies at the response support).
+fn ladder_quantile(ladder_row: ndarray::ArrayView1<'_, f64>, z: f64) -> f64 {
+    let m = ladder_row.len();
+    debug_assert_eq!(m, TRANSFORMATION_NORMAL_BAND_Z_NODES);
+    let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
+    let t = ((z + z_max) / (2.0 * z_max)) * ((m - 1) as f64);
+    if t <= 0.0 {
+        return ladder_row[0];
+    }
+    if t >= (m - 1) as f64 {
+        return ladder_row[m - 1];
+    }
+    let j = t.floor() as usize;
+    let frac = t - j as f64;
+    ladder_row[j] + frac * (ladder_row[j + 1] - ladder_row[j])
 }
 
 impl PredictionTransform for TransformationNormalPredictor {
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
         // The offset carries the precomputed response-scale conditional mean
-        // `E[Y|x]`; the standard error is zero (the η endpoints coincide with the
-        // offset), so the engine's identity-η path reproduces
-        // `eta = mean = bounds = E[Y|x]`. The zero SEs make the posterior-mean
-        // bounds collapse onto the point; whether bounds are produced at all is
-        // gated upstream by fit covariance.
+        // `E[Y|x]`. No covariance-propagated SE exists for this quantity (see
+        // the struct-level uncertainty contract), so the SEs are `None` —
+        // reporting zero would claim certainty the posterior does not have.
         let h = input.offset.clone();
-        let zeros = Array1::zeros(h.len());
         Ok(LinearState {
             eta: h.clone(),
             mean: h,
-            eta_se: Some(zeros.clone()),
-            mean_se: Some(zeros),
+            eta_se: None,
+            mean_se: None,
             covariance_corrected_used: false,
         })
-    }
-
-    fn linear_state(
-        &self,
-        input: &PredictInput,
-        fit: &UnifiedFitResult,
-        pass: PredictPass,
-        covariance_mode: InferenceCovarianceMode,
-    ) -> Result<LinearState, EstimationError> {
-        // Both passes share the same identity state (η = mean = h, zero SE). The
-        // provenance flag reflects whether the requested covariance mode would
-        // resolve to the smoothing-corrected covariance: corrected is used iff
-        // the caller asked for it and the fit carries it.
-        let mut state = self.point_state(input)?;
-        if matches!(pass, PredictPass::FullUncertainty) {
-            let corrected_requested =
-                !matches!(covariance_mode, InferenceCovarianceMode::Conditional);
-            state.covariance_corrected_used =
-                corrected_requested && fit.covariance_corrected.is_some();
-        }
-        Ok(state)
     }
 
     fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -65,8 +80,10 @@ impl PredictionTransform for TransformationNormalPredictor {
     }
 
     fn response_family(&self) -> ResponseFamily {
-        // The transformed scale `h(y)` is modelled as Gaussian; the identity-η
-        // observation band uses the residual SD.
+        // Only the *latent* `h(y)` is Gaussian. The generic family observation
+        // band must never be built from this (its σ lives in latent units);
+        // the predictor supplies its own response-scale band from the
+        // quantile ladder in `predict_posterior_mean`.
         ResponseFamily::Gaussian
     }
 }
@@ -96,31 +113,71 @@ impl PredictableModel for TransformationNormalPredictor {
 
     fn predict_full_uncertainty(
         &self,
-        input: &PredictInput,
-        fit: &UnifiedFitResult,
-        options: &PredictUncertaintyOptions,
+        _input: &PredictInput,
+        _fit: &UnifiedFitResult,
+        _options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        predict_full_uncertainty_generic(self, input, fit, options)
+        Err(EstimationError::InvalidInput(
+            "transformation-normal models cannot report coefficient-uncertainty intervals: \
+             propagating the coefficient covariance through the inverse transform h⁻¹ requires \
+             the I-spline basis Jacobian, which is not part of the persisted quantile grid. \
+             Use predict_posterior_mean for the point E[Y|x] and its response-scale \
+             observation (predictive) interval."
+                .to_string(),
+        ))
     }
 
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        fit: &UnifiedFitResult,
+        _fit: &UnifiedFitResult,
         options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        // Bounds are only defined once a fit covariance exists; the SE is zero,
-        // so the engine's identity-η path collapses the bounds onto `h`.
-        let has_fit_covariance =
-            fit.covariance_corrected.is_some() || fit.covariance_conditional.is_some();
-        let bound_level = has_fit_covariance
-            .then_some(options.confidence_level)
-            .flatten();
-        let bounded_options = PosteriorMeanOptions {
-            confidence_level: bound_level,
-            ..*options
+        let h = input.offset.clone();
+        let n = h.len();
+        let mut result = PredictPosteriorMeanResult {
+            eta: h.clone(),
+            // The result struct requires an SE array; epistemic uncertainty is
+            // unavailable (see the struct-level contract), so no credible
+            // bounds or mean SE are emitted below and this array is inert.
+            eta_standard_error: Array1::zeros(n),
+            mean: h,
+            mean_standard_error: None,
+            mean_lower: None,
+            mean_upper: None,
+            observation_lower: None,
+            observation_upper: None,
         };
-        predict_posterior_mean_generic(self, input, fit, &bounded_options)
+        if options.include_observation_interval
+            && let Some(level) = options.confidence_level
+        {
+            let z = crate::interval_policy::validated_central_z(level)?;
+            let ladder = input.auxiliary_matrix.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "transformation-normal prediction input is missing the response-scale \
+                     quantile ladder (auxiliary_matrix)"
+                        .to_string(),
+                )
+            })?;
+            if ladder.nrows() != n || ladder.ncols() != TRANSFORMATION_NORMAL_BAND_Z_NODES {
+                return Err(EstimationError::InvalidInput(format!(
+                    "transformation-normal quantile ladder shape mismatch: expected {}x{}, got {}x{}",
+                    n,
+                    TRANSFORMATION_NORMAL_BAND_Z_NODES,
+                    ladder.nrows(),
+                    ladder.ncols()
+                )));
+            }
+            // Equal-tailed response-scale predictive band: the p-quantile of
+            // `Y|x = h⁻¹(Z|x)` is `h⁻¹(Φ⁻¹(p)|x)`, interpolated from the
+            // tabulated ladder. `h⁻¹` is monotone increasing, so the band is
+            // ordered by construction.
+            let lower = Array1::from_shape_fn(n, |i| ladder_quantile(ladder.row(i), -z));
+            let upper = Array1::from_shape_fn(n, |i| ladder_quantile(ladder.row(i), z));
+            result.observation_lower = Some(lower);
+            result.observation_upper = Some(upper);
+        }
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {

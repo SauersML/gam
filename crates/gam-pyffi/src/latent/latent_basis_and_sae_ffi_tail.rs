@@ -1380,21 +1380,9 @@ fn steer_delta_from_arrays(
     // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = atom_basis.len();
-    if n_obs == 0 || p_out == 0 {
-        return Err(py_value_error(format!(
-            "sae_steer_delta: n_obs and p_out must be positive; got ({n_obs}, {p_out})"
-        )));
-    }
-    if k_atoms == 0 {
-        return Err(py_value_error(
-            "sae_steer_delta: atom_basis must be non-empty".into(),
-        ));
-    }
-    if atom_k >= k_atoms {
-        return Err(py_value_error(format!(
-            "sae_steer_delta: atom_k={atom_k} out of range for K={k_atoms} atoms"
-        )));
-    }
+    // Guard the per-atom metadata lengths before indexing them into the atom
+    // specs below; every other precondition (positive dims, atom_k range, coord /
+    // logit shapes, positive alpha/tau) is validated inside the engine entry.
     if atom_dim.len() != k_atoms
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
@@ -1406,288 +1394,100 @@ fn steer_delta_from_arrays(
             "sae_steer_delta: per-atom metadata lengths must equal K={k_atoms}"
         )));
     }
-    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
-        .iter()
-        .map(|kind| sae_atom_basis_kind_from_str(kind))
-        .collect();
-
-    // Build the per-atom plans (latent dim / basis size / centers), reusing the
-    // exact rebuild path `sae_manifold_predict_oos` uses so the rebuilt design
-    // matches the trained one.
-    let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        let kind = basis_kinds[atom_idx].clone();
-        let d = atom_dim[atom_idx];
-        match kind {
-            SaeAtomBasisKind::Periodic => {
-                let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
-                let basis_size = sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?;
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Periodic,
-                    latent_dim: 1,
-                    n_harmonics,
-                    duchon_centers: None,
-                    basis_size,
-                });
-            }
-            SaeAtomBasisKind::Sphere => {
-                if d != 2 {
-                    return Err(py_value_error(format!(
-                        "sae_steer_delta: atom {atom_idx} basis 'sphere' requires atom_dim == 2, got {d}"
-                    )));
-                }
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Sphere,
-                    latent_dim: 2,
-                    n_harmonics: 0,
-                    duchon_centers: None,
-                    basis_size: SAE_SPHERE_BASIS_SIZE,
-                });
-            }
-            SaeAtomBasisKind::Torus => {
-                let h = n_harmonics_list[atom_idx].unwrap_or(SAE_DEFAULT_TORUS_HARMONICS);
-                let evaluator = TorusHarmonicEvaluator::new(d, h).map_err(py_value_error)?;
-                let basis_size = evaluator.basis_size();
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Torus,
-                    latent_dim: d,
-                    n_harmonics: h,
-                    duchon_centers: None,
-                    basis_size,
-                });
-            }
-            _ => {
-                let centers = duchon_centers[atom_idx]
-                    .as_ref()
-                    .ok_or_else(|| {
-                        py_value_error(format!(
-                            "sae_steer_delta: atom {atom_idx} (Duchon-like) needs duchon_centers"
-                        ))
-                    })?
-                    .clone();
-                let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
-                let (phi, _jet, _penalty) = match kind {
-                    // #1221 — linear (degree-1) and euclidean-quadratic (degree-2)
-                    // share the monomial rebuild; the degree is recovered from the
-                    // trained block width so each matches its decoder bit-for-bit.
-                    SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch => {
-                        // #1132 bug 3: recover the Euclidean patch degree from the
-                        // TRAINED decoder block's `M` against the centers' own
-                        // dimension (the build dim is `centers.ncols()`), not from
-                        // `(atom_dim, basis_size_list)` which can disagree and
-                        // re-emit a wrong width. Keeps the steer rebuild's basis
-                        // width matched to the decoder, same as predict_oos.
-                        let euclidean_dim = centers.ncols();
-                        let trained_m = decoder_blocks[atom_idx].nrows();
-                        let degree = sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
-                            .map_err(py_value_error)?;
-                        sae_build_euclidean_atom_with_degree(
-                            probe_pts.view(),
-                            centers.view(),
-                            degree,
-                        )
-                        .map_err(py_value_error)?
-                    }
-                    _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
-                        .map_err(py_value_error)?,
-                };
-                let basis_size = phi.ncols();
-                plans.push(SaeAtomBuildPlan {
-                    kind,
-                    latent_dim: d,
-                    n_harmonics: 0,
-                    duchon_centers: Some(centers),
-                    basis_size,
-                });
-            }
-        }
-    }
-    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
-
-    // Pack the trained per-atom coordinates into the padded (K, N, D_max) buffer
-    // the basis-stack builder expects, validating each block against the rebuilt
-    // latent dim. These are the *trained* coords — no solve.
-    let d_max = effective_atom_dim.iter().copied().max().unwrap_or(1).max(1);
-    let mut start_coords = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
-    for atom_idx in 0..k_atoms {
-        let block = coords[atom_idx];
-        let d = effective_atom_dim[atom_idx];
-        if block.nrows() != n_obs || block.ncols() != d {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: coords[{atom_idx}] must be (N, d)=({n_obs}, {d}); got {:?}",
-                block.dim()
-            )));
-        }
-        if !block.iter().all(|v| v.is_finite()) {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: coords[{atom_idx}] contains non-finite values"
-            )));
-        }
-        start_coords
-            .slice_mut(s![atom_idx, 0..n_obs, 0..d])
-            .assign(&block);
-    }
-
-    let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
-            .map_err(py_value_error)?;
-    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
-    let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
-    for atom_idx in 0..k_atoms {
-        let block = decoder_blocks[atom_idx];
-        if block.ncols() != p_out {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: decoder_blocks[{atom_idx}] has p={} but p_out={p_out}",
-                block.ncols()
-            )));
-        }
-        if block.nrows() != basis_sizes[atom_idx] {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: decoder_blocks[{atom_idx}] has M={} but rebuilt basis has M={}; \
-                 atom_basis / atom_dim / n_harmonics_list / duchon_centers must match the trained design",
-                block.nrows(),
-                basis_sizes[atom_idx]
-            )));
-        }
-        if !block.iter().all(|v| v.is_finite()) {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: decoder_blocks[{atom_idx}] contains non-finite values"
-            )));
-        }
-        let m_k = basis_sizes[atom_idx];
-        decoder_coefficients
-            .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
-            .assign(&block.slice(s![0..m_k, 0..p_out]));
-    }
-
-    let logits_view = logits;
-    if logits_view.dim() != (n_obs, k_atoms) {
-        return Err(py_value_error(format!(
-            "sae_steer_delta: logits must be ({n_obs}, {k_atoms}); got {:?}",
-            logits_view.dim()
-        )));
-    }
-    if !logits_view.iter().all(|v| v.is_finite()) {
-        return Err(py_value_error(
-            "sae_steer_delta: logits contains non-finite values".into(),
-        ));
-    }
-    let initial_logits = logits_view.to_owned();
-
-    for (name, value) in [("alpha", alpha), ("tau", tau)] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: {name} must be finite and positive; got {value}"
-            )));
-        }
-    }
-    let mode = match assignment_kind.as_str() {
-        "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, false),
-        "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
-        "topk" => {
-            // The steer entry carries no support-size argument yet; the fixed
-            // support must come from the SAVED fit's metadata, not a guess.
-            // Typed refusal until the steer signature grows the parameter.
-            return Err(py_value_error(
-                "sae_steer_delta: assignment_kind 'topk' is not routed through the steer \
-                 entry yet — steering a topk fit needs its saved support size"
-                    .to_string(),
-            ));
-        }
+    let assignment = match assignment_kind.as_str() {
+        "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
+        "ibp_map" => gam::terms::sae::manifold::SaeOosAssignmentKind::IbpMap {
+            learnable_alpha: false,
+        },
+        "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
+            threshold: jumprelu_threshold,
+        },
+        "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
         _ => {
             return Err(py_value_error(format!(
                 "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
             )));
         }
     };
-    let mut coord_blocks = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        let d = effective_atom_dim[atom_idx];
-        coord_blocks.push(start_coords.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
-    }
-    let atom_centers: Vec<Option<Array2<f64>>> = plans
-        .iter()
-        .map(|plan| plan.duchon_centers.clone())
-        .collect();
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &effective_atom_dim,
-        &coord_blocks,
-        &atom_centers,
-    )
-    .map_err(py_value_error)?;
-    let mut term = term_from_padded_blocks_with_mode(
-        n_obs,
-        p_out,
-        &basis_kinds,
-        basis_values.view(),
-        basis_jacobian.view(),
-        &basis_sizes,
-        &effective_atom_dim,
-        decoder_coefficients.view(),
-        smooth_penalties.view(),
-        initial_logits.view(),
-        &coord_blocks,
-        mode,
-        &evaluators,
-    )
-    .map_err(py_value_error)?;
 
-    // Install the WP-D per-row output-Fisher metric if a shard was supplied — the
-    // same `(n, p, r)` → `(n, p*r)` flatten the fit uses. Presence activates the
-    // OutputFisher provenance so `predicted_nats` / `validity_radius` are
-    // available; absence keeps the Euclidean geometry-only path (dose = None).
-    if let Some(u3) = fisher_factors {
-        let u_shape = u3.shape();
-        if u_shape[0] != n_obs || u_shape[1] != p_out {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: fisher_factors U must be (n, p, r)=({n_obs}, {p_out}, r); \
-                 got leading dims ({}, {})",
-                u_shape[0], u_shape[1]
-            )));
-        }
-        let rank = u_shape[2];
-        if rank == 0 {
-            return Err(py_value_error(
-                "sae_steer_delta: fisher_factors U rank (last axis) must be >= 1".to_string(),
-            ));
-        }
-        if rank > p_out {
-            return Err(py_value_error(format!(
-                "sae_steer_delta: fisher_factors U rank {rank} exceeds output dim p={p_out}"
-            )));
-        }
-        if !u3.iter().all(|v| v.is_finite()) {
-            return Err(py_value_error(
-                "sae_steer_delta: fisher_factors U contains non-finite values".into(),
-            ));
-        }
-        let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
-        for row in 0..n_obs {
-            for i in 0..p_out {
-                for k in 0..rank {
-                    u_flat[[row, i * rank + k]] = u3[[row, i, k]];
+    // Marshal the persisted dictionary schema into typed OOS atom specs — the SAME
+    // rebuild contract `sae_manifold_predict_oos` marshals into, so the steer term
+    // and the OOS term are rebuilt by one engine path (`run_sae_manifold_steer`,
+    // #2236) rather than a duplicated pyffi rebuild.
+    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
+        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
+            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
+            latent_dim: atom_dim[atom_index],
+            decoder: decoder_blocks[atom_index].to_owned(),
+            centers: duchon_centers[atom_index].clone(),
+            n_harmonics: n_harmonics_list[atom_index],
+            basis_size: basis_size_list[atom_index],
+        })
+        .collect();
+    let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
+
+    // Marshal the WP-D output-Fisher shard into a `RowMetric` (array plumbing only):
+    // the `(n, p, r)` → `(n, p*r)` flatten the fit uses plus the provenance
+    // selection. Its presence installs the OutputFisher metric inside the engine so
+    // `predicted_nats` / `validity_radius` are available; absence keeps the
+    // geometry-only Euclidean path (dose degrades to None).
+    let fisher_metric = match fisher_factors {
+        Some(u3) => {
+            let u_shape = u3.shape();
+            if u_shape[0] != n_obs || u_shape[1] != p_out {
+                return Err(py_value_error(format!(
+                    "sae_steer_delta: fisher_factors U must be (n, p, r)=({n_obs}, {p_out}, r); \
+                     got leading dims ({}, {})",
+                    u_shape[0], u_shape[1]
+                )));
+            }
+            let rank = u_shape[2];
+            if rank == 0 {
+                return Err(py_value_error(
+                    "sae_steer_delta: fisher_factors U rank (last axis) must be >= 1".to_string(),
+                ));
+            }
+            if rank > p_out {
+                return Err(py_value_error(format!(
+                    "sae_steer_delta: fisher_factors U rank {rank} exceeds output dim p={p_out}"
+                )));
+            }
+            if !u3.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_steer_delta: fisher_factors U contains non-finite values".into(),
+                ));
+            }
+            let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
+            for row in 0..n_obs {
+                for i in 0..p_out {
+                    for k in 0..rank {
+                        u_flat[[row, i * rank + k]] = u3[[row, i, k]];
+                    }
                 }
             }
+            Some(row_metric_from_fisher_provenance(
+                u_flat,
+                p_out,
+                rank,
+                fisher_provenance,
+            )?)
         }
-        let metric =
-            row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
-        term.set_row_metric(metric).map_err(py_value_error)?;
-    }
+        None => None,
+    };
 
-    // The metric the dose is measured through: the installed per-row metric, or a
-    // bit-identical Euclidean metric (geometry-only; dose degrades to None).
-    let euclidean =
-        gam::inference::row_metric::RowMetric::euclidean(n_obs, p_out).map_err(py_value_error)?;
-    let metric = term.row_metric().unwrap_or(&euclidean);
-
-    let t_from_vec = t_from.to_vec();
-    let t_to_vec = t_to.to_vec();
-    let plan = gam::inference::steering::steer_delta(&term, metric, atom_k, &t_from_vec, &t_to_vec)
-        .map_err(py_value_error)?;
-    Ok(plan)
+    let request = gam::terms::sae::manifold::SaeSteerRequest {
+        atoms,
+        coords: coord_blocks,
+        logits: logits.to_owned(),
+        assignment,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        t_from: t_from.to_vec(),
+        t_to: t_to.to_vec(),
+    };
+    gam::terms::sae::manifold::run_sae_manifold_steer(request).map_err(py_value_error)
 }
 
 /// Render a [`gam::inference::steering::SteerPlan`] as the Python dict both steer

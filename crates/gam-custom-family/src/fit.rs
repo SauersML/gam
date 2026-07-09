@@ -385,18 +385,22 @@ pub(crate) fn design_penalty_range_gammas(
         return None;
     }
     let s_thresh = positive_eigenvalue_threshold(s_evals.as_slice()?);
-    // Collect the range-space columns U_r (penalty eigenvectors with d_j above
-    // the numerical-zero threshold) and their inverse square-root weights
-    // d_j^{-1/2}. Directions in ker(S) are dropped: they are unpenalized and do
-    // not enter the structural edf of this term.
+    // Split the penalty eigenbasis into range(S) columns U_r (d_j above the
+    // numerical-zero threshold, with inverse square-root weights d_j^{-1/2})
+    // and ker(S) columns U_0. Null directions carry no penalty, but they are
+    // NOT simply dropped: they are fitted unpenalized for every λ, so any
+    // design curvature they share with the range is absorbed by them and must
+    // be projected out of the range curvature (Schur complement below).
     let mut range_cols: Vec<usize> = Vec::new();
     let mut inv_sqrt_d: Vec<f64> = Vec::new();
+    let mut null_cols: Vec<usize> = Vec::new();
     for (j, &dj) in s_evals.iter().enumerate() {
         if dj <= s_thresh {
-            continue; // null space of S: not a penalized direction.
+            null_cols.push(j);
+        } else {
+            range_cols.push(j);
+            inv_sqrt_d.push(1.0 / dj.sqrt());
         }
-        range_cols.push(j);
-        inv_sqrt_d.push(1.0 / dj.sqrt());
     }
     let r = range_cols.len();
     if r == 0 {
@@ -415,7 +419,59 @@ pub(crate) fn design_penalty_range_gammas(
             y[(row, col)] = u[row] * w;
         }
     }
-    let b = y.t().dot(&gram).dot(&y);
+    let mut b = y.t().dot(&gram).dot(&y);
+    if !null_cols.is_empty() {
+        // Quotient the null space out of the range curvature. In the penalty
+        // eigenbasis, with A = UᵀGU partitioned into null (0) and range (r)
+        // blocks, the λ-dependent part of the exact trace identity
+        //   tr{ G (G + λS)⁻¹ } = rank(A₀₀) + Σ_j γ_j/(γ_j + λ)
+        // has γ_j the eigenvalues of the SCHUR COMPLEMENT
+        //   D_r^{-1/2} (A_rr − A_r0 A₀₀⁺ A₀r) D_r^{-1/2},
+        // not of A_rr alone: a range direction whose design curvature is
+        // shared with ker(S) contributes NO λ-resistant df of its own — the
+        // unpenalized null coordinate absorbs that fit at every λ. Keeping
+        // only A_rr (the pre-#audit behaviour) overstates the structural edf
+        // (S = diag(0,1,1), G coupling coordinates 1↔2 with residual ε gives
+        // quotient eigenvalues (ε, 1), not (1+ε, 1)) and mis-places the
+        // smoothing-collapse barrier.
+        let r0 = null_cols.len();
+        let mut u0 = Array2::<f64>::zeros((p, r0));
+        for (col, &src) in null_cols.iter().enumerate() {
+            let u = s_evecs.column(src);
+            for row in 0..p {
+                u0[(row, col)] = u[row];
+            }
+        }
+        let g00 = u0.t().dot(&gram).dot(&u0); // r0×r0
+        let g_r0 = y.t().dot(&gram).dot(&u0); // r×r0, already D_r^{-1/2}-scaled rows
+        // A₀₀⁺ through the null-block eigendecomposition (r0 is small); the
+        // pseudo-inverse (not an inverse) because the design need not have
+        // full column support on ker(S).
+        let mut g00_sym = g00.clone();
+        for i in 0..r0 {
+            for j in (i + 1)..r0 {
+                let avg = 0.5 * (g00_sym[(i, j)] + g00_sym[(j, i)]);
+                g00_sym[(i, j)] = avg;
+                g00_sym[(j, i)] = avg;
+            }
+        }
+        let (e0, v0) = g00_sym.eigh(Side::Lower).ok()?;
+        let tol0 = positive_eigenvalue_threshold(e0.as_slice()?);
+        // B ← B − G_r0 · A₀₀⁺ · G_r0ᵀ, accumulated per retained null mode:
+        // with w_k = G_r0 v0_k, subtract e0_k⁻¹ · w_k w_kᵀ.
+        for k in 0..r0 {
+            if e0[k] <= tol0 {
+                continue;
+            }
+            let inv_e = 1.0 / e0[k];
+            let w_k = g_r0.dot(&v0.column(k));
+            for i in 0..r {
+                for j in 0..r {
+                    b[(i, j)] -= inv_e * w_k[i] * w_k[j];
+                }
+            }
+        }
+    }
     // Symmetrize defensively against round-off before the symmetric solver, then
     // take eigenvalues. These are the γ_j (data-free, unit-weight).
     let mut b_sym = b.clone();

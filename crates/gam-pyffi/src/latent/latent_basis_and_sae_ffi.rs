@@ -895,15 +895,11 @@ fn fit_penalized_multinomial_pyfunc<'py>(
 // can dispatch by inspecting the JSON discriminator without deserialising
 // the whole `FittedModel` struct.
 
-/// Envelope used for both the fit and predict pyfunctions. The
-/// `model_class` discriminator is required so the Python load path can
-/// tell a `MultinomialSavedModel` apart from the scalar `FittedModel`
-/// payload that `fit_table` produces.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MultinomialModelEnvelope {
-    model_class: String,
-    saved: gam::families::multinomial::MultinomialSavedModel,
-}
+// The multinomial persistence envelope (the `model_class`-discriminated wrapper
+// that lets the Python load path tell a `MultinomialSavedModel` apart from the
+// scalar `FittedModel` payload) is defined once in the core so the CLI and the
+// FFI share one on-disk contract.
+use gam::families::multinomial::MultinomialModelEnvelope;
 
 /// Fit a penalized multinomial-logit GAM from a Wilkinson formula against
 /// a `headers + rows` table. Returns the bincode-free, serde-JSON model
@@ -939,12 +935,9 @@ fn fit_multinomial_formula_pyfunc<'py>(
             tol,
         )
         .map_err(estimation_error_to_pyerr)?;
-        let envelope = MultinomialModelEnvelope {
-            model_class: "multinomial".to_string(),
-            saved,
-        };
-        serde_json::to_vec(&envelope)
-            .map_err(|err| py_value_error(format!("failed to serialize multinomial model: {err}")))
+        MultinomialModelEnvelope::new(saved)
+            .to_json_bytes()
+            .map_err(estimation_error_to_pyerr)
     })?;
     Ok(PyBytes::new(py, &bytes).unbind())
 }
@@ -959,16 +952,8 @@ fn predict_multinomial_formula_pyfunc<'py>(
     rows: Vec<Vec<String>>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let probs = detach_pyresult(py, "predict_multinomial_formula", move || {
-        let envelope: MultinomialModelEnvelope =
-            serde_json::from_slice(&model_bytes).map_err(|err| {
-                py_value_error(format!("failed to deserialize multinomial model: {err}"))
-            })?;
-        if envelope.model_class != "multinomial" {
-            return Err(py_value_error(format!(
-                "predict_multinomial_formula: model_class = {:?}, expected 'multinomial'",
-                envelope.model_class
-            )));
-        }
+        let envelope =
+            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
         let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
@@ -995,16 +980,8 @@ fn predict_multinomial_intervals_pyfunc<'py>(
     z: f64,
 ) -> PyResult<Py<PyDict>> {
     let (probs, prob_se) = detach_pyresult(py, "predict_multinomial_intervals", move || {
-        let envelope: MultinomialModelEnvelope =
-            serde_json::from_slice(&model_bytes).map_err(|err| {
-                py_value_error(format!("failed to deserialize multinomial model: {err}"))
-            })?;
-        if envelope.model_class != "multinomial" {
-            return Err(py_value_error(format!(
-                "predict_multinomial_intervals: model_class = {:?}, expected 'multinomial'",
-                envelope.model_class
-            )));
-        }
+        let envelope =
+            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
         let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         gam::families::multinomial::predict_multinomial_formula_with_se(&envelope.saved, &dataset)
             .map_err(estimation_error_to_pyerr)
