@@ -80,12 +80,14 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
         // ---- Predictive (observation) intervals, per response family -----
         // `family_observation_band` (gam-predict lib.rs:2041) emits a predictive
         // interval Var(μ̂)+Var(Y|μ) for each family below. Gaussian is gated
-        // (in-process + location-scale + conformal); the others are registered
-        // but their per-family predictive-interval coverage gate is still
-        // PENDING — the harness naming these is precisely how it surfaces the
-        // gap. `royston_parmar` returns (None,None) (lib.rs:2261): it exposes NO
-        // predictive interval and is deliberately NOT registered (the family
-        // enumeration test pins that as a known gap, not drift).
+        // (in-process + location-scale + conformal); the non-Gaussian families
+        // are gated by the parameterized per-family predictive-interval sweep
+        // `sbc_family_predictive_interval_coverage`, which draws a genuinely NEW
+        // family response and checks the skew-correct observation band covers it
+        // (#817/#1193/#1194 skew + #1875/#1878 composition). `royston_parmar`
+        // returns (None,None) (lib.rs:2261): it exposes NO predictive interval
+        // and is deliberately NOT registered (the family enumeration test pins
+        // that as a known gap, not drift).
         CalibrationTarget {
             name: "predictive_interval_gaussian",
             kind: SurfaceKind::PredictiveInterval,
@@ -98,44 +100,49 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             name: "predictive_interval_poisson",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1875],
-            audited_by: "PENDING::sbc_poisson_predictive_interval_coverage \
-                         (gap: only the Poisson mean band is gated today)",
+            guards: &[1875, 817],
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (poisson_predictive_interval_covers_new_observation_at_nominal)",
         },
         CalibrationTarget {
             name: "predictive_interval_negative_binomial",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1875],
-            audited_by: "PENDING::sbc_negbin_predictive_interval_coverage",
+            guards: &[1875, 1193],
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (negative_binomial_predictive_interval_covers_new_observation_at_nominal)",
         },
         CalibrationTarget {
             name: "predictive_interval_tweedie",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1875],
-            audited_by: "PENDING::sbc_tweedie_predictive_interval_coverage",
+            guards: &[1875, 817],
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (tweedie_predictive_interval_covers_new_observation_at_nominal)",
         },
         CalibrationTarget {
             name: "predictive_interval_gamma",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1875],
-            audited_by: "PENDING::sbc_gamma_predictive_interval_coverage",
+            guards: &[1875, 817],
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (gamma_predictive_interval_covers_new_observation_at_nominal)",
         },
         CalibrationTarget {
             name: "predictive_interval_beta",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1875],
-            audited_by: "PENDING::sbc_beta_predictive_interval_coverage",
+            guards: &[1875, 1194],
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (beta_predictive_interval_covers_new_observation_at_nominal)",
         },
         CalibrationTarget {
             name: "predictive_interval_binomial",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
             guards: &[1875],
-            audited_by: "PENDING::sbc_binomial_predictive_interval_coverage",
+            audited_by: "sbc_family_predictive_interval_coverage \
+                         (binomial_predictive_interval_covers_new_observation_at_nominal)",
         },
         // Heteroscedastic location-scale predictive interval (#1561).
         CalibrationTarget {

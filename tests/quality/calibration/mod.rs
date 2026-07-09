@@ -9,7 +9,10 @@
 //! uncertainty-bearing field maps to a registered target. The audit GATES
 //! themselves are standing integration binaries so a single miscompiled gate
 //! cannot take down the whole grouped `quality` binary:
-//!   * the six credible-band / predictive gates: `tests/sbc_*.rs`;
+//!   * the credible-band / predictive gates: `tests/sbc_*.rs`, including the
+//!     parameterized per-family predictive-interval sweep
+//!     `tests/sbc_family_predictive_interval_coverage.rs` (Poisson, Negative-
+//!     Binomial, Gamma, Beta, Tweedie, Binomial);
 //!   * conformal intervals: `tests/misc/predict/full_conformal_predict_route_quality.rs`;
 //!   * the ALO/LOO predictive SE (#1869): `tests/sbc_alo_predictive_se_coverage.rs`;
 //!   * smooth-test size under the null (#1872/#1873): the standing
