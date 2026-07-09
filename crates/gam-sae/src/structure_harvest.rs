@@ -415,6 +415,7 @@ fn basis_kind_tag(kind: &SaeAtomBasisKind) -> &str {
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
         SaeAtomBasisKind::Cylinder => "cylinder",
+        SaeAtomBasisKind::Mobius => "mobius",
         SaeAtomBasisKind::FiniteSet => "finite_set",
         SaeAtomBasisKind::Precomputed(_) => "precomputed",
     }

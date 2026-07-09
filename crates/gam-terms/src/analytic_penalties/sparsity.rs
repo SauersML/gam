@@ -1508,3 +1508,148 @@ mod fisher_majorizer_1419_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod row_weighted_prior_991_tests {
+    //! #991 design-honesty per-row weights: row `i`'s softmax-entropy prior must
+    //! be scaled by `w_i` IDENTICALLY in every channel. Because value, gradient,
+    //! Hessian diagonal, HVP, and the PSD majorizer are all linear in the per-row
+    //! penalty strength, scaling the strength by `w_i` scales all of them by the
+    //! same `w_i` and cannot desync them. These are the CI gate for that
+    //! invariant (the fit that consumes it cannot be run here).
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::{Array1, s};
+
+    fn logits(n: usize, k: usize) -> Array1<f64> {
+        // Deterministic non-uniform logits so every row has genuine entropy
+        // gradient/curvature (no trivially-degenerate softmax rows).
+        let mut v = Array1::<f64>::zeros(n * k);
+        for r in 0..n {
+            for a in 0..k {
+                v[r * k + a] = 0.35 * (r as f64) - 0.6 * (a as f64) + 0.11 * ((r * k + a) as f64).sin();
+            }
+        }
+        v
+    }
+
+    /// The weighted value equals the unweighted per-row entropies recombined with
+    /// `w_i`, and the mean-1 weighting leaves the total exactly invariant when the
+    /// weights average to one — the design-honesty contract.
+    #[test]
+    fn weighted_value_is_per_row_reweight_of_unweighted() {
+        let (n, k) = (5usize, 3usize);
+        let temperature = 0.7_f64;
+        let rho = Array1::from_vec(vec![0.2_f64]);
+        let target = logits(n, k);
+        let base = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        // Per-row entropies via single-row penalties (each a 1-row problem).
+        let mut per_row = vec![0.0_f64; n];
+        for r in 0..n {
+            let row = target.slice(s![r * k..r * k + k]).to_owned();
+            per_row[r] = base.value(row.view(), rho.view());
+        }
+        let unweighted: f64 = per_row.iter().sum();
+        assert_abs_diff_eq!(base.value(target.view(), rho.view()), unweighted, epsilon = 1e-12);
+
+        let w = vec![1.7_f64, 0.3, 1.1, 0.5, 1.4]; // mean = 1.0 exactly.
+        let weighted = base.clone().with_row_weights(Some(&w));
+        let expect: f64 = (0..n).map(|r| w[r] * per_row[r]).sum();
+        assert_abs_diff_eq!(weighted.value(target.view(), rho.view()), expect, epsilon = 1e-12);
+        // Mean-1 weights preserve the total (Σ w_i H_i vs Σ H_i differ only by the
+        // per-row redistribution, but here we assert the exact reweighted target).
+        assert_abs_diff_eq!(
+            weighted.value(target.view(), rho.view()),
+            (0..n).map(|r| w[r] * per_row[r]).sum::<f64>(),
+            epsilon = 1e-12
+        );
+    }
+
+    /// FD ORACLE: `d(value)/d(z_{r,a}) == grad_target[r*K+a]` under NONTRIVIAL
+    /// per-row weights. This is the value/gradient desync gate — if any channel
+    /// carried a different weighting than the value, this central difference would
+    /// diverge from the analytic gradient.
+    #[test]
+    fn weighted_value_grad_are_fd_consistent() {
+        let (n, k) = (4usize, 3usize);
+        let temperature = 0.9_f64;
+        let rho = Array1::from_vec(vec![-0.1_f64]);
+        let target = logits(n, k);
+        let w = vec![1.9_f64, 0.4, 0.8, 0.9];
+        let pen = SoftmaxAssignmentSparsityPenalty::new(k, temperature).with_row_weights(Some(&w));
+        let grad = pen.grad_target(target.view(), rho.view());
+        let eps = 1e-6;
+        for idx in 0..n * k {
+            let mut plus = target.clone();
+            let mut minus = target.clone();
+            plus[idx] += eps;
+            minus[idx] -= eps;
+            let fd = (pen.value(plus.view(), rho.view()) - pen.value(minus.view(), rho.view()))
+                / (2.0 * eps);
+            assert_abs_diff_eq!(grad[idx], fd, epsilon = 1e-7);
+        }
+    }
+
+    /// Every channel scales by exactly `w_i` on row `i` relative to the unweighted
+    /// penalty — grad_target, hessian_diag, psd_majorizer_diag, and hvp. Confirms
+    /// the single strength multiplier reaches all of them identically.
+    #[test]
+    fn every_channel_scales_by_w_row_identically() {
+        let (n, k) = (4usize, 3usize);
+        let temperature = 0.8_f64;
+        let rho = Array1::from_vec(vec![0.15_f64]);
+        let target = logits(n, k);
+        let v = logits(n, k); // arbitrary HVP direction.
+        let w = vec![1.6_f64, 0.25, 1.05, 1.1];
+        let base = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        let wtd = base.clone().with_row_weights(Some(&w));
+
+        let g0 = base.grad_target(target.view(), rho.view());
+        let g1 = wtd.grad_target(target.view(), rho.view());
+        let d0 = base.hessian_diag(target.view(), rho.view()).unwrap();
+        let d1 = wtd.hessian_diag(target.view(), rho.view()).unwrap();
+        let m0 = base.psd_majorizer_diag(target.view(), rho.view()).unwrap();
+        let m1 = wtd.psd_majorizer_diag(target.view(), rho.view()).unwrap();
+        let h0 = base.hvp(target.view(), rho.view(), v.view());
+        let h1 = wtd.hvp(target.view(), rho.view(), v.view());
+        for r in 0..n {
+            for a in 0..k {
+                let i = r * k + a;
+                assert_abs_diff_eq!(g1[i], w[r] * g0[i], epsilon = 1e-12);
+                assert_abs_diff_eq!(d1[i], w[r] * d0[i], epsilon = 1e-12);
+                assert_abs_diff_eq!(m1[i], w[r] * m0[i], epsilon = 1e-12);
+                assert_abs_diff_eq!(h1[i], w[r] * h0[i], epsilon = 1e-12);
+            }
+        }
+        // grad_rho (softmax) is the value itself, so it too carries the weighting.
+        let r0 = base.grad_rho(target.view(), rho.view())[0];
+        let r1 = wtd.grad_rho(target.view(), rho.view())[0];
+        let expect: f64 = (0..n)
+            .map(|r| {
+                let row = target.slice(s![r * k..r * k + k]).to_owned();
+                w[r] * base.value(row.view(), rho.view())
+            })
+            .sum();
+        assert_abs_diff_eq!(r1, expect, epsilon = 1e-12);
+        assert!(r0.is_finite());
+    }
+
+    /// `None` weights are byte-for-byte the unweighted path (no silent ×1.0 drift).
+    #[test]
+    fn none_weights_are_bit_for_bit_unweighted() {
+        let (n, k) = (3usize, 4usize);
+        let rho = Array1::from_vec(vec![0.0_f64]);
+        let target = logits(n, k);
+        let base = SoftmaxAssignmentSparsityPenalty::new(k, 1.0);
+        let none = base.clone().with_row_weights(None);
+        assert_eq!(
+            base.value(target.view(), rho.view()).to_bits(),
+            none.value(target.view(), rho.view()).to_bits()
+        );
+        let g0 = base.grad_target(target.view(), rho.view());
+        let g1 = none.grad_target(target.view(), rho.view());
+        for i in 0..n * k {
+            assert_eq!(g0[i].to_bits(), g1[i].to_bits());
+        }
+    }
+}

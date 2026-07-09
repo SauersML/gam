@@ -213,11 +213,13 @@ fn expected_betti_signature(
     finite_set_components: Option<usize>,
 ) -> Option<BettiSignature> {
     match kind {
-        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Cylinder => Some(BettiSignature {
-            b0: 1,
-            b1: 1,
-            b2: None,
-        }),
+        SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Cylinder | SaeAtomBasisKind::Mobius => {
+            Some(BettiSignature {
+                b0: 1,
+                b1: 1,
+                b2: None,
+            })
+        }
         SaeAtomBasisKind::Torus => Some(BettiSignature {
             b0: 1,
             b1: 2,

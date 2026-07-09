@@ -1125,16 +1125,36 @@ pub(crate) struct BlockUpdateResult {
     pub(crate) active_set: Option<Vec<usize>>,
 }
 
-#[inline]
+/// Floor strictly positive working weights at `minweight`, preserving exact
+/// zeros (semantically excluded rows stay excluded).
+///
+/// The diagonal working-curvature contract requires nonnegative finite
+/// entries: a negative weight is indefinite diagonal curvature and a
+/// non-finite weight is a broken linearization. Coercing either (negatives to
+/// zero, or NaN to `minweight` through the NaN-ignoring `f64::max`) would
+/// silently substitute a different information matrix — the objective,
+/// gradient, and log|H| would then describe a model the family never
+/// evaluated — so both are rejected.
 pub(crate) fn floor_positiveworking_weights(
     working_weights: &Array1<f64>,
     minweight: f64,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, String> {
+    if let Some((i, &wi)) = working_weights
+        .iter()
+        .enumerate()
+        .find(|&(_, &wi)| !wi.is_finite() || wi < 0.0)
+    {
+        return Err(format!(
+            "invalid diagonal working weight at row {i}: {wi} (the working-curvature \
+             contract requires nonnegative finite entries; negative or non-finite \
+             curvature cannot be coerced without changing the information matrix)"
+        ));
+    }
     let mut out = Array1::<f64>::zeros(working_weights.len());
     ndarray::Zip::from(&mut out)
         .and(working_weights)
-        .par_for_each(|o, &wi| *o = if wi <= 0.0 { 0.0 } else { wi.max(minweight) });
-    out
+        .par_for_each(|o, &wi| *o = if wi == 0.0 { 0.0 } else { wi.max(minweight) });
+    Ok(out)
 }
 
 pub(crate) trait ParameterBlockUpdater {
@@ -1167,7 +1187,13 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         }
 
         // Zero-weight observations are semantically excluded and must stay inactive.
-        let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight);
+        let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight)
+            .map_err(|e| {
+                format!(
+                    "block {} ({}) diagonal solve: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
 
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(

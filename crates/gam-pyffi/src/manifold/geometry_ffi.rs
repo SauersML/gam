@@ -5083,6 +5083,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(benchmark_prediction_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(weighted_auc_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
@@ -8456,13 +8457,15 @@ fn predict_table_jackknife_plus_impl(
     // read it from the stored stats' beta directly to avoid touching the
     // predictor stack.
     // The jackknife+ theorem (Barber et al. 2021) guarantees
-    // P(Y_* ∈ Ĉ_α) ≥ 1 − 2α. The advertised finite-sample coverage is
-    // `conformal_level`, so the parameter must be α = (1 − level)/2: running
-    // at α = 1 − level would deliver a certified floor of only 1 − 2(1−level)
-    // (80% at level=0.9), overstating the guarantee by a factor of two. The
-    // interval is often conservative in practice — that is the honest price
-    // of a distribution-free finite-sample statement.
-    let alpha = (1.0 - conformal_level) / 2.0;
+    // P(Y_* ∈ Ĉ_α) ≥ 1 − 2α, while the set built at parameter α delivers
+    // ≈ 1 − α marginal coverage on exchangeable data in practice. Running at
+    // α = (1 − level)/2 to make the worst-case bound read "≥ level" was
+    // measured to systematically over-cover at (1 + level)/2 (#1546), so this
+    // path TARGETS the requested level with α = 1 − conformal_level — and
+    // every claim surface must then state the honest finite-sample floor at
+    // this setting, 1 − 2α = 2·level − 1, never "≥ level" (the theorem does
+    // not deliver that here).
+    let alpha = 1.0 - conformal_level;
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
@@ -8486,9 +8489,10 @@ fn predict_table_jackknife_plus_impl(
         model_class: prediction_model_class_label(&model),
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
-            "jackknife+ (distribution-free, finite-sample ≥{:.0}% coverage; \
-             Barber et al. 2021)",
-            conformal_level * 100.0
+            "jackknife+ targeting {:.0}% coverage (distribution-free finite-sample \
+             guarantee ≥{:.0}%; Barber et al. 2021, ≥ 1 − 2α)",
+            conformal_level * 100.0,
+            (2.0 * conformal_level - 1.0).max(0.0) * 100.0
         )),
     })
     .map_err(|err| format!("failed to serialize jackknife+ prediction payload: {err}"))
@@ -8655,8 +8659,10 @@ fn predict_table_full_conformal(
 /// calibration fold required (#1054 / #942).
 ///
 /// Auto-routes `predict(interval='conformal')` for Gaussian-identity models to
-/// the `GaussianJackknifePlusStats` precomputed at fit time, giving
-/// finite-sample ≥`conformal_level` marginal coverage (Barber et al. 2021).
+/// the `GaussianJackknifePlusStats` precomputed at fit time. The interval
+/// targets ≈`conformal_level` marginal coverage (α = 1 − level, #1546); the
+/// distribution-free finite-sample guarantee at that setting is
+/// ≥ `2·conformal_level − 1` (Barber et al. 2021, coverage ≥ 1 − 2α).
 /// Returns the same column JSON as `predict_table` (with `linear_predictor`,
 /// `mean`, `mean_lower`, `mean_upper`) so the Python shaper is unchanged.
 ///

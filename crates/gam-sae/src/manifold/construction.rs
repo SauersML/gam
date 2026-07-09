@@ -7897,6 +7897,88 @@ impl SaeManifoldTerm {
         acc
     }
 
+    /// β-tier selected inverse `(H⁻¹)_ββ`, shared across rows (#932 FRONT C). On
+    /// the plain bordered arrow this is the cached dense `S⁻¹` formed once from the
+    /// Schur factor; when a gauge / #1038 cross-row Woodbury is active the row-local
+    /// Takahashi blocks are NOT valid, so it falls back to the per-β-coordinate
+    /// `solve` loop (bit-identical, `O(n)` per column). `context` prefixes the
+    /// caller's error text. Shared by `learnable_ibp_data_logdet_alpha_trace` and
+    /// `logdet_theta_adjoint`, whose β selected-inverse preambles were verbatim.
+    fn selected_inverse_beta_block(
+        solver: &DeflatedArrowSolver<'_>,
+        cache: &ArrowFactorCache,
+        fast_selected: bool,
+        context: &str,
+    ) -> Result<Array2<f64>, String> {
+        if cache.k == 0 {
+            Ok(Array2::<f64>::zeros((0, 0)))
+        } else if fast_selected {
+            solver
+                .beta_inv()
+                .map_err(|err| format!("{context}: beta selected inverse: {err}"))
+        } else {
+            let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
+            let rhs_t = Array1::<f64>::zeros(cache.delta_t_len());
+            let mut rhs_beta = Array1::<f64>::zeros(cache.k);
+            for col in 0..cache.k {
+                rhs_beta[col] = 1.0;
+                let solved = solver
+                    .solve(rhs_t.view(), rhs_beta.view())
+                    .map_err(|err| format!("{context}: beta selected inverse solve: {err}"))?;
+                rhs_beta[col] = 0.0;
+                for r in 0..cache.k {
+                    beta_inv[[r, col]] = solved.beta[r];
+                }
+            }
+            Ok(beta_inv)
+        }
+    }
+
+    /// Per-row selected-inverse blocks `(inv_vv, inv_vbeta) = ((H⁻¹)_tt, (H⁻¹)_tβ)`
+    /// for `row` (#932 FRONT C). Row-local Takahashi (`O(q·(q+K))`) on the plain
+    /// arrow; a per-row full-system `solve` loop (`O(n·q)`) under gauge / cross-row
+    /// Woodbury where the row-local blocks are not valid. `rhs_t_scratch` is a
+    /// hoisted `delta_t_len()`-sized buffer, left zeroed on return; `rhs_beta_zero`
+    /// is a zero β-RHS of length `cache.k`; `context` prefixes the error text.
+    /// Shared by `learnable_ibp_data_logdet_alpha_trace` and `logdet_theta_adjoint`,
+    /// whose per-row selected-inverse preambles were verbatim.
+    #[allow(clippy::too_many_arguments)]
+    fn selected_inverse_row_blocks_or_solve(
+        solver: &DeflatedArrowSolver<'_>,
+        cache: &ArrowFactorCache,
+        beta_inv: &Array2<f64>,
+        fast_selected: bool,
+        row: usize,
+        base: usize,
+        q: usize,
+        rhs_t_scratch: &mut Array1<f64>,
+        rhs_beta_zero: ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        if fast_selected {
+            solver
+                .selected_inverse_row_blocks(row, beta_inv)
+                .map_err(|err| format!("{context}: selected inverse: {err}"))
+        } else {
+            let mut inv_vv = Array2::<f64>::zeros((q, q));
+            let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
+            for col in 0..q {
+                rhs_t_scratch[base + col] = 1.0;
+                let solved = solver
+                    .solve(rhs_t_scratch.view(), rhs_beta_zero)
+                    .map_err(|err| format!("{context}: selected inverse solve: {err}"))?;
+                rhs_t_scratch[base + col] = 0.0;
+                for r in 0..q {
+                    inv_vv[[r, col]] = solved.t[base + r];
+                }
+                for b in 0..cache.k {
+                    inv_vbeta[[col, b]] = solved.beta[b];
+                }
+            }
+            Ok((inv_vv, inv_vbeta))
+        }
+    }
+
     /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
     ///
     /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with the #614
@@ -7948,28 +8030,12 @@ impl SaeManifoldTerm {
         // active the row-local Takahashi blocks are NOT valid, so we fall back to
         // the per-β-coordinate `solve` loop (bit-identical, just O(n) per call).
         let fast_selected = solver.plain_selected_inverse_available();
-        let beta_inv = if cache.k == 0 {
-            Array2::<f64>::zeros((0, 0))
-        } else if fast_selected {
-            solver.beta_inv().map_err(|err| {
-                format!("learnable_ibp_data_logdet_alpha_trace: beta inverse: {err}")
-            })?
-        } else {
-            let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
-            let rhs_t = Array1::<f64>::zeros(total_t);
-            let mut rhs_beta = Array1::<f64>::zeros(cache.k);
-            for col in 0..cache.k {
-                rhs_beta[col] = 1.0;
-                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                    format!("learnable_ibp_data_logdet_alpha_trace: beta inverse: {err}")
-                })?;
-                rhs_beta[col] = 0.0;
-                for r in 0..cache.k {
-                    beta_inv[[r, col]] = solved.beta[r];
-                }
-            }
-            beta_inv
-        };
+        let beta_inv = Self::selected_inverse_beta_block(
+            solver,
+            cache,
+            fast_selected,
+            "learnable_ibp_data_logdet_alpha_trace",
+        )?;
         // Atom index of each β border channel (the `k_b` weight for the β leg).
         let border_atom: Vec<usize> = border.iter().map(|c| c.atom).collect();
 
@@ -8774,28 +8840,8 @@ impl SaeManifoldTerm {
         // Schur factor; gauge / #1038 cross-row Woodbury fall back to the per-β
         // `solve` loop where the row-local Takahashi blocks are not valid.
         let fast_selected = solver.plain_selected_inverse_available();
-        let beta_inv = if cache.k == 0 {
-            Array2::<f64>::zeros((0, 0))
-        } else if fast_selected {
-            solver
-                .beta_inv()
-                .map_err(|err| format!("logdet_theta_adjoint: beta selected inverse: {err}"))?
-        } else {
-            let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
-            let rhs_t = Array1::<f64>::zeros(total_t);
-            let mut rhs_beta = Array1::<f64>::zeros(cache.k);
-            for col in 0..cache.k {
-                rhs_beta[col] = 1.0;
-                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                    format!("logdet_theta_adjoint: beta selected inverse solve: {err}")
-                })?;
-                rhs_beta[col] = 0.0;
-                for row in 0..cache.k {
-                    beta_inv[[row, col]] = solved.beta[row];
-                }
-            }
-            beta_inv
-        };
+        let beta_inv =
+            Self::selected_inverse_beta_block(solver, cache, fast_selected, "logdet_theta_adjoint")?;
         // IBP `hessian_diag` logit third-derivative channels (#1006). The full
         // IBP Hessian also has per-column cross-row rank-one terms
         // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038

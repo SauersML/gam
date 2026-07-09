@@ -1722,10 +1722,13 @@ class ManifoldSAE:
         length per token decomposed into code / selection / dictionary bits.
 
         The bits are computed by the Rust
-        ``sae_manifold_description_length`` core from this fit's own summary
-        quantities (achieved EV, mean active atoms per token, coordinate dim,
-        dictionary size ``K``, decoder scalar count); Python only marshals those
-        scalars. ``l_param_bits`` overrides the per-decoder-scalar precision
+        ``sae_manifold_description_length`` core from this fit's own empirical
+        byproducts: the ``(N, K)`` assignment matrix (binarised into the support
+        matrix that prices selection by the support-entropy universal code) and
+        the per-atom ``(N, d_k)`` chart coordinates (whose covariance spectra set
+        the reverse-water-filling latent code rate at the achieved distortion),
+        plus the achieved EV and decoder scalar count; Python only marshals those
+        arrays. ``l_param_bits`` overrides the per-decoder-scalar precision
         (default: the distortion-matched precision). Returns ``None`` for an
         empty fit (no atoms or no coded tokens).
         """
@@ -1738,21 +1741,21 @@ class ManifoldSAE:
         # engine predates these exports (older build or a test double), degrade
         # to ``None`` rather than crashing the report — the fit is unchanged.
         dl_fn = getattr(module, "sae_manifold_description_length", None)
-        summary_fn = getattr(module, "sae_manifold_assignment_summary", None)
-        if dl_fn is None or summary_fn is None:
+        if dl_fn is None:
             return None
-        threshold = _active_threshold_for_assignment(self.assignment, k_atoms)
-        avg_active, _mean_mass = summary_fn(self.assignments, threshold)
-        coord_dims = [int(c.shape[1]) for c in self.coords if c.ndim == 2 and c.shape[1] > 0]
-        coord_dim = float(np.mean(coord_dims)) if coord_dims else 1.0
+        assignments = np.ascontiguousarray(np.asarray(self.assignments, dtype=np.float64))
+        coords: list[np.ndarray] = []
+        for block in self.coords:
+            arr = np.asarray(block, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            coords.append(np.ascontiguousarray(arr))
         n_params = int(sum(int(b.size) for b in self.decoder_blocks))
         return dict(
             dl_fn(
+                assignments,
+                coords,
                 float(self.reconstruction_r2),
-                int(n_tokens),
-                float(avg_active),
-                float(coord_dim),
-                int(k_atoms),
                 int(n_params),
                 l_param_bits=None if l_param_bits is None else float(l_param_bits),
             )
