@@ -254,21 +254,40 @@ impl SaeManifoldTerm {
         // Per-atom amortized encode (atlas distilled from the current dictionary)
         // → predicted coords t̂ + per-row certificates.
         let encoded = self.amortized_encode_fitted(targets, rho)?;
-        // Start from the current logits so an uncertified row keeps its existing
-        // routing (the predictor only OVERRIDES rows it can certify).
+        // Start from the current logits so an uncertified ROW keeps its existing
+        // routing verbatim (the predictor only overrides rows it can fully
+        // certify — see the per-row gate below).
         let mut logits = self.assignment.logits.clone();
+        // Accumulate the certified alignment logits and a per-(row, atom)
+        // validity mask WITHOUT writing them into `logits` yet: an alignment
+        // logit is `gate_logit_scale·⟨x, γ̂⟩` on the natural ‖x‖ scale, whereas the
+        // legacy `self.assignment.logits` live on the trained-gate scale. Splicing
+        // one certified alignment logit into a row while the other atoms in that
+        // row keep their legacy logits would build a softmax row that MIXES the
+        // two currencies — the gate would compare an alignment score against a
+        // trained score and route on the scale mismatch, not the geometry. So we
+        // route PER ROW by certification status: a row is rewritten to the
+        // alignment scale only when EVERY atom is certified for it (the whole row
+        // is single-currency); any row with an uncertified atom stays entirely on
+        // the legacy scale.
+        let mut aligned = Array2::<f64>::zeros((n, k_atoms));
+        let mut valid = vec![true; n]; // row fully certified so far
         for atom_idx in 0..k_atoms {
             let atom = &self.atoms[atom_idx];
             let evaluator = match atom.basis_evaluator.as_ref() {
                 Some(e) => e.clone(),
-                // No evaluator ⇒ cannot reconstruct at a new coord; keep current
-                // logits for this atom.
-                None => continue,
+                // No evaluator ⇒ this atom can never be certified at a fresh coord,
+                // so no row can be FULLY certified: mark every row legacy.
+                None => {
+                    valid.iter_mut().for_each(|v| *v = false);
+                    continue;
+                }
             };
             let result = &encoded[atom_idx];
             let m = atom.basis_size();
             for row in 0..n {
                 if !result.certified[row] {
+                    valid[row] = false;
                     continue;
                 }
                 // Reconstruct the amplitude-1 image γ_k(t̂) = Bᵀ φ(t̂).
@@ -291,6 +310,7 @@ impl SaeManifoldTerm {
                 // align with the row.
                 let norm = gamma.iter().map(|g| g * g).sum::<f64>().sqrt();
                 if !(norm.is_finite() && norm > 0.0) {
+                    valid[row] = false;
                     continue;
                 }
                 let mut align = 0.0_f64;
@@ -298,7 +318,18 @@ impl SaeManifoldTerm {
                     align += targets[[row, out]] * (gamma[out] / norm);
                 }
                 if align.is_finite() {
-                    logits[[row, atom_idx]] = gate_logit_scale * align;
+                    aligned[[row, atom_idx]] = gate_logit_scale * align;
+                } else {
+                    valid[row] = false;
+                }
+            }
+        }
+        // Per-row gate: rewrite a row onto the alignment scale only if the whole
+        // row certified; otherwise it keeps its legacy logits untouched.
+        for row in 0..n {
+            if valid[row] {
+                for atom_idx in 0..k_atoms {
+                    logits[[row, atom_idx]] = aligned[[row, atom_idx]];
                 }
             }
         }

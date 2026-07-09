@@ -118,16 +118,45 @@ pub struct AtomLambdaTrajectory {
 }
 
 impl AtomLambdaTrajectory {
-    /// The atom's strongest positive-jump (birth) log-e-value over its trajectory,
-    /// `−∞` (as `f64::NEG_INFINITY` mapped to a large-negative) if it never rose.
-    /// Feeds the cross-atom e-BH. A never-born atom contributes a log-e ≤ 0 so it
-    /// cannot be selected.
+    /// The atom's birth log-e-value: the log of the MEAN of its positive-jump
+    /// e-values, averaged over the atom's fixed step count. `−∞` if it never rose.
+    /// Feeds the cross-atom e-BH.
+    ///
+    /// The natural summary "did this atom ever rise?" is a UNION over steps. Its
+    /// tempting instrument — `max_step e_step` — is NOT an e-value: for `S` steps
+    /// `E_{H0}[max_s e_s] ≤ S`, not `≤ 1`, so feeding it to e-BH inflates the
+    /// cross-atom FDR by up to a factor of the step count. The valid union
+    /// instrument is the MIXTURE (average) e-value `ē = (1/S)·Σ_s e_s·1[Δλ_s>0]`:
+    /// each summand `e_s·1[Δλ_s>0] ≤ e_s` has `E_{H0}[e_s] ≤ 1` (the per-step
+    /// calibrated e-value), the sign indicator lies in `{0,1}` so it can only
+    /// shrink the summand, and the divisor is the FIXED step count `S` (not the
+    /// data-dependent number of positive steps), hence `E_{H0}[ē] ≤ (1/S)·Σ_s 1 =
+    /// 1` — a genuine e-value. We prefer the mixture to a compounded product
+    /// martingale here because a birth is a SINGLE step-jump (a union claim), not
+    /// evidence accumulating across every step; the product would test "jumped at
+    /// every step" and vanish for a lone birth. A large single-step birth e-value
+    /// survives the `1/S` dilution and still clears e-BH; a never-born atom sums
+    /// to 0 (`log −∞`) and cannot be selected. Computed by log-sum-exp for
+    /// overflow safety.
     pub fn peak_birth_log_e(&self) -> f64 {
-        self.jumps
+        let n_steps = self.jumps.len();
+        if n_steps == 0 {
+            return f64::NEG_INFINITY;
+        }
+        let positive: Vec<f64> = self
+            .jumps
             .iter()
             .filter(|j| j.delta_lambda > 0.0)
             .map(|j| j.log_e)
-            .fold(f64::NEG_INFINITY, f64::max)
+            .collect();
+        let max = positive.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if !max.is_finite() {
+            // No positive jump ⇒ the mixture is exactly 0 ⇒ log −∞.
+            return f64::NEG_INFINITY;
+        }
+        // log( (1/S)·Σ_{Δλ>0} exp(log_e) ) = logsumexp − ln S, overflow-safe.
+        let sumexp: f64 = positive.iter().map(|&l| (l - max).exp()).sum();
+        max + sumexp.ln() - (n_steps as f64).ln()
     }
 }
 
