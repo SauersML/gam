@@ -464,24 +464,33 @@ pub(crate) fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
 /// spaces of the honest decoders in `ℝ^p`. Each row space's orthonormal basis is
 /// the right-singular vectors of the `M × p` decoder above a numerical-rank
 /// threshold; the singular values of `Q_srcᵀ Q_tgt` are the cosines of the
-/// angles.
+/// angles. Unequal ranks append one `π/2` angle for every unmatched image
+/// direction, so nested spans surface the rank change instead of reporting a
+/// zero-distance match. A rank-zero image likewise contributes `π/2` for every
+/// live direction in the other image.
 pub(crate) fn principal_angles_between_images(
     b_src: &Array2<f64>,
     b_tgt: &Array2<f64>,
 ) -> Result<Vec<f64>, String> {
     let q_src = orthonormal_row_basis(b_src)?; // r_src × p
     let q_tgt = orthonormal_row_basis(b_tgt)?; // r_tgt × p
-    if q_src.nrows() == 0 || q_tgt.nrows() == 0 {
-        return Ok(Vec::new());
+    let r_src = q_src.nrows();
+    let r_tgt = q_tgt.nrows();
+    if r_src == 0 || r_tgt == 0 {
+        return Ok(vec![std::f64::consts::FRAC_PI_2; r_src.max(r_tgt)]);
     }
     let cross = q_src.dot(&q_tgt.t()); // r_src × r_tgt
     let (_u, svals, _vt) = cross
         .svd(false, false)
         .map_err(|e| format!("principal_angles_between_images: SVD failed: {e}"))?;
-    let angles = svals
+    let mut angles = svals
         .iter()
         .map(|&sv| sv.clamp(0.0, 1.0).acos())
         .collect::<Vec<f64>>();
+    angles.extend(std::iter::repeat_n(
+        std::f64::consts::FRAC_PI_2,
+        r_src.abs_diff(r_tgt),
+    ));
     Ok(angles)
 }
 

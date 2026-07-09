@@ -734,6 +734,14 @@ impl GrassmannFrame {
                 self.output_dim()
             ));
         }
+        if other.ncols() != self.rank() {
+            // Principal angles pair only the common number of directions. Any
+            // unmatched direction in unequal-rank subspaces is orthogonal to
+            // the absent direction and therefore contributes pi/2. Returning
+            // only the paired angles made nested spaces read as distance zero
+            // in one argument order and non-zero in the other.
+            return Ok(std::f64::consts::FRAC_PI_2);
+        }
         let other_owned = other.to_owned();
         let overlap = fast_atb(&self.frame, &other_owned);
         let (_u, sv_cos, _vt) = overlap
