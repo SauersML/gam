@@ -19,6 +19,7 @@ gam-custom-family = { path = "../gam-custom-family", version = "=0.3.148" }
 gam-identifiability = { path = "../gam-identifiability", version = "=0.3.148" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.148" }
 gam-math = { path = "../gam-math", version = "=0.3.148" }
+gam-optimize = { path = "../gam-optimize", version = "=0.3.148" }
 gam-model-api = { path = "../gam-model-api", version = "=0.3.148" }
 gam-model-kernels = { path = "../gam-model-kernels", version = "=0.3.148" }
 gam-problem = { path = "../gam-problem", version = "=0.3.148" }

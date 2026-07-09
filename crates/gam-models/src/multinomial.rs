@@ -68,6 +68,8 @@ use crate::multinomial_reml::MultinomialFamily;
 use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
 use gam_terms::inference::formula_dsl::parse_formula;
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
+use std::convert::Infallible;
 use crate::model_types::EstimationError;
 use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
@@ -1161,24 +1163,30 @@ fn fit_penalized_multinomial_firth_fallback(
             }
         }
 
-        // Backtracking line search on ℓ* (ascent). Reject any candidate whose I is
-        // not SPD (boundary), so the iterate stays interior.
+        // Backtracking line search on ℓ* (ascent) via the shared `gam_optimize`
+        // primitive: t₀ = 1, halving up to 60 trials. A candidate whose expected
+        // information `I` is not SPD (boundary) is an INVALID trial (`Ok(None)`),
+        // so the search contracts without consulting the acceptance test, keeping
+        // the iterate interior. The ascent predicate `o1 ≥ o0 − 1e-12` is inlined
+        // verbatim, so the accepted step is bit-for-bit the hand-rolled loop's.
         let o0 = objective(&probs, &beta, logdet_info);
-        let mut step = 1.0_f64;
-        let mut accepted = false;
-        for _ in 0..60 {
-            let cand = &beta + &(&delta * step);
-            let cand_probs = probs_at(&cand);
-            let cand_info = assemble_info(&cand_probs);
-            if let Some(cand_logdet) = spd_logdet(&cand_info) {
-                let o1 = objective(&cand_probs, &cand, cand_logdet);
-                if o1 >= o0 - 1e-12 {
-                    beta = cand;
-                    accepted = true;
-                    break;
-                }
-            }
-            step *= 0.5;
+        let accepted_step = match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig::default(),
+            |step| {
+                let cand = &beta + &(&delta * step);
+                let cand_probs = probs_at(&cand);
+                let cand_info = assemble_info(&cand_probs);
+                Ok(spd_logdet(&cand_info)
+                    .map(|cand_logdet| (objective(&cand_probs, &cand, cand_logdet), cand)))
+            },
+            |_step, o1| o1 >= o0 - 1e-12,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        };
+        let accepted = accepted_step.is_some();
+        if let Some(step) = accepted_step {
+            beta = step.payload;
         }
         if !accepted {
             // Backtracking exhausted 60 halvings without an admissible ascent
