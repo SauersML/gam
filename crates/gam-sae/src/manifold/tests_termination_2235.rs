@@ -84,6 +84,62 @@ fn reset_stationarity_reopens_a_stationary_freeze_but_not_a_budget_one() {
     );
 }
 
+/// Fit-level deadline honesty: a full production cascade under an
+/// adversarially tiny wall budget must RETURN — a fitted term with finite
+/// reconstruction and a `BudgetExhausted` (or engine-converged) verdict —
+/// never hang and never error. This is #2235's T4 property at the smallest
+/// real shape (the planted-circle fixture the 1782 harness uses).
+#[test]
+fn tiny_wall_budget_fit_returns_certified_incumbent_not_error() {
+    use super::tests::{global_ev, planted_circle_embedded};
+    use super::tests_startup_validation_1782::{Topo, objective_and_seed};
+
+    let z = planted_circle_embedded(48, 6, 0.03);
+    let (mut objective, seed) = objective_and_seed(
+        z.view(),
+        2,
+        Topo::Circle,
+        crate::assignment::AssignmentMode::softmax(1.0),
+    );
+    // A 1ms budget expires before the second evaluation; the ledger freezes
+    // as soon as the first cost is banked.
+    objective.set_outer_wall_budget(std::time::Duration::from_millis(1));
+    let n_params = seed.len();
+    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(seed)
+        .with_max_iter(8)
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .run(&mut objective, "SAE manifold")
+        .expect("a budget-frozen fit must complete through the bridge, not error");
+    let fitted = objective.into_fitted();
+    let ev = global_ev(z.view(), fitted.term.fitted().view());
+    eprintln!(
+        "[#2235 tiny-budget] verdict={:?} evals={} ev={ev:.4}",
+        fitted.termination.verdict, fitted.termination.evals
+    );
+    assert!(ev.is_finite(), "budget-frozen fit must return a real reconstruction");
+    assert!(
+        fitted.termination.evals >= 1,
+        "at least one evaluation must have banked an incumbent"
+    );
+    // With a 1ms budget the verdict is BudgetExhausted unless the engine
+    // legitimately finished inside the first evaluation (EngineStopped) —
+    // both are verdicts; a hang or an Err is the only failure.
+    assert!(
+        matches!(
+            fitted.termination.verdict,
+            super::outer_objective::SaeOuterTerminationVerdict::BudgetExhausted
+                | super::outer_objective::SaeOuterTerminationVerdict::EngineStopped
+        ),
+        "unexpected verdict {:?}",
+        fitted.termination.verdict
+    );
+}
+
 #[test]
 fn non_finite_and_immaterial_costs_do_not_count_as_improvement() {
     let mut ledger = OuterTerminationLedger::new(None);
