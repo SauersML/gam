@@ -17,12 +17,21 @@ impl gam_problem::HessianOperator for TestHessianOperator {
         self.matrix.nrows()
     }
 
-    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
-        Ok(self.matrix.dot(v))
+    fn apply_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), opt::ObjectiveEvalError> {
+        out.assign(&self.matrix.dot(v));
+        Ok(())
     }
 
-    fn is_cheap_to_materialize(&self) -> bool {
-        true
+    fn materialization(&self) -> opt::HessianMaterialization {
+        opt::HessianMaterialization::Explicit
+    }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, opt::ObjectiveEvalError> {
+        Ok(self.matrix.clone())
     }
 }
 
@@ -115,7 +124,7 @@ pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
         _ => panic!("batched hook should expose an operator"),
     };
     let dense = operator
-        .mul_mat(Array2::<f64>::eye(2).view())
+        .apply_mat(Array2::<f64>::eye(2).view())
         .expect("operator materializes on small exact case");
     assert_eq!(dense, exact);
 }

@@ -272,21 +272,33 @@ impl SaeFitCheckpoint {
             file.sync_all()?;
             Ok(())
         })();
-        if let Err(e) = write_result {
-            // Never leave a partial temp file behind.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!(
-                "SaeFitCheckpoint::save_atomic: write temp {}: {e}",
-                tmp.display()
-            ));
+        if let Err(write_error) = write_result {
+            return match remove_file_if_present(&tmp) {
+                Ok(()) => Err(format!(
+                    "SaeFitCheckpoint::save_atomic: write temp {}: {write_error}",
+                    tmp.display()
+                )),
+                Err(cleanup_error) => Err(format!(
+                    "SaeFitCheckpoint::save_atomic: write temp {}: {write_error}; cleanup failed: \
+                     {cleanup_error}",
+                    tmp.display()
+                )),
+            };
         }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!(
-                "SaeFitCheckpoint::save_atomic: rename into {}: {e}",
-                path.display()
-            )
-        })
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(rename_error) => match remove_file_if_present(&tmp) {
+                Ok(()) => Err(format!(
+                    "SaeFitCheckpoint::save_atomic: rename into {}: {rename_error}",
+                    path.display()
+                )),
+                Err(cleanup_error) => Err(format!(
+                    "SaeFitCheckpoint::save_atomic: rename into {}: {rename_error}; cleanup \
+                     failed: {cleanup_error}",
+                    path.display()
+                )),
+            },
+        }
     }
 
     /// Load and decode a checkpoint file. Errors on a missing / unreadable file
@@ -337,6 +349,16 @@ impl SaeFitCheckpoint {
             ));
         }
         Ok(())
+    }
+}
+
+/// Remove an atomic-write scratch file when it exists. A failed create leaves
+/// no file to remove; every other cleanup failure is surfaced to the caller.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -421,7 +443,7 @@ mod checkpoint_tests {
         ckpt.save_atomic(&path).expect("save");
         let loaded = SaeFitCheckpoint::load(&path).expect("load");
         assert_eq!(loaded, ckpt, "checkpoint must round-trip through disk");
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove round-trip checkpoint");
     }
 
     /// A data-fingerprint mismatch is a typed refusal, and a matching one passes.
@@ -506,7 +528,7 @@ mod checkpoint_tests {
             path.exists(),
             "destination must exist after a successful save"
         );
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).expect("remove successful-save checkpoint");
     }
 
     #[test]

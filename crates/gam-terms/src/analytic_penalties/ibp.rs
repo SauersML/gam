@@ -703,6 +703,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: a fixed/inert column contributes nothing to the energy,
+                // so its gradient block is exactly zero (matches `value`).
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k];
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let direct_z_score = ((1.0 - pk) / pk).ln();
@@ -756,6 +761,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: a fixed/inert column contributes nothing to the energy,
+                // so its curvature block is exactly zero (matches `value`).
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k];
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let direct_z_score = ((1.0 - pk) / pk).ln();
@@ -862,6 +872,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
+                // #Bug4: fixed/inert column ⇒ zero Hessian block (columns are
+                // decoupled, so skipping zeroes the whole block; matches `value`).
+                if self.column_is_fixed(k) {
+                    continue;
+                }
                 let zk = z[start + k];
                 let zjac = zk * (1.0 - zk) * inv_tau;
                 let rank1 = score_derivative[k] * zjac * s_per_col[k];
