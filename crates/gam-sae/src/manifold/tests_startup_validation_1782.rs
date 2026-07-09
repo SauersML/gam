@@ -28,7 +28,7 @@ use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
-enum Topo {
+pub(crate) enum Topo {
     Circle,
     Euclidean,
     Linear,
@@ -38,7 +38,7 @@ enum Topo {
 /// does (PCA-seed the per-atom coordinates, ridge-LSQ each per-atom decoder),
 /// for the requested topology and assignment mode. Returns the term and the
 /// seed reconstruction dispersion the outer cascade scales its ρ seed by.
-fn build_term(
+pub(crate) fn build_term(
     z: ArrayView2<'_, f64>,
     k: usize,
     topo: Topo,
@@ -147,7 +147,7 @@ fn build_term(
 /// Build the objective and dispersion-scaled seed ρ exactly the way the FFI
 /// does (single seed, `inner_max_iter` short — the seed decoder is already
 /// LSQ-fit, so its inner solve starts near-optimal and converges quickly).
-fn objective_and_seed(
+pub(crate) fn objective_and_seed(
     z: ArrayView2<'_, f64>,
     k: usize,
     topo: Topo,

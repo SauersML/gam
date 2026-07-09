@@ -261,6 +261,9 @@ mod tests_ibp_capacity_1784;
 mod tests_startup_validation_1782;
 
 #[cfg(test)]
+mod tests_zoo_micro_local;
+
+#[cfg(test)]
 mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]
