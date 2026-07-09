@@ -6689,18 +6689,22 @@ fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
     assert!(err.contains("approximately latent N(0,1)"));
 }
 
-/// Under P4, bad-normal latent z routes through a rank-INT
-/// calibration (Blom rankits → `Φ⁻¹`) instead of the legacy
-/// local-/global-empirical grid. The closed-form standard-normal
-/// kernel is **exact** on the calibrated scale (the transform is
-/// strictly monotone and produces an exactly-N(0,1) sample by
-/// construction), so the measure stays `StandardNormal` and the
-/// expensive `empirical_rigid_neglog_jet` machinery is bypassed
-/// entirely. This test pins that routing.
+/// Under P4, bad-normal but continuous latent z routes through a
+/// rank-INT calibration (weighted mid-distribution ranks → `Φ⁻¹`)
+/// instead of the legacy local-/global-empirical grid. Rank-INT is a
+/// modeling choice (the affine rigid model is respecified on the
+/// calibrated axis), and the standard-normal closed-form kernel is
+/// admitted only because the calibrated sample itself passes the
+/// standard-normal adequacy gate — which a distinct-valued sample's
+/// mid-rank normal scores do. This test pins that routing.
 #[test]
 fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
-    let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
-    let weights = Array1::from_elem(6, 1.0);
+    // Exponential quantiles: strongly skewed (the raw pooled gate fails on
+    // mean/skew), but all values are distinct, so the calibrated mid-rank
+    // normal scores pass the gate and keep the standard-normal kernel.
+    let n = 100usize;
+    let z = Array1::from_iter((1..=n).map(|i| -f64::ln(1.0 - (i as f64 - 0.5) / n as f64)));
+    let weights = Array1::from_elem(n, 1.0);
     let policy = LatentZPolicy {
         check_mode: LatentZCheckMode::Off,
         normalization: LatentZNormalizationMode::None,
@@ -6755,6 +6759,88 @@ fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
                  calibration must never be ConditionalLocationScale here"
             )
         }
+    }
+}
+
+/// Rank-INT cannot Gaussianize a heavily tied sample: the calibrated law
+/// stays discrete (here four of six observations share one atom), so the
+/// standard-normal adequacy re-check on the calibrated scale fails and the
+/// Auto path must fall back to the mathematically exact global-empirical
+/// latent measure instead of running the closed-form standard-normal
+/// kernel on a non-Gaussian score.
+#[test]
+fn auto_latent_measure_falls_back_to_empirical_when_rank_int_cannot_gaussianize() {
+    let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
+    let weights = Array1::from_elem(6, 1.0);
+    let policy = LatentZPolicy {
+        check_mode: LatentZCheckMode::Off,
+        normalization: LatentZNormalizationMode::None,
+        latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
+        ..LatentZPolicy::default()
+    };
+    let (measure, calibration) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto latent measure", e));
+    assert!(
+        matches!(measure, LatentMeasureKind::GlobalEmpirical { .. }),
+        "tied latent z whose rank-INT output fails the adequacy gate must use the \
+         global-empirical latent measure, got {measure:?}"
+    );
+    assert!(
+        matches!(calibration, LatentMeasureCalibration::None),
+        "the empirical fallback models the raw score directly; no rank-INT map applies"
+    );
+}
+
+/// The weighted mid-distribution rank-INT depends only on *relative*
+/// weights: rescaling every weight by a common factor must leave the
+/// calibrated scores unchanged, and a two-point sample must map to
+/// symmetric non-degenerate normal scores (the scale-dependent Blom
+/// formula collapsed both to zero at total weight one).
+#[test]
+fn rank_int_calibration_is_invariant_to_common_weight_rescaling() {
+    let z = array![-1.0, 1.0];
+    for &scale in &[0.5_f64, 1.0, 100.0] {
+        let weights = Array1::from_elem(2, scale * 0.5);
+        let cal = LatentZRankIntCalibration::fit(&z, &weights)
+            .unwrap_or_else(|e| panic!("rank-INT fit failed at weight scale {scale}: {e:?}"));
+        // Mid-ranks are (0.25, 0.75) at every common weight scale.
+        assert!(
+            (cal.weighted_cdf[0] - 0.25).abs() < 1e-12 && (cal.weighted_cdf[1] - 0.75).abs() < 1e-12,
+            "mid-distribution ranks must be (0.25, 0.75) independent of weight scale, got {:?} at scale {scale}",
+            cal.weighted_cdf
+        );
+        let lo = cal.apply_at_predict(-1.0);
+        let hi = cal.apply_at_predict(1.0);
+        assert!(
+            (lo + hi).abs() < 1e-12 && hi > 0.5,
+            "calibrated two-point scores must be symmetric and non-degenerate, got ({lo}, {hi}) at scale {scale}"
+        );
+    }
+}
+
+/// Zero-weight observations carry no probability mass: they must not become
+/// knots of the weighted empirical distribution, and tie groups get the
+/// midpoint of their pooled mass.
+#[test]
+fn rank_int_calibration_drops_zero_mass_knots_and_pools_tie_mass() {
+    let z = array![-2.0, 0.0, 0.0, 5.0, 3.0];
+    let weights = array![1.0, 1.0, 1.0, 0.0, 1.0];
+    let cal = LatentZRankIntCalibration::fit(&z, &weights)
+        .unwrap_or_else(|e| panic!("rank-INT fit failed: {e:?}"));
+    assert_eq!(
+        cal.sorted_z,
+        vec![-2.0, 0.0, 3.0],
+        "the zero-weight z=5 row must not become a knot"
+    );
+    // W=4: p(-2)=0.5/4, p(0)=(1+1)/4 (tie group of mass 2 centered at its
+    // midpoint), p(3)=(3+0.5)/4.
+    let expect = [0.125, 0.5, 0.875];
+    for (got, want) in cal.weighted_cdf.iter().zip(expect.iter()) {
+        assert!(
+            (got - want).abs() < 1e-12,
+            "mid-distribution ranks must be {expect:?}, got {:?}",
+            cal.weighted_cdf
+        );
     }
 }
 
