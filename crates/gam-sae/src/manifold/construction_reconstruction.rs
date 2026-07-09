@@ -142,6 +142,122 @@ pub fn reconstruct_persisted_atom_set(
     Ok(out)
 }
 
+/// Stateless on-manifold STEER of a persisted atom set (gam#2234): the ambient
+/// steering DELTA `a_{ik}·(Φ_k(t_i ⊕ δ) − Φ_k(t_i))·B_k` for the single atom
+/// `steer_atom`, one row per input row, shape `(n_rows, p_out)`. The caller adds
+/// it to the ambient activation `x`.
+///
+/// This is the stateless counterpart of [`SaeManifoldTerm::steer_rows`] for the
+/// Python facade's persisted-artifact path (E1), single-sourced against the SAME
+/// [`persisted_atom_basis_values`] evaluator as [`reconstruct_persisted_atom_set`]
+/// so the facade never becomes a second decoder. The group action `⊕` is the
+/// atom's own [`LatentManifold::retract`] (Circle phase add modulo period,
+/// Euclidean translate, product blockwise), derived from the persisted basis kind
+/// — never re-implemented modular arithmetic. The persisted decoder folds the
+/// atom amplitude in already (as in `reconstruct_persisted_atom_set`), so no
+/// separate `exp(s_k)` is applied. Gates are read from the persisted `assignments`
+/// and left untouched by the steer.
+pub fn steer_persisted_atom_set(
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dims: &[usize],
+    decoder_blocks: &[ArrayView2<'_, f64>],
+    coords: &[ArrayView2<'_, f64>],
+    assignments: ArrayView2<'_, f64>,
+    p_out: usize,
+    steer_atom: usize,
+    delta: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let k_atoms = basis_kinds.len();
+    if atom_dims.len() != k_atoms || decoder_blocks.len() != k_atoms || coords.len() != k_atoms {
+        return Err(format!(
+            "steer_persisted_atom_set: metadata lengths must all equal K={k_atoms} \
+             (atom_dims={}, decoder_blocks={}, coords={})",
+            atom_dims.len(),
+            decoder_blocks.len(),
+            coords.len()
+        ));
+    }
+    if steer_atom >= k_atoms {
+        return Err(format!(
+            "steer_persisted_atom_set: steer_atom {steer_atom} out of range (K={k_atoms})"
+        ));
+    }
+    let n_rows = assignments.nrows();
+    if assignments.ncols() != k_atoms {
+        return Err(format!(
+            "steer_persisted_atom_set: assignments {:?} must have K={k_atoms} columns",
+            assignments.dim()
+        ));
+    }
+    if p_out == 0 {
+        return Err("steer_persisted_atom_set: p_out must be positive".to_string());
+    }
+    let d = atom_dims[steer_atom];
+    if delta.len() != d {
+        return Err(format!(
+            "steer_persisted_atom_set: delta length {} != atom {steer_atom} latent_dim {d}",
+            delta.len()
+        ));
+    }
+    let decoder = decoder_blocks[steer_atom];
+    let (basis_width, decoder_p) = decoder.dim();
+    if decoder_p != p_out {
+        return Err(format!(
+            "steer_persisted_atom_set: atom {steer_atom} decoder output width {decoder_p} != \
+             p_out {p_out}"
+        ));
+    }
+    let atom_coords = coords[steer_atom];
+    if atom_coords.nrows() != n_rows {
+        return Err(format!(
+            "steer_persisted_atom_set: atom {steer_atom} coords rows {} != {n_rows}",
+            atom_coords.nrows()
+        ));
+    }
+    if atom_coords.ncols() != d {
+        return Err(format!(
+            "steer_persisted_atom_set: atom {steer_atom} coords cols {} != latent_dim {d}",
+            atom_coords.ncols()
+        ));
+    }
+    // The group action `t ⊕ δ` via the atom's own manifold retraction.
+    let manifold = basis_kinds[steer_atom].latent_manifold(d);
+    let mut steered = Array2::<f64>::zeros((n_rows, d));
+    for row in 0..n_rows {
+        let moved = manifold.retract(atom_coords.row(row), delta);
+        for a in 0..d {
+            steered[[row, a]] = moved[a];
+        }
+    }
+    let phi_base = persisted_atom_basis_values(
+        &basis_kinds[steer_atom],
+        atom_coords,
+        basis_width,
+        d,
+        steer_atom,
+    )?;
+    let phi_steer = persisted_atom_basis_values(
+        &basis_kinds[steer_atom],
+        steered.view(),
+        basis_width,
+        d,
+        steer_atom,
+    )?;
+    let base_dec = phi_base.dot(&decoder);
+    let steer_dec = phi_steer.dot(&decoder);
+    let mut out = Array2::<f64>::zeros((n_rows, p_out));
+    for row in 0..n_rows {
+        let gate = assignments[[row, steer_atom]];
+        if gate == 0.0 {
+            continue;
+        }
+        for col in 0..p_out {
+            out[[row, col]] = gate * (steer_dec[[row, col]] - base_dec[[row, col]]);
+        }
+    }
+    Ok(out)
+}
+
 impl SaeManifoldTerm {
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
     /// unscaled inverse-Hessian β-block `S_β⁻¹` into a posterior covariance

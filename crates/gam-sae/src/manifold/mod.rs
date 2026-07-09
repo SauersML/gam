@@ -221,6 +221,7 @@ mod sandwich;
 mod schedule;
 mod shape_uncertainty;
 mod stagewise;
+mod steering;
 mod stratum_births;
 mod streaming_plan;
 mod streaming_seed;
@@ -262,6 +263,9 @@ mod tests_startup_validation_1782;
 
 #[cfg(test)]
 mod tests_zoo_micro_local;
+
+#[cfg(test)]
+mod tests_steering_e4;
 
 #[cfg(test)]
 mod tests_schur_seed_refusal_1782;
@@ -402,6 +406,7 @@ pub use construction_aux_types::*;
 pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;
 pub use construction_reconstruction::reconstruct_persisted_atom_set;
+pub use construction_reconstruction::steer_persisted_atom_set;
 // #16/#2023 — the shared rank-charge DOF core, exposed so the hybrid-split DEMOTE
 // gate prices linear/curved candidates in the SAME currency as the joint REML fit.
 pub(crate) use construction::realised_rank_charge_dof;
