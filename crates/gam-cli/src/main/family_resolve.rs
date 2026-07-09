@@ -121,31 +121,3 @@ pub(crate) fn binomial_mean_linkwiggle_supports_family(
     standard_binomial
         && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
 }
-
-pub(crate) fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
-    if y.is_empty() {
-        return false;
-    }
-    y.iter()
-        .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
-}
-
-/// Project the CLI's `EncodedDataset` column-kind tag onto the
-/// [`ResponseColumnKind`] consumed by the family layer. Mirrors the helper
-/// of the same name in `workflow.rs` — having two tiny copies (one per
-/// crate-internal entry point) is cleaner than threading the ingest enum
-/// itself into the types layer.
-pub(crate) fn response_column_kind_for_dataset(ds: &Dataset, y_col: usize) -> ResponseColumnKind {
-    match ds.column_kinds.get(y_col) {
-        Some(ColumnKindTag::Categorical) => ResponseColumnKind::Categorical {
-            levels: ds
-                .schema
-                .columns
-                .get(y_col)
-                .map(|sc| sc.levels.clone())
-                .unwrap_or_default(),
-        },
-        Some(ColumnKindTag::Binary) => ResponseColumnKind::Binary,
-        Some(ColumnKindTag::Continuous) | None => ResponseColumnKind::Numeric,
-    }
-}

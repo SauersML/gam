@@ -887,7 +887,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
 /// it replaces would ALSO have executed on the device — the residency frame only
 /// changes HOW the (identical) device step is fed (base blocks resident vs
 /// re-uploaded), never the numbers. It additionally declines under
-/// [`gam_gpu::GpuMode::Off`], leaving the Off path bit-identical to before.
+/// [`gam_gpu::GpuPolicy::Off`], leaving the Off path bit-identical to before.
 fn build_resident_base_frame_if_admitted(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
@@ -903,7 +903,7 @@ fn build_resident_base_frame_if_admitted(
     {
         return None;
     }
-    if matches!(gam_gpu::gpu_mode(), gam_gpu::GpuMode::Off) {
+    if matches!(gam_gpu::global_policy(), gam_gpu::GpuPolicy::Off) {
         return None;
     }
     // Same size gate as `try_device_arrow_direct`, BEFORE `GpuRuntime::global()`,

@@ -135,7 +135,9 @@ fn sas_epsilon_objective_profile_measure() {
     let s_list = one_penalty_for_non_intercept(x.ncols());
 
     eprintln!("===== #1876 SAS ε OBJECTIVE PROFILE MEASURE =====");
-    eprintln!("fixture: n={n} eps_true={eps_true} log_delta_true={log_delta_true} (reml_score: lower = better)");
+    eprintln!(
+        "fixture: n={n} eps_true={eps_true} log_delta_true={log_delta_true} (reml_score: lower = better)"
+    );
 
     // 1. ε-profile of reml_score at the TRUE log_δ (β and λ optimized at each ε).
     eprintln!("--- reml_score(ε | log_δ = log_δ_true), β+λ optimized ---");
@@ -152,7 +154,9 @@ fn sas_epsilon_objective_profile_measure() {
             best_eps = e;
         }
     }
-    eprintln!("  => argmin reml_score over ε-grid: eps*={best_eps:+.3} (reml_score={best_score:+.6e})");
+    eprintln!(
+        "  => argmin reml_score over ε-grid: eps*={best_eps:+.3} (reml_score={best_score:+.6e})"
+    );
 
     // 2. Central finite-difference of the profile at ε=0 (the TRUE dReml/dε).
     let h = 0.05_f64;
@@ -167,7 +171,8 @@ fn sas_epsilon_objective_profile_measure() {
     );
 
     // 3. reml_score at the true skew vs at ε=0, holding log_δ = true.
-    let (score_at_true, _) = fixed_link_reml(&x, &y, &w, &offset, &s_list, eps_true, log_delta_true);
+    let (score_at_true, _) =
+        fixed_link_reml(&x, &y, &w, &offset, &s_list, eps_true, log_delta_true);
     let (score_at_zero, _) = fixed_link_reml(&x, &y, &w, &offset, &s_list, 0.0, log_delta_true);
     eprintln!(
         "--- reml_score(ε=0.38,log_δ_true)={score_at_true:+.6e}  vs reml_score(ε=0,log_δ_true)={score_at_zero:+.6e}  Δ={:+.6e} ---",
@@ -223,8 +228,16 @@ fn sas_epsilon_objective_profile_measure() {
     for (i, rec) in evals.iter().enumerate() {
         let n = rec.gradient.len();
         let eps_theta = if n >= 2 { rec.theta[n - 2] } else { f64::NAN };
-        let eps_grad = if n >= 2 { rec.gradient[n - 2] } else { f64::NAN };
-        let ldelta_grad = if n >= 1 { rec.gradient[n - 1] } else { f64::NAN };
+        let eps_grad = if n >= 2 {
+            rec.gradient[n - 2]
+        } else {
+            f64::NAN
+        };
+        let ldelta_grad = if n >= 1 {
+            rec.gradient[n - 1]
+        } else {
+            f64::NAN
+        };
         eprintln!(
             "  eval {:>2}: cost={:+.6e}  ε_raw(θ)={eps_theta:+.5e}  analytic dCost/dε={eps_grad:+.6e}  dCost/dlog_δ={ldelta_grad:+.6e}  ‖g‖={:+.3e}",
             i + 1,

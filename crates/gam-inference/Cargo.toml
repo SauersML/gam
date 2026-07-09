@@ -29,7 +29,6 @@ statrs = "0.18.0"
 libm = "0.2.16"
 log = "0.4.29"
 serde = { version = "1.0.228", features = ["derive"] }
-wide = "0.7"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"

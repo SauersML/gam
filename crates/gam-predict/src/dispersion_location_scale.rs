@@ -184,7 +184,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             // conditional η posterior `η ~ N(eta, eta_se²)`.
             PredictPass::PosteriorMean => {
                 let strategy = self.strategy();
-                let quadctx = gam::quadrature::QuadratureContext::new();
+                let quadctx = gam_solve::quadrature::QuadratureContext::new();
                 eta.iter()
                     .zip(eta_se.iter())
                     .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
@@ -370,7 +370,7 @@ impl PerRowDispersionChannel for DispersionLocationScalePredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::types::StandardLink;
+    use gam_spec::StandardLink;
     use ndarray::array;
 
     /// Build a predictor for the given family with unit (intercept-only) design.

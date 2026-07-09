@@ -9,13 +9,10 @@ fn parse_arg(args: &[String], idx: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn parse_mode(args: &[String]) -> Result<gam_gpu::GpuMode, String> {
-    match args.get(6).map(String::as_str).unwrap_or("required") {
-        "auto" => Ok(gam_gpu::GpuMode::Auto),
-        "required" => Ok(gam_gpu::GpuMode::Required),
-        "off" => Ok(gam_gpu::GpuMode::Off),
-        other => Err(format!("mode must be off|auto|required, got {other}")),
-    }
+fn parse_policy(args: &[String]) -> Result<gam_gpu::GpuPolicy, String> {
+    let raw = args.get(6).map(String::as_str).unwrap_or("required");
+    gam_gpu::GpuPolicy::parse(raw)
+        .ok_or_else(|| format!("policy must be off|auto|required, got {raw}"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p = parse_arg(&args, 3, 48);
     let active = parse_arg(&args, 4, 4);
     let tile = parse_arg(&args, 5, 1024);
-    let mode = parse_mode(&args)?;
+    let policy = parse_policy(&args)?;
 
     let rows = Array2::<f32>::from_shape_fn((n_rows, p), |(r, c)| {
         (((r * 31 + c * 17 + 3) as f32) * 0.013).sin() * 0.9
@@ -41,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scorer = TileScorer::new(active, tile);
     let start = Instant::now();
     let routed = scorer
-        .route_minibatch_with_mode(rows.view(), decoder.view(), mode)
+        .route_minibatch_with_mode(rows.view(), decoder.view(), policy)
         .expect("route benchmark");
     let elapsed = start.elapsed();
 
@@ -57,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fold(0u64, |acc, v| acc.wrapping_mul(16_777_619) ^ v);
     writeln!(
         std::io::stdout(),
-        "rows={n_rows} atoms={n_atoms} p={p} active={active} tile={tile} mode={mode} \
+        "rows={n_rows} atoms={n_atoms} p={p} active={active} tile={tile} policy={policy} \
          path={:?} elapsed_ms={:.3} admitted={} tiles={} peak_score_mb={:.2} \
          score_elems={} dot_flops_lower_bound={} device_dtoh_kb={:.2} \
          unfused_score_dtoh_avoided_mb={:.2} checksum={checksum}",

@@ -54,8 +54,7 @@ impl SmoothLogMean {
 
     fn eta(&self, x: f64) -> f64 {
         self.center
-            + self.amplitude
-                * (std::f64::consts::TAU * (self.frequency * x + self.phase)).sin()
+            + self.amplitude * (std::f64::consts::TAU * (self.frequency * x + self.phase)).sin()
     }
 }
 

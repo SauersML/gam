@@ -108,9 +108,7 @@ fn fit_scan_log_lambda(a: f64, n: usize) -> f64 {
     };
     match fit_from_formula("y ~ s(x, double_penalty=false)", &data, &cfg).expect("fit ok") {
         FitResult::SplineScan(scan) => scan.log_lambda,
-        _ => panic!(
-            "expected the single-penalty free B-spline to route to the exact spline scan"
-        ),
+        _ => panic!("expected the single-penalty free B-spline to route to the exact spline scan"),
     }
 }
 

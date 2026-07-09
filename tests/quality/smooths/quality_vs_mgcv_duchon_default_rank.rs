@@ -73,7 +73,8 @@ fn assert_duchon_1d_default_rank(n: usize, sigma: f64, seed: u64, k_mgcv: usize,
         .zip(y.iter())
         .map(|(a, b)| csv::StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode synthetic 1d dataset");
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode synthetic 1d dataset");
     let col = ds.column_map();
     let x_idx = col["x"];
 

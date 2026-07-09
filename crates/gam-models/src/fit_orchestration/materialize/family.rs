@@ -14,7 +14,7 @@ royston-parmar, transformation-normal";
 /// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
 /// maps to `Numeric` and the family layer scans `y` itself to decide
 /// Gaussian vs. Binomial.
-pub(crate) fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind {
+pub fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind {
     match data.column_kinds.get(y_col) {
         Some(ColumnKindTag::Categorical) => ResponseColumnKind::Categorical {
             levels: data

@@ -171,8 +171,8 @@ pub(crate) use gam::families::fit_orchestration::{
     SurvivalTransformationFitRequest, SurvivalTransformationTermSpec,
     TransformationNormalFitRequest, WorkflowError, fit_model,
     gate_duchon_operator_penalties_for_family, prepare_survival_time_stack,
-    residual_cascade_fast_path, resolve_offset_column, resolve_weight_column,
-    spline_scan_fast_path,
+    is_binary_response, residual_cascade_fast_path, resolve_offset_column, resolve_weight_column,
+    response_column_kind, route_marginal_slope_deviation_blocks, spline_scan_fast_path,
 };
 
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};

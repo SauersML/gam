@@ -38,7 +38,7 @@
 //! rate is the CPU encode throughput. This test does NOT fabricate a device
 //! number; it establishes the end-to-end CPU baseline + the correctness contract
 //! a future device encode must match, and it exercises `gam-gpu`'s runtime probe
-//! + fail-closed (`GpuMode::Required`) guard so the GPU plumbing stays wired.
+//! + fail-closed (`GpuPolicy::Required`) guard so the GPU plumbing stays wired.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,7 +48,7 @@ use ndarray::{Array1, Array2};
 use gam_gpu::device_runtime::GpuRuntime;
 use gam_gpu::encode_throughput::{FullEncodeThroughput, encode_quality_metrics};
 use gam_gpu::policy::EncodeDeploymentDecision;
-use gam_gpu::{GpuError, GpuMode};
+use gam_gpu::{GpuError, GpuPolicy};
 
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::encode::{AtlasConfig, EncodeAtlas};
@@ -300,20 +300,20 @@ fn full_exact_encode_throughput_and_correctness() {
     // (4) GPU plumbing stays wired and HONEST. The production encode does not
     // route to a device kernel, so on any host today `device_encode_engaged`
     // is false; separately, the fail-closed contract must hold — on a CPU-only
-    // host `GpuMode::Required` surfaces a structured error (never a silent CPU
+    // host `GpuPolicy::Required` surfaces a structured error (never a silent CPU
     // pass dressed as a device run), and on a real device it succeeds.
-    let required = GpuRuntime::global_or_fail(GpuMode::Required);
+    let required = GpuRuntime::global_or_fail(GpuPolicy::Required);
     if GpuRuntime::is_available() {
         assert!(
             required.is_ok(),
-            "GpuMode::Required must succeed when a device is present"
+            "GpuPolicy::Required must succeed when a device is present"
         );
     } else {
         assert!(
             matches!(required, Err(GpuError::DriverLibraryUnavailable { .. })),
-            "GpuMode::Required must fail closed when the device is absent, got {required:?}"
+            "GpuPolicy::Required must fail closed when the device is absent, got {required:?}"
         );
     }
-    // GpuMode::Off always refuses, regardless of hardware.
-    assert!(GpuRuntime::global_or_fail(GpuMode::Off).is_err());
+    // GpuPolicy::Off always refuses, regardless of hardware.
+    assert!(GpuRuntime::global_or_fail(GpuPolicy::Off).is_err());
 }

@@ -1818,7 +1818,7 @@ impl BernoulliMarginalSlopeFamily {
         //    skipped. Any failure (`NoDeviceKernel`, driver errors, or
         //    pack-time precondition mismatch) logs a one-liner and falls
         //    through to the existing CPU path, preserving production
-        //    behaviour under `gpu=auto`. Under `gpu=force`, the upstream
+        //    behaviour under `gpu=auto`. Under `gpu=required`, the upstream
         //    `require_row_primary_hessian_supported` would already have
         //    failed; here we still fall back on launch failure rather than
         //    panic mid-fit.

@@ -113,8 +113,17 @@ fn main() {
     let (seed_b, rho_b) = build_seed(&evaluator, &coords, p);
 
     let t0 = Instant::now();
-    let serial = fit_stagewise(seed_s, rho_s, target.view(), None, None, &config, None, None)
-        .expect("serial driver");
+    let serial = fit_stagewise(
+        seed_s,
+        rho_s,
+        target.view(),
+        None,
+        None,
+        &config,
+        None,
+        None,
+    )
+    .expect("serial driver");
     let serial_dt = t0.elapsed().as_secs_f64();
 
     let batch_config = BatchedStagewiseConfig {

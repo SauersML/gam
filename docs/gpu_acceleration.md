@@ -7,12 +7,12 @@ The runtime policy is set through `crate::gpu::configure_global_policy`:
 ```rust
 use gam::gpu::{configure_global_policy, GpuPolicy};
 
-configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Force
+configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 ```
 
-`cuda_selected()` resolves the policy at each dispatch point: `Auto` returns `GpuRuntime::is_available()` (the probe), `Off` forces CPU, and `Force` forces GPU (propagating any GPU error instead of falling back).
+`cuda_selected()` resolves the policy at each dispatch point: `Auto` returns `GpuRuntime::is_available()` (the probe), `Off` selects CPU, and `Required` requires GPU (propagating any GPU error instead of falling back).
 
-Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"force"`:
+Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
 
 ```python
 gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
@@ -61,7 +61,7 @@ eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense
 Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free
 PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
 `row_primary_hessian_decision(n, r)`; any GPU error under `gpu=auto`
-returns to the existing CPU rayon row loop, while `gpu=force`
+returns to the existing CPU rayon row loop, while `gpu=required`
 propagates the error.
 
 ## Transfer And Precision Policy

@@ -68,7 +68,7 @@ fn run() -> Result<(), String> {
     }
     let (rows, decoder) = fixture(m, g, b, p);
 
-    match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuMode::Auto) {
+    match route_blocks_required(rows.view(), decoder.view(), b, k, gam_gpu::GpuPolicy::Auto) {
         Ok((warm_route, warm_path, warm_bytes)) => {
             println!(
                 "[block-gate speedup] warm-up path={warm_path:?} rows={} dtoh={warm_bytes}B",
@@ -90,7 +90,7 @@ fn run() -> Result<(), String> {
         decoder.view(),
         b,
         k,
-        gam_gpu::GpuMode::Required,
+        gam_gpu::GpuPolicy::Required,
     );
     let (routed, path, dtoh) = match required {
         Ok(value) => value,
@@ -100,14 +100,14 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             return Err(format!(
-                "GpuMode::Required failed despite a CUDA runtime: {err}"
+                "GpuPolicy::Required failed despite a CUDA runtime: {err}"
             ));
         }
     };
     let device_secs = device_start.elapsed().as_secs_f64();
     if path != BlockRoutePath::Device {
         return Err(format!(
-            "GpuMode::Required returned {path:?}, expected Device"
+            "GpuPolicy::Required returned {path:?}, expected Device"
         ));
     }
     for (row, (dev_sel, cpu_sel)) in routed.iter().zip(&cpu).enumerate() {

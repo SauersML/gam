@@ -15,7 +15,6 @@ dyn-stack = "0.13.2"
 faer = "0.24.0"
 gam-geometry = { path = "../gam-geometry", version = "=0.3.148" }
 gam-gpu = { path = "../gam-gpu", version = "=0.3.148" }
-gam-identifiability = { path = "../gam-identifiability", version = "=0.3.148" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.148" }
 gam-math = { path = "../gam-math", version = "=0.3.148" }
 gam-model-api = { path = "../gam-model-api", version = "=0.3.148" }

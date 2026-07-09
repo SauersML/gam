@@ -28,7 +28,7 @@ pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns
-/// `gpu=force`-without-support into an `Err` string at the call site.
+/// `gpu=required`-without-support into an `Err` string at the call site.
 pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDecision, String> {
     let decision = row_primary_hessian_decision(n, r);
     decision.clone().log();

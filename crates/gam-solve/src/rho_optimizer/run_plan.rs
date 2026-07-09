@@ -1331,11 +1331,12 @@ pub(crate) fn run_outer_with_plan(
                     let device_input = crate::gpu::reml_outer::RemlOuterGpuInput {
                         seed_rho: seed.clone(),
                         bounds: bounds_dev,
-                        gradient_tolerance: grad_tol_dev.abs,
+                        gradient_tolerance: grad_tol_dev,
                         max_iterations: config.max_iter,
                         axis_step_caps: axis_caps_dev,
                         admission,
                         seed_objective: seed_eval_dev.cost,
+                        seed_gradient: seed_eval_dev.gradient.clone(),
                     };
                     // The per-step evaluator routes the on-device
                     // (cost, gradient) assembly through the same

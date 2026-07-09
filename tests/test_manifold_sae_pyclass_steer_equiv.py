@@ -25,14 +25,7 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 from gamfit._sae_manifold import rust_module  # noqa: E402
 
-
-def _core_cls():
-    cls = getattr(rust_module(), "ManifoldSaeCore", None)
-    if cls is None:
-        pytest.skip("wheel predates ManifoldSaeCore.steer (#2091 cutover)")
-    if not hasattr(cls, "steer"):
-        pytest.skip("wheel predates ManifoldSaeCore.steer (#2091 cutover)")
-    return cls
+ManifoldSaeCore = rust_module().ManifoldSaeCore
 
 
 def _assert_plans_bitwise_equal(a: dict, b: dict) -> None:
@@ -62,7 +55,6 @@ def _planted_circle(n: int, p: int, seed: int) -> np.ndarray:
 def test_steer_bitwise_equivalence_circle_with_fisher() -> None:
     """Periodic (circle) atom + a raw output-Fisher shard: exercises the
     n_harmonics gate and the Fisher-metric install / dose path."""
-    core_cls = _core_cls()
     n, p, r = 48, 6, 2
     x = _planted_circle(n, p, seed=0)
     u = np.random.default_rng(1).standard_normal((n, p, r)).astype(np.float64)
@@ -72,7 +64,7 @@ def test_steer_bitwise_equivalence_circle_with_fisher() -> None:
         n_iter=8, random_state=0, fisher_factors=u,
     )
     assert fit.metric_provenance == "OutputFisher"
-    core = core_cls(fit.to_dict())
+    core = ManifoldSaeCore(fit.to_dict())
 
     t_from = np.array([0.0], dtype=np.float64)
     t_to = np.array([0.75], dtype=np.float64)
@@ -87,15 +79,12 @@ def test_reconstruct_training_bitwise_equivalence() -> None:
     """The in-sample reconstruction rebuilt from stored codes is bitwise
     identical between the dataclass and the pyclass (both call the same
     reconstruct_persisted_atom_set core over the same stored state)."""
-    core_cls = _core_cls()
-    if not hasattr(core_cls, "reconstruct_training"):
-        pytest.skip("wheel predates ManifoldSaeCore.reconstruct_training (#2091)")
     x = _planted_circle(40, 6, seed=5)
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         n_iter=8, random_state=0,
     )
-    core = core_cls(fit.to_dict())
+    core = ManifoldSaeCore(fit.to_dict())
     np.testing.assert_array_equal(
         fit.reconstruct_training(), core.reconstruct_training()
     )
@@ -110,15 +99,12 @@ def test_reconstruct_encode_oos_bitwise_equivalence_circle() -> None:
     from its attributes. Any divergence is an arg-threading bug in that rebuild,
     which is exactly what exact equality catches. Held-out X (a distinct seed)
     forces the OOS branch on both — no training-data shortcut."""
-    core_cls = _core_cls()
-    if not hasattr(core_cls, "reconstruct") or not hasattr(core_cls, "encode"):
-        pytest.skip("wheel predates ManifoldSaeCore.reconstruct/encode (#2091)")
     x = _planted_circle(44, 6, seed=7)
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         n_iter=8, random_state=0,
     )
-    core = core_cls(fit.to_dict())
+    core = ManifoldSaeCore(fit.to_dict())
     x_oos = _planted_circle(20, 6, seed=101)
     np.testing.assert_array_equal(fit.reconstruct(x_oos), core.reconstruct(x_oos))
     np.testing.assert_array_equal(fit.encode(x_oos), core.encode(x_oos))
@@ -139,9 +125,6 @@ def test_reconstruct_encode_oos_hybrid_split_parse_exercised() -> None:
     `v` present (collapse-rescue), and a `linear_image`-less entry (skipped).
     A plain-vs-injected sanity assertion guarantees the images are actually
     consumed, so this cannot pass vacuously with a silently-dropped parse."""
-    core_cls = _core_cls()
-    if not hasattr(core_cls, "reconstruct") or not hasattr(core_cls, "encode"):
-        pytest.skip("wheel predates ManifoldSaeCore.reconstruct/encode (#2091)")
     n, p = 40, 5
     rng = np.random.default_rng(11)
     # Two 1-D linear latents -> two euclidean d=1 atoms, both collapse-eligible.
@@ -154,7 +137,7 @@ def test_reconstruct_encode_oos_hybrid_split_parse_exercised() -> None:
         n_iter=8, random_state=0,
     )
 
-    core_plain = core_cls(fit.to_dict())  # hybrid_split is None here
+    core_plain = ManifoldSaeCore(fit.to_dict())  # hybrid_split is None here
 
     # A hybrid_split shaped exactly as the FFI emits it (plain JSON scalars/lists
     # so it survives to_dict -> json.dumps). b0/b1/v are length p, as production.
@@ -177,7 +160,7 @@ def test_reconstruct_encode_oos_hybrid_split_parse_exercised() -> None:
         ],
     }
     assert fit._hybrid_linear_images_for_oos() is not None  # Python parse populated
-    core_hyb = core_cls(fit.to_dict())
+    core_hyb = ManifoldSaeCore(fit.to_dict())
 
     x_oos = (rng.standard_normal((16, p))).astype(np.float64)
     x_oos -= x_oos.mean(axis=0, keepdims=True)
@@ -197,7 +180,6 @@ def test_reconstruct_encode_oos_hybrid_split_parse_exercised() -> None:
 def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
     """Euclidean (degree-2 patch) atom: exercises the duchon_centers threading
     that the circle atom (no centers) does not."""
-    core_cls = _core_cls()
     n, p = 50, 5
     rng = np.random.default_rng(3)
     # A 2-D latent blob so a d=2 euclidean patch has real structure to fit.
@@ -211,7 +193,7 @@ def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
         X=x, K=1, d_atom=2, atom_topology="euclidean", assignment="softmax",
         n_iter=8, random_state=0,
     )
-    core = core_cls(fit.to_dict())
+    core = ManifoldSaeCore(fit.to_dict())
     assert fit.atoms[0].basis in {"euclidean", "linear"}
 
     t_from = np.array([0.0, 0.0], dtype=np.float64)

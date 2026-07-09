@@ -17,10 +17,7 @@ from gamfit._sae_manifold import rust_module  # noqa: E402
 
 
 def _rust_reorder(coords, mean, sd):
-    fn = getattr(rust_module(), "sae_periodic_shape_band_reorder", None)
-    if fn is None:
-        pytest.skip("wheel predates sae_periodic_shape_band_reorder (#2091 coercion slice)")
-    return fn(coords, mean, sd)
+    return rust_module().sae_periodic_shape_band_reorder(coords, mean, sd)
 
 
 def _py_reorder(coords, mean, sd):

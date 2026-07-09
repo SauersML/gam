@@ -10,5 +10,4 @@ license = "AGPL-3.0-or-later"
 warnings = "deny"
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }

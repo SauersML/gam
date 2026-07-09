@@ -131,7 +131,7 @@ fn linear_lane_ev_climbs_with_k_and_uses_full_budget_1026() {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-8,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         };
         let fit = fit_sparse_dictionary(z32.view(), &cfg).expect("linear lane fit runs");
         println!(

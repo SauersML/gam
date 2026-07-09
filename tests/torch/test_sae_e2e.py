@@ -4,7 +4,6 @@ Wires an encoder Linear → positions in [0,1] → F=4 Duchon atoms via
 ``gamfit.torch.fit`` → loss → ``backward()``. Confirms gradient flows
 back to the encoder's weights through the analytic REML VJP.
 
-Skipped (with reason) if the multi-block REML path is missing.
 """
 
 from __future__ import annotations
@@ -16,13 +15,6 @@ pytest: Any = import_module("pytest")
 
 gt = pytest.importorskip("gamfit.torch")
 torch = pytest.importorskip("torch")
-
-if not hasattr(gt, "gaussian_reml_fit_blocks"):
-    pytest.skip(
-        "gamfit.torch.gaussian_reml_fit_blocks missing; "
-        "the multi-block REML path is required for the SAE end-to-end test.",
-        allow_module_level=True,
-    )
 
 
 def test_encoder_receives_gradient_through_reml():

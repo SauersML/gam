@@ -117,8 +117,6 @@ def _old_numpy_reconstruct(
 
 def test_native_sae_manifold_reconstruct_matches_numpy_loop_and_shapes():
     rust = sae.rust_module()
-    if not hasattr(rust, "sae_manifold_reconstruct_ffi"):
-        pytest.skip("running extension predates sae_manifold_reconstruct_ffi")
 
     theta = np.array([[0.0], [0.25], [0.5], [0.75]], dtype=np.float64)
     sphere_coords = np.array(

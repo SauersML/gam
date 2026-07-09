@@ -142,9 +142,7 @@ fn declares_named_const(code: &str) -> bool {
                 || !code.as_bytes()[from + rel - 1].is_ascii_alphanumeric()
                     && code.as_bytes()[from + rel - 1] != b'_';
             let next = code[after..].trim_start().as_bytes().first().copied();
-            if left_ok
-                && matches!(next, Some(b) if b.is_ascii_uppercase() || b == b'_')
-            {
+            if left_ok && matches!(next, Some(b) if b.is_ascii_uppercase() || b == b'_') {
                 return true;
             }
             from = after;
@@ -274,8 +272,8 @@ fn is_trivial_core(core: &str) -> bool {
 
 fn scan_file(rel: &str) -> Vec<(usize, String, String)> {
     let path = workspace_root().join(rel);
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let lines: Vec<&str> = content.lines().collect();
     let end = test_region_start(&lines);
     let mut offenders = Vec::new();
@@ -349,7 +347,9 @@ fn scanner_recognizes_flags_and_exemptions() {
     assert!(!is_trivial_core("0.12"));
 
     // Bit-op / hash lines and named consts are wholesale-exempt.
-    assert!(line_is_exempt(&strip_code("    z = (z >> 30).wrapping_mul(0xBF58);")));
+    assert!(line_is_exempt(&strip_code(
+        "    z = (z >> 30).wrapping_mul(0xBF58);"
+    )));
     assert!(line_is_exempt(&strip_code("const CLAIMED_SNR: f64 = 3.7;")));
     assert!(!line_is_exempt(&strip_code("    let a = foo(3.7);")));
 
@@ -362,11 +362,17 @@ fn scanner_recognizes_flags_and_exemptions() {
     assert_eq!(suffixed.len(), 1);
     assert_eq!(suffixed[0].core, "0.0");
     assert!(is_trivial_core(&suffixed[0].core));
-    assert!(is_trivial_core(&numeric_literals(&strip_code("let n = 1_000usize;"))[0].core));
+    assert!(is_trivial_core(
+        &numeric_literals(&strip_code("let n = 1_000usize;"))[0].core
+    ));
 
     // Range and tuple access do not spawn literals beyond the leading `0`.
     let range = numeric_literals(&strip_code("    for i in 0..n {"));
     assert!(range.iter().all(|l| l.core == "0"));
     let tuple = numeric_literals(&strip_code("    let x = pair.0;"));
-    assert!(tuple.is_empty(), "tuple .0 must not be a literal: {:?}", tuple.iter().map(|l| &l.core).collect::<Vec<_>>());
+    assert!(
+        tuple.is_empty(),
+        "tuple .0 must not be a literal: {:?}",
+        tuple.iter().map(|l| &l.core).collect::<Vec<_>>()
+    );
 }

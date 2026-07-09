@@ -337,7 +337,7 @@ impl SaeManifoldTerm {
             // (`trial_crit < baseline_crit − armijo_eps`), bit-for-bit identical to
             // the pre-migration loop (initial step 1.0, ×0.5 contraction,
             // `MAX_BACKTRACK` trials).
-            let accepted_step = backtracking_line_search::<(Vec<f64>, f64), String>(
+            let accepted_step = backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
                 BacktrackConfig {
                     initial_step: 1.0,
                     contraction: 0.5,

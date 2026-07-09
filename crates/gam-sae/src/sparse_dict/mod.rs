@@ -120,7 +120,7 @@ pub struct SparseDictConfig {
     /// Per-fit score routing residency contract. `Required` is fail-closed: a
     /// high-`K` route that cannot run on the CUDA score-block path returns an
     /// error instead of silently scoring on the CPU.
-    pub score_mode: gam_gpu::GpuMode,
+    pub score_mode: gam_gpu::GpuPolicy,
 }
 
 impl SparseDictConfig {
@@ -145,7 +145,7 @@ impl Default for SparseDictConfig {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-6,
-            score_mode: gam_gpu::GpuMode::Auto,
+            score_mode: gam_gpu::GpuPolicy::Auto,
         }
     }
 }
@@ -257,7 +257,7 @@ pub fn sparse_dictionary_transform(
         active,
         score_tile,
         code_ridge,
-        gam_gpu::gpu_mode(),
+        gam_gpu::global_policy(),
     )?;
     Ok((transform.indices, transform.codes))
 }
@@ -265,7 +265,7 @@ pub fn sparse_dictionary_transform(
 /// Out-of-sample encode with an explicit score routing mode and route counters.
 ///
 /// This is the Rust-native high-`K` T1 transform surface: callers that require
-/// GPU scoring pass [`gam_gpu::GpuMode::Required`] and inspect
+/// GPU scoring pass [`gam_gpu::GpuPolicy::Required`] and inspect
 /// [`SparseDictTransform::score_route_stats`] to verify device engagement.
 pub fn sparse_dictionary_transform_with_mode(
     x: ArrayView2<'_, f32>,
@@ -273,7 +273,7 @@ pub fn sparse_dictionary_transform_with_mode(
     active: usize,
     score_tile: usize,
     code_ridge: f32,
-    score_mode: gam_gpu::GpuMode,
+    score_mode: gam_gpu::GpuPolicy,
 ) -> Result<SparseDictTransform, String> {
     let k = decoder.nrows();
     if k == 0 {

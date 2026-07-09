@@ -181,8 +181,8 @@ fn zz_measure_lambda_gap() {
         for (i, &t) in x_test.iter().enumerate() {
             mt[[i, x_col]] = t;
         }
-        let test_design = build_term_collection_design(mt.view(), &fit.resolvedspec)
-            .expect("test design");
+        let test_design =
+            build_term_collection_design(mt.view(), &fit.resolvedspec).expect("test design");
         let prod_pred = test_design.design.apply(&fit.fit.beta).to_vec();
         let prod_max = max_abs_err(&prod_pred, &y_truth);
         let prod_amp = prod_pred.iter().cloned().fold(f64::MIN, f64::max)
@@ -194,8 +194,8 @@ fn zz_measure_lambda_gap() {
         for i in 0..n_tr {
             mtr[[i, x_col]] = data.values[[i, x_col]];
         }
-        let train_design = build_term_collection_design(mtr.view(), &fit.resolvedspec)
-            .expect("train design");
+        let train_design =
+            build_term_collection_design(mtr.view(), &fit.resolvedspec).expect("train design");
         let x_dense = train_design.design.to_dense();
         let p = x_dense.ncols();
         let mut s = Array2::<f64>::zeros((p, p));
@@ -211,14 +211,8 @@ fn zz_measure_lambda_gap() {
         let y_tr = data.values.column(data.column_map()["y"]).to_owned();
 
         // gam's OWN global-grid REML optimum on this basis (single summed penalty)
-        let cf = gaussian_reml_closed_form(
-            x_dense.view(),
-            y_tr.view(),
-            s.view(),
-            None,
-            None,
-        )
-        .expect("closed form");
+        let cf = gaussian_reml_closed_form(x_dense.view(), y_tr.view(), s.view(), None, None)
+            .expect("closed form");
         // predict closed-form coefficients on truth grid
         let xt = test_design.design.to_dense();
         let cf_beta = Array1::from(cf.coefficients.to_vec());
@@ -234,12 +228,18 @@ fn zz_measure_lambda_gap() {
         let mgcv_amp = mgcv_pred.iter().cloned().fold(f64::MIN, f64::max)
             - mgcv_pred.iter().cloned().fold(f64::MAX, f64::min);
 
-        eprintln!("\n===== [{label}] p={p} nulldim={nulldim} n_penalties={} =====",
-            train_design.penalties.len());
-        eprintln!("  PROD  gam: log_lambda={prod_loglam:?} lambda={prod_lambdas:?} edf={prod_edf:?}");
+        eprintln!(
+            "\n===== [{label}] p={p} nulldim={nulldim} n_penalties={} =====",
+            train_design.penalties.len()
+        );
+        eprintln!(
+            "  PROD  gam: log_lambda={prod_loglam:?} lambda={prod_lambdas:?} edf={prod_edf:?}"
+        );
         eprintln!("        max_err={prod_max:.4} amp(pp)={prod_amp:.4}");
-        eprintln!("  CF    gam closed-form global-REML: rho={:.4} lambda={:.4e} edf={:.3} score={:.4}",
-            cf.rho, cf.lambda, cf.edf, cf.reml_score);
+        eprintln!(
+            "  CF    gam closed-form global-REML: rho={:.4} lambda={:.4e} edf={:.3} score={:.4}",
+            cf.rho, cf.lambda, cf.edf, cf.reml_score
+        );
         eprintln!("        max_err={cf_max:.4} amp(pp)={cf_amp:.4}");
         eprintln!("  MGCV  ds k={k}: sp={mgcv_sp:.4e} edf={mgcv_edf:.3}");
         eprintln!("        max_err={mgcv_max:.4} amp(pp)={mgcv_amp:.4}");

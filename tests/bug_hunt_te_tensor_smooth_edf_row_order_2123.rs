@@ -49,9 +49,7 @@ fn load_frame(name: &str) -> gam::data::EncodedDataset {
         if line.trim().is_empty() {
             continue;
         }
-        rows.push(csv::StringRecord::from(
-            line.split(',').collect::<Vec<_>>(),
-        ));
+        rows.push(csv::StringRecord::from(line.split(',').collect::<Vec<_>>()));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }

@@ -726,8 +726,9 @@ fn measure_jet_eiv_input_variance_matches_fitted_surface_2225() {
     let head_rank = transform.nrows() - m;
     let rep = z_full.slice(ndarray::s![..m]).to_owned();
     let head_coeffs = z_full.slice(ndarray::s![m..]).to_owned();
-    let head_t = (head_rank > 0)
-        .then(|| gam::basis::measure_jet_affine_head_transform(centers.view(), frozen.masses.view()));
+    let head_t = (head_rank > 0).then(|| {
+        gam::basis::measure_jet_affine_head_transform(centers.view(), frozen.masses.view())
+    });
 
     // Central-FD of the fit's own η along a single RAW ambient axis, via the
     // frozen design replay (the same path `predict_with_fit` uses).

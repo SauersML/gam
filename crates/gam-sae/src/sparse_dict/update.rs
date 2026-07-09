@@ -42,7 +42,7 @@ pub(super) fn route_and_code_all(
     s: usize,
     code_ridge: f32,
     minibatch: usize,
-    score_mode: gam_gpu::GpuMode,
+    score_mode: gam_gpu::GpuPolicy,
     mut score_route_stats: Option<&mut ScoreRouteStats>,
 ) -> Result<Vec<SparseCode>, String> {
     let n = x.nrows();
@@ -2366,7 +2366,7 @@ mod exact_solve_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6, // shared default: kernel must equal legacy run
             tolerance: 1.0e-9,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         };
         assert_eq!(
             config.code_ridge, config.decoder_ridge,
@@ -2589,7 +2589,7 @@ mod exact_solve_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-9,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         };
 
         // Iterate the schedule's loop body to the fixed point and return (ρ*, last
@@ -2756,7 +2756,7 @@ mod exact_solve_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-9,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         };
 
         // Magic-ridge baseline: legacy fixed-ridge fit at the default 1e-6.
@@ -2800,7 +2800,7 @@ mod exact_solve_tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-9,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         };
         let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
         let s = fit.active;

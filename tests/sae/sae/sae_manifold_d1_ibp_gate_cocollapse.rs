@@ -180,7 +180,10 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
     // A `GamError` here (inner solve stalls at fixed ρ) is the #2228 refusal.
     let result = problem
-        .run(&mut objective, "SAE d=1 K=1 IBP-gate co-collapse (#2228/#1095)")
+        .run(
+            &mut objective,
+            "SAE d=1 K=1 IBP-gate co-collapse (#2228/#1095)",
+        )
         .expect(
             "outer cascade must complete on a K=1 d=1 atom whose degree-2 patch spans its \
              planted curve — a RemlConvergenceError (inner solve stalls at fixed ρ) reproduces \

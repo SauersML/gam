@@ -96,7 +96,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 )?;
                 let eta_se = bernoulli_eta_standard_error_from_backend(self, input, &backend)?;
                 let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
-                let quadctx = gam::quadrature::QuadratureContext::new();
+                let quadctx = gam_solve::quadrature::QuadratureContext::new();
                 let mean = Array1::from_iter(
                     eta.iter()
                         .zip(eta_se.iter())

@@ -42,7 +42,7 @@ fn survival_tail_value_from_failure_jet(
     failure_jet: &InverseLinkJet,
 ) -> f64 {
     match inverse_link {
-        InverseLink::Standard(gam::types::StandardLink::Probit) => {
+        InverseLink::Standard(gam_spec::StandardLink::Probit) => {
             if eta.is_nan() {
                 f64::NAN
             } else if eta == f64::INFINITY {
@@ -53,8 +53,8 @@ fn survival_tail_value_from_failure_jet(
                 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
             }
         }
-        InverseLink::Standard(gam::types::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(gam::types::StandardLink::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(gam_spec::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(gam_spec::StandardLink::CLogLog) => (-(eta.exp())).exp(),
         _ => (1.0 - failure_jet.mu).clamp(0.0, 1.0),
     }
 }
@@ -65,7 +65,7 @@ fn inverse_link_survival_tail_value_and_failure_density(
     eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
     let failure_jet =
-        gam::solver::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)?;
+        gam_solve::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)?;
     Ok((
         survival_tail_value_from_failure_jet(inverse_link, eta, &failure_jet).clamp(0.0, 1.0),
         failure_jet.d1,
@@ -294,7 +294,7 @@ impl PredictionTransform for SurvivalPredictor {
                     p_s,
                     "survival posterior mean",
                 )?;
-                let quadctx = gam::quadrature::QuadratureContext::new();
+                let quadctx = gam_solve::quadrature::QuadratureContext::new();
                 let mean = Array1::from_vec(
                     (0..eta_threshold.len())
                         .map(|i| {
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn survival_tail_probit_at_infinity_is_zero() {
-        let link = InverseLink::Standard(gam::types::StandardLink::Probit);
+        let link = InverseLink::Standard(gam_spec::StandardLink::Probit);
         let jet = InverseLinkJet {
             mu: 0.0,
             d1: 0.0,
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn survival_tail_probit_at_neg_infinity_is_one() {
-        let link = InverseLink::Standard(gam::types::StandardLink::Probit);
+        let link = InverseLink::Standard(gam_spec::StandardLink::Probit);
         let jet = InverseLinkJet {
             mu: 1.0,
             d1: 0.0,
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn survival_tail_logit_at_zero_is_half() {
-        let link = InverseLink::Standard(gam::types::StandardLink::Logit);
+        let link = InverseLink::Standard(gam_spec::StandardLink::Logit);
         let jet = InverseLinkJet {
             mu: 0.5,
             d1: 0.25,
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn survival_tail_cloglog_at_zero() {
-        let link = InverseLink::Standard(gam::types::StandardLink::CLogLog);
+        let link = InverseLink::Standard(gam_spec::StandardLink::CLogLog);
         let jet = InverseLinkJet {
             mu: 0.0,
             d1: 0.0,

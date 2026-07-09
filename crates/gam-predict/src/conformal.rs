@@ -37,8 +37,8 @@
 //! heteroscedastic `s_i` it is conformalized scale regression.
 //!
 //! CRITICAL: this uses the EXACT k-th order statistic from
-//! [`gam::util::quantile::order_statistic`]. It deliberately does NOT use
-//! the interpolating [`gam::util::quantile::quantile_from_sorted`] — linear
+//! [`gam_math::quantile::order_statistic`]. It deliberately does NOT use
+//! the interpolating [`gam_math::quantile::quantile_from_sorted`] — linear
 //! interpolation between order statistics would void the finite-sample coverage
 //! proof.
 //!
@@ -63,7 +63,7 @@
 //! * **In-sample (no held-out fold available).** When the only data are the
 //!   training set, [`ConformalCalibrator::from_fit`] uses the
 //!   first-order approximate-leave-one-out diagnostics in
-//!   [`gam::inference::alo`] to manufacture leave-one-out residuals from the
+//!   [`gam_solve::inference::alo`] to manufacture leave-one-out residuals from the
 //!   training rows. This is a calibrated heuristic: it inherits the split
 //!   conformal finite-sample guarantee only to the extent that the approximate
 //!   ALO scores match true leave-one-out exchangeable scores; there is no
@@ -100,12 +100,13 @@
 
 use crate::PredictUncertaintyResult;
 use crate::interval_policy::ResponseBounds;
-use gam::estimate::{EstimationError, UnifiedFitResult};
-use gam::families::family_runtime::FamilyStrategy;
-use gam::families::family_runtime::strategy_for_spec;
-use gam::inference::alo::compute_alo_diagnostics_from_unified;
-use gam::types::{LikelihoodSpec, LinkFunction};
-use gam::util::quantile::order_statistic;
+use gam_math::quantile::order_statistic;
+use gam_models::family_runtime::FamilyStrategy;
+use gam_models::family_runtime::strategy_for_spec;
+use gam_problem::EstimationError;
+use gam_solve::inference::alo::compute_alo_diagnostics_from_unified;
+use gam_solve::model_types::UnifiedFitResult;
+use gam_spec::{LikelihoodSpec, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {

@@ -74,7 +74,7 @@ impl BinomialLocationScalePredictor {
         let pairs: Result<Vec<(f64, f64)>, EstimationError> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let jet = gam::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                let jet = gam_solve::mixture_link::inverse_link_jet_for_inverse_link(
                     &self.inverse_link,
                     eta[i],
                 )?;
@@ -275,7 +275,7 @@ impl BinomialLocationScalePredictor {
                             |eta_threshold, eta_log_sigma| {
                                 let q0 = -eta_threshold * (-eta_log_sigma).exp();
                                 let jet =
-                                    gam::solver::mixture_link::inverse_link_jet_for_inverse_link(
+                                    gam_solve::mixture_link::inverse_link_jet_for_inverse_link(
                                         &self.inverse_link,
                                         q0,
                                     )?;
@@ -358,7 +358,7 @@ impl BinomialLocationScalePredictor {
                             covw_cond[[r, c]] -= k0[r] * suv_t[c] + k1[r] * suv_ls[c];
                         }
                     }
-                    gam::quadrature::normal_expectation_2d_adaptive_result(
+                    gam_solve::quadrature::normal_expectation_2d_adaptive_result(
                         quadctx,
                         [eta_t[i], eta_s[i]],
                         [[var_t, cov_tls], [cov_tls, var_ls]],
@@ -377,7 +377,7 @@ impl BinomialLocationScalePredictor {
                                     varw += xr * covw_cond[[r, c]] * xw[c];
                                 }
                             }
-                            let jet = gam::quadrature::integrated_inverse_link_jetwith_state(
+                            let jet = gam_solve::quadrature::integrated_inverse_link_jetwith_state(
                                 quadctx,
                                 self.inverse_link.link_function(),
                                 meanw,

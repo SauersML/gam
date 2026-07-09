@@ -25,8 +25,9 @@ use crate::{
     PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, PredictionWithSE,
     family_observation_band,
 };
-use gam::estimate::{EstimationError, UnifiedFitResult};
-use gam::types::ResponseFamily;
+use gam_problem::EstimationError;
+use gam_solve::model_types::UnifiedFitResult;
+use gam_spec::ResponseFamily;
 use ndarray::Array1;
 
 /// Closed response-scale support `[lo, hi]` used to clamp transformed interval
@@ -95,7 +96,7 @@ impl ResponseBounds {
 /// throughout the predict path; every predictor's interval construction routes
 /// its quantile through here so the convention cannot diverge.
 pub fn central_z(level: f64) -> Result<f64, EstimationError> {
-    gam::probability::standard_normal_quantile(0.5 + 0.5 * level)
+    gam_math::probability::standard_normal_quantile(0.5 + 0.5 * level)
         .map_err(EstimationError::InvalidInput)
 }
 

@@ -20,15 +20,6 @@ import numpy as np
 import pytest
 
 import gamfit
-from gamfit._binding import rust_module
-
-# The compact stagewise FFI only exists in the new engine wheel; skip cleanly on
-# an older binary rather than erroring (SPEC forbids xfail, but a genuinely
-# absent FFI is a skip, not a silenced failure).
-pytestmark = pytest.mark.skipif(
-    not hasattr(rust_module(), "sae_manifold_fit_stagewise"),
-    reason="running extension predates the sae_manifold_fit_stagewise FFI",
-)
 
 
 def _planted_two_circles(

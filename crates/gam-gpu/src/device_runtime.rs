@@ -311,14 +311,14 @@ impl GpuRuntime {
         Self::global()
     }
 
-    /// Fail-closed accessor for the process-wide runtime under a [`GpuMode`]
+    /// Fail-closed accessor for the process-wide runtime under a [`GpuPolicy`]
     /// contract (issue #1017).
     ///
-    /// * [`GpuMode::Required`] — the device MUST be present: when the probe
+    /// * [`GpuPolicy::Required`] — the device MUST be present: when the probe
     ///   found no usable runtime this returns `Err(GpuError::DriverLibraryUnavailable)`
     ///   carrying the recorded CPU reason, so the resident path surfaces a
     ///   structured error instead of silently falling back to the CPU.
-    /// * [`GpuMode::Auto`] / [`GpuMode::Off`] — preserve the existing
+    /// * [`GpuPolicy::Auto`] / [`GpuPolicy::Off`] — preserve the existing
     ///   probe-first behavior bit-for-bit: this is a thin wrapper over
     ///   [`Self::global`] that maps the `None` case to the same typed error
     ///   without ever forcing the runtime on or changing any numerics. `Auto`
@@ -327,12 +327,12 @@ impl GpuRuntime {
     ///
     /// This does NOT alter `global()`/`cuda_context_for`/`ensure_cuda_runtime_device`;
     /// it only adds the residency gate on top of the working Auto path.
-    pub fn global_or_fail(mode: super::GpuMode) -> Result<&'static Self, GpuError> {
-        match mode {
-            super::GpuMode::Off => Err(GpuError::DriverLibraryUnavailable {
-                reason: "GPU residency mode is off".to_string(),
+    pub fn global_or_fail(policy: super::GpuPolicy) -> Result<&'static Self, GpuError> {
+        match policy {
+            super::GpuPolicy::Off => Err(GpuError::DriverLibraryUnavailable {
+                reason: "GPU policy is off".to_string(),
             }),
-            super::GpuMode::Auto | super::GpuMode::Required => {
+            super::GpuPolicy::Auto | super::GpuPolicy::Required => {
                 Self::global().ok_or_else(|| GpuError::DriverLibraryUnavailable {
                     reason: Self::cpu_reason()
                         .unwrap_or("CUDA runtime unavailable")

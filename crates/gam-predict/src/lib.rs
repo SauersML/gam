@@ -5,10 +5,10 @@ pub mod linalg;
 pub mod posterior_bands;
 
 pub use conformal::*;
-pub use gam::inference::dispersion_cov::se_from_covariance;
-pub use gam::inference::predict_io::{
+pub use gam_models::inference::predict_io::{
     BernoulliMarginalSlopePredictor, PredictInput, PredictResult,
 };
+pub use gam_problem::dispersion_cov::se_from_covariance;
 pub use posterior_bands::*;
 
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
@@ -31,29 +31,30 @@ use crate::linalg::{
 pub use crate::standard::StandardPredictor;
 use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
-use gam::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use gam::families::family_runtime::{
-    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
-    strategy_from_fit,
-};
-use gam::inference::model::{
-    FittedFamily, FittedModel, PredictModelClass, SavedLinkWiggleRuntime,
-    binomial_location_scale_threshold_beta, gaussian_location_scale_mean_beta,
-    location_scale_noise_beta,
-};
-use gam::linalg::utils::predict_gam_dimension_mismatch_message;
-use gam::matrix::{DesignMatrix, SymmetricMatrix};
-use gam::mixture_link::{
-    InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
-    mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
-};
-use gam::probability::{
+use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
+use gam_linalg::utils::predict_gam_dimension_mismatch_message;
+use gam_math::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
     negative_binomial_moment_matched_interval, normal_cdf, poisson_moment_matched_interval,
     standard_normal_quantile, tweedie_moment_matched_interval,
 };
-use gam::quadrature::QuadratureContext;
-use gam::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
+use gam_models::family_runtime::{
+    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
+    strategy_from_fit,
+};
+use gam_models::inference::model::{
+    FittedFamily, FittedModel, PredictModelClass, SavedLinkWiggleRuntime,
+    binomial_location_scale_threshold_beta, gaussian_location_scale_mean_beta,
+    location_scale_noise_beta,
+};
+use gam_problem::{BlockRole, EstimationError};
+use gam_solve::mixture_link::{
+    InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
+    mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
+};
+use gam_solve::model_types::{FittedLinkState, UnifiedFitResult};
+use gam_solve::quadrature::QuadratureContext;
+use gam_spec::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -791,7 +792,7 @@ fn padded_design_standard_errors_from_backend(
 }
 
 fn projected_bivariate_posterior_mean_result<F>(
-    quadctx: &gam::quadrature::QuadratureContext,
+    quadctx: &gam_solve::quadrature::QuadratureContext,
     mu: [f64; 2],
     cov: [[f64; 2]; 2],
     integrand: F,
@@ -807,24 +808,22 @@ where
         return integrand(mu[0], mu[1]);
     }
     if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return gam::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
-            quadctx,
-            [mu[1]],
-            [[var1]],
-            21,
-            |x| integrand(mu[0], x[0]),
-        );
+        return gam_solve::quadrature::normal_expectation_nd_adaptive_result::<
+            1,
+            _,
+            _,
+            EstimationError,
+        >(quadctx, [mu[1]], [[var1]], 21, |x| integrand(mu[0], x[0]));
     }
     if var1 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return gam::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
-            quadctx,
-            [mu[0]],
-            [[var0]],
-            21,
-            |x| integrand(x[0], mu[1]),
-        );
+        return gam_solve::quadrature::normal_expectation_nd_adaptive_result::<
+            1,
+            _,
+            _,
+            EstimationError,
+        >(quadctx, [mu[0]], [[var0]], 21, |x| integrand(x[0], mu[1]));
     }
-    gam::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
+    gam_solve::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -848,7 +847,7 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR;
+                let sigma_floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
@@ -898,7 +897,7 @@ impl FittedModelPredictExt for FittedModel {
                 }
                 let unified = self.unified()?;
                 let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
-                    gam::types::InverseLink::Standard(gam::types::StandardLink::Probit),
+                    gam_spec::InverseLink::Standard(gam_spec::StandardLink::Probit),
                 );
                 SurvivalPredictor::from_unified(unified, inverse_link)
                     .ok()
@@ -906,7 +905,7 @@ impl FittedModelPredictExt for FittedModel {
             }
             PredictModelClass::BinomialLocationScale => {
                 let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
-                    gam::types::InverseLink::Standard(gam::types::StandardLink::Probit),
+                    gam_spec::InverseLink::Standard(gam_spec::StandardLink::Probit),
                 );
                 let fit = self.fit_result.as_ref()?;
                 let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
@@ -987,8 +986,8 @@ impl FittedModelPredictExt for FittedModel {
             })?,
             self.resolved_inverse_link()
                 .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
-                .unwrap_or(gam::types::InverseLink::Standard(
-                    gam::types::StandardLink::Probit,
+                .unwrap_or(gam_spec::InverseLink::Standard(
+                    gam_spec::StandardLink::Probit,
                 )),
             self.family_state
                 .frailty()
@@ -1013,7 +1012,7 @@ fn slice_predict_input(
     rows: std::ops::Range<usize>,
 ) -> Result<PredictInput, EstimationError> {
     Ok(PredictInput {
-        design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             design_row_chunk(&input.design, rows.clone()).map_err(EstimationError::InvalidInput)?,
         )),
         offset: input.offset.slice(ndarray::s![rows.clone()]).to_owned(),
@@ -1022,7 +1021,7 @@ fn slice_predict_input(
             .as_ref()
             .map(|design| {
                 design_row_chunk(design, rows.clone())
-                    .map(|d| DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(d)))
+                    .map(|d| DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(d)))
                     .map_err(EstimationError::InvalidInput)
             })
             .transpose()?,
@@ -1331,7 +1330,7 @@ impl PosteriorMeanOptions {
 pub fn enrich_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: f64,
-    family: gam::types::LikelihoodSpec,
+    family: gam_spec::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
     let spec = spec_from_family_link(family, link_kind);
@@ -1748,7 +1747,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     // adjustment is applicable here.
     let etavar = linear_predictorvariance_from_backend(&x, backend, None)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
-    let quadctx = gam::quadrature::QuadratureContext::new();
+    let quadctx = gam_solve::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
@@ -2610,7 +2609,7 @@ where
             .zip(z_upper_per_row.iter())
             .map(|((&e, &s), &zu)| e + zu * s),
     );
-    let quadctx = gam::quadrature::QuadratureContext::new();
+    let quadctx = gam_solve::quadrature::QuadratureContext::new();
 
     // Derivative of inverse link g^{-1}(η) used for delta-method:
     //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
@@ -3025,15 +3024,15 @@ pub fn coefficient_uncertaintywith_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam::estimate::{
-        BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult,
-        UnifiedFitResultParts,
+    use gam_math::probability::normal_pdf;
+    use gam_models::bms::LatentMeasureKind;
+    use gam_models::inference::model::SavedLatentZNormalization;
+    use gam_problem::BlockRole;
+    use gam_solve::model_types::{
+        FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
     };
-    use gam::families::bms::LatentMeasureKind;
-    use gam::inference::model::SavedLatentZNormalization;
-    use gam::pirls::PirlsStatus;
-    use gam::probability::normal_pdf;
-    use gam::types::{LinkFunction, StandardLink};
+    use gam_solve::pirls::PirlsStatus;
+    use gam_spec::{LinkFunction, StandardLink};
     use ndarray::{Array1, Array2, array};
 
     #[test]
@@ -3055,7 +3054,7 @@ mod tests {
             ..PredictUncertaintyOptions::default()
         };
 
-        let beta_seed = gam::types::LikelihoodSpec::new(
+        let beta_seed = gam_spec::LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 1.0 },
             InverseLink::Standard(StandardLink::Logit),
         );
@@ -3073,7 +3072,7 @@ mod tests {
             "bare Vb must not build a Beta observation interval from the seed phi"
         );
 
-        let nb_seed = gam::types::LikelihoodSpec::new(
+        let nb_seed = gam_spec::LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial {
                 theta: 1.0,
                 theta_fixed: false,
@@ -3124,7 +3123,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::new(
+            gam_spec::LikelihoodSpec::new(
                 ResponseFamily::Beta { phi: 1.0 },
                 InverseLink::Standard(StandardLink::Logit),
             ),
@@ -3157,7 +3156,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::new(
+            gam_spec::LikelihoodSpec::new(
                 ResponseFamily::NegativeBinomial {
                     theta: 1.0,
                     theta_fixed: false,
@@ -3198,9 +3197,9 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam_spec::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3262,9 +3261,9 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam_spec::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3315,9 +3314,9 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(gam::types::LikelihoodSpec::royston_parmar()),
-            likelihood_scale: gam::types::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
-            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam_spec::LikelihoodSpec::royston_parmar()),
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3356,11 +3355,11 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::binomial_probit(),
+            gam_spec::LikelihoodSpec::binomial_probit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let expected = gam::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
+        let expected = gam_solve::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
         assert!((out.mean[0] - expected).abs() <= 1e-12);
         assert!((out.mean[1] - expected).abs() <= 1e-12);
     }
@@ -3375,12 +3374,12 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::binomial_logit(),
+            gam_spec::LikelihoodSpec::binomial_logit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let quadctx = gam::quadrature::QuadratureContext::new();
-        let expected = gam::quadrature::integrated_inverse_link_mean_and_derivative(
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        let expected = gam_solve::quadrature::integrated_inverse_link_mean_and_derivative(
             &quadctx,
             LinkFunction::Logit,
             0.4,
@@ -3418,7 +3417,7 @@ mod tests {
         enrich_posterior_mean_bounds(
             &mut result,
             0.95,
-            gam::types::LikelihoodSpec::binomial_logit(),
+            gam_spec::LikelihoodSpec::binomial_logit(),
             None,
         )
         .expect("enrich posterior-mean bounds");
@@ -3468,7 +3467,7 @@ mod tests {
         enrich_posterior_mean_bounds(
             &mut result,
             0.95,
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             None,
         )
         .expect("enrich posterior-mean bounds");
@@ -3496,7 +3495,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(gam::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam_spec::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -3567,7 +3566,7 @@ mod tests {
             );
             // The FFI surfaces the TransformEta band Φ(η ± z·se); reconstruct it
             // and check ordering + the probability clip range. z = Φ⁻¹(0.975).
-            let z = gam::probability::standard_normal_quantile(0.975).unwrap();
+            let z = gam_math::probability::standard_normal_quantile(0.975).unwrap();
             let lo = normal_cdf(eta[i] - z * se_oracle).clamp(0.0, 1.0);
             let hi = normal_cdf(eta[i] + z * se_oracle).clamp(0.0, 1.0);
             let mean = normal_cdf(eta[i]);
@@ -3592,7 +3591,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::royston_parmar(),
+            gam_spec::LikelihoodSpec::royston_parmar(),
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
@@ -3621,7 +3620,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::royston_parmar(),
+            gam_spec::LikelihoodSpec::royston_parmar(),
             covariance.view(),
         )
         .expect("royston-parmar posterior mean");
@@ -3629,14 +3628,14 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::royston_parmar(),
+            gam_spec::LikelihoodSpec::royston_parmar(),
             covariance.view(),
             &fit,
         )
         .expect("royston-parmar posterior mean with fit");
 
-        let quadctx = gam::quadrature::QuadratureContext::new();
-        let expected = gam::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        let expected = gam_solve::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected).abs() <= 1e-12);
             assert!((out_with_fit.mean[i] - expected).abs() <= 1e-12);
@@ -3673,14 +3672,15 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::royston_parmar(),
+            gam_spec::LikelihoodSpec::royston_parmar(),
             &fit,
             &options,
         )
         .expect("royston-parmar uncertainty");
 
-        let quadctx = gam::quadrature::QuadratureContext::new();
-        let (_, variance) = gam::quadrature::survival_posterior_meanvariance(&quadctx, 0.6, 0.5);
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        let (_, variance) =
+            gam_solve::quadrature::survival_posterior_meanvariance(&quadctx, 0.6, 0.5);
         assert!((out.mean[0] - (-(0.6_f64.exp())).exp()).abs() <= 1e-12);
         assert!((out.eta_standard_error[0] - 0.5).abs() <= 1e-12);
         assert!((out.mean_standard_error[0] - variance.sqrt()).abs() <= 1e-12);
@@ -3724,7 +3724,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &base_options,
         )
@@ -3733,7 +3733,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &options_fused,
         )
@@ -3761,7 +3761,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &options_mismatched,
         )
@@ -3777,7 +3777,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
             response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
@@ -3810,7 +3810,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
-            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
             response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
@@ -3840,7 +3840,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
             response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
@@ -4006,7 +4006,7 @@ mod tests {
         covariance: Array2<f64>,
         bias_correction_beta: Option<Array1<f64>>,
     ) -> UnifiedFitResult {
-        use gam::estimate::FitInference;
+        use gam_solve::model_types::FitInference;
         let p = beta.len();
         let inf = FitInference {
             // No penalty in this fixture (lambdas empty), so leave edf_by_block
@@ -4019,7 +4019,7 @@ mod tests {
             working_weights: Array1::zeros(0),
             working_response: Array1::zeros(0),
             reparam_qs: None,
-            dispersion: gam::estimate::Dispersion::Known(1.0),
+            dispersion: gam_problem::Dispersion::Known(1.0),
             beta_covariance: Some(covariance.clone().into()),
             beta_standard_errors: None,
             beta_covariance_corrected: None,
@@ -4039,9 +4039,9 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam_spec::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -4100,7 +4100,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4109,7 +4109,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4138,7 +4138,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4161,7 +4161,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit_with,
             &bc_options(true),
         )
@@ -4170,7 +4170,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit_without,
             &bc_options(true),
         )
@@ -4294,7 +4294,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4303,7 +4303,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4344,7 +4344,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4353,7 +4353,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4397,7 +4397,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                gam::types::LikelihoodSpec::gaussian_identity(),
+                gam_spec::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(false),
             )
@@ -4406,7 +4406,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                gam::types::LikelihoodSpec::gaussian_identity(),
+                gam_spec::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(true),
             )
@@ -4517,7 +4517,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4526,7 +4526,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4643,7 +4643,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    gam::types::LikelihoodSpec::gaussian_identity(),
+                    gam_spec::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(false),
                 )
@@ -4652,7 +4652,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    gam::types::LikelihoodSpec::gaussian_identity(),
+                    gam_spec::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(true),
                 )
@@ -4746,7 +4746,7 @@ mod tests {
             x_row,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit_orig,
             &bc_options(true),
         )
@@ -4755,7 +4755,7 @@ mod tests {
             x_tilde,
             theta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit_repar,
             &bc_options(true),
         )
@@ -4803,7 +4803,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4812,7 +4812,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4848,7 +4848,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4875,7 +4875,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4910,7 +4910,7 @@ mod tests {
     #[test]
     fn test_posterior_mean_eta_is_uncorrected_plugin_for_curved_link() {
         // Poisson log link (curved inverse link → uses_posterior_mean == true).
-        let spec = gam::types::LikelihoodSpec::poisson_log();
+        let spec = gam_spec::LikelihoodSpec::poisson_log();
         let strategy = strategy_for_spec(&spec);
 
         let beta = array![0.5_f64, -0.3, 0.8];
@@ -5037,7 +5037,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -5207,7 +5207,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5243,7 +5243,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5266,7 +5266,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5301,7 +5301,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5353,7 +5353,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5390,7 +5390,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            gam::types::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )

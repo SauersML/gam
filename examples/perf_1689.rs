@@ -213,7 +213,14 @@ fn build_profile(
 }
 
 /// 1-D P-spline `s(x)`: y = sin(5x) + 0.5x + N(0, 0.2), issue's truth.
-fn make_pspline_1d(n: usize) -> (gam::data::EncodedDataset, Array2<f64>, Array2<f64>, Vec<f64>) {
+fn make_pspline_1d(
+    n: usize,
+) -> (
+    gam::data::EncodedDataset,
+    Array2<f64>,
+    Array2<f64>,
+    Vec<f64>,
+) {
     let mut rng = StdRng::seed_from_u64(0);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let noise = Normal::new(0.0, 0.2).expect("normal");
@@ -249,7 +256,14 @@ fn make_pspline_1d(n: usize) -> (gam::data::EncodedDataset, Array2<f64>, Array2<
 }
 
 /// 2-D thin-plate `s(x,z)`: gaussian bump + N(0, 0.1), issue's truth.
-fn make_thinplate_2d(n: usize) -> (gam::data::EncodedDataset, Array2<f64>, Array2<f64>, Vec<f64>) {
+fn make_thinplate_2d(
+    n: usize,
+) -> (
+    gam::data::EncodedDataset,
+    Array2<f64>,
+    Array2<f64>,
+    Vec<f64>,
+) {
     let mut rng = StdRng::seed_from_u64(0);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let noise = Normal::new(0.0, 0.1).expect("normal");

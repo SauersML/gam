@@ -150,7 +150,9 @@ fn resolve_external_family_fits_binomial_loglog_and_cauchit_2158() {
             family.clone(),
             &opts,
         )
-        .unwrap_or_else(|e| panic!("binomial {link:?} must fit on the external route (#2158): {e}"));
+        .unwrap_or_else(|e| {
+            panic!("binomial {link:?} must fit on the external route (#2158): {e}")
+        });
 
         assert!(
             fit.deviance.is_finite(),

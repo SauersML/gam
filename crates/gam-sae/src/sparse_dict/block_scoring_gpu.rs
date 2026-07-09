@@ -167,11 +167,11 @@ const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE
 
 /// Fail-loud, residency-aware block-route entry point for the block-sparse lane.
 ///
-/// Honours the process-wide [`gam_gpu::GpuMode`] contract: under
-/// [`gam_gpu::GpuMode::Required`] a missing CUDA runtime, a compile/launch fault,
+/// Honours the process-wide [`gam_gpu::GpuPolicy`] contract: under
+/// [`gam_gpu::GpuPolicy::Required`] a missing CUDA runtime, a compile/launch fault,
 /// or an `n_rows × K` block below the device break-even all return `Err` instead
-/// of silently degrading to the CPU. [`gam_gpu::GpuMode::Auto`] uses the device
-/// when admitted and above break-even, else the CPU oracle; [`gam_gpu::GpuMode::Off`]
+/// of silently degrading to the CPU. [`gam_gpu::GpuPolicy::Auto`] uses the device
+/// when admitted and above break-even, else the CPU oracle; [`gam_gpu::GpuPolicy::Off`]
 /// always the CPU oracle. The returned [`BlockRoutePath`] reports which ran, and
 /// the `usize` is the device→host transfer in bytes (0 on the CPU path).
 ///
@@ -180,7 +180,7 @@ const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE
 /// `m × k` `(block, gate)` shortlists.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but the
+/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but the
 /// device path cannot run for this minibatch.
 /// One-shot engagement report for the block-gate router, mirroring the atom
 /// lane's [`super::scoring_gpu`] `note_route_engagement` (#1551 "GPU 0%" class:
@@ -214,9 +214,9 @@ pub fn route_blocks_required(
     decoder: ArrayView2<'_, f32>,
     b: usize,
     k: usize,
-    mode: gam_gpu::GpuMode,
+    mode: gam_gpu::GpuPolicy,
 ) -> Result<(Vec<Vec<(u32, f32)>>, BlockRoutePath, usize), gam_gpu::GpuError> {
-    use gam_gpu::GpuMode;
+    use gam_gpu::GpuPolicy;
 
     let m = rows.nrows();
     let krows = decoder.nrows();
@@ -230,7 +230,7 @@ pub fn route_blocks_required(
 
     let cpu_route = || route_blocks_cpu(rows, decoder, g, b, active);
 
-    if mode == GpuMode::Off {
+    if mode == GpuPolicy::Off {
         return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
     }
 
@@ -244,9 +244,9 @@ pub fn route_blocks_required(
         GPU_BLOCK_ROUTE_TILE_ELEMS,
     );
     if !plan.device_admitted {
-        if mode == GpuMode::Required {
+        if mode == GpuPolicy::Required {
             return Err(gam_gpu::gpu_err!(
-                "block-gate route GpuMode::Required: block of {m}×{krows} = {} elems is below the \
+                "block-gate route GpuPolicy::Required: block of {m}×{krows} = {} elems is below the \
                  device launch break-even (DEVICE_BLOCK_GATE_MIN_ELEMS={DEVICE_BLOCK_GATE_MIN_ELEMS}); \
                  refusing to silently run on the CPU",
                 m.saturating_mul(krows)
@@ -284,7 +284,7 @@ pub fn route_blocks_required(
         }
         Err(err) => {
             note_block_route_engagement(false, &format!("device route fault: {err}"));
-            if mode == GpuMode::Required {
+            if mode == GpuPolicy::Required {
                 return Err(err);
             }
             // Auto: device faulted mid-route; run the exact CPU oracle.
@@ -756,7 +756,7 @@ mod tests {
             decoder.view(),
             b,
             k,
-            gam_gpu::GpuMode::Required,
+            gam_gpu::GpuPolicy::Required,
         ) {
             Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
@@ -796,7 +796,7 @@ mod tests {
                     decoder.view(),
                     b,
                     k,
-                    gam_gpu::GpuMode::Auto,
+                    gam_gpu::GpuPolicy::Auto,
                 )
                 .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, BlockRoutePath::Cpu);
@@ -827,7 +827,7 @@ mod tests {
             decoder.view(),
             b,
             k,
-            gam_gpu::GpuMode::Required,
+            gam_gpu::GpuPolicy::Required,
         ) {
             Ok((routed, path, _)) => {
                 assert_eq!(

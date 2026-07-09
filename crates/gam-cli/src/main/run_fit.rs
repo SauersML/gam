@@ -386,7 +386,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
 
-    let y_kind = response_column_kind_for_dataset(&ds, y_col);
+    let y_kind = response_column_kind(&ds, y_col);
     let family = resolve_family(
         args.family,
         args.negative_binomial_theta,

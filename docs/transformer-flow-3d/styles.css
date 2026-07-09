@@ -210,11 +210,17 @@ h2 em {
 }
 
 .intro-copy p {
+  width: 100%;
   max-width: 620px;
   margin-bottom: 0;
   color: var(--muted);
   font-size: clamp(14px, 1.4vw, 18px);
   line-height: 1.65;
+}
+
+.intro-copy {
+  min-width: 0;
+  width: 100%;
 }
 
 .equation-card {
@@ -580,7 +586,7 @@ h2 em {
 .path-stat strong {
   display: block;
   color: var(--orange);
-  font: 300 38px/1 var(--mono);
+  font: 300 29px/1.1 var(--mono);
 }
 
 .path-stat span {
@@ -804,6 +810,29 @@ dialog > p {
   font: 400 9px/1.7 var(--mono);
 }
 
+body.stage-only {
+  overflow: hidden;
+}
+
+body.stage-only .app-shell {
+  width: 100%;
+  max-width: none;
+  border: 0;
+}
+
+body.stage-only .topbar,
+body.stage-only .intro,
+body.stage-only .explanation,
+body.stage-only footer {
+  display: none;
+}
+
+body.stage-only .experience {
+  grid-template-rows: 66px calc(100vh - 66px);
+  height: 100vh;
+  border: 0;
+}
+
 .dialog-close {
   position: absolute;
   top: 16px;
@@ -818,7 +847,7 @@ dialog > p {
 }
 
 @media (max-width: 1050px) {
-  .intro { grid-template-columns: 1fr; gap: 45px; }
+  .intro { grid-template-columns: minmax(0, 1fr); gap: 45px; }
   .equation-card { max-width: 620px; }
   .experience { grid-template-columns: 1fr; grid-template-rows: auto 680px auto; }
   .inspector { min-height: 430px; border-top: 1px solid var(--line); border-left: 0; }
@@ -835,6 +864,7 @@ dialog > p {
   .topbar { grid-template-columns: 1fr auto; min-height: 64px; }
   .chapter { display: none; }
   .intro { min-height: auto; padding-top: 70px; }
+  .equation-card { min-width: 0; padding-left: 20px; font-size: 8px; }
   .experience { grid-template-rows: auto 610px auto; }
   .mode-bar { overflow-x: auto; padding-left: 0; }
   .mode-button { min-width: 160px; padding: 0 14px; }
@@ -860,4 +890,15 @@ dialog > p {
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after { transition-duration: .01ms !important; }
+}
+
+@media (max-width: 1050px) {
+  body.stage-only {
+    overflow: auto;
+  }
+
+  body.stage-only .experience {
+    grid-template-rows: 66px calc(100vh - 66px) auto;
+    height: auto;
+  }
 }

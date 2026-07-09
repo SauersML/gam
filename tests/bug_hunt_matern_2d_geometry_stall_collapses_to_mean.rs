@@ -146,11 +146,7 @@ fn std(v: &[f64]) -> f64 {
 fn r2_vs_truth(pred: &[f64], truth: &[f64]) -> f64 {
     let tbar = mean(truth);
     let ss_tot: f64 = truth.iter().map(|t| (t - tbar).powi(2)).sum();
-    let ss_res: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, t)| (p - t).powi(2))
-        .sum();
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (p - t).powi(2)).sum();
     1.0 - ss_res / ss_tot
 }
 

@@ -122,7 +122,9 @@ fn skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null() {
     {
         let mut probe = CalibrationRng::new(SEED ^ 0x9E37_79B9);
         for _ in 0..64 {
-            let ys: Vec<f64> = (0..N_OBS).map(|_| exp_draw(TRUE_RATE, &mut probe)).collect();
+            let ys: Vec<f64> = (0..N_OBS)
+                .map(|_| exp_draw(TRUE_RATE, &mut probe))
+                .collect();
             let sum_y: f64 = ys.iter().sum();
             let n = N_OBS as f64;
             let theta_hat = n / sum_y;

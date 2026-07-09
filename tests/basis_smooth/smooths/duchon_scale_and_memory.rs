@@ -22,13 +22,13 @@
 //! even on the lazy path (which streams the design in row chunks rather than
 //! materializing it).
 
+use gam::ResourcePolicy;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::ResourcePolicy;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

@@ -58,7 +58,7 @@ impl GaussianLocationScalePredictor {
         }
         let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(eta_noise.mapv(|eta| {
-            gam::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
+            gam_model_kernels::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
         }))
     }
 

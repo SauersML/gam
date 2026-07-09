@@ -126,7 +126,9 @@ fn flexible_loglog_cauchit_are_distinct_from_cloglog_2155() {
     };
     let d_loglog = max_abs_diff(&loglog, &cloglog);
     let d_cauchit = max_abs_diff(&cauchit, &cloglog);
-    eprintln!("[#2155] warped-fit max|Δβ|: loglog-vs-cloglog={d_loglog:.4}, cauchit-vs-cloglog={d_cauchit:.4}");
+    eprintln!(
+        "[#2155] warped-fit max|Δβ|: loglog-vs-cloglog={d_loglog:.4}, cauchit-vs-cloglog={d_cauchit:.4}"
+    );
     assert!(
         d_loglog > 1.0e-4,
         "flexible(loglog) and flexible(cloglog) fits are indistinguishable ({d_loglog:.2e}) — \

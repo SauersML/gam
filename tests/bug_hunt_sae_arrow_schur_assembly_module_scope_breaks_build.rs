@@ -96,11 +96,7 @@ impl SplitMix64 {
 /// norm, and trivially separable by routing). A sparse-dictionary trainer with
 /// `K` atoms and an active budget of 1 must reconstruct such data essentially
 /// perfectly.
-fn build_single_active_dictionary_data(
-    n: usize,
-    k: usize,
-    seed: u64,
-) -> (Array2<f32>, usize) {
+fn build_single_active_dictionary_data(n: usize, k: usize, seed: u64) -> (Array2<f32>, usize) {
     let p = 2 * k; // each atom occupies its own disjoint 2-column block
     let inv_sqrt2 = (0.5_f64).sqrt();
     let mut rng = SplitMix64::new(seed);

@@ -940,7 +940,7 @@ fn group_metadata_from_groups(groups: JsonValue) -> Result<Option<GroupMetadata>
 fn parse_gpu_policy(raw_gpu: &str) -> Result<gam_gpu::GpuPolicy, String> {
     gam_gpu::GpuPolicy::parse(raw_gpu).ok_or_else(|| {
         format!(
-            "invalid gpu policy '{}'; supported values are auto, off, force",
+            "invalid gpu policy '{}'; supported values are auto, off, required",
             raw_gpu
         )
     })

@@ -335,8 +335,8 @@ impl DeviceResidentArrowWorkspace {
     }
 
     /// Production seam (#1017 Phase 3): one SAE data-fit inner Newton step under
-    /// the process-wide [`gam_gpu::GpuMode`] residency contract the caller passes
-    /// (`gam_gpu::gpu_mode()`). This is the entry a production inner Newton loop
+    /// the process-wide [`gam_gpu::GpuPolicy`] residency contract the caller passes
+    /// (`gam_gpu::global_policy()`). This is the entry a production inner Newton loop
     /// calls per iterate; it does NOT touch the fitting loop itself — the caller
     /// wires it (see the #1017 seam report).
     ///
@@ -346,61 +346,61 @@ impl DeviceResidentArrowWorkspace {
     /// row-block workload, so a below-break-even shape is simply not
     /// device-resident. This method adds the mode lever and the typed fallback:
     ///
-    /// * [`gam_gpu::GpuMode::Off`] — the dense CPU reference step; no device
+    /// * [`gam_gpu::GpuPolicy::Off`] — the dense CPU reference step; no device
     ///   contact.
-    /// * [`gam_gpu::GpuMode::Auto`] — the resident device step when the workspace
+    /// * [`gam_gpu::GpuPolicy::Auto`] — the resident device step when the workspace
     ///   is device-resident, else the CPU reference; on a device-solve fault the
     ///   fallback to the CPU reference is taken and logged ONCE per process (never
     ///   a silent CPU downgrade). The resident step is a single frame-build +
     ///   solve (no tile loop), so there is no unbounded async backlog to stall on
     ///   silently — the #2227 "never silent" discipline here is the one-shot
     ///   engagement warn plus the typed fault surface, not a per-tile heartbeat.
-    /// * [`gam_gpu::GpuMode::Required`] — the resident device step, or a typed
+    /// * [`gam_gpu::GpuPolicy::Required`] — the resident device step, or a typed
     ///   [`DeviceResidentArrowError`] when the workspace is not device-resident or
     ///   the solve faults (fails closed; never degrades to CPU).
     pub fn inner_iteration_for_production(
         &self,
-        mode: gam_gpu::GpuMode,
+        mode: gam_gpu::GpuPolicy,
         ridge_t: f64,
         ridge_beta: f64,
     ) -> Result<DeviceResidentArrowStep, DeviceResidentArrowError> {
         match mode {
-            gam_gpu::GpuMode::Off => {
-                note_resident_engagement(false, "GpuMode::Off — CPU reference step");
+            gam_gpu::GpuPolicy::Off => {
+                note_resident_engagement(false, "GpuPolicy::Off — CPU reference step");
                 self.cpu_reference_step(ridge_t, ridge_beta)
             }
-            gam_gpu::GpuMode::Required => {
+            gam_gpu::GpuPolicy::Required => {
                 if !self.device_resident() {
                     return Err(DeviceResidentArrowError::Unavailable {
                         reason: format!(
-                            "SAE resident inner step GpuMode::Required: workspace is not \
+                            "SAE resident inner step GpuPolicy::Required: workspace is not \
                              device-resident (the CUDA runtime did not admit shape n={} p={} d={} \
                              at break-even); refusing to run on the CPU",
                             self.shape.n, self.shape.p, self.shape.d
                         ),
                     });
                 }
-                note_resident_engagement(true, "GpuMode::Required — resident device step");
+                note_resident_engagement(true, "GpuPolicy::Required — resident device step");
                 self.one_inner_iteration(ridge_t, ridge_beta)
             }
-            gam_gpu::GpuMode::Auto => {
+            gam_gpu::GpuPolicy::Auto => {
                 if !self.device_resident() {
                     note_resident_engagement(
                         false,
-                        "GpuMode::Auto — workspace not device-resident; CPU reference step",
+                        "GpuPolicy::Auto — workspace not device-resident; CPU reference step",
                     );
                     return self.cpu_reference_step(ridge_t, ridge_beta);
                 }
                 match self.one_inner_iteration(ridge_t, ridge_beta) {
                     Ok(step) => {
-                        note_resident_engagement(true, "GpuMode::Auto — resident device step");
+                        note_resident_engagement(true, "GpuPolicy::Auto — resident device step");
                         Ok(step)
                     }
                     Err(err) => {
                         note_resident_engagement(
                             false,
                             &format!(
-                                "GpuMode::Auto — device solve fault, CPU reference fallback: {err}"
+                                "GpuPolicy::Auto — device solve fault, CPU reference fallback: {err}"
                             ),
                         );
                         self.cpu_reference_step(ridge_t, ridge_beta)

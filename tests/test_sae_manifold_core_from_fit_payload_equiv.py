@@ -28,10 +28,7 @@ from gamfit._sae_manifold import rust_module  # noqa: E402
 
 
 def _builder():
-    fn = getattr(rust_module(), "sae_manifold_core_from_fit_payload", None)
-    if fn is None:
-        pytest.skip("wheel predates sae_manifold_core_from_fit_payload (#2091 builder)")
-    return fn
+    return rust_module().sae_manifold_core_from_fit_payload
 
 
 def _jsonable(value):

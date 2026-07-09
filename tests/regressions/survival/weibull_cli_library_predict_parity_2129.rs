@@ -199,7 +199,11 @@ fn weibull_cli_and_library_predict_surfaces_agree() {
         with_uncertainty: false,
     };
     let lib = predict_survival(request).expect("library Weibull survival predict");
-    assert_eq!(lib.survival.nrows(), 1, "expected one library prediction row");
+    assert_eq!(
+        lib.survival.nrows(),
+        1,
+        "expected one library prediction row"
+    );
     assert_eq!(
         lib.survival.ncols(),
         GRID_TIMES.len(),
@@ -207,9 +211,18 @@ fn weibull_cli_and_library_predict_surfaces_agree() {
     );
     let lib_survival: Vec<f64> = lib.survival.row(0).to_vec();
     // eta = log H(t) = log(cumulative hazard).
-    let lib_eta: Vec<f64> = lib.cumulative_hazard.row(0).iter().map(|h| h.ln()).collect();
+    let lib_eta: Vec<f64> = lib
+        .cumulative_hazard
+        .row(0)
+        .iter()
+        .map(|h| h.ln())
+        .collect();
 
-    assert_eq!(cli_survival.len(), GRID_TIMES.len(), "CLI row count mismatch");
+    assert_eq!(
+        cli_survival.len(),
+        GRID_TIMES.len(),
+        "CLI row count mismatch"
+    );
 
     // The two paths compute the identical quantity from the identical saved
     // coefficients; they must agree to a tight numerical tolerance. Under the

@@ -161,11 +161,20 @@ struct FamilyCase {
 
 impl FamilyCase {
     fn mean(&self, eta: f64) -> f64 {
-        if self.log_link { eta.exp() } else { sigmoid(eta) }
+        if self.log_link {
+            eta.exp()
+        } else {
+            sigmoid(eta)
+        }
     }
 }
 
-fn simulate_dataset(x: &[f64], truth: &SmoothEta, case: &FamilyCase, rng: &mut CalibrationRng) -> EncodedDataset {
+fn simulate_dataset(
+    x: &[f64],
+    truth: &SmoothEta,
+    case: &FamilyCase,
+    rng: &mut CalibrationRng,
+) -> EncodedDataset {
     let rows: Vec<StringRecord> = x
         .iter()
         .map(|&xi| {
@@ -179,7 +188,11 @@ fn simulate_dataset(x: &[f64], truth: &SmoothEta, case: &FamilyCase, rng: &mut C
 }
 
 /// The predictive (observation) interval at every training row and level.
-fn predictive_interval(fit: &FitResult, family_name: &str, level: f64) -> (Array1<f64>, Array1<f64>) {
+fn predictive_interval(
+    fit: &FitResult,
+    family_name: &str,
+    level: f64,
+) -> (Array1<f64>, Array1<f64>) {
     let FitResult::Standard(standard) = fit else {
         panic!("{family_name} `y ~ s(x)` must fit through the dense standard path");
     };
@@ -204,7 +217,9 @@ fn predictive_interval(fit: &FitResult, family_name: &str, level: f64) -> (Array
     };
     let result =
         predict_gamwith_uncertainty(design, beta, offset.view(), family, &standard.fit, &options)
-            .unwrap_or_else(|e| panic!("{family_name} predictive-interval prediction failed: {e:?}"));
+            .unwrap_or_else(|e| {
+                panic!("{family_name} predictive-interval prediction failed: {e:?}")
+            });
     let lower = result.observation_lower.unwrap_or_else(|| {
         panic!(
             "{family_name} is registered as emitting a predictive interval but \
@@ -230,7 +245,12 @@ fn run_family_predictive_gate(case: &FamilyCase) {
     let mut positive_width_seen = false;
 
     for _ in 0..N_REPLICATIONS {
-        let truth = SmoothEta::draw(case.eta_prior.0, case.eta_prior.1, case.eta_prior.2, &mut rng);
+        let truth = SmoothEta::draw(
+            case.eta_prior.0,
+            case.eta_prior.1,
+            case.eta_prior.2,
+            &mut rng,
+        );
         let data = simulate_dataset(&x, &truth, case, &mut rng);
         let config = FitConfig {
             family: Some(case.family.to_string()),

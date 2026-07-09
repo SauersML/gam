@@ -126,7 +126,7 @@ impl SurvivalMarginalSlopeFamily {
     ///   backend-not-compiled, or runtime declined) — callers fall back
     ///   to the existing CPU per-row sweep.
     /// * `Ok(Some((nll, grad)))` when the GPU produced a usable answer.
-    /// * `Err(_)` only when `gpu=force` was requested but the kernel is
+    /// * `Err(_)` only when `gpu=required` was requested but the kernel is
     ///   not supported, mirroring the convention in `gpu::decide`.
     pub(crate) fn try_survival_flex_joint_dispatch_gradient(
         &self,
@@ -226,7 +226,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Step-6 dispatcher for the dense joint Hessian.  Returns
     /// `Ok(Some(H))` on a successful device assembly, `Ok(None)` for the
-    /// CPU fallback, and `Err(_)` only for `gpu=force` shape mismatches.
+    /// CPU fallback, and `Err(_)` only for `gpu=required` shape mismatches.
     pub(crate) fn try_survival_flex_joint_dispatch_dense_hessian(
         &self,
         block_states: &[ParameterBlockState],

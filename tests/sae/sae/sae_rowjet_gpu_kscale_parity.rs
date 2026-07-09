@@ -26,7 +26,7 @@
 //! "GPU 0%" failure mode.
 //!
 //! This test removes the hedge. On a CUDA host it drives the **fail-loud**
-//! `sae_row_jets_softmax_required(.., GpuMode::Required)` entry point, which
+//! `sae_row_jets_softmax_required(.., GpuPolicy::Required)` entry point, which
 //! returns `Err` instead of degrading. So:
 //!
 //!   * the device MUST compile the `sae_rowjet_softmax` kernel on THIS box's
@@ -106,11 +106,11 @@ fn sae_rowjet_gpu_kscale_parity() {
                     k,
                     p,
                     inv_tau,
-                    gam::gpu::GpuMode::Required,
+                    gam::gpu::GpuPolicy::Required,
                 )
                 .unwrap_or_else(|err| {
                     panic!(
-                        "[#1026] CUDA present but GpuMode::Required SAE row-jet \
+                        "[#1026] CUDA present but GpuPolicy::Required SAE row-jet \
                          FAILED at K={k}, p={p}, n={n}: {err}. A silent CPU \
                          fallback is a FAILURE — the device path did not engage \
                          (NVRTC compile/arch or launch fault on this GPU)."
@@ -163,15 +163,16 @@ fn sae_rowjet_gpu_kscale_parity() {
     let rows = fixture(n, k, p);
     let oracle = sae_row_jets_cpu_softmax(&rows, k, p, inv_tau);
 
-    let required = sae_row_jets_softmax_required(&rows, k, p, inv_tau, gam::gpu::GpuMode::Required);
+    let required =
+        sae_row_jets_softmax_required(&rows, k, p, inv_tau, gam::gpu::GpuPolicy::Required);
     assert!(
         required.is_err(),
-        "[#1026] no device present, yet GpuMode::Required returned Ok — the \
+        "[#1026] no device present, yet GpuPolicy::Required returned Ok — the \
          fail-closed contract was violated (a silent CPU fallback reported as a \
          device success is the exact #1551 false-routing bug)."
     );
 
-    for mode in [gam::gpu::GpuMode::Auto, gam::gpu::GpuMode::Off] {
+    for mode in [gam::gpu::GpuPolicy::Auto, gam::gpu::GpuPolicy::Off] {
         let (channels, path) = sae_row_jets_softmax_required(&rows, k, p, inv_tau, mode)
             .expect("[#1026] Auto/Off must never error on a device-absent host");
         assert_eq!(

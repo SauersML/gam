@@ -22,9 +22,7 @@ use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_for
 /// decorrelated from x.
 fn build_data() -> gam::data::EncodedDataset {
     let n = 200usize;
-    let x: Vec<f64> = (0..n)
-        .map(|i| i as f64 / (n as f64 - 1.0))
-        .collect();
+    let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
 
     let exp_table: Vec<f64> = (0..n)
         .map(|i| {
@@ -62,7 +60,11 @@ fn build_data() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn fit_family(family: &str, formula: &str, data: &gam::data::EncodedDataset) -> Result<Vec<f64>, String> {
+fn fit_family(
+    family: &str,
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+) -> Result<Vec<f64>, String> {
     let cfg = FitConfig {
         family: Some(family.to_string()),
         ..FitConfig::default()

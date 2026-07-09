@@ -22,10 +22,7 @@ from gamfit._sae_manifold import (  # noqa: E402
 
 
 def _rust_atom_topologies(bases):
-    fn = getattr(rust_module(), "sae_atom_topologies", None)
-    if fn is None:
-        pytest.skip("wheel predates sae_atom_topologies (#2091 coercion slice)")
-    return fn(list(bases))
+    return rust_module().sae_atom_topologies(list(bases))
 
 
 @pytest.mark.parametrize(

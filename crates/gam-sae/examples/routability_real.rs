@@ -67,7 +67,7 @@ fn run(root: &Path) -> Result<(), String> {
         cfg.max_epochs = EPOCHS;
         cfg.minibatch = 2_048;
         cfg.score_tile = 4_096;
-        cfg.score_mode = gam_sae::gpu::GpuMode::Off;
+        cfg.score_mode = gam_sae::gpu::GpuPolicy::Off;
         let fit = match fit_sparse_dictionary(x.view(), &cfg) {
             Ok(fit) => fit,
             Err(err) => {

@@ -27,7 +27,7 @@ struct Args {
     post_peel: bool,
     n_peeled: usize,
     pca_dim: Option<usize>,
-    gpu_mode: gam_gpu::GpuMode,
+    gpu_policy: gam_gpu::GpuPolicy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,17 +78,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (fail fast) rather than a silent CPU run or a GPU slot burned on a late
     // crash; the per-minibatch admission uses the same `minibatch × K` score
     // floor the router enforces.
-    gam_gpu::set_gpu_mode(args.gpu_mode);
+    gam_gpu::configure_global_policy(args.gpu_policy);
     let route_plan =
         gam_gpu::DictionaryScoreRoutePlan::default_for_shape(args.minibatch.min(n_used), args.atoms, p);
     println!(
         "[scale_k] gpu={:?} per-minibatch score elems = {} (device_admitted={}, break-even={})",
-        args.gpu_mode,
+        args.gpu_policy,
         args.minibatch.min(n_used).saturating_mul(args.atoms),
         route_plan.device_admitted,
         route_plan.device_min_score_elems,
     );
-    if args.gpu_mode == gam_gpu::GpuMode::Required {
+    if args.gpu_policy == gam_gpu::GpuPolicy::Required {
         if gam_gpu::GpuRuntime::global().is_none() {
             return Err(
                 "--gpu required but no CUDA runtime is available on this host (run on the A100 box)"
@@ -416,7 +416,7 @@ fn parse_args() -> Result<Args, String> {
         pca_dim: None,
         // Default Auto: the block router dispatches admitted minibatches to the
         // CUDA block-gate device path on a CUDA host, else the CPU router.
-        gpu_mode: gam_gpu::GpuMode::Auto,
+        gpu_policy: gam_gpu::GpuPolicy::Auto,
     };
     let mut i = 3usize;
     while i < raw.len() {
@@ -452,12 +452,9 @@ fn parse_args() -> Result<Args, String> {
             "--n-peeled" => args.n_peeled = parse_usize(value, key)?,
             "--pca-dim" => args.pca_dim = Some(parse_usize(value, key)?),
             "--gpu" => {
-                args.gpu_mode = match value.as_str() {
-                    "required" => gam_gpu::GpuMode::Required,
-                    "auto" => gam_gpu::GpuMode::Auto,
-                    "off" => gam_gpu::GpuMode::Off,
-                    other => return Err(format!("--gpu must be required|auto|off, got {other}")),
-                }
+                args.gpu_policy = gam_gpu::GpuPolicy::parse(value).ok_or_else(|| {
+                    format!("--gpu must be required|auto|off, got {value}")
+                })?;
             }
             other => return Err(format!("unknown argument {other}")),
         }

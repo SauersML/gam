@@ -17,10 +17,7 @@ from gamfit._sae_manifold import rust_module  # noqa: E402
 
 
 def _roundtrip(obj):
-    fn = getattr(rust_module(), "sae_coercion_json_roundtrip", None)
-    if fn is None:
-        pytest.skip("wheel predates sae_coercion_json_roundtrip (#2091 coercion slice)")
-    return fn(obj)
+    return rust_module().sae_coercion_json_roundtrip(obj)
 
 
 def _jsonable(value):

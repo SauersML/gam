@@ -451,7 +451,7 @@ pub struct FitConfig {
     pub outer_max_iter: Option<usize>,
 
     /// GPU backend selection policy. `Auto` uses supported device kernels for
-    /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
+    /// large workloads, `Off` pins execution to CPU kernels, and `Required` fails
     /// loudly when a requested GPU kernel has no compiled backend.
     pub gpu_policy: gam_gpu::GpuPolicy,
     /// Optional override of the [`gam_runtime::resource::ResourcePolicy`] used when

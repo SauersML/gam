@@ -447,26 +447,26 @@ pub enum ScoreBlockPath {
 
 /// Fail-loud, residency-aware score-block entry point (#1026 scale-K lane).
 ///
-/// Honours the process-wide [`gam_gpu::GpuMode`] contract: under
-/// [`gam_gpu::GpuMode::Required`] a missing CUDA runtime, an NVRTC/arch compile
+/// Honours the process-wide [`gam_gpu::GpuPolicy`] contract: under
+/// [`gam_gpu::GpuPolicy::Required`] a missing CUDA runtime, an NVRTC/arch compile
 /// failure, a launch fault, or a block below the device break-even all return
-/// `Err` instead of silently degrading to the CPU. [`gam_gpu::GpuMode::Auto`]
+/// `Err` instead of silently degrading to the CPU. [`gam_gpu::GpuPolicy::Auto`]
 /// uses the device when admitted and the block clears the break-even, else the
-/// CPU; [`gam_gpu::GpuMode::Off`] always the CPU. The returned [`ScoreBlockPath`]
+/// CPU; [`gam_gpu::GpuPolicy::Off`] always the CPU. The returned [`ScoreBlockPath`]
 /// reports which path actually ran.
 ///
 /// Both paths produce a BIT-IDENTICAL `f32` score block (see module docs), so
 /// the routed top-`s` support is identical whichever path runs.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but
+/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but
 /// the device path cannot run.
 pub fn score_block_required(
     rows: ArrayView2<'_, f32>,
     atoms: ArrayView2<'_, f32>,
-    mode: gam_gpu::GpuMode,
+    mode: gam_gpu::GpuPolicy,
 ) -> Result<(Vec<f32>, ScoreBlockPath), gam_gpu::GpuError> {
-    use gam_gpu::GpuMode;
+    use gam_gpu::GpuPolicy;
 
     let n_rows = rows.nrows();
     let n_atoms = atoms.nrows();
@@ -478,13 +478,13 @@ pub fn score_block_required(
         GPU_ROUTE_TILE_ELEMS,
     );
 
-    if mode == GpuMode::Off {
+    if mode == GpuPolicy::Off {
         return Ok((score_block_cpu(rows, atoms), ScoreBlockPath::Cpu));
     }
 
-    if mode == GpuMode::Required && !plan.device_admitted {
+    if mode == GpuPolicy::Required && !plan.device_admitted {
         return Err(gam_gpu::gpu_err!(
-            "sparse_dict score-block GpuMode::Required: block of {n_rows}×{n_atoms} = {} \
+            "sparse_dict score-block GpuPolicy::Required: block of {n_rows}×{n_atoms} = {} \
              elems is below the device launch break-even \
              (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS}); refusing \
              to silently run on the CPU",
@@ -495,7 +495,7 @@ pub fn score_block_required(
         match device::score_block_device(rows, atoms) {
             Ok(out) => return Ok((out, ScoreBlockPath::Device)),
             Err(err) => {
-                if mode == GpuMode::Required {
+                if mode == GpuPolicy::Required {
                     return Err(err);
                 }
                 // Auto: fall through to the CPU.
@@ -531,13 +531,13 @@ const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS
 /// folded into resident device top-`s` buffers and discarded, so peak score
 /// memory is `m × tile_cols`, independent of `K`.
 ///
-/// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuMode::Off`],
+/// Falls back to the per-row CPU `top_s_online` under [`gam_gpu::GpuPolicy::Off`],
 /// below the device break-even, or on any device error under
-/// [`gam_gpu::GpuMode::Auto`]; under [`gam_gpu::GpuMode::Required`] a device
+/// [`gam_gpu::GpuPolicy::Auto`]; under [`gam_gpu::GpuPolicy::Required`] a device
 /// failure is propagated. The returned [`ScoreBlockPath`] reports which path ran.
 ///
 /// # Errors
-/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuMode::Required`] is set but
+/// Returns [`gam_gpu::GpuError`] when [`gam_gpu::GpuPolicy::Required`] is set but
 /// the device path cannot run for this minibatch.
 /// One-shot engagement report for the T1 score router (#1551 class: "GPU 0%"
 /// runs where the decline reason was swallowed by the Auto fallback). Routed
@@ -570,7 +570,7 @@ pub fn route_minibatch_required(
     decoder: ArrayView2<'_, f32>,
     s: usize,
     tile: usize,
-    mode: gam_gpu::GpuMode,
+    mode: gam_gpu::GpuPolicy,
 ) -> Result<(Vec<Vec<(u32, f32)>>, ScoreBlockPath, usize), gam_gpu::GpuError> {
     use super::scoring::top_s_online;
 
@@ -586,7 +586,7 @@ pub fn route_minibatch_required(
             .collect()
     };
 
-    if mode == gam_gpu::GpuMode::Off {
+    if mode == gam_gpu::GpuPolicy::Off {
         return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
@@ -601,9 +601,9 @@ pub fn route_minibatch_required(
         GPU_ROUTE_TILE_ELEMS,
     );
     if !plan.device_admitted {
-        if mode == gam_gpu::GpuMode::Required {
+        if mode == gam_gpu::GpuPolicy::Required {
             return Err(gam_gpu::gpu_err!(
-                "route_minibatch GpuMode::Required: block of {m}×{k} = {} elems is below \
+                "route_minibatch GpuPolicy::Required: block of {m}×{k} = {} elems is below \
                  the device launch break-even (DEVICE_SCORE_BLOCK_MIN_ELEMS={DEVICE_SCORE_BLOCK_MIN_ELEMS}); \
                  refusing to silently run on the CPU",
                 m.saturating_mul(k)
@@ -641,7 +641,7 @@ pub fn route_minibatch_required(
         }
         Err(err) => {
             note_route_engagement(false, &format!("device route fault: {err}"));
-            if mode == gam_gpu::GpuMode::Required {
+            if mode == gam_gpu::GpuPolicy::Required {
                 return Err(err);
             }
             // Auto: the device faulted mid-route; discard partial selectors and
@@ -1147,7 +1147,7 @@ mod tests {
             atoms.view(),
             s,
             tile,
-            gam_gpu::GpuMode::Required,
+            gam_gpu::GpuPolicy::Required,
         ) {
             Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
@@ -1188,7 +1188,7 @@ mod tests {
                     atoms.view(),
                     s,
                     tile,
-                    gam_gpu::GpuMode::Auto,
+                    gam_gpu::GpuPolicy::Auto,
                 )
                 .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, ScoreBlockPath::Cpu);
@@ -1228,7 +1228,7 @@ mod tests {
             atoms.view(),
             s,
             tile,
-            gam_gpu::GpuMode::Required,
+            gam_gpu::GpuPolicy::Required,
         ) {
             Ok((routed, path, dtoh_bytes)) => {
                 assert_eq!(
@@ -1271,7 +1271,7 @@ mod tests {
                     atoms.view(),
                     s,
                     tile,
-                    gam_gpu::GpuMode::Auto,
+                    gam_gpu::GpuPolicy::Auto,
                 )
                 .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, ScoreBlockPath::Cpu);
@@ -1287,7 +1287,7 @@ mod tests {
         // Exactness gate. The block MUST clear DEVICE_SCORE_BLOCK_MIN_ELEMS so
         // the device path is actually admitted (a sub-break-even block would
         // skip-pass on the CPU and prove nothing). On a CUDA host we drive
-        // GpuMode::Required so a silent CPU fallback is a hard FAILURE, and we
+        // GpuPolicy::Required so a silent CPU fallback is a hard FAILURE, and we
         // assert the device block is BIT-IDENTICAL to the CPU reference. With no
         // runtime, Required must fail closed and the CPU path stays exact.
         let n_rows = 256;
@@ -1297,7 +1297,7 @@ mod tests {
         let (rows, atoms) = fixture(n_rows, n_atoms, p);
         let cpu = score_block_cpu(rows.view(), atoms.view());
 
-        match score_block_required(rows.view(), atoms.view(), gam_gpu::GpuMode::Required) {
+        match score_block_required(rows.view(), atoms.view(), gam_gpu::GpuPolicy::Required) {
             Ok((got, path)) => {
                 assert_eq!(
                     path,
@@ -1321,7 +1321,7 @@ mod tests {
                 );
                 // The CPU path must still be exact under Auto.
                 let (got, path) =
-                    score_block_required(rows.view(), atoms.view(), gam_gpu::GpuMode::Auto)
+                    score_block_required(rows.view(), atoms.view(), gam_gpu::GpuPolicy::Auto)
                         .expect("Auto must not error on a device-absent host");
                 assert_eq!(path, ScoreBlockPath::Cpu);
                 assert_eq!(got, cpu);

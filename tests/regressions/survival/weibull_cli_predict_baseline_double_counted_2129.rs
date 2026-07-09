@@ -96,7 +96,12 @@ fn write_grid_csv(path: &Path) {
         .expect("write grid header");
     for t in GRID_TIMES {
         writer
-            .write_record(["0.0".to_string(), format!("{t:.12}"), "1".to_string(), "0.0".to_string()])
+            .write_record([
+                "0.0".to_string(),
+                format!("{t:.12}"),
+                "1".to_string(),
+                "0.0".to_string(),
+            ])
             .expect("write grid row");
     }
     writer.flush().expect("flush grid csv");
@@ -130,7 +135,10 @@ fn fit(train: &Path, likelihood: &str, model: &Path) {
         .arg("--out")
         .arg(model);
     run_or_panic(cmd, &format!("gam fit Surv ~ x ({likelihood})"));
-    assert!(model.is_file(), "gam fit ({likelihood}) did not write {model:?}");
+    assert!(
+        model.is_file(),
+        "gam fit ({likelihood}) did not write {model:?}"
+    );
 }
 
 fn predict(model: &Path, grid: &Path, out: &Path, mode: &str) {

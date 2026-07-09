@@ -250,7 +250,10 @@ fn zz_1095_2228_measure_seed_vs_settled_r2() {
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
     let result = problem
-        .run(&mut objective, "SAE d=2 circle ridge-0 measure (#1095/#2228)")
+        .run(
+            &mut objective,
+            "SAE d=2 circle ridge-0 measure (#1095/#2228)",
+        )
         .expect("outer cascade completes");
     let fitted = objective.into_fitted();
     let used_pristine = fitted.used_pristine_seed_fallback;

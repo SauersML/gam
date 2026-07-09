@@ -5556,18 +5556,12 @@ fn score_route_stats_dict<'py>(
     Ok(out)
 }
 
-fn parse_sparse_dict_score_mode(score_mode: &str) -> PyResult<gam::gpu::GpuMode> {
-    if score_mode.eq_ignore_ascii_case("auto") {
-        Ok(gam::gpu::GpuMode::Auto)
-    } else if score_mode.eq_ignore_ascii_case("required") {
-        Ok(gam::gpu::GpuMode::Required)
-    } else if score_mode.eq_ignore_ascii_case("off") {
-        Ok(gam::gpu::GpuMode::Off)
-    } else {
-        Err(py_value_error(format!(
+fn parse_sparse_dict_score_mode(score_mode: &str) -> PyResult<gam::gpu::GpuPolicy> {
+    gam::gpu::GpuPolicy::parse(score_mode).ok_or_else(|| {
+        py_value_error(format!(
             "sparse dictionary score_mode must be 'auto', 'required', or 'off'; got {score_mode:?}"
-        )))
-    }
+        ))
+    })
 }
 
 /// Cap on the number of top strictly-improving birth candidates a sparse-dict

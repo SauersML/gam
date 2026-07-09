@@ -52,7 +52,7 @@ use crate::tiered::Tier0Mean;
 pub struct TieredFitConfig {
     /// Tier-1 block-sparse dictionary configuration (`G` blocks of size `b`, the
     /// block budget `k`, epochs, minibatch/tile geometry). GPU score-routing is
-    /// governed by the process-wide [`gam_gpu::GpuMode`] (`gam_gpu::set_gpu_mode`),
+    /// governed by the process-wide [`gam_gpu::GpuPolicy`] (`gam_gpu::configure_global_policy`),
     /// not by this config: the Tier-1 router dispatches each minibatch to the CUDA
     /// block-gate lane when the mode admits it and a runtime is present.
     pub tier1: BlockSparseConfig,

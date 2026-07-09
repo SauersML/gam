@@ -587,15 +587,20 @@ fn pinned_kappa_is_kept_verbatim_by_the_fit() {
     let rows = small_ball_rows(600, 2152);
 
     let (k_pos, pinned_pos) = fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=3, centers=20)", &rows);
-    assert!(pinned_pos, "explicit kappa=3 must mark the term kappa_fixed");
+    assert!(
+        pinned_pos,
+        "explicit kappa=3 must mark the term kappa_fixed"
+    );
     assert!(
         (k_pos - 3.0).abs() < 1e-9,
         "pinned kappa=+3 was re-derived: fit kept κ = {k_pos} (want +3)"
     );
 
-    let (k_neg, pinned_neg) =
-        fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=-3, centers=20)", &rows);
-    assert!(pinned_neg, "explicit kappa=-3 must mark the term kappa_fixed");
+    let (k_neg, pinned_neg) = fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=-3, centers=20)", &rows);
+    assert!(
+        pinned_neg,
+        "explicit kappa=-3 must mark the term kappa_fixed"
+    );
     assert!(
         (k_neg + 3.0).abs() < 1e-9,
         "pinned kappa=-3 was re-derived: fit kept κ = {k_neg} (want -3)"
@@ -605,7 +610,10 @@ fn pinned_kappa_is_kept_verbatim_by_the_fit() {
     // 0), not left free to drift to a chart bound.
     let (k_flat, pinned_flat) =
         fitted_kappa_and_pin("y ~ curv(x1, x2, kappa=0, centers=20)", &rows);
-    assert!(pinned_flat, "explicit kappa=0 must mark the term kappa_fixed");
+    assert!(
+        pinned_flat,
+        "explicit kappa=0 must mark the term kappa_fixed"
+    );
     assert!(
         k_flat.abs() < 1e-9,
         "pinned kappa=0 drifted off flat: fit kept κ = {k_flat} (want 0)"

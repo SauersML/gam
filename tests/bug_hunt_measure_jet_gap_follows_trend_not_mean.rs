@@ -155,11 +155,7 @@ fn measure_jet_gap_prediction_follows_trend_not_mean() {
     let pred = fit_and_predict("y ~ mjs(x, centers=18)", &data, &gap_xs);
 
     let slope_hat = ls_slope(&gap_xs, &pred);
-    let mad_pred = pred
-        .iter()
-        .map(|p| (p - train_mean).abs())
-        .sum::<f64>()
-        / pred.len() as f64;
+    let mad_pred = pred.iter().map(|p| (p - train_mean).abs()).sum::<f64>() / pred.len() as f64;
     let mad_truth = gap_truth
         .iter()
         .map(|t| (t - train_mean).abs())
@@ -207,10 +203,7 @@ fn measure_jet_gap_prediction_follows_trend_not_mean() {
     // Sanity: the fitted gap surface is not a constant (a constant would have
     // zero slope and be caught above, but pin it explicitly against a
     // degenerate/flat bridge).
-    let pred_range = pred
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max)
+    let pred_range = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         - pred.iter().cloned().fold(f64::INFINITY, f64::min);
     assert!(
         pred_range > 0.2 * (TRUE_SLOPE * (GAP_HI - GAP_LO)),

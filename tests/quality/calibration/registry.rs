@@ -48,14 +48,18 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
         // covariance-mode sweep.
         CalibrationTarget {
             name: "eta_credible_band_conditional",
-            kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: false,
+            },
             mode: AuditMode::CoverageSweep,
             guards: &[1870],
             audited_by: "sbc_gaussian_mean_band_covariance_modes (Conditional arm)",
         },
         CalibrationTarget {
             name: "eta_credible_band_smoothing_corrected",
-            kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: true,
+            },
             mode: AuditMode::CoverageSweep,
             guards: &[1871],
             audited_by: "sbc_gaussian_mean_band_covariance_modes (Preferred arm) \
@@ -63,7 +67,9 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
         },
         CalibrationTarget {
             name: "mean_credible_band_conditional",
-            kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: false,
+            },
             mode: AuditMode::CoverageSweep,
             guards: &[1870, 1878],
             audited_by: "sbc_gaussian_mean_band_covariance_modes (Conditional arm) \
@@ -71,7 +77,9 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
         },
         CalibrationTarget {
             name: "mean_credible_band_smoothing_corrected",
-            kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: true,
+            },
             mode: AuditMode::CoverageSweep,
             guards: &[1871],
             audited_by: "sbc_gaussian_smooth_band_coverage \
@@ -155,7 +163,9 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
         // Survival S(t|x) band.
         CalibrationTarget {
             name: "survival_probability_band",
-            kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: true,
+            },
             mode: AuditMode::CoverageSweep,
             guards: &[1869, 1870, 1871],
             audited_by: "sbc_survival_probability_band_coverage",
@@ -462,7 +472,10 @@ fn covariance_and_interval_modes_map_to_registered_bands() {
                 "mean_credible_band_conditional"
             }
         };
-        assert!(names.contains(target), "interval method {method:?} unmapped");
+        assert!(
+            names.contains(target),
+            "interval method {method:?} unmapped"
+        );
     }
 }
 

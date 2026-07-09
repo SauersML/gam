@@ -1,59 +1,21 @@
-//! Device-resident outer REML BFGS-over-ρ driver.
+//! GPU-backed outer REML optimization.
 //!
-//! ## Why this module exists
+//! Expensive objective work (inner P-IRLS, trace estimation, Arrow-Schur
+//! factorization, and derivative assembly) stays in the device-backed evaluator.
+//! Solver policy is shared with the host path through [`opt::Bfgs`], so both
+//! paths use the same bounds, projected-gradient stopping, direction scaling,
+//! hybrid line search, and robustness fixes.
 //!
-//! Before this driver landed, the outer REML BFGS optimiser over the smoothing
-//! parameter vector `ρ` ran on the host orchestrator (`rho_optimizer::run_outer`
-//! → `Solver::Bfgs`). Each outer iteration evaluated `(cost, grad)` by hopping
-//! back into the CPU REML evaluator, which in turn dispatched the inner P-IRLS
-//! loop, the Hutchinson trace estimator, the arrow-Schur batched Cholesky, and
-//! the sigma-cubature covariance to device kernels. The device-resident pieces
-//! were already in place (`pirls_loop_on_stream`, `sigma_cubature_dispatch`,
-//! `arrow_schur_gpu`), but every outer step still paid:
-//!
-//! * one full BFGS state hop out to host memory (ρ, gradient, inverse-Hessian
-//!   approximation, line-search bookkeeping);
-//! * a fresh round of design-matrix uploads inside the inner P-IRLS loop, even
-//!   when the design was unchanged across the entire outer trajectory;
-//! * scalar-by-scalar gather of trace estimates from the host orchestrator
-//!   between Hutchinson probes and the gradient assembler.
-//!
-//! At large scale (n ≈ 200k–500k, p ≈ 32–128, `num_rho` ≈ 8–32) those hops
-//! dominate the wall-clock cost of the outer BFGS-over-ρ loop. This module
-//! collapses them into a single device-resident driver that:
-//!
-//! 1. Uploads the shared design matrix `X` once via
-//!    `pirls_gpu::upload_shared_pirls_gpu`, and allocates the per-iter PIRLS
-//!    workspace once.
-//! 2. Keeps the BFGS state — ρ vector, gradient, BFGS inverse-Hessian
-//!    approximation `H⁻¹`, line-search trial points — resident on the device's
-//!    default stream; only the per-step scalar objective and a scalar
-//!    convergence flag are downloaded.
-//! 3. Assembles the per-step gradient by calling
-//!    `evidence_derivatives_gpu` against the cached factor, with the derivative
-//!    Hessians supplied by the existing arrow-Schur batched solver — no host
-//!    fan-out.
-//! 4. Drives the inner P-IRLS via `pirls_loop_on_stream` on the same stream so
-//!    the inner ↔ outer handoff is implicit ordering instead of a synchronise.
-//!
-//! Admission is governed by `gam_gpu::policy::should_run_reml_outer_on_device`
-//! and lives at the CPU outer-strategy boundary as a single yes/no decision.
-//! Anything the predicate rejects (small `n`, custom inverse-link family,
-//! `num_rho < 2`, GPU runtime absent) falls through to the existing host BFGS
-//! driver with bit-identical math.
-//!
-//! ## What this module does *not* do
-//!
-//! The device-resident driver is not a new optimisation algorithm: it consumes
-//! the same `OuterObjective` capability declaration and surfaces the same
-//! `OuterResult` shape as the host BFGS branch, so seeding, structural
-//! early-exit, screening, and continuation pre-warm all behave exactly as the
-//! host path. The only thing it changes is *where* the BFGS state lives
-//! between evaluations.
+//! The device evaluator naturally returns value and gradient from one kernel
+//! sequence. [`opt::FusedObjective`] preserves that fusion across the solver's
+//! split cost/gradient requests, so accepted line-search points are not
+//! evaluated twice.
 
-use gam_optimize::{BacktrackConfig, backtracking_line_search, constants};
-use ndarray::{Array1, Array2, ArrayView2};
-use std::convert::Infallible;
+use ndarray::Array1;
+use opt::{
+    Bfgs, BfgsError, Bounds, FirstOrderSample, FusedObjective, GradientTolerance,
+    InitialMetric, MaxIterations, ObjectiveEvalError, Profile,
+};
 
 use gam_gpu::policy::RemlOuterAdmission;
 use crate::estimate::EstimationError;
@@ -76,9 +38,9 @@ pub struct RemlOuterGpuInput {
     /// Per-axis lower / upper bounds on ρ. Same `(lo, hi)` shape the host
     /// branch consumes via `outer_bounds`.
     pub bounds: (Array1<f64>, Array1<f64>),
-    /// Outer convergence tolerance on `‖∇‖∞`. Mirrors
+    /// Outer projected-gradient convergence rule. Mirrors
     /// `outer_gradient_tolerance(config)`.
-    pub gradient_tolerance: f64,
+    pub gradient_tolerance: GradientTolerance,
     /// Hard cap on outer BFGS iterations.
     pub max_iterations: usize,
     /// Per-axis step caps applied to BFGS line-search trial points. `None`
@@ -93,6 +55,9 @@ pub struct RemlOuterGpuInput {
     /// up to the engine's sign convention). Used to seed the BFGS sample so
     /// the optimiser's first cached eval matches the host bridge.
     pub seed_objective: f64,
+    /// Gradient paired with `seed_objective`. Passing the complete sample avoids
+    /// repeating the expensive device-backed evaluation inside BFGS.
+    pub seed_gradient: Array1<f64>,
 }
 
 /// Result of the device-resident outer driver. Shaped to feed
@@ -107,12 +72,13 @@ pub struct RemlOuterGpuOutcome {
     pub objective: f64,
     /// Number of outer BFGS iterations consumed.
     pub iterations: usize,
-    /// Final `‖∇‖∞`; `None` when the optimiser exited before populating it.
+    /// Final projected-gradient L2 norm; `None` when the optimiser exited before
+    /// populating it.
     pub final_grad_norm: Option<f64>,
     /// Full final gradient vector (length `num_rho`); `None` on the same
     /// exits that leave `final_grad_norm` empty.
     pub final_gradient: Option<Array1<f64>>,
-    /// True when the outer BFGS satisfied `‖∇‖∞ ≤ gradient_tolerance`
+    /// True when the outer BFGS satisfied `gradient_tolerance`
     /// before exhausting the iteration budget.
     pub converged: bool,
 }
@@ -128,60 +94,6 @@ pub struct RemlOuterDeviceEval {
     pub gradient: Array1<f64>,
 }
 
-/// Default BFGS inverse-Hessian initialisation: identity scaled by the
-/// reciprocal of the seed-gradient infinity norm. Same heuristic the host
-/// `opt::Bfgs` uses internally when no explicit initial sample is supplied;
-/// reproduced here so the device-resident BFGS state starts at the same
-/// curvature scale as the host branch on the first line search.
-pub fn initial_inverse_hessian(num_rho: usize, seed_grad_inf_norm: f64) -> Array2<f64> {
-    let scale = if seed_grad_inf_norm > 0.0 && seed_grad_inf_norm.is_finite() {
-        1.0 / seed_grad_inf_norm.max(1.0)
-    } else {
-        1.0
-    };
-    let mut h_inv = Array2::<f64>::zeros((num_rho, num_rho));
-    for i in 0..num_rho {
-        h_inv[[i, i]] = scale;
-    }
-    h_inv
-}
-
-/// Apply per-axis step caps to a BFGS search direction. Same semantics as
-/// `Bfgs::with_axis_step_caps` on the host branch — used here so the
-/// device-resident driver's line-search trial points stay inside the caller's
-/// declared per-coordinate trust radius.
-pub fn cap_axiswise(direction: &mut Array1<f64>, caps: Option<&Array1<f64>>) {
-    let Some(caps) = caps else {
-        return;
-    };
-    for (d, c) in direction.iter_mut().zip(caps.iter()) {
-        if !c.is_finite() || *c <= 0.0 {
-            continue;
-        }
-        if d.abs() > *c {
-            *d = d.signum() * *c;
-        }
-    }
-}
-
-/// Project a candidate ρ onto the axis-aligned bounds box. Same routine the
-/// host outer-strategy uses via `project_to_bounds`; reproduced here on the
-/// device-resident driver's side so trial points generated by the on-device
-/// line search never leave the declared box before the next inner P-IRLS
-/// step is launched.
-pub fn project_onto_bounds(rho: &mut Array1<f64>, bounds: &(Array1<f64>, Array1<f64>)) {
-    let (lo, hi) = bounds;
-    for i in 0..rho.len() {
-        let lower = lo[i];
-        let upper = hi[i];
-        if rho[i] < lower {
-            rho[i] = lower;
-        } else if rho[i] > upper {
-            rho[i] = upper;
-        }
-    }
-}
-
 /// Drive the outer REML BFGS optimisation over ρ entirely through the
 /// device-resident kernels.
 ///
@@ -195,14 +107,8 @@ pub fn project_onto_bounds(rho: &mut Array1<f64>, bounds: &(Array1<f64>, Array1<
 ///    `evidence_derivatives_gpu`, which keeps `H_λ` factored exactly once
 ///    per outer step and back-solves the per-ρ derivative slabs in one
 ///    `potrs` of width `p · num_rho`.
-/// 4. BFGS state update (gradient diff `y`, search direction `H⁻¹ g`, line
-///    search) on the device stream's default scratch arena. Only the
-///    objective scalar and the convergence flag are downloaded.
-///
-/// Bounds projection, axis-wise step capping, and gradient-tolerance
-/// convergence all run against the same scalar download per step, so the
-/// host hop count per outer iteration is exactly one (the objective scalar
-/// for the line-search Armijo check), independent of `p` and `num_rho`.
+/// 4. Shared `opt::Bfgs` policy consumes the fused sample and chooses the next
+///    bounded trial.
 ///
 /// `evaluator` is the per-step bridge supplied by the outer-strategy
 /// dispatch site: it is responsible for invoking the inner P-IRLS loop and
@@ -248,177 +154,73 @@ where
         )));
     }
 
-    let bounds = input.bounds.clone();
-    let axis_caps = input.axis_step_caps.clone();
-    let grad_tol = input.gradient_tolerance.max(0.0);
-    let max_iter = input.max_iterations;
-
-    // Seed the BFGS state from the host-supplied (objective, gradient) at the
-    // seed ρ. The first evaluator call refines the gradient on the projected
-    // seed — projection is a no-op when the host has already projected, but
-    // we keep it for the device-resident driver's local invariants.
-    let mut rho = input.seed_rho.clone();
-    project_onto_bounds(&mut rho, &bounds);
-    let eval = evaluator(&rho)?;
-    let mut objective = eval.objective;
-    let mut gradient = eval.gradient;
-
-    let mut grad_inf = inf_norm(&gradient);
-    let mut h_inv = initial_inverse_hessian(num_rho, grad_inf);
-
-    let mut converged = grad_inf <= grad_tol;
-    let mut iterations = 0_usize;
-
-    while !converged && iterations < max_iter {
-        // BFGS search direction `d = − H⁻¹ g`.
-        let mut direction = matvec_neg(h_inv.view(), &gradient);
-        cap_axiswise(&mut direction, axis_caps.as_ref());
-
-        // Backtracking Armijo line search on the device-resident objective:
-        // start at α = 1, halve until f(ρ + α d) ≤ f(ρ) + c₁ α gᵀd, or until
-        // the trust radius collapses below 1e-12. From a unit step, 2⁻³⁹ is
-        // the last trial ≥ 1e-12, so the halving-count budget is 40 trials.
-        // A rejected/erroring trial evaluation is an INVALID trial
-        // (`Ok(None)`): the search halves without consulting the Armijo test.
-        const LINE_SEARCH_TRIALS: usize = 40;
-        let g_dot_d = dot(&gradient, &direction);
-        // Reject degenerate (non-descent) directions and treat as a stall;
-        // the host dispatcher's degraded-plan ladder will pick this up the
-        // same way it does for the host BFGS branch.
-        if !g_dot_d.is_finite() || g_dot_d >= 0.0 {
-            break;
-        }
-        let accepted = match backtracking_line_search::<_, Infallible>(
-            BacktrackConfig {
-                max_steps: LINE_SEARCH_TRIALS,
-                ..BacktrackConfig::default()
-            },
-            |alpha| {
-                let mut trial_rho = scaled_add(&rho, alpha, &direction);
-                project_onto_bounds(&mut trial_rho, &bounds);
-                Ok(evaluator(&trial_rho)
-                    .ok()
-                    .map(|e| (e.objective, (trial_rho, e))))
-            },
-            |alpha, f| f.is_finite() && f <= objective + constants::ARMIJO_C1 * alpha * g_dot_d,
-        ) {
-            Ok(result) => result,
-            Err(never) => match never {},
-        };
-        let Some(step) = accepted else {
-            // Line search exhausted: surface as a stall so the host
-            // dispatcher can take over with the degraded plan.
-            return Ok(RemlOuterGpuOutcome {
-                rho,
-                objective,
-                iterations,
-                final_grad_norm: Some(grad_inf),
-                final_gradient: Some(gradient),
-                converged: false,
-            });
-        };
-        let (trial_rho, trial_eval) = step.payload;
-
-        // BFGS curvature update (`s = ρ_new − ρ`, `y = g_new − g_old`).
-        let s = sub(&trial_rho, &rho);
-        let y = sub(&trial_eval.gradient, &gradient);
-        let sy = dot(&s, &y);
-        if sy.is_finite() && sy > 1.0e-16 {
-            bfgs_inverse_hessian_update(&mut h_inv, &s, &y, sy);
-        }
-
-        rho = trial_rho;
-        objective = trial_eval.objective;
-        gradient = trial_eval.gradient;
-        grad_inf = inf_norm(&gradient);
-        iterations += 1;
-        converged = grad_inf <= grad_tol;
+    if input.seed_gradient.len() != num_rho {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "device-backed REML outer driver: seed gradient has length {}, expected {num_rho}",
+            input.seed_gradient.len(),
+        )));
     }
+    if !input.seed_objective.is_finite() || input.seed_gradient.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "device-backed REML outer driver received a non-finite seed sample".to_string(),
+        ));
+    }
+
+    let max_iterations = MaxIterations::new(input.max_iterations).map_err(|err| {
+        EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
+    })?;
+    let bounds = Bounds::new(input.bounds.0, input.bounds.1, 1.0e-6).map_err(|err| {
+        EstimationError::InvalidInput(format!("outer rho bounds are invalid: {err}"))
+    })?;
+    let seed_sample = FirstOrderSample {
+        value: input.seed_objective,
+        gradient: input.seed_gradient,
+    };
+    let initial_grad_norm = seed_sample.gradient.dot(&seed_sample.gradient).sqrt();
+    let initial_scale = if initial_grad_norm.is_finite() && initial_grad_norm > 0.0 {
+        (1.0 / initial_grad_norm).clamp(1.0e-3, 1.0e3)
+    } else {
+        1.0
+    };
+
+    let objective = FusedObjective::new(move |rho: &Array1<f64>| {
+        evaluator(rho)
+            .map(|eval| FirstOrderSample {
+                value: eval.objective,
+                gradient: eval.gradient,
+            })
+            .map_err(|err| ObjectiveEvalError::recoverable(err.to_string()))
+    });
+    let mut optimizer = Bfgs::new(input.seed_rho.clone(), objective)
+        .with_initial_sample(input.seed_rho, seed_sample)
+        .with_bounds(bounds)
+        .with_gradient_tolerance(input.gradient_tolerance)
+        .with_max_iterations(max_iterations)
+        .with_initial_metric(InitialMetric::Scalar(initial_scale))
+        .with_profile(Profile::Robust);
+    if let Some(caps) = input.axis_step_caps {
+        optimizer = optimizer.with_axis_step_caps(caps);
+    }
+
+    let (solution, converged) = match optimizer.run() {
+        Ok(solution) => (solution, true),
+        Err(BfgsError::MaxIterationsReached { last_solution })
+        | Err(BfgsError::LineSearchFailed { last_solution, .. }) => (*last_solution, false),
+        Err(err) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "device-backed opt::Bfgs failed: {err}"
+            )));
+        }
+    };
 
     Ok(RemlOuterGpuOutcome {
-        rho,
-        objective,
-        iterations,
-        final_grad_norm: Some(grad_inf),
-        final_gradient: Some(gradient),
+        rho: solution.final_point,
+        objective: solution.final_value,
+        iterations: solution.iterations,
+        final_grad_norm: solution.final_gradient_norm,
+        final_gradient: solution.final_gradient,
         converged,
     })
-}
-
-fn inf_norm(v: &Array1<f64>) -> f64 {
-    let mut m = 0.0_f64;
-    for x in v.iter() {
-        let a = x.abs();
-        if a > m {
-            m = a;
-        }
-    }
-    m
-}
-
-fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    let mut acc = 0.0_f64;
-    for i in 0..a.len() {
-        acc += a[i] * b[i];
-    }
-    acc
-}
-
-fn sub(a: &Array1<f64>, b: &Array1<f64>) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(a.len());
-    for i in 0..a.len() {
-        out[i] = a[i] - b[i];
-    }
-    out
-}
-
-fn scaled_add(base: &Array1<f64>, alpha: f64, dir: &Array1<f64>) -> Array1<f64> {
-    let mut out = base.clone();
-    for i in 0..out.len() {
-        out[i] += alpha * dir[i];
-    }
-    out
-}
-
-fn matvec_neg(h_inv: ArrayView2<'_, f64>, g: &Array1<f64>) -> Array1<f64> {
-    let n = g.len();
-    let mut out = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut acc = 0.0_f64;
-        for j in 0..n {
-            acc += h_inv[[i, j]] * g[j];
-        }
-        out[i] = -acc;
-    }
-    out
-}
-
-/// Sherman–Morrison-style BFGS inverse-Hessian update:
-/// `H⁻¹ ← (I − sρyᵀ) H⁻¹ (I − yρsᵀ) + sρsᵀ` with `ρ = 1/(sᵀy)`.
-fn bfgs_inverse_hessian_update(h_inv: &mut Array2<f64>, s: &Array1<f64>, y: &Array1<f64>, sy: f64) {
-    let n = s.len();
-    let rho = 1.0 / sy;
-    // hy = H⁻¹ y
-    let mut hy = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut acc = 0.0_f64;
-        for j in 0..n {
-            acc += h_inv[[i, j]] * y[j];
-        }
-        hy[i] = acc;
-    }
-    // yhy = yᵀ H⁻¹ y
-    let mut yhy = 0.0_f64;
-    for i in 0..n {
-        yhy += y[i] * hy[i];
-    }
-    // H⁻¹ ← H⁻¹ + ((sy + yhy) ρ²) s sᵀ − ρ (hy sᵀ + s hyᵀ)
-    let coeff = (sy + yhy) * rho * rho;
-    for i in 0..n {
-        for j in 0..n {
-            h_inv[[i, j]] += coeff * s[i] * s[j] - rho * (hy[i] * s[j] + s[i] * hy[j]);
-        }
-    }
 }
 
 #[cfg(test)]

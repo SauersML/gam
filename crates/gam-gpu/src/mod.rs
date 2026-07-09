@@ -57,11 +57,11 @@ pub use profile::{GpuExecutionTelemetry, KernelStat, KernelStatsSnapshot};
 //
 // The first production-safe step for acceleration is an explicit policy
 // layer: `Auto` may opportunistically use supported device-resident kernels,
-// `Off` guarantees the CPU path, and `Force` turns an unsupported GPU route
+// `Off` guarantees the CPU path, and `Required` turns an unsupported GPU route
 // into a hard error instead of a silent CPU fallback. The numerical kernels
 // are wired to call these helpers before selecting a backend; until a vendor
 // backend is compiled in this module intentionally reports "unsupported" so
-// `force` fails loudly while `auto` remains a correct CPU fallback.
+// `required` fails loudly while `auto` remains a correct CPU fallback.
 // ---------------------------------------------------------------------------
 
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ pub enum GpuPolicy {
     /// Always use CPU kernels.
     Off,
     /// Require GPU kernels and error if the requested path is unsupported.
-    Force,
+    Required,
 }
 
 impl GpuPolicy {
@@ -101,7 +101,7 @@ impl GpuPolicy {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "off" => Some(Self::Off),
-            "force" => Some(Self::Force),
+            "required" => Some(Self::Required),
             _ => None,
         }
     }
@@ -111,81 +111,14 @@ impl GpuPolicy {
         match self {
             Self::Auto => "auto",
             Self::Off => "off",
-            Self::Force => "force",
+            Self::Required => "required",
         }
-    }
-
-    /// Whether unsupported GPU dispatch should be surfaced as a hard error.
-    #[inline]
-    pub const fn is_force(self) -> bool {
-        matches!(self, Self::Force)
     }
 }
 
 impl fmt::Display for GpuPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// Fail-closed GPU residency mode (issue #1017).
-///
-/// Distinct from [`GpuPolicy`], which governs opportunistic per-kernel dispatch.
-/// `GpuMode` is the process-wide *residency contract* the resident solver
-/// consults through [`crate::device_runtime::GpuRuntime::global_or_fail`]:
-///
-/// * [`GpuMode::Auto`] — use the device when the probe admits it, fall back to
-///   CPU otherwise (the current, working behavior; preserved bit-for-bit).
-/// * [`GpuMode::Required`] — the device MUST be available; if the runtime is
-///   absent the resident path returns a structured error instead of silently
-///   running on the CPU. This is the fail-closed guard the reviewers asked for.
-/// * [`GpuMode::Off`] — never use the device.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GpuMode {
-    /// Use the device when available; fall back to CPU otherwise.
-    #[default]
-    Auto,
-    /// Require the device; error (do not fall back) when it is unavailable.
-    Required,
-    /// Never use the device.
-    Off,
-}
-
-impl GpuMode {
-    /// Stable lowercase identifier.
-    #[inline]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Required => "required",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl fmt::Display for GpuMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-static GPU_MODE: OnceLock<GpuMode> = OnceLock::new();
-
-/// Configure the process-wide GPU residency mode. First-writer-wins so
-/// concurrent fits cannot race the contract; a redundant late call is ignored.
-pub fn set_gpu_mode(mode: GpuMode) {
-    GPU_MODE.set(mode).ok();
-}
-
-/// Read the process-wide GPU residency mode. Defaults to [`GpuMode::Auto`]
-/// without claiming the slot, mirroring [`global_policy`] so an incidental
-/// read never locks the mode against a later explicit [`set_gpu_mode`].
-#[inline]
-pub fn gpu_mode() -> GpuMode {
-    match GPU_MODE.get() {
-        Some(m) => *m,
-        None => GpuMode::Auto,
     }
 }
 
@@ -261,7 +194,7 @@ pub fn configure_global_policy(policy: GpuPolicy) {
 /// True when direct solver GPU entry points should be attempted.
 ///
 /// `Auto` attempts CUDA only after the runtime probe finds a usable device.
-/// `Off` pins the process to CPU. `Force` attempts the GPU path so missing
+/// `Off` pins the process to CPU. `Required` attempts the GPU path so missing
 /// runtime/backend support becomes an explicit error at the callee instead of
 /// an implicit CPU route.
 #[inline]
@@ -269,7 +202,7 @@ pub fn cuda_selected() -> bool {
     match global_policy() {
         GpuPolicy::Auto => device_runtime::GpuRuntime::is_available(),
         GpuPolicy::Off => false,
-        GpuPolicy::Force => true,
+        GpuPolicy::Required => true,
     }
 }
 
@@ -309,7 +242,7 @@ impl GpuEligibility {
 }
 
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
-/// with no compiled vendor backend, `auto` returns CPU fallback and `force`
+/// with no compiled vendor backend, `auto` returns CPU fallback and `required`
 /// returns an error at the call site through [`GpuDecision::require_supported`].
 pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
     let policy = global_policy();
@@ -329,14 +262,16 @@ pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
             (false, "cpu-workload-below-gpu-threshold")
         }
         (GpuPolicy::Auto, GpuEligibility::Eligible) => (true, "gpu-auto-supported"),
-        (GpuPolicy::Force, GpuEligibility::BackendNotCompiled) => {
-            (false, "cpu-gpu-force-unsupported")
+        (GpuPolicy::Required, GpuEligibility::BackendNotCompiled) => {
+            (false, "cpu-gpu-required-unsupported")
         }
-        (GpuPolicy::Force, _) if !runtime_available => (false, "cpu-gpu-force-runtime-unavailable"),
-        // Under `force`, the workload-threshold gate is intentionally bypassed:
+        (GpuPolicy::Required, _) if !runtime_available => {
+            (false, "cpu-gpu-required-runtime-unavailable")
+        }
+        // Under `required`, the workload-threshold gate is intentionally bypassed:
         // the user explicitly asked for GPU regardless of size.
-        (GpuPolicy::Force, GpuEligibility::WorkloadBelowThreshold)
-        | (GpuPolicy::Force, GpuEligibility::Eligible) => (true, "gpu-force-supported"),
+        (GpuPolicy::Required, GpuEligibility::WorkloadBelowThreshold)
+        | (GpuPolicy::Required, GpuEligibility::Eligible) => (true, "gpu-required-supported"),
     };
     GpuDecision {
         policy,
@@ -348,9 +283,9 @@ pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> GpuDecision {
 
 impl GpuDecision {
     pub fn require_supported(&self) -> Result<(), String> {
-        if self.policy == GpuPolicy::Force && !self.use_gpu {
+        if self.policy == GpuPolicy::Required && !self.use_gpu {
             return Err(format!(
-                "gpu=force requested kernel '{}' but no supported device backend is available ({})",
+                "gpu=required requested kernel '{}' but no supported device backend is available ({})",
                 self.kernel.as_str(),
                 self.reason
             ));
@@ -461,7 +396,11 @@ mod policy_tests {
     fn parses_canonical_user_gpu_policy_values() {
         assert_eq!(GpuPolicy::parse("auto"), Some(GpuPolicy::Auto));
         assert_eq!(GpuPolicy::parse("off"), Some(GpuPolicy::Off));
-        assert_eq!(GpuPolicy::parse("force"), Some(GpuPolicy::Force));
+        assert_eq!(
+            GpuPolicy::parse("required"),
+            Some(GpuPolicy::Required)
+        );
+        assert_eq!(GpuPolicy::parse("force"), None);
         assert_eq!(GpuPolicy::parse("cpu"), None);
         assert_eq!(GpuPolicy::parse(""), None);
         assert_eq!(GpuPolicy::parse("wat"), None);
@@ -484,25 +423,25 @@ mod policy_tests {
         use crate::device_runtime::GpuRuntime;
         // Off always refuses, regardless of hardware.
         assert!(matches!(
-            GpuRuntime::global_or_fail(GpuMode::Off),
+            GpuRuntime::global_or_fail(GpuPolicy::Off),
             Err(GpuError::DriverLibraryUnavailable { .. })
         ));
 
         if GpuRuntime::is_available() {
             // On a GPU host both Auto and Required must succeed.
-            assert!(GpuRuntime::global_or_fail(GpuMode::Required).is_ok());
-            assert!(GpuRuntime::global_or_fail(GpuMode::Auto).is_ok());
+            assert!(GpuRuntime::global_or_fail(GpuPolicy::Required).is_ok());
+            assert!(GpuRuntime::global_or_fail(GpuPolicy::Auto).is_ok());
         } else {
             // Fail-closed: Required surfaces a STRUCTURED error rather than a
             // silent CPU fallback. Auto also reports unavailable (callers there
             // swallow it and fall back), but the variant is what lets Required
             // propagate it as fatal.
-            let required = GpuRuntime::global_or_fail(GpuMode::Required);
+            let required = GpuRuntime::global_or_fail(GpuPolicy::Required);
             assert!(
                 matches!(required, Err(GpuError::DriverLibraryUnavailable { .. })),
-                "GpuMode::Required must fail closed when the device is absent, got {required:?}"
+                "GpuPolicy::Required must fail closed when the device is absent, got {required:?}"
             );
-            assert!(GpuRuntime::global_or_fail(GpuMode::Auto).is_err());
+            assert!(GpuRuntime::global_or_fail(GpuPolicy::Auto).is_err());
         }
     }
 
@@ -541,15 +480,15 @@ mod policy_tests {
     }
 
     #[test]
-    fn force_policy_reports_unsupported_kernel() {
+    fn required_policy_reports_unsupported_kernel() {
         let decision = GpuDecision {
-            policy: GpuPolicy::Force,
+            policy: GpuPolicy::Required,
             kernel: GpuKernel::DenseXtWX,
             use_gpu: false,
-            reason: "gpu-force-unsupported",
+            reason: "gpu-required-unsupported",
         };
         let err = decision.require_supported().unwrap_err();
         assert!(err.contains("dense-xtwx"));
-        assert!(err.contains("gpu=force"));
+        assert!(err.contains("gpu=required"));
     }
 }

@@ -690,7 +690,7 @@ mod tests {
             code_ridge: 1.0e-6,
             decoder_ridge: 1.0e-6,
             tolerance: 1.0e-6,
-            score_mode: gam_gpu::GpuMode::Off,
+            score_mode: gam_gpu::GpuPolicy::Off,
         }
     }
 

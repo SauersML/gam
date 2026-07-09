@@ -143,6 +143,11 @@ pub use gam_identifiability as identifiability;
 pub use gam_inference as inference;
 pub use gam_linalg as linalg;
 pub use gam_models as families;
+/// Prediction, uncertainty propagation, posterior bands, and conformal calibration.
+///
+/// The implementation lives in the upper-layer `gam-predict` crate and is exposed
+/// as a namespace instead of flattening its large API into the `gam` crate root.
+pub use gam_predict as predict;
 pub mod model_types;
 /// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
 /// ARROW_ROW_CHUNK). Hosted at the crate root so `families` can name them
@@ -333,6 +338,7 @@ pub use gam_models::fit_orchestration::{
     TransformationNormalFitRequest, WorkflowError, constant_curvature_profiled_reml_scores,
     fit_from_formula, fit_model, fit_residual_cascade_from_formula, fit_spline_scan_from_formula,
     is_binary_response, materialize, prepare_survival_time_stack, residual_cascade_fast_path,
-    resolve_family, resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
+    resolve_family, resolve_offset_column, resolve_weight_column, response_column_kind,
+    spline_scan_fast_path,
 };
 pub use gpu::GpuDeviceInfo;

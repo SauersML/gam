@@ -299,7 +299,7 @@ fn tile_scorer_required_mode_refuses_subfloor_route() {
     let scorer = TileScorer::new(4, 7);
 
     let err = scorer
-        .route_minibatch_with_mode(rows.view(), decoder.view(), gam_gpu::GpuMode::Required)
+        .route_minibatch_with_mode(rows.view(), decoder.view(), gam_gpu::GpuPolicy::Required)
         .expect_err("Required mode must fail closed below the device floor");
     assert!(
         err.contains("below the device launch break-even"),
@@ -328,7 +328,7 @@ fn sparse_transform_with_explicit_mode_reports_cpu_route_stats() {
         3,
         4,
         1.0e-6,
-        gam_gpu::GpuMode::Off,
+        gam_gpu::GpuPolicy::Off,
     )
     .expect("explicit-mode transform");
     assert_eq!(transform.indices.dim(), (rows.nrows(), 3));
@@ -360,7 +360,7 @@ fn sparse_fit_default_auto_uses_cpu_below_device_floor() {
     let fit = fit_sparse_dictionary(x.view(), &config)
         .expect("default Auto mode must not require a subfloor CUDA route");
 
-    assert_eq!(config.score_mode, gam_gpu::GpuMode::Auto);
+    assert_eq!(config.score_mode, gam_gpu::GpuPolicy::Auto);
     assert_eq!(fit.score_route_stats.minibatches, 8);
     assert_eq!(fit.score_route_stats.cpu_minibatches, 8);
     assert_eq!(fit.score_route_stats.device_minibatches, 0);
@@ -380,7 +380,7 @@ fn sparse_fit_records_score_route_stats() {
         code_ridge: 1.0e-6,
         decoder_ridge: 1.0e-6,
         tolerance: 0.0,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
     assert_eq!(fit.score_route_stats.minibatches, 8);
@@ -410,7 +410,7 @@ fn sparse_trainer_recovers_planted_dictionary_beats_pca_baseline() {
         code_ridge: 1.0e-6,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("sparse dictionary fit");
     let baseline = pca_ev(x.view(), k);
@@ -474,7 +474,7 @@ fn sparse_trainer_beats_rank_k_pca_on_held_out_reconstruction() {
         code_ridge,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
     };
     // Fit the dictionary on TRAIN ONLY.
     let fit = fit_sparse_dictionary(x_train.view(), &config).expect("held-out trainer fit");
@@ -562,7 +562,7 @@ fn dead_atom_revival_keeps_ev_monotone_in_k_and_beats_linear_subspace() {
         code_ridge,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
     };
 
     let fit_small = fit_sparse_dictionary(x_train.view(), &mk(16)).expect("K=16 fit");
@@ -722,7 +722,7 @@ fn real_olmo_sparse_dict_ev_vs_k_parity() {
                     code_ridge: 1.0e-6,
                     decoder_ridge: 1.0e-6,
                     tolerance: 1.0e-7,
-                    score_mode: gam_gpu::GpuMode::Off,
+                    score_mode: gam_gpu::GpuPolicy::Off,
                 };
                 let fit = fit_sparse_dictionary(x_tr.view(), &config).expect("fit");
                 let ev_te = held_out_ev(fit.decoder.view(), x_te.view(), s, tile, 1.0e-6);
@@ -751,7 +751,7 @@ fn fixed_width_sparse_storage_never_dense_and_reconstructs() {
         active: 1,
         max_epochs: 30,
         score_tile: 4,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
         ..SparseDictConfig::new(k)
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
@@ -887,7 +887,7 @@ fn fit_is_minibatch_size_invariant() {
         code_ridge: 1.0e-6,
         decoder_ridge: 1.0e-6,
         tolerance: 1.0e-9,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
     };
     let fit_mb1 = fit_sparse_dictionary(x.view(), &base).expect("minibatch=1 fit");
     let fit_mbn = fit_sparse_dictionary(
@@ -934,7 +934,7 @@ fn scales_to_large_k_without_dense_n_by_k() {
         active: 1,
         max_epochs: 6,
         score_tile: 256,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
         ..SparseDictConfig::new(k)
     };
     let fit = fit_sparse_dictionary(x.view(), &config).expect("large-K fit");
@@ -953,7 +953,7 @@ fn scales_to_large_k_without_dense_n_by_k() {
 fn large_k_fit_reports_admitted_route_stats_and_is_reproducible() {
     // minibatch=512 × K=4096 = 2,097,152-element score block per minibatch,
     // above DEVICE_SCORE_BLOCK_MIN_ELEMS (1<<20). p=48 is a representative
-    // residual-stream width. GpuMode::Off keeps this regression local-CPU only.
+    // residual-stream width. GpuPolicy::Off keeps this regression local-CPU only.
     let (planted_k, p, n) = (8usize, 48usize, 1536usize);
     let (x, _atoms) = planted(planted_k, p, n, 0.1);
     let k = 4096usize;
@@ -963,7 +963,7 @@ fn large_k_fit_reports_admitted_route_stats_and_is_reproducible() {
         minibatch: 512,
         max_epochs: 4,
         score_tile: 1024,
-        score_mode: gam_gpu::GpuMode::Off,
+        score_mode: gam_gpu::GpuPolicy::Off,
         ..SparseDictConfig::new(k)
     };
 
@@ -1004,7 +1004,7 @@ fn host_route_is_invariant_to_minibatch_chunking() {
     use super::update::route_and_code_all;
 
     // Tiny shape (K=64, N=512, P=32), K < N so the scorer runs the real GEMM
-    // route rather than the K>N wrap. GpuMode::Off pins the host path.
+    // route rather than the K>N wrap. GpuPolicy::Off pins the host path.
     let (x, decoder) = planted(64, 32, 512, 0.15);
     let s = 4usize;
     let tile = 13usize; // deliberately not a divisor of K, to exercise ragged tiles
@@ -1019,7 +1019,7 @@ fn host_route_is_invariant_to_minibatch_chunking() {
         s,
         code_ridge,
         x.nrows(),
-        gam_gpu::GpuMode::Off,
+        gam_gpu::GpuPolicy::Off,
         None,
     )
     .expect("single-block host route");
@@ -1032,7 +1032,7 @@ fn host_route_is_invariant_to_minibatch_chunking() {
         s,
         code_ridge,
         7,
-        gam_gpu::GpuMode::Off,
+        gam_gpu::GpuPolicy::Off,
         None,
     )
     .expect("chunked host route");

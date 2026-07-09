@@ -148,6 +148,7 @@ use gam_terms::term_builder::{
 /// identical for every caller.
 pub mod descriptors;
 
+mod deviation;
 pub mod drivers;
 
 mod entry;
@@ -173,6 +174,7 @@ mod curv_fixed_kappa_2152_tests;
 
 pub use entry::*;
 pub use error::*;
+pub use deviation::*;
 pub(crate) use fit::*;
 pub use materialize::*;
 pub use request::*;

@@ -340,7 +340,7 @@ impl TileScorer {
         decoder: ArrayView2<'_, f32>,
     ) -> Result<Vec<Vec<(u32, f32)>>, String> {
         Ok(self
-            .route_minibatch_with_mode(rows, decoder, gam_gpu::gpu_mode())?
+            .route_minibatch_with_mode(rows, decoder, gam_gpu::global_policy())?
             .selections)
     }
 
@@ -354,14 +354,14 @@ impl TileScorer {
         &self,
         rows: ArrayView2<'_, f32>,
         decoder: ArrayView2<'_, f32>,
-        mode: gam_gpu::GpuMode,
+        mode: gam_gpu::GpuPolicy,
     ) -> Result<ScoreRouteResult, String> {
         let plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
             rows.nrows(),
             decoder.nrows(),
             decoder.ncols(),
         );
-        if mode == gam_gpu::GpuMode::Off {
+        if mode == gam_gpu::GpuPolicy::Off {
             return Ok(ScoreRouteResult {
                 selections: self.route_minibatch(rows, decoder),
                 path: ScoreRoutePath::Cpu,
@@ -371,9 +371,9 @@ impl TileScorer {
             });
         }
 
-        if mode == gam_gpu::GpuMode::Required && !plan.device_admitted {
+        if mode == gam_gpu::GpuPolicy::Required && !plan.device_admitted {
             return Err(format!(
-                "sparse_dict route_minibatch GpuMode::Required: block of {}x{} = {} elems is \
+                "sparse_dict route_minibatch GpuPolicy::Required: block of {}x{} = {} elems is \
                  below the device launch break-even (DEVICE_SCORE_BLOCK_MIN_ELEMS={}); refusing \
                  to silently run on the CPU",
                 plan.n_rows,
@@ -385,7 +385,7 @@ impl TileScorer {
 
         #[cfg(target_os = "linux")]
         {
-            if mode == gam_gpu::GpuMode::Required || plan.device_admitted {
+            if mode == gam_gpu::GpuPolicy::Required || plan.device_admitted {
                 match super::scoring_gpu::route_minibatch_required(
                     rows,
                     decoder,
@@ -406,7 +406,7 @@ impl TileScorer {
                         });
                     }
                     Ok((routed, super::scoring_gpu::ScoreBlockPath::Cpu, _)) => {
-                        if mode == gam_gpu::GpuMode::Required {
+                        if mode == gam_gpu::GpuPolicy::Required {
                             return Err(
                                 "sparse_dict route_minibatch Required mode returned CPU path"
                                     .to_string(),
@@ -421,7 +421,7 @@ impl TileScorer {
                         });
                     }
                     Err(err) => {
-                        if mode == gam_gpu::GpuMode::Required {
+                        if mode == gam_gpu::GpuPolicy::Required {
                             return Err(err.to_string());
                         }
                     }
@@ -431,9 +431,9 @@ impl TileScorer {
 
         #[cfg(not(target_os = "linux"))]
         {
-            if mode == gam_gpu::GpuMode::Required {
+            if mode == gam_gpu::GpuPolicy::Required {
                 return Err(
-                    "sparse_dict route_minibatch GpuMode::Required: CUDA routing is only compiled \
+                    "sparse_dict route_minibatch GpuPolicy::Required: CUDA routing is only compiled \
                      on Linux"
                         .to_string(),
                 );

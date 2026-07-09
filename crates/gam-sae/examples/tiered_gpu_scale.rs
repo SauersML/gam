@@ -5,7 +5,7 @@
 //! the composed [`fit_tiered`] spine (Tier-0 mean → Tier-1 block-sparse bulk →
 //! optional Tier-2 curved co-fit) so the Tier-1 router is exercised through the
 //! same GPU dispatch a real tiered fit uses. The dispatch honours the
-//! process-wide [`gam_gpu::GpuMode`] this harness sets:
+//! process-wide [`gam_gpu::GpuPolicy`] this harness sets:
 //!
 //! * `--gpu required` — the Tier-1 router MUST run each admitted minibatch on the
 //!   device; a missing runtime or a device fault is a typed error, never a silent
@@ -44,13 +44,6 @@ use ndarray::Array2;
 use std::process::ExitCode;
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug)]
-enum GpuArg {
-    Required,
-    Auto,
-    Off,
-}
-
 struct Args {
     rows: usize,
     p: usize,
@@ -60,7 +53,7 @@ struct Args {
     epochs: usize,
     minibatch: usize,
     tier2: bool,
-    gpu: GpuArg,
+    gpu_policy: gam_gpu::GpuPolicy,
 }
 
 impl Args {
@@ -86,7 +79,7 @@ fn parse_args() -> Result<Args, String> {
         epochs: 3,
         minibatch: 512,
         tier2: false,
-        gpu: GpuArg::Auto,
+        gpu_policy: gam_gpu::GpuPolicy::Auto,
     };
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
@@ -109,12 +102,9 @@ fn parse_args() -> Result<Args, String> {
             "--epochs" => args.epochs = parse_usize(value, key)?,
             "--minibatch" => args.minibatch = parse_usize(value, key)?,
             "--gpu" => {
-                args.gpu = match value.as_str() {
-                    "required" => GpuArg::Required,
-                    "auto" => GpuArg::Auto,
-                    "off" => GpuArg::Off,
-                    other => return Err(format!("--gpu must be required|auto|off, got {other}")),
-                }
+                args.gpu_policy = gam_gpu::GpuPolicy::parse(value).ok_or_else(|| {
+                    format!("--gpu must be required|auto|off, got {value}")
+                })?;
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -174,12 +164,7 @@ fn splitmix64(mut x: u64) -> u64 {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
 
-    let mode = match args.gpu {
-        GpuArg::Required => gam_gpu::GpuMode::Required,
-        GpuArg::Auto => gam_gpu::GpuMode::Auto,
-        GpuArg::Off => gam_gpu::GpuMode::Off,
-    };
-    gam_gpu::set_gpu_mode(mode);
+    gam_gpu::configure_global_policy(args.gpu_policy);
 
     let k = args.atoms();
     let admitted =
@@ -196,7 +181,7 @@ fn run() -> Result<(), String> {
         args.epochs,
         args.minibatch,
         args.tier2,
-        mode,
+        args.gpu_policy,
     );
     println!(
         "[tiered gpu scale] per-minibatch device admission: minibatch*K = {} score elems, \
@@ -205,7 +190,7 @@ fn run() -> Result<(), String> {
         admitted.device_admitted,
         admitted.device_min_score_elems,
     );
-    if matches!(args.gpu, GpuArg::Required) && !admitted.device_admitted {
+    if args.gpu_policy == gam_gpu::GpuPolicy::Required && !admitted.device_admitted {
         return Err(format!(
             "--gpu required but the minibatch {} x K {} is below the device launch break-even {}; \
              raise --minibatch (need minibatch >= {})",
@@ -215,7 +200,9 @@ fn run() -> Result<(), String> {
             admitted.device_min_score_elems.div_ceil(k.max(1)),
         ));
     }
-    if matches!(args.gpu, GpuArg::Required) && gam_gpu::GpuRuntime::global().is_none() {
+    if args.gpu_policy == gam_gpu::GpuPolicy::Required
+        && gam_gpu::GpuRuntime::global().is_none()
+    {
         return Err(
             "--gpu required but no CUDA runtime is available on this host; run on the A100 box"
                 .to_string(),

@@ -494,7 +494,11 @@ fn zz_2087_third_order_envelope_discriminator_softmax() {
         "[2087-diag] θ̂-motion fingerprint at h={h_small:.1e}: \
          |loss(θ̂(ρ+h)) − loss(θ̂(ρ))| = {moved:.6e} \
          ({} — a re-solve that returns the warm start gives exactly 0)",
-        if moved == 0.0 { "θ̂ DID NOT MOVE" } else { "θ̂ moved" }
+        if moved == 0.0 {
+            "θ̂ DID NOT MOVE"
+        } else {
+            "θ̂ moved"
+        }
     );
 
     // (2) h-sweep with a deep probe budget so the inner response can express.

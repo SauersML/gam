@@ -8,9 +8,7 @@ suite constructs the pyclass from the golden fixture and checks:
   - the dense-array, scalar, list, and report-block getters return the right
     shapes/types/values the Python dataclass exposed.
 
-Skipped gracefully until a wheel exposing `ManifoldSaeCore` is built (the class
-is additive; the Python dataclass remains the live facade until a later cutover
-increment). This is the getter analogue of the round-trip contract in
+This is the getter analogue of the round-trip contract in
 `tests/test_manifold_sae_golden_roundtrip.py`.
 """
 from __future__ import annotations
@@ -19,7 +17,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from gamfit._sae_manifold import rust_module
 
@@ -28,12 +25,7 @@ GOLDEN_FULL = (
 )
 
 
-def _core_cls():
-    mod = rust_module()
-    cls = getattr(mod, "ManifoldSaeCore", None)
-    if cls is None:
-        pytest.skip("wheel predates the ManifoldSaeCore #[pyclass] (#2091 cutover)")
-    return cls
+ManifoldSaeCore = rust_module().ManifoldSaeCore
 
 
 def _golden() -> dict:
@@ -41,7 +33,7 @@ def _golden() -> dict:
 
 
 def test_to_dict_is_a_fixed_point() -> None:
-    core = _core_cls()(_golden())
+    core = ManifoldSaeCore(_golden())
     again = core.to_dict()
     golden = _golden()
     if again != golden:
@@ -53,7 +45,7 @@ def test_to_dict_is_a_fixed_point() -> None:
 
 def test_dense_array_getters() -> None:
     golden = _golden()
-    core = _core_cls()(golden)
+    core = ManifoldSaeCore(golden)
     fitted = core.fitted
     assert isinstance(fitted, np.ndarray)
     assert fitted.shape == np.asarray(golden["fitted"]).shape
@@ -76,7 +68,7 @@ def test_dense_array_getters() -> None:
 
 def test_fisher_and_selected_getters() -> None:
     golden = _golden()
-    core = _core_cls()(golden)
+    core = ManifoldSaeCore(golden)
     np.testing.assert_array_equal(
         core.fisher_factors, np.asarray(golden["fisher_factors"])
     )
@@ -95,7 +87,7 @@ def test_fisher_and_selected_getters() -> None:
 
 def test_scalar_and_list_getters() -> None:
     golden = _golden()
-    core = _core_cls()(golden)
+    core = ManifoldSaeCore(golden)
     assert core.atom_topology == golden["atom_topology"]
     assert core.assignment == golden["assignment"]
     assert core.assignment_label == golden["assignment_label"]
@@ -117,7 +109,7 @@ def test_atoms_is_an_object_surface() -> None:
     """model.atoms is a list of AtomCore handles read by attribute (the
     SaeManifoldAtomFit duck-type), NOT a list of dicts."""
     golden = _golden()
-    core = _core_cls()(golden)
+    core = ManifoldSaeCore(golden)
     atoms = core.atoms
     assert isinstance(atoms, list) and len(atoms) == len(golden["atoms"])
     a0 = atoms[0]
@@ -151,7 +143,7 @@ def test_atom_dense_covariance_is_reconstructed() -> None:
     for c in range(p):
         factor[c] = np.eye(m_k) * (c + 1.0)
     golden["atoms"][0]["decoder_covariance_channel_factors"] = factor.tolist()
-    atom0 = _core_cls()(golden).atoms[0]
+    atom0 = ManifoldSaeCore(golden).atoms[0]
     cov = atom0.decoder_covariance
     assert cov is not None and cov.shape == (m_k * p, m_k * p)
     # Same-channel diagonal blocks restored; cross-channel entries zero.
@@ -163,7 +155,7 @@ def test_atom_dense_covariance_is_reconstructed() -> None:
 
 def test_report_block_getters() -> None:
     golden = _golden()
-    core = _core_cls()(golden)
+    core = ManifoldSaeCore(golden)
     assert core.diagnostics == golden["diagnostics"]
     assert core.top_k_projection == golden["top_k_projection"]
     assert core.solver_plan == golden["solver_plan"]
@@ -173,4 +165,4 @@ def test_report_block_getters() -> None:
     # A None report block reads back as Python None.
     payload = dict(golden)
     payload["cotrain"] = None
-    assert _core_cls()(payload).cotrain is None
+    assert ManifoldSaeCore(payload).cotrain is None
