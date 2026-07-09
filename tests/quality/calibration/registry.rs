@@ -39,39 +39,105 @@ use ndarray::Array1;
 /// lists the cluster issues whose regression that gate would catch.
 pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
     vec![
-        // ---- Credible bands (the #1870/#1871 core) ------------------------
+        // ---- Credible bands, split by scale × covariance mode -------------
+        // The band is the #1870/#1871 core. The covariance mode is a real axis:
+        // the conditional band uses H⁻¹; the smoothing-corrected band adds
+        // J·Var(ρ̂)·Jᵀ. #1870 (mean-band collapse to 0.157) and #1871 (0.731 vs
+        // INLA) are the SAME field (mean_lower/upper) under the two modes, which
+        // is exactly why both are registered and both gated by the new
+        // covariance-mode sweep.
         CalibrationTarget {
-            name: "eta_credible_band",
+            name: "eta_credible_band_conditional",
             kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
             mode: AuditMode::CoverageSweep,
-            guards: &[1870, 1871],
-            // Identity-link Gaussian: the η band IS the mean band, so the
-            // gaussian smooth gate audits it directly; the GLM gates audit its
-            // monotone transform (TransformEta).
-            audited_by: "sbc_gaussian_smooth_band_coverage",
+            guards: &[1870],
+            audited_by: "sbc_gaussian_mean_band_covariance_modes (Conditional arm)",
+        },
+        CalibrationTarget {
+            name: "eta_credible_band_smoothing_corrected",
+            kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
+            mode: AuditMode::CoverageSweep,
+            guards: &[1871],
+            audited_by: "sbc_gaussian_mean_band_covariance_modes (Preferred arm) \
+                         + sbc_gaussian_smooth_band_coverage",
         },
         CalibrationTarget {
             name: "mean_credible_band_conditional",
             kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
             mode: AuditMode::CoverageSweep,
-            guards: &[1870, 1871, 1878],
-            audited_by: "sbc_glm_binomial_band_coverage + sbc_glm_poisson_band_coverage",
+            guards: &[1870, 1878],
+            audited_by: "sbc_gaussian_mean_band_covariance_modes (Conditional arm) \
+                         + sbc_glm_binomial_band_coverage + sbc_glm_poisson_band_coverage",
         },
         CalibrationTarget {
             name: "mean_credible_band_smoothing_corrected",
             kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
             mode: AuditMode::CoverageSweep,
             guards: &[1871],
-            audited_by: "sbc_gaussian_smooth_band_coverage",
+            audited_by: "sbc_gaussian_smooth_band_coverage \
+                         + sbc_gaussian_mean_band_covariance_modes (Preferred arm)",
         },
-        // ---- Predictive (observation) intervals per family ----------------
+        // ---- Predictive (observation) intervals, per response family -----
+        // `family_observation_band` (gam-predict lib.rs:2041) emits a predictive
+        // interval Var(μ̂)+Var(Y|μ) for each family below. Gaussian is gated
+        // (in-process + location-scale + conformal); the others are registered
+        // but their per-family predictive-interval coverage gate is still
+        // PENDING — the harness naming these is precisely how it surfaces the
+        // gap. `royston_parmar` returns (None,None) (lib.rs:2261): it exposes NO
+        // predictive interval and is deliberately NOT registered (the family
+        // enumeration test pins that as a known gap, not drift).
         CalibrationTarget {
             name: "predictive_interval_gaussian",
             kind: SurfaceKind::PredictiveInterval,
             mode: AuditMode::CoverageSweep,
             guards: &[1875, 1878],
-            audited_by: "sbc_gaussian_predictive_interval_coverage",
+            audited_by: "sbc_gaussian_predictive_interval_coverage \
+                         + sbc_location_scale_predictive_coverage",
         },
+        CalibrationTarget {
+            name: "predictive_interval_poisson",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_poisson_predictive_interval_coverage \
+                         (gap: only the Poisson mean band is gated today)",
+        },
+        CalibrationTarget {
+            name: "predictive_interval_negative_binomial",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_negbin_predictive_interval_coverage",
+        },
+        CalibrationTarget {
+            name: "predictive_interval_tweedie",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_tweedie_predictive_interval_coverage",
+        },
+        CalibrationTarget {
+            name: "predictive_interval_gamma",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_gamma_predictive_interval_coverage",
+        },
+        CalibrationTarget {
+            name: "predictive_interval_beta",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_beta_predictive_interval_coverage",
+        },
+        CalibrationTarget {
+            name: "predictive_interval_binomial",
+            kind: SurfaceKind::PredictiveInterval,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1875],
+            audited_by: "PENDING::sbc_binomial_predictive_interval_coverage",
+        },
+        // Heteroscedastic location-scale predictive interval (#1561).
         CalibrationTarget {
             name: "predictive_interval_location_scale",
             kind: SurfaceKind::PredictiveInterval,
@@ -79,6 +145,7 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             guards: &[1561],
             audited_by: "sbc_location_scale_predictive_coverage",
         },
+        // Survival S(t|x) band.
         CalibrationTarget {
             name: "survival_probability_band",
             kind: SurfaceKind::CredibleBand { smoothing_corrected: true },
@@ -91,20 +158,28 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             name: "coefficient_wald_interval",
             kind: SurfaceKind::WaldDeltaInterval,
             mode: AuditMode::CoverageSweep,
-            guards: &[1878],
+            guards: &[1875, 1878],
             audited_by: "quality::misc::quality_vs_statsmodels_negbin_coefficient_se",
         },
-        // ---- ALO / LOO predictive standard error (#1869) ------------------
+        // ---- ALO / LOO predictive standard errors (#1869) -----------------
+        // AloDiagnostics exposes two SEs (alo.rs:88/91): the Bayesian H⁻¹ SE and
+        // the frequentist sandwich SE. Both are validated against exact n-refit
+        // brute-force LOO (ground truth) — the strongest possible audit.
         CalibrationTarget {
-            name: "alo_predictive_standard_error",
+            name: "alo_se_bayes",
             kind: SurfaceKind::AloStandardError,
             mode: AuditMode::CoverageSweep,
             guards: &[1869],
-            // The ALO predictor + its SE are validated against exact n-refit
-            // brute-force LOO (ground truth), the strongest possible audit.
             audited_by: "quality::families::quality_vs_loo_psis_gaussian_smooth \
                          + quality_vs_brute_force_loo_binomial_logit \
                          + quality_vs_brute_force_loo_poisson_log",
+        },
+        CalibrationTarget {
+            name: "alo_se_sandwich",
+            kind: SurfaceKind::AloStandardError,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1869],
+            audited_by: "quality::families::quality_vs_scipy_sandwich_glm_gaussian",
         },
         // ---- Conformal predictive intervals -------------------------------
         CalibrationTarget {
@@ -114,16 +189,21 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             guards: &[942, 1054, 1098],
             audited_by: "full_conformal_predict_route_quality",
         },
-        // ---- Frequentist test p-values (size curves) ----------------------
+        // ---- Frequentist test p-values (type-I size curves) ---------------
+        // Skovgaard r*: first-order, corrected, corrected-empirical p-values
+        // (skovgaard.rs:132/134/143). #1872 (post-selection LR anti-conservative)
+        // is the corrected p-value's size under selection.
         CalibrationTarget {
-            name: "likelihood_ratio_test_pvalue",
+            name: "skovgaard_lr_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1872],
-            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
+                         (PENDING dedicated skovgaard r* size curve)",
         },
+        // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873).
         CalibrationTarget {
-            name: "smooth_bartlett_lawley_test_pvalue",
+            name: "wood_smooth_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
@@ -185,10 +265,10 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
     vec![
         FieldAudit::point("eta"),
         FieldAudit::point("mean"),
-        FieldAudit::audited("eta_standard_error", "eta_credible_band"),
+        FieldAudit::audited("eta_standard_error", "eta_credible_band_conditional"),
         FieldAudit::audited("mean_standard_error", "mean_credible_band_conditional"),
-        FieldAudit::audited("eta_lower", "eta_credible_band"),
-        FieldAudit::audited("eta_upper", "eta_credible_band"),
+        FieldAudit::audited("eta_lower", "eta_credible_band_conditional"),
+        FieldAudit::audited("eta_upper", "eta_credible_band_conditional"),
         FieldAudit::audited("mean_lower", "mean_credible_band_conditional"),
         FieldAudit::audited("mean_upper", "mean_credible_band_conditional"),
         FieldAudit::audited("observation_lower", "predictive_interval_gaussian"),
@@ -248,7 +328,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
     );
     vec![
         FieldAudit::point("eta"),
-        FieldAudit::audited("eta_standard_error", "eta_credible_band"),
+        FieldAudit::audited("eta_standard_error", "eta_credible_band_conditional"),
         FieldAudit::point("mean"),
         FieldAudit::audited("mean_standard_error", "mean_credible_band_conditional"),
         FieldAudit::audited("mean_lower", "mean_credible_band_conditional"),
@@ -369,4 +449,49 @@ fn covariance_and_interval_modes_map_to_registered_bands() {
         };
         assert!(names.contains(target), "interval method {method:?} unmapped");
     }
+}
+
+/// Every response family whose `family_observation_band` (gam-predict lib.rs:2041)
+/// emits a predictive interval must have a registered `predictive_interval_<fam>`
+/// target; every family that returns `(None, None)` (RoystonParmar, lib.rs:2261)
+/// must NOT — so a family silently gaining OR losing a predictive interval trips
+/// this gate. This is the per-family completeness half the single family-agnostic
+/// `observation_lower/upper` field cannot express on its own.
+#[test]
+fn every_family_predictive_interval_is_registered_or_a_known_gap() {
+    let registry = uq_surface_registry();
+    let names: std::collections::BTreeSet<&str> = registry.iter().map(|t| t.name).collect();
+    // (family, exposes a closed-form predictive/observation interval).
+    let families = [
+        ("gaussian", true),
+        ("poisson", true),
+        ("negative_binomial", true),
+        ("tweedie", true),
+        ("gamma", true),
+        ("beta", true),
+        ("binomial", true),
+        // Royston–Parmar returns (None, None): mean band only, no predictive
+        // interval. A KNOWN gap, pinned so it can't drift unnoticed.
+        ("royston_parmar", false),
+    ];
+    let mut drift = Vec::new();
+    for (fam, has_interval) in families {
+        let target = format!("predictive_interval_{fam}");
+        let registered = names.contains(target.as_str());
+        if has_interval && !registered {
+            drift.push(format!(
+                "family `{fam}` emits a predictive interval but `{target}` is unregistered"
+            ));
+        }
+        if !has_interval && registered {
+            drift.push(format!(
+                "family `{fam}` emits NO predictive interval yet `{target}` is registered"
+            ));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "family predictive-interval registry drift:\n{}",
+        drift.join("\n")
+    );
 }
