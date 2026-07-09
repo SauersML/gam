@@ -66,6 +66,11 @@ pub struct RationalLogdetPlan {
     /// Quadrature nodes `(t_ℓ, w_ℓ)` for `∫₀^∞ g(t) dt`, ordered ascending in
     /// `t` (the solve ladder walks them descending).
     pub nodes: Vec<(f64, f64)>,
+    /// `ln c` for the bracket-centred representation: the estimate is
+    /// `k·ln c + Σ_ℓ w_ℓ·[k/(c+t_ℓ) − tr-est (S+t_ℓ)⁻¹]`.
+    pub log_center: f64,
+    /// The bracket centre `c = √(λ_min·λ_max)` itself.
+    pub center: f64,
 }
 
 /// One evaluation of the surrogate: the value and the per-(probe, node) solve
@@ -74,6 +79,10 @@ pub struct RationalLogdetPlan {
 pub struct RationalLogdetEval {
     /// `L̃ ≈ log det S` (surrogate value; deterministic given the plan).
     pub estimate: f64,
+    /// Hutchinson standard error: sample sd of the per-probe estimates over
+    /// `√m`. Zero for a single probe. The QUADRATURE part of the error is not
+    /// in this bar (it is deterministic and bounded by the plan's `rel_tol`).
+    pub std_err: f64,
     /// `y_{jℓ} = (S + t_ℓ I)⁻¹ v_j`, outer index `ℓ` (node), inner `j` (probe).
     pub shifted_solves: Vec<Vec<Array1<f64>>>,
     /// Total CG iterations spent (diagnostic).
@@ -119,26 +128,42 @@ impl RationalLogdetPlan {
             }
             probes.push(v);
         }
-        // Exp-sinh DE nodes: t(u) = exp(π/2·sinh u), dt = t·(π/2)·cosh u du.
-        // The integrand's transition region spans t ∈ ~[λ_min, λ_max] (each
-        // eigenvalue's 1/(λ+t) knee sits at t = λ; the reference 1/(1+t) knee
-        // at t = 1). Pad the resolved t-window two decades beyond the bracket
-        // union {1}, then size the truncation U from the window and the step h
-        // from the tolerance (trapezoid-DE: error ~ exp(-2πd/h) with strip
-        // half-width d ≈ π/2 ⇒ h ≈ π²/ln(1/tol)).
-        let t_lo = (lambda_min.min(1.0)) * 1e-2;
-        let t_hi = (lambda_max.max(1.0)) * 1e2;
-        let sinh_arg_lo = (2.0 / std::f64::consts::PI) * t_lo.ln();
-        let sinh_arg_hi = (2.0 / std::f64::consts::PI) * t_hi.ln();
-        let u_lo = sinh_arg_lo.asinh();
-        let u_hi = sinh_arg_hi.asinh();
-        let h = std::f64::consts::PI * std::f64::consts::PI / (1.0f64 / rel_tol).ln();
-        let steps = (((u_hi - u_lo) / h).ceil() as usize).max(8);
+        // Bracket-centred exp-sinh DE nodes for the shifted representation
+        //
+        //   log x = log c + ∫₀^∞ ( 1/(c+t) − 1/(x+t) ) dt,   c = √(λ_min·λ_max),
+        //
+        // with t(u) = c·exp(π/2·sinh u), dt = t·(π/2)·cosh u du. Centring at the
+        // geometric bracket midpoint keeps the integrand's complex poles
+        // (t = −λ_i, i.e. u where c·exp(π/2·sinh u) = −λ_i) as far from the
+        // real u-axis as the spectrum allows. The nearest pole sits at height
+        // d(λ) ≈ (π/2)/cosh(u_λ), u_λ = asinh((2/π)·ln(λ/c)), which SHRINKS
+        // with the bracket width — the reason a fixed h fails at wide κ. Size
+        // the step from the trapezoid-DE bound err ~ exp(−2π·d_min/h):
+        // h = 2π·d_min/ln(1/tol); truncation window padded two decades past
+        // the bracket (the tail beyond contributes O(t_lo/λ_min) ≪ tol).
+        let c = (lambda_min * lambda_max).sqrt();
+        let t_lo = (lambda_min / c) * 1e-2;
+        let t_hi = (lambda_max / c) * 1e2;
+        let u_of = |ratio: f64| ((2.0 / std::f64::consts::PI) * ratio.ln()).asinh();
+        let u_lo = u_of(t_lo);
+        let u_hi = u_of(t_hi);
+        // Worst-case pole height over the padded bracket (evaluate at both
+        // ends; the pole of the reference term at t = −c sits at u = 0 with
+        // height π/2, never the minimum).
+        let pole_height = |lam_over_c: f64| -> f64 {
+            let s = (2.0 / std::f64::consts::PI) * lam_over_c.ln();
+            std::f64::consts::FRAC_PI_2 / (1.0 + s * s).sqrt()
+        };
+        let d_min = pole_height(lambda_min / c)
+            .min(pole_height(lambda_max / c))
+            .min(std::f64::consts::FRAC_PI_2);
+        let h_bound = 2.0 * std::f64::consts::PI * d_min / (1.0f64 / rel_tol).ln();
+        let steps = (((u_hi - u_lo) / h_bound).ceil() as usize).max(16);
         let h = (u_hi - u_lo) / steps as f64;
         let mut nodes = Vec::with_capacity(steps + 1);
         for s in 0..=steps {
             let u = u_lo + h * s as f64;
-            let t = (std::f64::consts::FRAC_PI_2 * u.sinh()).exp();
+            let t = c * (std::f64::consts::FRAC_PI_2 * u.sinh()).exp();
             let w = h * t * std::f64::consts::FRAC_PI_2 * u.cosh();
             if t.is_finite() && w.is_finite() && w > 0.0 {
                 nodes.push((t, w));
@@ -147,7 +172,13 @@ impl RationalLogdetPlan {
         if nodes.is_empty() {
             return None;
         }
-        Some(Self { dim, probes, nodes })
+        Some(Self {
+            dim,
+            probes,
+            nodes,
+            log_center: c.ln(),
+            center: c,
+        })
     }
 
     /// Evaluate the surrogate `L̃ ≈ log det S` through `matvec(v) = S·v`.
@@ -187,20 +218,32 @@ impl RationalLogdetPlan {
             }
             shifted[ell] = per_probe;
         }
-        let mut estimate = 0.0;
+        // Per-probe estimates: e_j = k·ln c + Σ_ℓ w_ℓ·(k/(c+t_ℓ) − v_jᵀ y_{jℓ});
+        // the surrogate is their mean, the Hutchinson error bar their spread.
+        let mut per_probe = vec![k * self.log_center; m];
         for (ell, &(t, w)) in self.nodes.iter().enumerate() {
-            let mut trace_est = 0.0;
+            let reference = k / (self.center + t);
             for (j, v) in self.probes.iter().enumerate() {
-                trace_est += v.dot(&shifted[ell][j]);
+                per_probe[j] += w * (reference - v.dot(&shifted[ell][j]));
             }
-            trace_est /= m as f64;
-            estimate += w * (k / (1.0 + t) - trace_est);
         }
-        if !estimate.is_finite() {
+        let estimate = per_probe.iter().sum::<f64>() / m as f64;
+        let std_err = if m > 1 {
+            let var = per_probe
+                .iter()
+                .map(|e| (e - estimate) * (e - estimate))
+                .sum::<f64>()
+                / (m as f64 - 1.0);
+            (var / m as f64).sqrt()
+        } else {
+            0.0
+        };
+        if !(estimate.is_finite() && std_err.is_finite()) {
             return None;
         }
         Some(RationalLogdetEval {
             estimate,
+            std_err,
             shifted_solves: shifted,
             cg_iterations: total_iters,
         })
@@ -359,12 +402,23 @@ mod tests {
         let eval = plan
             .evaluate(&|v: ArrayView1<f64>| a.dot(&v), 1e-12, 50_000)
             .expect("eval");
-        let rel = (eval.estimate - logdet).abs() / logdet.abs().max(1.0);
+        // The probe fluctuation on a wide spectrum is genuinely large (Hutchinson
+        // variance ~ 2·off-diag mass of log S), so assert the estimator against
+        // its OWN error bar (5σ ⇒ false-failure odds ~1e-6) plus a small
+        // deterministic quadrature budget — this validates estimate AND bar.
+        let err = (eval.estimate - logdet).abs();
+        let budget = 5.0 * eval.std_err + 1e-3 * logdet.abs().max(1.0);
         assert!(
-            rel < 0.05,
-            "probe estimate rel err {rel:.3e} (est {} vs exact {})",
+            err < budget,
+            "estimate {} vs exact {} — |err| {err:.3e} exceeds 5σ+quad budget {budget:.3e} \
+             (std_err {:.3e})",
             eval.estimate,
-            logdet
+            logdet,
+            eval.std_err
+        );
+        assert!(
+            eval.std_err.is_finite() && eval.std_err > 0.0,
+            "multi-probe eval must report a positive error bar"
         );
     }
 
