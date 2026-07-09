@@ -60,6 +60,15 @@ pub enum SaeAtomBasisKind {
     /// periodic-times-linear feature is adjudicable on its true manifold instead
     /// of being forced into a torus or flat-patch stand-in.
     Cylinder,
+    /// Möbius band (`d = 2`, #2240): the double-cover chart
+    /// `Circle{period 2} × Interval[-1, 1]` with the deck-invariant harmonic
+    /// basis of [`crate::basis::MobiusHarmonicEvaluator`] (`trig(πks)·wᵐ`,
+    /// `k + m` even). The half-twist lives in the parity culling of the
+    /// basis, not in the retraction manifold, so the optimizer walks an
+    /// ordinary smooth cylinder while the represented surface is genuinely
+    /// non-orientable — the topology a torus wraps spuriously and a flat
+    /// patch loses. Round-trips under the name `"mobius"`.
+    Mobius,
     /// A genuinely LINEAR (affine) decoder atom: `γ(t) = b₀ + Σ_a t_a·b_a`, the
     /// degree-1 monomial patch `{1, t₁, …, t_d}` (#1221). This is the principled
     /// reconstruction-parity baseline — one straight decoder direction per latent
@@ -194,6 +203,14 @@ impl SaeAtomBasisKind {
                 LatentManifold::Circle { period: 1.0 },
                 LatentManifold::Euclidean,
             ]),
+            // The Möbius basis lives on its smooth double cover. The deck
+            // identification `(s, w) ~ (s + 1, -w)` is enforced by the basis
+            // parity, while optimization retracts on the ordinary cylinder
+            // `S¹(period 2) × [-1, 1]`.
+            Self::Mobius => LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 2.0 },
+                LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+            ]),
             // Poincaré tangent patch: the latent `t` is a tangent vector at the
             // ball origin, optimised in the unconstrained tangent chart (the
             // hyperbolic geometry enters through the penalty, not a constrained
@@ -232,6 +249,8 @@ impl SaeAtomBasisKind {
             // unconstrained Newton step.
             Self::Cylinder if latent_dim == 2 => cylinder_projection_seed_grid(resolution),
             Self::Cylinder => None,
+            Self::Mobius if latent_dim == 2 => mobius_projection_seed_grid(resolution),
+            Self::Mobius => None,
             // The tangent latent of a Poincaré patch lies in the convex hull of
             // its PCA seed exactly like the Euclidean patch, so no compact
             // projection grid is needed.
@@ -258,6 +277,20 @@ pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f6
             let lon = -PI + 2.0 * PI * (j as f64) / r as f64;
             grid[[i * r + j, 0]] = lat;
             grid[[i * r + j, 1]] = lon;
+        }
+    }
+    Some(grid)
+}
+
+pub(crate) fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+    let r = resolution.max(2);
+    let mut grid = Array2::<f64>::zeros((r * r, 2));
+    for i in 0..r {
+        let angle = 2.0 * i as f64 / r as f64;
+        for j in 0..r {
+            let width = -1.0 + 2.0 * j as f64 / (r - 1) as f64;
+            grid[[i * r + j, 0]] = angle;
+            grid[[i * r + j, 1]] = width;
         }
     }
     Some(grid)

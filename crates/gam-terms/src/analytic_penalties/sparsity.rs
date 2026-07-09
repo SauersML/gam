@@ -78,6 +78,17 @@ pub struct SoftmaxAssignmentSparsityPenalty {
     pub temperature: f64,
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
+    /// #991 design-honesty per-row weights `w_i` (mean-1). When present, row `i`'s
+    /// prior contribution is scaled by `w_i` in EVERY aggregate channel — value,
+    /// `grad_target`, `hessian_diag`, `hvp`, `psd_majorizer_diag`, `grad_rho`.
+    /// Because each of those is linear in the per-row penalty strength, scaling
+    /// the strength by `w_i` scales all channels by the same `w_i` and cannot
+    /// desync them (the value/gradient FD oracle gates this). The per-row *block*
+    /// helpers (`row_dense_hessian` / `row_psd_majorizer` / their logit
+    /// derivatives / `psd_majorizer_abs_row_sums`) take an explicit `scale` and a
+    /// single row, so their callers apply `scale·w_i` instead. `None` ⇒ every
+    /// weight is `1`, bit-for-bit the unweighted path.
+    pub row_weights: Option<std::sync::Arc<[f64]>>,
 }
 
 impl SoftmaxAssignmentSparsityPenalty {
@@ -90,7 +101,25 @@ impl SoftmaxAssignmentSparsityPenalty {
             temperature,
             weight: 1.0,
             weight_schedule: None,
+            row_weights: None,
         }
+    }
+
+    /// Install #991 design-honesty per-row weights (see [`Self::row_weights`]).
+    /// A uniform / absent design is passed as `None` so the unweighted arithmetic
+    /// stays bit-for-bit; a present slice must have one finite weight per row.
+    #[must_use]
+    pub fn with_row_weights(mut self, weights: Option<&[f64]>) -> Self {
+        self.row_weights = weights.map(|w| std::sync::Arc::from(w.to_vec()));
+        self
+    }
+
+    /// Per-row strength multiplier `w_i` (defaults to `1.0` when no design weights
+    /// are installed). Callers of the per-row *block* helpers fold this into the
+    /// `scale` they pass so those channels carry the identical weighting.
+    #[must_use]
+    pub fn row_weight(&self, row: usize) -> f64 {
+        self.row_weights.as_ref().map_or(1.0, |w| w[row])
     }
 
     impl_with_weight_schedule!(weight);
@@ -389,9 +418,10 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         for row in 0..n {
             let start = row * self.k_atoms;
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let w_row = self.row_weight(row);
             for v in a {
                 if v > 0.0 {
-                    acc += -v * v.ln();
+                    acc += -w_row * v * v.ln();
                 }
             }
         }
@@ -407,6 +437,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         for row in 0..n {
             let start = row * self.k_atoms;
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let w_row = self.row_weight(row);
             let mut d_h_da = vec![0.0; self.k_atoms];
             let mut mean = 0.0;
             for k in 0..self.k_atoms {
@@ -414,7 +445,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
                 mean += a[k] * d_h_da[k];
             }
             for k in 0..self.k_atoms {
-                out[start + k] = a[k] * (d_h_da[k] - mean) * inv_tau;
+                out[start + k] = w_row * a[k] * (d_h_da[k] - mean) * inv_tau;
             }
         }
         out
@@ -452,6 +483,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         for row in 0..n {
             let start = row * self.k_atoms;
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let w_row = self.row_weight(row);
             let mut mean_log_plus_one = 0.0;
             for k in 0..self.k_atoms {
                 mean_log_plus_one += a[k] * entropy_log_plus_one(a[k]);
@@ -459,7 +491,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             for k in 0..self.k_atoms {
                 let log_plus_one = entropy_log_plus_one(a[k]);
                 let term = (1.0 - 2.0 * a[k]) * (mean_log_plus_one - log_plus_one) + a[k] - 1.0;
-                out[start + k] = scale * a[k] * term;
+                out[start + k] = w_row * scale * a[k] * term;
             }
         }
         Some(out)
@@ -491,6 +523,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         for row in 0..n {
             let start = row * self.k_atoms;
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let w_row = self.row_weight(row);
             let mut mean_log_plus_one = 0.0;
             let mut mean_v = 0.0;
             for k in 0..self.k_atoms {
@@ -506,7 +539,8 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             for k in 0..self.k_atoms {
                 let log_plus_one = entropy_log_plus_one(a[k]);
                 let centered_v = v[start + k] - mean_v;
-                out[start + k] = scale
+                out[start + k] = w_row
+                    * scale
                     * a[k]
                     * (centered_v * (mean_log_plus_one - log_plus_one - 1.0)
                         + mean_centered_v_log_plus_one);
@@ -542,9 +576,10 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         let mut out = Array1::<f64>::zeros(target.len());
         for row in 0..n {
             let start = row * self.k_atoms;
+            let w_row = self.row_weight(row);
             let d = self.psd_majorizer_abs_row_sums(&values[start..start + self.k_atoms], scale);
             for k in 0..self.k_atoms {
-                out[start + k] = d[k];
+                out[start + k] = w_row * d[k];
             }
         }
         Some(out)

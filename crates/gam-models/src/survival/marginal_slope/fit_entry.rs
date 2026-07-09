@@ -2,33 +2,8 @@
 
 use super::*;
 
-/// Pinned log-λ on the marginal/logslope `DoublePenaltyNullspace` slots — the
-/// numerical-identifiability floor REML cannot lower (gam#979). `λ = e^0 = 1` on
-/// the unit-Frobenius ZZᵀ block. Measured effect: this floor cut the n=3000
-/// survival marginal-slope fit ~2.3× (1976s → 851s), so it does relieve the
-/// #1082 deadlock — but a residual bottleneck remains under investigation
-/// (diagnostics logged below).
-const NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA: f64 = 0.0;
-
-/// Byte budget for dense materialization of a survival design during the gam#979 preflight λ_max read.
+/// Per-matrix byte budget for the construction-time identifiability preflight.
 const PREFLIGHT_MATERIALIZATION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-
-/// Estimate `λ_max(XᵀX)` for a surface design — a setup-time read on the raw
-/// (un-whitened, un-penalized) curvature scale of the surface, logged as a
-/// gam#979 diagnostic to compare against the inner solver's whitened λ_max.
-/// Returns `None` when the design is empty or the Gram spectrum is not finite.
-fn surface_gram_lambda_max(design: &DesignMatrix, label: &str) -> Option<f64> {
-    let dense = design
-        .try_to_dense_by_chunks_budgeted(label, PREFLIGHT_MATERIALIZATION_BUDGET_BYTES)
-        .ok()?;
-    if dense.ncols() == 0 || dense.nrows() == 0 {
-        return None;
-    }
-    let gram = dense.t().dot(&dense);
-    gam_linalg::utils::symmetric_extremes(&gram)
-        .map(|(_lambda_min, lambda_max)| lambda_max)
-        .filter(|v| v.is_finite() && *v > 0.0)
-}
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
@@ -692,81 +667,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 core_len + out.len(),
                 crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
             ));
-            out.push(
-                crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
-            );
+            out.push(crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA);
         }
         out
     };
-    // gam#979: pin the null-space identifiability floor on the marginal +
-    // logslope surfaces. `enable_surface_identifiability_double_penalty` makes
-    // the builder emit a Frobenius-normalized ZZᵀ ridge on each surface's
-    // polynomial-trend null space, but that ridge's REML-selected λ is driven
-    // low whenever the trend carries real signal (REML will not shrink a used
-    // direction) — leaving the trend flat, which re-forms the large-signal /
-    // tiny-curvature mode the inner joint-Newton deadlocks on (the spectral
-    // step drops it as near-null gauge #1082 while the certificate requires it
-    // #1449, so the solve neither progresses nor certifies and grinds to the
-    // cycle cap: the measured n=3000 hang). Pinning the null-space λ to a fixed
-    // conditioning floor — REML cannot lower it, via the same degenerate-box
-    // `pinned_rho_slots` path the #461 influence absorber uses — guarantees the
-    // trend direction always carries curvature, so cond(H_pen) stays bounded
-    // and no cond>1e10 gauge mode can form. This is a numerical-identifiability
-    // floor (a prior toward no effect), not a learned surface: the ZZᵀ block is
-    // unit-Frobenius normalised, so λ = e^0 = 1 gives the trend O(1) curvature —
-    // ample to hold cond ≤ ~λ_max ≈ 1e6 (≪ 1/√eps) at the penalty-dominated
-    // operating point, yet far too mild to bias a genuinely data-identified
-    // trend (whose own data curvature dominates 1). Statistical shrinkage of the
-    // trend beyond the floor still runs through the surface's primary
-    // wiggliness penalty.
-    {
-        use gam_terms::basis::PenaltySource;
-        let floor_log_lambda = NULLSPACE_IDENTIFIABILITY_FLOOR_LOG_LAMBDA;
-        let marginal_offset = time_penalties_len;
-        let mut pinned_marginal = 0usize;
-        let mut pinned_slots: Vec<usize> = Vec::new();
-        for info in marginal_design.penaltyinfo.iter() {
-            if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
-                let slot = marginal_offset + info.global_index;
-                pinned_rho_slots.push((slot, floor_log_lambda));
-                pinned_slots.push(slot);
-                pinned_marginal += 1;
-            }
-        }
-        let logslope_offset = time_penalties_len + marginal_design.penalties.len();
-        let mut pinned_logslope = 0usize;
-        for info in logslope_design.penaltyinfo.iter() {
-            if matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace) {
-                let slot = logslope_offset + info.global_index;
-                pinned_rho_slots.push((slot, floor_log_lambda));
-                pinned_slots.push(slot);
-                pinned_logslope += 1;
-            }
-        }
-        // gam#979 diagnostic: confirm the null-space floor actually fires (how
-        // many slots on each surface, at which ρ indices, and the pinned log-λ),
-        // and report the raw surface curvature scale (design-Gram λ_max) as a
-        // reference point for the inner solver's whitened λ_max. Surfaced at INFO
-        // so the failing Python-API n=3000 test prints it, disambiguating "pin
-        // not firing" from "floor too low for the true λ_max" from "a residual
-        // bottleneck unrelated to the null-space deadlock".
-        let marginal_gram_lmax =
-            surface_gram_lambda_max(&marginal_design.design, "smgs #979 marginal gram")
-                .unwrap_or(f64::NAN);
-        let logslope_gram_lmax =
-            surface_gram_lambda_max(&logslope_design.design, "smgs #979 logslope gram")
-                .unwrap_or(f64::NAN);
-        log::info!(
-            "[survival-marginal-slope] gam#979 null-space floor fired: pinned {} slots ({} marginal + {} logslope) at log_lambda={:.3} slots={:?} | design-Gram λ_max marginal={:.3e} logslope={:.3e} (raw, un-whitened)",
-            pinned_slots.len(),
-            pinned_marginal,
-            pinned_logslope,
-            floor_log_lambda,
-            pinned_slots,
-            marginal_gram_lmax,
-            logslope_gram_lmax,
-        );
-    }
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
@@ -1549,9 +1453,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             .time_block
                             .penalties
                             .iter()
-                            .map(|p| {
-                                gam_terms::smooth::BlockwisePenalty::new(0..p_time, p.clone())
-                            })
+                            .map(|p| gam_terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
                             .collect();
                         let applied: CompiledSurvivalDesignsVMExact =
                             apply_compiled_map_to_designs(
@@ -2776,7 +2678,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     drops_post.0,
                     drops_post.1,
                     drops_post.2,
-                    if confound_persists { "still" } else { "no longer" },
+                    if confound_persists {
+                        "still"
+                    } else {
+                        "no longer"
+                    },
                     recompile_started.elapsed().as_secs_f64(),
                 );
             }

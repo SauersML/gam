@@ -2582,9 +2582,7 @@ where
         let factor = {
             let scale = h.max_abs_diag();
             let min_step = scale * 1e-10;
-            let mut ridge = 0.0_f64;
-            let mut attempts = 0_usize;
-            loop {
+            let mut try_factorize = |ridge: f64| {
                 let candidate = if ridge > 0.0 {
                     match h.addridge(ridge) {
                         Ok(c) => c,
@@ -2593,8 +2591,17 @@ where
                 } else {
                     h.clone()
                 };
-                if let Ok(f) = candidate.factorize() {
-                    if ridge > 0.0 {
+                candidate.factorize().ok()
+            };
+            // Bare (unridged) factorization first, then the shared geometric
+            // ridge escalation; the bare try counts toward the attempt budget.
+            match try_factorize(0.0) {
+                Some(f) => f,
+                None => match opt::escalate_ridge(
+                    opt::RidgeSchedule::geometric(min_step, MAX_FACTORIZATION_ATTEMPTS - 1),
+                    &mut try_factorize,
+                ) {
+                    Ok(success) => {
                         // This ridged factor is reused for the reported standard
                         // errors, covariance, and bias correction below, so those
                         // quantities are stabilized approximations, not the exact
@@ -2604,18 +2611,16 @@ where
                              ridge {:.3e}; reported standard errors, covariance, and bias \
                              correction are computed from the ridge-stabilized factor and are \
                              approximations, not exact unridged values",
-                            ridge,
+                            success.ridge,
                         );
+                        success.value
                     }
-                    break f;
-                }
-                attempts += 1;
-                if attempts >= MAX_FACTORIZATION_ATTEMPTS {
-                    return Err(EstimationError::ModelIsIllConditioned {
-                        condition_number: f64::INFINITY,
-                    });
-                }
-                ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+                    Err(_) => {
+                        return Err(EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        });
+                    }
+                },
             }
         };
         let mut traces = vec![0.0f64; k];

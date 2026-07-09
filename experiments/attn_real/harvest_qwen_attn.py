@@ -268,12 +268,9 @@ def summarize_head_numpy(
     ov = head_ov_vectors(v[:, head, :], o_weight, head, head_dim)
     ov_t = phase_from_probe(ov, phase_beta, phase_intercept)
     delta = circular_delta(ov_t, t_np)
-    delta_by_bin = np.zeros(period, dtype=np.float64)
-    count_by_bin = np.zeros(period, dtype=np.int64)
-    for index, bin_index in enumerate(bins):
-        delta_by_bin[int(bin_index)] += float(delta[index])
-        count_by_bin[int(bin_index)] += 1
-    delta_by_bin /= count_by_bin
+    delta_by_bin, count_by_bin = circular_mean_by_bin(delta, bins, period)
+    if np.any(count_by_bin == 0):
+        raise SystemExit(f"head {head}: positional grid has empty OV cells")
 
     return {
         "layer": int(layer_index),
@@ -331,14 +328,11 @@ def summarize_head(
     ov_t = phase_from_probe(ov, phase_beta, phase_intercept)
     key_t = np.tile(t_np, scores_np.shape[0])
     delta = circular_delta(ov_t, key_t)
-    delta_by_bin = np.zeros(period, dtype=np.float64)
-    count_by_bin = np.zeros(period, dtype=np.int64)
-    for index, bin_index in enumerate(np.tile(k_bins, scores_np.shape[0])):
-        delta_by_bin[int(bin_index)] += float(delta[index])
-        count_by_bin[int(bin_index)] += 1
+    delta_by_bin, count_by_bin = circular_mean_by_bin(
+        delta, np.tile(k_bins, scores_np.shape[0]), period
+    )
     if np.any(count_by_bin == 0):
         raise SystemExit(f"head {head}: positional grid has empty OV cells")
-    delta_by_bin /= count_by_bin
 
     return {
         "layer": int(layer_index),

@@ -24,9 +24,11 @@
 //! ```
 //!
 //! (the linear tier's ridge is explicit in `J`; the curved tier's complexity
-//! penalty is realised as the compose lane's cross-fit / e-BH acceptance charge,
-//! which admits a chart only when its cross-validated gain exceeds its
-//! information charge — surfaced per round as [`CofitRound::curved_charge`]).
+//! penalty is realised as the compose lane's cross-fit BIC acceptance charge,
+//! which admits a chart only when its cross-validated deviance gain exceeds its
+//! `½·d_eff·log n_eff` information charge — a descriptive per-chart BIC gate, not
+//! an FDR-controlled e-BH discovery — surfaced per round as
+//! [`CofitRound::curved_charge`]).
 //!
 //! * **Block A — linear tier refit.** With the charts (hence `C`) held fixed and
 //!   the block routing frozen, re-solve the per-row active-set ridge
@@ -104,8 +106,10 @@ pub struct CofitRound {
     pub recon_sse: f64,
     /// Linear-tier ridge energy `λ_lin · ‖codes‖²_F`.
     pub linear_ridge: f64,
-    /// Total e-BH acceptance charge of the accepted charts this round (the curved
-    /// tier's complexity penalty, enforced as an acceptance gate).
+    /// Total BIC complexity charge (`Σ ½·d_eff·log n_eff`) of the descriptively
+    /// accepted charts this round — the curved tier's information penalty,
+    /// enforced as a per-chart BIC acceptance gate (not an FDR-controlled e-BH
+    /// discovery).
     pub curved_charge: f64,
     /// Composed explained variance (`1 − RSS/TSS`, mean baseline).
     pub explained_variance: f64,

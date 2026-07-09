@@ -7802,9 +7802,9 @@ impl ManifoldSaeCore {
     /// straight sub-models exactly as the Python does, so the returned arrays are
     /// bitwise-identical to the dataclass OOS path. No warm start is supplied
     /// (`initial_logits`/`initial_coords` are `None`), matching a bare
-    /// `reconstruct`/`encode` call, and the two ridge floors take the same
-    /// `1e-6` defaults the `sae_manifold_predict_oos` pyfunction applies when the
-    /// Python omits them.
+    /// `reconstruct`/`encode` call. The coordinate ridge takes the same `1e-6`
+    /// default the `sae_manifold_predict_oos` pyfunction applies when Python
+    /// omits it; there is no decoder ridge in a frozen-decoder solve.
     fn oos_payload_dict<'py>(
         &self,
         py: Python<'py>,
@@ -7824,14 +7824,15 @@ impl ManifoldSaeCore {
         let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
         let basis_sizes: Vec<usize> =
             inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
-        // Exact mirror of the Python OOS n_harmonics gate (case-sensitive
-        // `periodic`/`torus` only), matching the steer path above.
+        // Exact mirror of the Python OOS n_harmonics gate. Every harmonic
+        // topology must carry its persisted order; the typed entry never
+        // guesses it from a decoder width.
         let n_harm: Vec<Option<usize>> = inner
             .basis_kinds
             .iter()
             .zip(&inner.n_harmonics)
             .map(|(kind, &h)| {
-                if kind == "periodic" || kind == "torus" {
+                if matches!(kind.as_str(), "periodic" | "torus" | "cylinder" | "mobius") {
                     Some(h.max(0) as usize)
                 } else {
                     None
@@ -7841,8 +7842,7 @@ impl ManifoldSaeCore {
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
-        predict_oos_from_arrays(
-            py,
+        let request = sae_oos_request_from_arrays(
             x_new.as_array(),
             inner.basis_kinds.clone(),
             atom_dim,
@@ -7853,13 +7853,10 @@ impl ManifoldSaeCore {
             inner.alpha,
             inner.tau,
             inner.assignment.clone(),
-            inner.sparsity_strength,
-            inner.smoothness,
             inner.max_iter.max(0) as usize,
             inner.learning_rate,
-            // Ridge floors: the Python `_oos_payload` omits both, so the
-            // `sae_manifold_predict_oos` pyfunction supplies its `1e-6` defaults.
-            1.0e-6,
+            // Coordinate ridge: Python `_oos_payload` omits it, so the
+            // `sae_manifold_predict_oos` pyfunction supplies this `1e-6` default.
             1.0e-6,
             None,
             None,
@@ -7871,6 +7868,10 @@ impl ManifoldSaeCore {
             inner.selected_log_ard.clone(),
             inner.learnable_alpha,
         )
+        .map_err(py_value_error)?;
+        let report = gam::terms::sae::manifold::run_sae_manifold_oos(request)
+            .map_err(py_value_error)?;
+        sae_oos_report_to_pydict(py, report)
     }
 }
 
@@ -8153,8 +8154,8 @@ impl ManifoldSaeCore {
 
     /// Held-out dense reconstruction `(N, p)` of `x_new` — the Rust-owned
     /// counterpart of `ManifoldSAE.reconstruct` for out-of-sample rows. Runs the
-    /// frozen-decoder OOS Newton solve through the SAME `predict_oos_from_arrays`
-    /// core the `sae_manifold_predict_oos` pyfunction uses, reading the trained
+    /// frozen-decoder OOS Newton solve through the SAME typed gam-sae entry the
+    /// `sae_manifold_predict_oos` pyfunction uses, reading the trained
     /// geometry, terminal ρ*, and hybrid-collapsed straight sub-models from this
     /// handle's own state (no per-call re-marshalling), and returns the payload's
     /// `fitted` array. Unlike the dataclass path there is no training-data

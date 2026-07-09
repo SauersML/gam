@@ -741,4 +741,32 @@ mod tests {
         assert!((dominant.sin - 0.25).abs() < 1.0e-12);
         assert!(fit.r2 > 0.999_999_999);
     }
+
+    #[test]
+    fn ov_coordinate_map_unwraps_seam_straddling_half_turn() {
+        // A half-turn (0.5) shift with mild key-dependent variation. In the
+        // wrapped chart the deltas straddle the seam — some near +0.45, some near
+        // −0.45 — so a raw Euclidean regression averages them to ≈0, the antipode.
+        // The shortest-arc unwrapping around the circular mean recovers the true
+        // ≈0.5 half-turn shift and fits the variation.
+        let key_t: Vec<f64> = (0..40).map(|index| index as f64 / 40.0).collect();
+        let delta_t: Vec<f64> = key_t
+            .iter()
+            .map(|t| {
+                let raw = 0.5 + 0.1 * (TWO_PI * *t).cos();
+                raw - raw.round() // wrap into (−0.5, 0.5]
+            })
+            .collect();
+        let fit = fit_ov_coordinate_map(&key_t, &delta_t, 1).expect("ov fit");
+        let recovered = fit.intercept.rem_euclid(1.0);
+        assert!(
+            (recovered - 0.5).abs() < 0.05,
+            "circular unwrapping must recover the half-turn shift, not the antipode: got {recovered}"
+        );
+        assert!(
+            fit.r2 > 0.99,
+            "the unwrapped harmonic fit explains the key-dependent variation: r2={}",
+            fit.r2
+        );
+    }
 }

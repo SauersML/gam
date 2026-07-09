@@ -764,17 +764,16 @@ pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
 /// (the coordinates transmitted per firing), SELECTION (naming which atoms
 /// fired), and DICTIONARY (the amortised decoder).
 ///
-/// # Currency (reuses [`scalar_rate_bits`] + [`selection_bits`], no new math)
+/// # Currency (reuses [`reverse_water_filling`] + [`SparseAtomCodes::support_entropy`])
 ///
-/// A token is coded by (1) naming which `k_active` of `g_dict` atoms fired —
-/// `selection_bits(g_dict, k_active)` bits — and (2) transmitting each firing's
-/// `coord_dim` latent coordinates. A unit-variance coordinate coded to the
-/// achieved RELATIVE distortion `1 − ev` costs `scalar_rate_bits(1, 1 − ev)`
-/// bits — the Gaussian rate-distortion law `½·log₂(1/(1−ev))` at the fit's
-/// operating EV: a higher
-/// EV means a finer distortion floor and therefore MORE code bits, the honest
-/// rate–distortion trade the matched-EV comparison hides. The decoder is stored
-/// once, `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
+/// A token is coded by (1) naming which atoms fired — priced at the empirical
+/// support-distribution universal code `H(S)` (cardinality entropy plus
+/// conditional co-firing prices), a decodable code that does NOT overpay a
+/// predictable tiling dictionary the way the combinatorial worst case
+/// `log₂ C(G, k)` does — and (2) transmitting each firing's latent coordinates
+/// at the reverse-water-filling rate of the actual coordinate variance spectrum
+/// at the achieved distortion. The decoder is stored once,
+/// `n_params · l_param_bits`, amortised across the `n_tokens` corpus.
 ///
 /// `bits_per_token = total_bits / n_tokens` is the headline. It is the code
 /// length per token of the WHOLE representation (codes + amortised dictionary),
@@ -794,14 +793,17 @@ pub struct ManifoldFitDl {
     pub g_dict: i64,
     /// Decoder scalar count `n_params = Σ_k M_k·p` charged at `l_param_bits`.
     pub n_params: i64,
-    /// Per-coordinate code rate `½·log₂(1/(1 − ev))` (bits), floored at zero.
+    /// Per-coordinate code rate: the reverse-water-filling mean rate of the
+    /// actual coordinate variance spectrum at the achieved distortion (bits).
     pub coordinate_rate_bits: f64,
     /// Bits per stored dictionary scalar (`l_param_bits`); defaults to the
     /// distortion-matched precision `coordinate_rate_bits`.
     pub l_param_bits: f64,
-    /// Selection bits per token, `log₂ C(G, round(k̄))`.
+    /// Selection bits per token: the empirical support-entropy universal code
+    /// `H(S)` ([`SparseAtomCodes::support_entropy`]`.tree_bits`).
     pub selection_bits_per_token: f64,
-    /// Code bits per token, `k̄ · d̄ · coordinate_rate_bits`.
+    /// Code bits per token: firing-weighted coded scalars per token times the
+    /// per-coordinate rate, `(Σ_k firings(k)·d_k / N) · coordinate_rate_bits`.
     pub code_bits_per_token: f64,
     /// Amortised dictionary bits per token, `n_params · l_param_bits / N`.
     pub dict_bits_per_token: f64,
@@ -817,38 +819,86 @@ pub struct ManifoldFitDl {
     pub bits_per_token: f64,
 }
 
-/// Assemble the fit-level [`ManifoldFitDl`] from a fit's own summary quantities.
+/// Assemble the fit-level [`ManifoldFitDl`] as a VALID code length from a fit's
+/// own empirical byproducts.
 ///
-/// `ev` is the achieved explained variance, `n_tokens` the coded-token count,
-/// `k_active` the mean active atoms per token, `coord_dim` the mean coded
-/// coordinates per active atom, `g_dict` the dictionary size, `n_params` the
-/// decoder scalar count, and `l_param_bits` the per-scalar decoder precision
-/// (`None` ⇒ the distortion-matched precision = the per-coordinate code rate).
-/// Every quantity is READ OFF an existing fit; nothing is re-fit. `1 − ev` is
-/// floored at a tiny positive so a numerically-saturated fit reports a large
-/// (finite) code rate rather than `∞`.
+/// * `codes` — the empirical binary support matrix `S_n ⊆ {0,…,G−1}` (which
+///   atoms fired per token). The SELECTION price is charged as the empirical
+///   support-distribution code [`SparseAtomCodes::support_entropy`] (a decodable
+///   universal code: variable per-token cardinality plus conditional co-firing
+///   prices), NOT the invalid rounded-mean combinatorial `log₂ C(G, round k̄)`
+///   (which is not even an upper bound — a uniform support over all `2^G`
+///   subsets carries `G` bits, yet `log₂ C(G, G/2) < G`). Reading the support
+///   off `codes` also fixes the uniform-row edge case at its source: a token's
+///   active set is whatever the assignment recorded, so a maximally-spread row
+///   is priced at its true (high) support cost instead of being miscounted as
+///   zero active atoms.
+/// * `coord_variances` / `delta2` — the per-coordinate signal variances of the
+///   coded latent coordinates and the achieved total coding distortion. The
+///   per-coordinate CODE rate is the reverse-water-filling rate
+///   [`reverse_water_filling`] of that actual spectrum at that distortion, not a
+///   unit-variance rate read off the scalar output EV.
+/// * `atom_coord_dims` — the coded-coordinate dimension `d_k` of each atom
+///   (length `G`). The code term charges every coded scalar, weighted by which
+///   atoms ACTUALLY fire (`Σ_k firings(k)·d_k`), instead of `E[K]·d̄` with an
+///   unweighted mean dimension.
+/// * `ev` — the achieved output explained variance, reported alongside.
+/// * `n_params` / `l_param_bits` — the decoder scalar count and per-scalar
+///   precision (`None` ⇒ the distortion-matched precision = the per-coordinate
+///   code rate).
+///
+/// Every quantity is READ OFF an existing fit; nothing is re-fit.
 pub fn manifold_fit_description_length(
+    codes: &SparseAtomCodes,
+    coord_variances: &[f64],
+    delta2: f64,
+    atom_coord_dims: &[f64],
     ev: f64,
-    n_tokens: i64,
-    k_active: f64,
-    coord_dim: f64,
-    g_dict: i64,
     n_params: i64,
     l_param_bits: Option<f64>,
 ) -> ManifoldFitDl {
-    // Relative distortion floor achieved by the reconstruction. Floored away
-    // from zero so a saturated fit reports a large finite rate, not +∞.
-    let rel_distortion = (1.0 - ev).max(1.0e-12);
-    let coordinate_rate_bits = scalar_rate_bits(1.0, rel_distortion);
-    let l_param = l_param_bits.unwrap_or(coordinate_rate_bits).max(0.0);
+    let n_tokens = codes.n_obs() as i64;
+    let g_dict = codes.k_atoms() as i64;
 
-    let k_round = k_active.max(0.0).round() as i64;
-    let selection_bits_per_token = selection_bits(g_dict, k_round);
-    let code_bits_per_token = k_active.max(0.0) * coord_dim.max(0.0) * coordinate_rate_bits;
+    // SELECTION: the empirical support-distribution universal code per token
+    // (cardinality entropy + conditional co-firing prices), a decodable code
+    // that prices a predictable tiling dictionary honestly.
+    let support = codes.support_entropy();
+    let selection_bits_per_token = support.tree_bits;
+    let k_active = support.mean_support;
+
+    // CODE: the per-coordinate rate is the reverse-water-filling rate of the
+    // ACTUAL coordinate spectrum at the achieved distortion — the mean bits a
+    // coded scalar costs at this operating point.
+    let (coord_total_bits, _per_coord) = reverse_water_filling(coord_variances, delta2);
+    let n_coords = coord_variances.len();
+    let coordinate_rate_bits = if n_coords > 0 {
+        coord_total_bits / n_coords as f64
+    } else {
+        0.0
+    };
+
+    // Every coded scalar, weighted by which atoms actually fired: Σ_k firings(k)·d_k.
+    let mut coded_scalars = 0.0_f64;
+    let mut total_firings = 0.0_f64;
+    for code in codes.iter() {
+        for atom in code.active_mask.iter_ones() {
+            total_firings += 1.0;
+            coded_scalars += atom_coord_dims.get(atom).copied().unwrap_or(0.0);
+        }
+    }
+    let coord_dim = if total_firings > 0.0 {
+        coded_scalars / total_firings
+    } else {
+        0.0
+    };
+
+    let l_param = l_param_bits.unwrap_or(coordinate_rate_bits).max(0.0);
     let dict_bits = n_params.max(0) as f64 * l_param;
 
     let n = n_tokens.max(0) as f64;
-    let code_bits = n * code_bits_per_token;
+    let code_bits = coded_scalars * coordinate_rate_bits;
+    let code_bits_per_token = if n > 0.0 { code_bits / n } else { 0.0 };
     let selection_bits_total = n * selection_bits_per_token;
     let total_bits = code_bits + selection_bits_total + dict_bits;
     let (bits_per_token, dict_bits_per_token) = if n_tokens > 0 {

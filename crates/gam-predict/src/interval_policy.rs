@@ -122,13 +122,26 @@ pub fn symmetric_interval(
     (center - &half_width, center + &half_width)
 }
 
-/// Response-scale interval built by transforming the η-scale endpoints through
+/// Number of evaluation nodes (endpoints included) used to scan the response
+/// map over each η interval in [`transform_eta_interval`]. Odd, so the interval
+/// midpoint — the point predictor for a symmetric η interval — is always a
+/// node. Monotone maps attain their extrema at the endpoint nodes, so for them
+/// the scan is exact and reproduces the endpoint-only construction bit-for-bit;
+/// the interior nodes exist to catch extrema of non-monotone response maps
+/// (learnable link wiggles), for which endpoint-only transformation is false
+/// (e.g. `η²` on `[-1, 1]` has image `[0, 1]`, not `[1, 1]`).
+const TRANSFORM_INTERVAL_SCAN_NODES: usize = 17;
+
+/// Response-scale interval built by transforming the η-scale interval through
 /// a (possibly non-monotone) response map, then clamping to `bounds`.
 ///
-/// `response_map` is the predictor's inverse-link / response transform applied
-/// to a vector of linear-predictor endpoints. Because some transforms (notably
-/// survival tails) are decreasing, the per-row min/max of the two transformed
-/// endpoints is taken so the returned `(lower, upper)` are genuinely ordered.
+/// `response_map` is the predictor's inverse-link / response transform. The map
+/// is evaluated on [`TRANSFORM_INTERVAL_SCAN_NODES`] evenly spaced nodes across
+/// each row's η interval and the per-row min/max over the scan is returned, so
+/// interior extrema of a non-monotone transform (link wiggles) are captured
+/// rather than silently cut off by an endpoint-only image. Because some
+/// transforms (notably survival tails) are decreasing, the min/max also keeps
+/// the returned `(lower, upper)` genuinely ordered.
 ///
 /// `delta_fallback` supplies the delta-method response SE `SE(μ̂)` (and the
 /// central multiplier `z`) used as a finite fallback: on a degenerate fit (an
@@ -154,20 +167,41 @@ pub fn transform_eta_interval<F>(
 where
     F: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
 {
-    let transformed_lower = response_map(eta_lower)?;
-    let transformed_upper = response_map(eta_upper)?;
-    let n = transformed_lower.len();
+    let n = eta_lower.len();
+    // Scan the response map over each row's η interval. Node 0 is the lower
+    // endpoint and the last node is the upper endpoint, so a monotone map's
+    // extrema are reproduced exactly; interior nodes capture non-monotone
+    // extrema. All nodes must be finite for a row's scan to count — `f64::min`/
+    // `max` return the non-NaN argument, so a single `+inf`/NaN node would
+    // otherwise slip through as a finite-but-meaningless bound.
+    const K: usize = TRANSFORM_INTERVAL_SCAN_NODES;
+    let mut scan_min = Array1::<f64>::from_elem(n, f64::INFINITY);
+    let mut scan_max = Array1::<f64>::from_elem(n, f64::NEG_INFINITY);
+    let mut scan_finite = vec![true; n];
+    for k in 0..K {
+        let t = (k as f64) / ((K - 1) as f64);
+        let eta_node = Array1::from_shape_fn(n, |i| eta_lower[i] + t * (eta_upper[i] - eta_lower[i]));
+        let transformed = response_map(&eta_node)?;
+        for i in 0..n {
+            let v = transformed[i];
+            if v.is_finite() {
+                scan_min[i] = scan_min[i].min(v);
+                scan_max[i] = scan_max[i].max(v);
+            } else {
+                scan_finite[i] = false;
+            }
+        }
+    }
     let mut mean_lower = Array1::<f64>::zeros(n);
     let mut mean_upper = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
-        if let (Some((mean_se, z)), false) = (delta_fallback, lo.is_finite() && hi.is_finite()) {
+        if let (Some((mean_se, z)), false) = (delta_fallback, scan_finite[i]) {
             let half = z * mean_se[i];
             mean_lower[i] = mean[i] - half;
             mean_upper[i] = mean[i] + half;
         } else {
-            mean_lower[i] = lo.min(hi);
-            mean_upper[i] = lo.max(hi);
+            mean_lower[i] = scan_min[i].min(scan_max[i]);
+            mean_upper[i] = scan_max[i].max(scan_min[i]);
         }
     }
     bounds.clamp_in_place(&mut mean_lower);

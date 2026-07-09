@@ -1727,6 +1727,9 @@ impl SaeManifoldTerm {
                 // mixing the periodic and linear axes. `Circle` fixes the one
                 // real continuous gauge and leaves the linear axis ungauged.
                 (SaeAtomBasisKind::Cylinder, _) => AtomTopology::Circle,
+                // The double-cover chart has one continuous angular gauge;
+                // the bounded width axis carries no rotational gauge.
+                (SaeAtomBasisKind::Mobius, _) => AtomTopology::Circle,
                 (
                     SaeAtomBasisKind::Linear
                     | SaeAtomBasisKind::Duchon

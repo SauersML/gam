@@ -2,7 +2,9 @@
 //! `gnomon/examples/large-scale/test_local_synthetic.py`:
 //!     duchon(PC1..PC10, centers=40, order=0, power=2, length_scale=1.0)
 //! against parametric block [intercept | sex | prs_z], with 200 training rows
-//! drawn from a synthetic case/control cohort identical to the script.
+//! drawn from a synthetic case/control cohort identical to the script.  The
+//! literal request is spectrally inadmissible in ten dimensions; this regression
+//! requires a direct diagnostic instead of silently changing `power=2`.
 
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
@@ -75,7 +77,7 @@ fn synth_cohort(
 }
 
 #[test]
-fn local_synth_copd_like_duchon_orth_to_parametric() {
+fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
     let mut rng = StdRng::seed_from_u64(0);
     let cohort = synth_cohort(&mut rng, N_TOTAL, 0.6, 0.06);
 
@@ -124,11 +126,13 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
                     num_centers: DUCHON_CENTERS,
                 },
                 length_scale: Some(1.0),
-                // Mirror the term_builder policy auto-escalation: explicit power=2
-                // with order=Zero and length_scale=Some(1.0) in d=10 is bumped to
-                // the minimum admissible power for full triple-operator collocation,
-                // which is `s_op = (d + max_op + 2 - 2p)/2 = (10 + 2 + 2 - 2)/2 = 6`.
-                power: 6.0,
+                // Preserve the literal request from the reproducer.  With
+                // Zero null space (p=1), s=2, d=10, pointwise kernel existence
+                // fails because 2*(p+s)=6 <= 10.  Rewriting s to 6 made this
+                // fixture pass by testing a different kernel; explicit power
+                // must instead remain reachable/verbatim and fail clearly when
+                // that requested kernel is mathematically inadmissible.
+                power: 2.0,
                 nullspace_order: DuchonNullspaceOrder::Zero,
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: None,
@@ -169,17 +173,13 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
         smooth_terms: vec![duchon_term],
     };
 
-    let result = build_term_collection_design(data.view(), &spec);
-    match result {
-        Ok(design) => {
-            eprintln!(
-                "design built: rows={} cols={}",
-                design.design.nrows(),
-                design.design.ncols()
-            );
-        }
-        Err(e) => {
-            panic!("design build failed: {e}");
-        }
-    }
+    let err = build_term_collection_design(data.view(), &spec)
+        .expect_err("the literal d=10, p=1, s=2 Duchon request is inadmissible");
+    let message = err.to_string();
+    assert!(
+        message.contains("pointwise kernel values require 2*(p+s) > dimension")
+            && message.contains("p=1")
+            && message.contains("s=2"),
+        "expected a direct spectral-admissibility diagnostic without power rewriting, got: {message}"
+    );
 }

@@ -524,9 +524,13 @@ pub struct FittedModelPayload {
     /// Populated under the SAME eligibility as `gaussian_jackknife_plus`
     /// (Gaussian-identity, unit prior weights, offset-free, no link wiggle). It
     /// persists the training design + response + frozen penalty `Sλ` so the
-    /// distribution-free EXACT prediction set (a union of intervals, valid for
+    /// prediction set that is exact GIVEN `Sλ` (a union of intervals, valid for
     /// any penalized smooth) can be replayed per test point — one Cholesky each,
-    /// zero refits — and surfaces the frozen-ρ certificate flag. `None` for any
+    /// zero refits. Because λ̂ was selected from all training responses, the
+    /// frozen-λ construction is not permutation symmetric in the augmented
+    /// points; the distribution-free finite-sample coverage theorem is asserted
+    /// only per row where the surfaced frozen-ρ certificate accepts (under the
+    /// global-ρ grid-Lipschitz assumption). `None` for any
     /// ineligible model or an older payload, in which case the exact-set predict
     /// path errors with a clear message and the caller uses jackknife+ or the
     /// posterior band. `#[serde(default)]` so pre-existing models deserialize as

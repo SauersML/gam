@@ -2255,9 +2255,12 @@ impl JackknifePlusInterval {
 /// data and a symmetric fitting map — no model correctness assumed.
 ///
 /// The CV+ variant is THIS SAME assembly fed with K-fold out-of-fold
-/// quantities (`μ̂₋ₖ₍ᵢ₎(x_*)` and `Rᵢ = |yᵢ − μ̂₋ₖ₍ᵢ₎(xᵢ)|`); the construction
-/// and the guarantee are identical (Barber et al. 2021, Thm 4), so no second
-/// code path exists to drift.
+/// quantities (`μ̂₋ₖ₍ᵢ₎(x_*)` and `Rᵢ = |yᵢ − μ̂₋ₖ₍ᵢ₎(xᵢ)|`), so no second code
+/// path exists to drift — but its GUARANTEE is weaker, not identical: K-fold
+/// folds do not have leave-one-out symmetry, and Barber et al. (2021, Thm 4)
+/// prove only `P(Y_* ∈ Ĉ_α) ≥ 1 − 2α − (1 − K/n)/(K + 1)` for CV+. The extra
+/// slack vanishes at K = n (where CV+ IS jackknife+); any CV+ caller must
+/// state that bound, not the jackknife+ one.
 pub fn jackknife_plus_interval(
     loo_test_predictions: &Array1<f64>,
     loo_abs_residuals: &Array1<f64>,

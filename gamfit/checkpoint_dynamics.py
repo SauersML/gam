@@ -1,21 +1,23 @@
-"""Cross-checkpoint Riesz-debiased SAE atom-trajectory dynamics (issue #1102).
+"""Cross-checkpoint descriptive SAE atom-trajectory dynamics (issue #1102).
 
 Thin wrapper over the Rust core ``gam::inference::checkpoint_dynamics``: all math
-(per-step Riesz-debiased decoder-displacement contrast, inter-checkpoint
-transport maps, anytime-valid change e-process) lives in Rust; this module only
-marshals numpy arrays across the FFI boundary.
+(per-step descriptive decoder change, inter-checkpoint transport maps) lives in
+Rust; this module only marshals numpy arrays across the FFI boundary.
 
 The setting: an SAE is fitted at each of several training checkpoints on the same
 prompts at a layer; every atom ``k`` has a decoder curve ``g_k^(c)(t)`` sampled
-on a shared latent grid. ``sae_checkpoint_dynamics`` answers, per atom, *did the
-atom change across training and by how much*, with debiased point estimates,
-standard errors, and anytime-valid evidence.
+on a shared latent grid. ``sae_checkpoint_dynamics`` answers, per atom, *how much
+did the atom's decoder move across training*, as plain measured displacement. The
+anytime-valid change e-process and the penalty-debiased Riesz contrast estimator
+were removed: a bare decoder grid does not supply the inputs a coverage-valid
+change certificate requires, so the readout is descriptive only — no e-values, no
+debiased contrasts, no confidence claim.
 
 Functions
 ---------
 sae_checkpoint_dynamics
-    Run the per-atom debiased cross-checkpoint dynamics and return one trajectory
-    per atom (step contrasts, transport maps, change-evidence certificate).
+    Run the per-atom descriptive cross-checkpoint dynamics and return one
+    trajectory per atom (descriptive step changes and transport maps).
 """
 
 from __future__ import annotations
@@ -32,10 +34,8 @@ def sae_checkpoint_dynamics(
     checkpoint_ids: Sequence[str],
     atom_names: Sequence[str],
     latent_grid: Any,
-    *,
-    alpha: float = 0.05,
 ) -> dict[str, Any]:
-    """Debiased atom trajectories across training checkpoints.
+    """Descriptive atom trajectories across training checkpoints.
 
     Parameters
     ----------
@@ -50,18 +50,18 @@ def sae_checkpoint_dynamics(
     latent_grid
         The shared 1-D latent grid the curves are sampled on (length
         ``n_grid``).
-    alpha
-        Level for the per-atom anytime-valid change-evidence e-BH certificate.
 
     Returns
     -------
     dict
-        ``{"trajectories": [ {"atom_name", "step_contrasts": [...],
-        "transports": [...], "change_evidence": {...}} ]}``. Each entry in
-        ``step_contrasts`` is a Riesz report with ``theta_plugin``,
-        ``theta_onestep``, ``se``, ``penalty_bias`` and a 95% ``ci_lo`` /
-        ``ci_hi``; ``change_evidence`` is the e-BH certificate of the atom's
-        no-change e-process at ``alpha``.
+        ``{"trajectories": [ {"atom_name", "descriptive_step_changes": [...],
+        "transports": [...]} ]}``. Each entry in ``descriptive_step_changes`` is
+        one consecutive-checkpoint step with ``checkpoint_from``,
+        ``checkpoint_to``, ``latent_coordinate`` (the most-moved grid point),
+        ``displacement_at_mode`` (the ambient displacement vector there),
+        ``l2_at_mode``, ``grid_rms_l2``, and ``grid_max_l2``. These are plain
+        measured decoder changes: NO e-values, NO debiased contrasts, and NO
+        coverage claim.
     """
     grid = np.ascontiguousarray(decoder_grid, dtype=np.float64)
     if grid.ndim != 4:
@@ -76,5 +76,4 @@ def sae_checkpoint_dynamics(
         [str(c) for c in checkpoint_ids],
         [str(a) for a in atom_names],
         latent,
-        float(alpha),
     )

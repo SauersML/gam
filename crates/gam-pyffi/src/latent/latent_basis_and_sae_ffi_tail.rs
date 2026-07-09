@@ -657,14 +657,10 @@ fn sae_manifold_fit_minimal<'py>(
 /// coordinates as distillation targets. `initial_logits` (N, K) and
 /// `initial_coords` (K, N, D_max) optionally warm-start the OOS refinement
 /// from an encoder's per-token prediction.
-// Owned-array core of the frozen-decoder OOS solve (#2091). Identical body to
-// the `sae_manifold_predict_oos` #[pyfunction] below, on borrowed ndarray views
-// instead of `PyReadonlyArray`, so both that pyfunction (Python-marshalled
-// arrays) and `ManifoldSaeCore::reconstruct`/`encode` (arrays read from the
-// Rust-owned model state) route through ONE rebuild+solve path and return the
-// identical payload dict. Keeps `py` to build the result dict in place.
-fn predict_oos_from_arrays<'py>(
-    py: Python<'py>,
+// Convert borrowed FFI arrays into the owned typed library request. This helper
+// performs wire parsing and ownership transfer only; validation, basis rebuild,
+// seeding, inference, projection, and reporting live in gam-sae.
+fn sae_oos_request_from_arrays(
     x_view: ndarray::ArrayView2<'_, f64>,
     atom_basis: Vec<String>,
     atom_dim: Vec<usize>,
@@ -675,694 +671,148 @@ fn predict_oos_from_arrays<'py>(
     alpha: f64,
     tau: f64,
     assignment_kind: String,
-    sparsity_strength: f64,
-    smoothness: f64,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
-    ridge_beta: f64,
     initial_logits: Option<ndarray::ArrayView2<'_, f64>>,
     initial_coords: Option<ndarray::ArrayView3<'_, f64>>,
     jumprelu_threshold: f64,
     top_k: Option<usize>,
-    // #1228/#1777 — the trained dictionary's hybrid-collapsed straight sub-models,
-    // one per verdict-linear d=1 slot, as `(atom_idx, t_bar, b0[p], b1[p], v)`.
-    // `v` is `Some([p])` (unit norm) EXACTLY for a #1026 collapse-rescued slot and
-    // `None` for an ordinary straight image. Attached to the OOS term so held-out
-    // reconstruction decodes those slots by the same linear image the training
-    // reconstruction used; a rescued slot recomputes each row's coordinate from its
-    // own leave-this-atom-out residual projected onto `v` (`try_fitted_target_aware`),
-    // so it reconstructs identically train vs held-out. `None`/empty ⇒ all-curved
-    // OOS reconstruction (the prior behaviour).
     hybrid_linear_images: Option<Vec<(usize, f64, Array1<f64>, Array1<f64>, Option<Array1<f64>>)>>,
-    // #2132 — the TRAINING fit's terminal REML-selected penalized-objective
-    // hyperparameters. The frozen-decoder OOS Newton solve descends the same
-    // penalized objective the training state converged under, so re-encoding
-    // the training rows warm-started at the trained state is (approximately) a
-    // fixed point. Historically the OOS solve rebuilt ρ from the INITIAL
-    // `sparsity_strength` / `smoothness` / zero ARD; that different objective
-    // pulled coordinates toward the chart origin and re-mixed the gates, so a
-    // warm start at the trained optimum decayed BELOW the cold start (the
-    // 0.75-native → 0.20-cold / 0.02-warm re-encode collapse). `None` keeps the
-    // legacy scalar fallback for callers without a trained ρ.
-    //   * `log_lambda_sparse` — terminal `ρ.log_lambda_sparse` (softmax entropy /
-    //     gated-L1 strength, or the learnable IBP log-α offset).
-    //   * `log_lambda_smooth` — terminal per-atom `ρ.log_lambda_smooth` (len K).
-    //     With the decoder frozen this term is constant in the optimized
-    //     variables, but it keeps the reported `oos_penalized_loss` on the same
-    //     scale as the training score.
-    //   * `log_ard` — terminal per-atom, per-axis ARD strengths (len K; entry
-    //     `k` has len `d_k`, or 0 when native ARD was off for that atom).
     log_lambda_sparse: Option<f64>,
     log_lambda_smooth: Option<Vec<f64>>,
     log_ard: Option<Vec<Vec<f64>>>,
-    // #2132 — whether the TRAINING fit's IBP-MAP concentration α was a learnable
-    // outer parameter. When true the OOS gate resolution reads the SAME
-    // `resolve_learnable_weight(alpha, ρ.log_lambda_sparse)` schedule the fit
-    // converged under (with the terminal `log_lambda_sparse` threaded above);
-    // `false` (default) keeps the historical fixed-α path. Ignored outside
-    // IBP-MAP mode.
     learnable_alpha: bool,
-) -> PyResult<Py<PyDict>> {
-    // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
-    let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
-    let (n_obs, p_out) = x_view.dim();
+) -> Result<gam::terms::sae::manifold::SaeOosRequest, String> {
     let k_atoms = atom_basis.len();
-    if n_obs == 0 || p_out == 0 {
-        return Err(py_value_error(format!(
-            "sae_manifold_predict_oos: x_new must be non-empty; got shape ({n_obs}, {p_out})"
-        )));
-    }
-    if k_atoms == 0 {
-        return Err(py_value_error(
-            "sae_manifold_predict_oos: atom_basis must be non-empty".into(),
-        ));
-    }
-    if !x_view.iter().all(|v| v.is_finite()) {
-        return Err(py_value_error(
-            "sae_manifold_predict_oos: x_new contains non-finite values".into(),
-        ));
-    }
     if atom_dim.len() != k_atoms
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
         || n_harmonics_list.len() != k_atoms
         || basis_size_list.len() != k_atoms
     {
-        return Err(py_value_error(format!(
+        return Err(format!(
             "sae_manifold_predict_oos: per-atom metadata lengths must equal K={k_atoms}"
-        )));
+        ));
     }
-    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
-        .iter()
-        .map(|kind| sae_atom_basis_kind_from_str(kind))
-        .collect();
-    let seed_coords =
-        gam::terms::sae::manifold::sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim)
-            .map_err(py_value_error)?;
-    let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        let kind = basis_kinds[atom_idx].clone();
-        let d = atom_dim[atom_idx];
-        match kind {
-            SaeAtomBasisKind::Periodic => {
-                // Periodic atoms are intrinsically 1-D (see comment in
-                // `sae_build_atom_plans`); the user-supplied `atom_dim` only
-                // ever selects the harmonic count when no explicit
-                // `n_harmonics_list[k]` is supplied. Force the optimizer
-                // latent dimension to 1 so the analytic harmonic evaluator
-                // remains live during OOS prediction.
-                let n_harmonics = n_harmonics_list[atom_idx].unwrap_or(d.max(1));
-                let basis_size = sae_periodic_basis_size(n_harmonics).map_err(py_value_error)?;
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Periodic,
-                    latent_dim: 1,
-                    n_harmonics,
-                    duchon_centers: None,
-                    basis_size,
-                });
-            }
-            SaeAtomBasisKind::Sphere => {
-                if d != 2 {
-                    return Err(py_value_error(format!(
-                        "sae_manifold_predict_oos: atom {atom_idx} basis 'sphere' requires atom_dim == 2, got {d}"
-                    )));
-                }
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Sphere,
-                    latent_dim: 2,
-                    n_harmonics: 0,
-                    duchon_centers: None,
-                    basis_size: SAE_SPHERE_BASIS_SIZE,
-                });
-            }
-            SaeAtomBasisKind::Torus => {
-                let h = n_harmonics_list[atom_idx].unwrap_or(SAE_DEFAULT_TORUS_HARMONICS);
-                let evaluator = TorusHarmonicEvaluator::new(d, h).map_err(py_value_error)?;
-                let basis_size = evaluator.basis_size();
-                plans.push(SaeAtomBuildPlan {
-                    kind: SaeAtomBasisKind::Torus,
-                    latent_dim: d,
-                    n_harmonics: h,
-                    duchon_centers: None,
-                    basis_size,
-                });
-            }
-            _ => {
-                let centers = duchon_centers[atom_idx]
-                    .as_ref()
-                    .ok_or_else(|| {
-                        py_value_error(format!(
-                            "sae_manifold_predict_oos: atom {atom_idx} (Duchon-like) needs duchon_centers"
-                        ))
-                    })?
-                    .clone();
-                let probe_pts = Array2::<f64>::zeros((1, d.max(1)));
-                let (phi, _jet, _penalty) = match kind {
-                    // #1221 — the linear atom and the euclidean (quadratic) patch
-                    // share the monomial OOS rebuild; the polynomial degree is
-                    // recovered from the TRAINED decoder block's row count `M`
-                    // against the centers' dimension, so a degree-1 linear decoder
-                    // (`M = d + 1`) rebuilds `{1, t}` and a degree-2 euclidean
-                    // decoder rebuilds `{1, t, t²}`, each bit-for-bit matching its
-                    // trained block width.
-                    SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch => {
-                        // #1132 bug 3: the monomial WIDTH of a Euclidean patch is
-                        // `monomial_exponents(dim, degree).len()` where `dim` is
-                        // the build dimension `sae_build_euclidean_atom_with_degree`
-                        // reads off `centers.ncols()` — NOT the user-facing
-                        // `atom_dim`. Recovering the degree from `(atom_dim,
-                        // basis_size_list)` while the build uses `centers.ncols()`
-                        // re-emits a different width when those two disagree (the
-                        // "decoder_blocks[0] has M=1 but rebuilt basis has M=3"
-                        // euclidean OOS reconstruct failure). Anchor the recovery
-                        // to the TRAINED decoder block's row count `M` against the
-                        // centers' own dimension so the rebuilt basis width matches
-                        // the decoder bit-for-bit and the M-consistency guard below
-                        // passes.
-                        let euclidean_dim = centers.ncols();
-                        let trained_m = decoder_blocks[atom_idx].nrows();
-                        let degree = sae_euclidean_degree_for_basis_size(euclidean_dim, trained_m)
-                            .map_err(py_value_error)?;
-                        sae_build_euclidean_atom_with_degree(
-                            probe_pts.view(),
-                            centers.view(),
-                            degree,
-                        )
-                        .map_err(py_value_error)?
-                    }
-                    _ => sae_build_duchon_atom(probe_pts.view(), centers.view())
-                        .map_err(py_value_error)?,
-                };
-                let basis_size = phi.ncols();
-                plans.push(SaeAtomBuildPlan {
-                    kind,
-                    latent_dim: d,
-                    n_harmonics: 0,
-                    duchon_centers: Some(centers),
-                    basis_size,
-                });
-            }
-        }
-    }
-    // Warm-start coordinates (issue #357): an amortized encoder's predicted
-    // per-token on-manifold `t` seeds the OOS Newton refinement. When absent
-    // the PCA seed of `x_new` is the cold start. Layout `(K, N, D_max)` with
-    // `D_max` covering every atom's `atom_dim`.
-    let start_coords: Array3<f64> = match &initial_coords {
-        Some(view) => {
-            let shape = view.shape();
-            if shape.len() != 3 {
-                return Err(py_value_error(
-                    "sae_manifold_predict_oos: initial_coords must be a rank-3 (K, N, D_max) array"
-                        .to_string(),
-                ));
-            }
-            if shape[0] != k_atoms || shape[1] != n_obs {
-                return Err(py_value_error(format!(
-                    "sae_manifold_predict_oos: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
-                )));
-            }
-            let max_dim = *shape.get(2).unwrap_or(&0);
-            for (atom_idx, &d) in atom_dim.iter().enumerate() {
-                if d > max_dim {
-                    return Err(py_value_error(format!(
-                        "sae_manifold_predict_oos: initial_coords D_max={max_dim} is too small for atom {atom_idx} atom_dim={d}"
-                    )));
-                }
-            }
-            if !view.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_manifold_predict_oos: initial_coords contains non-finite values".into(),
-                ));
-            }
-            view.to_owned()
-        }
-        None => seed_coords.clone(),
-    };
-    let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
-            .map_err(py_value_error)?;
-    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
-    // Pad trained decoder blocks into (K, M_max, p)
-    let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
-    for atom_idx in 0..k_atoms {
-        let block = decoder_blocks[atom_idx];
-        if block.ncols() != p_out {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] has p={} but x_new has p={p_out}",
-                block.ncols()
-            )));
-        }
-        if block.nrows() != basis_sizes[atom_idx] {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] has M={} but rebuilt basis has M={}; \
-                 atom_basis / atom_dim / n_harmonics_list / duchon_centers must match the trained design",
-                block.nrows(),
-                basis_sizes[atom_idx]
-            )));
-        }
-        if !block.iter().all(|v| v.is_finite()) {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: decoder_blocks[{atom_idx}] contains non-finite values"
-            )));
-        }
-        let m_k = basis_sizes[atom_idx];
-        decoder_coefficients
-            .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
-            .assign(&block.slice(s![0..m_k, 0..p_out]));
-    }
-    let logits_are_warm = initial_logits.is_some();
-    let initial_logits = match &initial_logits {
-        Some(view) => {
-            if view.dim() != (n_obs, k_atoms) {
-                return Err(py_value_error(format!(
-                    "sae_manifold_predict_oos: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
-                    view.dim()
-                )));
-            }
-            if !view.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_manifold_predict_oos: initial_logits contains non-finite values".into(),
-                ));
-            }
-            view.to_owned()
-        }
-        None => {
-            let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
-            if k_atoms == 1 && assignment_kind == "ibp_map" {
-                for row in 0..n_obs {
-                    logits[[row, 0]] = 4.0;
-                }
-            }
-            logits
+    let assignment = match assignment_kind.as_str() {
+        "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
+        "ibp_map" => gam::terms::sae::manifold::SaeOosAssignmentKind::IbpMap { learnable_alpha },
+        "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
+            threshold: jumprelu_threshold,
+        },
+        "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
+        _ => {
+            return Err(format!(
+                "sae_manifold_predict_oos: unsupported assignment kind {assignment_kind:?}"
+            ));
         }
     };
-    if let Some(k_top) = top_k {
-        if k_top == 0 || k_top > k_atoms {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
-            )));
-        }
-    }
-    for (name, value) in [
-        ("alpha", alpha),
-        ("tau", tau),
-        ("learning_rate", learning_rate),
-        ("ridge_ext_coord", ridge_ext_coord),
-        ("ridge_beta", ridge_beta),
-    ] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: {name} must be finite and positive; got {value}"
-            )));
-        }
-    }
-    if !sparsity_strength.is_finite() || sparsity_strength < 0.0 {
-        return Err(py_value_error(format!(
-            "sae_manifold_predict_oos: sparsity_strength must be finite and non-negative; got {sparsity_strength}"
-        )));
-    }
-    // Zero disables the term (#184 sparsity / #2090 smoothness): floor to a
-    // tiny positive sentinel so the log-rho parametrisation stays finite.
-    if !smoothness.is_finite() || smoothness < 0.0 {
-        return Err(py_value_error(format!(
-            "sae_manifold_predict_oos: smoothness must be finite and non-negative; got {smoothness}"
-        )));
-    }
-    const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
-    let sparsity_strength = if sparsity_strength == 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        sparsity_strength
-    };
-    let smoothness = if smoothness == 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        smoothness
-    };
-
-    let mode = match assignment_kind.as_str() {
-        "softmax" => AssignmentMode::softmax(tau),
-        // #2132 — carry the fit's learnable-α flag so a learnable-IBP fit's OOS
-        // gates resolve through the SAME α schedule
-        // (`resolve_learnable_weight(alpha, ρ.log_lambda_sparse)`, with the
-        // terminal `log_lambda_sparse` threaded below) the training gates used.
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
-        "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
-        "topk" => {
-            let k_top = top_k.ok_or_else(|| {
-                py_value_error(
-                    "sae_manifold_predict_oos: assignment_kind 'topk' requires the top_k \
-                     argument (the fixed per-row support size)"
-                        .to_string(),
-                )
-            })?;
-            AssignmentMode::top_k_support(k_top)
+    let regularization = match (log_lambda_sparse, log_lambda_smooth, log_ard) {
+        (Some(log_lambda_sparse), Some(log_lambda_smooth), Some(log_ard)) => {
+            gam::terms::sae::manifold::SaeOosRegularization {
+                log_lambda_sparse,
+                log_lambda_smooth,
+                log_ard,
+            }
         }
         _ => {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
-            )));
+            return Err(
+                "sae_manifold_predict_oos: terminal rho must provide log_lambda_sparse, \
+                 log_lambda_smooth, and log_ard together"
+                    .to_string(),
+            );
         }
     };
-    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
-    let mut coord_blocks = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        let d = effective_atom_dim[atom_idx];
-        coord_blocks.push(start_coords.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
-    }
-    let atom_centers: Vec<Option<Array2<f64>>> = plans
-        .iter()
-        .map(|plan| plan.duchon_centers.clone())
+    let atoms = (0..k_atoms)
+        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
+            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
+            latent_dim: atom_dim[atom_index],
+            decoder: decoder_blocks[atom_index].to_owned(),
+            centers: duchon_centers[atom_index].clone(),
+            n_harmonics: n_harmonics_list[atom_index],
+            basis_size: basis_size_list[atom_index],
+        })
         .collect();
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &effective_atom_dim,
-        &coord_blocks,
-        &atom_centers,
+    let hybrid_linear_images = match hybrid_linear_images {
+        Some(images) => images,
+        None => Vec::new(),
+    }
+    .into_iter()
+    .map(
+        |(atom_idx, t_bar, b0, b1, v)| gam::terms::sae::hybrid_split::AtomLinearImage {
+            atom_idx,
+            t_bar,
+            b0,
+            b1,
+            row_codes: None,
+            v,
+        },
     )
-    .map_err(py_value_error)?;
-    let mut term = term_from_padded_blocks_with_mode(
-        n_obs,
-        p_out,
-        &basis_kinds,
-        basis_values.view(),
-        basis_jacobian.view(),
-        &basis_sizes,
-        &effective_atom_dim,
-        decoder_coefficients.view(),
-        smooth_penalties.view(),
-        initial_logits.view(),
-        &coord_blocks,
-        mode,
-        &evaluators,
-    )
-    .map_err(py_value_error)?;
-    // #1228/#1777 — attach the trained dictionary's hybrid-collapsed straight images
-    // so this OOS term decodes verdict-linear `d = 1` slots by the same linear image
-    // the training reconstruction used. Ordinary straight slots decode at the atom's
-    // own coordinate; a #1026 COLLAPSE-RESCUED slot carries the serialized projection
-    // direction `v` and recomputes each held-out row's coordinate from its own
-    // leave-this-atom-out residual projected onto `v` (via `try_fitted_target_aware`
-    // below) — the SAME math the train per-row codes were built with, so a rescued
-    // atom reconstructs IDENTICALLY train vs held-out. `row_codes` stays `None` here
-    // (it is the train-only cached projection); `v` is the OOS-safe quantity and it
-    // regenerates each row's coordinate from THIS target. Before #1777 `v` was not
-    // serialized, so a rescued slot fell back to its own collapsed coordinate out of
-    // sample (a degraded, different model); it now transfers exactly.
-    if let Some(images) = hybrid_linear_images {
-        let images: Vec<gam::terms::sae::hybrid_split::AtomLinearImage> = images
-            .into_iter()
-            .map(
-                |(atom_idx, t_bar, b0, b1, v)| gam::terms::sae::hybrid_split::AtomLinearImage {
-                    atom_idx,
-                    t_bar,
-                    b0,
-                    b1,
-                    // `row_codes` is the TRAIN-only cached projection and is never
-                    // transported to OOS; a rescued row's coordinate is recomputed
-                    // from `v` and the held-out residual instead.
-                    row_codes: None,
-                    // `Some(v)` marks this a collapse-rescued image so
-                    // `try_fitted_target_aware` recomputes the coordinate from the
-                    // residual; `None` is the ordinary own-coordinate straight image.
-                    v,
-                },
-            )
-            .collect();
-        term.set_hybrid_linear_images(images)
-            .map_err(py_value_error)?;
-    }
-    // #1408/#1409 — fold the inference `top_k` cap into the OOS fixed-decoder
-    // encode: for Softmax the frozen-decoder Newton solve below then runs on the
-    // compact top-`k` row layout (htt/gt sized by the row's top-`k` atoms), so
-    // the encode cost tracks k_active rather than full `K`, and the subsequent
-    // top-`k` projection is a no-op at the optimum.
-    term.set_softmax_active_cap(top_k);
-    // Global decoder-projection coordinate seed (cold start only). With the
-    // decoder frozen, the exact OOS latent of each row is its projection onto
-    // the atom's image manifold, `argmin_t ‖x − Φ(t)·B‖²`. That objective is
-    // non-convex on the compact periodic / torus / sphere latents, so the
-    // PCA-`atan2` seed plus a few Newton steps lands many rows in the wrong
-    // basin and mis-routes them (negative R², near-uniform assignments). Seeding
-    // from a dense manifold grid puts every row in the correct basin before the
-    // residual-based softmax logit seed and the Newton refinement below. An
-    // explicit warm `initial_coords` (e.g. from an amortized encoder, issue
-    // #357) is respected as-is and not overwritten.
-    if initial_coords.is_none() {
-        term.seed_coords_by_decoder_projection(x_view, SAE_OOS_PROJECTION_GRID_RESOLUTION)
-            .map_err(py_value_error)?;
-    }
-    if !logits_are_warm && assignment_kind == "softmax" {
-        term.seed_oos_softmax_logits_from_projection_residuals(x_view, tau);
-    } else if !logits_are_warm && assignment_kind == "ibp_map" {
-        // #2132 — seed the IBP logits with the SAME resolved α the gate
-        // resolution below uses: a learnable-α fit resolves α through the
-        // terminal `log_lambda_sparse` (`resolve_learnable_weight`, the exact
-        // schedule `AssignmentMode::resolved_ibp_alpha` applies); a fixed-α fit
-        // keeps the supplied α. Seeding at the initial α while the gates read
-        // the learnable α would seed against a different prior schedule.
-        let seed_alpha = if learnable_alpha {
-            gam::terms::analytic_penalties::resolve_learnable_weight(
-                alpha,
-                log_lambda_sparse.unwrap_or_else(|| sparsity_strength.ln()),
-            )
-        } else {
-            alpha
-        };
-        term.seed_oos_ibp_logits_from_projected_decoder_lsq(x_view, tau, seed_alpha);
-    }
-    // #2132 — assemble the OOS ρ from the TRAINED terminal hyperparameters when
-    // supplied, so the frozen-decoder solve descends the SAME penalized
-    // objective the training state converged under (see the parameter docs
-    // above). Each `None` falls back to the legacy initial-scalar seed.
-    let log_ard_vec: Vec<Array1<f64>> = match &log_ard {
-        Some(list) => {
-            if list.len() != k_atoms {
-                return Err(py_value_error(format!(
-                    "sae_manifold_predict_oos: log_ard must have K={k_atoms} per-atom entries; got {}",
-                    list.len()
-                )));
-            }
-            let mut out = Vec::with_capacity(k_atoms);
-            for (atom_idx, entry) in list.iter().enumerate() {
-                let d = effective_atom_dim[atom_idx];
-                if !(entry.is_empty() || entry.len() == d) {
-                    return Err(py_value_error(format!(
-                        "sae_manifold_predict_oos: log_ard[{atom_idx}] must be empty (ARD off) or \
-                         have the atom's latent dimension {d}; got {}",
-                        entry.len()
-                    )));
-                }
-                if !entry.iter().all(|v| v.is_finite()) {
-                    return Err(py_value_error(format!(
-                        "sae_manifold_predict_oos: log_ard[{atom_idx}] contains non-finite values"
-                    )));
-                }
-                out.push(Array1::from(entry.clone()));
-            }
-            out
-        }
-        None => effective_atom_dim
-            .iter()
-            .map(|&d| Array1::<f64>::zeros(d))
-            .collect(),
-    };
-    if let Some(value) = log_lambda_sparse {
-        if !value.is_finite() {
-            return Err(py_value_error(format!(
-                "sae_manifold_predict_oos: log_lambda_sparse must be finite; got {value}"
-            )));
-        }
-    }
-    let log_lambda_sparse_value = log_lambda_sparse.unwrap_or_else(|| sparsity_strength.ln());
-    let mut rho = match log_lambda_smooth {
-        Some(per_atom) => {
-            if per_atom.len() != k_atoms {
-                return Err(py_value_error(format!(
-                    "sae_manifold_predict_oos: log_lambda_smooth must have K={k_atoms} entries; got {}",
-                    per_atom.len()
-                )));
-            }
-            if !per_atom.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_manifold_predict_oos: log_lambda_smooth contains non-finite values".into(),
-                ));
-            }
-            SaeManifoldRho::with_per_atom_smooth(log_lambda_sparse_value, per_atom, log_ard_vec)
-        }
-        None => SaeManifoldRho::new(log_lambda_sparse_value, smoothness.ln(), log_ard_vec),
-    };
-    let loss = term
-        .run_fixed_decoder_arrow_schur(
-            x_view,
-            &mut rho,
-            None,
-            max_iter,
-            learning_rate,
-            ridge_ext_coord,
-        )
-        .map_err(py_value_error)?;
+    .collect();
 
-    // Do NOT reseed the logits here. The pre-solve seed above puts each row in
-    // the right basin; `run_fixed_decoder_arrow_schur` then jointly optimizes
-    // the coords AND the assignment logits to convergence. Reseeding from
-    // projection residuals after the solve overwrote those converged logits, so
-    // the returned assignments were the residual-seed routing rather than the
-    // Newton solution the OOS path advertises (#1229). The returned assignments
-    // and fitted values must both be read at the converged state.
-    let mut assignments = term.assignment.assignments();
-    // #1777 — TARGET-AWARE reconstruction: identical to `term.fitted()` for curved
-    // and ordinary straight slots, but a collapse-rescued slot (whose attached image
-    // carries `v`) recomputes each held-out row's coordinate from THIS `x_view`'s
-    // leave-this-atom-out residual projected onto `v`, so it reconstructs identically
-    // train vs held-out. `None` ρ uses the persisted (converged) gates, matching the
-    // reconstruction `term.fitted()` produced.
-    let mut fitted = term
-        .try_fitted_target_aware(x_view, None)
-        .map_err(py_value_error)?;
-    if let Some(k_top) = top_k {
-        if k_top < k_atoms {
-            let renormalise = assignment_kind == "softmax";
-            for row in 0..n_obs {
-                let mut paired: Vec<(f64, usize)> = (0..k_atoms)
-                    .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
-                    .collect();
-                // #1409: select the top-`k_top` via an O(K) PARTIAL selection
-                // (`select_nth_unstable_by`) instead of a full O(K log K) sort,
-                // mirroring the train-side projection. Only the kept prefix
-                // matters; the comparator (value desc, then atom index asc) is the
-                // SAME total order the sort used, so the partition's first `k_top`
-                // elements are exactly the sorted top-`k_top` set (identical `keep`
-                // mask, including tie-breaking). With the compact softmax active
-                // cap engaged above this projection is a no-op at the optimum, but
-                // it still touches every row once, so the O(K) selection keeps the
-                // per-row cost off the full-`K` sort path at large `K`.
-                let cmp = |a: &(f64, usize), b: &(f64, usize)| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.1.cmp(&b.1))
-                };
-                // `k_top < k_atoms` holds in this block (guarded above), so
-                // `k_top - 1` is a valid pivot index.
-                paired.select_nth_unstable_by(k_top - 1, cmp);
-                let mut keep = vec![false; k_atoms];
-                for &(_, atom_idx) in paired.iter().take(k_top) {
-                    keep[atom_idx] = true;
-                }
-                if renormalise {
-                    let kept_sum: f64 = (0..k_atoms)
-                        .filter(|&atom_idx| keep[atom_idx])
-                        .map(|atom_idx| assignments[[row, atom_idx]])
-                        .sum();
-                    if !(kept_sum.is_finite() && kept_sum > 0.0) {
-                        return Err(py_value_error(format!(
-                            "sae_manifold_predict_oos: top_k softmax projection has non-positive kept mass on row {row}"
-                        )));
-                    }
-                    for atom_idx in 0..k_atoms {
-                        assignments[[row, atom_idx]] = if keep[atom_idx] {
-                            assignments[[row, atom_idx]] / kept_sum
-                        } else {
-                            0.0
-                        };
-                    }
-                } else {
-                    for atom_idx in 0..k_atoms {
-                        if !keep[atom_idx] {
-                            assignments[[row, atom_idx]] = 0.0;
-                        }
-                    }
-                }
-            }
-            // Recompute through the SHARED collapse-aware assembler so the OOS
-            // top-k projection composes with the #1026 hybrid collapse (#1233):
-            // when the trained dictionary's hybrid-collapsed linear images are
-            // attached to this OOS term (`set_hybrid_linear_images`, #1228), a
-            // verdict-linear slot decodes its straight sub-model image here too,
-            // matching the train-side reconstruction policy. With no images
-            // attached this is the curved reconstruction, identical to before.
-            fitted = term
-                .reconstruct_from_assignments(assignments.view(), true)
-                .map_err(py_value_error)?;
-        }
-    }
+    Ok(gam::terms::sae::manifold::SaeOosRequest {
+        target: x_view.to_owned(),
+        atoms,
+        assignment,
+        alpha,
+        tau,
+        regularization,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        initial_logits: initial_logits.map(|view| view.to_owned()),
+        initial_coords: initial_coords.map(|view| view.to_owned()),
+        top_k,
+        hybrid_linear_images,
+    })
+}
 
-    let log_ard_py = PyList::empty(py);
-    for atom_log_ard in &rho.log_ard {
-        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
-    }
+// Serialize the typed library report. No fit or inference decisions live here.
+fn sae_oos_report_to_pydict<'py>(
+    py: Python<'py>,
+    report: gam::terms::sae::manifold::SaeOosReport,
+) -> PyResult<Py<PyDict>> {
+    let chosen_k = report.active_mask.len();
     let atoms_py = PyList::empty(py);
-    let mut decoded_row = vec![0.0_f64; p_out];
-    for atom_idx in 0..k_atoms {
-        let atom = &term.atoms[atom_idx];
+    for atom in report.atoms {
         let atom_dict = PyDict::new(py);
-        atom_dict.set_item(
-            "decoder_B",
-            atom.decoder_coefficients.clone().into_pyarray(py),
-        )?;
-        atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
+        atom_dict.set_item("decoder_B", atom.decoder.into_pyarray(py))?;
+        atom_dict.set_item("basis_kind", sae_atom_basis_kind_name(&atom.basis_kind))?;
         atom_dict.set_item("basis_centers", py.None())?;
-        atom_dict.set_item(
-            "on_atom_coords_t",
-            term.assignment.coords[atom_idx]
-                .as_matrix()
-                .into_pyarray(py),
-        )?;
-        atom_dict.set_item(
-            "assignments_z",
-            assignments.column(atom_idx).to_owned().into_pyarray(py),
-        )?;
-        atom_dict.set_item("active_dim", effective_atom_dim[atom_idx])?;
-        // #1777 — this atom's UNGATED decoded image `Φ(t)·B` in data space,
-        // `(n_obs, p_out)`, evaluated at each row's converged on-manifold coordinate
-        // via the SAME per-atom decode `fill_decoded_row` the reconstruction assembler
-        // uses. This backs `ManifoldSAE.atom_reconstruct(X, atom_k)` (a single atom's
-        // reconstruction in data space); the full reconstruction is the
-        // assignment-weighted sum `Σ_k a_k · atom_reconstruction_k`.
-        let mut atom_recon = Array2::<f64>::zeros((n_obs, p_out));
-        for row in 0..n_obs {
-            term.atoms[atom_idx].fill_decoded_row(row, &mut decoded_row);
-            for out_col in 0..p_out {
-                atom_recon[[row, out_col]] = decoded_row[out_col];
-            }
-        }
-        atom_dict.set_item("atom_reconstruction", atom_recon.into_pyarray(py))?;
+        atom_dict.set_item("on_atom_coords_t", atom.coords.into_pyarray(py))?;
+        atom_dict.set_item("assignments_z", atom.assignments.into_pyarray(py))?;
+        atom_dict.set_item("active_dim", atom.active_dim)?;
+        atom_dict.set_item("atom_reconstruction", atom.reconstruction.into_pyarray(py))?;
         atoms_py.append(atom_dict)?;
     }
+    let log_ard_py = PyList::empty(py);
+    for atom_log_ard in &report.rho.log_ard {
+        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
+    }
 
-    let active_mask: Vec<bool> = (0..k_atoms)
-        .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
-        .collect();
     let out = PyDict::new(py);
     out.set_item("atoms", atoms_py)?;
-    out.set_item("assignments_z", assignments.into_pyarray(py))?;
-    out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
-    out.set_item("atom_active_mask", active_mask)?;
-    out.set_item("fitted", fitted.into_pyarray(py))?;
-    // #1231 — fixed-decoder OOS path: this is the penalized reconstruction loss
-    // of held-out data under the frozen decoder, NOT a frozen-decoder evidence
-    // criterion, so it is surfaced as `oos_penalized_loss` (with a breakdown),
-    // never `reml_score`.
-    sae_set_penalized_loss_items(&out, &loss, "oos_penalized_loss")?;
-    out.set_item("log_alpha", alpha.ln())?;
-    out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
+    out.set_item("assignments_z", report.assignments.into_pyarray(py))?;
+    out.set_item("logits", report.logits.into_pyarray(py))?;
+    out.set_item("atom_active_mask", report.active_mask)?;
+    out.set_item("fitted", report.fitted.into_pyarray(py))?;
+    sae_set_penalized_loss_items(&out, &report.loss, "oos_penalized_loss")?;
+    out.set_item("log_alpha", report.alpha.ln())?;
+    out.set_item("log_lambda_smooth", report.rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
-    out.set_item("assignment_prior", assignment_kind)?;
+    out.set_item("assignment_prior", report.assignment_kind)?;
     out.set_item(
         "solver_plan",
-        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+        sae_streaming_plan_to_pydict(py, report.streaming_plan)?,
     )?;
-    out.set_item("chosen_k", k_atoms)?;
+    out.set_item("chosen_k", chosen_k)?;
     Ok(out.unbind())
 }
 
-/// FFI surface for the frozen-decoder out-of-sample solve: thin marshalling over
-/// the shared [`predict_oos_from_arrays`] rebuild+solve (#2091). Converts its
-/// Python-marshalled arrays to views and delegates; behaviour is byte-for-byte
-/// unchanged from the pre-extraction pyfunction.
+/// FFI surface for the frozen-decoder out-of-sample solve. The binding only
+/// marshals arrays into [`SaeOosRequest`](gam::terms::sae::manifold::SaeOosRequest),
+/// calls the typed gam-sae entry, and serializes its report (#2236).
 #[pyfunction(signature = (
     x_new,
     atom_basis,
@@ -1374,12 +824,9 @@ fn predict_oos_from_arrays<'py>(
     alpha,
     tau,
     assignment_kind,
-    sparsity_strength = 1.0,
-    smoothness = 1.0,
     max_iter = 50,
     learning_rate = 0.04,
     ridge_ext_coord = 1.0e-6,
-    ridge_beta = 1.0e-6,
     initial_logits = None,
     initial_coords = None,
     jumprelu_threshold = 0.0,
@@ -1402,12 +849,9 @@ fn sae_manifold_predict_oos<'py>(
     alpha: f64,
     tau: f64,
     assignment_kind: String,
-    sparsity_strength: f64,
-    smoothness: f64,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
-    ridge_beta: f64,
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     jumprelu_threshold: f64,
@@ -1448,8 +892,7 @@ fn sae_manifold_predict_oos<'py>(
             })
             .collect()
     });
-    predict_oos_from_arrays(
-        py,
+    let request = sae_oos_request_from_arrays(
         x_new.as_array(),
         atom_basis,
         atom_dim,
@@ -1460,12 +903,9 @@ fn sae_manifold_predict_oos<'py>(
         alpha,
         tau,
         assignment_kind,
-        sparsity_strength,
-        smoothness,
         max_iter,
         learning_rate,
         ridge_ext_coord,
-        ridge_beta,
         initial_logits_view,
         initial_coords_view,
         jumprelu_threshold,
@@ -1476,6 +916,10 @@ fn sae_manifold_predict_oos<'py>(
         log_ard,
         learnable_alpha,
     )
+    .map_err(py_value_error)?;
+    let report =
+        gam::terms::sae::manifold::run_sae_manifold_oos(request).map_err(py_value_error)?;
+    sae_oos_report_to_pydict(py, report)
 }
 
 /// (#1010) A frozen-dictionary Kantorovich-certified encode atlas, exposed to

@@ -2167,6 +2167,297 @@ impl SaeBasisThirdJet for CylinderHarmonicEvaluator {
     }
 }
 
+/// Möbius-band harmonic basis on the DOUBLE-COVER chart (#2240).
+///
+/// The band is charted by `(s, w)` with `s ∈ [0, 2)` an angle on the
+/// double-cover circle (period 2) and `w ∈ [-1, 1]` the width coordinate. The
+/// deck transformation of the double cover is `σ(s, w) = (s + 1, -w)`; the
+/// Möbius band is the quotient, and functions on the band are exactly the
+/// σ-invariant functions on the cylinder cover. With the tensor harmonics
+/// `T_k(s)·w^m` (`T_k ∈ {cos(πks), sin(πks)}`, period-2 modes), invariance is
+/// `(-1)^{k+m} = 1`, so the basis keeps exactly the columns with `k + m`
+/// EVEN: `(k even, m even) ∪ (k odd, m odd)`.
+///
+/// This gives the band its defining behavior with NO new manifold machinery:
+/// the optimizer retracts on an ordinary smooth cylinder (`Circle{period 2} ×
+/// Interval[-1, 1]`), every basis column is C^∞ there, and a point and its
+/// deck-twin `(s+1, -w)` produce IDENTICAL basis rows — the half-twist lives
+/// in the parity culling, not in a seam. Odd-`m` (width-odd) structure is
+/// forced to carry a half-period angular factor, which is precisely the
+/// non-orientability a torus or flat-patch chart cannot express.
+#[derive(Debug, Clone)]
+pub struct MobiusHarmonicEvaluator {
+    /// Circle harmonics `H ≥ 1` on the double-cover angle (mode `k ≤ H`).
+    pub circle_harmonics: usize,
+    /// Width monomial degree `D ≥ 1` (`w^m`, `m ≤ D`).
+    pub width_degree: usize,
+    /// Admitted `(circle_col, width_power)` pairs (deck-invariant columns),
+    /// circle-column-slow / width-power-fast, fixed at construction.
+    columns: Vec<(usize, usize)>,
+}
+
+impl MobiusHarmonicEvaluator {
+    pub fn new(circle_harmonics: usize, width_degree: usize) -> Result<Self, String> {
+        if circle_harmonics == 0 {
+            return Err(
+                "MobiusHarmonicEvaluator requires circle_harmonics >= 1 (the band core needs \
+                 at least the half-period harmonic pair)"
+                    .to_string(),
+            );
+        }
+        if width_degree == 0 {
+            return Err(
+                "MobiusHarmonicEvaluator requires width_degree >= 1: with no width-odd \
+                 columns the deck-invariant basis degenerates to a plain circle"
+                    .to_string(),
+            );
+        }
+        let mc = 2 * circle_harmonics + 1;
+        let mut columns = Vec::new();
+        for c in 0..mc {
+            let k = Self::circle_mode(c);
+            for m in 0..=width_degree {
+                if (k + m) % 2 == 0 {
+                    columns.push((c, m));
+                }
+            }
+        }
+        Ok(Self {
+            circle_harmonics,
+            width_degree,
+            columns,
+        })
+    }
+
+    /// Angular mode `k` of circle column `c` (col 0 = constant, cols
+    /// `2h-1`/`2h` = the sin/cos pair of mode `h`).
+    fn circle_mode(c: usize) -> usize {
+        c.div_ceil(2)
+    }
+
+    pub fn basis_size(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Circle derivative tables on the DOUBLE-COVER angle, orders 0..=3:
+    /// mode `k` has frequency `ω = πk` (period 2), so odd modes are the
+    /// half-period harmonics the quotient demands.
+    fn circle_tables(&self, s: f64) -> [Vec<f64>; 4] {
+        let mc = 2 * self.circle_harmonics + 1;
+        let pi = std::f64::consts::PI;
+        let mut table = [
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+            vec![0.0_f64; mc],
+        ];
+        table[0][0] = 1.0;
+        for h in 1..=self.circle_harmonics {
+            let omega = pi * (h as f64);
+            let w2 = omega * omega;
+            let w3 = w2 * omega;
+            let angle = omega * s;
+            let sv = angle.sin();
+            let cv = angle.cos();
+            let s_idx = 2 * h - 1;
+            let c_idx = 2 * h;
+            table[0][s_idx] = sv;
+            table[1][s_idx] = omega * cv;
+            table[2][s_idx] = -w2 * sv;
+            table[3][s_idx] = -w3 * cv;
+            table[0][c_idx] = cv;
+            table[1][c_idx] = -omega * sv;
+            table[2][c_idx] = -w2 * cv;
+            table[3][c_idx] = w3 * sv;
+        }
+        table
+    }
+
+    /// Width (monomial) derivative tables on `[-1, 1]`, orders 0..=3.
+    fn width_tables(&self, w: f64) -> [Vec<f64>; 4] {
+        let mw = self.width_degree + 1;
+        let mut table = [
+            vec![0.0_f64; mw],
+            vec![0.0_f64; mw],
+            vec![0.0_f64; mw],
+            vec![0.0_f64; mw],
+        ];
+        for j in 0..mw {
+            for k in 0..4 {
+                if k > j {
+                    table[k][j] = 0.0;
+                    continue;
+                }
+                let mut coeff = 1.0_f64;
+                for q in 0..k {
+                    coeff *= (j - q) as f64;
+                }
+                let residual = j - k;
+                let pow = if residual == 0 {
+                    1.0
+                } else {
+                    w.powi(residual as i32)
+                };
+                table[k][j] = coeff * pow;
+            }
+        }
+        table
+    }
+
+    /// Analytic seed roughness Gram `S = Sc ⊗ Gw + Gc ⊗ Sw` restricted to the
+    /// admitted deck-invariant columns. On the double-cover measure
+    /// `[0, 2) × [-1, 1]` the circle Grams are diagonal (`∫₀² 1 = 2`,
+    /// `∫₀² sin²(πks) = ∫₀² cos²(πks) = 1`, all cross terms vanish over the
+    /// full period; the second derivative scales a mode by `(πk)²`), and the
+    /// width Grams are the even-moment tables `∫₋₁¹ w^{i+j} dw`
+    /// (`= 2/(i+j+1)` for `i+j` even, `0` odd). The constant column sits in
+    /// the null space exactly as the smooth-penalty nullity recovery expects.
+    pub fn roughness_gram(&self) -> Array2<f64> {
+        let pi = std::f64::consts::PI;
+        let m = self.columns.len();
+        let moment = |exp: usize| -> f64 {
+            if exp % 2 == 0 {
+                2.0 / ((exp + 1) as f64)
+            } else {
+                0.0
+            }
+        };
+        let mut s = Array2::<f64>::zeros((m, m));
+        for (row, &(c_a, m_a)) in self.columns.iter().enumerate() {
+            for (col, &(c_b, m_b)) in self.columns.iter().enumerate() {
+                if c_a != c_b {
+                    // Distinct circle columns are orthogonal in BOTH circle
+                    // Grams over the full double-cover period.
+                    continue;
+                }
+                let k = Self::circle_mode(c_a) as f64;
+                let gc = if c_a == 0 { 2.0 } else { 1.0 };
+                let sc = if c_a == 0 { 0.0 } else { (pi * k).powi(4) * 1.0 };
+                let gw = moment(m_a + m_b);
+                let sw = if m_a >= 2 && m_b >= 2 {
+                    ((m_a * (m_a - 1)) as f64)
+                        * ((m_b * (m_b - 1)) as f64)
+                        * moment(m_a + m_b - 4)
+                } else {
+                    0.0
+                };
+                s[[row, col]] = sc * gw + gc * sw;
+            }
+        }
+        s
+    }
+
+    fn check_coords(&self, coords: ArrayView2<'_, f64>, what: &str) -> Result<(), String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "MobiusHarmonicEvaluator::{what}: expected latent_dim == 2 (double-cover \
+                 angle × width), got {}",
+                coords.ncols()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SaeBasisEvaluator for MobiusHarmonicEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let expected = self.basis_size();
+        if n_basis != expected {
+            return Err(format!(
+                "MobiusHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {expected}"
+            ));
+        }
+        // Base (η-invariant) block: the constant, the half-period first
+        // harmonic pair crossed with the affine width — the band's core
+        // embedding. Higher angular modes (k ≥ 2) or width curvature (m ≥ 2)
+        // are the η-dialed refinement, mirroring the cylinder's split.
+        let curved = self
+            .columns
+            .iter()
+            .map(|&(c, m)| Self::circle_mode(c) >= 2 || m >= 2)
+            .collect::<Vec<_>>();
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
+    /// The parity culling breaks the clean tensor-product factorization, so
+    /// the Möbius basis does not expose per-axis factor sizes.
+    fn factor_basis_sizes(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        self.check_coords(coords, "evaluate")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 2));
+        for row in 0..n {
+            let circ = self.circle_tables(coords[[row, 0]]);
+            let width = self.width_tables(coords[[row, 1]]);
+            for (col, &(c, wm)) in self.columns.iter().enumerate() {
+                phi[[row, col]] = circ[0][c] * width[0][wm];
+                jet[[row, col, 0]] = circ[1][c] * width[0][wm];
+                jet[[row, col, 1]] = circ[0][c] * width[1][wm];
+            }
+        }
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for MobiusHarmonicEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        self.check_coords(coords, "second_jet")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut h = Array4::<f64>::zeros((n, m, 2, 2));
+        for row in 0..n {
+            let circ = self.circle_tables(coords[[row, 0]]);
+            let width = self.width_tables(coords[[row, 1]]);
+            for (col, &(c, wm)) in self.columns.iter().enumerate() {
+                h[[row, col, 0, 0]] = circ[2][c] * width[0][wm];
+                h[[row, col, 1, 1]] = circ[0][c] * width[2][wm];
+                let mixed = circ[1][c] * width[1][wm];
+                h[[row, col, 0, 1]] = mixed;
+                h[[row, col, 1, 0]] = mixed;
+            }
+        }
+        Ok(h)
+    }
+}
+
+impl SaeBasisThirdJet for MobiusHarmonicEvaluator {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        self.check_coords(coords, "third_jet")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut t3 = Array5::<f64>::zeros((n, m, 2, 2, 2));
+        for row in 0..n {
+            let circ = self.circle_tables(coords[[row, 0]]);
+            let width = self.width_tables(coords[[row, 1]]);
+            for (col, &(c, wm)) in self.columns.iter().enumerate() {
+                for a in 0..2 {
+                    for b in 0..2 {
+                        for e in 0..2 {
+                            let k0 = (a == 0) as usize + (b == 0) as usize + (e == 0) as usize;
+                            let k1 = 3 - k0;
+                            t3[[row, col, a, b, e]] = circ[k0][c] * width[k1][wm];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(t3)
+    }
+}
+
 /// Rank-revealing subspace reparametrization of an inner basis evaluator.
 ///
 /// Issue #1117: a decoder basis (e.g. [`PeriodicHarmonicEvaluator`]) emits a

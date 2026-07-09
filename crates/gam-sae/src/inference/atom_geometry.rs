@@ -456,6 +456,10 @@ fn ideal_curve_dim(kind: &SaeAtomBasisKind, latent_dim: usize, m: usize, p: usiz
         SaeAtomBasisKind::Sphere => d + 1.0,
         // S¹ × ℝ: a circle plane (2) tensored with a flat line (1).
         SaeAtomBasisKind::Cylinder => 2.0 + (d - 1.0).max(0.0),
+        // A Möbius band is intrinsically two-dimensional but cannot embed in
+        // the plane without self-intersection; its natural smooth ambient
+        // dimension is three.
+        SaeAtomBasisKind::Mobius => 3.0,
         // Flat / polynomial patches: one ambient direction per latent axis.
         SaeAtomBasisKind::Linear
         | SaeAtomBasisKind::EuclideanPatch
@@ -480,6 +484,7 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Sphere => "sphere".to_string(),
         SaeAtomBasisKind::Torus => "torus".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
+        SaeAtomBasisKind::Mobius => "mobius".to_string(),
         SaeAtomBasisKind::Linear => "linear".to_string(),
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
@@ -494,7 +499,13 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
 fn topology_is_curved(topology: &str) -> bool {
     matches!(
         topology,
-        "periodic" | "sphere" | "torus" | "cylinder" | "poincare" | "duchon"
+        "periodic"
+            | "sphere"
+            | "torus"
+            | "cylinder"
+            | "mobius"
+            | "poincare"
+            | "duchon"
     )
 }
 

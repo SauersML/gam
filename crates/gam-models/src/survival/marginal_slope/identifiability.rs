@@ -30,23 +30,16 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
+use faer::Side;
 use gam_identifiability::families::compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use gam_problem::gauge::assemble_block_triangular_t;
-use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
+use gam_problem::gauge::assemble_block_triangular_t;
 use gam_problem::{FamilyChannelHessian, PenaltyMatrix};
 
 const K_SURVIVAL: usize = 4;
-
-/// Threshold below which a coefficient vector is treated as the trivial
-/// (all-zero) pilot point in the drift-detection audit. At β ≈ 0 the
-/// primary-state coupling g vanishes (c ≡ 1), so the frozen pilot W is exact;
-/// any |β_j| above this is "non-trivial" and requires the family scalars to
-/// re-evaluate W(β). The bound is well below any meaningful fitted coefficient.
-const BETA_NONTRIVIAL_ABS_THRESHOLD: f64 = 1e-12;
 
 /// Per-row 4×4 row Hessian for the survival marginal-slope likelihood at a
 /// pilot `β`. The pilot supplies the primary-state vector
@@ -58,6 +51,13 @@ pub struct SurvivalRowHessian {
     /// PSD-projected per-row 4×4 Hessian, stored row-major as
     /// `(n × 4 × 4)`.
     h: Array3<f64>,
+    /// Immutable row data needed to refresh `h` exactly at a new primary
+    /// state. These must not be replaced by unit weights/events: censoring and
+    /// observation weights change the channel curvature and therefore the
+    /// identifiability certificate.
+    weights: Array1<f64>,
+    event: Array1<f64>,
+    derivative_guard: f64,
 }
 
 impl SurvivalRowHessian {
@@ -100,41 +100,47 @@ impl SurvivalRowHessian {
         }
         let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
         for i in 0..n {
-            let (_, _grad, hess) =
-                crate::survival::marginal_slope::row_primary_for_compiler(
-                    q0[i],
-                    q1[i],
-                    qd1[i],
-                    g[i],
-                    z[i],
-                    weights[i],
-                    event[i],
-                    derivative_guard,
-                    probit_scale,
-                )?;
-            // PSD-clamp via eigendecomposition: project negative eigvals to 0.
-            let mut h_i = Array2::<f64>::zeros((K_SURVIVAL, K_SURVIVAL));
-            for a in 0..K_SURVIVAL {
-                for b in 0..K_SURVIVAL {
-                    h_i[[a, b]] = hess[a][b];
-                }
-            }
-            let clamped = psd_clamp_4x4(&h_i);
+            let clamped = evaluated_psd_row_hessian(
+                q0[i],
+                q1[i],
+                qd1[i],
+                g[i],
+                z[i],
+                weights[i],
+                event[i],
+                derivative_guard,
+                probit_scale,
+            )
+            .map_err(|reason| format!("SurvivalRowHessian: row {i}: {reason}"))?;
             for a in 0..K_SURVIVAL {
                 for b in 0..K_SURVIVAL {
                     h_full[[i, a, b]] = clamped[[a, b]];
                 }
             }
         }
-        Ok(Self { h: h_full })
+        Ok(Self {
+            h: h_full,
+            weights: weights.clone(),
+            event: event.clone(),
+            derivative_guard,
+        })
     }
 
-    /// Construct from an already-PSD per-row tensor. Used by callers that
-    /// have computed the Hessian via a different route.
-    pub fn from_full(h: Array3<f64>) -> Self {
+    /// Construct a synthetic tensor-backed Hessian for compiler unit tests.
+    /// Production instances must retain their real row data so a later
+    /// `channel_hessian_at` refresh is exact.
+    #[cfg(test)]
+    fn from_full(h: Array3<f64>) -> Self {
         assert_eq!(h.shape()[1], K_SURVIVAL);
         assert_eq!(h.shape()[2], K_SURVIVAL);
-        Self { h }
+        let n = h.shape()[0];
+        Self {
+            h,
+            weights: Array1::ones(n),
+            event: Array1::ones(n),
+            derivative_guard:
+                crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        }
     }
 }
 
@@ -188,9 +194,9 @@ impl RowHessian for SurvivalRowHessian {
 /// This makes `I(β) = J(β)^T W(β) J(β)` accurate at the current β instead of
 /// at the frozen pilot β=0 state.
 ///
-/// When `family_scalars` is `None` but `beta` is zero-ish (all entries ≤ ε),
-/// the frozen pilot W is returned unchanged.  When `family_scalars` is `None`
-/// and any `beta` entry is non-trivial, `Err` is returned — the caller must
+/// When `family_scalars` is `None` and `beta` is exactly zero, the frozen pilot
+/// W is returned unchanged. When `family_scalars` is `None` and any `beta`
+/// entry is non-zero, `Err` is returned — the caller must
 /// supply scalars for a correct W at non-pilot β (same contract as T26's
 /// Jacobian callbacks: scalars required when β affects the primary state).
 impl FamilyChannelHessian for SurvivalRowHessian {
@@ -222,13 +228,31 @@ impl FamilyChannelHessian for SurvivalRowHessian {
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
         use crate::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
 
-        let scalars_opt =
-            family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
+        if beta.iter().any(|b| !b.is_finite()) {
+            return Err(
+                "SurvivalRowHessian::channel_hessian_at: beta contains a non-finite value"
+                    .to_string(),
+            );
+        }
+        if beta.is_empty() && family_scalars.is_some() {
+            return Err(
+                "SurvivalRowHessian::channel_hessian_at: family_scalars supplied but beta is empty"
+                    .to_string(),
+            );
+        }
+        let scalars_opt = match family_scalars {
+            None => None,
+            Some(scalars) => Some(
+                scalars
+                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+                    .ok_or_else(|| {
+                        "SurvivalRowHessian::channel_hessian_at: family_scalars has the wrong type; expected SurvivalMarginalSlopeFamilyScalars"
+                            .to_string()
+                    })?,
+            ),
+        };
 
-        // Determine whether beta is non-trivial (any |β_j| > ε).
-        let beta_nontrivial = beta
-            .iter()
-            .any(|&b| b.abs() > BETA_NONTRIVIAL_ABS_THRESHOLD);
+        let beta_nontrivial = beta.iter().any(|&b| b != 0.0);
 
         match scalars_opt {
             None if beta_nontrivial => {
@@ -243,7 +267,7 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                 )
             }
             None => {
-                // β ≈ 0: return the frozen pilot W unchanged.
+                // β = 0: return the exact stored pilot W unchanged.
                 Ok(Arc::new(gam_problem::TensorChannelHessian {
                     h: self.h.clone(),
                 }))
@@ -266,84 +290,83 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                         sc.z_i.len(),
                     ));
                 }
-                // We do not have weights/event stored in SurvivalRowHessian itself.
-                // The scalars carry the per-row primary state; we need per-row weights
-                // and event indicators to call row_primary_for_compiler.  Those are
-                // NOT stored in SurvivalMarginalSlopeFamilyScalars — so we can only
-                // recompute W's structural shape (the 4×4 curvature geometry) using
-                // unit weights and event=1, which gives us the correct _direction_ of
-                // W at the current β even if the magnitude is off by the sample weight.
-                //
-                // For the drift-detection audit the direction matters more than the
-                // exact per-row magnitudes: rank changes emerge from structural
-                // identifiability, not from per-row weight scaling. Using w=1, d=1
-                // is therefore the principled approximation for the audit path.
-                //
-                // Production callers that need exact W (e.g. for the Fisher Gram in
-                // the compiler) should use SurvivalRowHessian::from_pilot_primary_state
-                // directly with the true per-row weights and event indicators.
                 let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
                 for i in 0..n {
-                    let q0 = sc.q0_i[i];
-                    let q1 = sc.q1_i[i];
-                    let qd1 = sc.qd1_i[i];
-                    let g = sc.g_i[i];
-                    let z = sc.z_i[i];
-                    // Use unit weight and d=1 (event indicator 1) for the audit path.
-                    // The derivative_guard is the family default (small but non-zero).
-                    match crate::survival::marginal_slope::row_primary_for_compiler(
-                        q0, q1, qd1, g, z, 1.0,  // w = unit weight
-                        1.0,  // d = event
-                        crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-                        sc.s, // probit_scale from scalars
-                    ) {
-                        Ok((_nll, _grad, hess)) => {
-                            let mut h_i = ndarray::Array2::<f64>::zeros((K_SURVIVAL, K_SURVIVAL));
-                            for a in 0..K_SURVIVAL {
-                                for b in 0..K_SURVIVAL {
-                                    h_i[[a, b]] = hess[a][b];
-                                }
-                            }
-                            let clamped = psd_clamp_4x4(&h_i);
-                            for a in 0..K_SURVIVAL {
-                                for b in 0..K_SURVIVAL {
-                                    h_full[[i, a, b]] = clamped[[a, b]];
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // Monotonicity violation or other numerical issue at this
-                            // row: fall back to the frozen pilot W for this row only.
-                            for a in 0..K_SURVIVAL {
-                                for b in 0..K_SURVIVAL {
-                                    h_full[[i, a, b]] = self.h[[i, a, b]];
-                                }
-                            }
+                    let clamped = evaluated_psd_row_hessian(
+                        sc.q0_i[i],
+                        sc.q1_i[i],
+                        sc.qd1_i[i],
+                        sc.g_i[i],
+                        sc.z_i[i],
+                        self.weights[i],
+                        self.event[i],
+                        self.derivative_guard,
+                        sc.s,
+                    )
+                    .map_err(|reason| {
+                        format!("SurvivalRowHessian::channel_hessian_at: row {i}: {reason}")
+                    })?;
+                    for a in 0..K_SURVIVAL {
+                        for b in 0..K_SURVIVAL {
+                            h_full[[i, a, b]] = clamped[[a, b]];
                         }
                     }
                 }
-                Ok(Arc::new(SurvivalRowHessian::from_full(h_full)))
+                Ok(Arc::new(gam_problem::TensorChannelHessian { h: h_full }))
             }
         }
     }
 }
 
-/// Project a 4×4 symmetric matrix onto the PSD cone: zero negative
-/// eigenvalues. If the eigendecomposition fails (extremely defensive —
-/// `row_primary_closed_form` already guarantees finite entries), return
-/// the diagonal with negatives clamped.
-fn psd_clamp_4x4(m: &Array2<f64>) -> Array2<f64> {
-    let k = m.nrows();
-    let (evals, evecs) = match m.eigh(Side::Lower) {
-        Ok(pair) => pair,
-        Err(_) => {
-            let mut out = Array2::<f64>::zeros((k, k));
-            for i in 0..k {
-                out[[i, i]] = m[[i, i]].max(0.0);
-            }
-            return out;
+fn evaluated_psd_row_hessian(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z: f64,
+    weight: f64,
+    event: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<Array2<f64>, String> {
+    let (_, _grad, hess) = crate::survival::marginal_slope::row_primary_for_compiler(
+        q0,
+        q1,
+        qd1,
+        g,
+        z,
+        weight,
+        event,
+        derivative_guard,
+        probit_scale,
+    )?;
+    let mut h_i = Array2::<f64>::zeros((K_SURVIVAL, K_SURVIVAL));
+    for a in 0..K_SURVIVAL {
+        for b in 0..K_SURVIVAL {
+            h_i[[a, b]] = hess[a][b];
         }
-    };
+    }
+    psd_clamp_4x4(&h_i)
+}
+
+/// Project a 4×4 symmetric matrix onto the PSD cone by zeroing negative
+/// eigenvalues. A failed decomposition is an invalid curvature certificate,
+/// so it is reported instead of being replaced by unrelated diagonal data.
+fn psd_clamp_4x4(m: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let k = m.nrows();
+    if m.dim() != (K_SURVIVAL, K_SURVIVAL) {
+        return Err(format!(
+            "survival row Hessian must be {K_SURVIVAL}x{K_SURVIVAL}, got {}x{}",
+            m.nrows(),
+            m.ncols(),
+        ));
+    }
+    if m.iter().any(|v| !v.is_finite()) {
+        return Err("survival row Hessian contains a non-finite entry".to_string());
+    }
+    let (evals, evecs) = m
+        .eigh(Side::Lower)
+        .map_err(|_| "survival row Hessian symmetric eigendecomposition failed".to_string())?;
     let mut out = Array2::<f64>::zeros((k, k));
     for i in 0..k {
         for j in 0..k {
@@ -354,7 +377,7 @@ fn psd_clamp_4x4(m: &Array2<f64>) -> Array2<f64> {
             out[[i, j]] = acc;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Row Jacobian operator for the survival time block. Channels (q0, q1,
@@ -714,10 +737,9 @@ pub fn compile_survival_parametric_designs_per_term(
     } else {
         Vec::new()
     };
-    let compiled =
-        compile_protected(&operators, row_hess, &ordering, &protected).map_err(|e| {
-            format!("identifiability::families::compiler::compile (per-term) failed: {e}")
-        })?;
+    let compiled = compile_protected(&operators, row_hess, &ordering, &protected).map_err(|e| {
+        format!("identifiability::families::compiler::compile (per-term) failed: {e}")
+    })?;
     let blocks = compiled.blocks;
     let n_marg = marginal_partition.len();
     let n_log = logslope_partition.len();
@@ -1543,7 +1565,7 @@ mod tests {
         m[[1, 1]] = -1.0;
         m[[2, 2]] = 0.5;
         m[[3, 3]] = -0.25;
-        let clamped = psd_clamp_4x4(&m);
+        let clamped = psd_clamp_4x4(&m).expect("finite 4x4 eigendecomposition must succeed");
         assert!((clamped[[0, 0]] - 2.0).abs() < 1e-12);
         assert!(clamped[[1, 1]].abs() < 1e-12);
         assert!((clamped[[2, 2]] - 0.5).abs() < 1e-12);
@@ -2555,9 +2577,8 @@ mod tests {
         let row_hess = const_row_hess_q0g(n, 2.0, 2.0, 2.0);
         let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
         let log = marg.clone();
-        let out =
-            survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
-                .expect("contraction must succeed");
+        let out = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+            .expect("contraction must succeed");
         assert!(
             out.is_none(),
             "a fully marginal-explained logslope column reduces to nothing → keep raw"
@@ -2575,10 +2596,12 @@ mod tests {
         let log =
             Array2::from_shape_vec((n, 2), vec![1.0, 10.0, 1.0, -10.0, 1.0, 10.0, 1.0, -10.0])
                 .unwrap();
-        let out =
-            survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
-                .expect("contraction must succeed");
-        assert!(out.is_none(), "W-orthogonal channels need no reduction → keep raw");
+        let out = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+            .expect("contraction must succeed");
+        assert!(
+            out.is_none(),
+            "W-orthogonal channels need no reduction → keep raw"
+        );
     }
 
     #[test]
@@ -2606,7 +2629,10 @@ mod tests {
         for i in 0..p_marg {
             for j in 0..p_marg {
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((t[[p_time + i, p_time + j]] - want).abs() < 1e-14, "V_marg[{i},{j}]");
+                assert!(
+                    (t[[p_time + i, p_time + j]] - want).abs() < 1e-14,
+                    "V_marg[{i},{j}]"
+                );
             }
         }
         // V_log = t_log.
@@ -2621,6 +2647,9 @@ mod tests {
         // No cross-block bleed: the only nonzeros are the two identities and the
         // t_log block (every t_log entry here is nonzero).
         let nnz = t.iter().filter(|&&v| v != 0.0).count();
-        assert_eq!(nnz, p_time + p_marg + t_log.iter().filter(|&&v| v != 0.0).count());
+        assert_eq!(
+            nnz,
+            p_time + p_marg + t_log.iter().filter(|&&v| v != 0.0).count()
+        );
     }
 }

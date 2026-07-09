@@ -202,6 +202,11 @@ fn margslope_duchon_above_cliff() {
         "margslope Duchon fit produced no coefficient blocks"
     );
     assert!(
+        out.fit.outer_converged,
+        "margslope Duchon fit returned without an outer convergence certificate; outer_iterations={} inner_cycles={}",
+        out.fit.outer_iterations, out.fit.inner_cycles,
+    );
+    assert!(
         out.fit
             .blocks
             .iter()

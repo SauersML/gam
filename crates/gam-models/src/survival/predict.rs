@@ -1207,10 +1207,24 @@ pub fn predict_competing_risks_survival(
     let (refined_times, user_time_to_refined_index): (Vec<f64>, Vec<usize>) = if per_row_eval {
         (Vec::new(), Vec::new())
     } else {
+        // The user grid may arrive in any order (and contain duplicates); the
+        // AJ recurrence is a time-ordered prefix integral, so the refinement
+        // walks the SORTED times and maps every user position back to its
+        // refined index. Walking an unsorted grid directly is not merely
+        // inaccurate: a decreasing grid produces negative gaps, skips the
+        // fill, and silently maps later user times onto the wrong refined
+        // column (e.g. grid [2, 1] returned the t=2 CIF for both queries).
+        let mut order: Vec<usize> = (0..eval_times.len()).collect();
+        order.sort_by(|&a, &b| {
+            eval_times[a]
+                .partial_cmp(&eval_times[b])
+                .expect("survival time_grid entries are validated finite above")
+        });
         let mut refined: Vec<f64> = Vec::new();
-        let mut user_index: Vec<usize> = Vec::with_capacity(eval_times.len());
+        let mut user_index: Vec<usize> = vec![0; eval_times.len()];
         let mut prev = 0.0_f64;
-        for &t_user in &eval_times {
+        for &j_user in &order {
+            let t_user = eval_times[j_user];
             // Insert CIF_REFINE_SUBINTERVALS-1 strictly-interior points in
             // (prev, t_user], landing exactly on t_user as the last point. Skip
             // the interior fill for a zero-length gap (duplicate / origin user
@@ -1228,12 +1242,18 @@ pub fn predict_competing_risks_survival(
             if refined.last().is_none_or(|&last| t_user > last) {
                 refined.push(t_user);
             }
-            user_index.push(refined.len() - 1);
+            user_index[j_user] = refined.len() - 1;
             prev = t_user;
         }
         (refined, user_index)
     };
-    let refined_cols = refined_times.len();
+    // Per-row eval integrates each row's CIF on its own refined [0, age_exit]
+    // subdivision (normalized-fraction grid; see the assembly step below).
+    let refined_cols = if per_row_eval {
+        CIF_REFINE_SUBINTERVALS
+    } else {
+        refined_times.len()
+    };
 
     let saved_timewiggle_by_cause = saved_cause_specific_timewiggles(model, &fit, cause_count)?;
     let cov_rows = (0..n)
@@ -1328,6 +1348,26 @@ pub fn predict_competing_risks_survival(
                 out.hazard[0] = haz_t;
                 out.cumulative[0] = cum_t;
                 out.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
+                // Cause-specific cumulative hazards on this row's refined
+                // [0, age_exit] subdivision for the time-ordered AJ assembly.
+                // A single-interval assembly splits the CIF by ENDPOINT
+                // cumulative-hazard proportions, which is exact only when the
+                // cause-specific hazard ratio is constant in time; the CIF is
+                // the time-ordered integral ∫ S(u−) dH_k(u) (gam#1385).
+                for s in 1..=CIF_REFINE_SUBINTERVALS {
+                    let frac = (s as f64) / (CIF_REFINE_SUBINTERVALS as f64);
+                    let t_query = age_exit[i] * frac;
+                    out.cumulative_refined[s - 1] = if t_query <= 0.0 {
+                        0.0
+                    } else if s == CIF_REFINE_SUBINTERVALS {
+                        // frac == 1 exactly: reuse the exit evaluation so the
+                        // assembled CIF and the reported cumulative hazard
+                        // agree to the bit.
+                        cum_t
+                    } else {
+                        evaluate_at(t_query)?.1
+                    };
+                }
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
                     // Mirror the single-cause origin guard: every subject is
@@ -1380,11 +1420,39 @@ pub fn predict_competing_risks_survival(
 
     // Assemble the Aalen-Johansen CIF on the refined grid (gam#1385), then read
     // the result back at the user-requested times so the CIF is grid-resolution
-    // independent. Per-row eval keeps the single-anchor assembly path.
+    // independent.
     let assembled = if per_row_eval {
-        let assembly_times = Array1::from_elem(1, 0.0);
-        assemble_competing_risks_cif_from_endpoints(assembly_times.view(), &cumulative_hazard)
-            .map_err(|err| err.to_string())?
+        // Each row was integrated on its own normalized subdivision
+        // t = age_exit·s/K. The AJ recurrence consumes only the time-ORDERED
+        // cumulative-hazard values (the time stamps enter validation, never
+        // the arithmetic), so a shared fraction grid s/K is an exact
+        // parameterization of every row's [0, age_exit]; the row's CIF at its
+        // exit time is the final column.
+        let assembly_times = Array1::from_shape_fn(CIF_REFINE_SUBINTERVALS, |s| {
+            ((s + 1) as f64) / (CIF_REFINE_SUBINTERVALS as f64)
+        });
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+            assembly_times.view(),
+            &cumulative_hazard_refined,
+        )
+        .map_err(|err| err.to_string())?;
+        let last = CIF_REFINE_SUBINTERVALS - 1;
+        let mut cif_user = (0..cause_count)
+            .map(|_| Array2::<f64>::zeros((n, 1)))
+            .collect::<Vec<_>>();
+        let mut overall_user = Array2::<f64>::zeros((n, 1));
+        for cause in 0..cause_count {
+            for row in 0..n {
+                cif_user[cause][[row, 0]] = refined_assembled.cif[cause][[row, last]];
+            }
+        }
+        for row in 0..n {
+            overall_user[[row, 0]] = refined_assembled.overall_survival[[row, last]];
+        }
+        CompetingRisksCifResult {
+            cif: cif_user,
+            overall_survival: overall_user,
+        }
     } else {
         let assembly_times = Array1::from_vec(refined_times.clone());
         let refined_assembled = assemble_competing_risks_cif_from_endpoints(

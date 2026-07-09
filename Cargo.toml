@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.148"
+version = "0.3.149"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -90,30 +90,30 @@ libm = "0.2.16"
 # registry versions. The exact `=` pin keeps the family lock-stepped: a given
 # `gam` release only ever builds against the foundation crates it was compiled
 # against (their cross-crate surface is internal and unstable).
-gam-data = { path = "crates/gam-data", version = "=0.3.148" }
-gam-math = { path = "crates/gam-math", version = "=0.3.148" }
-gam-problem = { path = "crates/gam-problem", version = "=0.3.148" }
-gam-spec = { path = "crates/gam-spec", version = "=0.3.148" }
-gam-runtime = { path = "crates/gam-runtime", version = "=0.3.148" }
-gam-linalg = { path = "crates/gam-linalg", version = "=0.3.148" }
-gam-geometry = { path = "crates/gam-geometry", version = "=0.3.148" }
-gam-gpu = { path = "crates/gam-gpu", version = "=0.3.148" }
-gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.148" }
-gam-terms = { path = "crates/gam-terms", version = "=0.3.148" }
-gam-solve = { path = "crates/gam-solve", version = "=0.3.148" }
-gam-models = { path = "crates/gam-models", version = "=0.3.148" }
-gam-inference = { path = "crates/gam-inference", version = "=0.3.148" }
-gam-predict = { path = "crates/gam-predict", version = "=0.3.148" }
-gam-report = { path = "crates/gam-report", version = "=0.3.148" }
-gam-config = { path = "crates/gam-config", version = "=0.3.148" }
-gam-sae = { path = "crates/gam-sae", version = "=0.3.148" }
+gam-data = { path = "crates/gam-data", version = "=0.3.149" }
+gam-math = { path = "crates/gam-math", version = "=0.3.149" }
+gam-problem = { path = "crates/gam-problem", version = "=0.3.149" }
+gam-spec = { path = "crates/gam-spec", version = "=0.3.149" }
+gam-runtime = { path = "crates/gam-runtime", version = "=0.3.149" }
+gam-linalg = { path = "crates/gam-linalg", version = "=0.3.149" }
+gam-geometry = { path = "crates/gam-geometry", version = "=0.3.149" }
+gam-gpu = { path = "crates/gam-gpu", version = "=0.3.149" }
+gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.149" }
+gam-terms = { path = "crates/gam-terms", version = "=0.3.149" }
+gam-solve = { path = "crates/gam-solve", version = "=0.3.149" }
+gam-models = { path = "crates/gam-models", version = "=0.3.149" }
+gam-inference = { path = "crates/gam-inference", version = "=0.3.149" }
+gam-predict = { path = "crates/gam-predict", version = "=0.3.149" }
+gam-report = { path = "crates/gam-report", version = "=0.3.149" }
+gam-config = { path = "crates/gam-config", version = "=0.3.149" }
+gam-sae = { path = "crates/gam-sae", version = "=0.3.149" }
 # Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 # harnesses) carved into their own crate under #1521 so the workspace's other
 # crates can reach them cross-crate from their `#[cfg(test)]` modules. The root
 # `gam` crate re-exports it as `gam::test_support` (and re-exports its
 # `#[macro_export]` macros) so the integration tests under `tests/` keep their
 # `gam::test_support::*` / `gam::gam_binary!` paths unchanged.
-gam-test-support = { path = "crates/gam-test-support", version = "=0.3.148" }
+gam-test-support = { path = "crates/gam-test-support", version = "=0.3.149" }
 wide = "0.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]

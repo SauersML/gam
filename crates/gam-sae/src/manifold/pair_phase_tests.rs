@@ -244,7 +244,13 @@ fn screen_all_pairs_ebh_selects_only_locked_pair() {
         axis_candidate(p, 2, 3, &active), // 1: torus factor B
         axis_candidate(p, 4, 5, &active), // 2: torus factor C
     ];
-    let verdicts = screen_all_pairs_phase(data.view(), &mean, &cands, 50, 0xEB, 0.05).unwrap();
+    // Budget: the ledger is m = 3 pairs × 3 channels = 9 entries, so an e-BH
+    // discovery at α = 0.05 needs a permutation e-value ≥ m/α = 180. The valid
+    // indicator e-value reaches only B + 1, so B must satisfy B + 1 ≥ 180; use
+    // B = 600 for headroom (e_max = 601), well above the impossible former B = 50
+    // (e_max = 51 < 180, the finding-22 defect).
+    let b = 600usize;
+    let verdicts = screen_all_pairs_phase(data.view(), &mean, &cands, b, 0xEB, 0.05).unwrap();
     let proposed: Vec<(usize, usize)> = verdicts
         .iter()
         .filter(|v| v.torus_proposed)
@@ -254,7 +260,7 @@ fn screen_all_pairs_ebh_selects_only_locked_pair() {
     assert_eq!(proposed, vec![(1, 2)], "only the phase-locked B–C pair may be proposed");
 
     // The proposal producer emits exactly the {1,2} binding Fusion move.
-    let moves = phase_fusion_moves(data.view(), &mean, &cands, 50, 0xEB, 0.05).unwrap();
+    let moves = phase_fusion_moves(data.view(), &mean, &cands, b, 0xEB, 0.05).unwrap();
     eprintln!("[e-BH ledger] fusion moves = {moves:?}");
     assert!(
         moves
@@ -397,11 +403,12 @@ fn ebh_rejects_dominant_e_value() {
     assert!(ebh_reject(&flat, 0.05).is_empty());
 }
 
-/// The independence certificate (dual of fusion): a TRUE independent product of
-/// circles certifies as separated (no residual coupling), while a phase-coupled
-/// pair breaks the certificate and names itself as the residual coupling.
+/// The pairwise phase-coupling screen (dual of fusion): a TRUE independent product
+/// of circles yields NO detected coupling (absence of a discovery, not a proof of
+/// independence), while a phase-coupled pair produces an e-BH discovery that names
+/// itself as the residual coupling.
 #[test]
-fn independence_certificate_passes_on_product_fails_on_coupling() {
+fn phase_coupling_screen_clean_on_product_fires_on_coupling() {
     let mut s = 0x21_11_u64;
     let n = 2000usize;
     let p = 8usize;
@@ -423,15 +430,19 @@ fn independence_certificate_passes_on_product_fails_on_coupling() {
     let cands: Vec<IsaPlaneCandidate> = (0..3)
         .map(|c| axis_candidate(p, 2 * c, 2 * c + 1, &active))
         .collect();
-    let cert = certify_pairwise_independence(indep.view(), &mean, &cands, 80, 0xC0, 0.05).unwrap();
+    // Budget: m = 3 pairs × 3 channels = 9 entries ⇒ an e-BH discovery needs a
+    // permutation e-value ≥ m/α = 180, and the valid indicator e-value reaches
+    // B + 1, so B + 1 ≥ 180. Use B = 600 (e_max = 601) for headroom.
+    let b = 600usize;
+    let cert = screen_pairwise_phase_coupling(indep.view(), &mean, &cands, b, 0xC0, 0.05).unwrap();
     eprintln!(
-        "[independence] separated={} residual={}",
-        cert.separated,
+        "[phase screen] no_coupling_detected={} residual={}",
+        cert.no_coupling_detected,
         cert.residual_couplings.len()
     );
     assert!(
-        cert.separated && cert.residual_couplings.is_empty(),
-        "an independent product must certify separated; residual={:?}",
+        cert.no_coupling_detected && cert.residual_couplings.is_empty(),
+        "an independent product must yield no detected coupling; residual={:?}",
         cert.residual_couplings
     );
 
@@ -453,17 +464,20 @@ fn independence_certificate_passes_on_product_fails_on_coupling() {
         }
     }
     let cert2 =
-        certify_pairwise_independence(coupled.view(), &mean, &cands, 80, 0xC1, 0.05).unwrap();
+        screen_pairwise_phase_coupling(coupled.view(), &mean, &cands, b, 0xC1, 0.05).unwrap();
     eprintln!(
-        "[independence coupled] separated={} residual={:?}",
-        cert2.separated,
+        "[phase screen coupled] no_coupling_detected={} residual={:?}",
+        cert2.no_coupling_detected,
         cert2
             .residual_couplings
             .iter()
             .map(|r| (r.atom_a, r.atom_b, r.channel.as_str()))
             .collect::<Vec<_>>()
     );
-    assert!(!cert2.separated, "a phase-coupled pair must break the certificate");
+    assert!(
+        !cert2.no_coupling_detected,
+        "a phase-coupled pair must produce an e-BH discovery"
+    );
     assert!(
         cert2
             .residual_couplings

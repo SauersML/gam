@@ -96,11 +96,13 @@ fn sae_select_k(
     Ok(out.into())
 }
 
-#[pyfunction(signature = (manifold_points, linear_points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_auto_k_recommendation(
     py: Python<'_>,
     manifold_points: Vec<(usize, f64)>,
     linear_points: Vec<(usize, f64)>,
+    manifold_params_per_atom: f64,
+    linear_params_per_atom: f64,
     mode: &str,
     knee_slope_fraction: f64,
     complexity_penalty: f64,
@@ -119,7 +121,18 @@ fn sae_auto_k_recommendation(
         // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
         measured_coding: None,
     };
-    let rec = gam::terms::sae::k_selection::recommend_auto_k(&manifold, &linear, &config);
+    // The manifold-vs-linear advantage is now measured in DECODER PARAMETERS, not
+    // atom count: a manifold atom stores `basis_size·p` scalars, a linear atom
+    // `p`, so `efficiency_ratio` is the parameter ratio `linear_params /
+    // manifold_params` and only exceeds 1 when the manifold reaches the target EV
+    // with fewer stored scalars.
+    let rec = gam::terms::sae::k_selection::recommend_auto_k(
+        &manifold,
+        &linear,
+        &config,
+        manifold_params_per_atom,
+        linear_params_per_atom,
+    );
     let out = PyDict::new(py);
     out.set_item("k", rec.selection.k)?;
     out.set_item("ev", rec.selection.ev)?;
@@ -129,36 +142,127 @@ fn sae_auto_k_recommendation(
     out.set_item("target_ev", rec.advantage.target_ev)?;
     out.set_item("manifold_k", rec.advantage.k_manifold)?;
     out.set_item("linear_k", rec.advantage.k_linear)?;
+    out.set_item("manifold_params", rec.advantage.manifold_params)?;
+    out.set_item("linear_params", rec.advantage.linear_params)?;
     out.set_item("efficiency_ratio", rec.advantage.compression_ratio)?;
     out.set_item("confirmed", rec.advantage.manifold_dominates())?;
     Ok(out.into())
 }
 
+/// Per-atom coordinate signal-variance spectrum: the eigenvalues of the coded
+/// chart coordinates' population covariance. This is the Gaussian-source variance
+/// spectrum the reverse-water-filling code rate is defined over, mirroring the
+/// block-chart MDL scorer's `coordinate_spectrum` (same mean-centred covariance,
+/// same `jacobi_eigh`, zeros clamped, descending). One eigenvalue per coded
+/// coordinate axis.
+fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64> {
+    let n = coords.nrows();
+    let d = coords.ncols();
+    if d == 0 || n == 0 {
+        return vec![0.0; d];
+    }
+    let mut means = vec![0.0f64; d];
+    for j in 0..d {
+        for i in 0..n {
+            means[j] += coords[[i, j]];
+        }
+        means[j] /= n as f64;
+    }
+    let mut cov = vec![0.0f64; d * d];
+    for i in 0..n {
+        for a in 0..d {
+            let va = coords[[i, a]] - means[a];
+            for b in 0..d {
+                cov[a * d + b] += va * (coords[[i, b]] - means[b]);
+            }
+        }
+    }
+    for v in &mut cov {
+        *v /= n as f64;
+    }
+    let mut vals = vec![0.0f64; d];
+    let mut vecs = vec![0.0f64; d * d];
+    gam::terms::sae::gpu_kernels::sae_encode_resident::jacobi_eigh(&cov, d, &mut vals, &mut vecs);
+    let mut spectrum: Vec<f64> = vals.into_iter().map(|v| v.max(0.0)).collect();
+    spectrum.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    spectrum
+}
+
 /// Fit-level bits/token description length of a manifold-SAE reconstruction.
 ///
 /// The headline currency the results.md postmortem argues for: the whole fit's
-/// code length per token, decomposed into code / selection / dictionary bits,
-/// computed from the fit's own summary quantities (achieved EV, active-atom
-/// count, coordinate dim, dictionary size, decoder scalar count). Every math
-/// term is owned by `description_length::manifold_fit_description_length`; this
-/// only marshals scalars in and the decomposition out.
-#[pyfunction(signature = (ev, n_tokens, k_active, coord_dim, g_dict, n_params, l_param_bits = None))]
-fn sae_manifold_description_length(
-    py: Python<'_>,
+/// code length per token, decomposed into code / selection / dictionary bits.
+/// The valid accounting reads the fit's own empirical byproducts rather than
+/// pre-summarised scalars: `assignments` `(N, K)` is binarised into the empirical
+/// support matrix (an atom is coded for a token when its gate magnitude clears
+/// `active_threshold`), so SELECTION is priced by the support-entropy universal
+/// code and a maximally-spread row pays its true high support cost; `coords` is
+/// the per-atom `(N, d_k)` chart coordinates, whose per-atom covariance
+/// eigen-spectra are the per-coordinate variances the latent CODE rate reverse-
+/// water-fills at the achieved distortion `(1 − ev)·Σ var`; the code term is
+/// firing-weighted by each atom's coded dim `d_k`. Every math term is owned by
+/// `description_length::manifold_fit_description_length`; this marshals the
+/// support/spectrum in and the decomposition out.
+#[pyfunction(signature = (assignments, coords, ev, n_params, l_param_bits = None, active_threshold = 1.0e-8))]
+fn sae_manifold_description_length<'py>(
+    py: Python<'py>,
+    assignments: PyReadonlyArray2<'py, f64>,
+    coords: Vec<PyReadonlyArray2<'py, f64>>,
     ev: f64,
-    n_tokens: i64,
-    k_active: f64,
-    coord_dim: f64,
-    g_dict: i64,
     n_params: i64,
     l_param_bits: Option<f64>,
+    active_threshold: f64,
 ) -> PyResult<PyObject> {
+    let assignments = assignments.as_array();
+    let (n_obs, k_atoms) = assignments.dim();
+    if coords.len() != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_description_length: expected {k_atoms} coordinate blocks \
+             (one per atom), got {}",
+            coords.len()
+        )));
+    }
+    // Per-coordinate signal-variance spectrum + coded dim per atom, from the
+    // fitted chart coordinates.
+    let mut coord_variances: Vec<f64> = Vec::new();
+    let mut atom_coord_dims: Vec<f64> = Vec::with_capacity(k_atoms);
+    for (k, block) in coords.iter().enumerate() {
+        let c = block.as_array();
+        if c.nrows() != n_obs {
+            return Err(py_value_error(format!(
+                "sae_manifold_description_length: coords[{k}] has {} rows but assignments \
+                 have {n_obs}",
+                c.nrows()
+            )));
+        }
+        atom_coord_dims.push(c.ncols() as f64);
+        coord_variances.extend(coordinate_variance_spectrum(c));
+    }
+    // Achieved coordinate coding distortion: the fit's residual fraction of the
+    // total coordinate signal variance `(1 − ev)·Σ var`, matching the
+    // per-featurizer `Featurizer::residual`. `1 − ev` is floored away from zero so
+    // a saturated fit reports a large finite rate, not +∞.
+    let total_var: f64 = coord_variances.iter().sum();
+    let delta2 = (1.0 - ev).max(1.0e-12) * total_var;
+    // Empirical binary support matrix: an atom is coded for a token when its gate
+    // magnitude clears the numerical-dust floor. Reads the TRUE recorded support
+    // per token (sparse gate families stay sparse; a maximally-spread softmax row
+    // is priced at its true high support cost) instead of a rounded-mean count.
+    let mut codes = gam::terms::sae::atom_codes::SparseAtomCodes::empty(n_obs, k_atoms);
+    for n in 0..n_obs {
+        for k in 0..k_atoms {
+            let gate = assignments[[n, k]];
+            if gate.is_finite() && gate.abs() > active_threshold {
+                codes.row_mut(n).assign(k, gate);
+            }
+        }
+    }
     let dl = gam::terms::sae::description_length::manifold_fit_description_length(
+        &codes,
+        &coord_variances,
+        delta2,
+        &atom_coord_dims,
         ev,
-        n_tokens,
-        k_active,
-        coord_dim,
-        g_dict,
         n_params,
         l_param_bits,
     );
@@ -8351,15 +8455,14 @@ fn predict_table_jackknife_plus_impl(
     // Plug-in mean (= beta-hat @ x_star for the Gaussian-identity model); we
     // read it from the stored stats' beta directly to avoid touching the
     // predictor stack.
-    // The jackknife+ construction of Barber et al. (2021) carries the
-    // *worst-case* guarantee P(Y_* ∈ Ĉ_α) ≥ 1 − 2α, but the set built at
-    // parameter α delivers ~1 − α marginal coverage in practice (the factor-of-two
-    // is a loose lower bound, not the realized coverage). Conflating the two
-    // over-covers: setting α = (1 − conformal_level) / 2 yields ~ (1 + level) / 2
-    // coverage (95% at level=0.9), not the advertised level. To deliver ~level
-    // marginal coverage, set α = 1 − conformal_level, matching the
-    // full-conformal path below (#1546).
-    let alpha = 1.0 - conformal_level;
+    // The jackknife+ theorem (Barber et al. 2021) guarantees
+    // P(Y_* ∈ Ĉ_α) ≥ 1 − 2α. The advertised finite-sample coverage is
+    // `conformal_level`, so the parameter must be α = (1 − level)/2: running
+    // at α = 1 − level would deliver a certified floor of only 1 − 2(1−level)
+    // (80% at level=0.9), overstating the guarantee by a factor of two. The
+    // interval is often conservative in practice — that is the honest price
+    // of a distribution-free finite-sample statement.
+    let alpha = (1.0 - conformal_level) / 2.0;
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
@@ -8391,16 +8494,22 @@ fn predict_table_jackknife_plus_impl(
     .map_err(|err| format!("failed to serialize jackknife+ prediction payload: {err}"))
 }
 
-/// #1098 EXACT Gaussian full-conformal prediction set — no calibration fold.
+/// #1098 Gaussian full-conformal prediction set at frozen `Sλ` — no
+/// calibration fold.
 ///
 /// Reads the `ExactFullConformalSubstrate` precomputed at fit time (only
 /// available for Gaussian-identity, unit-weight, offset-free models without a
 /// link wiggle), rebuilds the test design from the saved `resolved_termspec`,
 /// and calls `substrate.interval(x_*, alpha)` per test row — one Cholesky each,
-/// zero refits. The exact set is a union of intervals; the returned
-/// `mean_lower`/`mean_upper` are its outer envelope (a superset, inheriting the
-/// finite-sample coverage). A `frozen_rho_certified` column reports the Layer-3
-/// self-diagnostic per row (1.0 accepted / 0.0 refused).
+/// zero refits. The set is exact *given the frozen penalty*; because the fitted
+/// λ̂ was selected from all training responses, the frozen-λ score construction
+/// is not permutation symmetric in the n+1 augmented points, so the
+/// distribution-free finite-sample coverage theorem applies only where the
+/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, under
+/// the global-ρ grid-Lipschitz assumption); a 0.0 row is the frozen-λ
+/// approximation with no finite-sample guarantee. The exact set is a union of
+/// intervals; the returned `mean_lower`/`mean_upper` are its outer envelope (a
+/// superset).
 ///
 /// `alpha = 1 − conformal_level` (the full-conformal set `C_α` has marginal
 /// coverage `≥ 1 − α`, so `conformal_level = 1 − α` directly; unlike jackknife+
@@ -8465,9 +8574,11 @@ fn predict_table_full_conformal_impl(
             substrate.p()
         ));
     }
-    // The full-conformal set C_α covers Y_* with marginal probability ≥ 1 − α,
-    // so the user's conformal_level maps directly to α = 1 − conformal_level
-    // (no factor-of-two as in the jackknife+ ≥ 1 − 2α guarantee).
+    // A symmetric full-conformal set C_α covers Y_* with marginal probability
+    // ≥ 1 − α, so the user's conformal_level maps directly to
+    // α = 1 − conformal_level (no factor-of-two as in the jackknife+
+    // ≥ 1 − 2α guarantee). At frozen λ̂ that theorem is conditional on the
+    // per-row frozen-ρ certificate — see the function doc.
     let alpha = 1.0 - conformal_level;
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
@@ -8503,22 +8614,27 @@ fn predict_table_full_conformal_impl(
         model_class: prediction_model_class_label(&model),
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
-            "exact full-conformal (distribution-free, finite-sample ≥{:.0}% coverage; \
-             #942 Layer 1 + frozen-ρ certificate)",
+            "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
+             distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
+             ρ-re-selecting fit and is certified per row only where \
+             frozen_rho_certified=1, under the global-ρ grid-Lipschitz assumption)",
             conformal_level * 100.0
         )),
     })
     .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }
 
-/// Distribution-free EXACT full-conformal prediction intervals — no held-out
-/// calibration fold required (#1098 / #942 Layer 1).
+/// Full-conformal prediction intervals at frozen smoothing parameters — no
+/// held-out calibration fold required (#1098 / #942 Layer 1).
 ///
 /// Routes `predict(interval='full_conformal')` for Gaussian-identity models to
-/// the `ExactFullConformalSubstrate` precomputed at fit time, giving the EXACT
-/// distribution-free set with finite-sample ≥`conformal_level` marginal
-/// coverage. Returns the same column JSON as `predict_table` plus a
-/// `frozen_rho_certified` column carrying the Layer-3 self-diagnostic.
+/// the `ExactFullConformalSubstrate` precomputed at fit time. The set is exact
+/// given the frozen `Sλ`; the distribution-free finite-sample
+/// ≥`conformal_level` marginal-coverage theorem additionally requires the
+/// symmetric ρ-re-selecting fit and is certified per row only where the
+/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, under
+/// the global-ρ grid-Lipschitz assumption). Returns the same column JSON as
+/// `predict_table` plus that certificate column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to `predict_conformal`.

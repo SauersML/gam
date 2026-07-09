@@ -32,8 +32,9 @@
 //!
 //! The unified [`SaeMigrationLedger`] records the curved-tier promotions
 //! (births) / demotions (refusals) that the cadence adjudicates each round in the
-//! matched-description-length currency (`curved_charge`, the e-BH acceptance
-//! charge, banked as `dl_bits`), plus the Tier-1 block deaths.
+//! matched-description-length currency (`curved_charge`, the per-chart BIC
+//! complexity charge — a descriptive selection gate, not an FDR-controlled e-BH
+//! discovery — banked as `dl_bits`), plus the Tier-1 block deaths.
 //! `pc_reseed_events` is always `0` on this path.
 
 use ndarray::ArrayView2;

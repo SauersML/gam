@@ -932,6 +932,13 @@ pub(crate) fn family_jet_sups(
             let ev = CylinderHarmonicEvaluator::new(h.max(1), SAE_CYLINDER_LINE_DEGREE)?;
             JetSups::from_family(&ev, chart)
         }
+        Mobius => {
+            return Err(
+                "EncodeAtlas: Mobius jet bounds require its persisted harmonic and width \
+                 degrees; use the atom's exact analytic jets"
+                    .to_string(),
+            );
+        }
         Linear | EuclideanPatch | Poincare => {
             // The patch width fixes max_degree implicitly; bound by a degree that
             // covers the column count (conservative). Degree d-patch column count
@@ -4208,6 +4215,8 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
         // line starts route to the exact fallback honestly.
         Cylinder if d == 2 => cylinder_chart_center_grid(resolution),
         Cylinder => regular_product_grid(d, resolution, -0.5, 0.5, true),
+        Mobius if d == 2 => mobius_chart_center_grid(resolution),
+        Mobius => regular_product_grid(d, resolution, -1.0, 1.0, true),
         Sphere if d == 2 => sphere_latlon_grid(resolution),
         Linear | Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => {
             // Unbounded / non-compact latents (and the finite-set index axis): a
@@ -4317,6 +4326,27 @@ pub(crate) fn cylinder_chart_center_grid(resolution: usize) -> Array2<f64> {
     grid
 }
 
+/// Möbius double-cover chart grid: angle `s ∈ [0, 2)` and bounded width
+/// `w ∈ [-1, 1]`. The deck identification is encoded by the basis, so the
+/// atlas covers the ordinary cylindrical chart without duplicating a seam.
+pub(crate) fn mobius_chart_center_grid(resolution: usize) -> Array2<f64> {
+    let mut per_axis = resolution.max(2);
+    while per_axis * per_axis > SHAPE_BAND_MAX_POINTS && per_axis > 2 {
+        per_axis -= 1;
+    }
+    let mut grid = Array2::<f64>::zeros((per_axis * per_axis, 2));
+    let width_denom = (per_axis - 1) as f64;
+    for i in 0..per_axis {
+        let angle = 2.0 * i as f64 / per_axis as f64;
+        for j in 0..per_axis {
+            let width = -1.0 + 2.0 * j as f64 / width_denom;
+            grid[[i * per_axis + j, 0]] = angle;
+            grid[[i * per_axis + j, 1]] = width;
+        }
+    }
+    grid
+}
+
 /// Nominal in-chart radius: half the inter-center grid spacing, so charts tile
 /// the domain. For compact latents this is the grid step; for unbounded latents
 /// a unit default that the certified radius refines.
@@ -4343,6 +4373,10 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
         // take the tighter (periodic) step `0.5/res` to keep every chart valid
         // on both axes. The certified Kantorovich radius refines it per chart.
         Cylinder => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
+        // Angle spacing is `2/r` and width spacing is `2/(r-1)`; their
+        // half-spacings are `1/r` and `1/(r-1)`, so the angular axis is the
+        // conservative scalar chart radius.
+        Mobius => 1.0 / (capped_per_axis(atom.latent_dim, resolution) as f64),
         Linear | Duchon | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => {
             1.0 / (resolution.max(2) as f64)
         }
@@ -4380,7 +4414,7 @@ pub(crate) fn chart_region(
         }
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic | Sphere | Torus | Cylinder | Linear | EuclideanPatch | Poincare
+        Periodic | Sphere | Torus | Cylinder | Mobius | Linear | EuclideanPatch | Poincare
         | Precomputed(_) | FiniteSet => region,
     }
 }

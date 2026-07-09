@@ -1,3 +1,23 @@
+## v0.3.149 — gam 0.3.149 / gamfit 0.1.252 (2026-07-09)
+
+This release makes `opt` the single optimization-mechanics authority for the
+Rust engine. The former `gam-optimize` crate and GAM's hand-written GPU REML
+BFGS loop are removed rather than retained as compatibility layers.
+
+- All generic backtracking line-search and geometric ridge-escalation call sites
+  now consume `opt 0.5.12`; the redundant `gam-optimize` workspace crate is gone.
+- GPU-backed outer REML uses the same robust `opt::Bfgs` implementation as the
+  host path, including hybrid Wolfe/backtracking search, bounds, projected
+  stationarity, relative-to-cost tolerance, axis step caps, and best-iterate
+  recovery.
+- The device evaluator uses `opt::FusedObjective`, so a value+gradient kernel
+  result is evaluated once and moved through an accepted line-search point
+  without recomputing or cloning its gradient.
+- The already-computed REML seed sample is handed directly to BFGS, eliminating
+  another full inner solve at optimizer startup.
+- Optimization dependencies are exact and registry-backed at `opt = 0.5.12`;
+  every affected GAM library is validated against the published crate.
+
 ## v0.3.148 — gam 0.3.148 / gamfit 0.1.250 (2026-07-06)
 
 A correctness release on top of 0.3.147, concentrated in three areas: **honest

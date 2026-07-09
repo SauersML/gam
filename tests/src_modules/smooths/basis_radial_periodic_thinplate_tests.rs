@@ -4435,6 +4435,103 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
     assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
 }
 
+/// An explicit `power=0` is a literal Duchon spectral power, not a sentinel for
+/// the two-dimensional cubic default `s=(d-1)/2=0.5`.  Keep this proof entirely
+/// in Rust: build the same center geometry through both requests and require the
+/// realized basis and native RKHS penalty to be numerically distinct.  If any
+/// request/builder boundary ever rewrites zero to the default, both matrices
+/// become entry-identical and this regression fails without needing R/mgcv.
+#[test]
+fn test_explicit_zero_power_is_reachable_and_distinct_from_cubic_default_d2() {
+    let data = array![
+        [0.00, 0.10],
+        [0.15, 0.85],
+        [0.25, 0.35],
+        [0.40, 0.95],
+        [0.55, 0.20],
+        [0.65, 0.70],
+        [0.80, 0.05],
+        [0.95, 0.55],
+        [0.10, 0.50],
+        [0.35, 0.05],
+        [0.70, 0.40],
+        [0.90, 0.90]
+    ];
+    let base = DuchonBasisSpec {
+        radial_reparam: None,
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
+        periodic: None,
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: DuchonNullspaceOrder::Linear,
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: DuchonOperatorPenaltySpec::all_disabled(),
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let thinplate =
+        build_duchon_basis(data.view(), &base).expect("explicit power=0 Duchon basis must build");
+    let cubic = build_duchon_basis(
+        data.view(),
+        &DuchonBasisSpec {
+            power: 0.5,
+            ..base.clone()
+        },
+    )
+    .expect("two-dimensional cubic-default Duchon basis must build");
+
+    let metadata_power = |built: &BasisBuildResult| match &built.metadata {
+        BasisMetadata::Duchon { power, .. } => *power,
+        other => panic!("expected Duchon metadata, got {other:?}"),
+    };
+    assert_eq!(
+        metadata_power(&thinplate),
+        0.0,
+        "the builder must retain explicit spectral power zero verbatim"
+    );
+    assert_eq!(
+        metadata_power(&cubic),
+        0.5,
+        "the d=2 cubic construction must retain spectral power one-half"
+    );
+
+    let assert_resolved_distinct = |lhs: &Array2<f64>, rhs: &Array2<f64>, what: &str| {
+        if lhs.dim() != rhs.dim() {
+            // A different retained radial rank is already conclusive evidence
+            // that the two spectral powers reached different constructions.
+            return;
+        }
+        let max_delta = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let scale = lhs
+            .iter()
+            .chain(rhs.iter())
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(f64::MIN_POSITIVE);
+        assert!(
+            max_delta > 1024.0 * f64::EPSILON * scale,
+            "explicit power=0 and cubic s=0.5 produced numerically identical {what}: \
+             max_delta={max_delta:.3e}, scale={scale:.3e}; zero was likely swallowed as a default"
+        );
+    };
+    assert_resolved_distinct(
+        &thinplate.design.to_dense(),
+        &cubic.design.to_dense(),
+        "design",
+    );
+    assert_eq!(thinplate.penalties.len(), 2);
+    assert_eq!(cubic.penalties.len(), 2);
+    assert_resolved_distinct(
+        &thinplate.penalties[0],
+        &cubic.penalties[0],
+        "native RKHS penalty",
+    );
+}
+
 /// d=1: Linear null space (constant + linear) with power=0 satisfies
 /// 2(1+0) > 1 (RKHS) and 2·0 < 1 (CPD). Joint null must still be the
 /// constant only — the linear direction picks up the centered-mass
@@ -5514,11 +5611,20 @@ fn test_pure_duchon_auto_raises_order_for_undefined_gradient_collocation() {
     // `2(p+s)=2(1+1)=4 <= d+1=4`, so the D1 gradient collocation was undefined.
     // The margin auto-raise lifts Zero -> Linear (p=2), giving `2(p+s)=6`, which
     // clears both the D1 (`>d+1=4`) and D2 (`>d+2=5`) collocation floors.
+    let raw_err = validate_duchon_collocation_orders(None, 1, 1.0, 3, 2)
+        .expect_err("the requested p=1, s=1 configuration has undefined D1 collocation");
+    assert!(
+        raw_err.to_string().contains("D1 collocation"),
+        "the raw inadmissibility must be diagnosed as D1 collocation, got: {raw_err}"
+    );
+    let effective = duchon_order_for_operator_margin(3, 1.0, DuchonNullspaceOrder::Zero, 2);
     assert_eq!(
-        duchon_order_for_operator_margin(3, 1.0, DuchonNullspaceOrder::Zero, 2),
+        effective,
         DuchonNullspaceOrder::Linear,
         "d=3, Zero(p=1), s=1, max_op=2 must auto-raise to Linear so 2(p+s)=6 > d+2"
     );
+    validate_duchon_collocation_orders(None, duchon_p_from_nullspace_order(effective), 1.0, 3, 2)
+        .expect("the raised p=2, s=1 configuration must satisfy the D2 margin");
     // The eight unit-cube corners span the raised affine null space
     // `{1, x, y, z}` (rank 4) and leave 8-4=4 constrained radial degrees of
     // freedom, so the collocation operators build on a non-degenerate basis.
@@ -5543,10 +5649,27 @@ fn test_pure_duchon_auto_raises_order_for_undefined_gradient_collocation() {
         2,
     )
     .expect("gradient/Laplacian collocation must build after the #1817 order auto-raise");
+    assert_eq!(
+        ops.polynomial_block_cols, 4,
+        "the realized polynomial block must be the raised affine {{1,x,y,z}} block"
+    );
+    let z = ops
+        .kernel_nullspace_transform
+        .as_ref()
+        .expect("pure Duchon collocation must expose its kernel constraint transform");
+    assert_eq!(
+        z.dim(),
+        (8, 4),
+        "raised affine constraints leave four radial modes"
+    );
     for m in [&ops.d0, &ops.d1, &ops.d2] {
         assert!(
             m.iter().all(|v| v.is_finite()),
             "auto-raised collocation operator matrices must be finite"
+        );
+        assert!(
+            m.iter().any(|v| *v != 0.0),
+            "auto-raised collocation operator matrices must be nonzero"
         );
     }
 }
@@ -5561,11 +5684,20 @@ fn test_pure_duchon_auto_raises_order_for_divergent_laplacian_collocation() {
     // `2(p+s)=2(2+0)=4 <= d+2=4`, so the D2 Laplacian collocation was divergent.
     // The margin auto-raise lifts Linear -> Degree(2) (p=3), giving `2(p+s)=6`,
     // which clears the strict D2 floor `>d+2=4`.
+    let raw_err = validate_duchon_collocation_orders(None, 2, 0.0, 2, 2)
+        .expect_err("the requested p=2, s=0 configuration has divergent D2 collocation");
+    assert!(
+        raw_err.to_string().contains("D2 collocation"),
+        "the raw inadmissibility must be diagnosed as D2 collocation, got: {raw_err}"
+    );
+    let effective = duchon_order_for_operator_margin(2, 0.0, DuchonNullspaceOrder::Linear, 2);
     assert_eq!(
-        duchon_order_for_operator_margin(2, 0.0, DuchonNullspaceOrder::Linear, 2),
+        effective,
         DuchonNullspaceOrder::Degree(2),
         "d=2, Linear(p=2), s=0, max_op=2 must auto-raise to Degree(2) so 2(p+s)=6 > d+2"
     );
+    validate_duchon_collocation_orders(None, duchon_p_from_nullspace_order(effective), 0.0, 2, 2)
+        .expect("the raised p=3, s=0 configuration must satisfy the D2 margin");
     // The raised quadratic null space `{1, x, y, x^2, xy, y^2}` has 6 columns, so
     // the centers must span it: a 3x3 grid (9 points) has full rank-6 polynomial
     // block, so the collocation operators build at the auto-raised order.
@@ -5585,10 +5717,27 @@ fn test_pure_duchon_auto_raises_order_for_divergent_laplacian_collocation() {
         2,
     )
     .expect("Laplacian collocation must build after the #1817 order auto-raise");
+    assert_eq!(
+        ops.polynomial_block_cols, 6,
+        "the realized polynomial block must be the raised quadratic block"
+    );
+    let z = ops
+        .kernel_nullspace_transform
+        .as_ref()
+        .expect("pure Duchon collocation must expose its kernel constraint transform");
+    assert_eq!(
+        z.dim(),
+        (9, 3),
+        "raised quadratic constraints leave three radial modes"
+    );
     for m in [&ops.d0, &ops.d1, &ops.d2] {
         assert!(
             m.iter().all(|v| v.is_finite()),
             "auto-raised collocation operator matrices must be finite"
+        );
+        assert!(
+            m.iter().any(|v| *v != 0.0),
+            "auto-raised collocation operator matrices must be nonzero"
         );
     }
 }

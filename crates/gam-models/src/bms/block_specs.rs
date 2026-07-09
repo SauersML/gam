@@ -2824,10 +2824,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     //
     // `s_i = ∂²ℓ_i/∂β∂ζ_i = J_iᵀ·(∂²ℓ_i/∂η_i∂ζ_i)` is the mixed `(β, ζ)` second
     // derivative of the row kernel contracted through the slope Jacobian `J_i`.
-    // The conditional location-scale gate ALWAYS selects the rigid standard-normal
-    // measure (`build_latent_measure_with_geometry` returns
-    // `LatentMeasureKind::StandardNormal` for `ConditionalLocationScale`), so the
-    // per-row kernel is the closed-form `rigid_standard_normal` tower
+    // When the calibrated residual ζ passes the standard-normal adequacy gate,
+    // `build_latent_measure_with_geometry` pairs `ConditionalLocationScale`
+    // with `LatentMeasureKind::StandardNormal` and the per-row kernel is the
+    // closed-form `rigid_standard_normal` tower
     // `η = q·c(g) + g·(s·ζ)`. The mixed 2-vector `∂²ℓ_i/∂(q,g)∂ζ_i` is read off the
     // SAME `Tower4` the value/grad/Hessian path uses (#932 row-jet machinery) by
     // seeding `ζ` as a third jet axis
@@ -2849,8 +2849,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // standard-normal kernel: the rigid tower carries no score_warp/link_dev
     // z-dependence, so when aux deviation blocks widen β beyond `p_m + r` the
     // correction's deviation columns are not yet derived and the term is skipped
-    // (the conditional gate's intended kernel has no such blocks).
+    // (the conditional gate's intended kernel has no such blocks). Likewise
+    // skipped when the calibrated residual failed the standard-normal adequacy
+    // gate and the fit ran under the empirical latent measure: the `s_i`
+    // sensitivity below is read off the rigid standard-normal tower, which is
+    // not the kernel that produced `Vb` in that case.
     if let Some(cal) = latent_z_conditional_calibration.as_ref()
+        && matches!(latent_measure, LatentMeasureKind::StandardNormal)
         && let Some(vb) = solved_fit.covariance_conditional.clone()
     {
         let p_beta = vb.nrows();

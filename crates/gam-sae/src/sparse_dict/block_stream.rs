@@ -238,8 +238,13 @@ pub struct BlockRankCharges {
     pub delta_deviance: Vec<f64>,
     /// `½·d_eff·ln n_obs` — the evidence price.
     pub charge: Vec<f64>,
-    /// `delta_deviance − charge` (also the Laplace log-evidence-ratio the
-    /// e-BH certificate can consume as a `log_e_value`).
+    /// `delta_deviance − charge`: the descriptive held-out BIC margin for the
+    /// block (positive ⇒ its codes claim more deviance reduction than their
+    /// information charge). This is a model-selection score, NOT a p-value,
+    /// e-value, or FDR-controlled discovery — a BIC margin `M` is not a valid
+    /// log-e-value (`E[exp M] > 1` under the null), so it must never be fed to an
+    /// e-BH certificate as a `log_e_value`. `kept` applies the descriptive
+    /// `margin > 0` gate, the same convention as `block_chart::ChartEvidence`.
     pub margin: Vec<f64>,
     /// `margin > 0`.
     pub kept: Vec<bool>,

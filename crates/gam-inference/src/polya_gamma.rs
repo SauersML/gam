@@ -28,7 +28,13 @@ struct RandPgRng<'a, R: Rng + ?Sized> {
 impl<R: Rng + ?Sized> PgRng for RandPgRng<'_, R> {
     #[inline]
     fn next_unit(&mut self) -> f64 {
-        self.rng.random::<f64>()
+        // `random::<f64>()` is uniform on [0, 1); the `PgRng` contract requires
+        // (0, 1]. A raw zero here lets `sample_small_z`'s acceptance loop pass
+        // on its zero-initialized state and return an exact 0.0, which is
+        // outside the strictly-positive PG(1, c) support. Flipping to
+        // `1 - U` maps [0, 1) onto (0, 1] without biasing the distribution
+        // (the same upper-closed convention the Xorwow GPU adapter uses).
+        1.0 - self.rng.random::<f64>()
     }
 
     #[inline]

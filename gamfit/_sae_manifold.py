@@ -1174,10 +1174,12 @@ class ManifoldSAE:
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
-            [(int(h) if k in {"periodic", "torus"} else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
+            [
+                (int(h) if k in {"periodic", "torus", "cylinder", "mobius"} else None)
+                for k, h in zip(self._basis_kinds, self._n_harmonics)
+            ],
             [int(s) for s in self._basis_sizes],
             alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
-            sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
             max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
             initial_logits=logits_init, initial_coords=coords_init,
             top_k=self.top_k,
@@ -1192,7 +1194,7 @@ class ManifoldSAE:
             # INITIAL sparsity/smoothness scalars and zero ARD — a different
             # objective under which the trained optimum is not stationary, so
             # re-encoding the training rows collapsed (warm start decayed BELOW
-            # the cold start). ``None`` entries keep the legacy fallback.
+            # the cold start). A complete terminal state is required.
             log_lambda_sparse=self.selected_log_lambda_sparse,
             log_lambda_smooth=(
                 None

@@ -140,6 +140,111 @@ fn survival_marginal_slope_w_changes_with_beta() {
     );
 }
 
+/// A refreshed survival channel Hessian must use the original observation
+/// weights and censoring indicators. Replacing them by `(1, 1)` changes both
+/// the scale and structure of W and can therefore change a rank certificate.
+#[test]
+fn survival_marginal_slope_w_refresh_preserves_row_data() {
+    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
+    use std::sync::Arc;
+
+    let q0_pilot = Array1::from_vec(vec![0.10, -0.20, 0.35]);
+    let q1_pilot = Array1::from_vec(vec![0.45, 0.30, 0.80]);
+    let qd1_pilot = Array1::from_vec(vec![0.70, 1.10, 0.55]);
+    let g_pilot = Array1::zeros(3);
+    let z = Array1::from_vec(vec![-1.25, 0.40, 1.10]);
+    let weights = Array1::from_vec(vec![0.25, 2.0, 4.5]);
+    let event = Array1::from_vec(vec![0.0, 1.0, 0.0]);
+    let derivative_guard = 1e-6;
+    let probit_scale = 1.2;
+    let stored = SurvivalRowHessian::from_pilot_primary_state(
+        &q0_pilot,
+        &q1_pilot,
+        &qd1_pilot,
+        &g_pilot,
+        &z,
+        &weights,
+        &event,
+        derivative_guard,
+        probit_scale,
+    )
+    .expect("pilot row Hessian");
+
+    let q0_current = Array1::from_vec(vec![0.20, -0.05, 0.50]);
+    let q1_current = Array1::from_vec(vec![0.60, 0.55, 0.95]);
+    let qd1_current = Array1::from_vec(vec![0.85, 1.25, 0.75]);
+    let g_current = Array1::from_vec(vec![0.30, -0.45, 0.70]);
+    let scalars = SurvivalMarginalSlopeFamilyScalars::new(
+        q0_current.to_vec(),
+        q1_current.to_vec(),
+        qd1_current.to_vec(),
+        g_current.to_vec(),
+        probit_scale,
+        z.to_vec(),
+    );
+    let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars);
+    let refreshed = stored
+        .channel_hessian_at(&[1.0], Some(&scalars))
+        .expect("exact current-state refresh")
+        .evaluate_full();
+
+    let expected = SurvivalRowHessian::from_pilot_primary_state(
+        &q0_current,
+        &q1_current,
+        &qd1_current,
+        &g_current,
+        &z,
+        &weights,
+        &event,
+        derivative_guard,
+        probit_scale,
+    )
+    .expect("direct current-state row Hessian");
+    let expected = FamilyChannelHessian::evaluate_full(&expected);
+    let max_diff = refreshed
+        .iter()
+        .zip(expected.iter())
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_diff < 1e-12,
+        "refreshed W must equal direct W with the original row data; max_diff={max_diff:e}"
+    );
+}
+
+/// Invalid current-state curvature must abort the audit instead of silently
+/// reusing a stale pilot row.
+#[test]
+fn survival_marginal_slope_w_refresh_fails_closed() {
+    use gam::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
+    use std::sync::Arc;
+
+    let stored = make_survival_row_hessian(
+        &[0.5, 0.5, 0.5, 0.5],
+        &[0.5, 0.5, 0.5, 0.5],
+        &[1.0, 1.0, 1.0, 1.0],
+        &[0.0, 0.0, 0.0, 0.0],
+        &[1.0, -1.0, 0.5, -0.5],
+    );
+    let scalars = SurvivalMarginalSlopeFamilyScalars::new(
+        vec![0.5; 4],
+        vec![0.5; 4],
+        vec![0.0; 4],
+        vec![0.5; 4],
+        1.0,
+        vec![1.0, -1.0, 0.5, -0.5],
+    );
+    let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars);
+    let err = match stored.channel_hessian_at(&[1.0], Some(&scalars)) {
+        Ok(_) => panic!("invalid current qd1 must not reuse pilot curvature"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("row 0"),
+        "refresh error must identify the invalid row: {err}"
+    );
+}
+
 // ── T34 test 2: drift detected when rank changes ───────────────────────────
 
 /// Build a minimal audit result with a given set of dropped columns.

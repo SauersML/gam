@@ -564,6 +564,90 @@ fn topology_records_from_codes(
     records
 }
 
+/// Genuine chart-transfer certificate for one atlas-nerve gate between two
+/// charts, read from the frozen code matrix.
+///
+/// A gate stamped `valid = true` with zero transport/equivariance defect is a
+/// FABRICATED certificate: it admits every co-active chart pair as a nerve edge
+/// without running any transport test, so the reported topology is manufactured,
+/// not measured. The real certificate needs a square (≤2-D) chart-to-chart
+/// operator; only the harmonic circle lane (`block_size == 2`) exposes a 2-D
+/// per-row coordinate from which the empirical transfer operator `A` (least
+/// squares `X_a A ≈ X_b` over the rows that fire in BOTH charts) can be formed.
+/// `A` is certified against isometry (`‖AᵀA − I‖_F`) and SO(2) equivariance
+/// (`‖A·G − G·A‖_F`) by [`certify_square_transfer`], and validity is the
+/// library's own gate ([`AtlasTransferGate::from_square_transfer`]). Any other
+/// block width, fewer than two co-firing rows, a singular coordinate Gram, or a
+/// non-finite operator exposes no certifiable transfer at this boundary, so the
+/// gate is UNCERTIFIED (`valid = false`, unknown/`inf` defects) — never
+/// fabricated valid. `block_a`/`block_b` index the dictionary blocks the two
+/// charts read; `chart_a`/`chart_b` are the nerve-vertex labels.
+fn chart_transfer_gate<T: Copy + Into<f64>>(
+    codes: ndarray::ArrayView2<'_, T>,
+    block_size: usize,
+    block_a: usize,
+    block_b: usize,
+    chart_a: usize,
+    chart_b: usize,
+    activation_threshold: f64,
+) -> gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
+    use gam::terms::sae::inference::atlas_nerve::AtlasTransferGate;
+    let uncertified = || AtlasTransferGate {
+        a: chart_a,
+        b: chart_b,
+        valid: false,
+        transport_defect: f64::INFINITY,
+        equivariance_defect: f64::INFINITY,
+    };
+    if block_size != 2 {
+        return uncertified();
+    }
+    let mut xa: Vec<f64> = Vec::new();
+    let mut xb: Vec<f64> = Vec::new();
+    for row in 0..codes.nrows() {
+        let a0: f64 = codes[[row, block_a * 2]].into();
+        let a1: f64 = codes[[row, block_a * 2 + 1]].into();
+        let b0: f64 = codes[[row, block_b * 2]].into();
+        let b1: f64 = codes[[row, block_b * 2 + 1]].into();
+        let na = (a0 * a0 + a1 * a1).sqrt();
+        let nb = (b0 * b0 + b1 * b1).sqrt();
+        if na > activation_threshold && nb > activation_threshold {
+            xa.push(a0);
+            xa.push(a1);
+            xb.push(b0);
+            xb.push(b1);
+        }
+    }
+    let n_co = xa.len() / 2;
+    if n_co < 2 {
+        return uncertified();
+    }
+    let (Ok(x_a), Ok(x_b)) = (
+        ndarray::Array2::from_shape_vec((n_co, 2), xa),
+        ndarray::Array2::from_shape_vec((n_co, 2), xb),
+    ) else {
+        return uncertified();
+    };
+    // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
+    // solving `X_a A ≈ X_b` over the co-firing rows.
+    let Ok(operator) =
+        gam::terms::sae::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
+    else {
+        return uncertified();
+    };
+    // Both charts are circles, so the shared infinitesimal-rotation generator is
+    // the SO(2) generator `[[0,−1],[1,0]]`.
+    let generator = ndarray::array![[0.0_f64, -1.0], [1.0, 0.0]];
+    match gam::terms::sae::chart_transfer::certify_square_transfer(
+        operator.view(),
+        generator.view(),
+        generator.view(),
+    ) {
+        Ok(cert) => AtlasTransferGate::from_square_transfer(chart_a, chart_b, cert, 2),
+        Err(_) => uncertified(),
+    }
+}
+
 fn atlas_nerve_from_codes(
     codes: ndarray::ArrayView2<'_, f32>,
     block_size: usize,
@@ -611,13 +695,15 @@ fn atlas_nerve_from_codes(
     let mut gates = Vec::new();
     for a in 0..chart_blocks.len() {
         for b in (a + 1)..chart_blocks.len() {
-            gates.push(gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
+            gates.push(chart_transfer_gate(
+                codes,
+                block_size,
+                chart_blocks[a],
+                chart_blocks[b],
                 a,
                 b,
-                valid: true,
-                transport_defect: 0.0,
-                equivariance_defect: 0.0,
-            });
+                activation_threshold as f64,
+            ));
         }
     }
     let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
@@ -1042,13 +1128,15 @@ fn atlas_nerve_richness_statistic(
     let mut gates = Vec::new();
     for a in 0..chart_blocks.len() {
         for b in (a + 1)..chart_blocks.len() {
-            gates.push(gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
+            gates.push(chart_transfer_gate(
+                codes,
+                block_size,
+                chart_blocks[a],
+                chart_blocks[b],
                 a,
                 b,
-                valid: true,
-                transport_defect: 0.0,
-                equivariance_defect: 0.0,
-            });
+                activation_threshold,
+            ));
         }
     }
     let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;

@@ -28,9 +28,11 @@
 //! The frontier carries *two* curves: the manifold-SAE EV-vs-`K` and a
 //! linear-SAE baseline EV-vs-`K`. [`ManifoldVsLinearAdvantage`] quantifies the
 //! parameter-efficiency win: manifold reaches a target EV at `K_m` atoms vs
-//! linear at `K_l`, and the ratio `K_l / K_m > 1` is the compression factor —
-//! the manifold representation buys the same reconstruction quality with fewer
-//! atoms.
+//! linear at `K_l`, and the compression factor is the DECODER-PARAMETER ratio
+//! `K_l·p_l / K_m·p_m > 1`, NOT the atom ratio `K_l / K_m`. A manifold atom
+//! stores more scalars than a linear atom (a `d`-chart with an `M`-wide basis
+//! over `p` channels costs `M·p`, a linear atom `p`), so counting atoms would
+//! over-credit the manifold; the parameter ratio is the honest win.
 //!
 //! ## Degenerate curves
 //!
@@ -555,9 +557,14 @@ fn select_mdl(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
 /// The manifold-vs-linear parameter-efficiency advantage at a target EV.
 ///
 /// Manifold reaches `target_ev` at `k_manifold` atoms, linear at `k_linear`
-/// atoms. The compression ratio `k_linear / k_manifold > 1` is the number of
-/// linear atoms a single manifold atom is worth at equal reconstruction
-/// quality.
+/// atoms. Compression is measured in DECODER PARAMETERS, not atom count: a
+/// manifold atom stores more scalars than a linear atom (a `d`-chart with an
+/// `M`-wide basis over `p` output channels costs `M·p` decoder scalars, a linear
+/// atom `p`), so `k_linear / k_manifold` would over-credit the manifold — one
+/// manifold atom worth ten linear atoms in EV can cost ten linear atoms' worth
+/// of parameters and buy no compression at all. The honest ratio is
+/// `linear_params / manifold_params`, and it exceeds 1 only when the manifold
+/// truly reaches the target with fewer stored scalars.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ManifoldVsLinearAdvantage {
     /// Target explained variance both representations are compared at.
@@ -566,38 +573,60 @@ pub struct ManifoldVsLinearAdvantage {
     pub k_manifold: Option<usize>,
     /// Smallest linear `K` reaching `target_ev`, if any.
     pub k_linear: Option<usize>,
-    /// `k_linear / k_manifold` when both reach the target, else `None`.
+    /// Total decoder parameters the manifold spends to reach `target_ev`
+    /// (`k_manifold · manifold_params_per_atom`), if reached.
+    pub manifold_params: Option<f64>,
+    /// Total decoder parameters the linear baseline spends to reach `target_ev`
+    /// (`k_linear · linear_params_per_atom`), if reached.
+    pub linear_params: Option<f64>,
+    /// `linear_params / manifold_params` when both reach the target, else `None`
+    /// — the parameter-efficiency ratio (`> 1` ⇒ the manifold reaches the target
+    /// with fewer stored scalars).
     pub compression_ratio: Option<f64>,
 }
 
 impl ManifoldVsLinearAdvantage {
-    /// True iff the manifold representation is strictly more
-    /// parameter-efficient at the target EV (`k_manifold < k_linear`).
+    /// True iff the manifold representation reaches the target EV with strictly
+    /// FEWER decoder parameters than the linear baseline (`manifold_params <
+    /// linear_params`) — parameter efficiency, not atom-count efficiency.
     pub fn manifold_dominates(&self) -> bool {
-        match (self.k_manifold, self.k_linear) {
-            (Some(km), Some(kl)) => km < kl,
+        match (self.manifold_params, self.linear_params) {
+            (Some(pm), Some(pl)) => pm < pl,
             _ => false,
         }
     }
 }
 
 /// Compute the manifold-vs-linear advantage at `target_ev`: the cheapest `K`
-/// each representation needs to reach the target, and their ratio.
+/// each representation needs to reach the target and their PARAMETER ratio.
+///
+/// `manifold_params_per_atom` / `linear_params_per_atom` are the decoder scalar
+/// counts a single atom of each representation stores (manifold: `M·p` for an
+/// `M`-wide basis over `p` output channels; linear: `p`). The compression ratio
+/// is `linear_params / manifold_params`, so a manifold atom that reaches the
+/// target with a large basis is charged its true parameter cost instead of being
+/// credited one atom's worth.
 pub fn manifold_vs_linear_advantage(
     manifold: &EvVsKCurve,
     linear: &EvVsKCurve,
     target_ev: f64,
+    manifold_params_per_atom: f64,
+    linear_params_per_atom: f64,
 ) -> ManifoldVsLinearAdvantage {
     let k_manifold = manifold.k_reaching(target_ev);
     let k_linear = linear.k_reaching(target_ev);
-    let compression_ratio = match (k_manifold, k_linear) {
-        (Some(km), Some(kl)) if km > 0 => Some(kl as f64 / km as f64),
+    let manifold_params = k_manifold.map(|k| k as f64 * manifold_params_per_atom);
+    let linear_params = k_linear.map(|k| k as f64 * linear_params_per_atom);
+    let compression_ratio = match (manifold_params, linear_params) {
+        (Some(pm), Some(pl)) if pm > 0.0 => Some(pl / pm),
         _ => None,
     };
     ManifoldVsLinearAdvantage {
         target_ev,
         k_manifold,
         k_linear,
+        manifold_params,
+        linear_params,
         compression_ratio,
     }
 }
@@ -626,9 +655,17 @@ pub fn recommend_auto_k(
     manifold: &EvVsKCurve,
     linear: &EvVsKCurve,
     config: &KSelectionConfig,
+    manifold_params_per_atom: f64,
+    linear_params_per_atom: f64,
 ) -> AutoKRecommendation {
     let selection = select_k(manifold, config);
-    let advantage = manifold_vs_linear_advantage(manifold, linear, selection.ev);
+    let advantage = manifold_vs_linear_advantage(
+        manifold,
+        linear,
+        selection.ev,
+        manifold_params_per_atom,
+        linear_params_per_atom,
+    );
     AutoKRecommendation {
         selection,
         advantage,
@@ -801,29 +838,54 @@ mod k_selection_tests {
 
     #[test]
     fn advantage_metric_rewards_manifold_compression() {
-        // Manifold reaches EV 0.90 at K=4; linear needs K=16 for the same.
+        // Manifold reaches EV 0.90 at K=4; linear needs K=16 for the same. With
+        // equal per-atom parameter cost the parameter ratio is 16·p / 4·p = 4x.
         let manifold = curve_from_pairs(&[(1, 0.40), (2, 0.65), (4, 0.90), (8, 0.93), (16, 0.94)])
             .expect("manifold curve");
         let linear = curve_from_pairs(&[(1, 0.20), (2, 0.35), (4, 0.55), (8, 0.78), (16, 0.91)])
             .expect("linear curve");
-        let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90);
+        let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90, 10.0, 10.0);
         assert_eq!(adv.k_manifold, Some(4));
         assert_eq!(adv.k_linear, Some(16));
+        assert_eq!(adv.manifold_params, Some(40.0));
+        assert_eq!(adv.linear_params, Some(160.0));
         assert!(adv.manifold_dominates());
         let ratio = adv.compression_ratio.expect("both reach target");
         assert!(
             (ratio - 4.0).abs() < 1e-12,
-            "expected 16/4 = 4x, got {ratio}"
+            "expected 160/40 = 4x parameter compression, got {ratio}"
         );
+    }
+
+    #[test]
+    fn advantage_metric_counts_parameters_not_atoms() {
+        // The reviewer's counterexample: one heavy manifold atom (100 decoder
+        // scalars) reaching the target vs many light linear atoms (1 scalar each).
+        // An atom-count ratio would report a spurious win; the parameter ratio
+        // shows the manifold spends MORE scalars and does NOT dominate.
+        let manifold = curve_from_pairs(&[(1, 0.90), (2, 0.95)]).expect("manifold curve");
+        let linear =
+            curve_from_pairs(&[(2, 0.30), (5, 0.60), (10, 0.90)]).expect("linear curve");
+        let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90, 100.0, 1.0);
+        assert_eq!(adv.k_manifold, Some(1));
+        assert_eq!(adv.k_linear, Some(10));
+        assert_eq!(adv.manifold_params, Some(100.0));
+        assert_eq!(adv.linear_params, Some(10.0));
+        // 1 atom < 10 atoms, but 100 params > 10 params: no parameter compression.
+        assert!(!adv.manifold_dominates());
+        let ratio = adv.compression_ratio.expect("both reach target");
+        assert!((ratio - 0.1).abs() < 1e-12, "10/100 = 0.1x, got {ratio}");
     }
 
     #[test]
     fn advantage_metric_handles_unreached_target() {
         let manifold = curve_from_pairs(&[(1, 0.40), (2, 0.55)]).expect("manifold curve");
         let linear = curve_from_pairs(&[(1, 0.20), (2, 0.35)]).expect("linear curve");
-        let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90);
+        let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90, 10.0, 10.0);
         assert_eq!(adv.k_manifold, None);
         assert_eq!(adv.k_linear, None);
+        assert!(adv.manifold_params.is_none());
+        assert!(adv.linear_params.is_none());
         assert!(adv.compression_ratio.is_none());
         assert!(!adv.manifold_dominates());
     }
@@ -850,10 +912,11 @@ mod k_selection_tests {
             (32, 0.93),
         ])
         .expect("linear curve");
-        let rec = recommend_auto_k(&manifold, &linear, &KSelectionConfig::default());
+        let rec = recommend_auto_k(&manifold, &linear, &KSelectionConfig::default(), 10.0, 10.0);
         assert_eq!(rec.selection.k, 4);
         assert_eq!(rec.selection.flag, KSelectionFlag::Knee);
-        // At the auto-K EV (0.90) linear needs K=16 => 4x compression.
+        // At the auto-K EV (0.90) linear needs K=16; equal per-atom parameter
+        // cost => 160/40 = 4x parameter compression.
         assert_eq!(rec.advantage.k_manifold, Some(4));
         assert_eq!(rec.advantage.k_linear, Some(16));
         assert!(rec.advantage.manifold_dominates());

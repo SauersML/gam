@@ -14,6 +14,18 @@ use pyo3::PyResult;
 use pyo3::exceptions::PyValueError;
 
 pub(crate) fn benchmark_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
+    benchmark_weighted_auc_score(observed, predicted_mean, None)
+}
+
+/// Tie-aware weighted Mann-Whitney AUC. Each positive/negative pair `(i, j)`
+/// contributes with pair weight `w_i * w_j`, so the statistic is
+/// `Σ w_i⁺ w_j⁻ [1(p_i > p_j) + ½·1(p_i = p_j)] / (W⁺ W⁻)`. Unit weights
+/// (`weights = None`) reduce this exactly to the unweighted AUC.
+pub(crate) fn benchmark_weighted_auc_score(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    weights: Option<&[f64]>,
+) -> PyResult<f64> {
     if observed.len() != predicted_mean.len() {
         return Err(PyValueError::new_err(format!(
             "auc length mismatch: observed={} predicted={}",
@@ -21,34 +33,60 @@ pub(crate) fn benchmark_auc_score(observed: &[f64], predicted_mean: &[f64]) -> P
             predicted_mean.len()
         )));
     }
-    let mut pairs: Vec<(f64, bool)> = observed
+    if let Some(w) = weights {
+        if w.len() != observed.len() {
+            return Err(PyValueError::new_err(format!(
+                "auc length mismatch: observed={} weights={}",
+                observed.len(),
+                w.len()
+            )));
+        }
+        for (i, &wi) in w.iter().enumerate() {
+            if !wi.is_finite() || wi < 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "auc weights must be finite and non-negative; weights[{i}] = {wi}"
+                )));
+            }
+        }
+    }
+    let weight_of = |i: usize| weights.map_or(1.0, |w| w[i]);
+    let mut pairs: Vec<(f64, bool, f64)> = observed
         .iter()
         .zip(predicted_mean.iter())
-        .map(|(&y, &p)| (p, y > 0.5))
+        .enumerate()
+        .map(|(i, (&y, &p))| (p, y > 0.5, weight_of(i)))
         .collect();
-    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
-    let n_neg = pairs.len().saturating_sub(n_pos);
-    if n_pos == 0 || n_neg == 0 {
+    let pos_weight: f64 = pairs.iter().filter(|(_, p, _)| *p).map(|(_, _, w)| w).sum();
+    let neg_weight: f64 = pairs.iter().filter(|(_, p, _)| !*p).map(|(_, _, w)| w).sum();
+    if pos_weight <= 0.0 || neg_weight <= 0.0 {
         return Ok(0.5);
     }
-    pairs.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+    pairs.sort_by(|(a, _, _), (b, _, _)| a.total_cmp(b));
 
     let mut concordant = 0.0;
-    let mut negatives_below = 0usize;
+    let mut neg_weight_below = 0.0_f64;
     let mut i = 0usize;
     while i < pairs.len() {
         let mut j = i + 1;
         while j < pairs.len() && pairs[j].0 == pairs[i].0 {
             j += 1;
         }
-        let pos_in_group = pairs[i..j].iter().filter(|(_, is_pos)| *is_pos).count();
-        let neg_in_group = (j - i).saturating_sub(pos_in_group);
-        concordant += (pos_in_group * negatives_below) as f64;
-        concordant += 0.5 * (pos_in_group * neg_in_group) as f64;
-        negatives_below += neg_in_group;
+        let pos_in_group: f64 = pairs[i..j]
+            .iter()
+            .filter(|(_, is_pos, _)| *is_pos)
+            .map(|(_, _, w)| w)
+            .sum();
+        let neg_in_group: f64 = pairs[i..j]
+            .iter()
+            .filter(|(_, is_pos, _)| !*is_pos)
+            .map(|(_, _, w)| w)
+            .sum();
+        concordant += pos_in_group * neg_weight_below;
+        concordant += 0.5 * pos_in_group * neg_in_group;
+        neg_weight_below += neg_in_group;
         i = j;
     }
-    Ok(concordant / ((n_pos * n_neg) as f64))
+    Ok(concordant / (pos_weight * neg_weight))
 }
 
 pub(crate) fn benchmark_binary_logloss(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {

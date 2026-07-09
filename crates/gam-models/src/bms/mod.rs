@@ -603,8 +603,8 @@ impl LatentZNormalization {
     }
 }
 
-/// Blom-rankit weighted rank inverse-normal transform for the latent
-/// score.
+/// Weighted mid-distribution rank inverse-normal transform for the
+/// latent score.
 ///
 /// When the latent z fails the standard-normal auto-detection
 /// ([`latent_z_is_standard_normal_enough`]), the BMS family applied to
@@ -616,18 +616,25 @@ impl LatentZNormalization {
 /// and its higher-order siblings); at large scale that is the dominant
 /// cost.
 ///
-/// **Rank-INT is exact under monotone re-parameterisation.** The Blom rankit assigns
-/// each sorted training z the rank-probability
-/// `(W_i − 0.375) / (W_total + 0.25)`, then maps that probability
-/// through `Φ⁻¹`. The transform is **strictly monotone** on the
-/// observed support, so the BMS likelihood is invariant up to a
-/// re-parameterisation (the model is a transformation-equivariant
-/// family on the latent axis). The transformed sample is *exactly*
-/// N(0,1) by construction, so the standard-normal closed-form kernel
-/// is **exact** on the calibrated scale. The kept work is the same
-/// closed-form `signed_probit_logcdf_and_mills_ratio` evaluation as
-/// the no-calibration path; the dropped work is the empirical-grid
-/// jet machinery. Persisted to disk so prediction applies the same
+/// **Rank-INT is a modeling choice, not a reparameterisation.** The
+/// rigid BMS predictor is *affine* in the latent score
+/// (`η = q·√(1+b²) + b·z`), so a nonlinear monotone map of `z` changes
+/// the model class and its likelihood — it does not leave them
+/// invariant. Applying the calibration redefines the latent axis: the
+/// affine model is *specified on the calibrated score* `T(z)`. Nor is
+/// the calibrated training sample exactly N(0,1): a finite set of
+/// normal scores is discrete, and with heavy ties it can stay far from
+/// Gaussian. The closed-form standard-normal kernel is therefore
+/// adequate only when the calibrated sample itself passes the same
+/// standard-normal adequacy gate applied to raw z
+/// ([`latent_z_is_standard_normal_enough`]);
+/// [`build_latent_measure_with_geometry`] re-checks the calibrated
+/// sample and falls back to the mathematically exact global-empirical
+/// latent measure when that re-check fails. On the passing path the
+/// kept work is the same closed-form
+/// `signed_probit_logcdf_and_mills_ratio` evaluation as the
+/// no-calibration path; the dropped work is the empirical-grid jet
+/// machinery. Persisted to disk so prediction applies the same
 /// monotone map to incoming z and re-routes through the closed-form
 /// kernel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -862,10 +869,16 @@ pub enum LatentMeasureCalibration {
 /// estimated by weighted ridge regression of `z` (and its squared residual) on
 /// the marginal-index span `a(C) = [1 | X_marginal]`. The corrected `ζ` is
 /// conditionally centered (and homoskedastic when the variance block is
-/// active) by construction, so the `b(C)·m(C)` leakage vanishes and the
-/// standard-normal closed-form kernel is exact on `ζ`. Persisted so prediction
-/// rebuilds `a(C)` from the (reproducible) marginal design and applies the
-/// identical map to incoming z.
+/// active) by construction, so the `b(C)·m(C)` leakage vanishes. Matching the
+/// first two conditional moments does **not** by itself make `ζ` standard
+/// normal (a two-point residual law survives location-scale correction
+/// unchanged in shape), so [`build_latent_measure_with_geometry`] re-checks
+/// the calibrated sample against the standard-normal adequacy gate and
+/// retains an empirical latent measure for the residual distribution when
+/// that re-check fails; only a passing `ζ` uses the closed-form
+/// standard-normal kernel. Persisted so prediction rebuilds `a(C)` from the
+/// (reproducible) marginal design and applies the identical map to incoming
+/// z.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LatentZConditionalCalibration {
     /// Coefficients for the conditional mean `m(C) = β_m·[1 | a(C)]` over the
@@ -1615,7 +1628,7 @@ pub(crate) fn build_latent_measure_with_geometry(
     conditioning: Option<ArrayView2<'_, f64>>,
 ) -> Result<(LatentMeasureKind, LatentMeasureCalibration), String> {
     match policy.latent_measure {
-        LatentMeasureSpec::Auto { grid_size: _ } => {
+        LatentMeasureSpec::Auto { grid_size } => {
             // #905: conditional `E[z|C]`/`Var(z|C)` Rao gate. Inspect the latent
             // score's conditional moments on the marginal-index span a(C)
             // BEFORE the pooled-marginal gate. A significant conditional shift
@@ -1626,17 +1639,35 @@ pub(crate) fn build_latent_measure_with_geometry(
                 && let Some(cal) =
                     fit_conditional_latent_calibration_if_needed(z, weights, a_block)?
             {
+                // Matching the first two conditional moments does not
+                // establish Gaussianity of the residual ζ (a two-point
+                // residual law survives location-scale correction unchanged
+                // in shape). The closed-form standard-normal kernel is only
+                // admissible when the calibrated sample passes the same
+                // pooled adequacy gate raw z faces; otherwise retain an
+                // empirical latent measure built from ζ, so the residual
+                // distribution stays the one the data show.
+                let zeta = cal.apply(z.view(), a_block)?;
+                let residual_is_standard_normal =
+                    latent_z_is_standard_normal_enough(&zeta, weights, policy)?;
+                let kind = if residual_is_standard_normal {
+                    LatentMeasureKind::StandardNormal
+                } else {
+                    build_global_empirical_latent_measure(&zeta, weights, grid_size)?
+                };
                 log::info!(
-                    "[BMS latent-z] conditional location-scale calibrated: basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e} (E[z|C]/Var(z|C) Rao gate fired)",
+                    "[BMS latent-z] conditional location-scale calibrated: basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e} residual_measure={} (E[z|C]/Var(z|C) Rao gate fired)",
                     cal.basis_ncols,
                     !cal.var_coeffs.is_empty(),
                     cal.post_mean,
                     cal.post_sd,
+                    if residual_is_standard_normal {
+                        "standard-normal"
+                    } else {
+                        "global-empirical"
+                    },
                 );
-                return Ok((
-                    LatentMeasureKind::StandardNormal,
-                    LatentMeasureCalibration::ConditionalLocationScale(cal),
-                ));
+                return Ok((kind, LatentMeasureCalibration::ConditionalLocationScale(cal)));
             }
             if latent_z_is_standard_normal_enough(z, weights, policy)? {
                 Ok((
@@ -1644,25 +1675,41 @@ pub(crate) fn build_latent_measure_with_geometry(
                     LatentMeasureCalibration::None,
                 ))
             } else {
-                // P4: route bad-normal latent z through a Blom-rankit
-                // weighted rank inverse-normal transform. The transformed
-                // sample is exactly N(0,1) by construction, so the
-                // standard-normal closed-form rigid kernel is exact on the
-                // calibrated scale. This replaces the heavyweight
-                // local-/global-empirical paths at the construction site;
-                // the calibration is persisted so prediction applies the
-                // identical map.
+                // P4: route bad-normal latent z through a weighted
+                // mid-distribution-rank inverse-normal transform. Rank-INT
+                // redefines the latent axis (the affine rigid model is
+                // specified on the calibrated score); it makes the calibrated
+                // sample approximately — not exactly — N(0,1), so the
+                // closed-form standard-normal kernel is admitted only when
+                // the calibrated sample itself passes the adequacy gate.
+                // When it cannot (heavy ties leave the calibrated law
+                // discrete), fall back to the mathematically exact
+                // global-empirical latent measure on the raw score.
                 let calibration = LatentZRankIntCalibration::fit(z, weights)?;
-                log::info!(
-                    "[BMS latent-z] rank-INT calibrated: post_mean={:.3e} post_sd={:.3e} knots={}",
-                    calibration.post_mean,
-                    calibration.post_sd,
-                    calibration.sorted_z.len(),
-                );
-                Ok((
-                    LatentMeasureKind::StandardNormal,
-                    LatentMeasureCalibration::RankInverseNormal(calibration),
-                ))
+                let calibrated = calibration.apply_to_training(z)?;
+                if latent_z_is_standard_normal_enough(&calibrated, weights, policy)? {
+                    log::info!(
+                        "[BMS latent-z] rank-INT calibrated: post_mean={:.3e} post_sd={:.3e} knots={}",
+                        calibration.post_mean,
+                        calibration.post_sd,
+                        calibration.sorted_z.len(),
+                    );
+                    Ok((
+                        LatentMeasureKind::StandardNormal,
+                        LatentMeasureCalibration::RankInverseNormal(calibration),
+                    ))
+                } else {
+                    log::info!(
+                        "[BMS latent-z] rank-INT output failed the standard-normal adequacy gate (post_mean={:.3e} post_sd={:.3e} knots={}); using the global-empirical latent measure",
+                        calibration.post_mean,
+                        calibration.post_sd,
+                        calibration.sorted_z.len(),
+                    );
+                    Ok((
+                        build_global_empirical_latent_measure(z, weights, grid_size)?,
+                        LatentMeasureCalibration::None,
+                    ))
+                }
             }
         }
         LatentMeasureSpec::StandardNormal => Ok((

@@ -4778,6 +4778,15 @@ fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResul
 }
 
 #[pyfunction]
+fn weighted_auc_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    weights: Vec<f64>,
+) -> PyResult<f64> {
+    benchmark_scores::benchmark_weighted_auc_score(&observed, &predicted_mean, Some(&weights))
+}
+
+#[pyfunction]
 fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
     let diagnostics =
         gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
