@@ -27,6 +27,7 @@ struct Args {
     post_peel: bool,
     n_peeled: usize,
     pca_dim: Option<usize>,
+    gpu_mode: gam_gpu::GpuMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +70,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("atoms must be divisible by block-size".into());
     }
     validate_run_contract(&args, n_used, p)?;
+
+    // Device residency for the block-gate score-routing path (#2227/#1017). The
+    // block router dispatches admitted minibatches to the CUDA device lane when
+    // the mode is non-Off and a runtime is present. Under `--gpu required` a
+    // missing runtime or a below-break-even minibatch is a hard, up-front error
+    // (fail fast) rather than a silent CPU run or a GPU slot burned on a late
+    // crash; the per-minibatch admission uses the same `minibatch × K` score
+    // floor the router enforces.
+    gam_gpu::set_gpu_mode(args.gpu_mode);
+    let route_plan =
+        gam_gpu::DictionaryScoreRoutePlan::default_for_shape(args.minibatch.min(n_used), args.atoms, p);
+    println!(
+        "[scale_k] gpu={:?} per-minibatch score elems = {} (device_admitted={}, break-even={})",
+        args.gpu_mode,
+        args.minibatch.min(n_used).saturating_mul(args.atoms),
+        route_plan.device_admitted,
+        route_plan.device_min_score_elems,
+    );
+    if args.gpu_mode == gam_gpu::GpuMode::Required {
+        if gam_gpu::GpuRuntime::global().is_none() {
+            return Err(
+                "--gpu required but no CUDA runtime is available on this host (run on the A100 box)"
+                    .into(),
+            );
+        }
+        if !route_plan.device_admitted {
+            return Err(format!(
+                "--gpu required but minibatch {} x K {} = {} score elems is below the device \
+                 launch break-even {}; raise --minibatch to at least {}",
+                args.minibatch.min(n_used),
+                args.atoms,
+                args.minibatch.min(n_used).saturating_mul(args.atoms),
+                route_plan.device_min_score_elems,
+                route_plan.device_min_score_elems.div_ceil(args.atoms.max(1)),
+            )
+            .into());
+        }
+    }
 
     let admission = admit_sae_fit(n_used, p, args.atoms)?;
     if !admission.uses_sparse_codes() {
@@ -339,6 +378,7 @@ fn parse_args() -> Result<Args, String> {
     if raw.len() < 3 {
         return Err(
             "usage: scale_k <input.npy> <out-dir> [--rows N] [--atoms K] [--epochs N] \
+             [--minibatch M] [--gpu required|auto|off] \
              --post-peel --n-peeled N --pca-dim D [--raw-ok]"
                 .to_string(),
         );
@@ -361,6 +401,9 @@ fn parse_args() -> Result<Args, String> {
         post_peel: false,
         n_peeled: 0,
         pca_dim: None,
+        // Default Auto: the block router dispatches admitted minibatches to the
+        // CUDA block-gate device path on a CUDA host, else the CPU router.
+        gpu_mode: gam_gpu::GpuMode::Auto,
     };
     let mut i = 3usize;
     while i < raw.len() {
@@ -395,6 +438,14 @@ fn parse_args() -> Result<Args, String> {
             "--aux-k" => args.aux_k = parse_usize(value, key)?,
             "--n-peeled" => args.n_peeled = parse_usize(value, key)?,
             "--pca-dim" => args.pca_dim = Some(parse_usize(value, key)?),
+            "--gpu" => {
+                args.gpu_mode = match value.as_str() {
+                    "required" => gam_gpu::GpuMode::Required,
+                    "auto" => gam_gpu::GpuMode::Auto,
+                    "off" => gam_gpu::GpuMode::Off,
+                    other => return Err(format!("--gpu must be required|auto|off, got {other}")),
+                }
+            }
             other => return Err(format!("unknown argument {other}")),
         }
         i += 2;
