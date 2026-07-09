@@ -632,12 +632,14 @@ impl LatentZNormalization {
 /// kernel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LatentZRankIntCalibration {
-    /// Sorted unique z values seen during training, ascending. Knot table
-    /// for `apply_to_training` / `apply_at_predict`.
+    /// Sorted unique positive-mass z values seen during training, ascending.
+    /// Knot table for `apply_to_training` / `apply_at_predict`. Zero-weight
+    /// knots carry no probability mass and are not stored.
     pub sorted_z: Vec<f64>,
-    /// Weighted cumulative-distribution-function values at each
-    /// `sorted_z` knot, in `[eps, 1 - eps]` with
-    /// `eps = 0.5 / W_total`. Strictly increasing.
+    /// Weighted mid-distribution rank `(W_before + w_knot/2) / W_total` at
+    /// each `sorted_z` knot. Strictly increasing, strictly inside `(0, 1)`
+    /// (each knot is bounded away from the endpoints by half its own mass),
+    /// and invariant to a common rescaling of the weights.
     pub weighted_cdf: Vec<f64>,
     /// Weighted mean of the calibrated training sample. Used as a
     /// sanity-check value on `fit`; should be very close to zero.
@@ -651,12 +653,19 @@ impl LatentZRankIntCalibration {
     /// Fit the weighted rank-INT calibration from training z and weights.
     ///
     /// Algorithm:
-    /// 1. Sort rows by ascending z.
-    /// 2. Compute cumulative weight `W_i` at each sorted row.
-    /// 3. Blom-rankit cumulative probability:
-    ///    `p_i = (W_i − 0.375) / (W_total + 0.25)`.
-    /// 4. Clip to `[eps, 1 − eps]` with `eps = 0.5 / W_total`.
-    /// 5. Store `(sorted_z, weighted_cdf = p_i)`.
+    /// 1. Sort rows by ascending z and merge ties into one knot per unique
+    ///    z with the tie group's total weight `w_g`; discard zero-mass
+    ///    knots.
+    /// 2. Weighted mid-distribution rank at each knot:
+    ///    `p_g = (W_before + w_g/2) / W_total`,
+    ///    with `W_before` the cumulative weight strictly below the knot.
+    /// 3. Store `(sorted_z, weighted_cdf = p_g)`.
+    ///
+    /// The mid-rank depends only on *relative* weights (rescaling every
+    /// weight by a common factor leaves every `p_g` unchanged), is strictly
+    /// increasing across knots, and lies strictly inside `(0, 1)` — each
+    /// knot is separated from the endpoints by half its own mass, so no
+    /// ad-hoc clamp is needed and `Φ⁻¹(p_g)` is always finite.
     ///
     /// Returns the calibration plus the post-transform sample's weighted
     /// mean / SD for sanity-check logging.
@@ -696,27 +705,35 @@ impl LatentZRankIntCalibration {
 
         let mut sorted_z: Vec<f64> = Vec::with_capacity(z.len());
         let mut weighted_cdf: Vec<f64> = Vec::with_capacity(z.len());
-        let denom = w_total + 0.25;
-        let eps = 0.5 / w_total.max(1.0);
-        let mut cum_w = 0.0_f64;
-        let mut last_z: Option<f64> = None;
-        for &idx in &order {
-            cum_w += weights[idx];
-            let zi = z[idx];
-            // Collapse ties: store one knot per unique z (last cumulative).
-            if let Some(prev) = last_z
-                && zi == prev
-            {
-                if let Some(slot) = weighted_cdf.last_mut() {
-                    let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
-                    *slot = p;
-                }
-                continue;
+        // Merge ties into one knot per unique z, then assign the weighted
+        // mid-distribution rank p_g = (W_before + w_g/2) / W_total. This is
+        // the mid-point of the tie group's probability mass, so it depends
+        // only on relative weights, is strictly increasing, and sits
+        // strictly inside (0, 1) without any clamp. Zero-mass tie groups
+        // are not knots of the weighted empirical distribution and are
+        // dropped.
+        let mut cum_before = 0.0_f64;
+        let mut pos = 0usize;
+        while pos < order.len() {
+            let zi = z[order[pos]];
+            let mut w_group = 0.0_f64;
+            let mut end = pos;
+            while end < order.len() && z[order[end]] == zi {
+                w_group += weights[order[end]];
+                end += 1;
             }
-            let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
-            sorted_z.push(zi);
-            weighted_cdf.push(p);
-            last_z = Some(zi);
+            if w_group > 0.0 {
+                sorted_z.push(zi);
+                weighted_cdf.push((cum_before + 0.5 * w_group) / w_total);
+                cum_before += w_group;
+            }
+            pos = end;
+        }
+        if sorted_z.is_empty() {
+            return Err(
+                "rank-INT calibration requires at least one positive-weight observation"
+                    .to_string(),
+            );
         }
 
         // Compute sanity-check post-mean and post-sd on the transformed
