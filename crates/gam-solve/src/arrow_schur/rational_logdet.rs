@@ -279,8 +279,6 @@ impl RationalLogdetPlan {
         cg_rel_tol: f64,
         cg_max_iters: usize,
     ) -> Option<RationalLogdetEval> {
-        let m = self.probes.len();
-        let k = self.dim as f64;
         // Ladder: descending t (warm starts carry per vector across shifts).
         let mut order: Vec<usize> = (0..self.nodes.len()).collect();
         order.sort_by(|&a, &b| {
@@ -299,21 +297,8 @@ impl RationalLogdetPlan {
             .map(|d| d.basis.as_slice())
             .unwrap_or(&[]);
 
-        // Deflation-projected probes u_j = P v_j = v_j − Q(Qᵀ v_j). With no
-        // basis this is v_j unchanged, so the bare-Hutchinson path is recovered
-        // bit-for-bit (‖u_j‖² = k, one solve family, no term1).
-        let probes_proj: Vec<Array1<f64>> = self
-            .probes
-            .iter()
-            .map(|v| {
-                let mut u = v.clone();
-                for q in basis {
-                    let c = u.dot(q);
-                    u.scaled_add(-c, q);
-                }
-                u
-            })
-            .collect();
+        // Deflation-projected probes u_j = P v_j (raw probes without a basis).
+        let probes_proj = self.projected_probes(basis);
 
         // Shifted solves for the projected probes and (if any) the basis columns.
         let (shifted, iters_probe) =
@@ -323,8 +308,54 @@ impl RationalLogdetPlan {
         } else {
             solve_shift_ladder(matvec, &self.nodes, &order, basis, cg_rel_tol, cg_max_iters)?
         };
-        let total_iters = iters_probe + iters_basis;
+        self.assemble_eval(
+            probes_proj,
+            basis,
+            shifted,
+            deflation_solves,
+            iters_probe + iters_basis,
+        )
+    }
 
+    /// Deflation-projected probes `u_j = P v_j = v_j − Q(Qᵀ v_j)` (the raw probes
+    /// bit-for-bit when `basis` is empty: `‖u_j‖² = k`, no term1). Shared by
+    /// [`Self::evaluate`] and the wide-κ discriminator's exact-solve audit arm so
+    /// BOTH project against the identical frozen `Q` the term1 columns use — the
+    /// one place the "exact for any orthonormal Q" proof could silently break is a
+    /// `Q` that differs between the probe projector and term1, so they must draw
+    /// from the same `basis` slice.
+    fn projected_probes(&self, basis: &[Array1<f64>]) -> Vec<Array1<f64>> {
+        self.probes
+            .iter()
+            .map(|v| {
+                let mut u = v.clone();
+                for q in basis {
+                    let c = u.dot(q);
+                    u.scaled_add(-c, q);
+                }
+                u
+            })
+            .collect()
+    }
+
+    /// Assemble the surrogate value, error bar, and carried solves from the two
+    /// shifted-solve ladders — `shifted[ℓ][j]` for the projected probes and
+    /// `deflation_solves[ℓ][i]` for the basis columns, both indexed by node `ℓ`.
+    /// The ONLY solver-dependent inputs are those two ladders, so [`Self::evaluate`]
+    /// (CG) and any exact-solve audit that feeds the same ladders produce
+    /// byte-identical term1/term2/std_err bookkeeping — the property the wide-κ
+    /// discriminator's exact arm relies on to isolate solve error from a structural
+    /// split bias.
+    fn assemble_eval(
+        &self,
+        probes_proj: Vec<Array1<f64>>,
+        basis: &[Array1<f64>],
+        shifted: Vec<Vec<Array1<f64>>>,
+        deflation_solves: Vec<Vec<Array1<f64>>>,
+        total_iters: usize,
+    ) -> Option<RationalLogdetEval> {
+        let m = self.probes.len();
+        let k = self.dim as f64;
         // term1 = tr(Qᵀ log(S/c) Q) = Σ_i Σ_ℓ w_ℓ (‖q_i‖²/(c+t_ℓ) − q_iᵀ y_{q_iℓ}),
         // ‖q_i‖² = 1. Deterministic (no probe variance).
         let mut term1 = 0.0_f64;
@@ -811,6 +842,47 @@ mod tests {
         );
     }
 
+    /// Exact (dense Cholesky) audit arm: solve every shifted system
+    /// `(A + t_ℓ I) y = v` directly, replacing the CG ladder, but feed the results
+    /// through the SAME [`RationalLogdetPlan::assemble_eval`] the production
+    /// `evaluate` uses — identical probes, nodes, frozen `Q`, and term1/term2
+    /// bookkeeping. Any gap between this and the exact log-det is then split/Q
+    /// structure (or quadrature/probe), never CG solve error, since there is none.
+    fn evaluate_exact(plan: &RationalLogdetPlan, a: &Array2<f64>) -> RationalLogdetEval {
+        use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
+        let basis: &[Array1<f64>] = plan
+            .deflation
+            .as_ref()
+            .map(|d| d.basis.as_slice())
+            .unwrap_or(&[]);
+        let probes_proj = plan.projected_probes(basis);
+        let exact_ladder = |vectors: &[Array1<f64>]| -> Vec<Vec<Array1<f64>>> {
+            plan.nodes
+                .iter()
+                .map(|&(t, _)| {
+                    let mut at = a.clone();
+                    for i in 0..a.nrows() {
+                        at[[i, i]] += t;
+                    }
+                    let l = cholesky_factor_in_place(at.view(), CholeskyGuard::FiniteStrict)
+                        .expect("shifted SPD system must factor");
+                    vectors
+                        .iter()
+                        .map(|v| cholesky_solve_vector(l.view(), v.view()))
+                        .collect()
+                })
+                .collect()
+        };
+        let shifted = exact_ladder(&probes_proj);
+        let deflation_solves = if basis.is_empty() {
+            Vec::new()
+        } else {
+            exact_ladder(basis)
+        };
+        plan.assemble_eval(probes_proj, basis, shifted, deflation_solves, 0)
+            .expect("exact assemble")
+    }
+
     #[test]
     fn deflation_wide_kappa_bias_cg_convergence_discriminator() {
         // #2080 loop discriminator (battery_5e59e646b). With BOTH the quadrature
@@ -844,26 +916,90 @@ mod tests {
         let matvec = |v: ArrayView1<f64>| a.dot(&v);
         let plain = RationalLogdetPlan::build(dim, 32, 17, lmin, lmax, 1e-9).expect("plan");
         let defl = plain.clone().with_deflation(&matvec, 16, 3, 555);
-        // Loose CG (the failing fixture's budget) vs tightened CG (the discriminator).
+        // Three arms on the SAME deflated plan: loose CG (the failing fixture's
+        // budget), tightened CG, and EXACT dense-Cholesky solves. The exact arm is
+        // the DEFINITIVE one — it carries no CG error, so its residual is purely
+        // split/Q/quadrature structure.
         let e_loose = defl.evaluate(&matvec, 1e-12, 50_000).expect("loose");
         let e_tight = defl.evaluate(&matvec, 1e-15, 500_000).expect("tight");
+        let e_exact = evaluate_exact(&defl, &a);
         let rel_loose = (e_loose.estimate - logdet).abs() / logdet.abs().max(1.0);
         let rel_tight = (e_tight.estimate - logdet).abs() / logdet.abs().max(1.0);
+        let rel_exact = (e_exact.estimate - logdet).abs() / logdet.abs().max(1.0);
+        // Structural suspect 1: is the loose bias many σ (systematic) or within the
+        // Hutchinson bar (a probe fluctuation)? gap ≈ 5.85 vs the reported std_err.
+        let gap = logdet - e_loose.estimate;
+        let sigma_ratio = gap.abs() / e_loose.std_err.max(1e-300);
         eprintln!(
-            "wide-κ CG discriminator: exact={logdet:.6} loose(1e-12,50k)={:.6} rel={rel_loose:.3e} \
-             tight(1e-15,500k)={:.6} rel={rel_tight:.3e} Δest={:.3e}",
+            "wide-κ 3-arm discriminator: exact_logdet={logdet:.6}\n  \
+             loose(1e-12,50k)  est={:.6} rel={rel_loose:.3e} std_err={:.3e}\n  \
+             tight(1e-15,500k) est={:.6} rel={rel_tight:.3e} Δvs_loose={:.3e}\n  \
+             EXACT(cholesky)   est={:.6} rel={rel_exact:.3e} Δvs_loose={:.3e}\n  \
+             gap={gap:.4} = {sigma_ratio:.1}σ (loose std_err)",
             e_loose.estimate,
+            e_loose.std_err,
             e_tight.estimate,
-            (e_tight.estimate - e_loose.estimate).abs()
+            (e_tight.estimate - e_loose.estimate).abs(),
+            e_exact.estimate,
+            (e_exact.estimate - e_loose.estimate).abs(),
         );
-        // GREEN ⇒ tightening CG removed the bias ⇒ solve-convergence root.
-        // RED with Δest≈0 ⇒ bias is structural in the deflated split.
+
+        // Structural suspect 2: the "exact for any orthonormal Q" proof breaks only
+        // if the probe projector and term1 use a DIFFERENT or non-orthonormal Q.
+        // Verify the realised Q is the frozen basis, is orthonormal, and that the
+        // projected probes are truly Q-orthogonal (P = I − QQᵀ applied).
+        let frozen: &[Array1<f64>] = defl
+            .deflation
+            .as_ref()
+            .map(|d| d.basis.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(
+            e_exact.deflation_basis.len(),
+            frozen.len(),
+            "exact arm must realise the same frozen Q rank as the plan"
+        );
+        for (qe, qf) in e_exact.deflation_basis.iter().zip(frozen) {
+            assert!(
+                (qe - qf).mapv(f64::abs).sum() < 1e-12,
+                "term1's Q must be the plan's frozen Q (no drift)"
+            );
+        }
+        for (i, qi) in frozen.iter().enumerate() {
+            for (j, qj) in frozen.iter().enumerate() {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (qi.dot(qj) - expect).abs() < 1e-9,
+                    "frozen Q must be orthonormal: QᵀQ[{i},{j}] = {}",
+                    qi.dot(qj)
+                );
+            }
+        }
+        let proj = defl.projected_probes(frozen);
+        for u in &proj {
+            for q in frozen {
+                assert!(
+                    u.dot(q).abs() < 1e-9,
+                    "projected probe must be Q-orthogonal (same P as term1)"
+                );
+            }
+        }
+
+        // DEFINITIVE verdict via the exact arm (no CG error possible):
+        //   GREEN (rel_exact < 0.05) ⇒ the deflated split / frozen-Q structure is
+        //     SOUND; ALL residual bias in the CG path is solve error → the fix is
+        //     per-shift preconditioning (the κ·ε≈2e-8 residual floor at κ=1e8 means
+        //     a tighter cg_rel_tol alone cannot reach it; Jacobi / shifted-system
+        //     preconditioning is the lever, not tolerance).
+        //   RED with rel_exact ≈ rel_loose ⇒ the bias is STRUCTURAL in the deflated
+        //     split with the frozen subspace-iteration Q at wide κ → fresh derivation.
+        // The loop verdicts this test's pass/fail alongside the three logged arms.
         assert!(
-            rel_tight < 0.05,
-            "tightened-CG deflated estimate rel err {rel_tight:.3e} (est {} vs exact {logdet}); \
-             loose rel {rel_loose:.3e} — if ≈ loose (Δest≈0) the wide-κ bias is STRUCTURAL in \
-             the deflated split, not CG convergence",
-            e_tight.estimate
+            rel_exact < 0.05,
+            "EXACT-solve deflated estimate rel err {rel_exact:.3e} (est {} vs exact {logdet}); \
+             CG loose rel {rel_loose:.3e}, tight rel {rel_tight:.3e}. With no CG error possible, \
+             rel_exact ≈ rel_loose ⇒ the wide-κ bias is STRUCTURAL in the deflated split, not \
+             solve convergence",
+            e_exact.estimate
         );
     }
 
