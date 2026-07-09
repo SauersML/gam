@@ -77,7 +77,7 @@ def make_split(X: np.ndarray, test_frac: float, seed: int):
 
 # --------------------------------------------------------------------------- #
 def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
-                      return_model=False, cosine_lr=False):
+                      return_model=False, cosine_lr=False, collect=None):
     """Gao-et-al. TopK SAE with the standard training refinements (tied init,
     unit-norm decoder columns, pre-bias). The traditional-SAE bar."""
     import torch
@@ -132,6 +132,13 @@ def fit_external_topk(x_tr, x_te, mean_tr, *, K, top_k, steps, lr, bs, seed,
             outs.append(decode(vals, idx).float().cpu().numpy())
     recon = np.concatenate(outs, 0)
     ev = held_out_ev(x_te, recon, mean_tr)
+    if collect is not None:
+        # Stash the flat weights as numpy so the Eq-4 bits builder re-encodes
+        # x_bits host-side (torch-free) with the SAME dictionary.
+        collect["W_enc"] = W_enc.detach().float().cpu().numpy()
+        collect["W_dec"] = W_dec.detach().float().cpu().numpy()
+        collect["b_dec"] = b_dec.detach().float().cpu().numpy()
+        collect["top_k_flat"] = int(top_k)
     if return_model:
         return ev, (encode, decode, dev)
     return ev
@@ -154,12 +161,14 @@ def fit_pca_bar(x_tr, x_te, mean_tr, *, ranks):
     return out
 
 
-def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed):
+def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed, collect=None):
     import gamfit
 
     fit = gamfit.sparse_dictionary_fit(x_tr, K, active=top_k, max_epochs=max_epochs)
     tr = fit.transform(x_te)
     recon = fit.reconstruct(tr.indices, tr.codes)
+    if collect is not None:
+        collect["flat_fit"] = fit
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
 
@@ -244,7 +253,7 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
 
 
 def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
-               flat_steps, curved_steps, lr, bs, seed, manifold, basis):
+               flat_steps, curved_steps, lr, bs, seed, manifold, basis, collect=None):
     """Flat TopK at reduced budget k_lin + torch manifold on the flat residual.
 
     Matched per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
@@ -255,7 +264,7 @@ def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
     print(f"[hybrid] k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
     ev_flat, (encode, decode, dev) = fit_external_topk(
         x_tr, x_te, mean_tr, K=K, top_k=k_lin, steps=flat_steps, lr=lr, bs=bs,
-        seed=seed, return_model=True)
+        seed=seed, return_model=True, collect=collect)
     print(f"[hybrid] flat tier ev={ev_flat:.4f} (k_lin={k_lin})", flush=True)
     import torch
     with torch.no_grad():
@@ -268,15 +277,21 @@ def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
             return np.concatenate(parts, 0)
         r_tr, r_te = resid(x_tr), resid(x_te)
     flat_recon_te = x_te - r_te
-    curved_recon_r, _ = _torch_manifold_recon(
+    curved_recon_r, curved_model = _torch_manifold_recon(
         r_tr, r_te, atoms=curved_atoms, target_k=curved_k, d=d, steps=curved_steps,
         lr=lr, bs=bs, seed=seed, manifold=manifold, basis=basis)
     combined = flat_recon_te + curved_recon_r
+    if collect is not None:
+        collect["k_lin"] = k_lin
+        collect["r_te"] = r_te
+        collect["curved_model"] = curved_model
+        collect["dev"] = dev
+        collect["recon_full"] = combined
     return held_out_ev(x_te, combined, mean_tr), ev_flat
 
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
-                    topology, max_epochs, curved_rows, seed):
+                    topology, max_epochs, curved_rows, seed, collect=None):
     """ALL-RUST hybrid: gam sparse_dictionary_fit linear tier at reduced actives
     + gam sae_manifold_fit curved TopK tier on the linear residual. Matched
     per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k."""
@@ -305,11 +320,65 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
         assignment="topk", top_k=curved_k, random_state=seed)
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
     curved_recon_te = np.asarray(curved.reconstruct(r_te), dtype=np.float32)
-    ev = held_out_ev(x_te, flat_recon_te + curved_recon_te, mean_tr)
+    combined = flat_recon_te + curved_recon_te
+    if collect is not None:
+        collect["flat_fit"] = flat
+        collect["curved_model"] = curved
+        collect["r_te"] = r_te
+        collect["recon_full"] = combined
+    ev = held_out_ev(x_te, combined, mean_tr)
     return ev, ev_flat
 
 
 # --------------------------------------------------------------------------- #
+def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
+    """Build the arm's FittedFeaturizer on a test subsample and score Eq-4 bits.
+
+    Returns a dict of ``bits_at_r2_*`` / ``code_bits_*`` / ``resid_bits_*`` /
+    ``support_bits`` (namespaced ``bits_<key>``) plus the scorer provenance, or
+    ``None`` for arms with no bits builder wired (gam#2233 task 3 wires the four
+    dominance-argument contestants: external_topk, gam_flat, hybrid, hybrid_rust).
+    """
+    # Local imports so a non-bits run never pays the sibling-module import.
+    import bits_eq4
+    import arm_featurizers as af
+
+    n_te = x_te.shape[0]
+    rng = np.random.default_rng(seed + 7)  # bits stream separate from fit/split
+    take = min(int(bits_max_rows), n_te)
+    idx = np.sort(rng.choice(n_te, take, replace=False))
+    x_bits = np.ascontiguousarray(x_te[idx])
+
+    if arm == "external_topk":
+        fitted = af.build_external_topk(
+            x_bits, W_enc=collect["W_enc"], W_dec=collect["W_dec"],
+            b_dec=collect["b_dec"], top_k=collect.get("top_k_flat"))
+    elif arm == "gam_flat":
+        fitted = af.build_gam_flat(x_bits, fit=collect["flat_fit"])
+    elif arm == "hybrid":
+        r_bits = np.ascontiguousarray(collect["r_te"][idx])
+        recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
+        fitted = af.build_hybrid_torch(
+            x_bits, r_bits, W_enc=collect["W_enc"], W_dec=collect["W_dec"],
+            b_dec=collect["b_dec"], k_lin=collect["k_lin"],
+            curved_model=collect["curved_model"], dev=collect["dev"],
+            recon_full=recon_bits)
+    elif arm == "hybrid_rust":
+        r_bits = np.ascontiguousarray(collect["r_te"][idx])
+        recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
+        fitted = af.build_hybrid_rust(
+            x_bits, r_bits, flat_fit=collect["flat_fit"],
+            curved_model=collect["curved_model"], recon_full=recon_bits)
+    else:
+        return None
+
+    dl = bits_eq4.description_length(fitted, x_bits.astype(np.float64))
+    out = {f"bits_{k}": v for k, v in dl.items()}
+    out["bits_scorer"] = bits_eq4.scorer_source()
+    out["bits_rows"] = int(take)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True,
@@ -336,6 +405,14 @@ def main() -> int:
                     help="hybrid_rust: row subsample for the curved-tier Rust fit")
     ap.add_argument("--cosine-lr", action="store_true",
                     help="cosine LR decay for the external bar (stronger baseline)")
+    ap.add_argument("--bits", action="store_true",
+                    help="also score gam#2233 Eq-4 description-length bits at fixed "
+                         "R2 on the test split (the MDL scoreboard the crossover "
+                         "theorem says curved atoms win by a wide margin)")
+    ap.add_argument("--bits-max-rows", type=int, default=8192,
+                    help="test-row subsample for Eq-4 bits (bounds the per-atom "
+                         "SVD sweep at K=32768); the gate/contrib/recon are all "
+                         "rebuilt on this same subsample")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default="results_1026.jsonl")
     args = ap.parse_args()
@@ -349,13 +426,18 @@ def main() -> int:
 
     t0 = time.perf_counter()
     extra: dict = {}
+    # Handles for the Eq-4 bits scorer (gam#2233); only the four wired arms
+    # populate it, and only when --bits is requested.
+    collect: dict | None = {} if args.bits else None
     if args.arm == "external_topk":
         ev = fit_external_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                steps=args.steps, lr=args.lr, bs=args.batch_size,
-                               seed=args.seed, cosine_lr=args.cosine_lr)
+                               seed=args.seed, cosine_lr=args.cosine_lr,
+                               collect=collect)
     elif args.arm == "gam_flat":
         ev, ev_train = fit_gam_flat(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
-                                    max_epochs=args.max_epochs, seed=args.seed)
+                                    max_epochs=args.max_epochs, seed=args.seed,
+                                    collect=collect)
         extra["ev_train"] = ev_train
     elif args.arm == "curved_topk":
         ev = fit_curved_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
@@ -372,7 +454,8 @@ def main() -> int:
                                       curved_K=args.curved_atoms, curved_k=args.curved_k,
                                       d=args.d_atom, topology=args.atom_topology,
                                       max_epochs=args.max_epochs,
-                                      curved_rows=args.curved_rows, seed=args.seed)
+                                      curved_rows=args.curved_rows, seed=args.seed,
+                                      collect=collect)
         extra["ev_flat_tier"] = ev_flat
     elif args.arm == "pca_bar":
         extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
@@ -383,8 +466,14 @@ def main() -> int:
                                  d=args.d_atom, flat_steps=args.steps,
                                  curved_steps=args.curved_steps, lr=args.lr,
                                  bs=args.batch_size, seed=args.seed,
-                                 manifold=args.atom_manifold, basis=args.atom_basis)
+                                 manifold=args.atom_manifold, basis=args.atom_basis,
+                                 collect=collect)
         extra["ev_flat_tier"] = ev_flat
+
+    if args.bits and collect is not None:
+        bits = score_bits_for_arm(args.arm, collect, x_te, args.bits_max_rows, args.seed)
+        if bits is not None:
+            extra.update(bits)
 
     wall = time.perf_counter() - t0
     rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,
