@@ -3153,12 +3153,12 @@ impl SaeManifoldOuterObjective {
         // (5) Admit the discovery basin and read the envelope. `same_basin_at_rho`
         // needs the centered target variance normalizer; compute it once.
         let rho_state = self.baseline_rho.from_flat(rho_flat);
-        let ss_tot = super::fit_drivers::TargetCenteredColStats::compute(self.target.view()).ss_tot;
-        let target = self.target.view();
+        let ss_tot =
+            super::fit_drivers::TargetCenteredColStats::compute(self.target.view()).ss_tot();
         let len_before = bundle.len();
         if let (Some(term), Some(cost)) = (discovery_term, discovery_cost) {
             bundle.admit(term, cost, |a, b| {
-                Self::same_basin_at_rho(a, b, target, &rho_state, ss_tot)
+                Self::same_basin_at_rho(a, b, &rho_state, ss_tot)
             });
         }
         let grew = bundle.len() > len_before;
@@ -3257,7 +3257,6 @@ impl SaeManifoldOuterObjective {
     fn same_basin_at_rho(
         a: &SaeManifoldTerm,
         b: &SaeManifoldTerm,
-        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         ss_tot: f64,
     ) -> bool {

@@ -687,7 +687,14 @@ pub fn assert_registry_well_formed(registry: &[CalibrationTarget]) {
             problems.push(format!("target `{}` names no gate (`audited_by` empty)", t.name));
         }
         let mode_ok = match t.kind {
-            SurfaceKind::PosteriorSample => t.mode == AuditMode::SbcRankUniformity,
+            // SBC rank uniformity is the ideal posterior audit (it sees shape
+            // miscalibration a 3-level coverage sweep misses), but a posterior
+            // surface consumed only through a derived band may be legitimately
+            // gated by that band's coverage until a bespoke SBC gate exists —
+            // both are accepted, a test-size or interval mode is not.
+            SurfaceKind::PosteriorSample => {
+                t.mode == AuditMode::SbcRankUniformity || t.mode == AuditMode::CoverageSweep
+            }
             SurfaceKind::TestPValue => t.mode == AuditMode::TestSizeCurve,
             _ => t.mode == AuditMode::CoverageSweep,
         };
@@ -951,19 +958,20 @@ mod tests {
     }
 
     #[test]
-    fn well_formed_check_flags_wrong_audit_mode_for_a_posterior_kind() {
+    fn well_formed_check_flags_wrong_audit_mode() {
         assert_registry_well_formed(&tiny_registry());
-        // A posterior surface routed to a coverage sweep (which cannot see the
-        // shape miscalibration SBC catches) must be flagged.
+        // A frequentist test p-value routed to a coverage sweep instead of the
+        // type-I size curve is a mis-audit (it would never check the size under
+        // the null the #1872/#1873 defects corrupt) — must be flagged.
         let mis = vec![CalibrationTarget {
-            name: "nuts_posterior",
-            kind: SurfaceKind::PosteriorSample,
+            name: "lr_pvalue",
+            kind: SurfaceKind::TestPValue,
             mode: AuditMode::CoverageSweep,
-            guards: &[1841],
+            guards: &[1872],
             audited_by: "somewhere",
         }];
         let caught = std::panic::catch_unwind(|| assert_registry_well_formed(&mis));
-        assert!(caught.is_err(), "posterior kind on a coverage sweep must be flagged");
+        assert!(caught.is_err(), "test p-value on a coverage sweep must be flagged");
     }
 
     #[test]

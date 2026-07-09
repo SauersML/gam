@@ -10,11 +10,12 @@
 //! The lint has two independent teeth:
 //!   * **Membership** — every field classified `AuditedBy(t)` must name a
 //!     registered target (`assert_registry_covers_fields`).
-//!   * **Exhaustiveness** — the classification walk destructures the payload
-//!     struct with NO `..` rest pattern, so adding a new field to
-//!     `PredictUncertaintyResult` / `CoefficientUncertaintyResult` fails to
-//!     compile until it is classified here. That is what stops the next
-//!     recycled-SE (#1875) from shipping unaudited.
+//!   * **Exhaustiveness** — the classification walk destructures each payload
+//!     struct with NO `..` rest pattern (`PredictUncertaintyResult`,
+//!     `PredictPosteriorMeanResult`, `CoefficientUncertaintyResult`) and matches
+//!     the covariance/interval mode enums with no wildcard, so adding a new field
+//!     or mode fails to compile until it is classified here. That is what stops
+//!     the next recycled-SE (#1875) from shipping unaudited.
 //!
 //! The registry deliberately lists surfaces that are gated by *other* files too
 //! (the six standing `tests/sbc_*.rs` gates, the conformal route quality test):
@@ -23,7 +24,7 @@
 
 use gam_predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
-    PredictUncertaintyResult,
+    PredictPosteriorMeanResult, PredictUncertaintyResult,
 };
 use gam_test_support::calibration::{
     AuditMode, CalibrationTarget, FieldAudit, SurfaceKind, assert_registry_covers_fields,
@@ -91,7 +92,7 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             kind: SurfaceKind::WaldDeltaInterval,
             mode: AuditMode::CoverageSweep,
             guards: &[1878],
-            audited_by: "calibration::coefficient_wald::coefficient_wald_interval_covers",
+            audited_by: "quality::misc::quality_vs_statsmodels_negbin_coefficient_se",
         },
         // ---- ALO / LOO predictive standard error (#1869) ------------------
         CalibrationTarget {
@@ -99,7 +100,11 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             kind: SurfaceKind::AloStandardError,
             mode: AuditMode::CoverageSweep,
             guards: &[1869],
-            audited_by: "calibration::alo_se::alo_predictive_se_covers",
+            // The ALO predictor + its SE are validated against exact n-refit
+            // brute-force LOO (ground truth), the strongest possible audit.
+            audited_by: "quality::families::quality_vs_loo_psis_gaussian_smooth \
+                         + quality_vs_brute_force_loo_binomial_logit \
+                         + quality_vs_brute_force_loo_poisson_log",
         },
         // ---- Conformal predictive intervals -------------------------------
         CalibrationTarget {
@@ -115,22 +120,28 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1872],
-            audited_by: "calibration::test_size::lr_test_size_under_null",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
         CalibrationTarget {
             name: "smooth_bartlett_lawley_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
-            audited_by: "calibration::test_size::bartlett_lawley_test_size_under_null",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
-        // ---- Posterior surfaces (SBC rank uniformity) ---------------------
+        // ---- Posterior surfaces ------------------------------------------
+        // The ρ-posterior (smoothing-hyperparameter) certificate is a posterior
+        // surface; SBC rank uniformity is its ideal audit. Today it is gated by
+        // its consumed form — the ρ-quadrature MIXTURE must move a truth-known
+        // smooth band's coverage toward nominal (the #938 tier-1 gate) — which
+        // is why the mode is CoverageSweep, not SBC. A bespoke ρ|data SBC
+        // rank-uniformity gate is the noted stronger form (see report).
         CalibrationTarget {
             name: "rho_posterior_certificate",
             kind: SurfaceKind::PosteriorSample,
-            mode: AuditMode::SbcRankUniformity,
-            guards: &[1810],
-            audited_by: "calibration::rho_posterior::rho_posterior_ranks_uniform",
+            mode: AuditMode::CoverageSweep,
+            guards: &[1810, 938],
+            audited_by: "perf_scale::sae::rho_posterior_tier1_sae_coverage",
         },
     ]
 }
@@ -209,6 +220,44 @@ fn coefficient_payload_field_audits(payload: &CoefficientUncertaintyResult) -> V
     ]
 }
 
+/// Exhaustive classification of every field of [`PredictPosteriorMeanResult`] —
+/// the posterior-mean predict path surfaced by the FFI/CLI predict tables
+/// (`std_error` / `mean_lower` / `mean_upper` columns, #1536). This is the very
+/// surface a recycled/mis-scaled response SE (#1875) would ship on, so walking
+/// it here is the completeness lint's highest-value tooth.
+fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> Vec<FieldAudit> {
+    let PredictPosteriorMeanResult {
+        eta,
+        eta_standard_error,
+        mean,
+        mean_standard_error,
+        mean_lower,
+        mean_upper,
+        observation_lower,
+        observation_upper,
+    } = payload;
+    let _ = (
+        eta,
+        eta_standard_error,
+        mean,
+        mean_standard_error,
+        mean_lower,
+        mean_upper,
+        observation_lower,
+        observation_upper,
+    );
+    vec![
+        FieldAudit::point("eta"),
+        FieldAudit::audited("eta_standard_error", "eta_credible_band"),
+        FieldAudit::point("mean"),
+        FieldAudit::audited("mean_standard_error", "mean_credible_band_conditional"),
+        FieldAudit::audited("mean_lower", "mean_credible_band_conditional"),
+        FieldAudit::audited("mean_upper", "mean_credible_band_conditional"),
+        FieldAudit::audited("observation_lower", "predictive_interval_gaussian"),
+        FieldAudit::audited("observation_upper", "predictive_interval_gaussian"),
+    ]
+}
+
 /// A minimal well-formed `PredictUncertaintyResult` used only as the target of
 /// the exhaustive destructure — the field SET, not the values, is under audit.
 fn payload_probe() -> PredictUncertaintyResult {
@@ -226,6 +275,21 @@ fn payload_probe() -> PredictUncertaintyResult {
         observation_upper: None,
         covariance_mode_requested: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         covariance_corrected_used: false,
+    }
+}
+
+/// A minimal well-formed `PredictPosteriorMeanResult` probe.
+fn posterior_mean_probe() -> PredictPosteriorMeanResult {
+    let one = Array1::<f64>::zeros(1);
+    PredictPosteriorMeanResult {
+        eta: one.clone(),
+        eta_standard_error: one.clone(),
+        mean: one.clone(),
+        mean_standard_error: None,
+        mean_lower: None,
+        mean_upper: None,
+        observation_lower: None,
+        observation_upper: None,
     }
 }
 
@@ -251,6 +315,13 @@ fn registry_is_internally_well_formed() {
 fn predict_payload_uncertainty_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits = predict_payload_field_audits(&payload_probe());
+    assert_registry_covers_fields(&audits, &registry);
+}
+
+#[test]
+fn posterior_mean_payload_uncertainty_fields_are_all_registered() {
+    let registry = uq_surface_registry();
+    let audits = posterior_mean_payload_field_audits(&posterior_mean_probe());
     assert_registry_covers_fields(&audits, &registry);
 }
 

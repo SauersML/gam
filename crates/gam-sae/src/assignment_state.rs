@@ -1,5 +1,5 @@
 //! Unified support-sparse assignment state for the SAE fit-path unification
-//! (design: `docs/design/sae-unification.md`, Increment 1).
+//! (design: gam#2232, Increment 1).
 //!
 //! [`SaeAssignmentState`] is the ONE per-row routing state the unified engine
 //! carries: per row it stores the active atom set `S_i ⊆ [K]` as

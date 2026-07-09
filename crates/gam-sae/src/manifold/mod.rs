@@ -234,6 +234,9 @@ mod wbic_dynamics;
 mod tests;
 
 #[cfg(test)]
+mod tests_basin_bundle_envelope;
+
+#[cfg(test)]
 mod tests_chart_evaluator_jets;
 
 #[cfg(test)]

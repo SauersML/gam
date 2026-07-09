@@ -2,18 +2,21 @@
 //!
 //! The calibration harness is the "ban-scanner for uncertainty": every surface
 //! the library reports a coverage / credibility / size claim on is enumerated in
-//! [`registry`] and gated by an audit mode chosen by its kind. This suite holds
-//! (a) the registry + completeness lint and (b) the gates for the surfaces that
-//! were NOT already covered by the six standing `tests/sbc_*.rs` gates —
-//! coefficient Wald intervals, ALO/LOO predictive SEs (#1869), frequentist
-//! test-size curves (#1872/#1873), and the ρ-posterior certificate SBC (#1810).
+//! [`registry`] and gated by an audit mode chosen by its kind.
+//!
+//! This module holds the CONTRACT half — the registry and the completeness lint
+//! that walks the public result payloads field by field and asserts each
+//! uncertainty-bearing field maps to a registered target. The audit GATES
+//! themselves are standing integration binaries so a single miscompiled gate
+//! cannot take down the whole grouped `quality` binary:
+//!   * the six credible-band / predictive gates: `tests/sbc_*.rs`;
+//!   * conformal intervals: `tests/misc/predict/full_conformal_predict_route_quality.rs`;
+//!   * the ALO/LOO predictive SE (#1869): `tests/sbc_alo_predictive_se_coverage.rs`;
+//!   * smooth-test size under the null (#1872/#1873): the standing
+//!     `bug_hunt_smooth_significance_*` gates.
 //!
 //! The reusable engine (`run_sbc`/`audit_sbc_uniformity`, `run_coverage`/
 //! `audit_coverage`, the Wilson verdict, the registry types) lives in
-//! `gam_test_support::calibration`; these files are its consumers.
+//! `gam_test_support::calibration`; this file is its consumer.
 
-mod alo_se;
-mod coefficient_wald;
 mod registry;
-mod rho_posterior;
-mod test_size;

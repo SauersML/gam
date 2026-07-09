@@ -104,6 +104,13 @@ impl TargetCenteredColStats {
         }
         Self { col_means, ss_tot }
     }
+
+    /// Centered total sum of squares `Σ_col Σ_row (y − mean_col)²` — the EV
+    /// normalizer. Exposed for the basin-identity reconstruction distance in
+    /// [`SaeManifoldOuterObjective`] (#2230/#2087).
+    pub(crate) fn ss_tot(&self) -> f64 {
+        self.ss_tot
+    }
 }
 
 impl SaeManifoldTerm {

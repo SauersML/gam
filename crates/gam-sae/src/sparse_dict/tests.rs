@@ -994,9 +994,11 @@ fn large_k_fit_reports_admitted_route_stats_and_is_reproducible() {
 /// The host score route must be invariant to minibatch/chunk granularity: each
 /// routed shortlist and its active-set codes depend only on their own row, so
 /// splitting the rows into many parallel minibatch chunks (the multi-core host
-/// path) must return byte-identical routing to routing the whole block at once.
-/// This pins the parallel `route_and_code_all` host fast path (the fix for the
-/// single-threaded `matrixmultiply` score wall) against a single-block route.
+/// path) must return the same routing as routing the whole block at once —
+/// exact-equal atom shortlists, and codes equal to f32 tolerance (the per-row
+/// s×s solve is independent of how the rows are grouped). This pins the parallel
+/// `route_and_code_all` host fast path (the fix for the single-threaded
+/// `matrixmultiply` score wall) against a single-block route.
 #[test]
 fn host_route_is_invariant_to_minibatch_chunking() {
     use super::update::route_and_code_all;
