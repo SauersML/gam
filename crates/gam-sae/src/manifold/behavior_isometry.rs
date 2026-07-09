@@ -128,7 +128,26 @@ pub fn atom_behavior_isometry(
 
     // Split the fitted augmented decoder [B_k | √λ_y C_k] into the activation
     // decoder B_k and the nats-unit behavior decoder C_k (the √λ_y un-done).
-    let (b_k, c_k) = block.split_decoder(atom.decoder_coefficients.view())?;
+    let (mut b_k, mut c_k) = block.split_decoder(atom.decoder_coefficients.view())?;
+    // Scale quotient (#2099): the atom's physical decoder is `exp(s_k)·[B_k | C_k]`
+    // — under the unit-Frobenius peel the magnitude lives in the explicit
+    // log-amplitude `s_k`, and `decoder_coefficients` carries only the shape. Both
+    // split blocks share the SINGLE per-atom amplitude (the whole augmented
+    // decoder is scaled by `exp(s_k)` in the contribution `exp(s_k)·Φ·[B|√λ_y C]`),
+    // so both induced speeds `s_x = ‖Φ'·exp(s_k)B_k‖` and `s_y = ‖Φ'·exp(s_k)C_k‖`
+    // pick up the SAME factor. The ratio statistics (`scale = mean(s_x/s_y)`,
+    // `defect_cv`, `min/max_ratio_over_scale`) are therefore bit-identical either
+    // way — `exp(s_k)` cancels in every ratio — but the ABSOLUTE readouts
+    // (`activation_speed_rms`, `behavior_speed_rms`, and the calibration dose
+    // `nats_per_unit_t = mean(s_y²)`, which is a physical nats-per-unit-t² quantity)
+    // must reflect the PHYSICAL scale, so they consume `exp(s_k)·B_k`/`exp(s_k)·C_k`
+    // here. Guarded on `!= 0.0` exactly as `SaeManifoldAtom`'s forward paths are, so
+    // at the default (quotient off, `s_k = 0`) this is a bit-for-bit no-op.
+    if atom.log_amplitude != 0.0 {
+        let amp = atom.log_amplitude.exp();
+        b_k.mapv_inplace(|v| v * amp);
+        c_k.mapv_inplace(|v| v * amp);
+    }
 
     let coords = term.assignment.coords[atom_idx].as_matrix().to_owned();
     if coords.ncols() != 1 {
