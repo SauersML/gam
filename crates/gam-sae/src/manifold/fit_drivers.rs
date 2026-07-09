@@ -2544,9 +2544,18 @@ impl SaeManifoldTerm {
             if iteration == 0 {
                 return Ok(());
             }
-            let ev = self.dictionary_reconstruction_ev_maybe(target, rho, target_col_stats)?;
-            let out_energy_ratio = self
-                .dictionary_reconstruction_output_energy_ratio_maybe(target, rho, target_col_stats)?;
+            // The EV and output-energy degeneracy tests read the SAME
+            // reconstruction; compute the full `(N, p)` fitted matrix once and
+            // derive both from it (identical values, one `try_fitted_for_rho`
+            // instead of two) — this guard runs once per accepted outer iterate.
+            let fitted = self.try_fitted_for_rho(rho)?;
+            let ev =
+                self.dictionary_reconstruction_ev_from_fitted(&fitted, target, target_col_stats)?;
+            let out_energy_ratio = self.dictionary_reconstruction_output_energy_ratio_from_fitted(
+                &fitted,
+                target,
+                target_col_stats,
+            )?;
             let n = self.n_obs();
             let p = target.ncols();
             // Reachable rank `q = rank([Φ_1 … Φ_K])`, the CONCATENATED chart-design
@@ -2910,6 +2919,45 @@ impl SaeManifoldTerm {
         Ok(1.0 - ss_res / ss_tot)
     }
 
+    /// [`Self::dictionary_reconstruction_ev_maybe`] against an ALREADY-COMPUTED
+    /// fitted reconstruction. The decoder-norm guard reads both the EV and the
+    /// output-energy ratio off the SAME `try_fitted_for_rho` result, so sharing
+    /// one fitted matrix between them replaces two full `(N, p)` reconstructions
+    /// with one. `residual = fitted − target` and its reduction order are
+    /// identical to the `_maybe` path, so the returned value is bit-for-bit the
+    /// same.
+    pub(crate) fn dictionary_reconstruction_ev_from_fitted(
+        &self,
+        fitted: &Array2<f64>,
+        target: ArrayView2<'_, f64>,
+        precomputed: Option<&TargetCenteredColStats>,
+    ) -> Result<f64, String> {
+        if fitted.dim() != target.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::dictionary_reconstruction_ev_from_fitted: fitted {:?} != target {:?}",
+                fitted.dim(),
+                target.dim()
+            ));
+        }
+        let residual = fitted - &target;
+        let mut ss_res = 0.0_f64;
+        for &value in residual.iter() {
+            ss_res += value * value;
+        }
+        let owned;
+        let ss_tot = match precomputed {
+            Some(stats) => stats.ss_tot,
+            None => {
+                owned = TargetCenteredColStats::compute(target);
+                owned.ss_tot
+            }
+        };
+        if !(ss_tot > 0.0) {
+            return Ok(if ss_res > 0.0 { 0.0 } else { 1.0 });
+        }
+        Ok(1.0 - ss_res / ss_tot)
+    }
+
     /// S1 (guard surgery) — fraction of the centered target variance carried by the
     /// dictionary's OWN reconstruction OUTPUT: `Σ (fitted − mean)² / Σ (target −
     /// mean)²`. A dictionary whose decoders have co-vanished reconstructs ≈ the
@@ -2945,6 +2993,47 @@ impl SaeManifoldTerm {
             return Err(format!(
                 "SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio: fitted {:?} \
                  != target {:?}",
+                fitted.dim(),
+                target.dim()
+            ));
+        }
+        let n = target.nrows();
+        let owned;
+        let stats = match precomputed {
+            Some(stats) => stats,
+            None => {
+                owned = TargetCenteredColStats::compute(target);
+                &owned
+            }
+        };
+        let mut ss_out = 0.0_f64;
+        for col in 0..target.ncols() {
+            let mean = stats.col_means[col];
+            for row in 0..n {
+                let out = fitted[[row, col]] - mean;
+                ss_out += out * out;
+            }
+        }
+        if !(stats.ss_tot > 0.0) {
+            return Ok(0.0);
+        }
+        Ok(ss_out / stats.ss_tot)
+    }
+
+    /// [`Self::dictionary_reconstruction_output_energy_ratio_maybe`] against an
+    /// ALREADY-COMPUTED fitted reconstruction (the decoder-norm guard's shared
+    /// `try_fitted_for_rho`). The accumulation order is identical to the `_maybe`
+    /// path, so the returned ratio is bit-for-bit the same.
+    pub(crate) fn dictionary_reconstruction_output_energy_ratio_from_fitted(
+        &self,
+        fitted: &Array2<f64>,
+        target: ArrayView2<'_, f64>,
+        precomputed: Option<&TargetCenteredColStats>,
+    ) -> Result<f64, String> {
+        if fitted.dim() != target.dim() {
+            return Err(format!(
+                "SaeManifoldTerm::dictionary_reconstruction_output_energy_ratio_from_fitted: \
+                 fitted {:?} != target {:?}",
                 fitted.dim(),
                 target.dim()
             ));
@@ -3374,7 +3463,12 @@ impl SaeManifoldTerm {
             if phi.nrows() != n || n == 0 {
                 continue;
             }
-            let mut y = phi.dot(&self.atoms[atom].decoder_coefficients);
+            // Per-atom decode `Φ_k · B_k` (N×M · M×p). This runs inside the
+            // per-accepted-iterate structural-coherence guard, so route the
+            // matrix-matrix product through the faer GEMM (small shapes fall
+            // back to `ndarray::dot` inside `fast_ab`; the reduction order may
+            // differ, acceptable per the crate convention).
+            let mut y = fast_ab(phi, &self.atoms[atom].decoder_coefficients);
             for row in 0..n {
                 let g = gates[[row, atom]];
                 for col in 0..y.ncols() {

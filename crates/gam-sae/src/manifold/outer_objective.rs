@@ -196,6 +196,154 @@ pub struct AmortizedWarmStartTelemetry {
     pub total_rows_warm_started: usize,
 }
 
+/// #2235 — how the outer ρ search ENDED. Every fit terminates with exactly one
+/// verdict; "hang" is not in the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaeOuterTerminationVerdict {
+    /// The outer bridge stopped through its own convergence/stopping logic
+    /// while the criterion was still live (never frozen): stationarity, EFS
+    /// fixed point, or its iteration cap.
+    EngineStopped,
+    /// The termination ledger froze the criterion after the incumbent went
+    /// unimproved for the full stationarity window — every subsequent probe
+    /// returned the banked incumbent value, so the bridge converged onto it.
+    IncumbentStationary,
+    /// The caller-supplied wall budget expired; the criterion froze and the
+    /// bridge converged onto the banked incumbent (deadline honesty).
+    BudgetExhausted,
+}
+
+/// #2235 — outer termination ledger: one per fit, ticked by every criterion
+/// evaluation lane. When a verdict fires the ledger FREEZES the criterion:
+/// every later evaluation returns the best (incumbent) cost with a zero
+/// gradient, so the generic outer bridge — BFGS line search, ARC, or the EFS
+/// fixed point — sees a flat, feasible surface and halts through its own
+/// convergence logic onto the state the incumbent banking already holds. No
+/// engine surgery, no new stopping API: the objective simply stops moving.
+#[derive(Debug, Clone)]
+pub(crate) struct OuterTerminationLedger {
+    /// Total criterion evaluations across all lanes.
+    evals: u64,
+    /// Eval count at the last MATERIAL improvement of the best cost.
+    last_improvement_eval: u64,
+    /// Best (lowest) finite criterion value seen.
+    best_cost: Option<f64>,
+    /// Fit wall-clock start.
+    wall_start: std::time::Instant,
+    /// Optional wall budget (deadline honesty). `None` ⇒ unbounded.
+    wall_budget: Option<std::time::Duration>,
+    /// Latched verdict once frozen; `None` while the criterion is live.
+    frozen: Option<SaeOuterTerminationVerdict>,
+}
+
+impl OuterTerminationLedger {
+    pub(crate) fn new(wall_budget: Option<std::time::Duration>) -> Self {
+        Self {
+            evals: 0,
+            last_improvement_eval: 0,
+            best_cost: None,
+            wall_start: std::time::Instant::now(),
+            wall_budget,
+            frozen: None,
+        }
+    }
+
+    /// Stationarity window: how many consecutive evaluations without material
+    /// improvement before the incumbent is declared outer-stationary. Reuses
+    /// the basin-bundle line-search derivation (two full line-search
+    /// directions' worth of probes — the same evidence the outer bridge needs
+    /// before it declares a neighbourhood dead), so no new constant.
+    fn stationarity_window() -> u64 {
+        basin_bundle_dominance_window()
+    }
+
+    /// Record one finite criterion value; returns the improvement verdict.
+    pub(crate) fn record(&mut self, cost: f64) {
+        self.evals += 1;
+        if !cost.is_finite() {
+            return;
+        }
+        let improved = match self.best_cost {
+            None => true,
+            // Material improvement at the same scale the inner stall gate
+            // uses: a relative decrease beyond the EV-degradation tolerance.
+            Some(best) => cost < best - SAE_FINAL_EV_DEGRADATION_TOL * (1.0 + best.abs()),
+        };
+        if improved {
+            self.best_cost = Some(match self.best_cost {
+                Some(best) => best.min(cost),
+                None => cost,
+            });
+            self.last_improvement_eval = self.evals;
+        }
+    }
+
+    /// Consult the ledger: `Some(frozen_cost)` once a verdict has fired (and
+    /// latch the verdict), `None` while the criterion is live. Freezing
+    /// requires a banked best cost — with nothing banked yet there is no
+    /// incumbent to converge onto, so the fit keeps running (the very first
+    /// evaluations can never freeze).
+    pub(crate) fn frozen_cost(&mut self) -> Option<f64> {
+        if let Some(_verdict) = self.frozen {
+            return self.best_cost;
+        }
+        let best = self.best_cost?;
+        if let Some(budget) = self.wall_budget
+            && self.wall_start.elapsed() > budget
+        {
+            self.frozen = Some(SaeOuterTerminationVerdict::BudgetExhausted);
+            log::warn!(
+                "[#2235] outer wall budget exhausted after {} evals ({:.0?}); freezing the \
+                 criterion at the banked incumbent (cost {best:.6e}) — the bridge converges \
+                 onto it (deadline honesty)",
+                self.evals,
+                self.wall_start.elapsed()
+            );
+            return Some(best);
+        }
+        if self.evals.saturating_sub(self.last_improvement_eval) >= Self::stationarity_window() {
+            self.frozen = Some(SaeOuterTerminationVerdict::IncumbentStationary);
+            log::warn!(
+                "[#2235] outer incumbent stationary: no material improvement for {} \
+                 evaluations (window {}); freezing the criterion at the banked incumbent \
+                 (cost {best:.6e})",
+                self.evals - self.last_improvement_eval,
+                Self::stationarity_window()
+            );
+            return Some(best);
+        }
+        None
+    }
+
+    /// New multi-start seed: the stationarity window restarts (a fresh walk
+    /// deserves fresh evidence), the wall clock and eval totals do not (the
+    /// budget is fit-global).
+    pub(crate) fn reset_stationarity(&mut self) {
+        self.last_improvement_eval = self.evals;
+        if self.frozen == Some(SaeOuterTerminationVerdict::IncumbentStationary) {
+            self.frozen = None;
+        }
+    }
+
+    pub(crate) fn report(&self) -> SaeOuterTermination {
+        SaeOuterTermination {
+            verdict: self.frozen.unwrap_or(SaeOuterTerminationVerdict::EngineStopped),
+            evals: self.evals,
+            evals_since_improvement: self.evals.saturating_sub(self.last_improvement_eval),
+            wall: self.wall_start.elapsed(),
+        }
+    }
+}
+
+/// #2235 — the termination report carried out of the fit.
+#[derive(Debug, Clone, Copy)]
+pub struct SaeOuterTermination {
+    pub verdict: SaeOuterTerminationVerdict,
+    pub evals: u64,
+    pub evals_since_improvement: u64,
+    pub wall: std::time::Duration,
+}
+
 #[derive(Debug)]
 pub struct SaeIntoFittedResult {
     pub term: SaeManifoldTerm,
@@ -209,6 +357,8 @@ pub struct SaeIntoFittedResult {
     pub used_pristine_seed_fallback: bool,
     /// True when post-fit chart canonicalization changed any atom's chart.
     pub charts_canonicalized: bool,
+    /// #2235 — how the outer search ended (verdict + eval/wall ledger).
+    pub termination: SaeOuterTermination,
 }
 
 impl SaeIntoFittedResult {
@@ -773,6 +923,10 @@ pub struct SaeManifoldOuterObjective {
     /// row-support seam; bypassed in the streaming and `inner_max_iter == 0`
     /// freeze regimes (see `evaluate_envelope_value_probe`).
     basin_bundle: BasinBundle<SaeManifoldTerm>,
+    /// #2235 — outer termination ledger (verdicts: engine-stopped / incumbent-
+    /// stationary / budget-exhausted). Freezes the criterion once a verdict
+    /// fires so the bridge converges onto the banked incumbent.
+    pub(crate) termination: OuterTerminationLedger,
 }
 
 /// #2230/#2087 basin-bundle sizing, derived from problem structure (no tuning).
@@ -874,6 +1028,10 @@ impl SaeManifoldOuterObjective {
                 basin_bundle_max_members(term_k_atoms),
                 basin_bundle_dominance_window(),
             ),
+            // #2235 — no wall budget by default (unbounded); the FFI/driver can
+            // install one via `set_outer_wall_budget`. The incumbent-stationarity
+            // freeze is always armed.
+            termination: OuterTerminationLedger::new(None),
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all

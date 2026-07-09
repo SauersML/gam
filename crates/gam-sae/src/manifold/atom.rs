@@ -1042,7 +1042,10 @@ impl SaeManifoldAtom {
         // unconditionally call `refresh_basis_from_current_coords` to keep
         // the auto-refresh path correct, and that prelude has to pass through
         // unchanged for caller-managed atoms.
-        let Some(evaluator) = self.basis_evaluator.as_ref() else {
+        // Clone the `Arc` handle (a cheap refcount bump) so the evaluator is no
+        // longer borrowed from `self`, freeing the mutable borrow the in-place
+        // fill needs below.
+        let Some(evaluator) = self.basis_evaluator.clone() else {
             return Ok(());
         };
         // Curvature-homotopy dial (#1007): at the default `η = 1` this is the
@@ -1051,34 +1054,45 @@ impl SaeManifoldAtom {
         // tracker scales the curved columns toward the base-topology relaxation; the
         // `dphi_deta` / `djet_deta` channels are discarded here (the predictor
         // forms `∂g/∂η` separately from a dedicated evaluation).
-        let (phi, jet) = if self.homotopy_eta == 1.0 {
-            evaluator.evaluate(coords)?
+        if self.homotopy_eta == 1.0 {
+            // Hot path: fill the atom's already-correctly-shaped Φ / jet buffers
+            // in place. This is called on EVERY β-Newton line-search trial (via
+            // `apply_newton_step`), so avoiding the fresh `(N, M)` + `(N, M, d)`
+            // allocation here removes the dominant per-trial allocation churn.
+            // The evaluator validates the buffer shapes and errors on mismatch —
+            // the same guard the freshly-allocated path applied.
+            evaluator.evaluate_into(&mut self.basis_values, &mut self.basis_jacobian, coords)?;
         } else {
             let evaluated = evaluator.evaluate_phi_eta(coords, self.homotopy_eta)?;
-            (evaluated.phi, evaluated.jet)
-        };
-        if phi.dim() != self.basis_values.dim() {
-            return Err(format!(
-                "SaeManifoldAtom::refresh_basis: evaluator returned Phi {:?}, expected {:?}",
-                phi.dim(),
-                self.basis_values.dim()
-            ));
+            let (phi, jet) = (evaluated.phi, evaluated.jet);
+            if phi.dim() != self.basis_values.dim() {
+                return Err(format!(
+                    "SaeManifoldAtom::refresh_basis: evaluator returned Phi {:?}, expected {:?}",
+                    phi.dim(),
+                    self.basis_values.dim()
+                ));
+            }
+            if jet.dim() != self.basis_jacobian.dim() {
+                return Err(format!(
+                    "SaeManifoldAtom::refresh_basis: evaluator returned jet {:?}, expected {:?}",
+                    jet.dim(),
+                    self.basis_jacobian.dim()
+                ));
+            }
+            self.basis_values = phi;
+            self.basis_jacobian = jet;
         }
-        if jet.dim() != self.basis_jacobian.dim() {
-            return Err(format!(
-                "SaeManifoldAtom::refresh_basis: evaluator returned jet {:?}, expected {:?}",
-                jet.dim(),
-                self.basis_jacobian.dim()
-            ));
-        }
-        self.basis_values = phi;
-        self.basis_jacobian = jet;
         // Cache the latent coordinates on the same coordinate change: the
         // Poincaré conformal-Dirichlet roughness Gram is a function of `t`
         // (through the exp-map pullback metric) and
         // `refresh_intrinsic_smooth_penalty` receives no coordinates. Frozen at
-        // the current iterate exactly like the second-jet cache below.
-        self.latent_coords = Some(coords.to_owned());
+        // the current iterate exactly like the second-jet cache below. Reuse the
+        // existing buffer when its shape matches so the per-trial refresh does
+        // not re-allocate the `(N, d)` coordinate cache either.
+        match self.latent_coords.as_mut() {
+            Some(buf) if buf.dim() == coords.dim() => buf.assign(&coords),
+            _ => self.latent_coords = Some(coords.to_owned()),
+        }
         // Refresh the cached second-jet VALUES on the same coordinate change so
         // the `d ≥ 2` intrinsic bending Gram sees `∂²Φ` at the current chart
         // (the lagged-diffusivity freeze the metric obeys). Only an evaluator
