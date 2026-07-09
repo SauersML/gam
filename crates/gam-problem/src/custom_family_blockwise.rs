@@ -114,11 +114,30 @@ pub fn validate_blockspec_consistency(specs: &[ParameterBlockSpec]) -> Result<Ve
             }
             .into());
         }
+        for (k, &log_lambda) in spec.initial_log_lambdas.iter().enumerate() {
+            if !log_lambda.is_finite() {
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "block {b} initial log-precision {k} is non-finite: {log_lambda}"
+                    ),
+                }
+                .into());
+            }
+        }
         for (k, s) in spec.penalties.iter().enumerate() {
             let (r, c) = s.shape();
             if r != p || c != p {
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!("block {b} penalty {k} must be {p}x{p}, got {r}x{c}"),
+                }
+                .into());
+            }
+            // Establish the full quadratic-penalty contract (finite, symmetric,
+            // PSD, consistent embedding) once at the boundary; every downstream
+            // gradient, root, and pseudo-logdet assumes it without re-checking.
+            if let Err(reason) = s.validate(p) {
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!("block {b} penalty {k}: {reason}"),
                 }
                 .into());
             }

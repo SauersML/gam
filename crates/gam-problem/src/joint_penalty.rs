@@ -87,6 +87,17 @@ pub enum JointPenaltyError {
         total: usize,
         nullspace_dim: usize,
     },
+    NotPositiveSemidefinite {
+        min_eigenvalue: f64,
+        max_abs_eigenvalue: f64,
+    },
+    NullspaceMismatch {
+        declared: usize,
+        numerical: usize,
+    },
+    EigendecompositionFailed {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for JointPenaltyError {
@@ -116,6 +127,25 @@ impl std::fmt::Display for JointPenaltyError {
             } => write!(
                 f,
                 "joint penalty nullspace_dim={nullspace_dim} exceeds dim={total}"
+            ),
+            Self::NotPositiveSemidefinite {
+                min_eigenvalue,
+                max_abs_eigenvalue,
+            } => write!(
+                f,
+                "joint penalty matrix is not positive semidefinite: min eigenvalue \
+                 {min_eigenvalue:.6e} (max |eigenvalue| {max_abs_eigenvalue:.6e}); the \
+                 penalized objective is unbounded below along the negative mode"
+            ),
+            Self::NullspaceMismatch { declared, numerical } => write!(
+                f,
+                "joint penalty declares nullspace_dim={declared} but the eigenspectrum has \
+                 {numerical} numerical-zero direction(s); the REML pseudo-logdet rank would \
+                 be wrong"
+            ),
+            Self::EigendecompositionFailed { reason } => write!(
+                f,
+                "joint penalty eigendecomposition failed during validation: {reason}"
             ),
         }
     }
@@ -194,6 +224,43 @@ impl JointPenaltySpec {
                         asymmetry,
                     });
                 }
+            }
+        }
+        // PSD + declared-nullity honesty. An indefinite joint penalty makes
+        // the penalized objective unbounded below along its negative mode
+        // while the pseudo-logdet's positive-eigenspace filter would silently
+        // drop that mode; a wrong declared nullity mis-ranks the REML
+        // pseudo-logdet (the whole point of declaring it is to avoid runtime
+        // thresholds, so it must agree with the spectrum at construction).
+        if nrows > 0 {
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let (eigenvalues, _) = FaerEigh::eigh(&self.matrix, faer::Side::Lower).map_err(
+                |e| JointPenaltyError::EigendecompositionFailed {
+                    reason: e.to_string(),
+                },
+            )?;
+            let max_abs_eigenvalue = eigenvalues
+                .iter()
+                .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+            // Same relative classification as the REML pseudo-logdet kernel:
+            // the eigensolver noise floor is O(p·ε·‖S‖), never an absolute cut.
+            let tol = 100.0 * (nrows as f64) * f64::EPSILON * max_abs_eigenvalue;
+            if let Some(&min_eigenvalue) = eigenvalues
+                .iter()
+                .filter(|&&ev| ev < -tol)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                return Err(JointPenaltyError::NotPositiveSemidefinite {
+                    min_eigenvalue,
+                    max_abs_eigenvalue,
+                });
+            }
+            let numerical = eigenvalues.iter().filter(|&&ev| ev <= tol).count();
+            if numerical != self.nullspace_dim {
+                return Err(JointPenaltyError::NullspaceMismatch {
+                    declared: self.nullspace_dim,
+                    numerical,
+                });
             }
         }
         Ok(())

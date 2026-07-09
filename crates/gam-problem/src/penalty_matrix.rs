@@ -55,9 +55,79 @@ impl PenaltyMatrix {
     }
 
     /// Returns (nrows, ncols) like Array2::dim().
+    ///
+    /// Reports the ACTUAL storage shape, not `(dim(), dim())`: a malformed
+    /// non-square carrier must be visible to validation instead of being
+    /// laundered into a fabricated square shape.
     pub fn shape(&self) -> (usize, usize) {
-        let d = self.dim();
-        (d, d)
+        match self {
+            Self::Dense(m) => m.dim(),
+            Self::KroneckerFactored { left, right } => (
+                left.nrows() * right.nrows(),
+                left.ncols() * right.ncols(),
+            ),
+            Self::Blockwise { total_dim, .. } => (*total_dim, *total_dim),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.shape(),
+        }
+    }
+
+    /// Validate this penalty as the carrier of a quadratic form `½·λ·βᵀSβ`
+    /// on a coefficient block of width `expected_dim`.
+    ///
+    /// Establishes, at the model boundary, everything downstream code assumes
+    /// without re-checking: square storage of the right size, finite entries,
+    /// symmetry, and positive semidefiniteness (for `Blockwise`, also that the
+    /// embedded range is consistent). A nonsymmetric `S` would make the
+    /// implemented gradient `λSβ` disagree with the true gradient of the
+    /// quadratic, `λ·sym(S)β`; an indefinite `S` makes the penalized objective
+    /// unbounded below along its negative mode while positive-eigenspace
+    /// filtering silently drops that mode from ranks and log-determinants.
+    /// Neither is a fittable model, so both are rejected rather than coerced.
+    pub fn validate(&self, expected_dim: usize) -> Result<(), String> {
+        let (nrows, ncols) = self.shape();
+        if nrows != ncols || nrows != expected_dim {
+            return Err(format!(
+                "penalty must be {expected_dim}x{expected_dim}, got {nrows}x{ncols}"
+            ));
+        }
+        match self {
+            Self::Dense(m) => validate_symmetric_psd_core(m, "dense penalty"),
+            Self::KroneckerFactored { left, right } => {
+                // A ⊗ B is symmetric PSD when both factors are (the canonical
+                // tensor-product construction). Validating the factors avoids
+                // materializing the product and rejects the NSD⊗NSD encoding,
+                // which downstream Kronecker logdet identities do not support.
+                validate_symmetric_psd_core(left, "Kronecker left factor")?;
+                validate_symmetric_psd_core(right, "Kronecker right factor")
+            }
+            Self::Blockwise {
+                local,
+                col_range,
+                total_dim,
+            } => {
+                if col_range.end > *total_dim || col_range.len() != local.nrows() {
+                    return Err(format!(
+                        "blockwise penalty embedding is inconsistent: local {}x{} at columns \
+                         {}..{} of total_dim {}",
+                        local.nrows(),
+                        local.ncols(),
+                        col_range.start,
+                        col_range.end,
+                        total_dim
+                    ));
+                }
+                validate_symmetric_psd_core(local, "blockwise local penalty")
+            }
+            Self::Labeled { inner, .. } => inner.validate(expected_dim),
+            Self::Fixed { log_lambda, inner } => {
+                if !log_lambda.is_finite() {
+                    return Err(format!(
+                        "fixed penalty log-precision is non-finite: {log_lambda}"
+                    ));
+                }
+                inner.validate(expected_dim)
+            }
+        }
     }
 
     /// Materialize the full dense matrix.
@@ -278,6 +348,67 @@ impl From<Array2<f64>> for PenaltyMatrix {
     }
 }
 
+/// Core quadratic-form validity: square, finite, symmetric (up to a
+/// scale-relative round-off band), and positive semidefinite (eigenvalues
+/// above the relative eigensolver noise floor `p·ε·‖S‖`, the same relative
+/// classification the REML pseudo-logdet kernel uses — never an absolute
+/// floor, so validity is invariant under `S → c·S`).
+fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), String> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    let (nrows, ncols) = matrix.dim();
+    if nrows != ncols {
+        return Err(format!("{what} is not square: {nrows}x{ncols}"));
+    }
+    let mut max_abs = 0.0_f64;
+    for ((row, col), &value) in matrix.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "{what} has non-finite entry at ({row},{col}): {value}"
+            ));
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    // Symmetry: relative to the matrix scale so a legitimately large penalty
+    // is not rejected for round-off and a small one cannot hide genuine skew.
+    let sym_tol = 1e-10 * max_abs.max(1.0);
+    for row in 0..nrows {
+        for col in (row + 1)..ncols {
+            let asymmetry = (matrix[[row, col]] - matrix[[col, row]]).abs();
+            if asymmetry > sym_tol {
+                return Err(format!(
+                    "{what} is not symmetric at ({row},{col}): |S - Sᵀ| = {asymmetry:.3e}; \
+                     the gradient of βᵀSβ/2 is sym(S)β, so a skew component would make the \
+                     implemented objective and gradient describe different functions"
+                ));
+            }
+        }
+    }
+    if nrows == 0 || max_abs == 0.0 {
+        return Ok(()); // the zero penalty is trivially PSD
+    }
+    let (eigenvalues, _) = matrix
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("{what} eigendecomposition failed during validation: {e}"))?;
+    let max_abs_eval = eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let psd_tol = 100.0 * (nrows as f64) * f64::EPSILON * max_abs_eval;
+    if let Some(&min_eval) = eigenvalues
+        .iter()
+        .filter(|&&ev| ev < -psd_tol)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        return Err(format!(
+            "{what} is not positive semidefinite: min eigenvalue {min_eval:.6e} \
+             (max |eigenvalue| {max_abs_eval:.6e}); the penalized objective is unbounded \
+             below along the negative mode while rank/logdet filtering would silently \
+             drop it"
+        ));
+    }
+    Ok(())
+}
+
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.
 /// This is used to create tensor product penalties that enforce smoothness
 /// in multiple dimensions for interaction terms.
@@ -475,5 +606,78 @@ mod tests {
         let p = PenaltyMatrix::Dense(m).with_fixed_log_lambda(2.5);
         assert_eq!(p.dim(), 2);
         assert_eq!(p.fixed_log_lambda(), Some(2.5));
+    }
+
+    // ── Boundary validation ───────────────────────────────────────────────────
+
+    #[test]
+    fn shape_reports_actual_storage_not_fabricated_square() {
+        // A malformed 2x3 dense carrier must be visible as 2x3, not laundered
+        // into 2x2 through dim().
+        let p = PenaltyMatrix::Dense(Array2::<f64>::zeros((2, 3)));
+        assert_eq!(p.shape(), (2, 3));
+        assert!(p.validate(2).is_err());
+        assert!(p.validate(3).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_canonical_carriers() {
+        let dense = PenaltyMatrix::Dense(array![[2.0, -1.0], [-1.0, 2.0]]);
+        assert_eq!(dense.validate(2), Ok(()));
+
+        let kron = PenaltyMatrix::KroneckerFactored {
+            left: array![[1.0, -1.0], [-1.0, 1.0]],
+            right: ndarray::Array2::<f64>::eye(3),
+        };
+        assert_eq!(kron.validate(6), Ok(()));
+
+        let blockwise = PenaltyMatrix::Blockwise {
+            local: array![[1.0, 0.0], [0.0, 1.0]],
+            col_range: 1..3,
+            total_dim: 4,
+        };
+        assert_eq!(blockwise.validate(4), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_asymmetric_indefinite_and_nonfinite() {
+        // Nonsymmetric: gradient of βᵀSβ/2 is sym(S)β, not Sβ.
+        let skew = PenaltyMatrix::Dense(array![[1.0, 1.0], [0.0, 1.0]]);
+        assert!(skew.validate(2).unwrap_err().contains("not symmetric"));
+
+        // Indefinite: objective unbounded below along the negative mode.
+        let indefinite = PenaltyMatrix::Dense(array![[1.0, 0.0], [0.0, -1.0]]);
+        assert!(
+            indefinite
+                .validate(2)
+                .unwrap_err()
+                .contains("not positive semidefinite")
+        );
+
+        let nan = PenaltyMatrix::Dense(array![[f64::NAN, 0.0], [0.0, 1.0]]);
+        assert!(nan.validate(2).unwrap_err().contains("non-finite"));
+
+        // Fixed wrapper must carry a finite physical log-precision.
+        let bad_fixed = PenaltyMatrix::Dense(ndarray::Array2::<f64>::eye(2))
+            .with_fixed_log_lambda(f64::INFINITY);
+        assert!(bad_fixed.validate(2).unwrap_err().contains("non-finite"));
+    }
+
+    #[test]
+    fn validate_rejects_inconsistent_blockwise_embedding() {
+        // local width disagrees with the embedded column range.
+        let p = PenaltyMatrix::Blockwise {
+            local: ndarray::Array2::<f64>::eye(3),
+            col_range: 1..3,
+            total_dim: 4,
+        };
+        assert!(p.validate(4).is_err());
+        // range runs past total_dim.
+        let q = PenaltyMatrix::Blockwise {
+            local: ndarray::Array2::<f64>::eye(2),
+            col_range: 3..5,
+            total_dim: 4,
+        };
+        assert!(q.validate(4).is_err());
     }
 }
