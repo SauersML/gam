@@ -1623,7 +1623,7 @@ where
     points.sort_by(|a, b| a.gamma.partial_cmp(&b.gamma).expect("finite γ"));
 
     let grid: Vec<(f64, f64)> = points.iter().map(|p| (p.gamma, p.tk_score)).collect();
-    let ci = gam_geometry::profile_ci_from_grid(&grid, level)?;
+    let mut ci = gam_geometry::profile_ci_from_grid(&grid, level)?;
 
     // Pull the curve minimiser out of the points.
     let hat_index = points
@@ -1684,6 +1684,9 @@ where
                 representative = cand;
             }
         }
+        // Keep γ̂ and the representative fit coherent: the reported minimiser
+        // is the refined one whenever refinement improved on the curve node.
+        ci.gamma_hat = representative.gamma;
     }
 
     Ok(ClosureSelection {
