@@ -5284,9 +5284,22 @@ impl SaeManifoldTerm {
                     && final_ev.is_finite()
                     && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < best_reconstruction_ev
                 {
+                    // #2230 two-referee instrumentation: log the CRITERION's
+                    // opinion of the walked-to state alongside the EV guard's
+                    // veto, so a churn log decides empirically whether the
+                    // outer criterion genuinely prefers the basins this guard
+                    // keeps restoring (criterion↔guard conflict) or the walk
+                    // is pure line-search hysteresis. Penalized total only —
+                    // no factorization, same objective the Armijo lane uses.
+                    let walked_obj = self
+                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                        .unwrap_or(f64::NAN);
                     log::warn!(
                         "[#1026] restoring inner-fit reconstruction incumbent after EV degraded \
-                         from {best_reconstruction_ev:.4} to {final_ev:.4}"
+                         from {best_reconstruction_ev:.4} to {final_ev:.4} \
+                         (walked-to penalized objective {walked_obj:.6e} — compare against the \
+                         restored state's next accepted objective to adjudicate #2230's \
+                         two-referee conflict)"
                     );
                     self.restore_mutable_state(best_state)?;
                     if self.frames_active() {
