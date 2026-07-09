@@ -1415,18 +1415,49 @@ pub struct SurrogateLaneConfig {
 pub struct SurrogateLaneState {
     plan: Option<RationalLogdetPlan>,
     cfg: SurrogateLaneConfig,
+    /// When set, the next matrix-free evidence eval also computes the shared
+    /// `(probes, S⁻¹·probes)` bundle for the tr(S⁻¹·M) gradient channels (the
+    /// #2080 selected-inverse umbrella) and stashes it in `inverse_probes`. The
+    /// gradient lane (EFS α-step) sets this before its criterion call and takes
+    /// the bundle after; the value probes leave it unset and pay nothing.
+    request_inverse_probes: bool,
+    /// The last-computed shared bundle: the FROZEN plan's probes `v_j` and their
+    /// `S⁻¹ v_j` (t = 0) solves at the current operator. One bundle drives every
+    /// selected-inverse trace `tr(S⁻¹·M) ≈ (1/m)Σ_j (S⁻¹v_j)ᵀ(M v_j)` off the
+    /// SAME probes as the value, so value and ρ-gradient never desync.
+    inverse_probes: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
 }
 
 impl SurrogateLaneState {
     /// A lane with no plan yet — the first evaluation builds and freezes it.
     pub fn new(cfg: SurrogateLaneConfig) -> Self {
-        Self { plan: None, cfg }
+        Self {
+            plan: None,
+            cfg,
+            request_inverse_probes: false,
+            inverse_probes: None,
+        }
     }
 
     /// The frozen plan, once built (for the gradient lane, which contracts
     /// against the SAME `Q` the value used).
     pub fn plan(&self) -> Option<&RationalLogdetPlan> {
         self.plan.as_ref()
+    }
+
+    /// Ask the next matrix-free evidence eval to also emit the shared
+    /// `(probes, S⁻¹·probes)` bundle. Clears any stale bundle so a failed or
+    /// skipped eval cannot hand back last call's solves.
+    pub fn request_inverse_probes(&mut self) {
+        self.request_inverse_probes = true;
+        self.inverse_probes = None;
+    }
+
+    /// Take the shared bundle produced by the most recent eval, if requested and
+    /// computed. Consumes it so a later gradient read cannot reuse stale solves.
+    pub fn take_inverse_probes(&mut self) -> Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)> {
+        self.request_inverse_probes = false;
+        self.inverse_probes.take()
     }
 }
 
@@ -1515,18 +1546,51 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 .plan
                 .as_ref()
                 .expect("plan installed just above when absent");
-            let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
-                let x = v.to_owned();
-                let mut out = Array1::<f64>::zeros(dim);
-                schur_matvec(sys, &htt_factors, ridge_beta, &x, &mut out, &backend, resident.as_ref());
-                out
+            let want_bundle = state.request_inverse_probes;
+            // Value (and, when the gradient lane asked for it, the shared
+            // (probes, S⁻¹·probes) bundle) computed under one borrow of the
+            // frozen plan; the bundle is stashed on the lane after the borrow
+            // ends. The bundle uses the plan's RAW probes v_j (not the deflation-
+            // projected ones) since tr(S⁻¹·M) contracts the full S⁻¹ v_j.
+            let (estimate, bundle) = {
+                let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+                    let x = v.to_owned();
+                    let mut out = Array1::<f64>::zeros(dim);
+                    schur_matvec(sys, &htt_factors, ridge_beta, &x, &mut out, &backend, resident.as_ref());
+                    out
+                };
+                let eval = plan
+                    .evaluate(&matvec, state.cfg.cg_rel_tol, state.cfg.cg_max_iters)
+                    .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                        reason: "rational log-det surrogate evaluation returned non-finite"
+                            .to_string(),
+                    })?;
+                let bundle = if want_bundle {
+                    let sinv = reduced_schur_inverse_probe_solves(
+                        sys,
+                        &htt_factors,
+                        ridge_beta,
+                        &backend,
+                        resident.as_ref(),
+                        &plan.probes,
+                        None,
+                        state.cfg.cg_rel_tol,
+                        state.cfg.cg_max_iters,
+                    )
+                    .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                        reason: "rational surrogate inverse-probe bundle solve failed".to_string(),
+                    })?;
+                    Some((plan.probes.clone(), sinv))
+                } else {
+                    None
+                };
+                (eval.estimate, bundle)
             };
-            let eval = plan
-                .evaluate(&matvec, state.cfg.cg_rel_tol, state.cfg.cg_max_iters)
-                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
-                    reason: "rational log-det surrogate evaluation returned non-finite".to_string(),
-                })?;
-            eval.estimate
+            if want_bundle {
+                state.inverse_probes = bundle;
+                state.request_inverse_probes = false;
+            }
+            estimate
         }
     };
     Ok((log_det_tt, log_det_schur))

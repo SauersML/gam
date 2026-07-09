@@ -3075,6 +3075,15 @@ impl SaeManifoldOuterObjective {
         // arrow cache, which the streaming criterion produces (and now returns).
         // Route through it so the Fellner–Schall step runs matrix-free at large K;
         // dense-admitted fits keep the byte-for-byte dense path.
+        // #2080: ask the surrogate lane to emit the shared (probes, S⁻¹·probes)
+        // bundle during this criterion's matrix-free evidence eval, so the
+        // smoothness EDF below is the matrix-free tr(S⁻¹·M_k) off that bundle
+        // instead of the dense `beta_inv`. The direct-admitted path ignores it
+        // (no lane threaded); `take_inverse_probes` after the call clears the flag
+        // either way, so a dense eval never hands back stale solves.
+        if let Some(lane) = self.surrogate_lane.as_mut() {
+            lane.request_inverse_probes();
+        }
         let criterion = if self.term.streaming_plan().direct_logdet_admitted() {
             self.term.reml_criterion_with_cache(
                 self.target.view(),
@@ -3086,7 +3095,7 @@ impl SaeManifoldOuterObjective {
                 self.ridge_beta,
             )
         } else {
-            self.term.reml_criterion_streaming_exact_with_cache(
+            self.term.reml_criterion_streaming_exact_with_cache_and_lane(
                 self.target.view(),
                 &rho,
                 self.registry.as_ref(),
@@ -3094,6 +3103,7 @@ impl SaeManifoldOuterObjective {
                 self.learning_rate,
                 self.ridge_ext_coord,
                 self.ridge_beta,
+                self.surrogate_lane.as_mut(),
             )
         };
         let (cost, loss, cache) = match criterion {
@@ -3195,10 +3205,30 @@ impl SaeManifoldOuterObjective {
         let k_smooth = rho.log_lambda_smooth.len();
         let lambda_smooth_vec = rho.lambda_smooth_vec();
         let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
-        let eff_dof_per_atom = self
-            .term
-            .decoder_smoothness_effective_dof_per_atom(&cache, &lambda_smooth_vec)
-            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
+        // #2080: the surrogate lane's shared (probes, S⁻¹·probes) bundle from this
+        // eval's matrix-free evidence branch, if it ran. When present, the
+        // smoothness EDF is the matrix-free tr(S⁻¹·M_k) off that bundle (no dense
+        // `beta_inv`); otherwise (dense-admitted, or no lane) fall back to the
+        // dense selected-inverse trace.
+        let inverse_probe_bundle = self
+            .surrogate_lane
+            .as_mut()
+            .and_then(|l| l.take_inverse_probes());
+        let eff_dof_per_atom = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
+            self.term
+                .decoder_smoothness_effective_dof_per_atom_from_probes(
+                    probes,
+                    sinv,
+                    &lambda_smooth_vec,
+                )
+                .map_err(|e| {
+                    format!("SaeManifoldOuterObjective::efs_step: smooth dof (matrix-free): {e}")
+                })?
+        } else {
+            self.term
+                .decoder_smoothness_effective_dof_per_atom(&cache, &lambda_smooth_vec)
+                .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?
+        };
         for atom_idx in 0..k_smooth {
             let lambda_k = lambda_smooth_vec[atom_idx];
             let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)

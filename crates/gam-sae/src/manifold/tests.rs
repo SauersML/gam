@@ -3076,6 +3076,94 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     );
 }
 
+/// #2080 decoder-smoothness gradient channel: the matrix-free EDF off the shared
+/// (probes, S⁻¹·probes) bundle
+/// ([`SaeManifoldTerm::decoder_smoothness_effective_dof_per_atom_from_probes`])
+/// must reproduce the dense `beta_inv` trace
+/// ([`SaeManifoldTerm::decoder_smoothness_effective_dof_per_atom`]) that the
+/// Fellner–Schall α-step consumes. Feeding the bundle the EXACT dense `S⁻¹`
+/// (`cache.schur_inverse_apply`) at FULL-BASIS probes `√k·e_j` makes the
+/// Hutchinson estimator collapse to the exact trace `tr(S⁻¹·M_k)` deterministically
+/// (both `S⁻¹` and `M_k` symmetric), so the two paths must agree to solve
+/// precision — the FD-equivalent acceptance gate for the channel, isolating the
+/// new M_k-apply/umbrella-contraction code from the CG machinery (tested in
+/// gam-solve). The production path swaps the dense `S⁻¹` for the surrogate's
+/// matrix-free probe solves.
+#[test]
+fn matrix_free_smoothness_edf_from_probes_matches_dense_selected_inverse() {
+    let n = 24usize;
+    let p = 2usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let atom = SaeManifoldAtom::new(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let target = Array2::from_shape_fn((n, p), |(row, col)| {
+        let x = (row as f64 + 0.5) / n as f64;
+        if col == 0 {
+            0.45 * (std::f64::consts::TAU * x).sin() + 0.07
+        } else {
+            -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
+        }
+    });
+    let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![250.0_f64.ln()]]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let lambda = rho.lambda_smooth_vec();
+
+    let dense = term
+        .decoder_smoothness_effective_dof_per_atom(&cache, &lambda)
+        .unwrap();
+
+    // Full-basis probes √k·e_j + the EXACT dense S⁻¹ ⇒ the umbrella estimate is
+    // the exact trace, deterministically.
+    let k = cache.k;
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<Array1<f64>> = probes
+        .iter()
+        .map(|v| cache.schur_inverse_apply(v.view()).unwrap())
+        .collect();
+    let matrix_free = term
+        .decoder_smoothness_effective_dof_per_atom_from_probes(&probes, &sinv, &lambda)
+        .unwrap();
+
+    assert_eq!(dense.len(), matrix_free.len());
+    for (atom_idx, (d, mf)) in dense.iter().zip(&matrix_free).enumerate() {
+        assert_abs_diff_eq!(d, mf, epsilon = 1.0e-9);
+        assert!(
+            atom_idx < 1 || *mf >= 0.0,
+            "atom {atom_idx} edof must be a nonneg dof, got {mf}"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     // The matrix-free Hutchinson estimator of `diag((H⁻¹)_tt)` (the #1777 fold

@@ -127,4 +127,71 @@ impl SaeManifoldTerm {
         }
         Ok(per_atom)
     }
+
+    /// Per-atom decoder-smoothness effective dof `edof_k = tr((H⁻¹)_ββ·M_k)`,
+    /// `M_k = (λ_k·½(S_k+S_kᵀ)) ⊗ I_{r_k}`, from the #2080 SHARED selected-inverse
+    /// bundle instead of a dense `(H⁻¹)_ββ`: the surrogate lane's frozen probes
+    /// `z_j` and their `S⁻¹ z_j` (t = 0) solves. Estimated through the tr(S⁻¹·M)
+    /// umbrella `edof_k = (1/m)Σ_j (S⁻¹z_j)ᵀ(M_k z_j)` with `M_k` row-local (only
+    /// atom `k`'s β-block is nonzero, so this is exactly `tr((S⁻¹)_{kk} M_k)`,
+    /// matching the dense path's per-atom column trace). Reuses ONE
+    /// `(probes, S⁻¹·probes)` pair across every gradient channel so the value and
+    /// the ρ-gradient never desync — the matrix-free replacement for the dense
+    /// `beta_inv` in
+    /// [`SaeManifoldTerm::decoder_smoothness_effective_dof_with_solver_per_atom`]
+    /// on the massive-`K` surrogate lane. The probe/solve vectors have length
+    /// `border_dim` (the reduced-Schur dimension `cache.k`).
+    pub(crate) fn decoder_smoothness_effective_dof_per_atom_from_probes(
+        &self,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+        lambda_smooth: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        let p = self.output_dim();
+        let frames_active = self.frames_active();
+        let (offsets, out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) = if frames_active {
+            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            (
+                self.factored_beta_offsets(),
+                Box::new(move |k: usize| ranks[k]),
+            )
+        } else {
+            (self.beta_offsets(), Box::new(move |_k: usize| p))
+        };
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let s = &atom.smooth_penalty;
+            let m = atom.basis_size();
+            let off = offsets[atom_idx];
+            let r = out_dim(atom_idx);
+            let lambda = lambda_smooth[atom_idx];
+            // M_k·v: block-diagonal `(λ_k·½(S_k+S_kᵀ)) ⊗ I_{r_k}` restricted to
+            // atom `k`'s β-block, matching the exact path's `M[:,col]` column
+            // construction row-for-row.
+            let m_apply = |v: ArrayView1<'_, f64>| -> Array1<f64> {
+                let mut out = Array1::<f64>::zeros(v.len());
+                for nu in 0..m {
+                    for oc in 0..r {
+                        let mut acc = 0.0_f64;
+                        for mu in 0..m {
+                            let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
+                            acc += lambda * s_nu_mu * v[off + mu * r + oc];
+                        }
+                        out[off + nu * r + oc] = acc;
+                    }
+                }
+                out
+            };
+            per_atom[atom_idx] =
+                hutchinson_reduced_schur_inverse_trace(probes, sinv_probes, &m_apply).ok_or_else(
+                    || {
+                        format!(
+                            "decoder_smoothness_effective_dof_per_atom_from_probes: non-finite \
+                             Hutchinson trace for atom {atom_idx}"
+                        )
+                    },
+                )?;
+        }
+        Ok(per_atom)
+    }
 }

@@ -158,7 +158,8 @@ pub(crate) use gam_solve::arrow_schur::{
 // swaps the SLQ reduced-Schur log|S| for the desync-safe rational surrogate
 // (value + ρ-gradient one functional), plus its per-outer-solve frozen state.
 pub(crate) use gam_solve::arrow_schur::{
-    SurrogateLaneConfig, SurrogateLaneState, matrix_free_arrow_evidence_log_det_surrogate,
+    SurrogateLaneConfig, SurrogateLaneState, hutchinson_reduced_schur_inverse_trace,
+    matrix_free_arrow_evidence_log_det_surrogate,
 };
 
 pub(crate) use gam_solve::estimate::EstimationError;
