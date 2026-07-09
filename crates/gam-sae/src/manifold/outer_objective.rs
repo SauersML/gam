@@ -3205,7 +3205,7 @@ impl SaeManifoldOuterObjective {
             // Return the discovery verdict verbatim (its typed refusal / error is
             // what the value lanes already map to the finite collapse wall).
             None => {
-                let _ = member_eval;
+                debug_assert!(member_eval.is_err());
                 discovery
             }
         }
@@ -3275,12 +3275,6 @@ impl SaeManifoldOuterObjective {
             diff_sq += d * d;
         }
         (diff_sq / ss_tot) < SAE_FINAL_EV_DEGRADATION_TOL
-    }
-
-    /// Basin-bundle member count (test observability).
-    #[cfg(test)]
-    pub(crate) fn basin_bundle_len(&self) -> usize {
-        self.basin_bundle.len()
     }
 
     /// #1154 — add the amortized-encoder consistency fold to an already-computed

@@ -246,9 +246,9 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         covariance_mode_requested,
         covariance_corrected_used,
     } = payload;
-    // Bind-and-drop so the exhaustive pattern is not flagged unused; the values
-    // themselves are irrelevant — only the field set matters to the lint.
-    let _ = (
+    // Consume the bound references so the exhaustive pattern is not flagged
+    // unused; the values themselves are irrelevant, only the field set matters.
+    std::hint::black_box((
         eta,
         mean,
         eta_standard_error,
@@ -261,7 +261,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         observation_upper,
         covariance_mode_requested,
         covariance_corrected_used,
-    );
+    ));
     vec![
         FieldAudit::point("eta"),
         FieldAudit::point("mean"),
@@ -289,7 +289,14 @@ fn coefficient_payload_field_audits(payload: &CoefficientUncertaintyResult) -> V
         corrected,
         covariance_mode_requested,
     } = payload;
-    let _ = (estimate, standard_error, lower, upper, corrected, covariance_mode_requested);
+    std::hint::black_box((
+        estimate,
+        standard_error,
+        lower,
+        upper,
+        corrected,
+        covariance_mode_requested,
+    ));
     vec![
         FieldAudit::point("estimate"),
         FieldAudit::audited("standard_error", "coefficient_wald_interval"),
@@ -316,7 +323,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         observation_lower,
         observation_upper,
     } = payload;
-    let _ = (
+    std::hint::black_box((
         eta,
         eta_standard_error,
         mean,
@@ -325,7 +332,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         mean_upper,
         observation_lower,
         observation_upper,
-    );
+    ));
     vec![
         FieldAudit::point("eta"),
         FieldAudit::audited("eta_standard_error", "eta_credible_band_conditional"),

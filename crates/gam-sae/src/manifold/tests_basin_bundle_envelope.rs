@@ -231,7 +231,10 @@ fn freeze_contract_bypasses_the_bundle() {
     let (mut objective, _z, seed) = two_circle_objective(n, p, k, 2, 0);
     // Drive the production value lane directly a few times.
     for _ in 0..4 {
-        let _ = objective.eval_cost(&seed);
+        let value = objective
+            .eval_cost(&seed)
+            .expect("freeze-lane value evaluation should complete");
+        assert!(value.is_finite(), "freeze-lane value must be finite");
     }
     let telemetry = objective.probe_telemetry();
     assert_eq!(
@@ -239,7 +242,7 @@ fn freeze_contract_bypasses_the_bundle() {
         "the freeze lane must never run the basin envelope"
     );
     assert_eq!(
-        objective.basin_bundle_len(),
+        telemetry.basin_max_members,
         0,
         "the freeze lane must never seed the basin bundle"
     );

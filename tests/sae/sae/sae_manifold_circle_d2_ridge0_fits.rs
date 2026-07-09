@@ -256,8 +256,12 @@ fn zz_1095_2228_measure_seed_vs_settled_r2() {
     let used_pristine = fitted.used_pristine_seed_fallback;
     let used_seed_basin = fitted.used_seed_basin_fallback;
     let charts_canonicalized = fitted.charts_canonicalized;
-    let mut fitted_term = fitted.term;
+    let fitted_term = fitted.term;
     let returned_r2 = reconstruction_r2(&fitted_term.fitted(), &z);
+    assert!(
+        seed_r2.is_finite() && returned_r2.is_finite(),
+        "seed and returned reconstruction R² measurements must be finite"
+    );
     println!(
         "[#1095/#2228 measure] cold_seed_R2={seed_r2:.6} returned_R2={returned_r2:.6} \
          final_value={:.6e} used_pristine_seed_fallback={used_pristine} \
