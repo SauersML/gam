@@ -1,4 +1,5 @@
 use super::*;
+use gam_optimize::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
     match link {
@@ -97,59 +98,6 @@ fn resolved_wiggle_inverse_link(
     };
     require_inverse_link_supports_joint_wiggle(&resolved, "standard link wiggle")?;
     Ok(resolved)
-}
-
-fn deviation_block_config_from_formula_linkwiggle(
-    wiggle: &LinkWiggleFormulaSpec,
-) -> Result<DeviationBlockConfig, String> {
-    // #384: the score-warp / link-deviation block is realized by the
-    // structurally *cubic* I-spline `DeviationRuntime` (see
-    // `build_deviation_block_from_knots_and_design_seed` in `bms::family`):
-    // its span tables, C2-continuous construction, and derivative operators
-    // are all hard-wired to cubic, so the only realizable `degree` is 3. The
-    // shared formula parser intentionally stays general (it also feeds the
-    // arbitrary-degree `timewiggle` / location-scale monotone basis), so the
-    // cubic-only contract is enforced here, at the routing boundary that feeds
-    // this runtime — up front, instead of failing deep inside the fit after
-    // expensive setup with a cryptic "degree must be 3" IntegrationError. The
-    // CLI routing twin (`gam-cli::main::model_build`) applies the same guard.
-    if wiggle.degree != 3 {
-        return Err(format!(
-            "linkwiggle() degree must be 3 when routed into the score-warp / \
-             link-deviation block: that runtime is a cubic I-spline and only \
-             supports cubic splines; got degree={}",
-            wiggle.degree
-        ));
-    }
-    let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
-    Ok(DeviationBlockConfig {
-        degree: wiggle.degree,
-        num_internal_knots: wiggle.num_internal_knots,
-        penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
-        penalty_orders: wiggle.penalty_orders.clone(),
-        double_penalty: wiggle.double_penalty,
-        monotonicity_eps: defaults.monotonicity_eps,
-    })
-}
-
-#[derive(Debug)]
-pub(crate) struct MarginalSlopeDeviationRouting {
-    pub(crate) score_warp: Option<DeviationBlockConfig>,
-    pub(crate) link_dev: Option<DeviationBlockConfig>,
-}
-
-pub(crate) fn route_marginal_slope_deviation_blocks(
-    main_linkwiggle: Option<&LinkWiggleFormulaSpec>,
-    logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
-) -> Result<MarginalSlopeDeviationRouting, String> {
-    Ok(MarginalSlopeDeviationRouting {
-        score_warp: logslope_linkwiggle
-            .map(deviation_block_config_from_formula_linkwiggle)
-            .transpose()?,
-        link_dev: main_linkwiggle
-            .map(deviation_block_config_from_formula_linkwiggle)
-            .transpose()?,
-    })
 }
 
 pub(crate) fn fixed_gaussian_shift_frailty_from_spec(
@@ -1455,23 +1403,23 @@ fn survival_transformation_edf(
     // yields a usable trace rather than aborting the whole fit.
     let factor = {
         let scale = h_sym.max_abs_diag();
-        let min_step = scale * 1e-10;
-        let mut ridge = 0.0_f64;
-        let mut attempts = 0_usize;
-        loop {
+        let try_ridge = |ridge: f64| -> Option<_> {
             let candidate = if ridge > 0.0 {
                 h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
             } else {
                 h_sym.clone()
             };
-            if let Ok(f) = candidate.factorize() {
-                break f;
-            }
-            attempts += 1;
-            if attempts >= 8 {
-                return Err("survival edf: penalized Hessian could not be factorized".to_string());
-            }
-            ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+            candidate.factorize().ok()
+        };
+        // Bare (unridged) attempt first, then 7 geometric escalations from
+        // `scale·1e-10` — the pre-migration budget of 8 total attempts.
+        match try_ridge(0.0) {
+            Some(f) => f,
+            None => escalate_ridge(RidgeSchedule::geometric(scale * 1e-10, 7), try_ridge)
+                .map(|success| success.value)
+                .map_err(|_| {
+                    "survival edf: penalized Hessian could not be factorized".to_string()
+                })?,
         }
     };
     let mut edf_by_block = vec![0.0_f64; penalty_blocks.len()];

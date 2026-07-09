@@ -1,4 +1,8 @@
 use super::*;
+use gam_optimize::{
+    BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge,
+};
+use std::convert::Infallible;
 
 impl SurvivalLocationScaleFamily {
     /// Recompute every block's linear predictor `η_b = D_b · β_b + o_b` from
@@ -261,32 +265,41 @@ impl SurvivalLocationScaleFamily {
                 .iter()
                 .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
                 .max(1.0);
-            let mut tau = 0.0_f64;
-            let delta = loop {
+            let try_damped = |tau: f64| -> Option<Array1<f64>> {
                 let mut damped = h.clone();
                 if tau > 0.0 {
                     for i in 0..p_total {
                         damped[[i, i]] += tau;
                     }
                 }
-                match damped.cholesky(faer::Side::Lower) {
-                    Ok(chol) => break chol.solvevec(&g),
-                    Err(_) => {
-                        tau = if tau == 0.0 {
-                            LEVENBERG_INITIAL_DAMPING_REL * h_scale
-                        } else {
-                            tau * LEVENBERG_DAMPING_GROWTH
-                        };
-                        if tau > LEVENBERG_MAX_DAMPING_REL * h_scale {
-                            return Err(SurvivalLocationScaleError::NumericalFailure {
-                                reason:
-                                    "direct parametric-AFT MLE: Hessian not factorizable even with maximal damping"
-                                        .to_string(),
-                            }
-                            .into());
-                        }
-                    }
-                }
+                damped
+                    .cholesky(faer::Side::Lower)
+                    .ok()
+                    .map(|chol| chol.solvevec(&g))
+            };
+            // Bare (undamped) Newton solve first; on failure escalate τ
+            // geometrically across the damping span [INITIAL, MAX]·h_scale —
+            // the trial count is that span's decade count, inclusive.
+            let damping_trials = (LEVENBERG_MAX_DAMPING_REL / LEVENBERG_INITIAL_DAMPING_REL)
+                .log10()
+                .ceil() as usize
+                + 1;
+            let delta = match try_damped(0.0) {
+                Some(delta) => delta,
+                None => escalate_ridge(
+                    RidgeSchedule {
+                        initial: LEVENBERG_INITIAL_DAMPING_REL * h_scale,
+                        growth: LEVENBERG_DAMPING_GROWTH,
+                        max_escalations: damping_trials,
+                    },
+                    try_damped,
+                )
+                .map(|success| success.value)
+                .map_err(|_| SurvivalLocationScaleError::NumericalFailure {
+                    reason:
+                        "direct parametric-AFT MLE: Hessian not factorizable even with maximal damping"
+                            .to_string(),
+                })?,
             };
             if !delta.iter().all(|v| v.is_finite()) {
                 return Err(SurvivalLocationScaleError::NumericalFailure {
@@ -330,23 +343,40 @@ impl SurvivalLocationScaleFamily {
             // sufficient-increase condition on ℓ is well posed. The directional
             // derivative is exactly the Newton decrement computed above.
             let directional = newton_decrement;
-            const ARMIJO_C: f64 = 1e-4;
-            const BACKTRACK: f64 = 0.5;
             const MIN_ALPHA: f64 = 1e-12;
-            let mut accepted: Option<(Array1<f64>, Vec<ParameterBlockState>, f64)> = None;
-            while alpha >= MIN_ALPHA {
-                let trial_theta = &theta + &(alpha * &delta);
-                if let Ok(cand_states) = self.parametric_aft_states_from_theta(&trial_theta, specs)
-                    && let Ok(cand_ll) = self.log_likelihood_only(&cand_states)
-                    && cand_ll.is_finite()
-                    && cand_ll >= ll + ARMIJO_C * alpha * directional
-                {
-                    accepted = Some((trial_theta, cand_states, cand_ll));
-                    break;
-                }
-                alpha *= BACKTRACK;
-            }
-            match accepted {
+            // The pre-migration loop halved from the feasibility-capped α until
+            // it fell below MIN_ALPHA; the equivalent trial count is
+            // ⌊log₂(α₀/MIN_ALPHA)⌋ + 1 (zero when α₀ already sits below the
+            // floor, in which case no trial runs and the search is exhausted).
+            let max_steps = ((alpha / MIN_ALPHA).log2().floor() as i64 + 1).max(0) as usize;
+            // A trial whose block-state rebuild or likelihood evaluation errors
+            // is INVALID (`Ok(None)`): halve without consulting the Armijo test.
+            let accepted = match backtracking_line_search::<_, Infallible>(
+                BacktrackConfig {
+                    initial_step: alpha,
+                    max_steps,
+                    ..BacktrackConfig::default()
+                },
+                |alpha| {
+                    let trial_theta = &theta + &(alpha * &delta);
+                    let Ok(cand_states) =
+                        self.parametric_aft_states_from_theta(&trial_theta, specs)
+                    else {
+                        return Ok(None);
+                    };
+                    let Ok(cand_ll) = self.log_likelihood_only(&cand_states) else {
+                        return Ok(None);
+                    };
+                    Ok(Some((cand_ll, (trial_theta, cand_states))))
+                },
+                |alpha, cand_ll| {
+                    cand_ll.is_finite() && cand_ll >= ll + constants::ARMIJO_C1 * alpha * directional
+                },
+            ) {
+                Ok(result) => result,
+                Err(never) => match never {},
+            };
+            match accepted.map(|step| (step.payload.0, step.payload.1, step.value)) {
                 Some((new_theta, new_states, new_ll)) => {
                     theta = new_theta;
                     states = new_states;

@@ -9,7 +9,11 @@ use gam_solve::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use gam_problem::{Coefficients, LinearPredictor};
+use gam_optimize::{
+    BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
+use std::convert::Infallible;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -2592,9 +2596,11 @@ impl WorkingModelSurvival {
         {
             const POLISH_MAX_ITERS: usize = 400;
             const POLISH_TOL: f64 = 1e-13;
-            // Armijo sufficient-decrease constant and backtracking factor.
-            const ARMIJO_C: f64 = 1e-4;
-            const BACKTRACK: f64 = 0.5;
+            // Armijo sufficient-decrease constant and backtracking factor —
+            // the shared gam-optimize tuning constants; only the halving
+            // budget (80, deeper than the shared 60) is site-specific.
+            const ARMIJO_C: f64 = constants::ARMIJO_C1;
+            const BACKTRACK: f64 = constants::BACKTRACK_CONTRACTION;
             const MAX_BACKTRACK: usize = 80;
             let p = beta.len();
             // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ + ½ridge‖β‖² whose
@@ -2642,75 +2648,85 @@ impl WorkingModelSurvival {
                 // the smallest SPD shift, and for an SPD system rᵀ(H+λI)⁻¹r > 0
                 // EXACTLY (Cholesky is backward-stable, no clamping), so the
                 // Newton direction is a guaranteed descent direction.
-                let mut step: Option<Array1<f64>> = None;
-                let mut dir_deriv = 0.0_f64;
-                for lm_pow in 0..18 {
-                    let lambda_lm = if lm_pow == 0 {
-                        0.0
-                    } else {
-                        1e-12 * h_scale * 10f64.powi(lm_pow)
-                    };
+                // The attempt certifies a DESCENT direction, not mere
+                // factorability: Cholesky must succeed, the solve must stay
+                // finite, and the directional derivative must clear the
+                // sign floor. ∇fᵀd = rᵀ(−step) = −r·(H+λI)⁻¹r < 0 exactly
+                // for SPD systems.
+                let try_lm = |lambda_lm: f64| -> Option<(Array1<f64>, f64)> {
                     let mut h_reg = h.clone();
                     for d in 0..p {
                         h_reg[[d, d]] += lambda_lm;
                     }
-                    let factor = match gam_linalg::faer_ndarray::FaerCholesky::cholesky(
+                    let factor = gam_linalg::faer_ndarray::FaerCholesky::cholesky(
                         &h_reg,
                         faer::Side::Lower,
-                    ) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
+                    )
+                    .ok()?;
                     let candidate_step = factor.solvevec(&r);
                     if candidate_step.iter().any(|v| !v.is_finite()) {
-                        continue;
+                        return None;
                     }
-                    // ∇fᵀd = rᵀ(−step) = −r·(H+λI)⁻¹r < 0 exactly for SPD systems.
                     let dd = -r.dot(&candidate_step);
-                    if dd.is_finite() && dd < -1e-14 * r_norm * r_norm {
-                        step = Some(candidate_step);
-                        dir_deriv = dd;
-                        break;
-                    }
-                }
-                let (step, dir_deriv) = match step {
-                    Some(s) => (s, dir_deriv),
-                    None => {
+                    (dd.is_finite() && dd < -1e-14 * r_norm * r_norm)
+                        .then_some((candidate_step, dd))
+                };
+                // Bare λ=0 attempt first, then 17 decades from 1e-11·h_scale
+                // (the pre-migration `1e-12·h_scale·10^pow` for pow = 1..18).
+                let (step, dir_deriv) = try_lm(0.0)
+                    .or_else(|| {
+                        escalate_ridge(RidgeSchedule::geometric(1e-11 * h_scale, 17), try_lm)
+                            .ok()
+                            .map(|success| success.value)
+                    })
+                    .unwrap_or_else(|| {
                         // Steepest-descent fallback: d = −r ⇒ step = +r (we step
                         // β − step), ∇fᵀd = −‖r‖² < 0.
                         (r.clone(), -r_norm * r_norm)
-                    }
-                };
-                let mut alpha = 1.0_f64;
-                let mut accepted = false;
-                for _ in 0..MAX_BACKTRACK {
-                    let trial = &beta - &(alpha * &step);
-                    if let Ok(ts) = candidate.update_state(&trial) {
+                    });
+                // Accept on EITHER a sufficient objective decrease (Armijo,
+                // the global-convergence guarantee on the convex objective)
+                // OR a strict residual-norm decrease. Near the solution the
+                // penalized objective is flat to f64 roundoff (f0 ≈ ft), so a
+                // pure-Armijo test backtracks α→0 and crawls (the asymmetric
+                // ρ=3.99999 stall: 200 iters at 3.7e-7 vs 12 iters at the
+                // other two ρ). The ‖r‖-decrease arm lets the exact Cholesky
+                // Newton step (α=1) through, restoring quadratic convergence
+                // to ~1e-12 symmetrically across all three FD points so the
+                // centered FD of the value surface is itself exact.
+                //
+                // The dual criterion reads BOTH the trial objective and the
+                // trial residual norm, so the decision lives inside the trial
+                // closure: a rejected candidate returns `Ok(None)` (shrink)
+                // exactly like an invalid `update_state`, and the accept
+                // predicate is the constant `true`.
+                let accepted = match backtracking_line_search::<_, Infallible>(
+                    BacktrackConfig {
+                        contraction: BACKTRACK,
+                        max_steps: MAX_BACKTRACK,
+                        ..BacktrackConfig::default()
+                    },
+                    |alpha| {
+                        let trial = &beta - &(alpha * &step);
+                        let Ok(ts) = candidate.update_state(&trial) else {
+                            return Ok(None);
+                        };
                         let ft = penalized_objective(&ts);
                         let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        // Accept on EITHER a sufficient objective decrease (Armijo,
-                        // the global-convergence guarantee on the convex objective)
-                        // OR a strict residual-norm decrease. Near the solution the
-                        // penalized objective is flat to f64 roundoff (f0 ≈ ft), so a
-                        // pure-Armijo test backtracks α→0 and crawls (the asymmetric
-                        // ρ=3.99999 stall: 200 iters at 3.7e-7 vs 12 iters at the
-                        // other two ρ). The ‖r‖-decrease arm lets the exact Cholesky
-                        // Newton step (α=1) through, restoring quadratic convergence
-                        // to ~1e-12 symmetrically across all three FD points so the
-                        // centered FD of the value surface is itself exact.
-                        let armijo_ok = ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
+                        let armijo_ok =
+                            ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
                         let residual_ok = tn.is_finite() && tn < r_norm;
-                        if armijo_ok || residual_ok {
-                            beta = trial;
-                            accepted = true;
-                            break;
-                        }
-                    }
-                    alpha *= BACKTRACK;
-                }
-                if !accepted {
+                        Ok((armijo_ok || residual_ok).then_some((ft, trial)))
+                    },
+                    |_alpha, _ft| true,
+                ) {
+                    Ok(result) => result,
+                    Err(never) => match never {},
+                };
+                let Some(ls) = accepted else {
                     break;
-                }
+                };
+                beta = ls.payload;
             }
         }
 

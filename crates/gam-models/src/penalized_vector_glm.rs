@@ -71,7 +71,11 @@ use crate::vector_response::VectorLikelihood;
 use crate::model_types::EstimationError;
 use gam_solve::pirls::dense_block_xtwx;
 use faer::Side;
+use gam_optimize::{
+    BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use std::convert::Infallible;
 
 /// Base Levenberg–Marquardt ridge as a fraction of the penalized Hessian's
 /// largest diagonal entry (so it is invariant to the problem's overall
@@ -290,8 +294,12 @@ fn invert_symmetric_penalized_hessian(
     } else {
         BASE_RIDGE_FRACTION_OF_MAX_DIAG
     };
-    let mut ridge = 0.0_f64;
-    for attempt in 0..=MAX_RIDGE_ESCALATIONS {
+    // `last_failure` distinguishes the two exhaustion modes so their distinct
+    // terminal errors survive the migration: `Some((ridge, err))` when the
+    // final attempt died in the factorization, `None` when it factored but the
+    // back-solve stayed non-finite.
+    let mut last_failure: Option<(f64, String)> = None;
+    let mut try_ridge = |ridge: f64| -> Option<Array2<f64>> {
         let mut ridged = hessian.clone();
         if ridge > 0.0 {
             for idx in 0..dim {
@@ -304,14 +312,8 @@ fn invert_symmetric_penalized_hessian(
         ) {
             Ok(factor) => factor,
             Err(err) => {
-                if attempt == MAX_RIDGE_ESCALATIONS {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "{context}: covariance factorization failed even with ridge \
-                         {ridge:.3e}: {err}"
-                    )));
-                }
-                ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
-                continue;
+                last_failure = Some((ridge, err.to_string()));
+                return None;
             }
         };
         // Solve H·Σ = I: identity RHS, back-solved in place to yield Σ = H⁻¹.
@@ -320,23 +322,46 @@ fn invert_symmetric_penalized_hessian(
             let rhs_view = array2_to_matmut(&mut rhs);
             factor.solve_in_place(rhs_view);
         }
-        if rhs.iter().all(|v| v.is_finite()) {
-            // Symmetrize to remove round-off asymmetry from the back-solve.
-            let mut cov = Array2::<f64>::zeros((dim, dim));
-            for i in 0..dim {
-                for j in 0..dim {
-                    cov[[i, j]] = 0.5 * (rhs[[i, j]] + rhs[[j, i]]);
-                }
-            }
-            return Ok(cov);
+        if !rhs.iter().all(|v| v.is_finite()) {
+            last_failure = None;
+            return None;
         }
-        ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
+        // Symmetrize to remove round-off asymmetry from the back-solve.
+        let mut cov = Array2::<f64>::zeros((dim, dim));
+        for i in 0..dim {
+            for j in 0..dim {
+                cov[[i, j]] = 0.5 * (rhs[[i, j]] + rhs[[j, i]]);
+            }
+        }
+        Some(cov)
+    };
+    // Bare (unridged) attempt first — at full rank the ridge is never engaged —
+    // then the geometric escalation from `base_ridge` with the doubling growth
+    // this site has always used.
+    if let Some(cov) = try_ridge(0.0) {
+        return Ok(cov);
     }
-    Err(EstimationError::InvalidInput(format!(
-        "{context}: covariance solve remained non-finite after {} ridge escalations \
-         (max_diag={max_diag:.3e})",
-        MAX_RIDGE_ESCALATIONS,
-    )))
+    match escalate_ridge(
+        RidgeSchedule {
+            initial: base_ridge,
+            growth: 2.0,
+            max_escalations: MAX_RIDGE_ESCALATIONS,
+        },
+        &mut try_ridge,
+    ) {
+        Ok(success) => Ok(success.value),
+        Err(_) => match last_failure {
+            Some((ridge, err)) => Err(EstimationError::InvalidInput(format!(
+                "{context}: covariance factorization failed even with ridge \
+                 {ridge:.3e}: {err}"
+            ))),
+            None => Err(EstimationError::InvalidInput(format!(
+                "{context}: covariance solve remained non-finite after {} ridge escalations \
+                 (max_diag={max_diag:.3e})",
+                MAX_RIDGE_ESCALATIONS,
+            ))),
+        },
+    }
 }
 
 /// Fit a penalized vector-response GLM at fixed `λ` via damped Newton.
@@ -617,61 +642,63 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         } else {
             BASE_RIDGE_FRACTION_OF_MAX_DIAG
         };
-        let mut delta = Array1::<f64>::zeros(beta_flat_dim);
-        let mut ridge = base_ridge;
-        let mut solved = false;
-        for attempt in 0..=MAX_RIDGE_ESCALATIONS {
-            let mut ridged = hessian.clone();
-            if ridge > 0.0 {
+        // A genuine factorization failure (not just a singular pivot) is
+        // remembered so exhaustion can surface its distinct terminal error;
+        // singular pivots back-substituted to ±inf/NaN just escalate.
+        let mut last_factor_err: Option<(f64, String)> = None;
+        let delta = match escalate_ridge(
+            RidgeSchedule {
+                initial: base_ridge,
+                growth: 2.0,
+                max_escalations: MAX_RIDGE_ESCALATIONS + 1,
+            },
+            |ridge| {
+                let mut ridged = hessian.clone();
                 for idx in 0..beta_flat_dim {
                     ridged[[idx, idx]] += ridge;
                 }
-            }
-            let factor = match factorize_symmetricwith_fallback(
-                FaerArrayView::new(&ridged).as_ref(),
-                Side::Lower,
-            ) {
-                Ok(factor) => factor,
-                Err(err) => {
-                    // A genuine factorization failure (not just a singular
-                    // pivot) — escalate the ridge and retry; only give up after
-                    // exhausting the escalation budget.
-                    if attempt == MAX_RIDGE_ESCALATIONS {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "{context}: Hessian factorization failed at iter {iter} \
-                             even with ridge {ridge:.3e}: {err}"
-                        )));
+                let factor = match factorize_symmetricwith_fallback(
+                    FaerArrayView::new(&ridged).as_ref(),
+                    Side::Lower,
+                ) {
+                    Ok(factor) => factor,
+                    Err(err) => {
+                        last_factor_err = Some((ridge, err.to_string()));
+                        return None;
                     }
-                    ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
-                    continue;
-                }
-            };
-            let mut rhs = Array2::<f64>::zeros((beta_flat_dim, 1));
-            for i in 0..beta_flat_dim {
-                rhs[[i, 0]] = -grad_flat[i];
-            }
-            {
-                let rhs_view = array2_to_matmut(&mut rhs);
-                factor.solve_in_place(rhs_view);
-            }
-            if (0..beta_flat_dim).all(|i| rhs[[i, 0]].is_finite()) {
+                };
+                last_factor_err = None;
+                let mut rhs = Array2::<f64>::zeros((beta_flat_dim, 1));
                 for i in 0..beta_flat_dim {
-                    delta[i] = rhs[[i, 0]];
+                    rhs[[i, 0]] = -grad_flat[i];
                 }
-                solved = true;
-                break;
+                {
+                    let rhs_view = array2_to_matmut(&mut rhs);
+                    factor.solve_in_place(rhs_view);
+                }
+                (0..beta_flat_dim)
+                    .all(|i| rhs[[i, 0]].is_finite())
+                    .then(|| Array1::from_iter((0..beta_flat_dim).map(|i| rhs[[i, 0]])))
+            },
+        ) {
+            Ok(success) => success.value,
+            Err(exhausted) => {
+                if let Some((ridge, err)) = last_factor_err {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: Hessian factorization failed at iter {iter} \
+                         even with ridge {ridge:.3e}: {err}"
+                    )));
+                }
+                panic!(
+                    "{context}: Newton step remained non-finite at iter {iter} after {} ridge \
+                     escalations up to {:.3e}; the penalized Hessian is pathologically \
+                     rank-deficient (grad_norm={:.3e}, max_diag={max_diag:.3e})",
+                    MAX_RIDGE_ESCALATIONS,
+                    exhausted.next_ridge,
+                    grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                );
             }
-            // Singular pivots back-substituted to ±inf/NaN: escalate the ridge.
-            ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
-        }
-        assert!(
-            solved,
-            "{context}: Newton step remained non-finite at iter {iter} after {} ridge \
-             escalations up to {ridge:.3e}; the penalized Hessian is pathologically \
-             rank-deficient (grad_norm={:.3e}, max_diag={max_diag:.3e})",
-            MAX_RIDGE_ESCALATIONS,
-            grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
-        );
+        };
 
         // Damped acceptance: full step first, halve up to `MAX_BACKTRACKS` times
         // if the penalized negative log-likelihood fails to decrease. The first
@@ -691,18 +718,27 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 crate::bail_invalid_estim!("{context}: non-finite objective at β = 0");
             }
         }
-        let mut alpha = 1.0_f64;
-        let mut accepted_beta = proposed_beta(alpha);
-        let mut new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
-        let mut backtrack = 0usize;
-        while (!new_objective.is_finite()
-            || new_objective > last_objective + OBJECTIVE_DECREASE_SLACK)
-            && backtrack < MAX_BACKTRACKS
-        {
-            alpha *= LINE_SEARCH_SHRINK;
-            accepted_beta = proposed_beta(alpha);
-            new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
-            backtrack += 1;
+        // The trial closure writes each candidate into `accepted_beta`/
+        // `new_objective` directly: on acceptance they hold the accepted trial,
+        // and on exhaustion they hold the LAST (rejected) trial — this site has
+        // always proceeded with that final halved step rather than falling back.
+        let mut accepted_beta = Array2::<f64>::zeros(beta.raw_dim());
+        let mut new_objective = f64::NAN;
+        match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig {
+                contraction: LINE_SEARCH_SHRINK,
+                max_steps: MAX_BACKTRACKS + 1,
+                ..BacktrackConfig::default()
+            },
+            |alpha| {
+                accepted_beta = proposed_beta(alpha);
+                new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
+                Ok(Some((new_objective, ())))
+            },
+            |_alpha, f| f.is_finite() && f <= last_objective + OBJECTIVE_DECREASE_SLACK,
+        ) {
+            Ok(_) => {}
+            Err(never) => match never {},
         }
 
         let mut step_norm_sq = 0.0_f64;
