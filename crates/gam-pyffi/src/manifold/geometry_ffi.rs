@@ -2674,15 +2674,12 @@ fn validate_parametric_aux_conditional_prior(
     Ok(())
 }
 
-fn inverse_softplus_scalar(value: f64) -> f64 {
-    if value <= 0.0 || value.is_nan() {
-        f64::NAN
-    } else if value > 30.0 {
-        value + (-(-value).exp()).ln_1p()
-    } else {
-        value.exp_m1().ln()
-    }
-}
+// Softplus⁻¹ reparameterization helper: the single definition lives in the core
+// `gam-sae` crate next to the forward softplus link (`terms::sae::assignment`),
+// so no numeric policy lives in this FFI shim (SPEC: pyffi thin, single source
+// of truth). Aliased to the original local name so the call sites below stay
+// unchanged.
+use gam::terms::sae::assignment::inverse_softplus as inverse_softplus_scalar;
 
 #[pyclass(
     module = "gam_pyffi._rust",

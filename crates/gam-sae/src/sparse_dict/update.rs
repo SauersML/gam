@@ -1557,8 +1557,16 @@ fn cg_solve<F>(matvec: &F, b: &[f64], charge_floor: f64, cap: usize) -> CgSolveR
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
+    use gam_linalg::pcg::{DotReduction, PcgStop, pcg_core};
+
     let n = b.len();
     let bnorm = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    // Preserve the historical near-zero-rhs short-circuit: a right-hand side at
+    // or below the dead-denominator floor carries no informative solution, so
+    // return the zero iterate as converged rather than iterating on noise.
+    // (`pcg_core`'s own early-out fires only for an EXACT-zero rhs; retaining
+    // this keeps the whole `‖b‖ ≤ DEAD_DENOM` band byte-identical to the prior
+    // hand-rolled loop.)
     if bnorm <= DEAD_DENOM {
         return CgSolveResult {
             x: vec![0.0; n],
@@ -1569,69 +1577,54 @@ where
         };
     }
 
-    let mut x = vec![0.0f64; n];
-    let mut r = b.to_vec();
-    let mut pdir = r.clone();
-    let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
-    let mut alphas = Vec::new();
-    let mut betas = Vec::new();
-    let mut relative_residual = 1.0;
+    // Delegate the CG recurrence to the shared `gam_linalg::pcg` core — the
+    // single source of truth that exists precisely to end hand-rolled CG drift.
+    // This path is unpreconditioned (all-ones Jacobi diagonal), uses the
+    // bit-reproducible serial reduction, and disables residual refresh, which
+    // reproduces the prior loop's pure-recurrence residual exactly. The
+    // per-iteration alpha/beta trace is requested so the Lanczos condition
+    // estimate `kappa_hat` is reconstructed unchanged on the converged and
+    // cap-reached paths that feed the derived iteration cap downstream.
+    let rhs = ndarray::Array1::from_vec(b.to_vec());
+    let precond = ndarray::Array1::<f64>::from_elem(n, 1.0);
+    let mut solution = ndarray::Array1::<f64>::zeros(n);
+    let apply = |v: &ndarray::Array1<f64>, out: &mut ndarray::Array1<f64>| {
+        let av = matvec(v.as_slice().expect("pcg direction vector is contiguous"));
+        out.assign(&ndarray::Array1::from_vec(av));
+    };
+    let result = pcg_core(
+        apply,
+        &rhs.view(),
+        &precond.view(),
+        charge_floor,
+        cap,
+        0,
+        true,
+        DotReduction::Serial,
+        &mut solution.view_mut(),
+    );
 
-    for iter in 0..cap {
-        let ap = matvec(&pdir);
-        let mut pap = 0.0f64;
-        for i in 0..n {
-            pap += pdir[i] * ap[i];
-        }
-        if pap <= 0.0 || !pap.is_finite() {
-            return CgSolveResult {
-                x,
-                iterations: iter,
-                relative_residual,
-                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
-                stop: CgStop::Breakdown,
-            };
-        }
-        let alpha = rs_old / pap;
-        alphas.push(alpha);
-        for i in 0..n {
-            x[i] += alpha * pdir[i];
-            r[i] -= alpha * ap[i];
-        }
-        let rs_new: f64 = r.iter().map(|v| v * v).sum();
-        relative_residual = rs_new.sqrt() / bnorm;
-        if relative_residual <= charge_floor {
-            return CgSolveResult {
-                x,
-                iterations: iter + 1,
-                relative_residual,
-                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
-                stop: CgStop::Converged,
-            };
-        }
-        let beta = rs_new / rs_old;
-        if !beta.is_finite() {
-            return CgSolveResult {
-                x,
-                iterations: iter + 1,
-                relative_residual,
-                kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
-                stop: CgStop::Breakdown,
-            };
-        }
-        betas.push(beta);
-        for i in 0..n {
-            pdir[i] = r[i] + beta * pdir[i];
-        }
-        rs_old = rs_new;
-    }
+    let relative_residual = if result.rhs_norm > 0.0 {
+        result.final_residual_norm / result.rhs_norm
+    } else {
+        0.0
+    };
+    let kappa_hat = result
+        .diagnostics
+        .as_ref()
+        .and_then(|d| kappa_from_cg_tridiagonal(&d.alpha, &d.beta));
+    let stop = match result.stop {
+        PcgStop::Converged => CgStop::Converged,
+        PcgStop::MaxIters => CgStop::CapReached,
+        PcgStop::Breakdown | PcgStop::BadPreconditioner => CgStop::Breakdown,
+    };
 
     CgSolveResult {
-        x,
-        iterations: cap,
+        x: solution.to_vec(),
+        iterations: result.iterations,
         relative_residual,
-        kappa_hat: kappa_from_cg_tridiagonal(&alphas, &betas),
-        stop: CgStop::CapReached,
+        kappa_hat,
+        stop,
     }
 }
 

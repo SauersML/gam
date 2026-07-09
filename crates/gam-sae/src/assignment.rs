@@ -1773,6 +1773,33 @@ pub fn jumprelu_batch_value_grad(
     (value, grad)
 }
 
+/// Exact numerical inverse of the softplus link `softplus(x) = log(1 + eˣ)`
+/// (the forward direction is [`gam_linalg::utils::stable_softplus`], used by
+/// [`topk_activation_row_value_grad`] below). This is the single source of
+/// truth for the softplus⁻¹ reparameterization the SAE penalty FFI uses to map
+/// a positive scale hyperparameter `β > 0` back to its raw pre-softplus
+/// coordinate `raw = softplus⁻¹(β)` (the `raw_beta` of the parametric
+/// row-precision / aux-conditional priors). Moved out of the pyffi shim
+/// (`geometry_ffi::inverse_softplus_scalar`) so no numeric policy lives in the
+/// FFI layer.
+///
+/// Domain / stability contract (preserved exactly from the shim):
+///   * `value ≤ 0` or `NaN` → `NaN` (softplus is strictly positive, so its
+///     inverse is undefined off the positive reals);
+///   * `value > 30` uses the overflow-safe identity
+///     `softplus⁻¹(v) = v + log1p(−e^{−v})` (`eᵛ` would overflow);
+///   * otherwise the direct `log(e^v − 1) = ln(expm1(v))`.
+#[must_use]
+pub fn inverse_softplus(value: f64) -> f64 {
+    if value <= 0.0 || value.is_nan() {
+        f64::NAN
+    } else if value > 30.0 {
+        value + (-(-value).exp()).ln_1p()
+    } else {
+        value.exp_m1().ln()
+    }
+}
+
 /// Top-k SAE activation value+grad: the per-atom **independent**, strictly
 /// non-negative activation `a_k = τ · softplus(l_k / τ)` and its diagonal logit
 /// derivative `∂a_k/∂l_k = σ(l_k / τ)`.
