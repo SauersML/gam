@@ -165,6 +165,51 @@ def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
     assert new["metric_provenance"] == "OutputFisher"
 
 
+def test_builder_full_fit_equiv_linear_block(monkeypatch):
+    """linear_block arm: a flat-block fit reports the generic `linear` kind, and
+    `sae_manifold_fit` relabels declared-block atoms to `linear_block` AFTER
+    from_payload (basis_kinds + topologies, NOT basis_specs). The builder threads
+    the same declared bases and must reproduce that relabel in to_dict."""
+    builder = _builder()
+    rm = rust_module()
+    captured: dict = {}
+    orig = rm.sae_manifold_fit_minimal
+
+    def capture(*args, **kwargs):
+        payload = orig(*args, **kwargs)
+        captured["raw"] = dict(payload)
+        return payload
+
+    monkeypatch.setattr(rm, "sae_manifold_fit_minimal", capture)
+
+    x = _data_for("euclidean", n=60, p=5, seed=3)
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=2, d_atom=1, atom_topology="linear_block", assignment="ibp_map",
+        n_iter=8, random_state=0,
+    )
+    assert "raw" in captured
+    # What `_bases(...)` produces for atom_topology="linear_block": one per atom.
+    bases = ["linear_block"] * len(fit.atom_topologies)
+
+    raw_json = json.dumps(_jsonable(captured["raw"]))
+    core = builder(
+        raw_json, x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
+        list(fit.primitive_names[1:]),
+        float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
+        float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
+        int(fit.max_iter), int(fit.random_state), fit.top_k, float(fit.jumprelu_threshold),
+        None, None, bases,
+    )
+    old = fit.to_dict()
+    new = core.to_dict()
+    assert _no_nonfinite(old)
+    assert new == old
+    # The relabel must actually have fired (else this arm proves nothing).
+    assert "linear_block" in new["basis_kinds"]
+    # basis_specs keeps the fitted kind, exactly as _preserve_linear_block_labels.
+    assert "linear_block" not in new["basis_specs"]
+
+
 def test_builder_rejects_nonfinite_consistent_with_from_json():
     """The JSON-marshalled builder parses with serde, which rejects the bare
     `NaN` literal exactly as `ManifoldSaeCore.__new__` (`from_json`) does — so the

@@ -7356,10 +7356,10 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
 /// `training_mean = x.mean(0)`); the remaining args are the fit-config scalars
 /// `from_payload` receives (`assignment` already canonical). `fisher_factors`
 /// `(n, p, r)` + `fisher_provenance` are the retained output-Fisher shard
-/// `sae_manifold_fit` installs AFTER `from_payload` (`None` for a Euclidean fit).
-/// Reproduces `from_payload` ∘ `to_dict` bit-for-bit; the `linear_block` relabel
-/// (a post-`from_payload` step) is the one remaining follow-up arm before the
-/// fit-return flip.
+/// `sae_manifold_fit` installs AFTER `from_payload` (`None` for a Euclidean fit);
+/// `declared_bases` is the caller's per-atom bases list for the `linear_block`
+/// relabel (also a post-`from_payload` step). Reproduces `from_payload` ∘
+/// `to_dict` bit-for-bit for the full fit — the fit-return flip just calls this.
 ///
 /// The JSON parse rejects non-finite values exactly as `ManifoldSaeCore::new`
 /// does, so this path is NaN-consistent with the legacy reader. The raw-payload
@@ -7371,7 +7371,7 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
     raw_json, x, topology_fallback, assignment, assignment_label, penalties,
     alpha, learnable_alpha, tau, sparsity_strength, smoothness, learning_rate,
     max_iter, random_state, top_k, jumprelu_threshold,
-    fisher_factors=None, fisher_provenance=None
+    fisher_factors=None, fisher_provenance=None, declared_bases=None
 ))]
 fn sae_manifold_core_from_fit_payload(
     py: Python<'_>,
@@ -7393,6 +7393,7 @@ fn sae_manifold_core_from_fit_payload(
     jumprelu_threshold: f64,
     fisher_factors: Option<PyReadonlyArray3<'_, f64>>,
     fisher_provenance: Option<String>,
+    declared_bases: Option<Vec<String>>,
 ) -> PyResult<Py<ManifoldSaeCore>> {
     let raw: serde_json::Value = serde_json::from_str(raw_json).map_err(|e| {
         py_value_error(format!(
@@ -7435,6 +7436,7 @@ fn sae_manifold_core_from_fit_payload(
         jumprelu_threshold,
         fisher_factors: fisher_factors_nested,
         fisher_provenance,
+        declared_bases,
     };
     let payload =
         crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(&raw, training_mean, &cfg)

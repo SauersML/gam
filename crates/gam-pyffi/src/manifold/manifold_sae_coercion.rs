@@ -203,6 +203,37 @@ pub(crate) fn topology_for_bases(bases: &[String]) -> Option<String> {
     }
 }
 
+/// Restore the `linear_block` label a flat-block fit reports as the generic
+/// `linear`, mirroring `_preserve_linear_block_labels`: for each atom the caller
+/// DECLARED as `linear_block`/`flat_block` AND that the fit left at topology
+/// `linear` (K unchanged), relabel its `basis_kinds` entry and topology to
+/// `linear_block`. `basis_specs` (the fitted kinds) is intentionally NOT patched
+/// — only `basis_kinds` / `atom_topologies`, exactly as the Python does. No-op
+/// when `bases` is empty, length-mismatched (an evidence-gated K change), or
+/// declares no block; positions the fit RETYPED keep their discovered topology.
+pub(crate) fn preserve_linear_block_labels(
+    basis_kinds: &mut [String],
+    atom_topologies: &mut [String],
+    bases: &[String],
+) {
+    if bases.is_empty() || bases.len() != atom_topologies.len() {
+        return;
+    }
+    let want: Vec<bool> = bases
+        .iter()
+        .map(|b| matches!(canon_name(b).as_str(), "linear_block" | "flat_block"))
+        .collect();
+    if !want.iter().any(|&w| w) {
+        return;
+    }
+    for i in 0..atom_topologies.len() {
+        if want[i] && canon_name(&atom_topologies[i]) == "linear" {
+            atom_topologies[i] = "linear_block".to_string();
+            basis_kinds[i] = "linear_block".to_string();
+        }
+    }
+}
+
 /// Stable ascending reorder of a periodic atom's shape band by its single
 /// coordinate column, mirroring `_periodic_shape_band` in `from_payload`:
 ///
@@ -300,6 +331,10 @@ pub(crate) struct FitConfig {
     /// The shard's provenance tag (`shard[2]`); serialized only when
     /// `fisher_factors` is present, mirroring `to_dict`.
     pub(crate) fisher_provenance: Option<String>,
+    /// The caller's DECLARED per-atom bases (`_bases(...)`), for the
+    /// `linear_block` relabel `sae_manifold_fit` applies post-`from_payload` via
+    /// [`preserve_linear_block_labels`]. `None`/empty leaves the fitted labels.
+    pub(crate) declared_bases: Option<Vec<String>>,
 }
 
 // --- serde_json::Value accessors (mirror from_payload's `payload[...]` reads) --
@@ -537,9 +572,15 @@ pub(crate) fn build_manifold_sae_payload(
     primitive_names.push("rust_module.sae_manifold_fit_minimal".to_string());
     primitive_names.extend(cfg.penalties.iter().cloned());
 
+    // `basis_specs` keeps the fitted kinds; `basis_kinds` / `atom_topologies` may
+    // be relabeled to `linear_block` for a flat-block fit (post-from_payload).
+    let mut basis_kinds = kinds.clone();
+    let mut atom_topologies = topologies_for_bases(&kinds);
+    if let Some(bases) = cfg.declared_bases.as_deref() {
+        preserve_linear_block_labels(&mut basis_kinds, &mut atom_topologies, bases);
+    }
     let atom_topology =
-        topology_for_bases(&kinds).unwrap_or_else(|| cfg.topology_fallback.clone());
-    let atom_topologies = topologies_for_bases(&kinds);
+        topology_for_bases(&basis_kinds).unwrap_or_else(|| cfg.topology_fallback.clone());
     let metric_provenance = vopt(raw, "metric_provenance")
         .and_then(|v| v.as_str())
         .map(str::to_string)
@@ -583,8 +624,9 @@ pub(crate) fn build_manifold_sae_payload(
         reml_score: None,
         reconstruction_r2: vf64(raw, "reconstruction_r2")?,
         primitive_names,
-        basis_specs: kinds.clone(),
-        basis_kinds: kinds,
+        // basis_specs = fitted kinds (unpatched); basis_kinds = post-relabel.
+        basis_specs: kinds,
+        basis_kinds,
         atom_dims: dims,
         basis_sizes: sizes,
         n_harmonics,
@@ -731,6 +773,40 @@ mod manifold_sae_coercion_tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn preserve_linear_block_relabels_declared_linear() {
+        let mut basis_kinds = vec!["linear".to_string(), "periodic".to_string()];
+        let mut topos = vec!["linear".to_string(), "circle".to_string()];
+        let bases = vec!["linear_block".to_string(), "periodic".to_string()];
+        preserve_linear_block_labels(&mut basis_kinds, &mut topos, &bases);
+        // Declared-block + fitted-linear atom relabels; the periodic atom is left.
+        assert_eq!(basis_kinds, vec!["linear_block".to_string(), "periodic".to_string()]);
+        assert_eq!(topos, vec!["linear_block".to_string(), "circle".to_string()]);
+    }
+
+    #[test]
+    fn preserve_linear_block_noops() {
+        // No block declared -> unchanged.
+        let mut bk = vec!["linear".to_string()];
+        let mut tp = vec!["linear".to_string()];
+        preserve_linear_block_labels(&mut bk, &mut tp, &["linear".to_string()]);
+        assert_eq!(bk, vec!["linear".to_string()]);
+        // Declared block but the fit RETYPED to a non-linear topology -> keep it.
+        let mut bk2 = vec!["periodic".to_string()];
+        let mut tp2 = vec!["circle".to_string()];
+        preserve_linear_block_labels(&mut bk2, &mut tp2, &["linear_block".to_string()]);
+        assert_eq!(bk2, vec!["periodic".to_string()]);
+        // Length mismatch (evidence-gated K change) -> unchanged.
+        let mut bk3 = vec!["linear".to_string()];
+        let mut tp3 = vec!["linear".to_string()];
+        preserve_linear_block_labels(
+            &mut bk3,
+            &mut tp3,
+            &["linear_block".to_string(), "linear_block".to_string()],
+        );
+        assert_eq!(bk3, vec!["linear".to_string()]);
     }
 
     #[test]
