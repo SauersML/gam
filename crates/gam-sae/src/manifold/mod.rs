@@ -205,6 +205,7 @@ mod dual;
 mod fit_drivers;
 mod fit_entry;
 mod gauge;
+mod oos_encode;
 mod graph_atom;
 mod inframe_curved;
 mod isa_seed;
@@ -212,6 +213,7 @@ mod kronecker;
 pub mod lift;
 mod loss;
 mod oos_logit_seed;
+mod oos_entry;
 mod outer_objective;
 mod pair_kappa;
 mod pair_phase;
@@ -397,6 +399,9 @@ mod tests_crosscoder_multiblock;
 mod tests_crosscoder_rho_2231;
 
 #[cfg(test)]
+mod tests_checkpoint_resume_wiring;
+
+#[cfg(test)]
 mod tests_transport_law;
 
 #[cfg(test)]
@@ -468,11 +473,13 @@ pub use curl::*;
 pub use derivative_oracle::*;
 pub use fit_entry::*;
 pub use gauge::*;
+pub use oos_encode::*;
 pub use graph_atom::*;
 pub use inframe_curved::*;
 pub use isa_seed::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
+pub use oos_entry::*;
 pub use outer_objective::*;
 pub use pair_kappa::*;
 pub use pair_phase::*;
