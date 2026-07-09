@@ -35,7 +35,7 @@
 //! `y_f = x − Σ_{g≠f} gate_g · m_g(t_g)` built from the previous sweep's
 //! positions and gate weights, so co-active atoms carve complementary charts.
 
-use gam_linalg::{fast_ab, fast_abt};
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 
 /// Basis family the coordinate solver evaluates on the grid. Periodic

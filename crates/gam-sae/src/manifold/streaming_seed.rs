@@ -167,52 +167,51 @@ impl AtomDecoderNormalEq {
     }
 }
 
-/// Build the per-atom decoder seed `β_k = D_k⁺ R` from a whole gated design
-/// `D_k` (`N × M`) and residual `R` (`N × P`) by streaming row chunks of
-/// `chunk_rows`. Returned `β` is `M × P`, equal to the dense thin-SVD solve to
-/// tolerance.
-///
-/// Reference wrapper over [`AtomDecoderNormalEq`] for the parity tests: it takes
-/// the full design so it can be compared directly against
-/// [`super::solve_design_least_squares`] on the same input. The production
-/// cold-start seed
-/// ([`super::SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming`]) does
-/// NOT take a resident design — it forms each chunk's gated design on the fly
-/// and feeds it straight into [`AtomDecoderNormalEq::accumulate_chunk`], so its
-/// footprint is the chunk window plus the `M² + M·P` accumulators.
-#[cfg(test)]
-pub(crate) fn seed_atom_decoder_chunked(
-    design: ArrayView2<'_, f64>,
-    residual: ArrayView2<'_, f64>,
-    chunk_rows: usize,
-) -> Result<Array2<f64>, String> {
-    if design.nrows() != residual.nrows() {
-        return Err(format!(
-            "seed_atom_decoder_chunked: design rows {} != residual rows {}",
-            design.nrows(),
-            residual.nrows()
-        ));
-    }
-    let n = design.nrows();
-    let m = design.ncols();
-    let p = residual.ncols();
-    let step = chunk_rows.max(1);
-    let mut eq = AtomDecoderNormalEq::zeros(m, p);
-    let mut start = 0usize;
-    while start < n {
-        let end = (start + step).min(n);
-        eq.accumulate_chunk(
-            design.slice(s![start..end, ..]),
-            residual.slice(s![start..end, ..]),
-        )?;
-        start = end;
-    }
-    eq.solve()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the per-atom decoder seed `β_k = D_k⁺ R` from a whole gated design
+    /// `D_k` (`N × M`) and residual `R` (`N × P`) by streaming row chunks of
+    /// `chunk_rows`. Returned `β` is `M × P`, equal to the dense thin-SVD solve to
+    /// tolerance.
+    ///
+    /// Reference wrapper over [`AtomDecoderNormalEq`] for the parity tests: it takes
+    /// the full design so it can be compared directly against
+    /// [`super::solve_design_least_squares`] on the same input. The production
+    /// cold-start seed
+    /// ([`super::SaeManifoldTerm::seed_cold_start_disjoint_charts_streaming`]) does
+    /// NOT take a resident design — it forms each chunk's gated design on the fly
+    /// and feeds it straight into [`AtomDecoderNormalEq::accumulate_chunk`], so its
+    /// footprint is the chunk window plus the `M² + M·P` accumulators.
+    fn seed_atom_decoder_chunked(
+        design: ArrayView2<'_, f64>,
+        residual: ArrayView2<'_, f64>,
+        chunk_rows: usize,
+    ) -> Result<Array2<f64>, String> {
+        if design.nrows() != residual.nrows() {
+            return Err(format!(
+                "seed_atom_decoder_chunked: design rows {} != residual rows {}",
+                design.nrows(),
+                residual.nrows()
+            ));
+        }
+        let n = design.nrows();
+        let m = design.ncols();
+        let p = residual.ncols();
+        let step = chunk_rows.max(1);
+        let mut eq = AtomDecoderNormalEq::zeros(m, p);
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + step).min(n);
+            eq.accumulate_chunk(
+                design.slice(s![start..end, ..]),
+                residual.slice(s![start..end, ..]),
+            )?;
+            start = end;
+        }
+        eq.solve()
+    }
     use ndarray::array;
 
     /// A deterministic, well-conditioned gated design and residual.
