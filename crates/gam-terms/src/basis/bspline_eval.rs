@@ -1197,10 +1197,10 @@ pub(crate) fn bspline_raw_row_chunk(
         if period <= 0.0 {
             crate::bail_invalid_basis!("periodic B-spline period must be positive, got {period}");
         }
-        // #1593: wrap into the seam-invariant ANCHORED window so the data align
-        // with the canonically-anchored knot grid (`cyclic_knot_anchor`). The
-        // dense builder does the identical snap; both must agree for predict-time
-        // streaming to reproduce the fit-time design.
+        // Wrap into the ANCHORED window so the data align with the anchored
+        // knot grid (`cyclic_knot_anchor`, the domain origin). The dense
+        // builder resolves the anchor through the identical helper; both must
+        // agree for predict-time streaming to reproduce the fit-time design.
         let (anchor, _) = crate::basis::cyclic_knot_anchor(domain_start, period, num_basis);
         let wrapped = chunk.mapv(|x| wrap_to_period(x, anchor, period));
         let (extended, _) = create_basis::<Dense>(
