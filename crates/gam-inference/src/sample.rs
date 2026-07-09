@@ -714,9 +714,12 @@ fn sample_standard_bounded(
 /// posterior; for a non-Gaussian GLM it is the constraint-respecting Laplace
 /// approximation — the same modelling choice the `bounded()` term makes. The
 /// draws are produced by exact reflective Hamiltonian Monte Carlo
-/// ([`crate::truncated_gaussian`]), so every draw is feasible and
-/// successive draws are essentially independent (`rhat ≈ 1`, matching the other
-/// Laplace posterior paths).
+/// ([`crate::truncated_gaussian`]), so every draw is feasible and each draw's
+/// marginal law is exactly the truncated Gaussian. Successive draws are only
+/// independent when the quarter-period trajectory hits no wall; whenever a
+/// constraint is active at the mode the trajectory reflects on every draw and
+/// consecutive draws are autocorrelated, so `rhat`/`ess` are MEASURED with the
+/// split-chain Gelman–Rubin diagnostic rather than asserted.
 fn sample_standard_truncated(
     model: &SavedModel,
     cfg: &NutsConfig,
@@ -753,20 +756,34 @@ fn sample_standard_truncated(
         cfg.n_chains,
         chain_stream_seed(cfg.seed, 0, 0x7290_C047_5D6E_B14Du64),
     )?;
-    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
-
     let posterior_mean = samples
         .mean_axis(ndarray::Axis(0))
         .unwrap_or_else(|| Array1::<f64>::zeros(p));
     let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
 
+    // Reflective HMC draws are iid only while no wall is hit; an active
+    // constraint at the mode makes every trajectory reflect, correlating
+    // consecutive draws. Measure the diagnostics instead of asserting the
+    // iid triple (the sampler stacks rows chain-major: chain*n_samples+draw).
+    let mut chains = ndarray::Array3::<f64>::zeros((cfg.n_chains, cfg.n_samples, p));
+    for chain in 0..cfg.n_chains {
+        for draw in 0..cfg.n_samples {
+            let row = chain * cfg.n_samples + draw;
+            for j in 0..p {
+                chains[(chain, draw, j)] = samples[(row, j)];
+            }
+        }
+    }
+    let (rhat, ess) = super::hmc_io::compute_split_rhat_and_ess(&chains);
+    let converged = rhat < 1.1 && ess > 100.0;
+
     Ok(NutsResult {
         samples,
         posterior_mean,
         posterior_std,
-        rhat: 1.0,
-        ess: n_total as f64,
-        converged: true,
+        rhat,
+        ess,
+        converged,
     })
 }
 

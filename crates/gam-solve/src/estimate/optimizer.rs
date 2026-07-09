@@ -81,6 +81,96 @@ fn posterior_covariance_inverse(h: &Array2<f64>, label: &str) -> Option<Array2<f
     }
 }
 
+/// Grid-free continuous 1-D descent used by the post-convergence KKT escapes
+/// below. Minimizes `eval(t)` over the displacement `t ∈ (0, t_max]` along a
+/// fixed direction from the incumbent point: a geometric bracketing expansion
+/// (step doubling from one log-λ unit, the natural resolution of the ρ
+/// parameterization) locates a descending basin at any distance without fixed
+/// probe nodes, then golden-section refinement of the bracket around the best
+/// expansion probe converges to the continuous interior minimizer — so e.g.
+/// mirror-image data orientations land on the identical optimum (#1548).
+/// Returns the refined `(t, cost)` only when some probe strictly improves on
+/// the incumbent cost `f0` by the shared relative tolerance; otherwise `None`
+/// and the search was an exact no-op.
+fn continuous_directional_descent(
+    eval: &mut dyn FnMut(f64) -> Option<f64>,
+    t_max: f64,
+    f0: f64,
+) -> Option<(f64, f64)> {
+    const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
+    if !(t_max > 0.0) || !f0.is_finite() {
+        return None;
+    }
+    // Geometric expansion: 1, 2, 4, … log-λ units, always ending exactly on
+    // `t_max` so the full feasible segment is covered scale-freely.
+    let mut probes: Vec<f64> = Vec::new();
+    let mut t = 1.0_f64.min(t_max);
+    loop {
+        probes.push(t);
+        if t >= t_max {
+            break;
+        }
+        t = (t * 2.0).min(t_max);
+    }
+    let mut best: Option<(usize, f64, f64)> = None; // (probe index, t, cost)
+    for (idx, &ti) in probes.iter().enumerate() {
+        if let Some(c) = eval(ti)
+            && c.is_finite()
+            && c < f0 - 1e-6 * (1.0 + f0.abs())
+            && best.is_none_or(|(_, _, bc)| c < bc)
+        {
+            best = Some((idx, ti, c));
+        }
+    }
+    let (best_idx, mut t_best, mut f_best) = best?;
+    // Golden-section the bracket formed by the expansion neighbours of the
+    // best probe (clamped to the feasible segment): the continuous minimum of
+    // the basin containing the best probe lies inside it, and the bracket
+    // never re-enters territory the expansion already rejected.
+    let mut a = if best_idx == 0 {
+        0.0
+    } else {
+        probes[best_idx - 1]
+    };
+    let mut b = probes.get(best_idx + 1).copied().unwrap_or(t_max);
+    let mut c = b - GS_R * (b - a);
+    let mut d = a + GS_R * (b - a);
+    let mut fc = eval(c);
+    let mut fd = eval(d);
+    for _ in 0..40 {
+        if !(b - a > 1e-4) {
+            break;
+        }
+        match (fc, fd) {
+            (Some(vc), Some(vd)) if vc <= vd => {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - GS_R * (b - a);
+                fc = eval(c);
+            }
+            (Some(_), Some(_)) => {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + GS_R * (b - a);
+                fd = eval(d);
+            }
+            // An eval failed inside the bracket: keep the best expansion probe.
+            _ => break,
+        }
+    }
+    let xm = 0.5 * (a + b);
+    if let Some(fm) = eval(xm)
+        && fm.is_finite()
+        && fm < f_best
+    {
+        t_best = xm;
+        f_best = fm;
+    }
+    Some((t_best, f_best))
+}
+
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 pub fn optimize_external_design<X>(
     y: ArrayView1<'_, f64>,
@@ -1253,122 +1343,50 @@ where
                 // strictly cheaper than this honest cost.
                 let base_cost = strategy_result.final_value;
                 if !descent_coords.is_empty() && base_cost.is_finite() {
-                    // Inward probe grid (descending from the rail). Bounded and
-                    // cheap: at most 2 · |railed| · 8 inner solves, and only when a
-                    // coord is actually pinned at the upper rail. Two coordinate-
-                    // descent passes pick up cross-coordinate coupling between the
-                    // railed axes.
-                    const INWARD_GRID: [f64; 8] = [25.0, 20.0, 15.0, 10.0, 5.0, 2.0, 0.0, -2.0];
+                    // Grid-free inward descent from the incumbent: for each eligible
+                    // coordinate, run the continuous bracketing + golden-section
+                    // line search over the FULL feasible inward segment (down to
+                    // the lower ρ rail). Two coordinate-descent passes pick up
+                    // cross-coordinate coupling between the railed axes; each 1-D
+                    // search refines to the continuous interior minimizer so
+                    // mirror-image data orientations land on the identical optimum
+                    // (#1548). The escape only ever DESCENDS (less smoothing):
+                    // over-smoothing a null-space coordinate is the #1266 escape's
+                    // job (it carries the EDF parsimony guard that prevents the
+                    // #1476 concurvity transfer); this guard must never raise λ
+                    // without it.
+                    let rho_lower = -crate::estimate::RHO_BOUND;
                     let mut best_rho = strategy_result.rho.clone();
                     let mut best_cost = base_cost;
                     let mut improved = false;
                     for _pass in 0..2 {
                         let mut pass_improved = false;
                         for &coord in &descent_coords {
-                            let mut local_best = best_rho.clone();
-                            let mut local_cost = best_cost;
-                            for &cand in &INWARD_GRID {
-                                // Inward escape only ever DESCENDS (less smoothing):
-                                // skip any grid point at or above this coordinate's
-                                // current ρ. Over-smoothing a null-space coordinate is
-                                // the #1266 escape's job (it carries the EDF parsimony
-                                // guard that prevents the #1476 concurvity transfer);
-                                // this guard must never raise λ without it.
-                                if cand >= best_rho[coord] - 1e-9 {
-                                    continue;
-                                }
-                                let mut probe = best_rho.clone();
-                                probe[coord] = cand;
-                                if let Ok(c) = reml_state.compute_cost(&probe)
-                                    && c.is_finite()
-                                    && c < local_cost - 1e-6 * (1.0 + local_cost.abs())
-                                {
-                                    local_cost = c;
-                                    local_best = probe;
-                                }
+                            let from = best_rho[coord];
+                            let t_max = from - rho_lower;
+                            if !(t_max > 0.0) {
+                                continue;
                             }
-                            if local_cost < best_cost - 1e-6 * (1.0 + best_cost.abs()) {
-                                best_rho = local_best;
-                                best_cost = local_cost;
+                            let base = best_rho.clone();
+                            let mut eval = |t: f64| {
+                                let mut probe = base.clone();
+                                probe[coord] = from - t;
+                                reml_state
+                                    .compute_cost(&probe)
+                                    .ok()
+                                    .filter(|c| c.is_finite())
+                            };
+                            if let Some((t_best, f_best)) =
+                                continuous_directional_descent(&mut eval, t_max, best_cost)
+                            {
+                                best_rho[coord] = from - t_best;
+                                best_cost = f_best;
                                 improved = true;
                                 pass_improved = true;
                             }
                         }
                         if !pass_improved {
                             break;
-                        }
-                    }
-                    // CONTINUOUS REFINEMENT of each descended coordinate. The coarse
-                    // INWARD_GRID snaps λ to a grid node (e.g. ρ_null = 0), but in the
-                    // OTHER covariate orientation the outer optimizer reports the
-                    // continuous interior minimizer (e.g. ρ_null = −0.37). Leaving one
-                    // orientation on the grid node while the other keeps the continuous
-                    // optimum leaves a small residual reflection asymmetry (#1548:
-                    // ~1.7e-3 mirror drift survives the grid descent alone). Golden-
-                    // section the SAME authoritative penalized cost on each moved
-                    // coordinate so both orientations converge to the identical
-                    // continuous minimum. It can only lower the cost from the grid node
-                    // (the bracket straddles it), and the cold confirmation below still
-                    // gates adoption, so this never raises the certified cost.
-                    if improved {
-                        const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
-                        for coord in descent_coords.clone() {
-                            if (best_rho[coord] - strategy_result.rho[coord]).abs() <= 1e-9 {
-                                continue; // coordinate did not descend
-                            }
-                            // Bracket straddling the adopted grid node, never re-entering
-                            // the over-smoothing region above the coordinate's start ρ.
-                            let node = best_rho[coord];
-                            let mut a = node - 3.0;
-                            let mut b = (node + 3.0).min(strategy_result.rho[coord]);
-                            if b <= a + 1e-6 {
-                                continue;
-                            }
-                            let cost_at =
-                                |st: &mut RemlState, base: &Array1<f64>, x: f64| -> Option<f64> {
-                                    let mut p = base.clone();
-                                    p[coord] = x;
-                                    st.compute_cost(&p).ok().filter(|c| c.is_finite())
-                                };
-                            let mut c = b - GS_R * (b - a);
-                            let mut d = a + GS_R * (b - a);
-                            let mut fc = cost_at(&mut reml_state, &best_rho, c);
-                            let mut fd = cost_at(&mut reml_state, &best_rho, d);
-                            let mut refine_ok = fc.is_some() && fd.is_some();
-                            for _ in 0..40 {
-                                if (b - a).abs() < 1e-4 {
-                                    break;
-                                }
-                                match (fc, fd) {
-                                    (Some(vc), Some(vd)) if vc <= vd => {
-                                        b = d;
-                                        d = c;
-                                        fd = fc;
-                                        c = b - GS_R * (b - a);
-                                        fc = cost_at(&mut reml_state, &best_rho, c);
-                                    }
-                                    (Some(_), Some(_)) => {
-                                        a = c;
-                                        c = d;
-                                        fc = fd;
-                                        d = a + GS_R * (b - a);
-                                        fd = cost_at(&mut reml_state, &best_rho, d);
-                                    }
-                                    _ => {
-                                        refine_ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if refine_ok {
-                                let xm = 0.5 * (a + b);
-                                if let Some(fm) = cost_at(&mut reml_state, &best_rho, xm)
-                                    && fm < best_cost
-                                {
-                                    best_rho[coord] = xm;
-                                    best_cost = fm;
-                                }
-                            }
                         }
                     }
                     if improved {

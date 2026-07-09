@@ -84,8 +84,8 @@ use crate::atom_codes::SparseAtomCodes;
 use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::basis::{
-    CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
-    SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
+    CylinderHarmonicEvaluator, EuclideanPatchEvaluator, MobiusHarmonicEvaluator,
+    PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::manifold::{
     AssignmentMode, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw, SaeAtomBasisKind,

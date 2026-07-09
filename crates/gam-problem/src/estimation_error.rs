@@ -66,6 +66,33 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Block-orthogonal Gaussian REML did not converge within {iterations} outer passes: \
+         max relative rho-score residual {max_score_residual:.6e} exceeds tolerance \
+         {score_tol:.3e} (last scale fixed-point step {last_scale_step:.6e}{}). \
+         A fit is only minted from a converged optimization; resume from the \
+         checkpoint by passing `init_rhos` = {rho_checkpoint:?}.",
+        if *cycle_detected { ", deterministic limit cycle detected" } else { "" }
+    )]
+    BlockOrthogonalRemlDidNotConverge {
+        /// Outer alternation passes executed before exhaustion.
+        iterations: usize,
+        /// Largest per-block |dV/drho| at the final iterate, normalized by the
+        /// score's natural magnitude `d * max(1, rank)`.
+        max_score_residual: f64,
+        /// Tolerance the residual had to meet for the convergence certificate.
+        score_tol: f64,
+        /// Last max |Δ log scale-precision| fixed-point movement (evidence of
+        /// whether the alternation was still moving or had stalled).
+        last_scale_step: f64,
+        /// The alternation revisited an earlier `(rho, scale)` state exactly;
+        /// as a deterministic map it can never certify, so it stopped early.
+        cycle_detected: bool,
+        /// Per-block log-lambda iterates at exhaustion; feed back through the
+        /// entry point's `init_rhos` to resume rather than restart.
+        rho_checkpoint: Vec<f64>,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during model fitting at iteration {iteration}. \
         The model cannot converge because a predictor perfectly separates the binary outcomes. \
         (Diagnostic: max|eta| = {max_abs_eta:.2e})."

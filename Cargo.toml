@@ -62,7 +62,12 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-opt = "=0.5.12"
+# 0.5.13 adds TrustRegionPolicy / lm_step / find_root_monotone /
+# bidirectional_line_search (+ the Bfgs cost-stall hook). Git-pinned until
+# 0.5.13 is published to crates.io (`cargo login` + `cargo publish -p opt`
+# from /Users/user/opt); the `version` key keeps this publish-compatible —
+# cargo strips the git ref and keeps the version requirement on publish.
+opt = { version = "=0.5.13", git = "https://github.com/SauersML/opt.git", rev = "ddd0c337d0fb1535f182eff3937a8ab3a9511f6d" }
 
 [lints.rust]
 warnings = "deny"

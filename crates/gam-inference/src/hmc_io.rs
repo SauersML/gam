@@ -135,7 +135,7 @@ const AUTOCOVARIANCE_FLOOR: f64 = 1e-16;
 ///
 /// This is the standard split-chain formulation (no rank normalization).
 /// Returns (max_rhat, min_ess) across dimensions.
-fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
+pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let n_chains = samples.shape()[0];
     let n_samples = samples.shape()[1];
     let dim = samples.shape()[2];
@@ -6837,6 +6837,7 @@ struct JointBetaRhoPosterior {
 }
 
 impl JointBetaRhoPosterior {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
@@ -6847,12 +6848,33 @@ impl JointBetaRhoPosterior {
         rho_mode: ArrayView1<f64>,
         likelihood: LikelihoodSpec,
         gamma_shape: Option<f64>,
+        dispersion: gam_solve::model_types::Dispersion,
+        offset: Option<ArrayView1<f64>>,
         rho_prior: RhoPrior,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let n_beta = x.ncols();
         let n_rho = penalty_canonical.len();
+
+        if let Some(offset) = offset.as_ref() {
+            if offset.len() != n_samples {
+                return Err(HmcError::DimensionMismatch {
+                    reason: format!(
+                        "Joint HMC offset length {} does not match {} observations",
+                        offset.len(),
+                        n_samples
+                    ),
+                }
+                .into());
+            }
+            if !offset.iter().all(|v| v.is_finite()) {
+                return Err(HmcError::NonFiniteState {
+                    reason: "Joint HMC offset contains NaN or Inf values".to_string(),
+                }
+                .into());
+            }
+        }
 
         if rho_mode.len() != n_rho {
             return Err(HmcError::DimensionMismatch {
@@ -6946,13 +6968,17 @@ impl JointBetaRhoPosterior {
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
             mode: Arc::new(mode.to_owned()),
-            offset: None,
+            // The fit's offset and dispersion are fixed likelihood state: the
+            // joint target must retain both or it samples a different model —
+            // hard-coding φ = 1 gave a Gaussian fit with σ² = 4 four times its
+            // true likelihood curvature, and dropping the offset shifted every
+            // offset model's posterior (finding 18, #2245). The family kernels
+            // read `data.dispersion` (Gaussian 1/φ scaling, Tweedie 1/φ
+            // quasi-weight); families whose working weight already carries the
+            // dispersion pass `Known(1.0)` from the caller.
+            offset: offset.map(|o| Arc::new(o.to_owned())),
             gamma_shape: gamma_shape.unwrap_or(1.0),
-            // Joint (β, ρ) HMC keeps the likelihood on its native scale;
-            // dispersion enters via the per-family scale parameter, not
-            // via the whitening transform here. `Known(1.0)` matches the
-            // pre-refactor behaviour for this code path.
-            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            dispersion,
             n_samples,
             dim: n_beta,
         };
@@ -7090,8 +7116,11 @@ impl JointBetaRhoPosterior {
         // Un-whiten: β = μ + L z
         let beta = self.data.mode.as_ref() + &self.chol.dot(&z);
 
-        // η = X β
-        let eta = gam_linalg::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        // η = X β (+ fixed fit-time offset)
+        let mut eta = gam_linalg::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        if let Some(offset) = self.data.offset.as_ref() {
+            eta += offset.as_ref();
+        }
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
         let step_likelihood = LikelihoodSpec {
@@ -7355,6 +7384,16 @@ pub struct JointBetaRhoInputs<'a> {
     pub weights: ArrayView1<'a, f64>,
     pub likelihood: LikelihoodSpec,
     pub gamma_shape: Option<f64>,
+    /// Fitted dispersion φ, exactly as the flat NUTS path carries it: the
+    /// estimated σ² for a profiled Gaussian and the Tweedie φ; `Known(1.0)`
+    /// for families whose working weight already folds the dispersion in.
+    /// The joint target is the fitted model's posterior only if this matches
+    /// the fit.
+    pub dispersion: gam_solve::model_types::Dispersion,
+    /// Fixed additive offset on the linear predictor (η = Xβ + offset), or
+    /// `None` for an offset-free fit. Dropping a fit-time offset shifts the
+    /// sampled posterior of every offset model.
+    pub offset: Option<ArrayView1<'a, f64>>,
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub penalty_roots: Vec<CanonicalPenalty>,

@@ -136,6 +136,26 @@ pub(crate) fn run_fit_multinomial(
     if args.frailty_kind.is_some() || args.frailty_sd.is_some() || args.hazard_loading.is_some() {
         return Err("frailty options are not supported for --family multinomial".to_string());
     }
+    // Reject flags the shared multinomial driver does not consume, rather than
+    // silently ignoring them (dropping case weights or an offset would quietly
+    // change the fit the user asked for).
+    if args.weights_column.is_some() {
+        return Err("--weights-column is not supported for --family multinomial".to_string());
+    }
+    if args.offset_column.is_some() || args.noise_offset_column.is_some() {
+        return Err(
+            "--offset-column/--noise-offset-column is not supported for --family multinomial"
+                .to_string(),
+        );
+    }
+    if args.expectile_tau.is_some() {
+        return Err("--expectile-tau requires --family expectile".to_string());
+    }
+    if args.adaptive_regularization {
+        return Err(
+            "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
+        );
+    }
     let Some(out) = args.out.as_ref() else {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

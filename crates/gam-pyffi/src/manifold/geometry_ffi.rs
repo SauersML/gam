@@ -4857,10 +4857,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
     module.add_function(wrap_pyfunction!(survival_collect_chunks, module)?)?;
-    module.add_function(wrap_pyfunction!(hazard_from_cumulative, module)?)?;
+    module.add_function(wrap_pyfunction!(hazard_from_cumulative_knots, module)?)?;
     module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block_hazard, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_block_cumulative_hazard, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_block_failure, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;

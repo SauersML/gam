@@ -1212,44 +1212,62 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
         bundle.add_to_matrix(&mut h);
     }
     symmetrize_dense_in_place(&mut h);
-    if use_exact_newton_strict_spd(family) {
-        // #748: the strict posterior precision is `H + S_λ` AT THE CONVERGED
-        // OPTIMUM. A δ-ridge inverse `(H + S_λ + δI)⁻¹` would mask a genuinely
-        // non-PD curvature and report it as if it were the posterior
-        // covariance, biasing every standard error. Instead: eigendecompose and
-        // **reject** when the precision is genuinely indefinite (a real
-        // fit-quality failure — the mode is not a strict maximum), and on the
-        // PSD case return the honest positive-eigenspace pseudo-inverse (the
-        // structural null space of a penalised model is a flat posterior
-        // direction, not something to ridge away).
-        let p = h.nrows();
-        let (evals, _) = FaerEigh::eigh(&h, Side::Lower).map_err(|e| {
-            format!("strict pseudo-laplace covariance eigendecomposition failed: {e}")
-        })?;
-        let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-        let eps_np = f64::EPSILON * (p as f64) * (p as f64);
-        let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
-        if let Some(&min_eval) = evals
-            .iter()
-            .filter(|&&ev| ev < -tol)
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            let below = evals.iter().filter(|&&ev| ev < -tol).count();
-            return Err(format!(
-                "strict pseudo-laplace covariance: joint coefficient Hessian is non-PD at the \
-                 converged optimum ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
-                 max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
-                 maximum, so the reported covariance would be meaningless — fit-quality failure \
-                 surfaced instead of δ-ridge masking (gam#748)"
-            ));
-        }
-        pinv_positive_part(&h, effective_solverridge(options.ridge_floor))
-    } else {
-        match inverse_spdwith_retry(&h, effective_solverridge(options.ridge_floor), 8) {
-            Ok(cov) => Ok(cov),
-            Err(_) => pinv_positive_part(&h, effective_solverridge(options.ridge_floor)),
+    // #748 + audit-41: a Laplace posterior covariance exists only when the
+    // posterior precision `H + S_λ` is strictly positive definite AT THE
+    // CONVERGED OPTIMUM. Indefinite means the mode is not a maximum;
+    // singular means the posterior is IMPROPER along every flat direction
+    // (unbounded variance). Neither can be repaired at reporting time: a
+    // δ-ridge inverse `(H + S_λ + δI)⁻¹` reports an arbitrary ridge-bounded
+    // variance, and a positive-eigenspace pseudo-inverse reports exactly
+    // ZERO variance for the very direction the model does not identify
+    // (H = diag(1,0) → Σ = diag(1,0)). Both fabrications bias every
+    // downstream standard error, so both regimes surface as errors with the
+    // spectrum diagnostics; the remedy is at the model (constraint, penalty,
+    // canonicalisation), not in the covariance report.
+    let p = h.nrows();
+    let (evals, evecs) = FaerEigh::eigh(&h, Side::Lower)
+        .map_err(|e| format!("joint posterior-precision eigendecomposition failed: {e}"))?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let eps_np = f64::EPSILON * (p as f64) * (p as f64);
+    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
+    if let Some(&min_eval) = evals
+        .iter()
+        .filter(|&&ev| ev < -tol)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        let below = evals.iter().filter(|&&ev| ev < -tol).count();
+        return Err(format!(
+            "joint posterior precision H + S_λ is non-PD at the converged optimum \
+             ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
+             max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
+             maximum, so the reported covariance would be meaningless — fit-quality failure \
+             surfaced instead of δ-ridge masking (gam#748)"
+        ));
+    }
+    let flat = evals.iter().filter(|&&ev| ev <= tol).count();
+    if flat > 0 {
+        return Err(format!(
+            "joint posterior precision H + S_λ is singular at the converged optimum: {flat} \
+             flat direction(s) (max|λ|={max_abs_eval:.6e}, tol={tol:.6e}). The posterior is \
+             improper along a flat direction — its variance is unbounded, so no finite \
+             covariance entry is honest there (a pseudo-inverse would claim zero variance, a \
+             δ-ridge an arbitrary finite one). Identify the direction via a constraint, \
+             penalty, or canonicalisation instead"
+        ));
+    }
+    // Strictly SPD: exact inverse through the eigenbasis, Σ = V diag(1/λ) Vᵀ.
+    let mut cov = Array2::<f64>::zeros((p, p));
+    for (k, &ev) in evals.iter().enumerate() {
+        let inv_ev = 1.0 / ev;
+        for i in 0..p {
+            let vi = evecs[[i, k]];
+            for j in 0..p {
+                cov[[i, j]] += inv_ev * vi * evecs[[j, k]];
+            }
         }
     }
+    symmetrize_dense_in_place(&mut cov);
+    Ok(cov)
 }
 
 pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send + Sync + 'static>(

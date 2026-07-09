@@ -188,6 +188,12 @@ impl SaeManifoldTerm {
                     .as_slice()
                     .expect("softmax assignments row must be contiguous");
                 let m = softmax_majorizer_log_mean(a_soft);
+                // #991 — the assembled `B` wrote the design-weighted majorizer
+                // `w_row·D` into the logit block (see the assembly), and the exact
+                // prior curvature is `w_row·H_entropy`, so this dropped-curvature
+                // correction `ΔC = A − B = w_row·(H_entropy − D)` carries the SAME
+                // `w_row`. The prior is weighted directly, not via the √w data seam.
+                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
                 for (a, va) in jets.vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom: ka } = *va else {
                         continue;
@@ -213,7 +219,7 @@ impl SaeManifoldTerm {
                         } else {
                             h_entropy
                         };
-                        acc += delta * v_t[b];
+                        acc += w_row * delta * v_t[b];
                     }
                     out.t[base + a] += acc;
                 }

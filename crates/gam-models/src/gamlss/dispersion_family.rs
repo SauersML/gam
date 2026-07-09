@@ -157,6 +157,37 @@ pub const FAMILY_TWEEDIE_LOCATION_SCALE: &str = "tweedie-location-scale";
 /// keeps `exp(η)` and the logit jet away from overflow while staying in the
 /// smooth interior of every link.
 pub(super) const DISPERSION_ETA_CLAMP: f64 = 30.0;
+
+/// Derivative of the shared η clamp: 1 in the interior, 0 outside.
+///
+/// Every row likelihood in this module is evaluated at `clamp(η)`, so outside
+/// the clamp the implemented objective is locally CONSTANT in the raw
+/// predictor and every score/curvature channel of that predictor must vanish.
+/// Emitting the interior derivatives there hands the optimizer gradients and
+/// Hessians of a different function than the one being evaluated (the
+/// single-block Gaussian log-scale path already zeros its derivatives outside
+/// its clamp; this multi-block path must do the same).
+#[inline]
+fn eta_clamp_slope(eta: f64) -> f64 {
+    if eta.abs() <= DISPERSION_ETA_CLAMP {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Fold the clamp slope into one channel's IRLS working `(weight, response)`.
+/// On the zero-slope branch the channel contributes no score and no curvature
+/// and the response pins at the clamped predictor so downstream finiteness
+/// checks hold.
+#[inline]
+fn clamped_working_pair(slope: f64, eta_clamped: f64, weight: f64, step: f64) -> (f64, f64) {
+    if slope == 0.0 {
+        (0.0, eta_clamped)
+    } else {
+        (weight, eta_clamped + step)
+    }
+}
 /// Floor for a per-row IRLS working weight / curvature so the block normal
 /// equations stay positive-definite. The working *response* always carries the
 /// exact score, so the stationary point (penalised score = 0) is independent
@@ -566,61 +597,155 @@ pub(crate) fn dispersion_row_loglik(
     eta_d: f64,
     prior_weight: f64,
 ) -> f64 {
-    let wi = prior_weight.max(0.0);
+    // Zero-weight rows are excluded from the likelihood entirely (and exempt
+    // from the boundary support validation), so their row term must be an
+    // exact 0 rather than `0 · (±inf)` = NaN.
+    if prior_weight <= 0.0 {
+        return 0.0;
+    }
+    let wi = prior_weight;
     let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
     let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    // With |η| ≤ DISPERSION_ETA_CLAMP the link outputs are strictly positive
+    // and finite (exp ∈ [9.4e-14, 1.1e13], logistic ∈ (9.4e-14, 1−9.4e-14)),
+    // so no parameter-space floor is applied: a floor that binds INSIDE the
+    // clamp band would make the value locally constant while the derivative
+    // channels keep the unfloored chain — the same value/derivative desync
+    // the clamp slope exists to prevent.
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
-            let mu = em.exp().max(1e-300);
-            let theta = ed.exp().max(1e-12);
+            let mu = em.exp();
+            let theta = ed.exp();
             dispersion_nb_neg_loglik(yi, mu, theta, wi)
         }
         DispersionFamilyKind::Gamma => {
-            let mu = em.exp().max(1e-300);
-            let nu = ed.exp().max(1e-12);
+            let mu = em.exp();
+            let nu = ed.exp();
             let y_pos = yi.max(1e-300);
             dispersion_gamma_neg_loglik(yi, y_pos, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
-            let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
-            let phi = ed.exp().max(1e-12);
+            let mu = 1.0 / (1.0 + (-em).exp());
+            let phi = ed.exp();
             dispersion_beta_neg_loglik(yi, mu, phi, wi)
         }
         DispersionFamilyKind::Tweedie { p } => dispersion_tweedie_neg_loglik(yi, em, ed, p, wi),
     }
 }
 
-#[inline]
-pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
-    let q = (mu * (1.0 - mu)).max(1e-12);
-    let tower = dispersion_beta_nll_order2(yi, mu, phi, wi);
-    q * phi * tower.h()[0][1]
+/// Observed η-space row NLL tower: BOTH clamped predictors are jet variables
+/// (`η_μ` axis 0, `η_d` axis 1) and the full mean-link / precision-link
+/// chains are carried by the jet algebra, so `h()` is the exact per-row
+/// OBSERVED Hessian in `(η_μ, η_d)` — including the inverse-link
+/// second-derivative terms and the mean/dispersion cross curvature that the
+/// expected (Fisher) working weights do not represent. Example: Gamma with
+/// log links at `y = 4, μ = 2, ν = 3` has exact per-row `∂²NLL/∂η_μ² =
+/// νy/μ = 6` and `∂²NLL/∂η_μ∂η_ν = ν(1 − y/μ) = −3`, where the Fisher
+/// working weights give `ν = 3` and `0`.
+pub(crate) fn dispersion_eta_nll_order2(
+    kind: DispersionFamilyKind,
+    yi: f64,
+    em: f64,
+    ed: f64,
+    wi: f64,
+) -> gam_math::jet_scalar::Order2<2> {
+    type O2 = gam_math::jet_scalar::Order2<2>;
+    let eta_mu = O2::variable(em, 0);
+    let eta_d = O2::variable(ed, 1);
+    match kind {
+        DispersionFamilyKind::NegativeBinomial => {
+            let mu = eta_mu.exp();
+            let theta = eta_d.exp();
+            let tpm = theta.add(&mu);
+            let theta_plus_y = theta.add(&O2::constant(yi));
+            let loglik = order2_ln_gamma(&theta_plus_y)
+                .sub(&order2_ln_gamma(&theta))
+                .sub(&O2::constant(ln_gamma(yi + 1.0)))
+                .add(&theta.mul(&theta.ln()))
+                .sub(&theta.mul(&tpm.ln()))
+                .add(&mu.ln().scale(yi))
+                .sub(&tpm.ln().scale(yi));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Gamma => {
+            let mu = eta_mu.exp();
+            let nu = eta_d.exp();
+            let y_pos = yi.max(1e-300);
+            let loglik = nu
+                .mul(&nu.ln())
+                .sub(&nu.mul(&mu.ln()))
+                .sub(&order2_ln_gamma(&nu))
+                .add(&nu.sub(&O2::constant(1.0)).scale(y_pos.ln()))
+                .sub(&nu.mul(&mu.recip().scale(yi)));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Beta => {
+            let mu = eta_mu.scale(-1.0).exp().add(&O2::constant(1.0)).recip();
+            let phi = eta_d.exp();
+            let one_minus_mu = O2::constant(1.0).sub(&mu);
+            let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+            let a = mu.mul(&phi);
+            let b = one_minus_mu.mul(&phi);
+            let loglik = order2_ln_gamma(&phi)
+                .sub(&order2_ln_gamma(&a))
+                .sub(&order2_ln_gamma(&b))
+                .add(&a.sub(&O2::constant(1.0)).scale(yc.ln()))
+                .add(&b.sub(&O2::constant(1.0)).scale((1.0 - yc).ln()));
+            loglik.scale(-wi)
+        }
+        DispersionFamilyKind::Tweedie { p } => {
+            let one_minus_p = 1.0 - p;
+            let two_minus_p = 2.0 - p;
+            let mu = eta_mu.exp();
+            let phi = eta_d.scale(-1.0).exp();
+            if yi > 0.0 {
+                let dev = mu
+                    .powf(two_minus_p)
+                    .scale(1.0 / two_minus_p)
+                    .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p))
+                    .add(&O2::constant(
+                        yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
+                    ))
+                    .scale(2.0);
+                let loglik = dev
+                    .mul(&phi.recip().scale(-0.5))
+                    .sub(&phi.scale(2.0 * std::f64::consts::PI).ln().scale(0.5))
+                    .sub(&O2::constant(0.5 * p * yi.ln()));
+                loglik.scale(-wi)
+            } else {
+                let c = mu.powf(two_minus_p).scale(1.0 / two_minus_p);
+                let loglik = c.mul(&phi.recip()).scale(-1.0);
+                loglik.scale(-wi)
+            }
+        }
+    }
 }
 
-#[inline]
-pub(crate) fn dispersion_row_cross_weight(
+/// Per-row observed `(∂²NLL/∂η_μ², ∂²NLL/∂η_μ∂η_d, ∂²NLL/∂η_d²)` weights for
+/// the exact joint Hessian, with the η-clamp slopes folded in: a channel
+/// outside its clamp is locally constant in the raw predictor, so every
+/// second derivative involving it is exactly zero.
+pub(crate) fn dispersion_row_observed_hessian_weights(
     kind: DispersionFamilyKind,
     yi: f64,
     eta_mu: f64,
     eta_d: f64,
     prior_weight: f64,
-) -> f64 {
-    let wi = prior_weight.max(0.0);
-    if wi == 0.0 {
-        return 0.0;
+) -> (f64, f64, f64) {
+    if prior_weight <= 0.0 {
+        return (0.0, 0.0, 0.0);
     }
+    let mean_slope = eta_clamp_slope(eta_mu);
+    let disp_slope = eta_clamp_slope(eta_d);
     let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
     let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    match kind {
-        DispersionFamilyKind::Beta => {
-            let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
-            let phi = ed.exp().max(1e-12);
-            beta_observed_cross_weight_eta(yi, mu, phi, wi)
-        }
-        DispersionFamilyKind::NegativeBinomial
-        | DispersionFamilyKind::Gamma
-        | DispersionFamilyKind::Tweedie { .. } => 0.0,
-    }
+    let tower = dispersion_eta_nll_order2(kind, yi, em, ed, prior_weight);
+    let h = tower.h();
+    (
+        mean_slope * h[0][0],
+        mean_slope * disp_slope * h[0][1],
+        disp_slope * h[1][1],
+    )
 }
 
 #[inline]
@@ -647,13 +772,33 @@ pub(super) fn dispersion_row_kernel(
     eta_d: f64,
     prior_weight: f64,
 ) -> DispersionRowKernel {
-    let wi = prior_weight.max(0.0);
     let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
     let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    // Zero-weight rows are excluded from the likelihood (and exempt from the
+    // boundary support validation): return exact zeros rather than letting
+    // `0 · (±inf)` poison the objective sum.
+    if prior_weight <= 0.0 {
+        return DispersionRowKernel {
+            loglik: 0.0,
+            mean_weight: 0.0,
+            mean_response: em,
+            disp_weight: 0.0,
+            disp_response: ed,
+        };
+    }
+    let wi = prior_weight;
+    // Clamp slopes: outside the η clamp the row likelihood is locally
+    // constant in the raw predictor, so that channel's score and curvature
+    // must vanish (see `eta_clamp_slope`). With |η| ≤ clamp the link outputs
+    // are strictly positive/finite, so no parameter-space floor is applied —
+    // a floor binding inside the clamp band would reintroduce the same
+    // value/derivative desync on the θ/ν/φ/μ chains.
+    let mean_slope = eta_clamp_slope(eta_mu);
+    let disp_slope = eta_clamp_slope(eta_d);
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
-            let mu = em.exp().max(1e-300);
-            let theta = ed.exp().max(1e-12); // precision (size)
+            let mu = em.exp();
+            let theta = ed.exp(); // precision (size)
             let tpm = theta + mu;
             // Only the exact θ-space SCORE and the value are consumed here; the
             // observed-Hessian channel is discarded in favor of the expected
@@ -662,16 +807,16 @@ pub(super) fn dispersion_row_kernel(
             // never evaluates the discarded observed Hessian's trigamma at `θ+y`
             // and `θ`; `value`/`g[0]` are bit-identical to the `Order2` form.
             let tower = dispersion_nb_disp_order1(yi, mu, theta, wi);
-            let s_theta = if wi == 0.0 { 0.0 } else { -tower.g()[0] / wi };
+            let s_theta = -tower.g()[0] / wi;
             let loglik = -tower.value();
-            let info_mu = if wi == 0.0 {
-                DISPERSION_MIN_CURVATURE
-            } else {
-                (theta / (mu * tpm)).max(DISPERSION_MIN_CURVATURE)
-            };
+            let info_mu = (theta / (mu * tpm)).max(DISPERSION_MIN_CURVATURE);
             let score_mu = theta * (yi - mu) / (mu * tpm);
-            let mean_weight = wi * mu * mu * info_mu;
-            let mean_response = em + score_mu / (mu * info_mu);
+            let (mean_weight, mean_response) = clamped_working_pair(
+                mean_slope,
+                em,
+                wi * mu * mu * info_mu,
+                score_mu / (mu * info_mu),
+            );
             // Dispersion (log-θ) IRLS curvature: use the EXPECTED (Fisher)
             // information in θ, not the per-row OBSERVED Hessian channel
             // (`_info_theta_observed`). The NB2 log-likelihood is strongly
@@ -712,8 +857,12 @@ pub(super) fn dispersion_row_kernel(
             let trigamma_tpm = gam_math::jet_tower::trigamma(tpm);
             let info_theta_fisher = trigamma_theta - trigamma_tpm - 1.0 / theta + 1.0 / tpm;
             let info_pos = info_theta_fisher.max(DISPERSION_MIN_CURVATURE);
-            let disp_weight = wi * theta * theta * info_pos;
-            let disp_response = ed + s_theta / (theta * info_pos);
+            let (disp_weight, disp_response) = clamped_working_pair(
+                disp_slope,
+                ed,
+                wi * theta * theta * info_pos,
+                s_theta / (theta * info_pos),
+            );
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -723,23 +872,27 @@ pub(super) fn dispersion_row_kernel(
             }
         }
         DispersionFamilyKind::Gamma => {
-            let mu = em.exp().max(1e-300);
-            let nu = ed.exp().max(1e-12); // precision = shape ν
+            let mu = em.exp();
+            let nu = ed.exp(); // precision = shape ν
             let y_pos = yi.max(1e-300);
             let tower = dispersion_gamma_disp_order2(yi, y_pos, mu, nu, wi);
             let (s_nu, info_nu_raw) = tower_score_info(&tower, 0, wi);
             let loglik = -tower.value();
-            let info_mu = if wi == 0.0 {
-                DISPERSION_MIN_CURVATURE
-            } else {
-                (nu / (mu * mu)).max(DISPERSION_MIN_CURVATURE)
-            };
+            let info_mu = (nu / (mu * mu)).max(DISPERSION_MIN_CURVATURE);
             let score_mu = nu * (yi - mu) / (mu * mu);
-            let mean_weight = wi * mu * mu * info_mu;
-            let mean_response = em + score_mu / (mu * info_mu);
+            let (mean_weight, mean_response) = clamped_working_pair(
+                mean_slope,
+                em,
+                wi * mu * mu * info_mu,
+                score_mu / (mu * info_mu),
+            );
             let info_nu = info_nu_raw.max(DISPERSION_MIN_CURVATURE);
-            let disp_weight = wi * nu * nu * info_nu;
-            let disp_response = ed + s_nu / (nu * info_nu);
+            let (disp_weight, disp_response) = clamped_working_pair(
+                disp_slope,
+                ed,
+                wi * nu * nu * info_nu,
+                s_nu / (nu * info_nu),
+            );
             DispersionRowKernel {
                 loglik,
                 mean_weight,

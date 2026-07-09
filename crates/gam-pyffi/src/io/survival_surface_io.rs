@@ -657,87 +657,90 @@ pub(crate) fn survival_collect_chunks<'py>(
 }
 
 #[pyfunction]
-pub(crate) fn hazard_from_cumulative<'py>(
+pub(crate) fn hazard_from_cumulative_knots<'py>(
     py: Python<'py>,
+    grid: PyReadonlyArray1<'py, f64>,
+    surface: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
-    cumulative: PyReadonlyArray2<'py, f64>,
-    previous_cumulative: Option<PyReadonlyArray2<'py, f64>>,
-    previous_time: f64,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let cum_view = cumulative.as_array();
-    let times_view = times.as_array();
-    let (n_rows, n_times) = cum_view.dim();
-    if times_view.len() != n_times {
-        return Err(py_value_error(
-            "hazard_from_cumulative requires matching time count".to_string(),
-        ));
-    }
-    let previous = match previous_cumulative {
-        Some(arr) => {
-            let view = arr.as_array();
-            if view.dim() != (n_rows, 1) {
-                return Err(py_value_error(
-                    "previous_cumulative must have one column per row".to_string(),
-                ));
-            }
-            view.to_owned()
-        }
-        None => Array2::<f64>::zeros((n_rows, 1)),
-    };
-    hazard_from_cumulative_impl(times_view, cum_view, previous.view(), previous_time)
+    hazard_from_cumulative_knots_impl(grid.as_array(), surface.as_array(), times.as_array())
         .map(|out| out.into_pyarray(py))
         .map_err(py_value_error)
 }
 
-/// Forward-difference the sampled cumulative hazard into an instantaneous
-/// hazard, with the discretization preconditions a finite difference requires
-/// (issue #966).
+/// Pointwise hazard of the STORED piecewise-linear cumulative-hazard surface:
+/// the slope of the knot interval containing each query time.
 ///
-/// For each row the hazard at query `j` is the slope of the cumulative-hazard
-/// interpolant over the interval ending at `times[j]`:
-/// `(H(times[j]) - H(prev_t)) / (times[j] - prev_t)`, where the predecessor of
-/// the first query is the `(previous_time, previous_cumulative)` carry from the
-/// prior chunk. This is only meaningful when the evaluation times are strictly
-/// increasing (a forward difference needs a positive, well-defined width) and
-/// the cumulative hazard is non-decreasing (it is monotone by definition, so a
-/// decrease signals a corrupt input rather than a hazard the slope should
-/// "invent"). The previous code instead forced `width = 1.0` whenever the gap
-/// was non-positive, which silently changed the time unit, manufactured a zero
-/// hazard at repeated times, and produced a negative hazard from unsorted
-/// query times. We reject those inputs rather than fabricate a slope; callers
-/// that need hazards from an arbitrary order must sort their query times first.
-fn hazard_from_cumulative_impl(
+/// The hazard at a time is a property of the saved `(grid, H)` interpolant
+/// alone, so the answer for one query cannot depend on which other query
+/// times happen to share the call. The retired approach interpolated `H` at
+/// the queries and then took secants between consecutive *query* points; for
+/// stored knots `(t, H) = (0, 0), (1, 1), (2, 4)` it returned hazard 2 at
+/// `t = 1.5`, and inserting an unrelated query at `t = 1` changed that answer
+/// to 3 (issue #966 follow-up). Here every query is answered from the knot
+/// interval `(grid[k-1], grid[k]]` that contains it — left-continuous at
+/// knots, matching a càdlàg cumulative hazard.
+///
+/// Outside the grid the interpolant is flat (`H = 0` below the first knot and
+/// the #1595 flat clamp past the last), so the hazard there is exactly 0;
+/// `t = +inf` falls in the same flat-clamp region.
+fn hazard_from_cumulative_knots_impl(
+    grid: ndarray::ArrayView1<'_, f64>,
+    surface: ndarray::ArrayView2<'_, f64>,
     times: ndarray::ArrayView1<'_, f64>,
-    cumulative: ndarray::ArrayView2<'_, f64>,
-    previous_cumulative: ndarray::ArrayView2<'_, f64>,
-    previous_time: f64,
 ) -> Result<Array2<f64>, String> {
-    let (n_rows, n_times) = cumulative.dim();
-    let mut out = Array2::<f64>::zeros((n_rows, n_times));
-    for j in 0..n_times {
-        let prev_t = if j == 0 { previous_time } else { times[j - 1] };
-        let width = times[j] - prev_t;
-        if !(width > 0.0) {
+    let (n_rows, n_knots) = surface.dim();
+    if grid.len() != n_knots {
+        return Err(format!(
+            "hazard_from_cumulative_knots: surface has {n_knots} knot columns but the grid \
+             has {} entries",
+            grid.len()
+        ));
+    }
+    if n_knots == 0 {
+        return Err("hazard_from_cumulative_knots: empty knot grid".to_string());
+    }
+    for k in 1..n_knots {
+        if !(grid[k] > grid[k - 1]) {
             return Err(format!(
-                "hazard_from_cumulative requires strictly increasing query times; \
-                 width {width} at index {j} (time {} after {prev_t}) is not positive. \
-                 Sort the query times (and de-duplicate) before differencing.",
-                times[j]
+                "hazard_from_cumulative_knots: knot grid must be strictly increasing; \
+                 grid[{k}] = {} does not exceed grid[{}] = {}",
+                grid[k],
+                k - 1,
+                grid[k - 1]
             ));
         }
-        for i in 0..n_rows {
-            let prev_h = if j == 0 {
-                previous_cumulative[[i, 0]]
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, times.len()));
+    for (j, &t) in times.iter().enumerate() {
+        if t.is_nan() {
+            return Err(format!(
+                "hazard_from_cumulative_knots: query time at index {j} is NaN"
+            ));
+        }
+        if !(t > grid[0] && t <= grid[n_knots - 1]) {
+            // Flat extrapolation regions of the stored interpolant: slope 0.
+            continue;
+        }
+        // Binary search for the knot interval (grid[lo], grid[hi]] with t
+        // inside; the range check above guarantees 0 <= lo < hi < n_knots.
+        let (mut lo, mut hi) = (0usize, n_knots - 1);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if grid[mid] < t {
+                lo = mid;
             } else {
-                cumulative[[i, j - 1]]
-            };
-            let delta = cumulative[[i, j]] - prev_h;
+                hi = mid;
+            }
+        }
+        let width = grid[hi] - grid[lo];
+        for i in 0..n_rows {
+            let delta = surface[[i, hi]] - surface[[i, lo]];
             if delta < 0.0 {
                 return Err(format!(
                     "cumulative hazard must be non-decreasing in time; row {i} drops by \
-                     {} between index {} and {j}",
-                    -delta,
-                    j.wrapping_sub(1)
+                     {} between knots {lo} and {hi}",
+                    -delta
                 ));
             }
             out[[i, j]] = delta / width;
@@ -808,6 +811,79 @@ fn exponential_survival_at(hazard: f64, t: f64) -> f64 {
         return if hazard > 0.0 { 0.0 } else { 1.0 };
     }
     (-hazard * t).exp()
+}
+
+/// Cumulative hazard of the parametric exponential fallback at one time.
+///
+/// `H(t) = hazard * t` computed DIRECTLY, never reconstructed as
+/// `-ln(exp(-hazard * t))`: that round trip returns 0 instead of ~1e-20 when
+/// `S` rounds to 1 (hazard·t ≈ 1e-20) and `+inf` instead of 1000 when `S`
+/// underflows to 0 (hazard·t ≳ 745), corrupting risk scores and concordance
+/// ordering. Boundary cases mirror `exponential_survival_at`: `H(t <= 0) = 0`
+/// exactly, and `H(+inf) = +inf` for a positive hazard (0 for a degenerate
+/// zero hazard, avoiding `0 * inf = NaN`).
+fn exponential_cumulative_hazard_at(hazard: f64, t: f64) -> f64 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t == f64::INFINITY {
+        return if hazard > 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    hazard * t
+}
+
+#[pyfunction]
+pub(crate) fn survival_block_cumulative_hazard<'py>(
+    py: Python<'py>,
+    params: PyReadonlyArray2<'py, f64>,
+    times: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let params = params.as_array();
+    let times_view = times.as_array();
+    let n_rows = params.shape()[0];
+    let n_times = times_view.len();
+    if params.shape()[1] == 0 {
+        return Err(py_value_error(
+            "survival parameter matrix must have at least one column".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_times));
+    for i in 0..n_rows {
+        let hazard = params[[i, 0]].exp();
+        for j in 0..n_times {
+            out[[i, j]] = exponential_cumulative_hazard_at(hazard, times_view[j]);
+        }
+    }
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
+pub(crate) fn survival_block_failure<'py>(
+    py: Python<'py>,
+    params: PyReadonlyArray2<'py, f64>,
+    times: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    // Failure probability of the parametric exponential fallback,
+    // `F(t) = -expm1(-H(t))` evaluated directly: `1 - exp(-H)` cancels to 0
+    // for `H ≈ 1e-20` where the true failure probability is ~1e-20. The
+    // `H = +inf` endpoint maps to `-expm1(-inf) = 1` exactly.
+    let params = params.as_array();
+    let times_view = times.as_array();
+    let n_rows = params.shape()[0];
+    let n_times = times_view.len();
+    if params.shape()[1] == 0 {
+        return Err(py_value_error(
+            "survival parameter matrix must have at least one column".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_times));
+    for i in 0..n_rows {
+        let hazard = params[[i, 0]].exp();
+        for j in 0..n_times {
+            out[[i, j]] = -(-exponential_cumulative_hazard_at(hazard, times_view[j])).exp_m1();
+        }
+    }
+    Ok(out.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -966,81 +1042,130 @@ mod tests {
         assert!((s - (-100.0_f64).exp()).abs() < 1e-300);
     }
 
-    // ---- issue #966: hazard differencing requires strictly increasing times ----
+    // ---- issue #966 follow-up: pointwise hazard from the STORED knot lattice ----
 
     #[test]
-    fn hazard_from_cumulative_matches_constant_slope() {
-        // H(t) = 2 t over strictly increasing times sampled from the origin
-        // carry (previous_time = 0, previous_cumulative = 0) yields hazard 2.
-        let times = array![1.0, 2.0, 3.0];
-        let cumulative = array![[2.0, 4.0, 6.0]];
-        let previous = array![[0.0]];
-        let out =
-            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-                .expect("strictly increasing times");
-        for &h in out.iter() {
-            assert!(
-                (h - 2.0).abs() < 1e-12,
-                "expected constant hazard 2, got {h}"
-            );
-        }
+    fn hazard_knots_uses_the_containing_knot_interval() {
+        // Stored knots (t, H) = (0, 0), (1, 1), (2, 4): segment slopes 1 and 3.
+        let grid = array![0.0, 1.0, 2.0];
+        let surface = array![[0.0, 1.0, 4.0]];
+        let queries = array![0.5, 1.5];
+        let out = hazard_from_cumulative_knots_impl(grid.view(), surface.view(), queries.view())
+            .expect("valid knots");
+        assert!((out[[0, 0]] - 1.0).abs() < 1e-12, "got {}", out[[0, 0]]);
+        assert!((out[[0, 1]] - 3.0).abs() < 1e-12, "got {}", out[[0, 1]]);
     }
 
     #[test]
-    fn hazard_from_cumulative_rejects_repeated_times() {
-        // Repeated times (width 0) previously invented a zero hazard via the
-        // forced width = 1; now they are rejected.
-        let times = array![1.0, 1.0];
-        let cumulative = array![[2.0, 2.0]];
-        let previous = array![[0.0]];
-        let err =
-            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-                .expect_err("repeated times must error");
+    fn hazard_knots_is_independent_of_the_other_query_times() {
+        // The core contract: adding an unrelated query must not change any
+        // other query's hazard. The retired secant-between-queries differencing
+        // returned 2 at t = 1.5 for [0.5, 1.5] and 3 once t = 1 was inserted.
+        let grid = array![0.0, 1.0, 2.0];
+        let surface = array![[0.0, 1.0, 4.0]];
+        let sparse = hazard_from_cumulative_knots_impl(
+            grid.view(),
+            surface.view(),
+            array![0.5, 1.5].view(),
+        )
+        .expect("valid knots");
+        let dense = hazard_from_cumulative_knots_impl(
+            grid.view(),
+            surface.view(),
+            array![0.5, 1.0, 1.5].view(),
+        )
+        .expect("valid knots");
+        assert_eq!(sparse[[0, 1]].to_bits(), dense[[0, 2]].to_bits());
+    }
+
+    #[test]
+    fn hazard_knots_accepts_any_query_order_and_repeats() {
+        // Pointwise evaluation has no ordering precondition: unsorted and
+        // repeated queries are answered identically per time.
+        let grid = array![0.0, 1.0, 2.0];
+        let surface = array![[0.0, 1.0, 4.0]];
+        let out = hazard_from_cumulative_knots_impl(
+            grid.view(),
+            surface.view(),
+            array![1.5, 0.5, 1.5].view(),
+        )
+        .expect("valid knots");
+        assert!((out[[0, 0]] - 3.0).abs() < 1e-12);
+        assert!((out[[0, 1]] - 1.0).abs() < 1e-12);
+        assert!((out[[0, 2]] - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hazard_knots_is_zero_on_the_flat_extrapolation_regions() {
+        // Below the grid H ≡ 0 and past the top knot H flat-clamps (#1595), so
+        // the interpolant's slope — hence the hazard — is exactly 0 there,
+        // including at t = +inf.
+        let grid = array![1.0, 2.0];
+        let surface = array![[1.0, 3.0]];
+        let out = hazard_from_cumulative_knots_impl(
+            grid.view(),
+            surface.view(),
+            array![0.5, 1.0, 5.0, f64::INFINITY].view(),
+        )
+        .expect("valid knots");
+        assert_eq!(out[[0, 0]], 0.0);
+        // t exactly at the FIRST knot sits at the edge of the flat left
+        // region (left-continuous derivative): 0.
+        assert_eq!(out[[0, 1]], 0.0);
+        assert_eq!(out[[0, 2]], 0.0);
+        assert_eq!(out[[0, 3]], 0.0);
+    }
+
+    #[test]
+    fn hazard_knots_rejects_a_non_increasing_grid_and_decreasing_h() {
+        let surface = array![[1.0, 3.0]];
+        let err = hazard_from_cumulative_knots_impl(
+            array![2.0, 1.0].view(),
+            surface.view(),
+            array![1.5].view(),
+        )
+        .expect_err("decreasing grid must error");
         assert!(
             err.contains("strictly increasing"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn hazard_from_cumulative_rejects_unsorted_times() {
-        // Unsorted times previously produced a negative hazard from a negative
-        // width forced to 1; now they are rejected rather than fabricated.
-        let times = array![2.0, 1.0];
-        let cumulative = array![[4.0, 2.0]];
-        let previous = array![[0.0]];
-        let err =
-            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-                .expect_err("unsorted times must error");
-        assert!(
-            err.contains("strictly increasing"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn hazard_from_cumulative_rejects_origin_collision_with_carry() {
-        // First query equal to the previous-time carry has zero width.
-        let times = array![0.0, 1.0];
-        let cumulative = array![[0.0, 1.0]];
-        let previous = array![[0.0]];
-        assert!(
-            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn hazard_from_cumulative_rejects_decreasing_cumulative() {
-        // Cumulative hazard is monotone non-decreasing by definition; a drop
-        // signals corrupt input rather than a (nonsensical) negative hazard.
-        let times = array![1.0, 2.0];
-        let cumulative = array![[4.0, 2.0]];
-        let previous = array![[0.0]];
-        let err =
-            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-                .expect_err("decreasing cumulative must error");
+        let err = hazard_from_cumulative_knots_impl(
+            array![1.0, 2.0].view(),
+            array![[3.0, 1.0]].view(),
+            array![1.5].view(),
+        )
+        .expect_err("decreasing cumulative must error");
         assert!(err.contains("non-decreasing"), "unexpected error: {err}");
+    }
+
+    // ---- exponential fallback: exact H and F accessors (no S round trip) ----
+
+    #[test]
+    fn exponential_cumulative_hazard_is_exact_where_survival_rounds_away() {
+        // hazard * t = 1e-20: S rounds to 1.0, so -ln S is 0; the direct H is
+        // exact. hazard * t = 1000: S underflows to 0, so -ln S is +inf; the
+        // direct H is 1000.
+        assert_eq!(exponential_cumulative_hazard_at(1e-20, 1.0), 1e-20);
+        assert_eq!(exponential_cumulative_hazard_at(1.0, 1000.0), 1000.0);
+        assert_eq!(exponential_cumulative_hazard_at(1.0, 0.0), 0.0);
+        assert_eq!(exponential_cumulative_hazard_at(1.0, -3.0), 0.0);
+        assert_eq!(
+            exponential_cumulative_hazard_at(1.0, f64::INFINITY),
+            f64::INFINITY
+        );
+        assert_eq!(exponential_cumulative_hazard_at(0.0, f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn exponential_failure_preserves_tiny_probabilities() {
+        // F(t) = -expm1(-h t): for h t = 1e-20 the failure probability is
+        // ~1e-20, which 1 - exp(-h t) cancels to 0.
+        let h = 1e-20_f64;
+        let f = -(-exponential_cumulative_hazard_at(h, 1.0)).exp_m1();
+        assert!(
+            (f - 1e-20).abs() < 1e-32,
+            "tiny failure probability lost: {f}"
+        );
     }
 
     // ---- issue #965 / completing #1595: unified extrapolation policy on the

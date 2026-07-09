@@ -8535,10 +8535,15 @@ impl SaeManifoldTerm {
                 let inv_tau = 1.0 / temperature;
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
+                // #991 — this row's JumpReLU prior curvature in `htt` carries the
+                // design weight `w_row`, so its θ-derivative carries the SAME
+                // `w_row` (value/logdet/adjoint stay on one weighted branch).
+                let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
                 // #1415: P(ℓ)=λσ((ℓ−θ)/τ); P''(ℓ)=(λ/τ²)s(1−2a) so the third
                 // derivative is P'''(ℓ)=(λ/τ³)·s·(1−6a+6a²), because
                 // d/dℓ[s(1−2a)] = (1/τ)s[(1−2a)²−2s] = (1/τ)s(1−6a+6a²).
-                rho.lambda_sparse()
+                w_row
+                    * rho.lambda_sparse()
                     * slope
                     * (1.0 - 6.0 * activation + 6.0 * activation * activation)
                     * inv_tau
@@ -9042,6 +9047,12 @@ impl SaeManifoldTerm {
                     }
                     _ => None,
                 };
+            // #991 — the softmax majorizer written into `htt` carries this row's
+            // design weight `w_row`, so its θ-derivative below carries the SAME
+            // `w_row`; the data-curvature θ-derivative already carries `w` through
+            // the √w-scaled jets, and the IBP prior derivative
+            // (`assignment_prior_hdiag_derivative_entry`) is left unweighted.
+            let w_row_prior = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
             for w in 0..q {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
@@ -9081,9 +9092,10 @@ impl SaeManifoldTerm {
                         ) = (softmax_d_dw, jets.vars[a], jets.vars[b])
                         {
                             if atom_a == atom_b {
-                                dh += active_softmax_majorizer_logit_derivative_entry(
-                                    a_soft, atom_a, _atom_w, m, scale, inv_tau,
-                                );
+                                dh += w_row_prior
+                                    * active_softmax_majorizer_logit_derivative_entry(
+                                        a_soft, atom_a, _atom_w, m, scale, inv_tau,
+                                    );
                             }
                         }
                         if a == b {

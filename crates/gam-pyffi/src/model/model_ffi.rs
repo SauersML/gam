@@ -21,10 +21,11 @@ use sklearn_metadata::sklearn_fit_metadata;
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
 use survival_surface_io::{
-    hazard_from_cumulative, interpolate_rows, interpolate_survival_surface, survival_block,
-    survival_block_hazard, survival_chunk_iter_collect, survival_coerce_times,
-    survival_collect_chunks, survival_cumulative_from_survival, survival_ffi_surface,
-    survival_parameters_matrix, write_survival_csv,
+    hazard_from_cumulative_knots, interpolate_rows, interpolate_survival_surface, survival_block,
+    survival_block_cumulative_hazard, survival_block_failure, survival_block_hazard,
+    survival_chunk_iter_collect, survival_coerce_times, survival_collect_chunks,
+    survival_cumulative_from_survival, survival_ffi_surface, survival_parameters_matrix,
+    write_survival_csv,
 };
 
 #[derive(Default, Deserialize)]

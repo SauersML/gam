@@ -897,12 +897,23 @@ pub fn fit_spline_scan_at(
 
     let knots: Vec<f64> = nodes.iter().map(|n| n.x).collect();
     let mean: Vec<f64> = sm_state.iter().map(|s| s[0]).collect();
-    // f′ lives at state index 1 — present for order ≥ 2, structurally 0 at m = 1.
-    let deriv: Vec<f64> = sm_state
-        .iter()
-        .map(|s| if order >= 2 { s[1] } else { 0.0 })
-        .collect();
+    // f′ lives at state index 1 — present for order ≥ 2 only; the m = 1 latent
+    // process (Brownian motion) has no derivative state to expose.
+    let deriv: Option<Vec<f64>> = (order >= 2).then(|| sm_state.iter().map(|s| s[1]).collect());
     let var: Vec<f64> = sm_cov.iter().map(|p| p[0][0] * sigma2).collect();
+    // Weighted DATA residual sum of squares at the smoothed mean. Tied rows
+    // pool exactly: Σᵢ wᵢ(yᵢ − f̂ₖ)² = Σᵢ wᵢ(yᵢ − ȳₖ)² + Σₖ Wₖ(ȳₖ − f̂ₖ)²
+    // (within-tie scatter plus pooled-node misfit), so the raw rows the scan
+    // does not retain are not needed.
+    let data_sse = ssr_within
+        + nodes
+            .iter()
+            .zip(mean.iter())
+            .map(|(node, &fhat)| {
+                let r = node.y - fhat;
+                node.w * r * r
+            })
+            .sum::<f64>();
     Ok(SplineScanFit {
         order,
         knots,
@@ -913,6 +924,7 @@ pub fn fit_spline_scan_at(
         sigma2,
         restricted_loglik,
         n_obs,
+        data_sse,
         smoothed_state: sm_state,
         smoothed_cov: sm_cov,
         rts_gain: gains,
@@ -1032,6 +1044,11 @@ pub struct SplineScanState {
     pub restricted_loglik: f64,
     /// Raw observation count `n` (#1046).
     pub n_obs: u64,
+    /// Weighted data residual sum of squares `Σ wᵢ (yᵢ − f̂(xᵢ))²` at the
+    /// smoothed mean — the Gaussian deviance. Stored because it cannot be
+    /// recovered from the profiled σ² (whose quadratic also carries
+    /// process/roughness energy) and the raw rows are not retained.
+    pub data_sse: f64,
 }
 
 /// Serde default for [`SplineScanState::order`]: historical snapshots predate
@@ -1077,6 +1094,7 @@ impl SplineScanFit {
             sigma2: self.sigma2,
             restricted_loglik: self.restricted_loglik,
             n_obs: self.n_obs as u64,
+            data_sse: self.data_sse,
         }
     }
 
@@ -1137,6 +1155,12 @@ impl SplineScanFit {
                 state.log_lambda, state.sigma2, state.restricted_loglik
             ));
         }
+        if !(state.data_sse.is_finite() && state.data_sse >= 0.0) {
+            return Err(format!(
+                "spline scan state: invalid data_sse {}",
+                state.data_sse
+            ));
+        }
         if state.knots.windows(2).any(|kk| !(kk[0] < kk[1])) {
             return Err("spline scan state: knots must be strictly increasing".to_string());
         }
@@ -1190,12 +1214,13 @@ impl SplineScanFit {
             order,
             knots: state.knots.clone(),
             mean: smoothed_state.iter().map(|s| s[0]).collect(),
-            deriv: smoothed_state.iter().map(|s| s[1]).collect(),
+            deriv: (order >= 2).then(|| smoothed_state.iter().map(|s| s[1]).collect()),
             var: smoothed_cov.iter().map(|c| c[0][0] * sigma2).collect(),
             log_lambda: state.log_lambda,
             sigma2,
             restricted_loglik: state.restricted_loglik,
             n_obs,
+            data_sse: state.data_sse,
             smoothed_state,
             smoothed_cov,
             rts_gain,
@@ -1333,11 +1358,18 @@ impl SplineScanFit {
     }
 
     /// Posterior `(mean, variance)` of the derivative `f′` at a knot index.
-    pub fn deriv_at_knot(&self, t: usize) -> (f64, f64) {
-        (
-            self.smoothed_state[t][1],
-            self.smoothed_cov[t][1][1] * self.sigma2,
-        )
+    ///
+    /// `None` at order `m = 1`: the latent process is Brownian motion, which
+    /// is almost surely nondifferentiable — there is no derivative state, and
+    /// fabricating a "known zero" `(0, 0)` would assert certainty about a
+    /// quantity that does not exist.
+    pub fn deriv_at_knot(&self, t: usize) -> Option<(f64, f64)> {
+        (self.order >= 2).then(|| {
+            (
+                self.smoothed_state[t][1],
+                self.smoothed_cov[t][1][1] * self.sigma2,
+            )
+        })
     }
 
     /// Selected smoothing parameter `λ = e^{log λ}` (#1046).
@@ -1350,12 +1382,16 @@ impl SplineScanFit {
         self.n_obs
     }
 
-    /// Gaussian deviance — the weighted residual sum of squares `Σ wᵢ(yᵢ − f̂ᵢ)²`
-    /// (#1046). The profiled `σ² = RSS / (n − order)` (the restricted residual
-    /// d.o.f.), so `RSS = σ²·(n − order)` recovers the deviance exactly without
-    /// re-touching the raw rows the scan deliberately does not retain.
+    /// Gaussian deviance — the weighted DATA residual sum of squares
+    /// `Σ wᵢ(yᵢ − f̂ᵢ)²` at the smoothed mean (#1046). This is the stored
+    /// `data_sse`, computed against the fitted values at fit time. It is NOT
+    /// `σ̂²·(n − order)`: the profiled σ² divides the REML innovations
+    /// quadratic, which is data residual energy PLUS process/roughness energy
+    /// at the posterior mode (for order 1 on `x = (0,1)`, `y = (0,1)`, unit
+    /// weights and λ = 1 the posterior mean is `(1/3, 2/3)`; the data SSE is
+    /// 2/9 while `σ̂²·(n − order) = 1/3`, the extra 1/9 being penalty energy).
     pub fn deviance(&self) -> f64 {
-        self.sigma2 * (self.n_obs as f64 - self.order as f64).max(0.0)
+        self.data_sse
     }
 }
 
@@ -1405,10 +1441,15 @@ mod tests {
         assert_eq!(fit.sigma2.to_bits(), restored.sigma2.to_bits());
         assert_eq!(fit.edf().to_bits(), restored.edf().to_bits());
         for t in 0..fit.knots.len() {
-            let (d0, v0) = fit.deriv_at_knot(t);
-            let (d1, v1) = restored.deriv_at_knot(t);
-            assert_eq!(d0.to_bits(), d1.to_bits());
-            assert_eq!(v0.to_bits(), v1.to_bits());
+            match (fit.deriv_at_knot(t), restored.deriv_at_knot(t)) {
+                (Some((d0, v0)), Some((d1, v1))) => {
+                    assert!(order >= 2);
+                    assert_eq!(d0.to_bits(), d1.to_bits());
+                    assert_eq!(v0.to_bits(), v1.to_bits());
+                }
+                (None, None) => assert_eq!(order, 1),
+                _ => panic!("derivative availability drifted across the persistence seam"),
+            }
         }
         // Off-knot bridge, exact knot hit, and both extrapolation sides.
         for &xq in &[-0.2, 0.0, 0.013, 0.5, x[6], 0.987, 1.0, 1.3] {
@@ -1551,7 +1592,10 @@ mod tests {
             "order-1 EDF mismatch: scan={} dense={dense_edf}",
             fit.edf()
         );
-        // Order-1 derivative state is structurally absent.
-        assert!(fit.deriv.iter().all(|&d| d == 0.0));
+        // Order-1 derivative state is structurally absent: Brownian motion has
+        // no pointwise derivative, so the fit must say so rather than report a
+        // fabricated known-zero.
+        assert!(fit.deriv.is_none());
+        assert!(fit.deriv_at_knot(0).is_none());
     }
 }

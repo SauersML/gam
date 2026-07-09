@@ -144,7 +144,7 @@ fn conditional_prediction_backend<'a>(
     // We fall back to factorizing the penalized Hessian only when no stored
     // covariance is available. This keeps the conditional-covariance
     // semantics in `predict_gam_with_uncertainty` consistent with
-    // `posterior_mean_backend_or_warn`, which already prefers
+    // `require_posterior_mean_backend`, which already prefers
     // `fit.beta_covariance()` over any indirect derivation.
     if let Some(covariance) = fit.beta_covariance() {
         if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
@@ -617,12 +617,13 @@ const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
 /// numerically well-defined.
 const SURVIVAL_STANDARDIZED_ARG_CLAMP: f64 = 1e6;
 
-fn posterior_mean_backend_or_warn<'a>(
+fn require_posterior_mean_backend<'a>(
     fit: &'a UnifiedFitResult,
     fallback: Option<&'a Array2<f64>>,
     expected_dim: usize,
     label: &str,
-) -> Option<PredictionCovarianceBackend<'a>> {
+) -> Result<PredictionCovarianceBackend<'a>, EstimationError> {
+    let mut rejected: Vec<String> = Vec::new();
     for (source, covariance) in [
         ("fit result", fit.beta_covariance()),
         ("predictor state", fallback),
@@ -631,36 +632,31 @@ fn posterior_mean_backend_or_warn<'a>(
             continue;
         };
         if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
-            return Some(PredictionCovarianceBackend::from_dense(covariance.view()));
+            return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
         }
-        log::warn!(
-            "{label}: ignoring {source} covariance with shape {}x{}; expected {}x{}",
+        rejected.push(format!(
+            "{source} covariance is {}x{}",
             covariance.nrows(),
-            covariance.ncols(),
-            expected_dim,
-            expected_dim
-        );
+            covariance.ncols()
+        ));
     }
     if let Some(backend) = conditional_prediction_backend(fit, expected_dim, label) {
-        return Some(backend);
+        return Ok(backend);
     }
-    log::warn!(
-        "{label}: covariance/precision unavailable; falling back to plug-in point prediction"
-    );
-    None
-}
-
-fn require_posterior_mean_backend<'a>(
-    fit: &'a UnifiedFitResult,
-    fallback: Option<&'a Array2<f64>>,
-    expected_dim: usize,
-    label: &str,
-) -> Result<PredictionCovarianceBackend<'a>, EstimationError> {
-    posterior_mean_backend_or_warn(fit, fallback, expected_dim, label).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "{label} requires covariance or penalized Hessian for posterior-mean prediction"
-        ))
-    })
+    // The posterior mean E[g⁻¹(η)] is the estimand of this pass; without a
+    // usable coefficient covariance the integral cannot be formed, and quietly
+    // reporting the plug-in g⁻¹(η̂) instead would silently change the estimand.
+    // Missing or dimension-mismatched covariance is therefore a typed error
+    // carrying every rejected source, never a degraded prediction.
+    let detail = if rejected.is_empty() {
+        String::new()
+    } else {
+        format!(" (rejected: {})", rejected.join("; "))
+    };
+    Err(EstimationError::InvalidInput(format!(
+        "{label} requires a coefficient covariance or penalized Hessian of dimension \
+         {expected_dim}x{expected_dim} to integrate the posterior mean{detail}"
+    )))
 }
 
 fn project_two_block_linear_predictor_covariance(

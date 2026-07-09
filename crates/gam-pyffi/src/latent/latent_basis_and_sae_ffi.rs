@@ -1028,16 +1028,8 @@ fn posterior_predict_multinomial_pyfunc<'py>(
     seed: u64,
 ) -> PyResult<Py<PyDict>> {
     let (draws, class_levels) = detach_pyresult(py, "posterior_predict_multinomial", move || {
-        let envelope: MultinomialModelEnvelope =
-            serde_json::from_slice(&model_bytes).map_err(|err| {
-                py_value_error(format!("failed to deserialize multinomial model: {err}"))
-            })?;
-        if envelope.model_class != "multinomial" {
-            return Err(py_value_error(format!(
-                "posterior_predict_multinomial: model_class = {:?}, expected 'multinomial'",
-                envelope.model_class
-            )));
-        }
+        let envelope =
+            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
         let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         let draws = gam::families::multinomial::posterior_predict_multinomial_formula(
             &envelope.saved,
@@ -1065,14 +1057,8 @@ fn multinomial_smooth_significance_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
 ) -> PyResult<Py<pyo3::types::PyList>> {
-    let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
-        .map_err(|err| py_value_error(format!("failed to deserialize multinomial model: {err}")))?;
-    if envelope.model_class != "multinomial" {
-        return Err(py_value_error(format!(
-            "multinomial_smooth_significance: model_class = {:?}, expected 'multinomial'",
-            envelope.model_class
-        )));
-    }
+    let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+        .map_err(estimation_error_to_pyerr)?;
     let rows = envelope.saved.smooth_significance();
     let list = pyo3::types::PyList::empty(py);
     for r in rows {
@@ -1096,14 +1082,8 @@ fn multinomial_model_metadata_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
 ) -> PyResult<Py<PyDict>> {
-    let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
-        .map_err(|err| py_value_error(format!("failed to deserialize multinomial model: {err}")))?;
-    if envelope.model_class != "multinomial" {
-        return Err(py_value_error(format!(
-            "multinomial_model_metadata: model_class = {:?}, expected 'multinomial'",
-            envelope.model_class
-        )));
-    }
+    let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+        .map_err(estimation_error_to_pyerr)?;
     let out = PyDict::new(py);
     out.set_item("formula", &envelope.saved.formula)?;
     out.set_item("class_levels", envelope.saved.class_levels.clone())?;

@@ -2074,45 +2074,6 @@ pub(crate) fn resolved_ridge_determinant_mode(
     }
 }
 
-pub(crate) fn inverse_spdwith_retry(
-    matrix: &Array2<f64>,
-    baseridge: f64,
-    max_retry: usize,
-) -> Result<Array2<f64>, String> {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-
-    let invert_via_chol =
-        |chol: &gam_linalg::faer_ndarray::FaerCholeskyFactor, _: usize, _: f64| {
-            let mut ident = Array2::<f64>::eye(sym.nrows());
-            chol.solve_mat_in_place(&mut ident);
-            symmetrize_dense_in_place(&mut ident);
-            Some(ident)
-        };
-
-    // Attempt 0 in the original schedule uses ridge=0 (no diagonal addition).
-    // Express this as a single-attempt call with initial_boost=0.
-    if let Some((inv, _, _)) =
-        try_cholesky_with_escalating_ridge(&sym, 0.0, 1, 1.0, invert_via_chol)
-    {
-        return Ok(inv);
-    }
-
-    // Subsequent attempts use ridge = baseridge * 10^(k-1) for k = 1..=max_retry,
-    // which is `max_retry` total attempts with initial_boost=baseridge, growth=10.
-    if max_retry > 0
-        && let Some((inv, _, _)) =
-            try_cholesky_with_escalating_ridge(&sym, baseridge, max_retry, 10.0, invert_via_chol)
-    {
-        return Ok(inv);
-    }
-
-    Err(CustomFamilyError::BasisDecompositionFailed {
-        reason: "failed to invert SPD system after Cholesky ridge retries".to_string(),
-    }
-    .into())
-}
-
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
     gam_linalg::matrix::symmetrize_in_place(matrix);
 }
@@ -2380,36 +2341,6 @@ pub(crate) fn strict_exact_pseudo_logdet(
         .filter(|&ev| ev > pos_tol)
         .map(f64::ln)
         .sum())
-}
-
-pub(crate) fn pinv_positive_part(
-    matrix: &Array2<f64>,
-    ridge_floor: f64,
-) -> Result<Array2<f64>, String> {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let (eigenvalues, eigenvectors) = sym
-        .eigh(Side::Lower)
-        .map_err(|e| format!("positive-part covariance eigendecomposition failed: {e}"))?;
-    let max_abs_eigenvalue = eigenvalues.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tol = (max_abs_eigenvalue * CUSTOM_FAMILY_EVAL_FLOOR)
-        .max(ridge_floor.max(CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR));
-    let p = matrix.nrows();
-    let mut pinv = Array2::<f64>::zeros((p, p));
-    for (k, &ev) in eigenvalues.iter().enumerate() {
-        if ev <= tol {
-            continue;
-        }
-        let inv_ev = 1.0 / ev;
-        for i in 0..p {
-            let vi = eigenvectors[[i, k]];
-            for j in 0..p {
-                pinv[[i, j]] += inv_ev * vi * eigenvectors[[j, k]];
-            }
-        }
-    }
-    symmetrize_dense_in_place(&mut pinv);
-    Ok(pinv)
 }
 
 /// Numerical nullity of a symmetric penalized Hessian at the shared
