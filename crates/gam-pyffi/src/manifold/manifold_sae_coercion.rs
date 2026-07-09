@@ -681,6 +681,10 @@ pub(crate) fn build_manifold_sae_payload(
         selected_log_lambda_smooth,
         selected_log_ard,
         structured_residual_diagnostics: Vec::new(),
+        // #2235 — runtime-only termination ledger, carried straight from the raw
+        // fit payload (the legacy dataclass `from_payload` did the same:
+        // `termination = payload.get("termination")`). Not persisted by to_dict.
+        termination: report("termination"),
     })
 }
 

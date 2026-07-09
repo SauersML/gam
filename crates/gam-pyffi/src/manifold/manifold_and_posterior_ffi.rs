@@ -8510,6 +8510,16 @@ impl ManifoldSaeCore {
     fn hybrid_split(&self, py: Python<'_>) -> PyResult<PyObject> {
         manifold_sae_report(py, &self.inner.hybrid_split)
     }
+    /// The outer-ρ termination verdict/ledger (#2235). Runtime-only, like
+    /// `structured_residual_diagnostics`: `to_dict` never emitted it, so it is not
+    /// in the persisted schema; it is populated by the fit-path builder from the
+    /// raw payload and surfaced here so the pyclass exposes the same
+    /// `termination` attribute the legacy dataclass field did. `None` on payloads
+    /// predating the ledger.
+    #[getter]
+    fn termination(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.termination)
+    }
     /// The per-pass structured-residual alternation diagnostics (#2021). The serde
     /// schema WRITE-DROPS these (`to_dict` never emits the key; read-tolerated on
     /// load), but the payload struct retains them, so the pyclass surfaces the

@@ -185,6 +185,15 @@ pub(crate) struct ManifoldSaePayload {
     /// eventual `#[pyclass]`, but never re-serialize it.
     #[serde(default, skip_serializing)]
     pub(crate) structured_residual_diagnostics: Vec<Value>,
+    /// #2235 — the outer-ρ termination verdict/ledger the fit emitted
+    /// (`{"verdict", "evals", "evals_since_improvement", "wall_seconds"}`). Like
+    /// `structured_residual_diagnostics` this is a runtime-only field: `to_dict`
+    /// never emitted it (it is not part of the persisted v1 schema), so it is
+    /// `skip_serializing` here and populated only by the fit-path builder from the
+    /// raw `sae_manifold_fit_minimal` payload. `None` on payloads predating the
+    /// termination ledger, matching the legacy dataclass `termination` field.
+    #[serde(default, skip_serializing)]
+    pub(crate) termination: Option<Value>,
 }
 
 impl ManifoldSaePayload {
