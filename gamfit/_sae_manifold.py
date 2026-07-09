@@ -670,259 +670,135 @@ class SaeManifoldFitResult:
         _lazy_setattr(self, _LOW_LEVEL_LAZY_FIELDS, name, value)
 
 
-@dataclass(slots=True)
-class ManifoldSAE:
-    """Fitted SAE-manifold model returned by :func:`sae_manifold_fit`.
+class _LowLevelView:
+    """Read-only adapter reproducing the ``SaeManifoldFitResult`` surface consumers
+    touch off ``model.low_level`` (in practice only ``.chosen_k``); the remaining
+    fields are forwarded off the Rust-owned core for faithfulness. #2091."""
 
-    The main result arrays are exposed as ``fitted`` ``(N, p)``,
-    ``assignments`` ``(N, K)``, ``coords`` as a list of per-atom ``(N, d_k)``
-    arrays, ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices, and
-    ``atoms`` as detailed
-    :class:`SaeManifoldAtomFit` payloads. Metadata records the resolved
-    ``assignment`` kind, per-atom topology/basis information, score fields
-    (``penalized_loss_score`` -- a negative penalized-loss objective, NOT REML;
-    ``reml_score`` is retained as a deprecated read alias --,
-    ``reconstruction_r2``, ``dispersion``), fit controls
-    (``alpha``, ``learnable_alpha``, ``tau``, ``top_k``,
-    ``jumprelu_threshold``), and metadata for the training data. New fits do not
-    retain the input matrix; ``training_data`` is a metadata-only handle, while
-    dense result attributes are lazy and materialize when accessed.
+    __slots__ = ("_core",)
 
-    Public helpers include :meth:`predict`/:meth:`reconstruct`,
-    :meth:`reconstruct_training`, :meth:`encode`, :meth:`converged_latents`,
-    :meth:`project`, and :meth:`shape_uncertainty`.
-    """
-
-    atoms: list[SaeManifoldAtomFit]
-    atom_topology: str
-    atom_topologies: list[str]
-    assignment: str
-    assignment_label: str
-    primitive_names: list[str]
-    fitted: np.ndarray
-    assignments: np.ndarray
-    coords: list[np.ndarray]
-    decoder_blocks: list[np.ndarray]
-    basis_specs: list[str]
-    # The Rust FFI's negative penalized-loss score (NOT REML / marginal
-    # likelihood; #1231). ``None`` for closed-form shortcut payloads that do not
-    # compute it. ``reml_score`` is a deprecated read alias (see the property).
-    penalized_loss_score: float | None
-    reconstruction_r2: float
-    training_mean: np.ndarray
-    training_data: np.ndarray
-    low_level: SaeManifoldFitResult
-    low_level_logits: np.ndarray
-    diagnostics: dict[str, Any]
-    _basis_kinds: list[str]
-    _atom_dims: list[int]
-    _basis_sizes: list[int]
-    _n_harmonics: list[int]
-    _duchon_centers: list[np.ndarray | None]
-    _oos_projection_top1: bool = False
-    alpha: float = 1.0
-    learnable_alpha: bool = False
-    tau: float = 0.5
-    sparsity_strength: float = 1.0
-    smoothness: float = 1.0
-    learning_rate: float = 0.04
-    max_iter: int = 50
-    random_state: int = 0
-    top_k: int | None = None
-    top_k_projection: dict[str, Any] | None = None
-    pre_topk: dict[str, Any] | None = None
-    jumprelu_threshold: float = 0.0
-    solver_plan: dict[str, Any] | None = None
-    # #2235 -- outer-search accounting for the converged fit: {"evals",
-    # "evals_since_improvement", "wall_seconds"}. Non-convergence RAISES (the
-    # forcing-function contract) -- a fit object always came from a converged
-    # optimization. None on payloads predating the ledger.
-    termination: dict[str, Any] | None = None
-    # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
-    # covariance (Cov(beta_k) = phi * S_beta^{-1}[block]).
-    dispersion: float = 1.0
-    # Provenance of the per-row inner product the fit installed (#980):
-    # ``"Euclidean"`` (no shard, bit-identical isotropic path) or
-    # ``"OutputFisher"`` (a WP-D output-Fisher shard was supplied and
-    # ``RowMetric::OutputFisher`` was installed for the gauge/lens). The
-    # likelihood is untouched either way.
-    metric_provenance: str = "Euclidean"
-    # Per-row output-Fisher truncation diagnostic ``(n,)`` =
-    # ``trace(G_n) - sum_{k<=r} lambda_k``, the mass that fell off the captured
-    # rank-r subspace. ``None`` when no shard (or no mass_residual) was supplied.
-    # Surfaced so a too-small rank ``r`` is visible, not silent.
-    fisher_mass_residual: np.ndarray | None = None
-    # Per-pass iid→structured residual alternation diagnostics (#2021): each
-    # entry records λ̂ and φ̂ before/after installing the WhitenedStructured
-    # likelihood, plus the selected residual-factor rank/evidence.
-    structured_residual_diagnostics: list[dict[str, Any]] | None = None
-    # Additive two-score per-atom lens (#980): for each atom, ``presence``
-    # (representational, activation-side, Fisher-free), ``coupling`` (behavioral
-    # output-Fisher mass; ``NaN`` under a Euclidean / no-harvest provenance), and
-    # ``discrepancy = presence_normalized - coupling_normalized`` (the
-    # "represented but not currently used" headline; ``NaN`` when coupling is
-    # unavailable). A pure read of the fitted model; it feeds no loss or
-    # criterion. ``None`` only for payloads predating the diagnostic.
-    atom_two_lens: dict[str, Any] | None = None
-    # Residual-gauge certificate (#980): which symmetry group the fit is
-    # identified up to. ``group_signature`` names the surviving generator
-    # families; ``generators`` lists each enumerated symmetry's pinned/unpinned
-    # verdict; ``metric_provenance`` records the inner product it was computed in.
-    # Pure read; ``None`` only for payloads predating the diagnostic.
-    residual_gauge: dict[str, Any] | None = None
-    # Empirical curved-dictionary certificate inputs (#1008): frame incoherence
-    # ``mu_hat``, per-atom curvature bounds, activity floors, and an SNR proxy.
-    # This is deliberately quantities-only; no global-optimality verdict exists
-    # until the theorem threshold is implemented.
-    incoherence_report: dict[str, Any] | None = None
-    # Per-atom curvature report (#1099, rescoped under #1115).
-    # ``atoms[k]`` is ``{"atom": int, "kappa_hat": float}``: the fitted empirical
-    # second-fundamental-form sup-norm bound for atom k, a descriptive plug-in
-    # geometry summary. A curvature bound is not an estimand with a profiled
-    # criterion, so no SE/CI/flatness fields are carried.
-    curvature_report: dict[str, Any] | None = None
-    # Per-atom chart coordinate-fidelity certificate (#2081). ``atoms[k]`` carries
-    # the circular coordinate-uniformity statistic (Watson U² + closed-form
-    # p-value) of the fitted d=1 coordinate against the atom's uniform invariant
-    # measure, plus the arc-length (unit-speed) defect of the chart
-    # parameterization. Reconstruction EV does not certify coordinate quality;
-    # this reports it. Atoms without a d=1 circle/interval chart carry a null
-    # ``topology``.
-    coordinate_fidelity: dict[str, Any] | None = None
-    # Per-atom persistent-homology topology audit. ``atoms[k]`` carries measured
-    # Betti numbers, expected Betti numbers, the ``covering_side`` honesty band,
-    # inferred coarse topology, persistence bars, and a ``contested`` flag when
-    # the measured topology disagrees with the raced kind.
-    topology_persistence: dict[str, Any] | None = None
-    # Per-atom smooth-functional inference (#1097 / #1103): one entry per fitted
-    # atom, ``{"atom_index": int, "atom_name": str, "functionals": {...} | None,
-    # "smooth_significance": {"log_e_nonconstant": float | None} | None}``. The
-    # #1103 ``smooth_significance.log_e_nonconstant`` is the any-n-valid split-LRT
-    # e-value for "the atom's inner decoder smooth is non-constant" (null =
-    # constant), with ``E_{H0}[E] <= 1`` — a large positive ``log_e_nonconstant``
-    # is honest evidence the atom carries structure. Surfaced via
-    # :meth:`atom_inference`. ``None`` only for payloads predating the report.
-    atom_inference_reports: list[dict[str, Any]] | None = None
-    # The unified certificate ledger (#16): ONE coherent block consolidating every
-    # certificate this fit produced under a shared claim+evidence+verdict shape.
-    # ``{"overall": str, "overall_certified": bool, "claims": {claim_id: {"claim":
-    # str, "verdict": str, "certified": bool, "evidence": {...}}}}``. ``verdict``
-    # is on the conservative ladder ``unavailable < insufficient < certified`` —
-    # an absent or below-margin certificate never reads as a pass. The bespoke
-    # ``residual_gauge`` / ``incoherence_report`` keys above remain populated with
-    # the same values for back-compat; this is the additive canonical surface.
-    # ``None`` only for payloads predating the ledger.
-    certificates: dict[str, Any] | None = None
-    # Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
-    # over the structure-search ledger's per-claim e-processes at FDR level α.
-    # JSON string ``{"alpha": float, "entries": [{"kind": ..., "log_e": float,
-    # "steps": int, "confirmed": bool}, ...]}`` serialized by the Rust core.
-    # Surfaced via :meth:`structure_certificate`. ``None`` only for payloads
-    # predating the certificate.
-    structure_certificate_json: str | None = None
-    # Co-trained amortized-encoder diagnostics (#1154), emitted by the Rust
-    # fit payload when the Design-A REML + encoder-consistency fold is active.
-    # Keys: recon_consistency, uncertified_fraction, n_uncertified, n_encodes.
-    cotrain: dict[str, Any] | None = None
-    # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
-    # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
-    # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
-    # supplied to ``sae_manifold_fit(..., fisher_factors=...)``. ``None`` under the
-    # Euclidean (no-shard) path: steering still returns the geometry (delta /
-    # off_manifold_norm) but ``predicted_nats`` / ``validity_radius`` are ``None``
-    # (no behavioral axis to measure the dose through).
-    fisher_factors: np.ndarray | None = None
-    # Which output-Fisher pullback produced ``fisher_factors`` (#980):
-    # ``"output_fisher"`` (same-position, the default) or
-    # ``"output_fisher_downstream"`` (KV-path aggregate over future positions). A
-    # follow-up :meth:`steer` re-installs the matching ``RowMetric`` so the dose
-    # is measured in the same geometry the fit's gauge used.
-    fisher_provenance: str = "output_fisher"
-    # Per-atom curved-vs-linear hybrid-split report (#1202/#1204), the structured
-    # EV-vs-Θ frontier the FFI emits under the payload ``hybrid_split`` key. Keys:
-    # ``curved_atom_count``, ``linear_atom_count``, ``total_negative_log_evidence``,
-    # ``total_parameters``, ``is_pure_linear``, ``is_pure_curved``, and ``atoms``
-    # (one entry per eligible d=1 atom, each ``{"atom": str, "kept_curved": bool,
-    # "parameterization": str, "negative_log_evidence": float, "num_parameters":
-    # int, "curved_evidence_margin": float, "fitted_turning": float | None,
-    # "train_loao_delta_ev": float | None, "curved_ev": float | None,
-    # "topm_linear_ev": float | None, "curved_vs_envelope_ratio": float | None,
-    # "chart_efficiency_eta": float | None}``).
-    # ``topm_linear_ev`` is the one-SVD top-M linear/PCA envelope on the same
-    # atom response data, with M equal to the atom basis size.
-    # ``chart_efficiency_eta = curved_ev / topm_linear_ev`` is the named ceiling
-    # contract field; the older ``curved_vs_envelope_ratio`` key is the same
-    # quantity. Near 1 means the one-chart fit is at its information ceiling,
-    # while much below 1 means convergence headroom. NOTE (#1226): ``train_loao_delta_ev``
-    # is the per-atom IN-SAMPLE leave-one-atom-out ΔEV (computed on the training
-    # matrix during the fit), NOT a held-out generalization number. This is a
-    # common-data curved-vs-linear evidence
-    # comparison (#1202): both candidates fit the atom's response residual, with
-    # the line as the curved family's Θ=0 sub-model. Previously the FFI
-    # emitted this block but the public class dropped it, forcing callers to
-    # monkey-patch ``from_payload`` (see examples/structural_truth_ledger.py);
-    # surfaced here so the (Θ, ΔEV) frontier is queryable per atom off the normal
-    # object. ``None`` when no eligible d=1 atom existed (nothing to adjudicate) or
-    # for payloads predating the report.
-    hybrid_split: dict[str, Any] | None = None
-    # #2132 — the training fit's TERMINAL REML-selected penalized-objective
-    # hyperparameters (``ρ*``), retained so the frozen-decoder OOS encode
-    # (:meth:`_oos_payload`) descends the SAME objective the training state
-    # converged under. ``sparsity_strength`` / ``smoothness`` above are the
-    # INITIAL seeds the outer ρ search started from; feeding those back into the
-    # OOS solve made it optimize a different model, so re-encoding the training
-    # rows collapsed (warm-started at the trained optimum it walked AWAY).
-    # ``None`` (payloads predating the keys) falls back to the initial scalars.
-    selected_log_lambda_sparse: float | None = None
-    selected_log_lambda_smooth: np.ndarray | None = None
-    selected_log_ard: list[np.ndarray] | None = None
-    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if self._lazy_artifact is not None:
-            return
-        values = {
-            "fitted": object.__getattribute__(self, "fitted"),
-            "assignments": object.__getattribute__(self, "assignments"),
-            "coords": object.__getattribute__(self, "coords"),
-            "training_data": object.__getattribute__(self, "training_data"),
-            "low_level_logits": object.__getattribute__(self, "low_level_logits"),
-        }
-        artifact = _SaeLazyFitArtifact(values)
-        object.__setattr__(self, "_lazy_artifact", artifact)
-        for name in _MODEL_LAZY_FIELDS:
-            object.__setattr__(self, name, None)
-        low = object.__getattribute__(self, "low_level")
-        if isinstance(low, SaeManifoldFitResult):
-            object.__setattr__(low, "_lazy_artifact", artifact)
-
-    def __getattribute__(self, name: str) -> Any:
-        return _lazy_getattr(self, _MODEL_LAZY_FIELDS, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        _lazy_setattr(self, _MODEL_LAZY_FIELDS, name, value)
+    def __init__(self, core: Any) -> None:
+        self._core = core
 
     @property
     def chosen_k(self) -> int:
-        """The number of atoms the structure search settled on (#1205).
+        return int(self._core.chosen_k)
 
-        Convenience forwarder to ``self.low_level.chosen_k`` so callers can read
-        the discovered K directly off the high-level model. ``slots=True`` blocks
-        a same-named instance attribute, but a class-level property is fine and
-        always equals ``len(self.atoms)`` for a resolved fit.
-        """
-        return int(self.low_level.chosen_k)
+    @property
+    def atoms(self) -> list[Any]:
+        return list(self._core.atoms)
+
+    @property
+    def fitted(self) -> np.ndarray:
+        return self._core.fitted
+
+    @property
+    def assignments(self) -> np.ndarray:
+        return self._core.assignments
+
+    @property
+    def coords(self) -> list[np.ndarray]:
+        return list(self._core.coords)
 
     @property
     def reml_score(self) -> float | None:
-        """DEPRECATED read alias for :attr:`penalized_loss_score` (#1231).
+        return self._core.reml_score
 
-        The Rust FFI surfaces this value as ``penalized_loss_score`` and
-        documents that it is NOT a REML / marginal-likelihood ("evidence")
-        score but a negative penalized-loss objective. Retained as a read-only
-        alias so existing callers keep working.
-        """
-        return self.penalized_loss_score
+
+class ManifoldSAE:
+    """Fitted SAE-manifold model returned by :func:`sae_manifold_fit` — a thin
+    wrapper over a Rust-owned ``ManifoldSaeCore`` (#2091). ALL fit state (atoms,
+    decoder blocks, coords, assignments, scalar config, report/certificate blocks,
+    Fisher shard, selected ρ*) lives in the core and is read through
+    :meth:`__getattr__`; the only Python-side field is the ``training_data``
+    metadata overlay (the core never retains X). The public method surface
+    (predict/reconstruct/encode/steer/project/…) is unchanged and reads
+    ``self.<field>`` — now resolved off the core.
+    """
+
+    __slots__ = ("_core", "_training_data")
+
+    # Private design-field names whose core getter drops the leading underscore.
+    _CORE_ALIASES: dict[str, str] = {
+        "_basis_kinds": "basis_kinds",
+        "_atom_dims": "atom_dims",
+        "_basis_sizes": "basis_sizes",
+        "_n_harmonics": "n_harmonics",
+        "_duchon_centers": "duchon_centers",
+        "_oos_projection_top1": "oos_projection_top1",
+    }
+
+    # Fields with a Rust setter (attach_fisher / test mutation); all else read-only.
+    _SETTABLE_CORE: frozenset[str] = frozenset(
+        {
+            "fisher_factors",
+            "fisher_mass_residual",
+            "fisher_provenance",
+            "metric_provenance",
+            "oos_projection_top1",
+        }
+    )
+
+    def __init__(self, core: Any, *, training_data: Any = None) -> None:
+        object.__setattr__(self, "_core", core)
+        if training_data is None:
+            # New fits do not retain X: expose a zero-byte handle whose shape/dtype
+            # mirror the fitted array (the legacy lazy-artifact contract).
+            fitted = core.fitted
+            training_data = _SaeTrainingDataHandle(tuple(fitted.shape), fitted.dtype)
+        object.__setattr__(self, "_training_data", training_data)
+
+    # ── state delegation ──────────────────────────────────────────────────────
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup (slots / methods / properties) misses,
+        # i.e. for a STATE field → forward to the core getter.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        core = object.__getattribute__(self, "_core")
+        alias = type(self)._CORE_ALIASES.get(name, name)
+        try:
+            return getattr(core, alias)
+        except AttributeError:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r} "
+                f"(not a ManifoldSaeCore field)"
+            ) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_core", "_training_data"):
+            object.__setattr__(self, name, value)
+            return
+        if name == "training_data":
+            object.__setattr__(self, "_training_data", value)
+            return
+        alias = type(self)._CORE_ALIASES.get(name, name)
+        if alias in type(self)._SETTABLE_CORE:
+            setattr(self._core, alias, value)
+            return
+        raise AttributeError(
+            f"ManifoldSAE.{name} is read-only Rust-owned state (no core setter); "
+            f"settable: {sorted(type(self)._SETTABLE_CORE)} + training_data"
+        )
+
+    # ── Python-side overlay / forwarded properties ────────────────────────────
+    @property
+    def training_data(self) -> Any:
+        return self._training_data
+
+    @property
+    def low_level(self) -> "_LowLevelView":
+        return _LowLevelView(self._core)
+
+    @property
+    def chosen_k(self) -> int:
+        """The number of atoms the structure search settled on (#1205);
+        forwards to the core (== ``len(self.atoms)`` for a resolved fit)."""
+        return int(self._core.chosen_k)
+
+    @property
+    def reml_score(self) -> float | None:
+        """DEPRECATED read alias for :attr:`penalized_loss_score` (#1231)."""
+        return self._core.reml_score
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -941,283 +817,64 @@ class ManifoldSAE:
         )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0, top_k: int | None = None, jumprelu_threshold: float = 0.0) -> "ManifoldSAE":
-        plans = list(payload["atom_plans"])
-        # #977 variable-K boundary contract: the structure search may have GROWN
-        # K (evidence-gated births / fissions) or shrunk routing mass; the Rust
-        # producer re-derives EVERY per-atom field from the post-search dictionary
-        # so each one has length == discovered K. Assert that contract here at the
-        # single ingest point rather than letting a producer drift surface as an
-        # opaque ``plans[atom_idx]`` IndexError (grown K) or a silent truncation
-        # (shrunk lists). ``atom_plans`` is zipped positionally against
-        # ``payload["atoms"]`` below, and ``chosen_k`` / ``assignments_z`` /
-        # ``logits`` must agree on the same K.
-        payload_atoms = list(payload["atoms"])
-        k_discovered = len(payload_atoms)
-        if len(plans) != k_discovered:
-            raise ValueError(
-                "SAE payload is inconsistent at the variable-K boundary: "
-                f"{k_discovered} atoms but {len(plans)} atom_plans; every "
-                "per-atom field must have length == the discovered K"
-            )
-        chosen_k_declared = int(payload["chosen_k"])
-        if chosen_k_declared != k_discovered:
-            raise ValueError(
-                "SAE payload chosen_k does not match the atom count: "
-                f"chosen_k={chosen_k_declared} but {k_discovered} atoms were "
-                "emitted; the discovered K must thread through every field"
-            )
-        for field in ("assignments_z", "logits"):
-            arr = np.asarray(payload[field])
-            if arr.ndim != 2 or arr.shape[1] != k_discovered:
-                raise ValueError(
-                    f"SAE payload '{field}' must be (N, K=={k_discovered}); "
-                    f"got shape {arr.shape}"
-                )
-        def _opt_arr(atom: Mapping[str, Any], key: str) -> np.ndarray | None:
-            value = atom.get(key)
-            return None if value is None else np.asarray(value, dtype=float)
-
-        def _periodic_shape_band(
-            atom: Mapping[str, Any],
-            plan: Mapping[str, Any],
-        ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-            coords = _opt_arr(atom, "shape_band_coords")
-            if coords is None:
-                return None, None, None
-            if coords.ndim != 2 or coords.shape[1] != 1:
-                raise ValueError(
-                    "periodic shape_band_coords must be a 2D array with one "
-                    f"coordinate column; got shape {coords.shape}"
-                )
-            order = np.argsort(coords[:, 0], kind="mergesort")
-            coords = np.ascontiguousarray(coords[order])
-            # The band MEAN is a Rust-owned quantity, exactly like the sd: the
-            # engine's decode applies the atom's amplitude exp(log_amplitude) on
-            # top of Phi(t)·B, and the amplitude never crosses the FFI. The
-            # historical Python recompute (`phi @ decoder`) silently DROPPED
-            # that factor, so the band drew at the wrong radius whenever gauge
-            # canonicalization peeled decoder norm into the amplitude. Read the
-            # payload's amplitude-correct mean, reordered to the sorted
-            # coordinates, and never recompute model math here (SPEC rule 8). An
-            # absent Rust mean means no band: a wrong-radius curve is worse than
-            # an absent diagnostic.
-            mean = _opt_arr(atom, "shape_band_mean")
-            if mean is None:
-                return None, None, None
-            mean = np.asarray(mean, dtype=float)[order]
-            sd = _opt_arr(atom, "shape_band_sd")
-            if sd is not None:
-                sd = np.asarray(sd, dtype=float)[order]
-            return coords, mean, sd
-
-        def _shape_band_arrays(
-            atom: Mapping[str, Any],
-            plan: Mapping[str, Any],
-        ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-            if str(plan["kind"]) == "periodic":
-                return _periodic_shape_band(atom, plan)
-            return (
-                _opt_arr(atom, "shape_band_coords"),
-                _opt_arr(atom, "shape_band_mean"),
-                _opt_arr(atom, "shape_band_sd"),
-            )
-
-        assignments_cache: dict[str, np.ndarray] = {}
-
-        def _assignments_array() -> np.ndarray:
-            cached = assignments_cache.get("value")
-            if cached is None:
-                cached = np.asarray(payload["assignments_z"], dtype=float)
-                assignments_cache["value"] = cached
-            return cached
-
-        atoms: list[SaeManifoldAtomFit] = []
-        for atom_idx, atom in enumerate(payload_atoms):
-            shape_band_coords, shape_band_mean, shape_band_sd = _shape_band_arrays(
-                atom,
-                plans[atom_idx],
-            )
-            functional_evidence = _atom_functional_evidence(atom, plans[atom_idx])
-            atoms.append(SaeManifoldAtomFit(
-                basis=str(atom["basis_kind"]),
-                decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
-                assignments=(
-                    lambda idx=atom_idx: _assignments_array()[:, idx]
-                ),
-                coords=(
-                    lambda atom_payload=atom: np.asarray(
-                        atom_payload["on_atom_coords_t"], dtype=float
-                    )
-                ),
-                evidence=_penalized_loss_score(payload),
-                active_dim=int(atom["active_dim"]),
-                decoder_covariance=_opt_arr(atom, "decoder_covariance"),
-                shape_band_coords=shape_band_coords,
-                shape_band_mean=shape_band_mean,
-                shape_band_sd=shape_band_sd,
-                functional_evidence=functional_evidence,
-                coords_u_arc=_opt_arr(atom, "on_atom_coords_u_arc"),
-            ))
-        fitted = lambda: np.asarray(payload["fitted"], dtype=float)
-        assigns = _assignments_array
-        logits = lambda: np.asarray(payload["logits"], dtype=float)
-        diagnostics = coerce_sae_trust_diagnostics(payload)
-        coords = lambda: [atom.coords for atom in atoms]
-        score = _penalized_loss_score(payload)
-        chosen_k = int(payload["chosen_k"])
-        low = SaeManifoldFitResult(atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score)
-        kinds = [str(p["kind"]) for p in plans]
-        dims = [int(p["latent_dim"]) for p in plans]
-        sizes = [int(p["basis_size"]) for p in plans]
-        nharm = _canonical_n_harmonics(
-            kinds,
-            [int(p["n_harmonics"]) for p in plans],
-            [int(a.decoder_coefficients.shape[0]) for a in atoms],
+    def from_payload(
+        cls,
+        x: np.ndarray,
+        payload: Mapping[str, Any],
+        topology: str,
+        assignment: str,
+        penalties: list[str],
+        alpha: float = 1.0,
+        learnable_alpha: bool = False,
+        *,
+        assignment_label: str | None = None,
+        tau: float = 0.5,
+        sparsity_strength: float = 1.0,
+        smoothness: float = 1.0,
+        learning_rate: float = 0.04,
+        max_iter: int = 50,
+        random_state: int = 0,
+        top_k: int | None = None,
+        jumprelu_threshold: float = 0.0,
+        fisher_factors: np.ndarray | None = None,
+        fisher_provenance: str | None = None,
+        declared_bases: list[str] | None = None,
+    ) -> "ManifoldSAE":
+        """Build the Rust-owned core from the RAW ``sae_manifold_fit_minimal``
+        payload and wrap it. ``sae_manifold_core_from_fit_payload`` reproduces the
+        legacy ``from_payload ∘ to_dict`` bit-for-bit AND folds in the post-fit
+        Fisher attach (``fisher_factors``/``fisher_provenance``) and the
+        ``linear_block`` relabel (``declared_bases``), so those are builder args
+        rather than post-construction mutations."""
+        canonical_assignment = _canonical_assignment(assignment, "assignment")
+        raw_json = json.dumps(_jsonable_value(dict(payload)))
+        core = rust_module().sae_manifold_core_from_fit_payload(
+            raw_json,
+            np.ascontiguousarray(np.asarray(x, dtype=np.float64)),
+            str(topology),
+            canonical_assignment,
+            str(assignment if assignment_label is None else assignment_label),
+            list(penalties),
+            float(alpha),
+            bool(learnable_alpha),
+            float(tau),
+            float(sparsity_strength),
+            float(smoothness),
+            float(learning_rate),
+            int(max_iter),
+            int(random_state),
+            top_k,
+            float(jumprelu_threshold),
+            fisher_factors=(
+                None
+                if fisher_factors is None
+                else np.ascontiguousarray(np.asarray(fisher_factors, dtype=np.float64))
+            ),
+            fisher_provenance=fisher_provenance,
+            declared_bases=None if declared_bases is None else list(declared_bases),
         )
-        centers: list[np.ndarray | None] = [
-            None if p["duchon_centers"] is None else np.asarray(p["duchon_centers"], dtype=float)
-            for p in plans
-        ]
-        canonical = _canonical_assignment(assignment, "assignment")
-        # #977 variable-K: the scalar ``atom_topology`` MUST be derived from the
-        # POST-search ``kinds`` (the discovered dictionary), not the seed
-        # ``topology`` argument. A fit that seeds an all-``periodic`` dictionary
-        # but grows a heterogeneous one via evidence-gated births would otherwise
-        # report the stale seed scalar (e.g. ``"circle"``) while
-        # ``atom_topologies`` already reflects the heterogeneous truth — the
-        # honest scalar collapses to ``"mixed"`` exactly when the per-atom
-        # topologies disagree. ``basis_specs`` (== ``kinds``) remains the per-atom
-        # source of truth either way; the seed ``topology`` arg is only a fallback
-        # for an empty dictionary.
-        atom_topologies = _topologies_for_bases(kinds)
-        scalar_topology = _topology_for_bases(kinds) if kinds else str(topology)
-        atom_inference_reports = _coerce_atom_inference(payload.get("atom_inference"))
-        cotrain = _coerce_cotrain_report(payload.get("cotrain"))
-        return cls(
-            atoms=atoms, atom_topology=scalar_topology,
-            atom_topologies=atom_topologies,
-            assignment=canonical,
-            assignment_label=str(assignment if assignment_label is None else assignment_label),
-            primitive_names=["rust_module.sae_manifold_fit_minimal", *penalties],
-            fitted=fitted, assignments=assigns, coords=coords,
-            decoder_blocks=[a.decoder_coefficients.copy() for a in atoms],
-            basis_specs=kinds, penalized_loss_score=score,
-            reconstruction_r2=float(payload["reconstruction_r2"]),
-            training_mean=x.mean(axis=0), training_data=_training_data_handle(x), low_level=low,
-            low_level_logits=logits,
-            diagnostics=diagnostics,
-            _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
-            _n_harmonics=nharm, _duchon_centers=centers,
-            _oos_projection_top1=bool(payload["oos_projection_top1"]),
-            alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
-            tau=float(tau), sparsity_strength=float(sparsity_strength),
-            smoothness=float(smoothness), learning_rate=float(learning_rate),
-            max_iter=int(max_iter), random_state=int(random_state),
-            top_k=None if top_k is None else int(top_k),
-            top_k_projection=(
-                None
-                if payload.get("top_k_projection") is None
-                else dict(payload["top_k_projection"])
-            ),
-            pre_topk=(
-                None
-                if payload.get("pre_topk") is None
-                else dict(payload["pre_topk"])
-            ),
-            jumprelu_threshold=float(jumprelu_threshold),
-            solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
-            termination=(
-                None
-                if payload.get("termination") is None
-                else dict(payload["termination"])
-            ),
-            dispersion=float(payload["dispersion"]),
-            # WP-D → fit wiring (#980): surface the metric provenance and the
-            # per-row truncation diagnostic the Rust fit reports. Absent ⇒ the
-            # Euclidean default (no output-Fisher shard was installed).
-            metric_provenance=str(payload.get("metric_provenance", "Euclidean")),
-            fisher_mass_residual=(
-                None
-                if payload.get("fisher_mass_residual") is None
-                else np.asarray(payload["fisher_mass_residual"], dtype=float)
-            ),
-            structured_residual_diagnostics=[
-                dict(item) for item in payload.get("structured_residual_diagnostics", [])
-            ],
-            # Additive post-fit diagnostics: the two-score per-atom lens,
-            # residual-gauge certificate, and empirical incoherence inputs.
-            # Absent ⇒ ``None`` (payloads predating each diagnostic); present
-            # ⇒ the Rust report dict verbatim.
-            atom_two_lens=(
-                None
-                if payload.get("atom_two_lens") is None
-                else dict(payload["atom_two_lens"])
-            ),
-            residual_gauge=(
-                None
-                if payload.get("residual_gauge") is None
-                else dict(payload["residual_gauge"])
-            ),
-            incoherence_report=(
-                None
-                if payload.get("incoherence_report") is None
-                else dict(payload["incoherence_report"])
-            ),
-            curvature_report=(
-                None
-                if payload.get("curvature_report") is None
-                else dict(payload["curvature_report"])
-            ),
-            coordinate_fidelity=(
-                None
-                if payload.get("coordinate_fidelity") is None
-                else dict(payload["coordinate_fidelity"])
-            ),
-            topology_persistence=(
-                None
-                if payload.get("topology_persistence") is None
-                else dict(payload["topology_persistence"])
-            ),
-            atom_inference_reports=atom_inference_reports,
-            certificates=(
-                None
-                if payload.get("certificates") is None
-                else dict(payload["certificates"])
-            ),
-            structure_certificate_json=(
-                None
-                if payload.get("structure_certificate") is None
-                else str(payload["structure_certificate"])
-            ),
-            cotrain=cotrain,
-            # #1204: the per-atom curved-vs-linear hybrid-split frontier the FFI
-            # emits under ``hybrid_split``. Read it through verbatim so callers can
-            # query the (Θ, ΔEV) frontier off the public object rather than
-            # monkey-patching this method. ``None`` when the FFI emitted no report.
-            hybrid_split=(
-                None
-                if payload.get("hybrid_split") is None
-                else dict(payload["hybrid_split"])
-            ),
-            # #2132 — retain the terminal REML-selected ρ* so OOS encode
-            # optimizes the SAME penalized objective the fit converged under.
-            selected_log_lambda_sparse=(
-                None
-                if payload.get("log_lambda_sparse") is None
-                else float(payload["log_lambda_sparse"])
-            ),
-            selected_log_lambda_smooth=(
-                None
-                if payload.get("log_lambda_smooth") is None
-                else np.asarray(payload["log_lambda_smooth"], dtype=float)
-            ),
-            selected_log_ard=(
-                None
-                if payload.get("log_ard") is None
-                else [np.asarray(a, dtype=float) for a in payload["log_ard"]]
-            ),
-        )
+        # New fits do not retain X: overlay a zero-byte handle mirroring the input.
+        return cls(core, training_data=_training_data_handle(np.asarray(x)))
 
     def structure_certificate(self, *, alpha: float | None = None) -> dict[str, Any]:
         """Anytime-valid structure-discovery certificate (#1058 / #984).
@@ -1980,41 +1637,17 @@ class ManifoldSAE:
         that never installed a Fisher metric) lacks the arrays; such a model
         steers geometry-only with ``predicted_nats`` / ``validity_radius`` ``None``.
         """
+        # #2091 acceptance: the steering plan is computed by the Rust-owned core
+        # off its OWN state — zero per-call re-marshalling of ``fisher_factors``
+        # (or decoder blocks / coords / logits) across the FFI boundary. Only the
+        # resolved atom index and the two endpoints cross. ``ManifoldSaeCore.steer``
+        # is a bitwise mirror of the former Python path (guarded by
+        # tests/test_manifold_sae_pyclass_steer_equiv.py); the per-kind
+        # ``n_harmonics`` gate + provenance threading live in the core.
         k = self._atom_index(atom_k)
         t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))
         t_to_arr = np.ascontiguousarray(np.asarray(t_to, dtype=np.float64).reshape(-1))
-        kind = _canonical_assignment(self.assignment, "assignment")
-        n_obs, p_out = (int(self.fitted.shape[0]), int(self.fitted.shape[1]))
-        fisher = None if self.fisher_factors is None else np.ascontiguousarray(
-            np.asarray(self.fisher_factors, dtype=np.float64)
-        )
-        plan = rust_module().sae_steer_delta(
-            int(k),
-            t_from_arr,
-            t_to_arr,
-            n_obs,
-            p_out,
-            list(self._basis_kinds),
-            list(self._atom_dims),
-            [np.ascontiguousarray(b) for b in self.decoder_blocks],
-            [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
-            [
-                (int(h) if bk in {"periodic", "torus"} else None)
-                for bk, h in zip(self._basis_kinds, self._n_harmonics)
-            ],
-            [int(s) for s in self._basis_sizes],
-            [np.ascontiguousarray(c) for c in self.coords],
-            np.ascontiguousarray(np.asarray(self.low_level_logits, dtype=np.float64)),
-            str(kind),
-            float(self.tau),
-            alpha=float(self.alpha),
-            jumprelu_threshold=float(self.jumprelu_threshold),
-            fisher_factors=fisher,
-            fisher_provenance=(
-                None if self.fisher_factors is None else str(self.fisher_provenance)
-            ),
-        )
-        return dict(plan)
+        return dict(self._core.steer(int(k), t_from_arr, t_to_arr))
 
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
         """Per-token active atom set ``(N, K)`` boolean mask for ``X``.
@@ -2164,387 +1797,36 @@ class ManifoldSAE:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        """Round-trippable JSON-compatible serialization of this fit.
+        """Round-trippable v1 JSON-compatible serialization — the core owns the
+        schema (``reml_score`` write-alias, ``structured_residual_diagnostics``
+        write-drop, channel-cov-factor compaction all live in Rust serde now)."""
+        return dict(self._core.to_dict())
 
-        The dict can be passed to :meth:`ManifoldSAE.from_dict` (or written to
-        disk via :meth:`save` / :func:`gamfit.save`) to recover an object that
-        reproduces :meth:`predict` outputs bit-exactly on training data.
-
-        Fisher steering state (``fisher_factors``, ``fisher_provenance``,
-        ``metric_provenance``, ``fisher_mass_residual``) IS now round-tripped, so
-        a model recovered from this dict reproduces :meth:`steer`'s output
-        dosimetry (``predicted_nats`` / ``validity_radius``) — not just the
-        geometry-only fallback. For very large ``(N, p, r)`` Fisher shards the
-        inline arrays dominate the JSON size; a future optimisation could move
-        them to a sidecar, but correctness (no dropped state) takes priority here.
-        The posterior shape-band uncertainty arrays are likewise carried when
-        present on a freshly-fit model.
-        """
-        def _optional_list(value: np.ndarray | None) -> Any:
-            return None if value is None else value.tolist()
-
-        def _jsonable(value: Any) -> Any:
-            if isinstance(value, np.ndarray):
-                return value.tolist()
-            if isinstance(value, dict):
-                return {str(k): _jsonable(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [_jsonable(v) for v in value]
-            return value
-
-        return {
-            "schema": "gamfit.ManifoldSAE/v1",
-            "atom_topology": self.atom_topology,
-            "atom_topologies": list(self.atom_topologies),
-            "assignment": self.assignment,
-            "assignment_label": self.assignment_label,
-            "alpha": float(self.alpha),
-            "learnable_alpha": bool(self.learnable_alpha),
-            "tau": float(self.tau),
-            "sparsity_strength": float(self.sparsity_strength),
-            "smoothness": float(self.smoothness),
-            "learning_rate": float(self.learning_rate),
-            "max_iter": int(self.max_iter),
-            "random_state": int(self.random_state),
-            "top_k": self.top_k,
-            "top_k_projection": (
-                None if self.top_k_projection is None else _jsonable(self.top_k_projection)
-            ),
-            "pre_topk": None if self.pre_topk is None else _jsonable(self.pre_topk),
-            "jumprelu_threshold": float(self.jumprelu_threshold),
-            "oos_projection_top1": bool(self._oos_projection_top1),
-            "dispersion": float(self.dispersion),
-            "solver_plan": None if self.solver_plan is None else _jsonable(self.solver_plan),
-            "primitive_names": list(self.primitive_names),
-            "basis_specs": list(self.basis_specs),
-            # #1231: primary key is the honest penalized-loss score; "reml_score"
-            # is a deprecated alias retained for old loaders. ``None`` for
-            # closed-form shortcut payloads that do not compute it.
-            "penalized_loss_score": (
-                None if self.penalized_loss_score is None else float(self.penalized_loss_score)
-            ),
-            "reml_score": (
-                None if self.penalized_loss_score is None else float(self.penalized_loss_score)
-            ),
-            "reconstruction_r2": float(self.reconstruction_r2),
-            "training_mean": self.training_mean.tolist(),
-            "training_data": None,
-            "training_data_retained": False,
-            "fitted": self.fitted.tolist(),
-            "assignments": self.assignments.tolist(),
-            "logits": self.low_level_logits.tolist(),
-            "diagnostics": {
-                "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
-                "atoms": [dict(atom) for atom in self.diagnostics["atoms"]],
-            },
-            "coords": [c.tolist() for c in self.coords],
-            "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
-            "atoms": [
-                {
-                    "basis": a.basis,
-                    "decoder_coefficients": a.decoder_coefficients.tolist(),
-                    "assignments": a.assignments.tolist(),
-                    "coords": a.coords.tolist(),
-                    "coords_u_arc": _optional_list(a.coords_u_arc),
-                    "evidence": None if a.evidence is None else float(a.evidence),
-                    "active_dim": int(a.active_dim),
-                    # Objective-2 (band survives save/load): serialize the COMPACT
-                    # per-atom, per-channel covariance factor the shape band
-                    # actually consumes — the `(p, M_k, M_k)` same-channel Schur
-                    # blocks `Cov[(·,c),(·,c)]` — NOT the dense `(M_k·p)²` joint
-                    # covariance (gigabytes per atom at LLM-scale `p`, and the
-                    # cross-channel entries no band ever reads). `load()`
-                    # reconstructs the full-shape block-diagonal covariance from
-                    # this factor, reproducing the band to machine precision.
-                    "decoder_covariance_channel_factors": _channel_cov_factors(
-                        a.decoder_covariance, a.decoder_coefficients.shape[0]
-                    ),
-                    "shape_band_coords": _optional_list(a.shape_band_coords),
-                    "shape_band_mean": _optional_list(a.shape_band_mean),
-                    "shape_band_sd": _optional_list(a.shape_band_sd),
-                    "functional_evidence": _json_ready(a.functional_evidence),
-                }
-                for a in self.atoms
-            ],
-            "basis_kinds": list(self._basis_kinds),
-            "atom_dims": list(self._atom_dims),
-            "basis_sizes": list(self._basis_sizes),
-            "n_harmonics": list(self._n_harmonics),
-            "duchon_centers": [None if c is None else c.tolist() for c in self._duchon_centers],
-            "atom_two_lens": None if self.atom_two_lens is None else _jsonable(self.atom_two_lens),
-            "residual_gauge": None if self.residual_gauge is None else _jsonable(self.residual_gauge),
-            "incoherence_report": (
-                None if self.incoherence_report is None else _jsonable(self.incoherence_report)
-            ),
-            "curvature_report": (
-                None if self.curvature_report is None else _jsonable(self.curvature_report)
-            ),
-            "coordinate_fidelity": (
-                None
-                if self.coordinate_fidelity is None
-                else _jsonable(self.coordinate_fidelity)
-            ),
-            "topology_persistence": (
-                None
-                if self.topology_persistence is None
-                else _jsonable(self.topology_persistence)
-            ),
-            "atom_inference": (
-                None
-                if self.atom_inference_reports is None
-                else _jsonable(self.atom_inference_reports)
-            ),
-            "certificates": (
-                None if self.certificates is None else _jsonable(self.certificates)
-            ),
-            "structure_certificate": self.structure_certificate_json,
-            "cotrain": None if self.cotrain is None else _jsonable(self.cotrain),
-            "hybrid_split": None if self.hybrid_split is None else _jsonable(self.hybrid_split),
-            # Fisher steering state — round-tripped so a loaded model keeps its
-            # output-Fisher dosimetry (predicted_nats / validity_radius). Written
-            # as None when the fit was Euclidean (no shard).
-            "fisher_factors": _optional_list(self.fisher_factors),
-            "fisher_provenance": (
-                None if self.fisher_factors is None else str(self.fisher_provenance)
-            ),
-            "metric_provenance": str(self.metric_provenance),
-            "fisher_mass_residual": _optional_list(self.fisher_mass_residual),
-            # #2132 — terminal REML-selected ρ*, round-tripped so a reloaded
-            # model's OOS encode optimizes the SAME objective the fit selected.
-            "selected_log_lambda_sparse": (
-                None
-                if self.selected_log_lambda_sparse is None
-                else float(self.selected_log_lambda_sparse)
-            ),
-            "selected_log_lambda_smooth": _optional_list(self.selected_log_lambda_smooth),
-            "selected_log_ard": (
-                None
-                if self.selected_log_ard is None
-                else [np.asarray(a, dtype=float).ravel().tolist() for a in self.selected_log_ard]
-            ),
-        }
+    def to_json(self) -> str:
+        return self._core.to_json()
 
     def save(self, path: str | Path) -> None:
-        """Write this fit to ``path`` as JSON. Round-trips via :func:`gamfit.load`.
-
-        Fisher steering state is persisted, so a reloaded model reproduces
-        :meth:`steer`'s output dosimetry (see :meth:`to_dict`).
-        """
-        Path(path).write_text(json.dumps(self.to_dict()))
+        """Write this fit to ``path`` as the canonical JSON payload the core emits."""
+        Path(path).write_text(self._core.to_json())
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ManifoldSAE":
-        """Reconstruct a :class:`ManifoldSAE` from a :meth:`to_dict` payload.
-
-        The recovered model reproduces :meth:`predict` on training data
-        bit-exactly, AND now restores Fisher steering state (``fisher_factors`` /
-        ``fisher_provenance`` / ``metric_provenance`` / ``fisher_mass_residual``)
-        so :meth:`steer` reproduces its output dosimetry. (Legacy dicts written
-        before Fisher round-tripping simply lack those keys and load with
-        ``fisher_factors=None`` — the old geometry-only behaviour, where
-        ``predicted_nats`` / ``validity_radius`` are ``None``.)
-        """
-        schema = str(payload["schema"])
-        if schema != "gamfit.ManifoldSAE/v1":
-            raise ValueError(f"ManifoldSAE.from_dict: unsupported schema {schema!r}")
-        def _optional_array(atom_payload: Mapping[str, Any], key: str) -> np.ndarray | None:
-            value = atom_payload.get(key)
-            return None if value is None else np.asarray(value, dtype=float)
-
-        atoms = [
-            SaeManifoldAtomFit(
-                basis=str(a["basis"]),
-                decoder_coefficients=np.asarray(a["decoder_coefficients"], dtype=float),
-                assignments=np.asarray(a["assignments"], dtype=float),
-                coords=np.asarray(a["coords"], dtype=float),
-                evidence=None if a.get("evidence") is None else float(a["evidence"]),
-                active_dim=int(a["active_dim"]),
-                # Reconstruct the full-shape `(M_k·p, M_k·p)` decoder covariance
-                # from the compact per-channel factor written by `to_dict`. It is
-                # block-diagonal across channels (the cross-channel entries the
-                # band never reads are not stored), so it reproduces the shape
-                # band `Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]` exactly.
-                decoder_covariance=_channel_cov_from_factors(
-                    a.get("decoder_covariance_channel_factors")
-                ),
-                shape_band_coords=_optional_array(a, "shape_band_coords"),
-                shape_band_mean=_optional_array(a, "shape_band_mean"),
-                shape_band_sd=_optional_array(a, "shape_band_sd"),
-                functional_evidence=(
-                    None
-                    if a.get("functional_evidence") is None
-                    else dict(a["functional_evidence"])
-                ),
-                coords_u_arc=_optional_array(a, "coords_u_arc"),
-            )
-            for a in payload["atoms"]
-        ]
+        """Reconstruct from a :meth:`to_dict` payload. The core's ``#[new]``
+        validates the ``gamfit.ManifoldSAE/v1`` schema tag and parses through
+        ``ManifoldSaePayload::from_json`` (the same NaN→reject, ``reml_score``
+        fallback, channel-cov reconstruction, and n_harmonics canonicalization the
+        legacy reader had — now owned by the core)."""
+        core = rust_module().ManifoldSaeCore(dict(payload))
+        # training_data: the payload always writes null (new fits do not retain X);
+        # mirror the legacy from_dict, which built a handle from the fitted shape.
         fitted = np.asarray(payload["fitted"], dtype=float)
-        assigns = np.asarray(payload["assignments"], dtype=float)
-        logits = np.asarray(payload["logits"], dtype=float)
-        diagnostics = coerce_sae_trust_diagnostics(payload)
-        coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
-        decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
-        training_raw = payload.get("training_data")
+        raw_td = payload.get("training_data")
         training_data = (
             _SaeTrainingDataHandle(tuple(fitted.shape), fitted.dtype)
-            if training_raw is None
-            else np.asarray(training_raw, dtype=float)
+            if raw_td is None
+            else np.asarray(raw_td, dtype=float)
         )
-        # #1231: accept the new primary key, fall back to the deprecated
-        # "reml_score" alias for dicts written by older versions. ``None`` is a
-        # valid value (closed-form shortcut payloads).
-        raw_score = payload.get("penalized_loss_score", payload.get("reml_score"))
-        score = None if raw_score is None else float(raw_score)
-        chosen_k = len(atoms)
-        low = SaeManifoldFitResult(
-            atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score,
-        )
-        centers: list[np.ndarray | None] = [
-            None if c is None else np.asarray(c, dtype=float) for c in payload["duchon_centers"]
-        ]
-        raw_assignment = str(payload["assignment"])
-        canonical_assignment = _canonical_assignment(raw_assignment, "assignment")
-        return cls(
-            atoms=atoms,
-            atom_topology=str(payload["atom_topology"]),
-            atom_topologies=list(payload["atom_topologies"]),
-            assignment=canonical_assignment,
-            assignment_label=str(payload["assignment_label"]),
-            primitive_names=list(payload["primitive_names"]),
-            fitted=fitted,
-            assignments=assigns,
-            coords=coords,
-            decoder_blocks=decoder_blocks,
-            basis_specs=list(payload["basis_specs"]),
-            penalized_loss_score=score,
-            reconstruction_r2=float(payload["reconstruction_r2"]),
-            training_mean=np.asarray(payload["training_mean"], dtype=float),
-            training_data=training_data,
-            low_level=low,
-            low_level_logits=logits,
-            diagnostics=diagnostics,
-            _basis_kinds=list(payload["basis_kinds"]),
-            _atom_dims=[int(d) for d in payload["atom_dims"]],
-            _basis_sizes=[int(s) for s in payload["basis_sizes"]],
-            # N: canonicalize stale/degenerate periodic n_harmonics on load too,
-            # so a round-tripped model's OOS reconstruct + steer use the recovered
-            # value rather than a raw 0/stale plan value.
-            _n_harmonics=_canonical_n_harmonics(
-                list(payload["basis_kinds"]),
-                [int(h) for h in payload["n_harmonics"]],
-                [int(b.shape[0]) for b in decoder_blocks],
-            ),
-            _duchon_centers=centers,
-            alpha=float(payload["alpha"]),
-            learnable_alpha=bool(payload["learnable_alpha"]),
-            tau=float(payload["tau"]),
-            sparsity_strength=float(payload["sparsity_strength"]),
-            smoothness=float(payload["smoothness"]),
-            learning_rate=float(payload["learning_rate"]),
-            max_iter=int(payload["max_iter"]),
-            random_state=int(payload["random_state"]),
-            top_k=None if payload["top_k"] is None else int(payload["top_k"]),
-            top_k_projection=(
-                None
-                if payload.get("top_k_projection") is None
-                else dict(payload["top_k_projection"])
-            ),
-            pre_topk=(
-                None
-                if payload.get("pre_topk") is None
-                else dict(payload["pre_topk"])
-            ),
-            jumprelu_threshold=float(payload["jumprelu_threshold"]),
-            solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
-            _oos_projection_top1=bool(payload["oos_projection_top1"]),
-            dispersion=float(payload["dispersion"]),
-            atom_two_lens=(
-                None if payload.get("atom_two_lens") is None else dict(payload["atom_two_lens"])
-            ),
-            residual_gauge=(
-                None if payload.get("residual_gauge") is None else dict(payload["residual_gauge"])
-            ),
-            incoherence_report=(
-                None
-                if payload.get("incoherence_report") is None
-                else dict(payload["incoherence_report"])
-            ),
-            curvature_report=(
-                None
-                if payload.get("curvature_report") is None
-                else dict(payload["curvature_report"])
-            ),
-            coordinate_fidelity=(
-                None
-                if payload.get("coordinate_fidelity") is None
-                else dict(payload["coordinate_fidelity"])
-            ),
-            topology_persistence=(
-                None
-                if payload.get("topology_persistence") is None
-                else dict(payload["topology_persistence"])
-            ),
-            atom_inference_reports=_coerce_atom_inference(payload.get("atom_inference")),
-            # F: round-trip the unified certificate ledger. to_dict() writes it,
-            # so from_dict() must restore it (previously dropped on load).
-            certificates=(
-                None
-                if payload.get("certificates") is None
-                else dict(payload["certificates"])
-            ),
-            structure_certificate_json=(
-                None
-                if payload.get("structure_certificate") is None
-                else str(payload["structure_certificate"])
-            ),
-            cotrain=_coerce_cotrain_report(payload.get("cotrain")),
-            # #1204: round-trip the hybrid-split frontier through save/load.
-            hybrid_split=(
-                None
-                if payload.get("hybrid_split") is None
-                else dict(payload["hybrid_split"])
-            ),
-            # Round-trip Fisher steering state (previously dropped on load, which
-            # silently downgraded a loaded model's steer() to geometry-only).
-            fisher_factors=(
-                None
-                if payload.get("fisher_factors") is None
-                else np.ascontiguousarray(np.asarray(payload["fisher_factors"], dtype=float))
-            ),
-            fisher_provenance=(
-                None
-                if payload.get("fisher_provenance") is None
-                else str(payload["fisher_provenance"])
-            ),
-            metric_provenance=str(payload.get("metric_provenance", "Euclidean")),
-            fisher_mass_residual=(
-                None
-                if payload.get("fisher_mass_residual") is None
-                else np.asarray(payload["fisher_mass_residual"], dtype=float)
-            ),
-            structured_residual_diagnostics=[
-                dict(item) for item in payload.get("structured_residual_diagnostics", [])
-            ],
-            # #2132 — restore the terminal REML-selected ρ* so a loaded model's
-            # OOS encode optimizes the SAME objective the fit selected. Legacy
-            # dicts lack these keys and load with the initial-scalar fallback.
-            selected_log_lambda_sparse=(
-                None
-                if payload.get("selected_log_lambda_sparse") is None
-                else float(payload["selected_log_lambda_sparse"])
-            ),
-            selected_log_lambda_smooth=(
-                None
-                if payload.get("selected_log_lambda_smooth") is None
-                else np.asarray(payload["selected_log_lambda_smooth"], dtype=float)
-            ),
-            selected_log_ard=(
-                None
-                if payload.get("selected_log_ard") is None
-                else [np.asarray(a, dtype=float) for a in payload["selected_log_ard"]]
-            ),
-        )
+        return cls(core, training_data=training_data)
 
     @classmethod
     def load(cls, path: str | Path) -> "ManifoldSAE":
@@ -3291,6 +2573,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         run_outer_rho_search=bool(_run_outer_rho_search),
     )
     payload_dict = dict(payload)
+    # #2091 — ONE builder call returns the Rust-owned ManifoldSAE facade. The
+    # post-fit Fisher attach (fisher_shard) and the linear_block relabel (bases)
+    # are threaded into the Rust builder as `fisher_factors=`/`fisher_provenance=`
+    # and `declared_bases=`, replacing the old post-construction mutations +
+    # `_preserve_linear_block_labels`.
     model = ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, kind, penalties,
         assignment_label=str(assignment),
@@ -3299,17 +2586,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         learning_rate=float(effective_lr), max_iter=int(max_iter_total),
         random_state=int(random_state), top_k=top_k_arg,
         jumprelu_threshold=float(jumprelu_threshold),
+        fisher_factors=None if fisher_shard is None else np.ascontiguousarray(fisher_shard[0]),
+        fisher_provenance=None if fisher_shard is None else fisher_shard[2],
+        declared_bases=list(bases),
     )
-    # Retain the WP-D shard's (n, p, r) U so a follow-up `model.steer(...)` can
-    # re-install `RowMetric::OutputFisher` and report the KL dose (#980). Under the
-    # Euclidean (no-shard) path this stays None and steering is geometry-only.
-    if fisher_shard is not None:
-        model.fisher_factors = np.ascontiguousarray(fisher_shard[0])
-        model.fisher_provenance = fisher_shard[2]
-    # #BSF — keep the "linear_block" label on a flat-block fit (from_payload reports
-    # the generic fitted "linear"); so an artifact fitted as linear_block reloads as
-    # linear_block. No-op unless the caller requested linear_block atoms.
-    model = _preserve_linear_block_labels(model, bases)
     return model
 
 
@@ -3505,64 +2785,28 @@ class StagewiseSAE:
             )
         )
         assignment = _canonical_assignment(self.assignment, "assignment")
-        fit_atoms = [
-            SaeManifoldAtomFit(
-                basis=basis_kinds[k],
-                decoder_coefficients=decoder_blocks[k],
-                assignments=np.ascontiguousarray(assignments[:, k].copy()),
-                coords=coords[k],
-                evidence=None,
-                active_dim=int(atom_dims[k]),
-            )
-            for k in range(len(self.atoms))
-        ]
-        k_atoms = len(self.atoms)
-        low = SaeManifoldFitResult(
-            fit_atoms,
-            k_atoms,
-            {k_atoms: float("nan")},
-            {"winner": f"K={k_atoms}"},
-            fitted,
-            assignments,
-            [c.copy() for c in coords],
-            float("nan"),
-        )
-        return ManifoldSAE(
-            atoms=fit_atoms,
+        v1_dict = _stagewise_to_manifold_sae_dict(
+            basis_kinds=basis_kinds,
+            decoder_blocks=decoder_blocks,
+            atom_dims=atom_dims,
+            basis_sizes=basis_sizes,
+            n_harmonics=list(n_harmonics),
+            coords=[c.copy() for c in coords],
+            assignments=assignments,
+            fitted=fitted,
+            logits=np.ascontiguousarray(np.asarray(self.logits, dtype=np.float64)),
+            training=training,
+            assignment=assignment,
+            reconstruction_r2=self.reconstruction_ev(),
+            seed=seed,
             atom_topology=_topology_for_bases(basis_kinds),
             atom_topologies=_topologies_for_bases(basis_kinds),
-            assignment=assignment,
-            assignment_label=str(self.assignment),
-            primitive_names=["sae_manifold_fit_stagewise"],
-            fitted=fitted,
-            assignments=assignments,
-            coords=[c.copy() for c in coords],
-            decoder_blocks=decoder_blocks,
-            basis_specs=list(basis_kinds),
-            penalized_loss_score=None,
-            reconstruction_r2=self.reconstruction_ev(),
-            training_mean=training.mean(axis=0),
-            training_data=training,
-            low_level=low,
-            low_level_logits=np.ascontiguousarray(np.asarray(self.logits, dtype=np.float64)),
-            diagnostics={},
-            _basis_kinds=list(basis_kinds),
-            _atom_dims=atom_dims,
-            _basis_sizes=basis_sizes,
-            _n_harmonics=list(n_harmonics),
-            _duchon_centers=centers,
-            _oos_projection_top1=False,
-            alpha=float(seed.alpha),
-            learnable_alpha=bool(seed.learnable_alpha),
-            tau=float(seed.tau),
-            sparsity_strength=float(seed.sparsity_strength),
-            smoothness=float(seed.smoothness),
-            learning_rate=float(seed.learning_rate),
-            max_iter=int(seed.max_iter),
-            random_state=int(seed.random_state),
-            top_k=None,
-            jumprelu_threshold=float(seed.jumprelu_threshold),
         )
+        core = rust_module().ManifoldSaeCore(v1_dict)
+        # SAC retains the training matrix so `reconstruct(X=training)` returns the
+        # composed in-sample reconstruction bit-for-bit (the core's to_dict still
+        # nulls training_data, matching the legacy dataclass serialization).
+        return ManifoldSAE(core, training_data=training)
 
     def reconstruct(
         self, X: Any = None, *, t_init: Any = None, a_init: Any = None
@@ -4428,34 +3672,111 @@ def flat_block_assignment(gating: str) -> str:
     return _FLAT_BLOCK_GATING_TO_ASSIGNMENT[key]
 
 
-def _preserve_linear_block_labels(model: "ManifoldSAE", bases: list[str]) -> "ManifoldSAE":
-    """Round-trip fidelity for ``atom_topology="linear_block"``.
-
-    ``from_payload`` derives each atom's topology from the FITTED Rust kind, which
-    is the generic ``"linear"`` for a flat block (``linear_block`` maps to
-    ``SaeAtomBasisKind::Linear``). When the fit did NOT restructure the dictionary
-    (atom count unchanged), restore the ``"linear_block"`` label for the atoms the
-    caller declared as such AND that the fit left as plain ``"linear"`` — so an
-    artifact fitted as linear_block reloads as linear_block, not linear. Positions
-    the fit RETYPED (evidence-gated structure search) keep their discovered
-    topology. A first-class ``LinearBlock`` enum variant would make this automatic;
-    it was deferred (see the ``sae_atom_basis_kind_from_str`` doc-comment).
-    """
-    if not bases or len(bases) != len(model.atom_topologies):
-        return model
-    want = [_canon_name(b) in ("linear_block", "flat_block") for b in bases]
-    if not any(want):
-        return model
-    topos = list(model.atom_topologies)
-    kinds = list(model._basis_kinds)
-    for i, is_block in enumerate(want):
-        if is_block and _canon_name(topos[i]) == "linear":
-            topos[i] = "linear_block"
-            kinds[i] = "linear_block"
-    model.atom_topologies = topos
-    model._basis_kinds = kinds
-    model.atom_topology = _topology_for_bases(kinds) if kinds else model.atom_topology
-    return model
+def _stagewise_to_manifold_sae_dict(
+    *,
+    basis_kinds: list[str],
+    decoder_blocks: list[np.ndarray],
+    atom_dims: list[int],
+    basis_sizes: list[int],
+    n_harmonics: list[int],
+    coords: list[np.ndarray],
+    assignments: np.ndarray,
+    fitted: np.ndarray,
+    logits: np.ndarray,
+    training: np.ndarray,
+    assignment: str,
+    reconstruction_r2: float,
+    seed: Any,
+    atom_topology: str,
+    atom_topologies: list[str],
+) -> dict[str, Any]:
+    """Assemble a v1 ``to_dict``-schema payload for ``StagewiseSAE.to_manifold_sae``
+    (#2091). The SAC lift no longer constructs ``ManifoldSAE(...)`` with dataclass
+    kwargs; it builds this dict and loads it through the Rust core, so the core owns
+    the state exactly like every other route. Per-atom entries carry the minimal SAC
+    fields (no shape bands / covariance — SAC lifts a frozen dictionary). The
+    centering-mean reduction is computed in Rust (the shared ``column_mean`` core,
+    identical to the fit builder); this is pure marshaling of the result."""
+    atoms_payload: list[dict[str, Any]] = []
+    for k, block in enumerate(decoder_blocks):
+        atoms_payload.append(
+            {
+                "basis": basis_kinds[k],
+                "decoder_coefficients": np.asarray(block, dtype=float).tolist(),
+                "assignments": np.asarray(assignments[:, k], dtype=float).tolist(),
+                "coords": np.asarray(coords[k], dtype=float).tolist(),
+                "coords_u_arc": None,
+                "evidence": None,
+                "active_dim": int(atom_dims[k]),
+                "decoder_covariance_channel_factors": None,
+                "shape_band_coords": None,
+                "shape_band_mean": None,
+                "shape_band_sd": None,
+                "functional_evidence": None,
+            }
+        )
+    return {
+        "schema": "gamfit.ManifoldSAE/v1",
+        "atom_topology": atom_topology,
+        "atom_topologies": list(atom_topologies),
+        "assignment": assignment,
+        "assignment_label": str(seed.assignment) if hasattr(seed, "assignment") else assignment,
+        "alpha": float(seed.alpha),
+        "learnable_alpha": bool(seed.learnable_alpha),
+        "tau": float(seed.tau),
+        "sparsity_strength": float(seed.sparsity_strength),
+        "smoothness": float(seed.smoothness),
+        "learning_rate": float(seed.learning_rate),
+        "max_iter": int(seed.max_iter),
+        "random_state": int(seed.random_state),
+        "top_k": None,
+        "top_k_projection": None,
+        "pre_topk": None,
+        "jumprelu_threshold": float(seed.jumprelu_threshold),
+        "oos_projection_top1": False,
+        "dispersion": 1.0,
+        "solver_plan": None,
+        "primitive_names": ["sae_manifold_fit_stagewise"],
+        "basis_specs": list(basis_kinds),
+        "penalized_loss_score": None,
+        "reml_score": None,
+        "reconstruction_r2": float(reconstruction_r2),
+        "training_mean": rust_module()
+        .sae_manifold_training_mean(np.ascontiguousarray(np.asarray(training, dtype=float)))
+        .tolist(),
+        "training_data": None,
+        "training_data_retained": False,
+        "fitted": np.asarray(fitted, dtype=float).tolist(),
+        "assignments": np.asarray(assignments, dtype=float).tolist(),
+        "logits": np.asarray(logits, dtype=float).tolist(),
+        "diagnostics": {"atom_trust": [], "atoms": []},
+        "coords": [np.asarray(c, dtype=float).tolist() for c in coords],
+        "decoder_blocks": [np.asarray(b, dtype=float).tolist() for b in decoder_blocks],
+        "atoms": atoms_payload,
+        "basis_kinds": list(basis_kinds),
+        "atom_dims": [int(d) for d in atom_dims],
+        "basis_sizes": [int(s) for s in basis_sizes],
+        "n_harmonics": [int(h) for h in n_harmonics],
+        "duchon_centers": [None] * len(decoder_blocks),
+        "atom_two_lens": None,
+        "residual_gauge": None,
+        "incoherence_report": None,
+        "curvature_report": None,
+        "coordinate_fidelity": None,
+        "topology_persistence": None,
+        "atom_inference": None,
+        "certificates": None,
+        "structure_certificate": None,
+        "cotrain": None,
+        "hybrid_split": None,
+        "fisher_factors": None,
+        "fisher_provenance": None,
+        "metric_provenance": "Euclidean",
+        "fisher_mass_residual": None,
+        "selected_log_lambda_sparse": None,
+        "selected_log_lambda_smooth": None,
+        "selected_log_ard": None,
+    }
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:

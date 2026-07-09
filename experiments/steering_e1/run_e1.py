@@ -475,6 +475,16 @@ def main() -> int:
         "seed": args.seed,
     }
     write_outputs(Path(args.out_dir), meta, records, summary)
+
+    # E2 (gam#2234): the collateral-damage curve, read off the records just
+    # written. A failure here must not sink the E1 run, so it is best-effort.
+    try:
+        import analyze_collateral
+
+        analyze_collateral.run(Path(args.out_dir))
+    except Exception as exc:  # noqa: BLE001 — E2 is a downstream read-off
+        log(f"E2 collateral analysis skipped: {exc}")
+
     for arm in ("manifold", "flat"):
         s = summary.get(arm)
         if s:

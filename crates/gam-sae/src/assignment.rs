@@ -1611,6 +1611,55 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
     out
 }
 
+/// Fitted-encoder gate activations `a = gate(logits)` for a full `(N, K)` logit
+/// matrix under the named assignment family.
+///
+/// This is the SINGLE SOURCE OF TRUTH for "turn a fitted model's routing logits
+/// into per-atom activations": the closed-form fitter (via [`softmax_row`] /
+/// [`ibp_map_row`] / [`jumprelu_row`]) and the post-hoc distilled-encoder path
+/// both read it, so a distilled encoder's activation is bit-identical to the
+/// model it distills. Formerly the python `gamfit.distill` module re-derived
+/// this in numpy and had drifted — its IBP prior used `(α/(α+1))^k` instead of
+/// the consistent stick-breaking mean `π_k = (α/(α+1))^{k+1}` this path applies
+/// (issue #2011: python is a thin wrapper, no shadow math).
+///
+/// `kind` is the canonical assignment token (`"softmax"`, `"ibp_map"`,
+/// `"threshold_gate"`, or the legacy `"jumprelu"` alias). `alpha` is read only
+/// for `"ibp_map"`, `threshold` only for the gate family; both are ignored by
+/// the others. Non-finite logits and unsupported kinds are surfaced as errors.
+pub fn activation_matrix_from_logits(
+    logits: ArrayView2<'_, f64>,
+    kind: &str,
+    temperature: f64,
+    alpha: f64,
+    threshold: f64,
+) -> Result<Array2<f64>, String> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(format!(
+            "activation_matrix_from_logits: temperature must be finite and positive; got {temperature}"
+        ));
+    }
+    let (n_rows, k_atoms) = logits.dim();
+    let mut out = Array2::<f64>::zeros((n_rows, k_atoms));
+    for row in 0..n_rows {
+        let row_logits = logits.row(row);
+        validate_finite_logits(row_logits, row)?;
+        let activation = match kind {
+            "softmax" => softmax_row(row_logits, temperature),
+            "ibp_map" => ibp_map_row(row_logits, temperature, alpha),
+            "threshold_gate" | "jumprelu" => jumprelu_row(row_logits, temperature, threshold),
+            other => {
+                return Err(format!(
+                    "activation_matrix_from_logits: unsupported assignment kind {other:?} \
+                     (expected 'softmax', 'ibp_map', or 'threshold_gate')"
+                ));
+            }
+        };
+        out.row_mut(row).assign(&activation);
+    }
+    Ok(out)
+}
+
 /// Hard top-`k` support row (the [`AssignmentMode::TopK`] gate): 1.0 for the
 /// `k` largest routing logits in the row, 0.0 elsewhere. Ties break toward the
 /// LOWER atom index so the support is deterministic. `k ≥ len` degenerates to

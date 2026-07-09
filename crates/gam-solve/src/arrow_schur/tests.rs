@@ -5335,8 +5335,8 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
 
     // Bare pilot (rank-0): the variance the deflation must beat.
     let bare = rational_reduced_schur_plan_derived(
-        &sys, &htt_factors, ridge_beta, &backend, None, 32, seed, 1e-9, 40, 1e-11, 20_000, 0, 4,
-        0.0,
+        &sys, &htt_factors, ridge_beta, &backend, None, None, 32, seed, 1e-9, 40, 1e-11, 20_000, 0,
+        4, 0.0,
     )
     .expect("bare plan must build");
     let bare_eval = bare.evaluate(&matvec, 1e-11, 20_000).expect("bare eval");
@@ -5355,6 +5355,7 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         &htt_factors,
         ridge_beta,
         &backend,
+        None,
         None,
         32,
         seed,
@@ -5437,6 +5438,7 @@ fn hutchinson_reduced_schur_inverse_trace_matches_dense() {
         ridge_beta,
         &backend,
         None,
+        None,
         &plan.probes,
         None,
         1e-12,
@@ -5470,7 +5472,7 @@ fn hutchinson_reduced_schur_inverse_trace_matches_dense() {
 
     // Determinism: the fixed probe set + deterministic CG reproduce bit-for-bit.
     let sinv2 = reduced_schur_inverse_probe_solves(
-        &sys, &htt_factors, ridge_beta, &backend, None, &plan.probes, None, 1e-12, 50_000,
+        &sys, &htt_factors, ridge_beta, &backend, None, None, &plan.probes, None, 1e-12, 50_000,
     )
     .expect("S⁻¹ v_j bundle must re-solve");
     let tr2 = hutchinson_reduced_schur_inverse_trace(&plan.probes, &sinv2, &|v| v.to_owned())
@@ -5538,6 +5540,7 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
         ridge_beta,
         &backend,
         None,
+        None,
         &rhs,
         None,
         1e-12,
@@ -5555,7 +5558,7 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
 
     // Bit-reproducible for a fixed rhs (the REML gradient lane requires it).
     let mf_x2 = reduced_schur_inverse_apply(
-        &sys, &htt_factors, ridge_beta, &backend, None, &rhs, None, 1e-12, 50_000,
+        &sys, &htt_factors, ridge_beta, &backend, None, None, &rhs, None, 1e-12, 50_000,
     )
     .expect("matrix-free S⁻¹ rhs must re-solve");
     assert_eq!(mf_x, mf_x2, "single-rhs S⁻¹ solve must be bit-reproducible");
@@ -5568,6 +5571,7 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
         &htt_factors,
         ridge_beta,
         &backend,
+        None,
         None,
         &rhs,
         Some(&dense_x),
