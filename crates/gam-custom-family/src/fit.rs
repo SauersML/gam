@@ -679,29 +679,67 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     reason,
                 })?;
         let t_full = &canonical.gauge.t_full;
+        // The trait contract fixes the coordinates: joint penalties arrive in
+        // RAW (pre-canonicalisation) stacked coordinates, so the pullback
+        // decision must key on whether the gauge is the identity — NOT on a
+        // dimension comparison. When no columns are dropped the raw and
+        // reduced totals coincide even though `T_full` can still be a
+        // nontrivial rotation, and skipping `TᵀST` there would smooth the
+        // wrong quadratic form (a coordinate swap with S = diag(1,2) must
+        // become diag(2,1)).
+        let gauge_is_identity = t_full.nrows() == t_full.ncols()
+            && t_full
+                .indexed_iter()
+                .all(|((i, j), &v)| v == if i == j { 1.0 } else { 0.0 });
         raw_specs_joint
             .into_iter()
             .map(|spec| {
-                let pulled = if spec.matrix.nrows() == reduced_total {
-                    spec.matrix
-                } else if spec.matrix.nrows() == t_full.nrows() {
-                    t_full.t().dot(&spec.matrix).dot(t_full)
-                } else {
+                if spec.matrix.nrows() != t_full.nrows() {
                     return Err(CustomFamilyError::DimensionMismatch {
                         reason: format!(
-                            "joint penalty '{}' has dim {} but neither reduced total {} nor raw total {}",
+                            "joint penalty '{}' has dim {} but the trait contract requires the \
+                             raw stacked total {} (pre-canonicalisation coordinates)",
                             spec.label.as_deref().unwrap_or("<unlabeled>"),
                             spec.matrix.nrows(),
-                            reduced_total,
                             t_full.nrows(),
                         ),
                     });
+                }
+                let (pulled, nullspace_dim) = if gauge_is_identity {
+                    (spec.matrix, spec.nullspace_dim)
+                } else {
+                    let pulled = t_full.t().dot(&spec.matrix).dot(t_full);
+                    // The gauge changes rank/nullity nontrivially — a dropped
+                    // or rotated column can absorb penalized directions or
+                    // fold null directions away (reducing diag(1,0) to its
+                    // first coordinate has nullity 0, not 1) — so the declared
+                    // raw nullity is recomputed on the pulled-back operator
+                    // instead of being capped at the reduced total.
+                    let (evals, _) = pulled.eigh(Side::Lower).map_err(|e| {
+                        CustomFamilyError::Optimization {
+                            context: "fit_custom_family joint penalty pullback rank",
+                            reason: format!(
+                                "eigendecomposition of pulled-back joint penalty '{}' failed: {e}",
+                                spec.label.as_deref().unwrap_or("<unlabeled>"),
+                            ),
+                        }
+                    })?;
+                    let evals_slice =
+                        evals
+                            .as_slice()
+                            .ok_or_else(|| CustomFamilyError::Optimization {
+                                context: "fit_custom_family joint penalty pullback rank",
+                                reason: "non-contiguous eigenvalue buffer".to_string(),
+                            })?;
+                    let thresh = positive_eigenvalue_threshold(evals_slice);
+                    let rank = evals.iter().filter(|&&ev| ev > thresh).count();
+                    (pulled, reduced_total - rank)
                 };
                 let out = gam_problem::JointPenaltySpec {
                     label: spec.label,
                     matrix: pulled,
                     initial_log_lambda: spec.initial_log_lambda,
-                    nullspace_dim: spec.nullspace_dim.min(reduced_total),
+                    nullspace_dim,
                 };
                 out.validate().map_err(|e| CustomFamilyError::ConstraintViolation {
                     reason: format!("joint penalty validation failed: {e}"),
