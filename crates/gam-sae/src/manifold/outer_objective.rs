@@ -1277,6 +1277,13 @@ impl SaeManifoldOuterObjective {
 
     /// `Err` if a host cancellation was requested (see [`Self::set_cancel_flag`]);
     /// a cheap relaxed load, no-op when no flag is installed.
+    /// #2235 — install a wall budget for deadline-honest termination: past it,
+    /// the criterion freezes at the banked incumbent and the outer bridge
+    /// converges onto it instead of grinding (or dying at) an external wall.
+    pub fn set_outer_wall_budget(&mut self, budget: std::time::Duration) {
+        self.termination = OuterTerminationLedger::new(Some(budget));
+    }
+
     fn check_cancelled(&self) -> Result<(), EstimationError> {
         if let Some(flag) = &self.cancel_flag {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1383,6 +1390,8 @@ impl SaeManifoldOuterObjective {
     /// Consume the objective, returning the inner-fitted term, the last rho the
     /// engine evaluated, and the inner loss breakdown at that rho.
     pub fn into_fitted(mut self) -> SaeIntoFittedResult {
+        // #2235 — capture the termination ledger before `self` is consumed.
+        let termination_report = self.termination.report();
         // The final accepted fit and every reported quantity run at full `N` at
         // the selected ρ — the ρ search may have run on a row subsample, but it is
         // swapped back (warm-started from the search-fitted decoder) here.
@@ -1662,6 +1671,15 @@ impl SaeManifoldOuterObjective {
         if fitted.assignment.persist_resolved_ibp_alpha(&fitted_rho) {
             fitted_rho.log_lambda_sparse = 0.0;
         }
+        let termination = termination_report;
+        log::warn!(
+            "[#2235] outer termination: {:?} after {} evals ({} since last improvement, \
+             wall {:.1?})",
+            termination.verdict,
+            termination.evals,
+            termination.evals_since_improvement,
+            termination.wall
+        );
         SaeIntoFittedResult {
             term: fitted,
             rho: fitted_rho,
@@ -1669,6 +1687,7 @@ impl SaeManifoldOuterObjective {
             used_seed_basin_fallback: seed_won,
             used_pristine_seed_fallback: pristine_seed_won,
             charts_canonicalized,
+            termination,
         }
     }
 
@@ -3956,6 +3975,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // instead of the single hysteretic warm-start trajectory. Same value-probe
         // drive (`refine_progress_extension = false`) as the historical lane; the
         // envelope bypasses to it verbatim in the streaming / freeze regimes.
+        // #2235 — frozen criterion: once the termination ledger verdicts, every
+        // probe returns the banked incumbent value so the bridge halts onto it.
+        if let Some(frozen) = self.termination.frozen_cost() {
+            return Ok(frozen);
+        }
         match self.evaluate_envelope_value_probe(
             rho.view(),
             true,
@@ -3963,7 +3987,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 refine_progress_extension: false,
             },
         ) {
-            Ok((cost, _beta)) => Ok(cost),
+            Ok((cost, _beta)) => {
+                self.termination.record(cost);
+                Ok(cost)
+            }
             // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
             // collapse wall the EFS lane returns, not `+∞`. A finite (huge) wall is
             // still rejected by the cross-seed / EFS-backtracking comparison this
@@ -3983,6 +4010,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
+        // #2235 — frozen criterion (see OuterTerminationLedger): flat value +
+        // zero gradient converges the bridge onto the banked incumbent.
+        if let Some(frozen) = self.termination.frozen_cost() {
+            return Ok(OuterEval {
+                cost: frozen,
+                gradient: Array1::zeros(rho.len()),
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            });
+        }
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
         // cache does not exist, so the analytic gradient lane below
@@ -4020,6 +4057,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 }
                 Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
             };
+            self.termination.record(cost);
             return Ok(OuterEval {
                 cost,
                 gradient: Array1::zeros(rho.len()),
@@ -4248,6 +4286,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.forcing.observe_accepted_gradient(rho, gradient_norm);
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
+        self.termination.record(cost);
         Ok(OuterEval {
             cost,
             gradient,
@@ -4267,6 +4306,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // keep grinding. Idempotent for the gradient orders (they also delegate to
         // `eval`, which checks again); no-op when no cancel flag is installed.
         self.check_cancelled()?;
+        // #2235 — frozen criterion: the line-search probe lane must freeze too,
+        // or the bridge keeps probing a live surface the other lanes no longer
+        // report. Gradient orders delegate to `eval`, which freezes itself.
+        if matches!(order, OuterEvalOrder::Value)
+            && let Some(frozen) = self.termination.frozen_cost()
+        {
+            return Ok(OuterEval {
+                cost: frozen,
+                gradient: Array1::zeros(rho.len()),
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            });
+        }
         match order {
             OuterEvalOrder::Value => {
                 // #1224 — the `Value` order is the BFGS / ARC LINE-SEARCH cost
@@ -4326,6 +4378,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };
+                self.termination.record(cost);
                 Ok(OuterEval {
                     cost,
                     gradient: Array1::zeros(rho.len()),
@@ -4343,8 +4396,25 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2138 — the Fellner–Schall route is a primary outer descent path with its
         // own inner solve (bypassing `eval`/`eval_cost`), so cover it too.
         self.check_cancelled()?;
-        self.efs_step(rho.view())
-            .map_err(EstimationError::RemlOptimizationFailed)
+        // #2235 — frozen criterion on the EFS lane: flat cost + zero steps IS
+        // the Fellner–Schall fixed point, so the EFS loop halts onto the
+        // banked incumbent.
+        if let Some(frozen) = self.termination.frozen_cost() {
+            return Ok(EfsEval {
+                cost: frozen,
+                steps: vec![0.0; rho.len()],
+                beta: None,
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+                logdet_enclosure_gap: None,
+            });
+        }
+        let eval = self
+            .efs_step(rho.view())
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        self.termination.record(eval.cost);
+        Ok(eval)
     }
 
     fn reset(&mut self) {
@@ -4362,6 +4432,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // gradient decay is meaningless for it, so the Eisenstat–Walker ratio
         // is re-established from scratch (probes run tight until then).
         self.forcing.clear_history();
+        // #2235 — a fresh multi-start walk deserves a fresh stationarity window
+        // (the wall budget and eval totals stay fit-global).
+        self.termination.reset_stationarity();
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
