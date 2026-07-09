@@ -1109,7 +1109,7 @@ fn predict_oos_from_arrays<'py>(
             .map_err(py_value_error)?;
     }
     if !logits_are_warm && assignment_kind == "softmax" {
-        seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
+        term.seed_oos_softmax_logits_from_projection_residuals(x_view, tau);
     } else if !logits_are_warm && assignment_kind == "ibp_map" {
         // #2132 — seed the IBP logits with the SAME resolved α the gate
         // resolution below uses: a learnable-α fit resolves α through the
@@ -1125,7 +1125,7 @@ fn predict_oos_from_arrays<'py>(
         } else {
             alpha
         };
-        seed_oos_ibp_logits_from_projected_decoder_lsq(&mut term, x_view, tau, seed_alpha);
+        term.seed_oos_ibp_logits_from_projected_decoder_lsq(x_view, tau, seed_alpha);
     }
     // #2132 — assemble the OOS ρ from the TRAINED terminal hyperparameters when
     // supplied, so the frozen-decoder solve descends the SAME penalized
