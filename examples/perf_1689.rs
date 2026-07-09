@@ -87,9 +87,6 @@ impl Profile {
     fn actual_flops(&self) -> f64 {
         self.inner_pirls_solves.max(1) as f64 * self.solve_flops()
     }
-    fn parity_flops(&self) -> f64 {
-        self.ref_outer() * self.solve_flops()
-    }
     /// Realized solver throughput (GFLOP/s). Low ⇒ per-solve inefficiency.
     fn implied_gflops(&self) -> f64 {
         self.actual_flops() / self.fit_s / 1e9
