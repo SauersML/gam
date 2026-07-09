@@ -8510,6 +8510,20 @@ impl ManifoldSaeCore {
     fn hybrid_split(&self, py: Python<'_>) -> PyResult<PyObject> {
         manifold_sae_report(py, &self.inner.hybrid_split)
     }
+    /// The per-pass structured-residual alternation diagnostics (#2021). The serde
+    /// schema WRITE-DROPS these (`to_dict` never emits the key; read-tolerated on
+    /// load), but the payload struct retains them, so the pyclass surfaces the
+    /// attribute the legacy dataclass field `structured_residual_diagnostics`
+    /// exposed — the accessor surface is thus complete vs the dataclass. Returns a
+    /// list (empty when the fit recorded none), mirroring `from_dict`'s
+    /// `payload.get(..., [])` coercion.
+    #[getter]
+    fn structured_residual_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_value_to_py(
+            py,
+            serde_json::Value::Array(self.inner.structured_residual_diagnostics.clone()),
+        )
+    }
 }
 
 #[cfg(test)]

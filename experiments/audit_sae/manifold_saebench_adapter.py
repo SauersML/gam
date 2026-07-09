@@ -112,7 +112,22 @@ def build_manifold_saebench_sae(
             last axis."""
             lead = x.shape[:-1]
             flat = x.reshape(-1, x.shape[-1])
+            if int(flat.shape[-1]) != int(self.cfg.d_in):
+                raise ValueError(
+                    f"manifold encode got d_in={int(flat.shape[-1])} but the fit "
+                    f"expects {int(self.cfg.d_in)}. The manifold SAE must be trained "
+                    f"on the RAW residual of the hooked host (no PCA), so the hook "
+                    f"activation width matches the fit."
+                )
             codes = np.asarray(self._model.encode(self._to_numpy(flat)), dtype=np.float64)
+            # d_sae was inferred from len(atoms); assert it equals the real curved
+            # code width so a mismatch fails loudly here, not as a silent probe corruption.
+            if int(codes.shape[-1]) != int(self.cfg.d_sae):
+                raise ValueError(
+                    f"manifold code width {int(codes.shape[-1])} != d_sae "
+                    f"{int(self.cfg.d_sae)} (inferred from len(atoms)); pass an explicit "
+                    f"d_sae to build_manifold_saebench_sae equal to the encode code width."
+                )
             out = torch.from_numpy(np.ascontiguousarray(codes)).to(x.device, x.dtype)
             return out.reshape(*lead, out.shape[-1])
 
