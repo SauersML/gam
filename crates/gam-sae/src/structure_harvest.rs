@@ -446,10 +446,10 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
             // certified glue physically compacts the atom columns at the round
             // boundary, so the next round's `(0, 1)` can denote a DIFFERENT
             // pair than this round's `(0, 1)`.  Scope the running e-process by
-            // the parent dictionary's structural hash: contested seams in an
-            // unchanged dictionary still resume their evidence, while a
-            // compaction can never lend already-certified evidence to a newly
-            // re-indexed pair.
+            // the proposal's stamped structural hash (which includes the
+            // current dictionary skeleton): contested seams in an unchanged
+            // dictionary still resume their evidence, while a compaction can
+            // never lend already-certified evidence to a newly re-indexed pair.
             label: format!(
                 "seam_glue:{structure_hash:016x}:{}:{}",
                 (*a).min(*b),
@@ -2971,6 +2971,58 @@ pub fn discover_primary_atom_topologies(
         .collect()
 }
 
+/// Resolve every `"auto"` entry of a primary seed dictionary to the concrete
+/// basis-kind string + latent dimension the fit-entry evidence race selects
+/// (#2238/#2239). This is the SINGLE place the auto policy lives — the FFI
+/// layer only plumbs arrays through (SPEC: pyffi stays thin). Policy:
+///
+/// * torus / sphere winners keep their kind and carry `latent_dim = 2`;
+/// * a flat 2-D winner builds the expressive thin-plate (`duchon`) chart
+///   rather than the degree-2 patch the race scored with — same topology,
+///   strictly richer basis for the seeded atom;
+/// * a circle winner — and every failure path — is the historical periodic
+///   default with the caller's `d_atom` kept as the harmonic budget, so
+///   discovery can only ever ADD fidelity.
+pub fn resolve_auto_primary_atoms(
+    target: ArrayView2<'_, f64>,
+    labels: &[usize],
+    atom_basis: &mut [String],
+    atom_dim: &mut [usize],
+) {
+    let k_atoms = atom_basis.len();
+    if atom_dim.len() != k_atoms || !atom_basis.iter().any(|basis| basis == "auto") {
+        return;
+    }
+    let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim);
+    for atom_idx in 0..k_atoms {
+        if atom_basis[atom_idx] != "auto" {
+            continue;
+        }
+        match choices.get(atom_idx).and_then(|choice| choice.as_ref()) {
+            Some(choice) => match choice.basis_kind {
+                SaeAtomBasisKind::Torus => {
+                    atom_basis[atom_idx] = "torus".to_string();
+                    atom_dim[atom_idx] = choice.latent_dim;
+                }
+                SaeAtomBasisKind::Sphere => {
+                    atom_basis[atom_idx] = "sphere".to_string();
+                    atom_dim[atom_idx] = choice.latent_dim;
+                }
+                SaeAtomBasisKind::EuclideanPatch => {
+                    atom_basis[atom_idx] = "duchon".to_string();
+                    atom_dim[atom_idx] = choice.latent_dim;
+                }
+                _ => {
+                    atom_basis[atom_idx] = "periodic".to_string();
+                }
+            },
+            None => {
+                atom_basis[atom_idx] = "periodic".to_string();
+            }
+        }
+    }
+}
+
 /// A small neutral routing logit a born atom is seeded at: large enough that the
 /// refit can grow it if the residual-factor direction is real, small relative to
 /// the established atoms so it does not perturb the current routing.
@@ -5395,7 +5447,9 @@ mod tests {
     /// an error before changing the term, instead of panicking halfway through a
     /// gather and leaving atom/assignment arrays at different widths.
     #[test]
-    fn physical_excision_refuses_misaligned_rho_without_mutation() {
+    fn physical_excision_validation_is_transactional() {
+        use gam_solve::structure_search::{MoveRecord, MoveVerdict};
+
         let (mut term, mut rho) = tiled_circle_term(16, 3, &[1.0; 3]);
         let atoms_before = term.k_atoms();
         let logits_before = term.assignment.logits.clone();
@@ -5405,6 +5459,31 @@ mod tests {
         let err = remove_atoms(&mut term, &mut rho, &remove).unwrap_err();
         assert!(
             err.contains("rho per-atom lengths"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(term.k_atoms(), atoms_before);
+        assert_eq!(term.assignment.logits, logits_before);
+
+        // Restore ρ and feed an impossible overlapping matching.  The compactor
+        // must reject the whole ledger before the first fold mutates any logit.
+        rho.log_ard.push(Array1::zeros(1));
+        let accepted = |a: usize, b: usize| MoveRecord {
+            mv: StructureMove::Glue { a, b },
+            trigger: 40.0,
+            structure_hash: 0,
+            claim: ClaimKind::Custom {
+                label: format!("test-glue:{a}:{b}"),
+            },
+            verdict: MoveVerdict::Accepted { log_e: 40.0 },
+        };
+        let overlapping = SearchLedger {
+            alpha: 0.05,
+            moves: vec![accepted(0, 1), accepted(1, 2)],
+            collapse_events: Vec::new(),
+        };
+        let err = compact_glued_atoms(&mut term, &mut rho, &overlapping).unwrap_err();
+        assert!(
+            err.contains("not an atom-disjoint matching"),
             "unexpected error: {err}"
         );
         assert_eq!(term.k_atoms(), atoms_before);

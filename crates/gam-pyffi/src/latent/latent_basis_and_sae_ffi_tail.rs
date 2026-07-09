@@ -361,51 +361,21 @@ fn sae_manifold_fit_minimal<'py>(
         )));
     }
     // #2238/#2239 — per-atom topology discovery for the PRIMARY dictionary.
-    // An atom seeded as "auto" (the magic default when the caller names no
-    // topology) races circle / torus / sphere / flat-2-D by proper REML
-    // evidence over its seed cluster and is rewritten to the concrete winner
-    // BEFORE any seeding or plan building, so every downstream consumer
-    // (PCA seeds, atom plans, OOS metadata) sees only concrete kinds. A flat
-    // winner builds the expressive thin-plate (Duchon) chart rather than the
-    // degree-2 patch; any per-atom race failure falls back to the historical
-    // circle default.
+    // Atoms seeded "auto" (the magic default when the caller names no
+    // topology) are rewritten to their evidence-race winners BEFORE any
+    // seeding or plan building, so every downstream consumer (PCA seeds,
+    // atom plans, OOS metadata) sees only concrete kinds. The policy lives
+    // in gam-sae (`resolve_auto_primary_atoms`); this layer only plumbs.
     let mut atom_basis = atom_basis;
     let mut atom_dim = atom_dim;
     if atom_basis.iter().any(|basis| basis == "auto") {
         let labels = sae_output_energy_cluster_labels(z_view, k_atoms);
-        let choices = gam::terms::sae::structure_harvest::discover_primary_atom_topologies(
-            z_view, &labels, k_atoms, &atom_dim,
+        gam::terms::sae::structure_harvest::resolve_auto_primary_atoms(
+            z_view,
+            &labels,
+            &mut atom_basis,
+            &mut atom_dim,
         );
-        for atom_idx in 0..k_atoms {
-            if atom_basis[atom_idx] != "auto" {
-                continue;
-            }
-            match choices.get(atom_idx).and_then(|choice| choice.as_ref()) {
-                Some(choice) => match choice.basis_kind {
-                    SaeAtomBasisKind::Torus => {
-                        atom_basis[atom_idx] = "torus".to_string();
-                        atom_dim[atom_idx] = choice.latent_dim;
-                    }
-                    SaeAtomBasisKind::Sphere => {
-                        atom_basis[atom_idx] = "sphere".to_string();
-                        atom_dim[atom_idx] = choice.latent_dim;
-                    }
-                    SaeAtomBasisKind::EuclideanPatch => {
-                        atom_basis[atom_idx] = "duchon".to_string();
-                        atom_dim[atom_idx] = choice.latent_dim;
-                    }
-                    // Circle winner (or any kind without a richer seedable
-                    // form): the periodic atom, with the user's d_atom kept
-                    // as the harmonic budget exactly as before.
-                    _ => {
-                        atom_basis[atom_idx] = "periodic".to_string();
-                    }
-                },
-                None => {
-                    atom_basis[atom_idx] = "periodic".to_string();
-                }
-            }
-        }
     }
     let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
         .iter()
