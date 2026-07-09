@@ -256,6 +256,62 @@ pub(crate) fn two_circle_whitened_k2_recovers_disjoint_signal_2027() {
     );
 }
 
+/// #2099 quotient-ON twin of `two_circle_whitened_k2_recovers_disjoint_signal_2027`.
+///
+/// Identical fixture, ρ, and EV bar as the original; the only difference is
+/// `set_quotient_scale(true)` + `set_cone_atom_recovery(true)` (a co-collapse
+/// recovery scenario, so the cone-atom breach-gated retraction is implied). This
+/// is the conflict-2 (#980 whitening / OutputFisher) acceptance under the quotient.
+/// Default path untouched.
+///
+/// FALSIFIABLE PREDICTION (per my #2099 subsystem-2 audit): this fixture is
+/// Euclidean-metric, so no whitener is built from the decoder and `∂W/∂s_k = 0` —
+/// the whitening geometry cannot itself regress under the quotient. THEREFORE this
+/// twin should PASS (EV > 0.20, matching OFF). If it FAILS, the root is again
+/// trajectory cadence, most specifically the keep-best amplitude VarPro
+/// (`optimize_log_amplitudes_closed_form`, monotone revert on the fit's OWN
+/// weighted data-fit) FIGHTING the accepted-iterate `retract_collapsed_decoders_in_loop`
+/// on the breach rows of a genuinely co-collapsing K=2 pair: the retraction peels a
+/// near-collapsed atom's `‖B‖` into `s` (unit-frame + small `s`), then the next
+/// amplitude solve — because the peel changed the per-atom design `C_k = Φ·B_k`
+/// scale — either reverts (keep-best) or re-inflates `s`, so the two atoms never
+/// settle onto distinct rank-2 territories and the EV falls back toward the null
+/// floor. Watch `dictionary_cocollapse_reseeds` climbing relative to the OFF run.
+#[test]
+pub(crate) fn two_circle_whitened_k2_recovers_disjoint_signal_2027_quotient_on_2099() {
+    let n = 96usize;
+    let p = 16usize;
+    let m = 5usize; // [1, sin2πt, cos2πt, sin4πt, cos4πt]
+    let (mut term, target) = two_circle_k2_term(n, p, m);
+    // The lines under test: general scale quotient + cone-atom recovery engaged.
+    term.set_quotient_scale(true);
+    term.set_cone_atom_recovery(true);
+
+    let mut rho = SaeManifoldRho::new(
+        0.0,
+        -6.0,
+        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+    );
+    let loss = term
+        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 60, 0.05, 1.0e-3, 1.0e-3)
+        .unwrap();
+    assert!(loss.total().is_finite(), "loss must stay finite (quotient ON)");
+
+    let ev = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .unwrap();
+    eprintln!(
+        "[#2099 twin] K=2 whitened two-circle EV (quotient ON) = {ev:.4}, cocollapse_reseeds = {}",
+        term.dictionary_cocollapse_reseeds
+    );
+    assert!(
+        ev > 0.20,
+        "#2099: K=2 whitened two-circle with quotient_scale ON co-collapsed: EV={ev:.4} \
+         (expected > 0.20). The Euclidean whitening cannot cause this — a regression localizes \
+         to the retraction/amplitude-solve cadence on the breach rows"
+    );
+}
+
 /// The greedy disjoint-subspace decoder refit must, on a co-collapsed reseed,
 /// leave BOTH atoms carrying material decoder norm — never let one atom take all
 /// the residual while the other stays ≈0 (the relative-norm collapse the joint
