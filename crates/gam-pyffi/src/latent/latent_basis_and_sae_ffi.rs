@@ -3634,6 +3634,8 @@ fn sae_manifold_fit_inner<'py>(
     let fitted_result = objective.into_fitted();
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
+    // #2235 — the outer termination verdict + ledger, surfaced on the payload.
+    let outer_termination = fitted_result.termination;
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
     let mut loss = fitted_result.loss;
@@ -4441,6 +4443,19 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reconstruction_r2", reconstruction_r2)?;
+    // #2235 — how the outer ρ search ended: a verdict, never a hang. The
+    // driver-facing contract for budget honesty and stationarity accounting.
+    {
+        let termination = PyDict::new(py);
+        termination.set_item("verdict", outer_termination.verdict.as_str())?;
+        termination.set_item("evals", outer_termination.evals)?;
+        termination.set_item(
+            "evals_since_improvement",
+            outer_termination.evals_since_improvement,
+        )?;
+        termination.set_item("wall_seconds", outer_termination.wall.as_secs_f64())?;
+        out.set_item("termination", termination)?;
+    }
     // #1231 / #1232 — in-sample fit: the score is the negative penalized loss,
     // surfaced honestly as `penalized_loss_score` (NOT `reml_score`) with a
     // breakdown. The top-level payload describes ONE coherent model: when a hard

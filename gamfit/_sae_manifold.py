@@ -733,6 +733,10 @@ class ManifoldSAE:
     pre_topk: dict[str, Any] | None = None
     jumprelu_threshold: float = 0.0
     solver_plan: dict[str, Any] | None = None
+    # #2235 -- how the outer rho search ENDED: {"verdict": "engine_stopped" |
+    # "incumbent_stationary" | "budget_exhausted", "evals", "evals_since_improvement",
+    # "wall_seconds"}. None on payloads predating the termination ledger.
+    termination: dict[str, Any] | None = None
     # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
     # covariance (Cov(beta_k) = phi * S_beta^{-1}[block]).
     dispersion: float = 1.0
@@ -1122,6 +1126,11 @@ class ManifoldSAE:
             ),
             jumprelu_threshold=float(jumprelu_threshold),
             solver_plan=None if payload.get("solver_plan") is None else dict(payload["solver_plan"]),
+            termination=(
+                None
+                if payload.get("termination") is None
+                else dict(payload["termination"])
+            ),
             dispersion=float(payload["dispersion"]),
             # WP-D → fit wiring (#980): surface the metric provenance and the
             # per-row truncation diagnostic the Rust fit reports. Absent ⇒ the

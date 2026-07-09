@@ -213,6 +213,18 @@ pub enum SaeOuterTerminationVerdict {
     BudgetExhausted,
 }
 
+impl SaeOuterTerminationVerdict {
+    /// Canonical wire name — the SINGLE source of truth every surface
+    /// (pyffi payload, CLI output, logs) must use. Never re-map in a binding.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EngineStopped => "engine_stopped",
+            Self::IncumbentStationary => "incumbent_stationary",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
 /// #2235 — outer termination ledger: one per fit, ticked by every criterion
 /// evaluation lane. When a verdict fires the ledger FREEZES the criterion:
 /// every later evaluation returns the best (incumbent) cost with a zero
