@@ -1598,4 +1598,41 @@ mod tests {
         assert!(fit.deriv.is_none());
         assert!(fit.deriv_at_knot(0).is_none());
     }
+
+    /// `deviance()` must be the weighted DATA residual sum of squares at the
+    /// fitted values, not the profiled REML quadratic. For order 1 on
+    /// `x = (0, 1)`, `y = (0, 1)`, unit weights, λ = 1, the posterior mean is
+    /// `(1/3, 2/3)`: the data SSE is `2·(1/3)² = 2/9`, while
+    /// `σ̂²·(n − order) = 1/3` carries an extra `1/9` of process/roughness
+    /// energy.
+    #[test]
+    fn deviance_is_data_sse_not_penalized_quadratic() {
+        let x = [0.0, 1.0];
+        let y = [0.0, 1.0];
+        let w = [1.0, 1.0];
+        let fit = fit_spline_scan_at(&x, &y, &w, 0.0, None, 1).expect("order-1 fit");
+        // Self-consistency against a direct recomputation at the fitted values.
+        let manual: f64 = x
+            .iter()
+            .zip(&y)
+            .zip(&w)
+            .map(|((&xi, &yi), &wi)| {
+                let (m, _) = fit.predict(xi).expect("predict at knot");
+                wi * (yi - m) * (yi - m)
+            })
+            .sum();
+        assert!(
+            (fit.deviance() - manual).abs() <= 1e-12 * manual.max(1e-300),
+            "deviance {} != recomputed data SSE {manual}",
+            fit.deviance()
+        );
+        assert!(
+            (fit.deviance() - 2.0 / 9.0).abs() < 1e-10,
+            "deviance {} != 2/9",
+            fit.deviance()
+        );
+        // The old proxy is strictly larger: it includes penalty energy.
+        let reml_quadratic = fit.sigma2 * (fit.n_obs as f64 - fit.order as f64);
+        assert!(fit.deviance() < reml_quadratic);
+    }
 }
