@@ -4972,6 +4972,35 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss), String> {
+        self.reml_criterion_with_refine_policy_and_lane(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            refine_progress_extension,
+            None,
+        )
+    }
+
+    /// [`Self::reml_criterion_with_refine_policy`] with the #2080 surrogate lane
+    /// threaded to the streaming `log|S|` evidence term. `lane = None` is the
+    /// bit-identical SLQ path; on the dense (non-streaming) branch the lane is
+    /// unused (the dense evidence has its own factor-cache log-det).
+    pub(crate) fn reml_criterion_with_refine_policy_and_lane(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        refine_progress_extension: bool,
+        lane: Option<&mut SurrogateLaneState>,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
         let plan = self.streaming_plan().admitted_or_error(
             self.n_obs(),
             self.output_dim(),
@@ -4989,7 +5018,7 @@ impl SaeManifoldTerm {
             // chunk-by-chunk-bit-identical `½ log|H|_stream` and the same
             // `−Occam`/extra-penalty terms as the dense `reml_criterion_with_cache`
             // (different memory strategy, same objective).
-            self.reml_criterion_streaming_exact(
+            self.reml_criterion_streaming_exact_with_lane(
                 target,
                 rho,
                 registry,
@@ -4997,6 +5026,7 @@ impl SaeManifoldTerm {
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
+                lane,
             )
         } else {
             let (v, loss, _cache) = self.reml_criterion_with_cache_refine_policy(
@@ -6542,6 +6572,8 @@ impl SaeManifoldTerm {
     /// can take its matrix-free ARD / smoothness traces off this cache in the
     /// streaming regime instead of hard-erroring on the dense evidence path. The
     /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det`.
+    /// Convenience over [`Self::reml_criterion_streaming_exact_with_cache_and_lane`]
+    /// with no #2080 surrogate lane (bit-identical SLQ evidence).
     pub fn reml_criterion_streaming_exact_with_cache(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -6551,6 +6583,31 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        self.reml_criterion_streaming_exact_with_cache_and_lane(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            None,
+        )
+    }
+
+    /// [`Self::reml_criterion_streaming_exact_with_cache`] with the #2080 surrogate
+    /// lane threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
+    pub fn reml_criterion_streaming_exact_with_cache_and_lane(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let mut rho_fixed = rho.clone();
         let mut loss = self.run_joint_fit_arrow_schur(
@@ -6600,8 +6657,13 @@ impl SaeManifoldTerm {
         } else {
             None
         };
-        let log_det =
-            self.streaming_exact_arrow_log_det(target, rho, registry, rank_inputs.as_mut())?;
+        let log_det = self.streaming_exact_arrow_log_det_with_lane(
+            target,
+            rho,
+            registry,
+            rank_inputs.as_mut(),
+            lane,
+        )?;
         let occam = self.reml_occam_term(rho)?;
         // Extra analytic-penalty energy (#671/#737), matching the full-batch
         // `reml_criterion_with_cache` path so streaming and dense criteria rank
@@ -6685,7 +6747,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        let (cost, loss, _cache) = self.reml_criterion_streaming_exact_with_cache(
+        self.reml_criterion_streaming_exact_with_lane(
             target,
             rho,
             registry,
@@ -6693,16 +6755,60 @@ impl SaeManifoldTerm {
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
+            None,
+        )
+    }
+
+    /// [`Self::reml_criterion_streaming_exact`] with the #2080 surrogate lane
+    /// threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
+    pub fn reml_criterion_streaming_exact_with_lane(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        lane: Option<&mut SurrogateLaneState>,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
+        let (cost, loss, _cache) = self.reml_criterion_streaming_exact_with_cache_and_lane(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            lane,
         )?;
         Ok((cost, loss))
     }
 
+    /// Value-only streaming reduced-Schur evidence log-det via the historical SLQ
+    /// lane — convenience over [`Self::streaming_exact_arrow_log_det_with_lane`]
+    /// with `lane = None` (bit-identical to the pre-#2080 SLQ path).
     pub fn streaming_exact_arrow_log_det(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         registry: Option<&AnalyticPenaltyRegistry>,
+        rank_inputs: Option<&mut StreamingRankInputs>,
+    ) -> Result<f64, String> {
+        self.streaming_exact_arrow_log_det_with_lane(target, rho, registry, rank_inputs, None)
+    }
+
+    /// Streaming reduced-Schur evidence `log|H| = Σ log|H_tt| + log|S|` with the
+    /// #2080 surrogate lane threaded to the `log|S|` term. `lane = None` runs the
+    /// bit-identical SLQ path; `lane = Some(state)` builds-or-reuses the frozen
+    /// derived-rank rational surrogate (matrix-free, desync-safe) instead.
+    pub fn streaming_exact_arrow_log_det_with_lane(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
         mut rank_inputs: Option<&mut StreamingRankInputs>,
+        lane: Option<&mut SurrogateLaneState>,
     ) -> Result<f64, String> {
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
@@ -6782,7 +6888,12 @@ impl SaeManifoldTerm {
             let sys = full_chunk
                 .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
-            let (log_det_tt, slq) = matrix_free_arrow_evidence_log_det(
+            // #2080: the reduced-Schur `log|S|` term. `lane = None` runs the
+            // bit-identical SLQ estimate; `lane = Some(state)` swaps in the frozen
+            // derived-rank rational surrogate (matrix-free, value+ρ-gradient one
+            // functional). `log_det_tt` (the Σ log|H_tt| coordinate block) is exact
+            // on the shared factorization either way.
+            let (log_det_tt, log_det_schur) = matrix_free_arrow_evidence_log_det_surrogate(
                 &sys,
                 0.0,
                 0.0,
@@ -6790,23 +6901,23 @@ impl SaeManifoldTerm {
                 SCHUR_SLQ_LOGDET_PROBES,
                 SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
                 SCHUR_SLQ_LOGDET_SEED,
+                lane,
             )
             .map_err(|err| {
                 format!(
                     "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free evidence log-det: {err:?}"
                 )
             })?;
-            if !slq.estimate.is_finite() {
+            if !log_det_schur.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free SLQ reduced-Schur \
-                     log|S| non-finite ({})",
-                    slq.estimate
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free reduced-Schur \
+                     log|S| non-finite ({log_det_schur})"
                 ));
             }
             if let Some(ri) = rank_inputs.as_deref_mut() {
                 ri.log_det_tt = log_det_tt;
             }
-            return Ok(log_det_tt + slq.estimate);
+            return Ok(log_det_tt + log_det_schur);
         }
         let n_total = self.n_obs();
         let chunk_size = plan.chunk_size.min(n_total.max(1));

@@ -728,6 +728,41 @@ pub struct SaeManifoldOuterObjective {
     /// block comment above [`EW_FORCING_GAMMA`]). Updated at every accepted-
     /// gradient evaluation; consumed only by the `eval_with_order(Value)` lane.
     forcing: ProbeForcingState,
+    /// #2080 — the frozen per-outer-solve rational log-det surrogate lane. When
+    /// the streaming criterion takes the matrix-free massive-K evidence branch
+    /// (dense `k×k` reduced Schur over budget), the `log|S|` term is estimated by
+    /// this desync-safe rational surrogate instead of SLQ; below that branch it
+    /// stays dormant (`plan == None`), so small/dense fits are byte-unchanged. The
+    /// lane self-heals across basin mutations (its plan rebuilds when the reduced-
+    /// Schur dimension changes), so it is NOT cleared with `probe_converged_handoff`.
+    surrogate_lane: Option<SurrogateLaneState>,
+}
+
+/// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
+/// surrogate that supersedes SLQ on the matrix-free massive-K evidence path.
+/// Probe count and seed mirror the SLQ lane it replaces; the deflation target is
+/// one order under the inner-objective stall tolerance — `log|S|` is the
+/// criterion's dominant term at wide `k`, so the Hutchinson error bar must sit
+/// well inside the tolerance that certifies the ρ-search stationary.
+const SAE_SURROGATE_LANE_QUADRATURE_REL_TOL: f64 = 1.0e-8;
+const SAE_SURROGATE_LANE_POWER_ITERS: usize = 40;
+const SAE_SURROGATE_LANE_CG_REL_TOL: f64 = 1.0e-8;
+const SAE_SURROGATE_LANE_CG_MAX_ITERS: usize = 20_000;
+const SAE_SURROGATE_LANE_DEFLATION_MAX_RANK: usize = 128;
+const SAE_SURROGATE_LANE_DEFLATION_SUBSPACE_ITERS: usize = 4;
+
+fn sae_surrogate_lane_config() -> SurrogateLaneConfig {
+    SurrogateLaneConfig {
+        num_probes: SCHUR_SLQ_LOGDET_PROBES,
+        seed: SCHUR_SLQ_LOGDET_SEED,
+        rel_tol: SAE_SURROGATE_LANE_QUADRATURE_REL_TOL,
+        power_iters: SAE_SURROGATE_LANE_POWER_ITERS,
+        cg_rel_tol: SAE_SURROGATE_LANE_CG_REL_TOL,
+        cg_max_iters: SAE_SURROGATE_LANE_CG_MAX_ITERS,
+        deflation_max_rank: SAE_SURROGATE_LANE_DEFLATION_MAX_RANK,
+        deflation_subspace_iters: SAE_SURROGATE_LANE_DEFLATION_SUBSPACE_ITERS,
+        deflation_target_std_err_rel: 0.1 * SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,
+    }
 }
 
 impl SaeManifoldOuterObjective {
@@ -769,6 +804,7 @@ impl SaeManifoldOuterObjective {
             row_subsample: None,
             probe_converged_handoff: None,
             forcing: ProbeForcingState::new(),
+            surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all
@@ -2607,7 +2643,7 @@ impl SaeManifoldOuterObjective {
         let (reml_cost, loss) = match drive {
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
-            } => self.term.reml_criterion_with_refine_policy(
+            } => self.term.reml_criterion_with_refine_policy_and_lane(
                 self.target.view(),
                 &rho,
                 self.registry.as_ref(),
@@ -2616,6 +2652,7 @@ impl SaeManifoldOuterObjective {
                 self.ridge_ext_coord,
                 self.ridge_beta,
                 refine_progress_extension,
+                self.surrogate_lane.as_mut(),
             )?,
             ProbeInnerDrive::ForcedLineSearchProbe { eta } => {
                 self.forced_probe_criterion(&rho, eta)?
@@ -2715,7 +2752,7 @@ impl SaeManifoldOuterObjective {
             self.term.k_atoms(),
         )?;
         if self.inner_max_iter == 0 || admitted.streaming || !plan.direct_logdet_admitted() {
-            return self.term.reml_criterion_with_refine_policy(
+            return self.term.reml_criterion_with_refine_policy_and_lane(
                 self.target.view(),
                 rho,
                 self.registry.as_ref(),
@@ -2724,6 +2761,7 @@ impl SaeManifoldOuterObjective {
                 self.ridge_ext_coord,
                 self.ridge_beta,
                 false,
+                self.surrogate_lane.as_mut(),
             );
         }
         let options = ArrowSolveOptions::direct()
@@ -2848,7 +2886,7 @@ impl SaeManifoldOuterObjective {
                 // Its remaining refusal classes (border Schur non-PD, cross-row
                 // non-PD) are the typed recoverable probe refusals the outer
                 // bridge already maps to the finite wall.
-                return self.term.reml_criterion_with_refine_policy(
+                return self.term.reml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
                     self.registry.as_ref(),
@@ -2857,6 +2895,7 @@ impl SaeManifoldOuterObjective {
                     self.ridge_ext_coord,
                     self.ridge_beta,
                     false,
+                    self.surrogate_lane.as_mut(),
                 );
             }
             if spent >= budget {
@@ -2866,7 +2905,7 @@ impl SaeManifoldOuterObjective {
                 // "did not converge" refusal — warm from the current
                 // partially-refined state. The forcing lane thus never mints a
                 // refusal of its own for this class.
-                return self.term.reml_criterion_with_refine_policy(
+                return self.term.reml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
                     self.registry.as_ref(),
@@ -2875,6 +2914,7 @@ impl SaeManifoldOuterObjective {
                     self.ridge_ext_coord,
                     self.ridge_beta,
                     false,
+                    self.surrogate_lane.as_mut(),
                 );
             }
         }
