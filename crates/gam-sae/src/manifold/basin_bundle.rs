@@ -69,6 +69,17 @@ impl<S> BasinBundle<S> {
         self.members.is_empty()
     }
 
+    /// Drop every saved basin and reset the eval clock. Called by the outer
+    /// objective at any seam that invalidates the saved states wholesale — a
+    /// multi-start reset, a fresh β seed, a row-support swap (subsample
+    /// engage/restore), or a homotopy basin mutation — the same seams that
+    /// discard the single-shot probe→accept handoff. The bundle re-seeds itself
+    /// from the new accepted basin on the next envelope evaluation.
+    pub fn clear(&mut self) {
+        self.members.clear();
+        self.eval_counter = 0;
+    }
+
     /// Current envelope argmin member, if any evaluation has happened.
     pub fn argmin(&self) -> Option<&BasinMember<S>> {
         self.members

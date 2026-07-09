@@ -529,8 +529,188 @@ impl CalibrationRng {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UQ-surface registry + completeness contract (issue #1891).
+//
+// The two primitives above — SBC rank uniformity and the coverage sweep — are
+// the audit *engine*. The registry is the *contract*: every uncertainty-bearing
+// surface the library exposes is enumerated here, tagged with the audit mode
+// that gates it and the gate test that exercises it. A public result-payload
+// field carrying an SE, an interval bound, a p-value, or a certificate that maps
+// to NO registered target fails the completeness lint
+// ([`assert_registry_covers_fields`]) — the mechanism that stops the next
+// recycled-SE (#1875) from shipping unaudited.
+//
+// The registry TYPES live here (generic, dependency-light). The concrete
+// registry rows and the exhaustive payload field-walk live in the calibration
+// test suite (`tests/quality/calibration/`), which is the only layer that can
+// name the upper-crate payload structs (`PredictUncertaintyResult`, the ALO /
+// conformal / model-comparison / ρ-posterior results).
+// ---------------------------------------------------------------------------
+
+/// Type-I error rates the test-size audit sweeps, matching the issue's
+/// `α ∈ {0.01, 0.05, 0.1}`. A test surface is anti-conservative when its
+/// empirical size at `α` exceeds `α` beyond MC error — audited as coverage of
+/// the *non-rejection* event at nominal `1 − α`, so the shared Wilson verdict
+/// applies unchanged (an over-sized test under-covers non-rejection).
+pub const TEST_SIZE_ALPHAS: [f64; 3] = [0.01, 0.05, 0.10];
+
+/// The statistical kind of an uncertainty surface. Selects the audit mode and
+/// documents the object under test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceKind {
+    /// Wald / delta-method interval for a scalar or coefficient estimate.
+    WaldDeltaInterval,
+    /// Bayesian credible band for a mean / smooth function. `smoothing_corrected`
+    /// distinguishes the conditional `Vp` band (`false`) from the smoothing-
+    /// corrected `Vc` band (`true`) — the two surfaces the #1871 INLA comparison
+    /// separates.
+    CredibleBand { smoothing_corrected: bool },
+    /// Approximate-leave-one-out / LOO predictive standard error (#1869).
+    AloStandardError,
+    /// Split / full conformal predictive interval.
+    ConformalInterval,
+    /// Predictive (observation) interval for a named response family.
+    PredictiveInterval,
+    /// Frequentist test p-value; audited as a type-I size curve under a
+    /// simulated null (#1872 post-selection LR, #1873 Bartlett/Lawley).
+    TestPValue,
+    /// Posterior-sample surface audited by SBC rank uniformity (NUTS,
+    /// ρ-posterior #1810, Polya-Gamma).
+    PosteriorSample,
+}
+
+/// Which audit primitive gates a target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditMode {
+    /// Empirical coverage vs nominal at [`COVERAGE_NOMINAL_LEVELS`]
+    /// (`run_coverage` + `audit_coverage`); anti-conservative gates.
+    CoverageSweep,
+    /// Type-I size curve at [`TEST_SIZE_ALPHAS`] under a simulated null; an
+    /// empirical size above `α` beyond MC error gates.
+    TestSizeCurve,
+    /// SBC rank-uniformity histogram (`run_sbc` + `audit_sbc_uniformity`).
+    SbcRankUniformity,
+}
+
+/// One registered uncertainty surface: a row of the #1891 completeness contract.
+#[derive(Clone, Debug)]
+pub struct CalibrationTarget {
+    /// Stable identifier, referenced by the completeness lint's field map.
+    pub name: &'static str,
+    /// Statistical kind of the surface.
+    pub kind: SurfaceKind,
+    /// Audit primitive that gates this target.
+    pub mode: AuditMode,
+    /// Cluster issues whose regression this target's gate would catch.
+    pub guards: &'static [u32],
+    /// The gate test (`binary::module` or file stem) exercising it end to end.
+    pub audited_by: &'static str,
+}
+
+/// How a public result-payload field relates to the UQ registry, assigned by
+/// the completeness lint's exhaustive field walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldDisposition {
+    /// A point estimate or non-uncertainty metadata field — no coverage claim,
+    /// so no registered target is required.
+    NotUncertainty,
+    /// An uncertainty-bearing field (SE / interval bound / p-value / certificate)
+    /// whose calibration is audited by the registered target of this name.
+    AuditedBy(&'static str),
+}
+
+/// One classified payload field produced by the exhaustive field-walk.
+#[derive(Clone, Debug)]
+pub struct FieldAudit {
+    /// The payload field's Rust identifier.
+    pub field: &'static str,
+    /// Its relationship to the registry.
+    pub disposition: FieldDisposition,
+}
+
+impl FieldAudit {
+    /// A point-estimate / metadata field carrying no coverage claim.
+    pub const fn point(field: &'static str) -> Self {
+        Self { field, disposition: FieldDisposition::NotUncertainty }
+    }
+
+    /// An uncertainty field audited by the registered target `target`.
+    pub const fn audited(field: &'static str, target: &'static str) -> Self {
+        Self { field, disposition: FieldDisposition::AuditedBy(target) }
+    }
+}
+
+/// The completeness contract (#1891): every payload field classified
+/// `AuditedBy(t)` must name a registered target.
+///
+/// Panics (fails the lint) if any field points at an unregistered target — that
+/// is the "an uncertainty surface not in the registry fails" invariant. The
+/// complementary EXHAUSTIVENESS half — that no uncertainty field was omitted
+/// from `fields` — is enforced at the call site by an exhaustive struct
+/// destructure with no `..` rest pattern, so adding a payload field forces a
+/// classification here rather than silently shipping unaudited.
+pub fn assert_registry_covers_fields(fields: &[FieldAudit], registry: &[CalibrationTarget]) {
+    let registered: std::collections::BTreeSet<&str> = registry.iter().map(|t| t.name).collect();
+    let mut orphans = Vec::new();
+    for f in fields {
+        if let FieldDisposition::AuditedBy(target) = f.disposition {
+            if !registered.contains(target) {
+                orphans.push(format!(
+                    "payload field `{}` claims uncertainty audited by `{target}`, which is \
+                     NOT in the UQ-surface registry — register a CalibrationTarget for it",
+                    f.field
+                ));
+            }
+        }
+    }
+    assert!(
+        orphans.is_empty(),
+        "UQ completeness lint failed — unregistered uncertainty surfaces:\n{}",
+        orphans.join("\n")
+    );
+}
+
+/// Assert every registered target is exercised by a named gate and, for the
+/// posterior kinds, routed to the SBC audit mode (a `PosteriorSample` audited by
+/// a coverage sweep would silently miss the shape miscalibration SBC exists to
+/// catch). This is the registry's internal consistency check, complementary to
+/// the field-coverage lint.
+pub fn assert_registry_well_formed(registry: &[CalibrationTarget]) {
+    let mut problems = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for t in registry {
+        if !seen.insert(t.name) {
+            problems.push(format!("duplicate registry name `{}`", t.name));
+        }
+        if t.audited_by.is_empty() {
+            problems.push(format!("target `{}` names no gate (`audited_by` empty)", t.name));
+        }
+        let mode_ok = match t.kind {
+            SurfaceKind::PosteriorSample => t.mode == AuditMode::SbcRankUniformity,
+            SurfaceKind::TestPValue => t.mode == AuditMode::TestSizeCurve,
+            _ => t.mode == AuditMode::CoverageSweep,
+        };
+        if !mode_ok {
+            problems.push(format!(
+                "target `{}` kind {:?} routed to the wrong audit mode {:?}",
+                t.name, t.kind, t.mode
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "UQ registry is malformed:\n{}",
+        problems.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        AuditMode, CalibrationTarget, FieldAudit, FieldDisposition, SurfaceKind,
+        assert_registry_covers_fields, assert_registry_well_formed,
+    };
     use super::{
         CalibrationRng, ConjugateGaussianModel, SBC_BINS, SBC_POSTERIOR_DRAWS_PER_REP,
         SBC_REPLICATIONS, audit_sbc_uniformity, run_sbc, sbc_rank,
@@ -726,5 +906,72 @@ mod tests {
         let n = 20_000;
         let mean = (0..n).map(|_| rng.standard_normal()).sum::<f64>() / n as f64;
         assert!(mean.abs() < 0.05, "standard-normal mean drifted: {mean}");
+    }
+
+    fn tiny_registry() -> Vec<CalibrationTarget> {
+        vec![
+            CalibrationTarget {
+                name: "mean_credible_band",
+                kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
+                mode: AuditMode::CoverageSweep,
+                guards: &[1870, 1871],
+                audited_by: "sbc_gaussian_smooth_band_coverage",
+            },
+            CalibrationTarget {
+                name: "rho_posterior_certificate",
+                kind: SurfaceKind::PosteriorSample,
+                mode: AuditMode::SbcRankUniformity,
+                guards: &[1810],
+                audited_by: "calibration::rho_posterior_sbc",
+            },
+        ]
+    }
+
+    #[test]
+    fn completeness_lint_accepts_fully_mapped_payload_and_rejects_an_orphan() {
+        let registry = tiny_registry();
+        // A payload whose only uncertainty field maps to a registered target,
+        // plus a point estimate that needs no target — must pass.
+        let ok = [
+            FieldAudit::point("mean"),
+            FieldAudit::audited("mean_lower", "mean_credible_band"),
+        ];
+        assert_registry_covers_fields(&ok, &registry);
+
+        // Introduce a field auditing an UNREGISTERED surface — the exact
+        // "recycled SE ships unaudited" failure the lint exists to block.
+        let orphaned = [FieldAudit::audited("observation_lower", "predictive_interval_gaussian")];
+        let caught = std::panic::catch_unwind(|| {
+            assert_registry_covers_fields(&orphaned, &tiny_registry());
+        });
+        assert!(
+            caught.is_err(),
+            "completeness lint must reject a payload field pointing at an unregistered target"
+        );
+    }
+
+    #[test]
+    fn well_formed_check_flags_wrong_audit_mode_for_a_posterior_kind() {
+        assert_registry_well_formed(&tiny_registry());
+        // A posterior surface routed to a coverage sweep (which cannot see the
+        // shape miscalibration SBC catches) must be flagged.
+        let mis = vec![CalibrationTarget {
+            name: "nuts_posterior",
+            kind: SurfaceKind::PosteriorSample,
+            mode: AuditMode::CoverageSweep,
+            guards: &[1841],
+            audited_by: "somewhere",
+        }];
+        let caught = std::panic::catch_unwind(|| assert_registry_well_formed(&mis));
+        assert!(caught.is_err(), "posterior kind on a coverage sweep must be flagged");
+    }
+
+    #[test]
+    fn field_disposition_constructors_tag_correctly() {
+        assert_eq!(FieldAudit::point("eta").disposition, FieldDisposition::NotUncertainty);
+        assert_eq!(
+            FieldAudit::audited("eta_lower", "band").disposition,
+            FieldDisposition::AuditedBy("band")
+        );
     }
 }

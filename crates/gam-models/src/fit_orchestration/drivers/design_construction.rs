@@ -2795,10 +2795,29 @@ fn relax_smoothing_rho_prior(
         || options.mixture_link.is_some()
         || options.optimize_mixture;
     let has_moving_kappa = design.smooth.terms.iter().any(|t| {
+        // A PURE (scale-free) Duchon / polyharmonic smooth carries NO free length
+        // scale: its radial scale is REML-unidentifiable, so — exactly like
+        // thin-plate — the isotropic κ prescan skips it
+        // (`prescan_isotropic_spatial_range_seed`: "Pure Duchon / TPS without a
+        // length scale are skipped"), it is never assigned a `length_scale`, and it
+        // appends NO moving log-κ ρ coordinate. The inner ρ vector then aligns 1:1
+        // with `penaltyinfo` just as it does for `tp`, so relaxing its symmetric
+        // cap is length-safe. Only a HYBRID Duchon-Matérn term
+        // (`length_scale = Some`) or an ANISOTROPIC Duchon (`aniso_log_scales =
+        // Some`) puts a genuine moving κ into the inner ρ vector and needs the cap
+        // as a stabiliser. Treat pure Duchon as κ-free; every other spatial family
+        // keeps the blanket exclusion.
+        if let BasisMetadata::Duchon {
+            length_scale,
+            aniso_log_scales,
+            ..
+        } = &t.metadata
+        {
+            return length_scale.is_some() || aniso_log_scales.is_some();
+        }
         matches!(
             t.metadata,
             BasisMetadata::Matern { .. }
-                | BasisMetadata::Duchon { .. }
                 | BasisMetadata::Sphere { .. }
                 | BasisMetadata::SphereHarmonics { .. }
                 | BasisMetadata::ConstantCurvature { .. }
@@ -2878,12 +2897,31 @@ fn relax_smoothing_rho_prior(
         .terms
         .iter()
         .filter(|t| {
-            matches!(
+            (matches!(
                 t.metadata,
                 BasisMetadata::BSpline1D { .. }
                     | BasisMetadata::ThinPlate { .. }
                     | BasisMetadata::TensorBSpline { .. }
             )
+            // A PURE (scale-free) Duchon / polyharmonic smooth IS a thin-plate
+            // spline (unidentifiable radial scale, no moving κ coordinate — see the
+            // `has_moving_kappa` note), so its smoothing log-λ earns the SAME cap
+            // relaxation as `tp`. A straight-line truth under a Duchon bending
+            // penalty drives λ → ∞ (the collapse shelf mgcv `bs="ds"` rails to,
+            // edf → null); the symmetric `Normal{0,3}` cap otherwise pins it in the
+            // under-smoothed interior (#1867 null-recovery over-smoothing: the
+            // summed-diagonal shelf seed b26e1cfe9 could never win because
+            // `compute_cost` charged it the cap's ρ²/2·9 penalty). Hybrid
+            // Duchon-Matérn (`length_scale = Some`) / anisotropic Duchon keep the
+            // cap — their κ is a real moving coordinate that needs the stabiliser.
+            || matches!(
+                t.metadata,
+                BasisMetadata::Duchon {
+                    length_scale: None,
+                    aniso_log_scales: None,
+                    ..
+                }
+            ))
             // SHAPE-CONSTRAINED terms must KEEP the cap (#1380). A monotone /
             // convex / concave smooth carries linear-inequality constraints; at
             // the active boundary (e.g. a convex fit pinned at 2nd-diff = 0) the

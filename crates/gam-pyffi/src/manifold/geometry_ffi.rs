@@ -973,6 +973,55 @@ fn sae_solve_chart_coordinates<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Per-row / per-atom SAE trust scores from an assignment matrix and the
+/// per-atom trust vector. Returns `(row, per_atom)` where `row` is `(N,)` and
+/// `per_atom` is `(N, K)`. See `gam_sae::trust_scores::row_trust_scores`.
+#[pyfunction]
+fn sae_row_trust_scores<'py>(
+    py: Python<'py>,
+    assignments: PyReadonlyArray2<'py, f64>,
+    atom_trust: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)> {
+    let assignments_owned = assignments.as_array().to_owned();
+    let atom_trust_owned = atom_trust.as_array().to_owned();
+    let (row, per_atom) = py
+        .detach(move || {
+            gam::terms::sae::trust_scores::row_trust_scores(
+                assignments_owned.view(),
+                atom_trust_owned.view(),
+            )
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        row.into_pyarray(py).unbind(),
+        per_atom.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Value and encoder-gradient of the period-1 coordinate alignment penalty for
+/// the torch manifold-SAE trainer. `encoder` and `solved` are `(N, F)`; returns
+/// `(value, grad)` where `grad` is `∂value/∂encoder` `(N, F)`. `solved` is a
+/// constant (the detached E-step solve). See
+/// `gam_sae::chart_coordinate_solve::position_alignment_penalty`.
+#[pyfunction]
+fn sae_position_alignment_penalty<'py>(
+    py: Python<'py>,
+    encoder: PyReadonlyArray2<'py, f64>,
+    solved: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(f64, Py<PyArray2<f64>>)> {
+    let encoder_owned = encoder.as_array().to_owned();
+    let solved_owned = solved.as_array().to_owned();
+    let (value, grad) = py
+        .detach(move || {
+            gam::terms::sae::chart_coordinate_solve::position_alignment_penalty(
+                encoder_owned.view(),
+                solved_owned.view(),
+            )
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok((value, grad.into_pyarray(py).unbind()))
+}
+
 /// Device-resident periodic basis+jet for the torch manifold-SAE lane.
 ///
 /// `t_dev_ptr`, `phi_dev_ptr`, `jet_dev_ptr` are RAW CUDA device addresses of
@@ -4725,6 +4774,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
     module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_solve_chart_coordinates, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_row_trust_scores, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_position_alignment_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_basis_with_jet_cuda, module)?)?;

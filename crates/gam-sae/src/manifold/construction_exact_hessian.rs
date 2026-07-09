@@ -291,6 +291,43 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
+        self.analytic_outer_rho_gradient_components_with_bundle(
+            target, rho, loss, cache, solver, None,
+        )
+    }
+
+    /// #2080 forward plumbing — the analytic outer-ρ gradient with an OPTIONAL
+    /// shared selected-inverse probe bundle `(z_j, S⁻¹ z_j)`.
+    ///
+    /// When `inverse_probe_bundle` is `Some`, the two `½log|H|`-trace channels
+    /// that have matrix-free selected-inverse siblings — the per-atom decoder
+    /// smoothness EDF `tr(H⁻¹ M_k)` and the per-(atom,axis) ARD log-precision
+    /// Hessian trace `½tr(H⁻¹ ∂H/∂logα)` — are evaluated off that bundle
+    /// (`decoder_smoothness_effective_dof_per_atom_from_probes` /
+    /// `ard_log_precision_hessian_trace_from_probes`) instead of the dense
+    /// `DeflatedArrowSolver` selected inverse. They convert together as ONE
+    /// all-or-nothing cluster on the single `Some` (invariant #1): never a
+    /// partial mix within a single eval.
+    ///
+    /// The analytic-gradient cluster is DENSE-ONLY today (invariant #3): every
+    /// production caller passes `None`, so this `Some` branch is dormant forward
+    /// plumbing that the eventual routing flip (once the surrogate lane owns the
+    /// analytic gradient, not just the EFS lane) will exercise. Flipping any
+    /// caller to `Some` additionally requires matrix-free siblings for the
+    /// channels that still consume `solver` even on the `Some` branch — the
+    /// assignment/learnable-IBP log-strength traces and the `logdet_theta_adjoint`
+    /// envelope Γ (#2080 task-2, the θ-adjoint `tr(S⁻¹·M)` fold) — so the `solver`
+    /// argument is still required here and the flip stays off until that gap
+    /// closes.
+    pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
+    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -337,15 +374,31 @@ impl SaeManifoldTerm {
                 *v *= renorm;
             }
         }
-        let smooth_logdet = self
-            .decoder_smoothness_effective_dof_with_solver_per_atom(
-                cache,
-                solver,
-                &lambda_smooth_vec,
-            )
-            .map_err(|err| OuterGradientError::InternalInvariant {
-                reason: format!("analytic_outer_rho_gradient_components: {err}"),
-            })?;
+        // #2080: the per-atom smoothness EDF `tr(H⁻¹ M_k)` off the shared
+        // selected-inverse bundle when the surrogate lane supplied it; the dense
+        // `DeflatedArrowSolver` selected inverse otherwise (all callers today).
+        let smooth_logdet = match inverse_probe_bundle {
+            Some((probes, sinv)) => self
+                .decoder_smoothness_effective_dof_per_atom_from_probes(
+                    probes,
+                    sinv,
+                    &lambda_smooth_vec,
+                )
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!(
+                        "analytic_outer_rho_gradient_components: smooth dof (matrix-free): {err}"
+                    ),
+                })?,
+            None => self
+                .decoder_smoothness_effective_dof_with_solver_per_atom(
+                    cache,
+                    solver,
+                    &lambda_smooth_vec,
+                )
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!("analytic_outer_rho_gradient_components: {err}"),
+                })?,
+        };
         let smooth_occam = self
             .reml_occam_log_lambda_smooth_derivative(rho)
             .map_err(OuterGradientError::internal)?;
@@ -358,11 +411,28 @@ impl SaeManifoldTerm {
         let ard_explicit = self
             .ard_log_precision_explicit_derivatives(rho)
             .map_err(OuterGradientError::internal)?;
-        let ard_trace = self
-            .ard_log_precision_hessian_trace(rho, cache, solver)
-            .map_err(|err| OuterGradientError::InternalInvariant {
-                reason: format!("analytic_outer_rho_gradient_components: {err}"),
-            })?;
+        // #2080: the per-(atom,axis) ARD log-precision Hessian trace
+        // `½tr(H⁻¹ ∂H/∂logα)` off the SAME shared selected-inverse bundle (the
+        // all-or-nothing cluster's second channel) when present; the dense
+        // deflated selected inverse otherwise. The from-probes channel HARD-REFUSES
+        // any row carrying gauge/rotation deflation (the plain-S⁻¹ bundle cannot
+        // reconstruct the Daleckii–Krein correction), routing that fit to the dense
+        // channel rather than silently dropping the correction.
+        let ard_trace = match inverse_probe_bundle {
+            Some((probes, sinv)) => self
+                .ard_log_precision_hessian_trace_from_probes(rho, cache, probes, sinv)
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!(
+                        "analytic_outer_rho_gradient_components: ARD logdet trace \
+                         (matrix-free): {err}"
+                    ),
+                })?,
+            None => self
+                .ard_log_precision_hessian_trace(rho, cache, solver)
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!("analytic_outer_rho_gradient_components: {err}"),
+                })?,
+        };
         // #1026 shared-ARD: `ard_flat_index` maps `(k, axis)` onto the flat outer
         // coordinate for BOTH parameterizations. In `Shared` mode several atoms
         // alias one axis coordinate `1+K+axis`, and the outer derivative there is

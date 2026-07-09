@@ -4535,17 +4535,12 @@ def _trust_scores(model: ManifoldSAE, activations: np.ndarray | None = None) -> 
             "trust score assignments shape mismatch: "
             f"expected {(n_rows, n_atoms)}, got {assignments.shape}"
         )
-    weights = np.clip(assignments, 0.0, np.inf)
-    denom = weights.sum(axis=1)
-    normalized = np.divide(
-        weights,
-        denom[:, None],
-        out=np.zeros_like(weights, dtype=float),
-        where=denom[:, None] > 0.0,
+    row, per_atom = rust_module().sae_row_trust_scores(
+        np.ascontiguousarray(assignments, dtype=np.float64),
+        np.ascontiguousarray(atom_trust, dtype=np.float64),
     )
-    per_atom = normalized * atom_trust[None, :]
     return {
-        "row": per_atom.sum(axis=1),
+        "row": row,
         "per_atom": per_atom,
         "atom": atom_trust,
         "diagnostics": model.diagnostics,

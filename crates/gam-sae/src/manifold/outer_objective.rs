@@ -420,6 +420,24 @@ pub struct OuterProbeTelemetry {
     /// probe that exhausted the probe budget without meeting its gate) are not
     /// observable from this lane and are excluded identically in both modes.
     pub probe_inner_iterations: usize,
+    /// Basin-bundle lower-envelope telemetry (see [`BasinBundle`]). The outer
+    /// value lanes evaluate `V*(ρ) = min_b V_b(ρ)` over a small bundle of saved
+    /// inner basins instead of the single hysteretic warm-start trajectory
+    /// (#2230/#2087). These counters make the envelope's work observable.
+    ///
+    /// `basin_envelope_evals` — value-lane evaluations that ran the envelope
+    /// (dense-admitted, `inner_max_iter > 0`; the streaming / freeze bypass does
+    /// not increment it). `basin_admissions` — distinct new basins admitted to
+    /// the bundle across the fit (a growth event, not a duplicate-replace).
+    /// `basin_envelope_rescues` — envelope evals where a SAVED basin beat the
+    /// fresh discovery trajectory by more than the inner objective stall
+    /// tolerance, i.e. where the single-trajectory criterion would have jumped
+    /// UP across a basin boundary and the envelope held it down. `basin_max_members`
+    /// — the largest bundle size reached (bounded by the derived `max_members`).
+    pub basin_envelope_evals: usize,
+    pub basin_admissions: usize,
+    pub basin_envelope_rescues: usize,
+    pub basin_max_members: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -448,7 +466,7 @@ impl OuterProbeTelemetry {
 ///
 /// The generic outer line search evaluates its cost probes through the
 /// value-only lane (`eval_with_order(Value)` / `eval_cost` →
-/// `evaluate_value_probe_with_refine_policy`), each of which drives the FULL
+/// `evaluate_envelope_value_probe` → `evaluate_value_probe_with_drive`), each of which drives the FULL
 /// inner `(t, β)` Newton solve to KKT convergence at the probed ρ — starting
 /// from the accepted basin — and then RESTORES the accepted term, discarding
 /// that converged state. The accepted point of a successful line search is
@@ -660,6 +678,7 @@ impl ProbeForcingState {
 }
 
 /// How a criterion evaluation drives the inner `(t, β)` solve.
+#[derive(Clone, Copy)]
 enum ProbeInnerDrive {
     /// Historical path: hand the whole inner drive to
     /// `reml_criterion_with_refine_policy` (accepted-basin evaluations, the
@@ -736,6 +755,51 @@ pub struct SaeManifoldOuterObjective {
     /// lane self-heals across basin mutations (its plan rebuilds when the reduced-
     /// Schur dimension changes), so it is NOT cleared with `probe_converged_handoff`.
     surrogate_lane: Option<SurrogateLaneState>,
+    /// #2230/#2087 — the basin lower-envelope bundle. The historical outer
+    /// criterion is the hysteretic single-trajectory value `V_{b(warm,ρ)}(ρ)`:
+    /// whichever inner basin the warm-started solve at ρ happens to land in. That
+    /// value JUMPS at basin-boundary crossings, which is the measured pathology
+    /// (hours of `[#1026] restoring inner-fit reconstruction incumbent` churn = the
+    /// outer line search oscillating across a boundary it cannot represent). This
+    /// bundle holds a small set of saved converged inner basins; every value-lane
+    /// evaluation re-converges each member from its own state (warm ⇒ cheap), plus
+    /// runs the one historical discovery trajectory, and returns the MINIMUM —
+    /// the continuous, piecewise-smooth lower envelope `V*(ρ) = min_b V_b(ρ)`. The
+    /// argmin basin's converged state is handed to the gradient lane (via
+    /// `probe_converged_handoff`), so the accepted point's analytic λ-gradient
+    /// prices the argmin basin (envelope theorem, exact a.e.). Admitting a basin
+    /// can only LOWER the envelope, so discovery strictly improves the criterion
+    /// surface. Cleared with `probe_converged_handoff` at every accepted-basin /
+    /// row-support seam; bypassed in the streaming and `inner_max_iter == 0`
+    /// freeze regimes (see `evaluate_envelope_value_probe`).
+    basin_bundle: BasinBundle<SaeManifoldTerm>,
+}
+
+/// #2230/#2087 basin-bundle sizing, derived from problem structure (no tuning).
+///
+/// `max_members` — the number of plausible COEXISTING inner basins the outer
+/// line search can straddle. The pathology is a boundary between (at least) two
+/// basins, so the floor is 2. Distinct basins arise from distinct atom routings;
+/// along the low-dimensional ρ line search only a few compete simultaneously, so
+/// the cap is 4 (which also bounds per-eval cost to ≤ 5 inner solves: 4 members
+/// plus the one discovery trajectory). `K` atoms bound the reachable
+/// single-flip basin count, so clamp to `K` when `K < 4`.
+///
+/// `dominance_window` — how many envelope evaluations a saved basin may sit
+/// dominated before it is pruned. One outer line-search direction issues at most
+/// a StrongWolfe attempt (≤ 20 value probes) followed by a backtracking fallback
+/// (≤ 50 probes) — 70 envelope evaluations; the outer bridge only declares a
+/// neighbourhood infeasible after TWO such directions fail. A basin can therefore
+/// legitimately sit dominated for a whole outer iteration's probing and win again
+/// at the next accepted iterate, so the window spans two directions: 2 × 70.
+const BASIN_BUNDLE_LINE_SEARCH_PROBES_PER_DIRECTION: u64 = 70;
+
+fn basin_bundle_max_members(k_atoms: usize) -> usize {
+    k_atoms.clamp(2, 4)
+}
+
+fn basin_bundle_dominance_window() -> u64 {
+    2 * BASIN_BUNDLE_LINE_SEARCH_PROBES_PER_DIRECTION
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
@@ -784,6 +848,7 @@ impl SaeManifoldOuterObjective {
         term.structural_cocollapse_reseeds = 0;
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
+        let term_k_atoms = term.k_atoms();
         let mut objective = Self {
             term,
             baseline_term,
@@ -805,6 +870,10 @@ impl SaeManifoldOuterObjective {
             probe_converged_handoff: None,
             forcing: ProbeForcingState::new(),
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
+            basin_bundle: BasinBundle::new(
+                basin_bundle_max_members(term_k_atoms),
+                basin_bundle_dominance_window(),
+            ),
         };
         // Magic by default: above the row-count threshold, run the outer ρ search
         // on a deterministic Horvitz–Thompson row subsample; the final fit and all
@@ -879,6 +948,10 @@ impl SaeManifoldOuterObjective {
         // #2080 (a) — the accepted basin just changed row support; any pending
         // probe handoff (full-N state) is invalid against the subsampled term.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — the saved basin states are on the FULL-N row support; the
+        // ρ search now runs on the subsample, so they are invalid. Same rule as
+        // the handoff above: any accepted-basin / row-support seam clears both.
+        self.basin_bundle.clear();
         self.probe_telemetry.subsample_rows = n_sub;
         self.probe_telemetry.subsample_full_rows = n_full;
         self.row_subsample = Some(OuterRowSubsample {
@@ -1004,6 +1077,8 @@ impl SaeManifoldOuterObjective {
         // #2080 (a) — a probe handoff captured on the subsampled rows must never
         // warm-start a full-`N` evaluation.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — subsampled saved basins are invalid at full N.
+        self.basin_bundle.clear();
         // The subsample→full-`N` swap changes the criterion's scale, so the
         // subsampled gradient decay is not the full-`N` optimality measure:
         // drop the Eisenstat–Walker ratio. (The ρ search is over by now anyway
@@ -1470,6 +1545,8 @@ impl SaeManifoldOuterObjective {
         // #2080 (a) — this diagnostic commits its own inner solves to the
         // accepted basin; drop any pending probe handoff.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — the ρ search is over; drop the saved basins too.
+        self.basin_bundle.clear();
         let rho_hat_flat = self.current_rho.to_flat();
         let dir = deterministic_probe_direction(rho_hat_flat.view());
         let h = probe_step(rho_hat_flat.view());
@@ -1569,6 +1646,8 @@ impl SaeManifoldOuterObjective {
         // #2080 (a) — this diagnostic runs its own inner solves against the
         // accepted basin; drop any pending probe handoff.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — the ρ search is over; drop the saved basins too.
+        self.basin_bundle.clear();
         let rho = self.current_rho.clone();
         let plan = self.term.streaming_plan().admitted_or_error(
             self.term.n_obs(),
@@ -1678,6 +1757,9 @@ impl SaeManifoldOuterObjective {
         // #2080 (a) — the homotopy walk mutates the accepted basin through its
         // own corrector solves; drop any pending probe handoff.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — the homotopy walk moves the accepted basin; the saved
+        // basins predate it and no longer describe reachable minima.
+        self.basin_bundle.clear();
         let isometry_targets = self
             .registry
             .as_ref()
@@ -2581,6 +2663,7 @@ impl SaeManifoldOuterObjective {
                 refine_progress_extension,
             },
             fold_cotrain,
+            false,
         )
     }
 
@@ -2597,6 +2680,7 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
         drive: ProbeInnerDrive,
         fold_cotrain: bool,
+        basin_installed: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
         // #2080 (a) — install the last value probe's converged inner state when
@@ -2610,14 +2694,22 @@ impl SaeManifoldOuterObjective {
         // be re-applied on top of the converged state; likewise the amortized
         // latent warm-start is skipped — it is a basin-ENTRY heuristic, and the
         // installed state is already AT the converged optimum for this ρ.
-        let probe_handoff_installed =
-            if let Some(converged) = self.take_probe_converged_handoff(rho_flat) {
-                self.term = converged;
-                self.seeded_beta = None;
-                true
-            } else {
-                false
-            };
+        // #2230/#2087 — `basin_installed` (the basin-bundle member lane): the
+        // caller has already installed a saved converged basin state into
+        // `self.term` and wants it re-converged AT that state, so this evaluation
+        // must NOT consult the probe handoff (it would clobber the installed
+        // basin) and must skip the seeded-β re-apply and the amortized latent
+        // basin-ENTRY warm start — exactly the handoff path's semantics, since an
+        // installed member is already at (or near) its basin's converged optimum.
+        let probe_handoff_installed = if basin_installed {
+            true
+        } else if let Some(converged) = self.take_probe_converged_handoff(rho_flat) {
+            self.term = converged;
+            self.seeded_beta = None;
+            true
+        } else {
+            false
+        };
         if let Some(beta) = self.seeded_beta.take() {
             // Warm-start the inner decoder coefficients before the solve.
             if beta.len() == self.term.beta_dim() {
@@ -2936,25 +3028,10 @@ impl SaeManifoldOuterObjective {
     /// Evaluate a value-only rho probe without committing the inner basin it
     /// reaches. The generic line search may reject this point, so its solved
     /// coordinates/decoder must not become the warm-start state for later
-    /// probes or for the accepted iterate.
-    fn evaluate_value_probe_with_refine_policy(
-        &mut self,
-        rho_flat: ArrayView1<'_, f64>,
-        fold_cotrain: bool,
-    ) -> Result<(f64, Array1<f64>), String> {
-        self.evaluate_value_probe_with_drive(
-            rho_flat,
-            fold_cotrain,
-            ProbeInnerDrive::Criterion {
-                refine_progress_extension: false,
-            },
-        )
-    }
-
-    /// As [`Self::evaluate_value_probe_with_refine_policy`], with the inner
-    /// drive selected by the caller: the line-search lane
-    /// (`eval_with_order(Value)`) passes the Eisenstat–Walker forced-probe
-    /// drive, every other value lane the historical criterion drive.
+    /// probes or for the accepted iterate. The inner `(t, β)` drive is selected
+    /// by the caller: the line-search lane (`eval_with_order(Value)`) passes the
+    /// Eisenstat–Walker forced-probe drive, every other value lane the historical
+    /// criterion drive (`Criterion { refine_progress_extension: false }`).
     fn evaluate_value_probe_with_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2965,7 +3042,7 @@ impl SaeManifoldOuterObjective {
         let saved_rho = self.current_rho.clone();
         let saved_loss = self.last_loss.clone();
         let saved_seeded_beta = self.seeded_beta.clone();
-        let result = self.evaluate_with_inner_drive(rho_flat, drive, fold_cotrain);
+        let result = self.evaluate_with_inner_drive(rho_flat, drive, fold_cotrain, false);
         // #2080 (a) — instead of discarding the probe's converged inner state,
         // hand it off (a move: swapped against the restored `saved_term`, no
         // extra clone) to the next evaluation at this exact ρ — the line-search
@@ -2995,6 +3072,215 @@ impl SaeManifoldOuterObjective {
         self.last_loss = saved_loss;
         self.seeded_beta = saved_seeded_beta;
         result
+    }
+
+    /// #2230/#2087 — evaluate the basin lower envelope `V*(ρ) = min_b V_b(ρ)` for
+    /// the value lanes (`eval_cost`, `eval_with_order(Value)`), replacing the
+    /// single hysteretic warm-start trajectory. The steps:
+    ///
+    /// 1. **Bypass.** In the streaming / matrix-free regime (no dense per-round
+    ///    assembly, so the value path is the cost-only streaming cascade) and
+    ///    under the `inner_max_iter == 0` FREEZE contract (verbatim reuse, no
+    ///    exploration), the bundle is bypassed and the historical single probe is
+    ///    returned byte-for-byte. The streaming state snapshot is a subsampled /
+    ///    matrix-free term whose per-basin re-convergence has no dense factor, and
+    ///    the freeze lane must not re-converge anything.
+    /// 2. **Seed.** On the first envelope evaluation the bundle admits the current
+    ///    accepted basin (`self.term`).
+    /// 3. **Discovery.** Run the ONE historical warm-start probe from the accepted
+    ///    basin (`evaluate_value_probe_with_drive`). It consumes the seeded-β /
+    ///    amortized-encoder warm start, parks its converged term in the probe
+    ///    handoff, and — crucially — is the mechanism by which a basin JUMP is
+    ///    discovered (its warm start can cross a boundary at a far ρ).
+    /// 4. **Members.** Re-converge every saved basin from its OWN state through
+    ///    the cheap value-probe drive (`basin_installed = true`: no warm-start, no
+    ///    seed) — members near their optimum re-converge in a round or two.
+    /// 5. **Admit + envelope.** Admit the discovery basin (new basin ⇒ grow;
+    ///    duplicate ⇒ keep the better value). The envelope value is the bundle
+    ///    argmin over {members ∪ discovery}; the argmin basin's converged state is
+    ///    installed as the probe handoff so the subsequent gradient eval prices
+    ///    THAT basin (envelope theorem). Admission can only LOWER the envelope.
+    ///
+    /// Only the argmin is later re-converged to full tolerance (in `eval`); every
+    /// member and the discovery probe run on the cheap value-probe budget, so the
+    /// per-eval cost is at most `len(bundle) + 1` cheap inner solves.
+    fn evaluate_envelope_value_probe(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        fold_cotrain: bool,
+        drive: ProbeInnerDrive,
+    ) -> Result<(f64, Array1<f64>), String> {
+        // (1) Bypass: streaming/matrix-free (no dense per-basin factor to
+        // re-converge) or the freeze contract (verbatim reuse). Byte-for-byte
+        // historical single trajectory.
+        if self.inner_max_iter == 0 || !self.term.streaming_plan().direct_logdet_admitted() {
+            return self.evaluate_value_probe_with_drive(rho_flat, fold_cotrain, drive);
+        }
+
+        // (2) Seed the bundle with the accepted entry basin on first use. The
+        // placeholder +∞ value is overwritten the first time this member is
+        // re-converged below.
+        if self.basin_bundle.is_empty() {
+            self.basin_bundle
+                .admit(self.term.clone(), f64::INFINITY, |_, _| false);
+        }
+
+        // (3) Discovery trajectory — the historical single warm-start probe. Sets
+        // the probe handoff (if non-wall) to its converged term at this exact ρ.
+        let discovery = self.evaluate_value_probe_with_drive(rho_flat, fold_cotrain, drive);
+        let discovery_cost = match &discovery {
+            Ok((cost, _)) if !Self::probe_value_is_wall(*cost) => Some(*cost),
+            _ => None,
+        };
+        // Reclaim the discovery basin's converged term from the handoff it just
+        // parked (bitwise ρ match, so this retrieves exactly that term). The
+        // envelope argmin's handoff is re-installed at the end.
+        let discovery_term = self.take_probe_converged_handoff(rho_flat);
+
+        // (4) Re-converge every saved member from its own state (cheap, pure). The
+        // bundle is moved out of `self` so the closure can borrow `&mut self` for
+        // the per-member inner drive; restored immediately after.
+        let mut bundle = std::mem::replace(
+            &mut self.basin_bundle,
+            BasinBundle::new(1, basin_bundle_dominance_window()),
+        );
+        let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
+            let (res, converged) =
+                self.converge_member_criterion(rho_flat, state, drive, fold_cotrain);
+            res.map(|value| (converged, value))
+        });
+
+        // (5) Admit the discovery basin and read the envelope. `same_basin_at_rho`
+        // needs the centered target variance normalizer; compute it once.
+        let rho_state = self.baseline_rho.from_flat(rho_flat);
+        let ss_tot = super::fit_drivers::TargetCenteredColStats::compute(self.target.view()).ss_tot;
+        let target = self.target.view();
+        let len_before = bundle.len();
+        if let (Some(term), Some(cost)) = (discovery_term, discovery_cost) {
+            bundle.admit(term, cost, |a, b| {
+                Self::same_basin_at_rho(a, b, target, &rho_state, ss_tot)
+            });
+        }
+        let grew = bundle.len() > len_before;
+        let bundle_len = bundle.len();
+        // Envelope argmin over {members ∪ discovery}. Prefer the argmin member if
+        // any member is finite; otherwise fall back to the discovery result.
+        let envelope = bundle
+            .argmin()
+            .filter(|m| m.last_value.is_finite())
+            .map(|m| (m.last_value, m.state.flatten_beta(), m.state.clone()));
+        self.basin_bundle = bundle;
+
+        // Telemetry.
+        self.probe_telemetry.basin_envelope_evals += 1;
+        if grew {
+            self.probe_telemetry.basin_admissions += 1;
+        }
+        self.probe_telemetry.basin_max_members =
+            self.probe_telemetry.basin_max_members.max(bundle_len);
+
+        match envelope {
+            Some((env_value, env_beta, env_term)) => {
+                // A rescue: a SAVED basin beat the fresh discovery trajectory by
+                // more than the inner objective stall tolerance — the single
+                // trajectory would have jumped UP across a boundary here.
+                if let Some(dcost) = discovery_cost {
+                    let stall = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * dcost.abs().max(1.0);
+                    if dcost - env_value > stall {
+                        self.probe_telemetry.basin_envelope_rescues += 1;
+                    }
+                }
+                // Install the argmin basin's converged state as the handoff so the
+                // gradient lane prices THIS basin (envelope theorem). Only a
+                // non-wall envelope is worth handing off.
+                if !Self::probe_value_is_wall(env_value) {
+                    self.probe_converged_handoff = Some(ProbeConvergedHandoff {
+                        rho_flat: rho_flat.to_owned(),
+                        term: env_term,
+                    });
+                }
+                Ok((env_value, env_beta))
+            }
+            // Every member AND the discovery trajectory were infeasible at this ρ.
+            // Return the discovery verdict verbatim (its typed refusal / error is
+            // what the value lanes already map to the finite collapse wall).
+            None => {
+                let _ = member_eval;
+                discovery
+            }
+        }
+    }
+
+    /// Re-converge one saved basin `member` at `rho_flat` through the cheap
+    /// value-probe `drive`, returning `(criterion, converged_term)`. PURE w.r.t.
+    /// `self`: `term`, `current_rho`, `last_loss`, and `seeded_beta` are all saved
+    /// and restored. `basin_installed = true` so the installed converged state is
+    /// NOT re-warm-started (no amortized encoder entry heuristic) and does NOT
+    /// consume the pending β seed (the seed belongs to the discovery trajectory).
+    fn converge_member_criterion(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        member: &SaeManifoldTerm,
+        drive: ProbeInnerDrive,
+        fold_cotrain: bool,
+    ) -> (Result<f64, String>, SaeManifoldTerm) {
+        let saved_term = std::mem::replace(&mut self.term, member.clone());
+        let saved_rho = self.current_rho.clone();
+        let saved_loss = self.last_loss.clone();
+        // Members must not touch the pending seed — take it out for the duration.
+        let saved_seeded_beta = self.seeded_beta.take();
+        let res = self
+            .evaluate_with_inner_drive(rho_flat, drive, fold_cotrain, true)
+            .map(|(cost, _beta)| cost);
+        let converged = std::mem::replace(&mut self.term, saved_term);
+        self.current_rho = saved_rho;
+        self.last_loss = saved_loss;
+        self.seeded_beta = saved_seeded_beta;
+        (res, converged)
+    }
+
+    /// Basin-identity test for two converged SAE terms evaluated at the SAME ρ:
+    /// the two dictionaries lie in the same inner basin iff their fitted
+    /// reconstructions `Ŷ = Φ·B` coincide to within the fit's own explained-
+    /// variance equality band. The reconstruction and the target-variance
+    /// normalizer are both GAUGE-INVARIANT (chart rotation/reflection and
+    /// cross-atom relabeling leave `Ŷ` unchanged), so this discriminates genuine
+    /// distinct local minima — which fit the data differently — without splitting
+    /// one basin reached through two different gauges. The threshold is
+    /// `SAE_FINAL_EV_DEGRADATION_TOL`, the SAME normalized band the inner keep-best
+    /// (`prefer_candidate_basin`) treats as "equal EV": two fits whose
+    /// reconstructions differ by less than that in explained-variance units are
+    /// the fit's own definition of the same basin, so no new constant is minted.
+    /// A state that cannot be decoded at this ρ is treated as a distinct basin
+    /// (an over-admit is bounded by `max_members` and merely costs an extra cheap
+    /// solve; a false MERGE would silently lose a basin).
+    fn same_basin_at_rho(
+        a: &SaeManifoldTerm,
+        b: &SaeManifoldTerm,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        ss_tot: f64,
+    ) -> bool {
+        if !(ss_tot > 0.0) {
+            return false;
+        }
+        let (Ok(fa), Ok(fb)) = (a.try_fitted_for_rho(rho), b.try_fitted_for_rho(rho)) else {
+            return false;
+        };
+        if fa.dim() != fb.dim() {
+            return false;
+        }
+        let mut diff_sq = 0.0_f64;
+        for (x, y) in fa.iter().zip(fb.iter()) {
+            let d = x - y;
+            diff_sq += d * d;
+        }
+        (diff_sq / ss_tot) < SAE_FINAL_EV_DEGRADATION_TOL
+    }
+
+    /// Basin-bundle member count (test observability).
+    pub(crate) fn basin_bundle_len(&self) -> usize {
+        self.basin_bundle.len()
     }
 
     /// #1154 — add the amortized-encoder consistency fold to an already-computed
@@ -3061,6 +3347,9 @@ impl SaeManifoldOuterObjective {
         // mutation (the handoff is only valid against the basin its probe ran
         // from).
         self.probe_converged_handoff = None;
+        // #2230/#2087 — the EFS lane commits a new accepted basin below; the
+        // saved envelope basins are keyed to the pre-step accepted basin.
+        self.basin_bundle.clear();
         let rho = self.baseline_rho.from_flat(rho_flat);
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
@@ -3511,7 +3800,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is ever paired with this cost, so it is the correct place to carry the
         // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
         self.probe_telemetry.criterion_calls += 1;
-        match self.evaluate_value_probe_with_refine_policy(rho.view(), true) {
+        // #2230/#2087 — descend the basin lower envelope V*(ρ)=min_b V_b(ρ) here
+        // instead of the single hysteretic warm-start trajectory. Same value-probe
+        // drive (`refine_progress_extension = false`) as the historical lane; the
+        // envelope bypasses to it verbatim in the streaming / freeze regimes.
+        match self.evaluate_envelope_value_probe(
+            rho.view(),
+            true,
+            ProbeInnerDrive::Criterion {
+                refine_progress_extension: false,
+            },
+        ) {
             Ok((cost, _beta)) => Ok(cost),
             // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
             // collapse wall the EFS lane returns, not `+∞`. A finite (huge) wall is
@@ -3839,7 +4138,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     eta: self.forcing.line_search_eta(),
                 };
                 let (cost, _beta_hat) =
-                    match self.evaluate_value_probe_with_drive(rho.view(), false, drive) {
+                    match self.evaluate_envelope_value_probe(rho.view(), false, drive) {
                         Ok(evaluated) => evaluated,
                         // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
                         // log-det) presents to the line search as the SAME finite
@@ -3904,6 +4203,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2080 (a) — a reset replaces the accepted basin; a probe handoff from
         // the previous seed's basin must not warm-start the new one.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — a multi-start reset starts a NEW outer walk; the previous
+        // seed's saved basins are meaningless for it.
+        self.basin_bundle.clear();
         // A multi-start reset starts a NEW outer walk: the previous seed's
         // gradient decay is meaningless for it, so the Eisenstat–Walker ratio
         // is re-established from scratch (probes run tight until then).
@@ -3938,6 +4240,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // probe trajectory never saw; drop the handoff so the next evaluation
         // applies the seed instead of a converged state that predates it.
         self.probe_converged_handoff = None;
+        // #2230/#2087 — a fresh β seed is a NEW instruction the saved basins never
+        // saw; drop them so the envelope re-seeds from the seeded accepted basin.
+        self.basin_bundle.clear();
         Ok(SeedOutcome::Installed)
     }
 

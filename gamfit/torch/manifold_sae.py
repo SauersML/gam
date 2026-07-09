@@ -518,6 +518,41 @@ class _BasisWithJetFn(torch.autograd.Function):
         return grad_t, None, None
 
 
+class _PositionAlignmentPenaltyFn(torch.autograd.Function):
+    """Period-1 coordinate alignment penalty through Rust.
+
+    Forward returns the scalar mean squared circular (period-1) distance
+    between the tape-connected encoder positions and the detached solved
+    positions. The Rust core
+    (``gam_sae::chart_coordinate_solve::position_alignment_penalty``) also
+    returns ``∂value/∂encoder`` (``2·wrap(e − s)/M`` per entry), which is cached
+    for backward — no wrap/mean math lives in Python. ``solved`` is a tape
+    constant, so it receives no gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any, encoder: torch.Tensor, solved: torch.Tensor
+    ) -> torch.Tensor:
+        n = int(encoder.shape[0])
+        value, grad_np = rust_module().sae_position_alignment_penalty(
+            to_numpy_f64(encoder.reshape(n, -1)),
+            to_numpy_f64(solved.reshape(n, -1)),
+        )
+        ctx.save_for_backward(from_numpy_like(grad_np, encoder).reshape(encoder.shape))
+        return torch.as_tensor(
+            value, dtype=encoder.dtype, device=encoder.device
+        )
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        (grad_output,) = grad_outputs
+        (grad_enc,) = ctx.saved_tensors
+        return grad_output * grad_enc, None
+
+
 def _decode_params_json(params_json: str) -> dict[str, Any]:
     raw = json.loads(params_json)
     out: dict[str, Any] = {}
@@ -1613,10 +1648,12 @@ class ManifoldSAE(nn.Module):
         coordinates that are tape constants, so the encoder position head gets no
         reconstruction gradient. This penalty pulls the encoder toward the
         coordinates the projection solve found, keeping the position head
-        learning. It is the only coordinate-side tensor math kept in Python — a
-        subtraction, a period-1 wrap, and a mean. Returns a zero scalar when the
-        last forward did not run the E-step (non-circle / non-``softmax_topk``
-        lane, or before any forward).
+        learning. The subtraction, period-1 wrap, and mean live in the Rust core
+        (:class:`_PositionAlignmentPenaltyFn` →
+        ``gam_sae::chart_coordinate_solve::position_alignment_penalty``); this
+        wrapper only routes the stashed tensors through that autograd bridge.
+        Returns a zero scalar when the last forward did not run the E-step
+        (non-circle / non-``softmax_topk`` lane, or before any forward).
         """
         enc = getattr(self, "_last_encoder_positions", None)
         solved = getattr(self, "_last_solved_positions", None)
@@ -1624,10 +1661,7 @@ class ManifoldSAE(nn.Module):
             return torch.zeros(
                 (), dtype=self.cfg.dtype, device=self.decoder_blocks.device
             )
-        diff = enc - solved
-        # Period-1 circular wrap into (-0.5, 0.5]: d − round(d).
-        wrapped = diff - torch.round(diff)
-        return wrapped.square().mean()
+        return _PositionAlignmentPenaltyFn.apply(enc, solved)
 
     def forward(self, x: torch.Tensor) -> ManifoldSAEOutput:
         if not isinstance(x, torch.Tensor):

@@ -38,6 +38,7 @@ pub mod spectrometer;
 pub mod structure_harvest;
 pub mod super_resolution;
 pub mod tiered;
+pub mod trust_scores;
 
 // The pre-split engine referenced GPU infrastructure as `crate::gpu::*`; after
 // the #1521 split that code lives in the `gam-gpu` crate. Alias it back so the

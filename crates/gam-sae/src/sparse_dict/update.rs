@@ -21,7 +21,7 @@
 //! estimate reported with the epoch diagnostics.
 
 use super::codes::{SparseCode, solve_row_codes};
-use super::scoring::{ScoreRouteStats, TileScorer};
+use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
 use super::{SparseDictConfig, SparseDictFit};
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -47,25 +47,89 @@ pub(super) fn route_and_code_all(
 ) -> Result<Vec<SparseCode>, String> {
     let n = x.nrows();
     let batch = minibatch.max(1);
-    let mut codes: Vec<SparseCode> = Vec::with_capacity(n);
-    let mut start = 0usize;
-    while start < n {
-        let end = (start + batch).min(n);
-        let block = x.slice(ndarray::s![start..end, ..]);
-        let routed = scorer.route_minibatch_with_mode(block, decoder, score_mode)?;
-        if let Some(stats) = score_route_stats.as_deref_mut() {
-            stats.record_result(&routed);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Probe the first minibatch to learn whether this fit routes on the device
+    // or on the host. The score GEMM is by far the dominant cost of the whole
+    // fit — O(N·K·P) per pass — and `ndarray`'s `.dot` is single-threaded
+    // `matrixmultiply`, so a serial minibatch loop pins the entire pass to ONE
+    // core (≈100 h/pass at K≈32k, N≈96k, P≈2048). When the route lands on the
+    // host we must fan it across all cores; the device path stays serial so the
+    // CUDA score-block calls are never issued concurrently.
+    let first_end = batch.min(n);
+    let first_block = x.slice(ndarray::s![0..first_end, ..]);
+    let first_routed = scorer.route_minibatch_with_mode(first_block, decoder, score_mode)?;
+    let path = first_routed.path;
+    if let Some(stats) = score_route_stats.as_deref_mut() {
+        stats.record_result(&first_routed);
+    }
+    let first_active = first_routed.selections;
+    let mut codes: Vec<SparseCode> = first_block
+        .axis_iter(Axis(0))
+        .into_par_iter()
+        .zip(first_active.into_par_iter())
+        .map(|(row, active)| solve_row_codes(row, decoder, &active, s, code_ridge))
+        .collect();
+
+    if path == ScoreRoutePath::Cpu {
+        // Host route: fan the remaining rows across cores at minibatch
+        // granularity. Each chunk runs the batched CPU score GEMM (serial per
+        // chunk, so the decoder tile is reused across the whole minibatch) plus
+        // its own independent per-row active-set code solves; the chunk is the
+        // parallel unit, so there is no nested rayon fork-join. Per-row routing
+        // and code solves depend only on their own row, so the concatenation is
+        // order-identical to the serial pass up to f32 GEMM rounding.
+        let plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
+            batch,
+            decoder.nrows(),
+            decoder.ncols(),
+        );
+        if first_end < n {
+            let rest = x.slice(ndarray::s![first_end.., ..]);
+            let chunk_codes: Vec<Vec<SparseCode>> = rest
+                .axis_chunks_iter(Axis(0), batch)
+                .into_par_iter()
+                .map(|chunk| {
+                    let routed = scorer.route_minibatch(chunk, decoder);
+                    chunk
+                        .axis_iter(Axis(0))
+                        .zip(routed.into_iter())
+                        .map(|(row, active)| solve_row_codes(row, decoder, &active, s, code_ridge))
+                        .collect::<Vec<SparseCode>>()
+                })
+                .collect();
+            for chunk in chunk_codes {
+                // One route record per minibatch, mirroring the serial path's
+                // per-minibatch accounting (counts are order-independent).
+                if let Some(stats) = score_route_stats.as_deref_mut() {
+                    stats.record(plan, ScoreRoutePath::Cpu);
+                }
+                codes.extend(chunk);
+            }
         }
-        let active_lists = routed.selections;
-        // Per-row code solves are independent; fan them out over the minibatch.
-        let mut block_codes: Vec<SparseCode> = block
-            .axis_iter(Axis(0))
-            .into_par_iter()
-            .zip(active_lists.into_par_iter())
-            .map(|(row, active)| solve_row_codes(row, decoder, &active, s, code_ridge))
-            .collect();
-        codes.append(&mut block_codes);
-        start = end;
+    } else {
+        // Device route: keep the serial per-minibatch dispatch so CUDA
+        // score-block launches are never concurrent.
+        let mut start = first_end;
+        while start < n {
+            let end = (start + batch).min(n);
+            let block = x.slice(ndarray::s![start..end, ..]);
+            let routed = scorer.route_minibatch_with_mode(block, decoder, score_mode)?;
+            if let Some(stats) = score_route_stats.as_deref_mut() {
+                stats.record_result(&routed);
+            }
+            let active_lists = routed.selections;
+            let mut block_codes: Vec<SparseCode> = block
+                .axis_iter(Axis(0))
+                .into_par_iter()
+                .zip(active_lists.into_par_iter())
+                .map(|(row, active)| solve_row_codes(row, decoder, &active, s, code_ridge))
+                .collect();
+            codes.append(&mut block_codes);
+            start = end;
+        }
     }
     Ok(codes)
 }
@@ -80,8 +144,18 @@ pub(super) fn run(
     let k = config.n_atoms;
     let s = config.active.min(k).max(1);
 
+    let fit_start = Instant::now();
     let mut decoder = seed_decoder(x, k);
     unit_norm_rows(&mut decoder);
+    // Coarse phase heartbeat on the same channel as the score-router DECLINE
+    // (log::warn survives the RUST_LOG=warn harnesses that drop log::info), so a
+    // multi-hour host fit is never silent. Emitted at seed / initial-route /
+    // per-epoch cadence only — never per row or per minibatch.
+    log::warn!(
+        "[SAE sparse_dict] seeded decoder N={n} P={p} K={k} s={s} \
+         seed_s={:.1} (route + refresh follow)",
+        fit_start.elapsed().as_secs_f64(),
+    );
 
     let scorer = TileScorer::new(s, config.score_tile);
     let mut score_route_stats = ScoreRouteStats::default();
@@ -97,6 +171,7 @@ pub(super) fn run(
     // `N × K`) — on the GPU when the process admits a device and the block clears
     // the break-even, else the parallel CPU GEMM — and its per-row active-set code
     // solves run in parallel. These codes feed the first decoder refresh.
+    let initial_route_start = Instant::now();
     let mut codes = route_and_code_all(
         x,
         decoder.view(),
@@ -107,6 +182,15 @@ pub(super) fn run(
         config.score_mode,
         Some(&mut score_route_stats),
     )?;
+    log::warn!(
+        "[SAE sparse_dict] initial route done: minibatches={} device={} cpu={} \
+         route_s={:.1} elapsed_s={:.1}",
+        score_route_stats.minibatches,
+        score_route_stats.device_minibatches,
+        score_route_stats.cpu_minibatches,
+        initial_route_start.elapsed().as_secs_f64(),
+        fit_start.elapsed().as_secs_f64(),
+    );
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -168,13 +252,14 @@ pub(super) fn run(
         let ev = explained_variance(x, &codes, decoder.view());
         let improve = ev - prev_ev;
 
-        // Per-epoch heartbeat (info-per-minute): a hang in the refresh or route is
-        // visible immediately, and the CG certificate (giant component size, the
-        // a-priori κ bound, any typed non-convergence) is on the same line. Under
-        // `RUST_LOG=info` this is the phase-level progress trace for a long fit.
-        log::info!(
+        // Per-epoch heartbeat on the log::warn channel (log::info is dropped by
+        // the RUST_LOG=warn harnesses, which is why a multi-hour host fit went
+        // silent). A hang in the refresh or route is visible at round cadence,
+        // and the CG certificate (giant component size, the a-priori κ bound,
+        // any typed non-convergence) is on the same line.
+        log::warn!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} revived={} refresh_s={:.2} \
-             route_s={:.2} max_component={} cg_columns={} cg_nonconverged={} \
+             route_s={:.2} elapsed_s={:.1} max_component={} cg_columns={} cg_nonconverged={} \
              cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
@@ -183,6 +268,7 @@ pub(super) fn run(
             revived,
             refresh_secs,
             route_secs,
+            fit_start.elapsed().as_secs_f64(),
             decoder_solve_stats.max_component_size,
             decoder_solve_stats.cg_columns,
             decoder_solve_stats.cg_nonconverged_columns,

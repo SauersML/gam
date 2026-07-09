@@ -8130,6 +8130,22 @@ impl ManifoldSaeCore {
             Some(v) => Ok(Some(manifold_sae_vec3(py, v)?)),
         }
     }
+    /// Install or replace the retained output-Fisher shard `(n, p, r)` in place —
+    /// the Rust-owned counterpart of `ManifoldSAE.attach_fisher` / the fit-time
+    /// post-attach `model.fisher_factors = ...`. Stored in the SAME nested-`Vec`
+    /// layout the payload uses (identical to the `sae_manifold_core_from_fit_payload`
+    /// build-time conversion), so `to_dict` / `to_json` / `steer` read it back
+    /// unchanged; `None` detaches the shard (reverting steering to the
+    /// geometry-only, no-dose path).
+    #[setter]
+    fn set_fisher_factors(&mut self, factors: Option<PyReadonlyArray3<'_, f64>>) {
+        self.inner.fisher_factors = factors.map(|arr| {
+            arr.as_array()
+                .outer_iter()
+                .map(|m| m.rows().into_iter().map(|r| r.to_vec()).collect())
+                .collect()
+        });
+    }
     #[getter]
     fn fisher_mass_residual<'py>(
         &self,
@@ -8139,6 +8155,12 @@ impl ManifoldSaeCore {
             .fisher_mass_residual
             .as_ref()
             .map(|v| manifold_sae_vec1(py, v))
+    }
+    /// Set the per-row output-Fisher truncation residual `(n,)` in place, or
+    /// `None` to clear it (the Euclidean-detach branch of `attach_fisher`).
+    #[setter]
+    fn set_fisher_mass_residual(&mut self, residual: Option<PyReadonlyArray1<'_, f64>>) {
+        self.inner.fisher_mass_residual = residual.map(|arr| arr.as_array().to_vec());
     }
     #[getter]
     fn selected_log_lambda_smooth<'py>(
@@ -8185,9 +8207,21 @@ impl ManifoldSaeCore {
     fn metric_provenance(&self) -> String {
         self.inner.metric_provenance.clone()
     }
+    /// Set the installed inner-product provenance (`"Euclidean"` /
+    /// `"OutputFisher"`) in place, mirroring `attach_fisher`'s metric flip.
+    #[setter]
+    fn set_metric_provenance(&mut self, value: String) {
+        self.inner.metric_provenance = value;
+    }
     #[getter]
     fn fisher_provenance(&self) -> Option<String> {
         self.inner.fisher_provenance.clone()
+    }
+    /// Set the retained shard's pullback provenance (`"output_fisher"` /
+    /// `"output_fisher_downstream"`) in place, or `None` on detach.
+    #[setter]
+    fn set_fisher_provenance(&mut self, value: Option<String>) {
+        self.inner.fisher_provenance = value;
     }
     #[getter]
     fn structure_certificate_json(&self) -> Option<String> {
@@ -8236,6 +8270,18 @@ impl ManifoldSaeCore {
     #[getter]
     fn dispersion(&self) -> f64 {
         self.inner.dispersion
+    }
+    /// Whether the fit installed the top-1 hard OOS projection routing. Exposed
+    /// (with its setter) so the thin Python facade's private `_oos_projection_top1`
+    /// field is Rust-owned like the rest of the state; `to_dict` emits it as
+    /// `oos_projection_top1`.
+    #[getter]
+    fn oos_projection_top1(&self) -> bool {
+        self.inner.oos_projection_top1
+    }
+    #[setter]
+    fn set_oos_projection_top1(&mut self, value: bool) {
+        self.inner.oos_projection_top1 = value;
     }
     #[getter]
     fn reconstruction_r2(&self) -> f64 {

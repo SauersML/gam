@@ -301,6 +301,124 @@ pub fn solve_chart_coordinates(
     Ok(solved)
 }
 
+/// Value and encoder-gradient of the period-1 coordinate alignment penalty.
+///
+/// The E-step solves the chart coordinates as tape CONSTANTS, so the encoder
+/// position head receives no reconstruction gradient. This penalty pulls the
+/// tape-connected encoder positions `e` toward the detached solved positions
+/// `s` on the unit circle (period 1), keeping the head learning. For each
+/// `(row, atom)` entry with `d = e − s`, the shortest signed circular offset
+/// into `(−1/2, 1/2]` is
+///
+/// ```text
+///     wrap(d) = d − round_ties_even(d) ,
+/// ```
+/// and the penalty is the mean of its square over all `M = N·F` entries:
+///
+/// ```text
+///     P = (1/M) · Σ wrap(d)² .
+/// ```
+///
+/// `round_ties_even` (round half to even) matches `torch.round`, so ties at
+/// half-integer offsets break identically to the torch reference. `round` is
+/// locally constant, so its derivative is zero almost everywhere and
+///
+/// ```text
+///     ∂P/∂e_{ij} = (2/M) · wrap(d_{ij}) .
+/// ```
+///
+/// Returns `(P, G)` where `G ∈ R^{N×F}` is `∂P/∂e`. `s` is a constant (the
+/// detached solve), so no gradient flows to it. An empty input (`M = 0`)
+/// returns `(0, [])`.
+pub fn position_alignment_penalty(
+    encoder: ArrayView2<f64>,
+    solved: ArrayView2<f64>,
+) -> Result<(f64, Array2<f64>), String> {
+    if encoder.dim() != solved.dim() {
+        return Err(format!(
+            "position_alignment_penalty shape mismatch: encoder {:?} vs solved {:?}",
+            encoder.dim(),
+            solved.dim()
+        ));
+    }
+    let (n, f) = encoder.dim();
+    let total = n * f;
+    let mut grad = Array2::<f64>::zeros((n, f));
+    if total == 0 {
+        return Ok((0.0, grad));
+    }
+    let inv = 1.0 / total as f64;
+    let mut sum_sq = 0.0_f64;
+    for i in 0..n {
+        for j in 0..f {
+            let d = encoder[[i, j]] - solved[[i, j]];
+            let wrapped = d - d.round_ties_even();
+            sum_sq += wrapped * wrapped;
+            grad[[i, j]] = 2.0 * inv * wrapped;
+        }
+    }
+    Ok((sum_sq * inv, grad))
+}
+
+#[cfg(test)]
+mod position_alignment_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn wrap_takes_the_short_way_around_the_circle() {
+        // Positions 0.95 and 0.05 are 0.10 apart across the period-1 seam, not
+        // 0.90. wrap(0.90) = 0.90 − round(0.90) = 0.90 − 1 = −0.10.
+        let enc = array![[0.95]];
+        let solved = array![[0.05]];
+        let (value, grad) = position_alignment_penalty(enc.view(), solved.view()).unwrap();
+        assert!((value - 0.10_f64 * 0.10).abs() < 1e-12);
+        // ∂P/∂e = 2·wrap/M = 2·(−0.10)/1 = −0.20.
+        assert!((grad[[0, 0]] + 0.20).abs() < 1e-12);
+    }
+
+    #[test]
+    fn identical_positions_have_zero_penalty_and_gradient() {
+        let enc = array![[0.3, 0.7], [0.1, 0.9]];
+        let (value, grad) = position_alignment_penalty(enc.view(), enc.view()).unwrap();
+        assert_eq!(value, 0.0);
+        assert!(grad.iter().all(|g| *g == 0.0));
+    }
+
+    #[test]
+    fn matches_hand_computed_multi_entry_mean() {
+        // enc − solved = [[0.10, -0.10], [0.60, 0.00]]. Wrapping 0.60 → 0.60 − 1
+        // = −0.40 (the short way). Squares: [0.01, 0.01, 0.16, 0.00]; mean over
+        // M = 4 is 0.18/4 = 0.045.
+        let enc = array![[0.10, 0.40], [0.60, 0.25]];
+        let solved = array![[0.00, 0.50], [0.00, 0.25]];
+        let (value, grad) = position_alignment_penalty(enc.view(), solved.view()).unwrap();
+        assert!((value - 0.045).abs() < 1e-12);
+        // Gradients: 2·wrap/4 = wrap/2. wrap = [0.10, -0.10, -0.40, 0.00].
+        assert!((grad[[0, 0]] - 0.05).abs() < 1e-12);
+        assert!((grad[[0, 1]] + 0.05).abs() < 1e-12);
+        assert!((grad[[1, 0]] + 0.20).abs() < 1e-12);
+        assert!((grad[[1, 1]] - 0.00).abs() < 1e-12);
+    }
+
+    #[test]
+    fn half_integer_offset_breaks_ties_to_even_like_torch() {
+        // d = 0.5 → round_ties_even(0.5) = 0 → wrap = 0.5. d = 1.5 →
+        // round_ties_even(1.5) = 2 → wrap = -0.5. Both square to 0.25.
+        let enc = array![[0.5, 1.5]];
+        let solved = array![[0.0, 0.0]];
+        let (value, _grad) = position_alignment_penalty(enc.view(), solved.view()).unwrap();
+        assert!((value - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn shape_mismatch_errors() {
+        let enc = array![[0.1, 0.2]];
+        let solved = array![[0.1]];
+        assert!(position_alignment_penalty(enc.view(), solved.view()).is_err());
+    }
+}
+
 #[cfg(test)]
 mod chart_coordinate_solve_tests {
     use super::*;

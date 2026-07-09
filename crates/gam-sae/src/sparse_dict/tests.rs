@@ -990,3 +990,64 @@ fn large_k_fit_reports_admitted_route_stats_and_is_reproducible() {
         fit.explained_variance
     );
 }
+
+/// The host score route must be invariant to minibatch/chunk granularity: each
+/// routed shortlist and its active-set codes depend only on their own row, so
+/// splitting the rows into many parallel minibatch chunks (the multi-core host
+/// path) must return byte-identical routing to routing the whole block at once.
+/// This pins the parallel `route_and_code_all` host fast path (the fix for the
+/// single-threaded `matrixmultiply` score wall) against a single-block route.
+#[test]
+fn host_route_is_invariant_to_minibatch_chunking() {
+    use super::update::route_and_code_all;
+
+    // Tiny shape (K=64, N=512, P=32), K < N so the scorer runs the real GEMM
+    // route rather than the K>N wrap. GpuMode::Off pins the host path.
+    let (x, decoder) = planted(64, 32, 512, 0.15);
+    let s = 4usize;
+    let tile = 13usize; // deliberately not a divisor of K, to exercise ragged tiles
+    let code_ridge = 1.0e-6f32;
+    let scorer = TileScorer::new(s, tile);
+
+    // Whole block in one route (probe block covers all N; no parallel chunks).
+    let single = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        &scorer,
+        s,
+        code_ridge,
+        x.nrows(),
+        gam_gpu::GpuMode::Off,
+        None,
+    )
+    .expect("single-block host route");
+
+    // Many small parallel chunks (probe block of 7, then chunked remainder).
+    let chunked = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        &scorer,
+        s,
+        code_ridge,
+        7,
+        gam_gpu::GpuMode::Off,
+        None,
+    )
+    .expect("chunked host route");
+
+    assert_eq!(single.len(), x.nrows());
+    assert_eq!(single.len(), chunked.len());
+    for (row, (a, b)) in single.iter().zip(chunked.iter()).enumerate() {
+        assert_eq!(
+            a.indices, b.indices,
+            "row {row}: chunking changed the routed atom shortlist"
+        );
+        assert_eq!(a.codes.len(), b.codes.len());
+        for (j, (&ca, &cb)) in a.codes.iter().zip(b.codes.iter()).enumerate() {
+            assert!(
+                (ca - cb).abs() <= 1.0e-6,
+                "row {row} code {j}: chunking changed the code ({ca} vs {cb})"
+            );
+        }
+    }
+}

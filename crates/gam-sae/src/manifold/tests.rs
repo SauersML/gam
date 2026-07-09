@@ -3334,6 +3334,124 @@ fn matrix_free_ard_logdet_hessian_trace_from_probes_matches_dense() {
     }
 }
 
+/// #2080 analytic-gradient cluster routing seam: the whole analytic outer ρ-gradient
+/// assembled through `analytic_outer_rho_gradient_components_with_bundle(Some(bundle))`
+/// — routing BOTH selected-inverse channels (per-atom smoothness EDF `tr(H⁻¹ M_k)`
+/// and the per-(atom,axis) ARD log-precision Hessian trace `½tr(H⁻¹ ∂H/∂logα)`) off
+/// the shared (probes, S⁻¹·probes) bundle as one all-or-nothing cluster — must
+/// reproduce the dense (`None`) assembly bit-for-bit on the PLAIN (undeflated)
+/// fixture. Every other channel (explicit, Occam, the #1006 envelope third-order
+/// correction) is fed the IDENTICAL cache + plain solver in both calls, so this
+/// isolates the bundle routing: feeding full-basis probes `√k·e_j` with the EXACT
+/// dense `S⁻¹` (`cache.schur_inverse_apply`) collapses each channel's selected-inverse
+/// diagonal to its exact value, so the two assemblies must agree to solve precision.
+/// The gate that keeps the (dormant, `None`-only in production) forward plumbing from
+/// silently desyncing the value and gradient lanes if a routing flip ever engages it.
+#[test]
+fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
+    let n = 24usize;
+    let p = 2usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let atom = SaeManifoldAtom::new(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let target = Array2::from_shape_fn((n, p), |(row, col)| {
+        let x = (row as f64 + 0.5) / n as f64;
+        if col == 0 {
+            0.45 * (std::f64::consts::TAU * x).sin() + 0.07
+        } else {
+            -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
+        }
+    });
+    let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![250.0_f64.ln()]]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let loss = term.loss(target.view(), &rho).unwrap();
+
+    // Same plain (undeflated) solver in BOTH assemblies — the only variable is the
+    // bundle routing of the two selected-inverse channels.
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let dense = term
+        .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &solver)
+        .unwrap();
+
+    let k = cache.k;
+    let sqrt_k = (k as f64).sqrt();
+    let probes: Vec<Array1<f64>> = (0..k)
+        .map(|j| {
+            let mut v = Array1::<f64>::zeros(k);
+            v[j] = sqrt_k;
+            v
+        })
+        .collect();
+    let sinv: Vec<Array1<f64>> = probes
+        .iter()
+        .map(|v| cache.schur_inverse_apply(v.view()).unwrap())
+        .collect();
+    let bundled = term
+        .analytic_outer_rho_gradient_components_with_bundle(
+            target.view(),
+            &rho,
+            &loss,
+            &cache,
+            &solver,
+            Some((&probes, &sinv)),
+        )
+        .unwrap();
+
+    // The routed log|H|-trace channel must match the dense selected-inverse trace on
+    // every ρ-coordinate…
+    assert_eq!(dense.logdet_trace.len(), bundled.logdet_trace.len());
+    for (i, (d, b)) in dense
+        .logdet_trace
+        .iter()
+        .zip(bundled.logdet_trace.iter())
+        .enumerate()
+    {
+        assert_abs_diff_eq!(d, b, epsilon = 1.0e-9);
+        assert!(
+            d.is_finite() && b.is_finite(),
+            "logdet-trace coordinate {i} must be finite (dense={d}, bundled={b})"
+        );
+    }
+    // …and the FULLY ASSEMBLED gradient (all channels summed) must agree, since every
+    // other channel is fed identical inputs.
+    let dense_grad = dense.gradient();
+    let bundled_grad = bundled.gradient();
+    assert_eq!(dense_grad.len(), bundled_grad.len());
+    for (d, b) in dense_grad.iter().zip(bundled_grad.iter()) {
+        assert_abs_diff_eq!(d, b, epsilon = 1.0e-9);
+    }
+    // Non-triviality: the routed trace must be a genuine, nonzero contribution so the
+    // parity assertion is not vacuous (identity smooth penalty + ARD-shrunk axis).
+    let trace_sq: f64 = dense.logdet_trace.iter().map(|v| v * v).sum();
+    assert!(
+        trace_sq > 0.0 && trace_sq.is_finite(),
+        "the routed log|H|-trace channel must be non-trivial; ‖logdet_trace‖²={trace_sq}"
+    );
+}
+
 #[test]
 pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     // The matrix-free Hutchinson estimator of `diag((H⁻¹)_tt)` (the #1777 fold
