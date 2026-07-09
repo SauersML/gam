@@ -7511,24 +7511,24 @@ pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
         beta: Array1::zeros(0),
         eta: extreme_eta,
     }]);
-    if let Ok(eval) = eval_result {
-        match &eval.blockworking_sets[0] {
-            crate::custom_family::BlockWorkingSet::Diagonal {
-                working_response,
-                working_weights,
-            } => {
-                let all_finite = working_response.iter().all(|v| v.is_finite())
-                    && working_weights.iter().all(|v| v.is_finite())
-                    && eval.log_likelihood.is_finite();
-                assert!(
-                    all_finite,
-                    "Poisson evaluate should produce finite outputs for all eta, \
-                         but got non-finite values: ll={}, z={:?}, w={:?}",
-                    eval.log_likelihood, working_response, working_weights
-                );
-            }
-            _ => panic!("expected Diagonal block"),
+    let eval = eval_result
+        .expect("Poisson evaluate must succeed (finite, saturated) at extreme eta");
+    match &eval.blockworking_sets[0] {
+        crate::custom_family::BlockWorkingSet::Diagonal {
+            working_response,
+            working_weights,
+        } => {
+            let all_finite = working_response.iter().all(|v| v.is_finite())
+                && working_weights.iter().all(|v| v.is_finite())
+                && eval.log_likelihood.is_finite();
+            assert!(
+                all_finite,
+                "Poisson evaluate should produce finite outputs for all eta, \
+                     but got non-finite values: ll={}, z={:?}, w={:?}",
+                eval.log_likelihood, working_response, working_weights
+            );
         }
+        _ => panic!("expected Diagonal block"),
     }
 }
 

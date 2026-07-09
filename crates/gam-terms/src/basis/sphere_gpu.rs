@@ -2096,10 +2096,10 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu hill-climb] no CUDA runtime — skipping");
             return;
         };
-        if SphereGpuBackend::probe().is_err() {
-            eprintln!("[sphere_gpu hill-climb] backend probe failed — skipping");
-            return;
-        }
+        // A CUDA runtime is present, so a probe failure is a real device/
+        // dispatch fault — fail the gate loudly rather than skip-passing.
+        SphereGpuBackend::probe()
+            .expect("[sphere_gpu hill-climb] backend probe must succeed on a CUDA host");
 
         // (n=200_000, m=200, lmax=50). n·m = 4·10^7 ≫ 1e6 → GPU eligible.
         // Build a 200_000-row deterministic lat/lon grid.
@@ -2182,10 +2182,10 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu hill-climb fit] no CUDA runtime — skipping");
             return;
         };
-        if SphereGpuBackend::probe().is_err() {
-            eprintln!("[sphere_gpu hill-climb fit] backend probe failed — skipping");
-            return;
-        }
+        // A CUDA runtime is present, so a probe failure is a real device/
+        // dispatch fault — fail the gate loudly rather than skip-passing.
+        SphereGpuBackend::probe()
+            .expect("[sphere_gpu hill-climb fit] backend probe must succeed on a CUDA host");
         use crate::basis::{
             CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
             build_spherical_spline_basis,
