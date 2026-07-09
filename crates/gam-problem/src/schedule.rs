@@ -6,6 +6,21 @@ pub enum ScheduleKind {
     ReciprocalIter,
 }
 
+impl ScheduleKind {
+    /// Geometric decay rate annealing `tau_start` → `tau_min` over `steps`
+    /// steps: `rate = (tau_min / tau_start)^(1/steps)`.
+    ///
+    /// This is the single source for the endpoints-and-steps geometric spec, so
+    /// callers that only know the `(tau_start, tau_min, steps)` triple (e.g. the
+    /// Python `SparsityConfig.gumbel_schedule`) hand the spec over verbatim and
+    /// let the schedule derive the rate rather than duplicating the arithmetic.
+    #[must_use]
+    pub fn geometric_rate_from_steps(tau_start: f64, tau_min: f64, steps: usize) -> f64 {
+        let steps = steps.max(1);
+        (tau_min / tau_start).powf(1.0 / steps as f64)
+    }
+}
+
 /// Outer-state temperature annealing for SAE assignment relaxations.
 ///
 /// Annealing drives the continuous concrete/softmax assignment toward the

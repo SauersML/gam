@@ -1949,9 +1949,20 @@ fn gumbel_temperature_schedule_from_pydict(
     };
     let decay = match decay_name.as_str() {
         "geometric" => {
-            let rate = match schedule.get_item("rate").map_err(|err| err.to_string())? {
-                Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
-                None => 0.9,
+            // Prefer the (tau_start, tau_min, steps) endpoints spec and derive
+            // the rate here; fall back to an explicit `rate` (default 0.9).
+            let steps = match schedule.get_item("steps").map_err(|err| err.to_string())? {
+                Some(value) => Some(value.extract::<usize>().map_err(|err| err.to_string())?),
+                None => None,
+            };
+            let rate = match steps {
+                Some(steps) => {
+                    ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps)
+                }
+                None => match schedule.get_item("rate").map_err(|err| err.to_string())? {
+                    Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
+                    None => 0.9,
+                },
             };
             ScheduleKind::Geometric { rate }
         }
