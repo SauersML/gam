@@ -1649,7 +1649,7 @@ mod tests {
     use super::{
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
         LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior,
-        SharedData, cloglog_bernoulli_logp_and_residual, firth_jeffreys_logp_and_grad,
+        NutsResult, SharedData, cloglog_bernoulli_logp_and_residual, firth_jeffreys_logp_and_grad,
         joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
         laplace_skewness_threshold, laplace_trustworthiness_from_skewness,
         run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
@@ -1669,6 +1669,23 @@ mod tests {
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
+
+    #[test]
+    fn posterior_interval_uses_shared_linear_quantiles() {
+        let result = NutsResult {
+            samples: array![[0.0], [1.0], [2.0], [3.0]],
+            posterior_mean: array![1.5],
+            posterior_std: array![1.0],
+            rhat: 1.0,
+            ess: 4.0,
+            converged: true,
+        };
+
+        let (lower, upper) = result.posterior_interval_of(|row| row[0], 25.0, 75.0);
+
+        assert!((lower - 0.75).abs() < 1e-12, "lower = {lower}");
+        assert!((upper - 2.25).abs() < 1e-12, "upper = {upper}");
+    }
 
     impl NutsPosterior {
         /// Test-only allocation wrapper around `compute_logp_and_grad_nd_into`.
@@ -4400,14 +4417,11 @@ impl NutsResult {
             return (0.0, 0.0);
         }
         let mut values: Vec<f64> = (0..n).map(|i| f(self.samples.row(i))).collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let lower_idx = ((lower_pct / 100.0) * n as f64).floor() as usize;
-        let upper_idx = ((upper_pct / 100.0) * n as f64).ceil() as usize;
+        values.sort_by(f64::total_cmp);
 
         (
-            values[lower_idx.min(n.saturating_sub(1))],
-            values[upper_idx.min(n.saturating_sub(1))],
+            gam_math::quantile::quantile_from_sorted(&values, lower_pct / 100.0),
+            gam_math::quantile::quantile_from_sorted(&values, upper_pct / 100.0),
         )
     }
 }
