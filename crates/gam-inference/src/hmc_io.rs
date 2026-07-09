@@ -1522,6 +1522,9 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
         })
         .sum();
 
+    if !ll.is_finite() {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
 }
@@ -1539,10 +1542,10 @@ fn tweedie_log_quasilogp_and_grad(
     if !is_valid_tweedie_power(p) {
         return (f64::NAN, Array1::from_elem(data.dim, f64::NAN));
     }
-    if eta
-        .iter()
-        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
-    {
+    // Finite η is always in-support for the quasi-likelihood; the old ±700
+    // window artificially truncated the posterior. Binary64 exhaustion is
+    // caught after the sum.
+    if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let inv_phi = data.dispersion.inv_phi();
@@ -1563,6 +1566,9 @@ fn tweedie_log_quasilogp_and_grad(
         })
         .sum();
 
+    if !ll.is_finite() {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
 }
@@ -1575,9 +1581,7 @@ fn negative_binomial_log_logp_and_grad(
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     if !(theta.is_finite() && theta > 0.0)
-        || eta
-            .iter()
-            .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+        || eta.iter().any(|&eta_i| !eta_i.is_finite())
         || data
             .y
             .iter()
@@ -1612,6 +1616,9 @@ fn negative_binomial_log_logp_and_grad(
         })
         .sum();
 
+    if !ll.is_finite() {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
 }
@@ -1619,10 +1626,7 @@ fn negative_binomial_log_logp_and_grad(
 fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    if eta
-        .iter()
-        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
-    {
+    if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let shape = data.gamma_shape.max(1e-10);
@@ -1653,6 +1657,9 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
         })
         .sum();
 
+    if !ll.is_finite() {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
 }
@@ -1944,6 +1951,52 @@ mod tests {
             (residual_y1 - fd).abs() < 1e-9,
             "cloglog residual is not the derivative of log μ: analytic={residual_y1}, fd={fd}"
         );
+    }
+
+    #[test]
+    fn finite_eta_beyond_the_old_support_window_keeps_its_valid_log_density() {
+        // A Poisson row with y = 0 at η = −701 has log-likelihood
+        // −exp(−701) ≈ 0 — a perfectly valid, essentially maximal density.
+        // The old hard-coded ±700 window declared it impossible (−∞),
+        // truncating the sampled posterior at an arbitrary boundary.
+        let data = SharedData {
+            x: Arc::new(array![[1.0]]),
+            y: Arc::new(array![0.0]),
+            weights: Arc::new(array![1.0]),
+            mode: Arc::new(array![0.0]),
+            offset: None,
+            gamma_shape: 1.0,
+            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            n_samples: 1,
+            dim: 1,
+        };
+        let eta = array![-701.0];
+        let (ll, grad) = super::poisson_log_logp_and_grad(&data, &eta);
+        assert!(
+            ll.is_finite() && ll.abs() < 1e-300,
+            "Poisson y=0, eta=-701 must keep its ~0 log-density, got {ll}"
+        );
+        assert!(grad[0].is_finite());
+
+        // Deep cloglog left tail: exp(η) underflows below η ≈ −745, but the
+        // exact limits are log μ → η and d(log μ)/dη → 1.
+        let (ll_tail, res_tail) =
+            cloglog_bernoulli_logp_and_residual(-750.0, 1.0).expect("finite eta is valid");
+        assert!(
+            (ll_tail - (-750.0)).abs() < 1e-9,
+            "cloglog log-density must approach eta in the deep left tail, got {ll_tail}"
+        );
+        assert!((res_tail - 1.0).abs() < 1e-9, "residual limit is 1");
+
+        // Genuine binary64 exhaustion (y > 0 against an overflowing mean) is
+        // still rejected as −∞ with a zero gradient.
+        let data_pos = SharedData {
+            y: Arc::new(array![3.0]),
+            ..data
+        };
+        let (ll_of, grad_of) = super::poisson_log_logp_and_grad(&data_pos, &array![710.0]);
+        assert_eq!(ll_of, f64::NEG_INFINITY);
+        assert_eq!(grad_of[0], 0.0);
     }
 
     #[test]
@@ -5786,7 +5839,7 @@ impl LinkWigglePosterior {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
-                    if !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)) {
+                    if !eta_i.is_finite() {
                         grad.fill(0.0);
                         return f64::NEG_INFINITY;
                     }
@@ -5807,7 +5860,12 @@ impl LinkWigglePosterior {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
-                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                    // Only non-finite η invalidates the target: any finite η
+                    // has a valid Poisson log-density (the old ±30 window
+                    // declared e.g. y = 0, η = −31 impossible, pinning the
+                    // sampled posterior to an arbitrary boundary). Genuine
+                    // binary64 exhaustion is caught after the family match.
+                    if !eta_i.is_finite() {
                         grad.fill(0.0);
                         return f64::NEG_INFINITY;
                     }
@@ -5829,7 +5887,7 @@ impl LinkWigglePosterior {
                 let p = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
-                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                    if !eta_i.is_finite() {
                         grad.fill(0.0);
                         return f64::NEG_INFINITY;
                     }
@@ -5852,7 +5910,7 @@ impl LinkWigglePosterior {
                 let theta = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
-                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                    if !eta_i.is_finite() {
                         grad.fill(0.0);
                         return f64::NEG_INFINITY;
                     }
@@ -5879,7 +5937,7 @@ impl LinkWigglePosterior {
                 let shape = self.scale.max(1e-10);
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
-                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                    if !eta_i.is_finite() {
                         grad.fill(0.0);
                         return f64::NEG_INFINITY;
                     }
@@ -5890,6 +5948,14 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
+        }
+
+        // A finite η can still exhaust binary64 (overflowing exp against a
+        // positive response): genuine log-density underflow is rejected as −∞
+        // with a zero gradient — never via an a-priori η support window.
+        if !ll.is_finite() {
+            grad.fill(0.0);
+            return f64::NEG_INFINITY;
         }
 
         // Penalty weight = 1/cov_scale (#679/#680 invariant), matching the
