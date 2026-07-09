@@ -1731,7 +1731,6 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     // Grow the peel rank (doubling ⇒ log-many re-solves) until the bar clears or
     // the cap is hit; keep the LAST plan (its frozen Q is the deepest peel tried).
     let cap = deflation_max_rank.min(k);
-    let mut best_plan = base_plan.clone();
     let mut rank = 4usize;
     loop {
         let r = rank.min(cap);
@@ -1739,14 +1738,11 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             .clone()
             .with_deflation(&matvec, r, deflation_subspace_iters, seed);
         let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
-        let cleared = eval.std_err <= target;
-        best_plan = plan;
-        if cleared || r >= cap {
-            break;
+        if eval.std_err <= target || r >= cap {
+            return Some(plan);
         }
         rank = rank.saturating_mul(2);
     }
-    Some(best_plan)
 }
 
 /// Contract the surrogate's shifted-solve bundle from

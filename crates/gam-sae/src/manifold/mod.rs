@@ -152,7 +152,13 @@ pub(crate) use gam_solve::arrow_schur::{
 // and its shared tuning constants, used when the dense k×k Schur exceeds budget.
 pub(crate) use gam_solve::arrow_schur::{
     SCHUR_SLQ_LOGDET_LANCZOS_STEPS, SCHUR_SLQ_LOGDET_PROBES, SCHUR_SLQ_LOGDET_SEED,
-    matrix_free_arrow_evidence_log_det,
+};
+
+// #2080 rational-surrogate evidence lane: the build-once threaded entry that
+// swaps the SLQ reduced-Schur log|S| for the desync-safe rational surrogate
+// (value + ρ-gradient one functional), plus its per-outer-solve frozen state.
+pub(crate) use gam_solve::arrow_schur::{
+    SurrogateLaneConfig, SurrogateLaneState, matrix_free_arrow_evidence_log_det_surrogate,
 };
 
 pub(crate) use gam_solve::estimate::EstimationError;
@@ -177,6 +183,7 @@ pub use crate::frames::*;
 
 mod amortized_routing;
 mod arrow_solver;
+mod basin_bundle;
 mod atom;
 mod behavior;
 mod behavior_fit;
@@ -378,6 +385,7 @@ mod tests_joint_vs_cascade_2131;
 mod tests_outer_row_subsample;
 
 pub use arrow_solver::*;
+pub use basin_bundle::*;
 pub use atom::*;
 pub use behavior::*;
 pub use behavior_fit::*;
