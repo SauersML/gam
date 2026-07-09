@@ -755,6 +755,7 @@ pub(crate) fn gaussian_joint_psi_firstweights(
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
+        let kdpi = scalars.kappa_dprime[i];
         let ai = scalars.obs_weight[i];
         let ma = mu_a[i];
         let ea = eta_a[i];
@@ -769,31 +770,32 @@ pub(crate) fn gaussian_joint_psi_firstweights(
         // + κ'·(a−n)·η̇ chain-rule term (∂[κ(a−n)]/∂η = κ'(a−n) + 2κ²n).
         dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea) + kpi * (ai - ni) * ea);
         hmumu[i].write(wi);
-        // Cross block: Fisher expectation E[H_{μ,ls}] = 2κ·E[m] = 0 (μ ⊥ σ;
-        // see exact_newton_joint_hessian_from_designs / #684). The observed
-        // 2mκ is mean-zero noise that would inject spurious μ↔σ coupling into
-        // the REML determinant via the Schur complement and over-smooth log σ.
-        hmu_ls[i].write(0.0);
-        // Fisher/expected (log σ, log σ) information: E[H_{ls,ls}] = 2κ²a.
-        // The observed curvature 2κ²n + κ'(a−n) collapses where the fitted
-        // residual is small (n→0), under-counting the scale block's EDF and
-        // letting REML over-smooth the scale predictor toward a flat constant
-        // (#566). Using E[n]=a (true model) gives the residual-free expected
-        // information 2κ²a, exactly as gamlss/mgcv gaulss Fisher-score the
-        // scale channel and as the diagonal PIRLS kernel already does
-        // (gaussian_diagonal_row_kernel: 2·obs_weight·κ²). The score
-        // (score_ls/dscore_ls/d2score_ls) stays the exact observed gradient so
-        // the joint Newton still converges to the true MLE stationary point;
-        // only the (ls,ls) curvature feeding the REML determinant/EDF is the
-        // expectation.
-        h_ls_ls[i].write(2.0 * ki * ki * ai);
+        // OBSERVED joint penalized Hessian (Wood–Pya–Säfken 2016 LAML object;
+        // #1561 cutover from the block-Fisher #684/#566 approximation). The
+        // outer LAML criterion `−½log|H+S|` and its ρ-gradient require the
+        // observed curvature at β̂ — the Fisher object (cross ≡ 0, σσ = 2κ²a)
+        // overstated σ-block information on the near-flat scale surface and
+        // over-smoothed log σ. Observed cross block H_{μ,ls} = 2κm; this is the
+        // SAME single-source coefficient as `gaussian_locscale_observed_joint_row_coeffs`
+        // and the dense `exact_newton_joint_hessian_from_designs`. At a flat/true
+        // null σ surface n→a, m→0, so observed → Fisher and the null behavior is
+        // unchanged. The score channels stay the exact observed gradient.
+        hmu_ls[i].write(2.0 * ki * mi);
+        // Observed (log σ, log σ) curvature H_{ls,ls} = κ'(a−n) + 2κ²n.
+        h_ls_ls[i].write(kpi * (ai - ni) + 2.0 * ki * ki * ni);
         dhmumu[i].write(-2.0 * wi * sea);
-        // Cross block is Fisher 0 (μ ⊥ σ; #684), so its directional derivative
-        // is identically 0.
-        dhmu_ls[i].write(0.0);
-        // Directional derivative of E[H_{ls,ls}]=2κ²a along (μ̇,η̇): no μ
-        // dependence; ∂(2κ²a)/∂η = 4κκ'a, so dh_ls_ls = 4κκ'a·η̇.
-        dh_ls_ls[i].write(4.0 * ki * kpi * ai * ea);
+        // Directional derivative of the observed cross block 2κm along (μ̇=ma,
+        // η̇=ea): d(2κm)[ξ] = −2κw·ma + (2κ'−4κ²)m·ea (same as the dense
+        // `gaussian_joint_first_directionalweights` c_u channel).
+        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea) + 2.0 * mi * kpi * ea);
+        // Directional derivative of the observed h_ls_ls along (μ̇=ma, η̇=ea):
+        //   ∂h/∂η_μ = −2m(2κ²−κ'),  ∂h/∂η_ls = κ''(a−n) + (6κκ'−4κ³)n
+        // (same as the dense `gaussian_joint_first_directionalweights` d_u).
+        let a_coef = 2.0 * ki * ki - kpi;
+        dh_ls_ls[i].write(
+            -2.0 * mi * a_coef * ma
+                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * ea,
+        );
         objective_psirow[i].write(smu * ma + sls * ea);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
@@ -879,13 +881,35 @@ pub(crate) fn gaussian_joint_psisecondweights(
         );
         // − 2·κ'·w·ea·eb: ∂²w/∂η² = 4wκ² − 2wκ'.
         d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab - 2.0 * wi * kpi * ea_eb);
-        // Cross block is Fisher 0 (μ ⊥ σ; #684), so its second directional
-        // derivative is identically 0.
-        d2hmu_ls[i].write(0.0);
-        // d²/dψ_a dψ_b of the Fisher (ls,ls) information E[H_{ls,ls}]=2κ²a (#566).
-        // No μ dependence; ∂(2κ²a)/∂η=4κκ'a and ∂(4κκ'a)/∂η=4a(κ'²+κκ'')a, so
-        // the second directional derivative is 4a(κ'²+κκ'')·ea·eb + 4aκκ'·eab.
-        d2h_ls_ls[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * ea_eb + 4.0 * ai * ki * kpi * eab);
+        // Second ψ-directional derivative of the OBSERVED cross block 2κm
+        // (#1561). Bilinear part = the dense `gaussian_jointsecond_directionalweights`
+        // c_uv form; the direction-curvature part = ∇(2κm)·(μ_ab, η_ab) with
+        // ∂(2κm)/∂η_μ = −2κw, ∂(2κm)/∂η_ls = (2κ'−4κ²)m.
+        d2hmu_ls[i].write(
+            ki * (4.0 * wi * cross + 8.0 * mi * sea_seb) - 2.0 * wi * kpi * cross_eta
+                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * ea_eb
+                - 2.0 * ki * wi * mab
+                + (2.0 * kpi - 4.0 * ki * ki) * mi * eab,
+        );
+        // Second ψ-directional derivative of the OBSERVED h_ls_ls = κ'(a−n)+2κ²n
+        // (#1561). Bilinear part = the dense `gaussian_jointsecond_directionalweights`
+        // d_uv form (A = 2κ²−κ', E = 6κκ'−4κ³−κ'', κ''' = κ''(1−2κ)−2κ'²); the
+        // direction-curvature part = ∇h_ls_ls·(μ_ab, η_ab) with
+        // ∂h/∂η_μ = −2mA, ∂h/∂η_ls = κ''(a−n) + (6κκ'−4κ³)n.
+        let a_coef = 2.0 * ki * ki - kpi;
+        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
+        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        d2h_ls_ls[i].write(
+            2.0 * wi * a_coef * ma_mb
+                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * cross_eta
+                + (ktp * ai - 2.0 * ki * ni * e_coef
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
+                        - 12.0 * ki * ki * kpi
+                        - ktp))
+                    * ea_eb
+                - 2.0 * mi * a_coef * mab
+                + (kdpi * amn + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * eab,
+        );
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -903,11 +927,16 @@ pub(crate) fn gaussian_joint_psisecondweights(
 
 pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     scalars: &GaussianJointRowScalars,
-    // Only the log-σ–channel directions enter the surviving (μ,μ) and (ls,ls)
-    // Fisher blocks; the μ-channel drift directions fed the observed cross
-    // block, which is now Fisher 0 (μ ⊥ σ; #684) and no longer assembled.
+    // Both channels are needed now that the curvature is OBSERVED (#1561): the
+    // cross block H_{μ,ls}=2κm and the observed h_ls_ls both depend on the
+    // μ-channel drift (`dot_mu`), the ψ μ-direction (`mu_a`), and the mixed
+    // μ direction-curvature (`dot_mu_a`). `u = (dot_mu, dot_eta)` is the drift
+    // direction, `a = (mu_a, eta_a)` the ψ direction.
+    dot_mu: &Array1<f64>,
     dot_eta: &Array1<f64>,
+    mu_a: &Array1<f64>,
     eta_a: &Array1<f64>,
+    dot_mu_a: &Array1<f64>,
     dot_eta_a: &Array1<f64>,
 ) -> GaussianJointPsiMixedDriftWeights {
     let nobs = scalars.w.len();
@@ -919,34 +948,64 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
     let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
         let wi = scalars.w[i];
+        let mi = scalars.m[i];
+        let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
         let kdpi = scalars.kappa_dprime[i];
         let ai = scalars.obs_weight[i];
+        let dmu = dot_mu[i];
         let de = dot_eta[i];
+        let ma = mu_a[i];
         let ea = eta_a[i];
+        let dma = dot_mu_a[i];
         let dea = dot_eta_a[i];
         // κ-scaled log-sigma directions.
         let sde = ki * de;
         let sea = ki * ea;
         let sdea = ki * dea;
         let de_ea = de * ea;
-        // First directional derivative of Hessian blocks (== Helper A).
+        // A = 2κ²−κ', E = 6κκ'−4κ³−κ'', κ''' = κ''(1−2κ)−2κ'² (logb-link).
+        let a_coef = 2.0 * ki * ki - kpi;
+        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
+        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
+        // First directional derivative of Hessian blocks along the drift u.
         dhmumu_u[i].write(-2.0 * wi * sde);
-        // Cross block is Fisher 0 (μ ⊥ σ; #684); its first directional and
-        // second mixed directional derivatives are identically 0. The
-        // observed-cross drift inputs (m, dotmu, μ_a, dotmu_a) are therefore
-        // not read here.
-        dhmu_ls_u[i].write(0.0);
-        // Directional derivative of Fisher E[H_{ls,ls}]=2κ²a along (dm,de):
-        // no μ dependence, ∂(2κ²a)/∂η=4κκ'a ⇒ 4κκ'a·de (#566).
-        dh_ls_ls_u[i].write(4.0 * ki * kpi * ai * de);
+        // OBSERVED cross block drift d_u(2κm) = −2κw·dot_mu + (2κ'−4κ²)m·dot_eta
+        // (#1561; same closed form as the dense c_u channel).
+        dhmu_ls_u[i].write(ki * (-2.0 * wi * dmu - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
+        // OBSERVED h_ls_ls drift d_u(κ'(a−n)+2κ²n) = −2m·A·dot_mu
+        // + (κ''(a−n)+(6κκ'−4κ³)n)·dot_eta (#1561; dense d_u channel).
+        dh_ls_ls_u[i].write(
+            -2.0 * mi * a_coef * dmu
+                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * de,
+        );
         // − 2·κ'·w·de·ea: ∂²w/∂η² = 4wκ² − 2wκ'.
         d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea - 2.0 * wi * kpi * de_ea);
-        d2hmu_ls[i].write(0.0);
-        // d²/(drift × ψ) of Fisher E[H_{ls,ls}]=2κ²a: 4a(κ'²+κκ'')·de·ea +
-        // 4aκκ'·dea (drift direction de, ψ direction ea, mixed dea) (#566).
-        d2h_ls_ls[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * de_ea + 4.0 * ai * ki * kpi * dea);
+        // OBSERVED cross block mixed second drift D_u D_a(2κm): bilinear in
+        // u=(dmu,de), a=(ma,ea) plus the direction-curvature ∇(2κm)·(dma,dea)
+        // with ∂(2κm)/∂η_μ=−2κw, ∂(2κm)/∂η_ls=(2κ'−4κ²)m (#1561).
+        d2hmu_ls[i].write(
+            ki * (4.0 * wi * (dmu * sea + ma * sde) + 8.0 * mi * sde * sea)
+                - 2.0 * wi * kpi * (dmu * ea + ma * de)
+                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_ea
+                - 2.0 * ki * wi * dma
+                + (2.0 * kpi - 4.0 * ki * ki) * mi * dea,
+        );
+        // OBSERVED h_ls_ls mixed second drift D_u D_a(κ'(a−n)+2κ²n): bilinear in
+        // u=(dmu,de), a=(ma,ea) plus the direction-curvature ∇h_ls_ls·(dma,dea)
+        // with ∂h/∂η_μ=−2mA, ∂h/∂η_ls=κ''(a−n)+(6κκ'−4κ³)n (#1561).
+        d2h_ls_ls[i].write(
+            2.0 * wi * a_coef * (dmu * ma)
+                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * (dmu * ea + ma * de)
+                + (ktp * ai - 2.0 * ki * ni * e_coef
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
+                        - 12.0 * ki * ki * kpi
+                        - ktp))
+                    * de_ea
+                - 2.0 * mi * a_coef * dma
+                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * dea,
+        );
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
