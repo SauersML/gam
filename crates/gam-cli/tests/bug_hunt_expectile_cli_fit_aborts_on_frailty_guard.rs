@@ -8,7 +8,7 @@
 //!
 //! ROOT CAUSE (confirmed):
 //!   1. The CLI always populates the frailty config even with no `--frailty-kind`
-//!      (gam-config/src/lib.rs): `fit_config.frailty = Some(resolve_cli_frailty_spec(..))`,
+//!      (gam-config/src/lib.rs): `fit_config.frailty = resolve_cli_frailty_spec(..)`,
 //!      which returns `FrailtySpec::None` — so `frailty == Some(FrailtySpec::None)`
 //!      (semantically "no frailty", but a `Some`).
 //!   2. The expectile driver clones that config to build its inner Gaussian config
