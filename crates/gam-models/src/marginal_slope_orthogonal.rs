@@ -208,14 +208,19 @@ pub fn score_influence_jacobian(
     let upper_floor = family.response_upper_floor_offset();
     let median = family.response_median();
 
-    // Floor on φ(z): at the PIT clip the score saturates at a fixed extreme
-    // quantile, so φ(z) is bounded below by φ(Φ⁻¹(clip_eps)). Clamping the
-    // ∂z = ∂u/φ(z) denominator there keeps a saturated row's influence bounded
-    // rather than infinite — the same bound the PIT clip already imposes on z.
-    let pdf_z_floor = normal_pdf(
-        standard_normal_quantile(TRANSFORMATION_SCORE_PIT_CLIP_EPS)
-            .map_err(|e| format!("score_influence_jacobian: clip quantile failed: {e}"))?,
-    );
+    // Saturation boundaries of the PIT score. `transformation_normal_pit_score`
+    // returns Φ⁻¹(u.clamp(clip_eps, 1−clip_eps)), so whenever the raw PIT
+    // probability lies at-or-beyond a clip boundary the emitted z is EXACTLY
+    // the boundary quantile and is locally constant in θ₁. The Jacobian of
+    // that clamped function is identically zero there — reporting the interior
+    // density-ratio chain (as this routine once did, with a floored φ(z))
+    // would differentiate a different function from the one whose value is
+    // consumed downstream. Computing the boundaries with the same quantile
+    // kernel the score uses makes the saturation test exact.
+    let z_saturated_lo = standard_normal_quantile(TRANSFORMATION_SCORE_PIT_CLIP_EPS)
+        .map_err(|e| format!("score_influence_jacobian: clip quantile failed: {e}"))?;
+    let z_saturated_hi = standard_normal_quantile(1.0 - TRANSFORMATION_SCORE_PIT_CLIP_EPS)
+        .map_err(|e| format!("score_influence_jacobian: clip quantile failed: {e}"))?;
 
     let mut columns = Array2::<f64>::zeros((n, p1));
     let mut z_scores = Array1::<f64>::zeros(n);
@@ -267,11 +272,17 @@ pub fn score_influence_jacobian(
             .map_err(|e| format!("score_influence_jacobian: PIT score failed at row {i}: {e}"))?;
         z_scores[i] = z;
 
-        // The ∂u/∂θ chain is evaluated at the SAME (clipped) operating point z
-        // represents: u_pit = Φ(z) exactly inverts z = Φ⁻¹(u_clamped), so the
-        // derivative coefficient and the reported score stay self-consistent
-        // without recomputing the (less stable) direct ratio. The endpoint
-        // φ/D ratios below are the analytic derivatives of that ratio.
+        // At (or beyond) a clip boundary the score is the constant boundary
+        // quantile: ∂z/∂θ₁ ≡ 0. The row was zero-initialized; skip the chain.
+        if z <= z_saturated_lo || z >= z_saturated_hi {
+            continue;
+        }
+
+        // Interior row: z = Φ⁻¹(u) with u strictly inside the clip band, so
+        // u_pit = Φ(z) exactly inverts the score and the derivative
+        // coefficient and the reported score stay self-consistent without
+        // recomputing the (less stable) direct ratio. The endpoint φ/D ratios
+        // below are the analytic derivatives of that ratio.
         //
         // Compute log(D) = log(Φ(U)−Φ(L)) in log-space to avoid catastrophic
         // cancellation when L and U both sit deep in the same tail (e.g. L=5,
@@ -316,17 +327,15 @@ pub fn score_influence_jacobian(
         const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
         let log_phi = |x: f64| -0.5 * x * x - LOG_SQRT_2PI;
 
-        // φ at h/L/U. The chain ∂u/∂θ uses φ at the *unclamped* h when
-        // h is inside [L,U]; at the boundary (h clamped) φ(h)·∂h is the limiting
-        // contribution and the clamp keeps it finite.
-        let h_clamped = h.clamp(l, u);
-        let c_h = (log_phi(h_clamped) - log_denom).exp();
+        // φ at h/L/U. An interior z implies the raw PIT probability was strictly
+        // inside (0, 1), so h is strictly inside (L, U) here.
+        let c_h = (log_phi(h) - log_denom).exp();
         let c_l = (log_phi(l) - log_denom).exp();
         let c_u = (log_phi(u) - log_denom).exp();
 
-        // ∂z = ∂u / φ(z). Where the score saturates (|z| large), φ(z) underflows;
-        // the `pdf_z_floor` clamp keeps a saturated row's influence bounded.
-        let pdf_z = normal_pdf(z).max(pdf_z_floor);
+        // ∂z = ∂u / φ(z). Interior z is bounded by the clip quantiles, so
+        // φ(z) ≥ φ(Φ⁻¹(clip_eps)) > 0 — no floor is needed.
+        let pdf_z = normal_pdf(z);
 
         let mut row = columns.row_mut(i);
         for k in 0..p_resp {
