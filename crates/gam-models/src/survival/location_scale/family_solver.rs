@@ -279,7 +279,12 @@ impl SurvivalLocationScaleFamily {
             };
             // Bare (undamped) Newton solve first; on failure escalate τ
             // geometrically across the damping span [INITIAL, MAX]·h_scale —
-            // the trial count is that span's decade count, inclusive.
+            // the trial count is that span's decade count, INCLUSIVE of the
+            // final τ ≈ MAX·h_scale. The pre-primitive loop compared its
+            // FP-accumulated τ chain against the single product `MAX·h_scale`
+            // and, for ~40% of h_scale values, dropped the final decade by one
+            // ulp; the deterministic count realizes the documented cap for
+            // every h_scale.
             let damping_trials = (LEVENBERG_MAX_DAMPING_REL / LEVENBERG_INITIAL_DAMPING_REL)
                 .log10()
                 .ceil() as usize
