@@ -931,7 +931,7 @@ pub(crate) const SCHUR_PROLOGUE_PARALLEL_K_MIN: usize = 512;
 /// criterion ranking across topology candidates is stable except for candidates
 /// separated by less than that f64 margin, where reassociation can flip the
 /// near-tie winner — it is NOT an exact no-move guarantee (#1211).
-pub(crate) struct SaeResidentReducedSchur {
+pub struct SaeResidentReducedSchur {
     /// Decoder output dimension `p` (the side length of every `G_i = L_iᵀ Y_i`).
     pub(crate) p: usize,
     /// Per-row **factored** residency: `(L_i, Y_i)`, each stored row-major as a
