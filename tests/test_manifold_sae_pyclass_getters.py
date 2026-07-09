@@ -113,6 +113,54 @@ def test_scalar_and_list_getters() -> None:
     assert core.n_harmonics == golden["n_harmonics"]
 
 
+def test_atoms_is_an_object_surface() -> None:
+    """model.atoms is a list of AtomCore handles read by attribute (the
+    SaeManifoldAtomFit duck-type), NOT a list of dicts."""
+    golden = _golden()
+    core = _core_cls()(golden)
+    atoms = core.atoms
+    assert isinstance(atoms, list) and len(atoms) == len(golden["atoms"])
+    a0 = atoms[0]
+    g0 = golden["atoms"][0]
+    assert not isinstance(a0, dict)  # object surface, not a mapping
+    assert a0.basis == g0["basis"]
+    assert a0.active_dim == g0["active_dim"]
+    assert a0.evidence == g0["evidence"]
+    np.testing.assert_array_equal(
+        a0.decoder_coefficients, np.asarray(g0["decoder_coefficients"])
+    )
+    np.testing.assert_array_equal(a0.coords, np.asarray(g0["coords"]))
+    # atom 0 (periodic, d=1) carries the arc coordinate + shape band.
+    np.testing.assert_array_equal(a0.coords_u_arc, np.asarray(g0["coords_u_arc"]))
+    np.testing.assert_array_equal(a0.shape_band_mean, np.asarray(g0["shape_band_mean"]))
+    # atom 1 (euclidean, d=2) carries neither.
+    assert atoms[1].coords_u_arc is None
+    assert atoms[1].shape_band_mean is None
+    # No atom in the fixture carries a covariance factor -> dense cov is None.
+    assert all(a.decoder_covariance is None for a in atoms)
+
+
+def test_atom_dense_covariance_is_reconstructed() -> None:
+    """When a compact per-channel factor is present, atom.decoder_covariance is
+    the dense (M_k*p, M_k*p) block-diagonal matrix (not the compact factor)."""
+    golden = _golden()
+    # Plant a compact (p, M_k, M_k) factor on atom 0: M_k rows in decoder, p cols.
+    coeffs = np.asarray(golden["atoms"][0]["decoder_coefficients"])
+    m_k, p = coeffs.shape
+    factor = np.zeros((p, m_k, m_k))
+    for c in range(p):
+        factor[c] = np.eye(m_k) * (c + 1.0)
+    golden["atoms"][0]["decoder_covariance_channel_factors"] = factor.tolist()
+    atom0 = _core_cls()(golden).atoms[0]
+    cov = atom0.decoder_covariance
+    assert cov is not None and cov.shape == (m_k * p, m_k * p)
+    # Same-channel diagonal blocks restored; cross-channel entries zero.
+    for c in range(p):
+        for b1 in range(m_k):
+            for b2 in range(m_k):
+                assert cov[b1 * p + c, b2 * p + c] == factor[c, b1, b2]
+
+
 def test_report_block_getters() -> None:
     golden = _golden()
     core = _core_cls()(golden)

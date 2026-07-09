@@ -7380,6 +7380,131 @@ fn manifold_sae_report(py: Python<'_>, value: &Option<serde_json::Value>) -> PyR
     }
 }
 
+/// Rebuild the dense `(M_k·p, M_k·p)` decoder covariance the atom surface exposes
+/// from the compact per-channel factor `(p, M_k, M_k)` stored on disk (#2091):
+/// block-diagonal across channels, `cov[b1·p + c, b2·p + c] = factor[c][b1][b2]`.
+/// This is the same reassembly as `decoder_cov_from_channel_factors`, so
+/// `atom.decoder_covariance` reproduces the shape band exactly (cross-channel
+/// entries, which no band reads, are zero).
+fn manifold_sae_dense_cov<'py>(
+    py: Python<'py>,
+    factors: &[Vec<Vec<f64>>],
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let p = factors.len();
+    let m = factors.first().map_or(0, Vec::len);
+    let side = m * p;
+    let mut cov = Array2::<f64>::zeros((side, side));
+    for (c, block) in factors.iter().enumerate() {
+        if block.len() != m {
+            return Err(py_value_error(
+                "AtomCore.decoder_covariance: ragged per-channel factor".to_string(),
+            ));
+        }
+        for (b1, row) in block.iter().enumerate() {
+            if row.len() != m {
+                return Err(py_value_error(
+                    "AtomCore.decoder_covariance: non-square per-channel block".to_string(),
+                ));
+            }
+            for (b2, &value) in row.iter().enumerate() {
+                cov[[b1 * p + c, b2 * p + c]] = value;
+            }
+        }
+    }
+    Ok(cov.into_pyarray(py))
+}
+
+/// A single fitted atom's object surface (#2091). Mirrors the attributes
+/// `SaeManifoldAtomFit` exposed (`atom.basis`, `atom.decoder_coefficients`,
+/// `atom.decoder_covariance` reconstructed dense, the shape band, …) so
+/// `ManifoldSaeCore.atoms` stays a list of objects consumers read by attribute,
+/// not a list of dicts. Additive: the Python dataclass remains the live facade.
+#[pyclass(module = "gamfit._rust", name = "AtomCore")]
+pub(crate) struct AtomCore {
+    inner: crate::manifold::manifold_sae_payload::AtomPayload,
+}
+
+#[pymethods]
+impl AtomCore {
+    #[getter]
+    fn basis(&self) -> String {
+        self.inner.basis.clone()
+    }
+    #[getter]
+    fn decoder_coefficients<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        manifold_sae_vec2(py, &self.inner.decoder_coefficients)
+    }
+    #[getter]
+    fn assignments<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        manifold_sae_vec1(py, &self.inner.assignments)
+    }
+    #[getter]
+    fn coords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        manifold_sae_vec2(py, &self.inner.coords)
+    }
+    #[getter]
+    fn coords_u_arc<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner
+            .coords_u_arc
+            .as_ref()
+            .map(|v| manifold_sae_vec1(py, v))
+    }
+    #[getter]
+    fn evidence(&self) -> Option<f64> {
+        self.inner.evidence
+    }
+    #[getter]
+    fn active_dim(&self) -> i64 {
+        self.inner.active_dim
+    }
+    /// The DENSE `(M_k·p, M_k·p)` posterior covariance (or `None`), rebuilt from
+    /// the compact per-channel factor stored on disk.
+    #[getter]
+    fn decoder_covariance<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        match &self.inner.decoder_covariance_channel_factors {
+            None => Ok(None),
+            Some(factors) => Ok(Some(manifold_sae_dense_cov(py, factors)?)),
+        }
+    }
+    #[getter]
+    fn shape_band_coords<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        match &self.inner.shape_band_coords {
+            None => Ok(None),
+            Some(v) => Ok(Some(manifold_sae_vec2(py, v)?)),
+        }
+    }
+    #[getter]
+    fn shape_band_mean<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        match &self.inner.shape_band_mean {
+            None => Ok(None),
+            Some(v) => Ok(Some(manifold_sae_vec2(py, v)?)),
+        }
+    }
+    #[getter]
+    fn shape_band_sd<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        match &self.inner.shape_band_sd {
+            None => Ok(None),
+            Some(v) => Ok(Some(manifold_sae_vec2(py, v)?)),
+        }
+    }
+    #[getter]
+    fn functional_evidence(&self, py: Python<'_>) -> PyResult<PyObject> {
+        manifold_sae_report(py, &self.inner.functional_evidence)
+    }
+}
+
 /// Rust-owned fitted `ManifoldSAE` model handle (#2091). Flat surface only in
 /// this increment; see the module comment above.
 #[pyclass(module = "gamfit._rust", name = "ManifoldSaeCore")]
@@ -7442,6 +7567,17 @@ impl ManifoldSaeCore {
     #[getter]
     fn decoder_blocks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         manifold_sae_list2(py, &self.inner.decoder_blocks)
+    }
+    /// The per-atom object surface — a list of [`AtomCore`] handles, each read by
+    /// attribute (`atom.basis`, `atom.decoder_coefficients`, …), NOT a list of
+    /// dicts. This preserves the `SaeManifoldAtomFit` duck-type consumers use.
+    #[getter]
+    fn atoms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for atom in &self.inner.atoms {
+            list.append(Py::new(py, AtomCore { inner: atom.clone() })?)?;
+        }
+        Ok(list)
     }
     #[getter]
     fn duchon_centers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
