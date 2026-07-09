@@ -586,11 +586,33 @@ pub fn matching_pursuit_commit(
     Some(onehot_from_assign(&assign, f))
 }
 
+/// Exponential-moving-average update of the per-row assignment accumulator.
+///
+/// `prev[n, k]` is the current accumulator and `signal[n, k]` the freshly
+/// observed per-row assignment distribution (a commitment one-hot or the soft
+/// responsibilities); both are detached, non-negative `(N, F)` matrices of the
+/// same shape. Returns the blended accumulator `beta * prev + (1 - beta) *
+/// signal`. This is the sole arithmetic the torch `_update_assign_ema` used to
+/// perform inline; the Python side keeps the stateful orchestration (lazy
+/// sizing, reset on a row-count change, the training-only guard) and delegates
+/// only this recurrence so the EMA math lives in exactly one place.
+#[must_use]
+pub fn assign_ema_update(
+    prev: ArrayView2<'_, f64>,
+    signal: ArrayView2<'_, f64>,
+    beta: f64,
+) -> Array2<f64> {
+    let one_minus = 1.0 - beta;
+    let mut out = prev.to_owned();
+    out.zip_mut_with(&signal, |p, &s| *p = beta * *p + one_minus * s);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_anchor_rule, direction_cluster_anchor, duchon_centers_nd, matching_pursuit_commit,
-        quadratic_subspace_anchor, sinkhorn_balance_bias,
+        apply_anchor_rule, assign_ema_update, direction_cluster_anchor, duchon_centers_nd,
+        matching_pursuit_commit, quadratic_subspace_anchor, sinkhorn_balance_bias,
     };
     use ndarray::{array, Array2, Array3};
 
@@ -600,6 +622,24 @@ mod tests {
         let lifted = duchon_centers_nd(centers.view(), 3);
         assert_eq!(lifted.shape(), &[3, 3]);
         assert_eq!(lifted.column(0), centers);
+    }
+
+    #[test]
+    fn assign_ema_update_blends_prev_and_signal() {
+        // beta*prev + (1-beta)*signal, elementwise, shape-preserving.
+        let prev = array![[1.0, 0.0], [0.0, 1.0]];
+        let signal = array![[0.0, 1.0], [1.0, 0.0]];
+        let out = assign_ema_update(prev.view(), signal.view(), 0.75);
+        assert_eq!(out.shape(), &[2, 2]);
+        assert!((out[(0, 0)] - 0.75).abs() < 1e-12);
+        assert!((out[(0, 1)] - 0.25).abs() < 1e-12);
+        assert!((out[(1, 0)] - 0.25).abs() < 1e-12);
+        assert!((out[(1, 1)] - 0.75).abs() < 1e-12);
+        // beta = 1 keeps the accumulator; beta = 0 replaces it with the signal.
+        let keep = assign_ema_update(prev.view(), signal.view(), 1.0);
+        assert_eq!(keep, prev);
+        let replace = assign_ema_update(prev.view(), signal.view(), 0.0);
+        assert_eq!(replace, signal);
     }
 
     #[test]

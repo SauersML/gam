@@ -819,6 +819,29 @@ fn sae_sinkhorn_balance_bias<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Exponential-moving-average blend of the per-row assignment accumulator for
+/// the torch `softmax_topk` routing lane (issue #1282). Given the current
+/// accumulator `prev (N, F)`, the freshly observed assignment signal
+/// `signal (N, F)`, and the decay `beta`, returns `beta*prev + (1-beta)*signal`.
+/// Both inputs are detached routing state; the Python `_update_assign_ema` keeps
+/// the stateful orchestration (lazy sizing, reset on a row-count change, the
+/// training-only guard) and delegates only this numeric recurrence so the EMA
+/// math is single-sourced. See `gam::geometry::sae_routing::assign_ema_update`.
+#[pyfunction]
+fn sae_assign_ema_update<'py>(
+    py: Python<'py>,
+    prev: PyReadonlyArray2<'py, f64>,
+    signal: PyReadonlyArray2<'py, f64>,
+    beta: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let prev_owned = prev.as_array().to_owned();
+    let signal_owned = signal.as_array().to_owned();
+    let out = py.detach(move || {
+        sae_assign_ema_update_impl(prev_owned.view(), signal_owned.view(), beta)
+    });
+    Ok(out.into_pyarray(py).unbind())
+}
+
 /// Residual-EM routing scores for the torch `softmax_topk` lane (issue #1282).
 /// Given the input rows `x (N, D)` and the per-atom decoded curves
 /// `per_atom_recon (N, F, D)`, solves the best scalar code against each atom's
@@ -4831,6 +4854,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
     module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_assign_ema_update, module)?)?;
     module.add_function(wrap_pyfunction!(sae_residual_em_score, module)?)?;
     module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;

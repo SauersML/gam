@@ -103,6 +103,7 @@ pub(crate) use gam_predict::FittedModelPredictExt;
 pub(crate) use gam_predict::input::build_predict_input_for_model;
 
 pub(crate) use gam::geometry::sae_routing::apply_anchor_rule as sae_apply_anchor_rule_impl;
+pub(crate) use gam::geometry::sae_routing::assign_ema_update as sae_assign_ema_update_impl;
 pub(crate) use gam::geometry::sae_routing::direction_cluster_anchor as sae_direction_cluster_anchor_impl;
 pub(crate) use gam::geometry::sae_routing::duchon_centers_nd as sae_duchon_centers_nd_impl;
 pub(crate) use gam::geometry::sae_routing::matching_pursuit_commit as sae_matching_pursuit_commit_impl;

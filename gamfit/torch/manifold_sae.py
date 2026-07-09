@@ -1373,6 +1373,12 @@ class _SparsityLayer(nn.Module):
         routing falls back to the instantaneous residual). Only updated while
         training; in eval the accumulator is read but not advanced. Returns the
         current accumulator, or ``None`` if there is no history for this batch.
+
+        This method owns only the stateful orchestration (lazy sizing, reset on
+        a row-count change, the training-only guard); the EMA recurrence itself
+        (``beta·prev + (1−beta)·signal``) is the Rust source of truth
+        (``gam::geometry::sae_routing::assign_ema_update`` via
+        ``sae_assign_ema_update``), so no blend arithmetic lives in Python.
         """
         if signal is None or not self.training:
             # No update; return the accumulator only if it matches this batch.
@@ -1385,8 +1391,10 @@ class _SparsityLayer(nn.Module):
         if ema is None or ema.shape != sig.shape:
             self._assign_ema = sig.clone()
             return self._assign_ema
-        beta = self._assign_ema_beta
-        self._assign_ema = beta * ema + (1.0 - beta) * sig
+        blended = rust_module().sae_assign_ema_update(
+            to_numpy_f64(ema), to_numpy_f64(sig), float(self._assign_ema_beta)
+        )
+        self._assign_ema = from_numpy_like(blended, sig)
         return self._assign_ema
 
     @staticmethod
