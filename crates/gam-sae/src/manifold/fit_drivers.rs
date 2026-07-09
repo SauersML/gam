@@ -5175,25 +5175,26 @@ impl SaeManifoldTerm {
                 && self.retract_collapsed_decoders_in_loop() > 0
             {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
-            } else if self.quotient_scale && self.k_atoms() == 1 {
-                // #2228/#1095 K=1 scale-gauge. A single atom has no dictionary peer
-                // for the collapse-relative retraction above (`retract_collapsed_
-                // decoders_in_loop` is a K<2 no-op), so that path never fires — yet
-                // the K=1 IBP gate is HARD-CAPPED at `a_1 = σ(l_1/τ)·π_1 ≤ π_1`
-                // (`π_1 = (α/(α+1))^1 = 0.5` at the production α=1), so the decoder
-                // must carry the `1/a_1 ≥ 2×` compensating magnitude the smoothness
-                // penalty (scaled by λ, NOT the gate) fights: the penalized decoder
-                // argmin is over-shrunk by `1/a_1²`, the gated reconstruction can't
-                // reach the target, and the fit co-collapses (the #2228 inner-solve
-                // stall / the `R²≈1−(1−0.25)²=0.4375` pristine-seed fallback). Re-home
-                // the scale into the UNPENALIZED log-amplitude `s_1` at this accepted
-                // boundary — `pin_scale_gauge_k1` peels `‖B‖` into `s_1` (unit-`B̂`,
-                // scale-free smoothness) and pins `exp(s_1)` to the data optimum, so
-                // the reconstruction reaches the target regardless of the gate cap.
-                // Unconditional (not collapse-gated): a healthy low-signal K=1 atom is
-                // pinned to its true small amplitude by the same solve's monotone
-                // safeguard, so this only ever helps.
-                self.pin_scale_gauge_k1(target, rho)?;
+            } else if self.quotient_scale {
+                // #2228/#1095/#2134 SCALE-gauge pin (any active support). The
+                // collapse-relative retraction above MISSES the co-collapse whenever
+                // the whole active support shrinks TOGETHER: its `k<2` early-out kills
+                // K=1, and its MEDIAN-keyed breach never fires when every active atom
+                // is over-shrunk in lockstep (no atom is small RELATIVE to its peers).
+                // But that lockstep shrink is exactly the ordered IBP-MAP failure — each
+                // active atom's gate is capped by its column index `a_k = σ(l_k/τ)·π_k`,
+                // `π_k = (α/(α+1))^{k+1}` (0.5, 0.25, 0.125… at α=1), so the smoothness
+                // penalty (scaled by λ, NOT the gate) over-shrinks atom k's decoder by
+                // `1/π_k²` (4×, 16×, 64×…). `top_k=1` is only borderline
+                // (`R²≈1−0.75²=0.4375`); `top_k>1` diverges per active atom (#2134-p2 /
+                // real-OLMo multi-active co-collapse). `pin_scale_gauge` peels every
+                // atom's `‖B‖` into the UNPENALIZED `s_k` (unit-`B̂`, scale-free
+                // smoothness) and re-homes each `exp(s_k)~1/a_k` by the joint data-optimal
+                // solve, so every active atom reaches the target regardless of its `π_k`
+                // cap. Runs at this accepted boundary with the solve's monotone keep-best
+                // safeguard, so a healthy fit (K=1 low-amp or multi-active) is inert and
+                // this only ever helps.
+                self.pin_scale_gauge(target, rho)?;
             }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step

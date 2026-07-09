@@ -1130,41 +1130,49 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #2228/#1095/#2132/#1893 Option B — the K=1 SCALE-gauge PIN, the co-collapse
-    /// cure.
+    /// #2228/#1095/#2132/#1893/#2134 Option B — the SCALE-gauge PIN, the co-collapse
+    /// cure, for ANY active support (K=1 through fully multi-active).
     ///
     /// # The bug this fixes
     /// The decoder DATA-fit β-Hessian is gate-weighted (design `D_k = diag(a_·k)·Φ_k·B_k`,
     /// construction_arrow_schur_assembly.rs), but the decoder SMOOTHNESS / ARD penalty
-    /// is scaled by `λ` ONLY, not the gate — so the EFFECTIVE decoder shrinkage is
-    /// `λ/a_k²`. For a K=1 IBP fit whose gate is hard-capped (`a_1 ≤ 0.5`, π₁=0.5,
-    /// non-learnable α) the decoder is over-shrunk ≥4×, the gated reconstruction
-    /// `a_k·Φ·B` can no longer reach the target, and the fit STALLS at the pristine
-    /// seed (`R² = 0.4375`) — the #2228/#1095/#2132/#1893/OLMo co-collapse.
+    /// is scaled by `λ` ONLY, not the gate — so the EFFECTIVE decoder shrinkage per atom
+    /// is `λ/a_k²`. Under the ordered geometric IBP-MAP prior `π_k = (α/(α+1))^{k+1}`
+    /// (`ibp_map_row`) EACH active atom's gate is capped by its column index
+    /// (`π₀=0.5, π₁=0.25, π₂=0.125…` at α=1), so a multi-concept token that activates
+    /// atoms `{0,1,2,…}` has each atom's decoder over-shrunk by `1/π_k²` (4×, 16×,
+    /// 64×…). The gated reconstruction `a_k·Φ·B` can no longer reach the target and the
+    /// fit co-collapses PER ACTIVE ATOM — `top_k=1` is only borderline (`R²=0.4375`) but
+    /// `top_k>1` diverges (#2134-part-2 / the real-OLMo multi-active co-collapse).
     ///
     /// # The cure (architecturally intended, see
     /// [`Self::optimize_log_amplitudes_closed_form`]'s doc)
     /// Move the compensating magnitude OUT of the penalized decoder and INTO the
     /// UNPENALIZED log-amplitude `s_k`, so the penalty only shapes a unit-Frobenius
-    /// frame `B̂_k`:
+    /// frame `B̂_k` — applied to EVERY atom, so each active atom is compensated
+    /// independently for its own `π_k` cap:
     /// 1. **Peel** each atom's `‖B_k‖_F` into `s_k` ([`SaeManifoldAtom::absorb_decoder_norm_into_log_amplitude`]),
     ///    so `B̂_k` is unit-Frobenius and magnitude lives only in `s_k`. Unlike the
-    ///    peer-relative [`Self::retract_collapsed_decoders_in_loop`] (which has a
-    ///    `k < 2` early-out — a lone atom has no peer to be "collapsed" against, which
-    ///    is exactly why the K=1 case never self-healed), this fires unconditionally.
+    ///    peer-relative [`Self::retract_collapsed_decoders_in_loop`] (whose `k < 2`
+    ///    early-out and MEDIAN-keyed breach both MISS the multi-active case — when the
+    ///    whole active support shrinks TOGETHER no atom breaches relative to its peers),
+    ///    this fires unconditionally on every atom.
     /// 2. **Re-home** the magnitude via the data-optimal, ARD/SCAD-penalized amplitude
-    ///    solve — the gate-compensating amplitude `exp(s_k) ~ 1/a_k` emerges from the
-    ///    least-squares projection against the frozen unit-`B̂` design.
-    /// 3. **Condition** `exp(s_k)`: an IBP gate driven small by the sparsity prior
-    ///    would otherwise let `exp(s_k)` run away; clamp it against the atom's
-    ///    GATE-INDEPENDENT unit-design magnitude `‖Φ_k B̂_k‖_F` so the pathological
-    ///    `a_k → 0` blow-up is bounded while the legitimate `a_k ≤ 0.5` compensation
-    ///    (`exp(s) ~ 2`) is untouched.
+    ///    solve. This is the JOINT `K×K` solve (a non-negative coordinate descent over
+    ///    the coupled gated Gram, so overlapping atoms are resolved jointly, not by an
+    ///    independent per-atom LS); the gate-compensating amplitude `exp(s_k) ~ 1/a_k`
+    ///    emerges per atom from the least-squares projection against the frozen
+    ///    unit-`B̂` designs.
+    /// 3. **Condition** `exp(s_k)`: an IBP gate `a_k = σ(logit_k)·π_k` driven small by
+    ///    the ordered prior would otherwise let `exp(s_k)` run away; clamp each atom
+    ///    INDEPENDENTLY against its own GATE-INDEPENDENT unit-design magnitude
+    ///    `‖Φ_k B̂_k‖_F` so the pathological `a_k → 0` blow-up is bounded while the
+    ///    legitimate `π_k` compensation (e.g. `exp(s) ~ 1/π_k`) is untouched.
     ///
     /// Mirrors [`Self::optimize_log_amplitudes_closed_form`]'s `(target, rho)` params
     /// so a caller can invoke either at the same fit-loop site with no adaptor.
     /// Idempotent: peeling an already-unit decoder is a no-op (`ln 1 = 0`).
-    pub fn pin_scale_gauge_k1(
+    pub fn pin_scale_gauge(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,

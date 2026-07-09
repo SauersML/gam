@@ -80,17 +80,20 @@ pub struct SaeOuterRhoGradientComponents {
     /// Derivative contribution of `-occam`.
     pub occam: Array1<f64>,
     /// `−½·Γᵀθ̂_ρ`, the implicit-state (envelope) response, **after** the inner
-    /// stationarity dead-zone gate — this is the term [`Self::gradient`] consumes.
+    /// stationarity gate — this is the term [`Self::gradient`] consumes.
     ///
-    /// The tolerance-gated inner solve leaves `θ̂` frozen whenever an outer-ρ step
-    /// perturbs the inner KKT gradient by less than the stationarity tolerance `τ`
-    /// that declared convergence (`τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL ·
-    /// inner_iterate_scale`). On those coordinates the criterion the outer search
-    /// actually experiences has `θ̂` locally constant, so its (Clarke) gradient is
-    /// `explicit + logdet_trace + occam` with NO envelope term. This field is that
-    /// envelope term set to `0` on every coordinate whose predicted response sits
-    /// inside the dead-zone, and equal to the raw response elsewhere. See
-    /// `analytic_outer_rho_gradient_components` for the derivation of the gate.
+    /// The tolerance-gated inner solve leaves `θ̂` frozen for every outer-ρ step
+    /// small enough to keep the perturbed inner KKT gradient inside the
+    /// stationarity tolerance `τ` that declared convergence
+    /// (`τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL · inner_iterate_scale`). Since a
+    /// converged solve already satisfies `‖g(θ̂,ρ)‖ ≤ τ`, the `dρ → 0` limit that
+    /// defines the consumed gradient is always inside that dead-zone: `θ̂` is
+    /// locally constant and the criterion's gradient is `explicit + logdet_trace +
+    /// occam` with NO envelope term. This field is therefore `0` on every
+    /// coordinate of a converged inner solve; the raw envelope (which the θ̂-motion
+    /// would price only if the inner solve were still actively tracking ρ, `‖g‖ >
+    /// τ`) is preserved on [`Self::third_order_correction_raw`]. See
+    /// `analytic_outer_rho_gradient_components` for the full derivation.
     pub third_order_correction: Array1<f64>,
     /// The RAW, ungated envelope response `−½·Γᵀθ̂_ρ` per coordinate, before the
     /// dead-zone gate zeroes the frozen-`θ̂` coordinates. Diagnostics-only: it lets

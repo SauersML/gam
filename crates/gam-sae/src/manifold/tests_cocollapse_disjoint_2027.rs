@@ -674,3 +674,96 @@ pub(crate) fn quotient_scale_on_does_not_crash_k1_2100() {
         "quotient_scale ON must track the OFF baseline at K=1: ON={ev_on:.6} vs OFF={ev_off:.6}"
     );
 }
+
+/// #2134-part-2 — the SCALE-gauge pin generalized to MULTI-ACTIVE. Under the ordered
+/// geometric IBP-MAP prior each active atom's gate is capped by its COLUMN INDEX
+/// (`a_k = σ(l_k/τ)·π_k`, `π_k = (α/(α+1))^{k+1} = 0.5^{k+1}` at α=1), so a
+/// multi-concept token that activates atoms {0,1,2} has each atom's decoder
+/// over-shrunk by `1/π_k²` (4×, 16×, 64×) and the gated reconstruction `a_k·Φ·B`
+/// cannot reach the target PER ACTIVE ATOM — the top_k>1 co-collapse the K=1 pin
+/// alone never covered. `pin_scale_gauge` must peel EVERY atom's ‖B‖ into the
+/// unpenalized `s_k` and re-home each `exp(s_k) ≈ 1/a_k` by the JOINT amplitude
+/// solve, so every active atom's gated contribution reaches its planted concept
+/// regardless of its own `π_k` cap. Direct pin exercise (no full fit): three
+/// ORTHOGONAL unit-shape concepts on atoms 0,1,2, all strongly active.
+#[test]
+pub(crate) fn pin_scale_gauge_rehomes_multi_active_amplitudes_2134() {
+    let (n, p, m, k) = (48usize, 6usize, 5usize, 3usize);
+    let mut term = two_circle_kn_term(n, p, m, k);
+    // Three DISTINCT, ORTHOGONAL unit-Frobenius decoders: atom j writes a genuine
+    // (varying) harmonic into its OWN output column j only, so the gated designs are
+    // orthogonal across atoms and the joint amplitude solve recovers each exp(s_k)
+    // independently. `s_k = 0` is the co-collapsed state (gated output only reaches
+    // `a_k·concept`).
+    for (j, atom) in term.atoms.iter_mut().enumerate() {
+        let dec = &mut atom.decoder_coefficients; // (m × p)
+        for v in dec.iter_mut() {
+            *v = 0.0;
+        }
+        dec[[1, j]] = 0.6; // first harmonic → output column j
+        dec[[2, j]] = 0.8; // second harmonic → output column j (0.36+0.64 = 1: unit ‖·‖_F)
+        atom.log_amplitude = 0.0;
+    }
+    // Activate ALL atoms strongly (σ(6) ≈ 1 ⇒ gate a_k ≈ π_k = 0.5^{k+1}).
+    for row in 0..n {
+        for atom in 0..k {
+            term.assignment.logits[[row, atom]] = 6.0;
+        }
+    }
+    let rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1); k]);
+    // Measure the per-atom IBP-MAP gate (row-constant here) and confirm the ordered
+    // prior makes it STRICTLY DECREASING by column — the co-collapse driver.
+    let mut a = vec![0.0_f64; k];
+    term.assignment
+        .try_assignments_row_for_rho_into(0, &rho, a.as_mut_slice())
+        .expect("ibp-map gate");
+    assert!(
+        a[0] > a[1] && a[1] > a[2] && a[2] > 0.0,
+        "ordered IBP-MAP gates must strictly decrease by column: {a:?}"
+    );
+    // Plant target = Σ_k Φ_k B̂_k (each atom's UNIT-shape concept, gate-free): the
+    // reconstruction each atom must reach. At s=0 the gated output is only
+    // `a_k·concept_k`, so the multi-active fit under-reaches — the co-collapse.
+    let mut target = Array2::<f64>::zeros((n, p));
+    for atom in &term.atoms {
+        target = target + atom.basis_values.dot(&atom.decoder_coefficients);
+    }
+    let ev_pre = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("pre-pin EV");
+    assert!(
+        ev_pre < 0.75,
+        "pre-pin: the gate-capped multi-active fit must UNDER-reach (co-collapse); EV={ev_pre:.4}"
+    );
+
+    // The pin.
+    term.pin_scale_gauge(target.view(), &rho)
+        .expect("multi-active scale-gauge pin");
+
+    // (1) Each active atom re-homed to exp(s_k) ≈ 1/a_k — the gated contribution
+    //     a_k·exp(s_k)·Φ·B̂ reaches its unit concept, INDEPENDENTLY per atom.
+    let amps: Vec<f64> = (0..k).map(|j| term.atoms[j].log_amplitude.exp()).collect();
+    for j in 0..k {
+        assert!(
+            (amps[j] * a[j] - 1.0).abs() < 0.05,
+            "atom {j}: gated amplitude a·exp(s) must reach the concept; a={:.4}, exp(s)={:.4}, 1/a={:.4}",
+            a[j],
+            amps[j],
+            1.0 / a[j]
+        );
+    }
+    // (2) The compensating amplitudes INCREASE with the atom index — the signature of
+    //     per-active-atom compensation for the decreasing π_k cap (exp(s_k) ≈ 1/π_k).
+    assert!(
+        amps[0] < amps[1] && amps[1] < amps[2],
+        "compensating amplitudes must increase with the ordered π_k cap: {amps:?}"
+    );
+    // (3) The pinned multi-active reconstruction reaches every planted concept.
+    let ev_post = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("post-pin EV");
+    assert!(
+        ev_post > 0.9,
+        "post-pin: every active atom must reach its concept (co-collapse cured); EV={ev_post:.4}"
+    );
+}

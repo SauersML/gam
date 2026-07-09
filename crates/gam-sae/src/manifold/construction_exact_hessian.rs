@@ -481,39 +481,43 @@ impl SaeManifoldTerm {
         // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
         // biased by `(B⁻¹ − A⁻¹)`.
         //
-        // #2087 dead-zone gate. The raw envelope term `−½·Γᵀθ̂_ρ` is the response
-        // of the SMOOTH criterion `V(ρ) = penalized_loss(θ̂(ρ),ρ) + ½log|H|` that
-        // presumes the inner optimum tracks ρ exactly. The production inner solve
-        // does NOT: it accepts `θ̂` once the KKT gradient is stationary to the
-        // relative tolerance `τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL · iterate_scale`
+        // #2087 desync resolution — the envelope term `−½·Γᵀθ̂_ρ` is NOT part of
+        // the gradient the outer search consumes at a converged inner solve. It is
+        // the response of the SMOOTH criterion `V(ρ) = penalized_loss(θ̂(ρ),ρ) +
+        // ½log|H|` that presumes the inner optimum tracks ρ EXACTLY. The production
+        // criterion does not: `reml_criterion` warm-starts the inner solve from `θ̂`
+        // and accepts it the instant the KKT gradient is stationary to
+        // `τ = SAE_MANIFOLD_INNER_GRAD_REL_TOL · inner_iterate_scale`
         // (`reml_criterion`'s `grad_tolerance`, construction.rs). Under an outer
-        // step `dρ_j` the warm-started re-solve leaves `θ̂` UNCHANGED as long as
-        // the perturbed inner gradient stays inside that dead-zone. The IFT step
-        // `θ̂_ρ,j = −A⁻¹ rhs_j` images back through the inner Hessian to an inner
-        // gradient of exactly `A·θ̂_ρ,j = −rhs_j` (the `rhs_j` = `∂g/∂ρ_j`
-        // perturbation the re-solve would have to null), so `‖rhs_j‖` is precisely
-        // the inner-gradient signal that the predicted θ̂-response carries. When
-        // `‖rhs_j‖ ≤ τ`, a unit-ρ move perturbs the inner KKT gradient by less
-        // than the stationarity tolerance that declared convergence — the re-solve
-        // returns the incumbent and `θ̂` is FROZEN, so the criterion the outer
-        // search actually experiences has `θ̂` locally constant and its gradient is
-        // `explicit + logdet_trace + occam` with NO envelope term. A large raw
-        // `−½·Γᵀθ̂_ρ` there is the spurious amplification of a below-tolerance
-        // signal through a weakly-identified (near-null) direction of `A`. We
-        // therefore keep the envelope term ONLY on coordinates whose driving
-        // signal escapes the dead-zone (`‖rhs_j‖ > τ`, where the inner re-solve
-        // genuinely tracks `θ̂(ρ)`), and zero it otherwise. The raw value is
-        // preserved on `third_order_correction_raw` for diagnostics; no VALUE
-        // channel changes. Constants come entirely from the inner solver's own
-        // stationarity tolerance — no new knob.
-        let dead_zone_tol = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
+        // step `dρ` the perturbed inner gradient is `g(θ̂,ρ) + dρ·(∂g/∂ρ)`; the
+        // converged state already satisfies `‖g(θ̂,ρ)‖ ≤ τ`, so in the `dρ → 0`
+        // limit that DEFINES the consumed gradient it stays inside the τ-ball, the
+        // warm-started re-solve returns the incumbent, and `θ̂` is FROZEN. The
+        // criterion's local gradient is therefore `explicit + logdet_trace + occam`,
+        // with NO envelope term. The `θ̂`-motion the envelope prices is realized
+        // ONLY when the inner solve has not reached stationarity (`‖g‖ > τ`, still
+        // actively tracking ρ) — a regime no converged consumer of this routine is
+        // in, so the envelope is dropped on every coordinate.
+        //
+        // The earlier gate kept the envelope wherever `‖∂g/∂ρ‖ > τ`. That compared
+        // a UNIT-ρ-step signal against `τ`, but the criterion freezes `θ̂` whenever
+        // an ACTUAL step `h` leaves `h·‖∂g/∂ρ‖ ≤ τ`, i.e. for `‖∂g/∂ρ‖` up to
+        // `τ/h`. At the FD gate's `h = 2e-4` that is `5000·τ`, so coordinates with
+        // `τ < ‖∂g/∂ρ‖ < τ/h` survived the gate yet were frozen in the criterion —
+        // the analytic gradient then injected a large `−½·Γᵀθ̂_ρ` the criterion FD
+        // never experienced: the #2087 objective↔gradient desync (and the line-
+        // search thrash / #2080 wide-p wall-clock burn it drives). Consuming the
+        // frozen-`θ̂` gradient ends the desync: the outer optimizer descends its own
+        // criterion. No new knob.
+        //
+        // The raw envelope is still assembled onto `third_order_correction_raw` for
+        // the #2087 discriminator (it characterises the spurious amplification of a
+        // below-tolerance signal through a weakly-identified near-null direction of
+        // `A`). It is NEVER summed into the consumed gradient.
         for coord in 0..n_params {
             let rhs = self
                 .outer_rho_gradient_ift_rhs(rho, target, coord, cache)
                 .map_err(OuterGradientError::internal)?;
-            let rhs_norm_sq = rhs.t.iter().map(|&v| v * v).sum::<f64>()
-                + rhs.beta.iter().map(|&v| v * v).sum::<f64>();
-            let rhs_norm = rhs_norm_sq.sqrt();
             let solved = self
                 .solve_exact_stationarity(rho, target, cache, solver, &rhs)
                 .map_err(OuterGradientError::internal)?;
@@ -524,11 +528,10 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            let raw = -0.5 * dot;
-            third_order_correction_raw[coord] = raw;
-            // Dead-zone gate: only trust the envelope response where the outer
-            // step would drive the inner gradient past the stationarity tolerance.
-            third_order_correction[coord] = if rhs_norm > dead_zone_tol { raw } else { 0.0 };
+            third_order_correction_raw[coord] = -0.5 * dot;
+            // θ̂ is frozen at a converged inner solve (see above): the envelope is
+            // not part of the criterion's local gradient, so it is not consumed.
+            third_order_correction[coord] = 0.0;
         }
 
         Ok(SaeOuterRhoGradientComponents {
