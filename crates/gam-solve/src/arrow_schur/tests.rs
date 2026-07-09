@@ -4978,6 +4978,94 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
     );
 }
 
+/// The #2080 evidence lane switch: `matrix_free_arrow_evidence_log_det_surrogate`
+/// with `lane = None` must be BIT-IDENTICAL to `matrix_free_arrow_evidence_log_det`
+/// (same factorization, same SLQ path — a caller that has not opted in is
+/// unchanged), and with `lane = Some(state)` must (a) build+freeze the derived
+/// plan on first call, (b) return a `log|S|` close to the dense reduced Schur,
+/// and (c) REUSE the frozen plan on a second call at the same dimension
+/// (bit-identical estimate, and the same `Q` is what the gradient will contract).
+#[test]
+fn matrix_free_arrow_evidence_surrogate_none_matches_slq_some_builds_and_reuses() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let seed = 0x2080_5A17_C0DE_u64;
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+
+    // Dense oracle for the reduced-Schur log|S|.
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, options.tolerate_ill_conditioning)
+        .expect("SPD per-row blocks must factor");
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+    let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
+
+    // (a) None ⇒ bit-identical to the SLQ convenience.
+    let (tt_ref, slq_ref) =
+        matrix_free_arrow_evidence_log_det(&sys, 0.0, ridge_beta, &options, 48, 60, seed)
+            .expect("SLQ convenience must succeed");
+    let (tt_none, schur_none) = matrix_free_arrow_evidence_log_det_surrogate(
+        &sys, 0.0, ridge_beta, &options, 48, 60, seed, None,
+    )
+    .expect("None-lane surrogate entry must succeed");
+    assert_eq!(tt_none, tt_ref, "log_det_tt must be bit-identical to the SLQ convenience");
+    assert_eq!(
+        schur_none, slq_ref.estimate,
+        "None-lane log|S| must be the bit-identical SLQ estimate"
+    );
+
+    // (b) Some ⇒ builds+freezes the derived plan, log|S| tracks the dense oracle.
+    let cfg = SurrogateLaneConfig {
+        num_probes: 48,
+        seed,
+        rel_tol: 1e-9,
+        power_iters: 40,
+        cg_rel_tol: 1e-11,
+        cg_max_iters: 20_000,
+        deflation_max_rank: 16,
+        deflation_subspace_iters: 4,
+        deflation_target_std_err_rel: 1e-4,
+    };
+    let mut state = SurrogateLaneState::new(cfg);
+    assert!(state.plan().is_none(), "a fresh lane has no plan until first evaluated");
+    let (tt_some, schur_some) = matrix_free_arrow_evidence_log_det_surrogate(
+        &sys,
+        0.0,
+        ridge_beta,
+        &options,
+        48,
+        60,
+        seed,
+        Some(&mut state),
+    )
+    .expect("Some-lane surrogate entry must succeed");
+    assert_eq!(tt_some, tt_ref, "log_det_tt is factorization-only, independent of the log|S| lane");
+    assert!(state.plan().is_some(), "the first Some evaluation must build+freeze the plan");
+    let rel = (schur_some - exact_logdet).abs() / exact_logdet.abs();
+    eprintln!("surrogate-lane log|S|={schur_some:.6} exact={exact_logdet:.6} rel={rel:.3e}");
+    assert!(rel < 0.05, "surrogate-lane log|S| rel err {rel:.3e} exceeds 5%");
+
+    // (c) Second call at the same dim reuses the frozen plan ⇒ bit-identical.
+    let (_tt2, schur_reuse) = matrix_free_arrow_evidence_log_det_surrogate(
+        &sys,
+        0.0,
+        ridge_beta,
+        &options,
+        48,
+        60,
+        seed,
+        Some(&mut state),
+    )
+    .expect("reused-lane surrogate entry must succeed");
+    assert_eq!(
+        schur_reuse, schur_some,
+        "reusing the frozen plan at the same dimension must be bit-deterministic"
+    );
+}
+
 /// Dense power-iteration reference for the top eigenvalue of an SPD matrix — a
 /// self-contained oracle for [`reduced_schur_lambda_max`] that needs no eigh
 /// import. Converges to `λ_max` from below; 200 steps is far more than the

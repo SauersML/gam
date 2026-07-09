@@ -1387,6 +1387,151 @@ pub fn matrix_free_arrow_evidence_log_det(
     Ok((log_det_tt, slq))
 }
 
+/// Fixed configuration for the #2080 rational-surrogate evidence lane: the probe
+/// count, seeds, quadrature/CG tolerances, and derived-rank deflation budget the
+/// [`SurrogateLaneState`] plan is (re)built with. The caller (the SAE streaming
+/// criterion) supplies these once; `deflation_target_std_err_rel` is the derived
+/// bar `0.1 · STALL_REL_TOL` (see [`rational_reduced_schur_plan_derived`]).
+#[derive(Clone)]
+pub struct SurrogateLaneConfig {
+    pub num_probes: usize,
+    pub seed: u64,
+    pub rel_tol: f64,
+    pub power_iters: usize,
+    pub cg_rel_tol: f64,
+    pub cg_max_iters: usize,
+    pub deflation_max_rank: usize,
+    pub deflation_subspace_iters: usize,
+    pub deflation_target_std_err_rel: f64,
+}
+
+/// Per-outer-solve state for the #2080 rational-surrogate evidence lane. Holds
+/// the FROZEN derived-rank plan — probes, bracket-centred quadrature, and Hutch++
+/// `Q`, all fixed once at the entry ρ so value and gradient stay a single
+/// functional across the ρ sweep — plus the config to (re)build it when the
+/// reduced-Schur dimension changes (a basin mutation between outer solves).
+/// Threaded as `Option<&mut _>` through the streaming criterion; `None` keeps the
+/// bit-identical SLQ path.
+pub struct SurrogateLaneState {
+    plan: Option<RationalLogdetPlan>,
+    cfg: SurrogateLaneConfig,
+}
+
+impl SurrogateLaneState {
+    /// A lane with no plan yet — the first evaluation builds and freezes it.
+    pub fn new(cfg: SurrogateLaneConfig) -> Self {
+        Self { plan: None, cfg }
+    }
+
+    /// The frozen plan, once built (for the gradient lane, which contracts
+    /// against the SAME `Q` the value used).
+    pub fn plan(&self) -> Option<&RationalLogdetPlan> {
+        self.plan.as_ref()
+    }
+}
+
+/// Split arrow-Schur evidence `log|H| = Σ log|H_tt| + log|S|` where the reduced
+/// Schur term is estimated by the #2080 rational surrogate rather than SLQ, on
+/// ONE shared factorization. The build-once companion to
+/// [`matrix_free_arrow_evidence_log_det`]:
+///
+/// - `lane = None` runs the identical [`slq_reduced_schur_log_det`] path — a
+///   bit-for-bit fallback so a caller that has not opted in is unchanged.
+/// - `lane = Some(state)` builds (or, when the reduced-Schur dimension is
+///   unchanged, reuses) the frozen derived-rank [`RationalLogdetPlan`] and
+///   evaluates it against the current operator. The plan's `Q`/probes/quadrature
+///   are fixed at first build, so only the matrix-free `S·v` apply moves with ρ —
+///   the value and its [`RationalLogdetPlan::directional_derivative`] gradient
+///   remain one functional.
+///
+/// Returns `(log_det_tt, log_det_schur)`; the caller adds them for the evidence.
+pub fn matrix_free_arrow_evidence_log_det_surrogate(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+    slq_num_probes: usize,
+    slq_lanczos_steps: usize,
+    slq_seed: u64,
+    lane: Option<&mut SurrogateLaneState>,
+) -> Result<(f64, f64), ArrowSchurError> {
+    let backend = CpuBatchedBlockSolver;
+    let factorization = factor_blocks_for_system(sys, ridge_t, options, &backend)?;
+    let htt_factors = factorization.factors;
+    let mut log_det_tt = 0.0_f64;
+    for row in 0..htt_factors.len() {
+        let factor = htt_factors.factor(row);
+        for axis in 0..factor.nrows() {
+            log_det_tt += 2.0 * factor[[axis, axis]].ln();
+        }
+    }
+    let resident = SaeResidentReducedSchur::build(sys, &htt_factors, &backend);
+
+    let log_det_schur = match lane {
+        None => {
+            let slq = slq_reduced_schur_log_det(
+                sys,
+                &htt_factors,
+                ridge_beta,
+                &backend,
+                resident.as_ref(),
+                slq_num_probes,
+                slq_lanczos_steps,
+                slq_seed,
+            );
+            slq.estimate
+        }
+        Some(state) => {
+            let dim = sys.k;
+            // (Re)build the frozen plan when absent or dimension-mismatched (a
+            // basin mutation changed the border); otherwise reuse the frozen Q.
+            let need_build = state.plan.as_ref().map_or(true, |p| p.dim != dim);
+            if need_build {
+                let cfg = state.cfg.clone();
+                let plan = rational_reduced_schur_plan_derived(
+                    sys,
+                    &htt_factors,
+                    ridge_beta,
+                    &backend,
+                    resident.as_ref(),
+                    cfg.num_probes,
+                    cfg.seed,
+                    cfg.rel_tol,
+                    cfg.power_iters,
+                    cfg.cg_rel_tol,
+                    cfg.cg_max_iters,
+                    cfg.deflation_max_rank,
+                    cfg.deflation_subspace_iters,
+                    cfg.deflation_target_std_err_rel,
+                )
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                    reason: format!(
+                        "rational log-det surrogate plan build failed for reduced Schur dim {dim}"
+                    ),
+                })?;
+                state.plan = Some(plan);
+            }
+            let plan = state
+                .plan
+                .as_ref()
+                .expect("plan installed just above when absent");
+            let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+                let x = v.to_owned();
+                let mut out = Array1::<f64>::zeros(dim);
+                schur_matvec(sys, &htt_factors, ridge_beta, &x, &mut out, &backend, resident.as_ref());
+                out
+            };
+            let eval = plan
+                .evaluate(&matvec, state.cfg.cg_rel_tol, state.cfg.cg_max_iters)
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                    reason: "rational log-det surrogate evaluation returned non-finite".to_string(),
+                })?;
+            eval.estimate
+        }
+    };
+    Ok((log_det_tt, log_det_schur))
+}
+
 /// Power-iteration estimate of the largest eigenvalue `λ_max` of the SPD reduced
 /// Schur `S` through the matrix-free [`schur_matvec`] apply — the upper end of
 /// the spectral bracket the #2080 rational log-det surrogate
