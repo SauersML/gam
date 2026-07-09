@@ -1947,7 +1947,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                     spec,
                     block_idx,
                     |x_dyn, _| {
-                        let w = floor_positiveworking_weights(working_weights, options.minweight);
+                        let w = floor_positiveworking_weights(working_weights, options.minweight)?;
                         let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
                         diagonal_design = Some(x_dyn.clone());
                         Ok(xtwx)
@@ -2005,7 +2005,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                     )
                                 })?;
                         let wwork =
-                            floor_positiveworking_weights(working_weights, options.minweight);
+                            floor_positiveworking_weights(working_weights, options.minweight)?;
                         let x_dense = x_dyn.to_dense();
                         let n = x_dense.nrows();
 

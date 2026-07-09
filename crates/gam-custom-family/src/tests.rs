@@ -1792,10 +1792,31 @@ pub(crate) fn custom_family_default_outer_seed_config_is_tightened_for_expensive
 #[test]
 pub(crate) fn floor_positiveworking_weights_preserves_exactzeros() {
     let weights = array![0.0, 1.0e-16, 0.25];
-    let floored = floor_positiveworking_weights(&weights, 1.0e-6);
+    let floored =
+        floor_positiveworking_weights(&weights, 1.0e-6).expect("valid nonnegative weights");
     assert_eq!(floored[0], 0.0);
     assert_eq!(floored[1], 1.0e-6);
     assert_eq!(floored[2], 0.25);
+}
+
+#[test]
+pub(crate) fn floor_positiveworking_weights_rejects_negative_and_nonfinite() {
+    // A negative weight is indefinite diagonal curvature: coercing it to zero
+    // would swap in a different information matrix. Must reject.
+    let negative = array![0.5, -1.0e-3, 0.25];
+    let err = floor_positiveworking_weights(&negative, 1.0e-6)
+        .expect_err("negative curvature must be rejected, not zeroed");
+    assert!(err.contains("row 1"), "error should name the row: {err}");
+
+    // NaN previously slipped through `wi <= 0.0` (false for NaN) and became
+    // `minweight` via the NaN-ignoring `f64::max`. Must reject.
+    let nan = array![0.5, f64::NAN];
+    floor_positiveworking_weights(&nan, 1.0e-6)
+        .expect_err("NaN curvature must be rejected, not coerced to minweight");
+
+    let inf = array![f64::INFINITY, 0.5];
+    floor_positiveworking_weights(&inf, 1.0e-6)
+        .expect_err("infinite curvature must be rejected");
 }
 
 #[test]
