@@ -8,8 +8,10 @@ use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
 use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
 use gam_linalg::utils::StableSolver;
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
 use gam_problem::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
+use std::convert::Infallible;
 use std::fmt;
 
 /// Typed error variants for the ALO (approximate leave-one-out) diagnostics
@@ -281,27 +283,30 @@ fn alo_eta_exact_frozen_curvature(
             });
         }
         // Backtracking line search: take the longest damped Newton step
-        // 2^{-k} that strictly reduces the merit |r|. A non-finite trial
-        // (score/curvature evaluated in the runaway branch) is treated as no
-        // improvement and rejected, so the search retreats toward η̂.
-        let mut t = 1.0;
-        let mut advanced = false;
-        for _ in 0..ALO_EXACT_SCALAR_BACKTRACKS {
-            let trial = eta - t * step;
-            if let Ok((r_trial, j_trial)) = residual_and_jac(trial) {
-                if r_trial.abs() < residual.abs() {
-                    eta = trial;
-                    residual = r_trial;
-                    jac = j_trial;
-                    advanced = true;
-                    break;
-                }
-            }
-            t *= 0.5;
-        }
-        if !advanced {
+        // 2^{-k} that strictly reduces the merit |r|. A trial whose
+        // score/curvature evaluation errors (the runaway branch) is INVALID
+        // (`Ok(None)`), so the search retreats toward η̂ without consulting
+        // the merit test.
+        let accepted = match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig {
+                max_steps: ALO_EXACT_SCALAR_BACKTRACKS,
+                ..BacktrackConfig::default()
+            },
+            |t| {
+                let trial = eta - t * step;
+                Ok(residual_and_jac(trial)
+                    .ok()
+                    .map(|(r_trial, j_trial)| (r_trial.abs(), (trial, r_trial, j_trial))))
+            },
+            |_t, merit| merit < residual.abs(),
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        };
+        let Some(step) = accepted else {
             break;
-        }
+        };
+        (eta, residual, jac) = step.payload;
     }
     Err(AloExactScalarError::MaxIterations {
         iterations: ALO_EXACT_SCALAR_MAX_ITERS,

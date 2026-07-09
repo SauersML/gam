@@ -65,6 +65,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use crate::estimate::EstimationError;
 use crate::rho_optimizer::{OuterCapability, OuterObjective, OuterPlan, OuterResult};
 use faer::Side;
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
 use gam_problem::{HessianResult, OuterHessianOperator};
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -452,24 +453,26 @@ pub(crate) fn backtrack_cost(
     current_cost: f64,
     cfg: &PerAtomEfsConfig,
 ) -> Result<Option<(Array1<f64>, f64, f64)>, EstimationError> {
-    let mut alpha = 1.0_f64;
     let descent_slack = PER_ATOM_COST_DESCENT_TOL * current_cost.abs().max(1.0);
-    for _ in 0..=PER_ATOM_MAX_BACKTRACK {
-        let mut trial = rho.clone();
-        for i in 0..trial.len() {
-            trial[i] += alpha * full_step[i];
-        }
-        let trial = project_to_bounds(&trial, cfg);
-        match obj.eval_cost(&trial) {
-            Ok(cost) if cost.is_finite() && cost <= current_cost + descent_slack => {
-                return Ok(Some((trial, cost, alpha)));
+    // A trial whose cost evaluation errors is an INVALID trial (`Ok(None)`):
+    // the search halves and retries without consulting the acceptance test,
+    // exactly as the pre-migration loop swallowed `Err(_)`.
+    let accepted = backtracking_line_search::<_, EstimationError>(
+        BacktrackConfig {
+            max_steps: PER_ATOM_MAX_BACKTRACK + 1,
+            ..BacktrackConfig::default()
+        },
+        |alpha| {
+            let mut trial = rho.clone();
+            for i in 0..trial.len() {
+                trial[i] += alpha * full_step[i];
             }
-            Ok(_) => {}
-            Err(_) => {}
-        }
-        alpha *= 0.5;
-    }
-    Ok(None)
+            let trial = project_to_bounds(&trial, cfg);
+            Ok(obj.eval_cost(&trial).ok().map(|cost| (cost, trial)))
+        },
+        |_alpha, cost| cost.is_finite() && cost <= current_cost + descent_slack,
+    )?;
+    Ok(accepted.map(|step| (step.payload, step.value, step.step)))
 }
 
 /// Run the per-atom decoupled EFS outer iteration as the primary frontier

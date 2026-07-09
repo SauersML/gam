@@ -3,6 +3,7 @@ use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
+use gam_optimize::{RidgeSchedule, escalate_ridge};
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1, ArrayViewMut2, Axis,
     s,
@@ -2540,22 +2541,25 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
             condition_number: f64::INFINITY,
         });
     }
-    let mut jitter = 1e-12 * trace / (p as f64);
-    for _ in 0..6 {
-        let mut jittered = xtwx.clone();
-        for i in 0..p {
-            jittered[[i, i]] += jitter;
-        }
-        let mut gpu_candidate = jittered.clone();
-        if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
-            return Ok(gpu_candidate);
-        }
-        if let Ok(chol) = jittered.cholesky(Side::Lower) {
-            return Ok(chol.lower_triangular());
-        }
-        jitter *= 10.0;
-    }
-    Err(EstimationError::ModelIsIllConditioned {
+    escalate_ridge(
+        RidgeSchedule::geometric(1e-12 * trace / (p as f64), 6),
+        |jitter| {
+            let mut jittered = xtwx.clone();
+            for i in 0..p {
+                jittered[[i, i]] += jitter;
+            }
+            let mut gpu_candidate = jittered.clone();
+            if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
+                return Some(gpu_candidate);
+            }
+            jittered
+                .cholesky(Side::Lower)
+                .ok()
+                .map(|chol| chol.lower_triangular())
+        },
+    )
+    .map(|success| success.value)
+    .map_err(|_exhausted| EstimationError::ModelIsIllConditioned {
         condition_number: f64::INFINITY,
     })
 }

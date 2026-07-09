@@ -1,4 +1,5 @@
 use super::*;
+use gam_optimize::{BacktrackConfig, backtracking_line_search};
 
 pub(crate) struct OuterFirstOrderBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
@@ -2722,36 +2723,55 @@ impl OuterFixedPointBridge<'_> {
         // cost. Pure `<` rejects ULP-noise dithering on flat regions of V
         // and forces unnecessary halvings.
         let cost_floor = current_cost + EFS_COST_DESCENT_TOL * current_cost.abs().max(1.0);
-        let mut alpha = 1.0_f64;
-        for bt in 0..=max_halvings {
-            let trial_step = raw_step * alpha;
-            let trial = x + &trial_step;
-            match self.obj.eval_cost(&trial) {
-                Ok(c) if c.is_finite() && c <= cost_floor => {
-                    if bt > 0 {
-                        log::debug!(
-                            "[EFS] backtrack accepted at α=2^-{bt}={alpha:.4e} \
-                             after {bt} halvings (cost: {current_cost:.6e} → {c:.6e})"
-                        );
+        // `bt` counts trials so the accepted step can report its halving count
+        // (trial `bt` runs at α = 2^-bt). An eval error is an INVALID trial
+        // (`Ok(None)`): the search halves without consulting the acceptance
+        // test, exactly as the pre-migration loop swallowed `Err(_)`.
+        let mut bt = 0usize;
+        let accepted = backtracking_line_search::<_, ObjectiveEvalError>(
+            BacktrackConfig {
+                max_steps: max_halvings + 1,
+                ..BacktrackConfig::default()
+            },
+            |alpha| {
+                bt += 1;
+                let trial_step = raw_step * alpha;
+                let trial = x + &trial_step;
+                match self.obj.eval_cost(&trial) {
+                    Ok(c) => {
+                        if !(c.is_finite() && c <= cost_floor) {
+                            log::trace!(
+                                "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial cost {c:.6e} \
+                                 not below current {current_cost:.6e}, halving",
+                                bt = bt - 1,
+                            );
+                        }
+                        Ok(Some((c, trial_step)))
                     }
-                    return Ok(Some(trial_step));
+                    Err(err) => {
+                        log::trace!(
+                            "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial eval failed \
+                             ({err}), halving",
+                            bt = bt - 1,
+                        );
+                        Ok(None)
+                    }
                 }
-                Ok(c) => {
-                    log::trace!(
-                        "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial cost {c:.6e} \
-                         not below current {current_cost:.6e}, halving"
-                    );
-                }
-                Err(err) => {
-                    log::trace!(
-                        "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial eval failed \
-                         ({err}), halving"
-                    );
-                }
+            },
+            |_alpha, c| c.is_finite() && c <= cost_floor,
+        )?;
+        Ok(accepted.map(|step| {
+            let halvings = bt - 1;
+            if halvings > 0 {
+                log::debug!(
+                    "[EFS] backtrack accepted at α=2^-{halvings}={alpha:.4e} \
+                     after {halvings} halvings (cost: {current_cost:.6e} → {c:.6e})",
+                    alpha = step.step,
+                    c = step.value,
+                );
             }
-            alpha *= 0.5;
-        }
-        Ok(None)
+            step.payload
+        }))
     }
 
     fn fixed_point_step_converged(

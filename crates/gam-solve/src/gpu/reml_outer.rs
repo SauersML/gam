@@ -51,7 +51,9 @@
 //! host path. The only thing it changes is *where* the BFGS state lives
 //! between evaluations.
 
+use gam_optimize::{BacktrackConfig, backtracking_line_search, constants};
 use ndarray::{Array1, Array2, ArrayView2};
+use std::convert::Infallible;
 
 use gam_gpu::policy::RemlOuterAdmission;
 use crate::estimate::EstimationError;
@@ -274,9 +276,11 @@ where
 
         // Backtracking Armijo line search on the device-resident objective:
         // start at α = 1, halve until f(ρ + α d) ≤ f(ρ) + c₁ α gᵀd, or until
-        // the trust radius collapses below `MIN_ALPHA`.
-        const ARMIJO_C1: f64 = 1.0e-4;
-        const MIN_ALPHA: f64 = 1.0e-12;
+        // the trust radius collapses below 1e-12. From a unit step, 2⁻³⁹ is
+        // the last trial ≥ 1e-12, so the halving-count budget is 40 trials.
+        // A rejected/erroring trial evaluation is an INVALID trial
+        // (`Ok(None)`): the search halves without consulting the Armijo test.
+        const LINE_SEARCH_TRIALS: usize = 40;
         let g_dot_d = dot(&gradient, &direction);
         // Reject degenerate (non-descent) directions and treat as a stall;
         // the host dispatcher's degraded-plan ladder will pick this up the
@@ -284,40 +288,36 @@ where
         if !g_dot_d.is_finite() || g_dot_d >= 0.0 {
             break;
         }
-        let mut alpha = 1.0_f64;
-        let mut trial_rho;
-        let mut trial_eval;
-        loop {
-            trial_rho = scaled_add(&rho, alpha, &direction);
-            project_onto_bounds(&mut trial_rho, &bounds);
-            match evaluator(&trial_rho) {
-                Ok(e) => {
-                    trial_eval = e;
-                    if trial_eval.objective.is_finite()
-                        && trial_eval.objective <= objective + ARMIJO_C1 * alpha * g_dot_d
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    // Treat a non-finite/rejected trial as a failed step
-                    // and keep halving until the trust radius collapses.
-                }
-            }
-            alpha *= 0.5;
-            if alpha < MIN_ALPHA {
-                // Line search exhausted: surface as a stall so the host
-                // dispatcher can take over with the degraded plan.
-                return Ok(RemlOuterGpuOutcome {
-                    rho,
-                    objective,
-                    iterations,
-                    final_grad_norm: Some(grad_inf),
-                    final_gradient: Some(gradient),
-                    converged: false,
-                });
-            }
-        }
+        let accepted = match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig {
+                max_steps: LINE_SEARCH_TRIALS,
+                ..BacktrackConfig::default()
+            },
+            |alpha| {
+                let mut trial_rho = scaled_add(&rho, alpha, &direction);
+                project_onto_bounds(&mut trial_rho, &bounds);
+                Ok(evaluator(&trial_rho)
+                    .ok()
+                    .map(|e| (e.objective, (trial_rho, e))))
+            },
+            |alpha, f| f.is_finite() && f <= objective + constants::ARMIJO_C1 * alpha * g_dot_d,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        };
+        let Some(step) = accepted else {
+            // Line search exhausted: surface as a stall so the host
+            // dispatcher can take over with the degraded plan.
+            return Ok(RemlOuterGpuOutcome {
+                rho,
+                objective,
+                iterations,
+                final_grad_norm: Some(grad_inf),
+                final_gradient: Some(gradient),
+                converged: false,
+            });
+        };
+        let (trial_rho, trial_eval) = step.payload;
 
         // BFGS curvature update (`s = ρ_new − ρ`, `y = g_new − g_old`).
         let s = sub(&trial_rho, &rho);

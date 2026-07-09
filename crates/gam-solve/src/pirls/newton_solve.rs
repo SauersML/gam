@@ -4,6 +4,7 @@
 //! active-set KKT machinery, and the soft-acceptance progress test.
 
 use super::*;
+use gam_optimize::{RidgeSchedule, escalate_ridge};
 
 pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 
@@ -1298,22 +1299,23 @@ pub(crate) fn solve_subsystem_direction(
         .map(|i| h_sub[[i, i]].abs())
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    let mut tau = 1e-8 * diag_scale;
     let mut h_reg = h_sub.to_owned();
-    for _ in 0..12 {
+    if escalate_ridge(RidgeSchedule::geometric(1e-8 * diag_scale, 12), |tau| {
         for i in 0..n {
             h_reg[[i, i]] = h_sub[[i, i]] + tau;
         }
-        if let Ok(factor) = StableSolver::new("pirls bounded subsystem ridge").factorize(&h_reg) {
-            out.assign(&g_sub);
-            let mut rhs = array1_to_col_matmut(out);
-            factor.solve_in_place(rhs.as_mut());
-            out.mapv_inplace(|v| -v);
-            if array_is_finite(out) {
-                return Ok(());
-            }
-        }
-        tau *= 10.0;
+        let factor = StableSolver::new("pirls bounded subsystem ridge")
+            .factorize(&h_reg)
+            .ok()?;
+        out.assign(&g_sub);
+        let mut rhs = array1_to_col_matmut(out);
+        factor.solve_in_place(rhs.as_mut());
+        out.mapv_inplace(|v| -v);
+        array_is_finite(out).then_some(())
+    })
+    .is_ok()
+    {
+        return Ok(());
     }
     // All ridge attempts failed — fall back to steepest descent on the
     // free subspace: d = -g / ||g||, scaled to a conservative step.
