@@ -278,6 +278,16 @@ impl SaeManifoldTerm {
         if let Some(residual) = residual {
             coord_edf = (coord_edf + self.coordinate_sure_deflation_correction(residual, rho)?)
                 .clamp(0.0, n_scalar);
+            // #2133 — the basin-SELECTION (search) deflation dof: the boundary
+            // Stein term the within-basin correction above omits. The per-row charge
+            // depends on σ̂ = √φ̂, so seed it with the within-basin-corrected but
+            // search-UNcorrected φ̂ and take ONE monotone fixed-point pass (the charge
+            // is decreasing in σ̂ through the margin z, so one pass contracts). It is
+            // identically 0 for single-basin / hard-frozen / genuinely-soft rows, so
+            // w=None + non-selecting fits are bit-for-bit today's φ̂.
+            let phi_seed = rss / (n_scalar - beta_edf - coord_edf).max(1.0);
+            let df_search = self.basin_selection_deflation_correction(residual, rho, phi_seed)?;
+            coord_edf = (coord_edf + df_search).clamp(0.0, n_scalar);
         }
         let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);
         let phi = rss / resid_dof;

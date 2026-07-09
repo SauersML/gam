@@ -283,6 +283,185 @@ impl SaeManifoldTerm {
         Ok(acc)
     }
 
+    /// Top-weight threshold above which a SOFTMAX row is treated as an
+    /// effectively-DISCRETE selection for the #2133 basin-selection dof. Below it
+    /// the softmax simplex is genuinely soft: the routing Jacobian `∂a/∂η` is
+    /// non-degenerate and the row's reconstruction is a smooth blend whose
+    /// y-sensitivity is already carried by the within-basin curvature (the logit
+    /// block of `H`), so charging a boundary term there would DOUBLE-count. As the
+    /// top weight `a_max → 1` the softmax saturates toward a hard `argmax`: its
+    /// Jacobian degenerates, the smooth edf no longer sees the selection, and the
+    /// discontinuous boundary term (Tibshirani search dof) is what survives. `0.9`
+    /// = "the winner holds ≥90% of the mass" — the runner-up mass `1−a_max` is the
+    /// natural soft-vs-hard scale (a uniform `K`-way split gives `1/K` per atom, so
+    /// a winner far above `1−1/K` is saturated); a fixed `0.9` is robust across `K`
+    /// and conservative (it EXCLUDES ambiguous soft rows, never over-shooting). The
+    /// hard gate families (TopK / ThresholdGate / IBP-MAP) are discrete by
+    /// construction and bypass this threshold.
+    pub(crate) const SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT: f64 = 0.9;
+
+    /// #2133 — basin-SELECTION (search) deflation dof: the second Stein term the
+    /// within-basin [`Self::coordinate_sure_deflation_correction`] deliberately
+    /// omits. The SAE fit is a two-stage map — a discrete routing selection
+    /// `b(y) = argmin_b R_b(y)` followed by the smooth within-basin decode — so the
+    /// true dof `df = σ⁻² Σ_i cov(ŷ_i, y_i)` picks up a boundary term wherever the
+    /// reconstruction JUMPS across a routing decision surface (`ŷ` is discontinuous
+    /// there). For the two-candidate archetype `ŷ = m_b`, `b = argmin‖y−m_b‖²_M`,
+    /// the boundary integral collapses to the closed form
+    ///   `df_search = Σ_i w_i·(‖δ_i‖_M/σ̂)·φ( Δ_i / (2 σ̂ ‖δ_i‖_M) )`,
+    /// with `δ_i = ŷ¹_i − ŷ²_i` the reconstruction jump, `Δ_i = ‖y−ŷ²‖²_M −
+    /// ‖y−ŷ¹‖²_M` the residual margin, `σ̂` the noise scale, and `φ` the standard
+    /// normal density. Per row the WINNER candidate `ŷ¹` is the fitted mixture and
+    /// the PAIRED candidate `ŷ²` reassigns the top-mass atom's weight `a_w` to the
+    /// runner-up atom, so `δ_i = a_w·(decode_w − decode_r)` (the tier-0 mean and all
+    /// other atoms cancel in the difference). Writing `r = ŷ¹ − y` (= `residual`),
+    /// `Δ_i = ‖δ‖²_M − 2⟨r, δ⟩_M`.
+    ///
+    /// The charge fires ONLY on effectively-discrete selection — TopK (the
+    /// `k`-th↔`(k+1)`-th support swap), ThresholdGate / IBP-MAP hard gates, and
+    /// SATURATED softmax rows (`a_max ≥ SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT`);
+    /// genuinely-soft softmax rows contribute 0 (their selection smoothness is
+    /// already in the within-basin edf — charging them double-counts). It is also
+    /// identically 0 for single-atom / single-gated rows (no runner-up), for
+    /// candidates that predict identically (`δ = 0`, a 2→1 degeneracy = zero
+    /// selection cost), and whenever routing is FROZEN/amortized (`frozen_logits`
+    /// set — the selection is fixed data, not an estimated parameter, so it consumes
+    /// no dof). Both analytic anchors hold: as one basin dominates the residual
+    /// margin `Δ → +∞` so `φ → 0` (reduces to the single-basin within-basin term),
+    /// and identical candidates give `δ = 0`. `dispersion` seeds `σ̂ = √φ̂` from the
+    /// within-basin-corrected (search-UNcorrected) φ̂ — the caller runs the single
+    /// monotone fixed-point pass. HT `w_i`-weighted so it composes with the F6
+    /// weight-aware RSS.
+    pub(crate) fn basin_selection_deflation_correction(
+        &self,
+        residual: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        dispersion: f64,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if residual.dim() != (n, p) {
+            return Err(format!(
+                "basin_selection_deflation_correction: residual {:?} != ({n}, {p})",
+                residual.dim()
+            ));
+        }
+        let sigma = dispersion.sqrt();
+        if !(sigma > 0.0) {
+            return Ok(0.0);
+        }
+        // Frozen / amortized routing (#1033): the per-row selection is a fixed
+        // function of `x`, NOT an estimated parameter, so it consumes no search dof
+        // — the correction must stay identically 0 (φ̂ bit-for-bit today's).
+        if self.assignment.frozen_logits.is_some() {
+            return Ok(0.0);
+        }
+        let k_atoms = self.k_atoms();
+        if k_atoms < 2 {
+            return Ok(0.0);
+        }
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|m| m.whitens_likelihood());
+        let row_w = self.row_loss_weights.as_deref();
+        let norm_const = std::f64::consts::TAU.sqrt(); // √(2π)
+        let sat = Self::SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT;
+        let mut assignments = vec![0.0_f64; k_atoms];
+        let mut decode_w = vec![0.0_f64; p];
+        let mut decode_r = vec![0.0_f64; p];
+        let mut delta = vec![0.0_f64; p];
+        // Reusable ranking scratch of GATED (non-ungated) atoms by descending logit.
+        let mut ranked: Vec<usize> = Vec::with_capacity(k_atoms);
+        let mut acc = 0.0_f64;
+        for row in 0..n {
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, assignments.as_mut_slice())?;
+            let logits = self.assignment.logits.row(row);
+            // Selectable candidates are the GATED atoms (ungated = always-on
+            // background tier `a_k≡1`, not part of the selection simplex).
+            ranked.clear();
+            ranked.extend(
+                (0..k_atoms).filter(|&k| !self.assignment.ungated.get(k).copied().unwrap_or(false)),
+            );
+            if ranked.len() < 2 {
+                continue;
+            }
+            // Descending by logit; the routing order the selection boundary lives on.
+            ranked.sort_by(|&a, &b| {
+                logits[b]
+                    .partial_cmp(&logits[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // The boundary pair `(w, r)` = (the atom whose weight is at stake, the
+            // runner-up it would flip to) and the winner mass `a_w` moved across it.
+            let (w, r, a_w) = match self.assignment.mode {
+                // Hard top-`k` support: the live boundary is the WEAKEST selected
+                // (`k`-th) vs the STRONGEST unselected (`(k+1)`-th) — the cheapest
+                // one-atom support swap. Both carry unit gate weight.
+                AssignmentMode::TopK { k } => {
+                    if k == 0 || ranked.len() <= k {
+                        continue;
+                    }
+                    // Unit gate weight is swapped from the k-th to the (k+1)-th atom.
+                    (ranked[k - 1], ranked[k], 1.0)
+                }
+                // Saturated-softmax gate: only near-hard rows carry a search dof.
+                AssignmentMode::Softmax { .. } => {
+                    let top = ranked[0];
+                    let a_top = assignments[top];
+                    if a_top < sat {
+                        continue;
+                    }
+                    (top, ranked[1], a_top)
+                }
+                // Per-atom hard gates (IBP-MAP indicator, ThresholdGate hard
+                // sigmoid): discrete by construction. Dominant-pair approximation —
+                // the top-mass gated atom vs its nearest competitor (the exact
+                // multi-gate boundary enumeration is the documented follow-up, and
+                // like the within-basin term this dominant piece never over-counts).
+                AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
+                    let top = ranked[0];
+                    (top, ranked[1], assignments[top])
+                }
+            };
+            if w == r || !(a_w > 0.0) {
+                continue;
+            }
+            self.atoms[w].fill_decoded_row(row, decode_w.as_mut_slice());
+            self.atoms[r].fill_decoded_row(row, decode_r.as_mut_slice());
+            for c in 0..p {
+                delta[c] = a_w * (decode_w[c] - decode_r[c]);
+            }
+            // Metric-applied jump `M·δ`; identity when not whitening.
+            let m_delta: Vec<f64> = match self.row_metric.as_ref() {
+                Some(metric) if whitens => {
+                    metric.apply_metric_row(row, ndarray::ArrayView1::from(delta.as_slice()))
+                }
+                _ => delta.clone(),
+            };
+            let delta_norm2: f64 = delta.iter().zip(m_delta.iter()).map(|(&a, &b)| a * b).sum();
+            if !(delta_norm2 > 0.0) {
+                continue; // identical candidates ⇒ zero selection cost (anchor 2).
+            }
+            let delta_norm = delta_norm2.sqrt();
+            // ⟨r, δ⟩_M = rᵀ(Mδ); `residual` row is r = ŷ¹ − y.
+            let r_dot_delta: f64 = residual
+                .row(row)
+                .iter()
+                .zip(m_delta.iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+            // Δ = ‖y−ŷ²‖²_M − ‖y−ŷ¹‖²_M = ‖δ‖²_M − 2⟨r, δ⟩_M.
+            let gap = delta_norm2 - 2.0 * r_dot_delta;
+            let z = gap / (2.0 * sigma * delta_norm);
+            let phi_z = (-0.5 * z * z).exp() / norm_const;
+            let w_row = row_w.map_or(1.0, |wt| wt[row]);
+            acc += w_row * (delta_norm / sigma) * phi_z;
+        }
+        Ok(acc)
+    }
+
     /// Atom-count threshold at/above which [`Self::ard_inverse_traces`] switches
     /// from the exact selected-inverse latent diagonal (one dense `K×K` Schur
     /// solve per latent coordinate — the `O(total_t·K²) ≈ O(K³)` massive-`K`
