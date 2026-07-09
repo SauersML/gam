@@ -1387,6 +1387,166 @@ pub fn matrix_free_arrow_evidence_log_det(
     Ok((log_det_tt, slq))
 }
 
+/// Power-iteration estimate of the largest eigenvalue `λ_max` of the SPD reduced
+/// Schur `S` through the matrix-free [`schur_matvec`] apply — the upper end of
+/// the spectral bracket the #2080 rational log-det surrogate
+/// ([`RationalLogdetPlan`]) needs to size its bracket-centred DE quadrature.
+///
+/// Deterministic: the start vector is a fixed SplitMix64 Rademacher draw from
+/// `seed`, so a given `(sys, htt_factors, ρ_β, resident, iters, seed)` always
+/// returns the same estimate — the surrogate bracket must be reproducible for the
+/// REML outer loop, exactly like the SLQ probes. `iters` power steps refine the
+/// Rayleigh quotient `vᵀ S v` (each step is one `schur_matvec`); a handful
+/// suffice because the surrogate only needs a bracket good to a factor, not a
+/// converged eigenvalue (the quadrature window is padded two decades each side).
+///
+/// Returns `None` for a degenerate operator (`k == 0`) or a non-finite /
+/// non-positive Rayleigh quotient (an SPD operator forbids the latter, so it
+/// signals a caller bug or a non-finite operator, both of which must surface
+/// rather than be silently bracketed).
+pub(crate) fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    iters: usize,
+    seed: u64,
+) -> Option<f64> {
+    let k = sys.k;
+    if k == 0 {
+        return None;
+    }
+    // Deterministic Rademacher start (same stream discipline as the surrogate
+    // probes): a ±1 vector never lands orthogonal to the top eigenspace.
+    let mut v = Array1::<f64>::zeros(k);
+    {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut bits: u64 = 0;
+        let mut remaining: u32 = 0;
+        for value in v.iter_mut() {
+            if remaining == 0 {
+                bits = gam_linalg::utils::splitmix64(&mut state);
+                remaining = 64;
+            }
+            *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
+            bits >>= 1;
+            remaining -= 1;
+        }
+    }
+    let inv_norm0 = v.dot(&v).sqrt().recip();
+    if !inv_norm0.is_finite() {
+        return None;
+    }
+    v.mapv_inplace(|x| x * inv_norm0);
+    let apply = |x: &Array1<f64>| -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(sys, htt_factors, ridge_beta, x, &mut out, backend, resident);
+        out
+    };
+    let mut lambda = 0.0_f64;
+    for _ in 0..iters.max(1) {
+        let sv = apply(&v);
+        // v is unit, so the Rayleigh quotient is `vᵀ S v` directly.
+        lambda = v.dot(&sv);
+        let norm = sv.dot(&sv).sqrt();
+        if !(norm.is_finite() && norm > 0.0) {
+            break;
+        }
+        v = sv / norm;
+    }
+    // Final Rayleigh on the converged iterate (v stays unit).
+    let sv = apply(&v);
+    lambda = v.dot(&sv);
+    (lambda.is_finite() && lambda > 0.0).then_some(lambda)
+}
+
+/// Matrix-free reduced-Schur log-determinant `log|S|` via the #2080 fixed
+/// rational surrogate ([`RationalLogdetPlan`]) on the exact [`schur_matvec`]
+/// apply — the desync-safe companion to [`slq_reduced_schur_log_det`]. **The
+/// dense `k×k` `S` is NEVER formed.**
+///
+/// Returns the built plan and its evaluation so the caller can (a) read
+/// `eval.estimate` = the surrogate value `L̃ ≈ log|S|` (with `eval.std_err` the
+/// honest Hutchinson error bar), and (b) later contract the SAME shifted-solve
+/// bundle against any per-ρ-coordinate Schur-derivative operator `∂S` via
+/// [`rational_reduced_schur_directional`]. Because both the value and that
+/// derivative are the exact value / gradient of the ONE deterministic function
+/// `L̃(ρ)` (fixed probes, fixed quadrature), the outer optimiser descends a
+/// function whose gradient is its own — the objective↔gradient desync class the
+/// bare SLQ value re-opened (a stochastic value paired with the analytic exact
+/// gradient) is closed by construction, not by tolerance tuning.
+///
+/// The spectral bracket is estimated matrix-free: `λ_max` by power iteration
+/// ([`reduced_schur_lambda_max`]), `λ_min` from the deflation-floor convention
+/// `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (the operative lower bound of the
+/// unit-deflated spectrum). Deterministic for a fixed
+/// `(sys, htt_factors, ρ_β, resident, num_probes, seed, rel_tol, power_iters,
+/// cg_rel_tol, cg_max_iters)`.
+///
+/// `None` when `k == 0`, the bracket estimate is degenerate, the plan cannot be
+/// built, or a shifted CG solve breaks down on a non-finite operator.
+pub(crate) fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    num_probes: usize,
+    seed: u64,
+    rel_tol: f64,
+    power_iters: usize,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Option<(RationalLogdetPlan, RationalLogdetEval)> {
+    let k = sys.k;
+    if k == 0 {
+        return None;
+    }
+    let lambda_max =
+        reduced_schur_lambda_max(sys, htt_factors, ridge_beta, backend, resident, power_iters, seed)?;
+    // λ_min from the deflation floor: after unit-deflation the operative spectrum
+    // is bounded below by `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (or 1.0), so this
+    // is a sound lower bracket for the quadrature window sizing. The window is
+    // padded two decades below `λ_min` inside `RationalLogdetPlan::build`, so a
+    // conservative (too-small) floor only widens the resolved range, never biases
+    // the estimate.
+    let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
+    let plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+        // `schur_matvec` clears and fully assigns `out`, so a fresh zeroed buffer
+        // per apply is correct; the probes fan across rayon workers (in
+        // `evaluate`), and `schur_matvec`'s own row parallelism is guarded off
+        // inside a worker, so there is no nested oversubscription.
+        let x = v.to_owned();
+        let mut out = Array1::<f64>::zeros(k);
+        schur_matvec(sys, htt_factors, ridge_beta, &x, &mut out, backend, resident);
+        out
+    };
+    let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
+    Some((plan, eval))
+}
+
+/// Contract the surrogate's shifted-solve bundle from
+/// [`rational_reduced_schur_log_det`] against a reduced-Schur derivative operator
+/// `∂S` (supplied through its matvec `dmatvec(v) = (∂S)·v`) to obtain the EXACT
+/// ρ-derivative of the surrogate value:
+/// `∂L̃ = (1/m)·Σ_{j,ℓ} w_ℓ · y_{jℓ}ᵀ (∂S) y_{jℓ}`, `y_{jℓ} = (S+t_ℓ I)⁻¹ v_j`.
+///
+/// This is the true gradient of the SAME function the value came from — value
+/// and gradient can never desync. Thin reduced-Schur wrapper over
+/// [`RationalLogdetPlan::directional_derivative`]; the `∂S` matvec is the
+/// per-ρ-coordinate Schur-derivative operator the SAE trace channels assemble
+/// row-locally (`(∂S)·y = (∂H_ββ)y − Σ_i[ (∂H_βt^(i))(H_tt⁻¹H_tβ y) −
+/// H_βt H_tt⁻¹(∂H_tt^(i))H_tt⁻¹H_tβ y + H_βt H_tt⁻¹(∂H_tβ^(i))y ]`).
+pub(crate) fn rational_reduced_schur_directional(
+    plan: &RationalLogdetPlan,
+    eval: &RationalLogdetEval,
+    dmatvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+) -> Option<f64> {
+    plan.directional_derivative(eval, dmatvec)
+}
+
 /// Accumulate one row's reduced-Schur point-elimination contribution
 /// `H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i) x` (length `K`) into `acc`.
 ///

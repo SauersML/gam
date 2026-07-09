@@ -4978,6 +4978,178 @@ fn slq_reduced_schur_log_det_matches_dense_evidence() {
     );
 }
 
+/// Dense power-iteration reference for the top eigenvalue of an SPD matrix — a
+/// self-contained oracle for [`reduced_schur_lambda_max`] that needs no eigh
+/// import. Converges to `λ_max` from below; 200 steps is far more than the
+/// well-separated fixture needs.
+fn dense_top_eigenvalue(a: &Array2<f64>) -> f64 {
+    let n = a.nrows();
+    let mut v = Array1::<f64>::from_elem(n, 1.0);
+    let inv = v.dot(&v).sqrt().recip();
+    v.mapv_inplace(|x| x * inv);
+    let mut lambda = 0.0;
+    for _ in 0..200 {
+        let av = a.dot(&v);
+        lambda = v.dot(&av);
+        let norm = av.dot(&av).sqrt();
+        if norm == 0.0 {
+            break;
+        }
+        v = av / norm;
+    }
+    lambda
+}
+
+/// The #2080 fixed-rational log-det surrogate on the matrix-free `schur_matvec`
+/// apply (`rational_reduced_schur_log_det`, NO dense `k×k` Schur formed) must
+/// agree with the exact dense evidence `log|S|` it replaces, be bit-reproducible
+/// for a fixed seed (the REML outer loop differentiates a DETERMINISTIC
+/// objective), and bracket the spectrum correctly via the matrix-free power
+/// iteration. Companion to `slq_reduced_schur_log_det_matches_dense_evidence` —
+/// the surrogate's added contract (value/gradient one functional) is exercised
+/// separately by `rational_reduced_schur_directional_matches_fd_of_surrogate`.
+#[test]
+fn rational_reduced_schur_log_det_matches_dense_evidence() {
+    let (n, d, k) = (40usize, 3usize, 80usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-6;
+    let seed = 0x2080_0B0A_C0DE_u64;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    // Exact dense reduced-Schur log|S| and top eigenvalue — the O(k²) assembly
+    // the matrix-free surrogate avoids, kept here only as the test oracle.
+    let schur = build_dense_schur_direct(&sys, &htt_factors, ridge_beta, &backend)
+        .expect("dense reduced Schur must build for the well-conditioned fixture");
+    let l = cholesky_lower(&schur).expect("reduced Schur must be SPD");
+    let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
+    let true_lambda_max = dense_top_eigenvalue(&schur);
+
+    // Spectral bracket: power iteration on `schur_matvec` recovers λ_max
+    // (Rayleigh quotient converges from below, so it never exceeds the truth).
+    // The surrogate only needs a bracket good to a factor — its quadrature window
+    // is padded two decades each side — so assert a factor-of-2 band rather than a
+    // tight eigenvalue tolerance, which would be flaky when the top two
+    // eigenvalues are close (slow power-iteration convergence).
+    let lambda_max =
+        reduced_schur_lambda_max(&sys, &htt_factors, ridge_beta, &backend, None, 80, seed)
+            .expect("power iteration must produce a finite positive λ_max");
+    assert!(
+        lambda_max <= true_lambda_max * (1.0 + 1e-9),
+        "power-iteration Rayleigh quotient cannot exceed the true λ_max \
+         (est={lambda_max}, true={true_lambda_max})"
+    );
+    assert!(
+        lambda_max >= 0.5 * true_lambda_max,
+        "spectral-bracket λ_max must be within a factor of 2 of the truth \
+         (est={lambda_max}, true={true_lambda_max})"
+    );
+
+    // Matrix-free surrogate value — never forms S.
+    let (_plan, eval) = rational_reduced_schur_log_det(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        64,   // num_probes
+        seed,
+        1e-9, // rel_tol (quadrature)
+        40,   // power_iters
+        1e-11,
+        20_000,
+    )
+    .expect("rational surrogate must evaluate for the SPD fixture");
+    let rel = (eval.estimate - exact_logdet).abs() / exact_logdet.abs();
+    eprintln!(
+        "matrix-free reduced-Schur log|S|: rational={:.6} exact={:.6} rel={:.3e} std_err={:.3e}",
+        eval.estimate, exact_logdet, rel, eval.std_err
+    );
+    assert!(
+        rel < 0.05,
+        "matrix-free rational reduced-Schur log|S| rel err {rel:.3e} exceeds 5% \
+         (rational={}, exact={exact_logdet})",
+        eval.estimate
+    );
+
+    // Bit-reproducible for a fixed seed.
+    let (_plan2, eval2) = rational_reduced_schur_log_det(
+        &sys, &htt_factors, ridge_beta, &backend, None, 64, seed, 1e-9, 40, 1e-11, 20_000,
+    )
+    .expect("rational surrogate must re-evaluate");
+    assert_eq!(
+        eval.estimate, eval2.estimate,
+        "the fixed plan (fixed probes + fixed quadrature) must be bit-deterministic"
+    );
+}
+
+/// THE surrogate contract at the reduced-Schur level: the derivative returned by
+/// `rational_reduced_schur_directional` is the EXACT derivative of the SAME
+/// function `rational_reduced_schur_log_det` evaluates (same probes, same
+/// quadrature, same shifted-solve bundle), not of the true `log|S|`. A central
+/// finite difference of the surrogate value along a Schur perturbation `∂S`
+/// (evaluated on the SAME plan so the probes/nodes never move) must agree
+/// tightly — the FD gate that pins value↔gradient consistency, mirrored from the
+/// matrix-level `directional_derivative_matches_fd_of_the_surrogate_itself` but
+/// composed through `schur_matvec`.
+#[test]
+fn rational_reduced_schur_directional_matches_fd_of_surrogate() {
+    let (n, d, k) = (24usize, 2usize, 48usize);
+    let sys = dense_direct_system(n, d, k);
+    let backend = CpuBatchedBlockSolver;
+    let ridge_beta = 1e-5;
+    let seed = 0x2080_D1_EC_u64;
+
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    // A fixed SPD perturbation operator `∂S = diag(δ_c)`, δ_c ∈ [0.3, 1.3): a
+    // valid symmetric direction whose apply is trivially matrix-free. Deriving it
+    // from a fixed seed keeps the test reproducible with no RNG dependency.
+    let mut state = 0x00FF_2080_u64;
+    let d_diag: Array1<f64> = Array1::from_shape_fn(k, |_| {
+        let bits = gam_linalg::utils::splitmix64(&mut state) >> 11;
+        0.3 + (bits as f64) / ((1u64 << 53) as f64)
+    });
+    let d_matvec = |v: ArrayView1<f64>| -> Array1<f64> { &d_diag * &v.to_owned() };
+
+    // Build the surrogate value + solve bundle once from S.
+    let (plan, eval) = rational_reduced_schur_log_det(
+        &sys, &htt_factors, ridge_beta, &backend, None, 16, seed, 1e-10, 60, 1e-13, 40_000,
+    )
+    .expect("rational surrogate must evaluate");
+    let grad = rational_reduced_schur_directional(&plan, &eval, &d_matvec)
+        .expect("directional derivative must be finite");
+
+    // Central FD of the SAME plan's value along S ± h·∂S (probes/nodes fixed).
+    let h = 1e-5;
+    let eval_at = |scale: f64| -> f64 {
+        let matvec = |v: ArrayView1<f64>| -> Array1<f64> {
+            let x = v.to_owned();
+            let mut out = Array1::<f64>::zeros(k);
+            schur_matvec(&sys, &htt_factors, ridge_beta, &x, &mut out, &backend, None);
+            out.scaled_add(scale, &(&d_diag * &x));
+            out
+        };
+        plan.evaluate(&matvec, 1e-13, 40_000)
+            .expect("perturbed surrogate must evaluate")
+            .estimate
+    };
+    let fd = (eval_at(h) - eval_at(-h)) / (2.0 * h);
+    let rel = (grad - fd).abs() / fd.abs().max(1e-12);
+    eprintln!("reduced-Schur surrogate grad={grad:.9e} fd={fd:.9e} rel={rel:.3e}");
+    assert!(
+        rel < 1e-5,
+        "reduced-Schur surrogate directional {grad:.9e} vs its own FD {fd:.9e} (rel {rel:.3e})"
+    );
+    // Sign sanity: an SPD ∂S direction increases log det.
+    assert!(grad > 0.0, "SPD ∂S must increase the surrogate log det, got {grad}");
+}
+
 // ---------------------------------------------------------------------------
 // Co-visibility cluster preconditioner (Kushal & Agarwal visibility-based
 // preconditioning). At real over-complete SAE widths the co-firing graph is a
