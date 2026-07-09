@@ -436,7 +436,22 @@ pub(crate) fn feasible_point_for_linear_constraints(
     {
         return None;
     }
-    if constraints.b.iter().all(|v| v.abs() <= 1e-14) {
+    // The zero-vector shortcut must compare `b` in GEOMETRIC (per-row-scaled)
+    // units: on raw `b` alone, `1e-20·β ≥ 1e-20` — the same half-space as
+    // `β ≥ 1` — would accept `β = 0`. A numerically-zero row is vacuous when
+    // `b_i ≤ 0` and infeasible (no seed exists) when `b_i > 0`.
+    let mut all_scaled_b_tiny = true;
+    for i in 0..constraints.a.nrows() {
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        if norm > 0.0 {
+            if constraints.b[i].abs() > 1e-14 * norm {
+                all_scaled_b_tiny = false;
+            }
+        } else if constraints.b[i] > 0.0 {
+            return None;
+        }
+    }
+    if all_scaled_b_tiny {
         return Some(Array1::zeros(p));
     }
 
@@ -446,7 +461,10 @@ pub(crate) fn feasible_point_for_linear_constraints(
         return None;
     };
     let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular.max(1.0);
+    // Rank tolerance relative to the LARGEST singular value only — an absolute
+    // `max(σ_max, 1)` floor declares a uniformly small (but perfectly
+    // well-conditioned) system rank-deficient purely because of its units.
+    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular;
     let mut coeff = u.t().dot(&constraints.b);
     for (idx, value) in coeff.iter_mut().enumerate() {
         let sigma = singular[idx];
@@ -461,12 +479,17 @@ pub(crate) fn feasible_point_for_linear_constraints(
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let slack = constraints.a.dot(&beta) - &constraints.b;
-    if slack.iter().all(|v| *v >= -1e-8) {
-        Some(beta)
-    } else {
-        None
-    }
+    // Accept on per-row GEOMETRIC slack (raw slack over ‖a_i‖), the same
+    // scale-invariant metric the active-set gates use.
+    let feasible = (0..constraints.a.nrows()).all(|i| {
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        if norm > 0.0 {
+            (constraints.a.row(i).dot(&beta) - constraints.b[i]) / norm >= -1e-8
+        } else {
+            constraints.b[i] <= 0.0
+        }
+    });
+    if feasible { Some(beta) } else { None }
 }
 
 /// Strictly-interior margin (in per-row geometric / scaled-slack units) required
@@ -781,9 +804,7 @@ fn max_linear_constraint_violation(
     let mut worst = 0.0_f64;
     let mut worst_row = 0usize;
     for i in 0..constraints.a.nrows() {
-        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
-        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
-        let slack = (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv;
+        let slack = scaled_constraint_slack(beta, constraints, i);
         let viol = (-slack).max(0.0);
         if viol > worst {
             worst = viol;
@@ -793,10 +814,11 @@ fn max_linear_constraint_violation(
     (worst, worst_row)
 }
 
-/// Per-row signed scaled slack: `(a_i·beta - b_i) / ‖a_i‖`. Returns zero for
-/// degenerate rows with `‖a_i‖ = 0` (those rows carry no geometric content).
-/// Used wherever the active-set solver needs to compare per-row feasibility
-/// against a scale-invariant tolerance.
+/// Per-row signed scaled slack: `(a_i·beta - b_i) / ‖a_i‖`. A degenerate row
+/// with `‖a_i‖ = 0` carries no direction, but it is NOT free of content: for
+/// `b_i > 0` the row `0ᵀβ ≥ b_i` is unconditionally violated (−∞ slack), and
+/// only for `b_i ≤ 0` is it vacuously satisfied (+∞ slack). Returning zero for
+/// both let an impossible row report zero violation and pass every gate.
 #[inline]
 fn scaled_constraint_slack(
     beta: &Array1<f64>,
@@ -804,8 +826,13 @@ fn scaled_constraint_slack(
     i: usize,
 ) -> f64 {
     let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
-    let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
-    (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv
+    if norm > 0.0 {
+        (constraints.a.row(i).dot(beta) - constraints.b[i]) / norm
+    } else if constraints.b[i] > 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    }
 }
 
 pub(crate) fn solve_kkt_direction(
@@ -988,8 +1015,13 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         0.0
     };
 
+    // Rank tolerance relative to the leading pivot |R00| ONLY. The former
+    // absolute `max(|R00|, 1)` floor made rank detection unit-dependent: a
+    // perfectly independent system expressed in small units (A = 1e-20·I — the
+    // nonnegative orthant) had every pivot below the floor-driven tolerance and
+    // was silently declared rank zero, i.e. the constraints were DROPPED.
     const RANK_ALPHA: f64 = 100.0;
-    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * leading_diag.max(1.0);
+    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * leading_diag;
 
     let rank = (0..diag_len).filter(|&i| r_mat[(i, i)].abs() > tol).count();
     if rank >= k {
@@ -1715,6 +1747,17 @@ pub fn solve_quadratic_with_linear_constraints(
     {
         crate::bail_invalid_estim!("constrained quadratic solve: system dimension mismatch");
     }
+    // Canonicalize at the chokepoint: reject non-finite / infeasible-zero rows
+    // and unit-normalize every row, so all downstream slack, activation, and
+    // rank tolerances are geometric (scale-free) regardless of the units the
+    // caller expressed the constraints in. Row order is preserved, so
+    // `warm_active_set` indices and the returned active ids stay valid.
+    let constraints = constraints.canonicalized().map_err(|e| {
+        EstimationError::ParameterConstraintViolation(format!(
+            "constrained quadratic solve: invalid constraint system: {e}"
+        ))
+    })?;
+    let constraints = &constraints;
     let gradient = hessian.dot(beta_start) - rhs;
     let mut delta = Array1::<f64>::zeros(beta_start.len());
     let mut active_hint = warm_active_set.map_or_else(Vec::new, |active| active.to_vec());
