@@ -1256,6 +1256,56 @@ mod parity_tests {
         );
     }
 
+    /// A genuinely non-monotone response map must have its interior extrema
+    /// captured: `f(η) = η²` on the symmetric interval `[-c, c]` has image
+    /// `[0, c²]`, while endpoint-only transformation would report the
+    /// degenerate `[c², c²]`.
+    #[test]
+    fn transform_eta_non_monotone_captures_interior_extrema() {
+        let eta = array![0.0];
+        let square = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(e.mapv(|x| x * x))
+        };
+        let mean = square(&eta).unwrap();
+        let eta_se = array![1.0];
+        let z = z95();
+        let c = z * eta_se[0];
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            eta_se.clone(),
+            eta_se.clone(),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::UNBOUNDED,
+                response_map: &square,
+                mean_se: None,
+            },
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        // The interval midpoint η = 0 is a scan node, so the true interior
+        // minimum f(0) = 0 is found exactly; the maximum is at the endpoints.
+        assert!(
+            out.mean_lower[0].abs() < 1e-12,
+            "interior minimum not captured: lower = {}",
+            out.mean_lower[0]
+        );
+        assert!(
+            (out.mean_upper[0] - c * c).abs() < 1e-12,
+            "endpoint maximum wrong: upper = {}, expected {}",
+            out.mean_upper[0],
+            c * c
+        );
+    }
+
     /// A decreasing response map (survival tail) must still yield ordered
     /// `(lower, upper)` bounds — the engine takes the per-row min/max of the
     /// transformed endpoints.
