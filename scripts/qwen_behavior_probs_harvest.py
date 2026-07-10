@@ -57,8 +57,15 @@ def load_head_tensors(model_dir: str):
 
     def fetch(name: str) -> np.ndarray:
         shard = os.path.join(model_dir, weight_map[name])
-        with safe_open(shard, framework="numpy") as fh:
-            return np.asarray(fh.get_tensor(name), dtype=np.float64)
+        try:
+            with safe_open(shard, framework="numpy") as fh:
+                return np.asarray(fh.get_tensor(name), dtype=np.float64)
+        except (TypeError, ValueError):
+            # bf16 checkpoints are unreadable through the numpy framework.
+            import torch
+
+            with safe_open(shard, framework="pt") as fh:
+                return fh.get_tensor(name).to(torch.float64).numpy()
 
     def first_present(candidates: list[str]) -> str:
         for name in candidates:
