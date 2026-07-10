@@ -282,26 +282,35 @@ pub fn measure_atom_transport_between(
     let target_extrema = PeriodicCurveExtrema::from_gram(target_gram.view())?;
 
     // Empirical transport: project each source point onto the continuous target
-    // image by comparing every companion-enumerated stationary point.
-    let mut transport_grid = Vec::with_capacity(grid_resolution);
-    let mut t_arr = Vec::with_capacity(grid_resolution);
-    let mut tprime = Vec::with_capacity(grid_resolution);
-    for g in 0..grid_resolution {
-        let x = source_image.row(g);
-        let linear = b_tgt.dot(&x);
-        let projection = target_extrema
-            .minimize_squared_distance(linear.as_slice().ok_or_else(|| {
-                "measure_atom_transport: target linear coefficients are not contiguous".to_string()
-            })?)
-            .map_err(|error| {
-                format!("measure_atom_transport: source sample {g} target projection: {error}")
-            })?;
-        let t = g as f64 / grid_resolution as f64;
-        let tp = projection.coordinate;
-        t_arr.push(t);
-        tprime.push(tp);
-        transport_grid.push((t, tp));
-    }
+    // image by comparing every companion-enumerated stationary point. The
+    // per-point linear coefficients `B_tgt·x_g` are ONE `G×p · p×M` GEMM (the
+    // former per-point gemv was the loop's memory-bound half), and the
+    // companion-eigenvalue projections are embarrassingly parallel.
+    let linear_all = source_image.dot(&b_tgt.t()); // G × M
+    use rayon::prelude::*;
+    let tprime: Vec<f64> = (0..grid_resolution)
+        .into_par_iter()
+        .map(|g| {
+            let linear = linear_all.row(g);
+            let projection = target_extrema
+                .minimize_squared_distance(linear.as_slice().ok_or_else(|| {
+                    "measure_atom_transport: target linear coefficients are not contiguous"
+                        .to_string()
+                })?)
+                .map_err(|error| {
+                    format!("measure_atom_transport: source sample {g} target projection: {error}")
+                })?;
+            Ok(projection.coordinate)
+        })
+        .collect::<Result<Vec<f64>, String>>()?;
+    let t_arr: Vec<f64> = (0..grid_resolution)
+        .map(|g| g as f64 / grid_resolution as f64)
+        .collect();
+    let transport_grid: Vec<(f64, f64)> = t_arr
+        .iter()
+        .zip(tprime.iter())
+        .map(|(&t, &tp)| (t, tp))
+        .collect();
 
     let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, n_harmonics);
     let drift = decoder_drift(&b_src, &b_tgt);

@@ -691,20 +691,33 @@ impl SaeCrosscoderFitReport {
             let chain: Vec<CrosscoderLayer> = std::iter::once(CrosscoderLayer::Anchor)
                 .chain((0..self.layout.num_blocks()).map(CrosscoderLayer::Block))
                 .collect();
-            for atom in 0..self.term.k_atoms() {
-                for pair in chain.windows(2) {
+            // One independent measurement per (atom, consecutive-pair):
+            // embarrassingly parallel, and inner-loop parallelism (the grid
+            // projections) composes fine under rayon's work stealing.
+            use rayon::prelude::*;
+            let pairs: Vec<(usize, CrosscoderLayer, CrosscoderLayer)> = (0..self.term.k_atoms())
+                .flat_map(|atom| {
+                    chain
+                        .windows(2)
+                        .map(move |pair| (atom, pair[0], pair[1]))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            transport = pairs
+                .into_par_iter()
+                .map(|(atom, source_layer, target_layer)| {
                     let measured = measure_atom_transport_between(
                         &self.term,
                         &self.layout,
                         atom,
-                        pair[0],
-                        pair[1],
+                        source_layer,
+                        target_layer,
                         grid_resolution,
                     )?;
-                    transport.push(SaeCrosscoderWireTransport {
+                    Ok(SaeCrosscoderWireTransport {
                         atom,
-                        source: wire_layer_label(pair[0], anchor_label, block_labels)?,
-                        target: wire_layer_label(pair[1], anchor_label, block_labels)?,
+                        source: wire_layer_label(source_layer, anchor_label, block_labels)?,
+                        target: wire_layer_label(target_layer, anchor_label, block_labels)?,
                         grid_resolution: measured.grid_resolution,
                         n_harmonics: measured.n_harmonics,
                         phase_shift: measured.phase_shift,
@@ -718,9 +731,9 @@ impl SaeCrosscoderFitReport {
                         drift: measured.drift,
                         principal_angles: measured.principal_angles,
                         transport_grid: measured.transport_grid,
-                    });
-                }
-            }
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
         }
         let crosscoder = SaeCrosscoderWirePersistence {
             anchor_label: layout.anchor_label.clone(),

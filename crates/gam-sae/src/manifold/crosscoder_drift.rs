@@ -221,24 +221,36 @@ pub fn measure_crosscoder_drift(
     let num_atoms = term.atoms.len();
     let num_steps = layer_chain.len() - 1;
     let mut steps = Vec::with_capacity(num_atoms * num_steps);
-    for k in 0..num_atoms {
-        let decoder = term.atoms[k].full_width_decoder();
-        // Honest-units decoder at each layer, once per atom (reused across steps).
-        let mut honest: Vec<Array2<f64>> = Vec::with_capacity(layer_chain.len());
-        for &layer in &layer_chain {
-            honest.push(honest_layer_decoder(&decoder, layout, layer)?);
-        }
-        for s in 0..num_steps {
-            let drift = decoder_drift(&honest[s], &honest[s + 1]);
-            let principal_angles = principal_angles_between_images(&honest[s], &honest[s + 1])?;
-            steps.push(LayerStepDrift {
-                atom: k,
-                source: layer_chain[s],
-                target: layer_chain[s + 1],
-                drift,
-                principal_angles,
-            });
-        }
+    // Per-atom work (decoder re-expansion + per-step SVDs) is independent —
+    // parallelize over atoms and flatten in atom order (deterministic output).
+    use rayon::prelude::*;
+    let per_atom: Vec<Vec<LayerStepDrift>> = (0..num_atoms)
+        .into_par_iter()
+        .map(|k| {
+            let decoder = term.atoms[k].full_width_decoder();
+            // Honest-units decoder at each layer, once per atom (reused across steps).
+            let mut honest: Vec<Array2<f64>> = Vec::with_capacity(layer_chain.len());
+            for &layer in &layer_chain {
+                honest.push(honest_layer_decoder(&decoder, layout, layer)?);
+            }
+            let mut atom_steps = Vec::with_capacity(num_steps);
+            for s in 0..num_steps {
+                let drift = decoder_drift(&honest[s], &honest[s + 1]);
+                let principal_angles =
+                    principal_angles_between_images(&honest[s], &honest[s + 1])?;
+                atom_steps.push(LayerStepDrift {
+                    atom: k,
+                    source: layer_chain[s],
+                    target: layer_chain[s + 1],
+                    drift,
+                    principal_angles,
+                });
+            }
+            Ok(atom_steps)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for atom_steps in per_atom {
+        steps.extend(atom_steps);
     }
 
     Ok(CrosscoderDriftReport {
