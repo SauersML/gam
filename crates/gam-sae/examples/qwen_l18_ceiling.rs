@@ -491,36 +491,24 @@ fn print_gradient_certificate(label: &str, certificate: Option<&OuterCriterionCe
                 if clean { "clean" } else { "failing" }
             );
             println!(
-                "{label}_dual_oracle_gradient_certificate_first_order_consistent={}",
-                cert.first_order_consistent()
+                "{label}_dual_oracle_gradient_certificate_stationary={}",
+                cert.is_stationary()
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_grad_norm={:.9}",
                 cert.grad_norm
             );
             println!(
-                "{label}_dual_oracle_gradient_certificate_analytic_directional={:.9}",
-                cert.analytic_directional
+                "{label}_dual_oracle_gradient_certificate_projected_grad_norm={:.9}",
+                cert.projected_grad_norm
             );
             println!(
-                "{label}_dual_oracle_gradient_certificate_fd_directional={:.9}",
-                cert.fd_directional
+                "{label}_dual_oracle_gradient_certificate_stationarity_bound={:.9}",
+                cert.stationarity_bound
             );
             println!(
-                "{label}_dual_oracle_gradient_certificate_fd_error={:.9}",
-                cert.fd_error
-            );
-            println!(
-                "{label}_dual_oracle_gradient_certificate_agreement_z={:.9}",
-                cert.agreement_z
-            );
-            println!(
-                "{label}_dual_oracle_gradient_certificate_fd_step={:.9}",
-                cert.fd_step
-            );
-            println!(
-                "{label}_dual_oracle_gradient_certificate_hessian_pd={}",
-                optional_bool(cert.hessian_pd)
+                "{label}_dual_oracle_gradient_certificate_hessian_psd={}",
+                optional_bool(cert.hessian_psd)
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_lambdas_railed={:?}",
@@ -534,11 +522,7 @@ fn print_gradient_certificate(label: &str, certificate: Option<&OuterCriterionCe
 }
 
 fn gradient_certificate_clean(certificate: Option<&OuterCriterionCertificate>) -> bool {
-    certificate.is_some_and(|cert| {
-        cert.first_order_consistent()
-            && cert.hessian_pd != Some(false)
-            && cert.lambdas_railed.is_empty()
-    })
+    certificate.is_some_and(OuterCriterionCertificate::is_clean)
 }
 
 fn optional_bool(value: Option<bool>) -> &'static str {
