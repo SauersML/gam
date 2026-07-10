@@ -3990,9 +3990,11 @@ impl ChunkSchurStack {
     ) {
         let k = self.k;
         let d = left.nrows();
-        debug_assert_eq!(left.ncols(), k);
-        debug_assert_eq!(right.dim(), (d, k));
-        debug_assert_eq!(s_part.dim(), (k, k));
+        // Caller-contract shape checks; real asserts (scanner bans debug_*),
+        // and trivially cheap next to the k x k scatter below.
+        assert_eq!(left.ncols(), k, "scatter: left must be (d, k)");
+        assert_eq!(right.dim(), (d, k), "scatter: right must be (d, k)");
+        assert_eq!(s_part.dim(), (k, k), "scatter: s_part must be (k, k)");
         let mut scatter_flops = 0usize;
         for c in 0..d {
             let mut nnz_left = 0usize;
