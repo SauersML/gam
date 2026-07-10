@@ -298,7 +298,7 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         .streaming_plan()
         .admitted_or_error(N_OBS, P, K_ATOMS)
         .expect("fixture admitted by production memory plan");
-    let mut options = plan.solve_options_for_border_dim(sys.k);
+    let options = plan.solve_options_for_border_dim(sys.k);
     assert_eq!(
         options.mode,
         gam_solve::arrow_schur::ArrowSolverMode::InexactPCG,
@@ -337,9 +337,10 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         let started = std::time::Instant::now();
         let frame = gam_solve::arrow_schur::prepare_sae_resident_frame(&sys, &options, None)
             .expect("live CUDA runtime must admit the production resident frame");
-        options.sae_resident_frame = Some(frame);
+        let mut device_options = options.clone();
+        device_options.sae_resident_frame = Some(frame);
         let (_delta_t, _delta_beta, diagnostics) =
-            gam_solve::arrow_schur::solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &options)
+            gam_solve::arrow_schur::solve_with_lm_escalation_inner(&sys, 0.0, 0.0, &device_options)
                 .expect("resident InexactPCG production solve");
         assert!(
             diagnostics.used_device_arrow,
