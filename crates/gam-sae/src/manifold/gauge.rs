@@ -40,9 +40,20 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::{SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side};
+use super::{
+    AmplitudePriorState, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, Side,
+};
 use gam_linalg::faer_ndarray::FaerCholesky;
 use opt::{BacktrackConfig, backtracking_line_search};
+
+/// #1939 — amplitude floor below which an atom counts as turned OFF (SCAD's
+/// exact zero commits as `s = ln` of this floor). Shared by the boundary
+/// amplitude solve and the fit-level prior value
+/// ([`SaeManifoldTerm::amplitude_prior_value`]); the two MUST stay identical or
+/// the referee prices a different prior than the solve minimised.
+pub(crate) const AMPLITUDE_PRIOR_FLOOR: f64 = 1.0e-12;
+/// #1939 — Fan–Li canonical SCAD concavity, shared for the same reason.
+pub(crate) const AMPLITUDE_SCAD_GAMMA: f64 = 3.7;
 
 /// Frobenius norm `‖B‖_F = (Σ_{μ,j} B_{μj}²)^{1/2}` of a decoder block.
 pub fn decoder_frobenius_norm(decoder: ArrayView2<'_, f64>) -> f64 {
@@ -972,10 +983,10 @@ impl SaeManifoldTerm {
         // SCAD-penalized coordinate descent (exact zeros through the per-coordinate
         // threshold), with a 1-D Newton refining each ACTIVE amplitude under SCAD +
         // ARD, and a monotone keep-best guard on the penalized objective.
-        const AMP_FLOOR: f64 = 1.0e-12;
+        const AMP_FLOOR: f64 = AMPLITUDE_PRIOR_FLOOR;
         const S_MIN: f64 = -27.631_021_115_928_547; // ln(AMP_FLOOR)
         const S_MAX: f64 = 30.0; // exp(30) ≫ any physical amplitude
-        const SCAD_GAMMA: f64 = 3.7; // Fan–Li canonical concavity.
+        const SCAD_GAMMA: f64 = AMPLITUDE_SCAD_GAMMA;
         const ALPHA_MIN: f64 = 1.0e-8;
         const ALPHA_MAX: f64 = 1.0e8;
 
@@ -1213,7 +1224,68 @@ impl SaeManifoldTerm {
                 atom.log_amplitude = saved[j];
             }
         }
+        // #1939 — persist the CONVERGED empirical-Bayes prior (evidence α,
+        // per-atom SCAD λ, noise scale σ̂²) on the term, whether the update or
+        // the banked state won: the fit-level referee
+        // (`penalized_objective_total` → `prefer_candidate_state` / Armijo)
+        // must price the SAME amplitude prior on BOTH sides of every later
+        // comparison, or the incumbent bank silently vetoes the prior's
+        // accepted shrinkage (a data-fit-only referee ranks the pre-shrinkage
+        // state higher by construction).
+        self.amplitude_prior = Some(AmplitudePriorState {
+            alpha,
+            scad_lambda: lam.clone(),
+            sigma2,
+        });
         Ok(())
+    }
+
+    /// #1939 — the fit-level amplitude-prior energy in DATA-FIT units:
+    /// `σ̂² · Σ_k [ p_{λ_k}(β_k) + ½ α s_k² · 1(β_k > floor) ]`, `β_k = exp(s_k)`,
+    /// at the persisted converged `(α, λ, σ̂²)` of the last boundary amplitude
+    /// solve. The solve minimises `½βᵀG̃β − r̃·β + P(β)` in noise-whitened units
+    /// (`G̃ = G/σ̂²`); multiplying `P` by `σ̂²` expresses it on the same scale as
+    /// the weighted reconstruction data-fit that `loss_scaled` reports, so
+    /// `data_fit + amplitude_prior_value` ranks amplitude moves in EXACTLY the
+    /// order the solve's own keep-best does (the ½‖target‖² constant cancels in
+    /// every comparison). Zero (bit-for-bit historical objective) until a solve
+    /// has installed the state; a stale state whose per-atom `λ` no longer
+    /// matches `K` (growth/merge) is skipped until the next solve re-installs it.
+    pub(crate) fn amplitude_prior_value(&self, penalty_scale: f64) -> f64 {
+        let Some(prior) = self.amplitude_prior.as_ref() else {
+            return 0.0;
+        };
+        let k = self.k_atoms();
+        if prior.scad_lambda.len() != k {
+            return 0.0;
+        }
+        if !(prior.sigma2.is_finite() && prior.sigma2 > 0.0) {
+            return 0.0;
+        }
+        let gamma = AMPLITUDE_SCAD_GAMMA;
+        let mut energy = 0.0_f64;
+        for (atom, &l) in self.atoms.iter().zip(prior.scad_lambda.iter()) {
+            let s = atom.log_amplitude;
+            let beta = s.exp();
+            if !beta.is_finite() {
+                continue;
+            }
+            if beta > 0.0 && l.is_finite() && l > 0.0 {
+                // Fan–Li three-region SCAD value, identical to the solve's `scad_p`.
+                energy += if beta <= l {
+                    l * beta
+                } else if beta <= gamma * l {
+                    (2.0 * gamma * l * beta - beta * beta - l * l) / (2.0 * (gamma - 1.0))
+                } else {
+                    l * l * (gamma + 1.0) / 2.0
+                };
+            }
+            if beta > AMPLITUDE_PRIOR_FLOOR && prior.alpha.is_finite() && prior.alpha > 0.0 {
+                energy += 0.5 * prior.alpha * s * s;
+            }
+        }
+        let value = prior.sigma2 * energy * penalty_scale;
+        if value.is_finite() { value } else { 0.0 }
     }
 
     /// #2228/#1095/#2132/#1893/#2134 Option B — the SCALE-gauge PIN, the co-collapse

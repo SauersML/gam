@@ -358,6 +358,79 @@ fn joint_step_projection_gauge_orthogonal_first_order_exact_2022() {
     assert!(bdrift == 0.0, "restore must return the decoder exactly");
 }
 
+/// #1939 GATE — the empirical-Bayes amplitude prior (SCAD + evidence-ARD on
+/// the explicit amplitudes) is PRICED BY THE FIT-LEVEL REFEREE. The boundary
+/// amplitude solve persists its converged `(α, λ_k, σ̂²)` on the term, and
+/// `penalized_objective_total` must include the prior energy in data-fit units:
+/// otherwise the keep-best incumbent ranks states on the bare data-fit and
+/// silently vetoes the prior's accepted shrinkage (the #2230 desync class on
+/// the amplitude channel).
+#[test]
+fn amplitude_prior_priced_in_fit_referee_1939() {
+    let coords_col = array![
+        [0.02_f64],
+        [0.10],
+        [0.17],
+        [0.31],
+        [0.55],
+        [0.66],
+        [0.80],
+        [0.95]
+    ];
+    let n = coords_col.nrows();
+    let p = 3usize;
+    let (phi0, _) = periodic_basis(&coords_col);
+    let m = phi0.ncols();
+    let decoder = Array2::<f64>::from_shape_fn((m, p), |(a, b)| {
+        0.3 * ((a + 1) as f64) - 0.15 * (b as f64) + 0.05 * ((a * p + b) as f64)
+    });
+    let mut term = build_circle_term(&coords_col, &decoder);
+    let target =
+        Array2::<f64>::from_shape_fn((n, p), |(r, c)| 0.2 - 0.05 * (r as f64) + 0.1 * (c as f64));
+    let rho = SaeManifoldRho::new(0.0, -4.0, vec![array![0.0]]);
+
+    assert!(
+        term.amplitude_prior.is_none() && term.amplitude_prior_value(1.0) == 0.0,
+        "no amplitude-prior energy before the first boundary solve (historical objective)"
+    );
+    term.optimize_log_amplitudes_closed_form(target.view(), &rho)
+        .unwrap();
+    assert!(
+        term.amplitude_prior.is_some(),
+        "the boundary amplitude solve must persist its converged prior state"
+    );
+    let v = term.amplitude_prior_value(1.0);
+    assert!(
+        v.is_finite() && v >= 0.0,
+        "amplitude-prior energy must be finite and non-negative; got {v}"
+    );
+
+    // The referee objective includes EXACTLY the persisted prior energy.
+    let with_prior = term
+        .penalized_objective_total(target.view(), &rho, None, 1.0)
+        .unwrap();
+    let saved = term.amplitude_prior.take();
+    let without_prior = term
+        .penalized_objective_total(target.view(), &rho, None, 1.0)
+        .unwrap();
+    term.amplitude_prior = saved;
+    assert!(
+        (with_prior - without_prior - v).abs() <= 1.0e-12 * (1.0 + with_prior.abs()),
+        "penalized_objective_total must add the amplitude-prior energy exactly: \
+         with {with_prior}, without {without_prior}, prior {v}"
+    );
+
+    // Stale-K guard: a λ vector that no longer matches the dictionary is skipped.
+    if let Some(prior) = term.amplitude_prior.as_mut() {
+        prior.scad_lambda.push(1.0);
+    }
+    assert_eq!(
+        term.amplitude_prior_value(1.0),
+        0.0,
+        "a K-mismatched (stale) prior state must be skipped, not mispriced"
+    );
+}
+
 /// #2099 GATE (fit-level decoder-scale invariance, the acceptance pin the
 /// issue's close-audit says is "coupled to the amplitude-gauge fix"): two
 /// representations of the SAME fitted model that differ by the pure scale gauge

@@ -253,6 +253,9 @@ impl SaeManifoldTerm {
             // historical path is bit-for-bit). Installed via `set_tier0_mean` /
             // `fit_tier0_mean`.
             tier0_mean: None,
+            // #1939 — no amplitude-prior state until the first boundary
+            // amplitude solve installs one (bit-for-bit historical objective).
+            amplitude_prior: None,
         })
     }
 
@@ -416,6 +419,9 @@ impl SaeManifoldTerm {
         primary.best_cocollapse_incumbent = None;
         primary.best_fit_incumbent = None;
         primary.structural_cocollapse_reseeds = 0;
+        // #1939 — K-dependent (per-atom SCAD λ): stale after the concat; the
+        // merged term's next boundary amplitude solve re-installs it.
+        primary.amplitude_prior = None;
         // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
         primary.collapse_events = Vec::new();
         primary.curvature_walk_report = None;
@@ -4720,6 +4726,15 @@ impl SaeManifoldTerm {
         // decoders the assembly's gradient/curvature used, so the line search sees
         // exactly the term the inner Newton step optimises (no value/grad desync).
         total += self.separation_barrier_value(penalty_scale);
+        // #1939 — empirical-Bayes amplitude prior (SCAD + evidence-ARD on
+        // exp(s_k)/s_k) at the boundary solve's converged (α, λ, σ̂²), in data-fit
+        // units. Pricing it here keeps the fit-level referee
+        // (`prefer_candidate_state`) and the Armijo baseline monotone-consistent
+        // with the amplitude solve's own keep-best: an accepted SCAD/ARD
+        // shrinkage deliberately raises the bare data-fit, and a referee that
+        // omits the prior would bank and restore the pre-shrinkage state. Zero
+        // until the first amplitude solve installs the state (historical path).
+        total += self.amplitude_prior_value(penalty_scale);
         Ok(total)
     }
 

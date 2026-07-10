@@ -695,6 +695,35 @@ pub struct SaeManifoldTerm {
     /// DC-constant decoder is then EV-invisible BY CONSTRUCTION — the mean it would
     /// chase is already gone. Carried across clones like the other persisted config.
     pub(crate) tier0_mean: Option<Array1<f64>>,
+    /// #1939 — the boundary amplitude solve's converged empirical-Bayes prior
+    /// state: the MacKay/Fellner–Schall evidence precision `α` on the active
+    /// log-amplitudes, the per-atom SCAD selection coefficients `λ_k` (β-space),
+    /// and the noise scale `σ̂²` that converts the solve's noise-whitened prior
+    /// energy into data-fit units. Persisted so the FIT-LEVEL referee
+    /// ([`SaeManifoldTerm::penalized_objective_total`], hence
+    /// `prefer_candidate_state` and the Armijo line search) prices the SAME
+    /// amplitude prior the solve minimised — without it the keep-best incumbent
+    /// ranks states on the bare data-fit and silently vetoes the prior's
+    /// accepted shrinkage (the #2230 objective-desync class, relocated to the
+    /// amplitude channel). `None` until the first amplitude solve (bit-for-bit
+    /// historical objective); transient across clones and stale-guarded on `K`
+    /// (a mismatched `λ` length is skipped, then re-installed by the next
+    /// solve).
+    pub(crate) amplitude_prior: Option<AmplitudePriorState>,
+}
+
+/// #1939 — converged empirical-Bayes amplitude-prior state persisted by
+/// [`SaeManifoldTerm::optimize_log_amplitudes_closed_form`]; see the field doc
+/// on [`SaeManifoldTerm::amplitude_prior`].
+#[derive(Debug, Clone)]
+pub(crate) struct AmplitudePriorState {
+    /// Evidence (ARD) precision on the ACTIVE log-amplitudes, `s_k ~ N(0, 1/α)`.
+    pub(crate) alpha: f64,
+    /// Per-atom SCAD coefficient `λ_k` in amplitude (β) space.
+    pub(crate) scad_lambda: Vec<f64>,
+    /// LS residual noise scale `σ̂²`: multiplying the noise-whitened prior
+    /// energy by `σ̂²` expresses it in the same units as the weighted data-fit.
+    pub(crate) sigma2: f64,
 }
 
 /// Per-fit SAE configuration consumed by the Python/FFI layer. Build it, then
@@ -774,6 +803,10 @@ impl Clone for SaeManifoldTerm {
             // #2023 C4 — persisted Tier-0 shared mean, carried across clones like
             // the assignment mode so a cloned candidate de-means identically.
             tier0_mean: self.tier0_mean.clone(),
+            // #1939 — transient like the incumbents: a clone (stagewise birth /
+            // candidate) may change K, so it starts with no amplitude prior and
+            // the next boundary solve re-installs one sized to its dictionary.
+            amplitude_prior: None,
         }
     }
 }
