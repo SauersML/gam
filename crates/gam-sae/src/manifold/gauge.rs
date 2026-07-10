@@ -12,7 +12,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::{SaeBasisEvaluator, Side};
+use super::SaeBasisEvaluator;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 pub fn sample_decoded_curve(
