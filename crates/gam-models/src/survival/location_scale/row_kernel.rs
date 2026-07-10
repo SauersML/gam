@@ -1764,13 +1764,6 @@ impl SurvivalLocationScaleFamily {
         self.x_link_wiggle.is_none()
     }
 
-    pub(crate) fn survival_ls_row_kernel<'a>(
-        &'a self,
-        q: &'a SurvivalJointQuantities,
-        dynamic: &'a SurvivalDynamicGeometry,
-    ) -> SurvivalLsRowKernel<'a> {
-        self.survival_ls_row_kernel_rescaled(q, dynamic, 0.0)
-    }
 
     pub(crate) fn survival_ls_row_kernel_rescaled<'a>(
         &'a self,

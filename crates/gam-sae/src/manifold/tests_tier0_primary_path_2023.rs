@@ -1,0 +1,215 @@
+//! #2023 Increment 5 — Tier-0 shared mean is NATIVE to the ONE fit entry.
+//!
+//! [`crate::manifold::tests_tier0_shared_mean_2023`] proves the reconstruction /
+//! survival mechanics for a HAND-BUILT term with the mean installed by hand. This
+//! module proves the missing production half: the single fit entry
+//! [`run_sae_manifold_fit`] itself peels the shared column mean off a raw target,
+//! runs the whole fit on the de-meaned frame, and hands back a fitted term that
+//! SELF-CONTAINS μ — so the tiered schedule's Tier-0 "seed policy" is realized by
+//! the primary path, not a separate surface. Two properties, exercised through the
+//! exact typed seed→fit pipeline the bindings drive (`examples/sae_fit.rs`):
+//!
+//! 1. A raw circle target carrying a large global DC gets μ installed on the
+//!    returned term equal to the column mean, and the reported reconstruction is
+//!    lifted back to raw-target space (its column mean matches the target's).
+//! 2. An already-centered target yields μ ≈ 0 — always-on Tier-0 is a no-op on
+//!    centered data (μ is computed from THIS target, so there is no
+//!    double-subtraction hazard), the safety the C4 module documents.
+
+#[cfg(test)]
+mod tests {
+    use crate::manifold::{
+        SaeFitAssignmentKind, SaeFitConfig, SaeFitRequest, SaeFitSeedReport, SaeFitSeedRequest,
+        SaeMinimalSeedReport, SaeMinimalSeedRequest, build_sae_fit_seed, build_sae_minimal_seed,
+        run_sae_manifold_fit,
+    };
+    use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
+    use ndarray::{Array2, Axis};
+
+    /// Eight points on the unit circle, plus a per-dim constant `offset` (the global
+    /// DC Tier-0 must carry).
+    fn circle_target(offset: f64) -> Array2<f64> {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let base = [
+            [1.0, 0.0],
+            [s, s],
+            [0.0, 1.0],
+            [-s, s],
+            [-1.0, 0.0],
+            [-s, -s],
+            [0.0, -1.0],
+            [s, -s],
+        ];
+        Array2::from_shape_fn((8, 2), |(i, j)| base[i][j] + offset)
+    }
+
+    /// Drive the full typed pipeline (`build_sae_minimal_seed` →
+    /// `build_sae_fit_seed` → `run_sae_manifold_fit`) on `target`, returning the fit
+    /// report. Mirrors `examples/sae_fit.rs` with a single periodic atom.
+    fn run_primary(target: Array2<f64>) -> crate::manifold::SaeFitReport {
+        let assignment_kind = SaeFitAssignmentKind::Softmax;
+        let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
+            target: target.view(),
+            atom_basis: vec!["periodic".to_string()],
+            atom_dim: vec![1],
+            assignment_kind,
+            alpha: 1.0,
+            tau: 1.0,
+            threshold: 0.0,
+            top_k: None,
+            ibp_alpha_override: None,
+            random_state: 0,
+            initial_logits: None,
+            initial_coords: None,
+        })
+        .expect("minimal seed");
+        let SaeMinimalSeedReport {
+            atom_basis,
+            effective_atom_dim,
+            atom_centers,
+            basis_values,
+            basis_jacobian,
+            basis_sizes,
+            decoder_coefficients,
+            smooth_penalties,
+            initial_logits,
+            initial_coords,
+            refine_routing,
+        } = minimal;
+
+        let registry = AnalyticPenaltyRegistry::new();
+        let seed = build_sae_fit_seed(SaeFitSeedRequest {
+            target: target.view(),
+            atom_basis: &atom_basis,
+            atom_dim: &effective_atom_dim,
+            atom_centers: &atom_centers,
+            basis_values: basis_values.view(),
+            basis_jacobian: basis_jacobian.view(),
+            basis_sizes: &basis_sizes,
+            decoder_coefficients: decoder_coefficients.view(),
+            smooth_penalties: smooth_penalties.view(),
+            initial_logits: initial_logits.view(),
+            initial_coords: initial_coords.view(),
+            alpha: 1.0,
+            tau: 1.0,
+            learnable_alpha: false,
+            assignment_kind,
+            sparsity_strength: 1.0,
+            smoothness: 1.0,
+            max_iter: 4,
+            learning_rate: 1.0,
+            ridge_ext_coord: 1.0e-6,
+            ridge_beta: 1.0e-6,
+            top_k: None,
+            threshold: 0.0,
+            native_ard_enabled: true,
+            seed_refine_routing: refine_routing,
+            seed_refine_random_state: 0,
+            data_row_reseed: false,
+            fit_config: SaeFitConfig::default(),
+            temperature_schedule: None,
+            fisher_metric: None,
+            row_loss_weights: None,
+            registry: &registry,
+        })
+        .expect("fit seed");
+        let SaeFitSeedReport {
+            base_term,
+            initial_rho,
+            isometry_pin_active,
+            metric_provenance,
+        } = seed;
+
+        run_sae_manifold_fit(SaeFitRequest {
+            base_term,
+            target,
+            registry,
+            initial_rho,
+            max_iter: 4,
+            learning_rate: 1.0,
+            ridge_ext_coord: 1.0e-6,
+            ridge_beta: 1.0e-6,
+            assignment_kind,
+            alpha: 1.0,
+            top_k: None,
+            isometry_pin_active,
+            metric_provenance,
+            promote_from_residual: false,
+            run_structure_search: false,
+            run_outer_rho_search: false,
+            cancel: None,
+        })
+        .expect("primary fit runs")
+    }
+
+    /// The primary entry peels the shared mean off a RAW target: μ is installed on
+    /// the returned term (≈ the column mean = OFFSET), and the reported
+    /// reconstruction is lifted back to raw-target space (its column mean tracks the
+    /// target's, i.e. the DC is present in `report.fitted`, carried by Tier-0).
+    #[test]
+    fn primary_entry_installs_tier0_mean_on_raw_target() {
+        const OFFSET: f64 = 7.0;
+        let target = circle_target(OFFSET);
+        let target_col_mean = target.mean_axis(Axis(0)).unwrap();
+        let report = run_primary(target.clone());
+
+        let mu = report
+            .term
+            .tier0_mean()
+            .expect("primary entry must install a Tier-0 mean on a raw target")
+            .clone();
+        assert_eq!(mu.len(), 2, "μ must have one entry per output dim");
+        for j in 0..2 {
+            assert!(
+                (mu[j] - target_col_mean[j]).abs() < 1e-9,
+                "μ[{j}]={} must equal the target column mean {}",
+                mu[j],
+                target_col_mean[j]
+            );
+            // The DC dominates the column mean (the 8 circle coords sum to 0 exactly),
+            // so μ ≈ OFFSET.
+            assert!(
+                (mu[j] - OFFSET).abs() < 1e-9,
+                "μ[{j}]={} must equal OFFSET={OFFSET} (circle coords are mean-zero)",
+                mu[j]
+            );
+        }
+
+        // The reported reconstruction lives in RAW-target space: its column mean
+        // tracks the target's (the DC is added back by Tier-0), not the de-meaned
+        // frame the atoms were fit in.
+        let recon_col_mean = report.fitted.mean_axis(Axis(0)).unwrap();
+        for j in 0..2 {
+            assert!(
+                (recon_col_mean[j] - target_col_mean[j]).abs() < 1e-6,
+                "reconstruction column mean[{j}]={} must track the raw target mean {} \
+                 (Tier-0 add-back), not the de-meaned 0",
+                recon_col_mean[j],
+                target_col_mean[j]
+            );
+        }
+        assert!(
+            report.reconstruction_r2.is_finite(),
+            "reconstruction R² must be finite"
+        );
+    }
+
+    /// Always-on Tier-0 is a NO-OP on already-centered data: μ is computed from THIS
+    /// target, so a mean-zero target yields μ ≈ 0 (no double-subtraction hazard).
+    #[test]
+    fn primary_entry_tier0_is_a_noop_on_centered_target() {
+        let target = circle_target(0.0); // the circle coords are already mean-zero
+        let report = run_primary(target);
+        let mu = report
+            .term
+            .tier0_mean()
+            .expect("Tier-0 is installed unconditionally (value ≈ 0 here)")
+            .clone();
+        for (j, &m) in mu.iter().enumerate() {
+            assert!(
+                m.abs() < 1e-9,
+                "μ[{j}]={m} must be ≈ 0 on already-centered data (no phantom mean)"
+            );
+        }
+    }
+}

@@ -80,6 +80,48 @@ impl SaeManifoldTerm {
         }
     }
 
+    /// Verify the finalized per-row Newton arity fits the const-generic jet
+    /// dispatch ladder (#932 gap 5). The IBP-MAP / ThresholdGate / TopK
+    /// assignment modes route their per-row reconstruction / β-border log-det
+    /// channels through the compile-time-sized `Tower4<K>` ladder capped at
+    /// [`SAE_MAX_JET_ROW_PRIMARIES`](crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES);
+    /// a wider per-row block would otherwise hard-error in the ladder's
+    /// `unsupported` arm deep inside the streaming arrow log-det assembly. This
+    /// surfaces the shape violation once the row layout is finalized (the moment
+    /// the true per-row arity `logit slots + Σ latent coords` is known), with a
+    /// precise message naming the limit, the offending row, and the issue. The
+    /// softmax mode routes through the dynamically-sized hand path and is exempt.
+    fn validate_jet_row_primary_arity(
+        &self,
+        row_layout: Option<&SaeRowLayout>,
+    ) -> Result<(), String> {
+        use crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES;
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            return Ok(());
+        }
+        // Worst-case per-row primary count. With a row layout the arity is the
+        // finalized compact block width; without one every atom is active on
+        // every row, so the dense `row_block_dim()` is the exact per-row width.
+        let (worst_row, worst_q) = match row_layout {
+            Some(layout) => (0..self.assignment.n_obs())
+                .map(|row| (row, layout.row_q_active(row)))
+                .max_by_key(|&(_, q)| q)
+                .unwrap_or((0, 0)),
+            None => (0, self.assignment.row_block_dim()),
+        };
+        if worst_q > SAE_MAX_JET_ROW_PRIMARIES {
+            return Err(format!(
+                "SAE per-atom jet log-det dispatch supports at most \
+                 {SAE_MAX_JET_ROW_PRIMARIES} per-row Newton primaries, but row \
+                 {worst_row} has {worst_q} (free logit slots + Σ active-atom \
+                 latent coordinates); reduce the per-row active-atom count / \
+                 latent dimension or widen the const-generic dispatch ladder in \
+                 construction_row_jet_logdet_channels.rs (#932)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.
     ///
     /// Full-batch entry point: a single chunk covering all rows, with the
@@ -1770,6 +1812,7 @@ impl SaeManifoldTerm {
             {
                 sys.set_row_gauge_deflation(deflation);
             }
+            self.validate_jet_row_primary_arity(row_layout.as_ref())?;
             self.last_row_layout = row_layout;
             self.last_frames_active = frames_engaged;
             return Ok(sys);
@@ -2603,6 +2646,7 @@ impl SaeManifoldTerm {
             sys.set_ibp_cross_row_source(source);
         }
         // Store the active-set layout for `apply_newton_step`.
+        self.validate_jet_row_primary_arity(row_layout.as_ref())?;
         self.last_row_layout = row_layout;
         // Record whether `delta_beta` from this system is a factored ΔC (needs a
         // frame lift) or a full-`B` ΔB. Read by `apply_newton_step_impl`.

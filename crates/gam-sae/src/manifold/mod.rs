@@ -334,6 +334,9 @@ mod tests_two_tier_2023;
 mod tests_tier0_shared_mean_2023;
 
 #[cfg(test)]
+mod tests_tier0_primary_path_2023;
+
+#[cfg(test)]
 mod tests_streaming_efs_cache_1026;
 
 #[cfg(test)]
