@@ -271,7 +271,11 @@ fn sae_build_atom_plans(
     promote_from_residual = true,
     run_structure_search = true,
     run_outer_rho_search = true,
-    quotient_scale = false,
+    // #2228/#1095/#2132 — the SCALE-gauge is DEFAULT-ON to cure the decoder-penalty
+    // ↔ gate co-collapse (mirrors the `sae_manifold_fit_inner` default; the d06c1255f
+    // flip missed THIS entry, which is the one the Python `sae_manifold_fit` facade
+    // routes through). Callers can pass `quotient_scale=False` for a historical A/B.
+    quotient_scale = true,
     data_row_reseed = false,
     // #1893: default Python auto fits to the realised-rank REML/Laplace
     // complexity ledger; callers can set false for historical A/B.
