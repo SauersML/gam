@@ -162,6 +162,11 @@ pub struct FitRequestConfigDocument {
     pub time_smooth_lambda: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology_auto_selector: Option<JsonValue>,
+    /// Container type of the caller's training table (`"pandas"`, `"polars"`,
+    /// `"pyarrow"`, `"numpy"`, ...), passed through opaquely into the saved
+    /// model payload for the predict-time output-container fallback (#394).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training_table_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transformation_normal: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

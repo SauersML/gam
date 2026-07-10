@@ -556,6 +556,28 @@ def _group_terms_from_formula(formula: str) -> list[str]:
     return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
 
 
+def _normalize_groups_config(rust_config: dict[str, Any]) -> None:
+    """Translate the ``config["groups"]`` list sugar into ``group_metadata``.
+
+    ``groups`` is a list of ``{"name": ..., "metadata": ...}`` entries (one
+    per group level); the Rust core only understands the ``group_metadata``
+    dict keyed by group name, so merge here before the payload is built.
+    """
+    groups = rust_config.pop("groups", None)
+    if groups is None:
+        return
+    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes)):
+        raise TypeError("config['groups'] must be a sequence of {'name', 'metadata'} entries")
+    metadata_by_name: dict[str, Any] = dict(rust_config.get("group_metadata") or {})
+    for entry in groups:
+        if not isinstance(entry, Mapping) or "name" not in entry:
+            raise ValueError("each config['groups'] entry needs a 'name'")
+        if "metadata" in entry and entry["metadata"] is not None:
+            metadata_by_name[str(entry["name"])] = entry["metadata"]
+    if metadata_by_name:
+        rust_config["group_metadata"] = metadata_by_name
+
+
 def _resolve_precision_hyperpriors(
     value: Any | None,
     formula: str,
@@ -1216,6 +1238,7 @@ def fit(
         "response_reference",
     ):
         rust_config.pop(key, None)
+    _normalize_groups_config(rust_config)
     # Persist the training-table container type into the model payload (the
     # single serialized source of truth) so the predict-time output-container
     # fallback for dict/list inputs survives save/load and dumps/loads. Without
