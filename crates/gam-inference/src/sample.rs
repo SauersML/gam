@@ -1306,6 +1306,9 @@ fn sample_survival(
             .slice_mut(s![.., cov_range.clone()])
             .assign(&x_entry.slice(s![.., cov_range]));
     }
+    // The final assembly now owns every covariate column needed by sampling.
+    // Release the rebuilt term collection before allocating model-owned copies.
+    drop(cov_design);
     let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
     for (idx, s) in time_build.penalties.iter().enumerate() {
         if s.nrows() == p_time && s.ncols() == p_time {
@@ -1374,6 +1377,9 @@ fn sample_survival(
             }
         }
     }
+    // Wiggle columns and their penalty blocks have been copied into their final
+    // owners; the three source matrices must not overlap the sampler copies.
+    drop(saved_timewiggle);
     let ridge_lambda = model.survivalridge_lambda.ok_or_else(|| {
         "saved survival model is missing survivalridge_lambda; refusing to \
          pick a load-time default (the historical 1e-4 fallback silently \
@@ -1386,6 +1392,9 @@ fn sample_survival(
     } else {
         0
     };
+    // All time columns and penalty metadata are now represented in the final
+    // assembly. Drop the three source designs before constructing the model.
+    drop(time_build);
     if ridge_lambda > 0.0 && p > ridge_range_start {
         let dim = p - ridge_range_start;
         let mut ridge = Array2::<f64>::zeros((dim, dim));
