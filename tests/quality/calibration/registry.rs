@@ -186,7 +186,8 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             mode: AuditMode::CoverageSweep,
             guards: &[1891],
             audited_by: "sbc_survival_prediction_se_coverage \
-                         (survival_posterior_mean_se_covers_true_survival_probability_at_nominal)",
+                         (survival_posterior_mean_se_covers_true_survival_probability_at_nominal \
+                         + survival_location_scale_delta_method_se_covers_true_survival_probability_at_nominal)",
         },
         // ---- Coefficient Wald/delta intervals -----------------------------
         CalibrationTarget {
