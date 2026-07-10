@@ -361,7 +361,6 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
     let term = build_term(n, &arcs, &decoders);
     let rho = rho_for(2);
     let target = target_from_term(&term, p);
-    let fitted_before = term.try_fitted().unwrap();
 
     assert_eq!(
         active_atom_count(&term),
