@@ -3853,11 +3853,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let attempt = match first_attempt {
             Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
+                // A failed criterion call restores the pre-call term state, so a
+                // same-budget retry is a byte-identical replay — the rescue must
+                // grant genuinely more inner room (4×; the cost lane's two-stage
+                // envelope keeps its first stage's progress, which is why it
+                // certifies at the same ρ this lane refused).
                 self.term.reml_criterion_with_cache(
                     self.target.view(),
                     &rho_state,
                     self.registry.as_ref(),
-                    self.inner_max_iter,
+                    self.inner_max_iter.saturating_mul(4).max(64),
                     self.learning_rate,
                     self.ridge_ext_coord,
                     self.ridge_beta,
