@@ -2,6 +2,15 @@ use super::*;
 use gam_problem::dispersion_cov::se_from_covariance;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Moderate log-smoothing ceiling shared by the #1860/#1476 degeneracy-breaker
+/// cap and the #1266 whole-term / wiggliness continuous escapes: well within
+/// the shrink-out band (`exp(21) ≈ 1.3e9`, far past any meaningful finite
+/// smoothing) yet strictly below the numerical `RHO_BOUND` rail those guards
+/// exist to reject. Module-scoped because the escape searches read it outside
+/// the rail-guard block that originally declared it.
+const NULLSPACE_DEGENERACY_RHO_CEILING: f64 = 21.0;
+
+
 /// Max-abs entry of `H·H⁻¹ − I` — a scale-free trustworthiness probe for a
 /// computed inverse. It is `≈ κ(H)·ε` for a faithful inverse but blows up to
 /// `O(δ/σ_min)` when [`matrix_inversewith_regularization`] had to add a large
