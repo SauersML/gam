@@ -91,7 +91,7 @@ pub fn build_sae_stagewise_seed(
         row_loss_weights: None,
         registry: &registry,
     })?;
-    let mut base_term = seed.base_term;
+    let base_term = seed.base_term;
     if request.structured_whitening
         && base_term
             .row_metric()
