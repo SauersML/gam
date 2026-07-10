@@ -1,12 +1,19 @@
 /// Build [`SaeAtomBuildPlan`]s from `(z, atom_basis, atom_dim)` + per-atom
 /// PCA seed. Periodic atoms get `n_harmonics = max(1, d_atom)`; Duchon atoms
 /// get deterministic center indices from the PCA seed.
+///
+/// `duchon_center_overrides` (aligned with `atom_basis`) carries the
+/// evidence-selected thin-plate center count for a #2240 Duchon-sheet
+/// discovery winner (`resolve_auto_primary_atoms`); `None` entries keep the
+/// economy budget below. Overrides are clamped to the same identifiability
+/// floor and to `n_obs`.
 fn sae_build_atom_plans(
     z: ArrayView2<'_, f64>,
     atom_basis: &[String],
     atom_dim: &[usize],
     seed_coords: ArrayView3<'_, f64>,
     random_state: u64,
+    duchon_center_overrides: &[Option<usize>],
 ) -> Result<Vec<SaeAtomBuildPlan>, String> {
     let k_atoms = atom_basis.len();
     let n_obs = z.nrows();
@@ -15,6 +22,12 @@ fn sae_build_atom_plans(
         return Err(format!(
             "sae_build_atom_plans: atom_dim length {} must equal atom_basis length {k_atoms}",
             atom_dim.len()
+        ));
+    }
+    if duchon_center_overrides.len() != k_atoms {
+        return Err(format!(
+            "sae_build_atom_plans: duchon_center_overrides length {} must equal atom_basis length {k_atoms}",
+            duchon_center_overrides.len()
         ));
     }
     if seed_shape[0] != k_atoms || seed_shape[1] != n_obs {
@@ -119,7 +132,14 @@ fn sae_build_atom_plans(
                 let center_ceiling = center_floor.max(32);
                 let lo = center_floor.min(n_obs);
                 let hi = center_ceiling.min(n_obs);
-                let n_centers = n_obs.min(hi).max(lo);
+                // #2240 — a Duchon-sheet discovery winner carries its
+                // evidence-selected center count; honor it (clamped to the
+                // identifiability floor and the row count) instead of the
+                // fixed economy ceiling.
+                let n_centers = match duchon_center_overrides[atom_idx] {
+                    Some(selected) => selected.min(n_obs).max(lo),
+                    None => n_obs.min(hi).max(lo),
+                };
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
                     n_centers,
@@ -396,15 +416,17 @@ fn sae_manifold_fit_minimal<'py>(
     // in gam-sae (`resolve_auto_primary_atoms`); this layer only plumbs.
     let mut atom_basis = atom_basis;
     let mut atom_dim = atom_dim;
-    if atom_basis.iter().any(|basis| basis == "auto") {
+    let duchon_center_overrides = if atom_basis.iter().any(|basis| basis == "auto") {
         let labels = sae_output_energy_cluster_labels(z_view, k_atoms);
         gam::terms::sae::structure_harvest::resolve_auto_primary_atoms(
             z_view,
             &labels,
             &mut atom_basis,
             &mut atom_dim,
-        )?;
-    }
+        )?
+    } else {
+        vec![None; k_atoms]
+    };
     let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
         .iter()
         .map(|kind| sae_atom_basis_kind_from_str(kind))
@@ -418,6 +440,7 @@ fn sae_manifold_fit_minimal<'py>(
         &atom_dim,
         seed_coords.view(),
         random_state,
+        &duchon_center_overrides,
     )
     .map_err(py_value_error)?;
     // The optimizer's per-atom latent dimension is `plan.latent_dim`, not the

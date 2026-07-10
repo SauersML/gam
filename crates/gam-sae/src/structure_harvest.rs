@@ -84,8 +84,9 @@ use crate::atom_codes::SparseAtomCodes;
 use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::basis::{
-    CylinderHarmonicEvaluator, EuclideanPatchEvaluator, MobiusHarmonicEvaluator,
-    PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
+    CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
+    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator,
+    TorusHarmonicEvaluator,
 };
 use crate::manifold::{
     AssignmentMode, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw, SaeAtomBasisKind,
@@ -2794,6 +2795,13 @@ pub struct PrimaryTopologyChoice {
     /// harmonic count (sphere/torus/möbius carry fixed charts; flat winners
     /// carry data-scaled Duchon centers).
     pub n_harmonics: Option<usize>,
+    /// Evidence-selected thin-plate center count for a Duchon-sheet winner
+    /// (#2240, the #2243 resolution-growth pattern lifted to 2-D): the number
+    /// of Duchon centers the seeded sheet should carry, chosen by the same
+    /// REML marginal likelihood the topology race scores with. `None` for
+    /// every other kind (including a flat `EuclideanPatch` winner, which is
+    /// installed as a duchon seed at the builder's default center budget).
+    pub n_duchon_centers: Option<usize>,
 }
 
 /// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
@@ -2938,6 +2946,7 @@ pub fn discover_primary_atom_topologies(
                 });
                 coords
             };
+            let mut sheet_coords: Option<Array2<f64>> = None;
             if max_dims[atom_idx] >= 2 {
                 // Flat 2-D patch: standardized leading principal projections.
                 let (sd0, sd1) = (cluster_sd(0), cluster_sd(1));
@@ -2957,8 +2966,38 @@ pub fn discover_primary_atom_topologies(
                     manifold: LatentManifold::Euclidean,
                     latent_dim: 2,
                     evaluator: Arc::new(evaluator),
-                    coords,
+                    coords: coords.clone(),
                 });
+                // #2240 — flexible thin-plate (Duchon) sheet over the SAME
+                // standardized 2-PC chart, with adaptive in-cluster centers:
+                // the rich 2-D candidate for swiss-roll-class factors a
+                // degree-2 patch cannot follow. It races as its OWN kind
+                // (`DuchonSheet`): it is not a fixed constant-curvature form,
+                // so the #944 Euclidean/Sphere fusion cannot absorb it —
+                // without it, any race that also carried a sphere candidate
+                // fused the flat patch away and left a rolled sheet NO
+                // admissible chart at all. A cluster too small to identify the
+                // thin-plate nullspace simply skips the candidate (the flat
+                // patch above stays as the sheet fallback).
+                if let Some(centers) =
+                    duchon_sheet_centers(&coords, &rows, duchon_sheet_race_center_budget(rows.len()))
+                {
+                    let evaluator = DuchonCoordinateEvaluator::new(centers, DUCHON_SHEET_M)
+                        .map_err(|error| {
+                            format!(
+                                "discover_primary_atom_topologies: duchon-sheet evaluator failed for auto atom {atom_idx}: {error}"
+                            )
+                        })?;
+                    specs.push(TopologyCandidateSpec {
+                        kind: AutoTopologyKind::DuchonSheet,
+                        basis_kind: SaeAtomBasisKind::Duchon,
+                        manifold: LatentManifold::Euclidean,
+                        latent_dim: 2,
+                        evaluator: Arc::new(evaluator),
+                        coords: coords.clone(),
+                    });
+                }
+                sheet_coords = Some(coords);
                 if n_pcs >= 3 {
                     // Sphere: (lat, lon) of the unit-normalized leading 3-frame.
                     let mut coords = Array2::<f64>::zeros((n_obs, 2));
@@ -3072,10 +3111,31 @@ pub fn discover_primary_atom_topologies(
             } else {
                 None
             };
+            // #2240 — for a Duchon-sheet winner, GROW the center count by the
+            // same REML evidence (the #2243 pattern lifted from harmonics to
+            // thin-plate centers): the race ran the sheet at the seed-economy
+            // budget only to discriminate topology; a tightly rolled sheet's
+            // fidelity is capped by that budget.
+            let n_duchon_centers = if fit.basis_kind == SaeAtomBasisKind::Duchon {
+                let coords = sheet_coords.as_ref().ok_or_else(|| {
+                    format!(
+                        "discover_primary_atom_topologies: duchon-sheet winner without a 2-D chart for auto atom {atom_idx}"
+                    )
+                })?;
+                Some(select_duchon_sheet_resolution(
+                    coords,
+                    target,
+                    weights.view(),
+                    &rows,
+                )?)
+            } else {
+                None
+            };
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit.basis_kind,
                 latent_dim: fit.latent_dim,
                 n_harmonics,
+                n_duchon_centers,
             })
         })
         .collect()
@@ -3111,6 +3171,134 @@ pub fn discover_primary_atom_topologies(
 /// band. `n_cluster` too small for even a single harmonic, or a target with no
 /// angular energy, returns an error (the caller surfaces it as a discovery
 /// failure rather than silently pinning a resolution).
+/// Duchon nullspace order `m` for the raced 2-D thin-plate sheet (#2240) —
+/// DERIVED (identity with the seed builder): mirrors the FFI seed path's
+/// `sae_duchon_atom_m(dim) = dim/2 + 2`, i.e. `m = 3` (degree-2 polynomial
+/// nullspace) at `dim = 2`, so the race scores the same function space the
+/// winning seed will build.
+const DUCHON_SHEET_M: usize = 3;
+
+/// Polynomial-nullspace dimension of the `DUCHON_SHEET_M` thin-plate sheet in
+/// 2-D — DERIVED: monomials of total degree ≤ 2 in two variables, `C(2+2, 2) =
+/// 6`. The center count must clear this for the kernel block to have positive
+/// rank.
+const DUCHON_SHEET_NULLSPACE_DIM: usize = 6;
+
+/// Race-time center budget for the 2-D Duchon-sheet candidate (#2240) —
+/// mirrors the seed builder's economy band (`sae_build_atom_plans`: floor
+/// `nullspace + d + 1`, dense ceiling 32) so the race scores the exact chart a
+/// default seed would build; the evidence ladder
+/// ([`select_duchon_sheet_resolution`]) then grows a WINNER past this budget.
+/// Returns 0 (no realizable candidate) when the cluster cannot identify the
+/// thin-plate nullspace.
+fn duchon_sheet_race_center_budget(n_cluster: usize) -> usize {
+    let floor = DUCHON_SHEET_NULLSPACE_DIM + 2 + 1;
+    if n_cluster <= floor {
+        return 0;
+    }
+    n_cluster.min(32).max(floor)
+}
+
+/// Deterministic adaptive centers for the Duchon-sheet candidate: `n_centers`
+/// evenly-strided IN-CLUSTER rows of the standardized 2-PC chart, so the
+/// thin-plate kernel is anchored where the factor's data actually lies
+/// (knot-at-data placement). `None` when the cluster cannot supply the
+/// requested count (the candidate is skipped, not degraded).
+fn duchon_sheet_centers(
+    coords: &Array2<f64>,
+    rows: &[usize],
+    n_centers: usize,
+) -> Option<Array2<f64>> {
+    if n_centers == 0 || rows.len() < n_centers {
+        return None;
+    }
+    let mut centers = Array2::<f64>::zeros((n_centers, 2));
+    for i in 0..n_centers {
+        // Even stride over the cluster's rows; i·len/n is strictly increasing
+        // in i for n ≤ len, so the selected rows are distinct.
+        let row = rows[i * rows.len() / n_centers];
+        centers[[i, 0]] = coords[[row, 0]];
+        centers[[i, 1]] = coords[[row, 1]];
+    }
+    Some(centers)
+}
+
+/// Evidence-driven center count for a Duchon-sheet primary winner (#2240 — the
+/// #2243 resolution-growth pattern lifted from circle harmonics to thin-plate
+/// centers). The topology race scored the sheet at the seed-economy budget
+/// only to discriminate topology; a swiss-roll-class factor's fidelity is
+/// capped by that budget, so the winner's center count is selected by the SAME
+/// proper closed-form REML marginal likelihood the race scores with
+/// (`fit_topology_candidate` → `raw_reml`, complexity-priced, lower is
+/// better), taking the GLOBAL evidence minimum over a dyadic ladder — the
+/// evidence need not be unimodal in resolution.
+///
+/// The ladder is bounded by two hard, data-derived limits (no tuned
+/// resolution constant): the seed-economy floor below and the identifiability
+/// ceiling `n_centers < n_cluster` (the Duchon design has one column per
+/// center, and a weighted REML cannot be identified with as many columns as
+/// the cluster has observations). The ceiling rung is always included so a
+/// near-noiseless factor can reach full resolution.
+fn select_duchon_sheet_resolution(
+    sheet_coords: &Array2<f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    rows: &[usize],
+) -> Result<usize, String> {
+    let floor = duchon_sheet_race_center_budget(rows.len());
+    if floor == 0 {
+        return Err(
+            "select_duchon_sheet_resolution: cluster too small to identify the thin-plate nullspace"
+                .to_string(),
+        );
+    }
+    let ceiling = rows.len().saturating_sub(1).max(floor);
+    let mut ladder: Vec<usize> = Vec::new();
+    let mut c = floor;
+    while c < ceiling {
+        ladder.push(c);
+        c = c.saturating_mul(2);
+    }
+    ladder.push(ceiling);
+    let mut best_c = 0usize;
+    let mut best_score = f64::INFINITY;
+    for &n_centers in &ladder {
+        let Some(centers) = duchon_sheet_centers(sheet_coords, rows, n_centers) else {
+            continue;
+        };
+        let evaluator = match DuchonCoordinateEvaluator::new(centers, DUCHON_SHEET_M) {
+            Ok(evaluator) => evaluator,
+            Err(_) => continue,
+        };
+        let spec = TopologyCandidateSpec {
+            kind: AutoTopologyKind::DuchonSheet,
+            basis_kind: SaeAtomBasisKind::Duchon,
+            manifold: LatentManifold::Euclidean,
+            latent_dim: 2,
+            evaluator: Arc::new(evaluator),
+            coords: sheet_coords.clone(),
+        };
+        // `raw_reml` is the proper REML evidence (lower is better) on a common
+        // `n_obs`, so comparing it directly selects the same resolution the
+        // race machinery would (see `select_periodic_resolution`).
+        let score = match fit_topology_candidate(&spec, target, weights) {
+            Ok(evidence) => evidence.raw_reml,
+            Err(_) => continue,
+        };
+        if score.is_finite() && score < best_score {
+            best_score = score;
+            best_c = n_centers;
+        }
+    }
+    if best_c == 0 {
+        return Err(
+            "select_duchon_sheet_resolution: no fittable center count for the duchon-sheet winner"
+                .to_string(),
+        );
+    }
+    Ok(best_c)
+}
+
 fn select_periodic_resolution(
     circle_coords: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
@@ -3203,6 +3391,11 @@ fn select_periodic_resolution(
 /// * a flat 2-D winner builds the expressive thin-plate (`duchon`) chart
 ///   rather than the degree-2 patch the race scored with — same topology,
 ///   strictly richer basis for the seeded atom;
+/// * a Duchon-sheet winner (#2240, the rich swiss-roll-class chart raced as
+///   its own candidate) installs as `duchon` and carries its evidence-selected
+///   center count in the returned per-atom override vector, so the seed
+///   builder grows the thin-plate resolution REML picked rather than its
+///   fixed economy budget;
 /// * a circle winner carries the harmonic resolution the fit-entry evidence
 ///   race selected (#2243), installed as the periodic atom's `d_atom` (the seed
 ///   builder's harmonic-count knob) so discovery grows resolution rather than
@@ -3210,12 +3403,16 @@ fn select_periodic_resolution(
 /// * any discovery failure is returned. Auto mode never silently substitutes
 ///   the old periodic default; callers that require a fixed topology must name
 ///   that topology explicitly.
+///
+/// Returns the per-atom Duchon center-count overrides (aligned with
+/// `atom_basis`; `None` everywhere except Duchon-sheet winners), for the seed
+/// plan builder to honor.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
     atom_basis: &mut [String],
     atom_dim: &mut [usize],
-) -> Result<(), String> {
+) -> Result<Vec<Option<usize>>, String> {
     let k_atoms = atom_basis.len();
     if atom_dim.len() != k_atoms {
         return Err(format!(
@@ -3223,8 +3420,9 @@ pub fn resolve_auto_primary_atoms(
             atom_dim.len()
         ));
     }
+    let mut duchon_center_overrides: Vec<Option<usize>> = vec![None; k_atoms];
     if !atom_basis.iter().any(|basis| basis == "auto") {
-        return Ok(());
+        return Ok(duchon_center_overrides);
     }
     let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim)?;
     for atom_idx in 0..k_atoms {
@@ -3249,6 +3447,15 @@ pub fn resolve_auto_primary_atoms(
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
             }
+            SaeAtomBasisKind::Duchon => {
+                // #2240 — the rich thin-plate sheet won the race outright.
+                // Install as a duchon seed and carry the evidence-selected
+                // center count so the seed builder grows the resolution REML
+                // picked (the #2243 pattern in 2-D).
+                atom_basis[atom_idx] = "duchon".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+                duchon_center_overrides[atom_idx] = choice.n_duchon_centers;
+            }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
                 // #2243 — install the evidence-selected harmonic resolution as
@@ -3269,7 +3476,7 @@ pub fn resolve_auto_primary_atoms(
             }
         }
     }
-    Ok(())
+    Ok(duchon_center_overrides)
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the

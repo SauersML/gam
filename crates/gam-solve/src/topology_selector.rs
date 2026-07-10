@@ -79,6 +79,13 @@ pub enum AutoTopologyKind {
     /// patch, so it races as its own discrete candidate — no curvature fusion
     /// applies to it.
     Mobius,
+    /// Flexible thin-plate (Duchon) 2-D sheet (#2240): topologically a plane,
+    /// but with UNRESTRICTED embedding curvature — the chart for
+    /// swiss-roll-class sheets a degree-2 flat patch cannot follow. It is not a
+    /// fixed constant-curvature space form (its curvature is neither constant
+    /// nor a single estimated κ), so the #944 Euclidean/Sphere fusion must not
+    /// absorb it: it races as its own discrete candidate.
+    DuchonSheet,
     /// Constant-curvature space form `M_κ` with the sectional curvature κ
     /// ESTIMATED (#944 stage 4). This single candidate replaces the family of
     /// fixed simply-connected constant-curvature geometries — `Euclidean`
@@ -119,6 +126,7 @@ impl AutoTopologyKind {
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
             AutoTopologyKind::Mobius => "mobius",
+            AutoTopologyKind::DuchonSheet => "duchon_sheet",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
             AutoTopologyKind::Union { structure } => structure.as_str(),
@@ -185,11 +193,14 @@ impl AutoTopologyKind {
             "sphere" | "s2" => Ok(AutoTopologyKind::Sphere),
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
+            "duchon" | "duchon_sheet" | "duchonsheet" | "thin_plate" | "thinplate" => {
+                Ok(AutoTopologyKind::DuchonSheet)
+            }
             "constant_curvature" | "curv" | "curvature" | "mkappa" | "m_kappa" => {
                 Ok(AutoTopologyKind::ConstantCurvature)
             }
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, constant_curvature, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }
