@@ -495,7 +495,6 @@ fn fit_stratum(
         min_firings: 32,
         max_blocks: args.curved_blocks,
         crossfit_folds: 2,
-        alpha: 0.10,
         min_effect: 0.0,
         whitening_ridge: 1.0e-8,
         pair_screen: false,
@@ -525,7 +524,7 @@ fn fit_stratum(
                 "chart_loss": record.evidence.chart_loss,
                 "deviance_gain": record.evidence.deviance_gain,
                 "margin": record.evidence.margin,
-                "accepted": record.evidence.accepted
+                "accepted": record.evidence.fdr_selected
             })
         })
         .collect::<Vec<_>>();
@@ -554,8 +553,10 @@ fn fit_stratum(
         "curved_base_ev": curved.explained_variance,
         "flat_epochs": flat.epochs,
         "curved_epochs": curved.epochs,
-        "flat_converged": flat.converged,
-        "curved_converged": curved.converged,
+        // A returned BlockSparseFit is converged by construction now
+        // (non-convergence is a typed error); report the certificate residuals.
+        "flat_ev_residual": flat.convergence.ev_residual,
+        "curved_ev_residual": curved.convergence.ev_residual,
         "selected_blocks": composed.selected_blocks,
         "accepted_blocks": composed.accepted_blocks,
         "n_chart_records": records.len(),
