@@ -748,6 +748,7 @@ fn solve_shift_ladder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
     fn next_uniform(state: &mut u64, lo: f64, hi: f64) -> f64 {
         let bits = splitmix64(state) >> 11;
