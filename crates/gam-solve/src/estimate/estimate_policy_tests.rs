@@ -6,8 +6,8 @@ use super::prefit::{
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;
-use gam_linalg::utils::{StableSolver, max_abs_diag};
 use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
+use gam_linalg::utils::{StableSolver, max_abs_diag};
 use gam_problem::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -716,7 +716,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
 
 fn decode_invariant_test_fit() -> UnifiedFitResult {
     UnifiedFitResult::try_from_parts(decode_invariant_test_parts())
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
 }
 
 #[test]

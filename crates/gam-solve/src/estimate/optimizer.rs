@@ -159,9 +159,7 @@ struct NegbinJointCheckpoint {
 /// point holds its Hessian and inverse workspace. Charging the whole set
 /// atomically prevents several individually acceptable p×p allocations from
 /// jointly exceeding the process-wide memory ledger.
-fn reserve_dense_covariance_bundle(
-    p: usize,
-) -> Option<gam_runtime::resource::MemoryReservation> {
+fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
     const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
     const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
@@ -2059,17 +2057,14 @@ where
     // covariance, influence, or smoothing-correction matrix is built.
     let mut dense_covariance_reservation = opts
         .compute_inference
-        .then(|| {
-            reserve_dense_covariance_bundle(pirls_res.reparam_result.qs.nrows())
-        })
+        .then(|| reserve_dense_covariance_bundle(pirls_res.reparam_result.qs.nrows()))
         .flatten();
-    let mut factorized_inference_reservation = if opts.compute_inference
-        && dense_covariance_reservation.is_none()
-    {
-        reserve_factorized_inference_state(pirls_res.reparam_result.qs.nrows())
-    } else {
-        None
-    };
+    let mut factorized_inference_reservation =
+        if opts.compute_inference && dense_covariance_reservation.is_none() {
+            reserve_factorized_inference_state(pirls_res.reparam_result.qs.nrows())
+        } else {
+            None
+        };
 
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
@@ -2464,28 +2459,28 @@ where
         // the factorised-Hessian path in PredictionCovarianceBackend::Factorized.
 
         // Attempt the full inverse when the bundle fits the policy budget.
-        let beta_covariance_unscaled: Option<Array2<f64>> =
-            if dense_covariance_reservation.is_some() {
-                match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
-                    Some(h_inv) => Some(h_inv),
-                    None => {
-                        log::warn!(
-                            "posterior covariance inversion failed (p={p_cov}): \
+        let beta_covariance_unscaled: Option<Array2<f64>> = if dense_covariance_reservation
+            .is_some()
+        {
+            match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
+                Some(h_inv) => Some(h_inv),
+                None => {
+                    log::warn!(
+                        "posterior covariance inversion failed (p={p_cov}): \
                          falling back to solve-on-demand standard errors"
-                        );
-                        // Release the optional 24-matrix live-set charge before
-                        // the chunked path asks the governor for workspaces,
-                        // then retain only the factor/precision state that is
-                        // genuinely still live.
-                        drop(dense_covariance_reservation.take());
-                        factorized_inference_reservation =
-                            reserve_factorized_inference_state(p_cov);
-                        None
-                    }
+                    );
+                    // Release the optional 24-matrix live-set charge before
+                    // the chunked path asks the governor for workspaces,
+                    // then retain only the factor/precision state that is
+                    // genuinely still live.
+                    drop(dense_covariance_reservation.take());
+                    factorized_inference_reservation = reserve_factorized_inference_state(p_cov);
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         if let Some(ref h_inv) = beta_covariance_unscaled {
             // Full inverse available: wrap as phi-scaled covariance, compute

@@ -603,8 +603,7 @@ impl OuterStationarityCertificate {
         match self {
             Self::AnalyticGradient { grad_norm, .. } => *grad_norm,
             Self::FixedPoint {
-                residual_inf_norm,
-                ..
+                residual_inf_norm, ..
             } => *residual_inf_norm,
         }
     }
@@ -700,7 +699,9 @@ impl OuterCriterionCertificate {
                 grad_norm,
                 projected_grad_norm,
                 bound,
-            } => format!("gradient |g|={grad_norm:.3e} |Pg|={projected_grad_norm:.3e} bound={bound:.3e}"),
+            } => format!(
+                "gradient |g|={grad_norm:.3e} |Pg|={projected_grad_norm:.3e} bound={bound:.3e}"
+            ),
             OuterStationarityCertificate::FixedPoint {
                 residual_inf_norm,
                 projected_residual_inf_norm,

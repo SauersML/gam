@@ -1,9 +1,7 @@
 use super::*;
 
 // Re-exported here while the shared EFS contract lives in `gam-problem`.
-pub use gam_problem::{
-    EfsEval, FixedPointCertificateEval, FixedPointCoordinateCertificate,
-};
+pub use gam_problem::{EfsEval, FixedPointCertificateEval, FixedPointCoordinateCertificate};
 
 /// Outcome of [`OuterObjective::seed_inner_state`].
 ///
@@ -726,12 +724,7 @@ pub struct ClosureObjective<
     /// `OuterObjective::eval_efs` returns an error.
     pub(crate) efs_fn: Option<Fefs>,
     pub(crate) fixed_point_certificate_fn: Option<
-        Box<
-            dyn FnMut(
-                &mut S,
-                &Array1<f64>,
-            ) -> Result<FixedPointCertificateEval, EstimationError>,
-        >,
+        Box<dyn FnMut(&mut S, &Array1<f64>) -> Result<FixedPointCertificateEval, EstimationError>>,
     >,
     /// Optional seed-screening ranking proxy closure. When `None`,
     /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
@@ -854,10 +847,7 @@ where
 {
     pub fn with_fixed_point_certificate<Fcert>(mut self, certificate_fn: Fcert) -> Self
     where
-        Fcert: FnMut(
-                &mut S,
-                &Array1<f64>,
-            ) -> Result<FixedPointCertificateEval, EstimationError>
+        Fcert: FnMut(&mut S, &Array1<f64>) -> Result<FixedPointCertificateEval, EstimationError>
             + 'static,
     {
         self.fixed_point_certificate_fn = Some(Box::new(certificate_fn));

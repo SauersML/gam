@@ -579,6 +579,116 @@ fn plan_cost_only_many_params_with_fixed_point_still_efs() {
 }
 
 #[test]
+fn no_gradient_efs_requires_and_accepts_explicit_full_coverage_certificate() {
+    let n = 9;
+    let center = Array1::from_elem(n, 0.25);
+    let problem = OuterProblem::new(n)
+        .with_gradient(Derivative::Unavailable)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(Array1::zeros(n))
+        .with_max_iter(8)
+        .with_tolerance(1.0e-8);
+    let step_center = center.clone();
+    let proof_center = center.clone();
+    let mut objective = problem
+        .build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| {
+                let d = rho - &center;
+                Ok(0.5 * d.dot(&d))
+            },
+            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
+            None::<fn(&mut ())>,
+            Some(move |_: &mut (), rho: &Array1<f64>| {
+                let update = &step_center - rho;
+                Ok(EfsEval {
+                    cost: 0.5 * update.dot(&update),
+                    steps: update.to_vec(),
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                })
+            }),
+        )
+        .with_fixed_point_certificate(move |_: &mut (), rho: &Array1<f64>| {
+            let update = &proof_center - rho;
+            Ok(FixedPointCertificateEval {
+                cost: 0.5 * update.dot(&update),
+                coordinates: update
+                    .iter()
+                    .map(|&value| FixedPointCoordinateCertificate::covered(value, 1.0))
+                    .collect(),
+            })
+        });
+    let result = problem
+        .run(&mut objective, "explicit fixed-point certificate")
+        .expect("fully covered analytic fixed point must certify");
+    assert_eq!(result.plan_used.solver, Solver::Efs);
+    assert!(matches!(
+        result.converged_via,
+        Some(OuterConvergedVia::FixedPointStationary { .. })
+    ));
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|certificate| certificate.stationarity.is_fixed_point())
+    );
+}
+
+#[test]
+fn no_gradient_efs_refuses_guarded_zero_as_uncovered_certificate() {
+    let n = 9;
+    let problem = OuterProblem::new(n)
+        .with_gradient(Derivative::Unavailable)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(Array1::zeros(n))
+        .with_max_iter(2);
+    let mut objective = problem
+        .build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(0.0),
+            |_: &mut (), rho: &Array1<f64>| Ok(OuterEval::value_only(0.0, rho.len(), None)),
+            None::<fn(&mut ())>,
+            Some(|_: &mut (), rho: &Array1<f64>| {
+                Ok(EfsEval {
+                    cost: 0.0,
+                    steps: vec![0.0; rho.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                })
+            }),
+        )
+        .with_fixed_point_certificate(|_: &mut (), rho: &Array1<f64>| {
+            let mut coordinates =
+                vec![FixedPointCoordinateCertificate::covered(0.0, 1.0); rho.len()];
+            coordinates[3] = FixedPointCoordinateCertificate::uncovered(
+                "guard held; no root-equivalent update exists",
+            );
+            Ok(FixedPointCertificateEval {
+                cost: 0.0,
+                coordinates,
+            })
+        });
+    let error = problem
+        .run(&mut objective, "uncovered fixed-point coordinate")
+        .expect_err("an uncovered guarded zero must never certify");
+    assert!(
+        error
+            .to_string()
+            .contains("lacks root-equivalent analytic coverage"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn plan_no_gradient_with_declared_hessian_stays_bfgs() {
     // Contradictory capability (Hessian declared but no gradient) keeps the
     // Bfgs reject-with-context path.
@@ -3063,7 +3173,6 @@ fn parsimonious_keep_best_breaks_laml_tie_toward_more_smoothing() {
         Some(&parsimonious),
         rho_dim,
     ));
-
 }
 
 /// #1575: the parsimony-await second-seed waiver fires ONLY for a slot-0 result

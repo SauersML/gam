@@ -48,7 +48,11 @@ impl Certificate for OuterCriterionCertificate {
 
     fn evidence(&self) -> Evidence {
         let mut e = Evidence::new();
-        put_finite(&mut e, "stationarity_raw_norm", self.stationarity.raw_norm());
+        put_finite(
+            &mut e,
+            "stationarity_raw_norm",
+            self.stationarity.raw_norm(),
+        );
         put_finite(
             &mut e,
             "stationarity_projected_norm",

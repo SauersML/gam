@@ -386,10 +386,7 @@ impl ResponseGeometryModel {
     /// Predict tangent coordinates from the supplied already-materialized
     /// template design. Geometry exp-map dispatch intentionally remains in the
     /// geometry/FFI layer.
-    pub fn predict_tangent(
-        &self,
-        design: &DesignMatrix,
-    ) -> Result<Array2<f64>, EstimationError> {
+    pub fn predict_tangent(&self, design: &DesignMatrix) -> Result<Array2<f64>, EstimationError> {
         self.shared_tangent_fit.predict(design)
     }
 }
@@ -472,11 +469,12 @@ pub fn fit_shared_tangent_reml(
             Array1::<f64>::zeros(0),
             0,
             OuterCriterionCertificate {
-                stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                    grad_norm: 0.0,
-                    projected_grad_norm: 0.0,
-                    bound: 0.0,
-                },
+                stationarity:
+                    gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                        grad_norm: 0.0,
+                        projected_grad_norm: 0.0,
+                        bound: 0.0,
+                    },
                 hessian_psd: Some(true),
                 lambdas_railed: Vec::new(),
             },

@@ -2387,6 +2387,31 @@ fn compact_glued_atoms(
         .collect();
     let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for ((a, b, outcome), seam) in accepted_glues.into_iter().zip(seams) {
+        // Sphere pole seam: register the ambient rotation, remove nothing (both
+        // charts are kept as one atlas atom). The 1-D seam fit is `None` here.
+        if is_sphere_pair(term, a, b) {
+            if !matches!(outcome, ChartGlueOutcome::RegisterAtlas) {
+                return Err(format!(
+                    "compact_glued_atoms: sphere pole seam ({a},{b}) cannot be destructively fused"
+                ));
+            }
+            let sphere = fit_sphere_seam_transition(term, a, b).ok_or_else(|| {
+                format!("compact_glued_atoms: accepted sphere seam ({a},{b}) is no longer identifiable")
+            })?;
+            if !matches!(sphere.seam_kind, AtlasSeamKind::Pole) {
+                return Err(format!(
+                    "compact_glued_atoms: sphere seam ({a},{b}) lost its pole classification"
+                ));
+            }
+            let transition =
+                SphereChartTransition::new(b, a, sphere.rotation, AtlasSeamKind::Pole)?;
+            if term.charts_share_atlas(a, b) {
+                term.refresh_sphere_chart_transition(transition)?;
+            } else {
+                term.register_sphere_chart_transition(transition)?;
+            }
+            continue;
+        }
         let seam = seam.ok_or_else(|| {
             format!("compact_glued_atoms: accepted seam ({a},{b}) is no longer identifiable")
         })?;

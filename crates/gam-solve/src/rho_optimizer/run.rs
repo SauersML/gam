@@ -1212,11 +1212,8 @@ fn certify_fixed_point_optimality(
     }
 
     let solver_final_value = result.final_value;
-    let cost_agreement_bound = f64::EPSILON.sqrt()
-        * solver_final_value
-            .abs()
-            .max(evaluation.cost.abs())
-            .max(1.0);
+    let cost_agreement_bound =
+        f64::EPSILON.sqrt() * solver_final_value.abs().max(evaluation.cost.abs()).max(1.0);
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
     result.final_gradient = None;
@@ -1531,9 +1528,7 @@ pub(crate) fn certify_outer_optimality(
     // (criterion-flat, #2241).
     result.converged_via = match result.converged_via {
         Some(via @ OuterConvergedVia::RecurrentIncumbent { .. }) => Some(via),
-        _ if projected_grad_norm <= solver_bound => {
-            Some(OuterConvergedVia::GradientStationary)
-        }
+        _ if projected_grad_norm <= solver_bound => Some(OuterConvergedVia::GradientStationary),
         _ => Some(OuterConvergedVia::CriterionFlat {
             residual_grad_norm: projected_grad_norm,
             certificate_bound: stationarity_bound,

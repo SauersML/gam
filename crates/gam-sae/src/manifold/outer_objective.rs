@@ -1,5 +1,7 @@
 use super::*;
-use gam_solve::rho_optimizer::OuterResult;
+use gam_solve::rho_optimizer::{
+    FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
+};
 
 /// #1033 — temperature on the chart-geometry routing predictor's cosine-aligned
 /// logit `gate_logit_scale · ⟨x, γ̂⟩`. The alignment `⟨x, γ̂⟩` is on the natural
@@ -848,6 +850,17 @@ fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
         .max(plan.estimated_full_batch_bytes)
         .max(std::mem::size_of::<SaeManifoldTerm>());
     host_budget.saturating_sub(plan.estimated_direct_peak_bytes) / bytes_per_saved_state
+}
+
+/// The dense route exposes the exact joint-Hessian IFT gradient. The matrix-
+/// free route has only analytic EFS equations; its `eval()` zero vector exists
+/// for legacy startup plumbing and is never a derivative capability or proof.
+pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivative {
+    if plan.direct_logdet_admitted() {
+        Derivative::Analytic
+    } else {
+        Derivative::Unavailable
+    }
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
@@ -3424,6 +3437,7 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
 
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
+        let streaming_plan = self.term.streaming_plan();
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
@@ -3431,11 +3445,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             //    every assignment mode incl. IBP-MAP (#1006).
             //  * Matrix-free (dense evidence factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): no dense cache exists for the
-            //    IFT solve, so the fixed-point lane updates every ρ coordinate from
-            //    analytic inverse traces in one pass. The zero-gradient `eval`
-            //    result in that regime is startup-validation plumbing only; the
-            //    planner never uses it as a descent direction.
-            gradient: Derivative::Analytic,
+            //    IFT solve, so the fixed-point lane updates covered ρ coordinates
+            //    from analytic inverse traces in one pass. It explicitly declares
+            //    the gradient UNAVAILABLE; the zero-gradient `eval` result in that
+            //    regime is startup plumbing and can never certify a fit.
+            gradient: sae_outer_gradient_capability(streaming_plan),
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
