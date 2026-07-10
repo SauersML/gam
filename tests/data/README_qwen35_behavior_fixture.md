@@ -28,8 +28,8 @@ part of the recorded provenance, not a hidden approximation.
 - **Use:** `crates/gam-sae/src/manifold/tests_behavior_qwen_real.rs` — the
   unified behavior-anchored entry (`run_auto_sae_behavior_fit`) on real data.
 - **Full-width archive (4000 rows, acts_L10 + acts_L21 at 4096 dims, probs,
-  token ids, JSON provenance):** MSI
-  `/projects/standard/hsiehph/sauer354/qwen35_9b_joint_behavior.npz` (62 MB).
+  token ids, JSON provenance):** `qwen35_9b_joint_behavior.npz` (62 MB) in
+  the MSI project home.
 - **Regenerate:** the harvest script in-repo; any 24 GB GPU fits the 9B model.
   (The `msae_l17` 35B shards CANNOT supply this pair: no token ids, and the
   logit-lens readout at cached layer 23/40 measures near-uniform — top-63

@@ -5,8 +5,8 @@
 //! at the same 2000 WikiText token positions.
 //!
 //! Provenance: `tests/data/README_qwen35_behavior_fixture.md`; harvested by
-//! `scripts/qwen_joint_behavior_harvest.py`; full-width archive on MSI at
-//! `/projects/standard/hsiehph/sauer354/qwen35_9b_joint_behavior.npz`.
+//! `scripts/qwen_joint_behavior_harvest.py`; the full-width archive
+//! `qwen35_9b_joint_behavior.npz` lives in the MSI project home.
 
 use super::tests_olmo::{olmo_fixture_path, read_npy_f32_2d};
 use super::*;
