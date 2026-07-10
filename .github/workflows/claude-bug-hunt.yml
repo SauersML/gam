@@ -50,7 +50,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
           # Suppress the raw stream-json dump; a readable transcript of just
           # Claude's messages is rendered from execution_file after the run.
           show_full_output: false
