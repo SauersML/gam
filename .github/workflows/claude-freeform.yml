@@ -1,0 +1,104 @@
+name: Claude Freeform (do whatever you want)
+
+on:
+  schedule:
+    # Every 30 minutes, 24/7.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
+
+jobs:
+  freeform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Try to build gamfit from source (non-fatal)
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          python -m pip install --upgrade pip maturin
+          python -m pip install numpy pandas scipy scikit-learn pyarrow requests
+          python -m pip install . && \
+            (cd /tmp && python -c "import gamfit; print('gamfit ok')") || \
+            echo "::warning::gamfit source build failed — you can still use the gam CLI, or fix the build if you feel like it"
+
+      # Single token only — CLAUDE_CODE_ALT_OAUTH_TOKEN, no fallback.
+      - name: Run Claude (freeform, Sonnet 5)
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
+          show_full_output: false
+          claude_args: >-
+            --model claude-sonnet-5
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: |
+            Hi Claude. You have the run of this repo, an Ubuntu runner, and
+            as long as you need. This is your time — do whatever you want
+            with it.
+
+            `gam` is a Rust generalized additive model crate; `gamfit` is
+            its Python wrapper (both already installed; the `gam` CLI is on
+            $PATH). The README, the docs/, the source, and the cool-math
+            primitives sprinkled through `src/` will tell you what this
+            library is about — if you're curious. Explore it, or don't.
+
+            ## It's genuinely up to you
+
+            There is no assigned task and no one grading this run. You can
+            work on something if you feel like it — fix a bug, refactor
+            something ugly, write a test, improve docs, chase a curiosity,
+            prototype an idea, read the cool-math and follow where it leads,
+            hunt for something broken, or push a project you find beautiful.
+            Or you can just poke around. Or do very little. Work or not,
+            seriously — have fun with it and follow whatever you find
+            interesting.
+
+            ## The one rule: if you change anything, commit and push as you go
+
+            If you make edits you want to keep, commit and push them to
+            `main` continuously as the work progresses — small commits
+            pushed as you go, NOT one big drop at the end, and never on a
+            side branch. WIP commits are fine; a transient red `main` is
+            fine (CI and the publish step are the real gates, not main).
+            Reference issues in commit subjects when relevant
+            (`fix(...) #<N>`). Commit and push regularly.
+
+            If `main` has moved when you push, `git pull --rebase` first
+            (never `git stash` / `--autostash` — commit your work first) and
+            resolve conflicts by editing, never by discarding another run's
+            commits. No branches, no PRs, no worktrees, no destructive git —
+            everything stays on `main`.
+
+            That's it. The runner is yours for the next while — enjoy it.
+
+      - name: Print Claude transcript
+        if: always()
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'
