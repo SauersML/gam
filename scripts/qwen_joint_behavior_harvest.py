@@ -45,7 +45,9 @@ def main() -> None:
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--parquet", required=True)
     parser.add_argument("--rows", type=int, default=4000)
-    parser.add_argument("--layers", default="18,24", help="hidden_states indices to save")
+    parser.add_argument(
+        "--layers", default="auto", help="hidden_states indices to save, or 'auto' (n/3, 2n/3)"
+    )
     parser.add_argument("--top-v", type=int, default=64)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--out", required=True)
@@ -54,13 +56,28 @@ def main() -> None:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    layers = [int(x) for x in args.layers.split(",")]
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir, dtype=torch.bfloat16, device_map="cuda"
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir, dtype=torch.bfloat16, device_map="cuda"
+        )
+    except ValueError:
+        # Qwen3.5/3.6 checkpoints are multimodal ConditionalGeneration models;
+        # a text-only forward through them is still the plain causal LM.
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model_dir, dtype=torch.bfloat16, device_map="cuda"
+        )
     model.eval()
-    vocab = model.config.vocab_size
+    config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+    vocab = config.vocab_size
+    n_layers = config.num_hidden_layers
+    if args.layers == "auto":
+        layers = sorted({n_layers // 3, (2 * n_layers) // 3})
+    else:
+        layers = [int(x) for x in args.layers.split(",")]
+    print(f"model has {n_layers} layers; capturing hidden_states at {layers}", flush=True)
 
     acts: dict[int, list[np.ndarray]] = {layer: [] for layer in layers}
     prob_chunks: list[np.ndarray] = []
