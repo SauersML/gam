@@ -3835,7 +3835,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // while ibp_map (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
-        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
+        // #2234 budget rescue, gradient-lane edition: a budget-marker failure is
+        // retried ONCE — the failed attempt leaves an improved inner warm start,
+        // and the second call routinely certifies (measured: at the same ρ the
+        // cost lane converged to 1.13e3 through its rescue while this lane
+        // walled at 1e12, desyncing the (f, ∇f) pair the FD gate pins). Genuine
+        // non-PD classes fail both attempts and keep their wall semantics.
+        let first_attempt = self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho_state,
             self.registry.as_ref(),
@@ -3843,7 +3849,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
-        ) {
+        );
+        let attempt = match first_attempt {
+            Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
+                self.probe_telemetry.budget_rescued_value_probes += 1;
+                self.term.reml_criterion_with_cache(
+                    self.target.view(),
+                    &rho_state,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                )
+            }
+            other => other,
+        };
+        let (cost, loss, cache) = match attempt {
             Ok(evaluated) => evaluated,
             // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
             // complement joint Hessian) has no defined Laplace evidence at this ρ.
