@@ -8,9 +8,13 @@ const SMALL_MATRIX_SINGULAR_TOL: f64 = 1.0e-12;
 /// the rotation axis, avoiding a 0/0 at the identity rotation.
 const SO3_ANGLE_FLOOR: f64 = 1.0e-12;
 
-/// Tikhonov ridge added to the diagonal of `WᵀW` before inverting it for the
-/// orthogonal projector `P_perp`, keeping the small solve well-conditioned for
-/// near-rank-deficient atom bases.
+/// RELATIVE Tikhonov ridge added to the diagonal of `WᵀW` before inverting it
+/// for the orthogonal projector `P_perp`, keeping the small solve
+/// well-conditioned for near-rank-deficient atom bases. The ridge is scaled by
+/// the mean diagonal of `WᵀW` so the projector — and therefore the penalty —
+/// is exactly invariant under a pure rescaling `W ↦ c·W` of the atom basis
+/// (an absolute ridge would change `P_perp` with the gauge, the same
+/// scale-non-equivariance class as the whitening-ridge defect).
 const PROJECTION_WTW_RIDGE: f64 = 1.0e-6;
 
 /// Floor inside the ARD log-bandwidth penalty `½·ln(floor + bw²)`, bounding the
@@ -310,11 +314,16 @@ pub fn equivariant_penalty_value(
                 for d in 0..ambient_dim {
                     acc += w[[atom, d, r1]] * w[[atom, d, r2]];
                 }
-                if r1 == r2 {
-                    acc += PROJECTION_WTW_RIDGE;
-                }
                 wtw[r1][r2] = acc;
             }
+        }
+        // Scale-relative ridge: `ε·mean(diag WᵀW)` (floored at MIN_POSITIVE so a
+        // zero basis still inverts), making `P_perp` — and the whole penalty —
+        // invariant under the pure basis rescaling `W ↦ c·W`.
+        let diag_mean = (0..rep_dim).map(|r| wtw[r][r]).sum::<f64>() / rep_dim as f64;
+        let ridge = PROJECTION_WTW_RIDGE * diag_mean.max(f64::MIN_POSITIVE);
+        for (r, row) in wtw.iter_mut().enumerate() {
+            row[r] += ridge;
         }
         let inv = invert_small_matrix(&wtw, "equivariant_penalty_value WtW")?;
         for batch in 0..batches {
