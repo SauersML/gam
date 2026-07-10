@@ -1,0 +1,68 @@
+name: Rolling wheel (warm-start artifact)
+
+# Permanent warm-start: every push to main rebuilds the x86_64 manylinux wheel
+# and pins it to the rolling `wheel-latest` prerelease. Compute boxes (MSI,
+# cloud GPU nodes, laptops) download it in seconds instead of paying a 30-40
+# minute cold cargo build, and only fall back to building locally when this
+# workflow is red or they need an unpushed change:
+#
+#   gh release download wheel-latest --repo SauersML/gam -p 'gamfit-*.whl' -D dist/
+#   pip install --force-reinstall dist/gamfit-*.whl
+#
+# The wheel is built in a manylinux_2_28 container so it runs on MSI's Rocky 8
+# (glibc 2.28) as well as modern cloud images — a plain ubuntu-runner build
+# would tag manylinux_2_35 and refuse to install on the cluster. sccache keeps
+# rebuilds warm across runs. `concurrency` cancels superseded builds so only
+# the newest SHA spends minutes.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: wheel-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs consults git history (author guard / SPEC HEAD-diff check);
+          # a shallow clone with depth 2 keeps a parent commit available.
+          fetch-depth: 2
+
+      - name: Build manylinux_2_28 x86_64 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release -o dist -i python3.10
+          manylinux: 2_28
+          sccache: true
+
+      - name: Pin to rolling wheel-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/gamfit-*.whl)
+          gh release view wheel-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create wheel-latest --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Rolling main wheel" \
+              --notes "Continuously replaced by the newest green-main build. Not a versioned release."
+          gh release upload wheel-latest "$WHEEL" --repo "$GITHUB_REPOSITORY" --clobber
+          # Record provenance so consumers can verify what they downloaded.
+          echo "${GITHUB_SHA} $(sha256sum "$WHEEL")" > dist/WHEEL_PROVENANCE.txt
+          gh release upload wheel-latest dist/WHEEL_PROVENANCE.txt --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Also keep it as a run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamfit-wheel-${{ github.sha }}
+          path: dist/gamfit-*.whl
+          retention-days: 14
