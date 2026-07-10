@@ -756,7 +756,6 @@ pub fn fit_penalized_multinomial(
 /// Resolve a budget-exhausted fixed-λ softmax Newton solve: either the
 /// separation lane (escalate to the Firth/Jeffreys proper-prior refit) or the
 /// typed non-convergence error. Never mints a fit from the stalled iterate.
-#[allow(clippy::too_many_arguments)]
 fn handle_multinomial_fixed_lambda_stall(
     stall: crate::penalized_vector_glm::VectorGlmStall,
     design: ArrayView2<'_, f64>,

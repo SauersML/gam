@@ -774,8 +774,7 @@ pub struct AffineRemlProfile<'a> {
 }
 
 impl<'a> AffineRemlProfile<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+        pub fn new(
         gram_modes: &'a [f64],
         penalty_modes: &'a [f64],
         projected_rhs_squared: &'a [f64],

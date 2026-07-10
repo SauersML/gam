@@ -5853,8 +5853,7 @@ impl LinkWigglePosterior {
     }
 
     /// Creates a new link-wiggle posterior target.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+        pub fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,
@@ -6271,7 +6270,6 @@ impl HamiltonianTarget<Array1<f64>> for LinkWigglePosterior {
 }
 
 /// Runs NUTS sampling for joint (β_eta, β_wiggle) in a link-wiggle model.
-#[allow(clippy::too_many_arguments)]
 pub fn run_link_wiggle_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
@@ -7056,8 +7054,7 @@ struct JointBetaRhoPosterior {
 }
 
 impl JointBetaRhoPosterior {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
+        fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,
