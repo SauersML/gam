@@ -57,23 +57,21 @@ impl PolyaGamma {
     ///
     /// A Pólya–Gamma variate is strictly positive with a continuous density,
     /// so an exact `0.0`, a negative value, or a non-finite value can only be
-    /// a numerical artifact of the upstream sampler (an RNG endpoint hitting
-    /// the series loop, or the extreme-tilt tail-mass overflow — #2245
-    /// findings 26/27). Such artifacts are redrawn rather than returned; a
-    /// run of them is a broken sampler, not randomness, and panics with the
-    /// invariant that failed.
+    /// a numerical artifact of the upstream sampler. Rejecting those
+    /// measure-zero artifacts preserves the target distribution without a
+    /// finite retry budget. Non-finite tilts are rejected before entering the
+    /// upstream rejection sampler, where they would make its loop undefined.
     pub fn draw<R: Rng + ?Sized>(&self, rng: &mut R, tilt: f64) -> f64 {
-        const MAX_REDRAWS: usize = 64;
-        for _ in 0..MAX_REDRAWS {
+        assert!(
+            tilt.is_finite(),
+            "PG(1, c) requires a finite tilt, got {tilt}"
+        );
+        loop {
             let v = self.upstream.draw(&mut Rand08(rng), tilt);
             if v.is_finite() && v > 0.0 {
                 return v;
             }
         }
-        panic!(
-            "polya-gamma upstream sampler produced {MAX_REDRAWS} consecutive draws outside the \
-             strictly-positive PG(1, {tilt}) support — numerical invariant violated"
-        );
     }
 }
 
@@ -81,6 +79,7 @@ impl PolyaGamma {
 mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
+    use statrs::function::erf::erfc;
 
     fn empirical_mean(c: f64, n: usize, seed: u64) -> f64 {
         let pg = PolyaGamma::new();
@@ -116,6 +115,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "PG(1, c) requires a finite tilt")]
+    fn pg1_rejects_non_finite_tilt_before_calling_upstream() {
+        let pg = PolyaGamma::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        let _ = pg.draw(&mut rng, f64::NAN);
+    }
+
+    #[test]
     fn pg1_mean_matches_theory() {
         let n = 25_000;
         for (c, tol) in [(0.0, 0.05), (1.0, 0.10), (3.0, 0.10)] {
@@ -136,6 +143,74 @@ mod tests {
         } else {
             (c.sinh() - c) / (2.0 * c * c * c * (1.0 + c.cosh()))
         }
+    }
+
+    /// Exact `PG(1, 0)` CDF, evaluated from the two alternating Jacobi-series
+    /// representations on the side where each converges geometrically. If
+    /// `X ~ PG(1, 0)`, then `4X ~ J*(1, 0)`.
+    fn pg10_cdf(x: f64) -> f64 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        if x <= 1.0 / (2.0 * std::f64::consts::PI) {
+            loop {
+                let k = n as f64 + 0.5;
+                let term = 2.0 * erfc(k / (2.0 * x).sqrt());
+                sum += if n.is_multiple_of(2) { term } else { -term };
+                if term <= f64::EPSILON {
+                    break;
+                }
+                n += 1;
+            }
+            sum.clamp(0.0, 1.0)
+        } else {
+            loop {
+                let k = n as f64 + 0.5;
+                let term = 2.0 / (std::f64::consts::PI * k)
+                    * (-2.0 * std::f64::consts::PI.powi(2) * k * k * x).exp();
+                sum += if n.is_multiple_of(2) { term } else { -term };
+                if term <= f64::EPSILON {
+                    break;
+                }
+                n += 1;
+            }
+            (1.0 - sum).clamp(0.0, 1.0)
+        }
+    }
+
+    #[test]
+    fn pg10_distribution_matches_exact_cdf() {
+        let sample_count = 20_000usize;
+        let pg = PolyaGamma::new();
+        let mut rng = StdRng::seed_from_u64(0xD15C_1CDF);
+        let mut samples: Vec<f64> = (0..sample_count).map(|_| pg.draw(&mut rng, 0.0)).collect();
+        samples.sort_by(f64::total_cmp);
+
+        let n = sample_count as f64;
+        let statistic = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &sample)| {
+                let cdf = pg10_cdf(sample);
+                let empirical_below = i as f64 / n;
+                let empirical_through = (i + 1) as f64 / n;
+                (cdf - empirical_below)
+                    .abs()
+                    .max((empirical_through - cdf).abs())
+            })
+            .fold(0.0_f64, f64::max);
+
+        // Dvoretzky–Kiefer–Wolfowitz: P(D_n > epsilon) <=
+        // 2 exp(-2 n epsilon²). Use a one-in-a-million false-rejection bound.
+        let false_rejection_probability = 1e-6_f64;
+        let critical = (-(false_rejection_probability / 2.0).ln() / (2.0 * n)).sqrt();
+        assert!(
+            statistic <= critical,
+            "PG(1,0) one-sample KS statistic {statistic} exceeds DKW critical value {critical}",
+        );
     }
 
     #[test]
