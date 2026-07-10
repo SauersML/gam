@@ -2375,9 +2375,9 @@ where
             // strongly right-skewed, so the band is built from equal-tailed
             // Gamma quantiles (moment-matched predictive), not a symmetric
             // `μ ± z·σ` band that mis-covers each tail (#817).
-            let Some(phi) = source.observation_phi() else {
+            if source.observation_phi().is_none() {
                 return (None, None);
-            };
+            }
             // E[Var(Y|μ)] = φ(m² + Var(μ)) (the plug-in φm² omitted φ·Var(μ)).
             let response_var = family_response_variance(
                 response,
@@ -2399,9 +2399,9 @@ where
             // Tweedie/Gamma arms above. A raw covariance without a fitted
             // precision hint has no valid observation interval; using the seed
             // made the response-noise term `μ(1−μ)/2` for high-precision data.
-            let Some(phi) = source.observation_phi() else {
+            if source.observation_phi().is_none() {
                 return (None, None);
-            };
+            }
             // Beta is continuous on (0,1) and skewed toward whichever edge its
             // mean is near, so a symmetric band mis-covers BOTH tails (#1194).
             // Build the edges from equal-tailed quantiles of a moment-matched

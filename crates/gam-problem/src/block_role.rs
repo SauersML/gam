@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Role of a coefficient block within a multi-parameter model.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockRole {
     /// Single-parameter GAM (standard GLM/GAM mean model).
     Mean,
