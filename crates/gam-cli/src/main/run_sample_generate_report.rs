@@ -973,10 +973,30 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         converged: true,
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
+            let stationarity = match &cert.stationarity {
+                gam::model_types::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm,
+                    projected_grad_norm,
+                    bound,
+                } => report::CriterionStationarityRow::AnalyticGradient {
+                    grad_norm: *grad_norm,
+                    projected_grad_norm: *projected_grad_norm,
+                    bound: *bound,
+                },
+                gam::model_types::OuterStationarityCertificate::FixedPoint {
+                    residual_inf_norm,
+                    projected_residual_inf_norm,
+                    bound,
+                    covered_coordinates,
+                } => report::CriterionStationarityRow::FixedPoint {
+                    residual_inf_norm: *residual_inf_norm,
+                    projected_residual_inf_norm: *projected_residual_inf_norm,
+                    bound: *bound,
+                    covered_coordinates: *covered_coordinates,
+                },
+            };
             report::CriterionCertificateRow {
-                grad_norm: cert.stationarity.raw_norm(),
-                projected_grad_norm: cert.stationarity.projected_norm(),
-                stationarity_bound: cert.stationarity.bound(),
+                stationarity,
                 hessian_psd: cert.hessian_psd,
                 lambdas_railed: cert.lambdas_railed.clone(),
                 stationary: cert.is_stationary(),

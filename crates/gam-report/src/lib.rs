@@ -70,15 +70,54 @@ pub struct SmoothingForensicsRow {
     pub seed_screening: Vec<String>,
 }
 
-/// First-order optimality certificate row (#934, post-FD-purge): the fit's
-/// analytic KKT self-audit at the returned optimum — raw and bound-projected
-/// gradient norms against the stationarity bound, plus curvature-definiteness
-/// and λ-rail facts. `stationary` / `clean` are precomputed verdicts so the
-/// renderer never re-derives policy.
+/// First-order optimality evidence carried into a rendered report.
+///
+/// Matrix-free EFS fits are certified by explicit root-equivalent fixed-point
+/// equations rather than a gradient. Keeping the proof kind in the report row
+/// prevents those residuals from being mislabeled as gradient evidence.
+pub enum CriterionStationarityRow {
+    AnalyticGradient {
+        grad_norm: f64,
+        projected_grad_norm: f64,
+        bound: f64,
+    },
+    FixedPoint {
+        residual_inf_norm: f64,
+        projected_residual_inf_norm: f64,
+        bound: f64,
+        covered_coordinates: usize,
+    },
+}
+
+impl CriterionStationarityRow {
+    fn rendered_metrics(&self, stationary: bool) -> String {
+        let relation = if stationary { "\u{2264}" } else { ">" };
+        match self {
+            Self::AnalyticGradient {
+                grad_norm,
+                projected_grad_norm,
+                bound,
+            } => format!(
+                "|g|={grad_norm:.3e}, |Pg|={projected_grad_norm:.3e} {relation} bound={bound:.3e}"
+            ),
+            Self::FixedPoint {
+                residual_inf_norm,
+                projected_residual_inf_norm,
+                bound,
+                covered_coordinates,
+            } => format!(
+                "fixed-point |r|\u{221e}={residual_inf_norm:.3e}, |Pr|\u{221e}={projected_residual_inf_norm:.3e} {relation} bound={bound:.3e}, coordinates={covered_coordinates}"
+            ),
+        }
+    }
+}
+
+/// Optimality certificate row (#934, post-FD-purge): the fit's analytic KKT
+/// self-audit at the returned optimum, plus curvature-definiteness and λ-rail
+/// facts. `stationary` / `clean` are precomputed verdicts so the renderer never
+/// re-derives policy.
 pub struct CriterionCertificateRow {
-    pub grad_norm: f64,
-    pub projected_grad_norm: f64,
-    pub stationarity_bound: f64,
+    pub stationarity: CriterionStationarityRow,
     pub hessian_psd: Option<bool>,
     pub lambdas_railed: Vec<usize>,
     pub stationary: bool,
@@ -441,20 +480,15 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     if let Some(cert) = &input.criterion_certificate {
         let cert_value = if cert.clean {
             format!(
-                "<span class=\"conv-ok\">stationary</span> \
-                 (|g|={:.3e}, |Pg|={:.3e} \u{2264} bound={:.3e})",
-                cert.stationarity.raw_norm(),
-                cert.stationarity.projected_norm(),
-                cert.stationarity.bound()
+                "<span class=\"conv-ok\">stationary</span> ({})",
+                cert.stationarity.rendered_metrics(true)
             )
         } else {
             let mut flags = Vec::new();
             if !cert.stationary {
                 flags.push(format!(
-                    "non-stationary (|Pg|={:.3e} > bound={:.3e}, |g|={:.3e})",
-                    cert.stationarity.projected_norm(),
-                    cert.stationarity.bound(),
-                    cert.stationarity.raw_norm()
+                    "non-stationary ({})",
+                    cert.stationarity.rendered_metrics(false)
                 ));
             }
             if cert.hessian_psd == Some(false) {
