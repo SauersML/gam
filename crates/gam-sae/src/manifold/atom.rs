@@ -231,10 +231,6 @@ impl SaeAtomBasisKind {
     /// Dense candidate coordinates spanning compact latents for fixed-decoder
     /// out-of-sample projection. Unbounded/basis-linear latents return `None`
     /// because their PCA seed already lies in the convex training hull.
-    // Staged for the fixed-decoder OOS projection path (compact-latent chart
-    // sweep, #2240); not yet wired into a consumer. `allow(dead_code)` keeps the
-    // helper intact while the crate's `deny(warnings)` gate stays honest.
-    #[allow(dead_code)]
     pub(crate) fn projection_seed_grid(
         &self,
         latent_dim: usize,
@@ -271,7 +267,6 @@ impl SaeAtomBasisKind {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     use std::f64::consts::PI;
     let r = resolution.max(2);
@@ -287,7 +282,6 @@ pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f6
     Some(grid)
 }
 
-#[allow(dead_code)]
 pub(crate) fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     let r = resolution.max(2);
     let mut grid = Array2::<f64>::zeros((r * r, 2));
@@ -302,7 +296,6 @@ pub(crate) fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f6
     Some(grid)
 }
 
-#[allow(dead_code)]
 pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     // Sweep the periodic (circle) axis over one period in fraction-of-period
     // coordinates `[0, 1)`; hold the unbounded line axis at the hull-centered
@@ -316,7 +309,6 @@ pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<
     Some(grid)
 }
 
-#[allow(dead_code)]
 pub(crate) fn torus_projection_seed_grid(
     latent_dim: usize,
     resolution: usize,
