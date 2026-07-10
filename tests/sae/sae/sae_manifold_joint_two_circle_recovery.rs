@@ -397,7 +397,7 @@ fn run_production_fit(truth: &Truth, z: &Array2<f64>) -> (SaeManifoldTerm, Array
     let result = problem
         .run(&mut objective, "SAE manifold two-circle recovery")
         .expect("outer cascade must complete");
-    let fitted_term = objective.into_fitted().term;
+    let fitted_term = objective.into_fitted().expect("outer fit was evaluated").term;
     let assignments = fitted_term.assignment.assignments();
     (fitted_term, assignments, result.final_value)
 }
@@ -753,7 +753,7 @@ fn sae_two_circle_curvature_homotopy_entry_arrives_zero_reseed() {
         .clone();
 
     // Post-walk reconstruction R² at the certified η = 1 state.
-    let fitted_term = objective.into_fitted().term;
+    let fitted_term = objective.into_fitted().expect("outer fit was evaluated").term;
     let fitted = fitted_term.fitted();
     let mut ssr = 0.0;
     let mut sst = 0.0;

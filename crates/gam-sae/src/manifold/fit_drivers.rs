@@ -5900,8 +5900,8 @@ impl SaeManifoldTerm {
                     // any loss scale. Anything else (already-converged decoder, a
                     // round that traded data-fit for penalty, or a refit/projection
                     // failure) restores the pre-round state and stops.
-                    let accept_floor = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                        * (1.0 + best_objective.abs());
+                    let accept_floor =
+                        SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
                     match round {
                         Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                             best_objective = value;
@@ -5927,7 +5927,9 @@ impl SaeManifoldTerm {
                 .best_fit_incumbent
                 .as_ref()
                 .filter(|prior| self.matches_mutable_state(&prior.state))
-                .map_or(1, |prior| prior.consecutive_inner_restores.saturating_add(1));
+                .map_or(1, |prior| {
+                    prior.consecutive_inner_restores.saturating_add(1)
+                });
             self.best_fit_incumbent = Some(SaeFitIncumbent {
                 state: self.snapshot_mutable_state(),
                 consecutive_inner_restores,

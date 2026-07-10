@@ -2508,6 +2508,9 @@ impl SaeManifoldTerm {
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
             self.reclaim_border_hbb_workspace(&mut sys);
         }
+        if let Some(quotient) = self.beta_scale_gauge_quotient()? {
+            sys.set_beta_gauge_quotient(quotient)?;
+        }
         if let Some(deflation) = self
             .row_gauge_deflation_for_layout(row_layout.as_ref())
             .or_else(|| {

@@ -1578,14 +1578,12 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
 /// (issue #2011: python is a thin wrapper, no shadow math).
 ///
 /// `kind` is the canonical assignment token (`"softmax"`, `"ibp_map"`,
-/// or `"threshold_gate"`). `alpha` is read only
-/// for `"ibp_map"`, `threshold` only for the gate family; both are ignored by
-/// the others. Non-finite logits and unsupported kinds are surfaced as errors.
+/// or `"threshold_gate"`). `threshold` is read only for the gate family.
+/// Non-finite logits and unsupported kinds are surfaced as errors.
 pub fn activation_matrix_from_logits(
     logits: ArrayView2<'_, f64>,
     kind: &str,
     temperature: f64,
-    alpha: f64,
     threshold: f64,
 ) -> Result<Array2<f64>, String> {
     if !(temperature.is_finite() && temperature > 0.0) {
@@ -2024,11 +2022,7 @@ pub(crate) fn softmax_row_into(logits: ArrayView1<'_, f64>, temperature: f64, ou
     }
 }
 
-pub(crate) fn ibp_map_row_into(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-    out: &mut [f64],
-) {
+pub(crate) fn ibp_map_row_into(logits: ArrayView1<'_, f64>, temperature: f64, out: &mut [f64]) {
     for i in 0..logits.len() {
         out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
     }

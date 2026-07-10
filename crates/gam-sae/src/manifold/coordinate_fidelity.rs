@@ -1408,8 +1408,8 @@ pub fn prefer_candidate_state(
     if !incumbent_objective.is_finite() {
         return true;
     }
-    let scale = objective_rel_tol
-        * (1.0 + candidate_objective.abs().max(incumbent_objective.abs()));
+    let scale =
+        objective_rel_tol * (1.0 + candidate_objective.abs().max(incumbent_objective.abs()));
     if candidate_objective < incumbent_objective - scale {
         return true; // strictly lower penalized objective — the walk's own referee
     }
@@ -1494,8 +1494,7 @@ impl SaeManifoldTerm {
 mod coordinate_fidelity_tests {
     use super::*;
     use crate::manifold::{
-        SAE_FINAL_EV_DEGRADATION_TOL, SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,
-        SaeBasisEvaluator,
+        SAE_FINAL_EV_DEGRADATION_TOL, SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL, SaeBasisEvaluator,
     };
     use ndarray::{Array1, Array2, Array3, Array4, Array5, ArrayView2};
 

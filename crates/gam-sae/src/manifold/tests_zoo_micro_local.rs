@@ -6,9 +6,8 @@
 //! generator the MSI m12 job used — same kinds list) drives:
 //!
 //!  1. the FULL production outer cascade (`OuterProblem::run`, the exact FFI
-//!     entry) at the m12 budget (12 outer iterations, single PCA seed), timed
-//!     end to end — the wall that burned two 8-hour MSI jobs in
-//!     restore-incumbent churn before the basin-envelope wiring;
+//!     entry), timed for observation and required to return an analytic
+//!     convergence certificate;
 //!  2. the three-way OOS discriminator the zoo's `ours_rust` arm reports:
 //!     native train EV vs COLD re-encode(train) EV vs COLD encode(test) EV,
 //!     where the cold arms run the genuine frozen-decoder OOS solve
@@ -19,9 +18,8 @@
 //!     not data novelty); `cold(train) >> cold(test)` is a genuine
 //!     generalization gap.
 //!
-//! zz_measure discipline: eprintln the numbers; hard asserts are finiteness,
-//! fit-completes, and a GENEROUS wall bound that only trips on a pathological
-//! regression (the pre-envelope churn was ~100x over it).
+//! zz_measure discipline: eprintln elapsed measurements, but decide pass/fail
+//! only from convergence and fitted-state invariants.
 
 use super::tests_startup_validation_1782::{Topo, objective_and_seed};
 use ndarray::Array2;
@@ -94,8 +92,8 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
     let test = zoo_fixture("test_1500x48_f64le.bin", 1500, 48);
 
     // The m12 arm: K=12, top_k routing via softmax at the production default
-    // temperature, circle topology, 12 outer iterations, single PCA seed — the
-    // exact configuration whose MSI runs burned 8h walls in incumbent churn.
+    // temperature, circle topology, single PCA seed — the configuration whose
+    // MSI runs exposed incumbent churn.
     let (mut objective, seed) = objective_and_seed(
         train.view(),
         12,
@@ -104,9 +102,8 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
     );
     let n_params = seed.len();
     let t0 = Instant::now();
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_max_iter(12)
         .with_seed_config(gam_problem::SeedConfig {
             max_seeds: 1,
             seed_budget: 1,
@@ -114,12 +111,18 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
         })
         .run(&mut objective, "SAE manifold")
         .expect("zoo-micro full fit must not abort");
+    assert!(result.converged, "zoo fit must be analytically certified");
+    let certificate = result
+        .criterion_certificate
+        .as_ref()
+        .expect("converged zoo fit carries an analytic certificate");
+    assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
     let fit_secs = t0.elapsed().as_secs_f64();
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let native_fitted = fitted.term.fitted();
     let native_ev = global_ev(&train, &native_fitted.to_owned());
     eprintln!(
-        "[zoo-micro-local] FIT: {fit_secs:.1}s native_train_ev={native_ev:.4} (K=12, N=3000, p=48, 12 outer iters)"
+        "[zoo-micro-local] FIT: {fit_secs:.1}s native_train_ev={native_ev:.4} (K=12, N=3000, p=48)"
     );
 
     let cold_train_ev = cold_oos_ev(&fitted.term, &fitted.rho, &train, "re-encode(train)");
@@ -139,13 +142,5 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
         native_ev > 0.3,
         "zoo-micro native train EV {native_ev:.4} is below the signal floor — \
          the fit did not engage the planted mixture"
-    );
-    // Wall regression tripwire (GENEROUS): the pre-envelope churn burned 8h+
-    // without returning; a healthy micro fit is minutes. 30 min only trips on
-    // a pathological outer-loop regression.
-    assert!(
-        fit_secs < 1800.0,
-        "zoo-micro full fit took {fit_secs:.0}s — outer-loop churn regression \
-         (pre-basin-envelope this ran 8h+ without completing; see #2230)"
     );
 }

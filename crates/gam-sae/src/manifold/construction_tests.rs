@@ -444,8 +444,8 @@ mod exact_stationarity_solve_1418_tests {
             let ax = term
                 .apply_exact_hessian(&rho, target.view(), &cache, x)
                 .expect("A matvec");
-            let bx = apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view())
-                .expect("B matvec");
+            let bx =
+                apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view()).expect("B matvec");
             sae_inner(x, &ax) / sae_inner(x, &bx)
         };
 
@@ -457,10 +457,16 @@ mod exact_stationarity_solve_1418_tests {
         .expect("raw exact solve");
         let raw_mu = pencil_mu(&raw);
         assert!(
-            raw_mu < SAE_IFT_MIN_CURVATURE_FRACTION,
+            raw_mu > 0.0,
+            "fixture must be a stable near-null minimum, not a negative-curvature \
+             stationary point: raw pencil Rayleigh {raw_mu:.3e}"
+        );
+        assert!(
+            raw_mu < sae_ift_min_curvature_fraction(),
             "fixture must exercise the defect: raw solve pencil Rayleigh {raw_mu:.3e} \
-             should collapse below the {SAE_IFT_MIN_CURVATURE_FRACTION:.1e} floor \
-             (saturated gate produced no near-null direction — strengthen the fixture)"
+             should collapse below the {:.1e} floor \
+             (saturated gate produced no near-null direction — strengthen the fixture)",
+            sae_ift_min_curvature_fraction()
         );
 
         // The production solve deflates: identifiable-curvature fraction is
@@ -478,15 +484,16 @@ mod exact_stationarity_solve_1418_tests {
         );
         let deflated_mu = pencil_mu(&deflated);
         assert!(
-            deflated_mu >= SAE_IFT_MIN_CURVATURE_FRACTION,
+            deflated_mu >= sae_ift_min_curvature_fraction(),
             "deflated solve must remove the unidentifiable component: pencil Rayleigh \
-             {deflated_mu:.3e} still below the {SAE_IFT_MIN_CURVATURE_FRACTION:.1e} floor"
+             {deflated_mu:.3e} still below the {:.1e} floor",
+            sae_ift_min_curvature_fraction()
         );
         // Deflation only removes, never adds: the deflated solution is no
         // larger than the raw one in the B-metric.
         let b_norm = |x: &SaeArrowVector| -> f64 {
-            let bx = apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view())
-                .expect("B matvec");
+            let bx =
+                apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view()).expect("B matvec");
             sae_inner(x, &bx).max(0.0).sqrt()
         };
         assert!(

@@ -1354,19 +1354,47 @@ impl<'a, B: BatchedBlockSolver + Sync> ReducedSchurOperator<'a, B> {
     /// buffer per apply is correct (and the shift-ladder CG contract is upheld).
     #[inline]
     pub(crate) fn apply_into(&self, x: &Array1<f64>, out: &mut Array1<f64>) {
+        let Some(quotient) = self.sys.beta_gauge_quotient.as_ref() else {
+            if let Some(gpu) = self.gpu_matvec {
+                gpu(x, out);
+            } else {
+                schur_matvec(
+                    self.sys,
+                    self.htt_factors,
+                    self.ridge_beta,
+                    x,
+                    out,
+                    self.backend,
+                    self.resident,
+                );
+            }
+            return;
+        };
+
+        // Evidence operator on the quotient: `P S P + Q Q^T`.  Apply the
+        // original reduced Schur only to `P x`, project its result once more,
+        // then add the unit Faddeev--Popov pin. The same arithmetic is used by
+        // dense `pin_reduced_schur`, so SLQ/rational-logdet values and dense
+        // Cholesky values represent the identical operator.
+        let projected_x = quotient.project_complement(x.view());
         if let Some(gpu) = self.gpu_matvec {
-            gpu(x, out);
+            gpu(&projected_x, out);
         } else {
             schur_matvec(
                 self.sys,
                 self.htt_factors,
                 self.ridge_beta,
-                x,
+                &projected_x,
                 out,
                 self.backend,
                 self.resident,
             );
         }
+        let mut projected_out = quotient.project_complement(out.view());
+        for direction in quotient.directions.iter() {
+            projected_out.scaled_add(direction.dot(x), direction);
+        }
+        out.assign(&projected_out);
     }
 
     /// `S·v` into a fresh length-`k` vector — the shift-ladder matvec-closure form
@@ -2111,9 +2139,17 @@ fn reduced_schur_cg_solve<B: BatchedBlockSolver + Sync>(
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
         .with_gpu_matvec(gpu_matvec);
     let apply = |v: &Array1<f64>| -> Array1<f64> { op.apply_owned(v) };
-    let mut y = y0.clone();
-    let mut r = b - &apply(&y);
-    let b_norm = b.dot(b).sqrt().max(f64::MIN_POSITIVE);
+    let quotient = sys.beta_gauge_quotient.as_ref();
+    let b = match quotient {
+        Some(quotient) => quotient.project_complement(b.view()),
+        None => b.clone(),
+    };
+    let mut y = match quotient {
+        Some(quotient) => quotient.project_complement(y0.view()),
+        None => y0.clone(),
+    };
+    let mut r = &b - &apply(&y);
+    let b_norm = b.dot(&b).sqrt().max(f64::MIN_POSITIVE);
     let mut p = r.clone();
     let mut rs = r.dot(&r);
     if !rs.is_finite() {
@@ -2138,7 +2174,10 @@ fn reduced_schur_cg_solve<B: BatchedBlockSolver + Sync>(
         rs = rs_new;
         iters += 1;
     }
-    Some(y)
+    Some(match quotient {
+        Some(quotient) => quotient.project_complement(y.view()),
+        None => y,
+    })
 }
 
 /// Matrix-free single-rhs reduced-Schur solve `S⁻¹ rhs` (`t = 0`) via CG on

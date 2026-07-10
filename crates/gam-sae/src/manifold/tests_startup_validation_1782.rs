@@ -274,7 +274,7 @@ fn run_full_fit(
             // refusal as a finite collapse wall instead of `+∞`.
             panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
         });
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z, fitted.term.fitted().view());
     eprintln!("REPRO1782 {label} fit: ev={ev:.4}");
     assert!(

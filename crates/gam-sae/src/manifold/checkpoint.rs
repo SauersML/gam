@@ -100,10 +100,9 @@ impl SaeCheckpointFingerprint {
 }
 
 /// Outer termination-ledger counters carried across a resume. The wall clock is
-/// intentionally NOT persisted: a fresh job restarts its own wall (the ledger's
-/// forcing function measures *stalled evaluations*, not elapsed time — SPEC bans
-/// wall-clock budgets), but the eval/improvement tallies and the best cost
-/// continue so the non-convergence forcing function stays armed after a resume.
+/// intentionally NOT persisted: a fresh job restarts its own wall measurement
+/// (SPEC bans wall-clock budgets), while the evaluation/improvement tallies and
+/// best cost continue as checkpoint telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SaeCheckpointLedger {
     pub(crate) evals: u64,

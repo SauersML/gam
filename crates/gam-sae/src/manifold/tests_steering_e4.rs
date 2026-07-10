@@ -1,11 +1,14 @@
 //! E4 (gam#2234) — zoo ground-truth validation of the on-manifold steering
 //! primitive, no LLM, runs locally.
 //!
-//! A K=1 circle (periodic-harmonic) atom is fit on a PLANTED circle whose
-//! per-row angle `θ_i = 2π i / n` is known analytically. Steering the fitted
-//! atom's coordinate by the manifold group action `t ⊕ δ` (Circle phase add,
+//! A K=1 circle (periodic-harmonic) atom is fit on the circle-factor map
+//! used by `bench/bsf_manifold_zoo.py`: `m(θ) = (cos θ, sin θ) @ frame`.  The
+//! local `ZooCircleContrib` is the Rust test counterpart of the zoo generator's
+//! per-factor `contribs[i]` record and carries both the planted ambient
+//! contribution `m` and its known per-row `theta`. Steering the fitted atom's
+//! coordinate by the manifold group action `t ⊕ δ` (Circle phase add,
 //! [`LatentManifold::retract`]) must move the decoded reconstruction to the
-//! planted manifold point at `θ_i + Δ`:
+//! planted contribution at `theta + Δ`:
 //!
 //! * `δ = 0`      ⇒ an EXACTLY zero ambient delta (retraction is idempotent on
 //!                  the already-wrapped coordinates);
@@ -23,21 +26,21 @@ use super::tests_startup_validation_1782::{Topo, build_term};
 use super::*;
 use ndarray::{Array1, Array2, array};
 
-/// Deterministic pseudo-noise in `[-0.5, 0.5)` — reproducible without an RNG.
-fn det_noise(a: usize, b: usize) -> f64 {
-    let s = ((a as f64 + 1.0) * 12.9898 + (b as f64 + 1.0) * 78.233).sin() * 43758.5453;
-    s - s.floor() - 0.5
+/// Rust-side equivalent of one circle factor's zoo `contribs[i]` record.
+struct ZooCircleContrib {
+    /// Ambient planted contribution, corresponding to `contribs[i]["m"]`.
+    m: Array2<f64>,
+    /// Intrinsic angle in radians, corresponding to `contribs[i]["theta"]`.
+    theta: Array1<f64>,
+    /// The two orthonormal rows of the factor's ambient frame.
+    frame_cos: Array1<f64>,
+    frame_sin: Array1<f64>,
 }
 
-/// Plant a unit circle in a generic 2-plane of `ℝ^p` with known per-row angle
-/// `θ_i = 2π i / n`. Returns `(z, u, v)` where the NOISE-FREE manifold point at
-/// angle `φ` is `cos φ · u + sin φ · v` with `(u, v)` orthonormal — so the
-/// ground-truth steered point at `θ_i + Δ` is analytic and needs no refit.
-fn planted_circle_with_frame(
-    n: usize,
-    p: usize,
-    sigma: f64,
-) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+/// Draw a clean circle factor with known theta using the zoo's factor
+/// map. A deterministic equal-mass grid replaces RNG sampling so this local
+/// test is reproducible; it does not change the planted `theta -> m` law.
+fn zoo_circle_contrib(n: usize, p: usize) -> ZooCircleContrib {
     let mut u = Array1::<f64>::zeros(p);
     let mut v = Array1::<f64>::zeros(p);
     for j in 0..p {
@@ -54,37 +57,44 @@ fn planted_circle_with_frame(
     let vn = v.dot(&v).sqrt();
     v.mapv_inplace(|x| x / vn);
 
-    let mut z = Array2::<f64>::zeros((n, p));
+    let theta =
+        Array1::<f64>::from_shape_fn(n, |i| std::f64::consts::TAU * (i as f64 + 0.5) / n as f64);
+    let mut m = Array2::<f64>::zeros((n, p));
     for i in 0..n {
-        let theta = std::f64::consts::TAU * i as f64 / n as f64;
-        let (c, s) = (theta.cos(), theta.sin());
+        let (c, s) = (theta[i].cos(), theta[i].sin());
         for j in 0..p {
-            z[[i, j]] = c * u[j] + s * v[j] + sigma * det_noise(i, j);
+            m[[i, j]] = c * u[j] + s * v[j];
         }
     }
-    (z, u, v)
+    ZooCircleContrib {
+        m,
+        theta,
+        frame_cos: u,
+        frame_sin: v,
+    }
 }
 
-/// The analytic (noise-free) planted point at `θ_i + delta_theta` for every row.
-fn analytic_moved(u: &Array1<f64>, v: &Array1<f64>, n: usize, delta_theta: f64) -> Array2<f64> {
-    let p = u.len();
+/// Evaluate the same zoo factor at the planted `theta + delta_theta`.
+fn zoo_moved_contribution(contrib: &ZooCircleContrib, delta_theta: f64) -> Array2<f64> {
+    let n = contrib.theta.len();
+    let p = contrib.frame_cos.len();
     let mut out = Array2::<f64>::zeros((n, p));
     for i in 0..n {
-        let theta = std::f64::consts::TAU * i as f64 / n as f64 + delta_theta;
+        let theta = contrib.theta[i] + delta_theta;
         let (c, s) = (theta.cos(), theta.sin());
         for j in 0..p {
-            out[[i, j]] = c * u[j] + s * v[j];
+            out[[i, j]] = c * contrib.frame_cos[j] + s * contrib.frame_sin[j];
         }
     }
     out
 }
 
 #[test]
-fn zz_e4_circle_steer_matches_planted_moved() {
+fn zz_e4_zoo_circle_contrib_theta_steer_matches_planted_moved() {
     let n = 240usize;
     let p = 6usize;
-    let sigma = 0.01;
-    let (z, u, v) = planted_circle_with_frame(n, p, sigma);
+    let contrib = zoo_circle_contrib(n, p);
+    let z = &contrib.m;
 
     // K=1 circle atom, softmax assignment (a single-atom softmax gate is exactly
     // 1.0, so the gate leaves the decode untouched — the cleanest E4 baseline).
@@ -138,8 +148,8 @@ fn zz_e4_circle_steer_matches_planted_moved() {
     let steered = term
         .steer_decode(0, &rows, array![0.25].view())
         .expect("E4 steer δ=period/4");
-    let moved_plus = analytic_moved(&u, &v, n, quarter);
-    let moved_minus = analytic_moved(&u, &v, n, -quarter);
+    let moved_plus = zoo_moved_contribution(&contrib, quarter);
+    let moved_minus = zoo_moved_contribution(&contrib, -quarter);
     let r2_plus = global_ev(moved_plus.view(), steered.view());
     let r2_minus = global_ev(moved_minus.view(), steered.view());
     let r2 = r2_plus.max(r2_minus);

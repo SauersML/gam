@@ -197,19 +197,17 @@ pub struct AmortizedWarmStartTelemetry {
 }
 
 /// #2235 — outer termination ledger: one per fit, ticked by every criterion
-/// evaluation lane. PURE ACCOUNTING plus one FORCING FUNCTION:
+/// evaluation lane. This is pure accounting:
 ///
 /// * A fit object exists ONLY when the outer bridge concludes through its own
 ///   convergence/stopping logic. There is no freeze, no deadline-return, no
 ///   "best-effort fit" lane — an incomplete optimization must never mint a
 ///   consumable fit (that would remove all pressure to fix the solver; the
 ///   user's moral-hazard rule).
-/// * If the incumbent goes materially unimproved for a full stationarity
-///   window while the bridge KEEPS probing, that is a SOLVER DEFECT — the
-///   ledger raises a typed, non-recoverable error carrying the evidence
-///   (eval counts, window, best cost). The fit dies loudly; the defect gets
-///   fixed at the root. Wall-clock survival is the checkpoint/resume lane's
-///   job (persistent_warm_start), never a criterion freeze.
+/// * Convergence and non-convergence belong to the shared outer optimizer. This
+///   application ledger never substitutes an evaluation-count or wall-clock
+///   deadline for the optimizer's analytic certificate. Wall survival is the
+///   checkpoint/resume lane's job (`persistent_warm_start`).
 #[derive(Debug, Clone)]
 pub(crate) struct OuterTerminationLedger {
     /// Total criterion evaluations across all lanes.
@@ -230,15 +228,6 @@ impl OuterTerminationLedger {
             best_cost: None,
             wall_start: std::time::Instant::now(),
         }
-    }
-
-    /// Stationarity window: how many consecutive evaluations without material
-    /// improvement before the incumbent is declared outer-stationary. Reuses
-    /// the basin-bundle line-search derivation (two full line-search
-    /// directions' worth of probes — the same evidence the outer bridge needs
-    /// before it declares a neighbourhood dead), so no new constant.
-    fn stationarity_window() -> u64 {
-        basin_bundle_dominance_window()
     }
 
     /// Record one finite criterion value; returns `true` on a MATERIAL
@@ -264,10 +253,8 @@ impl OuterTerminationLedger {
         improved
     }
 
-    /// Resume accounting from a checkpoint: the eval/improvement tallies and
-    /// best cost continue across the wall so the #2235 forcing function stays
-    /// armed (the wall clock restarts — SPEC bans wall-clock budgets, and the
-    /// forcing function measures stalled evaluations, not elapsed time).
+    /// Resume accounting from a checkpoint. The wall clock restarts because it
+    /// is telemetry, never a solver deadline.
     pub(crate) fn seed_from_checkpoint(
         &mut self,
         evals: u64,
@@ -284,34 +271,9 @@ impl OuterTerminationLedger {
         (self.evals, self.last_improvement_eval, self.best_cost)
     }
 
-    /// Consult the ledger's FORCING FUNCTION: `Some(message)` when the
-    /// incumbent has gone materially unimproved for a full stationarity
-    /// window while the bridge kept probing — a solver defect the caller must
-    /// raise as a typed, NON-RECOVERABLE error (the fit must die loudly, not
-    /// mint a frozen "fit"). `None` while the walk is healthy. Requires a
-    /// banked best cost: the very first evaluations can never trip it.
-    pub(crate) fn stationarity_defect(&self) -> Option<String> {
-        let best = self.best_cost?;
-        let stalled = self.evals.saturating_sub(self.last_improvement_eval);
-        if stalled >= Self::stationarity_window() {
-            return Some(format!(
-                "SOLVER DEFECT (#2235): the outer search made no material improvement for \
-                 {stalled} consecutive criterion evaluations (window {}, total evals {}, \
-                 best cost {best:.6e}, wall {:.1?}) and the bridge did not conclude on its \
-                 own. A healthy fit terminates through the bridge's convergence logic; this \
-                 one wandered. Refusing to mint a fit from a non-converging optimization — \
-                 fix the driver/bridge composition defect this error is evidence of",
-                Self::stationarity_window(),
-                self.evals,
-                self.wall_start.elapsed()
-            ));
-        }
-        None
-    }
-
-    /// New multi-start seed: the stationarity window restarts (a fresh walk
-    /// deserves fresh evidence); the eval totals and wall clock are fit-global.
-    pub(crate) fn reset_stationarity(&mut self) {
+    /// New multi-start seed: start its improvement telemetry at the current
+    /// count; total evaluations and wall measurement remain fit-global.
+    pub(crate) fn reset_improvement_baseline(&mut self) {
         self.last_improvement_eval = self.evals;
     }
 
@@ -1250,10 +1212,7 @@ impl SaeManifoldOuterObjective {
     /// ledger counters, and returns the banked outer ρ to open the search at.
     /// Any incompatibility or install failure is logged and the fit proceeds
     /// cold — a checkpoint can improve a fit, never break one.
-    pub(crate) fn try_resume_from_checkpoint(
-        &mut self,
-        expected_rho_len: usize,
-    ) -> Option<Vec<f64>> {
+    pub fn try_resume_from_checkpoint(&mut self, expected_rho_len: usize) -> Option<Vec<f64>> {
         if !self.checkpoint_path.exists() {
             return None;
         }
@@ -1296,7 +1255,7 @@ impl SaeManifoldOuterObjective {
     /// Remove the banked checkpoint after a CONVERGED fit is minted: its
     /// purpose is wall survival of an in-flight optimization, not cross-fit
     /// caching (`persistent_warm_start` covers that). Best-effort.
-    pub(crate) fn remove_checkpoint(&self) {
+    pub fn remove_checkpoint(&self) {
         if self.checkpoint_path.exists()
             && let Err(e) = std::fs::remove_file(&self.checkpoint_path)
         {
@@ -1420,9 +1379,10 @@ impl SaeManifoldOuterObjective {
         self.warm_start_telemetry.record(&outcome);
     }
 
-    /// Consume the objective, returning the inner-fitted term, the last rho the
-    /// engine evaluated, and the inner loss breakdown at that rho.
-    pub fn into_fitted(self) -> SaeIntoFittedResult {
+    /// Consume a converged objective, returning the exact certified `(term, ρ)`
+    /// pair and its inner loss. A never-evaluated objective is an error: only a
+    /// completed fixed-ρ solve or a certified outer search may mint a fit.
+    pub fn into_fitted(self) -> Result<SaeIntoFittedResult, String> {
         // #2235 — capture the termination ledger before `self` is consumed.
         // A search-lane objective carries the converged-via certificate stamped
         // by `certify_outer_stage`; its absence means no outer search ran here
@@ -1432,211 +1392,28 @@ impl SaeManifoldOuterObjective {
             None => SaeOuterVerdict::FixedRho,
         });
         let Self {
-            mut term,
-            mut baseline_term,
+            term,
             target,
             registry,
             current_rho,
-            baseline_rho,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
             last_loss,
             ..
         } = self;
-        let pristine_seed_term = baseline_term.clone();
-        let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
-        let last_loss = last_loss;
-        // Fit-level keep-best consult (`best_fit_incumbent`): if the terminal
-        // outer state reconstructs strictly worse than the best basin any
-        // accepted iterate visited during the WHOLE ρ search, restore that basin
-        // BEFORE the seed-vs-settled arbitration below, so every downstream
-        // guard (seed refit, pristine-seed comparison, canonicalization) sees
-        // the search's real best rather than its last collapse. The banked
-        // snapshot is row-count bound to this term, so the restore is always
-        // shape-consistent.
-        let mut fit_incumbent_restored = false;
-        if let Some(SaeFitIncumbent {
-            ev: incumbent_ev,
-            uniformity: _incumbent_uniformity,
-            state: incumbent_state,
-            ..
-        }) = term.best_fit_incumbent.take()
-        {
-            let terminal_ev = term
-                .try_fitted_for_rho(&fitted_rho)
-                .ok()
-                .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
-            let restore = match terminal_ev {
-                Some(current_ev) => {
-                    incumbent_ev.is_finite()
-                        && current_ev.is_finite()
-                        && current_ev + SAE_FINAL_EV_DEGRADATION_TOL < incumbent_ev
-                }
-                None => incumbent_ev.is_finite(),
-            };
-            if restore {
-                log::warn!(
-                    "[#1026] restoring FIT-LEVEL reconstruction incumbent: terminal state \
-                     EV={terminal_ev:?} vs best-visited EV={incumbent_ev:.4} across the outer \
-                     ρ search"
-                );
-                // `into_fitted` has no error channel; a differential restore only
-                // fails if the basis re-evaluation fails on the restored coords
-                // (not reachable for a state that produced a valid incumbent).
-                // Report success honestly rather than swallowing a rebuild error.
-                match term.restore_mutable_state(&incumbent_state) {
-                    Ok(()) => fit_incumbent_restored = true,
-                    Err(err) => log::warn!(
-                        "[#1026] fit-level incumbent restore failed to rebuild basis ({err}); \
-                         keeping terminal state"
-                    ),
-                }
-            }
-        }
-        let mut loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
-            data_fit: 0.0,
-            assignment_sparsity: 0.0,
-            smoothness: 0.0,
-            ard: 0.0,
-            evidence_gauge_deflated_directions: 0,
-        });
-        // The terminal `last_loss` described the pre-restore state; re-read the
-        // frozen-state loss at the settled ρ so the reported loss matches the
-        // restored incumbent.
-        if fit_incumbent_restored && let Ok(recomputed) = term.loss(target.view(), &fitted_rho) {
-            loss = recomputed;
-        }
-        // Basin guard against the multi-atom routing-collapse failure mode
-        // (#629 #630). The outer ρ cascade mutates `term` cumulatively across
-        // candidate ρ evaluations and never restores it between evals, so a
-        // single ill-conditioned ρ poll can drag the per-row routing off the
-        // decisive seed basin (the EM routing-seed / decoder-projection start)
-        // into the near-uniform saddle. The settled `term` then reports that
-        // collapsed routing even though the seed basin reconstructs the data
-        // far better. `baseline_term` preserves the pristine seeded geometry;
-        // re-solve the inner joint fit from it at the SAME settled ρ the engine
-        // selected (smoothing choice is untouched) and keep the seed-basin state
-        // when it wins either the penalized objective OR the reconstruction EV.
-        // The EV tie-breaker is deliberately load-bearing for real activations:
-        // a collapsed/rank-deficient outer walk can return a lower Laplace score
-        // by pinning the quotient/curvature normalizer while losing the actual
-        // reconstruction the SAE is fitted to provide.
-        let settled_objective =
-            term.penalized_objective_total(target.view(), &fitted_rho, registry.as_ref(), 1.0);
-        let mut rho_seed = fitted_rho.clone();
-        let seed_solve = match baseline_term.streaming_plan().admitted_or_error(
-            baseline_term.n_obs(),
-            baseline_term.output_dim(),
-            baseline_term.k_atoms(),
-        ) {
-            Ok(plan)
-                if plan.streaming
-                    && plan.estimated_full_batch_bytes > plan.in_core_budget_bytes
-                    && plan.estimated_dense_schur_bytes <= plan.in_core_budget_bytes =>
-            {
-                baseline_term.fit_streaming_in_memory(
-                    target.view(),
-                    &mut rho_seed,
-                    registry.as_ref(),
-                    inner_max_iter,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                )
-            }
-            Ok(_) => baseline_term.run_joint_fit_arrow_schur(
-                target.view(),
-                &mut rho_seed,
-                registry.as_ref(),
-                inner_max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            ),
-            Err(err) => Err(err),
-        };
-        let mut seed_won = false;
-        if let (Ok(settled_total), Ok(_)) = (&settled_objective, &seed_solve) {
-            let seed_total = baseline_term.penalized_objective_total(
-                target.view(),
-                &fitted_rho,
-                registry.as_ref(),
-                1.0,
-            );
-            if let Ok(seed_total) = seed_total {
-                seed_won = seed_total.is_finite() && seed_total < *settled_total;
-            }
-            if !seed_won
-                && let (Ok(seed_fit), Ok(settled_fit)) = (
-                    baseline_term.try_fitted_for_rho(&fitted_rho),
-                    term.try_fitted_for_rho(&fitted_rho),
-                )
-                && let (Some(seed_ev), Some(settled_ev)) = (
-                    reconstruction_explained_variance(target.view(), seed_fit.view()),
-                    reconstruction_explained_variance(target.view(), settled_fit.view()),
-                )
-            {
-                // S1 (guard surgery) — keep the BEST-of-candidates by finiteness
-                // and strict EV improvement alone; do NOT additionally gate the
-                // seed on clearing an absolute `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`.
-                // The old floor made a genuinely-better seed unrecoverable whenever
-                // both candidates sat below it — unreachable for cold PC-pair seeds
-                // on real activations, the proximate cause of #1782's "no candidate
-                // seeds passed outer startup validation". A multi-start must return
-                // the best finite basin it visited, whatever its absolute EV; a
-                // truly degenerate seed is caught downstream by the null-floor
-                // detector, not by refusing to keep the better of two candidates.
-                seed_won = seed_ev.is_finite()
-                    && settled_ev.is_finite()
-                    && settled_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev;
-            }
-        }
-        let (mut fitted, mut fitted_loss) = if seed_won {
-            let seed_loss = seed_solve.expect("seed_won implies seed_solve is Ok");
-            (baseline_term, seed_loss)
-        } else {
-            (term, loss)
-        };
-        let mut pristine_seed_won = false;
-        if let (Ok(seed_fit), Ok(returned_fit)) = (
-            pristine_seed_term.try_fitted_for_rho(&pristine_seed_rho),
-            fitted.try_fitted_for_rho(&fitted_rho),
-        ) && let (Some(seed_ev), Some(returned_ev)) = (
-            reconstruction_explained_variance(target.view(), seed_fit.view()),
-            reconstruction_explained_variance(target.view(), returned_fit.view()),
-        ) && seed_ev.is_finite()
-            && returned_ev + SAE_FINAL_EV_DEGRADATION_TOL < seed_ev
-            && let Ok(seed_loss) = pristine_seed_term.loss(target.view(), &pristine_seed_rho)
-        {
-            fitted = pristine_seed_term;
-            fitted_rho = pristine_seed_rho;
-            fitted_loss = seed_loss;
-            pristine_seed_won = true;
-        }
-        // #1026 GLOBAL BASE-DOMINANCE FLOOR (F_returned ≤ F_base). The seed and
-        // pristine-seed guards above re-solve the CURVED (η=1) fit, which on real
-        // linear-Gaussian activations can co-collapse to a fraction of the
-        // rank ceiling (real OLMo K=8: EV ≈ 0.58 vs the 0.74 certified Eckart-Young
-        // ceiling — the SVD low-rank projection, valid at every η). As a final
-        // candidate, re-solve the CONVEX η=0 base-topology relaxation — the same
-        // certified anchor the curvature walk starts from (NOT a linear/affine model:
-        // for curved bases the base block still embeds curvature) — and adopt it when
-        // it reconstructs strictly better than the returned curved state. Curvature
-        // that cannot beat the convex base-topology optimum returns that optimum;
-        // because the anchor is a genuine parametric model (not a reconstruction-time
-        // substitution) the dominance holds on held-out data too.
-        // NOTE (#1026): a GLOBAL base-dominance floor was attempted here (re-derive the
-        // η=0 anchor and adopt it when the result reconstructs worse). It was
-        // REMOVED because it cannot move the user-facing metric: `m.reconstruct` rebuilds
-        // a fresh OOS term that RE-ENCODES the assignment + coordinates, so no term-state
-        // or decoder fix survives — only `hybrid_linear_images` (#1228) propagate to OOS.
-        // The robust generalizing recovery is therefore the hybrid-split rescue
-        // (collapsed atoms decode their linear image), not an η-anchor restore. Keeping
-        // the cheap SEED-level floor in the curvature walk (internal F≤F_base) and
-        // avoiding the expensive per-fit re-derive that delivered no measured gain.
+        let mut fitted = term;
+        let fitted_loss = last_loss.ok_or_else(|| {
+            "SaeManifoldOuterObjective::into_fitted: no converged evaluation is installed; \
+             run the fixed-rho solve or certify the outer search before minting a fit"
+                .to_string()
+        })?;
+
+        // Do not arbitrate the certified terminal state against historical
+        // reconstruction-EV incumbents or construction seeds here. Those states
+        // were optimized at different ρ values (or never optimized) and pairing
+        // one with `current_rho` after the outer certificate creates a fit object
+        // that is not a stationary point of its reported objective. Basin
+        // selection belongs inside the objective's lower-envelope evaluation,
+        // before the analytic outer certificate is issued.
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
         // for d = 1, minimum-isometry-defect flow for d = 2 torus atoms)
@@ -1670,15 +1447,13 @@ impl SaeManifoldOuterObjective {
             termination.evals_since_improvement,
             termination.wall
         );
-        SaeIntoFittedResult {
+        Ok(SaeIntoFittedResult {
             term: fitted,
             rho: fitted_rho,
             loss: fitted_loss,
-            used_seed_basin_fallback: seed_won,
-            used_pristine_seed_fallback: pristine_seed_won,
             charts_canonicalized,
             termination,
-        }
+        })
     }
 
     /// Posterior shape uncertainty of the fitted atoms — per-atom decoder
@@ -3633,11 +3408,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // instead of the single hysteretic warm-start trajectory. Same value-probe
         // drive (`refine_progress_extension = false`) as the historical lane; the
         // envelope bypasses to it verbatim in the streaming / freeze regimes.
-        // #2235 forcing function — a stationarity defect kills the fit loudly;
-        // no frozen "fit" is ever minted from a non-converging walk.
-        if let Some(defect) = self.termination.stationarity_defect() {
-            return Err(EstimationError::RemlOptimizationFailed(defect));
-        }
         match self.evaluate_envelope_value_probe(
             rho.view(),
             ProbeInnerDrive::Criterion {
@@ -3672,10 +3442,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
-        // #2235 forcing function — see OuterTerminationLedger.
-        if let Some(defect) = self.termination.stationarity_defect() {
-            return Err(EstimationError::RemlOptimizationFailed(defect));
-        }
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #2231 Inc-B — scale the block columns for this ρ before either the
         // streaming value path or the dense `reml_criterion_with_cache` below
@@ -3927,13 +3693,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // keep grinding. Idempotent for the gradient orders (they also delegate to
         // `eval`, which checks again); no-op when no cancel flag is installed.
         self.check_cancelled()?;
-        // #2235 forcing function — the probe lane raises too (gradient orders
-        // delegate to `eval`, which raises itself).
-        if matches!(order, OuterEvalOrder::Value)
-            && let Some(defect) = self.termination.stationarity_defect()
-        {
-            return Err(EstimationError::RemlOptimizationFailed(defect));
-        }
         match order {
             OuterEvalOrder::Value => {
                 // The `Value` order is the BFGS / ARC LINE-SEARCH cost probe
@@ -4013,10 +3772,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2138 — the Fellner–Schall route is a primary outer descent path with its
         // own inner solve (bypassing `eval`/`eval_cost`), so cover it too.
         self.check_cancelled()?;
-        // #2235 forcing function — the EFS lane raises too.
-        if let Some(defect) = self.termination.stationarity_defect() {
-            return Err(EstimationError::RemlOptimizationFailed(defect));
-        }
         let mut eval = self
             .efs_step(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)?;
@@ -4047,9 +3802,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // gradient decay is meaningless for it, so the Eisenstat–Walker ratio
         // is re-established from scratch (probes run tight until then).
         self.forcing.clear_history();
-        // #2235 — a fresh multi-start walk deserves a fresh stationarity window
-        // (the wall budget and eval totals stay fit-global).
-        self.termination.reset_stationarity();
+        self.termination.reset_improvement_baseline();
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
@@ -5062,7 +4815,8 @@ mod linear_parity_anchor_1026_tests {
                 (1.0e-2_f64).ln(),
                 vec![Array1::<f64>::zeros(1)],
             );
-            let outer = SaeManifoldOuterObjective::new(
+            let rho_flat = init_rho.to_flat();
+            let mut outer = SaeManifoldOuterObjective::new(
                 term,
                 target.clone(),
                 None,
@@ -5072,7 +4826,10 @@ mod linear_parity_anchor_1026_tests {
                 1e-4,
                 1e-4,
             );
-            let fitted = outer.into_fitted();
+            outer
+                .fit_at_fixed_rho(rho_flat.view())
+                .expect("fixed-rho fit converges");
+            let fitted = outer.into_fitted().expect("fixed-rho fit was evaluated");
             let recon = fitted.term.fitted();
             reconstruction_explained_variance(target.view(), recon.view()).expect("EV finite")
         };
@@ -5272,7 +5029,8 @@ mod linear_parity_anchor_1026_tests {
                 (1.0e-2_f64).ln(),
                 vec![Array1::<f64>::zeros(1)],
             );
-            let outer = SaeManifoldOuterObjective::new(
+            let rho_flat = init_rho.to_flat();
+            let mut outer = SaeManifoldOuterObjective::new(
                 term,
                 target.clone(),
                 None,
@@ -5282,7 +5040,10 @@ mod linear_parity_anchor_1026_tests {
                 1e-4,
                 1e-4,
             );
-            let fitted = outer.into_fitted();
+            outer
+                .fit_at_fixed_rho(rho_flat.view())
+                .expect("fixed-rho fit converges");
+            let fitted = outer.into_fitted().expect("fixed-rho fit was evaluated");
             let recon = fitted.term.fitted();
             reconstruction_explained_variance(target.view(), recon.view()).expect("EV finite")
         };

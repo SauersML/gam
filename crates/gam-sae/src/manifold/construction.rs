@@ -2952,6 +2952,74 @@ impl SaeManifoldTerm {
         out
     }
 
+    /// Per-live-atom radial decoder gauges in the border coordinates the
+    /// evidence Schur actually factors.
+    ///
+    /// The physical atom image is `exp(s_k) Phi_k B_k`.  Its exact scale orbit
+    /// is `(B_k, s_k) -> (c B_k, s_k - log c)`.  The inner walk removes the
+    /// corresponding joint `(delta B, delta s)` nullvector; this carrier gives
+    /// the evidence factor the same quotient in its profiled beta border.  For
+    /// framed atoms the border coordinate is `C_k` with `B_k = C_k U_k^T` and
+    /// orthonormal `U_k`, so the radial direction is simply `vec(C_k)`.
+    pub(crate) fn beta_scale_gauge_quotient(
+        &self,
+    ) -> Result<Option<ArrowBetaGaugeQuotient>, String> {
+        if !self.quotient_scale || self.beta_dim() == 0 {
+            return Ok(None);
+        }
+        let (border, offsets, widths) = if self.frames_active() {
+            let border = self.flatten_factored_border()?;
+            let offsets = self.factored_border_offsets();
+            let widths = self
+                .atoms
+                .iter()
+                .map(|atom| atom.border_coeff_count())
+                .collect::<Vec<_>>();
+            (border, offsets, widths)
+        } else {
+            let border = self.flatten_beta();
+            let offsets = self.beta_offsets();
+            let p = self.output_dim();
+            let widths = self
+                .atoms
+                .iter()
+                .map(|atom| atom.basis_size() * p)
+                .collect::<Vec<_>>();
+            (border, offsets, widths)
+        };
+        let mut directions = Vec::with_capacity(self.atoms.len());
+        for atom_idx in 0..self.atoms.len() {
+            let start = offsets[atom_idx];
+            let end = start + widths[atom_idx];
+            let norm_sq = border
+                .slice(s![start..end])
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>();
+            if norm_sq == 0.0 {
+                // At B_k = 0 the derivative of c B_k is zero: the scale action
+                // has no beta-border tangent and therefore supplies no direction
+                // to quotient. This is geometry, not a collapsed-atom fallback.
+                continue;
+            }
+            if !norm_sq.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::beta_scale_gauge_quotient: atom {atom_idx} decoder norm is non-finite"
+                ));
+            }
+            let mut direction = Array1::<f64>::zeros(border.len());
+            direction
+                .slice_mut(s![start..end])
+                .assign(&border.slice(s![start..end]));
+            directions.push(direction);
+        }
+        if directions.is_empty() {
+            Ok(None)
+        } else {
+            ArrowBetaGaugeQuotient::new(directions).map(Some)
+        }
+    }
+
     pub fn set_flat_beta(&mut self, beta: ArrayView1<'_, f64>) -> Result<(), String> {
         if beta.len() != self.beta_dim() {
             return Err(format!(
@@ -7207,6 +7275,16 @@ impl SaeManifoldTerm {
             }
             start = end;
         }
+        let beta_gauge_quotient = self.beta_scale_gauge_quotient()?;
+        if let Some(quotient) = beta_gauge_quotient.as_ref() {
+            schur_acc = quotient.pin_reduced_schur(schur_acc.view());
+            if let Some(w) = wood_w.as_mut() {
+                for column in 0..w.ncols() {
+                    let projected = quotient.project_complement(w.column(column));
+                    w.column_mut(column).assign(&projected);
+                }
+            }
+        }
         let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
         let mut total = log_det_tt + log_det_schur;
@@ -8698,7 +8776,6 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            self.add_learnable_ibp_forward_alpha_data_rhs(rho, target, cache, &mut t, &mut beta)?;
         } else if (1..=rho.log_lambda_smooth.len()).contains(&j) {
             // #1556: coordinate `j ∈ 1..=K` is the per-atom smoothness strength
             // `log λ_smooth[j-1]`. `∂(penalty)/∂log λ_k = λ_k·S_k C_k` touches ONLY

@@ -320,6 +320,227 @@ pub fn sae_refine_periodic_seed_coords_by_cluster(
     Ok(())
 }
 
+/// Recover the canonical Möbius double-cover chart from a three-dimensional
+/// principal projection.  Axis 0 is the center-circle plane and axis 2 is the
+/// transverse direction.  The radial displacement and transverse coordinate
+/// form a half-angle vector
+///
+/// `q = radial + i transverse = width * exp(i * (phase / 2 + gamma))`.
+///
+/// Squaring removes the sign ambiguity of `width`; the first circular moment
+/// of `q²` identifies both the orientation of the center-circle angle and the
+/// half-angle offset `gamma` in closed form.  Projecting `q` back onto that
+/// half-angle then yields the signed band width.  This is the quotient-aware
+/// coordinate the deck-invariant [`crate::basis::MobiusHarmonicEvaluator`]
+/// expects: `s = phase / TAU` occupies one fundamental domain `[0, 1)`, while
+/// its deck twin is `(s + 1, -width)` on the period-two cover.
+pub(crate) fn mobius_double_cover_coords_from_projection(
+    projection: ArrayView2<'_, f64>,
+    cluster_rows: &[usize],
+) -> Result<Array2<f64>, String> {
+    if projection.ncols() < 3 {
+        return Err(format!(
+            "mobius_double_cover_coords_from_projection: expected at least three principal coordinates, got {}",
+            projection.ncols()
+        ));
+    }
+    if cluster_rows.len() < 3 {
+        return Err(format!(
+            "mobius_double_cover_coords_from_projection: need at least three cluster rows, got {}",
+            cluster_rows.len()
+        ));
+    }
+    let n = projection.nrows();
+    if cluster_rows.iter().any(|&row| row >= n) {
+        return Err(
+            "mobius_double_cover_coords_from_projection: cluster row is out of bounds".to_string(),
+        );
+    }
+
+    let inv = 1.0 / cluster_rows.len() as f64;
+    let mean_radius = cluster_rows
+        .iter()
+        .map(|&row| projection[[row, 0]].hypot(projection[[row, 1]]))
+        .sum::<f64>()
+        * inv;
+    let mut radial = Array1::<f64>::zeros(n);
+    let mut transverse = Array1::<f64>::zeros(n);
+    let mut angle = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let x = projection[[row, 0]];
+        let y = projection[[row, 1]];
+        radial[row] = x.hypot(y) - mean_radius;
+        transverse[row] = projection[[row, 2]];
+        angle[row] = y.atan2(x);
+    }
+    let radial_sd = (cluster_rows
+        .iter()
+        .map(|&row| radial[row] * radial[row])
+        .sum::<f64>()
+        * inv)
+        .sqrt();
+    let transverse_sd = (cluster_rows
+        .iter()
+        .map(|&row| transverse[row] * transverse[row])
+        .sum::<f64>()
+        * inv)
+        .sqrt();
+    let scale_floor = f64::EPSILON.sqrt();
+    if !radial_sd.is_finite()
+        || !transverse_sd.is_finite()
+        || radial_sd <= scale_floor
+        || transverse_sd <= scale_floor
+    {
+        return Err(format!(
+            "mobius_double_cover_coords_from_projection: degenerate half-angle plane (radial sd {radial_sd}, transverse sd {transverse_sd})"
+        ));
+    }
+    radial.mapv_inplace(|value| value / radial_sd);
+    transverse.mapv_inplace(|value| value / transverse_sd);
+
+    // The correct angular orientation makes E[q² exp(-i phase)] non-zero;
+    // reversing it destroys that first circular moment.  Choose the stronger
+    // of the two orientations, a closed-form two-symmetry comparison rather
+    // than a parameter grid.
+    let moment = |orientation: f64| -> (f64, f64) {
+        let mut re = 0.0_f64;
+        let mut im = 0.0_f64;
+        for &row in cluster_rows {
+            let qr = radial[row];
+            let qi = transverse[row];
+            let q2_re = qr * qr - qi * qi;
+            let q2_im = 2.0 * qr * qi;
+            let phase = orientation * angle[row];
+            let (sin_phase, cos_phase) = phase.sin_cos();
+            re += q2_re * cos_phase + q2_im * sin_phase;
+            im += q2_im * cos_phase - q2_re * sin_phase;
+        }
+        (re * inv, im * inv)
+    };
+    let forward = moment(1.0);
+    let reverse = moment(-1.0);
+    let forward_norm = forward.0.hypot(forward.1);
+    let reverse_norm = reverse.0.hypot(reverse.1);
+    let (orientation, chosen) = if forward_norm >= reverse_norm {
+        (1.0, forward)
+    } else {
+        (-1.0, reverse)
+    };
+    let moment_norm = chosen.0.hypot(chosen.1);
+    if !moment_norm.is_finite() || moment_norm <= 64.0 * f64::EPSILON {
+        return Err(format!(
+            "mobius_double_cover_coords_from_projection: half-angle moment is not identifiable ({moment_norm})"
+        ));
+    }
+    let gamma = 0.5 * chosen.1.atan2(chosen.0);
+    let mut signed_width = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let half_angle = 0.5 * orientation * angle[row] + gamma;
+        signed_width[row] = radial[row] * half_angle.cos() + transverse[row] * half_angle.sin();
+    }
+    let width_sd = (cluster_rows
+        .iter()
+        .map(|&row| signed_width[row] * signed_width[row])
+        .sum::<f64>()
+        * inv)
+        .sqrt();
+    if !width_sd.is_finite() || width_sd <= scale_floor {
+        return Err(format!(
+            "mobius_double_cover_coords_from_projection: signed width is degenerate ({width_sd})"
+        ));
+    }
+
+    let mut coords = Array2::<f64>::zeros((n, 2));
+    for row in 0..n {
+        let phase = orientation * angle[row] / std::f64::consts::TAU;
+        coords[[row, 0]] = phase - phase.floor();
+        coords[[row, 1]] = (signed_width[row] / (2.0 * width_sd)).clamp(-1.0, 1.0);
+    }
+    Ok(coords)
+}
+
+/// Replace cold generic PCA coordinates for every Möbius atom with the
+/// quotient-aware double-cover chart recovered from that atom's cluster.
+pub fn sae_refine_mobius_seed_coords_by_cluster(
+    z: ArrayView2<'_, f64>,
+    atom_kinds: &[SaeAtomBasisKind],
+    labels: &[usize],
+    seed_coords: &mut Array3<f64>,
+) -> Result<(), String> {
+    let (n_obs, p_out) = z.dim();
+    let k_atoms = atom_kinds.len();
+    if labels.len() != n_obs {
+        return Err(format!(
+            "sae_refine_mobius_seed_coords_by_cluster: labels length {} must equal n_obs={n_obs}",
+            labels.len()
+        ));
+    }
+    if seed_coords.shape()[0] != k_atoms
+        || seed_coords.shape()[1] != n_obs
+        || seed_coords.shape()[2] < 2
+    {
+        return Err(format!(
+            "sae_refine_mobius_seed_coords_by_cluster: seed coords must have shape (K={k_atoms}, N={n_obs}, D>=2); got {:?}",
+            seed_coords.shape()
+        ));
+    }
+    for (atom_idx, kind) in atom_kinds.iter().enumerate() {
+        if !matches!(kind, SaeAtomBasisKind::Mobius) {
+            continue;
+        }
+        let rows: Vec<usize> = (0..n_obs).filter(|&row| labels[row] == atom_idx).collect();
+        if rows.len() < 3 || p_out < 3 {
+            return Err(format!(
+                "sae_refine_mobius_seed_coords_by_cluster: atom {atom_idx} needs at least three rows in a three-dimensional output; got {} rows and p={p_out}",
+                rows.len()
+            ));
+        }
+        let mut mean = Array1::<f64>::zeros(p_out);
+        for &row in &rows {
+            for col in 0..p_out {
+                mean[col] += z[[row, col]];
+            }
+        }
+        let inv = 1.0 / rows.len() as f64;
+        mean.mapv_inplace(|value| value * inv);
+        let mut local = Array2::<f64>::zeros((rows.len(), p_out));
+        for (local_row, &source_row) in rows.iter().enumerate() {
+            for col in 0..p_out {
+                local[[local_row, col]] = z[[source_row, col]] - mean[col];
+            }
+        }
+        let (_u, _s, vt) = local.svd(false, true).map_err(|error| {
+            format!(
+                "sae_refine_mobius_seed_coords_by_cluster: atom {atom_idx} SVD failed: {error:?}"
+            )
+        })?;
+        let vt = vt.ok_or_else(|| {
+            format!(
+                "sae_refine_mobius_seed_coords_by_cluster: atom {atom_idx} SVD returned no right frame"
+            )
+        })?;
+        if vt.nrows() < 3 {
+            return Err(format!(
+                "sae_refine_mobius_seed_coords_by_cluster: atom {atom_idx} has principal rank {}, need three",
+                vt.nrows()
+            ));
+        }
+        let mut projection = Array2::<f64>::zeros((n_obs, 3));
+        for row in 0..n_obs {
+            for pc in 0..3 {
+                for col in 0..p_out {
+                    projection[[row, pc]] += (z[[row, col]] - mean[col]) * vt[[pc, col]];
+                }
+            }
+        }
+        let coords = mobius_double_cover_coords_from_projection(projection.view(), &rows)?;
+        seed_coords
+            .slice_mut(ndarray::s![atom_idx, .., 0..2])
+            .assign(&coords);
+    }
+    Ok(())
+}
+
 /// Seed each atom's decoder coefficient block via a joint ridge-regularized
 /// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
 /// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton

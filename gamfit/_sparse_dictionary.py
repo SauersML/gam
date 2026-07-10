@@ -488,6 +488,16 @@ class BlockSparseDictionaryFit:
         """Number of blocks ``G = K / b``."""
         return self.decoder.shape[0] // self.block_size
 
+    @property
+    def n_atoms(self) -> int:
+        """Scalar dictionary capacity ``K`` (decoder rows)."""
+        return int(self.decoder.shape[0])
+
+    @property
+    def active(self) -> int:
+        """Maximum active scalar coordinates per row."""
+        return int(self.block_topk * self.block_size)
+
     def read_loss_at_prefix(self, K: int) -> float:
         """Return the stored MATRYOSHKA-PREFIX loss at atom prefix ``K``."""
         k = int(K)
@@ -818,6 +828,58 @@ def block_sparse_dictionary_fit(
         matryoshka_prefix=bool(matryoshka_prefix),
         tolerance=float(tolerance),
     )
+    return _block_sparse_fit_from_payload(payload)
+
+
+def fixed_budget_block_sparse_dictionary_fit(
+    X: Any,
+    n_atoms: int,
+    *,
+    active: int,
+    block_size: int,
+    max_epochs: int = 30,
+    minibatch: int = 512,
+    block_tile: int = 1024,
+    frame_ridge: float = 1.0e-9,
+    aux_k: int = 0,
+    matryoshka_prefix: bool = False,
+    tolerance: float = 1.0e-6,
+) -> BlockSparseDictionaryFit:
+    """Fit a block dictionary at an exact scalar capacity and active budget.
+
+    ``n_atoms`` is the number of decoder rows and ``active`` is the maximum
+    number of active scalar coordinates per row, so these quantities are
+    directly comparable to a scalar TopK SAE.  The Rust core requires both to
+    divide exactly into complete ``block_size`` groups; it never rounds or
+    clamps either budget.  For example, ``n_atoms=114688, active=64,
+    block_size=4`` fits 28,672 blocks and selects exactly 16 blocks/row while
+    retaining exactly 114,688 scalar decoder coordinates and 64 active scalar
+    coordinates.
+
+    Group routing removes within-block competition: correlated directions that
+    describe one local concept are selected by one gauge-invariant group-ℓ₂
+    gate, then carried as signed orthonormal coordinates.  This is the
+    fixed-budget alternative used by the #2251 concept-probe acceptance harness.
+    """
+    x = _as_2d_f32(X, "X")
+    payload = rust_module().fixed_budget_block_sparse_dictionary_fit(
+        x,
+        int(n_atoms),
+        active=int(active),
+        block_size=int(block_size),
+        max_epochs=int(max_epochs),
+        minibatch=int(minibatch),
+        block_tile=int(block_tile),
+        frame_ridge=float(frame_ridge),
+        aux_k=int(aux_k),
+        matryoshka_prefix=bool(matryoshka_prefix),
+        tolerance=float(tolerance),
+    )
+    return _block_sparse_fit_from_payload(payload)
+
+
+def _block_sparse_fit_from_payload(payload: Any) -> BlockSparseDictionaryFit:
+    """Convert the single Rust block-fit wire payload into the public model."""
     data = dict(payload)
     convergence = dict(data["convergence"])
     return BlockSparseDictionaryFit(
@@ -1249,6 +1311,7 @@ __all__ = [
     "SparseDictionaryTransform",
     "block_sparse_dictionary_fit",
     "block_sparse_dictionary_fit_begin",
+    "fixed_budget_block_sparse_dictionary_fit",
     "rank_charge_dof",
     "sparse_dictionary_fit",
     "sparse_dictionary_fit_begin",

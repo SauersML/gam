@@ -6,11 +6,14 @@
 // `construction.rs`, so these methods share that module's scope exactly as
 // before (same `impl SaeManifoldTerm`, same `use super::*` imports).
 
-/// Dimensionless curvature-fraction floor for the exact-stationarity IFT solve
-/// (#2080 defect 4). The majorizer construction guarantees `B ⪰ A`, so the
-/// pencil `(A, B)` has generalized spectrum `μ ∈ (0, 1]`: `μ` is the fraction
-/// of its own majorizer curvature a direction retains in the EXACT Hessian. A
-/// direction with `μ` below this floor (a saturated IBP gate logit has data
+/// Dimensionless numerical-rank floor for the exact-stationarity IFT solve
+/// (#2080 defect 4). `B` is the positive-definite scale/preconditioner for the
+/// exact stationarity Hessian `A`; the generalized Rayleigh quotient
+/// `μ(v) = vᵀAv/vᵀBv` therefore measures exact curvature relative to its own
+/// solver scale. The floor is `√ε_machine`, the standard boundary below which
+/// a double-precision curvature ratio is not numerically identifiable; it is
+/// derived from the scalar type rather than tuned to a fixture. A direction
+/// below this floor (a saturated IBP gate logit has data
 /// curvature `∝ σ'(ℓ)² → 0`) is numerically curvature-free — the inner
 /// optimizer cannot resolve the iterate's position along it, so the IFT
 /// response `θ̂_ρ = −A⁻¹g_ρ` there is an unidentifiable `1/μ` amplification,
@@ -19,16 +22,9 @@
 /// objective↔gradient desync. The former outer-objective numerical safeguard
 /// has been removed: deflating these directions keeps the envelope term
 /// value-consistent at its analytic source.
-const SAE_IFT_MIN_CURVATURE_FRACTION: f64 = 1.0e-8;
-
-/// Inverse-power refinement sweeps for a suspected near-null `(A, B)`
-/// direction. The corrupted solve is itself dominated by that direction, so
-/// one or two sweeps of `v ← A⁻¹(B v)` sharpen it to working accuracy.
-const SAE_IFT_DEFLATION_POWER_ITERS: usize = 2;
-
-/// Maximum near-null directions deflated per IFT solve (a backstop; the
-/// observed defect class is rank one or two — saturated gate logits).
-const SAE_IFT_DEFLATION_MAX_DIRECTIONS: usize = 8;
+fn sae_ift_min_curvature_fraction() -> f64 {
+    f64::EPSILON.sqrt()
+}
 
 impl SaeManifoldTerm {
     /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
@@ -313,9 +309,9 @@ impl SaeManifoldTerm {
         })?;
         // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
         //
-        // `B ⪰ A` (majorizer construction), so the generalized Rayleigh
-        // quotient `μ(x) = xᵀAx / xᵀBx ∈ (0, 1]` of the SOLUTION is a
-        // detector: expanding `x = Σ (vᵢᵀrhs/μᵢ) vᵢ` in the B-orthonormal
+        // The generalized Rayleigh quotient `μ(x) = xᵀAx / xᵀBx` of the
+        // SOLUTION is a detector: expanding
+        // `x = Σ (vᵢᵀrhs/μᵢ) vᵢ` in the B-orthonormal
         // `(A, B)`-eigenbasis, any near-null component present in `rhs` enters
         // `x` with weight `1/μᵢ`, so `μ(x)` collapses to `≈ μ_min` exactly
         // when the solve was amplified. A healthy solve (`rhs` B-orthogonal to
@@ -327,63 +323,124 @@ impl SaeManifoldTerm {
         // `v·(vᵀBx)` (since `vᵀBx = vᵀrhs/μ_v`), so subtracting the
         // B-projection removes precisely the unidentifiable component while
         // leaving every resolved direction untouched.
-        for _ in 0..SAE_IFT_DEFLATION_MAX_DIRECTIONS {
+        let dim = x.t.len() + x.beta.len();
+        let rank_floor = sae_ift_min_curvature_fraction();
+        for _ in 0..dim {
             let ax = self.apply_exact_hessian(rho, target, cache, &x)?;
             let bx = apply_cached_arrow_hessian(cache, x.t.view(), x.beta.view())?;
             let x_b_norm_sq = sae_inner(&x, &bx);
+            if x_b_norm_sq == 0.0 && sae_inner(&x, &x) == 0.0 {
+                return Ok(x);
+            }
             if !(x_b_norm_sq.is_finite() && x_b_norm_sq > 0.0) {
-                break;
+                return Err(format!(
+                    "solve_exact_stationarity: invalid B-norm squared {x_b_norm_sq:.6e}"
+                ));
             }
             let mu = sae_inner(&x, &ax) / x_b_norm_sq;
-            if !mu.is_finite() || mu >= SAE_IFT_MIN_CURVATURE_FRACTION {
-                break;
+            if !mu.is_finite() {
+                return Err("solve_exact_stationarity: non-finite generalized curvature".into());
+            }
+            if mu <= 0.0 {
+                return Err(format!(
+                    "solve_exact_stationarity: exact stationarity Hessian has non-positive \
+                     generalized curvature μ={mu:.6e}; the inner state is not a stable minimum"
+                ));
+            }
+            if mu >= rank_floor {
+                return Ok(x);
             }
             // Sharpen the offending direction by inverse power iteration on
             // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
-            // already dominated by it, so it is the natural seed. A refinement
-            // solve that fails keeps the unrefined seed — still a valid
-            // deflation direction, just first-order.
+            // already dominated by it, so it is the natural seed. Convergence
+            // is certified by successive B-normalized direction alignment;
+            // exhaustion or a failed inner solve propagates instead of silently
+            // projecting with `v=x` (which would delete the entire response).
             let mut v = x.clone();
-            for _ in 0..SAE_IFT_DEFLATION_POWER_ITERS {
+            let normalize_b = |v: &mut SaeArrowVector| -> Result<(), String> {
                 let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
-                match solve_b_preconditioned_gmres(solver, &bv, |w| {
-                    self.apply_exact_hessian(rho, target, cache, w)
-                }) {
-                    Ok(refined) => v = refined,
-                    Err(_) => break,
-                }
-                let bvv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
-                let norm_sq = sae_inner(&v, &bvv);
+                let norm_sq = sae_inner(v, &bv);
                 if !(norm_sq.is_finite() && norm_sq > 0.0) {
-                    break;
+                    return Err(format!(
+                        "solve_exact_stationarity: inverse-power direction has invalid \
+                         B-norm squared {norm_sq:.6e}"
+                    ));
                 }
                 let inv_norm = 1.0 / norm_sq.sqrt();
                 v.t.mapv_inplace(|val| val * inv_norm);
                 v.beta.mapv_inplace(|val| val * inv_norm);
+                Ok(())
+            };
+            normalize_b(&mut v)?;
+            let mut direction_converged = false;
+            for _ in 0..dim {
+                let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+                let mut refined = solve_b_preconditioned_gmres(solver, &bv, |w| {
+                    self.apply_exact_hessian(rho, target, cache, w)
+                })
+                .map_err(|err| {
+                    format!(
+                        "solve_exact_stationarity: inverse-power refinement did not converge: {err}"
+                    )
+                })?;
+                normalize_b(&mut refined)?;
+                let b_refined =
+                    apply_cached_arrow_hessian(cache, refined.t.view(), refined.beta.view())?;
+                let alignment = sae_inner(&v, &b_refined).abs();
+                if !alignment.is_finite() {
+                    return Err(
+                        "solve_exact_stationarity: non-finite inverse-power alignment".into(),
+                    );
+                }
+                v = refined;
+                if 1.0 - alignment.min(1.0) <= rank_floor {
+                    direction_converged = true;
+                    break;
+                }
             }
-            // B-normalize the final direction, then remove its B-projection.
+            if !direction_converged {
+                return Err(format!(
+                    "solve_exact_stationarity: inverse-power direction did not converge in the \
+                     derived Krylov dimension {dim}"
+                ));
+            }
+            // Refuse to remove a resolved or non-positive direction. A stable
+            // converged inner minimum has positive exact curvature; a negative
+            // Ritz value is a second-order convergence failure, not a null gauge.
+            let av = self.apply_exact_hessian(rho, target, cache, &v)?;
             let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
             let v_b_norm_sq = sae_inner(&v, &bv);
             if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
-                break;
+                return Err(format!(
+                    "solve_exact_stationarity: converged inverse-power direction has invalid \
+                     B-norm squared {v_b_norm_sq:.6e}"
+                ));
             }
-            let inv_norm = 1.0 / v_b_norm_sq.sqrt();
-            v.t.mapv_inplace(|val| val * inv_norm);
-            v.beta.mapv_inplace(|val| val * inv_norm);
-            let bx = apply_cached_arrow_hessian(cache, x.t.view(), x.beta.view())?;
+            let v_mu = sae_inner(&v, &av) / v_b_norm_sq;
+            if !(v_mu.is_finite() && v_mu > 0.0 && v_mu < rank_floor) {
+                return Err(format!(
+                    "solve_exact_stationarity: inverse power failed to isolate a positive \
+                     numerical-null direction: μ={v_mu:.6e}, floor={rank_floor:.6e}"
+                ));
+            }
             let proj = sae_inner(&v, &bx);
             if proj == 0.0 || !proj.is_finite() {
-                break;
+                return Err(format!(
+                    "solve_exact_stationarity: invalid near-null B-projection {proj:.6e}"
+                ));
             }
             x.t.scaled_add(-proj, &v.t);
             x.beta.scaled_add(-proj, &v.beta);
             log::debug!(
                 "[SAE/#2080-d4] IFT solve deflated a near-null pencil direction \
-                 (μ={mu:.3e} < {SAE_IFT_MIN_CURVATURE_FRACTION:.1e}, |proj|={:.3e})",
+                 (μ={mu:.3e} < {rank_floor:.1e}, |proj|={:.3e})",
                 proj.abs(),
             );
         }
-        Ok(x)
+        Err(format!(
+            "solve_exact_stationarity: numerical-null deflation exhausted the derived \
+             dimension {dim} without an identifiable IFT response"
+        ))
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged
@@ -448,25 +505,13 @@ impl SaeManifoldTerm {
             &self.assignment,
             rho,
             self.row_loss_weights.as_deref(),
-        ) + self
-            .learnable_ibp_forward_alpha_data_derivative(rho, target)
-            .map_err(OuterGradientError::internal)?;
-        // #1417: the FULL `½ tr(H⁻¹ ∂H/∂logα)` for the assignment coordinate.
-        // For LEARNABLE IBP alpha the forward assignments `a_ik = σ(ℓ/τ)·π_k(α)`
-        // carry an explicit α-dependence (`∂logπ_k/∂logα = k/(α+1)`), so BOTH the
-        // assignment-prior Hessian AND the data Gauss-Newton blocks
-        // `H_ββ`, `H_tβ`, `H_tt` depend on logα. We assemble both traces:
-        //   • prior:  `assignment_log_strength_hessian_trace`,
-        //   • data:   `learnable_ibp_data_logdet_alpha_trace` (#1417), using the
-        //             exact `(k_a+k_b)/(α+1)` block-scaling identity.
-        // For FIXED alpha (and non-IBP modes) the data term is identically zero,
-        // so the fixed-alpha gradient is unchanged and exact.
+        );
+        // IBP concentration controls only the Beta--Bernoulli prior. The final
+        // posterior-mean gate is `sigmoid(logit/tau)`, so the data likelihood
+        // and its Gauss--Newton blocks have no direct alpha derivative.
         logdet_trace[0] = self
             .assignment_log_strength_hessian_trace(rho, cache, solver)
-            .map_err(OuterGradientError::internal)?
-            + self
-                .learnable_ibp_data_logdet_alpha_trace(rho, cache, solver)
-                .map_err(OuterGradientError::internal)?;
+            .map_err(OuterGradientError::internal)?;
 
         // #1556: λ_smooth is per-atom, so the smoothness gradient block occupies
         // flat indices `1..1+K` (one per atom), not a single index 1. Each atom
@@ -604,7 +649,14 @@ impl SaeManifoldTerm {
                 .map_err(OuterGradientError::internal)?;
             let solved = self
                 .solve_exact_stationarity(rho, target, cache, solver, &rhs)
-                .map_err(OuterGradientError::internal)?;
+                .map_err(|err| {
+                    OuterGradientError::classify_arrow_solver_error(
+                        &err,
+                        OuterGradientError::NonIdentifiable {
+                            reason: err.clone(),
+                        },
+                    )
+                })?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
                 dot += gamma.t[idx] * solved.t[idx];

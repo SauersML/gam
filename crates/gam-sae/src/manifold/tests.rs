@@ -2416,7 +2416,7 @@ pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
         .with_initial_rho(init_rho_flat)
         .run(&mut objective, "SAE planted circle #1744 focused")
         .unwrap();
-    let fitted_result = objective.into_fitted();
+    let fitted_result = objective.into_fitted().expect("outer fit was evaluated");
     let rho = fitted_result.rho;
     let ev = global_ev(z.view(), fitted_result.term.fitted().view());
     assert!(
@@ -2463,7 +2463,7 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                     .with_initial_rho(init_rho_flat)
                     .run(&mut objective, "SAE planted circle dimensionless seed")
                     .unwrap();
-                let fitted_result = objective.into_fitted();
+                let fitted_result = objective.into_fitted().expect("outer fit was evaluated");
                 let fitted_term = fitted_result.term;
                 let rho = fitted_result.rho;
                 let fitted = fitted_term.fitted();

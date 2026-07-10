@@ -230,7 +230,7 @@ fn run_wide_outer_fit(
         .run(&mut objective, "SAE manifold")
         .expect("#2080 wide-p outer REML fit must terminate, not hang / abort");
     let telemetry = objective.probe_telemetry();
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     (ev, telemetry)
 }
@@ -264,7 +264,7 @@ fn run_k1_generated_seed_outer_fit(
         .run(&mut objective, "SAE manifold K=1 generated seed")
         .expect("#2153 K=1 generated-seed circle fit must terminate");
     let telemetry = objective.probe_telemetry();
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     (ev, telemetry)
 }
@@ -422,7 +422,7 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
                 rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius;
             let huge_final_gradient =
                 final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor;
-            let fitted = objective.into_fitted();
+            let fitted = objective.into_fitted().expect("outer fit was evaluated");
             let ev = global_ev(z.view(), fitted.term.fitted().view());
             let live_lock_present =
                 predicted_decrease_not_materializing && step_collapsed && huge_final_gradient;
@@ -724,7 +724,7 @@ fn entangled_two_circle_outer_reml_separates_2080() {
         })
         .run(&mut objective, "SAE manifold entangled two-circle")
         .expect("#2080 entangled two-circle outer REML fit must terminate, not abort");
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     let mut norms = vec![0.0_f64; k];
     for (i, atom) in fitted.term.atoms.iter().enumerate() {

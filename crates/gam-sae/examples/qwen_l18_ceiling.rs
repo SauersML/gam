@@ -376,7 +376,7 @@ fn fit_ceiling_region(
         .map_err(|err| format!("outer fit failed: {err}"))?;
     let fit_elapsed = fit_started.elapsed();
     let telemetry = objective.probe_telemetry();
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let final_term = fitted.term;
     let fitted_matrix = final_term.fitted();
     let curved_ev = reconstruction_ev(target, fitted_matrix.view())?;

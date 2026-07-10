@@ -272,25 +272,21 @@ def test_ibp_gumbel_forward_applies_stick_breaking_prior():
 
     assignments, gate_pre = layer(logits)
 
-    # gate_pre is the untouched logits; assignments carry the prior + temperature.
+    # gate_pre is the untouched logits; assignments carry the temperature-scaled
+    # posterior mean.
     np.testing.assert_allclose(gate_pre.detach().numpy(), logits.numpy(), rtol=0.0, atol=0.0)
 
     tau = max(tau_start, 1e-6)
-    expected = ibp_map(logits, tau, alpha)
+    expected = ibp_map(logits, tau)
     np.testing.assert_allclose(
         assignments.detach().numpy(), expected.detach().numpy(), rtol=0.0, atol=0.0
     )
 
-    # The stick-breaking prior strictly decays in atom index: with tied logits the
-    # per-atom mass must fall off geometrically, which bare sigmoid(logits/tau)
-    # could never produce.
+    # With tied logits, the Bernoulli posterior means are equal. Ordered
+    # stick-breaking shrinkage is owned by the IBP prior, not the forward map.
     tied = torch.zeros((1, 5), dtype=torch.float64)
     tied_assign = layer(tied)[0].detach().numpy().reshape(-1)
-    ratio = alpha / (alpha + 1.0)
-    sig0 = float(tied_assign[0])
-    for k in range(5):
-        np.testing.assert_allclose(tied_assign[k], sig0 * ratio**k, rtol=0.0, atol=1e-12)
-    assert np.all(np.diff(tied_assign) < 0.0), "stick-breaking prior must strictly decay"
+    np.testing.assert_allclose(tied_assign, np.full(5, 0.5), rtol=0.0, atol=1e-15)
 
 
 def test_isometry_backward_grad_matches_rust_grad_jacobian():

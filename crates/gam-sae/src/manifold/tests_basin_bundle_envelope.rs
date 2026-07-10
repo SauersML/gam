@@ -188,9 +188,8 @@ fn two_basin_outer_fit_engages_bounded_envelope() {
     let k = 2;
     let (mut objective, z, seed) = two_circle_objective(n, p, k, 2, 8);
     let n_params = seed.len();
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
             max_seeds: 1,
             seed_budget: 1,
@@ -198,6 +197,12 @@ fn two_basin_outer_fit_engages_bounded_envelope() {
         })
         .run(&mut objective, "SAE manifold basin envelope")
         .expect("two-basin outer REML fit must terminate");
+    assert!(result.converged, "the envelope fit must be certified");
+    let certificate = result
+        .criterion_certificate
+        .as_ref()
+        .expect("converged envelope fit carries an analytic certificate");
+    assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
     let telemetry = objective.probe_telemetry();
 
     // The dense-admitted value lanes ran the envelope (not the streaming/freeze
@@ -214,7 +219,7 @@ fn two_basin_outer_fit_engages_bounded_envelope() {
         telemetry.basin_max_members
     );
     // The fit still recovers materially positive reconstruction variance.
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     assert!(ev > 0.3, "two-circle K=2 envelope fit EV {ev} too low");
 }

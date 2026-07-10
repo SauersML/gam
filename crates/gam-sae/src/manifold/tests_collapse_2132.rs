@@ -205,7 +205,7 @@ fn fit_circle_dictionary(
         })
         .run(&mut objective, "SAE manifold")
         .expect("circle dictionary fit must not abort");
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let native_ev = global_ev(train, fitted.term.fitted().view());
     (fitted.term, fitted.rho, native_ev)
 }

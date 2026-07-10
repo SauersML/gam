@@ -41,13 +41,15 @@ use gam::terms::{
     AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3};
 
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
-const INNER_MAX_ITER: usize = 12;
+// Refinement chunk only: the inner evaluator extends until its stationarity
+// certificate is satisfied and returns an error rather than minting a partial fit.
+const INNER_REFINEMENT_CHUNK: usize = 12;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
@@ -168,12 +170,41 @@ fn ms(start: Instant) -> f64 {
     1000.0 * start.elapsed().as_secs_f64()
 }
 
-fn smooth_penalty(width: usize) -> Array2<f64> {
-    let mut s = Array2::<f64>::zeros((width, width));
-    for i in 0..width {
-        s[[i, i]] = if i == 0 { 1.0e-3 } else { 1.0 };
+/// Exact empirical first-derivative roughness of the final decoded function.
+///
+/// With basis jet `J[i,a,c]` and decoder `B[a,o]`, the decoded function has
+/// derivative `Df[i,o,c] = sum_a J[i,a,c] B[a,o]`. Therefore
+/// `mean_i sum_{o,c} Df[i,o,c]^2 = trace(B^T S B)` for the Gram below. The
+/// matrix consumed by the coefficient solver is thus exactly equivalent to a
+/// penalty on the final function, including the correct constant null space.
+fn final_function_roughness(jet: &Array3<f64>) -> Result<Array2<f64>, String> {
+    let (n, width, latent_dim) = jet.dim();
+    if n == 0 || width == 0 || latent_dim == 0 {
+        return Err(format!(
+            "final-function roughness needs non-empty jet dimensions; got {:?}",
+            jet.dim()
+        ));
     }
-    s
+    let mut s = Array2::<f64>::zeros((width, width));
+    for row in 0..n {
+        for axis in 0..latent_dim {
+            for a in 0..width {
+                let ja = jet[[row, a, axis]];
+                for b in 0..=a {
+                    s[[a, b]] += ja * jet[[row, b, axis]];
+                }
+            }
+        }
+    }
+    let inv_n = 1.0 / n as f64;
+    for a in 0..width {
+        for b in 0..=a {
+            let value = s[[a, b]] * inv_n;
+            s[[a, b]] = value;
+            s[[b, a]] = value;
+        }
+    }
+    Ok(s)
 }
 
 fn decoder(width: usize, p: usize, atom: usize, rng: &mut Lcg) -> Array2<f64> {
@@ -223,6 +254,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                 let coords = circle_coords(shape.n, atom_idx);
                 let (phi, jet) = evaluator.evaluate(coords.view())?;
                 let width = phi.ncols();
+                let roughness = final_function_roughness(&jet)?;
                 let atom = SaeManifoldAtom::new(
                     format!("circle_{atom_idx}"),
                     SaeAtomBasisKind::Periodic,
@@ -230,7 +262,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                     phi,
                     jet,
                     decoder(width, shape.p, atom_idx, &mut rng),
-                    smooth_penalty(width),
+                    roughness,
                 )?
                 .with_basis_evaluator(Arc::new(evaluator));
                 atoms.push(atom);
@@ -242,6 +274,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                 let coords = euclidean_coords(shape.n, shape.d, atom_idx);
                 let (phi, jet) = evaluator.evaluate(coords.view())?;
                 let width = phi.ncols();
+                let roughness = final_function_roughness(&jet)?;
                 let atom = SaeManifoldAtom::new(
                     format!("euclidean_{atom_idx}"),
                     SaeAtomBasisKind::EuclideanPatch,
@@ -249,7 +282,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                     phi,
                     jet,
                     decoder(width, shape.p, atom_idx, &mut rng),
-                    smooth_penalty(width),
+                    roughness,
                 )?
                 .with_basis_evaluator(Arc::new(evaluator));
                 atoms.push(atom);
@@ -355,7 +388,7 @@ fn run_rung(shape: Shape) -> Result<RungReport, String> {
         fixture.target.clone(),
         None,
         fixture.rho.clone(),
-        INNER_MAX_ITER,
+        INNER_REFINEMENT_CHUNK,
         LEARNING_RATE,
         RIDGE_EXT_COORD,
         RIDGE_BETA,

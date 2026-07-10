@@ -51,23 +51,19 @@ fn max_abs_diff(a: &DeviceResidentInnerOutcome, b: &DeviceResidentInnerOutcome) 
     m
 }
 
-fn time_fit<F>(reps: usize, mut f: F) -> (Duration, Option<DeviceResidentInnerOutcome>)
+fn time_fit<F, E>(reps: usize, mut f: F) -> Result<(Duration, DeviceResidentInnerOutcome), E>
 where
-    F: FnMut() -> Option<DeviceResidentInnerOutcome>,
+    F: FnMut() -> Result<DeviceResidentInnerOutcome, E>,
 {
     // Warm pass (driver/handle init, frame build paths) excluded from timing.
-    let warm = f();
+    let mut last = f()?;
     let mut total = Duration::ZERO;
-    let mut last = warm;
     for _ in 0..reps {
         let start = Instant::now();
-        let out = f();
+        last = f()?;
         total += start.elapsed();
-        if out.is_some() {
-            last = out;
-        }
     }
-    (total / reps.max(1) as u32, last)
+    Ok((total / reps.max(1) as u32, last))
 }
 
 fn main() {
@@ -86,30 +82,29 @@ fn main() {
              device paths decline. Run on the A100 node for residency wall-clock."
         );
         // Still exercise the CPU reference so the example does useful work off-GPU.
-        if let Ok(cpu) = ws.cpu_reference_fit(&opts) {
-            println!(
-                "DEVRES_1017 cpu_reference iters={} converged={} objective={:.6e} gnorm={:.3e}",
-                cpu.iterations, cpu.converged, cpu.objective, cpu.gradient_norm
-            );
-        }
+        let cpu = ws
+            .cpu_reference_fit(&opts)
+            .expect("CPU reference fit must converge when the device is unavailable");
+        assert!(cpu.converged, "CPU reference returned a partial fit");
+        println!(
+            "DEVRES_1017 cpu_reference iters={} converged={} objective={:.6e} gnorm={:.3e}",
+            cpu.iterations, cpu.converged, cpu.objective, cpu.gradient_norm
+        );
         return;
     }
 
     println!("DEVRES_1017 device_resident=true shape=color_arm n=180 p=5120 d=2");
     let reps = 5usize;
 
-    let (cpu_t, cpu_out) = time_fit(reps, || ws.cpu_reference_fit(&opts).ok());
-    let (reup_t, reup_out) = time_fit(reps, || ws.device_reupload_fit(&opts).ok());
-    let (res_t, res_out) = time_fit(reps, || ws.device_fit(&opts).ok());
-
-    let cpu_out = cpu_out.expect("cpu reference must produce an outcome");
-    let res_out = match res_out {
-        Some(o) => o,
-        None => {
-            println!("DEVRES_1017 RESIDENT_DECLINED — device frame did not admit the workload");
-            return;
-        }
-    };
+    let (cpu_t, cpu_out) =
+        time_fit(reps, || ws.cpu_reference_fit(&opts)).expect("CPU reference fit");
+    let (reup_t, reup_out) = time_fit(reps, || ws.device_reupload_fit(&opts))
+        .expect("device re-upload fit must converge after device admission");
+    let (res_t, res_out) = time_fit(reps, || ws.device_fit(&opts))
+        .expect("device-resident fit must converge after device admission");
+    assert!(cpu_out.converged, "CPU reference returned a partial fit");
+    assert!(reup_out.converged, "re-upload path returned a partial fit");
+    assert!(res_out.converged, "resident path returned a partial fit");
 
     // ---- parity: resident vs CPU reference ----
     let parity = max_abs_diff(&res_out, &cpu_out);
@@ -128,6 +123,10 @@ fn main() {
          pass={}",
         parity <= parity_tol
     );
+    assert!(
+        parity <= parity_tol,
+        "device-resident result differs from CPU by {parity:.3e}, tolerance {parity_tol:.3e}"
+    );
     println!(
         "DEVRES_1017 resident   iters={} accepted={} converged={} execution_path={} objective={:.9e} \
          logdetH={:.6e} wall_ms={:.3}",
@@ -139,14 +138,12 @@ fn main() {
         res_out.log_det_hessian,
         res_t.as_secs_f64() * 1e3,
     );
-    if let Some(reup) = reup_out {
-        println!(
-            "DEVRES_1017 reupload   iters={} converged={} wall_ms={:.3}",
-            reup.iterations,
-            reup.converged,
-            reup_t.as_secs_f64() * 1e3,
-        );
-    }
+    println!(
+        "DEVRES_1017 reupload   iters={} converged={} wall_ms={:.3}",
+        reup_out.iterations,
+        reup_out.converged,
+        reup_t.as_secs_f64() * 1e3,
+    );
     println!(
         "DEVRES_1017 cpu        iters={} converged={} objective={:.9e} wall_ms={:.3}",
         cpu_out.iterations,

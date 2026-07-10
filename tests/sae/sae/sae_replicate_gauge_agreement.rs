@@ -212,7 +212,7 @@ fn run_production_fit(z: &Array2<f64>, coord_seed: &[f64], label: &str) -> SaeMa
     problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
-    objective.into_fitted().term
+    objective.into_fitted().expect("outer fit was evaluated").term
 }
 
 /// `(cos 2πθ, sin 2πθ)` circle embedding of a coordinate vector (period 1).

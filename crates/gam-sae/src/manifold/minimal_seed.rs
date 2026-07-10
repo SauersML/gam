@@ -67,11 +67,15 @@ pub fn build_sae_minimal_seed(
         return Err("sae_manifold_fit_minimal: target contains non-finite values".to_string());
     }
 
-    let overrides = if request.atom_basis.iter().any(|basis| basis == "auto") {
-        let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
+    let auto_labels = if request.atom_basis.iter().any(|basis| basis == "auto") {
+        Some(sae_output_energy_cluster_labels(request.target, k_atoms))
+    } else {
+        None
+    };
+    let overrides = if let Some(labels) = auto_labels.as_ref() {
         crate::structure_harvest::resolve_auto_primary_atoms(
             request.target,
-            &labels,
+            labels,
             &mut request.atom_basis,
             &mut request.atom_dim,
         )?
@@ -83,7 +87,21 @@ pub fn build_sae_minimal_seed(
         .iter()
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
-    let seed_coords = sae_pca_seed_initial_coords(request.target, &basis_kinds, &request.atom_dim)?;
+    let mut seed_coords =
+        sae_pca_seed_initial_coords(request.target, &basis_kinds, &request.atom_dim)?;
+    if basis_kinds
+        .iter()
+        .any(|kind| matches!(kind, SaeAtomBasisKind::Mobius))
+    {
+        let labels = auto_labels
+            .unwrap_or_else(|| sae_output_energy_cluster_labels(request.target, k_atoms));
+        sae_refine_mobius_seed_coords_by_cluster(
+            request.target,
+            &basis_kinds,
+            &labels,
+            &mut seed_coords,
+        )?;
+    }
     let plans = sae_build_atom_plans(
         request.target,
         &request.atom_basis,

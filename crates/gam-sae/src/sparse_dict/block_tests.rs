@@ -12,6 +12,32 @@ use crate::sparse_dict::{
 };
 use ndarray::{Array1, Array2};
 
+#[test]
+fn scalar_budget_constructor_preserves_topk64_exactly() {
+    let config = BlockSparseConfig::from_scalar_budget(114_688, 64, 4)
+        .expect("DeepSeek-V3 comparison budget partitions into complete blocks");
+    assert_eq!(config.n_blocks, 28_672);
+    assert_eq!(config.block_topk, 16);
+    assert_eq!(config.block_size, 4);
+    assert_eq!(config.n_atoms(), 114_688);
+    assert_eq!(config.active_atoms(), 64);
+}
+
+#[test]
+fn scalar_budget_constructor_never_rounds_capacity_or_activity() {
+    let capacity = BlockSparseConfig::from_scalar_budget(114_689, 64, 4)
+        .expect_err("a partial final block must be rejected");
+    assert!(capacity.contains("not divisible"), "{capacity}");
+
+    let activity = BlockSparseConfig::from_scalar_budget(114_688, 63, 4)
+        .expect_err("a partial active block must be rejected");
+    assert!(activity.contains("not divisible"), "{activity}");
+
+    let excessive = BlockSparseConfig::from_scalar_budget(32, 64, 4)
+        .expect_err("the active budget cannot exceed scalar capacity");
+    assert!(excessive.contains("active_atoms in"), "{excessive}");
+}
+
 /// Deterministic LCG in `[-1, 1)` (no RNG dependency → reproducible tests).
 fn lcg(state: &mut u64) -> f32 {
     *state = state

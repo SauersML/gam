@@ -39,10 +39,8 @@ def test_ibp_map_gradcheck() -> None:
     rows, cols = 4, 6
     logits = torch.randn(rows, cols, dtype=torch.float64, requires_grad=True)
     temperature = 0.37
-    alpha = 2.5
-
     assert torch.autograd.gradcheck(
-        lambda x: ibp_map(x, temperature, alpha),
+        lambda x: ibp_map(x, temperature),
         (logits,),
         eps=1e-6,
         atol=1e-6,
@@ -50,21 +48,21 @@ def test_ibp_map_gradcheck() -> None:
     )
 
 
-def _assert_matches_rust(rows: int, cols: int, temperature: float, alpha: float) -> None:
+def _assert_matches_rust(rows: int, cols: int, temperature: float) -> None:
     rust = _rust_module()
 
     rng = np.random.default_rng(1234)
     logits_np = rng.standard_normal((rows, cols))
     logits = torch.tensor(logits_np, dtype=torch.float64, requires_grad=True)
 
-    value = ibp_map(logits, temperature, alpha)
+    value = ibp_map(logits, temperature)
 
     # Reference: run the Rust row kernel independently on each row.
     rust_value = np.empty_like(logits_np)
     rust_grad = np.empty_like(logits_np)
     for r in range(rows):
         v_r, g_r = rust.sae_ibp_map_value_grad(
-            np.ascontiguousarray(logits_np[r]), float(temperature), float(alpha)
+            np.ascontiguousarray(logits_np[r]), float(temperature)
         )
         rust_value[r] = np.asarray(v_r, dtype=np.float64)
         rust_grad[r] = np.asarray(g_r, dtype=np.float64)
@@ -93,15 +91,9 @@ def _assert_matches_rust(rows: int, cols: int, temperature: float, alpha: float)
 
 def test_ibp_map_matches_rust_row_by_row() -> None:
     """Torch forward value + diagonal Jacobian match the Rust kernel to 1e-9."""
-    _assert_matches_rust(rows=5, cols=7, temperature=0.41, alpha=2.5)
+    _assert_matches_rust(rows=5, cols=7, temperature=0.41)
 
 
-def test_ibp_map_matches_rust_large_k_prior_floor() -> None:
-    """Large K exercises the log-space prior accumulation + tiny floor.
-
-    ``(α/(α+1))^{k+1}`` underflows a naive running product past ~atom 320 for
-    α = 0.1/1.1; the Rust prior accumulates in log space and floors at
-    ``f64::MIN_POSITIVE``. The torch path mirrors that with ``clamp_min(tiny)``,
-    so parity here proves the floor is transcribed correctly.
-    """
-    _assert_matches_rust(rows=3, cols=400, temperature=0.5, alpha=1.0)
+def test_ibp_map_matches_rust_large_k() -> None:
+    """The allocation-free posterior-mean kernel remains exact at large K."""
+    _assert_matches_rust(rows=3, cols=400, temperature=0.5)

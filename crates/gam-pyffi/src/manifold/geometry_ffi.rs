@@ -5475,6 +5475,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_steer_rows, module)?)?;
     module.add_function(wrap_pyfunction!(block_sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
+        fixed_budget_block_sparse_dictionary_fit,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         block_sparse_dictionary_transform_ffi,
         module
     )?)?;
@@ -6369,7 +6373,67 @@ fn block_sparse_dictionary_fit<'py>(
         matryoshka_prefix,
         tolerance,
     };
-    let (fit, dual_cert) = detach_py_result(py, "block_sparse_dictionary_fit", move || {
+    block_sparse_dictionary_fit_payload(py, x_values, config, "block_sparse_dictionary_fit")
+}
+
+/// Comparison-safe block-sparse fit whose capacity and active budget are both
+/// expressed in scalar decoder coordinates.  `n_atoms` is the exact decoder-row
+/// count and `active` is the exact maximum scalar coordinates per row.  Rust
+/// refuses a block layout that would require rounding either number.
+#[pyfunction(signature = (
+    x,
+    n_atoms,
+    active,
+    block_size,
+    max_epochs = 30,
+    minibatch = 512,
+    block_tile = 1024,
+    frame_ridge = 1.0e-9,
+    aux_k = 0,
+    matryoshka_prefix = false,
+    tolerance = 1.0e-6
+))]
+fn fixed_budget_block_sparse_dictionary_fit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    n_atoms: usize,
+    active: usize,
+    block_size: usize,
+    max_epochs: usize,
+    minibatch: usize,
+    block_tile: usize,
+    frame_ridge: f64,
+    aux_k: usize,
+    matryoshka_prefix: bool,
+    tolerance: f64,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let mut config = BlockSparseConfig::from_scalar_budget(n_atoms, active, block_size)
+        .map_err(py_value_error)?;
+    config.max_epochs = max_epochs;
+    config.minibatch = minibatch;
+    config.block_tile = block_tile;
+    config.frame_ridge = frame_ridge;
+    config.aux_k = aux_k;
+    config.matryoshka_prefix = matryoshka_prefix;
+    config.tolerance = tolerance;
+    block_sparse_dictionary_fit_payload(
+        py,
+        x_values,
+        config,
+        "fixed_budget_block_sparse_dictionary_fit",
+    )
+}
+
+fn block_sparse_dictionary_fit_payload<'py>(
+    py: Python<'py>,
+    x_values: Array2<f32>,
+    config: BlockSparseConfig,
+    operation: &'static str,
+) -> PyResult<Py<PyDict>> {
+    let n_atoms = config.n_atoms();
+    let active_atoms = config.active_atoms();
+    let (fit, dual_cert) = detach_py_result(py, operation, move || {
         let fit = fit_block_sparse_dictionary(x_values.view(), &config)?;
         // Block-lane global-optimality dual certificate (gate of the residual),
         // computed in the same detached block so every block fit emits it.
@@ -6401,6 +6465,8 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("convergence", convergence)?;
     out.set_item("block_topk", fit.block_topk)?;
     out.set_item("block_size", fit.block_size)?;
+    out.set_item("n_atoms", n_atoms)?;
+    out.set_item("active", active_atoms)?;
     out.set_item(
         "dual_certificate",
         dual_certificate_report_dict(py, &dual_cert)?,

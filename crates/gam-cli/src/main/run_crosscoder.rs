@@ -211,6 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn crosscoder_help_exposes_named_npy_and_transport_contracts() {
+        let error = Cli::try_parse_from(["gam", "crosscoder", "--help"])
+            .expect_err("--help should return clap's display-help result");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        for required in [
+            "--anchor <LABEL=FILE>",
+            "--block <LABEL=FILE>",
+            "--transport-grid-resolution",
+            "--law-gap-tolerance",
+            "--out <REPORT.json>",
+        ] {
+            assert!(help.contains(required), "missing {required:?} in:\n{help}");
+        }
+    }
+
+    #[test]
     fn npy_reader_accepts_2d_f32_and_preserves_shape() {
         let mut file = tempfile::NamedTempFile::new().expect("temp NPY");
         {

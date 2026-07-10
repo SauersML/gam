@@ -354,6 +354,7 @@ mod selected_inverse_row_blocks_oracle_tests {
             gauge_deflated_directions: 0,
             deflated_row_directions: Arc::from(Vec::new()),
             deflation_row_spectra: Arc::from(Vec::new()),
+            beta_gauge_quotient: None,
             cross_row_woodbury: None,
         }
     }

@@ -137,8 +137,8 @@ pub(crate) use gam_linalg::faer_ndarray::{
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
 pub(crate) use gam_solve::arrow_schur::{
-    ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, arrow_factor_max_pivot,
-    arrow_factor_min_pivot, probe_undamped_evidence_row_factors,
+    ArrowBetaGaugeQuotient, ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum,
+    arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors,
     solve_arrow_newton_step_with_options,
 };
 
@@ -180,12 +180,13 @@ mod amortized_routing;
 mod arrow_solver;
 mod atom;
 mod atom_build;
-mod chart_atlas;
 mod basin_bundle;
 mod behavior;
+mod behavior_entry;
 mod behavior_fit;
 mod behavior_isometry;
 mod certificate;
+mod chart_atlas;
 mod checkpoint;
 mod construction;
 mod construction_ard;
@@ -434,12 +435,13 @@ mod tests_joint_vs_cascade_2131;
 
 pub use arrow_solver::*;
 pub use atom::*;
-pub use chart_atlas::*;
 pub use basin_bundle::*;
 pub use behavior::*;
+pub use behavior_entry::*;
 pub use behavior_fit::*;
 pub use behavior_isometry::*;
 pub use certificate::*;
+pub use chart_atlas::*;
 pub use construction_aux_types::*;
 pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;

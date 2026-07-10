@@ -99,7 +99,7 @@ def test_ibp_gumbel_k4_forward_backward_matches_numeric() -> None:
     logits_np = rng.standard_normal((5, 4))
     logits = torch.as_tensor(logits_np, dtype=torch.float64, requires_grad=True)
 
-    assignments = ibp_map(logits, tau, alpha)
+    assignments = ibp_map(logits, tau)
     # Scalarize with a fixed non-uniform weighting so the backprop exercises a
     # full Jacobian-vector product, not just a row sum.
     w_np = rng.standard_normal(assignments.shape)
@@ -118,8 +118,8 @@ def test_ibp_gumbel_k4_forward_backward_matches_numeric() -> None:
             lp[i, j] += h
             lm[i, j] -= h
             with torch.no_grad():
-                vp = ibp_map(torch.as_tensor(lp, dtype=torch.float64), tau, alpha).numpy()
-                vm = ibp_map(torch.as_tensor(lm, dtype=torch.float64), tau, alpha).numpy()
+                vp = ibp_map(torch.as_tensor(lp, dtype=torch.float64), tau).numpy()
+                vm = ibp_map(torch.as_tensor(lm, dtype=torch.float64), tau).numpy()
             numeric[i, j] = float(np.sum(w_np * (vp - vm)) / (2.0 * h))
 
     np.testing.assert_allclose(autograd_grad, numeric, rtol=1e-6, atol=1e-7)

@@ -145,11 +145,15 @@ impl UnitSpeedChartTransition {
         self.from_chart = old_to_new
             .get(self.from_chart)
             .and_then(|x| *x)
-            .ok_or_else(|| "cannot remove an atlas chart while its seam is registered".to_string())?;
+            .ok_or_else(|| {
+                "cannot remove an atlas chart while its seam is registered".to_string()
+            })?;
         self.to_chart = old_to_new
             .get(self.to_chart)
             .and_then(|x| *x)
-            .ok_or_else(|| "cannot remove an atlas chart while its seam is registered".to_string())?;
+            .ok_or_else(|| {
+                "cannot remove an atlas chart while its seam is registered".to_string()
+            })?;
         Ok(())
     }
 }
@@ -175,7 +179,10 @@ pub struct ManifoldChartAtlas {
 impl ManifoldChartAtlas {
     #[must_use = "atlas validation errors must be handled"]
     pub fn from_transition(transition: UnitSpeedChartTransition) -> Result<Self, String> {
-        let charts = vec![transition.from_chart.min(transition.to_chart), transition.from_chart.max(transition.to_chart)];
+        let charts = vec![
+            transition.from_chart.min(transition.to_chart),
+            transition.from_chart.max(transition.to_chart),
+        ];
         let atlas = Self {
             charts,
             transitions: vec![transition],
@@ -336,13 +343,21 @@ impl ManifoldChartAtlas {
         &self,
         row_assignments: ArrayView1<'_, f64>,
     ) -> Result<(f64, Array1<f64>), String> {
-        if let Some(&bad) = self.charts.iter().find(|&&chart| chart >= row_assignments.len()) {
+        if let Some(&bad) = self
+            .charts
+            .iter()
+            .find(|&&chart| chart >= row_assignments.len())
+        {
             return Err(format!(
                 "atlas chart {bad} is outside assignment row width {}",
                 row_assignments.len()
             ));
         }
-        let activation: f64 = self.charts.iter().map(|&chart| row_assignments[chart]).sum();
+        let activation: f64 = self
+            .charts
+            .iter()
+            .map(|&chart| row_assignments[chart])
+            .sum();
         if !(activation.is_finite() && activation >= 0.0) {
             return Err(format!(
                 "atlas activation must be finite and nonnegative, got {activation}"
@@ -370,9 +385,7 @@ impl ManifoldChartAtlas {
                 old_to_new
                     .get(chart)
                     .and_then(|x| *x)
-                    .ok_or_else(|| {
-                        format!("cannot remove registered atlas chart {chart}")
-                    })?,
+                    .ok_or_else(|| format!("cannot remove registered atlas chart {chart}"))?,
             );
         }
         charts.sort_unstable();
@@ -530,15 +543,7 @@ mod tests {
     use ndarray::array;
 
     fn tr(from: usize, to: usize, sign: i8, offset: f64) -> UnitSpeedChartTransition {
-        UnitSpeedChartTransition::new(
-            from,
-            to,
-            sign,
-            offset,
-            1.0,
-            AtlasSeamKind::Regular,
-        )
-        .unwrap()
+        UnitSpeedChartTransition::new(from, to, sign, offset, 1.0, AtlasSeamKind::Regular).unwrap()
     }
 
     #[test]
@@ -549,7 +554,10 @@ mod tests {
         assert_eq!(identity.sign, 1);
         assert_eq!(identity.offset.to_bits(), 0.0_f64.to_bits());
         for coordinate in [0.0, 0.125, 0.75, 1.25] {
-            assert!((ba.apply(ab.apply(coordinate)) - coordinate.rem_euclid(1.0)).abs() < 8.0 * f64::EPSILON);
+            assert!(
+                (ba.apply(ab.apply(coordinate)) - coordinate.rem_euclid(1.0)).abs()
+                    < 8.0 * f64::EPSILON
+            );
         }
     }
 
@@ -557,7 +565,10 @@ mod tests {
     fn sign_holonomy_distinguishes_coordinate_reversal_from_mobius() {
         // One negative edge is removable by flipping one chart orientation.
         let mut interval_cover = ManifoldChartAtlas::from_transition(tr(0, 1, -1, 0.0)).unwrap();
-        assert_eq!(interval_cover.orientability(), AtlasOrientability::Orientable);
+        assert_eq!(
+            interval_cover.orientability(),
+            AtlasOrientability::Orientable
+        );
 
         interval_cover.add_transition(tr(1, 2, 1, 0.0)).unwrap();
         interval_cover.add_transition(tr(2, 0, 1, 0.0)).unwrap();

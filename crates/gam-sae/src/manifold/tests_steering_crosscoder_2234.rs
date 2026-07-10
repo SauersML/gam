@@ -88,7 +88,11 @@ fn e3_crosscoder_handoff_uses_one_shared_moved_coordinate() {
 
     assert_eq!(moved_anchor.dim(), (n, 2));
     assert_eq!(moved_downstream.dim(), (n, 2));
-    assert_eq!(term.assignment.coords.len(), 1, "the two decoder blocks share one chart");
+    assert_eq!(
+        term.assignment.coords.len(),
+        1,
+        "the two decoder blocks share one chart"
+    );
     for row in 0..n {
         let t = coords[[row, 0]];
         let expected_anchor = circular_pair(t + delta);
@@ -109,7 +113,7 @@ fn e3_crosscoder_handoff_uses_one_shared_moved_coordinate() {
             assert!(
                 (downstream_delta[[row, col]]
                     - (moved_downstream[[row, col]] - base_downstream[[row, col]]))
-                    .abs()
+                .abs()
                     < 1.0e-12,
                 "downstream delta must be the moved-minus-base contribution"
             );

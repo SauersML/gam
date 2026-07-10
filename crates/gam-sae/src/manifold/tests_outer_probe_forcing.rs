@@ -286,7 +286,7 @@ fn ew_forcing_engages_on_full_outer_walk() {
         "the counted probe lane must have driven the line-search value probes; telemetry: \
          {telemetry:?}"
     );
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     assert!(
         ev > 0.5,

@@ -171,9 +171,56 @@ impl BlockSparseConfig {
         }
     }
 
+    /// Construct a block dictionary from a **scalar** capacity and scalar
+    /// per-row active budget.
+    ///
+    /// This is the comparison-safe constructor: `n_atoms` counts decoder rows
+    /// and `active_atoms` counts active scalar coordinates, exactly as they do
+    /// for a scalar TopK SAE.  Both quantities must partition into complete
+    /// blocks.  There is deliberately no rounding or clamping: changing either
+    /// quantity would launder capacity or sparsity through the block layout.
+    pub fn from_scalar_budget(
+        n_atoms: usize,
+        active_atoms: usize,
+        block_size: usize,
+    ) -> Result<Self, String> {
+        if block_size == 0 {
+            return Err("block sparse scalar budget requires block_size >= 1".to_string());
+        }
+        if n_atoms == 0 {
+            return Err("block sparse scalar budget requires n_atoms >= 1".to_string());
+        }
+        if active_atoms == 0 || active_atoms > n_atoms {
+            return Err(format!(
+                "block sparse scalar budget requires active_atoms in [1, {n_atoms}]; got {active_atoms}"
+            ));
+        }
+        if n_atoms % block_size != 0 {
+            return Err(format!(
+                "block sparse scalar capacity K={n_atoms} is not divisible by block_size={block_size}"
+            ));
+        }
+        if active_atoms % block_size != 0 {
+            return Err(format!(
+                "block sparse scalar active budget s={active_atoms} is not divisible by block_size={block_size}"
+            ));
+        }
+        Ok(Self {
+            n_blocks: n_atoms / block_size,
+            block_size,
+            block_topk: active_atoms / block_size,
+            ..Self::default()
+        })
+    }
+
     /// Dictionary width `K = G·b`.
     pub fn n_atoms(&self) -> usize {
         self.n_blocks * self.block_size
+    }
+
+    /// Maximum active scalar coordinates per row, `block_topk * block_size`.
+    pub fn active_atoms(&self) -> usize {
+        self.block_topk * self.block_size
     }
 }
 
@@ -1638,6 +1685,12 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
         return Err(BlockSparseFitError::invalid_input(
             "fit_block_sparse_dictionary requires block_topk >= 1",
         ));
+    }
+    if config.block_topk > config.n_blocks {
+        return Err(BlockSparseFitError::invalid_input(format!(
+            "fit_block_sparse_dictionary block_topk={} exceeds n_blocks={}; the active budget is never clamped",
+            config.block_topk, config.n_blocks
+        )));
     }
     if config.max_epochs == 0 {
         return Err(BlockSparseFitError::invalid_input(

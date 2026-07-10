@@ -31,6 +31,27 @@ pub const SCHUR_SLQ_LOGDET_LANCZOS_STEPS: usize = 64;
 /// so the probe vectors are derived from this constant — never a system RNG.
 pub const SCHUR_SLQ_LOGDET_SEED: u64 = 0x5121_0901_4C0D_E700;
 
+#[inline]
+fn evidence_beta_gauge_active(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> bool {
+    ridge_t == 0.0
+        && ridge_beta == 0.0
+        && options.tolerate_ill_conditioning
+        && sys.beta_gauge_quotient.is_some()
+}
+
+#[inline]
+fn pin_evidence_beta_schur(sys: &ArrowSchurSystem, schur: Array2<f64>) -> Array2<f64> {
+    match sys.beta_gauge_quotient.as_ref() {
+        Some(quotient) => quotient.pin_reduced_schur(schur.view()),
+        None => schur,
+    }
+}
+
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
 /// mode, returning the factor cache alongside the increments.
 ///
@@ -123,17 +144,27 @@ pub fn solve_arrow_newton_step_with_options(
         )
     };
     let mut schur_factor_is_undamped = sys.k == 0 || (ridge_t == 0.0 && ridge_beta == 0.0);
+    let mut beta_gauge_factor_is_pinned = evidence_beta_gauge_active(
+        sys,
+        ridge_t,
+        ridge_beta,
+        options,
+    );
     if sys.k > 0 && !schur_factor_is_undamped {
         let evidence_htt_factors = match &htt_factors_undamped {
             ArrowUndampedFactors::SameAsDamped => &htt_factors,
             ArrowUndampedFactors::Owned(factors) => factors,
         };
-        let evidence_schur = build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend)?;
+        let evidence_schur = pin_evidence_beta_schur(
+            sys,
+            build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend)?,
+        );
         let (evidence_schur_factor, floored_evidence_schur) =
             factor_dense_reduced_schur(&evidence_schur, options.schur_pd_floor, true)?;
         drop(floored_evidence_schur);
         schur_factor = Some(evidence_schur_factor);
         schur_factor_is_undamped = true;
+        beta_gauge_factor_is_pinned = sys.beta_gauge_quotient.is_some();
     }
 
     let mut cache = ArrowFactorCache {
@@ -156,6 +187,9 @@ pub fn solve_arrow_newton_step_with_options(
         gauge_deflated_directions,
         deflated_row_directions: Arc::from(deflated_row_directions),
         deflation_row_spectra: Arc::from(deflation_row_spectra),
+        beta_gauge_quotient: beta_gauge_factor_is_pinned
+            .then(|| sys.beta_gauge_quotient.clone())
+            .flatten(),
         cross_row_woodbury: None,
     };
     let mut delta_t = step.delta_t;
@@ -824,6 +858,11 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 let schur = match build_dense_schur_direct(sys, htt_factors, ridge_beta, backend) {
                     Ok(schur) => schur,
                     Err(err) => return Some(Err(err)),
+                };
+                let schur = if evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options) {
+                    pin_evidence_beta_schur(sys, schur)
+                } else {
+                    schur
                 };
                 let factor = match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
                     Ok((_cpu_delta_beta, Some(factor), _diag)) => factor,
@@ -2178,6 +2217,15 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
+    let beta_gauge_active = evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options);
+    let rhs_beta_evidence = if beta_gauge_active {
+        sys.beta_gauge_quotient
+            .as_ref()
+            .expect("active beta gauge quotient")
+            .project_complement(rhs_beta.view())
+    } else {
+        rhs_beta.clone()
+    };
     // The Schur solve is over the reduced β vector. Latent manifold metric
     // weights live on each d-dimensional t_i block, so the induced metric for
     // this β-only Steihaug problem is Euclidean.
@@ -2196,7 +2244,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             if let Some(device_step) = try_device_arrow_direct_sae_pcg(
                 sys,
                 &htt_factors,
-                &rhs_beta,
+                &rhs_beta_evidence,
                 ridge_t,
                 ridge_beta,
                 options,
@@ -2208,7 +2256,13 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 return device_step;
             }
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
-            if let Some(attempt) = try_mixed_precision_arrow_solve(
+            let schur = if beta_gauge_active {
+                pin_evidence_beta_schur(sys, schur)
+            } else {
+                schur
+            };
+            if !beta_gauge_active
+                && let Some(attempt) = try_mixed_precision_arrow_solve(
                 sys,
                 ridge_t,
                 ridge_beta,
@@ -2245,12 +2299,23 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 }
             }
             let (db, sf, diag) =
-                solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+                solve_dense_reduced_system(
+                    &schur,
+                    &rhs_beta_evidence,
+                    options,
+                    trust_metric_weights,
+                )?;
             (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
-            if let Some(attempt) = try_mixed_precision_arrow_solve(
+            let schur = if beta_gauge_active {
+                pin_evidence_beta_schur(sys, schur)
+            } else {
+                schur
+            };
+            if !beta_gauge_active
+                && let Some(attempt) = try_mixed_precision_arrow_solve(
                 sys,
                 ridge_t,
                 ridge_beta,
@@ -2287,10 +2352,21 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 }
             }
             let (db, sf, diag) =
-                solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+                solve_dense_reduced_system(
+                    &schur,
+                    &rhs_beta_evidence,
+                    options,
+                    trust_metric_weights,
+                )?;
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
+            if beta_gauge_active {
+                return Err(ArrowSchurError::SchurFactorFailed {
+                    reason: "evidence beta-gauge quotient requires a dense Direct/SqrtBA factor or the dedicated matrix-free evidence operator; InexactPCG does not return an evidence factor"
+                        .to_string(),
+                });
+            }
             if options.solve_precision.is_enabled() {
                 log::info!(
                     "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
@@ -2432,6 +2508,14 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     }
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
+    let delta_beta = if beta_gauge_active {
+        sys.beta_gauge_quotient
+            .as_ref()
+            .expect("active beta gauge quotient")
+            .project_complement(delta_beta.view())
+    } else {
+        delta_beta
+    };
     let delta_t = back_substitute_delta_t(sys, &htt_factors, delta_beta.view(), &backend);
 
     Ok(ArrowNewtonStepArtifacts {

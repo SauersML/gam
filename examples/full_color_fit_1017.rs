@@ -53,6 +53,8 @@ const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
+const GATE_TEMPERATURE: f64 = 0.5;
+const IBP_CONCENTRATION: f64 = 1.0;
 
 struct Lcg {
     state: u64,
@@ -140,7 +142,9 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
         logits(N, &mut rng),
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::softmax(1.0),
+        // Match the #1017 production color-arm gate exactly; this explicit
+        // diagnostic fixture does not alter the library's default assignment.
+        AssignmentMode::ibp_map(GATE_TEMPERATURE, IBP_CONCENTRATION, false),
     )?;
     let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     let target = term.fitted();
@@ -196,8 +200,13 @@ fn run() -> Result<(), String> {
     );
     // A single explicit initial state: the optimizer moves continuously in rho;
     // no seed lattice or grid is evaluated.
-    let problem = OuterProblem::new(initial_rho_flat.len())
-        .with_initial_rho(initial_rho_flat)
+    let rho_dim = initial_rho_flat.len();
+    let search_initial_rho = objective
+        .try_resume_from_checkpoint(rho_dim)
+        .map(Array1::from)
+        .unwrap_or(initial_rho_flat);
+    let problem = OuterProblem::new(rho_dim)
+        .with_initial_rho(search_initial_rho)
         .with_seed_config(SeedConfig {
             max_seeds: 1,
             seed_budget: 1,
@@ -219,6 +228,9 @@ fn run() -> Result<(), String> {
     }
 
     // Only consume/mint the fitted model after the convergence certificate.
+    // A successful fit no longer needs its wall-survival checkpoint; match the
+    // production front door's completion transaction before consuming state.
+    objective.remove_checkpoint();
     let fitted = objective.into_fitted();
     let elapsed = started.elapsed();
     let telemetry_after = telemetry_snapshot();

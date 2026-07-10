@@ -107,9 +107,7 @@ impl SaeManifoldTerm {
             ));
         }
         match layer {
-            CrosscoderLayer::Anchor => {
-                Ok(values.slice(s![.., 0..layout.anchor_dim()]).to_owned())
-            }
+            CrosscoderLayer::Anchor => Ok(values.slice(s![.., 0..layout.anchor_dim()]).to_owned()),
             CrosscoderLayer::Block(index) => {
                 if index >= layout.num_blocks() {
                     return Err(format!(

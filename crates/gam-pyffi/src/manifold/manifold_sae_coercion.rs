@@ -300,7 +300,6 @@ pub(crate) fn sae_activation_matrix_from_logits<'py>(
         logits.as_array(),
         kind,
         temperature,
-        effective_alpha,
         threshold,
     )
     .map(|values| values.into_pyarray(py).unbind())

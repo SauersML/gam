@@ -171,7 +171,7 @@ fn sae_manifold_circle_d2_ridge0_fits() {
             "outer cascade must complete on an over-parametrized (d=2) circle chart at ridge-0 \
              — the rank-1 radial-null refusal reproduces #1095/#2228",
         );
-    let fitted = objective.into_fitted();
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let mut fitted_term = fitted.term;
     let fitted_out = fitted_term.fitted();
     let r2 = reconstruction_r2(&fitted_out, &z);
@@ -255,9 +255,7 @@ fn zz_1095_2228_measure_seed_vs_settled_r2() {
             "SAE d=2 circle ridge-0 measure (#1095/#2228)",
         )
         .expect("outer cascade completes");
-    let fitted = objective.into_fitted();
-    let used_pristine = fitted.used_pristine_seed_fallback;
-    let used_seed_basin = fitted.used_seed_basin_fallback;
+    let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let charts_canonicalized = fitted.charts_canonicalized;
     let fitted_term = fitted.term;
     let returned_r2 = reconstruction_r2(&fitted_term.fitted(), &z);
@@ -267,8 +265,7 @@ fn zz_1095_2228_measure_seed_vs_settled_r2() {
     );
     println!(
         "[#1095/#2228 measure] cold_seed_R2={seed_r2:.6} returned_R2={returned_r2:.6} \
-         final_value={:.6e} used_pristine_seed_fallback={used_pristine} \
-         used_seed_basin_fallback={used_seed_basin} charts_canonicalized={charts_canonicalized} \
+         final_value={:.6e} charts_canonicalized={charts_canonicalized} \
          (a1=σ(0)·π0=0.25 → predicted gated-seed R2≈0.4375)",
         result.final_value
     );

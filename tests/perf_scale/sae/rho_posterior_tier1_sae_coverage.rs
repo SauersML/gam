@@ -171,7 +171,10 @@ fn fit_band_at_rho(
     let shape = objective
         .decoder_shape_uncertainty()
         .expect("decoder shape uncertainty at rho");
-    let term = objective.into_fitted().term;
+    let term = objective
+        .into_fitted()
+        .expect("outer fit was evaluated")
+        .term;
     fixed_grid_mean_var(&term, &shape)
 }
 
@@ -180,7 +183,10 @@ fn fit_mean_at_rho(theta: &[f64], z: &Array2<f64>, rho: ArrayView1<'_, f64>) -> 
     objective
         .eval(&rho.to_owned())
         .expect("SAE exact-gradient evaluation at rho");
-    let term = objective.into_fitted().term;
+    let term = objective
+        .into_fitted()
+        .expect("outer fit was evaluated")
+        .term;
     fixed_grid_mean(&term)
 }
 

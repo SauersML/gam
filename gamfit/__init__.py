@@ -110,6 +110,7 @@ from ._sparse_dictionary import (
     SparseDictionaryFit,
     block_sparse_dictionary_fit,
     block_sparse_dictionary_fit_begin,
+    fixed_budget_block_sparse_dictionary_fit,
     sparse_dictionary_fit,
     sparse_dictionary_fit_begin,
 )

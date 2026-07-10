@@ -1128,6 +1128,7 @@ pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),
+        beta_gauge_quotient: None,
         cross_row_woodbury: None,
     }
 }
@@ -1158,6 +1159,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),
+        beta_gauge_quotient: None,
         cross_row_woodbury: None,
     }
 }
@@ -1328,6 +1330,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         gauge_deflated_directions: 0,
         deflated_row_directions: std::sync::Arc::from(Vec::new()),
         deflation_row_spectra: std::sync::Arc::from(Vec::new()),
+        beta_gauge_quotient: None,
         cross_row_woodbury: None,
     }
 }

@@ -587,12 +587,8 @@ impl SaeCrosscoderFitReport {
         rows: &[usize],
         delta: ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
-        self.term.steer_layer_delta(
-            atom,
-            self.layer_from_label(layer_label)?,
-            rows,
-            delta,
-        )
+        self.term
+            .steer_layer_delta(atom, self.layer_from_label(layer_label)?, rows, delta)
     }
 
     pub fn steer_layer_decode(
@@ -602,12 +598,8 @@ impl SaeCrosscoderFitReport {
         rows: &[usize],
         delta: ndarray::ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
-        self.term.steer_layer_decode(
-            atom,
-            self.layer_from_label(layer_label)?,
-            rows,
-            delta,
-        )
+        self.term
+            .steer_layer_decode(atom, self.layer_from_label(layer_label)?, rows, delta)
     }
 
     /// Materialize the stable report shared by bindings. The optional transport
@@ -845,7 +837,7 @@ pub fn run_sae_crosscoder_fit(
         objective
     };
     objective.remove_checkpoint();
-    let fitted_result = objective.into_fitted();
+    let fitted_result = objective.into_fitted()?;
     let mut term = fitted_result.term;
     let rho = fitted_result.rho;
     let loss = fitted_result.loss;
