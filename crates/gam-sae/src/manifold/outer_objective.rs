@@ -3853,20 +3853,30 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let attempt = match first_attempt {
             Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
-                // A failed criterion call restores the pre-call term state, so a
-                // same-budget retry is a byte-identical replay — the rescue must
-                // grant genuinely more inner room (4×; the cost lane's two-stage
-                // envelope keeps its first stage's progress, which is why it
-                // certifies at the same ρ this lane refused).
-                self.term.reml_criterion_with_cache(
-                    self.target.view(),
-                    &rho_state,
-                    self.registry.as_ref(),
-                    self.inner_max_iter.saturating_mul(4).max(64),
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                )
+                // Two-stage rescue, mirroring what makes the COST lane succeed at
+                // the same ρ (measured: cost lane 1.128e3 vs this lane's wall,
+                // and a same-drive retry — even at 4× budget — replays the
+                // refusal). Stage 1: the envelope value probe converges the
+                // inner state through its chunked drive and leaves the warm
+                // start in place. Stage 2: the criterion certifies from that
+                // state and hands back the cache the gradient machinery needs.
+                match self.value_probe_with_budget_rescue(
+                    rho.view(),
+                    ProbeInnerDrive::Criterion {
+                        refine_progress_extension: true,
+                    },
+                ) {
+                    Ok(_warmed) => self.term.reml_criterion_with_cache(
+                        self.target.view(),
+                        &rho_state,
+                        self.registry.as_ref(),
+                        self.inner_max_iter,
+                        self.learning_rate,
+                        self.ridge_ext_coord,
+                        self.ridge_beta,
+                    ),
+                    Err(stage1) => Err(stage1),
+                }
             }
             other => other,
         };
