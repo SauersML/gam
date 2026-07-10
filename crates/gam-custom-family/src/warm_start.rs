@@ -491,9 +491,12 @@ mod assembly_convergence_tests {
     #[test]
     fn failed_outer_certificate_cannot_reach_fit_assembly() {
         let certificate = gam_solve::rho_optimizer::OuterCriterionCertificate {
-            grad_norm: 1.0,
-            projected_grad_norm: 1.0,
-            stationarity_bound: 0.1,
+            stationarity:
+                gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 1.0,
+                    projected_grad_norm: 1.0,
+                    bound: 0.1,
+                },
             hessian_psd: Some(true),
             lambdas_railed: Vec::new(),
         };

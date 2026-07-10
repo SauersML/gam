@@ -660,6 +660,15 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         Ok(r)
     }
 
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        let r = self.inner.eval_fixed_point_certificate(rho)?;
+        self.note(rho, None, r.cost);
+        Ok(r)
+    }
+
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Forward to the wrapped objective, then prime our last-inner-beta
         // cache so a subsequent finalize-write encodes the seeded β if no
@@ -716,6 +725,14 @@ pub struct ClosureObjective<
     /// Optional EFS evaluation closure. When `None`, the default
     /// `OuterObjective::eval_efs` returns an error.
     pub(crate) efs_fn: Option<Fefs>,
+    pub(crate) fixed_point_certificate_fn: Option<
+        Box<
+            dyn FnMut(
+                &mut S,
+                &Array1<f64>,
+            ) -> Result<FixedPointCertificateEval, EstimationError>,
+        >,
+    >,
     /// Optional seed-screening ranking proxy closure. When `None`,
     /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
     /// default), preserving legacy behavior for non-REML objectives.
@@ -784,6 +801,19 @@ where
         }
     }
 
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        crate::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
+        match self.fixed_point_certificate_fn.as_mut() {
+            Some(f) => f(&mut self.state, rho),
+            None => Err(EstimationError::RemlOptimizationFailed(
+                "fixed-point certification not implemented for this closure objective".to_string(),
+            )),
+        }
+    }
+
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Empty β: by convention, "no warm-start available" — treat as a
         // no-op install. Distinct from `NoSlot` because the objective may
@@ -822,6 +852,18 @@ where
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
     Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 {
+    pub fn with_fixed_point_certificate<Fcert>(mut self, certificate_fn: Fcert) -> Self
+    where
+        Fcert: FnMut(
+                &mut S,
+                &Array1<f64>,
+            ) -> Result<FixedPointCertificateEval, EstimationError>
+            + 'static,
+    {
+        self.fixed_point_certificate_fn = Some(Box::new(certificate_fn));
+        self
+    }
+
     pub fn with_seed_inner_state<Fseed>(
         self,
         seed_fn: Fseed,
@@ -837,6 +879,7 @@ where
             eval_order_fn: self.eval_order_fn,
             reset_fn: self.reset_fn,
             efs_fn: self.efs_fn,
+            fixed_point_certificate_fn: self.fixed_point_certificate_fn,
             screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
             continuation_prewarm: self.continuation_prewarm,
@@ -1143,6 +1186,22 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
             }
         }
         Ok(efs)
+    }
+
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        let native = self.to_native(rho);
+        let mut evaluation = self.inner.eval_fixed_point_certificate(&native)?;
+        if evaluation.coordinates.len() == self.perm.len() {
+            evaluation.coordinates = self
+                .perm
+                .iter()
+                .map(|&native_index| evaluation.coordinates[native_index].clone())
+                .collect();
+        }
+        Ok(evaluation)
     }
 
     fn reset(&mut self) {

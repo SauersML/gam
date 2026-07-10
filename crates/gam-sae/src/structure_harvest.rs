@@ -90,8 +90,8 @@ use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, UnitSpeedChartTransition,
-    amplitude_concentration_certificate, classify_occupancy_interval,
+    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SphereChartTransition,
+    UnitSpeedChartTransition, amplitude_concentration_certificate, classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
@@ -1870,6 +1870,50 @@ fn harvest_glue_proposals(
             proposed += 1;
         }
     }
+
+    // --- Sphere POLE-seam pass (#1890 Increment 2, the d=2 register emitter) ---
+    // Two `SphereChartEvaluator` charts whose poles sit in each other's interior
+    // are an irreducible atlas; the transition is an ambient rotation the 1-D
+    // lane cannot see. Screened with the SAME disjoint-support gate (over-tiling
+    // charts anti-correlate), certified by the ambient-rotation pole e-value, and
+    // always REGISTERED (a pole seam is never single-chart-coverable).
+    let mut sphere_candidates: Vec<(usize, usize)> = Vec::new();
+    for a in 0..k {
+        if support_sizes[a] == 0 || !matches!(term.atoms[a].basis_kind, SaeAtomBasisKind::Sphere) {
+            continue;
+        }
+        for b in (a + 1)..k {
+            if support_sizes[b] == 0
+                || !matches!(term.atoms[b].basis_kind, SaeAtomBasisKind::Sphere)
+                || term.charts_share_atlas(a, b)
+            {
+                continue;
+            }
+            let inter = (0..n_rows)
+                .filter(|&r| supports[a][r] && supports[b][r])
+                .count();
+            let expected = support_sizes[a] as f64 * support_sizes[b] as f64 / n_rows as f64;
+            if inter as f64 > expected {
+                continue;
+            }
+            sphere_candidates.push((a, b));
+        }
+    }
+    for &(a, b) in sphere_candidates.iter().take(budget) {
+        screened += 1;
+        if let Some((_transition, log_e)) = sphere_glue_pair_evalue(term, residuals, a, b) {
+            proposals.push(proposal(
+                term,
+                StructureMove::Glue {
+                    a,
+                    b,
+                    outcome: ChartGlueOutcome::RegisterAtlas,
+                },
+                log_e,
+            ));
+            proposed += 1;
+        }
+    }
     (proposed, screened)
 }
 
@@ -1936,6 +1980,39 @@ pub fn apply_structure_move(
             Ok((child, rho.clone()))
         }
         StructureMove::Glue { a, b, outcome } => {
+            // Sphere pole seam (d=2): the transition is an ambient rotation, not a
+            // 1-D affine map. Register it (keep both charts) — a pole seam has no
+            // destructive fuse outcome, since neither lat/lon chart covers both
+            // poles alone.
+            if is_sphere_pair(term, *a, *b) {
+                let mut child = term.clone();
+                match outcome {
+                    ChartGlueOutcome::RegisterAtlas => {
+                        let seam = fit_sphere_seam_transition(term, *a, *b).ok_or_else(|| {
+                            format!(
+                                "apply_structure_move: sphere seam ({a},{b}) is no longer identifiable"
+                            )
+                        })?;
+                        if !matches!(seam.seam_kind, AtlasSeamKind::Pole) {
+                            return Err(format!(
+                                "apply_structure_move: sphere seam ({a},{b}) is not a pole seam"
+                            ));
+                        }
+                        child.register_sphere_chart_transition(SphereChartTransition::new(
+                            *b,
+                            *a,
+                            seam.rotation,
+                            AtlasSeamKind::Pole,
+                        )?)?;
+                    }
+                    ChartGlueOutcome::Fuse => {
+                        return Err(format!(
+                            "apply_structure_move: sphere pole seam ({a},{b}) cannot be destructively fused"
+                        ));
+                    }
+                }
+                return Ok((child, rho.clone()));
+            }
             let seam = fit_seam_transition(term, *a, *b).ok_or_else(|| {
                 format!("apply_structure_move: chart seam ({a},{b}) is no longer identifiable")
             })?;

@@ -4412,16 +4412,28 @@ impl SaeManifoldTerm {
     /// atom `k` is the projection
     /// `t*_{ik} = argmin_t ‖x_i − Φ_k(t)·B_k‖²`. For a periodic curve this is a
     /// trigonometric polynomial: every stationary coordinate is enumerated by
-    /// the shared companion-root solver and compared globally. Coupled
-    /// multivariate compact charts are rejected before any atom is mutated: a
-    /// finite multistart support cannot certify that it found every stationary
-    /// component, and this crate does not yet expose the interval extensions or
-    /// polynomial-system solver needed to make that claim honestly.
+    /// the shared companion-root solver and compared globally. This exact
+    /// enumeration is available only for the rank-1 Fourier charts (periodic /
+    /// torus with `latent_dim == 1`).
     ///
-    /// Atoms with unbounded or basis-linear latents retain their incoming
-    /// coordinates. The decoder, assignment logits, smoothness penalties and rho
-    /// are untouched; only exact rank-1 Fourier coordinates and their basis
-    /// caches move.
+    /// Every other atom — coupled multivariate compact charts (sphere,
+    /// cylinder, Möbius, multivariate periodic/torus) and the unbounded or
+    /// basis-linear latents (Duchon, Euclidean patch, Poincaré, linear, finite
+    /// set) — **retains its incoming coordinates**. It is fed here already
+    /// carrying the natural-chart seed [`sae_pca_seed_initial_coords`] /
+    /// [`topology_curved_seed_initial_coords`] placed on it, and we do not
+    /// overwrite that with a dishonest fixed-lattice projection: a finite
+    /// multistart support cannot certify it found every stationary component of
+    /// a compact multivariate chart, and this crate does not yet expose the
+    /// interval extensions or polynomial-system solver needed to make that
+    /// completeness claim. Skipping refinement for those atoms is honest (no
+    /// completeness is asserted) and non-fatal (the natural-chart seed survives
+    /// into the joint solve), so a default fit whose topology race selects a
+    /// sphere / Möbius / swiss-sheet atom completes instead of aborting.
+    ///
+    /// The decoder, assignment logits, smoothness penalties and rho are
+    /// untouched; only exact rank-1 Fourier coordinates and their basis caches
+    /// move.
     pub fn seed_coords_by_decoder_projection(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -4434,30 +4446,15 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        // Reject the old fixed-lattice cases transactionally.  Doing this
-        // before the atom loop prevents a supported Fourier atom from moving
-        // before a later unsupported chart reports that complete stationary
-        // enumeration is unavailable.
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let needs_multivariate_enumerator = match &atom.basis_kind {
-                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => atom.latent_dim != 1,
-                SaeAtomBasisKind::Sphere
-                | SaeAtomBasisKind::Cylinder
-                | SaeAtomBasisKind::Mobius => true,
-                SaeAtomBasisKind::Duchon
-                | SaeAtomBasisKind::Linear
-                | SaeAtomBasisKind::EuclideanPatch
-                | SaeAtomBasisKind::Poincare
-                | SaeAtomBasisKind::FiniteSet
-                | SaeAtomBasisKind::Precomputed(_) => false,
-            };
-            if needs_multivariate_enumerator {
-                return Err(format!(
-                    "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} ({:?}, latent_dim {}) requires complete multivariate stationary-point enumeration; fixed-lattice projection is forbidden",
-                    &atom.basis_kind, atom.latent_dim
-                ));
-            }
-        }
+        // Atoms whose complete stationary set the rank-1 Fourier companion
+        // solver cannot enumerate (compact multivariate charts, and every
+        // unbounded / basis-linear latent) are SKIPPED below, retaining the
+        // natural-chart seed they arrived with. We deliberately do not perform a
+        // fixed-lattice projection for them: a finite multistart cannot certify
+        // completeness for a compact multivariate chart, so refining them here
+        // would assert a guarantee this engine does not carry. Skipping is
+        // honest and lets a default fit whose topology race selects a sphere /
+        // Möbius / swiss-sheet atom complete rather than abort.
         // ENRICHMENT (#980, role (c)): the order in which this discovery/seeding
         // pass *visits* rows is drawn from the per-row Fisher-mass sampling
         // measure when an output-Fisher harvest is present, so behaviorally-live
@@ -6855,7 +6852,13 @@ mod projection_policy_tests {
     use std::sync::Arc;
 
     #[test]
-    fn multivariate_compact_projection_rejects_lattice_without_mutation() {
+    fn multivariate_compact_projection_skips_without_mutation() {
+        // A compact multivariate chart (sphere) has no complete rank-1 Fourier
+        // stationary enumeration, so the decoder-projection E-step must SKIP it
+        // — leaving its incoming natural-chart coordinates untouched — and
+        // return Ok, rather than aborting the whole fit. (A fixed-lattice
+        // projection is still never performed: honesty is preserved by not
+        // moving the atom, not by erroring.)
         let coordinates = array![[0.2, 0.3]];
         let evaluator = Arc::new(SphereChartEvaluator);
         let (phi, jet) = evaluator.evaluate(coordinates.view()).unwrap();
@@ -6880,11 +6883,8 @@ mod projection_policy_tests {
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
         let before = term.assignment.coords[0].as_matrix();
-        let error = term
-            .seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view())
-            .unwrap_err();
-        assert!(error.contains("complete multivariate stationary-point enumeration"));
-        assert!(error.contains("fixed-lattice projection is forbidden"));
+        term.seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view())
+            .expect("compact multivariate chart is skipped, not an error");
         assert_eq!(term.assignment.coords[0].as_matrix(), before);
     }
 }

@@ -201,7 +201,7 @@ fn two_basin_outer_fit_engages_exact_envelope() {
         .criterion_certificate
         .as_ref()
         .expect("converged envelope fit carries an analytic certificate");
-    assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
+    assert!(certificate.stationarity.projected_norm() <= certificate.stationarity.bound());
     objective
         .certify_outer_result(&result)
         .expect("envelope OuterResult certifies the installed state");

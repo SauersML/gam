@@ -1275,9 +1275,9 @@ impl FitConvergenceEvidence {
             outer_iterations: parts.outer_iterations,
             final_value: parts.reml_score,
             gradient_residual: certificate
-                .map(|value| value.projected_grad_norm)
+                .map(|value| value.stationarity.projected_norm())
                 .or(parts.outer_gradient_norm),
-            gradient_bound: certificate.map(|value| value.stationarity_bound),
+            gradient_bound: certificate.map(|value| value.stationarity.bound()),
             step_residual: None,
             step_bound: None,
             rho_checkpoint: parts.log_lambdas.to_vec(),

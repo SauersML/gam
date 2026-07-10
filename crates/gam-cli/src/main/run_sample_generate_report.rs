@@ -974,9 +974,9 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
             report::CriterionCertificateRow {
-                grad_norm: cert.grad_norm,
-                projected_grad_norm: cert.projected_grad_norm,
-                stationarity_bound: cert.stationarity_bound,
+                grad_norm: cert.stationarity.raw_norm(),
+                projected_grad_norm: cert.stationarity.projected_norm(),
+                stationarity_bound: cert.stationarity.bound(),
                 hessian_psd: cert.hessian_psd,
                 lambdas_railed: cert.lambdas_railed.clone(),
                 stationary: cert.is_stationary(),

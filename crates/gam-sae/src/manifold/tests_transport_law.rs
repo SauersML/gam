@@ -391,3 +391,115 @@ fn phase_shift_keeps_layer_images_congruent() {
          max angle = {max_angle} rad"
     );
 }
+
+/// Wrap-boundary regression (audit 2026-07-10): a planted HALF-TURN offset
+/// `φ0 = ½` sits exactly at the `wrap_half` discontinuity. The uncentered
+/// smooth alternative used to fit the raw wrapped drift — at `φ0 ≈ ½` that
+/// signal alternates between ≈ +½ and ≈ −½, its Fourier LS fit was garbage,
+/// the (then-clamped) gap collapsed to 0, and a genuinely NONLINEAR transport
+/// at the wrap boundary read as "law holds". The φ̂-centered fit removes the
+/// discontinuity: the pure half-turn arm must HOLD with an honest small gap,
+/// and the half-turn-plus-reparameterization arm must FLIP.
+#[test]
+fn wrap_boundary_half_turn_phase_and_nonlinear_verdicts() {
+    let n = 160usize;
+    let sigma = 0.002_f64;
+    let two_pi = std::f64::consts::TAU;
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
+
+    // Arm A: exact half-turn phase shift θ' = θ + π (φ0 = ½).
+    {
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+        let mut z = Array2::<f64>::zeros((n, 2));
+        let mut y2 = Array2::<f64>::zeros((n, 2));
+        let mut nx = noise_stream(0x7a13_0001);
+        let mut n2 = noise_stream(0x7a13_0002);
+        for i in 0..n {
+            let theta = two_pi * (i as f64 / n as f64);
+            let shifted = theta + std::f64::consts::PI;
+            z[[i, 0]] = theta.cos() + sigma * nx();
+            z[[i, 1]] = theta.sin() + sigma * nx();
+            y2[[i, 0]] = shifted.cos() + sigma * n2();
+            y2[[i, 1]] = shifted.sin() + sigma * n2();
+        }
+        let (mut term, mut rho) = build_k1(&evaluator, &coords, 4);
+        term.set_guards_enabled(false);
+        let mut blocks = vec![OutputBlock::new("layer2", y2.clone(), 0.0).unwrap()];
+        term.run_multiblock_reml_fit(z.view(), &mut blocks, &mut rho, None, controls())
+            .unwrap();
+        let layout = term.crosscoder_layout().unwrap().clone();
+        let report = measure_atom_transport(&term, &layout, 0, 256).unwrap();
+        assert!(
+            report.phase_r2 > 0.95,
+            "half-turn shift is a pure phase law: phase_r2 = {}",
+            report.phase_r2
+        );
+        assert!(
+            report.law_gap().abs() < 0.02,
+            "smooth alternative must buy ~nothing at the wrap boundary; gap = {} \
+             (phase_r2 = {}, smooth_r2 = {})",
+            report.law_gap(),
+            report.phase_r2,
+            report.smooth_r2
+        );
+        assert!(report.law_holds(0.02), "half-turn law verdict should HOLD");
+        // Direct phase_shift recovery (the field itself, not a recomputation):
+        // the fitted chart's own orientation gauge can absorb a constant, so pin
+        // magnitude-at-the-boundary: |φ̂| within 0.05 of ½ OR the recovered
+        // constant drift matching ½ (both wrap-equivalent statements of φ0 = ½).
+        let (s_hat, phi_hat) = report.phase_shift;
+        assert!(
+            s_hat == 1.0 || s_hat == -1.0,
+            "reflection branch must be ±1; got {s_hat}"
+        );
+        let recovered = mean_drift_turns(&report.transport_grid).abs();
+        assert!(
+            (phi_hat.abs() - 0.5).abs() < 0.05 || (recovered - 0.5).abs() < 0.05,
+            "planted half-turn must be recovered: phase_shift = ({s_hat}, {phi_hat}), \
+             mean drift = {recovered}"
+        );
+    }
+
+    // Arm B: half-turn PLUS nonlinear reparameterization θ' = θ + π + a·sin θ.
+    // This is the exact configuration the uncentered fit certified as linear.
+    {
+        let a = 0.8_f64;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(11).unwrap());
+        let mut z = Array2::<f64>::zeros((n, 2));
+        let mut y2 = Array2::<f64>::zeros((n, 2));
+        let mut nx = noise_stream(0x7a14_0001);
+        let mut n2 = noise_stream(0x7a14_0002);
+        for i in 0..n {
+            let theta = two_pi * (i as f64 / n as f64);
+            let reparam = theta + std::f64::consts::PI + a * theta.sin();
+            z[[i, 0]] = theta.cos() + sigma * nx();
+            z[[i, 1]] = theta.sin() + sigma * nx();
+            y2[[i, 0]] = reparam.cos() + sigma * n2();
+            y2[[i, 1]] = reparam.sin() + sigma * n2();
+        }
+        let (mut term, mut rho) = build_k1(&evaluator, &coords, 4);
+        term.set_guards_enabled(false);
+        let mut blocks = vec![OutputBlock::new("layer2", y2.clone(), 0.0).unwrap()];
+        term.run_multiblock_reml_fit(z.view(), &mut blocks, &mut rho, None, controls())
+            .unwrap();
+        let layout = term.crosscoder_layout().unwrap().clone();
+        let report = measure_atom_transport(&term, &layout, 0, 256).unwrap();
+        assert!(
+            report.law_gap() > 0.1,
+            "nonlinear transport AT the wrap boundary must flip the verdict; \
+             gap = {} (phase_r2 = {}, smooth_r2 = {})",
+            report.law_gap(),
+            report.phase_r2,
+            report.smooth_r2
+        );
+        assert!(
+            !report.law_holds(0.02),
+            "law verdict must NOT hold for a wrap-boundary nonlinear transport"
+        );
+        assert!(
+            report.smooth_r2 > 0.9,
+            "the centered smooth alternative must capture the drift: smooth_r2 = {}",
+            report.smooth_r2
+        );
+    }
+}

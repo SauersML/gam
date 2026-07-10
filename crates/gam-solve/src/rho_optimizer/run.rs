@@ -542,6 +542,7 @@ impl OuterProblem {
             eval_order_fn: None,
             reset_fn,
             efs_fn,
+            fixed_point_certificate_fn: None,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
@@ -578,6 +579,7 @@ impl OuterProblem {
             eval_order_fn: Some(eval_order_fn),
             reset_fn,
             efs_fn,
+            fixed_point_certificate_fn: None,
             screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
@@ -616,6 +618,7 @@ impl OuterProblem {
             eval_order_fn: Some(eval_order_fn),
             reset_fn,
             efs_fn,
+            fixed_point_certificate_fn: None,
             screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             continuation_prewarm: self.continuation_prewarm,
@@ -1109,6 +1112,164 @@ fn outer_nonconvergence_error(
     }
 }
 
+fn certify_fixed_point_optimality(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    result: &mut OuterResult,
+) -> Result<OuterCriterionCertificate, EstimationError> {
+    let layout = obj.capability().theta_layout();
+    let evaluation = obj
+        .eval_fixed_point_certificate(&result.rho)
+        .map_err(|err| {
+            outer_nonconvergence_error(
+                context,
+                &format!("analytic fixed-point certificate evaluation failed: {err}"),
+                result,
+                None,
+                config.tolerance,
+            )
+        })?;
+    if evaluation.coordinates.len() != layout.n_params {
+        return Err(outer_nonconvergence_error(
+            context,
+            &format!(
+                "fixed-point certificate returned {} coordinates for an outer problem of dimension {}",
+                evaluation.coordinates.len(),
+                layout.n_params
+            ),
+            result,
+            None,
+            config.tolerance,
+        ));
+    }
+    if !evaluation.cost.is_finite() {
+        return Err(outer_nonconvergence_error(
+            context,
+            "fixed-point certificate returned a non-finite objective value",
+            result,
+            None,
+            config.tolerance,
+        ));
+    }
+
+    let mut normalized_updates = Vec::with_capacity(layout.n_params);
+    let mut uncovered = Vec::new();
+    for (index, coordinate) in evaluation.coordinates.iter().enumerate() {
+        match coordinate {
+            FixedPointCoordinateCertificate::Covered { update, scale }
+                if update.is_finite() && scale.is_finite() && *scale > 0.0 =>
+            {
+                normalized_updates.push(*update / *scale);
+            }
+            FixedPointCoordinateCertificate::Covered { update, scale } => {
+                uncovered.push(format!(
+                    "coordinate {index} has invalid covered residual update={update} scale={scale}"
+                ));
+                normalized_updates.push(f64::NAN);
+            }
+            FixedPointCoordinateCertificate::Uncovered { reason } => {
+                uncovered.push(format!("coordinate {index}: {reason}"));
+                normalized_updates.push(f64::NAN);
+            }
+        }
+    }
+    if !uncovered.is_empty() {
+        return Err(outer_nonconvergence_error(
+            context,
+            &format!(
+                "fixed-point certificate lacks root-equivalent analytic coverage: {}",
+                uncovered.join("; ")
+            ),
+            result,
+            None,
+            config.tolerance,
+        ));
+    }
+
+    let (lower, upper) = outer_bounds_template(config, layout.n_params);
+    let mut raw_inf = 0.0_f64;
+    let mut projected_inf = 0.0_f64;
+    for index in 0..layout.n_params {
+        let update = normalized_updates[index];
+        raw_inf = raw_inf.max(update.abs());
+        // `update` is a signed descent/update direction, the negative of the
+        // gradient convention used by `projected_gradient_norm`: at a lower
+        // bound a negative update points out of the box, and at an upper bound
+        // a positive update does. Only those infeasible multiplier components
+        // are removed.
+        let projected = if result.rho[index] <= lower[index] {
+            update.max(0.0)
+        } else {
+            update
+        };
+        let projected = if result.rho[index] >= upper[index] {
+            projected.min(0.0)
+        } else {
+            projected
+        };
+        projected_inf = projected_inf.max(projected.abs());
+    }
+
+    let solver_final_value = result.final_value;
+    let cost_agreement_bound = f64::EPSILON.sqrt()
+        * solver_final_value
+            .abs()
+            .max(evaluation.cost.abs())
+            .max(1.0);
+    result.final_value = evaluation.cost;
+    result.final_grad_norm = None;
+    result.final_gradient = None;
+    result.final_hessian = None;
+    result.converged = false;
+    if !solver_final_value.is_finite()
+        || (solver_final_value - evaluation.cost).abs() > cost_agreement_bound
+    {
+        return Err(outer_nonconvergence_error(
+            context,
+            &format!(
+                "fixed-point solver value {solver_final_value:.16e} disagrees with certificate value {:.16e} at the selected point (roundoff bound {cost_agreement_bound:.3e})",
+                evaluation.cost
+            ),
+            result,
+            Some(projected_inf),
+            config.tolerance,
+        ));
+    }
+
+    let certificate = OuterCriterionCertificate {
+        stationarity: OuterStationarityCertificate::FixedPoint {
+            residual_inf_norm: raw_inf,
+            projected_residual_inf_norm: projected_inf,
+            bound: config.tolerance,
+            covered_coordinates: layout.n_params,
+        },
+        hessian_psd: None,
+        lambdas_railed: certificate_railed_lambdas(&result.rho, layout.rho_dim(), config),
+    };
+    result.criterion_certificate = Some(certificate.clone());
+    if !certificate.certifies() {
+        return Err(outer_nonconvergence_error(
+            context,
+            &certificate.summary(),
+            result,
+            Some(projected_inf),
+            config.tolerance,
+        ));
+    }
+
+    result.converged = true;
+    result.converged_via = match result.converged_via {
+        Some(via @ OuterConvergedVia::RecurrentIncumbent { .. }) => Some(via),
+        _ => Some(OuterConvergedVia::FixedPointStationary {
+            projected_residual_inf_norm: projected_inf,
+            certificate_bound: config.tolerance,
+        }),
+    };
+    log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
+    Ok(certificate)
+}
+
 /// Build the mandatory analytic optimality certificate at the returned point.
 ///
 /// The objective is evaluated once at the selected point through its analytic
@@ -1161,9 +1322,11 @@ pub(crate) fn certify_outer_optimality(
             ));
         }
         let certificate = OuterCriterionCertificate {
-            grad_norm: 0.0,
-            projected_grad_norm: 0.0,
-            stationarity_bound: outer_gradient_tolerance(config).abs,
+            stationarity: OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 0.0,
+                projected_grad_norm: 0.0,
+                bound: outer_gradient_tolerance(config).abs,
+            },
             hessian_psd: None,
             lambdas_railed: Vec::new(),
         };
@@ -1175,6 +1338,11 @@ pub(crate) fn certify_outer_optimality(
         result.converged_via = Some(OuterConvergedVia::GradientStationary);
         result.criterion_certificate = Some(certificate.clone());
         return Ok(certificate);
+    }
+    if matches!(result.plan_used.solver, Solver::Efs | Solver::HybridEfs)
+        && capability.gradient != Derivative::Analytic
+    {
+        return certify_fixed_point_optimality(obj, config, context, result);
     }
     if capability.gradient != Derivative::Analytic {
         return Err(outer_nonconvergence_error(
@@ -1325,9 +1493,11 @@ pub(crate) fn certify_outer_optimality(
         None
     };
     let certificate = OuterCriterionCertificate {
-        grad_norm,
-        projected_grad_norm,
-        stationarity_bound,
+        stationarity: OuterStationarityCertificate::AnalyticGradient {
+            grad_norm,
+            projected_grad_norm,
+            bound: stationarity_bound,
+        },
         hessian_psd: analytic_hessian
             .as_ref()
             .and_then(certificate_hessian_is_psd),

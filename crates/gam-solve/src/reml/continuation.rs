@@ -1270,6 +1270,7 @@ mod tests {
             efs_fn: None::<
                 fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>,
             >,
+            fixed_point_certificate_fn: None,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<
                 fn(
@@ -1339,6 +1340,7 @@ mod tests {
             efs_fn: None::<
                 fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>,
             >,
+            fixed_point_certificate_fn: None,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<
                 fn(

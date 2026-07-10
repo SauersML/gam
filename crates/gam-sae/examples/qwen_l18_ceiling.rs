@@ -499,15 +499,15 @@ fn print_gradient_certificate(label: &str, certificate: Option<&OuterCriterionCe
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_grad_norm={:.9}",
-                cert.grad_norm
+                cert.stationarity.raw_norm()
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_projected_grad_norm={:.9}",
-                cert.projected_grad_norm
+                cert.stationarity.projected_norm()
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_stationarity_bound={:.9}",
-                cert.stationarity_bound
+                cert.stationarity.bound()
             );
             println!(
                 "{label}_dual_oracle_gradient_certificate_hessian_psd={}",

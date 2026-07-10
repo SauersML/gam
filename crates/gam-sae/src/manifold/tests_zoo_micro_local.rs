@@ -116,7 +116,7 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
         .criterion_certificate
         .as_ref()
         .expect("converged zoo fit carries an analytic certificate");
-    assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
+    assert!(certificate.stationarity.projected_norm() <= certificate.stationarity.bound());
     let fit_secs = t0.elapsed().as_secs_f64();
     objective
         .certify_outer_result(&result)

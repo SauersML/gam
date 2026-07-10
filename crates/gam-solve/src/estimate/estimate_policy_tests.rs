@@ -700,9 +700,11 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
         constraint_kkt: None,
         artifacts: FitArtifacts {
             criterion_certificate: Some(crate::model_types::OuterCriterionCertificate {
-                grad_norm: 0.05,
-                projected_grad_norm: 0.05,
-                stationarity_bound: 0.1,
+                stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 0.05,
+                    projected_grad_norm: 0.05,
+                    bound: 0.1,
+                },
                 hessian_psd: Some(true),
                 lambdas_railed: Vec::new(),
             }),

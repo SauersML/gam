@@ -125,10 +125,10 @@ fn planted_circle_fit_returns_with_analytic_certificate() {
         .as_ref()
         .expect("a converged result carries the analytic objective certificate");
     assert!(
-        certificate.projected_grad_norm <= certificate.stationarity_bound,
+        certificate.stationarity.projected_norm() <= certificate.stationarity.bound(),
         "projected outer gradient {} exceeds certified bound {}",
-        certificate.projected_grad_norm,
-        certificate.stationarity_bound
+        certificate.stationarity.projected_norm(),
+        certificate.stationarity.bound()
     );
     let certified_rho = result.rho.clone();
     objective

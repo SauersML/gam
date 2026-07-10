@@ -472,9 +472,11 @@ pub fn fit_shared_tangent_reml(
             Array1::<f64>::zeros(0),
             0,
             OuterCriterionCertificate {
-                grad_norm: 0.0,
-                projected_grad_norm: 0.0,
-                stationarity_bound: 0.0,
+                stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 0.0,
+                    projected_grad_norm: 0.0,
+                    bound: 0.0,
+                },
                 hessian_psd: Some(true),
                 lambdas_railed: Vec::new(),
             },
@@ -516,11 +518,11 @@ pub fn fit_shared_tangent_reml(
                 projected_grad_norm: outer
                     .criterion_certificate
                     .as_ref()
-                    .map(|value| value.projected_grad_norm),
+                    .map(|value| value.stationarity.projected_norm()),
                 stationarity_bound: outer
                     .criterion_certificate
                     .as_ref()
-                    .map_or(0.0, |value| value.stationarity_bound),
+                    .map_or(0.0, |value| value.stationarity.bound()),
                 rho_checkpoint: outer.rho.to_vec(),
             })?;
         (outer.rho, outer.iterations, certificate)

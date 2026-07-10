@@ -48,9 +48,22 @@ impl Certificate for OuterCriterionCertificate {
 
     fn evidence(&self) -> Evidence {
         let mut e = Evidence::new();
-        put_finite(&mut e, "grad_norm", self.grad_norm);
-        put_finite(&mut e, "projected_grad_norm", self.projected_grad_norm);
-        put_finite(&mut e, "stationarity_bound", self.stationarity_bound);
+        put_finite(&mut e, "stationarity_raw_norm", self.stationarity.raw_norm());
+        put_finite(
+            &mut e,
+            "stationarity_projected_norm",
+            self.stationarity.projected_norm(),
+        );
+        put_finite(&mut e, "stationarity_bound", self.stationarity.bound());
+        e.insert(
+            "stationarity_kind",
+            if self.stationarity.is_fixed_point() {
+                "fixed_point"
+            } else {
+                "analytic_gradient"
+            }
+            .into(),
+        );
         e.insert(
             "hessian_psd",
             match self.hessian_psd {
@@ -228,9 +241,11 @@ mod tests {
     #[test]
     fn criterion_stationarity_and_curvature_control_verdict() {
         let clean = OuterCriterionCertificate {
-            grad_norm: 1e-8,
-            projected_grad_norm: 1e-8,
-            stationarity_bound: 1e-6,
+            stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-8,
+                projected_grad_norm: 1e-8,
+                bound: 1e-6,
+            },
             hessian_psd: Some(true),
             lambdas_railed: Vec::new(),
         };
@@ -238,7 +253,11 @@ mod tests {
         assert!(clean.verdict().is_certified());
 
         let nonstationary = OuterCriterionCertificate {
-            projected_grad_norm: 1e-2,
+            stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-2,
+                projected_grad_norm: 1e-2,
+                bound: 1e-6,
+            },
             ..clean
         };
         assert_eq!(nonstationary.verdict(), Verdict::Insufficient);
@@ -301,9 +320,11 @@ mod tests {
     fn ledger_rolls_up_to_weakest_member() {
         let mut ledger = CertificateLedger::new();
         let clean = OuterCriterionCertificate {
-            grad_norm: 1e-8,
-            projected_grad_norm: 1e-8,
-            stationarity_bound: 1e-6,
+            stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
+                grad_norm: 1e-8,
+                projected_grad_norm: 1e-8,
+                bound: 1e-6,
+            },
             hessian_psd: Some(true),
             lambdas_railed: Vec::new(),
         };

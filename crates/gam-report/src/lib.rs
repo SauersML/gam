@@ -443,14 +443,14 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
             format!(
                 "<span class=\"conv-ok\">stationary</span> \
                  (|g|={:.3e}, |Pg|={:.3e} \u{2264} bound={:.3e})",
-                cert.grad_norm, cert.projected_grad_norm, cert.stationarity_bound
+                cert.stationarity.raw_norm(), cert.stationarity.projected_norm(), cert.stationarity.bound()
             )
         } else {
             let mut flags = Vec::new();
             if !cert.stationary {
                 flags.push(format!(
                     "non-stationary (|Pg|={:.3e} > bound={:.3e}, |g|={:.3e})",
-                    cert.projected_grad_norm, cert.stationarity_bound, cert.grad_norm
+                    cert.stationarity.projected_norm(), cert.stationarity.bound(), cert.stationarity.raw_norm()
                 ));
             }
             if cert.hessian_psd == Some(false) {

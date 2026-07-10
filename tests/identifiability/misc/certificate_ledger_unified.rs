@@ -6,19 +6,18 @@ use gam::inference::certificates::{Certificate, CertificateLedger, Verdict};
 
 use gam::inference::row_measure::CoresetCertificate;
 use gam::solver::logdet_bounds::LogdetEnclosure;
-use gam::solver::rho_optimizer::OuterCriterionCertificate;
+use gam::solver::rho_optimizer::{OuterCriterionCertificate, OuterStationarityCertificate};
 use gam::solver::structure_search::{CollapseAction, CollapseEvent};
 use gam::terms::sae::encode::EncodeResult;
 
 fn clean_criterion() -> OuterCriterionCertificate {
     OuterCriterionCertificate {
-        grad_norm: 1e-9,
-        analytic_directional: 2.0,
-        fd_directional: 2.0,
-        fd_error: 1e-6,
-        agreement_z: 0.0,
-        fd_step: 1e-4,
-        hessian_pd: Some(true),
+        stationarity: OuterStationarityCertificate::AnalyticGradient {
+            grad_norm: 1e-9,
+            projected_grad_norm: 1e-9,
+            bound: 1e-6,
+        },
+        hessian_psd: Some(true),
         lambdas_railed: Vec::new(),
     }
 }

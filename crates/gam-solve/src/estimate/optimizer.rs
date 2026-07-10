@@ -1812,7 +1812,7 @@ where
             let rho_bound = outer_result
                 .criterion_certificate
                 .as_ref()
-                .map(|certificate| certificate.stationarity_bound)
+                .map(|certificate| certificate.stationarity.bound())
                 .unwrap_or(reml_tol)
                 .max(f64::EPSILON);
             let rho_certificate_ok = final_rho.is_empty()
@@ -2413,7 +2413,7 @@ where
         let bound = outer_result
             .criterion_certificate
             .as_ref()
-            .map(|certificate| certificate.stationarity_bound)
+            .map(|certificate| certificate.stationarity.bound())
             .unwrap_or(reml_tol)
             .max(f64::EPSILON);
         (value, gradient, projected, bound)

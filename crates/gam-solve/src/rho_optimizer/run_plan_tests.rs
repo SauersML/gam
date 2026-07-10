@@ -57,7 +57,7 @@ fn certificate_attests_consistent_quadratic() {
         "interior optimum reported railed λ: {}",
         cert.summary(),
     );
-    assert!(cert.stationarity_bound > 0.0 && cert.projected_grad_norm.is_finite());
+    assert!(cert.stationarity.bound() > 0.0 && cert.stationarity.projected_norm().is_finite());
 }
 
 #[test]
@@ -294,12 +294,12 @@ fn certificate_certifies_kkt_stationary_railed_optimum() {
         cert.summary(),
     );
     assert!(
-        cert.projected_grad_norm <= cert.stationarity_bound,
+        cert.stationarity.projected_norm() <= cert.stationarity.bound(),
         "projected gradient must drop the railed component: {}",
         cert.summary(),
     );
     assert!(
-        cert.grad_norm > cert.stationarity_bound,
+        cert.stationarity.raw_norm() > cert.stationarity.bound(),
         "raw gradient norm must still see the railed slope (the projection, \
          not the raw norm, carries the KKT verdict): {}",
         cert.summary(),
@@ -897,6 +897,7 @@ fn closure_objective_delegates() {
             *st = 42;
         }),
         efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        fixed_point_certificate_fn: None,
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -933,6 +934,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         >,
         reset_fn: None::<fn(&mut Vec<f64>)>,
         efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        fixed_point_certificate_fn: None,
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -999,6 +1001,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
                 consecutive_restored_incumbents: None,
             })
         }),
+        fixed_point_certificate_fn: None,
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -1076,6 +1079,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
                 consecutive_restored_incumbents: Some(*restores),
             })
         }),
+        fixed_point_certificate_fn: None,
         screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
