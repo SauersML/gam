@@ -253,7 +253,7 @@ impl rand::TryRng for XorwowState {
 // the CUDA kernel remains an independent device implementation validated in
 // distribution against this host path.
 
-use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
+use std::f64::consts::{FRAC_PI_2, PI};
 
 fn upstream_pg1() -> &'static PolyaGamma {
     static SAMPLER: OnceLock<PolyaGamma> = OnceLock::new();
@@ -635,11 +635,12 @@ fn cholesky_lower_inplace(mut a: Array2<f64>) -> Result<Array2<f64>, String> {
 /// upstream CPU sampler's private implementation details.
 #[cfg(target_os = "linux")]
 fn render_cuda_devroye_constants() -> String {
+    let two_over_pi = std::f64::consts::FRAC_2_PI;
     let pi_squared = PI * PI;
-    let sqrt_two_over_pi = FRAC_2_PI.sqrt();
+    let sqrt_two_over_pi = two_over_pi.sqrt();
     let sqrt_pi_over_two = FRAC_PI_2.sqrt();
     format!(
-        "#define PG_FRAC_2_PI       ({FRAC_2_PI:.20e})\n\
+        "#define PG_FRAC_2_PI       ({two_over_pi:.20e})\n\
          #define PG_PI              ({PI:.20e})\n\
          #define PG_PI_SQ           ({pi_squared:.20e})\n\
          #define PG_SQRT_2_OVER_PI  ({sqrt_two_over_pi:.20e})\n\
