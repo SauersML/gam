@@ -421,6 +421,10 @@ pub struct OuterProbeTelemetry {
     /// Value probes that resolved to the finite collapse/refusal wall
     /// (`cost ≥ SAE_FIT_DATA_COLLAPSE_COST`) rather than a real REML value.
     pub wall_cost_value_probes: usize,
+    /// #2234 — cost-only probes whose capped/forced inner solve exhausted its
+    /// budget and were RESCUED by a one-shot retry at the accepted-point drive
+    /// (full budget) instead of being misclassified as the infeasibility wall.
+    pub budget_rescued_value_probes: usize,
     /// Eisenstat–Walker inexact-probe engagement: line-search value probes
     /// (`eval_with_order(Value)`) whose inner `(t, β)` solve was ACCEPTED at the
     /// loosened forcing gate `max(η_j·‖g_inner,entry‖, τ_full)` while the inner
@@ -2837,6 +2841,39 @@ impl SaeManifoldOuterObjective {
     /// member and the discovery probe run on the cheap value-probe budget, so the
     /// per-eval cost is `len(bundle) + 1` cheap inner solves. Retention is bounded
     /// only by memory admission; a work-count cap would make the envelope inexact.
+    /// #2234 stall fix — a cost-only probe whose inner solve exhausts its CAPPED
+    /// budget (#1029: probes never earn the progress extension; the EW forced
+    /// probe stops at the forcing gate) is an UNFINISHED COMPUTATION, not an
+    /// undefined Laplace evidence. Classifying that marker as a recoverable
+    /// infeasibility returned the 1e12 wall on every line-search/ranking probe
+    /// near any ρ whose inner problem needs more than the probe budget — the
+    /// value lane then disagreed with the (extended-budget) gradient lane at the
+    /// SAME ρ by ten orders of magnitude ("cost-only value 1e12 disagrees with
+    /// analytic-sample value 3.07e2"), Armijo rejected every step, and every fit
+    /// froze at a live gradient and refused to mint (the 2026-07-10 fleet-wide
+    /// plain-fit failure). Rescue: retry ONCE at the accepted-point drive (the
+    /// full budget the gradient lane runs); only a rescue that ITSELF fails
+    /// reaches the caller's wall/hard-error classification, so the genuine
+    /// non-PD/infeasibility classes keep their wall semantics unchanged.
+    fn value_probe_with_budget_rescue(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+        drive: ProbeInnerDrive,
+    ) -> Result<(f64, Array1<f64>), String> {
+        match self.evaluate_envelope_value_probe(rho_flat, drive) {
+            Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
+                self.probe_telemetry.budget_rescued_value_probes += 1;
+                self.evaluate_envelope_value_probe(
+                    rho_flat,
+                    ProbeInnerDrive::Criterion {
+                        refine_progress_extension: true,
+                    },
+                )
+            }
+            outcome => outcome,
+        }
+    }
+
     fn evaluate_envelope_value_probe(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -3649,7 +3686,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // instead of the single hysteretic warm-start trajectory. Same value-probe
         // drive (`refine_progress_extension = false`) as the historical lane; the
         // envelope bypasses to it verbatim in the streaming / freeze regimes.
-        match self.evaluate_envelope_value_probe(
+        match self.value_probe_with_budget_rescue(
             rho.view(),
             ProbeInnerDrive::Criterion {
                 refine_progress_extension: false,
@@ -3954,7 +3991,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let drive = ProbeInnerDrive::ForcedLineSearchProbe {
                     eta: self.forcing.line_search_eta(),
                 };
-                let (cost, _beta_hat) = match self.evaluate_envelope_value_probe(rho.view(), drive)
+                let (cost, _beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
                     Ok(evaluated) => evaluated,
                     // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
