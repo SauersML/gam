@@ -5136,11 +5136,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(skip_transcoder_reml_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
-    module.add_function(wrap_pyfunction!(topology_bic_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
     module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
-    module.add_function(wrap_pyfunction!(rank_topology_candidates, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        select_topology_candidate_lifecycle,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stacking_weights_from_log_density, module)?)?;
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;

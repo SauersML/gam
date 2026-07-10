@@ -88,12 +88,15 @@ pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,
     HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
     STACKING_CV_SEED, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
-    TopologyAutoSelectorResult, TopologyRaceParallelCandidate, UnionRungFit, UnionRungResult,
+    TopologyAutoSelectorResult, TopologyCandidateEvidence, TopologyCandidateFailure,
+    TopologyCandidateFailureStage, TopologyCandidateOutcome, TopologyCandidateRanked,
+    TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind,
+    TopologySelectionScoreScale, UnionRungFit, UnionRungResult,
     adjudicate_cross_class_race, build_cv_log_density_table, deterministic_cv_folds,
     deterministic_cv_folds_seeded, fit_mixture_rung, fit_union_candidate, fit_union_rung,
     mixture_density_provider, parse_union_name, run_topology_race_parallel,
-    select_topology_with_fit, select_topology_with_fit_parallel, tk_normalized_score,
-    union_density_provider,
+    select_topology_candidate_lifecycle, select_topology_with_fit,
+    select_topology_with_fit_parallel, tk_normalized_score, union_density_provider,
 };
 
 /// Process-wide counter of smoothing-corrections that took the sigma-cubature

@@ -12,7 +12,6 @@ Two public selectors are exposed:
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -21,12 +20,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 from . import topology
 from ._api import fit
 from ._binding import rust_module
-from ._compare import (
-    _extract_edf,
-    _extract_reml_score_raw,
-    _tierney_kadane_normalizer_from_null_dim,
-    compare_models,
-)
+from ._compare import _extract_reml_score_raw
 from ._tables import PreNormalizedTable, normalize_table, table_columns
 from .smooth import (
     Duchon,
@@ -59,7 +53,7 @@ class _TopologyRustModule(Protocol):
         strict_dimension: bool,
     ) -> str | None: ...
 
-    def rank_topology_candidates(self, evidence_json: str) -> str: ...
+    def select_topology_candidate_lifecycle(self, request_json: str) -> str: ...
 
     def stacking_weights_from_log_density(
         self,
@@ -76,11 +70,6 @@ class _TopologyRustModule(Protocol):
         uppers: list[list[float]],
         interval_level: float,
     ) -> str: ...
-
-    def topology_bic_score(
-        self, fit: Any, n_obs: int, basis_size: int
-    ) -> float: ...
-
 
 BasisSpec: TypeAlias = Smooth
 ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
@@ -135,23 +124,6 @@ class TopologySelectionError(ValueError):
             "no topology candidate produced a converged selectable fit"
             + (f" ({detail})" if detail else "")
         )
-
-
-def _candidate_failure(
-    candidate: _Candidate,
-    stage: FailureStage,
-    error: BaseException,
-    *,
-    evidence_at_failure: float | None = None,
-) -> TopologyCandidateFailure:
-    return TopologyCandidateFailure(
-        name=candidate.name,
-        stage=stage,
-        error_type=f"{type(error).__module__}.{type(error).__qualname__}",
-        message=str(error),
-        evidence_at_failure=evidence_at_failure,
-        checkpoint=getattr(error, "checkpoint", None),
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,13 +238,8 @@ def select_topology(
     headers, rows, table_kind = normalize_table(data)
     shared_table = PreNormalizedTable(headers, rows, table_kind)
     fits: dict[str, Any] = {}
-    names: list[str] = []
-    fit_list: list[Any] = []
-    basis_sizes: dict[str, int] = {}
-    effective_dim: dict[str, float] = {}
-    null_dims: dict[str, float] = {}
-    selected_scores: dict[str, float] = {}
-    failures: list[TopologyCandidateFailure] = []
+    outcomes: list[dict[str, Any]] = []
+    checkpoints: dict[str, object] = {}
 
     for candidate in normalized:
         try:
@@ -284,87 +251,69 @@ def select_topology(
             if candidate_formula is None:
                 raise ValueError(f"candidate {candidate.name!r} is not constructible")
         except Exception as error:
-            failures.append(_candidate_failure(candidate, "assembly", error))
+            outcomes.append(_failed_candidate_outcome(candidate, "assembly", error))
+            _remember_checkpoint(checkpoints, candidate.name, error)
             continue
 
         try:
             model = fit(shared_table, candidate_formula, **fit_kwargs)
         except Exception as error:
-            failures.append(_candidate_failure(candidate, "fit", error))
+            outcomes.append(_failed_candidate_outcome(candidate, "fit", error))
+            _remember_checkpoint(checkpoints, candidate.name, error)
             continue
 
         raw_reml: float | None = None
         try:
             raw_reml = float(_extract_reml_score_raw(model))
-            if not math.isfinite(raw_reml):
-                raise ValueError(f"non-finite REML evidence {raw_reml!r}")
-            basis_size = _basis_size(model)
-            fitted_effective_dim = _effective_dim(model)
-            null_dim = _fitted_null_dim(model)
-            raw_score = _score_for_kind(
+            outcome = _fitted_candidate_outcome(
+                candidate,
                 model,
-                score_kind,
-                n_obs,
-                basis_size,
-                null_dim,
+                raw_reml=raw_reml,
+                n_obs=n_obs,
             )
-            selected_score = _scale_score(
-                raw_score,
-                score_scale_kind,
-                n_obs,
-                fitted_effective_dim,
-            )
-            if not math.isfinite(selected_score):
-                raise ValueError(f"non-finite selected evidence {selected_score!r}")
         except Exception as error:
-            failures.append(
-                _candidate_failure(
-                    candidate,
-                    "evidence",
-                    error,
-                    evidence_at_failure=raw_reml,
+            outcomes.append(
+                _failed_candidate_outcome(
+                    candidate, "evidence", error, evidence_at_failure=raw_reml
                 )
             )
+            _remember_checkpoint(checkpoints, candidate.name, error)
             continue
 
         fits[candidate.name] = model
-        names.append(candidate.name)
-        fit_list.append(model)
-        basis_sizes[candidate.name] = basis_size
-        effective_dim[candidate.name] = fitted_effective_dim
-        null_dims[candidate.name] = null_dim
-        selected_scores[candidate.name] = selected_score
+        outcomes.append(outcome)
 
-    if not fits:
-        raise TopologySelectionError(failures)
-
-    n_obs_by_candidate = {name: n_obs for name in fits}
-    comparison_scores = {
-        name: _comparison_score(value, score_kind)
-        for name, value in selected_scores.items()
-    }
-    compared = compare_models(
-        [{"reml_score": comparison_scores[name], "edf": _extract_edf(fit_obj)}
-         for name, fit_obj in zip(names, fit_list)],
-        names=names,
-    )
-    rankings = [
-        (name, selected_scores[name])
-        for name, *_ in compared["ranking"]
-    ]
-    winner_name = compared["winner"]
-    warnings_out = _score_disagreement_warnings(
-        fits,
-        n_obs,
-        basis_sizes,
-        effective_dim,
-        null_dims,
+    lifecycle = _select_candidate_lifecycle(
+        score_kind,
         score_scale_kind,
+        outcomes,
     )
+    failures = _failures_from_lifecycle(lifecycle, checkpoints)
+    if lifecycle["winner_index"] is None:
+        raise TopologySelectionError(failures)
+    ranked_rows = lifecycle["ranked"]
+    winner_row = ranked_rows[int(lifecycle["winner_index"])]
+    winner_name = str(winner_row["name"])
+    selected_scores = {
+        str(row["name"]): float(row["score"]) for row in ranked_rows
+    }
+    rankings = [
+        (str(row["name"]), float(row["score"])) for row in ranked_rows
+    ]
+    basis_sizes = {
+        str(row["name"]): int(row["basis_size"]) for row in ranked_rows
+    }
+    effective_dim = {
+        str(row["name"]): float(row["effective_dim"]) for row in ranked_rows
+    }
+    n_obs_by_candidate = {
+        str(row["name"]): int(row["n_obs"]) for row in ranked_rows
+    }
+    survivor_fits = {name: fits[name] for name, _score in rankings}
 
     return SelectTopologyResult(
         winner_name=winner_name,
-        winner_fit=fits[winner_name],
+        winner_fit=survivor_fits[winner_name],
         scores=selected_scores,
         rankings=rankings,
         score_kind=score_kind,
@@ -372,9 +321,9 @@ def select_topology(
         basis_sizes=basis_sizes,
         effective_dim=effective_dim,
         n_obs=n_obs_by_candidate,
-        warnings=warnings_out,
-        failures=tuple(failures),
-        fits=fits if return_fits else None,
+        warnings=[str(warning) for warning in lifecycle["warnings"]],
+        failures=failures,
+        fits=survivor_fits if return_fits else None,
     )
 
 
@@ -702,6 +651,97 @@ def _topology_rust() -> _TopologyRustModule:
     return cast(_TopologyRustModule, rust_module())
 
 
+def _failed_candidate_outcome(
+    candidate: _Candidate,
+    stage: FailureStage,
+    error: BaseException,
+    *,
+    evidence_at_failure: float | None = None,
+) -> dict[str, Any]:
+    """Marshal one terminal failure; Rust owns its lifecycle disposition."""
+    return {
+        "status": "failed",
+        "name": candidate.name,
+        "stage": stage,
+        "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+        "message": str(error),
+        "evidence_at_failure": evidence_at_failure,
+    }
+
+
+def _remember_checkpoint(
+    checkpoints: dict[str, object],
+    candidate_name: str,
+    error: BaseException,
+) -> None:
+    checkpoint = getattr(error, "checkpoint", None)
+    if checkpoint is not None:
+        checkpoints[candidate_name] = checkpoint
+
+
+def _fitted_candidate_outcome(
+    candidate: _Candidate,
+    fit_obj: Any,
+    *,
+    raw_reml: float,
+    n_obs: int,
+) -> dict[str, Any]:
+    """Marshal fit metadata without constructing or ranking any score."""
+    return {
+        "status": "fitted",
+        "name": candidate.name,
+        "raw_reml": raw_reml,
+        "laml": _extract_float_field(fit_obj, ("laml",)),
+        "deviance": _extract_float_field(fit_obj, ("deviance",)),
+        "null_dim": _extract_null_dim(fit_obj),
+        "null_space_logdet": _extract_null_hessian_logdet(fit_obj),
+        "effective_dim": _effective_dim(fit_obj),
+        "basis_size": _basis_size(fit_obj),
+        "n_obs": int(n_obs),
+    }
+
+
+def _select_candidate_lifecycle(
+    score_kind: ScoreKind,
+    score_scale: ScoreScale,
+    outcomes: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    raw = _topology_rust().select_topology_candidate_lifecycle(
+        json.dumps(
+            {
+                "score_kind": score_kind,
+                "score_scale": score_scale,
+                "candidates": list(outcomes),
+            }
+        )
+    )
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise TypeError("Rust topology lifecycle result must be a JSON object")
+    return parsed
+
+
+def _failures_from_lifecycle(
+    lifecycle: Mapping[str, Any],
+    checkpoints: Mapping[str, object],
+) -> tuple[TopologyCandidateFailure, ...]:
+    return tuple(
+        TopologyCandidateFailure(
+            name=str(entry["name"]),
+            stage=cast(FailureStage, str(entry["stage"])),
+            error_type=str(entry["error_type"]),
+            message=str(entry["message"]),
+            evidence_at_failure=(
+                None
+                if entry.get("evidence_at_failure") is None
+                else float(entry["evidence_at_failure"])
+            ),
+            checkpoint=checkpoints.get(str(entry["name"])),
+        )
+        for entry in lifecycle["failed"]
+    )
+
+
 def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
     """Translate a Python `Smooth` topology into the typed JSON shape the
     Rust formula assembler consumes.
@@ -784,16 +824,6 @@ def _candidate_required_dim(topo: Smooth) -> int | None:
     return None
 
 
-def _fitted_null_dim(fit_obj: Any) -> float:
-    null_dim = _extract_null_dim(fit_obj)
-    if null_dim is not None:
-        return null_dim
-    raise ValueError(
-        "Topology selection requires Rust null-dimension metadata; "
-        "fit summary is missing null_dim"
-    )
-
-
 def _centers_dim(centers: Any) -> int | None:
     shape = getattr(centers, "shape", None)
     if shape is not None:
@@ -842,123 +872,12 @@ def _normalize_score_scale(score_scale: str) -> ScoreScale:
     return normalized  # type: ignore[return-value]
 
 
-def _score_for_kind(
-    fit_obj: Any,
-    score_kind: ScoreKind,
-    n_obs: int,
-    basis_size: int,
-    null_dim: float = 0.0,
-) -> float:
-    if score_kind == "tk":
-        return _extract_reml_score_raw(
-            fit_obj
-        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
-    if score_kind == "reml":
-        # Bare raw REML/evidence with no Tierney-Kadane normalizer. The
-        # `tk` kind is the only one that adds `_tk_normalizer_for_fit`; the
-        # null-space gauge-invariance caveat in `select_topology` applies to
-        # that normalizer alone, so `reml` deliberately returns the raw score.
-        return _extract_reml_score_raw(fit_obj)
-    if score_kind == "laml":
-        return _extract_laml_score(
-            fit_obj
-        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
-    return _bic_value(fit_obj, n_obs, basis_size)
-
-
-def _tk_normalizer_for_fit(fit_obj: Any, null_dim: float) -> float:
-    return _tierney_kadane_normalizer_from_null_dim(
-        null_dim,
-        _extract_null_hessian_logdet(fit_obj),
-    )
-
-
-def _tk_score_from_parts(
-    raw_reml: float,
-    null_dim: float,
-    null_hessian_logdet: float | None,
-    effective_dim: float,
-    n_obs: int,
-    score_scale: TopologyScoreScale,
-) -> float:
-    raw_tk = raw_reml + _tierney_kadane_normalizer_from_null_dim(
-        null_dim,
-        null_hessian_logdet,
-    )
-    if score_scale == "per_observation":
-        if n_obs <= 0:
-            raise ValueError("TopologyAutoSelector requires n_obs > 0")
-        return raw_tk / n_obs
-    if score_scale == "per_effective_dim":
-        if not math.isfinite(effective_dim) or effective_dim <= 0.0:
-            raise ValueError(
-                "TopologyAutoSelector requires finite positive effective_dim"
-            )
-        return raw_tk / effective_dim
-    raise ValueError(
-        "TopologyAutoSelector score_scale must be 'per_effective_dim' "
-        "or 'per_observation'"
-    )
-
-
 def _extract_null_dim(fit_obj: Any) -> float | None:
     return _extract_float_field(fit_obj, ("null_dim",))
 
 
 def _extract_null_hessian_logdet(fit_obj: Any) -> float | None:
     return _extract_float_field(fit_obj, _NULL_HESSIAN_LOGDET_KEYS)
-
-
-def _comparison_score(score: float, score_kind: ScoreKind) -> float:
-    # `compare_models` sorts its `reml_score` column ascending (lower is the
-    # better model; see `gamfit._reml_common.compare_models` /
-    # `solver::evidence`, issue #396). Every score kind handled here —
-    # REML, LAML, TK, and BIC (deviance + log(n)*k) — is a minimised
-    # lower-is-better cost, so all pass through with the SAME orientation.
-    # Negating BIC inverted the comparison and selected the WORST topology.
-    return float(score)
-
-
-def _scale_score(
-    score: float,
-    score_scale: ScoreScale,
-    n_obs: int,
-    effective_dim: float,
-) -> float:
-    if score_scale == "raw":
-        return float(score)
-    if score_scale == "per_observation":
-        if n_obs <= 0:
-            raise ValueError("per_observation topology scoring requires n_obs > 0")
-        return float(score) / float(n_obs)
-    if not (math.isfinite(effective_dim) and effective_dim > 0.0):
-        raise ValueError(
-            "per_effective_dim topology scoring requires finite positive "
-            f"effective_dim; got {effective_dim!r}"
-        )
-    return float(score) / effective_dim
-
-
-def _extract_laml_score(fit_obj: Any) -> float:
-    payload = _summary_payload(fit_obj)
-    if payload is not None:
-        value = payload.get("laml")
-        if value is not None:
-            return float(value)
-    if isinstance(fit_obj, Mapping):
-        value = fit_obj.get("laml")
-        if value is not None:
-            return float(value)
-    raise ValueError(
-        "score='laml' requires a real 'laml' field on the fitted result; "
-        "REML/evidence must be requested with score='reml'"
-    )
-
-
-def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
-    return float(
-        _topology_rust().topology_bic_score(fit_obj, int(n_obs), int(basis_size))
-    )
 
 
 def _basis_size(fit_obj: Any) -> int:
@@ -1020,12 +939,9 @@ def _first_mapping_value(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> A
 
 def _effective_dim_value(value: Any) -> float:
     try:
-        out = float(value)
+        return float(value)
     except (TypeError, ValueError):
-        out = float(sum(value))
-    if not math.isfinite(out):
-        raise ValueError(f"select_topology effective_dim must be finite; got {out!r}")
-    return out
+        return float(sum(value))
 
 
 def _extract_float_field(fit_obj: Any, keys: tuple[str, ...]) -> float | None:
@@ -1075,63 +991,6 @@ def _summary_payload(fit_obj: Any) -> Mapping[str, Any] | None:
         except (TypeError, KeyError):
             return None
     return None
-
-
-def _score_disagreement_warnings(
-    fits: Mapping[str, Any],
-    n_obs: int,
-    basis_sizes: Mapping[str, int],
-    effective_dim: Mapping[str, float],
-    null_dims: Mapping[str, float],
-    score_scale: ScoreScale,
-) -> list[str]:
-    orders: dict[str, tuple[str, ...]] = {}
-    for kind in ("reml", "laml", "bic"):
-        try:
-            scores = {
-                name: _scale_score(
-                    _score_for_kind(
-                        fit_obj,
-                        kind,
-                        n_obs,
-                        basis_sizes[name],
-                        null_dims[name],
-                    ),
-                    score_scale,
-                    n_obs,
-                    effective_dim[name],
-                )
-                for name, fit_obj in fits.items()
-            }
-        except (NotImplementedError, ValueError):
-            if kind in {"reml", "laml"}:
-                continue
-            raise
-        comparison = compare_models(
-            [{"reml_score": _comparison_score(scores[name], kind)}
-             for name in fits],
-            names=list(fits),
-        )
-        orders[kind] = tuple(name for name, *_ in comparison["ranking"])
-    if len(orders) < 2:
-        return []
-    if len(set(orders.values())) == 1:
-        return []
-    detail = "; ".join(
-        f"{kind}: {', '.join(order)}" for kind, order in orders.items()
-    )
-    if score_scale != "raw":
-        return [
-            "Scaled topology score rankings still differ across score kinds "
-            f"under score_scale={score_scale!r} ({detail}). Treat BIC as a "
-            "secondary diagnostic; the Tierney-Kadane Laplace normalizer "
-            "handles the known cross-basis evidence scale issue."
-        ]
-    return [
-        "Topology score rankings differ across score kinds "
-        f"({detail}). BIC and REML can disagree when candidate basis sizes "
-        "differ wildly."
-    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1254,18 +1113,17 @@ class TopologyAutoSelector:
         headers, rows, table_kind = normalize_table(data)
         shared_table = PreNormalizedTable(headers, rows, table_kind)
 
-        evidence_inputs: list[dict[str, Any]] = []
+        outcomes: list[dict[str, Any]] = []
         models_by_name: dict[str, Any] = {}
-        raw_reml_by_name: dict[str, float] = {}
-        effective_dim_by_name: dict[str, float] = {}
-        failures: list[TopologyCandidateFailure] = []
+        checkpoints: dict[str, object] = {}
 
         for candidate in normalized:
             try:
                 candidate_formula = _candidate_formula(formula, auto, candidate)
                 candidate_latent = _latent_for_topology(latent, candidate.name)
             except Exception as error:
-                failures.append(_candidate_failure(candidate, "assembly", error))
+                outcomes.append(_failed_candidate_outcome(candidate, "assembly", error))
+                _remember_checkpoint(checkpoints, candidate.name, error)
                 continue
 
             try:
@@ -1277,99 +1135,51 @@ class TopologyAutoSelector:
                     **fit_kwargs,
                 )
             except Exception as error:
-                failures.append(_candidate_failure(candidate, "fit", error))
+                outcomes.append(_failed_candidate_outcome(candidate, "fit", error))
+                _remember_checkpoint(checkpoints, candidate.name, error)
                 continue
 
             raw_reml: float | None = None
             try:
                 raw_reml = float(_extract_reml_score_raw(model))
-                if not math.isfinite(raw_reml):
-                    raise ValueError(f"non-finite REML evidence {raw_reml!r}")
-                effective_dim = float(_effective_dim(model))
-                null_dim = _extract_null_dim(model)
-                if null_dim is None:
-                    raise ValueError(
-                        "TopologyAutoSelector requires TK null-dimension metadata; "
-                        "fit summary is missing null_dim"
-                    )
-                null_hessian_logdet = _extract_null_hessian_logdet(model)
-                # Validate the exact same score payload before handing it to
-                # Rust, so a metadata failure is attached to this candidate.
-                _tk_score_from_parts(
-                    raw_reml,
-                    float(null_dim),
-                    null_hessian_logdet,
-                    effective_dim,
-                    int(n_obs),
-                    self.score_scale,
+                outcome = _fitted_candidate_outcome(
+                    candidate,
+                    model,
+                    raw_reml=raw_reml,
+                    n_obs=n_obs,
                 )
             except Exception as error:
-                failures.append(
-                    _candidate_failure(
-                        candidate,
-                        "evidence",
-                        error,
-                        evidence_at_failure=raw_reml,
+                outcomes.append(
+                    _failed_candidate_outcome(
+                        candidate, "evidence", error, evidence_at_failure=raw_reml
                     )
                 )
+                _remember_checkpoint(checkpoints, candidate.name, error)
                 continue
             models_by_name[candidate.name] = model
-            raw_reml_by_name[candidate.name] = raw_reml
-            effective_dim_by_name[candidate.name] = effective_dim
-            evidence_inputs.append(
-                {
-                    "name": candidate.name,
-                    "raw_reml": raw_reml,
-                    "null_dim": float(null_dim),
-                    "null_space_logdet": null_hessian_logdet,
-                    "effective_dim": effective_dim,
-                    "n_obs": int(n_obs),
-                }
-            )
+            outcomes.append(outcome)
 
-        if not evidence_inputs:
+        ranking = _select_candidate_lifecycle("tk", self.score_scale, outcomes)
+        failures = _failures_from_lifecycle(ranking, checkpoints)
+        if ranking["winner_index"] is None:
             raise TopologySelectionError(failures)
-
-        ranking_json = _topology_rust().rank_topology_candidates(
-            json.dumps(
-                {
-                    "score_scale": self.score_scale,
-                    "candidates": evidence_inputs,
-                }
-            )
-        )
-        ranking = json.loads(ranking_json)
-        for failure in ranking.get("failed", ()):
-            failures.append(
-                TopologyCandidateFailure(
-                    name=str(failure["name"]),
-                    stage=cast(FailureStage, str(failure["stage"])),
-                    error_type="gamfit.rust.TopologyCandidateFailure",
-                    message=str(failure["message"]),
-                    evidence_at_failure=(
-                        None
-                        if failure.get("evidence_at_failure") is None
-                        else float(failure["evidence_at_failure"])
-                    ),
-                )
-            )
         ranked: list[TopologyAutoSelectorRank] = []
         for entry in ranking["ranked"]:
-            name = entry["name"]
+            name = str(entry["name"])
             ranked.append(
                 (
                     name,
-                    float(entry["tk_score"]),
-                    raw_reml_by_name[name],
-                    effective_dim_by_name[name],
+                    float(entry["score"]),
+                    float(entry["raw_reml"]),
+                    float(entry["effective_dim"]),
                     int(entry["n_obs"]),
                     models_by_name[name],
                 )
             )
         return TopologyAutoSelectorResult(
             ranked=ranked,
-            winner=ranked[ranking["winner_index"]],
-            failures=tuple(failures),
+            winner=ranked[int(ranking["winner_index"])],
+            failures=failures,
         )
 
     select = fit

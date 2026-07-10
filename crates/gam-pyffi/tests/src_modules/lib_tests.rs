@@ -181,6 +181,43 @@ fn sae_fit_report_fields_are_marshaled_without_recomputation_2236() {
 }
 
 #[test]
+fn sae_sibling_fit_seeds_delegate_to_gam_sae_2236() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = std::fs::read_to_string(manifest.join("src/latent/latent_basis_and_sae_ffi.rs"))
+        .expect("read main SAE binding fragment");
+    let tail = std::fs::read_to_string(
+        manifest.join("src/latent/latent_basis_and_sae_ffi_tail.rs"),
+    )
+    .expect("read SAE binding tail");
+    let minimal = tail
+        .split_once("fn sae_manifold_fit_minimal")
+        .and_then(|(_, body)| body.split_once("/// Out-of-sample inference"))
+        .map(|(body, _)| body)
+        .expect("minimal fit body");
+    let stagewise = main
+        .split_once("fn sae_manifold_fit_stagewise")
+        .and_then(|(_, body)| body.split_once("fn sae_manifold_fit_inner"))
+        .map(|(body, _)| body)
+        .expect("stagewise fit body");
+    let forbidden = [
+        "sae_pca_seed_initial_coords(",
+        "sae_build_atom_plans(",
+        "sae_build_padded_basis_stacks(",
+        "sae_residual_seed_logits(",
+        "sae_decoder_lsq_init(",
+        "term_from_padded_blocks_with_mode(",
+        "seed_reconstruction_dispersion(",
+    ];
+
+    assert!(minimal.contains("build_sae_minimal_seed(SaeMinimalSeedRequest"));
+    assert!(stagewise.contains("build_sae_stagewise_seed(SaeStagewiseSeedRequest"));
+    for pattern in forbidden {
+        assert!(!minimal.contains(pattern), "minimal binding contains {pattern}");
+        assert!(!stagewise.contains(pattern), "stagewise binding contains {pattern}");
+    }
+}
+
+#[test]
 fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
     let n = 4usize;
     let k_atoms = 2usize;

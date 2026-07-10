@@ -1,41 +1,46 @@
-"""Pin the distinct semantics of the `reml` and `tk` score kinds.
-
-`select_topology(score='reml')` ranks candidates by the bare raw REML /
-evidence score, while `score='tk'` adds the Tierney-Kadane Laplace
-normalizer on top of it. Their `_score_for_kind` arms must NOT be
-identical: that duplicate-body bug made `reml` silently inherit the
-gauge-sensitive TK normalizer.
-"""
+"""Topology score policy must live behind the typed Rust lifecycle entry."""
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import gamfit._select_topology as st
 
 
-class _Fit:
-    def __init__(self, reml: float, null_logdet: float) -> None:
-        self._summary = {
-            "reml_score": reml,
-            "null_hessian_logdet": null_logdet,
-            "effective_dim": 1.0,
-            "coefficients": [0.0, 0.0],
-        }
+def test_python_selector_has_no_local_score_or_failure_policy() -> None:
+    source = Path(st.__file__).read_text(encoding="utf-8")
+    for deleted_helper in (
+        "def _score_for_kind(",
+        "def _scale_score(",
+        "def _score_disagreement_warnings(",
+        "def _candidate_failure(",
+    ):
+        assert deleted_helper not in source
+    assert ".select_topology_candidate_lifecycle(" in source
+    assert ".rank_topology_candidates(" not in source
 
-    def summary(self) -> dict[str, object]:
-        return self._summary
 
+def test_lifecycle_marshalling_preserves_distinct_reml_and_tk_kinds(monkeypatch) -> None:
+    requests: list[dict[str, object]] = []
 
-def test_reml_score_is_bare_raw_with_no_tk_normalizer(monkeypatch) -> None:
-    raw = -3.25
-    fit_obj = _Fit(reml=raw, null_logdet=7.0)
+    class _Rust:
+        def select_topology_candidate_lifecycle(self, request_json: str) -> str:
+            request = json.loads(request_json)
+            requests.append(request)
+            return json.dumps(
+                {
+                    "ranked": [],
+                    "winner_index": None,
+                    "failed": [],
+                    "warnings": [],
+                }
+            )
 
-    # Force a non-zero Tierney-Kadane normalizer so a leaked normalizer
-    # would be observable.
-    monkeypatch.setattr(st, "_extract_reml_score_raw", lambda m: raw)
-    monkeypatch.setattr(st, "_tk_normalizer_for_fit", lambda fit, null_dim: 1.75)
+    monkeypatch.setattr(st, "_topology_rust", lambda: _Rust())
+    st._select_candidate_lifecycle("reml", "raw", [])
+    st._select_candidate_lifecycle("tk", "per_observation", [])
 
-    reml = st._score_for_kind(fit_obj, "reml", n_obs=10, basis_size=2, null_dim=1.0)
-    tk = st._score_for_kind(fit_obj, "tk", n_obs=10, basis_size=2, null_dim=1.0)
-
-    assert reml == raw, "score='reml' must be the bare raw REML score"
-    assert tk == raw + 1.75, "score='tk' must add the Tierney-Kadane normalizer"
-    assert reml != tk, "the 'reml' and 'tk' arms must not be identical"
+    assert requests[0]["score_kind"] == "reml"
+    assert requests[0]["score_scale"] == "raw"
+    assert requests[1]["score_kind"] == "tk"
+    assert requests[1]["score_scale"] == "per_observation"

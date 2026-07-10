@@ -113,6 +113,33 @@ pub struct SaeFitSeedReport {
     pub metric_provenance: &'static str,
 }
 
+/// Admit one manifold fit shape through the assignment-aware front door.
+pub fn admit_sae_fit_shape(
+    n_obs: usize,
+    p_out: usize,
+    k_atoms: usize,
+    d_max: usize,
+    assignment_kind: SaeFitAssignmentKind,
+    top_k: Option<usize>,
+) -> Result<(), String> {
+    match assignment_kind {
+        SaeFitAssignmentKind::TopK => {
+            let support = top_k.ok_or_else(|| {
+                "assignment_kind 'topk' requires top_k (the fixed per-row support size)"
+                    .to_string()
+            })?;
+            crate::front_door::admit_topk_manifold(
+                n_obs,
+                p_out,
+                k_atoms,
+                d_max.max(1),
+                support,
+            )
+        }
+        _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms),
+    }
+}
+
 /// Validate and construct the complete Python-free seed for a SAE fit.
 pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_>) -> Result<SaeFitSeedReport, String> {
     let (n_obs, p_out) = request.target.dim();
@@ -130,7 +157,14 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_>) -> Result<SaeFitSeedRe
             request.basis_sizes.len()
         ));
     }
-    crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms)?;
+    admit_sae_fit_shape(
+        n_obs,
+        p_out,
+        k_atoms,
+        request.atom_dim.iter().copied().max().unwrap_or(1),
+        request.assignment_kind,
+        request.top_k,
+    )?;
     if request.max_iter < 1 {
         return Err(format!(
             "sae_manifold_fit requires max_iter >= 1; got {}",

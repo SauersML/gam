@@ -110,285 +110,38 @@ fn sae_manifold_fit_minimal<'py>(
     data_row_reseed: bool,
     rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
-    // Assignment tokens are strict: only the four canonical schema names pass.
+    // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
+    let assignment = SaeFitAssignmentKind::from_tag(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
-    let (n_obs, _p_out) = z_view.dim();
-    let k_atoms = atom_basis.len();
-    if n_obs == 0 || z_view.ncols() == 0 {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_minimal: z must be non-empty; got shape ({}, {})",
-            n_obs,
-            z_view.ncols()
-        )));
-    }
-    if k_atoms == 0 {
-        return Err(py_value_error(
-            "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
-        ));
-    }
-    // Front-door enforcement through the single shared seam (#985 / E1): the dense
-    // manifold engine is the small-K CERTIFICATION lane for penalty-gated modes,
-    // whose N×K logits are live Newton state. The hard TOP-K SUPPORT mode carries
-    // no gate coordinates, so its admission is the CONCRETE in-core memory budget
-    // (`admit_topk_manifold`): within budget the TRUE manifold engine runs at any
-    // overcompleteness K > P; over budget it refuses with a typed error — a topk
-    // manifold request is never silently substituted with the linear lane.
-    if assignment_kind == "topk" {
-        let support = top_k.ok_or_else(|| {
-            py_value_error(
-                "sae_manifold_fit_minimal: assignment_kind 'topk' requires the top_k \
-                 argument (the fixed per-row support size)"
-                    .to_string(),
-            )
-        })?;
-        let d_max = atom_dim.iter().copied().max().unwrap_or(1);
-        gam::terms::sae::front_door::admit_topk_manifold(
-            n_obs,
-            z_view.ncols(),
-            k_atoms,
-            d_max,
-            support,
-        )
-        .map_err(py_value_error)?;
-    } else {
-        gam::terms::sae::front_door::admit_dense_certification(n_obs, z_view.ncols(), k_atoms)
-            .map_err(py_value_error)?;
-    }
-    if !z_view.iter().all(|v| v.is_finite()) {
-        return Err(py_value_error(
-            "sae_manifold_fit_minimal: z contains non-finite values".into(),
-        ));
-    }
-    if atom_dim.len() != k_atoms {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_minimal: atom_dim length {} must equal atom_basis length {k_atoms}",
-            atom_dim.len()
-        )));
-    }
-    // #2238/#2239 — per-atom topology discovery for the PRIMARY dictionary.
-    // Atoms seeded "auto" (the magic default when the caller names no
-    // topology) are rewritten to their evidence-race winners BEFORE any
-    // seeding or plan building, so every downstream consumer (PCA seeds,
-    // atom plans, OOS metadata) sees only concrete kinds. The policy lives
-    // in gam-sae (`resolve_auto_primary_atoms`); this layer only plumbs.
-    let mut atom_basis = atom_basis;
-    let mut atom_dim = atom_dim;
-    let duchon_center_overrides = if atom_basis.iter().any(|basis| basis == "auto") {
-        let labels = sae_output_energy_cluster_labels(z_view, k_atoms);
-        gam::terms::sae::structure_harvest::resolve_auto_primary_atoms(
-            z_view,
-            &labels,
-            &mut atom_basis,
-            &mut atom_dim,
-        )
-        .map_err(py_value_error)?
-    } else {
-        vec![None; k_atoms]
-    };
-    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
-        .iter()
-        .map(|kind| sae_atom_basis_kind_from_str(kind))
-        .collect();
-    let seed_coords =
-        gam::terms::sae::manifold::sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim)
-            .map_err(py_value_error)?;
-    let plans = sae_build_atom_plans(
-        z_view,
-        &atom_basis,
-        &atom_dim,
-        seed_coords.view(),
-        random_state,
-        &duchon_center_overrides,
-    )
-    .map_err(py_value_error)?;
-    // The optimizer's per-atom latent dimension is `plan.latent_dim`, not the
-    // user-supplied `atom_dim` (periodic atoms carry a harmonic count there).
-    let plan_latent_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
-    // Warm-start coordinates (issue #357). When the caller supplies
-    // `initial_coords` (an amortized encoder's predicted on-manifold `t`), use
-    // them as the Newton start and as the point at which the basis stacks are
-    // first evaluated; otherwise fall back to the PCA seed. The basis *design*
-    // (`plans`) is always built from the PCA seed so the atom geometry matches
-    // the cold-start fit. Shape must be `(K, N, D_max)` with `D_max` covering
-    // every atom's `plan.latent_dim`.
-    let mut start_coords: Array3<f64> = match &initial_coords {
-        Some(arr) => {
-            let view = arr.as_array();
-            let shape = view.shape();
-            if shape.len() != 3 {
-                return Err(py_value_error(
-                    "sae_manifold_fit_minimal: initial_coords must be a rank-3 (K, N, D_max) array"
-                        .to_string(),
-                ));
-            }
-            if shape[0] != k_atoms || shape[1] != n_obs {
-                return Err(py_value_error(format!(
-                    "sae_manifold_fit_minimal: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
-                )));
-            }
-            let max_dim = *shape.get(2).unwrap_or(&0);
-            for (atom_idx, &d) in plan_latent_dim.iter().enumerate() {
-                if d > max_dim {
-                    return Err(py_value_error(format!(
-                        "sae_manifold_fit_minimal: initial_coords D_max={max_dim} is too small for atom {atom_idx} latent_dim={d}"
-                    )));
-                }
-            }
-            if !view.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_manifold_fit_minimal: initial_coords contains non-finite values".into(),
-                ));
-            }
-            view.to_owned()
-        }
-        None => seed_coords.clone(),
-    };
-    if initial_coords.is_none()
-        && k_atoms > 1
-        && matches!(assignment_kind.as_str(), "softmax" | "ibp_map")
-    {
-        let labels = sae_output_energy_cluster_labels(z_view, k_atoms);
-        let plan_kinds: Vec<SaeAtomBasisKind> =
-            plans.iter().map(|plan| plan.kind.clone()).collect();
-        sae_refine_periodic_seed_coords_by_cluster(z_view, &plan_kinds, &labels, &mut start_coords)
-            .map_err(py_value_error)?;
-    }
-    let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
-            .map_err(py_value_error)?;
-    // The JumpReLU gate activates only when a logit clears
-    // `jumprelu_threshold` (caller-configurable, default 0.0). Seeding the
-    // logits at or below the threshold would leave every gate closed at step
-    // 0, making the data-fit Jacobian, the sparsity prior gradient, and the
-    // assignment-weighted decoder gradient all zero simultaneously — the fit
-    // cannot escape that fixed point. Seed JumpReLU runs a fixed margin
-    // ABOVE the configured threshold so every atom starts active relative to
-    // its cut and the fit can learn which atoms to prune. Softmax
-    // (translation-invariant) remains neutral at zero, while IBP-MAP uses the
-    // zero seed except for its degenerate K=1 gate handled below.
-    // Warm-start logits (issue #357): a caller-supplied `(N, K)` assignment
-    // logit seed (from an amortized encoder) replaces the cold-start init.
-    // When absent we fall back to the documented zero / JumpReLU-positive init
-    // plus the seed-keyed jitter below.
-    let warm_logits: Option<Array2<f64>> = match &initial_logits {
-        Some(arr) => {
-            let view = arr.as_array();
-            if view.dim() != (n_obs, k_atoms) {
-                return Err(py_value_error(format!(
-                    "sae_manifold_fit_minimal: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
-                    view.dim()
-                )));
-            }
-            if !view.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_manifold_fit_minimal: initial_logits contains non-finite values".into(),
-                ));
-            }
-            Some(view.to_owned())
-        }
-        None => None,
-    };
-    let logits_are_cold = warm_logits.is_none();
-    let mut initial_logits = match warm_logits {
-        Some(logits) => logits,
-        None if assignment_kind == "threshold_gate" => {
-            // Start every atom one full margin above its activation threshold.
-            const SAE_JUMPRELU_SEED_MARGIN: f64 = 1.0;
-            Array2::<f64>::from_elem(
-                (n_obs, k_atoms),
-                jumprelu_threshold + SAE_JUMPRELU_SEED_MARGIN,
-            )
-        }
-        None if k_atoms == 1 && assignment_kind == "ibp_map" => {
-            // At K=1 the IBP stick-breaking prior is degenerate (pi_0 == 1), so the
-            // gate zeta = sigma(logit/tau) is a free multiplicative scalar on the
-            // reconstruction with no competing atom and no sparsity pressure. A zero
-            // seed starts it at sigma(0)=0.5 -- a 50% radial seed contraction the
-            // joint fit must climb back from against a vanishing sigmoid gradient,
-            // landing the ring inside the data (#1023). Seed the single atom
-            // "present" so zeta starts ~1; the gate stays free to fall if the atom is
-            // genuinely vacuous (the post-fit EV collapse guard, not zeta->0, flags
-            // that, so part-3 collapse detection is unaffected). Temperature-robust:
-            // seed logit = c*tau so zeta = sigma(c) is independent of tau.
-            const SAE_IBP_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
-            Array2::<f64>::from_elem((n_obs, k_atoms), SAE_IBP_K1_PRESENT_GATE_LOGIT * tau)
-        }
-        None => Array2::<f64>::zeros((n_obs, k_atoms)),
-    };
-    // Data-driven asymmetric cold-start seed (issue #629). A uniform logit
-    // init is an exact symmetric saddle for K>=2 exchangeable atoms under
-    // softmax / IBP-MAP, so the fit never routes and the decoder overfits
-    // through the frozen uniform mixture. Replace the saddle with one EM-style
-    // M-then-E step on the seed geometry: prefer the atom that best
-    // reconstructs each row. JumpReLU keeps its margin-above-threshold seed
-    // (its degeneracy is a closed gate, not a routing tie), and warm-started
-    // logits are left exactly as supplied.
-    if logits_are_cold && k_atoms > 1 && matches!(assignment_kind.as_str(), "softmax" | "ibp_map") {
-        const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
-        let residual_logits = sae_residual_seed_logits(
-            basis_values.view(),
-            &basis_sizes,
-            z_view,
-            SAE_RESIDUAL_SEED_GAIN,
-        )
-        .map_err(py_value_error)?;
-        initial_logits = residual_logits;
-    }
-    // Wire `random_state` into the optimizer init: jitter the initial
-    // assignment logits with a tiny, seed-keyed deterministic perturbation
-    // so different seeds explore different Newton trajectories (issue #178).
-    // The jitter is uniform in `±SAE_RANDOM_STATE_LOGIT_JITTER` and uses the
-    // same Lehmer LCG pattern as the Duchon-center picker, keyed by
-    // `random_state`. Fixed seeds still produce bit-identical fits. A
-    // warm-started logit seed is left untouched: the encoder's prediction is
-    // the requested starting point and the bounded refinement must begin
-    // exactly there.
-    if n_obs > 0 && k_atoms > 0 && logits_are_cold {
-        const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
-        let mut state = random_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        for row in 0..n_obs {
-            for atom_idx in 0..k_atoms {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                // Map top 53 bits to a double in [0, 1), then to [-1, 1).
-                let u = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
-                let signed = 2.0 * u - 1.0;
-                initial_logits[[row, atom_idx]] += SAE_RANDOM_STATE_LOGIT_JITTER * signed;
-            }
-        }
-    }
-    // Seed each atom's decoder block by least-squares projection of Z onto
-    // the joint atom design weighted by the iter-0 soft assignments. Without
-    // this, multi-atom fits collapse to A=0 because the assignment prior
-    // dominates a zero-decoder fit — see [`sae_decoder_lsq_init`] for the
-    // full diagnosis (issue #174).
-    let decoder_coefficients = sae_decoder_lsq_init(
-        basis_values.view(),
-        &basis_sizes,
-        z_view,
-        initial_logits.view(),
-        assignment_kind.as_str(),
-        ibp_alpha_override.unwrap_or(alpha),
+    let seed = build_sae_minimal_seed(SaeMinimalSeedRequest {
+        target: z_view,
+        atom_basis,
+        atom_dim,
+        assignment_kind: assignment,
+        alpha,
         tau,
-        jumprelu_threshold,
+        threshold: jumprelu_threshold,
         top_k,
-    )
+        ibp_alpha_override,
+        random_state,
+        initial_logits: initial_logits.as_ref().map(|values| values.as_array()),
+        initial_coords: initial_coords.as_ref().map(|values| values.as_array()),
+    })
     .map_err(py_value_error)?;
-    // `plan_latent_dim` (computed above) is the optimizer's per-atom latent
-    // dimension — `plan.latent_dim`, not the user-supplied `atom_dim` (periodic
-    // atoms carry a harmonic count there; their `latent_dim == 1`).
-    let effective_atom_dim: Vec<usize> = plan_latent_dim.clone();
-    // Thread the per-atom Duchon centers into the inner driver so its
-    // `DuchonCoordinateEvaluator` can re-evaluate `Phi(t)` / `dPhi/dt` at each
-    // updated latent coordinate instead of freezing the seed snapshot.
-    let atom_centers: Vec<Option<Array2<f64>>> = plans
-        .iter()
-        .map(|plan| plan.duchon_centers.clone())
-        .collect();
+    let SaeMinimalSeedReport {
+        atom_basis,
+        effective_atom_dim,
+        atom_centers,
+        basis_values,
+        basis_jacobian,
+        basis_sizes,
+        decoder_coefficients,
+        smooth_penalties,
+        initial_logits,
+        initial_coords: start_coords,
+        refine_routing,
+    } = seed;
     let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
     let row_w = row_loss_weights.as_ref().map(|w| w.as_array());
@@ -420,11 +173,7 @@ fn sae_manifold_fit_minimal<'py>(
         top_k,
         jumprelu_threshold,
         native_ard_enabled,
-        // Refine the cold routing seed (alternating coordinate projection +
-        // weighted decoder LSQ) only when BOTH the logits and the coordinates
-        // are cold — i.e. the auto seed is in control. A user-supplied warm
-        // start (amortized encoder, #357) is respected verbatim.
-        logits_are_cold && initial_coords.is_none(),
+        refine_routing,
         random_state,
         // WP-D → fit wiring (#980): thread the optional output-Fisher shard
         // through so the auto facade installs `RowMetric::OutputFisher` the same
@@ -444,15 +193,8 @@ fn sae_manifold_fit_minimal<'py>(
         data_row_reseed,
         rank_charge_evidence,
     )?;
-    // #977 — the per-atom `atom_plans` are now emitted by `sae_manifold_fit_inner`
-    // FROM THE POST-SEARCH dictionary (variable K), so OOS predict can rebuild the
-    // design for the DISCOVERED atoms (births included) without Python. The old
-    // post-hoc attachment here re-derived plans from the seed `plans` (input K),
-    // which would shadow the grown dictionary with a too-short list and break the
-    // `from_payload` zip the moment a birth landed — exactly the plumbing
-    // constraint #997 cited. The seed `plans` still build the cold-start design
-    // and the per-atom Duchon centers threaded into the inner driver above; they
-    // are no longer the serialized plan surface.
+    // Post-search atom plans are emitted by the shared fit entry from the final
+    // variable-K dictionary; the minimal binding never patches the payload.
     Ok(result_dict)
 }
 

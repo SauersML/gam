@@ -3836,22 +3836,6 @@ fn tierney_kadane_normalized_score(
     .map_err(PyValueError::new_err)
 }
 
-#[pyfunction]
-fn topology_bic_score(
-    py: Python<'_>,
-    fit: Py<PyAny>,
-    n_obs: usize,
-    basis_size: usize,
-) -> PyResult<f64> {
-    let fit = fit.bind(py);
-    let view = reml_fit_view(py, fit)?;
-    let deviance = extract_float_metadata_from_view(&view, DEVIANCE_KEYS)?.ok_or_else(|| {
-        py_value_error("BIC scoring requires fit.summary()['deviance']".to_string())
-    })?;
-    gam::solver::topology_selector::bic_score(deviance, n_obs, basis_size)
-        .map_err(PyValueError::new_err)
-}
-
 /// String dispatch for the torch fit entry — translate a Python `Smooth`
 /// subclass name into the matching torch entry kind string.
 #[pyfunction]
@@ -3979,126 +3963,182 @@ fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
     })
 }
 
-/// Rank a set of topology candidates by their TK-normalized REML score.
+/// Finalize topology candidate lifecycles through the typed Rust selector.
 ///
-/// Input JSON shape:
-/// ```json
-/// {"score_scale": "per_effective_dim" | "per_observation",
-///  "candidates": [
-///     {"name": "...", "raw_reml": ..., "null_dim": ...,
-///      "null_space_logdet": ..., "effective_dim": ..., "n_obs": ...},
-///     ...
-///  ]}
-/// ```
-/// Output JSON: `{"ranked": [...], "winner_index": 0}` with entries sorted
-/// ascending by `tk_score`.
+/// Python supplies exactly one terminal outcome per declared candidate:
+/// assembly/fit failures, or metadata from one completed fit. Rust owns score
+/// construction, evidence validation, failure conversion, deterministic
+/// ordering, winner selection, and cross-score disagreement diagnostics.
 #[pyfunction]
-fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
+fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     #[derive(Deserialize)]
-    struct CandidateEvidence {
-        name: String,
-        raw_reml: f64,
-        null_dim: f64,
-        null_space_logdet: Option<f64>,
-        effective_dim: f64,
-        n_obs: usize,
+    #[serde(rename_all = "snake_case")]
+    enum ScoreKind {
+        Reml,
+        Laml,
+        Bic,
+        Tk,
     }
     #[derive(Deserialize)]
-    struct EvidenceBundle {
-        score_scale: String,
-        candidates: Vec<CandidateEvidence>,
+    #[serde(rename_all = "snake_case")]
+    enum ScoreScale {
+        Raw,
+        PerObservation,
+        PerEffectiveDim,
     }
-    let bundle: EvidenceBundle = serde_json::from_str(evidence_json).map_err(|err| {
-        py_value_error(format!(
-            "rank_topology_candidates: failed to parse evidence JSON: {err}"
-        ))
-    })?;
-    let score_scale = match bundle
-        .score_scale
-        .trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
-    {
-        "per_observation" => gam::solver::evidence::TopologyScoreScale::PerObservation,
-        "per_effective_dim" => gam::solver::evidence::TopologyScoreScale::PerEffectiveDim,
-        other => {
-            return Err(py_value_error(format!(
-                "rank_topology_candidates: score_scale must be per_effective_dim or per_observation; got {other:?}"
-            )));
-        }
-    };
-    if bundle.candidates.is_empty() {
-        return Err(py_value_error(
-            "rank_topology_candidates: at least one candidate is required".to_string(),
-        ));
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum FailureStage {
+        Assembly,
+        Fit,
+        Evidence,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+    enum CandidateOutcome {
+        Fitted {
+            name: String,
+            raw_reml: f64,
+            laml: Option<f64>,
+            deviance: Option<f64>,
+            null_dim: Option<f64>,
+            null_space_logdet: Option<f64>,
+            effective_dim: f64,
+            basis_size: usize,
+            n_obs: usize,
+        },
+        Failed {
+            name: String,
+            stage: FailureStage,
+            error_type: String,
+            message: String,
+            evidence_at_failure: Option<f64>,
+        },
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LifecycleRequest {
+        score_kind: ScoreKind,
+        score_scale: ScoreScale,
+        candidates: Vec<CandidateOutcome>,
     }
 
-    let mut candidate_kinds = Vec::with_capacity(bundle.candidates.len());
-    let mut evidence_by_kind = HashMap::with_capacity(bundle.candidates.len());
-    for entry in bundle.candidates {
-        let kind = gam::solver::AutoTopologyKind::parse(&entry.name)
-            .map_err(|err| py_value_error(format!("rank_topology_candidates: {err}")))?;
-        if evidence_by_kind.insert(kind, entry).is_some() {
-            return Err(py_value_error(format!(
-                "rank_topology_candidates: duplicate topology candidate {:?}",
-                kind.as_str()
-            )));
-        }
-        candidate_kinds.push(kind);
-    }
-    let selector = gam::solver::TopologyAutoSelector {
-        candidates: candidate_kinds,
-        score_scale,
-        latent: None,
+    let request: LifecycleRequest = serde_json::from_str(request_json).map_err(|err| {
+        py_value_error(format!(
+            "select_topology_candidate_lifecycle: failed to parse request JSON: {err}"
+        ))
+    })?;
+    let score_kind = match request.score_kind {
+        ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
+        ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
+        ScoreKind::Bic => gam::solver::TopologySelectionScoreKind::Bic,
+        ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
     };
-    let ranked = gam::solver::select_topology_with_fit(&selector, |kind| {
-        let entry = evidence_by_kind
-            .get(&kind)
-            .ok_or_else(|| format!("missing evidence for topology {:?}", kind.as_str()))?;
-        Ok::<_, String>(gam::solver::TopologyAutoFitEvidence {
-            topology_name: entry.name.clone(),
-            raw_reml: entry.raw_reml,
-            null_dim: entry.null_dim,
-            null_space_logdet: entry.null_space_logdet,
-            effective_dim: entry.effective_dim,
-            n_obs: entry.n_obs,
-            fit_handle: (),
+    let score_scale = match request.score_scale {
+        ScoreScale::Raw => gam::solver::TopologySelectionScoreScale::Raw,
+        ScoreScale::PerObservation => {
+            gam::solver::TopologySelectionScoreScale::PerObservation
+        }
+        ScoreScale::PerEffectiveDim => {
+            gam::solver::TopologySelectionScoreScale::PerEffectiveDim
+        }
+    };
+    let candidates = request
+        .candidates
+        .into_iter()
+        .map(|candidate| match candidate {
+            CandidateOutcome::Fitted {
+                name,
+                raw_reml,
+                laml,
+                deviance,
+                null_dim,
+                null_space_logdet,
+                effective_dim,
+                basis_size,
+                n_obs,
+            } => gam::solver::TopologyCandidateOutcome::Fitted(
+                gam::solver::TopologyCandidateEvidence {
+                    name,
+                    raw_reml,
+                    laml,
+                    deviance,
+                    null_dim,
+                    null_space_logdet,
+                    effective_dim,
+                    basis_size,
+                    n_obs,
+                },
+            ),
+            CandidateOutcome::Failed {
+                name,
+                stage,
+                error_type,
+                message,
+                evidence_at_failure,
+            } => gam::solver::TopologyCandidateOutcome::Failed(
+                gam::solver::TopologyCandidateFailure {
+                    name,
+                    stage: match stage {
+                        FailureStage::Assembly => {
+                            gam::solver::TopologyCandidateFailureStage::Assembly
+                        }
+                        FailureStage::Fit => gam::solver::TopologyCandidateFailureStage::Fit,
+                        FailureStage::Evidence => {
+                            gam::solver::TopologyCandidateFailureStage::Evidence
+                        }
+                    },
+                    error_type,
+                    message,
+                    evidence_at_failure,
+                },
+            ),
         })
-    })
-    .map_err(PyValueError::new_err)?;
-    let failed_rows: Vec<serde_json::Value> = ranked
+        .collect();
+    let selected = gam::solver::select_topology_candidate_lifecycle(
+        candidates,
+        score_kind,
+        score_scale,
+    )
+    .map_err(|err| py_value_error(format!("select_topology_candidate_lifecycle: {err}")))?;
+    let ranked: Vec<serde_json::Value> = selected
+        .ranked
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.name,
+                "score": row.score,
+                "raw_reml": row.raw_reml,
+                "effective_dim": row.effective_dim,
+                "basis_size": row.basis_size,
+                "n_obs": row.n_obs,
+            })
+        })
+        .collect();
+    let failed: Vec<serde_json::Value> = selected
         .failed
-        .iter()
+        .into_iter()
         .map(|failure| {
             serde_json::json!({
-                "name": failure.topology_name,
+                "name": failure.name,
                 "stage": failure.stage.as_str(),
+                "error_type": failure.error_type,
                 "message": failure.message,
                 "evidence_at_failure": failure.evidence_at_failure,
             })
         })
         .collect();
-    let ranked_rows: Vec<serde_json::Value> = ranked
-        .ranked
-        .into_iter()
-        .map(|row| {
-            serde_json::json!({
-                "name": row.topology_name,
-                "tk_score": row.tk_score,
-                "raw_reml": row.raw_reml,
-                "effective_dim": row.effective_dim,
-                "n_obs": row.n_obs,
-            })
-        })
-        .collect();
-    let out = serde_json::json!({
-        "ranked": ranked_rows,
-        "winner_index": ranked.winner_index,
-        "failed": failed_rows,
-    });
-    serde_json::to_string(&out)
-        .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
+    serde_json::to_string(&serde_json::json!({
+        "ranked": ranked,
+        "winner_index": selected.winner_index,
+        "failed": failed,
+        "warnings": selected.warnings,
+    }))
+    .map_err(|err| {
+        py_value_error(format!(
+            "select_topology_candidate_lifecycle: serialise: {err}"
+        ))
+    })
 }
 
 /// Solve the stacking-of-predictive-distributions weight problem over retained

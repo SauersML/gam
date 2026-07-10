@@ -2122,154 +2122,52 @@ fn sae_manifold_fit_stagewise<'py>(
     fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
+    let assignment = SaeFitAssignmentKind::from_tag(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
-    let (n_obs, p_out) = z_view.dim();
-    if n_obs == 0 || p_out == 0 {
-        return Err(py_value_error(
-            "sae_manifold_fit_stagewise requires a non-empty (N, p) response".to_string(),
-        ));
-    }
-    if atom_basis.len() != 1 || atom_dim.len() != 1 || basis_sizes.len() != 1 {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_stagewise requires a single-atom (K=1) seed; got atom_basis={}, \
-             atom_dim={}, basis_sizes={}",
-            atom_basis.len(),
-            atom_dim.len(),
-            basis_sizes.len()
-        )));
-    }
-    if max_iter < 1 {
-        return Err(py_value_error(
-            "sae_manifold_fit_stagewise requires max_iter >= 1".to_string(),
-        ));
-    }
-    let d0 = atom_dim[0];
-    let coords_view = initial_coords.as_array();
-    if coords_view.shape().first().copied() != Some(1)
-        || coords_view.shape().get(1).copied() != Some(n_obs)
-        || coords_view.shape().get(2).copied().map(|dmax| d0 <= dmax) != Some(true)
-    {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit_stagewise: initial_coords must be (1, {n_obs}, D_max>={d0}); got {:?}",
-            coords_view.shape()
-        )));
-    }
-    let coord_blocks = vec![coords_view.slice(s![0, 0..n_obs, 0..d0]).to_owned()];
-    let basis_kinds = vec![sae_atom_basis_kind_from_str(&atom_basis[0])];
-    let atom_centers: Vec<Option<Array2<f64>>> = vec![None];
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &atom_dim,
-        &coord_blocks,
-        &atom_centers,
-    )
-    .map_err(py_value_error)?;
-    let mode = match assignment_kind.as_str() {
-        "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
-        "threshold_gate" => AssignmentMode::threshold_gate(tau, 0.0),
-        "topk" => {
-            // The stagewise entry carries no per-row support-size argument yet;
-            // routing 'topk' through it silently would guess k. Typed refusal
-            // until the stagewise signature grows the support parameter.
-            return Err(py_value_error(
-                "sae_manifold_fit_stagewise: assignment_kind 'topk' is not routed through \
-                 the stagewise entry yet — use sae_manifold_fit (joint) with top_k set"
-                    .to_string(),
-            ));
-        }
-        other => {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit_stagewise: assignment_kind must be \
-                 softmax/ibp_map/threshold_gate/topk; got {other}"
-            )));
-        }
+    let fisher_metric = match fisher_factors.as_ref() {
+        Some(factors) => Some(
+            SaeFisherRowMetricRequest::from_tag(
+                factors.as_array(),
+                z_view.nrows(),
+                z_view.ncols(),
+                fisher_provenance.as_deref(),
+                None,
+            )
+            .map_err(py_value_error)?,
+        ),
+        None => None,
     };
-    let mut base_term = term_from_padded_blocks_with_mode(
-        n_obs,
-        p_out,
-        &basis_kinds,
-        basis_values.as_array(),
-        basis_jacobian.as_array(),
-        &basis_sizes,
-        &atom_dim,
-        decoder_coefficients.as_array(),
-        smooth_penalties.as_array(),
-        initial_logits.as_array(),
-        &coord_blocks,
-        mode,
-        &evaluators,
-    )
+    let seed = build_sae_stagewise_seed(SaeStagewiseSeedRequest {
+        target: z_view,
+        atom_basis: &atom_basis,
+        atom_dim: &atom_dim,
+        basis_values: basis_values.as_array(),
+        basis_jacobian: basis_jacobian.as_array(),
+        basis_sizes: &basis_sizes,
+        decoder_coefficients: decoder_coefficients.as_array(),
+        smooth_penalties: smooth_penalties.as_array(),
+        initial_logits: initial_logits.as_array(),
+        initial_coords: initial_coords.as_array(),
+        alpha,
+        tau,
+        learnable_alpha,
+        assignment_kind: assignment,
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        cone_atom_recovery,
+        rank_charge_evidence,
+        structured_whitening,
+        fisher_metric,
+    })
     .map_err(py_value_error)?;
-    // #1939 — install the cone-atom RECOVERY opt-in before the fit consumes the
-    // term; it is carried across the stagewise clones (birth candidates / backfit)
-    // like the other per-fit config, so it reaches the K≥2 backfit where a born
-    // decoder can co-vanish. Default false ⇒ bit-for-bit historical path. Distinct
-    // from `quotient_scale` (which the stagewise entry never sets): this only arms
-    // the stable breach-gated boundary retraction, never the #2022 per-Newton fold.
-    base_term.set_cone_atom_recovery(cone_atom_recovery);
-    // #5/(B) — rank-charge evidence criterion (default true: the valid realised-rank
-    // REML/Laplace complexity ledger). Replaces the coord-block ½log|H_tt| with the realised-rank BIC.
-    base_term.set_rank_charge_evidence(rank_charge_evidence);
-    // Rung 1 (B4) — install the harvest-emitted output-Fisher `RowMetric` on the
-    // seed term BEFORE the fit consumes it. `fit_stagewise` carries the seed's
-    // metric into every birth-candidate / backfit clone (construction.rs clones
-    // `row_metric`), so a `"behavioral_fisher"` metric prices EVERY inner
-    // reconstruction in nats (GLS), not just the seed. The binding borrows the
-    // natural `(n, p, r)` factor stack; gam-sae owns validation, packing, and
-    // provenance selection.
-    if let Some(u3ro) = fisher_factors.as_ref() {
-        let u3 = u3ro.as_array();
-        let request = SaeFisherRowMetricRequest::from_tag(
-            u3,
-            n_obs,
-            p_out,
-            fisher_provenance.as_deref(),
-            None,
-        )
-        .map_err(py_value_error)?;
-        let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
-        // A supplied fixed metric and the structured-residual whitener are two
-        // rival sources for the SAME per-row inner product: `fit_stagewise`
-        // overwrites the term's metric with the refit Σ⁻¹ on each birth round when
-        // `structured_whitening` is on, silently clobbering the harvest metric.
-        // Refuse the ambiguous combination rather than let one win by accident.
-        if structured_whitening && metric.whitens_likelihood() {
-            return Err(py_value_error(
-                "sae_manifold_fit_stagewise: a likelihood-whitening fisher metric \
-                 (provenance 'behavioral_fisher') conflicts with structured_whitening=True \
-                 (which refits its own Σ⁻¹ metric per birth and would clobber it); pass \
-                 structured_whitening=False to fit under the fixed harvest metric"
-                    .to_string(),
-            ));
-        }
-        base_term.set_row_metric(metric).map_err(py_value_error)?;
-    }
-    // `0.0` sparsity/smoothness is the canonical "term disabled" baseline; floor
-    // to a tiny positive sentinel before the log so log-ρ stays finite (mirrors
-    // sae_manifold_fit; #184 sparsity, #2090 smoothness).
-    const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
-    let sparsity_strength = if sparsity_strength <= 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        sparsity_strength
-    };
-    let smoothness = if smoothness <= 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        smoothness
-    };
-    let seed_dispersion = base_term
-        .seed_reconstruction_dispersion(z_view)
-        .map_err(py_value_error)?;
-    let init_rho = SaeManifoldRho::new(
-        sparsity_strength.ln(),
-        smoothness.ln(),
-        vec![Array1::<f64>::zeros(d0)],
-    )
-    .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
-    .map_err(py_value_error)?;
+    let SaeStagewiseSeedReport {
+        base_term,
+        initial_rho: init_rho,
+    } = seed;
 
     let weights: Option<Vec<f64>> = row_loss_weights.as_ref().map(|w| w.as_array().to_vec());
     let config = gam::terms::sae::manifold::StagewiseConfig {

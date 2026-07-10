@@ -38,7 +38,7 @@ See https://github.com/SauersML/gam for the full guide.
 # - sae_manifold_assignment_summary
 # - topology_dispatch_key
 # - assemble_candidate_formula
-# - rank_topology_candidates
+# - select_topology_candidate_lifecycle
 # Rebuild or reinstall the local extension if importing from a source tree with
 # an older compiled .so.
 

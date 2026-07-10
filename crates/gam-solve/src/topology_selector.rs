@@ -1070,6 +1070,18 @@ fn topology_candidate_raw_score(
     evidence: &TopologyCandidateEvidence,
     score_kind: TopologySelectionScoreKind,
 ) -> Result<f64, String> {
+    if !evidence.effective_dim.is_finite() {
+        return Err(format!(
+            "candidate {:?} has non-finite effective_dim {:?}",
+            evidence.name, evidence.effective_dim
+        ));
+    }
+    if evidence.n_obs == 0 {
+        return Err(format!(
+            "candidate {:?} requires n_obs > 0",
+            evidence.name
+        ));
+    }
     if !evidence.raw_reml.is_finite() {
         return Err(format!(
             "candidate {:?} has non-finite REML evidence {:?}",
@@ -2737,8 +2749,89 @@ mod tests {
         assert_eq!(result.winner().unwrap().topology_name, "torus");
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].topology_name, "circle");
-        assert_eq!(result.failed[0].stage, TopologyAutoFailureStage::Fit);
+        assert_eq!(
+            result.failed[0].stage,
+            TopologyCandidateFailureStage::Fit
+        );
         assert!(result.failed[0].message.contains("stationarity"));
+    }
+
+    fn lifecycle_evidence(
+        name: &str,
+        raw_reml: f64,
+        laml: Option<f64>,
+        deviance: Option<f64>,
+        effective_dim: f64,
+    ) -> TopologyCandidateOutcome {
+        TopologyCandidateOutcome::Fitted(TopologyCandidateEvidence {
+            name: name.to_string(),
+            raw_reml,
+            laml,
+            deviance,
+            null_dim: Some(0.0),
+            null_space_logdet: None,
+            effective_dim,
+            basis_size: 4,
+            n_obs: 20,
+        })
+    }
+
+    #[test]
+    fn typed_lifecycle_owns_score_scaling_and_deterministic_winner() {
+        let result = select_topology_candidate_lifecycle(
+            vec![
+                lifecycle_evidence("larger_raw", 5.0, Some(5.0), Some(6.0), 10.0),
+                lifecycle_evidence("smaller_raw", 3.0, Some(3.0), Some(4.0), 2.0),
+            ],
+            TopologySelectionScoreKind::Reml,
+            TopologySelectionScoreScale::PerEffectiveDim,
+        )
+        .expect("typed lifecycle");
+        assert_eq!(result.winner_index, Some(0));
+        assert_eq!(result.ranked[0].name, "larger_raw");
+        assert!((result.ranked[0].score - 0.5).abs() < 1.0e-12);
+        assert_eq!(result.ranked[1].name, "smaller_raw");
+        assert!((result.ranked[1].score - 1.5).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn typed_lifecycle_converts_bad_evidence_without_losing_other_failures() {
+        let result = select_topology_candidate_lifecycle(
+            vec![
+                TopologyCandidateOutcome::Failed(TopologyCandidateFailure {
+                    name: "assembly_bad".to_string(),
+                    stage: TopologyCandidateFailureStage::Assembly,
+                    error_type: "ValueError".to_string(),
+                    message: "dimension mismatch".to_string(),
+                    evidence_at_failure: None,
+                }),
+                lifecycle_evidence("evidence_bad", f64::NAN, None, None, 2.0),
+                lifecycle_evidence("winner", 2.0, None, None, 2.0),
+            ],
+            TopologySelectionScoreKind::Reml,
+            TopologySelectionScoreScale::Raw,
+        )
+        .expect("candidate-local evidence failure");
+        assert_eq!(result.ranked.len(), 1);
+        assert_eq!(result.ranked[0].name, "winner");
+        assert_eq!(result.failed.len(), 2);
+        assert_eq!(result.failed[0].stage, TopologyCandidateFailureStage::Assembly);
+        assert_eq!(result.failed[1].stage, TopologyCandidateFailureStage::Evidence);
+        assert!(result.failed[1].message.contains("non-finite REML"));
+    }
+
+    #[test]
+    fn typed_lifecycle_rejects_duplicate_terminal_outcomes() {
+        let error = select_topology_candidate_lifecycle(
+            vec![
+                lifecycle_evidence("circle", 1.0, None, None, 1.0),
+                lifecycle_evidence("circle", 2.0, None, None, 1.0),
+            ],
+            TopologySelectionScoreKind::Reml,
+            TopologySelectionScoreScale::Raw,
+        )
+        .expect_err("duplicate candidate must be structural error");
+        assert!(error.contains("duplicate topology candidate"));
     }
 
     // --- #944 stage-4 topology collapse tests --------------------------------
