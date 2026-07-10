@@ -2022,7 +2022,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     use crate::custom_family::PenaltyMatrix;
     use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
     use gam_custom_family::evaluate_custom_family_joint_hyper;
-    use gam_problem::EvalMode;
+    use gam_problem::{EvalMode, HessianOperator};
     use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
     use gam_terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
@@ -2294,7 +2294,10 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     };
     let check = |dir: Array1<f64>, label: &str| {
         let fd = fd_along(&dir);
-        let operator_hvp = hess0_operator.mul_vec(&dir);
+        let mut operator_hvp = Array1::<f64>::zeros(theta_dim);
+        hess0_operator
+            .apply_into(&dir, &mut operator_hvp)
+            .expect("matrix-free outer Hessian HVP");
         assert_matches_fd(&operator_hvp, &fd, label, "operator-HVP");
 
         let dense_hvp = hess0_dense.dot(&dir);
