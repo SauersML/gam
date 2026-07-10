@@ -166,7 +166,7 @@ pub(crate) fn run_outer_with_plan(
     context: &str,
     cap: &OuterCapability,
     the_plan: &OuterPlan,
-) -> Result<OuterResult, EstimationError> {
+) -> Result<PlanRunOutcome, EstimationError> {
     let mut seeds = {
         let generated = crate::seeding::generate_rho_candidates(
             cap.n_params,
@@ -246,6 +246,7 @@ pub(crate) fn run_outer_with_plan(
     }
 
     let mut best: Option<OuterResult> = None;
+    let mut best_checkpoint: Option<OuterResult> = None;
     // Object 1 — ContinuationPath. Every SAE-manifold joint fit ENTERS through
     // the continuation path at a heavy-smoothing regime. When the objective
     // declares this requirement the seed cascade's structural-failure handling
@@ -274,9 +275,6 @@ pub(crate) fn run_outer_with_plan(
     // the more-penalized basin in the non-Gaussian multi-start keep-best.
     let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
-    let expensive_seed_limit =
-        expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);
-    let mut unsuccessful_expensive_seeds = 0usize;
     let continuation_prewarm_budget =
         continuation_prewarm_step_budget(config, cap, seeds.len(), seed_budget);
     if config.warm_start_cache_hit {
@@ -301,21 +299,6 @@ pub(crate) fn run_outer_with_plan(
         );
     }
     let mut continuation_prewarm_suppressed_after: Option<String> = None;
-    // Tracks whether the loop broke out early due to
-    // `expensive_unsuccessful_seed_limit` so the aggregate error can
-    // distinguish "all generated seeds tried" from "stopped early".
-    let mut stopped_early_due_to_limit = false;
-    // Tracks whether the loop stopped starting NEW seeds because the outer
-    // wall-clock deadline (gam#979) passed. Each seed attempt runs a
-    // continuation pre-warm plus one or more joint-Newton inner solves that
-    // can each take minutes on the non-convergent monotonicity-pinned survival
-    // marginal-slope baseline; the deadline is checked at inner-cycle
-    // boundaries, but nothing stopped the OUTER loop from opening yet another
-    // expensive seed once the budget was already spent, so the fit overran its
-    // budget several-fold (observed: 632s against a 300s budget). Consulting
-    // the deadline here caps the wall clock at "current seed finishes, no new
-    // seed starts" and returns the best-so-far iterate in bounded time.
-    let mut stopped_early_due_to_wall_clock = false;
     // Structured mirror of `rejection_reasons` used for honest seed
     // accounting + structural early-exit. Populated lazily at the top of
     // each iteration from any reasons accumulated during the previous
@@ -363,23 +346,6 @@ pub(crate) fn run_outer_with_plan(
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
         if started_seeds == seed_budget {
-            break;
-        }
-        // Stop opening new (expensive) seeds once the outer wall-clock deadline
-        // has passed (gam#979). The inner joint-Newton solves honour the same
-        // deadline at their cycle boundaries, but a fresh seed's continuation
-        // pre-warm can run for minutes before the first cycle check fires, so
-        // without this guard the outer loop kept launching seed after seed well
-        // past budget. Breaking here returns the best-so-far iterate accumulated
-        // in `best` (or the aggregated no-seed error) in bounded time.
-        if crate::rho_optimizer::outer_wall_clock_deadline_exceeded() {
-            log::warn!(
-                "[OUTER] {context}: outer wall-clock deadline reached before seed {seed_idx}; \
-                 stopping the seed cascade with {started_seeds} started seed(s) and \
-                 skipping the remaining {} candidate(s)",
-                seeds.len().saturating_sub(seed_idx),
-            );
-            stopped_early_due_to_wall_clock = true;
             break;
         }
         // Lazy structured classification: convert any new entries in
@@ -1919,7 +1885,6 @@ pub(crate) fn run_outer_with_plan(
         let seed_elapsed = t_seed_start.elapsed().as_secs_f64();
         match result {
             Ok(candidate) => {
-                let candidate_converged = candidate.converged;
                 log::debug!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
                     seed_slot,
@@ -1929,6 +1894,21 @@ pub(crate) fn run_outer_with_plan(
                     candidate.final_value,
                     candidate.converged,
                 );
+                if !candidate.converged {
+                    let improves_checkpoint = candidate.final_value.is_finite()
+                        && best_checkpoint.as_ref().is_none_or(|checkpoint| {
+                            !checkpoint.final_value.is_finite()
+                                || candidate.final_value < checkpoint.final_value
+                        });
+                    if improves_checkpoint {
+                        best_checkpoint = Some(candidate);
+                    }
+                    // An exhausted iterate is resumable work, not a fit
+                    // candidate. Continue the declared multistart budget in
+                    // search of a stationary seed; it may never populate or
+                    // short-circuit the certified winner slot.
+                    continue 'seed_attempts;
+                }
                 // #1373: for GLM/survival models the seed screening deliberately
                 // places the most-flexible (low-lambda) seed at slot 0 and the
                 // heaviest interior (high-lambda) seed at slot 1 so the budget-2
@@ -1984,63 +1964,6 @@ pub(crate) fn run_outer_with_plan(
                 {
                     break;
                 }
-                // Separable-fit multi-start guard (#1082). On a near-separable
-                // fit (the penguin-species multinomial) the unpenalized MLE is
-                // unbounded, so NO seed certifies outer convergence: every seed's
-                // projected gradient plateaus above tolerance on the λ→0 ridge,
-                // and the cost-stall guard publishes a feasible-but-`converged =
-                // false` best. The converged-break above therefore never fires,
-                // and the existing `expensive_seed_limit` only counts seeds that
-                // FAIL outright (Err / non-finite cost). So the optimizer pays a
-                // SECOND expensive seed which lands in a deeper-separation ρ whose
-                // inner joint-Newton crawls (~70s/eval), spending hundreds of
-                // wall-clock seconds to "refine" a feasible fit it provably cannot
-                // beat — the penguin 360s timeout.
-                //
-                // Once an expensive seed has produced a FEASIBLE (finite-cost)
-                // best, stop: paying another expensive seed to chase a stationary
-                // point that does not exist (the separating MLE is at λ = 0) is
-                // the budget waste #1082 is about. This is gated on the
-                // expensive-solver risk profiles (`expensive_seed_limit.is_some()`
-                // — ARC GeneralizedLinear/Survival; the cheap-EFS and Gaussian
-                // quality-compare paths are untouched) and only triggers AFTER a
-                // feasible result exists, so a seed that fails to produce any
-                // usable fit still falls through to the next seed exactly as
-                // before. The published best is the converged-or-best-feasible
-                // iterate either way, so accuracy is unchanged; only the wasted
-                // second expensive crawl is removed.
-                if should_stop_expensive_multistart_after_best(
-                    best.as_ref(),
-                    expensive_seed_limit,
-                    quality_compare_remaining_gaussian_seeds,
-                ) {
-                    log::info!(
-                        "[OUTER] {context}: stopping expensive multi-start: a feasible \
-                         NON-stationary best is in hand (value={:.6e}); the projected gradient \
-                         plateaued without certifying (the near-separable λ→0 ridge), so further \
-                         expensive {:?} seeds cannot reach a stationary point and only burn \
-                         wall-clock",
-                        best.as_ref().map(|b| b.final_value).unwrap_or(f64::NAN),
-                        the_plan.solver,
-                    );
-                    stopped_early_due_to_limit = true;
-                    break;
-                }
-                if !candidate_converged && matches!(expensive_seed_limit, Some(limit) if limit > 0)
-                {
-                    unsuccessful_expensive_seeds += 1;
-                    if let Some(limit) = expensive_seed_limit
-                        && unsuccessful_expensive_seeds >= limit
-                    {
-                        log::info!(
-                            "[OUTER] {context}: stopping expensive multi-start after {} non-converged {:?} seed(s)",
-                            unsuccessful_expensive_seeds,
-                            the_plan.solver,
-                        );
-                        stopped_early_due_to_limit = true;
-                        break;
-                    }
-                }
             }
             Err(e) => {
                 if requests_immediate_first_order_fallback(&e.to_string()) {
@@ -2055,18 +1978,6 @@ pub(crate) fn run_outer_with_plan(
                     e,
                 );
                 rejection_reasons.push((seed_idx, "solver", e.to_string()));
-                if let Some(limit) = expensive_seed_limit {
-                    unsuccessful_expensive_seeds += 1;
-                    if unsuccessful_expensive_seeds >= limit {
-                        log::info!(
-                            "[OUTER] {context}: stopping expensive multi-start after {} failed {:?} seed(s)",
-                            unsuccessful_expensive_seeds,
-                            the_plan.solver,
-                        );
-                        stopped_early_due_to_limit = true;
-                        break;
-                    }
-                }
             }
         }
     }
@@ -2101,7 +2012,11 @@ pub(crate) fn run_outer_with_plan(
         let finalize_outcome = obj.finalize_outer_result(&result.rho, the_plan);
         drop(finalize_cap_guard);
         finalize_outcome?;
-        return Ok(result);
+        return Ok(PlanRunOutcome::Converged(result));
+    }
+
+    if let Some(checkpoint) = best_checkpoint {
+        return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 
     Err({
@@ -2148,18 +2063,6 @@ pub(crate) fn run_outer_with_plan(
             format!(
                 "structural: {label} on seeds {first_seed}..{last_seed}; \
                  remaining {skipped} seeds skipped"
-            )
-        } else if stopped_early_due_to_wall_clock {
-            format!(
-                "stopped early: outer wall-clock deadline reached after {started_seeds} started \
-                 {:?} seed(s) (gam#979 bounded budget); best-so-far iterate returned",
-                the_plan.solver
-            )
-        } else if stopped_early_due_to_limit {
-            format!(
-                "stopped early after {unsuccessful_expensive_seeds} consecutive non-converged \
-                 {:?} seed(s) (expensive_unsuccessful_seed_limit)",
-                the_plan.solver
             )
         } else {
             String::new()
