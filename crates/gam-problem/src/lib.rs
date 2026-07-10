@@ -117,8 +117,9 @@ pub use row_metric::{MetricProvenance, RowMetric, WeightField, pack_probe_factor
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind, SearchStrategy};
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{
-    DeclaredHessianForm, Derivative, EfsEval, HessianMaterialization, HessianOperator,
-    HessianValue, ObjectiveEvalError, OuterEval, OuterStrategyError,
+    DeclaredHessianForm, Derivative, EfsEval, FixedPointCertificateEval,
+    FixedPointCoordinateCertificate, HessianMaterialization, HessianOperator, HessianValue,
+    ObjectiveEvalError, OuterEval, OuterStrategyError,
 };
 pub use types::*;
 
