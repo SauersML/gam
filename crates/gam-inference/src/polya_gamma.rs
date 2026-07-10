@@ -54,8 +54,26 @@ impl PolyaGamma {
     }
 
     /// Draw a single `PG(1, c)` variate from the caller's `rand` 0.10 stream.
+    ///
+    /// A Pólya–Gamma variate is strictly positive with a continuous density,
+    /// so an exact `0.0`, a negative value, or a non-finite value can only be
+    /// a numerical artifact of the upstream sampler (an RNG endpoint hitting
+    /// the series loop, or the extreme-tilt tail-mass overflow — #2245
+    /// findings 26/27). Such artifacts are redrawn rather than returned; a
+    /// run of them is a broken sampler, not randomness, and panics with the
+    /// invariant that failed.
     pub fn draw<R: Rng + ?Sized>(&self, rng: &mut R, tilt: f64) -> f64 {
-        self.upstream.draw(&mut Rand08(rng), tilt)
+        const MAX_REDRAWS: usize = 64;
+        for _ in 0..MAX_REDRAWS {
+            let v = self.upstream.draw(&mut Rand08(rng), tilt);
+            if v.is_finite() && v > 0.0 {
+                return v;
+            }
+        }
+        panic!(
+            "polya-gamma upstream sampler produced {MAX_REDRAWS} consecutive draws outside the \
+             strictly-positive PG(1, {tilt}) support — numerical invariant violated"
+        );
     }
 }
 
@@ -76,6 +94,24 @@ mod tests {
             0.25
         } else {
             (0.5 * c).tanh() / (2.0 * c)
+        }
+    }
+
+    /// #2245 findings 26/27: every draw must lie in the strictly-positive
+    /// PG(1, c) support and be finite, including the extreme-tilt regime where
+    /// the exponential-tail mass computation is numerically delicate.
+    #[test]
+    fn pg1_draws_are_strictly_positive_and_finite_at_extreme_tilt() {
+        let pg = PolyaGamma::new();
+        for &c in &[0.0_f64, 1.0, 30.0, 95.0, 200.0, 700.0] {
+            let mut rng = StdRng::seed_from_u64(0xABAD_1DEA ^ c.to_bits());
+            for _ in 0..20_000 {
+                let v = pg.draw(&mut rng, c);
+                assert!(
+                    v.is_finite() && v > 0.0,
+                    "PG(1,{c}) draw outside strict-positive support: {v}"
+                );
+            }
         }
     }
 
