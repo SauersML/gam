@@ -269,7 +269,7 @@ def main():
             }
             for attr in ["k", "reconstruction_ev", "births_accepted", "births_rejected",
                          "stopped_reason", "ev_trace", "backfit_ev_trace",
-                         "cone_atom_recovery_used", "rank_charge_evidence_used"]:
+                         "rank_charge_evidence_used"]:
                 try:
                     srec[attr] = _jsonable(getattr(sw, attr))
                 except Exception as e:

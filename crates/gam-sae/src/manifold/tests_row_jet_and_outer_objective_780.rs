@@ -81,14 +81,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 .try_assignments_row(row)
                 .expect("assignments row");
             let jets = term
-                .row_jets_for_logdet(
-                    &rho,
-                    row,
-                    vars.clone(),
-                    assignments.view(),
-                    &second_jets,
-                    &border,
-                )
+                .row_jets_for_logdet(row, vars.clone(), assignments.view(), &second_jets, &border)
                 .expect("production row jets");
 
             // Primary layout exactly as the cache rows it: slot positions
@@ -310,7 +303,7 @@ pub(crate) fn batch4_jet_lanes_match_scalar_hand_row_jets() {
             )
             .expect("assignments row");
         let hand = term
-            .row_jets_for_logdet(&rho, row, vars, a.view(), &second_jets, &border)
+            .row_jets_for_logdet(row, vars, a.view(), &second_jets, &border)
             .expect("hand scalar row jets");
         let jet = &batch[lane];
 
@@ -435,7 +428,7 @@ fn fixed_gate_probe_term() -> (SaeManifoldTerm, SaeManifoldRho) {
 #[test]
 pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
     use ndarray::{Array1, Array4};
-    let (mut term, rho) = fixed_gate_probe_term();
+    let mut term = fixed_gate_probe_term().0;
     // Frozen routing = OPPOSITE extreme of the free logits [5, -5].
     let frozen = ndarray::Array2::from_shape_vec((1, 2), vec![-5.0, 5.0]).unwrap();
     term.assignment
@@ -500,7 +493,7 @@ pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
 #[test]
 pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative() {
     use ndarray::{Array1, Array4};
-    let (mut term, rho) = fixed_gate_probe_term();
+    let mut term = fixed_gate_probe_term().0;
     // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. IBP-MAP
     // accepts ungated atoms (only Softmax rejects them; see `with_ungated`).
     term.assignment.ungated = vec![true, false];

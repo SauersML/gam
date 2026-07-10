@@ -100,7 +100,7 @@ def run_t2(residual, topo, args):
     rec = {"atom_topology": topo, "wall_s": wall}
     for attr in ["k", "reconstruction_ev", "births_accepted", "births_rejected",
                  "stopped_reason", "ev_trace", "collapse_events",
-                 "cone_atom_recovery_used", "rank_charge_evidence_used"]:
+                 "rank_charge_evidence_used"]:
         try: rec[attr] = _jsonable(getattr(sw, attr))
         except Exception as e: rec[attr] = f"<err {e}>"
     thetas, bases = _atom_thetas_and_bases(sw)

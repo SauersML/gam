@@ -156,7 +156,7 @@ def main():
                 "wall_s": wall,
             }
             for attr in ["k", "reconstruction_ev", "births_accepted", "births_rejected",
-                         "stopped_reason", "ev_trace", "cone_atom_recovery_used",
+                         "stopped_reason", "ev_trace",
                          "rank_charge_evidence_used"]:
                 try: srec[attr] = _jsonable(getattr(sw, attr))
                 except Exception as e: srec[attr] = f"<err {e}>"

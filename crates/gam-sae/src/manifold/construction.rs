@@ -200,7 +200,6 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            cone_atom_recovery: false,
             rank_charge_evidence: false,
             soft_rank_charge: false,
             data_row_reseed: false,
@@ -246,7 +245,6 @@ impl SaeManifoldTerm {
             tier0_mean: None,
             // #1939 — no amplitude-prior state until the first boundary
             // amplitude solve installs one (bit-for-bit historical objective).
-            amplitude_prior: None,
         })
     }
 
@@ -419,7 +417,6 @@ impl SaeManifoldTerm {
         primary.structural_cocollapse_reseeds = 0;
         // #1939 — K-dependent (per-atom SCAD λ): stale after the concat; the
         // merged term's next boundary amplitude solve re-installs it.
-        primary.amplitude_prior = None;
         // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
         primary.collapse_events = Vec::new();
         primary.curvature_walk_report = None;
@@ -969,17 +966,6 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #1939 — set the per-fit cone-atom RECOVERY-retraction opt-in (typed kwarg,
-    /// no env lever). Default false. This engages only the stable breach-gated
-    /// boundary retraction.
-    pub fn set_cone_atom_recovery(&mut self, enabled: bool) {
-        self.cone_atom_recovery = enabled;
-    }
-
-    /// #1939 — read the per-fit cone-atom RECOVERY-retraction opt-in.
-    pub fn cone_atom_recovery(&self) -> bool {
-        self.cone_atom_recovery
-    }
 
     /// #5/(B) — set the per-fit rank-charge evidence opt-in (typed kwarg, no env
     /// lever). Default false ⇒ historical path bit-for-bit. Replaces the
@@ -3866,12 +3852,8 @@ impl SaeManifoldTerm {
 
     /// #1026 — the fitted per-row assignment masses `a[i,k]` (the activation
     /// amplitudes `z_k` the amortized encode recovers `t` against), as an
-    /// `n × K` matrix. These are the realised positive intensities
-    /// `a_{ik}·exp(s_k)` that [`Self::try_fitted_with_rho`] multiplies into each
-    /// atom's unit-shape decoded row.  The gate `a_{ik}` remains the existence
-    /// posterior/indicator, while the atom log-amplitude `s_k` is the radial
-    /// intensity scale; feeding the product to [`Self::amortized_encode_target`]
-    /// re-encodes the SAME inference the dictionary was fit against.
+    /// `n × K` matrix. These are the posterior assignment intensities `a_{ik}`
+    /// that [`Self::try_fitted_with_rho`] multiplies into each atom's decoded row.
     pub fn fitted_assignment_amplitudes(
         &self,
         rho: &SaeManifoldRho,
@@ -3882,8 +3864,7 @@ impl SaeManifoldTerm {
         for row in 0..n {
             let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
             for atom_idx in 0..k_atoms {
-                amplitudes[[row, atom_idx]] =
-                    a[atom_idx] * self.atoms[atom_idx].log_amplitude.exp();
+                amplitudes[[row, atom_idx]] = a[atom_idx];
             }
         }
         Ok(amplitudes)
@@ -4713,15 +4694,6 @@ impl SaeManifoldTerm {
         // decoders the assembly's gradient/curvature used, so the line search sees
         // exactly the term the inner Newton step optimises (no value/grad desync).
         total += self.separation_barrier_value(penalty_scale);
-        // #1939 — empirical-Bayes amplitude prior (SCAD + evidence-ARD on
-        // exp(s_k)/s_k) at the boundary solve's converged (α, λ, σ̂²), in data-fit
-        // units. Pricing it here keeps the fit-level referee
-        // (`prefer_candidate_state`) and the Armijo baseline monotone-consistent
-        // with the amplitude solve's own keep-best: an accepted SCAD/ARD
-        // shrinkage deliberately raises the bare data-fit, and a referee that
-        // omits the prior would bank and restore the pre-shrinkage state. Zero
-        // until the first amplitude solve installs the state (historical path).
-        total += self.amplitude_prior_value(penalty_scale);
         Ok(total)
     }
 

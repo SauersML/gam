@@ -199,8 +199,8 @@ latent-manifold engine.
   are vetoed; the hybrid split prices deviance, not raw SSE (#2124).
 - A tiered spine (shared Tier-0 mean + Tier-1 interference emitter, #2023),
   block-coordinate manifold charts, behavioral-Fisher whitened-GLS encode
-  (#2021), cone-atom boundary retraction (#1939), and born-circle birth gating
-  (#2109/#2111). The 10k-line `construction.rs` was split out into a dedicated
+  (#2021), and born-circle birth gating (#2109/#2111). The 10k-line
+  `construction.rs` was split out into a dedicated
   arrow-Schur assembly module (#780).
 
 ### Build & hygiene

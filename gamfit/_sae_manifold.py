@@ -2274,10 +2274,6 @@ class StagewiseSAE:
     assignment: str
     seed: ManifoldSAE
     training_data: np.ndarray
-    #: #1939 — the resolved cone-atom RECOVERY opt-in the fit actually ran with
-    #: (echoed from the FFI). Lets a harness verify the kwarg engaged rather than
-    #: assuming which recovery policy ran.
-    cone_atom_recovery_used: bool = False
 
     @property
     def k(self) -> int:
@@ -2507,7 +2503,6 @@ def sae_manifold_fit_stagewise(
     assignment: str = "softmax",
     structured_whitening: bool | None = None,
     fisher_factors: Any = None,
-    cone_atom_recovery: bool = False,
     min_effect_ev: float = 0.0,
     max_births: int = 24,
     max_backfit_sweeps: int = 4,
@@ -2767,7 +2762,6 @@ def sae_manifold_fit_stagewise(
         min_effect_ev=float(min_effect_ev),
         max_factor_rank=int(max_factor_rank),
         structured_whitening=bool(structured_whitening_eff),
-        cone_atom_recovery=bool(cone_atom_recovery),
         row_loss_weights=weights_arr,
         progress_callback=progress_callback,
         fisher_factors=(
@@ -2856,10 +2850,6 @@ def _stagewise_from_payload(
         assignment=str(seed_fit.assignment),
         seed=seed_fit,
         training_data=np.asarray(x, dtype=np.float64),
-        # #1939 — surface the FFI's cone_atom_recovery echo on the result object so a
-        # harness can verify the flag engaged; older payloads without the key default
-        # to False.
-        cone_atom_recovery_used=bool(payload.get("cone_atom_recovery_used", False)),
     )
 
 

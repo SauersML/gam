@@ -588,14 +588,6 @@ pub struct SaeManifoldTerm {
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
-    /// #1939 — persisted per-fit opt-in for the cone-atom RECOVERY retraction
-    /// (default false ⇒ bit-for-bit historical path). When true, at each accepted
-    /// OUTER-iterate boundary any atom whose decoder has COLLAPSED relative to its
-    /// dictionary peers (`‖B_k‖ < ratio·median`) is retracted onto the unit sphere
-    /// and its amplitude re-solved, re-homing a co-vanished born decoder without
-    /// touching healthy atoms. This does only the stable breach-gated boundary
-    /// retraction. Carried across clones like the other per-fit config.
-    pub(crate) cone_atom_recovery: bool,
     /// #5/(B) — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
     /// path) for the RANK-CHARGE evidence criterion. When true, the Laplace
     /// complexity's per-atom COORDINATE-block term ½log|H_tt| — which mis-prices
@@ -673,35 +665,6 @@ pub struct SaeManifoldTerm {
     /// DC-constant decoder is then EV-invisible BY CONSTRUCTION — the mean it would
     /// chase is already gone. Carried across clones like the other persisted config.
     pub(crate) tier0_mean: Option<Array1<f64>>,
-    /// #1939 — the boundary amplitude solve's converged empirical-Bayes prior
-    /// state: the MacKay/Fellner–Schall evidence precision `α` on the active
-    /// log-amplitudes, the per-atom SCAD selection coefficients `λ_k` (β-space),
-    /// and the noise scale `σ̂²` that converts the solve's noise-whitened prior
-    /// energy into data-fit units. Persisted so the FIT-LEVEL referee
-    /// ([`SaeManifoldTerm::penalized_objective_total`], hence
-    /// `prefer_candidate_state` and the Armijo line search) prices the SAME
-    /// amplitude prior the solve minimised — without it the keep-best incumbent
-    /// ranks states on the bare data-fit and silently vetoes the prior's
-    /// accepted shrinkage (the #2230 objective-desync class, relocated to the
-    /// amplitude channel). `None` until the first amplitude solve (bit-for-bit
-    /// historical objective); transient across clones and stale-guarded on `K`
-    /// (a mismatched `λ` length is skipped, then re-installed by the next
-    /// solve).
-    pub(crate) amplitude_prior: Option<AmplitudePriorState>,
-}
-
-/// #1939 — converged empirical-Bayes amplitude-prior state persisted by
-/// [`SaeManifoldTerm::optimize_log_amplitudes_closed_form`]; see the field doc
-/// on [`SaeManifoldTerm::amplitude_prior`].
-#[derive(Debug, Clone)]
-pub(crate) struct AmplitudePriorState {
-    /// Evidence (ARD) precision on the ACTIVE log-amplitudes, `s_k ~ N(0, 1/α)`.
-    pub(crate) alpha: f64,
-    /// Per-atom SCAD coefficient `λ_k` in amplitude (β) space.
-    pub(crate) scad_lambda: Vec<f64>,
-    /// LS residual noise scale `σ̂²`: multiplying the noise-whitened prior
-    /// energy by `σ̂²` expresses it in the same units as the weighted data-fit.
-    pub(crate) sigma2: f64,
 }
 
 /// Per-fit SAE configuration consumed by the Python/FFI layer. Build it, then
@@ -765,7 +728,6 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            cone_atom_recovery: self.cone_atom_recovery,
             rank_charge_evidence: self.rank_charge_evidence,
             soft_rank_charge: self.soft_rank_charge,
             data_row_reseed: self.data_row_reseed,
@@ -781,10 +743,6 @@ impl Clone for SaeManifoldTerm {
             // #2023 C4 — persisted Tier-0 shared mean, carried across clones like
             // the assignment mode so a cloned candidate de-means identically.
             tier0_mean: self.tier0_mean.clone(),
-            // #1939 — transient like the incumbents: a clone (stagewise birth /
-            // candidate) may change K, so it starts with no amplitude prior and
-            // the next boundary solve re-installs one sized to its dictionary.
-            amplitude_prior: None,
         }
     }
 }
@@ -858,11 +816,6 @@ pub(crate) struct SaeFitIncumbent {
 #[derive(Debug)]
 pub(crate) struct SaeManifoldAtomSnapshot {
     pub(crate) decoder_coefficients: Array2<f64>,
-    /// Explicit physical log-amplitude `s_k`. A snapshot that banked only the
-    /// decoder would mix the banked `B_k` with a different amplitude after a
-    /// boundary recovery solve, producing a physically different model from the
-    /// one whose objective was banked.
-    pub(crate) log_amplitude: f64,
     pub(crate) smooth_penalty: Array2<f64>,
     pub(crate) basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     pub(crate) basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,

@@ -900,14 +900,8 @@ impl SaeManifoldTerm {
                 .map(|value| sqrt_weight * value)
                 .collect();
             let vars = self.row_vars_for_cache_row(row, cache)?;
-            let jets = self.row_jets_for_logdet(
-                rho,
-                row,
-                vars,
-                assignments.view(),
-                &second_jets,
-                &border,
-            )?;
+            let jets =
+                self.row_jets_for_logdet(row, vars, assignments.view(), &second_jets, &border)?;
             rhs_t.fill(0.0);
             rhs_beta.fill(0.0);
             let base = cache.row_offsets[row];

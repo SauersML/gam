@@ -26,7 +26,6 @@ pub struct SaeStagewiseSeedRequest<'a> {
     pub learning_rate: f64,
     pub ridge_ext_coord: f64,
     pub ridge_beta: f64,
-    pub cone_atom_recovery: bool,
     pub structured_whitening: bool,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
 }
@@ -103,7 +102,6 @@ pub fn build_sae_stagewise_seed(
                 .to_string(),
         );
     }
-    base_term.set_cone_atom_recovery(request.cone_atom_recovery);
     Ok(SaeStagewiseSeedReport {
         base_term,
         initial_rho: seed.initial_rho,

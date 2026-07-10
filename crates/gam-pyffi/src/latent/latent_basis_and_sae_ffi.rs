@@ -1921,13 +1921,10 @@ fn stagewise_atoms_py<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
-            // #2135/#2237 — persistence consumes BOTH fit-internal gauges: expand
-            // the reduced frame (`Q B̃`) and materialize the scale quotient
-            // (`exp(s_k) Q B̃`). A reloaded checkpoint therefore receives the
-            // physical `M × p` decoder and can set `log_amplitude = 0` without
-            // changing the fitted atom.
+            // Persistence expands the reduced frame to the physical `M × p`
+            // decoder expected at the Python boundary.
             "decoder_B",
-            atom.physical_full_width_decoder().into_pyarray(py),
+            atom.full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", stagewise_basis_kind_tag(&atom.basis_kind))?;
         atom_dict.set_item("latent_dim", atom.latent_dim)?;
@@ -2037,15 +2034,12 @@ fn stagewise_progress_py<'py>(
     structured_whitening = true,
     row_loss_weights = None,
     progress_callback = None,
-    // #1939 — appended LAST so the signature stays strictly additive: existing
-    // positional/kwarg callers (which never pass this) are byte-for-byte unaffected.
-    cone_atom_recovery = false,
     // Rung 1 (B4) — the harvest-emitted output-Fisher factor stack `(n, p, r)` and
-    // its provenance tag. Appended LAST so the signature stays strictly additive.
-    // Presence installs the metric on the seed term (carried across every birth /
-    // backfit clone); `"behavioral_fisher"` makes it the GLS reconstruction
-    // likelihood weight (nats). Conflicts with `structured_whitening` (which refits
-    // its own Σ⁻¹ metric per birth) — supply one or the other, not both.
+    // its provenance tag. Presence installs the metric on the seed term (carried
+    // across every birth / backfit clone); `"behavioral_fisher"` makes it the GLS
+    // reconstruction likelihood weight (nats). Conflicts with
+    // `structured_whitening` (which refits its own Σ⁻¹ metric per birth) — supply
+    // one or the other, not both.
     fisher_factors = None,
     fisher_provenance = None,
 ))]
@@ -2078,7 +2072,6 @@ fn sae_manifold_fit_stagewise<'py>(
     structured_whitening: bool,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     progress_callback: Option<PyObject>,
-    cone_atom_recovery: bool,
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
@@ -2119,7 +2112,6 @@ fn sae_manifold_fit_stagewise<'py>(
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-        cone_atom_recovery,
         structured_whitening,
         fisher_metric,
     })
@@ -2231,9 +2223,6 @@ fn sae_manifold_fit_stagewise<'py>(
 
     let out = PyDict::new(py);
     out.set_item("k_final", k_final)?;
-    // #1939 — echo the resolved cone-atom RECOVERY opt-in so a harness can VERIFY
-    // the kwarg engaged (no silent no-op): the value the fit actually ran with.
-    out.set_item("cone_atom_recovery_used", cone_atom_recovery)?;
     out.set_item("births_accepted", report.births_accepted)?;
     out.set_item("births_rejected", report.births_rejected)?;
     out.set_item("stopped_reason", stopped_reason)?;
@@ -2477,13 +2466,10 @@ fn sae_manifold_fit_inner<'py>(
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
         atom_dict.set_item(
-            // #2135/#2237 — emit the PHYSICAL full-width decoder
-            // `exp(s_k) Q B̃` (`M × p`). The rank-reduced frame `Q` and the
-            // quotient-scale coordinate `s_k` are both fit-internal; OOS, steering,
-            // reconstruction, and reload consumers rebuild the standard `M`-column
-            // basis with zero log-amplitude, so this boundary must materialize both.
+            // Expand the fit-internal rank-reduced frame before crossing the
+            // Python boundary. All consumers receive the physical `M × p` decoder.
             "decoder_B",
-            atom.physical_full_width_decoder().into_pyarray(py),
+            atom.full_width_decoder().into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
         atom_dict.set_item("basis_centers", py.None())?;
@@ -2564,6 +2550,16 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reconstruction_r2", reconstruction_r2)?;
+    // #2023 Increment 5 — the Tier-0 shared mean the ONE fit entry peeled off the
+    // raw target, now carried on the fitted artifact (`p`-vector μ) so a Python
+    // consumer reconstructing from the per-atom `decoder_B` (which fit the DE-MEANED
+    // target `Z − μ`) can add it back and be self-contained; `fitted` above already
+    // includes it. `None` when the target was already centered upstream and no mean
+    // was installed.
+    match term.tier0_mean() {
+        Some(mean) => out.set_item("tier0_mean", mean.clone().into_pyarray(py))?,
+        None => out.set_item("tier0_mean", py.None())?,
+    }
     // #2235 — outer-search accounting for the CONVERGED fit (the only kind
     // that exists: non-convergence raises a typed error before a fit is
     // minted — the forcing-function contract, see SPEC).
@@ -3499,8 +3495,8 @@ fn sae_manifold_fit_ibp<'py>(
         None,
         None,
         // Residual promotion stays disabled for this narrow convenience entry;
-        // canonical structured whitening, scale quotienting, and rank charge are
-        // unconditional in the shared core.
+        // canonical structured whitening and rank charge are unconditional in
+        // the shared core.
         false,
         true,
         true,

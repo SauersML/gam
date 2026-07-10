@@ -124,8 +124,33 @@ fn build_duchon_basis_uncached(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let Some((start, end, _period)) = spec.boundary.period() {
-        return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end);
+    if let Some((_start, _end, period)) = spec.boundary.period() {
+        // A 1-D cyclic boundary is the formula-DSL spelling of periodicity.
+        // Normalize it onto `spec.periodic` so ALL periodic 1-D Duchon terms
+        // share the single Bernoulli Green's-function construction
+        // (`build_periodic_duchon_basis_1d`): the exact periodic kernel of
+        // `(d²/dx²)^m` with the exact RKHS Gram penalty `ω = zᵀK_centers z`.
+        // The former wrapped-min-distance kernel + coefficient-difference
+        // penalty path was both a SPEC 5 violation (penalty on coefficients,
+        // not the function) and a live forward/derivative desync: every
+        // derivative/jet consumer (`create_duchon_basis_1d_derivative_dense`,
+        // the log-κ derivative builders, the pyffi periodic jet) reconstructs
+        // the Bernoulli design, never the wrapped-distance one. Only the
+        // period LENGTH matters — the periodic kernel depends on cyclic
+        // distance mod period, so the boundary's absolute phase anchor is
+        // immaterial (the wrap anchor is re-derived deterministically from
+        // the frozen center set at fit and predict time alike).
+        if data.ncols() != 1 {
+            crate::bail_invalid_basis!(
+                "cyclic-boundary Duchon smooths require exactly one covariate"
+            );
+        }
+        let mut spec_periodic = spec.clone();
+        spec_periodic.boundary = crate::basis::OneDimensionalBoundary::Open;
+        spec_periodic.periodic = Some(vec![Some(period)]);
+        let centers = select_centers_by_strategy(data, &spec_periodic.center_strategy)?;
+        assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
+        return build_periodic_duchon_basis_1d(data, &spec_periodic, centers, workspace);
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;

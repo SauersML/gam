@@ -555,23 +555,6 @@ pub struct SaeManifoldAtom {
     /// ever set for `latent_dim == 1` atoms and `latent_dim == 2` torus
     /// atoms; never a flag the user controls.
     pub chart_canonicalized: bool,
-    /// #2022 — explicit per-atom log-amplitude `s_k` (positivity-free): the atom
-    /// contributes `exp(s_k)·Φ_k(t)·B_k`, so `s_k` carries the atom's SCALE and
-    /// the decoder `B_k` can be a pure (eventually unit-Frobenius) shape frame.
-    /// Decoupling magnitude from the decoder frame removes the SCALE gauge
-    /// flat-direction (gate = existence, amplitude = intensity). Default `0.0`
-    /// ⇒ `exp(s_k) = 1`, i.e. the historical `Φ·B` contribution bit-for-bit; the
-    /// decode primitives skip the scaling entirely when `s_k == 0.0`, so the
-    /// hot loop is unchanged until an amplitude is set.
-    ///
-    /// STEP 1 (this change) installs the field, the decode-path threading, and
-    /// the [`Self::absorb_decoder_norm_into_log_amplitude`] peel. Carrying `s_k`
-    /// through the joint solve as a free arrow block AND pinning `‖B_k‖ = 1`
-    /// (the Stiefel retract) land together in STEP 2: because `set_flat_beta`
-    /// round-trips the magnitude-bearing β every inner iterate, `s_k` cannot
-    /// carry scale THROUGH the solve until `‖B_k‖` is constrained, so the two
-    /// are deliberately coupled.
-    pub log_amplitude: f64,
     /// Row indices of the quadrature subsample the `d ≥ 2` bending Gram is
     /// assembled from at scale. `None` ⇒ the Gram uses the full active set and
     /// [`Self::basis_second_jet_values`] is the full `(n, M, d, d)` jet — the
@@ -682,8 +665,6 @@ impl SaeManifoldAtom {
             decoder_frame: None,
             homotopy_eta: 1.0,
             chart_canonicalized: false,
-            // #2022 — default 0.0 ⇒ exp(s)=1 ⇒ historical `Φ·B` bit-for-bit.
-            log_amplitude: 0.0,
             bending_quadrature_rows: None,
             // Set only by `reduce_basis_to_subspace`; a freshly-built atom is
             // full-width (its decoder is already the un-reduced `M × p` block).
@@ -872,24 +853,6 @@ impl SaeManifoldAtom {
             Some(q) => q.dot(&self.decoder_coefficients),
             None => self.decoder_coefficients.clone(),
         }
-    }
-
-    /// Full-width decoder in physical output units.
-    ///
-    /// `decoder_coefficients` is the scale-gauge representative used by the
-    /// optimizer.  Once the quotient is active its Frobenius magnitude lives in
-    /// `log_amplitude`, so exporting the representative by itself loses fitted
-    /// scale.  Persistence and inference boundaries must use this accessor:
-    /// it first reverses any internal basis reduction and then materializes
-    /// `exp(log_amplitude) * B`.  The returned block is gauge free and can be
-    /// loaded with `log_amplitude = 0` without changing the represented atom.
-    pub fn physical_full_width_decoder(&self) -> Array2<f64> {
-        let mut decoder = self.full_width_decoder();
-        if self.log_amplitude != 0.0 {
-            let amplitude = self.log_amplitude.exp();
-            decoder.mapv_inplace(|v| amplitude * v);
-        }
-        decoder
     }
 
     /// Full inner-basis width `M` — the row count of
@@ -1472,15 +1435,6 @@ impl SaeManifoldAtom {
                 *o += phi * d;
             }
         }
-        // #2022 — apply the explicit log-amplitude: contribution is exp(s)·Φ·B.
-        // Skipped when s == 0.0 (default) so the historical hot loop is
-        // bit-for-bit; a non-zero s scales the whole decoded row.
-        if self.log_amplitude != 0.0 {
-            let amp = self.log_amplitude.exp();
-            for slot in out.iter_mut() {
-                *slot *= amp;
-            }
-        }
     }
 
     /// `d g_k(t_{ik}) / d t_{ik,j}` for one row and latent axis.
@@ -1508,14 +1462,6 @@ impl SaeManifoldAtom {
             let dec = self.decoder_coefficients.row(basis_col);
             for (o, &d) in out.iter_mut().zip(dec.iter()) {
                 *o += dphi * d;
-            }
-        }
-        // #2022 — the reconstruction is exp(s)·Φ·B, so its coordinate derivative
-        // is exp(s)·(dΦ·B). Skipped when s == 0.0 (default) ⇒ bit-for-bit.
-        if self.log_amplitude != 0.0 {
-            let amp = self.log_amplitude.exp();
-            for slot in out.iter_mut() {
-                *slot *= amp;
             }
         }
     }
@@ -1552,14 +1498,6 @@ impl SaeManifoldAtom {
                 *o += dphi * d;
             }
         }
-        // #2022 — same exp(s) scaling as the value/derivative primitives so the
-        // curved η-derivative stays consistent. No-op at s == 0.0 (default).
-        if self.log_amplitude != 0.0 {
-            let amp = self.log_amplitude.exp();
-            for slot in out.iter_mut() {
-                *slot *= amp;
-            }
-        }
     }
 
     /// #2133 — the pure second coordinate derivative `∂²g_k/∂t_{ik,axis}²`
@@ -1592,73 +1530,9 @@ impl SaeManifoldAtom {
                 *o += d2phi * d;
             }
         }
-        if self.log_amplitude != 0.0 {
-            let amp = self.log_amplitude.exp();
-            for slot in out.iter_mut() {
-                *slot *= amp;
-            }
-        }
     }
 
-    /// #2022 — fold the decoder's Frobenius magnitude into the explicit
-    /// log-amplitude: `s_k ← s_k + ln‖B_k‖_F` and `B_k ← B_k / ‖B_k‖_F`, leaving
-    /// the atom's contribution `exp(s_k)·Φ·B_k` numerically UNCHANGED. This is
-    /// the representation half of the SCALE-gauge removal — after peeling,
-    /// magnitude lives only in `s_k` and `B_k` is a unit-Frobenius shape frame
-    /// (the invariant the STEP 2 Stiefel retract maintains). A decoder at/under
-    /// `floor` (or non-finite norm) is treated as collapsed and left untouched
-    /// (no `ln 0`); pass e.g. `f64::MIN_POSITIVE` for "skip only an exactly-zero
-    /// decoder".
-    pub fn absorb_decoder_norm_into_log_amplitude(&mut self, floor: f64) {
-        let norm = self
-            .decoder_coefficients
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        if !(norm.is_finite() && norm > floor) {
-            return;
-        }
-        self.log_amplitude += norm.ln();
-        self.decoder_coefficients.mapv_inplace(|v| v / norm);
-        // `smooth_penalty` is a frozen quadratic operator.  Recomputing it from
-        // the new decoder here would make the reported value state-dependent
-        // while the optimizer differentiates it as fixed.  A pure scale-gauge
-        // retraction therefore leaves the operator untouched.
-    }
-
-    /// #2022 — like [`Self::absorb_decoder_norm_into_log_amplitude`] but SKIPS the
-    /// [`Self::refresh_intrinsic_smooth_penalty`] recompute, so a caller that has
-    /// already installed a specific `smooth_penalty` keeps it. Used at the
-    /// basis-change TRANSPORT / rank-reparam sites, whose penalty is set by
-    /// [`transport_smooth_penalty_for_decoder`](crate::manifold::outer_objective::transport_smooth_penalty_for_decoder)
-    /// = `T⁻ᵀ S_old T⁻¹` — a function of the basis transport and the OLD penalty
-    /// ONLY, independent of the decoder's magnitude/values — so normalizing the
-    /// decoder here cannot invalidate it, and refreshing would clobber it. A
-    /// decoder at/under `floor` (or non-finite norm) is left untouched.
-    pub fn absorb_decoder_norm_into_log_amplitude_without_refresh(&mut self, floor: f64) {
-        let norm = self
-            .decoder_coefficients
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        if !(norm.is_finite() && norm > floor) {
-            return;
-        }
-        self.log_amplitude += norm.ln();
-        self.decoder_coefficients.mapv_inplace(|v| v / norm);
-        // Deliberately NOT refreshing smooth_penalty — the caller's transported
-        // penalty is decoder-magnitude-independent and must survive the peel.
-    }
-
-    /// Physical atom scale in the represented contribution
-    /// `exp(s_k) · Φ_k · B_k`.
-    ///
-    /// Decoder-collapse logic must use this gauge-invariant scale once the
-    /// quotient has moved magnitude from `B_k` into `s_k`; otherwise a
-    /// unit-Frobenius decoder would make every atom look equally alive even when
-    /// its explicit amplitude has collapsed.
+    /// Frobenius scale of the physical decoder contribution.
     pub(crate) fn contribution_frobenius_scale(&self) -> f64 {
         let decoder_norm = self
             .decoder_coefficients
@@ -1666,9 +1540,11 @@ impl SaeManifoldAtom {
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let amplitude = self.log_amplitude.exp();
-        let scale = amplitude * decoder_norm;
-        if scale.is_finite() { scale } else { 0.0 }
+        if decoder_norm.is_finite() {
+            decoder_norm
+        } else {
+            0.0
+        }
     }
 
     /// Recompute the intrinsic (gauge-invariant) roughness Gram

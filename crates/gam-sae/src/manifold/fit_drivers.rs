@@ -179,7 +179,6 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| SaeManifoldAtomSnapshot {
                 decoder_coefficients: atom.decoder_coefficients.clone(),
-                log_amplitude: atom.log_amplitude,
                 smooth_penalty: atom.smooth_penalty.clone(),
                 // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
                 // are rebuilt from these + coords on restore, avoiding the
@@ -223,7 +222,6 @@ impl SaeManifoldTerm {
                         _ => false,
                     };
                     atom.decoder_coefficients == saved.decoder_coefficients
-                        && atom.log_amplitude.to_bits() == saved.log_amplitude.to_bits()
                         && atom.smooth_penalty == saved.smooth_penalty
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
                         && evaluator_matches
@@ -260,7 +258,6 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         for (atom, snap) in self.atoms.iter_mut().zip(snapshot.atoms.iter()) {
             atom.decoder_coefficients.assign(&snap.decoder_coefficients);
-            atom.log_amplitude = snap.log_amplitude;
             atom.smooth_penalty.assign(&snap.smooth_penalty);
             atom.basis_evaluator.clone_from(&snap.basis_evaluator);
             atom.basis_second_jet.clone_from(&snap.basis_second_jet);
@@ -5555,19 +5552,6 @@ impl SaeManifoldTerm {
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
             self.retract_unit_speed_charts_in_loop()?;
-            // #1939 cone-atom RECOVERY retraction (Design B) — at this accepted
-            // OUTER-iterate boundary, retract ONLY the atoms whose decoder has
-            // COLLAPSED relative to its dictionary peers (breach vs peer median),
-            // folding the vanished ‖B_k‖ into s_k so the paired amplitude solve can
-            // re-home it — recovering a co-vanished born decoder (the K≥2
-            // 0.7255→0.0023 collapse) — while leaving HEALTHY atoms' scale in B.
-            //
-            // Run the paired amplitude solve solely when the recovery retracted an
-            // atom. K<2 and all-zero-median dictionaries are no-ops inside the
-            // helper, and a healthy dictionary never enters the amplitude solve.
-            if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
-                self.optimize_log_amplitudes_closed_form(target, rho)?;
-            }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each

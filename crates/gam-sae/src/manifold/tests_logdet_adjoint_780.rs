@@ -609,7 +609,7 @@ fn softmax_logit_dual_channel_report_2156(
         .border_channels_for_cache(cache)
         .expect("border channels");
     let jets = term
-        .row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)
+        .row_jets_for_logdet(row, vars, assignments.view(), &second_jets, &border)
         .expect("softmax row jets");
     let mut tt_data = Array2::<f64>::zeros((dim, dim));
     let mut tt_majorizer = Array2::<f64>::zeros((dim, dim));
@@ -1167,7 +1167,7 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
         )
         .expect("assignments");
     let jets = term
-        .row_jets_for_logdet(&rho, row, vars, assignments.view(), &second_jets, &border)
+        .row_jets_for_logdet(row, vars, assignments.view(), &second_jets, &border)
         .expect("row jets");
 
     let mut dh = Array2::<f64>::zeros((dim, dim));

@@ -617,7 +617,6 @@ impl SaeManifoldTerm {
 
     pub(crate) fn row_jets_for_logdet(
         &self,
-        rho: &SaeManifoldRho,
         row: usize,
         vars: Vec<SaeLocalRowVar>,
         assignments: ArrayView1<'_, f64>,
@@ -865,7 +864,7 @@ impl SaeManifoldTerm {
             rho,
             a.as_slice_mut().expect("contiguous assignment scratch"),
         )?;
-        let jets = self.row_jets_for_logdet(rho, start, vars, a.view(), second_jets, border)?;
+        let jets = self.row_jets_for_logdet(start, vars, a.view(), second_jets, border)?;
         window.push_back(jets);
         Ok(start + 1)
     }
