@@ -1704,12 +1704,15 @@ fn fit_sphere_seam_transition(
     let points_a = sphere_decoded_points_at_units(atom_a.full_width_decoder().view(), &units_a)?;
     let points_b = sphere_decoded_points_at_units(atom_b.full_width_decoder().view(), &units_b)?;
     // B's rows carried into A: rotate u_b -> u_a, decode through A.
-    let mapped_b_units: Vec<[f64; 3]> = units_b.iter().map(|&u| rotate_unit(&rotation, u)).collect();
+    let mapped_b_units: Vec<[f64; 3]> =
+        units_b.iter().map(|&u| rotate_unit(&rotation, u)).collect();
     let mapped_b_to_a =
         sphere_decoded_points_at_units(atom_a.full_width_decoder().view(), &mapped_b_units)?;
     // A's rows carried into B: rotate u_a by R⁻¹ -> u_b, decode through B.
-    let mapped_a_units: Vec<[f64; 3]> =
-        units_a.iter().map(|&u| rotate_unit(&inv_rotation, u)).collect();
+    let mapped_a_units: Vec<[f64; 3]> = units_a
+        .iter()
+        .map(|&u| rotate_unit(&inv_rotation, u))
+        .collect();
     let mapped_a_to_b =
         sphere_decoded_points_at_units(atom_b.full_width_decoder().view(), &mapped_a_units)?;
     Some(SphereSeamTransition {
@@ -1749,8 +1752,7 @@ fn sphere_glue_pair_evalue(
         &seam.points_b,
         &seam.mapped_b_to_a,
     )?;
-    let transition =
-        SphereChartTransition::new(b, a, seam.rotation, AtlasSeamKind::Pole).ok()?;
+    let transition = SphereChartTransition::new(b, a, seam.rotation, AtlasSeamKind::Pole).ok()?;
     Some((transition, log_e))
 }
 
@@ -2396,7 +2398,9 @@ fn compact_glued_atoms(
                 ));
             }
             let sphere = fit_sphere_seam_transition(term, a, b).ok_or_else(|| {
-                format!("compact_glued_atoms: accepted sphere seam ({a},{b}) is no longer identifiable")
+                format!(
+                    "compact_glued_atoms: accepted sphere seam ({a},{b}) is no longer identifiable"
+                )
             })?;
             if !matches!(sphere.seam_kind, AtlasSeamKind::Pole) {
                 return Err(format!(

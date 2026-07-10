@@ -245,11 +245,7 @@ impl SphereChartTransition {
     /// (`det R > 0`), `-1` for a reflection.
     #[must_use]
     pub fn sign(&self) -> i8 {
-        if self.determinant() >= 0.0 {
-            1
-        } else {
-            -1
-        }
+        if self.determinant() >= 0.0 { 1 } else { -1 }
     }
 
     /// Apply the exact ambient rotation to a unit vector.
@@ -292,7 +288,9 @@ impl SphereChartTransition {
         let mut product = [[0.0; 3]; 3];
         for i in 0..3 {
             for j in 0..3 {
-                product[i][j] = (0..3).map(|k| next.rotation[i][k] * self.rotation[k][j]).sum();
+                product[i][j] = (0..3)
+                    .map(|k| next.rotation[i][k] * self.rotation[k][j])
+                    .sum();
             }
         }
         Self::new(
@@ -491,7 +489,8 @@ impl ManifoldChartAtlas {
         self.charts.sort_unstable();
         self.charts.dedup();
         self.transitions.append(&mut other.transitions);
-        self.sphere_transitions.append(&mut other.sphere_transitions);
+        self.sphere_transitions
+            .append(&mut other.sphere_transitions);
         // The new edge is what connects the formerly separate atlas
         // components. Validate only after it is present; validating the plain
         // union first would (correctly but prematurely) reject it as
@@ -510,7 +509,8 @@ impl ManifoldChartAtlas {
         self.charts.sort_unstable();
         self.charts.dedup();
         self.transitions.append(&mut other.transitions);
-        self.sphere_transitions.append(&mut other.sphere_transitions);
+        self.sphere_transitions
+            .append(&mut other.sphere_transitions);
         self.sphere_transitions.push(transition);
         self.canonicalize_transitions();
         self.validate()

@@ -628,7 +628,11 @@ fn sphere_pole_pair_registers_atlas_end_to_end() {
         }
     }
 
-    assert_eq!(active_atom_count(&term), 2, "fixture starts with 2 sphere charts");
+    assert_eq!(
+        active_atom_count(&term),
+        2,
+        "fixture starts with 2 sphere charts"
+    );
     assert_eq!(term.semantic_atom_count(), 2, "no atlas registered yet");
 
     let mut ledger = StructureLedger::new();
@@ -683,7 +687,11 @@ fn sphere_pole_pair_registers_atlas_end_to_end() {
     );
     assert_eq!(result.term.chart_atlases().len(), 1, "exactly one atlas");
     let atlas = &result.term.chart_atlases()[0];
-    assert_eq!(atlas.charts(), &[0, 1], "the atlas covers both sphere charts");
+    assert_eq!(
+        atlas.charts(),
+        &[0, 1],
+        "the atlas covers both sphere charts"
+    );
     // The pole seam is stored as a 2-D ambient-rotation transition, NOT a 1-D
     // affine one — asserting a 1-D map here would misdescribe the overlap.
     assert!(
@@ -696,7 +704,11 @@ fn sphere_pole_pair_registers_atlas_end_to_end() {
         "the pole pair registers exactly one ambient-rotation seam"
     );
     let sphere_seam = &atlas.sphere_transitions()[0];
-    assert_eq!(sphere_seam.seam_kind, AtlasSeamKind::Pole, "classified as a pole seam");
+    assert_eq!(
+        sphere_seam.seam_kind,
+        AtlasSeamKind::Pole,
+        "classified as a pole seam"
+    );
     assert_eq!(
         sphere_seam.sign(),
         1,
