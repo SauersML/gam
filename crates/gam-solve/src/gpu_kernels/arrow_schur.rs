@@ -982,32 +982,34 @@ pub trait SaeResidentFrame {
     ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure>;
 }
 
-/// Build the device-resident SAE frame for the LM ridge ladder, or `None` when
-/// the shape/host declines (non-CUDA host, no framed device data, or the offload
-/// predicate rejects the shape). `cg_iters` is the CG budget the offload gate
-/// scores (same value the per-trial framed solve uses). A `None` here keeps the
-/// established per-trial re-flatten path completely unchanged.
+/// Build the device-resident SAE frame for the LM ridge ladder.
+/// `Err(Unavailable)` is the decline signal — non-CUDA host, no framed device
+/// data, or the offload predicate rejects the shape — exactly the contract of
+/// the sibling device entry points ([`gpu_schur_matvec_backend`]): the caller
+/// keeps the established per-trial re-flatten path completely unchanged.
+/// `cg_iters` is the CG budget the offload gate scores (same value the
+/// per-trial framed solve uses).
 pub fn build_sae_resident_frame(
     sys: &ArrowSchurSystem,
     cg_iters: usize,
-) -> Option<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>> {
+) -> Result<std::sync::Arc<dyn SaeResidentFrame + Send + Sync>, ArrowSchurGpuFailure> {
     // Target-independent admission: a zero-K system has no reduced-Schur block
     // to keep resident, and a zero CG budget can never consume the frame — both
     // decline on every host, keeping the per-trial flatten the single fallback
     // (on CUDA hosts this also spares a doomed device build attempt).
     if sys.k == 0 || cg_iters == 0 {
-        return None;
+        return Err(ArrowSchurGpuFailure::Unavailable);
     }
     #[cfg(target_os = "linux")]
     {
         cuda::ResidentSaeFrameHandle::build(sys, cg_iters)
             .map(|h| std::sync::Arc::new(h) as std::sync::Arc<dyn SaeResidentFrame + Send + Sync>)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)
     }
-    // Non-CUDA host: the admission checks above are this signature's real use
-    // of both params; there is no device to build a frame on.
+    // Non-CUDA host: there is no device to build a frame on.
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        Err(ArrowSchurGpuFailure::Unavailable)
     }
 }
 

@@ -960,7 +960,9 @@ fn build_resident_sae_frame_if_admitted(
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters)
+    // `Err(Unavailable)` is the device layer's decline signal; the per-trial
+    // re-flatten path is the caller's fallback, so decline maps to `None` here.
+    crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters).ok()
 }
 
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
