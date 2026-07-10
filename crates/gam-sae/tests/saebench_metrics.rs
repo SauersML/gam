@@ -127,6 +127,9 @@ fn chart_interp_rejects_scalar_only_evidence_2250() {
 
 #[test]
 fn dose_response_reports_fisher_calibration_slope_and_unit_speed_constancy() {
+    // Endpoint dosing is quadratic in the applied chord: predicted = ½·arc²,
+    // measured = arc², so the per-arc² rate is exactly constant (CV = 0) and
+    // the calibration slope through the origin is exactly 2.
     let obs = [
         DoseResponseObservation {
             arc_length: 1.0,
@@ -136,14 +139,14 @@ fn dose_response_reports_fisher_calibration_slope_and_unit_speed_constancy() {
         },
         DoseResponseObservation {
             arc_length: 2.0,
-            predicted_nats: 1.0,
-            measured_nats: 2.0,
+            predicted_nats: 2.0,
+            measured_nats: 4.0,
             weight: 1.0,
         },
         DoseResponseObservation {
             arc_length: 3.0,
-            predicted_nats: 1.5,
-            measured_nats: 3.0,
+            predicted_nats: 4.5,
+            measured_nats: 9.0,
             weight: 1.0,
         },
     ];

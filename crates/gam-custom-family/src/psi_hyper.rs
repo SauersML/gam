@@ -846,9 +846,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     let rho_penalty_cache_bytes: usize = penalty_counts
         .iter()
         .enumerate()
-        .flat_map(|(block_idx, &count)| {
-            (0..count).map(move |penalty_idx| (block_idx, penalty_idx))
-        })
+        .flat_map(|(block_idx, &count)| (0..count).map(move |penalty_idx| (block_idx, penalty_idx)))
         .map(|(block_idx, penalty_idx)| {
             let (nrows, ncols) = specs_arc[block_idx].penalties[penalty_idx].shape();
             nrows

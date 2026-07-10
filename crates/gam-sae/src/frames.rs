@@ -542,7 +542,24 @@ fn refresh_framed_device_sae_data(
     frame.basis_sizes.extend_from_slice(basis_sizes);
     frame.border_offsets.clear();
     frame.border_offsets.extend_from_slice(border_offsets);
-    frame.frame_blocks = frame_blocks;
+    let stable_frame_block_layout = frame.frame_blocks.len() == frame_blocks.len()
+        && frame
+            .frame_blocks
+            .iter()
+            .zip(&frame_blocks)
+            .all(|(current, source)| {
+                current.g.dim() == source.g.dim() && current.w.dim() == source.w.dim()
+            });
+    if stable_frame_block_layout {
+        for (current, source) in frame.frame_blocks.iter_mut().zip(frame_blocks) {
+            current.atom_i = source.atom_i;
+            current.atom_j = source.atom_j;
+            current.g.assign(&source.g);
+            current.w.assign(&source.w);
+        }
+    } else {
+        frame.frame_blocks = frame_blocks;
+    }
     frame.smooth_ranks.clear();
     frame.smooth_ranks.extend_from_slice(ranks);
     frame.row_htbeta.resize_with(rows.len(), Vec::new);

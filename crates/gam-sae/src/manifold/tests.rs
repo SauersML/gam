@@ -1600,6 +1600,19 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .flatten()
         .map(|value| value.to_bits())
         .collect();
+    let first_device_frame_block = first_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.frame_blocks.first())
+        .expect("framed assembly retains a data-fit G tensor W block");
+    let first_device_frame_g_ptr = first_device_frame_block.g.as_ptr() as usize;
+    let first_device_frame_w_ptr = first_device_frame_block.w.as_ptr() as usize;
+    let first_device_frame_block_bits: Vec<u64> = first_device_frame_block
+        .g
+        .iter()
+        .chain(first_device_frame_block.w.iter())
+        .map(|value| value.to_bits())
+        .collect();
     let first_numerical_bits: Vec<u64> = first_row
         .htt
         .iter()
@@ -1637,6 +1650,11 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .as_ref()
         .and_then(|frame| frame.row_htbeta.first())
         .map_or(0, |row| row.as_ptr() as usize);
+    let second_device_frame_block = second_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.frame_blocks.first())
+        .expect("reused framed assembly retains its data-fit block");
     let second_numerical_bits: Vec<u64> = second_row
         .htt
         .iter()
@@ -1665,6 +1683,18 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         first_device_row_htbeta_ptr, second_device_row_htbeta_ptr,
         "dominant framed row H_tbeta host slab must retain its allocation"
     );
+    assert_ne!(first_device_frame_g_ptr, 0);
+    assert_eq!(
+        first_device_frame_g_ptr,
+        second_device_frame_block.g.as_ptr() as usize,
+        "framed data-fit G block must retain its allocation"
+    );
+    assert_ne!(first_device_frame_w_ptr, 0);
+    assert_eq!(
+        first_device_frame_w_ptr,
+        second_device_frame_block.w.as_ptr() as usize,
+        "framed output-factor W block must retain its allocation"
+    );
     let second_device_row_htbeta_bits: Vec<u64> = second_device
         .frame
         .as_ref()
@@ -1677,6 +1707,16 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         first_device_row_htbeta_bits, second_device_row_htbeta_bits,
         "retained framed row H_tbeta slab must be numerically refreshed"
     );
+    let second_device_frame_block_bits: Vec<u64> = second_device_frame_block
+        .g
+        .iter()
+        .chain(second_device_frame_block.w.iter())
+        .map(|value| value.to_bits())
+        .collect();
+    assert_ne!(
+        first_device_frame_block_bits, second_device_frame_block_bits,
+        "retained framed G tensor W block must be numerically refreshed"
+    );
     assert_ne!(
         first_numerical_bits, second_numerical_bits,
         "accepted state change must refresh Hessian/gradient numerical content"
@@ -1684,12 +1724,14 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     eprintln!(
         "#1017 accepted-iteration residency telemetry: iterations=2 row_htt_ptr={} \
          row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} device_row_htbeta_ptr={} \
-         numerical_content_changed=true",
+         device_frame_g_ptr={} device_frame_w_ptr={} numerical_content_changed=true",
         first_row_htt_ptr,
         first_row_htbeta_ptr,
         first_gb_ptr,
         first_device_frame_ptr,
         first_device_row_htbeta_ptr,
+        first_device_frame_g_ptr,
+        first_device_frame_w_ptr,
     );
 }
 
