@@ -802,7 +802,7 @@ fn render_markdown(
         let status = record
             .map(|r| format!("{:?}", r.occupancy_status))
             .unwrap_or_else(|| "Missing".to_string());
-        let accepted = record.map(|r| r.evidence.accepted).unwrap_or(false);
+        let accepted = record.map(|r| r.evidence.selected_by_bic).unwrap_or(false);
         let margin = record.map(|r| r.evidence.margin).unwrap_or(0.0);
         lines.push(format!(
             "| {} | {} | {} | {:.6} | {:.6} | {:.6} | {} | {} | {:.6} |",
