@@ -3866,15 +3866,25 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         refine_progress_extension: true,
                     },
                 ) {
-                    Ok(_warmed) => self.term.reml_criterion_with_cache(
-                        self.target.view(),
-                        &rho_state,
-                        self.registry.as_ref(),
-                        self.inner_max_iter,
-                        self.learning_rate,
-                        self.ridge_ext_coord,
-                        self.ridge_beta,
-                    ),
+                    Ok(_warmed) => {
+                        // The envelope parks its converged term in the ρ-keyed
+                        // handoff; INSTALL it (exactly as eval's entry does) so
+                        // the criterion opens AT the converged optimum instead
+                        // of replaying the refused trajectory.
+                        if let Some(converged) = self.take_probe_converged_handoff(rho.view()) {
+                            self.term = converged;
+                            self.seeded_beta = None;
+                        }
+                        self.term.reml_criterion_with_cache(
+                            self.target.view(),
+                            &rho_state,
+                            self.registry.as_ref(),
+                            self.inner_max_iter,
+                            self.learning_rate,
+                            self.ridge_ext_coord,
+                            self.ridge_beta,
+                        )
+                    }
                     Err(stage1) => Err(stage1),
                 }
             }
