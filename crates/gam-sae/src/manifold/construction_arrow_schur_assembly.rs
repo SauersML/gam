@@ -1538,7 +1538,7 @@ impl SaeManifoldTerm {
                                     // already carry exp(s) via fill_decoded_*; this is the
                                     // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
                                     // when no amplitude is set.
-                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
+                                    let w = a_k * phi * sqrt_row_w;
                                     a_phi.push((atom_beta_off + basis_col * p, w));
                                     wphi.push(w);
                                 }
@@ -1598,7 +1598,7 @@ impl SaeManifoldTerm {
                                     // already carry exp(s) via fill_decoded_*; this is the
                                     // one inline site that needs it. exp(0)=1 ⇒ bit-for-bit
                                     // when no amplitude is set.
-                                    let w = a_k * phi * sqrt_row_w * atom.log_amplitude.exp();
+                                    let w = a_k * phi * sqrt_row_w;
                                         if w == 0.0 {
                                             continue;
                                         }

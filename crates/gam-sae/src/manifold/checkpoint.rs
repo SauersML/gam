@@ -111,15 +111,14 @@ pub(crate) struct SaeCheckpointLedger {
 }
 
 /// Per-atom banked state. Mirrors the recoverable half of
-/// [`crate::manifold::term::SaeManifoldAtomSnapshot`] plus the slow
-/// log-amplitude gauge; the basis matrices are rebuilt on resume.
+/// [`crate::manifold::term::SaeManifoldAtomSnapshot`]; the basis matrices are
+/// rebuilt on resume.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SaeCheckpointAtom {
     /// `(M_k, p)` decoder block, nested row-major (numpy `.tolist()` shape).
     pub(crate) decoder_coefficients: Vec<Vec<f64>>,
     /// `(N, d_k)` latent coordinates, nested row-major.
     pub(crate) coords: Vec<Vec<f64>>,
-    pub(crate) log_amplitude: f64,
     pub(crate) homotopy_eta: f64,
 }
 
@@ -176,7 +175,6 @@ impl SaeFitCheckpoint {
             .map(|(atom_idx, atom)| SaeCheckpointAtom {
                 decoder_coefficients: rows_of(&atom.decoder_coefficients),
                 coords: rows_of(&term.assignment.coords[atom_idx].as_matrix()),
-                log_amplitude: atom.log_amplitude,
                 homotopy_eta: atom.homotopy_eta,
             })
             .collect();
@@ -196,7 +194,7 @@ impl SaeFitCheckpoint {
     }
 
     /// Install the banked incumbent into a freshly constructed term: assign the
-    /// per-atom decoder / coords / log-amplitude / η and the shared logits in
+    /// per-atom decoder / coords / η and the shared logits in
     /// place, then rebuild the basis caches from the restored coordinates
     /// (deterministic, exactly as `restore_mutable_state` does). Typed `Err` on
     /// any shape mismatch — a checkpoint that fails to install must never
@@ -221,7 +219,6 @@ impl SaeFitCheckpoint {
                 ));
             }
             atom.decoder_coefficients.assign(&decoder);
-            atom.log_amplitude = banked.log_amplitude;
             atom.homotopy_eta = banked.homotopy_eta;
             let coords = array2_from_rows(&banked.coords)?;
             let slot = &mut term.assignment.coords[atom_idx];
@@ -406,7 +403,6 @@ mod checkpoint_tests {
                 SaeCheckpointAtom {
                     decoder_coefficients: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
                     coords: vec![vec![0.1], vec![0.2], vec![0.3], vec![0.4]],
-                    log_amplitude: 0.7,
                     homotopy_eta: 1.0,
                 },
                 SaeCheckpointAtom {
@@ -417,7 +413,6 @@ mod checkpoint_tests {
                         vec![0.5, 0.4],
                         vec![0.3, 0.2],
                     ],
-                    log_amplitude: -0.3,
                     homotopy_eta: 0.5,
                 },
             ],

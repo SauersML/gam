@@ -106,8 +106,8 @@ pub use sphere_spec::{
 pub use cyclic::create_cyclic_difference_penalty_matrix;
 
 pub(crate) use cyclic::{
-    create_cyclic_bspline_basis_dense, cyclic_distance_1d, cyclic_knot_anchor,
-    cyclic_uniform_knot_vector, wrap_to_period,
+    create_cyclic_bspline_basis_dense, cyclic_knot_anchor, cyclic_uniform_knot_vector,
+    wrap_to_period,
 };
 
 // Concern modules: flatten each onto `basis::` so external paths are unchanged.

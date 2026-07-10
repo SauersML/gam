@@ -6760,6 +6760,216 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     }
 }
 
+/// #932 gap (c): a DIRECT third- AND fourth-order oracle on the PRODUCTION
+/// survival-LS link-wiggle path. The existing direct wiggle tests pin only the
+/// value/gradient/Hessian; the higher-order channels the log-det adjoint
+/// consumes (`Γ_a = tr(H⁻¹ ∂H/∂θ_a)` and its second directional) had no
+/// independent production witness. This drives the two live higher-order
+/// entry points —
+///   * third order: [`survival_ls_wiggle_directional_derivative_dense`],
+///     the contracted `D_dir H = Σ_c ℓ_abc dir_c`,
+///   * fourth order: [`survival_ls_wiggle_second_directional_derivative_dense`],
+///     the contracted `D_u D_v H = Σ_cd ℓ_abcd u_c v_d`,
+/// — and pins each against an INDEPENDENT central-difference (5-point
+/// Richardson) witness built from OTHER production entry points, exactly as
+/// `flex_verify_932_tests` differences the hand path's own returned value:
+///   * `D_dir H` is cross-checked against a Richardson derivative of the
+///     production joint Hessian [`survival_ls_wiggle_joint_hessian_dense`]
+///     along the coefficient direction `dir` (the coefficient→KW-primary map is
+///     linear, so `d/ds H(β + s·dir)|₀` IS `D_dir H`, with no dropped `dJ/dβ`
+///     term), and
+///   * `D_u D_v H` against a Richardson derivative of the production directional
+///     `D_u H(β + s·v)` along `v`.
+/// FD stencils use independent arithmetic (analytic packed `OneSeed`/`TwoSeed`
+/// jets vs finite differences of the `Order2` Hessian), so agreement is a true
+/// correctness proof of the higher-order jets; a dropped warp-coupling term
+/// would show O(1) relative error, far above the bounds asserted here.
+#[test]
+fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
+    use super::row_kernel::{
+        survival_ls_wiggle_directional_derivative_dense, survival_ls_wiggle_joint_hessian_dense,
+        survival_ls_wiggle_second_directional_derivative_dense,
+    };
+    use crate::row_kernel::RowSet;
+
+    // Event rows (d=1); moderate-tail primaries clear of the monotonicity guard,
+    // matching the joint-Hessian oracle's regime so the ±h·dir stencils stay in
+    // the smooth interior of the warp basis and the residual link.
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 1.0];
+    let weight = [1.0, 0.8, 1.2, 1.1];
+    let n = primaries.len();
+
+    let q0_exit = Array1::from_shape_fn(n, |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    let knots = array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2];
+    let degree = 3usize;
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wiggle design B(q0_exit)");
+    let pw = xwiggle.ncols();
+    let betaw = Array1::from_shape_fn(pw, |b| 0.25 - 0.08 * b as f64);
+    // Coefficient layout: [time(1), threshold(1), log_sigma(1), wiggle(pw)].
+    let ncoef = 3 + pw;
+
+    for distribution in [ResidualDistribution::Gaussian, ResidualDistribution::Gumbel] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
+        family.wiggle_knots = Some(knots.clone());
+        family.wiggle_degree = Some(degree);
+
+        // Build (q, dynamic) at the perturbed coefficient vector `β + δ`. The
+        // oracle-family eta vectors are the raw primary channels at β = 1, so a
+        // base-block coefficient `1 + δ_k` scales that block's eta linearly; the
+        // wiggle block re-forms `etaw = X·(βw + δw)`.
+        let build = |bt: f64, bthr: f64, bls: f64, bw: &Array1<f64>| {
+            let mut states = survival_ls_joint_oracle_states(&primaries);
+            states[0].eta.mapv_inplace(|e| e * bt);
+            states[0].beta = array![bt];
+            states[1].eta.mapv_inplace(|e| e * bthr);
+            states[1].beta = array![bthr];
+            states[2].eta.mapv_inplace(|e| e * bls);
+            states[2].beta = array![bls];
+            let etaw = xwiggle.dot(bw);
+            states.push(ParameterBlockState {
+                beta: bw.clone(),
+                eta: etaw,
+            });
+            let q = family
+                .collect_joint_quantities(&states)
+                .expect("joint quantities");
+            let dynamic = family
+                .build_dynamic_geometry(&states)
+                .expect("dynamic geometry");
+            (q, dynamic)
+        };
+
+        // Coefficient vector `β + s·dir` split back into per-block pieces.
+        let perturbed = |s: f64, dir: &[f64], bw: &mut Array1<f64>| -> (f64, f64, f64) {
+            for b in 0..pw {
+                bw[b] = betaw[b] + s * dir[3 + b];
+            }
+            (1.0 + s * dir[0], 1.0 + s * dir[1], 1.0 + s * dir[2])
+        };
+
+        let hessian_at = |s: f64, dir: &[f64]| {
+            let mut bw = betaw.clone();
+            let (bt, bthr, bls) = perturbed(s, dir, &mut bw);
+            let (q, dynamic) = build(bt, bthr, bls, &bw);
+            survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+                .expect("§13 dense wiggle Hessian")
+        };
+        let directional_at = |s: f64, dir_v: &[f64], dir_u: &[f64]| {
+            let mut bw = betaw.clone();
+            let (bt, bthr, bls) = perturbed(s, dir_v, &mut bw);
+            let (q, dynamic) = build(bt, bthr, bls, &bw);
+            survival_ls_wiggle_directional_derivative_dense(
+                &family,
+                &q,
+                &dynamic,
+                0.0,
+                &RowSet::All,
+                dir_u,
+            )
+            .expect("§13 dense wiggle directional")
+        };
+        // 5-point Richardson first derivative of a matrix-valued map at s = 0:
+        // f'(0) ≈ (−f(2h) + 8 f(h) − 8 f(−h) + f(−2h)) / (12 h).
+        let five_point = |fph: &Array2<f64>,
+                          fp2h: &Array2<f64>,
+                          fmh: &Array2<f64>,
+                          fm2h: &Array2<f64>,
+                          h: f64| {
+            (fp2h.mapv(|x| -x) + fph.mapv(|x| 8.0 * x) - fmh.mapv(|x| 8.0 * x) + fm2h) / (12.0 * h)
+        };
+
+        // Directions spanning all four coefficient blocks (kept modest so the
+        // ±2h stencil stays interior).
+        let dir_u: Vec<f64> = (0..ncoef)
+            .map(|c| match c {
+                0 => 0.7,
+                1 => -0.5,
+                2 => 0.4,
+                _ => 0.3 - 0.11 * (c - 3) as f64,
+            })
+            .collect();
+        let dir_v: Vec<f64> = (0..ncoef)
+            .map(|c| match c {
+                0 => -0.35,
+                1 => 0.6,
+                2 => -0.45,
+                _ => -0.12 + 0.09 * (c - 3) as f64,
+            })
+            .collect();
+
+        // Base-point analytic higher-order channels.
+        let (q0, dynamic0) = build(1.0, 1.0, 1.0, &betaw);
+        let d_dir_analytic = survival_ls_wiggle_directional_derivative_dense(
+            &family,
+            &q0,
+            &dynamic0,
+            0.0,
+            &RowSet::All,
+            &dir_u,
+        )
+        .expect("analytic first directional");
+        let d2_analytic = survival_ls_wiggle_second_directional_derivative_dense(
+            &family,
+            &q0,
+            &dynamic0,
+            0.0,
+            &RowSet::All,
+            &dir_u,
+            &dir_v,
+        )
+        .expect("analytic second directional");
+
+        // THIRD order: FD of the production Hessian along `dir_u`.
+        let h3 = 1e-2;
+        let fd_third = five_point(
+            &hessian_at(h3, &dir_u),
+            &hessian_at(2.0 * h3, &dir_u),
+            &hessian_at(-h3, &dir_u),
+            &hessian_at(-2.0 * h3, &dir_u),
+            h3,
+        );
+        for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
+            let fd = fd_third[[a, b]];
+            assert!(
+                (analytic - fd).abs() <= 1e-5 * (1.0 + analytic.abs()),
+                "{distribution:?}: wiggle D_dir H [{a}][{b}] analytic {analytic} != FD {fd}"
+            );
+        }
+
+        // FOURTH order: FD of the production directional `D_u H` along `dir_v`.
+        let h4 = 2e-2;
+        let fd_fourth = five_point(
+            &directional_at(h4, &dir_v, &dir_u),
+            &directional_at(2.0 * h4, &dir_v, &dir_u),
+            &directional_at(-h4, &dir_v, &dir_u),
+            &directional_at(-2.0 * h4, &dir_v, &dir_u),
+            h4,
+        );
+        for ((a, b), &analytic) in d2_analytic.indexed_iter() {
+            let fd = fd_fourth[[a, b]];
+            assert!(
+                (analytic - fd).abs() <= 1e-3 * (1.0 + analytic.abs()),
+                "{distribution:?}: wiggle D_u D_v H [{a}][{b}] analytic {analytic} != FD {fd}"
+            );
+        }
+    }
+}
+
 /// #1569: the post-update monotone-cone feasibility check
 /// ([`validate_linear_constraints`]) must accept any β the DOWNSTREAM gates
 /// (`check_linear_feasibility` / `project_onto_linear_constraints`) already

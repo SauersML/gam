@@ -220,7 +220,7 @@ pub fn measure_atom_transport_between(
     }
 
     // Honest-units source and target decoders, both `M × p` in the SAME ambient.
-    let physical_decoder = atom_ref.physical_full_width_decoder();
+    let physical_decoder = atom_ref.full_width_decoder();
     let b_src = honest_layer_decoder(&physical_decoder, layout, source)?;
     let b_tgt = honest_layer_decoder(&physical_decoder, layout, target)?;
     if b_src.ncols() != b_tgt.ncols() {

@@ -2957,17 +2957,11 @@ impl SaeManifoldTerm {
                 Array2::<f64>::eye(p)
             };
             let r = frame.ncols();
-            // The optimizer's beta coordinate is the scale-gauge representative
-            // B (or its framed C coordinate), while the physical decoder is
-            // exp(s_k) B.  Every border channel is a derivative with respect to
-            // that raw beta coordinate, so its ambient direction carries the
-            // same exp(s_k) factor as the fitted Jacobian.
-            let amplitude = atom.log_amplitude.exp();
             for basis_col in 0..m {
                 for channel in 0..r {
                     let mut output = vec![0.0_f64; p];
                     for out_col in 0..p {
-                        output[out_col] = amplitude * frame[[out_col, channel]];
+                        output[out_col] = frame[[out_col, channel]];
                     }
                     channels.push(SaeBorderChannel {
                         atom: atom_idx,

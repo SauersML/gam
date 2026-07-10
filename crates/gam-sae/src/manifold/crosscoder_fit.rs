@@ -852,7 +852,7 @@ pub fn run_sae_crosscoder_fit(
         .atoms
         .iter()
         .map(|atom| {
-            atom.physical_full_width_decoder()
+            atom.full_width_decoder()
                 .slice(s![.., 0..p_x])
                 .to_owned()
         })

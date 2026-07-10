@@ -5,47 +5,14 @@
 //! and circular distance therefore share one periodic-domain convention.
 //!
 //! This module owns the self-contained periodic-domain math for 1-D cyclic
-//! smooths plus an explicit difference operator for genuinely discrete cyclic
-//! coefficient sequences. Periodic B-spline smoothing does **not** use that
-//! coefficient operator: [`super::cyclic_bspline_derivative_penalty_matrix`]
-//! assembles the exact function roughness integral from the represented basis.
+//! smooths. Cyclic penalties are always the exact function roughness
+//! integral assembled from the represented basis
+//! ([`super::cyclic_bspline_derivative_penalty_matrix`]); there is no
+//! coefficient-difference operator here (SPEC 5: penalties act on the final
+//! function, never on model coefficients).
 
 use super::{BasisError, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d};
-use gam_linalg::faer_ndarray::fast_ata;
 use ndarray::{Array1, Array2, ArrayView1};
-
-/// Creates a cyclic finite-difference operator `S = D' D` on a discrete
-/// coefficient ring.
-///
-/// This is not a periodic B-spline roughness matrix; spline callers must use
-/// [`super::cyclic_bspline_derivative_penalty_matrix`]. Every stencil here
-/// wraps around the coefficient ring. For `order = 2`, each row is
-/// `β_i - 2β_{i+1} + β_{i+2}` modulo the number of coefficients, so the
-/// constant vector is the only null direction and no endpoint is privileged.
-pub fn create_cyclic_difference_penalty_matrix(
-    num_basis_functions: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_basis_functions {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order,
-            num_basis: num_basis_functions,
-        });
-    }
-
-    let mut d = Array2::<f64>::eye(num_basis_functions);
-    for _ in 0..order {
-        let previous = d;
-        d = Array2::<f64>::zeros((num_basis_functions, num_basis_functions));
-        for i in 0..num_basis_functions {
-            let next = (i + 1) % num_basis_functions;
-            for j in 0..num_basis_functions {
-                d[[i, j]] = previous[[next, j]] - previous[[i, j]];
-            }
-        }
-    }
-    Ok(fast_ata(&d))
-}
 
 #[inline]
 pub(crate) fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
@@ -64,12 +31,6 @@ pub(crate) fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
     } else {
         start + offset
     }
-}
-
-#[inline]
-pub(crate) fn cyclic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
-    let delta = (x - c).abs().rem_euclid(period);
-    delta.min(period - delta)
 }
 
 /// Knot anchor for the uniform cyclic grid: the supplied domain origin.

@@ -4480,7 +4480,7 @@ impl SaeManifoldTerm {
             ) && d == 1
             {
                 let mut seeded = self.assignment.coords[atom_idx].as_matrix();
-                let mut decoder = self.atoms[atom_idx].physical_full_width_decoder();
+                let mut decoder = self.atoms[atom_idx].full_width_decoder();
                 let eta = self.atoms[atom_idx].homotopy_eta;
                 if eta != 1.0 {
                     // The harmonic homotopy keeps `[1, sin θ, cos θ]` fixed and

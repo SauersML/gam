@@ -105,8 +105,7 @@ impl SaeManifoldTerm {
                             (0..p)
                                 .map(|out_col| {
                                     if atom_is_active(atom_idx) {
-                                        atom.log_amplitude.exp()
-                                            * atom.decoder_coefficients[[basis_col, out_col]]
+                                        atom.decoder_coefficients[[basis_col, out_col]]
                                     } else {
                                         0.0
                                     }
@@ -347,12 +346,6 @@ impl SaeManifoldTerm {
             }
             for out_col in 0..atom.output_dim() {
                 out[out_col] += d2phi * atom.decoder_coefficients[[basis_col, out_col]];
-            }
-        }
-        if atom.log_amplitude != 0.0 {
-            let amplitude = atom.log_amplitude.exp();
-            for value in out.iter_mut() {
-                *value *= amplitude;
             }
         }
     }

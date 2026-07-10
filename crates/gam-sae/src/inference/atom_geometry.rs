@@ -104,9 +104,6 @@ pub struct AtomGeometryEntry {
     /// Number of rows on which the atom is active (assignment mass above
     /// [`SAE_TRUST_ACTIVE_MASS_FLOOR`]).
     pub n_active: usize,
-    /// The atom's amplitude `a = exp(log_amplitude)`, the physical scale of the
-    /// decoder move.
-    pub amplitude: f64,
     /// Participation ratio of the decoded-point spectrum — the effective number of
     /// ambient dimensions the curve populates over its active rows.
     pub effective_output_dim: Option<f64>,
@@ -227,7 +224,6 @@ pub fn atom_geometry(
         atoms.push(atom_geometry_entry_from_parts(
             atom.name.clone(),
             &atom.basis_kind,
-            atom.log_amplitude,
             atom.basis_values.view(),
             atom.basis_jacobian.view(),
             atom.decoder_coefficients.view(),
@@ -249,13 +245,11 @@ pub fn atom_geometry(
 pub fn atom_geometry_entry_from_parts(
     name: String,
     basis_kind: &SaeAtomBasisKind,
-    log_amplitude: f64,
     basis_values: ArrayView2<'_, f64>,
     basis_jacobian: ArrayView3<'_, f64>,
     decoder: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
 ) -> AtomGeometryEntry {
-    let amplitude = log_amplitude.exp();
     let m = basis_values.ncols();
     let latent_dim = basis_jacobian.dim().2;
     let topology = topology_name(basis_kind);
@@ -292,14 +286,14 @@ pub fn atom_geometry_entry_from_parts(
         }
 
         // Arc speed² = Σ_c (∂Φ/∂t_c)ᵀ G (∂Φ/∂t_c), summed over latent axes; the
-        // physical move is a·g so the speed carries the amplitude.
+        // Physical move speed under the decoder metric.
         let mut speed_sq = 0.0_f64;
         for c in 0..latent_dim {
             let jc = basis_jacobian.slice(s![row, .., c]);
             let gjc = gram.dot(&jc);
             speed_sq += jc.dot(&gjc);
         }
-        let speed = amplitude * speed_sq.max(0.0).sqrt();
+        let speed = speed_sq.max(0.0).sqrt();
         speed_w += w * speed;
         speed2_w += w * speed * speed;
     }
@@ -345,7 +339,6 @@ pub fn atom_geometry_entry_from_parts(
         topology: topology.clone(),
         latent_dim,
         n_active,
-        amplitude,
         effective_output_dim: None,
         ideal_curve_dim: None,
         degeneracy: None,
@@ -547,7 +540,6 @@ mod tests {
         let entry = atom_geometry_entry_from_parts(
             "c".into(),
             &SaeAtomBasisKind::Periodic,
-            0.0,
             phi.view(),
             jac.view(),
             dec.view(),
@@ -621,7 +613,6 @@ mod tests {
         let entry = atom_geometry_entry_from_parts(
             "h2".into(),
             &SaeAtomBasisKind::Periodic,
-            0.0,
             phi.view(),
             jac.view(),
             dec.view(),
@@ -654,7 +645,6 @@ mod tests {
         let entry = atom_geometry_entry_from_parts(
             "c".into(),
             &SaeAtomBasisKind::Periodic,
-            0.0,
             phi.view(),
             jac.view(),
             dec.view(),
@@ -671,41 +661,6 @@ mod tests {
             "a circle flattened to a line is collapsed"
         );
     }
-
-    #[test]
-    fn amplitude_scales_speed_but_not_shape() {
-        let (phi, jac, dec, masses) = planted_circle(64, 1.5);
-        let base = atom_geometry_entry_from_parts(
-            "a".into(),
-            &SaeAtomBasisKind::Periodic,
-            0.0,
-            phi.view(),
-            jac.view(),
-            dec.view(),
-            masses.view(),
-        );
-        let scaled = atom_geometry_entry_from_parts(
-            "a".into(),
-            &SaeAtomBasisKind::Periodic,
-            (3.0_f64).ln(),
-            phi.view(),
-            jac.view(),
-            dec.view(),
-            masses.view(),
-        );
-        // Amplitude 3× scales the physical speed 3× ...
-        assert!(
-            (scaled.tangent_speed_mean.unwrap() - 3.0 * base.tangent_speed_mean.unwrap()).abs()
-                < 1.0e-9
-        );
-        // ... but the scale-free shape invariants are unchanged.
-        assert!(
-            (scaled.effective_output_dim.unwrap() - base.effective_output_dim.unwrap()).abs()
-                < 1.0e-9
-        );
-        assert!((scaled.nonlinearity.unwrap() - base.nonlinearity.unwrap()).abs() < 1.0e-9);
-    }
-
     #[test]
     fn inactive_atom_degrades_to_none_not_zero() {
         let (phi, jac, dec, _) = planted_circle(64, 1.0);
@@ -713,7 +668,6 @@ mod tests {
         let entry = atom_geometry_entry_from_parts(
             "dead".into(),
             &SaeAtomBasisKind::Periodic,
-            0.0,
             phi.view(),
             jac.view(),
             dec.view(),

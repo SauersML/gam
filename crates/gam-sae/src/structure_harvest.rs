@@ -1083,12 +1083,7 @@ fn atom_active_rows(term: &SaeManifoldTerm, atom: usize) -> Vec<usize> {
 /// `(rows.len() × p)`.
 fn decoded_points_at(atom: &SaeManifoldAtom, rows: &[usize]) -> Array2<f64> {
     let phi_sub = atom.basis_values.select(Axis(0), rows);
-    let mut points = phi_sub.dot(&atom.decoder_coefficients);
-    if atom.log_amplitude != 0.0 {
-        let amplitude = atom.log_amplitude.exp();
-        points.mapv_inplace(|value| amplitude * value);
-    }
-    points
+    phi_sub.dot(&atom.decoder_coefficients)
 }
 
 /// Decode a standard periodic-harmonic coefficient block at explicit
@@ -1262,8 +1257,8 @@ fn fit_seam_transition(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<Sea
     if period_a.to_bits() != 1.0_f64.to_bits() || period_b.to_bits() != period_a.to_bits() {
         return None;
     }
-    let decoder_a = atom_a.physical_full_width_decoder();
-    let decoder_b = atom_b.physical_full_width_decoder();
+    let decoder_a = atom_a.full_width_decoder();
+    let decoder_b = atom_b.full_width_decoder();
     let (sign, offset) = fit_periodic_transition_from_decoders(decoder_a.view(), decoder_b.view())?;
     let points_a = decoded_points_at(atom_a, &rows_a);
     let points_b = decoded_points_at(atom_b, &rows_b);

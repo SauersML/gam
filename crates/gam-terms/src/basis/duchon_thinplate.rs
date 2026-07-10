@@ -1251,13 +1251,20 @@ pub fn select_thin_plate_knots(
     // different knot set. `tie_tol` sits well above that round-off floor and far
     // below any genuine maximin gap, so near-ties are consistently resolved by
     // the invariant support-distance profile in every rotated frame.
-    let knot_scale2 = dist2_to_centroid.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let knot_scale2 = dist2_to_centroid
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let tie_tol = KNOT_MAXIMIN_TIE_REL_TOL * knot_scale2;
 
     // Seed = centroid-nearest row; near-equidistant rows (within `tie_tol`) are
     // resolved by the invariant support-distance profile so the seed is a
     // deterministic, rotation- and permutation-invariant function of the data.
-    let seed_min = dist2_to_centroid.iter().copied().fold(f64::INFINITY, f64::min);
+    let seed_min = dist2_to_centroid
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
     let seed_idx = (0..n)
         .filter(|&i| dist2_to_centroid[i] <= seed_min + tie_tol)
         .reduce(|a, b| if distance_profile_less(a, b) { a } else { b })

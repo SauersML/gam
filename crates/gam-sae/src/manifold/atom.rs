@@ -2183,44 +2183,6 @@ mod tests {
         }
     }
 
-    /// #2237 — persistence must export the physical decoder, not the unit-norm
-    /// representative left after the default-on scale quotient peels magnitude
-    /// into `log_amplitude`.
-    #[test]
-    fn physical_decoder_export_preserves_scale_quotient_2237() {
-        let mut atom = monomial_atom(SaeAtomBasisKind::EuclideanPatch, &[0.1, 0.4, 0.8]);
-        let physical_before = atom.full_width_decoder();
-
-        atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-
-        let representative = atom.full_width_decoder();
-        let representative_norm = representative.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(
-            (representative_norm - 1.0).abs() <= 1.0e-14,
-            "scale-quotient representative must have unit Frobenius norm; got {representative_norm}"
-        );
-        assert_ne!(
-            atom.log_amplitude, 0.0,
-            "fixture must move non-trivial magnitude into log_amplitude"
-        );
-
-        let physical_after = atom.physical_full_width_decoder();
-        assert_eq!(physical_after.dim(), physical_before.dim());
-        for ((row, col), expected) in physical_before.indexed_iter() {
-            assert!(
-                (physical_after[[row, col]] - *expected).abs() <= 1.0e-14,
-                "physical decoder changed across quotient peel at [{row},{col}]: {} vs {expected}",
-                physical_after[[row, col]]
-            );
-        }
-    }
-
-    // DEFECT 2 — a Poincaré atom's intrinsic smoothness is the HYPERBOLIC
-    // conformal Dirichlet roughness (the ball metric pulled back to the tangent
-    // chart), delegated to the single-source geometry primitive
-    // `conformal_dirichlet_penalty(coords, ∂Φ, curvature = −1)`, NOT the flat
-    // Euclidean second-derivative reweighting the code used before. The
-    // coordinates are supplied through the `latent_coords` cache exactly as
     // `refresh_basis` populates it in production.
     #[test]
     fn poincare_d1_uses_hyperbolic_conformal_dirichlet() {

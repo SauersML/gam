@@ -78,15 +78,7 @@ impl SaeManifoldAtom {
                 phi.ncols()
             ));
         }
-        let mut decoded = phi.dot(&self.decoder_coefficients);
-        // #2022 — the fitted contribution is exp(s_k)·Φ·B; scale to match the
-        // stored decode. Skipped at s_k == 0.0 (default) so the amplitude-free
-        // atom decodes bit-for-bit as `Φ·B`.
-        if self.log_amplitude != 0.0 {
-            let amp = self.log_amplitude.exp();
-            decoded.mapv_inplace(|v| v * amp);
-        }
-        Ok(decoded)
+        Ok(phi.dot(&self.decoder_coefficients))
     }
 }
 

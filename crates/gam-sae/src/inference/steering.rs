@@ -580,9 +580,6 @@ fn decode_tangents_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array2<f64>, 
             }
         }
     }
-    if atom.log_amplitude != 0.0 {
-        tang.mapv_inplace(|value| value * atom.log_amplitude.exp());
-    }
     Ok(tang)
 }
 
