@@ -11,6 +11,7 @@
 
 use super::*;
 
+#[cfg(test)]
 pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
