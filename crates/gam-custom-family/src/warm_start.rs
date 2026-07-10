@@ -451,7 +451,7 @@ mod assembly_convergence_tests {
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
     specs: &[ParameterBlockSpec],
-) -> Result<gam_solve::model_types::UnifiedFitResult, String> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     let BlockwiseFitResultParts {
         block_states,
         log_likelihood,
@@ -476,7 +476,7 @@ pub fn blockwise_fit_from_parts(
     // non-convergence must instead be raised as a typed error at the solver,
     // with a checkpoint, before ever reaching this assembler. This defensive
     // gate prevents direct assembly callers from bypassing that contract.
-    require_converged_outer_for_assembly(outer_converged).map_err(String::from)?;
+    require_converged_outer_for_assembly(outer_converged)?;
     match criterion_certificate.as_ref() {
         Some(certificate) if !certificate.certifies() => {
             return Err(CustomFamilyError::Optimization {
@@ -486,15 +486,6 @@ pub fn blockwise_fit_from_parts(
                      no fit was assembled",
                     certificate.summary()
                 ),
-            }
-            .into());
-        }
-        None if outer_iterations > 0 => {
-            return Err(CustomFamilyError::Optimization {
-                context: "blockwise_fit_from_parts",
-                reason: "refusing to assemble a fit after an outer optimization without its \
-                         analytic convergence certificate"
-                    .to_string(),
             }
             .into());
         }
@@ -745,7 +736,10 @@ pub fn blockwise_fit_from_parts(
         },
         inner_cycles,
     })
-    .map_err(|e| e.to_string())
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "blockwise_fit_from_parts result validation",
+        reason: error.to_string(),
+    })
 }
 
 pub(crate) fn checked_penalizedobjective(

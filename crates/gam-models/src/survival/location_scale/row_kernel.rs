@@ -434,12 +434,10 @@ impl SurvivalLsRowKernel<'_> {
             .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))
     }
 
-    /// Like [`Self::row_nll_inputs`] but returns `Ok(None)` for degenerate rows
-    /// (survival probability underflowed to 0, derivatives non-finite) instead of
-    /// converting `None` to an error. Callers that accumulate per-row quantities
-    /// (third/fourth contracted forms) use this to skip degenerate rows with a
-    /// zero contribution — the same policy as `exact_row_kernel_rescaled` and the
-    /// `evaluate()` path which also treat these rows as non-contributors.
+    /// Like [`Self::row_nll_inputs`] but returns `Ok(None)` for rows whose
+    /// observation weight is non-positive. A positive-weight row whose exact
+    /// derivatives cannot be represented is an error, never a zero
+    /// contribution.
     fn row_nll_inputs_opt(
         &self,
         row: usize,
@@ -1546,9 +1544,8 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // `t3`. Bit-identical to `row_nll_tower(row)?.third_contracted(dir)` by
         // the `survival_ls_packed_scalar_*` oracle.
         //
-        // Degenerate rows (survival probability underflowed to 0) return None
-        // from the exact kernel — treat their contribution as zero, consistent
-        // with how evaluate() and the zero-weight (w<=0) path handle them.
+        // `None` is reserved for non-positive observation weight, whose
+        // likelihood and every derivative are structurally zero.
         let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
             return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
         };
@@ -1567,7 +1564,8 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // `Σ_{cd} ℓ_{abcd} u_c v_d` without materialising the dense `t4`.
         // Bit-identical to `row_nll_tower(row)?.fourth_contracted(u, v)`.
         //
-        // Degenerate rows: same zero-contribution policy as row_third_contracted.
+        // Non-positive-weight rows have the same structural zero contribution
+        // as in `row_third_contracted`.
         let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
             return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
         };
@@ -1682,6 +1680,21 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 .collect::<Result<Vec<_>, String>>()
         })())
     }
+}
+
+fn require_fitted_block_geometry(
+    block_states: &[ParameterBlockState],
+    context: &'static str,
+) -> Result<(), SurvivalLocationScaleError> {
+    if block_states.is_empty() {
+        return Err(SurvivalLocationScaleError::InternalInvariant {
+            reason: format!(
+                "{context}: fitted block state is missing; likelihood residuals and curvature \
+                 are undefined without the converged per-block mode"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl SurvivalLocationScaleFamily {
@@ -2336,20 +2349,13 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), SurvivalLocationScaleError> {
         let n = self.n;
-        if block_states.is_empty() {
-            // Missing fitted state means the row likelihood geometry is
-            // undefined. Returning zeros would assert a false stationary
-            // point to the outer baseline optimizer and manufacture a
-            // convergence certificate, so propagate the invariant failure.
-            return Err(SurvivalLocationScaleError::InternalInvariant {
-                reason: format!(
-                    "SurvivalLocationScaleFamily::offset_channel_geometry: \
-                     block_states is empty (the fitted per-block state was not \
-                     propagated to the baseline-θ geometry path; n={n}); offset \
-                     residuals and curvatures are undefined without it"
-                ),
-            });
-        }
+        // Missing fitted state means the row likelihood geometry is
+        // undefined. Returning zeros would assert a false stationary point to
+        // the outer baseline optimizer and manufacture convergence.
+        require_fitted_block_geometry(
+            block_states,
+            "SurvivalLocationScaleFamily::offset_channel_geometry",
+        )?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
         let mut entry = Array1::<f64>::zeros(n);
@@ -2370,6 +2376,9 @@ impl SurvivalLocationScaleFamily {
                         dynamic.qdot_exit[i],
                     );
                     let Some(row) = self.row_derivatives(i, state)? else {
+                        // `row_derivatives` returns `None` only for a
+                        // non-positive-weight observation. Numerical geometry
+                        // failures on positive-weight rows propagate as errors.
                         return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
                     };
                     // NLL gradient + curvature on the three time channels
@@ -2434,12 +2443,13 @@ impl SurvivalLocationScaleFamily {
     pub(crate) fn link_param_data_fit_gradient(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<Array1<f64>>, String> {
+    ) -> Result<Option<Array1<f64>>, SurvivalLocationScaleError> {
         use gam_solve::mixture_link::{InverseLinkKernel, LinkParamPartials};
         let n = self.n;
-        if block_states.is_empty() {
-            return Ok(None);
-        }
+        require_fitted_block_geometry(
+            block_states,
+            "SurvivalLocationScaleFamily::link_param_data_fit_gradient",
+        )?;
         // ∂(log S)/∂θ and ∂(log φ)/∂θ contributions per row are accumulated
         // into a θ-length vector. Probe the parameter count from the link's
         // partials at a finite argument; `None` ⇒ no free link parameters.
@@ -3078,11 +3088,10 @@ impl SurvivalLocationScaleFamily {
                 (surv, pdf)
             };
 
-        // Row degeneracy guard: when any hazard/pdf derivative is non-finite
-        // (e.g. CLogLog with u > ~709 where exp(u) overflows), the row's
-        // survival probability has underflowed to 0 and the derivatives
-        // cannot be represented in f64.  Exclude the row — same principle
-        // as the w <= 0 early-return above.
+        // A positive-weight row must contribute its exact likelihood
+        // geometry. If a hazard/pdf derivative is not representable in f64
+        // (for example after survival underflow), silently excluding the row
+        // would change both the fitted objective and the outer gradient.
         if !(r0.is_finite()
             && dr0.is_finite()
             && ddr0.is_finite()
@@ -3096,11 +3105,14 @@ impl SurvivalLocationScaleFamily {
             && d3logphi1.is_finite()
             && d4logphi1.is_finite())
         {
-            log::debug!(
-                "skipping row {row}: survival derivatives non-finite \
-                 (u0={u0:.2e}, u1={u1:.2e})"
-            );
-            return Ok(None);
+            return Err(SurvivalLocationScaleError::NumericalFailure {
+                reason: format!(
+                    "survival location-scale derivatives are non-finite at positive-weight \
+                     row {row} (weight={w}, u0={u0:.6e}, u1={u1:.6e}); exact row geometry \
+                     is required"
+                ),
+            }
+            .into());
         }
 
         let guard = self.time_derivative_lower_bound();
@@ -3264,6 +3276,18 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 #[cfg(test)]
 mod simd_batch_bit_identity_tests {
     use super::*;
+
+    #[test]
+    fn missing_fitted_state_is_a_typed_geometry_error() {
+        let error = require_fitted_block_geometry(&[], "offset geometry")
+            .expect_err("missing fitted state must not become zero geometry");
+        match error {
+            SurvivalLocationScaleError::InternalInvariant { reason } => {
+                assert!(reason.contains("fitted block state is missing"));
+            }
+            other => panic!("missing fitted state must be an internal invariant, got {other:?}"),
+        }
+    }
 
     /// Tiny deterministic LCG (no external rng dep in the test).
     struct Lcg(u64);

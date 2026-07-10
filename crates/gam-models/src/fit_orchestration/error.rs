@@ -44,6 +44,16 @@ pub enum WorkflowError {
     /// optimizer / profile-cost evaluation) failed to converge or
     /// produced a non-finite value that downstream code cannot consume.
     IntegrationFailed { reason: String },
+    /// A spatial basis could not be certified at its current resolution and
+    /// the next information-bearing expansion could not be fitted. Carries the
+    /// attempted resolution and underlying evidence instead of returning the
+    /// last under-resolved fit as if it were complete.
+    SpatialUnderresolved {
+        term: String,
+        current_centers: usize,
+        attempted_centers: usize,
+        reason: String,
+    },
     /// Formula parsing / term-resolution failed before materialization; the
     /// source retains the parser-layer category and argument context.
     FormulaDsl {
@@ -72,6 +82,16 @@ impl std::fmt::Display for WorkflowError {
             | WorkflowError::SchemaMismatch { reason }
             | WorkflowError::MissingDependency { reason }
             | WorkflowError::IntegrationFailed { reason } => f.write_str(reason),
+            WorkflowError::SpatialUnderresolved {
+                term,
+                current_centers,
+                attempted_centers,
+                reason,
+            } => write!(
+                f,
+                "spatial term '{term}' remains under-resolution-uncertain at {current_centers} \
+                 centers: the {attempted_centers}-center certification refit failed ({reason})"
+            ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
             // Reconstruct the display text from the structured payload so
             // CLI / `to_string()` consumers see the same prose the legacy
@@ -121,6 +141,7 @@ impl std::error::Error for WorkflowError {
             | WorkflowError::SchemaMismatch { .. }
             | WorkflowError::MissingDependency { .. }
             | WorkflowError::IntegrationFailed { .. }
+            | WorkflowError::SpatialUnderresolved { .. }
             | WorkflowError::ColumnNotFound { .. } => None,
         }
     }

@@ -90,7 +90,19 @@ from .penalties import (
 )
 from .interchange import InterchangeSwapDecoder
 from .hyperbolic import PoincareAtoms
-from .skip_transcoder import SkipAffineSmooth, SkipTranscoderResult, skip_transcoder
+from .skip_transcoder import (
+    SkipAffineSmooth,
+    SkipTranscoderCandidateFailed,
+    SkipTranscoderContinuousNonConvergence,
+    SkipTranscoderFailedCandidate,
+    SkipTranscoderProfile,
+    SkipTranscoderSelectionCertificate,
+    SkipTranscoderSelectionError,
+    SkipTranscoderSelectionResult,
+    SkipTranscoderTrial,
+    select_skip_transcoder,
+    skip_transcoder,
+)
 from ..smooth import (
     BSpline,
     Categorical,
@@ -143,7 +155,15 @@ __all__ = [
     "SparsityConfig",
     "PoincareAtoms",
     "SkipAffineSmooth",
-    "SkipTranscoderResult",
+    "SkipTranscoderCandidateFailed",
+    "SkipTranscoderContinuousNonConvergence",
+    "SkipTranscoderFailedCandidate",
+    "SkipTranscoderProfile",
+    "SkipTranscoderSelectionCertificate",
+    "SkipTranscoderSelectionError",
+    "SkipTranscoderSelectionResult",
+    "SkipTranscoderTrial",
+    "select_skip_transcoder",
     "skip_transcoder",
     "GatedSAEDecoder",
     "MechanismSparsityPenalty",

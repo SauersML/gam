@@ -221,14 +221,14 @@ pub(crate) fn torus_projection_seed_grid_caps_total_points() {
     );
 }
 
-/// `seed_coords_by_decoder_projection` must replace each cold coordinate
-/// with the grid point whose frozen-decoder decode is closest to the target
-/// row, and refresh the atom basis there. Built on a decoder that maps the
+/// `seed_coords_by_decoder_projection` must replace each cold coordinate with
+/// the continuous frozen-decoder projection and refresh the atom basis there.
+/// Built on a decoder that maps the
 /// circle injectively into `ℝ²` (`decode(t) = (sin 2πt, cos 2πt)`) so the
 /// per-row global argmin is unambiguous. Direct Rust pin for the #628 OOS
 /// seed, complementing the Python oracle end-to-end test.
 #[test]
-pub(crate) fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
+pub(crate) fn seed_coords_by_decoder_projection_recovers_off_lattice_minimiser() {
     use std::f64::consts::PI;
 
     let resolution = 8usize;
@@ -260,11 +260,12 @@ pub(crate) fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
-    // Targets sit exactly on two distinct grid phases `k / resolution`.
-    let phases = [3usize, 6usize];
+    // Targets sit exactly at two phases that are not nodes of the supplied
+    // support resolution. The Fourier stationary-root path must therefore
+    // return a genuinely continuous answer.
+    let phases = [0.173_205_080_756_887_73, 0.731_058_578_630_004_9];
     let mut target = Array2::<f64>::zeros((2, 2));
-    for (row, &k) in phases.iter().enumerate() {
-        let t = k as f64 / resolution as f64;
+    for (row, &t) in phases.iter().enumerate() {
         target[[row, 0]] = (2.0 * PI * t).sin();
         target[[row, 1]] = (2.0 * PI * t).cos();
     }
@@ -272,12 +273,11 @@ pub(crate) fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
     term.seed_coords_by_decoder_projection(target.view(), resolution)
         .unwrap();
 
-    // Each row was seeded onto its exact grid minimiser …
+    // Each row was seeded onto its exact continuous minimiser …
     let seeded = term.assignment.coords[0].as_matrix();
     let mut expected_coords = Array2::<f64>::zeros((2, 1));
-    for (row, &k) in phases.iter().enumerate() {
-        let expected = k as f64 / resolution as f64;
-        assert_abs_diff_eq!(seeded[[row, 0]], expected, epsilon = 1e-12);
+    for (row, &expected) in phases.iter().enumerate() {
+        assert_abs_diff_eq!(seeded[[row, 0]], expected, epsilon = 1e-10);
         expected_coords[[row, 0]] = expected;
     }
     // … and the basis cache was refreshed at the seeded coordinates.

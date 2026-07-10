@@ -864,6 +864,16 @@ impl OuterProblem {
     }
 }
 
+/// Internal outcome of one planned solver/multistart attempt.
+///
+/// Exhausted checkpoints carry resumable work only. They never pass through
+/// finalization, cache promotion, uncertainty diagnostics, or fitted-model
+/// construction.
+pub(crate) enum PlanRunOutcome {
+    Converged(OuterResult),
+    Exhausted(OuterResult),
+}
+
 /// Result of a completed outer optimization.
 #[derive(Clone, Debug)]
 pub struct OuterResult {
@@ -1066,7 +1076,40 @@ pub(crate) fn certify_outer_optimality(
             outer_gradient_tolerance(config).abs,
         ));
     }
-    if capability.gradient != Derivative::Analytic && layout.n_params > 0 {
+    if layout.n_params == 0 {
+        let value = obj.eval_cost(&result.rho).map_err(|err| {
+            outer_nonconvergence_error(
+                context,
+                &format!("zero-dimensional final objective evaluation failed: {err}"),
+                result,
+                Some(0.0),
+                outer_gradient_tolerance(config).abs,
+            )
+        })?;
+        if !value.is_finite() {
+            return Err(outer_nonconvergence_error(
+                context,
+                "the zero-dimensional final objective is non-finite",
+                result,
+                Some(0.0),
+                outer_gradient_tolerance(config).abs,
+            ));
+        }
+        let certificate = OuterCriterionCertificate {
+            grad_norm: 0.0,
+            projected_grad_norm: 0.0,
+            stationarity_bound: outer_gradient_tolerance(config).abs,
+            hessian_psd: None,
+            lambdas_railed: Vec::new(),
+        };
+        result.final_value = value;
+        result.final_grad_norm = Some(0.0);
+        result.final_gradient = Some(Array1::zeros(0));
+        result.final_hessian = None;
+        result.converged = true;
+        return Ok(certificate);
+    }
+    if capability.gradient != Derivative::Analytic {
         return Err(outer_nonconvergence_error(
             context,
             "the objective exposes no analytic gradient for final certification",
@@ -1494,7 +1537,16 @@ pub(crate) fn run_outer_uncertified(
     // iteration; everything else falls through to the dense / standard path
     // below. Routed here so every entry point inherits it (magic by default).
     if let Some(result) = run_per_atom_efs_if_frontier(obj, config, context)? {
-        return Ok(result);
+        if result.converged {
+            return Ok(result);
+        }
+        return Err(outer_nonconvergence_error(
+            context,
+            "per-atom EFS exhausted its iteration budget before the fixed-point step converged",
+            &result,
+            None,
+            outer_gradient_tolerance(config).abs,
+        ));
     }
 
     if cap.n_params == 0 {
@@ -1525,6 +1577,7 @@ pub(crate) fn run_outer_uncertified(
     }
 
     let mut last_error: Option<EstimationError> = None;
+    let mut best_checkpoint: Option<OuterResult> = None;
 
     for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
@@ -1570,9 +1623,9 @@ pub(crate) fn run_outer_uncertified(
                 retry_config.clone().unwrap_or_else(|| config.clone());
             let active_config: &OuterConfig = &active_config_owned;
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
-                Ok(result) => {
-                    if result.converged
-                        || arc_retries_left == 0
+                Ok(PlanRunOutcome::Converged(result)) => break Ok(result),
+                Ok(PlanRunOutcome::Exhausted(result)) => {
+                    if arc_retries_left == 0
                         || matches!(
                             result.operator_stop_reason,
                             Some(
@@ -1676,17 +1729,17 @@ pub(crate) fn run_outer_uncertified(
 
         match outcome {
             Ok(result) => {
-                if result.converged || attempt_idx + 1 == attempts.len() {
-                    if !result.converged {
-                        log::warn!(
-                            "[OUTER warning] {context}: final outer attempt returned without convergence \
-                             (plan={the_plan}, iterations={}, final_value={:.6e}, |g|={})",
-                            result.iterations,
-                            result.final_value,
-                            result.final_grad_norm_report(),
-                        );
-                    }
+                if result.converged {
                     return Ok(result);
+                }
+
+                let improves_checkpoint = result.final_value.is_finite()
+                    && best_checkpoint.as_ref().is_none_or(|checkpoint| {
+                        !checkpoint.final_value.is_finite()
+                            || result.final_value < checkpoint.final_value
+                    });
+                if improves_checkpoint {
+                    best_checkpoint = Some(result);
                 }
 
                 let message = format!(
@@ -1704,6 +1757,20 @@ pub(crate) fn run_outer_uncertified(
                 last_error = Some(e);
             }
         }
+    }
+
+    if let Some(checkpoint) = best_checkpoint {
+        let gradient_bound = outer_gradient_tolerance(config).threshold(
+            checkpoint.final_value,
+            checkpoint.final_grad_norm.unwrap_or(0.0),
+        );
+        return Err(outer_nonconvergence_error(
+            context,
+            "all declared solver plans exhausted without a stationary result",
+            &checkpoint,
+            checkpoint.final_grad_norm,
+            gradient_bound,
+        ));
     }
 
     Err(last_error.unwrap_or_else(|| {

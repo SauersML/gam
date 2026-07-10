@@ -79,7 +79,10 @@ pub use dispersion::Dispersion;
 pub use dispersion_cov::{
     DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance,
 };
-pub use estimation_error::EstimationError;
+pub use estimation_error::{
+    EstimationError, FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage,
+    FixedLambdaStallReason, FixedLambdaStationarityEvidence,
+};
 pub use execution_path::ExecutionPath;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{

@@ -1824,13 +1824,13 @@ fn bspline_basis_derivative<'py>(
     Ok(basis.into_pyarray(py).unbind())
 }
 
-/// Build a closed cyclic uniform B-spline basis and its cyclic difference
-/// penalty on the periodic parameter `t`.
+/// Build a closed cyclic uniform B-spline basis and its exact derivative
+/// roughness penalty on the periodic parameter `t`.
 ///
 /// The basis lives on `[0, 1)` (values of `t` are reduced modulo 1 by the
 /// underlying kernel) with `n_knots` cyclic control points, and the
-/// returned penalty is the `penalty_order`-th cyclic difference penalty on
-/// those coefficients (constant vector is its only nullspace direction).
+/// returned penalty is `∮(f^(penalty_order))²` in that basis (the constant
+/// function is its only nullspace direction).
 #[pyfunction(signature = (t, n_knots, degree = 3, penalty_order = 2))]
 fn periodic_spline_curve_basis<'py>(
     py: Python<'py>,
@@ -1842,8 +1842,9 @@ fn periodic_spline_curve_basis<'py>(
     let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
     let basis =
         build_periodic_bspline_basis_1d(t.as_array(), &spec).map_err(basis_error_to_pyerr)?;
-    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
-        .map_err(basis_error_to_pyerr)?;
+    let penalty =
+        cyclic_bspline_derivative_penalty_matrix(degree, n_knots, 1.0, penalty_order)
+            .map_err(basis_error_to_pyerr)?;
     Ok((
         basis.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
@@ -1861,6 +1862,21 @@ fn cyclic_difference_penalty(
     order: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
+        .map_err(basis_error_to_pyerr)?;
+    Ok(penalty.into_pyarray(py).unbind())
+}
+
+/// Exact periodic B-spline function roughness
+/// `S_ab = ∮ B_a^(order)(t) B_b^(order)(t) dt` over one period.
+#[pyfunction(signature = (num_basis, degree = 3, period = 1.0, order = 2))]
+fn cyclic_bspline_roughness_penalty(
+    py: Python<'_>,
+    num_basis: usize,
+    degree: usize,
+    period: f64,
+    order: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let penalty = cyclic_bspline_derivative_penalty_matrix(degree, num_basis, period, order)
         .map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
 }
@@ -2330,8 +2346,13 @@ fn basis_with_jet<'py>(
                         jet.shape()
                     )));
                 }
-                let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
-                    .map_err(basis_error_to_pyerr)?;
+                let penalty = cyclic_bspline_derivative_penalty_matrix(
+                    degree,
+                    num_basis,
+                    right - left,
+                    order,
+                )
+                .map_err(basis_error_to_pyerr)?;
                 (jet, penalty)
             } else {
                 let deriv = bspline_basis_derivative_impl(
@@ -5402,12 +5423,13 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
 
 /// Analytic backward (VJP) for `gaussian_reml_fit_with_constraints_forward`.
 ///
-/// Math identity (see task spec): at the constrained cert exit with active
-/// set `A_act β̂ = 0`, the envelope theorem applied to the tangent-projected
-/// outer objective `V_T(ρ)` gives the same closed-form VJP as the
-/// unconstrained Gaussian REML backward, with `H⁻¹` replaced by the
-/// projected pseudo-inverse `P = Z (ZᵀHZ)⁻¹ Zᵀ` and `S⁺` replaced by
-/// `Z (ZᵀSZ)⁺ Zᵀ` (where `Z` is the basis of `null(A_act)`).
+/// At an active certificate the accepted face is affine,
+/// `A_act β̂ = b_act`, and its tangent space is `null(A_act)`.  The core
+/// adjoint retains the full affine `β̂` while replacing the unconstrained
+/// response and penalty kernels by
+/// `P = Z (ZᵀHZ)⁻¹ Zᵀ` and `Q = Z (ZᵀSZ)⁺ Zᵀ`.  This carries the penalty's
+/// affine cross/constant terms exactly; a response-shifted homogeneous solve
+/// would not.
 ///
 /// Implementation status:
 /// - **Interior cert (empty active set):** the projection `Z = I_p` is the
@@ -5415,14 +5437,10 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
 ///   closed-form Gaussian REML backward. This case delegates to
 ///   `gaussian_reml_multi_closed_form_backward` and produces gradients
 ///   identical to `gaussian_reml_fit_backward` (round-off agreement).
-/// - **Active cert (non-empty active set):** reparametrise `β = Z γ` with
-///   `Z = null(A_act)` and run the interior closed-form backward on the
-///   reduced operators `X_Z = X Z`, `S_Z = Zᵀ S Z`, pulling upstream
-///   cotangents through `Z` and lifting the returned gradients back to full
-///   p-space (`grad_X = grad_X_Z · Zᵀ`, `grad_S = Z · grad_S_Z · Zᵀ`). Since
-///   `Z` depends only on the non-differentiable active-constraint geometry,
-///   this is the exact analytic adjoint. Delegates to
-///   `constrained_active_backward`.
+/// - **Active cert (non-empty active set):** delegate the cached forward state
+///   and constraint certificate to the core KKT/envelope adjoint.  It supports
+///   nonzero affine bounds and emits a typed `GradientUnavailableError` at a
+///   weakly-active boundary where the derivative is genuinely set-valued.
 #[pyfunction(signature = (
     x,
     y,
@@ -5450,10 +5468,9 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     a_inequality: Option<PyReadonlyArray2<'py, f64>>,
     b_inequality: Option<PyReadonlyArray1<'py, f64>>,
     log_lambda_at_optimum: Option<f64>,
-    // `coefficients_at_optimum` is part of the documented API surface so
-    // callers can pre-compute or cache it, but the analytic backward
-    // derives the residual `y - X β̂` from the closed-form fit and never
-    // reads this argument back.
+    // The active-face core differentiates the accepted affine KKT state and
+    // therefore consumes the exact forward coefficients instead of launching
+    // a second, potentially different smoothing optimization.
     coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
     fitted_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
     active_indices: Option<PyReadonlyArray1<'py, u64>>,
@@ -5500,73 +5517,76 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     let is_interior = active_empty || no_constraints;
 
     if !is_interior {
-        // The tangent reparametrisation `β = Z γ`, `Z = null(A_act)` below
-        // encodes the *homogeneous* active face `A_act β̂ = 0`. A non-zero
-        // active bound `b_act` shifts the face to the affine set
-        // `A_act β̂ = b_act` (β̂ = β_particular + Z γ̂), which this reduced
-        // backward does not model. Guard exactly the rows that enter the
-        // reparametrisation — the active ones — rather than every bound:
-        // an interior cert (handled below) never touches `b`, so a slack
-        // constraint with a non-zero bound is perfectly admissible there.
-        if let (Some(b), Some(active)) = (b_inequality.as_ref(), active_indices.as_ref()) {
-            let b_view = b.as_array();
-            for &idx in active.as_array().iter() {
-                let idx = idx as usize;
-                if b_view.get(idx).is_some_and(|value| value.abs() > 0.0) {
-                    return Err(py_value_error(
-                        "gaussian_reml_fit_with_constraints_backward supports only \
-                         zero-bound inequality certificates on the active face"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        // Active cert: tangent-projected envelope-theorem VJP.
-        //
-        // At the active cert the equality constraints `A_act β̂ = 0` confine
-        // β̂ — and every sensitivity of the outer REML objective — to the
-        // tangent space `range(Z)`, where `Z = null(A_act)` is a p×k
-        // orthonormal basis (k = p − rank(A_act)). Reparametrise `β = Z γ`,
-        // `γ ∈ ℝ^k`. The reduced problem is the SAME closed-form Gaussian
-        // REML on the projected operators
-        //     X_Z = X Z   (n×k),    S_Z = Zᵀ S Z   (k×k),
-        // with `y`, `w` unchanged. This realises exactly the documented
-        // substitution `H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ`, `S⁺ → Z(ZᵀSZ)⁺Zᵀ`: the reduced
-        // inverse Hessian is `(ZᵀHZ)⁻¹`, lifted by Z on both sides, and the
-        // reduced penalty pseudo-inverse is `(ZᵀSZ)⁺`.
-        //
-        // The forward outputs map as β̂ = Z γ̂ and fitted = X_Z γ̂ = X β̂; the
-        // outer scalars (λ, REML score, edf) are functions of the reduced
-        // system. We therefore run the interior backward on the reduced
-        // problem with upstream cotangents pulled back through Z, then lift
-        // the returned gradients back to full p-space:
-        //     X_Z = X Z    ⟹  grad_X = grad_X_Z · Zᵀ
-        //     S_Z = Zᵀ S Z ⟹  grad_S = Z · grad_S_Z · Zᵀ
-        //     grad_y, grad_weights pass through unchanged.
-        // Z is a constant (it depends only on the non-differentiable active
-        // constraint geometry), so this is the exact analytic adjoint.
-        return constrained_active_backward(
+        let lambda = log_lambda_at_optimum
+            .map(f64::exp)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                py_value_error(
+                    "active constrained REML backward requires the accepted finite log-lambda"
+                        .to_string(),
+                )
+            })?;
+        let coefficients = coefficients_at_optimum.as_ref().ok_or_else(|| {
+            py_value_error(
+                "active constrained REML backward requires coefficients_at_optimum".to_string(),
+            )
+        })?;
+        let a = a_inequality.as_ref().ok_or_else(|| {
+            py_value_error("active constrained REML backward requires a_inequality".to_string())
+        })?;
+        let b = b_inequality.as_ref().ok_or_else(|| {
+            py_value_error("active constrained REML backward requires b_inequality".to_string())
+        })?;
+        let active = active_indices.as_ref().ok_or_else(|| {
+            py_value_error("active constrained REML backward requires active_indices".to_string())
+        })?;
+
+        let x_owned = x.as_array().to_owned();
+        let y_owned = y.as_array().to_owned();
+        let penalty_owned = penalty.as_array().to_owned();
+        let weights_owned = weights.as_ref().map(|values| values.as_array().to_owned());
+        let a_owned = a.as_array().to_owned();
+        let b_owned = b.as_array().to_owned();
+        let active_owned = active.as_array().to_owned();
+        let coefficients_owned = coefficients.as_array().to_owned();
+        let grad_coefficients_owned =
+            grad_coefficients.as_ref().map(|values| values.as_array().to_owned());
+        let grad_fitted_owned =
+            grad_fitted.as_ref().map(|values| values.as_array().to_owned());
+        let backward = detach_pyresult(
             py,
-            x.as_array(),
-            y.as_array(),
-            penalty.as_array(),
-            weights.as_ref().map(|w| w.as_array()),
-            a_inequality
-                .as_ref()
-                .expect("active cert implies a non-empty constraint matrix")
-                .as_array(),
-            active_indices
-                .as_ref()
-                .expect("active cert implies a non-empty active index set")
-                .as_array(),
-            log_lambda_at_optimum,
-            grad_coefficients.as_ref().map(|g| g.as_array()),
-            grad_fitted.as_ref().map(|g| g.as_array()),
-            grad_lambda,
-            grad_log_lambda,
-            grad_reml_score,
-            grad_edf,
-        );
+            "gaussian_reml_fit_with_constraints_backward",
+            move || {
+                gam::solver::constrained_gaussian_reml::constrained_gaussian_reml_backward(
+                    gam::solver::constrained_gaussian_reml::ConstrainedGaussianRemlBackwardProblem {
+                        x: x_owned.view(),
+                        y: y_owned.view(),
+                        penalty: penalty_owned.view(),
+                        weights: weights_owned.as_ref().map(|values| values.view()),
+                        a_inequality: a_owned.view(),
+                        b_inequality: b_owned.view(),
+                        active_indices: active_owned.view(),
+                        lambda,
+                        coefficients: coefficients_owned.view(),
+                        grad_coefficients: grad_coefficients_owned
+                            .as_ref()
+                            .map(|values| values.view()),
+                        grad_fitted: grad_fitted_owned.as_ref().map(|values| values.view()),
+                        grad_lambda,
+                        grad_log_lambda,
+                        grad_reml_score,
+                        grad_edf,
+                    },
+                )
+                .map_err(estimation_error_to_pyerr)
+            },
+        )?;
+        let out = PyDict::new(py);
+        out.set_item("grad_x", backward.grad_x.into_pyarray(py))?;
+        out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+        out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
+        out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+        return Ok(out.unbind());
     }
 
     // Interior cert: envelope theorem in full p-space. The constrained
@@ -5628,147 +5648,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     out.set_item("grad_x", backward.grad_x.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
-    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
-    Ok(out.unbind())
-}
-
-/// Tangent-projected analytic VJP for the constrained Gaussian REML fit at a
-/// non-empty active set (active cert exit).
-///
-/// See the call site for the derivation. In short: with `Z = null(A_act)` a
-/// p×k orthonormal basis of the tangent space, the constrained problem is the
-/// unconstrained closed-form Gaussian REML on the reduced operators
-/// `X_Z = X Z`, `S_Z = Zᵀ S Z`. We pull the upstream cotangents back through
-/// `Z`, call the SAME interior backward (`gaussian_reml_multi_closed_form_
-/// backward`) on the reduced system, and lift its gradients back to p-space:
-/// `grad_X = grad_X_Z Zᵀ`, `grad_S = Z grad_S_Z Zᵀ`; `grad_y`/`grad_weights`
-/// are invariant under the reparametrisation.
-fn constrained_active_backward<'py>(
-    py: Python<'py>,
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    a_inequality: ArrayView2<'_, f64>,
-    active_indices: ArrayView1<'_, u64>,
-    log_lambda_at_optimum: Option<f64>,
-    grad_coefficients: Option<ArrayView2<'_, f64>>,
-    grad_fitted: Option<ArrayView2<'_, f64>>,
-    grad_lambda: f64,
-    grad_log_lambda: f64,
-    grad_reml_score: f64,
-    grad_edf: f64,
-) -> PyResult<Py<PyDict>> {
-    let p = x.ncols();
-    if a_inequality.ncols() != p {
-        return Err(py_value_error(format!(
-            "a_inequality has {} cols; expected {p} to match X columns",
-            a_inequality.ncols(),
-        )));
-    }
-
-    // Assemble the active constraint rows `A_act` (m_act × p).
-    let mut a_act = Array2::<f64>::zeros((active_indices.len(), p));
-    for (out_row, &idx) in active_indices.iter().enumerate() {
-        let idx = idx as usize;
-        if idx >= a_inequality.nrows() {
-            return Err(py_value_error(format!(
-                "active index {idx} out of range for a_inequality with {} rows",
-                a_inequality.nrows(),
-            )));
-        }
-        a_act.row_mut(out_row).assign(&a_inequality.row(idx));
-    }
-
-    // `Z = null(A_act)`. `rrqr_nullspace_basis(M)` returns an orthonormal
-    // basis of `null(Mᵀ)`; feeding `A_actᵀ` (p × m_act, tall since p ≥ m_act
-    // at any valid cert) therefore yields `null((A_actᵀ)ᵀ) = null(A_act)` as a
-    // p×k orthonormal basis.
-    let a_act_t = a_act.t().to_owned();
-    let z = gam::linalg::faer_ndarray::rrqr_nullspace_basis(
-        &a_act_t,
-        gam::linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(|err| py_value_error(format!("failed to build tangent null-space basis Z: {err}")))?
-    .0;
-    let k = z.ncols();
-    if k == 0 {
-        // The active set pins β̂ to the origin: every sensitivity vanishes on
-        // the (empty) tangent space. The exact adjoint is the zero VJP.
-        let out = PyDict::new(py);
-        out.set_item("grad_x", Array2::<f64>::zeros(x.dim()).into_pyarray(py))?;
-        out.set_item("grad_y", Array2::<f64>::zeros(y.dim()).into_pyarray(py))?;
-        out.set_item(
-            "grad_penalty",
-            Array2::<f64>::zeros((p, p)).into_pyarray(py),
-        )?;
-        out.set_item(
-            "grad_weights",
-            Array1::<f64>::zeros(x.nrows()).into_pyarray(py),
-        )?;
-        return Ok(out.unbind());
-    }
-
-    // Reduce the system to Z-coordinates: X_Z = X Z, S_Z = Zᵀ S Z.
-    let x_z = x.dot(&z);
-    let penalty_z = z.t().dot(&penalty).dot(&z);
-
-    // Pull upstream cotangents back through Z. The coefficient output is
-    // β̂ = Z γ̂, so its cotangent maps as `grad_γ = Zᵀ grad_β` (k × d). The
-    // fitted output (X_Z γ̂ = X β̂) and the outer scalars are unchanged.
-    let grad_coefficients_z: Option<Array2<f64>> = grad_coefficients.map(|g| z.t().dot(&g));
-
-    // Chain `grad_log_lambda` onto `grad_lambda` via dlog λ/dλ = 1/λ, mirroring
-    // the interior branch (λ and log λ pull the same scalar).
-    let init_lambda = log_lambda_at_optimum.map(|rho| rho.exp());
-    let mut effective_grad_lambda = grad_lambda;
-    if grad_log_lambda != 0.0 {
-        let lam = init_lambda.unwrap_or(0.0);
-        if lam > 0.0 {
-            effective_grad_lambda += grad_log_lambda / lam;
-        } else {
-            return Err(py_value_error(
-                "gaussian_reml_fit_with_constraints_backward: grad_log_lambda is \
-                 non-zero but log_lambda_at_optimum is missing or λ ≤ 0; cannot \
-                 chain dlog λ/dλ = 1/λ."
-                    .to_string(),
-            ));
-        }
-    }
-
-    let y_owned = y.to_owned();
-    let weight_owned = weights.map(|w| w.to_owned());
-    let grad_fitted_owned = grad_fitted.map(|g| g.to_owned());
-    let backward = detach_pyresult(
-        py,
-        "gaussian_reml_fit_with_constraints_backward",
-        move || {
-            gaussian_reml_multi_closed_form_backward(
-                x_z.view(),
-                y_owned.view(),
-                penalty_z.view(),
-                weight_owned.as_ref().map(|w| w.view()),
-                init_lambda,
-                effective_grad_lambda,
-                grad_coefficients_z.as_ref().map(|g| g.view()),
-                grad_fitted_owned.as_ref().map(|g| g.view()),
-                grad_reml_score,
-                grad_edf,
-            )
-            .map_err(estimation_error_to_pyerr)
-        },
-    )?;
-
-    // Lift the reduced gradients back to full p-space.
-    //   X_Z = X Z    ⟹  grad_X = grad_X_Z Zᵀ      (n×p)
-    //   S_Z = Zᵀ S Z ⟹  grad_S = Z grad_S_Z Zᵀ    (p×p)
-    let grad_x = backward.grad_x.dot(&z.t());
-    let grad_penalty = z.dot(&backward.grad_penalty).dot(&z.t());
-
-    let out = PyDict::new(py);
-    out.set_item("grad_x", grad_x.into_pyarray(py))?;
-    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
-    out.set_item("grad_penalty", grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     Ok(out.unbind())
 }

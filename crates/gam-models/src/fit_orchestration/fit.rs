@@ -58,19 +58,43 @@ const SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING: usize = 40;
 
 const SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
 
-/// High finite LAML cost returned for an outer smoothing candidate whose inner
-/// constrained I-spline PIRLS failed to converge (gam#1123). It must be large
-/// enough to dominate any genuine LAML value at a fittable ρ (the survival LAML
-/// is O(deviance) ~ O(n·log) — a few thousand here) so the outer optimizer always
-/// prefers a converged region, yet finite so the line search treats it as a
-/// recoverable bad step (a backtrack) rather than aborting on a non-finite cost.
-const SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST: f64 = 1e12;
-
 struct SurvivalLocationScaleProfile {
     fit: SurvivalLocationScaleTermFitResult,
     inverse_link: InverseLink,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
+}
+
+fn survival_pirls_status_is_certified(status: gam_solve::pirls::PirlsStatus) -> bool {
+    status.is_converged()
+}
+
+fn require_certified_survival_pirls(
+    summary: &gam_solve::pirls::WorkingModelPirlsResult,
+    context: &str,
+    rho_checkpoint: &[f64],
+    durable_checkpoint_key: Option<&str>,
+) -> Result<(), String> {
+    if survival_pirls_status_is_certified(summary.status) {
+        return Ok(());
+    }
+    Err(format!(
+        "{context} did not produce a strict PIRLS convergence certificate \
+         (status={:?}, iterations={}, projected_gradient_norm={:.6e}, \
+         deviance={:.6e}, min_penalized_deviance={:.6e}, last_step_size={:.6e}, \
+         last_step_halving={}, rho_checkpoint={rho_checkpoint:?}{}). The accepted \
+         iterate is checkpoint evidence only; no fit was minted.",
+        summary.status,
+        summary.iterations,
+        summary.lastgradient_norm,
+        summary.state.deviance,
+        summary.min_penalized_deviance,
+        summary.last_step_size,
+        summary.last_step_halving,
+        durable_checkpoint_key
+            .map(|key| format!(", durable_checkpoint_key={key}"))
+            .unwrap_or_default(),
+    ))
 }
 
 impl SurvivalLocationScaleProfile {
@@ -105,14 +129,13 @@ fn resolved_wiggle_inverse_link(
 /// `request.options` untouched. Split out of [`fit_standard_model`] so the
 /// #1762 near-separation Firth fallback can re-run the identical fit with the
 /// Jeffreys penalty enabled without duplicating the dispatch.
+type StandardBaseFit = crate::fit_orchestration::drivers::FittedTermCollectionWithSpec;
+
 fn fit_standard_base(
     request: &StandardFitRequest<'_>,
     family: &LikelihoodSpec,
     options: &FitOptions,
-) -> Result<
-    crate::fit_orchestration::drivers::FittedTermCollectionWithSpec,
-    gam_solve::estimate::EstimationError,
-> {
+) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
     if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
         {
@@ -170,6 +193,145 @@ fn fit_standard_base(
             options,
             &request.kappa_options,
         )
+    }
+}
+
+fn standard_status_is_certified(
+    outer_converged: bool,
+    pirls_status: gam_solve::pirls::PirlsStatus,
+) -> bool {
+    outer_converged
+        && matches!(
+            pirls_status,
+            gam_solve::pirls::PirlsStatus::Converged
+                | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
+        )
+}
+
+fn standard_fit_is_certified(fit: &UnifiedFitResult) -> bool {
+    standard_status_is_certified(fit.outer_converged, fit.pirls_status)
+}
+
+/// Defensive conversion for legacy drivers that still return `Ok` with an
+/// explicit failed convergence verdict. New outer drivers return the same
+/// evidence directly as `EstimationError::RemlDidNotConverge`; this seam keeps
+/// a stale `Ok(false)` from ever becoming a fitted model while carrying its
+/// rho checkpoint forward for resume.
+fn uncertified_standard_fit_error(
+    fit: &UnifiedFitResult,
+    context: &str,
+    configured_stationarity_bound: f64,
+) -> gam_solve::estimate::EstimationError {
+    let certificate = fit.artifacts.criterion_certificate.as_ref();
+    gam_solve::estimate::EstimationError::RemlDidNotConverge {
+        context: context.to_string(),
+        reason: format!(
+            "returned outer_converged={} with inner PIRLS status {:?}{}",
+            fit.outer_converged,
+            fit.pirls_status,
+            certificate
+                .map(|value| format!("; final certificate: {}", value.summary()))
+                .unwrap_or_default(),
+        ),
+        iterations: fit.outer_iterations,
+        final_value: fit.reml_score,
+        projected_grad_norm: certificate
+            .map(|value| value.projected_grad_norm)
+            .or(fit.outer_gradient_norm),
+        stationarity_bound: certificate
+            .map(|value| value.stationarity_bound)
+            .unwrap_or(configured_stationarity_bound),
+        rho_checkpoint: fit.log_lambdas.to_vec(),
+    }
+}
+
+fn require_certified_standard_fit(
+    attempt: Result<StandardBaseFit, gam_solve::estimate::EstimationError>,
+    context: &str,
+    configured_stationarity_bound: f64,
+) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
+    let fitted = attempt?;
+    if standard_fit_is_certified(&fitted.fit) {
+        Ok(fitted)
+    } else {
+        Err(uncertified_standard_fit_error(
+            &fitted.fit,
+            context,
+            configured_stationarity_bound,
+        ))
+    }
+}
+
+fn firth_can_rescue(error: &gam_solve::estimate::EstimationError) -> bool {
+    use gam_solve::estimate::EstimationError;
+    error.is_inner_solve_retreat()
+        || matches!(
+            error,
+            EstimationError::PrefitPerfectSeparationDetected { .. }
+                | EstimationError::PrefitLinearSeparationDetected { .. }
+                | EstimationError::RemlDidNotConverge { .. }
+        )
+}
+
+fn certified_retry_or_original<T, E>(original: E, retry: Result<T, E>) -> Result<T, E> {
+    match retry {
+        Ok(value) => Ok(value),
+        Err(_) => Err(original),
+    }
+}
+
+#[cfg(test)]
+mod standard_convergence_gate_tests {
+    use super::{certified_retry_or_original, firth_can_rescue, standard_status_is_certified};
+    use gam_solve::estimate::EstimationError;
+    use gam_solve::pirls::PirlsStatus;
+
+    #[test]
+    fn standard_gate_requires_outer_and_inner_certificates() {
+        assert!(standard_status_is_certified(true, PirlsStatus::Converged));
+        assert!(standard_status_is_certified(
+            true,
+            PirlsStatus::StalledAtValidMinimum
+        ));
+        assert!(!standard_status_is_certified(
+            false,
+            PirlsStatus::Converged
+        ));
+        for status in [
+            PirlsStatus::MaxIterationsReached,
+            PirlsStatus::LmStepSearchExhausted,
+            PirlsStatus::Unstable,
+        ] {
+            assert!(!standard_status_is_certified(true, status));
+        }
+    }
+
+    #[test]
+    fn failed_retry_returns_original_evidence() {
+        let result = certified_retry_or_original::<(), _>("base evidence", Err("retry evidence"));
+        assert_eq!(result, Err("base evidence"));
+        assert_eq!(
+            certified_retry_or_original("base evidence", Ok::<_, &str>(7)),
+            Ok(7)
+        );
+    }
+
+    #[test]
+    fn firth_retry_is_limited_to_separation_and_nonconvergence() {
+        assert!(firth_can_rescue(&EstimationError::PirlsDidNotConverge {
+            max_iterations: 20,
+            last_change: 1.0,
+        }));
+        assert!(firth_can_rescue(
+            &EstimationError::PrefitPerfectSeparationDetected {
+                column_index: 0,
+                threshold: 0.0,
+                positive_above_threshold: true,
+            }
+        ));
+        assert!(!firth_can_rescue(&EstimationError::InvalidInput(
+            "structural mismatch".to_string()
+        )));
     }
 }
 
@@ -335,8 +497,6 @@ pub(crate) fn fit_standard_model(
         request.estimate_tweedie_p = false;
     }
 
-    let base = fit_standard_base(&request, &request.family, &request.options);
-
     // #1762: near-perfect linear separation drives the binomial-logit REML/ARC
     // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
     // separation the coefficients want to run to infinity, the PIRLS working
@@ -349,60 +509,70 @@ pub(crate) fn fit_standard_model(
     // remedy: it bounds the coefficients and keeps the working weights from
     // collapsing, so the inner solve is well conditioned at every λ and the
     // outer optimizer certifies quickly. Retry ONCE with Firth when a plain
-    // binomial-logit fit fails to converge (non-converged OR errored), and adopt
-    // it only if it actually converges — otherwise the honest non-converged base
-    // fit (or its original error) is preserved. This is a no-op on the
-    // overwhelming majority of fits, which converge on the first pass.
+    // binomial-logit fit fails with typed separation/non-convergence evidence,
+    // and adopt it only if the retry itself carries both inner and outer
+    // convergence certificates. If the retry fails, return the ORIGINAL base
+    // error unchanged; a failed rescue can never replace its evidence or mint
+    // the abandoned base iterate. Structural errors are not Firth-retryable.
     let is_binomial_logit = matches!(request.family.response, ResponseFamily::Binomial)
         && matches!(
             request.family.link,
             InverseLink::Standard(StandardLink::Logit)
         );
-    let base_needs_rescue = match &base {
-        Ok(f) => !f.fit.outer_converged,
-        Err(_) => true,
-    };
-    let mut fitted =
-        if is_binomial_logit && !request.options.firth_bias_reduction && base_needs_rescue {
+    let base = require_certified_standard_fit(
+        fit_standard_base(&request, &request.family, &request.options),
+        "standard REML/LAML fit",
+        request.options.tol,
+    );
+    let fitted = match base {
+        Ok(fitted) => fitted,
+        Err(original_error)
+            if is_binomial_logit
+                && !request.options.firth_bias_reduction
+                && firth_can_rescue(&original_error) =>
+        {
+            let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
-            match fit_standard_base(&request, &request.family, &firth_options) {
-                Ok(firth_fitted) if firth_fitted.fit.outer_converged => {
+            let firth = require_certified_standard_fit(
+                fit_standard_base(&request, &request.family, &firth_options),
+                "Firth binomial-logit REML/LAML retry",
+                firth_options.tol,
+            );
+            let firth_failure = firth.as_ref().err().map(ToString::to_string);
+            match certified_retry_or_original(original_error, firth) {
+                Ok(firth_fitted) => {
                     log::info!(
-                        "[#1762] binomial-logit fit did not converge (near-separation flat-valley \
-                     stall); Firth bias-reduction retry converged — adopting the Firth fit \
-                     (base edf {:.2}, Firth edf {:.2}).",
-                        base.as_ref()
-                            .ok()
-                            .map_or(f64::NAN, |f| f.fit.edf_total().unwrap_or(f64::NAN)),
+                        "[#1762] binomial-logit base fit failed with retryable \
+                         separation/non-convergence evidence ({original_report}); Firth \
+                         bias-reduction retry certified — adopting it (Firth edf {:.2}).",
                         firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
                     );
                     firth_fitted
                 }
-                _ => {
+                Err(original_error) => {
                     log::warn!(
-                        "[#1762] binomial-logit fit did not converge and the Firth retry did not \
-                     certify convergence; keeping the base result."
+                        "[#1762] binomial-logit base fit failed ({original_report}); Firth retry \
+                         also failed to certify ({}) — returning the original typed base \
+                         evidence, not either abandoned iterate.",
+                        firth_failure.unwrap_or_else(|| "unknown retry failure".to_string()),
                     );
-                    base?
+                    return Err(original_error.to_string());
                 }
             }
-        } else {
-            base?
-        };
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
-    // #1788: if the outer REML stalled with railed λ, the assembled penalized
-    // EDF can collapse to the intercept-only floor while the coefficients stay
-    // wiggly. Reuse the smooth-term LR path's `untrusted_edf_collapse` guard to
-    // keep the REPORTED EDF consistent with the fit and surface the
-    // non-convergence rather than leaving the collapse silent.
-    guard_untrusted_edf_collapse(&mut fitted.fit, &fitted.design, request.y.len());
-
+    let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
+    let adaptive_spatial_center_counts = adaptive_spatial_center_counts(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec: fitted.resolvedspec,
+        adaptive_spatial_terms: adaptive_spatial_terms.clone(),
+        adaptive_spatial_center_counts: adaptive_spatial_center_counts.clone(),
         adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
@@ -497,6 +667,8 @@ pub(crate) fn fit_standard_model(
         fit: solved.fit,
         design: solved.design,
         resolvedspec: solved.resolvedspec,
+        adaptive_spatial_terms,
+        adaptive_spatial_center_counts,
         adaptive_diagnostics: result.adaptive_diagnostics,
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
@@ -1277,7 +1449,10 @@ fn optimize_survival_transformation_smoothing(
     // unified survival LAML, and project the gradient onto the smoothing
     // coordinates (the trailing ridge gradient component is discarded since the
     // ridge is fixed).
-    let eval_at = |rho_smooth: &Array1<f64>| -> Result<(f64, Array1<f64>), String> {
+    let eval_at = |rho_smooth: &Array1<f64>| -> Result<
+        (f64, Array1<f64>),
+        gam_solve::estimate::EstimationError,
+    > {
         if let Some((cached_rho, cached_cost, cached_grad)) = eval_cache.borrow().as_ref()
             && cached_rho == rho_smooth
         {
@@ -1290,7 +1465,9 @@ fn optimize_survival_transformation_smoothing(
         }
         candidate
             .set_penalty_lambdas(&lambdas)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| {
+                gam_solve::estimate::EstimationError::InvalidInput(error.to_string())
+            })?;
         let opts = gam_solve::pirls::WorkingModelPirlsOptions {
             max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
             convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
@@ -1309,75 +1486,55 @@ fn optimize_survival_transformation_smoothing(
             &opts,
             |_| {},
         )
-        .map_err(|err| format!("survival smoothing PIRLS failed: {err}"))?;
-        // Bad-trial semantics (gam#1123). The CLI fits the transformation
-        // survival model at the SEED λ (no outer selection) and recovers the
-        // truth; the Python path additionally runs THIS outer BFGS over ρ. The
-        // two must be one engine: the outer selector may only ever IMPROVE on the
-        // seed, and a wandering trial at a bad ρ must never abort the fit. A
-        // trial ρ is only a *valid* LAML evaluation when the constrained inner
-        // PIRLS reaches its β-optimum (the envelope theorem that makes ∂LAML/∂ρ
-        // exact requires it) AND the resulting LAML cost+gradient are finite.
-        // Every other outcome at a *trial* ρ — inner non-convergence
-        // (`MaxIterationsReached`, gradient plateaued at a pathological large λ),
-        // a failed state/LAML evaluation, or a non-finite cost/gradient on the
-        // wandering trajectory — is NOT a structural error and must NOT be
-        // surfaced to the outer optimizer as an infeasible/undefined probe
-        // (which the BFGS bridge's probe-refusal guard escalates to a FATAL
-        // RemlOptimizationFailed when the whole trial neighbourhood is
-        // infeasible). Instead, return a high FINITE cost with a zero gradient so
-        // the line search sees no descent there and backtracks toward the
-        // converged seed region. This makes the Python outer loop incapable of
-        // doing worse than the CLI's seed fit. Only a genuine *structural* setup
-        // failure (e.g. `set_penalty_lambdas`) stays fatal, since it signals a
-        // bug rather than a merely-bad smoothing value.
-        let bad_trial = |reason: &str| -> Result<(f64, Array1<f64>), String> {
-            log::info!(
-                "[OUTER #1123] survival transformation smoothing candidate ρ rejected ({reason}): \
-                 inner PIRLS status={:?} grad_norm={:.3e} iters={} — returning high finite cost so \
-                 BFGS steps away from the un-fittable region toward the converged seed",
-                summary.status,
-                summary.lastgradient_norm,
-                summary.iterations,
-            );
-            let cost = SURVIVAL_TRANSFORMATION_NONCONVERGED_TRIAL_COST;
-            let grad = Array1::zeros(num_smoothing);
-            *eval_cache.borrow_mut() = Some((rho_smooth.to_owned(), cost, grad.clone()));
-            Ok((cost, grad))
-        };
-        let inner_converged = matches!(
-            summary.status,
-            gam_solve::pirls::PirlsStatus::Converged
-                | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-        );
-        if !inner_converged {
-            return bad_trial("inner PIRLS did not converge");
+        .map_err(|error| {
+            gam_solve::estimate::EstimationError::InvalidInput(format!(
+                "survival smoothing PIRLS failed: {error}"
+            ))
+        })?;
+        // The envelope gradient exists only at a certified beta optimum. A
+        // finite exhausted state is a checkpoint, not a derivative-bearing
+        // objective sample; return typed inner non-convergence so the generic
+        // outer bridge can retreat from this rho without fabricating a cost or
+        // zero gradient.
+        if !survival_pirls_status_is_certified(summary.status) {
+            return Err(gam_solve::estimate::EstimationError::PirlsDidNotConverge {
+                max_iterations: opts.max_iterations,
+                last_change: summary.lastgradient_norm,
+            });
         }
         let beta = summary.beta.as_ref().to_owned();
-        let state = match candidate.update_state(&beta) {
-            Ok(state) => state,
-            Err(_) => return bad_trial("inner state evaluation failed"),
-        };
+        let state = candidate.update_state(&beta).map_err(|error| {
+            gam_solve::estimate::EstimationError::InvalidInput(format!(
+                "survival smoothing inner state evaluation failed: {error}"
+            ))
+        })?;
         // Active-penalty ρ over ALL active blocks (smoothing + fixed ridge), in
         // block order, as the unified survival LAML evaluator requires. The
         // candidate's λ are exactly `lambdas` (smoothing entries from the
         // proposal, ridge entries frozen), so build ρ from that vector directly.
         let full_rho = Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
-        let (cost, grad_full) =
-            match candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho) {
-                Ok(pair) => pair,
-                Err(_) => return bad_trial("LAML evaluation failed"),
-            };
+        let (cost, grad_full) = candidate
+            .unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho)
+            .map_err(|error| {
+                gam_solve::estimate::EstimationError::InvalidInput(format!(
+                    "survival smoothing LAML evaluation failed: {error}"
+                ))
+            })?;
         // Project onto the smoothing coordinates. The active-block enumeration
         // lists the smoothing blocks first (they are constructed first and the
         // ridge is appended last), so the leading `num_smoothing` gradient
         // entries are exactly ∂LAML/∂ρ_smooth with the ridge held fixed.
         if grad_full.len() < num_smoothing || !cost.is_finite() {
-            return bad_trial("LAML cost non-finite or gradient too short");
+            return Err(gam_solve::estimate::EstimationError::InvalidInput(
+                "survival smoothing LAML cost was non-finite or gradient was too short"
+                    .to_string(),
+            ));
         }
         let grad = grad_full.slice(s![..num_smoothing]).to_owned();
         if grad.iter().any(|g| !g.is_finite()) {
-            return bad_trial("LAML gradient non-finite");
+            return Err(gam_solve::estimate::EstimationError::InvalidInput(
+                "survival smoothing LAML gradient was non-finite".to_string(),
+            ));
         }
         *eval_cache.borrow_mut() = Some((rho_smooth.to_owned(), cost, grad.clone()));
         Ok((cost, grad))

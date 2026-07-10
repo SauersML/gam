@@ -114,6 +114,12 @@ pub enum SurvivalPredictError {
     /// uncertainty for non-location-scale, latent window prediction,
     /// competing-risks with `with_uncertainty`).
     UnsupportedConfiguration { reason: String },
+    /// Posterior-mean prediction requires the fitted joint coefficient
+    /// covariance in exactly the same block-concatenated coordinate system as
+    /// the saved coefficient vector. Missing, malformed, or dimensionally
+    /// incompatible covariance is an error; it must never change the requested
+    /// estimand by falling back to a plug-in surface.
+    PosteriorCovariance { reason: String },
     /// A numerical step (hazard / derivative / survival reconstruction)
     /// produced a non-finite or out-of-domain value that downstream code
     /// cannot consume.
@@ -133,6 +139,7 @@ impl std::fmt::Display for SurvivalPredictError {
             | SurvivalPredictError::MissingFitMetadata { reason }
             | SurvivalPredictError::IncompatibleSchema { reason }
             | SurvivalPredictError::UnsupportedConfiguration { reason }
+            | SurvivalPredictError::PosteriorCovariance { reason }
             | SurvivalPredictError::NumericalFailure { reason } => f.write_str(reason),
             SurvivalPredictError::ModelPayload { context, source } => {
                 write!(f, "{context}: {source}")
@@ -149,6 +156,7 @@ impl std::error::Error for SurvivalPredictError {
             | SurvivalPredictError::MissingFitMetadata { .. }
             | SurvivalPredictError::IncompatibleSchema { .. }
             | SurvivalPredictError::UnsupportedConfiguration { .. }
+            | SurvivalPredictError::PosteriorCovariance { .. }
             | SurvivalPredictError::NumericalFailure { .. } => None,
         }
     }
@@ -182,6 +190,20 @@ impl From<gam_data::DataError> for SurvivalPredictError {
     }
 }
 
+/// Statistical target returned by the survival prediction API.
+///
+/// Survival, cumulative hazard, and hazard are nonlinear in the fitted
+/// coefficients, so evaluating them at the posterior centre is not the same
+/// estimand as integrating the coefficient posterior. The default is the
+/// posterior-predictive surface. Callers that specifically need the historical
+/// coefficient-mode surface must opt in to [`Self::Plugin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurvivalPredictEstimand {
+    #[default]
+    PosteriorMean,
+    Plugin,
+}
+
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
@@ -199,6 +221,9 @@ pub struct SurvivalPredictRequest<'a> {
     /// likelihood modes return `Err` rather than silently dropping
     /// the request.
     pub with_uncertainty: bool,
+    /// Response-scale estimand. [`SurvivalPredictEstimand::PosteriorMean`] is
+    /// the default; plug-in prediction is available only as an explicit opt-in.
+    pub estimand: SurvivalPredictEstimand,
 }
 
 /// Result of [`predict_survival`].

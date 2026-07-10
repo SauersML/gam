@@ -739,7 +739,12 @@ impl SaeManifoldTerm {
         // RAW channels: `ibp_psd_majorized_hdiag` and the source-`d` clamp below do
         // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
         // un-majorized channel set.
-        let ibp_majorizer = ibp_assignment_third_channels(&self.assignment, rho, false)?;
+        let ibp_majorizer = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            false,
+            self.row_loss_weights.as_deref(),
+        )?;
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
         // output channels and identical in each: with the flat β layout
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
@@ -2463,7 +2468,12 @@ impl SaeManifoldTerm {
         //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
         //     Both pin the `U`-column convention bit-for-bit to the consumer's
         //     `ibp_logit_sites`/`row_vars_for_cache_row` slot mapping.
-        if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho, false)? {
+        if let Some(channels) = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            false,
+            self.row_loss_weights.as_deref(),
+        )? {
             let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
             for row in 0..n {
                 let start = row * k_atoms;

@@ -757,7 +757,7 @@ def periodic_spline_curve_basis(
     t : torch.Tensor of shape ``(N,)``. Values are reduced modulo 1.
     n_knots : number of cyclic control-point basis columns.
     degree : B-spline degree. Default 3.
-    penalty_order : cyclic difference penalty order. Default 2.
+    penalty_order : derivative order in the cyclic roughness. Default 2.
 
     Returns
     -------
@@ -780,7 +780,7 @@ def smoothness_penalty(
     degree: int = 3,
     order: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the B-spline difference penalty and its null-space basis.
+    """Build exact B-spline derivative roughness and its null-space basis.
 
     Forward-only: ``knots`` is structural and the result has no autograd path.
 
@@ -791,7 +791,7 @@ def smoothness_penalty(
     degree : int, optional
         Spline degree. Default ``3``.
     order : int, optional
-        Difference penalty order. Default ``2``.
+        Derivative order in ``integral (f^(order)(x))^2 dx``. Default ``2``.
 
     Returns
     -------

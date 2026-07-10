@@ -1,4 +1,5 @@
 use super::*;
+use crate::chart_coordinate_solve::PeriodicCurveExtrema;
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
@@ -12,6 +13,146 @@ const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 /// knob — it only fences the division against a vanishing denominator at f64
 /// resolution.
 const ARD_SPREAD_FLOOR: f64 = 1.0e-12;
+
+/// Squared decoder-projection loss and its exact coordinate gradient at one
+/// chart point.  `decoder` is in physical output units and paired with the
+/// evaluator's current (possibly rank-reduced) basis.
+fn decoder_projection_value_gradient(
+    evaluator: &dyn crate::basis::SaeBasisEvaluator,
+    decoder: &Array2<f64>,
+    homotopy_eta: f64,
+    target: ArrayView1<'_, f64>,
+    coordinate: ArrayView1<'_, f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    let d = coordinate.len();
+    let coords = Array2::from_shape_vec((1, d), coordinate.to_vec())
+        .map_err(|error| format!("decoder projection coordinate reshape failed: {error}"))?;
+    let evaluated = evaluator.evaluate_phi_eta(coords.view(), homotopy_eta)?;
+    if evaluated.phi.ncols() != decoder.nrows() {
+        return Err(format!(
+            "decoder projection basis width {} != decoder rows {}",
+            evaluated.phi.ncols(),
+            decoder.nrows()
+        ));
+    }
+    if decoder.ncols() != target.len() {
+        return Err(format!(
+            "decoder projection ambient width {} != target width {}",
+            decoder.ncols(),
+            target.len()
+        ));
+    }
+    let mut residual = vec![0.0_f64; target.len()];
+    let mut value = 0.0_f64;
+    for output in 0..target.len() {
+        let mut decoded = 0.0_f64;
+        for basis in 0..decoder.nrows() {
+            decoded += evaluated.phi[[0, basis]] * decoder[[basis, output]];
+        }
+        residual[output] = decoded - target[output];
+        value += residual[output] * residual[output];
+    }
+    let mut gradient = Array1::<f64>::zeros(d);
+    for axis in 0..d {
+        let mut derivative = 0.0_f64;
+        for output in 0..target.len() {
+            let mut decoded_jet = 0.0_f64;
+            for basis in 0..decoder.nrows() {
+                decoded_jet += evaluated.jet[[0, basis, axis]] * decoder[[basis, output]];
+            }
+            derivative += 2.0 * residual[output] * decoded_jet;
+        }
+        gradient[axis] = derivative;
+    }
+    Ok((value, gradient))
+}
+
+/// Refine one compact-chart projection seed to an analytically stationary
+/// point.  Every accepted step strictly lowers the true squared distance; the
+/// line search terminates only at a scale where the retraction cannot represent
+/// a distinct point, which is reported as failure unless the projected gradient
+/// already satisfies the machine-scaled stationarity certificate.
+fn refine_decoder_projection_seed(
+    evaluator: &dyn crate::basis::SaeBasisEvaluator,
+    decoder: &Array2<f64>,
+    homotopy_eta: f64,
+    manifold: &LatentManifold,
+    target: ArrayView1<'_, f64>,
+    seed: ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, f64), String> {
+    let mut coordinate = manifold.project_point(seed);
+    let (mut value, mut gradient) = decoder_projection_value_gradient(
+        evaluator,
+        decoder,
+        homotopy_eta,
+        target,
+        coordinate.view(),
+    )?;
+    let initial_gradient_norm = gradient
+        .iter()
+        .map(|entry| entry * entry)
+        .sum::<f64>()
+        .sqrt();
+    loop {
+        let negative_gradient = gradient.mapv(|entry| -entry);
+        let descent = manifold.project_to_tangent(coordinate.view(), negative_gradient.view());
+        let descent_norm = descent
+            .iter()
+            .map(|entry| entry * entry)
+            .sum::<f64>()
+            .sqrt();
+        let stationarity_tolerance =
+            f64::EPSILON.sqrt() * (1.0 + initial_gradient_norm.max(value.abs().sqrt()));
+        if descent_norm <= stationarity_tolerance {
+            return Ok((coordinate, value));
+        }
+        let direction = descent.mapv(|entry| entry / descent_norm);
+        let slope: f64 = gradient
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right)
+            .sum();
+        if !(slope < 0.0) {
+            return Err(format!(
+                "decoder projection produced a non-descent tangent direction (slope {slope})"
+            ));
+        }
+        let mut step = 1.0_f64;
+        let accepted = loop {
+            let delta = direction.mapv(|entry| step * entry);
+            let trial = manifold.retract(coordinate.view(), delta.view());
+            if trial
+                .iter()
+                .zip(coordinate.iter())
+                .all(|(&left, &right)| left == right)
+            {
+                break None;
+            }
+            let (trial_value, trial_gradient) = decoder_projection_value_gradient(
+                evaluator,
+                decoder,
+                homotopy_eta,
+                target,
+                trial.view(),
+            )?;
+            if trial_value < value {
+                break Some((trial, trial_value, trial_gradient));
+            }
+            step *= 0.5;
+            if step == 0.0 {
+                break None;
+            }
+        };
+        let Some((next_coordinate, next_value, next_gradient)) = accepted else {
+            return Err(format!(
+                "decoder projection line search stalled with projected gradient {descent_norm:e}"
+            ));
+        };
+        coordinate = next_coordinate;
+        value = next_value;
+        gradient = next_gradient;
+    }
+}
 
 /// Put one softmax-logit row in the reference-logit chart used by the joint
 /// solver. Kept row-local so Newton's disjoint row update can canonicalize in
@@ -214,12 +355,12 @@ impl SaeManifoldTerm {
                         (None, None) => true,
                         _ => false,
                     };
-                    let second_jet_matches =
-                        match (&atom.basis_second_jet, &saved.basis_second_jet) {
-                            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
-                            (None, None) => true,
-                            _ => false,
-                        };
+                    let second_jet_matches = match (&atom.basis_second_jet, &saved.basis_second_jet)
+                    {
+                        (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+                        (None, None) => true,
+                        _ => false,
+                    };
                     atom.decoder_coefficients == saved.decoder_coefficients
                         && atom.smooth_penalty == saved.smooth_penalty
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
@@ -4479,20 +4620,15 @@ impl SaeManifoldTerm {
     ///
     /// For a fixed decoder the exact out-of-sample encoding of row `i` against
     /// atom `k` is the projection
-    /// `t*_{ik} = argmin_t ‖x_i − Φ_k(t)·B_k‖²`. That objective is non-convex
-    /// on a compact latent (a trigonometric polynomial for periodic / torus
-    /// atoms, a chart function on the sphere), so the cold PCA-`atan2` seed plus
-    /// a handful of Newton steps frequently converges into the wrong basin and
-    /// mis-routes the row — the root cause of the negative-`R²`, near-uniform
-    /// assignment OOS failures. We evaluate each atom's decoder once on a dense
-    /// manifold-spanning grid (provided by the atom basis kind), take the per-row
-    /// global argmin as the coordinate seed, refresh the atom basis there, and
-    /// let the subsequent Newton refinement polish to full precision from inside
-    /// the correct basin. Because the residual-based softmax logit seed reads the
-    /// freshly decoded rows, routing then follows the true per-atom projection
-    /// error rather than the cold-seed error.
+    /// `t*_{ik} = argmin_t ‖x_i − Φ_k(t)·B_k‖²`. For a periodic curve this is a
+    /// trigonometric polynomial: every stationary coordinate is enumerated by
+    /// the shared companion-root solver and compared globally. For the other
+    /// compact charts, every topology-spanning support point is only a START for
+    /// an analytic-gradient, retraction-safeguarded continuous solve; the winner
+    /// is selected among certified stationary points, never among lattice nodes.
+    /// Thus the returned coordinate is not quantized by `resolution`.
     ///
-    /// Atoms whose basis kind exposes no projection seed grid
+    /// Atoms whose basis kind exposes no compact projection support
     /// (unbounded / basis-linear latents) are left at their incoming seed. The
     /// decoder, assignment logits, smoothness penalties and ρ are all untouched;
     /// only the latent coordinates and the basis caches that depend on them move.
@@ -4523,56 +4659,104 @@ impl SaeManifoldTerm {
         let visit_order = self.enrichment_visit_order();
         for atom_idx in 0..self.k_atoms() {
             let d = self.atoms[atom_idx].latent_dim;
-            let Some(grid) = self.atoms[atom_idx]
-                .basis_kind
-                .projection_seed_grid(d, resolution)
-            else {
-                continue;
-            };
             let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.clone() else {
                 continue;
             };
-            if grid.ncols() != d {
-                return Err(format!(
-                    "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} grid has {} columns but latent_dim is {d}",
-                    grid.ncols()
-                ));
-            }
-            let g = grid.nrows();
-            if g == 0 {
-                continue;
-            }
-            // Decode the whole grid once: `decoded = Φ(grid) · B_k`  (g × p).
-            let (phi_grid, _jet) = evaluator.evaluate(grid.view())?;
-            if phi_grid.ncols() != self.atoms[atom_idx].basis_size() {
-                return Err(format!(
-                    "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} grid Φ has {} columns but decoder expects {}",
-                    phi_grid.ncols(),
-                    self.atoms[atom_idx].basis_size()
-                ));
-            }
-            let decoded = phi_grid.dot(&self.atoms[atom_idx].decoder_coefficients);
-            // Per-row global argmin of ‖x_i − decoded_g‖² over the grid. Rows are
-            // *visited* in the enrichment order (live rows first); the projection
-            // objective for each row is unchanged, and each row is seeded exactly
-            // once, so the order is pure attention and cannot move any seed.
-            let mut seeded = Array2::<f64>::zeros((n, d));
-            for &row in &visit_order {
-                let mut best_idx = 0usize;
-                let mut best_err = f64::INFINITY;
-                for grid_idx in 0..g {
-                    let mut err = 0.0_f64;
-                    for col in 0..p {
-                        let diff = target[[row, col]] - decoded[[grid_idx, col]];
-                        err += diff * diff;
-                    }
-                    if err < best_err {
-                        best_err = err;
-                        best_idx = grid_idx;
+            let mut seeded = self.assignment.coords[atom_idx].as_matrix();
+            if matches!(
+                self.atoms[atom_idx].basis_kind,
+                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus
+            ) && d == 1
+            {
+                let mut decoder = self.atoms[atom_idx].physical_full_width_decoder();
+                let eta = self.atoms[atom_idx].homotopy_eta;
+                if eta != 1.0 {
+                    // The harmonic homotopy keeps `[1, sin θ, cos θ]` fixed and
+                    // scales harmonics h >= 2.  Folding eta into the physical
+                    // decoder preserves the standard Fourier basis required by
+                    // the companion solver.
+                    for basis in 3..decoder.nrows() {
+                        for output in 0..decoder.ncols() {
+                            decoder[[basis, output]] *= eta;
+                        }
                     }
                 }
-                for axis in 0..d {
-                    seeded[[row, axis]] = grid[[best_idx, axis]];
+                let gram = decoder.dot(&decoder.t());
+                let extrema = PeriodicCurveExtrema::from_gram(gram.view()).map_err(|error| {
+                    format!(
+                        "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx}: {error}"
+                    )
+                })?;
+                for &row in &visit_order {
+                    let linear = decoder.dot(&target.row(row));
+                    let coefficients = linear.as_slice().ok_or_else(|| {
+                        "SaeManifoldTerm::seed_coords_by_decoder_projection: Fourier coefficients are not contiguous".to_string()
+                    })?;
+                    seeded[[row, 0]] = extrema
+                        .minimize_squared_distance(coefficients)
+                        .map_err(|error| {
+                            format!(
+                                "SaeManifoldTerm::seed_coords_by_decoder_projection: row {row}, atom {atom_idx}: {error}"
+                            )
+                        })?
+                        .coordinate;
+                }
+            } else {
+                let Some(support) = self.atoms[atom_idx]
+                    .basis_kind
+                    .projection_seed_grid(d, resolution)
+                else {
+                    continue;
+                };
+                if support.ncols() != d {
+                    return Err(format!(
+                        "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} support has {} columns but latent_dim is {d}",
+                        support.ncols()
+                    ));
+                }
+                if support.nrows() == 0 {
+                    continue;
+                }
+                let amplitude = self.atoms[atom_idx].log_amplitude.exp();
+                if !amplitude.is_finite() {
+                    return Err(format!(
+                        "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} physical amplitude is not finite"
+                    ));
+                }
+                let decoder = self.atoms[atom_idx]
+                    .decoder_coefficients
+                    .mapv(|value| amplitude * value);
+                let eta = self.atoms[atom_idx].homotopy_eta;
+                let manifold = self.atoms[atom_idx].basis_kind.latent_manifold(d);
+                for &row in &visit_order {
+                    // Include the incoming coordinate first. Equal objectives
+                    // retain it, so an unidentifiable constant chart does not
+                    // acquire an arbitrary coordinate merely from support order.
+                    let (mut best_coordinate, mut best_value) = refine_decoder_projection_seed(
+                        evaluator.as_ref(),
+                        &decoder,
+                        eta,
+                        &manifold,
+                        target.row(row),
+                        seeded.row(row),
+                    )?;
+                    for seed in support.rows() {
+                        let (candidate, candidate_value) = refine_decoder_projection_seed(
+                            evaluator.as_ref(),
+                            &decoder,
+                            eta,
+                            &manifold,
+                            target.row(row),
+                            seed,
+                        )?;
+                        let comparison_tolerance =
+                            f64::EPSILON * (1.0 + best_value.abs().max(candidate_value.abs()));
+                        if candidate_value < best_value - comparison_tolerance {
+                            best_coordinate = candidate;
+                            best_value = candidate_value;
+                        }
+                    }
+                    seeded.row_mut(row).assign(&best_coordinate);
                 }
             }
             let flat = Array1::from_iter(seeded.iter().copied());
@@ -5796,9 +5980,10 @@ impl SaeManifoldTerm {
         // entry_at_rho`, outer_objective.rs): a closed-form least-squares decoder
         // refit at the current coordinates/gates (the exact data-optimal decoder for
         // the fixed chart), then a per-row coordinate re-projection onto that
-        // refreshed decoder (a Lloyd/EM step that snaps each row's latent coordinate
-        // to the nearest decoded grid point), then one more decoder refit at the
-        // re-projected coordinates.
+        // refreshed decoder (a Lloyd/EM step that globally projects each periodic
+        // coordinate through all companion roots, or continuously refines every
+        // compact-chart support seed to stationarity), then one more decoder refit
+        // at the re-projected coordinates.
         //
         // It is applied here (every joint fit) rather than only on the homotopy
         // arrival because the standard inner solve — the path the real-data fit

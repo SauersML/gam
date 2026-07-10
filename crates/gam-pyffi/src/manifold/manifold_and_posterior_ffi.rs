@@ -4615,15 +4615,11 @@ fn periodic_bspline_basis_dense_via_spec(
             "periodic B-spline domain must be a finite ordered interval; got ({left}, {right})"
         ));
     }
-    // The FFI returns only the dense basis matrix; the penalty matrix is
-    // not exposed here, so `penalty_order` does not affect the output. Use
-    // 2 (curvature/second-difference) — the same default every internal
-    // call site uses — because `validate_periodic_bspline_spec` rejects
-    // `penalty_order == 0`, which is what we used to pass and which made
-    // every `bspline_basis(..., periodic=True)` call from Python fail with
-    // "Penalty order (0) must be positive and less than the number of
-    // basis functions".
-    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, left, 2);
+    // The FFI returns only the dense value basis, but the shared periodic spec
+    // validator requires a realizable derivative order. Use curvature when
+    // the polynomial degree supports it and slope roughness otherwise.
+    let penalty_order = degree.min(2);
+    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, left, penalty_order);
     build_periodic_bspline_basis_1d(t, &spec)
         .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
 }
@@ -4809,9 +4805,7 @@ fn smoothness_penalty_impl(
             knots.len()
         ));
     }
-    let num_basis = knots.len() - degree - 1;
-    let greville = greville_abscissae(knots, degree, num_basis)?;
-    let penalty = create_difference_penalty_matrix(num_basis, order, Some(greville.view()))
+    let penalty = bspline_derivative_penalty_matrix(knots, degree, order)
         .map_err(|err| format!("failed to build smoothness penalty: {err}"))?;
     let (null_basis, _) = gam::linalg::faer_ndarray::rrqr_nullspace_basis(
         &penalty,
@@ -5605,25 +5599,6 @@ fn resolve_duchon_hybrid_config(
 
 fn column_array(values: ArrayView1<'_, f64>) -> Array2<f64> {
     values.to_owned().insert_axis(Axis(1))
-}
-
-fn greville_abscissae(
-    knots: ArrayView1<'_, f64>,
-    degree: usize,
-    num_basis: usize,
-) -> Result<Array1<f64>, String> {
-    if degree == 0 {
-        return Err("smoothness_penalty requires degree >= 1".to_string());
-    }
-    let mut out = Array1::<f64>::zeros(num_basis);
-    for i in 0..num_basis {
-        let mut acc = 0.0;
-        for j in 1..=degree {
-            acc += knots[i + j];
-        }
-        out[i] = acc / degree as f64;
-    }
-    Ok(out)
 }
 
 fn fit_with_null_space_logdet(
@@ -7300,8 +7275,8 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
 /// `sae_manifold_fit_minimal` payload — the design-A coercion that lets
 /// `sae_manifold_fit` return the pyclass with no Python dataclass (#2091).
 ///
-/// `raw_json` is the raw payload marshalled to JSON (numpy `.tolist()`-flattened
-/// via `_jsonable`, then `json.dumps`); `x` is the training matrix (for
+/// `raw_payload` is the raw Python mapping; Rust converts numpy arrays/scalars
+/// through `py_any_to_json_value` without a Python JSON/schema pass. `x` is the training matrix (for
 /// `training_mean = x.mean(0)`); the remaining args are the fit-config scalars
 /// `from_payload` receives (`assignment` already canonical). `fisher_factors`
 /// `(n, p, r)` + `fisher_provenance` are the retained output-Fisher shard
@@ -7310,21 +7285,17 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
 /// relabel (also a post-`from_payload` step). Reproduces `from_payload` ∘
 /// `to_dict` bit-for-bit for the full fit — the fit-return flip just calls this.
 ///
-/// The JSON parse rejects non-finite values exactly as `ManifoldSaeCore::new`
-/// does, so this path is NaN-consistent with the legacy reader. The raw-payload
-/// JSON marshal is a per-fit round-trip measured in milliseconds against fits
-/// that run seconds-to-hours; a direct-read variant (via `py_any_to_json_value`)
-/// is a DEFERRED-UNTIL-MEASURED follow-up — justified only if a real fit profile
-/// ever shows the marshal as a cost, which no current shape does.
+/// Non-finite values become JSON null in the Rust conversion and are then
+/// rejected when encountered in a required numeric schema field.
 #[pyfunction(signature = (
-    raw_json, x, topology_fallback, assignment, assignment_label, penalties,
+    raw_payload, x, topology_fallback, assignment, assignment_label, penalties,
     alpha, learnable_alpha, tau, sparsity_strength, smoothness, learning_rate,
     max_iter, random_state, top_k, jumprelu_threshold,
     fisher_factors=None, fisher_provenance=None, declared_bases=None
 ))]
 fn sae_manifold_core_from_fit_payload(
     py: Python<'_>,
-    raw_json: &str,
+    raw_payload: &Bound<'_, PyAny>,
     x: PyReadonlyArray2<'_, f64>,
     topology_fallback: String,
     assignment: String,
@@ -7344,11 +7315,7 @@ fn sae_manifold_core_from_fit_payload(
     fisher_provenance: Option<String>,
     declared_bases: Option<Vec<String>>,
 ) -> PyResult<Py<ManifoldSaeCore>> {
-    let raw: serde_json::Value = serde_json::from_str(raw_json).map_err(|e| {
-        py_value_error(format!(
-            "sae_manifold_core_from_fit_payload: raw payload JSON parse: {e}"
-        ))
-    })?;
+    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw_payload)?;
     let x_view = x.as_array();
     // training_mean = x.mean(axis=0) (n >= 2 in every real fit); shared reduction
     // core so the SAC lift's `sae_manifold_training_mean` uses the identical math.

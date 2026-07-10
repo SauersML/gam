@@ -8,6 +8,7 @@ pub mod basis;
 pub mod basis_gpu;
 pub mod candidate_index;
 pub mod certificate_impls;
+#[cfg(test)]
 pub mod certificates;
 pub mod chart_canonicalization;
 pub mod chart_coordinate_solve;

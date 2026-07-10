@@ -629,10 +629,12 @@ class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
       REML backward in full p-space.
     * **Active cert (non-empty active set):** the math identity is
       ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ`` with ``Z = null(A_act)``.
-      The constrained problem is reduced to the ``Z`` subspace, the same
-      closed-form backward runs on the reduced operators, and the gradients
-      are lifted back to p-space. Both certs return exact gradients;
-      ``.backward()`` no longer raises ``NotImplementedError``.
+      The core KKT adjoint retains the full affine parameterization
+      ``β = β_particular + Zγ``, including its penalty cross and constant
+      terms. Both certs return exact gradients while the active set is locally
+      constant. At a weakly-active boundary, where the derivative is genuinely
+      set-valued, Rust raises ``GradientUnavailableError`` instead of returning
+      an arbitrary side derivative.
     """
 
     @staticmethod
@@ -785,14 +787,16 @@ def gaussian_reml_fit_with_constraints(
     a_inequality: torch.Tensor | None = None,
     b_inequality: torch.Tensor | None = None,
 ) -> ConstrainedRemlOutput:
-    """Constrained Gaussian REML fit, fully differentiable.
+    """Constrained Gaussian REML fit with an analytic piecewise-smooth VJP.
 
     Routes a single-block design ``x``/penalty ``penalty`` with an optional
     linear inequality system ``A·β ≥ b`` through the same Rust active-set
     + REML driver used by the formula-API shape constraints. ``.backward()``
     returns exact analytic gradients w.r.t. ``x``, ``y``, ``penalty`` and
     ``weights`` in both the interior cert (envelope theorem in full p-space)
-    and the active cert (tangent-projected ``Z = null(A_act)`` reduction).
+    and a locally stable active cert, including nonzero affine bounds
+    ``A_act·β = b_act``. Active-set transition points are non-differentiable;
+    backward reports them with ``GradientUnavailableError``.
     """
     apply = cast(
         Callable[

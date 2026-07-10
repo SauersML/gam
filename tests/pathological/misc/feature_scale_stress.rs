@@ -12,7 +12,7 @@ use gam::basis::{
     BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
     build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    create_cyclic_difference_penalty_matrix, fit_periodic_bspline_curve,
+    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
     periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2, Axis};
@@ -171,14 +171,15 @@ fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
 }
 
 #[test]
-fn cyclic_difference_penalty_constant_in_nullspace_at_large_k() {
+fn cyclic_derivative_penalty_constant_in_nullspace_at_large_k() {
     for k in [16, 64, 256] {
-        let s = create_cyclic_difference_penalty_matrix(k, 2).expect("penalty");
+        let s = cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, 2).expect("penalty");
+        let scale = s.iter().fold(0.0_f64, |m, value| m.max(value.abs()));
         let ones = Array1::<f64>::ones(k);
         let v = s.dot(&ones);
         for i in 0..k {
             assert!(
-                v[i].abs() < 1e-10,
+                v[i].abs() < 1e-10 * scale.max(1.0),
                 "ones not in nullspace at k={k}, row {i}: {}",
                 v[i]
             );
@@ -189,7 +190,7 @@ fn cyclic_difference_penalty_constant_in_nullspace_at_large_k() {
                 let lhs = s[(i, j)];
                 let rhs = s[((i + 1) % k, (j + 1) % k)];
                 assert!(
-                    (lhs - rhs).abs() < 1e-12,
+                    (lhs - rhs).abs() < 1e-12 * scale.max(1.0),
                     "shift invariance violated at k={k}, ({i},{j})"
                 );
             }

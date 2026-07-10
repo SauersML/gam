@@ -105,6 +105,7 @@ pub(crate) fn fit_reduced_parametric_aft(
         },
         &assembly_specs,
     )
+    .map_err(String::from)
 }
 
 /// Variant that also returns the offset-channel residuals + curvatures at the

@@ -63,19 +63,3 @@ pub fn add_rho_block_dense_to_hessian(
         HessianValue::Unavailable => Ok(()),
     }
 }
-
-#[inline]
-pub(crate) fn failed_inner_residual_barrier_cost(
-    cost: f64,
-    inner_failed_max_iterations: bool,
-    relative_gradient_norm: f64,
-) -> f64 {
-    if !cost.is_finite() || !inner_failed_max_iterations {
-        return cost;
-    }
-    if relative_gradient_norm.is_finite() {
-        cost + 0.5 * relative_gradient_norm * relative_gradient_norm
-    } else {
-        f64::INFINITY
-    }
-}

@@ -215,6 +215,16 @@ pub struct StandardFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
+    /// Which resolved smooth positions originated from an auto-sized 2-D+
+    /// spatial basis. Freeze replaces center strategies with explicit center
+    /// matrices, so this provenance must travel beside the result for the
+    /// adaptive resolution loop.
+    pub adaptive_spatial_terms: Vec<bool>,
+    /// Requested (pre-freeze) center counts aligned with
+    /// `adaptive_spatial_terms`. Frozen specs store realized center matrices,
+    /// whose row count can include periodic image expansion and is therefore
+    /// not the next request size.
+    pub adaptive_spatial_center_counts: Vec<Option<usize>>,
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
     pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
     pub saved_link_state: FittedLinkState,
@@ -230,6 +240,100 @@ pub struct StandardFitResult {
     /// evaluate the warp basis at the frozen index `η̂` the fit pinned it at,
     /// rather than at the de-aliased base predictor.
     pub wiggle_saved_index_shift: Option<Vec<f64>>,
+}
+
+pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool> {
+    fn auto_spatial(basis: &gam_terms::smooth::SmoothBasisSpec) -> bool {
+        use gam_terms::smooth::SmoothBasisSpec as B;
+        match basis {
+            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
+                auto_spatial(inner)
+            }
+            B::BySmooth { smooth, .. } => auto_spatial(smooth),
+            B::ThinPlate {
+                feature_cols, spec, ..
+            } => {
+                feature_cols.len() >= 2
+                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
+            }
+            B::Duchon {
+                feature_cols, spec, ..
+            } => {
+                feature_cols.len() >= 2
+                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
+            }
+            B::Matern {
+                feature_cols, spec, ..
+            } => {
+                feature_cols.len() >= 2
+                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
+            }
+            B::ConstantCurvature { feature_cols, spec } => {
+                feature_cols.len() >= 2
+                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
+            }
+            B::MeasureJet {
+                feature_cols, spec, ..
+            } => {
+                feature_cols.len() >= 2
+                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
+            }
+            _ => false,
+        }
+    }
+
+    spec.smooth_terms
+        .iter()
+        .map(|term| auto_spatial(&term.basis))
+        .collect()
+}
+
+pub(crate) fn adaptive_spatial_center_counts(
+    spec: &TermCollectionSpec,
+) -> Vec<Option<usize>> {
+    fn center_count(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
+        use gam_terms::smooth::SmoothBasisSpec as B;
+        match basis {
+            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
+                center_count(inner)
+            }
+            B::BySmooth { smooth, .. } => center_count(smooth),
+            B::ThinPlate {
+                feature_cols, spec, ..
+            } if feature_cols.len() >= 2 => Some(
+                spec.center_strategy
+                    .planned_num_centers(feature_cols.len()),
+            ),
+            B::Duchon {
+                feature_cols, spec, ..
+            } if feature_cols.len() >= 2 => Some(
+                spec.center_strategy
+                    .planned_num_centers(feature_cols.len()),
+            ),
+            B::Matern {
+                feature_cols, spec, ..
+            } if feature_cols.len() >= 2 => Some(
+                spec.center_strategy
+                    .planned_num_centers(feature_cols.len()),
+            ),
+            B::ConstantCurvature { feature_cols, spec } if feature_cols.len() >= 2 => Some(
+                spec.center_strategy
+                    .planned_num_centers(feature_cols.len()),
+            ),
+            B::MeasureJet {
+                feature_cols, spec, ..
+            } if feature_cols.len() >= 2 => Some(
+                spec.center_strategy
+                    .planned_num_centers(feature_cols.len()),
+            ),
+            _ => None,
+        }
+    }
+
+    spec.smooth_terms
+        .iter()
+        .map(|term| center_count(&term.basis))
+        .collect()
 }
 
 pub struct SurvivalLocationScaleFitResult {
@@ -565,17 +669,12 @@ pub struct FitConfig {
     /// Low-level embedding code may disable it explicitly when it owns a
     /// stronger external checkpoint transaction.
     pub persist_warm_start_disk: bool,
-    /// Saturation-escalation level for 2-D+ spatial smooths (#1689). In-process
-    /// plumbing ONLY — never a user flag/env var: the `fit_from_formula` refit
-    /// loop sets it (0, 1, 2, …) and re-materializes, and the spatial term build
-    /// resolves each 2-D+ smooth's center count to
-    /// `gam_terms::basis::escalated_num_centers(n, d, level)` instead of the
-    /// worst-case `default_num_centers`. Level 0 is the modest mgcv-parity start;
-    /// the loop grows the level only while a fitted spatial term's edf says its
-    /// basis is saturated and its count is still below the `default_num_centers`
-    /// ceiling (so a saturated fit converges back to today's basis size — the
-    /// accuracy fixed point). Default 0 for every fit.
-    pub spatial_escalation_level: u32,
+    /// Per-smooth spatial center requests maintained by the adaptive
+    /// fit→expand→refit loop. Empty/`None` entries select the structural
+    /// identifiable start; `Some(k)` requests the next evidence-backed
+    /// resolution for that smooth only. This is in-process orchestration state,
+    /// never a user knob or environment setting.
+    pub spatial_center_counts: Vec<Option<usize>>,
 }
 
 impl Default for FitConfig {
@@ -626,7 +725,7 @@ impl Default for FitConfig {
             topology_auto_selector: None,
             smooth_overrides: None,
             persist_warm_start_disk: true,
-            spatial_escalation_level: 0,
+            spatial_center_counts: Vec::new(),
         }
     }
 }

@@ -590,8 +590,7 @@ struct ProbeConvergedHandoff {
 //
 // WHAT STAYS FULL-TOLERANCE, unconditionally: gradient evaluations at accepted
 // iterates (`eval` / `ValueAndGradient` / `ValueGradientHessian`), the
-// cross-seed ranking / EFS value lane (`eval_cost`), the post-convergence
-// certificate probes (`optimality_certificate`), the finalize re-evaluation,
+// cross-seed ranking / EFS value lane (`eval_cost`), the finalize re-evaluation,
 // and the returned fit (`into_fitted` / `fit_at_fixed_rho`). Only the
 // Armijo/Wolfe comparison probes inside the line search are ever loosened, so
 // the outer KKT test is untouched.
@@ -747,7 +746,7 @@ pub struct SaeManifoldOuterObjective {
     /// opt-in lever for the n-independent outer loop; the n-scaling timing is
     /// verified on the cluster.
     pub(crate) routing_frozen: bool,
-    /// #2080 — outer probe telemetry (criterion/FD/infeasible counts). Read via
+    /// #2080 — outer probe telemetry (criterion/infeasible counts). Read via
     /// [`Self::probe_telemetry`] after the fit for the wide-`p` acceptance test.
     pub(crate) probe_telemetry: OuterProbeTelemetry,
     /// #2138 — cooperative cancellation. When the pyffi fit driver sets this after
@@ -1038,7 +1037,7 @@ impl SaeManifoldOuterObjective {
         Ok(())
     }
 
-    /// #2080 — the accumulated outer probe telemetry (criterion/FD/infeasible
+    /// #2080 — the accumulated outer probe telemetry (criterion/infeasible
     /// evaluation counts). The wide-`p` acceptance test asserts these counts stay
     /// bounded (a PROBE-COUNT budget, per SPEC's ban on wall-clock budgets).
     pub fn probe_telemetry(&self) -> OuterProbeTelemetry {
@@ -1383,106 +1382,6 @@ impl SaeManifoldOuterObjective {
             charts_canonicalized,
             termination,
         }
-    }
-
-    /// First-order optimality certificate for this fit (#934).
-    ///
-    /// At the converged outer optimum `ρ̂` this runs the self-audit the desync
-    /// bug genus (#752/#748/#808/#901) was always diagnosed by hand: it central-
-    /// differences the criterion **value path on every outer-ρ axis** (with a
-    /// Richardson `2h` step for each FD error bar), and compares the resulting
-    /// complete numerical gradient against the production analytic gradient. The
-    /// returned [`GradientCriterionCertificate`] records whether the objective and its
-    /// analytic gradient agree *here*, on this data shape, where #901-class
-    /// desyncs actually manifest.
-    ///
-    /// The numerical secant is the *audit instrument*, not an estimator: it
-    /// only checks the production analytic gradient against the production value
-    /// path after convergence, so it is fully compatible with the
-    /// exact-REML-only policy (see `sae_optimality_certificate`). Cost is four
-    /// `4 * dim(ρ)` criterion value-path evaluations at the final point.
-    ///
-    /// The value probes are taken on a **clone of the pristine baseline term**
-    /// so the production fitted state is untouched and the value caches start
-    /// cold — they must not alias the gradient path's converged warm state,
-    /// since that aliasing is exactly what the certificate audits. Call before
-    /// [`Self::into_fitted`].
-    pub fn optimality_certificate(&mut self) -> Result<GradientCriterionCertificate, String> {
-        // #2080 (a) — this diagnostic commits its own inner solves to the
-        // accepted basin; drop any pending probe handoff.
-        self.probe_converged_handoff = None;
-        // #2230/#2087 — the ρ search is over; drop the saved basins too.
-        self.basin_bundle.clear();
-        let rho_hat_flat = self.current_rho.to_flat();
-
-        // Analytic directional derivative at ρ̂, from the production gradient
-        // path (same code the outer optimizer consumed). Re-forming the cache
-        // here re-runs the inner solve at the settled ρ — already at its
-        // optimum, so it converges immediately — and reads the exact analytic
-        // outer gradient with the third-order correction included.
-        let rho_hat = self.current_rho.clone();
-        let (_v_hat, loss_hat, cache) = self.term.reml_criterion_with_cache(
-            self.target.view(),
-            &rho_hat,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-        )?;
-        let solver = self
-            .term
-            .outer_gradient_arrow_solver(&cache, &rho_hat.lambda_smooth_vec())?;
-        let components = self.term.analytic_outer_rho_gradient_components(
-            self.target.view(),
-            &rho_hat,
-            &loss_hat,
-            &cache,
-            &solver,
-        )?;
-        let grad = components.gradient();
-
-        // Value-path probes on cold clones of the pristine baseline term: the
-        // value path must be exercised WITHOUT the gradient path's warm caches,
-        // since aliasing the two is exactly the failure the certificate audits.
-        let value_at = |axis: usize, delta: f64| -> Result<f64, String> {
-            let mut probe_term = self.baseline_term.clone();
-            let mut flat = rho_hat_flat.clone();
-            flat[axis] += delta;
-            let rho = self.baseline_rho.from_flat(flat.view());
-            let (cost, _loss) = probe_term.reml_criterion(
-                self.target.view(),
-                &rho,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            )?;
-            Ok(cost)
-        };
-        let mut samples = Vec::with_capacity(rho_hat_flat.len());
-        for axis in 0..rho_hat_flat.len() {
-            let step = probe_step_for(rho_hat_flat[axis]);
-            let plus_h = value_at(axis, step)?;
-            let minus_h = value_at(axis, -step)?;
-            let plus_2h = value_at(axis, 2.0 * step)?;
-            let minus_2h = value_at(axis, -2.0 * step)?;
-            let well_posed = plus_h.is_finite()
-                && minus_h.is_finite()
-                && plus_2h.is_finite()
-                && minus_2h.is_finite();
-            samples.push(CoordinateSamples {
-                plus_h,
-                minus_h,
-                plus_2h,
-                minus_2h,
-                step,
-                analytic: grad[axis],
-                well_posed,
-            });
-        }
-        Ok(certificate_from_samples(&samples))
     }
 
     /// Posterior shape uncertainty of the fitted atoms — per-atom decoder

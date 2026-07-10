@@ -8,7 +8,8 @@ use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use gam_runtime::resource::{
-    MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
+    Governed, MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, ResourcePolicy,
+    dense_f64_bytes, rows_for_target_bytes,
 };
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
@@ -93,6 +94,37 @@ fn dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
         op.row_chunk_into(start..end, slice)?;
     }
     Ok(out)
+}
+
+/// Fallible full materialization whose process-wide reservation lives exactly
+/// as long as the returned matrix.
+fn governed_dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
+    op: &O,
+    policy: &MaterializationPolicy,
+    context: &'static str,
+) -> Result<Governed<Array2<f64>>, MatrixMaterializationError> {
+    if !policy.allow_operator_materialization {
+        return Err(MatrixMaterializationError::Forbidden {
+            context,
+            mode: gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired,
+        });
+    }
+    let bytes = dense_f64_bytes(op.nrows(), op.ncols()).unwrap_or(usize::MAX);
+    if bytes > policy.max_single_dense_bytes {
+        return Err(MatrixMaterializationError::TooLarge {
+            context,
+            nrows: op.nrows(),
+            ncols: op.ncols(),
+            bytes,
+            limit_bytes: policy.max_single_dense_bytes,
+        });
+    }
+    let reservation = MemoryGovernor::global().try_reserve_dense_f64(
+        op.nrows(),
+        op.ncols(),
+        context,
+    )?;
+    dense_operator_to_dense_by_chunks(op).map(|matrix| reservation.bind(matrix))
 }
 
 pub fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
@@ -1034,6 +1066,17 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         dense_operator_to_dense_by_chunks(self).map(Arc::new)
     }
 
+    /// Materialize through the process-wide governor and couple the returned
+    /// matrix to its reservation. Unlike the older Arc-returning helper, this
+    /// cannot release its ledger charge while the dense allocation is live.
+    fn try_to_dense_governed_with_policy(
+        &self,
+        policy: &MaterializationPolicy,
+        context: &'static str,
+    ) -> Result<Governed<Array2<f64>>, MatrixMaterializationError> {
+        governed_dense_operator_to_dense_by_chunks(self, policy, context)
+    }
+
     /// Shared dense materialization via the required row-chunk API.
     ///
     /// This deliberately does not fall back through `to_dense()`: operator-backed
@@ -1139,22 +1182,16 @@ impl DenseDesignMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Materialized(matrix) => matrix.as_ref().clone(),
-            // Infallible-by-contract dense materialization: callers that reach
-            // `to_dense` are committed to a dense `Array2<f64>` consumer and
-            // own the memory budget. Stream row chunks directly via the
-            // operator's `row_chunk_into`, bypassing the conservative
-            // single-materialization byte cap (which only callers with a
-            // strict-operator policy actually need). Strict callers must use
-            // `try_to_dense_arc_with_policy(ctx, &analytic_operator_required())`
-            // to get refusal semantics — they explicitly opted into operator-only math.
             Self::Lazy(op) => {
+                let policy = ResourcePolicy::default_library();
+                panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
+                    "DenseDesignMatrix::to_dense",
+                    op.nrows(),
+                    op.ncols(),
+                    &policy,
+                )
+                .unwrap_or_else(|reason| std::panic::panic_any(reason));
                 dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
-                    // SAFETY: this branch is the infallible-by-contract dense
-                    // materialization noted above; the row-chunk path only
-                    // fails on operator implementation bugs (it does not
-                    // enforce a byte budget), so failure here is a hard
-                    // contract violation rather than a runtime condition.
-                    // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
                     std::panic::panic_any(format!(
                         "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
@@ -1169,22 +1206,26 @@ impl DenseDesignMatrix {
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Materialized(matrix) => Arc::clone(matrix),
-            Self::Lazy(op) => Arc::new(
-                dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
-                    // SAFETY: companion to the `to_dense` arm above — this
-                    // path is infallible-by-contract; row-chunk
-                    // materialization only fails on operator implementation
-                    // bugs, so a non-Ok result here is a hard contract
-                    // violation rather than a runtime budget issue.
-                    // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
-                    std::panic::panic_any(format!(
-                        "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
-                         operator-backed design via row chunks: {err}",
-                        op.nrows(),
-                        op.ncols(),
-                    ))
-                }),
-            ),
+            Self::Lazy(op) => {
+                let policy = ResourcePolicy::default_library();
+                panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
+                    "DenseDesignMatrix::to_dense_arc",
+                    op.nrows(),
+                    op.ncols(),
+                    &policy,
+                )
+                .unwrap_or_else(|reason| std::panic::panic_any(reason));
+                Arc::new(
+                    dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                        std::panic::panic_any(format!(
+                            "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
+                             operator-backed design via row chunks: {err}",
+                            op.nrows(),
+                            op.ncols(),
+                        ))
+                    }),
+                )
+            }
         }
     }
 
@@ -4659,6 +4700,31 @@ impl DesignMatrix {
         <Self as DenseDesignOperator>::row_chunk_into(self, rows, out)
     }
 
+    /// Fully materialize this design under the process-wide byte governor.
+    ///
+    /// The returned owner retains the RAII reservation for precisely the
+    /// matrix lifetime. A refusal is typed, happens before allocation, and is
+    /// the caller's signal to remain row-chunked or matrix-free.
+    pub fn try_to_dense_governed(
+        &self,
+        context: &'static str,
+    ) -> Result<Governed<Array2<f64>>, MatrixMaterializationError> {
+        self.try_to_dense_governed_with_policy(
+            &ResourcePolicy::default_library().material_policy(),
+            context,
+        )
+    }
+
+    /// Policy-aware form of [`Self::try_to_dense_governed`]. Structural
+    /// operator-only policies refuse before consulting or charging the ledger.
+    pub fn try_to_dense_governed_with_policy(
+        &self,
+        policy: &MaterializationPolicy,
+        context: &'static str,
+    ) -> Result<Governed<Array2<f64>>, MatrixMaterializationError> {
+        governed_dense_operator_to_dense_by_chunks(self, policy, context)
+    }
+
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
         let n = self.nrows();
         let p = self.ncols();
@@ -5424,16 +5490,16 @@ impl DesignMatrix {
                 if let Some(dense) = op.as_dense_ref() {
                     Cow::Borrowed(dense)
                 } else {
-                    // Bypass the size-capped policy guard: callers reaching
-                    // `to_dense_cow` are committing to a dense consumer.
+                    let policy = ResourcePolicy::default_library();
+                    panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
+                        "DesignMatrix::to_dense_cow",
+                        op.nrows(),
+                        op.ncols(),
+                        &policy,
+                    )
+                    .unwrap_or_else(|reason| std::panic::panic_any(reason));
                     Cow::Owned(
                         dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
-                            // SAFETY: documented bypass — callers of
-                            // `to_dense_cow` are infallible-by-contract dense
-                            // consumers; the row-chunk path has no byte cap
-                            // and only fails on operator implementation bugs,
-                            // which the operator trait contract forbids.
-                            // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
                             std::panic::panic_any(format!(
                                 "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
                                  operator-backed design via row chunks: {err}",
@@ -5461,22 +5527,10 @@ impl DesignMatrix {
 
     /// Returns the design as a contiguous `Array2<f64>`.
     ///
-    /// **Bypass contract** (regression-pinned at
-    /// `to_dense_arc_bypasses_policy_cap_strict_policy_still_refuses`): for
-    /// operator-backed dense designs this streams row chunks via the
-    /// operator's `row_chunk_into` and does NOT consult the
-    /// `ResourcePolicy::max_single_materialization_bytes` cap. A caller
-    /// reaching this method has already committed to a dense
-    /// `Array2<f64>` consumer and owns the memory budget; consulting a
-    /// conservative byte cap here would refuse legitimate workloads
-    /// (e.g. the 4194304×10 Duchon basis at large scale that
-    /// historically panicked with "refusing to densify operator-backed
-    /// design").
-    ///
-    /// Strict-operator math (`DerivativeStorageMode::AnalyticOperatorRequired`)
-    /// must instead call
-    /// `try_to_dense_arc_with_policy(ctx, &ResourcePolicy::analytic_operator_required())`,
-    /// which keeps refusal semantics intact for large-scale invariants.
+    /// Operator-backed designs consult the available-memory-derived policy
+    /// before allocating. Production code that can handle refusal must prefer
+    /// [`Self::try_to_dense_governed`], which additionally holds the
+    /// process-wide reservation for the returned matrix's whole lifetime.
     ///
     /// Sparse designs still honor their own internal
     /// `MAX_SPARSE_TO_DENSE_BYTES` cap (which is a separate hard limit
@@ -5487,11 +5541,6 @@ impl DesignMatrix {
             Self::Dense(matrix) => matrix.to_dense(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
-                // SAFETY: `to_dense` is documented as a dense-by-contract
-                // accessor (see the bypass-contract doc above). Sparse path
-                // honours `MAX_SPARSE_TO_DENSE_BYTES` internally; failure
-                // means the matrix exceeded that hard limit which callers of
-                // `to_dense` are forbidden from triggering.
                 // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
                 .unwrap_or_else(|msg| std::panic::panic_any(msg))
                 .as_ref()
@@ -5499,18 +5548,12 @@ impl DesignMatrix {
         }
     }
 
-    /// Arc-shared variant of [`Self::to_dense`]; same bypass contract for the
-    /// operator-backed dense branch (no policy guard), same sparse cap.
+    /// Arc-shared variant of [`Self::to_dense`], with the same policy guard.
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Dense(matrix) => matrix.to_dense_arc(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
-                // SAFETY: arc-shared variant of `to_dense` — same bypass
-                // contract; callers have committed to a dense consumer, so a
-                // densification failure would mean the sparse matrix exceeded
-                // `MAX_SPARSE_TO_DENSE_BYTES`, which this method's contract
-                // forbids.
                 // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
                 .unwrap_or_else(|msg| std::panic::panic_any(msg)),
         }
@@ -6502,51 +6545,38 @@ mod tests {
         }
     }
 
-    /// Regression: the original `4194304x10 (~0.31 GiB)` Duchon panic was a
-    /// policy-cap refusal inside `try_to_dense_arc_with_policy`. The infallible
-    /// entry points (`to_dense`, `to_dense_arc`, `to_dense_cow`) must bypass
-    /// that guard so callers asking for a contiguous `Array2<f64>` get one,
-    /// while strict-operator callers still see refusal through the explicit
-    /// `try_to_dense_arc_with_policy(_, &analytic_operator_required())` path.
-    /// Use a tiny operator so the contract is pinned without allocating
-    /// hundreds of MiB on CI.
+    /// The governed path couples the full allocation to its byte reservation,
+    /// while strict and undersized policies refuse before row work begins.
     #[test]
-    fn to_dense_arc_bypasses_policy_cap_strict_policy_still_refuses() {
+    fn governed_to_dense_reserves_and_policy_refusals_are_typed() {
         let op = Arc::new(ChunkOnlyOperator {
             n: 128,
             p: 4,
             row_chunk_calls: AtomicUsize::new(0),
         });
-        let design = DenseDesignMatrix::from(Arc::clone(&op));
+        let design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::clone(&op)));
 
-        // The panic-free entry points must succeed regardless of the policy cap.
-        let dense = design.to_dense_arc();
+        let dense = design
+            .try_to_dense_governed("governed dense regression")
+            .expect("small governed materialization");
         assert_eq!(dense.dim(), (128, 4));
+        assert_eq!(dense.reserved_bytes(), 128 * 4 * std::mem::size_of::<f64>());
 
-        // Strict operator-required policy still refuses on the explicit
-        // policy-aware API — large-scale invariants preserved.
-        let strict = ResourcePolicy::analytic_operator_required();
+        let strict = ResourcePolicy::analytic_operator_required().material_policy();
         let err = design
-            .try_to_dense_arc_with_policy("regression strict refuses", &strict)
+            .try_to_dense_governed_with_policy(&strict, "regression strict refuses")
             .expect_err("strict policy must refuse lazy materialization");
-        assert!(
-            err.contains("refusing to densify operator-backed design")
-                && err.contains("AnalyticOperatorRequired"),
-            "unexpected strict-policy error: {err}"
-        );
+        assert!(matches!(err, MatrixMaterializationError::Forbidden { .. }));
 
-        // Tighten the size cap below the design footprint and confirm the
-        // policy-aware API rejects on size (the contract the infallible path
-        // is documented to bypass).
-        let mut tight = ResourcePolicy::default_library();
-        tight.max_single_materialization_bytes = 1;
+        let mut tight = ResourcePolicy::default_library().material_policy();
+        tight.max_single_dense_bytes = 1;
         let size_err = design
-            .try_to_dense_arc_with_policy("regression tight refuses", &tight)
+            .try_to_dense_governed_with_policy(&tight, "regression tight refuses")
             .expect_err("undersized cap must refuse lazy materialization");
-        assert!(
-            size_err.contains("refusing to densify operator-backed design"),
-            "unexpected size-cap error: {size_err}"
-        );
+        assert!(matches!(
+            size_err,
+            MatrixMaterializationError::TooLarge { .. }
+        ));
     }
 
     #[test]

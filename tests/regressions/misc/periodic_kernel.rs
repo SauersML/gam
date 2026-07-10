@@ -3,14 +3,14 @@
 //! The pyffi binding `periodic_spline_curve_basis` is missing (see
 //! `tests/test_issue_225_periodic_spline_curve_basis.py`). The underlying
 //! Rust kernels `build_periodic_bspline_basis_1d` +
-//! `create_cyclic_difference_penalty_matrix` are what the new pyfunction
+//! `cyclic_bspline_derivative_penalty_matrix` are what the pyfunction
 //! must call. These asserts pin the contract the Python wrapper expects:
 //! correct shape, seam periodicity, partition of unity, and cyclic
-//! difference penalty with constant nullspace.
+//! exact derivative roughness with constant nullspace.
 
 use gam::terms::basis::{
     PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d,
-    create_cyclic_difference_penalty_matrix,
+    cyclic_bspline_derivative_penalty_matrix,
 };
 use ndarray::{Array1, Array2};
 
@@ -41,12 +41,13 @@ fn issue_225_periodic_basis_shape_partition_and_seam() {
 #[test]
 fn issue_225_cyclic_penalty_rank_and_nullspace() {
     let k = 12usize;
-    let s = create_cyclic_difference_penalty_matrix(k, 2).expect("cyclic penalty");
+    let s = cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, 2)
+        .expect("cyclic derivative penalty");
     assert_eq!(s.shape(), &[k, k]);
     let ones = Array2::from_elem((k, 1), 1.0);
     let p = s.dot(&ones);
     assert!(
-        p.iter().all(|v| v.abs() < 1e-12),
+        p.iter().all(|v| v.abs() < 1e-9),
         "constant vector must lie in nullspace"
     );
     for i in 0..k {

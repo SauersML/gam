@@ -475,44 +475,38 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
-/// mgcv-parity STARTING center count for saturation-escalation (#1689).
+/// Structural starting center count for saturation-driven spatial fitting.
 ///
-/// Rather than provisioning [`default_num_centers`] up-front (≈134 at n=800, d=2)
-/// and paying `O(n·k² + k³)` for the worst case on every fit, a spatial smooth is
-/// first fit at this modest count and grows [`escalated_num_centers`] ONLY when
-/// its own fitted evidence says the basis is saturated ([`basis_is_saturated`]).
-/// The start is mgcv's thin-plate/Duchon default `k = 10·3^(d−1)` (30 in 2-D) —
-/// the SAME quantity `default_duchon_center_count` already uses as its implicit
-/// low-rank cap, not a new constant — clamped so it never exceeds the ceiling on
-/// small `n` (where `default_num_centers` is already below 30).
+/// A radial basis needs enough centers to own its affine null space (`d + 1`)
+/// plus one genuinely penalizable direction. Higher-order Duchon terms raise
+/// this term-independent floor with their exact polynomial dimension during
+/// materialization. Starting at that identifiable minimum removes sample-size
+/// heuristics from the estimator: resolution is added only when a converged
+/// larger-basis fit improves the model evidence.
 pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
-    mgcv_default.min(default_num_centers(n, d)).max(1)
+    d.saturating_add(2).min(n).max(1)
 }
 
 /// Center count at escalation `level` (0 = [`starting_num_centers`]) for #1689.
 ///
-/// Geometric doubling from the start, capped at the [`default_num_centers`]
-/// ceiling. The ceiling is TODAY's provisioned count, so a fully-saturated fit
-/// escalates back to exactly the current basis size — making the current
-/// accuracy the fixed point for wiggly truths (no quality loss), while smooth
-/// truths stop at a small `level` and never pay for the dense basis. Because each
-/// step at most doubles, the number of escalations before hitting the ceiling is
-/// bounded by `⌈log₂(ceiling / start)⌉` (≈1–2 in the n≈800 regime).
+/// Geometric growth from the structural start, capped only by the observed row
+/// support. The cap is information-theoretic rather than heuristic: more than
+/// `n` selected centers cannot add a training-data direction. Resource policy
+/// independently decides whether a candidate must stay operator-backed.
 pub fn escalated_num_centers(n: usize, d: usize, level: u32) -> usize {
-    let ceiling = default_num_centers(n, d);
     let start = starting_num_centers(n, d);
     let grown = start.saturating_mul(2usize.saturating_pow(level.min(32)));
-    grown.min(ceiling).max(1)
+    grown.min(n).max(1)
 }
 
 /// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
-/// the data wants more resolution than the current `num_centers` provides (#1689)?
+/// the data wants more resolution than its realized coefficient span provides (#1689)?
 ///
-/// The penalizable capacity is `num_centers − nullspace_dim`: the unpenalized
+/// The penalizable capacity is `realized_width − nullspace_dim`: the unpenalized
 /// polynomial null space is always fully used, so it is excluded from the "is the
-/// PENALIZED part maxed out?" test. The effective degrees of freedom `edf` of the
-/// penalized block rises toward that capacity exactly as REML drives the penalty
+/// PENALIZED part maxed out?" test. The supplied `edf` is the total term EDF;
+/// subtracting `nullspace_dim` yields its penalized contribution, which rises
+/// toward that capacity exactly as REML drives the penalty
 /// λ toward its floor to chase structure the basis cannot resolve. Saturated ⟺
 /// `edf ≥ capacity − ε`, with the margin `ε` DERIVED from the outer REML
 /// convergence tolerance (`ε = capacity · outer_tol`, floored at `outer_tol` so a
@@ -525,16 +519,17 @@ pub fn escalated_num_centers(n: usize, d: usize, level: u32) -> usize {
 /// margin) is the load-bearing contract this function pins.
 pub fn basis_is_saturated(
     edf: f64,
-    num_centers: usize,
+    realized_width: usize,
     nullspace_dim: usize,
     outer_tol: f64,
 ) -> bool {
-    let capacity = num_centers.saturating_sub(nullspace_dim) as f64;
+    let capacity = realized_width.saturating_sub(nullspace_dim) as f64;
     if !(capacity > 0.0) || !edf.is_finite() {
         return false;
     }
+    let penalized_edf = (edf - nullspace_dim as f64).clamp(0.0, capacity);
     let margin = (capacity * outer_tol).max(outer_tol);
-    edf >= capacity - margin
+    penalized_edf >= capacity - margin
 }
 
 /// Resource-aware plan for a spatial smooth (Duchon / Matérn / TPS).
@@ -2247,35 +2242,27 @@ mod saturation_escalation_tests {
     use super::*;
 
     #[test]
-    fn starting_count_is_mgcv_default_capped_by_ceiling() {
-        // Large n, d=2: mgcv default 10·3^1 = 30, well below the n=800 ceiling.
-        assert_eq!(starting_num_centers(800, 2), 30);
-        // The start never exceeds the default_num_centers ceiling on small n.
-        let small = starting_num_centers(40, 2);
-        assert!(small <= default_num_centers(40, 2));
-        assert!(small >= 1);
-        // d=1: mgcv default 10.
-        assert_eq!(starting_num_centers(100_000, 1), 10);
+    fn starting_count_is_the_identifiable_affine_plus_one_floor() {
+        assert_eq!(starting_num_centers(800, 2), 4);
+        assert_eq!(starting_num_centers(100_000, 1), 3);
+        assert_eq!(starting_num_centers(3, 5), 3);
+        assert_eq!(starting_num_centers(1, 2), 1);
     }
 
     #[test]
-    fn escalation_doubles_then_pins_at_the_default_ceiling() {
+    fn escalation_doubles_then_pins_at_observed_support() {
         let n = 800;
         let d = 2;
-        let ceiling = default_num_centers(n, d);
         let start = starting_num_centers(n, d);
         assert_eq!(escalated_num_centers(n, d, 0), start);
-        // Each step at most doubles.
-        assert_eq!(escalated_num_centers(n, d, 1), (2 * start).min(ceiling));
-        // A high level saturates exactly at the ceiling — never past it, so the
-        // fully-escalated basis is byte-for-byte today's provisioned count.
-        assert_eq!(escalated_num_centers(n, d, 20), ceiling);
+        assert_eq!(escalated_num_centers(n, d, 1), 2 * start);
+        assert_eq!(escalated_num_centers(n, d, 20), n);
         // Monotone non-decreasing in level.
         let mut prev = 0;
-        for level in 0..8 {
+        for level in 0..16 {
             let k = escalated_num_centers(n, d, level);
             assert!(k >= prev);
-            assert!(k <= ceiling);
+            assert!(k <= n);
             prev = k;
         }
     }
@@ -2283,10 +2270,9 @@ mod saturation_escalation_tests {
     #[test]
     fn saturation_excludes_the_nullspace_and_tracks_edf() {
         let tol = 1e-4;
-        // edf pinned at the penalizable capacity (num_centers − nullspace) reads
-        // saturated; the null space (3 unpenalized polynomial columns in 2-D) is
-        // excluded from the capacity.
-        assert!(basis_is_saturated(97.0, 100, 3, tol));
+        // Total term EDF includes the three-dimensional nullspace. Saturation
+        // means its penalized component spends all 97 remaining directions.
+        assert!(basis_is_saturated(100.0, 100, 3, tol));
         // Half-used basis is NOT saturated.
         assert!(!basis_is_saturated(48.5, 100, 3, tol));
         // Just below capacity by more than the derived margin: not saturated.
@@ -2301,11 +2287,11 @@ mod saturation_escalation_tests {
     fn saturation_is_monotone_in_edf() {
         let tol = 1e-3;
         let (k, null) = (60usize, 3usize);
-        let capacity = (k - null) as f64;
+        let full_width = k as f64;
         // Once saturated at some edf, any larger edf stays saturated.
         let mut first_true: Option<f64> = None;
-        let mut e = capacity - 5.0;
-        while e <= capacity {
+        let mut e = full_width - 5.0;
+        while e <= full_width {
             let sat = basis_is_saturated(e, k, null, tol);
             if sat && first_true.is_none() {
                 first_true = Some(e);

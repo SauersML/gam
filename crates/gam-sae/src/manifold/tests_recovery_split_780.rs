@@ -1373,73 +1373,12 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     );
 }
 
-/// #1273/#1440 regression — the gradient lane (`eval` /
-/// `OuterEvalOrder::ValueAndGradient`) must NOT hard-abort when the
-/// gauge-deflated analytic outer gradient declines at a finite-cost ρ whose
-/// joint Hessian is near-singular-but-valid (the circle/torus topology the
-/// issue reports: a flat direction the Faddeev-Popov deflation legitimately
-/// rejects). Before #1273 the conditioning error `?`-propagated out of `eval`
-/// as `RemlOptimizationFailed` → `RemlConvergenceError`; #1273 recovered it
-/// with a central finite-difference descent of the value path, and #1440
-/// REPLACED that finite-difference instrument with the PLAIN (undeflated)
-/// analytic outer gradient of the same Laplace value. The recovery direction is
-/// now fully analytic — never a differenced value path.
-///
-/// The test exercises both halves deterministically in unit time: (1) the
-/// conditioning gate genuinely rejects a near-singular cache that no gauge/β-null
-/// deflation can recover (the bug's precondition), and (2) `eval` still returns a
-/// finite, ρ-sized `(cost, ∇f)` pair on the same objective (the analytic
-/// recovery wiring), with no regression to the well-conditioned analytic path.
+/// #1436 — the analytic derivative error taxonomy must keep internal-invariant
+/// failures distinct from genuine conditioning/non-identifiability. Every class
+/// propagates if the projected solve cannot produce a reliable derivative, but
+/// the diagnostic must remain machine-distinguishable.
 #[test]
-pub(crate) fn gradient_lane_analytic_fallback_recovers_singular_outer_gradient_1440() {
-    let objective = warmstart_test_objective();
-    // Precondition: a near-singular joint Hessian whose sub-floor pivot is NOT
-    // explained by any chart-gauge / decoder-β-null direction — so the analytic
-    // gauge-deflated outer-gradient solver REJECTS it. This is the exact
-    // condition the issue's pivot-ratio gate trips on.
-    let singular_cache = near_singular_outer_gradient_cache();
-    assert!(
-        SaeManifoldTerm::outer_gradient_conditioning_error(&singular_cache).is_err(),
-        "fixture precondition: the cache must trip the pivot-ratio floor (#1273)"
-    );
-    assert!(
-        objective
-            .term
-            .outer_gradient_arrow_solver(
-                &singular_cache,
-                &objective.current_rho.lambda_smooth_vec()
-            )
-            .is_err(),
-        "fixture precondition: the gauge-deflated analytic outer gradient must          REJECT this near-singular cache (no matching gauge/β-null to deflate)"
-    );
-
-    // The #1440 fix: at such a finite-cost ρ the gradient lane (`eval`) descends
-    // with the PLAIN analytic outer gradient instead of a finite-difference of
-    // the value path. End-to-end it must still return a finite, ρ-sized
-    // `(cost, ∇f)` — the recovery wiring shares the well-conditioned analytic
-    // path, so it must not regress it.
-    let mut objective = warmstart_test_objective();
-    let rho_flat = objective.current_rho.to_flat();
-    let eval = objective
-        .eval(&rho_flat)
-        .expect("gradient lane must return a finite (cost, gradient) pair (#1440 wiring)");
-    assert!(
-        eval.cost.is_finite()
-            && eval.gradient.len() == rho_flat.len()
-            && eval.gradient.iter().all(|g| g.is_finite()),
-        "gradient lane must yield a finite, ρ-sized outer gradient; got cost={}, grad={:?}",
-        eval.cost,
-        eval.gradient
-    );
-}
-
-/// #1436 — `OuterGradientError::InternalInvariant` must never be FD-eligible,
-/// so an internal-invariant failure propagates as a hard error instead of being
-/// silently masked by a finite-difference descent direction. This is the core
-/// acceptance criterion: shape/indexing bugs, non-finite intermediates, and
-/// violated invariants surface as failures, not plausible-but-wrong FD steps.
-#[test]
-pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
+pub(crate) fn outer_gradient_internal_invariant_is_typed_1436() {
     let ill_conditioned = OuterGradientError::IllConditioned {
         reason: "near-singular joint Hessian".to_string(),
     };
@@ -1449,77 +1388,13 @@ pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
     let internal = OuterGradientError::InternalInvariant {
         reason: "shape mismatch".to_string(),
     };
-    assert!(
-        ill_conditioned.is_conditioning_recoverable(),
-        "IllConditioned must be conditioning-recoverable (#1273)"
-    );
-    assert!(
-        non_identifiable.is_conditioning_recoverable(),
-        "NonIdentifiable must be conditioning-recoverable (#1273)"
-    );
-    assert!(
-        !internal.is_conditioning_recoverable(),
-        "InternalInvariant must NOT be conditioning-recoverable (#1436) — it must propagate"
-    );
-    // The Display output must be descriptive enough for the outer log.
+    assert!(ill_conditioned.to_string().contains("ill-conditioned"));
+    assert!(non_identifiable.to_string().contains("non-identifiable"));
     assert!(
         internal.to_string().contains("internal invariant"),
         "InternalInvariant Display must name the class; got: {}",
         internal
     );
-}
-
-/// #1436 — exercise the EXACT gate `SaeManifoldOuterObjective::eval` consults,
-/// `OuterGradientError::admits_plain_solver_fallback`, over the full `cost x error-class`
-/// matrix. `is_conditioning_recoverable` alone does not capture the cost interaction the call
-/// site depends on; this pins the composed contract so the FD fallback can never
-/// silently absorb an internal-invariant failure NOR fire at an infeasible
-/// (non-finite-cost) ρ — both must propagate as hard errors.
-#[test]
-pub(crate) fn admits_plain_solver_fallback_only_for_conditioning_at_finite_cost_1436() {
-    let ill = OuterGradientError::IllConditioned {
-        reason: "near-singular joint Hessian".to_string(),
-    };
-    let non_id = OuterGradientError::NonIdentifiable {
-        reason: "gauge-degenerate direction".to_string(),
-    };
-    let internal = OuterGradientError::InternalInvariant {
-        reason: "shape mismatch".to_string(),
-    };
-
-    // Finite cost: only the genuine #1273 conditioning/identifiability classes
-    // admit the FD descent direction.
-    assert!(
-        ill.admits_plain_solver_fallback(1.0),
-        "IllConditioned at a finite-cost ρ must admit the #1273/#1440 analytic plain-solver fallback"
-    );
-    assert!(
-        non_id.admits_plain_solver_fallback(1.0),
-        "NonIdentifiable at a finite-cost ρ must admit the #1273/#1440 analytic plain-solver fallback"
-    );
-    assert!(
-        !internal.admits_plain_solver_fallback(1.0),
-        "InternalInvariant must NEVER admit the plain-solver fallback, even at a finite \
-         cost (#1436) — it must propagate as a hard error"
-    );
-
-    // Non-finite cost (infeasible point): NOTHING admits FD, not even an
-    // otherwise-eligible conditioning failure — there is no feasible value path
-    // to descend.
-    for bad_cost in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-        assert!(
-            !ill.admits_plain_solver_fallback(bad_cost),
-            "IllConditioned must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
-        );
-        assert!(
-            !non_id.admits_plain_solver_fallback(bad_cost),
-            "NonIdentifiable must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
-        );
-        assert!(
-            !internal.admits_plain_solver_fallback(bad_cost),
-            "InternalInvariant must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
-        );
-    }
 }
 
 /// gam#577 / gam#579 root cause: the continuation pre-warm forwards an

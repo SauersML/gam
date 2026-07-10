@@ -8,6 +8,24 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 use rayon::prelude::*;
 
+fn validate_dense_surface_shape(n_rows: usize, n_columns: usize) -> Result<(), String> {
+    let cells = n_rows.checked_mul(n_columns).ok_or_else(|| {
+        format!("survival surface shape {n_rows}x{n_columns} overflows the addressable cell count")
+    })?;
+    let bytes = cells
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| {
+            format!("survival surface shape {n_rows}x{n_columns} overflows its byte count")
+        })?;
+    let cap = gam_runtime::resource::MemoryGovernor::global().single_materialization_cap_bytes();
+    if bytes > cap {
+        return Err(format!(
+            "dense survival surface {n_rows}x{n_columns} requires {bytes} bytes, exceeding the current single-materialization cap of {cap} bytes; consume survival chunks or stream CSV instead"
+        ));
+    }
+    Ok(())
+}
+
 /// Semantic kind of a saved survival surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurvivalSurfaceKind {
@@ -188,6 +206,7 @@ impl<'a> SurvivalSurface<'a> {
     pub fn interpolate(&self, query: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
         let n_rows = self.values.nrows();
         let n_query = query.len();
+        validate_dense_surface_shape(n_rows, n_query)?;
         let query_values = query.to_vec();
         let rows: Result<Vec<Vec<f64>>, String> = (0..n_rows)
             .into_par_iter()
@@ -210,6 +229,7 @@ impl<'a> SurvivalSurface<'a> {
         people_chunk: Option<usize>,
         time_chunk: Option<usize>,
     ) -> Result<Array2<f64>, String> {
+        validate_dense_surface_shape(self.values.nrows(), query.len())?;
         let chunks =
             chunk_policy.chunks(self.values.nrows(), query.len(), people_chunk, time_chunk)?;
         let mut output = Array2::<f64>::zeros((self.values.nrows(), query.len()));
@@ -243,6 +263,7 @@ pub struct SurvivalSurfaceChunkPolicy {
 pub fn failure_probability_from_survival(
     survival: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
+    validate_dense_surface_shape(survival.nrows(), survival.ncols())?;
     let values: Result<Vec<f64>, String> = survival
         .iter()
         .copied()
@@ -384,5 +405,21 @@ mod tests {
         let (people, times) = policy.resolve_shape(None, Some(8)).unwrap();
         assert_eq!(times, 8);
         assert_eq!(people, policy.target_cells() / 8);
+    }
+
+    #[test]
+    fn unsorted_saved_grid_uses_the_same_typed_interpolant() {
+        let grid = array![2.0, 0.0, 1.0];
+        let values = array![[2.0, 0.0, 1.0]];
+        let surface =
+            SurvivalSurface::new(SurvivalSurfaceKind::Hazard, grid.view(), values.view()).unwrap();
+        assert_eq!(surface.value_at(0, 0.5).unwrap(), 0.5);
+        assert_eq!(surface.value_at(0, 1.5).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn dense_shape_overflow_is_rejected_before_allocation() {
+        let error = validate_dense_surface_shape(usize::MAX, 2).unwrap_err();
+        assert!(error.contains("overflows"), "unexpected error: {error}");
     }
 }

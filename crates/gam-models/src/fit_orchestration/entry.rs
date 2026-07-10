@@ -274,17 +274,87 @@ impl ExpectileSignCycle {
     }
 }
 
-fn expectile_kkt_certified(residual: f64, bound: f64) -> bool {
-    residual.is_finite()
-        && bound.is_finite()
-        && residual >= 0.0
-        && bound >= 0.0
-        && residual <= bound
+/// Dimensionless KKT residual for the asymmetric objective at a frozen-weight
+/// WLS solution.
+///
+/// For coefficient `j`, `d_j = x_j'((w_frozen - w_target) ⊙ r)` is the
+/// gradient defect introduced by using the old residual signs.  Normalize it
+/// by `sqrt((x_j' W_audit x_j) (r' W_audit r))`, its Cauchy–Schwarz scale with
+/// `W_audit = max(W_frozen, W_target)`.  The maximum coordinate residual is
+/// invariant to response scale, column scale, and a common rescaling of prior
+/// weights; unlike a score-relative ratio, it remains meaningful when the
+/// frozen unpenalized score cancels to zero.
+fn expectile_kkt_residual(
+    design: &gam_linalg::matrix::DesignMatrix,
+    residual: ArrayView1<'_, f64>,
+    frozen_weights: ArrayView1<'_, f64>,
+    target_weights: ArrayView1<'_, f64>,
+) -> Result<f64, String> {
+    use gam_linalg::matrix::LinearOperator;
+
+    let n = design.nrows();
+    if residual.len() != n || frozen_weights.len() != n || target_weights.len() != n {
+        return Err(format!(
+            "expectile KKT dimension mismatch: design rows={n}, residual={}, frozen weights={}, \
+             target weights={}",
+            residual.len(),
+            frozen_weights.len(),
+            target_weights.len(),
+        ));
+    }
+    if residual.iter().any(|v| !v.is_finite())
+        || frozen_weights
+            .iter()
+            .chain(target_weights.iter())
+            .any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err("expectile KKT audit requires finite residuals and finite non-negative weights"
+            .to_string());
+    }
+
+    let mut row_scratch = Array1::from_shape_fn(n, |i| {
+        (frozen_weights[i] - target_weights[i]) * residual[i]
+    });
+    let defect = design.apply_transpose(&row_scratch);
+    for i in 0..n {
+        row_scratch[i] = frozen_weights[i].max(target_weights[i]);
+    }
+    let energy = (0..n)
+        .map(|i| row_scratch[i] * residual[i] * residual[i])
+        .sum::<f64>();
+    if !energy.is_finite() || energy < 0.0 {
+        return Err(format!(
+            "expectile KKT audit produced invalid residual energy {energy:?}"
+        ));
+    }
+    let gram_diag = design.diag_gram(&row_scratch)?;
+    if defect.len() != gram_diag.len()
+        || defect.iter().any(|v| !v.is_finite())
+        || gram_diag.iter().any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err("expectile KKT audit produced invalid score/Gram evidence".to_string());
+    }
+
+    let mut max_scaled = 0.0_f64;
+    for (&d, &q) in defect.iter().zip(gram_diag.iter()) {
+        let denominator_squared = q * energy;
+        let scaled = if denominator_squared > 0.0 {
+            d.abs() / denominator_squared.sqrt()
+        } else if d == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+        max_scaled = max_scaled.max(scaled);
+    }
+    Ok(max_scaled)
 }
 
 #[cfg(test)]
 mod expectile_convergence_tests {
-    use super::{ExpectileSignCycle, expectile_kkt_certified};
+    use super::{ExpectileSignCycle, expectile_kkt_residual};
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use ndarray::array;
 
     #[test]
     fn brent_detector_finds_fixed_sign_state() {
@@ -314,14 +384,47 @@ mod expectile_convergence_tests {
     }
 
     #[test]
-    fn kkt_gate_never_certifies_non_finite_or_over_bound_residual() {
-        assert!(expectile_kkt_certified(0.0, 0.0));
-        assert!(expectile_kkt_certified(1.0e-9, 1.0e-8));
-        assert!(!expectile_kkt_certified(1.0e-7, 1.0e-8));
-        assert!(!expectile_kkt_certified(-1.0, 1.0));
-        assert!(!expectile_kkt_certified(0.0, -1.0));
-        assert!(!expectile_kkt_certified(f64::NAN, 1.0));
-        assert!(!expectile_kkt_certified(0.0, f64::NAN));
+    fn normalized_kkt_residual_handles_a_cancelling_frozen_score() {
+        let design = DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [1.0]]));
+        // The frozen intercept score is exactly zero. A score-relative ratio
+        // would divide the tiny target defect by itself and report O(1); the
+        // Cauchy–Schwarz normalization correctly recognizes a near-tie.
+        let residual = array![-1.0, 1.0];
+        let frozen = array![1.0, 1.0];
+        let target = array![1.0, 1.0 + 1.0e-12];
+        let kkt = expectile_kkt_residual(
+            &design,
+            residual.view(),
+            frozen.view(),
+            target.view(),
+        )
+        .expect("finite KKT audit");
+        assert!(kkt < 1.0e-10, "normalized residual was {kkt:.3e}");
+    }
+
+    #[test]
+    fn normalized_kkt_residual_is_column_and_weight_scale_invariant() {
+        let residual = array![-2.0, 1.0, 1.0];
+        let frozen = array![1.0, 1.0, 1.0];
+        let target = array![1.0, 1.25, 0.75];
+        let x = array![[1.0], [2.0], [-1.0]];
+        let base = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
+        let scaled = DesignMatrix::Dense(DenseDesignMatrix::from(x * 1.0e6));
+        let base_kkt = expectile_kkt_residual(
+            &base,
+            residual.view(),
+            frozen.view(),
+            target.view(),
+        )
+        .expect("base KKT audit");
+        let scaled_kkt = expectile_kkt_residual(
+            &scaled,
+            residual.view(),
+            (frozen.clone() * 1.0e4).view(),
+            (target.clone() * 1.0e4).view(),
+        )
+        .expect("scaled KKT audit");
+        assert!((base_kkt - scaled_kkt).abs() <= f64::EPSILON.sqrt());
     }
 }
 
@@ -424,6 +527,8 @@ fn constant_gaussian_standard_fit(
         fit,
         design,
         resolvedspec,
+        adaptive_spatial_terms: adaptive_spatial_term_mask(&request.spec),
+        adaptive_spatial_center_counts: adaptive_spatial_center_counts(&request.spec),
         adaptive_diagnostics: None,
         kappa_timing: None,
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
@@ -473,10 +578,206 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
-    let config = config
+    let mut config = config
         .clone()
         .resolve()
         .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+    let mut current = fit_from_formula_once_with_notes(formula, data, &config)?;
+    let mut rejected = Vec::<bool>::new();
+
+    loop {
+        let Some(current_standard) = standard_result(&current) else {
+            return Ok(current);
+        };
+        certify_adaptive_spatial_fit(current_standard)?;
+        let candidates = adaptive_spatial_candidates(current_standard, data.values.nrows())?;
+        if candidates.is_empty() {
+            return Ok(current);
+        }
+        if rejected.len() != candidates.term_count {
+            rejected = vec![false; candidates.term_count];
+        }
+
+        let mut accepted = false;
+        for candidate in candidates
+            .terms
+            .iter()
+            .filter(|candidate| !rejected[candidate.term_index])
+        {
+            let mut candidate_config = config.clone();
+            if candidate_config.spatial_center_counts.len() < candidates.term_count {
+                candidate_config
+                    .spatial_center_counts
+                    .resize(candidates.term_count, None);
+            }
+            candidate_config.spatial_center_counts[candidate.term_index] =
+                Some(candidate.proposed_centers);
+            let candidate_outcome = fit_from_formula_once_with_notes(
+                formula,
+                data,
+                &candidate_config,
+            )
+            .map_err(|error| WorkflowError::SpatialUnderresolved {
+                term: candidate.term_name.clone(),
+                current_centers: candidate.current_centers,
+                attempted_centers: candidate.proposed_centers,
+                reason: error.to_string(),
+            })?;
+            let Some(candidate_standard) = standard_result(&candidate_outcome) else {
+                return Err(WorkflowError::SpatialUnderresolved {
+                    term: candidate.term_name.clone(),
+                    current_centers: candidate.current_centers,
+                    attempted_centers: candidate.proposed_centers,
+                    reason: "the certification refit changed estimator representation"
+                        .to_string(),
+                });
+            };
+            certify_adaptive_spatial_fit(candidate_standard)?;
+
+            // Both sides are fully converged REML/LAML optima. A strictly lower
+            // criterion is direct evidence that the smaller function space was
+            // under-resolved; no tuned EDF fraction or sample-size cutoff enters
+            // the decision. If the larger span cannot improve the criterion,
+            // the current term is certified unsaturated at its smaller size.
+            if candidate_standard.fit.reml_score < current_standard.fit.reml_score {
+                config = candidate_config;
+                current = candidate_outcome;
+                rejected.fill(false);
+                accepted = true;
+                break;
+            }
+            rejected[candidate.term_index] = true;
+        }
+
+        if !accepted {
+            return Ok(current);
+        }
+    }
+}
+
+struct AdaptiveSpatialCandidates {
+    term_count: usize,
+    terms: Vec<AdaptiveSpatialCandidate>,
+}
+
+impl AdaptiveSpatialCandidates {
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+}
+
+struct AdaptiveSpatialCandidate {
+    term_index: usize,
+    term_name: String,
+    current_centers: usize,
+    proposed_centers: usize,
+    edf_saturated: bool,
+}
+
+fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
+    match &outcome.result {
+        FitResult::Standard(result) => Some(result),
+        _ => None,
+    }
+}
+
+fn certify_adaptive_spatial_fit(result: &StandardFitResult) -> Result<(), WorkflowError> {
+    let criterion_certifies = result
+        .fit
+        .artifacts
+        .criterion_certificate
+        .as_ref()
+        .is_none_or(|certificate| certificate.certifies());
+    if result.fit.outer_converged
+        && result.fit.pirls_status.is_converged()
+        && criterion_certifies
+    {
+        return Ok(());
+    }
+    Err(WorkflowError::IntegrationFailed {
+        reason: format!(
+            "adaptive spatial resolution requires a fully certified fit before comparing \
+             function spaces (outer_converged={}, pirls_status={:?}, criterion_certifies={})",
+            result.fit.outer_converged, result.fit.pirls_status, criterion_certifies
+        ),
+    })
+}
+
+fn adaptive_spatial_candidates(
+    result: &StandardFitResult,
+    n_rows: usize,
+) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
+    let term_count = result.resolvedspec.smooth_terms.len();
+    if result.adaptive_spatial_terms.len() != term_count
+        || result.adaptive_spatial_center_counts.len() != term_count
+        || result.design.smooth.terms.len() != term_count
+    {
+        return Err(WorkflowError::IntegrationFailed {
+            reason: format!(
+                "adaptive spatial provenance mismatch: resolved terms={term_count}, mask={}, \
+                 requested counts={}, realized terms={}",
+                result.adaptive_spatial_terms.len(),
+                result.adaptive_spatial_center_counts.len(),
+                result.design.smooth.terms.len(),
+            ),
+        });
+    }
+
+    let smooth_offset = result
+        .design
+        .design
+        .ncols()
+        .saturating_sub(result.design.smooth.total_smooth_cols());
+    let mut penalty_cursor = result.design.leading_penalty_blocks_before_smooth();
+    let mut candidates = Vec::new();
+    for term_index in 0..term_count {
+        let realized = &result.design.smooth.terms[term_index];
+        let penalty_count = realized.penalties_local.len();
+        if result.adaptive_spatial_terms[term_index]
+            && let Some(current_centers) =
+                result.adaptive_spatial_center_counts[term_index]
+            && current_centers < n_rows
+        {
+            let global_range = (smooth_offset + realized.coeff_range.start)
+                ..(smooth_offset + realized.coeff_range.end);
+            let edf = result
+                .fit
+                .per_term_edf(global_range, penalty_cursor, penalty_count);
+            let nullspace_dim = realized.wald_unpenalized_dim();
+            let edf_saturated = gam_terms::basis::basis_is_saturated(
+                edf,
+                realized.coeff_range.len(),
+                nullspace_dim,
+                f64::EPSILON.sqrt(),
+            );
+            let proposed_centers = current_centers.saturating_mul(2).min(n_rows);
+            if proposed_centers > current_centers {
+                candidates.push(AdaptiveSpatialCandidate {
+                    term_index,
+                    term_name: result.resolvedspec.smooth_terms[term_index].name.clone(),
+                    current_centers,
+                    proposed_centers,
+                    edf_saturated,
+                });
+            }
+        }
+        penalty_cursor = penalty_cursor.saturating_add(penalty_count);
+    }
+    // EDF-at-capacity is useful scheduling evidence, but never the acceptance
+    // rule: every candidate still has to improve the converged REML/LAML
+    // criterion. Stable index order makes the adaptive path deterministic.
+    candidates.sort_by_key(|candidate| (!candidate.edf_saturated, candidate.term_index));
+    Ok(AdaptiveSpatialCandidates {
+        term_count,
+        terms: candidates,
+    })
+}
+
+fn fit_from_formula_once_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
     // Expectile regression (Newey–Powell asymmetric least squares): when the
     // family resolves to "expectile", the τ-expectile of `y | x` is the
     // minimizer of `Σ wᵢ(τ)·(yᵢ − μᵢ)²`, `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`
@@ -693,8 +994,8 @@ fn fit_expectile_laws(
     // proves recurrence using one O(n) sign checkpoint; no iteration-count
     // multiple of the training data is retained.
     let mut sign_cycle = ExpectileSignCycle::default();
-    // Evidence for the typed exhaustion error: (kkt residual, kkt scale) of the
-    // final uncertified iterate.
+    // Evidence for the typed exhaustion error: (dimensionless KKT residual,
+    // configured KKT bound) of the final uncertified iterate.
     let mut last_kkt = (f64::NAN, f64::NAN);
     let mut last_rho_checkpoint = Vec::new();
 
@@ -711,8 +1012,6 @@ fn fit_expectile_laws(
             ),
         });
     }
-
-    let inf_norm = |v: &Array1<f64>| v.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
 
     for iteration in 1..=max_laws_iters {
         let request = StandardFitRequest {
@@ -734,12 +1033,8 @@ fn fit_expectile_laws(
         };
         let result = fit_standard_model(request)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
-        let inner_certified = result.fit.outer_converged
-            && matches!(
-                result.fit.pirls_status,
-                gam_solve::pirls::PirlsStatus::Converged
-                    | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-            );
+        let inner_certified =
+            result.fit.outer_converged && result.fit.pirls_status.is_converged();
         if !inner_certified {
             return Err(WorkflowError::IntegrationFailed {
                 reason: format!(
@@ -783,51 +1078,29 @@ fn fit_expectile_laws(
         // of the FROZEN-weight problem, Xᵀ(w_used ∘ r) = S_λ β, hence
         //   ∇J(β)/2 = Xᵀ((w_used − w_new) ∘ r),
         // supported exactly on rows whose residual sign disagrees with the
-        // pattern the weights were frozen at. Scaling by the stationarity
-        // balance ‖Xᵀ(w ∘ r)‖∞ makes the residual dimensionless: it is 0 at
-        // the exact LAWS fixed point and below tolerance precisely when the
-        // only unstabilized rows sit (numerically) on the fitted surface —
-        // the equal-objective tie oscillation, now certified instead of
-        // assumed benign.
+        // pattern the weights were frozen at. The production audit normalizes
+        // each coefficient defect by its Cauchy–Schwarz score scale, making the
+        // result invariant to column, response, and prior-weight scale while
+        // remaining defined when an unpenalized frozen score cancels to zero.
         let residual = &y - &mu_off;
-        let frozen_score = result
-            .design
-            .design
-            .apply_transpose(&(&weights * &residual));
-        let expectile_score = result
-            .design
-            .design
-            .apply_transpose(&(&next_weights * &residual));
-        if frozen_score
-            .iter()
-            .chain(expectile_score.iter())
-            .any(|v| !v.is_finite())
-        {
-            return Err(WorkflowError::IntegrationFailed {
-                reason: format!(
-                    "expectile LAWS KKT audit produced a non-finite score \
-                     (iteration={iteration}, rho_checkpoint={:?})",
-                    result.fit.log_lambdas.to_vec(),
-                ),
-            });
-        }
-        let kkt = inf_norm(&(&frozen_score - &expectile_score));
-        let scale = inf_norm(&frozen_score).max(inf_norm(&expectile_score));
-        let kkt_bound = options.tol * scale;
-        if !(kkt.is_finite() && kkt_bound.is_finite()) {
-            return Err(WorkflowError::IntegrationFailed {
-                reason: format!(
-                    "expectile LAWS KKT audit produced non-finite evidence \
-                     (iteration={iteration}, residual={kkt:?}, bound={kkt_bound:?}, \
-                     rho_checkpoint={:?})",
-                    result.fit.log_lambdas.to_vec(),
-                ),
-            });
-        }
-        if expectile_kkt_certified(kkt, kkt_bound) {
+        let kkt = expectile_kkt_residual(
+            &result.design.design,
+            residual.view(),
+            weights.view(),
+            next_weights.view(),
+        )
+        .map_err(|reason| WorkflowError::IntegrationFailed {
+            reason: format!(
+                "expectile LAWS KKT audit failed at iteration {iteration} \
+                 (rho_checkpoint={:?}): {reason}",
+                result.fit.log_lambdas.to_vec(),
+            ),
+        })?;
+        let kkt_bound = options.tol;
+        if kkt <= kkt_bound {
             return Ok(result);
         }
-        last_kkt = (kkt, scale);
+        last_kkt = (kkt, kkt_bound);
         last_rho_checkpoint = result.fit.log_lambdas.to_vec();
         if let Some(cycle_length) = sign_cycle.observe(&sign) {
             return Err(WorkflowError::IntegrationFailed {
@@ -855,7 +1128,7 @@ fn fit_expectile_laws(
              rho_checkpoint={last_rho_checkpoint:?}); the iteration cap \
              never selects the estimator — non-convergence is a typed error",
             last_kkt.0,
-            options.tol * last_kkt.1,
+            last_kkt.1,
         ),
     })
 }

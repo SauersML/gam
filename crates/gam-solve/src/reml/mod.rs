@@ -334,6 +334,7 @@ mod tests {
         DirectionalHyperParam, EvalCacheManager, EvalShared, HyperDesignDerivative,
         HyperPenaltyDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
     };
+    use super::atoms::CriterionAtom;
     use crate::estimate::EstimationError;
     use gam_linalg::faer_ndarray::FaerCholesky;
     use gam_linalg::matrix::symmetrize_in_place;
@@ -710,6 +711,58 @@ mod tests {
             state.analytic_outer_hessian_enabled(),
             "small Firth rescue fits should keep exact TK Hessian curvature"
         );
+    }
+
+    #[test]
+    fn nonlogit_firth_keeps_tk_value_and_gradient() {
+        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.3],
+            [1.0, -0.7, -0.2],
+            [1.0, -0.3, 0.4],
+            [1.0, 0.0, -0.5],
+            [1.0, 0.2, 0.6],
+            [1.0, 0.6, -0.4],
+            [1.0, 0.9, 0.2],
+            [1.0, 1.3, -0.1],
+        ];
+        let s = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7]];
+        let rho = array![0.15];
+
+        for link in [StandardLink::Probit, StandardLink::CLogLog] {
+            let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(link),
+            ));
+            let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
+            let state = build_logit_state(&y, &w, &x, &s, &cfg);
+            assert!(
+                !state.analytic_outer_hessian_enabled(),
+                "{link:?} should use BFGS curvature until exact f_obs is available"
+            );
+
+            let bundle = state.obtain_eval_bundle(&rho).expect("non-logit Firth bundle");
+            let atom = state
+                .tierney_kadane_terms(
+                    &rho,
+                    &bundle,
+                    super::reml_outer_engine::EvalMode::ValueAndGradient,
+                    &[],
+                )
+                .expect("non-logit TK correction");
+            let value = CriterionAtom::value(&atom);
+            let gradient = atom.gradient().expect("TK gradient");
+            assert!(
+                value.is_finite() && value.abs() > 1e-12,
+                "{link:?} must receive a material finite TK correction, got {value}"
+            );
+            assert_eq!(gradient.len(), rho.len());
+            assert!(
+                gradient.iter().all(|entry| entry.is_finite()),
+                "{link:?} TK gradient must be finite: {gradient:?}"
+            );
+        }
     }
 
     pub(crate) fn poisson_log_glm_spec() -> GlmLikelihoodSpec {

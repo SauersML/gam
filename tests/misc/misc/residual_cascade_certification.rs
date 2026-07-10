@@ -25,8 +25,8 @@
 //!   certificates.
 
 use gam::solver::residual_cascade::{
-    LogdetMethod, ResidualCascadeDesign, ResidualCascadeFit, ResidualCascadeState,
-    fit_residual_cascade,
+    LogdetMethod, ResidualCascadeDesign, ResidualCascadeError, ResidualCascadeFit,
+    ResidualCascadeState, fit_residual_cascade,
 };
 
 /// SplitMix64 — deterministic test stream, no external RNG dependency.
@@ -310,8 +310,8 @@ fn cascade_recovers_planted_smooth() {
     );
     let refinement = fit.refinement.as_ref().expect("refinement certificate");
     assert!(
-        refinement.exhausted || refinement.next_level_gain_bound <= refinement.tolerance,
-        "refinement neither converged nor exhausted: bound {} tol {}",
+        refinement.next_level_gain_bound <= refinement.tolerance,
+        "returned fit has an uncertified refinement bound: bound {} tol {}",
         refinement.next_level_gain_bound,
         refinement.tolerance
     );
@@ -1015,14 +1015,12 @@ fn gap_bridges_without_sagging_and_variance_grows() {
 /// the `INITIAL_LEVELS` nets can resolve — must FORCE the magic-default
 /// refinement loop to add levels past `INITIAL_LEVELS = 3`, and the loop must
 /// terminate with the exact level-(L+1) gain bound as an HONEST upper bound on
-/// the remaining penalized-objective decrease: either the bound is certified
-/// below its tolerance (the discretization bias is provably spent), or the net /
-/// `MAX_LEVELS` cap is reached and the certificate reports `exhausted` with a
-/// finite bound that bounds the unresolved tail. Either way the recovered fit's
-/// in-domain error must be consistent with that certified residual — the
+/// the remaining penalized-objective decrease. A returned fit's bound must be
+/// certified below its tolerance, proving the discretization bias is spent;
+/// structural exhaustion is a typed error, not an accepted fit. The recovered
+/// fit's in-domain error must be consistent with that certified residual — the
 /// certificate is the instrument that detects "adding a level still moves the
-/// functional", exactly as the spec requires (same certified-or-fallback
-/// discipline as radial_profile / the GL ladder).
+/// functional", exactly as the spec requires.
 #[test]
 fn smoothness_ceiling_forces_refinement_and_certifies_residual_bias() {
     // Four full cycles per axis: the level-0..2 nets (covering radius h0·2^-l
@@ -1059,7 +1057,8 @@ fn smoothness_ceiling_forces_refinement_and_certifies_residual_bias() {
 
     // The terminating certificate is an honest bound on the residual movement:
     // a non-negative, finite level-(L+1) gain bound compared against its own
-    // tolerance. Converged ⇒ bound ≤ tol; capped ⇒ exhausted flag set.
+    // tolerance. Returning a fit requires bound ≤ tolerance; capacity exhaustion
+    // is reported as `ResidualCascadeError::Underresolved` instead.
     let cert = fit.refinement.as_ref().expect("refinement certificate");
     assert!(
         cert.next_level_gain_bound.is_finite() && cert.next_level_gain_bound >= 0.0,
@@ -1067,25 +1066,14 @@ fn smoothness_ceiling_forces_refinement_and_certifies_residual_bias() {
         cert.next_level_gain_bound
     );
     assert!(cert.tolerance.is_finite() && cert.tolerance > 0.0);
-    if cert.exhausted {
-        // Capped before the bound passed: the certificate must still bound the
-        // unresolved tail relative to the penalized residual it was scaled by.
-        assert!(
-            cert.next_level_gain_bound <= fit.rss_pen,
-            "exhausted refinement reports a gain bound exceeding the penalized residual: {} vs {}",
-            cert.next_level_gain_bound,
-            fit.rss_pen
-        );
-    } else {
-        // Converged: one more level provably cannot move the objective by more
-        // than the tolerance — the discretization bias is certified spent.
-        assert!(
-            cert.next_level_gain_bound <= cert.tolerance,
-            "refinement claimed convergence but the gain bound exceeds tolerance: {} vs {}",
-            cert.next_level_gain_bound,
-            cert.tolerance
-        );
-    }
+    // One more level provably cannot move the objective by more than the
+    // tolerance — the discretization bias is certified spent.
+    assert!(
+        cert.next_level_gain_bound <= cert.tolerance,
+        "returned fit has an uncertified refinement bound: {} vs {}",
+        cert.next_level_gain_bound,
+        cert.tolerance
+    );
 
     // The certified fit recovers the high-frequency surface on held-out truth:
     // once refinement has run, the frame resolves the planted structure rather
@@ -1151,16 +1139,13 @@ fn quasi_uniformity_guard_rejects_degenerate_metric_keeps_benign() {
          aspect_ratio={}",
         design_bad.metric_scaled_aspect_ratio()
     );
-    // The full magic-default fit refuses the degenerate metric with the guard
-    // message (the auto-route reads this as "fall back to dense").
-    let err = match fit_residual_cascade(&xs, &y, &w, &collapse, 2.0) {
+    // The full magic-default fit refuses the degenerate metric with the typed
+    // computation failure that the auto-route reads as "fall back to dense".
+    match fit_residual_cascade(&xs, &y, &w, &collapse, 2.0) {
         Ok(_) => panic!("degenerate metric must be refused by the quasi-uniformity guard"),
-        Err(e) => e,
-    };
-    assert!(
-        err.contains("quasi-uniformity"),
-        "expected the quasi-uniformity guard to reject, got: {err}"
-    );
+        Err(ResidualCascadeError::Computation(_)) => {}
+        Err(err) => panic!("expected quasi-uniformity computation failure, got: {err}"),
+    }
 }
 
 /// Persistence round-trip (#1032 solver prerequisite): `to_state` → JSON →

@@ -711,6 +711,7 @@ pub fn fit_penalized_multinomial(
             // reference-symmetric Centered metric requires (shared λ). The
             // Centered engine path + its invariance proof land first.
             class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+            resume_from: None,
         },
         &likelihood,
         "fit_penalized_multinomial",
@@ -3612,6 +3613,7 @@ mod fisher_override_tests {
                 max_iter: 1,
                 tol: 1.0e-9,
                 class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Centered,
+                resume_from: None,
             },
             &likelihood,
             "multinomial scaled-curvature first-step test",
@@ -3627,6 +3629,7 @@ mod fisher_override_tests {
                 max_iter: 1,
                 tol: 1.0e-9,
                 class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Centered,
+                resume_from: None,
             },
             &likelihood,
             "multinomial analytic-curvature first-step test",

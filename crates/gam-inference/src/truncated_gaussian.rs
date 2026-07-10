@@ -47,12 +47,21 @@
 //! # Whitening
 //!
 //! With `H = L Lᵀ` (lower Cholesky) the target covariance is
-//! `Σ = φ·H⁻¹ = (√φ·L⁻ᵀ)(√φ·L⁻ᵀ)ᵀ`, so `β = mode + √φ·L⁻ᵀ z` maps
-//! `z ~ N(0, I)` to `β ~ N(mode, Σ)`. The constraint `A β ≥ b` becomes
-//! `F z + g ≥ 0` with `Fᵢ = √φ·L⁻¹ aᵢ` (forward solve) and `gᵢ = aᵢᵀ mode − bᵢ`.
-//! The mode is feasible by construction, so `g ≥ 0` and `z = 0` is a valid
-//! start; active constraints have `gᵢ = 0` (the particle starts on that wall
-//! and the bounce logic launches it inward).
+//! `Σ = φ·H⁻¹ = (√φ·L⁻ᵀ)(√φ·L⁻ᵀ)ᵀ`, so `β = center + √φ·L⁻ᵀ z` maps
+//! `z ~ N(0, I)` to `β ~ N(center, Σ)`. The constraint `A β ≥ b` becomes
+//! `F z + g ≥ 0` with `Fᵢ = √φ·L⁻¹ aᵢ` (forward solve) and
+//! `gᵢ = aᵢᵀ center − bᵢ`.
+//!
+//! `center` is the UNCONSTRAINED Gaussian center of the local quadratic — a
+//! truncated Gaussian stays centred at its pre-truncation mean, and that mean
+//! is not the boundary KKT mode (#2245 finding 20: centring `N(0,1)·1{β≥0}`
+//! at a boundary mode of a `N(−1,1)` quadratic reports the half-normal mean
+//! `0.798` where the true truncated mean is `0.525`). The center may be
+//! infeasible (`g` can be negative); each chain instead starts from the
+//! caller-supplied feasible point (the constrained mode), whose whitened
+//! image `z₀ = (1/√φ)·Lᵀ·(start − center)` satisfies every wall, with active
+//! constraints sitting ON their wall (the bounce logic launches the particle
+//! inward).
 
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -82,18 +91,28 @@ const WALL_SLACK_EPS: f64 = 1e-9;
 /// position — never an out-of-bounds draw.
 const MAX_BOUNCES_BASE: usize = 256;
 
-/// Draw `n_samples · n_chains` posterior samples of `β ~ N(mode, φ·H⁻¹)`
+/// Draw `n_samples · n_chains` posterior samples of `β ~ N(center, φ·H⁻¹)`
 /// truncated to `{β : A β ≥ b}`, returned as a `(n_total, p)` matrix in the
-/// same coefficient coordinate system as `mode` / `penalized_hessian` / `A`.
+/// same coefficient coordinate system as `center` / `penalized_hessian` / `A`.
 ///
-/// * `mode` — the constrained fit's coefficient vector (feasible: `A·mode ≥ b`).
+/// * `center` — the UNCONSTRAINED Gaussian center of the local quadratic
+///   (`H⁻¹X′Wz` at the converged working state). A Gaussian truncated to a
+///   feasible set stays centred at its pre-truncation mean; the boundary KKT
+///   mode is NOT that mean, and centring there samples a different law
+///   (half-normal instead of the correct boundary-truncated Gaussian — #2245
+///   finding 20). May be infeasible; only the start point must be feasible.
+/// * `feasible_start` — a feasible point (`A·start ≥ b`, up to numeric
+///   slack), normally the constrained fit's KKT mode. Used only to seed each
+///   reflective chain.
 /// * `penalized_hessian` — the *unscaled* penalised Hessian `H` (no φ).
 /// * `sqrt_phi` — `√φ` (dispersion square root); `1.0` for fixed-scale
 ///   families (Binomial / Poisson). Scales the posterior covariance to
 ///   `φ·H⁻¹`, exactly as [`crate::sample::laplace_gaussian_fallback`].
 /// * `constraints` — `A` (`m × p`) and `b` (`m`), meaning `A β ≥ b`.
+#[allow(clippy::too_many_arguments)]
 pub fn sample_truncated_gaussian_posterior(
-    mode: &Array1<f64>,
+    center: &Array1<f64>,
+    feasible_start: &Array1<f64>,
     penalized_hessian: &Array2<f64>,
     sqrt_phi: f64,
     constraints: &LinearInequalityConstraints,
@@ -101,7 +120,13 @@ pub fn sample_truncated_gaussian_posterior(
     n_chains: usize,
     seed: u64,
 ) -> Result<Array2<f64>, String> {
-    let p = mode.len();
+    let p = center.len();
+    if feasible_start.len() != p {
+        return Err(format!(
+            "truncated-Gaussian posterior: start point has {} coefficients, expected {p}",
+            feasible_start.len(),
+        ));
+    }
     if p == 0 {
         return Err(
             "truncated-Gaussian posterior: cannot sample from an empty coefficient vector"
@@ -146,9 +171,11 @@ pub fn sample_truncated_gaussian_posterior(
         })?;
     let l = chol.lower_triangular();
 
-    // Whitened constraint rows Fᵢ = √φ · L⁻¹ aᵢ and slacks gᵢ = aᵢᵀ mode − bᵢ.
-    // `F` is `m × p`; `forward_substitution_lower_matrix` solves `L M = Aᵀ`
-    // column-by-column giving `M = L⁻¹ Aᵀ` (`p × m`), so `F = √φ · Mᵀ`.
+    // Whitened constraint rows Fᵢ = √φ · L⁻¹ aᵢ and slacks gᵢ = aᵢᵀ center − bᵢ
+    // (possibly negative — the CENTER may be infeasible; only the start point
+    // must satisfy the polytope). `F` is `m × p`;
+    // `forward_substitution_lower_matrix` solves `L M = Aᵀ` column-by-column
+    // giving `M = L⁻¹ Aᵀ` (`p × m`), so `F = √φ · Mᵀ`.
     let (f_rows, g, f_sq_norm) = if m == 0 {
         (
             Array2::<f64>::zeros((0, p)),
@@ -159,10 +186,31 @@ pub fn sample_truncated_gaussian_posterior(
         let at = a.t().to_owned();
         let mut f = forward_substitution_lower_matrix(&l, &at).reversed_axes(); // m × p
         f.mapv_inplace(|v| v * sqrt_phi);
-        let g = a.dot(mode) - b;
+        let g = a.dot(center) - b;
         let f_sq_norm: Vec<f64> = (0..m).map(|i| f.row(i).dot(&f.row(i))).collect();
         (f, g, f_sq_norm)
     };
+
+    // Whitened start `z₀ = (1/√φ)·Lᵀ·(start − center)`, validated feasible up
+    // to reflective slack: the constrained KKT mode sits ON its active walls,
+    // so tiny negative numeric slack is snapped by the wall logic, but a
+    // genuinely infeasible start would corrupt every trajectory.
+    let start_diff = feasible_start - center;
+    let z0 = l.t().dot(&start_diff) / sqrt_phi;
+    for i in 0..m {
+        let slack = a.row(i).dot(feasible_start) - b[i];
+        let scale = a.row(i).iter().map(|v| v.abs()).sum::<f64>().max(1.0)
+            * feasible_start
+                .iter()
+                .map(|v| v.abs())
+                .fold(1.0_f64, f64::max);
+        if slack < -1e-8 * scale {
+            return Err(format!(
+                "truncated-Gaussian posterior: start point violates constraint row {i} \
+                 (slack {slack:.3e}); the constrained mode must be feasible"
+            ));
+        }
+    }
 
     let n_total = n_samples.saturating_mul(n_chains);
     let mut samples = Array2::<f64>::zeros((n_total, p));
@@ -177,19 +225,21 @@ pub fn sample_truncated_gaussian_posterior(
         let mut rng = rand::rngs::StdRng::seed_from_u64(
             seed ^ ((chain as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
         );
-        // Each chain starts at the mode (z = 0), which is feasible.
-        z.fill(0.0);
+        // Each chain starts at the feasible start point (the constrained
+        // mode), which in whitened coordinates is `z₀` — NOT the origin: the
+        // origin is the unconstrained center, which may be infeasible.
+        z.assign(&z0);
         for draw in 0..n_samples {
             // Refresh the velocity from N(0, I).
             for vi in v.iter_mut() {
                 *vi = standard_normal(&mut rng);
             }
             simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm, max_bounces);
-            // Back-transform: β = mode + √φ · L⁻ᵀ z.
+            // Back-transform: β = center + √φ · L⁻ᵀ z.
             back_substitution_lower_transpose_guarded_into(&l, &z, &mut beta);
             let row = chain * n_samples + draw;
             for j in 0..p {
-                samples[(row, j)] = mode[j] + sqrt_phi * beta[j];
+                samples[(row, j)] = center[j] + sqrt_phi * beta[j];
             }
         }
     }
@@ -373,7 +423,7 @@ mod tests {
         // β₀ ≥ −1000: utterly non-binding at this mode/scale.
         let c = constraints(array![[1.0, 0.0]], array![-1000.0]);
         let n = 60_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 1, 20240613)
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 20240613)
             .expect("sampler");
         assert_all_feasible(&s, &c);
 
@@ -417,7 +467,7 @@ mod tests {
         let mode = array![0.0]; // pinned on the boundary (active constraint)
         let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
         let n = 200_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 1, 7).expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 7).expect("sampler");
         assert_all_feasible(&s, &c);
 
         let col = s.column(0);
@@ -446,7 +496,7 @@ mod tests {
         let c = constraints(array![[1.0]], array![0.0]);
         let n = 200_000;
         let sqrt_phi = 2.0; // φ = 4 → σ = sqrt(φ/h) = 2.
-        let s = sample_truncated_gaussian_posterior(&mode, &h, sqrt_phi, &c, n, 1, 99)
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, sqrt_phi, &c, n, 1, 99)
             .expect("sampler");
         let mean = s.column(0).mean().unwrap();
         let expect = 2.0 * (2.0 / std::f64::consts::PI).sqrt();
@@ -482,7 +532,7 @@ mod tests {
         let c = constraints(a, Array1::zeros(p - 1));
         let n = 40_000;
         let chains = 2;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, chains, 31337)
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, chains, 31337)
             .expect("sampler");
         assert_eq!(s.dim(), (n * chains, p));
         assert_all_feasible(&s, &c);
@@ -501,7 +551,7 @@ mod tests {
         // β ≥ 0 and −β ≥ −1  ⟺  0 ≤ β ≤ 1.
         let c = constraints(array![[1.0], [-1.0]], array![0.0, -1.0]);
         let n = 80_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 1, 5).expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 5).expect("sampler");
         assert_all_feasible(&s, &c);
         assert!(s.column(0).iter().all(|&v| v > 0.0 && v < 1.0));
         // Symmetric truncation around the centred mode ⇒ mean ≈ 0.5.

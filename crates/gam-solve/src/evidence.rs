@@ -236,7 +236,9 @@ pub struct StackingCheckpoint {
 /// certificate evidence and an exact checkpoint rather than returning weights.
 #[derive(Debug, Clone)]
 pub enum StackingError {
-    InvalidInput { message: String },
+    InvalidInput {
+        message: String,
+    },
     NumericalFailure {
         message: String,
         certificate: Option<StackingCertificate>,
@@ -262,7 +264,9 @@ impl std::fmt::Display for StackingError {
                 f,
                 "stacking numerical failure: {message} (certificate residual {}, checkpoint iterations {})",
                 certificate.map_or(f64::NAN, |value| value.residual()),
-                checkpoint.as_ref().map_or(0, |value| value.completed_iterations)
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |value| value.completed_iterations)
             ),
             Self::DidNotConverge {
                 max_iterations,
@@ -289,6 +293,12 @@ pub struct StackingWeights {
     pub weights: Array1<f64>,
     pub iterations: usize,
     pub certificate: StackingCertificate,
+}
+
+impl StackingWeights {
+    pub fn mean_log_score(&self) -> f64 {
+        self.certificate.mean_log_score
+    }
 }
 
 struct StackingProblem {
@@ -350,10 +360,14 @@ impl StackingProblem {
         let k = self.scaled_density.ncols();
         let mass = weights.sum();
         if weights.len() != k
-            || weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+            || weights
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
             || !(mass.is_finite() && mass > 0.0)
         {
-            return Err("checkpoint weights are not a finite nonnegative simplex vector".to_string());
+            return Err(
+                "checkpoint weights are not a finite nonnegative simplex vector".to_string(),
+            );
         }
         let mut gradient = Array1::<f64>::zeros(k);
         let mut centered_objective = 0.0_f64;
@@ -481,7 +495,9 @@ fn solve_stacking_weights_impl(
         }
         let mut weights = checkpoint.weights.clone();
         let mass = weights.sum();
-        if weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+        if weights
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
             || !(mass.is_finite() && mass > 0.0)
         {
             return Err(StackingError::InvalidInput {
@@ -501,13 +517,14 @@ fn solve_stacking_weights_impl(
             weights: weights.clone(),
             completed_iterations,
         };
-        let (gradient, certificate, objective) = problem.evaluate(weights.view()).map_err(|message| {
-            StackingError::NumericalFailure {
-                message,
-                certificate: None,
-                checkpoint: Some(checkpoint.clone()),
-            }
-        })?;
+        let (gradient, certificate, objective) =
+            problem.evaluate(weights.view()).map_err(|message| {
+                StackingError::NumericalFailure {
+                    message,
+                    certificate: None,
+                    checkpoint: Some(checkpoint.clone()),
+                }
+            })?;
         if certificate.residual() <= config.kkt_tol {
             return Ok(StackingWeights {
                 weights,
@@ -589,17 +606,14 @@ fn stacking_newton_step(
             }
         }
     }
-    let reduced_gradient = Array1::from_iter(
-        free.iter()
-            .map(|&col| gradient[col] - gradient[reference]),
-    );
+    let reduced_gradient =
+        Array1::from_iter(free.iter().map(|&col| gradient[col] - gradient[reference]));
     let (eigenvalues, eigenvectors) = information.eigh(Side::Lower).ok()?;
     let spectral_scale = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
     if !(spectral_scale.is_finite() && spectral_scale > 0.0) {
         return None;
     }
-    let rank_tolerance =
-        f64::EPSILON * (dimension as f64) * spectral_scale.max(f64::MIN_POSITIVE);
+    let rank_tolerance = f64::EPSILON * (dimension as f64) * spectral_scale.max(f64::MIN_POSITIVE);
     let projected = eigenvectors.t().dot(&reduced_gradient);
     let mut spectral_step = Array1::<f64>::zeros(dimension);
     for index in 0..dimension {
@@ -821,7 +835,9 @@ pub struct GaussianMixtureCheckpoint {
 /// monotonicity invariant both carry the last internally consistent state.
 #[derive(Debug, Clone)]
 pub enum GaussianMixtureError {
-    InvalidInput { message: String },
+    InvalidInput {
+        message: String,
+    },
     NumericalFailure {
         message: String,
         checkpoint: Option<GaussianMixtureCheckpoint>,
@@ -849,7 +865,9 @@ impl std::fmt::Display for GaussianMixtureError {
             } => write!(
                 f,
                 "Gaussian-mixture numerical failure: {message} (checkpoint iterations {})",
-                checkpoint.as_ref().map_or(0, |value| value.completed_iterations)
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |value| value.completed_iterations)
             ),
             Self::MonotonicityViolation {
                 previous_mean_log_likelihood,
@@ -979,10 +997,10 @@ impl GaussianMixtureFit {
     ///
     /// The Laplace expansion is only meaningful at a stationary point:
     /// [`fit_gaussian_mixture`] enforces this by returning a typed error
-    /// whenever EM exhausts its budget without the monotone-ascent +
-    /// objective-residual certificate, so every `GaussianMixtureFit` that can
-    /// reach this method is a certified EM optimum and its evidence is
-    /// comparable across candidates.
+    /// whenever EM exhausts its budget without monotone ascent plus both the
+    /// objective and full parameter-map residual certificates. The private fit
+    /// state and training-data fingerprint prevent an uncertified or unrelated
+    /// mode from reaching evidence comparison.
     pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
         if data.nrows() != self.n_obs
             || data.ncols() != self.d
@@ -1269,185 +1287,428 @@ pub fn fit_gaussian_mixture(
     data: ArrayView2<'_, f64>,
     k: usize,
     config: GaussianMixtureConfig,
-) -> Result<GaussianMixtureFit, String> {
-    let n = data.nrows();
-    let d = data.ncols();
-    if k == 0 {
-        return Err("gaussian mixture requires k >= 1".to_string());
-    }
-    if d == 0 {
-        return Err("gaussian mixture requires at least one column".to_string());
-    }
-    if k > n {
-        return Err(format!(
-            "gaussian mixture requested {k} components but data has {n} rows"
-        ));
-    }
+) -> Result<GaussianMixtureFit, GaussianMixtureError> {
+    validate_gaussian_mixture_problem(data, k, config)?;
     // Deterministic k-means++-style seeding via the shared basis k-means
-    // (farthest-point init + Lloyd iterations). Fixed by construction.
-    let centers = gam_terms::basis::select_centers_by_strategy(
+    // (farthest-point init + Lloyd iterations).
+    let means = gam_terms::basis::select_centers_by_strategy(
         data,
         &gam_terms::basis::CenterStrategy::KMeans {
             num_centers: k,
             max_iter: config.kmeans_max_iter,
         },
     )
-    .map_err(|e| format!("gaussian mixture k-means seeding failed: {e}"))?;
-    if centers.nrows() != k || centers.ncols() != d {
-        return Err(format!(
-            "gaussian mixture seeding returned {}x{} centers, expected {k}x{d}",
-            centers.nrows(),
-            centers.ncols()
-        ));
+    .map_err(|error| GaussianMixtureError::NumericalFailure {
+        message: format!("deterministic k-means seeding failed: {error}"),
+        checkpoint: None,
+    })?;
+    if means.nrows() != k || means.ncols() != data.ncols() {
+        return Err(GaussianMixtureError::NumericalFailure {
+            message: format!(
+                "seeding returned {}x{} centers, expected {k}x{}",
+                means.nrows(),
+                means.ncols(),
+                data.ncols()
+            ),
+            checkpoint: None,
+        });
     }
-
-    let mut means = centers;
-    // Seed covariances from the global data covariance (shared start).
-    let global_cov = data_covariance(data, config.covariance_floor);
-    let mut covariances = vec![global_cov; k];
-    let mut weights = Array1::<f64>::from_elem(k, 1.0 / k as f64);
-
-    let mut resp = Array2::<f64>::zeros((n, k));
-    let mut prev_mean_ll = f64::NEG_INFINITY;
-    let mut total_loglik = f64::NEG_INFINITY;
-    let mut iterations = 0usize;
-    // EM convergence certificate (both parts must hold before the fit is
-    // minted; SPEC rule 20):
-    //   1. Monotonicity — EM is an ascent algorithm, so a mean log-likelihood
-    //      DROP beyond the stopping tolerance means the numerics broke and the
-    //      iterate is not a certified EM fixed point.
-    //   2. Objective residual — the relative mean log-likelihood step must
-    //      fall below `config.loglik_tol`.
-    // Exhausting `config.max_iter` without the certificate is an error: an
-    // uncertified mixture is not a stationary Laplace expansion point, so its
-    // "evidence" would not be comparable to other candidates' and must never
-    // enter ranking or stacking.
-    let mut converged = false;
-    let mut last_rel_step = f64::INFINITY;
-
-    for iter in 0..config.max_iter.max(1) {
-        iterations = iter + 1;
-        // E-step: responsibilities and total log-likelihood.
-        let mut comp = Vec::with_capacity(k);
-        for j in 0..k {
-            comp.push(GaussianComponentEval::factor(
-                means.row(j),
-                &covariances[j],
-            )?);
-        }
-        let log_w: Vec<f64> = weights
-            .iter()
-            .map(|w| w.max(f64::MIN_POSITIVE).ln())
-            .collect();
-        total_loglik = 0.0;
-        for i in 0..n {
-            let yrow = data.row(i);
-            let mut log_terms = vec![0.0_f64; k];
-            let mut max_term = f64::NEG_INFINITY;
-            for j in 0..k {
-                let lt = log_w[j] + comp[j].log_density(yrow);
-                log_terms[j] = lt;
-                if lt > max_term {
-                    max_term = lt;
-                }
+    let global_covariance =
+        constrained_data_covariance(data, config.covariance_floor).map_err(|message| {
+            GaussianMixtureError::NumericalFailure {
+                message,
+                checkpoint: None,
             }
-            let log_mix = log_sum_exp(&log_terms, max_term);
-            total_loglik += log_mix;
-            for j in 0..k {
-                resp[[i, j]] = (log_terms[j] - log_mix).exp();
+        })?;
+    let weights = Array1::<f64>::from_elem(k, 1.0 / k as f64);
+    let covariances = vec![global_covariance; k];
+    let (_, mean_log_likelihood) =
+        mixture_e_step(data, &weights, &means, &covariances).map_err(|message| {
+            GaussianMixtureError::NumericalFailure {
+                message,
+                checkpoint: None,
             }
-        }
-        let mean_ll = total_loglik / n as f64;
-        if iter > 0 {
-            let denom = prev_mean_ll.abs().max(1.0);
-            let step = mean_ll - prev_mean_ll;
-            if step < -config.loglik_tol * denom {
-                return Err(format!(
-                    "gaussian mixture EM (k={k}) violated ascent monotonicity at iteration \
-                     {iterations}: mean log-likelihood fell from {prev_mean_ll:.12e} to \
-                     {mean_ll:.12e}; the EM certificate is broken, so this fit cannot be \
-                     scored as evidence"
-                ));
-            }
-            last_rel_step = step.abs() / denom;
-            if last_rel_step <= config.loglik_tol {
-                converged = true;
-                break;
-            }
-        }
-        prev_mean_ll = mean_ll;
-
-        // M-step.
-        let mut nk = vec![0.0_f64; k];
-        for j in 0..k {
-            let mut sum = 0.0_f64;
-            for i in 0..n {
-                sum += resp[[i, j]];
-            }
-            nk[j] = sum.max(f64::MIN_POSITIVE);
-        }
-        for j in 0..k {
-            weights[j] = nk[j] / n as f64;
-            // Means.
-            let mut mu = Array1::<f64>::zeros(d);
-            for i in 0..n {
-                let r = resp[[i, j]];
-                if r == 0.0 {
-                    continue;
-                }
-                for c in 0..d {
-                    mu[c] += r * data[[i, c]];
-                }
-            }
-            mu.mapv_inplace(|v| v / nk[j]);
-            for c in 0..d {
-                means[[j, c]] = mu[c];
-            }
-            // Covariance with a fixed diagonal floor for SPD safety.
-            let mut cov = Array2::<f64>::zeros((d, d));
-            for i in 0..n {
-                let r = resp[[i, j]];
-                if r == 0.0 {
-                    continue;
-                }
-                for a in 0..d {
-                    let da = data[[i, a]] - mu[a];
-                    for b in 0..d {
-                        cov[[a, b]] += r * da * (data[[i, b]] - mu[b]);
-                    }
-                }
-            }
-            cov.mapv_inplace(|v| v / nk[j]);
-            for a in 0..d {
-                cov[[a, a]] += config.covariance_floor;
-            }
-            covariances[j] = cov;
-        }
-    }
-
-    if !converged {
-        return Err(format!(
-            "gaussian mixture EM (k={k}) did not converge within {iterations} iterations: \
-             last relative mean log-likelihood step {last_rel_step:.6e} exceeds tolerance \
-             {:.3e}; an uncertified mixture must not enter evidence comparison or stacking",
-            config.loglik_tol
-        ));
-    }
-
-    Ok(GaussianMixtureFit {
+        })?;
+    let checkpoint = GaussianMixtureCheckpoint {
         weights,
         means,
         covariances,
-        k,
-        d,
-        n_obs: n,
-        loglik: total_loglik,
-        iterations,
+        mean_log_likelihood,
+        completed_iterations: 0,
+    };
+    run_gaussian_mixture_em(data, config, checkpoint)
+}
+
+/// Resume EM from the exact state carried by [`GaussianMixtureError`].
+pub fn resume_gaussian_mixture(
+    data: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+    checkpoint: GaussianMixtureCheckpoint,
+) -> Result<GaussianMixtureFit, GaussianMixtureError> {
+    let k = checkpoint.weights.len();
+    validate_gaussian_mixture_problem(data, k, config)?;
+    validate_gaussian_mixture_checkpoint(data.ncols(), &checkpoint)?;
+    run_gaussian_mixture_em(data, config, checkpoint)
+}
+
+fn validate_gaussian_mixture_problem(
+    data: ArrayView2<'_, f64>,
+    k: usize,
+    config: GaussianMixtureConfig,
+) -> Result<(), GaussianMixtureError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    if k == 0 {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: "k must be positive".to_string(),
+        });
+    }
+    if d == 0 {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: "at least one data column is required".to_string(),
+        });
+    }
+    if k > n {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: format!("requested {k} components but data has {n} rows"),
+        });
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: "data must be finite".to_string(),
+        });
+    }
+    if config.max_iter == 0 || config.kmeans_max_iter == 0 {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: "max_iter and kmeans_max_iter must be positive".to_string(),
+        });
+    }
+    let numerical_floor = f64::EPSILON.sqrt();
+    if !config.loglik_tol.is_finite()
+        || config.loglik_tol < numerical_floor
+        || !config.parameter_tol.is_finite()
+        || config.parameter_tol < numerical_floor
+        || !config.covariance_floor.is_finite()
+        || config.covariance_floor <= 0.0
+    {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: format!(
+                "loglik_tol and parameter_tol must be finite and >= {numerical_floor:.3e}, and covariance_floor must be finite and positive"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_gaussian_mixture_checkpoint(
+    d: usize,
+    checkpoint: &GaussianMixtureCheckpoint,
+) -> Result<(), GaussianMixtureError> {
+    let k = checkpoint.weights.len();
+    let mass = checkpoint.weights.sum();
+    if k == 0
+        || checkpoint.means.dim() != (k, d)
+        || checkpoint.covariances.len() != k
+        || checkpoint
+            .covariances
+            .iter()
+            .any(|covariance| covariance.dim() != (d, d))
+        || checkpoint
+            .weights
+            .iter()
+            .chain(checkpoint.means.iter())
+            .chain(checkpoint.covariances.iter().flat_map(|value| value.iter()))
+            .any(|value| !value.is_finite())
+        || checkpoint.weights.iter().any(|value| *value < 0.0)
+        || !mass.is_finite()
+        || (mass - 1.0).abs() > f64::EPSILON.sqrt()
+        || !checkpoint.mean_log_likelihood.is_finite()
+    {
+        return Err(GaussianMixtureError::InvalidInput {
+            message: "checkpoint dimensions, parameters, likelihood, or simplex mass are invalid"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn run_gaussian_mixture_em(
+    data: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+    mut checkpoint: GaussianMixtureCheckpoint,
+) -> Result<GaussianMixtureFit, GaussianMixtureError> {
+    validate_gaussian_mixture_checkpoint(data.ncols(), &checkpoint)?;
+    let k = checkpoint.weights.len();
+    let d = data.ncols();
+    let mut last_certificate = GaussianMixtureCertificate {
+        mean_log_likelihood: checkpoint.mean_log_likelihood,
+        objective_residual: f64::INFINITY,
+        objective_tolerance: config.loglik_tol,
+        parameter_residual: f64::INFINITY,
+        parameter_tolerance: config.parameter_tol,
+    };
+    for _ in 0..config.max_iter {
+        let (responsibilities, current_mean_log_likelihood) = mixture_e_step(
+            data,
+            &checkpoint.weights,
+            &checkpoint.means,
+            &checkpoint.covariances,
+        )
+        .map_err(|message| GaussianMixtureError::NumericalFailure {
+            message,
+            checkpoint: Some(checkpoint.clone()),
+        })?;
+        let (next_weights, next_means, next_covariances) = mixture_m_step(
+            data,
+            responsibilities.view(),
+            &checkpoint,
+            config.covariance_floor,
+        )
+        .map_err(|message| GaussianMixtureError::NumericalFailure {
+            message,
+            checkpoint: Some(checkpoint.clone()),
+        })?;
+        let (_, next_mean_log_likelihood) =
+            mixture_e_step(data, &next_weights, &next_means, &next_covariances).map_err(
+                |message| GaussianMixtureError::NumericalFailure {
+                    message,
+                    checkpoint: Some(checkpoint.clone()),
+                },
+            )?;
+        let objective_scale = current_mean_log_likelihood
+            .abs()
+            .max(next_mean_log_likelihood.abs())
+            .max(1.0);
+        let objective_step = next_mean_log_likelihood - current_mean_log_likelihood;
+        let objective_residual = objective_step.abs() / objective_scale;
+        let parameter_residual = mixture_parameter_residual(
+            &checkpoint.weights,
+            &checkpoint.means,
+            &checkpoint.covariances,
+            &next_weights,
+            &next_means,
+            &next_covariances,
+        );
+        let next_checkpoint = GaussianMixtureCheckpoint {
+            weights: next_weights,
+            means: next_means,
+            covariances: next_covariances,
+            mean_log_likelihood: next_mean_log_likelihood,
+            completed_iterations: checkpoint.completed_iterations + 1,
+        };
+        let allowed_decrease = config.loglik_tol * objective_scale;
+        if objective_step < -allowed_decrease {
+            return Err(GaussianMixtureError::MonotonicityViolation {
+                previous_mean_log_likelihood: current_mean_log_likelihood,
+                next_mean_log_likelihood,
+                allowed_decrease,
+                checkpoint: next_checkpoint,
+            });
+        }
+        let certificate = GaussianMixtureCertificate {
+            mean_log_likelihood: next_mean_log_likelihood,
+            objective_residual,
+            objective_tolerance: config.loglik_tol,
+            parameter_residual,
+            parameter_tolerance: config.parameter_tol,
+        };
+        last_certificate = certificate;
+        if objective_residual <= config.loglik_tol && parameter_residual <= config.parameter_tol {
+            let loglik = next_mean_log_likelihood * data.nrows() as f64;
+            if !loglik.is_finite() {
+                return Err(GaussianMixtureError::NumericalFailure {
+                    message: "certified mean log likelihood overflows as a total likelihood"
+                        .to_string(),
+                    checkpoint: Some(next_checkpoint),
+                });
+            }
+            return Ok(GaussianMixtureFit {
+                weights: next_checkpoint.weights,
+                means: next_checkpoint.means,
+                covariances: next_checkpoint.covariances,
+                k,
+                d,
+                n_obs: data.nrows(),
+                loglik,
+                iterations: next_checkpoint.completed_iterations,
+                certificate,
+                data_fingerprint: mixture_data_fingerprint(data),
+            });
+        }
+        checkpoint = next_checkpoint;
+    }
+    Err(GaussianMixtureError::DidNotConverge {
+        max_iterations: config.max_iter,
+        certificate: last_certificate,
+        checkpoint,
     })
 }
 
-/// Global data covariance with a fixed diagonal floor (used to seed EM).
-fn data_covariance(data: ArrayView2<'_, f64>, floor: f64) -> Array2<f64> {
+fn mixture_e_step(
+    data: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    means: &Array2<f64>,
+    covariances: &[Array2<f64>],
+) -> Result<(Array2<f64>, f64), String> {
+    let n = data.nrows();
+    let k = weights.len();
+    let mut components = Vec::with_capacity(k);
+    for component in 0..k {
+        components.push(GaussianComponentEval::factor(
+            means.row(component),
+            &covariances[component],
+        )?);
+    }
+    let log_weights: Vec<f64> = weights
+        .iter()
+        .map(|&weight| {
+            if weight > 0.0 {
+                weight.ln()
+            } else {
+                f64::NEG_INFINITY
+            }
+        })
+        .collect();
+    let mut responsibilities = Array2::<f64>::zeros((n, k));
+    let mut mean_log_likelihood = 0.0_f64;
+    for row in 0..n {
+        let observation = data.row(row);
+        let mut log_terms = vec![f64::NEG_INFINITY; k];
+        let mut max_term = f64::NEG_INFINITY;
+        for component in 0..k {
+            let term = log_weights[component] + components[component].log_density(observation);
+            log_terms[component] = term;
+            max_term = max_term.max(term);
+        }
+        let log_mixture = log_sum_exp(&log_terms, max_term);
+        if !log_mixture.is_finite() {
+            return Err(format!(
+                "mixture density is non-finite at training row {row}"
+            ));
+        }
+        let count = (row + 1) as f64;
+        mean_log_likelihood = mean_log_likelihood * ((count - 1.0) / count) + log_mixture / count;
+        for component in 0..k {
+            responsibilities[[row, component]] = (log_terms[component] - log_mixture).exp();
+        }
+    }
+    if !mean_log_likelihood.is_finite() {
+        return Err("mean mixture log likelihood is non-finite".to_string());
+    }
+    Ok((responsibilities, mean_log_likelihood))
+}
+
+fn mixture_m_step(
+    data: ArrayView2<'_, f64>,
+    responsibilities: ArrayView2<'_, f64>,
+    previous: &GaussianMixtureCheckpoint,
+    covariance_floor: f64,
+) -> Result<(Array1<f64>, Array2<f64>, Vec<Array2<f64>>), String> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let k = responsibilities.ncols();
+    let mut component_mass = Array1::<f64>::zeros(k);
+    for component in 0..k {
+        component_mass[component] = responsibilities.column(component).sum();
+    }
+    let mut weights = component_mass.mapv(|mass| mass / n as f64);
+    let total_weight = weights.sum();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err("M-step produced invalid mixture-weight mass".to_string());
+    }
+    weights.mapv_inplace(|weight| weight / total_weight);
+    let mut means = previous.means.clone();
+    let mut covariances = previous.covariances.clone();
+    for component in 0..k {
+        let mass = component_mass[component];
+        if mass == 0.0 {
+            continue;
+        }
+        let mut mean = Array1::<f64>::zeros(d);
+        for row in 0..n {
+            let responsibility = responsibilities[[row, component]];
+            for col in 0..d {
+                mean[col] += responsibility * data[[row, col]];
+            }
+        }
+        mean.mapv_inplace(|value| value / mass);
+        means.row_mut(component).assign(&mean);
+        let mut covariance = Array2::<f64>::zeros((d, d));
+        for row in 0..n {
+            let responsibility = responsibilities[[row, component]];
+            for left in 0..d {
+                let left_residual = data[[row, left]] - mean[left];
+                for right in 0..d {
+                    covariance[[left, right]] +=
+                        responsibility * left_residual * (data[[row, right]] - mean[right]);
+                }
+            }
+        }
+        covariance.mapv_inplace(|value| value / mass);
+        covariances[component] = constrain_covariance(covariance, covariance_floor)?;
+    }
+    Ok((weights, means, covariances))
+}
+
+fn mixture_parameter_residual(
+    previous_weights: &Array1<f64>,
+    previous_means: &Array2<f64>,
+    previous_covariances: &[Array2<f64>],
+    next_weights: &Array1<f64>,
+    next_means: &Array2<f64>,
+    next_covariances: &[Array2<f64>],
+) -> f64 {
+    let relative_step = |previous: f64, next: f64| {
+        (next - previous).abs() / previous.abs().max(next.abs()).max(1.0)
+    };
+    previous_weights
+        .iter()
+        .zip(next_weights.iter())
+        .map(|(&previous, &next)| relative_step(previous, next))
+        .chain(
+            previous_means
+                .iter()
+                .zip(next_means.iter())
+                .map(|(&previous, &next)| relative_step(previous, next)),
+        )
+        .chain(
+            previous_covariances
+                .iter()
+                .zip(next_covariances.iter())
+                .flat_map(|(previous, next)| previous.iter().zip(next.iter()))
+                .map(|(&previous, &next)| relative_step(previous, next)),
+        )
+        .fold(0.0_f64, f64::max)
+}
+
+fn constrain_covariance(covariance: Array2<f64>, floor: f64) -> Result<Array2<f64>, String> {
+    let (eigenvalues, eigenvectors) = covariance
+        .eigh(Side::Lower)
+        .map_err(|error| format!("covariance eigendecomposition failed: {error}"))?;
+    let d = covariance.nrows();
+    let mut constrained = Array2::<f64>::zeros((d, d));
+    for row in 0..d {
+        for col in 0..d {
+            let mut value = 0.0_f64;
+            for index in 0..d {
+                value += eigenvectors[[row, index]]
+                    * eigenvalues[index].max(floor)
+                    * eigenvectors[[col, index]];
+            }
+            constrained[[row, col]] = value;
+        }
+    }
+    if constrained.iter().any(|value| !value.is_finite()) {
+        return Err("constrained covariance became non-finite".to_string());
+    }
+    Ok(constrained)
+}
+
+/// Global constrained covariance used to seed EM.
+fn constrained_data_covariance(
+    data: ArrayView2<'_, f64>,
+    floor: f64,
+) -> Result<Array2<f64>, String> {
     let n = data.nrows();
     let d = data.ncols();
     let mut mean = Array1::<f64>::zeros(d);
@@ -1466,12 +1727,9 @@ fn data_covariance(data: ArrayView2<'_, f64>, floor: f64) -> Array2<f64> {
             }
         }
     }
-    let inv = 1.0 / (n.max(1) as f64);
+    let inv = 1.0 / n as f64;
     cov.mapv_inplace(|v| v * inv);
-    for a in 0..d {
-        cov[[a, a]] += floor;
-    }
-    cov
+    constrain_covariance(cov, floor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,7 +1747,7 @@ fn data_covariance(data: ArrayView2<'_, f64>, floor: f64) -> Array2<f64> {
 // generative density and scored through the SAME rank-aware Laplace /
 // Tierney-Kadane normalizer used by the smooth rungs and the mixture rung:
 // `−V_c = loglik_c − ½ log|H_c| + ½ P_c log(2π)` with `H_c` the observed
-// empirical-Fisher (BHHH) information `I + Σ s_i s_iᵀ` at the component optimum
+// empirical-Fisher (BHHH) information `Σ s_i s_iᵀ` at the component optimum
 // (`rank(S)=0`, fully likelihood-identified). The union's evidence is the SUM
 // `V = Σ_c V_c` (the components partition the rows, so their log-likelihoods
 // add and their Hessians are block-diagonal — `log|H| = Σ_c log|H_c|`). The
@@ -1607,7 +1865,7 @@ pub fn union_responsibility_split(
     if m == 1 {
         return Ok(vec![(0..n).collect()]);
     }
-    let fit = fit_gaussian_mixture(data, m, config)?;
+    let fit = fit_gaussian_mixture(data, m, config).map_err(|error| error.to_string())?;
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); m];
     // Hard assignment by argmax per-component log responsibility.
     let mut comp = Vec::with_capacity(m);
@@ -1758,7 +2016,8 @@ fn fit_union_component(
                     group.nrows()
                 ));
             }
-            let fit = fit_gaussian_mixture(group, 1, config)?;
+            let fit =
+                fit_gaussian_mixture(group, 1, config).map_err(|error| error.to_string())?;
             let nle = fit.laplace_negative_log_evidence(group)?;
             Ok((nle, fit.num_free_parameters()))
         }
@@ -1966,7 +2225,8 @@ fn fit_union_component_densities(
                         group.nrows()
                     ));
                 }
-                let fit = fit_gaussian_mixture(group.view(), 1, config)?;
+                let fit = fit_gaussian_mixture(group.view(), 1, config)
+                    .map_err(|error| error.to_string())?;
                 let eval = GaussianComponentEval::factor(fit.means.row(0), &fit.covariances[0])?;
                 out.push(UnionComponentDensity::Gaussian { log_weight, eval });
             }
@@ -4179,12 +4439,14 @@ mod tests {
         // g_k = mean_i p_ik / mix_i must satisfy g_k <= 1 (+tol) everywhere
         // and w_k * |g_k - 1| <= tol. The objective is concave, so this
         // certifies the GLOBAL optimum, not merely a stationary iterate.
-        let log_density =
-            Array2::from_shape_vec((4, 2), vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5])
-                .unwrap();
+        let log_density = Array2::from_shape_vec(
+            (5, 2),
+            vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5, -0.1, -2.0],
+        )
+        .unwrap();
         let config = StackingConfig::default();
         let out = solve_stacking_weights(log_density.view(), config).unwrap();
-        assert!(out.kkt_residual <= config.kkt_tol);
+        assert!(out.certificate.residual() <= config.kkt_tol);
         let n = log_density.nrows();
         for k in 0..2 {
             let mut g = 0.0_f64;
@@ -4209,31 +4471,67 @@ mod tests {
 
     #[test]
     fn stacking_exhaustion_without_certificate_is_an_error_not_weights() {
-        // A one-iteration budget cannot certify a nontrivial table; the solve
-        // must refuse to mint weights rather than return the capped iterate.
-        let log_density =
-            Array2::from_shape_vec((4, 2), vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5])
-                .unwrap();
+        let log_density = Array2::from_shape_vec(
+            (6, 3),
+            vec![
+                0.0, -2.0, -4.0, -0.4, -0.1, -3.0, -2.0, 0.0, -0.3, -3.0, -1.0, 0.0,
+                -0.2, -2.0, -0.5, -1.0, -0.3, -2.0,
+            ],
+        )
+        .unwrap();
+        let config = StackingConfig {
+            max_iter: 1,
+            ..StackingConfig::default()
+        };
         let err = solve_stacking_weights(
             log_density.view(),
-            StackingConfig {
-                max_iter: 1,
-                kkt_tol: 0.0,
-            },
+            config,
         )
         .unwrap_err();
-        assert!(err.contains("KKT"), "error must carry the evidence: {err}");
+        let checkpoint = match err {
+            StackingError::DidNotConverge {
+                certificate,
+                checkpoint,
+                ..
+            } => {
+                assert!(certificate.residual() > config.kkt_tol);
+                assert_eq!(checkpoint.completed_iterations, 1);
+                checkpoint
+            }
+            other => panic!("expected typed stacking exhaustion, got {other}"),
+        };
+        let resumed = resume_stacking_weights(
+            log_density.view(),
+            StackingConfig::default(),
+            &checkpoint,
+        )
+        .unwrap();
+        let uninterrupted =
+            solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        for (resumed, uninterrupted) in resumed.weights.iter().zip(uninterrupted.weights.iter()) {
+            assert!((resumed - uninterrupted).abs() <= 1.0e-10);
+        }
     }
 
     #[test]
-    fn stacking_dead_candidate_column_is_rejected_and_zero_weighted() {
+    fn stacking_near_tied_boundary_uses_newton_not_millions_of_em_steps() {
+        let log_density = Array2::from_shape_fn((64, 2), |(_, candidate)| {
+            if candidate == 0 { 0.0 } else { -1.0e-6 }
+        });
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!(out.weights[0] >= 1.0 - StackingConfig::default().kkt_tol);
+        assert!(out.iterations < 8, "iterations = {}", out.iterations);
+    }
+
+    #[test]
+    fn stacking_dead_candidate_column_gets_zero_weight() {
         let log_density = Array2::from_shape_vec(
             (3, 2),
             vec![
                 -1.0,
                 f64::NEG_INFINITY,
                 -2.0,
-                f64::NAN,
+                f64::NEG_INFINITY,
                 -0.5,
                 f64::NEG_INFINITY,
             ],
@@ -4245,21 +4543,124 @@ mod tests {
     }
 
     #[test]
-    fn stacking_rows_with_no_finite_density_are_dropped() {
+    fn stacking_rejects_invalid_and_unscorable_rows() {
         let log_density = Array2::from_shape_vec(
             (3, 2),
             vec![-1.0, -2.0, f64::NAN, f64::NEG_INFINITY, -2.0, -1.0],
         )
         .unwrap();
-        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
-        assert!((out.weights.sum() - 1.0).abs() < 1e-9);
-        assert!(out.mean_log_score.is_finite());
+        assert!(matches!(
+            solve_stacking_weights(log_density.view(), StackingConfig::default()),
+            Err(StackingError::InvalidInput { .. })
+        ));
+        let unscorable = Array2::from_shape_vec(
+            (2, 2),
+            vec![-1.0, -2.0, f64::NEG_INFINITY, f64::NEG_INFINITY],
+        )
+        .unwrap();
+        assert!(matches!(
+            solve_stacking_weights(unscorable.view(), StackingConfig::default()),
+            Err(StackingError::InvalidInput { .. })
+        ));
+    }
+
+    fn two_cluster_mixture_data() -> Array2<f64> {
+        Array2::from_shape_vec(
+            (12, 1),
+            vec![
+                -2.2, -2.0, -1.9, -2.1, -1.8, -2.05, 1.8, 2.0, 2.2, 1.9, 2.1, 2.05,
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
-    fn stacking_all_dead_table_errors() {
-        let log_density = Array2::from_elem((2, 2), f64::NEG_INFINITY);
-        assert!(solve_stacking_weights(log_density.view(), StackingConfig::default()).is_err());
+    fn gaussian_mixture_fit_has_a_post_update_fixed_point_certificate() {
+        let data = two_cluster_mixture_data();
+        let config = GaussianMixtureConfig::default();
+        let fit = fit_gaussian_mixture(data.view(), 2, config).unwrap();
+        let certificate = fit.certificate();
+        assert!(certificate.objective_residual <= certificate.objective_tolerance);
+        assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
+
+        let checkpoint = GaussianMixtureCheckpoint {
+            weights: fit.weights.clone(),
+            means: fit.means.clone(),
+            covariances: fit.covariances.clone(),
+            mean_log_likelihood: certificate.mean_log_likelihood,
+            completed_iterations: fit.iterations,
+        };
+        let (responsibilities, current_objective) = mixture_e_step(
+            data.view(),
+            &checkpoint.weights,
+            &checkpoint.means,
+            &checkpoint.covariances,
+        )
+        .unwrap();
+        let (weights, means, covariances) = mixture_m_step(
+            data.view(),
+            responsibilities.view(),
+            &checkpoint,
+            config.covariance_floor,
+        )
+        .unwrap();
+        let residual = mixture_parameter_residual(
+            &checkpoint.weights,
+            &checkpoint.means,
+            &checkpoint.covariances,
+            &weights,
+            &means,
+            &covariances,
+        );
+        let (_, next_objective) =
+            mixture_e_step(data.view(), &weights, &means, &covariances).unwrap();
+        assert!(residual <= config.parameter_tol);
+        assert!(
+            (next_objective - current_objective).abs()
+                / current_objective.abs().max(next_objective.abs()).max(1.0)
+                <= config.loglik_tol
+        );
+    }
+
+    #[test]
+    fn gaussian_mixture_exhaustion_is_typed_and_resumable() {
+        let data = two_cluster_mixture_data();
+        let short = GaussianMixtureConfig {
+            max_iter: 1,
+            ..GaussianMixtureConfig::default()
+        };
+        let err = fit_gaussian_mixture(data.view(), 2, short).unwrap_err();
+        let checkpoint = match err {
+            GaussianMixtureError::DidNotConverge {
+                certificate,
+                checkpoint,
+                ..
+            } => {
+                assert!(
+                    certificate.objective_residual > short.loglik_tol
+                        || certificate.parameter_residual > short.parameter_tol
+                );
+                assert_eq!(checkpoint.completed_iterations, 1);
+                checkpoint
+            }
+            other => panic!("expected typed EM exhaustion, got {other}"),
+        };
+        let resumed =
+            resume_gaussian_mixture(data.view(), GaussianMixtureConfig::default(), checkpoint)
+                .unwrap();
+        let uninterrupted =
+            fit_gaussian_mixture(data.view(), 2, GaussianMixtureConfig::default()).unwrap();
+        for (resumed, uninterrupted) in resumed.weights.iter().zip(uninterrupted.weights.iter()) {
+            assert!((resumed - uninterrupted).abs() <= 1.0e-10);
+        }
+
+        let mut other_data = data.clone();
+        other_data[[0, 0]] += 0.01;
+        assert!(
+            resumed
+                .laplace_negative_log_evidence(other_data.view())
+                .is_err()
+        );
     }
 
     #[test]

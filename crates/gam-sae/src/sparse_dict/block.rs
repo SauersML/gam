@@ -50,6 +50,77 @@ use super::scoring::TopSSelector;
 use crate::frames::GrassmannFrame;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
+use std::fmt;
+
+/// Typed failure from [`fit_block_sparse_dictionary`].
+#[derive(Clone, Debug)]
+pub enum BlockSparseFitError {
+    InvalidInput {
+        reason: String,
+    },
+    NumericalFailure {
+        reason: String,
+    },
+    NonConvergence {
+        epochs: usize,
+        explained_variance: f64,
+        ev_residual: f64,
+        gamma_residual: f64,
+        frame_residual: f64,
+        tolerance: f64,
+        accepted_births: usize,
+        polar_failures: usize,
+    },
+}
+
+impl BlockSparseFitError {
+    fn invalid_input(reason: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<String> for BlockSparseFitError {
+    fn from(reason: String) -> Self {
+        Self::NumericalFailure { reason }
+    }
+}
+
+impl From<BlockSparseFitError> for String {
+    fn from(error: BlockSparseFitError) -> Self {
+        error.to_string()
+    }
+}
+
+impl fmt::Display for BlockSparseFitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput { reason } | Self::NumericalFailure { reason } => {
+                f.write_str(reason)
+            }
+            Self::NonConvergence {
+                epochs,
+                explained_variance,
+                ev_residual,
+                gamma_residual,
+                frame_residual,
+                tolerance,
+                accepted_births,
+                polar_failures,
+            } => write!(
+                f,
+                "fit_block_sparse_dictionary did not converge after {epochs} epochs: EV \
+                 {explained_variance:.6}, EV residual {ev_residual:.3e}, gamma residual \
+                 {gamma_residual:.3e}, frame-projector residual {frame_residual:.3e} \
+                 (tolerance {tolerance:.3e}), accepted births {accepted_births}, polar \
+                 failures {polar_failures}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BlockSparseFitError {}
 
 /// Shared (NOT per-block) hyper-parameters for the block-sparse lane. As in
 /// [`super::SparseDictConfig`] every knob is a single scalar shared across the
@@ -156,12 +227,22 @@ pub struct BlockSparseFit {
     pub explained_variance: f64,
     /// Number of epochs actually run.
     pub epochs: usize,
-    /// Whether the EV-improvement tolerance was reached.
-    pub converged: bool,
+    /// Checkable fixed-point certificate for the final full alternation.
+    pub convergence: BlockSparseConvergence,
     /// Block budget `k` actually used (`min(block_topk, G)`).
     pub block_topk: usize,
     /// Block size `b` actually used.
     pub block_size: usize,
+}
+
+/// Fixed-point evidence attached to every converged [`BlockSparseFit`].
+#[derive(Clone, Copy, Debug)]
+pub struct BlockSparseConvergence {
+    pub ev_residual: f64,
+    pub gamma_residual: f64,
+    /// Maximum gauge-invariant projector displacement over all blocks.
+    pub frame_residual: f64,
+    pub tolerance: f64,
 }
 
 impl BlockSparseFit {
@@ -691,7 +772,7 @@ fn refresh_frames(
     n_blocks: usize,
     b: usize,
     ridge: f64,
-) {
+) -> (usize, f64) {
     let p = x.ncols();
     // Cross-moments M_g (P×b), one per block.
     let mut cm: Vec<Array2<f64>> = (0..n_blocks)
@@ -738,6 +819,8 @@ fn refresh_frames(
         }
     }
 
+    let mut polar_failures = 0usize;
+    let mut projector_residual = 0.0_f64;
     for g in 0..n_blocks {
         if !touched[g] {
             continue;
@@ -753,21 +836,39 @@ fn refresh_frames(
                 }
             }
         }
-        if let Ok(frame) = GrassmannFrame::polar_update(cm[g].view()) {
-            let u = frame.frame(); // P×b column-orthonormal
-            let sv = frame.gauge_singular_values();
-            let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
-            if full_rank && u.ncols() == b {
-                for r in 0..b {
-                    for c in 0..p {
-                        decoder[[g * b + r, c]] = u[[c, r]] as f32;
+        match GrassmannFrame::polar_update(cm[g].view()) {
+            Ok(frame) => {
+                let u = frame.frame(); // P×b column-orthonormal
+                let sv = frame.gauge_singular_values();
+                let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
+                if full_rank && u.ncols() == b {
+                    let mut overlap_sq = 0.0_f64;
+                    for old_axis in 0..b {
+                        for new_axis in 0..b {
+                            let mut dot = 0.0_f64;
+                            for c in 0..p {
+                                dot += decoder[[g * b + old_axis, c]] as f64 * u[[c, new_axis]];
+                            }
+                            overlap_sq += dot * dot;
+                        }
                     }
+                    projector_residual = projector_residual
+                        .max(projector_residual_from_overlap(overlap_sq, b));
+                    for r in 0..b {
+                        for c in 0..p {
+                            decoder[[g * b + r, c]] = u[[c, r]] as f32;
+                        }
+                    }
+                } else {
+                    polar_failures += 1;
                 }
             }
+            Err(_) => polar_failures += 1,
         }
         // A degenerate cross-moment (rank-deficient) leaves the block's current
         // (already orthonormal) frame in place; revival handles a truly dead block.
     }
+    (polar_failures, projector_residual)
 }
 
 /// AuxK-style dead-block revival (house rule: seed from residual ROWS, never PCs).
@@ -781,7 +882,7 @@ fn refresh_frames(
 /// the AuxK auxiliary-reconstruction loss, but installs a genuine `St(b, P)` frame
 /// spanning the directions the model most fails to explain.
 ///
-/// Returns the number of blocks revived (0 leaves the decoder untouched).
+/// Returns the block indices whose residual-row birth proposals were installed.
 fn revive_dead_blocks(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
@@ -790,9 +891,9 @@ fn revive_dead_blocks(
     n_blocks: usize,
     b: usize,
     aux_k: usize,
-) -> usize {
+) -> (Vec<usize>, f64) {
     if aux_k == 0 {
-        return 0;
+        return (Vec::new(), 0.0);
     }
     let n = x.nrows();
     let p = x.ncols();
@@ -816,7 +917,7 @@ fn revive_dead_blocks(
         .filter(|&g| usage[g] == 0) // only truly dead blocks are reseeded
         .collect();
     if candidates.is_empty() {
-        return 0;
+        return (Vec::new(), 0.0);
     }
 
     // Per-row residual energy under the current model.
@@ -851,7 +952,8 @@ fn revive_dead_blocks(
             .then(a.cmp(&c))
     });
 
-    let mut revived = 0usize;
+    let mut revived = Vec::new();
+    let mut projector_residual = 0.0_f64;
     let mut cursor = 0usize;
     for &g in candidates.iter() {
         // Take the next b distinct high-residual rows for this block's frame.
@@ -871,14 +973,27 @@ fn revive_dead_blocks(
             }
         }
         gram_schmidt_rows(&mut seed);
+        let mut overlap_sq = 0.0_f64;
+        for old_axis in 0..b {
+            for new_axis in 0..b {
+                let mut dot = 0.0_f64;
+                for c in 0..p {
+                    dot += decoder[[g * b + old_axis, c]] as f64
+                        * seed[[new_axis, c]] as f64;
+                }
+                overlap_sq += dot * dot;
+            }
+        }
+        projector_residual =
+            projector_residual.max(projector_residual_from_overlap(overlap_sq, b));
         for r in 0..b {
             for c in 0..p {
                 decoder[[g * b + r, c]] = seed[[r, c]];
             }
         }
-        revived += 1;
+        revived.push(g);
     }
-    revived
+    (revived, projector_residual)
 }
 
 /// Held-in explained variance `1 − RSS/TSS` of the block reconstruction.
@@ -1120,38 +1235,75 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
     decoder
 }
 
-fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), String> {
+/// Grassmann-projector displacement from the squared frame overlap,
+/// `||P_new-P_old||_F / sqrt(2b)`. Gauge rotations within either frame leave it
+/// unchanged.
+fn projector_residual_from_overlap(overlap_sq: f64, b: usize) -> f64 {
+    let distance_sq = (2.0 * b as f64 - 2.0 * overlap_sq).max(0.0);
+    (distance_sq / (2.0 * b as f64)).sqrt()
+}
+
+fn relative_scalar_change(previous: f32, current: f32) -> f64 {
+    let previous = previous as f64;
+    let current = current as f64;
+    (current - previous).abs()
+        / previous
+            .abs()
+            .max(current.abs())
+            .max(f64::MIN_POSITIVE)
+}
+
+fn validate(
+    x: ArrayView2<'_, f32>,
+    config: &BlockSparseConfig,
+) -> Result<(), BlockSparseFitError> {
     if x.nrows() == 0 || x.ncols() == 0 {
-        return Err("fit_block_sparse_dictionary requires a non-empty N×P matrix".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary requires a non-empty N×P matrix",
+        ));
     }
     if !x.iter().all(|v| v.is_finite()) {
-        return Err("fit_block_sparse_dictionary input must be finite".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary input must be finite",
+        ));
     }
     if config.n_blocks == 0 {
-        return Err("fit_block_sparse_dictionary requires n_blocks >= 1".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary requires n_blocks >= 1",
+        ));
     }
     if config.block_size == 0 {
-        return Err("fit_block_sparse_dictionary requires block_size >= 1".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary requires block_size >= 1",
+        ));
     }
     if config.block_size > x.ncols() {
-        return Err(format!(
+        return Err(BlockSparseFitError::invalid_input(format!(
             "fit_block_sparse_dictionary block_size b={} cannot exceed output dim P={} \
              (a block's b orthonormal rows must fit in ℝ^P)",
             config.block_size,
             x.ncols()
-        ));
+        )));
     }
     if config.block_topk == 0 {
-        return Err("fit_block_sparse_dictionary requires block_topk >= 1".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary requires block_topk >= 1",
+        ));
     }
     if config.max_epochs == 0 {
-        return Err("fit_block_sparse_dictionary requires max_epochs >= 1".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary requires max_epochs >= 1",
+        ));
     }
     if !(config.frame_ridge.is_finite() && config.frame_ridge >= 0.0) {
-        return Err("fit_block_sparse_dictionary frame_ridge must be finite and >= 0".to_string());
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary frame_ridge must be finite and >= 0",
+        ));
     }
-    if !config.tolerance.is_finite() {
-        return Err("fit_block_sparse_dictionary tolerance must be finite".to_string());
+    if !(config.tolerance.is_finite() && config.tolerance >= 0.0) {
+        return Err(BlockSparseFitError::invalid_input(
+            "fit_block_sparse_dictionary tolerance must be finite and non-negative",
+        ));
     }
     Ok(())
 }
@@ -1163,7 +1315,7 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), St
 pub fn fit_block_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
-) -> Result<BlockSparseFit, String> {
+) -> Result<BlockSparseFit, BlockSparseFitError> {
     validate(x, config)?;
     let n = x.nrows();
     let g = config.n_blocks;
@@ -1187,18 +1339,30 @@ pub fn fit_block_sparse_dictionary(
     let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut epochs_run = 0usize;
+    let mut last_ev = f64::NEG_INFINITY;
+    let mut ev_residual = f64::INFINITY;
+    let mut gamma_residual = f64::INFINITY;
+    let mut frame_residual = f64::INFINITY;
+    let mut accepted_births = 0usize;
+    let mut polar_failures = 0usize;
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
+        let previous_gamma = gamma;
 
         // (γ) closed-form shared scalar given current frames/routing.
         gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
 
         // (frames) MOD cross-moment + polar reprojection onto St(b, P).
-        refresh_frames(x, &codes, &mut decoder, gamma, g, b, config.frame_ridge);
+        let refresh_outcome =
+            refresh_frames(x, &codes, &mut decoder, gamma, g, b, config.frame_ridge);
+        polar_failures = refresh_outcome.0;
+        frame_residual = refresh_outcome.1;
 
         // (revival) AuxK dead-block reseeding from worst-residual rows.
-        let revived = revive_dead_blocks(x, &codes, &mut decoder, gamma, g, b, config.aux_k);
+        let (revived_blocks, revival_residual) =
+            revive_dead_blocks(x, &codes, &mut decoder, gamma, g, b, config.aux_k);
+        frame_residual = frame_residual.max(revival_residual);
 
         // (re-encode) fresh routing + codes against the refreshed frames — these
         // define the post-epoch model, feed the next epoch, and score EV.
@@ -1213,16 +1377,64 @@ pub fn fit_block_sparse_dictionary(
             config.block_tile,
         )?;
 
+        // Close the γ coordinate on the refreshed frames/routing before testing
+        // stationarity. Routing is invariant to a positive shared γ, and every
+        // signed code is linear in γ, so rescaling is the exact re-encode and
+        // avoids a second O(N·G·P) route pass.
+        let gamma_before_close = gamma;
+        gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
+        if gamma_before_close > 0.0 && gamma != gamma_before_close {
+            let rescale = gamma / gamma_before_close;
+            for code in &mut codes {
+                for value in &mut code.codes {
+                    *value *= rescale;
+                }
+            }
+        }
+        gamma_residual = relative_scalar_change(previous_gamma, gamma);
+
+        let mut revived_mask = vec![false; g];
+        for &block in &revived_blocks {
+            revived_mask[block] = true;
+        }
+        let mut accepted_mask = vec![false; g];
+        for code in &codes {
+            for (slot, &block) in code.blocks.iter().enumerate() {
+                let block = block as usize;
+                if code.gates[slot] != 0.0 && revived_mask[block] {
+                    accepted_mask[block] = true;
+                }
+            }
+        }
+        accepted_births = accepted_mask.into_iter().filter(|accepted| *accepted).count();
+
         let ev = explained_variance(x, &codes, decoder.view(), gamma, b);
         let improve = ev - prev_ev;
-        // As in the atom lane: do not declare convergence while dead blocks are
-        // still being revived (a plateau mid-population would freeze a still-dead
-        // tail). Once no block is revived, the ordinary EV-plateau test governs.
-        if revived == 0 && improve.abs() <= config.tolerance && epoch > 0 {
+        last_ev = ev;
+        ev_residual = improve.abs();
+        let fixed_point_residual = ev_residual.max(gamma_residual).max(frame_residual);
+        if accepted_births == 0
+            && polar_failures == 0
+            && fixed_point_residual <= config.tolerance
+            && epoch > 0
+        {
             converged = true;
             break;
         }
         prev_ev = ev;
+    }
+
+    if !converged {
+        return Err(BlockSparseFitError::NonConvergence {
+            epochs: epochs_run,
+            explained_variance: last_ev,
+            ev_residual,
+            gamma_residual,
+            frame_residual,
+            tolerance: config.tolerance,
+            accepted_births,
+            polar_failures,
+        });
     }
 
     // One final γ refresh against the last routing so the returned scalar is the
@@ -1305,7 +1517,12 @@ pub fn fit_block_sparse_dictionary(
         matryoshka_prefix_losses: prefix_losses,
         explained_variance: final_ev,
         epochs: epochs_run,
-        converged,
+        convergence: BlockSparseConvergence {
+            ev_residual,
+            gamma_residual,
+            frame_residual,
+            tolerance: config.tolerance,
+        },
         block_topk: k,
         block_size: b,
     })

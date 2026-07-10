@@ -345,9 +345,9 @@ pub fn build_termspec(
                         feature_col: col,
                         feature_cols: vec![col],
                         categorical_levels: vec![],
-                        // Parametric linear terms are unpenalized by default
-                        // (MLE, matching mgcv/glm); see #749.
-                        double_penalty: false,
+                        // Only the intercept is structurally unpenalized by
+                        // default; REML may shrink an unsupported slope to zero.
+                        double_penalty: true,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
                         coefficient_max: *coefficient_max,
@@ -360,8 +360,7 @@ pub fn build_termspec(
                                 feature_col: col,
                                 feature_cols: vec![col],
                                 categorical_levels: vec![],
-                                // Unpenalized parametric effect by default (#749).
-                                double_penalty: false,
+                                double_penalty: true,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
@@ -413,7 +412,7 @@ pub fn build_termspec(
                     feature_col: col,
                     feature_cols: vec![col],
                     categorical_levels: vec![],
-                    double_penalty: false,
+                    double_penalty: true,
                     coefficient_geometry: LinearCoefficientGeometry::Bounded {
                         min: *min,
                         max: *max,
@@ -713,9 +712,8 @@ pub fn build_termspec(
                         feature_col: numeric_cols[0],
                         feature_cols: numeric_cols,
                         categorical_levels: vec![],
-                        // Parametric `:` interaction column is unpenalized by
-                        // default, same as any other linear term (#749).
-                        double_penalty: false,
+                        // Interactions are recoverable as zero by default.
+                        double_penalty: true,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: None,
                         coefficient_max: None,
@@ -797,7 +795,7 @@ pub fn build_termspec(
                             feature_col,
                             feature_cols: numeric_cols.clone(),
                             categorical_levels,
-                            double_penalty: false,
+                            double_penalty: true,
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
@@ -2388,14 +2386,10 @@ pub fn build_smooth_basis(
                     parse_cyclic_boundary(options, minv, maxv)?,
                 )
             };
-            // mgcv `bs="cr"` does not shrink the linear null space; only `cs`
-            // (and the gamfit-flavoured `bspline`/`ps`) do. Honour an explicit
-            // `double_penalty=` either way.
-            let double_penalty = if type_opt == "cr" {
-                option_bool(options, "double_penalty").unwrap_or(false)
-            } else {
-                smooth_double_penalty
-            };
+            // Both cubic-regression spellings recover unsupported null-space
+            // effects by default. An explicit `double_penalty=false` is the
+            // MLE-style opt-out.
+            let double_penalty = smooth_double_penalty;
             // Clamp the marginal difference penalty to `<= effective_degree`
             // so it stays well-defined when the per-axis degree was reduced
             // (mirrors the tensor margin path: `create_difference_penalty_matrix`
@@ -3538,22 +3532,10 @@ pub fn build_smooth_basis(
             } else {
                 Vec::new()
             };
-            // Tensor smooths (`te`/`ti`/`t2`) must match mgcv's DEFAULT
-            // `select = FALSE`: the joint null space of the per-margin
-            // penalties — the bilinear, low-order interaction directions that
-            // no marginal roughness operator can see — is left UNPENALIZED.
-            // mgcv only adds a null-space shrinkage penalty there under the
-            // opt-in `select = TRUE` (which gam exposes as `double_penalty`).
-            //
-            // The general smooth default (`smooth_double_penalty`, true) is
-            // calibrated for 1-D `s()` terms; carrying it into tensors silently
-            // shrinks the genuinely-present bilinear interaction signal, so
-            // REML places positive weight on the extra ridge and systematically
-            // OVER-SMOOTHS the recovered surface relative to mgcv's plain
-            // `te`/`ti` (gam#700/#701/#702/#703). Default tensors to no extra
-            // null-space penalty; an explicit user `double_penalty=`/`select=`
-            // still wins.
-            let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
+            // The tensor's joint polynomial null space is independently
+            // shrinkable by default, so REML can recover an unsupported surface
+            // as zero. Explicit `double_penalty=false` remains the MLE opt-out.
+            let tensor_double_penalty = smooth_double_penalty;
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: canon_cols,
                 spec: TensorBSplineSpec {
@@ -5535,7 +5517,7 @@ mod tests {
         );
         let col_map = ds.column_map();
 
-        for (selector, expect_double_penalty) in [("cr", false), ("cs", true)] {
+        for selector in ["cr", "cs"] {
             let formula = format!("y ~ s(x, bs='{selector}')");
             let parsed = parse_formula(&formula).expect("parse cr/cs smooth");
             let mut notes = Vec::new();
@@ -5553,12 +5535,102 @@ mod tests {
                     terms.smooth_terms[0].basis
                 );
             };
-            assert_eq!(
-                spec.double_penalty, expect_double_penalty,
-                "bs='{selector}' must default double_penalty to mgcv's convention \
-                 (cr=no-shrinkage, cs=shrinkage); got double_penalty={}",
-                spec.double_penalty
+            assert!(
+                spec.double_penalty,
+                "bs='{selector}' must recover its null space by default"
             );
+
+            let opt_out = format!("y ~ s(x, bs='{selector}', double_penalty=false)");
+            let parsed = parse_formula(&opt_out).expect("parse explicit null-shrinkage opt-out");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &gam_runtime::resource::ResourcePolicy::default_library(),
+            )
+            .expect("explicit cr/cs opt-out should build");
+            let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+                panic!("bs='{selector}' must lower to a BSpline1D");
+            };
+            assert!(!spec.double_penalty, "explicit opt-out must be preserved");
+        }
+    }
+
+    #[test]
+    fn non_intercept_linear_effects_default_to_null_recovery() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..24)
+                .map(|i| {
+                    let x = i as f64 / 23.0;
+                    let z = 1.0 - x;
+                    vec![x - z, x, z]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula(
+            "y ~ x + bounded(z, min=-2, max=2) + x:z",
+        )
+        .expect("parse linear defaults");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &ds.column_map(),
+            &mut notes,
+            &gam_runtime::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build linear defaults");
+        assert!(!terms.linear_terms.is_empty());
+        assert!(
+            terms
+                .linear_terms
+                .iter()
+                .all(|term| term.double_penalty),
+            "every non-intercept linear effect must be shrinkable by default: {:?}",
+            terms
+                .linear_terms
+                .iter()
+                .map(|term| (&term.name, term.double_penalty))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tensor_smooths_default_to_joint_null_recovery_with_explicit_opt_out() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..36)
+                .map(|i| {
+                    let x = i as f64 / 35.0;
+                    let z = ((i * 11) % 36) as f64 / 35.0;
+                    vec![x * z, x, z]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+        for constructor in ["te", "ti", "t2"] {
+            for (option, expected) in [("", true), (", double_penalty=false", false)] {
+                let formula = format!("y ~ {constructor}(x, z{option})");
+                let parsed = parse_formula(&formula).expect("parse tensor default");
+                let mut notes = Vec::new();
+                let terms = build_termspec(
+                    &parsed.terms,
+                    &ds,
+                    &col_map,
+                    &mut notes,
+                    &gam_runtime::resource::ResourcePolicy::default_library(),
+                )
+                .unwrap_or_else(|error| panic!("{formula} must build: {error}"));
+                let SmoothBasisSpec::TensorBSpline { spec, .. } =
+                    &terms.smooth_terms[0].basis
+                else {
+                    panic!("{formula} must lower to TensorBSpline");
+                };
+                assert_eq!(spec.double_penalty, expected, "{formula}");
+            }
         }
     }
 

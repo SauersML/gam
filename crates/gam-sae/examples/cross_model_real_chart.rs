@@ -60,7 +60,6 @@ struct ChartFit {
     final_grad_norm: Option<f64>,
     fit_wall_seconds: f64,
     criterion_calls: usize,
-    fd_probe_calls: usize,
     infeasible_total: usize,
     coords_radians: Array1<f64>,
 }
@@ -266,7 +265,6 @@ fn print_chart_fit(fit: &ChartFit) {
     );
     println!("{prefix}_fit_wall_seconds={:.3}", fit.fit_wall_seconds);
     println!("{prefix}_criterion_calls={}", fit.criterion_calls);
-    println!("{prefix}_fd_probe_calls={}", fit.fd_probe_calls);
     println!("{prefix}_infeasible_total={}", fit.infeasible_total);
 }
 
@@ -375,7 +373,6 @@ fn fit_real_chart(
         final_grad_norm: result.final_grad_norm,
         fit_wall_seconds: fit_started.elapsed().as_secs_f64(),
         criterion_calls: telemetry.criterion_calls,
-        fd_probe_calls: telemetry.fd_probe_calls,
         infeasible_total: telemetry.infeasible_total(),
         coords_radians,
     })

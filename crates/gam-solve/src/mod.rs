@@ -1,6 +1,7 @@
 pub mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
+pub mod constrained_gaussian_reml;
 pub mod cross_node;
 // The custom-family blockwise carrier (`custom_family` + its persistent
 // warm-start cache) was extracted into the `gam-custom-family` crate (#1521),
@@ -72,14 +73,16 @@ pub mod warm_start_artifact;
 pub mod warm_start_transfer;
 
 pub use evidence::{
-    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,
-    GaussianMixtureFit, SelectedTopology, StackingConfig, StackingWeights, TopologyCandidate,
+    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource,
+    GaussianMixtureCertificate, GaussianMixtureCheckpoint, GaussianMixtureConfig,
+    GaussianMixtureError, GaussianMixtureFit, SelectedTopology, StackingCertificate,
+    StackingCheckpoint, StackingConfig, StackingError, StackingWeights, TopologyCandidate,
     TopologyKind, TopologyScoreScale, TopologySelectOptions, UNION_STRUCTURE_LADDER,
     UnionComponentFit, UnionComponentKind, UnionStructure, UnionStructureFit, evidence_grad_rho,
     evidence_hessian_log_det, evidence_ift_gradient_correction, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp, laplace_evidence,
-    select_topology, solve_stacking_weights, union_per_point_log_density,
-    union_responsibility_split,
+    resume_gaussian_mixture, resume_stacking_weights, select_topology, solve_stacking_weights,
+    union_per_point_log_density, union_responsibility_split,
 };
 pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,

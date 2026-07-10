@@ -130,23 +130,29 @@ def _torch_smooth_dispatch_key(class_name: str) -> str:
 
 
 def _bspline_penalty_np(knots_np: Any, degree: int, order: int, periodic: bool) -> Any:
-    """Difference penalty matching the design ``bspline_basis`` builds.
+    """Exact derivative roughness matching the design ``bspline_basis`` builds.
 
     The open basis spans ``len(knots) - degree - 1`` columns and takes the
-    open-spline difference penalty. The periodic basis is cyclic on the
+    open-spline derivative Gram. The periodic basis is cyclic on the
     knot-interval lattice — ``len(knots) - 1`` columns for any degree — so
-    its penalty must be the cyclic difference penalty at that SAME width;
-    the open penalty has the wrong dimension (and the wrong wrap-around
-    coupling) for a cyclic coefficient vector.
+    its penalty integrates wrapped basis derivatives over that SAME period.
     """
     if periodic:
         import numpy as np
 
         from .._binding import rust_module
 
-        num_basis = int(np.asarray(knots_np).size - 1)
+        knots_array = np.asarray(knots_np, dtype=float)
+        num_basis = int(knots_array.size - 1)
+        period = float(knots_array[-1] - knots_array[0])
         return np.asarray(
-            rust_module().cyclic_difference_penalty(num_basis, int(order)), dtype=float
+            rust_module().cyclic_bspline_roughness_penalty(
+                num_basis,
+                int(degree),
+                period,
+                int(order),
+            ),
+            dtype=float,
         )
     from .._api import smoothness_penalty as _smoothness_penalty
 
@@ -196,8 +202,8 @@ def _marginal_bspline_design_penalty(
     Mirrors the scalar :class:`BSpline` branch exactly: the design carries the
     autograd VJP back to ``x`` through :func:`bspline_basis`, and the penalty
     shares the SAME resolved knot vector, effective degree, and (cyclic vs
-    open) topology as the design so the difference penalty regularizes the
-    basis the design actually spans (auto-knot derivation may downgrade the
+    open) topology as the design so the derivative roughness regularizes the
+    function the design actually spans (auto-knot derivation may downgrade the
     degree for small n — #340).
 
     ``x`` is the 1D marginal coordinate ``(N,)``. Returns ``(B_x, S_x)`` where
@@ -422,7 +428,7 @@ def _build_design_penalty(
                 f"TensorBSpline has {len(marginals)} marginals but points have "
                 f"d={points.shape[1]}"
             )
-        # Per-marginal 1D B-spline design + difference penalty (shared knots).
+        # Per-marginal 1D B-spline design + exact derivative Gram (shared knots).
         marg_designs: list[torch.Tensor] = []
         marg_penalties: list[torch.Tensor] = []
         for j, marg in enumerate(marginals):

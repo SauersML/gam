@@ -2109,11 +2109,12 @@ def smoothness_penalty(
     degree: int = 3,
     order: int = 2,
 ) -> tuple[Any, Any]:
-    """Return ``(S, null_basis)`` for the Rust B-spline difference penalty.
+    """Return ``(S, null_basis)`` for exact B-spline derivative roughness.
 
     ``knots`` must be a knot vector here — auto-derivation requires
     sample positions, which this penalty constructor does not take. Build
-    one with :func:`bspline_basis`'s defaults (or pass any 1D array).
+    one with :func:`bspline_basis`'s defaults (or pass any 1D array). ``S``
+    represents ``integral (f^(order)(x))^2 dx`` in that spline basis.
     """
     import numpy as np
 
@@ -2182,8 +2183,8 @@ def periodic_spline_curve_basis(
     """Return ``(basis, penalty)`` for a closed cyclic B-spline basis on ``t``.
 
     The basis is uniform on ``[0, 1)`` and periodic (wraps cleanly). The
-    penalty is the cyclic ``order``-th difference penalty on the ``n_knots``
-    cyclic control points. To fit a closed curve ``t -> R^d``, regress a
+    penalty is the exact cyclic derivative roughness
+    ``integral_0^1 (f^(order)(t))^2 dt``. To fit a closed curve ``t -> R^d``, regress a
     ``(N, d)`` response against the returned ``(N, K)`` basis with the
     returned ``(K, K)`` penalty.
 
@@ -2192,7 +2193,7 @@ def periodic_spline_curve_basis(
     t : array-like of shape ``(N,)``. Values are taken modulo 1.
     n_knots : number of cyclic control points / basis columns.
     degree : B-spline degree. Default 3.
-    penalty_order : order of the cyclic difference penalty. Default 2.
+    penalty_order : derivative order in the cyclic roughness. Default 2.
 
     Returns
     -------

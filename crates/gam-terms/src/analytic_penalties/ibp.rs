@@ -52,6 +52,19 @@ pub struct IBPAssignmentPenalty {
     /// (the default) scores every column, bit-for-bit the historical path. Set
     /// via a plain field assignment, like `weight`. (#Bug4)
     pub fixed_columns: Option<Vec<bool>>,
+    /// #991 design-honesty per-row weights `w_i` (mean-1 inclusion weights of a
+    /// design-weighted subsample; `None` ⇒ every row weighs 1, bit-for-bit the
+    /// historical path). The IBP prior is NOT row-separable — the plug-in
+    /// posterior mean couples rows through the column active mass — so the
+    /// weights enter in exactly two places, identically in every channel:
+    /// the column mass becomes `M_k = Σ_i w_i·z_ik` with effective row count
+    /// `N_eff = Σ_i w_i` (all column scalars `π̂, score, s′, s″` and their
+    /// α-derivatives read these), and each per-row emission carries `w_i`
+    /// (energy `w_i·bce_i`, so the design-weighted concrete Jacobian is
+    /// `u_ik = w_i·J_ik` and every gradient/curvature/third-channel slot is the
+    /// exact derivative of the weighted energy — value/gradient/Hessian remain
+    /// one operator).
+    pub row_weights: Option<std::sync::Arc<[f64]>>,
 }
 
 impl IBPAssignmentPenalty {
@@ -69,7 +82,40 @@ impl IBPAssignmentPenalty {
             weight: 1.0,
             weight_schedule: None,
             fixed_columns: None,
+            row_weights: None,
         }
+    }
+
+    /// Install #991 design-honesty per-row weights (see [`Self::row_weights`]).
+    #[must_use]
+    pub fn with_row_weights(mut self, weights: Option<&[f64]>) -> Self {
+        self.row_weights = weights.map(|w| std::sync::Arc::from(w.to_vec()));
+        self
+    }
+
+    /// Per-row design weight `w_i` (`1.0` when no weights are installed).
+    #[inline]
+    fn row_weight(&self, row: usize) -> f64 {
+        self.row_weights.as_ref().map_or(1.0, |w| w[row])
+    }
+
+    /// Design-weighted column active mass `M_k = Σ_i w_i·z_ik` and effective row
+    /// count `N_eff = Σ_i w_i` — the ONE source every channel's column scalars
+    /// read, so the weighted objective and all its derivatives share a single
+    /// plug-in `π̂_k = (M_k + a_k)/(N_eff + a_k + 1)`.
+    fn weighted_active_mass(&self, z: ArrayView1<'_, f64>) -> (Array1<f64>, f64) {
+        let n = z.len() / self.k_max;
+        let mut mass = Array1::<f64>::zeros(self.k_max);
+        let mut n_eff = 0.0_f64;
+        for row in 0..n {
+            let w = self.row_weight(row);
+            n_eff += w;
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                mass[k] += w * z[start + k];
+            }
+        }
+        (mass, n_eff)
     }
 
     /// Whether column (atom) `k` is a FIXED / inert column excluded from this
@@ -169,15 +215,11 @@ impl IBPAssignmentPenalty {
         z: ArrayView1<'_, f64>,
         a_col: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        let n = z.len() / self.k_max;
+        let (active_mass, n_eff) = self.weighted_active_mass(z);
         let mut pi = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
-            let mut active_mass = 0.0;
-            for row in 0..n {
-                active_mass += z[row * self.k_max + k];
-            }
-            let denom = (n as f64 + a_col[k] + 1.0).max(IBP_COUNT_DENOM_FLOOR);
-            let raw = (active_mass + a_col[k]) / denom;
+            let denom = (n_eff + a_col[k] + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let raw = (active_mass[k] + a_col[k]) / denom;
             pi[k] = raw.clamp(IBP_INTERIOR_TOL, 1.0 - IBP_INTERIOR_TOL);
         }
         pi
@@ -245,20 +287,16 @@ impl IBPAssignmentPenalty {
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
 
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991 design weights: column scalars read the weighted mass/N_eff, and
+        // every per-slot emission below uses the weighted Jacobian `u = w·J`.
+        let (active_mass, n_eff) = self.weighted_active_mass(z.view());
 
         let mut score = Array1::<f64>::zeros(self.k_max);
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut score_second_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let a = a_col[k];
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let denom = (n_eff + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -267,12 +305,12 @@ impl IBPAssignmentPenalty {
             } else {
                 0.0
             };
-            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let bce_pi_score = -mass / pk + (n_eff - mass) / (1.0 - pk);
             let beta_pi_score = -(a - 1.0) / pk;
             let pi_score = bce_pi_score + beta_pi_score;
             let pi_score_derivative = -1.0 / pk + (mass + a - 1.0) * pi_jac / (pk * pk)
                 - 1.0 / (1.0 - pk)
-                + (n as f64 - mass) * pi_jac / ((1.0 - pk) * (1.0 - pk));
+                + (n_eff - mass) * pi_jac / ((1.0 - pk) * (1.0 - pk));
             let direct_z_score = ((1.0 - pk) / pk).ln();
             let implicit_pi_score = pi_score * pi_jac;
             score[k] = direct_z_score + implicit_pi_score;
@@ -296,7 +334,7 @@ impl IBPAssignmentPenalty {
             let dpisd = 2.0 / (pk * pk)
                 - 2.0 * (mass + a - 1.0) * pi_jac / (pk * pk * pk)
                 - 2.0 / (one_minus * one_minus)
-                + 2.0 * (n as f64 - mass) * pi_jac / (one_minus * one_minus * one_minus);
+                + 2.0 * (n_eff - mass) * pi_jac / (one_minus * one_minus * one_minus);
             score_second_derivative[k] = ddzd + dpisd * pi_jac * pi_jac;
         }
 
@@ -307,6 +345,16 @@ impl IBPAssignmentPenalty {
         let mut logit_curvature = Array1::<f64>::zeros(len);
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: the design-weighted energy is `Σ_i w_i·bce_i` with
+            // `M_k = Σ_i w_i·z_ik`, so its concrete-Jacobian carrier is
+            // `u_ik = w_i·J_ik` and the per-slot curvature is
+            // `H_ik = w·[s'_k·u_ik² + s_k·(w_i·c_ik)]`. The slots below emit the
+            // exact derivatives of THAT weighted operator: `z_jac` carries `u`,
+            // `logit_curvature` carries `∂u_ik/∂ℓ_ik = w_i·c_ik`, and the local /
+            // M-channels differentiate `H_ik` with the same folding — consumers
+            // (Woodbury rank-one, θ-adjoint, ∂M/∂ℓ distribution) read the folded
+            // slots and stay convention-free of the weights.
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 // #Bug4: fixed/inert column ⇒ every log-det adjoint channel slot
                 // stays zero (matches `value`/`grad_target`/`hessian_diag`).
@@ -315,6 +363,7 @@ impl IBPAssignmentPenalty {
                 }
                 let zk = z[start + k];
                 let jac = zk * (1.0 - zk) * inv_tau;
+                let u_ik = w_i * jac;
                 let c_ik = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
                 // ∂_z J = (1−2z)/τ, ∂_z c = (1−6z+6z²)/τ².
                 let dz_j = (1.0 - 2.0 * zk) * inv_tau;
@@ -331,14 +380,19 @@ impl IBPAssignmentPenalty {
                 } else {
                     (1.0, 1.0)
                 };
+                // ∂_z H_ik = w_i·w·[s'·2u·∂_zJ + s·∂_zc]; the trailing `jac` is
+                // the ∂z/∂ℓ chain (unweighted J — the weight already rode in via
+                // `w_i·`), so `local = (∂_z H)·J = w·u·[s'·2u·dz_j + s·dz_c]`.
                 let dz_h =
-                    gate_col * score_derivative[k] * 2.0 * jac * dz_j + gate_sc * score[k] * dz_c;
-                z_jac[start + k] = jac;
-                local_logit_third[start + k] = self.weight * jac * dz_h;
+                    gate_col * score_derivative[k] * 2.0 * u_ik * dz_j + gate_sc * score[k] * dz_c;
+                z_jac[start + k] = u_ik;
+                local_logit_third[start + k] = self.weight * u_ik * dz_h;
+                // ∂_M H_ik = w·[s''·u_ik² + s'·(w_i·c_ik)]; the consumer's
+                // `∂M_k/∂ℓ_wk = u_wk` factor comes from the folded `z_jac` slot.
                 m_channel[start + k] = self.weight
-                    * (gate_col * score_second_derivative[k] * jac * jac
-                        + gate_sc * score_derivative[k] * c_ik);
-                logit_curvature[start + k] = c_ik;
+                    * (gate_col * score_second_derivative[k] * u_ik * u_ik
+                        + gate_sc * score_derivative[k] * w_i * c_ik);
+                logit_curvature[start + k] = w_i * c_ik;
             }
         }
 
@@ -436,14 +490,8 @@ impl IBPAssignmentPenalty {
         let z = self.concrete_logits(target);
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
-        let n_f = n as f64;
+        // #991: weighted mass/N_eff — one plug-in π̂ shared with every channel.
+        let (active_mass, n_f) = self.weighted_active_mass(z.view());
         // mixed[i·K+k] = ∂(grad_rho)/∂ℓ_ik = ∂²F/∂ρ∂ℓ_ik. With grad_rho's per-column
         // summand G_k = pi_score_k·(a_k'(N+1−M_k)/D_k²) + a_k'·(−1/a_k − ln π_k),
         // where a_k' = ∂a_k/∂ρ, and ℓ_ik's only reach through M_k (∂M_k/∂ℓ_ik =
@@ -475,10 +523,13 @@ impl IBPAssignmentPenalty {
         }
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: `∂M_k/∂ℓ_ik = w_i·J_ik` — the mixed channel differentiates
+            // the SAME weighted mass every other channel reads.
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let z_jac = zk * (1.0 - zk) / tau;
-                out[start + k] = self.weight * d_g_dm[k] * z_jac;
+                out[start + k] = self.weight * d_g_dm[k] * w_i * z_jac;
             }
         }
         out
@@ -522,15 +573,9 @@ impl IBPAssignmentPenalty {
         let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
-        let n = z.len() / self.k_max;
-        let n_f = n as f64;
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991: weighted mass/N_eff — the α-derivative scalars differentiate the
+        // same design-weighted plug-in π̂ every other channel reads.
+        let (active_mass, n_f) = self.weighted_active_mass(z.view());
         for k in 0..self.k_max {
             // #Bug4: fixed/inert column ⇒ zero ρ-derivative scalars (this masks
             // both `hessian_diag_log_alpha_derivative` and `cross_row_d_logalpha`).
@@ -596,12 +641,16 @@ impl IBPAssignmentPenalty {
         let (d_score, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: ∂ρ of the weighted diagonal H_ik = w·[s'·u² + s·(w_i·c)],
+            // u = w_i·J — the α-derivative keeps the identical folding.
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let z_jac = zk * (1.0 - zk) * inv_tau;
+                let u_ik = w_i * z_jac;
                 let z_second = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
-                out[start + k] =
-                    self.weight * (d_score_derivative[k] * z_jac * z_jac + d_score[k] * z_second);
+                out[start + k] = self.weight
+                    * (d_score_derivative[k] * u_ik * u_ik + d_score[k] * w_i * z_second);
             }
         }
         out
@@ -668,6 +717,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let mut acc = 0.0;
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: each retained row stands for `w_i` design rows, so its
+            // Bernoulli score carries `w_i` — matching the weighted mass inside
+            // `π̂` so value and every derivative describe ONE weighted energy.
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 // #Bug4: a fixed/inert column contributes nothing to the energy.
                 if self.column_is_fixed(k) {
@@ -675,7 +728,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 }
                 let zk = z[start + k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
-                acc -= zk * pk.ln() + (1.0 - zk) * (1.0 - pk).ln();
+                acc -= w_i * (zk * pk.ln() + (1.0 - zk) * (1.0 - pk).ln());
             }
         }
         for k in 0..self.k_max {
@@ -701,30 +754,29 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991: weighted mass/N_eff — the same plug-in π̂ the value scores.
+        let (active_mass, n_eff) = self.weighted_active_mass(z.view());
         let mut pi_score = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let a = a_col[k];
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let denom = (n_eff + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 pi_jac[k] = 1.0 / denom;
             }
-            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let bce_pi_score = -mass / pk + (n_eff - mass) / (1.0 - pk);
             let beta_pi_score = -(a - 1.0) / pk;
             pi_score[k] = bce_pi_score + beta_pi_score;
         }
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: ∂F/∂ℓ_ik = w_i·score_k·J_ik — BOTH the row's own `w_i·bce_i`
+            // and the implicit-π̂ channel (∂M/∂ℓ_ik = w_i·J_ik) carry the same
+            // w_i, so the slot is w_i × the column score.
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 // #Bug4: a fixed/inert column contributes nothing to the energy,
                 // so its gradient block is exactly zero (matches `value`).
@@ -735,8 +787,12 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let direct_z_score = ((1.0 - pk) / pk).ln();
                 let implicit_pi_score = pi_score[k] * pi_jac[k];
-                out[start + k] =
-                    self.weight * (direct_z_score + implicit_pi_score) * zk * (1.0 - zk) / tau;
+                out[start + k] = self.weight
+                    * w_i
+                    * (direct_z_score + implicit_pi_score)
+                    * zk
+                    * (1.0 - zk)
+                    / tau;
             }
         }
         out
@@ -755,34 +811,33 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let n = z.len() / self.k_max;
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (tau * tau);
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991: weighted mass/N_eff — one plug-in π̂ shared with every channel.
+        let (active_mass, n_eff) = self.weighted_active_mass(z.view());
         let mut pi_score = Array1::<f64>::zeros(self.k_max);
         let mut pi_score_derivative = Array1::<f64>::zeros(self.k_max);
         let mut pi_jac = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let a = a_col[k];
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let denom = (n_eff + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
             if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
                 pi_jac[k] = 1.0 / denom;
             }
-            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let bce_pi_score = -mass / pk + (n_eff - mass) / (1.0 - pk);
             let beta_pi_score = -(a - 1.0) / pk;
             pi_score[k] = bce_pi_score + beta_pi_score;
             pi_score_derivative[k] = -1.0 / pk + (mass + a - 1.0) * pi_jac[k] / (pk * pk)
                 - 1.0 / (1.0 - pk)
-                + (n as f64 - mass) * pi_jac[k] / ((1.0 - pk) * (1.0 - pk));
+                + (n_eff - mass) * pi_jac[k] / ((1.0 - pk) * (1.0 - pk));
         }
         for row in 0..n {
             let start = row * self.k_max;
+            // #991: H_ik = w·[s'_k·u_ik² + s_k·(w_i·c_ik)], u_ik = w_i·J_ik — the
+            // exact second derivative of the weighted energy (the rank-one self
+            // term carries w_i², the diagonal concrete-curvature term w_i).
+            let w_i = self.row_weight(row);
             for k in 0..self.k_max {
                 // #Bug4: a fixed/inert column contributes nothing to the energy,
                 // so its curvature block is exactly zero (matches `value`).
@@ -798,9 +853,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let score_derivative =
                     direct_z_score_derivative + pi_score_derivative[k] * pi_jac[k];
                 let z_jac = zk * (1.0 - zk) / tau;
+                let u_ik = w_i * z_jac;
                 out[start + k] = self.weight
-                    * (score_derivative * z_jac * z_jac
-                        + score * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2);
+                    * (score_derivative * u_ik * u_ik
+                        + score * w_i * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2);
             }
         }
         Some(out)
@@ -830,18 +886,13 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         // score, score_derivative). These are identical to hessian_diag and
         // share the same interior / boundary-clamp convention, so the on-row
         // diagonal returned by hvp(·, eⱼ) agrees with hessian_diag bit-for-bit.
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991: weighted mass/N_eff — one plug-in π̂ shared with every channel.
+        let (active_mass, n_eff) = self.weighted_active_mass(z.view());
         let mut score = Array1::<f64>::zeros(self.k_max);
         let mut score_derivative = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let a = a_col[k];
-            let denom = (n as f64 + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
+            let denom = (n_eff + a + 1.0).max(IBP_COUNT_DENOM_FLOOR);
             let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
             let mass = active_mass[k];
             let raw = (mass + a) / denom;
@@ -850,12 +901,12 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             } else {
                 0.0
             };
-            let bce_pi_score = -mass / pk + (n as f64 - mass) / (1.0 - pk);
+            let bce_pi_score = -mass / pk + (n_eff - mass) / (1.0 - pk);
             let beta_pi_score = -(a - 1.0) / pk;
             let pi_score = bce_pi_score + beta_pi_score;
             let pi_score_derivative = -1.0 / pk + (mass + a - 1.0) * pi_jac / (pk * pk)
                 - 1.0 / (1.0 - pk)
-                + (n as f64 - mass) * pi_jac / ((1.0 - pk) * (1.0 - pk));
+                + (n_eff - mass) * pi_jac / ((1.0 - pk) * (1.0 - pk));
             let direct_z_score = ((1.0 - pk) / pk).ln();
             let implicit_pi_score = pi_score * pi_jac;
             score[k] = direct_z_score + implicit_pi_score;
@@ -875,25 +926,31 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         // full Hessian is block-diagonal by column.
         //
         // For an input vector v, the rank-1 contribution collapses to a
-        // single per-column scalar sₖ = Σⱼ z_jac[j,k] · v[j,k]:
+        // single per-column scalar sₖ = Σⱼ u[j,k] · v[j,k], with the #991
+        // design-weighted carrier u[j,k] = w_j·z_jac[j,k]:
         //
-        //   (Hv)[j,k] = w · score_derivative[k] · z_jac[j,k] · sₖ
-        //             + w · score[k] · (1-2z[j,k]) · z(1-z)/τ² · v[j,k].
+        //   (Hv)[j,k] = w · score_derivative[k] · u[j,k] · sₖ
+        //             + w · score[k] · w_j · (1-2z[j,k]) · z(1-z)/τ² · v[j,k],
+        //
+        // the exact Hessian-vector product of the weighted energy (rank-one
+        // block u uᵀ, diagonal concrete curvature ×w_j).
         //
         // The default diagonal-only hvp drops the off-diagonal rank-1 piece,
         // which empirically carries ≈85% of the operator's Frobenius norm.
         let mut s_per_col = Array1::<f64>::zeros(self.k_max);
         for row in 0..n {
             let start = row * self.k_max;
+            let w_row = self.row_weight(row);
             for k in 0..self.k_max {
                 let zk = z[start + k];
                 let zjac = zk * (1.0 - zk) * inv_tau;
-                s_per_col[k] += zjac * v[start + k];
+                s_per_col[k] += w_row * zjac * v[start + k];
             }
         }
         let mut out = Array1::<f64>::zeros(target.len());
         for row in 0..n {
             let start = row * self.k_max;
+            let w_row = self.row_weight(row);
             for k in 0..self.k_max {
                 // #Bug4: fixed/inert column ⇒ zero Hessian block (columns are
                 // decoupled, so skipping zeroes the whole block; matches `value`).
@@ -901,9 +958,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                     continue;
                 }
                 let zk = z[start + k];
-                let zjac = zk * (1.0 - zk) * inv_tau;
-                let rank1 = score_derivative[k] * zjac * s_per_col[k];
-                let c_diag = score[k] * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+                let u_jk = w_row * zk * (1.0 - zk) * inv_tau;
+                let rank1 = score_derivative[k] * u_jk * s_per_col[k];
+                let c_diag = score[k] * w_row * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
                 out[start + k] = self.weight * (rank1 + c_diag * v[start + k]);
             }
         }
@@ -922,15 +979,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let z = self.concrete_logits(target);
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
-        let n = z.len() / self.k_max;
-        let n_f = n as f64;
-        let mut active_mass = Array1::<f64>::zeros(self.k_max);
-        for row in 0..n {
-            let start = row * self.k_max;
-            for k in 0..self.k_max {
-                active_mass[k] += z[start + k];
-            }
-        }
+        // #991: weighted mass/N_eff — this ρ-gradient differentiates the same
+        // design-weighted energy `value` reports (column-level; the per-row w_i
+        // already live inside `mass` and the weighted pi_score).
+        let (active_mass, n_f) = self.weighted_active_mass(z.view());
         // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ. Each column has its OWN Beta shape
         // a_k=μ_k/(1−μ_k) (μ_k=(α/(α+1))^(k+1) = the gate's prior mean), so
         // D_k=N+a_k+1 and da_k/dρ = column_beta_shape_rho_deriv. The plug-in π̂_k =

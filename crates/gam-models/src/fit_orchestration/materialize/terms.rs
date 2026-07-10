@@ -17,21 +17,18 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     scale_dimensions: bool,
     policy: &gam_runtime::resource::ResourcePolicy,
     smooth_overrides: Option<&JsonValue>,
-    spatial_escalation: Option<u32>,
+    spatial_center_counts: Option<&[Option<usize>]>,
 ) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    // #1689 saturation-escalation: when the caller opts in (`Some(level)` — only
-    // the standard fit path's refit loop does), resolve each 2-D+ spatial smooth's
-    // center count to the truth-adaptive escalated value BEFORE user overrides
-    // apply, so an explicit Python `smooths={...}` centers/n_centers request
-    // (applied just below) still wins. An explicit formula `centers=`/`k=` is
-    // honored via the parsed-term options provenance inside the helper. `None`
-    // leaves the worst-case `default_num_centers` provisioning untouched.
-    if let Some(level) = spatial_escalation {
-        apply_spatial_saturation_start(&mut spec, terms, data, col_map, level);
+    // The standard formula path starts every auto-sized 2-D+ spatial smooth at
+    // its structural minimum and threads per-term evidence-backed expansions
+    // back through this same materializer. Explicit formula counts are not
+    // `Auto`, and Python overrides apply afterward, so both remain authoritative.
+    if let Some(counts) = spatial_center_counts {
+        apply_adaptive_spatial_center_counts(&mut spec, data, counts)?;
     }
     if let Some(overrides) = smooth_overrides {
         gam_terms::smooth_overrides::apply_smooth_overrides(
@@ -45,40 +42,32 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     Ok(spec)
 }
 
-/// #1689 saturation-escalation: lower each eligible 2-D+ spatial smooth from the
-/// worst-case [`gam_terms::basis::default_num_centers`] provisioning down to the
-/// truth-adaptive [`gam_terms::basis::escalated_num_centers`] count at
-/// `escalation_level`. Level 0 is the modest mgcv-parity start; the
-/// `fit_from_formula` refit loop raises the level (re-materializing) only while a
-/// fitted spatial term reports its basis saturated, and the escalated count is
-/// capped at `default_num_centers`, so a saturated fit converges back to today's
-/// basis size (the accuracy fixed point).
+/// Apply the standard workflow's per-term adaptive spatial resolution plan.
 ///
 /// Eligibility (never clobber a pinned basis):
 /// * spatial radial family only (thin-plate / Duchon / Matérn / constant-curvature
 ///   / measure-jet) with covariate dimension `d ≥ 2` — the `default_num_centers`
 ///   -from-`n` cost driver; 1-D `s(x)` P-splines are already lean and untouched;
-/// * the current strategy must be a DATA-DRIVEN default
-///   ([`CenterStrategy::FarthestPoint`]/[`EqualMass`]); an explicit
-///   [`CenterStrategy::UserProvided`] center matrix is left alone;
-/// * the matching parsed term must carry no explicit `centers=`/`k=` option
-///   (formula provenance the built spec no longer records) — checked here against
-///   the `ParsedTerm` options.
+/// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
+///   every explicit formula/programmatic strategy is therefore left alone;
 /// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
 /// override the escalated value unconditionally.
-fn apply_spatial_saturation_start(
+fn apply_adaptive_spatial_center_counts(
     spec: &mut TermCollectionSpec,
-    terms: &[ParsedTerm],
     data: &Dataset,
-    col_map: &HashMap<String, usize>,
-    escalation_level: u32,
-) {
-    use gam_terms::basis::CenterStrategy;
+    requested_counts: &[Option<usize>],
+) -> Result<(), WorkflowError> {
+    use gam_terms::basis::{
+        center_strategy_is_auto, center_strategy_with_num_centers, starting_num_centers,
+    };
     let n = data.values.nrows();
     if n == 0 {
-        return;
+        return Ok(());
     }
-    for term in spec.smooth_terms.iter_mut() {
+    for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
+        let structural_minimum = gam_terms::smooth::spatial_term_min_center_count(term)
+            .saturating_add(1)
+            .min(n);
         let Some((strategy, feature_cols)) = spatial_center_strategy_mut(&mut term.basis) else {
             continue;
         };
@@ -86,21 +75,26 @@ fn apply_spatial_saturation_start(
         if d < 2 {
             continue;
         }
-        // Respect an explicit user center matrix.
-        if matches!(strategy, CenterStrategy::UserProvided(_)) {
+        if !center_strategy_is_auto(strategy) {
             continue;
         }
-        // Respect an explicit formula `centers=`/`k=` on the matching parsed term.
-        if parsed_term_pins_centers(terms, col_map, &feature_cols) {
-            continue;
-        }
-        let target = gam_terms::basis::escalated_num_centers(n, d, escalation_level);
-        if target >= 1 {
-            *strategy = CenterStrategy::EqualMass {
-                num_centers: target,
-            };
-        }
+        let target = requested_counts
+            .get(term_index)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| starting_num_centers(n, d))
+            .max(structural_minimum)
+            .min(n);
+        *strategy = center_strategy_with_num_centers(strategy, target).map_err(|error| {
+            WorkflowError::InvalidConfig {
+                reason: format!(
+                    "failed to set adaptive center count for spatial term '{}': {error}",
+                    term.name
+                ),
+            }
+        })?;
     }
+    Ok(())
 }
 
 /// Mutable `(center_strategy, feature_cols)` for a spatial radial smooth, peeling
@@ -153,40 +147,6 @@ fn spatial_center_strategy_mut(
         }
         _ => None,
     }
-}
-
-/// Did the user pin an explicit center count on the formula term that owns
-/// `feature_cols`? Matches the parsed `Smooth` term whose `vars` resolve (via
-/// `col_map`) to the same column set and checks its options for the center-count
-/// aliases the spatial builders honor (`centers`/`k`/`n_centers`/`basis_dim`).
-fn parsed_term_pins_centers(
-    terms: &[ParsedTerm],
-    col_map: &HashMap<String, usize>,
-    feature_cols: &[usize],
-) -> bool {
-    use std::collections::HashSet;
-    let needle: HashSet<usize> = feature_cols.iter().copied().collect();
-    for term in terms {
-        if let ParsedTerm::Smooth { vars, options, .. } = term {
-            let got: HashSet<usize> = vars
-                .iter()
-                .filter_map(|name| col_map.get(name.trim()).copied())
-                .collect();
-            if got == needle {
-                return [
-                    "centers",
-                    "k",
-                    "n_centers",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                ]
-                .iter()
-                .any(|key| options.contains_key(*key));
-            }
-        }
-    }
-    false
 }
 
 /// Drop the Duchon *operator* penalties (the collocation-Gram mass `Σ(f−f̄)²`

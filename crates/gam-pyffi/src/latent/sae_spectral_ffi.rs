@@ -70,151 +70,141 @@ fn block_sparse_fit_from_arrays(
     }
 }
 
-fn reconstruct_dense_sae_rows(
-    decoder: ndarray::ArrayView2<'_, f32>,
-    codes: ndarray::ArrayView2<'_, f32>,
-) -> Result<ndarray::Array2<f32>, String> {
-    if codes.ncols() != decoder.nrows() {
-        return Err(format!(
-            "audit_sae: codes have K={} columns but decoder has K={} rows",
-            codes.ncols(),
-            decoder.nrows()
-        ));
-    }
-    let mut fitted = ndarray::Array2::<f32>::zeros((codes.nrows(), decoder.ncols()));
-    for i in 0..codes.nrows() {
-        for k in 0..codes.ncols() {
-            let code = codes[[i, k]];
-            if code == 0.0 {
-                continue;
-            }
-            for p in 0..decoder.ncols() {
-                fitted[[i, p]] += code * decoder[[k, p]];
-            }
-        }
-    }
-    Ok(fitted)
+#[derive(Clone)]
+struct AuditSparseRoute {
+    indices: ndarray::Array2<u32>,
+    values: ndarray::Array3<f32>,
+    n_units: usize,
+    block_size: usize,
 }
 
-fn residuals_from_dense_sae(
+impl AuditSparseRoute {
+    fn new(
+        indices: ndarray::Array2<u32>,
+        values: ndarray::Array3<f32>,
+        n_units: usize,
+        block_size: usize,
+        label: &str,
+    ) -> Result<Self, String> {
+        if block_size == 0 {
+            return Err("audit_sae block_size must be >= 1".to_string());
+        }
+        if n_units == 0 {
+            return Err(format!("audit_sae {label} requires at least one routing unit"));
+        }
+        let (n_rows, width) = indices.dim();
+        if n_rows == 0 || width == 0 {
+            return Err(format!(
+                "audit_sae {label} must be a non-empty N×s route; got {:?}",
+                indices.dim()
+            ));
+        }
+        if values.shape() != [n_rows, width, block_size] {
+            return Err(format!(
+                "audit_sae {label} values shape {:?} does not match indices {:?} and block_size {block_size}",
+                values.shape(),
+                indices.dim()
+            ));
+        }
+        for row in 0..n_rows {
+            let mut live = std::collections::HashSet::with_capacity(width);
+            for slot in 0..width {
+                let unit = indices[[row, slot]] as usize;
+                if unit >= n_units {
+                    return Err(format!(
+                        "audit_sae {label} index {unit} at row {row}, slot {slot} is outside 0..{n_units}"
+                    ));
+                }
+                let mut norm2 = 0.0_f64;
+                for offset in 0..block_size {
+                    let value = values[[row, slot, offset]] as f64;
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "audit_sae {label} value at row {row}, slot {slot}, offset {offset} is not finite"
+                        ));
+                    }
+                    norm2 += value * value;
+                }
+                if norm2 > 0.0 && !live.insert(unit) {
+                    return Err(format!(
+                        "audit_sae {label} repeats live unit {unit} in row {row}"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            indices,
+            values,
+            n_units,
+            block_size,
+        })
+    }
+
+    fn nrows(&self) -> usize {
+        self.indices.nrows()
+    }
+
+    fn width(&self) -> usize {
+        self.indices.ncols()
+    }
+
+    fn gate(&self, row: usize, slot: usize) -> f64 {
+        let mut norm2 = 0.0_f64;
+        for offset in 0..self.block_size {
+            let value = self.values[[row, slot, offset]] as f64;
+            norm2 += value * value;
+        }
+        norm2.sqrt()
+    }
+
+    fn linear_codes(&self) -> ndarray::Array2<f32> {
+        self.values.index_axis(ndarray::Axis(2), 0).to_owned()
+    }
+
+    fn gates(&self) -> ndarray::Array2<f32> {
+        ndarray::Array2::from_shape_fn(self.indices.dim(), |(row, slot)| {
+            self.gate(row, slot) as f32
+        })
+    }
+
+    fn reconstruct(
+        &self,
+        decoder: ndarray::ArrayView2<'_, f32>,
+    ) -> Result<ndarray::Array2<f32>, String> {
+        if self.block_size == 1 {
+            gam::terms::sae::sparse_dict::reconstruct_sparse_rows(
+                decoder,
+                self.indices.view(),
+                self.values.index_axis(ndarray::Axis(2), 0),
+            )
+        } else {
+            gam::terms::sae::sparse_dict::reconstruct_block_sparse_rows(
+                decoder,
+                self.indices.view(),
+                self.values.view(),
+                self.block_size,
+            )
+        }
+    }
+}
+
+fn residuals_from_sparse_sae(
     data: ndarray::ArrayView2<'_, f32>,
     decoder: ndarray::ArrayView2<'_, f32>,
-    codes: ndarray::ArrayView2<'_, f32>,
+    route: &AuditSparseRoute,
 ) -> Result<ndarray::Array2<f32>, String> {
-    if data.ncols() != decoder.ncols() {
+    if data.ncols() != decoder.ncols() || data.nrows() != route.nrows() {
         return Err(format!(
-            "audit_sae: data have P={} columns but decoder has P={} columns",
-            data.ncols(),
-            decoder.ncols()
+            "audit_sae data shape {:?} is incompatible with decoder {:?} and {} route rows",
+            data.dim(),
+            decoder.dim(),
+            route.nrows()
         ));
     }
-    let fitted = reconstruct_dense_sae_rows(decoder, codes)?;
-    if fitted.nrows() != data.nrows() {
-        return Err(format!(
-            "audit_sae: data have N={} rows but codes have N={} rows",
-            data.nrows(),
-            fitted.nrows()
-        ));
-    }
+    let fitted = route.reconstruct(decoder)?;
     let mut residuals = data.to_owned();
     residuals -= &fitted;
     Ok(residuals)
-}
-
-fn dense_linear_topk(
-    codes: ndarray::ArrayView2<'_, f32>,
-    active: Option<usize>,
-) -> (ndarray::Array2<u32>, ndarray::Array2<f32>) {
-    let n = codes.nrows();
-    let k = codes.ncols();
-    let active_width = active.unwrap_or_else(|| {
-        let mut max_live = 0usize;
-        for row in codes.rows() {
-            let live = row.iter().filter(|value| **value != 0.0).count();
-            max_live = max_live.max(live);
-        }
-        max_live.max(1)
-    });
-    let width = active_width.min(k.max(1));
-    let mut indices = ndarray::Array2::<u32>::zeros((n, width));
-    let mut sparse_codes = ndarray::Array2::<f32>::zeros((n, width));
-    for row_idx in 0..n {
-        let mut live = Vec::new();
-        for atom_idx in 0..k {
-            let code = codes[[row_idx, atom_idx]];
-            if code != 0.0 {
-                live.push((atom_idx, code));
-            }
-        }
-        live.sort_by(|left, right| right.1.abs().total_cmp(&left.1.abs()));
-        for (slot, (atom_idx, code)) in live.into_iter().take(width).enumerate() {
-            indices[[row_idx, slot]] = atom_idx as u32;
-            sparse_codes[[row_idx, slot]] = code;
-        }
-    }
-    (indices, sparse_codes)
-}
-
-fn dense_block_topk(
-    codes: ndarray::ArrayView2<'_, f32>,
-    block_size: usize,
-    block_topk: Option<usize>,
-) -> Result<(ndarray::Array2<u32>, ndarray::Array2<f32>, ndarray::Array3<f32>, usize), String> {
-    if block_size == 0 {
-        return Err("audit_sae: block_size must be >= 1".to_string());
-    }
-    if codes.ncols() % block_size != 0 {
-        return Err(format!(
-            "audit_sae: codes have K={} columns, not a multiple of block_size {block_size}",
-            codes.ncols()
-        ));
-    }
-    let n = codes.nrows();
-    let n_blocks = codes.ncols() / block_size;
-    let topk = block_topk.unwrap_or_else(|| {
-        let mut max_live = 0usize;
-        for row_idx in 0..n {
-            let mut live = 0usize;
-            for block in 0..n_blocks {
-                let mut norm2 = 0.0f32;
-                for offset in 0..block_size {
-                    let value = codes[[row_idx, block * block_size + offset]];
-                    norm2 += value * value;
-                }
-                if norm2 > 0.0 {
-                    live += 1;
-                }
-            }
-            max_live = max_live.max(live);
-        }
-        max_live.max(1)
-    });
-    let width = topk.min(n_blocks.max(1));
-    let mut blocks = ndarray::Array2::<u32>::zeros((n, width));
-    let mut gates = ndarray::Array2::<f32>::zeros((n, width));
-    let mut block_codes = ndarray::Array3::<f32>::zeros((n, width, block_size));
-    for row_idx in 0..n {
-        let mut live = Vec::new();
-        for block in 0..n_blocks {
-            let mut norm2 = 0.0f32;
-            for offset in 0..block_size {
-                let value = codes[[row_idx, block * block_size + offset]];
-                norm2 += value * value;
-            }
-            if norm2 > 0.0 {
-                live.push((block, norm2.sqrt()));
-            }
-        }
-        live.sort_by(|left, right| right.1.total_cmp(&left.1));
-        for (slot, (block, gate)) in live.into_iter().take(width).enumerate() {
-            blocks[[row_idx, slot]] = block as u32;
-            gates[[row_idx, slot]] = gate;
-            for offset in 0..block_size {
-                block_codes[[row_idx, slot, offset]] = codes[[row_idx, block * block_size + offset]];
-            }
-        }
-    }
-    Ok((blocks, gates, block_codes, width))
 }
 
 /// Build the fit-report sub-dict for a [`DualCertificateReport`] — the lane's
@@ -285,98 +275,160 @@ fn block_coordinate_report_dict<'py>(
     Ok(out)
 }
 
-fn absorption_audit_dict<'py>(
-    py: Python<'py>,
-    codes: ndarray::ArrayView2<'_, f32>,
-    block_size: usize,
+#[derive(Clone, Copy, Default)]
+struct SparsePairAccum {
+    n_joint: usize,
+    sum_a: f64,
+    sum_b: f64,
+    sum_a2: f64,
+    sum_b2: f64,
+    sum_ab: f64,
+}
+
+struct AbsorptionPairReport {
+    a: usize,
+    b: usize,
+    n_obs: usize,
+    n_a: usize,
+    n_b: usize,
+    n_joint: usize,
+    p_a_given_b: f64,
+    p_b_given_a: f64,
+    lift: f64,
+    weight_correlation: f64,
+    dependence: f64,
+    fusion_evidence: f64,
+    absorption_asymmetry: f64,
+}
+
+struct AbsorptionAuditReport {
+    n_units: usize,
+    activation_threshold: f32,
+    pairs: Vec<AbsorptionPairReport>,
+}
+
+fn absorption_audit(
+    route: &AuditSparseRoute,
     activation_threshold: f32,
     max_pairs: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let n = codes.nrows();
-    let k_units = if block_size == 1 {
-        codes.ncols()
-    } else {
-        codes.ncols() / block_size
-    };
-    let mut atom_codes = gam::terms::sae::atom_codes::SparseAtomCodes::empty(n, k_units);
-    for row_idx in 0..n {
-        for unit in 0..k_units {
-            let weight = if block_size == 1 {
-                codes[[row_idx, unit]].abs() as f64
-            } else {
-                let mut norm2 = 0.0f64;
-                for offset in 0..block_size {
-                    let value = codes[[row_idx, unit * block_size + offset]] as f64;
-                    norm2 += value * value;
-                }
-                norm2.sqrt()
-            };
+) -> AbsorptionAuditReport {
+    let mut marginals = vec![0usize; route.n_units];
+    let mut accumulators = std::collections::BTreeMap::<(usize, usize), SparsePairAccum>::new();
+    for row in 0..route.nrows() {
+        let mut live = Vec::with_capacity(route.width());
+        for slot in 0..route.width() {
+            let weight = route.gate(row, slot);
             if weight > activation_threshold as f64 {
-                atom_codes.row_mut(row_idx).assign(unit, weight);
+                let unit = route.indices[[row, slot]] as usize;
+                marginals[unit] += 1;
+                live.push((unit, weight));
+            }
+        }
+        live.sort_unstable_by_key(|(unit, _)| *unit);
+        for left in 0..live.len() {
+            for right in (left + 1)..live.len() {
+                let (a, wa) = live[left];
+                let (b, wb) = live[right];
+                let acc = accumulators.entry((a, b)).or_default();
+                acc.n_joint += 1;
+                acc.sum_a += wa;
+                acc.sum_b += wb;
+                acc.sum_a2 += wa * wa;
+                acc.sum_b2 += wb * wb;
+                acc.sum_ab += wa * wb;
             }
         }
     }
-
-    let mut pairs = Vec::new();
-    for a in 0..k_units {
-        for b in (a + 1)..k_units {
-            let stats = atom_codes.coactivation(a, b);
-            pairs.push((
-                stats.absorption_asymmetry(),
+    let n_obs = route.nrows();
+    let mut pairs = accumulators
+        .into_iter()
+        .map(|((a, b), acc)| {
+            let n_a = marginals[a];
+            let n_b = marginals[b];
+            let conditional = |joint: usize, marginal: usize| {
+                if marginal == 0 {
+                    0.0
+                } else {
+                    joint as f64 / marginal as f64
+                }
+            };
+            let p_a_given_b = conditional(acc.n_joint, n_b);
+            let p_b_given_a = conditional(acc.n_joint, n_a);
+            let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
+                0.0
+            } else {
+                acc.n_joint as f64 * n_obs as f64 / (n_a as f64 * n_b as f64)
+            };
+            let weight_correlation = if acc.n_joint < 2 {
+                0.0
+            } else {
+                let n = acc.n_joint as f64;
+                let covariance = acc.sum_ab - acc.sum_a * acc.sum_b / n;
+                let variance_a = acc.sum_a2 - acc.sum_a * acc.sum_a / n;
+                let variance_b = acc.sum_b2 - acc.sum_b * acc.sum_b / n;
+                if variance_a > 0.0 && variance_b > 0.0 {
+                    (covariance / (variance_a.sqrt() * variance_b.sqrt())).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            };
+            let dependence = p_a_given_b.min(p_b_given_a);
+            AbsorptionPairReport {
                 a,
                 b,
-                stats.n_obs,
-                stats.n_a,
-                stats.n_b,
-                stats.n_joint,
-                stats.p_a_given_b,
-                stats.p_b_given_a,
-                stats.lift,
-                stats.weight_correlation,
-                stats.dependence(),
-                stats.fusion_evidence(),
-            ));
-        }
+                n_obs,
+                n_a,
+                n_b,
+                n_joint: acc.n_joint,
+                p_a_given_b,
+                p_b_given_a,
+                lift,
+                weight_correlation,
+                dependence,
+                fusion_evidence: dependence * weight_correlation.abs(),
+                absorption_asymmetry: (p_a_given_b - p_b_given_a).abs(),
+            }
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        right
+            .absorption_asymmetry
+            .total_cmp(&left.absorption_asymmetry)
+    });
+    pairs.truncate(max_pairs);
+    AbsorptionAuditReport {
+        n_units: route.n_units,
+        activation_threshold,
+        pairs,
     }
-    pairs.sort_by(|left, right| right.0.total_cmp(&left.0));
+}
 
+fn absorption_audit_dict<'py>(
+    py: Python<'py>,
+    report: &AbsorptionAuditReport,
+) -> PyResult<Bound<'py, PyDict>> {
     let pair_list = PyList::empty(py);
-    for (
-        absorption_asymmetry,
-        a,
-        b,
-        n_obs,
-        n_a,
-        n_b,
-        n_joint,
-        p_a_given_b,
-        p_b_given_a,
-        lift,
-        weight_correlation,
-        dependence,
-        fusion_evidence,
-    ) in pairs.into_iter().take(max_pairs)
-    {
+    for entry in &report.pairs {
         let pair = PyDict::new(py);
-        pair.set_item("a", a)?;
-        pair.set_item("b", b)?;
-        pair.set_item("n_obs", n_obs)?;
-        pair.set_item("n_a", n_a)?;
-        pair.set_item("n_b", n_b)?;
-        pair.set_item("n_joint", n_joint)?;
-        pair.set_item("p_a_given_b", p_a_given_b)?;
-        pair.set_item("p_b_given_a", p_b_given_a)?;
-        pair.set_item("lift", lift)?;
-        pair.set_item("weight_correlation", weight_correlation)?;
-        pair.set_item("dependence", dependence)?;
-        pair.set_item("fusion_evidence", fusion_evidence)?;
-        pair.set_item("absorption_asymmetry", absorption_asymmetry)?;
+        pair.set_item("a", entry.a)?;
+        pair.set_item("b", entry.b)?;
+        pair.set_item("n_obs", entry.n_obs)?;
+        pair.set_item("n_a", entry.n_a)?;
+        pair.set_item("n_b", entry.n_b)?;
+        pair.set_item("n_joint", entry.n_joint)?;
+        pair.set_item("p_a_given_b", entry.p_a_given_b)?;
+        pair.set_item("p_b_given_a", entry.p_b_given_a)?;
+        pair.set_item("lift", entry.lift)?;
+        pair.set_item("weight_correlation", entry.weight_correlation)?;
+        pair.set_item("dependence", entry.dependence)?;
+        pair.set_item("fusion_evidence", entry.fusion_evidence)?;
+        pair.set_item("absorption_asymmetry", entry.absorption_asymmetry)?;
         pair_list.append(pair)?;
     }
 
     let out = PyDict::new(py);
-    out.set_item("n_units", k_units)?;
-    out.set_item("activation_threshold", activation_threshold)?;
+    out.set_item("n_units", report.n_units)?;
+    out.set_item("activation_threshold", report.activation_threshold)?;
     out.set_item("pairs", pair_list)?;
     Ok(out)
 }
@@ -582,9 +634,8 @@ fn topology_records_from_codes(
 /// gate is UNCERTIFIED (`valid = false`, unknown/`inf` defects) — never
 /// fabricated valid. `block_a`/`block_b` index the dictionary blocks the two
 /// charts read; `chart_a`/`chart_b` are the nerve-vertex labels.
-fn chart_transfer_gate<T: Copy + Into<f64>>(
-    codes: ndarray::ArrayView2<'_, T>,
-    block_size: usize,
+fn chart_transfer_gate_sparse(
+    route: &AuditSparseRoute,
     block_a: usize,
     block_b: usize,
     chart_a: usize,
@@ -599,23 +650,33 @@ fn chart_transfer_gate<T: Copy + Into<f64>>(
         transport_defect: f64::INFINITY,
         equivariance_defect: f64::INFINITY,
     };
-    if block_size != 2 {
+    if route.block_size != 2 {
         return uncertified();
     }
     let mut xa: Vec<f64> = Vec::new();
     let mut xb: Vec<f64> = Vec::new();
-    for row in 0..codes.nrows() {
-        let a0: f64 = codes[[row, block_a * 2]].into();
-        let a1: f64 = codes[[row, block_a * 2 + 1]].into();
-        let b0: f64 = codes[[row, block_b * 2]].into();
-        let b1: f64 = codes[[row, block_b * 2 + 1]].into();
-        let na = (a0 * a0 + a1 * a1).sqrt();
-        let nb = (b0 * b0 + b1 * b1).sqrt();
-        if na > activation_threshold && nb > activation_threshold {
-            xa.push(a0);
-            xa.push(a1);
-            xb.push(b0);
-            xb.push(b1);
+    for row in 0..route.nrows() {
+        let mut a = None;
+        let mut b = None;
+        for slot in 0..route.width() {
+            let unit = route.indices[[row, slot]] as usize;
+            let gate = route.gate(row, slot);
+            if gate <= activation_threshold {
+                continue;
+            }
+            let value = [
+                route.values[[row, slot, 0]] as f64,
+                route.values[[row, slot, 1]] as f64,
+            ];
+            if unit == block_a {
+                a = Some(value);
+            } else if unit == block_b {
+                b = Some(value);
+            }
+        }
+        if let (Some([a0, a1]), Some([b0, b1])) = (a, b) {
+            xa.extend([a0, a1]);
+            xb.extend([b0, b1]);
         }
     }
     let n_co = xa.len() / 2;
@@ -648,17 +709,16 @@ fn chart_transfer_gate<T: Copy + Into<f64>>(
     }
 }
 
-fn atlas_nerve_from_codes(
-    codes: ndarray::ArrayView2<'_, f32>,
-    block_size: usize,
+fn atlas_nerve_from_sparse_route(
+    route: &AuditSparseRoute,
     activation_threshold: f32,
     requested_blocks: Option<&[usize]>,
     max_charts: usize,
 ) -> Result<Option<AuditAtlasReport>, String> {
-    if block_size == 1 || codes.ncols() % block_size != 0 {
+    if route.block_size == 1 {
         return Ok(None);
     }
-    let n_blocks = codes.ncols() / block_size;
+    let n_blocks = route.n_units;
     let chart_blocks: Vec<usize> = match requested_blocks {
         Some(blocks) => blocks.to_vec(),
         None if n_blocks <= max_charts => (0..n_blocks).collect(),
@@ -667,25 +727,31 @@ fn atlas_nerve_from_codes(
     if chart_blocks.len() < 2 {
         return Ok(None);
     }
-    let mut charts = Vec::with_capacity(chart_blocks.len());
+    let mut chart_positions = std::collections::HashMap::with_capacity(chart_blocks.len());
+    let mut chart_weights = (0..chart_blocks.len())
+        .map(|_| ndarray::Array1::<f64>::zeros(route.nrows()))
+        .collect::<Vec<_>>();
     for (chart_idx, &block) in chart_blocks.iter().enumerate() {
         if block >= n_blocks {
             return Err(format!(
                 "audit_sae atlas block {block} out of range 0..{n_blocks}"
             ));
         }
-        let mut weights = ndarray::Array1::<f64>::zeros(codes.nrows());
-        for row in 0..codes.nrows() {
-            let mut norm2 = 0.0f64;
-            for offset in 0..block_size {
-                let value = codes[[row, block * block_size + offset]] as f64;
-                norm2 += value * value;
-            }
-            let norm = norm2.sqrt();
-            if norm > activation_threshold as f64 {
-                weights[row] = norm;
+        chart_positions.insert(block, chart_idx);
+    }
+    for row in 0..route.nrows() {
+        for slot in 0..route.width() {
+            let unit = route.indices[[row, slot]] as usize;
+            if let Some(&chart_idx) = chart_positions.get(&unit) {
+                let gate = route.gate(row, slot);
+                if gate > activation_threshold as f64 {
+                    chart_weights[chart_idx][row] = gate;
+                }
             }
         }
+    }
+    let mut charts = Vec::with_capacity(chart_blocks.len());
+    for (chart_idx, weights) in chart_weights.into_iter().enumerate() {
         charts.push(
             gam::terms::sae::inference::atlas_nerve::AtlasChart::from_weights(
                 chart_idx, weights,
@@ -695,9 +761,8 @@ fn atlas_nerve_from_codes(
     let mut gates = Vec::new();
     for a in 0..chart_blocks.len() {
         for b in (a + 1)..chart_blocks.len() {
-            gates.push(chart_transfer_gate(
-                codes,
-                block_size,
+            gates.push(chart_transfer_gate_sparse(
+                route,
                 chart_blocks[a],
                 chart_blocks[b],
                 a,
@@ -739,31 +804,47 @@ fn atlas_nerve_dict<'py>(
     Ok(out)
 }
 
-/// Standalone atlas-nerve diagram from a dense block-sparse code matrix (#985 / E1
-/// FFI completeness). This exposes the same Čech-nerve reduction `audit_sae`
+/// Standalone atlas-nerve diagram from fixed-width sparse block routing (#985 /
+/// E1 FFI completeness). This exposes the same Čech-nerve reduction `audit_sae`
 /// computes internally as its own front-door accessor: build one `AtlasChart` per
 /// requested `b`-wide block from the per-row block-energy weights, wire the charts
 /// with all-valid transfer gates, and reduce the nerve to its Betti signature and
 /// simplex counts. Every number is computed in the `gam::terms::sae::inference::
-/// atlas_nerve` core; this only marshals the code matrix in and the diagram dict
+/// atlas_nerve` core; this only marshals the sparse route in and the diagram dict
 /// out. Returns `{computed: false, reason}` for shapes the nerve does not apply to
 /// (scalar `block_size == 1`, a width that does not divide `K`, fewer than two
 /// charts, or more blocks than `max_charts` with no explicit `blocks`), matching
 /// `atlas_nerve_dict`'s skipped-report contract.
-#[pyfunction(signature = (codes, block_size, activation_threshold = 1.0e-6, blocks = None, max_charts = 16))]
+#[pyfunction(signature = (
+    indices,
+    values,
+    n_units,
+    block_size,
+    activation_threshold = 1.0e-6,
+    blocks = None,
+    max_charts = 16
+))]
 fn atlas_nerve_diagram<'py>(
     py: Python<'py>,
-    codes: PyReadonlyArray2<'py, f32>,
+    indices: PyReadonlyArray2<'py, u32>,
+    values: PyReadonlyArray3<'py, f32>,
+    n_units: usize,
     block_size: usize,
     activation_threshold: f32,
     blocks: Option<Vec<usize>>,
     max_charts: usize,
 ) -> PyResult<Py<PyDict>> {
-    let codes = codes.as_array().to_owned();
+    let route = AuditSparseRoute::new(
+        indices.as_array().to_owned(),
+        values.as_array().to_owned(),
+        n_units,
+        block_size,
+        "atlas route",
+    )
+    .map_err(PyValueError::new_err)?;
     let report = detach_py_result(py, "atlas_nerve_diagram", move || {
-        atlas_nerve_from_codes(
-            codes.view(),
-            block_size,
+        atlas_nerve_from_sparse_route(
+            &route,
             activation_threshold,
             blocks.as_deref(),
             max_charts,
@@ -1084,88 +1165,177 @@ struct StandingCalibrationConfig {
     spikein_false_positive_rate: f64,
 }
 
-/// Atlas-nerve topological-richness statistic on a dense `N×K` code matrix: the
-/// admitted higher-simplex count (`edges + triangles + tetrahedra`) of the
-/// all-valid Čech nerve built from the per-block energy charts. This is the
-/// scalar audit the standing null battery re-invokes on the architecture-matched
-/// random-weight donor surrogates to calibrate the atlas / topology claims.
-fn atlas_nerve_richness_statistic(
-    codes: ndarray::ArrayView2<'_, f64>,
-    block_size: usize,
+/// Atlas-nerve topological-richness statistic over a fixed-width sparse route.
+/// The statistic never materializes the logical `N×K` code matrix.
+fn sparse_atlas_nerve_richness_statistic(
+    route: &AuditSparseRoute,
     chart_blocks: &[usize],
     activation_threshold: f64,
 ) -> Result<f64, String> {
-    if block_size == 0 || codes.ncols() % block_size != 0 {
-        return Err(format!(
-            "atlas null statistic: codes have K={} columns, not a multiple of block_size {block_size}",
-            codes.ncols()
-        ));
-    }
-    let n_blocks = codes.ncols() / block_size;
-    let mut charts = Vec::with_capacity(chart_blocks.len());
-    for (chart_idx, &block) in chart_blocks.iter().enumerate() {
-        if block >= n_blocks {
-            return Err(format!(
-                "atlas null statistic: block {block} out of range 0..{n_blocks}"
-            ));
-        }
-        let mut weights = ndarray::Array1::<f64>::zeros(codes.nrows());
-        for row in 0..codes.nrows() {
-            let mut norm2 = 0.0f64;
-            for offset in 0..block_size {
-                let value = codes[[row, block * block_size + offset]];
-                norm2 += value * value;
-            }
-            let norm = norm2.sqrt();
-            if norm > activation_threshold {
-                weights[row] = norm;
-            }
-        }
-        charts.push(
-            gam::terms::sae::inference::atlas_nerve::AtlasChart::from_weights(chart_idx, weights)?,
-        );
-    }
-    let mut gates = Vec::new();
-    for a in 0..chart_blocks.len() {
-        for b in (a + 1)..chart_blocks.len() {
-            gates.push(chart_transfer_gate(
-                codes,
-                block_size,
-                chart_blocks[a],
-                chart_blocks[b],
-                a,
-                b,
-                activation_threshold,
-            ));
-        }
-    }
-    let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
-    Ok((diagram.n_edges + diagram.n_triangles + diagram.n_tetrahedra) as f64)
+    let report = atlas_nerve_from_sparse_route(
+        route,
+        activation_threshold as f32,
+        Some(chart_blocks),
+        chart_blocks.len(),
+    )?
+    .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
+    Ok((report.diagram.n_edges + report.diagram.n_triangles + report.diagram.n_tetrahedra) as f64)
 }
 
-/// Build the standing null battery + spike-in calibration for the audit's
-/// topology / atlas-nerve claims. The architecture-matched random-weight donor
-/// (`random_weight_codes`) supplies the required null: the atlas-richness audit
-/// is re-run on donor-resampled, moment-matched surrogates to form the null
-/// distribution of the claim statistic, and a synthetic circle is planted into
-/// the real audit residuals to measure the block-chart/topology detector's
-/// spike-in power at the claimed operating point. Returns `None` for shapes that
-/// carry no topological claim or cannot support the spike-in detector (fewer
-/// than two charts, residuals with < 4 rows or < 2 columns, or a donor whose
-/// atom width does not match the dictionary).
-fn standing_null_calibration(
-    codes_f64: ndarray::ArrayView2<'_, f64>,
-    donor_f64: ndarray::ArrayView2<'_, f64>,
+#[derive(Clone, Copy, Default)]
+struct LiveAmplitudeMoments {
+    count: usize,
+    sum: f64,
+    sum2: f64,
+}
+
+impl LiveAmplitudeMoments {
+    fn mean(self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+
+    fn sd(self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            let n = self.count as f64;
+            ((self.sum2 - self.sum * self.sum / n) / (n - 1.0))
+                .max(0.0)
+                .sqrt()
+        }
+    }
+}
+
+fn live_amplitude_moments(route: &AuditSparseRoute) -> Vec<LiveAmplitudeMoments> {
+    let mut moments = vec![LiveAmplitudeMoments::default(); route.n_units];
+    for row in 0..route.nrows() {
+        for slot in 0..route.width() {
+            let gate = route.gate(row, slot);
+            if gate > 0.0 {
+                let unit = route.indices[[row, slot]] as usize;
+                moments[unit].count += 1;
+                moments[unit].sum += gate;
+                moments[unit].sum2 += gate * gate;
+            }
+        }
+    }
+    moments
+}
+
+fn resample_sparse_architecture_null<R: rand::Rng + ?Sized>(
+    observed: &AuditSparseRoute,
+    donor: &AuditSparseRoute,
+    rng: &mut R,
+) -> Result<AuditSparseRoute, String> {
+    use rand::RngExt;
+    let observed_moments = live_amplitude_moments(observed);
+    let donor_moments = live_amplitude_moments(donor);
+    let mut indices = ndarray::Array2::<u32>::zeros((observed.nrows(), donor.width()));
+    let mut values = ndarray::Array3::<f32>::zeros((
+        observed.nrows(),
+        donor.width(),
+        donor.block_size,
+    ));
+    for row in 0..observed.nrows() {
+        let source = rng.random_range(0..donor.nrows());
+        for slot in 0..donor.width() {
+            let unit = donor.indices[[source, slot]] as usize;
+            indices[[row, slot]] = unit as u32;
+            let gate = donor.gate(source, slot);
+            if gate == 0.0 {
+                continue;
+            }
+            let observed_moment = observed_moments[unit];
+            let donor_moment = donor_moments[unit];
+            if observed_moment.count == 0 {
+                continue;
+            }
+            let donor_sd = donor_moment.sd();
+            let target_gate = if donor_sd > 0.0 {
+                (observed_moment.mean()
+                    + (gate - donor_moment.mean()) * observed_moment.sd() / donor_sd)
+                    .max(0.0)
+            } else {
+                observed_moment.mean()
+            };
+            if target_gate == 0.0 {
+                continue;
+            }
+            let scale = target_gate / gate;
+            for offset in 0..donor.block_size {
+                values[[row, slot, offset]] =
+                    (donor.values[[source, slot, offset]] as f64 * scale) as f32;
+            }
+        }
+    }
+    AuditSparseRoute::new(
+        indices,
+        values,
+        observed.n_units,
+        observed.block_size,
+        "architecture-matched null route",
+    )
+}
+
+fn larger_tail_null_summary(
+    observed: f64,
+    mut samples: Vec<f64>,
+) -> gam::terms::sae::null_battery::NullSummary {
+    use gam::terms::sae::null_battery::{NullKind, NullSummary};
+    samples.sort_by(|left, right| left.total_cmp(right));
+    let n = samples.len();
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    let variance = if n > 1 {
+        samples
+            .iter()
+            .map(|sample| (sample - mean) * (sample - mean))
+            .sum::<f64>()
+            / (n - 1) as f64
+    } else {
+        0.0
+    };
+    let sd = variance.sqrt();
+    let z = if sd > 0.0 {
+        (observed - mean) / sd
+    } else {
+        0.0
+    };
+    let extreme = samples.iter().filter(|sample| **sample >= observed).count();
+    NullSummary {
+        kind: NullKind::ArchitectureMatchedRandomWeight,
+        observed,
+        n,
+        mean,
+        sd,
+        min: samples[0],
+        q25: samples[n / 4],
+        median: samples[n / 2],
+        q75: samples[(3 * n) / 4],
+        max: samples[n - 1],
+        z,
+        p_value: (extreme + 1) as f64 / (n + 1) as f64,
+        samples,
+    }
+}
+
+/// Build the standing sparse donor null + residual spike-in calibration. Both
+/// observed and donor routing remain `N×s×b`; implicit zeros are never expanded.
+fn standing_sparse_null_calibration(
+    route: &AuditSparseRoute,
+    donor: &AuditSparseRoute,
     residuals_f64: ndarray::ArrayView2<'_, f64>,
-    block_size: usize,
     chart_blocks: &[usize],
     activation_threshold: f64,
     cfg: &StandingCalibrationConfig,
 ) -> Result<Option<gam::terms::sae::null_battery::ClaimNullCalibration>, String> {
     use gam::terms::sae::null_battery as nb;
     if chart_blocks.len() < 2
-        || donor_f64.ncols() != codes_f64.ncols()
-        || donor_f64.nrows() == 0
+        || donor.n_units != route.n_units
+        || donor.block_size != route.block_size
         || residuals_f64.nrows() < 4
         || residuals_f64.ncols() < 2
         || cfg.null_replicates == 0
@@ -1173,21 +1343,23 @@ fn standing_null_calibration(
     {
         return Ok(None);
     }
-    // Required null: the architecture-matched random-weight donor. A whole-row
-    // token shuffle preserves cross-chart coactivation (it does not break the
-    // nerve) and a column rotation mixes the block charts, so only an
-    // independent random-weight encoder is a valid negative control for a nerve
-    // claim.
-    let null_config = nb::NullBatteryConfig {
-        replicates: cfg.null_replicates,
-        seed: cfg.null_seed,
-        kinds: vec![nb::NullKind::ArchitectureMatchedRandomWeight],
-        tail: nb::Tail::Larger,
+    use rand::SeedableRng;
+    let observed =
+        sparse_atlas_nerve_richness_statistic(route, chart_blocks, activation_threshold)?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.null_seed);
+    let mut samples = Vec::with_capacity(cfg.null_replicates);
+    for _ in 0..cfg.null_replicates {
+        let surrogate = resample_sparse_architecture_null(route, donor, &mut rng)?;
+        samples.push(sparse_atlas_nerve_richness_statistic(
+            &surrogate,
+            chart_blocks,
+            activation_threshold,
+        )?);
+    }
+    let nulls = nb::NullBatteryReport {
+        observed,
+        summaries: vec![larger_tail_null_summary(observed, samples)],
     };
-    let chart_blocks = chart_blocks.to_vec();
-    let nulls = nb::run_null_battery(codes_f64, Some(donor_f64), &null_config, |surrogate| {
-        atlas_nerve_richness_statistic(surrogate, block_size, &chart_blocks, activation_threshold)
-    })?;
     // Spike-in power: plant a synthetic circle into the real audit residuals and
     // measure the default block-chart/topology detector's recovery rate at the
     // requested false-positive operating point. Bootstrapping the empirical
@@ -1215,9 +1387,7 @@ fn standing_null_calibration(
 /// typo can never silently fall back to a default.
 #[derive(Debug)]
 struct SaeAuditOptions {
-    active: Option<usize>,
     block_size: usize,
-    block_topk: Option<usize>,
     delta: f64,
     quantile_levels: Option<Vec<f64>>,
     max_candidates: usize,
@@ -1238,10 +1408,8 @@ struct SaeAuditOptions {
 impl SaeAuditOptions {
     /// Every key `from_pydict` accepts, in documentation order; kept as a
     /// single list so the unknown-key error names the full valid vocabulary.
-    const KNOWN_KEYS: [&'static str; 18] = [
-        "active",
+    const KNOWN_KEYS: [&'static str; 16] = [
         "block_size",
-        "block_topk",
         "delta",
         "quantile_levels",
         "max_candidates",
@@ -1262,9 +1430,7 @@ impl SaeAuditOptions {
     /// The audit's historical keyword defaults (the pre-dict FFI signature).
     fn defaults() -> Self {
         Self {
-            active: None,
             block_size: 1,
-            block_topk: None,
             delta: 0.05,
             quantile_levels: None,
             max_candidates: 16,
@@ -1287,18 +1453,6 @@ impl SaeAuditOptions {
     /// the caller sees which knob was malformed.
     fn knob_error(key: &str, err: &PyErr) -> PyErr {
         PyValueError::new_err(format!("audit_sae options[{key:?}]: {err}"))
-    }
-
-    /// `None`-passthrough extraction for the optional integer knobs
-    /// (`active`, `block_topk`).
-    fn optional_usize(value: &Bound<'_, PyAny>, key: &str) -> PyResult<Option<usize>> {
-        if value.is_none() {
-            return Ok(None);
-        }
-        value
-            .extract::<usize>()
-            .map(Some)
-            .map_err(|err| Self::knob_error(key, &err))
     }
 
     /// `None`-passthrough extraction for the optional index-list knob
@@ -1344,13 +1498,11 @@ impl SaeAuditOptions {
                 PyValueError::new_err("audit_sae options keys must be strings")
             })?;
             match key.as_str() {
-                "active" => cfg.active = Self::optional_usize(&value, &key)?,
                 "block_size" => {
                     cfg.block_size = value
                         .extract::<usize>()
                         .map_err(|err| Self::knob_error(&key, &err))?;
                 }
-                "block_topk" => cfg.block_topk = Self::optional_usize(&value, &key)?,
                 "delta" => {
                     cfg.delta = value
                         .extract::<f64>()
@@ -1430,23 +1582,17 @@ impl SaeAuditOptions {
     }
 }
 
-/// One-shot audit over an externally supplied, frozen SAE dictionary: decoder
-/// rows `K×P`, dense activation/codes matrix `N×K`, source activations `N×P`,
-/// and an architecture-matched random-weight code donor `N'×K` for the required
-/// topology/atlas null battery. No fitting occurs here; the function
-/// reconstructs the frozen rows, derives the sparse/block routing views required
-/// by the existing Rust diagnostics, calibrates the topology/atlas claims
-/// against the donor null and a residual spike-in, and returns a dict of
-/// dual-cert, routability, coordinate-SE, absorption, topology, atlas-nerve, and
-/// optional transport diagnostics.
+/// One-shot audit over an externally supplied, frozen SAE dictionary. Routing
+/// crosses the boundary only as fixed-width sparse `(indices, values)` arrays:
+/// `indices` is `N×s`, `values` is `N×s×b`, and implicit zeros are never
+/// expanded into `N×K`. The architecture-matched donor uses the same sparse
+/// representation and may have a different row count / route width.
 ///
 /// All tuning knobs travel in the single optional `options` dict; omitted keys
 /// (or `options = None`) take the audit's long-standing defaults, and unknown
 /// keys are a hard error. Accepted keys and their defaults:
 ///
-/// * `active = None` — sparse-lane atoms per row (`block_size == 1`).
 /// * `block_size = 1` — dictionary block width; `>= 2` selects the block lane.
-/// * `block_topk = None` — active blocks per row in the block lane.
 /// * `delta = 0.05` — routability confidence level.
 /// * `quantile_levels = None` — routability quantiles (default `[0.5, 0.9, 0.99]`).
 /// * `max_candidates = 16` — dual-certificate candidate budget.
@@ -1459,19 +1605,27 @@ impl SaeAuditOptions {
 /// * `null_replicates = 64`, `null_seed = 0x5AE0_A0D1` — donor null battery.
 /// * `spikein_trials = 32`, `spikein_snr = 2.0`,
 ///   `spikein_false_positive_rate = 0.05` — residual spike-in ROC calibration.
-#[pyfunction(signature = (decoder, codes, data, random_weight_codes, options = None))]
+#[pyfunction(signature = (
+    decoder,
+    route_indices,
+    route_values,
+    data,
+    donor_indices,
+    donor_values,
+    options = None
+))]
 fn audit_sae<'py>(
     py: Python<'py>,
     decoder: PyReadonlyArray2<'py, f32>,
-    codes: PyReadonlyArray2<'py, f32>,
+    route_indices: PyReadonlyArray2<'py, u32>,
+    route_values: PyReadonlyArray3<'py, f32>,
     data: PyReadonlyArray2<'py, f32>,
-    random_weight_codes: PyReadonlyArray2<'py, f32>,
+    donor_indices: PyReadonlyArray2<'py, u32>,
+    donor_values: PyReadonlyArray3<'py, f32>,
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let SaeAuditOptions {
-        active,
         block_size,
-        block_topk,
         delta,
         quantile_levels,
         max_candidates,
@@ -1489,42 +1643,55 @@ fn audit_sae<'py>(
         spikein_false_positive_rate,
     } = SaeAuditOptions::from_pydict(options)?;
     let decoder_values = decoder.as_array().to_owned();
-    let code_values = codes.as_array().to_owned();
+    let route_indices = route_indices.as_array().to_owned();
+    let route_values = route_values.as_array().to_owned();
     let data_values = data.as_array().to_owned();
-    let donor_values = random_weight_codes.as_array().to_owned();
+    let donor_indices = donor_indices.as_array().to_owned();
+    let donor_values = donor_values.as_array().to_owned();
     if decoder_values.nrows() == 0 || decoder_values.ncols() == 0 {
         return Err(PyValueError::new_err(
             "audit_sae requires a non-empty decoder matrix",
         ));
     }
-    if code_values.ncols() != decoder_values.nrows() {
-        return Err(PyValueError::new_err(format!(
-            "audit_sae codes/decoder mismatch: codes K={} but decoder K={}",
-            code_values.ncols(),
-            decoder_values.nrows()
-        )));
-    }
-    if data_values.nrows() != code_values.nrows() || data_values.ncols() != decoder_values.ncols() {
-        return Err(PyValueError::new_err(format!(
-            "audit_sae data shape {:?} incompatible with codes {:?} and decoder {:?}",
-            data_values.dim(),
-            code_values.dim(),
-            decoder_values.dim()
-        )));
-    }
     if block_size == 0 {
         return Err(PyValueError::new_err("audit_sae block_size must be >= 1"));
-    }
-    if active == Some(0) {
-        return Err(PyValueError::new_err("audit_sae active must be >= 1"));
-    }
-    if block_topk == Some(0) {
-        return Err(PyValueError::new_err("audit_sae block_topk must be >= 1"));
     }
     if decoder_values.nrows() % block_size != 0 {
         return Err(PyValueError::new_err(format!(
             "audit_sae decoder has K={} rows, not a multiple of block_size {block_size}",
             decoder_values.nrows()
+        )));
+    }
+    if decoder_values.iter().any(|value| !value.is_finite())
+        || data_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(PyValueError::new_err(
+            "audit_sae decoder and activations must be finite",
+        ));
+    }
+    let n_units = decoder_values.nrows() / block_size;
+    let route = AuditSparseRoute::new(
+        route_indices,
+        route_values,
+        n_units,
+        block_size,
+        "observed route",
+    )
+    .map_err(PyValueError::new_err)?;
+    let donor = AuditSparseRoute::new(
+        donor_indices,
+        donor_values,
+        n_units,
+        block_size,
+        "random-weight donor route",
+    )
+    .map_err(PyValueError::new_err)?;
+    if data_values.nrows() != route.nrows() || data_values.ncols() != decoder_values.ncols() {
+        return Err(PyValueError::new_err(format!(
+            "audit_sae data shape {:?} is incompatible with {} route rows and decoder {:?}",
+            data_values.dim(),
+            route.nrows(),
+            decoder_values.dim()
         )));
     }
     if !delta.is_finite() || delta <= 0.0 {
@@ -1535,19 +1702,6 @@ fn audit_sae<'py>(
     if activation_threshold < 0.0 || !activation_threshold.is_finite() {
         return Err(PyValueError::new_err(
             "audit_sae activation_threshold must be finite and non-negative",
-        ));
-    }
-    if donor_values.ncols() != decoder_values.nrows() || donor_values.nrows() == 0 {
-        return Err(PyValueError::new_err(format!(
-            "audit_sae random_weight_codes must be a non-empty N'xK donor matrix with K={} \
-             columns (the dictionary atom count); got {:?}",
-            decoder_values.nrows(),
-            donor_values.dim()
-        )));
-    }
-    if donor_values.iter().any(|value| !value.is_finite()) {
-        return Err(PyValueError::new_err(
-            "audit_sae random_weight_codes must be finite",
         ));
     }
     if null_replicates == 0 {
@@ -1580,10 +1734,16 @@ fn audit_sae<'py>(
         spikein_false_positive_rate,
     };
     let quantiles = quantile_levels.unwrap_or_else(|| vec![0.5, 0.9, 0.99]);
+    let decoder_shape = decoder_values.dim();
+    let route_rows = route.nrows();
+    let route_width = route.width();
 
     let audit = detach_py_result(py, "audit_sae", move || {
-        let residuals =
-            residuals_from_dense_sae(data_values.view(), decoder_values.view(), code_values.view())?;
+        let residuals = residuals_from_sparse_sae(
+            data_values.view(),
+            decoder_values.view(),
+            &route,
+        )?;
         let routability = gam::terms::sae::routability::routability_audit(
             decoder_values.view(),
             residuals.view(),
@@ -1593,8 +1753,11 @@ fn audit_sae<'py>(
         )?;
 
         let (dual, coordinate_reports) = if block_size == 1 {
-            let (indices, sparse_codes) = dense_linear_topk(code_values.view(), active);
-            let fit = sparse_dict_fit_from_arrays(decoder_values.clone(), indices, sparse_codes);
+            let fit = sparse_dict_fit_from_arrays(
+                decoder_values.clone(),
+                route.indices.clone(),
+                route.linear_codes(),
+            );
             let report = gam::terms::sae::dual_certificate::sparse_dict_dual_certificate(
                 data_values.view(),
                 &fit,
@@ -1602,14 +1765,12 @@ fn audit_sae<'py>(
             )?;
             (report, Vec::new())
         } else {
-            let (blocks, gates, block_codes, width) =
-                dense_block_topk(code_values.view(), block_size, block_topk)?;
             let fit = block_sparse_fit_from_arrays(
                 decoder_values.clone(),
-                blocks,
-                gates,
-                block_codes,
-                width,
+                route.indices.clone(),
+                route.gates(),
+                route.values.clone(),
+                route.width(),
                 block_size,
             );
             let report = gam::terms::sae::dual_certificate::block_dual_certificate(
@@ -1642,13 +1803,17 @@ fn audit_sae<'py>(
             block_size,
             activation_threshold,
         );
-        let atlas_nerve = atlas_nerve_from_codes(
-            code_values.view(),
-            block_size,
+        let atlas_nerve = atlas_nerve_from_sparse_route(
+            &route,
             activation_threshold,
             coordinate_blocks.as_deref(),
             max_absorption_pairs,
         )?;
+        let absorption = absorption_audit(
+            &route,
+            activation_threshold,
+            max_absorption_pairs,
+        );
 
         let transport = match (theta_in_values, theta_out_values) {
             (Some(theta_in), Some(theta_out)) => Some(
@@ -1675,14 +1840,11 @@ fn audit_sae<'py>(
         // with >= 2 charts); scalar/degenerate shapes carry no such claim.
         let calibration = match atlas_nerve.as_ref() {
             Some(atlas) => {
-                let codes_f64 = code_values.mapv(|value| value as f64);
-                let donor_f64 = donor_values.mapv(|value| value as f64);
                 let residuals_f64 = residuals.mapv(|value| value as f64);
-                standing_null_calibration(
-                    codes_f64.view(),
-                    donor_f64.view(),
+                standing_sparse_null_calibration(
+                    &route,
+                    &donor,
                     residuals_f64.view(),
-                    block_size,
                     &atlas.chart_blocks,
                     activation_threshold as f64,
                     &calibration_cfg,
@@ -1697,10 +1859,9 @@ fn audit_sae<'py>(
             coordinate_reports,
             topology_records,
             atlas_nerve,
+            absorption,
             transport,
             calibration,
-            decoder_values,
-            code_values,
         ))
     })?;
 
@@ -1710,26 +1871,18 @@ fn audit_sae<'py>(
         coordinate_reports,
         topology_records,
         atlas_nerve,
+        absorption,
         transport,
         calibration,
-        decoder_values,
-        code_values,
     ) = audit;
     let out = PyDict::new(py);
-    out.set_item("decoder_shape", (decoder_values.nrows(), decoder_values.ncols()))?;
-    out.set_item("codes_shape", (code_values.nrows(), code_values.ncols()))?;
+    out.set_item("decoder_shape", decoder_shape)?;
+    out.set_item("codes_shape", (route_rows, decoder_shape.0))?;
 
     let route = PyDict::new(py);
     route.set_item("block_size", block_size)?;
-    route.set_item("n_blocks", decoder_values.nrows() / block_size)?;
-    match active {
-        Some(value) => route.set_item("active", value)?,
-        None => route.set_item("active", py.None())?,
-    }
-    match block_topk {
-        Some(value) => route.set_item("block_topk", value)?,
-        None => route.set_item("block_topk", py.None())?,
-    }
+    route.set_item("n_units", n_units)?;
+    route.set_item("width", route_width)?;
     out.set_item("routing", route)?;
 
     let routability_dict = PyDict::new(py);
@@ -1744,16 +1897,7 @@ fn audit_sae<'py>(
     routability_dict.set_item("dark_matter_fraction", 1.0 - routability.fraction_below_floor)?;
     out.set_item("routability", routability_dict)?;
     out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual)?)?;
-    out.set_item(
-        "absorption",
-        absorption_audit_dict(
-            py,
-            code_values.view(),
-            block_size,
-            activation_threshold,
-            max_absorption_pairs,
-        )?,
-    )?;
+    out.set_item("absorption", absorption_audit_dict(py, &absorption)?)?;
 
     let coordinate_list = PyList::empty(py);
     for report in &coordinate_reports {

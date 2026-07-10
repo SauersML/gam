@@ -43,11 +43,11 @@ mod update;
 mod tests;
 
 pub use block::{
-    BlockSparseConfig, BlockSparseFit, block_gates, block_projections_row,
-    block_sparse_dictionary_block_coords, block_sparse_dictionary_lift_block,
-    block_sparse_dictionary_project_residual, block_sparse_dictionary_transform,
-    fit_block_sparse_dictionary, reconstruct_block_sparse_rows, reconstruct_row, route_row_blocks,
-    row_loss,
+    BlockSparseConfig, BlockSparseConvergence, BlockSparseFit, BlockSparseFitError, block_gates,
+    block_projections_row, block_sparse_dictionary_block_coords,
+    block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
+    block_sparse_dictionary_transform, fit_block_sparse_dictionary, reconstruct_block_sparse_rows,
+    reconstruct_row, route_row_blocks, row_loss,
 };
 pub use block_chart::{
     BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,

@@ -716,16 +716,33 @@ pub enum FactorSmoothFlavour {
     Re,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
     pub marginalspecs: Vec<BSplineBasisSpec>,
     #[serde(default)]
     pub periods: Vec<Option<f64>>,
+    #[serde(default = "default_tensor_double_penalty")]
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: TensorBSplineIdentifiability,
     #[serde(default)]
     pub penalty_decomposition: TensorBSplinePenaltyDecomposition,
+}
+
+pub const fn default_tensor_double_penalty() -> bool {
+    true
+}
+
+impl Default for TensorBSplineSpec {
+    fn default() -> Self {
+        Self {
+            marginalspecs: Vec::new(),
+            periods: Vec::new(),
+            double_penalty: default_tensor_double_penalty(),
+            identifiability: TensorBSplineIdentifiability::default(),
+            penalty_decomposition: TensorBSplinePenaltyDecomposition::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1091,12 +1108,9 @@ pub struct LinearTermSpec {
     /// in which case the realized column is exactly the numeric product.
     #[serde(default)]
     pub categorical_levels: Vec<(usize, u64)>,
-    /// Optional ridge (`S = I`, REML-selected `λ`) on this linear coefficient.
-    /// A parametric linear term carries no wiggliness, so it is **unpenalized by
-    /// default** — gam reports the MLE, matching mgcv/glm/survreg/VGAM (which
-    /// penalize parametric terms only under an explicit `paraPen`). Set `true`
-    /// to opt into an explicit shrinkage ridge (a zero-mean Gaussian prior
-    /// `β ~ N(0, λ⁻¹)`); doing so adds one outer REML smoothing coordinate.
+    /// Zero-centered shrinkage ridge with a REML-selected `λ`. It is enabled
+    /// by default so an unsupported non-intercept effect can be recovered as
+    /// zero; set `false` for an explicit unpenalized/MLE effect.
     #[serde(default = "default_linear_term_double_penalty")]
     pub double_penalty: bool,
     #[serde(default)]
@@ -1191,14 +1205,7 @@ impl LinearTermSpec {
 }
 
 pub const fn default_linear_term_double_penalty() -> bool {
-    // Parametric/linear terms are unpenalized by default — a single linear
-    // coefficient has no roughness for a smoothing penalty to control, so the
-    // historical `S = I`, REML-selected `λ` shrank every linear coefficient off
-    // the MLE and injected a spurious outer smoothing coordinate (#749). Mature
-    // tools (mgcv/glm/survreg/VGAM) leave parametric terms unpenalized; gam now
-    // matches that and reports the MLE. An explicit `double_penalty = true`
-    // still opts a term into a ridge.
-    false
+    true
 }
 
 pub const fn default_pca_smooth_penalty() -> f64 {
@@ -5698,7 +5705,15 @@ pub fn build_tensor_bspline_basis(
             .iter()
             .any(|candidate| matches!(candidate.source, PenaltySource::TensorGlobalRidge))
         {
-            let width = candidates[0].matrix.nrows();
+            let width = candidates
+                .first()
+                .ok_or_else(|| {
+                    BasisError::InvalidInput(
+                        "TensorBSpline global ridge has no penalty candidates".to_string(),
+                    )
+                })?
+                .matrix
+                .nrows();
             let mut joint_primary = Array2::<f64>::zeros((width, width));
             for candidate in &candidates {
                 if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {

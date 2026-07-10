@@ -3,6 +3,7 @@ pub mod input;
 pub mod interval_policy;
 pub mod linalg;
 pub mod posterior_bands;
+pub mod posterior_predict;
 
 pub use conformal::*;
 pub use gam_models::inference::predict_io::{
@@ -10,6 +11,7 @@ pub use gam_models::inference::predict_io::{
 };
 pub use gam_problem::dispersion_cov::se_from_covariance;
 pub use posterior_bands::*;
+pub use posterior_predict::*;
 
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 // Surface the per-family predictors at the crate root so callers (integration

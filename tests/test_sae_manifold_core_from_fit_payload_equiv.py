@@ -12,12 +12,10 @@ passthroughs) surfaces as a dict mismatch. Three atom kinds are exercised
 (circle=periodic shape-band path, euclidean + duchon = duchon_centers path).
 
 MAINLINE only: no Fisher shard, no linear_block relabel (follow-up arms). The
-mainline fixture is asserted NON-FINITE-FREE so a future data change cannot
-silently exercise the NaN branch, and the builder's NaN handling is pinned as
-CONSISTENT with the legacy `from_json` reader (both reject via serde parse)."""
+mainline fixture is asserted free of non-finite values so a future data change cannot
+silently exercise the Rust mapping-coercion rejection branch."""
 from __future__ import annotations
 
-import json
 import math
 
 import numpy as np
@@ -29,17 +27,6 @@ from gamfit._sae_manifold import rust_module  # noqa: E402
 
 def _builder():
     return rust_module().sae_manifold_core_from_fit_payload
-
-
-def _jsonable(value):
-    """The exact `to_dict._jsonable`: numpy -> list, dict keys stringified."""
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
 
 
 def _no_nonfinite(v) -> bool:
@@ -88,10 +75,9 @@ def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
     )
     assert "raw" in captured, "raw sae_manifold_fit_minimal payload was not captured"
 
-    raw_json = json.dumps(_jsonable(captured["raw"]))
     penalties = list(fit.primitive_names[1:])
     core = builder(
-        raw_json,
+        captured["raw"],
         x,
         str(fit.atom_topology),
         fit.assignment,
@@ -144,9 +130,8 @@ def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
     assert fit.metric_provenance == "OutputFisher"
     assert "raw" in captured
 
-    raw_json = json.dumps(_jsonable(captured["raw"]))
     core = builder(
-        raw_json, x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
+        captured["raw"], x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
         list(fit.primitive_names[1:]),
         float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
         float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
@@ -188,9 +173,8 @@ def test_builder_full_fit_equiv_linear_block(monkeypatch):
     # What `_bases(...)` produces for atom_topology="linear_block": one per atom.
     bases = ["linear_block"] * len(fit.atom_topologies)
 
-    raw_json = json.dumps(_jsonable(captured["raw"]))
     core = builder(
-        raw_json, x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
+        captured["raw"], x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
         list(fit.primitive_names[1:]),
         float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
         float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
@@ -207,17 +191,13 @@ def test_builder_full_fit_equiv_linear_block(monkeypatch):
     assert "linear_block" not in new["basis_specs"]
 
 
-def test_builder_rejects_nonfinite_consistent_with_from_json():
-    """The JSON-marshalled builder parses with serde, which rejects the bare
-    `NaN` literal exactly as `ManifoldSaeCore.__new__` (`from_json`) does — so the
-    two paths are NaN-CONSISTENT (both reject), no silent divergence. The distinct
-    `py_any_to_json_value` Null policy (for the future perf direct-read builder) is
-    pinned in test_sae_coercion_json_roundtrip."""
+def test_builder_rejects_nonfinite_required_numeric_field():
+    """The Rust mapping coercion nulls NaN and required numeric fields reject it."""
     builder = _builder()
-    bad_json = '{"atom_plans": [], "atoms": [], "chosen_k": 0, "dispersion": NaN}'
+    bad_payload = {"atom_plans": [], "atoms": [], "chosen_k": 0, "dispersion": np.nan}
     x = np.zeros((2, 2), dtype=np.float64)
     with pytest.raises(ValueError):
         builder(
-            bad_json, x, "euclidean", "softmax", "softmax", [],
+            bad_payload, x, "euclidean", "softmax", "softmax", [],
             1.0, False, 0.5, 1.0, 1.0, 0.04, 50, 0, None, 0.0,
         )

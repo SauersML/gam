@@ -12,12 +12,19 @@ different ``lambda_sparse`` give a different objective on the same input.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from gamfit.torch.modules import AdaptiveTopK
-from gamfit.torch.skip_transcoder import SkipAffineSmooth, skip_transcoder
+from gamfit.torch.skip_transcoder import (
+    SkipAffineSmooth,
+    SkipTranscoderProfile,
+    select_skip_transcoder,
+    skip_transcoder,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +145,61 @@ def test_skip_transcoder_scalar_path_carries_lambda_sparse():
     assert s.jumprelu.weight == pytest.approx(2e-3)
 
 
-def test_skip_transcoder_grid_each_candidate_carries_its_lambda():
-    results = skip_transcoder(
-        in_dim=4, out_dim=4, n_atoms=8, rank_skip=2, lambda_sparse=[1e-3, 1e-1]
+def test_skip_transcoder_rejects_cartesian_hyperparameter_sequences():
+    with pytest.raises((TypeError, ValueError)):
+        skip_transcoder(
+            in_dim=4,
+            out_dim=4,
+            n_atoms=8,
+            rank_skip=2,
+            lambda_sparse=[1e-3, 1e-1],
+        )
+
+
+def test_skip_transcoder_continuous_profile_and_rank_birth_death_certificate():
+    target_logs = (0.37, -0.61)
+
+    def profile(trial):
+        rank_cost = float((trial.rank_skip - 2) ** 2)
+        dl = trial.log_lambda_sparse - target_logs[0]
+        dt = trial.log_jumprelu_threshold - target_logs[1]
+        score = dl * dl + dt * dt + rank_cost
+        smooth = SkipAffineSmooth(
+            in_dim=3,
+            out_dim=3,
+            n_atoms=4,
+            rank_skip=trial.rank_skip,
+            lambda_sparse=math.exp(trial.log_lambda_sparse),
+            jumprelu_threshold=math.exp(trial.log_jumprelu_threshold),
+            dtype=torch.float64,
+        )
+        return SkipTranscoderProfile(
+            smooth=smooth,
+            rank_skip=trial.rank_skip,
+            log_lambda_sparse=trial.log_lambda_sparse,
+            log_jumprelu_threshold=trial.log_jumprelu_threshold,
+            negative_log_evidence=score,
+            gradient_log_hyperparameters=(2.0 * dl, 2.0 * dt),
+            gradient_scale=1.0 + abs(score),
+        )
+
+    selected = select_skip_transcoder(
+        3,
+        3,
+        profile,
+        initial_lambda_sparse=0.2,
+        initial_jumprelu_threshold=0.8,
     )
-    assert isinstance(results, list)
-    by_lambda = {r.lambda_sparse: r for r in results}
-    assert set(by_lambda) == {1e-3, 1e-1}
-    for lam, r in by_lambda.items():
-        # The module's own JumpReLU weight matches the swept lambda_sparse,
-        # not just the result metadata.
-        assert r.smooth.jumprelu.weight == pytest.approx(lam)
+    assert selected.rank_skip == 2
+    assert selected.profile.log_lambda_sparse == pytest.approx(target_logs[0], abs=1e-7)
+    assert selected.profile.log_jumprelu_threshold == pytest.approx(
+        target_logs[1], abs=1e-7
+    )
+    assert selected.certificate.death.structurally_feasible
+    assert selected.certificate.birth.structurally_feasible
+    assert selected.certificate.death.gap_from_selected > 0.0
+    assert selected.certificate.birth.gap_from_selected > 0.0
+    assert all(
+        transition.to_rank in {0, 1, 2, 3}
+        for transition in selected.certificate.transitions
+    )

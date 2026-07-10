@@ -160,15 +160,28 @@ pub struct PenalizedVectorGlmInputs<'a> {
     /// adapter is responsible for any family-specific structural precondition
     /// on the block (e.g. zero off-diagonals for independent columns).
     pub fisher_w_override: Option<ArrayView3<'a, f64>>,
-    /// Maximum Newton iterations; recommend 50.
+    /// Number of Newton iterations available to this invocation. On resume,
+    /// this is an additional budget beyond the checkpoint's completed count.
     pub max_iter: usize,
-    /// Relative-step convergence tolerance; recommend 1e-7.
+    /// Relative-step convergence tolerance.
     pub tol: f64,
     /// Class-space metric of the replicated penalty (#1587). `Diagonal`
     /// preserves the historical independent-per-output penalty; `Centered`
     /// selects the reference-symmetric softmax penalty (requires uniform
     /// `lambdas`). See [`ClassPenaltyMetric`].
     pub class_penalty_metric: ClassPenaltyMetric,
+    /// Optional checkpoint from the SAME design/response/penalty/weight
+    /// problem. Coefficients are sufficient to resume because η, the score,
+    /// Hessian, and objective are deterministically rebuilt before the first
+    /// additional Newton step.
+    pub resume_from: Option<VectorGlmResume<'a>>,
+}
+
+/// Borrowed fixed-λ vector-GLM checkpoint used to continue a stalled solve.
+#[derive(Debug, Clone, Copy)]
+pub struct VectorGlmResume<'a> {
+    pub coefficients: ArrayView2<'a, f64>,
+    pub completed_iterations: usize,
 }
 
 /// Outputs of a CONVERGED [`fit_penalized_vector_glm`] solve.
@@ -538,6 +551,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         max_iter,
         tol,
         class_penalty_metric,
+        resume_from,
     } = inputs;
 
     // ────────────────────────────── shape checks ──────────────────────────
@@ -581,7 +595,25 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // ────────────────────────── Newton iteration ──────────────────────────
     // β stored as (P, M) column-major-per-output; flat index uses output-major
     // ordering `flat[a · P + i] = β[i, a]` to align with `dense_block_xtwx`.
-    let mut beta = Array2::<f64>::zeros((p, m));
+    let (mut beta, completed_iterations) = match resume_from {
+        Some(resume) => {
+            if resume.coefficients.dim() != (p, m) {
+                crate::bail_invalid_estim!(
+                    "{context}: resume checkpoint coefficient shape {:?} ≠ (P, M) = ({p}, {m})",
+                    resume.coefficients.dim()
+                );
+            }
+            for ((i, a), &value) in resume.coefficients.indexed_iter() {
+                if !value.is_finite() {
+                    crate::bail_invalid_estim!(
+                        "{context}: resume checkpoint coefficient[{i},{a}] must be finite (got {value})"
+                    );
+                }
+            }
+            (resume.coefficients.to_owned(), resume.completed_iterations)
+        }
+        None => (Array2::<f64>::zeros((p, m)), 0),
+    };
     let mut eta = Array2::<f64>::zeros((n_obs, m));
     // Reused η scratch for the line-search objective probes (see
     // `evaluate_objective`): overwritten in full on every call, so it carries
@@ -596,8 +628,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // heap-allocation removal with no effect on the computed gradient.
     let mut grad_flat = Array1::<f64>::zeros(beta_flat_dim);
 
-    let mut iterations = 0usize;
-    let mut converged = false;
+    let mut iterations = completed_iterations;
+    let mut small_step_reached = false;
     let mut stall_reason = VectorGlmStallReason::IterationBudgetExhausted;
     let mut last_objective = f64::INFINITY;
 
@@ -631,7 +663,13 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     };
 
     for iter in 0..max_iter {
-        iterations = iter + 1;
+        iterations = completed_iterations
+            .checked_add(iter + 1)
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "{context}: resume checkpoint iteration count overflowed usize"
+                ))
+            })?;
 
         recompute_eta(&beta, &mut eta);
 
@@ -881,7 +919,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // bounded softmax/binomial likelihood.
         let grad_optimal = grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + max_diag);
         if step_norm <= tol * (1.0 + beta_norm) && grad_optimal {
-            converged = true;
+            small_step_reached = true;
             break;
         }
     }
@@ -969,8 +1007,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         (0..beta_flat_dim).fold(0.0_f64, |acc, i| acc.max(hessian_final[[i, i]].abs()));
     let final_grad_optimal =
         final_grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag);
-    if !(converged && final_grad_optimal) {
-        if converged {
+    if !final_grad_optimal {
+        if small_step_reached {
             stall_reason = VectorGlmStallReason::PostStepCertificateFailed;
         }
         // Budget exhausted (or the post-step score failed certification). Hand

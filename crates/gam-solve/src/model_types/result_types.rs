@@ -831,6 +831,13 @@ pub struct FitArtifacts {
     /// λ, per-class EDF, and the influence matrix `F = I − H⁻¹ S_λ`.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub joint_log_lambdas: Option<Array1<f64>>,
+    /// Whether the fit optimized the Firth/Jeffreys-adjusted likelihood.
+    /// Persisted (serialized) so saved-model posterior sampling reconstructs
+    /// the SAME target the fit optimized — dropping the Jeffreys term Φ(β)
+    /// from the sampled log-posterior silently samples a different model
+    /// (#2245 finding 16). `false` for fits that never engaged Firth.
+    #[serde(default)]
+    pub firth_bias_reduction: bool,
 }
 
 impl std::fmt::Debug for FitArtifacts {

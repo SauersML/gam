@@ -1,13 +1,13 @@
 use crate::estimate::EstimationError;
+use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
-use faer::Side;
-use opt::{RidgeSchedule, escalate_ridge};
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1, ArrayViewMut2, Axis,
     s,
 };
+use opt::{RidgeSchedule, escalate_ridge};
 use rayon::prelude::*;
 use std::sync::Once;
 
@@ -447,8 +447,7 @@ pub fn gaussian_reml_point_eval_at_rho(
     rho: f64,
 ) -> Result<GaussianRemlPointEval, EstimationError> {
     let y2 = y.insert_axis(Axis(1));
-    let prepared =
-        prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
+    let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
     let eval = prepared.evaluate(rho);
     let lambda = rho.exp();
     let coefficients = prepared.coefficients(lambda).column(0).to_owned();
@@ -710,7 +709,6 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
         edf: eval.edf,
     })
 }
-
 
 pub fn gaussian_reml_multi_closed_form_batch<'a>(
     problems: &[GaussianRemlMultiBatchProblem<'a>],
@@ -974,7 +972,10 @@ fn block_orthogonal_conditional_scale(
         });
     }
     let scale = q.mapv(|value| nu / value);
-    if scale.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+    if scale
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
@@ -1095,8 +1096,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scale_precision =
-        block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
+    let mut scale_precision = block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
     // Convergence is certified by the analytic score of the joint REML
     // objective, never by the iteration cap (SPEC rule 20). Each outer pass
     // (a) solves every block's 1-D rho Newton at the current scale precisions
@@ -1149,8 +1149,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
                 scale_precision.view(),
                 ranks[block],
             );
-            let residual =
-                derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64));
+            let residual = derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64));
             if !residual.is_finite() {
                 return Err(EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
@@ -1688,8 +1687,8 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             // stationary root with usable ρ-curvature (a ρ̂ railed at a box
             // endpoint is locally the constant projection — its channel is 0).
             let rho_hat = problem.fit.lambda.ln();
-            let rho_at_bound = (rho_hat - RHO_UPPER).abs() <= 1.0e-9
-                || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
+            let rho_at_bound =
+                (rho_hat - RHO_UPPER).abs() <= 1.0e-9 || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
             let implicit_rho_usable = problem.fit.reml_hess_rho.is_finite()
                 && problem.fit.reml_hess_rho.abs() > 1.0e-14
                 && !rho_at_bound;
@@ -2430,8 +2429,7 @@ fn batched_whitened_penalty_transforms(
         let l_inv = invert_lower_triangular(lower).ok()?;
         linv_stack.slice_mut(s![idx, .., ..]).assign(&l_inv);
     }
-    let penalty_in_metric =
-        gam_gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)?;
+    let penalty_in_metric = gam_gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)?;
     let transformed =
         gam_gpu::try_fast_abt_strided_batched(penalty_in_metric.view(), linv_stack.view())?;
     Some(
@@ -2965,10 +2963,15 @@ pub fn gaussian_reml_cyclic_multi_lambda_rho(
     let n_effective = effective_observation_count(weight.view());
     let y2 = y.insert_axis(Axis(1));
     if y2.nrows() != n {
-        crate::bail_invalid_estim!("Gaussian REML cyclic: X has {n} rows but y has {}", y2.nrows());
+        crate::bail_invalid_estim!(
+            "Gaussian REML cyclic: X has {n} rows but y has {}",
+            y2.nrows()
+        );
     }
     let xtwy = dense_xt_diag_y(x, weight.view(), y2.view());
-    let ywy_val: f64 = (0..n).map(|row| weight[row] * y2[[row, 0]] * y2[[row, 0]]).sum();
+    let ywy_val: f64 = (0..n)
+        .map(|row| weight[row] * y2[[row, 0]] * y2[[row, 0]])
+        .sum();
     let ywy = Array1::from_elem(1, ywy_val);
     let xtwx = dense_xt_diag_x(x, weight.view());
 
@@ -3619,7 +3622,14 @@ fn optimize_rho_no_alloc(
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
     let eval = |rho: f64| {
-        evaluate_reml_parts(cache, ywy, projected_rhs_squared, n_effective, n_outputs, rho)
+        evaluate_reml_parts(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            n_effective,
+            n_outputs,
+            rho,
+        )
     };
     let enclose = |a: f64, b: f64| {
         reml_deriv_enclosure(
@@ -3813,8 +3823,7 @@ mod tests {
         let eval = block_orthogonal_eval(&gram, &rhs, &penalty, rho).unwrap();
         let analytic = block_orthogonal_scale_objective(&eval, rho, scale.view(), 2).grad;
         let value_at = |candidate_rho: f64| {
-            let candidate =
-                block_orthogonal_eval(&gram, &rhs, &penalty, candidate_rho).unwrap();
+            let candidate = block_orthogonal_eval(&gram, &rhs, &penalty, candidate_rho).unwrap();
             block_orthogonal_scale_objective(&candidate, candidate_rho, scale.view(), 2).value
         };
         let numerical = (value_at(rho + step) - value_at(rho - step)) / (2.0 * step);
@@ -4899,15 +4908,14 @@ mod tests {
         // The enumerator must isolate BOTH roots of the winning spectrum.
         let eigs = vec![(-0.5 * delta).exp(), (0.5 * delta).exp()];
         let cache = synthetic_cache(&eigs);
-        let prs = Array2::from_shape_vec(
-            (2, 1),
-            vec![0.361060218768292, 0.01014486085547482 * scale],
-        )
-        .unwrap();
+        let prs =
+            Array2::from_shape_vec((2, 1), vec![0.361060218768292, 0.01014486085547482 * scale])
+                .unwrap();
         let eval =
             |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
-        let enclose =
-            |a: f64, b: f64| reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b);
+        let enclose = |a: f64, b: f64| {
+            reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
+        };
         let mut roots = Vec::new();
         enumerate_and_select_rho(&eval, &enclose, None, |r, _| roots.push(r)).unwrap();
         assert!(
@@ -5475,10 +5483,8 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
     let mut trace_pairs = Array2::<f64>::zeros((f_blocks, f_blocks));
     for i in 0..f_blocks {
         for j in 0..f_blocks {
-            trace_pairs[[i, j]] = gam_linalg::utils::trace_of_product(
-                rp_matrices[i].view(),
-                rp_matrices[j].view(),
-            );
+            trace_pairs[[i, j]] =
+                gam_linalg::utils::trace_of_product(rp_matrices[i].view(), rp_matrices[j].view());
         }
     }
 
@@ -5640,9 +5646,11 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
                 if weights[row] <= 0.0 {
                     continue;
                 }
-                let z_r_z = (0..p_total).map(|col| z[[row, col]] * zr[[row, col]]).sum::<f64>();
-                let a_score = q_kernel_score * residual[row] * residual[row]
-                    + 0.5 * grad_reml_score * z_r_z;
+                let z_r_z = (0..p_total)
+                    .map(|col| z[[row, col]] * zr[[row, col]])
+                    .sum::<f64>();
+                let a_score =
+                    q_kernel_score * residual[row] * residual[row] + 0.5 * grad_reml_score * z_r_z;
                 weighted_score_partial_sum += weights[row] * a_score;
             }
             let projection = weighted_score_partial_sum / n_pos as f64;

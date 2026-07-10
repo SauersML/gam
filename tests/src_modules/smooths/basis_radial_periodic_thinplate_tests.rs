@@ -2167,9 +2167,9 @@ fn test_clamped_bspline_curvature_penalty_null_space_is_exactly_linear() {
         let rel = (resid.sqrt()) / amp.sqrt().max(1e-30);
         worst_rel_dev = worst_rel_dev.max(rel);
     }
-    assert!(
-        null_count >= 2,
-        "curvature penalty should have a 2-D (const+linear) null space, found {null_count}"
+    assert_eq!(
+        null_count, 2,
+        "curvature penalty must have exactly the const+linear null space"
     );
     assert!(
         worst_rel_dev < 1e-8,
@@ -2180,7 +2180,7 @@ fn test_clamped_bspline_curvature_penalty_null_space_is_exactly_linear() {
 }
 
 #[test]
-fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
+fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
     let x = array![0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.45, 10.0, 10.5, 11.0, 12.0];
     let spec = BSplineBasisSpec {
         degree: 2,
@@ -2196,26 +2196,18 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     };
 
     let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
-    let built_design = built.design.to_dense();
     let knots = match &built.metadata {
         BasisMetadata::BSpline1D { knots, .. } => knots,
         _ => panic!("expected BSpline1D metadata"),
     };
-    let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{} failed", "quantile knots should trigger Greville scaling"));
     let expected_raw =
-        create_difference_penalty_matrix(built_design.ncols(), spec.penalty_order, Some(g.view()))
-            .unwrap();
+        bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order).unwrap();
     // Since #1365 the shipped B-spline bending penalty is Frobenius-normalized
     // (`normalize_penalty`) so the REML λ-search sees a unit-Frobenius block on
     // a basis-independent scale; `built.penalties[0]` is therefore `S/‖S‖_F`,
-    // not the raw divided-difference matrix. The test's claim — that quantile
-    // (non-uniform) knots use the Greville-scaled divided-difference penalty —
-    // holds up to that normalization, so compare against the normalized oracle.
-    // (The earlier raw comparison mismatched by ~1e4 purely from the missing
-    // 1/‖S‖_F factor: this data's 0.45→10 gap makes the raw Greville-scaled
-    // entries large.)
+    // not the raw derivative Gram. The test's claim — that quantile
+    // (non-uniform) knots use the exact derivative Gram — holds up to that
+    // normalization, so compare against the normalized production oracle.
     let frob = expected_raw
         .iter()
         .map(|v| v * v)

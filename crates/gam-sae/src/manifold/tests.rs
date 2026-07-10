@@ -2715,8 +2715,7 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     assert_abs_diff_eq!(probe_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
-/// #1224 — the BFGS/ARC line-search cost probe must see PURE REML, not the
-/// co-training consistency fold `f+c`.
+/// #1224 — every fitting/ranking lane must price the same pure REML criterion.
 ///
 /// The outer optimizer compares three lanes at a fixed ρ:
 ///   * `eval` (`OuterEvalOrder::ValueAndGradient`) returns the consistent
@@ -2728,20 +2727,14 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
 ///     here while the direction is `∇f` mixes two functions in the Armijo test
 ///     (the objective↔gradient desync bug class). The fix threads
 ///     `fold_cotrain = false` into this lane.
-///   * `eval_cost` is the derivative-free cross-seed RANKING lane, where no
-///     gradient is ever paired with the cost, so it legitimately carries the
-///     fold (`fold_cotrain = true`): its cost is `f + c`.
+///   * `eval_cost` is the cross-seed ranking lane and also returns `f`; ranking
+///     by a different `f+c` criterion would select a fit that need not be
+///     stationary for the objective the optimizer descended.
 ///
-/// This fixture's atoms carry no basis evaluator, so every joint row solve is
-/// unavailable (`unconverged_fraction = 1.0`) and the consistency fold `c` is
-/// strictly positive. The regression therefore pins:
-///   (1) line-search lane cost == gradient lane cost  (the desync invariant),
-///   (2) ranking lane cost  >  line-search lane cost   (the fold IS present on
-///       the ranking lane and ABSENT on the line-search lane).
-/// The pre-fix code fed `f+c` to the line search, collapsing (1)/(2): the
-/// line-search cost would equal the ranking cost and exceed the gradient cost.
+/// The regression pins one invariant: gradient, line-search, and ranking costs
+/// agree at the same `ρ`.
 #[test]
-pub(crate) fn line_search_value_probe_sees_pure_reml_not_cotrain_fold() {
+pub(crate) fn outer_value_and_ranking_lanes_share_pure_reml_criterion() {
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
     // A fixed ρ at which all three lanes converge from the same fixture state.
@@ -2763,33 +2756,16 @@ pub(crate) fn line_search_value_probe_sees_pure_reml_not_cotrain_fold() {
         .expect("line-search probe must converge on the warm-start fixture")
         .cost;
 
-    // Ranking lane (`eval_cost`): the derivative-free cross-seed screen, which
-    // DOES carry the consistency fold `c`.
+    // Ranking lane (`eval_cost`): the cross-seed screen prices the same `f`.
     let mut rank_obj = warmstart_test_objective();
     let rank_cost = rank_obj
         .eval_cost(&rho_flat)
         .expect("ranking lane must converge on the warm-start fixture");
 
-    // (1) The line-search cost equals the gradient-lane cost: the BFGS Armijo
-    //     sufficient-decrease test now pairs `f` with `∇f` (no desync).
+    // Armijo and cross-seed selection both price the criterion whose gradient
+    // the accepted-point lane returns.
     assert_abs_diff_eq!(ls_cost, grad_cost, epsilon = 1.0e-10);
-
-    // The fold is genuinely present in this fixture (no basis evaluator ⇒
-    // unconverged_fraction = 1.0), so the ranking lane is strictly costlier.
-    assert!(
-        rank_cost > grad_cost + 1.0e-6,
-        "ranking lane must carry a strictly positive co-training fold: \
-             rank_cost={rank_cost:.12} grad_cost={grad_cost:.12}"
-    );
-
-    // (2) The line-search lane must NOT carry the fold: it is strictly cheaper
-    //     than the ranking lane by exactly the fold magnitude. The pre-fix bug
-    //     (line search sees `f+c`) would make `ls_cost == rank_cost`.
-    assert!(
-        ls_cost < rank_cost - 1.0e-6,
-        "line-search lane must exclude the co-training fold the ranking lane \
-             carries: ls_cost={ls_cost:.12} rank_cost={rank_cost:.12}"
-    );
+    assert_abs_diff_eq!(rank_cost, grad_cost, epsilon = 1.0e-10);
 }
 
 /// #1029 budget-policy gate: value probes get the base refine budget and

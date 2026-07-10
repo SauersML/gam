@@ -31,11 +31,14 @@
 //! through degree 2·4−1 = 7 ≥ 6, so the assembled `S` is the EXACT integral,
 //! not a quadrature approximation.
 //!
-//! Solve and selection. For a trial λ the bands are expanded and
-//! `(X'WX + λS)c = X'Wy` is solved by dense Cholesky with the exact
-//! log-determinant read off the factor. `p ≤ (32+3)² = 1225`, so the O(p³)
-//! factorization costs ≲ 1 Gflop per trial and the retained factor is ≤ 12 MB;
-//! K is capped at 32 to keep that sizing contract honest. λ maximizes the
+//! Solve and selection. A single reference factorization of `H₀=X'WX+S`
+//! produces the affine generalized-eigenvalue pencil
+//! `H(λ)=L[I+(λ-1)U diag(μ)U']L'`. The profiled score and its first two
+//! analytic log-λ derivatives are then O(pD), and outward interval enclosures
+//! isolate every stationary interval without a grid. The selected system is
+//! factored once more for coefficients/posterior covariance. `p ≤ (32+3)² =
+//! 1225`; K is capped at 32 to keep the dense reference factor and eigensystem
+//! sizing contract honest. λ maximizes the
 //! profiled-σ² restricted (REML) criterion
 //!   `ℓ_R(λ) = −½[ log|X'WX+λS| − r·log λ + (n−3)·log σ̂²(λ) ] + const`,
 //! where `r = p−3` is the penalty rank — the null space of `J` is
@@ -43,9 +46,9 @@
 //! is 1 ≠ 0, so it is NOT in the null space), `σ̂²(λ) = (y'Wy − c'X'Wy)/(n−3)`
 //! is the profiled scale, and the λ-free additive constants (`log|S|₊` on the
 //! row space of S, `Σ log w`, 2π factors) are dropped: differences across λ
-//! are exact REML criterion differences. Selection is the same deterministic
-//! coarse-grid + golden-section scheme as `spline_scan` — no RNG, same data ⇒
-//! same fit.
+//! are exact REML criterion differences. The exact bounded-domain endpoints
+//! (including the null-recovery end) compete with every certified stationary
+//! point; no RNG or lattice is involved, so the same data imply the same fit.
 //!
 //! Prediction. `predict(x1, x2)` builds the 16-entry basis row; the mean is
 //! its dot with `c` and the variance is the Bayesian posterior
@@ -53,17 +56,18 @@
 //! bounding box the boundary cell's cubic polynomial extends naturally (the
 //! cell index clamps, the local coordinate does not).
 
+use faer::Side;
+use gam_linalg::faer_ndarray::FaerEigh;
+use gam_math::score_opt::AffineRemlProfile;
+use ndarray::{Array1, Array2};
+
 /// Dimension of the penalty null space: span{1, x1, x2}. The mixed
 /// `2·a1·a2·f_{x1x2}²` term excludes `x1·x2` (its cross derivative is 1).
 const PENALTY_NULLITY: usize = 3;
 
-/// Deterministic coarse-grid width for the log-λ search.
-const LOG_LAMBDA_GRID: usize = 25;
 /// Search interval for log λ (natural log), generous on both sides.
 const LOG_LAMBDA_LO: f64 = -18.0;
 const LOG_LAMBDA_HI: f64 = 18.0;
-/// Golden-section refinement tolerance on log λ.
-const LOG_LAMBDA_TOL: f64 = 1e-7;
 /// Cholesky pivot floor below which the penalized system is declared singular.
 const PIVOT_FLOOR: f64 = 1e-300;
 /// Dense-Cholesky sizing contract documented in the module header.

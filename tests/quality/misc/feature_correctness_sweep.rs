@@ -10,7 +10,7 @@ use gam::basis::{
     BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
     build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    create_cyclic_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
+    cyclic_bspline_derivative_penalty_matrix, evaluate_bspline_derivative_scalar,
     periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -169,18 +169,22 @@ fn periodic_bspline_rejects_invalid_range() {
 }
 
 #[test]
-fn cyclic_difference_penalty_constant_in_nullspace_across_orders_and_k() {
+fn cyclic_derivative_penalty_constant_in_nullspace_across_orders_and_k() {
     for &k in &[4_usize, 6, 12, 24, 64, 256] {
         for &order in &[1_usize, 2, 3] {
             if order >= k {
                 continue;
             }
-            let s = create_cyclic_difference_penalty_matrix(k, order).unwrap();
+            let s = cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, order).unwrap();
+            let scale = s.iter().fold(0.0_f64, |m, value| m.max(value.abs()));
             let v = s.dot(&Array1::<f64>::ones(k));
             for (i, &vi) in v.iter().enumerate() {
-                assert!(vi.abs() < 1e-9, "k={k} order={order} row {i}: {vi}");
+                assert!(
+                    vi.abs() < 1e-10 * scale.max(1.0),
+                    "k={k} order={order} row {i}: {vi}"
+                );
             }
-            // Symmetry: S = D'D so S' = S
+            // Exact derivative Gram symmetry.
             for i in 0..k {
                 for j in i + 1..k {
                     assert!(near(s[(i, j)], s[(j, i)], 1e-12), "k={k} order={order}");

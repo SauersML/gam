@@ -15,8 +15,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand::{RngExt, SeedableRng};
 
 use super::hmc_io::{
-    FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsFamily, SurvivalFlatInputs,
-    explicit_fit_hessian_for_whitening, run_link_wiggle_nuts_sampling,
+    FamilyNutsInputs, GlmFlatInputs, LinkWiggleFamilyParams, LinkWiggleSplineArtifacts,
+    SurvivalFlatInputs, explicit_fit_hessian_for_whitening, run_link_wiggle_nuts_sampling,
     run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
 pub use super::hmc_io::{NutsConfig, NutsResult};
@@ -46,7 +46,8 @@ use gam_models::wiggle::{
     split_wiggle_penalty_orders,
 };
 use gam_problem::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_solve::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
+use gam_runtime::resource::{MemoryGovernor, ResourcePolicy, rows_for_target_bytes};
+use gam_solve::estimate::{BlockRole, validate_all_finite};
 use gam_terms::basis::create_difference_penalty_matrix;
 use gam_terms::smooth::build_term_collection_design;
 use gam_terms::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
@@ -140,20 +141,49 @@ fn validate_explicit_link_wiggle_joint_hessian(
     Ok(())
 }
 
-/// Resolve the scalar generative dispersion for a fitted model.
+/// Resolve the fitted prior-weights column for saved-model sampling.
 ///
-/// Thin adapter over the single canonical
-/// [`crate::generative::family_noise_parameter`]: the replicate-sampling path
-/// here and the CLI `gam generate` path both route through that one helper, so
-/// the fitted dispersion (NB θ̂, Beta/Tweedie φ̂, Gamma k̂) can never be read
-/// inconsistently between them. A divergent second copy of this logic was the
-/// root cause of #1124.
-fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -> Option<f64> {
-    crate::generative::family_noise_parameter(
-        fit.likelihood_scale,
-        fit.standard_deviation,
-        likelihood,
-    )
+/// The fit optimized a weighted likelihood; reconstructing the target with
+/// unit weights samples a DIFFERENT posterior — an intercept-only Bernoulli
+/// with `(y, w) = (1, 100), (0, 1)` has its weighted mode at `log 100`, not 0
+/// (#2245 finding 16). `None` weight column means the fit was unweighted.
+fn saved_prior_weights(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<Array1<f64>, String> {
+    match model.weight_column.as_deref() {
+        Some(name) => {
+            let idx = resolve_role_col(col_map, name, "weights")?;
+            let w = data.column(idx).to_owned();
+            if !w.iter().all(|v| v.is_finite() && *v >= 0.0) {
+                return Err(format!(
+                    "sample: prior-weights column '{name}' contains negative or non-finite values"
+                ));
+            }
+            Ok(w)
+        }
+        None => Ok(Array1::ones(data.nrows())),
+    }
+}
+
+/// Re-apply the offset the model was fit with so the posterior targets the
+/// same `η = Xβ + offset` as the fit and predict paths. The diagnostic loader
+/// keeps the saved offset column in the frame; dropping the offset silently
+/// sampled the wrong target for any `--offset-column` GLM (#882, #2245
+/// finding 16).
+fn saved_offset(
+    model: &SavedModel,
+    data: ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<Option<Array1<f64>>, String> {
+    match model.offset_column.as_deref() {
+        Some(name) => {
+            let idx = resolve_role_col(col_map, name, "offset")?;
+            Ok(Some(data.column(idx).to_owned()))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Refresh the Negative-Binomial overdispersion `theta` on the sampling
@@ -566,7 +596,7 @@ fn sample_standard(
         .as_ref()
         .filter(|c| c.a.nrows() > 0)
     {
-        return sample_standard_truncated(model, cfg, constraints);
+        return sample_standard_truncated(model, cfg, constraints, &design.design);
     }
 
     // (3) unconstrained Gaussian identity — saved closed-form Laplace posterior.
@@ -574,10 +604,24 @@ fn sample_standard(
         return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
     }
 
-    // (4) unconstrained non-Gaussian GLM — exact NUTS over the raw design.
-    let weights = Array1::ones(data.nrows());
-    let dense_design_hmc = design.design.to_dense();
+    // (4) unconstrained non-Gaussian GLM — exact NUTS over the raw design,
+    // under the SAME prior weights the fit optimized (#2245 finding 16).
+    let weights = saved_prior_weights(model, data, col_map)?;
+    let dense_design_hmc = design
+        .design
+        .try_to_dense_governed("saved standard model HMC design")
+        .map_err(|error| error.to_string())?;
     let p = dense_design_hmc.ncols();
+    // Both current dense sampler routes retain one additional n×p design:
+    // NUTS owns an Arc copy and Pólya-Gamma owns its row-scaled workspace.
+    // Reserve that simultaneous copy now and keep the charge through the call.
+    let sampler_design_copy_reservation = MemoryGovernor::global()
+        .try_reserve_dense_f64(
+            dense_design_hmc.nrows(),
+            dense_design_hmc.ncols(),
+            "saved standard model sampler design copy",
+        )
+        .map_err(|error| error.to_string())?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     // Refresh the NB overdispersion `theta` from the fit's jointly-estimated
     // `theta_hat` before sampling. The construction seed stored on the family
@@ -607,19 +651,9 @@ fn sample_standard(
     let penalty =
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
-    // Re-apply the offset the model was fit with so the posterior targets the
-    // same η = Xβ + offset as the fit and predict paths. The diagnostic loader
-    // keeps the saved offset column in the frame; dropping the offset silently
-    // sampled the wrong target for any `--offset-column` GLM (#882).
-    let offset_vec: Option<Array1<f64>> = match model.offset_column.as_deref() {
-        Some(name) => {
-            let idx = resolve_role_col(col_map, name, "offset")?;
-            Some(data.column(idx).to_owned())
-        }
-        None => None,
-    };
+    let offset_vec = saved_offset(model, data, col_map)?;
 
-    run_nuts_sampling_flattened_family(
+    let result = run_nuts_sampling_flattened_family(
         likelihood,
         FamilyNutsInputs::Glm(GlmFlatInputs {
             x: dense_design_hmc.view(),
@@ -633,12 +667,17 @@ fn sample_standard(
             // posterior scale selected at fit time; fixed-scale families remain
             // a no-op.
             dispersion: fit.dispersion().unwrap_or_default(),
-            firth_bias_reduction: false,
+            // The fit's optimized target: dropping the Jeffreys term Φ(β)
+            // from a Firth fit samples a different posterior (#2245
+            // finding 16). Persisted on the fit artifacts at fit time.
+            firth_bias_reduction: fit.artifacts.firth_bias_reduction,
             offset: offset_vec.as_ref().map(|o| o.view()),
         }),
         cfg,
     )
-    .map_err(|e| format!("NUTS sampling failed: {e}"))
+    .map_err(|e| format!("NUTS sampling failed: {e}"));
+    drop(sampler_design_copy_reservation);
+    result
 }
 
 /// Exact posterior draws for a standard GLM with `bounded()` coefficients.
@@ -724,6 +763,7 @@ fn sample_standard_truncated(
     model: &SavedModel,
     cfg: &NutsConfig,
     constraints: &gam_solve::pirls::LinearInequalityConstraints,
+    design: &gam_terms::construction::DesignMatrix,
 ) -> Result<NutsResult, String> {
     validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -747,7 +787,49 @@ fn sample_standard_truncated(
     let penalized_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard constrained model")?;
     let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
+
+    // Recover the UNCONSTRAINED Gaussian center of the local quadratic (#2245
+    // finding 20). A Gaussian truncated to the polytope stays centred at its
+    // pre-truncation mean `H⁻¹X′Wz`; the boundary KKT mode is not that mean.
+    // With every constraint strictly inactive at the mode the KKT gradient is
+    // zero and the two coincide, so the geometry solve is only required when a
+    // constraint is active.
+    let mode_scale = mode.iter().map(|v| v.abs()).fold(1.0_f64, f64::max);
+    let min_slack = (constraints.a.dot(&mode) - &constraints.b)
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+    let center = if min_slack > 1e-8 * mode_scale {
+        mode.clone()
+    } else {
+        let geometry = fit.geometry.as_ref().ok_or_else(|| {
+            "standard constrained-coefficient posterior: an inequality constraint is active at \
+             the mode but the saved model carries no working geometry to recover the \
+             unconstrained Gaussian center; refit with exact geometry export"
+                .to_string()
+        })?;
+        let x = design.as_dense_cow();
+        let n = x.nrows();
+        if geometry.working_weights.len() != n || geometry.working_response.len() != n {
+            return Err(format!(
+                "standard constrained-coefficient posterior: saved working geometry has {} rows \
+                 but the rebuilt design has {n}",
+                geometry.working_weights.len(),
+            ));
+        }
+        let wz = &geometry.working_weights * &geometry.working_response;
+        let rhs = x.t().dot(&wz);
+        let chol = FaerCholesky::cholesky(&penalized_hessian, faer::Side::Lower).map_err(|e| {
+            format!(
+                "standard constrained-coefficient posterior: Cholesky of the penalised Hessian \
+                 failed while recovering the unconstrained center: {e:?}"
+            )
+        })?;
+        gam_linalg::triangular::cholesky_solve_vector(&chol.lower_triangular(), &rhs)
+    };
+
     let samples = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
+        &center,
         &mode,
         &penalized_hessian,
         sqrt_cov_scale,
@@ -902,7 +984,17 @@ fn sample_standard_link_wiggle(
 
     let penalty_link = weighted_penalty_matrix(&wiggle_penalties, wiggle_lambdas)?;
 
-    let q0 = design.design.dot(&mode_beta);
+    // Fitted prior weights and offset, so the sampled target is exactly the
+    // fitted model's posterior (#2245 finding 16). The offset also enters the
+    // wiggle abscissa q₀ = Xβ + offset below, matching the target's basis
+    // evaluation.
+    let weights = saved_prior_weights(model, data, col_map)?;
+    let offset_vec = saved_offset(model, data, col_map)?;
+
+    let mut q0 = design.design.dot(&mode_beta);
+    if let Some(offset) = offset_vec.as_ref() {
+        q0 += offset;
+    }
     let (q0_min, q0_max) = q0
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
@@ -915,21 +1007,39 @@ fn sample_standard_link_wiggle(
         degree,
     };
 
-    let nuts_family = match (&likelihood.response, &likelihood.link) {
+    // Typed per-family likelihood parameters (#2245 finding 15): each family
+    // names exactly what its log-likelihood needs, read from the FITTED scale
+    // metadata. The historical single `scale` slot let Tweedie dispersion φ be
+    // consumed as the variance power p — a different posterior entirely.
+    let family = match (&likelihood.response, &likelihood.link) {
         (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
-            NutsFamily::BinomialLogit
+            LinkWiggleFamilyParams::BinomialLogit
         }
         (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
-            NutsFamily::BinomialProbit
+            LinkWiggleFamilyParams::BinomialProbit
         }
         (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
-            NutsFamily::BinomialCLogLog
+            LinkWiggleFamilyParams::BinomialCLogLog
         }
-        (ResponseFamily::Gaussian, _) => NutsFamily::Gaussian,
-        (ResponseFamily::Poisson, _) => NutsFamily::PoissonLog,
-        (ResponseFamily::Tweedie { .. }, _) => NutsFamily::TweedieLog,
-        (ResponseFamily::NegativeBinomial { .. }, _) => NutsFamily::NegativeBinomialLog,
-        (ResponseFamily::Gamma, _) => NutsFamily::GammaLog,
+        (ResponseFamily::Gaussian, _) => LinkWiggleFamilyParams::Gaussian {
+            sigma: fit.standard_deviation,
+        },
+        (ResponseFamily::Poisson, _) => LinkWiggleFamilyParams::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => LinkWiggleFamilyParams::TweedieLog {
+            power: *p,
+            phi: fit.likelihood_scale.fixed_phi().unwrap_or(1.0),
+        },
+        (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
+            LinkWiggleFamilyParams::NegativeBinomialLog {
+                theta: fit.likelihood_scale.negbin_theta().unwrap_or(*theta),
+            }
+        }
+        (ResponseFamily::Gamma, _) => LinkWiggleFamilyParams::GammaLog {
+            shape: fit
+                .likelihood_scale
+                .gamma_shape()
+                .unwrap_or(fit.standard_deviation),
+        },
         _ => {
             return Err(format!(
                 "NUTS sampling with link wiggle is not supported for family {}",
@@ -938,22 +1048,19 @@ fn sample_standard_link_wiggle(
         }
     };
 
-    let weights = Array1::ones(data.nrows());
-    let scale = family_noise_parameter(&fit, &likelihood).unwrap_or(fit.standard_deviation);
-
     let wiggle_nuts_dense = design.design.as_dense_cow();
     run_link_wiggle_nuts_sampling(
         wiggle_nuts_dense.view(),
         y.view(),
         weights.view(),
+        offset_vec.as_ref().map(|o| o.view()),
         penalty_base.view(),
         penalty_link.view(),
         mode_beta.view(),
         mode_theta.view(),
         hessian.view(),
         spline,
-        nuts_family,
-        scale,
+        family,
         cfg,
     )
     .map_err(|e| format!("link-wiggle NUTS sampling failed: {e}"))

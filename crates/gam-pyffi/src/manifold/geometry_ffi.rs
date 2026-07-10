@@ -6048,7 +6048,16 @@ fn sparse_dictionary_fit<'py>(
     out.set_item("codes", fit.codes.into_pyarray(py))?;
     out.set_item("explained_variance", fit.explained_variance)?;
     out.set_item("epochs", fit.epochs)?;
-    out.set_item("converged", fit.converged)?;
+    let convergence = PyDict::new(py);
+    convergence.set_item("inner_ev_residual", fit.convergence.inner_ev_residual)?;
+    convergence.set_item("inner_tolerance", fit.convergence.inner_tolerance)?;
+    convergence.set_item("decoder_residual", fit.convergence.decoder_residual)?;
+    convergence.set_item("decoder_tolerance", fit.convergence.decoder_tolerance)?;
+    convergence.set_item("outer_rho_residual", fit.convergence.outer_rho_residual)?;
+    convergence.set_item("outer_tolerance", fit.convergence.outer_tolerance)?;
+    convergence.set_item("selected_rho", fit.convergence.selected_rho)?;
+    convergence.set_item("outer_iterations", fit.convergence.outer_iterations)?;
+    out.set_item("convergence", convergence)?;
     out.set_item("active", fit.active)?;
     out.set_item(
         "score_route_stats",
@@ -6315,7 +6324,12 @@ fn block_sparse_dictionary_fit<'py>(
     out.set_item("matryoshka_prefix_losses", fit.matryoshka_prefix_losses)?;
     out.set_item("explained_variance", fit.explained_variance)?;
     out.set_item("epochs", fit.epochs)?;
-    out.set_item("converged", fit.converged)?;
+    let convergence = PyDict::new(py);
+    convergence.set_item("ev_residual", fit.convergence.ev_residual)?;
+    convergence.set_item("gamma_residual", fit.convergence.gamma_residual)?;
+    convergence.set_item("frame_residual", fit.convergence.frame_residual)?;
+    convergence.set_item("tolerance", fit.convergence.tolerance)?;
+    out.set_item("convergence", convergence)?;
     out.set_item("block_topk", fit.block_topk)?;
     out.set_item("block_size", fit.block_size)?;
     out.set_item(

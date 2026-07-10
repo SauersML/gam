@@ -329,6 +329,7 @@ pub fn fit_penalized_binomial_multi(
             // the per-output Diagonal penalty is correct here (the #1587 Centered
             // metric is softmax-specific — there is no shared reference class).
             class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+            resume_from: None,
         },
         &likelihood,
         "fit_penalized_binomial_multi",
@@ -528,6 +529,7 @@ mod tests {
             max_iter: 1,
             tol: 1.0e-9,
                 class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+                resume_from: None,
             },
             &likelihood,
             "binomial scaled-curvature first-step test",
@@ -543,6 +545,7 @@ mod tests {
                 max_iter: 1,
                 tol: 1.0e-9,
                 class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+                resume_from: None,
             },
             &likelihood,
             "binomial analytic-curvature first-step test",

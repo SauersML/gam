@@ -25,13 +25,15 @@ use opt::{
     BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search, constants,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::convert::Infallible;
+use std::{convert::Infallible, fmt};
 
 use crate::manifold::{
     GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
     sym,
 };
-use crate::manifolds::constant_curvature::ConstantCurvature;
+use crate::manifolds::constant_curvature::{
+    ConstantCurvature, cs_stacks3, distance_kappa_jet,
+};
 use crate::{GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
 
 /// Split a parenthesised `key=value, key=value` parameter list into trimmed,
@@ -984,6 +986,70 @@ pub fn response_frechet_mean(
 // contract `profile_ci_walk` / `flatness_lr_test` in `curvature_estimand.rs`
 // consume, with no new outer machinery.
 
+/// Typed failures from constant-curvature response fitting. In particular,
+/// optimiser exhaustion carries the exact score/Hessian and the normalized
+/// box-KKT residual, so a caller never receives a midpoint merely because an
+/// iteration cap was reached.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResponseGeometryError {
+    InvalidInput(String),
+    NumericalGeometry(String),
+    CurvatureUnidentified {
+        dispersion: f64,
+    },
+    CurvatureNonConvergence {
+        iterations: usize,
+        max_iter: usize,
+        bracket_lo: f64,
+        bracket_hi: f64,
+        kappa: f64,
+        criterion: f64,
+        score: f64,
+        curvature: f64,
+        kkt_residual: f64,
+        tolerance: f64,
+    },
+}
+
+impl fmt::Display for ResponseGeometryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message) | Self::NumericalGeometry(message) => f.write_str(message),
+            Self::CurvatureUnidentified { dispersion } => write!(
+                f,
+                "response curvature is unidentified: profiled geodesic dispersion is {dispersion:.6e}"
+            ),
+            Self::CurvatureNonConvergence {
+                iterations,
+                max_iter,
+                bracket_lo,
+                bracket_hi,
+                kappa,
+                criterion,
+                score,
+                curvature,
+                kkt_residual,
+                tolerance,
+            } => write!(
+                f,
+                "response curvature did not satisfy its box-KKT certificate after \
+                 {iterations}/{max_iter} iterations: bracket=[{bracket_lo:.6e}, \
+                 {bracket_hi:.6e}], kappa={kappa:.6e}, criterion={criterion:.6e}, \
+                 score={score:.6e}, curvature={curvature:.6e}, normalized KKT \
+                 residual={kkt_residual:.6e} > tolerance={tolerance:.6e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResponseGeometryError {}
+
+impl From<GeometryError> for ResponseGeometryError {
+    fn from(error: GeometryError) -> Self {
+        Self::NumericalGeometry(error.to_string())
+    }
+}
+
 /// Outcome of fitting curvature as an estimand on a constant-curvature response
 /// geometry: the optimised κ̂, its tangent base point, the profile-likelihood CI,
 /// and the interior-point flatness (Wilks) test of κ = 0.
@@ -1068,7 +1134,8 @@ pub struct ResponseCurvatureFit {
 ///
 /// * **Lower (hyperbolic) bound.** The κ-stereographic chart requires
 ///   `1 + κ‖x‖² > 0` at every point measured from the chart origin, i.e.
-///   `κ > −1/R²` with `R² = max_i ‖y_i‖²`. With a safety margin: `−0.999/R²`.
+///   `κ > −1/R²` with `R² = max_i ‖y_i‖²`. The open boundary is
+///   approached only to the relative resolution of f64 arithmetic.
 /// * **Upper (spherical) bound.** Unlike the hyperbolic side this is NOT
 ///   unbounded: on a sphere of curvature κ the geodesic radius cannot exceed the
 ///   conjugate radius `π/√κ`, beyond which the exp-map volume Jacobian
@@ -1076,14 +1143,15 @@ pub struct ResponseCurvatureFit {
 ///   collapse `V_p` toward `−∞`, railing the optimiser onto a spurious shell.
 ///   The κ = 0 geodesic radius of the farthest point from the centroid is
 ///   `ρ_max = 2·max_i‖y_i − μ‖` (doubled-gauge chart). We cap κ so that radius
-///   stays strictly inside the first conjugate shell with a 10% margin:
-///   `√κ·ρ_max ≤ 0.9π ⇒ κ_max = (0.9π / ρ_max)²`. This keeps every geodesic
-///   radius before the antipodal singularity along the whole search/CI walk.
+///   stays strictly inside the first conjugate shell to f64-relative resolution:
+///   `√κ·ρ_max < π`. This keeps every geodesic radius before the
+///   antipodal singularity along the whole search/CI walk without an arbitrary
+///   fractional margin.
 ///
 /// `κ_max` is the chart-RESOLUTION limit of the cloud: at it the geodesic spread
-/// fills `(0.9π)² ≈ (π/2·1.8)²` of the conjugate shell, i.e. the cloud nearly
-/// fills the sphere `S^d(1/√κ_max)`. The DIMENSIONLESS product `κ_max·ρ_max²
-/// = (0.9π)²` is fixed and data-scale-free — it is the natural "the cloud is
+/// fills the conjugate shell to machine resolution, i.e. the cloud nearly fills
+/// the sphere `S^d(1/√κ_max)`. The DIMENSIONLESS product `κ_max·ρ_max²
+/// → π²` is fixed and data-scale-free — it is the natural "the cloud is
 /// maximally curved relative to its spread" sentinel the rail check compares κ̂ to.
 fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
     let (n_rows, dim) = values.dim();
@@ -1113,25 +1181,15 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
             }
         }
     }
-    if r2_max <= 0.0 && s2_max <= 0.0 {
-        // Degenerate (all points at the origin): κ is unidentified; use a wide
-        // symmetric default so the optimiser/CI report a flat, unbounded result.
-        return (-1.0e6, 1.0e6, 0.0);
-    }
-    // Keep a safety margin off the singular hyperbolic boundary.
-    let kappa_min = if r2_max > 0.0 {
-        -0.999 / r2_max
-    } else {
-        -1.0e6
-    };
+    debug_assert!(r2_max > 0.0 && s2_max > 0.0);
+    // Stay one square-root-epsilon relative step inside both open singular
+    // boundaries. This is derived from f64 resolution, not a tuning knob.
+    let open_boundary = 1.0 - f64::EPSILON.sqrt();
+    let kappa_min = -open_boundary / r2_max;
     // Conjugate-radius cap: ρ_max = 2·max‖y_i − μ‖ is the κ=0 geodesic radius.
     let rho_max = 2.0 * s2_max.sqrt();
-    let kappa_max = if s2_max > 0.0 {
-        let edge = 0.9 * std::f64::consts::PI / rho_max;
-        edge * edge
-    } else {
-        1.0e6
-    };
+    let edge = open_boundary * std::f64::consts::PI / rho_max;
+    let kappa_max = edge * edge;
     (kappa_min, kappa_max, rho_max)
 }
 
@@ -1166,14 +1224,39 @@ pub fn response_curvature_criterion(
     dim: usize,
     kappa: f64,
 ) -> Result<(f64, Array1<f64>), String> {
+    response_curvature_criterion_jet(values, dim, kappa)
+        .map(|jet| (jet.value, jet.base))
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug)]
+struct CurvatureCriterionJet {
+    kappa: f64,
+    value: f64,
+    score: f64,
+    curvature: f64,
+    base: Array1<f64>,
+    dispersion: f64,
+}
+
+/// Hand-derived value, score, and Hessian of the profiled criterion. Every
+/// derivative is assembled from the closed-form distance κ-jet and analytic
+/// chain rules; no production finite difference or autodiff is involved.
+fn response_curvature_criterion_jet(
+    values: ArrayView2<'_, f64>,
+    dim: usize,
+    kappa: f64,
+) -> Result<CurvatureCriterionJet, ResponseGeometryError> {
     if !kappa.is_finite() {
-        return Err("response curvature criterion: kappa must be finite".into());
+        return Err(ResponseGeometryError::InvalidInput(
+            "response curvature criterion: kappa must be finite".into(),
+        ));
     }
     let (n_rows, cols) = values.dim();
     if n_rows == 0 || cols != dim || dim == 0 {
-        return Err(format!(
+        return Err(ResponseGeometryError::InvalidInput(format!(
             "response curvature criterion: values must be N×{dim} with N >= 1"
-        ));
+        )));
     }
     // κ-independent base point: the flat (ambient) centroid. Holding μ fixed across
     // κ is the de-entangling move — re-solving the Fréchet mean per κ couples the
@@ -1185,60 +1268,96 @@ pub fn response_curvature_criterion(
     base.mapv_inplace(|v| v / n_rows as f64);
 
     let chart = ConstantCurvature::new(dim, kappa);
-    // Reject κ at/over the chart boundary (1 + κ‖x‖² ≤ 0) at the centroid or any
-    // data point: the geodesic primitives are undefined there. The bracket in
-    // `response_kappa_bounds` keeps the optimiser strictly inside, but a CI/LR
-    // probe can still land on the edge, so guard rather than panic.
-    chart
-        .conformal_factor(base.view())
-        .map_err(|e| format!("response curvature criterion: base off chart: {e}"))?;
-
     let d = dim as f64;
-    let mut dispersion = 0.0_f64; // D = Σ s_i²
-    let mut ln_jac = 0.0_f64; // Σ ln J_κ(s_i)
-    let mut ln_lambda = 0.0_f64; // Σ ln λ_{y_i}
-    // Geodesic radii s_i = d_κ(μ, y_i) for every row, computed in a single
-    // batched pass (four rows per SIMD lane-group). `distance_batch` is
-    // bit-for-bit identical to the per-row `distance`, so D, Σ ln J, and Σ ln λ
-    // below are unchanged; it also validates each y_i is in-chart.
-    let mut radii = vec![0.0_f64; n_rows];
-    chart
-        .distance_batch(base.view(), values, &mut radii)
-        .map_err(|e| format!("response curvature criterion distance: {e}"))?;
-    for (row, &s) in values.outer_iter().zip(radii.iter()) {
-        dispersion += s * s;
-        // ln J_κ(s_i): exp-map volume Jacobian (≥ 0); floor before the log so the
-        // conjugate-shell clamp (J → 0 on the κ>0 antipodal shell) is a large
-        // finite penalty rather than −∞.
-        ln_jac += chart.jacobian_radial(s).max(1.0e-300).ln();
-        // ln λ_{y_i} = ln(2) − ln(1 + κ‖y_i‖²); `conformal_factor` validates chart.
-        let lam = chart
-            .conformal_factor(row)
-            .map_err(|e| format!("response curvature criterion conformal factor: {e}"))?;
-        ln_lambda += lam.ln();
+    let mut dispersion = 0.0_f64;
+    let mut dispersion_d1 = 0.0_f64;
+    let mut dispersion_d2 = 0.0_f64;
+    let mut ln_jac = 0.0_f64;
+    let mut ln_jac_d1 = 0.0_f64;
+    let mut ln_jac_d2 = 0.0_f64;
+    let mut chart_volume = 0.0_f64;
+    let mut chart_volume_d1 = 0.0_f64;
+    let mut chart_volume_d2 = 0.0_f64;
+
+    for row in values.outer_iter() {
+        let (r, r_d1, r_d2) = distance_kappa_jet(&chart, base.view(), row)?;
+        dispersion += r * r;
+        dispersion_d1 += 2.0 * r * r_d1;
+        dispersion_d2 += 2.0 * (r_d1 * r_d1 + r * r_d2);
+
+        if dim > 1 {
+            // J_κ(r)=S(u)^(d−1), u=κr². Chain-rule jets of u.
+            let u = kappa * r * r;
+            let u_d1 = r * r + 2.0 * kappa * r * r_d1;
+            let u_d2 = 4.0 * r * r_d1 + 2.0 * kappa * (r_d1 * r_d1 + r * r_d2);
+            let s = cs_stacks3(u).1;
+            if !(s[0].is_finite() && s[0] > 0.0) {
+                return Err(ResponseGeometryError::NumericalGeometry(
+                    "response curvature criterion reached the conjugate shell".into(),
+                ));
+            }
+            let log_s_d1 = s[1] / s[0];
+            let log_s_d2 = s[2] / s[0] - log_s_d1 * log_s_d1;
+            let exponent = (dim - 1) as f64;
+            ln_jac += exponent * s[0].ln();
+            ln_jac_d1 += exponent * log_s_d1 * u_d1;
+            ln_jac_d2 += exponent * (log_s_d2 * u_d1 * u_d1 + log_s_d1 * u_d2);
+        }
+
+        // −d ln λ_y = d[ln(1+κ‖y‖²)−ln 2].
+        let q = row.dot(&row);
+        let gauge = 1.0 + kappa * q;
+        if !(gauge.is_finite() && gauge > 0.0) {
+            return Err(ResponseGeometryError::NumericalGeometry(
+                "response curvature criterion reached the chart boundary".into(),
+            ));
+        }
+        chart_volume += d * (gauge.ln() - std::f64::consts::LN_2);
+        chart_volume_d1 += d * q / gauge;
+        chart_volume_d2 -= d * q * q / (gauge * gauge);
     }
     let nobs = (n_rows * dim) as f64;
-    // Floor the dispersion so a (near-)perfect flat fit does not blow ln up; the
-    // floor is far below any genuine residual scale and cancels in profile drops.
-    let disp = dispersion.max(1.0e-300 * nobs.max(1.0));
+    if !(dispersion.is_finite() && dispersion > 0.0) {
+        return Err(ResponseGeometryError::CurvatureUnidentified { dispersion });
+    }
 
     // σ profiles in closed form: σ̂² = D/(nd). Substituting and dropping the
     // κ-independent constant (nd/2)(1 + ln 2π):
     //   V_p(κ) = (nd/2)·ln(D/(nd)) + Σ ln J_κ(s_i) − d·Σ ln λ_{y_i}.
-    let v_p = 0.5 * nobs * (disp / nobs).ln() + ln_jac - d * ln_lambda;
-    Ok((v_p, base))
+    let value = 0.5 * nobs * (dispersion / nobs).ln() + ln_jac + chart_volume;
+    let score = 0.5 * nobs * dispersion_d1 / dispersion + ln_jac_d1 + chart_volume_d1;
+    let curvature = 0.5
+        * nobs
+        * (dispersion_d2 / dispersion
+            - (dispersion_d1 / dispersion) * (dispersion_d1 / dispersion))
+        + ln_jac_d2
+        + chart_volume_d2;
+    if !value.is_finite() || !score.is_finite() || !curvature.is_finite() {
+        return Err(ResponseGeometryError::NumericalGeometry(
+            "response curvature criterion jet is non-finite".into(),
+        ));
+    }
+    Ok(CurvatureCriterionJet {
+        kappa,
+        value,
+        score,
+        curvature,
+        base,
+        dispersion,
+    })
 }
 
 /// Fit curvature as an estimand on a constant-curvature response geometry.
 ///
 /// κ̂ is the minimiser of the profiled criterion [`response_curvature_criterion`]
 /// (the σ-profiled honest change-of-variables negative log-evidence of the wrapped
-/// normal w.r.t. ambient measure), found by a golden-section search inside the
-/// chart-validity bracket. The base point μ is the κ-independent flat centroid, so
+/// normal w.r.t. ambient measure), found by a safeguarded root solve of its
+/// exact analytic score inside the chart-validity bracket. The base point μ is
+/// the κ-independent flat centroid, so
 /// every `V_p` evaluation scores the SAME geometry without re-entangling κ with the
 /// chart scale (the #1104 fix). The exact outer
-/// curvature `V_p''(κ̂)` is taken by a central second difference of the same
-/// criterion and handed to [`profile_ci_walk`](crate::profile_ci_walk)
+/// curvature `V_p''(κ̂)` is evaluated by the same hand-derived criterion jet
+/// and handed to [`profile_ci_walk`](crate::profile_ci_walk)
 /// to size the initial Wald step; the CI itself is the exact χ²₁ profile crossing.
 /// Flatness is the interior-point χ²₁ LR test
 /// [`flatness_lr_test`](crate::flatness_lr_test). κ = 0 is an interior
@@ -1268,20 +1387,40 @@ pub fn fit_response_curvature(
     level: f64,
     tol: f64,
     max_iter: usize,
-) -> Result<ResponseCurvatureFit, String> {
+) -> Result<ResponseCurvatureFit, ResponseGeometryError> {
     if dim == 0 {
-        return Err("constant-curvature response geometry requires dim >= 1".into());
+        return Err(ResponseGeometryError::InvalidInput(
+            "constant-curvature response geometry requires dim >= 1".into(),
+        ));
     }
     let (n_rows, cols) = values.dim();
     if n_rows == 0 || cols != dim {
-        return Err(format!(
+        return Err(ResponseGeometryError::InvalidInput(format!(
             "constant-curvature response geometry: values must be N×{dim} with N >= 1"
-        ));
+        )));
     }
     if !(level > 0.0 && level < 1.0) {
-        return Err("response curvature CI level must lie in (0, 1)".into());
+        return Err(ResponseGeometryError::InvalidInput(
+            "response curvature CI level must lie in (0, 1)".into(),
+        ));
     }
+    if !(tol.is_finite() && tol > 0.0) {
+        return Err(ResponseGeometryError::InvalidInput(
+            "response curvature tolerance must be finite and positive".into(),
+        ));
+    }
+
+    // Establish identifiability at the flat member before constructing bounds;
+    // a zero-dispersion point cloud carries no curvature scale.
+    let flat_jet = response_curvature_criterion_jet(values, dim, 0.0)?;
     let (kappa_min, kappa_max, rho_max) = response_kappa_bounds(values);
+    let span = kappa_max - kappa_min;
+    let nobs = (n_rows * dim) as f64;
+    if !(span.is_finite() && span > 0.0) {
+        return Err(ResponseGeometryError::NumericalGeometry(
+            "response curvature chart bracket is not finite and ordered".into(),
+        ));
+    }
 
     // `V_p` as a closure over the criterion; threaded through both the κ̂ search
     // and the CI walk. Every evaluation uses the same κ-independent flat-centroid
@@ -1290,55 +1429,84 @@ pub fn fit_response_curvature(
         response_curvature_criterion(values, dim, kappa).map(|(v, _)| v)
     };
 
-    // ── κ̂: golden-section minimisation inside the chart bracket. ────────────
-    // The dispersion criterion is smooth and unimodal in practice; golden
-    // section is derivative-free and respects the bracket bounds exactly.
-    const GOLDEN_INV: f64 = 0.618_033_988_749_894_8; // 1/φ
+    // ── κ̂: analytic score root / constrained box-KKT solve. ─────────────
+    // `(span/nobs)·|V'|` is dimensionless, response-scale invariant, and row-
+    // replication invariant. At a bound only the outward score component is a
+    // KKT violation.
+    let normalized_kkt = |kappa: f64, score: f64| {
+        let violation = if kappa == kappa_min {
+            (-score).max(0.0)
+        } else if kappa == kappa_max {
+            score.max(0.0)
+        } else {
+            score.abs()
+        };
+        span * violation / nobs
+    };
+
+    let lower = response_curvature_criterion_jet(values, dim, kappa_min)?;
+    let upper = response_curvature_criterion_jet(values, dim, kappa_max)?;
     let mut a = kappa_min;
     let mut b = kappa_max;
-    let mut c = b - GOLDEN_INV * (b - a);
-    let mut d_pt = a + GOLDEN_INV * (b - a);
-    let mut fc = v_p(c)?;
-    let mut fd = v_p(d_pt)?;
-    let ktol = (tol * (kappa_max - kappa_min)).max(tol).max(1.0e-12);
-    for _ in 0..max_iter {
-        if (b - a).abs() <= ktol {
-            break;
-        }
-        if fc < fd {
-            b = d_pt;
-            d_pt = c;
-            fd = fc;
-            c = b - GOLDEN_INV * (b - a);
-            fc = v_p(c)?;
-        } else {
-            a = c;
-            c = d_pt;
-            fc = fd;
-            d_pt = a + GOLDEN_INV * (b - a);
-            fd = v_p(d_pt)?;
-        }
-    }
-    let kappa_hat = 0.5 * (a + b);
-    let (v_p_hat, base) = response_curvature_criterion(values, dim, kappa_hat)?;
+    let mut iterations = 0_usize;
+    let (jet, railed_at_resolution_limit) = if lower.score >= 0.0 {
+        // V'(κ_min)≥0 is the exact lower-bound minimization KKT condition.
+        (lower, false)
+    } else if upper.score <= 0.0 {
+        // V'(κ_max)≤0 means the criterion is still improving at the
+        // spherical chart-resolution limit.
+        (upper, true)
+    } else {
+        let mut current = flat_jet;
+        while iterations < max_iter {
+            iterations += 1;
+            if normalized_kkt(current.kappa, current.score) <= tol && current.curvature > 0.0 {
+                break;
+            }
+            if current.score < 0.0 {
+                a = current.kappa;
+            } else {
+                b = current.kappa;
+            }
 
-    // ── Honest chart-resolution-rail detection. ─────────────────────────────
-    // The spherical cap κ_max is the curvature at which the cloud's geodesic
-    // spread ρ_max fills `(0.9π)²` of the conjugate shell — i.e. the cloud nearly
-    // fills the sphere S^d(1/√κ_max). When the criterion's optimum sits AT that
-    // cap (the data want κ ≥ κ_max, but the chart cannot resolve a sphere smaller
-    // than the cloud), the search converges onto the upper bracket and κ̂ ≈ κ_max
-    // is NOT a resolved point estimate — it is a lower bound on |κ|. We flag this
-    // so the caller reports "curvature exceeds chart-resolvable range at this
-    // scale" instead of silently quoting κ̂ / ci_hi as if interior. The detection
-    // is scale-free: it triggers when κ̂ lands within the final golden-section
-    // resolution of κ_max (the dimensionless product κ̂·ρ_max² ↗ (0.9π)²), never
-    // by an absolute κ threshold. The hyperbolic side has no conjugate radius, so
-    // only the spherical (upper) cap can rail this way.
-    let span = kappa_max - kappa_min;
-    let rail_margin = (0.02 * span).max(ktol);
-    let railed_at_resolution_limit = kappa_hat >= kappa_max - rail_margin;
+            // Newton's score step supplies local quadratic convergence; the
+            // analytic sign bracket safeguards it globally. An inadmissible
+            // Newton point is replaced by the strictly contracting midpoint.
+            let newton = current.kappa - current.score / current.curvature;
+            let next = if current.curvature > 0.0
+                && newton.is_finite()
+                && newton > a
+                && newton < b
+            {
+                newton
+            } else {
+                0.5 * (a + b)
+            };
+            current = response_curvature_criterion_jet(values, dim, next)?;
+        }
+        let residual = normalized_kkt(current.kappa, current.score);
+        if residual > tol || current.curvature <= 0.0 {
+            return Err(ResponseGeometryError::CurvatureNonConvergence {
+                iterations,
+                max_iter,
+                bracket_lo: a,
+                bracket_hi: b,
+                kappa: current.kappa,
+                criterion: current.value,
+                score: current.score,
+                curvature: current.curvature,
+                kkt_residual: residual,
+                tolerance: tol,
+            });
+        }
+        (current, false)
+    };
+    let kappa_hat = jet.kappa;
+    let v_p_hat = jet.value;
+    let base = jet.base.clone();
 
+    // The upper rail flag comes only from the exact active-bound KKT condition
+    // `V'(κ_max) ≤ 0`; proximity to a bound is not treated as convergence.
     // Dimensionless scale-free invariant κ̂·r²: the geometric content the cloud
     // actually determines (invariant under y ↦ αy). r = ρ_max is the κ=0 doubled-
     // gauge characteristic radius; for a degenerate (point) cloud r = 0 and the
@@ -1346,22 +1514,24 @@ pub fn fit_response_curvature(
     // honest "how curved relative to its spread" number alongside the dimensional κ̂.
     let kappa_r2 = kappa_hat * rho_max * rho_max;
 
-    // Exact outer curvature V_p''(κ̂) by a central second difference, on a step
-    // scaled to the bracket; only used to size the Wald bracket of the CI walk.
-    let h = (1.0e-3 * (kappa_max - kappa_min)).max(1.0e-6);
-    let v_pp = if (kappa_hat - h) > kappa_min && (kappa_hat + h) < kappa_max {
-        let vp = v_p(kappa_hat + h)?;
-        let vm = v_p(kappa_hat - h)?;
-        (vp - 2.0 * v_p_hat + vm) / (h * h)
-    } else {
-        // Near a bound: leave it to the walk's default step.
-        f64::NAN
-    };
-
+    let kappa_tol = tol * span;
+    if !(kappa_tol.is_finite() && kappa_tol > 0.0) {
+        return Err(ResponseGeometryError::InvalidInput(
+            "response curvature tolerance underflows in the chart scale".into(),
+        ));
+    }
     let profile_ci = crate::curvature_estimand::profile_ci_walk(
-        &mut v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, ktol,
-    )?;
-    let flatness = crate::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
+        &mut v_p,
+        kappa_hat,
+        jet.curvature,
+        kappa_min,
+        kappa_max,
+        level,
+        kappa_tol,
+    )
+    .map_err(ResponseGeometryError::NumericalGeometry)?;
+    let flatness = crate::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)
+        .map_err(ResponseGeometryError::NumericalGeometry)?;
 
     // The sign of κ̂ is statistically resolved iff the profile CI excludes 0 — the
     // CI is the honest sign-bearing summary (it reports Flat under-resolution rather

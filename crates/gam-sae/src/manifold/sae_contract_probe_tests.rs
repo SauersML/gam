@@ -253,26 +253,22 @@ pub(crate) fn euclidean_line_decoder_gradient_matches_penalized_objective_fd() {
     }
 }
 
-/// #1154 — the joint amortized-encoder + REML co-training fold (Design A).
+/// #1154 — amortized-encoder fidelity on a known manifold.
 ///
 /// On a synthetic 1D periodic manifold with KNOWN structure (the target is
 /// drawn from a true sine curve on the circle), after the inner `(t, β)`
 /// solve converges to stationarity:
 ///
-/// 1. the co-trained criterion is the exact REML criterion PLUS a
-///    non-negative, correctly-scaled amortized-encoder consistency penalty —
-///    so the fold is sound and the REML λ-coupling is untouched (the inner
-///    solve still produces the stationary point the criterion is read at);
-/// 2. the cheap one-mat-vec amortized encode is FAITHFUL: its reconstruction
+/// 1. the cheap one-mat-vec amortized encode is FAITHFUL: its reconstruction
 ///    matches the exact fitted reconstruction (the encode-by-inner-solve
 ///    truth) within a tight tolerance on the rows the certificate accepts —
 ///    proving the encoder recovers the same structure the exact path does,
 ///    at amortized cost; and
-/// 3. the encoder CERTIFIES coverage of the fitted dictionary (a strictly
-///    positive certified fraction), so the co-training signal rewards a real,
-///    measurable encoder-quality axis rather than a vacuous one.
+/// 2. the encoder CERTIFIES coverage of the fitted dictionary (a strictly
+///    positive certified fraction), so the diagnostic measures a real quality
+///    axis rather than a vacuous one.
 #[test]
-fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
+fn amortized_encoder_is_faithful_on_known_manifold() {
     let n = 24usize;
     let p = 4usize;
     // A true circle coordinate per row, and a smooth periodic decoder, so the
@@ -314,8 +310,8 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
 
-    // Converge the inner (t, β) solve to stationarity — the REML criterion
-    // and the co-training fold are both read at the converged dictionary.
+    // Converge the inner (t, β) solve to stationarity before reading the
+    // encoder-consistency diagnostic.
     // Full Newton steps (learning_rate = 1.0): the heavily-damped 0.1 step
     // cannot drive this well-conditioned planted-circle fit to the strict KKT
     // tolerance within the refine budget (it stalls at ‖g‖≈6e-3), so the
@@ -326,32 +322,9 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
     term.run_joint_fit_arrow_schur(target.view(), &mut rho_fit, None, 12, 1.0, 1.0e-4, 1.0e-4)
         .expect("inner solve converges on the known periodic manifold");
 
-    // (1) Fold soundness: the co-trained criterion = REML + scaled, finite,
-    // non-negative consistency penalty.
-    let (reml, _loss) = term
-        .reml_criterion_with_refine_policy(
-            target.view(),
-            &rho_fit,
-            None,
-            25,
-            1.0,
-            1.0e-4,
-            1.0e-4,
-            true,
-        )
-        .expect("REML criterion evaluates");
-    let (cotrained, _loss2, consistency) = term
-        .reml_criterion_cotrained(target.view(), &rho_fit, None, 64, 1.0, 1.0e-4, 1.0e-4)
-        .expect("co-trained criterion evaluates");
-    assert!(
-        cotrained.is_finite() && reml.is_finite(),
-        "both criteria must be finite: cotrained={cotrained}, reml={reml}"
-    );
-    assert!(
-        cotrained >= reml - 1.0e-9,
-        "co-trained criterion must add a NON-NEGATIVE consistency penalty: \
-         cotrained={cotrained} < reml={reml}"
-    );
+    let consistency = term
+        .amortized_encoder_consistency(target.view(), &rho_fit)
+        .expect("encoder consistency evaluates at the fitted dictionary");
     assert!(
         consistency.recon_consistency >= 0.0 && consistency.recon_consistency.is_finite(),
         "recon consistency must be a finite non-negative gap, got {}",
@@ -363,7 +336,7 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
         consistency.unconverged_fraction
     );
 
-    // (3) The joint encoder must converge on real rows of the fitted dictionary.
+    // The joint encoder must converge on real rows of the fitted dictionary.
     assert!(
         consistency.unconverged_fraction < 1.0,
         "the joint encoder must converge on at least some rows of a \
@@ -371,7 +344,7 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
         consistency.unconverged_fraction
     );
 
-    // (2) Faithfulness: on the rows the certificate accepts, the cheap
+    // Faithfulness: on the rows the certificate accepts, the cheap
     // one-mat-vec amortized encode recovers the SAME latent coordinate the
     // EXACT encode-by-inner-solve (the certified cold chart-center Newton
     // probe) produces. This is the encoder-fidelity question Design A makes —
@@ -974,33 +947,22 @@ fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
     );
 }
 
-/// #1206 — the gradient lane's `(cost, gradient)` pair must be SELF-CONSISTENT
-/// for the outer BFGS Armijo line search. The amortized-encoder consistency
-/// fold `c(ρ)` (#1154) has no analytic gradient (under Design A the exact
-/// outer derivative is the REML λ-gradient `∇f` only), so it MUST NOT enter
-/// the cost the gradient lane (`eval` / `OuterEvalOrder::ValueAndGradient`)
-/// returns alongside `∇f` — otherwise BFGS minimizes `f+c` while believing the
-/// gradient is `∇(f+c)`, which is the objective↔gradient desync bug class
-/// (#931). The fold is a DERIVATIVE-FREE ranking regularizer carried ONLY by
-/// the value-probe lane (`eval_cost`), whose cost is never paired with a
-/// gradient.
-///
-/// This test pins the corrected split:
-/// - the value-probe lane carries a strictly positive fold over bare REML
-///   (the encoder has some inconsistency on this fixture), and
-/// - the gradient lane's cost EQUALS bare REML (it does NOT carry the fold),
-///   so it sits a full fold below the value lane and its (cost, ∇f) pair is
-///   self-consistent.
+/// #1206 — ranking and gradient lanes must optimize one coherent criterion.
+/// The amortized-encoder consistency diagnostic `c(ρ)` has no analytic
+/// derivative, so it cannot rank `f+c` while BFGS descends `f`: the selected fit
+/// would not be stationary for its selection criterion. Both lanes therefore
+/// report their matched pure-REML value (plus the shared discrete collapse
+/// wall), while encoder consistency remains a read-only diagnostic.
 #[test]
-fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
+fn ranking_and_gradient_lanes_match_bare_reml() {
     let mut objective = warmstart_test_objective_with_evaluator();
     let rho_flat = objective.current_rho.to_flat();
 
-    // Value-probe lane: the cheap derivative-free comparand the cascade uses
-    // for seed validation / cross-seed ranking. Carries the consistency fold.
+    // Value-probe lane: the comparand the cascade uses for seed validation and
+    // cross-seed ranking.
     let value_lane = objective
         .eval_cost(&rho_flat)
-        .expect("value-probe lane evaluates the co-trained cost");
+        .expect("value-probe lane evaluates pure REML");
 
     // Gradient lane: the cost an ACCEPTED iterate reports, paired with the
     // analytic ∇f the BFGS Armijo test consumes. A fresh objective so the two
@@ -1019,20 +981,19 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
     // The amortized warm-start fires on this fixture (the basin-warmup fix lets the
     // Kantorovich gate certify unit-amplitude rows), so it shifts the inner-coord
     // seed of the value/gradient lanes. To keep the lane-vs-bare comparisons an
-    // ISOLATION of the consistency fold (not warm-start drift), each bare reference
+    // isolation of objective plumbing (not warm-start drift), each bare reference
     // below is warm-started identically — the SAME `warm_start_latents_from_amortized_encoder`
     // call the objective's `eval`/`eval_cost` apply — so the only remaining
-    // difference between a lane and its matched bare is the fold itself.
+    // difference between a lane and its matched bare is the objective plumbing.
 
     // Bare REML for the VALUE lane, computed on the SAME probe refine policy
     // (`refine_progress_extension = false`) the value lane uses, plus the
-    // collapse barrier it also keeps — so the only difference from the value
-    // lane is the consistency fold.
+    // collapse barrier it also keeps.
     let bare_value = {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
         let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
-        // Warm-start identically to the value lane so the fold is isolated.
+        // Warm-start identically to the value lane.
         probe
             .term
             .warm_start_latents_from_amortized_encoder(target.view(), &rho_state)
@@ -1054,12 +1015,12 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
             .add_fit_data_collapse_penalty(reml, &rho_state)
             .expect("collapse penalty evaluates")
     };
-    let value_fold = value_lane - bare_value;
+    let value_vs_bare = (value_lane - bare_value).abs();
     assert!(
-        value_fold > 1.0e-12,
-        "the value-probe lane carries the co-training fold (positive penalty \
-         over bare REML): value_lane={value_lane}, bare={bare_value}, \
-         fold={value_fold}"
+        value_vs_bare < 1.0e-9,
+        "the ranking lane must report bare REML so selection and descent share \
+         one criterion: value_lane={value_lane}, bare={bare_value}, \
+         diff={value_vs_bare}"
     );
 
     // Bare REML for the GRADIENT lane, computed on the SAME full-refine path
@@ -1073,7 +1034,7 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
         let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
-        // Warm-start identically to the gradient lane so the fold is isolated.
+        // Warm-start identically to the gradient lane.
         probe
             .term
             .warm_start_latents_from_amortized_encoder(target.view(), &rho_state)

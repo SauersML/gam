@@ -2228,6 +2228,7 @@ fn ibp_prior_penalty(
     rho: &SaeManifoldRho,
     base_alpha: f64,
     temperature: f64,
+    row_weights: Option<&[f64]>,
 ) -> (IBPAssignmentPenalty, Array1<f64>) {
     let learnable = assignment.effective_alpha_is_learnable();
     let alpha_eff = if learnable {
@@ -2235,8 +2236,15 @@ fn ibp_prior_penalty(
     } else {
         assignment.resolved_ibp_alpha(rho).unwrap_or(base_alpha)
     };
+    // #991 design-honesty weights: the IBP prior is not row-separable (the
+    // plug-in π̂ couples rows through the column active mass), so the weights are
+    // installed ON the penalty — its value/grad/hessian/hvp/ρ- and third
+    // channels all fold them identically (weighted mass `M_k = Σ w_i z_ik` and
+    // carrier `u = w·J`), keeping every channel the exact derivative of one
+    // weighted energy. `None` ⇒ bit-for-bit the historical unweighted path.
     let mut penalty =
-        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable);
+        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable)
+            .with_row_weights(row_weights);
     // #Bug4: ungated atoms have a pinned unit gate and a held-constant logit — they
     // are inert columns excluded from the sparsity energy and all its derivatives.
     if assignment.has_ungated() {
@@ -2297,7 +2305,8 @@ pub(crate) fn assignment_prior_value_weighted(
         AssignmentMode::IBPMap {
             temperature, alpha, ..
         } => {
-            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let (penalty, rho_view) =
+                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::ThresholdGate {
@@ -2366,7 +2375,8 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         } => {
             // #Bug6: `ibp_prior_penalty` picks the effective-α learnability (an
             // override forces the fixed-α value branch) and the #Bug4 ungated mask.
-            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let (penalty, rho_view) =
+                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             if penalty.learnable_alpha {
                 penalty.grad_rho(target.view(), rho_view.view())[0]
             } else {
@@ -2451,7 +2461,8 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
         AssignmentMode::IBPMap {
             temperature, alpha, ..
         } => {
-            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let (penalty, rho_view) =
+                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let mut d = if penalty.learnable_alpha {
                 penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view())
             } else {
@@ -2522,7 +2533,8 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
         AssignmentMode::IBPMap {
             temperature, alpha, ..
         } if assignment.effective_alpha_is_learnable() => {
-            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let (penalty, rho_view) =
+                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let mut d = penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view());
             // #Bug4: inert columns carry no mixed derivative.
             mask_fixed_logit_entries(assignment, &mut d);
@@ -2592,7 +2604,8 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
             // matching the forward gate — and installs the #Bug4 ungated mask. The
             // per-atom fixed-logit columns are additionally zeroed post-hoc below,
             // so the array (grad/hessian) methods need no internal column mask.
-            let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+            let (penalty, rho_view) =
+                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
@@ -2667,6 +2680,19 @@ pub(crate) fn ibp_assignment_third_channels(
     rho: &SaeManifoldRho,
     majorize: bool,
 ) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
+    ibp_assignment_third_channels_weighted(assignment, rho, majorize, None)
+}
+
+/// As [`ibp_assignment_third_channels`], with the #991 design-honesty per-row
+/// weights the assembled `htt` carried (the channels must differentiate the
+/// SAME weighted operator; `z_jac` then carries the weighted carrier `u = w·J`
+/// and `logit_curvature` its slot derivative `w·c`).
+pub(crate) fn ibp_assignment_third_channels_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    majorize: bool,
+    row_weights: Option<&[f64]>,
+) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
     let AssignmentMode::IBPMap {
         temperature, alpha, ..
     } = assignment.mode
@@ -2681,7 +2707,7 @@ pub(crate) fn ibp_assignment_third_channels(
     // `assignment_prior_grad_hdiag` uses, so an α override differentiates the same
     // fixed-α operator. Fixed-logit columns are zeroed post-hoc below (the channel
     // arrays are not internally column-masked).
-    let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature);
+    let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
     let mut channels =
         penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit

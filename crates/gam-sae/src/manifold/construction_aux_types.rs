@@ -11,38 +11,22 @@ use super::*;
 
 /// Typed error from the SAE outer-gradient analytic assembly path (#1436).
 ///
-/// The `eval()` analytic fallback (#1273/#1440: the plain undeflated analytic
-/// outer gradient, NOT a finite difference) must fire ONLY for the genuine
-/// conditioning/identifiability failure modes it was designed for — a
-/// near-singular-but-valid joint Hessian or a gauge-degenerate direction.
-/// Shape/indexing bugs, non-finite intermediates, and violated internal
-/// invariants are [`OuterGradientError::InternalInvariant`] and MUST propagate
-/// as hard errors so regressions surface instead of being silently masked by a
-/// degraded descent direction.
+/// Every variant propagates when the rank-revealing projected solve cannot
+/// produce a reliable implicit derivative. The taxonomy distinguishes genuine
+/// conditioning/non-identifiability from assembly invariant defects without
+/// authorizing a degraded fallback direction.
 #[derive(Clone, Debug)]
 pub(crate) enum OuterGradientError {
-    /// Expected: near-singular or ill-conditioned joint Hessian at a feasible ρ
-    /// (the genuine #1273 flat-valley case). Eligible for the FD fallback.
+    /// Near-singular or ill-conditioned joint Hessian at a feasible ρ.
     IllConditioned { reason: String },
-    /// Expected: a non-identifiable / gauge-degenerate direction at this ρ.
-    /// Eligible for the FD fallback.
+    /// A non-identifiable / gauge-degenerate direction at this ρ.
     NonIdentifiable { reason: String },
     /// Unexpected: shape/dimension mismatch, non-finite intermediate, or a
-    /// violated internal invariant. MUST propagate — never fall back to FD.
+    /// violated internal invariant.
     InternalInvariant { reason: String },
 }
 
 impl OuterGradientError {
-    /// Whether this error class is recoverable by the #1273/#1440 analytic
-    /// plain-solver fallback (i.e. it represents a legitimate
-    /// conditioning/identifiability failure, not a programming/invariant defect).
-    pub(crate) fn is_conditioning_recoverable(&self) -> bool {
-        matches!(
-            self,
-            Self::IllConditioned { .. } | Self::NonIdentifiable { .. }
-        )
-    }
-
     /// Construct an [`OuterGradientError::InternalInvariant`] from any error
     /// displayable — the default classification for unexpected assembly failures
     /// (shape mismatches, non-finite intermediates, violated invariants).
@@ -59,7 +43,7 @@ impl OuterGradientError {
     /// A genuine rank-deficiency / near-singularity failure (a back-solve or
     /// Cholesky/Woodbury factor that tripped on a finite, correctly-shaped input)
     /// is a legitimate #1273 conditioning failure and keeps `conditioning_err`
-    /// (`IllConditioned`), so it stays recoverable by the analytic fallback. A
+    /// (`IllConditioned`). A
     /// shape/dimension mismatch or a non-finite intermediate is an
     /// internal-invariant defect and MUST propagate ([`Self::internal`]) instead
     /// of being masked as a plausible-but-wrong descent direction — exactly the
@@ -69,7 +53,8 @@ impl OuterGradientError {
     /// distinction is drawn from the stable markers those helpers emit for their
     /// shape/non-finite guards (`vector shapes`, `gauge length`, `must be finite`,
     /// `non-finite`). Everything else — including the `cholesky`/back-solve
-    /// near-singular failures — is treated as a genuine conditioning trip.
+    /// near-singular failures — is treated as a genuine conditioning trip. Both
+    /// typed classes propagate if the projected solve cannot complete.
     pub(crate) fn classify_arrow_solver_error(message: &str, conditioning_err: Self) -> Self {
         let lower = message.to_ascii_lowercase();
         let is_internal = lower.contains("vector shapes")
@@ -86,28 +71,6 @@ impl OuterGradientError {
         } else {
             conditioning_err
         }
-    }
-
-    /// The exact gate the gradient lane (`SaeManifoldOuterObjective::eval`) uses
-    /// to decide whether to descend with the #1273/#1440 analytic plain-solver
-    /// fallback instead of propagating the error as a hard failure.
-    ///
-    /// The fallback is admissible ONLY when BOTH hold:
-    /// * the REML cost at this rho is finite (a genuinely feasible point -- the
-    ///   plain analytic solver supplies a descent direction for a value the
-    ///   analytic path already produced), and
-    /// * the error is a legitimate conditioning/identifiability failure
-    ///   ([`Self::is_conditioning_recoverable`]) -- the genuine #1273 flat-valley
-    ///   case.
-    ///
-    /// A non-finite cost or an [`OuterGradientError::InternalInvariant`] must
-    /// propagate: masking a shape/indexing bug, a non-finite intermediate, or a
-    /// violated invariant behind a plausible-but-wrong step is exactly the
-    /// regression #1436 closes. Centralising the decision here (rather than
-    /// inlining the boolean at the call site) makes the `cost x error-class`
-    /// contract a single, directly unit-testable predicate.
-    pub(crate) fn admits_plain_solver_fallback(&self, cost: f64) -> bool {
-        cost.is_finite() && self.is_conditioning_recoverable()
     }
 }
 

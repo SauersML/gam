@@ -75,20 +75,4 @@ pub use run::OuterProblem;
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
 pub use run::OuterResult;
 pub(crate) use run_plan::*;
-
-/// #2055 / #979 reconciliation shim. Commit `bdc0bc0dc` (#2055) removed all
-/// wall-clock time budgets/deadlines from the solver (non-deterministic;
-/// violates SPEC). A later concurrent #979 commit (`1b1ce27c7`) re-introduced a
-/// call to this predicate in `run_plan::run_outer_with_plan` to cap the seed
-/// cascade, but the removed infrastructure left the symbol undefined and broke
-/// the workspace build. With no deadline mechanism present the predicate is
-/// permanently `false` — no wall-clock deadline can be exceeded — so #979's
-/// seed-cascade guard compiles and stays inert, consistent with the #2055
-/// no-wall-clock-deadline rule. If #979's intent (bounding the seed cascade)
-/// still matters it must be re-expressed as a DETERMINISTIC iteration-count
-/// budget, not a wall clock.
-#[inline]
-pub(crate) fn outer_wall_clock_deadline_exceeded() -> bool {
-    false
-}
 pub(crate) use seed_screening::*;

@@ -331,83 +331,7 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    #[inline]
-    pub(crate) fn large_n_efs_single_loop_lane(&self) -> bool {
-        (self.x.nrows() as f64) * (self.x.ncols() as f64) > LARGE_N_EFS_THRESHOLD
-    }
-
-    #[inline]
-    pub(crate) fn efs_single_loop_cap_active(&self) -> bool {
-        decode_efs_single_loop_cap(self.outer_inner_cap.load(Ordering::Relaxed)).is_some()
-    }
-
-    pub(crate) fn record_efs_single_loop_bias(
-        &self,
-        rho: &Array1<f64>,
-        diagnostics: super::reml_outer_engine::EfsSingleLoopDiagnostics,
-    ) -> Result<(), EstimationError> {
-        if !self.efs_single_loop_cap_active() {
-            return Ok(());
-        }
-
-        let owner = self as *const _ as usize;
-        let mut state = EFS_SINGLE_LOOP_BIAS_GUARD.lock().unwrap();
-        if state.owner != owner {
-            state.owner = owner;
-            state.consecutive = 0;
-        }
-
-        if diagnostics.bias_proxy >= EFS_SINGLE_LOOP_BIAS_THRESHOLD {
-            state.consecutive = state.consecutive.saturating_add(1);
-        } else {
-            state.consecutive = 0;
-        }
-
-        log::info!(
-            "[EFS-single-loop] bias_proxy={:.3e} gradient_residual={:.3e} inner_residual={:.3e} \
-             |g|={:.3e} |step|inf={:.3e} consecutive={}/{} rho[..4]=[{}]",
-            diagnostics.bias_proxy,
-            diagnostics.gradient_residual,
-            diagnostics.inner_residual,
-            diagnostics.gradient_norm,
-            diagnostics.step_inf_norm,
-            state.consecutive,
-            EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT,
-            rho.iter()
-                .take(4)
-                .map(|v| format!("{v:.3}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-
-        if state.consecutive >= EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT {
-            state.consecutive = 0;
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "{} EFS single-loop bias guard fired: bias_proxy={:.3e} \
-                 threshold={:.3e} consecutive_limit={} rho_dim={}",
-                crate::rho_optimizer::EFS_FIRST_ORDER_FALLBACK_MARKER,
-                diagnostics.bias_proxy,
-                EFS_SINGLE_LOOP_BIAS_THRESHOLD,
-                EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT,
-                rho.len(),
-            )));
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        if self.large_n_efs_single_loop_lane() {
-            log::info!(
-                "[EFS-single-loop] large-n lane engaged: n={} p={} n*p={:.3e} threshold={:.3e}; \
-                 declining analytic outer Hessian so the EFS fixed-point route runs first",
-                self.x.nrows(),
-                self.x.ncols(),
-                (self.x.nrows() as f64) * (self.x.ncols() as f64),
-                LARGE_N_EFS_THRESHOLD,
-            );
-            return false;
-        }
         // The Tierney-Kadane fallback gate is no longer needed: the analytic
         // TK value, first ρ-derivative, AND second ρ-derivative paths are
         // implemented in `tierney_kadane_terms`, which now populates the
@@ -2124,9 +2048,8 @@ impl<'a> RemlState<'a> {
         // both `bundle.firth_dense_operator` and `bundle.firth_dense_operator_original`
         // are `None`. The TK refinement is a higher-order correction on top of the
         // Firth/Jeffreys-augmented Laplace expansion; without the operator it has
-        // nothing to refine. Mirror the gate here so large-model fits silently drop
-        // the refinement rather than erroring out — matching the established skip
-        // pattern for non-canonical-logit links above.
+        // nothing to refine. Mirror the gate here so large-model fits omit a
+        // correction whose underlying Jeffreys operator was not assembled.
         //
         // The Firth gate is strictly tighter than the TK dense-work caps used by
         // the non-Gaussianity audit (`TK_MAX_*`): `firth_problem_scale_allows`
@@ -3402,11 +3325,13 @@ impl<'a> RemlState<'a> {
         // taken from the dedicated 5-jet (no variance-jet machinery).
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
-        let canonical_logit = {
-            let spec = reml_spec(&pirls_result.likelihood);
-            matches!(spec.response, ResponseFamily::Binomial)
-                && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
-        } && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = matches!(
+            reml_spec(&pirls_result.likelihood).response,
+            ResponseFamily::Binomial
+        ) && matches!(
+            &inverse_link,
+            InverseLink::Standard(StandardLink::Logit)
+        );
 
         if canonical_logit {
             // Canonical Logit fast path: per-row 5-jet evaluation, no
@@ -3514,11 +3439,13 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let canonical_logit = {
-            let spec = reml_spec(&pirls_result.likelihood);
-            matches!(spec.response, ResponseFamily::Binomial)
-                && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
-        } && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = matches!(
+            reml_spec(&pirls_result.likelihood).response,
+            ResponseFamily::Binomial
+        ) && matches!(
+            self.runtime_inverse_link(),
+            InverseLink::Standard(StandardLink::Logit)
+        );
         if !canonical_logit {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only"
@@ -6642,8 +6569,8 @@ impl<'a> RemlState<'a> {
         // value (~3); trial seeds are NOT expected to certify a stationary
         // mode under that cap. Partial fits whose objective (deviance +
         // penalty), β, Hessian proxy, and residual are all finite are
-        // surfaced as `Ok` so the caller can rank them by an approximate
-        // cost (`screening_residual_penalty`); KKT enforcement, the
+        // surfaced as `Ok` so the caller can rank them through the dedicated
+        // value-only `compute_screening_proxy`; KKT enforcement, the
         // pirls_cache LRU write, and the warm-start update are all
         // suppressed to keep screening-mode results out of cross-call
         // state. The single atomic load below feeds both the bool and the
@@ -6687,10 +6614,7 @@ impl<'a> RemlState<'a> {
         // a budget. Driven by the outer optimizer to coarsen early-iter
         // inner solves when ρ is far from converged. Both caps are honored
         // jointly via `min` when both are nonzero.
-        let raw_outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
-        let efs_single_loop_cap = decode_efs_single_loop_cap(raw_outer_cap);
-        let in_efs_single_loop = efs_single_loop_cap.is_some();
-        let outer_cap = efs_single_loop_cap.unwrap_or(raw_outer_cap);
+        let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs.
@@ -7082,7 +7006,7 @@ impl<'a> RemlState<'a> {
         // partial mode. Skip the certificate so the seed can still be ranked
         // by an approximate cost; the actual fit (full inner budget) will
         // certify KKT later.
-        if !in_screening && !in_efs_single_loop {
+        if !in_screening {
             self.enforce_constraint_kkt(pirls_result.as_ref())?;
         }
 
@@ -7207,42 +7131,6 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
-                // DESIGN INTENT: EFS single-loop intentionally accepts partial PIRLS
-                // (capped to EFS_SINGLE_LOOP_PIRLS_SWEEPS) and exposes the resulting
-                // (uncertified) gradient to the EFS update. This deviates from the
-                // WS3b hard rule that uncertified inner states must NOT produce
-                // derivative-bearing samples; the deviation is mitigated by the
-                // bias_proxy guard (max(gradient_residual, inner_residual) > 0.10
-                // for K=3 consecutive iters triggers fallback to the standard
-                // two-loop driver). This is the bam (Wood 2015) tradeoff: tolerate
-                // uncertified inner accuracy at large-scale n to amortize per-outer-iter
-                // cost, then bail to the certified path if the EFS surrogate drifts.
-                if in_efs_single_loop
-                    && pirls_result.deviance.is_finite()
-                    && pirls_result.stable_penalty_term.is_finite()
-                    && pirls_result.gradient_natural_scale.is_finite()
-                    && pirls_result.lastgradient_norm.is_finite()
-                    && pirls_result
-                        .beta_transformed
-                        .0
-                        .iter()
-                        .all(|v| v.is_finite())
-                {
-                    log::info!(
-                        "[EFS-single-loop] accepted partial PIRLS sweep: {kind} \
-                         (cap={} |g_beta|={:.3e} r_g={:.3e} iter={})",
-                        efs_single_loop_cap.unwrap_or(outer_cap),
-                        pirls_result.lastgradient_norm,
-                        pirls_result.relative_gradient_norm(),
-                        pirls_result.iteration,
-                    );
-                    self.updatewarm_start_from(pirls_result.as_ref());
-                    self.record_warm_start_rho(rho);
-                    self.last_inner_iters
-                        .store(pirls_result.iteration, Ordering::Relaxed);
-                    self.last_inner_converged.store(false, Ordering::Relaxed);
-                    return Ok(pirls_result);
-                }
                 // Seed screening's purpose is to rank candidate seeds by an
                 // approximate cost. Requiring full KKT-style convergence under
                 // a 3-iteration cap would discard all informative seeds, so

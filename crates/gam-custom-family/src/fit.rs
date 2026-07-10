@@ -116,7 +116,6 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     /// joint-penalized family (the multinomial centered metric) can recover its
     /// converged smoothing. `None` for every per-block-only family.
     pub(crate) joint_log_lambdas: Option<Array1<f64>>,
-    pub(crate) context: &'static str,
 }
 
 pub(crate) fn assemble_custom_family_fit_result(
@@ -135,7 +134,6 @@ pub(crate) fn assemble_custom_family_fit_result(
         criterion_certificate,
         outer_converged,
         joint_log_lambdas,
-        context,
     } = assembly;
     let lambdas = rho_physical.mapv(f64::exp);
     let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
@@ -175,7 +173,6 @@ pub(crate) fn assemble_custom_family_fit_result(
         },
         result_specs,
     )
-    .map_err(|reason| CustomFamilyError::Optimization { context, reason })
 }
 
 /// Install the channel-aware `AdditiveBlockJacobian` callbacks declared by a
@@ -907,7 +904,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 criterion_certificate: None,
                 outer_converged: true,
                 joint_log_lambdas: None,
-                context: "fit_custom_family no-smoothing result assembly",
             },
         );
     }
@@ -1690,7 +1686,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             criterion_certificate: outer_certificate,
             outer_converged: true,
             joint_log_lambdas,
-            context: "fit_custom_family result assembly",
         },
     )
 }
@@ -1776,7 +1771,6 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
             criterion_certificate: None,
             outer_converged: true,
             joint_log_lambdas: None,
-            context: "fit_custom_family_fixed_log_lambdas result assembly",
         },
     )
 }

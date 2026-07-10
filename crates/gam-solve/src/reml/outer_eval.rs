@@ -46,7 +46,7 @@ pub(crate) use gam_problem::laplace_sampler_contract::BlockExcessTarget;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::collections::{HashMap, VecDeque};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-pub(crate) use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+pub(crate) use std::sync::{Arc, Mutex, OnceLock};
 
 #[path = "gradient_hessian.rs"]
 mod gradient_hessian;

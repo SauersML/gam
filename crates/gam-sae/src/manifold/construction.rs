@@ -6374,10 +6374,10 @@ impl SaeManifoldTerm {
         // decoder-null directions and deflate it. When NO such deflatable
         // direction can be recovered, the flat subspace is genuinely
         // non-identifiable -- a degenerate direction OUTSIDE the gauge orbit -- a
-        // diagnosis distinct from the raw pivot-ratio conditioning trip. Both
-        // classes are #1273 FD-eligible, but surfacing the gauge-degenerate case
-        // as its own [`OuterGradientError::NonIdentifiable`] keeps the diagnostic
-        // distinction the FD-eligibility contract is built around.
+        // diagnosis distinct from the raw pivot-ratio conditioning trip.
+        // Surfacing the gauge-degenerate case as its own
+        // [`OuterGradientError::NonIdentifiable`] preserves that typed evidence
+        // when the derivative is refused.
         let non_identifiable_err = OuterGradientError::NonIdentifiable {
             reason: format!(
                 "near-singular joint Hessian with no deflatable gauge/decoder-null \
@@ -6478,8 +6478,8 @@ impl SaeManifoldTerm {
                 Ok(value) => value,
                 // #1451: a shape/dimension mismatch or non-finite intermediate
                 // from the Hessian apply is an internal-invariant defect and MUST
-                // propagate; only a genuine numeric failure on a finite,
-                // correctly-shaped input keeps the FD-eligible conditioning class.
+                // propagate; a genuine numeric failure on a finite,
+                // correctly-shaped input keeps the typed conditioning class.
                 Err(err) => {
                     return Err(OuterGradientError::classify_arrow_solver_error(
                         &err,
@@ -6502,9 +6502,9 @@ impl SaeManifoldTerm {
         // #1451: a non-finite entry in the projected gauge Hessian is an
         // internal-invariant defect (a NaN/Inf intermediate leaked into the
         // span), not a conditioning failure — it MUST propagate rather than be
-        // masked behind an FD descent. Guard finiteness BEFORE the eigh so only a
+        // masked behind a degraded descent. Guard finiteness BEFORE the eigh so a
         // genuine decomposition failure on a finite, correctly-shaped matrix keeps
-        // the FD-eligible conditioning class.
+        // the typed conditioning class.
         if !h_span.iter().all(|v| v.is_finite()) {
             return Err(OuterGradientError::internal(format!(
                 "outer_gradient_arrow_solver: non-finite entry in projected gauge \
@@ -6539,49 +6539,11 @@ impl SaeManifoldTerm {
             orthonormal.push(direction);
         }
         if orthonormal.is_empty() {
-            // #1273/#1440: the conditioning gate has ALREADY certified a
-            // near-singular joint Hessian (`conditioning_err`), so a genuine flat
-            // direction exists inside the assembled gauge/decoder-null span even
-            // when no projected-Hessian eigenvector cleared the strict or the
-            // `fallback_gauge_floor` Rayleigh band. Rather than declining
-            // (which historically routed the outer step to a finite-difference
-            // descent direction — the FD instrument #1440 removes), deflate the
-            // SMALLEST-Rayleigh eigenvector of the projected gauge Hessian
-            // UNCONDITIONALLY. That eigenvector is the least-curvature member of
-            // the validated gauge span (a Faddeev-Popov gauge candidate), so the
-            // Tikhonov stiffness `max_pivot` in `from_orthonormal_gauges` bounds
-            // its contribution at the Hessian scale and the components orthogonal
-            // to it are byte-for-byte the plain analytic inverse solve. This keeps
-            // the descent direction fully ANALYTIC (a projected/damped gradient),
-            // never a differenced value path.
-            let mut best_idx = None;
-            let mut best_rayleigh = f64::INFINITY;
-            for eig_idx in 0..evals.len() {
-                let rayleigh = evals[eig_idx];
-                if rayleigh.is_finite() && rayleigh < best_rayleigh {
-                    best_idx = Some(eig_idx);
-                    best_rayleigh = rayleigh;
-                }
-            }
-            if let Some(eig_idx) = best_idx {
-                let mut direction = Array1::<f64>::zeros(full_len);
-                for basis_idx in 0..span_rank {
-                    let coeff = evecs[[basis_idx, eig_idx]];
-                    for row in 0..full_len {
-                        direction[row] += coeff * gauge_span[basis_idx][row];
-                    }
-                }
-                let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
-                if norm_sq.is_finite() && norm_sq > 1.0e-24 {
-                    let inv_norm = norm_sq.sqrt().recip();
-                    for value in direction.iter_mut() {
-                        *value *= inv_norm;
-                    }
-                    orthonormal.push(direction);
-                }
-            }
-        }
-        if orthonormal.is_empty() {
+            // The joint factor is ill-conditioned, but no direction in the
+            // analytically known gauge/decoder-null span is actually flat at the
+            // rank-revealing Rayleigh threshold. The unreliable direction lies
+            // outside the quotient we can justify, so refuse the derivative
+            // instead of projecting an arbitrary least-curvature candidate.
             return Err(non_identifiable_err);
         }
 
@@ -6591,8 +6553,8 @@ impl SaeManifoldTerm {
         // bounded at the Hessian scale `max_pivot`.
         // #1451: a shape/length mismatch or non-finite stiffness/intermediate in
         // the deflated-solver assembly is an internal-invariant defect and MUST
-        // propagate; only a genuine near-singular gauge Woodbury/back-solve keeps
-        // the FD-eligible conditioning class.
+        // propagate; a genuine near-singular gauge Woodbury/back-solve keeps the
+        // typed conditioning class.
         DeflatedArrowSolver::from_orthonormal_gauges(cache, orthonormal, max_pivot)
             .map_err(|err| OuterGradientError::classify_arrow_solver_error(&err, conditioning_err))
     }
@@ -6978,7 +6940,14 @@ impl SaeManifoldTerm {
             // correction. The IBP cross-row term additionally needs
             // `log det(I_R + D Uᵀ H₀'⁻¹ U)`, which has no matrix-free route yet, so
             // it keeps refusing (loudly, pointing at the dense resident path).
-            if ibp_assignment_third_channels(&self.assignment, rho, false)?.is_some() {
+            if ibp_assignment_third_channels_weighted(
+                &self.assignment,
+                rho,
+                false,
+                self.row_loss_weights.as_deref(),
+            )?
+            .is_some()
+            {
                 return Err(format!(
                     "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur \
                      {} bytes exceeds budget {} bytes and the exact cross-row IBP Woodbury evidence \
@@ -7522,7 +7491,12 @@ impl SaeManifoldTerm {
         // identically 0 (the deflated block IS the full block).
         // RAW channels: the `w·s·c` diagonal split needs the un-clamped `w·s'`, so
         // build raw and apply the gam#2144 majorization here.
-        let mut cross_channels = ibp_assignment_third_channels(&self.assignment, rho, false)?;
+        let mut cross_channels = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            false,
+            self.row_loss_weights.as_deref(),
+        )?;
         let learnable_alpha = matches!(
             self.assignment.mode,
             AssignmentMode::IBPMap {
@@ -8874,7 +8848,12 @@ impl SaeManifoldTerm {
         // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike) and is
         // independent of the PSD majorization.
         let whiten_row_jets = self.whiten_logdet_row_jets();
-        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, true)?;
+        let ibp_channels = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            true,
+            self.row_loss_weights.as_deref(),
+        )?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
         // `block.htt` has off-diagonal logit terms whose θ-derivative the adjoint
@@ -9471,7 +9450,12 @@ impl SaeManifoldTerm {
         // channel matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
         // reduced-Schur/bundle design step). The from-probes lane therefore owns the
         // softmax / euclidean / non-cross-row regimes where base = full inverse.
-        let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho, true)?;
+        let ibp_channels = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            true,
+            self.row_loss_weights.as_deref(),
+        )?;
         if ibp_channels.is_some() || cache.cross_row_woodbury.is_some() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache carries an IBP cross-row Woodbury \

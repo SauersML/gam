@@ -651,7 +651,10 @@ impl FittedTransport {
     /// Point-evaluation influence by original observation row. The returned
     /// matrix has shape `(t.len(), n_obs)` and retains cross-map row identity.
     fn eval_score_influence(&self, t: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        Ok(self.basis.value_rows(t)?.dot(&self.coefficient_score_influence))
+        Ok(self
+            .basis
+            .value_rows(t)?
+            .dot(&self.coefficient_score_influence))
     }
 
     /// Pre-wrap map value `slope·t + offset + g(t)` at a single point — the
@@ -957,7 +960,10 @@ impl LayerTransportReport {
     pub fn with_composition(mut self, composition: &CompositionDefectReport) -> Self {
         self.composition_defect = Some(composition.rms_defect);
         self.composition_max_studentized = Some(composition.max_studentized_defect);
-        self.composition_p_value = composition.p_value.is_finite().then_some(composition.p_value);
+        self.composition_p_value = composition
+            .p_value
+            .is_finite()
+            .then_some(composition.p_value);
         self.composition_gauge_reflected = Some(composition.gauge_reflected);
         self
     }
@@ -1567,6 +1573,55 @@ mod invert_tests {
         ChartTopology::Interval { lo, hi }
     }
 
+    /// The transport wrapper must reuse Gaussian REML's profiled scale and its
+    /// exact spectral inverse. In particular, covariance cannot come from the
+    /// removed eigenvalue floor/micro-ridge solve or from `RSS / (n - edf)`.
+    #[test]
+    fn penalized_1d_covariance_and_scale_match_reml_system() {
+        let n = 32;
+        let design = Array2::from_shape_fn((n, 3), |(row, col)| {
+            let x = row as f64 / (n - 1) as f64;
+            match col {
+                0 => 1.0,
+                1 => x,
+                2 => x * x,
+                _ => unreachable!(),
+            }
+        });
+        let response = Array1::from_shape_fn(n, |row| {
+            let x = row as f64 / (n - 1) as f64;
+            0.3 + 0.8 * x + 0.2 * (TAU * x).sin()
+        });
+        let mut penalty = Array2::<f64>::zeros((3, 3));
+        penalty[[2, 2]] = 1.0;
+        let fit = fit_penalized_1d(&design, &penalty, response.view(), None, 1)
+            .expect("certified REML fit");
+
+        let mut penalized_gram = design.t().dot(&design);
+        penalized_gram[[2, 2]] += fit.lambda;
+        let inverse = fit.covariance.mapv(|value| value / fit.sigma2);
+        let identity = penalized_gram.dot(&inverse);
+        for row in 0..3 {
+            for col in 0..3 {
+                let expected = f64::from(u8::from(row == col));
+                assert!(
+                    (identity[[row, col]] - expected).abs() < 1.0e-9,
+                    "penalized inverse mismatch at ({row}, {col}): {}",
+                    identity[[row, col]],
+                );
+            }
+        }
+
+        let xtwy = design.t().dot(&response);
+        let prss = response.dot(&response) - fit.beta.dot(&xtwy);
+        let expected_sigma2 = prss / (n - 2) as f64;
+        assert!(
+            (fit.sigma2 - expected_sigma2).abs() <= 1.0e-11 * expected_sigma2.abs().max(1.0),
+            "REML scale mismatch: fitted {}, expected {expected_sigma2}",
+            fit.sigma2,
+        );
+    }
+
     #[test]
     fn invert_round_trips_interval_transport() {
         // A strictly increasing nonlinear warp on [0,1] → [0,1] with derivative
@@ -1914,5 +1969,4 @@ mod invert_tests {
         assert_eq!(crit.len(), 1);
         assert!((crit[0] - 1.3 / 4.2).abs() < 1e-12);
     }
-
 }

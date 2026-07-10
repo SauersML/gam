@@ -136,6 +136,7 @@ pub fn stack_topologies_gaussian(
 ) -> Result<StackingWeights, String> {
     let table = gaussian_log_density_table(y, means, lowers, uppers, interval_level)?;
     solve_stacking_weights(table.view(), StackingConfig::default())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -204,7 +205,7 @@ mod tests {
         let solved = stack_topologies_gaussian(&y, &means, &lowers, &uppers, 0.95).unwrap();
         assert!((solved.weights.sum() - 1.0).abs() < 1e-9);
         assert!(solved.weights.iter().all(|w| w.is_finite() && *w >= 0.0));
-        assert!(solved.mean_log_score.is_finite());
+        assert!(solved.mean_log_score().is_finite());
     }
 
     #[test]

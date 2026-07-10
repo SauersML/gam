@@ -104,7 +104,7 @@ workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
 | Manifold SAE | `ManifoldSAE`, `ManifoldSAEConfig`, `DecoderConfig`, `RemlConfig`, `SparsityConfig`, `ManifoldSAEOutput` |
 | Harvest / Fisher factors | `HarvestShard`, `harvest_output_fisher_factors`, `harvest_downstream_output_fisher_factors`, `save_harvest_shard`, `load_harvest_shard` |
 | Hyperbolic / interchange | `PoincareAtoms`, `InterchangeSwapDecoder` |
-| Skip transcoder | `SkipAffineSmooth`, `SkipTranscoderResult`, `skip_transcoder` |
+| Skip transcoder | `SkipAffineSmooth`, `skip_transcoder`, `select_skip_transcoder`, `SkipTranscoderSelectionResult` |
 | Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean`; in `gamfit.torch.geometry`: `ilr`, `inverse_ilr`, `aitchison_metric` |
 | Fitted-model loader | `from_fitted` |
 

@@ -22,11 +22,98 @@
 
 use super::codes::{SparseCode, solve_row_codes};
 use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
-use super::{SparseDictConfig, SparseDictFit};
+use super::{SparseDictConfig, SparseDictConvergence, SparseDictFit};
 use ndarray::{Array2, ArrayView2, Axis};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Instant;
+
+/// Typed failure from the sparse-dictionary optimizer.
+#[derive(Clone, Debug)]
+pub enum SparseDictionaryError {
+    InvalidInput {
+        reason: String,
+    },
+    NumericalFailure {
+        reason: String,
+    },
+    InnerNonConvergence {
+        epochs: usize,
+        explained_variance: f64,
+        ev_residual: f64,
+        tolerance: f64,
+        accepted_births: usize,
+        decoder_residual: f64,
+        decoder_tolerance: f64,
+        decoder_nonconverged_columns: usize,
+    },
+}
+
+impl SparseDictionaryError {
+    fn invalid_input(reason: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<String> for SparseDictionaryError {
+    fn from(reason: String) -> Self {
+        Self::NumericalFailure { reason }
+    }
+}
+
+impl fmt::Display for SparseDictionaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput { reason } | Self::NumericalFailure { reason } => {
+                f.write_str(reason)
+            }
+            Self::InnerNonConvergence {
+                epochs,
+                explained_variance,
+                ev_residual,
+                tolerance,
+                accepted_births,
+                decoder_residual,
+                decoder_tolerance,
+                decoder_nonconverged_columns,
+            } => write!(
+                f,
+                "fit_sparse_dictionary did not converge after {epochs} epochs: EV \
+                 {explained_variance:.6}, EV residual {ev_residual:.3e} (tolerance \
+                 {tolerance:.3e}), accepted births {accepted_births}, decoder residual \
+                 {decoder_residual:.3e} (tolerance {decoder_tolerance:.3e}), \
+                 nonconverged decoder columns {decoder_nonconverged_columns}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SparseDictionaryError {}
+
+impl From<SparseDictionaryError> for String {
+    fn from(error: SparseDictionaryError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Certified inner work state. This is deliberately not a [`SparseDictFit`]:
+/// the outer REML fixed point must also settle before the public model exists.
+#[derive(Clone, Debug)]
+pub(crate) struct SparseDictIterate {
+    pub(crate) decoder: Array2<f32>,
+    pub(crate) indices: Array2<u32>,
+    pub(crate) codes: Array2<f32>,
+    pub(crate) explained_variance: f64,
+    pub(crate) epochs: usize,
+    pub(crate) active: usize,
+    pub(crate) score_route_stats: ScoreRouteStats,
+    pub(crate) decoder_solve_stats: DecoderSolveStats,
+    inner_ev_residual: f64,
+    inner_tolerance: f64,
+}
 
 /// Route + sparse-code every row of `x`, processing the rows in minibatches of
 /// `config.minibatch` so the peak score working set is `minibatch × score_tile`
@@ -137,7 +224,7 @@ pub(super) fn route_and_code_all(
 pub(super) fn run(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
-) -> Result<SparseDictFit, String> {
+) -> Result<SparseDictIterate, SparseDictionaryError> {
     validate(x, config)?;
     let n = x.nrows();
     let p = x.ncols();
@@ -164,6 +251,8 @@ pub(super) fn run(
     let mut converged = false;
     let mut epochs_run = 0usize;
     let mut decoder_solve_stats = DecoderSolveStats::default();
+    let mut last_improve = f64::INFINITY;
+    let mut accepted_births = 0usize;
 
     // (a)+(b) route + sparse codes for every row against the seeded, unit-normed
     // decoder, in minibatches: each minibatch is routed by one batched score block
@@ -223,8 +312,8 @@ pub(super) fn run(
         // is the standard dead-feature resampling that makes every atom load-
         // bearing, so adding atoms can only help. It runs only while dead atoms
         // remain, so a fully-alive small-`K` dictionary is untouched.
-        let revived = revive_dead_atoms(x, &codes, &mut decoder);
-        if revived > 0 {
+        let revived_atoms = revive_dead_atoms(x, &codes, &mut decoder);
+        if !revived_atoms.is_empty() {
             unit_norm_rows(&mut decoder);
         }
 
@@ -251,6 +340,21 @@ pub(super) fn run(
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
         let ev = explained_variance(x, &codes, decoder.view());
         let improve = ev - prev_ev;
+        last_improve = improve;
+        let mut revived_mask = vec![false; k];
+        for &atom in &revived_atoms {
+            revived_mask[atom] = true;
+        }
+        let mut accepted_mask = vec![false; k];
+        for code in &codes {
+            for (slot, &atom) in code.indices.iter().enumerate() {
+                let atom = atom as usize;
+                if code.codes[slot] != 0.0 && revived_mask[atom] {
+                    accepted_mask[atom] = true;
+                }
+            }
+        }
+        accepted_births = accepted_mask.into_iter().filter(|accepted| *accepted).count();
 
         // Per-epoch heartbeat on the log::warn channel (log::info is dropped by
         // the RUST_LOG=warn harnesses, which is why a multi-hour host fit went
@@ -265,7 +369,7 @@ pub(super) fn run(
             config.max_epochs,
             ev,
             improve,
-            revived,
+            revived_atoms.len(),
             refresh_secs,
             route_secs,
             fit_start.elapsed().as_secs_f64(),
@@ -275,18 +379,20 @@ pub(super) fn run(
             decoder_solve_stats.cg_kappa_bound,
             decoder_solve_stats.cg_relative_residual,
         );
-        // #1026 — do NOT declare convergence while dead atoms are still being
-        // revived. Revival runs at most one atom per row per epoch, so a large
-        // dictionary populates its tail over SEVERAL epochs; a one-epoch EV
-        // plateau can occur mid-population (a revived atom needs the next route to
-        // start firing). Stopping on that plateau froze the dictionary with a
-        // still-dead tail — effective `K` below the requested `K`, the exact
-        // under-population this issue tracks. Requiring `revived == 0` forces every
-        // atom to become load-bearing before the plateau test can fire, so the
-        // returned dictionary uses its full budget and its EV climbs with `K`
-        // toward reconstruction parity. Once no atom is dead, revival returns 0 and
-        // the ordinary EV-plateau test governs stopping exactly as before.
-        if revived == 0 && improve.abs() <= config.tolerance && epoch > 0 {
+        // A proposed dead-atom birth is work, not automatically progress. At
+        // overcomplete K > N·s there must always be unused atoms, so requiring
+        // literally zero proposals makes convergence impossible. The checkable
+        // condition is instead that no proposed atom entered the fresh optimal
+        // routing: every residual-row birth was tested and rejected. Couple that
+        // no-beneficial-birth certificate to the EV residual and the decoder's
+        // normal-equation certificate; a diagonal fallback can never mint a fit.
+        if accepted_births == 0
+            && decoder_solve_stats.cg_nonconverged_columns == 0
+            && decoder_solve_stats.cg_relative_residual
+                <= decoder_solve_stats.cg_residual_stop.max(f64::MIN_POSITIVE)
+            && improve.abs() <= config.tolerance
+            && epoch > 0
+        {
             converged = true;
             break;
         }
@@ -299,17 +405,31 @@ pub(super) fn run(
     // returned EV equals the convergence-decision EV from the final epoch.
     let final_ev = explained_variance(x, &codes, decoder.view());
 
+    if !converged {
+        return Err(SparseDictionaryError::InnerNonConvergence {
+            epochs: epochs_run,
+            explained_variance: final_ev,
+            ev_residual: last_improve.abs(),
+            tolerance: config.tolerance,
+            accepted_births,
+            decoder_residual: decoder_solve_stats.cg_relative_residual,
+            decoder_tolerance: decoder_solve_stats.cg_residual_stop,
+            decoder_nonconverged_columns: decoder_solve_stats.cg_nonconverged_columns,
+        });
+    }
+
     let (indices, code_mat) = pack_codes(&codes, n, s);
-    Ok(SparseDictFit {
+    Ok(SparseDictIterate {
         decoder,
         indices,
         codes: code_mat,
         explained_variance: final_ev,
         epochs: epochs_run,
-        converged,
         active: s,
         score_route_stats,
         decoder_solve_stats,
+        inner_ev_residual: last_improve.abs(),
+        inner_tolerance: config.tolerance,
     })
 }
 
@@ -340,11 +460,11 @@ pub(super) fn run(
 /// engine's inner-solve seam; [`super::fit_sparse_dictionary`] remains a thin
 /// wrapper over [`run`] for now (its two-ridge FFI surface is preserved until
 /// Increment 5 re-points callers to the REML schedule).
-pub fn run_linear_fast_kernel(
+pub(crate) fn run_linear_fast_kernel(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
     shared_rho: f64,
-) -> Result<SparseDictFit, String> {
+) -> Result<SparseDictIterate, SparseDictionaryError> {
     let mut unified = *config;
     // ONE shared variance coordinate drives both the code and the decoder ridge:
     // the `d = 1` specialization carries a single ρ, not two.
@@ -587,9 +707,14 @@ fn code_gram_from_routing(
 /// Reconstruction residual sum of squares `Σ_i ‖x_i − Σ_j c_{ij} d_{a_{ij}}‖²` of
 /// a fit's stored routing against its decoder — the `RSS` aggregate the shared-ρ
 /// REML fixed point consumes.
-fn reconstruction_rss(x: ArrayView2<'_, f32>, fit: &SparseDictFit) -> f64 {
+fn reconstruction_rss_from_parts(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+) -> f64 {
     let p = x.ncols();
-    let s = fit.indices.ncols();
+    let s = indices.ncols();
     let mut rss = 0.0f64;
     let mut recon = vec![0.0f64; p];
     for i in 0..x.nrows() {
@@ -597,11 +722,11 @@ fn reconstruction_rss(x: ArrayView2<'_, f32>, fit: &SparseDictFit) -> f64 {
             *r = 0.0;
         }
         for a in 0..s {
-            let cj = fit.codes[[i, a]] as f64;
+            let cj = codes[[i, a]] as f64;
             if cj == 0.0 {
                 continue;
             }
-            let drow = fit.decoder.row(fit.indices[[i, a]] as usize);
+            let drow = decoder.row(indices[[i, a]] as usize);
             for (c, r) in recon.iter_mut().enumerate() {
                 *r += cj * drow[c] as f64;
             }
@@ -629,11 +754,27 @@ pub fn linear_block_reml_stats(
     fit: &SparseDictFit,
     rho: f64,
 ) -> LinearBlockRemlStats {
-    let k = fit.decoder.nrows();
-    let (diag, off) = code_gram_from_routing(fit.indices.view(), fit.codes.view(), k);
+    linear_block_reml_stats_from_parts(
+        x,
+        fit.decoder.view(),
+        fit.indices.view(),
+        fit.codes.view(),
+        rho,
+    )
+}
+
+fn linear_block_reml_stats_from_parts(
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    rho: f64,
+) -> LinearBlockRemlStats {
+    let k = decoder.nrows();
+    let (diag, off) = code_gram_from_routing(indices, codes, k);
     let gram_edof = hutchinson_gram_edof(&diag, &off, rho, k);
-    let penalty_energy: f64 = fit.decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
-    let rss = reconstruction_rss(x, fit);
+    let penalty_energy: f64 = decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
+    let rss = reconstruction_rss_from_parts(x, decoder, indices, codes);
     LinearBlockRemlStats {
         gram_edof,
         p_cols: x.ncols(),
@@ -642,15 +783,6 @@ pub fn linear_block_reml_stats(
         n_obs: x.nrows(),
     }
 }
-
-/// Iteration cap for the shared-ρ REML schedule (design gam#2232, Increment 2,
-/// plug 4). The Fellner–Schall / MacKay evidence recursion for a single variance
-/// component contracts geometrically near its fixed point, and each iteration is
-/// a FULL linear-kernel fit, so a small cap bounds the schedule at a few times a
-/// single fit while comfortably covering the handful of steps to the stochastic
-/// edof floor. A run that has not settled by the cap returns its last fit rather
-/// than spinning.
-const MAX_REML_SCHEDULE_ITERS: usize = 8;
 
 /// Relative-ρ stopping band for the shared-ρ REML schedule, DERIVED from the
 /// edof probe variance target: the Hutchinson estimator resolves a PSD trace to a
@@ -675,28 +807,42 @@ fn reml_schedule_rho_rel_tol() -> f64 {
 /// constant becomes only the WARM START of the evidence loop. Iteration stops
 /// when the relative ρ change falls below the solver-derived stochastic floor
 /// ([`reml_schedule_rho_rel_tol`]) — at which point the current fit already
-/// reflects a ρ within that band, so no redundant refit is issued — or at the
-/// documented cap [`MAX_REML_SCHEDULE_ITERS`].
+/// reflects a ρ within that band, so no redundant refit is issued. There is no
+/// fixed pass count: an unsettled outer iterate is work, not a model.
 pub fn run_linear_reml_schedule(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
-) -> Result<SparseDictFit, String> {
-    // Warm start at the shared-default ridge; from here ρ is REML-selected.
+) -> Result<SparseDictFit, SparseDictionaryError> {
+    if config.code_ridge != config.decoder_ridge {
+        return Err(SparseDictionaryError::invalid_input(format!(
+            "fit_sparse_dictionary has one shared REML ridge, so code_ridge ({}) and \
+             decoder_ridge ({}) must be equal",
+            config.code_ridge, config.decoder_ridge
+        )));
+    }
+    // Warm start at the caller's shared ridge; from here ρ is REML-selected.
     let mut rho = config.decoder_ridge as f64;
     let mut fit = run_linear_fast_kernel(x, config, rho)?;
     let tol = reml_schedule_rho_rel_tol();
+    let mut outer_iterations = 0usize;
 
-    for iter in 0..MAX_REML_SCHEDULE_ITERS {
-        let stats = linear_block_reml_stats(x, &fit, rho);
+    loop {
+        outer_iterations += 1;
+        let stats = linear_block_reml_stats_from_parts(
+            x,
+            fit.decoder.view(),
+            fit.indices.view(),
+            fit.codes.view(),
+            rho,
+        );
         let rho_new = linear_shared_rho_fs_step(&stats, rho);
         let rel_change = (rho_new - rho).abs() / rho.abs().max(f64::MIN_POSITIVE);
         // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
         // harnesses), at outer-loop cadence only — never per row or minibatch.
         log::warn!(
-            "[SAE reml-schedule iter {}/{}] rho={:.6e} rho_new={:.6e} rel_change={:.3e} \
+            "[SAE reml-schedule iter {}] rho={:.6e} rho_new={:.6e} rel_change={:.3e} \
              edof={:.2} rss={:.6e} penalty_energy={:.6e} tol={:.3e}",
-            iter + 1,
-            MAX_REML_SCHEDULE_ITERS,
+            outer_iterations,
             rho,
             rho_new,
             rel_change,
@@ -709,40 +855,76 @@ pub fn run_linear_reml_schedule(
             // The current `fit` was produced at `rho`, which is within `tol` of
             // `rho_new`: it already reflects the fixed point. Stop without a
             // redundant refit.
-            break;
+            let convergence = SparseDictConvergence {
+                inner_ev_residual: fit.inner_ev_residual,
+                inner_tolerance: fit.inner_tolerance,
+                decoder_residual: fit.decoder_solve_stats.cg_relative_residual,
+                decoder_tolerance: fit.decoder_solve_stats.cg_residual_stop,
+                outer_rho_residual: rel_change,
+                outer_tolerance: tol,
+                selected_rho: rho,
+                outer_iterations,
+            };
+            return Ok(SparseDictFit {
+                decoder: fit.decoder,
+                indices: fit.indices,
+                codes: fit.codes,
+                explained_variance: fit.explained_variance,
+                epochs: fit.epochs,
+                convergence,
+                active: fit.active,
+                score_route_stats: fit.score_route_stats,
+                decoder_solve_stats: fit.decoder_solve_stats,
+            });
         }
         rho = rho_new;
         fit = run_linear_fast_kernel(x, config, rho)?;
     }
-    Ok(fit)
 }
 
-fn validate(x: ArrayView2<'_, f32>, config: &SparseDictConfig) -> Result<(), String> {
+fn validate(
+    x: ArrayView2<'_, f32>,
+    config: &SparseDictConfig,
+) -> Result<(), SparseDictionaryError> {
     if x.nrows() == 0 || x.ncols() == 0 {
-        return Err("fit_sparse_dictionary requires a non-empty N×P matrix".to_string());
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary requires a non-empty N×P matrix",
+        ));
     }
     if !x.iter().all(|v| v.is_finite()) {
-        return Err("fit_sparse_dictionary input must be finite".to_string());
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary input must be finite",
+        ));
     }
     if config.n_atoms == 0 {
-        return Err("fit_sparse_dictionary requires K >= 1".to_string());
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary requires K >= 1",
+        ));
     }
     if config.active == 0 {
-        return Err("fit_sparse_dictionary requires active (top_s) >= 1".to_string());
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary requires active (top_s) >= 1",
+        ));
     }
     if config.max_epochs == 0 {
-        return Err("fit_sparse_dictionary requires max_epochs >= 1".to_string());
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary requires max_epochs >= 1",
+        ));
     }
-    if !(config.code_ridge.is_finite() && config.code_ridge >= 0.0) {
-        return Err("fit_sparse_dictionary code_ridge must be finite and non-negative".to_string());
+    if !(config.code_ridge.is_finite() && config.code_ridge > 0.0) {
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary code_ridge must be finite and positive",
+        ));
     }
-    if !(config.decoder_ridge.is_finite() && config.decoder_ridge >= 0.0) {
-        return Err(
-            "fit_sparse_dictionary decoder_ridge must be finite and non-negative".to_string(),
-        );
+    if !(config.decoder_ridge.is_finite() && config.decoder_ridge > 0.0) {
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary decoder_ridge must be finite and positive",
+        ));
     }
-    if !config.tolerance.is_finite() {
-        return Err("fit_sparse_dictionary tolerance must be finite".to_string());
+    if !(config.tolerance.is_finite() && config.tolerance >= 0.0) {
+        return Err(SparseDictionaryError::invalid_input(
+            "fit_sparse_dictionary tolerance must be finite and non-negative",
+        ));
     }
     Ok(())
 }
@@ -1159,13 +1341,15 @@ pub(super) fn solve_decoder_with_routability_gate(
 /// epoch — with more dead atoms than rows the remainder revive on later epochs as
 /// the residual field changes, which is the standard bounded-resample cadence.
 ///
-/// Returns the number of atoms revived (0 leaves the decoder untouched, so a
-/// fully-alive small-`K` dictionary pays only the usage scan).
+/// Returns the atom indices whose residual-row birth proposals were installed.
+/// The fresh route decides which proposals are accepted; convergence requires
+/// zero accepted births, not zero proposals (the latter is impossible whenever
+/// `K > N·s`).
 fn revive_dead_atoms(
     x: ArrayView2<'_, f32>,
     codes: &[SparseCode],
     decoder: &mut Array2<f32>,
-) -> usize {
+) -> Vec<usize> {
     let n = x.nrows();
     let p = x.ncols();
     let k = decoder.nrows();
@@ -1181,7 +1365,7 @@ fn revive_dead_atoms(
     }
     let dead: Vec<usize> = (0..k).filter(|&a| !alive[a]).collect();
     if dead.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     // Per-row residual under the current model, and its squared norm for ranking.
@@ -1221,7 +1405,7 @@ fn revive_dead_atoms(
             .then_with(|| a.cmp(&b))
     });
 
-    let mut revived = 0usize;
+    let mut revived = Vec::new();
     for (t, &atom) in dead.iter().enumerate() {
         if t >= n {
             break; // one atom per distinct row this epoch
@@ -1235,7 +1419,7 @@ fn revive_dead_atoms(
         for c in 0..p {
             dst[c] = src[c];
         }
-        revived += 1;
+        revived.push(atom);
     }
     revived
 }

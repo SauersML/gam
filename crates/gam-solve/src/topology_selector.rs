@@ -1122,7 +1122,12 @@ pub fn mixture_density_provider<'a>(
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
             let train_mat = gather_rows(owned.view(), train);
-            let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)?;
+            let fit = fit_gaussian_mixture(
+                train_mat.view(),
+                k.min(train.len().max(1)),
+                config,
+            )
+            .map_err(|error| error.to_string())?;
             let eval_mat = gather_rows(owned.view(), eval);
             let dens = fit.per_point_log_density(eval_mat.view())?;
             Ok(dens.to_vec())
@@ -1516,7 +1521,8 @@ pub fn adjudicate_cross_class_race(
     let providers: Vec<HeldOutDensityProvider<'_>> =
         candidates.into_iter().map(|c| c.density_provider).collect();
     let table = build_cv_log_density_table(n, folds, seed, &providers)?;
-    let stacking = solve_stacking_weights(table.view(), stacking_config)?;
+    let stacking =
+        solve_stacking_weights(table.view(), stacking_config).map_err(|error| error.to_string())?;
     // Headline winner = max stacking weight (most predictive mass).
     let mut winner_index = 0usize;
     let mut best_w = f64::NEG_INFINITY;

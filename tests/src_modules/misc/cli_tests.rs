@@ -3388,8 +3388,8 @@ fn build_termspec_leaves_parametric_linear_terms_unpenalized_by_default() {
 
     assert_eq!(spec.linear_terms.len(), 3);
     assert!(
-        spec.linear_terms.iter().all(|term| !term.double_penalty),
-        "parametric linear terms should be unpenalized by default: {:?}",
+        spec.linear_terms.iter().all(|term| term.double_penalty),
+        "non-intercept linear terms should recover zero by default: {:?}",
         spec.linear_terms
             .iter()
             .map(|term| (&term.name, term.double_penalty))

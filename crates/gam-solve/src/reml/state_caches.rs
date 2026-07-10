@@ -21,18 +21,6 @@ pub(crate) const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 
 pub(crate) const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
-// `n * p` catches bam-shaped tall designs while avoiding small-n wide problems.
-pub(crate) const LARGE_N_EFS_THRESHOLD: f64 = 1.0e8;
-
-pub(crate) const EFS_SINGLE_LOOP_PIRLS_SWEEPS: usize = 2;
-
-pub(crate) const EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL: usize = usize::MAX / 4;
-
-// Bail after 3 consecutive iterations whose surrogate/partial-inner drift is >= 10%.
-pub(crate) const EFS_SINGLE_LOOP_BIAS_THRESHOLD: f64 = 0.10;
-
-pub(crate) const EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT: usize = 3;
-
 pub(crate) const HGB_INNER_FLOOR: f64 = 1e-12;
 
 pub(crate) const HGB_LINEAR_FLOOR: f64 = 1e-12;
@@ -859,98 +847,9 @@ pub(crate) fn mean_positive(values: &[f64]) -> Option<f64> {
     (count > 0).then_some(sum / count as f64)
 }
 
-#[derive(Default)]
-pub(crate) struct EfsSingleLoopBiasGuardState {
-    pub(crate) owner: usize,
-    pub(crate) consecutive: usize,
-}
-
-// `LazyLock` (not `OnceLock` lazy init) so the init closure never parks
-// callers on the OS condvar. The init body here is trivial — just a default-
-// constructed `Mutex` — but the call site sits in a module that elsewhere
-// dispatches rayon parallel iterators, and the codebase-level lint
-// (see `tests/once_lock_get_or_init_not_inside_parallel_regions.rs`)
-// forbids the lazy `OnceLock` accessor in any rayon-adjacent file.
-// `LazyLock`'s initializer runs at first deref under its own dedicated
-// synchronization that does not interact with rayon's worker pool.
-pub(crate) static EFS_SINGLE_LOOP_BIAS_GUARD: LazyLock<Mutex<EfsSingleLoopBiasGuardState>> =
-    LazyLock::new(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
-
 #[inline]
 pub(crate) fn compute_gradient_for_tk(mode: super::reml_outer_engine::EvalMode) -> bool {
     mode != super::reml_outer_engine::EvalMode::ValueOnly
-}
-
-#[inline]
-pub(crate) fn efs_single_loop_encoded_cap() -> usize {
-    EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL + EFS_SINGLE_LOOP_PIRLS_SWEEPS
-}
-
-#[inline]
-pub(crate) fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
-    // `.then_some` evaluates its argument eagerly, so the subtraction must be
-    // guarded by `.then(|| ...)` to avoid usize underflow when raw_cap <
-    // SENTINEL (the common path for non-EFS-single-loop iterates).
-    (raw_cap >= EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
-        .then(|| raw_cap - EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
-        .filter(|cap| *cap > 0)
-}
-
-/// Apply the screening residual penalty to a cost.
-///
-/// Under multi-start seed screening (a ranking pass over candidate ρ
-/// vectors), the inner P-IRLS is intentionally capped at a few iterations.
-/// Partial modes that do not certify stationarity are accepted for ranking
-/// in `execute_pirls_if_needed`; this helper turns the partial cost into a
-/// finite ranking score
-///
-/// ```text
-/// C_screen(s) = C_approx(s) + ½ · r_g(s)² ,
-/// ```
-///
-/// where r_g = ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖) is the scale-invariant
-/// relative gradient residual. Using r_g rather than the absolute ‖g‖ keeps
-/// the penalty meaningful at large-scale n: the absolute score grows as O(√n),
-/// so an absolute residual term would swamp the actual REML cost differences
-/// across seeds and reduce the screen to a √n-scaled tie-break. r_g is
-/// dimensionless and bounded above by 1 for any well-defined PIRLS state, so
-/// the penalty stays comparable to the cost differences that actually
-/// distinguish good seeds from bad. The penalty vanishes at the true inner
-/// mode (r_g → 0), so converged screening fits incur no penalty.
-///
-/// In the standard two-loop driver, partial fits never reach this helper:
-/// `execute_pirls_if_needed` surfaces `MaxIterationsReached` and
-/// `LmStepSearchExhausted` as `EstimationError::PirlsDidNotConverge`, so those
-/// REML evaluations always operate on certified inner modes and this helper is
-/// a strict no-op for them. The EFS single-loop strategy is the exception: it
-/// intentionally ACCEPTS a partial (`is_failed_max_iterations`) inner state at
-/// large n (the bam / Wood 2015 amortization tradeoff; see
-/// `execute_pirls_if_needed`'s `in_efs_single_loop` branch), so an uncertified
-/// inner mode can flow into cost assembly with the barrier active.
-///
-/// SINGLE SOURCE OF TRUTH (objective↔gradient consistency): this helper is the
-/// one and only place the outer objective VALUE gains the `+0.5·r_g²` barrier.
-/// Every outer-cost emission in the REML evaluator MUST route through it so the
-/// `eval_cost` line-search value (`compute_cost`), the value+gradient/Hessian
-/// path (`compute_outer_eval_with_order`), and the EFS step value
-/// (`assemble_and_evaluate_efs`) report the IDENTICAL objective. The barrier
-/// carries no analytic ρ/ψ-gradient and vanishes at every converged point, so
-/// the analytic gradient is exact wherever the barrier is inactive; the only
-/// requirement is that the reported VALUE never drifts from the gradient's
-/// objective. Omitting the wrap on any one path reintroduces the
-/// objective↔gradient desync that stalls the EFS iso-κ optimizer at large n
-/// with a nonzero `final_grad_norm` (#1122). The complete caller set is:
-///   * `compute_cost` (dense + sparse) — the `eval_cost` value
-///   * `compute_outer_eval_with_order` (value-only early return + main path)
-///   * `assemble_and_evaluate_efs` — the EFS step value
-/// Add the wrap to any future outer-cost emission as well.
-#[inline]
-pub(crate) fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
-    crate::objective_base::failed_inner_residual_barrier_cost(
-        cost,
-        pr.status.is_failed_max_iterations(),
-        pr.relative_gradient_norm(),
-    )
 }
 
 pub(crate) fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::ArrayView1<'_, f64>) {

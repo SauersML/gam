@@ -1,5 +1,4 @@
 use super::*;
-use crate::model_types::result_types::CERTIFICATE_Z_GATE;
 use ::opt::FixedPointObjective;
 use ndarray::array;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,8 +48,8 @@ fn certificate_attests_consistent_quadratic() {
         .as_ref()
         .expect("gradient-based solve must ship a certificate");
     assert!(
-        cert.first_order_consistent(),
-        "consistent value/gradient paths flagged as desynced: {}",
+        cert.certifies(),
+        "consistent quadratic optimum failed certification: {}",
         cert.summary(),
     );
     assert!(
@@ -58,7 +57,7 @@ fn certificate_attests_consistent_quadratic() {
         "interior optimum reported railed λ: {}",
         cert.summary(),
     );
-    assert!(cert.fd_step > 0.0 && cert.fd_error > 0.0);
+    assert!(cert.stationarity_bound > 0.0 && cert.projected_grad_norm.is_finite());
 }
 
 #[test]
@@ -188,51 +187,36 @@ fn certificate_flags_value_gradient_desync() {
         .criterion_certificate
         .as_ref()
         .expect("gradient-based solve must ship a certificate");
-    // At wrong_center the analytic slope is ~0 but the true value path
-    // slopes by v·(wrong_center − value_center) along the audit
-    // direction. Guard the assertion on that projection being visible
-    // (the deterministic direction is not axis-aligned, so it is).
+    // Post-FD-purge semantics: the production certificate attests ANALYTIC
+    // KKT stationarity only (the FD directional cross-audit was removed from
+    // the production path; value↔gradient desyncs are guarded by the
+    // structural single-evaluator design plus the FD gates that live in
+    // tests). The lying gradient drove the solve to ITS OWN stationary point,
+    // so the analytic certificate is stationary there — pin that so any
+    // future re-introduction of a production FD audit shows up here as an
+    // intentional semantic change rather than silent drift.
     assert!(
-        cert.fd_directional.abs() > 1e-3,
-        "audit direction nearly orthogonal to the desync displacement: {}",
+        cert.is_stationary(),
+        "analytic-surface certificate unexpectedly non-stationary at the \
+         gradient's own optimum: {}",
         cert.summary(),
     );
-    assert!(
-        !cert.first_order_consistent(),
-        "value↔gradient desync NOT flagged: {}",
-        cert.summary(),
-    );
-    assert!(cert.agreement_z > CERTIFICATE_Z_GATE);
 }
 
 #[test]
-fn certificate_audit_direction_is_deterministic_and_context_sensitive() {
-    let theta = array![1.5, -0.25, 7.0];
-    let a = certificate_audit_direction(&theta, "ctx-one");
-    let b = certificate_audit_direction(&theta, "ctx-one");
-    assert_eq!(a, b, "same fingerprint must give the same direction");
-    let c = certificate_audit_direction(&theta, "ctx-two");
-    assert!(
-        (&a - &c).iter().any(|d| d.abs() > 1e-12),
-        "different context must give a different direction",
-    );
-    assert!((a.dot(&a).sqrt() - 1.0).abs() < 1e-12, "unit norm");
-}
-
-#[test]
-fn certificate_hessian_pd_probe_classifies_definiteness() {
+fn certificate_hessian_psd_probe_classifies_definiteness() {
     assert_eq!(
-        certificate_hessian_is_pd(&Array2::<f64>::eye(3)),
+        certificate_hessian_is_psd(&Array2::<f64>::eye(3)),
         Some(true)
     );
     let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
-    assert_eq!(certificate_hessian_is_pd(&indefinite), Some(false));
+    assert_eq!(certificate_hessian_is_psd(&indefinite), Some(false));
     assert_eq!(
-        certificate_hessian_is_pd(&Array2::<f64>::zeros((0, 0))),
+        certificate_hessian_is_psd(&Array2::<f64>::zeros((0, 0))),
         None
     );
     let non_finite = array![[f64::NAN]];
-    assert_eq!(certificate_hessian_is_pd(&non_finite), None);
+    assert_eq!(certificate_hessian_is_psd(&non_finite), None);
 }
 
 #[test]
@@ -250,17 +234,16 @@ fn certificate_rail_detection_uses_outer_box() {
     assert_eq!(certificate_railed_lambdas(&pinned, 3, &bounded), vec![0, 1]);
 }
 
-/// Helper: build an objective whose VALUE path (the one the certificate
-/// probes via `eval_cost`) is `0.5·ρ₀² + slope_railed·ρ₁`, and run the audit
-/// directly at a constructed optimum where ρ₁ is railed at the upper box
-/// bound. The analytic gradient is supplied separately so we control the
-/// railed-vs-free desync structure exactly.
+/// Helper: build an objective `0.5·ρ₀² + slope·ρ₁` (analytic gradient
+/// `[ρ₀, slope]`) and run the post-FD-purge certificate audit
+/// (`certify_outer_optimality`, which re-evaluates the analytic gradient at
+/// the point and returns `Err` on non-certification) at a constructed point
+/// where ρ₁ sits on the upper box bound.
 fn audit_at_railed_optimum(
     config: &OuterConfig,
     theta_hat: Array1<f64>,
-    analytic_gradient: Array1<f64>,
     value_slope_railed: f64,
-) -> Option<OuterCriterionCertificate> {
+) -> Result<OuterCriterionCertificate, EstimationError> {
     let slope = value_slope_railed;
     let mut obj = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
@@ -293,8 +276,7 @@ fn audit_at_railed_optimum(
             hessian_source: HessianSource::BfgsApprox,
         },
     );
-    result.final_gradient = Some(analytic_gradient);
-    audit_first_order_optimality(&mut obj, config, "railed-audit-unit", &result)
+    certify_outer_optimality(&mut obj, config, "railed-audit-unit", &mut result)
 }
 
 /// TASK 1+2+3: at an optimum where the ONLY disagreement lives on a railed

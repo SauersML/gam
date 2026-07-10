@@ -302,18 +302,6 @@ def _canonical_n_harmonics(
     ]
 
 
-def _jsonable_value(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Mapping):
-        return {str(k): _jsonable_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable_value(v) for v in value]
-    return value
-
-
 def _canonical_assignment(value: str, label: str) -> str:
     try:
         return str(rust_module().sae_canonical_assignment_kind(str(value)))
@@ -796,9 +784,8 @@ class ManifoldSAE:
         ``linear_block`` relabel (``declared_bases``), so those are builder args
         rather than post-construction mutations."""
         canonical_assignment = _canonical_assignment(assignment, "assignment")
-        raw_json = json.dumps(_jsonable_value(dict(payload)))
         core = rust_module().sae_manifold_core_from_fit_payload(
-            raw_json,
+            dict(payload),
             np.ascontiguousarray(np.asarray(x, dtype=np.float64)),
             str(topology),
             canonical_assignment,
@@ -2756,24 +2743,10 @@ class StagewiseSAE:
             return seed
         training = np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64))
         fitted = np.ascontiguousarray(self._in_sample_reconstruction())
-        basis_kinds = [
-            _canonical_basis_kind(a.topology)
-            for a in self.atoms
-        ]
         decoder_blocks = [
             np.ascontiguousarray(np.asarray(a.decoder, dtype=np.float64)) for a in self.atoms
         ]
         atom_dims = [int(a.latent_dim) for a in self.atoms]
-        basis_sizes = [int(b.shape[0]) for b in decoder_blocks]
-        # Periodic harmonics recovered DIRECTLY from the decoder width (M = 2H + 1):
-        # ``(M - 1) // 2`` with no floor, so a DC-only born atom (M = 1 → H = 0)
-        # keeps its constant basis instead of being inflated to a 3-column periodic
-        # design the frozen decoder no longer matches. Sphere / non-periodic pass
-        # through as 0 (their basis size is fixed, not harmonic-derived).
-        n_harmonics = [
-            ((size - 1) // 2 if kind in ("periodic", "periodic_spline") else 0)
-            for kind, size in zip(basis_kinds, basis_sizes)
-        ]
         coords = [np.ascontiguousarray(np.asarray(a.coords, dtype=np.float64)) for a in self.atoms]
         assignments = np.ascontiguousarray(
             np.column_stack(
@@ -2781,24 +2754,28 @@ class StagewiseSAE:
             )
         )
         assignment = _canonical_assignment(self.assignment, "assignment")
-        v1_dict = _stagewise_to_manifold_sae_dict(
-            basis_kinds=basis_kinds,
-            decoder_blocks=decoder_blocks,
-            atom_dims=atom_dims,
-            basis_sizes=basis_sizes,
-            n_harmonics=list(n_harmonics),
-            coords=[c.copy() for c in coords],
-            assignments=assignments,
-            fitted=fitted,
-            logits=np.ascontiguousarray(np.asarray(self.logits, dtype=np.float64)),
-            training=training,
-            assignment=assignment,
-            reconstruction_r2=self.reconstruction_ev(),
-            seed=seed,
-            atom_topology=_topology_for_bases(basis_kinds),
-            atom_topologies=_topologies_for_bases(basis_kinds),
+        core = rust_module().sae_manifold_core_from_stagewise(
+            [str(atom.topology) for atom in self.atoms],
+            decoder_blocks,
+            atom_dims,
+            coords,
+            assignments,
+            fitted,
+            np.ascontiguousarray(np.asarray(self.logits, dtype=np.float64)),
+            training,
+            assignment,
+            str(seed.assignment),
+            float(seed.alpha),
+            bool(seed.learnable_alpha),
+            float(seed.tau),
+            float(seed.sparsity_strength),
+            float(seed.smoothness),
+            float(seed.learning_rate),
+            int(seed.max_iter),
+            int(seed.random_state),
+            float(seed.jumprelu_threshold),
+            float(self.reconstruction_ev()),
         )
-        core = rust_module().ManifoldSaeCore(v1_dict)
         # SAC retains the training matrix so `reconstruct(X=training)` returns the
         # composed in-sample reconstruction bit-for-bit (the core's to_dict still
         # nulls training_data, matching the legacy dataclass serialization).
@@ -3601,113 +3578,6 @@ def flat_block_assignment(gating: str) -> str:
     curved atom race under ONE fit. Raises on an unknown mode.
     """
     return str(rust_module().sae_flat_block_assignment(str(gating)))
-
-
-def _stagewise_to_manifold_sae_dict(
-    *,
-    basis_kinds: list[str],
-    decoder_blocks: list[np.ndarray],
-    atom_dims: list[int],
-    basis_sizes: list[int],
-    n_harmonics: list[int],
-    coords: list[np.ndarray],
-    assignments: np.ndarray,
-    fitted: np.ndarray,
-    logits: np.ndarray,
-    training: np.ndarray,
-    assignment: str,
-    reconstruction_r2: float,
-    seed: Any,
-    atom_topology: str,
-    atom_topologies: list[str],
-) -> dict[str, Any]:
-    """Assemble a v1 ``to_dict``-schema payload for ``StagewiseSAE.to_manifold_sae``
-    (#2091). The SAC lift no longer constructs ``ManifoldSAE(...)`` with dataclass
-    kwargs; it builds this dict and loads it through the Rust core, so the core owns
-    the state exactly like every other route. Per-atom entries carry the minimal SAC
-    fields (no shape bands / covariance — SAC lifts a frozen dictionary). The
-    centering-mean reduction is computed in Rust (the shared ``column_mean`` core,
-    identical to the fit builder); this is pure marshaling of the result."""
-    atoms_payload: list[dict[str, Any]] = []
-    for k, block in enumerate(decoder_blocks):
-        atoms_payload.append(
-            {
-                "basis": basis_kinds[k],
-                "decoder_coefficients": np.asarray(block, dtype=float).tolist(),
-                "assignments": np.asarray(assignments[:, k], dtype=float).tolist(),
-                "coords": np.asarray(coords[k], dtype=float).tolist(),
-                "coords_u_arc": None,
-                "evidence": None,
-                "active_dim": int(atom_dims[k]),
-                "decoder_covariance_channel_factors": None,
-                "shape_band_coords": None,
-                "shape_band_mean": None,
-                "shape_band_sd": None,
-                "functional_evidence": None,
-            }
-        )
-    return {
-        "schema": "gamfit.ManifoldSAE/v1",
-        "atom_topology": atom_topology,
-        "atom_topologies": list(atom_topologies),
-        "assignment": assignment,
-        "assignment_label": str(seed.assignment) if hasattr(seed, "assignment") else assignment,
-        "alpha": float(seed.alpha),
-        "learnable_alpha": bool(seed.learnable_alpha),
-        "tau": float(seed.tau),
-        "sparsity_strength": float(seed.sparsity_strength),
-        "smoothness": float(seed.smoothness),
-        "learning_rate": float(seed.learning_rate),
-        "max_iter": int(seed.max_iter),
-        "random_state": int(seed.random_state),
-        "top_k": None,
-        "top_k_projection": None,
-        "pre_topk": None,
-        "jumprelu_threshold": float(seed.jumprelu_threshold),
-        "oos_projection_top1": False,
-        "dispersion": 1.0,
-        "solver_plan": None,
-        "primitive_names": ["sae_manifold_fit_stagewise"],
-        "basis_specs": list(basis_kinds),
-        "penalized_loss_score": None,
-        "reml_score": None,
-        "reconstruction_r2": float(reconstruction_r2),
-        "training_mean": rust_module()
-        .sae_manifold_training_mean(np.ascontiguousarray(np.asarray(training, dtype=float)))
-        .tolist(),
-        "training_data": None,
-        "training_data_retained": False,
-        "fitted": np.asarray(fitted, dtype=float).tolist(),
-        "assignments": np.asarray(assignments, dtype=float).tolist(),
-        "logits": np.asarray(logits, dtype=float).tolist(),
-        "diagnostics": {"atom_trust": [], "atoms": []},
-        "coords": [np.asarray(c, dtype=float).tolist() for c in coords],
-        "decoder_blocks": [np.asarray(b, dtype=float).tolist() for b in decoder_blocks],
-        "atoms": atoms_payload,
-        "basis_kinds": list(basis_kinds),
-        "atom_dims": [int(d) for d in atom_dims],
-        "basis_sizes": [int(s) for s in basis_sizes],
-        "n_harmonics": [int(h) for h in n_harmonics],
-        "duchon_centers": [None] * len(decoder_blocks),
-        "atom_two_lens": None,
-        "residual_gauge": None,
-        "incoherence_report": None,
-        "curvature_report": None,
-        "coordinate_fidelity": None,
-        "topology_persistence": None,
-        "atom_inference": None,
-        "certificates": None,
-        "structure_certificate": None,
-        "cotrain": None,
-        "hybrid_split": None,
-        "fisher_factors": None,
-        "fisher_provenance": None,
-        "metric_provenance": "Euclidean",
-        "fisher_mass_residual": None,
-        "selected_log_lambda_sparse": None,
-        "selected_log_lambda_smooth": None,
-        "selected_log_ard": None,
-    }
 
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:

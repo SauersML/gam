@@ -26,22 +26,24 @@ JumpReLU penalty (already in the Rust core) and Pca-style low-rank smooth.
 
 Outer-loop REML
 ---------------
-``skip_transcoder`` expands an ``(lambda_sparse, jumprelu_threshold,
-rank_skip)`` grid into per-config ``SkipAffineSmooth`` modules. The
-analytic REML score and the argmin selector are computed in the gam Rust
-core (``skip_transcoder_reml_metrics`` / ``skip_transcoder_select_reml``):
-this Python module is a thin marshaling layer.
+``skip_transcoder`` builds exactly one explicitly configured module.
+``select_skip_transcoder`` profiles ``log(lambda_sparse)`` and the shared
+``log(jumprelu_threshold)`` continuously from an analytic evidence/gradient
+oracle supplied by the caller's PyTorch training loop. Rank remains genuinely
+discrete and is selected by evidence-priced sequential birth/death moves. The
+result carries the two-neighbour stop certificate; failed or non-stationary
+candidates are surfaced, never skipped or replaced.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Sequence
+from numbers import Integral, Real
+from typing import Callable, Literal
 
 import torch
 from torch import nn
 
-from .._binding import rust_module
-from ._coerce import to_numpy_f64
 from .penalties import JumpReLUPenalty
 
 
@@ -264,207 +266,481 @@ class SkipAffineSmooth(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# skip_transcoder: PyFFI entry point with outer-loop REML model selection
+# Scalar builder and continuous/sequential evidence selector
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class SkipTranscoderResult:
-    """One configuration in the outer-loop sweep."""
-
-    smooth: SkipAffineSmooth
-    lambda_sparse: float
-    jumprelu_threshold: float
-    rank_skip: int
-    reml_score: float          # negative log-marginal-likelihood (lower = better)
-    mse: float
-    sparsity: float            # mean nonzero fraction
-    explained_variance: float
-
-
-def _int_grid(value: int | Sequence[int]) -> list[int]:
-    if isinstance(value, int):
-        return [value]
-    return [int(item) for item in value]
-
-
-def _float_grid(value: float | int | Sequence[float]) -> list[float]:
-    if isinstance(value, (float, int)):
-        return [float(value)]
-    return [float(item) for item in value]
 
 
 def skip_transcoder(
     in_dim: int,
     out_dim: int,
     n_atoms: int,
-    rank_skip: int | Sequence[int] = 64,
-    jumprelu_threshold: float | Sequence[float] = 0.05,
-    lambda_sparse: float | Sequence[float] = 1e-3,
+    rank_skip: int,
+    jumprelu_threshold: float = 0.05,
+    lambda_sparse: float = 1e-3,
     *,
     learnable_threshold: bool = False,
     smoothing_eps: float = 1e-3,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-) -> SkipAffineSmooth | list[SkipTranscoderResult]:
-    """Build a skip-transcoder smooth, optionally swept over hyperparameters.
+) -> SkipAffineSmooth:
+    """Build one explicitly configured skip-transcoder.
 
-    When all of ``rank_skip``, ``jumprelu_threshold``, ``lambda_sparse`` are
-    scalars, this returns a single ``SkipAffineSmooth`` ready for training.
-
-    When any of them is a sequence, the caller opts into the outer-loop
-    REML selector: train each returned candidate, then call
-    :func:`score_and_select` to fill the REML/MSE/sparsity/EV fields and
-    pick the best. This module deliberately does not own the training
-    loop — gamfit's job is the composition primitive and the REML score;
-    the user owns the optimizer.
+    Hyperparameter sequences are intentionally rejected by the scalar type and
+    by :class:`SkipAffineSmooth` validation. Model selection lives in
+    :func:`select_skip_transcoder`; it never expands a Cartesian product.
     """
-    rank_list = _int_grid(rank_skip)
-    thr_list = _float_grid(jumprelu_threshold)
-    lam_list = _float_grid(lambda_sparse)
-
-    is_sweep = (len(rank_list) > 1) or (len(thr_list) > 1) or (len(lam_list) > 1)
-    if not is_sweep:
-        return SkipAffineSmooth(
-            in_dim=in_dim,
-            out_dim=out_dim,
-            n_atoms=n_atoms,
-            rank_skip=int(rank_list[0]),
-            jumprelu_threshold=float(thr_list[0]),
-            lambda_sparse=float(lam_list[0]),
-            learnable_threshold=learnable_threshold,
-            smoothing_eps=smoothing_eps,
-            device=device,
-            dtype=dtype,
+    if isinstance(rank_skip, bool) or not isinstance(rank_skip, Integral):
+        raise TypeError("rank_skip must be one integer, not a candidate sequence")
+    if isinstance(jumprelu_threshold, bool) or not isinstance(
+        jumprelu_threshold, Real
+    ):
+        raise TypeError(
+            "jumprelu_threshold must be one real scalar, not a candidate sequence"
         )
-
-    out: list[SkipTranscoderResult] = []
-    for r in rank_list:
-        for tau in thr_list:
-            for lam in lam_list:
-                # Each candidate carries its own lambda_sparse so the module
-                # the user trains uses the same sparsity weight it is scored
-                # under (SkipTranscoderResult.lambda_sparse below).
-                s = SkipAffineSmooth(
-                    in_dim=in_dim,
-                    out_dim=out_dim,
-                    n_atoms=n_atoms,
-                    rank_skip=int(r),
-                    jumprelu_threshold=float(tau),
-                    lambda_sparse=float(lam),
-                    learnable_threshold=learnable_threshold,
-                    smoothing_eps=smoothing_eps,
-                    device=device,
-                    dtype=dtype,
-                )
-                out.append(
-                    SkipTranscoderResult(
-                        smooth=s,
-                        lambda_sparse=float(lam),
-                        jumprelu_threshold=float(tau),
-                        rank_skip=int(r),
-                        reml_score=float("nan"),
-                        mse=float("nan"),
-                        sparsity=float("nan"),
-                        explained_variance=float("nan"),
-                    )
-                )
-    return out
-
-
-def _as_2d_f64_numpy(tensor: torch.Tensor):
-    """Detach, cast to f64, ensure 2-D shape for the Rust metrics call."""
-    t = tensor.detach()
-    if t.dim() == 1:
-        t = t.unsqueeze(-1)
-    return to_numpy_f64(t)
-
-
-def reml_score_skip_transcoder(
-    smooth: SkipAffineSmooth,
-    x_in: torch.Tensor,
-    y_out: torch.Tensor,
-    lambda_sparse: float,
-) -> float:
-    """Closed-form Gaussian REML score for one trained skip-transcoder.
-
-    Thin marshaling over the Rust ``skip_transcoder_reml_metrics`` driver:
-    the Rust core assembles the effective design — every feature column is the
-    flattened outer product of a per-observation activation with an
-    output-space loading: ``(z[:, a], W_dec[a, :])`` for sparse atoms and
-    ``(XV[:, r], U[:, r])`` for the skip bypass, with ``XV = x_in @ skip_V``.
-    It Cholesky-factors ``DᵀD + lambda_sparse * I`` and returns
-    ``0.5 * (n * log sigma2 + logdet)`` — the gauge-invariant Laplace marginal
-    likelihood used by gam's outer loop.
-    """
-    with torch.no_grad():
-        y_hat, z = smooth(x_in)
-        skip_proj = smooth.skip_projection(x_in)
-        skip_u = None if smooth.skip_U is None else _as_2d_f64_numpy(smooth.skip_U)
-        skip_proj = None if skip_proj is None else _as_2d_f64_numpy(skip_proj)
-        metrics = rust_module().skip_transcoder_reml_metrics(
-            _as_2d_f64_numpy(y_out),
-            _as_2d_f64_numpy(y_hat),
-            _as_2d_f64_numpy(z),
-            _as_2d_f64_numpy(smooth.W_dec),
-            float(lambda_sparse),
-            skip_u,
-            skip_proj,
+    if isinstance(lambda_sparse, bool) or not isinstance(lambda_sparse, Real):
+        raise TypeError(
+            "lambda_sparse must be one real scalar, not a candidate sequence"
         )
-        return float(metrics["reml_score"])
+    return SkipAffineSmooth(
+        in_dim=in_dim,
+        out_dim=out_dim,
+        n_atoms=n_atoms,
+        rank_skip=int(rank_skip),
+        jumprelu_threshold=float(jumprelu_threshold),
+        lambda_sparse=float(lambda_sparse),
+        learnable_threshold=learnable_threshold,
+        smoothing_eps=smoothing_eps,
+        device=device,
+        dtype=dtype,
+    )
 
 
-def select_by_reml(results: list[SkipTranscoderResult]) -> SkipTranscoderResult:
-    """Return the candidate with the lowest REML score (best Bayesian fit).
+TransitionKind = Literal["seed", "birth", "death", "continuous"]
 
-    Thin wrapper over the Rust ``skip_transcoder_select_reml`` argmin,
-    which performs the NaN-skip + raise-on-empty contract.
+
+@dataclass(frozen=True)
+class SkipTranscoderTrial:
+    """One continuous evidence query at a genuinely discrete rank."""
+
+    rank_skip: int
+    log_lambda_sparse: float
+    log_jumprelu_threshold: float
+    transition: TransitionKind
+    warm_start: SkipAffineSmooth | None
+
+
+@dataclass(frozen=True)
+class SkipTranscoderProfile:
+    """A converged fixed-rank fit and its analytic profile score jet.
+
+    Constructing this type is the oracle's assertion that ``smooth`` converged
+    for the same negative evidence whose two log-hyperparameter derivatives are
+    returned. A partial/best-effort module must instead be represented by
+    :class:`SkipTranscoderFailedCandidate`.
     """
-    idx = rust_module().skip_transcoder_select_reml([float(r.reml_score) for r in results])
-    return results[int(idx)]
 
+    smooth: SkipAffineSmooth
+    rank_skip: int
+    log_lambda_sparse: float
+    log_jumprelu_threshold: float
+    negative_log_evidence: float
+    gradient_log_hyperparameters: tuple[float, float]
+    gradient_scale: float
 
-def score_and_select(
-    results: list[SkipTranscoderResult],
-    x_in: torch.Tensor,
-    y_out: torch.Tensor,
-) -> SkipTranscoderResult:
-    """Score each (trained) candidate against ``(x_in, y_out)`` and return
-    the best.
-
-    For every entry in ``results`` this fills ``reml_score``, ``mse``,
-    ``sparsity`` and ``explained_variance`` in place by calling the Rust
-    ``skip_transcoder_reml_metrics`` driver, then picks the argmin REML
-    via ``skip_transcoder_select_reml``.
-    """
-    rm = rust_module()
-    with torch.no_grad():
-        for r in results:
-            y_hat, z = r.smooth(x_in)
-            skip_proj = r.smooth.skip_projection(x_in)
-            skip_u = None if r.smooth.skip_U is None else _as_2d_f64_numpy(r.smooth.skip_U)
-            skip_proj = None if skip_proj is None else _as_2d_f64_numpy(skip_proj)
-            m = rm.skip_transcoder_reml_metrics(
-                _as_2d_f64_numpy(y_out),
-                _as_2d_f64_numpy(y_hat),
-                _as_2d_f64_numpy(z),
-                _as_2d_f64_numpy(r.smooth.W_dec),
-                float(r.lambda_sparse),
-                skip_u,
-                skip_proj,
+    def __post_init__(self) -> None:
+        values = (
+            self.log_lambda_sparse,
+            self.log_jumprelu_threshold,
+            self.negative_log_evidence,
+            *self.gradient_log_hyperparameters,
+            self.gradient_scale,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("SkipTranscoderProfile score jet must be finite")
+        if self.gradient_scale <= 0.0:
+            raise ValueError("SkipTranscoderProfile.gradient_scale must be > 0")
+        if self.rank_skip != self.smooth.rank_skip:
+            raise ValueError(
+                "SkipTranscoderProfile rank does not match its fitted smooth: "
+                f"{self.rank_skip} != {self.smooth.rank_skip}"
             )
-            r.reml_score = float(m["reml_score"])
-            r.mse = float(m["mse"])
-            r.sparsity = float(m["sparsity"])
-            r.explained_variance = float(m["explained_variance"])
-    return select_by_reml(results)
+
+    @property
+    def stationarity_tolerance(self) -> float:
+        return math.sqrt(torch.finfo(torch.float64).eps) * self.gradient_scale
+
+    @property
+    def stationarity_defect(self) -> float:
+        return math.hypot(*self.gradient_log_hyperparameters)
+
+
+@dataclass(frozen=True)
+class SkipTranscoderFailedCandidate:
+    """Explicit failed trial record; failures are never made selectable."""
+
+    trial: SkipTranscoderTrial
+    error: Exception
+    evidence_at_failure: float | None = None
+    checkpoint: object | None = None
+
+
+ProfileTrial = Callable[
+    [SkipTranscoderTrial],
+    SkipTranscoderProfile | SkipTranscoderFailedCandidate,
+]
+
+
+class SkipTranscoderSelectionError(RuntimeError):
+    """Base class for typed skip-transcoder selection failures."""
+
+
+class SkipTranscoderCandidateFailed(SkipTranscoderSelectionError):
+    """A required continuous or neighbouring-rank candidate failed."""
+
+    def __init__(self, failure: SkipTranscoderFailedCandidate) -> None:
+        self.failure = failure
+        super().__init__(
+            f"skip-transcoder candidate rank={failure.trial.rank_skip} failed: "
+            f"{failure.error}"
+        )
+
+
+class SkipTranscoderContinuousNonConvergence(SkipTranscoderSelectionError):
+    """Continuous profiling stopped without a stationarity certificate."""
+
+    def __init__(self, profile: SkipTranscoderProfile, reason: str) -> None:
+        self.profile = profile
+        self.reason = reason
+        super().__init__(
+            f"rank {profile.rank_skip} continuous evidence optimization did not "
+            f"converge ({reason}); stationarity defect "
+            f"{profile.stationarity_defect} exceeds "
+            f"{profile.stationarity_tolerance}"
+        )
+
+
+@dataclass(frozen=True)
+class RankTransition:
+    from_rank: int
+    to_rank: int
+    negative_log_evidence_gap: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
+class RankNeighbourCertificate:
+    direction: Literal["birth", "death"]
+    rank_skip: int | None
+    structurally_feasible: bool
+    negative_log_evidence: float | None
+    gap_from_selected: float | None
+    stationarity_defect: float | None
+    stationarity_tolerance: float | None
+
+
+@dataclass(frozen=True)
+class SkipTranscoderSelectionCertificate:
+    selected_rank: int
+    death: RankNeighbourCertificate
+    birth: RankNeighbourCertificate
+    transitions: tuple[RankTransition, ...]
+
+
+@dataclass(frozen=True)
+class SkipTranscoderSelectionResult:
+    profile: SkipTranscoderProfile
+    certificate: SkipTranscoderSelectionCertificate
+
+    @property
+    def smooth(self) -> SkipAffineSmooth:
+        return self.profile.smooth
+
+    @property
+    def lambda_sparse(self) -> float:
+        return math.exp(self.profile.log_lambda_sparse)
+
+    @property
+    def jumprelu_threshold(self) -> float:
+        return math.exp(self.profile.log_jumprelu_threshold)
+
+    @property
+    def rank_skip(self) -> int:
+        return self.profile.rank_skip
+
+    @property
+    def negative_log_evidence(self) -> float:
+        return self.profile.negative_log_evidence
+
+
+def _evaluate_profile_trial(
+    profile_trial: ProfileTrial,
+    trial: SkipTranscoderTrial,
+) -> SkipTranscoderProfile:
+    outcome = profile_trial(trial)
+    if isinstance(outcome, SkipTranscoderFailedCandidate):
+        raise SkipTranscoderCandidateFailed(outcome)
+    if not isinstance(outcome, SkipTranscoderProfile):
+        raise TypeError(
+            "profile_trial must return SkipTranscoderProfile or "
+            "SkipTranscoderFailedCandidate"
+        )
+    if outcome.rank_skip != trial.rank_skip:
+        raise ValueError(
+            f"profile_trial returned rank {outcome.rank_skip} for rank "
+            f"{trial.rank_skip} trial"
+        )
+    coordinate_tolerance = math.sqrt(torch.finfo(torch.float64).eps)
+    for name, actual, requested in (
+        (
+            "log_lambda_sparse",
+            outcome.log_lambda_sparse,
+            trial.log_lambda_sparse,
+        ),
+        (
+            "log_jumprelu_threshold",
+            outcome.log_jumprelu_threshold,
+            trial.log_jumprelu_threshold,
+        ),
+    ):
+        if abs(actual - requested) > coordinate_tolerance * (1.0 + abs(requested)):
+            raise ValueError(
+                f"profile_trial returned {name}={actual} for requested {requested}"
+            )
+    return outcome
+
+
+def _continuously_profile_rank(
+    profile_trial: ProfileTrial,
+    rank_skip: int,
+    initial_logs: tuple[float, float],
+    transition: TransitionKind,
+    warm_start: SkipAffineSmooth | None,
+) -> SkipTranscoderProfile:
+    """Profile two log-hyperparameters with analytic-gradient Torch LBFGS.
+
+    One strong-Wolfe LBFGS iteration is requested at a time. There is no
+    arbitrary iteration cap: the loop terminates only at the oracle-calibrated
+    stationarity tolerance or with a typed checkpoint when no representable
+    evidence-decreasing step remains.
+    """
+
+    logs = torch.tensor(initial_logs, dtype=torch.float64, requires_grad=True)
+
+    def evaluate(kind: TransitionKind, seed: SkipAffineSmooth | None) -> SkipTranscoderProfile:
+        return _evaluate_profile_trial(
+            profile_trial,
+            SkipTranscoderTrial(
+                rank_skip=rank_skip,
+                log_lambda_sparse=float(logs[0].detach()),
+                log_jumprelu_threshold=float(logs[1].detach()),
+                transition=kind,
+                warm_start=seed,
+            ),
+        )
+
+    current = evaluate(transition, warm_start)
+    optimizer = torch.optim.LBFGS(
+        [logs],
+        max_iter=1,
+        tolerance_grad=0.0,
+        tolerance_change=0.0,
+        line_search_fn="strong_wolfe",
+    )
+    while current.stationarity_defect > current.stationarity_tolerance:
+        previous_coordinates = tuple(float(value) for value in logs.detach())
+        previous_score = current.negative_log_evidence
+        closure_seed = current.smooth
+
+        def closure() -> torch.Tensor:
+            optimizer.zero_grad()
+            profiled = evaluate("continuous", closure_seed)
+            gradient = torch.tensor(
+                profiled.gradient_log_hyperparameters,
+                dtype=logs.dtype,
+                device=logs.device,
+            )
+            # Value-matched linear surrogate: numeric value is the exact
+            # profiled evidence; backward is the oracle's analytic gradient.
+            loss = logs.new_tensor(profiled.negative_log_evidence) + (
+                (logs - logs.detach()) * gradient
+            ).sum()
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        current = evaluate("continuous", current.smooth)
+        coordinates = tuple(float(value) for value in logs.detach())
+        if coordinates == previous_coordinates:
+            raise SkipTranscoderContinuousNonConvergence(
+                current, "no representable parameter step remains"
+            )
+        score_roundoff = torch.finfo(torch.float64).eps * (
+            1.0 + abs(previous_score) + abs(current.negative_log_evidence)
+        )
+        if current.negative_log_evidence >= previous_score - score_roundoff:
+            raise SkipTranscoderContinuousNonConvergence(
+                current, "strong-Wolfe step did not decrease evidence"
+            )
+    return current
+
+
+def _rank_neighbour_certificate(
+    direction: Literal["birth", "death"],
+    selected: SkipTranscoderProfile,
+    neighbour: SkipTranscoderProfile | None,
+) -> RankNeighbourCertificate:
+    if neighbour is None:
+        return RankNeighbourCertificate(
+            direction=direction,
+            rank_skip=None,
+            structurally_feasible=False,
+            negative_log_evidence=None,
+            gap_from_selected=None,
+            stationarity_defect=None,
+            stationarity_tolerance=None,
+        )
+    return RankNeighbourCertificate(
+        direction=direction,
+        rank_skip=neighbour.rank_skip,
+        structurally_feasible=True,
+        negative_log_evidence=neighbour.negative_log_evidence,
+        gap_from_selected=(
+            neighbour.negative_log_evidence - selected.negative_log_evidence
+        ),
+        stationarity_defect=neighbour.stationarity_defect,
+        stationarity_tolerance=neighbour.stationarity_tolerance,
+    )
+
+
+def select_skip_transcoder(
+    in_dim: int,
+    out_dim: int,
+    profile_trial: ProfileTrial,
+    *,
+    initial_lambda_sparse: float,
+    initial_jumprelu_threshold: float,
+    initial_rank: int = 0,
+) -> SkipTranscoderSelectionResult:
+    """Continuously profile lambda/threshold and sequentially select rank.
+
+    ``profile_trial`` is the PyTorch interaction boundary: for every requested
+    rank and pair of log-hyperparameters it must train/profile the same evidence
+    to convergence and return its analytic two-vector gradient. Rank selection
+    starts at ``initial_rank``, evaluates every feasible birth/death neighbour,
+    moves only on strict evidence improvement, and stops only after both
+    neighbours have converged continuous optima that do not improve the fit.
+    """
+
+    if in_dim <= 0 or out_dim <= 0:
+        raise ValueError("in_dim and out_dim must be > 0")
+    structural_max_rank = min(in_dim, out_dim)
+    if not 0 <= initial_rank <= structural_max_rank:
+        raise ValueError(
+            f"initial_rank must be in [0, {structural_max_rank}], got {initial_rank}"
+        )
+    if not math.isfinite(initial_lambda_sparse) or initial_lambda_sparse <= 0.0:
+        raise ValueError("initial_lambda_sparse must be finite and > 0")
+    if (
+        not math.isfinite(initial_jumprelu_threshold)
+        or initial_jumprelu_threshold <= 0.0
+    ):
+        raise ValueError("initial_jumprelu_threshold must be finite and > 0")
+
+    initial_logs = (
+        math.log(initial_lambda_sparse),
+        math.log(initial_jumprelu_threshold),
+    )
+    profiles: dict[int, SkipTranscoderProfile] = {}
+    transitions: list[RankTransition] = []
+    current = _continuously_profile_rank(
+        profile_trial,
+        initial_rank,
+        initial_logs,
+        "seed",
+        None,
+    )
+    profiles[initial_rank] = current
+
+    while True:
+        neighbours: list[SkipTranscoderProfile] = []
+        for candidate_rank, direction in (
+            (current.rank_skip - 1, "death"),
+            (current.rank_skip + 1, "birth"),
+        ):
+            if not 0 <= candidate_rank <= structural_max_rank:
+                continue
+            candidate = profiles.get(candidate_rank)
+            if candidate is None:
+                candidate = _continuously_profile_rank(
+                    profile_trial,
+                    candidate_rank,
+                    (
+                        current.log_lambda_sparse,
+                        current.log_jumprelu_threshold,
+                    ),
+                    direction,
+                    current.smooth,
+                )
+                profiles[candidate_rank] = candidate
+            neighbours.append(candidate)
+
+        best_neighbour = min(
+            neighbours,
+            key=lambda profile: profile.negative_log_evidence,
+            default=None,
+        )
+        evidence_tolerance = torch.finfo(torch.float64).eps * (
+            1.0
+            + abs(current.negative_log_evidence)
+            + (
+                0.0
+                if best_neighbour is None
+                else abs(best_neighbour.negative_log_evidence)
+            )
+        )
+        improves = (
+            best_neighbour is not None
+            and best_neighbour.negative_log_evidence
+            < current.negative_log_evidence - evidence_tolerance
+        )
+        for neighbour in neighbours:
+            transitions.append(
+                RankTransition(
+                    from_rank=current.rank_skip,
+                    to_rank=neighbour.rank_skip,
+                    negative_log_evidence_gap=(
+                        neighbour.negative_log_evidence
+                        - current.negative_log_evidence
+                    ),
+                    accepted=improves and neighbour is best_neighbour,
+                )
+            )
+        if not improves:
+            death = profiles.get(current.rank_skip - 1)
+            birth = profiles.get(current.rank_skip + 1)
+            certificate = SkipTranscoderSelectionCertificate(
+                selected_rank=current.rank_skip,
+                death=_rank_neighbour_certificate("death", current, death),
+                birth=_rank_neighbour_certificate("birth", current, birth),
+                transitions=tuple(transitions),
+            )
+            return SkipTranscoderSelectionResult(
+                profile=current,
+                certificate=certificate,
+            )
+        current = best_neighbour
 
 
 __all__ = [
     "SkipAffineSmooth",
-    "SkipTranscoderResult",
+    "SkipTranscoderCandidateFailed",
+    "SkipTranscoderContinuousNonConvergence",
+    "SkipTranscoderFailedCandidate",
+    "SkipTranscoderProfile",
+    "SkipTranscoderSelectionCertificate",
+    "SkipTranscoderSelectionError",
+    "SkipTranscoderSelectionResult",
+    "SkipTranscoderTrial",
+    "select_skip_transcoder",
     "skip_transcoder",
-    "reml_score_skip_transcoder",
-    "select_by_reml",
-    "score_and_select",
 ]

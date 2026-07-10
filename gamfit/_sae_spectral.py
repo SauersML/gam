@@ -14,6 +14,7 @@ linear / block lanes these diagnostics read.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,46 @@ def _as_2d_u32(values: Any, label: str) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError(f"{label} must be a 2-D array; got shape {arr.shape}")
     return np.ascontiguousarray(arr)
+
+
+def _sparse_route_arrays(
+    route: Any, label: str, block_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize a fixed-width sparse route without expanding implicit zeros."""
+    if isinstance(route, Mapping):
+        if "indices" not in route:
+            raise ValueError(f"{label} mapping must contain 'indices'")
+        indices = route["indices"]
+        if "values" in route:
+            values = route["values"]
+        elif "codes" in route:
+            values = route["codes"]
+        else:
+            raise ValueError(f"{label} mapping must contain 'values' or 'codes'")
+    elif isinstance(route, Sequence) and not isinstance(route, (str, bytes, bytearray)):
+        if len(route) != 2:
+            raise ValueError(f"{label} must be an (indices, values) pair")
+        indices, values = route
+    elif hasattr(route, "indices") and hasattr(route, "codes"):
+        indices, values = route.indices, route.codes
+    else:
+        raise TypeError(
+            f"{label} must be a sparse route mapping/object or (indices, values) pair"
+        )
+    idx = _as_2d_u32(indices, f"{label}.indices")
+    val = np.asarray(values, dtype=np.float32)
+    if block_size == 1 and val.ndim == 2:
+        val = val[:, :, None]
+    if val.ndim != 3:
+        raise ValueError(
+            f"{label}.values must be N x s x block_size; got shape {val.shape}"
+        )
+    if val.shape != (idx.shape[0], idx.shape[1], block_size):
+        raise ValueError(
+            f"{label} values shape {val.shape} does not match indices {idx.shape} "
+            f"and block_size {block_size}"
+        )
+    return idx, np.ascontiguousarray(val)
 
 
 def _as_optional_1d_f64(values: Any | None, label: str) -> np.ndarray | None:
@@ -340,13 +381,6 @@ def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[
     )
 
 
-def _dense_codes_from_sparse(indices: np.ndarray, sparse_codes: np.ndarray, k: int) -> np.ndarray:
-    dense = np.zeros((indices.shape[0], k), dtype=np.float32)
-    rows = np.arange(indices.shape[0])[:, None]
-    dense[rows, indices] = sparse_codes
-    return np.ascontiguousarray(dense)
-
-
 def audit_sae(
     checkpoint: Any,
     activations: Any,
@@ -380,14 +414,14 @@ def audit_sae(
     ``K x P``: one dictionary row per atom and one column per activation
     dimension. ``activations`` is ``N x P``.
 
-    If dense SAE ``codes`` (``N x K``) are supplied, they are audited as the
-    frozen external encoder output. If not, the Rust sparse router encodes
-    ``activations`` against the frozen decoder with ``active`` atoms per row
-    (default ``1``) before running the audit. ``random_weight_codes`` is an
-    architecture-matched random-weight encoder donor used for the required
-    null battery attached to topology and atlas claims. All certificate,
-    routability, coordinate-SE, topology, and atlas-nerve quantities are
-    computed by Rust.
+    ``codes`` and ``random_weight_codes`` are sparse routes represented as an
+    ``(indices, values)`` pair or a mapping/object with ``indices`` and
+    ``values``/``codes`` fields. ``indices`` is ``N x s``; values are ``N x s``
+    for scalar routing or ``N x s x block_size`` for block routing. If
+    ``codes`` is omitted in the scalar lane, the Rust sparse router encodes the
+    activations with ``active`` atoms per row. Block audits require the frozen
+    external route because its fitted block-gate state is part of the encoder.
+    Neither Python nor Rust materializes the logical ``N x K`` matrix.
     """
     dec, checkpoint_meta = _load_decoder_checkpoint(checkpoint, decoder_key)
     acts = _as_2d_f32(activations, "activations")
@@ -396,6 +430,10 @@ def audit_sae(
             f"activations have P={acts.shape[1]} columns but decoder has P={dec.shape[1]}"
         )
     if codes is None:
+        if block_size != 1:
+            raise ValueError(
+                "block audit requires sparse external codes=(block_indices, block_values)"
+            )
         route_active = 1 if active is None else int(active)
         routed = rust_module().sparse_dictionary_transform_ffi(
             acts,
@@ -405,25 +443,24 @@ def audit_sae(
             float(code_ridge),
             score_mode,
         )
-        cod = _dense_codes_from_sparse(routed["indices"], routed["codes"], dec.shape[0])
+        route_indices, route_values = _sparse_route_arrays(
+            routed, "codes", block_size
+        )
         route_meta: dict[str, Any] = {
             "source": "rust_sparse_router",
             "active": route_active,
             "score_route_stats": dict(routed.get("score_route_stats", {})),
         }
     else:
-        cod = _as_2d_f32(codes, "codes")
+        route_indices, route_values = _sparse_route_arrays(codes, "codes", block_size)
         route_meta = {"source": "external_codes"}
-    if cod.shape != (acts.shape[0], dec.shape[0]):
+    if route_indices.shape[0] != acts.shape[0]:
         raise ValueError(
-            f"codes must have shape (N, K)=({acts.shape[0]}, {dec.shape[0]}); got {cod.shape}"
+            f"codes must have N={acts.shape[0]} rows; got {route_indices.shape[0]}"
         )
-    rw_cod = _as_2d_f32(random_weight_codes, "random_weight_codes")
-    if rw_cod.shape[1] != dec.shape[0] or rw_cod.shape[0] == 0:
-        raise ValueError(
-            "random_weight_codes must be a non-empty matrix with K="
-            f"{dec.shape[0]} columns; got {rw_cod.shape}"
-        )
+    donor_indices, donor_values = _sparse_route_arrays(
+        random_weight_codes, "random_weight_codes", block_size
+    )
     if transport is not None:
         if transport_theta_in is not None or transport_theta_out is not None:
             raise ValueError(
@@ -436,13 +473,13 @@ def audit_sae(
     blocks = None if coordinate_blocks is None else [int(block) for block in coordinate_blocks]
     payload = rust_module().audit_sae(
         dec,
-        cod,
+        route_indices,
+        route_values,
         acts,
-        rw_cod,
+        donor_indices,
+        donor_values,
         {
-            "active": active,
             "block_size": block_size,
-            "block_topk": block_topk,
             "delta": delta,
             "quantile_levels": q_levels,
             "max_candidates": max_candidates,

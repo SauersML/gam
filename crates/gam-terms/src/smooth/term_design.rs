@@ -1139,7 +1139,13 @@ fn apply_global_smooth_identifiability(
             let primaries: Vec<((usize, usize), Array2<f64>)> = penalty_candidates
                 .iter()
                 .filter(|c| matches!(c.source, PenaltySource::Primary))
-                .map(|c| (support_rows(&c.matrix), c.matrix.clone()))
+                .map(|c| {
+                    (
+                        support_rows(&c.matrix),
+                        c.matrix
+                            .mapv(|value| value * c.normalization_scale),
+                    )
+                })
                 .collect();
             for candidate in &mut penalty_candidates {
                 if !matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
@@ -1153,18 +1159,27 @@ fn apply_global_smooth_identifiability(
                 let owner = primaries
                     .iter()
                     .find(|((plo, phi), _)| *plo <= rlo && rhi <= *phi)
-                    .or_else(|| (primaries.len() == 1).then(|| &primaries[0]));
-                let Some(((plo, phi), s_full)) = owner else {
-                    // No co-located Primary (shouldn't happen for a well-formed
-                    // double-penalty term): leave the restricted ridge as-is.
-                    continue;
-                };
-                // Rebuild from the Primary's OWN block submatrix so the resulting
-                // projector spans only that block's null space, then embed back
-                // into the term-local `q×q` frame at the same offset.
+                    .or_else(|| (primaries.len() == 1).then(|| &primaries[0]))
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "double-penalty ridge for smooth '{}' has no co-located primary penalty",
+                            term.name
+                        ))
+                    })?;
+                let ((plo, phi), s_full) = owner;
+                // Rebuild from the physical Primary and ridge submatrices. The
+                // generalized `(S, S+R)` null solve preserves the function metric
+                // through this global congruence instead of replacing it by a
+                // coefficient-space projector.
                 let block = s_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
-                let rebuilt_block = crate::basis::build_nullspace_shrinkage_penalty(&block)?
-                    .map(|shrink| shrink.sym_penalty);
+                let ridge_full = candidate
+                    .matrix
+                    .mapv(|value| value * candidate.normalization_scale);
+                let ridge_block = ridge_full
+                    .slice(s![*plo..*phi, *plo..*phi])
+                    .to_owned();
+                let rebuilt_block =
+                    crate::basis::rebuild_metric_consistent_ridge(&block, &ridge_block)?;
                 match rebuilt_block {
                     Some(ridge_block) => {
                         let mut full = Array2::<f64>::zeros((q, q));

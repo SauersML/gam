@@ -20,9 +20,9 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 use crate::manifold::{
-    AssignmentMode, CrosscoderLayer, LatentManifold, OutputBlock, PeriodicHarmonicEvaluator,
-    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, TwoBlockRemlControls, measure_atom_transport,
+    AssignmentMode, CrosscoderLayer, CrosscoderLayout, LatentManifold, OutputBlock,
+    PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
+    SaeManifoldRho, SaeManifoldTerm, TwoBlockRemlControls, measure_atom_transport,
 };
 
 const ON: f64 = 6.0;
@@ -108,6 +108,62 @@ fn mean_drift_turns(grid: &[(f64, f64)]) -> f64 {
         (a + (two_pi * d).sin(), b + (two_pi * d).cos())
     });
     s.atan2(c) / two_pi
+}
+
+/// The target projection is continuous even when the source report uses the
+/// coarsest sample count that can identify the smooth alternative. The former
+/// target-grid argmin quantized this planted phase to quarter turns.
+#[test]
+fn transport_projection_recovers_off_lattice_phase_at_coarse_reporting_density() {
+    let sample_count = 4;
+    let planted_phase = 0.173_205_080_756_887_73;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+    let coords = Array2::<f64>::from_shape_fn((sample_count, 1), |(row, _)| {
+        row as f64 / sample_count as f64
+    });
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+    let angle = std::f64::consts::TAU * planted_phase;
+    let mut decoder = Array2::<f64>::zeros((3, 4));
+    // Anchor curve: (sin theta, cos theta).
+    decoder[[1, 0]] = 1.0;
+    decoder[[2, 1]] = 1.0;
+    // Target curve: anchor(u + planted_phase). Its nearest coordinate for
+    // anchor(t) is therefore u = t - planted_phase (mod 1).
+    decoder[[1, 2]] = angle.cos();
+    decoder[[1, 3]] = -angle.sin();
+    decoder[[2, 2]] = angle.sin();
+    decoder[[2, 3]] = angle.cos();
+    let atom = SaeManifoldAtom::new(
+        "off-lattice-transport",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((sample_count, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let block = OutputBlock::new("target", Array2::<f64>::zeros((sample_count, 2)), 0.0).unwrap();
+    let layout = CrosscoderLayout::from_blocks(2, &[block]);
+
+    let report = measure_atom_transport(&term, &layout, 0, sample_count).unwrap();
+    for &(source, target) in &report.transport_grid {
+        let error = (target - (source - planted_phase)).rem_euclid(1.0);
+        let circular_error = error.min(1.0 - error);
+        assert!(
+            circular_error < 1.0e-10,
+            "source {source} projected to {target}, circular error {circular_error}"
+        );
+    }
 }
 
 /// Arm 1: layer 2 is an exact constant-phase reparameterization of layer 1. The

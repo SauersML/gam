@@ -89,8 +89,8 @@ pub(crate) fn channel_cov_factors(cov: ArrayView2<'_, f64>, m_basis: i64) -> Opt
 /// (#2091). The inverse of the crate's `json_value_to_py`; the
 /// `from_fit_payload` builder needs it to carry the raw fit payload's opaque
 /// report blocks (`diagnostics`, `atom_inference`, `hybrid_split`, …) through as
-/// `Value` without a Python `json.dumps` hop. Mirrors the Python `_jsonable`
-/// coercion `to_dict` applies to those blocks: numpy arrays/scalars are
+/// `Value` without a Python `json.dumps` hop. This owns the coercion applied to
+/// report blocks: numpy arrays/scalars are
 /// `.tolist()`-flattened, `dict` keys are stringified, `list`/`tuple` become
 /// arrays, and JSON scalars pass through. `bool` is checked before `int`
 /// (Python `bool` subclasses `int`), and `int` before `float` so an integral
@@ -130,7 +130,7 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
-            // Mirror `_jsonable`'s `str(k)` key coercion.
+            // Schema keys are always strings.
             let key: String = match k.extract::<String>() {
                 Ok(key) => key,
                 Err(_) => k.str()?.extract::<String>()?,
@@ -140,7 +140,7 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Object(map));
     }
     // A numpy array (or any object exposing `.tolist()`) flattens to native
-    // Python lists first, then recurses — the same path `_jsonable` takes.
+    // Python lists first, then recurse.
     if obj.hasattr("tolist")? {
         let listed = obj.call_method0("tolist")?;
         return py_any_to_json_value(&listed);
@@ -357,6 +357,288 @@ pub(crate) fn topology_for_bases(bases: &[String]) -> Option<String> {
     } else {
         Some("mixed".to_string())
     }
+}
+
+struct StagewisePayloadConfig {
+    assignment: String,
+    assignment_label: String,
+    alpha: f64,
+    learnable_alpha: bool,
+    tau: f64,
+    sparsity_strength: f64,
+    smoothness: f64,
+    learning_rate: f64,
+    max_iter: i64,
+    random_state: i64,
+    jumprelu_threshold: f64,
+}
+
+fn require_matrix_shape(
+    matrix: &Array2<f64>,
+    rows: usize,
+    cols: usize,
+    label: &str,
+) -> Result<(), String> {
+    if matrix.dim() != (rows, cols) {
+        return Err(format!(
+            "sae_manifold_core_from_stagewise: {label} must have shape ({rows}, {cols}); got {:?}",
+            matrix.dim()
+        ));
+    }
+    if let Some(((row, col), value)) = matrix.indexed_iter().find(|(_, value)| !value.is_finite()) {
+        return Err(format!(
+            "sae_manifold_core_from_stagewise: {label} contains non-finite value \
+             at ({row}, {col}): {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// Build the persisted model schema for a stagewise-composed frozen dictionary.
+/// This is the only owner of the v1 field/default layout for that lift; Python
+/// passes typed arrays and seed scalars and receives a [`ManifoldSaePayload`].
+fn build_stagewise_manifold_sae_payload(
+    basis_kinds: Vec<String>,
+    decoder_blocks: Vec<Array2<f64>>,
+    atom_dims: Vec<i64>,
+    coords: Vec<Array2<f64>>,
+    assignments: Array2<f64>,
+    fitted: Array2<f64>,
+    logits: Array2<f64>,
+    training: Array2<f64>,
+    reconstruction_r2: f64,
+    cfg: &StagewisePayloadConfig,
+) -> Result<ManifoldSaePayload, String> {
+    let k = basis_kinds.len();
+    if k == 0 {
+        return Err("sae_manifold_core_from_stagewise requires at least one atom".to_string());
+    }
+    for (label, len) in [
+        ("decoder_blocks", decoder_blocks.len()),
+        ("atom_dims", atom_dims.len()),
+        ("coords", coords.len()),
+    ] {
+        if len != k {
+            return Err(format!(
+                "sae_manifold_core_from_stagewise: {label} has length {len}, expected K={k}"
+            ));
+        }
+    }
+    let (n, p) = training.dim();
+    if n == 0 || p == 0 {
+        return Err(
+            "sae_manifold_core_from_stagewise requires non-empty training data".to_string(),
+        );
+    }
+    require_matrix_shape(&training, n, p, "training")?;
+    require_matrix_shape(&fitted, n, p, "fitted")?;
+    require_matrix_shape(&assignments, n, k, "assignments")?;
+    require_matrix_shape(&logits, n, k, "logits")?;
+    for atom in 0..k {
+        let dim = usize::try_from(atom_dims[atom]).map_err(|_| {
+            format!(
+                "sae_manifold_core_from_stagewise: atom_dims[{atom}] must be positive; got {}",
+                atom_dims[atom]
+            )
+        })?;
+        if dim == 0 {
+            return Err(format!(
+                "sae_manifold_core_from_stagewise: atom_dims[{atom}] must be positive"
+            ));
+        }
+        require_matrix_shape(&coords[atom], n, dim, &format!("coords[{atom}]"))?;
+        if decoder_blocks[atom].nrows() == 0 {
+            return Err(format!(
+                "sae_manifold_core_from_stagewise: decoder_blocks[{atom}] has zero basis rows"
+            ));
+        }
+        require_matrix_shape(
+            &decoder_blocks[atom],
+            decoder_blocks[atom].nrows(),
+            p,
+            &format!("decoder_blocks[{atom}]"),
+        )?;
+    }
+    if !reconstruction_r2.is_finite() {
+        return Err(format!(
+            "sae_manifold_core_from_stagewise: reconstruction_r2 must be finite; got {reconstruction_r2}"
+        ));
+    }
+
+    let basis_sizes: Vec<i64> = decoder_blocks
+        .iter()
+        .map(|block| block.nrows() as i64)
+        .collect();
+    let raw_n_harmonics: Vec<i64> = basis_kinds
+        .iter()
+        .zip(&basis_sizes)
+        .map(|(kind, &size)| if kind == "periodic" { (size - 1) / 2 } else { 0 })
+        .collect();
+    let n_harmonics = canonical_n_harmonics(&basis_kinds, &raw_n_harmonics, &basis_sizes);
+    let decoder_nested: Vec<Vec<Vec<f64>>> = decoder_blocks.iter().map(array2_to_nested).collect();
+    let coords_nested: Vec<Vec<Vec<f64>>> = coords.iter().map(array2_to_nested).collect();
+    let assignments_nested = array2_to_nested(&assignments);
+
+    let atoms: Vec<AtomPayload> = (0..k)
+        .map(|atom| AtomPayload {
+            basis: basis_kinds[atom].clone(),
+            decoder_coefficients: decoder_nested[atom].clone(),
+            assignments: assignments_nested
+                .iter()
+                .map(|row| row[atom])
+                .collect(),
+            coords: coords_nested[atom].clone(),
+            coords_u_arc: None,
+            evidence: None,
+            active_dim: atom_dims[atom],
+            decoder_covariance_channel_factors: None,
+            shape_band_coords: None,
+            shape_band_mean: None,
+            shape_band_sd: None,
+            functional_evidence: None,
+        })
+        .collect();
+    let atom_topologies = topologies_for_bases(&basis_kinds);
+    let atom_topology = topology_for_bases(&basis_kinds)
+        .ok_or("sae_manifold_core_from_stagewise requires at least one basis")?;
+
+    Ok(ManifoldSaePayload {
+        schema: SCHEMA_TAG.to_string(),
+        atom_topology,
+        atom_topologies,
+        assignment: cfg.assignment.clone(),
+        assignment_label: cfg.assignment_label.clone(),
+        alpha: cfg.alpha,
+        learnable_alpha: cfg.learnable_alpha,
+        tau: cfg.tau,
+        sparsity_strength: cfg.sparsity_strength,
+        smoothness: cfg.smoothness,
+        learning_rate: cfg.learning_rate,
+        max_iter: cfg.max_iter,
+        random_state: cfg.random_state,
+        top_k: None,
+        jumprelu_threshold: cfg.jumprelu_threshold,
+        oos_projection_top1: false,
+        dispersion: 1.0,
+        penalized_loss_score: None,
+        reml_score: None,
+        reconstruction_r2,
+        primitive_names: vec!["sae_manifold_fit_stagewise".to_string()],
+        basis_specs: basis_kinds.clone(),
+        basis_kinds,
+        atom_dims,
+        basis_sizes,
+        n_harmonics,
+        training_mean: column_mean(training.view()),
+        training_data: None,
+        training_data_retained: false,
+        fitted: array2_to_nested(&fitted),
+        assignments: assignments_nested,
+        low_level_logits: array2_to_nested(&logits),
+        coords: coords_nested,
+        decoder_blocks: decoder_nested,
+        duchon_centers: vec![None; k],
+        atoms,
+        diagnostics: serde_json::json!({"atom_trust": [], "atoms": []}),
+        top_k_projection: None,
+        pre_topk: None,
+        solver_plan: None,
+        atom_two_lens: None,
+        residual_gauge: None,
+        incoherence_report: None,
+        curvature_report: None,
+        coordinate_fidelity: None,
+        topology_persistence: None,
+        atom_inference: None,
+        certificates: None,
+        structure_certificate: None,
+        cotrain: None,
+        hybrid_split: None,
+        fisher_factors: None,
+        fisher_provenance: None,
+        metric_provenance: "Euclidean".to_string(),
+        fisher_mass_residual: None,
+        selected_log_lambda_sparse: None,
+        selected_log_lambda_smooth: None,
+        selected_log_ard: None,
+        structured_residual_diagnostics: Vec::new(),
+        termination: None,
+    })
+}
+
+/// Typed Python entry point for the stagewise-to-model lift.
+#[pyfunction(signature = (
+    atom_topologies, decoder_blocks, atom_dims, coords, assignments, fitted,
+    logits, training, assignment, assignment_label, alpha, learnable_alpha, tau,
+    sparsity_strength, smoothness, learning_rate, max_iter, random_state,
+    jumprelu_threshold, reconstruction_r2
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sae_manifold_core_from_stagewise<'py>(
+    py: Python<'py>,
+    atom_topologies: Vec<String>,
+    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
+    atom_dims: Vec<i64>,
+    coords: Vec<PyReadonlyArray2<'py, f64>>,
+    assignments: PyReadonlyArray2<'py, f64>,
+    fitted: PyReadonlyArray2<'py, f64>,
+    logits: PyReadonlyArray2<'py, f64>,
+    training: PyReadonlyArray2<'py, f64>,
+    assignment: &str,
+    assignment_label: String,
+    alpha: f64,
+    learnable_alpha: bool,
+    tau: f64,
+    sparsity_strength: f64,
+    smoothness: f64,
+    learning_rate: f64,
+    max_iter: i64,
+    random_state: i64,
+    jumprelu_threshold: f64,
+    reconstruction_r2: f64,
+) -> PyResult<Py<crate::ManifoldSaeCore>> {
+    let assignment = canonical_assignment_kind(assignment)
+        .map(str::to_string)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let basis_kinds = atom_topologies
+        .iter()
+        .map(|topology| canonical_basis_kind(topology))
+        .collect();
+    let decoder_blocks = decoder_blocks
+        .iter()
+        .map(|block| block.as_array().to_owned())
+        .collect();
+    let coords = coords
+        .iter()
+        .map(|block| block.as_array().to_owned())
+        .collect();
+    let cfg = StagewisePayloadConfig {
+        assignment,
+        assignment_label,
+        alpha,
+        learnable_alpha,
+        tau,
+        sparsity_strength,
+        smoothness,
+        learning_rate,
+        max_iter,
+        random_state,
+        jumprelu_threshold,
+    };
+    let payload = build_stagewise_manifold_sae_payload(
+        basis_kinds,
+        decoder_blocks,
+        atom_dims,
+        coords,
+        assignments.as_array().to_owned(),
+        fitted.as_array().to_owned(),
+        logits.as_array().to_owned(),
+        training.as_array().to_owned(),
+        reconstruction_r2,
+        &cfg,
+    )
+    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    Py::new(py, crate::ManifoldSaeCore { inner: payload })
 }
 
 /// Restore the `linear_block` label a flat-block fit reports as the generic
@@ -891,6 +1173,50 @@ mod manifold_sae_coercion_tests {
         assert_eq!(flat_block_assignment("norm-selection"), Ok("ibp_map"));
         assert_eq!(flat_block_assignment(" Separate-Gate "), Ok("threshold_gate"));
         assert!(flat_block_assignment("unknown").is_err());
+    }
+
+    #[test]
+    fn stagewise_payload_is_built_from_the_rust_schema() {
+        let cfg = StagewisePayloadConfig {
+            assignment: "softmax".to_string(),
+            assignment_label: "softmax".to_string(),
+            alpha: 1.0,
+            learnable_alpha: false,
+            tau: 0.5,
+            sparsity_strength: 1.0,
+            smoothness: 2.0,
+            learning_rate: 1.0,
+            max_iter: 20,
+            random_state: 7,
+            jumprelu_threshold: 0.0,
+        };
+        let payload = build_stagewise_manifold_sae_payload(
+            vec!["periodic".to_string(), "euclidean".to_string()],
+            vec![
+                array![[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
+                array![[1.0, 1.0], [0.5, -0.5]],
+            ],
+            vec![1, 1],
+            vec![array![[0.1], [0.2]], array![[0.3], [0.4]]],
+            array![[0.75, 0.25], [0.4, 0.6]],
+            array![[1.0, 2.0], [3.0, 4.0]],
+            array![[1.0, 0.0], [0.0, 1.0]],
+            array![[0.0, 2.0], [4.0, 6.0]],
+            0.8,
+            &cfg,
+        )
+        .expect("stagewise payload");
+
+        assert_eq!(payload.schema, SCHEMA_TAG);
+        assert_eq!(payload.atom_topology, "mixed");
+        assert_eq!(payload.atom_topologies, vec!["circle", "euclidean"]);
+        assert_eq!(payload.training_mean, vec![2.0, 4.0]);
+        assert_eq!(payload.basis_sizes, vec![3, 2]);
+        assert_eq!(payload.n_harmonics, vec![1, 0]);
+        assert_eq!(payload.atoms[0].assignments, vec![0.75, 0.4]);
+        assert_eq!(payload.primitive_names, vec!["sae_manifold_fit_stagewise"]);
+        assert!(payload.penalized_loss_score.is_none());
+        assert!(payload.fisher_factors.is_none());
     }
 
     #[test]

@@ -87,7 +87,7 @@ def Circle(
     penalty_order: int = 2,
     output_dim: int = 1,
     by: Any | None = None,
-    double_penalty: bool = False,
+    double_penalty: bool | None = None,
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Closed one-dimensional loop for angular scalar inputs.
@@ -110,7 +110,7 @@ def Cylinder(
     n_knots: tuple[int, int] = (20, 8),
     *,
     by: Any | None = None,
-    double_penalty: bool = False,
+    double_penalty: bool | None = None,
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Tensor topology with one periodic axis and one open axis.
@@ -131,7 +131,7 @@ def Torus(
     n_knots: tuple[int, int] = (20, 20),
     *,
     by: Any | None = None,
-    double_penalty: bool = False,
+    double_penalty: bool | None = None,
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Tensor topology with two periodic axes.
@@ -156,7 +156,7 @@ def Sphere(
     kernel: str = "sobolev",
     radians: bool = False,
     by: Any | None = None,
-    double_penalty: bool = False,
+    double_penalty: bool | None = None,
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Spherical topology for latitude/longitude style inputs.
@@ -186,7 +186,7 @@ def EuclideanPatch(
     m: int = 2,
     length_scale: float | None = None,
     by: Any | None = None,
-    double_penalty: bool = False,
+    double_penalty: bool | None = None,
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Open Euclidean baseline with no periodic axes.

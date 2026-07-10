@@ -1,7 +1,195 @@
 use gam_linalg::LinalgError;
 use gam_linalg::faer_ndarray::FaerLinalgError;
+use serde::{Deserialize, Serialize};
 
 use crate::{BasisError, CustomFamilyError, MonotoneRootError};
+
+/// Fixed-lambda solver stage that owns a resumable coefficient checkpoint.
+///
+/// The multinomial fitter has two distinct objectives: the ordinary softmax
+/// likelihood and the Firth/Jeffreys separation refit. Recording the stage is
+/// therefore part of correctness: a Firth checkpoint must resume the Firth
+/// objective rather than being mistaken for an ordinary multinomial start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixedLambdaSolverStage {
+    BinomialMultiNewton,
+    MultinomialNewton,
+    MultinomialFirth,
+}
+
+impl core::fmt::Display for FixedLambdaSolverStage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::BinomialMultiNewton => "binomial-multi Newton",
+            Self::MultinomialNewton => "multinomial Newton",
+            Self::MultinomialFirth => "multinomial Firth/Jeffreys Newton",
+        })
+    }
+}
+
+/// Exhaustive terminal reason for a fixed-lambda solve without a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixedLambdaStallReason {
+    IterationBudgetExhausted,
+    LineSearchExhausted,
+    StationarityCertificateFailed,
+}
+
+impl core::fmt::Display for FixedLambdaStallReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::IterationBudgetExhausted => "iteration budget exhausted",
+            Self::LineSearchExhausted => "line search exhausted without an accepted step",
+            Self::StationarityCertificateFailed => "stationarity certificate failed",
+        })
+    }
+}
+
+/// Solver-native first-order residual carried by a fixed-lambda stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixedLambdaResidualKind {
+    /// Euclidean norm of the exact penalized likelihood gradient.
+    PenalizedGradientNorm,
+    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    NewtonDecrement,
+}
+
+impl core::fmt::Display for FixedLambdaResidualKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::PenalizedGradientNorm => "penalized gradient norm",
+            Self::NewtonDecrement => "Newton decrement",
+        })
+    }
+}
+
+/// Evidence from the exact stationarity check at the last accepted iterate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FixedLambdaStationarityEvidence {
+    pub kind: FixedLambdaResidualKind,
+    pub residual: f64,
+    pub bound: f64,
+}
+
+impl core::fmt::Display for FixedLambdaStationarityEvidence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} {:.6e} against bound {:.6e}",
+            self.kind, self.residual, self.bound
+        )
+    }
+}
+
+/// Owned, serde-safe coefficient checkpoint for a fixed-lambda Newton solve.
+///
+/// Coefficients are row-major with shape `(rows, cols)`, where rows are the
+/// per-output coefficient count and columns are active outputs/classes. The
+/// values deliberately remain private so diagnostics cannot accidentally dump
+/// a potentially large coefficient vector; resume code accesses them through
+/// [`Self::values`] after calling [`Self::validate`].
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixedLambdaCheckpoint {
+    stage: FixedLambdaSolverStage,
+    coefficients_row_major: Vec<f64>,
+    rows: usize,
+    cols: usize,
+    completed_iterations: usize,
+}
+
+impl FixedLambdaCheckpoint {
+    pub fn new(
+        stage: FixedLambdaSolverStage,
+        coefficients_row_major: Vec<f64>,
+        rows: usize,
+        cols: usize,
+        completed_iterations: usize,
+    ) -> Result<Self, String> {
+        let checkpoint = Self {
+            stage,
+            coefficients_row_major,
+            rows,
+            cols,
+            completed_iterations,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Validate persisted checkpoint geometry and coefficient finiteness before
+    /// rebuilding an ndarray view in a resumed solver.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rows == 0 || self.cols == 0 {
+            return Err(format!(
+                "fixed-lambda checkpoint shape must be nonempty, got {}x{}",
+                self.rows, self.cols
+            ));
+        }
+        let expected = self.rows.checked_mul(self.cols).ok_or_else(|| {
+            format!(
+                "fixed-lambda checkpoint shape {}x{} overflows usize",
+                self.rows, self.cols
+            )
+        })?;
+        if self.coefficients_row_major.len() != expected {
+            return Err(format!(
+                "fixed-lambda checkpoint has {} coefficient values, expected {} for shape {}x{}",
+                self.coefficients_row_major.len(),
+                expected,
+                self.rows,
+                self.cols
+            ));
+        }
+        if let Some((index, _)) = self
+            .coefficients_row_major
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "fixed-lambda checkpoint coefficient {index} must be finite"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn stage(&self) -> FixedLambdaSolverStage {
+        self.stage
+    }
+
+    pub fn values(&self) -> &[f64] {
+        &self.coefficients_row_major
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn completed_iterations(&self) -> usize {
+        self.completed_iterations
+    }
+}
+
+impl core::fmt::Display for FixedLambdaCheckpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} checkpoint {}x{} after {} iteration(s)",
+            self.stage, self.rows, self.cols, self.completed_iterations
+        )
+    }
+}
+
+impl core::fmt::Debug for FixedLambdaCheckpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
 
 /// A comprehensive error type for the model estimation process.
 #[derive(thiserror::Error)]
@@ -50,19 +238,28 @@ pub enum EstimationError {
     },
 
     #[error(
-        "{context} did not converge within {iterations} iterations (final penalized \
-         objective {penalized_neg_log_likelihood:.6e}). A fit is only minted from a \
-         converged optimization; raise the iteration budget or inspect the data for \
-         ill-conditioning."
+        "{context} did not certify a stationary fixed-lambda optimum after {} iteration(s): \
+         {reason}; final minimized objective {objective_value:.6e}; {stationarity}. A fit is \
+         only minted from a converged optimization; resume by passing the carried checkpoint \
+         through the fixed-lambda input's `resume_from` field ({checkpoint}).",
+        .checkpoint.completed_iterations()
     )]
     FixedLambdaNewtonDidNotConverge {
         /// Which fixed-λ Newton entry stalled (e.g. the multinomial softmax or
         /// independent-binomial vector-GLM solve, or the Firth refit lane).
         context: String,
-        /// Newton iterations executed before the budget was exhausted.
-        iterations: usize,
-        /// Penalized negative log-likelihood at the abandoned iterate.
-        penalized_neg_log_likelihood: f64,
+        /// Why the solver stopped without its convergence certificate.
+        reason: FixedLambdaStallReason,
+        /// Final value of the solver's minimized criterion. For ordinary vector
+        /// GLMs this is `-log L + penalty`; for the Firth lane it also includes
+        /// the negative Jeffreys `0.5 log det(I)` contribution.
+        objective_value: f64,
+        /// Exact first-order residual and the bound it failed to clear.
+        stationarity: FixedLambdaStationarityEvidence,
+        /// Last accepted coefficients and cumulative iteration count. This is
+        /// work-preservation state, not a fitted model, and carries no covariance
+        /// or prediction surface.
+        checkpoint: FixedLambdaCheckpoint,
     },
 
     #[error(
@@ -93,27 +290,27 @@ pub enum EstimationError {
     },
 
     #[error(
-        "Negative-binomial θ↔λ alternation did not reach its joint fixed point within {rounds} \
-         rounds: the ML-refreshed θ still drifts {relative_drift_percent:.2}% from the λ-search θ \
-         (θ_frozen = {theta_frozen:.6e} → θ_final = {theta_final:.6e}; joint-stationarity \
-         tolerance {tolerance_percent:.2}%). A fit is only minted from a certified joint (θ, ρ) \
-         optimum; resume from the carried checkpoint (θ_final and rho_checkpoint) rather than \
-         accepting a degraded fit."
+        "Negative-binomial (theta, rho) optimization did not certify a joint optimum within \
+         {rounds} round(s): projected rho-gradient {rho_projected_grad_norm:.3e} against \
+         {rho_stationarity_bound:.3e}, theta-score Newton residual {theta_score_residual:.3e} \
+         against {theta_stationarity_bound:.3e}. A fit is only minted when both analytic \
+         partials are stationary at one identical point; resume from theta={theta_checkpoint:.6e} \
+         and rho={rho_checkpoint:?}."
     )]
     NegativeBinomialAlternationDidNotConverge {
-        /// Alternation rounds executed before the budget was exhausted.
+        /// Joint block-coordinate rounds executed before exhaustion.
         rounds: usize,
-        /// θ the exhausted round's λ-search was frozen at.
-        theta_frozen: f64,
-        /// ML-refreshed θ at the exhausted round's converged η (the best
-        /// checkpoint θ for a resumed fit).
-        theta_final: f64,
-        /// Fixed-point residual |θ_final − θ_frozen| / θ_frozen, in percent.
-        relative_drift_percent: f64,
-        /// Joint-stationarity tolerance the residual failed to meet, in percent.
-        tolerance_percent: f64,
-        /// The last accepted log-smoothing parameters ρ̂ (the best checkpoint
-        /// for warm-starting a resumed λ search via `init_rhos`).
+        /// Conditional theta coordinate at the best measured checkpoint.
+        theta_checkpoint: f64,
+        /// KKT-projected rho-gradient norm at that checkpoint.
+        rho_projected_grad_norm: f64,
+        /// Bound the rho residual had to clear.
+        rho_stationarity_bound: f64,
+        /// Curvature-normalized log-theta score residual at that checkpoint.
+        theta_score_residual: f64,
+        /// Bound the theta residual had to clear.
+        theta_stationarity_bound: f64,
+        /// Best measured log-smoothing checkpoint for warm-started resume.
         rho_checkpoint: Vec<f64>,
     },
 
@@ -406,6 +603,100 @@ mod tests {
             last_change: 0.001,
         };
         assert!(err.to_string().contains("42"));
+    }
+
+    #[test]
+    fn fixed_lambda_checkpoint_validates_shape_and_values() {
+        let checkpoint = FixedLambdaCheckpoint::new(
+            FixedLambdaSolverStage::MultinomialNewton,
+            vec![1.0, 2.0, 3.0, 4.0],
+            2,
+            2,
+            7,
+        )
+        .expect("well-shaped finite checkpoint");
+        assert_eq!(
+            checkpoint.stage(),
+            FixedLambdaSolverStage::MultinomialNewton
+        );
+        assert_eq!(checkpoint.values(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!((checkpoint.rows(), checkpoint.cols()), (2, 2));
+        assert_eq!(checkpoint.completed_iterations(), 7);
+
+        assert!(
+            FixedLambdaCheckpoint::new(
+                FixedLambdaSolverStage::BinomialMultiNewton,
+                vec![1.0],
+                2,
+                1,
+                0,
+            )
+            .is_err(),
+            "coefficient length must match rows * cols"
+        );
+        assert!(
+            FixedLambdaCheckpoint::new(
+                FixedLambdaSolverStage::BinomialMultiNewton,
+                vec![f64::NAN],
+                1,
+                1,
+                0,
+            )
+            .is_err(),
+            "checkpoint coefficients must be finite"
+        );
+        assert!(
+            FixedLambdaCheckpoint::new(
+                FixedLambdaSolverStage::MultinomialFirth,
+                Vec::new(),
+                usize::MAX,
+                2,
+                0,
+            )
+            .is_err(),
+            "checkpoint shape multiplication must not overflow"
+        );
+    }
+
+    #[test]
+    fn fixed_lambda_error_displays_evidence_but_never_coefficients() {
+        let checkpoint = FixedLambdaCheckpoint::new(
+            FixedLambdaSolverStage::MultinomialFirth,
+            vec![12_345.678_9, -98_765.432_1],
+            2,
+            1,
+            11,
+        )
+        .expect("valid checkpoint");
+        let checkpoint_debug = format!("{checkpoint:?}");
+        assert!(!checkpoint_debug.contains("12345.6789"));
+        assert!(!checkpoint_debug.contains("98765.4321"));
+        let err = EstimationError::FixedLambdaNewtonDidNotConverge {
+            context: "test Firth solve".to_string(),
+            reason: FixedLambdaStallReason::LineSearchExhausted,
+            objective_value: 3.25,
+            stationarity: FixedLambdaStationarityEvidence {
+                kind: FixedLambdaResidualKind::NewtonDecrement,
+                residual: 0.125,
+                bound: 1.0e-7,
+            },
+            checkpoint,
+        };
+
+        let display = err.to_string();
+        assert!(display.contains("test Firth solve"));
+        assert!(display.contains("line search exhausted"));
+        assert!(display.contains("Newton decrement"));
+        assert!(display.contains("2x1"));
+        assert!(display.contains("11 iteration"));
+        assert!(!display.contains("12345.6789"));
+        assert!(!display.contains("98765.4321"));
+        assert_eq!(
+            format!("{err:?}"),
+            display,
+            "Debug delegates to safe Display"
+        );
+        assert!(err.is_inner_solve_retreat());
     }
 
     // ── From<LinalgError> ─────────────────────────────────────────────────────

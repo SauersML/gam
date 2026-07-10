@@ -129,6 +129,7 @@ pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
 pub(crate) use crate::criterion_atoms::SaeCriterion;
 
+#[cfg(test)]
 pub(crate) use crate::certificates::{
     CoordinateSamples, GradientCriterionCertificate, certificate_from_samples, probe_step_for,
 };

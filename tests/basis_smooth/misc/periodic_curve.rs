@@ -4,7 +4,7 @@ use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d,
-    create_cyclic_difference_penalty_matrix, fit_periodic_bspline_curve,
+    cyclic_bspline_derivative_penalty_matrix, fit_periodic_bspline_curve,
     periodic_bspline_first_derivative_nd,
 };
 use gam::terms::smooth::{
@@ -64,19 +64,20 @@ fn periodic_basis_wraps_partitions_unity_and_has_periodic_derivative() {
 }
 
 #[test]
-fn cyclic_difference_penalty_wraps_and_has_constant_nullspace() {
-    let s = create_cyclic_difference_penalty_matrix(10, 2).unwrap();
+fn cyclic_derivative_penalty_wraps_and_has_constant_nullspace() {
+    let s = cyclic_bspline_derivative_penalty_matrix(3, 10, 1.0, 2).unwrap();
     assert_eq!(s.nrows(), 10);
     assert_eq!(s.ncols(), 10);
 
     let ones = Array2::from_elem((10, 1), 1.0);
     let penalized = s.dot(&ones);
-    assert!(penalized.iter().all(|v| v.abs() < 1e-12));
+    let scale = s.iter().fold(0.0_f64, |m, value| m.max(value.abs()));
+    assert!(penalized.iter().all(|v| v.abs() < 1e-12 * scale));
 
     for i in 0..10 {
         for j in 0..10 {
-            assert!((s[[i, j]] - s[[(i + 1) % 10, (j + 1) % 10]]).abs() < 1e-12);
-            assert!((s[[i, j]] - s[[j, i]]).abs() < 1e-12);
+            assert!((s[[i, j]] - s[[(i + 1) % 10, (j + 1) % 10]]).abs() < 1e-12 * scale);
+            assert_eq!(s[[i, j]], s[[j, i]]);
         }
     }
 }

@@ -314,7 +314,7 @@ class Duchon(Smooth):
 
 @dataclass(slots=True)
 class BSpline(Smooth):
-    """1D B-spline (Eilers-Marx P-spline) with a difference penalty.
+    """1D B-spline with exact integrated derivative roughness.
 
     For multi-dimensional inputs with DIFFERENT axis units (space × time
     being the canonical example), use :class:`TensorBSpline` instead.

@@ -334,10 +334,8 @@ struct CeilingRegionReport {
     inner_iterations: usize,
     fit_wall_seconds: f64,
     criterion_calls: usize,
-    fd_probe_calls: usize,
     infeasible_total: usize,
     wall_cost_value_probes: usize,
-    mutating_value_probes: usize,
     certificate: Option<OuterCriterionCertificate>,
 }
 
@@ -405,10 +403,8 @@ fn fit_ceiling_region(
         inner_iterations: inner_iters,
         fit_wall_seconds: fit_elapsed.as_secs_f64(),
         criterion_calls: telemetry.criterion_calls,
-        fd_probe_calls: telemetry.fd_probe_calls,
         infeasible_total: telemetry.infeasible_total(),
         wall_cost_value_probes: telemetry.wall_cost_value_probes,
-        mutating_value_probes: telemetry.mutating_value_probes,
         certificate: result.criterion_certificate,
     })
 }
@@ -456,15 +452,10 @@ fn print_ceiling_report(report: &CeilingRegionReport) {
     println!("{label}_inner_iterations={}", report.inner_iterations);
     println!("{label}_fit_wall_seconds={:.3}", report.fit_wall_seconds);
     println!("{label}_criterion_calls={}", report.criterion_calls);
-    println!("{label}_fd_probe_calls={}", report.fd_probe_calls);
     println!("{label}_infeasible_total={}", report.infeasible_total);
     println!(
         "{label}_wall_cost_value_probes={}",
         report.wall_cost_value_probes
-    );
-    println!(
-        "{label}_mutating_value_probes={}",
-        report.mutating_value_probes
     );
     print_gradient_certificate(label, report.certificate.as_ref());
     println!(

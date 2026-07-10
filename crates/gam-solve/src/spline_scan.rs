@@ -46,10 +46,16 @@
 //!   end states, which reproduces the spline's polynomial extrapolation with
 //!   growing variance — bridge-don't-sag is a theorem here.
 //!
-//! The smoothing parameter is selected by maximizing the concentrated diffuse
-//! (restricted) log-likelihood over log λ with a deterministic coarse-grid +
-//! golden-section refinement; σ² is profiled in closed form from the proper
+//! The smoothing parameter is selected by isolating every stationary interval
+//! of the concentrated diffuse restricted log-likelihood over log λ. Exact
+//! analytic score sensitivities are propagated through the filter, and global
+//! curvature bounds drive certified adaptive subdivision; both finite-domain
+//! boundaries compete exactly. σ² is profiled in closed form from the proper
 //! innovations plus the within-tie residual sum.
+
+use gam_math::score_opt::{
+    ClosedInterval, DerivativeEnclosure, ScoreJet, maximize_score_1d,
+};
 
 /// One pooled (distinct-abscissa) observation node.
 #[derive(Clone, Copy, Debug)]
@@ -61,13 +67,9 @@ struct PooledNode {
     w: f64,
 }
 
-/// Deterministic coarse-grid width for the log-λ search.
-const LOG_LAMBDA_GRID: usize = 25;
 /// Search interval for log λ (natural log), generous on both sides.
 const LOG_LAMBDA_LO: f64 = -18.0;
 const LOG_LAMBDA_HI: f64 = 18.0;
-/// Golden-section refinement tolerance on log λ.
-const LOG_LAMBDA_TOL: f64 = 1e-7;
 /// Numerical floor treating a predicted innovation variance as singular.
 const INNOVATION_VAR_FLOOR: f64 = 1e-300;
 
@@ -505,10 +507,7 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
             for i in 0..order {
                 a[i] += gain[i] * v;
                 a_d1[i] = a_old_d1[i] + gain_d1[i] * v + gain[i] * v_d1;
-                a_d2[i] = a_old_d2[i]
-                    + gain_d2[i] * v
-                    + 2.0 * gain_d1[i] * v_d1
-                    + gain[i] * v_d2;
+                a_d2[i] = a_old_d2[i] + gain_d2[i] * v + 2.0 * gain_d1[i] * v_d1 + gain[i] * v_d2;
             }
             let mut p_new = p_star;
             let mut p_new_d1 = p_star_d1;
@@ -522,10 +521,9 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                         + m_star[i] * m_star_d2[j];
                     p_new[i][j] -= mm * inv_f;
                     p_new_d1[i][j] -= mm_d1 * inv_f - mm * f_star_d1 * inv_f2;
-                    p_new_d2[i][j] -= mm_d2 * inv_f
-                        - 2.0 * mm_d1 * f_star_d1 * inv_f2
-                        - mm * f_star_d2 * inv_f2
-                        + 2.0 * mm * f_star_d1 * f_star_d1 * inv_f3;
+                    p_new_d2[i][j] -=
+                        mm_d2 * inv_f - 2.0 * mm_d1 * f_star_d1 * inv_f2 - mm * f_star_d2 * inv_f2
+                            + 2.0 * mm * f_star_d1 * f_star_d1 * inv_f3;
                 }
             }
             p_star = p_new;
@@ -543,10 +541,9 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
             sum_log_f_d2 += f_star_d2 * inv_f - f_star_d1 * f_star_d1 * inv_f2;
             sum_v2_over_f += vv * inv_f;
             sum_v2_over_f_d1 += vv_d1 * inv_f - vv * f_star_d1 * inv_f2;
-            sum_v2_over_f_d2 += vv_d2 * inv_f
-                - 2.0 * vv_d1 * f_star_d1 * inv_f2
-                - vv * f_star_d2 * inv_f2
-                + 2.0 * vv * f_star_d1 * f_star_d1 * inv_f3;
+            sum_v2_over_f_d2 +=
+                vv_d2 * inv_f - 2.0 * vv_d1 * f_star_d1 * inv_f2 - vv * f_star_d2 * inv_f2
+                    + 2.0 * vv * f_star_d1 * f_star_d1 * inv_f3;
             n_proper += 1;
         }
         steps.push(FilterStep {
@@ -752,7 +749,56 @@ fn concentrated_criterion_jet(
     ))
 }
 
-/// Value-only diagnostic surface retained for fixed-λ callers and tests.
+/// Rigorous interval enclosure of the score's first two derivatives.
+///
+/// After eliminating the diffuse polynomial null space, the Gaussian profile
+/// is an affine covariance pencil. Every determinant mode has response
+/// `u in [0,1]`; every normalized profiled-residual derivative is a convex
+/// average of the same kernels. Consequently
+///
+/// `|L''| <= 1/2 (r/4 + 2 nu)` and
+/// `|L'''| <= 1/2 (r/4 + 6 nu)`,
+///
+/// where `r` is the number of proper innovation modes and `nu=n-order` is the
+/// residual d.f. Within-tie residual energy is lambda-independent and only
+/// tightens these bounds. Endpoint jets plus these analytic Lipschitz bounds
+/// therefore enclose the entire interval without a sampling lattice.
+fn concentrated_criterion_enclosure(
+    nodes: &[PooledNode],
+    ssr_within: f64,
+    n_obs: usize,
+    lo: f64,
+    hi: f64,
+    order: usize,
+) -> Result<DerivativeEnclosure, String> {
+    if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+        return Err(format!(
+            "spline scan: invalid score-enclosure interval [{lo}, {hi}]"
+        ));
+    }
+    let left = concentrated_criterion_jet(nodes, ssr_within, n_obs, lo, order)?;
+    let right = concentrated_criterion_jet(nodes, ssr_within, n_obs, hi, order)?;
+    let width = hi - lo;
+    let proper_modes = (nodes.len() - order) as f64;
+    let residual_dof = (n_obs - order) as f64;
+    let curvature_abs_bound = 0.5 * (0.25 * proper_modes + 2.0 * residual_dof);
+    let third_abs_bound = 0.5 * (0.25 * proper_modes + 6.0 * residual_dof);
+    let derivative_radius = curvature_abs_bound * width;
+    let curvature_radius = third_abs_bound * width;
+    Ok(DerivativeEnclosure {
+        derivative: ClosedInterval::outward(
+            (left.1 - derivative_radius).min(right.1 - derivative_radius),
+            (left.1 + derivative_radius).max(right.1 + derivative_radius),
+        ),
+        curvature: ClosedInterval::outward(
+            (left.2 - curvature_radius).min(right.2 - curvature_radius),
+            (left.2 + curvature_radius).max(right.2 + curvature_radius),
+        ),
+    })
+}
+
+/// Value-only diagnostic surface retained for the derivative oracle tests.
+#[cfg(test)]
 fn concentrated_criterion(
     nodes: &[PooledNode],
     ssr_within: f64,
@@ -1053,9 +1099,10 @@ pub fn fit_spline_scan_at(
     })
 }
 
-/// Fit with `log λ` selected by the concentrated diffuse REML criterion:
-/// deterministic coarse grid then golden-section refinement (no RNG, no
-/// iteration-count sensitivity — same data ⇒ same fit).
+/// Fit with `log λ` selected by the concentrated diffuse REML criterion.
+/// Every stationary interval in the bounded, scale-equivariant log-λ domain
+/// is isolated using analytic derivatives and rigorous interval bounds; the
+/// two boundary/null-recovery candidates are evaluated exactly.
 pub fn fit_spline_scan(
     x: &[f64],
     y: &[f64],
@@ -1090,42 +1137,32 @@ pub fn fit_spline_scan(
     };
     let lo_anchor = LOG_LAMBDA_LO + scale_shift;
     let hi_anchor = LOG_LAMBDA_HI + scale_shift;
-    let crit = |ll: f64| concentrated_criterion(&nodes, ssr_within, n_obs, ll, order);
-    let mut best_i = 0usize;
-    let mut best_v = f64::NEG_INFINITY;
-    let step = (hi_anchor - lo_anchor) / (LOG_LAMBDA_GRID - 1) as f64;
-    for i in 0..LOG_LAMBDA_GRID {
-        let ll = lo_anchor + step * i as f64;
-        let v = crit(ll)?;
-        if v > best_v {
-            best_v = v;
-            best_i = i;
-        }
-    }
-    let mut lo = lo_anchor + step * best_i.saturating_sub(1) as f64;
-    let mut hi = (lo_anchor + step * (best_i + 1) as f64).min(hi_anchor);
-    // Golden-section maximization on [lo, hi].
-    let inv_phi = 0.618_033_988_749_894_9_f64;
-    let mut x1 = hi - inv_phi * (hi - lo);
-    let mut x2 = lo + inv_phi * (hi - lo);
-    let mut f1 = crit(x1)?;
-    let mut f2 = crit(x2)?;
-    while hi - lo > LOG_LAMBDA_TOL {
-        if f1 < f2 {
-            lo = x1;
-            x1 = x2;
-            f1 = f2;
-            x2 = lo + inv_phi * (hi - lo);
-            f2 = crit(x2)?;
-        } else {
-            hi = x2;
-            x2 = x1;
-            f2 = f1;
-            x1 = hi - inv_phi * (hi - lo);
-            f1 = crit(x1)?;
-        }
-    }
-    fit_spline_scan_at(x, y, w, 0.5 * (lo + hi), None, order)
+    let search = maximize_score_1d(
+        lo_anchor,
+        hi_anchor,
+        f64::EPSILON.sqrt(),
+        |ll| {
+            concentrated_criterion_jet(&nodes, ssr_within, n_obs, ll, order).map(
+                |(value, derivative, curvature)| ScoreJet {
+                    value,
+                    derivative,
+                    curvature,
+                },
+            )
+        },
+        |lo, hi| {
+            concentrated_criterion_enclosure(
+                &nodes,
+                ssr_within,
+                n_obs,
+                lo,
+                hi,
+                order,
+            )
+        },
+    )
+    .map_err(|error| format!("spline scan: REML stationary isolation failed: {error}"))?;
+    fit_spline_scan_at(x, y, w, search.optimum.x, None, order)
 }
 
 /// Lossless serializable snapshot of a [`SplineScanFit`] (#1034).
@@ -1527,9 +1564,8 @@ mod tests {
         for order in 1..=MAX_ORDER {
             let (nodes, within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pooled data");
             for &rho in &[-4.0, -0.3, 2.5] {
-                let (value, d1, d2) =
-                    concentrated_criterion_jet(&nodes, within, n_obs, rho, order)
-                        .expect("analytic score jet");
+                let (value, d1, d2) = concentrated_criterion_jet(&nodes, within, n_obs, rho, order)
+                    .expect("analytic score jet");
                 // Finite differences are deliberately confined to this oracle
                 // test; production selection uses the analytic sensitivities.
                 let h = 2.0e-4;
