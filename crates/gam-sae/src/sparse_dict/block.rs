@@ -537,7 +537,7 @@ pub(super) struct RowBlockCode {
 /// `N×K`. Returns each row's top-`k` `(block, gate)` shortlist. Mirrors
 /// [`super::scoring::TileScorer::route_minibatch`] but the tile GEMM produces
 /// per-block group ℓ₂ gates rather than per-atom scores.
-fn route_block_minibatch(
+pub(super) fn route_block_minibatch(
     block_rows: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
     n_blocks: usize,
