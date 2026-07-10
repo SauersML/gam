@@ -219,7 +219,7 @@ fn run_wide_outer_fit(
     let n_params = seed.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
@@ -229,6 +229,13 @@ fn run_wide_outer_fit(
         })
         .run(&mut objective, "SAE manifold")
         .expect("#2080 wide-p outer REML fit must terminate, not hang / abort");
+    assert!(
+        result.converged,
+        "#2080 wide-p acceptance requires a CONVERGED outer REML optimum, not a \
+         finite max-iteration/line-search incumbent: iterations={}, final_value={:.6e}, \
+         final_grad_norm={:?}",
+        result.iterations, result.final_value, result.final_grad_norm,
+    );
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
@@ -254,7 +261,7 @@ fn run_k1_generated_seed_outer_fit(
     let n_params = init_rho.to_flat().len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
             max_seeds: 1,
@@ -263,6 +270,12 @@ fn run_k1_generated_seed_outer_fit(
         })
         .run(&mut objective, "SAE manifold K=1 generated seed")
         .expect("#2153 K=1 generated-seed circle fit must terminate");
+    assert!(
+        result.converged,
+        "#2153 K=1 acceptance requires a converged outer optimum: iterations={}, \
+         final_value={:.6e}, final_grad_norm={:?}",
+        result.iterations, result.final_value, result.final_grad_norm,
+    );
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
@@ -714,7 +727,7 @@ fn entangled_two_circle_outer_reml_separates_2080() {
     let n_params = seed.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
@@ -724,6 +737,12 @@ fn entangled_two_circle_outer_reml_separates_2080() {
         })
         .run(&mut objective, "SAE manifold entangled two-circle")
         .expect("#2080 entangled two-circle outer REML fit must terminate, not abort");
+    assert!(
+        result.converged,
+        "#2080 entangled acceptance requires a converged outer REML optimum: \
+         iterations={}, final_value={:.6e}, final_grad_norm={:?}",
+        result.iterations, result.final_value, result.final_grad_norm,
+    );
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     let mut norms = vec![0.0_f64; k];
