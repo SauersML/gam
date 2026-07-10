@@ -498,7 +498,7 @@ fn build_sphere_pair_term(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     let mut q = Array2::<f64>::zeros((n, p));
     for j in 0..half {
         let lon = -std::f64::consts::PI + std::f64::consts::TAU * (j as f64 + 0.5) / half as f64;
-        let lat = if j % 2 == 0 { 0.3 } else { -0.3 };
+        let lat: f64 = if j % 2 == 0 { 0.3 } else { -0.3 };
         // A's frame: ambient = [x, y, z].
         q[[j, 0]] = lat.cos() * lon.cos();
         q[[j, 1]] = lat.cos() * lon.sin();
@@ -507,7 +507,7 @@ fn build_sphere_pair_term(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     for j in 0..half {
         let row = half + j;
         let lon_b = -std::f64::consts::PI + std::f64::consts::TAU * (j as f64 + 0.5) / half as f64;
-        let lat_b = if j % 2 == 0 { 0.3 } else { -0.3 };
+        let lat_b: f64 = if j % 2 == 0 { 0.3 } else { -0.3 };
         let xb = lat_b.cos() * lon_b.cos();
         let yb = lat_b.cos() * lon_b.sin();
         let zb = lat_b.sin();
