@@ -245,8 +245,6 @@ impl SaeManifoldTerm {
             // historical path is bit-for-bit). Installed via `set_tier0_mean` /
             // `fit_tier0_mean`.
             tier0_mean: None,
-            // #1939 — no amplitude-prior state until the first boundary
-            // amplitude solve installs one (bit-for-bit historical objective).
         })
     }
 
@@ -417,8 +415,6 @@ impl SaeManifoldTerm {
         primary.best_cocollapse_incumbent = None;
         primary.best_fit_incumbent = None;
         primary.structural_cocollapse_reseeds = 0;
-        // #1939 — K-dependent (per-atom SCAD λ): stale after the concat; the
-        // merged term's next boundary amplitude solve re-installs it.
         // Stale tier-1 diagnostics — rebuilt at the next assembly / post-fit pass.
         primary.collapse_events = Vec::new();
         primary.curvature_walk_report = None;
